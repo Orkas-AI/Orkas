@@ -163,11 +163,19 @@ def percentile(sorted_values, fraction: float) -> float:
     return float(sorted_values[min(rank, len(sorted_values)) - 1])
 
 
+def _price_list(value) -> list:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise InputError("market_prices must be a JSON array")
+    return value
+
+
 def market_band(dr: float, traffic: float, observed_prices=None) -> dict:
     dr_index = tier_index(dr, DR_TIERS)
     traffic_index = tier_index(traffic, TRAFFIC_TIERS)
     prices = []
-    for price in observed_prices or []:
+    for price in _price_list(observed_prices):
         try:
             number = float(price)
         except (TypeError, ValueError):
@@ -384,6 +392,9 @@ def apply_public_proxies(metrics: dict, proxies: dict, sources: dict, today: _dt
     notes = []
     if not isinstance(proxies, dict) or not proxies:
         return notes
+    history = proxies.get("tranco_history")
+    if history is not None and not isinstance(history, list):
+        raise InputError("tranco_history must be a JSON array")
     today = today or _dt.date.today()
     has_rank_signal = "tranco_rank" in proxies
     if has_rank_signal:
@@ -427,7 +438,10 @@ def evaluate(payload: dict) -> dict:
         raise InputError("domain is required")
     link_type = normalize_link_type(payload.get("link_type"))
     quote = _num(payload.get("quoted_price_usd", payload.get("quote")), "quoted_price_usd", minimum=0)
-    metrics = normalize_metrics(payload.get("metrics") or payload)
+    raw_metrics = payload.get("metrics")
+    if raw_metrics is not None and not isinstance(raw_metrics, dict):
+        raise InputError("metrics must be a JSON object")
+    metrics = normalize_metrics(raw_metrics or payload)
     declared_sources = payload.get("sources") if isinstance(payload.get("sources"), dict) else {}
     sources = {name: str(declared_sources.get(name) or "supplied") for name, value in metrics.items() if value is not None}
     today = _parse_date(payload.get("as_of")) if payload.get("as_of") else None
@@ -487,7 +501,7 @@ def rank(payload: dict) -> dict:
     candidates = payload.get("candidates") if isinstance(payload, dict) else None
     if not isinstance(candidates, list) or not candidates:
         raise InputError("candidates must be a non-empty list")
-    shared_prices = payload.get("market_prices") if isinstance(payload, dict) else None
+    shared_prices = _price_list(payload.get("market_prices"))
     rows = []
     for index, candidate in enumerate(candidates):
         if not isinstance(candidate, dict):
@@ -503,7 +517,11 @@ def rank(payload: dict) -> dict:
         price = row["quoted_price_usd"]
         if price is None and row["value_band_usd"]:
             price = row["value_band_usd"]["median"]
-        value_per_dollar = (score / price) if (price and score >= 0) else 0.0
+        # A free offer has no cost denominator; keep the quality gate first
+        # and use the existing score tie-break among equally free offers.
+        value_per_dollar = math.inf if price == 0 and score >= 0 else (
+            (score / price) if (price and score >= 0) else 0.0
+        )
         return (gate_rank, -value_per_dollar, -score)
 
     ordered = sorted(rows, key=sort_key)

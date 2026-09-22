@@ -98,12 +98,9 @@ Author visual DOM inside generated scene roots and motion on
 
 Write `art_direction` inside the manifest. It is an internal visual contract,
 not another artifact or user gate. `frontend-design` owns its field list and
-pre-code anti-template check: name the first generic move rejected and the brief-
-specific replacement. Reject lazy defaults such as purple/blue neon, glowing
-black circles, centered equal-weight layouts, identical cards, decorative
-emoji/icons, tiny badges, dashboard fragments, pure black/white, and web-scale
-type. When `style_source` exists, name what was adapted, simplified, and not
-copied.
+pre-code anti-template check and reference precedence. When `style_source`
+exists, name the observed attributes retained and the changes justified by the
+brief; apply original design choices to the remaining open decisions.
 
 Fields come from `frontend-design`: `aesthetic`, `visual_direction`
 (`VisualDirectionV1`), `cover`, `typography_tokens`, `anti_template_check`,

@@ -265,14 +265,14 @@ export const invokeHandlers = {
 
   /** A non-blocking question replies to its original live CLI turn. */
   'localAgents.asyncInputResponse': async (
-    payload: { cid?: unknown; message_id?: unknown; answers?: unknown },
+    payload: { cid?: unknown; message_id?: unknown; answers?: unknown; cancelled?: unknown },
     ctx: { userId: string },
   ) => {
     if (typeof payload?.cid !== 'string' || typeof payload?.message_id !== 'string') {
       throw new Error('invalid question identity');
     }
     const group = await import('../features/group_chat');
-    return group.submitCliAsyncInput(ctx.userId, payload.cid, payload.message_id, payload.answers);
+    return group.submitCliAsyncInput(ctx.userId, payload.cid, payload.message_id, payload.answers, payload.cancelled === true);
   },
 
   /** Renderer answer to a native CLI structured user-input request. */

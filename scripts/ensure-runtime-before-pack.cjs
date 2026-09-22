@@ -13,6 +13,7 @@ const {
 } = require('../bin/runtime-gate.cjs');
 const {
   verifyExtraResourcesConfig,
+  verifyXlsReaderRoot,
   verifyMacLocalizedMetadataRoot,
 } = require('../bin/packaged-resource-gate.cjs');
 const { verifySourceEntrypointContract } = require('../bin/packaged-entrypoint-gate.cjs');
@@ -88,6 +89,7 @@ module.exports = async function ensureRuntimeBeforePack(context) {
   // extraResources destination has no declared verification owner.
   const packageJson = JSON.parse(fs.readFileSync(path.join(pcRoot, 'package.json'), 'utf8'));
   verifyExtraResourcesConfig(packageJson.build && packageJson.build.extraResources);
+  verifyXlsReaderRoot(path.join(pcRoot, 'resources', 'xls-reader'));
   verifyWindowsVcExtraFilesConfig(packageJson.build && packageJson.build.win);
   verifyMacLocalizedMetadataRoot(path.join(pcRoot, 'resources', 'mac-locales'));
   verifyBuiltinExtraResourcesConfig(packageJson.build && packageJson.build.extraResources);

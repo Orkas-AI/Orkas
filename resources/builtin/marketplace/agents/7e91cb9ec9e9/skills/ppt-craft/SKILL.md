@@ -59,7 +59,7 @@ actually unresolved.
 
 ## Scratch new editable deck
 
-Use `create_pptx` as the only initial construction route. Call it exactly once with the complete slide array and `preview:false`; accept the exact path it returns, including a collision-safe rename. Call `office_review` once on that exact path with `action:"check_and_render"`, every required initial slide in `pages`, and `analysis_mode:"quality_review"`; invalid structure stops the render phase, while a valid result returns the collected image set for `ppt-review`. In the first response that receives this image batch, write one concise page-specific evidence sentence before loading `ppt-review` or making any other tool call. That sentence must record the reviewed pages, concrete pass/defect observations, and the next action. Loading review guidance never justifies rendering the same page at the same `artifact_revision` again: use the persisted sentence for unchanged pages, and after an edit rerender only affected pages. The create call's first-slide preview must not start visual review ahead of structural validation. Do not create one slide at a time, issue a second create call for the same deck, or use shell/file tools to copy or rename the result. Source-reference renders used only to understand a visual language use `office_review` with `action:"render"` and the default `analysis_mode:"understand"`; defect checking is an explicit output-review operation.
+Use `create_pptx` as the only initial construction route. Call it exactly once with the complete slide array and `preview:false`; accept the exact path it returns, including a collision-safe rename. After construction, read `ppt-review` before the first output quality review and follow its check/render and audit procedure on that exact path. The create call's first-slide preview must not start visual review ahead of structural validation. Do not create one slide at a time, issue a second create call for the same deck, or use shell/file tools to copy or rename the result. Source-reference renders used only to understand a visual language use `office_review` with `action:"render"` and the default `analysis_mode:"understand"`; defect checking is an explicit output-review operation.
 
 Map every storyboard card to supported native objects:
 
@@ -116,16 +116,3 @@ path on the output and repair it if the requested properties do not match.
 If `ppt-review` finds a defect in a deck produced in this conversation, use `office_read` to locate the exact target and `edit_office` to refine the exact returned artifact. Do not restart with `create_pptx`, fork a second draft, or patch OpenXML directly. Each repair batch must correspond to concrete validation or render evidence.
 
 Hand the exact final-candidate path to `ppt-review`; construction is not complete merely because the create or edit tool returned successfully.
-
-## Generated-deck handoff audit
-
-Before publishing a generated deck, prepare exactly one row per slide in page
-order. Use this literal shape and these exact status tokens:
-
-`P1 | Content: PASS — evidence | Design: WARNING — evidence | Coherence: PASS — evidence`
-
-Replace the page number, status, and evidence from the current render, but keep
-the labels `Content`, `Design`, and `Coherence` and use only `PASS`, `WARNING`,
-or `BLOCKER`. Do not substitute unlabeled prose such as “完整、清晰、正常” for
-the status fields. Count the rows before `publish_outputs`; every generated page
-must appear exactly once, and any `BLOCKER` must be repaired before publication.

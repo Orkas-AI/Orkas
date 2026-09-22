@@ -1,7 +1,13 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { armKillWatchdog } from '../../../../src/main/features/local_agents/backends/base';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
-import { AgentActivityClock, agentExecutionDeadline } from '../../../../src/main/util/agent-execution-budget';
+import {
+  AGENT_EXECUTION_IDLE_MS,
+  AgentActivityClock,
+  agentExecutionDeadline,
+} from '../../../../src/main/util/agent-execution-budget';
+import { resolveIdleKillMs } from '../../../../src/main/features/local_agents/runner';
+import { localCliCapabilities } from '../../../../src/main/features/local_agents/registry';
 
 // Business invariants of the activity-aware kill watchdog
 // (backends/base.ts::armKillWatchdog). The bug class this guards: a
@@ -138,5 +144,42 @@ describe('armKillWatchdog', () => {
     await vi.advanceTimersByTimeAsync(300);
     expect(wd.fired()).toBe(null);
     expect(kill).not.toHaveBeenCalled();
+  });
+});
+
+describe('who gets an idle clock', () => {
+  const previous = process.env.ORKAS_LOCAL_AGENT_IDLE_KILL_MS;
+  afterEach(() => {
+    if (previous === undefined) delete process.env.ORKAS_LOCAL_AGENT_IDLE_KILL_MS;
+    else process.env.ORKAS_LOCAL_AGENT_IDLE_KILL_MS = previous;
+  });
+
+  it('arms the shared idle window for backends that can report progress', () => {
+    delete process.env.ORKAS_LOCAL_AGENT_IDLE_KILL_MS;
+    for (const cli of ['claude', 'codex', 'opencode'] as const) {
+      expect(resolveIdleKillMs(cli), cli).toBe(AGENT_EXECUTION_IDLE_MS);
+    }
+  });
+
+  it('leaves a backend without mid-run output on the wall cap alone', () => {
+    // openclaw hands over its whole reply when the process exits, so silence is
+    // its working state: an idle clock would cut a healthy long turn and throw
+    // the answer away (openclaw_e2e.test.ts). Registry capability, not a name
+    // list — a future silent backend inherits the same rule. Not the same as
+    // `activeRunIngress`: opencode and hermes accept nothing into a live run
+    // yet stream out of it, so they keep the clock.
+    delete process.env.ORKAS_LOCAL_AGENT_IDLE_KILL_MS;
+    expect(resolveIdleKillMs('openclaw')).toBeUndefined();
+    for (const cli of ['opencode', 'hermes'] as const) {
+      expect(localCliCapabilities(cli).activeRunIngress, cli).toBe('none');
+      expect(resolveIdleKillMs(cli), cli).toBe(AGENT_EXECUTION_IDLE_MS);
+    }
+  });
+
+  it('lets an explicit override decide either way, including for openclaw', () => {
+    process.env.ORKAS_LOCAL_AGENT_IDLE_KILL_MS = '900000';
+    expect(resolveIdleKillMs('openclaw')).toBe(900_000);
+    process.env.ORKAS_LOCAL_AGENT_IDLE_KILL_MS = '0';
+    expect(resolveIdleKillMs('claude')).toBeUndefined();
   });
 });

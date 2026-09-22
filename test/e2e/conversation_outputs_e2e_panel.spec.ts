@@ -11,7 +11,7 @@
 //
 // The first reply below deliberately does NOT paste a media link; the second
 // one does, and must not gain a duplicate underneath it.
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 
@@ -51,9 +51,35 @@ function pngBytes(width: number, height: number): Buffer {
   ]);
 }
 
+/** A short, valid PCM WAV so Chromium has real metadata to distinguish the
+ *  usable produced narration from the stale same-named reference. */
+function wavBytes(): Buffer {
+  const sampleRate = 8_000;
+  const samples = 800;
+  const pcm = Buffer.alloc(samples * 2);
+  for (let i = 0; i < samples; i += 1) {
+    pcm.writeInt16LE(Math.round(Math.sin((i / sampleRate) * Math.PI * 2 * 440) * 8_000), i * 2);
+  }
+  const out = Buffer.alloc(44 + pcm.length);
+  out.write('RIFF', 0, 'ascii');
+  out.writeUInt32LE(out.length - 8, 4);
+  out.write('WAVEfmt ', 8, 'ascii');
+  out.writeUInt32LE(16, 16);
+  out.writeUInt16LE(1, 20);
+  out.writeUInt16LE(1, 22);
+  out.writeUInt32LE(sampleRate, 24);
+  out.writeUInt32LE(sampleRate * 2, 28);
+  out.writeUInt16LE(2, 32);
+  out.writeUInt16LE(16, 34);
+  out.write('data', 36, 'ascii');
+  out.writeUInt32LE(pcm.length, 40);
+  pcm.copy(out, 44);
+  return out;
+}
+
 test.describe.configure({ timeout: 120_000 });
 
-test('surfaces produced files, outside files, and artifacts for one conversation', async ({ orkas }) => {
+test('surfaces produced files, outside files, and artifacts for one conversation', async ({ orkas }, testInfo) => {
   const page = orkas.page!;
   const uid = 'account-e2e';
   const chatFile = (cid: string) => path.join(
@@ -155,9 +181,9 @@ test('surfaces produced files, outside files, and artifacts for one conversation
   await expect(page.locator('#conversation-info-tab-count-files')).toHaveText('4');
 
   // Opening the artifact from the panel reaches the same frame the bubble uses.
-  await panel.locator('.conversation-info-file[data-artifact-id]').click();
-  await expect(page.locator('.chat-artifact-viewer.is-open')).toBeVisible();
-  await page.locator('.chat-artifact-viewer-close').click();
+  const artifactPreview = await orkas.openPreview(() => panel.locator('.conversation-info-file[data-artifact-id]').click());
+  await expect(artifactPreview.locator('.chat-artifact-viewer.is-open')).toBeVisible();
+  await orkas.closePreview(artifactPreview);
   await page.locator('#conversation-info-toggle').click();
 
   // A reply that embedded the media itself must not gain a second copy.
@@ -180,4 +206,191 @@ test('surfaces produced files, outside files, and artifacts for one conversation
   await expect(pasted.locator('.chat-msg-produced-item')).toHaveCount(1);
   await expect(pasted.locator('img.chat-md-img')).toHaveCount(1);
   await expect(pasted.locator('.chat-msg-produced-media')).toHaveCount(0);
+
+  // A model can retain an earlier audition path while the completed turn
+  // publishes a new same-named narration. The stale player reports 0:00 and
+  // the host-rendered produced player works; once that failure is known, keep
+  // only the usable narration rather than showing two indistinguishable cards.
+  const narrationPath = path.join(wsDir, 'narration.wav');
+  writeFileSync(narrationPath, wavBytes());
+  const staleNarrationPath = path.join(listing.root, 'discarded-audition', 'narration.wav');
+  const staleNarrationUrl = `chat-media://local/${
+    staleNarrationPath.replace(/^\//, '').split('/').map(encodeURIComponent).join('/')
+  }`;
+  appendFileSync(chatFile(cid), `${JSON.stringify({
+    id: 'm_outputs_reply_stale_narration',
+    ts: new Date().toISOString(),
+    from: 'commander',
+    to: ['user'],
+    text: `Narration audition:\n\n[narration.wav](${staleNarrationUrl})`,
+    produced: [narrationPath],
+  })}\n`, 'utf8');
+  await reopen();
+
+  const narration = page.locator('#chat-history .chat-message.assistant').last();
+  await expect(narration.locator('.chat-md-audio-card')).toHaveCount(1);
+  await expect(narration.locator('.chat-msg-produced-media .chat-md-audio')).toHaveJSProperty('duration', 0.1);
+  await expect(narration.locator('.chat-msg-produced-item')).toContainText('narration.wav');
+
+  // Revisit existing files in the body while the footer contains only this
+  // reply's new output. The outside file needs the current conversation scope;
+  // a custom link label must not replace the filename used to select a viewer.
+  const htmlPath = path.join(wsDir, 'previous draft (1).html');
+  writeFileSync(htmlPath, '<!doctype html><html><body><h1>Previous draft</h1></body></html>');
+  const currentPath = path.join(wsDir, 'revision.txt');
+  writeFileSync(currentPath, 'Current revision');
+  appendFileSync(chatFile(cid), `${JSON.stringify({
+    id: 'm_existing_files_reply',
+    ts: new Date().toISOString(),
+    from: 'commander',
+    to: ['user'],
+    text: `Existing references:\n\n[Read the summary](${notesPath}:21)\n\n[Read targets](${outsidePath})\n\n[Open previous draft](<${htmlPath}>)\n\n<span class="file-reference-baseline">正文对齐</span> [正文对齐](${notesPath}:21:5)\n\n[Read relative summary](reports/summary.md#L21)\n\n[Outside relative](<${path.relative(listing.root, outsidePath)}>)\n\n[Missing relative](reports/missing.md)`,
+    produced: [currentPath],
+  })}\n`, 'utf8');
+  await reopen();
+
+  const references = page.locator('#chat-history .chat-message.assistant').last();
+  await expect(references.locator('[data-chat-md-file-open="1"]')).toHaveCount(5);
+  await expect(references.getByRole('button', { name: 'Outside relative' })).toHaveCount(0);
+  await expect(references.getByRole('button', { name: 'Missing relative' })).toHaveCount(0);
+  await expect(references).toContainText('TARGETS.md');
+  await expect(references).toContainText('missing.md');
+  const baselineOffset = await references.evaluate((element) => {
+    const textRect = (selector: string) => {
+      const range = document.createRange();
+      range.selectNodeContents(element.querySelector(selector)!);
+      return range.getBoundingClientRect();
+    };
+    const prose = textRect('.file-reference-baseline');
+    const label = textRect('.file-reference-baseline + .chat-attach-chip .chat-attach-label');
+    return Math.abs(prose.bottom - label.bottom);
+  });
+  expect(baselineOffset).toBeLessThanOrEqual(1);
+  await references.screenshot({ path: testInfo.outputPath('inline-file-references.png') });
+  await expect(references.locator('.chat-msg-produced-item')).toHaveCount(1);
+  await expect(references.locator('.chat-msg-produced-item')).toContainText('revision.txt');
+  let preview: import('@playwright/test').Page;
+  let viewer: import('@playwright/test').Locator;
+  for (const [label, name, content] of [
+    ['Read the summary', 'summary.md', 'Summary'],
+    ['Read targets', 'TARGETS.md', 'Targets'],
+    ['Read relative summary', 'summary.md', 'Summary'],
+  ]) {
+    preview = await orkas.openPreview(() => references.getByRole('button', { name: label, exact: true }).click());
+    viewer = preview.locator('.chat-file-viewer');
+    await expect(viewer).toHaveClass(/\bis-open\b/);
+    await expect(viewer.locator('.chat-file-viewer-title')).toHaveText(name);
+    await expect(viewer.locator('.chat-file-viewer-body')).toContainText(content);
+    await orkas.closePreview(preview);
+  }
+  preview = await orkas.openPreview(() => references.getByRole('button', { name: 'Open previous draft', exact: true }).click());
+  viewer = preview.locator('.chat-file-viewer');
+  await expect(viewer.locator('.chat-file-viewer-title')).toHaveText('previous draft (1).html');
+  await expect(preview.frameLocator('.chat-file-viewer-html').getByRole('heading', { name: 'Previous draft' })).toBeVisible();
+  await orkas.closePreview(preview);
+
+  // A stale reference gives feedback; it neither reopens stale preview content
+  // nor adds the missing file to the turn's outputs.
+  unlinkSync(notesPath);
+  await references.getByRole('button', { name: 'Read the summary', exact: true }).click();
+  await expect(page.locator('.ui-toast')).toContainText('no longer exists');
+  await expect.poll(() => preview.isClosed()).toBe(true);
+  await expect(references.locator('.chat-msg-produced-item')).toHaveCount(1);
+
+  writeFileSync(notesPath, '# Restored summary\nFresh contents after recovery.\n');
+  preview = await orkas.openPreview(() => references.getByRole('button', { name: 'Read the summary', exact: true }).click());
+  viewer = preview.locator('.chat-file-viewer');
+  await expect(viewer).toHaveClass(/\bis-open\b/);
+  await expect(viewer.locator('.chat-file-viewer-body')).toContainText('Fresh contents after recovery.');
+  await orkas.closePreview(preview);
+
+  // A reference-only reply must stay usable after a full renderer reload,
+  // including keyboard activation, without claiming an output for this turn.
+  const longLabel = 'Read the previous summary and its detailed supporting notes from the earlier conversation';
+  appendFileSync(chatFile(cid), `${JSON.stringify({
+    id: 'm_reference_only_reply',
+    ts: new Date().toISOString(),
+    from: 'commander',
+    to: ['user'],
+    text: `Here is the existing reference: [${longLabel}](${notesPath})`,
+  })}\n`, 'utf8');
+  await page.reload();
+  await page.waitForFunction(() => typeof (window as any).setView === 'function');
+  await reopen();
+
+  const referenceOnly = page.locator('#chat-history .chat-message.assistant').last();
+  const card = referenceOnly.getByRole('button', { name: longLabel, exact: true });
+  await expect(card).toBeVisible();
+  await expect(referenceOnly.locator('.chat-msg-produced')).toHaveCount(0);
+  // Long labels remain inside the chip; the full accessible name is retained.
+  const label = card.locator('.chat-attach-label');
+  await expect(label).toHaveCSS('text-overflow', 'ellipsis');
+  expect(await label.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
+  await card.focus();
+  preview = await orkas.openPreview(() => page.keyboard.press('Enter'));
+  viewer = preview.locator('.chat-file-viewer');
+  await expect(viewer).toHaveClass(/\bis-open\b/);
+  await expect(viewer.locator('.chat-file-viewer-title')).toHaveText('summary.md');
+  await expect(viewer.locator('.chat-file-viewer-body')).toContainText('Fresh contents after recovery.');
+  await expect(referenceOnly.locator('.chat-msg-produced')).toHaveCount(0);
+});
+
+test('opens code references from the project task selected directory', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  const uid = 'account-e2e';
+  const { project } = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: 'Code references' });
+  const { conversation } = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+    title: 'Review the code', projectId: project.project_id,
+  });
+  const cid = conversation.conversation_id;
+  // Real persisted device selection, outside the app's default workspace.
+  // These existing source files have never been recorded as produced outputs.
+  const repository = path.join(orkas.root, 'selected repository');
+  mkdirSync(repository);
+  const runner = path.join(repository, 'runner.ts');
+  const bridge = path.join(repository, 'bridge.ts');
+  writeFileSync(runner, 'export const assembleAgent = () => "agent ready";\n');
+  writeFileSync(bridge, 'export const authorizeCli = () => "cli authorized";\n');
+  const selection = path.join(orkas.workspaceRoot, uid, 'local', 'cli-directories', `${cid}.json`);
+  mkdirSync(path.dirname(selection), { recursive: true });
+  writeFileSync(selection, JSON.stringify({ version: 1, directory: repository, explicit: true }));
+  const unavailable = path.join(orkas.root, 'unselected.txt');
+  writeFileSync(unavailable, 'Outside the selected task directory');
+  const history = path.join(orkas.workspaceRoot, uid, 'cloud', 'projects', project.project_id, 'chats', `${cid}.jsonl`);
+  appendFileSync(history, `${JSON.stringify({
+    id: 'm_code_reference', ts: new Date().toISOString(), from: 'commander', to: ['user'],
+    text: `按本次运行条件授予。[Agent 组装逻辑](<${runner}:646>)、[CLI 授权逻辑](bridge.ts#L212)\n\n[Unselected file](<${unavailable}>)`,
+  })}\n`);
+  await page.evaluate(async (id) => {
+    await (window as any).loadConversations();
+    (window as any).setView('conversation', id);
+  }, cid);
+  const reply = page.locator('#chat-history .chat-message.assistant').last();
+  let preview: import('@playwright/test').Page;
+  let viewer: import('@playwright/test').Locator;
+  await expect(reply.getByRole('button', { name: 'Agent 组装逻辑', exact: true })).toBeVisible();
+  await reply.screenshot({ path: testInfo.outputPath('coding-file-references.png') });
+  for (const [label, name, content] of [
+    ['Agent 组装逻辑', 'runner.ts', 'agent ready'],
+    ['CLI 授权逻辑', 'bridge.ts', 'cli authorized'],
+  ]) {
+    preview = await orkas.openPreview(() => reply.getByRole('button', { name: label, exact: true }).click());
+    viewer = preview.locator('.chat-file-viewer');
+    await expect(viewer).toHaveClass(/\bis-open\b/);
+    await expect(viewer.locator('.chat-file-viewer-title')).toHaveText(name);
+    await expect(viewer.locator('.chat-file-viewer-body')).toContainText(content);
+    await expect(reply.locator('.chat-msg-produced')).toHaveCount(0);
+    if (name === 'runner.ts') await viewer.screenshot({ path: testInfo.outputPath('coding-file-preview.png') });
+    await orkas.closePreview(preview);
+  }
+
+  await reply.getByRole('button', { name: 'Unselected file', exact: true }).click();
+  const dialog = page.locator('.ui-dialog-overlay:visible');
+  await expect(dialog).toContainText('Could not read');
+  await expect(page.locator('.ui-toast').filter({ hasText: 'no longer exists' })).toHaveCount(0);
+  await dialog.locator('[data-act="cancel"]').click();
+  await expect.poll(() => preview.isClosed()).toBe(true);
+  preview = await orkas.openPreview(() => reply.getByRole('button', { name: 'Agent 组装逻辑', exact: true }).click());
+  viewer = preview.locator('.chat-file-viewer');
+  await expect(viewer.locator('.chat-file-viewer-body')).toContainText('agent ready');
 });

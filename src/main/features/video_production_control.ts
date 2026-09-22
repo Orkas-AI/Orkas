@@ -7,6 +7,7 @@ import { Mutex } from 'async-mutex';
 import { userLocalRoot } from '../paths';
 import { sha256OfFileStream } from '../util/sha256';
 import { projectVideoApprovalIntent } from './video_approval_identity';
+import { videoProductionIsGeneration } from './video_production_mode';
 import { assessEstimatedNarrationFit, estimateNarrationDuration, narrationMeasurementOverruns } from './tts';
 
 export type VideoProductionGenerationKind = 'image' | 'video';
@@ -83,6 +84,8 @@ export type VideoProductionGenerationTransaction = {
   segment_id: string;
   kind: VideoProductionGenerationKind;
   request_signature: string;
+  /** Signed generation intent, retained when a later local edit re-signs the EDL. */
+  intent_signature?: string;
   output_path: string;
   reserved_output_paths?: string[];
   status: 'pending' | 'completed' | 'failed';
@@ -215,8 +218,19 @@ export type VideoProductionControlStateV1 = {
   };
   transactions: Record<string, VideoProductionGenerationTransaction>;
   transaction_history: VideoProductionGenerationTransaction[];
+  local_outputs?: VideoProductionLocalOutput[];
+  delivery?: { plan_signature: string; output_path: string; output_sha256: string; checked_at: string; result: Record<string, unknown> };
   created_at: string;
   updated_at: string;
+};
+
+export type VideoProductionLocalOutput = {
+  plan_signature: string;
+  output_path: string;
+  output_sha256: string;
+  source_path: string;
+  source_sha256: string;
+  created_at: string;
 };
 
 export type VideoProductionPlanIdentity = {
@@ -1251,6 +1265,7 @@ export async function beginVideoProductionGeneration(input: {
       segment_id: input.segmentId,
       kind: input.kind,
       request_signature: requestSignature,
+      intent_signature: sha256Text(stableJson(intent)),
       output_path: path.resolve(input.outputPath),
       reserved_output_paths: reservedOutputPaths,
       status: 'pending',
@@ -1415,6 +1430,7 @@ export function videoProductionControlSummary(
     schema_version: state.schema_version,
     revision: state.revision,
     plan_signature: identity.signature,
+    is_generation: videoProductionIsGeneration(identity.plan),
     plan_approval_current: state.plan_approval?.signature === identity.signature,
     generation_intent_count: identity.generation_intents.length,
     generation_approval_current: !!state.generation_approval
@@ -1422,6 +1438,10 @@ export function videoProductionControlSummary(
       && state.generation_approval.intent_signature === identity.intent_signature,
     generation_segment_ids: identity.generation_intents.map((intent) => intent.segment_id),
     transaction_history_count: state.transaction_history.length,
+    ...(state.local_outputs?.length ? {
+      current_output: [...state.local_outputs].reverse().find((item) => item.plan_signature === identity.signature) || null,
+      previous_output: state.local_outputs.at(-1),
+    } : {}),
     // The stale error tells the model this record exists; production.status
     // is the model's only read surface, so the claim has to be true HERE.
     // Written without a reader, the invalidation was diagnosable only by a
@@ -1449,4 +1469,78 @@ export function videoProductionControlSummary(
     })),
     updated_at: state.updated_at,
   };
+}
+
+export function videoProductionGenerationSources(identity: VideoProductionPlanIdentity, state: VideoProductionControlStateV1): VideoProductionGenerationTransaction[] {
+  const active = Object.values(state.transactions);
+  return [...active, ...[...state.transaction_history].reverse()].filter((record) => {
+    if (record.status !== 'completed' || record.kind !== 'video' || !record.output_sha256) return false;
+    const intent = identity.generation_intents.find((item) => item.segment_id === record.segment_id && item.kind === 'video');
+    if (!intent) return false;
+    return record.intent_signature
+      ? record.intent_signature === sha256Text(stableJson(intent))
+      : (state.plan_approval?.signature === identity.signature && active.includes(record))
+        || legacyVideoGenerationIntentMatches(record, intent);
+  });
+}
+
+/** Older receipts signed the complete request rather than storing its intent
+ * separately. Reproduce the old video tool's structured request shapes; never
+ * infer legacy ownership from a filename or model-authored runtime annotation. */
+function legacyVideoGenerationIntentMatches(record: VideoProductionGenerationTransaction, intent: VideoProductionGenerationIntent): boolean {
+  const base: Record<string, unknown> = {
+    prompt: intent.prompt, operation: intent.operation || 'generate',
+    reference_image_urls: intent.reference_image_urls || [], reference_image_paths: intent.reference_image_paths || [],
+    reference_video_urls: intent.reference_video_urls || [], reference_video_paths: intent.reference_video_paths || [],
+    generate_audio: intent.generate_audio !== false,
+  };
+  const optional = ['ratio', 'duration', 'resolution', 'quality'] as const;
+  for (let mask = 0; mask < 16; mask += 1) {
+    const request = { ...base };
+    optional.forEach((key, index) => { if (mask & (1 << index) && intent[key] !== undefined) request[key] = intent[key]; });
+    if (generationRequestSignature({ intent, outputPath: record.output_path, request }) === record.request_signature) return true;
+  }
+  return false;
+}
+
+/** Serialize only this plan's local execution. Failed/cancelled/stale edits
+ * never replace the last completed artifact. No paid operation is dispatched. */
+export async function executeVideoProductionLocalEdit(input: {
+  statePath: string;
+  planPath: string;
+  signal?: AbortSignal;
+  execute: (identity: VideoProductionPlanIdentity, state: VideoProductionControlStateV1) => Promise<Omit<VideoProductionLocalOutput, 'plan_signature' | 'created_at'>>;
+  matchesHash?: (path: string, hash: string) => Promise<boolean>;
+}): Promise<{ artifact: VideoProductionLocalOutput; reused: boolean }> {
+  return mutexFor(input.statePath).runExclusive(async () => {
+    if (input.signal?.aborted) throw new Error('E_VIDEO_PRODUCTION_EDIT_CANCELLED');
+    const identity = await readVideoProductionPlanIdentity(input.planPath);
+    const state = await readVideoProductionControlState(input.statePath, input.planPath);
+    if (state.plan_approval?.signature !== identity.signature) throw new Error('E_VIDEO_PRODUCTION_GATE_B_STALE: approve the current local edit plan first');
+    if (videoProductionIsGeneration(identity.plan)) throw new Error('E_VIDEO_PRODUCTION_LOCAL_EDIT_REQUIRED: record the requested local changes in the canonical plan first');
+    const previous = [...(state.local_outputs || [])].reverse().find((item) => item.plan_signature === identity.signature);
+    const matches = input.matchesHash || (async (file: string, hash: string) => await sha256File(file).catch(() => '') === hash);
+    if (previous && await matches(previous.output_path, previous.output_sha256)
+      && await matches(previous.source_path, previous.source_sha256)) return { artifact: previous, reused: true };
+    const result = await input.execute(identity, state);
+    if ((await readVideoProductionPlanIdentity(input.planPath)).signature !== identity.signature) throw new Error('E_VIDEO_PRODUCTION_EDIT_STALE: the plan changed during editing; no new output was registered');
+    if (!await matches(result.source_path, result.source_sha256)
+      || !await matches(result.output_path, result.output_sha256)) throw new Error('E_VIDEO_PRODUCTION_EDIT_ARTIFACT_CHANGED: edit files changed before completion');
+    if (input.signal?.aborted) throw new Error('E_VIDEO_PRODUCTION_EDIT_CANCELLED');
+    const artifact = { ...result, plan_signature: identity.signature, created_at: new Date().toISOString() };
+    state.local_outputs = [...(state.local_outputs || []), artifact].slice(-20);
+    delete state.delivery;
+    state.revision += 1;
+    state.updated_at = artifact.created_at;
+    await writeState(input.statePath, state);
+    return { artifact, reused: false };
+  });
+}
+
+export async function recordVideoProductionDelivery(input: {
+  statePath: string; planPath: string; signature: string; outputPath: string; outputSha256: string; result: Record<string, unknown>;
+}): Promise<void> {
+  await updateState(input.statePath, input.planPath, (state) => {
+    state.delivery = { plan_signature: input.signature, output_path: input.outputPath, output_sha256: input.outputSha256, checked_at: new Date().toISOString(), result: input.result };
+  });
 }

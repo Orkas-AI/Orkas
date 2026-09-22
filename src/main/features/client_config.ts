@@ -6,6 +6,8 @@
  * views such as the provider model catalog.
  */
 
+import * as fs from 'node:fs';
+import type { Lang } from '../i18n';
 import { getActiveUserId, hasActiveUser } from './users';
 import { userRemoteConfigFile } from '../paths';
 import { readJsonSync, writeJsonSync } from '../storage';
@@ -141,20 +143,43 @@ function cacheFile(): string | null {
   }
 }
 
+let remoteConfigSnapshot: { file: string | null; version: string; data: RemoteConfigCache } | undefined;
+let remoteConfigRevision = 0;
+
 function readRemoteConfigCache(): RemoteConfigCache {
+  // Resolve the current account/root on every access. Only unchanged file contents are reused;
+  // an external replacement, account switch, or deletion must take effect on the next read.
   const file = cacheFile();
-  if (!file) return emptyCache();
-  try {
-    return normalizeRemoteConfigCache(readJsonSync(file));
-  } catch {
-    return emptyCache();
+  let version = 'missing';
+  if (file) {
+    try {
+      const stat = fs.statSync(file, { bigint: true });
+      version = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch { /* Missing/unreadable config keeps the existing local-default behavior. */ }
   }
+  if (remoteConfigSnapshot?.file === file && remoteConfigSnapshot.version === version) {
+    return remoteConfigSnapshot.data;
+  }
+  const raw = file && version !== 'missing' ? readJsonSync(file) : emptyCache();
+  const data = normalizeRemoteConfigCache(raw);
+  // storage returns {} on read/parse failure. Do not pin that fallback to an otherwise
+  // unchanged file: a transient IO failure must be recoverable on the next access.
+  remoteConfigSnapshot = raw && Object.keys(raw).length ? { file, version, data } : undefined;
+  remoteConfigRevision += 1;
+  return data;
+}
+
+/** Revision of the current account's persisted config, for derived read-only indexes. */
+export function getRemoteConfigRevision(): number {
+  readRemoteConfigCache();
+  return remoteConfigRevision;
 }
 
 function writeRemoteConfigCache(cache: RemoteConfigCache): void {
   const file = cacheFile();
   if (!file) return;
   writeJsonSync(file, normalizeRemoteConfigCache(cache));
+  remoteConfigSnapshot = undefined;
 }
 
 function promotePendingRestartConfig(): boolean {
@@ -245,10 +270,10 @@ export class ClientConfigManager {
     const k = normalizeKey(key);
     if (!k) return undefined;
     const cache = readRemoteConfigCache();
-    const immediate = normalizeRecord(cache.active?.immediate);
-    if (own(immediate, k)) return immediate[k];
-    const restart = normalizeRecord(cache.active?.restart);
-    if (own(restart, k)) return restart[k];
+    const immediate = cache.active.immediate;
+    if (own(immediate, k)) return structuredClone(immediate[k]);
+    const restart = cache.active.restart;
+    if (own(restart, k)) return structuredClone(restart[k]);
     return undefined;
   }
 
@@ -256,7 +281,7 @@ export class ClientConfigManager {
     const k = normalizeKey(key);
     if (!k) return false;
     const cache = readRemoteConfigCache();
-    return own(normalizeRecord(cache.active?.immediate), k) || own(normalizeRecord(cache.active?.restart), k);
+    return own(cache.active.immediate, k) || own(cache.active.restart, k);
   }
 
   get<T = unknown>(key: string, fallback?: T): T | undefined {
@@ -275,7 +300,7 @@ export class ClientConfigManager {
   }
 
   readCache(): RemoteConfigCache {
-    return readRemoteConfigCache();
+    return structuredClone(readRemoteConfigCache());
   }
 
   lastRequestAtMs(): number {
@@ -576,6 +601,7 @@ export type QuickStartScenarioId =
   | 'office'
   | 'ppt'
   | 'creation'
+  | 'ecommerce'
   | 'video'
   | 'image'
   | 'ui_design'
@@ -625,9 +651,9 @@ export const DEFAULT_IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapa
  */
 export const DEFAULT_QUICK_START_CONFIG: ReadonlyArray<QuickStartConfigEntry> = [
   { id: 'data', agent_id: '78900d8758bc' },
-  { id: 'office', agent_id: 'a19101ba698a' },
+  { id: 'ecommerce', agent_id: '5a1d43c2f28a' },
   { id: 'ppt', agent_id: '7e91cb9ec9e9' },
-  { id: 'creation', agent_id: '173d4235a431' },
+  { id: 'office', agent_id: 'a19101ba698a' },
   { id: 'image', agent_id: '814b61b027f0' },
   { id: 'video', agent_id: '79df9cc89f5f' },
   { id: 'ui_design', agent_id: 'bcfcb4921dce' },
@@ -636,7 +662,7 @@ export const DEFAULT_QUICK_START_CONFIG: ReadonlyArray<QuickStartConfigEntry> = 
 ];
 
 const QUICK_START_SCENARIO_IDS = new Set<QuickStartScenarioId>(
-  DEFAULT_QUICK_START_CONFIG.map((entry) => entry.id),
+  [...DEFAULT_QUICK_START_CONFIG.map((entry) => entry.id), 'creation'],
 );
 let lastInvalidQuickStartConfigHash = '';
 
@@ -667,7 +693,7 @@ function emptyModelCatalog(): ModelCatalogConfig {
   return { providers: {}, imageGeneration: {} };
 }
 
-function normalizeProviderModels(value: unknown): ProviderModelEntry[] | null {
+function normalizeProviderModels(value: unknown, providerId: string): ProviderModelEntry[] | null {
   if (!Array.isArray(value)) return null;
   const out: ProviderModelEntry[] = [];
   const seenIds = new Set<string>();
@@ -753,7 +779,7 @@ function mergeProviderSection(target: Record<string, ProviderModelEntry[]>, valu
   for (const [rawKey, rawModels] of Object.entries(value as Record<string, unknown>)) {
     const key = normalizeKey(rawKey);
     if (!key) continue;
-    const models = normalizeProviderModels(rawModels);
+    const models = normalizeProviderModels(rawModels, key);
     if (models) target[key] = models;
   }
 }

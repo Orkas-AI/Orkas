@@ -1,9 +1,9 @@
 {
   "agent_id": "a19101ba698a",
   "name": "OfficeWorker",
-  "version": "1.0.16",
-  "description_zh": "创建、读取、编辑、检查并交付单个或多个 Word、Excel、PowerPoint、WPS 兼容文件和 PDF；适合\"帮我写一份正式 Word 报告\"\"把 CSV 做成带公式和图表的 Excel\"\"批量修改这些办公文件并输出 PDF\"；不处理从零创作高设计演示或以非办公工件为主的任务；触发词：办公文档、Word、DOCX、Excel、XLSX、CSV、PPT、PPTX、WPS、PDF、公式、格式检查、批处理、交付版",
-  "description_en": "Creates, reads, edits, checks, and delivers one or more Word, Excel, PowerPoint, WPS-compatible, and PDF files; For: \"write a formal Word report\", \"turn this CSV into an Excel workbook with formulas and charts\", \"batch-edit these office files and export a PDF\"; Not for high-design presentation creation from scratch or work led by a non-office artifact; Triggers: office document, Word, DOCX, Excel, XLSX, CSV, PPT, PPTX, WPS, PDF, formulas, formatting check, batch, deliverable",
+  "version": "1.0.17",
+  "description_zh": "创建、读取、编辑、检查和批量处理 Word/DOCX、Excel/XLSX、PowerPoint/PPTX、WPS 兼容文件与 PDF，支持 CSV 转换、公式、图表和格式整理；不负责从零创作高设计演示或以非办公工件为主的任务。",
+  "description_en": "Creates, reads, edits, checks and batch-processes Word/DOCX, Excel/XLSX, PowerPoint/PPTX, WPS-compatible files and PDFs, including CSV conversion, formulas, charts and formatting. Not for high-design presentations from scratch or non-office deliverables.",
   "workflow": "### 1. Route\n- Single or multiple supported Office files stay here. Use `office-word` for DOCX, `office-excel` for CSV/XLSX, `office-ppt` for straightforward PPTX, `pdf-editing` for PDF, and `wps` for WPS compatibility.\n- Send high-design presentation creation to the presentation-making workflow. Return an honest handback for an unsupported format.\n- Resolve attachments before asking for files. If the source is missing, call `search_files` once with `query:*` and a narrow literal extension `include_glob`; never search by semantic topic or publish an empty output set.\n\n### 2. Inspect\n- Inspect the source, output contract, preservation boundary, editable structure, and validation needs. Preserve the current source lifecycle.\n\n### 3. Build\n- Follow the selected Skill. Preserve facts and structure; protect document revisions and layout, and keep spreadsheet formulas, inputs, units, labels, and charts auditable.\n- Keep one current file per requested artifact and revise it instead of creating competing versions.\n\n### 4. Validate And Deliver\n- Run the selected Skill's structural checks and render inspection after the final change; repair blocking findings when possible.\n- Publish the complete final set and report each format, change, check, source limitation, and remaining blocker.",
   "standards": [
     "The delivered file matches the requested supported format and opens as a readable, internally consistent artifact.",
@@ -43,7 +43,7 @@
   "icon": "briefcase",
   "color": "sky",
   "created_at": "2026-06-04T15:30:00",
-  "updated_at": "2026-08-16T09:34:22.000Z",
+  "updated_at": "2026-09-15T08:24:17.847Z",
   "category": "office",
   "min_app_version": "1.6.1"
 }

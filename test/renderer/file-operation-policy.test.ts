@@ -19,8 +19,10 @@ describe('file operation policy', () => {
   });
 
   it.each([
-    'note.md', 'data.json', 'report.pdf', 'document.docx', 'sheet.xlsx', 'slides.pptx',
+    'note.md', 'data.json', 'report.pdf', 'document.docx', 'sheet.xlsx', 'legacy.xls', 'slides.pptx',
     'photo.png', 'clip.mp4', 'voice.mp3', 'skills.zip',
+    'page.html', 'style.css', 'script.js', 'source.py', 'data.jsonl', 'events.ndjson',
+    'config.toml', 'report.tex', 'notes.rst', 'captions.srt', 'captions.vtt',
   ])('allows supported chat attachment %s', (name) => {
     expect(policy.canAddToChat(name)).toBe(true);
   });
@@ -32,7 +34,7 @@ describe('file operation policy', () => {
   });
 
   it.each([
-    'page.html', 'style.css', 'script.js', 'source.py', 'legacy.doc',
+    'legacy.doc',
     'vector.svg', 'font.woff2', 'module.wasm',
   ])('does not advertise Add to chat for unsupported %s', (name) => {
     expect(policy.canAddToChat(name)).toBe(false);
@@ -40,7 +42,7 @@ describe('file operation policy', () => {
 
   it.each([
     'note.md', 'page.html', 'style.css', 'script.js', 'source.py', 'report.pdf',
-    'document.docx', 'sheet.xlsx', 'slides.pptx', 'photo.png',
+    'document.docx', 'sheet.xlsx', 'legacy.xls', 'slides.pptx', 'photo.png',
   ])('allows common Library file %s', (name) => {
     expect(policy.canAddToLibrary(name)).toBe(true);
   });

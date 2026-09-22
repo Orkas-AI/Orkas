@@ -93,6 +93,7 @@ function loadSettingsClickHarness(
     'settings-picker-model',
     'settings-add-entry-btn',
     'settings-picker-status',
+    'settings-add-modal',
     'add-account-modal',
     'add-account-title',
     'add-account-body',
@@ -307,6 +308,11 @@ describe('settings model authorization add account', () => {
     expect(settingsSource).toContain('class="form-hint custom-model-intro"');
     expect(settingsSource).toMatch(/type="password" class="api-key-input\b/);
     expect(settingsSource).toMatch(/type="password" class="custom-key-input\b/);
+    const customForm = settingsSource.slice(
+      settingsSource.indexOf('function _settingsShowCustomModelForm'),
+      settingsSource.indexOf('function _settingsOpenModal'),
+    );
+    expect(customForm).toContain('_settingsCloseAddModal();');
     for (const inputId of [
       'settings-search-key-input',
       'settings-image-key-input',

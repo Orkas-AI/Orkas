@@ -48,29 +48,53 @@ describe('public model catalog', () => {
     ]);
   });
 
-  it('publishes DeepSeek V4.1 Flash and the V4 models with their official limits', () => {
+  it('publishes DeepSeek V4.1 Flash and the V4 models with their window and the host output reservation', () => {
     expect(PUBLIC_PROVIDER_MODELS.deepseek?.map((model) => model.id)).toEqual([
       'deepseek-flash',
       'deepseek-v4-pro',
       'deepseek-v4-flash-vision-exp',
       'deepseek-v4-flash',
     ]);
+    expect(PUBLIC_PROVIDER_MODELS.deepseek?.map((model) => model.contextWindow))
+      .toEqual([1_000_000, 1_000_000, 1_000_000, 1_000_000]);
     expect(PUBLIC_PROVIDER_MODELS.deepseek?.[0]).toMatchObject({
       name: 'DeepSeek V4.1 Flash',
-      contextWindow: 1_048_576,
-      maxTokens: 384_000,
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
       supportsVision: true,
       maxInputImages: 600,
     });
     expect(PUBLIC_PROVIDER_MODELS.deepseek?.[2]).toMatchObject({
       name: 'DeepSeek V4 Flash Vision',
-      contextWindow: 1_048_576,
-      maxTokens: 384_000,
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
       supportsVision: true,
       maxInputImages: 600,
     });
     expect(PUBLIC_PROVIDER_MODELS.deepseek?.[1]).toMatchObject({ supportsVision: false });
     expect(PUBLIC_PROVIDER_MODELS.deepseek?.[3]).toMatchObject({ supportsVision: false });
+  });
+
+  // `maxTokens` is the host's output reservation and is subtracted from the
+  // window; a row where it is not smaller than the window has no room for
+  // input at all. The Doubao Seed 2.1 rows once mirrored a vendor spec that
+  // lists a 256K output on a 256K window; the runtime sanitizer still guards
+  // the shape, but the catalog itself must not ship it.
+  it('reserves less output than the window on every row that declares both', () => {
+    const violators: string[] = [];
+    for (const [provider, models] of Object.entries(PUBLIC_PROVIDER_MODELS)) {
+      for (const model of models) {
+        if (typeof model.contextWindow !== 'number' || typeof model.maxTokens !== 'number') continue;
+        if (model.maxTokens >= model.contextWindow) violators.push(`${provider}/${model.id}`);
+      }
+    }
+    expect(violators).toEqual([]);
+    expect(PUBLIC_PROVIDER_MODELS.doubao?.filter((m) => m.id.startsWith('doubao-seed-2-1-')).map((m) => m.maxTokens))
+      .toEqual([32768, 32768]);
+    expect(PUBLIC_PROVIDER_MODELS.doubao?.slice(0, 2)).toMatchObject([
+      { id: 'doubao-seed-2-1-pro-260915', contextWindow: 1_000_000, maxTokens: 32768 },
+      { id: 'doubao-seed-2-1-turbo-260628', contextWindow: 256000, maxTokens: 32768 },
+    ]);
   });
 
   it('keeps the explicitly curated OpenRouter shortcut set', () => {
@@ -109,21 +133,25 @@ describe('public model catalog', () => {
 
   it('declares compatibility metadata for models newer than older runtimes', () => {
     for (const provider of ['openai', 'openai-codex'] as const) {
+      // GPT windows belong to the SDK catalog, including compatibility templates.
       expect(PUBLIC_PROVIDER_MODELS[provider]?.[0]).toEqual({
         id: 'gpt-6-astra',
         name: 'GPT-6 Astra',
+        maxTokens: 128_000,
         maxInputImages: 20,
       });
       for (const model of PUBLIC_PROVIDER_MODELS[provider]?.slice(1, 4) || []) {
         expect(model.template).toBe('gpt-5.5');
-        expect(model.contextWindow).toBeGreaterThan(0);
-        expect(model.maxTokens).toBe(128000);
+        expect(model.contextWindow).toBeUndefined();
+        // 64K is the host's output reservation, not
+        // OpenAI's 128K ceiling; the request itself carries no limit.
+        expect(model.maxTokens).toBe(64000);
       }
     }
     expect(PUBLIC_PROVIDER_MODELS['kimi-coding']?.[0]).toMatchObject({
       id: 'k3',
       template: 'kimi-for-coding',
-      contextWindow: 1048576,
+      contextWindow: 1_000_000,
       maxTokens: 131072,
     });
   });

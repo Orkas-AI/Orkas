@@ -14,6 +14,13 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
+// Hidden source E2E runs must opt out of Dock activation before Main imports
+// or Electron's ready event. Visible debugging keeps the normal app policy.
+if (process.defaultApp === true && process.platform === 'darwin'
+    && String(process.env.ORKAS_E2E_HIDE_WINDOW || '').trim() === '1') {
+  require('electron').app.setActivationPolicy('accessory');
+}
+
 for (const arg of process.argv.slice(1)) {
   if (typeof arg !== 'string') continue;
   if (arg.startsWith('--orkas-profile=')) {

@@ -5,25 +5,38 @@ import * as path from 'node:path';
 
 import {
   SKILL_DESCRIPTION_AUTHORING_MAX_CHARS,
-  SKILL_DESCRIPTION_AUTHORING_MIN_CHARS,
-  SKILL_DESCRIPTION_ROSTER_MAX_CHARS,
+  SKILL_DESCRIPTION_ROSTER_MAX_TOKENS,
 } from '../../../src/main/util/skill-description-policy';
 
 const UID = 'system-skills-user';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let logDeliveries: ReturnType<typeof import('../../../src/main/util/log-delivery').createLogDelivery>[];
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.doUnmock('node:fs');
   vi.doUnmock('../../../src/main/paths');
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-system-skills-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  logDeliveries = [];
+  const delivery = await import('../../../src/main/util/log-delivery');
+  const create = delivery.createLogDelivery;
+  vi.spyOn(delivery, 'createLogDelivery').mockImplementation((...args) => {
+    const instance = create(...args);
+    logDeliveries.push(instance);
+    return instance;
+  });
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // Account activation starts a real log worker. Drain and close it before
+  // removing its directory so late file creation cannot race the teardown.
+  try {
+    for (const delivery of logDeliveries) await vi.waitFor(() => expect(delivery.stats().pending).toBe(0));
+  } finally { await Promise.all(logDeliveries.map(delivery => delivery.close())); }
   if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -71,7 +84,48 @@ function frontmatterOf(md: string): string {
   return md.slice(4, end);
 }
 
+async function capturePrivateWarnings(scope: string): Promise<unknown[][]> {
+  const logger = await import('../../../src/main/logger');
+  const createLogger = logger.createLogger;
+  const records: unknown[][] = [];
+  vi.spyOn(logger, 'createLogger').mockImplementation((name) => {
+    const scoped = createLogger(name);
+    if (name !== scope) return scoped;
+    return { ...scoped, warn: (message: string, ...args: unknown[]) => {
+      records.push([message, ...args].map((value) => logger.redact(value)));
+    } };
+  });
+  return records;
+}
+
 describe('system skills reconciliation', () => {
+  it.each(['packaged', 'local'] as const)('keeps %s manifest diagnostics private and preserves recovery', async (kind) => {
+    const records = await capturePrivateWarnings('system-skills');
+    const paths = await import('../../../src/main/paths');
+    const packagedRoot = path.join(tmpDir, 'packaged');
+    const packagedManifest = path.join(packagedRoot, '_system.json');
+    fs.mkdirSync(path.join(packagedRoot, 'creator'), { recursive: true });
+    fs.writeFileSync(path.join(packagedRoot, 'creator', 'SKILL.md'), 'creator body');
+    const valid = JSON.stringify([{ id: 'creator', update_at: 1 }]);
+    fs.writeFileSync(packagedManifest, kind === 'packaged' ? 'CONFIDENTIAL' : valid);
+    fs.mkdirSync(paths.userSystemSkillsDir(UID), { recursive: true });
+    fs.writeFileSync(paths.userSystemSkillsManifestFile(UID), kind === 'local' ? 'CONFIDENTIAL' : '[]');
+    vi.doMock('../../../src/main/paths', async () => ({
+      ...await vi.importActual<typeof import('../../../src/main/paths')>('../../../src/main/paths'),
+      packagedSystemSkillsDir: () => packagedRoot,
+      packagedSystemSkillsManifestFile: () => packagedManifest,
+    }));
+    const skills = await import('../../../src/main/features/system_skills');
+    if (kind === 'packaged') expect(skills.listPackagedSystemSkillIds()).toEqual([]);
+    const result = await skills.reconcileAllForUser(UID);
+    expect(result[0].action).toBe(kind === 'packaged' ? 'invalid_manifest' : 'created');
+    fs.writeFileSync(packagedManifest, valid);
+    expect((await skills.reconcileAllForUser(UID))[0].action).toBe(kind === 'packaged' ? 'created' : 'skipped');
+    expect(fs.readFileSync(path.join(paths.userSystemSkillDir(UID, 'creator'), 'SKILL.md'), 'utf8')).toBe('creator body');
+    expect(records.length).toBeGreaterThan(0);
+    expect(JSON.stringify(records)).not.toContain('CONFIDENTIAL');
+  });
+
   it('copies packaged creator skills into the active user local system root', async () => {
     const users = await import('../../../src/main/features/users');
     const systemSkills = await import('../../../src/main/features/system_skills');
@@ -83,6 +137,7 @@ describe('system skills reconciliation', () => {
       ['agent-creator', 'created'],
       ['package-installer', 'created'],
       ['skill-creator', 'created'],
+      ['web-app-sdk', 'created'],
 
     ]);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), 'SKILL.md'))).toBe(true);
@@ -119,6 +174,7 @@ describe('system skills reconciliation', () => {
       ['agent-creator', 'created'],
       ['package-installer', 'created'],
       ['skill-creator', 'created'],
+      ['web-app-sdk', 'created'],
 
     ]);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'agent-creator'), 'SKILL.md'))).toBe(true);
@@ -137,6 +193,7 @@ describe('system skills reconciliation', () => {
     fs.writeFileSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), '_system.json'), '{}');
     const skipped = await systemSkills.reconcileAllForActiveUser();
     expect(skipped.map((r) => r.action)).toEqual([
+      'skipped',
       'skipped',
       'skipped',
       'skipped',
@@ -186,6 +243,7 @@ describe('system skills reconciliation', () => {
   });
 
   it('retries failed reconciliation twice', async () => {
+    const records = await capturePrivateWarnings('system-skills');
     const users = await import('../../../src/main/features/users');
     const systemSkills = await import('../../../src/main/features/system_skills');
     const paths = await import('../../../src/main/paths');
@@ -195,20 +253,24 @@ describe('system skills reconciliation', () => {
     fs.rmSync(skillsRoot, { recursive: true, force: true });
     fs.mkdirSync(path.dirname(skillsRoot), { recursive: true });
     fs.writeFileSync(skillsRoot, 'temporarily blocks directory creation');
-    let checks = 0;
+    let repaired = false;
 
     const results = await systemSkills.reconcileAllForUserWithRetry(UID, {
       retries: 2,
       delayMs: 0,
       reason: 'test',
       shouldContinue: () => {
-        checks += 1;
-        if (checks === 3) fs.rmSync(skillsRoot, { force: true });
+        if (!repaired && records.some((row) => String(row[0]).startsWith('system skill reconcile retry 2/2'))) {
+          fs.rmSync(skillsRoot, { force: true });
+          repaired = true;
+        }
         return true;
       },
     });
 
-    expect(checks).toBe(3);
+    expect(records.filter((row) => String(row[0]).startsWith('system skill reconcile retry'))).toHaveLength(2);
+    expect(records.length).toBeGreaterThan(0);
+    expect(JSON.stringify(records)).not.toContain(tmpDir);
     expect(results.find((r) => r.id === 'agent-creator')?.action).toBe('created');
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), 'SKILL.md'))).toBe(true);
   });
@@ -379,6 +441,7 @@ describe('system skill contracts', () => {
       'agent-creator',
       'package-installer',
       'skill-creator',
+      'web-app-sdk',
     ];
     for (const id of ids) {
       const fm = frontmatterOf(packagedSystemSkill(id));
@@ -431,7 +494,7 @@ describe('system skill contracts', () => {
     expect(md).toContain('Do not re-emit unchanged package files');
   });
 
-  it('pins skill-creator description guidance to the runtime roster boundary', () => {
+  it('keeps skill-creator descriptions complete without a minimum length or padding', () => {
     const md = packagedSystemSkillBundle('skill-creator');
     expect(md).toContain('normally one or two sentences containing');
     expect(md).toContain('Core capability and delivery');
@@ -440,10 +503,15 @@ describe('system skill contracts', () => {
     expect(md).toContain('without quoting sample requests or adding a separate keyword list');
     expect(md).toContain('When authoring or repairing a description, use the same compact routing index as SKILL.md frontmatter');
     expect(md).toContain(
-      `aim for ${SKILL_DESCRIPTION_AUTHORING_MIN_CHARS}–${SKILL_DESCRIPTION_AUTHORING_MAX_CHARS} characters without padding`,
+      `aim for no more than ${SKILL_DESCRIPTION_AUTHORING_MAX_CHARS} characters`,
     );
-    expect(md).toContain(`at or below ${SKILL_DESCRIPTION_ROSTER_MAX_CHARS} characters`);
-    expect(md).toContain('preserve the complete description up to that boundary');
+    expect(md).toContain('only the detail needed for complete routing');
+    expect(md).toContain('exceed this target only when needed to preserve routing information');
+    expect(md).toContain('no minimum length');
+    expect(md).toContain('no need to pad');
+    expect(md).not.toMatch(/aim for \d+[–-]\d+ characters/);
+    expect(md).toContain(`at or below ${SKILL_DESCRIPTION_ROSTER_MAX_TOKENS} estimated tokens`);
+    expect(md).toContain('preserve the complete description up to that token boundary');
     // Roster overflow degrades lower-priority rows to their name; the guide
     // must not promise that a description always reaches the prompt.
     expect(md).toContain('when the roster exceeds its budget, lower-priority non-builtin entries are listed by name only and stay discoverable through `skill_search`');

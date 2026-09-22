@@ -1,4 +1,5 @@
 import { fileFailure, type FileFailureDiagnostic } from "./file-diagnostics.js";
+import { matchRecoveryContext } from "./match-context.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -271,8 +272,10 @@ export function parseApplyPatch(patch: unknown): ParsedPatchFile[] | ToolResult 
         hunkLines.push({ kind, text: line.slice(1) });
         index++;
       }
-      if (!hunkLines.some((line) => line.kind === "+" || line.kind === "-")) {
-        return invalid("E_PATCH_FORMAT", `${filePath}: each hunk must add or remove at least one line`, "hunk_without_changes", { line: hunkLine, file_index: files.length + 1, hunk_index: hunks.length + 1, added_lines: 0, removed_lines: 0, context_lines: hunkLines.length });
+      // Context-only hunks constrain the next search through the normal matcher
+      // and cursor. Dropping them could apply a later edit to the wrong location.
+      if (hunkLines.length === 0) {
+        return invalid("E_PATCH_FORMAT", `${filePath}: a hunk must contain context, added, or removed lines`, "hunk_without_changes", { line: hunkLine, file_index: files.length + 1, hunk_index: hunks.length + 1, added_lines: 0, removed_lines: 0, context_lines: 0 });
       }
       hunks.push({
         ...(locator ? { header: locator } : {}),
@@ -313,13 +316,14 @@ export function applyPatchHunks(
   original: string,
   filePath: string,
   hunks: readonly ParsedPatchHunk[],
-): { content: string } | ToolResult {
+): { content: string } | (ToolResult & { candidateLines?: number[] }) {
   const eol = original.includes("\r\n") ? "\r\n" : "\n";
   const normalized = original.replace(/\r\n?/g, "\n");
   let trailingNewline = normalized.endsWith("\n");
   const lines = normalized.split("\n");
   if (trailingNewline) lines.pop();
   let cursor = 0;
+  let lineDelta = 0;
 
   for (let hunkIndex = 0; hunkIndex < hunks.length; hunkIndex++) {
     const hunk = hunks[hunkIndex];
@@ -347,6 +351,7 @@ export function applyPatchHunks(
           ),
           isError: true,
           observations: fileFailure("E_PATCH_AMBIGUOUS", "insertion_without_anchor", { stage: "match", hunk_index: hunkIndex + 1, match_count: anchorPositions.length }),
+          candidateLines: anchorPositions.slice(0, 3).map((at) => at - lineDelta + 1),
         };
       }
     } else {
@@ -370,6 +375,7 @@ export function applyPatchHunks(
           ),
           isError: true,
           observations: fileFailure("E_PATCH_AMBIGUOUS", "ambiguous_match", { stage: "match", hunk_index: hunkIndex + 1, match_count: positions.length }),
+          candidateLines: positions.slice(0, 3).map((at) => at - lineDelta + 1),
         };
       }
       position = positions[0];
@@ -377,6 +383,9 @@ export function applyPatchHunks(
 
     lines.splice(position, before.length, ...after);
     cursor = position + after.length;
+    // Candidates after the cursor are in the untouched original tail. Report
+    // their original rows, since this transaction has not committed any bytes.
+    lineDelta += after.length - before.length;
     if (hunk.endOfFile && hunk.noNewlineAtEnd) trailingNewline = false;
   }
   return { content: lines.join(eol) + (trailingNewline && lines.length ? eol : "") };
@@ -453,8 +462,25 @@ function callbackError(value: void | ToolResult): ToolResult | null {
 export function createApplyPatchTool(hooks: ApplyPatchToolHooks = {}): AgentTool {
   return defineTool({
     name: "apply_patch",
+    // Adapted from Codex 3d2ee51 core/assets/tools/apply_patch.lark: retain
+    // Orkas's required @@ hunks, empty adds and no-newline markers. Grammar
+    // constrains syntax only; the parser and host still own all validation.
+    // pi-ai maps Responses custom input back to { patch: string }.
+    constrainedSampling: {
+      type: "grammar",
+      variants: {
+        openai_lark: String.raw`start: "*** Begin Patch" NL file+ "*** End Patch" NL*
+file: "*** Add File:" TEXT NL ("+" TEXT? NL | no_nl)*
+    | "*** Delete File:" TEXT NL
+    | "*** Update File:" TEXT NL ("*** Move to:" TEXT NL)? hunk+
+hunk: "@@" TEXT? NL ((" " | "+" | "-") TEXT? NL | no_nl)+ ("*** End of File" NL)?
+no_nl: "\\ No newline at end of file" NL
+TEXT: /[^\r\n]+/
+NL: /\r\n|\r|\n/`,
+      },
+    },
     description:
-      "Apply one transactional patch across existing or new text files. Read existing targets first; validation or conflicts leave every target unchanged. Use a targeted edit tool for one small replacement.",
+      "Apply multiple known edits in one transactional patch to one or more existing or new text files. Read existing targets first; validation or conflicts leave every target unchanged. Use a targeted edit tool for one small replacement.",
     inputSchema: {
       type: "object",
       properties: {
@@ -622,9 +648,14 @@ export function createApplyPatchTool(hooks: ApplyPatchToolHooks = {}): AgentTool
           if (operation.type === "delete") continue;
           const applied = applyPatchHunks(current, file.sourceAbs, operation.hunks);
           if ("isError" in applied && applied.isError) {
+            const { candidateLines, ...failure } = applied;
+            const recovery = candidateLines?.length
+              ? `<patch-recovery>\n${matchRecoveryContext(current, currentHash,
+                candidateLines.map((line) => ({ line })), applied.observations!.fileFailure!.match_count!, 1600)}\n</patch-recovery>`
+              : recoveryContext(current, currentHash);
             return {
-              ...applied,
-              content: `${applied.content}\n${recoveryContext(current, currentHash)}`,
+              ...failure,
+              content: `${failure.content}\n${recovery}`,
             };
           }
           if (applied.content === current && file.destinationAbs === file.sourceAbs) {

@@ -33,7 +33,7 @@
         <button class="sidebar-btn" id="skills-btn"><span data-ui-icon="sparkles" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.skills">Skills</span></button>
         <button class="sidebar-btn" id="connectors-btn"><span data-ui-icon="plug" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.connectors">Connectors</span></button>
         <button class="sidebar-btn" id="contexts-btn"><span data-ui-icon="database" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.contexts">Library</span></button>
-        <button class="sidebar-btn" id="apps-btn"><span data-ui-icon="layout-grid" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.apps">My Apps</span></button>
+        <button class="sidebar-btn" id="apps-btn"><span data-ui-icon="layout-grid" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.apps">Apps</span></button>
       </div>
       <div class="sidebar-conversation-nav">
         <div class="sidebar-section sidebar-today-section">
@@ -78,14 +78,6 @@
         </div>
       </div>
       <div class="sidebar-footer-actions">
-        <button type="button" class="sb-connect" id="new-chat-external-agent-btn">
-          <span class="sb-connect-ic"><span data-ui-icon="terminal" data-ui-icon-class="sb-connect-icon"></span></span>
-          <span class="sb-connect-tx">
-            <b data-i18n="sidebar.connect_agent">Connect agents</b>
-            <small data-i18n="sidebar.connect_agent_sub">Claude Code · Codex &amp; more</small>
-          </span>
-          <span data-ui-icon="plus" data-ui-icon-class="sb-connect-plus"></span>
-        </button>
         <div class="sidebar-footer-action-row">
           <button class="sidebar-footer-btn" id="settings-btn" data-i18n-title="sidebar.settings_title" title="Settings">
             <span data-ui-icon="settings" data-ui-icon-class="sidebar-footer-icon"></span>
@@ -270,6 +262,7 @@
                     </button>
                   </div>
                   <button id="chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
+                    <span data-ui-icon="check" data-ui-icon-class="queue-save-icon"></span>
                     <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
                     <span data-ui-icon="stop" data-ui-icon-class="stop-icon"></span>
                   </button>
@@ -277,8 +270,8 @@
               </div>
             </div>
           </div>
-          <aside class="conversation-info-panel" id="conversation-info-panel" hidden>
-            <div class="conversation-info-resize" id="conversation-info-resize" role="separator"
+          <aside class="conversation-info-panel task-side-panel" id="conversation-info-panel" hidden>
+            <div class="conversation-info-resize task-side-panel-resize" id="conversation-info-resize" role="separator"
                  tabindex="0" aria-orientation="vertical"
                  data-i18n-title="conversation_info.resize" data-i18n-aria-label="conversation_info.resize"
                  title="Resize task details" aria-label="Resize task details"></div>
@@ -334,9 +327,11 @@
                production straight from production state. Read-only; its
                action buttons only prefill the composer.
                See modules/video-review-panel.js. -->
-          <aside class="chat-md-drawer-panel video-review-panel" id="video-review-panel" hidden>
+          <aside class="video-review-panel task-side-panel" id="video-review-panel" hidden>
+            <div class="task-side-panel-resize" id="video-review-resize" role="separator"
+                 tabindex="0" aria-orientation="vertical" aria-labelledby="video-review-panel-title"></div>
             <div class="chat-md-drawer-header">
-              <div class="chat-md-drawer-title" data-i18n="video_review.title">Video production</div>
+              <div class="chat-md-drawer-title" id="video-review-panel-title" data-i18n="video_review.title">Video production</div>
               <div class="chat-md-drawer-actions detail-actions">
                 <button type="button" class="btn btn-sm" id="video-review-panel-refresh"
                         data-i18n="video_review.refresh">Refresh</button>
@@ -356,9 +351,19 @@
         <div class="skills-grid-view" id="skills-grid-view">
           <div class="skills-grid-header">
             <span data-i18n="skills.title">Skills</span>
-            <div class="header-actions">
-              <button class="btn btn-sm" id="create-skill-btn" data-i18n="skills.add">+ Create</button>
-              <button class="btn btn-sm" id="skills-more-btn" data-i18n="skills.more_btn">More</button>
+            <!-- Skills entry cluster. Same named-entry treatment as the AI
+                 Team header above: the icon carries the old `+`, and each
+                 label says what it opens. Ids and targets are unchanged:
+                 `skills-more-btn` still opens the skill marketplace. -->
+            <div class="header-actions header-entry-actions">
+              <button class="btn header-entry-btn header-entry-btn-create" id="create-skill-btn">
+                <span data-ui-icon="plus" data-ui-icon-class="header-entry-icon"></span>
+                <span data-i18n="skills.add">Create skill</span>
+              </button>
+              <button class="btn header-entry-btn header-entry-btn-market" id="skills-more-btn">
+                <span data-ui-icon="shopping-cart" data-ui-icon-class="header-entry-icon"></span>
+                <span data-i18n="skills.more_btn">Skill marketplace</span>
+              </button>
             </div>
           </div>
           <div class="marketplace-reconcile-banner" data-reconcile-banner data-reconcile-kind="skill" style="display:none"></div>
@@ -466,9 +471,28 @@
               <span class="agents-grid-title" data-i18n="agents.title">AI Team</span>
               <span class="agents-grid-subtitle" data-i18n="agents.subtitle">Every member is an agent — @ it, form squads, assign tasks.</span>
             </div>
-            <div class="header-actions">
-              <button class="btn btn-sm" id="create-agent-btn" data-i18n="agents.create_btn">+ Create</button>
-              <button class="btn btn-sm" id="agents-more-btn" data-i18n="agents.more_btn">More</button>
+            <!-- AI Team entry cluster. The old icon-less `+ Create` / `More`
+                 chips were too small to find, so each entry now names what it
+                 opens and the coding-CLI flow — previously only the create
+                 dialog's second tab — gets its own button. Ids and targets are
+                 unchanged: `agents-more-btn` still opens the agent
+                 marketplace. -->
+            <div class="header-actions header-entry-actions">
+              <button class="btn header-entry-btn header-entry-btn-create" id="create-agent-btn">
+                <span data-ui-icon="plus" data-ui-icon-class="header-entry-icon"></span>
+                <span data-i18n="agents.create_btn">Create agent</span>
+              </button>
+              <button class="btn header-entry-btn header-entry-btn-cli" id="agents-connect-cli-btn">
+                <span data-ui-icon="terminal" data-ui-icon-class="header-entry-icon"></span>
+                <span class="header-entry-copy">
+                  <span data-i18n="agents.connect_cli_btn">Connect an agent</span>
+                  <small data-i18n="agents.connect_cli_sub">Claude Code / Codex CLIs</small>
+                </span>
+              </button>
+              <button class="btn header-entry-btn header-entry-btn-market" id="agents-more-btn">
+                <span data-ui-icon="shopping-cart" data-ui-icon-class="header-entry-icon"></span>
+                <span data-i18n="agents.market_btn">Agent marketplace</span>
+              </button>
             </div>
           </div>
           <div class="marketplace-reconcile-banner" data-reconcile-banner data-reconcile-kind="agent" style="display:none"></div>
@@ -751,39 +775,57 @@
               </div>
               <aside class="project-detail-side" aria-label="Project resources">
                 <section class="project-side-card project-side-context">
+                  <!-- Head is two rows: the card identity, then the context
+                       type tabs. Instructions and memory are different
+                       long-lived stores, so the tabs get their own line
+                       instead of sharing one 44px strip with the title. -->
                   <div class="project-side-card-head project-side-card-head-tabs">
-                    <div class="project-side-card-title-wrap">
-                      <span class="project-side-card-title" data-i18n="project.context.title">Context</span>
+                    <div class="project-side-card-head-top">
+                      <div class="project-side-card-title-wrap">
+                        <span class="project-side-card-title" data-i18n="project.context.title">Context</span>
+                      </div>
+                      <span class="project-side-card-scope" data-i18n="project.context.scope">Shared by every conversation</span>
                     </div>
                     <div class="project-side-tabs" role="tablist" data-project-side-tabs="context">
                       <button type="button" class="project-side-tab is-active" data-project-side-tab="instructions">
-                        <span data-i18n="project.context.instructions_tab">Instructions</span>
+                        <span data-i18n="project.context.instructions_tab">Goals &amp; rules</span>
                       </button>
                       <button type="button" class="project-side-tab" data-project-side-tab="memory">
                         <span data-i18n="project.context.memory_tab">Memory</span>
                         <span class="project-side-tab-count" id="project-memory-count"></span>
                       </button>
                     </div>
-                    <button type="button" class="project-side-icon-btn" id="project-memory-add-btn"
-                            data-project-context-action="memory" hidden
-                            data-i18n-title="project.memory.add" title="Add memory"
-                            data-i18n-aria-label="project.memory.add" aria-label="Add memory">
-                      <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
-                    </button>
                   </div>
+                  <!-- Instructions read first, edit on demand: the saved rules
+                       are what every conversation actually gets, so the panel
+                       shows them as copy and moves the editor into a dialog
+                       instead of parking an empty textarea in the rail. -->
                   <div class="project-side-panel project-side-instructions-panel" data-project-side-panel="instructions">
-                    <p class="project-context-help" data-i18n="project.instructions.subtitle">Set project goals, priorities, and rules. The AI follows them in every conversation.</p>
-                    <textarea class="project-instructions-input" id="project-instructions-input" rows="5"
-                              data-i18n-placeholder="project.instructions.placeholder"
-                              placeholder="Rules and context every conversation in this project should follow"></textarea>
-                    <div class="project-instructions-foot">
-                      <span class="project-instructions-counter muted" id="project-instructions-counter"></span>
-                      <button type="button" class="btn btn-sm btn-primary" id="project-instructions-save-btn"
-                              data-i18n="project.instructions.save" disabled>Save</button>
+                    <div class="project-context-section-head">
+                      <h3 class="project-context-section-title" data-i18n="project.instructions.heading">Rules in effect</h3>
+                      <button type="button" class="btn btn-sm project-context-action" id="project-instructions-edit-btn"
+                              data-i18n="common.edit">Edit</button>
                     </div>
+                    <div class="project-instructions-read" id="project-instructions-read"></div>
+                    <div class="project-instructions-empty" id="project-instructions-empty" hidden>
+                      <p class="project-context-help" data-i18n="project.instructions.subtitle">Set project goals, priorities, and rules. The AI follows them in every conversation.</p>
+                      <button type="button" class="btn btn-sm" id="project-instructions-setup-btn"
+                              data-i18n="project.instructions.setup">Set goals and rules</button>
+                    </div>
+                    <div class="project-context-status" id="project-instructions-status" role="status"></div>
                   </div>
                   <div class="project-side-panel project-side-memory-panel" data-project-side-panel="memory" hidden>
-                    <p class="project-context-help" data-i18n="project.memory.subtitle">Record project facts, decisions, and progress for the AI to reference in future conversations.</p>
+                    <!-- Same shape as the rules panel: guidance while the
+                         store is empty, heading once there is something to
+                         read. -->
+                    <div class="project-context-section-head" id="project-memory-section-head" hidden>
+                      <h3 class="project-context-section-title" data-i18n="project.memory.heading">Saved facts and decisions</h3>
+                      <button type="button" class="btn btn-sm project-context-action" id="project-memory-add-btn"
+                              data-project-context-action="memory" hidden
+                              data-i18n="project.memory.add_short"
+                              data-i18n-title="project.memory.add" title="Add memory"
+                              data-i18n-aria-label="project.memory.add" aria-label="Add memory">Add</button>
+                    </div>
                     <div class="project-memory-editor" id="project-memory-editor" hidden>
                       <textarea class="project-memory-editor-input" id="project-memory-editor-input" rows="3" maxlength="2500"
                                 data-i18n-placeholder="project.memory.placeholder" placeholder="Record a durable fact, decision, or project update"></textarea>
@@ -796,14 +838,32 @@
                       </div>
                     </div>
                     <div class="project-side-card-list project-memory-list" id="project-memory-list"></div>
-                    <div class="empty muted" id="project-memory-empty" data-i18n="project.memory.empty">No project memory yet</div>
+                    <div class="empty project-memory-empty-state" id="project-memory-empty">
+                      <p class="project-context-help" data-i18n="project.memory.subtitle">Record project facts, decisions, and progress for the AI to reference in future conversations.</p>
+                      <button type="button" class="btn btn-sm" id="project-memory-add-empty-btn"
+                              data-i18n="project.memory.add">Add memory</button>
+                    </div>
                   </div>
                 </section>
 
                 <section class="project-side-card project-side-resources">
                   <div class="project-side-card-head project-side-card-head-tabs">
-                    <div class="project-side-card-title-wrap">
-                      <span class="project-side-card-title" data-i18n="project.resources.title">Resources</span>
+                    <div class="project-side-card-head-top">
+                      <div class="project-side-card-title-wrap">
+                        <span class="project-side-card-title" data-i18n="project.resources.title">Resources</span>
+                      </div>
+                      <button type="button" class="project-side-icon-btn" id="project-add-agent-btn"
+                              data-project-resource-action="agents"
+                              data-i18n-title="project.bindings.add_agent" title="Add"
+                              data-i18n-aria-label="project.bindings.add_agent" aria-label="Add">
+                        <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
+                      </button>
+                      <button type="button" class="project-side-icon-btn project-library-add-btn ctx-row-menu-btn ctx-root-menu-btn" id="project-library-root-menu-btn"
+                              data-project-resource-action="files" hidden
+                              data-i18n-title="contexts.menu.more_actions" title="More actions"
+                              data-i18n-aria-label="contexts.menu.more_actions" aria-label="More actions">
+                        <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
+                      </button>
                     </div>
                     <div class="project-side-tabs" role="tablist" data-project-side-tabs="resources">
                       <button type="button" class="project-side-tab is-active" data-project-side-tab="agents">
@@ -815,18 +875,6 @@
                         <span class="project-side-tab-count" id="project-detail-files-count"></span>
                       </button>
                     </div>
-                    <button type="button" class="project-side-icon-btn" id="project-add-agent-btn"
-                            data-project-resource-action="agents"
-                            data-i18n-title="project.bindings.add_agent" title="Add"
-                            data-i18n-aria-label="project.bindings.add_agent" aria-label="Add">
-                      <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
-                    </button>
-                    <button type="button" class="project-side-icon-btn project-library-add-btn ctx-row-menu-btn ctx-root-menu-btn" id="project-library-root-menu-btn"
-                            data-project-resource-action="files" hidden
-                            data-i18n-title="contexts.menu.more_actions" title="More actions"
-                            data-i18n-aria-label="contexts.menu.more_actions" aria-label="More actions">
-                      <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
-                    </button>
                   </div>
                   <div class="project-side-panel project-side-agents-panel" data-project-side-panel="agents">
                     <div class="project-side-card-list project-agent-rail-list" id="project-agents-list"></div>
@@ -841,6 +889,36 @@
                 </section>
 
               </aside>
+            </div>
+
+            <!-- Goals & rules editor. The rail shows saved rules; writing
+                 them happens here so the draft has room and never looks like
+                 the live value. Save path is unchanged. -->
+            <div class="modal-overlay project-instructions-modal" id="project-instructions-modal" aria-hidden="true">
+              <div class="modal project-instructions-dialog" role="dialog" aria-modal="true" aria-labelledby="project-instructions-dialog-title">
+                <div class="modal-header">
+                  <h3 class="modal-title" id="project-instructions-dialog-title" data-i18n="project.instructions.edit_title">Goals and rules</h3>
+                  <button type="button" class="modal-close-btn" id="project-instructions-close-btn"
+                          data-i18n-title="common.close" title="Close"
+                          data-i18n-aria-label="common.close" aria-label="Close">
+                    <span data-ui-icon="x" data-ui-icon-class="modal-close-icon"></span>
+                  </button>
+                </div>
+                <div class="modal-body">
+                  <p class="project-context-help" data-i18n="project.instructions.subtitle">Set project goals, priorities, and rules. The AI follows them in every conversation.</p>
+                  <textarea class="project-instructions-input" id="project-instructions-input" rows="12"
+                            data-i18n-placeholder="project.instructions.placeholder"
+                            placeholder="Rules and context every conversation in this project should follow"></textarea>
+                </div>
+                <div class="project-instructions-foot">
+                  <span class="project-instructions-counter muted" id="project-instructions-counter"></span>
+                  <span class="project-instructions-foot-actions">
+                    <button type="button" class="btn btn-sm" id="project-instructions-cancel-btn" data-i18n="common.cancel">Cancel</button>
+                    <button type="button" class="btn btn-sm btn-primary" id="project-instructions-save-btn"
+                            data-i18n="project.instructions.save" disabled>Save</button>
+                  </span>
+                </div>
+              </div>
             </div>
 
             <div class="modal-overlay project-library-viewer-modal" id="project-library-viewer-modal" aria-hidden="true">
@@ -933,8 +1011,7 @@
         <div class="contexts-layout">
           <div class="contexts-tree-col" id="contexts-tree-col">
             <div class="contexts-section-header">
-              <span data-ui-icon="folder" data-ui-icon-class="contexts-section-folder-icon"></span>
-              <span class="contexts-section-title" data-i18n="contexts.tree_title">Files</span>
+              <div id="contexts-project-select" class="contexts-project-select ai-select-compact"></div>
               <span class="contexts-section-count" id="contexts-tree-count"></span>
               <button type="button" class="ctx-row-menu-btn ctx-root-menu-btn" id="ctx-root-menu-btn"
                       data-i18n-title="contexts.menu.more_actions" title="More actions"
@@ -992,10 +1069,13 @@
           <div class="apps-page-header">
             <div class="apps-page-header-main">
               <div class="apps-page-header-title-row">
-                <h1 class="apps-page-header-title" data-i18n="apps.title">My Apps</h1>
+                <h1 class="apps-page-header-title" data-i18n="apps.title">Apps</h1>
                 <span class="apps-page-header-count" id="apps-page-header-count"></span>
               </div>
             </div>
+            <button type="button" class="btn btn-sm" id="apps-create-btn" aria-haspopup="dialog">
+              <span data-ui-icon="plus" aria-hidden="true"></span><span data-i18n="apps.create">Create</span>
+            </button>
           </div>
           <div class="agents-grid-scroll">
             <div class="apps-grid" id="apps-grid"></div>
@@ -1007,299 +1087,275 @@
       <!-- Settings -->
       <section class="panel" id="panel-settings">
         <div class="settings-container">
-          <div class="settings-header">
-            <div class="settings-heading">
-              <h2 data-i18n="settings.title">Settings</h2>
+          <div class="settings-nav">
+            <div class="settings-header">
+              <div class="settings-heading">
+                <h2 data-i18n="settings.title">Settings</h2>
+              </div>
             </div>
-          </div>
-          <div class="settings-tabs" role="tablist">
-            <button class="settings-tab is-active" data-settings-tab="data" data-i18n="settings.tab.data">数据</button>
-            <button class="settings-tab" data-settings-tab="credentials" data-i18n="settings.tab.credentials">配置</button>
-            <button class="settings-tab" data-settings-tab="general" data-i18n="settings.tab.general">通用</button>
+            <div class="settings-tabs" role="tablist" aria-orientation="horizontal">
+              <button class="settings-tab is-active" type="button" role="tab" aria-selected="true" data-settings-tab="data"><span data-ui-icon="database" data-ui-icon-class="settings-tab-icon"></span><span class="settings-tab-label" data-i18n="settings.tab.data">数据</span></button>
+              <button class="settings-tab" type="button" role="tab" aria-selected="false" tabindex="-1" data-settings-tab="credentials"><span data-ui-icon="sparkles" data-ui-icon-class="settings-tab-icon"></span><span class="settings-tab-label" data-i18n="settings.tab.credentials">Models</span></button>
+              <button class="settings-tab" type="button" role="tab" aria-selected="false" tabindex="-1" data-settings-tab="general"><span data-ui-icon="settings" data-ui-icon-class="settings-tab-icon"></span><span class="settings-tab-label" data-i18n="settings.tab.general">通用</span></button>
+            </div>
           </div>
 
           <div class="settings-body">
-
             <!-- ───────────────────────── 数据 ───────────────────────── -->
             <div class="settings-tab-pane" data-settings-pane="data">
-              <!-- ─── 记忆 ───────────────────────────────────────────────
-                   Entry card into the memory detail page (#panel-memory). The
-                   whole card is clickable; memory.js binds the handler + fills
-                   the count. Personal cross-session memory, not team-shared. -->
-              <div class="settings-section-head" data-i18n="memory.section">记忆</div>
-              <button type="button" class="memory-entry-card" id="memory-entry-card">
-                <span class="memory-entry-icon" data-ui-icon="sparkles"></span>
-                <span class="memory-entry-body">
-                  <span class="memory-entry-title" data-i18n="memory.entry_title">记忆</span>
-                  <!-- desc carries a live count → filled by memory.js (_memRefreshEntryCount); no data-i18n (can't interpolate {n}). -->
-                  <span class="memory-entry-desc" id="memory-entry-desc"></span>
-                </span>
-                <span class="memory-entry-chevron" data-ui-icon="chevron-right"></span>
-              </button>
+              <div class="settings-page">
+                <header class="settings-page-head">
+                  <h1 data-i18n="settings.tab.data">数据</h1>
+                  <p data-i18n="settings.data.page_sub">管理记忆、回收站与本地数据。</p>
+                </header>
 
-              <!-- ─── 本地 ───────────────────────────────────────────────
-                   Maintenance actions on local data; not synced. -->
-              <div class="settings-section-head" data-i18n="settings.section.local">本地</div>
+                <section class="settings-section" id="settings-section-memory">
+                  <div class="settings-sheet">
+                    <button type="button" class="settings-row settings-row-btn memory-entry-card" id="memory-entry-card">
+                      <span class="memory-entry-icon" data-ui-icon="sparkles"></span>
+                      <span class="settings-row-copy memory-entry-body">
+                        <span class="settings-row-title memory-entry-title" data-i18n="memory.entry_title">记忆</span>
+                        <span class="settings-row-desc memory-entry-desc" id="memory-entry-desc"></span>
+                      </span>
+                      <span class="memory-entry-chevron" data-ui-icon="chevron-right"></span>
+                    </button>
+                  </div>
+                </section>
 
-              <div class="settings-group">
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.data_root.title">Data root</div>
-                  <div class="settings-group-sub" data-i18n="settings.data_root.sub">All conversations, agents, skills, and Library content live under this directory. Click the path to open it in the OS file manager.</div>
-                </div>
-                <div class="settings-row">
-                  <button class="btn btn-sm" id="settings-data-root-btn" type="button" title="" data-i18n-title="settings.data_root.open_tooltip"><span id="settings-data-root-path" class="muted"></span></button>
-                </div>
+                <section class="settings-section" id="settings-section-local">
+                  <div class="settings-section-title">
+                    <h2 data-i18n="settings.section.local">本地</h2>
+                    <span class="settings-section-hint" data-i18n="settings.data.local_hint">仅此设备</span>
+                  </div>
+                  <div class="settings-sheet">
+                    <div class="settings-row settings-data-root-row">
+                      <div class="settings-row-copy">
+                        <div class="settings-row-title" data-i18n="settings.data_root.title">Data root</div>
+                        <div class="settings-row-desc" data-i18n="settings.data_root.sub">All conversations, agents, skills, and Library content live under this directory. Click the path to open it in the OS file manager.</div>
+                        <span class="settings-mono" id="settings-data-root-path"></span>
+                      </div>
+                      <button class="btn btn-sm" id="settings-data-root-btn" type="button" title="" data-i18n-title="settings.data_root.open_tooltip" data-i18n="settings.data_root.open">打开目录</button>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="settings-section" id="settings-recycle-group">
+                  <div class="settings-section-title">
+                    <div class="settings-section-copy">
+                      <h2 data-i18n="settings.recycle.title">回收站</h2>
+                      <p class="settings-section-sub" data-i18n="settings.recycle.sub">本机删除会保留完整快照，可手动恢复或删除。</p>
+                    </div>
+                  </div>
+                  <div class="settings-sheet settings-recycle-body" id="settings-recycle-body">
+                    <div class="settings-empty" data-i18n="settings.recycle.empty">暂无可恢复数据</div>
+                  </div>
+                </section>
               </div>
-
-              <div class="settings-group" id="settings-recycle-group">
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.recycle.title">回收站</div>
-                  <div class="settings-group-sub" data-i18n="settings.recycle.sub">本机删除会保留完整快照，可手动恢复或删除。</div>
-                </div>
-                <div class="settings-recycle-body" id="settings-recycle-body">
-                  <div class="settings-empty" data-i18n="settings.recycle.empty">暂无可恢复数据</div>
-                </div>
-              </div>
-
             </div>
 
             <!-- ───────────────────────── 通用 ───────────────────────── -->
             <div class="settings-tab-pane" data-settings-pane="general" hidden>
-              <div class="settings-group">
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.language.title">语言 / Language</div>
-                </div>
-                <div class="settings-row" id="settings-language-row">
-                  <div class="ai-select" id="settings-language-select"></div>
-                </div>
-              </div>
+              <div class="settings-page">
+                <header class="settings-page-head">
+                  <h1 data-i18n="settings.tab.general">通用</h1>
+                  <p data-i18n="settings.general.page_sub">调整使用偏好与智能体权限。</p>
+                </header>
 
-              <div class="settings-group">
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.task_notifications.title">任务通知</div>
-                  <div class="settings-group-sub" data-i18n="settings.task_notifications.sub">当 Orkas 不在前台时，在任务完成、失败或需要你操作时发送系统通知。</div>
-                </div>
-                <div class="settings-row">
-                  <label class="settings-toggle">
-                    <input type="checkbox" id="settings-task-notifications-toggle" checked />
-                    <span data-i18n="settings.task_notifications.toggle">启用</span>
-                  </label>
-                </div>
-                <div class="settings-row settings-task-notification-permission" id="settings-task-notification-permission" role="status" aria-live="polite" hidden>
-                  <span class="settings-task-notification-permission-text" id="settings-task-notification-permission-text" data-i18n="settings.task_notifications.permission_disabled">系统已关闭 Orkas 的通知权限。请前往系统设置开启，否则无法收到任务进度提醒。</span>
-                  <button type="button" class="btn btn-sm" id="settings-task-notification-open-settings" data-i18n="settings.task_notifications.open_settings">打开系统设置</button>
-                </div>
-              </div>
+                <section class="settings-section">
+                  <div class="settings-section-title">
+                    <h2 data-i18n="settings.general.preferences_title">使用偏好</h2>
+                  </div>
+                  <div class="settings-sheet">
+                    <div class="settings-row" id="settings-language-row">
+                      <div class="settings-row-copy">
+                        <div class="settings-row-title" data-i18n="settings.language.title">语言 / Language</div>
+                        <div class="settings-row-desc" data-i18n="settings.language.sub">设置 Orkas 的界面语言</div>
+                      </div>
+                      <div class="ai-select settings-row-select" id="settings-language-select"></div>
+                    </div>
+                    <div class="settings-row">
+                      <div class="settings-row-copy">
+                        <div class="settings-row-title" id="settings-task-notifications-title" data-i18n="settings.task_notifications.title">任务通知</div>
+                        <div class="settings-row-desc" data-i18n="settings.task_notifications.sub">当 Orkas 不在前台时，在任务完成、失败或需要你操作时发送系统通知。</div>
+                      </div>
+                      <label class="toggle-switch settings-switch">
+                        <input type="checkbox" id="settings-task-notifications-toggle" checked aria-labelledby="settings-task-notifications-title" />
+                      </label>
+                    </div>
+                    <div class="settings-row settings-task-notification-permission" id="settings-task-notification-permission" role="status" aria-live="polite" hidden>
+                      <span class="settings-task-notification-permission-text" id="settings-task-notification-permission-text" data-i18n="settings.task_notifications.permission_disabled">系统已关闭 Orkas 的通知权限。请前往系统设置开启，否则无法收到任务进度提醒。</span>
+                      <button type="button" class="btn btn-sm" id="settings-task-notification-open-settings" data-i18n="settings.task_notifications.open_settings">打开系统设置</button>
+                    </div>
+                  </div>
+                </section>
 
-              <div class="settings-group">
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.localexec.title">Local operation permissions</div>
-                  <div class="settings-group-sub" data-i18n="settings.localexec.sub">Control which files agents can access and whether they must ask before running sensitive commands, deleting files, accessing sensitive folders, or performing administrator-level actions.</div>
-                </div>
-                <div class="settings-row settings-mode-list" id="settings-localexec-modes">
-                  <label class="settings-mode-opt">
-                    <input type="radio" name="localexec-mode" value="workspace_approval" />
-                    <span class="settings-mode-text">
-                      <span class="settings-mode-label" data-i18n="settings.localexec.mode.workspace_approval">Cautious</span>
-                      <span class="settings-mode-desc" data-i18n="settings.localexec.mode.workspace_approval_desc">Workspace files only, approve sensitive actions</span>
-                    </span>
-                  </label>
-                  <label class="settings-mode-opt">
-                    <input type="radio" name="localexec-mode" value="all_files_approval" />
-                    <span class="settings-mode-text">
-                      <span class="settings-mode-label" data-i18n="settings.localexec.mode.all_files_approval">Standard</span>
-                      <span class="settings-mode-desc" data-i18n="settings.localexec.mode.all_files_approval_desc">All files, approve sensitive actions</span>
-                    </span>
-                  </label>
-                  <label class="settings-mode-opt">
-                    <input type="radio" name="localexec-mode" value="all_files_auto" />
-                    <span class="settings-mode-text">
-                      <span class="settings-mode-label" data-i18n="settings.localexec.mode.all_files_auto">Trusted</span>
-                      <span class="settings-mode-desc" data-i18n="settings.localexec.mode.all_files_auto_desc">All files, no sensitive approvals</span>
-                    </span>
-                  </label>
-                </div>
-              </div>
-
-              <div class="settings-group">
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.metacognition.title">Automatic agent review</div>
-                  <div class="settings-group-sub" data-i18n="settings.metacognition.sub">When enabled, agents periodically review recent performance, learn from it, and adjust how they work. Disable it to stop automatic reviews.</div>
-                </div>
-                <div class="settings-row">
-                  <label class="settings-toggle">
-                    <input type="checkbox" id="settings-metacognition-toggle" />
-                    <span data-i18n="settings.metacognition.toggle">Enable</span>
-                  </label>
-                  <span class="settings-status muted" id="settings-metacognition-status"></span>
-                </div>
+                <section class="settings-section">
+                  <div class="settings-section-title">
+                    <h2 data-i18n="settings.general.agent_title">智能体行为</h2>
+                  </div>
+                  <div class="settings-sheet">
+                    <div class="settings-row settings-row-stack">
+                      <div class="settings-row-copy">
+                        <div class="settings-row-title" data-i18n="settings.localexec.title">Local operation permissions</div>
+                        <div class="settings-row-desc" data-i18n="settings.localexec.sub">Control which files agents can access and whether they must ask before running sensitive commands, deleting files, accessing sensitive folders, or performing administrator-level actions.</div>
+                      </div>
+                      <div class="settings-mode-list" id="settings-localexec-modes" role="radiogroup">
+                        <label class="settings-mode-opt">
+                          <input type="radio" name="localexec-mode" value="workspace_approval" />
+                          <span class="settings-mode-text">
+                            <span class="settings-mode-label" data-i18n="settings.localexec.mode.workspace_approval">Cautious</span>
+                            <span class="settings-mode-desc" data-i18n="settings.localexec.mode.workspace_approval_desc">Workspace files only, approve sensitive actions</span>
+                          </span>
+                        </label>
+                        <label class="settings-mode-opt">
+                          <input type="radio" name="localexec-mode" value="all_files_approval" />
+                          <span class="settings-mode-text">
+                            <span class="settings-mode-label" data-i18n="settings.localexec.mode.all_files_approval">Standard</span>
+                            <span class="settings-mode-desc" data-i18n="settings.localexec.mode.all_files_approval_desc">All files, approve sensitive actions</span>
+                          </span>
+                        </label>
+                        <label class="settings-mode-opt">
+                          <input type="radio" name="localexec-mode" value="all_files_auto" />
+                          <span class="settings-mode-text">
+                            <span class="settings-mode-label" data-i18n="settings.localexec.mode.all_files_auto">Trusted</span>
+                            <span class="settings-mode-desc" data-i18n="settings.localexec.mode.all_files_auto_desc">All files, no sensitive approvals</span>
+                          </span>
+                        </label>
+                      </div>
+                    </div>
+                    <div class="settings-row">
+                      <div class="settings-row-copy">
+                        <div class="settings-row-title" id="settings-metacognition-title" data-i18n="settings.metacognition.title">Automatic agent review</div>
+                        <div class="settings-row-desc" data-i18n="settings.metacognition.sub">When enabled, agents periodically review recent performance, learn from it, and adjust how they work. Disable it to stop automatic reviews.</div>
+                        <span class="settings-status muted" id="settings-metacognition-status"></span>
+                      </div>
+                      <label class="toggle-switch settings-switch">
+                        <input type="checkbox" id="settings-metacognition-toggle" aria-labelledby="settings-metacognition-title" />
+                      </label>
+                    </div>
+                  </div>
+                </section>
               </div>
             </div>
 
-            <!-- ───────────────────────── 配置 ───────────────────────── -->
+            <!-- ───────────────────────── 模型 ───────────────────────── -->
             <div class="settings-tab-pane" data-settings-pane="credentials" hidden>
-              <div class="settings-group settings-orkas-api-group" id="settings-orkas-api-group">
-                <div class="settings-group-head settings-orkas-api-head">
-                  <div class="settings-group-head-main">
-                    <div class="settings-group-title" data-i18n="settings.orkas_api.title">Orkas API Key</div>
-                    <div class="settings-group-sub" data-i18n="settings.orkas_api.sub">This shared credential is used by Orkas models, media, search, and credit-based connectors.</div>
-                  </div>
-                  <button type="button" class="btn btn-sm" id="settings-orkas-api-create-key" data-i18n="settings.orkas_api.create_key">Create API Key</button>
-                </div>
-                <div class="settings-orkas-api-saved" id="settings-orkas-api-saved" hidden>
-                  <div class="settings-orkas-api-key-summary">
-                    <code id="settings-orkas-api-key-masked"></code>
-                  </div>
-                  <div class="settings-orkas-api-actions">
-                    <button type="button" class="btn btn-sm" id="settings-orkas-api-edit" data-i18n="settings.orkas_api.edit">Edit</button>
-                    <button type="button" class="btn btn-sm btn-danger" id="settings-orkas-api-delete" data-i18n="settings.orkas_api.delete">Delete</button>
-                  </div>
-                </div>
-                <div class="settings-row settings-orkas-api-configure-row" id="settings-orkas-api-editor">
-                  <input type="password" class="form-input" id="settings-orkas-api-key-input" autocomplete="new-password" spellcheck="false" data-i18n-placeholder="settings.orkas_api.key_placeholder" placeholder="Enter API Key" />
-                  <div class="settings-orkas-api-editor-actions">
-                    <button type="button" class="btn" id="settings-orkas-api-cancel" data-i18n="common.cancel" hidden>Cancel</button>
-                    <button type="button" class="btn btn-primary" id="settings-orkas-api-configure" data-i18n="settings.orkas_api.configure">Configure</button>
-                  </div>
-                </div>
-                <div class="settings-status settings-orkas-api-status" id="settings-orkas-api-status" aria-live="polite"></div>
-              </div>
-              <div class="settings-section-note" data-i18n="settings.section.models_note">API keys and authorization data are stored only on this device — never synced or sent elsewhere.</div>
+              <div class="settings-page">
+                <header class="settings-page-head">
+                  <h1 data-i18n="settings.tab.credentials">Models</h1>
+                  <p data-i18n="settings.models.page_sub">按用途配置服务，设置默认模型与备用顺序。</p>
+                </header>
 
-              <div class="settings-group settings-model-auth-group">
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.add_auth_title">Add model account</div>
-                  <div class="settings-group-sub" data-i18n="settings.add_auth_sub">Choose a model or enter a custom endpoint, then sign in or add an API key.</div>
-                </div>
-                <div class="settings-row">
-                  <label data-i18n="settings.provider">Provider</label>
-                  <div class="ai-select" id="settings-picker-provider"></div>
-                </div>
-                <div class="settings-row" id="settings-picker-model-row">
-                  <label data-i18n="settings.model">Model</label>
-                  <div class="ai-select" id="settings-picker-model"></div>
-                </div>
-                <div class="settings-row settings-model-auth-actions">
-                  <button class="btn btn-primary" id="settings-add-entry-btn" data-i18n="settings.add_account">+ Add account</button>
-                  <span class="settings-status" id="settings-picker-status"></span>
+                <div class="settings-group settings-orkas-api-group" id="settings-orkas-api-group">
+                  <div class="settings-group-head settings-orkas-api-head">
+                    <div class="settings-group-head-main">
+                      <div class="settings-group-title" data-i18n="settings.orkas_api.title">Orkas API Key</div>
+                      <div class="settings-group-sub" data-i18n="settings.orkas_api.sub">This shared credential is used by Orkas models, media, search, and credit-based connectors.</div>
+                    </div>
+                    <button type="button" class="btn btn-sm" id="settings-orkas-api-create-key" data-i18n="settings.orkas_api.create_key">Create API Key</button>
+                  </div>
+                  <div class="settings-orkas-api-saved" id="settings-orkas-api-saved" hidden>
+                    <div class="settings-orkas-api-key-summary">
+                      <code id="settings-orkas-api-key-masked"></code>
+                    </div>
+                    <div class="settings-orkas-api-actions">
+                      <button type="button" class="btn btn-sm" id="settings-orkas-api-edit" data-i18n="settings.orkas_api.edit">Edit</button>
+                      <button type="button" class="btn btn-sm btn-danger" id="settings-orkas-api-delete" data-i18n="settings.orkas_api.delete">Delete</button>
+                    </div>
+                  </div>
+                  <div class="settings-row settings-orkas-api-configure-row" id="settings-orkas-api-editor">
+                    <input type="password" class="form-input" id="settings-orkas-api-key-input" autocomplete="new-password" spellcheck="false" data-i18n-placeholder="settings.orkas_api.key_placeholder" placeholder="Enter API Key" />
+                    <div class="settings-orkas-api-editor-actions">
+                      <button type="button" class="btn" id="settings-orkas-api-cancel" data-i18n="common.cancel" hidden>Cancel</button>
+                      <button type="button" class="btn btn-primary" id="settings-orkas-api-configure" data-i18n="settings.orkas_api.configure">Configure</button>
+                    </div>
+                  </div>
+                  <div class="settings-status settings-orkas-api-status" id="settings-orkas-api-status" aria-live="polite"></div>
                 </div>
 
-                <div class="settings-group-subsection">
-                  <div class="settings-group-head">
-                    <div class="settings-group-title" data-i18n="settings.configured_title">Configured (by priority)</div>
-                    <div class="settings-group-sub" data-i18n="settings.configured_sub">The first entry is the default model; later entries are the fallback chain. Drag to reorder.</div>
+                <div class="settings-note settings-section-note">
+                  <span data-ui-icon="lock" data-ui-icon-class="settings-note-icon"></span>
+                  <span data-i18n="settings.section.models_note">API keys and authorization data are stored only on this device — never synced or sent elsewhere.</span>
+                </div>
+
+                <div class="settings-subnav" role="tablist" aria-orientation="horizontal" data-i18n-aria-label="settings.models.subnav_aria" aria-label="Model purpose">
+                  <button type="button" class="settings-subnav-tab is-active" role="tab" id="settings-model-tab-chat" aria-selected="true" aria-controls="settings-model-panel-chat" data-settings-model-tab="chat" data-i18n="settings.models.chat">对话</button>
+                  <button type="button" class="settings-subnav-tab" role="tab" id="settings-model-tab-search" aria-selected="false" tabindex="-1" aria-controls="settings-model-panel-search" data-settings-model-tab="search" data-i18n="settings.models.search">搜索</button>
+                  <button type="button" class="settings-subnav-tab" role="tab" id="settings-model-tab-image" aria-selected="false" tabindex="-1" aria-controls="settings-model-panel-image" data-settings-model-tab="image" data-i18n="settings.models.image">图片</button>
+                  <button type="button" class="settings-subnav-tab" role="tab" id="settings-model-tab-video" aria-selected="false" tabindex="-1" aria-controls="settings-model-panel-video" data-settings-model-tab="video" data-i18n="settings.models.video">视频</button>
+                  <button type="button" class="settings-subnav-tab" role="tab" id="settings-model-tab-tts" aria-selected="false" tabindex="-1" aria-controls="settings-model-panel-tts" data-settings-model-tab="tts" data-i18n="settings.models.tts">语音</button>
+                </div>
+
+                <div class="settings-model-panel" id="settings-model-panel-chat" role="tabpanel" aria-labelledby="settings-model-tab-chat" data-settings-model-panel="chat">
+                  <div class="settings-list-head">
+                    <div class="settings-section-copy">
+                      <h2 data-i18n="settings.models.chat_title">对话模型</h2>
+                      <p class="settings-section-sub" data-i18n="settings.configured_sub">The first entry is the default model; later entries are the fallback chain. Drag to reorder.</p>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-primary settings-add-btn" data-settings-add="chat" data-i18n="settings.models.add_chat">添加模型</button>
                   </div>
-                  <div class="settings-entries" id="settings-entries">
+                  <div class="settings-sheet settings-entries" id="settings-entries">
+                    <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                  </div>
+                  <p class="settings-foot-note" data-i18n="settings.models.order_hint">拖动列表调整优先级，也可使用上下箭头。停用的官方模型不参与轮转。</p>
+                </div>
+
+                <div class="settings-model-panel" id="settings-model-panel-search" role="tabpanel" aria-labelledby="settings-model-tab-search" data-settings-model-panel="search" hidden>
+                  <div class="settings-list-head">
+                    <div class="settings-section-copy">
+                      <h2 data-i18n="settings.models.search_title">搜索服务</h2>
+                      <p class="settings-section-sub" data-i18n="settings.models.search_sub">配置独立搜索服务的使用优先级。</p>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-primary settings-add-btn" data-settings-add="search" data-i18n="settings.models.add_search">添加搜索服务</button>
+                  </div>
+                  <div class="settings-sheet settings-entries" id="settings-search-entries">
+                    <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                  </div>
+                  <p class="settings-foot-note" data-i18n="settings.search.sub">Search uses these in order: configured search services, the model's built-in search, then free local search.</p>
+                </div>
+
+                <div class="settings-model-panel" id="settings-model-panel-image" role="tabpanel" aria-labelledby="settings-model-tab-image" data-settings-model-panel="image" hidden>
+                  <div class="settings-list-head">
+                    <div class="settings-section-copy">
+                      <h2 data-i18n="settings.models.image_title">图片生成</h2>
+                      <p class="settings-section-sub" data-i18n="settings.models.image_sub">按服务商与模型配置独立生成服务。</p>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-primary settings-add-btn" data-settings-add="image" data-i18n="settings.models.add_image">添加图片服务</button>
+                  </div>
+                  <div class="settings-sheet settings-entries" id="settings-image-entries">
+                    <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                  </div>
+                  <p class="settings-foot-note" data-i18n="settings.image.sub">If no separate service is configured, the current model will be used when it uses an API key and supports image generation.</p>
+                </div>
+
+                <div class="settings-model-panel" id="settings-model-panel-video" role="tabpanel" aria-labelledby="settings-model-tab-video" data-settings-model-panel="video" hidden>
+                  <div class="settings-list-head">
+                    <div class="settings-section-copy">
+                      <h2 data-i18n="settings.models.video_title">视频生成</h2>
+                      <p class="settings-section-sub" data-i18n="settings.models.video_sub">管理视频服务及其备用顺序。</p>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-primary settings-add-btn" data-settings-add="video" data-i18n="settings.models.add_video">添加视频服务</button>
+                  </div>
+                  <div class="settings-sheet settings-entries" id="settings-video-entries">
                     <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
                   </div>
                 </div>
-              </div>
 
-              <div class="settings-group">
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.search.title">Search API Key</div>
-                  <div class="settings-group-sub" data-i18n="settings.search.sub">Search uses these in order: configured search services, the model's built-in search, then free local search.</div>
-                </div>
-                <div class="settings-row">
-                  <label data-i18n="settings.search.provider">Provider</label>
-                  <div class="ai-select" id="settings-search-provider"></div>
-                </div>
-                <div class="settings-row">
-                  <label data-i18n="settings.search.api_key">API Key</label>
-                  <input type="password" class="form-input" id="settings-search-key-input" autocomplete="new-password" spellcheck="false" />
-                </div>
-                <div class="settings-row">
-                  <button class="btn btn-primary" id="settings-search-add-btn" data-i18n="settings.search.add">+ Add search key</button>
-                  <span class="settings-status" id="settings-search-status"></span>
-                </div>
-                <div class="settings-entries" id="settings-search-entries">
-                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                <div class="settings-model-panel" id="settings-model-panel-tts" role="tabpanel" aria-labelledby="settings-model-tab-tts" data-settings-model-panel="tts" hidden>
+                  <div class="settings-list-head">
+                    <div class="settings-section-copy">
+                      <h2 data-i18n="settings.models.tts_title">语音合成</h2>
+                      <p class="settings-section-sub" data-i18n="settings.models.tts_sub">管理语音服务；根据服务商显示所需参数。</p>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-primary settings-add-btn" data-settings-add="tts" data-i18n="settings.models.add_tts">添加语音服务</button>
+                  </div>
+                  <div class="settings-sheet settings-entries" id="settings-tts-entries">
+                    <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                  </div>
+                  <p class="settings-foot-note" data-i18n="settings.models.tts_note">已知服务使用预设参数。自定义服务需填写 Base URL、模型和音色。</p>
                 </div>
               </div>
-
-              <div class="settings-group">
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.image.title">Image generation API Key</div>
-                  <div class="settings-group-sub" data-i18n="settings.image.sub">API for the generate_image tool. Falls back to chat keys when those target OpenAI or Google.</div>
-                </div>
-                <div class="settings-row">
-                  <label data-i18n="settings.image.provider">Provider</label>
-                  <div class="ai-select" id="settings-image-provider"></div>
-                </div>
-                <div class="settings-row">
-                  <label data-i18n="settings.image.api_key">API Key</label>
-                  <input type="password" class="form-input" id="settings-image-key-input" autocomplete="new-password" spellcheck="false" />
-                </div>
-                <div class="settings-row">
-                  <button class="btn btn-primary" id="settings-image-add-btn" data-i18n="settings.image.add">+ Add image key</button>
-                  <span class="settings-status" id="settings-image-status"></span>
-                </div>
-                <div class="settings-entries" id="settings-image-entries">
-                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
-                </div>
-              </div>
-
-              <div class="settings-group">
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.video.title">Video generation API Key</div>
-                  <div class="settings-group-sub" data-i18n="settings.video.sub">API key for video generation providers.</div>
-                </div>
-                <div class="settings-row">
-                  <label data-i18n="settings.video.provider">Provider</label>
-                  <div class="ai-select" id="settings-video-provider"></div>
-                </div>
-                <div class="settings-row" id="settings-video-key-row">
-                  <label data-i18n="settings.video.api_key">API Key</label>
-                  <input type="password" class="form-input" id="settings-video-key-input" autocomplete="new-password" spellcheck="false" />
-                </div>
-                <div class="settings-row">
-                  <button class="btn btn-primary" id="settings-video-add-btn" data-i18n="settings.video.add">+ Add video key</button>
-                  <span class="settings-status" id="settings-video-status"></span>
-                </div>
-                <div class="settings-entries" id="settings-video-entries">
-                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
-                </div>
-              </div>
-
-              <div class="settings-group">
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.tts.title">Text-to-speech API Key</div>
-                </div>
-                <div class="settings-row">
-                  <label data-i18n="settings.tts.provider">Provider</label>
-                  <div class="ai-select" id="settings-tts-provider"></div>
-                </div>
-                <div class="settings-row" id="settings-tts-key-row">
-                  <label data-i18n="settings.tts.api_key">API Key</label>
-                  <input type="password" class="form-input" id="settings-tts-key-input" autocomplete="new-password" spellcheck="false" />
-                </div>
-                <div class="settings-row tts-row-voice" hidden>
-                  <label data-i18n="settings.tts.voice">Voice</label>
-                  <input type="text" class="form-input" id="settings-tts-voice-input" placeholder="alloy / zh_female_..._bigtts" autocomplete="off" spellcheck="false" />
-                </div>
-                <div class="settings-row tts-row-base" hidden>
-                  <label data-i18n="settings.tts.base_url">Base URL</label>
-                  <input type="text" class="form-input" id="settings-tts-base-input" placeholder="https://api.openai.com/v1" autocomplete="off" spellcheck="false" />
-                </div>
-                <div class="settings-row tts-row-model" hidden>
-                  <label data-i18n="settings.tts.model">Model</label>
-                  <input type="text" class="form-input" id="settings-tts-model-input" autocomplete="off" spellcheck="false" />
-                </div>
-                <div class="settings-row tts-row-doubao-res" hidden>
-                  <label><span data-i18n="settings.tts.doubao_resource">Voice resource ID</span> <span class="form-hint" data-i18n="settings.tts.doubao_resource_hint">Filled in automatically when you select a voice. You can also edit it manually.</span></label>
-                  <input type="text" class="form-input" id="settings-tts-doubao-resource" placeholder="auto (seed-tts-2.0 / 1.0 / icl-2.0)" autocomplete="off" spellcheck="false" />
-                </div>
-                <div class="settings-row">
-                  <button class="btn btn-primary" id="settings-tts-add-btn" data-i18n="settings.tts.add">+ Add speech key</button>
-                  <span class="settings-status" id="settings-tts-status"></span>
-                </div>
-                <div class="settings-entries" id="settings-tts-entries">
-                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
-                </div>
-              </div>
-
             </div>
-
           </div>
         </div>
       </section>
@@ -1326,13 +1382,13 @@
             <div class="chat-input-overlay">
               <div class="chat-attachments project-todo-attachments" id="project-todo-attachments" hidden></div>
             </div>
-            <textarea id="project-todo-input" rows="3" maxlength="200"
+            <textarea id="project-todo-input" rows="3" maxlength="4000"
                       data-i18n-placeholder="project.todo.placeholder" placeholder="Create a task…"></textarea>
             <div class="chat-bottom-bar todo-editor-composer-bar">
               <button type="button" class="chat-attach-btn project-todo-attach-btn" id="project-todo-attach-btn"
                       data-i18n-title="project.todo.attach" data-i18n-aria-label="project.todo.attach" title="Attach files" aria-label="Attach files">+</button>
               <span class="chat-composer-divider" aria-hidden="true"></span>
-              <span class="project-memory-editor-counter muted" id="project-todo-counter">0/200</span>
+              <span class="project-memory-editor-counter muted" id="project-todo-counter">0/4000</span>
             </div>
           </div>
         </label>
@@ -1490,6 +1546,21 @@
       <input type="text" id="agent-picker-search" data-i18n-placeholder="agent_picker.search_placeholder" placeholder="Search agents..." autocomplete="off" />
     </div>
     <div class="skill-picker-list" id="agent-picker-list"></div>
+    <!-- Coding-CLI entry, pinned below the list so neither scrolling nor a
+         search that matches nothing can hide it. Shown on the Agents tab only,
+         and only for the composer anchors: the automation dialog is a
+         `.ui-dialog-overlay` (z-index 13000) and the create modal it opens is a
+         plain `.modal-overlay` (z-index 100), which would land behind it. -->
+    <div class="skill-picker-footer" id="agent-picker-cli-footer" hidden>
+      <button type="button" class="skill-picker-cli-entry" id="agent-picker-connect-cli">
+        <span data-ui-icon="terminal" data-ui-icon-class="skill-picker-cli-icon"></span>
+        <span class="skill-picker-cli-copy">
+          <span data-i18n="agents.connect_cli_btn">Connect an agent</span>
+          <small data-i18n="agents.connect_cli_sub">Claude Code / Codex CLIs</small>
+        </span>
+        <span data-ui-icon="chevron-right" data-ui-icon-class="skill-picker-cli-arrow"></span>
+      </button>
+    </div>
   </div>
 
   <div class="agent-row-menu" id="agent-row-menu" style="display:none">
@@ -1503,6 +1574,119 @@
       <h3 class="modal-title" id="add-account-title" data-i18n="add_account.title">Add account</h3>
       <div class="modal-body add-account-body" id="add-account-body"></div>
       <div class="modal-actions" id="add-account-actions"></div>
+    </div>
+  </div>
+
+  <!-- Settings › Models: add-model / add-service dialog. Forms stay mounted
+       so provider pickers keep their state while the active purpose changes. -->
+  <div class="modal-overlay" id="settings-add-modal">
+    <div class="modal settings-add-modal modal-standard" role="dialog" aria-modal="true" aria-labelledby="settings-add-modal-title">
+      <div class="modal-header">
+        <h3 class="modal-title" id="settings-add-modal-title" data-i18n="settings.models.add_chat">Add model</h3>
+        <button type="button" class="modal-close-btn settings-add-modal-close" id="settings-add-modal-close"
+                data-i18n-title="common.close" title="Close"
+                data-i18n-aria-label="common.close" aria-label="Close">
+          <span data-ui-icon="x" data-ui-icon-class="modal-close-icon"></span>
+        </button>
+      </div>
+      <div class="modal-body settings-add-modal-body">
+        <div class="settings-add-form" data-settings-add-form="chat">
+          <p class="settings-add-form-hint" data-i18n="settings.add_auth_sub">Choose a model or enter a custom endpoint, then sign in or add an API key.</p>
+          <div class="settings-row settings-form-row">
+            <label data-i18n="settings.provider">Provider</label>
+            <div class="ai-select" id="settings-picker-provider"></div>
+          </div>
+          <div class="settings-row settings-form-row" id="settings-picker-model-row">
+            <label data-i18n="settings.model">Model</label>
+            <div class="ai-select" id="settings-picker-model"></div>
+          </div>
+          <div class="settings-form-status"><span class="settings-status" id="settings-picker-status"></span></div>
+          <div class="modal-actions settings-add-form-actions">
+            <button type="button" class="btn" data-settings-add-cancel data-i18n="common.cancel">Cancel</button>
+            <button type="button" class="btn btn-primary" id="settings-add-entry-btn" data-i18n="settings.add_account">+ Add account</button>
+          </div>
+        </div>
+
+        <div class="settings-add-form" data-settings-add-form="search" hidden>
+          <div class="settings-row settings-form-row">
+            <label data-i18n="settings.search.provider">Provider</label>
+            <div class="ai-select" id="settings-search-provider"></div>
+          </div>
+          <div class="settings-row settings-form-row" id="settings-search-key-row">
+            <label data-i18n="settings.search.api_key">API Key</label>
+            <input type="password" class="form-input" id="settings-search-key-input" autocomplete="new-password" spellcheck="false" />
+          </div>
+          <div class="settings-form-status"><span class="settings-status" id="settings-search-status"></span></div>
+          <div class="modal-actions settings-add-form-actions">
+            <button type="button" class="btn" data-settings-add-cancel data-i18n="common.cancel">Cancel</button>
+            <button type="button" class="btn btn-primary" id="settings-search-add-btn" data-i18n="settings.search.add">+ Add search key</button>
+          </div>
+        </div>
+
+        <div class="settings-add-form" data-settings-add-form="image" hidden>
+          <div class="settings-row settings-form-row">
+            <label data-i18n="settings.image.provider">Provider</label>
+            <div class="ai-select" id="settings-image-provider"></div>
+          </div>
+          <div class="settings-row settings-form-row" id="settings-image-key-row">
+            <label data-i18n="settings.image.api_key">API Key</label>
+            <input type="password" class="form-input" id="settings-image-key-input" autocomplete="new-password" spellcheck="false" />
+          </div>
+          <div class="settings-form-status"><span class="settings-status" id="settings-image-status"></span></div>
+          <div class="modal-actions settings-add-form-actions">
+            <button type="button" class="btn" data-settings-add-cancel data-i18n="common.cancel">Cancel</button>
+            <button type="button" class="btn btn-primary" id="settings-image-add-btn" data-i18n="settings.image.add">+ Add image key</button>
+          </div>
+        </div>
+
+        <div class="settings-add-form" data-settings-add-form="video" hidden>
+          <div class="settings-row settings-form-row">
+            <label data-i18n="settings.video.provider">Provider</label>
+            <div class="ai-select" id="settings-video-provider"></div>
+          </div>
+          <div class="settings-row settings-form-row" id="settings-video-key-row">
+            <label data-i18n="settings.video.api_key">API Key</label>
+            <input type="password" class="form-input" id="settings-video-key-input" autocomplete="new-password" spellcheck="false" />
+          </div>
+          <div class="settings-form-status"><span class="settings-status" id="settings-video-status"></span></div>
+          <div class="modal-actions settings-add-form-actions">
+            <button type="button" class="btn" data-settings-add-cancel data-i18n="common.cancel">Cancel</button>
+            <button type="button" class="btn btn-primary" id="settings-video-add-btn" data-i18n="settings.video.add">+ Add video key</button>
+          </div>
+        </div>
+
+        <div class="settings-add-form" data-settings-add-form="tts" hidden>
+          <div class="settings-row settings-form-row">
+            <label data-i18n="settings.tts.provider">Provider</label>
+            <div class="ai-select" id="settings-tts-provider"></div>
+          </div>
+          <div class="settings-row settings-form-row" id="settings-tts-key-row">
+            <label data-i18n="settings.tts.api_key">API Key</label>
+            <input type="password" class="form-input" id="settings-tts-key-input" autocomplete="new-password" spellcheck="false" />
+          </div>
+          <div class="settings-row settings-form-row tts-row-voice" hidden>
+            <label data-i18n="settings.tts.voice">Voice</label>
+            <input type="text" class="form-input" id="settings-tts-voice-input" placeholder="alloy / zh_female_…_bigtts" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="settings-row settings-form-row tts-row-base" hidden>
+            <label data-i18n="settings.tts.base_url">Base URL</label>
+            <input type="text" class="form-input" id="settings-tts-base-input" placeholder="https://api.openai.com/v1" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="settings-row settings-form-row tts-row-model" hidden>
+            <label data-i18n="settings.tts.model">Model</label>
+            <input type="text" class="form-input" id="settings-tts-model-input" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="settings-row settings-form-row tts-row-doubao-res" hidden>
+            <label><span data-i18n="settings.tts.doubao_resource">Voice resource ID</span> <span class="form-hint" data-i18n="settings.tts.doubao_resource_hint">Filled in automatically when you select a voice. You can also edit it manually.</span></label>
+            <input type="text" class="form-input" id="settings-tts-doubao-resource" placeholder="auto (seed-tts-2.0 / 1.0 / icl-2.0)" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="settings-form-status"><span class="settings-status" id="settings-tts-status"></span></div>
+          <div class="modal-actions settings-add-form-actions">
+            <button type="button" class="btn" data-settings-add-cancel data-i18n="common.cancel">Cancel</button>
+            <button type="button" class="btn btn-primary" id="settings-tts-add-btn" data-i18n="settings.tts.add">+ Add speech key</button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1751,10 +1935,13 @@
   <script src="./modules/web-assist.js"></script>
   <script src="./modules/file-operation-policy.js"></script>
   <script src="./modules/chat-file-viewer.js"></script>
+  <script src="./modules/preview-windows.js"></script>
+  <script src="./modules/delimited-preview.js"></script>
   <script src="./modules/md-view-edit.js"></script>
   <script src="./modules/text-view-edit.js"></script>
   <script src="./modules/context-menu.js"></script>
   <script src="./modules/chat-md-drawer.js"></script>
+  <script src="./modules/task-side-panel.js"></script>
   <script src="./modules/video-review-panel.js"></script>
   <script src="./modules/strip-structural-blocks.js"></script>
   <script src="./modules/name-limit.js"></script>
@@ -1764,12 +1951,14 @@
   <script src="./modules/conversation-view-model.js"></script>
   <script src="./modules/conversation.js"></script>
   <script src="./modules/conversation-turn-nav.js"></script>
+  <script src="./modules/web-app-host.js"></script>
   <script src="./modules/artifact-security.js"></script>
   <script src="./modules/chat-artifact.js"></script>
   <script src="./modules/conversation-info.js"></script>
   <script src="./modules/task-board.js"></script>
   <script src="./modules/queue-draft.js"></script>
   <script src="./modules/connectors.js"></script>
+  <script src="./modules/connector-action-dialog.js"></script>
   <script src="./modules/bash_permission.js"></script>
   <script src="./modules/interactive-cli.js"></script>
   <script src="./modules/search.js"></script>

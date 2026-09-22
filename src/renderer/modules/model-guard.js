@@ -16,7 +16,6 @@ function _modelGuardErrorType(error) {
 
 let _hasConfiguredModel = true;   // optimistic — flipped to false after refresh if empty
 let _modelGuardRefreshSequence = 0;
-let _modelConfigSnapshotSignature = '';
 
 async function refreshModelGuard() {
   const refreshSequence = ++_modelGuardRefreshSequence;
@@ -49,61 +48,9 @@ async function refreshModelConfigSnapshot() {
       window.dispatchEvent(new CustomEvent('orkas:model-entries-changed', {
         detail: { entries: res.entries },
       }));
-      trackModelConfigSnapshot(res.entries);
     }
   } catch (err) {
     _guardLog.warn('model config snapshot refresh failed', { error: (err && err.message) || String(err) });
-  }
-}
-
-function _modelConfigTelemetryEntry(entry, entryRank) {
-  const rawProvider = String((entry && entry.provider) || '').trim();
-  const rawModel = String((entry && entry.model) || '').trim();
-  if (!rawProvider || !rawModel) return null;
-  const legacyDynamicProvider = /^cp:/i.test(rawProvider) || rawProvider === 'custom-openai';
-  const userEnteredModel = legacyDynamicProvider
-    || rawProvider === 'custom'
-    || rawProvider === 'openrouter';
-  const normalizedProvider = legacyDynamicProvider ? 'custom' : rawProvider;
-  return {
-    provider: /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(normalizedProvider)
-      ? normalizedProvider
-      : 'unknown',
-    model: userEnteredModel
-      ? 'custom'
-      : (/^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,119}$/.test(rawModel) ? rawModel : 'unknown'),
-    entry_rank: entryRank,
-  };
-}
-
-function trackModelConfigSnapshot(entries) {
-  try {
-    if (!window.Monitor || typeof Monitor.event !== 'function') return;
-    const safeEntries = (Array.isArray(entries) ? entries : [])
-      .map((entry, idx) => _modelConfigTelemetryEntry(entry, idx + 1))
-      .filter(Boolean);
-    const uid = (typeof globalThis.currentUserId === 'string') ? globalThis.currentUserId : '';
-    const signature = uid + '|' + safeEntries
-      .map((entry) => entry.provider + '/' + entry.model + '#' + entry.entry_rank)
-      .join('|');
-    if (signature === _modelConfigSnapshotSignature) return;
-    _modelConfigSnapshotSignature = signature;
-
-    const snapshotId = String(Date.now()) + '-' + Math.random().toString(36).slice(2, 8);
-    Monitor.event('model_config_snapshot', {
-      snapshot_id: snapshotId,
-      entry_count: safeEntries.length,
-    });
-    safeEntries.forEach((entry) => {
-      Monitor.event('model_config_entry', {
-        snapshot_id: snapshotId,
-        provider: entry.provider,
-        model: entry.model,
-        entry_rank: entry.entry_rank,
-      });
-    });
-  } catch (err) {
-    _guardLog.warn('model config snapshot telemetry failed', { error: (err && err.message) || String(err) });
   }
 }
 

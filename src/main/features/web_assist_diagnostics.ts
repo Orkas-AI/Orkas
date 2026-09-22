@@ -1,4 +1,4 @@
-/** Low-volume browser incident samples, never page/URL or exception telemetry. */
+/** Low-volume local browser diagnostics, never page/URL or raw exception text. */
 import type { WebContents } from 'electron';
 import { createLogger } from '../logger';
 
@@ -18,7 +18,7 @@ export function createWebAssistDiagnostics() {
   const last = new Map<Failure, number>();
   const suppressed = new Map<Failure, number>();
   let emitted: number[] = [];
-  return (sender: Pick<WebContents, 'isDestroyed' | 'send'>, failure: Failure, netCode?: unknown): void => {
+  return (sender: Pick<WebContents, 'isDestroyed'>, failure: Failure, netCode?: unknown): void => {
     if (!Object.hasOwn(FAILURES, failure) || sender.isDestroyed()) return;
     const now = Date.now();
     emitted = emitted.filter(time => now - time < WINDOW_MS);
@@ -37,11 +37,10 @@ export function createWebAssistDiagnostics() {
         ? { net_error_code: netCode } : {}),
     };
     suppressed.delete(failure);
-    // Best effort only: diagnostics must never change navigation or recovery.
+    // Best effort only: local diagnostics must never change navigation or recovery.
     try { log.warn('browser failure', payload); } catch { /* no recursive logging */ }
-    try { sender.send('web-assist:failure', payload); } catch { /* no queue/retry */ }
   };
 }
 
 // Shared across tabs, tasks, accounts and windows for this main-process lifetime.
-export const reportWebAssistFailure = createWebAssistDiagnostics();
+export const logWebAssistFailure = createWebAssistDiagnostics();

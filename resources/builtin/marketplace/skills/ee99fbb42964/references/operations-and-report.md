@@ -82,8 +82,8 @@ gap instead of manufacturing another claim. Audit every canonical comparison
 column before running citations.
 
 On the compact landscape path, let the verifier write `RESEARCH-<topic>.md`
-directly from the field-tagged evidence ledger and compact candidate profiles.
-Do not read `citations_output.json`, author another recommendation list or
+from the field-tagged evidence ledger, compact candidate profiles, and your
+`analysis_markdown`. Review meaning before assembly. Do not duplicate the
 comparison table, reconstruct fields from memory, or use shell code to assemble
 the report. Other paths may use the returned Markdown fields directly.
 
@@ -100,6 +100,7 @@ evidence-source bindings from the sibling field-tagged ledger:
   "compact_landscape": {
     "title": "AI desktop-app comparison",
     "boundary": "Scope, cutoff, source limits, and named evidence gaps.",
+    "analysis_markdown": "## Recommendations\n\nYour evidence-grounded choices, decisive citations, conditions, and limitations.",
     "candidates": [{
       "candidate": "Exact ledger candidate name",
       "best_for": "A bounded decision mode",
@@ -114,7 +115,7 @@ after `canonical_url` is optional and no implementation-specific fields are
 required.
 
 ```json
-{"id":"E1","source_id":"S1","candidate":"Exact candidate name","field":"os","claim":"Narrow supported claim in the quote's language","quote":"Exact source text","canonical_url":"https://official.example/page"}
+{"id":"E1","source_id":"S1","candidate":"Exact candidate name","field":"os","claim":"Narrow claim checked against the quoted context","quote":"Exact source text","canonical_url":"https://official.example/page"}
 ```
 
 Do not mix this with copied `sources`, `claims`, or `comparison` arrays. The
@@ -132,40 +133,38 @@ remains valid.
 
 - Exact quote matching normalizes Unicode, smart punctuation, case, and
   whitespace, but never accepts a paraphrase.
-- Keep each narrow claim in its quote's language and retain the decisive source
-  wording; translate only outside verifier-bound factual cells.
-- `supported=true` requires a known fetched source, exact verified quote, and
-  minimum claim/quote content alignment.
+- Claims may paraphrase or translate; quotes must preserve the fetched wording.
+  Apply the Skill's verification rules to the final ledger and analysis.
+- A citation `verdict=verified` means its quote and DOI attribution passed,
+  never that its claim is true. No claim-support verdict is emitted.
 - An unknown source, missing quote in source, malformed DOI, or DOI absent from
-  the source is flagged. A known source without a quote is weak/unproven.
+  the source is flagged. A known source without an adequate quote is weak.
 - When the input file has a sibling `evidence_ledger.jsonl`, missing dates,
   access dates, publisher/type, and limitations are merged by source ID or URL.
-- `data.comparison_markdown` is a fixed complete table. Missing cells are
-  explicit; unsupported or lexically unrelated field bindings are replaced
-  with `Not verified`; each verified factual cell carries its claim-level
-  Evidence ID inline, and the Evidence column keeps the row's de-duplicated IDs.
-- `data.comparison_coverage` classifies each normalized row after those
-  downgrades. Recommendation readiness requires verified OS and setup/ease,
-  model capabilities, local/offline or privacy, pricing/cost, and a material
-  limitation. The result lists remaining and blocking decision groups without
-  turning honest gaps into citation warnings.
-- `data.evidence_markdown` contains verified claims, exact quotes, official
-  links, source/release dates, access dates, status, and limitations.
+- `data.comparison_markdown` is a complete table. Missing cells or bindings
+  without matched quotes from the candidate's declared sources become
+  `Not verified`; retained factual cells carry their Evidence IDs inline.
+  The script does not judge whether a cell follows from its bound claim.
+- `data.comparison_coverage` lists `fields_with_citations` and
+  `missing_citation_fields`; it never determines recommendation readiness.
+- `data.evidence_markdown` contains Agent-authored claims, matched quotes,
+  links, dates, and limitations. Its labels describe quote matching only.
 
-The verifier already omits unsupported evidence and downgrades unsupported
-cells. It reports complete or partial factual coverage for each model-selected
-path. An under-evidenced path remains visible with its named blocking gaps and
-must not become a definitive winner. With `--report-out`, it appends the
-recommendation, comparison, and Evidence used sections unchanged to the title
-and boundary supplied by the compact input. Do not rebuild them from memory or
-add a separate source list.
-Correct and rerun only when a decision-changing issue has valid evidence that
-can resolve it; otherwise use the verified subset and disclose the gap. Never
-rewrite the payload merely to remove non-material warnings.
+For `--report-out`, provide non-empty `analysis_markdown` in `compact_landscape`.
+Write concise recommendations in the user's language from the checked ledger
+claims, citing decisive Evidence IDs and retaining their conditions. Label
+inferences and explain how the cited facts support the choice. Do not add unsupported
+capabilities or privacy guarantees while summarizing, or call a candidate best,
+easiest, or most complete without comparative evidence. Keep useful supported
+choices when other facts remain unknown. The script preserves this prose
+unchanged and appends the comparison and evidence tables; it never generates
+recommendations. Correct invalid citations when a material gap can be resolved;
+otherwise retain the supported subset and disclose the gap. Do not rewrite the
+payload merely to remove non-material warnings.
 
 ## Final compact report
 
-Generate the compact verified report once with:
+Generate the compact report once with:
 
 ```bash
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" deep-research citations -- --op verify --input citations_input.json --out citations_output.json --report-out RESEARCH-<topic>.md
@@ -176,14 +175,13 @@ carries a name a reader can recognise in the file list. The command refuses an
 existing target: a second research run in the same conversation is a new report,
 not a revision of the earlier one, and must never overwrite it.
 
-The report contains the supplied title and boundary, then evidence-informed
-model-selected paths with complete or partial factual coverage, the only
-systematic comparison table, and the final Evidence used section. Do not
+The report contains the supplied title and boundary, then your unchanged
+analysis, the only systematic comparison table, and the final Evidence used section. Do not
 reconstruct or rewrite it.
 
 Keep the report compact with one short boundary and one retained evidence row
-per factual candidate/field. Do not add model-authored recommendation bullets,
-per-candidate sections, or prose that restates comparison-table cells. The
+per factual candidate/field. Keep analysis decision-focused; do not restate
+comparison-table cells or add repetitive per-candidate sections. The
 deterministic table uses this literal header:
 
 ```markdown
@@ -192,7 +190,7 @@ deterministic table uses this literal header:
 
 It gives every retained candidate every column and marks gaps `Not verified`
 rather than guessing. The evidence markdown is the de-duplicated reference list
-and already contains verified claims, exact source quotes, official links,
+and already contains Agent-authored claims, matched source quotes, official links,
 source/release dates, access dates, verification status, and limitations. Do not
 append a separate bare source list.
 

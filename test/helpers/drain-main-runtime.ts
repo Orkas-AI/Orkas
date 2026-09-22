@@ -4,6 +4,8 @@
  * connection is still open, and search can retain delayed flush timers.
  */
 export async function drainMainRuntimeForTest(): Promise<void> {
+  // `flushAll` settles deferred chat writes and releases the chat store's
+  // SQLite handle, which Windows needs before the workspace can be removed.
   const searchIndexer = await import('../../src/main/features/search/indexer');
   await searchIndexer.flushAll();
 

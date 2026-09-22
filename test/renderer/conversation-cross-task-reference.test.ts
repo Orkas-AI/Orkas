@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as vm from 'node:vm';
 
 const conversationSource = fs.readFileSync(
   path.join(__dirname, '../../src/renderer/modules/conversation.js'),
@@ -18,23 +19,19 @@ const projectDetailSource = fs.readFileSync(
 const indexSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/index.html'), 'utf8');
 
 describe('conversation cross-task message reference UI', () => {
-  it('keeps quote visible while moving secondary actions into the overflow menu', () => {
+  it('exposes secondary actions after the quote without an overflow menu', () => {
     expect(conversationSource).toContain('<span class="chat-bubble-direct-actions">${quoteButton}</span>');
-    expect(conversationSource).toContain('class="chat-bubble-more-menu" role="menu" hidden');
-    expect(conversationSource).toContain('chat-bubble-menu-item bubble-copy-btn');
-    expect(conversationSource).toContain('chat-bubble-menu-item bubble-select-btn');
-    expect(conversationSource).toContain('chat-bubble-menu-item bubble-archive-btn');
-    expect(styleSource).toContain('.chat-bubble-more-menu');
-    expect(styleSource).toContain('.chat-bubble-menu-item');
-    expect(conversationSource).not.toContain("'bubble-action-icon'");
-    expect(styleSource).toContain('border: 1px solid color-mix(in srgb, var(--border) 88%, #94a3b8);');
-    expect(styleSource).toContain('height: 24px;');
-  });
-
-  it('opens the overflow menu without scanning every message menu', () => {
-    expect(conversationSource).toContain('let _openBubbleActionMenu = null;');
-    expect(conversationSource).toContain('_openBubbleActionMenu = menu;');
-    expect(conversationSource).not.toContain("document.querySelectorAll('.chat-bubble-more-menu:not([hidden])')");
+    expect(conversationSource).toContain('${secondaryActions}');
+    const secondary = conversationSource.slice(
+      conversationSource.indexOf('const secondaryActions ='),
+      conversationSource.indexOf('actions.innerHTML = `', conversationSource.indexOf('const secondaryActions =')),
+    );
+    expect(secondary.indexOf('bubble-copy-btn')).toBeLessThan(secondary.indexOf('bubble-select-btn'));
+    expect(secondary.indexOf('bubble-select-btn')).toBeLessThan(secondary.indexOf('bubble-archive-btn'));
+    for (const retiredClass of ['bubble-more-btn', 'chat-bubble-more-menu', 'chat-bubble-menu-item']) {
+      expect(conversationSource).not.toContain(retiredClass);
+      expect(styleSource).not.toContain(retiredClass);
+    }
   });
 
   it('adds quote plus copy/select overflow actions to persisted user messages', () => {
@@ -150,5 +147,78 @@ describe('conversation cross-task message reference UI', () => {
     expect(styleSource).toContain('border-left: 3px solid rgba(37, 99, 235, 0.45);');
     expect(styleSource).toContain('background: rgba(37, 99, 235, 0.04);');
     expect(styleSource).toContain('.chat-reference-author { display: block; margin-bottom: 1px; color: #2563eb; font-size: 12px; font-weight: 500; }');
+  });
+});
+
+// History is paginated: all-select must not silently omit older messages or
+// overwrite a new selection after the user cancels a pending load.
+function selectionHarness() {
+  const messages = [{ dataset: { msgId: 'latest' } }];
+  let row: any = { dataset: { cid: 'task', cursor: '20', state: 'idle' } };
+  const context: any = {
+    currentCid: 'task',
+    t: (key: string) => key,
+    uiToast: () => {},
+    _messageSelectionState: { cid: 'task', selected: new Set(['latest']) },
+    document: {
+      querySelector: () => row,
+      querySelectorAll: () => messages,
+    },
+    _updateMessageSelectionToolbar: () => {},
+    _syncMessageSelectionUi: () => {},
+  };
+  vm.createContext(context);
+  vm.runInContext(conversationSource.slice(
+    conversationSource.indexOf('function _historyNextCursor('),
+    conversationSource.indexOf('function _setEarlierHistoryLoaderState('),
+  ) + conversationSource.slice(
+    conversationSource.indexOf('function _allMessagesSelected('),
+    conversationSource.indexOf('function _toggleMessageSelection('),
+  ), context);
+  return { context, messages, getRow: () => row, setRow: (value: any) => { row = value; } };
+}
+
+describe('select all across conversation history pages', () => {
+  it('includes older pages before completing selection and can deselect the whole conversation', async () => {
+    const { context, messages, setRow } = selectionHarness();
+    context._loadOlderConversationHistory = async (_cid: string, cursor: number) => {
+      messages.unshift({ dataset: { msgId: cursor === 20 ? 'middle' : 'oldest' } });
+      setRow(cursor === 20 ? { dataset: { cid: 'task', cursor: '10', state: 'idle' } } : null);
+    };
+    await context._toggleAllMessageSelection();
+    expect(Array.from(context._messageSelectionState.selected)).toEqual(['oldest', 'middle', 'latest']);
+    expect(context._messageSelectionState.loadingAll).toBe(false);
+    await context._toggleAllMessageSelection();
+    expect(context._messageSelectionState.selected.size).toBe(0);
+  });
+
+  it('preserves the prior selection on a page failure and allows a complete retry', async () => {
+    const { context, messages, getRow, setRow } = selectionHarness();
+    context._loadOlderConversationHistory = async () => { getRow().dataset.state = 'error'; };
+    await context._toggleAllMessageSelection();
+    expect(Array.from(context._messageSelectionState.selected)).toEqual(['latest']);
+    expect(context._messageSelectionState.loadingAll).toBe(false);
+    expect(context._allMessagesSelected()).toBe(false);
+    context._loadOlderConversationHistory = async () => {
+      messages.unshift({ dataset: { msgId: 'oldest' } });
+      setRow(null);
+    };
+    await context._toggleAllMessageSelection();
+    expect(Array.from(context._messageSelectionState.selected)).toEqual(['oldest', 'latest']);
+    expect(context._allMessagesSelected()).toBe(true);
+  });
+
+  it('does not select messages in another task when a pending all-select is cancelled', async () => {
+    const { context, setRow } = selectionHarness();
+    let finish!: () => void;
+    context._loadOlderConversationHistory = () => new Promise<void>((resolve) => { finish = resolve; });
+    const pending = context._toggleAllMessageSelection();
+    expect(context._messageSelectionState.loadingAll).toBe(true);
+    context.currentCid = 'other';
+    context._messageSelectionState = { cid: 'other', selected: new Set(['chosen']) };
+    setRow(null);
+    finish();
+    await pending;
+    expect(Array.from(context._messageSelectionState.selected)).toEqual(['chosen']);
   });
 });

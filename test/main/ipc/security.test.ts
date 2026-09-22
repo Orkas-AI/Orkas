@@ -15,6 +15,9 @@ describe('IPC security envelope', () => {
   it('trusts only the exact local renderer entry', () => {
     expect(isTrustedIpcSender({ getURL: () => rendererUrl })).toBe(true);
     expect(isTrustedIpcSender({ getURL: () => `${rendererUrl}?boot=1#ready` })).toBe(true);
+    expect(isTrustedIpcSender({ getURL: () => rendererUrl.replace('index.html', 'preview.html') })).toBe(true);
+    expect(isTrustedIpcSender({ getURL: () => rendererUrl.replace('index.html', 'preview.html.evil') })).toBe(false);
+    expect(isTrustedIpcSender({ getURL: () => rendererUrl.replace('index.html', 'nested/preview.html') })).toBe(false);
     expect(isTrustedIpcSender({ getURL: () => 'https://example.test/' })).toBe(false);
     expect(isTrustedIpcSender({ getURL: () => pathToFileURL('/tmp/index.html').toString() })).toBe(false);
     expect(isTrustedIpcSender({ getURL: () => 'file:///not%ZZvalid' })).toBe(false);

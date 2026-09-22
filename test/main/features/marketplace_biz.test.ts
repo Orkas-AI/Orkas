@@ -137,6 +137,8 @@ describe('marketplace category cache', () => {
         code: 'Writing',
         name_zh: '创作',
         name_en: 'Creation',
+        name_es: 'Creación', name_fr: 'Création', name_ko: '창작',
+        name_de: 'Kreation', name_ru: 'Творчество', name_it: 'Creazione',
         sort_order: 40,
       },
       {
@@ -162,6 +164,11 @@ describe('marketplace category cache', () => {
 
     expect(list.map((entry) => entry.code)).toEqual(['data', 'creation']);
     expect(list.filter((entry) => entry.code === 'creation')).toHaveLength(1);
+    expect(list.find(entry => entry.code === 'creation')).toMatchObject({
+      name_es: 'Creación', name_fr: 'Création', name_ko: '창작',
+      name_de: 'Kreation', name_ru: 'Творчество', name_it: 'Creazione',
+    });
+    expect(await marketplaceBiz.getMarketplaceCategories({ localOnly: true })).toEqual(list);
   });
 
   it('returns fresh server categories even when the disposable cache cannot be written', async () => {

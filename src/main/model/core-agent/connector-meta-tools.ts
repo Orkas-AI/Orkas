@@ -36,7 +36,7 @@ import {
 } from '../../features/connectors/tools-adapter';
 import { validateCustomTransport, validateDisplayName, CustomTransportError } from '../../features/connectors/custom-transport';
 import { requestInstallConfirm } from '../../features/connectors/install_confirm';
-import { requestActionConfirm, connectorAccountKey } from '../../features/connectors/action_confirm';
+import { requestActionConfirm, connectorAccountKey, type AppUsageScope } from '../../features/connectors/action_confirm';
 import { connectorActionRisk, isConnectorActionBlocked } from '../../features/connectors/action_policy';
 import { findCatalogEntry } from '../../features/connectors/catalog';
 import { resolveLanguageForUser } from '../../features/config';
@@ -59,6 +59,8 @@ export interface ConnectorMetaToolsOpts {
    *  tool so its confirmation dialog routes to the right conversation.
    *  Omitted for discover-mode (agent-edit) where add is not exposed. */
   cid?: string;
+  /** Trusted Web app lifetime, separate from conversation/task authority. */
+  appUsage?: AppUsageScope;
   /** Keep list/call schemas available for a live run that may gain a
    * connector after construction. */
   allowRuntimeRefresh?: boolean;
@@ -434,11 +436,12 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
             `This connector action accepts at most ${policy.max_batch_size} items in any array argument. Split the request into smaller batches.`,
           );
         }
-        const actionRisk = connectorActionRisk(match.instance, toolMatch);
+        const actionRisk = connectorActionRisk(match.instance, toolMatch, normalizedArgs);
         if (actionRisk.risk === 'H' || actionRisk.risk === 'D') {
           const approved = await requestActionConfirm({
             userId: opts.userId,
             cid: opts.cid,
+            appUsage: opts.appUsage,
             connectorId: cid,
             displayName: _localizedConnectorDisplayName(
               match.instance,

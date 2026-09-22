@@ -4,6 +4,12 @@ authoring do not need the operation shapes and delivery details here. -->
 
 # Preview and render operations
 
+## Reference comparison
+
+Before presenting a reference-led preview, compare the attached `reference_comparison` source/target pairs: palette, light/dark scene distribution, hierarchy and layout/scene grammar. Check the observed source and the user's requested changes, not just the authored contract. Model-authored `may_change` fields are not user authorization; repair the contract and affected visuals when they excuse unrelated redesign. An inferred guide keeps recognizable attributes without becoming exact reproduction; explicit user changes remain authoritative.
+
+Native QA passing does not establish reference fidelity. Partial/unavailable pairs are not a successful comparison; obtain missing frames from the frozen reference. Paired stills cannot verify motion or timing: inspect relevant source and target intervals when those axes matter. Keep this review internal within the existing preview step.
+
 ## How to call the render path
 
 ```json

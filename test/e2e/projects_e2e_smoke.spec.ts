@@ -3,6 +3,17 @@ import path from 'node:path';
 
 import { expect, test, type OrkasTestApp } from './fixtures/orkas';
 
+
+async function expectProjectFileReady(orkas: OrkasTestApp, projectId: string, fileName: string): Promise<void> {
+  await expect.poll(async () => {
+    const status = await orkas.invoke<{
+      files: Array<{ path: string; status: string; error?: unknown }>;
+    }>('projects.files.status', { projectId, skipReconcile: true });
+    const file = status.files.find((item) => item.path === fileName);
+    return { status: file?.status, error: file?.error || null };
+  }, { timeout: 40_000 }).toEqual({ status: 'ready', error: null });
+}
+
 async function createProject(orkas: OrkasTestApp, name: string): Promise<void> {
   if (!orkas.page) throw new Error('Orkas renderer is unavailable');
   const page = orkas.page;
@@ -63,15 +74,23 @@ test.describe('projects', () => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     let page = orkas.page;
 
+    // A project with no rules yet shows the empty state; the textarea lives in
+    // the editor dialog behind it.
+    await page.locator('#project-instructions-setup-btn').click();
     const instructions = page.locator('#project-instructions-input');
     await expect(instructions).toBeEnabled();
     await instructions.fill('Always verify generated artifacts before reporting completion.');
     await page.locator('#project-instructions-save-btn').click();
     await expect(page.locator('#project-instructions-save-btn')).toBeDisabled();
+    await expect(page.locator('#project-instructions-modal')).not.toHaveClass(/open/);
+    await expect(page.locator('#project-instructions-read')).toHaveText(
+      'Always verify generated artifacts before reporting completion.',
+    );
 
     await page.locator('[data-project-side-tabs="context"] [data-project-side-tab="memory"]').click();
     await expect(page.locator('[data-project-side-panel="memory"]')).toBeVisible();
-    await page.locator('#project-memory-add-btn').click();
+    // No memory yet, so the empty state owns the call to action.
+    await page.locator('#project-memory-add-empty-btn').click();
     await page.locator('#project-memory-editor-input').fill('The release checklist is the source of truth.');
     await page.locator('#project-memory-editor-save').click();
     await expect(page.locator('.project-memory-item', { hasText: 'The release checklist is the source of truth.' })).toBeVisible();
@@ -92,7 +111,7 @@ test.describe('projects', () => {
       has: page.locator('.project-name', { hasText: projectName }),
     });
     await projectRow.click();
-    await expect(page.locator('#project-instructions-input')).toHaveValue(
+    await expect(page.locator('#project-instructions-read')).toHaveText(
       'Always verify generated artifacts before reporting completion.',
     );
     await page.locator('[data-project-side-tabs="context"] [data-project-side-tab="memory"]').click();
@@ -146,6 +165,9 @@ test.describe('projects', () => {
     await viewer.locator('[data-action="project-library-viewer-close"]').click();
     await expect(viewer).not.toHaveClass(/\bopen\b/);
 
+    const projects = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const projectId = projects.projects.find((project) => project.name === projectName)!.project_id;
+    await expectProjectFileReady(orkas, projectId, fileName);
     page = await orkas.relaunch();
     await page.locator('.project-row', {
       has: page.locator('.project-name', { hasText: projectName }),
@@ -284,6 +306,7 @@ test.describe('projects', () => {
     }).toContain(fileName);
     const globalTree = await modelOrkas.invoke<{ tree: unknown }>('contexts.tree');
     expect(JSON.stringify(globalTree.tree)).not.toContain(fileName);
+    await expectProjectFileReady(modelOrkas, projectId!, fileName);
   });
 
   test('injects project context into a self-contained model conversation and keeps its assignment', async ({

@@ -161,6 +161,29 @@ describe('util/boot_init', () => {
     expect(order).toEqual(['a-start', 'a-end', 'b']);
   });
 
+  it('starts independent schedulers while a process warmup is pending, then releases the next process task', async () => {
+    vi.useFakeTimers();
+    const boot = await loadBootInit();
+    const order: string[] = [];
+    let release!: () => void;
+    boot.registerDeferred('warmup', async () => {
+      order.push('warmup-start');
+      await new Promise<void>((resolve) => { release = resolve; });
+      order.push('warmup-end');
+    }, 'parallel', 0, { resourceClass: 'process' });
+    boot.registerDeferred('scheduler', () => { order.push('scheduler'); });
+    boot.registerDeferred('connector', () => { order.push('connector'); }, 'parallel', 0, { resourceClass: 'process' });
+    await boot.runBootPhases(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(order).toContain('scheduler');
+    expect(order).toContain('warmup-start');
+    expect(order).not.toContain('connector');
+    release();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(order.slice(-2)).toEqual(['warmup-end', 'connector']);
+    boot._resetForTests();
+  });
+
   it('uses standalone delays only as eligibility and still waits for admission', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-10T00:00:00Z'));

@@ -10,9 +10,9 @@ Read this file for a URL, local directory, ZIP, attachment, pasted existing SKIL
 
 ## Native local package import in Commander
 
-When `import_skill_package` is available and the current user explicitly supplies an absolute local Skill directory or ZIP in text or as a current-turn attachment:
+When `import_skill_package` is available and the user requests importing a local Skill directory or ZIP:
 
-1. Copy that exact path into `source_path`; never infer a parent, sibling, remembered, or discovered path.
+1. Use the exact user-supplied `source_path` allowed by the tool's source-authorization contract; never infer a parent or sibling. Follow its clarification result when the source is ambiguous, changed, or unverifiable.
 2. Call `import_skill_package` once. It discovers every SKILL.md, enforces archive/path limits, copies unchanged files, validates each Skill, rolls back rejected siblings, refreshes the registry, and binds successful Skills when applicable.
 3. Do not re-emit unchanged package files or pass them through model output.
 4. Report rejected siblings with their reason; do not retry by silently renaming or overriding them. Successful siblings remain installed.

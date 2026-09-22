@@ -37,7 +37,10 @@ afterEach(async () => {
   for (const instance of clients.splice(0)) instance.close();
   await Promise.all(exiting);
   children.splice(0);
-  for (const dir of temporary.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  for (const dir of temporary.splice(0)) {
+    await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    expect(fs.existsSync(dir), 'image fixture cleanup must remove the whole tree').toBe(false);
+  }
 });
 
 describe('isolated bundled-Node image processing', () => {
@@ -136,7 +139,7 @@ describe('isolated bundled-Node image processing', () => {
     await rejected;
   });
 
-  it('loads the shipped dependency closure beside app.asar without checkout or Electron resolution', () => {
+  it('loads the shipped dependency closure beside app.asar without checkout or Electron resolution', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-packaged-image-'));
     temporary.push(root);
     const unpacked = path.join(root, 'app.asar.unpacked');
@@ -152,7 +155,12 @@ describe('isolated bundled-Node image processing', () => {
       fs.cpSync(path.join(process.cwd(), relative), path.join(unpacked, relative), { recursive: true });
     }
     expect(probeImageRuntime(node, entry)).toMatchObject({ status: 'passed', sharp: 'png-2x2', electron: null, arch: process.arch });
-    fs.rmSync(path.join(unpacked, 'node_modules', '@img'), { recursive: true });
+    // Electron on Windows can reject synchronous deletion immediately after
+    // the native probe. Await real removal before testing the missing closure;
+    // bounded filesystem retries still fail if the fixture cannot be removed.
+    const imageDependencies = path.join(unpacked, 'node_modules', '@img');
+    await fs.promises.rm(imageDependencies, { recursive: true, maxRetries: 10, retryDelay: 50 });
+    expect(fs.existsSync(imageDependencies)).toBe(false);
     expect(() => probeImageRuntime(node, entry)).toThrow(/E_IMAGE_RUNTIME_VERIFY.*reinstall/);
   });
 

@@ -69,7 +69,7 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-async function setupHandler(): Promise<{ pid: string; projectTasks: any }> {
+async function setupHandler(global = false): Promise<{ pid: string; projectTasks: any }> {
   const paths = await import('../../../../src/main/paths');
   seedAgent(paths, BOUND_ID, BOUND_NAME);
   seedAgent(paths, UNBOUND_ID, UNBOUND_NAME);
@@ -88,14 +88,46 @@ async function setupHandler(): Promise<{ pid: string; projectTasks: any }> {
     sessionId: state.buildGconvSessionId(cid),
     userId: TEST_UID,
     cid,
-    projectId: pid,
+    projectId: global ? undefined : pid,
   }).catch(() => {});
   if (!captured.handler) throw new Error('todo_tasks handler was not captured from buildRunner');
+  if (global) {
+    const resolved = await captured.handler.resolveProject('__global__');
+    expect(resolved.ok).toBe(true);
+    captured.handler = resolved.handler;
+  }
   const projectTasks = await import('../../../../src/main/features/project_tasks');
-  return { pid, projectTasks };
+  return { pid: global ? '' : pid, projectTasks };
 }
 
 describe('runner › todo_tasks owner resolution', () => {
+  it('assigns and reassigns global tasks to enabled account agents by name or id', async () => {
+    const { pid, projectTasks } = await setupHandler(true);
+    const created = await captured.handler.create({ title: 'Global work', owner: 're viewer' });
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    expect((await projectTasks.listTasks(TEST_UID, pid))[0]).toMatchObject({
+      owner_agent_id: UNBOUND_ID, owner_agent: UNBOUND_NAME,
+    });
+    const updated = await captured.handler.update(created.task.id, { owner: BOUND_ID });
+    expect(updated.ok, JSON.stringify(updated)).toBe(true);
+    expect((await projectTasks.listTasks(TEST_UID, pid))[0]).toMatchObject({
+      owner_agent_id: BOUND_ID, owner_agent: BOUND_NAME,
+    });
+  }, 30_000);
+
+  it('rejects unknown, disabled and other-account global owners without a write', async () => {
+    const { pid, projectTasks } = await setupHandler(true);
+    const agents = await import('../../../../src/main/features/agents');
+    agents.setAgentEnabledForActiveUser(UNBOUND_ID, false);
+    for (const owner of ['Nonexistent', UNBOUND_NAME, UNBOUND_ID]) {
+      expect((await captured.handler.create({ title: 'Rejected work', owner })).ok).toBe(false);
+    }
+    const users = await import('../../../../src/main/features/users');
+    users.activateUser('another-owner-account');
+    expect((await captured.handler.create({ title: 'Wrong account', owner: BOUND_NAME })).ok).toBe(false);
+    expect(await projectTasks.listTasks(TEST_UID, pid)).toHaveLength(0);
+  }, 30_000);
+
   it('create with an owner display name resolves and persists owner_agent_id', async () => {
     const { pid, projectTasks } = await setupHandler();
 

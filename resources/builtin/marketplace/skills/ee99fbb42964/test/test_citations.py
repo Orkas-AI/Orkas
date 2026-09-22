@@ -153,7 +153,7 @@ class QuoteVerification(unittest.TestCase):
         c = out["claims"][0]["citations"][0]
         self.assertEqual(c["quote_status"], "verified")
         self.assertEqual(c["verdict"], "verified")
-        self.assertTrue(out["claims"][0]["supported"])
+        self.assertEqual(out["claims"][0]["citations"][0]["verdict"], "verified")
         self.assertEqual(c["ref"], 1)
         self.assertEqual(out["flags"], [])
 
@@ -164,7 +164,7 @@ class QuoteVerification(unittest.TestCase):
         c = out["claims"][0]["citations"][0]
         self.assertEqual(c["quote_status"], "not_found")
         self.assertEqual(c["verdict"], "flagged")
-        self.assertFalse(out["claims"][0]["supported"])
+        self.assertNotIn("supported", out["claims"][0])
         self.assertEqual(out["flags"][0]["issue"], "quote_not_found_in_source")
 
     def test_real_quote_attributed_to_wrong_source_is_flagged(self):
@@ -186,32 +186,32 @@ class QuoteVerification(unittest.TestCase):
         c = out["claims"][0]["citations"][0]
         self.assertEqual(c["quote_status"], "too_short")
         self.assertEqual(c["verdict"], "weak")          # real source, just unprovable
-        self.assertFalse(out["claims"][0]["supported"])
-        self.assertEqual(out["claims"][0]["support_status"], "unproven")
-        self.assertEqual(out["warnings"][0]["issue"], "claim_evidence_alignment_unproven")
+        self.assertNotIn("supported", out["claims"][0])
         self.assertEqual(out["flags"], [])
 
-    def test_exact_but_unrelated_quote_does_not_support_claim(self):
-        sources = SOURCES + [{
-            "id": "s3",
-            "url": "https://example.net/moon",
-            "title": "Lunar observations",
-            "text": "The Moon completes one orbit around Earth in approximately 27.3 days.",
-        }]
-        out = _verify([
-            _claim(
-                "This treatment cures cancer.",
-                _cite(source="s3", quote="The Moon completes one orbit around Earth in approximately 27.3 days."),
-            ),
-        ], sources=sources)
-        citation = out["claims"][0]["citations"][0]
-        self.assertEqual(citation["quote_status"], "verified")
-        self.assertEqual(citation["verdict"], "verified")
-        self.assertEqual(citation["alignment_status"], "unproven")
-        self.assertFalse(out["claims"][0]["supported"])
-        self.assertEqual(out["claims"][0]["support_status"], "unproven")
+    def test_quote_matching_never_asserts_semantic_support(self):
+        # Opposite meanings share almost every word; translations share none.
+        quote = "Example Desktop does not support Windows."
+        source = {"id": "s", "url": "https://example.test/os", "text": quote}
+        for claim in (
+            "Example Desktop supports Windows.",
+            "Example Desktop does not support Windows.",
+            "此桌面应用无法在微软的操作系统上使用。",
+            "This treatment cures cancer.",
+        ):
+            with self.subTest(claim=claim):
+                out = _verify([_claim(claim, _cite(source="s", quote=quote))], [source])
+                result = out["claims"][0]
+                self.assertEqual(result["text"], claim)
+                self.assertEqual(result["citations"][0]["quote_status"], "verified")
+                self.assertNotIn("supported", result)
+                self.assertNotIn("support_status", result)
+                self.assertNotIn("alignment_status", result["citations"][0])
+                self.assertEqual(out["evidence_rows"][0]["quote"], quote)
+                self.assertIn("quote matched", out["evidence_markdown"])
+                self.assertNotIn("recommendation_markdown", out)
 
-    def test_related_chinese_quote_passes_alignment_gate(self):
+    def test_chinese_exact_quote_is_matched(self):
         source = {
             "id": "zh",
             "url": "https://example.cn/study",
@@ -223,9 +223,8 @@ class QuoteVerification(unittest.TestCase):
                 _cite(source="zh", quote="该疗法使部分癌症患者达到完全缓解"),
             ),
         ], sources=[source])
-        self.assertTrue(out["claims"][0]["supported"])
-        self.assertEqual(
-            out["claims"][0]["citations"][0]["alignment_status"], "aligned")
+        self.assertEqual(out["claims"][0]["citations"][0]["verdict"], "verified")
+        self.assertNotIn("alignment_status", out["claims"][0]["citations"][0])
 
 
 class DoiVerification(unittest.TestCase):
@@ -277,8 +276,7 @@ class SourceResolution(unittest.TestCase):
         out = _verify([_claim("x", _cite(source="s1"))])
         c = out["claims"][0]["citations"][0]
         self.assertEqual(c["verdict"], "weak")
-        self.assertFalse(out["claims"][0]["supported"])
-        self.assertEqual(out["claims"][0]["support_status"], "unproven")
+        self.assertNotIn("supported", out["claims"][0])
 
 
 class SourceTextCache(unittest.TestCase):
@@ -354,6 +352,7 @@ class CompactLandscapeInput(unittest.TestCase):
                 "compact_landscape": {
                     "title": "Example desktop-app comparison",
                     "boundary": "Official evidence accessed on 2026-08-20.",
+                    "analysis_markdown": "## Recommendations\n\n 仅在内存充足时选择本地方案 [E6]。\n\n价格不等于适用性。 ",
                     "candidates": [{
                         "candidate": "Example desktop app",
                         "best_for": "Everyday private use",
@@ -382,8 +381,8 @@ class CompactLandscapeInput(unittest.TestCase):
                 ])
 
             data = result["data"]
-            self.assertEqual(data["summary"]["supported"], 6)
-            self.assertEqual(data["summary"]["comparison_recommendation_ready"], 1)
+            self.assertEqual(data["summary"]["verified"], 6)
+            self.assertNotIn("comparison_recommendation_ready", data["summary"])
             self.assertEqual(
                 data["compact_landscape_expansion"]["selected_evidence_rows"], 6
             )
@@ -393,10 +392,8 @@ class CompactLandscapeInput(unittest.TestCase):
             self.assertIn("# Example desktop-app comparison", report)
             self.assertIn("Official evidence accessed on 2026-08-20.", report)
             self.assertIn("## Recommendations", report)
-            self.assertIn(
-                "Recommendations are analytical inferences",
-                report,
-            )
+            self.assertIn(payload["compact_landscape"]["analysis_markdown"], report)
+            self.assertNotIn("material limitation:", report)
             self.assertIn("| Candidate | Best for |", report)
             self.assertIn("## Evidence used", report)
             self.assertEqual(
@@ -479,7 +476,7 @@ class CompactLandscapeInput(unittest.TestCase):
                 ])
 
             data = result["data"]
-            self.assertEqual(data["summary"]["supported"], 0)
+            self.assertEqual(data["summary"]["verified"], 0)
             self.assertEqual(data["summary"]["flagged"], 1)
             self.assertEqual(data["claims"][0]["citations"][0]["quote_status"], "not_found")
 
@@ -526,7 +523,7 @@ class CompactLandscapeInput(unittest.TestCase):
                 ])
 
             expansion = result["data"]["compact_landscape_expansion"]
-            self.assertEqual(result["data"]["summary"]["supported"], 0)
+            self.assertEqual(result["data"]["summary"]["verified"], 0)
             self.assertEqual(expansion["trusted_source_snapshots"]["valid_rows"], 0)
             self.assertEqual(expansion["trusted_source_snapshots"]["invalid_rows"], 1)
             self.assertEqual(expansion["missing_snapshot_sources"], 1)
@@ -557,7 +554,7 @@ class CompactLandscapeInput(unittest.TestCase):
 
             data = result["data"]
             expansion = data["compact_landscape_expansion"]
-            self.assertEqual(data["summary"]["supported"], 0)
+            self.assertEqual(data["summary"]["verified"], 0)
             self.assertEqual(data["summary"]["flagged"], 1)
             self.assertEqual(
                 data["claims"][0]["citations"][0]["quote_status"],
@@ -592,7 +589,7 @@ class CompactLandscapeInput(unittest.TestCase):
             diagnostics = data["compact_landscape_expansion"][
                 "trusted_source_snapshots"
             ]
-            self.assertEqual(data["summary"]["supported"], 1)
+            self.assertEqual(data["summary"]["verified"], 1)
             self.assertEqual(data["summary"]["flagged"], 0)
             self.assertEqual(diagnostics["valid_rows"], 1)
             self.assertEqual(diagnostics["invalid_rows"], 1)
@@ -642,13 +639,13 @@ class CompactLandscapeInput(unittest.TestCase):
                 ])
 
             data = result["data"]
-            self.assertEqual(data["summary"]["supported"], 1)
+            self.assertEqual(data["summary"]["verified"], 1)
             self.assertEqual(data["summary"]["flagged"], 0)
             self.assertEqual(data["claims"][0]["id"], "supported_os")
             self.assertIn(supported, data["comparison_rows"][0]["os"])
             self.assertNotIn(unsupported, data["comparison_markdown"])
 
-    def test_compact_field_skips_an_exact_quote_that_does_not_support_its_claim(self):
+    def test_compact_selection_does_not_infer_meaning_from_words(self):
         with tempfile.TemporaryDirectory() as tmp:
             input_path = os.path.join(tmp, "citations_input.json")
             ledger_path = os.path.join(tmp, "evidence_ledger.jsonl")
@@ -697,11 +694,68 @@ class CompactLandscapeInput(unittest.TestCase):
                 ])
 
             data = result["data"]
-            self.assertEqual(data["summary"]["supported"], 1)
+            self.assertEqual(data["summary"]["verified"], 1)
             self.assertEqual(data["summary"]["flagged"], 0)
-            self.assertEqual(data["claims"][0]["id"], "supported_os")
-            self.assertIn(supported, data["comparison_rows"][0]["os"])
-            self.assertNotIn(unsupported, data["comparison_markdown"])
+            self.assertEqual(data["claims"][0]["id"], "misaligned_os")
+            self.assertIn(unsupported, data["comparison_rows"][0]["os"])
+            self.assertNotIn("supported", data["claims"][0])
+
+    def test_compact_report_preserves_ledger_ids_after_a_failed_row_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_url = "https://example.test/guide"
+            input_path = _write_single_compact_case(tmp, source_url=source_url,
+                                                    claim="Runs on Windows computers.")
+            ledger_path = os.path.join(tmp, "evidence_ledger.jsonl")
+            snapshot_path = os.path.join(tmp, "snapshots.jsonl")
+            rows = [
+                {"id": "E1", "field": "os", "claim": "Runs on Windows computers."},
+                {"id": "E2", "field": "pricing_cost", "claim": "Free for everyone forever."},
+                {"id": "limit_3", "field": "key_limitations", "claim": "Requires sixteen gigabytes of memory."},
+            ]
+            for row in rows:
+                row.update(candidate="Example app", source_id="official", canonical_url=source_url,
+                           quote=row["claim"])
+            _write_trusted_snapshot(snapshot_path, source_url,
+                                    rows[0]["quote"] + " " + rows[2]["quote"])
+            with open(input_path, encoding="utf-8") as fh:
+                spec = json.load(fh)
+            analysis = "## Choice\nOnly with sufficient memory [limit_3]."
+            spec["compact_landscape"]["analysis_markdown"] = analysis
+            with open(input_path, "w", encoding="utf-8") as fh:
+                json.dump(spec, fh)
+            for index, current_rows in enumerate((rows, [rows[0], rows[2]])):
+                with open(ledger_path, "w", encoding="utf-8") as fh:
+                    for row in current_rows:
+                        fh.write(json.dumps(row) + "\n")
+                report_path = os.path.join(tmp, "report-{}.md".format(index))
+                with mock.patch.dict(os.environ, {"ORKAS_DEEP_RESEARCH_EVIDENCE_FILE": snapshot_path}):
+                    data = citations.main(["--input", input_path, "--report-out", report_path])["data"]
+                self.assertEqual([row["evidence_id"] for row in data["evidence_rows"]], ["E1", "limit_3"])
+                self.assertEqual(data["comparison_rows"][0]["key_limitations"],
+                                 "Requires sixteen gigabytes of memory. [limit_3]")
+                with open(report_path, encoding="utf-8") as fh:
+                    report = fh.read()
+                self.assertIn(analysis, report)
+                self.assertIn("[limit_3] Requires sixteen gigabytes", report)
+                self.assertEqual(data["summary"]["flagged"], 1 if index == 0 else 0)
+
+    def test_report_requires_agent_analysis_without_creating_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = _write_single_compact_case(tmp, source_url="https://example.test/os",
+                                                    claim="The app supports Windows and macOS.")
+            with open(input_path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            report_path = os.path.join(tmp, "RESEARCH-example.md")
+            output_path = os.path.join(tmp, "citations_output.json")
+            for value in (None, "", "  ", [], {"text": "recommend"}):
+                payload["compact_landscape"]["analysis_markdown"] = value
+                with open(input_path, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+                with self.assertRaisesRegex(ValueError, "analysis_markdown"):
+                    citations.main(["--input", input_path, "--out", output_path,
+                                    "--report-out", report_path])
+                self.assertFalse(os.path.exists(report_path))
+                self.assertFalse(os.path.exists(output_path))
 
     def test_rejects_mixed_compact_and_expanded_payloads(self):
         with self.assertRaisesRegex(ValueError, "must not be mixed"):
@@ -782,6 +836,21 @@ class ReferencesContinued(unittest.TestCase):
         self.assertEqual(reference["pmid"], "12345678")
         self.assertEqual(reference["source_type"], "journal")
 
+    def test_failed_quote_does_not_renumber_later_analysis_references(self):
+        source = {"id": "s", "url": "https://example.test/guide",
+                  "text": "Runs on Windows computers. Requires sixteen gigabytes of memory."}
+        out = verify({"sources": [source], "claims": [
+            _claim("Runs on Windows computers.", _cite(source="s", quote="Runs on Windows computers.")),
+            _claim("Runs on any computer.", _cite(source="s", quote="Runs on any computer.")),
+            _claim("Requires sixteen gigabytes of memory.",
+                   _cite(source="s", quote="Requires sixteen gigabytes of memory.")),
+        ]})
+        self.assertEqual([row["evidence_id"] for row in out["evidence_rows"]], ["E1", "E3"])
+        self.assertEqual(out["evidence_rows"][1]["claim"], "Requires sixteen gigabytes of memory.")
+        self.assertNotIn("[E2]", out["evidence_markdown"])
+        self.assertIn("[E3] Requires sixteen gigabytes", out["evidence_markdown"])
+        self.assertEqual(out["flags"][0]["claim"], 1)
+
     def test_verified_aligned_citation_emits_delivery_ready_evidence_markdown(self):
         source = {
             **SOURCES[0],
@@ -804,7 +873,7 @@ class ReferencesContinued(unittest.TestCase):
         self.assertIn("[On Local Agents](https://example.com/paper)", out["evidence_markdown"])
         self.assertIn("source/release date: 2024-05-01", out["evidence_markdown"])
         self.assertIn("access date: 2026-07-28", out["evidence_markdown"])
-        self.assertIn("— verified —", out["evidence_markdown"])
+        self.assertIn("— quote matched —", out["evidence_markdown"])
 
     def test_evidence_markdown_groups_repeated_source_metadata_without_losing_quotes(self):
         source = {
@@ -830,7 +899,7 @@ class ReferencesContinued(unittest.TestCase):
         self.assertIn('"keep user data on the device"', markdown)
         self.assertIn('"The study reports a 42% latency reduction."', markdown)
 
-    def test_structured_source_candidates_become_atomic_evidence_without_model_claim_splitting(self):
+    def test_source_adapter_fields_cannot_replace_agent_claim_bindings(self):
         source = {
             "id": "repo",
             "url": "https://github.com/example/project",
@@ -861,20 +930,11 @@ class ReferencesContinued(unittest.TestCase):
                 "evidence_sources": ["repo"],
             }],
         })
-        self.assertEqual(out["summary"]["structured_evidence_candidates"], 3)
-        self.assertEqual(
-            [row["field"] for row in out["evidence_rows"]],
-            ["os", "privacy", "project_activity"],
-        )
-        self.assertTrue(all(
-            row["verification_basis"] == "structured_source_adapter"
-            for row in out["evidence_rows"]
-        ))
-        self.assertIn("[E1]", out["evidence_markdown"])
-        self.assertIn('"All data remains on your device."', out["evidence_markdown"])
-        self.assertEqual(out["comparison_rows"][0]["evidence"], "E1, E2")
+        self.assertEqual(out["evidence_rows"], [])
+        self.assertEqual(out["comparison_rows"][0]["os"], "Not verified: OS")
+        self.assertEqual(out["comparison_rows"][0]["privacy_data_handling"], "Not verified: Privacy/data handling")
 
-    def test_github_snapshot_is_classified_in_research_layer(self):
+    def test_github_readme_keywords_do_not_create_verified_facts(self):
         source = {
             "id": "repo",
             "url": "https://github.com/example/project",
@@ -901,24 +961,8 @@ class ReferencesContinued(unittest.TestCase):
         }
         out = verify({"sources": [source], "claims": []})
 
-        fields = [row["field"] for row in out["evidence_rows"]]
-        self.assertEqual(out["summary"]["structured_evidence_candidates"], 10)
-        self.assertEqual(fields[:3], [
-            "core_use_case",
-            "license_open_source",
-            "project_activity",
-        ])
-        self.assertTrue({
-            "os",
-            "installation",
-            "local_model_path",
-            "privacy",
-            "hardware_constraints",
-        }.issubset(set(fields)))
-        self.assertTrue(all(
-            row["verification_basis"] == "structured_source_adapter"
-            for row in out["evidence_rows"]
-        ))
+        self.assertEqual(out["evidence_rows"], [])
+        self.assertEqual(out["references"], [])
 
     def test_verifier_emits_complete_comparison_table_from_same_payload(self):
         source = {
@@ -960,97 +1004,43 @@ class ReferencesContinued(unittest.TestCase):
         self.assertIn("| E1 |", table)
         self.assertEqual(out["comparison_warnings"], [])
 
-    def test_comparison_coverage_marks_a_complete_decision_row_ready(self):
-        out = verify(_comparison_fixture())
-
+    def test_full_field_coverage_never_makes_a_recommendation(self):
+        payload = _comparison_fixture()
+        # Complete even the remaining privacy field, while proposing an
+        # intentionally unjustified universal recommendation.
+        row = payload["comparison"][0]
+        row["privacy_data_handling"] = row["local_offline"]
+        row["field_claims"]["privacy_data_handling"] = row["field_claims"]["local_offline"]
+        row["best_for"] = "Best for everyone"
+        out = verify(payload)
         coverage = out["comparison_coverage"][0]
-        self.assertEqual(coverage["status"], "recommendation_ready")
-        self.assertTrue(coverage["recommendation_ready"])
-        self.assertEqual(coverage["verified_field_count"], 6)
-        self.assertEqual(coverage["factual_field_count"], 7)
-        self.assertEqual(coverage["missing_decision_groups"], [])
-        self.assertEqual(out["summary"]["comparison_recommendation_ready"], 1)
-        self.assertEqual(out["summary"]["comparison_under_evidenced"], 0)
-        self.assertIn(
-            "**Everyday private use: Example desktop app**",
-            out["recommendation_markdown"],
-        )
-        self.assertIn("material limitation:", out["recommendation_markdown"])
-        self.assertIn("[E6]", out["recommendation_markdown"])
-        self.assertIn(
-            "Recommendations are analytical inferences",
-            out["recommendation_markdown"],
-        )
-        self.assertIn(
-            "verified comparison evidence:",
-            out["recommendation_markdown"],
-        )
-        self.assertNotIn("verified recommendation", out["recommendation_markdown"].lower())
-        self.assertNotIn("verified pick", out["recommendation_markdown"].lower())
+        self.assertEqual(len(coverage["fields_with_citations"]), 7)
+        self.assertEqual(coverage["missing_citation_fields"], [])
+        self.assertEqual(set(coverage), {"candidate", "fields_with_citations", "missing_citation_fields"})
+        self.assertNotIn("recommendation_markdown", out)
+        self.assertNotIn("comparison_recommendation_ready", out["summary"])
 
-    def test_comparison_coverage_accepts_privacy_instead_of_offline_evidence(self):
+    def test_coverage_distinguishes_privacy_and_offline_fields(self):
         out = verify(_comparison_fixture(privacy_field="privacy_data_handling"))
-
         coverage = out["comparison_coverage"][0]
-        self.assertTrue(coverage["recommendation_ready"])
-        self.assertIn("privacy_data_handling", coverage["verified_fields"])
-        self.assertIn("local_offline", coverage["not_verified_fields"])
+        self.assertIn("privacy_data_handling", coverage["fields_with_citations"])
+        self.assertIn("local_offline", coverage["missing_citation_fields"])
 
-    def test_comparison_coverage_requires_a_material_limitation(self):
+    def test_coverage_reports_missing_limitations_without_judging_choice(self):
         payload = _comparison_fixture()
-        row = payload["comparison"][0]
-        row["key_limitations"] = "Not verified"
-        row["field_claims"].pop("key_limitations")
-
+        payload["comparison"][0]["key_limitations"] = "Not verified"
         out = verify(payload)
+        self.assertIn("key_limitations", out["comparison_coverage"][0]["missing_citation_fields"])
+        self.assertNotIn("recommendation_ready", out["comparison_coverage"][0])
 
-        coverage = out["comparison_coverage"][0]
-        self.assertFalse(coverage["recommendation_ready"])
-        self.assertEqual(coverage["tradeoff_groups_verified"], 2)
-        self.assertEqual(coverage["missing_decision_groups"], ["limitations"])
-        self.assertEqual(coverage["blocking_decision_groups"], ["limitations"])
-        self.assertIn(
-            "Conditional path — **Everyday private use: Example desktop app**",
-            out["recommendation_markdown"],
-        )
-        self.assertIn(
-            "verify before choosing: limitations",
-            out["recommendation_markdown"],
-        )
-        self.assertIn(
-            "current comparison evidence:",
-            out["recommendation_markdown"],
-        )
-        self.assertNotIn(
-            "verified comparison evidence:",
-            out["recommendation_markdown"],
-        )
-
-    def test_comparison_coverage_keeps_honest_gaps_but_downgrades_the_row(self):
+    def test_explicit_unknowns_remain_gaps_without_citation_warnings(self):
         payload = _comparison_fixture()
-        row = payload["comparison"][0]
-        row["pricing_cost"] = "Not verified"
-        row["key_limitations"] = "Not verified"
-        row["field_claims"].pop("pricing_cost")
-        row["field_claims"].pop("key_limitations")
-
+        for field in ("pricing_cost", "key_limitations"):
+            payload["comparison"][0][field] = "Not verified"
         out = verify(payload)
-
         self.assertEqual(out["comparison_warnings"], [])
-        coverage = out["comparison_coverage"][0]
-        self.assertEqual(coverage["status"], "under_evidenced")
-        self.assertFalse(coverage["recommendation_ready"])
-        self.assertEqual(coverage["missing_decision_groups"], ["pricing", "limitations"])
-        self.assertEqual(coverage["blocking_decision_groups"], ["limitations", "pricing"])
-        self.assertEqual(out["summary"]["comparison_under_evidenced"], 1)
-        self.assertIn(
-            "verify before choosing: limitations, pricing",
-            out["recommendation_markdown"],
-        )
-        self.assertNotIn(
-            "No retained candidate is recommendation-ready",
-            out["recommendation_markdown"],
-        )
+        self.assertEqual(out["comparison_coverage"][0]["missing_citation_fields"],
+                         ["privacy_data_handling", "pricing_cost", "key_limitations"])
 
     def test_comparison_markdown_places_claim_ids_on_each_verified_factual_cell(self):
         out = verify(_comparison_fixture())
@@ -1074,8 +1064,8 @@ class ReferencesContinued(unittest.TestCase):
 
         self.assertEqual(out["comparison_rows"][0]["os"], "Not verified: OS")
         self.assertEqual(
-            out["comparison_coverage"][0]["missing_decision_groups"],
-            ["platform_and_setup"],
+            out["comparison_coverage"][0]["missing_citation_fields"],
+            ["os", "privacy_data_handling"],
         )
         self.assertIn(
             "comparison_field_evidence_missing",
@@ -1144,14 +1134,14 @@ class ReferencesContinued(unittest.TestCase):
         self.assertEqual(row["local_offline"], "Not verified: Local/offline")
         self.assertEqual(row["evidence"], "Not verified: no verified Evidence ID")
 
-    def test_comparison_rejects_unproven_field_claim(self):
+    def test_comparison_rejects_claim_without_matched_quote(self):
         out = verify({
             "sources": SOURCES,
             "claims": [{
                 "id": "c_unproven",
                 **_claim(
                     "The application supports Windows and macOS.",
-                    _cite(source="s1", quote="keep user data on the device"),
+                    _cite(source="s1", quote="This quote was never fetched."),
                 ),
             }],
             "comparison": [{
@@ -1170,11 +1160,11 @@ class ReferencesContinued(unittest.TestCase):
             }],
         })
         row = out["comparison_rows"][0]
-        self.assertFalse(out["claims"][0]["supported"])
+        self.assertNotIn("supported", out["claims"][0])
         self.assertEqual(row["os"], "Not verified: OS")
         self.assertEqual(row["evidence"], "Not verified: no verified Evidence ID")
 
-    def test_comparison_rejects_verified_but_unrelated_field_claim(self):
+    def test_comparison_binding_does_not_claim_semantic_validation(self):
         out = verify({
             "sources": SOURCES,
             "claims": [{
@@ -1200,9 +1190,10 @@ class ReferencesContinued(unittest.TestCase):
             }],
         })
         row = out["comparison_rows"][0]
-        self.assertTrue(out["claims"][0]["supported"])
-        self.assertEqual(row["os"], "Not verified: OS")
-        self.assertEqual(row["evidence"], "Not verified: no verified Evidence ID")
+        self.assertEqual(out["claims"][0]["citations"][0]["verdict"], "verified")
+        self.assertEqual(row["os"], "Windows and macOS [E1]")
+        self.assertEqual(row["evidence"], "E1")
+        self.assertNotIn("supported", out["claims"][0])
 
     def test_comparison_marks_missing_fields_and_unverified_evidence(self):
         out = verify({
@@ -1272,19 +1263,19 @@ class AbstainAndSummary(unittest.TestCase):
     def test_summary_counts(self):
         out = _verify([
             _claim("User data stays on the device.",
-                   _cite(source="s1", quote="keep user data on the device")),          # supported
+                   _cite(source="s1", quote="keep user data on the device")),          # quote matched
             _claim("weak", _cite(source="s2")),                                         # weak
             _claim("bad", _cite(source="s1", quote="totally invented sentence here")),  # flagged
         ])
         s = out["summary"]
         self.assertEqual(s["claims"], 3)
-        self.assertEqual(s["supported"], 1)
-        self.assertEqual(s["unsupported"], 2)
+        self.assertNotIn("supported", s)
+        self.assertNotIn("unsupported", s)
         self.assertEqual(s["verified"], 1)
         self.assertEqual(s["weak"], 1)
         self.assertEqual(s["flagged"], 1)
-        self.assertEqual(s["aligned"], 1)
-        self.assertEqual(s["support_unproven"], 1)
+        self.assertNotIn("aligned", s)
+        self.assertNotIn("support_unproven", s)
 
     def test_references_op_matches_verify(self):
         claims = [_claim("a", _cite(source="s1", quote="keep user data on the device"))]
@@ -1372,28 +1363,18 @@ class AbstainAndSummary(unittest.TestCase):
                 persisted = json.load(fh)
 
         self.assertEqual(stdout["output"], output_path)
-        self.assertEqual(stdout["summary"]["supported"], 1)
+        self.assertEqual(stdout["summary"]["verified"], 1)
         self.assertEqual(stdout["flags"], 0)
         self.assertEqual(stdout["comparison_warnings"], 0)
         self.assertEqual(stdout["comparison_warning_details"], [])
-        self.assertEqual(
-            stdout["comparison_coverage_details"][0]["status"],
-            "under_evidenced",
-        )
-        self.assertEqual(
-            stdout["comparison_coverage_details"][0]["blocking_decision_groups"],
-            ["platform_and_setup", "model_capabilities", "limitations", "pricing"],
-        )
-        self.assertNotIn("verified_fields", stdout["comparison_coverage_details"][0])
+        self.assertEqual(stdout["comparison_coverage_details"][0]["fields_with_citations"],
+                         ["privacy_data_handling"])
+        self.assertEqual(stdout["comparison_coverage_details"], persisted["data"]["comparison_coverage"])
         self.assertNotIn("data", stdout)
         self.assertIn("| Candidate |", stdout["comparison_markdown"])
-        self.assertIn("## Recommendations", stdout["recommendation_markdown"])
+        self.assertNotIn("recommendation_markdown", stdout)
         self.assertIn("## Evidence used", stdout["evidence_markdown"])
-        self.assertTrue(persisted["data"]["claims"][0]["supported"])
-        self.assertEqual(
-            persisted["data"]["comparison_coverage"][0]["missing_decision_groups"],
-            ["platform_and_setup", "model_capabilities", "pricing", "limitations"],
-        )
+        self.assertEqual(persisted["data"]["claims"][0]["citations"][0]["verdict"], "verified")
         self.assertIn("## Evidence used", persisted["data"]["evidence_markdown"])
         self.assertIn("The desktop application keeps private documents", persisted["data"]["evidence_markdown"])
 

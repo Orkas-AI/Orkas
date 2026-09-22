@@ -9,7 +9,54 @@ import { describe, expect, it } from 'vitest';
 const require = createRequire(import.meta.url);
 
 describe('MCP stdio diagnostic boundary', () => {
-  it.each(['quiet', 'progress', 'endless'])('bounds a %s operation and never replays it after timeout', (mode) => {
+  it.each(['stdio', 'streamable-http'])('closes a %s channel that never completes initialization within 30s', (kind) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mcp-connect-'));
+    const childPath = path.join(root, 'silent.cjs');
+    const probePath = path.join(root, 'probe.cjs');
+    const pidPath = path.join(root, 'child.pid');
+    fs.writeFileSync(childPath, `require('node:fs').writeFileSync(${JSON.stringify(pidPath)}, String(process.pid)); process.stdin.resume();`);
+    fs.writeFileSync(probePath, [
+      `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/logger.ts'))})] = { exports: { createLogger: () => ({ info() {}, warn() {} }) } };`,
+      `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/util/proxy-dispatcher.ts'))})] = { exports: { buildChildProxyEnvironment: async () => ({}) } };`,
+      `const { McpConnection } = require(${JSON.stringify(path.resolve('src/main/features/connectors/mcp-client.ts'))});`,
+      'const realSetTimeout = global.setTimeout; const deadlines = [];',
+      // Scale only the production 30s budget. An incorrect 180s/60s default fails the probe deadline.
+      'global.setTimeout = (fn, ms, ...args) => { deadlines.push(ms); return realSetTimeout(fn, ms === 30000 ? 500 : ms, ...args); };',
+      '(async () => {',
+      "  const server = require('node:http').createServer(() => {});",
+      "  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));",
+      `  const transport = ${JSON.stringify(kind)} === 'stdio'`,
+      `    ? { kind: 'stdio', command: process.execPath, args: [${JSON.stringify(childPath)}], env: { ELECTRON_RUN_AS_NODE: '1' } }`,
+      "    : { kind: 'streamable-http', url: 'http://127.0.0.1:' + server.address().port + '/mcp' };",
+      "  const connection = new McpConnection('fixture', transport);",
+      '  try {',
+      '    await connection.connect();',
+      '    throw new Error("Unexpected connection success");',
+      '  } catch (error) {',
+      '    process.stdout.write(JSON.stringify({ message: error.message, connected: connection.isConnected, deadlines }));',
+      '  } finally { await connection.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }',
+      '})().catch(() => { process.exitCode = 1; });',
+    ].join('\n'));
+    try {
+      const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', ORKAS_WORKSPACE_ROOT: root };
+      for (const key of ['ORKAS_MCP_CONNECT_TIMEOUT_MS', 'ORKAS_MCP_STDIO_CONNECT_TIMEOUT_MS', 'ORKAS_MCP_HTTP_CONNECT_TIMEOUT_MS']) delete env[key];
+      const result = spawnSync(process.execPath, ['-r', require.resolve('tsx/cjs'), probePath], {
+        cwd: root, env, encoding: 'utf8', timeout: 8000, maxBuffer: 1024 * 1024,
+      });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe('');
+      const outcome = JSON.parse(result.stdout);
+      expect(outcome.connected).toBe(false);
+      expect(outcome.message).toContain('MCP connect timed out (>30s)');
+      expect(outcome.deadlines.slice(0, 2)).toEqual([30_000, 30_000]);
+      if (kind === 'stdio') {
+        expect(fs.existsSync(pidPath)).toBe(true);
+        expect(() => process.kill(Number(fs.readFileSync(pidPath, 'utf8')), 0)).toThrow();
+      }
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['quiet', 'progress', 'endless', 'late-progress'])('bounds a %s operation and never replays it after timeout', (mode) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mcp-deadline-'));
     const childPath = path.join(root, 'server.cjs');
     const probePath = path.join(root, 'probe.cjs');
@@ -42,13 +89,15 @@ describe('MCP stdio diagnostic boundary', () => {
       `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/util/proxy-dispatcher.ts'))})] = { exports: { buildChildProxyEnvironment: async () => ({}) } };`,
       `const { McpConnection } = require(${JSON.stringify(path.resolve('src/main/features/connectors/mcp-client.ts'))});`,
       `const connection = new McpConnection('fixture', { kind: 'stdio', command: process.execPath, args: [${JSON.stringify(childPath)}], env: { ELECTRON_RUN_AS_NODE: '1' } });`,
+      'const realSetTimeout = global.setTimeout; const deadlines = [];',
+      'global.setTimeout = (fn, ms, ...args) => { deadlines.push(ms); return realSetTimeout(fn, ms === 600000 ? 1200 : ms === 60000 ? 300 : ms, ...args); };',
       '(async () => {',
       '  try {',
       '    await connection.connect();',
       '    try {',
-      "      const result = await connection.callTool('execute_write', {}, { timeoutMs: 300, maxTotalTimeoutMs: 1500 });",
-      "      process.stdout.write(JSON.stringify({ outcome: result.content[0].text }));",
-      '    } catch (error) { process.stdout.write(JSON.stringify({ code: error.code })); }',
+      `      const result = await connection.callTool('execute_write', {}${mode === 'late-progress' ? ', { timeoutMs: 300 }' : ''});`,
+      "      process.stdout.write(JSON.stringify({ outcome: result.content[0].text, deadlines }));",
+      '    } catch (error) { process.stdout.write(JSON.stringify({ code: error.code, deadlines })); }',
       '    await new Promise(resolve => setTimeout(resolve, 150));',
       '  } finally { await connection.close(); }',
       '})().catch(() => { process.exitCode = 1; });',
@@ -60,9 +109,13 @@ describe('MCP stdio diagnostic boundary', () => {
       });
       expect(result.status).toBe(0);
       expect(result.stderr).toBe('');
-      expect(JSON.parse(result.stdout)).toEqual(mode === 'progress' ? { outcome: 'complete' } : { code: -32001 });
+      const { deadlines, ...outcome } = JSON.parse(result.stdout);
+      expect(outcome).toEqual(['quiet', 'progress'].includes(mode) ? { outcome: 'complete' } : { code: -32001 });
+      // Both the startup guard and SDK initialize request use the same default.
+      expect(deadlines.slice(0, 2)).toEqual([30_000, 30_000]);
+      expect(deadlines).toContain(mode === 'late-progress' ? 300 : 600_000);
       expect(fs.readFileSync(eventsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line)))
-        .toEqual(['start', mode === 'progress' ? 'complete' : 'cancel']);
+        .toEqual(['start', ['quiet', 'progress'].includes(mode) ? 'complete' : 'cancel']);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 

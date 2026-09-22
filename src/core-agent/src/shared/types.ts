@@ -41,6 +41,9 @@ export type ToolResultContent = {
   /** Images returned by this actual call, not a separate user turn. New
    * receipts always include this array; absence identifies legacy trailers. */
   images?: ImageContent[];
+  /** Host-selected authoring input; latest set (at most six images) survives
+   * active-turn elision/checkpoints. Empty replaces/clears the prior set. */
+  imageRetention?: "active_turn";
 };
 
 /** Reasoning / chain-of-thought block emitted by reasoning models.
@@ -58,12 +61,21 @@ export type ThinkingContent = {
   redacted?: boolean;
 };
 
-export type MessageContent =
+/** Google-owned server tool context, never executable host tools or user prose.
+ * Optional JSONL field: legacy sessions remain readable; other providers ignore it. */
+export type GoogleNativeReplay = {
+  api: "google-generative-ai";
+  provider: string;
+  model: string;
+  partsJson: string;
+};
+
+export type MessageContent = (
   | TextContent
   | ImageContent
   | ToolUseContent
   | ToolResultContent
-  | ThinkingContent;
+  | ThinkingContent) & { googleNativeReplay?: GoogleNativeReplay };
 
 export type MessageRole = "user" | "assistant" | "system" | "developer";
 

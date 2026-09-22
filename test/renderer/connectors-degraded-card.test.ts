@@ -49,6 +49,60 @@ function makeElement(tag: string): any {
 }
 
 describe('connector setup assistance', () => {
+  it('keeps private IPC errors out of catalog, verification and install logs while retaining recovery', async () => {
+    const privateError = new Error('private-shop-token https://private-shop.example/orders');
+    const invoke = vi.fn(async () => { throw privateError; });
+    const ctx = loadConnectorsRenderer(invoke);
+    await ctx.loadConnectors();
+    await ctx.verifyConnectors();
+    await ctx.__runInstallConfirm({ request_id: 'private-request', display_name: 'Private shop', kind: 'streamable-http' });
+    expect(ctx.__logs.warn.mock.calls.map(([message]) => message)).toEqual([
+      'catalog failed', 'list failed', 'connector verification failed', 'install confirm response failed',
+    ]);
+    expect(JSON.stringify([ctx.__logs.warn.mock.calls, ctx.__logs.info.mock.calls, ctx.__events])).not.toMatch(/private-shop|private-request|Private shop/);
+    invoke.mockResolvedValue({ ok: true, catalog: [], instances: [] } as never);
+    ctx.__logs.warn.mockClear();
+    await ctx.loadConnectors();
+    await ctx.verifyConnectors();
+    expect(ctx.__logs.warn).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancel', 'connect', 'assist'])('shows Color Me prerequisites before OAuth and supports %s without collecting secrets', async outcome => {
+    const { CONNECTOR_CATALOG } = await import('../../src/main/features/connectors/catalog');
+    const entry = CONNECTOR_CATALOG.find(row => row.id === 'colorme-shop')!;
+    const invoke = vi.fn(async () => ({ ok: true, started: true, attempt_id: 'fixture-attempt' }));
+    const ctx = loadConnectorsRenderer(invoke);
+    ctx.__setCatalog([entry]);
+    const handlers = new Map<string, (event?: any) => void>();
+    const control = (key: string) => ({ focus: vi.fn(), reportValidity: () => true,
+      addEventListener: (event: string, handler: any) => handlers.set(`${key}:${event}`, handler) });
+    const elements = { '[data-act="setup-form"]': control('form'), '[data-act="cancel"]': control('cancel'),
+      '[data-act="setup-assist"]': control('assist') };
+    const overlay: any = { innerHTML: '', querySelector: (key: string) => elements[key] || null,
+      querySelectorAll: () => [], remove: vi.fn() };
+    ctx.document.createElement = () => overlay;
+    ctx._uiNextDialogId = () => 'prerequisite-dialog';
+    ctx._uiKeepDialogFocus = () => () => {};
+    ctx._uiRestoreDialogFocus = () => {};
+    ctx._assistConnectorSetup = vi.fn((_entry, _button, ready) => ready());
+    const pending = ctx._runConnect(entry);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(overlay.innerHTML).toContain('connectors.setup.prerequisites_message');
+    expect(overlay.innerHTML).toContain('data-act="setup-assist"');
+    expect(overlay.innerHTML).toContain('https://app.shop-pro.jp/apps/956');
+    expect(overlay.innerHTML).not.toContain('data-connector-field');
+    expect(ctx.__events).toEqual([]);
+    handlers.get(outcome === 'connect' ? 'form:submit' : `${outcome}:click`)?.({ preventDefault: vi.fn() });
+    await pending;
+    expect(overlay.remove).toHaveBeenCalledOnce();
+    if (outcome === 'connect') {
+      expect(invoke).toHaveBeenCalledExactlyOnceWith('connectors.start_oauth', {
+        catalog_id: 'colorme-shop', connection_parameters: {},
+      });
+    } else expect(invoke).not.toHaveBeenCalled();
+    expect(ctx._assistConnectorSetup).toHaveBeenCalledTimes(outcome === 'assist' ? 1 : 0);
+  });
+
   it.each(['feishu', 'dingtalk', 'wecom'])('shows %s missing permissions alongside both Use and Reauthorize', id => {
     const ctx = loadConnectorsRenderer();
     ctx.t = (key: string, args: any = {}) => `${key} ${args.permissions || ''}`.trim();
@@ -189,7 +243,8 @@ describe('connector setup assistance', () => {
     ctx.document.querySelectorAll = () => [];
     ctx._runConnect = vi.fn(async () => {});
     expect(await ctx.window.openConnectorSetupById(complex.id)).toBe(true);
-    expect(ctx._runConnect).toHaveBeenCalledWith(complex);
+    // Host/model navigation must retain its source so it cannot inflate user clicks.
+    expect(ctx._runConnect).toHaveBeenCalledWith(complex, 'agent');
     expect(await ctx.window.openConnectorSetupById('missing-connector')).toBe(false);
     expect(ctx._runConnect).toHaveBeenCalledTimes(1);
   });
@@ -243,6 +298,7 @@ function loadConnectorsRenderer(
   const clicks: Array<[string, Record<string, unknown>]> = [];
   const events: Array<[string, Record<string, unknown>]> = [];
   const errors: Array<[string, Record<string, unknown>]> = [];
+  const logs = { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
   const views: string[] = [];
   const settingsTabs: string[] = [];
   const toasts: string[] = [];
@@ -272,7 +328,7 @@ function loadConnectorsRenderer(
     currentUserId: 'u-degraded',
     currentView: 'connectors',
     globalThis: { currentUserId: 'u-degraded' },
-    createLogger: () => ({ warn: () => {}, error: () => {}, info: () => {} }),
+    createLogger: () => logs,
     localStorage: {
       getItem: (key: string) => storage.get(key) || null,
       setItem: (key: string, value: string) => { storage.set(key, value); },
@@ -332,6 +388,7 @@ function loadConnectorsRenderer(
   context.window.globalThis = context.globalThis;
   vm.createContext(context);
   vm.runInContext(code, context, { filename: 'connectors.js' });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/connector-action-dialog.js'), 'utf8'), context);
   // `_connectorsState` is a top-level `let`, so it is NOT a property of the context object (only
   // function declarations are). Reach it by running code inside the context instead.
   context.__setInstances = (list: unknown[]) => {
@@ -346,6 +403,7 @@ function loadConnectorsRenderer(
   context.__clicks = clicks;
   context.__events = events;
   context.__errors = errors;
+  context.__logs = logs;
   context.__views = views;
   context.__settingsTabs = settingsTabs;
   context.__toasts = toasts;
@@ -709,13 +767,19 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
       en: ['Shop ID', 'Mainland China (open.shopee.cn)', 'External', 'Lark'],
       ja: ['ショップ ID', '中国本土（open.shopee.cn）', '外部', 'Lark'],
       pt: ['ID da loja', 'China continental (open.shopee.cn)', 'Ação externa', 'Lark'],
+      es: ['ID de la tienda', 'China continental (open.shopee.cn)', '', 'Lark'],
+      fr: ['ID de la boutique', 'Chine continentale (open.shopee.cn)', '', 'Lark'],
+      ko: ['Shop ID', '중국 본토(open.shopee.cn)', '', 'Lark'],
+      de: ['Shop-ID', 'Festlandchina (open.shopee.cn)', '', 'Lark'],
+      ru: ['Shop ID', 'Материковый Китай (open.shopee.cn)', '', 'Lark'],
+      it: ['Shop ID', 'Cina continentale (open.shopee.cn)', '', 'Lark'],
     };
-    for (const lang of ['zh', 'en', 'ja', 'pt'] as const) {
+    for (const lang of ['zh', 'en', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it'] as const) {
       const table = JSON.parse(fs.readFileSync(path.join(__dirname, `../../src/renderer/locales/${lang}.json`), 'utf8'));
       ctx.getLang = () => lang;
       ctx.t = (key: string, params: Record<string, unknown> = {}) => String(table[key] || key)
         .replace(/\{(\w+)\}/g, (match: string, name: string) => String(params[name] ?? match));
-      const html = ctx._connectorSetupMarkup(shopee, shopee.connection_setup!.fields, lang, 'four-locales');
+      const html = ctx._connectorSetupMarkup(shopee, shopee.connection_setup!.fields, lang, 'ten-locales');
       expect(html).toContain(expected[lang][0]);
       expect(html).toContain(ctx.escapeHtml(expected[lang][1]));
       expect(html).toContain('value="cn"');
@@ -755,6 +819,9 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
         .toBe(`node (${ctx.t('connectors.custom.argument_count', { n: 3 })})`);
     }
     expect(ctx._connectorCopy({ description_en: 'Remote fallback' }, 'description', 'ja-JP')).toBe('Remote fallback');
+    for (const lang of ['es', 'fr', 'ko', 'de', 'ru', 'it']) {
+      expect(ctx._connectorCopy({ description_en: 'Remote fallback' }, 'description', lang)).toBe('Remote fallback');
+    }
   });
 
   it('shows the detailed authorization result once without sending provider text to telemetry', () => {
@@ -1621,6 +1688,12 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
       display_name: 'Gmail',
       description_zh: '读取和发送邮件',
       description_en: 'Read and send email',
+      description_es: 'Leer y enviar correo',
+      description_fr: 'Lire et envoyer des courriels',
+      description_ko: '이메일 읽기 및 보내기',
+      description_de: 'E-Mails lesen und senden',
+      description_ru: 'Читать и отправлять письма',
+      description_it: 'Leggere e inviare email',
     };
     const workspace = {
       id: 'google-workspace',
@@ -1635,6 +1708,10 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(ctx._connectorMatchesSearch(workspace, 'productivity suite')).toBe(true);
     expect(ctx._connectorMatchesSearch(workspace, 'google-workspace')).toBe(true);
     expect(ctx._connectorMatchesSearch(workspace, '发送邮件')).toBe(true);
+    for (const query of ['enviar correo', 'envoyer des courriels', '이메일', 'E-Mails lesen', 'отправлять письма', 'inviare email']) {
+      expect(ctx._connectorMatchesSearch(gmail, query), query).toBe(true);
+      expect(ctx._connectorMatchesSearch(workspace, query), query).toBe(true);
+    }
     expect(ctx._connectorMatchesSearch(workspace, 'shopify')).toBe(false);
   });
 
@@ -1698,17 +1775,17 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(markup).toContain('value="live"');
   });
 
-  it('renders real user-app fields, guidance and a read-only callback in all four languages', async () => {
+  it('renders real user-app fields, guidance and a read-only callback in all ten languages', async () => {
     const { DIRECT_COMMERCE_ENTRIES } = await import('../../src/main/features/connectors/catalog-direct-commerce');
     const ctx = loadConnectorsRenderer();
     for (const entry of DIRECT_COMMERCE_ENTRIES.filter(row => row.connection_setup?.requirement)) {
       const setup = entry.connection_setup!;
-      for (const lang of ['zh', 'en', 'ja', 'pt'] as const) {
+      for (const lang of ['zh', 'en', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it'] as const) {
         const html = ctx._connectorSetupMarkup(entry, setup.fields, lang, 'app-dialog');
         expect(html.match(/data-connector-field/g), entry.id).toHaveLength(setup.fields.length);
         expect(html.match(/<form /g)).toHaveLength(1);
         expect(html).toContain('connectors.setup.user_app_message');
-        expect(setup.fields.filter(field => field.storage === 'credential').every(field => field.help_zh && field.help_en), entry.id)
+        expect(setup.fields.filter(field => field.storage === 'credential').every(field => field[`help_${lang}`]), `${entry.id}/${lang}`)
           .toBe(true);
         expect(html).toContain(ctx.escapeHtml(setup[`instructions_${lang}`]!));
         expect(html).toContain('data-act="open-setup-guide"');
@@ -1760,6 +1837,8 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     ctx._uiRestoreDialogFocus = () => {};
     ctx.navigator = { clipboard: { writeText: vi.fn(async () => undefined) } };
     const result = ctx._collectConnectionParameters(entry);
+    expect(ctx.__events).toEqual([]);
+    expect(JSON.stringify(ctx.__events)).not.toContain('my-app');
     await listeners.get('copy:click')!();
     expect(ctx.navigator.clipboard.writeText).toHaveBeenCalledWith(callbackUrl);
     expect(status.textContent).toBe('chat.copy_done');
@@ -1820,6 +1899,14 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(invoke).toHaveBeenCalledWith('auth.openExternal', {
       url: 'https://op.jinritemai.com/docs/guide-docs/140/583',
     });
+    invoke.mockRejectedValueOnce(new Error('private-guide-token https://private.example/callback'));
+    guideListeners.get('click')!();
+    await Promise.resolve();
+    expect(ctx.__logs.warn).toHaveBeenCalledWith('connector setup guide could not be opened', {
+      connector_id: 'douyin-shop-seller', error_type: 'exception',
+    });
+    expect(JSON.stringify(ctx.__logs.warn.mock.calls)).not.toMatch(/private-guide-token|private.example/);
+    expect(overlay.remove).not.toHaveBeenCalled();
     formListeners.get('submit')!({ preventDefault: vi.fn() });
     await expect(result).resolves.toEqual({ shop_id: '700000000000000001' });
   });
@@ -1904,7 +1991,7 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     await ctx._runConnect(entry);
 
     expect(ctx._collectConnectionParameters).toHaveBeenCalledTimes(1);
-    expect(ctx._collectConnectionParameters).toHaveBeenCalledWith(entry);
+    expect(ctx._collectConnectionParameters).toHaveBeenCalledWith(entry, 'form');
     expect(ctx.__prompts).toEqual([]);
     expect(invoke).toHaveBeenCalledWith('connectors.start_oauth', {
       catalog_id: 'netsuite',
@@ -1950,7 +2037,7 @@ describe('explicit connector failure codes', () => {
     [{ code: 'invalid_grant', error: 'Previous operation canceled; grant invalid' }, true],
   ])('shows hard failures without mistaking incidental cancel text for user cancellation: %j', (error, shouldAlert) => {
     const context = loadConnectorsRenderer();
-    context._handleConnectFailure({}, 0, error);
+    context._handleConnectFailure(error);
     expect(context.__alerts.length).toBe(shouldAlert ? 1 : 0);
     if (error.code === 'storage_unavailable') expect(context.__alerts[0]).toBe(context.t('connectors.errors.storage_unavailable'));
   });

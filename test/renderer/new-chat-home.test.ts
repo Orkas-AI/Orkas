@@ -15,20 +15,17 @@ function quickStartOrder(source: string, declaration: string) {
 }
 
 describe('new chat home surface', () => {
-  it('keeps the commercial external-agent entry fixed above Settings in the sidebar footer', () => {
+  it('keeps the open-source sidebar footer focused on local Settings', () => {
     const html = read('src/renderer/index.html');
     const sidebarFooter = html.slice(
       html.indexOf('<div class="sidebar-footer-actions">'),
       html.indexOf('<div class="sidebar-resize-handle"'),
     );
-    const landing = html.slice(html.indexOf('<section class="panel active" id="panel-new-chat">'), html.indexOf('<!-- Conversation Detail -->'));
-
-    expect(sidebarFooter).toContain('class="sb-connect" id="new-chat-external-agent-btn"');
-    expect(sidebarFooter).toContain('data-i18n="sidebar.connect_agent"');
-    expect(sidebarFooter).toContain('data-i18n="sidebar.connect_agent_sub"');
-    expect(sidebarFooter.indexOf('id="new-chat-external-agent-btn"'))
-      .toBeLessThan(sidebarFooter.indexOf('id="settings-btn"'));
-    expect(landing).not.toContain('new-chat-external-agent-btn');
+    expect(sidebarFooter).toContain('id="settings-btn"');
+    expect(sidebarFooter).not.toContain('new-chat-external-agent-btn');
+    expect(sidebarFooter).not.toContain('class="sb-connect"');
+    expect(sidebarFooter).not.toContain('sidebar-invite-btn');
+    expect(sidebarFooter.match(/<button\b/g)).toHaveLength(1);
   });
 
   it('keeps voice input filtered from the open-source composer', () => {
@@ -38,20 +35,20 @@ describe('new chat home surface', () => {
     expect(html).not.toContain('data-ui-icon="mic"');
   });
 
-  it('uses the commercial sidebar external-agent handler contract', () => {
+  it('keeps external CLI onboarding on the AI Team header only', () => {
+    const html = read('src/renderer/index.html');
     const state = read('src/renderer/modules/state.js');
     const agents = read('src/renderer/modules/agents.js');
     const handler = state.slice(
-      state.indexOf("document.getElementById('new-chat-external-agent-btn')"),
-      state.indexOf("document.getElementById('create-agent-btn')"),
+      state.indexOf("document.getElementById('agents-connect-cli-btn')"),
+      state.indexOf("document.getElementById('agents-back-btn')"),
     );
-
+    expect(html).not.toContain('id="new-chat-external-agent-btn"');
+    expect(html).toContain('id="agents-connect-cli-btn"');
+    expect(state).not.toContain("document.getElementById('new-chat-external-agent-btn')");
     expect(handler).toContain("initialTab: 'external'");
     expect(handler).toContain('externalOnly: true');
-    expect(handler).toContain("returnFocusId: 'new-chat-input'");
-    expect(handler).toContain("entryPoint: 'new_chat_external_agent'");
-    expect(handler).toContain("_trackAgentCreateOpen('new_chat_external_agent', { agent_type: 'cli' })");
-    expect(handler).not.toContain("setView('agents'");
+    expect(handler).toContain("entryPoint: 'agents_connect_cli_button'");
     expect(agents).toContain('if (tabBar) tabBar.hidden = externalOnly;');
     expect(agents).toContain('closeAgentModal({ restoreFocus: true });');
   });
@@ -62,9 +59,9 @@ describe('new chat home surface', () => {
     const clientConfig = read('src/main/features/client_config.ts');
     const expected = [
       'data',
-      'office',
+      'ecommerce',
       'ppt',
-      'creation',
+      'office',
       'image',
       'video',
       'ui_design',
@@ -93,7 +90,7 @@ describe('new chat home surface', () => {
 
     expect(css).toMatch(/#panel-new-chat\s*{[\s\S]*?position:\s*relative;/);
     expect(css).toContain('.quick-panel-more');
-    expect(css).toContain('.sb-connect');
+    expect(css).not.toContain('.sb-connect');
     expect(css).not.toContain('.sidebar-external-agent-btn');
     expect(css).not.toContain('.new-chat-external-agent-btn');
     expect(css).toMatch(/\.sidebar-footer-actions\s*{[\s\S]*?flex-direction:\s*column;[\s\S]*?align-items:\s*stretch;/);

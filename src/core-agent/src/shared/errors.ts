@@ -1,3 +1,5 @@
+import { providerCredentialFailure } from "./provider-error-facts.js";
+
 /** Base error class for core-agent errors. */
 export class CoreAgentError extends Error {
   constructor(
@@ -51,6 +53,19 @@ export class ProviderError extends CoreAgentError {
     this.provider = provider;
     this.statusCode = statusCode;
   }
+}
+
+/** Storage retries belong to Session, never to provider/tool replay. */
+export class SessionPersistenceError extends CoreAgentError {
+  constructor(public readonly storageCode?: string) {
+    super("Task progress could not be saved. Restore available storage and retry to continue.", "SESSION_PERSISTENCE_FAILED");
+    this.name = "SessionPersistenceError";
+  }
+}
+
+/** Structural check crosses the host CommonJS/core ESM module boundary. */
+export function isToolResultPersistenceError(err: unknown): err is Error & { code: string } {
+  return errorCodeOf(err) === "TOOL_RESULT_PERSISTENCE_FAILED";
 }
 
 export class StorageFullError extends CoreAgentError {
@@ -175,10 +190,6 @@ const TRANSIENT_MESSAGE_REASON_PATTERNS: Array<[RetryableErrorKind, RegExp]> = [
   [
     "network",
     /network.?(error|failure)|enetunreach|enetdown|eai_again|econnrefused/i,
-  ],
-  [
-    "rate_limit",
-    /rate.?limit|too many requests|\b429\b/i,
   ],
   [
     "server_error",
@@ -479,6 +490,11 @@ export function classifyTransientNetworkErrorWithPolicy(
   return null;
 }
 
+/** Only explicit throttling ends a run as a rate-limit failure. */
+export function isProviderRateLimitError(err: unknown): boolean {
+  return !isProviderSafetyError(err) && providerCredentialFailure(err) === "rate_limit";
+}
+
 export function classifyRetryableError(err: unknown): RetryableErrorKind | null {
   return classifyRetryableErrorWithPolicy(err, activeRetryErrorPolicy.config);
 }
@@ -488,7 +504,7 @@ export function classifyRetryableErrorWithPolicy(
   config?: Partial<RetryErrorPolicyConfig> | null,
 ): RetryableErrorKind | null {
   const policy = config ? compileRetryErrorPolicy(config) : activeRetryErrorPolicy;
-  if (err == null) return null;
+  if (err == null || isProviderRateLimitError(err)) return null;
   if (err instanceof AuthError || err instanceof ContextOverflowError || err instanceof OutputLimitError || err instanceof StorageFullError) return null;
 
   // Retry budget already spent below us (for example after provider rotation).
@@ -496,8 +512,12 @@ export function classifyRetryableErrorWithPolicy(
   // cannot silently re-enable the outer retry loop.
   if (
     err instanceof RetryExhaustedError
+    || errorCodeOf(err) === "SESSION_PERSISTENCE_FAILED"
+    || errorCodeOf(err) === "TASK_TOKEN_LIMIT_REACHED"
+    || isToolResultPersistenceError(err)
     || errorCodeOf(err) === RETRY_EXHAUSTED_CODE
     || errorCodeOf(err) === "PROVIDER_NETWORK_EXHAUSTED"
+    || errorCodeOf(err) === "PROVIDER_RETRIES_EXHAUSTED"
   ) return null;
 
   // Provider safety decisions are never retryable. This is a hard product
@@ -521,7 +541,6 @@ export function classifyRetryableErrorWithPolicy(
 
   if (hasPermanentFailureSignal(policy, err, true)) return null;
 
-  if (err instanceof RateLimitError) return "rate_limit";
   if (err instanceof TimeoutError) return "timeout";
 
   // Default to retrying unknown model/provider/runtime failures. The

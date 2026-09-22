@@ -43,6 +43,58 @@ afterEach(() => {
 });
 
 describe('project_files › explicit versioned replacement', () => {
+  it('stores a large text upload while retaining the whole-text preview/edit limit', async () => {
+    const files = await import('../../../src/main/features/project_files');
+    const bytes = Buffer.alloc(6 * 1024 * 1024, 'a');
+    const uploaded = await files.uploadProjectFile('u1', 'p1', 'large.csv', bytes);
+    expect(uploaded).toMatchObject({ ok: true, info: { bytes: bytes.length } });
+    expect(await files.readProjectTextFile('u1', 'p1', 'large.csv')).toMatchObject({ ok: false });
+    expect(await files.updateProjectTextFile('u1', 'p1', 'large.csv', bytes.toString())).toMatchObject({ ok: false });
+    const resolved = await files.resolveProjectFileAbsPath('u1', 'p1', 'large.csv');
+    if (!resolved.ok) throw new Error('Missing stored source');
+    expect(fs.readFileSync(resolved.absPath).equals(bytes)).toBe(true);
+    expect(enqueueCalls).toHaveLength(1);
+  });
+
+  it('imports exactly 200 MiB from disk without a full-file read and rejects the next byte', async () => {
+    const files = await import('../../../src/main/features/project_files');
+    const source = path.join(tmpDir, 'large.txt');
+    fs.closeSync(fs.openSync(source, 'w'));
+    fs.truncateSync(source, 200 * 1024 * 1024);
+    const read = vi.spyOn(fs.promises, 'readFile');
+    const imported = await files.importProjectFileFromPath('u1', 'p1', 'large.txt', source);
+    expect(imported).toMatchObject({ ok: true, info: { bytes: 200 * 1024 * 1024 } });
+    expect(read.mock.calls.some(([file]) => file === source)).toBe(false);
+    fs.truncateSync(source, 200 * 1024 * 1024 + 1);
+    expect(await files.importProjectFileFromPath('u1', 'p1', 'too-large.txt', source)).toMatchObject({ ok: false });
+    expect((await files.listProjectFiles('u1', 'p1')).map(file => file.name)).toEqual(['large.txt']);
+    expect(enqueueCalls).toHaveLength(1);
+  });
+
+  it('copies large text but rejects malformed UTF-8 beyond the former 5 MiB boundary', async () => {
+    const files = await import('../../../src/main/features/project_files');
+    const source = path.join(tmpDir, 'large.txt');
+    fs.writeFileSync(source, Buffer.alloc(6 * 1024 * 1024, 'a'));
+    expect(await files.copyProjectEntryFromPath('u1', 'p1', source, 'copied.txt')).toMatchObject({ ok: true });
+    fs.appendFileSync(source, Buffer.from([0xff]));
+    expect(await files.importProjectFileFromPath('u1', 'p1', 'invalid.txt', source)).toMatchObject({ ok: false });
+    expect((await files.listProjectFiles('u1', 'p1')).map(file => file.name)).toEqual(['copied.txt']);
+  });
+
+  it('preserves the successful copy when two streaming validations target the same name', async () => {
+    const files = await import('../../../src/main/features/project_files');
+    const source = path.join(tmpDir, 'source.txt');
+    fs.writeFileSync(source, 'concurrent copy sentinel');
+    const results = await Promise.all([
+      files.copyProjectEntryFromPath('u1', 'p1', source, 'copied.txt'),
+      files.copyProjectEntryFromPath('u1', 'p1', source, 'copied.txt'),
+    ]);
+    expect(results.filter(result => result.ok)).toHaveLength(1);
+    expect(results.find(result => !result.ok)).toMatchObject({ ok: false, error: 'target_exists' });
+    expect(await files.readProjectTextFile('u1', 'p1', 'copied.txt'))
+      .toMatchObject({ ok: true, content: 'concurrent copy sentinel' });
+  });
+
   it('preserves create-only saves and protects a newer user edit from a stale save', async () => {
     const files = await import('../../../src/main/features/project_files');
     await files.uploadProjectFile('u1', 'p1', 'report.md', Buffer.from('Original'));
@@ -106,6 +158,23 @@ describe('project_files › diagnostic privacy', () => {
     });
     return records;
   }
+
+  it('reports failed checkout and replacement privately while preserving Library bytes', async () => {
+    const records = await captureDiagnostics();
+    const files = await import('../../../src/main/features/project_files');
+    const name = 'Private acquisition.md';
+    await files.uploadProjectFile('u1', 'p1', name, Buffer.from('original'));
+    const working = path.join(tmpDir, 'private-working.md');
+    const checkout = await files.checkoutProjectFile('u1', 'p1', name, working);
+    if (!checkout.ok) throw new Error('checkout failed');
+    records.length = 0;
+    expect(await files.checkoutProjectFile('u1', 'p1', name, working)).toMatchObject({ ok: false });
+    expect(await files.replaceProjectFileFromPath('u1', 'p1', working + '.missing', name, checkout.revision))
+      .toMatchObject({ ok: false });
+    expect(records).toHaveLength(2);
+    expect(JSON.stringify(records)).not.toMatch(/Private acquisition|private-working|original/);
+    expect(await files.readProjectTextFile('u1', 'p1', name)).toMatchObject({ content: 'original' });
+  });
 
   it('keeps Library names and cache error content private through edit, move, and delete', async () => {
     const records = await captureDiagnostics();

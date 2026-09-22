@@ -188,6 +188,28 @@ class QuoteTest(unittest.TestCase):
 
 
 class RankTest(unittest.TestCase):
+    def test_free_offers_preserve_quality_order_and_never_bypass_the_gate(self):
+        base = {"dr": 45, "monthly_traffic": 30_000}
+        candidates = [
+            {"domain": "paid.example", "quoted_price_usd": 100, "metrics": base},
+            {"domain": "free.example", "quoted_price_usd": 0, "metrics": base},
+            {"domain": "strong-free.example", "quoted_price_usd": 0, "metrics": {**base, "dr": 70}},
+            {"domain": "no-quote.example", "metrics": base},
+            {"domain": "free-unknown.example", "quoted_price_usd": 0},
+            {"domain": "free-farm.example", "quoted_price_usd": 0, "metrics": {"dr": 70, "monthly_traffic": 100}},
+        ]
+        for offers in (candidates, list(reversed(candidates))):
+            with self.subTest(reversed=offers is not candidates):
+                got = rank({"candidates": offers})
+                self.assertEqual([row["domain"] for row in got["candidates"]], [
+                    "strong-free.example", "free.example", "paid.example", "no-quote.example",
+                    "free-unknown.example", "free-farm.example",
+                ])
+                self.assertEqual(got["needs_metrics"], ["free-unknown.example"])
+                self.assertEqual(got["avoid"], ["free-farm.example"])
+                self.assertEqual(got["candidates"][1]["quote"]["verdict"], "bargain")
+                json.dumps(got, allow_nan=False)
+
     def test_rank_orders_pass_by_value_then_needs_metrics_then_avoid(self):
         got = rank({"candidates": [
             {"domain": "farm.example", "quoted_price_usd": 50, "metrics": {"dr": 70, "monthly_traffic": 100}},
@@ -364,11 +386,74 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(body["data"]["candidates"][0]["rank"], 1)
 
+    def test_malformed_nested_containers_return_structured_errors(self):
+        for op in ("evaluate", "rank"):
+            for field in ("metrics", "market_prices", "tranco_history"):
+                invalid = ([], ["wrong-shape"], 1, "wrong-shape", False) if field == "metrics" else ({}, 1, "wrong-shape", False)
+                for value in invalid:
+                    with self.subTest(op=op, field=field, value=value):
+                        offer = {"domain": "fixture.example", "metrics": {"dr": 45, "monthly_traffic": 30_000}}
+                        if field == "tranco_history":
+                            offer["proxies"] = {field: value}
+                        else:
+                            offer[field] = value
+                        payload = offer if op == "evaluate" else {"candidates": [offer]}
+                        code, body = self.run_cli(["--op", op], payload)
+                        self.assertEqual(code, 1)
+                        self.assertFalse(body["ok"])
+                        self.assertIn(field, body["error"])
+                        self.assertNotIn("data", body)
+
+    def test_optional_nested_containers_keep_legacy_metrics_and_empty_inputs(self):
+        for op in ("evaluate", "rank"):
+            for metrics in (None, {}):
+                for prices in (None, []):
+                    for history in (None, []):
+                        with self.subTest(op=op, metrics=metrics, prices=prices, history=history):
+                            offer = {"domain": "fixture.example", "dr": 45, "monthly_traffic": 30_000,
+                                     "metrics": metrics, "market_prices": prices, "proxies": {"tranco_history": history}}
+                            payload = offer if op == "evaluate" else {"candidates": [offer]}
+                            code, body = self.run_cli(["--op", op], payload)
+                            self.assertEqual(code, 0)
+                            row = body["data"] if op == "evaluate" else body["data"]["candidates"][0]
+                            self.assertEqual(row["gate"]["status"], "pass")
+                            self.assertEqual(row["metrics"]["dr"], 45)
+                            self.assertEqual(row["metrics"]["monthly_traffic"], 30_000)
+                            self.assertEqual(row["market"]["data_tier"], "reference_table")
+
     def test_invalid_input_is_a_structured_error(self):
         code, body = self.run_cli(["--op", "evaluate"], {"metrics": {}})
         self.assertEqual(code, 1)
         self.assertFalse(body["ok"])
         self.assertIn("domain is required", body["error"])
+
+    def test_malformed_price_collections_never_become_observed_market_data(self):
+        for prices in ("12345", 100, False, {"100": 0, "120": 0, "150": 0, "200": 0, "400": 0}):
+            for op in ("evaluate", "rank"):
+                with self.subTest(prices=prices, op=op):
+                    payload = {**SOLID, "market_prices": prices} if op == "evaluate" else {
+                        "candidates": [SOLID], "market_prices": prices,
+                    }
+                    code, body = self.run_cli(["--op", op], payload)
+                    self.assertEqual(code, 1)
+                    self.assertFalse(body["ok"])
+                    self.assertIn("market_prices", body["error"])
+                    self.assertNotIn("data", body)
+        code, recovered = self.run_cli(["--op", "evaluate"], {
+            **SOLID, "market_prices": [100, 120, 150, 200, 400],
+        })
+        self.assertEqual(code, 0)
+        self.assertEqual(recovered["data"]["market"]["data_tier"], "observed_market")
+        self.assertEqual(recovered["data"]["market"]["guest_post_band_usd"]["median"], 150)
+
+    def test_malformed_metrics_return_the_structured_error_envelope(self):
+        for metrics in ("private fixture", [45, 30000], 45, False):
+            with self.subTest(metrics=metrics):
+                code, body = self.run_cli(["--op", "evaluate"], {**SOLID, "metrics": metrics})
+                self.assertEqual(code, 1)
+                self.assertFalse(body["ok"])
+                self.assertIn("metrics", body["error"])
+                self.assertNotIn("private fixture", body["error"])
 
 
 if __name__ == "__main__":

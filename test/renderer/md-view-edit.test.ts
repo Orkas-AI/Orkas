@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 
 type MarkdownEditorExports = {
+  mountMdViewEdit: (options: any) => any;
   _mveApplyMd: (state: any, textarea: FakeTextarea, kind: string) => void;
   _mveEnterEdit: (state: any) => void;
   _mveOnKey: (state: any, textarea: FakeTextarea, event: any) => void;
@@ -78,7 +79,7 @@ function loadMarkdownEditor(input: {
     console,
   };
   vm.runInNewContext(source, sandbox, { filename: 'md-view-edit.js' });
-  return module.exports;
+  return { ...module.exports, mountMdViewEdit: sandbox.mountMdViewEdit };
 }
 
 function editorState(content: string, draft = content) {
@@ -290,5 +291,22 @@ describe('Markdown view/edit behavior', () => {
       content: '- [x] pending',
     });
     expect(state.content).toBe('- [x] pending');
+  });
+});
+
+
+describe('Markdown editor save controller', () => {
+  it.each([true, false])('reports write success %s to a caller deciding whether to navigate', async (ok) => {
+    const editor = loadMarkdownEditor({ invoke: vi.fn(async () => ({ ok })), alert: vi.fn() });
+    const { state } = editorState('Original', 'Draft');
+    const controller = editor.mountMdViewEdit({
+      bodyEl: state.bodyEl, actionsEl: state.actionsEl,
+      source: { kind: 'project-file', projectId: 'p1', name: 'note.md' },
+      initialContent: 'Original', initialDraft: { content: 'Draft' },
+    });
+    expect(await controller.save()).toBe(ok);
+    expect(controller.isDirty()).toBe(!ok);
+    expect(controller.getMode()).toBe(ok ? 'view' : 'edit');
+    expect(controller.getDraft().content).toBe('Draft');
   });
 });

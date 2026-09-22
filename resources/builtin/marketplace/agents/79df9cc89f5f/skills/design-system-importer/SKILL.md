@@ -15,6 +15,8 @@ Do not use it for vague adjectives like "modern", "clean", "premium", "dynamic",
 
 ## Reference Intent Before Input Technique
 
+For reference-led reconstruction, first read [reference-recreation.md](../video-craft/references/reference-recreation.md) for content, motion, timing and audio evidence. Map its observations into the executable design contract below; token extraction alone does not reproduce a video's behavior.
+
 For every supplied image or video, first classify what the user wants from it. Explicit user requirements always override defaults; infer only when the user is silent:
 
 - `reproduce`: preserve the declared content, identity, composition, structure, style, motion, timing, or audio axes.
@@ -23,13 +25,12 @@ For every supplied image or video, first classify what the user wants from it. E
 
 Record `intent_basis:"user"` for an explicit requirement and `intent_basis:"inferred"` for a fallback. A request to change the supplied original implies edit; an explicit restore/recreate/match request implies reproduce; otherwise default to guide. Mixed instructions keep their operational intent while the user's exact protected and changeable axes remain authoritative. This classification is independent of origin. A screenshot, exported frame, camera photo, generated image, HTML capture, design-tool export, uploaded MP4, or generated video receives the same contract when the requested intent and roles are the same.
 
-Copy every exact inspected media file into `project/composition/assets/references/` before authoring and record that composition-local path. Do not rely on a chat thumbnail, stale temporary path, or prose description after the source has been supplied.
+Keep every exact inspected media file in `project/composition/assets/references/` before authoring and record that composition-local path. For video, reuse the frozen copy and `reference_path` returned by `reference.inspect`; no second shell copy is needed. Do not rely on a chat thumbnail, stale temporary path, or prose description after the source has been supplied.
 
 ## Source Access Is An Optimization, Not A Different Contract
 
 If the user owns reusable source code, vectors, layers, or assets, use them when that is the safest way to satisfy the same reference contract. If only pixels are available, derive the same spatial/temporal anchors from pixels. Availability of HTML, an ImageStudio project, or another authoring format must not change the requested intent, roles, fidelity floor, or review rubric.
 
-Adapt style; do not copy logos, protected assets, proprietary text, or trademarked UI one-to-one.
 Keep extraction small enough to fit inside the manifest art direction. Do not load or recreate an entire external design system.
 
 ## Extract Compact Tokens
@@ -42,7 +43,7 @@ Write a `style_source` object under `art_direction` in `project/composition/comp
     "style_source": {
       "source_type": "brand_system | design_notes | reference_media | existing_product | named_reference",
       "source_basis": "file path, user note, or inspected artifact",
-      "adaptation_boundary": "what may be borrowed vs what must not be copied",
+      "adaptation_boundary": "what the user wants preserved vs changed",
       "confidence": "high | medium | low",
       "fidelity_mode": "exact | close | adapt"
     }
@@ -58,7 +59,7 @@ Then normalize the source into sibling fields in `manifest.art_direction` that m
 - `layout_language`: grid, editorial, cinematic, dashboard, diagrammatic, poster, product-demo, or another concrete grammar.
 - `motion_language`: entrance, transition, emphasis, data-build, and exit patterns; keep it compatible with GSAP timeline seeking.
 - `asset_rules`: what images/icons/marks are allowed, need replacement, or must be avoided.
-- `do_not_copy`: logos, exact layouts, trademarked copy, screenshots, or protected illustrations unless the user owns them.
+- `do_not_copy`: only elements the user explicitly excludes; leave empty when none are excluded.
 
 Keep the imported style small. If more than 6 chromatic colors or 3 font roles are needed, summarize the conflict and pick the smallest faithful subset.
 
@@ -117,6 +118,6 @@ After extraction, `manifest.art_direction` must state:
 - What source was used.
 - Which tokens were adopted.
 - Which tokens were deliberately simplified.
-- Which elements must not be copied.
-- What visual signature will make the video feel related to the reference without becoming a clone.
+- Which elements the user explicitly excludes.
+- Which observed visual signature is retained under `preserve` and adapted under `may_change`.
 - Which image/video reference intent and roles, preserve/may-change rules, target scenes, layout/temporal anchors, and scored verification floor apply.

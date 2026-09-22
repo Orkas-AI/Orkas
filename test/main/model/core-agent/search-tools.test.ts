@@ -1,10 +1,19 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
   candidates: [] as Array<Record<string, any>>,
+  userId: 'user-1',
+  sessionId: 'session-1',
+  apiBase: 'https://search-account.test/api',
   runBuiltinWebSearch: vi.fn(),
   runSearchAdapter: vi.fn(),
 }));
+
+vi.mock('../../../../src/main/features/users', () => ({ getActiveUserId: () => h.userId }));
+vi.mock('../../../../src/main/features/account/token_store', () => ({
+  authHeaders: () => ({ user_id: h.userId, session_id: h.sessionId }),
+}));
+vi.mock('../../../../src/main/features/account/server', () => ({ accountApiBase: () => h.apiBase }));
 
 vi.mock('#core-agent', () => ({
   defineTool: (definition: Record<string, unknown>) => definition,
@@ -47,10 +56,15 @@ describe('web_search override tool', () => {
   beforeEach(() => {
     vi.resetModules();
     h.candidates = [];
+    h.userId = 'user-1';
+    h.sessionId = 'session-1';
+    h.apiBase = 'https://search-account.test/api';
     h.runBuiltinWebSearch.mockReset();
     h.runSearchAdapter.mockReset();
     h.runBuiltinWebSearch.mockResolvedValue({ content: 'free results', displayName: 'Brave' });
   });
+
+  afterEach(() => { vi.restoreAllMocks(); });
 
   it('keeps the parallel execution contract and validates query before provider access', async () => {
     const tool = await createTool();
@@ -180,5 +194,121 @@ describe('web_search override tool', () => {
     expect(result).toMatchObject({ isError: true });
     expect(result.content).toContain('Keyless fallback also failed');
     expect(result.content).toContain('network unavailable');
+  });
+
+  it.each([
+    'Search failed on all providers. Brave: HTTP 429; DuckDuckGo: request timed out',
+    'Search failed on all providers. Brave: no parseable search results',
+  ])('preserves the free-search failure after a paid account error: %s', async content => {
+    h.candidates = [{ id: 'paid', provider: 'tavily', apiKey: 'synthetic' }];
+    h.runSearchAdapter.mockRejectedValue(new Error('Tavily 402: credits exhausted'));
+    h.runBuiltinWebSearch.mockResolvedValue({ isError: true, content, displayName: 'Brave' });
+    const tool = await createTool();
+    for (let i = 0; i < 2; i++) {
+      const result = await tool.execute({ query: 'research query' }, { state: {} } as any);
+      expect(result).toMatchObject({ isError: true, displayName: 'Brave' });
+      expect(result.content).toContain(content);
+      expect(result.content).not.toContain('returned no results');
+      expect(result.content).not.toContain('Try a broader/different query');
+    }
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['credentials', 'provider', 'account'])(
+    'uses a working configuration immediately after changing %s', async change => {
+      h.candidates = [{ id: 'profile', provider: 'tavily', apiKey: 'synthetic-old' }];
+      h.runSearchAdapter.mockRejectedValueOnce(new Error('Search 402: credits exhausted'));
+      const tool = await createTool();
+      await tool.execute({ query: 'first' }, { state: {} } as any);
+      if (change === 'credentials') h.candidates[0] = { ...h.candidates[0], apiKey: 'synthetic-new' };
+      if (change === 'provider') h.candidates[0] = { ...h.candidates[0], provider: 'serper' };
+      if (change === 'account') h.userId = 'user-2';
+      h.runSearchAdapter.mockResolvedValueOnce({ results: [{ title: 'Recovered source', url: 'https://example.test/source', snippet: '' }] });
+      const result = await tool.execute({ query: 'second' }, { state: {} } as any);
+      expect(result.isError).not.toBe(true);
+      expect(result.content).toContain('Recovered source');
+      expect(h.runSearchAdapter).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('cools only the rejected profile even when another provider succeeds or has a transient outage', async () => {
+    h.candidates = [{ id: 'a', provider: 'tavily', apiKey: 'a' }, { id: 'b', provider: 'serper', apiKey: 'b' }];
+    h.runSearchAdapter
+      .mockRejectedValueOnce(new Error('Tavily 402: exhausted'))
+      .mockResolvedValueOnce({ results: [{ title: 'Source', url: 'https://example.test', snippet: '' }] })
+      .mockRejectedValueOnce(new Error('Serper 500: temporary outage'))
+      .mockResolvedValueOnce({ results: [{ title: 'Recovered', url: 'https://example.test', snippet: '' }] });
+    const tool = await createTool();
+    expect((await tool.execute({ query: 'one' }, { state: {} } as any)).content).toContain('Source');
+    expect((await tool.execute({ query: 'two' }, { state: {} } as any)).content).toContain('free results');
+    expect((await tool.execute({ query: 'three' }, { state: {} } as any)).content).toContain('Recovered');
+    expect(h.runSearchAdapter.mock.calls.map(call => call[0].id)).toEqual(['a', 'b', 'b', 'b']);
+  });
+
+  it('retries an unchanged configuration at cooldown expiry without extending it on skipped calls', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+    h.candidates = [{ id: 'profile', provider: 'tavily', apiKey: 'synthetic' }];
+    h.runSearchAdapter.mockRejectedValueOnce(new Error('Tavily 401: rejected'));
+    const tool = await createTool();
+    await tool.execute({ query: 'one' }, { state: {} } as any);
+    now.mockReturnValue(600_999);
+    await tool.execute({ query: 'two' }, { state: {} } as any);
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(1);
+    now.mockReturnValue(601_000);
+    h.runSearchAdapter.mockResolvedValueOnce({ results: [{ title: 'Recovered', url: 'https://example.test', snippet: '' }] });
+    expect((await tool.execute({ query: 'three' }, { state: {} } as any)).content).toContain('Recovered');
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(2);
+  });
+
+  it('shares cooldown across tools but keeps label edits and credential order out of its identity', async () => {
+    h.candidates = [{ id: 'profile', provider: 'tavily', apiKey: 'synthetic', extras: { region: 'global', mode: 'basic' } }];
+    h.runSearchAdapter.mockRejectedValue(new Error('Tavily 403: rejected'));
+    await (await createTool()).execute({ query: 'one' }, { state: {} } as any);
+    h.candidates[0] = { ...h.candidates[0], label: 'renamed', extras: { mode: 'basic', region: 'global' } };
+    await (await createTool('agent-2')).execute({ query: 'two' }, { state: {} } as any);
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not attach stale account failures after all paid profiles are removed', async () => {
+    h.candidates = [{ provider: 'tavily', apiKey: 'synthetic' }];
+    h.runSearchAdapter.mockRejectedValue(new Error('Tavily 402: exhausted'));
+    const tool = await createTool();
+    await tool.execute({ query: 'one' }, { state: {} } as any);
+    h.candidates = [];
+    const result = await tool.execute({ query: 'two' }, { state: {} } as any);
+    expect(result.content).toBe('free results');
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['credentials', 'account'])('a late failure cannot cool replacement %s', async change => {
+    h.candidates = [{ id: 'profile', provider: 'tavily', apiKey: 'synthetic-old' }];
+    let rejectOld!: (error: Error) => void;
+    h.runSearchAdapter.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOld = reject; }));
+    const tool = await createTool();
+    const old = tool.execute({ query: 'old' }, { state: {} } as any);
+    if (change === 'credentials') h.candidates[0] = { ...h.candidates[0], apiKey: 'synthetic-new' };
+    else h.userId = 'user-2';
+    h.runSearchAdapter.mockResolvedValue({ results: [{ title: 'Current source', url: 'https://example.test', snippet: '' }] });
+    expect((await tool.execute({ query: 'current' }, { state: {} } as any)).content).toContain('Current source');
+    rejectOld(new Error('Tavily 402: old credentials exhausted'));
+    await old;
+    expect((await tool.execute({ query: 'after late failure' }, { state: {} } as any)).content).toContain('Current source');
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(3);
+  });
+
+  it('bounds retained failures and evicts the oldest configuration without blocking a new one', async () => {
+    h.runSearchAdapter.mockRejectedValue(new Error('Tavily 402: exhausted'));
+    const tool = await createTool();
+    for (let i = 0; i < 129; i++) {
+      h.candidates = [{ id: `profile-${i}`, provider: 'tavily', apiKey: `synthetic-${i}` }];
+      await tool.execute({ query: 'one' }, { state: {} } as any);
+    }
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(129);
+    h.candidates = [{ id: 'profile-128', provider: 'tavily', apiKey: 'synthetic-128' }];
+    await tool.execute({ query: 'retained' }, { state: {} } as any);
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(129);
+    h.candidates = [{ id: 'profile-0', provider: 'tavily', apiKey: 'synthetic-0' }];
+    await tool.execute({ query: 'evicted' }, { state: {} } as any);
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(130);
   });
 });

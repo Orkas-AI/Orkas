@@ -166,7 +166,12 @@ test.describe('automation', () => {
     await page.screenshot({ path: testInfo.outputPath('automation-project-groups-narrow.png') });
   });
 
-  test('creates a persistent automation from the Commander model protocol', async ({ modelOrkas }) => {
+  test('leaves retired container markup inert and keeps a saved automation across relaunch', async ({ modelOrkas }) => {
+    // `<auto-task>` was retired on 2026-09-13 (review P3-2): the `auto_tasks`
+    // tool is the only writer, so markup in a reply — including markup quoted
+    // from a page — must create nothing, while the request still advertises the
+    // tool. Tool-driven creation is covered in `auto_tasks_tool.test.ts`; this
+    // case owns the app-level inertness and the persistence of a saved task.
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     let page = modelOrkas.page;
     modelOrkas.setModelTextReplies([[
@@ -185,30 +190,31 @@ test.describe('automation', () => {
     await page.locator('#new-chat-send-btn').click();
 
     const final = page.locator('#chat-history .chat-message.assistant [data-role="final"]').last();
-    await expect(final).toContainText('Automation created: E2E Daily Wrap-up', {
-      timeout: 20_000,
-    });
+    await expect(final).toContainText('将创建每日收尾提醒', { timeout: 20_000 });
     await expect(final).not.toContainText('<auto-task>');
+    await expect(final).not.toContainText('Automation created');
     expect(modelOrkas.modelRequests).toHaveLength(1);
     const requestText = JSON.stringify(modelOrkas.modelRequests[0]);
     expect(requestText).toContain('auto_tasks');
     expect(requestText).not.toContain('**auto-tasks**');
+    expect((await modelOrkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list')).tasks).toHaveLength(0);
 
-    let listed = await modelOrkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list');
+    const saved = await modelOrkas.invoke<{ task: AutoTask }>('autoTasks.create', {
+      title: 'E2E Daily Wrap-up',
+      content: 'Review unfinished work and choose tomorrow’s first task.',
+      schedule: { type: 'daily', hour: 19, minute: 45 },
+    });
+    expect(saved.task.enabled).toBe(true);
+
+    page = await modelOrkas.relaunch();
+    await openAutomation(page);
+    await expect(page.locator('.auto-row', { hasText: 'E2E Daily Wrap-up' })).toBeVisible();
+    const listed = await modelOrkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list');
     expect(listed.tasks).toHaveLength(1);
     expect(listed.tasks[0]).toMatchObject({
       title: 'E2E Daily Wrap-up',
       content: 'Review unfinished work and choose tomorrow’s first task.',
       enabled: true,
-      schedule: { type: 'daily', hour: 19, minute: 45 },
-    });
-
-    page = await modelOrkas.relaunch();
-    await openAutomation(page);
-    await expect(page.locator('.auto-row', { hasText: 'E2E Daily Wrap-up' })).toBeVisible();
-    listed = await modelOrkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list');
-    expect(listed.tasks[0]).toMatchObject({
-      title: 'E2E Daily Wrap-up',
       schedule: { type: 'daily', hour: 19, minute: 45 },
     });
     expect(modelOrkas.modelRequests).toHaveLength(1);

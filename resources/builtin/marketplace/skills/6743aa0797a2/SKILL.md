@@ -1,7 +1,7 @@
 ---
 name: brand-research
-description_zh: "研究公司、产品或品牌的公开资料并交付带来源的 Brand DNA，覆盖定位、受众、竞品、品牌语气、定价、社交证明和内容缺口；用于品牌网站研究、公司背景梳理和 GTM 内容准备。"
-description_en: "Research public information about a company, product, or brand and deliver sourced Brand DNA covering positioning, audience, competitors, voice, pricing, social proof, and content gaps. Use for brand research, company context, and GTM content preparation."
+description_zh: "研究公司、产品或品牌公开资料，交付带来源的 Brand DNA：定位、受众、竞品、语气、定价、社交证明与内容缺口，支持 GTM 准备。"
+description_en: "Research public company, product or brand information for sourced Brand DNA: positioning, audience, competitors, voice, pricing, social proof and content gaps for GTM preparation."
 ---
 
 # Brand Research

@@ -33,16 +33,15 @@
 //     renderer origin, so SOP already blocks parent.* access; the sandbox
 //     flags pre-empt top-window navigation and new-window pop.
 //   - The reveal-in-folder header button goes through workspace.revealPath,
-//     which the main process re-validates against the workspace + attachment
-//     scope.
+//     which validates an existing absolute path without granting read access.
 //
 // Usage:
 //   openChatFileViewer(absPath, displayName?, opts?)
 //     opts.cid — pass through when the file is a per-conv attachment, so
-//                main can include the cid's attachment dir in the reveal /
-//                read scope. Workspace-only paths can omit it.
+//                main can include the cid's attachment dir in the read scope.
+//                Workspace-only paths can omit it.
 //     opts.projectId — pass through when the file belongs to a project file
-//                pool so reveal / text preview can include that scope.
+//                pool so text preview can include that scope.
 
 let _viewerEl = null;
 let _viewerBody = null;
@@ -76,15 +75,6 @@ const _VIEWER_HTML_SLOW_LOAD_MS = 5000;
 const _viewerLog = (typeof createLogger === 'function')
   ? createLogger('chat-file-viewer')
   : { warn: () => {}, info: () => {}, error: () => {} };
-
-function _viewerTrack(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-}
-
-function _viewerTrackEvent(action, data) {
-  void action;
-  void data;
-}
 
 function _viewerClearPdfSlowTimer(state) {
   if (!state || !state.slowTimer) return;
@@ -340,14 +330,14 @@ const _IMAGE_EXTS = new Set([
 ]);
 const _VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
 const _AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.oga', '.opus', '.weba', '.m4a', '.aac', '.flac']);
-const _OFFICE_EXTS = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm']);
+const _OFFICE_EXTS = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.pptm']);
 const _MARKDOWN_EXTS = new Set(['.md', '.markdown']);
 // Text exts: the source-as-text bucket. Keep code-ish exts here too so the
 // user can peek at a generated script without leaving the app. No syntax
 // highlighting in this round; <pre> with white-space:pre-wrap is enough.
 const _TEXT_EXTS = new Set([
   '.txt', '.log',
-  '.csv', '.tsv',
+  '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
   '.json', '.yaml', '.yml',
   '.xml', '.ini', '.toml', '.conf',
   '.py', '.pyi',
@@ -503,6 +493,7 @@ function _viewerCanAddToLibrary(name, options = {}) {
 }
 
 function _viewerConversationIsProjectScoped(cid) {
+  if (window.OrkasPreviewHost?.projectScopedFor) return window.OrkasPreviewHost.projectScopedFor(cid);
   if (!cid || typeof conversations === 'undefined' || !Array.isArray(conversations)) return false;
   const conversation = conversations.find((item) => item && item.conversation_id === cid);
   return !!(conversation && conversation.project_id);
@@ -606,6 +597,7 @@ function _teardownViewerContent(reason = 'replaced') {
   }
   _viewerEditController = null;
   _viewerDirty = false;
+  window.OrkasPreviewHost?.setDirty(false);
   _viewerLibraryProjectScoped = false;
   if (_viewerHtmlCanvasResizeHandler && typeof window !== 'undefined') {
     window.removeEventListener('resize', _viewerHtmlCanvasResizeHandler);
@@ -660,7 +652,6 @@ async function _onAddLibraryClick() {
   if (!p || !_viewerCurrentCid || !_viewerAddLibraryBtn || _viewerAddLibraryBtn.disabled) return;
   if (!_viewerCanAddToLibrary(p, { projectScoped: _viewerLibraryProjectScoped })) return;
   const startedAt = Date.now();
-  _viewerTrack('file_preview_add_library', { kind: _kindOf(p), has_project: !!_viewerCurrentProjectId });
   const label = _viewerLabel('chat.preview_add_library_title', 'Add to Library');
   const doneLabel = _viewerLabel('chat.preview_add_library_done', 'Added');
   const original = _viewerAddLibraryButtonHtml(label);
@@ -674,12 +665,6 @@ async function _onAddLibraryClick() {
   } catch (err) {
     const failure = _viewerStableFailure(err, 'library_import_failed', 'ipc');
     const reason = String(err && err.message || err);
-    _viewerTrackEvent('file_preview_add_library_result', {
-      result: 'failure',
-      kind: _kindOf(p),
-      duration_ms: _viewerDurationSince(startedAt),
-      ...failure,
-    });
     _viewerLogFailure('file_preview_add_library', failure);
     let message = `Add to Library failed: ${reason}`;
     if (typeof t === 'function') {
@@ -699,24 +684,13 @@ async function _onAddLibraryClick() {
   if (!res || !res.ok) {
     const failure = _viewerStableFailure(res, 'library_import_failed', 'operation');
     const reason = String((res && res.error) || 'failed');
-    _viewerTrackEvent('file_preview_add_library_result', {
-      result: 'failure',
-      kind: _kindOf(p),
-      duration_ms: _viewerDurationSince(startedAt),
-      ...failure,
-    });
     _viewerLogFailure('file_preview_add_library', failure);
     await _viewerShowAlert(`Add to Library failed: ${reason}`, 'file_preview_add_library_presentation');
     return;
   }
 
   const scope = res.scope === 'project' ? 'project' : (res.scope === 'global' ? 'global' : 'unknown');
-  _viewerTrackEvent('file_preview_add_library_result', {
-    result: 'success',
-    kind: _kindOf(p),
-    scope,
-    duration_ms: _viewerDurationSince(startedAt),
-  });
+  window.OrkasPreviewHost?.filesChanged();
   try {
     _viewerAddLibraryBtn.innerHTML = _viewerAddLibraryButtonHtml(doneLabel, 'check');
     if (scope === 'global' && typeof currentView !== 'undefined' && currentView === 'contexts' && typeof loadContexts === 'function') {
@@ -763,20 +737,12 @@ async function _onSaveAppClick() {
   if (!p || !_viewerSaveAppBtn || _viewerSaveAppBtn.disabled) return;
   const startedAt = Date.now();
   if (_viewerDirty) {
-    _viewerTrackEvent('file_preview_save_app_result', {
-      result: 'failure',
-      surface: 'file_preview',
-      kind: _kindOf(p),
-      duration_ms: _viewerDurationSince(startedAt),
-      error_type: 'validation',
-      error_code: 'unsaved_changes',
-    });
     const message = _viewerLabel('apps.save_from_file_dirty', 'Save the file changes before saving it as an app.');
     await _viewerShowAlert(message, 'file_preview_save_app_presentation');
     return;
   }
   const label = _viewerLabel('apps.save_from_file_action', 'Save as app');
-  const doneLabel = _viewerLabel('apps.saved_toast', 'Saved to My Apps');
+  const doneLabel = _viewerLabel('apps.saved_toast', 'Saved to Apps');
   const original = _viewerSaveAppButtonHtml(label);
   try { _setSaveAppVisible(false); } catch (_) {
     _viewerLogFailure('file_preview_save_app_presentation', {
@@ -790,13 +756,6 @@ async function _onSaveAppClick() {
   } catch (err) {
     const failure = _viewerStableFailure(err, 'saved_app_save_failed', 'ipc');
     const reason = String(err && err.message || err);
-    _viewerTrackEvent('file_preview_save_app_result', {
-      result: 'failure',
-      surface: 'file_preview',
-      kind: _kindOf(p),
-      duration_ms: _viewerDurationSince(startedAt),
-      ...failure,
-    });
     _viewerLogFailure('file_preview_save_app', failure);
     const prefix = _viewerLabel('apps.save_failed', 'Could not save the app');
     await _viewerShowAlert(`${prefix}: ${reason}`, 'file_preview_save_app_presentation');
@@ -806,26 +765,13 @@ async function _onSaveAppClick() {
   if (!res || res.ok === false) {
     const failure = _viewerStableFailure(res, 'saved_app_save_failed', 'operation');
     const reason = String((res && res.error) || 'failed');
-    _viewerTrackEvent('file_preview_save_app_result', {
-      result: 'failure',
-      surface: 'file_preview',
-      kind: _kindOf(p),
-      duration_ms: _viewerDurationSince(startedAt),
-      ...failure,
-    });
     _viewerLogFailure('file_preview_save_app', failure);
     const prefix = _viewerLabel('apps.save_failed', 'Could not save the app');
     await _viewerShowAlert(`${prefix}: ${reason}`, 'file_preview_save_app_presentation');
     _scheduleSaveAppButtonRestore(p, original);
     return;
   }
-
-  _viewerTrackEvent('file_preview_save_app_result', {
-    result: 'success',
-    surface: 'file_preview',
-    kind: _kindOf(p),
-    duration_ms: _viewerDurationSince(startedAt),
-  });
+  window.OrkasPreviewHost?.filesChanged();
   try {
     _viewerSaveAppBtn.innerHTML = _viewerSaveAppButtonHtml(doneLabel, 'check');
     if (typeof uiToast === 'function') uiToast(doneLabel, { variant: 'success' });
@@ -904,6 +850,7 @@ async function closeChatFileViewer(opts) {
     document.removeEventListener('keydown', _viewerKeyHandler);
     _viewerKeyHandler = null;
   }
+  if (!force) window.OrkasPreviewHost?.close();
   return true;
 }
 
@@ -994,13 +941,11 @@ async function _renderHtmlBody(absPath, displayName, cid, projectId) {
   if (!seq) return;
   const state = _viewerBeginHtmlPreview(cid, projectId);
   const url = _chatMediaLocalUrl(absPath);
-  // sandbox: allow-scripts ONLY. chat-media:// is a distinct origin from
+  // sandbox: opaque origin. chat-media:// is a distinct origin from
   // file://, so SOP blocks parent.* access; we additionally forbid
   // allow-same-origin (no cookie / localStorage / sibling-fetch reach),
-  // allow-popups (no window.open), and allow-top-navigation (no top-frame
-  // redirects). Self-contained LLM-generated HTML still runs its inline
-  // scripts and styles.
-  const sandbox = 'allow-scripts';
+  // top navigation. Browser actions use existing host handlers.
+  const sandbox = 'allow-scripts allow-forms allow-downloads allow-popups allow-modals';
   const iframe = document.createElement('iframe');
   iframe.className = 'chat-file-viewer-html';
   iframe.setAttribute('sandbox', sandbox);
@@ -1206,6 +1151,7 @@ async function _renderVideoBody(absPath, displayName, cid, projectId, playbackOp
 async function openChatVideoUrlViewer(src, displayName, opts) {
   const url = String(src || '').trim();
   if (!url) return;
+  if (window.OrkasPreviewWindows) return window.OrkasPreviewWindows.open({ kind: 'video', src: url, title: displayName || '', options: window.OrkasPreviewWindows.options(opts) });
   const absPath = (opts && opts.absPath) || _viewerAbsPathFromChatMediaLocalUrl(url);
   const cid = (opts && opts.cid) || null;
   const projectId = (opts && opts.projectId) || null;
@@ -1288,7 +1234,7 @@ async function _renderMarkdownBody(absPath, displayName, cid, projectId) {
     initialContent: text,
     actionIconOnly: true,
     callbacks: {
-      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; },
+      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; window.OrkasPreviewHost?.setDirty(_viewerDirty); },
       onSaved: () => _typesetViewerMarkdown(),
     },
   });
@@ -1303,7 +1249,8 @@ async function _renderTextBody(absPath, displayName, cid, projectId) {
   // back to the "open the folder?" dialog (same UX as the read-only path
   // before). On success, hand the text to mountTextViewEdit; it owns the
   // view ↔ edit transitions, save IPC, and dirty tracking from there.
-  const text = await _readTextFile(absPath, cid, projectId, seq);
+  const preview = {};
+  const text = await _readTextFile(absPath, cid, projectId, seq, preview);
   if (text === null || seq !== _viewerRenderSeq || !_isViewerOpen()) return;
   _viewerFinishLoading();
   if (typeof mountTextViewEdit !== 'function') {
@@ -1317,12 +1264,13 @@ async function _renderTextBody(absPath, displayName, cid, projectId) {
     source: { absPath, cid: cid || undefined, projectId: projectId || undefined },
     // Project Library files are read-only by design (the LLM owns project workspace
     // mutations); workspace / per-conv attachments allow edit + save.
-    capabilities: projectId ? { edit: false, save: false } : { edit: true, save: true },
+    partial: preview.truncated === true,
+    capabilities: projectId || preview.truncated ? { edit: false, save: false } : { edit: true, save: true },
     initialMode: 'view',
     initialContent: text,
     actionIconOnly: true,
     callbacks: {
-      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; },
+      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; window.OrkasPreviewHost?.setDirty(_viewerDirty); },
     },
   });
 }
@@ -1331,17 +1279,21 @@ async function _renderTextBody(absPath, displayName, cid, projectId) {
 // surfaces the fallback dialog (and returns null so the caller knows to
 // stop). Closes the overlay before showing the dialog so it doesn't stack
 // on top of a half-built viewer.
-async function _readTextFile(absPath, cid, projectId, seq) {
+async function _readTextFile(absPath, cid, projectId, seq, preview) {
   _viewerCurrentPath = absPath;
   _viewerCurrentCid = cid || null;
   _viewerCurrentProjectId = projectId || null;
   try {
     const payload = { path: absPath };
+    if (preview && /\.(csv|tsv)$/i.test(absPath)) payload.preview = true;
     if (cid) payload.cid = cid;
     if (projectId) payload.projectId = projectId;
     const res = await window.orkas.invoke('produced.readText', payload);
     if (seq && seq !== _viewerRenderSeq) return null;
-    if (res && res.ok) return String(res.text || '');
+    if (res && res.ok) {
+      if (preview) preview.truncated = res.truncated === true;
+      return String(res.text || '');
+    }
     // Specifically distinguish too_large so the user sees "file is X MB,
     // open in folder?" instead of a generic failure.
     const err = (res && res.error) || 'unknown';
@@ -1424,6 +1376,14 @@ async function _ensureViewerFileExists(absPath, cid, projectId) {
     if (res && res.ok && res.exists && res.isFile !== false) return true;
     if (res && res.ok && res.exists && res.isFile === false) return true;
     const name = String(absPath || '').split(/[\\/]/).pop() || String(absPath || '');
+    if (!res || !res.ok) {
+      await _showUnsupportedDialog(absPath, cid, projectId, {
+        messageKey: 'chat.preview_read_failed_message',
+        vars: { name },
+        fallback: 'Could not read this file. Open the containing folder?',
+      });
+      return false;
+    }
     const message = _viewerLabelVars(
       'chat.file_missing_toast',
       'The file no longer exists.',
@@ -1442,19 +1402,24 @@ async function _ensureViewerFileExists(absPath, cid, projectId) {
 
 async function openChatFileViewer(absPath, displayName, opts) {
   if (!absPath) return;
+  if (window.OrkasPreviewWindows) {
+    if (!(await _ensureViewerFileExists(absPath, opts?.cid, opts?.projectId))) return;
+    if (_kindOf(absPath) === 'image') return window.OrkasPreviewWindows.image(_chatMediaLocalUrl(absPath), displayName || absPath.split(/[\\/]/).pop(), { ...opts, absPath });
+    return window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: displayName || absPath.split(/[\\/]/).pop(), options: window.OrkasPreviewWindows.options(opts) });
+  }
   const cid = (opts && opts.cid) || null;
   const projectId = (opts && opts.projectId) || null;
   const name = displayName || (absPath.split(/[\\/]/).pop() || absPath);
   const exists = await _ensureViewerFileExists(absPath, cid, projectId);
   if (!exists) return;
-  const kind = _kindOf(name);
+  const kind = _kindOf(absPath);
 
   if (kind === 'image') {
     // Delegate — the image lightbox already has zoom / pan / keyboard. We
     // need the chat-media:// URL since openChatImageLightbox expects an
     // <img>-loadable src, not an abs path.
     if (typeof openChatImageLightbox === 'function') {
-      openChatImageLightbox(_chatMediaLocalUrl(absPath), name, { absPath, cid, projectId });
+      openChatImageLightbox(_chatMediaLocalUrl(absPath), name, { absPath, cid, projectId, sourceElement: opts?.sourceElement });
     }
     return;
   }

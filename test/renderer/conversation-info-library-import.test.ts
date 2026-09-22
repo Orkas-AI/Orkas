@@ -76,6 +76,8 @@ function createHarness(options: {
   projectId?: string;
   importResult: Record<string, unknown>;
   labels?: Record<string, string>;
+  fileActionResult?: Record<string, unknown>;
+  confirmDelete?: boolean;
 }) {
   const policySource = fs.readFileSync(
     path.join(__dirname, '../../src/renderer/modules/file-operation-policy.js'),
@@ -90,13 +92,18 @@ function createHarness(options: {
   const invoke = vi.fn(async (channel: string) => {
     if (channel === 'savedApps.inspectBundleFromPath') return { ok: true, canSave: false };
     if (channel === 'library.importProduced') return options.importResult;
+    if (channel === 'workspace.revealPath' || channel === 'workspace.deletePath') {
+      return options.fileActionResult || { ok: true };
+    }
     throw new Error(`unexpected channel: ${channel}`);
   });
   const uiToast = vi.fn();
   const uiAlert = vi.fn(async () => undefined);
+  const uiConfirmDanger = vi.fn(async () => options.confirmDelete === true);
   const monitorEvent = vi.fn();
   const labels: Record<string, string> = {
     'conversation_info.file_reveal_action': 'Show in folder',
+    'conversation_info.file_reveal_failed': 'Could not open folder: {reason}',
     'conversation_info.file_add_to_chat_action': 'Add to chat',
     'conversation_info.file_add_to_library_action': 'Add to Library',
     'conversation_info.file_add_to_library_done': 'Added to {library}',
@@ -134,6 +141,7 @@ function createHarness(options: {
     },
     uiToast,
     uiAlert,
+    uiConfirmDanger,
     Monitor: { event: monitorEvent },
     document: {
       readyState: 'complete',
@@ -170,7 +178,23 @@ function createHarness(options: {
     invoke,
     uiToast,
     uiAlert,
+    uiConfirmDanger,
     monitorEvent,
+    async openFileMenu(filePath: string, onDeleted = vi.fn()) {
+      await context.window.ConversationInfo.openFileMenu(
+        new FakeElement(), filePath, path.basename(filePath),
+        { cid: 'conversation-1', onDeleted },
+      );
+      const menu = elements.get('conversation-info-file-menu')!;
+      return {
+        actions: menu.children.map(item => item.dataset.action),
+        async click(action: string) {
+          const item = menu.children.find(item => item.dataset.action === action);
+          expect(item, `${action} should be available`).toBeDefined();
+          await item!.click();
+        },
+      };
+    },
     async clickAddToLibrary(filePath: string) {
       const anchor = new FakeElement();
       await context.window.ConversationInfo.openFileMenu(
@@ -270,5 +294,65 @@ describe('ConversationInfo produced-file Library import', () => {
       cid: 'conversation-1',
     });
     expect(harness.uiToast).toHaveBeenCalledWith('Added to Project Library', { variant: 'success' });
+  });
+});
+
+describe('shared file actions for inline audio', () => {
+  const filePath = '/workspace/voice.mp3';
+
+  it('offers reveal and delete without a hosted share action', async () => {
+    const harness = createHarness({ importResult: {} });
+    const menu = await harness.openFileMenu(filePath);
+    expect(menu.actions).toEqual(expect.arrayContaining(['reveal', 'delete']));
+    expect(menu.actions).not.toContain('share-file');
+    await menu.click('reveal');
+    expect(harness.invoke).toHaveBeenCalledWith('workspace.revealPath', { path: filePath, cid: 'conversation-1' });
+  });
+
+  it.each(['/tmp/new temporary/试听 #1 %.mp3', '/outside/downloads/会议记录.pdf'])(
+    'adds the selected external file %s to the current conversation without rewriting its path',
+    async selectedPath => {
+      const harness = createHarness({ importResult: {} });
+      const addAttachments = vi.fn(async () => undefined);
+      harness.context.window.addChatAttachmentsFromPaths = addAttachments;
+      const menu = await harness.openFileMenu(selectedPath);
+      expect(menu.actions).toContain('add-to-chat');
+      await menu.click('add-to-chat');
+      expect(addAttachments).toHaveBeenCalledExactlyOnceWith('conversation-1', [
+        { path: selectedPath, name: path.basename(selectedPath) },
+      ]);
+    },
+  );
+
+  it('keeps the audio intact when deletion is cancelled', async () => {
+    const harness = createHarness({ importResult: {}, confirmDelete: false });
+    const onDeleted = vi.fn();
+    await (await harness.openFileMenu(filePath, onDeleted)).click('delete');
+    expect(harness.uiConfirmDanger).toHaveBeenCalledOnce();
+    expect(harness.invoke).not.toHaveBeenCalledWith('workspace.deletePath', expect.anything());
+    expect(onDeleted).not.toHaveBeenCalled();
+  });
+
+  it.each(['response', 'rejection'])('reports a reveal %s failure and allows another attempt', async failure => {
+    const harness = createHarness({ importResult: {} });
+    const menu = await harness.openFileMenu(filePath);
+    if (failure === 'response') harness.invoke.mockResolvedValueOnce({ ok: false, error: 'unavailable' });
+    else harness.invoke.mockRejectedValueOnce(new Error('unavailable'));
+    await menu.click('reveal');
+    expect(harness.uiAlert).toHaveBeenCalledExactlyOnceWith('Could not open folder: unavailable');
+    await (await harness.openFileMenu(filePath)).click('reveal');
+    expect(harness.invoke.mock.calls.filter(([channel]) => channel === 'workspace.revealPath')).toHaveLength(2);
+  });
+
+  it('removes the card only after confirmed deletion succeeds and permits retry after failure', async () => {
+    const harness = createHarness({ importResult: {}, confirmDelete: true, fileActionResult: { ok: false, error: 'not_found' } });
+    const onDeleted = vi.fn();
+    await (await harness.openFileMenu(filePath, onDeleted)).click('delete');
+    expect(harness.invoke).toHaveBeenCalledWith('workspace.deletePath', { path: filePath, cid: 'conversation-1' });
+    expect(onDeleted).not.toHaveBeenCalled();
+    const retry = await harness.openFileMenu(filePath, onDeleted);
+    harness.invoke.mockResolvedValueOnce({ ok: true });
+    await retry.click('delete');
+    expect(onDeleted).toHaveBeenCalledExactlyOnceWith(filePath);
   });
 });

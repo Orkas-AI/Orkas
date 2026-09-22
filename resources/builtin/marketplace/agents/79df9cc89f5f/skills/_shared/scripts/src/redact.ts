@@ -1,6 +1,6 @@
 /**
  * Redaction helpers for log/telemetry text. Subprocess stderr (ffmpeg /
- * OCR / whisper) can contain absolute filesystem paths, which CLAUDE.md
+ * whisper) can contain absolute filesystem paths, which CLAUDE.md
  * forbids writing to logs. Use `redactPaths` on any captured stderr/stdout tail
  * before logging it.
  */

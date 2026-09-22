@@ -91,11 +91,13 @@ export is not a scene-only shortcut.
 
 ## Fast COMPOSE runbook
 
-1. Read this installed root once per conversation; re-read only when runtime
+1. For a new runtime production, finish
+   [video-router's direction confirmation](../video-router/SKILL.md#direction-confirmation)
+   before design preparation. On resume, reuse the chosen direction; do not ask again.
+2. Read this installed root once per conversation; re-read only when runtime
    reports an updated installation. Read an existing canonical manifest. Apply
    `frontend-design`; apply `design-system-importer` only for a concrete style
    source; apply `composition-design-review` only after snapshot.
-2. Stop for direction before writing any manifest, narration, or art direction.
 3. The plan is only
    `project/composition/composition-manifest.json`: duration, language, audio
    ownership, scenes, approved copy, narration, and art direction. No shotlist,
@@ -181,10 +183,9 @@ promise.
 ## Director judgment
 
 - One concept per visual chapter; concrete before abstract.
-- Choose one subject-derived signature device and spend distinctiveness there.
+- Follow `frontend-design`'s selected reference-led or original path for visual identity and scene variation.
 - Render exact stats/names/CTAs as real text, never AI-image text.
 - Build to narration words and hold a resolved chart/scene before moving on.
-- Vary scene types; no three near-identical layouts in a row.
 - Ordinary subtitles are caption-track data owned by assembly. Only decorative
   kinetic captioning may be baked into the composition, and the user must know
   it is not separately editable.

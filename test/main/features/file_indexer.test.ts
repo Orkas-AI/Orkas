@@ -74,6 +74,42 @@ async function makePng(): Promise<Buffer> {
   return await img.getBuffer('image/png');
 }
 
+describe('file_indexer › opaque media', () => {
+  it.each([
+    ['MP4', 'video'], ['webm', 'video'], ['mov', 'video'], ['m4v', 'video'], ['ogv', 'video'],
+    ['mp3', 'audio'], ['wav', 'audio'], ['ogg', 'audio'], ['opus', 'audio'],
+    ['m4a', 'audio'], ['aac', 'audio'], ['flac', 'audio'],
+  ])('keeps %s bytes out of text reads and the extraction cache', async (ext, kind) => {
+    const m = await loadMod();
+    const bytes = Buffer.from('\0\0ftypisom\0binary-media-sentinel');
+    const abs = attachmentFile('reference-chat', `source.${ext}`, bytes);
+    expect(m.kindOf(abs)).toBe(kind);
+    expect(await m.statFile(UID, abs)).toMatchObject({ kind, bytes: bytes.length, source: 'attachment', cid: 'reference-chat' });
+    expect((await m.statFile(UID, abs)).totalChars).toBeUndefined();
+    await expect(m.readRange(UID, abs)).rejects.toThrow(m.NoTextError);
+    await expect(m.getExtractedText(UID, abs)).rejects.toThrow(m.NoTextError);
+    expect(m.getCachedMeta(UID, abs)).toBeNull();
+    const cacheDir = path.join(userFileCacheRoot(), crypto.createHash('sha1').update(abs).digest('hex').slice(0, 16));
+    expect(fs.existsSync(cacheDir)).toBe(false);
+    expect(fs.readFileSync(abs)).toEqual(bytes);
+  });
+
+  it('ignores a legacy text cache for an unchanged MP4 source', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('reference.mp4', '\0legacy-media-sentinel');
+    const dir = path.join(userFileCacheRoot(), crypto.createHash('sha1').update(abs).digest('hex').slice(0, 16));
+    const st = fs.statSync(abs);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({
+      absPath: abs, mtime: st.mtimeMs, size: st.size, kind: 'text', source: 'workspace',
+      totalChars: st.size, cacheVersion: m.EXTRACT_CACHE_VERSION, lastAccessed: Date.now(),
+    }));
+    expect(m.getCachedMeta(UID, abs)).toBeNull();
+    expect(await m.statFile(UID, abs)).toMatchObject({ kind: 'video' });
+    await expect(m.readRange(UID, abs)).rejects.toThrow(m.NoTextError);
+  });
+});
+
 describe('file_indexer › statFile', () => {
   it('logs only masked account and path references when materialising', async () => {
     const m = await loadMod();
@@ -260,6 +296,73 @@ describe('file_indexer › readRange on text', () => {
       syncBuiltinESMExports();
     }
   });
+
+  it.each(['char', 'line'] as const)('bounds a %s page below 4 MiB and reuses streamed metadata', async (unit) => {
+    const prefix = 'header\n';
+    const selected = 'a'.repeat(65_528) + '🙂' + '中文\n'.repeat(30_000) + 'z'.repeat(700_000);
+    const body = prefix + selected + '\nTAIL';
+    const abs = writeWorkspaceFile('bounded.txt', body);
+    const hash = `sha256:${crypto.createHash('sha256').update(body, 'utf8').digest('hex')}`;
+    const streamSpy = vi.spyOn(fsDefault, 'createReadStream');
+    const readSpy = vi.spyOn(fs.promises, 'readFile');
+    syncBuiltinESMExports();
+    try {
+      const m = await loadMod();
+      const request = unit === 'char'
+        ? { charStart: prefix.length, charEnd: prefix.length + selected.length }
+        : { lineStart: 2, lineEnd: 30_002 };
+      const first = await m.readRange(UID, abs, { ...request, maxContentChars: 100_000 });
+      expect(first.content.length).toBeLessThanOrEqual(100_000);
+      expect(first.content).toBe(selected.slice(0, 100_000));
+      expect(first.range).toEqual({ charStart: prefix.length, charEnd: prefix.length + 100_000 });
+      expect(first.requestedCharEnd).toBe(prefix.length + selected.length);
+      expect(first.meta.totalChars).toBe(body.length);
+      expect(first.sourceHash).toBe(hash);
+      // A bounded request must not take the old whole-file fast path, including
+      // during first-use metadata preparation. Later pages reuse the hash.
+      expect(readSpy.mock.calls.filter(([file]) => file === abs)).toHaveLength(0);
+      expect(streamSpy.mock.calls.filter(([file]) => file === abs)).toHaveLength(2);
+      streamSpy.mockClear();
+      const next = await m.readRange(UID, abs, {
+        charStart: first.range.charEnd, charEnd: first.requestedCharEnd, maxContentChars: 100_000,
+      });
+      expect(next.content).toBe(selected.slice(100_000, 200_000));
+      expect(next.requestedCharEnd).toBe(first.requestedCharEnd);
+      expect(next.sourceHash).toBe(hash);
+      const streams = streamSpy.mock.results.map(result => result.value as fs.ReadStream);
+      expect(streams).toHaveLength(1);
+      expect(streams[0].bytesRead).toBeLessThan(Buffer.byteLength(body));
+      expect(streams[0].closed).toBe(true);
+      expect(readSpy.mock.calls.filter(([file]) => file === abs)).toHaveLength(0);
+
+      fs.appendFileSync(abs, '!');
+      streamSpy.mockClear();
+      const changed = await m.readRange(UID, abs, { maxContentChars: 100_000 });
+      expect(changed.meta.totalChars).toBe(body.length + 1);
+      expect(changed.requestedCharEnd).toBe(body.length + 1);
+      expect(changed.sourceHash).not.toBe(hash);
+      expect(streamSpy.mock.calls.filter(([file]) => file === abs)).toHaveLength(2);
+    } finally {
+      streamSpy.mockRestore();
+      readSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+
+  it.each([
+    [{ charStart: 2, charEnd: 99, maxContentChars: 0 }, '', 2, 8, 1],
+    [{ charStart: 99, maxContentChars: 3 }, '', 8, 8, 3],
+    [{ lineStart: 2, lineEnd: 99, maxContentChars: 2 }, 'cd', 3, 8, 2],
+    [{ lineStart: 99, lineEnd: 100, maxContentChars: 2 }, '', 8, 8, 3],
+  ])('keeps requested and delivered ends distinct at empty/EOF boundaries (%j)', async (request, content, start, requestedEnd, line) => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('edge.txt', 'ab\ncde\nf');
+    const result = await m.readRange(UID, abs, request);
+    expect(result.content).toBe(content);
+    expect(result.range).toEqual({ charStart: start, charEnd: start + content.length });
+    expect(result.requestedCharEnd).toBe(requestedEnd);
+    expect(result.startLine).toBe(line);
+  });
 });
 
 describe('file_indexer › readRange on pdf/docx', () => {
@@ -323,12 +426,12 @@ describe('file_indexer › readRange on pdf/docx', () => {
   });
 });
 
-describe('file_indexer › readImageAsGrayJpeg', () => {
-  it('returns grayscale JPEG with no disk cache', async () => {
+describe('file_indexer › readImageAsJpeg', () => {
+  it('returns color JPEG with no disk cache', async () => {
     const m = await loadMod();
     const png = await makePng();
     const abs = writeWorkspaceFile('chart.png', png);
-    const r = await m.readImageAsGrayJpeg(UID, abs);
+    const r = await m.readImageAsJpeg(UID, abs);
     expect(r.mediaType).toBe('image/jpeg');
     expect(r.base64.length).toBeGreaterThan(50);
     expect(r.bytes).toBe(png.length);

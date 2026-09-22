@@ -35,11 +35,10 @@ describe('ProductDeveloper Resource contract', () => {
 
     for (const marker of [
       'Classify The Engineering Contract',
-      'Read repository instructions',
-      'acceptance-to-evidence matrix',
-      'Debug by falsifiable hypotheses',
-      'Review-On-Submit',
-      'unverified path',
+      'Use `product-dev` for repository intake',
+      'selected Skill',
+      'completion criteria',
+      'Delivery standards',
       'do not fill it with a recommended MVP',
       'Do not patch generated trees',
     ]) {
@@ -110,9 +109,8 @@ describe('ProductDeveloper Resource contract', () => {
     }
 
     const skillMd = fs.readFileSync(path.join(productDevDir, 'SKILL.md'), 'utf8');
-    expect(skillMd).toContain('## 边界先行');
-    expect(skillMd).toContain('不编造推荐 MVP、PRD、功能范围、架构或代码');
-    expect(skillMd).toContain('不生成实现工件');
+    expect(skillMd).toMatch(/do not invent an MVP, PRD, scope, architecture, or code/i);
+    expect(skillMd).toMatch(/disposable demo[\s\S]*do not produce implementation\s+artifacts/i);
     const frontmatter = skillMd.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
     const frontmatterKeys = frontmatter.split('\n')
       .map((line) => line.match(/^([a-z_]+):/)?.[1])

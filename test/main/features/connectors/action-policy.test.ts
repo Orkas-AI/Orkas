@@ -48,6 +48,55 @@ describe('connector operation classification', () => {
     }).risk).toBe('R');
   });
 
+  it.each([
+    ['box', 'BOX_UPDATE_FOLDER', { shared_link: { access: 'open' } }],
+    ['box', 'BOX_UPDATE_FOLDER', { shared_link: null }],
+    ['box', 'BOX_UPDATE_FOLDER', { can_non_owners_invite: false }],
+    ['box', 'BOX_UPDATE_FOLDER', { can_non_owners_view_collaborators: true }],
+    ['box', 'BOX_UPDATE_FOLDER', { is_collaboration_restricted_to_enterprise: false }],
+    ['box', 'BOX_UPDATE_FOLDER', { folder_upload_email: { access: 'open' } }],
+    ['box', 'BOX_UPDATE_FILE', { permissions__can__download: 'open' }],
+    ['box', 'BOX_UPDATE_FILE', { disposition_at: '2030-01-01T00:00:00Z' }],
+    ['miro', 'MIRO_UPDATE_BOARD', { policy: { sharingPolicy: { access: 'edit' } } }],
+    ['wrike', 'WRIKE_MODIFY_FOLDER', { addShareds: ['user-1'] }],
+    ['wrike', 'WRIKE_MODIFY_FOLDER', { removeShareds: ['user-1'] }],
+    ['wrike', 'WRIKE_MODIFY_FOLDER', { addAccessRoles: { 'user-1': 'Full' } }],
+    ['wrike', 'WRIKE_MODIFY_FOLDER', { removeAccessRoles: ['user-1'] }],
+    ['youtube', 'YOUTUBE_UPDATE_PLAYLIST', { status: { privacyStatus: 'public' } }],
+  ] as const)('requires sensitive treatment for structured access changes: %s / %s / %j', (id, name, args) => {
+    const instance = { id, origin: 'catalog', composio_grant: {
+      connection_id: 'connection', toolkit: id, auth_config_id: 'config',
+    } } as ConnectorInstance;
+    const tool: ToolSchema = { name, description: 'Update metadata', input_schema: {},
+      orkas_action_policy: { risk: 'W', confirmation: 'none', max_batch_size: 25 } };
+    expect(connectorActionRisk(instance, tool, args).risk).toBe('H');
+    expect(connectorActionRisk(instance, tool, { name: 'Renamed', title: 'Renamed' }).risk).toBe('W');
+    expect(connectorActionRisk(instance, tool, { description: JSON.stringify(args) }).risk).toBe('W');
+    expect(connectorActionRisk(instance, { ...tool, orkas_action_policy: {
+      risk: 'D', confirmation: 'destructive', max_batch_size: 25,
+    } }, args).risk).toBe('D');
+  });
+
+  it.each(['FATHOM_GET_RECORDING_SUMMARY', 'FATHOM_GET_RECORDING_TRANSCRIPT'])(
+    'requires confirmation when %s delivers meeting content to an external URL', (name) => {
+      const instance = { id: 'fathom', origin: 'catalog', composio_grant: {
+        connection_id: 'connection', toolkit: 'fathom', auth_config_id: 'config',
+      } } as ConnectorInstance;
+      const tool: ToolSchema = { name, description: 'Get meeting content', input_schema: {},
+        orkas_action_policy: { risk: 'R', confirmation: 'none', max_batch_size: 25 } };
+      const args = { recording_id: 42, destination_url: 'https://example.com/meeting' };
+      expect(connectorActionRisk(instance, tool, args)).toEqual({
+        risk: 'H', sensitive_operation: 'external_communication',
+      });
+      expect(connectorActionRisk(instance, tool, { recording_id: 42 }).risk).toBe('R');
+      expect(connectorActionRisk(instance, tool, { recording_id: 42, destination_url: undefined }).risk).toBe('R');
+      expect(connectorActionRisk(instance, tool, { description: JSON.stringify(args) }).risk).toBe('R');
+      expect(connectorActionRisk({ ...instance, origin: 'custom' }, tool, args)).toEqual({
+        risk: 'H', sensitive_operation: 'unclassified',
+      });
+    },
+  );
+
   it('blocks exact account-wide actions without confusing CRM business records', () => {
     expect(isConnectorActionBlocked('github', 'delete_organization')).toBe(true);
     expect(isConnectorActionBlocked('gmail', 'GMAIL_BATCH_DELETE_MESSAGES')).toBe(true);

@@ -25,7 +25,7 @@ describe('createMetacognitionTool', () => {
     expect((tool.inputSchema as any).properties.target).toBeDefined();
     expect((tool.inputSchema as any).required).toEqual(['action', 'target']);
     expect((tool.inputSchema as any).additionalProperties).toBe(false);
-    expect((tool.inputSchema as any)).not.toHaveProperty('oneOf');
+    expect((tool.inputSchema as any).oneOf).toBeUndefined();
     expect((tool.inputSchema as any).properties.action.description)
       .toContain('Omit unrelated fields');
   });
@@ -82,15 +82,15 @@ describe('metacognition › read', () => {
     expect(handler.read).toHaveBeenCalledWith('strategies');
   });
 
-  it('rejects write-only content instead of silently ignoring it', async () => {
+  it('ignores malformed write-only content while reading', async () => {
     const handler = mockHandler();
     const result = await createMetacognitionTool(handler).execute(
-      { action: 'read', target: 'strategies', content: 'unrelated' },
+      { action: 'read', target: 'strategies', content: { unused: true } },
       dummyCtx,
     );
-    expect(result).toMatchObject({ isError: true });
-    expect(JSON.parse(result.content).error).toContain('not allowed for read');
-    expect(handler.read).not.toHaveBeenCalled();
+    expect(result.isError).toBeFalsy();
+    expect(handler.read).toHaveBeenCalledWith('strategies');
+    expect(handler.write).not.toHaveBeenCalled();
   });
 });
 

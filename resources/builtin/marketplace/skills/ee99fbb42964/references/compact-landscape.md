@@ -169,19 +169,14 @@ workflows, or extensible open-source alternative; label any remaining preference
 as an inference and cite the decisive Evidence IDs. Missing or Not verified
 comparison cells can never support a universal first choice.
 
-The citations verifier returns `comparison_coverage` in the persisted result and
-`comparison_coverage_details` in the compact command result. Citation-clean and
-recommendation-ready are separate. A `recommendation_ready` row has complete
-factual coverage for a model-selected path. Coverage is diagnostic, not a
-completeness gate: a missing field that cannot change the choice does not block
-a supported recommendation. The model decides whether the verified facts
-support the proposed path. If it depends on a blocking gap, continue only when
-a targeted source or materially different strategy has a reasonable chance of
-changing the decision; otherwise stop and deliver an evidence-honest partial
-result that names the condition and how the unresolved fact could change the
-choice. An `under_evidenced` row is not a recommendation: it may remain only as
-that conditional path, never as complete research. The verifier does not make
-this semantic decision.
+The citation script returns `comparison_coverage` (and compact
+`comparison_coverage_details`) listing `fields_with_citations` and
+`missing_citation_fields`. These describe bindings, not semantic support or
+recommendation readiness. Judge each proposed path from the cited context.
+A missing field that cannot change the choice does not block a recommendation.
+When a choice-changing gap remains, continue only if a targeted source or a
+materially different strategy could resolve it; otherwise give a conditional
+partial result naming how either outcome would change the choice.
 
 ## Source-unavailable advisory fallback
 

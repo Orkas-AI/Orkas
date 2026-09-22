@@ -21,6 +21,13 @@ export interface ProviderModelEntry {
    * the model runtime shipped by a client. The request still uses `id`. */
   template?: string;
   contextWindow?: number;
+  /** Output tokens the host reserves for this model: subtracted from
+   * `contextWindow` when deriving input budgets, and the value sent as the
+   * request's output limit unless the provider hook applies the provider's
+   * own default. It is the host's reservation, not the provider's ceiling —
+   * reserving a 384K ceiling on a 1M window left a third of it idle for output
+   * no turn produced. Must be smaller than `contextWindow`; a row that is not
+   * has its limit dropped at runtime and reported. */
   maxTokens?: number;
   /** Explicit visual capability for any Server-configured model. Omit to
    * preserve a built-in/template model's protocol metadata; declarative
@@ -41,16 +48,22 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'claude-sonnet-5', name: 'Claude Sonnet 5', maxInputImages: 20 },
   ],
   'openai-codex': [
-    { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxInputImages: 20 },
-    { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', contextWindow: 372000, maxTokens: 128000, maxInputImages: 20 },
-    { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'gpt-5.5', contextWindow: 372000, maxTokens: 128000, maxInputImages: 20 },
-    { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'gpt-5.5', contextWindow: 272000, maxTokens: 128000, maxInputImages: 20 },
+    // Context windows come from pi-ai. Output reservations remain independent
+    // of the vendor ceiling; main turns send no output limit
+    // (see omitReservedOutputLimitForProvider).
+    { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
+    { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
+    { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
+    { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
   ],
   openai: [
-    { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxInputImages: 20 },
-    { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', contextWindow: 272000, maxTokens: 128000, maxInputImages: 20 },
-    { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'gpt-5.5', contextWindow: 272000, maxTokens: 128000, maxInputImages: 20 },
-    { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'gpt-5.5', contextWindow: 272000, maxTokens: 128000, maxInputImages: 20 },
+    // Context windows come from pi-ai. Output reservations remain independent
+    // of the vendor ceiling; main turns send no output limit
+    // (see omitReservedOutputLimitForProvider).
+    { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
+    { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
+    { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
+    { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
   ],
   google: [
     { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', maxInputImages: 20 },
@@ -63,11 +76,11 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'glm-5.2', name: 'GLM-5.2' },
   ],
   moonshot: [
-    { id: 'kimi-k3', name: 'Kimi K3', contextWindow: 1048576, maxTokens: 131072 },
+    { id: 'kimi-k3', name: 'Kimi K3', contextWindow: 1_000_000, maxTokens: 131072 },
     { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code' },
   ],
   'kimi-coding': [
-    { id: 'k3', name: 'Kimi K3', template: 'kimi-for-coding', contextWindow: 1048576, maxTokens: 131072 },
+    { id: 'k3', name: 'Kimi K3', template: 'kimi-for-coding', contextWindow: 1_000_000, maxTokens: 131072 },
     { id: 'k2p7', name: 'Kimi K2.7 Code' },
   ],
   'minimax-cn': [
@@ -83,14 +96,17 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'MiniMax-M2.7', name: 'MiniMax 2.7' },
   ],
   deepseek: [
-    { id: 'deepseek-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: true, maxInputImages: 600 },
-    { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: false },
-    { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek V4 Flash Vision', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: true, maxInputImages: 600 },
-    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: false },
+    { id: 'deepseek-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1_000_000, maxTokens: 128_000, supportsVision: true, maxInputImages: 600 },
+    { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1_000_000, maxTokens: 128_000, supportsVision: false },
+    { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek V4 Flash Vision', contextWindow: 1_000_000, maxTokens: 128_000, supportsVision: true, maxInputImages: 600 },
+    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1_000_000, maxTokens: 128_000, supportsVision: false },
   ],
   doubao: [
-    { id: 'doubao-seed-2-1-pro-260628', name: 'Doubao Seed 2.1 Pro', contextWindow: 256000, maxTokens: 256000, maxInputImages: 20 },
-    { id: 'doubao-seed-2-1-turbo-260628', name: 'Doubao Seed 2.1 Turbo', contextWindow: 256000, maxTokens: 256000, maxInputImages: 20 },
+    // September Pro advertises 1024K; the host uses the requested decimal 1M.
+    // Turbo retains its 256K window. Both reserve 32K for output rather than
+    // the vendor's 256K output ceiling.
+    { id: 'doubao-seed-2-1-pro-260915', name: 'Doubao Seed 2.1 Pro', contextWindow: 1_000_000, maxTokens: 32768, maxInputImages: 20 },
+    { id: 'doubao-seed-2-1-turbo-260628', name: 'Doubao Seed 2.1 Turbo', contextWindow: 256000, maxTokens: 32768, maxInputImages: 20 },
     { id: 'doubao-seed-2-0-pro-260215', name: 'Doubao Seed 2.0 Pro' },
     { id: 'doubao-seed-2-0-lite-260428', name: 'Doubao Seed 2.0 Lite' },
   ],
@@ -102,7 +118,7 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'anthropic/claude-fable-5.1', name: 'Claude Fable 5.1', maxInputImages: 20 },
     { id: 'anthropic/claude-fable-5', name: 'Claude Fable 5', maxInputImages: 20 },
     { id: 'anthropic/claude-sonnet-5', name: 'Claude Sonnet 5', maxInputImages: 20 },
-    { id: 'openai/gpt-6-astra', name: 'GPT-6 Astra', maxInputImages: 20 },
+    { id: 'openai/gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
     { id: 'openai/gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'openai/gpt-5.5', maxInputImages: 20 },
     { id: 'openai/gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'openai/gpt-5.5', maxInputImages: 20 },
     { id: 'openai/gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'openai/gpt-5.5', maxInputImages: 20 },
@@ -110,9 +126,9 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'google/gemini-3.7-flash', name: 'Gemini 3.7 Flash', maxInputImages: 20 },
     { id: 'google/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (preview)', maxInputImages: 20 },
     { id: 'google/gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', maxInputImages: 20 },
-    { id: 'deepseek/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', template: 'deepseek/deepseek-v4-flash-vision-exp', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: true, maxInputImages: 20 },
+    { id: 'deepseek/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', template: 'deepseek/deepseek-v4-flash-vision-exp', contextWindow: 1_000_000, maxTokens: 128_000, supportsVision: true, maxInputImages: 20 },
     { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-    { id: 'deepseek/deepseek-v4-flash-0731', name: 'DeepSeek V4 Flash 0731', template: 'deepseek/deepseek-v4-flash', contextWindow: 1048576, maxTokens: 384000 },
+    { id: 'deepseek/deepseek-v4-flash-0731', name: 'DeepSeek V4 Flash 0731', template: 'deepseek/deepseek-v4-flash', contextWindow: 1_000_000, maxTokens: 128000 },
     { id: 'moonshotai/kimi-k3', name: 'Kimi K3', maxInputImages: 20 },
     { id: 'moonshotai/kimi-k2.7-code', name: 'Kimi K2.7 Code' },
     { id: 'qwen/qwen3.8-max-0902', name: 'Qwen3.8 Max (0902)', maxInputImages: 20 },

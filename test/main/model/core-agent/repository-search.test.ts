@@ -2,13 +2,18 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 
 import {
   grepRepository,
   isIgnoredByScopes,
   listRepositoryFiles,
   parseIgnoreRules,
+  visitRepositoryFiles,
+  createRepositorySearchBudget,
 } from '../../../../src/main/model/core-agent/repository-search';
 
 const RG_AVAILABLE = spawnSync('rg', ['--version'], {
@@ -24,12 +29,27 @@ function tempRepository(): string {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
   for (const directory of tempDirs.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 
 describe.runIf(RG_AVAILABLE)('repository search streaming bounds', () => {
+  it('streams every filename without retaining a bounded prefix as the search universe', async () => {
+    const root = tempRepository();
+    const expected = Array.from({ length: 2100 }, (_, i) => `file-${i}.txt`);
+    for (const name of expected) fs.writeFileSync(path.join(root, name), 'x');
+    const seen: string[] = [];
+    const result = await visitRepositoryFiles(root, async file => {
+      seen.push(path.basename(file));
+      return false;
+    });
+    expect(result).toEqual({ backend: 'rg', capped: false });
+    expect(seen.sort()).toEqual(expected.sort());
+  });
+
   it('stops high-cardinality grep after the requested result cap', async () => {
     const root = tempRepository();
     fs.writeFileSync(
@@ -65,6 +85,58 @@ describe.runIf(RG_AVAILABLE)('repository search streaming bounds', () => {
     expect(result.backend).toBe('rg');
     expect(result.capped).toBe(true);
     expect(result.files).toHaveLength(7);
+  });
+});
+
+describe('repository search interruption', () => {
+  it.each([
+    ['deadline', 'list'], ['cancel', 'list'], ['deadline', 'grep'], ['cancel', 'grep'],
+  ])('keeps partial results and terminates the child on %s (%s)', async (mode, operation) => {
+    const child = new EventEmitter() as any;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = vi.fn(() => {
+      child.stdout.end();
+      child.stderr.end();
+      setImmediate(() => child.emit('close', null));
+      return true;
+    });
+    const cp = createRequire(import.meta.url)('node:child_process');
+    vi.spyOn(cp, 'spawn').mockImplementation(() => child);
+    syncBuiltinESMExports();
+    const controller = new AbortController();
+    const budget = createRepositorySearchBudget(controller.signal, mode === 'deadline' ? 30 : 1000);
+    try {
+      const root = tempRepository();
+      const result = operation === 'list'
+        ? listRepositoryFiles(root, 200, { signal: budget.signal })
+        : grepRepository(root, { pattern: 'needle', regex: false, caseSensitive: true,
+          contextLines: 0, maxResults: 200, includeGlobs: [], excludeGlobs: [], signal: budget.signal });
+      child.stdout.write(operation === 'list' ? 'kept.txt\0' : `${JSON.stringify({
+        type: 'match', data: { path: { text: 'kept.txt' }, lines: { text: 'needle\n' },
+          line_number: 1, submatches: [{ start: 0, end: 6 }] },
+      })}\n`);
+      if (mode === 'cancel') setTimeout(() => controller.abort(), 10);
+      const value = await result;
+      const files = 'files' in value ? value.files : value.hits.map(hit => hit.path);
+      expect(files.map(file => path.basename(file))).toEqual(['kept.txt']);
+      if ('hits' in value) {
+        expect(value.error).toBeUndefined();
+        expect(value.hits[0]).toMatchObject({ line: 1, column: 1, text: 'needle' });
+      }
+      expect(value.interrupted).toBe(true);
+      expect(child.kill).toHaveBeenCalled();
+      expect(budget.reason()).toBe(mode === 'deadline' ? 'time_budget' : 'cancelled');
+    } finally { budget.dispose(); }
+  });
+
+  it('does not start a child for an already cancelled search', async () => {
+    const cp = createRequire(import.meta.url)('node:child_process');
+    const spawn = vi.spyOn(cp, 'spawn');
+    syncBuiltinESMExports();
+    const result = await listRepositoryFiles(tempRepository(), 10, { signal: AbortSignal.abort() });
+    expect(result.interrupted).toBe(true);
+    expect(spawn).not.toHaveBeenCalled();
   });
 });
 

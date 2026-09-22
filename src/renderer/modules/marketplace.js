@@ -1984,7 +1984,7 @@ function _mpActionResult(result) {
   return result === 'success' || result === 'cancelled' ? result : 'failure';
 }
 
-function _mpTrackActionResult(startedAt, action, kind, result, errorCode = '') {
+function _mpLogActionResult(startedAt, action, kind, result, errorCode = '') {
   const safeAction = _mpActionName(action);
   const safeKind = _mpResourceKind(kind);
   const safeResult = _mpActionResult(result);
@@ -2043,11 +2043,11 @@ async function _mpInstall(kind, id, itemOverride = null) {
   const startedAt = Date.now();
   const initialStatus = _mpInstallStatus(kind, item);
   const actionName = initialStatus.installed && initialStatus.updateAvailable ? 'update' : 'install';
-  let resultTracked = false;
-  const trackResult = (result, errorCode = '') => {
-    if (resultTracked) return;
-    resultTracked = true;
-    _mpTrackActionResult(startedAt, actionName, kind, result, errorCode);
+  let resultLogged = false;
+  const logResult = (result, errorCode = '') => {
+    if (resultLogged) return;
+    resultLogged = true;
+    _mpLogActionResult(startedAt, actionName, kind, result, errorCode);
   };
   _mpState.installing.add(key);
   _mpRender();
@@ -2067,7 +2067,7 @@ async function _mpInstall(kind, id, itemOverride = null) {
     const installed = await invokeInstall(false);
     // Main's completed install response is the durable boundary. Local cache,
     // list refresh, alerts, and rendering cannot reverse this success.
-    trackResult('success');
+    logResult('success');
     _mpApplyInstalledState(kind, item, installed);
     await _mpRefreshAfterAction(kind);
     // Success: no toast — the button flips to "Installed" + state set above is the signal.
@@ -2092,26 +2092,26 @@ async function _mpInstall(kind, id, itemOverride = null) {
         if (action === 'force') {
           try {
             const installed = await invokeInstall(true);
-            trackResult('success');
+            logResult('success');
             _mpApplyInstalledState(kind, item, installed);
             await _mpRefreshAfterAction(kind);
           } catch (forceErr) {
-            trackResult('failure', _mpActionErrorCode(forceErr));
+            logResult('failure', _mpActionErrorCode(forceErr));
             uiAlert(_mpInstallFailedText(kind, item, forceErr));
           }
         } else {
-          trackResult('cancelled', 'validation_cancelled');
+          logResult('cancelled', 'validation_cancelled');
         }
       } else {
-        trackResult('failure', _mpActionErrorCode(err, 'quality_rejected'));
+        logResult('failure', _mpActionErrorCode(err, 'quality_rejected'));
         uiAlert(_mpInstallFailedText(kind, item, err));
       }
     } else {
-      trackResult('failure', _mpActionErrorCode(err));
+      logResult('failure', _mpActionErrorCode(err));
       uiAlert(_mpInstallFailedText(kind, item, err));
     }
   } finally {
-    if (!resultTracked) trackResult('failure', 'operation_failed');
+    if (!resultLogged) logResult('failure', 'operation_failed');
     _mpState.installing.delete(key);
     _mpRender();
     if (_mpState.view === 'detail') _mpRenderDetail();
@@ -2132,11 +2132,11 @@ async function _mpUninstall(kind, id) {
   const key = `${kind}:${id}`;
   if (_mpState.installing.has(key)) return;
   const startedAt = Date.now();
-  let resultTracked = false;
-  const trackResult = (result, errorCode = '') => {
-    if (resultTracked) return;
-    resultTracked = true;
-    _mpTrackActionResult(startedAt, 'uninstall', kind, result, errorCode);
+  let resultLogged = false;
+  const logResult = (result, errorCode = '') => {
+    if (resultLogged) return;
+    resultLogged = true;
+    _mpLogActionResult(startedAt, 'uninstall', kind, result, errorCode);
   };
   _mpState.installing.add(key);
   _mpState.uninstalling.add(key);
@@ -2145,16 +2145,16 @@ async function _mpUninstall(kind, id) {
     const channel = kind === 'agent' ? 'marketplace.uninstallAgent' : 'marketplace.uninstallSkill';
     const r = await window.orkas.invoke(channel, { id });
     if (!r || r.ok === false) throw _mpErrorFromResponse(r, 'uninstall failed');
-    trackResult('success');
+    logResult('success');
     _mpApplyUninstalledState(kind, id);
     await _mpRefreshAfterAction(kind);
     // Success: button flips back to "Install" — no toast needed. (Failures still alert.)
   } catch (err) {
-    trackResult('failure', _mpActionErrorCode(err));
+    logResult('failure', _mpActionErrorCode(err));
     const msg = _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
     uiAlert(t('marketplace.uninstall_failed').replace('{reason}', msg));
   } finally {
-    if (!resultTracked) trackResult('failure', 'operation_failed');
+    if (!resultLogged) logResult('failure', 'operation_failed');
     _mpState.installing.delete(key);
     _mpState.uninstalling.delete(key);
     _mpRender();

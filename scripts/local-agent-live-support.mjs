@@ -121,6 +121,26 @@ const BRIDGE_SKILL = [
   '',
 ].join('\n');
 const MUTATION_PROTECTED_FILE = 'This workspace is reference-only. Do not modify it.\n';
+const SKILL_SOURCE_BEFORE = Object.freeze({
+  'src/sdk.ts': 'export const timeoutMs = 1000;\n',
+  'skills/source-helper/SKILL.md': '---\nname: source-helper\ndescription: Explain the SDK timeout.\n---\n\nThe SDK timeout is 1000 ms.\n',
+  'docs/guide.md': '# SDK guide\n\nThe SDK timeout is 1000 ms.\n',
+});
+const SKILL_SOURCE_AFTER = Object.freeze({
+  'src/sdk.ts': 'export const timeoutMs = 2000;\n',
+  'skills/source-helper/SKILL.md': '---\nname: source-helper\ndescription: Explain the SDK timeout.\n---\n\nThe SDK timeout is 2000 ms.\n',
+  'docs/guide.md': '# SDK guide\n\nThe SDK timeout is 2000 ms.\n',
+});
+const BUILTIN_SKILL_SOURCE_BEFORE = Object.freeze({
+  'src/sdk.ts': 'export const timeoutMs = 1000;\n',
+  'resources/builtin/system/skills/sdk/SKILL.md': '---\nname: sdk\ndescription: Explain the SDK timeout.\n---\n\nThe SDK timeout is 1000 ms.\n',
+  'resources/builtin/system/skills/orkas-guide/SKILL.md': '---\nname: orkas-guide\ndescription: Guide to SDK usage.\n---\n\nThe SDK timeout is 1000 ms.\n',
+});
+const BUILTIN_SKILL_SOURCE_AFTER = Object.freeze({
+  'src/sdk.ts': 'export const timeoutMs = 2000;\n',
+  'resources/builtin/system/skills/sdk/SKILL.md': '---\nname: sdk\ndescription: Explain the SDK timeout.\n---\n\nThe SDK timeout is 2000 ms.\n',
+  'resources/builtin/system/skills/orkas-guide/SKILL.md': '---\nname: orkas-guide\ndescription: Guide to SDK usage.\n---\n\nThe SDK timeout is 2000 ms.\n',
+});
 
 const TASK_REVIEW_PROMPT = '处理当前项目的“Release review”待办。检查 delivery.md 是否包含 Bluejay 发布代号、2031-04-17 发布日期和负责人 Mira Chen。只有这些交付证据齐全才推进状态：处理中的事项进入待确认，待确认的事项进入已完成。证据不足时保留原状态并说明缺失内容，不补造证据，不修改工作区文件。';
 
@@ -217,6 +237,7 @@ export const LOCAL_AGENT_BENCHMARK_SCENARIOS = Object.freeze([
     id: 'local-agent-commander-owned-mutations',
     agents: Object.freeze(['claude', 'codex']),
     category: 'bridge-capability-boundary',
+    permissionPolicy: 'full_access',
     prompt: [
       'In Orkas, create one daily 08:00 automation that runs the core, VideoStudio, and ImageStudio benchmarks,',
       'automatically repairs discovered problems, and lists anything needing user confirmation.',
@@ -228,6 +249,25 @@ export const LOCAL_AGENT_BENCHMARK_SCENARIOS = Object.freeze([
       'protected.txt': MUTATION_PROTECTED_FILE,
     }),
     observedFiles: Object.freeze(['protected.txt']),
+  }),
+  ...[false, true].map(install => Object.freeze({
+    id: install ? 'local-agent-skill-source-and-install' : 'local-agent-skill-source-edit',
+    agents: Object.freeze(['claude', 'codex']),
+    category: 'bridge-capability-boundary',
+    permissionPolicy: 'full_access',
+    prompt: '把当前项目 src/sdk.ts 的 timeoutMs 从 1000 改成 2000，同步更新 skills/source-helper/SKILL.md 和 docs/guide.md 里的超时数值，其余内容保持原样。'
+      + (install ? '然后把更新后的 source-helper Skill 安装到 Orkas 中供我使用。' : '完成后简要说明结果。'),
+    seedFiles: SKILL_SOURCE_BEFORE,
+    observedFiles: Object.freeze(Object.keys(SKILL_SOURCE_BEFORE)),
+  })),
+  Object.freeze({
+    id: 'local-agent-builtin-skill-source-edit',
+    agents: Object.freeze(['claude', 'codex']),
+    category: 'bridge-capability-boundary',
+    permissionPolicy: 'full_access',
+    prompt: '把当前项目 SDK 的默认超时从 1000 ms 改成 2000 ms，同步更新内置 SDK Skill 和 orkas-guide 系统 Skill 中的超时说明，其余内容保持原样。完成后简要说明结果。',
+    seedFiles: BUILTIN_SKILL_SOURCE_BEFORE,
+    observedFiles: Object.freeze(Object.keys(BUILTIN_SKILL_SOURCE_BEFORE)),
   }),
   ...[
     { suffix: 'delivery', initialStatus: 'progress', expectedStatus: 'review', evidence: RELEASE_BRIEF },
@@ -488,6 +528,29 @@ export function scoreLocalAgentBenchmarkScenario(scenario, observation) {
         'an available Skill is used directly without transferring to Commander',
       ),
     );
+  } else if (['local-agent-skill-source-edit', 'local-agent-skill-source-and-install', 'local-agent-builtin-skill-source-edit'].includes(scenario?.id)) {
+    const install = scenario.id === 'local-agent-skill-source-and-install';
+    const expectedFiles = scenario.id === 'local-agent-builtin-skill-source-edit'
+      ? BUILTIN_SKILL_SOURCE_AFTER : SKILL_SOURCE_AFTER;
+    const handoffCount = (observation?.toolNames || []).filter(name => /orkas_handoff_to_commander$/i.test(name)).length;
+    const handoff = observation?.commanderHandoff;
+    const sourceIsUpdated = candidate => Object.entries(expectedFiles)
+      .every(([name, body]) => candidate?.[name] === body);
+    checks.push(
+      check('source-and-guide-updated', sourceIsUpdated(files), 'SDK, Skill source and guide contain the requested value with no unrelated edits'),
+      check('workspace-vs-app-route', install ? handoffCount === 1 && !!handoff?.reason : handoffCount === 0 && !handoff,
+        'only the requested app installation requires a Commander handoff'),
+    );
+    if (install) {
+      const snapshots = observation?.handoffWorkspaceSnapshots || [];
+      const context = [handoff?.reason, handoff?.context].filter(Boolean).join('\n');
+      checks.push(
+        check('source-complete-before-handoff', snapshots.length === 1 && sourceIsUpdated(snapshots[0]),
+          'the runner observes all requested source edits before the handoff tool executes'),
+        check('preserves-install-source', context.includes('source-helper') && context.includes('skills/source-helper'),
+          'the handoff identifies the requested Skill and its workspace source'),
+      );
+    }
   } else if (scenario?.id === 'local-agent-commander-owned-mutations') {
     const bridgeToolNames = (observation?.toolNames || []).map(name => String(name || ''));
     const handoffCount = bridgeToolNames.filter(name => /orkas_handoff_to_commander$/i.test(name)).length;

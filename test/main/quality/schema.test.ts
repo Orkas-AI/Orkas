@@ -83,21 +83,27 @@ describe('quality › schema › validateSkillFrontmatter', () => {
     expect(incomplete?.field).toBe('frontmatter:description_en');
   });
 
-  it('flags Skill descriptions only above the runtime roster boundary', () => {
-    const atBoundary = validateSkillFrontmatter({
-      name: 'foo',
-      description: 'x'.repeat(512),
-    });
-    expect(atBoundary.map((x) => x.rule)).not.toContain('frontmatter_description_too_long');
+  it('keeps the 200-character writing target separate from the 200-token runtime cap', () => {
+    for (const length of [1, 200, 201, 400, 799, 800]) {
+      const withinBoundary = validateSkillFrontmatter({
+        name: 'foo',
+        description: 'x'.repeat(length),
+      });
+      expect(withinBoundary.map((x) => x.rule)).not.toContain('frontmatter_description_too_long');
+    }
 
     const overBoundary = validateSkillFrontmatter({
       name: 'foo',
-      description: 'x'.repeat(513),
+      description: 'x'.repeat(801),
     });
     const long_v = overBoundary.find((x) => x.rule === 'frontmatter_description_too_long');
     expect(long_v?.level).toBe('MEDIUM');
     expect(long_v?.field).toBe('frontmatter:description');
-    expect(long_v?.suggested_fix).toContain('512');
+    expect(long_v?.suggested_fix).toContain('200 estimated tokens');
+    expect(validateSkillFrontmatter({ name: 'foo', description: '界'.repeat(133) })
+      .some(v => v.rule === 'frontmatter_description_too_long')).toBe(false);
+    expect(validateSkillFrontmatter({ name: 'foo', description: '界'.repeat(134) })
+      .some(v => v.rule === 'frontmatter_description_too_long')).toBe(true);
   });
 
   it('flags a name with single-space groups', () => {

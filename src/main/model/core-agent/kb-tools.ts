@@ -510,7 +510,8 @@ const LIBRARY_ACTION_FIELDS: Readonly<Record<LibraryAction, ReadonlySet<string>>
 };
 
 function libraryActionError(action: LibraryAction, input: Record<string, unknown>): string | null {
-  const unexpected = Object.keys(input).filter((key) => !LIBRARY_ACTION_FIELDS[action].has(key));
+  const ignored = action === 'read' ? ['query', 'k', 'limit'] : ['chunk', 'window'];
+  const unexpected = Object.keys(input).filter((key) => !LIBRARY_ACTION_FIELDS[action].has(key) && !ignored.includes(key));
   if (!unexpected.length) return null;
   return `library(${action}): unsupported field(s): ${unexpected.sort().join(', ')}`;
 }

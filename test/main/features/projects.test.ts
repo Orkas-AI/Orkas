@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
+import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
 
 // Mock the model client so cascade-delete (which calls
 // `chats.deleteConversation`, which clears CLI sessions etc.) doesn't
@@ -16,6 +18,7 @@ vi.mock('../../../src/main/model/client', () => ({
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let closeLogWorkers: () => Promise<void>;
 const TEST_UID = 'uProj';
 
 beforeEach(async () => {
@@ -23,12 +26,15 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  closeLogWorkers = await captureMainLogWorkers();
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
+  await drainMainRuntimeForTest();
+  await closeLogWorkers();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -866,6 +872,58 @@ async function capturePrivateDiagnostics(): Promise<unknown[][]> {
 }
 
 describe('projects › diagnostic privacy', () => {
+  it('keeps the account and instruction text private across both write paths', async () => {
+    const records = await capturePrivateDiagnostics();
+    const projects = await loadProjects();
+    const uid = 'instruction-owner-canary-42';
+    const created = await projects.createProject(uid, 'Instructions');
+    if (!created.ok) throw new Error('create failed');
+    const pid = created.project.project_id;
+    records.length = 0;
+    const original = 'Confidential instruction draft';
+    const replacement = 'Private revised instruction';
+    expect(await projects.writeProjectInstructions(uid, pid, original)).toEqual({ ok: true });
+    expect(await projects.writeProjectInstructionsIfUnchanged(uid, pid, original, replacement))
+      .toEqual({ ok: true });
+    expect(await projects.readProjectInstructions(uid, pid)).toMatchObject({ ok: true, content: replacement });
+    expect(records).toHaveLength(2);
+    const emitted = JSON.stringify(records);
+    expect(emitted).not.toContain(uid);
+    expect(emitted).not.toContain(original);
+    expect(emitted).not.toContain(replacement);
+  });
+
+  it('keeps compare-read failures private and leaves instructions recoverable', async () => {
+    const records = await capturePrivateDiagnostics();
+    const projects = await loadProjects();
+    const created = await projects.createProject(TEST_UID, 'Instructions');
+    if (!created.ok) throw new Error('create failed');
+    const pid = created.project.project_id;
+    const original = 'Preserve this instruction';
+    expect(await projects.writeProjectInstructions(TEST_UID, pid, original)).toEqual({ ok: true });
+    records.length = 0;
+    const target = path.join(tmpDir, TEST_UID, 'cloud', 'projects', pid, 'ORKAS.md');
+    const preserved = `${target}.preserved`;
+    fs.renameSync(target, preserved);
+    fs.mkdirSync(target);
+    const readError = await fs.promises.readFile(target, 'utf8').catch((error: NodeJS.ErrnoException) => error);
+    if (typeof readError === 'string') throw new Error('read unexpectedly succeeded');
+    expect(readError.code).toBe('EISDIR');
+    expect(await projects.writeProjectInstructionsIfUnchanged(TEST_UID, pid, original, 'Replacement'))
+      .toEqual({ ok: false, error: 'read_failed' });
+    expect(fs.statSync(target).isDirectory()).toBe(true);
+    fs.rmdirSync(target);
+    fs.renameSync(preserved, target);
+    expect(await projects.readProjectInstructions(TEST_UID, pid)).toMatchObject({ ok: true, content: original });
+    expect(records).toHaveLength(1);
+    const emitted = JSON.stringify(records);
+    expect(emitted).not.toContain(TEST_UID);
+    expect(emitted).not.toContain(readError.message);
+    expect(emitted).toContain('EISDIR');
+    expect(await projects.writeProjectInstructionsIfUnchanged(TEST_UID, pid, original, 'Replacement'))
+      .toEqual({ ok: true });
+  });
+
   it('preserves project names in storage without including them in logs', async () => {
     const records = await capturePrivateDiagnostics();
     const projects = await loadProjects();

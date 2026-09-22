@@ -8,6 +8,7 @@ import {
   buildGroupConversationHistory,
   buildGroupConversationHistoryTail,
   groupConversationHistorySource,
+  projectFullRebaseMessages,
   type GroupMessage,
 } from '../../../../src/main/features/group_chat/visibility';
 
@@ -40,7 +41,8 @@ describe('actor attribution survives the final model-history boundary', () => {
     expect(own).not.toContain(rows[2].text);
     expect(own).not.toContain('Local notes.');
     expect(own).not.toContain(rows[4].text);
-    const context = model[0].content[1];
+    const context = model.find(message => message.role === 'user'
+      && message.content.some(block => block.type === 'text' && block.text === rows[0].text))!.content[1];
     expect(context.type).toBe('text');
     const records = JSON.parse((context as { text: string }).text.split('\n').slice(1).join('\n'));
     expect(records.map((record: any) => record.from)).toEqual(['Commander', 'Commander', 'Writer (writer)', 'Reviewer (reviewer)', 'Commander']);
@@ -50,6 +52,58 @@ describe('actor attribution survives the final model-history boundary', () => {
     expect(JSON.stringify(model)).not.toContain(rows[6].text);
     expect(model.flatMap((message) => message.content).every((block) => block.type === 'text')).toBe(true);
     expect(JSON.stringify(rows)).toBe(original);
+  });
+
+  it('clips an oversized other-actor body without cutting its attribution envelope', () => {
+    const longRows = [rows[0], { ...rows[3], text: 'OLD_DRAFT_HEAD ' + '界🙂'.repeat(40_000) + ' WRITER_TAIL' }, rows[5], rows[6]];
+    const original = JSON.stringify(longRows);
+    const source = groupConversationHistorySource('clipped');
+    const full = projectFullRebaseMessages(longRows, 'u2', names);
+    const hostContext = full[0].content.find(block => block.type === 'text'
+      && block.text.startsWith('[Conversation context note] Host routing')) as { text: string };
+    expect(JSON.parse(hostContext.text.split('\n').slice(1).join('\n'))[0]).toMatchObject({
+      from: 'Writer (writer)', to: 'User',
+    });
+    for (const history of [full, buildGroupConversationHistory(longRows, 'u2', names)]) {
+      const session = new Session();
+      session.replaceConversationHistory(history, source);
+      session.beginUserTurn([{ type: 'text', text: rows[6].text }]);
+      session.configureHistoryBudget(24_000, 19_680, 5000);
+      const model = session.getMessagesForModel();
+      const context = model.flatMap(message => message.content).find(block => block.type === 'text'
+        && block.text.startsWith('[Conversation context note] Host routing')) as { text: string };
+      const records = JSON.parse(context.text.split('\n').slice(1).join('\n'));
+      expect(records[0]).toMatchObject({ from: 'Writer (writer)', to: 'User' });
+      expect(records[0].text).toContain('WRITER_TAIL');
+      expect(records[0].text).toContain('[Earlier history text omitted]');
+      expect(records[0].text).not.toContain('OLD_DRAFT_HEAD');
+      expect(records[1]).toMatchObject({ assistant_block: 1 });
+      expect(textFor(model, 'assistant')).toBe(rows[5].text);
+      expect(session.estimateHistoryTokens()).toBeLessThanOrEqual(2936);
+    }
+    expect(JSON.stringify(longRows)).toBe(original);
+  });
+
+  it('preserves a reply-only clipped turn across canonical rebase, reload and tail replacement', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-history-text-reload-'));
+    try {
+      const file = path.join(directory, 'session.jsonl');
+      const source = groupConversationHistorySource('reply-only');
+      const longRows = [rows[0], { ...rows[5], text: 'REPLY_HEAD ' + '界'.repeat(30_000) + ' REPLY_TAIL' }, rows[6]];
+      const history = projectFullRebaseMessages(longRows, 'u2', names);
+      expect(history[0]).toMatchObject({ role: 'user', turnId: 1, content: [{ type: 'text', text: '[Earlier history text omitted]' }] });
+      const session = new PersistentSession({ sessionFile: file });
+      session.replaceConversationHistory(history, source);
+      expect(textFor(session.getMessagesForModel(), 'assistant')).toContain('REPLY_TAIL');
+      const restored = new PersistentSession({ sessionFile: file });
+      expect(restored.getMessagesForModel()).toEqual(session.getMessagesForModel());
+      expect(restored.canReplaceConversationHistoryTail(source, 1)).toBe(true);
+      restored.replaceConversationHistory(buildGroupConversationHistoryTail(longRows, 'u2', 0, names), source, { replaceFromTurnId: 1 });
+      expect(textFor(restored.getMessagesForModel(), 'assistant')).toContain('REPLY_TAIL');
+      expect(restored.beginUserTurn([{ type: 'text', text: rows[6].text }])).toBe(2);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('uses the receiving named Agent as the assistant in both full and incremental projections', () => {
@@ -103,9 +157,7 @@ describe('actor attribution survives the final model-history boundary', () => {
     expect(JSON.stringify(model)).not.toContain('OLD_');
     expect(JSON.stringify(session.getSerializedContextState()?.resources)).toContain('release.md');
     const archive = session.getPendingHistoryArchive();
-    expect(archive?.turnIds).toEqual([1]);
-    expect(JSON.stringify(archive?.messages)).toContain('Local notes.');
-    expect(JSON.stringify(archive?.messages)).toContain('Writer (writer)');
+    expect(archive).toBeNull();
     expect(textFor(model, 'assistant')).not.toContain('Local notes.');
   });
 

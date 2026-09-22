@@ -24,7 +24,7 @@ CLI-backed section is canonical.
 1. Clarify what coding task it owns and what deliverable it produces.
 2. Most CLI agents need zero/few inputs; add only genuinely structured launch choices. If unsure, leave inputs empty, or use one task field plus one optional context field.
 3. `interactive` is usually `false`; set `true` only for real multi-turn dependency.
-4. Descriptions must be detailed, CLI-agnostic, independently written per language, and follow `agent-creator`'s formula.
+4. Follow `agent-creator`'s routing-description contract; keep requested languages equivalent and CLI-agnostic.
 5. Iterate gradually and keep replies concise.
 
 ---

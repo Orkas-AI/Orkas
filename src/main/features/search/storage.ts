@@ -38,11 +38,26 @@ const fsp = fs.promises;
 // could mistake tokens such as `constructor` for inherited properties and
 // persist partially indexed documents. Rebuild those derived snapshots once
 // from source files, even when their recorded mtime/size still matches.
-export const SCHEMA_VERSION = 5;
+// v6 adds `files[fileKey].next` for the chat kind. Earlier builds let a single
+// appended message stamp the whole file's mtime+size, so a conversation whose
+// history had never been indexed was certified complete and `reconcile` skipped
+// it forever (only the appended tail stayed searchable). Existing indexes carry
+// no watermark and cannot be told apart from correct ones, so they rebuild once.
+// v7 indexes captured public execution records alongside canonical message text.
+// v8 excludes inline image/video bytes from historical search terms.
+export const SCHEMA_VERSION = 8;
 
 export type IndexKind = 'context' | 'chat';
 
-export interface FileMeta { mtime: number; size: number }
+export interface FileMeta {
+  mtime: number;
+  size: number;
+  /** Chat kind only: the first message position this index has never read.
+   * An incremental append may only re-stamp `mtime`/`size` when it continues
+   * exactly here; anything else means unindexed history the reconciler still
+   * owns. Absent on `context` entries, whose one doc covers the whole file. */
+  next?: number;
+}
 
 export interface Doc {
   kind: IndexKind;

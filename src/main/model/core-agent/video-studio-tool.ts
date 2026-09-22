@@ -23,9 +23,11 @@ import {
 import {
   draftComposition,
   inspectComposition,
+  inspectVideoReference,
   lintComposition,
   prepareComposition,
   snapshotComposition,
+  writeReferenceComparison,
   transcribeSpeech,
   writeProductionContactSheet,
   type RenderFormat,
@@ -91,10 +93,14 @@ import {
   videoProductionControlSummary,
   videoProductionReviewStatus,
   videoProductionSegmentIds,
+  recordVideoProductionDelivery,
   type VideoProductionPlanIdentity,
   type VideoProductionSegmentReviewFact,
 } from '../../features/video_production_control';
 import { verifyProductionDelivery } from '../../features/video_studio_delivery';
+import { editVideoProductionCaptions, videoProductionArtifactBinding, videoProductionFileMatches, videoProductionIsCaptionEdit } from '../../features/video_production_edit';
+import { sha256OfFileStream } from '../../util/sha256';
+import { videoProductionIsGeneration } from '../../features/video_production_mode';
 import { projectVideoApprovalIntent } from '../../features/video_approval_identity';
 import { redactPaths } from '../../util/redact';
 import { canonicalizeManifestSourceShotReferences } from '../../features/video_studio_source_alignment';
@@ -556,6 +562,7 @@ function missingUserTurnGateResult(
  * degraded mode is "produce and show, but no gate decisions".
  */
 const CONTRACT_SENSITIVE_OPS = new Set<string>([
+  'production.edit',
   'composition.approve_plan',
   'composition.approve_draft',
   'composition.submit_design_review',
@@ -786,12 +793,16 @@ export interface VideoStudioToolOpts {
   agentName?: string;
   projectId?: string;
   extraRoots?: readonly string[];
+  readOnlyExtraRoots?: readonly string[];
+  runtimeReadOnlyRoots?: readonly string[];
   onFileWritten?: (absPath: string) => void | Promise<void>;
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
   hasProducedPath?: (absPath: string) => boolean;
 }
 
 const OPS = new Set<VideoStudioOp>([
+  'reference.inspect',
+  'production.edit',
   'production.status',
   'production.approve_plan',
   'production.approve_generation',
@@ -3395,6 +3406,17 @@ async function runProductionSegmentQa(input: {
   failedSignatures: Map<string, string>;
 }): Promise<Record<string, unknown>> {
   const identity = await readVideoProductionPlanIdentity(input.planPathAbs);
+  if (videoProductionIsGeneration(identity.plan)) {
+    return {
+      ok: true,
+      op: 'production.segment_qa',
+      phase: input.phase,
+      is_generation: true,
+      nothing_to_check: true,
+      checked_segment_ids: [],
+      segments: [],
+    };
+  }
   const statePath = videoProductionControlStatePath({
     userId: input.opts.userId,
     ...(input.opts.projectId ? { projectId: input.opts.projectId } : {}),
@@ -9186,7 +9208,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
   const inner: AgentTool = {
     name: 'video_studio',
     description:
-      'Manage durable EDL approvals, billable generation authorization, signed HTML video production, speech capabilities, and transcription.',
+      'Inspect reference video frames, manage durable EDL approvals, billable generation authorization, signed HTML video production, speech capabilities, and transcription.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -9196,7 +9218,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           description: 'Keyframe preview must end the current turn; draft resumes after a later real user reply. No preview-approval op. Retry exhaustion allows one fresh turn to approve one narration materialize call; never reuse an old turn.',
         },
         plan_path: { type: 'string', description: 'Canonical project/plan.json for production.* operations or AUTO child-composition production-plan inheritance.' },
-        delivered_video_path: { type: 'string', description: 'Assembled final video for production.status verification against approved length, canvas, narration placement, loudness, and captions. Hand-built and operation-produced files use the same checks.' },
+        delivered_video_path: { type: 'string', description: 'Final video for production.status. Direct model output receives a readable-video check and advisory spec differences; locally assembled output also checks timing, canvas, narration, loudness, and captions.' },
         segment_id: { type: 'string', description: 'Parent EDL segment id for AUTO child-composition production-plan inheritance.' },
         composition_dir: { type: 'string', description: 'Directory containing composition-manifest.json and generated index.html; prepare may run before index.html exists.' },
         decision_evidence: {
@@ -9245,7 +9267,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         reviewed_frame_paths: { type: 'array', items: { type: 'string' }, description: 'Every returned snapshot frame path actually inspected during a preview design review. Required to cover the complete current preview frame set before the preview can be shown.' },
         phase: { type: 'string', enum: ['lint', 'inspect', 'snapshot'], description: 'QA phase for production.segment_qa.' },
         segment_ids: { type: 'array', items: { type: 'string' }, description: 'Segments for production.segment_qa. Omit to check every segment the ledger reports as stale or uncaptured.' },
-        input_path: { type: 'string', description: 'Input audio/video path for speech.transcribe.' },
+        input_path: { type: 'string', description: 'Input for speech.transcribe or reference.inspect. Reference inspection reads scoped videos up to 256 MiB, freezes a composition-local copy, and attaches colored source frames before any plan is needed.' },
+        sample_times: { type: 'array', items: { type: 'number', minimum: 0 }, minItems: 1, maxItems: 6, description: 'reference.inspect: distinct source seconds below duration; omit for six distributed samples. Use nearby times to inspect relevant changes.' },
         transcript_path: { type: 'string', description: 'Optional transcript JSON output path for speech.transcribe.' },
         model: { type: 'string', description: 'ASR model id/path. Backend-specific.' },
         language: { type: 'string', description: 'ASR language code for speech.transcribe, or auto. For speech.capabilities, the deliverable narration language: the listing then carries only the voices verified for it.' },
@@ -9277,6 +9300,20 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
       let decisionRoutedFromOp = '';
 
       const roots = allowedRoots(opts);
+
+      if (op === 'reference.inspect') {
+        const raw = typeof input.input_path === 'string' ? input.input_path.trim() : '';
+        if (!raw) return { content: resultContent({ ok: false, op, errorCode: 'E_REFERENCE_INPUT', message: 'input_path is required.' }), isError: true };
+        const readOnlyRoots = [...(opts.readOnlyExtraRoots || []), ...(opts.runtimeReadOnlyRoots || [])];
+        const writeRoots = [defaultRoot(opts, ctx)].filter(root => isPathAllowed(root, [getWorkspacePath(opts.userId, opts.projectId)]));
+        const compositionDirAbs = resolvePath(ctx, opts, String(input.composition_dir || 'project/composition'), roots);
+        const result = await inspectVideoReference({ inputAbsPath: resolvePath(ctx, opts, raw, roots), compositionDirAbs,
+          readRoots: [...roots, ...readOnlyRoots], writeRoots, sampleTimes: input.sample_times, signal: ctx.signal });
+        if (!result.ok) return { content: resultContent(result), isError: true };
+        const visual = await prepareVideoStudioModelVisual(String(result.contact_sheet));
+        if (!visual) return { content: resultContent({ ok: false, op, errorCode: 'E_REFERENCE_IMAGE', message: 'Reference frames could not be attached for inspection.' }), isError: true };
+        return { content: resultContent({ ...result, visual_evidence: { attached: true, role: 'reference_source_frames' } }), images: [visual], imageRetention: 'active_turn' };
+      }
 
       if (op === 'speech.capabilities') {
         const routes = await listTtsCapabilities(ctx.signal);
@@ -9372,16 +9409,29 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           planPath: planAbs,
         });
         try {
+          if (op === 'production.edit') {
+            const result = await editVideoProductionCaptions({ statePath, planPath: planAbs, userId: opts.userId, cid: opts.cid, roots, signal: ctx.signal });
+            const current = await readVideoProductionPlanIdentity(planAbs);
+            if (current.signature !== result.artifact.plan_signature) throw new Error('E_VIDEO_PRODUCTION_EDIT_STALE: the plan changed before delivery');
+            const runtime = current.plan._runtime && typeof current.plan._runtime === 'object' ? current.plan._runtime as Record<string, unknown> : {};
+            current.plan._runtime = { ...runtime, is_generation: false, render: { ...(runtime.render && typeof runtime.render === 'object' ? runtime.render as Record<string, unknown> : {}), final_path: result.artifact.output_path } };
+            const temporary = `${planAbs}.${crypto.randomUUID()}.tmp`;
+            await fs.writeFile(temporary, JSON.stringify(current.plan, null, 2), 'utf8');
+            await fs.rename(temporary, planAbs);
+            await opts.onFileWritten?.(result.artifact.output_path);
+            return { content: resultContent({ ok: true, op, status: result.reused ? 'reused' : 'completed', is_generation: false, ...result.artifact }), isError: false } as ToolResult;
+          }
           if (op === 'production.status') {
             const identity = await readVideoProductionPlanIdentity(planAbs);
             const state = await readVideoProductionControlState(statePath, planAbs);
-            const records = await videoProductionSegmentReviewRecords({
+            const isGeneration = videoProductionIsGeneration(identity.plan);
+            const records = isGeneration ? [] : await videoProductionSegmentReviewRecords({
               opts,
               planPathAbs: planAbs,
               identity,
               roots,
             });
-            const review = videoProductionReviewStatus({
+            const review = isGeneration ? undefined : videoProductionReviewStatus({
               identity,
               facts: records.map((record) => record.fact),
             });
@@ -9407,17 +9457,39 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               }
               const missing = await ensureInputFile(deliveredAbs, 'delivered_video_path');
               if (missing) return { content: missing, isError: true } as ToolResult;
-              deliveryCheck = await verifyProductionDelivery({
+              const outputHash = await sha256OfFileStream(deliveredAbs);
+              const binding = await videoProductionArtifactBinding({ userId: opts.userId, identity, state, file: deliveredAbs, outputHash });
+              const associationRequired = isGeneration || videoProductionIsCaptionEdit(identity.plan);
+              const associated = isGeneration ? binding === 'generation' : binding === 'local_edit';
+              deliveryCheck = associationRequired && !associated ? {
+                ok: false, is_generation: null, video_path: deliveredAbs,
+                errorCode: 'E_VIDEO_PRODUCTION_DELIVERY_UNBOUND',
+                message: 'This file is not a recorded output of the current plan. Update the canonical plan for local changes and execute production.edit for a caption revision; retain the original generated source. No generation exemption or completed delivery was recorded.',
+              } : await verifyProductionDelivery({
                 planAbsPath: planAbs,
                 plan: identity.plan,
                 videoAbsPath: deliveredAbs,
                 allowedRoots: roots,
                 ...(ctx.signal ? { signal: ctx.signal } : {}),
               }) as unknown as Record<string, unknown>;
+              if ((await readVideoProductionPlanIdentity(planAbs)).signature !== identity.signature
+                || await sha256OfFileStream(deliveredAbs) !== outputHash) {
+                deliveryCheck = { ok: false, is_generation: null, errorCode: 'E_VIDEO_PRODUCTION_DELIVERY_STALE', message: 'The plan or video changed during verification; check the current version again.' };
+              } else {
+                await recordVideoProductionDelivery({ statePath, planPath: planAbs, signature: identity.signature, outputPath: deliveredAbs, outputSha256: outputHash, result: deliveryCheck });
+              }
+            } else if (state.delivery) {
+              const evidence = state.delivery;
+              const current = evidence.plan_signature === identity.signature
+                && isPathAllowed(evidence.output_path, roots)
+                && await videoProductionFileMatches(opts.userId, evidence.output_path, evidence.output_sha256);
+              deliveryCheck = current ? evidence.result : { ok: false, status: 'stale', reason: 'The plan or delivered artifact changed; verify the current output.' };
             } else if (videoProductionLooksAssembled(identity.plan)) {
               deliveryCheck = {
                 status: 'not_run',
-                reason: 'Every segment reports a produced_path, so this production has something to deliver.'
+                reason: videoProductionIsGeneration(identity.plan)
+                  ? 'Pass delivered_video_path to check that the direct model output has a readable video stream. Report any duration/canvas differences without automatic repair or regeneration.'
+                  : 'Every segment reports a produced_path, so this production has something to deliver.'
                   + ' Pass delivered_video_path to have the final file checked against the approved plan —'
                   + ' length, canvas, narration placement, loudness, and declared captions — whichever way it'
                   + ' was assembled. This is the QA headline the final-video stop needs.',
@@ -9439,12 +9511,12 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                   plan_presentation: 'This plan is not approved yet. Present plan_summary verbatim in the user\'s language before asking them to approve it.',
                 }),
                 production_control: videoProductionControlSummary(identity, state),
-                production_review: {
+                ...(review ? { production_review: {
                   renderable: review.renderable,
                   uncaptured_segment_ids: review.uncaptured_segment_ids,
                   segments: review.segments,
                   invariant: 'Segment frames are shown to the user, never put to them for approval: publish the current frames and keep working. Only the production plan, paid generation, and the final video wait for the user. A segment listed in uncaptured_segment_ids has no current frames and needs its QA phase re-run; everything else is ready to assemble.',
-                },
+                } } : {}),
               }),
               isError: false,
             } as ToolResult;
@@ -9524,9 +9596,10 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             }
             // Same exemption as the composition line: a change the user named
             // in this turn does not have to be confirmed back to them. The
-            // quote is host-verified against the current user message, the
-            // caller must declare it is applying a change, and the EDL must
-            // actually differ from the one already approved.
+            // quote is host-verified against the current user message and the
+            // EDL must actually differ from the one already approved. The host
+            // owns that fact; a redundant model boolean cannot create another
+            // user approval round trip (2026-09-17 caption revision trace).
             const controlBefore = await readVideoProductionControlState(statePath, planAbs).catch(() => null);
             const identityNow = await readVideoProductionPlanIdentity(planAbs).catch(() => null);
             const priorPlanSignature = controlBefore?.plan_approval?.signature || '';
@@ -9534,7 +9607,6 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               && priorPlanSignature !== identityNow.signature;
             const userInstructed = resolvedDecision.decision === 'revise'
               && resolvedDecision.evidence_status === 'valid'
-              && input.expected_plan_change === true
               && edlChanged;
             if (resolvedDecision.decision !== 'approve' && !userInstructed) {
               const digest = videoProductionPlanDigest(identityNow?.plan);
@@ -9544,7 +9616,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                   op,
                   errorCode: 'E_VIDEO_PRODUCTION_GATE_B_EXPLICIT_APPROVAL_REQUIRED',
                   message: 'The current real user turn must explicitly approve this plan, or name the exact change being applied'
-                    + ' (decision_evidence decision="revise" quoting the user, with expected_plan_change=true).'
+                    + ' (decision_evidence decision="revise" quoting the user, with a changed previously approved EDL).'
                     + ' Present plan_summary below to the user verbatim, in their language, then end the turn.',
                   presentation_required: true,
                   requires_user_decision: true,
@@ -10154,6 +10226,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               ok: true,
               op,
               status: freshMissingComposition ? 'not_started' : 'reported',
+              is_generation: false,
               composition_dir_exists: dirCheck.exists,
               ...(freshMissingComposition ? {
                 message: 'No composition has been authored at this location yet. Author composition-manifest.json first; after plan approval, composition.prepare owns the generated index.html scaffold.',
@@ -12060,6 +12133,32 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           } as typeof result;
         }
 
+        const modelImages = modelVisual ? [modelVisual] : [];
+        if (result.ok && op === 'composition.prepare') {
+          const reference = result.reference_authoring as Record<string, unknown> | undefined;
+          const referenceImage = typeof reference?.contact_sheet === 'string' && reference.contact_sheet
+            ? await prepareVideoStudioModelVisual(reference.contact_sheet) : null;
+          if (referenceImage) modelImages.push(referenceImage);
+          if (reference) result = { ...result, reference_authoring: { ...reference, attached: !!referenceImage } };
+        }
+        if (shouldAttachSnapshotVisual || shouldAttachFirstDraftVisual) {
+          const comparison = await writeReferenceComparison({
+            compositionDirAbs, reviewInputs: result.design_review_inputs, evidenceRoots: roots,
+            frameEvidence: result.frame_evidence
+              || (result.report as { steps?: { render?: { frame_evidence?: unknown } } } | undefined)?.steps?.render?.frame_evidence,
+            signal: ctx.signal,
+          }).catch((err) => {
+            log.warn('reference comparison unavailable', { error: logErrorSummary(err) });
+            return { status: 'unavailable', attached: false, issues: [{ reason: 'capture_failed' }] } as Record<string, unknown>;
+          });
+          if (comparison) {
+            const comparisonImage = typeof comparison.contact_sheet === 'string' && comparison.contact_sheet
+              ? await prepareVideoStudioModelVisual(comparison.contact_sheet) : null;
+            if (comparisonImage) modelImages.push(comparisonImage);
+            result = { ...result, reference_comparison: { ...comparison, attached: !!comparisonImage } } as typeof result;
+          }
+        }
+
         const consumesFullRenderAttempt = (op === 'composition.draft' || op === 'composition.export')
           && resultConsumesFullRenderTurnBudget(result);
 
@@ -12250,7 +12349,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         // projection at serialization time for every return path.
         return {
           content: resultContent(result, renameNote),
-          ...(modelVisual ? { images: [modelVisual] } : {}),
+          ...(modelImages.length ? { images: modelImages } : {}),
+          ...(result.ok && op === 'composition.prepare' ? { imageRetention: 'active_turn' as const } : {}),
           isError: result.ok === false,
         } as ToolResult;
       }

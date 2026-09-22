@@ -1,3 +1,4 @@
+import { prepareIndexedJsonlAppend } from './util/indexed-jsonl';
 /**
  * Timestamps, ID generation, and JSON/JSONL IO helpers.
  *
@@ -15,11 +16,19 @@ import { Mutex, type MutexInterface } from 'async-mutex';
 
 // ── Timestamps / IDs ─────────────────────────────────────────────────────
 
-/** Local-time ISO8601 down to seconds, no TZ suffix (matches Python `now_iso`). */
-export function nowIso(): string {
-  const d = new Date();
+/** Local-time ISO8601 down to seconds, no TZ suffix (matches Python `now_iso`),
+ *  for an explicit instant. Records that describe something that happened
+ *  earlier than their write (a streamed message flushed at the next boundary)
+ *  stamp the moment it happened, not the moment it was persisted. */
+export function localIsoAt(at: number | Date): string {
+  const d = at instanceof Date ? at : new Date(at);
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+/** Local-time ISO8601 down to seconds, no TZ suffix (matches Python `now_iso`). */
+export function nowIso(): string {
+  return localIsoAt(new Date());
 }
 
 /** UUID v4 local user id: 32 lowercase hexadecimal characters without hyphens. */
@@ -153,10 +162,15 @@ export async function writeJson(
   data: unknown,
   opts?: { shouldCommit?: () => boolean },
 ): Promise<void> {
+  return writeBytesAtomic(filePath, Buffer.from(JSON.stringify(data, null, 2)), opts);
+}
+
+/** Atomic bounded-payload callers use the same guarded publication as JSON. */
+export async function writeBytesAtomic(filePath: string, data: Uint8Array, opts?: { shouldCommit?: () => boolean }): Promise<void> {
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
   const tmp = atomicTmpPath(filePath);
-  await fsp.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
   try {
+    await fsp.writeFile(tmp, data, { mode: 0o600 });
     if (!await renameWithRetry(tmp, filePath, opts?.shouldCommit)) {
       await fsp.rm(tmp, { force: true });
     }
@@ -253,7 +267,10 @@ export async function appendJsonlAtomic<T>(filePath: string, record: T): Promise
       count = await _loadLineCount(filePath);
       _lineCounts.set(filePath, count);
     }
-    await fsp.appendFile(filePath, JSON.stringify(record) + '\n', 'utf8');
+    const finishIndex = await prepareIndexedJsonlAppend(filePath);
+    const line = JSON.stringify(record) + '\n';
+    await fsp.appendFile(filePath, line, 'utf8');
+    await finishIndex(record, Buffer.byteLength(line));
     _lineCounts.set(filePath, count + 1);
     return { record, msgIndex: count };
   });

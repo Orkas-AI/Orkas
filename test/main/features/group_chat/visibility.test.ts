@@ -79,7 +79,8 @@ describe('group_chat canonical conversation history', () => {
     expect(JSON.stringify(history)).not.toContain('[User -> Commander]');
     expect(JSON.stringify(history)).not.toContain('[Commander -> User]');
     expect(JSON.stringify(history)).not.toContain('[Conversation context note]');
-    expect(v.groupConversationHistorySource('cid42')).toBe('group-main-v5:cid42');
+    // Version 7 invalidates projections containing historical inline media.
+    expect(v.groupConversationHistorySource('cid42')).toBe('group-main-v8:cid42');
   });
 
   it('removes only authoritative leading legacy route headers during actor-history replay', async () => {

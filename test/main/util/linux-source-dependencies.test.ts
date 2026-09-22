@@ -153,7 +153,6 @@ describe('Linux source dependency contract', () => {
     expect(workflow).toContain('test/e2e/app_e2e_smoke.spec.ts');
     expect(workflow).toContain('xvfb-run --auto-servernum npm run test:linux-source');
     expect(workflow).toContain('npm run test:linux-whisper');
-    expect(workflow).toContain('npm run test:linux-ocr');
 
     const nativeRunner = fs.readFileSync(
       path.join(process.cwd(), 'scripts', 'run-platform-native-tests.mjs'),

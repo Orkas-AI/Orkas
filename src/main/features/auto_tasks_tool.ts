@@ -4,6 +4,10 @@ import type { AgentTool } from '../../core-agent/src/tools/base';
 import * as autoTasks from './auto_tasks';
 import { projectExists } from './projects';
 import { taskSummaryPage } from './task_query';
+import { createLogger } from '../logger';
+import { logErrorSummary } from '../util/log-redact';
+
+const log = createLogger('auto-tasks-tool');
 
 const contract = require('../../../bin/auto-tasks-contract.cjs');
 const EDIT_FIELDS = ['title', 'content', 'schedule', 'enabled', 'end_condition', 'recipient', 'skill', 'connector', 'attachments', 'project_id'];
@@ -25,12 +29,19 @@ function taskSummary(task: autoTasks.AutoTask) {
   };
 }
 
-export function createAutoTasksTool(opts: { userId: string; cid?: string; projectId?: string }): AgentTool {
-  const schema = z.object(contract.shape(z, !!opts.projectId)).strict();
+export function createAutoTasksTool(opts: {
+  userId: string;
+  cid?: string;
+  projectId?: string | null;
+  /** Saved automation id, for the host's click-through offer. Not called for a
+   *  delete: there is nothing left to open. */
+  onSaved?: (taskId: string) => void;
+}): AgentTool {
+  const schema = z.object(contract.shape(z, opts.projectId !== undefined)).strict();
   return {
     name: 'auto_tasks',
     description: contract.description,
-    inputSchema: contract.inputSchema(z, !!opts.projectId),
+    inputSchema: contract.inputSchema(z, opts.projectId !== undefined),
     async execute(input) {
       const fail = (error: string) => ({ content: JSON.stringify({ ok: false, error }), isError: true });
       const parsed = schema.safeParse(input);
@@ -47,7 +58,7 @@ export function createAutoTasksTool(opts: { userId: string; cid?: string; projec
       try {
         if (opts.projectId && !await projectExists(opts.userId, opts.projectId)) return fail('project_not_found');
         if (action === 'list') {
-          const selected = opts.projectId ?? data.project_id;
+          const selected = opts.projectId !== undefined ? opts.projectId : data.project_id;
           const tasks = await autoTasks.listTasks(opts.userId, selected !== undefined ? { projectId: selected } : undefined);
           const summaries = tasks.filter((task) => data.enabled === undefined || task.enabled === data.enabled)
             .sort((a, b) => b.created_at.localeCompare(a.created_at) || a.id.localeCompare(b.id)).map(taskSummary);
@@ -55,16 +66,22 @@ export function createAutoTasksTool(opts: { userId: string; cid?: string; projec
         }
         if (action === 'get') {
           const task = await autoTasks.getTask(opts.userId, taskId);
-          if (!task || (opts.projectId && task.project_id !== opts.projectId)) return fail('task_not_found');
+          if (!task || (opts.projectId !== undefined && (task.project_id ?? null) !== opts.projectId)) return fail('task_not_found');
           return { content: JSON.stringify({ ok: true, task: taskView(task) }) };
         }
         const updates = Object.fromEntries(EDIT_FIELDS.filter((key) => data[key] !== undefined).map((key) => [key, data[key]]));
-        const result = await autoTasks.applyAutoTaskContainerFromCommander(opts.userId, {
+        const result = await autoTasks.applyAutoTaskMutation(opts.userId, {
           action, taskId, updates,
         }, { sourceAttachmentCid: opts.cid, projectId: opts.projectId });
         if (!result.ok && result.error && !/^[a-z][a-z0-9_]*$/.test(result.error)) return fail('automation operation failed');
+        if (result.ok && result.taskId && result.kind !== 'deleted') {
+          try { opts.onSaved?.(result.taskId); } catch { /* navigation is an offer, never a failure */ }
+        }
         return { content: JSON.stringify({ ...result, ...(result.task ? { task: taskView(result.task) } : {}) }), isError: !result.ok };
-      } catch { return fail('automation operation failed'); }
+      } catch (err) {
+        log.warn('automation tool operation failed', { error: logErrorSummary(err) });
+        return fail('automation operation failed');
+      }
     },
   };
 }

@@ -474,16 +474,18 @@ describe('kb-tools › shape', () => {
     expect(schema.properties).toHaveProperty('query');
     expect(schema.properties).toHaveProperty('path');
     expect(schema.additionalProperties).toBe(false);
+    expect(schema.oneOf).toBeUndefined();
     expect(schema.required).toEqual(['action']);
-    expect(schema).not.toHaveProperty('oneOf');
 
     const missingAction = await library.execute({ query: 'alpha' }, ctxFor());
+    await seedFiles();
     const crossActionField = await library.execute({
       action: 'read', path: 'notes/a.md', query: 'alpha',
     }, ctxFor());
     expect(missingAction.isError).toBe(true);
     expect(missingAction.content).toContain('`action`');
-    expect(crossActionField.isError).toBe(true);
-    expect(crossActionField.content).toContain('unsupported field(s): query');
+    expect(crossActionField.isError).toBeFalsy();
+    expect(crossActionField.content).toContain('alpha content');
+    expect(crossActionField.content).toContain('second chunk body');
   });
 });

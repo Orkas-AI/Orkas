@@ -89,23 +89,24 @@ describe('synced PC surface regressions', () => {
     expect(css).toContain('.agents-grid-subtitle');
   });
 
-  it('keeps the sidebar external-agent entry aligned with the commercial copy', () => {
+  it('keeps the named AI Team and Skills header entries aligned with the commercial copy', () => {
     const html = read('src/renderer/index.html');
     const locales = Object.fromEntries(['en', 'zh', 'ja', 'pt'].map((locale) => [
       locale,
       JSON.parse(read(`src/renderer/locales/${locale}.json`)) as Record<string, string>,
     ]));
 
-    expect(html).toContain('data-i18n="sidebar.connect_agent"');
-    expect(html).toContain('data-i18n="sidebar.connect_agent_sub"');
-    expect(locales.en['sidebar.connect_agent']).toBe('Connect agents');
-    expect(locales.en['sidebar.connect_agent_sub']).toBe('Claude Code · Codex & more');
-    expect(locales.zh['sidebar.connect_agent']).toBe('接入智能体');
-    expect(locales.zh['sidebar.connect_agent_sub']).toBe('Claude Code · Codex 等');
-    expect(locales.ja['sidebar.connect_agent']).toBe('エージェントを接続');
-    expect(locales.ja['sidebar.connect_agent_sub']).toBe('Claude Code · Codex など');
-    expect(locales.pt['sidebar.connect_agent']).toBe('Conectar agentes');
-    expect(locales.pt['sidebar.connect_agent_sub']).toBe('Claude Code · Codex e mais');
+    expect(html).toContain('data-i18n="agents.connect_cli_btn"');
+    expect(html).toContain('data-i18n="agents.connect_cli_sub"');
+    expect(html).toContain('data-i18n="skills.more_btn"');
+    expect(locales.en['agents.connect_cli_btn']).toBe('Connect an agent');
+    expect(locales.en['skills.more_btn']).toBe('Skill marketplace');
+    expect(locales.zh['agents.connect_cli_btn']).toBe('接入智能体');
+    expect(locales.zh['skills.more_btn']).toBe('技能市场');
+    expect(locales.ja['agents.connect_cli_btn']).toBe('エージェントを接続');
+    expect(locales.ja['skills.more_btn']).toBe('スキルマーケット');
+    expect(locales.pt['agents.connect_cli_btn']).toBe('Conectar agente');
+    expect(locales.pt['skills.more_btn']).toBe('Mercado de habilidades');
   });
 
   it('exposes the local Commander profile to the renderer', () => {

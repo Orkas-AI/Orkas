@@ -6,6 +6,8 @@ import type { NativeImage as ElectronNativeImage } from 'electron';
 
 import { hardenedWebPreferences } from '../util/window-security';
 import { isPathAllowed } from '../util/path-sandbox';
+import { encodeImage } from '../util/sharp-runtime';
+import { isImageStudioGeneration, type ImageStudioGenerationOutput } from './image_studio_provenance';
 import {
   extractCssImports,
   extractCssUrls,
@@ -173,6 +175,8 @@ export interface ImageStudioInspection {
   signature?: string;
   evidence_path?: string;
   source_path?: string;
+  source_kind?: 'html' | 'raster';
+  is_generation?: boolean;
   blockers: ImageStudioIssue[];
   advisories: ImageStudioIssue[];
   resources: string[];
@@ -189,8 +193,9 @@ export interface ImageStudioEvidenceState {
   source_path?: string;
   image_hash: string;
   captured_at: string;
-  /** Missing means a legacy evidence state and remains review-gated. */
-  review_required?: boolean;
+  /** Missing legacy provenance never establishes a generation exemption. */
+  is_generation?: boolean;
+  source_kind?: 'html' | 'raster';
   review?: {
     verdict: ImageStudioReviewVerdict;
     scope: string;
@@ -475,13 +480,14 @@ export function validateImageStudioManifest(value: unknown): {
     pushIssue(issues, 'E_COMPOSE_GENERATION_BUDGET', 'COMPOSE requires generation_budget.max_calls=0.');
   } else if (route === 'hybrid' && maxCalls > 1) {
     pushIssue(issues, 'E_HYBRID_GENERATION_BUDGET', 'HYBRID supports at most one image-generation call.');
-  } else if ((route === 'generate' || route === 'edit') && maxCalls < 1) {
-    pushIssue(issues, 'E_GENERATE_GENERATION_BUDGET', 'GENERATE and EDIT require a generation budget of at least one call.');
+  } else if (route === 'generate' && maxCalls < 1) {
+    pushIssue(issues, 'E_GENERATE_GENERATION_BUDGET', 'GENERATE requires a generation budget of at least one call.');
   }
 
   const entry = value.entry === undefined ? undefined : String(value.entry).trim();
   const rasterSource = value.raster_source === undefined ? undefined : String(value.raster_source).trim();
   if (entry !== undefined && !entry) pushIssue(issues, 'E_MANIFEST_ENTRY', 'entry must be a non-empty relative path when present.');
+  if (entry && rasterSource) pushIssue(issues, 'E_MANIFEST_FINAL_SOURCE_CONFLICT', 'Choose entry for the final HTML composition or raster_source for the final raster, not both.');
   if (rasterSource !== undefined && !rasterSource) pushIssue(issues, 'E_MANIFEST_RASTER_SOURCE', 'raster_source must be a non-empty relative path when present.');
 
   const references: ImageStudioReference[] = [];
@@ -581,9 +587,6 @@ export function validateImageStudioManifest(value: unknown): {
       if (!instructions?.length) {
         pushIssue(issues, 'E_MANIFEST_EDIT_INSTRUCTIONS', 'edit intent requires at least one explicit change instruction.');
       }
-      if (route !== 'edit' && route !== 'hybrid') {
-        pushIssue(issues, 'E_MANIFEST_EDIT_ROUTE', 'edit reference intent requires the EDIT or HYBRID route.');
-      }
       const editSources = referenceValidationViews
         .filter((reference) => reference.role === 'edit_source');
       if (!editSources.length) {
@@ -604,7 +607,9 @@ export function validateImageStudioManifest(value: unknown): {
       }
     }
     if (mode === 'reproduce') {
+      if (!referenceValidationViews.length) pushIssue(issues, 'E_MANIFEST_REPRODUCE_REFERENCE_REQUIRED', 'Reproduction requires at least one reference image.');
       for (const reference of referenceValidationViews) {
+        if (!reference.preserve?.length) pushIssue(issues, 'E_MANIFEST_REPRODUCE_BOUNDARY_REQUIRED', `references[${reference.index}].preserve must name the attributes to reproduce.`);
         if (!reference.required) {
           pushIssue(
             issues,
@@ -904,7 +909,7 @@ export async function inspectImageStudioProject(
   const manifest = read.manifest;
   const referenceResources = await collectManifestReferenceResources(projectDir, manifest, blockers);
 
-  if (manifest.route === 'compose' || manifest.route === 'hybrid') {
+  if (manifest.entry || (!explicitRasterAbsPath && !manifest.raster_source && (manifest.route === 'compose' || manifest.route === 'hybrid'))) {
     const entryRef = manifest.entry || 'index.html';
     const entryAbs = path.resolve(projectDir, entryRef);
     if (!isPathAllowed(entryAbs, [projectDir])) {
@@ -957,6 +962,8 @@ export async function inspectImageStudioProject(
     return {
       ok: blockers.length === 0,
       route: manifest.route,
+      source_kind: 'html',
+      is_generation: false,
       ...(signature ? { signature } : {}),
       blockers,
       advisories,
@@ -967,7 +974,7 @@ export async function inspectImageStudioProject(
 
   const sourceRef = explicitRasterAbsPath || (manifest.raster_source ? path.resolve(projectDir, manifest.raster_source) : '');
   const sourceAbs = sourceRef ? path.resolve(sourceRef) : '';
-  if (!sourceAbs) pushIssue(blockers, 'E_RASTER_SOURCE_REQUIRED', 'raster_source or input_path is required for GENERATE and EDIT.');
+  if (!sourceAbs) pushIssue(blockers, 'E_RASTER_SOURCE_REQUIRED', 'raster_source or input_path is required for a raster; use entry for an HTML composition.');
   else if (!isPathAllowed(sourceAbs, [projectDir])) pushIssue(blockers, 'E_RASTER_SOURCE_OUTSIDE_PROJECT', 'The raster source must stay inside the image project.');
   if (blockers.length) return { ok: false, route: manifest.route, blockers, advisories, resources: [], manifest };
 
@@ -977,7 +984,6 @@ export async function inspectImageStudioProject(
     if (analysis.width !== manifest.canvas.width || analysis.height !== manifest.canvas.height) {
       pushIssue(blockers, 'E_RASTER_CANVAS_SIZE_MISMATCH', `Raster is ${analysis.width}x${analysis.height}; manifest canvas is ${manifest.canvas.width}x${manifest.canvas.height}.`);
     }
-    if (analysis.contrast < 8) pushIssue(advisories, 'A_LOW_CONTRAST', 'The raster has unusually low global contrast.');
     const signature = await sha256Files([
       { label: 'image-manifest.json', absPath: read.manifestPath },
       { label: `raster:${serializedProjectRelativePath(projectDir, sourceAbs)}`, absPath: sourceAbs },
@@ -987,6 +993,7 @@ export async function inspectImageStudioProject(
       ok: blockers.length === 0,
       route: manifest.route,
       signature,
+      source_kind: 'raster',
       evidence_path: sourceAbs,
       source_path: sourceAbs,
       blockers,
@@ -1019,6 +1026,20 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
       (error) => { clearTimeout(timer); reject(error); },
     );
   });
+}
+
+/** Browser capture pixels follow display density; the manifest specifies the
+ * delivered raster dimensions. Normalize before hashing/review so the reviewed
+ * pixels and the exported pixels are the same on every display. */
+export async function normalizeImageStudioSnapshot(
+  capturedPng: Buffer,
+  canvas: ImageStudioManifest['canvas'],
+): Promise<Buffer> {
+  const { data } = await encodeImage(capturedPng, {
+    resize: { width: canvas.width, height: canvas.height, fit: 'fill' },
+    format: 'png',
+  });
+  return data;
 }
 
 async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioManifest, outputAbsPath: string): Promise<{
@@ -1119,9 +1140,11 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
         };
       });
     })()`, true), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_READY_TIMEOUT: fonts or local images did not become ready.');
-    const image = await withTimeout(win.webContents.capturePage(), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_CAPTURE_TIMEOUT: screenshot capture timed out.');
+    const captured = await withTimeout(win.webContents.capturePage(), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_CAPTURE_TIMEOUT: screenshot capture timed out.');
+    const bytes = await normalizeImageStudioSnapshot(captured.toPNG(), manifest.canvas);
     await fs.mkdir(path.dirname(outputAbsPath), { recursive: true });
-    await fs.writeFile(outputAbsPath, image.toPNG());
+    await fs.writeFile(outputAbsPath, bytes);
+    const image = electron.nativeImage.createFromBuffer(bytes);
     return {
       image: analyzeNativeImage(image),
       layoutBlockers: requiredCopyLayoutIssues(
@@ -1143,15 +1166,14 @@ async function writeEvidenceState(stateAbsPath: string, state: ImageStudioEviden
 export async function readImageStudioEvidenceState(stateAbsPath: string): Promise<ImageStudioEvidenceState | null> {
   try {
     const value = JSON.parse(await fs.readFile(stateAbsPath, 'utf8')) as ImageStudioEvidenceState;
-    return value?.schema_version === 1 ? value : null;
+    if (value?.schema_version !== 1) return null;
+    const { review_required: _legacyReviewRequired, ...current } = value as ImageStudioEvidenceState & { review_required?: unknown };
+    return current;
   } catch { return null; }
 }
 
-/** Generated rasters never use ImageStudio visual review. Legacy composed
- * evidence predates the explicit flag and remains fail-closed. */
-export function imageStudioEvidenceReviewRequired(state: ImageStudioEvidenceState | null): boolean {
-  if (!state || state.route === 'generate' || state.route === 'edit') return false;
-  return state.review_required !== false;
+export function imageStudioEvidenceIsGeneration(state: ImageStudioEvidenceState | null): boolean {
+  return state?.source_kind === 'raster' && state.is_generation === true;
 }
 
 /** Preserve a completed review when recapturing did not prove a material
@@ -1193,11 +1215,11 @@ export async function snapshotImageStudioProject(input: {
   const previous = await readImageStudioEvidenceState(input.stateAbsPath);
   const inspection = await inspectImageStudioProject(input.projectDirAbs);
   if (!inspection.ok || !inspection.manifest || !inspection.signature) return inspection;
-  if (inspection.route !== 'compose' && inspection.route !== 'hybrid') {
+  if (inspection.source_kind !== 'html') {
     return {
       ...inspection,
       ok: false,
-      blockers: [...inspection.blockers, { code: 'E_SNAPSHOT_ROUTE', message: 'project.snapshot is only for COMPOSE and HYBRID; inspect the generated raster directly.' }],
+      blockers: [...inspection.blockers, { code: 'E_SNAPSHOT_ROUTE', message: 'project.snapshot requires an HTML entry; use project.inspect for the final raster.' }],
     };
   }
   const rendered = await renderHtmlSnapshot(path.resolve(input.projectDirAbs), inspection.manifest, path.resolve(input.outputAbsPath));
@@ -1220,7 +1242,8 @@ export async function snapshotImageStudioProject(input: {
     evidence_path: evidencePath,
     image_hash: image.hash,
     captured_at: new Date().toISOString(),
-    review_required: true,
+    is_generation: false,
+    source_kind: 'html',
     ...(review ? { review } : {}),
   };
   await writeEvidenceState(input.stateAbsPath, state);
@@ -1240,11 +1263,15 @@ export async function recordRasterEvidence(input: {
   projectDirAbs: string;
   rasterAbsPath?: string;
   stateAbsPath: string;
+  generationOutputs?: readonly ImageStudioGenerationOutput[];
 }): Promise<ImageStudioInspection> {
   const inspection = await inspectImageStudioProject(input.projectDirAbs, input.rasterAbsPath);
   if (!inspection.ok || !inspection.signature || !inspection.evidence_path || !inspection.image || !inspection.route) return inspection;
-  if (inspection.route === 'compose' || inspection.route === 'hybrid') return inspection;
+  if (inspection.source_kind !== 'raster') return inspection;
   const evidencePath = path.resolve(inspection.evidence_path);
+  const isGeneration = await isImageStudioGeneration({ projectDirAbs: input.projectDirAbs, rasterAbsPath: evidencePath, outputs: input.generationOutputs || [] });
+  const previous = await readImageStudioEvidenceState(input.stateAbsPath);
+  const review = isGeneration ? undefined : reviewForRecapturedEvidence({ previous, projectDirAbs: input.projectDirAbs, signature: inspection.signature, evidencePath, imageHash: inspection.image.hash });
   await writeEvidenceState(input.stateAbsPath, {
     schema_version: 1,
     project_dir: path.resolve(input.projectDirAbs),
@@ -1254,9 +1281,11 @@ export async function recordRasterEvidence(input: {
     source_path: inspection.source_path,
     image_hash: inspection.image.hash,
     captured_at: new Date().toISOString(),
-    review_required: false,
+    is_generation: isGeneration,
+    source_kind: 'raster',
+    ...(review ? { review } : {}),
   });
-  return inspection;
+  return { ...inspection, is_generation: isGeneration };
 }
 
 async function assertCurrentEvidence(stateAbsPath: string): Promise<{ state: ImageStudioEvidenceState; inspection: ImageStudioInspection }> {
@@ -1283,8 +1312,8 @@ export async function submitImageStudioDesignReview(input: {
   additionalDimensions?: unknown;
 }): Promise<ImageStudioEvidenceState> {
   const { state, inspection } = await assertCurrentEvidence(input.stateAbsPath);
-  if (!imageStudioEvidenceReviewRequired(state)) {
-    throw new Error('E_IMAGE_REVIEW_NOT_APPLICABLE: GENERATE and EDIT rasters do not use ImageStudio visual review.');
+  if (imageStudioEvidenceIsGeneration(state)) {
+    throw new Error('E_IMAGE_REVIEW_NOT_APPLICABLE: Verified generation artifacts do not use ImageStudio visual review.');
   }
   if (path.resolve(input.evidenceAbsPath) !== path.resolve(state.evidence_path)) {
     throw new Error('E_IMAGE_REVIEW_PATH_MISMATCH: review the exact evidence path returned by ImageStudio.');
@@ -1331,9 +1360,9 @@ export async function exportImageStudioProject(input: {
   stateAbsPath: string;
   outputAbsPath: string;
   format: 'png' | 'jpeg';
-}): Promise<{ output_path: string; signature: string; image: ReturnType<typeof analyzeNativeImage> }> {
+}): Promise<{ output_path: string; signature: string; is_generation: boolean; image: ReturnType<typeof analyzeNativeImage> }> {
   const { state } = await assertCurrentEvidence(input.stateAbsPath);
-  if (imageStudioEvidenceReviewRequired(state)
+  if (!imageStudioEvidenceIsGeneration(state)
     && (!state.review || state.review.verdict !== 'passed' || state.review.signature !== state.signature)) {
     throw new Error('E_IMAGE_REVIEW_PASS_REQUIRED: the exact current evidence needs a passing design review before export.');
   }
@@ -1342,5 +1371,5 @@ export async function exportImageStudioProject(input: {
   await fs.mkdir(path.dirname(input.outputAbsPath), { recursive: true });
   await fs.writeFile(input.outputAbsPath, bytes);
   const outputImage = await nativeImageFromPath(input.outputAbsPath);
-  return { output_path: input.outputAbsPath, signature: state.signature, image: analyzeNativeImage(outputImage) };
+  return { output_path: input.outputAbsPath, signature: state.signature, is_generation: imageStudioEvidenceIsGeneration(state), image: analyzeNativeImage(outputImage) };
 }

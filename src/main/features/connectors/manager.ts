@@ -1947,10 +1947,6 @@ export async function callTool(
   try {
     const requestOpts = {
       ...(opts.signal ? { signal: opts.signal } : {}),
-      ...(inst.composio_grant ? { timeoutMs: COMPOSIO_CALL_TOOL_TIMEOUT_MS } : {}),
-      ...(entry?.auth_mode === 'local_cli'
-        && ['execute_read', 'execute_write', 'execute_high_impact', 'execute_destructive'].includes(name)
-        ? { timeoutMs: LOCAL_CLI_IDLE_TIMEOUT_MS, maxTotalTimeoutMs: LOCAL_CLI_TOTAL_TIMEOUT_MS } : {}),
     };
     const result = Object.keys(requestOpts).length
       ? await conn.callTool(name, args, requestOpts)

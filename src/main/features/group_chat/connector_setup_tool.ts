@@ -163,6 +163,16 @@ function searchText(entry: CatalogEntry, catalog: readonly CatalogEntry[]): stri
     entry.description_pt,
     entry.category,
   ];
+  // Append added locales after the legacy corpus: searchRank uses match offsets,
+  // so inserting translated copy between existing fields would reorder old queries.
+  const additionalLocalizedParts: unknown[] = [
+    entry.description_es,
+    entry.description_fr,
+    entry.description_ko,
+    entry.description_de,
+    entry.description_ru,
+    entry.description_it,
+  ];
   for (const id of relatedCatalogIds(entry, catalog)) {
     if (id === entry.id) continue;
     const related = catalog.find((candidate) => candidate.id === id);
@@ -175,6 +185,14 @@ function searchText(entry: CatalogEntry, catalog: readonly CatalogEntry[]): stri
       related?.description_en,
       related?.description_ja,
       related?.description_pt,
+    );
+    additionalLocalizedParts.push(
+      related?.description_es,
+      related?.description_fr,
+      related?.description_ko,
+      related?.description_de,
+      related?.description_ru,
+      related?.description_it,
     );
   }
   for (const variant of entry.connection_variants || []) {
@@ -189,8 +207,22 @@ function searchText(entry: CatalogEntry, catalog: readonly CatalogEntry[]): stri
       variant.description_ja,
       variant.description_pt,
     );
+    additionalLocalizedParts.push(
+      variant.label_es,
+      variant.label_fr,
+      variant.label_ko,
+      variant.label_de,
+      variant.label_ru,
+      variant.label_it,
+      variant.description_es,
+      variant.description_fr,
+      variant.description_ko,
+      variant.description_de,
+      variant.description_ru,
+      variant.description_it,
+    );
   }
-  return normalizeSearch(parts.filter(Boolean).join(' '));
+  return normalizeSearch([...parts, ...additionalLocalizedParts].filter(Boolean).join(' '));
 }
 
 function searchRank(entry: CatalogEntry, query: string, catalog: readonly CatalogEntry[]): number {

@@ -8,7 +8,7 @@ import * as driver from '../../../src/main/features/project_driver';
 
 function mkTask(id: string, status: TaskStatus, depends_on?: string[]): ProjectTask {
   return {
-    id, title: id, status, created_by: 'user',
+    id, content: id, status, created_by: 'user',
     created_at: '2026-07-21T00:00:00.000Z', updated_at: '2026-07-21T00:00:00.000Z',
     ...(depends_on ? { depends_on } : {}),
   };

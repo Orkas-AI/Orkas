@@ -7,7 +7,7 @@ import { Session } from "../src/agent/session.js";
 import { DEFAULT_BASH_TIMEOUT_MS, normalizeBashTimeoutMs } from "../src/tools/builtin.js";
 import { compactGitHubReadme } from "../src/tools/github-repository-fetch.js";
 import { MAX_WEB_FETCH_RESPONSE_BYTES } from "../src/tools/web-fetch.js";
-import type { ToolContext } from "../src/tools/index.js";
+import type { AgentTool, ToolContext } from "../src/tools/index.js";
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
@@ -24,6 +24,19 @@ function shellInvoke(executable: string, args: string[]): string {
 
 describe("Tools", () => {
   describe("defineTool", () => {
+    it("preserves trusted continuation inspection without exposing it to the model", () => {
+      const inspectReadContinuation = vi.fn(() => ({ version: "private", waiting: true }));
+      const tool = defineTool({
+        name: "read_progress", description: "Read progress", inputSchema: { type: "object" },
+        inspectReadContinuation,
+        async execute() { return { content: "ok" }; },
+      });
+      expect(tool.inspectReadContinuation).toBe(inspectReadContinuation);
+      expect(toToolDefinition(tool)).not.toHaveProperty("inspectReadContinuation");
+      expect(JSON.stringify(toToolDefinition(tool))).not.toContain("private");
+      expect(inspectReadContinuation).not.toHaveBeenCalled();
+    });
+
     it("creates a tool with all required fields", () => {
       const tool = defineTool({
         name: "test_tool",
@@ -734,7 +747,7 @@ describe("Tools", () => {
         clear: () => session.clearExecutionPlan(),
       });
       const context: ToolContext = { state: {} };
-      const longStep = `Inspect the production evidence and preserve every accepted constraint ${"detail ".repeat(30)}`.trim();
+      const longStep = `Inspect the production evidence and preserve every accepted constraint ${"detail ".repeat(60)}`.trim();
       expect(longStep.length).toBeGreaterThan(180);
 
       const result = await tool.execute({
@@ -829,6 +842,34 @@ describe("Tools", () => {
       expect(schemaReads).toBe(1);
     });
 
+    it("refreshes dynamic descriptions while reusing unchanged definitions", () => {
+      let description = "Read the current state.";
+      let schemaReads = 0;
+      const tool: AgentTool = {
+        name: "dynamic_token_budget_probe",
+        dynamicDescription: true,
+        get description() { return description; },
+        get inputSchema() { schemaReads++; return { type: "object" }; },
+        async execute() { return { content: "" }; },
+      };
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const first = toToolDefinition(tool);
+        expect(toToolDefinition(tool)).toBe(first);
+        expect(schemaReads).toBe(1);
+        description = "界".repeat(101); // 152 estimated tokens; only 101 characters
+        const second = toToolDefinition(tool);
+        expect(second).not.toBe(first);
+        expect(second.description).toBe(description);
+        expect(toToolDefinition(tool)).toBe(second);
+        expect(schemaReads).toBe(2);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith("[tool-definitions]",
+          "tool definition description exceeds soft budget; sent untruncated",
+          expect.objectContaining({ estimatedTokens: 152, softBudgetTokens: 150 }));
+      } finally { warn.mockRestore(); }
+    });
+
     it("keeps descriptions intact while warning on soft-budget overruns", () => {
       const longDescription = "Use this tool carefully. " + "detail ".repeat(120);
       const modeDescription = "Choose execution mode. " + "extra ".repeat(80);
@@ -878,7 +919,7 @@ describe("Tools", () => {
           expect.objectContaining({
             tool: "schema_tool",
             field: "tool description",
-            softBudget: 480,
+            softBudgetTokens: 150,
           }),
         );
         expect(warn).toHaveBeenCalledWith(
@@ -887,7 +928,7 @@ describe("Tools", () => {
           expect.objectContaining({
             tool: "schema_tool",
             field: "schema description at /inputSchema/properties/mode",
-            softBudget: 220,
+            softBudgetTokens: 80,
           }),
         );
       } finally {
@@ -1495,9 +1536,9 @@ describe("Tools", () => {
       const stdout = "progress ".repeat(40) + "stdout-tail";
       const stderr = "diagnostic ".repeat(40) + "stderr-tail";
       try {
-        const result = await bash.execute({ command: shellInvoke(TEST_NODE, ["-e",
-          `process.stdout.write(${JSON.stringify(stdout)}); process.stderr.write(${JSON.stringify(stderr)}); process.exitCode = ${exitCode};`,
-        ]) }, ctx);
+        const script = path.join(tmpDir, "failure.cjs");
+        await fs.writeFile(script, `process.stdout.write(${JSON.stringify(stdout)}); process.stderr.write(${JSON.stringify(stderr)}); process.exitCode = ${exitCode};`);
+        const result = await bash.execute({ command: shellInvoke(TEST_NODE, [script]) }, ctx);
         expect(result.isError).toBe(true);
         expect(result.content).toContain(`<stdout>\n${stdout}\n</stdout>`);
         expect(result.content).toContain(`<stderr>\n${stderr}\n</stderr>`);
@@ -1506,7 +1547,8 @@ describe("Tools", () => {
           stdout: { bytes: Buffer.byteLength(stdout), truncated: false },
           stderr: { bytes: Buffer.byteLength(stderr), truncated: false },
         });
-        const recovered = await bash.execute({ command: shellInvoke(TEST_NODE, ["-e", "process.stdout.write('recovered')"]) }, ctx);
+        await fs.writeFile(script, "process.stdout.write('recovered')");
+        const recovered = await bash.execute({ command: shellInvoke(TEST_NODE, [script]) }, ctx);
         expect(recovered.isError).toBeUndefined();
         expect(recovered.content).toContain("<stdout>\nrecovered\n</stdout>");
       } finally {

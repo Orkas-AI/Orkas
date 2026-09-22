@@ -1,6 +1,7 @@
 import { randomInt, randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import {
+  appendFileSync,
   chmodSync,
   mkdirSync,
   mkdtempSync,
@@ -14,6 +15,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import AdmZip from 'adm-zip';
+import { BackgroundServices } from './background-services';
+import { closeElectronFixture, requestElectronQuit } from './electron-cleanup';
+import { ownFixtureServer } from './server-cleanup';
 import {
   _electron as electron,
   expect,
@@ -44,6 +48,9 @@ const E2E_MP4_BYTES = Buffer.from([
 ]);
 
 type OrkasOptions = {
+  /** Exercise native capture on machines/evaluators without GPU compositing. */
+  softwareRendering?: boolean;
+  captureRendererErrorWindows?: boolean;
   /** Keep storage-location probes isolated while allowing a non-temporary parent. */
   rootParent?: string;
   configuredModel?: boolean;
@@ -94,6 +101,15 @@ type ModelToolScenario =
   }
   | { kind: 'connector'; connectorId: string }
   | { kind: 'agent-authoring'; finalText: string }
+  | {
+    kind: 'create-pdf';
+    sourceType: 'markdown' | 'html';
+    content: string;
+    outputPath: string;
+    finalText: string;
+    issued: boolean;
+    toolLoadRequested: boolean;
+  }
   | {
     kind: 'bash-sequence';
     commands: string[];
@@ -292,7 +308,8 @@ const writeState = value => {
 const state = readState();
 const sessionIndex = args.indexOf('--session');
 const resumeSessionId = sessionIndex >= 0 ? String(args[sessionIndex + 1] || '') : '';
-const prompt = String(args[args.length - 1] || '');
+// The OpenCode backend supplies the prompt on stdin, not as the final argv.
+const prompt = fs.readFileSync(0, 'utf8');
 let marker = 'default';
 for (const candidate of [
   'E2E_CLI_ESTABLISH_SESSION',
@@ -664,6 +681,12 @@ input.on('line', line => {
     send({ method: 'turn/started', params: {
       threadId, turn: { id: turnId, status: 'inProgress' },
     } });
+    if (prompt.includes('E2E_CODEX_ASYNC_QUESTION')) {
+      send({ method: 'item/completed', params: { threadId, turnId, item: {
+        id: 'async-question', type: 'agentMessage', delivery: 'async', text: 'Which scope?',
+        questions: [{ title: 'Which scope?', options: ['Current', 'All'] }],
+      } } });
+    }
     if (!prompt.includes('E2E_CODEX_SEND_NOW_ACTIVE')) finish('E2E_CODEX_DEFAULT_OK');
     return;
   }
@@ -745,9 +768,24 @@ export class OrkasTestApp {
 
   electronApp: ElectronApplication | null = null;
   page: Page | null = null;
+  async openPreview(action: () => Promise<unknown>): Promise<Page> {
+    if (!this.electronApp) throw new Error('Electron is unavailable');
+    const opened = this.electronApp.waitForEvent('window');
+    await action();
+    const preview = await opened;
+    await preview.waitForLoadState('domcontentloaded');
+    return preview;
+  }
+  async closePreview(preview: Page): Promise<void> {
+    if (!this.electronApp) throw new Error('Electron is unavailable');
+    const native = await this.electronApp.browserWindow(preview);
+    await native.evaluate(win => win.close());
+    await expect.poll(() => preview.isClosed()).toBe(true);
+  }
   lastLaunchReadyMs: number | null = null;
 
   private apiServer: Server | null = null;
+  private disposeApiServer: (() => Promise<void>) | null = null;
   private apiBaseUrl = 'http://127.0.0.1:9/api';
   private modelStubMode: ModelStubMode = 'success';
   private clientConfigGeneration = 0;
@@ -763,12 +801,16 @@ export class OrkasTestApp {
   } | null = null;
   private readonly testInfo: TestInfo;
   private readonly diagnostics: string[] = [];
-  private readonly rendererPageErrors: string[] = [];
+  private readonly rendererPageErrors: Array<{ diagnosticIndex: number; detail: string }> = [];
+  private readonly rendererErrors: Array<{ diagnosticIndex: number; type: string; windowId: Promise<number | null> }> = [];
+  private readonly recoveredRendererErrors = new Set<number>();
   private readonly tracePaths: string[] = [];
   private traceNumber = 0;
   private activeUserId: string;
   private readonly configuredModelSeededUsers = new Set<string>();
   private modelToolScenario: ModelToolScenario | null = null;
+  private generatedImageBytes = Buffer.from(E2E_PNG_B64, 'base64');
+  private generatedVideoBytes = E2E_MP4_BYTES;
   private modelToolScenarioRequestStart = 0;
   private pendingAgentHandoffReply: (() => void) | null = null;
   private pendingCommentaryReply: (() => void) | null = null;
@@ -776,7 +818,7 @@ export class OrkasTestApp {
   private modelTextReplies: string[] = [];
   private libraryImageDescriptionReplies: string[] = [];
 
-  constructor(testInfo: TestInfo, options: OrkasOptions = {}) {
+  constructor(testInfo: TestInfo, private readonly options: OrkasOptions = {}) {
     this.testInfo = testInfo;
     this.configuredModel = options.configuredModel !== false;
     this.setDefaultViewport = options.setDefaultViewport !== false;
@@ -867,7 +909,13 @@ export class OrkasTestApp {
     delete environment.ELECTRON_RUN_AS_NODE;
     // Preserve no-color output without leaking contradictory runner settings
     // into Electron's stderr (which the app records as console errors).
-    if (environment.NO_COLOR !== undefined) delete environment.FORCE_COLOR;
+    // Playwright forces worker color. Restore the caller's plain-output intent
+    // at the Electron boundary without reintroducing conflicting controls.
+    if (environment.NO_COLOR !== undefined || environment.ORKAS_E2E_NO_COLOR === '1') {
+      environment.NO_COLOR = '1';
+      delete environment.FORCE_COLOR;
+    }
+    delete environment.ORKAS_E2E_NO_COLOR;
     if (this.cliStub) {
       environment.ORKAS_E2E_CLI_STATE = this.cliStatePath;
       environment.ORKAS_OPENCODE_PATH = this.fakeOpenCodePath || '';
@@ -913,16 +961,32 @@ export class OrkasTestApp {
       sources: true,
     });
 
+    const observed = new WeakSet<Page>();
+    const observePage = (surface: Page) => {
+      if (observed.has(surface)) return;
+      observed.add(surface);
+      const windowId = this.options.captureRendererErrorWindows
+        ? app.browserWindow(surface).then(async win => {
+          try { return await win.evaluate(value => value.id); } finally { await win.dispose(); }
+        }).catch(() => null)
+        : Promise.resolve(null);
+      surface.on('console', message => {
+        const diagnosticIndex = this.diagnostics.length;
+        this.diagnostics.push(`[renderer:${message.type()}] ${message.text()}`);
+        if (message.type() === 'error') this.rendererErrors.push({ diagnosticIndex, type: 'error', windowId });
+      });
+      surface.on('pageerror', error => {
+        const detail = error.stack || error.message;
+        const diagnosticIndex = this.diagnostics.length;
+        this.rendererPageErrors.push({ diagnosticIndex, detail });
+        this.rendererErrors.push({ diagnosticIndex, type: 'pageerror', windowId });
+        this.diagnostics.push(`[renderer:pageerror] ${detail}`);
+      });
+    };
+    app.on('window', observePage);
     const page = await app.firstWindow();
     this.page = page;
-    page.on('console', (message) => {
-      this.diagnostics.push(`[renderer:${message.type()}] ${message.text()}`);
-    });
-    page.on('pageerror', (error) => {
-      const detail = error.stack || error.message;
-      this.rendererPageErrors.push(detail);
-      this.diagnostics.push(`[renderer:pageerror] ${detail}`);
-    });
+    observePage(page);
     if (this.setDefaultViewport) {
       await page.setViewportSize({ width: 1280, height: 800 });
     }
@@ -1099,7 +1163,7 @@ export class OrkasTestApp {
   }
 
   setClientConfigImmediate(immediate: Record<string, unknown>): string {
-    if (!this.updateStub) throw new Error('The local client-config stub is not enabled for this fixture');
+    if (!this.updateStub && !this.modelStub) throw new Error('The local client-config stub is not enabled for this fixture');
     this.clientConfigGeneration += 1;
     this.clientConfigImmediate = {
       'feature.e2e_published': 'generation-a',
@@ -1232,6 +1296,22 @@ export class OrkasTestApp {
       writeIssued: false,
       toolLoadRequested: false,
     };
+  }
+
+  setCreatePdfScenario(sourceType: 'markdown' | 'html', content: string, outputPath: string, finalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!content.trim() || !path.isAbsolute(outputPath) || !finalText.trim()) {
+      throw new Error('The PDF scenario requires content, an absolute output path, and a final reply');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = { kind: 'create-pdf', sourceType, content, outputPath, finalText,
+      issued: false, toolLoadRequested: false };
+  }
+
+  setGeneratedMediaFixture(kind: 'image' | 'video', bytes: Buffer): void {
+    if (!this.modelStub || !bytes.length) throw new Error('Generated media requires a local model stub and nonempty bytes');
+    if (kind === 'image') this.generatedImageBytes = Buffer.from(bytes);
+    else this.generatedVideoBytes = Buffer.from(bytes);
   }
 
   setDelayedWriteFileScenario(
@@ -1573,9 +1653,33 @@ export class OrkasTestApp {
     });
   }
 
+  async rendererErrorEvidence() {
+    return Promise.all(this.rendererErrors.map(async record => ({
+      diagnosticIndex: record.diagnosticIndex, type: record.type, windowId: await record.windowId,
+    })));
+  }
+
+  /** Test-only recovery: the caller must provide independently verified preview
+   * windows. Raw diagnostic entries are never rewritten or removed. */
+  async recoverPreviewRendererErrors(windowIds: readonly number[]) {
+    const windows = new Set(windowIds);
+    for (const record of await this.rendererErrorEvidence()) {
+      if (record.windowId !== null && windows.has(record.windowId)) this.recoveredRendererErrors.add(record.diagnosticIndex);
+    }
+    let line = 1;
+    const ranges: Array<{ start: number; end: number; diagnosticIndex: number }> = [];
+    this.diagnostics.forEach((entry, diagnosticIndex) => {
+      const count = entry.split('\n').length;
+      if (this.recoveredRendererErrors.has(diagnosticIndex)) ranges.push({ start: line, end: line + count - 1, diagnosticIndex });
+      line += count;
+    });
+    return ranges;
+  }
+
   async dispose(): Promise<void> {
-    const rendererFailed = this.rendererPageErrors.length > 0;
-    const failed = this.testInfo.status !== this.testInfo.expectedStatus || rendererFailed;
+    const unresolvedRendererErrors = this.rendererPageErrors.filter(error => !this.recoveredRendererErrors.has(error.diagnosticIndex));
+    const rendererFailed = unresolvedRendererErrors.length > 0;
+    let failed = this.testInfo.status !== this.testInfo.expectedStatus || rendererFailed;
     if (failed && this.page && !this.page.isClosed()) {
       const screenshotPath = this.testInfo.outputPath('failure.png');
       await this.page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
@@ -1585,8 +1689,14 @@ export class OrkasTestApp {
       }).catch(() => undefined);
     }
 
-    await this.closeCurrentApp();
-    await this.closeStubServer();
+    let cleanupError: unknown;
+    try { await this.closeCurrentApp(); }
+    catch (error) { cleanupError = error; failed = true; }
+    try { await this.closeStubServer(); }
+    catch (error) {
+      cleanupError = cleanupError ? new AggregateError([cleanupError, error], 'Fixture cleanup failed') : error;
+      failed = true;
+    }
 
     if (failed) {
       for (const [index, tracePath] of this.tracePaths.entries()) {
@@ -1658,9 +1768,20 @@ export class OrkasTestApp {
 
     if (rendererFailed && this.testInfo.status === this.testInfo.expectedStatus) {
       throw new Error(
-        `Renderer page error detected (${this.rendererPageErrors.length}); see attached Electron diagnostics`,
+        `Renderer page error detected (${unresolvedRendererErrors.length}); see attached Electron diagnostics`,
       );
     }
+    if (cleanupError) throw cleanupError;
+  }
+
+  private recordCleanupPhase(phase: string, outcome: string): void {
+    const entry = JSON.stringify({ phase, outcome, at: new Date().toISOString() });
+    this.diagnostics.push(`[fixture-cleanup] ${entry}`);
+    // Persist before awaiting cleanup: a worker timeout must not erase the last phase.
+    try {
+      mkdirSync(this.testInfo.outputDir, { recursive: true });
+      appendFileSync(this.testInfo.outputPath('fixture-cleanup.jsonl'), `${entry}\n`);
+    } catch { /* Diagnostic IO must not interrupt resource cleanup. */ }
   }
 
   private async closeCurrentApp(): Promise<void> {
@@ -1668,11 +1789,19 @@ export class OrkasTestApp {
     if (!app) return;
 
     const tracePath = this.testInfo.outputPath(`trace-${++this.traceNumber}.zip`);
-    await app.context().tracing.stop({ path: tracePath }).catch(() => undefined);
     this.tracePaths.push(tracePath);
-    await app.close().catch(() => undefined);
-    this.electronApp = null;
-    this.page = null;
+    try {
+      await closeElectronFixture({
+        process: () => app.process(),
+        context: () => app.context(),
+        close: () => requestElectronQuit(app),
+      }, tracePath, {
+        phase: (phase, outcome) => this.recordCleanupPhase(phase, outcome),
+      });
+    } finally {
+      this.electronApp = null;
+      this.page = null;
+    }
   }
 
   private async ensureStubServer(): Promise<void> {
@@ -1710,6 +1839,7 @@ export class OrkasTestApp {
     const marketplaceUnsafeSkillBundle = marketplaceUnsafeSkillZip.toBuffer();
     const server = createServer((request, response) => {
       const requestUrl = new URL(request.url || '/', 'http://127.0.0.1');
+      response.setHeader('X-Orkas-E2E-Stub', '1');
       this.apiRequests.push({
         method: request.method || '',
         path: requestUrl.pathname,
@@ -1799,7 +1929,7 @@ export class OrkasTestApp {
         return;
       }
       if (request.method === 'GET' && isImageOutput && this.modelStub) {
-        const image = Buffer.from(E2E_PNG_B64, 'base64');
+        const image = this.generatedImageBytes;
         response.writeHead(200, {
           'Content-Type': 'image/png',
           'Content-Length': String(image.length),
@@ -1825,9 +1955,9 @@ export class OrkasTestApp {
       if (request.method === 'GET' && isVideoOutput && this.modelStub) {
         response.writeHead(200, {
           'Content-Type': 'video/mp4',
-          'Content-Length': String(E2E_MP4_BYTES.length),
+          'Content-Length': String(this.generatedVideoBytes.length),
         });
-        response.end(E2E_MP4_BYTES);
+        response.end(this.generatedVideoBytes);
         return;
       }
       const validGenerationUpload = this.modelStub
@@ -1844,7 +1974,7 @@ export class OrkasTestApp {
 
       const chunks: Buffer[] = [];
       request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-      request.on('end', () => {
+      request.on('end', async () => {
         if (isGenerationReferenceAuth) {
           const authRequest = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
             content_length: number;
@@ -2639,6 +2769,21 @@ export class OrkasTestApp {
           }
           return;
         }
+        if (scenario?.kind === 'create-pdf') {
+          if (!scenario.issued && !advertisedToolNames.has('create_pdf')
+            && advertisedToolNames.has('tool_load') && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-create-pdf', 'office.pdf');
+          } else if (!scenario.issued) {
+            scenario.issued = true;
+            finishImmediately(toolCallEvents('call-e2e-create-pdf', 'create_pdf', {
+              path: scenario.outputPath, source_type: scenario.sourceType, content: scenario.content,
+            }));
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
+          }
+          return;
+        }
         if (scenario?.kind === 'write-file') {
           if (!scenario.writeIssued
             && !advertisedToolNames.has('write_file')
@@ -3058,6 +3203,7 @@ export class OrkasTestApp {
     // Retrying EADDRINUSE keeps parallel Playwright workers isolated. Windows
     // may also reserve arbitrary slices of this range and reports those ports
     // as EACCES, so treat that as another allocation miss.
+    const disposeServer = ownFixtureServer(server);
     let listening = false;
     for (let attempt = 0; attempt < 100 && !listening; attempt += 1) {
       const port = randomInt(49_152, 65_536);
@@ -3083,6 +3229,7 @@ export class OrkasTestApp {
     }
     if (!listening) throw new Error('Unable to allocate a safe local E2E stub port');
     this.apiServer = server;
+    this.disposeApiServer = disposeServer;
     const address = server.address() as AddressInfo;
     this.apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
   }
@@ -3100,7 +3247,6 @@ export class OrkasTestApp {
     if ('closeAllConnections' in server && typeof server.closeAllConnections === 'function') {
       server.closeAllConnections();
     }
-    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 }
 

@@ -7,7 +7,7 @@ description_en: The craft know-how that makes a video GOOD (not just rendered) �
 
 # video-craft
 
-The difference between a video that merely renders and one that's actually good. Apply these standards while scripting, storyboarding, composing, generating, and editing — and run the self-check before publishing. These are general production-craft norms; the exact numbers are starting points, adjust to the brief.
+Apply these craft principles while scripting, composing, prompting and editing; the numbers are starting points to adapt to the brief. They guide authoring, not mandatory local postprocessing of model output. Before any pre-publish self-check, apply [production-method.md](../video-router/references/production-method.md): direct generation skips the review below, and mixed work reviews only local integration.
 
 ## 1. The opening (hook)
 
@@ -123,3 +123,11 @@ The most common failure of generated/composed video is that it quietly degrades 
 - **Consistent** — one grade, one type system, a small transition set; subject identity preserved across cuts.
 - **Audio** — speech clear and loudest; music ducked; SFX slightly lead the cut; ~−14 LUFS integrated, true-peak ≤ ~−1 dBTP, no clipping/pops; silences intentional.
 - **Platform** — text in safe zones; correct aspect; length in range; first frame matches the promise.
+
+## Product listing and sales creative
+
+For this route, read [ecommerce.md](references/ecommerce.md) when selected by the router.
+
+## Reference-led reconstruction
+
+For `is_generation:false` reference-led creative work, read [reference-recreation.md](references/reference-recreation.md) after production-method selection.

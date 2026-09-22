@@ -113,3 +113,31 @@ export function estimateBudgetTokenQuarters(text: string, state?: TokenBudgetSca
   }
   return quarters;
 }
+
+/** Shared conservative unit for model-facing text budgets. */
+export function estimateBudgetTokens(text: string): number {
+  return Math.ceil(estimateBudgetTokenQuarters(text) / 4);
+}
+
+/** Prefix projection only; preserve source text and include the omission marker
+ * in the budget. Bisection never splits a UTF-16 surrogate pair. */
+export function truncateBudgetText(text: string, maxTokens: number): string {
+  const budget = Math.max(0, Math.floor(maxTokens));
+  if (estimateBudgetTokens(text) <= budget) return text;
+  if (budget === 0) return '';
+  const marker = '…';
+  let low = 0;
+  let high = text.length;
+  const render = (end: number): string => {
+    if (end > 0 && end < text.length
+      && text.charCodeAt(end - 1) >= 0xD800 && text.charCodeAt(end - 1) <= 0xDBFF
+      && text.charCodeAt(end) >= 0xDC00 && text.charCodeAt(end) <= 0xDFFF) end--;
+    return text.slice(0, end).trimEnd() + marker;
+  };
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (estimateBudgetTokens(render(mid)) <= budget) low = mid;
+    else high = mid - 1;
+  }
+  return render(low);
+}

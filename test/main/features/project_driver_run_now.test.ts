@@ -3,16 +3,15 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-const driverLogs = vi.hoisted(() => [] as unknown[][]);
-vi.mock('../../../src/main/logger', () => ({
-  createLogger: (scope: string) => Object.fromEntries(
-    ['info', 'warn', 'error', 'debug'].map((level) => [level, (...args: unknown[]) => {
-      if (scope === 'project-driver-runner') driverLogs.push([level, ...args]);
-    }]),
-  ),
-}));
-
 import type { TaskStatus } from '../../../src/main/features/project_tasks';
+
+const driverLogs = vi.hoisted(() => [] as unknown[][]);
+vi.mock('../../../src/main/logger', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../src/main/logger')>();
+  return { ...actual, createLogger: (scope: string) => scope === 'project-driver-runner'
+    ? Object.fromEntries(['info', 'warn', 'error', 'debug'].map(level => [level, (...args: unknown[]) => driverLogs.push([level, ...args])]))
+    : actual.createLogger(scope) };
+});
 
 // runTaskNow dispatches through the real conversation/bus modules (no injection
 // seam like advanceProjectIfDue), so mock those; todo_tasks runs for real
@@ -23,7 +22,14 @@ vi.mock('../../../src/main/features/chats', () => ({
 }));
 vi.mock('../../../src/main/features/group_chat', () => ({
   send: vi.fn(async () => ({ ok: true })),
+  setFloor: vi.fn(async () => ({ ok: true })),
   busIsQuiescent: () => true,
+}));
+vi.mock('../../../src/main/features/users', () => ({
+  getActiveUserId: vi.fn(() => 'uRUNNOW'), hasActiveUser: () => true,
+}));
+vi.mock('../../../src/main/features/agents', () => ({
+  listAgentSummaries: vi.fn(async () => [{ agent_id: 'a_owner', name: 'Owner', enabled: true }]),
 }));
 vi.mock('../../../src/main/features/projects', () => ({
   projectExists: vi.fn(async () => true),
@@ -33,6 +39,9 @@ vi.mock('../../../src/main/features/projects', () => ({
 
 import * as chats from '../../../src/main/features/chats';
 import * as groupChat from '../../../src/main/features/group_chat';
+import * as agents from '../../../src/main/features/agents';
+import * as projects from '../../../src/main/features/projects';
+import * as users from '../../../src/main/features/users';
 import * as runner from '../../../src/main/features/project_driver_runner';
 import * as projectTasks from '../../../src/main/features/project_tasks';
 import * as driver from '../../../src/main/features/project_driver';
@@ -57,6 +66,10 @@ beforeEach(() => {
   vi.mocked(chats.createConversation).mockResolvedValue({ conversation_id: 'c_run' } as never);
   vi.mocked(chats.deleteConversation).mockResolvedValue(undefined as never);
   vi.mocked(groupChat.send).mockResolvedValue({ ok: true } as never);
+  vi.mocked(groupChat.setFloor).mockResolvedValue({ ok: true } as never);
+  vi.mocked(users.getActiveUserId).mockReturnValue(UID);
+  vi.mocked(projects.getBindings).mockResolvedValue({ agents: ['a_owner'], skills: [] } as never);
+  vi.mocked(agents.listAgentSummaries).mockResolvedValue([{ agent_id: 'a_owner', name: 'Owner', enabled: true }] as never);
 });
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
@@ -112,13 +125,13 @@ describe('project_driver_runner › runTaskNow', () => {
       const result = mode === 'manual' ? await runner.runTaskNow(UID, PID, task.id) : await runner.advance(UID, PID, task);
       expect(result.ok).toBe(true);
       expect(tb.backlogExecutionSnapshot(UID, PID).get(task.id)?.is_running).toBe(true);
-      expect((await projectTasks.getTask(UID, PID, task.id))?.origin_cid).toBe('c_original');
+      expect((await projectTasks.getTask(UID, PID, task.id))?.origin_cid).toBe(cid);
     } finally { tb._resetForTest(); }
   });
 
-  it('routes an assigned task through the Commander and requires an explicit verified review transition', async () => {
+  it.each(['manual', 'automatic'])('routes an assigned task directly to its owner with verified review rules for a %s run', async (mode) => {
     const task = await seedTask({ owner: 'Owner', ownerId: 'a_owner' });
-    const res = await runner.runTaskNow(UID, PID, task.id);
+    const res = mode === 'manual' ? await runner.runTaskNow(UID, PID, task.id) : await runner.advance(UID, PID, task);
 
     expect(res.ok).toBe(true);
     expect(res.cid).toBe('c_run');
@@ -135,7 +148,11 @@ describe('project_driver_runner › runTaskNow', () => {
     expect(sendArg.text).toBe('Ship the thing');
     expect(sendArg.title_text).toBe('Ship the thing');
     expect(sendArg.model_text).toContain(`Execute project task ${task.id} now: "Ship the thing"`);
-    expect(sendArg.model_text).toContain('dispatch the work to @Owner');
+    expect(groupChat.setFloor).toHaveBeenCalledWith(UID, 'c_run', 'a_owner');
+    expect(vi.mocked(groupChat.setFloor).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(groupChat.send).mock.invocationCallOrder[0]);
+    expect(sendArg.model_text).toContain('Complete and verify the work');
+    expect(sendArg.model_text).not.toContain('Commander');
+    expect(sendArg.model_text).not.toContain('dispatch the work');
     expect(sendArg.model_text).toContain('fully complete and verified');
     expect(sendArg.model_text).toContain('update this exact task to review with todo_tasks');
     expect(sendArg.model_text).toContain('incomplete, interrupted, or fails');
@@ -146,6 +163,90 @@ describe('project_driver_runner › runTaskNow', () => {
     const after = await projectTasks.getTask(UID, PID, task.id);
     expect(after?.status).toBe('progress');
     expect(after?.origin_cid).toBe('c_run');
+  });
+
+  it.each(['disabled', 'unbound', 'missing', 'selection_failed'])('does not substitute Commander when the assigned owner is %s', async (reason) => {
+    const task = await seedTask({ owner: 'Owner', ownerId: 'a_owner' });
+    if (reason === 'disabled') vi.mocked(agents.listAgentSummaries).mockResolvedValue([{ agent_id: 'a_owner', name: 'Owner', enabled: false }] as never);
+    if (reason === 'missing') vi.mocked(agents.listAgentSummaries).mockResolvedValue([]);
+    if (reason === 'unbound') vi.mocked(projects.getBindings).mockResolvedValue({ agents: [], skills: [] } as never);
+    if (reason === 'selection_failed') vi.mocked(groupChat.setFloor).mockResolvedValue({ ok: false, error: 'unknown agent' } as never);
+    expect(await runner.runTaskNow(UID, PID, task.id)).toMatchObject({ ok: false, error: 'owner_not_bound' });
+    expect(groupChat.send).not.toHaveBeenCalled();
+    expect(chats.deleteConversation).toHaveBeenCalledWith(UID, 'c_run', PID);
+    expect(await projectTasks.getTask(UID, PID, task.id)).toMatchObject({ status: 'todo' });
+
+    // Restoring availability must make the same task retryable; a failed
+    // selection must not retain the in-flight dispatch lock.
+    vi.mocked(projects.getBindings).mockResolvedValue({ agents: ['a_owner'], skills: [] } as never);
+    vi.mocked(agents.listAgentSummaries).mockResolvedValue([{ agent_id: 'a_owner', name: 'Owner', enabled: true }] as never);
+    vi.mocked(groupChat.setFloor).mockResolvedValue({ ok: true } as never);
+    expect((await runner.runTaskNow(UID, PID, task.id)).ok).toBe(true);
+    expect(groupChat.send).toHaveBeenCalledTimes(1);
+    expect((await projectTasks.getTask(UID, PID, task.id))?.status).toBe('progress');
+  });
+
+  it('keeps an assignment by id after the agent is renamed, even if another agent takes its old name', async () => {
+    const task = await seedTask({ owner: 'Owner', ownerId: 'a_owner' });
+    vi.mocked(projects.getBindings).mockResolvedValue({ agents: ['a_owner', 'a_other'], skills: [] } as never);
+    vi.mocked(agents.listAgentSummaries).mockResolvedValue([
+      { agent_id: 'a_other', name: 'Owner', enabled: true },
+      { agent_id: 'a_owner', name: 'Renamed owner', enabled: true },
+    ] as never);
+    expect((await runner.runTaskNow(UID, PID, task.id)).ok).toBe(true);
+    expect(groupChat.setFloor).toHaveBeenCalledExactlyOnceWith(UID, 'c_run', 'a_owner');
+    expect(groupChat.send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['before_lookup', 'during_lookup'])('does not dispatch an assigned task after an account switch %s', async (phase) => {
+    const task = await seedTask({ ownerId: 'a_owner' });
+    if (phase === 'before_lookup') vi.mocked(users.getActiveUserId).mockReturnValue('another_account');
+    else vi.mocked(agents.listAgentSummaries).mockImplementationOnce(async () => {
+      vi.mocked(users.getActiveUserId).mockReturnValue('another_account');
+      return [{ agent_id: 'a_owner', name: 'Owner', enabled: true }] as never;
+    });
+    expect(await runner.runTaskNow(UID, PID, task.id)).toMatchObject({ ok: false, error: 'owner_not_bound' });
+    expect(groupChat.setFloor).not.toHaveBeenCalled();
+    expect(groupChat.send).not.toHaveBeenCalled();
+    expect(chats.deleteConversation).toHaveBeenCalledWith(UID, 'c_run', PID);
+    expect((await projectTasks.getTask(UID, PID, task.id))?.status).toBe('todo');
+    if (phase === 'before_lookup') expect(agents.listAgentSummaries).not.toHaveBeenCalled();
+  });
+
+  it.each(['manual', 'automatic'])('preserves a concurrent status decision when owner lookup fails during a %s run, and permits retry', async (mode) => {
+    const task = await seedTask({ ownerId: 'a_owner' });
+    vi.mocked(agents.listAgentSummaries).mockImplementationOnce(async () => {
+      await projectTasks.updateTask(UID, PID, task.id, { status: 'review' });
+      throw new Error('Injected agent registry read failure');
+    });
+    const result = mode === 'manual' ? await runner.runTaskNow(UID, PID, task.id) : await runner.advance(UID, PID, task);
+    expect(result.ok).toBe(false);
+    expect(groupChat.send).not.toHaveBeenCalled();
+    expect(chats.deleteConversation).toHaveBeenCalledWith(UID, 'c_run', PID);
+    expect((await projectTasks.getTask(UID, PID, task.id))?.status).toBe('review');
+    expect((await runner.runTaskNow(UID, PID, task.id)).ok).toBe(true);
+    expect(groupChat.send).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(groupChat.send).mock.calls[0][0].model_text).toContain('to done with todo_tasks');
+  });
+
+  it('resolves an existing name-only assignment to its project-bound owner', async () => {
+    const task = await seedTask({ owner: 'Owner' });
+    expect((await runner.runTaskNow(UID, PID, task.id)).ok).toBe(true);
+    expect(groupChat.setFloor).toHaveBeenCalledWith(UID, 'c_run', 'a_owner');
+    expect(vi.mocked(groupChat.send).mock.calls[0][0].model_text).not.toContain('Commander');
+  });
+
+  it('rejects an ambiguous name-only owner instead of picking one project member', async () => {
+    const task = await seedTask({ owner: 'Owner' });
+    vi.mocked(projects.getBindings).mockResolvedValue({ agents: ['a_owner', 'a_other'], skills: [] } as never);
+    vi.mocked(agents.listAgentSummaries).mockResolvedValue([
+      { agent_id: 'a_owner', name: 'Owner', enabled: true },
+      { agent_id: 'a_other', name: 'Owner', enabled: true },
+    ] as never);
+    expect(await runner.runTaskNow(UID, PID, task.id)).toMatchObject({ ok: false, error: 'owner_not_bound' });
+    expect(groupChat.setFloor).not.toHaveBeenCalled();
+    expect(groupChat.send).not.toHaveBeenCalled();
+    expect((await projectTasks.getTask(UID, PID, task.id))?.status).toBe('todo');
   });
 
   it('keeps the review status explicitly written by the Commander during execution', async () => {
@@ -162,13 +263,13 @@ describe('project_driver_runner › runTaskNow', () => {
 
   it.each([PID, ''])('can resume an in-progress task in scope %s without completing it prematurely', async (pid) => {
     const created = await projectTasks.createTask(UID, pid, {
-      title: 'Resume unfinished work', status: 'progress', origin_cid: 'c_original',
+      title: 'Resume unfinished work', status: 'progress', origin_cid: 'c_run',
     });
     if (!created.ok) throw new Error('task fixture failed');
     expect(await runner.runTaskNow(UID, pid, created.task.id)).toMatchObject({ ok: true, cid: 'c_run' });
     expect(vi.mocked(groupChat.send).mock.calls[0][0].model_text).toContain('to review with todo_tasks');
     expect(await projectTasks.getTask(UID, pid, created.task.id)).toMatchObject({
-      status: 'progress', origin_cid: 'c_original',
+      status: 'progress', origin_cid: 'c_run',
     });
     await projectTasks.updateTask(UID, pid, created.task.id, { status: 'review' });
     expect((await projectTasks.getTask(UID, pid, created.task.id))?.status).toBe('review');
@@ -275,12 +376,17 @@ describe('project_driver_runner › runTaskNow', () => {
   it.each([PID, ''])('requests verified completion when processing a review task in scope %s', async (pid) => {
     const created = await projectTasks.createTask(UID, pid, {
       title: 'Verify the delivery', status: 'review', origin_cid: 'c_original',
+      ...(pid ? { owner_agent_id: 'a_owner' } : {}),
     });
     if (!created.ok) throw new Error('task fixture failed');
 
     expect(await runner.runTaskNow(UID, pid, created.task.id)).toMatchObject({ ok: true, cid: 'c_run' });
     const sent = vi.mocked(groupChat.send).mock.calls[0][0];
     expect(sent.text).toBe('Verify the delivery');
+    if (pid) {
+      expect(groupChat.setFloor).toHaveBeenCalledWith(UID, 'c_run', 'a_owner');
+      expect(sent.model_text).not.toContain('Commander');
+    }
     expect(sent.model_text).toContain('fully complete and verified');
     expect(sent.model_text).toContain('to done with todo_tasks');
     expect(sent.model_text).toContain('When work starts, mark it progress with todo_tasks');
@@ -291,7 +397,7 @@ describe('project_driver_runner › runTaskNow', () => {
     // Enqueuing is not verification. Pending input, interruption, and failure
     // must not be mistaken for a completed deliverable.
     expect(await projectTasks.getTask(UID, pid, created.task.id)).toMatchObject({
-      status: 'review', origin_cid: 'c_original',
+      status: 'review', origin_cid: 'c_run',
     });
     expect((await projectTasks.getTask(UID, pid, created.task.id))?.done_at).toBeUndefined();
   });
@@ -347,15 +453,27 @@ describe('project_driver_runner › runTaskNow', () => {
     expect(after?.origin_cid).toBeUndefined();
   });
 
-  it('never replaces an existing task-conversation association on a later run', async () => {
+  it.each(['manual', 'automatic'])('%s retry preserves the prior link until send succeeds, including failure and recovery', async (mode) => {
     const task = await seedTask({ originCid: 'c_original' });
-    const res = await runner.runTaskNow(UID, PID, task.id);
-
-    expect(res.ok).toBe(true);
-    expect(await projectTasks.getTask(UID, PID, task.id)).toMatchObject({
-      status: 'progress',
-      origin_cid: 'c_original',
+    const run = async () => mode === 'manual'
+      ? runner.runTaskNow(UID, PID, task.id)
+      : runner.advance(UID, PID, (await projectTasks.getTask(UID, PID, task.id))!);
+    vi.mocked(groupChat.send).mockImplementationOnce(async () => {
+      expect((await projectTasks.getTask(UID, PID, task.id))?.origin_cid).toBe('c_original');
+      return { ok: false, error: 'no_model' } as never;
     });
+    expect((await run()).ok).toBe(false);
+    expect(await projectTasks.getTask(UID, PID, task.id)).toMatchObject({ status: 'todo', origin_cid: 'c_original' });
+    expect(chats.deleteConversation).toHaveBeenCalledWith(UID, 'c_run', PID);
+
+    vi.mocked(chats.createConversation).mockResolvedValue({ conversation_id: 'c_retry' } as never);
+    vi.mocked(groupChat.send).mockImplementationOnce(async () => {
+      expect((await projectTasks.getTask(UID, PID, task.id))?.origin_cid).toBe('c_original');
+      return { ok: true } as never;
+    });
+    expect(await run()).toMatchObject({ ok: true, cid: 'c_retry' });
+    expect(await projectTasks.getTask(UID, PID, task.id)).toMatchObject({ status: 'progress', origin_cid: 'c_retry' });
+    expect(chats.deleteConversation).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -403,18 +521,51 @@ describe('project_driver_runner › advance de-duplication', () => {
     expect(after?.origin_cid).toBeUndefined();
   });
 
-  it('seeds the commander (no @mention) to dispatch, verify, and explicitly request review', async () => {
+  it('seeds an advanced assigned task to its owner as the executor, not as an orchestrator', async () => {
+    // The owner holds todo_tasks too, so it reconciles the status itself. Seeding
+    // it with the Commander's dispatch copy would ask it to relay its own work.
     const task = await seedTask({ owner: 'Owner', ownerId: 'a_owner' });
+    expect((await runner.advance(UID, PID, task)).ok).toBe(true);
+    expect(groupChat.setFloor).toHaveBeenCalledWith(UID, 'c_run', 'a_owner');
+    const sendArg = vi.mocked(groupChat.send).mock.calls[0][0] as { model_text?: string };
+    expect(sendArg.model_text).toContain(`Execute project task ${task.id} now`);
+    expect(sendArg.model_text).toContain("You are this task's assigned owner");
+    expect(sendArg.model_text).toContain('do the work yourself rather than handing it off');
+    expect(sendArg.model_text).toContain('started by auto-advance');
+    expect(sendArg.model_text).not.toContain('Dispatch it to its owner agent');
+    expect(sendArg.model_text).not.toContain('Commander');
+    expect(sendArg.model_text).toContain('update this exact task to review with todo_tasks');
+    expect(sendArg.model_text).toContain('it must remain progress');
+    expect(sendArg.model_text).toContain('never set it to blocked or done');
+  });
+
+  it('seeds the commander (no @mention) to dispatch, verify, and explicitly request review', async () => {
+    const task = await seedTask();
     await runner.advance(UID, PID, task);
     const sendArg = vi.mocked(groupChat.send).mock.calls[0][0] as { text: string; model_text?: string };
-    // No leading @mention → routes to the commander, which (unlike a worker
-    // agent) can write task status; it names the exact progress task so the
-    // commander advances that one and moves its status forward.
+    // An unassigned project task keeps the Commander orchestration fallback.
+    expect(groupChat.setFloor).not.toHaveBeenCalled();
     expect(sendArg.text.trimStart().startsWith('@')).toBe(false);
     expect(sendArg.text).toContain('Ship the thing');
     expect(sendArg.model_text).toContain('fully complete and verified');
     expect(sendArg.model_text).toContain('update this exact task to review with todo_tasks');
     expect(sendArg.model_text).toContain('it must remain progress');
     expect(sendArg.model_text).toContain('never set it to blocked or done');
+  });
+});
+
+describe('project_driver_runner › complete task content', () => {
+  it.each(['manual', 'automatic'])('passes every requirement to the visible message and executor in a %s run', async (mode) => {
+    const content = 'Publish the report\n' + 'Retain all requirements. '.repeat(30) + '\nVerify the last table.';
+    const created = await projectTasks.createTask(UID, PID, { content });
+    if (!created.ok) throw new Error('fixture failed');
+    const result = mode === 'manual'
+      ? await runner.runTaskNow(UID, PID, created.task.id)
+      : await runner.advance(UID, PID, created.task);
+    expect(result.ok).toBe(true);
+    const sent = vi.mocked(groupChat.send).mock.calls[0][0];
+    expect(sent.text).toBe(content);
+    expect(sent.model_text).toContain(content);
+    expect(sent.model_text!.split('Verify the last table.')).toHaveLength(2);
   });
 });

@@ -49,8 +49,12 @@
     onActivate: null,
     loadingInitial: null,
     loadingOlder: null,
+    failedOlderCursor: null,
     mutationObserver: null,
-    intersectionObserver: null,
+    resizeObserver: null,
+    positionFrame: null,
+    explicitKey: '',
+    explicitScrollTop: null,
     refreshFrame: null,
     requestGeneration: 0,
     userIntentUntil: 0,
@@ -401,25 +405,71 @@
     }
   }
 
-  function bindIntersectionObserver() {
-    if (state.intersectionObserver) state.intersectionObserver.disconnect();
-    state.intersectionObserver = null;
-    if (!root || typeof root.IntersectionObserver !== 'function' || !state.container) return;
-    state.intersectionObserver = new root.IntersectionObserver((entries) => {
-      const visible = entries.filter((entry) => entry.isIntersecting);
-      if (!visible.length) return;
-      visible.sort((left, right) => right.intersectionRatio - left.intersectionRatio);
-      const target = visible[0].target;
-      const turn = state.turns.find((entry) => entry.target === target);
-      if (turn) setActiveTurn(turn);
-    }, {
-      root: state.container,
-      rootMargin: '-18% 0px -68% 0px',
-      threshold: [0, 0.25, 0.75],
+  // Each turn extends through its replies up to the next user message.
+  // All coordinates are relative to the transcript viewport, not the rail.
+  function viewportTurnIndex(tops, metrics = {}) {
+    if (!tops.length || !(metrics.height > 0)) return -1;
+    if (metrics.atStart && metrics.scrollTop <= SCROLL_EDGE_EPSILON) return 0;
+    const lastVisible = metrics.lastBottom > SCROLL_EDGE_EPSILON
+      && metrics.lastTop < metrics.height - SCROLL_EDGE_EPSILON;
+    if (metrics.atEnd && (lastVisible || metrics.distanceToBottom <= SCROLL_EDGE_EPSILON)) {
+      return tops.length - 1;
+    }
+    const readingLine = metrics.height * 0.25;
+    let index = 0;
+    tops.forEach((top, candidate) => { if (top <= readingLine) index = candidate; });
+    return index;
+  }
+
+  function syncViewportTurn() {
+    if (state.nav?.hidden || state.explicitKey || !state.container?.getBoundingClientRect) return;
+    const container = state.container;
+    const mounted = mountedUserTurns(container);
+    if (!mounted.length) return;
+    const viewportTop = container.getBoundingClientRect().top + container.clientTop;
+    const tops = mounted.map((target) => target.getBoundingClientRect().top - viewportTop);
+    const turns = mounted.map((target) => state.turns.find((turn) => turn.target === target));
+    const first = state.turns.find((turn) => turn.target === mounted[0]);
+    const last = state.turns.find((turn) => turn.target === mounted[mounted.length - 1]);
+    const messages = Array.from(container.children).filter((node) => node.matches?.('.chat-message'));
+    const lastRect = messages[messages.length - 1]?.getBoundingClientRect();
+    // A paged window can start inside the preceding reply. That reply still
+    // belongs to the previous turn, even though its question is not mounted.
+    if (messages[0] !== mounted[0] && first?.turnNo !== 1) {
+      tops.unshift(-container.clientHeight);
+      turns.unshift(state.turns.find((turn) => turn.turnNo === first?.turnNo - 1));
+    }
+    const index = viewportTurnIndex(tops, {
+      height: container.clientHeight,
+      scrollTop: container.scrollTop,
+      distanceToBottom: container.scrollHeight - container.clientHeight - container.scrollTop,
+      atStart: first?.turnNo === 1,
+      atEnd: last?.turnNo === state.total,
+      lastTop: lastRect?.top - viewportTop,
+      lastBottom: lastRect?.bottom - viewportTop,
     });
-    state.turns.forEach((turn) => {
-      if (turn.target) state.intersectionObserver.observe(turn.target);
+    if (index < 0) return;
+    const turn = turns[index];
+    if (turn) setActiveTurn(turn);
+    else if (state.nextCursor !== null && state.nextCursor !== state.failedOlderCursor) void loadOlderPage();
+  }
+
+  function scheduleViewportSync() {
+    if (!root || state.positionFrame !== null) return;
+    state.positionFrame = root.requestAnimationFrame(() => {
+      state.positionFrame = null;
+      syncViewportTurn();
     });
+  }
+
+  function bindPositionObservers() {
+    state.resizeObserver?.disconnect();
+    if (root?.ResizeObserver && state.container) {
+      state.resizeObserver ||= new root.ResizeObserver(scheduleViewportSync);
+      state.resizeObserver.observe(state.container);
+      Array.from(state.container.children).forEach((node) => state.resizeObserver.observe(node));
+    }
+    scheduleViewportSync();
   }
 
   function renderMarkers(options = {}) {
@@ -430,7 +480,7 @@
       state.markers.replaceChildren();
       state.nav.hidden = true;
       updateOverflowIndicators();
-      if (state.intersectionObserver) state.intersectionObserver.disconnect();
+      state.resizeObserver?.disconnect();
       return;
     }
     const requestedActiveKey = options.activeTurn ? turnKey(options.activeTurn) : '';
@@ -459,7 +509,7 @@
     state.nav.hidden = false;
     const activeChanged = turnKey(previousActive) !== state.activeKey;
     setActiveTurn(previousActive, { forceCenter: options.forceCenter === true });
-    bindIntersectionObserver();
+    bindPositionObservers();
     const requestFrame = root?.requestAnimationFrame || ((callback) => setTimeout(callback, 0));
     requestFrame(() => {
       const activeMarker = Array.from(
@@ -523,6 +573,7 @@
       try {
         const page = await state.loadPage(cursor);
         if (generation !== state.requestGeneration) return;
+        state.failedOlderCursor = null;
         state.turns = mergeTurnPage(state.turns, page?.turns || []);
         state.total = Math.max(Number(page?.total) || 0, state.turns.length);
         const next = Number(page?.nextCursor ?? page?.next_cursor);
@@ -536,6 +587,7 @@
         });
       } catch (error) {
         warnRecoverable('turn navigation older page load failed', error);
+        if (generation === state.requestGeneration) state.failedOlderCursor = cursor;
         // Keep the current page and allow the next user gesture to retry.
       }
     })();
@@ -547,6 +599,7 @@
   }
 
   function markUserIntent() {
+    state.failedOlderCursor = null;
     state.userIntentUntil = Date.now() + 1200;
   }
 
@@ -561,13 +614,15 @@
     state.refreshFrame = requestFrame(() => {
       state.refreshFrame = null;
       rebindMountedTargets();
-      bindIntersectionObserver();
+      bindPositionObservers();
     });
   }
 
   async function activateMarker(marker) {
     const turn = turnFromMarker(marker);
     if (!turn) return;
+    state.explicitKey = turnKey(turn);
+    state.explicitScrollTop = null;
     setActiveTurn(turn, { forceCenter: true });
     if (turn.target) {
       jumpToTurn(state.container, turn.target, {
@@ -575,6 +630,7 @@
         requestFrame: root.requestAnimationFrame?.bind(root),
         setTimer: root.setTimeout?.bind(root),
       });
+      state.explicitScrollTop = state.container.scrollTop;
       return;
     }
     if (typeof state.onActivate !== 'function') return;
@@ -583,6 +639,7 @@
     try { await state.onActivate(turn); } finally {
       marker.classList.remove('is-loading');
       marker.disabled = false;
+      state.explicitScrollTop = state.container.scrollTop;
       scheduleMountedRebind();
     }
   }
@@ -590,6 +647,28 @@
   function bindEvents() {
     if (!state.nav || !state.markers || state.bound) return;
     state.bound = true;
+    const resumeViewportTracking = () => {
+      state.explicitKey = '';
+      state.failedOlderCursor = null;
+      scheduleViewportSync();
+    };
+    ['wheel', 'touchmove', 'pointerdown'].forEach((type) => {
+      state.container.addEventListener(type, resumeViewportTracking, { passive: true });
+    });
+    state.container.addEventListener('keydown', (event) => {
+      if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
+        resumeViewportTracking();
+      }
+    });
+    state.container.addEventListener('scroll', () => {
+      // A later jump-to-bottom or scrollbar drag also ends click selection;
+      // the scroll event emitted by the original centered jump does not.
+      if (state.explicitScrollTop !== null
+          && Math.abs(state.container.scrollTop - state.explicitScrollTop) > SCROLL_EDGE_EPSILON) {
+        state.explicitKey = '';
+      }
+      scheduleViewportSync();
+    }, { passive: true });
     state.nav.addEventListener('pointerover', (event) => {
       const marker = markerFromEvent(event);
       if (marker) showPreview(marker);
@@ -684,10 +763,13 @@
     state.nextCursor = null;
     state.indexReady = false;
     state.activeKey = '';
+    state.explicitKey = '';
+    state.explicitScrollTop = null;
     state.loadPage = null;
     state.onActivate = null;
     state.loadingInitial = null;
     state.loadingOlder = null;
+    state.failedOlderCursor = null;
     state.userIntentUntil = 0;
     hidePreview();
     state.markers?.replaceChildren();
@@ -695,7 +777,7 @@
       state.nav.hidden = true;
       updateOverflowIndicators();
     }
-    if (state.intersectionObserver) state.intersectionObserver.disconnect();
+    state.resizeObserver?.disconnect();
     return state;
   }
 
@@ -718,6 +800,7 @@
 
   function appendLiveTurn(cid, target, content = '') {
     if (!cid || cid !== state.cid || !target || !state.container?.contains(target)) return null;
+    state.explicitKey = '';
     const messageId = String(target.dataset?.msgId || '');
     const messageIndex = Number(target.dataset?.msgIndex);
     const liveKey = String(target.dataset?.clientMsgId || `live-${++state.liveSequence}`);
@@ -768,5 +851,6 @@
     turnNavOverflowState,
     overflowEdgeRanks,
     jumpToTurn,
+    viewportTurnIndex,
   };
 }));

@@ -271,12 +271,16 @@ describe('stop and settlement wiring', () => {
 
   it('drops the snapshot when the turn settles', () => {
     const clear = vi.fn();
+    const watermarks = new Map([['conv-a', 12], ['conv-other', 20]]);
+    const offViewDirty = new Set(['conv-a', 'conv-other']);
     const context: any = {
       Map,
       Set,
       pendingConvs: new Map([['conv-a', { aborted: false }]]),
       currentCid: 'conv-other',
       _clearSentComposerSnapshot: clear,
+      _liveDisplayWatermarks: watermarks,
+      _offViewLiveDisplayDirty: offViewDirty,
       _stopRuntimeActorRecovery: vi.fn(),
       _stopGroupEventObserver: vi.fn(),
       _lastGroupWorkEventAt: new Map(),
@@ -293,5 +297,7 @@ describe('stop and settlement wiring', () => {
     context._finishStreamingMsg('conv-a');
 
     expect(clear).toHaveBeenCalledWith('conv-a');
+    expect([...watermarks]).toEqual([['conv-other', 20]]);
+    expect([...offViewDirty]).toEqual(['conv-other']);
   });
 });

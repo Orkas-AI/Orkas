@@ -25,11 +25,11 @@ Adding narration to any existing video is plan-first and ordered. Author
 `project/plan.json` before generating speech and let it drive generation. Do
 not synthesize one narration blob and describe it afterward.
 
-1. **Analyze the video first.** Probe duration, run
-   `stage-edit analyze_media --op ocr` for on-screen text, and run
-   `video_studio` `op: "speech.transcribe"` for spoken audio. For title cards,
-   slideshows, and screen recordings, OCR is mandatory rather than a fallback.
-   Do not describe the product from memory.
+1. **Analyze the video first.** Probe duration and audio presence. For spoken
+   audio, run `video_studio` `op: "speech.transcribe"`. For title cards,
+   slideshows, screen recordings, or other on-screen content, use
+   `stage-edit edit_video --op extract_frame` and inspect the returned files
+   with the current model. Follow the frame-evidence rules below.
 2. **Author `project/plan.json` as the segments EDL.** Use the exact
    `stage-plan` skeleton. `source` is the method enum `edit`, not a file path;
    the clip belongs in `spec.input_id`, duration uses `target_sec`, and
@@ -43,7 +43,7 @@ not synthesize one narration blob and describe it afterward.
      `synthesis:{route_ref,voice_ref,display_name,language,speed}` from
      `video_studio speech.capabilities` for the deliverable's exact BCP-47
      language. Create one `{ text, start_sec, target_sec }` line per on-screen
-     beat, derived from the OCR/transcript table before TTS. Never invent a
+     beat, derived from the observed-frame/transcript table before TTS. Never invent a
      voice id or use one paragraph for the whole clip.
    - Use `delivery_promise:{ type:"source_led", source_required:true }` and set
      `aspect` from the source's probed dimensions.
@@ -64,20 +64,21 @@ not synthesize one narration blob and describe it afterward.
    plan. Never pre-bake one large narration file.
 5. **Self-check before presenting.** Validate the plan with
    `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-plan video_plan -- --op validate --plan project/plan.json`.
-   Every narration line must have a produced path and an OCR/transcript-aligned
+   Every narration line must have a produced path and an observed-frame/transcript-aligned
    window, coverage must approximate the whole clip, and
    `project/render/video.mp4` must exist.
 
 If the clip has no spoken audio, or meaning lives in on-screen text, an empty
 transcript does not mean an empty screen. Resolve evidence in this order:
 
-1. Run OCR across the clip and use its `{startSec, endSec, text}` segments to
-   align each narration line to its own window.
-2. Only if the OCR runtime is unavailable, extract frames across the whole
-   clip and read them with the current model's own vision capability.
-3. If neither OCR nor image reading is available, stop and ask the user for a
-   short outline of the on-screen beats. Do not write narration from topic
-   knowledge or escalate to a separate paid vision model.
+1. Extract a small set of frames spanning the whole clip, then inspect them
+   with `read_files` using the current model's vision. Record each frame path,
+   extraction time, readable text and uncertainty. Add nearby frames only where
+   needed to locate a change or resolve unclear content; a sample is not an
+   exact transition boundary. Align each narration line to observed evidence.
+2. If the current model cannot read images, ask for readable text with timing
+   or a vision-capable model. Do not invent on-screen content, install a local
+   recognition engine, or escalate to a separate paid vision model.
 
-Before the draft, confirm every narration segment matches the OCR or transcript
+Before the draft, confirm every narration segment matches the observed-frame or transcript
 evidence in its time window.

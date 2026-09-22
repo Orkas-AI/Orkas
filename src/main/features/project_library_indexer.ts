@@ -20,6 +20,7 @@ import { EventEmitter } from 'node:events';
 
 import { projectFilesDir, projectLibraryVectorDbPath, projectLocalDir } from '../paths';
 import { createLogger } from '../logger';
+import { MAX_PROJECT_TEXT_PROCESSING_BYTES } from '../util/file-size-limits';
 import type { ChunkableKind } from '../util/file_to_chunks';
 import * as vs from './vec_store';
 import { projectExists } from './projects';
@@ -87,6 +88,7 @@ function corpusFor(uid: string, projectId: string): LibraryCorpus {
   return openLibraryCorpus({
     uid,
     scope: 'project',
+    maxTextBytes: MAX_PROJECT_TEXT_PROCESSING_BYTES,
     sourceRoot: projectFilesDir(uid, pid),
     dbDir: path.dirname(projectLibraryVectorDbPath(uid, pid)),
     imageSessionPrefix: 'extract-img-project',
@@ -167,8 +169,13 @@ export function getFileByPath(uid: string, projectId: string, relPath: string): 
   return corpusFor(uid, projectId).getFile(relPath);
 }
 
-export function listFiles(uid: string, projectId: string): vs.VecFileRow[] {
-  return corpusFor(uid, projectId).listFiles();
+export function listFiles(uid: string, projectId: string): Array<vs.VecFileRow & { errorCode?: string }> {
+  return corpusFor(uid, projectId).listFiles().map(row => ({
+    ...row,
+    ...(row.status === 'failed' && row.kind === 'text'
+      && row.bytes > MAX_PROJECT_TEXT_PROCESSING_BYTES && row.sha1 === ''
+      ? { errorCode: 'E_LIBRARY_FILE_TOO_LARGE' } : {}),
+  }));
 }
 
 export function readFileChunks(

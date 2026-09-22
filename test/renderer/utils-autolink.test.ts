@@ -32,6 +32,7 @@ const {
   _chatMediaLocalPathFromUrl,
   _normalizeLocalMediaSrc,
   _mediaDedupKey,
+  _localMediaReferenceBasename,
   _parseOrkasMediaTitle,
   _chatVideoNativeControlsHit,
   renderMarkdown,
@@ -48,6 +49,7 @@ const {
   _chatMediaLocalPathFromUrl: (src: string) => string;
   _normalizeLocalMediaSrc: (src: string) => string;
   _mediaDedupKey: (src: string) => string;
+  _localMediaReferenceBasename: (src: string) => string;
   _parseOrkasMediaTitle: (title: string) => { kind: 'image' | 'video'; remoteSrc: string } | null;
   _chatVideoNativeControlsHit: (clientY: number, rectTop: number, rectBottom: number) => boolean;
   renderMarkdown: (md: string) => string;
@@ -354,9 +356,11 @@ describe('markdown media links', () => {
     expect(inlineFormat('[clip](https://x.test/a.mp4)')).toContain('src="https://x.test/a.mp4"');
     expect(inlineFormat('[clip](chat-media://local/Users/test/a.mp4)'))
       .toContain('src="chat-media://local/Users/test/a.mp4"');
-    // A non-media link keeps ordinary link handling: an unsafe scheme still
-    // renders as text rather than becoming an anchor.
-    expect(inlineFormat('[doc](sandbox:/Users/test/notes.txt)')).not.toContain('chat-media://');
+    // A non-media local link becomes a safe preview chip, never a raw anchor.
+    const documentLink = inlineFormat('[doc](sandbox:/Users/test/notes.txt)');
+    expect(documentLink).toContain('data-chat-md-file-open="1"');
+    expect(documentLink).toContain('data-file-src="chat-media://local/Users/test/notes.txt"');
+    expect(documentLink).not.toContain('<a ');
     expect(_normalizeLocalMediaSrc('C:\\Users\\test\\render\\clip.mp4'))
       .toBe('chat-media://local/C:/Users/test/render/clip.mp4');
     expect(_normalizeLocalMediaSrc('/Users/test/has space.mp4'))
@@ -377,6 +381,14 @@ describe('markdown media links', () => {
     expect(_chatMediaLocalPathFromUrl('https://x.test/a.mp4')).toBe('');
   });
 
+  it('matches stale local media by basename without treating remote media as a produced-file duplicate', () => {
+    expect(_localMediaReferenceBasename('chat-media://local/Users/user/old/narration%20final.wav?v=1'))
+      .toBe('narration final.wav');
+    expect(_localMediaReferenceBasename('drafts/narration.wav#preview')).toBe('narration.wav');
+    expect(_localMediaReferenceBasename('https://cdn.example/narration.wav')).toBe('');
+    expect(_localMediaReferenceBasename('data:audio/wav;base64,AAAA')).toBe('');
+  });
+
   it('reserves native video controls while allowing the rest of the surface to toggle playback', () => {
     expect(_chatVideoNativeControlsHit(351, 100, 360)).toBe(true);
     expect(_chatVideoNativeControlsHit(312, 100, 360)).toBe(true);
@@ -391,7 +403,7 @@ describe('markdown media links', () => {
     expect(out).toContain('<span class="chat-md-audio-name">audio</span>');
     expect(out).toContain('<audio class="chat-md-audio"');
     expect(out).toContain('controls');
-    expect(out).toContain('controlslist="nodownload noremoteplayback"');
+    expect(out).toContain('controlslist="nodownload noplaybackrate noremoteplayback"');
     expect(out).toContain('preload="metadata"');
     expect(out).toContain('src="chat-media://local/Users/test/hello.mp3"');
     expect(out).not.toContain('<a ');
@@ -406,9 +418,10 @@ describe('markdown media links', () => {
     expect(out).toContain('title="&quot;preview&quot;"');
   });
 
-  it('renders non-media private-protocol references as inert text', () => {
+  it('renders non-media private-protocol references as safe preview chips', () => {
     const out = inlineFormat('[clip](chat-media://local/Users/test/notes.txt)');
-    expect(out).toBe('clip');
+    expect(out).toContain('data-chat-md-file-open="1"');
+    expect(out).toContain('data-file-src="chat-media://local/Users/test/notes.txt"');
     expect(out).not.toContain('<a ');
     expect(out).not.toContain('<video ');
     expect(out).not.toContain('<audio ');
@@ -428,6 +441,14 @@ describe('duplicate media in one message', () => {
   const CARD = 'chat-media://local/Users/test/deck/card.png';
   const V1 = `${CARD}?v=111-111-360587`;
   const imgCount = (html: string) => (html.match(/<img /g) || []).length;
+
+  it.each([['png', 'img'], ['mp4', 'video']])('preserves media display and deduplication for angle-wrapped %s paths', (ext, tag) => {
+    const destination = `/Users/test/old draft (1).${ext}`;
+    const out = renderMarkdown(`[Open](<${destination}>)\n\n![Preview](<${destination}>)`);
+    expect(out.match(new RegExp(`<${tag} `, 'g'))).toHaveLength(1);
+    expect(out).toContain(`src="chat-media://local/Users/test/old%20draft%20(1).${ext}"`);
+    expect(out).not.toContain('data-chat-md-file-open');
+  });
 
   it('renders one image when a download link and the embed name the same file', () => {
     const out = renderMarkdown(`已完成。\n\n[下载卡片图](${V1})\n\n![AI创业增量市场卡片图](${V1})`);

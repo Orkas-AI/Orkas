@@ -1,18 +1,6 @@
-import { expect, test as base, OrkasTestApp } from './fixtures/orkas';
+import { expect, test } from './fixtures/orkas';
 
 // The assignment journey exercises both account-scoped agents and execution.
-const test = base.extend({
-  modelOrkas: async ({}, use, testInfo) => {
-    const app = new OrkasTestApp(testInfo, { modelStub: true });
-    try {
-      await app.launch();
-      await use(app);
-    } finally {
-      await app.dispose();
-    }
-  },
-});
-
 test('manages the same backlog from global and project boards with independent disclosures', async ({ connectorOrkas: orkas }, testInfo) => {
   const page = orkas.page!;
   await page.evaluate(() => (window as any).setLang('zh'));
@@ -30,11 +18,11 @@ test('manages the same backlog from global and project boards with independent d
     [a, '检查空状态', 'review'], [a, '确认视觉规范', 'done'],
     [b, '整理首页文案', 'todo'], [b, '处理依赖阻塞', 'todo'], [b, '确认旧版页面', 'done'],
   ]) {
-    await orkas.invoke('projects.tasks.create', { projectId, title, status, detail: '沿用现有项目机制，验证交付结果。' });
+    await orkas.invoke('projects.tasks.create', { projectId, content: title, status });
   }
-  const alphaTasks = await orkas.invoke<{ tasks: Array<{ id: string; title: string }> }>('projects.tasks.list', { projectId: a });
-  const assignedTask = alphaTasks.tasks.find((task) => task.title === '设计项目看板')!;
-  const completedTask = alphaTasks.tasks.find((task) => task.title === '确认视觉规范')!;
+  const alphaTasks = await orkas.invoke<{ tasks: Array<{ id: string; content: string }> }>('projects.tasks.list', { projectId: a });
+  const assignedTask = alphaTasks.tasks.find((task) => task.content === '设计项目看板')!;
+  const completedTask = alphaTasks.tasks.find((task) => task.content === '确认视觉规范')!;
   await orkas.invoke('projects.tasks.update', {
     projectId: a,
     taskId: assignedTask.id,
@@ -186,8 +174,8 @@ test('manages the same backlog from global and project boards with independent d
   await page.screenshot({ path: testInfo.outputPath('todo-editor.png') });
   await page.locator('#project-todo-save').click();
   await expect(page.locator('#todo-editor-modal')).not.toHaveClass(/\bopen\b/);
-  const globalSaved = await orkas.invoke<{ tasks: Array<{ id: string; title: string; detail?: string; status: string; attachments?: string[] }> }>('projects.tasks.list', {});
-  const globalTask = globalSaved.tasks.find((task) => task.title === '全局跟进发票')!;
+  const globalSaved = await orkas.invoke<{ tasks: Array<{ id: string; content: string; detail?: string; status: string; attachments?: string[] }> }>('projects.tasks.list', {});
+  const globalTask = globalSaved.tasks.find((task) => task.content === '全局跟进发票')!;
   expect(globalTask).toMatchObject({
     status: 'todo',
     attachments: ['global-notes.txt'],
@@ -221,13 +209,13 @@ test('manages the same backlog from global and project boards with independent d
   await page.locator('#project-todo-status-listbox .ai-select-item[data-value="review"]').click();
   await page.locator('#project-todo-save').click();
   await expect(page.locator('#todo-editor-modal')).not.toHaveClass(/\bopen\b/);
-  const saved = await orkas.invoke<{ tasks: Array<{ id: string; title: string; detail?: string; status: string }> }>('projects.tasks.list', { projectId: b });
-  const created = saved.tasks.find((task) => task.title === '完善价格页')!;
+  const saved = await orkas.invoke<{ tasks: Array<{ id: string; content: string; detail?: string; status: string }> }>('projects.tasks.list', { projectId: b });
+  const created = saved.tasks.find((task) => task.content === '完善价格页')!;
   expect(created).toMatchObject({ status: 'review' });
   expect(created.detail).toBeUndefined();
-  const otherProject = await orkas.invoke<{ tasks: Array<{ title: string }> }>('projects.tasks.list', { projectId: a });
-  expect(otherProject.tasks.some((task) => task.title === '完善价格页')).toBe(false);
-  expect(saved.tasks.some((task) => task.title === '全局跟进发票')).toBe(false);
+  const otherProject = await orkas.invoke<{ tasks: Array<{ content: string }> }>('projects.tasks.list', { projectId: a });
+  expect(otherProject.tasks.some((task) => task.content === '完善价格页')).toBe(false);
+  expect(saved.tasks.some((task) => task.content === '全局跟进发票')).toBe(false);
 
   await page.locator('[data-todo-group="status"]').click();
   await expect(content.locator(':scope > .todo-board > .todo-column')).toHaveCount(4);
@@ -290,7 +278,7 @@ test('manages the same backlog from global and project boards with independent d
   // A write from another entry point must reach the open page via the normal
   // tasks-changed push, without revisiting the tab or manually reloading.
   const pushed = await orkas.invoke<{ task: { id: string } }>('projects.tasks.create', {
-    projectId: b, title: '后台同步待办', status: 'todo',
+    projectId: b, content: '后台同步待办', status: 'todo',
   });
   await expect(content.getByText('后台同步待办', { exact: true })).toBeVisible();
   await orkas.invoke('projects.tasks.delete', { projectId: b, taskId: pushed.task.id });
@@ -347,7 +335,7 @@ test('manages the same backlog from global and project boards with independent d
   // while the user is on a different project tab.
   await page.locator('[data-project-tab="tasks"]').click();
   const counted = await orkas.invoke<{ task: { id: string } }>('projects.tasks.create', {
-    projectId: b, title: '核对待办总数', status: 'review',
+    projectId: b, content: '核对待办总数', status: 'review',
   });
   await expect(todoTabCount).toHaveText('5');
   await orkas.invoke('projects.tasks.update', { projectId: b, taskId: counted.task.id, status: 'done' });
@@ -375,6 +363,60 @@ test('manages the same backlog from global and project boards with independent d
   await expect(removed).toHaveCount(0);
   const final = await orkas.invoke<{ tasks: Array<{ id: string }> }>('projects.tasks.list', { projectId: b });
   expect(final.tasks.some((item) => item.id === created.id)).toBe(false);
+});
+
+test('processes an assigned Codex todo from its card with one execution and no Commander panel', async ({ cliOrkas: orkas }) => {
+  const page = orkas.page!;
+  await page.evaluate(() => (window as any).setLang('en'));
+  const { agent } = await orkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+    name: 'AssignedCodex', category: 'general', runtime: { kind: 'cli', cli: 'codex' },
+  });
+  const { project } = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: 'Codex assignment' });
+  const pid = project.project_id;
+  await orkas.invoke('projects.bindings.add', { projectId: pid, kind: 'agent', id: agent.agent_id });
+
+  for (const running of [false, true]) {
+    // The existing CLI fixture holds this second turn open until stopped,
+    // allowing us to inspect the panel while execution is actually running.
+    const content = running ? 'E2E_CODEX_SEND_NOW_ACTIVE assigned todo' : 'Inspect the assigned project';
+    const { task } = await orkas.invoke<{ task: { id: string } }>('projects.tasks.create', {
+      projectId: pid, content, owner_agent_id: agent.agent_id,
+    });
+    await page.locator('#todos-btn').click();
+    const card = page.locator('#todos-content .project-todo-item', { hasText: content });
+    await card.hover();
+    await card.locator('[data-action="todo-menu"]').click();
+    await page.locator('.context-menu-item', { hasText: 'Process now' }).click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    await expect.poll(() => orkas.readCliState().invocations.filter((item) => item.prompt.includes(content)).length).toBe(1);
+    const { tasks } = await orkas.invoke<{ tasks: Array<{ id: string; origin_cid?: string; status: string }> }>('projects.tasks.list', { projectId: pid });
+    const started = tasks.find((item) => item.id === task.id)!;
+    expect(started.status).toBe('progress');
+    expect(started.origin_cid).toBeTruthy();
+    const cid = started.origin_cid!;
+    const execution = await orkas.invoke<{ tasks: Array<{ assignee: string; created_by: string; status: string; parent_task_id?: string }> }>('groupChat.tasks.list', { cid });
+    expect(execution.tasks).toHaveLength(1);
+    expect(execution.tasks[0]).toMatchObject({ assignee: agent.agent_id, created_by: 'user' });
+    expect(execution.tasks[0].parent_task_id).toBeFalsy();
+    await expect(page.locator('#chat-task-board')).toBeHidden();
+    const invocation = orkas.readCliState().invocations.find((item) => item.prompt.includes(content))!;
+    expect(invocation.cli).toBe('codex');
+    expect(invocation.prompt).toContain('Complete and verify the work');
+    expect(invocation.prompt).not.toContain('Act as the project Commander');
+    if (running) {
+      expect(execution.tasks[0].status).toBe('running');
+      await orkas.invoke('groupChat.abort', { cid });
+      await expect.poll(async () => {
+        const current = await orkas.invoke<{ tasks: Array<{ status: string }> }>('groupChat.tasks.list', { cid });
+        return current.tasks.every((item) => item.status !== 'running' && item.status !== 'queued');
+      }).toBe(true);
+    } else {
+      await expect(page.locator('#chat-history')).toContainText('E2E_CODEX_DEFAULT_OK');
+    }
+    const history = await orkas.invoke<{ history: Array<{ from: string; to?: string[] }> }>('conversations.history', { cid, limit: 20 });
+    expect(history.history.find((message) => message.from === 'user')?.to).toEqual([agent.agent_id]);
+    expect(history.history.some((message) => message.from === 'commander')).toBe(false);
+  }
 });
 
 test('assigns global and project todos in the editor and keeps cards and saved owners in sync', async ({ modelOrkas: orkas }, testInfo) => {
@@ -408,22 +450,22 @@ test('assigns global and project todos in the editor and keeps cards and saved o
     const card = page.locator('#todos-content .project-todo-item', { hasText: title });
     await expect(card.locator('.project-todo-assign')).toContainText(agent.name);
     let tasks = await orkas.invoke<{ tasks: any[] }>('projects.tasks.list', { projectId: scope });
-    expect(tasks.tasks.find((t) => t.title === title)).toMatchObject({ owner_agent_id: agent.agent_id, owner_agent: agent.name });
+    expect(tasks.tasks.find((t) => t.content === title)).toMatchObject({ owner_agent_id: agent.agent_id, owner_agent: agent.name });
     await card.locator('[data-action="todo-edit"]').click();
     await expect(agentControl).toHaveAttribute('data-value', agent.agent_id);
     await chooseAgent('');
     await page.locator('#project-todo-save').click();
     await expect(card.locator('.project-todo-assign')).toHaveClass(/is-empty/);
     tasks = await orkas.invoke<{ tasks: any[] }>('projects.tasks.list', { projectId: scope });
-    expect(tasks.tasks.find((t) => t.title === title)).not.toHaveProperty('owner_agent_id');
-    if (!scope) {
+    expect(tasks.tasks.find((t) => t.content === title)).not.toHaveProperty('owner_agent_id');
+    {
       await card.locator('.project-todo-assign').click();
       await page.locator('.context-menu-item', { hasText: agent.name }).click();
       await expect(card.locator('.project-todo-assign')).toContainText(agent.name);
-      const assigned = await orkas.invoke<{ tasks: any[] }>('projects.tasks.list', { projectId: '' });
-      const task = assigned.tasks.find((t) => t.title === title);
+      const assigned = await orkas.invoke<{ tasks: any[] }>('projects.tasks.list', { projectId: scope });
+      const task = assigned.tasks.find((t) => t.content === title);
       orkas.setModelTextReplies(['Assignment received']);
-      const result = await orkas.invoke<{ ok: boolean; cid: string }>('projects.tasks.run', { projectId: '', taskId: task.id });
+      const result = await orkas.invoke<{ ok: boolean; cid: string }>('projects.tasks.run', { projectId: scope, taskId: task.id });
       expect(result.ok).toBe(true);
       const history = await orkas.invoke<{ history: any[] }>('conversations.history', { cid: result.cid, limit: 20 });
       expect(history.history.find((message) => message.from === 'user')?.to).toEqual([agent.agent_id]);
@@ -431,6 +473,8 @@ test('assigns global and project todos in the editor and keeps cards and saved o
         const messages = await orkas.invoke<{ history: any[] }>('conversations.history', { cid: result.cid, limit: 20 });
         return messages.history.some((message) => message.from === agent.agent_id && message.text.includes('Assignment received'));
       }).toBe(true);
+      const finished = await orkas.invoke<{ history: any[] }>('conversations.history', { cid: result.cid, limit: 20 });
+      expect(finished.history.some((message) => message.from === 'commander')).toBe(false);
     }
   }
 });

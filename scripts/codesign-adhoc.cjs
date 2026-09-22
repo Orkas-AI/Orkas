@@ -22,6 +22,7 @@ const {
 } = require('../bin/runtime-gate.cjs');
 const {
   verifyEmbeddingModelRoot,
+  verifyXlsReaderRoot,
   verifyMacLocalizedMetadataRoot,
 } = require('../bin/packaged-resource-gate.cjs');
 const {
@@ -537,6 +538,7 @@ function verifyPackedResourcePayload(context, appPath, targetPlatform) {
   const builtinRoot = context.__orkasTestBuiltinRoot || path.join(resourcesDir, 'builtin');
   const verified = [
     verifyEmbeddingModelRoot(path.join(resourcesDir, 'embedding-model')),
+    verifyXlsReaderRoot(path.join(resourcesDir, 'xls-reader')),
     verifyBuiltinRoot(builtinRoot, context.__orkasTestBuiltinRoot ? { allowIgnoredJunk: true } : {}),
   ];
   if (targetPlatform === 'darwin') {

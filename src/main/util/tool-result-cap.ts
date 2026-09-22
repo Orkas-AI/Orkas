@@ -18,7 +18,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
-import { StringDecoder } from 'string_decoder';
+import { StringDecoder } from 'node:string_decoder';
 import type { AgentTool, ToolResult, ToolContext } from '#core-agent';
 import { createLogger } from '../logger';
 import {
@@ -35,17 +35,12 @@ const log = createLogger('util/tool-result-cap');
 /** One simple default for original tool results. Results above this estimated
  * token count are persisted losslessly; smaller results may still spill when
  * the shared per-model-step inline ledger is exhausted. Persisted-result
- * retrieval tools retain their own stricter 2K/4K limits.
+ * retrieval uses the same allowance and never persists another wrapper.
  *
- * The value is the token-aware equivalent of the 50K-character threshold this
- * module used before the char→token switch: 50_000 / 4 = 12_500 for ASCII.
- * Picking 8K instead silently tightened the effective budget by 36% and pushed
- * `skill-creator` (11.1K tokens) and `agent-creator` (10.6K) — the two system
- * skills whose SKILL.md is a machine protocol that must be read verbatim —
- * over the line, so commander authored `<skill>` / `<agent>` containers from a
- * 600-token head/tail preview and emitted unparseable blocks. Keep the CJK
- * weighting (that part of the switch was the point) but restore the reach. */
-export const DEFAULT_INLINE_RESULT_TOKENS = 12_500;
+ * Ordinary results use a fixed 10K allowance. AgentRunner supplies a separate
+ * 25K ceiling for complete Skill documents; lowering this ordinary default
+ * must not turn those document reads into partial previews. */
+export const DEFAULT_INLINE_RESULT_TOKENS = 10_000;
 
 /** `AgentRunner` creates one of these ledgers for every model tool-use step.
  * The result transformer consumes it synchronously after each tool completes,
@@ -55,14 +50,49 @@ export const TOOL_RESULT_INLINE_LEDGER_STATE_KEY = 'toolResultInlineLedger';
 export type ToolResultInlineLedger = {
   initialTokens: number;
   remainingTokens: number;
-  /** Per-result ceiling for this round, derived from the resolved context
-   *  budget. Absent when no model window was resolvable, in which case the
-   *  caller's `maxInlineTokens` default applies unchanged. */
+  /** Fixed per-result ceiling supplied by the runner, independent of window
+   *  size. Standalone callers may omit it and use `maxInlineTokens`. */
   perResultTokens?: number;
   /** Per-result ceiling for a document the model was told to read whole.
-   *  Absent alongside `perResultTokens`. */
+   *  This is also fixed; the shared round ledger still bounds admission. */
   verbatimDocumentTokens?: number;
 };
+
+/** Host-owned storage failure; never a request to re-execute the tool. */
+export class ToolResultPersistenceError extends Error {
+  readonly code = 'TOOL_RESULT_PERSISTENCE_FAILED';
+  constructor() {
+    super('The tool executed, but its complete output could not be saved. The task has stopped. Check available storage and write permissions before continuing.');
+    this.name = 'ToolResultPersistenceError';
+  }
+}
+
+const RESULT_SAVE_RETRY_DELAYS_MS = [200, 1_000, 3_000];
+
+/** Retain the original result and retry storage only, with cancellable backoff.
+ * No shared lock: other tasks and already-running tools continue normally. */
+export async function capToolResultWithRetry(
+  toolName: string, result: ToolResult, ctx: ToolContext, opts: WrapOpts,
+): Promise<ToolResult> {
+  for (let attempt = 0; ; attempt++) {
+    ctx.signal?.throwIfAborted();
+    try {
+      return capToolResult(toolName, result, ctx, opts);
+    } catch (err) {
+      if (!(err instanceof ToolResultPersistenceError) || attempt >= RESULT_SAVE_RETRY_DELAYS_MS.length) throw err;
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          clearTimeout(timer);
+          ctx.signal?.removeEventListener('abort', finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, RESULT_SAVE_RETRY_DELAYS_MS[attempt]);
+        ctx.signal?.addEventListener('abort', finish, { once: true });
+        if (ctx.signal?.aborted) finish();
+      });
+    }
+  }
+}
 
 const PERSISTED_PREVIEW_TOKENS = 600;
 /** Head-only preview kept alongside a section map. Smaller than the plain
@@ -88,6 +118,80 @@ export interface WrapOpts {
   toolResultsDir: string;
 }
 
+/** Host-owned receipts cannot be forged through a tool payload. Reservations
+ * happen synchronously before I/O; concurrent calls see only unreserved room.
+ * The final transformer recognizes the exact result/ledger/content tuple and
+ * does not charge it a second time. Nothing is serialized into conversation. */
+const retrievalReceipts = new WeakMap<ToolResult, { ledger: unknown; content: string }>();
+export const RETRIEVAL_OUTPUT_BUDGET_KEY = 'retrievalOutputBudget';
+
+const retrievalQueues = new WeakMap<object, Promise<void>>();
+export async function withRetrievalBudget(
+  ctx: ToolContext,
+  execute: (ctx: ToolContext, budget: number) => Promise<ToolResult>,
+): Promise<ToolResult> {
+  const ledger = ctx.state[TOOL_RESULT_INLINE_LEDGER_STATE_KEY];
+  if (!ledger || typeof ledger !== 'object') return executeWithRetrievalBudget(ctx, execute);
+  const previous = retrievalQueues.get(ledger) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  retrievalQueues.set(ledger, current);
+  await previous;
+  try {
+    if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error('Retrieval aborted.');
+    return await executeWithRetrievalBudget(ctx, execute);
+  } finally {
+    release();
+    if (retrievalQueues.get(ledger) === current) retrievalQueues.delete(ledger);
+  }
+}
+
+async function executeWithRetrievalBudget(
+  ctx: ToolContext,
+  execute: (ctx: ToolContext, budget: number) => Promise<ToolResult>,
+): Promise<ToolResult> {
+  const ledger = ctx.state[TOOL_RESULT_INLINE_LEDGER_STATE_KEY] as ToolResultInlineLedger | undefined;
+  const ceiling = Math.min(DEFAULT_INLINE_RESULT_TOKENS, ledger?.perResultTokens ?? DEFAULT_INLINE_RESULT_TOKENS);
+  const reserved = Math.max(0, Math.floor(Math.min(ceiling, ledger?.remainingTokens ?? ceiling)));
+  if (ledger) ledger.remainingTokens -= reserved;
+  const previousReads = ctx.state.toolResultReadLedger as { epoch: number; readKeys: Set<string> } | undefined;
+  const reads = { epoch: previousReads?.epoch ?? 0, remainingTokens: reserved,
+    readKeys: new Set(previousReads?.readKeys ?? []) };
+  const child = { ...ctx, state: { ...ctx.state, [RETRIEVAL_OUTPUT_BUDGET_KEY]: reserved,
+    toolResultReadLedger: reads } };
+  let used = 0;
+  try {
+    let result = reserved > 0 ? await execute(child, reserved) : { content: '', isError: true };
+    if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error('Retrieval aborted.');
+    if (estimateToolResultTokens(result.content) > reserved) {
+      // Contract failure: do not publish partial source bytes or advance its
+      // cursor. In particular, never turn this receipt into a persisted ref.
+      result = { content: boundedRetrievalText('Retrieval output did not fit. No source data was delivered; retry the same source with a narrower range.', reserved), isError: true };
+    } else if (previousReads) {
+      for (const key of reads.readKeys) previousReads.readKeys.add(key);
+    }
+    used = estimateToolResultTokens(result.content);
+    retrievalReceipts.set(result, { ledger, content: result.content });
+    return result;
+  } finally {
+    if (ledger) ledger.remainingTokens += reserved - used;
+  }
+}
+
+export function boundedRetrievalText(text: string, maxTokens: number): string {
+  if (estimateToolResultTokens(text) <= maxTokens) return text;
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (estimateToolResultTokens(text.slice(0, mid)) <= maxTokens) lo = mid;
+    else hi = mid - 1;
+  }
+  // Never split a UTF-16 surrogate pair at the source cursor.
+  if (lo > 0 && /[\uD800-\uDBFF]/.test(text[lo - 1])) lo--;
+  return text.slice(0, lo);
+}
+
 /** Apply the result policy after any tool has executed. Kept separate from the
  * decorator so AgentRunner can transform its own late-added tools (notably
  * skill_manage) at the final execution boundary as well. */
@@ -97,6 +201,9 @@ export function capToolResult(
   ctx: ToolContext,
   opts: WrapOpts,
 ): ToolResult {
+  const receipt = retrievalReceipts.get(result);
+  if (receipt && receipt.ledger === ctx.state[TOOL_RESULT_INLINE_LEDGER_STATE_KEY]
+    && receipt.content === result.content && !result.streamedOutput) return result;
   if (result.streamedOutput) {
     const { streamedOutput, ...resultWithoutStreamPath } = result;
     const sid = path.basename(opts.toolResultsDir);
@@ -136,19 +243,13 @@ export function capToolResult(
         },
       };
     } catch (err) {
-      log.warn('streamed tool result adoption failed; returning bounded preview', {
+      log.warn('streamed tool result adoption failed', {
         tool: toolName,
         session_id: maskId(sid),
         size_bytes: streamedOutput.size,
         error: logErrorRef(err),
       });
-      return {
-        ...resultWithoutStreamPath,
-        content:
-          buildBoundedPreview(result.content, PERSISTED_PREVIEW_TOKENS) +
-          '\n\n[ERROR: streamed output adoption failed; the full output was not preserved. Retry with a narrower command or query.]',
-        isError: true,
-      };
+      throw new ToolResultPersistenceError();
     }
   }
 
@@ -187,19 +288,13 @@ export function capToolResult(
       },
     };
   } catch (err) {
-    log.warn('tool result persist failed; falling back to bounded preview', {
+    log.warn('tool result persist failed', {
       tool: toolName,
       session_id: maskId(sid),
       size: len,
       error: logErrorRef(err),
     });
-    return {
-      ...result,
-      content:
-        buildBoundedPreview(content, PERSISTED_PREVIEW_TOKENS) +
-        '\n\n[ERROR: oversized output persistence failed; the full output was not preserved. Retry with a narrower command or query.]',
-      isError: true,
-    };
+    throw new ToolResultPersistenceError();
   }
 }
 
@@ -218,9 +313,12 @@ export function wrapToolWithCap(tool: AgentTool, opts: WrapOpts): AgentTool {
     // kept their parallel mode natively, but now flow through this wrapper, so
     // their executionMode must be carried over here.
     ...(tool.executionMode ? { executionMode: tool.executionMode } : {}),
+    // The per-call refinement travels with the mode: dropping it would turn a
+    // read-only-only shell into an unconditional parallel one.
+    ...(tool.parallelWhen ? { parallelWhen: tool.parallelWhen } : {}),
     async execute(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
       const result = await tool.execute(input, ctx);
-      return capToolResult(tool.name, result, ctx, opts);
+      return capToolResultWithRetry(tool.name, result, ctx, opts);
     },
   };
 }
@@ -230,11 +328,9 @@ export function wrapToolWithCap(tool: AgentTool, opts: WrapOpts): AgentTool {
  * The round ledger — not this number — is what protects the context window:
  * it is derived from real remaining headroom and falls to zero as the request
  * fills, and every result must claim from it regardless of what this returns.
- * So the per-result ceiling is a policy about ONE item, and it says: do not
- * admit verbatim what the active checkpoint has already been told it cannot
- * keep. `perResultTokens` therefore tracks `activeSingleStepMaxTokens`. When
- * no model window was resolvable there is no such budget, and the caller's
- * historical default applies unchanged.
+ * The per-result ceiling is a fixed policy about ONE item. It is independent
+ * of the checkpoint's raw-tail retention and summarization input budget.
+ * Standalone callers without a runner ledger retain their explicit limit.
  */
 function resolvePerResultBudget(
   ctx: ToolContext,
@@ -248,8 +344,7 @@ function resolvePerResultBudget(
   if (verbatimDocument) {
     const declared = ledger?.verbatimDocumentTokens;
     if (Number.isFinite(declared) && (declared as number) > 0) return declared as number;
-    // No resolved window means no derived ceiling to widen; the historical
-    // default stands rather than inventing a multiple here.
+    // Standalone callers retain their explicit limit.
     return opts.maxInlineTokens;
   }
   const declared = ledger?.perResultTokens;
@@ -372,9 +467,13 @@ export function persistStreamedToolResult(
         if (fs.existsSync(abs)) {
           fs.unlinkSync(source);
         } else if (code === 'EXDEV') {
-          try { fs.copyFileSync(source, abs, fs.constants.COPYFILE_EXCL); }
-          catch (copyErr) {
-            if (!fs.existsSync(abs)) throw copyErr;
+          const tmp = `${abs}.${process.pid}.copy.tmp`;
+          try {
+            fs.copyFileSync(source, tmp);
+            fs.renameSync(tmp, abs);
+          } catch (copyErr) {
+            try { fs.unlinkSync(tmp); } catch { /* best-effort partial copy cleanup */ }
+            throw copyErr;
           }
           fs.unlinkSync(source);
         } else {
@@ -504,16 +603,9 @@ export function buildPersistedOutputMarkerFromPreview(
   const sourceWarning = meta.sourceTruncated
     ? '[WARNING: The producer exceeded its hard safety limit. The stored file is an incomplete prefix; do not treat it as a lossless full result.]\n'
     : '';
-  const queryHint = actions.startsWith('query')
-    ? ' Use tool_result action="query" for deterministic calculations supported by the Result data contract; structured queries must omit match and count_unit.'
-    : '';
-  const batchingHint = ' Make at most one tool_result call in the next model step; batch same-action requests in one requests array.';
-  const calculationHint = dataDescriptor?.reason === 'input_too_large'
-    ? ''
-    : ' Use action="materialize" with an available local runtime for full-data calculations not supported by query.';
-  const retrievalHint = outline
-    ? `[Full content is stored under result ref ${ref}.${queryHint}${batchingHint} Seek a section with tool_result(action="read", requests=[{ref, cursor}]) using the @N offsets above; use action="search" with requests=[{ref, query}] when you do not know which section you need.${calculationHint} Do not use read_files on the stored path.]`
-    : `[Full content is stored under result ref ${ref}.${queryHint}${batchingHint} Use tool_result(action="search", requests=[{ref, query}]) to locate content or tool_result(action="read", requests=[{ref, cursor, max_tokens}]) for an exact bounded slice.${calculationHint} Do not use read_files on the stored path.]`;
+  // Tool definitions own invocation guidance. Keep each receipt independently
+  // addressable without repeating that manual for every persisted result.
+  const retrievalHint = `[Full content is stored under result ref ${ref}. Retrieve with tool_result.]`;
   return (
     `<persisted-output ref="${escapeAttr(ref)}" tool="${escapeAttr(toolName)}" size="${meta.sizeChars}" estimated_tokens="${meta.estimatedTokens}" status="${meta.isError ? 'error' : 'success'}" source_truncated="${meta.sourceTruncated ? 'true' : 'false'}" data_type="${dataDescriptor?.reason === 'input_too_large' ? 'unknown' : dataDescriptor?.kind || 'unknown'}" actions="${actions}">\n` +
     sourceWarning +
@@ -742,79 +834,3 @@ function removeToolResultEntry(abs: string, isDirectory: boolean): void {
 }
 
 // ── Cloud-side retention ─────────────────────────────────────────────────
-
-/** Cloud-side persisted results expire per-file after this many days. Unlike
- *  the machine-local store swept above, these files sit beside their cloud
- *  session, sync to the server and every device, and were previously
- *  reclaimed only by conversation deletion — a long-lived chat grew without
- *  bound. Expiry is by file mtime (spill files are content-addressed and
- *  write-once, so mtime is creation time). A ref past this window resolves to
- *  E_RESULT_REF_MISSING, whose message carries this retention and the remedy
- *  (re-run the original tool). */
-export const CLOUD_TOOL_RESULT_MAX_AGE_DAYS = 30;
-
-/** Per-sweep deletion cap. Cloud removals ride the normal sync reconcile as
- *  ordinary delete ops (the same primitive conversation deletion uses); one
- *  sync pass deleting 50+ files would trip the engine's mass-delete
- *  confirmation prompt, so a backlogged account amortizes cleanup across
- *  activations — oldest first, so the backlog converges. */
-const CLOUD_TOOL_RESULT_SWEEP_MAX_DELETIONS = 40;
-
-export type CloudToolResultSweepStats = {
-  removedFiles: number;
-  removedDirs: number;
-  /** True when the deletion budget ran out with expired files remaining. */
-  truncated: boolean;
-};
-
-/** Expire individual persisted-result files under the given cloud session
- *  tool-results dirs. Symlink-safe: only regular-file dirents are considered,
- *  and a dir emptied by the sweep is removed. Missing dirs are tolerated. */
-export function sweepExpiredCloudToolResults(
-  sessionToolResultsDirs: readonly string[],
-  maxAgeDays = CLOUD_TOOL_RESULT_MAX_AGE_DAYS,
-  maxDeletions = CLOUD_TOOL_RESULT_SWEEP_MAX_DELETIONS,
-): CloudToolResultSweepStats {
-  const stats: CloudToolResultSweepStats = { removedFiles: 0, removedDirs: 0, truncated: false };
-  const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-  const expired: Array<{ abs: string; mtimeMs: number }> = [];
-  const scannedDirs: string[] = [];
-  for (const dir of sessionToolResultsDirs) {
-    let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
-    catch { continue; }
-    scannedDirs.push(dir);
-    for (const ent of entries) {
-      if (!ent.isFile()) continue;
-      const abs = path.join(dir, ent.name);
-      try {
-        const st = fs.lstatSync(abs);
-        if (st.isFile() && st.mtimeMs < cutoffMs) expired.push({ abs, mtimeMs: st.mtimeMs });
-      } catch { /* per-entry best-effort */ }
-    }
-  }
-  expired.sort((a, b) => a.mtimeMs - b.mtimeMs || a.abs.localeCompare(b.abs));
-  const budget = Math.max(0, Math.floor(maxDeletions));
-  for (const entry of expired) {
-    if (stats.removedFiles >= budget) { stats.truncated = true; break; }
-    try {
-      fs.unlinkSync(entry.abs);
-      stats.removedFiles++;
-    } catch { /* per-entry best-effort */ }
-  }
-  for (const dir of scannedDirs) {
-    try {
-      if (fs.readdirSync(dir).length === 0) {
-        fs.rmdirSync(dir);
-        stats.removedDirs++;
-      }
-    } catch { /* best-effort */ }
-  }
-  if (stats.removedFiles || stats.removedDirs) log.info('swept expired cloud tool-results', {
-    removed_files: stats.removedFiles,
-    removed_dirs: stats.removedDirs,
-    truncated: stats.truncated,
-    maxAgeDays,
-  });
-  return stats;
-}

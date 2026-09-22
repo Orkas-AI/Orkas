@@ -93,19 +93,13 @@ function _consumePendingTaskNotificationConversation() {
   return _openTaskNotificationConversation(_pendingTaskNotificationNavigation);
 }
 
-// Keep sidebar navigation independent from private analytics. The commercial
-// build decorates this boundary with click tracking; the open build still
-// needs the routing wrapper because every sidebar handler calls it.
+// Keep the shared routing wrapper because every sidebar handler calls it.
 function _setViewFromSidebar(targetView) {
   // The shell becomes clickable before asynchronous boot stages finish.
   // Preserve explicit user navigation over the later startup restore.
   if (typeof _markBootUserNavigation === 'function') _markBootUserNavigation();
   setView(targetView);
 }
-
-// Public agent creation has no analytics dependency, but its click handler
-// intentionally keeps the same hook as the commercial build.
-function _trackAgentCreateOpen() {}
 
 const _DRAFT_KEY = (cid) => `draft_${cid}`;
 
@@ -389,6 +383,7 @@ function bindStaticHandlers() {
   const chatInput = document.getElementById('chat-input');
   const chatSendBtn = document.getElementById('chat-send-btn');
   chatSendBtn.addEventListener('click', () => {
+    if (_isQueueItemEditing(currentCid)) { handleChatSubmit(); return; }
     // While a reply is streaming, the button is a stop icon — click aborts
     // the in-flight reply. Queued board tasks stay put on the backend.
     if (currentCid && isConvPending(currentCid)) {
@@ -401,6 +396,11 @@ function bindStaticHandlers() {
     // Plain Enter sends; Shift/Cmd/Ctrl+Enter inserts a newline. Skip IME
     // (CLAUDE.md §8 — keyCode 229 belt-and-suspenders for older builds).
     if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Escape' && _isQueueItemEditing(currentCid)) {
+      e.preventDefault();
+      void _cancelQueueItemEdit(currentCid);
+      return;
+    }
     if (_handleModifiedComposerEnter(e)) return;
     if (_isPlainComposerEnter(e)) {
       e.preventDefault();
@@ -420,18 +420,7 @@ function bindStaticHandlers() {
 
   // Agents (grid + detail)
   // "Done" button (only visible while editing) — exits edit mode.
-  document.getElementById('new-chat-external-agent-btn')?.addEventListener('click', () => {
-    _trackAgentCreateOpen('new_chat_external_agent', { agent_type: 'cli' });
-    openAgentModal({
-      initialTab: 'external',
-      externalOnly: true,
-      returnFocusId: 'new-chat-input',
-      entryPoint: 'new_chat_external_agent',
-      sourceView: currentView || '',
-    });
-  });
   document.getElementById('create-agent-btn')?.addEventListener('click', () => {
-    _trackAgentCreateOpen('agents_create_button');
     openAgentModal({
       entryPoint: 'agents_create_button',
       sourceView: currentView || '',
@@ -460,6 +449,18 @@ function bindStaticHandlers() {
     const load = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
     if (typeof load !== 'function') return;
     load('marketplace').then(() => openMarketplace('agent')).catch(() => {});
+  });
+  // AI Team header CLI entry. Opens the external-only dialog — no tab bar, just
+  // the CLI flow — rather than the tabbed create dialog, so the page matches
+  // what the button promises. Its own `entry_point` keeps the funnel separable
+  // from the create button's.
+  document.getElementById('agents-connect-cli-btn')?.addEventListener('click', () => {
+    openAgentModal({
+      initialTab: 'external',
+      externalOnly: true,
+      entryPoint: 'agents_connect_cli_button',
+      sourceView: currentView || '',
+    });
   });
   document.getElementById('agents-back-btn')?.addEventListener('click', () => _returnFromAgentsDetailView());
   document.getElementById('agent-use-btn')?.addEventListener('click', () => {

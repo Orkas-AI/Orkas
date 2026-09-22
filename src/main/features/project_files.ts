@@ -7,7 +7,11 @@
  * file tools get read-only access to this directory.
  */
 
+import { readTextPreview } from '../util/text-preview';
+import { fileFailureKind, type FileFailureKind } from '../util/app-error';
 import * as fs from 'node:fs';
+import { isUtf8 } from 'node:buffer';
+import { MAX_TEXT_FILE_BYTES, MAX_PROJECT_TEXT_PROCESSING_BYTES } from '../util/file-size-limits';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -28,6 +32,7 @@ import {
   assertLocalImportTarget,
   copyLocalFileAtomic,
   inspectLocalImportSource,
+  isUtf8File,
   withLocalImportLock,
 } from '../util/file-import';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
@@ -35,7 +40,7 @@ import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 const log = createLogger('project_files');
 
 const TEXT_EXTS: ReadonlySet<string> = new Set([
-  '.md', '.markdown', '.txt', '.csv', '.tsv',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
   '.json', '.yaml', '.yml', '.log',
   '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
   '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
@@ -47,7 +52,7 @@ const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp
 const VIDEO_EXTS: ReadonlySet<string> = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
 const PDF_EXT = '.pdf';
 const DOCX_EXTS: ReadonlySet<string> = new Set(['.docx', '.docm']);
-const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm']);
+const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm', '.xls']);
 const PRESENTATION_EXTS: ReadonlySet<string> = new Set(['.pptx', '.pptm']);
 const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
   ...TEXT_EXTS,
@@ -62,7 +67,7 @@ const IMAGE_MEDIA_TYPE: Record<string, string> = {
   '.gif': 'image/gif',
 };
 
-const MAX_BYTES_TEXT = 5 * 1024 * 1024;
+const MAX_BYTES_TEXT = MAX_PROJECT_TEXT_PROCESSING_BYTES;
 const MAX_BYTES_DOCX = 20 * 1024 * 1024;
 const MAX_BYTES_OFFICE = 50 * 1024 * 1024;
 const MAX_BYTES_IMAGE = 20 * 1024 * 1024;
@@ -94,7 +99,7 @@ export interface ProjectDirInfo {
 
 export type ProjectLibraryNode = ProjectFileInfo | ProjectDirInfo;
 
-export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string };
+export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string; failure_kind?: FileFailureKind };
 
 function safeProjectId(projectId: unknown): string {
   if (typeof projectId !== 'string' || !projectId) throw new Error('projectId required');
@@ -177,7 +182,7 @@ function maxBytesFor(name: string): number {
   if (SPREADSHEET_EXTS.has(ext) || PRESENTATION_EXTS.has(ext)) return MAX_BYTES_OFFICE;
   if (IMAGE_EXTS.has(ext)) return MAX_BYTES_IMAGE;
   if (VIDEO_EXTS.has(ext)) return MAX_BYTES_VIDEO;
-  return MAX_BYTES_TEXT;
+  return MAX_TEXT_FILE_BYTES;
 }
 
 function uniqueTarget(dir: string, name: string): string {
@@ -406,8 +411,7 @@ export async function uploadProjectFile(
     return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }) };
   }
   if (TEXT_EXTS.has(path.extname(safeName).toLowerCase())) {
-    const s = buf.toString('utf8');
-    if (Buffer.from(s, 'utf8').length !== buf.length) {
+    if (!isUtf8(buf)) {
       return { ok: false, error: t('errors.not_utf8') };
     }
   }
@@ -456,10 +460,7 @@ export async function importProjectFileFromPath(
   try {
     const source = await inspectLocalImportSource(sourceAbs, maxBytesFor(safeName));
     if (TEXT_EXTS.has(path.extname(safeName).toLowerCase())) {
-      // Text caps are small; validate UTF-8 without bringing large Office/PDF
-      // payloads back into the main-process heap.
-      const text = await fsp.readFile(sourceAbs, 'utf8');
-      if (Buffer.byteLength(text, 'utf8') !== source.bytes) {
+      if (!await isUtf8File(sourceAbs)) {
         return { ok: false, error: t('errors.not_utf8') };
       }
     }
@@ -616,15 +617,15 @@ export async function resolveProjectFileAbsPath(
     safeName = safeFileName(name);
     pid = safeProjectId(projectId);
     if (!await projectExists(userId, pid)) return { ok: false, error: 'not_found' };
-  } catch (err) { return { ok: false, error: (err as Error).message }; }
+  } catch (err) { return { ok: false, error: (err as Error).message, failure_kind: fileFailureKind(err) }; }
 
   const root = path.resolve(projectFilesDir(userId, pid));
   let abs: string;
   try { abs = await resolveUnder(root, safeName); }
-  catch (err) { return { ok: false, error: (err as Error).message }; }
+  catch (err) { return { ok: false, error: (err as Error).message, failure_kind: fileFailureKind(err) }; }
   let st: fs.Stats;
   try { st = fs.lstatSync(abs); }
-  catch { return { ok: false, error: 'not_found' }; }
+  catch (err) { return { ok: false, error: 'not_found', failure_kind: fileFailureKind(err) }; }
   if (st.isSymbolicLink()) return { ok: false, error: 'symlink_not_supported' };
   if (!st.isFile()) return { ok: false, error: 'not_found' };
   return { ok: true, absPath: abs, kind: kindOfName(safeName) };
@@ -656,7 +657,7 @@ export async function resolveProjectEntryAbsPath(
   return { ok: false, error: 'not_found' };
 }
 
-function validateProjectCopySource(sourceAbs: string): Result<{ fileCount: number; bytes: number }> {
+async function validateProjectCopySource(sourceAbs: string): Promise<Result<{ fileCount: number; bytes: number }>> {
   const stack = [sourceAbs];
   let fileCount = 0;
   let bytes = 0;
@@ -682,13 +683,9 @@ function validateProjectCopySource(sourceAbs: string): Result<{ fileCount: numbe
       return { ok: false, error: 'unsupported_destination' };
     }
     if (TEXT_EXTS.has(ext)) {
-      let buf: Buffer;
-      try { buf = fs.readFileSync(current); }
-      catch { return { ok: false, error: 'read_failed' }; }
-      const text = buf.toString('utf8');
-      if (Buffer.byteLength(text, 'utf8') !== buf.length) {
-        return { ok: false, error: 'unsupported_destination' };
-      }
+      try {
+        if (!await isUtf8File(current)) return { ok: false, error: 'unsupported_destination' };
+      } catch { return { ok: false, error: 'read_failed' }; }
     }
     fileCount += 1;
     bytes += st.size;
@@ -726,8 +723,10 @@ export async function copyProjectEntryFromPath(
   try {
     if (!fs.statSync(path.dirname(targetAbs)).isDirectory()) return { ok: false, error: 'not_found' };
   } catch { return { ok: false, error: 'not_found' }; }
-  const checked = validateProjectCopySource(sourceAbs);
+  const checked = await validateProjectCopySource(sourceAbs);
   if (checked.ok === false) return { ok: false, error: checked.error };
+  // Validation streams may yield; do not delete a concurrent winner in copy rollback.
+  if (fs.existsSync(targetAbs)) return { ok: false, error: 'target_exists' };
 
   try {
     fs.cpSync(sourceAbs, targetAbs, {
@@ -768,7 +767,7 @@ export async function checkoutProjectFile(
   const resolved = await resolveProjectFileAbsPath(userId, projectId, name);
   if (resolved.ok === false) return resolved;
   try {
-    const checked = validateProjectCopySource(resolved.absPath);
+    const checked = await validateProjectCopySource(resolved.absPath);
     if (checked.ok === false) return checked;
     // No await between the copy and receipt: renderer and bridge writes cannot
     // interleave. Hash the copy so the receipt always describes the bytes read.
@@ -777,7 +776,10 @@ export async function checkoutProjectFile(
       ok: true, name, bytes: checked.bytes,
       revision: projectFileRevision(userId, projectId, safeFileName(name), destination),
     };
-  } catch {
+  } catch (error) {
+    log.warn('project Library checkout failed', {
+      user_id: maskId(userId), project_id: maskId(projectId), error: logErrorSummary(error),
+    });
     return { ok: false, error: 'checkout_failed: use a new workspace filename and an existing parent folder' };
   }
 }
@@ -793,7 +795,7 @@ export async function replaceProjectFileFromPath(
   try {
     const safeName = safeFileName(name);
     if (!fs.lstatSync(source).isFile() || fs.lstatSync(source).isSymbolicLink()) return { ok: false, error: 'source must be a regular file' };
-    const checked = validateProjectCopySource(source);
+    const checked = await validateProjectCopySource(source);
     if (checked.ok === false) return checked;
     if (checked.bytes > maxBytesFor(safeName)) return { ok: false, error: 'file_too_large' };
     temp = path.join(path.dirname(resolved.absPath), `.orkas-replace-${randomUUID()}.tmp`);
@@ -806,14 +808,27 @@ export async function replaceProjectFileFromPath(
     // (including UI text edits) observe a single uninterrupted replacement.
     fs.renameSync(temp, resolved.absPath);
     temp = '';
-    try { invalidateFileCache(userId, resolved.absPath); } catch { /* rebuilt on next read */ }
+    try { invalidateFileCache(userId, resolved.absPath); } catch (error) {
+      log.warn('project Library replacement cache invalidation failed', {
+        user_id: maskId(userId), project_id: maskId(projectId), error: logErrorSummary(error),
+      });
+    }
     projectLibraryIndexer.enqueue(userId, projectId, safeName, 'upsert');
     _notifyDirty(userId, projectId);
     return { ok: true, name: safeName, bytes: checked.bytes, revision };
-  } catch {
+  } catch (error) {
+    log.warn('project Library replacement failed', {
+      user_id: maskId(userId), project_id: maskId(projectId), error: logErrorSummary(error),
+    });
     return { ok: false, error: 'replace_failed: check the source file and retry' };
   } finally {
-    if (temp) { try { fs.unlinkSync(temp); } catch { /* best-effort staging cleanup */ } }
+    if (temp) {
+      try { fs.unlinkSync(temp); } catch (error) {
+        log.warn('project Library replacement staging cleanup failed', {
+          user_id: maskId(userId), project_id: maskId(projectId), error: logErrorSummary(error),
+        });
+      }
+    }
   }
 }
 
@@ -821,13 +836,20 @@ export async function readProjectTextFile(
   userId: string,
   projectId: string,
   name: string,
-): Promise<Result<{ content: string; name: string }>> {
+  preview = false,
+): Promise<Result<{ content: string; name: string; truncated?: boolean }>> {
   const r = await resolveProjectFileAbsPath(userId, projectId, name);
   if (!r.ok) return { ok: false, error: (r as { error?: string }).error || 'not_found' };
   if (r.kind !== 'text') return { ok: false, error: 'binary file cannot be read as text' };
   let st: fs.Stats;
   try { st = fs.statSync(r.absPath); }
   catch { return { ok: false, error: 'not_found' }; }
+  if (preview && /\.(csv|tsv)$/i.test(name)) {
+    try {
+      const result = readTextPreview(r.absPath);
+      return { ok: true, content: result.text, name, truncated: result.truncated };
+    } catch (err) { return { ok: false, error: (err as Error).message }; }
+  }
   if (st.size > MAX_BYTES_TEXT) {
     return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(MAX_BYTES_TEXT / 1024 / 1024) }) };
   }

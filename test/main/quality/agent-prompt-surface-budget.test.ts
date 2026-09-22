@@ -73,25 +73,38 @@ const AGENTS_ROOT = path.join(
  *  deliberately about one percent: an ordinary wording fix fits, a new
  *  paragraph does not. */
 const RECORDED_CEILING: Readonly<Record<string, number>> = {
-  VideoStudio: 7_292,
+  VideoStudio: 6_987,
+  VoiceStudio: 2_571, // Audio-only Agent; one private Skill, no runtime manual.
   // Re-measured 2026-09-09 at 7,996 after the BACKLINK route joined the
   // surface: one workflow line naming `seo-backlink-value`, its roster
   // description, one knowhow line, and the routing terms in both
   // descriptions. The offer-valuation procedure itself lives in the Skill.
-  SeoGeoAgent: 8_080,
-  UIDesigner: 6_920,
-  ImageStudio: 4_068,
-  PptMaker: 3_925,
-  ProductDeveloper: 3_274,
-  DeepResearcher: 2_751,
-  OfficeWorker: 2_444,
-  ContentWriter: 1_936,
+  SeoGeoAgent: 7_683,
+  UIDesigner: 6_728,
+  ImageStudio: 3_817,
+  PptMaker: 3_816,
+  ProductDeveloper: 2_536,
+  DeepResearcher: 2_382,
+  OfficeWorker: 2_219,
+  ContentWriter: 1_912,
+  StockAnalyser: 4_725,
+  // Added as built-ins on 2026-09-21. Each ceiling is the measured resident
+  // surface plus about one percent; route-specific procedures remain in the
+  // six standalone ecommerce Skills shipped with them.
+  ECommerceResearcher: 2_569,
+  ECommerceReviewer: 2_568,
+  ECommerceOperator: 1_642,
+  ECommerceWriter: 1_605,
+  ECommerceAnalyzer: 1_445,
 };
 
-/** The corpus total matters on its own: nine agents each creeping under their
+/** The corpus total matters on its own: eleven agents each creeping under their
  *  own ceiling is still a shared regression, because a user with several
  *  agents in one group chat pays for all of them. */
-const RECORDED_CORPUS_CEILING = 40_740; // 40,331 measured 2026-09-09 (SeoGeoAgent BACKLINK route)
+// 2026-09-15: routing descriptions lost 2,224 characters of duplicated prose;
+// lower the existing ceilings by that delta, preserving their prior headroom.
+// 2026-09-17: ProductDeveloper delegates execution procedures to product-dev.
+const RECORDED_CORPUS_CEILING = 55_208;
 
 interface AgentSurface {
   name: string;
@@ -252,8 +265,7 @@ describe('built-in agent resident prompt surface', () => {
 
   it('keeps every built-in routing description inside the agent roster ceiling', () => {
     // The Commander directory shortens longer descriptions with an ellipsis
-    // and no other signal, and the tail is where authors put the trigger
-    // list. A description over the ceiling therefore loses routing terms
+    // and no other signal. A description over the ceiling can lose a boundary
     // silently; fail here instead.
     const over = fs.readdirSync(AGENTS_ROOT).flatMap((dir) => {
       const file = path.join(AGENTS_ROOT, dir, 'agent.json');

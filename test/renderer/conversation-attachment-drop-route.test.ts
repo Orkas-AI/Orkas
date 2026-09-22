@@ -139,7 +139,7 @@ function loadHarness(opts: {
     },
     URL: {
       createObjectURL: (file: FakeFile) => `blob:${file.name}`,
-      revokeObjectURL: () => {},
+      revokeObjectURL: vi.fn(),
     },
     t: (key: string, vars?: Record<string, unknown>) =>
       vars ? `${key}:${JSON.stringify(vars)}` : key,
@@ -246,6 +246,18 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
     },
   );
 
+  it('admits an XLS drop and paints it as a spreadsheet before main import finishes', async () => {
+    const h = loadHarness();
+    const file = fakeFile('inventory.XLS', { localPath: '/Users/test/Desktop/inventory.XLS' });
+    const done = h.upload(CID, [file], 'drop');
+    expect(h.chips.get(CID)).toEqual([expect.objectContaining({ kind: 'spreadsheet', status: 'uploading' })]);
+    expect(h.importCalls).toHaveLength(1);
+    h.releaseImport();
+    await done;
+    expect(h.alerts).toEqual([]);
+    expect(file.arrayBufferReads).toBe(0);
+  });
+
   it('keeps the base64 upload for a path-less clipboard File (negative control)', async () => {
     const h = loadHarness();
     const blob = fakeFile('screenshot.png', { bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]) });
@@ -327,6 +339,42 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
         payload: expect.objectContaining({ result: 'failure', uploaded_count: 0, failed_count: 1 }),
       })]);
     }
+  });
+
+  it.each([
+    ['path', 'picture.png'], ['path', 'recording.mp3'],
+    ['bytes', 'picture.png'], ['bytes', 'recording.mp3'],
+  ])('releases a rejected %s preview for %s when its chip is removed', async (route, name) => {
+    const rejected = { ok: false, error: 'errors.file_too_large_mb' };
+    const h = loadHarness({
+      importResult: (files, resolved) => ({ ok: true,
+        files: resolved.map(index => ({ index, name: files[index].name, ...rejected })),
+      }),
+      uploadResult: () => rejected,
+    });
+    const file = fakeFile(name, route === 'path' ? { localPath: `/tmp/${name}` } : {});
+    const done = h.upload(CID, [file], 'drop');
+    if (route === 'path') {
+      expect(h.chips.get(CID)).toEqual([expect.objectContaining({ dataUrl: `blob:${name}`, status: 'uploading' })]);
+    }
+    expect(h.context.URL.revokeObjectURL).not.toHaveBeenCalled();
+    h.releaseImport();
+    await done;
+    expect(h.chips.get(CID)).toEqual([]);
+    expect(h.context.URL.revokeObjectURL).toHaveBeenCalledExactlyOnceWith(`blob:${name}`);
+    expect(h.events).toEqual([expect.objectContaining({
+      payload: expect.objectContaining({ result: 'failure', failed_count: 1 }),
+    })]);
+  });
+
+  it.each(['ready', 'error'])('retains a preview while its %s chip remains available', async status => {
+    const h = loadHarness(status === 'error' ? { importReject: new Error('reply unavailable') } : {});
+    const done = h.upload(CID, [fakeFile('retained.png', { localPath: '/tmp/retained.png' })], 'drop');
+    expect(h.context.URL.revokeObjectURL).not.toHaveBeenCalled();
+    h.releaseImport();
+    await done;
+    expect(h.chips.get(CID)).toEqual([expect.objectContaining({ status, dataUrl: 'blob:retained.png' })]);
+    expect(h.context.URL.revokeObjectURL).not.toHaveBeenCalled();
   });
 
   it('lets a path-imported chip dedupe a later identical clipboard paste, like a byte-uploaded chip does', async () => {

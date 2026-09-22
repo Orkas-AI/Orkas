@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -17,28 +17,18 @@ activateUser(UID);
 import {
   onAgentTurnEnd,
   onUserMessage,
-  _clearAgentMsgCache,
 } from '../../../../src/main/features/expert_signals/turn_hooks';
 import { querySignals } from '../../../../src/main/features/expert_signals';
+import { _clearAllPending, scheduleSilenceCheck } from '../../../../src/main/features/expert_signals/extractors/silence';
 
 async function wait() { return new Promise((r) => setTimeout(r, 30)); }
 
-// Why this file exists: phase-0 commit 76358a8e shipped the chokepoint
-// functions (onAgentTurnEnd / onUserMessage) and the bus.ts wiring, but
-// the bus.ts portion silently fell out of the commit. The fall-out wasn't
-// detected because all expert_signals coverage was on the pure extractors
-// (text.test.ts / silence.test.ts / event.test.ts) — none exercised the
-// chokepoint end-to-end. These fixtures lock the chokepoint behaviour so
-// the next time someone refactors turn_hooks or moves the bus call site,
-// a missing wire surfaces in the test suite, not in production weeks
-// later. See `docs/plans/expert-signals-phase0-wiring-gaps.md`.
+// Observe persisted signals through the real chokepoint. Free-form feedback
+// no longer creates a verdict; objective failure events remain available.
+afterEach(() => { _clearAllPending(); });
 
-beforeEach(() => {
-  _clearAgentMsgCache();
-});
-
-describe('onAgentTurnEnd › set A (live emit + cache)', () => {
-  it('caches agent msg + does NOT emit signals on a clean turn (no errText)', async () => {
+describe('onAgentTurnEnd › objective events', () => {
+  it('does not emit failure signals on a clean turn', async () => {
     const cid = 'cid-tha-a1';
     onAgentTurnEnd({
       uid: UID, cid,
@@ -51,7 +41,6 @@ describe('onAgentTurnEnd › set A (live emit + cache)', () => {
 
     const errSigs = await querySignals({ types: ['tool_failure'], cid });
     expect(errSigs.length).toBe(0);
-    // Cache write is observable via the next onUserMessage call below.
   });
 
   it('errText non-empty → emits tool_failure once', async () => {
@@ -88,74 +77,13 @@ describe('onAgentTurnEnd › set A (live emit + cache)', () => {
   });
 });
 
-describe('onUserMessage › set A (text-signal extraction after cache)', () => {
-  it('correction word → emits correction signal joined on cached turn_id', async () => {
-    const cid = 'cid-thu-a1';
-    onAgentTurnEnd({
-      uid: UID, cid,
-      actorId: 'agent_x',
-      isCommander: false,
-      agentMsg: { id: 'm_thu_a1', text: '我帮你写了一段示例代码。' },
-    });
-    const r = await onUserMessage({
-      uid: UID, cid,
-      userMsg: { id: 'u_a1', text: '不对，应该用另一种写法' },
-    });
-    expect(r.correctionDetected).toBe(true);
-    await wait();
-
-    const sigs = await querySignals({ types: ['correction'], cid });
-    expect(sigs.length).toBeGreaterThanOrEqual(1);
-    expect(sigs[0].turn_id).toBe('m_thu_a1');
-    expect(sigs[0].aid).toBe('agent_x');
-  });
-
-  it('explicit accept word → emits accept signal', async () => {
-    const cid = 'cid-thu-a2';
-    onAgentTurnEnd({
-      uid: UID, cid,
-      actorId: 'agent_x',
-      isCommander: false,
-      agentMsg: { id: 'm_thu_a2', text: 'How about this approach?' },
-    });
-    await onUserMessage({
-      uid: UID, cid,
-      userMsg: { id: 'u_a2', text: '好的，就这样' },
-    });
-    await wait();
-
-    const sigs = await querySignals({ types: ['accept'], cid });
-    expect(sigs.length).toBe(1);
-    expect(sigs[0].turn_id).toBe('m_thu_a2');
-  });
-
-  it('rejection word → emits reject signal', async () => {
-    const cid = 'cid-thu-a3';
-    onAgentTurnEnd({
-      uid: UID, cid,
-      actorId: 'agent_x',
-      isCommander: false,
-      agentMsg: { id: 'm_thu_a3', text: '我用 Python 实现一个排序。' },
-    });
-    await onUserMessage({
-      uid: UID, cid,
-      userMsg: { id: 'u_a3', text: '算了，不要这个了' },
-    });
-    await wait();
-
-    const sigs = await querySignals({ types: ['reject'], cid });
-    expect(sigs.length).toBe(1);
-  });
-});
-
 describe('onUserMessage / onAgentTurnEnd › set B (must NOT emit)', () => {
-  it('onUserMessage with no prior onAgentTurnEnd → no signals (cache miss)', async () => {
+  it('onUserMessage with no prior agent turn → no feedback signals', async () => {
     const cid = 'cid-thu-b1';
-    const r = await onUserMessage({
+    await onUserMessage({
       uid: UID, cid,
       userMsg: { id: 'u_b1', text: '不对' },
     });
-    expect(r.correctionDetected).toBe(false);
     await wait();
 
     const sigs = await querySignals({
@@ -165,7 +93,7 @@ describe('onUserMessage / onAgentTurnEnd › set B (must NOT emit)', () => {
     expect(sigs.length).toBe(0);
   });
 
-  it('silent agent turn (empty text) → no cache, so next user msg gets no signal', async () => {
+  it('silent agent turn → next user message does not imply feedback', async () => {
     const cid = 'cid-thu-b2';
     onAgentTurnEnd({
       uid: UID, cid,
@@ -186,7 +114,7 @@ describe('onUserMessage / onAgentTurnEnd › set B (must NOT emit)', () => {
     expect(sigs.length).toBe(0);
   });
 
-  it('neutral user reply → no correction/accept/reject (might still emit edit if it looks like one)', async () => {
+  it('neutral user reply → no inferred feedback', async () => {
     const cid = 'cid-thu-b3';
     onAgentTurnEnd({
       uid: UID, cid,
@@ -206,4 +134,37 @@ describe('onUserMessage / onAgentTurnEnd › set B (must NOT emit)', () => {
     });
     expect(tagged.length).toBe(0);
   });
+});
+
+describe('user prose is not a feedback verdict', () => {
+  it.each(['Actually, explain the word wrong.', 'Write about perfect numbers.', '不要把“重新做”当作用户反馈。', '好的，就这样', '不对，重新做', '算了，不要这个了'])('does not label a follow-up from keywords: %s', async (text) => {
+    const cid = `prose-${text.length}`;
+    onAgentTurnEnd({ uid: UID, cid, actorId: 'agent_x', isCommander: false, agentMsg: { id: 'prior', text: 'An earlier answer.' } });
+    await onUserMessage({ uid: UID, cid, userMsg: { id: 'next', text } });
+    await wait();
+    expect(await querySignals({ cid, types: ['accept', 'reject', 'correction', 'edit'] })).toEqual([]);
+  });
+});
+
+it('does not infer an edit verdict from a follow-up that overlaps the previous answer', async () => {
+  const cid = 'followup-overlap';
+  const prefix = 'The report should include the project timeline and owners. ';
+  onAgentTurnEnd({ uid: UID, cid, actorId: 'agent_x', isCommander: false,
+    agentMsg: { id: 'previous-overlap', text: prefix + 'Use the remaining section for a detailed budget and cost summary.' } });
+  await onUserMessage({ uid: UID, cid, userMsg: { id: 'followup-overlap',
+    text: prefix + 'Explain this sentence in the context of a small volunteer project.' } });
+  await wait();
+  expect(await querySignals({ cid, types: ['accept', 'reject', 'correction', 'edit'] })).toEqual([]);
+});
+
+// The removed classifier shared this hook with inactivity bookkeeping. Keep
+// cancellation scoped to the user's conversation, without changing timers.
+it('a user reply cancels only its conversation inactivity observation', async () => {
+  for (const cid of ['replied-conversation', 'still-inactive']) {
+    scheduleSilenceCheck({ uid: UID, cid, aid: 'agent_x', turn_id: cid, msg_ids: [cid], thresholdMs: 30 });
+  }
+  await onUserMessage({ uid: UID, cid: 'replied-conversation', userMsg: { id: 'reply', text: 'Actually, continue.' } });
+  await new Promise(resolve => setTimeout(resolve, 80));
+  expect(await querySignals({ cid: 'replied-conversation', types: ['silence', 'accept', 'correction', 'reject', 'edit'] })).toEqual([]);
+  expect(await querySignals({ cid: 'still-inactive', types: ['silence'] })).toHaveLength(1);
 });

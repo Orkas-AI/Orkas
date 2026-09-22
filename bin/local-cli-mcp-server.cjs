@@ -563,7 +563,7 @@ async function prepareLocalInputs(parameters, inspection, env, signal) {
     return { parameters: prepared, cwd: directory, cleanup };
   } catch (error) {
     cleanup();
-    if (error.code === 'E_TOOL_CALL_CANCELLED') throw error;
+    if (error.code === 'E_TOOL_CALL_CANCELLED' || error.code === 'ETIMEDOUT') throw error;
     throw new Error('local input could not be prepared; check file access and size');
   }
 }
@@ -821,13 +821,13 @@ async function executeAction(expectedRisk, args, options = {}, env = process.env
       return fileContract(property, inspection.provider).url && typeof value === 'string' && /^https:\/\//i.test(value);
     })
     || actionTokens(inspection.action).at(-1).split(/[-_+]/).some(token => ['upload', 'download', 'import', 'export'].includes(token));
-  const timeoutMs = transfer ? 10 * 60_000 : 60_000;
+  const timeoutMs = 10 * 60_000;
   const deadline = new AbortController();
   const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
   const timer = setTimeout(() => deadline.abort(new DOMException('Execution deadline exceeded', 'TimeoutError')), timeoutMs);
   timer.unref?.();
-  // MCP progress is a liveness heartbeat during a bounded transfer, not a
-  // completion percentage. Ordinary commands retain their shorter deadline.
+  // Transfer progress is a liveness heartbeat, not a completion percentage.
+  // The host keeps a fixed ten-minute deadline regardless of these notifications.
   const heartbeat = transfer && options.onProgress ? setInterval(() => { void options.onProgress(); }, 15_000) : null;
   heartbeat?.unref?.();
   let prepared;

@@ -1,7 +1,15 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from 'vitest';
 import * as fs from 'node:fs';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
+
+const logProbe = vi.hoisted(() => ({ warn: vi.fn() }));
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ info: vi.fn(), debug: vi.fn(), error: vi.fn(), warn: logProbe.warn }),
+}));
 
 let root: string;
 let previous: string | undefined;
@@ -36,6 +44,87 @@ const run = async (tool: ReturnType<typeof createTool>, args: Record<string, unk
 };
 
 describe('auto_tasks shared tool', () => {
+  it('exposes union-free definitions for each scope while retaining types, bounds and nullable clears', () => {
+    const validator = new AjvJsonSchemaValidator();
+    for (const projectId of [undefined, null, pid]) {
+      const schema = createTool({ userId: uid, projectId }).inputSchema;
+      expect(JSON.stringify(schema)).not.toMatch(/"(?:anyOf|oneOf|\$ref)":/);
+      const accepts = validator.getValidator(schema);
+      for (const args of [
+        { action: 'create', ...draft },
+        { action: 'update', skill: null, connector: null, end_condition: null },
+        { action: 'update', skill: { id: 's1', name: 'Skill' }, connector: { id: 'c1', name: 'Connector' } },
+        { action: 'update', recipient: { kind: 'agent', id: 'a1', name: 'Agent' } },
+      ]) expect(accepts(args).valid).toBe(true);
+      for (const fields of [
+        { schedule: null }, { schedule: { type: 'daily', hour: 24 } },
+        { recipient: null }, { skill: {} }, { connector: { id: '', name: 'Invalid' } },
+        { end_condition: { type: 'count', max_runs: 0 } }, { unknown: true },
+      ]) expect(accepts({ action: 'update', ...fields }).valid).toBe(false);
+      expect(accepts({ action: 'list', project_id: null }).valid).toBe(projectId === undefined);
+      expect(accepts({ action: 'list', project_id: '' }).valid).toBe(false);
+    }
+  });
+
+  it.each([
+    { type: 'one_time', at: '2099-01-01T09:00:00+08:00' },
+    { type: 'hourly', interval_hours: 2 },
+    { type: 'daily', hour: 9, minute: 5 },
+    { type: 'weekly', weekday: 1, hour: 9, minute: 5 },
+    { type: 'monthly', day: 31, hour: 9, minute: 5 },
+  ])('saves and reads the $type schedule through the real executor', async schedule => {
+    const tool = createTool({ userId: uid, projectId: pid });
+    const result = await run(tool, { action: 'create', ...draft, schedule });
+    expect(result).toMatchObject({ ok: true, isError: false });
+    expect(await tasks.getTask(uid, result.taskId)).toMatchObject({ schedule, enabled: false, project_id: pid });
+    expect((await run(tool, { action: 'get', task_id: result.taskId })).task.schedule).toEqual(schedule);
+  });
+
+  it('rejects conditional omissions and mixed variants without changing saved state, then clears nullable fields', async () => {
+    const tool = createTool({ userId: uid, projectId: pid });
+    const created = await run(tool, { action: 'create', ...draft, end_condition: { type: 'count', max_runs: 3 } });
+    expect(created.ok).toBe(true);
+    const before = await tasks.getTask(uid, created.taskId);
+    for (const fields of [
+      { schedule: { type: 'one_time' } }, { schedule: { type: 'hourly' } },
+      { schedule: { type: 'daily', hour: 9 } }, { schedule: { type: 'weekly', hour: 9, minute: 0 } },
+      { schedule: { type: 'monthly', hour: 9, minute: 0 } },
+      { schedule: { type: 'daily', hour: 9, minute: 0, day: 1 } },
+      { end_condition: { type: 'count' } }, { end_condition: { type: 'date' } },
+      { end_condition: { type: 'count', max_runs: 2, date: '2099-01-01' } },
+      { recipient: { kind: 'agent' } }, { recipient: { kind: 'commander', id: 'unrelated' } },
+      { skill: { id: 's1' } }, { connector: { name: 'Missing id' } },
+    ]) {
+      expect((await run(tool, { action: 'update', task_id: created.taskId, ...fields })).isError).toBe(true);
+      expect(await tasks.getTask(uid, created.taskId)).toEqual(before);
+    }
+    expect((await run(tool, { action: 'update', task_id: created.taskId, end_condition: { type: 'date', date: '2099-01-01' } })).ok).toBe(true);
+    expect(await tasks.getTask(uid, created.taskId)).toMatchObject({ end_condition: { type: 'date', date: '2099-01-01' } });
+    expect((await run(tool, { action: 'update', task_id: created.taskId, end_condition: null, skill: null, connector: null })).ok).toBe(true);
+    const cleared = await tasks.getTask(uid, created.taskId);
+    for (const name of ['end_condition', 'skill', 'connector']) expect(cleared).not.toHaveProperty(name);
+    expect(cleared).toMatchObject({ schedule: draft.schedule, content: draft.content, enabled: false, project_id: pid });
+  });
+
+  it('reports a saved automation for the host click-through, and nothing on delete', async () => {
+    // The retired `<auto-task>` container had the bus stage this offer; the tool
+    // is the only writer now, so it reports the save (2026-09-13, review P3-2).
+    const saved: string[] = [];
+    const tool = createTool({ userId: uid, cid: 'cid-auto-nav', onSaved: (id) => saved.push(id) });
+    const created = await run(tool, {
+      action: 'create',
+      title: 'Nightly digest',
+      content: 'Summarize the day.',
+      schedule: { type: 'daily', hour: 22, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+    expect(saved).toEqual([created.taskId]);
+
+    const deleted = await run(tool, { action: 'delete', task_id: created.taskId });
+    expect(deleted.ok).toBe(true);
+    expect(saved).toEqual([created.taskId]);
+  });
+
   it('pages filtered summaries and retrieves complete long content without changing saved schedules', async () => {
     const tool = createTool({ userId: uid, projectId: pid });
     expect(await run(tool, { action: 'list' })).toMatchObject({ tasks: [], total: 0, next_offset: null });
@@ -46,7 +135,21 @@ describe('auto_tasks shared tool', () => {
       if (!created.ok) throw new Error('fixture failed');
       saved.push(created.task);
     }
-    const first = await run(tool, { action: 'list' });
+    const directoryReads = vi.spyOn(nativeFs, 'readdirSync');
+    syncBuiltinESMExports();
+    let first: Awaited<ReturnType<typeof run>>;
+    try {
+      first = await run(tool, { action: 'list' });
+      const scans = new Map<string, number>();
+      for (const [directory] of directoryReads.mock.calls) {
+        const key = String(directory);
+        if (path.basename(key) === 'auto_tasks') scans.set(key, (scans.get(key) || 0) + 1);
+      }
+      // Reading a saved collection must not rediscover every task directory
+      // for each record. Keep real storage, content and scope checks below.
+      expect(scans.size).toBeGreaterThan(0);
+      expect([...scans.values()].every(count => count === 1)).toBe(true);
+    } finally { directoryReads.mockRestore(); syncBuiltinESMExports(); }
     expect(first.tasks).toHaveLength(20);
     expect(first).toMatchObject({ total: 75, next_offset: 20 });
     const received: string[] = [];
@@ -134,14 +237,55 @@ describe('auto_tasks shared tool', () => {
   });
 
   it('binds the legacy Commander mutation path and enforces write scope inside storage locks', async () => {
-    const created = await tasks.applyAutoTaskContainerFromCommander(uid, { action: 'create', updates: draft as any }, { projectId: pid });
+    const created = await tasks.applyAutoTaskMutation(uid, { action: 'create', updates: draft as any }, { projectId: pid });
     expect(created.task?.project_id).toBe(pid);
     const id = created.taskId!;
     expect((await tasks.updateTask(uid, id, { title: 'forbidden' }, other)).ok).toBe(false);
     expect((await tasks.setTaskEnabled(uid, id, true, other)).ok).toBe(false);
     expect((await tasks.deleteTask(uid, id, other)).ok).toBe(false);
-    expect((await tasks.applyAutoTaskContainerFromCommander(uid, { action: 'update', taskId: id, updates: { project_id: null } as any }, { projectId: pid })).ok).toBe(false);
+    expect((await tasks.applyAutoTaskMutation(uid, { action: 'update', taskId: id, updates: { project_id: null } as any }, { projectId: pid })).ok).toBe(false);
     expect(await tasks.getTask(uid, id)).toMatchObject({ project_id: pid, content: draft.content, enabled: false });
+  });
+
+  it('binds global automation CRUD and rejects project IDs even at the locked storage boundary', async () => {
+    const tool = createTool({ userId: uid, projectId: null });
+    const foreign = await tasks.createTask(uid, { ...draft, schedule: draft.schedule as any, project_id: pid });
+    if (!foreign.ok) throw new Error('fixture failed');
+    const created = await run(tool, { action: 'create', ...draft });
+    expect(created.ok).toBe(true);
+    expect(await tasks.getTask(uid, created.taskId)).not.toHaveProperty('project_id');
+    expect((await run(tool, { action: 'list' })).tasks.map((t: any) => t.id)).toEqual([created.taskId]);
+    for (const action of ['get', 'update', 'enable', 'disable', 'delete']) {
+      expect((await run(tool, { action, task_id: foreign.task.id, ...(action === 'update' ? { title: 'forbidden' } : {}) })).isError).toBe(true);
+      expect(await tasks.getTask(uid, foreign.task.id)).toEqual(foreign.task);
+    }
+    expect((await run(tool, { action: 'create', ...draft, project_id: pid })).isError).toBe(true);
+    expect((await tasks.updateTask(uid, foreign.task.id, { title: 'forbidden' }, null)).ok).toBe(false);
+    expect((await tasks.setTaskEnabled(uid, foreign.task.id, true, null)).ok).toBe(false);
+    expect((await tasks.deleteTask(uid, foreign.task.id, null)).ok).toBe(false);
+    expect((await tasks.updateTask(uid, created.taskId, { project_id: pid }, null)).ok).toBe(false);
+    expect(await tasks.getTask(uid, foreign.task.id)).toEqual(foreign.task);
+    expect((await run(tool, { action: 'update', task_id: created.taskId, title: 'Global report' })).ok).toBe(true);
+    expect((await run(tool, { action: 'enable', task_id: created.taskId })).ok).toBe(true);
+    expect(await tasks.getTask(uid, created.taskId)).toMatchObject({ title: 'Global report', enabled: true });
+    expect((await run(tool, { action: 'disable', task_id: created.taskId })).ok).toBe(true);
+    expect(await tasks.getTask(uid, created.taskId)).toMatchObject({ enabled: false });
+    expect((await run(tool, { action: 'delete', task_id: created.taskId })).ok).toBe(true);
+    expect(await tasks.getTask(uid, created.taskId)).toBeNull();
+  });
+
+  it('reports a storage failure without exposing private error content', async () => {
+    const privateText = 'PRIVATE_AUTOMATION_CONTENT_71';
+    const list = vi.spyOn(tasks, 'listTasks').mockRejectedValueOnce(new Error(privateText));
+    logProbe.warn.mockClear();
+    try {
+      expect(await run(createTool({ userId: uid }), { action: 'list' }))
+        .toMatchObject({ ok: false, isError: true, error: 'automation operation failed' });
+      expect(logProbe.warn).toHaveBeenCalledWith('automation tool operation failed', expect.objectContaining({
+        error: expect.any(Object),
+      }));
+      expect(JSON.stringify(logProbe.warn.mock.calls)).not.toContain(privateText);
+    } finally { list.mockRestore(); }
   });
 
   it('keeps unbound Commander explicit project selection and global schedules compatible', async () => {

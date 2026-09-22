@@ -240,12 +240,12 @@ describe('Project Library external file drag-and-drop', () => {
     expect(viewer.surface.classList.contains('is-external-drag-over')).toBe(false);
   });
 
-  it('rejects hidden and unsupported drops while still uploading supported video files', async () => {
+  it.each(['demo.mp4', 'inventory.XLS'])('rejects hidden and unsupported drops while uploading %s', async name => {
     const context = loadProjectDetailScript();
     const hidden = { name: '.secret.md', size: 2, arrayBuffer: vi.fn() };
     const unsupported = { name: 'archive.zip', size: 3, arrayBuffer: vi.fn() };
     const video = {
-      name: 'demo.mp4',
+      name,
       size: 4,
       arrayBuffer: vi.fn(async () => new ArrayBuffer(4)),
     };
@@ -261,7 +261,7 @@ describe('Project Library external file drag-and-drop', () => {
     expect(context.window.orkas.invoke).toHaveBeenCalledOnce();
     expect(context.window.orkas.invoke).toHaveBeenCalledWith('projects.files.upload', expect.objectContaining({
       projectId: 'project-1',
-      name: 'References/demo.mp4',
+      name: `References/${name}`,
     }));
     expect(context.loadProjectDetail).toHaveBeenCalledWith('project-1');
     expect(context.uiAlert).toHaveBeenCalledTimes(2);
@@ -318,4 +318,54 @@ describe('Project Library external file drag-and-drop', () => {
     expect(context._projectTrackEvent.mock.calls[0][1]).not.toHaveProperty('project_id');
     expect(context.uiAlert).toHaveBeenCalledWith(expect.stringContaining('bad.zip'));
   });
+});
+
+
+describe('Project detail Library transfer drafts', () => {
+  it.each([true, false])('resolves the save choice %s before opening transfer', async (save) => {
+    const context = loadProjectDetailScript();
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/library-transfer.js'), 'utf8'), context);
+    context.window.LibraryTransfer = { ...context.window.LibraryTransfer, open: vi.fn(async () => ({})) };
+    context.uiConfirm = vi.fn(async () => save);
+    context.uiAlert = vi.fn();
+    context.__controller = { isDirty: () => true, save: vi.fn(async () => true) };
+    vm.runInContext(`
+      _projectLibraryActiveName = 'draft.md';
+      _projectLibraryMveController = __controller;
+      _projectLibraryDrafts.set('draft.md', { content: 'Edited', dirty: true });
+    `, context);
+    await context._openProjectLibraryTransfer(['draft.md'], 'menu');
+    expect(context.uiConfirm).toHaveBeenCalledOnce();
+    expect(context.__controller.save).toHaveBeenCalledTimes(save ? 1 : 0);
+    expect(context.window.LibraryTransfer.open).toHaveBeenCalledOnce();
+    expect(context.window.LibraryTransfer.open.mock.calls[0][0].source).toEqual({ scope: 'project', projectId: 'project-1' });
+  });
+
+  it('saves hidden project folder drafts through their own editor before transfer', async () => {
+    const context = loadProjectDetailScript();
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/library-transfer.js'), 'utf8'), context);
+    context.window.LibraryTransfer = { ...context.window.LibraryTransfer, open: vi.fn(async () => ({})) };
+    context.uiConfirm = vi.fn(async () => true);
+    context.uiAlert = vi.fn();
+    context.window.orkas.invoke.mockResolvedValue({ ok: true, content: 'Original' });
+    context._prepProjectLibraryViewer = () => ({ bodyEl: {}, actionsEl: {} });
+    const written: any[] = [];
+    context.mountMdViewEdit = ({ source, initialDraft, callbacks }: any) => ({
+      isDirty: () => true,
+      save: async () => { written.push({ ...source, content: initialDraft.content }); callbacks.onDraftChange(null); return true; },
+    });
+    vm.runInContext(`
+      _projectLibraryDrafts.set('notes/one.md', { content: 'First edit', dirty: true });
+      _projectLibraryDrafts.set('notes/two.md', { content: 'Second edit', dirty: true });
+      _projectLibraryDrafts.set('unrelated.md', { content: 'Keep this draft', dirty: true });
+    `, context);
+    await context._openProjectLibraryTransfer(['notes'], 'batch');
+    expect(written).toEqual([
+      { kind: 'project-file', projectId: 'project-1', name: 'notes/one.md', content: 'First edit' },
+      { kind: 'project-file', projectId: 'project-1', name: 'notes/two.md', content: 'Second edit' },
+    ]);
+    expect(context.window.LibraryTransfer.open).toHaveBeenCalledOnce();
+    expect(vm.runInContext('Array.from(_projectLibraryDrafts.keys())', context)).toEqual(['unrelated.md']);
+  });
+
 });

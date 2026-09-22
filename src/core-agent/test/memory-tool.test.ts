@@ -1,5 +1,6 @@
+import { estimateTextTokens } from '../src/shared/token-estimate.js';
 import { describe, it, expect, vi } from 'vitest';
-import { TOOL_DESCRIPTION_SOFT_BUDGET_CHARS, toToolDefinition } from '../src/tools/base.js';
+import { SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS, TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS, toToolDefinition } from '../src/tools/base.js';
 import { createCrossSessionMemoryTool, type MemoryToolHandler } from '../src/tools/memory-tool.js';
 
 function mockHandler(): MemoryToolHandler {
@@ -19,9 +20,21 @@ function mockHandler(): MemoryToolHandler {
   };
 }
 
-const dummyCtx = { state: {} };
+const dummyCtx = { state: {}, signal: new AbortController().signal };
 
 describe('createCrossSessionMemoryTool', () => {
+  it('publishes measured state effects without leaking host evidence in the receipt', async () => {
+    const handler = mockHandler();
+    handler.add = () => ({ ok: true, changed: false, entries: ['stable fact'], usage: { current: 11, limit: 2000 } });
+    const tool = createCrossSessionMemoryTool(handler);
+    const result = await tool.execute({ action: 'add', content: 'stable fact' }, { state: {} });
+    expect(JSON.parse(result.content)).toMatchObject({ ok: true, changed: false });
+    expect(result.content).not.toContain('stateMutation');
+    expect(result.observations?.stateMutation).toMatchObject({ scope: 'agent', changed: false });
+    expect(result.observations?.stateMutation?.version).toMatch(/^[a-f0-9]{64}$/);
+    handler.add = () => ({ ok: true, entries: ['stable fact'], usage: { current: 11, limit: 2000 } });
+    expect((await tool.execute({ action: 'add', content: 'stable fact' }, { state: {} })).observations).toBeUndefined();
+  });
   it('returns a well-formed AgentTool', () => {
     const tool = createCrossSessionMemoryTool(mockHandler());
     expect(tool.name).toBe('cross_session_memory');
@@ -48,7 +61,7 @@ describe('createCrossSessionMemoryTool', () => {
       expect(def.description).toContain('even without an explicit save request');
       expect(def.description).toContain('Decide from meaning, never trigger words');
       expect(def.description).toContain('Do not store current-task progress');
-      expect(def.description.length).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_CHARS);
+      expect(estimateTextTokens(def.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
       expect(properties.target.description).toContain('Defaults to agent');
       expect(properties.target.description).toContain('shared: rare cross-project facts');
       expect(properties.target.description).toContain('user: stable user-wide profile/preferences');
@@ -56,7 +69,7 @@ describe('createCrossSessionMemoryTool', () => {
       expect(properties.action.description).toContain('use list only');
       expect(properties.action.description).toContain('Omit unrelated fields');
       expect(def.inputSchema.additionalProperties).toBe(false);
-      expect(def.inputSchema).not.toHaveProperty('oneOf');
+      expect(def.inputSchema.oneOf).toBeUndefined();
       expect(warn).not.toHaveBeenCalled();
     } finally {
       warn.mockRestore();
@@ -74,7 +87,7 @@ describe('cross_session_memory › add', () => {
       dummyCtx,
     );
 
-    expect(handler.add).toHaveBeenCalledWith('shared', 'new fact');
+    expect(handler.add).toHaveBeenCalledWith('shared', 'new fact', dummyCtx.signal);
     const parsed = JSON.parse(result.content);
     expect(parsed.ok).toBe(true);
     expect(parsed.entries).toContain('new entry');
@@ -97,14 +110,14 @@ describe('cross_session_memory › add', () => {
       { action: 'add', target: 'user', content: 'prefers dark mode' },
       dummyCtx,
     );
-    expect(handler.add).toHaveBeenCalledWith('user', 'prefers dark mode');
+    expect(handler.add).toHaveBeenCalledWith('user', 'prefers dark mode', dummyCtx.signal);
   });
 
   it('defaults to the "agent" tier when target is omitted', async () => {
     const handler = mockHandler();
     const tool = createCrossSessionMemoryTool(handler);
     await tool.execute({ action: 'add', content: 'plan.json is the EDL' }, dummyCtx);
-    expect(handler.add).toHaveBeenCalledWith('agent', 'plan.json is the EDL');
+    expect(handler.add).toHaveBeenCalledWith('agent', 'plan.json is the EDL', dummyCtx.signal);
   });
 });
 
@@ -118,7 +131,7 @@ describe('cross_session_memory › replace', () => {
       dummyCtx,
     );
 
-    expect(handler.replace).toHaveBeenCalledWith('shared', 'old', 'new');
+    expect(handler.replace).toHaveBeenCalledWith('shared', 'old', 'new', dummyCtx.signal);
     expect(JSON.parse(result.content).ok).toBe(true);
   });
 
@@ -182,15 +195,16 @@ describe('cross_session_memory › list', () => {
     expect(parsed.entries).toEqual(['entry1', 'entry2']);
   });
 
-  it('rejects content fields owned by write actions', async () => {
+  it('ignores write-only fields on list without writing', async () => {
     const handler = mockHandler();
     const result = await createCrossSessionMemoryTool(handler).execute(
       { action: 'list', target: 'user', content: 'unrelated' },
       dummyCtx,
     );
-    expect(result).toMatchObject({ isError: true });
-    expect(JSON.parse(result.content).error).toContain('fields not allowed for list');
-    expect(handler.list).not.toHaveBeenCalled();
+    expect(result.isError).toBeFalsy();
+    expect(handler.list).toHaveBeenCalledWith('user');
+    expect(handler.add).not.toHaveBeenCalled();
+    expect(handler.replace).not.toHaveBeenCalled();
   });
 });
 
@@ -239,7 +253,7 @@ describe('cross_session_memory › project tier', () => {
     expect(withProject.description).toContain('even without an explicit save request');
     expect(withProject.description).toContain('Decide from meaning, never trigger words');
     expect(withProject.description).toContain('Use todo_tasks for task progress');
-    expect(withProject.description.length).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_CHARS);
+    expect(estimateTextTokens(withProject.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
     expect((withProject.inputSchema as any).properties.target.enum).toEqual(['agent', 'project', 'shared', 'user']);
     expect((withProject.inputSchema as any).properties.target.description)
       .toContain('project: project-specific facts and decisions');
@@ -254,19 +268,19 @@ describe('cross_session_memory › project tier', () => {
     const tool = createCrossSessionMemoryTool(handler, { includeProjectTier: true });
     const result = await tool.execute({ action: 'add', target: 'project', content: 'decided X' }, dummyCtx);
     expect(result.isError).toBeFalsy();
-    expect(handler.add).toHaveBeenCalledWith('project', 'decided X');
+    expect(handler.add).toHaveBeenCalledWith('project', 'decided X', dummyCtx.signal);
   });
 
   it('read-only sub-agent may list the project tier but not add/replace/remove', async () => {
     const handler = mockHandler();
     const tool = createCrossSessionMemoryTool(handler, { includeProjectTier: true, projectTierReadOnly: true });
 
-    expect(tool.description).toContain('Project memory is read-only; only Commander may write it.');
-    expect(tool.description.length).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_CHARS);
+    expect(tool.description).toContain('Project memory is read-only in this session; Commander can change it.');
+    expect(estimateTextTokens(tool.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
 
     // The relevant target parameter tells this actor it cannot write project memory.
     expect((tool.inputSchema as any).properties.target.description).toContain('Project is read-only');
-    expect((tool.inputSchema as any).properties.target.description.length).toBeLessThanOrEqual(220);
+    expect(estimateTextTokens((tool.inputSchema as any).properties.target.description)).toBeLessThanOrEqual(SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS);
 
     // list is allowed (read).
     const listed = await tool.execute({ action: 'list', target: 'project' }, dummyCtx);
@@ -290,6 +304,22 @@ describe('cross_session_memory › project tier', () => {
     // read-only applies to the project tier only — the agent's own tier still writes.
     const ownAdd = await tool.execute({ action: 'add', target: 'agent', content: 'lesson' }, dummyCtx);
     expect(ownAdd.isError).toBeFalsy();
-    expect(handler.add).toHaveBeenCalledWith('agent', 'lesson');
+    expect(handler.add).toHaveBeenCalledWith('agent', 'lesson', dummyCtx.signal);
   });
+});
+
+// The provider schema is advisory; malformed effective values must not reach storage.
+it.each([
+  { action: 'add', content: 123 },
+  { action: 'add', content: 'new', old_text: 'old' },
+  { action: 'replace', old_text: {}, content: 'new' },
+  { action: 'remove', old_text: false },
+  { action: 'add', target: '', content: 'new' },
+])('rejects malformed effective memory arguments without writes: %j', async (args) => {
+  const handler = mockHandler();
+  const result = await createCrossSessionMemoryTool(handler).execute(args, dummyCtx);
+  expect(result.isError).toBe(true);
+  expect(handler.add).not.toHaveBeenCalled();
+  expect(handler.replace).not.toHaveBeenCalled();
+  expect(handler.remove).not.toHaveBeenCalled();
 });

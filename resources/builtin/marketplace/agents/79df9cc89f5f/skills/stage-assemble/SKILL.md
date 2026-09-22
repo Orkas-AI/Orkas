@@ -9,6 +9,8 @@ description_en: "Assemble an approved cross-modal EDL into a finished video by p
 
 How to execute a validated, currently authorized `project/plan.json` into one finished file. Start/resume with `production.status`; if `plan_approval_current` is false, pass the state to `gate-control` and stop instead of producing or opening child gates. Walk the signed EDL; do not re-plan. Host-neutral: VideoStudio-specific edit/plan work runs through skill scripts (`stage-edit edit_video`, `stage-plan video_plan` via `bin/run-skill.cjs`), while authorization state, composition, and transcription run through the required built-in `video_studio` runtime; generic built-in capabilities remain `generate_video` / `generate_image` / `generate_speech`.
 
+Apply [production-method.md](../video-router/references/production-method.md) before assembly or QA. If the current plan has `is_generation:true`, deliver its completed model clip directly after its basic file check; skip the local assembly tiers and detailed QA below. For mixed work, these checks cover local integration, not creative quality of model-produced pixels.
+
 ## Script calls used here
 
 ```bash
@@ -99,7 +101,7 @@ Before showing the draft, run the QA pass and write `project/render_report.json`
 
 - **technical_probe** — `stage-edit edit_video --op probe` the draft (real duration / resolution / fps / audio present); confirm it matches the plan's aspect + total.
 - **promise_preservation** — run `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-plan video_plan -- --op promise_check --plan project/plan.json --probe-produced`. At gate D this probes each primary segment's `produced_path` and computes the REAL primary-track footage/generated-video ratio vs. `motion_min_ratio` plus the `source_required` invariant. A `compose_led` plan uses a zero real-motion floor because native composition QA owns its HTML animation contract. Missing/unreadable produced media or a fail means **"slideshow / promise broken" — do not deliver**. Send it back (below). Do not eyeball this; let the numbers decide.
-- **visual_spotcheck** — extract ~4 frames across the draft (`stage-edit edit_video --op extract_frame`) and read them for upside-down / garbled-caption / empty / wrong-product frames. Read them yourself if you are multimodal; if you cannot see images, record the spot-check as `unverified` and proceed — do not invent what the frames show.
+- **visual_spotcheck** — extract ~4 frames across the draft (`stage-edit edit_video --op extract_frame`) and inspect locally authored layout, captions, crops and joins. Do not score the creative fidelity of model-produced pixels. Read them yourself if you are multimodal; if you cannot see images, record the spot-check as `unverified` and proceed — do not invent what the frames show.
 - **audio_spotcheck** — the `op="normalize_loudness"` measured loudness numbers + the narration coverage result from step 2 (uncovered tail / silent lead-in).
 - **transcript_comparison** (when there is narration) — optionally transcribe the draft with `video_studio` `op: "speech.transcribe"`, then confirm the spoken words match the planned narration lines.
 
@@ -112,7 +114,7 @@ On approve → finalize `project/render/video.mp4` (loudness / captions only; ne
 A QA `fail` does not go to the user as "here's a broken video". Diagnose which segment(s) caused it and redo ONLY those, then re-assemble and re-run QA:
 
 - promise_preservation fail (slideshow) → the static composed segments are too long / the motion segments too short. Rebalance segment durations or convert a static beat to footage, re-assemble.
-- visual_spotcheck fail (bad frame) → re-produce that one segment (re-trim / re-compose / re-generate), not the whole video.
+- visual_spotcheck fail in local work → repair that cut, overlay or composition and rebuild dependent outputs. A generated visual is not subject to this creative repair loop; never re-generate it to resolve local QA.
 - audio fail (uncovered tail) → re-time or extend the narration / trim the tail.
 
 Bound repetition, not recovery: allow at most **2** send-back rounds for the same failing check and unchanged recovery strategy. If it still fails, preserve the evidence, stop repeating that strategy, and choose a materially different localized repair or return to the earliest affected non-billable step. Do not create a technical confirmation form. If every safe non-billable recovery conflicts with the signed plan, present the concrete conflict at the normal final-video review; a direct user reply may revise the affected scope. A signed-plan change uses the single plan-amendment review, and a new billable provider call uses the paid-generation review. Never loop forever or quietly ship a known-failing draft.

@@ -24,6 +24,7 @@ import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
 import { fileEditLock } from '../../util/locks';
 import { officeCliAvailable, runOfficeCli, closeOfficeFile, OfficeCliError } from '../../features/office/office_engine';
 import { renderOfficePageToPng } from '../../features/office/office_page_renderer';
+import { unassessedTextCollision, type TextCollisionAudit } from '../../features/office/pptx_text_collision';
 import {
   buildDocxBatch, buildXlsxWorkbookBatch, buildPptxBatch, buildEditBatch, serializeOfficeBatch,
   type DocxParagraphSpec, type DocxTableSpec, type DocxImageSpec,
@@ -448,9 +449,11 @@ async function acquireFileLocks(absPaths: readonly string[]): Promise<() => void
 
 /** Render one page to a PNG and return it as a tool-result image. Best-effort
  *  for the create-preview path; the caller decides whether a null is fatal. */
-async function renderToImage(file: string, cwd: string, page: string, signal?: AbortSignal): Promise<ToolResultImage | null> {
+async function renderToImage(file: string, cwd: string, page: string, signal?: AbortSignal, onTextCollisionAudit?: (audit: TextCollisionAudit) => void): Promise<ToolResultImage | null> {
   try {
-    const png = await renderOfficePageToPng(file, cwd, page, signal);
+    const png = onTextCollisionAudit
+      ? await renderOfficePageToPng(file, cwd, page, signal, { onTextCollisionAudit })
+      : await renderOfficePageToPng(file, cwd, page, signal);
     return { data: png.toString('base64'), mediaType: 'image/png' };
   } catch (err) {
     log.warn('render error', { error: logErrorRef(err) });
@@ -1144,7 +1147,10 @@ async function renderOfficePage(
   signal: AbortSignal | undefined,
   artifact: { artifactSha256: string; echoArtifactSha256: boolean },
 ): Promise<ToolResult> {
-  const img = await renderToImage(abs, cwd, page, signal);
+  let collisionAudit = analysisMode === 'quality_review' && path.extname(abs).toLowerCase() === '.pptx'
+    ? unassessedTextCollision('collection_unavailable') : undefined;
+  const img = await renderToImage(abs, cwd, page, signal, collisionAudit
+    ? audit => { collisionAudit = audit; } : undefined);
   if (!img) return errResult('E_OFFICE_RENDER_FAILED', `could not render ${abs} page ${page}`);
   const imageSha256 = sha256Bytes(Buffer.from(img.data, 'base64'));
   return {
@@ -1153,7 +1159,8 @@ async function renderOfficePage(
       `artifact_revision=${shortRevision(artifact.artifactSha256)} ` +
       `image_revision=${shortRevision(imageSha256)} path=${abs}` +
       (artifact.echoArtifactSha256 ? ` artifact_sha256=${artifact.artifactSha256}` : '') +
-      ` image_sha256=${imageSha256}`,
+      ` image_sha256=${imageSha256}` +
+      (collisionAudit ? `\n<office-text-collision>${JSON.stringify(collisionAudit).replace(/</g, '\\u003c')}</office-text-collision>` : ''),
     images: [{ ...img, analysisMode }],
     observations: { fileReads: [{ path: abs, hash: artifact.artifactSha256 }] },
   };

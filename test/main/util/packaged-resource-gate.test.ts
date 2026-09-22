@@ -9,12 +9,14 @@ const require = createRequire(import.meta.url);
 const {
   parseAppleStrings,
   verifyEmbeddingModelRoot,
+  verifyXlsReaderRoot,
   verifyExtraResourcesConfig,
   verifyMacLocalizedMetadataRoot,
   verifyResourceContract,
 } = require('../../../bin/packaged-resource-gate.cjs') as {
   parseAppleStrings: (text: string, label?: string) => Record<string, string>;
   verifyEmbeddingModelRoot: (root: string) => string;
+  verifyXlsReaderRoot: (root: string) => string;
   verifyExtraResourcesConfig: (entries: unknown) => string[];
   verifyMacLocalizedMetadataRoot: (root: string, options?: { allowElectronResources?: boolean }) => string;
   verifyResourceContract: (root: string, contract: Record<string, unknown>) => string;
@@ -53,6 +55,22 @@ function writeFixture(): { root: string; file: string; contract: Record<string, 
 }
 
 describe('packaged-resource-gate', () => {
+  it('pins the offline XLS reader including its license and worker', () => {
+    expect(verifyXlsReaderRoot(path.join(process.cwd(), 'resources/xls-reader'))).toBe('resource:xls-reader:2.0.2');
+  });
+
+  it.each(['Orkas.app/Contents/Resources', 'win-unpacked/resources'])('verifies XLS resources in %s and rejects missing or changed payloads', layout => {
+    const root = path.join(tmpDir, layout, 'xls-reader');
+    fs.cpSync(path.join(process.cwd(), 'resources/xls-reader'), root, { recursive: true });
+    expect(verifyXlsReaderRoot(root)).toBe('resource:xls-reader:2.0.2');
+    const worker = path.join(root, '2.0.2/read.py');
+    fs.appendFileSync(worker, '# changed');
+    expect(() => verifyXlsReaderRoot(root)).toThrow(/size mismatch/);
+    fs.copyFileSync(path.join(process.cwd(), 'resources/xls-reader/2.0.2/read.py'), worker);
+    fs.unlinkSync(path.join(root, '2.0.2/xlrd-2.0.2-py2.py3-none-any.whl'));
+    expect(() => verifyXlsReaderRoot(root)).toThrow(/missing/);
+  });
+
   it('verifies the complete pinned resource tree', () => {
     const fixture = writeFixture();
     expect(verifyResourceContract(fixture.root, fixture.contract)).toBe('resource:test-model:model-v1');
@@ -97,8 +115,8 @@ describe('packaged-resource-gate', () => {
     expect(() => verifyMacLocalizedMetadataRoot(root)).toThrow(/content mismatch/);
 
     fs.cpSync(path.join(process.cwd(), 'resources', 'mac-locales'), root, { recursive: true, force: true });
-    fs.mkdirSync(path.join(root, 'fr.lproj'));
-    fs.writeFileSync(path.join(root, 'fr.lproj', 'InfoPlist.strings'), '"key" = "value";\n');
+    fs.mkdirSync(path.join(root, 'ar.lproj'));
+    fs.writeFileSync(path.join(root, 'ar.lproj', 'InfoPlist.strings'), '"key" = "value";\n');
     expect(() => verifyMacLocalizedMetadataRoot(root)).toThrow(/unexpected mac localized metadata locale/);
   });
 
@@ -117,7 +135,7 @@ describe('packaged-resource-gate', () => {
   it('requires every package extraResources destination to have shared contract ownership', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
     expect(verifyExtraResourcesConfig(pkg.build.extraResources)).toEqual([
-      'embedding-model', 'runtime', 'builtin', 'officecli', '.',
+      'embedding-model', 'runtime', 'builtin', 'officecli', 'xls-reader', '.',
     ]);
   });
 

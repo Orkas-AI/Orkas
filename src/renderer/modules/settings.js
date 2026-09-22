@@ -58,26 +58,14 @@ let _settingsState = {
   taskNotificationsBound: false,
   taskNotificationsToggleEpoch: 0,
   taskNotificationPermissionRefreshTimer: null,
-  taskNotificationPermissionTelemetryKey: '',
+  taskNotificationPermissionLogKey: '',
   clientConfigBound: false,
   recycleBound: false,
   orkasApiCredential: null,
   orkasApiEditing: false,
 };
 
-function _settingsTrackClick() {}
-
-function _settingsTrackEvent(action, payload) {
-  void action;
-  void payload;
-}
-
-function _settingsTrackError(action, payload) {
-  void action;
-  void payload;
-}
-
-function _settingsTrackOperationResult(eventAction, startedAt, result, data, errorCode = '', errorType = 'operation') {
+function _settingsLogOperationResult(eventAction, startedAt, result, data, errorCode = '', errorType = 'operation') {
   const payload = {
     result,
     duration_ms: Math.max(0, Date.now() - startedAt),
@@ -90,12 +78,6 @@ function _settingsTrackOperationResult(eventAction, startedAt, result, data, err
   const level = result === 'failure' ? 'warn' : 'info';
   _settingsLog[level]('settings operation result', { operation: eventAction, ...payload });
 }
-
-function _settingsTrackModelProviderSelect() {}
-
-// The open build keeps the settings flow intact but intentionally has no
-// internal model-configuration telemetry sink.
-function _settingsTrackModelConfigResult() {}
 
 function _settingsResultErrorCode(res, fallback = 'operation_failed') {
   const code = String((res && res.code) || '').trim();
@@ -115,6 +97,11 @@ async function loadSettings() {
   // 4-tab structure (batch 6). Initialize switching + activate default tab
   // (通用 by default — matches the is-active class on the markup).
   if (typeof initSettingsTabs === 'function') initSettingsTabs();
+  // Models pane chrome: purpose sub-tabs, the add dialog and cross-tab jumps.
+  // Bound before the async reads so the first click is never lost.
+  _settingsBindModelTabsOnce();
+  _settingsBindAddModalOnce();
+  _settingsBindNavOnce();
   _settingsBindLanguageOnce();
   _settingsBindTaskNotificationsOnce();
   _settingsBindClientConfigOnce();
@@ -174,21 +161,20 @@ function _settingsNormalizeTaskNotificationPermission(permission) {
   };
 }
 
-function _settingsReportTaskNotificationPermission(source) {
+function _settingsLogTaskNotificationPermission(source) {
   const state = _settingsState.taskNotifications || {
     enabled: true,
     permission: { state: 'unknown', can_open_settings: false },
   };
   const permissionState = _settingsTaskNotificationPermissionState(state);
   const key = `${!!state.enabled}:${permissionState}`;
-  if (_settingsState.taskNotificationPermissionTelemetryKey === key) return;
-  _settingsState.taskNotificationPermissionTelemetryKey = key;
+  if (_settingsState.taskNotificationPermissionLogKey === key) return;
+  _settingsState.taskNotificationPermissionLogKey = key;
   const payload = {
     enabled: !!state.enabled,
     permission_state: permissionState,
     source: String(source || 'settings_load'),
   };
-  _settingsTrackEvent('task_notification_permission_state', payload);
   _settingsLog.info('task notification state observed', payload);
 }
 
@@ -215,7 +201,7 @@ async function _settingsRefreshTaskNotifications(source = 'settings_load') {
   } catch (_) {
     return false;
   }
-  _settingsReportTaskNotificationPermission(source);
+  _settingsLogTaskNotificationPermission(source);
   _settingsRenderTaskNotifications();
   return true;
 }
@@ -266,7 +252,6 @@ function _settingsRenderTaskNotifications() {
     if (!openBtn.dataset.bound) {
       openBtn.addEventListener('click', async () => {
         openBtn.disabled = true;
-        _settingsTrackClick('task_notification_permission_open');
         try {
           const res = await window.orkas.invoke('prefs.openTaskNotificationSettings');
           if (!res || !res.ok || !res.opened) {
@@ -288,14 +273,12 @@ function _settingsRenderTaskNotifications() {
   if (!cb.dataset.bound) {
     cb.addEventListener('change', async () => {
       _settingsState.taskNotificationsToggleEpoch += 1;
-      const startedAt = Date.now();
       const next = !!cb.checked;
       const currentState = _settingsState.taskNotifications || {
         enabled: true,
         permission: { state: 'unknown', can_open_settings: false },
       };
       const previous = !!currentState.enabled;
-      const targetState = next ? 'enabled' : 'disabled';
       const permissionState = _settingsTaskNotificationPermissionState(currentState);
       // Keep state aligned with the already-changed checkbox while persistence
       // is pending. A concurrent permission refresh can then render without
@@ -320,19 +303,12 @@ function _settingsRenderTaskNotifications() {
               : latestState.permission,
           };
           const savedPermissionState = _settingsTaskNotificationPermissionState(_settingsState.taskNotifications);
-          _settingsTrackEvent('task_notification_toggle_result', {
-            result: 'success',
-            enabled: savedEnabled,
-            target_state: targetState,
-            permission_state: savedPermissionState,
-            duration_ms: Math.max(0, Date.now() - startedAt),
-          });
           _settingsLog.info('task notification toggle saved', {
             previous_enabled: previous,
             enabled: savedEnabled,
             permission_state: savedPermissionState,
           });
-          _settingsReportTaskNotificationPermission('toggle_result');
+          _settingsLogTaskNotificationPermission('toggle_result');
         } else {
           const actualEnabled = res && res.ok ? savedEnabled : previous;
           _settingsState.taskNotifications = {
@@ -342,43 +318,19 @@ function _settingsRenderTaskNotifications() {
               ? _settingsNormalizeTaskNotificationPermission(res.permission)
               : latestState.permission,
           };
-          const actualPermissionState = _settingsTaskNotificationPermissionState(
-            _settingsState.taskNotifications,
-          );
           const mismatch = !!(res && res.ok);
-          _settingsTrackEvent('task_notification_toggle_result', {
-            result: 'failure',
-            enabled: actualEnabled,
-            target_state: targetState,
-            permission_state: actualPermissionState,
-            duration_ms: Math.max(0, Date.now() - startedAt),
-            error_type: 'persistence',
-            error_code: mismatch ? 'update_mismatch' : 'update_rejected',
-          });
           _settingsLog.warn('set task notifications rejected', {
             target_enabled: next,
             actual_enabled: actualEnabled,
             error_code: mismatch ? 'update_mismatch' : 'update_rejected',
           });
-          if (mismatch) _settingsReportTaskNotificationPermission('toggle_result');
+          if (mismatch) _settingsLogTaskNotificationPermission('toggle_result');
         }
       } catch (err) {
         _settingsState.taskNotifications = {
           ...(_settingsState.taskNotifications || currentState),
           enabled: previous,
         };
-        const actualPermissionState = _settingsTaskNotificationPermissionState(
-          _settingsState.taskNotifications,
-        );
-        _settingsTrackEvent('task_notification_toggle_result', {
-          result: 'failure',
-          enabled: previous,
-          target_state: targetState,
-          permission_state: actualPermissionState,
-          duration_ms: Math.max(0, Date.now() - startedAt),
-          error_type: 'ipc',
-          error_code: 'invoke_failed',
-        });
         _settingsLog.warn('set task notifications failed', {
           error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
         });
@@ -726,7 +678,7 @@ function _settingsRenderLocalExec() {
             const actual = res && res.ok && returnedMode ? returnedMode : prev;
             _settingsState.localExec = { mode: actual };
             _settingsRenderLocalExec();
-            _settingsTrackOperationResult(
+            _settingsLogOperationResult(
               'localexec_mode_change_result', startedAt, 'failure',
               { target_mode: next, actual_mode: actual },
               res && res.ok ? 'update_mismatch' : 'update_rejected',
@@ -735,7 +687,7 @@ function _settingsRenderLocalExec() {
         } catch (err) {
           _settingsState.localExec = { mode: prev };
           _settingsRenderLocalExec();
-          _settingsTrackOperationResult(
+          _settingsLogOperationResult(
             'localexec_mode_change_result', startedAt, 'failure',
             { target_mode: next, actual_mode: prev }, 'invoke_failed', 'ipc',
           );
@@ -818,12 +770,6 @@ function _settingsBindMetacognitionOnce() {
       if (epoch !== _settingsState.metacognitionToggleEpoch) return;
       if (res && res.ok) {
         _settingsState.metacognition = { ..._settingsState.metacognition, enabled: !!res.enabled };
-        _settingsTrackEvent('metacognition_toggle_result', {
-          result: 'success',
-          enabled: !!res.enabled,
-          target_enabled: next,
-          duration_ms: Math.max(0, Date.now() - startedAt),
-        });
       } else {
         // The initial preference read may have been in flight when the user
         // clicked. Its enabled value is intentionally ignored after the epoch
@@ -832,14 +778,6 @@ function _settingsBindMetacognitionOnce() {
         await _settingsRefreshMetacognition({ failureFallbackEnabled: previous });
         const actualEnabled = !!(_settingsState.metacognition && _settingsState.metacognition.enabled);
         _settingsLog.warn('setMetacognition rejected', { error_code: 'update_rejected' });
-        _settingsTrackEvent('metacognition_toggle_result', {
-          result: 'failure',
-          enabled: actualEnabled,
-          target_enabled: next,
-          duration_ms: Math.max(0, Date.now() - startedAt),
-          error_type: 'operation',
-          error_code: 'update_rejected',
-        });
       }
     } catch (err) {
       if (epoch !== _settingsState.metacognitionToggleEpoch) return;
@@ -847,14 +785,6 @@ function _settingsBindMetacognitionOnce() {
       const actualEnabled = !!(_settingsState.metacognition && _settingsState.metacognition.enabled);
       _settingsLog.warn('setMetacognition failed', {
         error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
-      });
-      _settingsTrackEvent('metacognition_toggle_result', {
-        result: 'failure',
-        enabled: actualEnabled,
-        target_enabled: next,
-        duration_ms: Math.max(0, Date.now() - startedAt),
-        error_type: 'ipc',
-        error_code: 'invoke_failed',
       });
     } finally {
       if (epoch === _settingsState.metacognitionToggleEpoch) {
@@ -906,28 +836,12 @@ function _settingsRenderDataRoot() {
         _settingsLog.warn('open data root failed', {
           error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
         });
-        _settingsTrackEvent('settings_open_data_root_result', {
-          result: 'failure',
-          duration_ms: Math.max(0, Date.now() - startedAt),
-          error_type: 'ipc',
-          error_code: 'invoke_failed',
-        });
         return;
       }
       if (!res || res.ok === false) {
         _settingsLog.warn('open data root rejected', { error_code: 'open_rejected' });
-        _settingsTrackEvent('settings_open_data_root_result', {
-          result: 'failure',
-          duration_ms: Math.max(0, Date.now() - startedAt),
-          error_type: 'operation',
-          error_code: 'open_rejected',
-        });
         return;
       }
-      _settingsTrackEvent('settings_open_data_root_result', {
-        result: 'success',
-        duration_ms: Math.max(0, Date.now() - startedAt),
-      });
     });
     btn.dataset.bound = '1';
   }
@@ -998,7 +912,154 @@ window.addEventListener('i18n-change', () => {
   _settingsRenderTtsEntries();
   _settingsRenderOrkasApiCard();
   _settingsRenderMetacognition();
+  _settingsRenderAddModalTitle();
 });
+
+// ── Models pane: purpose sub-tabs (对话 / 搜索 / 图片 / 视频 / 语音) ──
+// Pure view state — every list keeps its own container + render function, the
+// sub-tabs only decide which `[data-settings-model-panel]` is visible.
+
+const _SETTINGS_MODEL_KINDS = ['chat', 'search', 'image', 'video', 'tts'];
+
+function _settingsQueryAll(selector) {
+  if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return [];
+  return Array.from(document.querySelectorAll(selector) || []);
+}
+
+function _settingsBindModelTabsOnce() {
+  if (_settingsState.modelTabsBound) return;
+  const tabs = _settingsQueryAll('[data-settings-model-tab]');
+  if (!tabs.length) return;
+  _settingsState.modelTabsBound = true;
+  tabs.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      _settingsActivateModelTab(btn.dataset.settingsModelTab, { explicit: true });
+    });
+    btn.addEventListener('keydown', (e) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+      const list = _settingsQueryAll('[data-settings-model-tab]');
+      const idx = list.indexOf(btn);
+      if (idx < 0) return;
+      e.preventDefault();
+      const next = e.key === 'Home' ? 0
+        : e.key === 'End' ? list.length - 1
+          : (idx + (e.key === 'ArrowRight' ? 1 : -1) + list.length) % list.length;
+      _settingsActivateModelTab(list[next].dataset.settingsModelTab, { focus: true, explicit: true });
+    });
+  });
+  // Initial / programmatic activation does not represent a user navigation.
+  _settingsActivateModelTab(_settingsState.modelTab || 'chat');
+}
+
+function _settingsActivateModelTab(kind, opts = {}) {
+  const target = _SETTINGS_MODEL_KINDS.includes(kind) ? kind : 'chat';
+  // `click_settings_model_tab` — explicit user selection of a Models purpose
+  // sub-tab (mouse or arrow keys). Bounded payload: the purpose id only.
+  if (opts.explicit) {
+  }
+  _settingsState.modelTab = target;
+  _settingsQueryAll('[data-settings-model-tab]').forEach((btn) => {
+    const active = btn.dataset.settingsModelTab === target;
+    btn.classList.toggle('is-active', active);
+    btn.setAttribute('aria-selected', active ? 'true' : 'false');
+    btn.tabIndex = active ? 0 : -1;
+    if (active && opts.focus && typeof btn.focus === 'function') btn.focus();
+  });
+  _settingsQueryAll('[data-settings-model-panel]').forEach((panel) => {
+    panel.hidden = panel.dataset.settingsModelPanel !== target;
+  });
+}
+
+// ── Models pane: add dialog ──
+// The five add forms (#settings-picker-*, #settings-search-*, …) are mounted
+// permanently inside #settings-add-modal so their pickers are created once;
+// opening the dialog just reveals the form for `kind`. Success paths close it
+// (see _settingsCloseAddModal call sites); validation errors keep it open with
+// the inline status text.
+
+const _SETTINGS_ADD_STATUS_ID = {
+  chat: 'settings-picker-status',
+  search: 'settings-search-status',
+  image: 'settings-image-status',
+  video: 'settings-video-status',
+  tts: 'settings-tts-status',
+};
+
+function _settingsAddModalTitleKey(kind) {
+  return `settings.models.add_${_SETTINGS_MODEL_KINDS.includes(kind) ? kind : 'chat'}`;
+}
+
+function _settingsRenderAddModalTitle() {
+  const title = document.getElementById('settings-add-modal-title');
+  if (!title || !_settingsState.addModalKind) return;
+  const key = _settingsAddModalTitleKey(_settingsState.addModalKind);
+  if (title.dataset) title.dataset.i18n = key;
+  title.textContent = t(key);
+}
+
+function _settingsBindAddModalOnce() {
+  if (_settingsState.addModalBound) return;
+  const overlay = document.getElementById('settings-add-modal');
+  if (!overlay) return;
+  _settingsState.addModalBound = true;
+  _settingsQueryAll('[data-settings-add]').forEach((btn) => {
+    btn.addEventListener('click', () => _settingsOpenAddModal(btn.dataset.settingsAdd));
+  });
+  _settingsQueryAll('#settings-add-modal [data-settings-add-cancel]').forEach((btn) => {
+    btn.addEventListener('click', () => _settingsCloseAddModal());
+  });
+  const closeBtn = document.getElementById('settings-add-modal-close');
+  if (closeBtn) closeBtn.addEventListener('click', () => _settingsCloseAddModal());
+}
+
+function _settingsOpenAddModal(kind) {
+  if (!_SETTINGS_MODEL_KINDS.includes(kind)) return;
+  const overlay = document.getElementById('settings-add-modal');
+  if (!overlay) return;
+  _settingsState.addModalKind = kind;
+  _settingsQueryAll('#settings-add-modal [data-settings-add-form]').forEach((form) => {
+    form.hidden = form.dataset.settingsAddForm !== kind;
+  });
+  _settingsRenderAddModalTitle();
+  // A stale "added" / error line from the previous visit must not greet the
+  // user as if it described this attempt.
+  _settingsSetStatus(_SETTINGS_ADD_STATUS_ID[kind], '', '');
+  _settingsState.addModalReturnFocus = (typeof document !== 'undefined' && document.activeElement) || null;
+  _settingsOpenModal(overlay);
+  setTimeout(() => {
+    const first = typeof overlay.querySelector === 'function'
+      ? overlay.querySelector('[data-settings-add-form]:not([hidden]) .ai-select-trigger')
+      : null;
+    if (first && typeof first.focus === 'function') first.focus();
+  }, 0);
+}
+
+function _settingsCloseAddModal() {
+  const overlay = document.getElementById('settings-add-modal');
+  if (!overlay || !overlay.classList || !overlay.classList.contains('open')) return;
+  _settingsCloseModal(overlay);
+  _settingsState.addModalKind = '';
+  const back = _settingsState.addModalReturnFocus;
+  _settingsState.addModalReturnFocus = null;
+  if (back && typeof back.focus === 'function' && back.isConnected !== false) {
+    try { back.focus(); } catch (_) {}
+  }
+}
+
+// ── Cross-tab jumps from inside a pane (e.g. account › "管理数据" → 数据) ──
+
+function _settingsBindNavOnce() {
+  if (_settingsState.navBound) return;
+  const buttons = _settingsQueryAll('[data-settings-goto]');
+  if (!buttons.length) return;
+  _settingsState.navBound = true;
+  buttons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const tab = String(btn.dataset.settingsGoto || '');
+      if (tab && typeof window.activateSettingsTab === 'function') window.activateSettingsTab(tab);
+    });
+  });
+}
 
 async function _settingsRefreshProviders() {
   const res = await window.orkas.invoke('auth.listProviders');
@@ -1304,6 +1365,8 @@ function _settingsChooseAccountMethod(provider, modelId) {
     const body    = document.getElementById('add-account-body');
     const actions = document.getElementById('add-account-actions');
     if (!overlay || !title || !body || !actions) return;
+    // The picker dialog hands over to the credential dialog — never stack them.
+    _settingsCloseAddModal();
 
     title.textContent = t('settings.modal.add_account_title_with_provider', { provider: provider.label || provider.id });
     body.innerHTML = `
@@ -1349,6 +1412,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
   const actions = document.getElementById('add-account-actions');
   if (!overlay || !title || !body || !actions) return;
 
+  _settingsCloseAddModal();
   title.textContent = t('settings.modal.api_key_form_title', { provider: provider.label || provider.id });
   // docs_prefix has `{url}` which we fill with a marked-up span; escape the
   // surrounding text but keep the span as raw HTML.
@@ -1405,14 +1469,12 @@ function _settingsShowApiKeyForm(provider, modelId) {
     if (!resolvedModelId) {
       msg.textContent = t('settings.custom.error_model');
       msg.className = 'form-msg error';
-      _settingsTrackModelConfigResult(startedAt, 'add', 'api_key', 'blocked', 'model_required');
       modelInput?.focus();
       return;
     }
     if (!apiKey) {
       msg.textContent = t('settings.paste_key_first');
       msg.className = 'form-msg error';
-      _settingsTrackModelConfigResult(startedAt, 'add', 'api_key', 'blocked', 'api_key_required');
       return;
     }
     saveBtn.disabled = true;
@@ -1436,7 +1498,6 @@ function _settingsShowApiKeyForm(provider, modelId) {
       _settingsLog.warn('add api key failed', { provider: provider.id, error: addRes && addRes.error });
       return;
     }
-    _settingsTrackModelConfigResult(startedAt, 'add', 'api_key', 'success');
     saveBtn.disabled = false;
     _settingsCloseModal(overlay);
     await _settingsReload();
@@ -1531,6 +1592,9 @@ function _settingsShowCustomModelForm(provider) {
   const actions = document.getElementById('add-account-actions');
   if (!overlay || !title || !body || !actions) return;
 
+  // Hand over from the purpose-specific picker to the credential dialog.
+  // Keeping both overlays open traps focus behind the topmost dialog.
+  _settingsCloseAddModal();
   title.innerHTML = `
     <span class="modal-title-text">${escapeHtml(t('settings.custom.title'))}</span>
     <span class="form-hint custom-model-intro">${escapeHtml(t('settings.custom.compat_hint'))}</span>
@@ -1592,13 +1656,6 @@ function _settingsShowCustomModelForm(provider) {
     if (errorCode) {
       msg.textContent = _settingsCustomModelError(errorCode);
       msg.className = 'form-msg error';
-      _settingsTrackModelConfigResult(
-        startedAt,
-        'add',
-        'custom',
-        'blocked',
-        _settingsModelConfigValidationCode(errorCode),
-      );
       return;
     }
 
@@ -1621,16 +1678,8 @@ function _settingsShowCustomModelForm(provider) {
         model,
         error_code: addRes && addRes.code,
       });
-      _settingsTrackModelConfigResult(
-        startedAt,
-        'add',
-        'custom',
-        'failure',
-        _settingsResultErrorCode(addRes),
-      );
       return;
     }
-    _settingsTrackModelConfigResult(startedAt, 'add', 'custom', 'success');
     saveBtn.disabled = false;
     _settingsCloseModal(overlay);
     await _settingsReload();
@@ -1660,7 +1709,14 @@ function _settingsShowCustomModelForm(provider) {
 
 function _settingsOpenModal(overlay) {
   overlay.classList.add('open');
-  const onKey = (e) => { if (e.key === 'Escape') _settingsCloseModal(overlay, onKey); };
+  const onKey = (e) => {
+    if (e.key !== 'Escape') return;
+    // An open dropdown inside the dialog owns this Escape (it closes itself
+    // on the bubbling phase); only a second Escape dismisses the dialog.
+    if (typeof overlay.querySelector === 'function' && overlay.querySelector('.ai-select.open')) return;
+    if (overlay.id === 'settings-add-modal') _settingsCloseAddModal();
+    else _settingsCloseModal(overlay);
+  };
   overlay._onKey = onKey;
   document.addEventListener('keydown', onKey, true);
 }
@@ -1677,15 +1733,7 @@ function _settingsCloseModal(overlay) {
 
 let _oauthFlowPollTimer = null;
 let _oauthFlowId        = null;
-let _oauthFlowTarget    = null; // { provider, modelId }
-let _oauthFlowTelemetry = null;
-
-function _settingsFinishOAuthTelemetry(result, errorCode = '') {
-  if (!_oauthFlowTelemetry || _oauthFlowTelemetry.done) return;
-  const startedAt = _oauthFlowTelemetry.startedAt;
-  _oauthFlowTelemetry.done = true;
-  _settingsTrackModelConfigResult(startedAt, 'add', 'oauth', result, errorCode);
-}
+let _oauthFlowTarget    = null;
 
 async function _settingsStartOAuthFlow(provider, modelId) {
   const overlay   = document.getElementById('oauth-flow-modal');
@@ -1699,8 +1747,8 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   const oauthProviderId = provider.oauthProvider || provider.id;
   const aliased = oauthProviderId !== provider.id;
 
+  _settingsCloseAddModal();
   _oauthFlowTarget = { provider, modelId, oauthProviderId };
-  _oauthFlowTelemetry = { startedAt: Date.now(), done: false };
   title.textContent = t('settings.oauth.title_prefix', { provider: provider.label || provider.id });
   const aliasTip = aliased
     ? `<div class="oauth-flow-hint">${escapeHtml(t('settings.oauth.alias_tip', { provider: oauthProviderId }))}</div>`
@@ -1709,14 +1757,12 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   overlay.classList.add('open');
 
   const closeFlow = () => {
-    _settingsFinishOAuthTelemetry('cancelled', 'cancelled');
     if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
     if (_oauthFlowId) {
       window.orkas.invoke('auth.cancelOAuthFlow', { flowId: _oauthFlowId }).catch(() => {});
     }
     _oauthFlowId = null;
     _oauthFlowTarget = null;
-    _oauthFlowTelemetry = null;
     overlay.classList.remove('open');
     document.removeEventListener('keydown', onKey, true);
   };
@@ -1852,7 +1898,6 @@ function _oauthFlowRender(provider, status, closeFlow) {
           error_code: errorCode,
           ...logContext,
         });
-        _settingsFinishOAuthTelemetry('failure', errorCode);
       };
 
       if (!target || !target.modelId || !profileId) {
@@ -1899,7 +1944,6 @@ function _oauthFlowRender(provider, status, closeFlow) {
         });
         return;
       }
-      _settingsFinishOAuthTelemetry('success');
       closeFlow();
       await _settingsReload();
     })();
@@ -1909,7 +1953,6 @@ function _oauthFlowRender(provider, status, closeFlow) {
   if (status.kind === 'error') {
     body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml(status.error || t('settings.oauth.auth_failed'))}</div>`;
     if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
-    _settingsFinishOAuthTelemetry('failure', 'oauth_failed');
     return;
   }
 }
@@ -1982,18 +2025,10 @@ async function _settingsUpdateEntryModel(entry, model, modelSel) {
   if (!res || !res.ok) {
     const errorCode = _settingsResultErrorCode(res);
     _settingsLog.warn('model configuration update failed', { error_code: errorCode });
-    _settingsTrackModelConfigResult(
-      startedAt,
-      'update_model',
-      'existing',
-      'failure',
-      errorCode,
-    );
     await uiAlert((res && res.error) || t('settings.entries.switch_model_failed'));
     modelSel?.setValue(entry.model);
     return false;
   }
-  _settingsTrackModelConfigResult(startedAt, 'update_model', 'existing', 'success');
   await _settingsReload();
   return true;
 }
@@ -2146,6 +2181,41 @@ async function _settingsAttachReorderDnd(row, opts) {
   handle.title = t('settings.entries.drag_title');
   handle.textContent = '⋮⋮';
   row.prepend(handle);
+  // Keyboard / pointer alternative to dragging: ↑ ↓ move the row one slot
+  // through the same reorder IPC, so the persisted order contract is shared.
+  const orderIds = getIds();
+  const orderIdx = orderIds.indexOf(id);
+  const sort = document.createElement('div');
+  sort.className = 'entry-sort';
+  const makeSortButton = (delta, labelKey, glyph) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'entry-sort-btn';
+    btn.textContent = glyph;
+    btn.title = t(labelKey);
+    btn.setAttribute('aria-label', t(labelKey));
+    btn.disabled = orderIdx < 0
+      || (delta < 0 ? orderIdx === 0 : orderIdx >= orderIds.length - 1);
+    btn.addEventListener('mousedown', (e) => e.stopPropagation());
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (btn.disabled) return;
+      btn.disabled = true;
+      try {
+        await _settingsMoveEntry(opts, delta);
+      } finally {
+        const currentIds = getIds();
+        const currentIdx = currentIds.indexOf(id);
+        btn.disabled = currentIdx < 0
+          || (delta < 0 ? currentIdx === 0 : currentIdx >= currentIds.length - 1);
+      }
+    });
+    return btn;
+  };
+  sort.appendChild(makeSortButton(-1, 'settings.entries.move_up', '↑'));
+  sort.appendChild(makeSortButton(1, 'settings.entries.move_down', '↓'));
+  sort.setAttribute('draggable', 'false');
+  row.appendChild(sort);
   row.addEventListener('dragstart', (e) => {
     _settingsState.dragState = { kind, id };
     row.classList.add('dragging');
@@ -2195,6 +2265,31 @@ async function _settingsAttachReorderDnd(row, opts) {
   });
 }
 
+// Move `opts.id` by `delta` slots (−1 up / +1 down) within its list. Reads the
+// current id order at click time like the drop handler does, so a stale row
+// (re-rendered since attach) can never write an outdated order.
+async function _settingsMoveEntry(opts, delta) {
+  const { id, getIds, ipcName, onSuccess } = opts;
+  const ids = [...getIds()];
+  const idx = ids.indexOf(id);
+  const target = idx + delta;
+  if (idx < 0 || target < 0 || target >= ids.length) return false;
+  ids.splice(idx, 1);
+  ids.splice(target, 0, id);
+  let res = null;
+  try {
+    res = await window.orkas.invoke(ipcName, { orderedIds: ids });
+  } catch (_) {
+    res = { ok: false, code: 'invoke_failed' };
+  }
+  if (res && res.ok) {
+    await onSuccess(res);
+    return true;
+  }
+  await uiAlert((res && res.error) || t('settings.entries.reorder_failed'));
+  return false;
+}
+
 async function _settingsTestEntry(entry, statusEl) {
   _settingsSetRowStatus(statusEl, 'busy', t('settings.entries.testing'), 'entry-status');
   const res = await window.orkas.invoke('auth.testConnection', {
@@ -2226,17 +2321,9 @@ async function _settingsRemoveEntry(entry) {
   catch (_) { res = { ok: false, code: 'invoke_failed' }; }
   if (!res || !res.ok) {
     _settingsLog.warn('remove entry failed', { entry_id: entry.entryId, error: res && res.error });
-    _settingsTrackModelConfigResult(
-      startedAt,
-      'remove',
-      'existing',
-      'failure',
-      _settingsResultErrorCode(res),
-    );
     await uiAlert((res && res.error) || t('settings.entries.delete_failed'));
     return;
   }
-  _settingsTrackModelConfigResult(startedAt, 'remove', 'existing', 'success');
   await _settingsReload();
 }
 
@@ -2355,6 +2442,7 @@ async function _settingsClickAddSearchKey() {
     }
     if (input) input.value = '';
     _settingsSetStatus('settings-search-status', 'ok', t('settings.search.add_ok'));
+    _settingsCloseAddModal();
     await _settingsRefreshSearchProfiles();
     _settingsRenderSearchEntries();
   } catch (err) {
@@ -2500,6 +2588,7 @@ async function _settingsClickAddImageKey() {
     }
     if (input) input.value = '';
     _settingsSetStatus('settings-image-status', 'ok', t('settings.image.add_ok'));
+    _settingsCloseAddModal();
     await _settingsRefreshImageProfiles();
     _settingsRenderImageEntries();
   } catch (err) {
@@ -2623,7 +2712,6 @@ function _settingsRenderVideoPicker() {
       placeholder: t('settings.video.pick_provider'),
     });
     _settingsState.videoProviderSel.onChange((provider) => {
-      _settingsTrackModelProviderSelect('video_auth_picker', provider);
       _settingsSetStatus('settings-video-status', '', '');
     });
   }
@@ -2658,6 +2746,7 @@ async function _settingsClickAddVideoKey() {
     }
     if (input) input.value = '';
     _settingsSetStatus('settings-video-status', 'ok', t('settings.video.add_ok'));
+    _settingsCloseAddModal();
     await _settingsRefreshVideoProfiles();
     _settingsRenderVideoEntries();
   } catch (err) {
@@ -2861,6 +2950,7 @@ async function _settingsClickAddTts() {
     const keyInput = document.getElementById('settings-tts-key-input');
     if (keyInput) keyInput.value = '';
     _settingsSetStatus('settings-tts-status', 'ok', t('settings.tts.add_ok'));
+    _settingsCloseAddModal();
     await _settingsRefreshTtsProfiles();
   } catch (err) {
     const failure = _settingsTtsAddFailure(err);

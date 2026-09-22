@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>霓虹贪吃蛇</title>
+  <style>
+    :root { color-scheme: dark; --bg:#09111f; --panel:#111d31; --line:#254264; --text:#eaf5ff; --muted:#91a9c5; --mint:#54f4bd; --cyan:#58c7ff; --danger:#ff6b8d; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; font-family: Inter, ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: radial-gradient(circle at 50% 0%, #19365d 0%, var(--bg) 48%, #050911 100%); color:var(--text); display:grid; place-items:center; padding:24px; }
+    .app { width:min(100%, 680px); }
+    header { display:flex; align-items:end; justify-content:space-between; gap:20px; margin-bottom:18px; }
+    h1 { margin:0; font-size:clamp(1.7rem, 5vw, 2.7rem); letter-spacing:-.06em; }
+    .eyebrow { margin:0 0 4px; color:var(--mint); font-size:.78rem; font-weight:800; letter-spacing:.16em; text-transform:uppercase; }
+    .best { color:var(--muted); font-size:.9rem; text-align:right; }
+    .best strong { display:block; color:var(--text); font-size:1.45rem; }
+    .game-card { background:linear-gradient(145deg, rgba(23,39,65,.97), rgba(10,20,36,.97)); border:1px solid rgba(119,183,255,.22); border-radius:24px; padding:clamp(14px, 3vw, 24px); box-shadow:0 24px 60px #0008; }
+    .hud { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; }
+    .score { font-weight:700; color:var(--muted); } .score b { color:var(--mint); font-size:1.65rem; margin-left:7px; }
+    .status { border:1px solid var(--line); color:var(--cyan); border-radius:999px; padding:6px 10px; font-size:.78rem; font-weight:800; }
+    .board-wrap { position:relative; width:min(100%, 560px); margin:auto; }
+    canvas { display:block; width:100%; aspect-ratio:1; background:#07111e; border:1px solid #2e537a; border-radius:16px; image-rendering:pixelated; box-shadow: inset 0 0 36px #1a6ca61c; }
+    .overlay { position:absolute; inset:0; display:grid; place-items:center; padding:30px; text-align:center; background:#07111eaa; border-radius:16px; backdrop-filter:blur(3px); }
+    .overlay[hidden] { display:none; }
+    .overlay h2 { margin:0 0 7px; font-size:1.75rem; } .overlay p { color:var(--muted); margin:0; }
+    .controls { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:18px; }
+    button, select { font:inherit; }
+    button { min-height:46px; cursor:pointer; color:var(--text); border:1px solid #3c5d81; border-radius:12px; background:#172a44; font-weight:800; transition:transform .15s, background .15s; }
+    button:hover { background:#223b5f; } button:active { transform:translateY(1px); } button:focus-visible, select:focus-visible { outline:3px solid var(--mint); outline-offset:2px; }
+    .primary { background:linear-gradient(120deg, #1fbb91, #1684a9); border:0; } .primary:hover { background:linear-gradient(120deg, #31ce9f, #249cc6); }
+    .settings { display:flex; align-items:center; justify-content:space-between; gap:14px; margin-top:14px; padding:12px 0 0; border-top:1px solid #294562; color:var(--muted); font-weight:700; }
+    select { background:#0b1829; color:var(--text); border:1px solid #3c5d81; border-radius:9px; padding:8px 10px; }
+    .dpad { width:198px; margin:21px auto 0; display:grid; grid-template-columns:repeat(3, 60px); grid-template-rows:repeat(2, 54px); gap:7px; justify-content:center; }
+    .dpad button { font-size:1.35rem; min-height:54px; } .up { grid-column:2; } .left { grid-column:1; grid-row:2; } .down { grid-column:2; grid-row:2; } .right { grid-column:3; grid-row:2; }
+    .help { text-align:center; color:var(--muted); font-size:.86rem; margin:17px 0 0; }
+    @media (max-width:460px) { body{padding:14px} header{align-items:start} .best strong{font-size:1.2rem} .game-card{border-radius:18px} }
+    @media (prefers-reduced-motion:reduce) { *,*::before,*::after { transition:none!important; } }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header><div><p class="eyebrow">Classic arcade</p><h1>霓虹贪吃蛇</h1></div><div class="best">最高分<strong id="bestScore">0</strong></div></header>
+    <section class="game-card" aria-label="贪吃蛇游戏">
+      <div class="hud"><div class="score">分数 <b id="score">0</b></div><div class="status" id="status" aria-live="polite">准备开始</div></div>
+      <div class="board-wrap"><canvas id="game" width="600" height="600" aria-label="游戏区域。使用方向键或方向按钮控制蛇。"></canvas><div class="overlay" id="overlay"><div><h2 id="overlayTitle">准备好了吗？</h2><p id="overlayText">按方向键或点击方向按钮开始</p></div></div></div>
+      <div class="controls"><button class="primary" id="pauseBtn" type="button">暂停</button><button id="restartBtn" type="button">重新开始</button></div>
+      <label class="settings" for="difficulty">难度 <select id="difficulty" aria-label="选择游戏难度"><option value="180">悠闲</option><option value="120" selected>标准</option><option value="75">极速</option></select></label>
+      <div class="dpad" aria-label="屏幕方向控制"><button class="up" data-dir="up" aria-label="向上">↑</button><button class="left" data-dir="left" aria-label="向左">←</button><button class="down" data-dir="down" aria-label="向下">↓</button><button class="right" data-dir="right" aria-label="向右">→</button></div>
+      <p class="help">方向键 / 屏幕按钮控制 · 空格键暂停或继续</p>
+    </section>
+  </main>
+<script>
+(() => {
+  const canvas = document.querySelector('#game'), ctx = canvas.getContext('2d');
+  const scoreEl = document.querySelector('#score'), bestEl = document.querySelector('#bestScore'), statusEl = document.querySelector('#status');
+  const overlay = document.querySelector('#overlay'), overlayTitle = document.querySelector('#overlayTitle'), overlayText = document.querySelector('#overlayText');
+  const pauseBtn = document.querySelector('#pauseBtn'), difficulty = document.querySelector('#difficulty');
+  const size = 20, cells = 20;
+  let snake, food, dir, nextDir, score, timer, running, paused, hasStarted;
+  let best = Number(localStorage.getItem('neon-snake-best') || 0); bestEl.textContent = best;
+  const dirs = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0} };
+  function randomFood() { let f; do { f={x:Math.floor(Math.random()*cells),y:Math.floor(Math.random()*cells)}; } while(snake.some(s=>s.x===f.x&&s.y===f.y)); return f; }
+  function setMessage(title, text) { overlayTitle.textContent=title; overlayText.textContent=text; overlay.hidden=false; }
+  function draw() {
+    ctx.clearRect(0,0,canvas.width,canvas.height); ctx.fillStyle='#07111e'; ctx.fillRect(0,0,600,600);
+    ctx.strokeStyle='rgba(107,172,230,.10)'; ctx.lineWidth=1; for(let i=0;i<=cells;i++){ctx.beginPath();ctx.moveTo(i*size,0);ctx.lineTo(i*size,600);ctx.stroke();ctx.beginPath();ctx.moveTo(0,i*size);ctx.lineTo(600,i*size);ctx.stroke();}
+    ctx.fillStyle='#ff597c'; ctx.beginPath(); ctx.arc((food.x+.5)*size,(food.y+.5)*size,7,0,Math.PI*2); ctx.fill();
+    snake.forEach((part,i)=>{ctx.fillStyle=i===0?'#8effda':'#35c99a';ctx.fillRect(part.x*size+2,part.y*size+2,size-4,size-4);});
+  }
+  function tick() { if(!running || paused) return; dir=nextDir; const head={x:snake[0].x+dir.x,y:snake[0].y+dir.y};
+    if(head.x<0||head.x>=cells||head.y<0||head.y>=cells||snake.some(s=>s.x===head.x&&s.y===head.y)){ end(); return; }
+    snake.unshift(head); if(head.x===food.x&&head.y===food.y){score+=10; scoreEl.textContent=score; food=randomFood(); if(score>best){best=score;bestEl.textContent=best;localStorage.setItem('neon-snake-best',best);} } else snake.pop(); draw();
+  }
+  function begin() { if(!hasStarted){hasStarted=true; overlay.hidden=true; statusEl.textContent='进行中';} if(!running){running=true; clearInterval(timer); timer=setInterval(tick,Number(difficulty.value));} }
+  function changeDirection(name) { const d=dirs[name]; if(!d) return; if(d.x===-dir.x && d.y===-dir.y) return; nextDir=d; begin(); statusEl.textContent=`进行中 · 向${{up:'上',down:'下',left:'左',right:'右'}[name]}`; }
+  function end(){running=false;clearInterval(timer);statusEl.textContent='游戏结束';pauseBtn.textContent='暂停';setMessage('游戏结束',`本局得分 ${score}，点击“重新开始”再来一局`);}
+  function restart(){clearInterval(timer); snake=[{x:10,y:10},{x:9,y:10},{x:8,y:10}]; dir=dirs.right; nextDir=dirs.right; food=randomFood(); score=0;scoreEl.textContent=0;running=false;paused=false;hasStarted=false;pauseBtn.textContent='暂停';statusEl.textContent='已重新开始';setMessage('准备好了吗？','按方向键或点击方向按钮开始');draw();}
+  function togglePause(){ if(!hasStarted||!running){ statusEl.textContent='请先选择方向开始'; return; } paused=!paused; pauseBtn.textContent=paused?'继续':'暂停';statusEl.textContent=paused?'已暂停':'进行中'; if(paused) setMessage('已暂停','点击“继续”或按空格键回到游戏'); else {overlay.hidden=true;} }
+  document.addEventListener('keydown',e=>{const map={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right'}; if(map[e.key]){e.preventDefault();changeDirection(map[e.key]);} if(e.code==='Space'){e.preventDefault();togglePause();}});
+  document.querySelectorAll('[data-dir]').forEach(b=>b.addEventListener('click',()=>changeDirection(b.dataset.dir)));
+  pauseBtn.addEventListener('click',togglePause); document.querySelector('#restartBtn').addEventListener('click',restart);
+  difficulty.addEventListener('change',()=>{ const label=difficulty.options[difficulty.selectedIndex].text; statusEl.textContent=`难度：${label}`; if(running&&!paused){clearInterval(timer);timer=setInterval(tick,Number(difficulty.value));}});
+  restart();
+})();
+</script>
+</body>
+</html>

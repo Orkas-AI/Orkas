@@ -1,8 +1,8 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-edit
-description_zh: 真实素材的智能编辑知识——先用转写/OCR/镜头/静音/质量/视觉证据理解视频，再选择确定性时间线编辑或受约束的语义 AI 编辑；clip-factory、蒙太奇、二创和局部内容修改的核心。
-description_en: Intelligent editing knowledge for real footage: understand it through transcript/OCR/scene/silence/quality/vision evidence, then choose deterministic timeline editing or constrained semantic AI editing; core of repurpose, montage, cleanup, and local content changes.
+description_zh: 真实素材的智能编辑知识——先用转写/镜头/静音/质量/视觉证据理解视频，再选择确定性时间线编辑或受约束的语义 AI 编辑；clip-factory、蒙太奇、二创和局部内容修改的核心。
+description_en: Intelligent editing knowledge for real footage: understand it through transcript/scene/silence/quality/vision evidence, then choose deterministic timeline editing or constrained semantic AI editing; core of repurpose, montage, cleanup, and local content changes.
 ---
 
 # stage-edit
@@ -13,17 +13,34 @@ How to intelligently edit **real user-supplied footage** while keeping the sourc
 
 **Where the footage comes from.** A user-uploaded clip arrives as a chat attachment marked `model_readable="false"` with a `path` (see the attachment list). That flag means "not vision input", NOT "unusable" — the file is exactly what these media scripts operate on. Copy it into the project's `raw/` (or pass its attachment path directly as `--input`) before probing; never treat a `model_readable="false"` clip as something to skip.
 
+For semantic model edits, apply [production-method.md](../video-router/references/production-method.md) before source analysis and delivery checks. EDIT does not imply local assembly: one directly delivered semantic edit has `is_generation:true`; follow its lightweight input and output checks. The deterministic loop and local audio mastering below apply only when actually performing local edits.
+
+## Captions on an existing generated video
+
+A follow-up on a video with a production plan stays with that plan, even when the
+change is small. For caption-only changes to one completed generated clip, keep
+its original generate segment and update `tracks.captions.lines` with exact text,
+`start_sec` and `target_sec`. Author only the requested delta. Use the existing
+Gate B amendment with the current user instruction as authorization, then call
+`video_studio` with `op:"production.edit"` and `plan_path`. The host reuses the
+recorded original footage, runs the existing subtitle engine, registers a new
+output and writes the final locator. Repeat caption revisions use that original
+footage, never the previous burned-in caption version. Read the returned output
+path and check it with `production.status` before presenting it. Do not use the
+standalone edit script or regenerate footage for this case. Other EDL operations
+and standalone trims/concats keep the paths below.
+
 ## Intelligent edit contract
 
 Write `project/plan.json::edit_strategy` whenever VideoStudio decides what to change rather than merely executing user-supplied timecodes:
 
-- `mode`: `deterministic` for transcript/OCR/scene/silence/quality/vision-driven timeline decisions, `semantic` for AI pixel changes, or `mixed` when both are necessary.
+- `mode`: `deterministic` for transcript/scene/silence/quality/vision-driven timeline decisions, `semantic` for AI pixel changes, or `mixed` when both are necessary.
 All four fields below are non-empty arrays of strings — one entry per item,
 never a single sentence. `objectives` is the one most often written as prose;
 the validator rejects a bare string with `E_EDIT_STRATEGY_BOUNDARY`.
 
 - `objectives`: the exact editorial or pixel-level changes requested, one per entry.
-- `decision_signals`: the provenance list of evidence actually used (`timecode`, `transcript`, `ocr`, `scene`, `silence`, `quality`, `vision`, `semantic_model`). Include each supplied or analyzed signal that supports the decision, not only the signal used to execute it.
+- `decision_signals`: the provenance list of evidence actually used (`timecode`, `transcript`, `scene`, `silence`, `quality`, `vision`, `semantic_model`). Include each supplied or analyzed signal that supports the decision, not only the signal used to execute it.
 - `preserve` and `may_change`: non-overlapping boundaries. `may_change` must name every class of change the user authorized — omitting one silently narrows the plan's declared authority below what they asked for.
 
 Declare every source/reference image or video in top-level `references` with `media_type`, reproduce/edit/guide intent, `intent_basis`, roles, required state, preserve/may-change, and target segment ids. This applies to deterministic trims/highlights as well as semantic edits: `spec.input_id` and `edit_strategy` do not replace the top-level source contract. User-declared requirements override defaults; only an unspecified reference defaults to guide/inferred. Video reproduce/edit/motion/timing contracts need one `{source_start_sec,source_end_sec,target_segment_id}` temporal anchor for every targeted segment. A semantic video edit is represented as `source:"generate"`, `media_kind:"video"`, `operation:"edit"`, with the original in `reference_video_paths`/`reference_video_urls`; it still belongs to the EDIT workflow and its count enters Gate C.
@@ -35,7 +52,7 @@ Use these `run-skill` entry points whenever this document says `stage-edit edit_
 ```bash
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op probe --input raw/clip.mp4
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op trim --input raw/clip.mp4 --start 12 --duration 8 --output project/cuts/seg-1.mp4
-"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit analyze_media -- --op ocr --input raw/screen-recording.mp4
+"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op extract_frame --input raw/screen-recording.mp4 --start 3 --output project/frames/screen-3s.png
 ```
 
 The scripts return JSON. A non-zero exit means the operation failed; fix the input/plan before proceeding.
@@ -52,7 +69,7 @@ The scripts return JSON. A non-zero exit means the operation failed; fix the inp
 For every plan-backed follow-up, start with `production.status` and compare the
 requested delta with the signed EDL. A caption typo/translation, one narration
 line, one cut, or one output in a multi-output batch invalidates only that
-entry and outputs derived from it. Reuse the source probe, transcript/OCR,
+entry and outputs derived from it. Reuse the source probe, transcript and observed frames,
 unaffected cuts, audio, and sibling outputs; do not retranscribe or re-run a
 semantic/billable edit unless its signed input actually changed. A replacement
 source clip is different: re-probe and regenerate evidence for that source,
@@ -65,7 +82,7 @@ recorded byte SHA-256, keep its signed logical source identity and approved EDL
 unchanged. Record the new physical path under the plan's excluded
 `_runtime.asset_locators` envelope with the verified hash, and pass that
 resolved path to `stage-edit edit_video`; do not rewrite the signed
-`spec.input_id`, open the gate resolver, re-probe, retranscribe, or re-run OCR.
+`spec.input_id`, open the gate resolver, re-probe, retranscribe, or re-inspect unchanged frames.
 `production.status` reports the approval facts but there is no
 `production.reconcile` call. Refresh the locator record, rebuild only outputs
 that were paused by the missing source, run the complete-draft QA, and continue
@@ -81,18 +98,7 @@ next action instead of a generic recovery form.
 ## The deterministic editing loop
 
 1. **Ingest — always probe first.** For every input clip, read its metadata (duration, resolution, fps, codecs). Never plan a cut blind; a `trim` past the real duration produces an empty or broken clip. (Orkas: `stage-edit edit_video --op probe`.)
-2. **Plan — write an `edit_decisions` timeline.** From the user's intent + the probe results, decide the exact segments and order, and write them to `project/edit_plan.json` so the plan is inspectable and re-runnable. Shape:
-   ```json
-   {
-     "segments": [
-       { "input": "raw/clipA.mp4", "start": 12.0, "duration": 8.0 },
-       { "input": "raw/clipB.mp4", "start": 0.0,  "duration": 5.5 }
-     ],
-     "subtitles": "raw/captions.srt",
-     "overlay": { "media": "assets/logo.png", "x": 40, "y": 40 }
-   }
-   ```
-   Every `start`/`duration` must be inside the probed duration of its input.
+2. **Plan — use the canonical EDL.** For plan-backed work, record the chosen cuts, order, captions, and overlays in `project/plan.json` using `stage-plan`'s schema, then follow the Gate B transition owned by `gate-control`. Keep each `spec.in_sec`/`spec.out_sec` within its probed source duration. For a one-shot deterministic trim or concat, use the requested timecodes directly and write no plan.json.
 3. **Execute in order.**
    - `trim` each segment to its own file (`project/cuts/seg-1.mp4`, ...).
    - `concat` the cut files (in plan order) into one (`project/render/edited.mp4`).
@@ -130,7 +136,7 @@ Per repurpose/montage line:
 
 ## Rules
 
-- **Timecodes come from the user, from probe, from a transcript, or from on-screen text (OCR) — never guessed.** If the target moment can't be located deterministically (no timecode, no transcript/OCR match), ask the user for the timestamp.
+- **Timecodes come from the user, probe, a transcript, or inspected frames with recorded extraction times — never guessed.** A sampled frame proves only that moment; inspect nearby frames to locate a transition. If the target moment remains unclear, ask the user for the timestamp.
 - **Layer composition over footage when the brief needs designed elements** (animated lower-thirds, kinetic captions, hooks): produce those with the composition skill as an overlay/element and `overlay` them, rather than trying to draw them in ffmpeg.
 - **One output file** at the end; intermediate cuts live under `project/cuts/` and are not the deliverable.
 

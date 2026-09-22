@@ -13,7 +13,31 @@ const EXTRA_RESOURCES_CONTRACT = Object.freeze({
   runtime: 'target-runtime-gate',
   builtin: 'builtin-resource-contract',
   officecli: 'officecli-release-gate',
+  'xls-reader': 'pinned-offline-resource',
   '.': 'mac-localized-metadata',
+});
+
+const XLS_READER_CONTRACT = Object.freeze({
+  "kind": "xls-reader",
+  "id": "2.0.2",
+  "source": "https://pypi.org/project/xlrd/2.0.2/",
+  "files": [
+    {
+      "name": "LICENSE",
+      "bytes": 3771,
+      "sha256": "b5a5dbce60265e305a815a6cb83ed07f24519d8ba644f2a307994488bced8815"
+    },
+    {
+      "name": "read.py",
+      "bytes": 3179,
+      "sha256": "ef70f29110c9b0e7b622865a912e69fd3cb5ae1ffad37ea347a6666e92a7e341"
+    },
+    {
+      "name": "xlrd-2.0.2-py2.py3-none-any.whl",
+      "bytes": 96555,
+      "sha256": "ea762c3d29f4cca48d82df517b6d89fbce4db3107f9d78713e48cd321d5c9aa9"
+    }
+  ]
 });
 
 const EMBEDDING_MODEL_CONTRACT = Object.freeze({
@@ -54,6 +78,43 @@ const MAC_LOCALIZED_METADATA_CONTRACT = Object.freeze([
       NSMicrophoneUsageDescription: 'Orkas 需要使用麦克风进行语音输入。',
     }),
   }),
+  Object.freeze({
+    directory: "es.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas usa el micrófono para la entrada de voz.",
+    }),
+  }),
+  Object.freeze({
+    directory: "fr.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas utilise le microphone pour la saisie vocale.",
+    }),
+  }),
+  Object.freeze({
+    directory: "ko.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas는 음성 입력에 마이크를 사용합니다.",
+    }),
+  }),
+  Object.freeze({
+    directory: "de.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas verwendet das Mikrofon für die Spracheingabe.",
+    }),
+  }),
+  Object.freeze({
+    directory: "ru.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas использует микрофон для голосового ввода.",
+    }),
+  }),
+  Object.freeze({
+    directory: "it.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas usa il microfono per l’inserimento vocale.",
+    }),
+  }),
+
 ]);
 
 const MAC_LOCALIZED_METADATA_FILTERS = Object.freeze(
@@ -190,6 +251,10 @@ function verifyResourceContract(resourceRoot, contract) {
   return `resource:${contract.kind}:${contract.id}`;
 }
 
+function verifyXlsReaderRoot(resourceRoot) {
+  return verifyResourceContract(resourceRoot, XLS_READER_CONTRACT);
+}
+
 function verifyEmbeddingModelRoot(resourceRoot) {
   return verifyResourceContract(resourceRoot, EMBEDDING_MODEL_CONTRACT);
 }
@@ -239,7 +304,7 @@ function requiredMacLocalizedMetadataVerificationEntries() {
 }
 
 function requiredPackagedResourceVerificationEntries() {
-  return [`resource:embedding-model:${EMBEDDING_MODEL_CONTRACT.id}`];
+  return [`resource:embedding-model:${EMBEDDING_MODEL_CONTRACT.id}`, `resource:xls-reader:${XLS_READER_CONTRACT.id}`];
 }
 
 function verifyExtraResourcesConfig(extraResources) {
@@ -281,6 +346,8 @@ function verifyExtraResourcesConfig(extraResources) {
 }
 
 module.exports = {
+  XLS_READER_CONTRACT,
+  verifyXlsReaderRoot,
   EMBEDDING_MODEL_CONTRACT,
   EXTRA_RESOURCES_CONTRACT,
   MAC_LOCALIZED_METADATA_CONTRACT,

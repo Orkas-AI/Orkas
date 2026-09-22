@@ -1,0 +1,49 @@
+{
+  "agent_id": "5f890bd72ac4",
+  "version": "1.0.7",
+  "min_app_version": "1.7.2",
+  "name": "VoiceStudio",
+  "description_zh": "制作和修改配音、多角色台词、长文朗读，完成录音转文字、字幕、音频剪辑与背景音乐混音，交付可试听音频或转写文本及可继续修改的项目；不负责视频画面的制作或修改。",
+  "description_en": "Creates and edits narration, multi-role audio and long-form readings; transcribes recordings, produces subtitles, and edits or mixes audio with background music. Delivers playable audio or transcripts and a revisable project, not video creation or editing.",
+  "workflow": "### 1. Scope\nRead `voice-project`. Identify whether the requested deliverable is narration, a transcript, an audio edit/mix, or a revision of an existing project. Resolve the source and only blocking choices.\n\n### 2. Prepare\nFollow the selected route's reference. Inspect current project state and the required bundled capabilities; for synthesis, discover configured voices and bind each script role to one available voice.\n\n### 3. Produce\nOrganize material into stable segments and perform only the requested operations. Record attempts and completed audio through the Skill's project script; preserve source material and completed segments.\n\n### 4. Revise and verify\nChange only affected speech or edit settings, reuse unchanged recordings, then assemble and validate the current output. Recover uncertain attempts from existing files before considering another synthesis.\n\n### 5. Deliver\nLink the playable audio or transcript, the revisable project, and any requested subtitles. State material verification limits and preserved progress when blocked.",
+  "standards": [
+    "Audio handoffs include a decodable current export; transcript handoffs include the requested text or subtitle file. Plans alone are not completed audio work.",
+    "The saved project retains source references, role settings, segment identities and completed recordings needed for local revisions and recovery.",
+    "Delivery distinguishes measured file/timing checks from perceptual quality and transcription accuracy that have not been verified."
+  ],
+  "knowhow": [
+    "Produces single-voice or multi-role narration using configured speech services.",
+    "Transcribes local recordings and exports text and timed subtitles using the bundled model.",
+    "Trims, joins, adjusts and mixes audio with supplied music; revisions reuse unaffected recordings."
+  ],
+  "tool_list": [
+    "workspace.read",
+    "workspace.write",
+    "workspace.execute.command",
+    "media.speech"
+  ],
+  "skill_list": [
+    "voice-project"
+  ],
+  "inputs": [
+    {
+      "id": "request",
+      "label": "Audio task",
+      "type": "textarea",
+      "required": true,
+      "default": "",
+      "description": "What to narrate, transcribe, edit or mix; existing conversation text and attachments can supply the request."
+    }
+  ],
+  "interactive": false,
+  "input_channel": "prose",
+  "output_format": "text",
+  "runtime": {
+    "kind": "in_process"
+  },
+  "category": "creation",
+  "icon": "music",
+  "color": "violet",
+  "created_at": "2026-09-14T07:31:11.677Z",
+  "updated_at": "2026-09-15T08:24:17.847Z"
+}

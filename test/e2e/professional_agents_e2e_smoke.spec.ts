@@ -1,10 +1,11 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import type { Page } from '@playwright/test';
 import { expect, test } from './fixtures/orkas';
 
 const BUILTIN_AGENTS = [
   { agent_id: '173d4235a431', name: 'ContentWriter' },
+  { agent_id: '5f890bd72ac4', name: 'VoiceStudio' },
   { agent_id: '78900d8758bc', name: 'DeepResearcher' },
   { agent_id: '79df9cc89f5f', name: 'VideoStudio' },
   { agent_id: '814b61b027f0', name: 'ImageStudio' },
@@ -77,6 +78,48 @@ test.describe('shipped professional agents', () => {
         timeout: 30_000,
       },
     ).toEqual(BUILTIN_AGENTS);
+  });
+
+  test('runs VoiceStudio local audio through its installed private Skill', async ({ modelOrkas }) => {
+    if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = modelOrkas.page;
+    const sampleRate = 16000, samples = sampleRate;
+    const wav = Buffer.alloc(44 + samples * 2);
+    wav.write('RIFF', 0); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVEfmt ', 8);
+    wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+    wav.writeUInt32LE(sampleRate, 24); wav.writeUInt32LE(sampleRate * 2, 28);
+    wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write('data', 36); wav.writeUInt32LE(samples * 2, 40);
+    for (let i = 0; i < samples; i++) wav.writeInt16LE(Math.round(Math.sin(i * 2 * Math.PI * 440 / sampleRate) * 8000), 44 + i * 2);
+    const source = modelOrkas.createWorkspaceFile('voice-studio-e2e/sources/tone.wav', wav);
+    const project = modelOrkas.createWorkspaceFile('voice-studio-e2e/voice-project.json', JSON.stringify({
+      schema_version: 1, roles: {}, segments: [{ id: 'recording', path: 'sources/tone.wav', gap_after_sec: 0.25 }],
+    }));
+    const request = modelOrkas.createWorkspaceFile('voice-studio-e2e/render.json', JSON.stringify({ project, format: 'wav' }));
+    const quotedRequest = process.platform === 'win32'
+      ? "'" + request.replace(/'/g, "''") + "'"
+      : "'" + request.replace(/'/g, "'\"'\"'") + "'";
+    const command = process.platform === 'win32'
+      ? `& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" voice-project audio -- render ${quotedRequest}`
+      : `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" voice-project audio -- render ${quotedRequest}`;
+    modelOrkas.setBashSequenceScenario([command], 'E2E VoiceStudio local audio exported.');
+    await selectBuiltinAgent(page, '5f890bd72ac4');
+    await expect(page.locator('#new-chat-recipient-name')).toHaveText('VoiceStudio');
+    await fillSelectedAgentPrompt(page, `Export the saved audio project at ${project} as WAV with its requested pause.`);
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#chat-history [data-role="final"]')).toContainText('E2E VoiceStudio local audio exported.', { timeout: 30_000 });
+    await expect(page.locator('#chat-history .chat-input-form')).toHaveCount(0);
+    await expect.poll(() => modelOrkas.modelRequests.length).toBe(2);
+    const initial = JSON.stringify(modelOrkas.modelRequests[0]);
+    expect(initial).toContain('@skill/voice-project');
+    expect(initial).toContain('generate_speech');
+    const result = JSON.stringify(modelOrkas.modelRequests[1]);
+    expect(result).toContain('duration_sec');
+    const exports = readdirSync(path.dirname(project)).filter(name => name.startsWith('export-'));
+    expect(exports).toHaveLength(1);
+    const exported = path.join(path.dirname(project), exports[0]);
+    expect(JSON.parse(readFileSync(path.join(exported, 'receipt.json'), 'utf8')).duration_sec).toBeCloseTo(1.25, 2);
+    expect(readFileSync(path.join(exported, 'audio.wav')).length).toBeGreaterThan(44);
+    expect(readFileSync(source)).toEqual(wav);
   });
 
   test('runs ContentWriter source audit through its shipped governing skill', async ({
@@ -347,9 +390,11 @@ test.describe('shipped professional agents', () => {
     );
     expect(governingSkill).toContain('caps_plan.json');
     expect(governingSkill).toContain(
-      'Never deliver a claim or comparison binding with `support_status=unproven`',
+      'not semantic support. Before final ledger and analysis submission, check every',
     );
-    expect(governingSkill).toContain('`alignment_status=unproven`');
+    expect(governingSkill).toContain('factual part of each claim and comparison cell against cited context');
+    expect(governingSkill).toContain('negation, conditions, versions, and limitations');
+    expect(governingSkill).toContain('uncovered parts; leave unsupported fields `Not verified`');
     // The bounded-run artifacts moved with the skill body: they are read on
     // demand rather than inlined, so protect them at the shipped source.
     expect(governingSkill).toContain('caps_plan.json');

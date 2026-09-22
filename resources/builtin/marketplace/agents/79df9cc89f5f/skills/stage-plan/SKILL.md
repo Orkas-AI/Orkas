@@ -7,7 +7,7 @@ description_en: "Ingest user media and turn an end-to-end video request into one
 
 # stage-plan
 
-How to turn "here is my material + here's the video I want" into a single, inspectable plan that spans reference images, reference videos, deterministic editing, semantic editing, generation, and composition. The output is `project/plan.json` — a cross-modal Edit Decision List (EDL) — which the assembler walks. Host-neutral: ingest evidence comes from `stage-edit` skill scripts (probe / silence / ocr / scenes / quality / extract_frame) plus `video_studio` transcription; this skill provides the plan validator, and line producers execute the signed decisions.
+How to turn "here is my material + here's the video I want" into a single, inspectable plan that spans reference images, reference videos, deterministic editing, semantic editing, generation, and composition. The output is `project/plan.json` — a cross-modal Edit Decision List (EDL) — which the assembler walks. Host-neutral: ingest evidence comes from `stage-edit` skill scripts (probe / silence / scenes / quality / extract_frame) plus `video_studio` transcription; this skill provides the plan validator, and line producers execute the signed decisions.
 
 **Where the material comes from.** User-uploaded clips arrive as chat attachments marked `model_readable="false"` with a `path` (see the attachment list). That flag means "not vision input", NOT "unusable" — it is source material to ingest with the scripts below. Copy each into `raw/` (or pass its attachment path as `--input`) before probing; never skip a `model_readable="false"` clip or plan around material you have not actually ingested.
 
@@ -17,7 +17,6 @@ Use `stage-edit` scripts for factual ingest before writing the plan, except tran
 
 ```bash
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op probe --input raw/clip.mp4
-"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit analyze_media -- --op ocr --input raw/screen-recording.mp4
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op extract_frame --input raw/clip.mp4 --start 3 --output project/frames/clip-3s.png
 ```
 
@@ -51,15 +50,15 @@ Use this line when the deliverable is NOT cleanly one axis — e.g. "trim my cli
 
 ## Step 1 — Ingest from evidence, never from assumption
 
-You cannot plan against material you have not looked at. For EVERY supplied clip, before writing any segment:
+First apply [production-method.md](../video-router/references/production-method.md): choose from the brief and basic input evidence before deep analysis. For `is_generation:true`, retain only the lightweight evidence and real model reference bindings it requires. The detailed ingest below applies to non-generation work only, and only where the requested edit needs it:
 
 1. **Probe** it (`stage-edit edit_video --op probe`) for real duration / resolution / fps / audio presence. A plan that cuts past the real duration breaks.
 2. **Read its content** the cheapest way that fits:
    - spoken audio → call `video_studio` `op: "speech.transcribe"` with `timestamps: "word"` → you now have timecoded words to cut on.
-   - silent / screen-recording / slideshow → `stage-edit analyze_media --op ocr` → per-timecode on-screen text. The audio being empty does NOT mean the screen is.
-   - need to judge what a moment LOOKS like (is the hero shot usable? is the product right-side up?) → read frames: `stage-edit edit_video --op extract_frame` then look at them. If you are multimodal you read them directly; if you cannot see images, say so and plan on probe/transcript/OCR evidence alone — mark those judgments unverified, do not invent them.
+   - silent / screen-recording / slideshow → `stage-edit edit_video --op extract_frame` across the clip, then read the images with the current model and record each extraction time with the observed content. The audio being empty does NOT mean the screen is.
+   - need to judge what a moment LOOKS like (is the hero shot usable? is the product right-side up?) → read frames: `stage-edit edit_video --op extract_frame` then look at them. If you are multimodal you read them directly; if you cannot see images, say so and plan on probe/transcript evidence alone — mark those judgments unverified, do not invent them.
 3. Record what each input is good for in `project/ingest.json`: `{input_id, duration, has_audio, content_summary, quality_risks:[...], usable_for:[...], planning_implications:[...]}`. This is the factual basis the plan cites — segments reference `input_id`s from here. Rules:
-   - **`content_summary` is specific and from observation:** "45 s of interview, no b-roll, mono audio" — never "user provided footage". An entry is only "reviewed" if a real probe/transcript/OCR actually ran; never claim you looked at a clip you did not.
+   - **`content_summary` is specific and from observation:** "45 s of interview, no b-roll, mono audio" — never "user provided footage". An entry is only "reviewed" if the relevant probe, transcription, or frame inspection actually ran; never claim you looked at a clip you did not.
    - **Usability heuristics:** video > 10 s → hero footage; > 3 s → b-roll; has speech → dialogue source; audio-only → narration/music source, production must supply the visuals; image-only → motion must come from animation or generation.
    - **Quality risks to flag:** width < 720 / height < 480 (will look soft), clip < 3 s (limited use), mono audio, a still where the brief wants motion. A flagged risk the plan ignores is a planning bug — surface and resolve it at the Production plan confirmation.
 
@@ -108,11 +107,13 @@ review artifact. If multiple references conflict, the current explicit user
 instruction outranks inferred defaults; do not blend mutually exclusive
 requirements silently.
 
-When VideoStudio chooses or transforms content intelligently, add `edit_strategy:{mode,objectives,decision_signals,preserve,may_change}`, where `mode` is a string and the other four are non-empty string arrays (a bare sentence in `objectives` is rejected as `E_EDIT_STRATEGY_BOUNDARY`). Use `deterministic` for evidence-driven cuts/cleanup, `semantic` for AI pixel edits, and `mixed` for both. `decision_signals` is a closed set naming the evidence actually used — `timecode`, `transcript`, `ocr`, `scene`, `silence`, `quality`, `vision`, `semantic_model` — never free-text findings; put the observed values in `objectives` or the segment specs instead. A semantic video edit remains an EDIT/AUTO workflow but is encoded as a billable `source:"generate"` segment with `media_kind:"video"`, `operation:"edit"`, and its declared original in `reference_video_paths` or `reference_video_urls`. Keep `edit_strategy` at the PLAN TOP LEVEL as a sibling of `segments`, never inside a segment. Its temporal anchor signs the exact source interval consumed by the target segment: a bounded 3s-7s child signs 3-7, while a full-duration 12s edit signs 0-12; in both shapes, `may_change` separately limits the actual pixel change to the requested 3s-7s target. The validator blocks semantic edits without a matching top-level edit reference, temporal anchor, edit strategy, and Gate-C count.
+When VideoStudio chooses or transforms content intelligently, add `edit_strategy:{mode,objectives,decision_signals,preserve,may_change}`, where `mode` is a string and the other four are non-empty string arrays (a bare sentence in `objectives` is rejected as `E_EDIT_STRATEGY_BOUNDARY`). Use `deterministic` for evidence-driven cuts/cleanup, `semantic` for AI pixel edits, and `mixed` for both. `decision_signals` is a closed set naming the evidence actually used — `timecode`, `transcript`, `scene`, `silence`, `quality`, `vision`, `semantic_model` — never free-text findings; put the observed values in `objectives` or the segment specs instead. A semantic video edit remains an EDIT/AUTO workflow but is encoded as a billable `source:"generate"` segment with `media_kind:"video"`, `operation:"edit"`, and its declared original in `reference_video_paths` or `reference_video_urls`. Keep `edit_strategy` at the PLAN TOP LEVEL as a sibling of `segments`, never inside a segment. Its temporal anchor signs the exact source interval consumed by the target segment: a bounded 3s-7s child signs 3-7, while a full-duration 12s edit signs 0-12; in both shapes, `may_change` separately limits the actual pixel change to the requested 3s-7s target. The validator blocks semantic edits without a matching top-level edit reference, temporal anchor, edit strategy, and Gate-C count.
 
 Tracks are separate from the visual timeline. The top-level `tracks` container is always required and must be an object, even when the video has no active tracks: use `"tracks": {}` (or object members set to `null`), never `"tracks": null`. Source audio retained inside an edit segment needs no separate track. For a semantic edit that retains source audio, `generate_audio:true` requests an audio-bearing edit output but does not override the signed audio-preservation boundary. Before authoring an active narration track, call `video_studio` `speech.capabilities` with `language` set to the deliverable's BCP-47 narration language — the listing then carries only the voices cleared for it — and copy one returned selection into `tracks.narration.synthesis:{route_ref,voice_ref,display_name,language,speed}`. Never invent a provider voice id. Add at least one timed line `{text, start_sec, target_sec}` — `target_sec` is the line's DURATION, never its end time, and windows must not overlap (the validator rejects `E_NARRATION_WINDOWS_OVERLAP`; overlapping windows mix as two voices speaking at once). Each line gets a `produced_path` once synthesized, so one line can be re-voiced alone. `tracks.music` holds a real `path` + ducking, and `tracks.captions` holds `{ from?, style?, lines:[{text, start_sec, target_sec}] }` as DATA, not burned pixels. A disabled track must be omitted or set to `null`; never emit empty placeholders. Legacy raw `voice` plans are recovery-only and receive a validator warning. Put the billable-generation count in `cost_estimate` — gate C reads it.
 
 Fit narration in the plan before any TTS call: use natural cadence (about 2.2-2.7 English words/sec or 4-5 Chinese chars/sec), shorten over-budget lines here, and do not rely on repeated synthesis to discover timing.
+
+The example assumes observed source footage covers 12–34 seconds and that its cuts, copy, audio, and overlay are requested. Primary segments total 30 seconds, with 22 seconds of source motion; overlay time does not extend the timeline. Replace the voice selection and asset locators with actual capability and ingest results.
 
 **Author plan.json in EXACTLY this shape (copy the field names — the `stage-plan video_plan --op validate` script rejects any other shape):**
 
@@ -130,7 +131,13 @@ Fit narration in the plan before any TTS call: use natural cadence (about 2.2-2.
         { "id": "s2_body", "approved_copy": ["42% faster"], "narration_text": "", "roles": ["title", "visual"] }
       ] } } },
     { "id": "s2_cap", "order": 3, "role": "body", "layer": "overlay", "over": "s2_body",
-      "source": "compose", "target_sec": 3, "spec": { "kind": "lower-third" } }
+      "source": "compose", "target_sec": 3, "spec": { "kind": "lower-third", "composition_plan": { "scenes": [
+        { "id": "s2_cap", "approved_copy": ["Measured result"], "narration_text": "", "roles": ["title"] }
+      ] } } },
+    { "id": "s3_demo", "order": 4, "role": "body", "layer": "primary", "source": "edit",
+      "target_sec": 10, "spec": { "input_id": "clipA", "in_sec": 18, "out_sec": 28 } },
+    { "id": "s4_close", "order": 5, "role": "cta", "layer": "primary", "source": "edit",
+      "target_sec": 6, "spec": { "input_id": "clipA", "in_sec": 28, "out_sec": 34 } }
   ],
   "references": [
     {
@@ -139,9 +146,11 @@ Fit narration in the plan before any TTS call: use natural cadence (about 2.2-2.
       "required": true,
       "preserve": ["approved content", "original audio sync"],
       "may_change": ["signed timeline cuts"],
-      "target_segment_ids": ["s1_hook"],
+      "target_segment_ids": ["s1_hook", "s3_demo", "s4_close"],
       "temporal_anchors": [
-        { "source_start_sec": 12, "source_end_sec": 18, "target_segment_id": "s1_hook" }
+        { "source_start_sec": 12, "source_end_sec": 18, "target_segment_id": "s1_hook" },
+        { "source_start_sec": 18, "source_end_sec": 28, "target_segment_id": "s3_demo" },
+        { "source_start_sec": 28, "source_end_sec": 34, "target_segment_id": "s4_close" }
       ]
     }
   ],

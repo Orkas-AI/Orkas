@@ -43,8 +43,8 @@ import { desktopPlatform, osVersion, preferredSystemLanguage } from './system_in
 import {
   hardenedWebPreferences,
   installExternalNavigationGuard,
-  installOfflineHtmlPreviewNavigationGuard,
-  withOfflineHtmlPreviewPolicy,
+  installHtmlPreviewNavigationGuard,
+  withHtmlPreviewPolicy,
 } from './util/window-security';
 import {
   createRendererChannel,
@@ -205,6 +205,7 @@ import type { BuiltinMarketplaceSeedResult } from './features/builtin_marketplac
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
 import * as savedApps from './features/saved_apps';
+import { appResource } from './features/web_apps/host';
 import * as clientConfigFeature from './features/client_config';
 import * as connectorsFeature from './features/connectors';
 import * as taskNotifications from './features/task_notifications';
@@ -241,7 +242,7 @@ function setTaskNotificationBadgeCount(count: number): void {
   app.setBadgeCount(normalized);
 }
 
-let taskTurnRendererReady = false;
+let mainRendererReady = false;
 
 // Renderer channels replay what the window could not take while loading; the
 // owner-scoped ones never hand one account's rows to the next (see
@@ -250,7 +251,7 @@ let taskTurnRendererReady = false;
 const rendererChannels: RendererChannel[] = [];
 const rendererChannelDeps: RendererChannelDeps = {
   broadcast: (channel, payload) => ipc.broadcastToRenderer(channel, payload),
-  rendererReady: () => taskTurnRendererReady,
+  rendererReady: () => mainRendererReady,
   activeUserId: () => (users.hasActiveUser() ? users.getActiveUserId() : null),
 };
 function rendererChannel(channel: string, options: RendererChannelOptions): RendererChannel {
@@ -274,6 +275,7 @@ function createWindow(): BrowserWindow {
     ...restored.bounds,
     title: '',
     show: !IS_PACKAGED_LAUNCH_SMOKE && !E2E_HIDE_WINDOW,
+    focusable: !E2E_HIDE_WINDOW,
     backgroundColor: '#ffffff',
     icon: path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png'),
     webPreferences: hardenedWebPreferences({
@@ -289,21 +291,25 @@ function createWindow(): BrowserWindow {
     }),
   });
   windowState.watchWindowState(win);
-  if (restored.isMaximized) win.maximize();
+  // maximize() also shows a hidden native window.
+  if (restored.isMaximized && !E2E_HIDE_WINDOW) win.maximize();
 
   win.loadFile(path.join(paths.SRC_ROOT, 'renderer', 'index.html'));
-  win.webContents.on('did-start-loading', () => {
-    taskTurnRendererReady = false;
+  win.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+    // Embedded previews also trigger did-start-loading, but only a new main
+    // document replaces our subscribers and later emits did-finish-load.
+    if (!isMainFrame || isInPlace) return;
+    mainRendererReady = false;
   });
   win.webContents.on('did-finish-load', () => {
-    taskTurnRendererReady = true;
+    mainRendererReady = true;
     for (const channel of rendererChannels) channel.flush();
   });
   win.webContents.on('render-process-gone', () => {
-    taskTurnRendererReady = false;
+    mainRendererReady = false;
   });
   win.on('closed', () => {
-    taskTurnRendererReady = false;
+    mainRendererReady = false;
   });
 
   // Block HTML <title> from populating the native titlebar — we want a
@@ -323,7 +329,7 @@ function createWindow(): BrowserWindow {
     (url) => shell.openExternal(url),
     (err) => log.warn('openExternal failed', { error: (err as Error)?.message || String(err) }),
   );
-  installOfflineHtmlPreviewNavigationGuard(win.webContents);
+  installHtmlPreviewNavigationGuard(win.webContents);
 
   // Hijack Cmd/Ctrl+R / F5 uniformly:
   //   - Packaged: refresh disabled (the App doesn't need reload).
@@ -358,9 +364,11 @@ function openConversationFromTaskNotification(
   }
 
   const win = BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed()) || createWindow();
-  if (win.isMinimized()) win.restore();
-  if (!win.isVisible()) win.show();
-  win.focus();
+  if (win.isFocusable()) {
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    win.focus();
+  }
 
   const send = () => {
     if (win.isDestroyed() || win.webContents.isDestroyed()) return;
@@ -1127,8 +1135,8 @@ function registerChatMediaProtocol(): void {
         const uid = users.getActiveUserId();
         const resolved = chatAttachments.resolveAttachmentAbsPath(uid, cid, name);
         if (!resolved.ok) {
-          const code = (resolved as { code?: string }).code;
-          log.warn('chat-media/cid: reject', { error_code: code || 'rejected' });
+          const { code, diagnosticCode } = resolved as { code?: string; diagnosticCode?: string };
+          log.warn('chat-media/cid: reject', { error_code: diagnosticCode || code || 'rejected' });
           return new Response(String((resolved as { error?: string }).error || code || 'error'), { status: _statusFor(code) });
         }
         const st = fs.statSync(resolved.absPath);
@@ -1158,8 +1166,8 @@ function registerChatMediaProtocol(): void {
           // Same `(x as {field?: T}).field` access pattern as the cid branch above —
           // tsc's narrow on `if (!resolved.ok)` doesn't always propagate to the
           // error-branch fields here, so go through the type-assertion escape hatch.
-          const err = resolved as { code?: string; error?: string };
-          log.warn('chat-media/local: reject', { error_code: err.code || 'rejected' });
+          const err = resolved as { code?: string; error?: string; diagnosticCode?: string };
+          log.warn('chat-media/local: reject', { error_code: err.diagnosticCode || err.code || 'rejected' });
           return new Response(String(err.error || ''), { status: _statusFor(err.code) });
         }
         const st = fs.statSync(resolved.absPath);
@@ -1168,8 +1176,8 @@ function registerChatMediaProtocol(): void {
         if (path.extname(resolved.absPath).toLowerCase() === '.svg') {
           const materialized = chatAttachments.materializeLocalDisplaySvg(resolved.absPath);
           if (!materialized.ok) {
-            const err = materialized as { code?: string; error?: string };
-            log.warn('chat-media/local: SVG materialize rejected', { error_code: err.code || 'rejected' });
+            const err = materialized as { code?: string; error?: string; diagnosticCode?: string };
+            log.warn('chat-media/local: SVG materialize rejected', { error_code: err.diagnosticCode || err.code || 'rejected' });
             return new Response(String(err.error || ''), { status: _statusFor(err.code) });
           }
           const bytes = Buffer.byteLength(materialized.body, 'utf8');
@@ -1190,7 +1198,7 @@ function registerChatMediaProtocol(): void {
           'chat_local',
         );
         return resolved.kind === 'html'
-          ? withOfflineHtmlPreviewPolicy(response)
+          ? withHtmlPreviewPolicy(response)
           : response;
       }
 
@@ -1230,6 +1238,18 @@ function registerChatAppProtocol(): void {
       catch {
         log.warn('chat-app: unparseable URL', { error_code: 'invalid_url' });
         return new Response('bad request', { status: 400 });
+      }
+      const sdkResource = appResource(request);
+      if (sdkResource) {
+        if (sdkResource.status !== 200) return new Response('Application resource unavailable', { status: sdkResource.status });
+        if ('body' in sdkResource) return new Response(sdkResource.body, {
+          headers: { ...sdkResource.headers, 'Content-Type': sdkResource.mime },
+        });
+        const stat = fs.statSync(sdkResource.file);
+        const response = serveFileRange(request, sdkResource.file, sdkResource.mime, stat.size, stat.mtimeMs, sdkResource.source);
+        const headers = new Headers(response.headers);
+        for (const [key, value] of Object.entries(sdkResource.headers)) headers.set(key, value);
+        return new Response(response.body, { status: response.status, headers });
       }
       const host = u.host.toLowerCase();
       // pathname is `/<encCid>/<encArtifactId>/<relpath...>` (always leading
@@ -1458,7 +1478,7 @@ if (!gotLock) {
         !win.isDestroyed() && win.isFocused()
       )),
       // Test and packaged-smoke launches use synthetic workspaces and must not
-      // write production analytics. Normal source and packaged runs behave alike.
+      // write lifecycle reports. Normal source and packaged runs behave alike.
       enabled: !E2E_USER_DATA_DIR && !IS_PACKAGED_LAUNCH_SMOKE,
     });
     app.once('will-quit', () => {
@@ -1568,6 +1588,10 @@ if (!gotLock) {
       const mod = await import('./features/sessions_sweep');
       await mod.sweepSessions(users.getActiveUserId(), signal);
     }, 'serial', BOOT_POST_STARTUP_DELAY_MS, idleDisk);
+    registerDeferred('memory:loop', async () => {
+      const memoryMaintenance = await import('./features/memory-maintenance');
+      memoryMaintenance.startMemoryMaintenanceLoop(users.getActiveUserId());
+    }, 'serial', BOOT_POST_STARTUP_DELAY_MS);
     registerDeferred('reflection:loop', () => {
       reflectionOrchestrator.startReflectionLoop(users.getActiveUserId());
     }, 'serial', BOOT_POST_STARTUP_DELAY_MS);

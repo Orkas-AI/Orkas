@@ -25,6 +25,9 @@ function loadStatusHint() {
   return {
     hint: windowObject.getLocalCliUnavailableHint as (entry: Record<string, unknown> | undefined) => string,
     isCodingAgent: windowObject.cliIsCodingAgent as (cli: string) => boolean,
+    defaults: windowObject.getCliDefaults as (cli: string) => {
+      name: string; description_en: string; description_zh: string;
+    } | null,
     calls,
   };
 }
@@ -32,11 +35,7 @@ function loadStatusHint() {
 function loadExternalSelectorHarness() {
   const source = fs.readFileSync(path.join(rendererRoot, 'modules/local-agents.js'), 'utf8');
   let now = 1000;
-  const monitorCalls: any[] = [];
   const availabilityStates: boolean[] = [];
-  const monitor = {
-    event: (name: string, payload: unknown) => monitorCalls.push(['event', name, payload]),
-  };
   const pendingInvokes: Array<{
     channel: string;
     payload: unknown;
@@ -84,7 +83,6 @@ function loadExternalSelectorHarness() {
     },
   };
   const windowObject: Record<string, any> = {
-    Monitor: monitor,
     setExternalAgentCreateAvailability: (available: boolean) => availabilityStates.push(available),
     orkas: {
       invoke: (channel: string, payload: unknown) => {
@@ -97,7 +95,6 @@ function loadExternalSelectorHarness() {
   };
   const context = vm.createContext({
     window: windowObject,
-    Monitor: monitor,
     document: {
       getElementById: (id: string) => {
         if (id === 'agent-modal-ext-cli-select') return mount;
@@ -165,7 +162,6 @@ function loadExternalSelectorHarness() {
     trigger,
     classes,
     attributes,
-    monitorCalls,
     availabilityStates,
   };
 }
@@ -192,6 +188,24 @@ describe('external-agent unavailable status copy', () => {
     expect(isCodingAgent('openclaw')).toBe(false);
     expect(isCodingAgent('opencode')).toBe(true);
     expect(isCodingAgent('hermes')).toBe(false);
+  });
+
+  it('offers concise bilingual routing seeds without repeated examples or protocol details', () => {
+    const { defaults } = loadStatusHint();
+    for (const cli of ['claude', 'codex', 'openclaw', 'opencode', 'hermes']) {
+      const seed = defaults(cli)!;
+      expect(seed).not.toBeNull();
+      // Source-only regression ceilings, not limits on user-authored descriptions.
+      expect(seed.description_en.length).toBeLessThanOrEqual(250);
+      expect(seed.description_zh.length).toBeLessThanOrEqual(100);
+      expect(seed.description_en).toMatch(/[a-z]/i);
+      expect(seed.description_zh).toMatch(/[\u4e00-\u9fff]/);
+      for (const description of [seed.description_en, seed.description_zh]) {
+        expect(description).not.toMatch(/For:|Triggers:|触发词|ACP|session-scoped/);
+      }
+    }
+    expect(defaults('unknown')).toBeNull();
+    expect(defaults('toString')).toBeNull();
   });
 
   it('ships recovery and detection messages in every renderer locale', () => {
@@ -331,25 +345,9 @@ describe('external-agent unavailable status copy', () => {
     ]);
     expect(selected).toEqual(['codex']);
     expect(harness.availability()).toBe('available');
-    expect(harness.monitorCalls).toEqual([
-      ['event', 'external_cli_detect_result', {
-        result: 'success',
-        available_count: 1,
-        not_found_count: 0,
-        version_too_old_count: 0,
-        version_timeout_count: 0,
-        version_unknown_count: 0,
-        available_types: 'codex',
-        not_found_types: '',
-        version_too_old_types: '',
-        version_timeout_types: '',
-        version_unknown_types: '',
-        duration_ms: 0,
-      }],
-    ]);
   });
 
-  it('reports unavailable CLI reasons as one aggregate detection result', async () => {
+  it('renders unavailable CLI reasons after discovery', async () => {
     const harness = loadExternalSelectorHarness();
     const pending = harness.mount();
     harness.advanceTime(40);
@@ -364,22 +362,6 @@ describe('external-agent unavailable status copy', () => {
     });
     await pending;
 
-    expect(harness.monitorCalls).toEqual([
-      ['event', 'external_cli_detect_result', {
-        result: 'success',
-        available_count: 0,
-        not_found_count: 2,
-        version_too_old_count: 1,
-        version_timeout_count: 1,
-        version_unknown_count: 1,
-        available_types: '',
-        not_found_types: 'claude,codex',
-        version_too_old_types: 'openclaw',
-        version_timeout_types: 'hermes',
-        version_unknown_types: 'opencode',
-        duration_ms: 40,
-      }],
-    ]);
     expect(harness.selectState.placeholder).toBe('agent_modal.ext_cli_unavailable');
     expect(harness.selectState.value).toBe('');
     expect(harness.selectState.options).toEqual([
@@ -491,12 +473,9 @@ describe('external-agent unavailable status copy', () => {
       'claude',
     ]);
     expect(harness.selectState.value).toBe('claude');
-    expect(harness.monitorCalls.filter(
-      ([kind, name]) => kind === 'event' && name === 'external_cli_detect_result',
-    )).toHaveLength(1);
   });
 
-  it('keeps one telemetry owner when another mount starts during version validation', async () => {
+  it('coalesces another mount during version validation', async () => {
     const harness = loadExternalSelectorHarness();
     const first = harness.mount();
     harness.resolveList({
@@ -516,9 +495,7 @@ describe('external-agent unavailable status copy', () => {
     });
     await Promise.all([first, second]);
 
-    expect(harness.monitorCalls.filter(
-      ([kind, name]) => kind === 'event' && name === 'external_cli_detect_result',
-    )).toHaveLength(1);
+    expect(harness.getInvokeCount()).toBe(3);
   });
 
   it('shows cached options immediately, resets to the first CLI, and marks the title updating', async () => {
@@ -619,23 +596,6 @@ describe('external-agent unavailable status copy', () => {
     await flushPromises();
     harness.rejectList(new Error('IPC unavailable'));
     await first;
-    expect(harness.monitorCalls).toEqual([
-      ['event', 'external_cli_detect_result', {
-        result: 'failure',
-        available_count: 0,
-        not_found_count: 0,
-        version_too_old_count: 0,
-        version_timeout_count: 0,
-        version_unknown_count: 0,
-        available_types: '',
-        not_found_types: '',
-        version_too_old_types: '',
-        version_timeout_types: '',
-        version_unknown_types: '',
-        duration_ms: 0,
-        error_code: 'invoke_failed',
-      }],
-    ]);
 
     const retry = harness.mount();
 

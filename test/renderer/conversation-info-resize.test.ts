@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { runInNewContext } from 'node:vm';
 
 const source = readFileSync(join(__dirname, '../../src/renderer/modules/conversation-info.js'), 'utf8');
+const resizeSource = readFileSync(join(__dirname, '../../src/renderer/modules/task-side-panel.js'), 'utf8');
 const storageKey = 'orkas.conversationInfo.width';
 
 function createHarness(viewport = 1800, saved?: string) {
@@ -28,7 +29,7 @@ function createHarness(viewport = 1800, saved?: string) {
     innerWidth: viewport,
     addEventListener: (type: string, listener: () => void) => windowListeners.set(type, listener),
   };
-  runInNewContext(source, {
+  const context = {
     window,
     document: {
       readyState: 'complete',
@@ -37,9 +38,16 @@ function createHarness(viewport = 1800, saved?: string) {
       querySelectorAll: () => [],
     },
     localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
-  });
+  };
+  runInNewContext(resizeSource + source, context);
   const dispatch = (type: string, event = {}) => listeners.get(type)!({ preventDefault() {}, ...event });
-  return { panel, attributes, storage, dispatch, resize: (width: number) => {
+  const secondPanel = { ...panel, style: {} as Record<string, string> };
+  const secondHandle = { ...handle, addEventListener() {} };
+  const getElement = context.document.getElementById;
+  context.document.getElementById = (id: string) => id === 'video-review-panel' ? secondPanel
+    : id === 'video-review-resize' ? secondHandle : getElement(id);
+  const second = (window as any).TaskSidePanel.bind('video-review-panel', 'video-review-resize');
+  return { panel, attributes, storage, dispatch, secondPanel, second, resize: (width: number) => {
     window.innerWidth = width;
     windowListeners.get('resize')!();
   } };
@@ -81,6 +89,16 @@ describe('conversation info resizing', () => {
     expect(harness.panel.style.width).toBe('1100px');
     harness.resize(1280);
     expect(harness.panel.style.width).toBe('580px');
+  });
+
+  it('shares the selected width with the video panel', () => {
+    const harness = createHarness();
+    harness.dispatch('pointerdown', { button: 0, pointerId: 1 });
+    harness.dispatch('pointermove', { clientX: 1000 });
+    harness.dispatch('pointerup');
+    harness.second.apply();
+    expect(harness.secondPanel.style.width).toBe('800px');
+    expect(harness.secondPanel.style.flexBasis).toBe('800px');
   });
 
   it('resizes from the displayed default using the keyboard and ignores IME input', () => {

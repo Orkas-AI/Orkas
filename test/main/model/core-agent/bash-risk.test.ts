@@ -127,6 +127,11 @@ const RISKY: Array<[string, RiskCategory]> = [
   ['systemctl restart orkas-api', 'external_mutation'],
   ['systemctl --user restart orkas-worker', 'external_mutation'],
   ['service nginx restart', 'external_mutation'],
+  ['redis-cli -p 6379 shutdown nosave', 'external_mutation'],
+    ['redis-cli -h redis.example.com -p 6380 SHUTDOWN', 'external_mutation'],
+  ['redis-cli --tls --user default --pass test shutdown', 'external_mutation'],
+  ['redis-cli.exe shutdown', 'external_mutation'],
+  ["redis-cli --quoted-input '\"shutdown\"' nosave", 'external_mutation'],
   ['ssh db.example "mysql prod -e \'TRUNCATE TABLE cache_entries\'"', 'external_mutation'],
   ['ssh deploy@app.example "service nginx restart"', 'external_mutation'],
   ['scp dist/app.js deploy@app.example:/srv/orkas/app.js', 'external_mutation'],
@@ -409,6 +414,10 @@ describe('bash-risk › structure / edge cases', () => {
     'ssh host \'sudo -u root systemctl status orkas-api\'',
     'scp deploy@app.example:/srv/orkas/app.log ./app.log',
     'systemctl status orkas-api',
+      'redis-cli -h redis.example.com -p 6380 GET shutdown',
+    'redis-cli -a shutdown PING',
+    'redis-cli --help',
+    'echo redis-cli shutdown',
   ])('keeps remote read-only operations out of external_mutation: %s', (command) => {
     const result = classifyBashCommand(command);
     expect(result.reasons).not.toContain('external_mutation');

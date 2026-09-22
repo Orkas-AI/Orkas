@@ -42,6 +42,58 @@ afterEach(async () => {
 });
 
 describe('generation reference assets', () => {
+  it.each(['empty', 'local', 'remote', 'mixed'])('preserves reference identity and progress for %s image inputs', async (mode) => {
+    const localBytes = [Buffer.from('local identity'), Buffer.from('local composition')];
+    const remoteBytes = [Buffer.from('remote style'), Buffer.from('remote content')];
+    const paths = localBytes.map((_, i) => path.join(tmpDir, `reference-${i}.png`));
+    await Promise.all(paths.map((file, i) => fs.writeFile(file, localBytes[i])));
+    const urls = ['https://cdn.example/style.png', 'https://cdn.example/content.png'];
+    const fetchMock = vi.fn(async (url: string) => {
+      const index = urls.indexOf(String(url));
+      if (index < 0) throw new Error('unexpected reference download');
+      return new Response(remoteBytes[index], { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const referenceAssets = await import('../../../src/main/features/generation_reference_assets');
+    const hasLocal = mode === 'local' || mode === 'mixed';
+    const hasRemote = mode === 'remote' || mode === 'mixed';
+    const progress: Array<{ phase: string; data?: Record<string, unknown> }> = [];
+    const buffers = await referenceAssets.loadImageReferenceBuffersWithProgress(
+      hasRemote ? urls : [], hasLocal ? paths : [], { onProgress: event => progress.push(event) },
+    );
+
+    const expected = [...(hasLocal ? localBytes : []), ...(hasRemote ? remoteBytes : [])];
+    expect(buffers).toEqual(expected);
+    expect(fetchMock).toHaveBeenCalledTimes(hasRemote ? 2 : 0);
+    expect(progress.map(event => event.data)).toEqual(expected.map((_, i) => ({
+      kind: 'image', index: i + 1, total: expected.length,
+    })));
+    expect(progress.map(event => event.phase)).toEqual([
+      ...(hasLocal ? ['reference_load', 'reference_load'] : []),
+      ...(hasRemote ? ['reference_download', 'reference_download'] : []),
+    ]);
+  });
+
+  it.each(['cancel', 'missing', 'download'])('rejects %s during mixed reference preparation without returning a partial list', async (failure) => {
+    const localPath = path.join(tmpDir, 'reference.png');
+    if (failure !== 'missing') await fs.writeFile(localPath, Buffer.from('local identity'));
+    const fetchMock = vi.fn(async () => new Response('reference unavailable', { status: 403 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const referenceAssets = await import('../../../src/main/features/generation_reference_assets');
+    const controller = new AbortController();
+    const loading = referenceAssets.loadImageReferenceBuffersWithProgress(
+      ['https://cdn.example/style.png'], [localPath], {
+        signal: controller.signal,
+        onProgress: event => {
+          if (failure === 'cancel' && event.phase === 'reference_load') controller.abort();
+        },
+      },
+    );
+    if (failure === 'missing') await expect(loading).rejects.toMatchObject({ code: 'ENOENT' });
+    else await expect(loading).rejects.toThrow(failure === 'cancel' ? /aborted/i : /403/);
+    expect(fetchMock).toHaveBeenCalledTimes(failure === 'download' ? 1 : 0);
+  });
+
   it('reuses a generated public URL for the unchanged local output', async () => {
     const localPath = await writeTinyMp4();
     const fetchMock = vi.fn();

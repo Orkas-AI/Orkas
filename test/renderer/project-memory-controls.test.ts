@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as vm from 'node:vm';
 
 const rendererRoot = path.join(__dirname, '../../src/renderer');
 const html = fs.readFileSync(path.join(rendererRoot, 'index.html'), 'utf8');
@@ -52,6 +53,44 @@ describe('project memory controls', () => {
       const guidance = `${table['project.memory.subtitle']} ${table['project.memory.placeholder']}`;
       expect(guidance, locale).not.toMatch(forbidden[locale]);
     }
+  });
+
+  it('swaps the guidance line for the heading once an entry exists', () => {
+    const nodes: Record<string, any> = {
+      'project-memory-list': { innerHTML: '', style: {}, children: [] as any[], appendChild(child: any) { this.children.push(child); } },
+      'project-memory-empty': { style: {} },
+      'project-memory-count': { textContent: '' },
+      'project-memory-section-head': { hidden: false },
+    };
+    const context = vm.createContext({
+      console,
+      createLogger: () => ({ warn() {}, info() {}, error() {} }),
+      document: {
+        readyState: 'loading',
+        addEventListener() {},
+        getElementById: (id: string) => nodes[id] || null,
+        querySelector: () => null,
+        createElement: () => ({
+          appendChild() {}, className: '', dataset: {}, style: {}, textContent: '',
+          setAttribute() {}, addEventListener() {},
+        }),
+      },
+      window: { addEventListener() {}, orkas: { invoke: async () => ({ ok: true }) } },
+      escapeHtml: (value: string) => value,
+      t: (key: string) => key,
+      setTimeout,
+      clearTimeout,
+    });
+    vm.runInContext(source, context, { filename: 'project-detail.js' });
+
+    vm.runInContext('_projectMemory = []; _renderProjectMemoryList()', context);
+    expect(nodes['project-memory-section-head'].hidden).toBe(true);
+    expect(nodes['project-memory-empty'].style.display).toBe('');
+
+    vm.runInContext("_projectMemory = ['The release checklist is the source of truth.']; _renderProjectMemoryList()", context);
+    expect(nodes['project-memory-section-head'].hidden).toBe(false);
+    expect(nodes['project-memory-empty'].style.display).toBe('none');
+    expect(nodes['project-memory-count'].textContent).toBe('1');
   });
 
   it('guards project-instruction saves with dirty, limit, and error states', () => {

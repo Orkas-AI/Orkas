@@ -1518,6 +1518,21 @@ describe('chats › index repair', () => {
 });
 
 describe('chats › deleteConversation', () => {
+  it('purges retained member outputs after a model-state reset removed the session JSONL', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID);
+    const sessions = await import('../../../src/main/model/core-agent/session-store');
+    const cid = conv.conversation_id;
+    const own = sessions.toolResultsDirForSession(TEST_UID, `gmember-${cid}-agent01`);
+    const other = sessions.toolResultsDirForSession(TEST_UID, 'gmember-othercid-agent01');
+    for (const directory of [own, other]) {
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, 'original.txt'), 'retained result');
+    }
+    expect(await chats.deleteConversation(TEST_UID, cid)).toBe(true);
+    expect(fs.existsSync(own)).toBe(false);
+    expect(fs.existsSync(other)).toBe(true);
+  });
   it('removes only the deleted task directory binding and preserves project files and other bindings', async () => {
     const chats = await loadChats();
     const removed = await chats.createConversation(TEST_UID);
@@ -2146,10 +2161,16 @@ describe('chats › sweepStaleProcessing', () => {
         model_text: expect.stringContaining('interrupted'),
       }),
     ]);
-    const searchEntry = await searchIndexer.getEntry(paths.userChatsIndexPath(TEST_UID), 'chat');
-    expect(searchEntry.idx.docs[`chat:${conv.conversation_id}:0`]).toMatchObject({
-      role: '79df9cc89f5f',
-    });
+    // The recovery message must reach the search index, not just the jsonl:
+    // an interrupted reply the user can read but never find again is the
+    // failure this assertion exists for. The index now lives in chat_store.
+    const chatStore = await import('../../../src/main/features/search/chat_store');
+    expect(chatStore._allDocsForTests(TEST_UID)).toContainEqual(
+      expect.objectContaining({
+        docId: `chat:${conv.conversation_id}:0`,
+        role: '79df9cc89f5f',
+      }),
+    );
     expect((await chats.sweepStaleProcessing()).swept).toBe(0);
     expect(fs.readFileSync(
       path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`),

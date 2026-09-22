@@ -1,3 +1,4 @@
+import { webContentCsp } from './web-content-policy';
 import type { WebPreferences } from 'electron';
 
 /**
@@ -152,30 +153,12 @@ interface GuardedWebContents {
   on(event: 'will-navigate', handler: (event: NavigationEvent, url: string) => void): void;
 }
 
-export const OFFLINE_HTML_PREVIEW_CSP = [
-  "default-src 'none'",
-  "script-src 'unsafe-inline' 'unsafe-eval' blob:",
-  "style-src 'unsafe-inline'",
-  'img-src chat-media://local data: blob:',
-  'media-src chat-media://local data: blob:',
-  'font-src data: blob:',
-  "connect-src 'none'",
-  "frame-src 'none'",
-  'worker-src blob:',
-  "object-src 'none'",
-  "base-uri 'none'",
-  "form-action 'none'",
-  "manifest-src 'none'",
-].join('; ');
+export const HTML_PREVIEW_CSP = webContentCsp('chat-media://local');
 
-/**
- * Preserve the streamed/range response while making local HTML previews
- * offline-first. Inline code remains usable inside the existing sandbox, but
- * network-loaded code/assets and programmatic connections fail closed.
- */
-export function withOfflineHtmlPreviewPolicy(response: Response): Response {
+/** Preserve streaming and local-file authorization while allowing Web resources. */
+export function withHtmlPreviewPolicy(response: Response): Response {
   const headers = new Headers(response.headers);
-  headers.set('Content-Security-Policy', OFFLINE_HTML_PREVIEW_CSP);
+  headers.set('Content-Security-Policy', HTML_PREVIEW_CSP);
   headers.set('Referrer-Policy', 'no-referrer');
   headers.set('X-Content-Type-Options', 'nosniff');
   return new Response(response.body, {
@@ -198,7 +181,7 @@ function parsedLocalChatMediaUrl(raw: unknown): URL | null {
   }
 }
 
-export function isOfflineHtmlPreviewUrl(raw: unknown): boolean {
+export function isHtmlPreviewUrl(raw: unknown): boolean {
   const url = parsedLocalChatMediaUrl(raw);
   if (!url) return false;
   try {
@@ -226,19 +209,15 @@ interface PreviewFrameWebContents {
   ): void;
 }
 
-/**
- * CSP resource directives do not cover every document navigation. Keep an
- * already-loaded local HTML preview on the validated local protocol so inline
- * code cannot exfiltrate data by assigning an HTTP(S) URL to its own frame.
- */
-export function installOfflineHtmlPreviewNavigationGuard(
+/** Keep local previews away from privileged document schemes. */
+export function installHtmlPreviewNavigationGuard(
   webContents: PreviewFrameWebContents,
 ): void {
   webContents.on('will-frame-navigate', (event) => {
     if (event.isMainFrame) return;
     const sourceUrl = event.frame?.url || event.initiator?.url || '';
-    if (!isOfflineHtmlPreviewUrl(sourceUrl)) return;
-    if (parsedLocalChatMediaUrl(event.url)) return;
+    if (!isHtmlPreviewUrl(sourceUrl)) return;
+    if (parsedLocalChatMediaUrl(event.url) || safeExternalHttpUrl(event.url)) return;
     event.preventDefault();
   });
 }

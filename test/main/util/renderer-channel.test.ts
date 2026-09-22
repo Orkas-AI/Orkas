@@ -100,3 +100,13 @@ describe('renderer channel', () => {
     expect(broadcast.mock.calls.map((call) => call[0])).toEqual(['auth:x', 'telemetry:y']);
   });
 });
+
+
+it('summarizes bounded channel drops without exposing owners or payloads', () => {
+  const { deps } = harness({ ready: false });
+  const onDrop = vi.fn();
+  const channel = createRendererChannel('telemetry:connector', { maxPending: 2, ownerScoped: true, onDrop }, deps);
+  for (let i = 0; i < 105; i += 1) channel.emit({ private: 'canary' }, 'u1');
+  expect(channel.pending()).toBe(2);
+  expect(onDrop.mock.calls).toEqual([['buffer_full', 1], ['buffer_full', 100]]);
+});

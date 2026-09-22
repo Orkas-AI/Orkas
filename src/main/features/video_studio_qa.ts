@@ -2978,18 +2978,19 @@ export function analyzeNativeImage(image: ElectronNativeImage): { hash: string; 
 
 export async function writeFrameContactSheet(
   evidenceDirAbs: string,
-  samples: FrameSampleEvidence[],
+  samples: Array<Pick<FrameSampleEvidence, 'label' | 'time_seconds' | 'path'>>,
   opts: {
     /** Label cells with `sample.label` alone. A production sheet spans several
      *  compositions, where each cell's own timeline start says nothing useful
      *  and "@ 0s" on every cell would be false. */
     labelOnly?: boolean;
+    columns?: number;
   } = {},
 ): Promise<string> {
   const thumbW = 320;
   const thumbH = 180;
   const gap = 16;
-  const cols = Math.min(3, Math.max(1, samples.length));
+  const cols = Math.min(opts.columns || 3, Math.max(1, samples.length));
   const rows = Math.max(1, Math.ceil(samples.length / cols));
   const width = cols * thumbW + (cols + 1) * gap;
   const height = rows * (thumbH + 36) + (rows + 1) * gap;
@@ -3172,6 +3173,9 @@ export function buildDesignReviewInputs(opts: DesignReviewInputOptions): Record<
     version: 1,
     contract_path: opts.contractLoad.path,
     scene_map_path: opts.sceneMapLoad.exists ? opts.sceneMapLoad.path : '',
+    style_source: contract.style_source || null,
+    references: Array.isArray(contract.references) ? contract.references : [],
+    reference_fidelity: contract.reference_fidelity || null,
     aesthetic: contract.aesthetic || null,
     color_tokens: contract.color_tokens || null,
     typography_tokens: contract.typography_tokens || null,

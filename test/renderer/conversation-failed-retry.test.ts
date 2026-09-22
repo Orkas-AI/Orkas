@@ -74,23 +74,6 @@ function loadFailedRetrySender() {
   };
 }
 
-function loadModelOutputTracker() {
-  const source = [
-    extractFunction('_normalizeFeedbackFieldText'),
-    extractFunction('_trimTelemetryText'),
-    extractFunction('_handleModelOutputErrorForUi'),
-  ].join('\n');
-  return vm.runInNewContext(`
-    const currentCid = 'fallback-cid';
-    const calls = [];
-    function _convTrackError(action, data) { calls.push({ action, data }); }
-    function _groupActorLabel(actorId) { return actorId === 'commander' ? 'Commander' : ''; }
-    const window = {};
-    ${source}
-    ({ track: _handleModelOutputErrorForUi, calls });
-  `, {});
-}
-
 describe('conversation failed assistant retry actions', () => {
   it('offers retry from recorded failure state even without error prose, but not for successful empty deliveries', () => {
     const isFailed = loadFailedClassifier();
@@ -172,14 +155,16 @@ describe('conversation failed assistant retry actions', () => {
     await Promise.all([first, second]);
   });
 
-  it('classifies localized model-call failure text as retryable failure content', () => {
+  it('does not infer retryable failure from prose and preserves legacy host markup', () => {
     const isFailed = loadFailedClassifier();
 
-    expect(isFailed('⚠️ 模型调用失败：503 系统繁忙，请稍后重试')).toBe(true);
-    expect(isFailed('Model call failed: 503 service unavailable')).toBe(true);
-    expect(isFailed('Model response failed: aborted')).toBe(true);
+    expect(isFailed('⚠️ 模型调用失败：503 系统繁忙，请稍后重试')).toBe(false);
+    expect(isFailed('Model call failed: 503 service unavailable')).toBe(false);
+    expect(isFailed('Model response failed: aborted')).toBe(false);
     expect(isFailed('<span style="color:var(--danger)">⚠️ 模型调用失败：503</span>')).toBe(true);
     expect(isFailed('普通回复，没有失败状态')).toBe(false);
+    expect(isFailed('Explain what Model call failed means.', { failed: false })).toBe(false);
+    expect(isFailed('A normal response', { failed: true })).toBe(true);
   });
 
   it('classifies persisted stop and startup-recovery records without matching ordinary prose', () => {
@@ -212,7 +197,6 @@ describe('conversation failed assistant retry actions', () => {
     );
     expect(styleSource).toContain('.chat-message:hover .chat-bubble-actions');
     expect(styleSource).toContain('.chat-message:focus-within .chat-bubble-actions');
-    expect(styleSource).toContain('.chat-bubble-actions:has(.bubble-more-btn[aria-expanded="true"])');
     expect(styleSource).toMatch(
       /\.chat-message:hover \.chat-bubble-actions,[^{]+\{[^}]*opacity:\s*1;[^}]*pointer-events:\s*auto;/s,
     );
@@ -230,7 +214,6 @@ describe('conversation failed assistant retry actions', () => {
     expect(finalizeBody).toContain('archive: archive && !failedAssistant && !interruptedAssistant');
     expect(finalizeBody).toContain('_attachFailedAssistantActions(ph, () => _messageTextForActions(ph, text));');
     expect(finalizeBody).toContain('_attachInterruptedAssistantActions(ph, () => _messageTextForActions(ph, text), { archive });');
-    expect(finalizeBody).toContain("failure_kind: String(gm.failure_kind || '')");
 
     const failedActionsBody = extractFunction('_attachFailedAssistantActions');
     expect(failedActionsBody).toContain("msgDiv.dataset.failed = '1';");
@@ -238,7 +221,8 @@ describe('conversation failed assistant retry actions', () => {
     expect(failedActionsBody).toContain('retry: true');
     expect(failedActionsBody).not.toContain('report: true');
     expect(source).toContain("const mode = compact\n    ? 'failure-only'\n    : includeRetry");
-    expect(source).toContain('class="chat-bubble-more-wrap"');
+    expect(source).not.toContain('class="chat-bubble-more-wrap"');
+    expect(source).toContain('class="bubble-action-btn bubble-copy-btn"');
     expect(source).toContain('_attachBubbleRetryBtn(directActions, msgDiv)');
 
     const interruptedActionsBody = extractFunction('_attachInterruptedAssistantActions');
@@ -251,21 +235,9 @@ describe('conversation failed assistant retry actions', () => {
   });
 
   it('does not send model output error telemetry in the open build', () => {
-    const { track, calls } = loadModelOutputTracker();
-    const msgDiv = {
-      dataset: {
-        msgId: 'm123',
-        turnId: 'turn-1',
-        fromActor: 'commander',
-      },
-    };
-    const longError = `Model call failed: ${'x'.repeat(900)}`;
-
-    track('cid-1', msgDiv, longError, { stage: 'stream_event' });
-    track('cid-1', msgDiv, longError, { stage: 'stream_event' });
-    track('cid-1', msgDiv, 'aborted', { aborted: true });
-
-    expect(calls).toHaveLength(0);
+    expect(source).not.toContain('_handleModelOutputErrorForUi');
+    expect(source).not.toContain('_trimTelemetryText');
+    expect(source).not.toContain("_convTrackError('model_output_error'");
   });
 
 });

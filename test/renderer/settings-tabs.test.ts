@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -28,14 +28,17 @@ class FakeElement {
   dataset: Record<string, string>;
   classList: FakeClassList;
   hidden = false;
-  listeners = new Map<string, Array<() => void>>();
+  tabIndex = -1;
+  focused = false;
+  attributes: Record<string, string> = {};
+  listeners = new Map<string, Array<(event?: any) => void>>();
 
   constructor(dataset: Record<string, string>, classes: string[] = []) {
     this.dataset = dataset;
     this.classList = new FakeClassList(classes);
   }
 
-  addEventListener(type: string, handler: () => void) {
+  addEventListener(type: string, handler: (event?: any) => void) {
     const list = this.listeners.get(type) || [];
     list.push(handler);
     this.listeners.set(type, list);
@@ -43,6 +46,20 @@ class FakeElement {
 
   click() {
     for (const handler of this.listeners.get('click') || []) handler();
+  }
+
+  setAttribute(name: string, value: string) {
+    this.attributes[name] = value;
+  }
+
+  focus() {
+    this.focused = true;
+  }
+
+  keydown(key: string) {
+    const event = { key, preventDefault: vi.fn() };
+    for (const handler of this.listeners.get('keydown') || []) handler(event);
+    return event;
   }
 }
 
@@ -107,6 +124,26 @@ describe('settings tabs module', () => {
     expect(panes[0].hidden).toBe(true);
     expect(panes[1].hidden).toBe(false);
     expect(panes[2].hidden).toBe(true);
+    expect(tabs[1].attributes['aria-selected']).toBe('true');
+    expect(tabs[1].tabIndex).toBe(0);
+    expect(tabs[0].attributes['aria-selected']).toBe('false');
+    expect(tabs[0].tabIndex).toBe(-1);
+  });
+
+  it('supports the horizontal ARIA tab keyboard pattern', () => {
+    const { window, tabs, panes } = loadSettingsTabsModule();
+
+    window.initSettingsTabs();
+    const event = tabs[0].keydown('ArrowLeft');
+
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(tabs[2].focused).toBe(true);
+    expect(tabs[2].attributes['aria-selected']).toBe('true');
+    expect(panes[2].hidden).toBe(false);
+
+    tabs[2].keydown('Home');
+    expect(tabs[0].focused).toBe(true);
+    expect(panes[0].hidden).toBe(false);
   });
 
   it('falls back to the first surviving tab when asked for a stripped tab', () => {

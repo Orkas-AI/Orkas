@@ -52,15 +52,11 @@ function _memLogSafe(level, message, data) {
   } catch (_) { /* diagnostics must not alter the operation result */ }
 }
 
-function _memTrackEvent(action, data) {
+function _memLogResult(action, data) {
   _memLogSafe('info', 'memory action result', { action, ...(data || {}) });
 }
 
-function _memTrackError(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-}
-
-function _memTrackReadResult(action, startedAt, results) {
+function _memLogReadResult(action, startedAt, results) {
   const rows = Array.isArray(results) ? results : [];
   const failures = rows.filter((row) => !row || row.ok !== true);
   const successCount = rows.length - failures.length;
@@ -82,7 +78,7 @@ function _memTrackReadResult(action, startedAt, results) {
     payload.error_code = errorCodes.length === 1 ? errorCodes[0] : 'multiple';
     payload.error_type = errorTypes.length === 1 ? errorTypes[0] : 'runtime';
   }
-  _memTrackEvent('memory_read_result', payload);
+  _memLogResult('memory_read_result', payload);
 }
 
 function _memDuration(startedAt) {
@@ -139,12 +135,6 @@ function _memReportIpcFailure(channel, result) {
   if (_memIpcFailureCount >= _MEM_IPC_FAILURE_MAX_PER_SESSION) return;
   _memIpcFailureState.set(key, now);
   _memIpcFailureCount += 1;
-  _memTrackError('memory_ipc', {
-    channel: safeChannel,
-    error_type: details.error_type,
-    error_code: details.error_code,
-    error_message: details.error_code,
-  });
 }
 
 async function _memInvoke(channel, payload, options) {
@@ -226,7 +216,7 @@ async function _memLoad() {
     _memParseScope(s.key),
     { resultOwned: true },
   )));
-  _memTrackReadResult('list', startedAt, results);
+  _memLogReadResult('list', startedAt, results);
   _memData = {};
   _memScopes.forEach((s, i) => {
     const r = results[i];
@@ -241,7 +231,7 @@ async function _memReveal(target) {
     _memParseScope(target),
     { resultOwned: true },
   );
-  _memTrackReadResult('reveal', startedAt, [result]);
+  _memLogReadResult('reveal', startedAt, [result]);
   return result;
 }
 
@@ -488,7 +478,7 @@ async function _memSaveEditor(target) {
   const durationMs = _memDuration(startedAt);
   if (!res.ok) {
     const details = _memFailureDetails(res);
-    _memTrackEvent('memory_entry_save_result', {
+    _memLogResult('memory_entry_save_result', {
       result: 'failure',
       target: safeTarget,
       mode,
@@ -498,7 +488,7 @@ async function _memSaveEditor(target) {
     _memToast(_memErrorToText(res.error), 'error');
     return;
   }
-  _memTrackEvent('memory_entry_save_result', {
+  _memLogResult('memory_entry_save_result', {
     result: 'success',
     target: safeTarget,
     mode,
@@ -524,7 +514,7 @@ async function _memDelete(target, text) {
   const durationMs = _memDuration(startedAt);
   if (!res.ok) {
     const details = _memFailureDetails(res);
-    _memTrackEvent('memory_entry_delete_result', {
+    _memLogResult('memory_entry_delete_result', {
       result: 'failure',
       target: safeTarget,
       duration_ms: durationMs,
@@ -533,7 +523,7 @@ async function _memDelete(target, text) {
     _memToast(_memErrorToText(res.error), 'error');
     return;
   }
-  _memTrackEvent('memory_entry_delete_result', {
+  _memLogResult('memory_entry_delete_result', {
     result: 'success',
     target: safeTarget,
     duration_ms: durationMs,
@@ -797,7 +787,7 @@ async function _memDoMerge() {
   }
   // Persistence is the terminal boundary. Modal/toast/render failures cannot
   // erase or reverse the completed aggregate result.
-  _memTrackEvent('memory_import_result', resultPayload);
+  _memLogResult('memory_import_result', resultPayload);
   _memCloseModal();
   if (added) _memToast(t('memory.merge_done', { n: added }), 'success');
   if (failed) _memToast(t('memory.merge_partial', { n: failed }), 'warning');

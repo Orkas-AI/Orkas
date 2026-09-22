@@ -1,3 +1,5 @@
+import { estimateBudgetTokens, estimateBudgetTokenQuarters, truncateBudgetText } from '../../util/token-estimate';
+import { isPortableRuntimeRef } from './skill-runtime-ref';
 /**
  * Skill registry implementation: source loaders, prompt rosters, conflict
  * resolution, and run-scoped logical bindings. The complete runtime policy is
@@ -6,6 +8,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { isPathAllowed } from '../../util/path-sandbox';
 
 import {
   agentEvolvedSkillsDir,
@@ -24,8 +27,8 @@ import { registerUserSwitchHook } from '../../features/user-switch-hooks';
 import { getLanguage, getGlobalSkillRootsEnabled } from '../../features/config';
 import { descriptionLang } from '../../i18n';
 import {
-  SKILL_DESCRIPTION_ROSTER_MAX_CHARS,
-  SKILL_ROSTER_MAX_CHARS,
+  SKILL_DESCRIPTION_ROSTER_MAX_TOKENS,
+  SKILL_ROSTER_MAX_TOKENS,
 } from '../../util/skill-description-policy';
 // `pickDescription` is loaded lazily — see CLAUDE.md §3: any static import
 // from `#core-agent` at module load would pull in pi-ai before
@@ -114,9 +117,13 @@ function capPromptDescription(text: string, maxChars: number): string {
   return `${visible}…`;
 }
 
+export function compactAgentPromptDescription(description: string, maxChars: number): string {
+  return capPromptDescription(String(description || '').trim(), maxChars);
+}
+
 export function compactPromptDescription(
   description: string,
-  maxChars: number = SKILL_DESCRIPTION_ROSTER_MAX_CHARS,
+  maxTokens: number = SKILL_DESCRIPTION_ROSTER_MAX_TOKENS,
 ): string {
   const text = String(description || '').trim();
   if (!text) return '';
@@ -124,7 +131,7 @@ export function compactPromptDescription(
   // and any necessary boundary all affect whether the model reads the body.
   // Do not guess which clauses are expendable. Authors keep entries concise;
   // runtime only enforces the roster's visible safety ceiling.
-  return capPromptDescription(text, maxChars);
+  return truncateBudgetText(text, maxTokens);
 }
 
 /** Prompt-internal routing descriptions use one stable language so a Chinese
@@ -232,9 +239,22 @@ export interface SkillRuntimeBinding {
   entryReadPrelude?: string;
 }
 
-function isPortableRuntimeRef(value: string): boolean {
-  const ref = String(value || '').trim();
-  return /^[A-Za-z0-9][A-Za-z0-9._:@+-]*$/u.test(ref);
+/** Dependency candidates reuse the already enabled, owner-filtered and bounded
+ * roster. Commander-only protocols and transient open-Skill reads are never
+ * advertised as durable Agent dependencies. No additional discovery or grants. */
+export function getAgentSkillDependenciesPromptBlock(
+  bindings: ReadonlyMap<string, SkillRuntimeBinding>,
+): string {
+  const lines = ['## Agent Skill dependencies', ''];
+  const seen = new Set<SkillRuntimeBinding>();
+  for (const [ref, binding] of bindings) {
+    if (seen.has(binding)) continue;
+    seen.add(binding);
+    if (!['builtin', 'platform', 'custom', 'agent', 'agent2'].includes(binding.source)) continue;
+    lines.push(`- **${binding.name}** (read ref: @skill/${ref})`);
+  }
+  if (lines.length === 2) lines.push('(none)');
+  return lines.join('\n');
 }
 
 function sameRuntimeBinding(a: SkillRuntimeBinding, b: SkillRuntimeBinding): boolean {
@@ -328,7 +348,7 @@ interface RenderSkillLinesOptions {
   /** User-selected Skills stay fully described even when the shared roster is
    * compacted. Object identity is stable within one registry render. */
   forceFullSpecs?: ReadonlySet<SkillSpec>;
-  maxChars?: number;
+  maxTokens?: number;
   onRenderedSpecs?: (specs: readonly SkillSpec[]) => void;
 }
 
@@ -347,15 +367,34 @@ async function renderSkillLines(
   // Only print ROOT rows the entry list actually references; roots with zero
   // surviving entries would be prompt noise.
   const usedLabels = new Set<string>();
+  const labels = new Map<SkillSpec, string>();
+  const descriptions = new Map<SkillSpec, string>();
+  // Local to this render: no stale cross-run rows or unbounded global text cache.
+  const lineCosts = new Map<string, number>();
+  const textCost = (lines: string[]): number => {
+    let quarters = Math.max(0, lines.length - 1); // newline separators reset lexical state
+    for (const line of lines) {
+      let cost = lineCosts.get(line);
+      if (cost === undefined) {
+        cost = estimateBudgetTokenQuarters(line);
+        lineCosts.set(line, cost);
+      }
+      quarters += cost;
+    }
+    return Math.ceil(quarters / 4);
+  };
   const labelOf = (s: SkillSpec): string => {
+    const cached = labels.get(s);
+    if (cached !== undefined) return cached;
     const trusted = skillSourceLabelForSpec(s);
-    if (trusted !== 'unknown') return trusted;
-    return labelByRoot.get(path.resolve(s.source)) || 'unknown';
+    const label = trusted !== 'unknown' ? trusted : labelByRoot.get(path.resolve(s.source)) || 'unknown';
+    labels.set(s, label);
+    return label;
   };
   const build = (
     selected: SkillSpec[],
     detailed: ReadonlySet<SkillSpec>,
-  ): { text: string; bindings: Map<string, SkillRuntimeBinding> | null } => {
+  ): { text: string; tokens: number; bindings: Map<string, SkillRuntimeBinding> | null } => {
     usedLabels.clear();
     for (const s of selected) usedLabels.add(labelOf(s));
     const nextBindings = runtimeBindings ? new Map(runtimeBindings) : null;
@@ -386,9 +425,10 @@ async function renderSkillLines(
     }
     for (const s of selected) {
       const source = labelOf(s);
-      const description = detailed.has(s)
-        ? compactPromptDescription(pickPromptDescription(s))
-        : '';
+      if (detailed.has(s) && !descriptions.has(s)) {
+        descriptions.set(s, compactPromptDescription(pickPromptDescription(s)));
+      }
+      const description = detailed.has(s) ? descriptions.get(s)! : '';
       const desc = description ? ` — ${description}` : '';
       const displayName = s.name || s.id;
       const runtimeRef = runtimeRefBySpec?.get(s);
@@ -397,14 +437,14 @@ async function renderSkillLines(
         : displayName !== s.id ? `; internal read id: ${s.id}` : '';
       lines.push(`- **${displayName}** (Source: ${source}${internal})${desc}`);
     }
-    return { text: lines.join('\n'), bindings: nextBindings };
+    return { text: lines.join('\n'), tokens: textCost(lines), bindings: nextBindings };
   };
 
-  const maxChars = Math.max(1, options.maxChars ?? SKILL_ROSTER_MAX_CHARS);
+  const maxTokens = Math.max(1, options.maxTokens ?? SKILL_ROSTER_MAX_TOKENS);
   const allDetailed = new Set(specs);
   let finalSpecs = specs;
   let result = build(specs, allDetailed);
-  if (result.text.length > maxChars) {
+  if (result.tokens > maxTokens) {
     // System Skills are rendered by a separate block. In the regular roster,
     // platform builtins, the acting Agent's private Skills, and explicit user
     // selections are non-searchable or user-mandated, so they remain complete.
@@ -418,7 +458,7 @@ async function renderSkillLines(
     const searchable = specs.filter((s) => !protectedSpecs.has(s));
     // Fit searchable name-only rows by stable source priority. There is no
     // item-count limit: retain the longest priority prefix that fits the one
-    // character budget. Binary search keeps large registries O(n log n).
+    // token budget. Binary search keeps large registries O(n log n).
     const orderedSearchable = searchable
       .map((spec, index) => ({ spec, index, rank: SOURCE_DEDUPE_RANK[labelOf(spec) as SkillSourceLabel] ?? 99 }))
       .sort((a, b) => (a.rank - b.rank) || (a.index - b.index));
@@ -429,7 +469,7 @@ async function renderSkillLines(
       const candidate = new Set(protectedSpecs);
       for (let i = 0; i < middle; i += 1) candidate.add(orderedSearchable[i].spec);
       const next = build(specs.filter((s) => candidate.has(s)), protectedSpecs);
-      if (next.text.length <= maxChars) low = middle;
+      if (next.tokens <= maxTokens) low = middle;
       else high = middle - 1;
     }
     const retained = new Set(protectedSpecs);
@@ -438,7 +478,7 @@ async function renderSkillLines(
     // Gradual compaction: with the retained set fixed, give the top-ranked
     // searchable rows their descriptions back for as long as the roster still
     // fits, and degrade only the tail to name-only rows. Descriptions only add
-    // characters, so the longest describable prefix is a second binary search.
+    // tokens, so the longest describable prefix is a second binary search.
     const retainedSearchable = orderedSearchable.slice(0, low).map((item) => item.spec);
     let detailedLow = 0;
     let detailedHigh = retainedSearchable.length;
@@ -446,7 +486,7 @@ async function renderSkillLines(
       const middle = Math.ceil((detailedLow + detailedHigh) / 2);
       const detailed = new Set(protectedSpecs);
       for (let i = 0; i < middle; i += 1) detailed.add(retainedSearchable[i]);
-      if (build(finalSpecs, detailed).text.length <= maxChars) detailedLow = middle;
+      if (build(finalSpecs, detailed).tokens <= maxTokens) detailedLow = middle;
       else detailedHigh = middle - 1;
     }
     const detailedSpecs = new Set(protectedSpecs);
@@ -1193,11 +1233,11 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   rendered = rendered.filter((s) => !s.ownerAgent || s.ownerAgent === actorAgentId);
 
   const includeSearchHint = opts.includeSkillSearchHint === true;
-  const hintCost = includeSearchHint ? SKILL_SEARCH_HINT.length + 2 : 0;
+  const hintCost = includeSearchHint ? estimateBudgetTokens(`\n\n${SKILL_SEARCH_HINT}`) : 0;
   let actuallyRendered: readonly SkillSpec[] = [];
   const block = await renderSkillLines(rendered, rootEntries, opts.runtimeBindings, {
     forceFullSpecs: new Set(forcedSpecs),
-    maxChars: Math.max(1, SKILL_ROSTER_MAX_CHARS - hintCost),
+    maxTokens: Math.max(1, SKILL_ROSTER_MAX_TOKENS - hintCost),
     onRenderedSpecs: (next) => { actuallyRendered = next; },
   });
   // Signals and display metadata must describe the effective prompt, not rows
@@ -1247,15 +1287,10 @@ export async function getSystemSkillsPromptBlock(
     '',
     'Treat each description as an activation contract. Decide from the whole request\'s intended outcome and context, not keyword overlap. Before answering or calling another tool, read the smallest complete set whose use conditions apply; never load nonmatches.',
     '',
-    'Read one match:',
+    'Read all matches together in one call (one path entry per match):',
     runtimeRefBySpec
-      ? '`read_files({"paths":[{"path":"@skill/<read-ref>"}]})` using the exact read ref on the matching entry.'
+      ? '`read_files({"paths":[{"path":"@skill/<read-ref>"}]})` using the exact read refs on matching entries.'
       : '`read_files({"paths":[{"path":"<SYSTEM_SKILLS_ROOT>/<id>/SKILL.md"}]})`',
-    '',
-    'Read 2+ matches together first:',
-    runtimeRefBySpec
-      ? '`read_files({"paths":[{"path":"@skill/<read-ref-1>"},{"path":"@skill/<read-ref-2>"}]})` using the exact read refs on the matching entries.'
-      : '`read_files({"paths":[{"path":"<SYSTEM_SKILLS_ROOT>/<id-1>/SKILL.md"},{"path":"<SYSTEM_SKILLS_ROOT>/<id-2>/SKILL.md"}]})`',
     'Load only system SKILL.md files in that call; read attachments and other task sources afterward.',
     ...(runtimeRefBySpec ? [] : ['', 'SYSTEM_SKILLS_ROOT:', root]),
     '',
@@ -1282,6 +1317,9 @@ export interface BridgeSkillRow {
   package_enabled?: boolean;
 }
 
+/** Read-only product API guidance shared with app-authoring task runtimes. */
+export const APP_AUTHORING_SYSTEM_SKILLS: readonly string[] = ['web-app-sdk'];
+
 /**
  * Trusted + external-package listing for the orkas-bridge (external CLI
  * agents calling back into Orkas — plan §D). The CLI gets the trusted tier
@@ -1294,13 +1332,12 @@ export interface BridgeSkillRow {
  * matches `getSystemPromptBlock` (trusted shadows external). The disabled-id
  * filter is the caller's job (bridge.ts passes the component-enabled set).
  */
-export async function listSkillsForBridge(uid: string): Promise<BridgeSkillRow[]> {
+export async function listSkillsForBridge(uid: string, agentId = ''): Promise<BridgeSkillRow[]> {
   const loader = await getLoader(uid);
   const lang = descriptionLang(getLanguage());
   const pick = await getPickDescription();
-  // Agent-private skills never reach external CLI agents — the orkas-bridge
-  // serves the CLI actor, never the in-process owning agent.
-  let specs: SkillSpec[] = loader.list().filter((s) => !s.ownerAgent);
+  // Identity is supplied by the run host, never by the MCP caller.
+  let specs: SkillSpec[] = loader.list().filter((s) => !s.ownerAgent || (!!agentId && s.ownerAgent === agentId));
   const rankByRoot = new Map<string, number>();
   const openDirs = _computeOpenTierDirs(uid);
   const openLoader = await getOpenLoader(openDirs);
@@ -1311,7 +1348,7 @@ export async function listSkillsForBridge(uid: string): Promise<BridgeSkillRow[]
     // External packages only — a spec sourced from a global root is dropped
     // here so the CLI never sees it twice (native + bridge).
     specs = [...specs, ...openLoader.list().filter((s) => {
-      if (!externalSet.has(path.resolve(s.source))) return false;
+      if (!externalSet.has(path.resolve(s.source)) || s.ownerAgent) return false;
       if (trustedIds.has(s.id)) return false;
       const meta = packageMetaForSkillDir(uid, s.dir);
       return !!meta.package_name && meta.package_enabled !== false;
@@ -1321,9 +1358,41 @@ export async function listSkillsForBridge(uid: string): Promise<BridgeSkillRow[]
     const openRank = s.source ? rankByRoot.get(path.resolve(s.source)) : undefined;
     return openRank !== undefined ? openRank : SOURCE_DEDUPE_RANK[skillSourceLabelForSpec(s, uid)];
   });
+  const privateDirs = new Set<string>();
+  if (agentId) {
+    const owned = await loadAgentPrivateSkillSpecs(uid, agentId);
+    const evolvedRoot = agentEvolvedSkillsDir(uid, agentId);
+    if (fs.existsSync(evolvedRoot)) {
+      owned.push({ root: evolvedRoot, specs: (await getAgentPrivateLoader(evolvedRoot)).list() as SkillSpec[] });
+    }
+    const ids = new Set(specs.map((s) => s.id));
+    for (const { root, specs: privateSpecs } of owned) {
+      // A private source cannot borrow another owner's directory or entry
+      // through a symlink, even when the copied frontmatter omits ownerAgent.
+      if (fs.lstatSync(root).isSymbolicLink() || fs.lstatSync(path.dirname(root)).isSymbolicLink()) continue;
+      for (const s of privateSpecs) {
+        if ((s.ownerAgent && s.ownerAgent !== agentId) || ids.has(s.id)
+            || !isPathAllowed(s.dir, [root]) || !isPathAllowed(s.skillFile, [s.dir])) continue;
+        ids.add(s.id);
+        privateDirs.add(s.dir);
+        specs.push(s);
+      }
+    }
+  }
+  // SDK guidance is a narrow System exception, not access to authoring/mutation
+  // protocols. A custom/private name collision cannot replace this contract.
+  const systemRoot = path.resolve(userSystemSkillsDir(uid));
+  const { SkillLoader } = await import('#core-agent');
+  const authoringSpecs = new SkillLoader({ dirs: [systemRoot] }).list().filter(s =>
+    APP_AUTHORING_SYSTEM_SKILLS.includes(s.id) && !s.ownerAgent
+    && isPathAllowed(s.dir, [systemRoot]) && isPathAllowed(s.skillFile, [s.dir]));
+  const systemDirs = new Set(authoringSpecs.map(s => s.dir));
+  specs = [...authoringSpecs, ...specs.filter(s => !authoringSpecs.some(a =>
+    a.id === s.id || (a.name || a.id).toLowerCase() === (s.name || s.id).toLowerCase()))];
   return specs.map((s) => {
     const openRank = rankByRoot.get(path.resolve(s.source));
-    const source = openRank === SOURCE_DEDUPE_RANK.external ? 'external' : skillSourceLabelForSpec(s, uid);
+    const source = systemDirs.has(s.dir) ? 'system' : privateDirs.has(s.dir) || s.ownerAgent ? 'agent'
+      : openRank === SOURCE_DEDUPE_RANK.external ? 'external' : skillSourceLabelForSpec(s, uid);
     return {
       id: s.id,
       name: s.name || s.id,

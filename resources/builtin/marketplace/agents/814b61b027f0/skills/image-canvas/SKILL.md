@@ -7,7 +7,7 @@ description_en: After route lock, creates a shared canvas contract only for mult
 
 # Image Canvas
 
-Read this private ImageStudio skill only after route lock when the result has multiple meaningful visual regions, an explicit reading order, exact layout constraints, or references bound to regions. Skip it for a simple single-region image. If art direction is also needed, read `image-craft` first. This adapts the Canvas-as-intermediate-representation method popularized by Omost into Orkas's provider-neutral manifest; it does not import an Omost model runtime.
+Read this private ImageStudio skill only after route lock when the result has multiple meaningful visual regions, an explicit reading order, exact layout constraints, or references bound to regions. Skip it for a simple single-region image. If art direction is also needed, establish it with `image-craft` before designing the canvas. This adapts the Canvas-as-intermediate-representation method popularized by Omost into Orkas's provider-neutral manifest; it does not import an Omost model runtime.
 
 ## Canvas contract
 
@@ -19,7 +19,7 @@ Populate the canonical `image-manifest.json` template's `visual_plan` object whe
 
 Use as few regions as possible. Regions describe visible image logic, not implementation components. Reserve meaningful negative space deliberately and prevent hero, copy, and support regions from competing for the same focal priority.
 
-For `COMPOSE` and `HYBRID`, map every region to at least one HTML/SVG element with `data-image-region="<id>"`. ImageStudio blocks snapshots when the plan and DOM diverge. For `GENERATE` and `EDIT`, compile the global description and region details into the provider prompt, preserving the same reading order and crop.
+For a final HTML composition, map every region to at least one HTML/SVG element with `data-image-region="<id>"`. ImageStudio blocks snapshots when the plan and DOM diverge. For model-produced raster assets, compile the global description and region details into the provider prompt, preserving the same reading order and crop.
 
 ## Reference contract
 

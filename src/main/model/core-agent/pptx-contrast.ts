@@ -39,6 +39,13 @@ function unwrapTree(value: unknown): JsonRecord | null {
   const root = record(value);
   if (!root) return null;
   const data = record(root.data);
+  // `get / --json` wraps the presentation in a query result, while older
+  // callers provide the tree directly. Never audit an arbitrary match.
+  if (data && Array.isArray(data.results)) {
+    if (data.results.length !== 1) return null;
+    const tree = record(data.results[0]);
+    return tree?.path === '/' && tree.type === 'presentation' ? tree : null;
+  }
   return data && (data.path !== undefined || data.children !== undefined) ? data : root;
 }
 

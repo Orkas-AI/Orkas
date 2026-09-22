@@ -46,10 +46,22 @@ export function resolveCatalogConnection(
   rawParameters?: unknown,
 ): ResolvedCatalogConnection {
   const setup = entry.connection_setup;
-  if (!setup) {
+  if (!setup || setup.fields.length === 0) {
     if (rawParameters !== undefined && rawParameters !== null) {
       if (!_isPlainObject(rawParameters) || Object.keys(rawParameters).length > 0) {
         throw new Error(`connector '${entry.id}' does not accept connection parameters`);
+      }
+    }
+    // A prerequisite-only guide does not create tenant parameters. Preserve
+    // existing grants on reconnect while refusing an unbound URL template.
+    if (setup) {
+      const transport = entry.transport_template;
+      if (transport?.kind !== 'streamable-http' || /[{}]/.test(transport.url)) {
+        throw new Error('invalid connector connection setup');
+      }
+      const url = new URL(transport.url);
+      if (url.protocol !== 'https:' || url.username || url.password) {
+        throw new Error('resolved connector URL must be credential-free HTTPS');
       }
     }
     return { entry };

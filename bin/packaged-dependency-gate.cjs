@@ -4,8 +4,25 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const asar = require('@electron/asar');
-const semver = require('semver');
+function requireGateTool(name) {
+  try {
+    return require(name);
+  } catch (err) {
+    if (err.code !== 'MODULE_NOT_FOUND' || !String(err.message).includes(`'${name}'`)) throw err;
+    return require(path.join(__dirname, '..', 'product', 'node_modules', ...name.split('/')));
+  }
+}
+
+const asar = requireGateTool('@electron/asar');
+const semver = requireGateTool('semver');
+const minimatchModule = requireGateTool('minimatch');
+const minimatch = minimatchModule.minimatch || minimatchModule;
+
+// Full package graphs consumed by ordinary bundled Node. Connector adapters
+// load selected SDK entrypoints; their smaller closure and executable smoke
+// remain owned by packaged-entrypoint-gate.cjs. Electron-only dependencies can
+// stay in app.asar. See docs/packaged-dependencies.md for the complete inventory.
+const NODE_RUNTIME_PACKAGE_ROOTS = Object.freeze(['sharp', 'tsx']);
 
 const TARGETS = new Set(['darwin-arm64', 'darwin-x64', 'win32-x64']);
 const PACKAGE_ROOT_PATTERN = /^(?:node_modules\/(?:@[^/]+\/)?[^/]+)(?:\/node_modules\/(?:@[^/]+\/)?[^/]+)*$/;
@@ -303,6 +320,68 @@ function verifyResolvedGraph(sourcePackage, rootManifest, records) {
   return { edgeCount, overrideEdgeCount };
 }
 
+function nodeRuntimeClosure(records, rootNames, includeOptional) {
+  const found = new Set();
+  const queue = rootNames.map((name) => {
+    const record = records.get(`node_modules/${name}`);
+    if (!record) fail(`stock Node runtime root missing: ${name}`);
+    return record;
+  });
+  for (let index = 0; index < queue.length; index += 1) {
+    const current = queue[index];
+    if (found.has(current.root)) continue;
+    found.add(current.root);
+    for (const edge of dependencySpecs(current.manifest)) {
+      if (!includeOptional && !edge.required) continue;
+      const resolved = resolveDependency(records, current.root, edge.name);
+      if (!resolved && edge.required) fail(`stock Node ${current.root} is missing ${edge.name}`);
+      if (resolved) queue.push(resolved);
+    }
+  }
+  return [...found].sort();
+}
+
+function verifyNodeRuntimeBuildConfig(sourcePackage, lock) {
+  const records = new Map(Object.entries(lock.packages || {}).filter(([root]) => root).map(([root, manifest]) => (
+    [root, { root, manifest }]
+  )));
+  const inventory = nodeRuntimeClosure(records, NODE_RUNTIME_PACKAGE_ROOTS, false);
+  for (const root of inventory) {
+    for (const field of ['files', 'asarUnpack']) {
+      const patterns = sourcePackage.build?.[field] || [];
+      const file = `${root}/package.json`;
+      const included = patterns.some((pattern) => typeof pattern === 'string'
+        && !pattern.startsWith('!') && minimatch(file, pattern, { dot: true }));
+      const excluded = patterns.some((pattern) => typeof pattern === 'string'
+        && pattern.startsWith('!') && minimatch(file, pattern.slice(1), { dot: true }));
+      if (!included || excluded) fail(`stock Node ${root} must be included in build.${field}`);
+    }
+  }
+  return inventory;
+}
+
+function verifyUnpackedNodeRuntime(appAsar, sourcePackage, records) {
+  const roots = NODE_RUNTIME_PACKAGE_ROOTS.filter((name) => sourcePackage.dependencies?.[name]);
+  const inventory = nodeRuntimeClosure(records, roots, true);
+  // Visit each package's own archive entries once. Do not walk nested packages
+  // here; resolution above selects the actual dependency, including nesting.
+  function visit(relative, entry) {
+    if (entry.files) {
+      for (const [name, child] of Object.entries(entry.files)) {
+        if (name !== 'node_modules') visit(`${relative}/${name}`, child);
+      }
+      return;
+    }
+    if (!entry.unpacked) fail(`stock Node ${relative} is not unpacked from app.asar`);
+    const file = path.join(`${appAsar}.unpacked`, ...relative.split('/'));
+    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) fail(`stock Node ${relative} is missing`);
+    // Signing can change native binary sizes after the archive is written.
+    // Architecture/integrity and executable behavior have their own gates.
+  }
+  for (const root of inventory) visit(root, asar.statFile(appAsar, root));
+  return inventory;
+}
+
 function inventoryCounts(records, predicate) {
   const counts = {};
   for (const record of records.values()) {
@@ -327,6 +406,7 @@ function verifyPackagedDependencyGraphWithRawFs(options) {
   const records = packageRecords(manifests, lockedVersionsByName(lock), platform, arch);
   verifyDirectDependencies(sourcePackage, lock, records);
   const graph = verifyResolvedGraph(sourcePackage, rootManifest, records);
+  const nodeRuntimeInventory = verifyUnpackedNodeRuntime(appAsar, sourcePackage, records);
   const packageCount = records.size;
 
   return {
@@ -335,6 +415,7 @@ function verifyPackagedDependencyGraphWithRawFs(options) {
     packageCount,
     edgeCount: graph.edgeCount,
     overrideEdgeCount: graph.overrideEdgeCount,
+    nodeRuntimeInventory,
     neutralInventory: inventoryCounts(records, (record) => !record.platformSpecific),
     platformInventory: inventoryCounts(records, (record) => record.platformSpecific),
     // mac x64/arm64 packages that are OS-specific but support both CPUs must
@@ -388,8 +469,10 @@ function comparePackagedDependencyInventories(left, right) {
 }
 
 module.exports = {
+  NODE_RUNTIME_PACKAGE_ROOTS,
   TARGETS,
   comparePackagedDependencyInventories,
   packageRootFromManifestPath,
   verifyPackagedDependencyGraph,
+  verifyNodeRuntimeBuildConfig,
 };

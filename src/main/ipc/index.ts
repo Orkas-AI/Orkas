@@ -14,6 +14,7 @@
  * dropping it into `invokeHandlers` or `streamHandlers`.
  */
 
+import { readTextPreview } from '../util/text-preview';
 import { app, ipcMain, dialog, BrowserWindow, type WebContents } from 'electron';
 
 import * as users from '../features/users';
@@ -25,6 +26,7 @@ import * as projectDriver from '../features/project_driver';
 import * as projectDriverRunner from '../features/project_driver_runner';
 import * as projectLibraryIndexer from '../features/project_library_indexer';
 import * as groupChat from '../features/group_chat';
+import { readState } from '../features/group_chat/state';
 import type { GroupEvent } from '../features/group_chat/bus';
 import * as agents from '../features/agents';
 import * as autoTasks from '../features/auto_tasks';
@@ -43,6 +45,8 @@ import * as chatAttachments from '../features/chat_attachments';
 import * as chatArtifacts from '../features/chat_artifacts';
 import * as conversationOutputs from '../features/conversation_outputs';
 import * as savedApps from '../features/saved_apps';
+import * as previewWindows from '../features/preview_windows';
+import { webAppInvokeHandlers, webAppCall } from './web_apps';
 import * as recycleBin from '../features/recycle_bin';
 import * as search from '../features/search';
 import * as auth from '../features/auth';
@@ -95,7 +99,7 @@ import { logErrorRef, logPathRef, maskId } from '../util/log-redact';
 import { chatMediaLocalPathFromUrl } from '../util/chat-media-url';
 import { captureDeliveredTaskIntervention } from '../util/task-intervention-events';
 import { macosTccSensitivePath } from '../util/macos-tcc';
-import { normalizeAppError } from '../util/app-error';
+import { normalizeAppError, fileFailureKind } from '../util/app-error';
 import {
   isTrustedIpcSender,
   parseInvokeEnvelope,
@@ -129,7 +133,9 @@ function logInvokeResultFailure(channel: string, result: Record<string, unknown>
   log.warn('invoke returned failure', {
     channel,
     code,
-    error: typeof result.error === 'string' ? result.error : 'operation rejected',
+    ...(channel === 'contexts.attachToDraft' || channel === 'projects.files.attachToDraft'
+      ? { failure_stage: result.failure_stage, failure_kind: result.failure_kind }
+      : { error: typeof result.error === 'string' ? result.error : 'operation rejected' }),
     ...(suppressed > 0 ? { suppressed_count: suppressed } : {}),
   });
 }
@@ -200,13 +206,13 @@ const CHAT_PICK_EXTENSIONS = [...chatAttachments.ALLOWED_EXTENSIONS]
   .map((ext) => ext.replace(/^\./, ''))
   .sort();
 const CONTEXT_PICK_EXTENSIONS = [
-  'md', 'markdown', 'txt', 'csv', 'tsv', 'json', 'yaml', 'yml', 'log',
+  'md', 'markdown', 'txt', 'csv', 'tsv', 'jsonl', 'ndjson', 'rst', 'tex', 'srt', 'vtt', 'json', 'yaml', 'yml', 'log',
   'html', 'htm', 'xml', 'toml', 'ini', 'conf',
   'py', 'pyi', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
   'sh', 'bash', 'zsh', 'ps1', 'cmd', 'bat', 'rb', 'go', 'rs', 'java', 'kt',
   'c', 'cpp', 'cc', 'h', 'hpp', 'css', 'scss', 'less',
   'sql', 'graphql', 'gql',
-  'pdf', 'docx', 'docm', 'xlsx', 'xlsm', 'pptx', 'pptm',
+  'pdf', 'docx', 'docm', 'xlsx', 'xlsm', 'xls', 'pptx', 'pptm',
   'png', 'jpg', 'jpeg', 'webp', 'gif',
 ];
 const PROJECT_PICK_EXTENSIONS = [
@@ -350,7 +356,7 @@ async function _resolveWorkspaceScope(
 
 // Resolve the cid-scoped attachment dir from a renderer payload, when present.
 // The file-tools' allowed-paths scope is "active workspace ∪ this cid's
-// attachment dir" (CLAUDE.md §5); reveal + preview must honour the same
+// attachment dir" (CLAUDE.md §5); file reads and previews honour the same
 // union so a user can preview an attachment they uploaded, not just files
 // the LLM wrote into the workspace.
 function _attachmentScopeForPayload(userId: string, payload: any): string | null {
@@ -562,7 +568,7 @@ function _wrapOfficePreviewHtml(kind: OfficePreviewKind, title: string, body: st
  *  realpath-resolves both candidate and roots so a symlink planted inside
  *  any allowed root cannot exfiltrate to a path outside.
  *
- *  Centralised for `conversations.attachments.import` / `workspace.revealPath`
+ *  Centralised for `workspace.statPath`
  *  / `produced.readText` / `produced.writeText` so the scope union stays in
  *  sync. Previously each handler did its own `path.resolve(target).startsWith(
  *  scope + path.sep)` triplet — lexical only, which let a symlink target
@@ -574,6 +580,15 @@ function _wrapOfficePreviewHtml(kind: OfficePreviewKind, title: string, body: st
 async function _ipcFileSandboxAllowedRoots(userId: string, payload: any): Promise<string[]> {
   const projectId = await _resolveWorkspaceScope(userId, payload);
   const roots: string[] = [userWorkspace.getWorkspacePath(userId, projectId)];
+  // The task's device-confirmed CLI directory is its active workspace too.
+  // Use the same owner as reference resolution; a link, payload cwd, or an
+  // unconfirmed directory synced from another device cannot authorize a root.
+  const cid = payload?.cid;
+  if (typeof cid === 'string' && safeId(cid) && !chatAttachments.isDraftAttachmentCid(cid)) {
+    const state = await readState(userId, cid, projectId).catch(() => null);
+    const codingDir = state?.coding_project_dir;
+    if (codingDir && path.isAbsolute(codingDir) && !roots.includes(codingDir)) roots.push(codingDir);
+  }
   const att = _attachmentScopeForPayload(userId, payload);
   if (att) roots.push(att);
   const pf = _projectFileScopeForUser(userId, projectId);
@@ -948,6 +963,7 @@ async function _afterRecycleRestore(ctx: IpcContext, paths: string[]): Promise<v
 // merged into a `{ ok: true, ...result }` response. Throw to signal error.
 
 const invokeHandlers: Record<string, InvokeHandler> = {
+  ...webAppInvokeHandlers,
   'clientConfig.getQuickStart': async () => getQuickStartConfigState(),
   'user.init': async () => {
     const user = await users.getOrCreateSelfUser();
@@ -995,10 +1011,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'conversations.history': async (args, ctx) => {
+    const startedAt = performance.now();
     const { cid, limit = 10, before, around_index, around_message_id } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
     const projectIdHint = conversationProjectHint(args);
     const conv = await chats.getConversationMetadata(ctx.userId, cid, projectIdHint);
+    const metadataMs = Math.round(performance.now() - startedAt);
     if (!conv) throw new Error('conversation not found');
     const resolvedProjectId = conv.project_id ?? null;
     // Stamp the conv-bound agent's current enabled state so the renderer can
@@ -1012,6 +1030,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       ? around_message_id
       : '';
     const hasAroundIndex = Number.isSafeInteger(requestedAroundIndex) && requestedAroundIndex >= 0;
+    const readStartedAt = performance.now();
+    let historyMs = 0;
+    let runtimeMs = 0;
     const pagePromise = hasAroundIndex
       ? chats.getMessagesPageAtIndex(
         ctx.userId, cid, requestedAroundIndex, requestedLimit, resolvedProjectId)
@@ -1023,8 +1044,14 @@ const invokeHandlers: Record<string, InvokeHandler> = {
         resolvedProjectId,
       );
     const [runtime, initialPage] = await Promise.all([
-      groupChat.runtimeStatus(ctx.userId, cid, resolvedProjectId),
-      pagePromise,
+      groupChat.runtimeStatus(ctx.userId, cid, resolvedProjectId).then((result) => {
+        runtimeMs = Math.round(performance.now() - readStartedAt);
+        return result;
+      }),
+      pagePromise.then((result) => {
+        historyMs = Math.round(performance.now() - readStartedAt);
+        return result;
+      }),
     ]);
     let page = initialPage;
     if (hasAroundIndex && requestedAroundMessageId
@@ -1038,9 +1065,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
         );
       }
     }
+    const totalMs = Math.round(performance.now() - startedAt);
+    if (totalMs >= 1000) {
+      log.info('slow conversation history read', {
+        metadata_ms: metadataMs, history_ms: historyMs, runtime_ms: runtimeMs,
+        total_ms: totalMs, rows: page.history.length, anchored: hasAroundIndex,
+      });
+    }
     return {
       conversation: { ...conv, ...runtime, agent_enabled },
       history: page.history,
+      ...(args.live === '1' ? { live_display: groupChat.displaySnapshot(ctx.userId, cid, resolvedProjectId) } : {}),
       next_cursor: page.nextCursor,
       ...(hasAroundIndex && 'pageStart' in page && 'historyIndexes' in page ? {
         page_start: page.pageStart,
@@ -1085,7 +1120,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'conversations.create': async ({ title = '', projectId = '', assistance } = {}, ctx) => {
-    const setupAssistance = assistance === undefined ? undefined
+    const normalizedAssistance = chats.normalizeConversationAssistance(assistance);
+    const validatedAssistance = assistance === undefined ? undefined
+      : normalizedAssistance?.kind === 'app_creation' ? normalizedAssistance
       : (await import('../features/connector_setup_context')).validateConnectorSetupAssistance(assistance);
     // Validate the projectId belongs to this user before persisting it on
     // the conv record. Unknown / invalid projectIds are dropped silently
@@ -1101,7 +1138,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       kind: 'normal',
       title,
       ...(validProjectId ? { projectId: validProjectId } : {}),
-      ...(setupAssistance ? { assistance: setupAssistance } : {}),
+      ...(validatedAssistance ? { assistance: validatedAssistance } : {}),
     });
     return { conversation: conv };
   },
@@ -1289,11 +1326,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     };
   },
 
-  'projects.tasks.create': async ({ projectId, taskId, title, detail, status, owner_agent, owner_agent_id, depends_on } = {}, ctx) => {
+  'projects.tasks.create': async ({ projectId, taskId, content, title, detail, status, owner_agent, owner_agent_id, depends_on } = {}, ctx) => {
     const scopeProjectId = todoProjectScope(projectId);
-    if (typeof title !== 'string') throw new Error('invalid title');
+    if (content !== undefined && typeof content !== 'string') throw new Error('invalid content');
     const r = await projectTasks.createTask(ctx.userId, scopeProjectId, {
-      title, detail, status, owner_agent, owner_agent_id, depends_on, created_by: 'user',
+      content, title, detail, status, owner_agent, owner_agent_id, depends_on, created_by: 'user',
       // Optional pre-allocated id so the editor can stage attachments before the
       // task exists; create adopts whatever landed in that draft dir.
       ...(typeof taskId === 'string' && taskId ? { id: taskId } : {}),
@@ -1302,10 +1339,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { task: r.task, alreadyExists: r.alreadyExists };
   },
 
-  'projects.tasks.update': async ({ projectId, taskId, title, detail, status, owner_agent, owner_agent_id, result_ref } = {}, ctx) => {
+  'projects.tasks.update': async ({ projectId, taskId, content, title, detail, status, owner_agent, owner_agent_id, result_ref } = {}, ctx) => {
     const scopeProjectId = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
-    const r = await projectTasks.updateTask(ctx.userId, scopeProjectId, taskId, { title, detail, status, owner_agent, owner_agent_id, result_ref });
+    const r = await projectTasks.updateTask(ctx.userId, scopeProjectId, taskId, { content, title, detail, status, owner_agent, owner_agent_id, result_ref });
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { task: r.task };
   },
@@ -1435,14 +1472,26 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'projects.files.attachToDraft': async ({ cid, projectId, name } = {}, ctx) => {
-    if (typeof cid !== 'string' || !cid) throw new Error('missing cid');
-    if (!safeId(projectId)) throw new Error('invalid projectId');
-    if (typeof name !== 'string' || !name.trim()) throw new Error('missing name');
-    const resolved = await projectFiles.resolveProjectFileAbsPath(ctx.userId, projectId, name);
-    if (!resolved.ok) throw new Error((resolved as { error?: string }).error || 'not_found');
-    const imported = await chatAttachments.importAttachmentFromPath(ctx.userId, cid, resolved.absPath);
-    if (!imported.ok) throw new Error((imported as { error?: string }).error || 'attach_failed');
-    return { info: imported.info };
+    let stage = 'input_validation';
+    try {
+      if (typeof cid !== 'string' || !cid) throw new Error('missing cid');
+      if (!safeId(projectId)) throw new Error('invalid projectId');
+      if (typeof name !== 'string' || !name.trim()) throw new Error('missing name');
+      stage = 'source_resolve';
+      const resolved = await projectFiles.resolveProjectFileAbsPath(ctx.userId, projectId, name);
+      if (!resolved.ok) throw Object.assign(new Error((resolved as { error?: string }).error || 'not_found'), { failure_kind: fileFailureKind(resolved) });
+      stage = 'attachment_import';
+      const imported = await chatAttachments.importAttachmentFromPath(ctx.userId, cid, resolved.absPath);
+      if (!imported.ok) throw Object.assign(new Error((imported as { error?: string }).error || 'attach_failed'), { failure_kind: fileFailureKind(imported) });
+      return { info: imported.info };
+    } catch (error) {
+      const normalized = normalizeAppError(error);
+      const rawCode = (error as { code?: unknown })?.code;
+      const failureKind = fileFailureKind(error);
+      const code = typeof rawCode === 'number' ? rawCode
+        : typeof rawCode === 'string' && rawCode ? (/^\d+$/.test(rawCode.trim()) ? Number(rawCode.trim()) : rawCode) : normalized.code;
+      return { ok: false, ...normalized, code, failure_stage: stage, failure_kind: failureKind };
+    }
   },
 
   'projects.files.pickAndUpload': async ({ projectId, targetDir } = {}, ctx) => {
@@ -1470,10 +1519,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return projectFiles.createProjectTextFile(ctx.userId, projectId, name);
   },
 
-  'projects.files.readText': async ({ projectId, name }, ctx) => {
+  'projects.files.readText': async ({ projectId, name, preview }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (typeof name !== 'string' || !name) throw new Error('invalid name');
-    return projectFiles.readProjectTextFile(ctx.userId, projectId, name);
+    return projectFiles.readProjectTextFile(ctx.userId, projectId, name, preview === true || preview === 'true');
   },
 
   'projects.files.updateText': async ({ projectId, name, content }, ctx) => {
@@ -1545,6 +1594,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       bytes: r.bytes,
       mtime: r.mtime,
       error: r.error || undefined,
+      errorCode: r.errorCode,
     }));
     return { summary, files, reconcile };
   },
@@ -1718,11 +1768,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
     if (typeof sourcePath !== 'string' || !sourcePath) throw new Error('missing path');
 
+    if (!path.isAbsolute(sourcePath) || sourcePath.includes('\0')) throw new Error('invalid path');
+    // As with the native picker, user-selected attachments may come from any directory.
     const norm = path.resolve(sourcePath);
-    const allowedRoots = await _ipcFileSandboxAllowedRoots(ctx.userId, payload);
-    if (!isPathAllowed(norm, allowedRoots)) {
-      throw new Error('path is outside the user workspace');
-    }
 
     let st: fs.Stats;
     try { st = fs.statSync(norm); }
@@ -1891,6 +1939,21 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return groupChat.sendTaskNow(ctx.userId, cid, String(task_id || ''));
   },
 
+  'groupChat.tasks.beginEdit': async ({ cid, task_id }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.beginTaskEdit(ctx.userId, cid, task_id);
+  },
+
+  'groupChat.tasks.cancelEdit': async ({ cid, task_id }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.cancelTaskEdit(ctx.userId, cid, task_id);
+  },
+
+  'groupChat.tasks.edit': async ({ cid, task_id, instruction, expected_instruction, resources }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.editTask(ctx.userId, cid, task_id, instruction, expected_instruction, resources);
+  },
+
   'groupChat.tasks.setAfter': async ({ cid, task_id, after_task_id }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     const after = typeof after_task_id === 'string' && after_task_id ? after_task_id : null;
@@ -2045,14 +2108,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!safeId(cid)) throw new Error('invalid cid');
     if (typeof sourcePath !== 'string' || !sourcePath) throw new Error('missing path');
 
-    const norm = path.resolve(sourcePath);
-    const allowedRoots = await _ipcFileSandboxAllowedRoots(ctx.userId, payload);
-    const inSandbox = isPathAllowed(norm, allowedRoots);
-    const inRecordedFile = !inSandbox && await _isConversationRecordedFile(ctx.userId, cid, norm);
-    if (!inSandbox && !inRecordedFile) {
-      throw new Error('path is outside the user workspace');
-    }
-    return chatAttachments.importAttachmentFromPath(ctx.userId, cid, norm);
+    if (!path.isAbsolute(sourcePath) || sourcePath.includes('\0')) throw new Error('invalid path');
+    // Explicit attachment selection follows the same import rules as the native
+    // picker and file drops; the source does not need to be in the workspace.
+    return chatAttachments.importAttachmentFromPath(ctx.userId, cid, sourcePath);
   },
 
   'conversations.attachments.delete': async ({ cid, name }, ctx) => {
@@ -2098,7 +2157,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // `⋯` → "保存".
   'conversations.artifacts.save': async ({ cid, artifactId }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    const r = savedApps.saveFromArtifact(ctx.userId, String(cid), String(artifactId || ''));
+    const r = await savedApps.saveFromArtifact(ctx.userId, String(cid), String(artifactId || ''));
     if (!r.ok) throw new Error((r as { error?: string }).error || 'failed to save app');
     return { ok: true, id: (r as { id: string }).id, title: (r as { title: string }).title };
   },
@@ -2122,7 +2181,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!await _isAllowedFileActionPath(ctx.userId, payload, norm)) {
       throw new Error('path is outside the user workspace');
     }
-    const r = savedApps.saveFromPath(ctx.userId, norm, {
+    const r = await savedApps.saveFromPath(ctx.userId, norm, {
       title: payload?.title,
       sourceCid: payload?.cid,
       fenceRoots: await _ipcFileSandboxAllowedRoots(ctx.userId, payload),
@@ -2142,15 +2201,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: true, path: absPath };
   },
   'savedApps.openInApp': async ({ appId }, ctx) => {
-    const id = String(appId || '');
-    const r = savedApps.resolveSavedAppFilePath(ctx.userId, id, '');
-    if (!r.ok) throw new Error((r as { error?: string }).error || 'app not found');
-    const entry = (r as { entry: string }).entry || 'index.html';
-    const url = ['chat-app://saved', encodeURIComponent(id)]
-      .concat(entry.split('/').map((part) => encodeURIComponent(part)))
-      .join('/');
-    return { ok: true, url, entry };
+    return webAppInvokeHandlers['webApps.open']({ source: { appId } }, ctx);
   },
+  'previewWindows.open': async (payload, ctx) => previewWindows.openPreview(ctx.userId, ctx.sender, payload),
+  'previewWindows.initialize': async (_payload, ctx) => previewWindows.initializePreview(ctx.userId, ctx.sender),
+  'previewWindows.ready': async (_payload, ctx) => { previewWindows.readyPreview(ctx.userId, ctx.sender); return {}; },
+  'previewWindows.replace': async (payload, ctx) => { await previewWindows.replacePreview(ctx.userId, ctx.sender, payload.accepted); return {}; },
+  'previewWindows.setDirty': async (payload, ctx) => { previewWindows.setPreviewDirty(ctx.userId, ctx.sender, payload.dirty); return {}; },
+  'previewWindows.filesChanged': async (_payload, ctx) => { previewWindows.notifyPreviewFilesChanged(ctx.userId, ctx.sender); return {}; },
+  'previewWindows.close': async (_payload, ctx) => { previewWindows.closePreview(ctx.userId, ctx.sender); return {}; },
+  'previewWindows.requestOwner': async (payload, ctx) => previewWindows.requestPreviewOwner(ctx.userId, ctx.sender, payload),
+  'previewWindows.resolveOwner': async (payload, ctx) => { previewWindows.resolvePreviewOwner(ctx.sender, payload); return {}; },
   // Open a saved app for editing — creates a fresh conversation with the
   // app's source bundled in as an `app-source.md` attachment. The renderer
   // navigates to it + pre-fills a draft.
@@ -2608,8 +2669,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // ── Contexts (user-owned directory tree; vectorized via kb_indexer) ──
   'contexts.tree': async () => ({ tree: contexts.listContextsTree() }),
 
-  'contexts.read': async ({ path }) => {
-    return contexts.readContextFile(path || '');
+  'contexts.read': async ({ path, preview }) => {
+    return contexts.readContextFile(path || '', preview === true || preview === 'true');
   },
 
   'contexts.index': async () => ({
@@ -2623,12 +2684,24 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'contexts.attachToDraft': async ({ cid, relPath } = {}, ctx) => {
-    if (typeof cid !== 'string' || !cid) throw new Error('missing cid');
-    if (typeof relPath !== 'string' || !relPath.trim()) throw new Error('missing relPath');
-    const absPath = contexts.resolveContextFileAbsPath(relPath);
-    const imported = await chatAttachments.importAttachmentFromPath(ctx.userId, cid, absPath);
-    if (!imported.ok) throw new Error((imported as { error?: string }).error || 'attach_failed');
-    return { info: imported.info };
+    let stage = 'input_validation';
+    try {
+      if (typeof cid !== 'string' || !cid) throw new Error('missing cid');
+      if (typeof relPath !== 'string' || !relPath.trim()) throw new Error('missing relPath');
+      stage = 'source_resolve';
+      const absPath = contexts.resolveContextFileAbsPath(relPath);
+      stage = 'attachment_import';
+      const imported = await chatAttachments.importAttachmentFromPath(ctx.userId, cid, absPath);
+      if (!imported.ok) throw Object.assign(new Error((imported as { error?: string }).error || 'attach_failed'), { failure_kind: fileFailureKind(imported) });
+      return { info: imported.info };
+    } catch (error) {
+      const normalized = normalizeAppError(error);
+      const rawCode = (error as { code?: unknown })?.code;
+      const failureKind = fileFailureKind(error);
+      const code = typeof rawCode === 'number' ? rawCode
+        : typeof rawCode === 'string' && rawCode ? (/^\d+$/.test(rawCode.trim()) ? Number(rawCode.trim()) : rawCode) : normalized.code;
+      return { ok: false, ...normalized, code, failure_stage: stage, failure_kind: failureKind };
+    }
   },
 
   // Edit an existing text file (refuses to create).
@@ -2763,6 +2836,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── Global search (knowledge base + chat history) ──
+  'search.status': async (_payload, ctx) => search.searchIndexStatus(ctx.userId),
   'search.global': async ({ query, limit, scope, projectId }, ctx) => {
     return search.searchAll(ctx.userId, query || '', {
       limit: typeof limit === 'number' ? limit : 30,
@@ -3157,32 +3231,33 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // Open the OS file manager focused on a single file (Finder on macOS,
-  // Explorer on Windows, default file manager on Linux). The path must sit
-  // inside the active user's file scope, or be an exact produced-file path
-  // already recorded on the current conversation.
-  'workspace.revealPath': async (payload, ctx) => {
+  // Explorer on Windows, default file manager on Linux). This explicit UI
+  // action accepts existing absolute paths outside the workspace as well.
+  // It grants no file-content access; reads and mutations remain scoped.
+  'workspace.revealPath': async (payload) => {
     const target = payload?.path;
-    if (typeof target !== 'string' || !target) {
-      throw new Error('missing path');
+    if (typeof target !== 'string' || !path.isAbsolute(target) || target.includes('\0')) {
+      throw new Error(t('errors.reveal_invalid_path'));
     }
     const norm = path.resolve(target);
-    if (!await _isAllowedFileActionPath(ctx.userId, payload, norm)) {
-      throw new Error('path is outside the user workspace');
-    }
     let st: fs.Stats;
     try { st = fs.statSync(norm); }
-    catch { throw new Error('file not found'); }
-    if (st.isDirectory()) {
-      const openErr = await shell.openPath(norm);
-      if (openErr) throw new Error(openErr);
-    } else {
-      shell.showItemInFolder(norm);
+    catch { throw new Error(t('errors.reveal_unavailable')); }
+    try {
+      if (st.isDirectory()) {
+        const openErr = await shell.openPath(norm);
+        if (openErr) throw new Error(t('errors.reveal_failed'));
+      } else {
+        shell.showItemInFolder(norm);
+      }
+    } catch {
+      throw new Error(t('errors.reveal_failed'));
     }
     return { path: norm };
   },
 
   // Lightweight existence check for renderer previews. Same scope as
-  // reveal/delete/read: workspace, current cid attachments, project library,
+  // delete/read: workspace, current cid attachments, project library,
   // or an exact produced path already recorded on the conversation.
   'workspace.statPath': async (payload, ctx) => {
     const target = payload?.path;
@@ -3195,7 +3270,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     }
     let st: fs.Stats;
     try { st = fs.statSync(norm); }
-    catch { return { exists: false, path: norm }; }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return { exists: false, path: norm };
+      return { ok: false, error: 'stat_failed' };
+    }
     return {
       exists: true,
       path: norm,
@@ -3263,9 +3342,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // Diagnose a failed <img>/<video> request without returning or reporting a
-  // local path. Monitor uses the stable reason to distinguish missing/moved
+  // local path. The stable reason distinguishes missing/moved
   // files from unsupported/oversized media and browser decode/stream errors.
-  'media.diagnose': async ({ url }, ctx) => {
+  'media.diagnose': async ({ url, diagnosticOnly }, ctx) => {
     let parsed: URL;
     try { parsed = new URL(String(url || '')); }
     catch { return { diagnosis: 'invalid_url' }; }
@@ -3274,6 +3353,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (host === 'local') {
       const absPath = chatMediaLocalPathFromUrl(parsed.toString());
       if (!absPath) return { diagnosis: 'invalid_url' };
+      if (diagnosticOnly === true) return chatAttachments.diagnoseMediaFile(ctx.userId, { localPath: absPath });
       const resolved = chatAttachments.resolveLocalMediaPath(absPath);
       if (!resolved.ok) {
         return { diagnosis: (resolved as { code?: string }).code || 'unavailable' };
@@ -3292,6 +3372,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       const cid = segments.shift() || '';
       const name = segments.join('/');
       if (!cid || !name) return { diagnosis: 'invalid_url' };
+      if (diagnosticOnly === true) return chatAttachments.diagnoseMediaFile(ctx.userId, { cid, name });
       const resolved = chatAttachments.resolveAttachmentAbsPath(ctx.userId, cid, name);
       if (!resolved.ok) {
         return { diagnosis: (resolved as { code?: string }).code || 'unavailable' };
@@ -3323,6 +3404,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!st.isFile()) return { ok: false, error: 'not_found' };
     const MAX_TEXT_BYTES = 2 * 1024 * 1024;
     const htmlPreviewLayoutOnly = payload?.htmlPreviewLayoutOnly === true;
+    if (payload?.preview === true && /\.(csv|tsv)$/i.test(norm)) {
+      return { ok: true, ...readTextPreview(norm), size: st.size };
+    }
     if (!htmlPreviewLayoutOnly && st.size > MAX_TEXT_BYTES) {
       return { ok: false, error: 'too_large', size: st.size, cap: MAX_TEXT_BYTES };
     }
@@ -3345,7 +3429,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // Convert modern Office files into a local, sandboxed HTML preview.
   // Word, spreadsheet, and presentation files use the bundled Office layout
   // renderer, with the lightweight content path retained as a failure fallback.
-  // It shares the same path scope as produced.readText and revealPath.
+  // It shares the same path scope as produced.readText.
   'produced.officePreviewHtml': async (payload, ctx) => {
     const target = payload?.path;
     if (typeof target !== 'string' || !target) {
@@ -3468,6 +3552,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 // unexpected throws.
 
 const streamHandlers: Record<string, StreamHandler> = {
+  'webApps.call': webAppCall,
   'conversations.sendStream': async function* ({
     cid,
     content,
@@ -3882,6 +3967,7 @@ export function register(): void {
     const envelope = parseInvokeEnvelope(request);
     if (!envelope) return { ok: false, error: 'invalid ipc request', code: 'E_IPC_REQUEST' };
     const { channel, payload } = envelope;
+    if ((channel.startsWith('webApps.') || channel.startsWith('previewWindows.') || channel === 'savedApps.openInApp' || previewWindows.isPreviewContents(event.sender)) && event.senderFrame !== event.sender.mainFrame) return { ok: false, code: 'E_IPC_SENDER' };
     const handler = invokeHandlers[channel];
     if (!handler) return { ok: false, error: `unknown channel: ${channel}` };
     try {
@@ -3966,6 +4052,7 @@ export function register(): void {
     const envelope = parseStreamEnvelope(request);
     if (!envelope) return;
     const { requestId, channel, payload } = envelope;
+    if ((channel.startsWith('webApps.') || previewWindows.isPreviewContents(event.sender)) && event.senderFrame !== event.sender.mainFrame) return;
     const out = (ev: unknown) => {
       if (event.sender.isDestroyed()) return;
       event.sender.send(`stream:${requestId}`, ev);

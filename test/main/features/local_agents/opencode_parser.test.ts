@@ -274,7 +274,6 @@ describe('local_agents/backends/opencode › fixed full access', () => {
       'json',
       '--dir',
       path.resolve(cwd),
-      'hi',
     ]);
   });
 
@@ -288,7 +287,7 @@ describe('local_agents/backends/opencode › fixed full access', () => {
     expect(args).toEqual([
       'run', '--auto', '--format', 'json',
       '--model', 'openai/gpt-5.4', '--variant', 'high',
-      '--dir', path.resolve('/workspace/project'), 'hi',
+      '--dir', path.resolve('/workspace/project'),
     ]);
   });
 
@@ -309,7 +308,7 @@ describe('local_agents/backends/opencode › fixed full access', () => {
     const directoryFlags = args.filter((arg) => arg === '--dir' || arg.startsWith('--dir='));
     expect(directoryFlags).toEqual(['--dir']);
     expect(args.indexOf('--dir')).toBeLessThan(args.indexOf('--model'));
-    expect(args.at(-1)).toBe('hi');
+    expect(args).not.toContain('hi');
     expect(args).not.toContain('/workspace/stale-a');
     expect(args).not.toContain('--dir=/workspace/stale-b');
     expect(args).not.toContain('/workspace/stale-c');
@@ -329,7 +328,7 @@ describe('local_agents/backends/opencode › fixed full access', () => {
 
     expect(args).toEqual([
       'run', '--auto', '--format', 'json',
-      '--dir', selected, '--verbose', 'hi',
+      '--dir', selected, '--verbose',
     ]);
   });
 
@@ -343,7 +342,7 @@ describe('local_agents/backends/opencode › fixed full access', () => {
 
     expect(args).toEqual([
       'run', '--auto', '--format', 'json',
-      '--dir', selected, '--verbose', 'hi',
+      '--dir', selected, '--verbose',
     ]);
   });
 
@@ -357,7 +356,7 @@ describe('local_agents/backends/opencode › fixed full access', () => {
 
     expect(args).toEqual([
       'run', '--auto', '--format', 'json',
-      '--dir', selected, '--verbose', '--', 'hi',
+      '--dir', selected, '--verbose', '--',
     ]);
     expect(args.indexOf('--dir')).toBeLessThan(args.indexOf('--'));
   });

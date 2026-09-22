@@ -3,8 +3,64 @@ import { describe, it, expect } from 'vitest';
 import {
   parseMentions, resolveRecipients,
   extractFormFromFinal, computeFormId, decodeSubmission, encodeSubmission,
+  validateFormAnswers,
   extractPlanInteractionFromFinal, extractHandbackFromFinal,
 } from '../../../../src/main/features/group_chat/router';
+
+describe('group_chat router › chat form answers', () => {
+  it.each([
+    { type: 'number', default: 0, min: 1, answer: 1 },
+    { type: 'number', default: 11, max: 10, answer: 10 },
+    { type: 'number', default: 'unknown', answer: 0 },
+    { type: 'boolean', default: 'unknown', answer: false },
+    { type: 'select', default: 'removed', options: [{ value: 'a', label: 'A' }], answer: 'a' },
+    { type: 'multiselect', default: ['a', 'removed'], options: [{ value: 'a', label: 'A' }], answer: ['a'] },
+    { type: 'text', default: 123, answer: 'Provided' },
+    { type: 'textarea', default: { value: 'invalid' }, answer: 'Provided' },
+  ])('keeps a required $type question answerable when its default is invalid: $default', ({ answer, ...definition }) => {
+    const question = { id: 'question', label: 'Question', required: true, ...definition };
+    const result = extractFormFromFinal(`<agent-input-form>\n${JSON.stringify({ fields: [question] })}\n</agent-input-form>`, 'writer');
+    const { default: _invalid, ...expected } = question;
+    expect(result.form?.fields).toEqual([expected]);
+    expect(result.cleanText).toBe('');
+    expect(validateFormAnswers(result.form!.fields, {})).toBe(false);
+    expect(validateFormAnswers(result.form!.fields, { question: null })).toBe(false);
+    expect(validateFormAnswers(result.form!.fields, { question: answer })).toBe(true);
+  });
+
+  it('keeps unanswered form definitions separate from defaults and supplied answers', () => {
+    const fields = [
+      { id: 'count', type: 'number', required: true, min: 0 },
+      { id: 'confirmed', type: 'boolean', required: true },
+      { id: 'choice', type: 'select', required: true, options: [{ value: 'a' }, { value: 'b' }] },
+    ];
+    for (const empty of [undefined, null, '']) {
+      const text = `<agent-input-form>\n${JSON.stringify({ fields: fields.map(f => ({ ...f, default: empty })) })}\n</agent-input-form>`;
+      const result = extractFormFromFinal(text, 'writer');
+      expect(result.form?.fields).toHaveLength(3);
+      expect(result.form?.fields.every(f => !Object.hasOwn(f, 'default'))).toBe(true);
+      expect(result.cleanText).toBe('');
+    }
+    const resolved = extractFormFromFinal(`<agent-input-form>\n${JSON.stringify({ fields: fields.map((f, i) => ({ ...f, default: [0, false, 'b'][i] })) })}\n</agent-input-form>`, 'writer');
+    expect(resolved.form?.fields.map(f => f.default)).toEqual([0, false, 'b']);
+    const schema = resolved.form!.fields;
+    expect(validateFormAnswers(schema, { count: 0, confirmed: false, choice: 'b' })).toBe(true);
+    for (const values of [
+      {}, { count: null, confirmed: false, choice: 'b' },
+      { count: '', confirmed: false, choice: 'b' },
+      { count: 1, confirmed: null, choice: 'b' },
+      { count: 1, confirmed: 'false', choice: 'b' },
+      { count: 1, confirmed: false, choice: '' },
+      { count: 1, confirmed: false, choice: 'c' },
+      ...[NaN, Infinity, -1, '3'].map(count => ({ count, confirmed: false, choice: 'b' })),
+    ]) expect(validateFormAnswers(schema, values), JSON.stringify(values)).toBe(false);
+    expect(validateFormAnswers(schema.map(f => ({ ...f, required: false })), { count: null, confirmed: null, choice: '' })).toBe(true);
+    expect(validateFormAnswers(schema.map(f => ({ ...f, required: false })), { count: [] })).toBe(false);
+    expect(encodeSubmission({ form_id: 'abcd1234', agent_id: 'writer', fields: resolved.form!.fields }, { count: null, confirmed: null, choice: null }))
+      .not.toMatch(/：(?:0|no|b)/);
+  });
+
+});
 
 describe('group_chat router › parseMentions', () => {
   it('finds @-tokens deduped in first-occurrence order', () => {

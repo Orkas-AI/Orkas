@@ -162,11 +162,12 @@ describe('tool-surface', () => {
       'management.app',
       'management.skills',
       'management.marketplace',
-      'management.automation',
     ]) {
       expect(surface.load([group as any])).toMatchObject({ isError: true });
       expect(groupEnum).not.toContain(group);
     }
+    expect(surface.load(['management.automation']).isError).toBeFalsy();
+    expect(surface.isActive('auto_tasks')).toBe(true);
     expect(surface.isActive('open_app_view')).toBe(false);
     expect(surface.isActive('app_health')).toBe(false);
     expect(surface.isActive('skill_search')).toBe(false);
@@ -669,13 +670,24 @@ describe('tool-surface', () => {
     expect(block).toContain('`workspace.write`');
     expect(block).toContain('`office`');
     expect(block).toContain('`web`');
-    expect(block).toContain('`management` (runtime only; not an Agent dependency)');
+    expect(block).toContain('`management` — Management.');
     expect(block).toContain('smallest sufficient groups');
-    expect(block).toContain('current user turn only');
+    expect(block).toContain('a parent includes all child groups');
+    // The directory owns hierarchy/discovery; the active tool definition
+    // already owns invocation timing, batching and permission semantics.
+    const loadTool = createToolLoadTool(surface);
+    expect(loadTool.description).toContain('Activate in one call');
+    expect(loadTool.description).toContain('not currently exposed');
+    expect(loadTool.description).toContain('next model round');
+    expect(loadTool.description).toContain('current user turn only');
+    expect(loadTool.description).toContain('Loading never grants execution permissions');
+    expect(block).not.toContain('current user turn only');
+    expect(block).not.toContain('not currently exposed');
+    expect(block).not.toMatch(/runtime.only|Agent dependency/i);
     expect(block).not.toContain('Fallback only');
     expect(block).toContain('`workspace.write.output` — Workspace output.\n      - `write_file` — Write a text file.');
     expect(block).toContain('`office.pdf` — PDF.\n    - `create_pdf` — Create a PDF from Markdown or HTML.');
-    expect(block).toContain('`management.marketplace` (runtime only; not an Agent dependency) — Marketplace management.\n    - `marketplace_search` — Search the marketplace.');
+    expect(block).toContain('`management.marketplace` — Marketplace management.\n    - `marketplace_search` — Search the marketplace.');
     expect(block).not.toContain('`read_files`');
     expect(block).not.toContain('`publish_outputs`');
     expect(block).not.toContain('`web_search`');
@@ -734,7 +746,7 @@ describe('tool-surface', () => {
     });
     expect(surface.loadableGroupsForTool('write_file')).toEqual(['workspace.write.output']);
     expect(surface.loadableGroupsForTool('call_connector_tool')).toEqual([]);
-    expect(surface.loadableGroupsForTool('todo_tasks')).toEqual([]);
+    expect(surface.loadableGroupsForTool('todo_tasks')).toEqual(['management.projects']);
     expect(surface.loadableGroupsForTool('missing')).toEqual([]);
   });
 
@@ -793,5 +805,27 @@ describe('tool-surface', () => {
     expect(block).not.toContain('- `office` —');
     expect(block).not.toContain('marketplace_search');
     expect(block).not.toContain('`management`');
+  });
+});
+
+
+describe('command lifecycle exposure', () => {
+  it.each(['workspace.execute.command', 'workspace.execute.session'])(
+    'pairs startup and continuation for %s without granting user-interactive CLI through command alone', (group) => {
+      const surface = createToolSurfaceController({
+        availableToolNames: ['bash', 'process_session', 'interactive_cli'],
+        configuredGroups: [group], scopedEligible: true, allowLegacyAll: false,
+      });
+      expect(surface.isActive('bash')).toBe(true);
+      expect(surface.isActive('process_session')).toBe(true);
+      expect(surface.isActive('interactive_cli')).toBe(group === 'workspace.execute.session');
+    });
+  it('does not activate missing continuation executors or broaden read-only actors', () => {
+    const commandOnly = createToolSurfaceController({ availableToolNames: ['bash'],
+      configuredGroups: ['workspace.execute.command'], scopedEligible: true });
+    expect(commandOnly.activeToolNames()).toEqual(['bash']);
+    const reader = createToolSurfaceController({ availableToolNames: ['bash', 'process_session', 'read_files'],
+      configuredGroups: ['workspace.read'], scopedEligible: true, dynamicLoading: false });
+    expect(reader.activeToolNames()).toEqual(['read_files']);
   });
 });

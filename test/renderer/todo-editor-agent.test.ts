@@ -13,7 +13,7 @@ function harness(load?: (channel: string, args: any) => Promise<any>) {
   const selects: Record<string, any> = {};
   for (const id of ['input', 'add', 'agent', 'project', 'status', 'save', 'cancel']) {
     elements['project-todo-' + id] = {
-      id: 'project-todo-' + id, value: '', maxLength: 200, dataset: {}, hidden: false,
+      id: 'project-todo-' + id, value: '', maxLength: 4000, dataset: {}, hidden: false,
       focus() {}, setSelectionRange() {}, classList: { toggle() {} }, querySelector() { return null; },
     };
   }
@@ -67,14 +67,14 @@ describe('todo editor assignment', () => {
     expect(h.alerts).toEqual([]);
   });
 
-  it('preserves concurrent assignment on a title-only edit, including a removed owner', async () => {
+  it('preserves concurrent assignment on a content-only edit, including a removed owner', async () => {
     const h = harness();
-    await h.open({ id: 't_aabbccddeeff', title: 'Old', status: 'todo', owner_agent_id: 'removed', owner_agent: 'Previous owner' });
+    await h.open({ id: 't_aabbccddeeff', content: 'Old', status: 'todo', owner_agent_id: 'removed', owner_agent: 'Previous owner' });
     expect(h.selects['project-todo-agent'].getValue()).toBe('removed');
     h.elements['project-todo-input'].value = 'New';
     await h.context._saveProjectTodoEditor();
     const patch = h.calls.find((c) => c.channel === 'projects.tasks.update').args;
-    expect(patch).toEqual({ projectId: '', taskId: 't_aabbccddeeff', title: 'New' });
+    expect(patch).toEqual({ projectId: '', taskId: 't_aabbccddeeff', content: 'New' });
   });
 
   it('discards stale agent responses when the project changes and never carries an owner across scopes', async () => {
@@ -99,7 +99,7 @@ describe('todo editor assignment', () => {
     expect(h.calls.find((c) => c.channel === 'projects.tasks.create').args).not.toHaveProperty('owner_agent_id');
   });
 
-  it('keeps the selected owner and title after a failed save so the user can retry', async () => {
+  it('keeps the selected owner and content after a failed save so the user can retry', async () => {
     let fail = true;
     const h = harness(async (channel) => channel === 'agents.list'
       ? { agents: [{ agent_id: 'a', name: 'Alpha' }] }

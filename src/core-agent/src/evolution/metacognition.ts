@@ -1,7 +1,5 @@
 /**
- * Metacognitive self-improvement building blocks: the user-correction
- * heuristic consumed by the expert-signals pipeline, and the reflection
- * review prompt used by the host reflection orchestrator and benchmark.
+ * Reflection review prompt used by the host reflection orchestrator and benchmark.
  * (The unwired multi-signal `shouldReflect` scorer that once lived here was
  * deleted 2026-08-16 — production triggering is the orchestrator's
  * `isAgentDirty`, and half the scorer's input signals had lost their
@@ -14,35 +12,6 @@ export const REFLECTION_SYSTEM_PROMPT =
   'You are a self-improvement assistant. Reflect on the conversation summary and refine your skills and self-knowledge. '
   + 'Use only the tools supplied to this reflection. metacognition updates COMPETENCE.md / LEARNING_STRATEGIES.md; '
   + 'skill_manage is supplied only when reflecting for a named Agent.';
-
-// ── User correction detection (heuristic, no LLM cost) ─────────────────
-
-const CORRECTION_PATTERNS_ZH = [
-  /不[是对要]/, /错了/, /不要这样/, /应该是/, /你搞错/,
-  /不对/, /改一下/, /重新/, /别这样/, /换个/,
-];
-
-const CORRECTION_PATTERNS_EN = [
-  /\bno[,.]?\s+(it|that|the|this|you)\b/i,
-  /\bwrong\b/i,
-  /\bactually\b/i,
-  /\binstead\b/i,
-  /\bdon'?t\s+do\b/i,
-  /\bstop\s+(doing|that)\b/i,
-  /\bnot\s+what\s+I\b/i,
-  /\bplease\s+(fix|change|redo)\b/i,
-];
-
-const ALL_CORRECTION_PATTERNS = [...CORRECTION_PATTERNS_ZH, ...CORRECTION_PATTERNS_EN];
-
-/**
- * Heuristic detection of user corrections in a message.
- * Returns true if the message likely contains a correction or complaint.
- * False positives are acceptable — this is a signal, not a classifier.
- */
-export function detectUserCorrection(userMessage: string): boolean {
-  return ALL_CORRECTION_PATTERNS.some(re => re.test(userMessage));
-}
 
 // ── Review prompt generation ────────────────────────────────────────────
 

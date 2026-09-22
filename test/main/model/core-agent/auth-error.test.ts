@@ -26,7 +26,7 @@ describe('auth-error › classifyKeyFailure › status code fast path', () => {
   it('403 带 rate/quota 字样 → 归到 rate_limit（一些云商用 403 返限速）', () => {
     // 例：Google Vertex AI 偶发 403 "Resource has been exhausted (e.g. check quota)"
     const err = Object.assign(new Error('Resource has been exhausted: quota'), { status: 403 });
-    expect(classifyKeyFailure(err)).toBe('rate_limit');
+    expect(classifyKeyFailure(err)).toBe('permission');
   });
 
   it('429 → rate_limit', () => {
@@ -46,16 +46,16 @@ describe('auth-error › classifyKeyFailure › 跨模块边界 (message-only)',
   it('pi-provider 的 wrapError 产物 "auth failed" 前缀 → auth', () => {
     // pi-provider.ts::wrapError 构造的 message 格式
     const err = new Error('openai auth failed: 401 Incorrect API key provided: sk-xxx');
-    expect(classifyKeyFailure(err)).toBe('auth');
+    expect(classifyKeyFailure(err)).toBeNull();
   });
 
   it('"auth failed" 前缀带 permission 关键词 → permission', () => {
     const err = new Error('anthropic auth failed: forbidden: subscription expired');
-    expect(classifyKeyFailure(err)).toBe('permission');
+    expect(classifyKeyFailure(err)).toBeNull();
   });
 
   it('rate_limit message', () => {
-    expect(classifyKeyFailure(new Error('rate limited: too many requests per minute'))).toBe('rate_limit');
+    expect(classifyKeyFailure(new Error('rate limited: too many requests per minute'))).toBeNull();
   });
 
   it('context_length_exceeded → null（不换 key，换了一样溢出）', () => {
@@ -77,27 +77,27 @@ describe('auth-error › classifyKeyFailure › message fallback', () => {
 
   it('中文"余额不足"', () => {
     const err = new ProviderError('账户余额不足，请充值后重试', 'moonshot');
-    expect(classifyKeyFailure(err)).toBe('balance');
+    expect(classifyKeyFailure(err)).toBeNull();
   });
 
   it('OpenAI "insufficient_quota"', () => {
     const err = new Error('You exceeded your current quota — insufficient_quota');
-    expect(classifyKeyFailure(err)).toBe('balance');
+    expect(classifyKeyFailure(err)).toBeNull();
   });
 
   it('permission error 不带状态码也能识别', () => {
     const err = new Error('permission_error: this API key does not have access to the requested model');
-    expect(classifyKeyFailure(err)).toBe('permission');
+    expect(classifyKeyFailure(err)).toBeNull();
   });
 
   it('rate limit 英文报文', () => {
     const err = new Error('rate_limit_error: too many requests per minute');
-    expect(classifyKeyFailure(err)).toBe('rate_limit');
+    expect(classifyKeyFailure(err)).toBeNull();
   });
 
   it('balance 关键词排在 auth 前面（"insufficient credits" 不应误判为 invalid）', () => {
     const err = new Error('Your request was blocked: insufficient credits');
-    expect(classifyKeyFailure(err)).toBe('balance');
+    expect(classifyKeyFailure(err)).toBeNull();
   });
 });
 

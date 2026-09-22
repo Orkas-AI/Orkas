@@ -40,10 +40,8 @@ Resolve every turn from the latest durable facts:
 
 Keep the first two stops mechanically distinct:
 
-- **Direction stop:** route and lock facts already settled by the brief, then
-  show two or three concepts without writing a manifest, script, narration copy,
-  or art direction. Use the exact localized name from the table below; in
-  Chinese this is `制作方向确认`, never a renamed label.
+- **Direction stop:** use [video-router's direction confirmation](../video-router/SKILL.md#direction-confirmation)
+  as the content contract; the decision authorizes planning from the chosen concept.
 - **COMPOSE plan stop after direction choice:** call `speech.capabilities`, write the canonical
   `project/composition/composition-manifest.json` from the chosen concept, then run the free `composition.check_narration_fit`; only after those concrete
   results present the one `制作方案确认` / `Production plan confirmation`.
@@ -134,7 +132,7 @@ segments and surface at the production review; never create a segment gate.
 Before presenting or consuming any of the five stopping decisions, or handling
 a COMPOSE narration retry, read
 [confirmation-artifacts.md](references/confirmation-artifacts.md). It owns exact
-artifact content, locator rules, gate table, video-language default, the once-per-
+post-direction artifact content, locator rules, gate table, video-language default, the once-per-
 visual-identity preview, and narration retry presentation. Do not load it for a
 pure technical recovery that will not reach a user stop.
 

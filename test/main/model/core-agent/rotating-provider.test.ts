@@ -158,7 +158,7 @@ describe('rotating-provider › rotatable stream failures', () => {
   });
 
   it('invalidated OAuth is shown once, falls back immediately, and stays skipped for later model rounds', async () => {
-    const authErr = new Error('Encountered invalidated oauth token for user, failing request');
+    const authErr = Object.assign(new Error('Encountered invalidated oauth token for user, failing request'), { status: 401, code: 'token_invalidated' });
     let primaryBuilds = 0;
     let fallbackBuilds = 0;
     const p = createRotatingProvider({
@@ -391,7 +391,7 @@ describe('rotating-provider › rotatable stream failures', () => {
     });
     const events = await collect(p.stream(PARAMS));
     expect(events.length).toBe(1);
-    expect(getCooldown('p1')?.kind).toBe('rate_limit');
+    expect(getCooldown('p1')).toBeUndefined();
   });
 
   it('treats a 429 insufficient-quota response as balance exhaustion without a network retry', async () => {
@@ -411,7 +411,7 @@ describe('rotating-provider › rotatable stream failures', () => {
   });
 
   it('rotates on an in-band balance-exhaustion error', async () => {
-    const quotaErr = new Error('429 账户余额不足');
+    const quotaErr = Object.assign(new Error('429 账户余额不足'), { status: 402, code: 'insufficient_balance' });
     const p = createRotatingProvider({
       providerId: 'test',
       networkRetryDelayMs: () => 0,
@@ -432,7 +432,7 @@ describe('rotating-provider › rotatable stream failures', () => {
   });
 
   it('rotates on a localized balance-exhaustion error', async () => {
-    const balanceErr = new Error('账户余额不足，请充值');
+    const balanceErr = Object.assign(new Error('账户余额不足，请充值'), { status: 402, code: 'insufficient_balance' });
     const p = createRotatingProvider({
       providerId: 'test',
       candidates: [
@@ -445,7 +445,7 @@ describe('rotating-provider › rotatable stream failures', () => {
   });
 
   it('rotates when provider construction reports a credential failure', async () => {
-    const authErr = new Error('invalid_api_key');
+    const authErr = Object.assign(new Error('invalid_api_key'), { status: 401, code: 'invalid_api_key' });
     const p = createRotatingProvider({
       providerId: 'test',
       candidates: [
@@ -1131,7 +1131,7 @@ describe('rotating-provider › stream preamble drain', () => {
   });
 
   it('does not commit after repeated preambles and still rotates on a later error', async () => {
-    const authErr = new Error('invalid_api_key');
+    const authErr = Object.assign(new Error('invalid_api_key'), { status: 401, code: 'invalid_api_key' });
     const p = createRotatingProvider({
       providerId: 'test',
       candidates: [
@@ -1360,6 +1360,24 @@ describe('rotating-provider › exhausted stream candidates', () => {
       providerId: 'test',
       candidates: [],
     })).toThrow(/candidates list is empty/);
+  });
+
+  it('returns a structured unavailable error when every candidate was exhausted earlier in the run', async () => {
+    const authErr = Object.assign(new Error('Unauthorized'), { status: 401 });
+    const p = createRotatingProvider({
+      providerId: 'test',
+      candidates: [candidate('p1', { throwBefore: authErr })],
+    });
+
+    await expect(collect(p.stream(PARAMS))).rejects.toMatchObject({
+      code: 'PROVIDER_AUTH_EXHAUSTED',
+    });
+    await expect(p.complete(PARAMS)).rejects.toMatchObject({
+      code: 'PROVIDER_CANDIDATES_UNAVAILABLE',
+    });
+    await expect(collect(p.stream(PARAMS))).rejects.toMatchObject({
+      code: 'PROVIDER_CANDIDATES_UNAVAILABLE',
+    });
   });
 
   it('retries each network-failing candidate and surfaces a stable exhausted error without cooldown', async () => {

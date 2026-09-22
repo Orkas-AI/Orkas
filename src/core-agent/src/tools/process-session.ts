@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { commandSessionWait, continueCommandSession, inspectCommandRead, resetCommandSessionsForTest, runningCommandSessions } from "./command-sessions.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -15,6 +16,7 @@ import {
   type CommandExecutionObservation,
   type ToolContext,
   type ToolResult,
+  type ToolReadContinuation,
 } from "./base.js";
 
 export type ProcessSessionStatus = "running" | "exited" | "error" | "stopped";
@@ -133,7 +135,8 @@ function finishSession(
   if ("signal" in patch) session.signal = patch.signal;
   if (patch.error) session.error = patch.error;
   clearTimeout(session.lifetimeTimer);
-  if (session.killTimer) clearTimeout(session.killTimer);
+  // Terminal bookkeeping must not cancel escalation: even a closed shell
+  // can leave descendants that ignored SIGTERM in its process group.
   scheduleCleanup(session);
 }
 
@@ -160,11 +163,11 @@ function isToolResult(value: ProcessSession | ToolResult): value is ToolResult {
   return !("child" in value);
 }
 
-function readPayload(
+function readRange(
   session: ProcessSession,
   cursorValue: unknown,
   maxCharsValue: unknown,
-): Record<string, unknown> {
+) {
   const requestedCursor = Number(cursorValue);
   const cursor = Number.isFinite(requestedCursor)
     ? Math.max(0, Math.trunc(requestedCursor))
@@ -174,6 +177,11 @@ function readPayload(
     ? Math.max(1, Math.min(PROCESS_READ_MAX_CHARS, Math.trunc(maxCharsNumber)))
     : PROCESS_READ_DEFAULT_CHARS;
   const effectiveCursor = Math.max(session.outputStart, Math.min(cursor, session.outputEnd));
+  return { cursor, effectiveCursor, maxChars };
+}
+
+function readPayload(session: ProcessSession, cursorValue: unknown, maxCharsValue: unknown): Record<string, unknown> {
+  const { cursor, effectiveCursor, maxChars } = readRange(session, cursorValue, maxCharsValue);
   const relativeStart = effectiveCursor - session.outputStart;
   const output = session.output.slice(relativeStart, relativeStart + maxChars);
   const nextCursor = effectiveCursor + output.length;
@@ -255,18 +263,19 @@ function terminalResultJson(
   );
 }
 
+export function processSessionCapacityError(ctx: ToolContext): ToolResult | null {
+  const owner = processOwner(ctx);
+  const running = [...sessions.values()].filter((session) => session.owner === owner && session.status === "running").length
+    + runningCommandSessions(owner);
+  return running >= PROCESS_MAX_RUNNING_PER_OWNER
+    ? { content: `E_PROCESS_SESSION_LIMIT: at most ${PROCESS_MAX_RUNNING_PER_OWNER} running process sessions are allowed`, isError: true }
+    : null;
+}
+
 function startProcessSession(command: string, ctx: ToolContext, maxLifetimeMs: unknown): ProcessSession | ToolResult {
   const owner = processOwner(ctx);
-  const runningForOwner = [...sessions.values()]
-    .filter((session) => session.owner === owner && session.status === "running")
-    .length;
-  if (runningForOwner >= PROCESS_MAX_RUNNING_PER_OWNER) {
-    return {
-      content:
-        `E_PROCESS_SESSION_LIMIT: at most ${PROCESS_MAX_RUNNING_PER_OWNER} running process sessions are allowed`,
-      isError: true,
-    };
-  }
+  const capacityError = processSessionCapacityError(ctx);
+  if (capacityError) return capacityError;
 
   const cwd = path.resolve(ctx.workingDir ?? ".");
   try {
@@ -446,9 +455,32 @@ export const processReadTool: AgentTool = defineTool({
     required: ["session_id"],
   },
   executionMode: "parallel",
+  inspectReadContinuation(input, ctx) {
+    if (!input) return undefined;
+    return inspectProcessRead({ ...input, action: "read", yield_time_ms: input.yield_time_ms ?? 0 }, ctx, false);
+  },
   async execute(input, ctx) {
     const session = ownedSession(ctx, input.session_id);
     if (isToolResult(session)) return session;
+    const waitMs = input.yield_time_ms === undefined ? 0 : commandSessionWait(input.yield_time_ms) ?? 0;
+    const cursor = typeof input.cursor === "number" ? input.cursor : session.outputStart;
+    if (session.status === "running" && session.outputEnd <= cursor && waitMs > 0 && !ctx.signal?.aborted) {
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          clearTimeout(timer);
+          session.child.stdout.off("data", finish);
+          session.child.stderr.off("data", finish);
+          session.child.off("close", finish);
+          ctx.signal?.removeEventListener("abort", finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, waitMs);
+        session.child.stdout.once("data", finish);
+        session.child.stderr.once("data", finish);
+        session.child.once("close", finish);
+        ctx.signal?.addEventListener("abort", finish, { once: true });
+      });
+    }
     return session.status === "running"
       ? resultJson(readPayload(session, input.cursor, input.max_chars))
       : terminalResultJson(session, input.cursor, input.max_chars);
@@ -521,7 +553,7 @@ type ProcessSessionAction = "start" | "read" | "write" | "stop";
 
 const PROCESS_SESSION_ACTION_FIELDS: Readonly<Record<ProcessSessionAction, ReadonlySet<string>>> = {
   start: new Set(["action", "command", "max_lifetime_ms"]),
-  read: new Set(["action", "session_id", "cursor", "max_chars"]),
+  read: new Set(["action", "session_id", "cursor", "max_chars", "yield_time_ms"]),
   write: new Set(["action", "session_id", "chars", "add_newline"]),
   stop: new Set(["action", "session_id"]),
 };
@@ -531,11 +563,30 @@ function processSessionActionError(
   input: Record<string, unknown>,
 ): string | null {
   const unexpected = Object.keys(input)
-    .filter((key) => !PROCESS_SESSION_ACTION_FIELDS[action].has(key))
+    .filter((key) => !Object.values(PROCESS_SESSION_ACTION_FIELDS).some((fields) => fields.has(key))
+      || (action === "start" && key === "session_id"))
     .sort();
   return unexpected.length
     ? `E_BAD_INPUT: process_session(${action}) does not accept: ${unexpected.join(", ")}`
     : null;
+}
+
+function inspectProcessRead(input: Record<string, unknown>, ctx: ToolContext, includeManaged = true): ToolReadContinuation | undefined {
+  if (!input || input.action !== "read" || processSessionActionError("read", input)
+    || typeof input.session_id !== "string" || !input.session_id.trim()
+    || commandSessionWait(input.yield_time_ms) === null
+    || (input.cursor !== undefined && (typeof input.cursor !== "number" || !Number.isFinite(input.cursor)))
+    || (input.max_chars !== undefined && (typeof input.max_chars !== "number" || !Number.isFinite(input.max_chars) || input.max_chars < 1))) return undefined;
+  const managed = includeManaged ? inspectCommandRead(input, ctx) : undefined;
+  if (managed) return managed;
+  const session = ownedSession(ctx, input.session_id);
+  if (isToolResult(session)) return undefined;
+  const { effectiveCursor, maxChars } = readRange(session, input.cursor, input.max_chars);
+  const waitCursor = typeof input.cursor === "number" ? input.cursor : session.outputStart;
+  return {
+    version: JSON.stringify([session.id, effectiveCursor, Math.min(session.outputEnd, effectiveCursor + maxChars), session.status]),
+    waiting: !ctx.signal?.aborted && session.status === "running" && session.outputEnd <= waitCursor && (commandSessionWait(input.yield_time_ms) ?? 0) > 0,
+  };
 }
 
 /** Public lifecycle umbrella. The action discriminator removes three repeated
@@ -545,42 +596,46 @@ function processSessionActionError(
 export const processSessionTool: AgentTool = defineTool({
   name: "process_session",
   description:
-    "Manage a persistent shell process for long builds, tests, watchers, servers, or later stdin. Use bash for one-shot commands and interactive_cli when the user must enter secrets or complete OAuth.",
+    "Read, send input to, or stop a running shell session. Start commands with bash; use interactive_cli for user-entered secrets or OAuth.",
   inputSchema: {
     type: "object",
     additionalProperties: false,
     properties: {
       action: {
         type: "string",
-        enum: ["start", "read", "write", "stop"],
-        description: "start: command; read: session_id/cursor; write: session_id/chars; stop: session_id. Use only its action-specific fields.",
-      },
-      command: { type: "string", description: "Required for start. Shell command to launch." },
-      max_lifetime_ms: {
-        type: "number",
-        description: "Start only. Default 6 hours; minimum 1 minute; maximum 24 hours.",
+        enum: ["read", "write", "stop"],
+        description: "read: session_id/cursor; write: session_id/chars; stop: session_id. Use only its action-specific fields.",
       },
       session_id: { type: "string", description: "Required for read, write, and stop." },
+      yield_time_ms: { type: "integer", minimum: 0, maximum: 30000, default: 10000, description: "Read only. Wait for new output or exit; zero polls immediately." },
       cursor: { type: "number", description: "Read only. Previous next_cursor." },
       max_chars: { type: "number", description: "Read only. Default 32000; maximum 64000." },
       chars: { type: "string", description: "Write only. Known non-secret characters for stdin." },
       add_newline: { type: "boolean", description: "Write only. Append a newline; default false." },
     },
-    required: ["action"],
+    required: ["action", "session_id"],
   },
   executionMode: "parallel",
+  inspectReadContinuation: inspectProcessRead,
   async execute(input, ctx) {
     const action = String(input.action ?? "") as ProcessSessionAction;
     if (!(["start", "read", "write", "stop"] as const).includes(action)) {
       return {
-        content: "E_BAD_INPUT: `action` must be start, read, write, or stop",
+        content: "E_BAD_INPUT: `action` must be read, write, or stop",
         isError: true,
       };
     }
     const fieldError = processSessionActionError(action, input);
     if (fieldError) return { content: fieldError, isError: true };
+    if (action !== "start") {
+      if (action === "read" && commandSessionWait(input.yield_time_ms) === null) {
+        return { content: "E_BAD_INPUT: yield_time_ms must be an integer from 0 to 30000", isError: true };
+      }
+      const managed = await continueCommandSession(input, ctx);
+      if (managed) return managed;
+    }
     if (action === "start") return processStartTool.execute(input, ctx);
-    if (action === "read") return processReadTool.execute(input, ctx);
+    if (action === "read") return processReadTool.execute({ ...input, yield_time_ms: input.yield_time_ms ?? 10_000 }, ctx);
     if (action === "write") return processWriteTool.execute(input, ctx);
     if (action === "stop") return processStopTool.execute(input, ctx);
     return processStopTool.execute(input, ctx);
@@ -593,6 +648,7 @@ export function getProcessSessionTools(): AgentTool[] {
 
 /** Test-only cleanup; production sessions are retained by their lifecycle. */
 export async function _resetProcessSessionsForTest(): Promise<void> {
+  await resetCommandSessionsForTest();
   const active = [...sessions.values()];
   for (const session of active) {
     if (session.status === "running") {

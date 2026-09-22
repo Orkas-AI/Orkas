@@ -1,28 +1,8 @@
-"""deep-research citations — the deterministic anti-fabrication half of the engine.
+"""Check fetched sources, exact quotations, DOI attribution, and citation bindings.
 
-A Python skill cannot reach Orkas's in-process model or web tools, so the AGENT
-gathers sources (web_search / web_fetch) and drafts claims-with-citations; this
-skill does the deterministic verification the model must not be trusted to do on
-itself:
-
-  verify      — for each claim citation, check the quote actually appears in the
-                CITED source, the DOI (if any) is well-formed and present, and the
-                source is one that was really fetched. A verified quote must also
-                share meaningful claim terms before it is eligible to support the
-                claim; provenance alone never implies support. Abstain when there
-                are no sources at all.
-  references  — build a de-duplicated, stably-numbered reference list from the
-                sources that are validly cited (the add-references step).
-
-Design (deep-research references guardrail, stronger than GPT-Researcher):
-a model answering from parametric memory can invent a plausible quote, a real-
-looking DOI, or a URL it never read. All three are caught here deterministically:
-quote match is formatting-insensitive but NOT paraphrase-tolerant, a DOI must
-resolve to a fetched source, and a citation to an unknown source is flagged, not
-silently accepted. Nothing here calls a model — same input always yields the same
-verdicts, so it is fully unit-testable. The lexical alignment gate is deliberately
-conservative and is only a necessary condition for support, not a semantic
-entailment proof; the agent must still inspect meaning and contradictions.
+The Agent owns claim meaning and recommendations. This deterministic formatter
+never infers semantic support from wording or recommendation quality from field
+coverage. Compact reports preserve the Agent's analysis alongside citation tables.
 
 stdlib only.
 """
@@ -57,62 +37,6 @@ _SMART_MAP = {
     " ": " ", "…": "...",
 }
 _WS_RE = re.compile(r"\s+")
-_ALIGN_WORD_RE = re.compile(r"[0-9A-Za-z]+", re.UNICODE)
-_ALIGN_CJK_RUN_RE = re.compile(
-    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]+",
-    re.UNICODE,
-)
-_ALIGN_STOP = {
-    "the", "and", "for", "with", "are", "that", "this", "from", "was", "were",
-    "has", "have", "had", "not", "but", "its", "their", "they", "will", "would",
-    "which", "these", "those", "such", "than", "then", "there", "here", "when",
-    "where", "about", "over", "more", "most", "some", "also", "may", "might",
-    "been", "being", "does", "did", "study", "paper", "report", "reports",
-    "reported", "source", "article", "research", "researchers", "finding",
-    "findings", "a", "an", "of", "to", "in", "is", "it", "on", "by", "or",
-    "be", "as", "at",
-}
-_ALIGN_CJK_STOP = {
-    "研究", "报告", "论文", "来源", "结果", "显示", "指出", "认为", "相关",
-    "这个", "那个", "一种", "一个", "以及", "对于", "进行",
-}
-_STRUCTURED_EVIDENCE_RE = re.compile(
-    r"^\s*-\s*field=([a-z_]+);\s*exact_quote=(.+?)\s*$",
-    re.MULTILINE,
-)
-_GITHUB_SNAPSHOT_MARKER = "Source type: structured GitHub repository snapshot"
-_GITHUB_README_MARKER = "Official repository README:"
-_GITHUB_README_EVIDENCE_PATTERNS = (
-    ("core_use_case", re.compile(
-        r"\b(?:assistant|chat|document|knowledge base|rag|agent|workspace|productivity|image generation)\b",
-        re.IGNORECASE,
-    )),
-    ("os", re.compile(
-        r"\b(?:windows|macos|mac os|linux|ubuntu|cross-platform|cross platform)\b",
-        re.IGNORECASE,
-    )),
-    ("installation", re.compile(
-        r"\b(?:install|installer|download|setup|getting started|quick ?start|no environment setup)\b",
-        re.IGNORECASE,
-    )),
-    ("local_model_path", re.compile(
-        r"\b(?:local model|offline|ollama|lm studio|llama\.?cpp|on-device|on device|self-host)\b",
-        re.IGNORECASE,
-    )),
-    ("privacy", re.compile(
-        r"\b(?:privacy|private|local-first|local first|100%\s+offline|no data|telemetry)\b",
-        re.IGNORECASE,
-    )),
-    ("license_open_source", re.compile(
-        r"\b(?:licen[cs]e|open.source|agpl|apache-2|apache 2|mit|gpl)\b",
-        re.IGNORECASE,
-    )),
-    ("hardware_constraints", re.compile(
-        r"\b(?:gpu|cpu|ram|memory|hardware|system requirement|minimum requirement|vram)\b",
-        re.IGNORECASE,
-    )),
-)
-
 _COMPARISON_COLUMNS = (
     ("candidate", "Candidate"),
     ("best_for", "Best for"),
@@ -132,29 +56,8 @@ _COMPARISON_FACTUAL_FIELDS = tuple(
     key for key, _ in _COMPARISON_COLUMNS
     if key not in {"candidate", "evidence", *_COMPARISON_INFERENCE_FIELDS}
 )
-_COMPARISON_DECISION_GROUPS = (
-    ("platform_and_setup", ("os", "setup_ease"), "all"),
-    ("model_capabilities", ("model_capabilities",), "all"),
-    ("privacy_or_offline", ("local_offline", "privacy_data_handling"), "any"),
-    ("pricing", ("pricing_cost",), "all"),
-    ("limitations", ("key_limitations",), "all"),
-)
-_COMPARISON_CORE_GROUPS = {
-    "platform_and_setup", "model_capabilities", "limitations",
-}
-_COMPARISON_TRADEOFF_GROUPS = {"privacy_or_offline", "pricing"}
-_MIN_TRADEOFF_GROUPS = 2
 _TRUSTED_SNAPSHOT_ENV = "ORKAS_DEEP_RESEARCH_EVIDENCE_FILE"
 _MAX_TRUSTED_SNAPSHOT_BYTES = 4 * 1024 * 1024
-_STRUCTURED_COMPARISON_FIELDS = {
-    "os": "os",
-    "installation": "setup_ease",
-    "local_model_path": "local_offline",
-    "privacy": "privacy_data_handling",
-    "hardware_constraints": "key_limitations",
-}
-
-
 def _normalize_text(s: str) -> str:
     """Collapse away the differences that are NOT fabrication: unicode form,
     smart quotes/dashes, case, and whitespace runs. Preserves word content, so a
@@ -165,53 +68,6 @@ def _normalize_text(s: str) -> str:
     s = "".join(_SMART_MAP.get(ch, ch) for ch in s)
     s = _WS_RE.sub(" ", s).strip()
     return s.casefold()
-
-
-def _stem_alignment_word(word: str) -> str:
-    """Tiny deterministic normalization for common English inflections."""
-    if len(word) > 5 and word.endswith("ies"):
-        return word[:-3] + "y"
-    if len(word) > 4 and word.endswith("s") and not word.endswith("ss"):
-        return word[:-1]
-    return word
-
-
-def _alignment_terms(value: str) -> set:
-    """Return Latin content words plus CJK bigrams for a conservative gate."""
-    normalized = _normalize_text(value)
-    terms = {
-        _stem_alignment_word(match.group(0))
-        for match in _ALIGN_WORD_RE.finditer(normalized)
-        if match.group(0) not in _ALIGN_STOP
-    }
-    for match in _ALIGN_CJK_RUN_RE.finditer(normalized):
-        run = match.group(0)
-        if len(run) == 1:
-            terms.add(run)
-            continue
-        terms.update(
-            token for token in (run[i:i + 2] for i in range(len(run) - 1))
-            if token not in _ALIGN_CJK_STOP
-        )
-    return terms
-
-
-def _claim_quote_alignment(claim_text: str, quote: str) -> tuple[str, float]:
-    """Return (aligned|unproven, claim-term coverage).
-
-    Exact quote presence proves attribution, not relevance. Requiring at least
-    two shared content terms (or the only term for a one-term claim) rejects the
-    most dangerous shape: a real but unrelated quote attached to a claim.
-    """
-    claim_terms = _alignment_terms(claim_text)
-    quote_terms = _alignment_terms(quote)
-    if not claim_terms or not quote_terms:
-        return "unproven", 0.0
-    overlap = claim_terms & quote_terms
-    coverage = len(overlap) / len(claim_terms)
-    required = 1 if len(claim_terms) == 1 else 2
-    aligned = len(overlap) >= required and coverage >= 0.25
-    return ("aligned" if aligned else "unproven"), round(coverage, 4)
 
 
 def _normalize_url(u: str) -> str:
@@ -352,105 +208,13 @@ def _render_evidence_markdown(rows: list) -> str:
             claim = _inline_markdown(row.get("claim"))
             quote = _inline_markdown(row.get("quote"))
             lines.append(
-                '  - [{evidence_id}] {claim} — "{quote}" — verified —'.format(
+                '  - [{evidence_id}] {claim} — "{quote}" — quote matched —'.format(
                     evidence_id=row["evidence_id"],
                     claim=claim,
                     quote=quote,
                 )
             )
     return "\n".join(lines)
-
-
-def _bounded_repository_line(line: str):
-    quote = line.strip()
-    if (
-        len(quote) < 20
-        or len(quote) > 600
-        or re.match(r"^#{1,6}\s", quote)
-        or quote.startswith("![")
-        or re.search(r"<img\b|img\.shields\.io", quote, re.IGNORECASE)
-    ):
-        return None
-    return quote
-
-
-def _github_metadata_value(text: str, label: str):
-    match = re.search(
-        r"^\s*-\s*{}:\s*(.+?)\s*$".format(re.escape(label)),
-        text,
-        re.MULTILINE,
-    )
-    if not match:
-        return None
-    value = match.group(1).strip()
-    return None if not value or value == "Not provided" else value
-
-
-def _github_repository_evidence(text: str) -> list:
-    """Derive research fields from a neutral structured GitHub snapshot."""
-    if _GITHUB_SNAPSHOT_MARKER not in text:
-        return []
-
-    rows = []
-    description = _github_metadata_value(text, "Description")
-    license_id = _github_metadata_value(text, "License SPDX ID")
-    pushed_at = _github_metadata_value(text, "Pushed at")
-    if description:
-        rows.append({"field": "core_use_case", "quote": description})
-    if license_id:
-        rows.append({
-            "field": "license_open_source",
-            "quote": "License SPDX ID: {}".format(license_id),
-        })
-    if pushed_at:
-        rows.append({
-            "field": "project_activity",
-            "quote": "Pushed at: {}".format(pushed_at),
-        })
-
-    readme = text.partition(_GITHUB_README_MARKER)[2]
-    for field, pattern in _GITHUB_README_EVIDENCE_PATTERNS:
-        for raw_line in readme.splitlines():
-            quote = _bounded_repository_line(raw_line)
-            if quote and pattern.search(quote):
-                rows.append({"field": field, "quote": quote})
-                break
-    return rows
-
-
-def _structured_source_evidence(source: dict) -> list:
-    """Build deterministic evidence atoms in the research layer.
-
-    Explicit source-adapter atoms remain supported for compatibility. Neutral
-    GitHub repository snapshots are classified here so the general web_fetch
-    tool does not contain DeepResearch-specific field taxonomy.
-    """
-    text = str(source.get("text") or "")
-    candidates = []
-    for match in _STRUCTURED_EVIDENCE_RE.finditer(text):
-        field = match.group(1)
-        raw_quote = match.group(2)
-        try:
-            quote = json.loads(raw_quote)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if not isinstance(quote, str):
-            continue
-        quote = quote.strip()
-        candidates.append({"field": field, "quote": quote})
-    candidates.extend(_github_repository_evidence(text))
-
-    rows = []
-    seen = set()
-    for candidate in candidates:
-        field = candidate["field"]
-        quote = candidate["quote"]
-        key = (field, _normalize_text(quote))
-        if not quote or key in seen:
-            continue
-        seen.add(key)
-        rows.append({"field": field, "quote": quote})
-    return rows
 
 
 def _comparison_cell(value) -> str:
@@ -471,133 +235,22 @@ def _is_not_verified(value: str) -> bool:
 
 
 def _comparison_coverage(normalized_rows: list) -> list:
-    """Classify whether verified comparison facts can support a recommendation.
-
-    Citation cleanliness and decision readiness are intentionally separate. An
-    honest ``Not verified`` value is valid delivery data, but it cannot fill a
-    decision group. The canonical product-comparison schema requires platform
-    and setup plus model capability. It also requires at least two of the three
-    decision trade-offs: privacy/local operation and pricing. A material
-    limitation is mandatory rather than an optional trade-off: a product row
-    cannot support a recommendation while its downside remains unevaluated.
-    """
+    """Report citation coverage only; field presence does not establish meaning."""
     coverage = []
     for row in normalized_rows:
-        verified_fields = [
+        cited = [
             field for field in _COMPARISON_FACTUAL_FIELDS
             if _inline_markdown(row.get(field))
             and not _is_not_verified(_inline_markdown(row.get(field)))
         ]
-        verified_set = set(verified_fields)
-        satisfied_groups = set()
-        for name, fields, mode in _COMPARISON_DECISION_GROUPS:
-            satisfied = (
-                all(field in verified_set for field in fields)
-                if mode == "all"
-                else any(field in verified_set for field in fields)
-            )
-            if satisfied:
-                satisfied_groups.add(name)
-        missing_groups = [
-            name for name, _, _ in _COMPARISON_DECISION_GROUPS
-            if name not in satisfied_groups
-        ]
-        missing_core_groups = [
-            name for name in missing_groups if name in _COMPARISON_CORE_GROUPS
-        ]
-        tradeoff_groups_verified = len(
-            satisfied_groups & _COMPARISON_TRADEOFF_GROUPS
-        )
-        blocking_groups = [
-            name for name in missing_groups
-            if name in _COMPARISON_TRADEOFF_GROUPS
-            and tradeoff_groups_verified < _MIN_TRADEOFF_GROUPS
-        ]
-        blocking_groups = missing_core_groups + blocking_groups
-        ready = not blocking_groups
         coverage.append({
             "candidate": row.get("candidate"),
-            "status": "recommendation_ready" if ready else "under_evidenced",
-            "recommendation_ready": ready,
-            "verified_fields": verified_fields,
-            "not_verified_fields": [
-                field for field in _COMPARISON_FACTUAL_FIELDS
-                if field not in verified_set
+            "fields_with_citations": cited,
+            "missing_citation_fields": [
+                field for field in _COMPARISON_FACTUAL_FIELDS if field not in cited
             ],
-            "verified_field_count": len(verified_fields),
-            "factual_field_count": len(_COMPARISON_FACTUAL_FIELDS),
-            "tradeoff_groups_verified": tradeoff_groups_verified,
-            "missing_decision_groups": missing_groups,
-            "blocking_decision_groups": blocking_groups,
         })
     return coverage
-
-
-def _render_recommendation_markdown(normalized_rows: list, coverage: list) -> str:
-    """Render model-selected analysis while preserving the verification boundary.
-
-    The verifier establishes factual coverage, not whether a model-authored
-    recommendation follows semantically from those facts. Under-evidenced rows
-    therefore keep the model's ``best_for`` choice but name the evidence gaps
-    that prevent a definitive recommendation.
-    """
-    coverage_by_candidate = {
-        str(item.get("candidate") or ""): item for item in coverage
-    }
-    lines = [
-        "## Recommendations",
-        (
-            "Recommendations are analytical inferences. Citation verification "
-            "checks each cited comparison fact, not the recommendation itself."
-        ),
-    ]
-    path_count = 0
-    for row in normalized_rows:
-        candidate = _inline_markdown(row.get("candidate"))
-        item = coverage_by_candidate.get(candidate) or {}
-        best_for = _inline_markdown(row.get("best_for"))
-        ideal_user = _inline_markdown(row.get("ideal_user"))
-        if _is_not_verified(best_for) or _is_not_verified(ideal_user):
-            continue
-        limitation = _inline_markdown(row.get("key_limitations"))
-        evidence = _inline_markdown(row.get("evidence"))
-        if item.get("recommendation_ready"):
-            lines.append(
-                "- **{best_for}: {candidate}** — ideal user: {ideal_user}; "
-                "material limitation: {limitation}; verified comparison "
-                "evidence: {evidence}.".format(
-                    best_for=best_for,
-                    candidate=candidate,
-                    ideal_user=ideal_user,
-                    limitation=limitation,
-                    evidence=evidence,
-                )
-            )
-        else:
-            gaps = item.get("blocking_decision_groups") or []
-            gap_text = ", ".join(
-                str(group).replace("_", " ") for group in gaps
-            ) or "material decision evidence"
-            lines.append(
-                "- Conditional path — **{best_for}: {candidate}** — ideal user: "
-                "{ideal_user}; verify before choosing: {gaps}; current comparison evidence: "
-                "{evidence}.".format(
-                    best_for=best_for,
-                    candidate=candidate,
-                    ideal_user=ideal_user,
-                    gaps=gap_text,
-                    evidence=evidence,
-                )
-            )
-        path_count += 1
-        if path_count >= 5:
-            break
-    if path_count == 0:
-        lines.append(
-            "- No retained candidate has a usable model-selected decision path; "
-            "use the comparison and its named evidence gaps."
-        )
-    return "\n".join(lines)
 
 
 def _render_comparison(payload_rows, evidence_rows: list) -> tuple[list, str, list]:
@@ -606,29 +259,20 @@ def _render_comparison(payload_rows, evidence_rows: list) -> tuple[list, str, li
     The model still decides the candidates and field values. This formatter only
     guarantees the delivery contract: every retained candidate gets every
     column, missing facts are explicit, and each factual cell can survive only
-    when its declared claim ID produced verified evidence from that candidate's
-    source. Row-level source attribution is not enough to verify every cell.
+    when its declared claim ID has a matched quote from that candidate's source.
+    Row-level attribution does not establish individual cell bindings.
     """
     rows = payload_rows if isinstance(payload_rows, list) else []
     evidence_by_claim: dict = {}
-    structured_by_source_field: dict = {}
     valid_evidence_ids = set()
     for evidence in evidence_rows:
-        evidence_id = str(evidence.get("evidence_id") or "").upper()
+        evidence_id = str(evidence.get("evidence_id") or "")
         if not evidence_id:
             continue
         valid_evidence_ids.add(evidence_id)
-        source_id = evidence.get("source_id")
         claim_id = evidence.get("claim_id")
         if claim_id is not None and str(claim_id).strip():
             evidence_by_claim.setdefault(str(claim_id), []).append(evidence)
-        structured_field = _STRUCTURED_COMPARISON_FIELDS.get(
-            str(evidence.get("field") or "")
-        )
-        if source_id is not None and structured_field:
-            structured_by_source_field.setdefault(
-                (str(source_id), structured_field), []
-            ).append(evidence)
 
     normalized_rows = []
     warnings = []
@@ -676,22 +320,12 @@ def _render_comparison(payload_rows, evidence_rows: list) -> tuple[list, str, li
             field_evidence = []
             for claim_id in _source_ids(field_claims.get(key)):
                 for evidence in evidence_by_claim.get(claim_id, []):
-                    cell_alignment, _ = _claim_quote_alignment(
-                        value, str(evidence.get("claim") or "")
-                    )
-                    if (
-                        str(evidence.get("source_id") or "") in candidate_source_ids
-                        and cell_alignment == "aligned"
-                    ):
+                    if str(evidence.get("source_id") or "") in candidate_source_ids:
                         field_evidence.append(evidence)
-            for source_id in candidate_source_ids:
-                field_evidence.extend(
-                    structured_by_source_field.get((source_id, key), [])
-                )
             field_evidence_ids = list(dict.fromkeys(
-                str(evidence.get("evidence_id") or "").upper()
+                str(evidence.get("evidence_id") or "")
                 for evidence in field_evidence
-                if str(evidence.get("evidence_id") or "").upper() in valid_evidence_ids
+                if str(evidence.get("evidence_id") or "") in valid_evidence_ids
             ))
             if not field_evidence_ids:
                 normalized[key] = "Not verified: {}".format(label)
@@ -701,8 +335,8 @@ def _render_comparison(payload_rows, evidence_rows: list) -> tuple[list, str, li
                     "field": key,
                     "issue": "comparison_field_evidence_missing",
                     "detail": (
-                        "a factual comparison value requires a supported, lexically "
-                        "aligned field_claims entry from one of the candidate's "
+                        "a factual comparison value requires a quote-matched "
+                        "field_claims entry from one of the candidate's "
                         "evidence_sources"
                     ),
                 })
@@ -740,7 +374,6 @@ def _render_comparison(payload_rows, evidence_rows: list) -> tuple[list, str, li
 
 def _classify_citation(
     cit: dict,
-    claim_text: str,
     by_id: dict,
     by_url: dict,
     source_text_cache: dict,
@@ -759,8 +392,6 @@ def _classify_citation(
             quote_status="unverifiable",
             doi_status="unverifiable",
             verdict="flagged",
-            alignment_status="invalid",
-            alignment_score=0.0,
         )
         return out
 
@@ -774,18 +405,8 @@ def _classify_citation(
     elif q == "verified":
         verdict = "verified"         # quote proven present in the cited source
     else:
-        verdict = "weak"             # real source, but no quote to prove the claim
+        verdict = "weak"             # known source, but no adequate matched quote
     out["verdict"] = verdict
-    if verdict == "verified":
-        alignment, score = _claim_quote_alignment(claim_text, cit.get("quote") or "")
-        out["alignment_status"] = alignment
-        out["alignment_score"] = score
-    elif verdict == "weak":
-        out["alignment_status"] = "unproven"
-        out["alignment_score"] = 0.0
-    else:
-        out["alignment_status"] = "invalid"
-        out["alignment_score"] = 0.0
     return out
 
 
@@ -799,13 +420,11 @@ def verify(payload: dict) -> dict:
         return {
             "abstain": True,
             "abstain_reason": "no_sources",
-            "summary": {"claims": len(claims), "supported": 0, "unsupported": len(claims),
-                        "citations": 0, "verified": 0, "weak": 0, "flagged": 0,
-                        "aligned": 0, "support_unproven": 0},
+            "summary": {"claims": len(claims), "citations": 0,
+                        "verified": 0, "weak": 0, "flagged": 0},
             "claims": [], "references": [], "evidence_rows": [],
             "evidence_markdown": "", "comparison_rows": comparison_rows,
             "comparison_markdown": comparison_markdown,
-            "recommendation_markdown": "",
             "comparison_coverage": comparison_coverage,
             "comparison_warnings": comparison_warnings,
             "flags": [], "warnings": [],
@@ -815,8 +434,7 @@ def verify(payload: dict) -> dict:
     source_text_cache: dict = {}
     ref_order: list = []          # normalized-url keys in first-cited order
     ref_meta: dict = {}
-    n_verified = n_weak = n_flagged = n_cit = n_aligned = n_unproven = 0
-    n_supported = 0
+    n_verified = n_weak = n_flagged = n_cit = 0
     out_claims: list = []
     evidence_rows: list = []
     flags: list = []
@@ -833,7 +451,7 @@ def verify(payload: dict) -> dict:
                 continue
             n_cit += 1
             info = _classify_citation(
-                cit, str(claim.get("text") or ""), by_id, by_url, source_text_cache)
+                cit, by_id, by_url, source_text_cache)
             if info["verdict"] == "verified":
                 n_verified += 1
             elif info["verdict"] == "weak":
@@ -842,24 +460,8 @@ def verify(payload: dict) -> dict:
                 n_flagged += 1
                 flags.append({"claim": ci, "citation": cj,
                               "issue": _flag_issue(info), "detail": _flag_detail(info, cit)})
-            if info["alignment_status"] == "aligned":
-                n_aligned += 1
-            elif info["verdict"] != "flagged":
-                n_unproven += 1
-                warnings.append({
-                    "claim": ci,
-                    "citation": cj,
-                    "issue": "claim_evidence_alignment_unproven",
-                    "detail": (
-                        "source attribution is valid, but the quote does not share enough "
-                        "specific claim terms to establish support"
-                        if info["verdict"] == "verified"
-                        else "source is known, but a verifiable quote is required for support"
-                    ),
-                })
-
-            # Assign a stable reference number to any source that backs the claim
-            # (verified or weak). Flagged/phantom citations get no reference.
+            # Number known sources with verified or weak citations.
+            # Flagged/phantom citations get no reference.
             if info["verdict"] in ("verified", "weak"):
                 src, _ = _resolve_source(cit, by_id, by_url)
                 key = _normalize_url(src.get("url") or "") or "src:{}".format(src.get("id"))
@@ -876,9 +478,14 @@ def verify(payload: dict) -> dict:
                         "source_type": src.get("source_type") or src.get("source"),
                     }
                 info["ref"] = ref_order.index(key) + 1
-                if info["verdict"] == "verified" and info["alignment_status"] == "aligned":
+                if info["verdict"] == "verified":
                     evidence_rows.append({
-                        "evidence_id": "E{}".format(len(evidence_rows) + 1),
+                        # Compact prose cites stable ledger IDs. Filtering or removing
+                        # another row must never redirect those references.
+                        "evidence_id": (
+                            claim_id if isinstance(payload.get("compact_landscape"), dict)
+                            else "E{}".format(n_cit)
+                        ),
                         "claim_id": claim_id,
                         "ref": info["ref"],
                         "source_id": src.get("id"),
@@ -894,123 +501,32 @@ def verify(payload: dict) -> dict:
                             or src.get("limitation")
                             or src.get("limitations")
                         ),
-                        "verification": "verified",
+                        "quote_status": "verified",
                     })
             classified.append(info)
 
-        supported = any(
-            c["verdict"] == "verified" and c["alignment_status"] == "aligned"
-            for c in classified
-        )
-        if supported:
-            n_supported += 1
-        has_usable_attribution = any(c["verdict"] != "flagged" for c in classified)
         out_claims.append({
             "id": claim_id,
             "text": claim.get("text"),
-            "supported": supported,
-            "support_status": (
-                "supported" if supported
-                else "unproven" if has_usable_attribution
-                else "invalid"
-            ),
             "citations": classified,
         })
-
-    # Source adapters can emit exact, field-indexed evidence candidates. Add
-    # them deterministically so evidence granularity does not depend on whether
-    # the model happened to split a compound repository snapshot into many
-    # separate claims.
-    existing_atoms = {
-        (
-            str(row.get("source_id") or ""),
-            _normalize_text(str(row.get("quote") or "")),
-        )
-        for row in evidence_rows
-    }
-    structured_count = 0
-    for source in sources:
-        if not isinstance(source, dict):
-            continue
-        atoms = _structured_source_evidence(source)
-        if not atoms:
-            continue
-        key = _normalize_url(source.get("url") or "") or "src:{}".format(source.get("id"))
-        if key not in ref_meta:
-            ref_order.append(key)
-            ref_meta[key] = {
-                "title": source.get("title"),
-                "url": source.get("url"),
-                "date": source.get("date"),
-                "authors": source.get("authors") or [],
-                "publisher": source.get("publisher") or source.get("venue"),
-                "doi": source.get("doi"),
-                "pmid": source.get("pmid"),
-                "source_type": source.get("source_type") or source.get("source"),
-            }
-        ref = ref_order.index(key) + 1
-        for atom in atoms:
-            atom_key = (
-                str(source.get("id") or ""),
-                _normalize_text(atom["quote"]),
-            )
-            if atom_key in existing_atoms:
-                continue
-            existing_atoms.add(atom_key)
-            evidence_rows.append({
-                "evidence_id": "E{}".format(len(evidence_rows) + 1),
-                "claim_id": "structured:{}:{}".format(
-                    source.get("id") or "source", atom["field"]
-                ),
-                "ref": ref,
-                "source_id": source.get("id"),
-                "title": source.get("title"),
-                "field": atom["field"],
-                "claim": "{}: {}".format(atom["field"], atom["quote"]),
-                "quote": atom["quote"],
-                "url": source.get("url"),
-                "source_date": source.get("date") or source.get("published_at"),
-                "accessed_at": source.get("accessed_at") or source.get("access_date"),
-                "limitation": (
-                    source.get("limitation")
-                    or source.get("limitations")
-                    or "Structured official-source excerpt; not an independent usability test."
-                ),
-                "verification": "verified",
-                "verification_basis": "structured_source_adapter",
-            })
-            structured_count += 1
 
     references = [{"ref": i + 1, **ref_meta[k]} for i, k in enumerate(ref_order)]
     comparison_rows, comparison_markdown, comparison_warnings = _render_comparison(
         payload.get("comparison"), evidence_rows)
     comparison_coverage = _comparison_coverage(comparison_rows)
-    recommendation_markdown = _render_recommendation_markdown(
-        comparison_rows, comparison_coverage
-    )
-    recommendation_ready = sum(
-        1 for row in comparison_coverage if row["recommendation_ready"]
-    )
     return {
         "abstain": False,
         "abstain_reason": None,
-        "summary": {"claims": len(out_claims), "supported": n_supported,
-                    "unsupported": len(out_claims) - n_supported, "citations": n_cit,
+        "summary": {"claims": len(out_claims), "citations": n_cit,
                     "verified": n_verified, "weak": n_weak, "flagged": n_flagged,
-                    "aligned": n_aligned, "support_unproven": n_unproven,
-                    "structured_evidence_candidates": structured_count,
-                    "comparison_rows": len(comparison_coverage),
-                    "comparison_recommendation_ready": recommendation_ready,
-                    "comparison_under_evidenced": (
-                        len(comparison_coverage) - recommendation_ready
-                    )},
+                    "comparison_rows": len(comparison_coverage)},
         "claims": out_claims,
         "references": references,
         "evidence_rows": evidence_rows,
         "evidence_markdown": _render_evidence_markdown(evidence_rows),
         "comparison_rows": comparison_rows,
         "comparison_markdown": comparison_markdown,
-        "recommendation_markdown": recommendation_markdown,
         "comparison_coverage": comparison_coverage,
         "comparison_warnings": comparison_warnings,
         "flags": flags,
@@ -1180,15 +696,11 @@ def _compact_evidence_row_verifies(
     }
     info = _classify_citation(
         {"source": source_id, "quote": quote},
-        claim,
         {source_id: source},
         {source_url: source},
         {},
     )
-    return (
-        info.get("verdict") == "verified"
-        and info.get("alignment_status") == "aligned"
-    )
+    return info.get("verdict") == "verified"
 
 
 def _expand_compact_landscape_payload(payload: dict, input_path) -> dict:
@@ -1446,14 +958,16 @@ def main(argv):
         spec = payload.get("compact_landscape")
         if not isinstance(spec, dict):
             raise ValueError("--report-out requires compact_landscape input")
-        title = _inline_markdown(spec.get("title")) or "Verified research report"
+        title = _inline_markdown(spec.get("title")) or "Research report"
         boundary = str(spec.get("boundary") or "").strip()
+        analysis = spec.get("analysis_markdown")
+        if not isinstance(analysis, str) or not analysis.strip():
+            raise ValueError("--report-out requires non-empty compact_landscape.analysis_markdown")
         parts = ["# {}".format(title)]
         if boundary:
             parts.append(boundary)
-        for key in (
-            "recommendation_markdown", "comparison_markdown", "evidence_markdown"
-        ):
+        parts.append(analysis)
+        for key in ("comparison_markdown", "evidence_markdown"):
             value = str(data.get(key) or "").strip()
             if value:
                 parts.append(value)
@@ -1498,8 +1012,8 @@ def _cli_stdout(result: dict, argv: list[str]) -> dict:
             continue
         coverage.append({
             "candidate": item.get("candidate"),
-            "status": item.get("status"),
-            "blocking_decision_groups": item.get("blocking_decision_groups") or [],
+            "fields_with_citations": item.get("fields_with_citations") or [],
+            "missing_citation_fields": item.get("missing_citation_fields") or [],
         })
 
     compact = {
@@ -1522,7 +1036,6 @@ def _cli_stdout(result: dict, argv: list[str]) -> dict:
     if "--report-out" not in argv:
         compact.update({
             "comparison_markdown": data.get("comparison_markdown") or "",
-            "recommendation_markdown": data.get("recommendation_markdown") or "",
             "evidence_markdown": data.get("evidence_markdown") or "",
         })
     return compact

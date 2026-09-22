@@ -1,19 +1,4 @@
 const _agentsLog = createLogger('agents');
-// ─── Agents (three-column: list / detail / inline edit chat) ───
-
-function _agentsTrackClick(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-}
-
-function _agentsTrackEvent(action, data) {
-  void action;
-  void data;
-}
-
-function _agentsTrackError(action, data) {
-  void action;
-  void data;
-}
 
 function _agentManageErrorCode(value, fallback = 'operation_failed') {
   const message = String((value && value.message) || '').trim();
@@ -470,9 +455,7 @@ function _generalCategoryLabel(lang) {
   });
   const label = c ? pickLocalizedName(c, lang) : '';
   if (label) return label;
-  if (lang === 'zh') return '通用';
-  if (lang === 'ja') return '汎用';
-  return 'General';
+  return t('marketplace.category_general');
 }
 
 function _knownCategoryCodes(cats) {
@@ -857,21 +840,17 @@ function renderAgentsGrid(agents) {
  *  success, refreshes the grid + detail page. */
 async function _flipAgentEnabled(agentId, nextEnabled) {
   if (_isCommanderAgent(agentId)) return false;
-  const trackResult = _createAgentManageTracker('toggle');
   let res;
   try {
     res = await window.orkas.invoke('agents.setEnabled', { agent_id: agentId, enabled: nextEnabled });
   } catch (err) {
-    trackResult('failure', 'invoke_failed');
     await uiAlert(t('component.toggle_failed'));
     return false;
   }
   if (!res || !res.ok) {
-    trackResult('failure', 'update_failed');
     await uiAlert(t('component.toggle_failed'));
     return false;
   }
-  trackResult('success');
   const cached = _agentsCache?.find((a) => a.agent_id === agentId);
   if (cached) cached.enabled = nextEnabled;
   try {
@@ -883,24 +862,6 @@ async function _flipAgentEnabled(agentId, nextEnabled) {
     _agentsLog.warn('agent toggle refresh failed', { error_code: 'refresh_failed' });
   }
   return true;
-}
-
-function _createAgentManageTracker(action) {
-  const startedAt = Date.now();
-  let done = false;
-  return (result, errorCode = '') => {
-    if (done) return;
-    done = true;
-    const payload = {
-      result,
-      action,
-      duration_ms: Math.max(0, Date.now() - startedAt),
-    };
-    if (result !== 'success') payload.error_code = errorCode || 'unknown';
-    try {
-      if (window.Monitor) Monitor.event('agent_manage_result', payload);
-    } catch (_) {}
-  };
 }
 
 // ─── View switching: entry page ↔ detail ────────────────────────────────
@@ -1334,24 +1295,20 @@ function _renderAgentHeaderCategory(agent) {
     value: agent?.category || 'general',
     readonly: isMock,
     onChange: async (category, api) => {
-      const trackResult = _createAgentManageTracker('edit');
       try {
         const res = await window.orkas.invoke('agents.update', {
           agent_id: agentId,
           updates: { category: category || 'general' },
         });
         if (!res || !res.ok) {
-          trackResult('failure', _agentManageErrorCode(res, 'update_failed'));
           api.setValue(agent?.category || 'general');
           uiAlert((res && res.error) || t('agents.update_failed'));
           return;
         }
-        trackResult('success');
         agent.category = res.agent?.category || category || 'general';
         await loadAgents(true);
         if (_selectedAgent?.id === agentId && !_agentEditing) await selectAgent(agentId);
       } catch (err) {
-        trackResult('failure', _agentManageErrorCode(err, 'invoke_failed'));
         api.setValue(agent?.category || 'general');
         uiAlert((err && err.message) || t('agents.update_failed'));
       }
@@ -1455,7 +1412,6 @@ function _canEnterAgentEditMode(agent) {
 
 async function _saveAgentTextList(agent, key, values) {
   if (!agent || !_canEditAgentDefinition(agent)) return false;
-  const trackResult = _createAgentManageTracker('edit');
   const clean = [];
   const seen = new Set();
   for (const raw of Array.isArray(values) ? values : []) {
@@ -1471,16 +1427,13 @@ async function _saveAgentTextList(agent, key, values) {
       updates: { [key]: clean },
     });
     if (!res || !res.ok) {
-      trackResult('failure', _agentManageErrorCode(res, 'update_failed'));
       await uiAlert((res && res.error) || t('agents.update_failed'));
       return false;
     }
-    trackResult('success');
     await loadAgents(true);
     await _refreshAgentDetail(agent.agent_id);
     return true;
   } catch (err) {
-    trackResult('failure', _agentManageErrorCode(err, 'invoke_failed'));
     await uiAlert((err && err.message) || t('agents.update_failed'));
     return false;
   }
@@ -1676,19 +1629,15 @@ function _wireAgentMemoryControls(host, agent) {
         : window.prompt(label, '');
       const text = (content || '').trim();
       if (!text) return;
-      const trackResult = _createAgentManageTracker('edit');
       try {
         const res = await _agentMemoryAdd(agent, text);
         if (!res || res.ok === false) {
-          trackResult('failure', _agentManageErrorCode(res, 'memory_add_failed'));
           uiAlert((res && res.error) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
           return;
         }
-        trackResult('success');
         await loadAgents(true);
         await _refreshAgentDetail(agent.agent_id);
       } catch (err) {
-        trackResult('failure', _agentManageErrorCode(err, 'memory_add_failed'));
         uiAlert((err && err.message) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
       }
     });
@@ -1704,19 +1653,15 @@ function _wireAgentMemoryControls(host, agent) {
         : window.prompt(label, oldText);
       const text = (content || '').trim();
       if (!text || text === oldText) return;
-      const trackResult = _createAgentManageTracker('edit');
       try {
         const res = await _agentMemoryUpdate(agent, oldText, text);
         if (!res || res.ok === false) {
-          trackResult('failure', _agentManageErrorCode(res, 'memory_update_failed'));
           uiAlert((res && res.error) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
           return;
         }
-        trackResult('success');
         await loadAgents(true);
         await _refreshAgentDetail(agent.agent_id);
       } catch (err) {
-        trackResult('failure', _agentManageErrorCode(err, 'memory_update_failed'));
         uiAlert((err && err.message) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
       }
     });
@@ -1735,19 +1680,15 @@ function _wireAgentMemoryControls(host, agent) {
           })
         : false;
       if (!ok) return;
-      const trackResult = _createAgentManageTracker('edit');
       try {
         const res = await _agentMemoryRemove(agent, text);
         if (!res || res.ok === false) {
-          trackResult('failure', _agentManageErrorCode(res, 'memory_remove_failed'));
           uiAlert((res && res.error) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
           return;
         }
-        trackResult('success');
         await loadAgents(true);
         await _refreshAgentDetail(agent.agent_id);
       } catch (err) {
-        trackResult('failure', _agentManageErrorCode(err, 'memory_remove_failed'));
         uiAlert((err && err.message) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
       }
     });
@@ -1957,25 +1898,20 @@ function _renderAgentOutputFormatSection(agent, editing = false) {
     options,
     value: current,
     onChange: async (val) => {
-      const trackResult = _createAgentManageTracker('edit');
       try {
         const res = await window.orkas.invoke('agents.update', {
           agent_id: agent.agent_id,
           updates: { output_format: val },
         });
         if (!res || !res.ok) {
-          trackResult('failure', _agentManageErrorCode(res, 'update_failed'));
           api.setValue(current);
           uiAlert((res && res.error) || t('agents.update_failed'));
         } else if (res.agent) {
           agent.output_format = res.agent.output_format;
           current = val;
-          trackResult('success');
         } else {
-          trackResult('failure', 'invalid_response');
         }
       } catch (err) {
-        trackResult('failure', _agentManageErrorCode(err, 'invoke_failed'));
         api.setValue(current);
         uiAlert((err && err.message) || t('agents.update_failed'));
       }
@@ -2121,13 +2057,11 @@ async function _renderAgentDetailRuntime(agent) {
           updates.description_en = next2.description_en;
         }
       }
-      const trackResult = _createAgentManageTracker('edit');
       try {
         const res = await window.orkas.invoke('agents.update', {
           agent_id: agent.agent_id, updates,
         });
         if (res?.ok && res.agent) {
-          trackResult('success');
           _agentsCache = null;
           const fetched = await apiFetch(`/api/agents/${encodeURIComponent(agent.agent_id)}`);
           const data = await fetched.json();
@@ -2143,7 +2077,6 @@ async function _renderAgentDetailRuntime(agent) {
             agent_id: agent.agent_id, updates: safeUpdates,
           });
           if (!fallback?.ok) throw new Error(fallback?.code || 'update_failed');
-          trackResult('success');
           _agentsCache = null;
           const fetched = await apiFetch(`/api/agents/${encodeURIComponent(agent.agent_id)}`);
           const data = await fetched.json();
@@ -2153,7 +2086,6 @@ async function _renderAgentDetailRuntime(agent) {
           throw new Error(res?.code || 'update_failed');
         }
       } catch (err) {
-        trackResult('failure', _agentManageErrorCode(err, 'update_failed'));
       }
     },
   });
@@ -2265,9 +2197,11 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
     seenModelIds.add(id);
     const isDefault = id === defaultModelId;
     const isAlias = model?.is_alias === true;
-    const aliasResolvedModel = isAlias && id === currentModel
-      ? observedModelForCurrentSelection
-      : '';
+    // The catalog states what this row runs right now; a model observed on the
+    // last run only covers the current selection and can be older, so it is the
+    // fallback for CLIs whose catalog omits the resolution.
+    const resolvedModel = String(model?.resolved_model || '').trim()
+      || (id === currentModel ? observedModelForCurrentSelection : '');
     const label = String(model.label || id);
     const hints = [];
     if (isDefault) hints.push(t('agents.cli_default'));
@@ -2276,9 +2210,10 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
       // The real default model doubles as the "inherit CLI default" action.
       // Keep its empty persisted value without adding a synthetic first row.
       value: isDefault ? '' : id,
-      label: isAlias
-        ? `${label} · ${aliasResolvedModel || t('agents.cli_model_alias_latest')}`
-        : label,
+      // Name the model this row runs; for an alias the hint adds that the
+      // choice follows later CLI updates. A label that already is the model id,
+      // or a row with no known resolution, appends nothing.
+      label: resolvedModel && resolvedModel !== label ? `${label} · ${resolvedModel}` : label,
       hint: hints.join(' · '),
     });
   }
@@ -2390,11 +2325,11 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
         ? t('agents.cli_settings_partial')
         : t('agents.cli_settings_unavailable'),
     )}</div>`;
-  const selectedModelIsAlias = models.some(
-    model => model?.is_alias === true && String(model.id || '') === currentModel,
-  );
+  // A listed row already names its resolution in the picker, so the note is
+  // left for a saved override the catalog does not list at all.
+  const selectedModelIsListed = models.some(model => String(model?.id || '') === currentModel);
   const observedModelNote = observedModelForCurrentSelection
-    && !selectedModelIsAlias
+    && !selectedModelIsListed
     && observedModelForCurrentSelection !== currentModel
     ? `<div class="agents-detail-cli-note agents-detail-cli-model-observed">${escapeHtml(
       t('agents.cli_model_recent', { model: observedModelForCurrentSelection }),
@@ -2428,7 +2363,6 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
     }
   };
   const saveRuntime = async (patch) => {
-    const trackResult = _createAgentManageTracker('edit');
     try {
       const nextRuntime = { ...runtime, ...patch };
       if (!nextRuntime.model_override) delete nextRuntime.model_override;
@@ -2439,7 +2373,6 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
         updates: { runtime: nextRuntime },
       });
       if (!saved?.agent) throw new Error(saved?.code || t('agents.update_failed'));
-      trackResult('success');
       if (!_mergeAgentIntoCache(saved.agent)) {
         // Detail normally opens from the registry, so this is only a cold-cache
         // fallback. Await it before returning control to the composer.
@@ -2447,7 +2380,6 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
       }
       _renderAgentDetail(saved.agent, _agentEditing);
     } catch (error) {
-      trackResult('failure', _agentManageErrorCode(error, 'update_failed'));
       throw error;
     }
   };
@@ -2595,26 +2527,21 @@ async function _renderAgentDetailProjectDir(agent) {
     const resetBtn = slot.querySelector('[data-act="reset"]');
     const pick = async () => {
       if (!canEdit) return;
-      let trackResult = null;
       try {
         const picked = await window.orkas.invoke('common.pickDirectory', {
           title: t('agents.label_project_dir'),
         });
         if (!picked || picked.cancelled || !picked.path) return;
-        trackResult = _createAgentManageTracker('edit');
         const saved = await window.orkas.invoke('agents.cliProjectDir.set', {
           agent_id: agent.agent_id,
           path: picked.path,
         });
         if (!saved || !saved.ok) {
-          trackResult('failure', _agentManageErrorCode(saved, 'project_dir_save_failed'));
           await uiAlert((saved && saved.error) || t('agents.project_dir_save_failed'));
           return;
         }
         renderInfo(saved.info);
-        trackResult('success');
       } catch (err) {
-        if (trackResult) trackResult('failure', _agentManageErrorCode(err, 'project_dir_save_failed'));
         await uiAlert((err && err.message) || t('agents.project_dir_save_failed'));
       }
     };
@@ -2622,21 +2549,17 @@ async function _renderAgentDetailProjectDir(agent) {
     resetBtn?.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (!canEdit) return;
-      const trackResult = _createAgentManageTracker('edit');
       try {
         const saved = await window.orkas.invoke('agents.cliProjectDir.set', {
           agent_id: agent.agent_id,
           path: '',
         });
         if (!saved || !saved.ok) {
-          trackResult('failure', _agentManageErrorCode(saved, 'project_dir_save_failed'));
           await uiAlert((saved && saved.error) || t('agents.project_dir_save_failed'));
           return;
         }
         renderInfo(saved.info);
-        trackResult('success');
       } catch (err) {
-        trackResult('failure', _agentManageErrorCode(err, 'project_dir_save_failed'));
         await uiAlert((err && err.message) || t('agents.project_dir_save_failed'));
       }
     });
@@ -2693,7 +2616,6 @@ function _renderAgentDetailAvatar(agent) {
       agent.icon = nextIcon;
       agent.color = next.color;
       applyAvatarToElement(trigger, nextIcon, next.color, agent.agent_id);
-      const trackResult = _createAgentManageTracker('edit');
       try {
         if (isCommander) {
           const res = await window.orkas.invoke('prefs.setCommanderAvatar', { icon: nextIcon, color: next.color });
@@ -2715,9 +2637,7 @@ function _renderAgentDetailAvatar(agent) {
             if (_agentsCache) renderAgentsList(_agentsCache);
           } else throw new Error(res?.code || 'avatar_update_failed');
         }
-        trackResult('success');
       } catch (err) {
-        trackResult('failure', _agentManageErrorCode(err, 'avatar_update_failed'));
       }
     });
   });
@@ -2984,7 +2904,7 @@ function _switchAgentTab(tab) {
   // CLI discovery is process-heavy and belongs only to the External flow.
   // Start it when that panel actually becomes visible, not whenever the
   // default in-process create modal opens.
-  if (tab === 'external') _trackExternalAgentFlowEnter();
+  if (tab === 'external')
   if (tab === 'external' && typeof mountExternalCliSelect === 'function') {
     mountExternalCliSelect((cli) => _applyExternalCliDefaults(cli)).catch(() => {});
   }
@@ -3001,8 +2921,6 @@ let _agentModalEntryPoint = '';
 let _agentModalSourceView = '';
 let _agentModalReturnTarget = null;
 let _agentModalOpenedAt = 0;
-let _agentModalHadExternalSubmitAttempt = false;
-let _agentModalExternalFlowEntered = false;
 let _externalAgentCreateAvailable = false;
 let _agentModalActiveTab = 'create';
 
@@ -3020,37 +2938,6 @@ function setExternalAgentCreateAvailability(available) {
   _syncAgentCreateSaveButton();
 }
 window.setExternalAgentCreateAvailability = setExternalAgentCreateAvailability;
-
-function _trackExternalAgentFlowEnter() {
-  if (_agentModalExternalFlowEntered) return;
-  _agentModalExternalFlowEntered = true;
-  try {
-    if (window.Monitor) Monitor.event('agent_create_flow_enter', {
-      agent_type: 'cli',
-      entry_point: _agentModalEntryPoint,
-      source_view: _agentModalSourceView,
-    });
-  } catch (_) {}
-}
-
-function _trackAgentCreateBlocked({
-  agentType,
-  startedAt,
-  errorCode,
-  cli = '',
-}) {
-  if (!window.Monitor) return;
-  const payload = {
-    result: 'blocked',
-    agent_type: agentType,
-    duration_ms: Math.round(Math.max(0, performance.now() - startedAt)),
-    error_code: errorCode,
-  };
-  if (cli) payload.cli = cli;
-  try {
-    Monitor.event('agent_create_result', payload);
-  } catch (_) {}
-}
 
 /** Decide whether a current `name` value still counts as "the default
  *  for `defaultName`" — meaning a CLI swap should overwrite it. We
@@ -3126,13 +3013,20 @@ function openAgentModal(options = {}) {
     : '';
   _agentModalReturnTarget = _captureAgentDetailReturnTarget();
   _agentModalOpenedAt = performance.now();
-  _agentModalHadExternalSubmitAttempt = false;
-  _agentModalExternalFlowEntered = false;
   _externalAgentCreateAvailable = false;
   const modal = document.getElementById('agent-modal');
   const msgEl = document.getElementById('agent-form-msg');
   msgEl.textContent = '';
   msgEl.className = 'form-msg';
+
+  // The external-only entry binds a CLI that already exists, so "New agent"
+  // misdescribes it. Swap the key rather than the rendered string, so a later
+  // language change re-renders the title this dialog is actually showing.
+  const titleEl = document.getElementById('agent-modal-title');
+  if (titleEl?.dataset) {
+    titleEl.dataset.i18n = externalOnly ? 'agent_modal.title_connect' : 'agent_modal.title';
+    titleEl.textContent = t(titleEl.dataset.i18n);
+  }
 
   // Reset both panels' inputs.
   const nameInput = document.getElementById('agent-name-input');
@@ -3172,8 +3066,6 @@ function closeAgentModal(options = {}) {
   _agentModalReturnFocusId = '';
   document.getElementById('agent-modal').classList.remove('open');
   _agentModalOpenedAt = 0;
-  _agentModalHadExternalSubmitAttempt = false;
-  _agentModalExternalFlowEntered = false;
   _agentModalEntryPoint = '';
   _agentModalSourceView = '';
   _agentModalReturnTarget = null;
@@ -3184,13 +3076,9 @@ function closeAgentModal(options = {}) {
 }
 window.closeAgentModal = closeAgentModal;
 
-function _trackExternalAgentCreateCancel() {
-  // Analytics is intentionally disabled in the open-source build.
-}
-
 function cancelAgentModal() {
   const activeTab = document.querySelector('#agent-modal-tabs .is-active')?.dataset.agentTab || 'create';
-  if (activeTab === 'external') _trackExternalAgentCreateCancel();
+  if (activeTab === 'external')
   closeAgentModal({ restoreFocus: true });
 }
 window.cancelAgentModal = cancelAgentModal;
@@ -3205,7 +3093,6 @@ window.saveAgentModal = saveAgentModal;
 
 async function _saveCreateAgent({ msgEl }) {
   const startedAt = performance.now();
-  let terminalResultTracked = false;
   const rawName = document.getElementById('agent-name-input').value;
   const name = rawName.trim();
   const description = document.getElementById('agent-desc-input').value.trim();
@@ -3213,11 +3100,6 @@ async function _saveCreateAgent({ msgEl }) {
     msgEl.textContent = t('agents.input_name_needed');
     msgEl.className = 'form-msg err';
     document.getElementById('agent-name-input').focus();
-    _trackAgentCreateBlocked({
-      agentType: 'default',
-      startedAt,
-      errorCode: 'no_name',
-    });
     return;
   }
   const hasWhitespace = /\s/.test(rawName);
@@ -3226,33 +3108,18 @@ async function _saveCreateAgent({ msgEl }) {
     msgEl.textContent = t('agents.name_invalid');
     msgEl.className = 'form-msg err';
     document.getElementById('agent-name-input').focus();
-    _trackAgentCreateBlocked({
-      agentType: 'default',
-      startedAt,
-      errorCode: 'name_invalid',
-    });
     return;
   }
   if (reserved) {
     msgEl.textContent = t('agents.name_reserved');
     msgEl.className = 'form-msg err';
     document.getElementById('agent-name-input').focus();
-    _trackAgentCreateBlocked({
-      agentType: 'default',
-      startedAt,
-      errorCode: 'name_reserved',
-    });
     return;
   }
   if (!description) {
     msgEl.textContent = t('agents.input_desc_needed');
     msgEl.className = 'form-msg err';
     document.getElementById('agent-desc-input').focus();
-    _trackAgentCreateBlocked({
-      agentType: 'default',
-      startedAt,
-      errorCode: 'no_desc',
-    });
     return;
   }
 
@@ -3270,31 +3137,8 @@ async function _saveCreateAgent({ msgEl }) {
     if (!data.ok || !data.agent) {
       msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
       msgEl.className = 'form-msg err';
-      terminalResultTracked = true;
-      if (window.Monitor) {
-        (() => {})('agent_create_result', {
-          result: 'failure',
-          agent_type: 'default',
-          duration_ms: Math.round(performance.now() - startedAt),
-          error_code: data.code || '',
-        });
-        (() => {})('agent_create', {
-          agent_type: 'default',
-          output_format: outputFormat,
-          error_type: 'api',
-          error_code: data.code || '',
-          error_message: data.error || 'unknown',
-        });
-      }
       return;
     }
-    terminalResultTracked = true;
-    if (window.Monitor) (() => {})('agent_create_result', {
-      result: 'success',
-      agent_id: data.agent.agent_id,
-      agent_type: 'default',
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
     const detailReturnTarget = _agentModalReturnTarget;
     closeAgentModal();
     await loadAgents(true);
@@ -3305,26 +3149,11 @@ async function _saveCreateAgent({ msgEl }) {
   } catch (e) {
     msgEl.textContent = t('agents.network_error', { reason: e.message || e });
     msgEl.className = 'form-msg err';
-    if (window.Monitor && !terminalResultTracked) {
-      (() => {})('agent_create_result', {
-        result: 'failure',
-        agent_type: 'default',
-        duration_ms: Math.round(performance.now() - startedAt),
-      });
-      (() => {})('agent_create', {
-        agent_type: 'default',
-        output_format: outputFormat,
-        error_type: 'network',
-        error_message: e.message || String(e),
-      });
-    }
   }
 }
 
 async function _saveExternalAgent({ msgEl }) {
   const startedAt = performance.now();
-  _agentModalHadExternalSubmitAttempt = true;
-  let terminalResultTracked = false;
   const cli = (typeof getExternalCliValue === 'function') ? getExternalCliValue() : null;
   const cliWarning = (typeof getExternalCliSelectionWarning === 'function')
     ? getExternalCliSelectionWarning()
@@ -3345,34 +3174,17 @@ async function _saveExternalAgent({ msgEl }) {
   if (!cli) {
     msgEl.textContent = t('agents.ext_cli_needed');
     msgEl.className = 'form-msg err';
-    _trackAgentCreateBlocked({
-      agentType: 'cli',
-      startedAt,
-      errorCode: 'no_cli',
-    });
     return;
   }
   if (cliWarning) {
     msgEl.textContent = cliWarning;
     msgEl.className = 'form-msg err';
-    _trackAgentCreateBlocked({
-      agentType: 'cli',
-      startedAt,
-      errorCode: 'cli_version_too_old',
-      cli,
-    });
     return;
   }
   if (!name) {
     msgEl.textContent = t('agents.input_name_needed');
     msgEl.className = 'form-msg err';
     nameEl.focus();
-    _trackAgentCreateBlocked({
-      agentType: 'cli',
-      startedAt,
-      errorCode: 'no_name',
-      cli,
-    });
     return;
   }
   const hasWhitespace = /\s/.test(rawName);
@@ -3381,36 +3193,18 @@ async function _saveExternalAgent({ msgEl }) {
     msgEl.textContent = t('agents.name_invalid');
     msgEl.className = 'form-msg err';
     nameEl.focus();
-    _trackAgentCreateBlocked({
-      agentType: 'cli',
-      startedAt,
-      errorCode: 'name_invalid',
-      cli,
-    });
     return;
   }
   if (reserved) {
     msgEl.textContent = t('agents.name_reserved');
     msgEl.className = 'form-msg err';
     nameEl.focus();
-    _trackAgentCreateBlocked({
-      agentType: 'cli',
-      startedAt,
-      errorCode: 'name_reserved',
-      cli,
-    });
     return;
   }
   if (!desc) {
     msgEl.textContent = t('agents.input_desc_needed');
     msgEl.className = 'form-msg err';
     descEl.focus();
-    _trackAgentCreateBlocked({
-      agentType: 'cli',
-      startedAt,
-      errorCode: 'no_desc',
-      cli,
-    });
     return;
   }
 
@@ -3443,33 +3237,8 @@ async function _saveExternalAgent({ msgEl }) {
     if (!data.ok || !data.agent) {
       msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
       msgEl.className = 'form-msg err';
-      terminalResultTracked = true;
-      if (window.Monitor) {
-        (() => {})('agent_create_result', {
-          result: 'failure',
-          agent_type: 'cli',
-          cli,
-          duration_ms: Math.round(performance.now() - startedAt),
-          error_code: data.code || '',
-        });
-        (() => {})('agent_create', {
-          agent_type: 'cli',
-          cli,
-          error_type: 'api',
-          error_code: data.code || '',
-          error_message: data.error || 'unknown',
-        });
-      }
       return;
     }
-    terminalResultTracked = true;
-    if (window.Monitor) (() => {})('agent_create_result', {
-      result: 'success',
-      agent_id: data.agent.agent_id,
-      agent_type: 'cli',
-      cli,
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
     const detailReturnTarget = _agentModalReturnTarget;
     closeAgentModal();
     await loadAgents(true);
@@ -3480,20 +3249,6 @@ async function _saveExternalAgent({ msgEl }) {
   } catch (e) {
     msgEl.textContent = t('agents.network_error', { reason: e.message || e });
     msgEl.className = 'form-msg err';
-    if (window.Monitor && !terminalResultTracked) {
-      (() => {})('agent_create_result', {
-        result: 'failure',
-        agent_type: 'cli',
-        cli,
-        duration_ms: Math.round(performance.now() - startedAt),
-      });
-      (() => {})('agent_create', {
-        agent_type: 'cli',
-        cli,
-        error_type: 'network',
-        error_message: e.message || String(e),
-      });
-    }
   }
 }
 
@@ -3713,9 +3468,6 @@ async function useAgent(agentId) {
   if (_isAgentProfileMock(agentId)) return;
   if (_isCommanderAgent(agentId)) {
     _agentsLog.info('use commander');
-    _agentsTrackClick('agent_use', {
-      agent_id: _COMMANDER_AGENT_ID,
-    });
     setView('new-chat');
     if (typeof setChatRecipient === 'function') setChatRecipient('new-chat', { kind: 'commander' });
     if (typeof setChatUseSelection === 'function') setChatUseSelection('new-chat', null, { focus: false });
@@ -3733,9 +3485,6 @@ async function useAgent(agentId) {
     if (agent.enabled === false) return;
 
     _agentsLog.info('use agent', { agent_id: agentId });
-    _agentsTrackClick('agent_use', {
-      agent_id: agentId,
-    });
 
     setView('new-chat');
     setChatRecipient('new-chat', {
@@ -3762,9 +3511,6 @@ async function useSkill(skillId, skillName, skillSource) {
   // Skill "use" flow: navigate to the new-chat page with the skill
   // pre-selected and wait for user input.
   _agentsLog.info('use skill', { skill_id: skillId, skill_name: skillName || skillId });
-  _agentsTrackClick('skill_use', {
-    skill_id: skillId,
-  });
   setView('new-chat');
   if (typeof setChatRecipient === 'function') {
     setChatRecipient('new-chat', { kind: 'commander' });
@@ -3875,6 +3621,16 @@ function _agentPickerAllowsLibrary(anchorId) {
     || anchorId === 'auto-recipient-chip';
 }
 
+/** Composer anchors that may offer the coding-CLI entry. The automation
+ *  dialog is excluded on purpose: it is a `.ui-dialog-overlay` (z-index 13000)
+ *  and `openAgentModal` opens a plain `.modal-overlay` (z-index 100), so the
+ *  create dialog would open behind the task the user is still filling in. */
+function _agentPickerAllowsCliEntry(anchorId) {
+  return anchorId === 'chat-recipient-chip'
+    || anchorId === 'new-chat-recipient-chip'
+    || anchorId === 'project-chat-recipient-chip';
+}
+
 function _agentPickerVisibleTabs(anchorId) {
   // Skills and connectors use the same visible picker surface for commander
   // and agent recipients; runtime capability gates live in the main process.
@@ -3904,6 +3660,14 @@ function _updateAgentPickerChrome() {
   if (tabsEl) tabsEl.style.gridTemplateColumns = `repeat(${Math.max(1, visibleTabs.size)}, minmax(0, 1fr))`;
   const search = document.getElementById('agent-picker-search');
   if (search) search.placeholder = _agentPickerSearchPlaceholder();
+  // Picking an agent and connecting a new CLI are different jobs, so the entry
+  // sits below the roster instead of in it, and only where it applies: the
+  // Agents tab of a composer picker.
+  const cliFooter = document.getElementById('agent-picker-cli-footer');
+  if (cliFooter) {
+    cliFooter.hidden = _agentPickerTab !== 'agents'
+      || !_agentPickerAllowsCliEntry(picker.dataset.anchorId || '');
+  }
 }
 
 function _setAgentPickerTab(tab, opts = {}) {
@@ -4070,11 +3834,6 @@ async function _openAgentPicker(anchorBtn, entryPoint = 'unknown') {
     _closeOtherComposerPopovers('recipient');
   }
   if (anchorBtn.id === 'new-chat-recipient-chip') {
-    _agentsTrackClick('new_chat_recipient_picker_open', {
-      entry_point: entryPoint === 'recipient_chip' || entryPoint === 'at_key'
-        ? entryPoint
-        : 'unknown',
-    });
   }
   const previousAnchorId = picker.dataset.anchorId || '';
   if (previousAnchorId && previousAnchorId !== anchorBtn.id) {
@@ -4122,7 +3881,23 @@ function _closeAgentPicker({ preserveAtKey = false } = {}) {
   if (!preserveAtKey) _atKeyMark = null;
 }
 
+/** Re-anchor the open picker to its current content height. The popover is
+ *  placed from a measurement, so any later list repaint — tab switch, search,
+ *  async project/tab data — must re-run it or the box keeps a `top` computed
+ *  for the previous height and grows past its placement. */
+function _repositionAgentPicker() {
+  const picker = document.getElementById('agent-picker');
+  if (!picker || picker.style.display === 'none') return;
+  const anchor = document.getElementById(picker.dataset.anchorId || '');
+  if (anchor) _positionPopoverAboveOrBelow(picker, anchor);
+}
+
 function _renderAgentPickerList(filterText) {
+  _renderAgentPickerListRows(filterText);
+  _repositionAgentPicker();
+}
+
+function _renderAgentPickerListRows(filterText) {
   const listEl = document.getElementById('agent-picker-list');
   const picker = document.getElementById('agent-picker');
   if (!listEl) return;
@@ -4330,6 +4105,14 @@ function _agentPickerBasename(rel) {
   return i >= 0 ? s.slice(i + 1) : s;
 }
 
+// Comparable timestamp for ordering; same seconds-or-milliseconds tolerance as
+// `_agentPickerFormatMtime`. Rows without a usable mtime rank last.
+function _agentPickerMtimeRank(mtime) {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n > 100000000000 ? n : n * 1000;
+}
+
 function _agentPickerFormatMtime(mtime) {
   const n = Number(mtime);
   if (!Number.isFinite(n) || n <= 0) return '';
@@ -4402,6 +4185,11 @@ async function _loadLibraryPickerRows(projectId) {
   if (globalData && globalData.ok !== false) {
     rows.push(..._flattenLibraryPickerTree(globalData.tree || [], 'global', ''));
   }
+  // Recency-first, like both Library trees — the file you just saved is the one
+  // you are most likely to @-mention. Scope grouping is re-applied at render, so
+  // sorting across scopes here is safe, and the search path's sort is stable so
+  // equally-scored matches keep this order.
+  rows.sort((a, b) => _agentPickerMtimeRank(b?.mtime) - _agentPickerMtimeRank(a?.mtime));
   return rows;
 }
 
@@ -4551,8 +4339,7 @@ function _renderAgentPickerSelectionHeader(picker, selected) {
     (header.children[Math.min(focusedIndex, header.children.length - 1)]
       || document.getElementById('agent-picker-search'))?.focus();
   }
-  const anchor = document.getElementById(picker.dataset.anchorId);
-  if (anchor && picker.style.display !== 'none') _positionPopoverAboveOrBelow(picker, anchor);
+  _repositionAgentPicker();
 }
 
 function _refreshAgentPickerSelection() {
@@ -4637,17 +4424,9 @@ function _targetFromPickerAnchor(anchorId) {
 async function _triggerPickerItem(kind, itemId, itemName, anchorId, dataset, sourceType = 'unknown') {
   const target = _targetFromPickerAnchor(anchorId);
   if (target === 'new-chat') {
-    _agentsTrackClick('new_chat_recipient_picker_select', {
-      resource_kind: ['agent', 'skill', 'connector', 'library'].includes(kind) ? kind : 'unknown',
-      source_type: sourceType === 'mouse' || sourceType === 'keyboard' ? sourceType : 'unknown',
-    });
   }
   if (kind === 'skill') {
     const skillId = String(itemId || itemName || '');
-    _agentsTrackClick(target === 'auto' ? 'auto_skill_select' : 'chat_skill_select', {
-      target,
-      skill_id: skillId,
-    });
     _consumeAtKeyChar();
     setChatSkill(target, itemId, itemName || itemId);
     const inputId = target === 'new-chat'
@@ -4717,11 +4496,6 @@ async function _triggerLibraryFile(dataset, anchorId) {
     ? { projectId, name: rel }
     : { relPath: rel };
   const inputId = _libraryPickerInputIdForTarget(target);
-  const telemetry = {
-    target,
-    scope,
-    has_project: scope === 'project' && !!projectId,
-  };
   try {
     await window.attachKbFileToDraft(
       channel,
@@ -4732,17 +4506,15 @@ async function _triggerLibraryFile(dataset, anchorId) {
         else if (target === 'project' && projectId && typeof setView === 'function') setView('project', projectId);
       },
     );
-    _agentsTrackEvent('chat_library_attach_result', { ...telemetry, result: 'success' });
     _consumeAtKeyChar();
     _focusInput(document.getElementById(inputId));
   } catch (err) {
     const reason = String((err && err.message) || err || 'failed');
-    _agentsTrackEvent('chat_library_attach_result', { ...telemetry, result: 'failure' });
-    _agentsTrackError('chat_library_attach', {
-      ...telemetry,
-      error_type: 'operation',
-      error_message: 'library_attach_failed',
-    });
+    const failure_stage = ['draft_lock', 'ipc_request', 'input_validation', 'source_resolve', 'attachment_import', 'navigation', 'draft_render'].includes(err && err.failure_stage)
+      ? err.failure_stage : 'picker_finalize';
+    const failure_kind = ['not_found', 'permission_denied', 'disk_full'].includes(err && err.failure_kind)
+      ? err.failure_kind : 'operation_failed';
+    _agentsLog.warn('library attachment failed', { target, scope, failure_stage, failure_kind });
     if (typeof uiAlert === 'function') await uiAlert(t('agent_picker.library_attach_failed', { reason }));
   }
 }
@@ -4760,11 +4532,6 @@ async function _triggerAgent(agentId, agentName, anchorId) {
       ? { kind: 'commander' }
       : { kind: 'agent', id: agentId, name: agentName || agentId };
     const resourceAgentId = rec.kind === 'commander' ? _COMMANDER_AGENT_ID : String(agentId || '');
-    _agentsTrackClick('auto_agent_select', {
-      target: 'auto',
-      recipient_type: rec.kind,
-      agent_id: rec.kind === 'agent' ? String(agentId || '') : '',
-    });
     if (typeof window !== 'undefined' && typeof window._autoOnRecipientPicked === 'function') {
       window._autoOnRecipientPicked(rec);
     }
@@ -4935,6 +4702,28 @@ function bindAgentPickers() {
       _setAgentPickerTab(btn.dataset.agentPickerTab || 'agents');
     });
   });
+  // Coding-CLI entry. It leaves the picker rather than selecting from it, so it
+  // closes first and hands off to the external-only dialog the AI Team header
+  // and the old sidebar card both open -- no tab bar, just the CLI flow, so
+  // every entry to it shows one page. Only `entry_point` differs, which keeps
+  // the funnels separable. The modal returns focus to the chip on cancel.
+  const cliEntry = document.getElementById('agent-picker-connect-cli');
+  if (cliEntry && cliEntry.dataset.bound !== '1') {
+    cliEntry.dataset.bound = '1';
+    cliEntry.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const anchorId = document.getElementById('agent-picker')?.dataset.anchorId || '';
+      _closeAgentPicker();
+      if (typeof openAgentModal !== 'function') return;
+      openAgentModal({
+        initialTab: 'external',
+        externalOnly: true,
+        entryPoint: 'agent_picker_connect_cli',
+        sourceView: typeof currentView === 'string' ? currentView : '',
+        returnFocusId: anchorId,
+      });
+    });
+  }
   const searchInput = document.getElementById('agent-picker-search');
   searchInput?.addEventListener('input', () => {
     _renderAgentPickerList(searchInput.value);

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
 
 /**
  * Project to-do trunk flow — deterministic end-to-end (no model).
@@ -37,7 +38,8 @@ let tmpDir: string;
 let prevWs: string | undefined;
 let convSeq: number;
 const UID = 'uTODOE2E';
-const AGENT = 'a1b2c3d4e5f6';
+let AGENT: string;
+let closeLogWorkers: () => Promise<void>;
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-todo-e2e-'));
@@ -47,10 +49,12 @@ beforeEach(async () => {
   // Each user journey owns its dispatch counts; resetModules does not clear hoisted mocks.
   vi.clearAllMocks();
   vi.resetModules();
+  closeLogWorkers = await captureMainLogWorkers();
   const users = await import('../../../src/main/features/users');
   users.activateUser(UID);
 });
-afterEach(() => {
+afterEach(async () => {
+  await closeLogWorkers();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -75,6 +79,10 @@ async function load() {
 }
 
 async function seedProject(projects: any, name = 'Iterate'): Promise<string> {
+  const agents = await import('../../../src/main/features/agents');
+  const agent = await agents.createCustomAgent({ name: 'Owner' });
+  if (!agent) throw new Error('agent fixture failed');
+  AGENT = agent.agent_id;
   const r = await projects.createProject(UID, name);
   if (!r.ok) throw new Error('createProject failed');
   await projects.addAgentBinding(UID, r.project.project_id, AGENT);
@@ -82,38 +90,77 @@ async function seedProject(projects: any, name = 'Iterate'): Promise<string> {
 }
 
 describe('project to-do › end-to-end', () => {
-  it.each(['manual', 'auto'])('dispatches a globally assigned task through the selected agent for %s processing', async (mode) => {
-    const { pt, runner, groupChat, chats } = await load();
+  it.each(['project', 'global'])('links a %s todo only on execution, never on creation, edits, completion or duplicate creation', async (scope) => {
+    const { pt, runner, projects } = await load();
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const pid = scope === 'project' ? await seedProject(projects) : '';
+    const creator = createProjectTasksHandler(UID, pid, 'c_creator', new Map());
+    const created = await creator.create({ content: 'Execute only when requested' });
+    expect(created.ok).toBe(true);
+    const tid = created.task.id;
+    expect(created.task).not.toHaveProperty('origin_cid');
+    expect((await creator.update(tid, { status: 'progress' })).ok).toBe(true);
+    expect((await creator.complete(tid, 'early-result')).ok).toBe(true);
+    expect(await pt.getTask(UID, pid, tid)).not.toHaveProperty('origin_cid');
+    await creator.update(tid, { status: 'todo' });
+
+    const first = await runner.runTaskNow(UID, pid, tid);
+    expect(first.ok).toBe(true);
+    expect(await pt.getTask(UID, pid, tid)).toMatchObject({ origin_cid: first.cid, status: 'progress' });
+    const reused = await creator.create({ content: 'Execute only when requested' });
+    expect(reused).toMatchObject({ ok: true, alreadyExists: true, task: { id: tid, origin_cid: first.cid } });
+    await creator.update(tid, { content: 'Revised requirements', owner: '', status: 'todo' });
+    const second = await runner.advance(UID, pid, (await pt.getTask(UID, pid, tid))!);
+    expect(second.ok).toBe(true);
+    expect(second.cid).not.toBe(first.cid);
+    const oldExecutor = createProjectTasksHandler(UID, pid, first.cid!, new Map());
+    expect((await oldExecutor.update(tid, { status: 'review', result_ref: 'delivery' })).ok).toBe(true);
+    expect((await oldExecutor.complete(tid, 'verified')).ok).toBe(true);
+    expect((await creator.update(tid, { content: 'Final requirements' })).ok).toBe(true);
+    vi.resetModules();
+    const reloaded = await import('../../../src/main/features/project_tasks');
+    expect(await reloaded.listTasks(UID, pid)).toEqual([expect.objectContaining({
+      id: tid, content: 'Final requirements', status: 'done', result_ref: 'verified', origin_cid: second.cid,
+    })]);
+  });
+
+  it.each([
+    { mode: 'manual', scope: 'global' }, { mode: 'auto', scope: 'global' },
+    { mode: 'manual', scope: 'project' }, { mode: 'auto', scope: 'project' },
+  ])('dispatches an assigned $scope task through the selected agent for $mode processing', async ({ mode, scope }) => {
+    const { pt, runner, groupChat, chats, projects } = await load();
     const agents = await import('../../../src/main/features/agents');
     const owner = await agents.createCustomAgent({ name: 'GlobalSpecialist' });
     if (!owner) throw new Error('agent fixture failed');
-    const created = await pt.createTask(UID, '', { title: 'Assigned global work', owner_agent_id: owner.agent_id });
+    const pid = scope === 'project' ? await seedProject(projects) : '';
+    if (pid) await projects.addAgentBinding(UID, pid, owner.agent_id);
+    const created = await pt.createTask(UID, pid, { content: 'Assigned work', owner_agent_id: owner.agent_id });
     if (!created.ok) throw new Error('task fixture failed');
-    const run = () => mode === 'manual' ? runner.runTaskNow(UID, '', created.task.id) : runner.advance(UID, '', created.task);
+    const run = () => mode === 'manual' ? runner.runTaskNow(UID, pid, created.task.id) : runner.advance(UID, pid, created.task);
     const result = await run();
     expect(result.ok).toBe(true);
     expect(groupChat.setFloor).toHaveBeenCalledWith(UID, result.cid, owner.agent_id);
-    expect(groupChat.send).toHaveBeenCalledWith(expect.objectContaining({ cid: result.cid, text: created.task.title }));
+    expect(groupChat.send).toHaveBeenCalledWith(expect.objectContaining({ cid: result.cid, text: created.task.content }));
     expect(vi.mocked(groupChat.setFloor).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(groupChat.send).mock.invocationCallOrder[0]);
-    expect(await pt.getTask(UID, '', created.task.id)).toMatchObject({ owner_agent_id: owner.agent_id, status: 'progress', origin_cid: result.cid });
+    expect(await pt.getTask(UID, pid, created.task.id)).toMatchObject({ owner_agent_id: owner.agent_id, status: 'progress', origin_cid: result.cid });
 
     // Losing the selected agent must not silently run the default assistant.
-    await pt.updateTask(UID, '', created.task.id, { status: 'todo' });
+    await pt.updateTask(UID, pid, created.task.id, { status: 'todo' });
     vi.mocked(groupChat.setFloor).mockResolvedValueOnce({ ok: false, error: 'unknown agent' } as never);
     expect((await run()).ok).toBe(false);
     expect(groupChat.send).toHaveBeenCalledTimes(1);
-    expect(chats.deleteConversation).toHaveBeenCalledWith(UID, 'c_2', null);
-    expect((await pt.getTask(UID, '', created.task.id))?.status).toBe('todo');
+    expect(chats.deleteConversation).toHaveBeenCalledWith(UID, 'c_2', pid || null);
+    expect((await pt.getTask(UID, pid, created.task.id))?.status).toBe('todo');
     agents.setAgentEnabledForActiveUser(owner.agent_id, false);
     expect((await run()).ok).toBe(false);
     expect(groupChat.send).toHaveBeenCalledTimes(1);
-    expect(chats.deleteConversation).toHaveBeenCalledWith(UID, 'c_3', null);
-    expect((await pt.getTask(UID, '', created.task.id))?.status).toBe('todo');
+    expect(chats.deleteConversation).toHaveBeenCalledWith(UID, 'c_3', pid || null);
+    expect((await pt.getTask(UID, pid, created.task.id))?.status).toBe('todo');
   });
-  it('processes a task again from review while preserving its brief and first conversation', async () => {
+  it('processes a task again from review while preserving its brief and linking the latest execution', async () => {
     const { pt, runner, projects, groupChat } = await load();
     const pid = await seedProject(projects);
-    const created = await pt.createTask(UID, pid, { title: 'Deliver and verify' });
+    const created = await pt.createTask(UID, pid, { content: 'Deliver and verify' });
     if (!created.ok) throw new Error('task fixture failed');
     await pt.uploadTaskAttachment(UID, pid, created.task.id, 'brief.txt', Buffer.from('Required delivery'));
     const first = await runner.runTaskNow(UID, pid, created.task.id);
@@ -126,7 +173,7 @@ describe('project to-do › end-to-end', () => {
     expect(second.ok).toBe(true);
     expect(second.cid).not.toBe(first.cid);
     expect(await pt.getTask(UID, pid, created.task.id)).toMatchObject({
-      status: 'review', result_ref: 'delivery-v1', origin_cid: first.cid,
+      status: 'review', result_ref: 'delivery-v1', origin_cid: second.cid,
     });
     expect(vi.mocked(groupChat.send).mock.calls.at(-1)?.[0]).toMatchObject({
       cid: second.cid, attachments: ['brief.txt'], model_text: expect.stringContaining('to done with todo_tasks'),
@@ -137,7 +184,7 @@ describe('project to-do › end-to-end', () => {
     expect((await pt.completeTask(UID, pid, created.task.id, 'verified-delivery')).ok).toBe(true);
     const persisted = await pt.listTasks(UID, pid);
     expect(persisted).toEqual([expect.objectContaining({
-      id: created.task.id, status: 'done', result_ref: 'verified-delivery', origin_cid: first.cid,
+      id: created.task.id, status: 'done', result_ref: 'verified-delivery', origin_cid: second.cid,
     })]);
     expect(pt.computeProgress(persisted)).toMatchObject({ done: 1, open: 0 });
   });
@@ -147,10 +194,13 @@ describe('project to-do › end-to-end', () => {
     { scope: 'global', competing: 'manual' },
     { scope: 'project', competing: 'auto' },
     { scope: 'global', competing: 'auto' },
-  ])('dispatches a $scope task only once when a manual start overlaps $competing', async ({ scope, competing }) => {
+  ])('dispatches an assigned $scope task only once when a manual start overlaps $competing', async ({ scope, competing }) => {
     const { pt, runner, projects, chats, groupChat } = await load();
     const pid = scope === 'project' ? await seedProject(projects) : '';
-    const created = await pt.createTask(UID, pid, { title: 'One deliverable, one execution' });
+    const agents = await import('../../../src/main/features/agents');
+    const owner = pid ? { agent_id: AGENT } : await agents.createCustomAgent({ name: 'Owner' });
+    if (!owner) throw new Error('agent fixture failed');
+    const created = await pt.createTask(UID, pid, { content: 'One deliverable, one execution', owner_agent_id: owner.agent_id });
     if (!created.ok) throw new Error('task fixture failed');
     // Both entry points reach conversation creation before either can claim
     // the task, as with a double click or a scheduler tick during a UI start.
@@ -174,6 +224,7 @@ describe('project to-do › end-to-end', () => {
     expect(results.filter((result) => result.ok)).toHaveLength(1);
     expect(groupChat.send).toHaveBeenCalledTimes(1);
     const winningCid = results.find((result) => result.ok)!.cid;
+    expect(groupChat.setFloor).toHaveBeenCalledExactlyOnceWith(UID, winningCid, owner.agent_id);
     expect(await pt.getTask(UID, pid, created.task.id)).toMatchObject({
       status: 'progress', origin_cid: winningCid,
     });
@@ -184,7 +235,7 @@ describe('project to-do › end-to-end', () => {
   it.each(['project', 'global'])('can retry an unsent $scope task without losing its attachments', async (scope) => {
     const { pt, runner, projects, groupChat } = await load();
     const pid = scope === 'project' ? await seedProject(projects) : '';
-    const created = await pt.createTask(UID, pid, { title: 'Retry with original brief' });
+    const created = await pt.createTask(UID, pid, { content: 'Retry with original brief' });
     if (!created.ok) throw new Error('task fixture failed');
     expect((await pt.uploadTaskAttachment(UID, pid, created.task.id, 'brief.txt', Buffer.from('Original brief'))).ok).toBe(true);
     vi.mocked(groupChat.send).mockResolvedValueOnce({ ok: false, error: 'no_model' } as never);
@@ -204,7 +255,7 @@ describe('project to-do › end-to-end', () => {
   it.each(['review', 'done'] as const)('does not undo a newer %s decision when dispatch reports failure late', async (status) => {
     const { pt, runner, projects, groupChat } = await load();
     const pid = await seedProject(projects);
-    const created = await pt.createTask(UID, pid, { title: 'Preserve the latest decision' });
+    const created = await pt.createTask(UID, pid, { content: 'Preserve the latest decision' });
     if (!created.ok) throw new Error('task fixture failed');
     vi.mocked(groupChat.send).mockImplementationOnce(async () => {
       expect((await pt.getTask(UID, pid, created.task.id))?.status).toBe('progress');
@@ -218,9 +269,9 @@ describe('project to-do › end-to-end', () => {
   it('drives the whole backlog to progress and keeps advancing while conversations run', async () => {
     const { pt, drv, runner, projects } = await load();
     const pid = await seedProject(projects);
-    await pt.createTask(UID, pid, { title: 'Design', owner_agent: 'Owner', owner_agent_id: AGENT });
-    await pt.createTask(UID, pid, { title: 'Build' });
-    await pt.createTask(UID, pid, { title: 'Ship' });
+    await pt.createTask(UID, pid, { content: 'Design', owner_agent: 'Owner', owner_agent_id: AGENT });
+    await pt.createTask(UID, pid, { content: 'Build' });
+    await pt.createTask(UID, pid, { content: 'Ship' });
     await drv.writeConfig(UID, pid, { enabled: true });
 
     const advances: Array<{ pid: string; cid: string }> = [];
@@ -257,8 +308,8 @@ describe('project to-do › end-to-end', () => {
   it('completes a task through the human review lifecycle and rolls up progress, notifying the UI', async () => {
     const { pt, projects } = await load();
     const pid = await seedProject(projects);
-    const t1 = await pt.createTask(UID, pid, { title: 'Feature' });
-    await pt.createTask(UID, pid, { title: 'Docs' });
+    const t1 = await pt.createTask(UID, pid, { content: 'Feature' });
+    await pt.createTask(UID, pid, { content: 'Docs' });
     if (!t1.ok) throw new Error('seed');
 
     const changes: Array<{ uid: string; pid: string }> = [];
@@ -286,7 +337,7 @@ describe('project to-do › end-to-end', () => {
   it('a manual run dispatches assigned and unassigned tasks and flips them progress', async () => {
     const { pt, runner, projects } = await load();
     const pid = await seedProject(projects);
-    const t = await pt.createTask(UID, pid, { title: 'Analyze funnel', owner_agent: 'Owner', owner_agent_id: AGENT });
+    const t = await pt.createTask(UID, pid, { content: 'Analyze funnel', owner_agent: 'Owner', owner_agent_id: AGENT });
     if (!t.ok) throw new Error('seed');
 
     const res = await runner.runTaskNow(UID, pid, t.task.id);
@@ -297,7 +348,7 @@ describe('project to-do › end-to-end', () => {
 
     // Without an owner the same manual action routes through the project
     // commander, matching the automation-style run-now fallback.
-    const bare = await pt.createTask(UID, pid, { title: 'no owner' });
+    const bare = await pt.createTask(UID, pid, { content: 'no owner' });
     if (!bare.ok) throw new Error('seed');
     const unassigned = await runner.runTaskNow(UID, pid, bare.task.id);
     expect(unassigned.ok).toBe(true);
@@ -310,7 +361,7 @@ describe('project to-do › end-to-end', () => {
 
     // Manual run: file is copied into the new conversation's chat_attachments dir
     // and its name rides along in the send, exactly like a chat attachment.
-    const t1 = await pt.createTask(UID, pid, { title: 'Brief', owner_agent: 'Owner', owner_agent_id: AGENT });
+    const t1 = await pt.createTask(UID, pid, { content: 'Brief', owner_agent: 'Owner', owner_agent_id: AGENT });
     if (!t1.ok) throw new Error('seed');
     await pt.uploadTaskAttachment(UID, pid, t1.task.id, 'brief.txt', Buffer.from('do X'));
     const res = await runner.runTaskNow(UID, pid, t1.task.id);
@@ -324,7 +375,7 @@ describe('project to-do › end-to-end', () => {
     expect(fs.readFileSync(dest, 'utf-8')).toBe('do X');
 
     // Driver advance carries them too (reads the task fresh, like the real loop).
-    const t2 = await pt.createTask(UID, pid, { title: 'Spec' });
+    const t2 = await pt.createTask(UID, pid, { content: 'Spec', owner_agent_id: AGENT });
     if (!t2.ok) throw new Error('seed');
     await pt.uploadTaskAttachment(UID, pid, t2.task.id, 'spec.md', Buffer.from('# spec'));
     const fresh = await pt.getTask(UID, pid, t2.task.id);

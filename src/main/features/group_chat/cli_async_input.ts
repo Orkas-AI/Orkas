@@ -4,6 +4,9 @@
  * save cannot send the same answer to the CLI twice. */
 import type { LocalActiveRunIngress, LocalCliAsyncQuestion } from '../local_agents/backends/base';
 import type { GroupMessage } from './visibility';
+import { createLogger } from '../../logger';
+
+const log = createLogger('group_chat.cli_async_input');
 
 type Entry = {
   uid: string;
@@ -13,16 +16,19 @@ type Entry = {
   questions: LocalCliAsyncQuestion[];
   ingress: () => LocalActiveRunIngress | null;
   save: (text: string, answers: string[], inputId: string) => Promise<GroupMessage>;
+  saveCancelled: () => Promise<GroupMessage>;
   inputId: string;
   accepted?: { text: string; answers: string[] };
   saved?: GroupMessage;
   submitting?: Promise<AsyncInputResult>;
+  cancelling?: Promise<AsyncInputResult>;
+  cancelled?: GroupMessage;
   closed?: boolean;
 };
 
 export type AsyncInputResult =
   | { ok: true; message: GroupMessage }
-  | { ok: false; error: 'expired' | 'invalid_answers' | 'delivery_failed' | 'save_failed' | 'already_answered' };
+  | { ok: false; error: 'expired' | 'invalid_answers' | 'delivery_failed' | 'save_failed' | 'already_answered' | 'cancelled' };
 
 const entries = new Map<string, Entry>();
 const key = (uid: string, cid: string, messageId: string) => JSON.stringify([uid, cid, messageId]);
@@ -48,6 +54,7 @@ export async function finishCliAsyncInputs(uid: string, cid: string, turnId: str
     if (entry.uid !== uid || entry.cid !== cid || entry.turnId !== turnId) continue;
     entry.closed = true;
     if (entry.submitting) pending.push(entry.submitting);
+    if (entry.cancelling) pending.push(entry.cancelling);
   }
   await Promise.all(pending);
   closeCliAsyncInputs(uid, cid, turnId);
@@ -58,6 +65,8 @@ export async function answerCliAsyncInput(
 ): Promise<AsyncInputResult> {
   const entry = entries.get(key(uid, cid, messageId));
   if (!entry) return { ok: false, error: 'expired' };
+  if (entry.cancelling) await entry.cancelling;
+  if (entry.cancelled) return { ok: false, error: 'cancelled' };
   if (!Array.isArray(rawAnswers) || rawAnswers.length !== entry.questions.length
       || rawAnswers.some(value => typeof value !== 'string' || !value.trim() || value.length > 4000)) {
     return { ok: false, error: 'invalid_answers' };
@@ -95,4 +104,33 @@ export async function answerCliAsyncInput(
   })();
   try { return await entry.submitting; }
   finally { delete entry.submitting; }
+}
+
+/** Dismiss only this question. Never deliver a synthetic answer or stop the run. */
+export async function cancelCliAsyncInput(
+  uid: string, cid: string, messageId: string,
+): Promise<AsyncInputResult> {
+  const entry = entries.get(key(uid, cid, messageId));
+  if (!entry) return { ok: false, error: 'expired' };
+  if (entry.cancelling) return entry.cancelling;
+  if (entry.submitting) {
+    await entry.submitting;
+    return cancelCliAsyncInput(uid, cid, messageId);
+  }
+  if (entry.saved) return { ok: true, message: entry.saved };
+  // Delivery cannot be undone, even when its history write still needs retrying.
+  if (entry.accepted) return { ok: false, error: 'already_answered' };
+  if (entry.cancelled) return { ok: true, message: entry.cancelled };
+  if (entry.closed) return { ok: false, error: 'expired' };
+  entry.cancelling = (async (): Promise<AsyncInputResult> => {
+    try {
+      entry.cancelled = await entry.saveCancelled();
+      return { ok: true, message: entry.cancelled };
+    } catch {
+      log.warn('question cancellation save failed');
+      return { ok: false, error: 'save_failed' };
+    }
+  })();
+  try { return await entry.cancelling; }
+  finally { delete entry.cancelling; }
 }

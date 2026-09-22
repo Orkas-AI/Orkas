@@ -299,6 +299,12 @@ export interface MarketplaceProject {
   by: string;
   description_zh: string;
   description_en: string;
+  description_es?: string;
+  description_fr?: string;
+  description_ko?: string;
+  description_de?: string;
+  description_ru?: string;
+  description_it?: string;
   task_zh: string;
   task_en: string;
   home?: boolean;
@@ -364,6 +370,12 @@ function _listLocalMarketplaceProjects(
       p.by,
       p.description_zh,
       p.description_en,
+      p.description_es,
+      p.description_fr,
+      p.description_ko,
+      p.description_de,
+      p.description_ru,
+      p.description_it,
       p.task_zh,
       p.task_en,
     ].join(' ').toLowerCase().includes(normalized.q));
@@ -1220,7 +1232,7 @@ async function _seedAgentSkillDependencies(
         throw new Error(`requires Orkas >= ${minAppVersion}; current ${_currentAppVersion() || 'unknown'}`);
       }
       if (!shouldContinue()) return { seeded, blocked: true };
-      await addSkillInstall(uid, {
+      const applied = await addSkillInstall(uid, {
         id: sid,
         version: meta.version || '1.0.0',
         published_at: meta.published_at || 0,
@@ -1230,7 +1242,8 @@ async function _seedAgentSkillDependencies(
         ...((meta.status || meta.state) ? { status: meta.status || meta.state } : {}),
         default_install: meta.default_install === true,
         ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
-      });
+      }, { mode: 'seed' });
+      if (!applied) return { seeded, blocked: true };
       seeded++;
       installedSkills.add(sid);
     } catch (err) {
@@ -1393,7 +1406,7 @@ export async function ensureDefaultInstalls(
         if (!canContinue()) return { seeded_agents: seededAgents, seeded_skills: seededSkills };
         seededSkills += depSeed.seeded;
         if (installedAgents.has(a.id) || depSeed.blocked) continue;
-        await addAgentInstall(uid, {
+        const applied = await addAgentInstall(uid, {
           id: a.id, version: a.version || '1.0.0',
           published_at: a.published_at || 0,
           ...(typeof a.updated_at === 'number' ? { updated_at: a.updated_at } : {}),
@@ -1403,7 +1416,8 @@ export async function ensureDefaultInstalls(
           ...((a.status || a.state) ? { status: a.status || a.state } : {}),
           default_install: true,
           ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
-        });
+        }, { mode: 'seed' });
+        if (!applied) continue;
         seededAgents++;
         installedAgents.add(a.id);
       } catch (err) {
@@ -1420,7 +1434,7 @@ export async function ensureDefaultInstalls(
           log.info(`skip default skill ${s.id}; requires Orkas >= ${minAppVersion}`);
           continue;
         }
-        await addSkillInstall(uid, {
+        const applied = await addSkillInstall(uid, {
           id: s.id, version: s.version || '1.0.0',
           published_at: s.published_at || 0,
           ...(typeof s.updated_at === 'number' ? { updated_at: s.updated_at } : {}),
@@ -1429,7 +1443,8 @@ export async function ensureDefaultInstalls(
           ...((s.status || s.state) ? { status: s.status || s.state } : {}),
           default_install: true,
           ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
-        });
+        }, { mode: 'seed' });
+        if (!applied) continue;
         seededSkills++;
         installedSkills.add(s.id);
       } catch (err) {
@@ -1478,11 +1493,11 @@ export async function uninstallMarketplaceAgent(agentId: string): Promise<{ ok: 
   _assertSafeMarketplaceId(agentId);
   const uid = getActiveUserId();
   return withMarketplaceInstallLock(uid, 'agent', agentId, async () => {
+    await removeAgentInstall(uid, agentId);
     await fsp.rm(userMarketplaceAgentDir(uid, agentId), { recursive: true, force: true });
     await withMarketplaceCacheLock(uid, 'agent', agentId, async () => {
       await fsp.rm(marketplaceCacheAgentDir(uid, agentId), { recursive: true, force: true });
     });
-    await removeAgentInstall(uid, agentId);
     log.info(`uninstalled marketplace agent ${agentId} (local + cache + manifest)`);
     return { ok: true, id: agentId };
   });
@@ -1492,11 +1507,11 @@ export async function uninstallMarketplaceSkill(skillId: string): Promise<{ ok: 
   _assertSafeMarketplaceId(skillId);
   const uid = getActiveUserId();
   return withMarketplaceInstallLock(uid, 'skill', skillId, async () => {
+    await removeSkillInstall(uid, skillId);
     await fsp.rm(userMarketplaceSkillDir(uid, skillId), { recursive: true, force: true });
     await withMarketplaceCacheLock(uid, 'skill', skillId, async () => {
       await fsp.rm(marketplaceCacheSkillDir(uid, skillId), { recursive: true, force: true });
     });
-    await removeSkillInstall(uid, skillId);
     invalidateCoreAgentSkills();
     log.info(`uninstalled marketplace skill ${skillId} (local + cache + manifest)`);
     return { ok: true, id: skillId };

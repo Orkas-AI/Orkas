@@ -55,11 +55,19 @@ export function resolveSandboxRoot(root: string): string {
   return realOrResolve(root);
 }
 
+/** Resolve an unlink operand without following its final directory entry. */
+export function resolveSandboxEntry(candidate: string): string {
+  return path.join(realOrResolve(path.dirname(candidate)), path.basename(candidate));
+}
+
 export interface PathAllowedOptions {
   /** Every entry of `allowedRoots` came from `resolveSandboxRoot`, so the
    *  per-call root realpath walk is skipped. Candidates are always resolved;
    *  an unresolved symlinked root therefore fails closed. */
   rootsResolved?: boolean;
+  /** Only for operations that unlink the final entry. Ancestor symlinks still
+   * resolve normally; reads, writes and traversals must keep the default. */
+  followFinalSymlink?: boolean;
 }
 
 /**
@@ -82,7 +90,13 @@ export function isPathAllowed(
   if (!candidate || !allowedRoots.length) return false;
   if (!path.isAbsolute(candidate)) return false;
 
-  const realCand = realOrResolve(candidate);
+  if (options.followFinalSymlink === false) {
+    const parts = candidate.split(path.sep);
+    if (!parts.at(-1) || parts.at(-1) === '.' || parts.includes('..')) return false;
+  }
+  const realCand = options.followFinalSymlink === false
+    ? resolveSandboxEntry(candidate)
+    : realOrResolve(candidate);
   const candidateKey = comparisonKey(realCand);
   for (const root of allowedRoots) {
     if (!root || !path.isAbsolute(root)) continue;

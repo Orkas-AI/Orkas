@@ -20,6 +20,7 @@ import {
   userMarketplaceAgentDir,
   userMarketplaceSkillDir,
 } from '../paths';
+import { withMarketplaceInstallLock } from './marketplace_locks';
 import { createLogger } from '../logger';
 import { safeId } from '../storage';
 import { compareVersions, minAppVersionFrom } from '../util/app-version-compat';
@@ -31,6 +32,7 @@ import {
   MARKETPLACE_TREE_HASH_SKIP_NAMES,
   marketplaceContentTreeFiles,
   marketplaceContentTreeHash,
+  marketplaceContentTreeHashForFiles,
 } from '../util/marketplace-tree-hash';
 import {
   DEFAULT_MARKETPLACE_VERSION,
@@ -143,12 +145,6 @@ function _builtinAgentMinAppVersion(agentJson: Record<string, unknown>): string 
   return minAppVersionFrom(agentJson);
 }
 
-function _builtinAgentReseedIfDeletedBefore(srcDir: string, agentJson: Record<string, unknown>): number {
-  const meta = _readJsonObject(path.join(srcDir, '_meta.json'));
-  return _timestampMs(meta?.reseed_if_deleted_before)
-    || _timestampMs(agentJson.reseed_if_deleted_before);
-}
-
 /** One parse of a packaged skill's `_meta.json`; the field readers below
  *  take the parsed object so a seed pass reads the file once per skill. */
 function _builtinSkillMeta(srcDir: string): Record<string, unknown> {
@@ -165,10 +161,6 @@ function _builtinSkillUpdatedAt(meta: Record<string, unknown>): number {
 
 function _builtinSkillMinAppVersion(meta: Record<string, unknown>): string {
   return minAppVersionFrom(meta);
-}
-
-function _builtinSkillReseedIfDeletedBefore(meta: Record<string, unknown>): number {
-  return _timestampMs(meta.reseed_if_deleted_before);
 }
 
 function _emptyUrl(value: unknown): boolean {
@@ -263,32 +255,6 @@ function _deletedAt(map: Record<string, number> | undefined, id: string): number
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
-function _clearDeletedAt(
-  manifest: { _deleted_at?: { agents?: Record<string, number>; skills?: Record<string, number> } },
-  kind: 'agents' | 'skills',
-  id: string,
-): boolean {
-  const bucket = manifest._deleted_at?.[kind];
-  if (!bucket || !(id in bucket)) return false;
-  delete bucket[id];
-  if (Object.keys(bucket).length === 0) delete manifest._deleted_at?.[kind];
-  if (manifest._deleted_at && Object.keys(manifest._deleted_at).length === 0) delete manifest._deleted_at;
-  return true;
-}
-
-function _shouldBypassBuiltinSkillTombstone(srcDir: string, deletedAt: number): boolean {
-  const cutoff = _builtinSkillReseedIfDeletedBefore(_builtinSkillMeta(srcDir));
-  return cutoff > 0 && deletedAt > 0 && deletedAt < cutoff;
-}
-
-function _shouldBypassBuiltinAgentTombstone(
-  srcDir: string,
-  agentJson: Record<string, unknown>,
-  deletedAt: number,
-): boolean {
-  const cutoff = _builtinAgentReseedIfDeletedBefore(srcDir, agentJson);
-  return cutoff > 0 && deletedAt > 0 && deletedAt < cutoff;
-}
 
 function _shouldRefreshBuiltinAgent(
   uid: string,
@@ -428,7 +394,8 @@ async function _writeAgentSeed(
       'utf8',
     );
     const contentSha = sha256OfFile(path.join(staged, 'agent.json'));
-    const contentTreeHash = marketplaceContentTreeHash(srcDir);
+    // Hash the installed serialization, excluding preserved user-owned files.
+    const contentTreeHash = marketplaceContentTreeHashForFiles(staged, files);
     const updatedAt = _builtinAgentUpdatedAt(agentJson);
     const minAppVersion = _builtinAgentMinAppVersion(agentJson);
     await fsp.writeFile(
@@ -479,7 +446,7 @@ async function _writeAgentMarketplaceOverlay(
     );
 
     const contentSha = sha256OfFile(path.join(staged, 'agent.json'));
-    const contentTreeHash = marketplaceContentTreeHash(srcDir);
+    const contentTreeHash = marketplaceContentTreeHashForFiles(staged, files);
     const updatedAt = _builtinAgentUpdatedAt(agentJson);
     const minAppVersion = _builtinAgentMinAppVersion(agentJson);
     await fsp.writeFile(
@@ -732,7 +699,7 @@ export async function seedBuiltinMarketplaceForUser(
     const packagedAgent = _readPackagedJsonObject(path.join(srcDir, 'agent.json'));
     const agentJson = packagedAgent.value;
     if (!agentJson) {
-      log.warn(`skip builtin agent ${entry.name}: ${packagedAgent.error}`);
+      log.warn(`skip builtin agent ${entry.name}`, { error: logErrorSummary(packagedAgent.error) });
       continue;
     }
     const installId = _agentInstallId(entry.name, agentJson);
@@ -740,55 +707,53 @@ export async function seedBuiltinMarketplaceForUser(
       log.warn(`skip builtin agent ${entry.name}: directory name must equal 12-hex agent_id`);
       continue;
     }
-    const agentDeletedAt = _deletedAt(manifest._deleted_at?.agents, installId);
-    if (agentDeletedAt > 0) {
-      if (!_shouldBypassBuiltinAgentTombstone(srcDir, agentJson, agentDeletedAt)) continue;
-      if (_clearDeletedAt(manifest, 'agents', installId)) manifestChanged = true;
-      log.info(`reseed builtin agent ${installId}: packaged content supersedes old uninstall tombstone`);
-    }
-    const manifestAgentIndex = manifest.agents.findIndex((a) => a.id === installId);
-    const manifestAgent = manifestAgentIndex >= 0 ? manifest.agents[manifestAgentIndex] : null;
-    const targetAgentJson = path.join(userMarketplaceAgentDir(uid, installId), 'agent.json');
-    if (!fs.existsSync(targetAgentJson)) {
-      const installedAt = manifestAgent?.installed_at || Date.now();
-      await _writeAgentSeed(uid, installId, srcDir, agentJson, installedAt, opts);
-      result.seeded_agents++;
-    } else if (_shouldTakeOverResourceSeedFromBuiltin(
-      uid,
-      'agent',
-      installId,
-      _builtinAgentVersion(agentJson),
-      manifestAgent,
-    )) {
-      if (manifestAgent?.agent_json_url) {
-        await _writeAgentMarketplaceOverlay(uid, installId, srcDir, agentJson, manifestAgent, opts);
-      } else {
+    await withMarketplaceInstallLock(uid, 'agent', installId, async () => {
+      const agentDeletedAt = _deletedAt((await readInstalls(uid))._deleted_at?.agents, installId);
+      if (agentDeletedAt > 0) return;
+      const manifestAgentIndex = manifest.agents.findIndex((a) => a.id === installId);
+      const manifestAgent = manifestAgentIndex >= 0 ? manifest.agents[manifestAgentIndex] : null;
+      const targetAgentJson = path.join(userMarketplaceAgentDir(uid, installId), 'agent.json');
+      if (!fs.existsSync(targetAgentJson)) {
         const installedAt = manifestAgent?.installed_at || Date.now();
         await _writeAgentSeed(uid, installId, srcDir, agentJson, installedAt, opts);
+        result.seeded_agents++;
+      } else if (_shouldTakeOverResourceSeedFromBuiltin(
+        uid,
+        'agent',
+        installId,
+        _builtinAgentVersion(agentJson),
+        manifestAgent,
+      )) {
+        if (manifestAgent?.agent_json_url) {
+          await _writeAgentMarketplaceOverlay(uid, installId, srcDir, agentJson, manifestAgent, opts);
+        } else {
+          const installedAt = manifestAgent?.installed_at || Date.now();
+          await _writeAgentSeed(uid, installId, srcDir, agentJson, installedAt, opts);
+          if (manifestAgentIndex >= 0) {
+            manifest.agents[manifestAgentIndex] = _agentSeedInstallRow(installId, agentJson, installedAt);
+            manifestChanged = true;
+          }
+        }
+        result.seeded_agents++;
+      } else if (_shouldRefreshBuiltinAgent(uid, installId, agentJson, manifestAgent)) {
+        const installedAt = manifestAgent?.installed_at || Date.now();
+        await _writeAgentSeed(uid, installId, srcDir, agentJson, installedAt, opts);
+        result.seeded_agents++;
         if (manifestAgentIndex >= 0) {
           manifest.agents[manifestAgentIndex] = _agentSeedInstallRow(installId, agentJson, installedAt);
           manifestChanged = true;
         }
+      } else if (manifestAgent && _shouldOverlayMarketplaceAgentFromBuiltin(uid, installId, agentJson, manifestAgent)) {
+        await _writeAgentMarketplaceOverlay(uid, installId, srcDir, agentJson, manifestAgent, opts);
+        result.seeded_agents++;
       }
-      result.seeded_agents++;
-    } else if (_shouldRefreshBuiltinAgent(uid, installId, agentJson, manifestAgent)) {
-      const installedAt = manifestAgent?.installed_at || Date.now();
-      await _writeAgentSeed(uid, installId, srcDir, agentJson, installedAt, opts);
-      result.seeded_agents++;
-      if (manifestAgentIndex >= 0) {
-        manifest.agents[manifestAgentIndex] = _agentSeedInstallRow(installId, agentJson, installedAt);
+      if (!installedAgents.has(installId)) {
+        manifest.agents.push(_agentSeedInstallRow(installId, agentJson, Date.now()));
+        installedAgents.add(installId);
+        result.manifest_agents++;
         manifestChanged = true;
       }
-    } else if (manifestAgent && _shouldOverlayMarketplaceAgentFromBuiltin(uid, installId, agentJson, manifestAgent)) {
-      await _writeAgentMarketplaceOverlay(uid, installId, srcDir, agentJson, manifestAgent, opts);
-      result.seeded_agents++;
-    }
-    if (!installedAgents.has(installId)) {
-      manifest.agents.push(_agentSeedInstallRow(installId, agentJson, Date.now()));
-      installedAgents.add(installId);
-      result.manifest_agents++;
-      manifestChanged = true;
-    }
+    });
   }
 
   for (const entry of _safeDirEntries(packagedBuiltinMarketplaceSkillsDir())) {
@@ -799,35 +764,48 @@ export async function seedBuiltinMarketplaceForUser(
       continue;
     }
     const installId = entry.name;
-    const skillDeletedAt = _deletedAt(manifest._deleted_at?.skills, installId);
-    if (skillDeletedAt > 0) {
-      if (!_shouldBypassBuiltinSkillTombstone(srcDir, skillDeletedAt)) continue;
-      if (_clearDeletedAt(manifest, 'skills', installId)) manifestChanged = true;
-      log.info(`reseed builtin skill ${installId}: packaged content supersedes old uninstall tombstone`);
-    }
-    const packagedMeta = _builtinSkillMeta(srcDir);
-    const packagedVersion = _builtinSkillVersion(packagedMeta);
-    const packagedUpdatedAt = _builtinSkillUpdatedAt(packagedMeta);
-    const packagedMinAppVersion = _builtinSkillMinAppVersion(packagedMeta);
-    const manifestSkillIndex = manifest.skills.findIndex((s) => s.id === installId);
-    const manifestSkill = manifestSkillIndex >= 0 ? manifest.skills[manifestSkillIndex] : null;
-    const targetSkillMd = path.join(userMarketplaceSkillDir(uid, installId), 'SKILL.md');
-    if (!fs.existsSync(targetSkillMd)) {
-      const installedAt = manifestSkill?.installed_at || Date.now();
-      await _writeSkillSeed(uid, installId, srcDir, installedAt, opts);
-      result.seeded_skills++;
-    } else if (_shouldTakeOverResourceSeedFromBuiltin(
-      uid,
-      'skill',
-      installId,
-      packagedVersion,
-      manifestSkill,
-    )) {
-      if (manifestSkill?.bundle_url) {
-        await _writeSkillMarketplaceOverlay(uid, installId, srcDir, manifestSkill, opts);
-      } else {
+    await withMarketplaceInstallLock(uid, 'skill', installId, async () => {
+      const skillDeletedAt = _deletedAt((await readInstalls(uid))._deleted_at?.skills, installId);
+      if (skillDeletedAt > 0) return;
+      const packagedMeta = _builtinSkillMeta(srcDir);
+      const packagedVersion = _builtinSkillVersion(packagedMeta);
+      const packagedUpdatedAt = _builtinSkillUpdatedAt(packagedMeta);
+      const packagedMinAppVersion = _builtinSkillMinAppVersion(packagedMeta);
+      const manifestSkillIndex = manifest.skills.findIndex((s) => s.id === installId);
+      const manifestSkill = manifestSkillIndex >= 0 ? manifest.skills[manifestSkillIndex] : null;
+      const targetSkillMd = path.join(userMarketplaceSkillDir(uid, installId), 'SKILL.md');
+      if (!fs.existsSync(targetSkillMd)) {
         const installedAt = manifestSkill?.installed_at || Date.now();
         await _writeSkillSeed(uid, installId, srcDir, installedAt, opts);
+        result.seeded_skills++;
+      } else if (_shouldTakeOverResourceSeedFromBuiltin(
+        uid,
+        'skill',
+        installId,
+        packagedVersion,
+        manifestSkill,
+      )) {
+        if (manifestSkill?.bundle_url) {
+          await _writeSkillMarketplaceOverlay(uid, installId, srcDir, manifestSkill, opts);
+        } else {
+          const installedAt = manifestSkill?.installed_at || Date.now();
+          await _writeSkillSeed(uid, installId, srcDir, installedAt, opts);
+          if (manifestSkillIndex >= 0) {
+            manifest.skills[manifestSkillIndex] = _skillSeedInstallRow(
+              installId,
+              installedAt,
+              packagedVersion,
+              packagedUpdatedAt,
+              packagedMinAppVersion,
+            );
+            manifestChanged = true;
+          }
+        }
+        result.seeded_skills++;
+      } else if (_shouldRefreshBuiltinSkill(uid, installId, srcDir, manifestSkill)) {
+        const installedAt = manifestSkill?.installed_at || Date.now();
+        await _writeSkillSeed(uid, installId, srcDir, installedAt, opts);
+        result.seeded_skills++;
         if (manifestSkillIndex >= 0) {
           manifest.skills[manifestSkillIndex] = _skillSeedInstallRow(
             installId,
@@ -838,37 +816,22 @@ export async function seedBuiltinMarketplaceForUser(
           );
           manifestChanged = true;
         }
+      } else if (manifestSkill && _shouldOverlayMarketplaceSkillFromBuiltin(uid, installId, srcDir, manifestSkill)) {
+        await _writeSkillMarketplaceOverlay(uid, installId, srcDir, manifestSkill, opts);
+        result.seeded_skills++;
       }
-      result.seeded_skills++;
-    } else if (_shouldRefreshBuiltinSkill(uid, installId, srcDir, manifestSkill)) {
-      const installedAt = manifestSkill?.installed_at || Date.now();
-      await _writeSkillSeed(uid, installId, srcDir, installedAt, opts);
-      result.seeded_skills++;
-      if (manifestSkillIndex >= 0) {
-        manifest.skills[manifestSkillIndex] = _skillSeedInstallRow(
+      if (!installedSkills.has(installId)) {
+        manifest.skills.push(_skillSeedInstallRow(
           installId,
-          installedAt,
+          Date.now(),
           packagedVersion,
           packagedUpdatedAt,
           packagedMinAppVersion,
-        );
-        manifestChanged = true;
+        ));
+        installedSkills.add(installId);
+        result.manifest_skills++;
       }
-    } else if (manifestSkill && _shouldOverlayMarketplaceSkillFromBuiltin(uid, installId, srcDir, manifestSkill)) {
-      await _writeSkillMarketplaceOverlay(uid, installId, srcDir, manifestSkill, opts);
-      result.seeded_skills++;
-    }
-    if (!installedSkills.has(installId)) {
-      manifest.skills.push(_skillSeedInstallRow(
-        installId,
-        Date.now(),
-        packagedVersion,
-        packagedUpdatedAt,
-        packagedMinAppVersion,
-      ));
-      installedSkills.add(installId);
-      result.manifest_skills++;
-    }
+    });
   }
 
   if (manifestChanged || result.manifest_agents || result.manifest_skills) {
@@ -1025,6 +988,7 @@ export async function resolveBuiltinMarketplaceInstalls(
   const manifest = await readInstalls(uid);
   let changed = false;
   const enabledIdMigrations: Array<{ kind: 'agent' | 'skill'; fromId: string; toId: string }> = [];
+  const snapshotRemovals = { agents: {} as Record<string, number>, skills: {} as Record<string, number> };
   for (const row of [...manifest.agents]) {
     if (!_canContinue(opts)) return result;
     if (row.seed_source !== 'builtin' || row.agent_json_url) continue;
@@ -1039,12 +1003,15 @@ export async function resolveBuiltinMarketplaceInstalls(
       if (migrated === 'moved') result.migrated_agents++;
       manifest.agents = manifest.agents.filter((a) => a.id !== row.id && a.id !== resolved.id);
       manifest.agents.push(resolved);
-      if (row.id !== resolved.id) enabledIdMigrations.push({ kind: 'agent', fromId: row.id, toId: resolved.id });
+      if (row.id !== resolved.id) {
+        enabledIdMigrations.push({ kind: 'agent', fromId: row.id, toId: resolved.id });
+        snapshotRemovals.agents[row.id] = row.installed_at;
+      }
       result.resolved_agents++;
       changed = true;
     } catch (err) {
       result.failed.push(`agent:${row.id}`);
-      log.warn(`resolve builtin agent ${row.id} failed: ${(err as Error).message}`);
+      log.warn(`resolve builtin agent ${row.id} failed`, { error: logErrorSummary(err) });
     }
   }
   for (const row of [...manifest.skills]) {
@@ -1061,17 +1028,20 @@ export async function resolveBuiltinMarketplaceInstalls(
       if (migrated === 'moved') result.migrated_skills++;
       manifest.skills = manifest.skills.filter((s) => s.id !== row.id && s.id !== resolved.id);
       manifest.skills.push(resolved);
-      if (row.id !== resolved.id) enabledIdMigrations.push({ kind: 'skill', fromId: row.id, toId: resolved.id });
+      if (row.id !== resolved.id) {
+        enabledIdMigrations.push({ kind: 'skill', fromId: row.id, toId: resolved.id });
+        snapshotRemovals.skills[row.id] = row.installed_at;
+      }
       result.resolved_skills++;
       changed = true;
     } catch (err) {
       result.failed.push(`skill:${row.id}`);
-      log.warn(`resolve builtin skill ${row.id} failed: ${(err as Error).message}`);
+      log.warn(`resolve builtin skill ${row.id} failed`, { error: logErrorSummary(err) });
     }
   }
 
   if (changed) {
-    await writeInstalls(uid, manifest);
+    await writeInstalls(uid, manifest, snapshotRemovals);
     for (const migration of enabledIdMigrations) {
       try {
         migrateComponentEnabledId(uid, migration.kind, migration.fromId, migration.toId);
@@ -1101,7 +1071,7 @@ async function _invalidateMarketplaceListings(): Promise<void> {
     const registry = require('../model/core-agent/skill-registry') as { invalidateSkills?: () => Promise<void> };
     await registry.invalidateSkills?.();
   } catch (err) {
-    log.warn(`builtin marketplace Skill index invalidation failed: ${(err as Error).message}`);
+    log.warn('builtin marketplace Skill index invalidation failed', { error: logErrorSummary(err) });
     throw err;
   }
 }

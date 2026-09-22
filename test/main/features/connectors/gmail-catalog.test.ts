@@ -3,10 +3,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const config = vi.hoisted(() => ({
   google: { google: 'disabled', gmail: 'disabled' },
   catalog: [] as any[],
+  revision: 0,
 }));
 vi.mock('../../../../src/main/features/client_config', () => ({
   getGoogleConnectorsConfig: () => config.google,
   getServerConnectorCatalogConfig: () => config.catalog,
+  getRemoteConfigRevision: () => config.revision,
 }));
 import { connectorCatalog, findCatalogEntry } from '../../../../src/main/features/connectors/catalog';
 import { GOOGLE_ENTRIES } from '../../../../src/main/features/connectors/catalog-google';
@@ -16,6 +18,7 @@ describe('Gmail catalog migration', () => {
   beforeEach(() => {
     config.google = { google: 'disabled', gmail: 'disabled' };
     config.catalog = [];
+    config.revision++;
   });
 
   it.each([
@@ -44,6 +47,7 @@ describe('Gmail catalog migration', () => {
         usage_metering: { provider: 'composio', credits_milli_per_call: 500 } },
       { id: 'github', auth_mode: 'composio' },
     ];
+    config.revision++;
     expect(connectorCatalog().filter((entry) => entry.id === 'gmail')).toHaveLength(1);
     expect(findCatalogEntry('gmail')).toMatchObject({
       auth_mode: 'composio', composio: { toolkit: 'gmail', tools: [{ slug: 'GMAIL_FETCH_EMAILS' }] },
@@ -59,6 +63,7 @@ describe('Gmail catalog migration', () => {
     expect(drive()[0].oauth).toBeUndefined();
     expect(() => assertConnectorRuntimeEnabled('gdrive')).not.toThrow();
     config.catalog = [{ id: 'gdrive', auth_mode: 'composio', composio: { toolkit: 'googledrive', tools: [{ slug: 'GOOGLEDRIVE_LIST_FILES' }] } }];
+    config.revision++;
     expect(drive()).toHaveLength(1);
     expect(drive()[0].composio?.tools).toEqual([{ slug: 'GOOGLEDRIVE_LIST_FILES' }]);
     expect(() => assertConnectorRuntimeEnabled('gsearch-console')).toThrow('connector_unsupported');

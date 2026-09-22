@@ -14,13 +14,121 @@ const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 const UID = 'u-localtools-001';
 const CID = 'conv-edit';
 
+it('advertises edit freshness before the model attempts a cross-turn revision', async () => {
+  const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+  const edit = createLocalTools({}).find(tool => tool.name === 'edit_file')!;
+  expect(edit.description).toContain('unchanged read/write baseline from this run');
+  expect(edit.description).toContain('or a matching expected_hash');
+  expect(edit.description).toContain('earlier turns alone do not establish a baseline');
+});
+
 let tmpDir: string;
 let prevWs: string | undefined;
 
+it('offers detached lifetime explicitly without directing ordinary long tasks away from managed sessions', async () => {
+  const { bashTool } = await import('../../../../src/core-agent/src/tools/builtin');
+  const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+  const hostBash = createLocalTools({}).find(tool => tool.name === 'bash')!;
+  const core = (bashTool.inputSchema.properties as any).run_in_background;
+  const host = (hostBash.inputSchema.properties as any).run_in_background;
+  expect(host).toEqual(core);
+  expect(host.description).toContain('only when');
+  expect(host.description).toContain('after the conversation ends');
+  expect(host.description).toContain('timeoutMs does not apply');
+  expect(host.description).toContain('Otherwise omit for long tasks and temporary services');
+  expect(host.description).toContain('process_session');
+  expect(host.description).not.toContain('Use for long builds');
+});
+
+it('keeps Redis service shutdown behind one-time host approval without executing it', async () => {
+  await allFilesApproval();
+  const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+  const { SandboxExecutor } = await import('../../../../src/core-agent/src/sandbox/executor');
+  const bp = await import('../../../../src/main/model/core-agent/bash-permissions');
+  // A regression must fail without ever running the service-control command.
+  const execute = vi.spyOn(SandboxExecutor.prototype, 'execute').mockImplementation(async () => {
+    throw new Error('Command must not reach execution');
+  });
+  const requests: any[] = [];
+  bp._setBroadcastForTest((_channel, info: any) => {
+    requests.push(info);
+    bp.respond(info.request_id, 'deny');
+  });
+  try {
+    const bash = createLocalTools({ userId: UID, cid: CID }).find(tool => tool.name === 'bash')!;
+    const result = await bash.execute({ command: 'redis-cli -p 6379 shutdown nosave' }, {
+      workingDir: tmpDir, state: {},
+    } as any);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      can_allow_run: false,
+      external_mutations: [{ kind: 'service_change', action: 'shutdown' }],
+    });
+    expect(execute).not.toHaveBeenCalled();
+  } finally {
+    execute.mockRestore();
+    bp._setBroadcastForTest(null);
+    bp._resetForTest();
+  }
+});
+
 describe('local-tools › Windows PowerShell compatibility preflight', () => {
+  it('authorizes the original chain once before passing it to the shell adapter', async () => {
+    await allFilesAuto();
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const execute = vi.spyOn(core.bashTool, 'execute').mockResolvedValue({ content: 'completed' });
+    const command = "Write-Output 'first && literal' && Write-Output second || Write-Output recovery";
+    try {
+      const bash = createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' })
+        .find(tool => tool.name === 'bash')!;
+      const result = await bash.execute({ command }, { workingDir: tmpDir, state: {} } as any);
+      expect(result.isError).toBeFalsy();
+      expect(execute).toHaveBeenCalledOnce();
+      expect(execute.mock.calls[0][0].command).toBe(command);
+    } finally { execute.mockRestore(); }
+  });
+
+  it.each(['bash', 'process_session', 'interactive_cli'])('keeps conditional removal behind approval: %s', async name => {
+    await allFilesApproval();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bp = await import('../../../../src/main/model/core-agent/bash-permissions');
+    const target = path.join(tmpDir, 'protected-chain-target.txt');
+    fs.writeFileSync(target, 'keep');
+    const command = `Write-Output ready && Remove-Item '${target.replace(/'/g, "''")}'`;
+    const requests: any[] = [];
+    bp._setBroadcastForTest((_channel, info: any) => {
+      requests.push(info);
+      bp.respond(info.request_id, 'deny');
+    });
+    try {
+      const tool = createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' })
+        .find(candidate => candidate.name === name)!;
+      const result = await tool.execute({ command, ...(name === 'bash' ? {} : { action: 'start' }) }, {
+        workingDir: path.join(tmpDir, 'chain-workspace'), state: {},
+      } as any);
+      expect(requests).toHaveLength(1);
+      expect(result.isError).toBe(true);
+      expect(result.content).not.toContain('E_SHELL_SYNTAX_MISMATCH');
+      expect(fs.readFileSync(target, 'utf8')).toBe('keep');
+      expect(fs.existsSync(path.join(tmpDir, 'chain-workspace'))).toBe(false);
+    } finally {
+      bp._setBroadcastForTest(null);
+      bp._resetForTest();
+    }
+  });
+
   it('rejects high-confidence POSIX syntax before execution and leaves PowerShell syntax alone', async () => {
     const { windowsPowerShellCompatibilityError } = await import('../../../../src/main/model/core-agent/local-tools');
-    expect(windowsPowerShellCompatibilityError('npm install && npm test', 'win32')).toContain('E_SHELL_SYNTAX_MISMATCH');
+    expect(windowsPowerShellCompatibilityError('npm install && npm test', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('npm test || npm run report', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('echo done && mkdir -p api', 'win32')).toContain('POSIX mkdir -p');
+    expect(windowsPowerShellCompatibilityError('npm test && (npm run report)', 'win32')).toContain('unsupported complex');
+    expect(windowsPowerShellCompatibilityError('Write-Output "C:\\data\\" "&&"', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('Write-Output "C:\\data\\" "&&" && Write-Output done', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('Write-Output `&`&', 'win32')).toBeNull();
     expect(windowsPowerShellCompatibilityError("cat <<'TEXT'\nnode run-skill.cjs missing-skill probe\nTEXT", 'win32')).toContain('POSIX heredoc');
     expect(windowsPowerShellCompatibilityError('export TOKEN=x; head -n 3 a.txt > /dev/null', 'win32')).toContain('source/export');
     expect(windowsPowerShellCompatibilityError('mkdir -p api core/data core/analysis', 'win32')).toContain('POSIX mkdir -p');
@@ -38,7 +146,7 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     const processStart = tools.find((tool) => tool.name === 'process_session')!;
     const interactive = tools.find((tool) => tool.name === 'interactive_cli')!;
     const marker = path.join(tmpDir, 'must-not-run.txt');
-    const command = `node -e "require('fs').writeFileSync('${marker}', 'ran')" && echo done`;
+    const command = `node -e "require('fs').writeFileSync('${marker}', 'ran')" && (echo done)`;
     const ctx = { workingDir: tmpDir, signal: undefined, state: {} } as any;
 
     const bashResult = await bash.execute({ command }, ctx);
@@ -102,7 +210,7 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     fs.mkdirSync(cwd, { recursive: true });
 
     const result = await bash.execute({
-      command: 'Write-Output $env:ORKAS_NATIVE_SMOKE',
+      command: 'Write-Output $env:ORKAS_NATIVE_SMOKE && Write-Output chain-complete',
       timeoutMs: 10_000,
     }, {
       workingDir: cwd,
@@ -112,6 +220,7 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     expect(result.isError).toBeUndefined();
     expect(result.content).toContain('<command-result status="succeeded" exit_code="0"');
     expect(result.content).toContain('Windows-你好');
+    expect(result.content).toContain('chain-complete');
     expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
   });
 
@@ -318,11 +427,82 @@ describe('local-tools › interactive CLI action contract', () => {
       input: 'yes',
     }, { workingDir: tmpDir, state: {} } as any);
     expect(rejected).toMatchObject({ isError: true });
-    expect(rejected.content).toContain('interactive_cli(close) does not accept: input');
+    expect(schema.oneOf).toBeUndefined();
+    expect(rejected.content).not.toContain('does not accept');
+    expect(rejected.content).toMatch(/not found|unknown|not exist/i);
   });
 });
 
 describe('local-tools › persistent process sessions', () => {
+  it.each([false, true])('isolates concurrent output manifests and environments (programmatic=%s)', async (programmatic) => {
+    await allFilesAuto();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const { markProgrammaticToolCallState } = await import('../../../../src/core-agent/src/tools/run-program');
+    const { _resetProcessSessionsForTest } = await import('../../../../src/core-agent/src/tools/process-session');
+    const written = [vi.fn(), vi.fn()];
+    const bash = written.map(onFileWritten => createLocalTools({ userId: UID, cid: CID, onFileWritten }).find(t => t.name === 'bash')!);
+    const workspace = path.join(tmpDir, 'parallel-output');
+    fs.mkdirSync(path.join(workspace, '.cache'), { recursive: true });
+    const state = { commandSessionEnabled: true, sandboxEnv: { KEEP_ME: 'original' } };
+    const ctx = { workingDir: workspace, state: programmatic ? markProgrammaticToolCallState(state) : state };
+    const quote = (s: string) => "'" + s.replace(/'/g, process.platform === 'win32' ? "''" : "'\\''") + "'";
+    const manifestPaths: string[] = [];
+    try {
+      const results = await Promise.all([0, 1].map(id => {
+        // Explicit manifests discover files excluded from ordinary workspace scans.
+        // Both manifests are written before either command exits.
+        const script = `const fs=require('fs'); const p='.cache/${id}.txt'; fs.writeFileSync(p,'${id}');
+          fs.appendFileSync(process.env.ORKAS_OUTPUT_MANIFEST,p+'\\n');
+          fs.writeFileSync('.cache/${id}.ready','');
+          console.log(process.env.ORKAS_OUTPUT_MANIFEST); const deadline=Date.now()+2500;
+          const timer=setInterval(()=>{if(fs.existsSync('.cache/${1 - id}.ready')){clearInterval(timer);setTimeout(()=>{},${50 + id * 50});}
+            else if(Date.now()>deadline){clearInterval(timer);process.exitCode=1;}},20);`;
+        return bash[id].execute({ command: `${process.platform === 'win32' ? '& ' : ''}${quote(TEST_NODE)} -e ${quote(script)}`, yield_time_ms: 5000, timeoutMs: 6000 }, ctx);
+      }));
+      results.forEach((result, id) => {
+        expect(result.isError).toBeUndefined();
+        expect(result.observations?.execution?.status).toBe('succeeded');
+        expect(written[id].mock.calls.map(([file]) => file)).toEqual([path.join(workspace, '.cache', `${id}.txt`)]);
+        const match = result.content.match(/\.orkas-output-manifest[^\s<"]*/);
+        expect(match).not.toBeNull();
+        manifestPaths.push(match![0]);
+      });
+      expect(new Set(manifestPaths).size).toBe(2);
+      expect(ctx.state.sandboxEnv).toEqual({ KEEP_ME: 'original' });
+      expect(fs.readdirSync(workspace).filter(name => name.startsWith('.orkas-output-manifest'))).toEqual([]);
+      expect(bash[0].executionMode).toBe('parallel');
+    } finally { await _resetProcessSessionsForTest(); }
+  });
+
+  it('retains a new empty workspace until its last concurrent command completes', async () => {
+    await allFilesAuto();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const { bashTool } = await import('../../../../src/core-agent/src/tools/builtin');
+    const workspace = path.join(tmpDir, 'empty-parallel-workspace');
+    const completions: Array<() => void> = [];
+    const execute = vi.spyOn(bashTool, 'execute').mockImplementation(async () => {
+      await new Promise<void>(resolve => completions.push(resolve));
+      return { content: 'done' };
+    });
+    const bash = createLocalTools({ userId: UID, cid: CID }).find(t => t.name === 'bash')!;
+    const ctx = { workingDir: workspace, state: {} };
+    const first = bash.execute({ command: 'echo first' }, ctx);
+    const second = bash.execute({ command: 'echo second' }, ctx);
+    try {
+      await expect.poll(() => completions.length).toBe(2);
+      completions[0]();
+      await first;
+      expect(fs.existsSync(workspace)).toBe(true);
+      completions[1]();
+      await second;
+      expect(fs.existsSync(workspace)).toBe(false);
+    } finally {
+      completions.forEach(resolve => resolve());
+      await Promise.allSettled([first, second]);
+      execute.mockRestore();
+    }
+  });
+
   it('applies the workspace write boundary before starting a process', async () => {
     await allFilesAuto();
     await workspaceOnly();
@@ -352,6 +532,88 @@ describe('local-tools › persistent process sessions', () => {
     expect(result.isError).toBe(true);
     expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
     expect(fs.existsSync(outside)).toBe(false);
+  });
+
+  it.each(['shell', 'managed', 'programmatic', 'no-workspace'] as const)(
+    'preserves silent command completion on the %s path', async (mode) => {
+      await allFilesAuto();
+      const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+      const { markProgrammaticToolCallState } = await import('../../../../src/core-agent/src/tools/run-program');
+      const { _resetProcessSessionsForTest } = await import('../../../../src/core-agent/src/tools/process-session');
+      const bash = createLocalTools({ userId: UID, cid: CID }).find((tool) => tool.name === 'bash')!;
+      const command = process.platform === 'win32' ? '& $env:ComSpec /c exit 0' : 'true';
+      const state = { commandSessionEnabled: mode === 'managed' || mode === 'programmatic' };
+      try {
+        const result = await bash.execute({ command, yield_time_ms: 1000 }, {
+          workingDir: mode === 'no-workspace' ? undefined : tmpDir,
+          state: mode === 'programmatic' ? markProgrammaticToolCallState(state) : state,
+        });
+        expect(result.isError).toBeFalsy();
+        expect(result.content).toContain('<command-result status="succeeded" exit_code="0"');
+        expect(result.content).toContain('[no command output]');
+      } finally { await _resetProcessSessionsForTest(); }
+    },
+  );
+
+  it('cleans a newly materialized empty command workspace only after completion', async () => {
+    await allFilesAuto();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const { _resetProcessSessionsForTest } = await import('../../../../src/core-agent/src/tools/process-session');
+    const tools = createLocalTools({ userId: UID, cid: CID });
+    const bash = tools.find((tool) => tool.name === 'bash')!;
+    const session = tools.find((tool) => tool.name === 'process_session')!;
+    const workspace = path.join(tmpDir, 'empty-managed-workspace');
+    const command = process.platform === 'win32' ? 'Start-Sleep -Milliseconds 500' : 'sleep 0.5';
+    try {
+      const ctx = { workingDir: workspace, state: { commandSessionEnabled: true } };
+      const initial = JSON.parse((await bash.execute({ command, yield_time_ms: 0 }, ctx)).content);
+      expect(initial.status).toBe('running');
+      expect(fs.existsSync(workspace)).toBe(true);
+      await expect.poll(() => fs.existsSync(workspace), { timeout: 5000 }).toBe(false);
+      const completed = await session.execute({ action: 'read', session_id: initial.session_id }, ctx);
+      expect(JSON.parse(completed.content)).toMatchObject({
+        status: 'exited', execution_status: 'succeeded', exit_code: 0,
+      });
+    } finally { await _resetProcessSessionsForTest(); }
+  });
+
+  it('records bash outputs once when a yielded command exits between reads, with conversation isolation', async () => {
+    await allFilesAuto();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const { _resetProcessSessionsForTest } = await import('../../../../src/core-agent/src/tools/process-session');
+    const { markProgrammaticToolCallState } = await import('../../../../src/core-agent/src/tools/run-program');
+    const workspace = path.join(tmpDir, 'managed-command');
+    fs.mkdirSync(workspace, { recursive: true });
+    const onFileWritten = vi.fn();
+    const tools = createLocalTools({ userId: UID, cid: CID, onFileWritten });
+    const bash = tools.find((tool) => tool.name === 'bash')!;
+    const session = tools.find((tool) => tool.name === 'process_session')!;
+    const quote = (value: string) => "'" + value.replace(/'/g, process.platform === 'win32' ? "''" : "'\\''") + "'";
+    const script = "setTimeout(()=>{require('fs').writeFileSync('generated.txt','complete');console.log('done')},100)";
+    const command = `${process.platform === 'win32' ? '& ' : ''}${quote(TEST_NODE)} -e ${quote(script)}`;
+    const ctx = { workingDir: workspace, state: { commandSessionEnabled: true } };
+    try {
+      const initial = JSON.parse((await bash.execute({ command, yield_time_ms: 0 }, ctx)).content);
+      expect(initial.status).toBe('running');
+      await expect.poll(() => onFileWritten.mock.calls.length).toBe(1);
+      const foreign = createLocalTools({ userId: UID, cid: 'foreign' }).find((tool) => tool.name === 'process_session')!;
+      const readInput = { action: 'read', session_id: initial.session_id };
+      const forgedCtx = { ...ctx, state: { ...ctx.state, processSessionOwner: 'forged' } };
+      expect(session.inspectReadContinuation!(readInput, forgedCtx)).toMatchObject({ waiting: false });
+      expect(foreign.inspectReadContinuation!(readInput, ctx)).toBeUndefined();
+      expect((await foreign.execute({ action: 'read', session_id: initial.session_id }, ctx)).isError).toBe(true);
+      const result = await session.execute({ action: 'read', session_id: initial.session_id }, ctx);
+      expect(JSON.parse(result.content).status).toBe('exited');
+      expect(result.observations?.fileChanges).toEqual([expect.objectContaining({ operation: 'create', sourcePath: path.join(workspace, 'generated.txt') })]);
+      expect(result.observations?.execution?.status).toBe('succeeded');
+      const repeated = await session.execute({ action: 'read', session_id: initial.session_id }, ctx);
+      expect(repeated.observations).toBeUndefined();
+      expect(onFileWritten).toHaveBeenCalledTimes(1);
+      const program = await bash.execute({ command, yield_time_ms: 0 }, {
+        ...ctx, state: markProgrammaticToolCallState({ commandSessionEnabled: true }),
+      });
+      expect(program.content).toContain('<command-result status="succeeded"');
+    } finally { await _resetProcessSessionsForTest(); }
   });
 
   it('reports terminal execution and file changes produced by a long process', async () => {
@@ -531,6 +793,24 @@ describe('local-tools › bash › disabled skills', () => {
 });
 
 describe('local-tools › bash › run-scoped Skill binding', () => {
+  it('rejects malformed Skill operands before executing or changing the environment', async () => {
+    await allFilesAuto();
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(core.bashTool, 'execute').mockResolvedValue({ content: 'must not execute' });
+    try {
+      const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+      const bash = createLocalTools({ userId: UID, skillRuntimeBindings: new Map() }).find(t => t.name === 'bash')!;
+      const ctx = { workingDir: tmpDir, state: { sandboxEnv: { SENTINEL: 'unchanged' } } } as any;
+      const invalid = await bash.execute({ command: "node run-skill.cjs 'skill-creator},{' probe" }, ctx);
+      expect(invalid.content).toContain('E_SKILL_REF_INVALID');
+      expect(invalid.observations?.fileFailure).toMatchObject({ skill_ref_valid: false });
+      const missing = await bash.execute({ command: 'node run-skill.cjs missing-skill probe' }, ctx);
+      expect(missing.content).toContain('E_SKILL_NOT_AVAILABLE');
+      expect(missing.observations?.fileFailure).toMatchObject({ skill_ref_valid: true, skill_binding_found: false });
+      expect(execute).not.toHaveBeenCalled();
+      expect(ctx.state.sandboxEnv).toEqual({ SENTINEL: 'unchanged' });
+    } finally { execute.mockRestore(); }
+  });
   it.runIf(process.platform !== 'win32')('finds the runner file without attempting to execute a Skill', async () => {
     await allFilesAuto();
     fs.writeFileSync(path.join(tmpDir, 'run-skill.cjs'), 'throw new Error("must not execute");');
@@ -571,6 +851,40 @@ describe('local-tools › bash › run-scoped Skill binding', () => {
       expect(rejected.content).toContain('E_SKILL_MULTI_ROOT');
       expect(execute).toHaveBeenCalledOnce();
     } finally { execute.mockRestore(); }
+  });
+
+  it('isolates overlapping Skill environments even without an explicit working directory', async () => {
+    await allFilesAuto();
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const completions: Array<() => void> = [];
+    const roots: unknown[] = [];
+    const execute = vi.spyOn(core.bashTool, 'execute').mockImplementation(async (_input, ctx) => {
+      await new Promise<void>(resolve => completions.push(resolve));
+      roots.push((ctx.state.sandboxEnv as any)?.ORKAS_RUN_SKILL_DIR);
+      return { content: 'done' };
+    });
+    const bindings = ['first-skill', 'second-skill'].map(id => ({
+      id, name: id, root: path.join(tmpDir, id), entry: path.join(tmpDir, id, 'SKILL.md'), source: 'custom',
+    }));
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bash = createLocalTools({ userId: UID, hostPlatform: 'linux',
+      skillRuntimeBindings: new Map(bindings.map(binding => [binding.id, binding])),
+    }).find(t => t.name === 'bash')!;
+    const ctx = { state: { sandboxEnv: { KEEP_ME: 'original' } } };
+    const calls = bindings.map(binding => bash.execute({ command: `printf ok; node run-skill.cjs ${binding.id} probe` }, ctx));
+    try {
+      await expect.poll(() => completions.length).toBe(2);
+      completions[0]();
+      await calls[0];
+      completions[1]();
+      await calls[1];
+      expect(roots).toEqual(bindings.map(binding => binding.root));
+      expect(ctx.state.sandboxEnv).toEqual({ KEEP_ME: 'original' });
+    } finally {
+      completions.forEach(resolve => resolve());
+      await Promise.allSettled(calls);
+      execute.mockRestore();
+    }
   });
 
   it.each([
@@ -635,6 +949,69 @@ describe('local-tools › bash › run-scoped Skill binding', () => {
     } finally { execute.mockRestore(); }
   });
 
+  it.runIf(process.platform !== 'win32').each(['substitution', 'backtick', 'quoted data', 'plain data'])(
+    'keeps heredoc Skill execution bound without executing literal data: %s', async (kind) => {
+      await allFilesAuto();
+      const paths = await import('../../../../src/main/paths');
+      const installedRoot = paths.userMarketplaceSkillDir(UID, 'heredoc-skill');
+      const boundRoot = path.join(tmpDir, 'exact-heredoc-skill');
+      for (const [root, source] of [[installedRoot, 'rescanned'], [boundRoot, 'bound']] as const) {
+        fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+        fs.writeFileSync(path.join(root, 'SKILL.md'), `---\nname: heredoc-skill\ndescription: ${source}\n---\n`);
+        fs.writeFileSync(path.join(root, 'scripts', 'probe.js'),
+          `module.exports = async () => ({ source: '${source}' });\n`);
+      }
+      const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+      const bash = createLocalTools({ userId: UID, skillRuntimeBindings: new Map([['heredoc-skill', {
+        id: 'heredoc-skill', name: 'heredoc-skill', root: boundRoot,
+        entry: path.join(boundRoot, 'SKILL.md'), source: 'global',
+      }]]) }).find(tool => tool.name === 'bash')!;
+      const invocation = '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" heredoc-skill probe';
+      const body = kind === 'backtick' ? '`' + invocation + '`'
+        : kind === 'plain data' ? invocation : '$(' + invocation + ')';
+      const command = `cat <<${kind === 'quoted data' ? "'TEXT'" : 'TEXT'}\n${body}\nTEXT`;
+      const ctx = { workingDir: tmpDir, state: { sandboxEnv: {
+        ORKAS_NODE: TEST_NODE, ORKAS_PC_DIR: process.cwd(), ORKAS_UID: UID,
+        ORKAS_WORKSPACE_ROOT: tmpDir, ORKAS_GLOBAL_SKILL_ROOTS_ENABLED: '0',
+      } } } as any;
+      const result = await bash.execute({ command, timeoutMs: 10_000 }, ctx);
+      expect(result.isError, result.content).toBeFalsy();
+      if (kind === 'substitution' || kind === 'backtick') {
+        expect(result.content).toContain('"source":"bound"');
+        expect(result.content).not.toContain('"source":"rescanned"');
+      } else {
+        expect(result.content).not.toContain('"source":');
+        expect(result.content).toContain('heredoc-skill probe');
+      }
+      expect(ctx.state.sandboxEnv).not.toHaveProperty('ORKAS_RUN_SKILL_DIR');
+    },
+  );
+
+  it.runIf(process.platform !== 'win32').each([
+    { command: 'cat <<TEXT\n# "$(node run-skill.cjs missing-skill probe)"\nTEXT', executes: true },
+    { command: "cat <<TEXT\n'$(node run-skill.cjs missing-skill probe)'\nTEXT", executes: true },
+    { command: "cat <<T'EXT'\n$(node run-skill.cjs missing-skill probe)\nTEXT", executes: false },
+    { command: 'cat <<\\TEXT\n$(node run-skill.cjs missing-skill probe)\nTEXT', executes: false },
+    { command: 'cat <<TEXT\n\\$(node run-skill.cjs missing-skill probe)\nTEXT', executes: false },
+  ])('distinguishes heredoc expansion from delimiter and payload quoting: $command', async ({ command, executes }) => {
+    await allFilesAuto();
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(core.bashTool, 'execute').mockResolvedValue({ content: 'literal data accepted' });
+    try {
+      const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+      const bash = createLocalTools({ userId: UID, skillRuntimeBindings: new Map() })
+        .find(tool => tool.name === 'bash')!;
+      const result = await bash.execute({ command }, { workingDir: tmpDir, state: {} } as any);
+      if (executes) {
+        expect(result.content).toContain('E_SKILL_NOT_AVAILABLE');
+        expect(execute).not.toHaveBeenCalled();
+      } else {
+        expect(result.isError).toBeFalsy();
+        expect(execute).toHaveBeenCalledOnce();
+      }
+    } finally { execute.mockRestore(); }
+  });
+
   it('executes the exact @skill binding instead of rescanning a same-id installed directory', async () => {
     await allFilesAuto();
     const paths = await import('../../../../src/main/paths');
@@ -672,8 +1049,19 @@ describe('local-tools › bash › run-scoped Skill binding', () => {
       },
     } as any;
 
+    // Use only the model-visible read receipt, without knowing the runner path.
+    const { createFileTools } = await import('../../../../src/main/model/core-agent/file-tools');
+    const read = createFileTools({
+      userId: UID,
+      skillRuntimeBindings: new Map([['collision-skill', binding]]),
+    }).find((tool) => tool.name === 'read_files')!;
+    const receipt = await read.execute({ paths: [{ path: '@skill/collision-skill' }] }, ctx);
+    expect(receipt.isError).toBeFalsy();
+    const template = receipt.content.match(/```(?:sh|powershell)\n([^\n]+)\n```/)?.[1];
+    expect(template, 'A Skill read must provide an executable host entry point').toBeTruthy();
+    expect(receipt.content).not.toContain(boundRoot);
     const result = await bash.execute({
-      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" collision-skill probe',
+      command: template!.replace('<script-basename> -- <args...>', 'probe'),
       timeoutMs: 10_000,
     }, ctx);
 
@@ -1360,6 +1748,8 @@ describe('local-tools › delete_file › confirmation scope', () => {
 });
 
 describe('local-tools \u203a bash \u203a removing files outside the writable workspace', () => {
+  const moveSourceOperation = process.platform === 'win32' ? 'move-item source' : 'mv source';
+
   async function buildScopedTool(name: string) {
     const localTools = await import('../../../../src/main/model/core-agent/local-tools');
     const ws = await import('../../../../src/main/features/user_workspace');
@@ -1414,7 +1804,7 @@ describe('local-tools \u203a bash \u203a removing files outside the writable wor
       expect(r.isError).toBe(true);
       expect(r.content).toContain('E_BASH_RISK_DENIED');
       expect(seen).toHaveLength(1);
-      expect(seen[0]).toMatchObject({ subject: src, operation: 'mv source', reasons: ['destructive'] });
+      expect(seen[0]).toMatchObject({ subject: src, operation: moveSourceOperation, reasons: ['destructive'] });
       expect(fs.existsSync(src)).toBe(true);
       expect(fs.existsSync(dest)).toBe(false);
     });
@@ -1499,7 +1889,7 @@ describe('local-tools \u203a bash \u203a removing files outside the writable wor
       expect(r.isError).toBe(true);
       expect(r.content).toContain('E_BASH_RISK_DENIED');
       expect(seen).toHaveLength(1);
-      expect(seen[0]).toMatchObject({ subject: src, operation: 'mv source' });
+      expect(seen[0]).toMatchObject({ subject: src, operation: moveSourceOperation });
       expect(fs.existsSync(src)).toBe(true);
     });
   });
@@ -1826,6 +2216,33 @@ describe('local-tools › edit_file › file kind / existence', () => {
 });
 
 describe('local-tools › edit_file › matching semantics', () => {
+  it('returns bounded real contexts for long-line matches and supports an exact targeted retry', async () => {
+    await allFilesAuto();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'long.txt');
+    const original = Array.from({ length: 5 }, (_, i) => `${'"\\'.repeat(2000)}section ${i}: target\r\n`).join('');
+    fs.writeFileSync(p, original);
+    const ctx = { workingDir: wsDir, state: {} } as any;
+    const result = await edit.execute({ path: p, old_string: 'target', new_string: 'changed' }, ctx);
+    expect(result.isError).toBe(true);
+    const raw = result.content.split('<edit-recovery>\n')[1].split('\n</edit-recovery>')[0];
+    expect(raw.length).toBeLessThanOrEqual(1200);
+    const recovery = JSON.parse(raw);
+    expect(recovery.match_count).toBe(5);
+    expect(recovery.omitted_matches).toBe(2);
+    expect(recovery.candidates.map((c: any) => [c.line, c.column])).toEqual([[1, 4012], [2, 4012], [3, 4012]]);
+    for (const c of recovery.candidates) {
+      expect(c.text).toContain('target\r\n');
+      expect(c.text).toBe(original.slice(c.char_start, c.char_end));
+    }
+    expect(fs.readFileSync(p, 'utf8')).toBe(original);
+    const chosen = recovery.candidates[1].text;
+    const retry = await edit.execute({ path: p, old_string: chosen,
+      new_string: chosen.replace('target', 'changed'), expected_hash: recovery.file_hash }, ctx);
+    expect(retry.isError).toBeFalsy();
+    expect(fs.readFileSync(p, 'utf8')).toBe(original.replace('section 1: target', 'section 1: changed'));
+  });
+
   it('replaces a unique occurrence and returns char-counted result tag', async () => {
     await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
@@ -1855,6 +2272,11 @@ describe('local-tools › edit_file › matching semantics', () => {
     const r = await run(edit, { path: p, old_string: 'foo', new_string: 'baz' });
     expect(r.isError).toBe(true);
     expect(r.content).toContain('E_MULTIPLE_MATCHES');
+    const recovery = JSON.parse(r.content.split('<edit-recovery>\n')[1].split('\n</edit-recovery>')[0]);
+    expect(recovery.match_count).toBe(2);
+    expect(recovery.candidates.map((c: any) => [c.line, c.column])).toEqual([[1, 1], [1, 9]]);
+    expect(recovery.candidates.every((c: any) => c.text === 'foo bar foo')).toBe(true);
+    expect(JSON.stringify(r.observations)).not.toContain('foo bar foo');
     // file untouched
     expect(fs.readFileSync(p, 'utf8')).toBe('foo bar foo');
   });
@@ -2155,10 +2577,10 @@ describe('local-tools › create_artifact › permission mode', () => {
     const r = await run(tool, { title: 'X', files: MIN_FILES });
     expect(r.isError).toBeFalsy();
     expect(r.content).toMatch(/do NOT paste/i);
-    expect(r.content).toMatch(/interaction smoke passed/i);
+    expect(r.content).toMatch(/preview checks passed/i);
   });
 
-  it('rejects and discards a static candidate before firing onArtifactCreated', async () => {
+  it('publishes a valid bundle with honest diagnostics even when preview checks find issues', async () => {
     await allFilesAuto();
     const created: unknown[] = [];
     let candidateDir = '';
@@ -2169,28 +2591,27 @@ describe('local-tools › create_artifact › permission mode', () => {
         return {
           ok: false,
           blockers: [
-            'interactive artifact smoke observed no visible state change',
-            'submit control did not emit a payload',
+            'interactive artifact smoke found no operable control to exercise',
+            'desktop: 1 console/runtime error(s)',
             'download control produced no file',
             'keyboard traversal could not reach the primary action',
           ],
-          controlsExercised: 1,
+          controlsExercised: 0,
           observableEffects: 0,
         };
       },
     });
     const r = await run(tool, { title: 'Static app', files: MIN_FILES });
 
-    expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_ARTIFACT_INTERACTION_INCOMPLETE');
-    expect(r.content).toContain('Repair the app behavior');
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('preview reported issues');
     expect(r.content).toContain('keyboard traversal could not reach the primary action');
-    expect(created).toEqual([]);
+    expect(created).toHaveLength(1);
     expect(candidateDir).toBeTruthy();
-    expect(fs.existsSync(candidateDir)).toBe(false);
+    expect(fs.existsSync(candidateDir)).toBe(true);
   });
 
-  it('turns blocked remote images into a bounded self-contained recovery path', async () => {
+  it('retains unavailable remote resource diagnostics without forcing an offline rewrite', async () => {
     await allFilesAuto();
     const tool = await buildCreateArtifactTool({
       onArtifactCreated: () => {},
@@ -2206,16 +2627,37 @@ describe('local-tools › create_artifact › permission mode', () => {
     });
     const r = await run(tool, { title: 'Remote image app', files: MIN_FILES });
 
-    expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_ARTIFACT_INTERACTION_INCOMPLETE');
-    expect(r.content).toMatch(/user explicitly supplied or required an asset/i);
-    expect(r.content).toMatch(/bundle it under files.*base64/i);
-    expect(r.content).toMatch(/model-chosen remote assets.*local CSS\/SVG or data\/blob/i);
-    expect(r.content).toMatch(/Do not retry the same remote URLs/i);
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('6 images failed to load');
+    expect(r.content).not.toContain('Do not retry the same remote URLs');
   });
 });
 
 describe('local-tools › create_artifact › success + callback', () => {
+  it('preserves the application and reports unavailable preview without claiming verification', async () => {
+    const created: unknown[]=[];
+    const tool=await buildCreateArtifactTool({onArtifactCreated:a=>created.push(a),artifactInteractionSmoke:async()=>{throw new Error('fixture preview unavailable');}});
+    const result=await run(tool,{title:'Retained',files:MIN_FILES});
+    expect(result.isError).toBeFalsy();expect(created).toHaveLength(1);
+    expect(result.content).toContain('Preview unavailable');
+    expect(result.content).not.toContain('checks passed');
+  });
+  it('publishes an artifact with inconclusive effects and preserves the warning', async () => {
+    await allFilesAuto();
+    const created: unknown[] = [];
+    const warning = 'functional behavior remains unverified';
+    const tool = await buildCreateArtifactTool({
+      onArtifactCreated: artifact => created.push(artifact),
+      artifactInteractionSmoke: async () => ({ ok: true, blockers: [], warnings: [warning],
+        controlsExercised: 1, observableEffects: 0 }),
+    });
+    const result = await run(tool, { title: 'Canvas app', files: MIN_FILES });
+    expect(result.isError).toBeFalsy();
+    expect(created).toHaveLength(1);
+    expect(result.content).toContain('0 observable effect(s)');
+    expect(result.content).toContain(warning);
+  });
+
   it('writes the bundle, fires onArtifactCreated, and tells the model not to paste HTML', async () => {
     await allFilesAuto();
     const created: Array<{ id: string; title: string }> = [];

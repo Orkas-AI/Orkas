@@ -25,17 +25,19 @@ import {
 } from './core-agent/client';
 
 export interface StreamEvent {
-  type: 'progress' | 'event' | 'delta' | 'final' | 'error' | 'done';
+  type: 'progress' | 'event' | 'delta' | 'commentary-finalized' | 'final' | 'error' | 'done';
   text?: string;
-  /** Assistant text presentation channel. Present on model text deltas after
-   * provider-native phase preservation or structured tool-round inference. */
-  phase?: 'commentary' | 'final_answer';
+  /** Assistant text presentation channel. Pending drafts are visible before
+   * a structured boundary classifies them as commentary or a final answer. */
+  phase?: 'commentary' | 'final_answer' | 'pending';
   event?: Record<string, unknown>;
   aborted?: boolean;
   /** Structured source for terminal failures. */
   failureKind?: 'model' | 'config';
   /** Stable low-cardinality reason paired with `failureKind`. */
   failureCode?: string;
+  /** This terminal failure explicitly exhausted the inner retry policy. */
+  retryExhausted?: boolean;
   /** Runtime phase where the terminal failure occurred. */
   failurePhase?: 'preflight' | 'provider_wait' | 'model_text' | 'tool_input' | 'tool' | 'compaction';
   /** Bounded provider code retained only for local failure classification. */
@@ -128,10 +130,6 @@ export interface ChatOptions {
   /** Optional soft convergence threshold; the hard tool-loop limit is unchanged. */
   elapsedConvergenceMs?: number;
   abortSignal?: AbortSignal | null;
-  /** Optional host-owned structural check for terminal text. Returning a
-   * correction asks the runner for one repair attempt; a second rejection is
-   * still shipped, so this can improve delivery without becoming a hard gate. */
-  terminalTextGuard?: (text: string) => string | null | undefined;
   /** Legacy openclaw CLI timeout — ignored, retained for signature parity. */
   timeout?: number;
   /** Subset of skill ids to inject into this call's system prompt. Undefined
@@ -212,7 +210,7 @@ export interface ChatOptions {
    * extended by the trusted main-process attachment/reference resolver. */
   runtimeReadOnlyRoots?: string[];
   /** Build the stable superset of tools needed by a rich active-turn ingress
-   * (currently OCR plus connector meta-tools that resolve availability when
+   * (connector meta-tools that resolve availability when
    * executed). Group Chat sets this only for top-level CoreAgent turns. */
   richSteerEnabled?: boolean;
   /** Fired with the absolute path of every file produced by the local-exec
@@ -241,6 +239,8 @@ export interface ChatOptions {
    * user-confirmed server. Group chat uses the stable id to offer a review
    * shortcut; the callback is not part of installation authorization. */
   onCustomConnectorAdded?: (connectorId: string) => void;
+  /** A saved automation, so the host can offer the user a route to it. */
+  onAutoTaskSaved?: (taskId: string) => void;
   /** Fired at turn start with each skill id that entered the system-prompt
    *  index, split by source system (`A.custom` / `A.platform` / `B`).
    *  `features/group_chat` buffers per turn and emits `skill_advertised`

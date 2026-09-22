@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import sharp from 'sharp';
 
 const require = createRequire(import.meta.url);
 const structuredVisual = require('../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/structured_visual.js') as
@@ -73,6 +74,34 @@ describe('ImageStudio private skill scripts', () => {
 
     expect(result).toMatchObject({ ok: true, op: 'process', engine: 'image-compose-skill-sharp', width: 160, height: 80, model_calls: 0 });
     expect(fs.statSync(path.join(root, 'processed.webp')).size).toBeGreaterThan(0);
+  });
+
+  it('recovers a rejected resize request into the delivery size without changing source or provider pixels', async () => {
+    const source = await sharp({ create: { width: 900, height: 900, channels: 4, background: '#112233' } }).png().toBuffer();
+    const provider = await sharp({ create: { width: 2048, height: 2048, channels: 4, background: '#bb6622' } }).png().toBuffer();
+    fs.writeFileSync(path.join(root, 'original.png'), source);
+    fs.writeFileSync(path.join(root, 'provider.png'), provider);
+    const request = {
+      op: 'process', input_path: 'provider.png', output_path: 'delivery.png',
+      operations: [{ type: 'resize', width: 900, height: 900, fit: 'invalid-fit' }],
+    };
+    writeJson('resize.json', request);
+    await expect(imageAsset({ args: ['--project', root, '--request', 'resize.json'] }))
+      .rejects.toThrow('fit is invalid');
+    expect(fs.existsSync(path.join(root, 'delivery.png'))).toBe(false);
+
+    // A corrected request may use the same helper; the earlier failure does
+    // not impose a retry cutoff or require touching the original/reference.
+    request.operations[0].fit = 'contain';
+    writeJson('resize.json', request);
+    const result = await imageAsset({ args: ['--project', root, '--request', 'resize.json'] });
+    expect(result).toMatchObject({ ok: true, width: 900, height: 900, model_calls: 0 });
+    const decoded = await sharp(path.join(root, 'delivery.png')).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    expect(decoded.info).toMatchObject({ width: 900, height: 900, channels: 4 });
+    expect([...decoded.data.subarray(0, 4)]).toEqual([187, 102, 34, 255]);
+    expect(fs.readFileSync(path.join(root, 'original.png'))).toEqual(source);
+    expect(fs.readFileSync(path.join(root, 'provider.png'))).toEqual(provider);
+    expect(fs.readdirSync(root).sort()).toEqual(['delivery.png', 'delivery.png.image-normalization.json', 'original.png', 'provider.png', 'resize.json']);
   });
 
   it('keeps script requests project-local and treats Real-ESRGAN as host-managed', async () => {

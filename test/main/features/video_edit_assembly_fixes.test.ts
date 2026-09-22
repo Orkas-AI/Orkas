@@ -29,6 +29,34 @@ afterAll(() => {
   for (const dir of tmpRoots) fs.rmSync(dir, { recursive: true, force: true });
 });
 
+describe('subtitle filesystem paths through the real filter parser', () => {
+  it.each(['captions.srt', "字幕 [1], it's; final.srt"])(
+    'burns %s without changing the original clip', async (filename) => {
+      const root = tmp();
+      const input = path.join(root, 'source.mp4');
+      const output = path.join(root, 'captioned.mp4');
+      const subtitles = path.join(root, filename);
+      const ffmpeg = bundledFfmpegPaths().ffmpeg!;
+      const generated = spawnSync(ffmpeg, ['-y', '-v', 'error', '-f', 'lavfi', '-i',
+        'color=c=blue:s=216x384:d=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', input], { timeout: 10_000 });
+      expect(generated.status, String(generated.stderr)).toBe(0);
+      const original = fs.readFileSync(input);
+      fs.writeFileSync(subtitles, '1\n00:00:00,000 --> 00:00:01,000\nCaption visible\n');
+      const result = await editVideo({ op: 'burnsubs', inputAbsPath: input,
+        subtitlesAbsPath: subtitles, outputAbsPath: output });
+      expect(result).toMatchObject({ ok: true, path: output });
+      const frame = (file: string) => {
+        const decoded = spawnSync(ffmpeg, ['-v', 'error', '-i', file, '-frames:v', '1',
+          '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'], { timeout: 10_000 });
+        expect(decoded.status, String(decoded.stderr)).toBe(0);
+        expect(decoded.stdout.length).toBe(216 * 384 * 3);
+        return decoded.stdout;
+      };
+      expect(frame(output)).not.toEqual(frame(input));
+      expect(fs.readFileSync(input)).toEqual(original);
+    });
+});
+
 describe('normalize_loudness channel-layout pin', () => {
   it('pins a known stereo layout after the resample', () => {
     // Without the trailing aformat, a mono input dies in negotiation between

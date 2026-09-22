@@ -52,30 +52,47 @@ async function loadModuleWithRunner(opts: {
   writes: number;
   responseText?: string;
   transcriptText?: string;
+  /** Reported through `runReflection`'s failure observer before returning. */
+  failure?: { kind: string; error?: unknown };
+  /** Make `buildRunner` itself throw (no usable model, expired OAuth …). */
+  buildRunnerError?: Error;
+  inputBudget?: number;
+  observeBudget?: (budget: number) => void;
+  capacityExceeded?: boolean;
 }) {
   vi.resetModules();
   vi.doMock('../../../src/main/features/reflection-transcript', () => ({
-    buildTranscript: async () => ({
-      text: opts.transcriptText ?? 'user did something',
-      stats: { convsIncluded: 1, convsConsidered: 2, estimatedTokens: 42 },
-    }),
+    buildTranscript: async (_uid: string, _agent: string, _since: number, budget: number) => {
+      opts.observeBudget?.(budget);
+      return {
+        capacityExceeded: opts.capacityExceeded,
+        text: opts.transcriptText ?? 'user did something',
+        stats: { convsIncluded: 1, convsConsidered: 2, estimatedTokens: 42 },
+      };
+    },
     listAgentGmemberFiles: async () => [],
   }));
   vi.doMock('../../../src/main/model/core-agent/runner', () => ({
-    buildRunner: async () => ({
-      runner: {
-        runReflection: async (
-          _prompt: string,
-          _signal?: AbortSignal,
-          _sandboxEnv?: Record<string, string>,
-          _onModelCall?: unknown,
-          onDurableWrite?: () => void,
-        ) => {
-          for (let i = 0; i < opts.writes; i++) onDurableWrite?.();
-          return opts.responseText ?? 'nothing to save';
+    buildRunner: async () => {
+      if (opts.buildRunnerError) throw opts.buildRunnerError;
+      return {
+        runner: {
+          getReflectionInputBudget: (_fixed: string) => opts.inputBudget ?? 150000,
+          runReflection: async (
+            _prompt: string,
+            _signal?: AbortSignal,
+            _sandboxEnv?: Record<string, string>,
+            _onModelCall?: unknown,
+            onDurableWrite?: () => void,
+            onFailure?: (failure: { kind: string; error?: unknown }) => void,
+          ) => {
+            for (let i = 0; i < opts.writes; i++) onDurableWrite?.();
+            if (opts.failure) onFailure?.(opts.failure);
+            return opts.responseText ?? 'nothing to save';
+          },
         },
-      },
-    }),
+      };
+    },
   }));
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -100,6 +117,8 @@ function writeReflectionState(uid: string, lastReflectedAt: Record<string, strin
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'reflection-state.json'), JSON.stringify({ lastReflectedAt }));
 }
+
+const HOUR = 3600 * 1000;
 
 // ── pickAgentsForCycle ──────────────────────────────────────────────────
 
@@ -162,6 +181,23 @@ describe('reflection-orchestrator › pickAgentsForCycle', () => {
     expect(picked.length).toBe(mod.MAX_AGENTS_PER_CYCLE);
     // First in result should be the oldest (agent-0)
     expect(picked[0].agentId).toBe('agent-0');
+  });
+
+  it('a recently failed agent sorts behind never-touched agents and honors its longer cooldown', async () => {
+    const mod = await loadModule();
+    const state = {
+      lastReflectedAt: {},
+      lastAttemptAt: { bad: new Date(NOW - 10 * 3600 * 1000).toISOString() },
+      failureStreak: { bad: 1 },
+    };
+    const picked = await mod.pickAgentsForCycle(TEST_UID, ['bad', 'fresh'], state, NOW, async () => true);
+    // 10h since the failed attempt clears the 8h cooldown, but a touched
+    // agent no longer jumps ahead of one that has never had a turn.
+    expect(picked.map((p) => p.agentId)).toEqual(['fresh', 'bad']);
+
+    const recent = { ...state, lastAttemptAt: { bad: new Date(NOW - 5 * 3600 * 1000).toISOString() } };
+    const pickedRecent = await mod.pickAgentsForCycle(TEST_UID, ['bad', 'fresh'], recent, NOW, async () => true);
+    expect(pickedRecent.map((p) => p.agentId)).toEqual(['fresh']);
   });
 
   it('processes a mix: only past-cooldown dirty agents are picked', async () => {
@@ -390,11 +426,13 @@ describe('reflection-orchestrator › runOneCycle', () => {
     expect(stamped[mod.DEFAULT_AGENT_ID]).toBeUndefined();  // failed → retry
   });
 
-  it('defers the remaining agents when the user comes back, never cutting one off', async () => {
+  it('defers remaining agents when a task arrives after an agent completed', async () => {
     const mod = await loadModuleWithAgents(['agent-b', 'agent-c']);
+    let idle = true;
     const seen: string[] = [];
     const reflect = vi.fn(async (_uid: string, agentId: string) => {
       seen.push(agentId);
+      idle = false;
       return 'reflected' as const;
     });
 
@@ -402,8 +440,7 @@ describe('reflection-orchestrator › runOneCycle', () => {
       now: () => NOW,
       reflect,
       isDirty: async () => true,
-      // Idle for the admission-granted first agent, busy from then on.
-      isIdle: () => false,
+      isIdle: () => idle,
     });
 
     expect(seen).toEqual([mod.DEFAULT_AGENT_ID]);
@@ -461,6 +498,184 @@ describe('reflection-orchestrator › runOneCycle', () => {
 
     expect(completed).toBe(0);
     expect(reflect).not.toHaveBeenCalled();
+  });
+
+  it('reports the per-agent deadline as timeout and moves on even when the reflection ignores abort', async () => {
+    const mod = await loadModuleWithAgents(['agent-b']);
+    const seen: string[] = [];
+    const reflect = vi.fn(async (_uid: string, agentId: string) => {
+      seen.push(agentId);
+      // A provider call that never honors the abort signal: the deadline must
+      // still hand the slot to the next agent.
+      if (agentId === mod.DEFAULT_AGENT_ID) return new Promise<'reflected'>(() => {});
+      return 'reflected' as const;
+    });
+
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      reflect,
+      isDirty: async () => true,
+      perAgentTimeoutMs: 20,
+      isIdle: () => true,
+    });
+
+    expect(seen).toEqual([mod.DEFAULT_AGENT_ID, 'agent-b']);
+    expect(completed).toBe(1);
+    const state = mod.readReflectionState(TEST_UID);
+    expect(state.lastReflectedAt[mod.DEFAULT_AGENT_ID]).toBeUndefined();   // window kept
+    expect(state.lastAttemptAt?.[mod.DEFAULT_AGENT_ID]).toBe(new Date(NOW).toISOString());
+    expect(state.failureStreak?.[mod.DEFAULT_AGENT_ID]).toBe(1);
+  });
+
+  it('keeps a window whose deadline fired after the lessons were already saved', async () => {
+    // The deadline abandons the run rather than waiting for it, so writes that
+    // already landed stay on disk. Retrying that window would ask the model to
+    // save the same lessons a second time.
+    const mod = await loadModule();
+    const reflect = vi.fn(async (
+      _uid: string, _agentId: string, _sinceMs: number,
+      _signal?: AbortSignal, onDurableWrite?: () => void,
+    ) => {
+      onDurableWrite?.();
+      return new Promise<'reflected'>(() => {});
+    });
+
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      reflect,
+      isDirty: async () => true,
+      perAgentTimeoutMs: 20,
+      isIdle: () => true,
+    });
+
+    expect(completed).toBe(1);
+    const state = mod.readReflectionState(TEST_UID);
+    expect(state.lastReflectedAt[mod.DEFAULT_AGENT_ID]).toBe(new Date(NOW).toISOString());
+    expect(state.failureStreak?.[mod.DEFAULT_AGENT_ID]).toBeUndefined();
+  });
+
+  it('a failed attempt is stamped and the agent waits out a doubled cooldown before retrying', async () => {
+    const mod = await loadModule();
+    const reflect = vi.fn(async () => { throw new Error('provider down'); });
+    const isDirty = async () => true;
+
+    await mod.runOneCycle(TEST_UID, { now: () => NOW, reflect, isDirty });
+    expect(reflect).toHaveBeenCalledTimes(1);
+
+    // Past the base 4h cooldown but inside the 8h one a single failure earns.
+    await mod.runOneCycle(TEST_UID, { now: () => NOW + 5 * HOUR, reflect, isDirty });
+    expect(reflect).toHaveBeenCalledTimes(1);
+
+    await mod.runOneCycle(TEST_UID, { now: () => NOW + 9 * HOUR, reflect, isDirty });
+    expect(reflect).toHaveBeenCalledTimes(2);
+    expect(mod.readReflectionState(TEST_UID).failureStreak?.[mod.DEFAULT_AGENT_ID]).toBe(2);
+  });
+
+  it('gives up the window after MAX_FAILURE_STREAK consecutive failures', async () => {
+    const mod = await loadModule();
+    const reflect = vi.fn(async () => { throw new Error('provider down'); });
+    const isDirty = async () => true;
+    const t1 = NOW;
+    const t2 = t1 + 9 * HOUR;          // past the 8h cooldown after one failure
+    const t3 = t2 + 17 * HOUR;         // past the 16h cooldown after two
+
+    await mod.runOneCycle(TEST_UID, { now: () => t1, reflect, isDirty });
+    await mod.runOneCycle(TEST_UID, { now: () => t2, reflect, isDirty });
+    expect(mod.readReflectionState(TEST_UID).lastReflectedAt).toEqual({});
+    await mod.runOneCycle(TEST_UID, { now: () => t3, reflect, isDirty });
+
+    expect(reflect).toHaveBeenCalledTimes(mod.MAX_FAILURE_STREAK);
+    const state = mod.readReflectionState(TEST_UID);
+    // The same transcript failed the same way three cycles running: advance
+    // past it rather than hold a cap slot for it forever.
+    expect(state.lastReflectedAt[mod.DEFAULT_AGENT_ID]).toBe(new Date(t3).toISOString());
+    expect(state.failureStreak).toBeUndefined();
+  });
+
+  it('a cycle-level cancel does not count as the agent failing', async () => {
+    const mod = await loadModule();
+    const controller = new AbortController();
+    const reflect = vi.fn(async () => {
+      controller.abort();
+      throw new Error('cancelled by account switch');
+    });
+    await mod.runOneCycle(TEST_UID, {
+      now: () => NOW, reflect, isDirty: async () => true, signal: controller.signal,
+    });
+    const state = mod.readReflectionState(TEST_UID);
+    expect(state.lastAttemptAt).toBeUndefined();
+    expect(state.failureStreak).toBeUndefined();
+  });
+
+  it('skips the cycle without touching any window when every model is cooling down', async () => {
+    const mod = await loadModule();
+    const reflect = vi.fn();
+    const isDirty = vi.fn(async () => true);
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW, reflect, isDirty, isModelUsable: () => false,
+    });
+    expect(completed).toBe(0);
+    expect(reflect).not.toHaveBeenCalled();
+    expect(isDirty).not.toHaveBeenCalled();
+    expect(mod.readReflectionState(TEST_UID)).toEqual({ lastReflectedAt: {} });
+  });
+
+  it('passes model-safe capacity into transcript selection', async () => {
+    const observeBudget = vi.fn();
+    const mod = await loadModuleWithRunner({ writes: 0, inputBudget: 43210, observeBudget });
+    await mod.runOneCycle(TEST_UID, { now: () => NOW, isDirty: async () => true });
+    expect(observeBudget).toHaveBeenCalledWith(43210);
+  });
+
+  it('does not classify fully cropped evidence as a quiet window', async () => {
+    const mod = await loadModuleWithRunner({ writes: 0, transcriptText: '', capacityExceeded: true });
+    expect(await mod.runOneCycle(TEST_UID, { now: () => NOW, isDirty: async () => true })).toBe(0);
+    expect(mod.readReflectionState(TEST_UID).lastReflectedAt[mod.DEFAULT_AGENT_ID]).toBeUndefined();
+  });
+
+  it('retains the window when runReflection reports a known failure', async () => {
+    const cases: Array<{ kind: string; error?: unknown }> = [
+      { kind: 'max_loops' },
+      { kind: 'no_provider' },
+      { kind: 'llm_error', error: new Error('rotating-provider: no candidates') },
+      { kind: 'llm_error', error: new Error('400 Bad Request') },
+      { kind: 'empty_output', stopReason: 'end_turn' },
+    ];
+    for (const failure of cases) {
+      const mod = await loadModuleWithRunner({ writes: 0, responseText: '', failure });
+      const completed = await mod.runOneCycle(TEST_UID, { now: () => NOW, isDirty: async () => true });
+      expect(completed).toBe(0);
+      expect(mod.readReflectionState(TEST_UID).lastReflectedAt[mod.DEFAULT_AGENT_ID]).toBeUndefined();
+      fs.rmSync(path.join(tmpDir, TEST_UID, 'local', 'config', 'reflection-state.json'), { force: true });
+    }
+  });
+
+  it('reports a runner that cannot be built as runner_unavailable', async () => {
+    const privateDetail = 'provider-private-detail at /private/customer/model-config.json';
+    const mod = await loadModuleWithRunner({ writes: 0, buildRunnerError: new Error(privateDetail) });
+    const completed = await mod.runOneCycle(TEST_UID, { now: () => NOW, isDirty: async () => true });
+    expect(completed).toBe(0);
+    expect(loggerMocks.warn).toHaveBeenCalled();
+    const logs = JSON.stringify(loggerMocks.warn.mock.calls);
+    expect(logs).not.toContain('provider-private-detail');
+    expect(logs).not.toContain('/private/customer/');
+  });
+
+  it('keeps reflection failure diagnostics private while retaining retry state', async () => {
+    const privateAgentId = 'private-agent-123456';
+    const mod = await loadModuleWithAgents([privateAgentId]);
+    await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      isDirty: async (_uid, agentId) => agentId === privateAgentId,
+      reflect: async () => { throw new Error('private-source-detail /private/customer/transcript.jsonl'); },
+    });
+    const state = mod.readReflectionState(TEST_UID);
+    expect(state.lastReflectedAt[privateAgentId]).toBeUndefined();
+    expect(state.failureStreak?.[privateAgentId]).toBe(1);
+    const logs = JSON.stringify(loggerMocks.warn.mock.calls);
+    expect(logs).not.toContain(privateAgentId);
+    expect(logs).not.toContain('private-source-detail');
+    expect(logs).not.toContain('/private/customer/');
   });
 
   it('skips with debug log when feature flag is off', async () => {
@@ -672,10 +887,110 @@ describe('reflection-orchestrator › state persistence', () => {
     expect(serialized).not.toContain(tmpDir);
   });
 
+  it('round-trips attempt stamps and failure streaks, dropping non-positive streaks', async () => {
+    const mod = await loadModule();
+    fs.mkdirSync(path.join(tmpDir, TEST_UID, 'local', 'config'), { recursive: true });
+    mod.writeReflectionState(TEST_UID, {
+      lastReflectedAt: { 'agent-x': '2026-05-21T10:00:00Z' },
+      lastAttemptAt: { 'agent-x': '2026-05-21T22:00:00Z', 'agent-y': '2026-05-22T01:00:00Z' },
+      failureStreak: { 'agent-y': 2, 'agent-z': 0, 'agent-w': -1 },
+    });
+    expect(mod.readReflectionState(TEST_UID)).toEqual({
+      lastReflectedAt: { 'agent-x': '2026-05-21T10:00:00Z' },
+      lastAttemptAt: { 'agent-x': '2026-05-21T22:00:00Z', 'agent-y': '2026-05-22T01:00:00Z' },
+      failureStreak: { 'agent-y': 2 },
+    });
+  });
+
   it('filters out non-string values defensively', async () => {
     const mod = await loadModule();
     writeReflectionState(TEST_UID, { 'a': 'iso', /* @ts-expect-error */ 'b': 123 as any });
     const read = mod.readReflectionState(TEST_UID);
     expect(read.lastReflectedAt).toEqual({ a: 'iso' });
+  });
+});
+
+
+describe('reflection bounded busy retry', () => {
+  it('checks once after ten minutes, then skips to fourteen hours if still busy', async () => {
+    const mod = await loadModuleWithAgents([]);
+    vi.useFakeTimers({ now: Date.parse('2026-09-18T09:00:00Z'), toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    let busy = true;
+    const reflect = vi.fn(async () => 'reflected' as const);
+    const deferred = vi.fn();
+    const loop = mod.startReflectionLoop(TEST_UID, { reflect, isDirty: async () => true,
+      isIdle: () => !busy, isModelUsable: () => true, onDeferred: deferred });
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      expect(deferred).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(10 * 60 * 1000 - 1);
+      expect(deferred).toHaveBeenCalledTimes(2);
+      expect(reflect).not.toHaveBeenCalled();
+      busy = false;
+      await vi.advanceTimersByTimeAsync(14 * 3600 * 1000 - 1);
+      expect(reflect).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(reflect).toHaveBeenCalledTimes(1);
+    } finally { loop.stop(); }
+  });
+
+  it('retries an interrupted inference after ten minutes without recording a failure', async () => {
+    const mod = await loadModuleWithAgents([]);
+    const { yieldReflectionForTask } = await import('../../../src/main/features/reflection-coordination');
+    vi.useFakeTimers({ now: Date.parse('2026-09-18T09:00:00Z'), toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    let calls = 0;
+    const reflect = vi.fn(async () => {
+      if (++calls === 1) return await new Promise<never>(() => {}); // Deliberately ignores abort.
+      return 'reflected' as const;
+    });
+    const loop = mod.startReflectionLoop(TEST_UID, { reflect, isDirty: async () => true,
+      isIdle: () => true, isModelUsable: () => true });
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      expect(reflect).toHaveBeenCalledTimes(1);
+      expect(yieldReflectionForTask(TEST_UID)).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mod.readReflectionState(TEST_UID)).toEqual({ lastReflectedAt: {} });
+      await vi.advanceTimersByTimeAsync(10 * 60 * 1000 - 1);
+      expect(reflect).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(reflect).toHaveBeenCalledTimes(2);
+      expect(mod.readReflectionState(TEST_UID).lastReflectedAt[mod.DEFAULT_AGENT_ID]).toBeTruthy();
+    } finally { loop.stop(); }
+  });
+
+  it('an interruption during the one retry cannot schedule a third attempt', async () => {
+    const mod = await loadModuleWithAgents([]);
+    const { yieldReflectionForTask } = await import('../../../src/main/features/reflection-coordination');
+    vi.useFakeTimers({ now: Date.parse('2026-09-18T09:00:00Z'), toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    let idle = false;
+    const reflect = vi.fn(async () => new Promise<never>(() => {}));
+    const loop = mod.startReflectionLoop(TEST_UID, { reflect, isDirty: async () => true,
+      isIdle: () => idle, isModelUsable: () => true });
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      idle = true;
+      await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+      expect(reflect).toHaveBeenCalledTimes(1);
+      yieldReflectionForTask(TEST_UID);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(14 * 3600 * 1000 - 1);
+      expect(reflect).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(reflect).toHaveBeenCalledTimes(2);
+    } finally { loop.stop(); await vi.advanceTimersByTimeAsync(0); }
+  });
+
+  it('stopping a pending busy retry leaves no later execution', async () => {
+    const mod = await loadModuleWithAgents([]);
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    let idle = false;
+    const reflect = vi.fn();
+    const loop = mod.startReflectionLoop(TEST_UID, { reflect, isDirty: async () => true, isIdle: () => idle });
+    await vi.advanceTimersByTimeAsync(1);
+    loop.stop();
+    idle = true;
+    await vi.advanceTimersByTimeAsync(15 * 3600 * 1000);
+    expect(reflect).not.toHaveBeenCalled();
   });
 });

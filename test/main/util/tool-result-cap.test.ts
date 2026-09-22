@@ -3,8 +3,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
+import { MAX_PER_RESULT_INLINE_TOKENS, MAX_VERBATIM_DOCUMENT_INLINE_TOKENS } from '../../../src/core-agent/src/agent/context-budget';
 import {
   capToolResult,
+  ToolResultPersistenceError,
   DEFAULT_INLINE_RESULT_TOKENS,
   DEFAULT_LOCAL_TOOL_RESULTS_MAX_BYTES,
   TOOL_RESULT_REF_HASH_HEX,
@@ -15,7 +17,6 @@ import {
   estimateToolResultTokens,
   maybeSpillToolResult,
   persistToolResult,
-  sweepExpiredCloudToolResults,
   sweepToolResults,
   wrapToolWithCap,
 } from '../../../src/main/util/tool-result-cap';
@@ -34,18 +35,12 @@ const makeTmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-tool-cap-'
 const cleanup = (dir: string) => fs.rmSync(dir, { recursive: true, force: true });
 
 describe('tool-result-cap configuration', () => {
-  it('keeps the token budget at the pre-switch 50K-char equivalent', () => {
-    expect(DEFAULT_INLINE_RESULT_TOKENS).toBe(12_500);
+  it('keeps ordinary output at 10K and Skill documents at 25K', () => {
+    expect(DEFAULT_INLINE_RESULT_TOKENS).toBe(10_000);
+    expect(MAX_PER_RESULT_INLINE_TOKENS).toBe(DEFAULT_INLINE_RESULT_TOKENS);
+    expect(MAX_VERBATIM_DOCUMENT_INLINE_TOKENS).toBe(25_000);
     expect(TOOL_RESULT_REF_HASH_HEX).toBe(64);
     expect(DEFAULT_LOCAL_TOOL_RESULTS_MAX_BYTES).toBe(1024 ** 3);
-  });
-
-  // Regression: an 8K budget spilled `skill-creator` (11.1K tokens) and
-  // `agent-creator` (10.6K), so commander authored machine containers from a
-  // head/tail preview and emitted unparseable blocks. Both must stay inline.
-  it('keeps the largest system-skill protocol specs inline', () => {
-    expect(estimateToolResultTokens('a'.repeat(44_000)))
-      .toBeLessThan(DEFAULT_INLINE_RESULT_TOKENS);
   });
 
   it('counts CJK more aggressively than ASCII', () => {
@@ -94,6 +89,156 @@ describe('wrapToolWithCap', () => {
     expect(fs.readdirSync(dir)).toEqual([]);
   });
 
+  it.each([
+    ['five ordinary results', [10_000, 10_000, 10_000, 10_000, 10_000], false],
+    ['two Skill results', [25_000, 25_000], true],
+    ['eight ordinary results', [10_000, 10_000, 10_000, 10_000, 10_000, 10_000, 10_000, 10_000], false],
+    ['oversized ordinary result and an inline sibling', [50_000, 7_000], false],
+    ['oversized Skill result and an inline sibling', [50_000, 20_000], true],
+  ] as const)('delivers independent parallel allowances through the runner: %s', async (_label, sizes, skill) => {
+    const { AgentRunner } = await import('../../../src/core-agent/src/agent/runner');
+    const { createConfig } = await import('../../../src/core-agent/src/config/loader');
+    const { ProviderRegistry } = await import('../../../src/core-agent/src/providers/registry');
+    const bodies = sizes.map((tokens, i) => String.fromCharCode(97 + i).repeat(tokens * 4));
+    const requests: import('../../../src/core-agent/src/providers/base').CompletionParams[] = [];
+    const provider: import('../../../src/core-agent/src/providers/base').LLMProvider = {
+      id: 'mock', name: 'Mock',
+      async complete() { throw new Error('No summary is needed with this context headroom'); },
+      async validateAuth() { return true; },
+      async *stream(params) {
+        requests.push(params);
+        yield { type: 'message_start' };
+        yield {
+          type: 'message_end', model: 'test-window',
+          stopReason: requests.length === 1 ? 'tool_use' : 'end_turn',
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          content: requests.length === 1
+            ? bodies.map((_, i) => ({ type: 'tool_use' as const, id: `call_${i}`, name: 'sample', input: { index: i } }))
+            : [{ type: 'text', text: 'done' }],
+        };
+      },
+    };
+    const providers = new ProviderRegistry();
+    providers.registerFactory('mock', () => provider);
+    let started = 0;
+    let release!: () => void;
+    const allStarted = new Promise<void>((resolve) => { release = resolve; });
+    const results: ToolResult[] = [];
+    const runner = new AgentRunner({
+      config: createConfig({
+        agent: { defaultProvider: 'mock', defaultModel: 'test-window' },
+        models: { catalog: { 'test-window': {
+          provider: 'mock', model: 'test-window', contextWindow: 128_000, maxOutputTokens: 4_096,
+        } } },
+      }),
+      providers,
+      tools: [{
+        name: 'sample', description: 'Return a report', executionMode: 'parallel',
+        inputSchema: { type: 'object', properties: { index: { type: 'number' } } },
+        async execute(input) {
+          if (++started === bodies.length) release();
+          await allStarted;
+          return { content: bodies[Number(input.index)], ...(skill ? { verbatimDocument: true } : {}) };
+        },
+      }],
+      transformToolResult(name, raw, context) {
+        const result = capToolResult(name, raw, context, {
+          maxInlineTokens: DEFAULT_INLINE_RESULT_TOKENS, toolResultsDir: dir,
+        });
+        results.push(result);
+        return result;
+      },
+    });
+    const events = [];
+    for await (const event of runner.runStream({ message: 'Compare the reports.' })) events.push(event);
+    expect(started).toBe(bodies.length);
+    expect(requests).toHaveLength(2);
+    const delivered = requests[1].messages.flatMap((message) => message.content)
+      .filter((item) => item.type === 'tool_result');
+    expect(delivered.map((item) => item.toolUseId)).toEqual(bodies.map((_, i) => `call_${i}`));
+    for (let i = 0; i < bodies.length; i++) {
+      if (sizes[i] <= (skill ? 25_000 : 10_000)) {
+        expect(delivered[i].content).toBe(bodies[i]);
+      } else {
+        const spilled = results.find((result) => result.persistedOutput?.size === bodies[i].length)!;
+        expect(spilled.persistedOutput).toBeDefined();
+        expect(fs.readFileSync(spilled.persistedOutput!.path, 'utf8')).toBe(bodies[i]);
+        expect(delivered[i].content).toContain(spilled.persistedOutput!.ref);
+        expect(estimateToolResultTokens(delivered[i].content)).toBeLessThan(1_000);
+        expect(delivered[i].content).not.toContain(dir);
+      }
+    }
+    expect(events.filter((event) => event.type === 'done')).toHaveLength(1);
+  });
+
+  it.each([
+    [1_000_000, 128_000, 150_000],
+    [272_000, 64_000, 150_000],
+    [32_000, 4_096, 23_000],
+  ])('keeps an admitted parallel result group and prior summary compactable (%s window)', async (window, output, expectedLimit) => {
+    const { contextBudget } = await import('../../../src/core-agent/src/agent/context-budget');
+    const { calculateActiveCheckpointInputBudget, calculateToolResultInlineBudget } = await import('../../../src/core-agent/src/agent/runner');
+    const { Session } = await import('../../../src/core-agent/src/agent/session');
+    const usable = window - output;
+    const budget = contextBudget({
+      usableInputTokens: usable,
+      requestCeilingTokens: Math.floor(usable * 0.82),
+      fixedOverheadTokens: 2_000,
+      historyOccupancyTokens: 0,
+    });
+    const round = calculateToolResultInlineBudget({
+      requestTokensBeforeResults: 2_000,
+      usableInputTokens: usable,
+      toolCallCount: 2,
+    });
+    const callContext: ToolContext = { state: {
+      [TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: {
+        initialTokens: round,
+        remainingTokens: round,
+        perResultTokens: MAX_PER_RESULT_INLINE_TOKENS,
+      },
+    } };
+    const session = new Session();
+    session.beginUserTurn([{ type: 'text', text: 'Compare the two reports.' }]);
+    session.addAssistantMessage([{ type: 'tool_use', id: 'prior', name: 'read_files', input: {} }]);
+    session.addToolResult('prior', 'Prior report checked.');
+    const prior = `Prior decision retained.\n${'s'.repeat(budget.summaryTargetTokens * 4 - 100)}`;
+    session.applyActiveCheckpointSummary(prior, session.length - 1, budget.summaryHardTokens);
+    session.addAssistantMessage(['left', 'right'].map((id) => ({
+      type: 'tool_use' as const, id, name: 'read_files', input: { report: id },
+    })));
+    for (const id of ['left', 'right']) {
+      const original = `${'x'.repeat((Math.min(MAX_PER_RESULT_INLINE_TOKENS, Math.floor(round / 2)) - 30) * 4)}\nREPORT_END_${id}`;
+      const capped = capToolResult('read_files', { content: original }, callContext, {
+        maxInlineTokens: DEFAULT_INLINE_RESULT_TOKENS, toolResultsDir: dir,
+      });
+      expect(capped.persistedOutput).toBeUndefined();
+      expect(capped.content).toBe(original);
+      session.addToolResult(id, capped.content);
+    }
+    const inputLimit = calculateActiveCheckpointInputBudget(usable);
+    if (window >= 272_000) expect(inputLimit).toBe(expectedLimit);
+    else {
+      expect(inputLimit).toBeGreaterThan(20_000);
+      expect(inputLimit).toBeLessThan(expectedLimit);
+    }
+    // Force eligibility to isolate the admission/whole-group capacity contract;
+    // ordinary trigger and recent-tail selection have their own Session cases.
+    session.addAssistantMessage([{ type: 'tool_use', id: 'next', name: 'read_files', input: {} }]);
+    session.addToolResult('next', 'LATEST_RAW');
+    const selection = session.selectPendingActiveCheckpoint({
+      ...budget, activeProcessTrigger: 1, activeRetainTokens: 0,
+    }, inputLimit);
+    expect(selection.capacityIssue).toBeUndefined();
+    expect(selection.candidate?.groups).toHaveLength(1);
+    expect(selection.candidate!.inputTokens).toBeLessThanOrEqual(expectedLimit);
+    const input = JSON.stringify(selection.candidate!.messages);
+    expect(input).toContain('Prior decision retained.');
+    expect(input).toContain('REPORT_END_left');
+    expect(input).toContain('REPORT_END_right');
+    expect(input).not.toContain('LATEST_RAW');
+  });
+
   it('persists every over-budget result instead of using a truncation tier', async () => {
     const original = 'x'.repeat(10_000);
     const tool = wrapToolWithCap(stubTool('web_fetch', { content: original }), {
@@ -103,7 +248,7 @@ describe('wrapToolWithCap', () => {
     const result = await tool.execute({}, ctx);
     expect(result.content).toMatch(/^<persisted-output ref="web_fetch\.[0-9a-f]{64}"/);
     expect(result.content).toContain('tool_result');
-    expect(result.content).toContain('action="read"');
+    expect(result.content).toContain('actions="query,search,read,materialize"');
     expect(result.content).not.toContain('Use read_file(path)');
     expect(result.content).not.toContain(' path="');
     expect(result.persistedOutput).toMatchObject({
@@ -115,36 +260,33 @@ describe('wrapToolWithCap', () => {
     expect(fs.readFileSync(path.join(dir, files[0]), 'utf8')).toBe(original);
   });
 
-  it('keeps the observed agent-creator-sized read inline under the verbatim ceiling', () => {
-    // Regression from 2026-08-07: a system-skill read was ~10,940 tokens while
-    // gpt-5.6-luna derived a 7,917-token ordinary ceiling. The round still had
-    // enough room, so correct skill classification must admit the document.
-    const ledger = () => ({
-      initialTokens: 11_728,
-      remainingTokens: 11_728,
-      perResultTokens: 7_917,
-      verbatimDocumentTokens: 15_834,
-    });
-    const body = 'x'.repeat(43_760);
-    expect(estimateToolResultTokens(body)).toBe(10_940);
-
-    const spilled = capToolResult('read_file', { content: body }, {
-      ...ctx,
-      state: { [TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: ledger() },
-    } as unknown as typeof ctx, {
-      maxInlineTokens: 12_500,
-      toolResultsDir: dir,
-    });
-    expect(spilled.content).toMatch(/^<persisted-output/);
-
-    const inlined = capToolResult('read_file', { content: body, verbatimDocument: true }, {
-      ...ctx,
-      state: { [TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: ledger() },
-    } as unknown as typeof ctx, {
-      maxInlineTokens: 12_500,
-      toolResultsDir: dir,
-    });
-    expect(inlined.content).toBe(body);
+  it.each([
+    [false, 10_000, false],
+    [false, 10_001, true],
+    [false, 16_226, true],
+    [true, 16_226, false],
+    [true, 25_000, false],
+    [true, 25_001, true],
+  ])('bounds one result while preserving complete Skill reads (verbatim=%s, tokens=%s)', (verbatimDocument, tokens, shouldSpill) => {
+    // The historical 16.2K Skill must be readable whole; ordinary output of
+    // the same size must spill, even with a roomy one-million-token model.
+    const body = 'x'.repeat(tokens * 4);
+    const ledger = {
+      initialTokens: 100_000, remainingTokens: 100_000,
+      perResultTokens: MAX_PER_RESULT_INLINE_TOKENS,
+      verbatimDocumentTokens: MAX_VERBATIM_DOCUMENT_INLINE_TOKENS,
+    };
+    const result = capToolResult('read_files', { content: body, verbatimDocument }, {
+      state: { [TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: ledger },
+    }, { maxInlineTokens: DEFAULT_INLINE_RESULT_TOKENS, toolResultsDir: dir });
+    if (shouldSpill) {
+      expect(result.content).toMatch(/^<persisted-output/);
+      expect(fs.readFileSync(result.persistedOutput!.path, 'utf8')).toBe(body);
+    } else {
+      expect(result.content).toBe(body);
+      expect(result.persistedOutput).toBeUndefined();
+      expect(ledger.remainingTokens).toBe(100_000 - tokens);
+    }
   });
 
   it('still charges a verbatim document to the round ledger', () => {
@@ -181,9 +323,7 @@ describe('wrapToolWithCap', () => {
   });
 
   it('keeps the caller default when no budget was resolved', () => {
-    // Unknown model, reflection, one-shots: there is no window to derive from,
-    // so behaviour must be exactly what it was before the derivation existed —
-    // including for a verbatim document, which gets no invented multiple.
+    // Standalone callers without a runner ledger retain their explicit cap.
     const body = 'x'.repeat(2_400);
     const plain = capToolResult('read_file', { content: body }, ctx, {
       maxInlineTokens: 1_000,
@@ -202,16 +342,14 @@ describe('wrapToolWithCap', () => {
   it('marks persistence failure as an error without leaking the backing path', async () => {
     const blockedDir = path.join(dir, 'not-a-directory');
     fs.writeFileSync(blockedDir, 'block mkdir');
-    const result = capToolResult('bash', { content: 'x'.repeat(10_000) }, ctx, {
-      maxInlineTokens: 1_000,
-      toolResultsDir: blockedDir,
+    const save = () => capToolResult('bash', { content: 'x'.repeat(10_000) }, ctx, {
+      maxInlineTokens: 1_000, toolResultsDir: blockedDir,
     });
-
-    expect(result.isError).toBe(true);
-    expect(result.persistedOutput).toBeUndefined();
-    expect(result.content).toContain('oversized output persistence failed');
-    expect(result.content).toContain('full output was not preserved');
-    expect(result.content).not.toContain(blockedDir);
+    expect(save).toThrow(ToolResultPersistenceError);
+    try { save(); } catch (err) {
+      expect((err as Error).message).not.toContain(blockedDir);
+      expect((err as Error).message).toContain('tool executed');
+    }
   });
 
   it('uses the token estimate for CJK spill decisions', async () => {
@@ -225,17 +363,9 @@ describe('wrapToolWithCap', () => {
 
   it('persists oversized error output and preserves the error flag', async () => {
     const original = 'error\n'.repeat(2_000);
-    const failureContext = {
-      kind: 'deterministic_validation' as const,
-      scope: 'project:stable-id',
-      complete: true,
-      issueCount: 80,
-      issueCodes: ['E_FIRST', 'E_SECOND'],
-    };
     const tool = wrapToolWithCap(stubTool('bash', {
       content: original,
       isError: true,
-      failureContext,
       observations: { fileFailure: { code: "E_NO_MATCH", reason: "no_match", match_count: 0 } },
     }), {
       maxInlineTokens: 200,
@@ -243,7 +373,6 @@ describe('wrapToolWithCap', () => {
     });
     const result = await tool.execute({}, ctx);
     expect(result.isError).toBe(true);
-    expect(result.failureContext).toEqual(failureContext);
     expect(result.observations?.fileFailure).toEqual({ code: "E_NO_MATCH", reason: "no_match", match_count: 0 });
     expect(result.content).not.toContain("fileFailure");
     expect(result.content).toContain('status="error"');
@@ -254,8 +383,13 @@ describe('wrapToolWithCap', () => {
     const image = { data: 'Zm9v', mediaType: 'image/jpeg' };
     const base = stubTool('web_fetch', { content: 'x'.repeat(5_000), images: [image] });
     base.executionMode = 'parallel';
+    const parallelWhen = (input: Record<string, unknown>) => input.ro === true;
+    (base as { parallelWhen?: typeof parallelWhen }).parallelWhen = parallelWhen;
     const tool = wrapToolWithCap(base, { maxInlineTokens: 100, toolResultsDir: dir });
     expect(tool.executionMode).toBe('parallel');
+    // Dropping the refinement would silently widen a read-only-only shell to
+    // unconditional concurrency; the wrapper must carry it with the mode.
+    expect(tool.parallelWhen).toBe(parallelWhen);
     expect((await tool.execute({}, ctx)).images).toEqual([image]);
   });
 
@@ -298,16 +432,11 @@ describe('wrapToolWithCap', () => {
     const source = path.join(outsideDir, '.outside.spool');
     fs.writeFileSync(source, 'outside');
     try {
-      const result = capToolResult('bash', {
-        content: 'safe preview',
-        streamedOutput: { path: source, size: 7 },
+      const save = () => capToolResult('bash', {
+        content: 'safe preview', streamedOutput: { path: source, size: 7 },
       }, ctx, { maxInlineTokens: 8_000, toolResultsDir: dir });
-
-      expect(result.isError).toBe(true);
-      expect(result.streamedOutput).toBeUndefined();
-      expect(result.persistedOutput).toBeUndefined();
-      expect(result.content).toContain('streamed output adoption failed');
-      expect(result.content).not.toContain(source);
+      expect(save).toThrow(ToolResultPersistenceError);
+      try { save(); } catch (err) { expect((err as Error).message).not.toContain(source); }
       expect(fs.readFileSync(source, 'utf8')).toBe('outside');
     } finally {
       cleanup(outsideDir);
@@ -474,8 +603,6 @@ describe('persisted result helpers', () => {
     expect(marker).toContain('actions="query,search,read,materialize"');
     expect(marker).toContain('query operations=count,sum,average,minimum,maximum');
     expect(marker).toContain('omit match/count_unit for structured data');
-    expect(marker).toContain('Make at most one tool_result call in the next model step');
-    expect(marker).toContain('batch same-action requests in one requests array');
     expect(marker).toContain('data{records=2;fields=');
     expect(marker).toContain('amount:number');
     expect(marker).toContain('nested.region:string');
@@ -517,8 +644,6 @@ describe('persisted result helpers', () => {
     expect(marker).toContain('data_type="text"');
     expect(marker).toContain('actions="query,search,read,materialize"');
     expect(marker).toContain('query supports exact count only with match + count_unit');
-    expect(marker).toContain('Make at most one tool_result call in the next model step');
-    expect(marker).toContain('batch same-action requests in one requests array');
     expect(marker).toContain('lines=3');
   });
 
@@ -707,79 +832,5 @@ describe('sweepToolResults', () => {
     expect(fs.existsSync(middle)).toBe(true);
     expect(fs.existsSync(newest)).toBe(true);
     expect(stats).toMatchObject({ removedStale: 0, removedForQuota: 1, retainedBytes: 24 });
-  });
-});
-
-describe('sweepExpiredCloudToolResults', () => {
-  let dir: string;
-  beforeEach(() => { dir = makeTmpDir(); });
-  afterEach(() => cleanup(dir));
-
-  const daysAgoSec = (days: number) => (Date.now() - days * 24 * 60 * 60 * 1_000) / 1_000;
-  const spillDir = (name: string) => {
-    const abs = path.join(dir, name);
-    fs.mkdirSync(abs, { recursive: true });
-    return abs;
-  };
-  const spillFile = (parent: string, name: string, ageDays: number) => {
-    const abs = path.join(parent, name);
-    fs.writeFileSync(abs, name);
-    const t = daysAgoSec(ageDays);
-    fs.utimesSync(abs, t, t);
-    return abs;
-  };
-
-  it('expires old files, keeps fresh ones, and removes only emptied dirs', () => {
-    const emptied = spillDir('gconv-a.tool-results');
-    const mixed = spillDir('gconv-b.tool-results');
-    const oldA = spillFile(emptied, 'bash.a1.txt', 40);
-    const oldB = spillFile(mixed, 'web_fetch.b1.txt', 31);
-    const fresh = spillFile(mixed, 'web_fetch.b2.txt', 1);
-
-    const stats = sweepExpiredCloudToolResults([emptied, mixed]);
-
-    expect(fs.existsSync(oldA)).toBe(false);
-    expect(fs.existsSync(oldB)).toBe(false);
-    expect(fs.existsSync(fresh)).toBe(true);
-    expect(fs.existsSync(emptied)).toBe(false);
-    expect(fs.existsSync(mixed)).toBe(true);
-    expect(stats).toEqual({ removedFiles: 2, removedDirs: 1, truncated: false });
-  });
-
-  it('spends the deletion budget oldest-first across dirs and reports truncation', () => {
-    const a = spillDir('gconv-a.tool-results');
-    const b = spillDir('gconv-b.tool-results');
-    const oldest = spillFile(b, 'bash.oldest.txt', 90);
-    const middle = spillFile(a, 'bash.middle.txt', 60);
-    const newerExpired = spillFile(a, 'bash.newer.txt', 35);
-
-    const stats = sweepExpiredCloudToolResults([a, b], 30, 2);
-
-    expect(fs.existsSync(oldest)).toBe(false);
-    expect(fs.existsSync(middle)).toBe(false);
-    expect(fs.existsSync(newerExpired)).toBe(true);
-    expect(stats).toEqual({ removedFiles: 2, removedDirs: 1, truncated: true });
-  });
-
-  it('tolerates missing dirs', () => {
-    expect(sweepExpiredCloudToolResults([path.join(dir, 'absent.tool-results')]))
-      .toEqual({ removedFiles: 0, removedDirs: 0, truncated: false });
-  });
-
-  it('never follows or deletes symlink entries', () => {
-    const spill = spillDir('gconv-a.tool-results');
-    const outside = path.join(dir, 'outside.txt');
-    fs.writeFileSync(outside, 'target');
-    const t = daysAgoSec(90);
-    fs.utimesSync(outside, t, t);
-    const link = path.join(spill, 'bash.link.txt');
-    fs.symlinkSync(outside, link);
-    // lutimes is not portable; the dirent type gate must skip the link even
-    // though its target is long expired.
-    const stats = sweepExpiredCloudToolResults([spill]);
-
-    expect(fs.existsSync(outside)).toBe(true);
-    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
-    expect(stats).toEqual({ removedFiles: 0, removedDirs: 0, truncated: false });
   });
 });

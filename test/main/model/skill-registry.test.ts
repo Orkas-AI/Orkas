@@ -1,8 +1,15 @@
+import { estimateBudgetTokens } from '../../../src/main/util/token-estimate';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { SKILL_ROSTER_MAX_CHARS } from '../../../src/main/util/skill-description-policy';
+import { SKILL_ROSTER_MAX_TOKENS } from '../../../src/main/util/skill-description-policy';
+
+// These registry cases own filesystem fixtures, not asynchronous log delivery.
+// Keep the logger worker from recreating their root during teardown.
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
 
 // skill-registry.ts wraps core-agent's SkillLoader. To test allowlist
 // filtering without pulling in the real core-agent import, we write fake
@@ -93,6 +100,125 @@ afterEach(() => {
 async function loadRegistry() {
   return import('../../../src/main/model/core-agent/skill-registry');
 }
+
+describe('Agent authoring Skill candidates', () => {
+  it('advertises all packaged shared and System descriptions once without loading bodies', async () => {
+    const packaged = path.resolve(__dirname, '../../../resources/builtin');
+    const { SkillLoader } = await import('../../../src/core-agent/src/skills/loader');
+    const specs = [];
+    for (const [tier, destination] of [['system', systemDir()], ['marketplace', builtinDir()]]) {
+      const source = path.join(packaged, tier, 'skills');
+      const loaded = new SkillLoader({ dirs: [source] }).list();
+      specs.push(...loaded);
+      for (const spec of loaded) {
+        const dir = path.join(destination, spec.id);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.copyFileSync(path.join(spec.dir, 'SKILL.md'), path.join(dir, 'SKILL.md'));
+        fs.writeFileSync(path.join(dir, '_install.json'), JSON.stringify({ seed_source: 'builtin' }));
+      }
+    }
+    expect(specs.length).toBeGreaterThan(0);
+    const registry = await loadRegistry();
+    const bindings = new Map<string, import('../../../src/main/model/core-agent/skill-registry').SkillRuntimeBinding>();
+    const system = await registry.getSystemSkillsPromptBlock(TEST_UID, bindings);
+    const shared = await registry.getSystemPromptBlock({ runtimeBindings: bindings, includeSkillSearchHint: true });
+    const block = `${system}\n\n${shared}`;
+    expect(new Set([...bindings.values()].map(binding => binding.entry)).size).toBe(specs.length);
+    for (const spec of specs) {
+      expect(block.split(spec.description_en)).toHaveLength(2);
+      expect(block).not.toContain(spec.description_zh);
+      expect(block).toContain(`**${spec.name}**`);
+      const body = fs.readFileSync(spec.skillFile, 'utf8').replace(/^---\n[\s\S]*?\n---\n/, '').trim();
+      expect(body).not.toBe('');
+      expect(block).not.toContain(body);
+    }
+    console.info('Packaged Skill roster characters', JSON.stringify({ system: system.length, shared: shared.length, combined: block.length }));
+  });
+
+  it('uses enabled target bindings and provenance rather than copying System names or aliases', async () => {
+    writeSkill(systemDir(), 'package-installer', 'package-installer', 'System installation protocol');
+    writeSkill(customDir(), 'shared-copy', 'package-installer', 'An independent shared helper');
+    writeSkill(customDir(), 'disabled-helper', 'disabled-helper', 'Disabled helper');
+    writeSkill(customDir(), 'foreign-helper', 'foreign-helper', 'Foreign helper');
+    fs.writeFileSync(path.join(customDir(), 'foreign-helper', 'SKILL.md'),
+      '---\nname: foreign-helper\ndescription: Foreign helper\nownerAgent: another-agent\n---\nbody');
+    writeSkill(agentPrivateDir('target'), 'own-helper', 'own-helper', 'Owned helper');
+    const registry = await loadRegistry();
+    const bindings = new Map<string, import('../../../src/main/model/core-agent/skill-registry').SkillRuntimeBinding>();
+    await registry.getSystemSkillsPromptBlock(TEST_UID, bindings);
+    await registry.getSystemPromptBlock({ agentId: 'target',
+      allowlist: ['shared-copy', 'disabled-helper', 'foreign-helper'],
+      disabledIds: ['disabled-helper'], runtimeBindings: bindings });
+    for (const source of ['external', 'global', 'unknown']) {
+      registry.bindRuntimeSkillTarget({ id: `${source}-helper`, name: `${source}-helper`,
+        source, root: path.join(tmpDir, source), entry: path.join(tmpDir, source, 'SKILL.md') }, bindings);
+    }
+    const before = bindings.size;
+    const directory = registry.getAgentSkillDependenciesPromptBlock(bindings);
+    expect(directory).toContain('**package-installer** (read ref: @skill/shared-copy)');
+    expect(directory).not.toContain('@skill/package-installer');
+    expect(directory).toContain('own-helper');
+    expect(directory).not.toContain('disabled-helper');
+    expect(directory).not.toContain('foreign-helper');
+    for (const source of ['external', 'global', 'unknown']) expect(directory).not.toContain(`${source}-helper`);
+    expect(directory.match(/\*\*package-installer\*\*/g)).toHaveLength(1);
+    expect(bindings.size).toBe(before);
+    expect(bindings.get('package-installer')!.source).toBe('system');
+  });
+
+  it('keeps a compact bounded candidate directory and explicitly represents no dependencies', async () => {
+    const registry = await loadRegistry();
+    expect(registry.getAgentSkillDependenciesPromptBlock(new Map())).toContain('(none)');
+    for (let i = 0; i < 300; i++) {
+      writeSkill(customDir(), `helper-${i}`, `helper-${i}`, 'Shared helper for authored workflows.');
+    }
+    const bindings = new Map<string, import('../../../src/main/model/core-agent/skill-registry').SkillRuntimeBinding>();
+    await registry.getSystemPromptBlock({ runtimeBindings: bindings });
+    const directory = registry.getAgentSkillDependenciesPromptBlock(bindings);
+    expect(directory).toContain('helper-0');
+    expect(estimateBudgetTokens(directory)).toBeLessThanOrEqual(SKILL_ROSTER_MAX_TOKENS);
+    expect(directory).not.toContain(tmpDir);
+  });
+});
+
+describe('CLI private Skill ownership', () => {
+  it('gives SDK guidance System precedence without exposing other System protocols or other accounts', async () => {
+    writeSkill(systemDir(), 'web-app-sdk', 'web-app-sdk', 'Build Orkas apps');
+    writeSkill(systemDir(), 'skill-creator', 'skill-creator', 'Mutate Skills');
+    writeSkill(systemDir(), 'orkas-guide', 'orkas-guide', 'Product guide');
+    writeSkill(customDir(), 'web-app-sdk', 'forged-sdk', 'Shadow by id');
+    writeSkill(customDir(), 'shadow', 'web-app-sdk', 'Shadow by name');
+    const registry = await loadRegistry();
+    const rows = await registry.listSkillsForBridge(TEST_UID, 'agent-a');
+    expect(rows.map(s => ({id:s.id,source:s.source}))).toEqual([{id:'web-app-sdk',source:'system'}]);
+    expect(rows[0].skillFile).toBe(path.join(systemDir(), 'web-app-sdk', 'SKILL.md'));
+    expect(await registry.listSkillsForBridge('other-account', 'agent-a')).toEqual([]);
+    expect(await registry.getSystemPromptBlock()).not.toContain('Build Orkas apps');
+  });
+  it('includes only the bound Agent private, installed and learned Skills without changing public discovery', async () => {
+    writeSkill(customDir(), 'shared', 'shared', 'shared helper');
+    writeSkill(agentPrivateDir('agent-a'), 'private-a', 'private-a', 'private helper');
+    writeSkill(agentEvolvedDir('agent-a'), 'learned-a', 'learned-a', 'learned helper');
+    writeSkill(path.join(tmpDir, TEST_UID, 'local', 'marketplace', 'agents', 'agent-a', 'skills'), 'installed-a', 'installed-a', 'installed helper');
+    writeSkill(agentPrivateDir('agent-b'), 'private-b', 'private-b', 'foreign helper');
+    writeSkill(agentPrivateDir('agent-a'), 'forged', 'forged', 'wrong owner');
+    const forgedFile = path.join(agentPrivateDir('agent-a'), 'forged', 'SKILL.md');
+    fs.writeFileSync(forgedFile, '---\nname: forged\ndescription: wrong owner\nownerAgent: agent-b\n---\nFOREIGN');
+    fs.symlinkSync(path.join(agentPrivateDir('agent-b'), 'private-b'), path.join(agentPrivateDir('agent-a'), 'borrowed-package'), 'dir');
+    fs.mkdirSync(path.join(agentPrivateDir('agent-a'), 'borrowed-entry'));
+    fs.symlinkSync(path.join(agentPrivateDir('agent-b'), 'private-b', 'SKILL.md'), path.join(agentPrivateDir('agent-a'), 'borrowed-entry', 'SKILL.md'));
+    const registry = await loadRegistry();
+    const mine = await registry.listSkillsForBridge(TEST_UID, 'agent-a');
+    expect(mine.map((s) => s.id).sort()).toEqual(['installed-a', 'learned-a', 'private-a', 'shared']);
+    expect(mine.filter((s) => s.id !== 'shared').every((s) => s.source === 'agent')).toBe(true);
+    expect((await registry.listSkillsForBridge(TEST_UID)).map((s) => s.id)).toEqual(['shared']);
+    expect((await registry.listSkillsForBridge(TEST_UID, 'agent-b')).map((s) => s.id).sort()).toEqual(['private-b', 'shared']);
+    expect((await registry.listSkillsForBridge('other-account', 'agent-a')).map((s) => s.id)).toEqual([]);
+    fs.mkdirSync(path.dirname(agentPrivateDir('agent-c')), { recursive: true });
+    fs.symlinkSync(agentPrivateDir('agent-b'), agentPrivateDir('agent-c'), 'dir');
+    expect((await registry.listSkillsForBridge(TEST_UID, 'agent-c')).map((s) => s.id)).toEqual(['shared']);
+  });
+});
 
 describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
   it('returns full listing when allowlist is undefined (legacy behavior)', async () => {
@@ -261,7 +387,7 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     const { getSystemPromptBlock } = await loadRegistry();
     const text = await getSystemPromptBlock({ runtimeBindings: new Map() });
 
-    expect(text.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect(estimateBudgetTokens(text)).toBeLessThanOrEqual(SKILL_ROSTER_MAX_TOKENS);
     expect((text.match(/^- \*\*/gm) || [])).toHaveLength(60);
     expect(text).toContain('small-59');
   });
@@ -281,7 +407,7 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
       forceOpenSkillRefs: [{ id: 'custom-24', source: 'custom' }],
     });
 
-    expect(text.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect(estimateBudgetTokens(text)).toBeLessThanOrEqual(SKILL_ROSTER_MAX_TOKENS);
     expect(text).toContain('BUILTIN-FULL');
     expect(text).toContain('CUSTOM-DETAIL-24');
     // Gradual compaction: the top-ranked searchable rows (platform before
@@ -311,7 +437,7 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     for (let i = 4; i < 40; i += 1) writeSkill(customDir(), `custom-${i}`, `Custom ${i}`, detail(`CUSTOM-DETAIL-${i}`));
     const { getSystemPromptBlock: reloaded } = await loadRegistry();
     const crowded = await reloaded({ runtimeBindings: new Map(), includeSkillSearchHint: true });
-    expect(crowded.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect(estimateBudgetTokens(crowded)).toBeLessThanOrEqual(SKILL_ROSTER_MAX_TOKENS);
     expect(crowded).toContain('BUILTIN-FULL');
     // Every name still fits, so names are kept first; the first-ranked rows
     // keep their detail and only the tail degrades to name-only rows.
@@ -345,7 +471,7 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     });
     const boundIds = new Set([...runtimeBindings.values()].map((binding) => binding.id));
 
-    expect(text.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect(estimateBudgetTokens(text)).toBeLessThanOrEqual(SKILL_ROSTER_MAX_TOKENS);
     expect(platformIds.every((id) => boundIds.has(id))).toBe(true);
     expect(customIds.some((id) => boundIds.has(id))).toBe(true);
     expect(customIds.some((id) => !boundIds.has(id))).toBe(true);
@@ -367,7 +493,7 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
       runtimeBindings: new Map(),
     });
 
-    expect(text.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect(estimateBudgetTokens(text)).toBeLessThanOrEqual(SKILL_ROSTER_MAX_TOKENS);
     expect(text).toContain('PRIVATE-FULL');
     expect(text).toContain('Shared 0');
     // Gradual compaction keeps the first-ranked shared descriptions and
@@ -399,7 +525,7 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     const boundIds = new Set([...runtimeBindings.values()].map((binding) => binding.id));
     const omitted = ids.find((id) => !boundIds.has(id));
 
-    expect(text.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect(estimateBudgetTokens(text)).toBeLessThanOrEqual(SKILL_ROSTER_MAX_TOKENS);
     expect(omitted).toBeTruthy();
     expect(text).not.toContain(omitted!);
     expect(advertised).not.toContain(omitted!);
@@ -680,8 +806,12 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
     expect(systemText).toContain('Before answering or calling another tool');
     expect(systemText).toContain('read the smallest complete set whose use conditions apply');
     expect(systemText).toContain('never load nonmatches.');
-    expect(systemText).toContain('Read 2+ matches together first:');
-    expect(systemText).toContain('read_files({"paths"');
+    expect(systemText).toContain('Read all matches together in one call (one path entry per match):');
+    const examples = [...systemText.matchAll(/`read_files\((\{[^\n]+\})\)`/g)];
+    expect(examples).toHaveLength(1);
+    expect(JSON.parse(examples[0][1])).toEqual({
+      paths: [{ path: '<SYSTEM_SKILLS_ROOT>/<id>/SKILL.md' }],
+    });
     expect(systemText).toContain('Load only system SKILL.md files in that call');
     expect(systemText).toContain('read attachments and other task sources afterward.');
     expect(systemText).toContain('**agent-creator**');
@@ -734,14 +864,27 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
     expect(projectText).toContain('**fixture-backlog-guide**');
   });
 
-  it('registers system skills in the same run-scoped logical namespace', async () => {
+  it.each([1, 2])('uses one valid read example while binding %i system skills in the same run-scoped namespace', async (count) => {
     writeSkill(systemDir(), 'agent-creator', 'agent-creator', 'Create agents');
+    if (count === 2) writeSkill(systemDir(), 'skill-creator', 'skill-creator', 'Create skills');
     const runtimeBindings = new Map();
     const { getSystemSkillsPromptBlock } = await loadRegistry();
     const text = await getSystemSkillsPromptBlock(undefined, runtimeBindings);
 
-    expect(text).toContain('read_files({"paths":[{"path":"@skill/<read-ref>"}]})');
-    expect(text).toContain('read_files({"paths":[{"path":"@skill/<read-ref-1>"}');
+    // One JSON-shaped example works for both cardinalities; prose explicitly
+    // requires a single batch rather than a separate call for each match.
+    expect(text).toContain('Read all matches together in one call (one path entry per match):');
+    expect(text).toContain('using the exact read refs on matching entries');
+    const examples = [...text.matchAll(/`read_files\((\{[^\n]+\})\)`/g)];
+    expect(examples).toHaveLength(1);
+    expect(JSON.parse(examples[0][1])).toEqual({ paths: [{ path: '@skill/<read-ref>' }] });
+    expect(runtimeBindings.size).toBe(count);
+    if (count === 2) {
+      expect(text).toContain('read ref: @skill/skill-creator');
+      expect(runtimeBindings.get('skill-creator')).toMatchObject({
+        id: 'skill-creator', source: 'system', root: path.join(path.resolve(systemDir()), 'skill-creator'),
+      });
+    }
     expect(text).toContain('read ref: @skill/agent-creator');
     expect(text).not.toContain('SYSTEM_SKILLS_ROOT');
     expect(runtimeBindings.get('agent-creator')).toMatchObject({
@@ -819,21 +962,47 @@ describe('skill-registry › compactPromptDescription', () => {
     const { compactPromptDescription } = await loadRegistry();
     const long = '短。' + '这是一段没有触发段的很长描述内容用来测试上限。'.repeat(40);
     const out = compactPromptDescription(long);
-    expect(out.length).toBeLessThanOrEqual(512);
+    expect(estimateBudgetTokens(out)).toBeLessThanOrEqual(200);
     expect(out.endsWith('…')).toBe(true);
   });
 
   it('caps a long substantive summary instead of bypassing the ceiling', async () => {
     const { compactPromptDescription } = await loadRegistry();
-    const exact = 'x'.repeat(512);
-    const over = 'x'.repeat(513);
+    const exact = 'x'.repeat(800);
+    const over = 'x'.repeat(801);
 
     expect(compactPromptDescription(exact)).toBe(exact);
-    expect(compactPromptDescription(over)).toHaveLength(512);
+    expect(compactPromptDescription(over)).toBe(`${'x'.repeat(799)}…`);
     expect(compactPromptDescription(over).endsWith('…')).toBe(true);
 
-    const emojiAtBoundary = `${'x'.repeat(510)}🙂tail`;
-    expect(compactPromptDescription(emojiAtBoundary)).toBe(`${'x'.repeat(510)}…`);
+    const emojiAtBoundary = `${'x'.repeat(798)}🙂tail`;
+    expect(compactPromptDescription(emojiAtBoundary)).toBe(`${'x'.repeat(798)}…`);
+  });
+
+  it('caps discovery surfaces without changing files or search over the omitted tail', async () => {
+    const registry = await loadRegistry();
+    const description = `${'x'.repeat(800)} tailkeyword`;
+    writeSkill(customDir(), 'long-description', 'long-description', description);
+    writeSkill(systemDir(), 'system-description', 'system-description', description);
+    const files = [
+      path.join(customDir(), 'long-description', 'SKILL.md'),
+      path.join(systemDir(), 'system-description', 'SKILL.md'),
+    ];
+    const originals = files.map(file => fs.readFileSync(file, 'utf8'));
+    const visible = `${'x'.repeat(799)}…`;
+    const regular = await registry.getSystemPromptBlock();
+    const system = await registry.getSystemSkillsPromptBlock(TEST_UID);
+    for (const block of [regular, system]) {
+      expect(block).toContain(visible);
+      expect(block).not.toContain('tailkeyword');
+    }
+    const bridge = await registry.listSkillsForBridge(TEST_UID);
+    expect(bridge.find(row => row.id === 'long-description')?.description).toBe(visible);
+    // Search still indexes the full source, even though its returned row is capped.
+    const search = await registry.searchAvailableSkills(TEST_UID, 'tailkeyword');
+    expect(search.rows.map(row => row.id)).toEqual(['long-description']);
+    expect(search.rows[0].description).toBe(visible);
+    expect(files.map(file => fs.readFileSync(file, 'utf8'))).toEqual(originals);
   });
 
   it('returns empty string for empty/whitespace input', async () => {

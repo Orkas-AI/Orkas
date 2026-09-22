@@ -135,7 +135,21 @@ export async function loadImageReferenceBuffersWithProgress(
   const out: Buffer[] = [];
   let index = 0;
   const total = urls.filter(Boolean).length + paths.filter(Boolean).length;
-  for (const url of urls.map(normalizeUrl).filter(Boolean)) {
+  // Validate URLs before I/O, then preserve the public reference-binding order.
+  const referenceUrls = urls.map(normalizeUrl).filter(Boolean);
+  for (const localPath of paths.map(normalizePath).filter(Boolean)) {
+    index += 1;
+    throwIfAborted(opts.signal);
+    emitProgress(opts.onProgress, 'reference_load', `Loading reference image ${index}/${total}`, {
+      kind: 'image',
+      index,
+      total,
+    });
+    const buf = await fs.readFile(localPath);
+    throwIfAborted(opts.signal);
+    out.push(buf);
+  }
+  for (const url of referenceUrls) {
     index += 1;
     throwIfAborted(opts.signal);
     if (url.toLowerCase().startsWith('asset://')) {
@@ -166,18 +180,6 @@ export async function loadImageReferenceBuffersWithProgress(
     } finally {
       composed.cleanup();
     }
-    throwIfAborted(opts.signal);
-    out.push(buf);
-  }
-  for (const localPath of paths.map(normalizePath).filter(Boolean)) {
-    index += 1;
-    throwIfAborted(opts.signal);
-    emitProgress(opts.onProgress, 'reference_load', `Loading reference image ${index}/${total}`, {
-      kind: 'image',
-      index,
-      total,
-    });
-    const buf = await fs.readFile(localPath);
     throwIfAborted(opts.signal);
     out.push(buf);
   }

@@ -11,7 +11,8 @@ const CONNECTION_ID = process.env.COMPOSIO_CONNECTION_ID || '';
 const CONNECTION_TOKEN = process.env.COMPOSIO_CONNECTION_TOKEN || '';
 const CONNECTOR_ID = process.env.COMPOSIO_CONNECTOR_ID || '';
 const TOOLS_REQUEST_TIMEOUT_MS = 25000;
-const EXECUTE_REQUEST_TIMEOUT_MS = 100000;
+// Leave ten seconds for forwarding the terminal result before the host's 600s deadline.
+const EXECUTE_REQUEST_TIMEOUT_MS = 590000;
 const CREDIT_CONTEXT_ARG = '__orkas_credit_context';
 
 class OrkasProxyResponseError extends Error {
@@ -75,7 +76,7 @@ function boundedErrorCode(value) {
   return /^[A-Za-z0-9_.:-]{1,80}$/.test(code) ? code : 'connector_proxy_failed';
 }
 
-async function orkasRequest(path, body, timeoutMs) {
+async function orkasRequest(path, body, timeoutMs, signal) {
   assertConfigured();
   const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
@@ -112,7 +113,7 @@ async function orkasRequest(path, body, timeoutMs) {
   return payload;
 }
 
-async function callComposioTool(name, value, request = orkasRequest) {
+async function callComposioTool(name, value, request = orkasRequest, signal) {
   const { args, creditContextBody } = splitComposioToolArguments(value);
   try {
     const body = await request('/connectors/composio/execute', {

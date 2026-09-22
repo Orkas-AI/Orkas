@@ -33,9 +33,9 @@ class FakeNode {
   style: Record<string, string> = {};
   className = 'chat-message assistant';
   children: FakeNode[] = [];
-  bodies: Record<string, { children: unknown[]; textContent: string }> = {
-    process: { children: [], textContent: '' },
-    final: { children: [], textContent: '' },
+  bodies: Record<string, { children: unknown[]; textContent: string; replaceChildren(): void }> = {
+    process: { children: [], textContent: '', replaceChildren() { this.children = []; this.textContent = ''; } },
+    final: { children: [], textContent: '', replaceChildren() { this.children = []; this.textContent = ''; } },
   };
 
   querySelector(selector: string) {
@@ -53,6 +53,14 @@ class FakeNode {
 
 class FakeContainer {
   rows: FakeNode[] = [];
+  dataset: Record<string, string> = {};
+  classList = { remove() {} };
+  style = { removeProperty() {} };
+
+  set innerHTML(_value: string) {
+    for (const row of this.rows) row.parentElement = null;
+    this.rows = [];
+  }
 
   appendChild(node: FakeNode) {
     node.parentElement = this as any;
@@ -87,6 +95,7 @@ class FakeContainer {
     const msgId = selector.match(/data-msg-id="([^"]+)"/)?.[1];
     const actor = selector.match(/data-from-actor="([^"]+)"/)?.[1];
     const wantsNoMsgId = selector.includes(':not([data-msg-id])');
+    if (!selector.startsWith('.chat-message')) return [];
     return this.rows.filter((row) => {
       if (exactKey && row.dataset.renderKey !== exactKey) return false;
       if (prefixKey && !(row.dataset.renderKey || '').startsWith(prefixKey)) return false;
@@ -156,11 +165,11 @@ function loadRenderer(cid: string) {
       container.appendChild(node);
       return node;
     };
-    appendChatMessage = function(legacy) {
+    appendChatMessage = function(legacy, _scroll, opts = {}) {
       // Mirrors production's dedupe entry: identity first, create only when the
       // record has no row yet. Uses the REAL matcher so these tests exercise
       // render-key identity rather than a simplified stand-in.
-      var existing = _findRenderedGroupMessage(__container, legacy);
+      var existing = opts.historyHydration ? null : _findRenderedGroupMessage(__container, legacy);
       if (existing) {
         _syncRenderedGroupMessageIdentity(existing, legacy);
         return existing;
@@ -170,7 +179,19 @@ function loadRenderer(cid: string) {
       node.dataset.msgId = String(legacy._msg_id || '');
       if (legacy._render_key) node.dataset.renderKey = String(legacy._render_key);
       if (legacy._from) node.dataset.fromActor = String(legacy._from);
-      __container.appendChild(node);
+      // Production sets this too; cross-page absorb finds a turn's bubble by it.
+      if (legacy._turn_id) node.dataset.turnId = String(legacy._turn_id);
+      node.bodies.final.textContent = legacy.content || '';
+      node.message = legacy;
+      // Mirror production's narration hydration (conversation.js, assistant
+      // branch) so a merged record's earlier segments reach the row.
+      if (legacy._narration && legacy._narration.length) {
+        for (var i = 0; i < legacy._narration.length; i++) {
+          _appendNarrationBlock(node, legacy._narration[i].seg, legacy._narration[i].text, { deferFold: true });
+        }
+        _applyNarrationFold(node);
+      }
+      (opts.container || __container).appendChild(node);
       return node;
     };
     _finalizeActorPlaceholder = function(node, gm) {
@@ -237,6 +258,81 @@ describe('keyed rendering › reconnect history', () => {
   });
 });
 
+describe('history refresh overlapping a Codex handback', () => {
+  it.each([
+    { included: false, superseded: false },
+    { included: true, superseded: false },
+    { included: true, superseded: true },
+  ])('keeps the completed reply through stale active history and stream cleanup ($included, $superseded)', async ({ included, superseded }) => {
+    const { context, container } = loadRenderer(CID);
+    const warnings: unknown[] = [];
+    context.__warnings = warnings;
+    vm.runInContext('_convLog.warn = (...args) => __warnings.push(args)', context);
+    context.performance = performance;
+    context.convAgentEnabledByCid = new Map();
+    context.pollMsgCounts = new Map();
+    context._agentsCache = [];
+    context.document.createDocumentFragment = () => new FakeContainer();
+    const append = container.appendChild.bind(container);
+    container.appendChild = (node: any) => {
+      if (node instanceof FakeContainer) {
+        for (const row of [...node.rows]) append(row);
+        return node;
+      }
+      return append(node);
+    };
+    for (const name of ['_setChatScrollOffset', '_ensureCreateAgentInlineObserver',
+      '_ensureConvCreateAgentInline', '_syncFailedFromHistory',
+      '_setLoadEarlierHistory', '_scheduleConversationTurnNavigation', '_renderConvDisabledBanner',
+      '_scrollToBottomNoAnim', '_observeConversationRunFromPlanAction', '_startRuntimeActorRecovery']) {
+      context[name] = () => {};
+    }
+    let resolveHistory!: (value: any) => void;
+    context.apiFetch = () => new Promise(resolve => { resolveHistory = resolve; });
+    const loading = context.loadConversationHistory(CID);
+    const reply = { id: 'codex-result', from: 'codex-agent', to: ['user'], turn_id: TURN,
+      seg: 0, text: 'Changes saved; Commander will update the automation.',
+      ts: new Date().toISOString(), produced: ['result.md'] };
+    context._handleGroupBusEvent(CID, null, { type: 'message', turn_end: true, msg: reply });
+    const finishOlder = resolveHistory;
+    const replacement = superseded ? context.loadConversationHistory(CID) : null;
+    // The history request began before Codex settled; its snapshot still lists
+    // that turn as active even though the terminal event has already arrived.
+    resolveHistory({ json: async () => ({ ok: true, history: included ? [reply] : [],
+      conversation: { processing: true, processing_since: new Date().toISOString() },
+      live_display: { sequence: 1, active_turns: [{ actor: reply.from, turn_id: TURN },
+        { actor: 'commander', turn_id: 'commander-turn' }],
+        turns: [{ actor: reply.from, turn_id: TURN,
+          records: [{ ...reply, id: '', text: 'Working...', produced: [] }] }] },
+    }) });
+    if (replacement) {
+      await replacement;
+      finishOlder({ json: async () => ({ ok: true, history: [] }) });
+    }
+    await loading;
+    expect(warnings.filter(args => String(args).includes('history load failed'))).toEqual([]);
+    const codex = container.rows.find(row => row.dataset.msgId === reply.id);
+    expect(codex, 'history refresh must retain the canonical Codex reply').toBeDefined();
+    expect(codex!.bodies.final.textContent).toBe(reply.text);
+    expect((codex as any).message.produced).toEqual(['result.md']);
+    context._handleGroupBusEvent(CID, null, { ...delta(0, 'Stale Codex delta', reply.from), display_seq: 2 });
+    context._handleGroupBusEvent(CID, null, {
+      type: 'process', actor: 'commander', turn_id: 'commander-turn', seg: 0,
+      data: { type: 'delta', text: 'Updating automation...' },
+    });
+    expect(container.rows.find(row => row.dataset.fromActor === 'commander')?.bodies.final.textContent)
+      .toBe('Updating automation...');
+    expect(codex!.bodies.final.textContent).toBe(reply.text);
+    context._handleGroupBusEvent(CID, null, {
+      type: 'message', turn_end: true,
+      msg: { id: 'commander-result', from: 'commander', turn_id: 'commander-turn', seg: 0,
+        text: 'Automation updated.', ts: new Date().toISOString() },
+    });
+    context._settleDanglingActorPlaceholders(CID);
+    expect(container.rows.map(row => row.dataset.msgId)).toEqual(['codex-result', 'commander-result']);
+  });
+});
+
 function delta(seg: number, text: string, actor = 'commander') {
   return { type: 'process', cid: CID, actor, turn_id: TURN, seg, data: { type: 'delta', text } };
 }
@@ -254,6 +350,259 @@ function segMessage(seg: number, text: string, id: string) {
 function commanderRows(container: FakeContainer) {
   return container.rows.filter((row) => row.dataset.fromActor === 'commander');
 }
+
+describe('keyed rendering › native assistant messages', () => {
+  // 2026-09-17 (requester decision): a turn's native messages stay separate
+  // records, but the transcript shows ONE bubble per turn. The live row
+  // advances from segment to segment; earlier segments become narration
+  // blocks above the body and their records are absorbed, never rows.
+  it('keeps one row per turn even when persistence trails the next live message', async () => {
+    const { context, container, finalized, appended } = loadRenderer(CID);
+    const first = { ...segMessage(0, 'Report', 'native-0'), turn_end: false };
+    first.msg.from = 'agent-1';
+    const last = { ...segMessage(1, 'Saved', 'native-1'), turn_end: true };
+    last.msg.from = 'agent-1';
+    context._handleGroupBusEvent(CID, null, delta(0, 'Report', 'agent-1'));
+    context._handleGroupBusEvent(CID, null, delta(1, 'Saved', 'agent-1'));
+    expect(container.rows, 'the second segment continues in the same row').toHaveLength(1);
+    expect(container.rows[0].dataset.renderKey).toBe('s:turn-1:1');
+    expect(container.rows[0]._narration.map((item: any) => item.text)).toEqual(['Report']);
+    context._handleGroupBusEvent(CID, null, first);
+    context._handleGroupBusEvent(CID, null, first);
+    context._handleGroupBusEvent(CID, null, last);
+    await context._recoverPolledVisibleMessages(CID, [first.msg, last.msg]);
+    expect(container.rows.map(row => row.dataset.msgId)).toEqual(['native-1']);
+    expect(finalized.map(entry => entry.gm.text)).toEqual(['Saved']);
+    expect(finalized[0].gm._narration.map((item: any) => item.text)).toEqual(['Report']);
+    expect(appended).toHaveLength(0);
+  });
+});
+
+describe('keyed rendering › a turn that settles before its records arrive', () => {
+  // 2026-09-19, from the logs of conversation 68cb889e225e: an external-CLI
+  // turn hit `cli_idle_timeout` after 72 minutes. The bus emitted the terminal
+  // record, closed both streams, and only THEN flushed segments 31..37 — one
+  // at a time, down the single-record path. `_liveTurnRow` skips settled rows,
+  // so every late record appended a bubble of its own: seven extra bubbles
+  // that only a reload folded back, because the fold lived in the batch merge
+  // the reload runs and not in the path that delivered them.
+  const ACTOR = 'agent-1';
+
+  function seg(index: number, text: string, id: string, turnEnd = false) {
+    const event = segMessage(index, text, id);
+    event.msg.from = ACTOR;
+    return { ...event, turn_end: turnEnd };
+  }
+
+  /** Stream the turn, then settle it on its terminal record. */
+  function settleTurn(context: any) {
+    context._handleGroupBusEvent(CID, null, delta(0, 'first', ACTOR));
+    context._handleGroupBusEvent(CID, null, delta(1, 'second', ACTOR));
+    context._handleGroupBusEvent(CID, null, delta(2, 'done', ACTOR));
+    context._handleGroupBusEvent(CID, null, seg(2, 'done', 'rec-2', true));
+  }
+
+  it('folds a late segment record into the row its terminal record settled', () => {
+    const { context, container, appended } = loadRenderer(CID);
+    settleTurn(context);
+    expect(container.rows, 'the turn settles into one bubble').toHaveLength(1);
+    expect(container.rows[0].dataset.msgId).toBe('rec-2');
+
+    context._handleGroupBusEvent(CID, null, seg(0, 'first', 'rec-0'));
+    context._handleGroupBusEvent(CID, null, seg(1, 'second', 'rec-1'));
+
+    expect(container.rows, 'a late record must not open a bubble of its own').toHaveLength(1);
+    expect(appended, 'appending is the duplicate-bubble class this closes').toHaveLength(0);
+    expect(container.rows[0]._narration.map((item: any) => [item.seg, item.text]))
+      .toEqual([[0, 'first'], [1, 'second']]);
+  });
+
+  it('stays idempotent when the same late record is delivered twice', () => {
+    // The trace shows two flushes: seg 31 five seconds after turn-end, then
+    // 32..37 twenty-one minutes later when the window regained focus.
+    const { context, container } = loadRenderer(CID);
+    settleTurn(context);
+    // Streaming already demoted segments 0 and 1 into narration slots; a late
+    // record fills its slot canonically rather than adding a second one.
+    const before = container.rows[0]._narration.map((item: any) => item.seg);
+    context._handleGroupBusEvent(CID, null, seg(0, 'first', 'rec-0'));
+    context._handleGroupBusEvent(CID, null, seg(0, 'first', 'rec-0'));
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0]._narration.map((item: any) => item.seg)).toEqual(before);
+    expect(container.rows[0]._narration.filter((item: any) => item.seg === 0))
+      .toHaveLength(1);
+  });
+
+  it('keeps a settled long turn folded when earlier records arrive without a history request', () => {
+    const { context, container } = loadRenderer(CID);
+    for (let index = 0; index <= 6; index++) {
+      context._handleGroupBusEvent(CID, null, delta(index, `part ${index}`, ACTOR));
+    }
+    context._handleGroupBusEvent(CID, null, seg(6, 'part 6', 'rec-6', true));
+    const row = container.rows[0];
+    // The DOM fold suite covers the default presentation of six blocks.
+    // A passive record delivery must not switch that presentation to open.
+    row.dataset.narrationExpanded = '0';
+    context._handleGroupBusEvent(CID, null, seg(0, 'part 0', 'rec-0'));
+    expect(container.rows).toHaveLength(1);
+    expect(row._narration).toHaveLength(6);
+    expect(row.dataset.narrationExpanded).toBe('0');
+    expect(row.dataset.msgId).toBe('rec-6');
+  });
+
+  it('still appends when no settled row owns the turn', () => {
+    // The fallback must stay a fallback: a record whose turn was never
+    // rendered has nothing to fold into and still needs its own bubble.
+    const { context, container } = loadRenderer(CID);
+    context._handleGroupBusEvent(CID, null, seg(0, 'orphan', 'rec-0'));
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0].dataset.msgId).toBe('rec-0');
+  });
+});
+
+describe('keyed rendering › a turn split across history pages', () => {
+  // 2026-09-18: history pages are HISTORY_PAGE_SIZE (10) records, and the
+  // merge ran per page, so a 62-segment external-CLI turn rendered as seven
+  // bubbles whose boundaries were the PAGE boundaries. Older segments belong
+  // to the bubble their later segments already occupy.
+  //
+  // Absorption lives inside _mergeNativeSegmentRecords, the merger every
+  // history path runs, so these drive that rather than a private helper.
+  function record(turnId: string, seg: number, text: string, actor = 'agent-1') {
+    return {
+      id: `${turnId}-${seg}`, from: actor, to: ['user'], text,
+      ts: '2026-09-18T14:20:00', turn_id: turnId, seg,
+    };
+  }
+
+  /** Mint the settled bubble the way the newest page really does: merge, then
+   * append what the merge did not absorb. */
+  function settle(context: any, turnId: string, seg: number, actor = 'agent-1') {
+    const merged = context._mergeNativeSegmentRecords(
+      [record(turnId, seg, `step ${seg}`, actor)], CID,
+    );
+    for (const gm of merged) {
+      context.appendChatMessage(context._groupMsgToLegacy(gm), false, { cid: CID });
+    }
+  }
+
+  it('folds an older page into the bubble the turn already owns', () => {
+    const { context, container } = loadRenderer(CID);
+    settle(context, 'T1', 9);
+    expect(container.rows).toHaveLength(1);
+    const remaining = context._mergeNativeSegmentRecords([record('T1', 0, 'first')], CID);
+    expect(remaining, 'an absorbed record must not mint a second bubble').toEqual([]);
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0]._narration.map((item: any) => [item.seg, item.text]))
+      .toEqual([[0, 'first']]);
+  });
+
+  it('expands the bubble it absorbed into, so auto-load cannot fire back to back', () => {
+    // A folded narration block adds no height. If absorbing left the bubble
+    // folded, `scrollHeight` would not move, `scrollTop` would stay under
+    // HISTORY_AUTO_LOAD_THRESHOLD, and the next scroll event would load
+    // another page immediately — pages firing back to back to the start of the
+    // conversation. That is what "scrolling stutters" was (2026-09-18).
+    const { context, container } = loadRenderer(CID);
+    settle(context, 'T1', 9);
+    container.rows[0].dataset.narrationExpanded = '0';
+    context._mergeNativeSegmentRecords([record('T1', 5, 'fifth')], CID);
+    expect(container.rows[0].dataset.narrationExpanded,
+      'older segments are what the reader scrolled up for').toBe('1');
+  });
+
+  it('does not override a fold the reader chose', () => {
+    // Absorbing expands so auto-load cannot fire back to back, but that must
+    // not undo an explicit collapse (2026-09-18: switching conversations and
+    // back re-opened it).
+    const { context, container } = loadRenderer(CID);
+    settle(context, 'T-chosen', 9);
+    context._rememberNarrationFoldChoice('T-chosen', false);
+    container.rows[0].dataset.narrationExpanded = '0';
+    context._mergeNativeSegmentRecords([record('T-chosen', 5, 'fifth')], CID);
+    expect(container.rows[0].dataset.narrationExpanded,
+      'the reader decided this one').toBe('0');
+  });
+
+  it('leaves a record alone when no rendered bubble owns its turn', () => {
+    const { context } = loadRenderer(CID);
+    settle(context, 'T1', 9);
+    const remaining = context._mergeNativeSegmentRecords([record('T2', 3, 'other turn')], CID);
+    expect(remaining, 'a different turn still needs its own bubble').toHaveLength(1);
+    expect(remaining[0].id).toBe('T2-3');
+  });
+
+  it('does not absorb across actors or into commander bubbles', () => {
+    const { context } = loadRenderer(CID);
+    settle(context, 'T1', 9, 'agent-2');
+    const remaining = context._mergeNativeSegmentRecords([
+      record('T1', 1, 'mine', 'agent-1'),
+      record('T1', 1, 'cmd', 'commander'),
+    ], CID);
+    expect(remaining.map((gm: any) => gm.from).sort())
+      .toEqual(['agent-1', 'commander']);
+  });
+
+  it('keeps records without a turn or segment untouched', () => {
+    const { context } = loadRenderer(CID);
+    settle(context, 'T1', 9);
+    const remaining = context._mergeNativeSegmentRecords([
+      { id: 'u-1', from: 'user', to: ['agent-1'], text: 'ask' },
+      { id: 'x-1', from: 'agent-1', to: ['user'], text: 'no seg', turn_id: 'T1' },
+    ], CID);
+    expect(remaining.map((gm: any) => gm.id)).toEqual(['u-1', 'x-1']);
+  });
+});
+
+describe('keyed rendering › paging a long turn end to end', () => {
+  // The reported failure, at full size: a 62-segment turn arriving the way
+  // `loadConversationHistory` really delivers it — newest page first, ten
+  // records at a time, each page merged on its own. Before cross-page absorb
+  // this produced ceil(62/10) = 7 bubbles.
+  const PAGE = 10;
+
+  function recordsFor(turnId: string, count: number) {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `${turnId}-${i}`, from: 'agent-1', to: ['user'],
+      text: `step ${i}`, ts: '2026-09-18T14:20:00', turn_id: turnId, seg: i,
+    }));
+  }
+
+  it('collapses a turn that spans seven pages into one bubble', () => {
+    const { context, container } = loadRenderer(CID);
+    const all = recordsFor('T-long', 62);
+    let pagesLoaded = 0;
+    // Newest page first, then successively older ones — the scroll-up order.
+    for (let end = all.length; end > 0; end -= PAGE) {
+      const raw = all.slice(Math.max(0, end - PAGE), end);
+      // The merger absorbs what an already-rendered bubble owns and returns
+      // only what still needs one, which is exactly what the page-load path
+      // then appends.
+      const merged = context._mergeNativeSegmentRecords(raw, CID);
+      for (const gm of merged) {
+        context.appendChatMessage(context._groupMsgToLegacy(gm), false, { cid: CID });
+      }
+      pagesLoaded += 1;
+    }
+    expect(pagesLoaded, 'the turn really did span seven pages').toBe(7);
+    expect(container.rows, 'one turn, one bubble').toHaveLength(1);
+    const segs = container.rows[0]._narration.map((item: any) => Number(item.seg)).sort((a, b) => a - b);
+    // 61 narration blocks + the body the bubble already showed = 62 segments.
+    expect(segs).toHaveLength(61);
+    expect(segs[0]).toBe(0);
+    expect(segs[segs.length - 1]).toBe(60);
+  });
+
+  it('still separates two different turns arriving in the same page', () => {
+    const { context, container } = loadRenderer(CID);
+    const page = [...recordsFor('T-a', 2), ...recordsFor('T-b', 2)];
+    const merged = context._mergeNativeSegmentRecords(page, CID);
+    for (const gm of merged) {
+      context.appendChatMessage(context._groupMsgToLegacy(gm), false, { cid: CID });
+    }
+    expect(container.rows.map((r: any) => r.dataset.turnId)).toEqual(['T-a', 'T-b']);
+  });
+});
 
 describe('keyed rendering › commander segment persisted after streaming', () => {
   // The exact reported failure. Before render keys, the persisted segment could
@@ -418,6 +767,40 @@ describe('keyed rendering › silent turns', () => {
 });
 
 describe('keyed rendering › level-triggered placeholder reconciliation', () => {
+  it.each([true, false])('shows a capability-handback Commander with an Agent selected (snapshot=%s)', (snapshot) => {
+    const { context, container } = loadRenderer(CID);
+    const state = {
+      status: 'running', in_flight: ['commander'], active_recipient: 'agent-a',
+      active_recipient_source: 'user_selection', active_recipient_revision: 3,
+    };
+    // Re-entry seeds from runtime; a live subscription can instead receive
+    // progress before its next snapshot. Both must show the actual worker.
+    context._rememberServerFloor(CID, state);
+    if (snapshot) context._handleGroupBusEvent(CID, null, {
+      type: 'state_changed', cid: CID, state,
+      active_turns: [{ actor: 'commander', turn_id: TURN }],
+    });
+    context._handleGroupBusEvent(CID, null, {
+      type: 'process', cid: CID, actor: 'commander', turn_id: TURN, seg: 0,
+      data: { type: 'event', event: { stream: 'tool', data: { phase: 'start', id: 'read', name: 'read_files' } } },
+    });
+    context._handleGroupBusEvent(CID, null, delta(0, 'Checking the requested change.'));
+
+    expect(commanderRows(container)).toHaveLength(1);
+    const row = commanderRows(container)[0];
+    expect(row.bodies.final.textContent).toBe('Checking the requested change.');
+    expect(row.bodies.process.children).toHaveLength(1);
+    expect(vm.runInContext('_serverFloorByCid.get("c1")', context)).toBe('agent-a');
+
+    const terminal = { ...segMessage(0, 'Checked.', 'commander-result'), turn_end: true };
+    context._handleGroupBusEvent(CID, null, terminal);
+    context._handleGroupBusEvent(CID, null, terminal);
+    context._handleGroupBusEvent(CID, null, delta(1, 'late output'));
+    expect(commanderRows(container)).toEqual([row]);
+    expect(row.dataset.msgId).toBe('commander-result');
+    expect(row.bodies.final.textContent).not.toContain('late output');
+  });
+
   it('moves pending recovery ownership to the actor in the latest active snapshot', () => {
     const { context, container } = loadRenderer(CID);
     const staleCommander = new FakeNode();
@@ -829,5 +1212,314 @@ describe('keyed rendering › terminal hand-off with an end-of-turn record', () 
     });
     context._handleGroupBusEvent(CID, null, delta(1, 'Here is the synthesis.'));
     expect(commanderRows(container), 'a mid-turn record does not end the turn').toHaveLength(2);
+  });
+});
+
+
+describe('keyed rendering › one bubble per external-CLI turn', () => {
+  const ACTOR = 'agent-1';
+
+  function nativeMessage(seg: number, text: string, id: string, turnEnd: boolean) {
+    const event = { ...segMessage(seg, text, id), turn_end: turnEnd };
+    event.msg.from = ACTOR;
+    return event;
+  }
+
+  it('advances the same row across three segments and merges their rails and narration', () => {
+    const { context, container, finalized, appended } = loadRenderer(CID);
+    const toolEvent = (seg: number, name: string) => ({
+      type: 'process', cid: CID, actor: ACTOR, turn_id: TURN, seg,
+      data: { type: 'event', event: { stream: 'tool', data: { phase: 'start', id: `t${seg}`, name } } },
+    });
+    context._handleGroupBusEvent(CID, null, delta(0, '开始改。', ACTOR));
+    context._handleGroupBusEvent(CID, null, toolEvent(0, 'read_file'));
+    context._handleGroupBusEvent(CID, null, delta(1, '我在核对。', ACTOR));
+    context._handleGroupBusEvent(CID, null, toolEvent(1, 'bash'));
+    const record0 = nativeMessage(0, '开始改。', 'native-0', false);
+    record0.msg.process = [{ type: 'event', event: { stream: 'tool', data: { phase: 'start', id: 't0', name: 'read_file' } } }];
+    context._handleGroupBusEvent(CID, null, record0);
+    context._handleGroupBusEvent(CID, null, delta(2, '改完了。', ACTOR));
+    const record1 = nativeMessage(1, '我在核对。', 'native-1', false);
+    record1.msg.process = [{ type: 'event', event: { stream: 'tool', data: { phase: 'start', id: 't1', name: 'bash' } } }];
+    context._handleGroupBusEvent(CID, null, record1);
+    const record2 = nativeMessage(2, '改完了。', 'native-2', true);
+    record2.msg.process = [{ type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 't1', name: 'bash' } } }];
+    context._handleGroupBusEvent(CID, null, record2);
+
+    expect(container.rows.map(row => row.dataset.msgId)).toEqual(['native-2']);
+    expect(container.rows[0].dataset.narrationSegs).toBe('0,1');
+    expect(container.rows[0]._narration.map((item: any) => item.text)).toEqual(['开始改。', '我在核对。']);
+    expect(container.rows[0].dataset.turnEnd).toBe('1');
+    expect(finalized).toHaveLength(1);
+    expect(finalized[0].gm.text).toBe('改完了。');
+    expect(finalized[0].gm._narration.map((item: any) => item.seg)).toEqual([0, 1]);
+    expect(finalized[0].gm.process.map((item: any) => item.event.data.name + ':' + item.event.data.phase))
+      .toEqual(['read_file:start', 'bash:start', 'bash:end']);
+    expect(appended).toHaveLength(0);
+  });
+
+  it('merges recovered history records into the last segment before rendering', async () => {
+    const { context, container, appended } = loadRenderer(CID);
+    const records = [
+      nativeMessage(0, '开始改。', 'native-0', false).msg,
+      nativeMessage(1, '我在核对。', 'native-1', false).msg,
+      nativeMessage(2, '改完了。', 'native-2', true).msg,
+    ];
+    await context._recoverPolledVisibleMessages(CID, records);
+    expect(container.rows.map(row => row.dataset.msgId)).toEqual(['native-2']);
+    expect(appended).toHaveLength(1);
+    expect(appended[0]._narration.map((item: any) => item.text)).toEqual(['开始改。', '我在核对。']);
+    expect(appended[0].content).toBe('改完了。');
+  });
+
+  it('joins earlier history pages to the already rendered final turn without duplicate bubbles', async () => {
+    const { context, container, appended } = loadRenderer(CID);
+    const final = nativeMessage(3, '改完了。', 'native-3', true).msg;
+    await context._recoverPolledVisibleMessages(CID, [final]);
+    const row = container.rows[0];
+    // DOM construction is outside this identity harness; retain the actual
+    // persisted-process collector while testing its cross-page input order.
+    row.querySelector = () => null;
+    (row as any)._persistedProcessItems = [{ type: 'event', event: { stream: 'runtime', data: { duration_ms: 30 } } }];
+    for (const seg of [2, 1, 0]) {
+      const record = nativeMessage(seg, `过程 ${seg}`, `native-${seg}`, false).msg;
+      (record as any).process = [{ type: 'event', event: { stream: 'runtime', data: { duration_ms: seg } } }];
+      // Older-history loading calls this same page merger before appending.
+      expect(context._mergeNativeSegmentRecords([record], CID)).toEqual([]);
+      expect(context._mergeNativeSegmentRecords([record], CID)).toEqual([]);
+    }
+    expect(container.rows).toEqual([row]);
+    expect(appended).toHaveLength(1);
+    expect(row.dataset.msgId).toBe('native-3');
+    expect((row as any)._narration.map((item: any) => item.seg).sort()).toEqual([0, 1, 2]);
+    expect((row as any)._persistedProcessItems.map((item: any) => item.event.data.duration_ms)).toEqual([0, 1, 2, 30]);
+    const otherActor = nativeMessage(0, '另一位成员', 'other-actor', false).msg;
+    otherActor.from = 'agent-other';
+    expect(context._mergeNativeSegmentRecords([otherActor], CID)).toHaveLength(1);
+    const otherTurn = { ...nativeMessage(0, '另一轮', 'other-turn', false).msg, turn_id: 'different-turn' };
+    expect(context._mergeNativeSegmentRecords([otherTurn], CID)).toHaveLength(1);
+    expect(context._mergeNativeSegmentRecords([nativeMessage(0, '另一会话', 'other-cid', false).msg], 'other-cid')).toHaveLength(1);
+  });
+
+  it('does not let a recovery poll re-add segments a live row already owns', async () => {
+    const { context, container, appended } = loadRenderer(CID);
+    context._handleGroupBusEvent(CID, null, delta(0, '开始改。', ACTOR));
+    context._handleGroupBusEvent(CID, null, delta(1, '我在核对。', ACTOR));
+    await context._recoverPolledVisibleMessages(CID, [nativeMessage(0, '开始改。', 'native-0', false).msg]);
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0].dataset.msgId).toBeUndefined();
+    expect(appended).toHaveLength(0);
+  });
+
+  // 2026-09-17 live report: the runtime snapshot (state_changed, the 1 s
+  // recovery tick) names no segment. Once the row had advanced to segment 1
+  // the snapshot's segment-0 key found nothing and minted an empty sibling
+  // bubble that only the end-of-turn record swept away.
+  it('keeps the turn row when a runtime snapshot names no segment', () => {
+    const { context, container } = loadRenderer(CID);
+    const snapshot = () => context._handleGroupBusEvent(CID, null, {
+      type: 'state_changed', cid: CID, state: { status: 'running', in_flight: [ACTOR] },
+      active_turns: [{ actor: ACTOR, turn_id: TURN, started_at_ms: 1000 }],
+    });
+    snapshot();
+    context._handleGroupBusEvent(CID, null, delta(0, '开始改。', ACTOR));
+    snapshot();
+    context._handleGroupBusEvent(CID, null, delta(1, '我在核对。', ACTOR));
+    snapshot();
+    context._handleGroupBusEvent(CID, null, nativeMessage(0, '开始改。', 'native-0', false));
+    snapshot();
+    expect(container.rows.map(row => row.dataset.renderKey)).toEqual(['s:turn-1:1']);
+    expect(container.rows[0]._narration.map((item: any) => item.text)).toEqual(['开始改。']);
+  });
+
+  it('routes a late bookkeeping event for an absorbed segment into the turn row', () => {
+    const { context, container } = loadRenderer(CID);
+    context._handleGroupBusEvent(CID, null, delta(0, '开始改。', ACTOR));
+    context._handleGroupBusEvent(CID, null, delta(1, '我在核对。', ACTOR));
+    context._handleGroupBusEvent(CID, null, {
+      type: 'process', cid: CID, actor: ACTOR, turn_id: TURN, seg: 0,
+      data: { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 't0', name: 'read_file' } } },
+    });
+    expect(container.rows.map(row => row.dataset.renderKey)).toEqual(['s:turn-1:1']);
+    expect(container.rows[0].bodies.process.children).toHaveLength(1);
+  });
+
+  it('moves the row on when a mid-turn record lands before the next segment\'s first token', () => {
+    const { context, container, finalized } = loadRenderer(CID);
+    context._handleGroupBusEvent(CID, null, delta(0, '开始改。', ACTOR));
+    context._handleGroupBusEvent(CID, null, nativeMessage(0, '开始改。', 'native-0', false));
+    expect(container.rows.map(row => row.dataset.renderKey)).toEqual(['s:turn-1:1']);
+    expect(container.rows[0].dataset.msgId).toBeUndefined();
+    context._handleGroupBusEvent(CID, null, delta(1, '改完了。', ACTOR));
+    context._handleGroupBusEvent(CID, null, nativeMessage(1, '改完了。', 'native-1', true));
+    expect(container.rows.map(row => row.dataset.msgId)).toEqual(['native-1']);
+    expect(finalized).toHaveLength(1);
+    expect(finalized[0].gm._narration.map((item: any) => item.text)).toEqual(['开始改。']);
+  });
+
+  it('lets the record fill narration the stream never painted', () => {
+    const { context, container } = loadRenderer(CID);
+    // Attached after segment 0 streamed: the row opens on segment 1 directly.
+    context._handleGroupBusEvent(CID, null, {
+      type: 'state_changed', cid: CID, state: { status: 'running', in_flight: [ACTOR] },
+      active_turns: [{ actor: ACTOR, turn_id: TURN, started_at_ms: 1000 }],
+    });
+    context._handleGroupBusEvent(CID, null, delta(1, '我在核对。', ACTOR));
+    expect(container.rows[0]._narration).toEqual([{ seg: 0, text: '' }]);
+    context._handleGroupBusEvent(CID, null, nativeMessage(0, '开始改。', 'native-0', false));
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0]._narration).toEqual([{ seg: 0, text: '开始改。' }]);
+  });
+
+  it('absorbs earlier records a recovery poll brings to a live row', async () => {
+    const { context, container, appended } = loadRenderer(CID);
+    context._handleGroupBusEvent(CID, null, delta(1, '我在核对。', ACTOR));
+    const record0 = nativeMessage(0, '开始改。', 'native-0', false).msg;
+    await context._recoverPolledVisibleMessages(CID, [record0]);
+    await context._recoverPolledVisibleMessages(CID, [record0]);
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0].dataset.renderKey).toBe('s:turn-1:1');
+    expect(container.rows[0]._narration).toEqual([{ seg: 0, text: '开始改。' }]);
+    expect(appended).toHaveLength(0);
+  });
+
+  it('restores a running turn\'s persisted segments into a live row on rebuild', () => {
+    const { context, container, finalized, appended } = loadRenderer(CID);
+    const record0 = nativeMessage(0, '开始改。', 'native-0', false).msg;
+    record0.process = [{ type: 'progress', text: '读取文件' }];
+    const record1 = nativeMessage(1, '我在核对。', 'native-1', false).msg;
+    record1.process = [{ type: 'progress', text: '运行测试' }];
+    const liveTurnGroups: any[] = [];
+    const history = context._mergeNativeSegmentRecords([record0, record1], CID, {
+      rebuild: true, activeTurnIds: new Set([TURN]), liveTurnGroups,
+    });
+    expect(history).toEqual([]);
+    expect(liveTurnGroups.map((g: any) => [g.actor, g.turnId, g.records.length])).toEqual([[ACTOR, TURN, 2]]);
+    context._restoreLiveTurnRows(CID, liveTurnGroups, [{ actor: ACTOR, turn_id: TURN, started_at_ms: 1000 }]);
+    expect(container.rows.map(row => row.dataset.renderKey)).toEqual(['s:turn-1:2']);
+    expect(container.rows[0].dataset.msgId).toBeUndefined();
+    expect(container.rows[0]._narration.map((item: any) => item.text)).toEqual(['开始改。', '我在核对。']);
+    // The turn continues in that row and settles as one bubble.
+    context._handleGroupBusEvent(CID, null, {
+      type: 'state_changed', cid: CID, state: { status: 'running', in_flight: [ACTOR] },
+      active_turns: [{ actor: ACTOR, turn_id: TURN, started_at_ms: 1000 }],
+    });
+    context._handleGroupBusEvent(CID, null, delta(2, '改完了。', ACTOR));
+    const record2 = nativeMessage(2, '改完了。', 'native-2', true);
+    record2.msg.process = [{ type: 'progress', text: '收尾' }];
+    context._handleGroupBusEvent(CID, null, record2);
+    expect(container.rows.map(row => row.dataset.msgId)).toEqual(['native-2']);
+    expect(finalized).toHaveLength(1);
+    expect(finalized[0].gm._narration.map((item: any) => item.seg)).toEqual([0, 1]);
+    expect(finalized[0].gm.process.map((item: any) => item.text)).toEqual(['读取文件', '运行测试', '收尾']);
+    expect(appended).toHaveLength(0);
+  });
+
+  it('reuses the re-attached live row on rebuild instead of minting another', () => {
+    const { context, container } = loadRenderer(CID);
+    context._handleGroupBusEvent(CID, null, delta(1, '我在核对。', ACTOR));
+    const record0 = nativeMessage(0, '开始改。', 'native-0', false).msg;
+    context._restoreLiveTurnRows(CID, [{ actor: ACTOR, turnId: TURN, records: [record0] }], []);
+    expect(container.rows.map(row => row.dataset.renderKey)).toEqual(['s:turn-1:1']);
+    expect(container.rows[0]._narration).toEqual([{ seg: 0, text: '开始改。' }]);
+  });
+
+  it('leaves Commander dispatch segments alone', () => {
+    const { context, container } = loadRenderer(CID);
+    context._handleGroupBusEvent(CID, null, delta(0, 'Handing this to the researcher.'));
+    context._handleGroupBusEvent(CID, null, { ...segMessage(0, 'Handing this to the researcher.', 'msg-0'), turn_end: false });
+    context._handleGroupBusEvent(CID, null, delta(1, 'Synthesis.'));
+    expect(commanderRows(container)).toHaveLength(2);
+    expect(commanderRows(container).map(row => row.dataset.narrationSegs)).toEqual([undefined, undefined]);
+  });
+});
+
+
+describe('active transcript recovery after task switching', () => {
+  it('joins events received during the history request without replaying the snapshot prefix', () => {
+    const { context, container } = loadRenderer(CID);
+    const actor = 'codex-agent';
+    context.__load = { cid: CID, container, collectingProcess: true, processEvents: [] };
+    vm.runInContext('_conversationHistoryLoad = __load', context);
+    context._handleGroupBusEvent(CID, null, { ...delta(0, 'Beginning ', actor), display_seq: 1 });
+    context._handleGroupBusEvent(CID, null, { ...delta(0, 'middle ', actor), display_seq: 2 });
+    context._handleGroupBusEvent(CID, null, { ...delta(0, 'end', actor), display_seq: 3 });
+    expect(container.rows).toHaveLength(0);
+    context._restoreLiveDisplaySnapshot(CID, { sequence: 2, turns: [{ actor, turn_id: TURN, records: [{
+      id: '', from: actor, turn_id: TURN, seg: 0, text: 'Beginning middle ', process: [],
+    }] }] });
+    context._finishHistoryLoadProcess(context.__load);
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0].bodies.final.textContent).toBe('Beginning middle end');
+    expect(context.__load.processEvents).toEqual([]);
+  });
+
+  it('keeps a terminal reply that arrives before the active snapshot can be restored', () => {
+    const { context, container, finalized } = loadRenderer(CID);
+    const actor = 'codex-agent';
+    context._handleGroupBusEvent(CID, null, delta(0, 'In progress', actor));
+    context._handleGroupBusEvent(CID, null, {
+      type: 'message', turn_end: true, turn_id: TURN,
+      msg: { id: 'terminal', from: actor, to: ['user'], turn_id: TURN, seg: 0, text: 'Done' },
+    });
+    context._restoreLiveDisplaySnapshot(CID, { sequence: 1, turns: [{ actor, turn_id: TURN, records: [{
+      id: '', from: actor, turn_id: TURN, seg: 0, text: 'In progress', process: [],
+    }] }] });
+    context._handleGroupBusEvent(CID, null, { ...delta(0, 'In progress', actor), display_seq: 1 });
+    expect(container.rows.map(row => row.dataset.msgId)).toEqual(['terminal']);
+    expect(finalized.map(item => item.gm.text)).toEqual(['Done']);
+  });
+
+  it('does not restore a stale snapshot into the other task after another switch', () => {
+    const { context, container } = loadRenderer(CID);
+    context.currentCid = 'other';
+    context._restoreLiveDisplaySnapshot(CID, { sequence: 1, turns: [{ actor: 'codex-agent', turn_id: TURN, records: [{
+      id: '', from: 'codex-agent', turn_id: TURN, seg: 0, text: 'Private task content', process: [],
+    }] }] });
+    expect(container.rows).toHaveLength(0);
+  });
+
+  it('merges recovered native segments once when their final reply arrives', () => {
+    const { context, container, finalized } = loadRenderer(CID);
+    const actor = 'claude-agent';
+    const first = { id: 'first', from: actor, turn_id: TURN, seg: 0, text: 'First message',
+      process: [{ type: 'progress', text: 'Read' }] };
+    const snapshot = { sequence: 3, turns: [{ actor, turn_id: TURN, records: [first,
+      { id: '', from: actor, turn_id: TURN, seg: 1, text: 'Second message', process: [{ type: 'progress', text: 'Check' }] },
+    ] }] };
+    context._restoreLiveDisplaySnapshot(CID, snapshot);
+    context._restoreLiveDisplaySnapshot(CID, snapshot);
+    context._handleGroupBusEvent(CID, null, { type: 'message', turn_end: true, turn_id: TURN,
+      msg: { id: 'last', from: actor, turn_id: TURN, seg: 1, text: 'Done', process: [{ type: 'progress', text: 'Check' }] },
+    });
+    expect(container.rows).toHaveLength(1);
+    expect(finalized[0].gm._narration.map((item: any) => item.text)).toEqual(['First message']);
+    expect(finalized[0].gm.process.map((item: any) => item.text)).toEqual(['Read', 'Check']);
+  });
+
+  it('restores more than 300 operations and continues a partial reply once', () => {
+    const { context, container } = loadRenderer(CID);
+    const actor = 'codex-agent';
+    const process = Array.from({ length: 350 }, (_, i) => ({ type: 'progress', text: `Operation ${i}` }));
+    context._appendProjectedProcessRow = (node: any, row: any) => node.bodies.process.children.push(row.text);
+    const snapshot = { sequence: 351, turns: [{ actor, turn_id: TURN, started_at_ms: 1000, records: [{
+      id: '', from: actor, to: ['user'], turn_id: TURN, seg: 0, ts: '2026-09-18T00:00:00Z',
+      process, text: 'Partial ',
+    }] }] };
+    context._handleGroupBusEvent(CID, null, delta(0, 'Old partial', actor));
+    context._restoreLiveDisplaySnapshot(CID, snapshot);
+    // A delayed IPC delivery already represented by the snapshot must not append twice.
+    context._handleGroupBusEvent(CID, null, { ...delta(0, 'Partial ', actor), display_seq: 351 });
+    context._handleGroupBusEvent(CID, null, { ...delta(0, 'reply', actor), display_seq: 352 });
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0].bodies.final.textContent).toBe('Partial reply');
+    expect(container.rows[0].bodies.process.children).toEqual(process.map(item => item.text));
+    // Reopening from a newer complete snapshot remains idempotent.
+    snapshot.sequence = 352;
+    snapshot.turns[0].records[0].text = 'Partial reply';
+    context._restoreLiveDisplaySnapshot(CID, snapshot);
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0].bodies.final.textContent).toBe('Partial reply');
+    expect(container.rows[0].bodies.process.children).toHaveLength(350);
   });
 });

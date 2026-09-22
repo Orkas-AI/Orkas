@@ -1,39 +1,17 @@
 /**
- * Central logger — wraps `electron-log/main` with:
- *
- *   - **Daily file rotation** via `resolvePathFn` returning a date-suffixed
- *     path (`YYYY-MM-DD.log`); electron-log opens a fresh file whenever
- *     the path changes, which naturally happens at midnight.
- *   - **Per-file size cap** so a chatty day doesn't produce a 1 GB file —
- *     once a file hits `FILE_MAX_BYTES`, electron-log archives it to
- *     `YYYY-MM-DD.old.log` and starts a new one for the same day.
- *   - **Retention sweep on boot**: drop files older than `RETAIN_DAYS`
- *     days, then (if the logs dir still exceeds `TOTAL_MAX_BYTES`) drop
- *     the oldest until under cap. Runs once per process start — no
- *     timers, no background work.
- *   - **Sensitive-field redaction** via an electron-log hook: any object
- *     property whose name matches our secret-looking key set is masked
- *     before the record is serialized. Stack traces and plain strings
- *     pass through unchanged.
- *   - **Scoped loggers** — `createLogger('auth')` yields a logger that
- *     stamps every record with `[auth]`, so the file reads at-a-glance
- *     as `[2026-04-20 14:23:45.123] [info] [auth] OAuth flow started`.
- *
- * The console transport stays on too: in dev you see the same events in
- * the DevTools / terminal, with a lighter format.
- *
- * Renderer-side callers talk to us through the `orkas.log` IPC channel
- * (wired in `main/ipc/index.ts`); every renderer record gets a
- * `renderer/<module>` scope so it's distinguishable from main-side work.
+ * Scoped logger with bounded, sanitized snapshots on the calling thread.
+ * A worker owns file creation, daily/size rotation, retention and console I/O.
+ * The mailbox reserves capacity for warnings/errors; saturation never waits
+ * for diagnostic I/O. Renderer records arrive through the existing log IPC.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
+const { sweepLogDirectory } = require('./util/log-retention');
 
 import log from 'electron-log/main';
 import type { LogMessage } from 'electron-log';
 
 import { LOGS_DIR } from './paths';
+import { createLogDelivery } from './util/log-delivery';
 import { maskLogId, sanitizeLogTextForUpload } from './util/log-sanitize';
 
 // ── Tunables ─────────────────────────────────────────────────────────────
@@ -63,25 +41,6 @@ export function writeConsoleSafely(
     if (!isBrokenPipeError(error)) throw error;
     onBrokenPipe?.();
   }
-}
-
-// ── Date helpers ─────────────────────────────────────────────────────────
-
-function dateKey(d: Date = new Date()): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${dd}`;
-}
-
-// File names we manage: either `YYYY-MM-DD.log` (current) or the archive
-// variants electron-log creates under size pressure (`...old.log`,
-// `...1.log`, etc.). We leave anything else alone.
-const LOG_FILE_RE = /^\d{4}-\d{2}-\d{2}.*\.log$/;
-
-function datePrefixOf(name: string): string | null {
-  const m = name.match(/^(\d{4}-\d{2}-\d{2})/);
-  return m ? m[1] : null;
 }
 
 // ── Sensitive-field redaction ────────────────────────────────────────────
@@ -130,19 +89,31 @@ const PATH_MASK = '***REDACTED_PATH***';
  * - Errors keep their name/message/stack shape, but message and stack text
  *   are sanitized before they reach file/console transports.
  */
-export function redact(v: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
+export function redact(v: unknown, seen: WeakSet<object> = new WeakSet(), budget = { nodes: 0, chars: 0 }, depth = 0, wire = false): unknown {
+  if (++budget.nodes > 128 || depth > 6) return '[truncated]';
   if (v === null || v === undefined) return v;
-  if (typeof v === 'string') return sanitizeLogTextForUpload(v);
+  if (typeof v === 'string') {
+    if (v.length > 4096 || budget.chars + v.length > 16384) return '[oversized text omitted]';
+    budget.chars += v.length;
+    return sanitizeLogTextForUpload(v);
+  }
+  if (typeof v === 'function' || typeof v === 'symbol') return '[unsupported]';
   if (typeof v !== 'object') return v;
 
   if (seen.has(v as object)) return '[circular]';
   seen.add(v as object);
 
   if (v instanceof Error) {
-    const out = new Error(sanitizeLogTextForUpload(v.message || ''));
-    out.name = sanitizeLogTextForUpload(v.name || 'Error');
-    if (typeof v.stack === 'string') out.stack = sanitizeLogTextForUpload(v.stack);
-    for (const [k, val] of Object.entries(v as Error & Record<string, unknown>)) {
+    const out = new Error(String(redact(v.message || '', seen, budget, depth + 1, wire)));
+    out.name = String(redact(v.name || 'Error', seen, budget, depth + 1, wire));
+    if (typeof v.stack === 'string') out.stack = String(redact(v.stack, seen, budget, depth + 1, wire));
+    let keys = 0;
+    for (const k in v) {
+      if (++keys > 32 || budget.nodes >= 128) break;
+      if (k.length > 128 || k === '__proto__') continue;
+      const descriptor = Object.getOwnPropertyDescriptor(v, k);
+      if (!descriptor) continue;
+      const val = 'value' in descriptor ? descriptor.value : '[accessor]';
       if (k === 'name' || k === 'message' || k === 'stack') continue;
       const key = k.toLowerCase();
       if (REDACT_KEYS.has(key)) {
@@ -150,26 +121,39 @@ export function redact(v: unknown, seen: WeakSet<object> = new WeakSet()): unkno
       } else if (PRIVATE_FILE_KEYS.has(key) && typeof val === 'string') {
         (out as Error & Record<string, unknown>)[k] = PATH_MASK;
       } else if (MASK_ID_KEYS.has(key)) {
-        (out as Error & Record<string, unknown>)[k] = maskLogId(val);
+        (out as Error & Record<string, unknown>)[k] = maskLogId(typeof val === 'string' && val.length <= 4096 ? val : '[omitted]');
       } else {
-        (out as Error & Record<string, unknown>)[k] = redact(val, seen);
+        (out as Error & Record<string, unknown>)[k] = redact(val, seen, budget, depth + 1, wire);
       }
     }
-    return out;
+    return wire ? { ...out, name: out.name, message: out.message, stack: out.stack } : out;
   }
 
-  if (Array.isArray(v)) return v.map((it) => redact(it, seen));
+  if (Array.isArray(v)) {
+    const items = [];
+    for (let i = 0; i < Math.min(v.length, 32); i++) {
+      const element = Object.getOwnPropertyDescriptor(v, String(i));
+      items.push(element && 'value' in element ? redact(element.value, seen, budget, depth + 1, wire) : '[accessor]');
+    }
+    return items;
+  }
 
   const out: Record<string, unknown> = {};
-  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+  let keys = 0;
+  for (const k in v) {
+    if (++keys > 32 || budget.nodes >= 128) { out.truncated = true; break; }
+    const descriptor = Object.getOwnPropertyDescriptor(v, k);
+    if (!descriptor) continue;
+    const val = 'value' in descriptor ? descriptor.value : '[accessor]';
+    if (k.length > 128 || k === '__proto__') continue;
     if (REDACT_KEYS.has(k.toLowerCase())) {
       out[k] = MASK;
     } else if (PRIVATE_FILE_KEYS.has(k.toLowerCase()) && typeof val === 'string') {
       out[k] = PATH_MASK;
     } else if (MASK_ID_KEYS.has(k.toLowerCase())) {
-      out[k] = maskLogId(val);
+      out[k] = maskLogId(typeof val === 'string' && val.length <= 4096 ? val : '[omitted]');
     } else {
-      out[k] = redact(val, seen);
+      out[k] = redact(val, seen, budget, depth + 1, wire);
     }
   }
   return out;
@@ -177,87 +161,9 @@ export function redact(v: unknown, seen: WeakSet<object> = new WeakSet()): unkno
 
 // ── Retention sweep ──────────────────────────────────────────────────────
 
-interface FileStat {
-  name: string;
-  full: string;
-  size: number;
-  mtimeMs: number;
-  datePrefix: string;
-}
-
-function listLogFiles(): FileStat[] {
-  let names: string[];
-  try { names = fs.readdirSync(LOGS_DIR); } catch { return []; }
-  const out: FileStat[] = [];
-  for (const name of names) {
-    if (!LOG_FILE_RE.test(name)) continue;
-    const full = path.join(LOGS_DIR, name);
-    let st: fs.Stats;
-    try { st = fs.statSync(full); } catch { continue; }
-    if (!st.isFile()) continue;
-    out.push({
-      name,
-      full,
-      size: st.size,
-      mtimeMs: st.mtimeMs,
-      datePrefix: datePrefixOf(name) || '',
-    });
-  }
-  return out;
-}
-
-/**
- * Delete:
- *   1. files whose date prefix is older than `RETAIN_DAYS`, OR
- *   2. oldest-first until total size fits under `TOTAL_MAX_BYTES` (if it
- *      still overshoots after step 1).
- *
- * Today's live file is skipped — we never delete the file electron-log
- * is currently appending to, even if size/age rules would otherwise hit
- * it. Exposed for testing.
- */
-export function sweepLogs(now: Date = new Date()): {
-  removed: string[];
-  reason: Record<string, 'age' | 'size'>;
-} {
-  const todayKey = dateKey(now);
-  const files = listLogFiles();
-  const ageLimitMs = now.getTime() - RETAIN_DAYS * 24 * 60 * 60 * 1000;
-
-  const removed: string[] = [];
-  const reason: Record<string, 'age' | 'size'> = {};
-
-  // Phase 1: drop anything older than RETAIN_DAYS. Use the date prefix —
-  // a mis-stamped mtime shouldn't spare a genuinely old file.
-  const survivors: FileStat[] = [];
-  for (const f of files) {
-    if (f.datePrefix && f.datePrefix < todayKey) {
-      const fileDate = new Date(`${f.datePrefix}T00:00:00`).getTime();
-      if (fileDate < ageLimitMs) {
-        try { fs.unlinkSync(f.full); removed.push(f.name); reason[f.name] = 'age'; continue; }
-        catch { /* fall through — leave the file, we'll try again next boot */ }
-      }
-    }
-    survivors.push(f);
-  }
-
-  // Phase 2: if still over total cap, drop oldest (by date prefix, then
-  // mtime as tiebreak). Never touch today's live file.
-  let totalSize = survivors.reduce((s, f) => s + f.size, 0);
-  if (totalSize > TOTAL_MAX_BYTES) {
-    survivors.sort((a, b) => {
-      if (a.datePrefix !== b.datePrefix) return a.datePrefix.localeCompare(b.datePrefix);
-      return a.mtimeMs - b.mtimeMs;
-    });
-    for (const f of survivors) {
-      if (totalSize <= TOTAL_MAX_BYTES) break;
-      if (f.datePrefix === todayKey && f.name === `${todayKey}.log`) continue;
-      try { fs.unlinkSync(f.full); removed.push(f.name); reason[f.name] = 'size'; totalSize -= f.size; }
-      catch { /* keep going */ }
-    }
-  }
-
-  return { removed, reason };
+/** Retention policy is shared with the file worker; exposed for isolated tests. */
+export function sweepLogs(now: Date = new Date()): { removed: string[]; reason: Record<string, 'age' | 'size'> } {
+  return sweepLogDirectory(LOGS_DIR, RETAIN_DAYS, TOTAL_MAX_BYTES, now);
 }
 
 // ── Bootstrap ────────────────────────────────────────────────────────────
@@ -272,65 +178,35 @@ export function initLogger(): void {
   if (_initialized) return;
   _initialized = true;
 
-  try { fs.mkdirSync(LOGS_DIR, { recursive: true }); } catch { /* noop */ }
-
-  // Level config — `ORKAS_LOG_LEVEL` overrides in both environments; dev
-  // gets verbose console by default so you see activity while coding.
-  const fileLevel = (process.env.ORKAS_LOG_LEVEL as any) || 'info';
-  const consoleLevel = process.env.ORKAS_DEVTOOLS ? 'debug' : (process.env.ORKAS_LOG_LEVEL as any) || 'info';
-  const originalConsole = {
-    error: console.error.bind(console),
-    warn: console.warn.bind(console),
-    info: console.info.bind(console),
-    debug: console.debug.bind(console),
-  };
-  const disableConsoleTransport = () => {
-    log.transports.console.level = false;
-  };
-
-  log.transports.file.level    = fileLevel;
-  log.transports.console.level = consoleLevel;
-
-  // Daily file path — electron-log reopens the file whenever the resolved
-  // path changes, so at midnight the next write naturally lands in a new
-  // `YYYY-MM-DD.log`. Size-based rotation (maxSize) produces `.old.log`
-  // siblings for the same day.
-  log.transports.file.resolvePathFn = () =>
-    path.join(LOGS_DIR, `${dateKey()}.log`);
-
-  log.transports.file.maxSize = FILE_MAX_BYTES;
-
-  log.transports.file.format    = '[{y}-{m}-{d} {h}:{i}:{s}.{ms}] [{level}] [{scope}] {text}';
-  log.transports.console.format = '[{h}:{i}:{s}.{ms}] [{level}] [{scope}] {text}';
-  log.transports.console.writeFn = ({ message }) => {
-    const write = message.level === 'error'
-      ? originalConsole.error
-      : message.level === 'warn'
-        ? originalConsole.warn
-        : message.level === 'debug' || message.level === 'silly'
-          ? originalConsole.debug
-          : originalConsole.info;
-    writeConsoleSafely(write, message.data, disableConsoleTransport);
-  };
-
-  // A closed pipe can surface asynchronously as a stream `error`, outside the
-  // transport's try/catch. Once that happens, stop console logging and retain
-  // the file transport; non-EPIPE stream failures keep their normal fatal
-  // semantics.
-  const handleOutputError = (error: Error & { code?: string }) => {
-    if (!isBrokenPipeError(error)) throw error;
-    disableConsoleTransport();
-  };
-  process.stdout?.on('error', handleOutputError);
-  process.stderr?.on('error', handleOutputError);
-
-  // Redaction hook — runs for every record before formatting. Walk the
-  // `data` array (the arguments passed to log.info(...) etc.) and mask
-  // any object property named like a secret.
-  log.hooks.push((message: LogMessage) => {
-    message.data = message.data.map((d) => redact(d));
-    return message;
-  });
+  const levels = ['error', 'warn', 'info', 'verbose', 'debug', 'silly'];
+  const configuredLevel = process.env.ORKAS_LOG_LEVEL || 'info';
+  const fileLevel = levels.includes(configuredLevel) ? configuredLevel : 'info';
+  const consoleLevel = process.env.ORKAS_DEVTOOLS ? 'debug' : fileLevel;
+  // Disable direct transports before starting the worker: startup failure must
+  // never fall back to synchronous disk I/O in the business process.
+  log.transports.file.level = false;
+  log.transports.console.level = false;
+  // Renderer logging already has its own bounded bridge and console mirror.
+  // electron-log's implicit development IPC serializes raw data synchronously.
+  if (log.transports.ipc) log.transports.ipc.level = false;
+  try {
+    const delivery = createLogDelivery({
+      directory: LOGS_DIR, fileLevel, consoleLevel,
+      retainDays: RETAIN_DAYS, fileMaxBytes: FILE_MAX_BYTES, totalMaxBytes: TOTAL_MAX_BYTES,
+    });
+    const transport = (message: LogMessage) => {
+      if (!delivery.canAccept(message.level)) { delivery.noteDrop(); return; }
+      try {
+        delivery.send({
+          level: message.level, scope: typeof message.scope === 'string' ? sanitizeLogTextForUpload(message.scope.slice(0, 128)) : '',
+          date: message.date,
+          data: redact(message.data.slice(0, 16), new WeakSet(), { nodes: 0, chars: 0 }, 0, true),
+        });
+      } catch (_) { /* Logging must not fail the business operation. */ }
+    };
+    (transport as any).level = levels[Math.max(levels.indexOf(fileLevel), levels.indexOf(consoleLevel))];
+    (log.transports as any).background = transport;
+  } catch (_) { /* Worker unavailable: retain business availability. */ }
 
   // Catch uncaught main-process errors. Must come after transports are
   // configured so the first error hits the file.
@@ -342,7 +218,7 @@ export function initLogger(): void {
   // `data/logs/`. Without this, core-agent stream errors only print to
   // stderr and disappear when the dev terminal is closed — making "fetch
   // failed" impossible to retro-diagnose. The console transport writes each
-  // bridged record once through the original methods captured above.
+  // bridged record once in the worker.
   try {
     const consoleScope = log.scope('console');
     console.info = (...args: any[]) => { try { consoleScope.info(...args); } catch { /* noop */ } };
@@ -350,15 +226,8 @@ export function initLogger(): void {
     console.error = (...args: any[]) => { try { consoleScope.error(...args); } catch { /* noop */ } };
   } catch { /* noop */ }
 
-  // One-shot retention sweep. Log the outcome via the newly-initialized
-  // logger so the first line in today's file reads self-diagnostic.
-  const sweep = sweepLogs();
-  const boot = log.scope('logger');
-  if (sweep.removed.length > 0) {
-    boot.info(`retention sweep: removed ${sweep.removed.length} file(s)`, sweep.reason);
-  } else {
-    boot.info(`retention sweep: nothing to drop (${RETAIN_DAYS}d / ${Math.round(TOTAL_MAX_BYTES / 1024 / 1024)}MB caps)`);
-  }
+  // The worker owns retention, file creation, rotation and console transport.
+
 }
 
 // ── Scoped-logger factory ────────────────────────────────────────────────
@@ -380,13 +249,13 @@ export interface Logger {
  *   log.info('OAuth flow started', { provider: 'minimax-portal' });
  */
 export function createLogger(module: string): Logger {
-  const scope = (module || 'app').trim() || 'app';
+  const scope = typeof module === 'string' && module.length <= 128 ? sanitizeLogTextForUpload(module.trim()) || 'app' : 'app';
   const s = log.scope(scope);
   return {
-    error: (msg, ...args) => s.error(msg, ...args),
-    warn:  (msg, ...args) => s.warn (msg, ...args),
-    info:  (msg, ...args) => s.info (msg, ...args),
-    debug: (msg, ...args) => s.debug(msg, ...args),
+    error: (msg, ...args) => { initLogger(); s.error(msg, ...args); },
+    warn:  (msg, ...args) => { initLogger(); s.warn(msg, ...args); },
+    info:  (msg, ...args) => { initLogger(); s.info(msg, ...args); },
+    debug: (msg, ...args) => { initLogger(); s.debug(msg, ...args); },
   };
 }
 
@@ -405,7 +274,7 @@ export function logFromRenderer(payload: {
   const module = String(p.module || 'app').trim() || 'app';
   const scoped = createLogger(`renderer/${module}`);
   const msg = String(p.message ?? '');
-  const args = Array.isArray(p.data) ? p.data : [];
+  const args = Array.isArray(p.data) ? p.data.slice(0, 16) : [];
   switch ((p.level || 'info').toLowerCase()) {
     case 'error': return scoped.error(msg, ...args);
     case 'warn':  return scoped.warn (msg, ...args);

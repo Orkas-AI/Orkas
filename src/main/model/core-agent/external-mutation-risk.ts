@@ -7,6 +7,8 @@
  * "DELETE" in `echo`, documentation, or a search pattern is not an action.
  */
 
+import { pythonSqliteResources, type SqliteResource } from './python-sqlite-resources';
+
 export type ExternalMutationKind =
   | 'database_write'
   | 'remote_command'
@@ -21,6 +23,9 @@ export interface ExternalMutationFinding {
   kind: ExternalMutationKind;
   action: string;
   target?: string;
+  /** Internal provenance only; the host authorizes the resource and removes it
+   * before serializing the existing permission payload. */
+  resource?: SqliteResource;
 }
 
 const HELP_FLAGS = new Set(['--help', '-h', '-?', '/?', '--version']);
@@ -247,6 +252,24 @@ export function classifyExternalMutationCommand(cmdRaw: string, args: readonly s
     return target ? { kind: 'external_launch', action: 'start', target } : null;
   }
 
+  // SHUTDOWN changes a service even when it targets localhost. It is not the
+  // operating-system shutdown executable, and endpoint locality is not ownership.
+  if (cmd === 'redis-cli' || cmd === 'redis-cli.exe') {
+    const valueOptions = new Set([
+      '-h', '-p', '-t', '-s', '-a', '-u', '-r', '-i', '-n', '-d', '-D', '-X',
+      '--user', '--pass', '--name', '--sni', '--cacert', '--cacertdir', '--cert',
+      '--key', '--tls-ciphers', '--tls-ciphersuites', '--show-pushes',
+    ]);
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i];
+      if (arg === '--help' || arg === '--version') return null;
+      if (valueOptions.has(arg)) { i++; continue; }
+      if (arg.startsWith('-')) continue;
+      const action = args.includes('--quoted-input') ? arg.replace(/^["']|["']$/g, '') : arg;
+      return action.toLowerCase() === 'shutdown' ? { kind: 'service_change', action: 'shutdown' } : null;
+    }
+    return null;
+  }
   if (DATABASE_CLIENTS.has(cmd)) {
     if (args.some((arg) => arg === '--help' || arg === '--version' || arg === '-?')) return null;
     return databaseMutation(args);
@@ -329,52 +352,93 @@ export function classifyExternalMutationCommand(cmdRaw: string, args: readonly s
   return null;
 }
 
-function literalCallArguments(source: string, callPattern: RegExp): string[] {
+// Preserve offsets and literal arguments while excluding example text from
+// executable call matching. Interpolations are expressions, not literal text.
+// This is a bounded lexical inspection, not a language interpreter or sandbox.
+function scriptCodeMask(source: string): Uint8Array {
+  const code = new Uint8Array(source.length).fill(1);
+  const scan = (start: number, interpolation: boolean, depth: number): number => {
+    // Retain conservative inspection of the remaining text at the nesting cap.
+    if (depth >= 32) return source.length;
+    let braces = 0;
+    let lineHasCode = interpolation;
+    for (let i = start; i < source.length;) {
+      const char = source[i];
+      if (char === '\n') { lineHasCode = false; i++; continue; }
+      if (!lineHasCode && (char === '#' || source.startsWith('//', i))) {
+        const end = source.indexOf('\n', i);
+        const next = end < 0 ? source.length : end;
+        code.fill(0, i, next);
+        i = next;
+        continue;
+      }
+      const blockEnd = source.startsWith('/*', i) ? '*/' : source.startsWith('<!--', i) ? '-->' : '';
+      if (blockEnd) {
+        const end = source.indexOf(blockEnd, i + 2);
+        const next = end < 0 ? source.length : end + blockEnd.length;
+        code.fill(0, i, next);
+        i = next;
+        continue;
+      }
+      if (!/\s/.test(char)) lineHasCode = true;
+      if (interpolation && char === '}' && braces-- === 0) return i + 1;
+      if (char === '{') braces++;
+      if (char !== '"' && char !== "'" && char !== '`') { i++; continue; }
+      const quote = char !== '`' && source.startsWith(char.repeat(3), i) ? char.repeat(3) : char;
+      const formatted = char !== '`' && /(?:^|\W)(?:f|fr|rf)$/i.test(source.slice(Math.max(0, i - 3), i));
+      let segment = i;
+      i += quote.length;
+      while (i < source.length) {
+        // Python backslashes do not escape replacement-field braces. JS
+        // template escapes do, including an escaped `${` sequence.
+        if (source[i] === '\\') { i += formatted && source[i + 1] === '{' ? 1 : 2; continue; }
+        // Do not let an unmatched quote in a trailing comment hide executable
+        // code on following lines. Multiline source uses triple/template quotes.
+        if (source[i] === '\n' && quote.length === 1 && char !== '`') break;
+        if (source.startsWith(quote, i)) { i += quote.length; break; }
+        if (formatted && source.startsWith('{{', i)) { i += 2; continue; }
+        const expression = char === '`' && source.startsWith('${', i) ? 2
+          : formatted && source[i] === '{' ? 1 : 0;
+        if (expression) {
+          code.fill(0, segment, i + expression);
+          i = scan(i + expression, true, depth + 1);
+          segment = i;
+        } else i++;
+      }
+      code.fill(0, segment, i);
+    }
+    return source.length;
+  };
+  scan(0, false, 0);
+  return code;
+}
+
+function* executableMatches(source: string, pattern: RegExp, code: Uint8Array) {
+  for (const match of source.matchAll(pattern)) {
+    if (code[match.index!]) yield match;
+  }
+}
+
+const SCRIPT_LITERAL = /(?:[rubf]{0,2})?(?:"""([\s\S]{0,4000}?)"""|'''([\s\S]{0,4000}?)'''|'((?:\\.|[^'\\\n]){0,4000})'|"((?:\\.|[^"\\\n]){0,4000})"|`((?:\\.|[^`\\]){0,4000})`)/.source;
+
+function matchedLiteral(match: RegExpMatchArray): string | undefined {
+  return match.slice(1).find(value => value !== undefined)?.replace(/\\(['"`\\])/g, '$1');
+}
+
+function literalCallArguments(source: string, callPattern: RegExp, code: Uint8Array): string[] {
   const results: string[] = [];
-  for (const match of source.matchAll(callPattern)) {
-    const value = match[1] || match[2] || match[3];
-    if (value) results.push(value.replace(/\\(['"`\\])/g, '$1'));
+  for (const match of executableMatches(source, callPattern, code)) {
+    const value = matchedLiteral(match);
+    if (value) results.push(value);
   }
   return results;
 }
 
-function isOutputOnlyLine(line: string): boolean {
-  const start = /^\s*(?:print|console\.(?:log|info|warn|error))\s*\(/.exec(line);
-  if (!start) return false;
-  let depth = 1;
-  let quote = '';
-  let escaped = false;
-  for (let index = start[0].length; index < line.length; index++) {
-    const char = line[index];
-    if (escaped) { escaped = false; continue; }
-    if (char === '\\') { escaped = true; continue; }
-    if (quote) {
-      if (char === quote) quote = '';
-      continue;
-    }
-    if (char === '"' || char === "'" || char === '`') { quote = char; continue; }
-    if (char === '(') depth++;
-    if (char !== ')') continue;
-    depth--;
-    if (depth === 0) return /^\s*;?\s*$/.test(line.slice(index + 1));
-  }
-  return false;
-}
-
-function sourceWithoutNonExecutableExamples(source: string): string {
-  const withoutBlocks = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/<!--[\s\S]*?-->/g, '');
-  return withoutBlocks.split(/\r?\n/).filter((line) => (
-    !/^\s*(?:#|\/\/|\*)/.test(line) && !isOutputOnlyLine(line)
-  )).join('\n');
-}
-
-function assignedLiteral(source: string, variable: string): string | undefined {
+function assignedLiteral(source: string, variable: string, code: Uint8Array): string | undefined {
   const escaped = variable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern = '\\b' + escaped + '\\s*=\\s*(?:[rubf]{0,2})?'
-    + '(?:"""([\\s\\S]{1,4000}?)"""|\'\'\'([\\s\\S]{1,4000}?)\'\'\''
-    + '|\'([^\'\\n]{1,4000})\'|"([^"\\n]{1,4000})"|`([^`]{1,4000})`)';
-  const match = new RegExp(pattern, 'i').exec(source);
-  return match?.[1] || match?.[2] || match?.[3] || match?.[4] || match?.[5];
+  const pattern = new RegExp('\\b' + escaped + '\\s*=\\s*' + SCRIPT_LITERAL, 'gi');
+  for (const match of executableMatches(source, pattern, code)) return matchedLiteral(match);
+  return undefined;
 }
 
 /**
@@ -382,38 +446,66 @@ function assignedLiteral(source: string, variable: string): string | undefined {
  * an executable call shape (execute/exec_command/upload/HTTP verb), so a SQL
  * migration mentioned only in a comment or README string does not prompt.
  */
-export function classifyExternalMutationScript(sourceRaw: string): ExternalMutationFinding[] {
-  const source = sourceWithoutNonExecutableExamples(String(sourceRaw || ''));
+export function classifyExternalMutationScript(sourceRaw: string, options?: { language?: 'python' }): ExternalMutationFinding[] {
+  return inspectScript(String(sourceRaw || ''), 0, options?.language);
+}
+
+function inspectScript(source: string, depth: number, language?: 'python'): ExternalMutationFinding[] {
+  const code = depth < 4 ? scriptCodeMask(source) : new Uint8Array(source.length).fill(1);
+  const resources = language === 'python' ? pythonSqliteResources(source) : new Map<number, SqliteResource>();
   const findings: ExternalMutationFinding[] = [];
   const add = (finding: ExternalMutationFinding | null) => {
     if (!finding) return;
-    if (!findings.some((item) => item.kind === finding.kind && item.action === finding.action && item.target === finding.target)) findings.push(finding);
+    if (!findings.some((item) => item.kind === finding.kind && item.action === finding.action && item.target === finding.target
+      && item.resource?.database === finding.resource?.database)) findings.push(finding);
+  };
+  const addSql = (literal: string | undefined, at: number) => {
+    if (!literal) return;
+    const finding = sqlFinding(literal);
+    if (finding) add({ ...finding, ...(resources.has(at) ? { resource: resources.get(at)! } : {}) });
   };
 
-  const executeCalls = /(?:\.\s*(?:execute|executemany|query)|\bmysqli_query)\s*\(\s*(?:[rubf]{0,2})?(?:'([^'\n]{1,4000})'|"([^"\n]{1,4000})"|`([^`]{1,4000})`)/gim;
-  for (const literal of literalCallArguments(source, executeCalls)) add(sqlFinding(literal));
+  const executeCalls = new RegExp('(?:\\.\\s*(?:execute|executemany|query)|\\bmysqli_query)\\s*\\(\\s*' + SCRIPT_LITERAL, 'gim');
+  for (const match of executableMatches(source, executeCalls, code)) addSql(matchedLiteral(match), match.index!);
 
-  const remoteExecCalls = /\.\s*(?:exec_command|execCommand)\s*\(\s*(?:[rubf]{0,2})?(?:'([^'\n]{1,4000})'|"([^"\n]{1,4000})"|`([^`]{1,4000})`)/gim;
-  for (const literal of literalCallArguments(source, remoteExecCalls)) {
+  const remoteExecCalls = new RegExp('\\.\\s*(?:exec_command|execCommand)\\s*\\(\\s*' + SCRIPT_LITERAL, 'gim');
+  for (const literal of literalCallArguments(source, remoteExecCalls, code)) {
     add(shellLikeMutation(literal));
     for (const interpolation of literal.matchAll(/\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}/g)) {
-      const value = assignedLiteral(source, interpolation[1]);
+      const value = assignedLiteral(source, interpolation[1], code);
       if (value) add(sqlFinding(value) || shellLikeMutation(value));
     }
   }
 
   const variableSink = /(?:\.\s*(?:execute|executemany|query|exec_command|execCommand)|\bmysqli_query)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\b/gim;
-  for (const match of source.matchAll(variableSink)) {
-    const value = assignedLiteral(source, match[1]);
-    if (value) add(sqlFinding(value) || shellLikeMutation(value));
+  for (const match of executableMatches(source, variableSink, code)) {
+    const value = assignedLiteral(source, match[1], code);
+    if (value) {
+      if (sqlFinding(value)) addSql(value, match.index!);
+      else add(shellLikeMutation(value));
+    }
   }
 
-  if (/(?:\bsftp\s*\.\s*put|\.\s*(?:upload_file|uploadFile|put_object|upload_fileobj))\s*\(/i.test(source)
-    && /\b(?:sftp|paramiko|boto3|ssh2|scp)\b/i.test(source)) {
+  if (executableMatches(source, /(?:\bsftp\s*\.\s*put|\.\s*(?:upload_file|uploadFile|put_object|upload_fileobj))\s*\(/gi, code).next().value
+    && executableMatches(source, /\b(?:sftp|paramiko|boto3|ssh2|scp)\b/gi, code).next().value) {
     add({ kind: 'remote_file_write', action: 'upload' });
   }
-  const httpCall = /\b(?:requests|httpx|axios)\s*\.\s*(post|put|patch|delete)\s*\(|\bfetch\s*\([^)]{0,1000}\bmethod\s*:\s*['"](POST|PUT|PATCH|DELETE)['"]/i.exec(source);
-  if (httpCall) add({ kind: 'external_api_write', action: (httpCall[1] || httpCall[2]).toUpperCase() });
+  const httpCalls = /\b(?:requests|httpx|axios)\s*\.\s*(post|put|patch|delete)\s*\(|\bfetch\s*\([^)]{0,1000}\bmethod\s*:\s*['"](POST|PUT|PATCH|DELETE)['"]/gi;
+  for (const match of executableMatches(source, httpCalls, code)) {
+    add({ kind: 'external_api_write', action: (match[1] || match[2]).toUpperCase() });
+  }
+
+  // A literal becomes executable again at an explicit evaluation sink. Bound
+  // recursion; at the cap retain the previous conservative text inspection.
+  if (depth < 4) {
+    const evaluations = new RegExp('\\b(?:exec|eval|Function)\\s*\\(\\s*' + SCRIPT_LITERAL, 'gi');
+    const evaluated = literalCallArguments(source, evaluations, code);
+    for (const match of executableMatches(source, /\b(?:exec|eval|Function)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\b/gi, code)) {
+      const value = assignedLiteral(source, match[1], code);
+      if (value) evaluated.push(value);
+    }
+    for (const value of new Set(evaluated)) for (const finding of inspectScript(value, depth + 1)) add(finding);
+  }
 
   return findings;
 }

@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { estimateBudgetTokens } from '../../../../src/main/util/token-estimate';
 
 import {
-  CLI_HISTORY_MAX_MESSAGE_BYTES,
   CLI_HISTORY_MAX_TURNS,
-  CLI_RECOVERY_MAX_BYTES,
+  CLI_HISTORY_MAX_TOKENS,
   buildCliDurableInstructions,
   buildCliConversationContext,
   buildCliTurnPrompt,
@@ -44,6 +44,27 @@ function plan() {
 }
 
 describe('local_agents/context › semantic CLI context', () => {
+  it.each(['recovery', 'incremental'] as const)('marks %s dialogue as a partial execution view without inventing archived facts', (mode) => {
+    expect(buildCliConversationContext({ mode, turns: [] })).toBe('');
+    const context = buildCliConversationContext({ mode, turns: [{ id: 'recent', messages: ['User: Check Cedar', 'Agent: Check completed'] }] });
+    expect(context).toContain('not a full execution transcript');
+    expect(context).toContain('public tool records may be available via chat_history');
+    expect(context).not.toContain('older turns omitted');
+    expect(context).toContain('User: Check Cedar');
+    expect(context).toContain('Agent: Check completed');
+  });
+
+  it('omits inline image/video payloads before CLI clipping while preserving file references', () => {
+    const output = buildCliConversationContext({ mode: 'recovery', turns: [{ id: 'media', messages: [
+      'data:image/png;base64,' + 'AAAA'.repeat(100_000) + ' MIDDLE_FACT /work/chart.png '
+        + 'data:video/mp4;base64,' + 'BBBB'.repeat(100_000) + ' /work/clip.mp4',
+    ] }] });
+    expect(output).toContain('MIDDLE_FACT');
+    expect(output).toContain('/work/chart.png');
+    expect(output).toContain('/work/clip.mp4');
+    expect(output).not.toMatch(/AAAA|BBBB|truncated/);
+  });
+
   it.each([
     ['claude', 'native', 'invocation'],
     ['codex', 'native', 'session'],
@@ -219,47 +240,50 @@ describe('local_agents/context › semantic CLI context', () => {
     expect(resumed.resumeFallbackPrompt).toContain('FULL_HISTORY_MUST_ONLY_BE_FALLBACK');
   });
 
-  it('bounds canonical CLI history by complete turn count, total bytes, and single-message bytes', () => {
-    const context = buildCliConversationContext({
-      mode: 'recovery',
-      turns: Array.from({ length: 25 }, (_, index) => ({
-        id: String(index + 1),
-        messages: [`turn-${index + 1} ${index === 24 ? 'z'.repeat(20_000) : 'short'}`],
-      })),
-      maxBytes: 4096,
-      maxTurns: 20,
-      maxMessageBytes: 1024,
-    });
-
-    expect(Buffer.byteLength(context, 'utf8')).toBeLessThanOrEqual(4096);
-    expect(context).toContain('turn-25');
-    expect(context).toContain('message truncated by Orkas');
-    expect(context).not.toContain('turn-1 ');
-    expect(context).toMatch(/older turns? omitted/);
+  it.each(['recovery', 'incremental'] as const)('keeps five complete turns in %s without cutting long messages', (mode) => {
+    const turns = Array.from({ length: 7 }, (_, i) => ({ id: String(i),
+      messages: [`INPUT_${i} ${'x'.repeat(9000)} MIDDLE_${i} ${'x'.repeat(9000)} END_${i}`] }));
+    const original = JSON.stringify(turns);
+    const context = buildCliConversationContext({ mode, turns });
+    expect(context).not.toContain('INPUT_1');
+    expect(context.match(/^### Turn /gm)).toHaveLength(5);
+    for (let i = 2; i < 7; i++) expect(context).toContain(turns[i].messages[0]);
+    expect(estimateBudgetTokens(context)).toBeLessThanOrEqual(30_000);
+    expect(JSON.stringify(turns)).toBe(original);
   });
 
-  it('enforces the production CLI history limits without overriding test budgets', () => {
-    expect(CLI_HISTORY_MAX_TURNS).toBe(20);
-    expect(CLI_RECOVERY_MAX_BYTES).toBe(16 * 1024);
-    expect(CLI_HISTORY_MAX_MESSAGE_BYTES).toBe(8 * 1024);
-
-    const context = buildCliConversationContext({
-      mode: 'recovery',
-      turns: Array.from({ length: 25 }, (_, index) => ({
-        id: String(index + 1),
-        messages: [index === 24
-          ? `NEWEST_DEFAULT_LIMIT_FACT=violet-orbit\n${'界'.repeat(6_000)}`
-          : `DEFAULT_LIMIT_TURN_${String(index + 1).padStart(2, '0')} ${'x'.repeat(900)}`],
-      })),
+  it('clips the oldest text under the token cap including Chinese text and framing', () => {
+    const context = buildCliConversationContext({ mode: 'recovery',
+      turns: Array.from({ length: 7 }, (_, i) => ({ id: String(i), messages: [`INPUT_${i} ${'界'.repeat(6000)} END_${i}`] })),
     });
+    expect(estimateBudgetTokens(context)).toBeLessThanOrEqual(30_000);
+    expect(context.match(/^### Turn /gm)).toHaveLength(4);
+    expect(context).not.toContain('INPUT_3');
+    for (let i = 3; i < 7; i++) expect(context).toContain(`END_${i}`);
+    expect(context).toContain('3 older turns omitted');
+    expect(context).toContain('[Earlier history text omitted]');
+  });
 
-    expect(Buffer.byteLength(context, 'utf8')).toBeLessThanOrEqual(CLI_RECOVERY_MAX_BYTES);
-    expect((context.match(/^### Turn /gm) || []).length).toBeLessThanOrEqual(CLI_HISTORY_MAX_TURNS);
-    expect(context).toContain('NEWEST_DEFAULT_LIMIT_FACT=violet-orbit');
-    expect(context).toContain('message truncated by Orkas');
-    expect(context).toMatch(/older turns? omitted/);
-    expect(context).not.toContain('DEFAULT_LIMIT_TURN_01');
-    expect(context).not.toContain('\uFFFD');
+  it('clips an oversized newest turn without backfilling old dialogue or cutting current input', () => {
+    const recoveryContext = buildCliConversationContext({ mode: 'recovery', turns: [
+      { id: 'old', messages: ['OLD_SMALL'] }, { id: 'new', messages: ['NEW_BIG ' + '界'.repeat(30_000) + ' NEW_TAIL', 'LATEST_REPLY'] },
+    ] });
+    expect(recoveryContext).not.toMatch(/OLD_SMALL|NEW_BIG/);
+    expect(recoveryContext).toContain('1 older turn omitted');
+    expect(recoveryContext).toContain('NEW_TAIL');
+    expect(recoveryContext).toContain('LATEST_REPLY');
+    expect(estimateBudgetTokens(recoveryContext)).toBeLessThanOrEqual(30_000);
+    const current = 'CURRENT ' + '界'.repeat(35_000);
+    expect(materializeCliContext(createCliContextPlan({ durableInstructions: '', turnPrompt: current, recoveryContext }),
+      { cli: 'codex', resumed: false }).prompt).toContain(current);
+  });
+
+  it('keeps host and core fixed ceilings in agreement', async () => {
+    const { RECENT_HISTORY_MAX_TURNS, RECENT_HISTORY_MAX_TOKENS } = await import('../../../../src/core-agent/src/agent/session');
+    expect(CLI_HISTORY_MAX_TURNS).toBe(5);
+    expect(CLI_HISTORY_MAX_TOKENS).toBe(30_000);
+    expect(CLI_HISTORY_MAX_TURNS).toBe(RECENT_HISTORY_MAX_TURNS);
+    expect(CLI_HISTORY_MAX_TOKENS).toBe(RECENT_HISTORY_MAX_TOKENS);
   });
 
   it('keeps a plain turn byte-small when no dynamic protocol or attachment exists', () => {

@@ -10,6 +10,7 @@ import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { spawn } from 'node:child_process';
 import {
   CLAUDE_BACKGROUND_TIMEOUT_MS,
   claudeBackend,
@@ -63,6 +64,22 @@ describe('local_agents/backends/claude › end-to-end with fake CLI', () => {
 
   it('uses an exact 24-hour production background cap', () => {
     expect(CLAUDE_BACKGROUND_TIMEOUT_MS).toBe(24 * 60 * 60_000);
+  });
+
+  it('settles an is_error result as one failure even with success subtype and a clean CLI exit', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', emitAfterPrompt([
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-error-result' }),
+      JSON.stringify({ type: 'result', subtype: 'success', is_error: true, errors: [], result: 'API connection failed' }),
+    ]) + "process.stdin.on('end', () => process.exit(0));\n");
+    const events: any[] = [];
+    await claudeBackend.run({
+      binPath: fake, prompt: 'Inspect the fixture', cwd: tmpDir,
+      signal: new AbortController().signal, onEvent: event => events.push(event), timeoutMs: 3_000,
+    });
+    expect(events.filter(event => event.type === 'done')).toEqual([
+      expect.objectContaining({ type: 'done', status: 'failed', error: 'API connection failed' }),
+    ]);
+    expect(events).not.toContainEqual(expect.objectContaining({ type: 'status', status: 'result' }));
   });
 
   it('parses a minimal completed conversation', async () => {
@@ -352,6 +369,41 @@ process.exit(7);
     expect(done.status).toBe('cancelled');
   });
 
+  it('cancels the native CLI subtree before EOF while preserving unrelated work', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', [
+      "const { spawn } = require('node:child_process');",
+      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });",
+      "require('node:fs').writeFileSync('cancel-pids.json', JSON.stringify([process.pid, child.pid]));",
+      "process.stdin.resume(); process.stdin.on('end', () => process.exit(0));",
+    ].join('\n'));
+    const unrelated = spawn(TEST_NODE, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const controller = new AbortController();
+    const events: any[] = [];
+    let pids: number[] = [];
+    const run = claudeBackend.run({ binPath: fake, prompt: 'hi', cwd: tmpDir,
+      signal: controller.signal, onEvent: event => events.push(event), timeoutMs: 10_000 });
+    try {
+      const file = path.join(tmpDir, 'cancel-pids.json');
+      await expect.poll(() => {
+        try { pids = JSON.parse(fs.readFileSync(file, 'utf8')); return pids.length; } catch { return 0; }
+      }, { timeout: 3_000 }).toBe(2);
+      expect(pids.every(alive)).toBe(true);
+      controller.abort();
+      await run;
+      expect(events.filter(event => event.type === 'done')).toEqual([
+        expect.objectContaining({ status: 'cancelled' }),
+      ]);
+      await expect.poll(() => pids.some(alive), { timeout: 3_000 }).toBe(false);
+      expect(alive(unrelated.pid!)).toBe(true);
+    } finally {
+      controller.abort();
+      await run;
+      for (const pid of pids) { if (alive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch {} } }
+      unrelated.kill('SIGKILL');
+    }
+  });
+
   it('reports timeout when Claude never emits a terminal result', async () => {
     const fake = writeNodeExecutable(tmpDir, 'claude', `setInterval(() => {}, 1_000);\n`);
     const events: any[] = [];
@@ -568,7 +620,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
       await vi.waitFor(() => expect(requestId).not.toBe(''), { timeout: 5000 });
       let finished = false;
       const cancel = userInput.cancelRequest(requestId, 'u-input').then(result => { finished = true; return result; });
-      await vi.waitFor(() => expect(events).toContainEqual({ type: 'text-delta', text: 'Unrelated receipt delivered.' }));
+      await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({ type: 'text-delta', text: 'Unrelated receipt delivered.' })));
       expect(finished).toBe(false);
       if (boundary !== 'confirmed') {
         // The real child has consumed our reply. Withhold its receipt through
@@ -885,6 +937,7 @@ process.stdin.on('data', (buf) => {
         type: 'done',
         status: 'completed',
         output: 'main answer\n\nthe build passed',
+        finalMessageText: 'the build passed',
         sessionId: 'sess-linger',
       });
       expect(events.some(event => (

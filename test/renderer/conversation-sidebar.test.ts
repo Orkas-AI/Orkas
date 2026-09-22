@@ -209,6 +209,8 @@ function loadConversationRenderer() {
       'chat.process.action_not_allowed': 'Not allowed',
       'chat.process.status_done': 'Done',
       'chat.process.status_failed': 'Failed',
+      'chat.process.status_not_executed': 'Not executed',
+      'chat.process.preparing_action': `Preparing: ${params?.label || ''}`,
       'chat.process.video_narration_timing_mismatch': `Narration ${params?.measured}s outside ${params?.min}-${params?.max}s`,
       'chat.process.video_narration_timing_decision': `Narration ${params?.measured}s still outside ${params?.min}-${params?.max}s; decide next step`,
       'chat.process.repeated_failure_decision': 'Current candidate failed repeatedly; decide next step',
@@ -300,6 +302,7 @@ function loadConversationRenderer() {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/strip-structural-blocks.js'), 'utf8'), context);
   const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
   vm.runInContext(source, context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/queue-draft.js'), 'utf8'), context);
   return context;
 }
 
@@ -1059,6 +1062,183 @@ describe('conversation history initial window', () => {
 
     expect(context.conversations.map((item: any) => item.conversation_id)).toEqual(['keep']);
     expect(views).toEqual(['new-chat']);
+  });
+});
+
+
+describe('conversation history response ordering', () => {
+  const question = { id: 'u1', from: 'user', text: 'Question', ts: '2026-01-01T00:00:00Z' };
+  const answer = {
+    id: 'a1', from: 'commander', text: 'Answer', ts: '2026-01-01T00:00:01Z',
+    produced: ['synthetic-output.png'], form: { title: 'Review', fields: [] },
+  };
+  const response = (history: any[], extra: any = {}) => ({
+    json: async () => ({ ok: true, history, conversation: { processing: false }, next_cursor: null, ...extra }),
+  });
+  function setup() {
+    const context = loadConversationRenderer();
+    const rows: any[] = [];
+    const history: any = {
+      classList: { remove() {} }, style: { removeProperty() {} },
+      querySelector: () => null, querySelectorAll: () => [],
+      addEventListener() {}, scrollHeight: 100, scrollTop: 0,
+      appendChild(fragment: any) { rows.push(...fragment.children); },
+    };
+    let html = '';
+    Object.defineProperty(history, 'innerHTML', {
+      get: () => html,
+      set: (value) => { html = value; rows.length = 0; },
+    });
+    context.currentCid = 'c1';
+    context.performance = performance;
+    context._agentsCache = [];
+    context.convAgentEnabledByCid = new Map();
+    context.pollMsgCounts = new Map();
+    context.messageQueues = new Map();
+    context.document.getElementById = (id: string) => id === 'chat-history' ? history : null;
+    context.document.createDocumentFragment = () => ({ children: [] });
+    for (const name of ['_ensureCreateAgentInlineObserver', '_ensureConvCreateAgentInline',
+      '_renderConvDisabledBanner', '_updateConvSendUI', '_scrollToBottomNoAnim',
+      '_scheduleConversationTurnNavigation', '_syncFailedFromHistory',
+      '_bumpConvToTop', '_scheduleConversationInfoFileRefresh']) context[name] = () => {};
+    context._refreshGroupMembers = async () => [];
+    context._evaluateAutoRecipient = async () => {};
+    context._recoverMissingConversation = vi.fn();
+    // Exercise the real request, projection, visibility, and live-event paths;
+    // replace only the final DOM/card drawing with observable message rows.
+    context.appendChatMessage = (message: any, _scroll: boolean, opts: any = {}) => {
+      const node = { message, dataset: { msgId: message._msg_id } };
+      if (opts.container) opts.container.children.push(node);
+      else rows.push(node);
+      return node;
+    };
+    let resolve!: (value: any) => void;
+    let reject!: (error: Error) => void;
+    context.apiFetch = () => new Promise((res, rej) => { resolve = res; reject = rej; });
+    return {
+      context, rows, history,
+      resolve: (value: any) => resolve(value), reject: (error: Error) => reject(error),
+      ids: () => rows.map((row) => row.message._msg_id),
+      receive: (gm: any, cid = 'c1') => context._handleGroupBusEvent(cid, null, {
+        type: 'message', msg: gm, turn_end: gm.from !== 'user',
+      }),
+    };
+  }
+
+  it.each(['success', 'failure', 'missing'] as const)('ignores an older request after a newer load succeeds: %s', async (outcome) => {
+    const s = setup();
+    const older = s.context.loadConversationHistory('c1');
+    s.context.apiFetch = async () => response([question, answer]);
+    await s.context.loadConversationHistory('c1');
+    expect(s.ids()).toEqual(['u1', 'a1']);
+    if (outcome === 'failure') s.reject(new Error('Synthetic IPC failure'));
+    else s.resolve(response([question], outcome === 'missing' ? { ok: false, code: 'E_CONVERSATION_NOT_FOUND' } : {}));
+    await older;
+    expect(s.ids()).toEqual(['u1', 'a1']);
+    expect(s.context._recoverMissingConversation).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('retains a live reply and its sidecars without duplication (already in snapshot: %s)', async (included) => {
+    const s = setup();
+    const loading = s.context.loadConversationHistory('c1');
+    s.receive(answer);
+    expect(s.ids()).toEqual(['a1']);
+    s.resolve(response(included ? [question, answer] : [question], {
+      page_start: 20, history_indexes: included ? [20, 21] : [20],
+    }));
+    await loading;
+    expect(s.ids()).toEqual(['u1', 'a1']);
+    expect(s.rows[1].message).toMatchObject({ content: 'Answer', produced: answer.produced, form: answer.form });
+    expect(s.rows[1].message._history_index).toBe(included ? 21 : undefined);
+    // The temporary arrival buffer must not become a persistent shadow history.
+    s.context.apiFetch = async () => response([question]);
+    await s.context.loadConversationHistory('c1');
+    expect(s.ids()).toEqual(['u1']);
+  });
+
+  it('preserves a reply if the current history request fails after it arrives', async () => {
+    const s = setup();
+    const loading = s.context.loadConversationHistory('c1');
+    s.receive(answer);
+    s.reject(new Error('Synthetic IPC failure'));
+    await loading;
+    expect(s.ids()).toEqual(['a1']);
+  });
+
+  it('retains admitted user messages alongside new replies while history is loading', async () => {
+    const s = setup();
+    s.context._claimPersistedUserMessage = () => false;
+    s.context._syncRenderedGroupMessageIdentity = () => {};
+    s.context._moveUserBeforeOrphanLivePlaceholder = () => {};
+    s.context._markEarlierLiveMessagesForUser = () => {};
+    const loading = s.context.loadConversationHistory('c1');
+    s.receive(question);
+    s.receive(answer);
+    s.resolve(response([]));
+    await loading;
+    expect(s.ids()).toEqual(['u1', 'a1']);
+  });
+
+  it('retains a reply recovered by polling during the history request', async () => {
+    const s = setup();
+    const loading = s.context.loadConversationHistory('c1');
+    await s.context._recoverPolledVisibleMessages('c1', [answer]);
+    expect(s.ids()).toEqual(['a1']);
+    s.resolve(response([question]));
+    await loading;
+    expect(s.ids()).toEqual(['u1', 'a1']);
+  });
+
+  it('does not paint polled replies after switching conversations during member refresh', async () => {
+    const s = setup();
+    let finishMembers!: () => void;
+    s.context._refreshGroupMembers = () => new Promise<void>((resolve) => { finishMembers = resolve; });
+    const polling = s.context._recoverPolledVisibleMessages('c1', [answer]);
+    s.context.currentCid = 'c2';
+    finishMembers();
+    expect(await polling).toBe(false);
+    expect(s.ids()).toEqual([]);
+  });
+
+  it('carries unpainted arrivals into a replacement history request', async () => {
+    const s = setup();
+    const older = s.context.loadConversationHistory('c1');
+    const finishOlder = s.resolve;
+    s.receive(answer);
+    s.context.apiFetch = async () => response([question]);
+    await s.context.loadConversationHistory('c1');
+    expect(s.ids()).toEqual(['u1', 'a1']);
+    finishOlder(response([]));
+    await older;
+    expect(s.ids()).toEqual(['u1', 'a1']);
+  });
+
+  it('does not mix background messages into a loading conversation', async () => {
+    const s = setup();
+    const loading = s.context.loadConversationHistory('c1');
+    s.receive({ ...answer, id: 'foreign' }, 'c2');
+    s.resolve(response([question]));
+    await loading;
+    expect(s.ids()).toEqual(['u1']);
+  });
+
+  it('does not let a failed request from a previous conversation erase the current one', async () => {
+    const s = setup();
+    const older = s.context.loadConversationHistory('c1');
+    s.context.currentCid = 'c2';
+    s.context.apiFetch = async () => response([{ ...answer, id: 'c2-answer' }]);
+    await s.context.loadConversationHistory('c2');
+    s.reject(new Error('Synthetic IPC failure'));
+    await older;
+    expect(s.ids()).toEqual(['c2-answer']);
+  });
+
+  it('keeps a painted transcript if a secondary post-paint action rejects', async () => {
+    const s = setup();
+    s.context.apiFetch = async () => response([question, answer]);
+    s.context._evaluateAutoRecipient = async () => { throw new Error('Synthetic secondary failure'); };
+    await s.context.loadConversationHistory('c1');
+    expect(s.ids()).toEqual(['u1', 'a1']);
   });
 });
 
@@ -2320,6 +2500,177 @@ describe('conversation sticky scroll', () => {
 });
 
 describe('conversation stream lifecycle idempotency', () => {
+  it.each([false, true])('preserves an active recovery stream through pairing, cancellation, and reconnection (side observer: %s)', async (allowWithController) => {
+    const context = loadConversationRenderer();
+    const shouldDeferCleanup = context._observerShouldDeferCleanup;
+    const { loadingEl } = setupRunningObserverTestContext(context);
+    context._observerShouldDeferCleanup = shouldDeferCleanup;
+    context._removeEmptyStreamingPlaceholder = () => {};
+    const cleanup = vi.fn();
+    context._finishStreamingMsg = cleanup;
+    context._makeStreamPaintYield = () => () => null;
+    const delivered: any[] = [];
+    context._handleGroupBusEvent = (_cid: string, _el: unknown, event: any) => delivered.push(event);
+    const streams: Array<{ writer: ReadableStreamDefaultController<Uint8Array>; signal: AbortSignal }> = [];
+    context.apiFetch = async (url: string, options: any = {}) => {
+      if (url.includes('/history')) return { ok: true, json: async () => ({ ok: true, history: [] }) };
+      const body = new ReadableStream<Uint8Array>({
+        start(writer) {
+          streams.push({ writer, signal: options.signal });
+          options.signal.addEventListener('abort', () => writer.close(), { once: true });
+        },
+      });
+      return { ok: true, body };
+    };
+    const publish = (index: number, ...events: any[]) => streams[index].writer.enqueue(
+      new TextEncoder().encode(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('')),
+    );
+    const progress = (turn: string) => ({
+      type: 'process', actor: 'commander', turn_id: turn, seg: 0,
+      data: { type: 'delta', phase: 'commentary', text: 'Still checking.\n' },
+    });
+    const first = progress('before-pairing');
+    const next = progress('after-pairing');
+    const resumed = progress('after-reconnect');
+    const terminal = { type: 'message', msg: { id: 'reply-1', from: 'commander', text: 'Done.' } };
+    const observer = context._observeConversationRunFromPlanAction('c1', { attachExisting: true, allowWithController });
+    let reconnected: { cancel(): void } | null = null;
+    try {
+      publish(0, first);
+      await vi.waitFor(() => expect(delivered).toEqual([first]));
+      context.__primaryController = { abort: vi.fn() };
+      context.pendingConvs.get('c1').controller = context.__primaryController;
+      vm.runInContext(`_convChatCtrls.set('c1', __primaryController)`, context);
+      // Repeated polling/send triggers must reuse the same active transport.
+      for (let i = 0; i < 3; i += 1) {
+        context._observeConversationRunFromPlanAction('c1', { attachExisting: true, allowWithController: true });
+      }
+      expect(streams).toHaveLength(1);
+      context._handleStreamEvent('c1', loadingEl, {
+        type: 'event', event: { stream: 'group', data: next },
+      });
+      publish(0, next, terminal);
+      await vi.waitFor(() => expect(delivered).toEqual([first, next, terminal]));
+
+      // The normal observer-stop path must find the promoted subscription and
+      // cancel its transport, without aborting or settling the active send.
+      context._stopGroupEventObserver('c1');
+      expect(streams[0].signal.aborted).toBe(true);
+      await vi.waitFor(() => expect(vm.runInContext('_groupObserverReservations.size', context)).toBe(0));
+      expect(context.__primaryController.abort).not.toHaveBeenCalled();
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(context.pendingConvs.get('c1').controller).toBe(context.__primaryController);
+
+      // Once the primary is gone, a fresh recovery subscription owns text
+      // again. Pairing from the old subscription must not leak into it.
+      vm.runInContext(`_convChatCtrls.delete('c1')`, context);
+      context.pendingConvs.get('c1').controller = null;
+      reconnected = context._observeConversationRunFromPlanAction('c1', { attachExisting: true });
+      expect(streams).toHaveLength(2);
+      publish(1, resumed);
+      await vi.waitFor(() => expect(delivered).toEqual([first, next, terminal, resumed]));
+    } finally {
+      observer.cancel();
+      reconnected?.cancel();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  });
+
+  it.each([
+    { allowWithController: false, primarySettled: false },
+    { allowWithController: true, primarySettled: false },
+    { allowWithController: false, primarySettled: true },
+    { allowWithController: true, primarySettled: true },
+  ])('hands an existing observer to a later primary without repeating progress ($allowWithController, settled: $primarySettled)', async ({ allowWithController, primarySettled }) => {
+    const context = loadConversationRenderer();
+    const shouldDeferCleanup = context._observerShouldDeferCleanup;
+    const { loadingEl } = setupRunningObserverTestContext(context);
+    context._observerShouldDeferCleanup = shouldDeferCleanup;
+    const delivered: any[] = [];
+    const cleanup = vi.fn();
+    context._handleGroupBusEvent = (_cid: string, _el: unknown, event: any) => delivered.push(event);
+    context._finishStreamingMsg = cleanup;
+    context._removeEmptyStreamingPlaceholder = () => {};
+    context._makeStreamPaintYield = () => () => null;
+    let resolveResponse: (value: unknown) => void = () => {};
+    let observerSignal: AbortSignal | undefined;
+    let subscriptions = 0;
+    context.apiFetch = async (url: string, options: any = {}) => {
+      if (url.includes('/history')) return { ok: true, json: async () => ({ ok: true, history: [] }) };
+      subscriptions += 1;
+      observerSignal = options.signal;
+      return new Promise(resolve => { resolveResponse = resolve; });
+    };
+
+    // Recovery can subscribe before the next send, with its response still
+    // pending. Reusing that subscription must transfer process ownership.
+    const observer = context._observeConversationRunFromPlanAction('c1', { attachExisting: true, allowWithController });
+    context.__primaryController = { abort() {} };
+    context.pendingConvs.get('c1').controller = context.__primaryController;
+    vm.runInContext(`_convChatCtrls.set('c1', __primaryController)`, context);
+    context._observeConversationRunFromPlanAction('c1', { attachExisting: true, allowWithController: true });
+
+    // Equal prose from two distinct source events is valid and must survive.
+    const progress = [0, 1].map(seg => ({
+      type: 'process', actor: 'commander', turn_id: 'turn-1', seg,
+      data: { type: 'delta', phase: 'commentary', text: 'Checking the result.\n' },
+    }));
+    for (const event of progress) context._handleStreamEvent('c1', loadingEl, {
+      type: 'event', event: { stream: 'group', data: event },
+    });
+    // Already-buffered observer events must stay suppressed after the primary
+    // finishes; querying only the current controller map would replay them.
+    if (primarySettled) vm.runInContext(`_convChatCtrls.delete('c1')`, context);
+    const terminal = { type: 'message', msg: { id: 'reply-1', from: 'commander', text: 'Done.' } };
+    const stream = createObserverTestStream(observerSignal!, [
+      [...progress, terminal].map(event => `data: ${JSON.stringify(event)}\n\n`).join(''),
+    ]);
+    resolveResponse({ ok: true, body: stream.body });
+    try {
+      await vi.waitFor(() => expect(stream.readCount).toBe(2), { timeout: 200 });
+      expect(delivered).toEqual([...progress, terminal]);
+      expect(subscriptions).toBe(1);
+      stream.release();
+      await vi.waitFor(() => expect(vm.runInContext('_groupObserverReservations.size', context)).toBe(0));
+      if (primarySettled) expect(cleanup).toHaveBeenCalledWith('c1');
+      else {
+        expect(cleanup).not.toHaveBeenCalled();
+        expect(context.pendingConvs.get('c1').controller).toBe(context.__primaryController);
+      }
+    } finally {
+      observer.cancel();
+      stream.release();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  });
+
+  it('keeps a standalone recovery stream consuming progress when polling re-arms that same controller', async () => {
+    const context = loadConversationRenderer();
+    setupRunningObserverTestContext(context);
+    const delivered: any[] = [];
+    context._handleGroupBusEvent = (_cid: string, _el: unknown, event: any) => delivered.push(event);
+    let resolveResponse: (value: unknown) => void = () => {};
+    let signal: AbortSignal | undefined;
+    const progress = { type: 'process', data: { type: 'delta', phase: 'commentary', text: 'Working.' } };
+    context.apiFetch = async (url: string, options: any = {}) => {
+      if (url.includes('/history')) return { ok: true, json: async () => ({ ok: true, history: [] }) };
+      signal = options.signal;
+      return new Promise(resolve => { resolveResponse = resolve; });
+    };
+    const observer = context._observeConversationRunFromPlanAction('c1', { attachExisting: true });
+    context._observeConversationRunFromPlanAction('c1', { attachExisting: true, allowWithController: true });
+    const stream = createObserverTestStream(signal!, [`data: ${JSON.stringify(progress)}\n\n`]);
+    resolveResponse({ ok: true, body: stream.body });
+    try {
+      await vi.waitFor(() => expect(stream.readCount).toBe(2), { timeout: 200 });
+      expect(delivered).toEqual([progress]);
+    } finally {
+      observer.cancel();
+      stream.release();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  });
+
   it('reserves a recovery observer before activity so concurrent triggers cannot double-subscribe', async () => {
     const context = loadConversationRenderer();
     context.AbortController = AbortController;
@@ -3972,6 +4323,8 @@ describe('conversation execution plan presentation', () => {
 
 describe('conversation process metadata formatting', () => {
   const orkasBridgeCases: Array<[string, Record<string, unknown>, string]> = [
+    ['inner_browser', { operation: 'open', url: 'https://example.com/docs' }, 'Run action · inner_browser · open · https://example.com/docs'],
+    ['publish_outputs', { paths: ['reports/result.md'] }, 'Run action · publish_outputs · reports/result.md'],
     ['orkas_list_skills', {}, 'View skill'],
     ['orkas_read_skill', { id: 'pdf' }, 'View skill · pdf'],
     ['orkas_run_skill', { skill: 'pdf' }, 'Use skill · pdf'],
@@ -4011,6 +4364,7 @@ describe('conversation process metadata formatting', () => {
   it('keeps historical split-tool events readable without registering those tools', () => {
     const context = loadConversationRenderer();
     const cases: Array<[string, Record<string, unknown>, string]> = [
+      ['browser', { operation: 'open', url: 'https://example.com/docs' }, 'Run action · browser · open · https://example.com/docs'],
       ['orkas_kb_list', {}, 'View reference'],
       ['orkas_kb_search', { query: 'launch plan' }, 'Search references · launch plan'],
       ['orkas_kb_read', { path: 'plans/launch.md' }, 'View reference · plans/launch.md'],
@@ -4030,12 +4384,18 @@ describe('conversation process metadata formatting', () => {
       path.join(__dirname, '../../bin/orkas-bridge.cjs'),
       'utf8',
     );
-    const registeredTools = [...bridgeSource.matchAll(/server\.tool\(\s*'([^']+)'/g)]
+    const registeredTools = (source: string) => [...source.matchAll(/server\.(?:tool|registerTool)\(\s*'([^']+)'/g)]
       .map((match) => match[1])
       .sort();
     const presentedTools = [...new Set(orkasBridgeCases.map(([tool]) => tool))].sort();
 
-    expect(registeredTools).toEqual(presentedTools);
+    expect(registeredTools(bridgeSource)).toEqual(presentedTools);
+    // An uncovered tool must invalidate the matrix with either SDK API.
+    for (const method of ['tool', 'registerTool']) {
+      const extendedSource = `${bridgeSource}\nserver.${method}('uncovered_tool', {}, () => {});`;
+      expect(registeredTools(extendedSource)).toEqual([...presentedTools, 'uncovered_tool'].sort());
+      expect(registeredTools(extendedSource)).not.toEqual(presentedTools);
+    }
   });
 
   it('resolves known Bridge Skill ids and keeps unknown ids readable', () => {
@@ -4524,6 +4884,52 @@ describe('conversation process metadata formatting', () => {
     expect(body.children[0]).toBe(group);
     expect(group._processCompactBody.children).toHaveLength(8);
     expect(group._processCompactSummary.innerHTML).toContain('Operations 8');
+  });
+
+  it('rescans a settled rail without re-reading the row list once per row', () => {
+    // Narration rows carry no compact-group key, so every tool row appended
+    // after one misses the trailing-group fast path and runs the general scan.
+    // That scan used to rebuild its `body.children` snapshot on each step,
+    // making one idempotent pass O(rows squared) and a whole replayed turn
+    // O(rows cubed): restoring a long CLI turn blocked the renderer for
+    // seconds, and scrolling or clicking during a live turn stuttered. A pass
+    // over a long rail must cost what a pass over a short one costs.
+    const context = loadConversationRenderer();
+    context.document.createElement = (tag: string) => createProcessTestElement(tag);
+
+    function buildRail(operations: number) {
+      const body = createProcessTestElement('div');
+      const backing: any[] = [];
+      let reads = 0;
+      Object.defineProperty(body, 'children', { get() { reads += 1; return backing; } });
+      for (let i = 0; i < operations; i += 1) {
+        context._appendProcessTextLines(body, `Run · step ${i}`, 'tool', 'bash', `cli:op-${i}`);
+        // The agent narrates between calls; that row breaks the operation run.
+        context._appendProcessCommentaryToBody(body, `Checking result ${i}`);
+      }
+      return {
+        body,
+        topLevelRows: backing.length,
+        readsDuring(work: () => void) {
+          const before = reads;
+          work();
+          return reads - before;
+        },
+      };
+    }
+
+    const short = buildRail(4);
+    const long = buildRail(120);
+    // The rail really is a long alternating list, not one absorbed group.
+    expect(long.topLevelRows).toBeGreaterThan(200);
+
+    const shortReads = short.readsDuring(() => context._compactAdjacentProcessRows(short.body));
+    const longReads = long.readsDuring(() => context._compactAdjacentProcessRows(long.body));
+
+    expect(shortReads).toBeGreaterThan(0);
+    // 30x the rows must not mean 30x the row-list reads. Before the fix the
+    // long rail read the list once per top-level child.
+    expect(longReads).toBeLessThanOrEqual(shortReads + 2);
   });
 
   it('updates one process row across a tool call lifecycle', () => {
@@ -5720,6 +6126,54 @@ describe('conversation process metadata formatting', () => {
     expect(body.children[2].innerHTML).not.toContain('stream-process-icon');
   });
 
+  it('paints draft text before phase resolution and moves each round into process only once', async () => {
+    const context = loadConversationRenderer();
+    // This scenario exercises cancellation of a queued preview paint. Match
+    // the browser's paired request/cancel API, absent from the minimal shim.
+    context.requestAnimationFrame = (fn: () => void) => setTimeout(fn, 0);
+    context.cancelAnimationFrame = (handle: ReturnType<typeof setTimeout>) => clearTimeout(handle);
+    context.document.createElement = (tag: string) => createProcessTestElement(tag);
+    const body = createProcessTestElement('div');
+    const container = createProcessTestElement('details');
+    container.dataset.processState = 'active';
+    container.open = true;
+    container.style = { display: '' };
+    const finalEl: any = { style: { display: 'none' }, innerHTML: '', querySelector: () => null };
+    const msg: any = {
+      dataset: {},
+      querySelector(selector: string) {
+        if (selector === '[data-role="final"]') return finalEl;
+        if (selector === '[data-role="process"]') return body;
+        if (selector === '[data-role="process-container"]' || selector === '.stream-process') return container;
+        return null;
+      },
+    };
+    context._bindProcessStickToBottom = () => {};
+    context._stickProcessBottomIfPinned = () => {};
+    context._stickBottomFromMsg = () => {};
+    context._streamingDisplayText = (text: string) => text;
+    context._paintStreamingFinalMarkdown = (_msg: any, el: any, text: string) => { el.innerHTML = text; };
+    context._attachAssistantActions = () => {};
+    context._stripSurvivingStructuralBlocks = (text: string) => text;
+    for (const text of ['Inspect sources.', 'Verify results.']) {
+      context._streamingAppendFinalDelta(msg, text, 'pending');
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(finalEl.innerHTML).toBe(text);
+      expect(container.dataset.processState).toBe('active');
+      context._streamingFinalizeCommentary(msg, text);
+      context._streamingFinalizeCommentary(msg, text);
+      expect(finalEl.style.display).toBe('none');
+      expect(msg.dataset.streamBuf).toBe('');
+    }
+    expect(body.children.map((line: any) => line.dataset.processText))
+      .toEqual(['Inspect sources.', 'Verify results.']);
+    context._streamingAppendFinalDelta(msg, 'Delivered.', 'pending');
+    context._streamingSetFinal(msg, 'Delivered.');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(finalEl.innerHTML).toBe('Delivered.');
+    expect(body.children).toHaveLength(2);
+  });
+
   it('renders commentary through the markdown pipeline and keeps the raw source text', () => {
     const context = loadConversationRenderer();
     context.document.createElement = (tagName: string) => createProcessTestElement(tagName);
@@ -6129,7 +6583,7 @@ describe('conversation process metadata formatting', () => {
     });
     expect(onlyCssDeclarations(
       style,
-      '.stream-process[data-process-state="active"] > .stream-process-loading',
+      '.chat-message[data-activity-start]:not([data-activity-done="1"]) > .chat-bubble > .stream-process-loading',
     )).toMatchObject({ display: 'flex' });
     expect(cssDeclarationsForSelector(style, '.stream-activity')).toEqual([]);
   });
@@ -6302,7 +6756,7 @@ describe('conversation process metadata formatting', () => {
         retryDelayMs: 2_000,
         error: 'network unavailable',
       },
-    })).toBe('Network connection unavailable · Retry 2/4 · Continue in 2s');
+    })).toBe('Temporary model service error · Retry 2/4 · Continue in 2s');
     expect(context._formatEventLine({
       stream: 'cli',
       data: {
@@ -6409,13 +6863,9 @@ describe('conversation process metadata formatting', () => {
     expect(retry({ errorStatus: 503, error: 'service unavailable' }))
       .toBe('Model service is temporarily unavailable · Retry 1/10 · Continue in 1s');
     expect(retry({ error: 'ECONNRESET while connecting' }))
-      .toBe('Network connection unavailable · Retry 1/10 · Continue in 1s');
+      .toBe('Temporary model service error · Retry 1/10 · Continue in 1s');
     expect(retry({ errorStatus: 418, error: 'new-provider-error private detail' }))
       .toBe('Temporary model service error · Retry 1/10 · Continue in 1s');
-    expect(context._formatKnownCliDiagnostic('HTTP 529 overloaded_error'))
-      .toBe('Model service is busy');
-    expect(context._formatKnownCliDiagnostic('HTTP 503 service unavailable'))
-      .toBe('Model service is temporarily unavailable');
   });
 
   it('merges one retry series into one row and closes it with the terminal outcome', () => {
@@ -6474,12 +6924,12 @@ describe('conversation process metadata formatting', () => {
       lifecycleKey: 'cli-retry:2',
       lifecycleTerminal: true,
       kind: 'err',
-      text: 'Failed · Model service is busy',
+      text: 'Failed · overloaded',
     });
     expect(body.children[1].dataset).toMatchObject({
       processCallId: 'cli-retry:2',
       processTerminal: '1',
-      processText: 'Failed · Model service is busy',
+      processText: 'Failed · overloaded',
     });
   });
 
@@ -6776,7 +7226,7 @@ describe('conversation process metadata formatting', () => {
     })).toBe(expected);
   });
 
-  it('uses the top process summary as the only live activity surface', () => {
+  it('keeps elapsed time in the process summary without duplicating event status text', () => {
     const context = loadConversationRenderer();
     const runtimeText = { textContent: '', hidden: true };
     const label = { textContent: '' };
@@ -7137,7 +7587,7 @@ describe('conversation process metadata formatting', () => {
         source: 'codex',
         message: 'connection recovered',
       },
-    })).toBe('Connection restored');
+    })).toBeNull();
 
     expect(context._formatEventLine({
       stream: 'cli',
@@ -7343,8 +7793,20 @@ describe('conversation process metadata formatting', () => {
     expect(disclosureSummary.getAttribute('tabindex')).toBeNull();
   });
 
+  it('places the execution indicator below the final body outside the process disclosure', () => {
+    const context = loadConversationRenderer();
+    context.document.createElement = createProcessTestElement;
+    context.formatTime = () => '12:00';
+    context._appendBeforeSpacer = () => {};
+    const msg = context._createStreamingAssistantMessage({ querySelector: () => null });
+
+    // This order keeps the indicator visible when the process is collapsed
+    // and places it after the growing answer, including answers without tools.
+    expect(msg.innerHTML).toMatch(/<\/details>\s*<div[^>]*data-role="final"[^>]*><\/div>\s*<div[^>]*data-role="process-loading"/);
+  });
+
   it.each(['completed', 'failed', 'cancelled'])(
-    'keeps reply text and subsequent work live until the turn is %s', (terminal) => {
+    'folds the first reply delta while timing subsequent work until the turn is %s', (terminal) => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-09-09T09:00:00Z'));
       try {
@@ -7395,6 +7857,8 @@ describe('conversation process metadata formatting', () => {
         context._streamingUpdateActivity(msg);
         vi.advanceTimersByTime(38_000);
         expect(runtime.textContent).toBe('38s');
+        expect(msg.dataset.activityStart).toBeTruthy();
+        expect(msg.dataset.activityDone).toBeUndefined();
 
         // Codex delivers asynchronous questions as final_answer text before
         // continuing the same turn. Ordinary answer deltas are nonterminal too.
@@ -7403,11 +7867,18 @@ describe('conversation process metadata formatting', () => {
         vi.advanceTimersByTime(12_000);
         expect(finalEl.innerHTML).toBe(text);
         expect(runtime.textContent).toBe('50s');
-        expect(details.open).toBe(true);
-        expect(details.dataset.processState).toBe('active');
+        expect(details.open).toBeFalsy();
+        expect(details.dataset.processState).toBe('complete');
+        expect(msg.dataset.activityDone).toBeUndefined();
+        expect(summary['aria-disabled']).toBeUndefined();
+        expect(summary.tabindex).toBeUndefined();
 
         if (terminal === 'completed') {
+          // Reading the process while the rest of the answer streams must not
+          // be interrupted by another automatic collapse on every token.
+          details.open = true;
           processEvent({ type: 'delta', phase: 'final_answer', text: 'ready.' });
+          expect(details.open).toBe(true);
         } else {
           // The incident continued with commentary after the async question.
           // That reopens the details even if an earlier delta stopped liveness.
@@ -7436,6 +7907,7 @@ describe('conversation process metadata formatting', () => {
         vi.advanceTimersByTime(4_000);
         expect(runtime.textContent).toBe('1m 20s');
         expect(details.open).toBe(false);
+        expect(msg.dataset.activityDone).toBeUndefined();
 
         processEvent({ type: 'event', event: {
           stream: 'runtime', data: { phase: 'end', duration_ms: 79_000 },
@@ -7447,12 +7919,14 @@ describe('conversation process metadata formatting', () => {
         expect(runtime.textContent).toBe('1m 19s');
         expect(details.open).toBeFalsy();
         expect(details.dataset.processState).toBe('complete');
+        expect(msg.dataset.activityDone).toBe('1');
         expect(vi.getTimerCount()).toBe(0);
         const terminalBody = finalEl.innerHTML;
         vi.advanceTimersByTime(20_000);
         context._streamingUpdateActivityFromEvent(msg);
         expect(runtime.textContent).toBe('1m 19s');
         expect(finalEl.innerHTML).toBe(terminalBody);
+        expect(msg.dataset.activityDone).toBe('1');
         expect(vi.getTimerCount()).toBe(0);
       } finally {
         vi.useRealTimers();
@@ -8051,6 +8525,46 @@ describe('conversation auto recipient', () => {
       .toBe('ordinary follow-up');
   });
 
+  it.each([false, true])('keeps an admitted send in A and preserves B while attachment preparation awaits (busy=%s)', async busy => {
+    const context = loadConversationRenderer();
+    const input = { value: 'message for A', dataset: {}, dispatchEvent() {} };
+    const sends: any[] = [];
+    const clearedDrafts: string[] = [];
+    let release: (value: any) => void;
+    const attachments = new Promise(resolve => { release = resolve; });
+    context.performance = performance;
+    context.currentCid = 'conversation-a';
+    context.document.getElementById = (id: string) => id === 'chat-input' ? input : null;
+    context.ensureModelConfigured = () => true;
+    context._chatAttachSnapshotForSend = () => attachments;
+    context._recipientSnapshotForSend = () => ({ kind: 'agent', id: context.currentCid, name: context.currentCid });
+    context.getChatRecipient = context._recipientSnapshotForSend;
+    context._applyRecipientPrefixWithSnapshot = (text: string, recipient: any) => `@${recipient.id} ${text}`;
+    context._commanderMentionDisplayForSend = () => ({});
+    context.transformWithChatUse = (text: string) => text;
+    context._clearDraft = (cid: string) => clearedDrafts.push(cid);
+    context._clearQuotes = () => {};
+    context._rememberSentComposerSnapshot = () => {};
+    context.autoGrow = () => {};
+    context._updateComposerSeqToggle = () => {};
+    context.isConvPending = (cid: string) => busy && cid === 'conversation-a';
+    context.apiFetch = async (url: string, options: any) => {
+      sends.push({ cid: url.split('/')[3], content: JSON.parse(options.body).content });
+      return { json: async () => ({ ok: true }) };
+    };
+    context.sendInConversation = async (cid: string, content: string) => { sends.push({ cid, content }); };
+    const pending = context.handleChatSubmit();
+    context.currentCid = 'conversation-b';
+    input.value = 'unsent draft in B';
+    input.dataset.commanderResourceId = 'b-template';
+    release!({ ok: true, items: [], names: [] });
+    await pending;
+    expect(sends).toEqual([{ cid: 'conversation-a', content: '@conversation-a message for A' }]);
+    expect(input.value).toBe('unsent draft in B');
+    expect(input.dataset.commanderResourceId).toBe('b-template');
+    expect(clearedDrafts).toEqual(['conversation-a']);
+  });
+
   it('sends directly to the backend while busy (queue absorption) with attachments cleared', async () => {
     // Queue absorption: a busy conversation's new message goes straight to
     // /send (the scheduler queues it as a visible board task) instead of
@@ -8106,7 +8620,7 @@ describe('conversation auto recipient', () => {
 
 });
 
-function setupConversationStatusController(context: any, cid = 'c1') {
+function setupConversationStatusController(context: any, cid = 'c1', options = {}) {
   let hooks: any = null;
   const cleanups: string[] = [];
   context.createChatController = (config: any) => {
@@ -8120,7 +8634,7 @@ function setupConversationStatusController(context: any, cid = 'c1') {
   context._startRuntimeActorRecovery = () => {};
   context._observeConversationRunFromPlanAction = () => {};
 
-  const ctrl = context._makeConvChatController(cid);
+  const ctrl = context._makeConvChatController(cid, options);
   context.__ctrl = ctrl;
   context.__cid = cid;
   vm.runInContext('_convChatCtrls.set(__cid, __ctrl)', context);
@@ -8130,6 +8644,35 @@ function setupConversationStatusController(context: any, cid = 'c1') {
 }
 
 describe('conversation controller settlement', () => {
+  it('restores a rejected send before snapshot cleanup and ignores stale controllers', () => {
+    const context = loadConversationRenderer();
+    const { hooks, msg } = setupConversationStatusController(context, 'c1', { restoreComposerOnFailure: true });
+    let snapshot = 'unsent description';
+    let draft = '';
+    context._restoreSentComposerSnapshot = () => { if (snapshot) draft = snapshot; };
+    context._finishStreamingMsg = () => { snapshot = ''; };
+    hooks.onDone(msg, 'c1', { started: true, accepted: false, errored: true });
+    expect(draft).toBe('unsent description');
+    expect(snapshot).toBe('');
+    snapshot = 'newer send'; draft = '';
+    vm.runInContext('_convChatCtrls.set("c1", {})', context);
+    hooks.onDone(msg, 'c1', { started: true, accepted: false, errored: true });
+    expect(draft).toBe('');
+    expect(snapshot).toBe('newer send');
+  });
+
+  it('notifies programmatic creation only after the stream accepts the request', () => {
+    const context = loadConversationRenderer();
+    let hooks: any;
+    context.createChatController = (config: any) => { hooks = config.hooks; return { abort() {} }; };
+    const accepted = vi.fn();
+    context._makeConvChatController('c1', { onAccepted: accepted });
+    hooks.onStreamEvent({ type: 'text_delta', text: 'not a receipt' });
+    expect(accepted).not.toHaveBeenCalled();
+    hooks.onStreamEvent({ type: 'send_accepted' });
+    expect(accepted).toHaveBeenCalledOnce();
+  });
+
   it('keeps main-conversation user bubbles off the transcript until the bus persists them', async () => {
     const context = loadConversationRenderer();
     const createChatController = context.createChatController;
@@ -8273,7 +8816,6 @@ describe('conversation controller settlement', () => {
     context.document.activeElement = searchInput;
     context.document.getElementById = (id: string) => ({
       'chat-send-btn': sendButton,
-      'chat-queue-edit-delete-btn': { hidden: true, setAttribute() {} },
       'chat-input': input,
     }[id] || null);
 
@@ -8572,7 +9114,6 @@ describe('conversation controller settlement', () => {
       hooks = config.hooks;
       return { abort() {} };
     };
-    context._taskTurnFinish = () => {};
     context._finishStreamingMsg = (cid: string) => cleanups.push(cid);
     context._scheduleHistoryReconcileAfterStream = () => {};
     context._updateConvSendUI = () => {};
@@ -8823,16 +9364,14 @@ describe('conversation controller settlement', () => {
     context._streamingStopActivity(msg);
   });
 
-  it('cleans an aborted send from onDone without locally finalizing bus-owned sampling', () => {
+  it('cleans an aborted send from onDone without locally finalizing bus-owned lifecycle state', () => {
     const context = loadConversationRenderer();
-    const finishes: any[] = [];
     const cleanups: string[] = [];
     let hooks: any = null;
     context.createChatController = (config: any) => {
       hooks = config.hooks;
       return { abort() {} };
     };
-    context._taskTurnFinish = (...args: any[]) => finishes.push(args);
     context._finishStreamingMsg = (cid: string) => cleanups.push(cid);
     context._updateConvSendUI = () => {};
     context._updateConvSidebarBadge = () => {};
@@ -8854,15 +9393,12 @@ describe('conversation controller settlement', () => {
     expect(browserTurnStarts).toEqual(['c1']);
     expect(context.pendingConvs.get('c1').controller).toBe(ctrl);
     hooks.onAbort(msg, 'c1');
-    expect(finishes).toHaveLength(0);
     expect(cleanups).toHaveLength(0);
 
     hooks.onDone(msg, 'c1', { started: true, aborted: true, errored: false });
-    expect(finishes).toHaveLength(0);
     expect(cleanups).toEqual(['c1']);
 
     hooks.onDone(msg, 'c1', { started: true, aborted: true, errored: false });
-    expect(finishes).toHaveLength(0);
     expect(cleanups).toEqual(['c1']);
   });
 
@@ -8999,7 +9535,6 @@ describe('conversation controller settlement', () => {
   ])('returns the terminal chat result from controller state %#', async (terminal, expected) => {
     const context = loadConversationRenderer();
     context.performance = performance;
-    context._taskTurnStart = () => {};
     context._makeConvChatController = (_cid: string, options: any) => ({
       abort() {},
       async send() {
@@ -9026,7 +9561,6 @@ describe('conversation controller settlement', () => {
   it.each(['rejected', 'thrown'])(
     'discards a sent composer snapshot when preflight is %s', async (failure) => {
     const context = loadConversationRenderer();
-    vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/queue-draft.js'), 'utf8'), context);
     context._rememberSentComposerSnapshot('c1', { text: 'old unsent attempt' });
     context.performance = performance;
     context._makeConvChatController = () => ({
@@ -9216,6 +9750,21 @@ describe('chat attachment picker targeting', () => {
     ]);
     expect(JSON.stringify(context.__attachmentWarningRows)).not.toContain('main_chat');
     expect(JSON.stringify(context.__attachmentWarningRows)).not.toContain('missing.pdf');
+  });
+
+  it('fails an edited attachment snapshot without consuming the displaced draft when a new selection is missing', async () => {
+    const context = loadConversationRenderer();
+    context.apiFetch = async () => ({ json: async () => ({ ok: true,
+      items: [{ name: 'other-draft.txt', kind: 'text', bytes: 1 }],
+    }) });
+    vm.runInContext("_chatAttachments.set('c1', [{ name: 'missing.txt', status: 'ready' }, { name: 'queued.txt', reused: true, status: 'ready' }])", context);
+    const release = vm.runInContext("_chatAttachTryBeginSend('c1')", context);
+    try {
+      const snapshot = await context._chatAttachSnapshotForSend('c1', { onlySelected: true });
+      expect(snapshot).toMatchObject({ ok: false, reason: 'attachment_sync_mismatch' });
+      expect(vm.runInContext("_chatAttachList('c1').map((item) => item.name)", context))
+        .toEqual(['missing.txt', 'queued.txt']);
+    } finally { release(); }
   });
 
   it('summarizes app navigation failures without logging raw exception text', () => {
@@ -9694,7 +10243,7 @@ describe('new chat quick-start scenarios', () => {
     expect(input.dataset.commanderQuickStartPlaceholder).toBeUndefined();
   });
 
-  it('binds article writing to the dedicated default-installed ContentWriter', async () => {
+  it('binds content creation to the default-installed ContentWriter', async () => {
     const context = loadConversationRenderer();
     const events: any[] = [];
     let clickHandler: Function | null = null;
@@ -9744,7 +10293,7 @@ describe('new chat quick-start scenarios', () => {
       id: '173d4235a431',
       name: 'ContentWriter',
     });
-    expect(input.value).toContain('Write');
+    expect(input.value).toContain('Write a social post');
   });
 
   it('binds software development to the default-installed ProductDeveloper', async () => {
@@ -9859,5 +10408,53 @@ describe('polled history recovery identity', () => {
     expect(await context._recoverPolledVisibleMessages('c1', [{ id: 'reply-with-files', from: 'commander', produced: [{ path: 'report.pdf' }] }])).toBe(true);
     expect(context.loadConversationHistory).toHaveBeenCalledWith('c1', { preserveScroll: true });
     expect(context.appendChatMessage).not.toHaveBeenCalled();
+  });
+});
+
+// User-approved removal: diagnostics need state, not incidental words.
+describe('CLI prose cannot establish runtime state', () => {
+  it.each([
+    'Authentication successful',
+    'Credentials loaded successfully',
+    'Git authentication failed',
+    'Rate limits configured successfully',
+    'Connection recovered example',
+  ])('does not translate ordinary logs into an app diagnosis: %s', (message) => {
+    const context = loadConversationRenderer();
+    for (const data of [
+      { type: 'log', level: 'info', message },
+      { type: 'stderr-line', line: message },
+      { type: 'raw-line', line: message },
+    ]) expect(context._formatEventLine({ stream: 'cli', data })).toBeNull();
+  });
+
+  it('keeps a retry reason unknown when only prose names a failure class', () => {
+    const context = loadConversationRenderer();
+    for (const error of ['network configured', 'rate limit configured', 'not overloaded']) {
+      expect(context._formatCliRetryReason({ error })).toBe('Temporary model service error');
+    }
+    expect(context._formatCliRetryReason({ errorStatus: 429, error: 'not overloaded' }))
+      .toBe('Request rate limited');
+    expect(context._formatCliRetryReason({ error_status: 503 }))
+      .toBe('Model service is temporarily unavailable');
+  });
+});
+
+
+describe('authoritative tool execution states', () => {
+  it('distinguishes a proposed memory write from execution and a skipped receipt on replay', () => {
+    const context = loadConversationRenderer();
+    const display = context._createProcessDisplayContext();
+    const data = { id: 'memory', name: 'cross_session_memory', arguments: { action: 'add', content: 'private fact' } };
+    const proposed = { stream: 'tool', data: { ...data, phase: 'start', execution_state: 'proposed' } };
+    const running = { stream: 'tool', data: { ...data, phase: 'progress', execution_state: 'running' } };
+    const skipped = { stream: 'tool', data: { ...data, phase: 'end', execution_state: 'skipped', isError: true, result_preview: 'Tool not executed' } };
+    expect(context._formatEventLine(proposed, display)).toContain('Preparing:');
+    expect(context._formatEventLine(running, display)).not.toContain('Preparing:');
+    const terminal = context._formatEventLine(skipped, display);
+    expect(terminal).toContain('Not executed');
+    expect(terminal).not.toContain('Failed');
+    expect(terminal).not.toContain('private fact');
+    expect(context._formatEventLine(skipped, display)).toBe(terminal);
   });
 });

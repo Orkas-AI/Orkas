@@ -15,7 +15,15 @@ export const ModelConfigSchema = z.object({
   maxOutputTokens: z.number().int().positive().optional(),
   /** Whether this model supports vision/images. */
   supportsVision: z.boolean().optional(),
-});
+}).refine(
+  // Input and output share the window on every provider this runtime talks
+  // to; an output limit that fills it leaves no input at all. The host
+  // sanitizes catalog rows before they get here; this is the library's own
+  // boundary, so a config built any other way fails loudly instead of running
+  // on a budget derived from a window that cannot exist.
+  (m) => m.contextWindow === undefined || m.maxOutputTokens === undefined || m.maxOutputTokens < m.contextWindow,
+  { message: "maxOutputTokens must be smaller than contextWindow" },
+);
 
 /** Agent configuration schema. */
 export const AgentConfigSchema = z.object({

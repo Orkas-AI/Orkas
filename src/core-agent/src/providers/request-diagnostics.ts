@@ -1,0 +1,166 @@
+/** Metadata only: this observer never changes errors used by retry policy. */
+export interface ProviderRequestFailure {
+  phase: 'unknown' | 'before_request' | 'before_response' | 'after_response';
+  code: string;
+  httpStatus?: number;
+  elapsedMs: number;
+  aborted: boolean;
+  source: ProviderFailureSource;
+  lastEvent: string;
+  requestSequence?: number;
+  /** Opaque transport correlation; restricted diagnostics only. */
+  requestRef?: string;
+  contextWindow?: number;
+  outputLimit?: number;
+  budgetObserved?: boolean;
+  contextBudget?: Record<string, number | string>;
+}
+
+/** Existing runner observations, never a second scan of request content. */
+export type FailureContextBudget = Record<string, number | string>;
+const BUDGET_NUMBERS = ['budget_context_window', 'output_reservation', 'usable_input_tokens',
+  'input_ceiling_tokens', 'estimated_input_tokens', 'emergency_before_tokens', 'emergency_after_tokens',
+  'compaction_before_tokens', 'compaction_after_tokens', 'compaction_attempts', 'compaction_failures'];
+
+function safeContextBudget(value: unknown): FailureContextBudget | undefined {
+  if (!value || typeof value !== 'object') return;
+  const raw = value as Record<string, unknown>;
+  if (raw.version !== 1) return;
+  const out: FailureContextBudget = { version: 1 };
+  for (const key of BUDGET_NUMBERS) {
+    const v = raw[key];
+    if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) out[key] = Math.min(1_000_000_000, v);
+  }
+  for (const [key, values] of Object.entries({
+    estimate_source: ['estimated', 'anchored'], window_source: ['catalog', 'fallback'],
+    emergency_result: ['not_needed', 'applied', 'nothing_to_drop'],
+  })) if (typeof raw[key] === 'string' && values.includes(raw[key] as string)) out[key] = raw[key] as string;
+  return out;
+}
+
+export type ProviderFailureSource = 'unknown' | 'payload' | 'transport' | 'http' | 'sdk_error' | 'exception';
+const STREAM_EVENTS = new Set(['start', 'text_start', 'text_delta', 'text_end',
+  'thinking_start', 'thinking_delta', 'thinking_end', 'toolcall_start', 'toolcall_delta', 'toolcall_end', 'done']);
+// The host supplies one observer per run, shared by retries and auxiliary calls.
+// Weak ownership retains no sessions, request bodies or unbounded attempt arrays.
+const requestSequences = new WeakMap<(failure: ProviderRequestFailure) => void, number>();
+
+const DIAGNOSTIC_CODES = new Set([
+  'EPERM', 'EACCES',
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN',
+  'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
+  'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'ERR_TLS_CERT_ALTNAME_INVALID',
+]);
+
+function safeCode(error: unknown): string {
+  // Bound traversal even for cyclic causes. Never inspect messages or bodies.
+  try {
+    for (let depth = 0; error && typeof error === 'object' && depth < 8; depth++) {
+      const item = error as { code?: unknown; cause?: unknown };
+      if (typeof item.code === 'string' && DIAGNOSTIC_CODES.has(item.code)) return item.code;
+      if (error instanceof ReferenceError) return 'REFERENCE_ERROR';
+      error = item.cause;
+    }
+  } catch { /* Untrusted exception accessors are not diagnostic facts. */ }
+  return 'unknown';
+}
+
+/** Request-local hooks supported by pi-ai. Observe headers without cloning,
+ * buffering or wrapping the response body; post-header SDK-flattened causes
+ * remain unknown instead of being guessed from prose. */
+export function createRequestDiagnostics(
+  signal?: AbortSignal,
+  onFailure?: (failure: ProviderRequestFailure) => void,
+  requestRef?: unknown,
+  contextBudget?: unknown,
+) {
+  const started = performance.now();
+  const requestSequence = onFailure ? Math.min(1_000_000_000, (requestSequences.get(onFailure) ?? 0) + 1) : undefined;
+  if (onFailure && requestSequence !== undefined) requestSequences.set(onFailure, requestSequence);
+  let source: ProviderFailureSource = 'unknown';
+  let lastEvent = 'none';
+  let phase: ProviderRequestFailure['phase'] = 'unknown';
+  let status: number | undefined;
+  let code = 'unknown';
+  let reported = false;
+  let observed = false;
+  let contextWindow: number | undefined;
+  let outputLimit: number | undefined;
+  let budgetObserved = false;
+  const onResponse = (response: { status: number }) => {
+    phase = 'after_response';
+    status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+      ? response.status : undefined;
+  };
+  const requestFetch: typeof globalThis.fetch = async (input, init) => {
+    phase = 'before_response';
+    status = undefined;
+    code = 'unknown';
+    source = 'unknown';
+    try {
+      const response = await globalThis.fetch(input, init);
+      onResponse(response);
+      return response;
+    } catch (error) {
+      code = safeCode(error);
+      source = 'transport';
+      throw error;
+    }
+  };
+  return {
+    get observed(): boolean { return observed; },
+    onResponse,
+    observeBudget(payload: unknown, window: unknown): void {
+      // O(1) observation of the final adapter payload. Never estimate tokens here.
+      try {
+        if (!payload || typeof payload !== 'object') return;
+        const body = payload as Record<string, unknown>;
+        const bounded = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 1_000_000_000 ? value : undefined;
+        contextWindow = bounded(window);
+        outputLimit = bounded(body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens);
+        budgetObserved = true;
+      } catch { /* Metadata cannot change the payload result. */ }
+    },
+    requestFetch,
+    observeEvent(type: string): void {
+      // Retain the event preceding failure, not the generic terminal error.
+      if (type !== 'error') lastEvent = STREAM_EVENTS.has(type) ? type : 'unknown';
+    },
+    async observePayload<T>(operation: () => T | Promise<T>): Promise<T> {
+      try { return await operation(); }
+      catch (error) {
+        // The host hook failed before this SDK invocation could send a request.
+        // Store only closed metadata; rethrow the same error for the SDK policy.
+        phase = 'before_request';
+        source = 'payload';
+        status = undefined;
+        code = safeCode(error);
+        throw error;
+      }
+    },
+    report(error: unknown, aborted = false, boundary: ProviderFailureSource = 'unknown'): ProviderRequestFailure | undefined {
+      if (reported) return undefined;
+      reported = true;
+      const failure: ProviderRequestFailure = {
+        phase,
+        ...(budgetObserved ? { budgetObserved, contextWindow, outputLimit } : {}),
+        ...(typeof requestRef === 'string' && /^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestRef) ? { requestRef } : {}),
+        source: source !== 'unknown' ? source : status !== undefined && status >= 400 ? 'http' : boundary,
+        lastEvent,
+        ...(requestSequence === undefined ? {} : { requestSequence }),
+        code: code === 'unknown' ? safeCode(error) : code,
+        ...(status === undefined ? {} : { httpStatus: status }),
+        elapsedMs: Math.min(1_000_000_000, Math.max(0, Math.round(performance.now() - started))),
+        aborted: aborted || signal?.aborted === true,
+      };
+      // Only a failed request copies/sanitizes this small metadata record.
+      if (!failure.aborted) {
+        try { failure.contextBudget = safeContextBudget(contextBudget); } catch { /* Best effort. */ }
+      }
+      try { if (onFailure) { onFailure({ ...failure }); observed = true; } } catch { /* Best-effort observer. */ }
+      return failure;
+    },
+  };
+}

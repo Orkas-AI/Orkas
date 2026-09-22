@@ -1,3 +1,4 @@
+import { estimateBudgetTokens } from '../../../src/main/util/token-estimate';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -5,12 +6,11 @@ import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
-  DEFAULT_INLINE_RESULT_TOKENS,
   estimateToolResultTokens,
 } from '../../../src/main/util/tool-result-cap';
 import {
-  SKILL_DESCRIPTION_AUTHORING_MAX_CHARS,
-  SKILL_ROSTER_MAX_CHARS,
+  SKILL_DESCRIPTION_ROSTER_MAX_TOKENS,
+  SKILL_ROSTER_MAX_TOKENS,
 } from '../../../src/main/util/skill-description-policy';
 import {
   _renderSkillLinesForTest,
@@ -41,6 +41,9 @@ import { validateSkillDir } from '../../../src/main/quality';
  */
 
 const BUILTIN_ROOT = path.join(__dirname, '..', '..', '..', 'resources', 'builtin');
+// Preserve the established authoring ceiling when ordinary tool admission
+// changes. Runtime Skill reads have their own wider 25K ceiling.
+const BUILTIN_SKILL_AUTHORING_TOKENS = 12_500;
 const VIDEO_STUDIO_RESIDENT_SKILL_HEADROOM = 500;
 const CREATOR_ROOT_MAX_CHARS = 7_500;
 // These are ceilings for documented, actually loaded paths. Never add every
@@ -313,7 +316,19 @@ describe('builtin skill inline budget', () => {
           }
         }
       }
-      localFindings.push(...report.violations.map((violation) => (
+      // Length feedback is advisory for existing source descriptions. Verify
+      // it independently rather than treating the authoring target as schema.
+      const lengthAdvisories = report.violations.filter(violation => (
+        violation.rule === 'frontmatter_description_too_long'
+      ));
+      const expectedLengthFields = (['zh', 'en'] as const)
+        .filter(lang => estimateBudgetTokens(pickDescription(spec, lang)) > SKILL_DESCRIPTION_ROSTER_MAX_TOKENS)
+        .map(lang => `frontmatter:description_${lang}`);
+      expect(lengthAdvisories.map(violation => violation.field)).toEqual(expectedLengthFields);
+      expect(lengthAdvisories.every(violation => violation.level === 'MEDIUM')).toBe(true);
+      localFindings.push(...report.violations.filter(violation => (
+        violation.rule !== 'frontmatter_description_too_long'
+      )).map((violation) => (
         `validator:${violation.level}:${violation.rule}:${violation.field}`
       )));
       return localFindings.map((finding) => (
@@ -348,8 +363,8 @@ describe('builtin skill inline budget', () => {
         label: doc.label,
         tokens: estimateToolResultTokens(asReadFileResult(doc.body, doc.label)),
       }))
-      .filter((doc) => doc.tokens > DEFAULT_INLINE_RESULT_TOKENS)
-      .map((doc) => `${doc.label}: ~${doc.tokens} tokens (budget ${DEFAULT_INLINE_RESULT_TOKENS})`);
+      .filter((doc) => doc.tokens > BUILTIN_SKILL_AUTHORING_TOKENS)
+      .map((doc) => `${doc.label}: ~${doc.tokens} tokens (budget ${BUILTIN_SKILL_AUTHORING_TOKENS})`);
 
     expect(
       oversized,
@@ -410,12 +425,12 @@ describe('builtin skill inline budget', () => {
       }
       const specs = roots.flatMap((entry) => new SkillLoader({ dirs: [entry.root] }).list());
       expect(specs.map((spec) => spec.id).sort()).toEqual(['builtin-skill', 'custom-skill']);
-      const full = await _renderSkillLinesForTest(specs, roots, undefined, { maxChars: 10_000 });
+      const full = await _renderSkillLinesForTest(specs, roots, undefined, { maxTokens: 10_000 });
       expect(full).toContain(`**builtin-skill** (Source: builtin) — ${description}`);
       expect(full).toContain(`**custom-skill** (Source: custom) — ${description}`);
 
       const compacted = await _renderSkillLinesForTest(specs, roots, undefined, {
-        maxChars: full.length - 20,
+        maxTokens: estimateBudgetTokens(full) - 20,
       });
       expect(compacted).toContain(`**builtin-skill** (Source: builtin) — ${description}`);
       expect(compacted).toMatch(/^- \*\*custom-skill\*\* \(Source: custom\)$/m);
@@ -613,46 +628,55 @@ describe('builtin skill inline budget', () => {
       .toEqual([]);
   });
 
-  it('keeps every shipped routing description within the authoring target', () => {
+  it('keeps shipped routing intent natural instead of adding separate keyword lists', () => {
     const descriptions = groups.flatMap((group) => group.specs.flatMap((spec) => [
       [group.label, spec.id, 'zh', pickDescription(spec, 'zh')],
       [group.label, spec.id, 'en', pickDescription(spec, 'en')],
     ] as const));
-    const oversized = descriptions
-      .filter(([, , , description]) => description.length > SKILL_DESCRIPTION_AUTHORING_MAX_CHARS)
-      .map(([group, id, lang, description]) => `${group}:${id}:${lang}:${description.length}`);
     const keywordLists = descriptions
       .filter(([, , , description]) => /(?:触发词|Triggers:)/i.test(description))
       .map(([group, id, lang]) => `${group}:${id}:${lang}`);
 
-    expect(
-      oversized,
-      `shipped descriptions stay at or below ${SKILL_DESCRIPTION_AUTHORING_MAX_CHARS} characters; move execution detail into SKILL.md`,
-    ).toEqual([]);
     expect(
       keywordLists,
       'write natural routing intent instead of a separate trigger-keyword list',
     ).toEqual([]);
   });
 
-  it('ships descriptions that reach the prompt unchanged rather than silently losing routing clauses', () => {
-    const changed = groups.flatMap((group) => group.specs.flatMap((spec) => (
-      ['zh', 'en'] as const
-    ).flatMap((lang) => {
-      const authored = pickDescription(spec, lang);
-      const rendered = compactPromptDescription(authored);
-      return rendered === authored
-        ? []
-        : [`${group.label}:${spec.id}:${lang}:${authored.length}->${rendered.length}`];
-    })));
-
-    expect(
-      changed,
-      'shipped routing descriptions must fit without runtime truncation or semantic rewriting',
-    ).toEqual([]);
+  it('keeps shared and System discovery descriptions compact without changing user-content limits', () => {
+    const resident = groups.filter(group => group.kind !== 'agent').flatMap(group => group.specs);
+    // A shipped-source growth alarm, not a runtime truncation or quality gate.
+    const chars = resident.reduce((sum, spec) => sum + pickDescription(spec, 'en').length, 0);
+    expect(chars).toBeLessThanOrEqual(4_500);
+    const creator = resident.find(spec => spec.name === 'agent-creator')!;
+    const skillCreator = resident.find(spec => spec.name === 'skill-creator')!;
+    expect(creator.description_en).not.toMatch(/inline.*container/i);
+    expect(skillCreator.description_en).not.toMatch(/containers|file blocks/i);
+    // The mutation protocol remains available after selection.
+    expect(fs.readFileSync(path.join(creator.dir, 'SKILL.md'), 'utf8')).toContain('<agent>...</agent>');
+    expect(fs.readFileSync(path.join(skillCreator.dir, 'SKILL.md'), 'utf8')).toContain('<<<skill-file>>>');
   });
 
-  it('keeps each shipped effective routing block within the production 8,000-character budget', async () => {
+  it('preserves source descriptions and marks only over-limit display tails', () => {
+    for (const group of groups) for (const spec of group.specs) {
+      const source = fs.readFileSync(spec.skillFile, 'utf8');
+      for (const lang of ['zh', 'en'] as const) {
+        const authored = pickDescription(spec, lang);
+        const rendered = compactPromptDescription(authored);
+        const label = `${group.label}:${spec.id}:${lang}`;
+        if (estimateBudgetTokens(authored) <= SKILL_DESCRIPTION_ROSTER_MAX_TOKENS) {
+          expect(rendered, label).toBe(authored);
+        } else {
+          expect(estimateBudgetTokens(rendered), label).toBeLessThanOrEqual(SKILL_DESCRIPTION_ROSTER_MAX_TOKENS);
+          expect(rendered.endsWith('…'), label).toBe(true);
+          expect(authored.startsWith(rendered.slice(0, -1)), label).toBe(true);
+        }
+      }
+      expect(fs.readFileSync(spec.skillFile, 'utf8')).toBe(source);
+    }
+  });
+
+  it('keeps each shipped effective routing block within the production token budget', async () => {
     const shared = groups.find((group) => group.kind === 'shared');
     const system = groups.find((group) => group.kind === 'system');
     expect(shared, 'shared marketplace Skill root must be scanned').toBeDefined();
@@ -681,12 +705,13 @@ describe('builtin skill inline budget', () => {
     const overBudget: string[] = [];
     for (const roster of rosters) {
       const rendered = await _renderSkillLinesForTest(roster.specs, roster.roots, new Map());
-      if (rendered.length > SKILL_ROSTER_MAX_CHARS) {
-        overBudget.push(`${roster.label}:${rendered.length}>${SKILL_ROSTER_MAX_CHARS}`);
+      if (estimateBudgetTokens(rendered) > SKILL_ROSTER_MAX_TOKENS) {
+        overBudget.push(`${roster.label}:${estimateBudgetTokens(rendered)}>${SKILL_ROSTER_MAX_TOKENS}`);
       }
-      // Mandatory shipped rows are never made name-only to hit the budget.
+      // Protected rows retain their per-entry-capped description instead of
+      // becoming name-only to meet the aggregate roster budget.
       for (const spec of roster.specs) {
-        expect(rendered, `${roster.label}:${spec.id} description must remain complete`)
+        expect(rendered, `${roster.label}:${spec.id} capped description must remain visible`)
           .toContain(compactPromptDescription(spec.description_en || spec.description_zh || ''));
       }
     }
@@ -712,7 +737,7 @@ describe('builtin skill inline budget', () => {
       expect(
         measured.get(target),
         `${target} must retain at least ${VIDEO_STUDIO_RESIDENT_SKILL_HEADROOM} inline-result tokens of headroom`,
-      ).toBeLessThanOrEqual(DEFAULT_INLINE_RESULT_TOKENS - VIDEO_STUDIO_RESIDENT_SKILL_HEADROOM);
+      ).toBeLessThanOrEqual(BUILTIN_SKILL_AUTHORING_TOKENS - VIDEO_STUDIO_RESIDENT_SKILL_HEADROOM);
     }
   });
 
@@ -730,7 +755,7 @@ describe('builtin skill inline budget', () => {
 
     expect(ranked[0].tokens).toBeGreaterThan(0);
     for (const doc of ranked) {
-      expect(doc.tokens, `${doc.label} is over budget`).toBeLessThanOrEqual(DEFAULT_INLINE_RESULT_TOKENS);
+      expect(doc.tokens, `${doc.label} is over budget`).toBeLessThanOrEqual(BUILTIN_SKILL_AUTHORING_TOKENS);
     }
   });
 });

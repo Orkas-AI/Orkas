@@ -24,6 +24,7 @@
  */
 
 import { createLogger } from '../../logger.js';
+import { isBootAdmissionIdle } from '../../util/boot_init.js';
 import { whichBin, whichBins } from './which.js';
 import {
   checkMinVersion,
@@ -69,14 +70,22 @@ export interface LocalCliCapabilities {
   codingProjectDirectory: boolean;
   /** Whether the runner can attach the per-run Orkas MCP bridge. */
   orkasBridge: boolean;
-  /** Whether this backend may read and update the calling Agent's durable
-   * memory. Keep this independent from the wider bridge capability: adding a
-   * bridge transport must not implicitly opt a backend into Agent memory. */
+  /** Whether durable Agent memory is automatically projected into the Agent
+   * profile and native session context. On-demand bridge memory tools use the
+   * same host-bound permissions for every CLI independently of projection. */
   agentMemory: boolean;
   /** Transport contract for accepting another user message before the current
    * native CLI process/turn finishes. This is a framework capability, not a
    * model allowlist. */
   activeRunIngress: LocalCliActiveRunIngress;
+  /** Whether the adapter sees output from the CLI while the turn is still
+   * running. Idle-kill reads progress, so `false` means silence carries no
+   * hang signal and the wall cap is the only honest bound: openclaw hands over
+   * its whole reply when the process exits, and an idle clock would cut a
+   * healthy long turn and discard the answer. Independent of
+   * `activeRunIngress`, which is about sending INTO a live run: opencode and
+   * hermes stream out while accepting nothing in. */
+  progressEvents: boolean;
   /** Policies the adapter can apply without rewriting global CLI config. */
   permissionPolicies: readonly LocalCliPermissionPolicy[];
 }
@@ -91,6 +100,7 @@ export const LOCAL_CLI_CAPABILITIES = {
     orkasBridge: true,
     agentMemory: true,
     activeRunIngress: 'stream-json',
+    progressEvents: true,
     permissionPolicies: ['inherit', 'ask', 'full_access'],
   },
   codex: {
@@ -101,6 +111,7 @@ export const LOCAL_CLI_CAPABILITIES = {
     orkasBridge: true,
     agentMemory: true,
     activeRunIngress: 'codex-app-server',
+    progressEvents: true,
     permissionPolicies: ['inherit', 'ask', 'full_access'],
   },
   openclaw: {
@@ -108,9 +119,10 @@ export const LOCAL_CLI_CAPABILITIES = {
     instructionChannel: 'user-message',
     durableInstructionScope: 'session',
     codingProjectDirectory: false,
-    orkasBridge: false,
+    orkasBridge: true,
     agentMemory: false,
     activeRunIngress: 'none',
+    progressEvents: false,
     permissionPolicies: ['inherit'],
   },
   opencode: {
@@ -121,6 +133,7 @@ export const LOCAL_CLI_CAPABILITIES = {
     orkasBridge: true,
     agentMemory: false,
     activeRunIngress: 'none',
+    progressEvents: true,
     // OpenCode's one-shot run transport has no interactive approval return
     // channel. Run it in its supported automatic mode and do not expose a
     // selector that suggests Orkas can pause and answer a native prompt.
@@ -131,9 +144,10 @@ export const LOCAL_CLI_CAPABILITIES = {
     instructionChannel: 'user-message',
     durableInstructionScope: 'invocation',
     codingProjectDirectory: false,
-    orkasBridge: false,
+    orkasBridge: true,
     agentMemory: false,
     activeRunIngress: 'none',
+    progressEvents: true,
     permissionPolicies: ['inherit', 'ask', 'full_access'],
   },
 } as const satisfies Record<string, LocalCliCapabilities>;
@@ -153,6 +167,9 @@ const UNKNOWN_CLI_CAPABILITIES: Readonly<LocalCliCapabilities> = Object.freeze({
   orkasBridge: false,
   agentMemory: false,
   activeRunIngress: 'none',
+  // An unregistered CLI makes no promise about mid-run output, so its silence
+  // is not evidence of a hang either.
+  progressEvents: false,
   permissionPolicies: ['inherit'] as const,
 });
 
@@ -552,6 +569,8 @@ export async function resolveCliForDispatch(type: LocalCliType): Promise<LocalCl
 export async function warmLocalClis(signal?: AbortSignal): Promise<LocalCliEntry[]> {
   const installed = await findAllInstalled();
   const results: LocalCliEntry[] = [];
+  let attempted = 0;
+  let yielded = false;
   for (const presence of installed) {
     if (signal?.aborted) break;
     if (!presence.available) {
@@ -559,12 +578,22 @@ export async function warmLocalClis(signal?: AbortSignal): Promise<LocalCliEntry
       results.push(entryCache.get(presence.type)?.entry || presence);
       continue;
     }
+    // Initial admission belongs to boot_init (including its deferral deadline).
+    // Recheck between probes so returning users do not compete with the rest
+    // of the scan. Finish the current shared probe: dispatch may be awaiting
+    // it. Unchecked CLIs remain available through normal on-demand resolution.
+    if (attempted > 0 && !isBootAdmissionIdle()) {
+      yielded = true;
+      break;
+    }
+    attempted += 1;
     results.push(await resolveCli(presence.type));
   }
   log.info('local CLI idle warmup finished', {
     checked: results.map(entry => entry.type),
     available: results.filter(entry => entry.available).map(entry => entry.type),
     aborted: signal?.aborted === true,
+    yielded,
   });
   return results;
 }

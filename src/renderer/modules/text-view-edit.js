@@ -4,19 +4,9 @@
 // (`destroy / isDirty / getMode / setMode`) so chat-file-viewer can hold
 // either MD or text controller in `_viewerEditController` without branching.
 //
-// Why a sibling instead of a `plainText` flag on mountMdViewEdit:
-//   - Plain text has no markdown toolbar, no preview toggle, no
-//     task-checkbox interactivity. Threading `plainText: true` through
-//     md-view-edit would mean three `if (!plainText) …` branches in the
-//     editor / view paths — duplicating logic at the call site is less
-//     code than gating each rendering primitive.
-//   - PC/CLAUDE.md §8 "only md files show the md toolbar" — a physical
-//     module boundary makes that invariant unforgeable; adding a flag
-//     leaves the toolbar visible if anyone later forgets the gate.
-//
-// Backend reuse: same `produced.readText` / `produced.writeText` IPC as
-// the workspace branch of md-view-edit. Path-sandbox + 2 MB read cap
-// already enforced on the main side, so nothing new to validate here.
+// Task files use the produced-file read/write lifecycle. Library files retain
+// their own draft/rename lifecycle in md-view-edit's plain-text mode. CSV/TSV
+// share a bounded table preview; both editors save the literal source text.
 //
 // Source shape: { absPath: string, cid?: string, projectId?: string }
 //   `cid` widens the read/write scope to include this conversation's
@@ -56,6 +46,7 @@ function mountTextViewEdit(opts) {
 
   const state = {
     source,
+    partial: opts.partial === true,
     caps,
     callbacks,
     bodyEl,
@@ -144,18 +135,11 @@ function _tveRender(state) {
   else _tveRenderView(state);
 }
 
-function _tveTrack(action, state, data) {
-  try {
-    if (!window.Monitor) return;
-    (() => {})(action, Object.assign({
-      can_save: !!(state && state.caps && state.caps.save),
-    }, data || {}));
-  } catch (_) {}
-}
-
 function _tveRenderView(state) {
   state.mode = 'view';
-  state.bodyEl.innerHTML = `<pre class="chat-file-viewer-text">${escapeHtml(state.content)}</pre>`;
+  if (typeof window !== 'undefined' && window.DelimitedPreview?.isDelimited(state.source.absPath)) {
+    window.DelimitedPreview.mount(state.bodyEl, state.content, state.source.absPath, !!state.partial);
+  } else state.bodyEl.innerHTML = `<pre class="chat-file-viewer-text">${escapeHtml(state.content)}</pre>`;
   const actions = [];
   if (state.caps.edit) actions.push(_tveActionButton(state, 'edit', 'contexts.viewer.edit', 'edit-pencil'));
   state.actionsEl.innerHTML = actions.join('');

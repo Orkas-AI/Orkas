@@ -11,6 +11,7 @@
  */
 
 import type { AgentTool, ToolContext, ToolResult } from "./base.js";
+import { createHash } from "node:crypto";
 
 /** Which store a memory op targets. `agent` is bound by the host to the CALLING
  *  agent (the LLM cannot reach another agent's store); `project` is bound to
@@ -26,27 +27,19 @@ export interface MemoryEvictionReport {
   truncated_entries?: number;
 }
 
-/** Handler interface implemented by the features layer. */
+export interface MemoryHandlerResult {
+  ok: boolean; error?: string; entries: string[];
+  changed?: boolean;
+  usage: { current: number; limit: number };
+  evicted?: MemoryEvictionReport;
+}
+
+/** Hosts may consolidate asynchronously before committing a memory write. */
 export interface MemoryToolHandler {
-  add(tier: MemoryTier, content: string): {
-    ok: boolean; error?: string; entries: string[];
-    usage: { current: number; limit: number };
-    evicted?: MemoryEvictionReport;
-  };
-  replace(tier: MemoryTier, oldText: string, content: string): {
-    ok: boolean; error?: string; entries: string[];
-    usage: { current: number; limit: number };
-    evicted?: MemoryEvictionReport;
-  };
-  remove(tier: MemoryTier, oldText: string): {
-    ok: boolean; error?: string; entries: string[];
-    usage: { current: number; limit: number };
-    evicted?: MemoryEvictionReport;
-  };
-  list(tier: MemoryTier): {
-    ok: boolean; entries: string[];
-    usage: { current: number; limit: number };
-  };
+  add(tier: MemoryTier, content: string, signal?: AbortSignal): MemoryHandlerResult | Promise<MemoryHandlerResult>;
+  replace(tier: MemoryTier, oldText: string, content: string, signal?: AbortSignal): MemoryHandlerResult | Promise<MemoryHandlerResult>;
+  remove(tier: MemoryTier, oldText: string): MemoryHandlerResult;
+  list(tier: MemoryTier): MemoryHandlerResult;
 }
 
 const TOOL_DESCRIPTION =
@@ -57,7 +50,7 @@ const TOOL_DESCRIPTION_WITH_PROJECT =
 
 /** Appended for sub-agents: they may read project memory but not write it. */
 const PROJECT_READONLY_NOTE =
-  ' Project memory is read-only; only Commander may write it.';
+  ' Project memory is read-only in this session; Commander can change it.';
 
 export interface CrossSessionMemoryToolOptions {
   /** Offer the `project` tier (project sessions only). The host binds it to
@@ -68,6 +61,8 @@ export interface CrossSessionMemoryToolOptions {
    *  not write. Sub-agents get this; only the commander writes project memory.
    *  Ignored unless `includeProjectTier`. */
   projectTierReadOnly?: boolean;
+  /** Only Commander may mutate account-global user/shared memory. */
+  globalTiersReadOnly?: boolean;
 }
 
 type MemoryAction = 'add' | 'replace' | 'remove' | 'list';
@@ -84,10 +79,16 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
     ? ['agent', 'project', 'shared', 'user']
     : ['agent', 'shared', 'user'];
   const projectReadOnly = !!opts.includeProjectTier && !!opts.projectTierReadOnly;
-  const description = opts.includeProjectTier
+  const description = opts.globalTiersReadOnly
+    ? 'Manage durable memory by its intended scope, not write access. Save stable facts, corrections or invalidations for future conversations before replying, even without a save request; exclude task progress and temporary state. User/shared writes belong to Commander: hand back those changes without substituting or duplicating them in another store. Decide from meaning, never trigger words.'
+      + (projectReadOnly ? PROJECT_READONLY_NOTE : '')
+    : opts.includeProjectTier
     ? TOOL_DESCRIPTION_WITH_PROJECT + (projectReadOnly ? PROJECT_READONLY_NOTE : '')
     : TOOL_DESCRIPTION;
-  const targetDescription = opts.includeProjectTier
+  const targetDescription = opts.globalTiersReadOnly
+    ? 'Defaults to agent: Agent-only reusable lessons; user: user-wide preferences; shared: cross-project facts. User/shared allow list only.'
+      + (opts.includeProjectTier ? ` Project: current-project facts${projectReadOnly ? ', read-only' : ''}.` : '')
+    : opts.includeProjectTier
     ? 'Defaults to agent: this agent\'s reusable lessons; project: project-specific facts and decisions; user: stable user-wide profile/preferences; shared: rare cross-project facts for every agent.'
       + (projectReadOnly ? ' Project is read-only.' : '')
     : 'Memory store. Defaults to agent: this agent\'s reusable lessons; user: stable user-wide profile/preferences; shared: rare cross-project facts for every agent.';
@@ -122,19 +123,23 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
 
     async execute(input: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {
       const action = input.action as string;
-      const target = (input.target as MemoryTier) || 'agent';
-      const content = (input.content as string) || '';
-      const oldText = (input.old_text as string) || '';
+      const target = input.target === undefined ? 'agent' : input.target as MemoryTier;
+      const content = typeof input.content === 'string' ? input.content : '';
+      const oldText = typeof input.old_text === 'string' ? input.old_text : '';
 
       const allowedFields = MEMORY_ACTION_FIELDS[action as MemoryAction];
       if (allowedFields) {
-        const unrelated = Object.keys(input).filter((key) => !allowedFields.has(key));
+        const unrelated = Object.keys(input).filter((key) => !['action', 'target', 'content', 'old_text'].includes(key));
         if (unrelated.length) {
           return {
             content: JSON.stringify({ ok: false, error: `fields not allowed for ${action}: ${unrelated.sort().join(', ')}` }),
             isError: true,
           };
         }
+      }
+
+      if (action === 'add' && input.old_text != null && (typeof input.old_text !== 'string' || input.old_text.trim())) {
+        return { content: JSON.stringify({ ok: false, error: 'add cannot match old_text; use replace to change an existing entry' }), isError: true };
       }
 
       if (!tiers.includes(target)) {
@@ -145,20 +150,24 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
         return { content: JSON.stringify({ ok: false, error: 'project memory is read-only for you; only the commander can add/replace/remove project entries' }), isError: true };
       }
 
-      let result: ReturnType<MemoryToolHandler['add']>;
+      if (opts.globalTiersReadOnly && (target === 'user' || target === 'shared') && action !== 'list') {
+        return { content: JSON.stringify({ ok: false, error: 'user/shared memory is read-only for you; only Commander may write it' }), isError: true };
+      }
+
+      let result: MemoryHandlerResult;
 
       switch (action) {
         case 'add':
-          if (!content) return { content: JSON.stringify({ ok: false, error: '"content" is required for add' }), isError: true };
-          result = handler.add(target, content);
+          if (!content.trim()) return { content: JSON.stringify({ ok: false, error: '"content" is required for add' }), isError: true };
+          result = await handler.add(target, content, _ctx.signal);
           break;
         case 'replace':
-          if (!oldText) return { content: JSON.stringify({ ok: false, error: '"old_text" is required for replace' }), isError: true };
-          if (!content) return { content: JSON.stringify({ ok: false, error: '"content" is required for replace' }), isError: true };
-          result = handler.replace(target, oldText, content);
+          if (!oldText.trim()) return { content: JSON.stringify({ ok: false, error: '"old_text" is required for replace' }), isError: true };
+          if (!content.trim()) return { content: JSON.stringify({ ok: false, error: '"content" is required for replace' }), isError: true };
+          result = await handler.replace(target, oldText, content, _ctx.signal);
           break;
         case 'remove':
-          if (!oldText) return { content: JSON.stringify({ ok: false, error: '"old_text" is required for remove' }), isError: true };
+          if (!oldText.trim()) return { content: JSON.stringify({ ok: false, error: '"old_text" is required for remove' }), isError: true };
           result = handler.remove(target, oldText);
           break;
         case 'list':
@@ -168,7 +177,15 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
           return { content: JSON.stringify({ ok: false, error: `unknown action: ${action}` }), isError: true };
       }
 
-      return { content: JSON.stringify(result), isError: !result.ok };
+      return {
+        content: JSON.stringify(result), isError: !result.ok,
+        ...(result.ok && (action === 'add' || action === 'replace') && typeof result.changed === 'boolean'
+          ? { observations: { stateMutation: {
+              scope: target,
+              version: createHash('sha256').update(JSON.stringify(result.entries)).digest('hex'),
+              changed: result.changed,
+            } } } : {}),
+      };
     },
   };
 }

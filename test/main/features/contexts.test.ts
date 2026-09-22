@@ -142,7 +142,7 @@ describe('contexts › writeContextFile', () => {
 
   it('accepts every text extension in the whitelist', async () => {
     const c = await loadContexts();
-    const exts = ['.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log'];
+    const exts = ['.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log', '.html', '.xml', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt'];
     for (const ext of exts) {
       const r = c.writeContextFile(`f${ext}`, 'content');
       expect(r.ok, ext).toBe(true);
@@ -345,6 +345,20 @@ describe('contexts › uploadContextFile', () => {
     expect(fs.existsSync(path.join(ctxRoot(), 'doc.pdf'))).toBe(true);
   });
 
+  it('imports and previews a legacy XLS without changing the workbook', async () => {
+    const c = await loadContexts();
+    const bytes = fs.readFileSync(path.join(__dirname, '../../fixtures/xls/inventory.xls'));
+    expect(c.uploadContextFile('inventory.xls', bytes).ok).toBe(true);
+    const preview = await c.readContextOfficeHtml('inventory.xls');
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) throw new Error('missing preview');
+    expect(preview.html).toContain('冷却泵');
+    expect(preview.html).toContain('Inventory sentinel 8384');
+    expect(preview.html).not.toContain('<script>');
+    expect(preview.allowScripts).not.toBe(true);
+    expect(fs.readFileSync(path.join(ctxRoot(), 'inventory.xls'))).toEqual(bytes);
+  });
+
   it('accepts modern Office bytes', async () => {
     const c = await loadContexts();
     const sheet = c.uploadContextFile('scores.xlsx', makeMinimalXlsx());
@@ -540,6 +554,17 @@ describe('contexts › createContextDir', () => {
 });
 
 describe('contexts › readContextFile', () => {
+  it('offers a bounded CSV preview while preserving the full stored source', async () => {
+    const c = await loadContexts();
+    const body = 'id,value\n' + '001,中文\n'.repeat(300_000);
+    writeFile('large.csv', body);
+    const result = c.readContextFile('large.csv', true);
+    expect(result).toMatchObject({ ok: true, truncated: true });
+    expect((result as any).content.startsWith('id,value\n001,中文')).toBe(true);
+    expect(Buffer.byteLength((result as any).content)).toBeLessThanOrEqual(2 * 1024 * 1024);
+    expect(fs.readFileSync(path.join(ctxRoot(), 'large.csv'), 'utf8')).toBe(body);
+    expect(c.readContextFile('../outside.csv', true).ok).toBe(false);
+  });
   it('returns content for an existing text file', async () => {
     writeFile('a.md', '# hello');
     const c = await loadContexts();
@@ -575,6 +600,16 @@ describe('contexts › listContextsTree', () => {
     expect(top).toEqual(['sub', 'a.md'].sort());
     const sub = tree.find((n) => n.name === 'sub')!;
     expect((sub.children || []).map((n) => n.name)).toEqual(['b.pdf']);
+  });
+
+  // The renderer orders the Library newest-first, so folders need an mtime of
+  // their own — without it every folder ties at the bottom of its group.
+  it('stamps an mtime on folders as well as files', async () => {
+    writeFile('sub/b.pdf', 'PDF');
+    const c = await loadContexts();
+    const tree = c.listContextsTree();
+    const sub = tree.find((n) => n.name === 'sub')!;
+    expect(sub.mtime).toBeGreaterThan(0);
   });
 });
 

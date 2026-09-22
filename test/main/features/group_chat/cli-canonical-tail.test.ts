@@ -6,7 +6,7 @@ import * as path from 'node:path';
 // A CLI turn used to parse the whole canonical log to keep ≤20 user turns
 // (2026-08-28 review A-2). The bounded tail read must still hand the compiler
 // everything it anchors on: the turn boundary, the stored history cursor and
-// enough prior user turns; a missing boundary keeps the whole-log behavior.
+// enough prior user turns; an unavailable boundary must not admit unbounded history.
 let tmpDir: string;
 beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-cli-tail-')); });
 afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
@@ -29,14 +29,14 @@ function writeLog(rows: number): string {
 }
 
 describe('_readCliCanonicalTail', () => {
-  it('reads a bounded tail that still contains the boundary and 40 prior user turns', async () => {
+  it('reads a bounded tail that still contains the boundary and five prior user turns', async () => {
     const { _readCliCanonicalTailForTest } = await import('../../../../src/main/features/group_chat/bus');
     const file = writeLog(2000);
     const rows = await _readCliCanonicalTailForTest(file, { boundaryId: 'm1998' });
     expect(rows.at(-1)?.id).toBe('m1999');
     expect(rows.some((r) => r.id === 'm1998')).toBe(true);
     const boundaryAt = rows.findIndex((r) => r.id === 'm1998');
-    expect(rows.slice(0, boundaryAt).filter((r) => r.from === 'user').length).toBeGreaterThanOrEqual(40);
+    expect(rows.slice(0, boundaryAt).filter((r) => r.from === 'user').length).toBeGreaterThanOrEqual(5);
     expect(rows.length).toBeLessThan(2000 / 2);
     // Chronological, contiguous tail.
     expect(rows.map((r) => Number(r.id.slice(1)))).toEqual(
@@ -53,11 +53,13 @@ describe('_readCliCanonicalTail', () => {
     expect(rows.length).toBeLessThan(2000);
   });
 
-  it('falls back to the whole log when the boundary is absent', async () => {
+  it('rejects missing boundaries instead of treating later records as prior history', async () => {
     const { _readCliCanonicalTailForTest } = await import('../../../../src/main/features/group_chat/bus');
     const file = writeLog(700);
-    const rows = await _readCliCanonicalTailForTest(file, { boundaryId: 'missing' });
-    expect(rows).toHaveLength(700);
-    expect(rows[0].id).toBe('m0');
+    await expect(_readCliCanonicalTailForTest(file, { boundaryId: 'missing' }))
+      .rejects.toThrow('history turn boundary is unavailable');
+    fs.unlinkSync(file);
+    await expect(_readCliCanonicalTailForTest(file, { boundaryId: 'm0' }))
+      .rejects.toThrow('history turn boundary is unavailable');
   });
 });

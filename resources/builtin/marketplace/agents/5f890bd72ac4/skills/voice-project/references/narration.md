@@ -1,0 +1,11 @@
+# Narration and revisions
+
+1. Query `generate_speech` with `action:"capabilities"` and the requested language. Page with `route_ref` and `offset` when needed. Select only returned compatible voices; retain the same voice per role. A configured-only voice has limited catalog evidence. Explain when the available voices cannot satisfy a requested multi-role distinction.
+2. Save the script and roles in the project. For open-ended narration use natural reading speed and let actual audio determine duration. For a fixed duration, fit the wording first; do not silently cut off speech to meet a target. Show the planned role choices and material text adaptation in normal progress; no additional approval stop is required for already authorized production.
+3. Run `status`. Reuse `ready` recordings. For each `pending` identity, run `begin`, then call `generate_speech` once with the returned request. Run `record` immediately after a successful file receipt. Persist between segments; do not send an unbounded batch.
+4. If synthesis fails or the task stops, leave the attempt uncertain. On resume, inspect the recorded destination or the tool's actual output path and `record` a valid completed file. A rejected preflight with explicit no-request/no-charge evidence may be retried after fixing its cause; record that evidence and use an explicit new take. Without such evidence or an explicit user retake request, do not retry, switch provider or change the filename to repeat a possibly billed request.
+5. For revisions, change only the affected text/role settings. Background gain, pauses and local speed changes need only rendering. After speech is ready, use the local-audio reference to render and deliver.
+
+Use existing provider configuration and credentials through the speech tool only. No keys in project files, scripts, arguments or chat. Capabilities are discovery, not synthesis or proof of account quota. Respect the host's existing billing/permission decisions without duplicating them in an Agent-specific form.
+
+If a user requests a wholly new performance of identical text, increment only its `take`; retain old recordings and exports. A stale `.voice-lock` after a hard crash may be removed only after establishing that no project operation is still running. Never recover by deleting the state or all project media.

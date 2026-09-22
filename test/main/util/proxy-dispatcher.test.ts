@@ -88,6 +88,51 @@ describe('util/proxy-dispatcher environment configuration', () => {
     expect(envProxyAppliesToUrl(new URL('https://port.example/file'), config)).toBe(true);
   });
 
+  it.each([
+    { NO_PROXY: '*' },
+    { no_proxy: '*' },
+    { NO_PROXY: 'direct.example' },
+  ])('preserves an explicit direct route through the actual environment dispatcher: %j', async (bypass) => {
+    const { EnvHttpProxyAgent, request } = await import('undici');
+    let directRequests = 0;
+    let proxyRequests = 0;
+    const direct = createServer((_req, res) => {
+      directRequests += 1;
+      res.end('direct response');
+    });
+    const proxy = createServer();
+    proxy.on('connect', (_req, socket) => {
+      proxyRequests += 1;
+      socket.end('HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n');
+    });
+    const listen = (server: ReturnType<typeof createServer>) => new Promise<number>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => resolve((server.address() as import('node:net').AddressInfo).port));
+    });
+    const directPort = await listen(direct);
+    const proxyPort = await listen(proxy);
+    const config = envProxyConfig({ HTTP_PROXY: `http://127.0.0.1:${proxyPort}`, ...bypass });
+    const dispatcher = new EnvHttpProxyAgent({
+      ...config,
+      connect: { lookup: (_hostname, options, callback) => {
+        if (options.all) callback(null, [{ address: '127.0.0.1', family: 4 }]);
+        else callback(null, '127.0.0.1', 4);
+      } },
+    });
+    const url = new URL(`http://direct.example:${directPort}/probe`);
+    try {
+      const result = await request(url, { dispatcher, signal: AbortSignal.timeout(2_000) })
+        .then(response => response.body.text(), error => `transport failure: ${error.code}`);
+      expect({ result, directRequests, proxyRequests }).toEqual({
+        result: 'direct response', directRequests: 1, proxyRequests: 0,
+      });
+      expect(envProxyAppliesToUrl(url, config)).toBe(false);
+    } finally {
+      await dispatcher.destroy();
+      await Promise.all([direct, proxy].map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+    }
+  });
+
   it('uses ALL_PROXY as the final fallback and supports lowercase variables', () => {
     expect(envProxyConfig({ all_proxy: 'socks5://proxy:1080' })).toMatchObject({
       httpProxy: 'socks5://proxy:1080',
@@ -175,6 +220,18 @@ describe('util/proxy-dispatcher child routes', () => {
       async () => 'DIRECT',
     )).resolves.toEqual({ ORKAS_PROXY_MODE: 'direct' });
     expect(bridge).not.toHaveBeenCalled();
+  });
+
+  it.each([' * ', 'direct.example,*'])('preserves all-hosts bypass in child fetch configuration: %s', async (noProxy) => {
+    process.env.HTTP_PROXY = 'http://proxy.example:8080';
+    process.env.NO_PROXY = noProxy;
+    const bridge = vi.fn();
+    const resolve = vi.fn();
+    expect(await buildChildProxyEnvironment('https://api.example.com', bridge, resolve)).toMatchObject({
+      NO_PROXY: '*', ORKAS_PROXY_NO_PROXY: '*', ORKAS_PROXY_MODE: 'env',
+    });
+    expect(bridge).not.toHaveBeenCalled();
+    expect(resolve).not.toHaveBeenCalled();
   });
 
   it('propagates separate explicit environment routes without consulting PAC', async () => {

@@ -1,0 +1,56 @@
+/* Native titlebars own the window title, dragging and window controls. */
+.preview-window { overflow: hidden; height: 100vh; }
+#preview-loading { padding: 24px; color: var(--text-secondary); }
+.preview-window .chat-lightbox-backdrop,
+.preview-window .chat-file-viewer-backdrop,
+.preview-window .saved-app-viewer-backdrop,
+.preview-window .chat-artifact-viewer-backdrop,
+.preview-window .saved-app-viewer-title,
+.preview-window .saved-app-viewer-close,
+.preview-window .chat-artifact-viewer-title,
+.preview-window .chat-artifact-viewer-close,
+.preview-window .chat-file-viewer-title,
+.preview-window .chat-file-viewer-close,
+.preview-window .chat-lightbox-close,
+.chat-lightbox-title { display: none; }
+.preview-window .chat-file-viewer-stage,
+.preview-window .chat-file-viewer.is-office-fit .chat-file-viewer-stage,
+.preview-window .saved-app-viewer-stage,
+.preview-window .chat-artifact-viewer-stage {
+  width: 100%; height: 100%; max-width: none; max-height: none;
+  border-radius: 0; box-shadow: none;
+}
+.preview-window .saved-app-viewer-header { display: none; }
+.preview-window .chat-file-viewer-header,
+.preview-window .chat-artifact-viewer-header { display: contents; }
+.preview-window .chat-file-viewer-actions,
+.preview-window .chat-lightbox-actions {
+  position: absolute; top: 12px; right: 12px; z-index: 4;
+  gap: 6px; padding: 6px; border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 12px; background: rgba(248, 250, 252, 0.94);
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.12);
+  opacity: 0.5;
+  transition: opacity 180ms ease; -webkit-app-region: no-drag;
+}
+.preview-window .chat-file-viewer-actions:hover,
+.preview-window .chat-file-viewer-actions:focus-within,
+.preview-window .chat-lightbox-actions:hover,
+.preview-window .chat-lightbox-actions:focus-within { opacity: 1; }
+.preview-window .chat-lightbox-actions > button {
+  width: 28px; height: 28px; background: transparent; box-shadow: none;
+}
+.preview-window .chat-lightbox-actions > button:hover:not(:disabled) { background: #e2e8f0; }
+.preview-window .chat-file-viewer.is-video-idle .chat-file-viewer-actions:not(:hover):not(:focus-within) {
+  opacity: 0; pointer-events: none;
+}
+.preview-window .chat-lightbox-stage,
+.preview-window .chat-lightbox.is-loading .chat-lightbox-stage {
+  width: 100%; height: 100%; max-width: none; max-height: none;
+  padding: 16px 56px; overflow: hidden; background: #0f172a;
+}
+.preview-window .chat-lightbox-img { max-width: 100%; max-height: 100%; box-shadow: none; }
+.preview-window .chat-lightbox-nav { top: 50%; }
+.preview-window .chat-lightbox-previous { left: 12px; }
+.preview-window .chat-lightbox-next { right: 12px; }
+.preview-window .chat-file-viewer.is-office-fit .chat-file-viewer-body { flex: 1; max-height: none; }
+.preview-window .chat-file-viewer-office { height: 100% !important; }

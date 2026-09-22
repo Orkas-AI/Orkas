@@ -274,6 +274,32 @@ def gen_queries(crawl_obj: dict, brand: str, competitors: list[str], domain: str
     return rows
 
 
+_DOMAIN_REFERENCE_RE = re.compile(
+    r"(?:[a-z][a-z0-9+.-]*://|//)[^\s<>\"']+"
+    r"|(?<![\w@./-])(?:[^\s<>\"'()/]*@)?(?:[\w-]+\.)+[\w-]+\.?"
+    r"(?::[^\s<>\"'/?#]*)?(?:[/?#][^\s<>\"']*)?",
+    re.I,
+)
+
+
+def _cites_domain(text: str, domain: str) -> bool:
+    """Count bare domains and genuine URL hosts, never URL path/userinfo text."""
+    target = domain.strip().lower().rstrip(".")
+    if not target:
+        return False
+    for match in _DOMAIN_REFERENCE_RE.finditer(text or ""):
+        candidate = match.group().rstrip(".,;:!?)]}")
+        try:
+            parsed = urlsplit(candidate if "://" in candidate or candidate.startswith("//")
+                              else "//" + candidate)
+            host = (parsed.hostname or "").lower().rstrip(".")
+        except ValueError:
+            continue
+        if host == target or host.endswith("." + target):
+            return True
+    return False
+
+
 def _mentions(text: str, needle: str) -> bool:
     if not needle:
         return False
@@ -300,11 +326,9 @@ def score_answers(payload: dict) -> dict:
         mode = (a.get("mode") or "param").lower()
         if mode == "retrieval":
             retrieval_n += 1
-        # Word-boundary match only: a raw `domain in text` substring test counted
-        # the domain as cited when it merely prefixed a longer host (orkas.ai is a
-        # substring of orkas.airlines.com), inflating citation_rate. _mentions already
-        # accepts orkas.ai/path, (orkas.ai) and trailing-dot forms.
-        m_dom = _mentions(text, domain)
+        # Match URL hosts instead of embedded path/userinfo text, while retaining
+        # bare-domain citations. Brand and context terms keep their token rules.
+        m_dom = _cites_domain(text, domain)
         m_brand = _mentions(text, brand)
         corroborated = any(_mentions(text, t) for t in context) if context else None
         if m_dom:
@@ -459,7 +483,7 @@ def disambiguate_references(payload: dict) -> dict:
         if not isinstance(ref, dict):
             continue
         blob = " ".join(str(ref.get(k) or "") for k in ("title", "snippet", "text", "url"))
-        m_dom = _mentions(blob, domain)
+        m_dom = _cites_domain(blob, domain)
         m_brand = _mentions(blob, brand)
         hits = [t for t in context if _mentions(blob, t)]
         near = _near_miss_tokens(blob, brand)

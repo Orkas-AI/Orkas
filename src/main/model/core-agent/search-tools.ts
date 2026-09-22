@@ -22,7 +22,10 @@
  * overwrites core-agent's builtin (last-write-wins).
  */
 
+import { createHash } from 'node:crypto';
 import type { AgentTool, ToolResult } from '#core-agent';
+import type { SearchProfile } from '../../features/auth';
+import { getActiveUserId } from '../../features/users';
 import { listSearchProfiles } from '../../features/search_auth';
 import { runSearchAdapter, SEARCH_PROVIDER_LABEL, SearchAccountError } from './search-adapters';
 import { createLogger } from '../../logger';
@@ -43,7 +46,30 @@ const log = createLogger('search-tools');
 const DEFAULT_COUNT = 8;
 const MAX_COUNT = 20;
 const PAID_SEARCH_COOLDOWN_MS = 10 * 60_000;
-let paidSearchDisabledUntil = 0;
+const MAX_PAID_SEARCH_COOLDOWNS = 128;
+const paidSearchCooldowns = new Map<string, number>();
+
+function searchCooldownKey(userId: string, profile: SearchProfile): string {
+  return createHash('sha256').update(JSON.stringify([
+    userId,
+    profile.id,
+    profile.provider,
+    profile.apiKey,
+    Object.entries(profile.extras || {}).sort(([a], [b]) => a.localeCompare(b)),
+  ])).digest('hex');
+}
+
+function rememberAccountFailure(key: string): void {
+  const now = Date.now();
+  for (const [entry, until] of paidSearchCooldowns) {
+    if (until <= now) paidSearchCooldowns.delete(entry);
+  }
+  paidSearchCooldowns.delete(key);
+  while (paidSearchCooldowns.size >= MAX_PAID_SEARCH_COOLDOWNS) {
+    paidSearchCooldowns.delete(paidSearchCooldowns.keys().next().value!);
+  }
+  paidSearchCooldowns.set(key, now + PAID_SEARCH_COOLDOWN_MS);
+}
 
 export interface SearchExecutionContext {
   conversationId?: string;
@@ -81,7 +107,7 @@ export async function createWebSearchOverrideTool(context?: SearchExecutionConte
       const fallback = await mod.runBuiltinWebSearch(query, count);
       if (fallback.isError) {
         const head = accountErr
-          ? `Paid search unavailable (account: ${accountErr}); automatically switched to free search, which returned no results for this query. Try a broader/different query — the account quota/auth issue itself needs the user, retrying paid search will not help.`
+          ? `Paid search unavailable (account: ${accountErr}); free search fallback also failed: ${fallback.content}`
           : `Configured search providers failed:\n${errors.join('\n')}\nKeyless fallback also failed: ${fallback.content}`;
         return {
           content: head,
@@ -126,12 +152,19 @@ export async function createWebSearchOverrideTool(context?: SearchExecutionConte
       if (!query) return { content: 'Error: query is required', isError: true };
 
       const profiles = listSearchProfiles();
-      const paidOnCooldown = Date.now() < paidSearchDisabledUntil;
-      if (profiles.length && !paidOnCooldown) {
+      if (profiles.length) {
+        const userId = getActiveUserId();
+        const candidates = profiles.map(profile => ({ profile, key: searchCooldownKey(userId, profile) }));
         const errors: string[] = [];
         let accountErr: string | null = null;
-        for (const profile of profiles) {
+        for (const { profile, key } of candidates) {
           const label = SEARCH_PROVIDER_LABEL[profile.provider] || profile.provider;
+          if (Date.now() < (paidSearchCooldowns.get(key) || 0)) {
+            accountErr = `${label}: temporarily unavailable (account quota/auth)`;
+            errors.push(accountErr);
+            continue;
+          }
+          paidSearchCooldowns.delete(key);
           log.info('web_search via paid API', { provider: profile.provider, query_len: query.length, count });
           try {
             const res = await runSearchAdapter(profile, query, count, context);
@@ -143,21 +176,21 @@ export async function createWebSearchOverrideTool(context?: SearchExecutionConte
           } catch (err) {
             const msg = (err as Error).message || String(err);
             errors.push(`${label}: ${msg}`);
-            if (err instanceof SearchAccountError || /(^|\s)(401|402|403):/.test(msg)) accountErr = msg;
+            const accountError = err instanceof SearchAccountError || /(^|\s)(401|402|403):/.test(msg);
+            if (accountError) {
+              accountErr = msg;
+              rememberAccountFailure(key);
+            }
             log.warn('paid search failed; trying next provider', {
               provider: profile.provider,
-              account_error: err instanceof SearchAccountError || /(^|\s)(401|402|403):/.test(msg),
+              account_error: accountError,
               error: logErrorSummary(err),
             });
           }
         }
-        if (accountErr) paidSearchDisabledUntil = Date.now() + PAID_SEARCH_COOLDOWN_MS;
         return runKeylessFallback(query, count, errors, accountErr);
       }
 
-      if (paidOnCooldown) {
-        return runKeylessFallback(query, count, [], 'paid search temporarily unavailable (account quota/auth)');
-      }
       log.info('web_search via builtin keyless (no paid profile configured)', { query_len: query.length, count });
       return mod.runBuiltinWebSearch(query, count);
     },

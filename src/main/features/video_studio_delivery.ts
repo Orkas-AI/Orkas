@@ -11,8 +11,9 @@
  * "narration added, AAC 48kHz". Two of the three real assemblies on this
  * machine had taken that route at least once.
  *
- * So this verifies the ARTIFACT against the signed plan and never asks how the
- * artifact was made. Same bar for every route.
+ * Local assembly verifies the ARTIFACT against the signed plan regardless of
+ * which tool assembled it. Direct model output instead receives a basic media
+ * check; production method is derived from the current plan, not route labels.
  *
  * Measurement (needs ffmpeg) is separated from assessment (pure) so the
  * judgement is unit-testable against real captured numbers.
@@ -24,6 +25,7 @@ import { createLogger } from '../logger';
 import { bundledFfmpegPaths } from '../util/bundled-runtime';
 import { isPathAllowed } from '../util/path-sandbox';
 import { runVideoProcessForTest } from './video_studio';
+import { videoProductionIsGeneration } from './video_production_mode';
 
 const log = createLogger('video-studio-delivery');
 
@@ -62,6 +64,7 @@ export type DeliveryNarrationLine = {
 
 export type DeliveryIssue = {
   code:
+    | 'DELIVERY_VIDEO_UNREADABLE'
     | 'DELIVERY_NARRATION_OVERLAP'
     | 'DELIVERY_NARRATION_TRUNCATED'
     | 'DELIVERY_DURATION_DRIFT'
@@ -261,6 +264,7 @@ export async function probeDeliveredVideo(videoAbsPath: string, signal?: AbortSi
     };
     const streams = parsed.streams ?? [];
     const video = streams.find((s) => s.codec_type === 'video');
+    if (!video || !(Number(video.width) > 0) || !(Number(video.height) > 0)) return null;
     const rate = String(video?.r_frame_rate ?? '');
     const [num, den] = rate.split('/').map(Number);
     return {
@@ -306,6 +310,7 @@ export async function measureVoicedSpan(
 
 export type DeliveryVerdict = {
   ok: boolean;
+  is_generation: boolean;
   video_path: string;
   duration_sec: number | null;
   canvas: string | null;
@@ -331,9 +336,8 @@ async function sidecarSubtitleExists(videoAbsPath: string): Promise<boolean> {
 
 /** Verify one delivered video against the plan it was produced from.
  *
- * Route-agnostic on purpose: it reads the artifact and the signed plan, never
- * how the file was built, so the hand-written ffmpeg fallback and the assembly
- * ops are held to the same bar. */
+ * Route-agnostic: the current executable plan selects direct model delivery or
+ * local assembly checks. Hand-written and native local assembly share a bar. */
 export async function verifyProductionDelivery(input: {
   planAbsPath: string;
   plan: Record<string, unknown>;
@@ -351,6 +355,43 @@ export async function verifyProductionDelivery(input: {
   // rewrote paths that had been correct all along before publishing anyway.
   const videoDir = path.dirname(path.dirname(input.planAbsPath));
   const spec = await probeDeliveredVideo(input.videoAbsPath, input.signal);
+  const isGeneration = videoProductionIsGeneration(input.plan);
+  if (isGeneration) {
+    // Provider output is delivered directly. Do not decode its whole audio,
+    // analyze its creative content, or prescribe a new paid attempt to enforce
+    // local-composition tolerances on a probabilistic generator.
+    const issues = spec ? assessDeliveredSpec({
+      spec,
+      planTotalTargetSec: typeof input.plan.total_target_sec === 'number' ? input.plan.total_target_sec : null,
+      planAspect: typeof input.plan.aspect === 'string' ? input.plan.aspect : null,
+      narrationLineCount: 0,
+      captionLineCount: 0,
+      integratedLufs: null,
+      sidecarSubtitleFound: false,
+    }).map((issue): DeliveryIssue => ({
+      ...issue,
+      severity: 'warning',
+      message: issue.code === 'DELIVERY_DURATION_DRIFT'
+        ? `Model output duration is ${spec.durationSec}s; requested ${input.plan.total_target_sec}s. Report the difference; no automatic regeneration or trimming.`
+        : `Model output canvas is ${spec.width}x${spec.height}; requested ${input.plan.aspect}. Report the difference; no automatic regeneration or reframing.`,
+    })) : [{
+      code: 'DELIVERY_VIDEO_UNREADABLE' as const,
+      severity: 'error' as const,
+      message: 'The output has no readable video stream. Delivery failed; retain transaction evidence before deciding recovery.',
+    }];
+    return {
+      ok: !!spec,
+      is_generation: true,
+      video_path: input.videoAbsPath,
+      duration_sec: spec?.durationSec ?? null,
+      canvas: spec?.width && spec?.height ? `${spec.width}x${spec.height}` : null,
+      fps: spec?.fps ?? null,
+      integrated_lufs: null,
+      narration_lines_measured: 0,
+      issues,
+      note: 'Direct model output: readable video stream checked; creative, reference fidelity and audio mastering checks were not run.',
+    };
+  }
   const tracks = (input.plan.tracks && typeof input.plan.tracks === 'object' && !Array.isArray(input.plan.tracks))
     ? input.plan.tracks as Record<string, unknown>
     : {};
@@ -458,6 +499,7 @@ export async function verifyProductionDelivery(input: {
   const blocking = issues.filter((issue) => issue.severity === 'error');
   return {
     ok: blocking.length === 0,
+    is_generation: false,
     video_path: input.videoAbsPath,
     duration_sec: spec?.durationSec ?? null,
     canvas: spec?.width && spec?.height ? `${spec.width}x${spec.height}` : null,

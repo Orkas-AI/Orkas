@@ -1,7 +1,7 @@
 ---
 name: agent-creator
-description_zh: "通过内联 Agent 容器创建或修改用户明确要求的自定义 Agent；用于新建 Agent、把当前对话沉淀为 Agent，或调整其工作流与路由描述，不用于执行普通 Agent 任务。"
-description_en: "Author or revise an explicitly requested custom Agent through its inline agent container. Use when the user asks to create an Agent, crystallize a conversation into one, or change its workflow or routing description; not for running an Agent task."
+description_zh: "创建或修改用户明确要求的自定义 Agent，支持把对话沉淀为 Agent、调整工作流或路由描述；不用于执行普通 Agent 任务。"
+description_en: "Create or revise explicitly requested custom Agents, including conversation crystallization, workflows and routing descriptions; not ordinary Agent task execution."
 ---
 
 # agent-creator
@@ -43,6 +43,10 @@ Do not read unrelated references. A simple bound edit normally needs only `llm-a
 - Pure discussion, unrelated questions, or a request that changes no field: emit no container.
 
 For a new Agent, first compare its name and its typical objects/actions with the injected Agent index. If an existing Agent substantially overlaps, stop and ask whether to use it or still create a new one. Otherwise create in the same turn.
+
+## Routing descriptions
+
+New or rewritten descriptions usually need one or two concise sentences: action, work object, deliverable, and any boundary needed to distinguish adjacent roles. Use natural routing terms; add an example only to resolve ambiguity, not a repeated keyword list. Keep execution steps out of the description. Do not shorten supplied or existing descriptions during unrelated edits or source-preserving imports.
 
 ## Execution sequence
 

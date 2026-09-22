@@ -62,8 +62,7 @@ async function setupProjectStateTools() {
     },
     async create(input) {
       const result = await projectTasks.createTask(UID, pid, {
-        title: input.title,
-        detail: input.detail,
+        content: input.content,
         status: input.status,
         owner_agent: input.owner,
         created_by: 'Commander',
@@ -74,8 +73,7 @@ async function setupProjectStateTools() {
     },
     async update(taskId, patch) {
       const result = await projectTasks.updateTask(UID, pid, taskId, {
-        title: patch.title,
-        detail: patch.detail,
+        content: patch.content,
         status: patch.status,
         owner_agent: patch.owner,
         result_ref: patch.result_ref,
@@ -95,6 +93,37 @@ async function setupProjectStateTools() {
 }
 
 describe('project state tools → durable feature stores', () => {
+  it('resolves global task owners only from the enabled account registry and rejects scope overrides', async () => {
+    const agents = await import('../../../../src/main/features/agents');
+    const users = await import('../../../../src/main/features/users');
+    const tasks = await import('../../../../src/main/features/project_tasks');
+    const { createProjectTasksHandler } = await import('../../../../src/main/features/project_tasks_tool_handler');
+    const registry = vi.spyOn(agents, 'listAgentSummaries').mockResolvedValue([
+      { agent_id: 'enabled-owner', name: 'Researcher', enabled: true },
+      { agent_id: 'disabled-owner', name: 'Disabled', enabled: false },
+    ] as any);
+    try {
+      const tool = createProjectTasksTool(createProjectTasksHandler(UID, '', 'global-chat', new Map()), { globalScope: true });
+      const call = async (args: Record<string, unknown>) => tool.execute(args, { state: {} });
+      const created = await call({ action: 'create', content: 'Global research', owner: 'Researcher' });
+      expect(created.isError).toBeFalsy();
+      const id = JSON.parse(created.content).task.id;
+      const saved = await tasks.getTask(UID, '', id);
+      expect(saved).toMatchObject({ owner_agent_id: 'enabled-owner', owner_agent: 'Researcher' });
+      for (const args of [
+        { action: 'update', task_id: id, owner: 'Disabled' },
+        { action: 'complete', task_id: id, project: 'another-project' },
+        { action: 'create', content: 'Forbidden', userId: 'foreign-account' },
+      ]) {
+        expect((await call(args)).isError).toBe(true);
+        expect(await tasks.listTasks(UID, '')).toEqual([saved]);
+      }
+      users.activateUser('another-account');
+      expect((await call({ action: 'update', task_id: id, owner: 'Researcher' })).isError).toBe(true);
+      expect(await tasks.getTask(UID, '', id)).toEqual(saved);
+    } finally { registry.mockRestore(); }
+  });
+
   it('round-trips instructions, durable memory, and task progress through real handlers', async () => {
     const state = await setupProjectStateTools();
     const ctx = {} as any;
@@ -116,15 +145,14 @@ describe('project state tools → durable feature stores', () => {
 
     const created = await state.tasksTool.execute({
       action: 'create',
-      title: 'Implement webhook retries',
-      detail: 'Retry transient failures three times.',
+      content: 'Implement webhook retries\nRetry transient failures three times.',
       owner: 'Backend',
     }, ctx);
     expect(created.isError).toBe(false);
     const taskId = JSON.parse(created.content).task.id as string;
     const listed = await state.tasksTool.execute({ action: 'list' }, ctx);
     expect(JSON.parse(listed.content).tasks).toEqual([
-      expect.objectContaining({ id: taskId, title: 'Implement webhook retries', status: 'todo' }),
+      expect.objectContaining({ id: taskId, content: 'Implement webhook retries\nRetry transient failures three times.', status: 'todo' }),
     ]);
 
     const completed = await state.tasksTool.execute({

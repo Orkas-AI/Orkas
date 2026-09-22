@@ -4,7 +4,9 @@
 // is hard to spot in code review. This is the multi-branch decision
 // function category from PC/CLAUDE.md §9.
 
-import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import * as vm from 'node:vm';
+import { describe, it, expect, vi } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const viewer = require('../../src/renderer/modules/chat-file-viewer.js');
 const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions, _viewerVideoSeekTarget, _htmlCanvasDimensions, _htmlCanvasWidthFit } = viewer as {
@@ -35,6 +37,7 @@ describe('chat-file-viewer › _kindOf', () => {
     ['macro.docm', 'office'],
     ['workbook.xlsx', 'office'],
     ['sheet.xlsm', 'office'],
+    ['legacy.xls', 'office'],
     ['slides.pptx', 'office'],
     ['deck.pptm', 'office'],
     ['page.html', 'html'],
@@ -60,7 +63,7 @@ describe('chat-file-viewer › _kindOf', () => {
   it.each([
     ['archive.zip', 'unsupported'],
     ['legacy.doc', 'unsupported'],
-    ['legacy.xls', 'unsupported'],
+    ['legacy.xls.exe', 'unsupported'],
     ['legacy.ppt', 'unsupported'],
     ['binary.exe', 'unsupported'],
     ['photo.heic', 'unsupported'], // image-ish but not in the allow-list
@@ -75,6 +78,7 @@ describe('chat-file-viewer › _kindOf', () => {
   it('is case-insensitive on the extension portion', () => {
     expect(_kindOf('REPORT.PDF')).toBe('pdf');
     expect(_kindOf('REPORT.XLSX')).toBe('office');
+    expect(_kindOf('REPORT.XLS')).toBe('office');
     expect(_kindOf('Note.MD')).toBe('markdown');
     expect(_kindOf('Page.Html')).toBe('html');
     expect(_kindOf('Voice.MP3')).toBe('audio');
@@ -84,6 +88,33 @@ describe('chat-file-viewer › _kindOf', () => {
   it('handles paths with directories — only the basename ext matters', () => {
     expect(_kindOf('/Users/test/Documents/note.md')).toBe('markdown');
     expect(_kindOf('C:\\\\work\\\\report.pdf')).toBe('pdf');
+  });
+});
+
+describe('file preview availability feedback', () => {
+  it.each([
+    [{ ok: true, exists: false }, 'missing'],
+    [{ ok: false, error: 'path is outside the user workspace' }, 'unreadable'],
+    [null, 'unreadable'],
+    [{ ok: true, exists: true, isFile: true }, 'open'],
+  ])('handles stat result %j without misreporting availability', async (response, outcome) => {
+    const invoke = vi.fn(async () => response);
+    const uiToast = vi.fn();
+    const uiConfirm = vi.fn(async () => false);
+    const openChatImageLightbox = vi.fn();
+    const context = vm.createContext({
+      window: { orkas: { invoke } }, uiToast, uiConfirm, openChatImageLightbox,
+      console,
+    });
+    vm.runInContext(readFileSync(require.resolve('../../src/renderer/modules/chat-file-viewer.js'), 'utf8'), context);
+    await context.openChatFileViewer('/repository/cover.png', 'cover.png', { cid: 'code-task' });
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('workspace.statPath', { path: '/repository/cover.png', cid: 'code-task' });
+    expect(openChatImageLightbox).toHaveBeenCalledTimes(outcome === 'open' ? 1 : 0);
+    expect(uiToast).toHaveBeenCalledTimes(outcome === 'missing' ? 1 : 0);
+    expect(uiConfirm).toHaveBeenCalledTimes(outcome === 'unreadable' ? 1 : 0);
+    if (outcome === 'unreadable') {
+      expect(uiConfirm).toHaveBeenCalledWith(expect.objectContaining({ message: 'Could not read this file. Open the containing folder?' }));
+    }
   });
 });
 

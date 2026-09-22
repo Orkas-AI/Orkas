@@ -20,13 +20,14 @@ type AgentRunEvent =
   | { type: 'text_phase'; phase: 'commentary' | 'final_answer' }
   | { type: 'thinking'; phase: 'start' | 'progress' | 'end'; chars: number; text?: string }
   | { type: 'tool_delta'; name?: string; id: string; inputDelta: string; inputBytes?: number }
-  | { type: 'tool_start'; name: string; id: string; input: unknown }
+  | { type: 'tool_start'; name: string; id: string; input: unknown; skipped?: boolean }
   | { type: 'tool_progress'; name: string; id: string; phase?: string; message: string; data?: Record<string, unknown> }
   | {
       type: 'tool_end';
       name: string;
       id: string;
       result: string;
+      skipped?: boolean;
       displayName?: string;
       persistedOutput?: { path: string; size: number; ref: string };
       isError?: boolean;
@@ -89,7 +90,7 @@ type AgentRunEvent =
             statusCode?: number;
           };
           convergenceSignals?: string[];
-          termination?: { status: 'waiting_input'; reason: 'user_action_required' };
+          termination?: import('#core-agent').AgentRunTermination;
         };
       };
     };
@@ -189,6 +190,31 @@ it('does not let a user-input marker hide an explicit model failure', async () =
   expect(out).toContainEqual(expect.objectContaining({ type: 'error', failureKind: 'model' }));
 });
 
+it.each(['en', 'zh'] as const)('accepts a successful textless handoff in %s without inventing a final answer', async (language) => {
+  setCurrentLang(language);
+  try {
+    const out = await collect([{
+      type: 'done', result: { text: '', meta: {
+        error: null,
+        termination: { status: 'handed_off', reason: 'tool_handoff' },
+      } },
+    }]);
+    expect(out).toEqual([]);
+  } finally {
+    setCurrentLang('en');
+  }
+});
+
+it('does not let a handoff marker hide an explicit model failure', async () => {
+  const out = await collect([{
+    type: 'done', result: { text: '', meta: {
+      error: { kind: 'provider_error', message: 'provider failed' },
+      termination: { status: 'handed_off', reason: 'tool_handoff' },
+    } },
+  }]);
+  expect(out).toContainEqual(expect.objectContaining({ type: 'error', failureKind: 'model' }));
+});
+
 it('classifies phase-less text from structured model-round boundaries without inspecting prose', async () => {
   const out = await collect([
     { type: 'text_delta', text: 'This arbitrary sentence contains no status keywords.' },
@@ -247,6 +273,70 @@ it('passes provider-native assistant phases through unchanged', async () => {
     { type: 'delta', text: 'The answer is ready.', phase: 'final_answer' },
     { type: 'final', text: 'The answer is ready.' },
   ]);
+});
+
+it('delivers task draft text before a stalled provider reaches a phase boundary', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const source = (async function* () {
+    yield { type: 'text_delta', text: 'First chunk' };
+    await gate;
+    yield { type: 'provider_call', outcome: 'completed', stopReason: 'end_turn' };
+    yield { type: 'done', result: { text: 'First chunk', meta: { error: null } } };
+  })();
+  const output = mapCoreAgentEvents(source as any, { failureTrackingScope: {}, streamUnphasedText: true });
+  // The first next() must settle while the provider is still blocked. A
+  // bounded race makes the old buffering implementation fail without hanging.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let first: any;
+  try {
+    first = await Promise.race([output.next(), new Promise(resolve => {
+      timer = setTimeout(() => resolve(null), 100);
+    })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    release();
+  }
+  const rest: any[] = [];
+  for await (const event of output) rest.push(event);
+  expect(first?.value).toEqual({ type: 'delta', text: 'First chunk', phase: 'pending' });
+  expect(rest).toEqual([{ type: 'final', text: 'First chunk' }]);
+});
+
+it('moves successive task drafts into commentary once and never replays final deltas', async () => {
+  const out = await collect([
+    { type: 'text_delta', text: 'Inspect ' },
+    { type: 'text_delta', text: 'sources.' },
+    { type: 'tool_delta', id: 'read-1', name: 'read_files', inputDelta: '{}' },
+    { type: 'provider_call', durationMs: 1, outcome: 'completed', stopReason: 'tool_use', model: 'test' },
+    { type: 'text_delta', text: 'Check results.' },
+    { type: 'provider_call', durationMs: 1, outcome: 'completed', stopReason: 'tool_use', model: 'test' },
+    { type: 'text_delta', text: 'Delivered.' },
+    { type: 'text_phase', phase: 'final_answer' },
+    { type: 'done', result: { text: 'Delivered.', meta: { error: null } } },
+  ], { streamUnphasedText: true });
+  expect(out.filter(e => e.type === 'delta').map(e => e.text).join(''))
+    .toBe('Inspect sources.Check results.Delivered.');
+  expect(out.filter(e => e.type === 'commentary-finalized')).toEqual([
+    { type: 'commentary-finalized', text: 'Inspect sources.' },
+    { type: 'commentary-finalized', text: 'Check results.' },
+  ]);
+  expect(out.filter(e => e.type === 'final')).toEqual([{ type: 'final', text: 'Delivered.' }]);
+});
+
+it.each(['error', 'incomplete'] as const)('retains visible task draft on %s without inventing success', async ending => {
+  const out = await collect([
+    { type: 'text_delta', text: 'Partial work' },
+    ...(ending === 'error' ? [{ type: 'done' as const, result: {
+      text: '', meta: { error: { kind: 'timeout' as const, message: 'timed out' } },
+    } }] : []),
+  ], { streamUnphasedText: true });
+  expect(out[0]).toEqual({ type: 'delta', text: 'Partial work', phase: 'pending' });
+  expect(out.filter(e => e.type === 'commentary-finalized')).toEqual([
+    { type: 'commentary-finalized', text: 'Partial work' },
+  ]);
+  expect(out.some(e => e.type === 'final')).toBe(false);
+  expect(out.some(e => e.type === 'error')).toBe(true);
 });
 
 it('does not fabricate process prose when a tool round contains no assistant text', async () => {
@@ -778,6 +868,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(starts[0].event.stream).toBe('tool');
     expect(starts[0].event.data.name).toBe('write_file');
     expect(starts[0].event.data.arguments).toBeUndefined();
+    expect(starts[0].event.data.execution_state).toBe('proposed');
     const executionUpdate = out.find((e) => (
       e.type === 'event'
       && e.event?.stream === 'tool'
@@ -785,6 +876,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
       && e.event?.data?.id === 'c-write'
     ));
     expect(executionUpdate?.event.data.arguments).toEqual({ path: 'notes/report.md', content });
+    expect(executionUpdate?.event.data.execution_state).toBe('running');
     const endIdx = out.findIndex((e) => e.type === 'event' && e.event?.data?.phase === 'end');
     const startIdx = out.findIndex((e) => e.type === 'event' && e.event?.data?.phase === 'start');
     expect(startIdx).toBeGreaterThanOrEqual(0);
@@ -807,6 +899,19 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
       { phase: 'progress', id: 'c-web' },
       { phase: 'end', id: 'c-web' },
     ]);
+  });
+
+  it('closes an announced but unexecuted call with an authoritative skipped state', async () => {
+    const out = await collect([
+      { type: 'tool_delta', name: 'cross_session_memory', id: 'not-run', inputDelta: '' },
+      { type: 'tool_start', name: 'cross_session_memory', id: 'not-run', input: {}, skipped: true },
+      { type: 'tool_end', name: 'cross_session_memory', id: 'not-run', result: 'Not executed: turn budget reached.', skipped: true, isError: true, durationMs: 0 },
+      { type: 'done', result: { text: 'Stopped', meta: { error: null, termination: { status: 'stopped', reason: 'tool_loop_limit' } } } },
+    ]);
+    const lifecycle = out.filter(e => e.type === 'event' && e.event?.stream === 'tool').map(e => e.event.data);
+    expect(lifecycle.map(data => data.execution_state)).toEqual(['proposed', 'skipped', 'skipped']);
+    expect(lifecycle.filter(data => data.phase === 'start')).toHaveLength(1);
+    expect(lifecycle.at(-1)).toMatchObject({ phase: 'end', id: 'not-run', duration_ms: 0 });
   });
 
   it('does not surface an uncorrelatable early call when its id is absent', async () => {
@@ -1328,6 +1433,34 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     }
   });
 
+  it('reports a save failure to the user without suggesting a provider retry', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([{ type: 'done', result: { text: '', meta: {
+        error: { kind: 'storage', code: 'SESSION_PERSISTENCE_FAILED', message: 'private storage detail' },
+      } } }]);
+      expect(out).toEqual([{
+        type: 'error',
+        text: '任务进度未能保存，后续操作已暂停。请检查磁盘空间和写入权限后重试。请保持 Orkas 开启，以保留尚未保存的进度。',
+        failureKind: 'model', failureCode: 'session_persistence_failed', retryExhausted: true,
+      }]);
+    } finally { setCurrentLang('en'); }
+  });
+
+  it('reports exhausted result storage as terminal without leaking storage diagnostics', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([{ type: 'done', result: { text: '', meta: {
+        error: { kind: 'storage', code: 'TOOL_RESULT_PERSISTENCE_FAILED', message: '/private/path ENOSPC' },
+      } } }]);
+      expect(out).toEqual([{
+        type: 'error',
+        text: '工具已执行，但多次重试后仍无法保存完整结果，当前任务已停止。请检查磁盘空间和写入权限；再次执行前，请先核实已完成的操作。',
+        failureKind: 'model', failureCode: 'tool_result_persistence_failed', retryExhausted: true,
+      }]);
+    } finally { setCurrentLang('en'); }
+  });
+
   it('localizes storage exhaustion and emits a stable failure code', async () => {
     setCurrentLang('zh');
     try {
@@ -1496,6 +1629,25 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     }
   });
 
+  it('keeps a 403 permission cause consistent between terminal metadata and display', async () => {
+    const out = await collect([{ type: 'done', result: { text: '', meta: {
+      provider: 'custom', error: { kind: 'provider_error', code: 'PROVIDER_ERROR', statusCode: 403,
+        message: 'Not authorized to operate on this resource' },
+    } } }]);
+    expect(out).toEqual([expect.objectContaining({ type: 'error', failureCode: 'provider_permission' })]);
+    expect(out[0].text).toBe('This account cannot use the selected model. Check account access or switch models in Settings.');
+  });
+
+  it('preserves an unclassified provider diagnostic through terminal display', async () => {
+    const message = 'There is no rate limit; the supplied operation is invalid';
+    const out = await collect([{ type: 'done', result: { text: '', meta: {
+      provider: 'custom', error: { kind: 'provider_error', code: 'unrecognized_gateway_code', message },
+    } } }]);
+    expect(out).toEqual([expect.objectContaining({
+      type: 'error', text: message, failureCode: 'provider_error', failureRawCode: 'unrecognized_gateway_code',
+    })]);
+  });
+
   it('names the user-configured provider on a third-party balance failure, never Orkas credits', async () => {
     // W4-3: BYOK balance exhaustion used the same "credits" wording as Orkas
     // billing, sending users to the wrong top-up page. The two must stay
@@ -1646,8 +1798,42 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
       type: 'error',
       failureKind: 'model',
       failureCode: 'provider_retries_exhausted',
+      retryExhausted: true,
       failurePhase: 'provider_wait',
     })]);
+  });
+
+  it.each([
+    ['PROVIDER_NETWORK_EXHAUSTED', true],
+    ['RETRY_EXHAUSTED', true],
+    ['ECONNRESET', false],
+    ['PROVIDER_EMPTY_TRANSPORT', false],
+    ['PROVIDER_NO_FIRST_EVENT_TIMEOUT', false],
+    ['PROVIDER_NETWORK_EXHAUSTED_LOOKALIKE', false],
+  ])('preserves explicit exhaustion for %s without inferring it from retry progress or prose', async (code, exhausted) => {
+    const out = await collect([
+      { type: 'retry', attempt: 1, reason: 'fetch failed' },
+      { type: 'done', result: { text: '', meta: { error: {
+        kind: 'provider_error', code: String(code),
+        message: 'fetch failed; PROVIDER_NETWORK_EXHAUSTED mentioned in diagnostic text',
+      } } } },
+    ]);
+    const failure = out.find((event) => event.type === 'error');
+    expect(failure).toBeDefined();
+    expect(failure.retryExhausted === true).toBe(exhausted);
+    if (code === 'PROVIDER_NETWORK_EXHAUSTED') expect(failure.failureCode).toBe('provider_network');
+    expect(out.some((event) => event.type === 'final')).toBe(false);
+  });
+
+  it('does not carry exhaustion into a later run sharing failure diagnostics', async () => {
+    const failureTrackingScope = {};
+    const fail = (code: string) => collect([{ type: 'done', result: { text: '', meta: {
+      error: { kind: 'provider_error', code, message: 'fetch failed' },
+    } } }], { failureTrackingScope });
+    expect((await fail('PROVIDER_NETWORK_EXHAUSTED'))[0].retryExhausted).toBe(true);
+    const later = await fail('ECONNRESET');
+    expect(later[0].failureCode).toBe('provider_network');
+    expect(later[0].retryExhausted).toBeUndefined();
   });
 
   it('classifies an endpoint-level HTTP 4xx by status without leaking a raw code', async () => {
@@ -1673,6 +1859,37 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
       failureCode: 'provider_http_410',
     })]);
     expect(out[0].failureRawCode).toBeUndefined();
+  });
+
+  it('maps exhausted in-run candidates to actionable unavailable-model guidance', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([
+        {
+          type: 'done',
+          result: {
+            text: '',
+            meta: {
+              error: {
+                kind: 'provider_error',
+                message: 'rotating-provider: no candidates',
+                code: 'PROVIDER_CANDIDATES_UNAVAILABLE',
+              },
+            },
+          },
+        },
+      ]);
+      expect(out).toEqual([expect.objectContaining({
+        type: 'error',
+        failureKind: 'model',
+        failureCode: 'provider_unavailable',
+      })]);
+      expect(String(out[0].text || '')).toContain('暂时不可用');
+      expect(String(out[0].text || '')).not.toContain('rotating-provider');
+      expect(String(out[0].text || '')).not.toContain('no candidates');
+    } finally {
+      setCurrentLang('en');
+    }
   });
 
   it('diagnoses a repeatedly failing custom endpoint on the second consecutive 4xx', async () => {
@@ -1741,6 +1958,34 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     const afterUnrelatedFailure = await failedRun();
     expect(String(afterUnrelatedFailure[0].text || '')).not.toContain('endpoint');
     mapper.resetCustomEndpointFailureTracking();
+  });
+
+  it.each([
+    [401, 'provider_auth'],
+    [402, 'provider_balance'],
+    [403, 'provider_permission'],
+    [429, 'provider_rate_limit'],
+  ] as const)('preserves the classified HTTP %s error across repeated custom-provider failures', async (statusCode, failureCode) => {
+    const failureTrackingScope = {};
+    const failedRun = (status: number) => collect([{
+      type: 'done',
+      result: { text: '', meta: { provider: 'custom', error: {
+        kind: 'provider_error', message: `${status} status code (no body)`,
+        code: 'PROVIDER_ERROR', statusCode: status,
+      } } },
+    }], { failureTrackingScope });
+
+    // An account error must also break an existing endpoint-failure streak.
+    await failedRun(410);
+    const first = await failedRun(statusCode);
+    const second = await failedRun(statusCode);
+    for (const out of [first, second]) {
+      expect(out).toEqual([expect.objectContaining({ type: 'error', failureCode })]);
+      expect(String(out[0].text)).not.toContain('endpoint');
+    }
+    expect(second[0].text).toBe(first[0].text);
+    expect(String((await failedRun(410))[0].text)).not.toContain('endpoint');
+    expect(String((await failedRun(410))[0].text)).toContain('endpoint');
   });
 
   it('keeps repeated custom-endpoint guidance isolated between model sessions', async () => {
@@ -1972,9 +2217,10 @@ describe('event-mapper › friendlyRetryReason', () => {
     expect(friendlyRetryReason('Codex SSE response headers timed out after 10000ms')).toBe('Response timed out');
   });
 
-  it('maps rate limiting to "Service rate-limited"', () => {
-    expect(friendlyRetryReason('429 Too Many Requests')).toBe('Service rate-limited');
-    expect(friendlyRetryReason('Rate limit exceeded')).toBe('Service rate-limited');
+  it('maps only structured rate-limit evidence to Service rate-limited', () => {
+    expect(friendlyRetryReason('{"error":{"code":"rate_limit_exceeded"}}')).toBe('Service rate-limited');
+    expect(friendlyRetryReason('429 Too Many Requests')).toBe('429 Too Many Requests');
+    expect(friendlyRetryReason('Rate limit exceeded')).toBe('Rate limit exceeded');
   });
 
   it('maps 5xx gateway errors to "Service temporarily unavailable"', () => {
@@ -1983,8 +2229,9 @@ describe('event-mapper › friendlyRetryReason', () => {
     expect(friendlyRetryReason('504 Gateway Timeout')).toBe('Service temporarily unavailable');
   });
 
-  it('empty or unknown reason → generic "Network error"', () => {
-    expect(friendlyRetryReason('')).toBe('Network error');
-    expect(friendlyRetryReason('some brand-new SDK error we have not seen')).toBe('Network error');
+  it('preserves an unknown retry diagnostic without inventing a network cause', () => {
+    expect(friendlyRetryReason('')).toBe('');
+    expect(friendlyRetryReason('some brand-new SDK error we have not seen')).toBe('some brand-new SDK error we have not seen');
+    expect(friendlyRetryReason('There is no rate limit')).toBe('There is no rate limit');
   });
 });

@@ -446,13 +446,49 @@ describe('group_chat state › touchActivity (stuck-turn watchdog heartbeat)', (
 });
 
 describe('group_chat facade › runtimeStatus orphan recovery', () => {
+  async function loadFacade() {
+    const logger = await import('../../../../src/main/logger');
+    const original = logger.createLogger;
+    const warn = vi.fn();
+    vi.spyOn(logger, 'createLogger').mockImplementation((scope) => {
+      const scoped = original(scope);
+      return scope === 'group_chat.facade' ? { ...scoped, warn } : scoped;
+    });
+    return { facade: await import('../../../../src/main/features/group_chat'), warn };
+  }
+
+  // Hold a real disk snapshot while another state writer finishes. This
+  // reproduces history/status queries overlapping task completion or cancel.
+  async function pauseNextStateRead(skip = 0) {
+    const storage = await import('../../../../src/main/storage');
+    const { groupChatStateFile } = await import('../../../../src/main/paths');
+    const file = groupChatStateFile(TEST_UID, TEST_CID);
+    const original = storage.readJson;
+    let release!: () => void;
+    let entered!: () => void;
+    const paused = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let intercepted = false;
+    vi.spyOn(storage, 'readJson').mockImplementation(async (...args) => {
+      const hold = args[0] === file && !intercepted && skip-- <= 0;
+      if (hold) intercepted = true;
+      const value = await original(...args);
+      if (hold) { entered(); await gate; }
+      return value;
+    });
+    return { paused, release };
+  }
+
   it('heals persisted running/in_flight state when no worker exists in this process', async () => {
     const s = await import('../../../../src/main/features/group_chat/state');
     await s.setStatus(TEST_UID, TEST_CID, 'running');
     await s.markInFlight(TEST_UID, TEST_CID, 'commander', true);
 
-    const facade = await import('../../../../src/main/features/group_chat');
-    const runtime = await facade.runtimeStatus(TEST_UID, TEST_CID);
+    const { facade, warn } = await loadFacade();
+    const [runtime, concurrent] = await Promise.all([
+      facade.runtimeStatus(TEST_UID, TEST_CID),
+      facade.runtimeStatus(TEST_UID, TEST_CID),
+    ]);
     expect(runtime).toMatchObject({
       processing: false,
       processing_since: null,
@@ -463,6 +499,91 @@ describe('group_chat facade › runtimeStatus orphan recovery', () => {
     const healed = await s.readState(TEST_UID, TEST_CID);
     expect(healed.status).toBe('idle');
     expect(healed.in_flight).toEqual([]);
+    expect(concurrent).toEqual(runtime);
+    expect((await s.readRunningConversationRegistry(TEST_UID)).items).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['idle', 'aborted'] as const)('preserves a concurrent %s transition without a false recovery warning', async (status) => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await s.setStatus(TEST_UID, TEST_CID, 'running');
+    const { facade, warn } = await loadFacade();
+    const read = await pauseNextStateRead();
+    const query = facade.runtimeStatus(TEST_UID, TEST_CID);
+    await read.paused;
+    try {
+      await s.setStatus(TEST_UID, TEST_CID, status);
+    } finally { read.release(); }
+    expect(await query).toMatchObject({ processing: false, in_flight: [] });
+    expect((await s.readState(TEST_UID, TEST_CID)).status).toBe(status);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('preserves a new task admitted between the initial snapshot and recovery', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await s.setStatus(TEST_UID, TEST_CID, 'running');
+    await s.markInFlight(TEST_UID, TEST_CID, 'commander', true);
+    const { facade, warn } = await loadFacade();
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    let admitted = false;
+    vi.spyOn(bus, 'runtimeSnapshot').mockImplementation(() => ({
+      processing: admitted, inFlight: admitted ? ['commander'] : [], activeTurns: [],
+    }));
+    // Admit while the recovery's locked disk read is pending, after the
+    // facade has already observed an idle bus. Rechecking before locking
+    // or before the asynchronous read would still erase the new task.
+    const read = await pauseNextStateRead(1);
+    const query = facade.runtimeStatus(TEST_UID, TEST_CID);
+    await read.paused;
+    admitted = true;
+    read.release();
+    const runtime = await query;
+    expect(runtime).toMatchObject({ processing: true, in_flight: ['commander'] });
+    expect(await s.readState(TEST_UID, TEST_CID)).toMatchObject({ status: 'running', in_flight: ['commander'] });
+    expect((await s.readRunningConversationRegistry(TEST_UID)).items).toEqual([{ conversation_id: TEST_CID }]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each(['idle', 'aborted'] as const)('clears an orphan roster while preserving the persisted %s status', async (status) => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await s.setStatus(TEST_UID, TEST_CID, status);
+    await s.markInFlight(TEST_UID, TEST_CID, 'commander', true);
+    const { facade, warn } = await loadFacade();
+    expect(await facade.runtimeStatus(TEST_UID, TEST_CID)).toMatchObject({ processing: false, in_flight: [] });
+    expect(await s.readState(TEST_UID, TEST_CID)).toMatchObject({ status, in_flight: [] });
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports work admitted during recovery persistence and retains its running registry', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await s.setStatus(TEST_UID, TEST_CID, 'running');
+    const { facade, warn } = await loadFacade();
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const storage = await import('../../../../src/main/storage');
+    const { groupChatStateFile } = await import('../../../../src/main/paths');
+    const file = groupChatStateFile(TEST_UID, TEST_CID);
+    const original = storage.writeJson;
+    let admitted = false;
+    let restart: Promise<unknown> | undefined;
+    vi.spyOn(bus, 'runtimeSnapshot').mockImplementation(() => ({
+      processing: admitted, inFlight: admitted ? ['commander'] : [], activeTurns: [],
+    }));
+    vi.spyOn(storage, 'writeJson').mockImplementation(async (...args) => {
+      if (args[0] === file && !admitted) {
+        admitted = true;
+        // Like normal admission, its state write queues behind recovery.
+        restart = s.setStatus(TEST_UID, TEST_CID, 'running')
+          .then(() => s.markInFlight(TEST_UID, TEST_CID, 'commander', true));
+      }
+      return original(...args);
+    });
+    expect(await facade.runtimeStatus(TEST_UID, TEST_CID)).toMatchObject({
+      processing: true, in_flight: ['commander'],
+    });
+    await restart;
+    expect(await s.readState(TEST_UID, TEST_CID)).toMatchObject({ status: 'running', in_flight: ['commander'] });
+    expect((await s.readRunningConversationRegistry(TEST_UID)).items).toEqual([{ conversation_id: TEST_CID }]);
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 });
 

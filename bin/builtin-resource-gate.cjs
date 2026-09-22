@@ -19,7 +19,7 @@ const CATEGORY_CODE = /^[a-z][a-z0-9_-]{0,79}$/;
 const INPUT_ID = /^[a-z_][a-z0-9_]{0,31}$/;
 const INPUT_TYPES = new Set(['text', 'textarea', 'select', 'multiselect', 'number', 'boolean', 'file', 'directory']);
 const OUTPUT_FORMATS = new Set(['auto', 'text', 'dashboard', 'artifact']);
-const INPUT_UI_LANGUAGES = new Set(['zh', 'en', 'ja', 'pt']);
+const INPUT_UI_LANGUAGES = new Set(['zh', 'en', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it']);
 const AVATAR_CATALOG = readJson(
   'avatar catalog',
   path.resolve(__dirname, '..', 'src', 'main', 'data', 'avatars.json'),
@@ -35,22 +35,32 @@ const REQUIRED_BUILTIN_INVENTORY = Object.freeze({
     'agent-creator',
     'package-installer',
     'skill-creator',
+    'web-app-sdk',
   ]),
   marketplace_agents: Object.freeze([
+    '1040b336306f',
     '173d4235a431',
+    '5a1d43c2f28a',
+    '5f890bd72ac4',
     '78900d8758bc',
     '79df9cc89f5f',
     '7e91cb9ec9e9',
     '814b61b027f0',
     'a19101ba698a',
     'a316881746f9',
+    'a4930d19ba6c',
+    'bc7e2a904d18',
     'bcfcb4921dce',
+    'e0f3a98c624b',
     'e064dca9e1bd',
+    'fa3e1f2f9e07',
   ]),
   marketplace_skills: Object.freeze([
     '081c15ffbab4',
     '08837be6032e',
+    '272355bc883d',
     '36bd44ae956c',
+    '59d186285161',
     '6743aa0797a2',
     '68fb048b85cb',
     '88aca13869d9',
@@ -59,6 +69,10 @@ const REQUIRED_BUILTIN_INVENTORY = Object.freeze({
     '9dfbd4e00c0d',
     'b1f384166705',
     'c72c656eca12',
+    'c91a84e7b206',
+    'd47b20f9a631',
+    'de52c67d49dd',
+    'e8868f762c1d',
     'e7f5c0e6f1be',
     'ee99fbb42964',
     'f283632103ba',

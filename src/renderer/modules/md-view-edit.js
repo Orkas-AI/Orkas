@@ -17,7 +17,7 @@
 //   mountMdViewEdit({ bodyEl, actionsEl, source, capabilities?, initialMode?,
 //                     initialContent?, initialDraft?, actionIconOnly?, callbacks? })
 //     → { destroy, refreshContent, getMode, setMode, isDirty,
-//         getDraft, setDraftAsContent, getSource }
+//         getDraft, setDraftAsContent, getSource, save }
 //
 //   source: { kind: 'context',   rel: string }
 //         | { kind: 'workspace', absPath: string, cid?: string }
@@ -102,6 +102,8 @@ function mountMdViewEdit(opts) {
   // ── State ─────────────────────────────────────────────────────────────
   const state = {
     source,
+    plainText: opts.plainText === true,
+    partial: opts.partial === true,
     caps,
     callbacks,
     bodyEl,
@@ -178,6 +180,11 @@ function mountMdViewEdit(opts) {
   function isDirty()  { return state.mode === 'edit' && state.draft !== state.content; }
   function getDraft() { return { content: state.draft, isPreview: state.preview }; }
   function getSource() { return state.source; }
+  async function save() {
+    if (state.destroyed || !state.caps.save) return false;
+    await _mveSave(state);
+    return !state.destroyed && state.mode === 'view' && !isDirty();
+  }
   /** Update the controller's source descriptor in place. Used when the
    *  host renamed the underlying file out from under us — `state.draft`
    *  / `state.content` stay intact (rename doesn't change bytes), only
@@ -202,7 +209,7 @@ function mountMdViewEdit(opts) {
     _mveRender(state);
   }
 
-  return { destroy, refreshContent, getMode, setMode, isDirty, getDraft, setDraftAsContent, getSource, setSource };
+  return { destroy, refreshContent, getMode, setMode, isDirty, getDraft, setDraftAsContent, getSource, setSource, save };
 }
 
 function _mveNoopController() {
@@ -215,6 +222,7 @@ function _mveNoopController() {
     getDraft()       { return { content: '', isPreview: false }; },
     setDraftAsContent() {},
     getSource()      { return null; },
+    async save()    { return false; },
     setSource()      {},
   };
 }
@@ -347,23 +355,19 @@ function _mveActionButton(state, action, labelKey, iconName, extraClass) {
   return `<button type="button" class="${cls}" data-mve-action="${action}" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">${icon}</button>`;
 }
 
-function _mveTrack(action, state, data) {
-  try {
-    if (!window.Monitor) return;
-    (() => {})(action, Object.assign({
-      source: state && state.source ? String(state.source.kind || '') : '',
-      can_save: !!(state && state.caps && state.caps.save),
-    }, data || {}));
-  } catch (_) {}
-}
-
 function _mveRenderView(state) {
   state.mode = 'view';
   const bodyEl = state.bodyEl;
   const actionsEl = state.actionsEl;
   const content = state.content || '';
-  bodyEl.innerHTML = `<div class="ctx-viewer-md markdown-body">${renderMarkdown(content)}</div>`;
-  if (state.caps.taskCheckbox) _mveBindTaskCheckboxes(state, bodyEl);
+  if (state.plainText) {
+    const name = state.source.name || state.source.rel || state.source.absPath;
+    if (window.DelimitedPreview?.isDelimited(name)) window.DelimitedPreview.mount(bodyEl, content, name, !!state.partial);
+    else bodyEl.innerHTML = `<pre class="chat-file-viewer-text">${escapeHtml(content)}</pre>`;
+  } else {
+    bodyEl.innerHTML = `<div class="ctx-viewer-md markdown-body">${renderMarkdown(content)}</div>`;
+    if (state.caps.taskCheckbox) _mveBindTaskCheckboxes(state, bodyEl);
+  }
 
   const actions = [];
   if (state.caps.edit)   actions.push(_mveActionButton(state, 'edit', 'contexts.viewer.edit', 'edit-pencil'));
@@ -391,7 +395,7 @@ function _mveEnterEdit(state) {
 function _mveRenderEditor(state) {
   const bodyEl = state.bodyEl;
   const actionsEl = state.actionsEl;
-  const toolbarHtml = _MVE_EDITOR_TOOLBAR.map(item => {
+  const toolbarHtml = (state.plainText ? [] : _MVE_EDITOR_TOOLBAR).map(item => {
     if (item.kind === 'sep') return `<span class="ctx-editor-toolbar-sep" aria-hidden="true"></span>`;
     const disabled = state.preview ? 'disabled' : '';
     const extraCls = item.cls ? ` ${item.cls}` : '';
@@ -405,10 +409,10 @@ function _mveRenderEditor(state) {
     ? window.uiIconHtml(state.preview ? 'edit-pencil' : 'eye', 'ui-icon ctx-editor-toggle-icon')
     : '';
   const draft = state.draft;
-  const bodyHtml = state.preview
+  const bodyHtml = state.preview && !state.plainText
     ? `<div class="ctx-viewer-md markdown-body ctx-editor-preview">${draft.trim() ? renderMarkdown(draft) : `<div class="ctx-viewer-msg">${escapeHtml(t('contexts.editor.preview_empty'))}</div>`}</div>`
     : `<textarea class="ctx-viewer-editor" data-mve-textarea spellcheck="false">${escapeHtml(draft)}</textarea>`;
-  bodyEl.innerHTML = `
+  bodyEl.innerHTML = state.plainText ? bodyHtml : `
     <div class="ctx-editor-toolbar" role="toolbar">
       ${toolbarHtml}
       <span class="ctx-editor-toolbar-spacer"></span>
@@ -477,21 +481,6 @@ function _mveSourceType(source) {
   if (source.kind === 'context') return 'library';
   if (source.kind === 'project-file' || source.projectId) return 'project';
   return source.cid ? 'conversation' : 'workspace';
-}
-
-function _mveTrackSaveResult(source, content, startedAt, result, errorCode = '') {
-  try {
-    if (!window.Monitor) return;
-    const payload = {
-      result,
-      surface: 'markdown_editor',
-      source_type: _mveSourceType(source),
-      char_count: String(content || '').length,
-      duration_ms: Math.max(0, Date.now() - startedAt),
-    };
-    if (result !== 'success') payload.error_code = errorCode || 'unknown';
-    Monitor.event('text_editor_save_result', payload);
-  } catch (_) {}
 }
 
 async function _mveSave(state) {
@@ -605,13 +594,6 @@ async function _mveToggleTask(state, lineIdx, liEl, boxEl) {
   if (liEl) liEl.classList.toggle('is-done', !wasChecked);
   if (boxEl) boxEl.checked = !wasChecked;
   const res = await _mveWriteSource(state.source, next);
-  _mveTrackSaveResult(
-    state.source,
-    next,
-    startedAt,
-    res && res.ok ? 'success' : 'failure',
-    res && res.ok ? '' : 'write_failed',
-  );
   if (!res.ok) {
     if (liEl) liEl.classList.toggle('is-done', wasChecked);
     if (boxEl) boxEl.checked = wasChecked;
@@ -798,6 +780,17 @@ function _mveOnKey(state, ta, e) {
   // IME composition guard (CLAUDE.md §8).
   if (e.isComposing || e.keyCode === 229) return;
 
+  if (state.plainText) {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's' && state.caps.save) {
+      e.preventDefault(); return _mveSave(state);
+    }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const start = ta.selectionStart;
+      _mveReplaceRange(state, ta, start, ta.selectionEnd, '\t', start + 1, start + 1);
+    }
+    return;
+  }
   const mod = e.metaKey || e.ctrlKey;
   if (mod && !e.shiftKey && !e.altKey) {
     const k = (e.key || '').toLowerCase();

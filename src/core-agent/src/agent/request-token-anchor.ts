@@ -13,7 +13,15 @@
  *   anchored = realTokens + (estimateNow − estimateAtAnchor)
  *
  * The differential cancels the estimator's absolute error; only the delta —
- * typically this round's tool results — is estimated. Folding, archiving, and
+ * typically this round's tool results — is estimated. When no anchor is valid
+ * (a fold earlier in the same prepare phase discards it), there is nothing to
+ * anchor to, so the caller's session calibration is applied to the whole
+ * estimate — the same de-biasing the segment triggers use. Without it a
+ * request-level line (the 0.82 emergency/overflow lines) would compare an
+ * uncalibrated estimate, which on CJK-heavy or image-heavy context runs high
+ * and fires those lines on a request that is really well under them.
+ *
+ * Folding, archiving, and
  * other rewrites of already-anchored content cannot be attributed by the
  * differential, so any such rewrite bumps `Session.contentEpoch()` and the
  * anchor is discarded until the next completed call re-anchors. Segment-level
@@ -68,13 +76,16 @@ export function anchoredRequestTokens(
   anchor: RequestTokenAnchor | null,
   estimatedNow: number,
   contentEpochNow: number,
+  /** Session estimator calibration (real/estimated, clamped [0.5,1]). Applied
+   *  only to the estimate fallback; the anchored branch is already real. */
+  estimatorCalibration = 1,
 ): AnchoredRequestTokens {
   if (
     !anchor
     || anchor.realTokens <= 0
     || anchor.contentEpoch !== contentEpochNow
   ) {
-    return { tokens: estimatedNow, source: "estimated" };
+    return { tokens: Math.round(Math.max(0, estimatedNow) * estimatorCalibration), source: "estimated" };
   }
   return {
     tokens: Math.max(0, anchor.realTokens + (estimatedNow - anchor.estimatedTokens)),

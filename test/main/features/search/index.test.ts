@@ -595,6 +595,9 @@ describe('search › searchChats — group-chat shape end-to-end', () => {
       postings: {},
     }));
     const s = await loadSearch();
+    expect(await s.searchChatsWithStatus(TEST_UID, 'recoveredmarker')).toEqual({ results: [], indexComplete: false });
+    expect(s.__searchTestHooks.hasPendingChatRepair(TEST_UID)).toBe(true);
+    await s.reconcileActive();
     expect(await s.searchChats(TEST_UID, 'recoveredmarker')).toMatchObject([
       { cid: 'partial-chat', msg_index: 0, snippet: message.text },
     ]);
@@ -658,13 +661,16 @@ describe('search › searchChats', () => {
     ]));
     ix.invalidateChatsIndex(TEST_UID);
 
-    const results = await s.searchChats(TEST_UID, 'snapshot token');
-    expect(results.some((result) => result.cid === 'c1')).toBe(true);
+    const page = await s.searchChatsWithStatus(TEST_UID, 'snapshot token');
+    expect(page.indexComplete).toBe(false);
+    expect(page.results.some((result) => result.cid === 'c1')).toBe(true);
     expect(s.__searchTestHooks.hasPendingChatRepair(TEST_UID)).toBe(true);
 
     await s.searchChats(TEST_UID, 'snapshot token');
     expect(s.__searchTestHooks.hasPendingChatRepair(TEST_UID)).toBe(true);
     s.__searchTestHooks.cancelChatRepair(TEST_UID);
+    await ix.reconcileChatsIndex(TEST_UID);
+    expect((await s.searchChatsWithStatus(TEST_UID, 'snapshot token')).indexComplete).toBe(true);
   });
 
   it('caches display metadata and invalidates it on conversation/project rename', async () => {
@@ -783,6 +789,71 @@ describe('search › CJK bigram anchor (noise-doc rejection)', () => {
   });
 });
 
+// Typing two words means "find where I wrote about both". A plain OR sum lets
+// one word repeated in an otherwise unrelated message outrank the message that
+// actually contains the whole query, so the answer never reaches the screen —
+// the reported symptom for a two-word product-name search.
+describe('search › multi-term coverage', () => {
+  // The shape that actually loses: the answer is one long message that says
+  // each word once, while short messages repeat a single word. BM25 rewards
+  // the repetition and penalises the length, so relevance alone ranks the
+  // real answer below every partial match.
+  function writeCoverageCorpus(): void {
+    writeChat(TEST_UID, 'both-terms', [{
+      from: 'user',
+      ts: '2026-01-01T00:00:00Z',
+      text: `draft post about minimax h3 ${'and the rest of a long working note '.repeat(20)}`,
+    }]);
+    for (let i = 0; i < 8; i++) {
+      writeChat(TEST_UID, `single-${i}`, [{
+        from: 'user', ts: '2026-01-02T00:00:00Z', text: 'minimax '.repeat(12).trim(),
+      }]);
+    }
+    for (let i = 0; i < 20; i++) {
+      writeChat(TEST_UID, `filler-${i}`, [{
+        from: 'user', ts: '2026-01-03T00:00:00Z', text: `unrelated conversation number ${i}`,
+      }]);
+    }
+  }
+
+  it('ranks the message carrying every query term above higher-scoring partial matches', async () => {
+    writeCoverageCorpus();
+    await (await import('../../../../src/main/features/search/indexer')).reconcileChatsIndex(TEST_UID);
+    const s = await loadSearch();
+    const results = await s.searchChats(TEST_UID, 'minimax h3');
+
+    expect(results[0]?.cid).toBe('both-terms');
+    // Independent check that the tier is doing the work: on raw relevance
+    // alone a partial match still wins, so ordering by score would bury it.
+    const partial = results.find((row) => row.cid !== 'both-terms');
+    expect(partial).toBeDefined();
+    expect(partial!.score).toBeGreaterThan(results[0].score);
+  });
+
+  it('keeps the full-query match inside a merge limit that partial matches would fill', async () => {
+    writeCoverageCorpus();
+    await (await import('../../../../src/main/features/search/indexer')).reconcileChatsIndex(TEST_UID);
+    const s = await loadSearch();
+    // limit 4 → one reserved chat slot; the rest fills by raw score, which
+    // every partial match wins.
+    const { results } = await s.searchAll(TEST_UID, 'minimax h3', { limit: 4 });
+
+    expect(results).toHaveLength(4);
+    expect(results.some((row) => row.cid === 'both-terms')).toBe(true);
+  });
+
+  it('does not let a repeated query word inflate coverage', async () => {
+    writeCoverageCorpus();
+    await (await import('../../../../src/main/features/search/indexer')).reconcileChatsIndex(TEST_UID);
+    const s = await loadSearch();
+    // "minimax minimax" covers one distinct term, exactly like "minimax":
+    // the partial matches must not be promoted into the full-coverage tier.
+    const results = await s.searchChats(TEST_UID, 'minimax minimax');
+
+    expect(results[0]?.cid).not.toBe('both-terms');
+  });
+});
+
 describe('search › reconcileAll', () => {
   it('runs without throwing on an empty workspace', async () => {
     const s = await loadSearch();
@@ -804,12 +875,10 @@ describe('search › reconcileAll', () => {
     await s.reconcileAll();
 
     const paths = await import('../../../../src/main/paths');
-    const ix = await import('../../../../src/main/features/search/indexer');
-    const entry = await ix.getEntry(paths.userChatsIndexPath('real_user'), 'chat');
-    expect(Object.keys(entry.idx.files)).toContain('c1');
+    const store = await import('../../../../src/main/features/search/chat_store');
+    expect([...store.readAllWatermarks('real_user').keys()]).toContain('c1');
     for (const name of reserved) {
-      const reservedEntry = await ix.getEntry(paths.userChatsIndexPath(name), 'chat');
-      expect(Object.keys(reservedEntry.idx.files), name).not.toContain('must-not-index');
+      expect([...store.readAllWatermarks(name).keys()], name).not.toContain('must-not-index');
       expect(fs.existsSync(paths.userContextsIndexPath(name)), name).toBe(false);
       expect(fs.existsSync(paths.userChatsIndexPath(name)), name).toBe(false);
     }
@@ -817,7 +886,44 @@ describe('search › reconcileAll', () => {
 });
 
 describe('search › startup reconcile', () => {
-  it('reuses an existing active-user snapshot and defers validation until the first query', async () => {
+  it('reuses a current-schema snapshot and defers validation until the first query', async () => {
+    writeChat(TEST_UID, 'active-chat', [
+      { role: 'user', content: 'startup fallback token', time: 't' },
+    ]);
+    writeChat('inactive-user', 'inactive-chat', [
+      { role: 'user', content: 'should not be scanned at startup', time: 't' },
+    ]);
+    const chatStore = await import('../../../../src/main/features/search/chat_store');
+    // An index this build understands and that was completed at least once,
+    // but which no longer covers the conversation. Startup must reuse it
+    // rather than walk history; query time stays the repair boundary.
+    chatStore.writeSourceStamp(TEST_UID, 'stale-but-readable');
+    expect(chatStore.docCount(TEST_UID)).toBe(0);
+
+    const s = await loadSearch();
+    await s.reconcileActive();
+
+    const indexer = await import('../../../../src/main/features/search/indexer');
+    expect(chatStore.docCount(TEST_UID), 'startup reused instead of scanning').toBe(0);
+    expect(indexer.isChatsIndexTrusted(TEST_UID)).toBe(false);
+    expect(fs.existsSync(chatStore.chatStorePath('inactive-user')),
+      'an inactive profile must not be scanned at startup').toBe(false);
+    expect(await s.searchChatsWithStatus(TEST_UID, 'fallback token')).toEqual({ results: [], indexComplete: false });
+    expect(s.__searchTestHooks.hasPendingChatRepair(TEST_UID)).toBe(true);
+    await indexer.reconcileChatsIndex(TEST_UID);
+    const results = await s.searchChats(TEST_UID, 'fallback token');
+    expect(results.some((result) => result.cid === 'active-chat')).toBe(true);
+  });
+
+  // A snapshot this build cannot read is discarded by `loadIndex`, so the
+  // whole history has to be re-tokenized. Leaving that to the first query
+  // makes the user's first search after an upgrade wait for a full rebuild,
+  // and the startup cohort is the cheap place to absorb it.
+  it('rebuilds an index that was never completed, and ignores the retired snapshot', async () => {
+    // The old startup gate read `chats.idx.json` to decide whether an index
+    // could be reused. That file still sits in every existing profile and now
+    // says nothing about the store, so a leftover snapshot must not be able to
+    // suppress the rebuild — chat search would come back empty with no error.
     writeChat(TEST_UID, 'active-chat', [
       { role: 'user', content: 'startup fallback token', time: 't' },
     ]);
@@ -825,20 +931,49 @@ describe('search › startup reconcile', () => {
       { role: 'user', content: 'should not be scanned at startup', time: 't' },
     ]);
     const paths = await import('../../../../src/main/paths');
-    const activeIndex = paths.userChatsIndexPath(TEST_UID);
-    const inactiveIndex = paths.userChatsIndexPath('inactive-user');
-    fs.mkdirSync(path.dirname(activeIndex), { recursive: true });
-    // Deliberately invalid but non-empty: startup must not parse a large
-    // persisted snapshot. Query-time reconcile remains the repair boundary.
-    fs.writeFileSync(activeIndex, 'persisted-snapshot');
+    const legacySnapshot = paths.userChatsIndexPath(TEST_UID);
+    fs.mkdirSync(path.dirname(legacySnapshot), { recursive: true });
+    fs.writeFileSync(legacySnapshot, JSON.stringify({
+      version: 4, kind: 'chat', files: { 'active-chat': { mtime: 0, size: 0, next: 1 } },
+      docs: {}, postings: {},
+    }));
 
     const s = await loadSearch();
     await s.reconcileActive();
 
-    expect(fs.readFileSync(activeIndex, 'utf-8')).toBe('persisted-snapshot');
-    expect(fs.existsSync(inactiveIndex)).toBe(false);
-    const results = await s.searchChats(TEST_UID, 'fallback token');
-    expect(results.some((result) => result.cid === 'active-chat')).toBe(true);
+    const indexer = await import('../../../../src/main/features/search/indexer');
+    const chatStore = await import('../../../../src/main/features/search/chat_store');
+    expect(indexer.isChatsIndexTrusted(TEST_UID)).toBe(true);
+    expect(chatStore.docCount(TEST_UID), 'the conversation was indexed for real').toBe(1);
+    expect(fs.existsSync(chatStore.chatStorePath('inactive-user'))).toBe(false);
+  });
+
+  it('migrates off the retired chat snapshot and reclaims its disk', async () => {
+    // The snapshot is not ported into the store: it was stale on a real
+    // profile (two thirds of conversations) and carried hundreds of thousands
+    // of single-document terms. The rebuild from the JSONL source is the
+    // migration; this leaves nothing behind to grow again.
+    writeChat(TEST_UID, 'active-chat', [
+      { role: 'user', content: 'migration marker quokka', time: 't' },
+    ]);
+    const paths = await import('../../../../src/main/paths');
+    const snapshot = paths.userChatsIndexPath(TEST_UID);
+    fs.mkdirSync(path.dirname(snapshot), { recursive: true });
+    fs.writeFileSync(snapshot, JSON.stringify({ version: 4, kind: 'chat', files: {}, docs: {}, postings: {} }));
+    fs.writeFileSync(`${snapshot}.tmp`, 'half-written flush');
+
+    const chatStore = await import('../../../../src/main/features/search/chat_store');
+    const compact = vi.spyOn(chatStore, 'compact').mockImplementation(() => undefined);
+    const s = await loadSearch();
+    await s.reconcileActive();
+
+    expect(compact).toHaveBeenCalledTimes(1);
+    expect(compact).toHaveBeenCalledWith(TEST_UID);
+    expect(fs.existsSync(snapshot), 'the retired snapshot is removed').toBe(false);
+    expect(fs.existsSync(`${snapshot}.tmp`), 'and so is a half-written flush').toBe(false);
+    const results = await s.searchChats(TEST_UID, 'quokka');
+    expect(results.some((r) => r.cid === 'active-chat'),
+      'history stays searchable through the store').toBe(true);
   });
 
   it('bounds chat source stats instead of awaiting every JSONL serially', async () => {

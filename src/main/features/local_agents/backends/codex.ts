@@ -366,6 +366,10 @@ export const codexBackend: LocalBackend = {
     const pending = new Map<number, { method: string; resolve: (r: any) => void; reject: (e: Error) => void }>();
     const userInputRequests = new Map<string | number, AbortController>();
     const inputCancellations = new Map<string | number, CliInputCancellation>();
+    // `allow_run` is host-owned and must not become a durable CLI grant, so an
+    // approved MCP tool is remembered for this run only. Without it a turn that
+    // calls the same bridge tool repeatedly re-prompts on every call.
+    const mcpToolRunGrants = new Set<string>();
     let threadId: string | undefined;
     let activeTurnId: string | undefined;
     let turnStarted = false;
@@ -455,6 +459,61 @@ export const codexBackend: LocalBackend = {
         ...(fullAccess
           ? { autoDecided: 'allow', reason: 'full_access' }
           : { decision: permissionDecision === 'deny' ? 'deny' : 'allow', reason: 'user' }),
+      });
+    };
+
+    const respondToMcpElicitation = async (env: any): Promise<void> => {
+      const params = env?.params && typeof env.params === 'object' ? env.params : {};
+      const meta = params._meta && typeof params._meta === 'object' ? params._meta : {};
+      const serverName = typeof params.serverName === 'string' ? params.serverName : '';
+      const message = typeof params.message === 'string' ? params.message : '';
+      const reply = (result: Record<string, unknown>) => sendLine({ jsonrpc: '2.0', id: env.id, result });
+      // A server collecting form input has no Orkas surface. Decline inside
+      // the protocol so Codex degrades cleanly rather than logging a client
+      // error, and keep the permission path for tool approval only.
+      if (meta.codex_approval_kind !== CODEX_MCP_TOOL_APPROVAL_KIND) {
+        reply({ action: 'decline' });
+        return;
+      }
+      let argumentPreview = '';
+      if (meta.tool_params && typeof meta.tool_params === 'object') {
+        try {
+          const serialized = JSON.stringify(meta.tool_params);
+          if (serialized && serialized !== '{}') argumentPreview = serialized;
+        } catch { /* unserializable arguments are simply not previewed */ }
+      }
+      const grantKey = `${serverName} ${message}`;
+      const fullAccess = opts.permissionPolicy === 'full_access';
+      let decision: LocalCliPermissionDecision = fullAccess ? 'allow_once' : 'deny';
+      let autoReason = fullAccess ? 'full_access' : '';
+      if (!fullAccess && mcpToolRunGrants.has(grantKey)) {
+        decision = 'allow_run';
+        autoReason = 'allow_run';
+      } else if (!fullAccess && opts.requestPermission) {
+        try {
+          decision = await opts.requestPermission({
+            id: String(env.id ?? ''),
+            tool: 'mcp_tool',
+            description: message || `Run an MCP tool from "${serverName}"?`,
+            ...(argumentPreview ? { command: argumentPreview } : {}),
+            ...(serverName ? { subject: serverName } : {}),
+          });
+        } catch (err) {
+          log.warn('codex MCP elicitation permission request failed; declining', {
+            error: logErrorSummary(err),
+          });
+          decision = 'deny';
+        }
+      }
+      if (decision === 'allow_run') mcpToolRunGrants.add(grantKey);
+      reply(decision === 'deny' ? { action: 'decline' } : { action: 'accept', content: {} });
+      opts.onEvent({
+        type: 'permission-request',
+        id: String(env.id ?? ''),
+        tool: CODEX_MCP_ELICITATION_METHOD,
+        ...(autoReason
+          ? { autoDecided: decision === 'deny' ? 'deny' : 'allow', reason: autoReason }
+          : { decision: decision === 'deny' ? 'deny' : 'allow', reason: 'user' }),
       });
     };
 
@@ -635,9 +694,16 @@ export const codexBackend: LocalBackend = {
               if (userInputRequests.get(env.id) === controller) userInputRequests.delete(env.id);
               inputCancellations.delete(env.id);
             });
+          } else if (env.method === CODEX_MCP_ELICITATION_METHOD) {
+            void respondToMcpElicitation(env).catch((err) => {
+              log.warn('codex MCP elicitation response failed', { error: logErrorSummary(err) });
+              // Stay inside the elicitation contract. A JSON-RPC error here is
+              // exactly what made Codex report a rejection the user never made.
+              sendLine({ jsonrpc: '2.0', id: env.id, result: { action: 'decline' } });
+            });
           } else if (CODEX_OPTIONAL_SERVER_REQUEST_METHODS.has(env.method)) {
             // These callbacks require an explicit client capability or a
-            // feature Orkas did not register (dynamic tools, MCP elicitation,
+            // feature Orkas did not register (dynamic tools, openai forms,
             // auth/attestation). Reply immediately so Codex can degrade; an
             // absent optional integration must not wedge or kill the turn.
             sendLine({
@@ -1431,12 +1497,20 @@ const CODEX_PERMISSION_REQUEST_METHODS = new Set([
   'item/permissions/requestApproval',
 ]);
 const CODEX_USER_INPUT_REQUEST_METHOD = 'item/tool/requestUserInput';
+/** Codex asks for MCP tool-call approval through MCP elicitation
+ *  (`_meta.codex_approval_kind === 'mcp_tool_call'`), so this callback is a
+ *  permission surface rather than an optional integration. Answering it with
+ *  a JSON-RPC error makes Codex resolve the elicitation as `Decline`, which
+ *  reaches the model as "user rejected MCP tool call" even though the user
+ *  was never asked — every orkas bridge tool would be unusable below
+ *  `full_access`. */
+const CODEX_MCP_ELICITATION_METHOD = 'mcpServer/elicitation/request';
+const CODEX_MCP_TOOL_APPROVAL_KIND = 'mcp_tool_call';
 const CODEX_OPTIONAL_SERVER_REQUEST_METHODS = new Set([
   'account/chatgptAuthTokens/refresh',
   'attestation/generate',
   'currentTime/read',
   'item/tool/call',
-  'mcpServer/elicitation/request',
   'openai/form',
 ]);
 

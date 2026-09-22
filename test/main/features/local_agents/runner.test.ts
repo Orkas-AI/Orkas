@@ -160,11 +160,16 @@ describe('local_agents/runner', () => {
       'skills.read', 'skills.run', 'kb.read', 'chat.read', 'memory.agent', 'commander.handoff',
     ]);
     expect(restricted).toContain('cross_session_memory');
-    expect(restricted).toContain('Agent identity is fixed by the host');
+    expect(restricted).toContain('writable scopes are bound by the host');
+    expect(restricted).toContain('user/shared global memory is read-only');
     // The MCP tool description owns the write rule; the prompt keeps the pointer only.
     expect(restricted).not.toContain('Decide from meaning');
     expect(restricted).not.toContain('stable, reusable information');
     expect(restricted).toContain('orkas_handoff_to_commander');
+    expect(restricted).toContain('Authorized workspace edits, including Agent/Skill source files and documentation, remain your work.');
+    expect(restricted).toContain('complete the supported workspace work before handing off the remaining app operations');
+    expect(restricted).toContain('Agent or Skill changes through Orkas app resource management');
+    expect(restricted).not.toContain('Orkas Agent or Skill mutation');
     expect(restricted).toContain('Do not emit Commander-only <agent>');
     expect(restricted).not.toContain('Orkas automation CRUD');
     expect(restricted).not.toContain('orkas_list_connector_tools');
@@ -177,6 +182,7 @@ describe('local_agents/runner', () => {
     expect(openOnly).toContain('orkas_run_skill');
     expect(openOnly).not.toContain('cross_session_memory');
     expect(openOnly).not.toContain('orkas_handoff_to_commander');
+    expect(openOnly).not.toContain('For mixed requests');
     expect(openOnly).not.toContain('<auto-task>');
   });
 
@@ -988,6 +994,27 @@ describe('local_agents/runner', () => {
     }
   });
 
+  it('forwards file publication through the live runner bridge without changing file bytes', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    const output = path.join(tmpDir, 'report.txt');
+    fs.writeFileSync(output, 'Exact output');
+    const selected: string[][] = [];
+    mockBackendImpl = async ({ bridge, onEvent }) => {
+      expect((await callRunnerBridge(bridge, 'publish_outputs', { paths: ['report.txt'] })).result).toEqual({ requested: 1, published: 1 });
+      expect((await callRunnerBridge(bridge, 'publish_outputs', { paths: [] })).result).toEqual({ requested: 0, published: 0 });
+      onEvent({ type: 'done', status: 'completed', output: 'Ready' });
+    };
+    const runner = await loadRunner();
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c-publish', agentId: 'agent-x', currentMessageId: 'message-x', cli: 'claude',
+      prompt: 'Prepare output', cwd: tmpDir, signal: new AbortController().signal, onEvent: () => {},
+      onOutputsPublished: (paths) => { selected.push(paths); return paths; },
+    });
+    expect(result.status).toBe('completed');
+    expect(selected).toEqual([[output], []]);
+    expect(fs.readFileSync(output, 'utf8')).toBe('Exact output');
+  });
+
   it('forwards the backend active-run ingress and always clears it after the attempt', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     const ingress = {
@@ -1019,50 +1046,57 @@ describe('local_agents/runner', () => {
     expect(states).toEqual([ingress, null]);
   });
 
-  it('gives project OpenCode runs live backlog status updates without expanding other Orkas permissions', async () => {
+  it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('gives %s runs uniform bridge tools with scoped writes', async (cli) => {
     const projects = await import('../../../../src/main/features/projects');
     const tasks = await import('../../../../src/main/features/project_tasks');
     const project = await projects.createProject(TEST_UID, 'On-demand OpenCode');
     if (!project.ok) throw new Error('project fixture failed');
     const projectId = project.project.project_id;
-    mockDetect.mockResolvedValue({ type: 'opencode', available: true, path: '/fake/opencode', version: '1.0.0' });
+    mockDetect.mockResolvedValue({ type: cli, available: true, path: `/fake/${cli}`, version: '1.0.0' });
     let envFile: string | undefined;
-    mockOpencodeBackendImpl = async ({ bridge, onEvent }) => {
+    mockBackendImpl = mockCodexBackendImpl = mockOpencodeBackendImpl = mockHermesBackendImpl = mockOpenclawBackendImpl = async ({ bridge, onEvent }) => {
       expect(bridge).toBeDefined();
       envFile = bridge.server.env.ORKAS_BRIDGE_ENV_FILE;
       expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'list' })).result.tasks).toEqual([]);
       const created = await tasks.createTask(TEST_UID, projectId, { title: 'Latest backlog state' });
       if (!created.ok) throw new Error('task fixture failed');
       expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'list' })).result.tasks)
-        .toContainEqual(expect.objectContaining({ id: created.task.id, title: 'Latest backlog state' }));
+        .toContainEqual(expect.objectContaining({ id: created.task.id, content: 'Latest backlog state' }));
       expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'update', task_id: created.task.id, status: 'review' })).ok).toBe(true);
       expect((await tasks.getTask(TEST_UID, projectId, created.task.id))?.status).toBe('review');
       expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'complete', task_id: created.task.id })).ok).toBe(true);
       for (const [method, params] of [
         ['todo_tasks', { action: 'list', project: 'another-project' }],
-        ['memory.agent', { action: 'list' }], ['skills.list', {}], ['connectors.list', {}],
-        ['commander.handoff', { reason: 'Not granted' }],
+        ['memory.agent', { action: 'add', target: 'user', content: 'denied' }], ['connectors.list', {}],
       ] as const) expect((await callRunnerBridge(bridge, method, params)).ok).toBe(false);
-      expect(await tasks.getTask(TEST_UID, projectId, created.task.id)).toMatchObject({ status: 'done', origin_cid: 'c-opencode-backlog' });
+      expect((await callRunnerBridge(bridge, 'skills.list', {})).ok).toBe(true);
+      expect((await callRunnerBridge(bridge, 'memory.agent', { action: 'list' })).ok).toBe(true);
+      expect((await callRunnerBridge(bridge, 'memory.agent', { action: 'list', target: 'user' })).ok).toBe(true);
+      expect(await tasks.getTask(TEST_UID, projectId, created.task.id)).toMatchObject({ status: 'done' });
+      expect(await tasks.getTask(TEST_UID, projectId, created.task.id)).not.toHaveProperty('origin_cid');
       onEvent({ type: 'done', status: 'completed', output: 'Read on demand.' });
     };
     const runner = await loadRunner();
     const opts = {
       uid: TEST_UID, cid: 'c-opencode-backlog', agentId: 'agent-x', currentMessageId: 'message-x',
-      cli: 'opencode' as const, prompt: 'Inspect the backlog', cwd: tmpDir,
+      cli, prompt: 'Inspect the backlog', cwd: tmpDir,
       signal: new AbortController().signal, onEvent: () => {},
     };
     expect((await runner.run({ ...opts, projectId })).status).toBe('completed');
     expect(envFile).toBeDefined();
     expect(fs.existsSync(envFile!)).toBe(false);
-    mockOpencodeBackendImpl = async ({ bridge, onEvent }) => {
-      expect(bridge).toBeUndefined();
-      onEvent({ type: 'done', status: 'completed', output: 'No project scope.' });
+    mockBackendImpl = mockCodexBackendImpl = mockOpencodeBackendImpl = mockHermesBackendImpl = mockOpenclawBackendImpl = async ({ bridge, onEvent }) => {
+      expect(bridge).toBeDefined();
+      const created = await callRunnerBridge(bridge, 'todo_tasks', { action: 'create', content: 'Global CLI work' });
+      expect(created.ok).toBe(true);
+      expect(await tasks.getTask(TEST_UID, '', created.result.task.id)).toMatchObject({ content: 'Global CLI work' });
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'list', project: projectId })).ok).toBe(false);
+      onEvent({ type: 'done', status: 'completed', output: 'Global scope.' });
     };
     expect((await runner.run(opts)).status).toBe('completed');
   });
 
-  it.each(['claude', 'codex', 'opencode'] as const)('gives a projectless %s task browser access that expires with its conversation turn', async (cli) => {
+  it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('gives a projectless %s task browser access that expires with its conversation turn', async (cli) => {
     const life = await import('../../../../src/main/features/web_assist_lifecycle');
     const cid = 'c-projectless-browser';
     life.beginBrowserTaskRun(TEST_UID, cid, 'browser-turn');
@@ -1075,14 +1109,14 @@ describe('local_agents/runner', () => {
       const reply = await callRunnerBridge(bridge, 'browser', { operation: 'tabs' });
       expect(reply).toMatchObject({ ok: true, result: { isError: true } });
       expect(JSON.parse(reply.result.content)).toMatchObject({ ok: false, code: 'task_run_ended' });
-      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'list' })).ok).toBe(false);
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'list' })).ok).toBe(true);
       if (cli === 'opencode') {
-        expect((await callRunnerBridge(bridge, 'skills.list', {})).ok).toBe(false);
+        expect((await callRunnerBridge(bridge, 'skills.list', {})).ok).toBe(true);
         expect((await callRunnerBridge(bridge, 'connectors.list', {})).ok).toBe(false);
       }
       onEvent({ type: 'done', status: 'completed', output: 'Browser authority expired.' });
     };
-    mockBackendImpl = mockCodexBackendImpl = mockOpencodeBackendImpl = backend;
+    mockBackendImpl = mockCodexBackendImpl = mockOpencodeBackendImpl = mockHermesBackendImpl = mockOpenclawBackendImpl = backend;
     try {
       const runner = await loadRunner();
       const result = await runner.run({
@@ -1673,7 +1707,11 @@ describe('local_agents/runner', () => {
     await expect(runner.stopBackgroundRuns('already drained', 10)).resolves.toBe(0);
   });
 
-  it.each(['claude', 'codex', 'openclaw', 'opencode', 'hermes'] as const)('applies the shared 24-hour total and 30-minute idle limits to %s', async (cli) => {
+  // openclaw is deliberately absent from the idle half: it has no mid-run
+  // output, so the clock would kill a healthy long turn and discard its reply
+  // (2026-09-12, review P3-1; see the `progressEvents` capability and
+  // `openclaw_e2e.test.ts`). Its own case below pins the wall-cap-only shape.
+  it.each(['claude', 'codex', 'opencode', 'hermes'] as const)('applies the shared 24-hour total and 30-minute idle limits to %s', async (cli) => {
     mockDetect.mockResolvedValue({ type: cli, available: true, path: `/fake/${cli}`, version: '2026.4.11' });
     let captured: any = null;
     const backendImpl = async (opts: any) => {
@@ -1693,6 +1731,26 @@ describe('local_agents/runner', () => {
     expect(result.status).toBe('completed');
     expect(captured?.timeoutMs).toBe(24 * 60 * 60 * 1000);
     expect(captured?.idleKillMs).toBe(30 * 60 * 1000);
+  });
+
+  it('gives openclaw the shared wall cap and no idle clock at all', async () => {
+    mockDetect.mockResolvedValue({ type: 'openclaw', available: true, path: '/fake/openclaw', version: '2026.4.11' });
+    let captured: any = null;
+    mockOpenclawBackendImpl = async (opts: any) => {
+      captured = opts;
+      opts.onEvent({ type: 'done', status: 'completed', output: '', durationMs: 0 });
+    };
+
+    const result = await (await import('../../../../src/main/features/local_agents/runner')).run({
+      uid: TEST_UID, cid: 'c-openclaw-caps', agentId: 'a',
+      cli: 'openclaw', prompt: 'p', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+
+    expect(result.status).toBe('completed');
+    expect(captured?.timeoutMs).toBe(24 * 60 * 60 * 1000);
+    expect(captured?.idleKillMs).toBeUndefined();
   });
 
   it('counts throttled protocol activity but not synthetic UI pulses as real progress', async () => {

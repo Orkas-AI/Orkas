@@ -25,6 +25,7 @@ import {
   LOCAL_CLI_TYPES,
   VERSION_PROBE_TIMEOUT_MS,
 } from '../../../../src/main/features/local_agents/registry';
+import { configureBootAdmission, noteBootUserActivity, _resetForTests as resetBoot } from '../../../../src/main/util/boot_init';
 import { MIN_VERSIONS } from '../../../../src/main/features/local_agents/version';
 
 const isWindows = process.platform === 'win32';
@@ -42,6 +43,7 @@ describe('local CLI context capabilities', () => {
         orkasBridge: true,
         agentMemory: true,
         activeRunIngress: 'stream-json',
+        progressEvents: true,
         permissionPolicies: ['inherit', 'ask', 'full_access'],
       },
       codex: {
@@ -52,6 +54,7 @@ describe('local CLI context capabilities', () => {
         orkasBridge: true,
         agentMemory: true,
         activeRunIngress: 'codex-app-server',
+        progressEvents: true,
         permissionPolicies: ['inherit', 'ask', 'full_access'],
       },
       openclaw: {
@@ -59,9 +62,10 @@ describe('local CLI context capabilities', () => {
         instructionChannel: 'user-message',
         durableInstructionScope: 'session',
         codingProjectDirectory: false,
-        orkasBridge: false,
+        orkasBridge: true,
         agentMemory: false,
         activeRunIngress: 'none',
+        progressEvents: false,
         permissionPolicies: ['inherit'],
       },
       opencode: {
@@ -72,6 +76,7 @@ describe('local CLI context capabilities', () => {
         orkasBridge: true,
         agentMemory: false,
         activeRunIngress: 'none',
+        progressEvents: true,
         permissionPolicies: ['full_access'],
       },
       hermes: {
@@ -79,9 +84,10 @@ describe('local CLI context capabilities', () => {
         instructionChannel: 'user-message',
         durableInstructionScope: 'invocation',
         codingProjectDirectory: false,
-        orkasBridge: false,
+        orkasBridge: true,
         agentMemory: false,
         activeRunIngress: 'none',
+        progressEvents: true,
         permissionPolicies: ['inherit', 'ask', 'full_access'],
       },
     });
@@ -96,6 +102,7 @@ describe('local CLI context capabilities', () => {
       orkasBridge: false,
       agentMemory: false,
       activeRunIngress: 'none',
+      progressEvents: false,
       permissionPolicies: ['inherit'],
     });
     expect(localCliResumeStrategy('unknown')).toBe('none');
@@ -670,6 +677,37 @@ describe('local_agents/registry', () => {
     expect(dispatched).toMatchObject({ type: 'claude', path: fake, available: true });
     expect(warm.find(entry => entry.type === 'claude')).toBe(dispatched);
     expect(fs.readFileSync(probeLog, 'utf8').trim().split(/\r?\n/)).toEqual(['--version']);
+  });
+
+  it.each(['conversation', 'interaction', 'abort', 'idle'] as const)('respects %s activity during warmup and keeps on-demand dispatch available', async (activity) => {
+    const firstLog = path.join(tmpDir, 'first-probe.log');
+    const nextLog = path.join(tmpDir, 'next-probe.log');
+    const first = writeCountingMockCli(path.join(tmpDir, 'first-cli'), firstLog);
+    const next = writeCountingMockCli(path.join(tmpDir, 'next-cli'), nextLog);
+    process.env.PATH = '';
+    for (const type of LOCAL_CLI_TYPES) process.env[`ORKAS_${type.toUpperCase()}_PATH`] = path.join(tmpDir, `missing-${type}`);
+    process.env.ORKAS_CLAUDE_PATH = first;
+    process.env.ORKAS_CODEX_PATH = next;
+    resetBoot();
+    const controller = new AbortController();
+    let warming: Promise<unknown> | undefined;
+    try {
+      warming = warmLocalClis(controller.signal);
+      await vi.waitFor(() => expect(fs.existsSync(firstLog)).toBe(true));
+      if (activity === 'conversation') configureBootAdmission({ isRuntimeBusy: () => true });
+      else if (activity === 'interaction') noteBootUserActivity();
+      else if (activity === 'abort') controller.abort();
+      else vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 3_000);
+      await warming;
+      expect(fs.existsSync(nextLog)).toBe(activity === 'idle');
+      const dispatched = await resolveCliForDispatch('codex');
+      expect(dispatched).toMatchObject({ available: true, version: '2.1.0' });
+      expect(fs.readFileSync(nextLog, 'utf8').trim().split(/\r?\n/)).toEqual(['--version']);
+    } finally {
+      controller.abort();
+      await warming;
+      resetBoot();
+    }
   });
 
   it('reuses a validated dispatch result indefinitely while its file identity is unchanged', async () => {

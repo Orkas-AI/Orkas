@@ -226,13 +226,13 @@ export const invokeHandlers = {
   },
 
   /** Renderer answer to a per-action sensitive connector confirmation. */
-  'connectors.action_confirm_response': async (payload: { request_id?: unknown; approved?: unknown; scope?: unknown }) => {
+  'connectors.action_confirm_response': async (payload: { request_id?: unknown; approved?: unknown; scope?: unknown }, ctx: { sender: { id: number } }) => {
     if (typeof payload?.request_id !== 'string' || !payload.request_id) throw new Error('invalid request_id');
     if (typeof payload?.approved !== 'boolean') throw new Error('invalid approved flag');
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const actionConfirm = require('../features/connectors/action_confirm') as typeof import('../features/connectors/action_confirm');
-    if (payload.scope !== undefined && payload.scope !== 'once' && payload.scope !== 'task') throw new Error('invalid approval scope');
-    return { handled: actionConfirm.respond(payload.request_id, payload.approved, payload.scope === 'task' ? 'task' : 'once') };
+    if (payload.scope !== undefined && payload.scope !== 'once' && payload.scope !== 'task' && payload.scope !== 'usage') throw new Error('invalid approval scope');
+    return { handled: actionConfirm.respond(payload.request_id, payload.approved, payload.scope === 'task' || payload.scope === 'usage' ? payload.scope : 'once', ctx.sender.id) };
   },
 
   'connectors.add_custom': async (

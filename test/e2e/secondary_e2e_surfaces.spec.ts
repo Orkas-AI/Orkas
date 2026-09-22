@@ -131,6 +131,20 @@ test.describe('secondary user surfaces', () => {
     await expect(persistedSection.locator('.memory-empty')).toBeVisible();
   });
 
+  test('opens the external-only coding-CLI dialog from the AI Team header', async ({ appPage }) => {
+    await appPage.locator('#agents-btn').click();
+    await appPage.locator('#agents-connect-cli-btn').click();
+
+    await expect(appPage.locator('#agent-modal')).toHaveClass(/\bopen\b/);
+    await expect(appPage.locator('#agent-modal [data-agent-panel="external"]')).toHaveClass(/\bis-active\b/);
+    await expect(appPage.locator('#agent-modal-title')).toHaveText('Connect an agent');
+    await expect(appPage.locator('#agent-modal-tabs')).toBeHidden();
+    await expect(appPage.locator('#agent-modal-ext-cli-select')).toBeVisible();
+
+    await appPage.locator('#agent-modal .modal-actions .btn').first().click();
+    await expect(appPage.locator('#agent-modal')).not.toHaveClass(/\bopen\b/);
+  });
+
   test('opens Marketplace from Agents and switches every catalog tab', async ({ appPage }) => {
     await appPage.locator('#agents-btn').click();
     await appPage.locator('#agents-more-btn').click();

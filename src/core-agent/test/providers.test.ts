@@ -814,18 +814,15 @@ it("reads Responses text phase only from structured signature metadata", () => {
       });
     });
 
-    it("removes a complete leading think block at every provider boundary", () => {
+    it("removes a complete leading think block only for opted-in provider routes", () => {
       const providerText = "<think>private chain of thought</think>\n\nUser-facing result";
-      const content = mapProviderContentForTest([
-        {
-          type: "text",
-          text: providerText,
-        },
-      ]);
+      const rawContent = [{ type: "text" as const, text: providerText }];
+      const content = mapProviderContentForTest(rawContent, true);
 
       expect(content).toEqual([{ type: "text", text: "User-facing result" }]);
-      // The low-level mapper remains opt-in for replay and conversion callers;
-      // only provider output crosses the mandatory privacy boundary.
+      expect(mapProviderContentForTest(rawContent)).toEqual(rawContent);
+      // Replay and conversion callers remain pass-through unless the owning
+      // provider route explicitly enables the wire-compatibility repair.
       expect(mapContentForTest([{ type: "text", text: providerText }]))
         .toEqual([{ type: "text", text: providerText }]);
       expect(stripLeadingThinkTextForTest(
@@ -1407,11 +1404,15 @@ it.each(["truncated", "aborted"] as const)("does not complete a %s OpenRouter Cl
         const errorPattern = failure === "aborted" ? /abort/i : /stream ended/i;
         expect(errors[0].error.message).toMatch(errorPattern);
         expect(requestCount).toBe(1);
-        expect(warning.mock.calls).toEqual([["[pi-provider]", "provider stream failed", {
-          provider: "openrouter", model: modelId,
-          reason: failure === "aborted" ? "aborted" : "error",
-          messageChars: expect.any(Number), fieldCount: expect.any(Number),
-        }]]);
+        expect(warning.mock.calls).toEqual([["[pi-provider]", "provider stream failed", expect.objectContaining({
+          aborted: failure === "aborted",
+          code: "unknown",
+          elapsedMs: expect.any(Number),
+          httpStatus: 200,
+          lastEvent: "text_delta",
+          phase: "after_response",
+          source: "sdk_error",
+        })]]);
         expect(JSON.stringify(warning.mock.calls)).not.toContain(errors[0].error.message);
 
         warning.mockClear();

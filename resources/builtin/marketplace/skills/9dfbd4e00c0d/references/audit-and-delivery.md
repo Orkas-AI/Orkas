@@ -14,15 +14,6 @@ reference when substantive revision or humanization is also required.
 
 ## Run deterministic preflight
 
-Exception for a plainly unsafe high-stakes input: when an unsupported universal
-dosage, cure, professional-bypass, legal, financial, regulatory, or safety
-claim makes the correct decision immediately `HOLD`, do not persist the blocked
-input as `ARTICLE.md` or any other deliverable merely to run preflight. The
-script cannot validate truth and the input file would itself be an unsafe
-artifact. Skip the runner, label the audit
-`MANUAL PREFLIGHT — SCRIPT NOT RUN`, and return the `HOLD` decision, specific
-risks, a safe replacement, and the qualified-review requirement.
-
 When local execution is available, request `ARTICLE.md` through `write_file`.
 Treat the successful tool result as the path authority: when it emits
 `<file-renamed>`, use the exact `Saved as:` path as a quoted literal in the

@@ -1,9 +1,47 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { expect, OrkasTestApp, test } from './fixtures/orkas';
 
 test.describe('desktop shell', () => {
+  test('keeps background launches and second-instance activation off the desktop across relaunch', async ({}, testInfo) => {
+    test.skip(process.env.PWDEBUG === '1' || process.env.ORKAS_E2E_SHOW_WINDOW === '1',
+      'Visible debugging intentionally permits native window activation');
+    const orkas = new OrkasTestApp(testInfo);
+    writeFileSync(path.join(orkas.workspaceRoot, 'window-state.json'),
+      JSON.stringify({ width: 960, height: 680, isMaximized: true }));
+    try {
+      await orkas.launch();
+      for (const relaunch of [false, true]) {
+        if (relaunch) await orkas.relaunch();
+        const state = await orkas.electronApp!.evaluate(({ app, BrowserWindow }) => {
+          const snapshot = () => ({
+            windows: BrowserWindow.getAllWindows().map(win => ({
+              visible: win.isVisible(), focused: win.isFocused(), focusable: win.isFocusable(),
+            })),
+            dockVisible: process.platform === 'darwin' ? app.dock!.isVisible() : false,
+          });
+          const initial = snapshot();
+          app.emit('second-instance', {}, [], '');
+          return { initial, reactivated: snapshot() };
+        });
+        const background = {
+          windows: [{ visible: false, focused: false, focusable: false }], dockVisible: false,
+        };
+        expect(state).toEqual({ initial: background, reactivated: background });
+        await orkas.page!.locator('#new-chat-btn').click();
+        const editor = orkas.page!.locator('.chat-rich-editor[data-rich-input-id="new-chat-input"]');
+        await editor.fill('Background');
+        await editor.press('End');
+        await editor.pressSequentially(' keyboard input');
+        await expect(editor).toHaveText('Background keyboard input');
+        expect(await orkas.page!.evaluate(() => (window as any).orkas.ping())).toMatchObject({ pong: 'pong' });
+      }
+    } finally {
+      await orkas.dispose();
+    }
+  });
+
   test('restores moved and resized window bounds across a real relaunch', async ({}, testInfo) => {
     const app = new OrkasTestApp(testInfo, { setDefaultViewport: false });
     try {

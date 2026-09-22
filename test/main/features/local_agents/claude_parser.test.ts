@@ -10,7 +10,7 @@ describe('local_agents/backends/claude › mapClaudeEvent', () => {
 
   it('emits text-delta for assistant text content (fallback when no stream_event)', () => {
     const r = mapClaudeEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'hi' }] } }, 'sess');
-    expect(r?.event).toEqual({ type: 'text-delta', text: 'hi' });
+    expect(r?.event).toEqual({ type: 'text-delta', text: 'hi', itemId: 'claude-message:1' });
   });
 
   it('skips assistant text when stream_event already streamed it', () => {
@@ -25,8 +25,102 @@ describe('local_agents/backends/claude › mapClaudeEvent', () => {
       type: 'stream_event',
       event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'tok' } },
     }, undefined, state);
-    expect(r?.event).toEqual({ type: 'text-delta', text: 'tok' });
+    expect(r?.event).toEqual({ type: 'text-delta', text: 'tok', itemId: 'claude-message:1' });
     expect(state.sawTextStreamEvent).toBe(true);
+  });
+
+  it('preserves native message identity across partials and full records without duplicating text', () => {
+    const state = { sawTextStreamEvent: false };
+    const records = [
+      { type: 'stream_event', event: { type: 'message_start', message: { id: 'm1' } } },
+      { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '## Draft' } } },
+      { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: '## Draft' }] } },
+      { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: '## Draft' }] } },
+      { type: 'stream_event', event: { type: 'message_start', message: { id: 'm2' } } },
+      { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Corrected.' } } },
+      { type: 'assistant', message: { id: 'm2', content: [{ type: 'text', text: 'Corrected.' }] } },
+      // A later message can fall back to a complete record without partials.
+      { type: 'assistant', message: { id: 'm3', content: [{ type: 'text', text: 'Saved.' }] } },
+    ];
+    const events = records.flatMap(record => {
+      const parsed = mapClaudeEvent(record, undefined, state);
+      return parsed?.events || (parsed?.event ? [parsed.event] : []);
+    });
+    expect(events).toEqual([
+      { type: 'text-delta', text: '## Draft', itemId: 'm1' },
+      { type: 'text-delta', text: 'Corrected.', itemId: 'm2' },
+      { type: 'text-delta', text: 'Saved.', itemId: 'm3' },
+    ]);
+  });
+
+  it('does not replay partial text when the full record supplies the first native id', () => {
+    const state = { sawTextStreamEvent: false };
+    const partial = mapClaudeEvent({ type: 'stream_event', event: {
+      type: 'content_block_delta', delta: { type: 'text_delta', text: 'Report' },
+    } }, undefined, state);
+    const full = mapClaudeEvent({ type: 'assistant', message: {
+      id: 'm1', content: [{ type: 'text', text: 'Report' }],
+    } }, undefined, state);
+    const next = mapClaudeEvent({ type: 'assistant', message: {
+      id: 'm2', content: [{ type: 'text', text: 'Saved' }],
+    } }, undefined, state);
+    expect(partial?.event).toMatchObject({ type: 'text-delta', text: 'Report' });
+    expect(full).toBeUndefined();
+    expect(next?.event).toMatchObject({ type: 'text-delta', text: 'Saved', itemId: 'm2' });
+  });
+
+  it('emits the text record that follows a thinking record of the same message when no partial text streamed', () => {
+    // Live shape observed on 2026-09-17: one `assistant` record per content
+    // block, all sharing the message id, thinking streamed but text not.
+    const state = { sawTextStreamEvent: false };
+    const records = [
+      { type: 'stream_event', event: { type: 'message_start', message: { id: 'msg_X' } } },
+      { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'hmm' } } },
+      { type: 'assistant', message: { id: 'msg_X', content: [{ type: 'thinking', thinking: 'hmm' }] } },
+      { type: 'assistant', message: { id: 'msg_X', content: [{ type: 'text', text: '开始改。' }] } },
+      { type: 'assistant', message: { id: 'msg_X', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } },
+      { type: 'stream_event', event: { type: 'message_start', message: { id: 'msg_Y' } } },
+      { type: 'assistant', message: { id: 'msg_Y', content: [{ type: 'thinking', thinking: 'more' }] } },
+      { type: 'assistant', message: { id: 'msg_Y', content: [{ type: 'text', text: '改完了。' }] } },
+      // A genuine replay of the same record is still deduplicated.
+      { type: 'assistant', message: { id: 'msg_Y', content: [{ type: 'text', text: '改完了。' }] } },
+    ];
+    const events = records.flatMap(record => {
+      const parsed = mapClaudeEvent(record, undefined, state);
+      return parsed?.events || (parsed?.event ? [parsed.event] : []);
+    });
+    expect(events.filter(event => event.type === 'text-delta')).toEqual([
+      { type: 'text-delta', text: '开始改。', itemId: 'msg_X' },
+      { type: 'text-delta', text: '改完了。', itemId: 'msg_Y' },
+    ]);
+    expect(events.filter(event => event.type === 'tool-event').map(event => event.tool)).toEqual(['Bash', 'tool_result']);
+  });
+
+  it('still skips the text record when the partials of that message were streamed after a thinking record', () => {
+    const state = { sawTextStreamEvent: false };
+    const records = [
+      { type: 'stream_event', event: { type: 'message_start', message: { id: 'msg_X' } } },
+      { type: 'assistant', message: { id: 'msg_X', content: [{ type: 'thinking', thinking: 'hmm' }] } },
+      { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '开始' } } },
+      { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '改。' } } },
+      { type: 'assistant', message: { id: 'msg_X', content: [{ type: 'text', text: '开始改。' }] } },
+    ];
+    const events = records.flatMap(record => {
+      const parsed = mapClaudeEvent(record, undefined, state);
+      return parsed?.events || (parsed?.event ? [parsed.event] : []);
+    });
+    expect(events.filter(event => event.type === 'text-delta').map(event => event.text)).toEqual(['开始', '改。']);
+  });
+
+  it('uses full-record boundaries when older Claude records omit message ids', () => {
+    const state = { sawTextStreamEvent: false };
+    const record = { type: 'assistant', message: { content: [{ type: 'text', text: 'Same text' }] } };
+    const first = mapClaudeEvent(record, undefined, state)?.event;
+    const second = mapClaudeEvent(record, undefined, state)?.event;
+    expect(first).toMatchObject({ type: 'text-delta', text: 'Same text' });
+    expect(second).toMatchObject({ type: 'text-delta', text: 'Same text' });
+    expect(first?.itemId).not.toBe(second?.itemId);
   });
 
   it('emits thinking from stream_event content_block_delta', () => {
@@ -446,6 +540,28 @@ describe('local_agents/backends/claude › mapClaudeEvent', () => {
   it('marks result(error_*) as terminal failed', () => {
     const r = mapClaudeEvent({ type: 'result', subtype: 'error_max_turns', error: 'too many turns' }, 'sess');
     expect(r?.terminal).toEqual({ status: 'failed', text: '', error: 'too many turns' });
+  });
+
+  it.each([
+    { errors: undefined, error: undefined, expected: 'API connection failed' },
+    { errors: [], error: undefined, expected: 'API connection failed' },
+    { errors: ['Retries exhausted'], error: undefined, expected: 'Retries exhausted' },
+    { errors: [], error: 'Provider unavailable', expected: 'Provider unavailable' },
+  ])('honors an error result even when its subtype is success: $expected', ({ errors, error, expected }) => {
+    const r = mapClaudeEvent({
+      type: 'result', subtype: 'success', is_error: true,
+      result: 'API connection failed', errors, error,
+    }, 'sess');
+    expect(r?.event).toMatchObject({ type: 'status', status: 'error' });
+    expect(r?.terminal).toMatchObject({ status: 'failed', error: expected, text: 'API connection failed' });
+  });
+
+  it('does not infer failure from ordinary result text', () => {
+    const r = mapClaudeEvent({
+      type: 'result', subtype: 'success', is_error: false,
+      result: 'Documented the API Error example.',
+    }, 'sess');
+    expect(r?.terminal).toMatchObject({ status: 'completed', error: undefined });
   });
 
   it('joins result errors arrays emitted by newer Claude versions', () => {

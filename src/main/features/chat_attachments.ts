@@ -8,7 +8,7 @@
  *   text   — .md / .markdown / .txt / .csv / .tsv / .json / .yaml / .yml / .log
  *   pdf    — .pdf
  *   docx   — .docx / .docm
- *   spreadsheet  — .xlsx / .xlsm
+ *   spreadsheet  — .xlsx / .xlsm / .xls
  *   presentation — .pptx / .pptm
  *   archive — .zip (opaque path-only input for host-native import tools)
  *   image  — .png / .jpg / .jpeg / .webp / .gif
@@ -21,7 +21,7 @@
  *                        (`main_chat`, `projchat-*`) are local-only until
  *                        adoptDraftAttachments moves them into a real cid.
  *                        PDF/DOCX/
- *                        XLSX/PPTX extract + image grayscale happen lazily on read via
+ *                        XLSX/PPTX extraction and color image compression happen lazily on read via
  *                        features/file_indexer (which caches under
  *                        <uid>/local/file_cache/<hash>/). Video is kept raw
  *                        and never cached.
@@ -41,13 +41,17 @@
  * Size caps and extension whitelists align with `features/contexts`.
  */
 
+import { fileFailureKind, type FileFailureKind } from '../util/app-error';
 import * as fs from 'node:fs';
+import { isUtf8File } from '../util/file-import';
+import { MAX_TEXT_FILE_BYTES } from '../util/file-size-limits';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
 import { chatAttachmentDir, chatAttachmentDraftDir, userChatAttachmentsDir } from '../paths';
 import {
   chatAttachmentDirForConversation,
+  cachedChatAttachmentDirForConversation,
   chatAttachmentRelPath,
   conversationMessageReadFile,
 } from '../util/project-layout';
@@ -67,19 +71,25 @@ const log = createLogger('chat_attachments');
 // ── Whitelists & caps (aligned with features/contexts) ────────────────────
 
 const TEXT_EXTS: ReadonlySet<string> = new Set([
-  '.md', '.markdown', '.txt', '.csv', '.tsv',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
   '.json', '.yaml', '.yml', '.log',
+  '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
+  '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
 ]);
 const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
-// SVG is intentionally display-only. Keep it out of IMAGE_EXTS so attachment
+// Additional browser formats are display-only. Keep them out of IMAGE_EXTS so attachment
 // upload, model vision input, image transforms, and per-cid attachment serving
 // retain their existing raster-only contract.
-const LOCAL_DISPLAY_IMAGE_EXTS: ReadonlySet<string> = new Set([...IMAGE_EXTS, '.svg']);
+const LOCAL_DISPLAY_IMAGE_EXTS: ReadonlySet<string> = new Set([...IMAGE_EXTS, '.apng', '.jpe', '.jfif', '.avif', '.bmp', '.ico', '.svg']);
 const VIDEO_EXTS: ReadonlySet<string> = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
 const AUDIO_EXTS: ReadonlySet<string> = new Set(['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac']);
+const LOCAL_DISPLAY_AUDIO_EXTS: ReadonlySet<string> = new Set([...AUDIO_EXTS, '.oga', '.weba']);
 const PDF_EXT = '.pdf';
 const DOCX_EXTS: ReadonlySet<string> = new Set(['.docx', '.docm']);
-const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm']);
+const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm', '.xls']);
 const PRESENTATION_EXTS: ReadonlySet<string> = new Set(['.pptx', '.pptm']);
 const ARCHIVE_EXTS: ReadonlySet<string> = new Set(['.zip']);
 export const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
@@ -90,9 +100,8 @@ export const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
 
 // Text attachments are path-addressed and read by the model in bounded slices,
 // so their composer cap does not need to mirror a prompt/body upload limit.
-// Keep this aligned with the existing context/task local-file ceiling while
-// leaving Project Library's eager indexing boundary unchanged.
-export const MAX_TEXT_ATTACHMENT_BYTES = 200 * 1024 * 1024;
+// Share storage admission with Project Library; indexing has a separate work limit.
+export const MAX_TEXT_ATTACHMENT_BYTES = MAX_TEXT_FILE_BYTES;
 const MAX_BYTES_TEXT = MAX_TEXT_ATTACHMENT_BYTES;
 const MAX_BYTES_DOCX  = 20  * 1024 * 1024;
 const MAX_BYTES_OFFICE = 50 * 1024 * 1024;
@@ -135,7 +144,7 @@ export interface AttachmentInfo {
   mtime: number;      // epoch seconds
 }
 
-export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string };
+export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string; failure_kind?: FileFailureKind };
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -490,32 +499,6 @@ function hashFile(absPath: string): Promise<string> {
   });
 }
 
-async function isUtf8File(absPath: string): Promise<boolean> {
-  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
-  const stream = fs.createReadStream(absPath);
-  try {
-    for await (const chunk of stream) {
-      decoder.decode(chunk as Buffer, { stream: true });
-    }
-    decoder.decode();
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') {
-      return false;
-    }
-    throw err;
-  } finally {
-    // An invalid chunk ends iteration before the asynchronous handle close.
-    // Callers must be able to remove or replace the rejected source at once.
-    if (!stream.closed) {
-      await new Promise<void>((resolve) => {
-        stream.once('close', resolve);
-        stream.destroy();
-      });
-    }
-  }
-}
-
 async function findDuplicateByHash(
   dir: string,
   bytes: number,
@@ -647,12 +630,12 @@ export async function importAttachmentFromPath(
   try {
     safeName = safeAttachmentName(name || path.basename(sourcePath || ''));
     safeConvId = safeCid(cid);
-  } catch (err) { return { ok: false, error: (err as Error).message }; }
+  } catch (err) { return { ok: false, error: (err as Error).message, failure_kind: fileFailureKind(err) }; }
 
   const absSource = path.resolve(String(sourcePath || ''));
   let sourceStat: fs.Stats;
   try { sourceStat = fs.statSync(absSource); }
-  catch { return { ok: false, error: 'file not found' }; }
+  catch (err) { return { ok: false, error: 'file not found', failure_kind: fileFailureKind(err) }; }
   if (!sourceStat.isFile()) return { ok: false, error: 'file not found' };
 
   const ext = path.extname(safeName).toLowerCase();
@@ -663,7 +646,7 @@ export async function importAttachmentFromPath(
   if (TEXT_EXTS.has(ext)) {
     let validUtf8: boolean;
     try { validUtf8 = await isUtf8File(absSource); }
-    catch (err) { return { ok: false, error: (err as Error).message }; }
+    catch (err) { return { ok: false, error: (err as Error).message, failure_kind: fileFailureKind(err) }; }
     if (!validUtf8) {
       return { ok: false, error: t('errors.not_utf8') };
     }
@@ -673,7 +656,7 @@ export async function importAttachmentFromPath(
     const dir = ensureDir(userId, safeConvId);
     let incomingHash: string;
     try { incomingHash = await hashFile(absSource); }
-    catch (err) { return { ok: false, error: (err as Error).message }; }
+    catch (err) { return { ok: false, error: (err as Error).message, failure_kind: fileFailureKind(err) }; }
 
     // Match uploadAttachment: a historical file needs a new pool entry so
     // the newly-selected pending item can be reconstructed after restart.
@@ -701,7 +684,7 @@ export async function importAttachmentFromPath(
       try {
         if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
       } catch { /* best-effort */ }
-      return { ok: false, error: (err as Error).message };
+      return { ok: false, error: (err as Error).message, failure_kind: fileFailureKind(err) };
     }
 
     const st = fs.statSync(target);
@@ -842,6 +825,56 @@ export function deleteAttachment(userId: string, cid: string, name: string): Res
   return { ok: true };
 }
 
+// Internal only: preserve the failed operation's reason for protocol logging.
+// Public resolver codes and response bodies retain their compatibility contract.
+type MediaFileDiagnostic = 'not_found' | 'permission_denied' | 'not_file' | 'io_error';
+function mediaFileFailureCode(error: unknown): MediaFileDiagnostic {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR' ? 'not_found'
+    : code === 'EACCES' || code === 'EPERM' ? 'permission_denied' : 'io_error';
+}
+
+/** Diagnostic only: one async stat, no read, SVG materialization or mutation.
+ * stat_available does not establish readability, transport or decode success.
+ */
+export async function diagnoseMediaFile(
+  userId: string,
+  source: { localPath: string } | { cid: string; name: string },
+): Promise<{ diagnosis: string; media_kind?: AttachmentKind }> {
+  let abs: string;
+  let local = false;
+  if ('localPath' in source) {
+    if (!source.localPath || !path.isAbsolute(source.localPath)) return { diagnosis: 'bad_input' };
+    abs = path.resolve(source.localPath);
+    local = true;
+  } else {
+    try {
+      const cid = safeCid(source.cid);
+      const name = safeAttachmentName(source.name);
+      // Rendering resolves/migrates the owning layout first. Diagnostics use
+      // that hint only; a cold cache remains unknown instead of scanning files.
+      const dir = isDraftAttachmentCid(cid) ? chatAttachmentDraftDir(userId, cid)
+        : cachedChatAttachmentDirForConversation(userId, cid);
+      if (!dir) return { diagnosis: 'unavailable' };
+      abs = path.resolve(dir, name);
+    } catch { return { diagnosis: 'bad_input' }; }
+  }
+  const ext = path.extname(abs).toLowerCase();
+  if (local && !LOCAL_DISPLAY_IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !LOCAL_DISPLAY_AUDIO_EXTS.has(ext)) {
+    return { diagnosis: 'bad_input' };
+  }
+  const media_kind = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? 'image' : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? 'audio' : kindOf(ext));
+  try {
+    const stat = await fs.promises.stat(abs);
+    if (!stat.isFile()) return { diagnosis: 'not_file', media_kind };
+    const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? MAX_BYTES_AUDIO : maxBytesFor(ext));
+    if (local && stat.size > cap) return { diagnosis: 'too_large', media_kind };
+    return { diagnosis: 'stat_available', media_kind };
+  } catch (error) {
+    return { diagnosis: mediaFileFailureCode(error), media_kind };
+  }
+}
+
 /**
  * Resolve (uid, cid, name) → absolute on-disk path, with every guard rail the
  * `chat-media://` protocol handler needs:
@@ -860,7 +893,7 @@ export function resolveAttachmentAbsPath(
   userId: string,
   cid: string,
   name: string,
-): Result<{ absPath: string; kind: AttachmentKind }> | { ok: false; code: 'bad_input' | 'forbidden' | 'not_found'; error: string } {
+): Result<{ absPath: string; kind: AttachmentKind }> | { ok: false; code: 'bad_input' | 'forbidden' | 'not_found'; error: string; diagnosticCode?: MediaFileDiagnostic } {
   let safeName: string;
   let safeConvId: string;
   try {
@@ -877,8 +910,8 @@ export function resolveAttachmentAbsPath(
   }
   let stat: fs.Stats;
   try { stat = fs.statSync(abs); }
-  catch { return { ok: false, code: 'not_found', error: 'not found' }; }
-  if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file' };
+  catch (error) { return { ok: false, code: 'not_found', error: 'not found', diagnosticCode: mediaFileFailureCode(error) }; }
+  if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file', diagnosticCode: 'not_file' };
   const ext = path.extname(safeName).toLowerCase();
   return { ok: true, absPath: abs, kind: kindOf(ext) };
 }
@@ -900,7 +933,7 @@ export function resolveAttachmentAbsPath(
  */
 export function resolveLocalMediaPath(
   absPath: string,
-): { ok: true; absPath: string; kind: 'image' | 'video' | 'audio' } | { ok: false; code: 'bad_input' | 'not_found' | 'too_large'; error: string } {
+): { ok: true; absPath: string; kind: 'image' | 'video' | 'audio' } | { ok: false; code: 'bad_input' | 'not_found' | 'too_large'; error: string; diagnosticCode?: MediaFileDiagnostic } {
   if (typeof absPath !== 'string' || !absPath) {
     return { ok: false, code: 'bad_input', error: 'path required' };
   }
@@ -909,14 +942,14 @@ export function resolveLocalMediaPath(
   }
   const normalized = path.resolve(absPath);
   const ext = path.extname(normalized).toLowerCase();
-  if (!LOCAL_DISPLAY_IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !AUDIO_EXTS.has(ext)) {
+  if (!LOCAL_DISPLAY_IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !LOCAL_DISPLAY_AUDIO_EXTS.has(ext)) {
     return { ok: false, code: 'bad_input', error: `unsupported extension: ${ext || '(none)'}` };
   }
   let stat: fs.Stats;
   try { stat = fs.statSync(normalized); }
-  catch { return { ok: false, code: 'not_found', error: 'not found' }; }
-  if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file' };
-  const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : maxBytesFor(ext);
+  catch (error) { return { ok: false, code: 'not_found', error: 'not found', diagnosticCode: mediaFileFailureCode(error) }; }
+  if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file', diagnosticCode: 'not_file' };
+  const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? MAX_BYTES_AUDIO : maxBytesFor(ext));
   if (stat.size > cap) {
     const mb = Math.round(cap / 1024 / 1024);
     return { ok: false, code: 'too_large', error: `file exceeds ${mb}MB cap` };
@@ -924,7 +957,7 @@ export function resolveLocalMediaPath(
   if (ext === '.svg') {
     let body: string;
     try { body = fs.readFileSync(normalized, 'utf8'); }
-    catch { return { ok: false, code: 'not_found', error: 'not found' }; }
+    catch (error) { return { ok: false, code: 'not_found', error: 'not found', diagnosticCode: mediaFileFailureCode(error) }; }
     // Do not run markup-pattern checks across opaque raster base64 payloads;
     // arbitrary encoded bytes can coincidentally end with text like `onfoo=`.
     const bodyForSafety = body.replace(
@@ -943,7 +976,7 @@ export function resolveLocalMediaPath(
       return { ok: false, code: 'bad_input', error: 'unsafe SVG content' };
     }
   }
-  const kind = VIDEO_EXTS.has(ext) ? 'video' : (AUDIO_EXTS.has(ext) ? 'audio' : 'image');
+  const kind = VIDEO_EXTS.has(ext) ? 'video' : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? 'audio' : 'image');
   return { ok: true, absPath: normalized, kind };
 }
 
@@ -956,11 +989,11 @@ export function resolveLocalMediaPath(
  */
 export function materializeLocalDisplaySvg(
   absPath: string,
-): { ok: true; body: string } | { ok: false; code: 'bad_input' | 'not_found' | 'too_large'; error: string } {
+): { ok: true; body: string } | { ok: false; code: 'bad_input' | 'not_found' | 'too_large'; error: string; diagnosticCode?: MediaFileDiagnostic } {
   const resolved = resolveLocalMediaPath(absPath);
   if (!resolved.ok) {
-    const err = resolved as { code: 'bad_input' | 'not_found' | 'too_large'; error: string };
-    return { ok: false, code: err.code, error: err.error };
+    const err = resolved as { code: 'bad_input' | 'not_found' | 'too_large'; error: string; diagnosticCode?: MediaFileDiagnostic };
+    return { ok: false, code: err.code, error: err.error, ...(err.diagnosticCode ? { diagnosticCode: err.diagnosticCode } : {}) };
   }
   if (path.extname(resolved.absPath).toLowerCase() !== '.svg') {
     return { ok: false, code: 'bad_input', error: 'path is not an SVG' };
@@ -968,10 +1001,10 @@ export function materializeLocalDisplaySvg(
 
   let body: string;
   try { body = fs.readFileSync(resolved.absPath, 'utf8'); }
-  catch { return { ok: false, code: 'not_found', error: 'not found' }; }
+  catch (error) { return { ok: false, code: 'not_found', error: 'not found', diagnosticCode: mediaFileFailureCode(error) }; }
 
   const root = path.dirname(resolved.absPath);
-  let inlineError: { code: 'bad_input' | 'not_found' | 'too_large'; error: string } | null = null;
+  let inlineError: { code: 'bad_input' | 'not_found' | 'too_large'; error: string; diagnosticCode?: MediaFileDiagnostic } | null = null;
   let refCount = 0;
   body = body.replace(
     /(<image\b[^>]*?\b(?:href|xlink:href)\s*=\s*)(["'])([^"']*)\2/gi,
@@ -1002,12 +1035,12 @@ export function materializeLocalDisplaySvg(
       }
       let stat: fs.Stats;
       try { stat = fs.statSync(imageAbs); }
-      catch {
-        inlineError = { code: 'not_found', error: 'SVG image reference not found' };
+      catch (error) {
+        inlineError = { code: 'not_found', error: 'SVG image reference not found', diagnosticCode: mediaFileFailureCode(error) };
         return full;
       }
       if (!stat.isFile()) {
-        inlineError = { code: 'not_found', error: 'SVG image reference is not a file' };
+        inlineError = { code: 'not_found', error: 'SVG image reference is not a file', diagnosticCode: 'not_file' };
         return full;
       }
       if (stat.size > MAX_BYTES_IMAGE) {
@@ -1085,10 +1118,16 @@ export function mediaMimeFor(name: string): string {
   return 'application/octet-stream';
 }
 
-/** MIME lookup for `chat-media://local`. SVG support is deliberately kept
+/** MIME lookup for `chat-media://local`. Browser display aliases are kept
  * separate from `mediaMimeFor`, which is also used by per-cid attachments. */
 export function localMediaMimeFor(name: string): string {
-  if (path.extname(name).toLowerCase() === '.svg') return 'image/svg+xml';
+  const aliases: Record<string, string> = {
+    '.apng': 'image/apng', '.jpe': 'image/jpeg', '.jfif': 'image/jpeg',
+    '.avif': 'image/avif', '.bmp': 'image/bmp', '.ico': 'image/x-icon',
+    '.svg': 'image/svg+xml', '.oga': 'audio/ogg', '.weba': 'audio/webm',
+  };
+  const alias = aliases[path.extname(name).toLowerCase()];
+  if (alias) return alias;
   return mediaMimeFor(name);
 }
 
@@ -1217,7 +1256,7 @@ export interface AttachmentManifest {
    *  attachments are attached. The model uses this as a directory listing
    *  and calls the on-demand file tools for content. */
   manifest: string;
-  /** Compressed gray JPEG images formatted for `ChatOptions.images` (pi-ai
+  /** Compressed color JPEG images formatted for `ChatOptions.images` (pi-ai
    *  ImageContent). Produced in real time on each call — no cache. */
   images: Array<{ data: string; mediaType: ImageMimeType }>;
   /** Names of attachments we couldn't use (missing / too big / load error). */
@@ -1257,7 +1296,7 @@ export interface BuildConversationAttachmentIndexOpts {
  *                       Otherwise `total_chars` is omitted and the model must
  *                       let read_files prepare extraction. Never eagerly extract
  *                       here — upload stays zero-cost.
- *   - image           → compressed grayscale JPEG via real-time
+ *   - image           → compressed color JPEG via real-time
  *                       toCompressedGrayJpeg on the raw source → images[]
  *                       for pi-ai vision.
  *   - video/audio     → listed by path for media tools, without inline bytes.
@@ -1315,7 +1354,8 @@ export async function buildAttachmentManifest(
       }
       try {
         const buf = fs.readFileSync(abs);
-        const compressed = await toCompressedGrayJpeg(buf, { maxDim: 1024, quality: 70, grayscale: true });
+        // Preserve reference colors on first delivery, just as read_files does.
+        const compressed = await toCompressedGrayJpeg(buf, { maxDim: 1024, quality: 70, grayscale: false });
         images.push({ data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' });
         // Candidate providers enforce their own N-image request limit after
         // this manifest is built. `image_order` preserves a deterministic

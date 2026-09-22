@@ -91,6 +91,8 @@ export interface ConversationTask {
   assignee: string;
   /** Dispatch text — the persisted source-message text verbatim. */
   instruction: string;
+  /** Monotonic user-edit version; absent in snapshots created before editing. */
+  instruction_revision?: number;
   attachments?: string[];
   status: ConversationTaskStatus;
   /** A newly queued row has not yet been evaluated by the scheduler. It is
@@ -165,7 +167,11 @@ export function onBacklogExecutionChanged(listener: (event: { uid: string; pid: 
 
 function notifyBacklogChanges(uid: string, projects: Set<string>): void {
   for (const pid of projects) for (const listener of _backlogListeners) {
-    try { listener({ uid, pid }); } catch { /* UI listeners cannot interrupt execution. */ }
+    try { listener({ uid, pid }); } catch (error) {
+      log.warn('backlog execution listener failed', {
+        user_id: maskId(uid), project_id: maskId(pid), error: logErrorSummary(error),
+      });
+    }
   }
 }
 
@@ -225,6 +231,9 @@ function normalizeTask(raw: any, cid: string): ConversationTask | null {
     created_at: typeof raw.created_at === 'string' ? raw.created_at : nowIso(),
   };
   if (raw.admission_pending === true && status === 'queued') t.admission_pending = true;
+  if (Number.isSafeInteger(raw.instruction_revision) && raw.instruction_revision > 0) {
+    t.instruction_revision = raw.instruction_revision;
+  }
   if (Array.isArray(raw.attachments)) {
     const atts = raw.attachments.filter((a: unknown) => typeof a === 'string');
     if (atts.length) t.attachments = atts;
@@ -736,6 +745,33 @@ export function reassignQueued(
     if (t.assignee === assignee) return { task: { ...t } };
     t.assignee = assignee;
     return { task: { ...t } };
+  });
+}
+
+/** Commit a user edit with its runtime payload in the same synchronous board
+ * transaction. Admission may have removed the item while this chain waited;
+ * the owning bus must recheck that fact before changing either representation. */
+export function editQueued(
+  uid: string,
+  cid: string,
+  taskId: string,
+  instruction: string,
+  expectedInstruction: string,
+  applyRuntime: () => { sourceMsgId?: string; attachments?: string[]; error?: string },
+): Promise<{ task: ConversationTask | null; error?: string }> {
+  return withBoard(uid, cid, (b) => {
+    const task = b.tasks.find((row) => row.task_id === taskId);
+    if (!task || task.status !== 'queued') return { task: null, error: 'not_queued' };
+    if (task.created_by !== 'user') return { task: null, error: 'not_editable' };
+    if (typeof instruction !== 'string' || !instruction.trim()) return { task: null, error: 'empty_instruction' };
+    if (task.instruction !== expectedInstruction) return { task: null, error: 'edit_conflict' };
+    const result = applyRuntime();
+    if (result.error) return { task: null, error: result.error };
+    task.instruction = instruction;
+    task.instruction_revision = (task.instruction_revision || 0) + 1;
+    if (result.sourceMsgId) task.source_msg_id = result.sourceMsgId;
+    if (result.attachments) task.attachments = result.attachments.slice();
+    return { task: { ...task } };
   });
 }
 

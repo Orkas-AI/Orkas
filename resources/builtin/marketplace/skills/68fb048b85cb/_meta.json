@@ -1,6 +1,6 @@
 {
-  "version": "1.0.9",
-  "updated_at": "2026-08-21T10:43:04.000Z",
+  "version": "1.0.13",
+  "updated_at": "2026-09-18T14:46:49.000Z",
   "reseed_if_deleted_before": "2026-07-28T13:32:31Z",
   "category": "rnd",
   "routing": {

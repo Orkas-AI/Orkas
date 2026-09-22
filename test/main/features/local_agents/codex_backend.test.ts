@@ -22,6 +22,7 @@ describePosix('local_agents/backends/codex process lifecycle', () => {
     fs.writeFileSync(fakeCodexPath, `#!/usr/bin/env node
 const fs = require('node:fs');
 const specialScenarios = [
+  'exit-with-child',
   'bootstrap-hang',
   'protocol-failure',
   'fatal-lingers',
@@ -41,6 +42,8 @@ const specialScenarios = [
   'user-input-146',
   'user-input-151',
   'async-question',
+  'mcp-elicitation-form',
+  'mcp-elicitation',
   'unknown-request',
   'hang',
 ];
@@ -104,6 +107,16 @@ process.stdin.on('data', (chunk) => {
     } else if (message.method === 'turn/start') {
       if (rejectUnnegotiatedPermissions(message)) continue;
       send({ jsonrpc: '2.0', id: message.id, result: { turn: { id: 'turn-1' } } });
+      if (scenario === 'exit-with-child') {
+        const child = require('node:child_process').spawn(process.execPath, ['-e',
+          "process.on('SIGTERM', () => {}); process.send('ready'); setInterval(() => {}, 1000);"
+        ], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
+        child.once('message', () => {
+          fs.writeFileSync(process.argv[process.argv.indexOf('--child-pid') + 1], String(child.pid));
+          process.exit(7);
+        });
+        continue;
+      }
       if (scenario !== 'resume-fallback') {
         if (scenario === 'legacy-complete' || scenario === 'legacy-abort') {
           send({ jsonrpc: '2.0', method: 'codex/event', params: {
@@ -235,6 +248,32 @@ process.stdin.on('data', (chunk) => {
               approvalId: 'permissions-approval-1',
               reason: 'Use the requested permission profile',
               permissions: { fileSystem: { read: ['/workspace'] } },
+            },
+          });
+        } else if (scenario === 'mcp-elicitation' || scenario === 'mcp-elicitation-form') {
+          const toolApproval = scenario === 'mcp-elicitation';
+          send({
+            jsonrpc: '2.0',
+            id: 95,
+            method: 'mcpServer/elicitation/request',
+            params: {
+              threadId: 'fresh-thread',
+              turnId: 'turn-1',
+              serverName: 'orkas',
+              mode: 'form',
+              message: toolApproval
+                ? 'Allow the orkas MCP server to run tool "browser"?'
+                : 'Enter the workspace name',
+              requestedSchema: { type: 'object', properties: {} },
+              _meta: toolApproval
+                ? {
+                  codex_approval_kind: 'mcp_tool_call',
+                  persist: ['session', 'always'],
+                  tool_description: 'Control the visible Browser tabs',
+                  tool_params: { operation: 'tabs' },
+                  tool_params_display: [],
+                }
+                : {},
             },
           });
         } else if (scenario === 'async-question') {
@@ -580,6 +619,54 @@ process.stdin.on('data', (chunk) => {
       send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: {
         threadId: 'fresh-thread', turnId: 'turn-1',
         itemId: 'full-answer', delta: 'auto approved',
+      } });
+      send({ jsonrpc: '2.0', method: 'turn/completed', params: {
+        threadId: 'fresh-thread', turn: { id: 'turn-1', status: 'completed' },
+      } });
+    } else if (scenario === 'mcp-elicitation' && message.id === 95) {
+      if (message.result?.action !== 'accept' || JSON.stringify(message.result?.content) !== '{}') {
+        process.stderr.write('mcp tool call was not approved: ' + JSON.stringify(message) + '\\n');
+        process.exit(7);
+      }
+      send({
+        jsonrpc: '2.0',
+        id: 96,
+        method: 'mcpServer/elicitation/request',
+        params: {
+          threadId: 'fresh-thread', turnId: 'turn-1', serverName: 'orkas', mode: 'form',
+          message: 'Allow the orkas MCP server to run tool "browser"?',
+          requestedSchema: { type: 'object', properties: {} },
+          _meta: { codex_approval_kind: 'mcp_tool_call', tool_params: { operation: 'tabs' } },
+        },
+      });
+    } else if (scenario === 'mcp-elicitation' && message.id === 96) {
+      if (message.result?.action !== 'accept') {
+        process.stderr.write('run grant did not approve the repeat call: ' + JSON.stringify(message) + '\\n');
+        process.exit(7);
+      }
+      send({ jsonrpc: '2.0', method: 'item/started', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        item: { id: 'mcp-answer', type: 'agentMessage', phase: 'final_answer' },
+      } });
+      send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        itemId: 'mcp-answer', delta: 'browser allowed',
+      } });
+      send({ jsonrpc: '2.0', method: 'turn/completed', params: {
+        threadId: 'fresh-thread', turn: { id: 'turn-1', status: 'completed' },
+      } });
+    } else if (scenario === 'mcp-elicitation-form' && message.id === 95) {
+      if (message.result?.action !== 'decline') {
+        process.stderr.write('form elicitation was not declined: ' + JSON.stringify(message) + '\\n');
+        process.exit(7);
+      }
+      send({ jsonrpc: '2.0', method: 'item/started', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        item: { id: 'form-answer', type: 'agentMessage', phase: 'final_answer' },
+      } });
+      send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        itemId: 'form-answer', delta: 'form declined',
       } });
       send({ jsonrpc: '2.0', method: 'turn/completed', params: {
         threadId: 'fresh-thread', turn: { id: 'turn-1', status: 'completed' },
@@ -977,6 +1064,61 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
     });
   });
 
+  it('bridges an MCP tool-call elicitation to the host prompt and reuses the run grant', async () => {
+    const events: any[] = [];
+    const requestPermission = vi.fn(async () => 'allow_run' as const);
+
+    await codexBackend.run({
+      binPath: fakeCodexPath,
+      prompt: 'list the browser tabs',
+      customArgs: ['--mcp-elicitation'],
+      permissionPolicy: 'ask',
+      requestPermission,
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      onEvent: event => events.push(event),
+    });
+
+    // Second identical call is answered by the run-scoped grant, not a prompt.
+    expect(requestPermission).toHaveBeenCalledTimes(1);
+    expect(requestPermission).toHaveBeenCalledWith(expect.objectContaining({
+      tool: 'mcp_tool',
+      description: 'Allow the orkas MCP server to run tool "browser"?',
+      command: '{"operation":"tabs"}',
+      subject: 'orkas',
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'completed',
+      output: 'browser allowed',
+    });
+  });
+
+  it('declines a non-approval MCP elicitation without prompting the user', async () => {
+    const events: any[] = [];
+    const requestPermission = vi.fn(async () => 'allow_once' as const);
+
+    await codexBackend.run({
+      binPath: fakeCodexPath,
+      prompt: 'fill the form',
+      customArgs: ['--mcp-elicitation-form'],
+      permissionPolicy: 'ask',
+      requestPermission,
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      onEvent: event => events.push(event),
+    });
+
+    expect(requestPermission).not.toHaveBeenCalled();
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'completed',
+      output: 'form declined',
+    });
+  });
+
   it('denies a file change when the host approval bridge fails', async () => {
     const events: any[] = [];
     const requestPermission = vi.fn(async () => {
@@ -1149,6 +1291,35 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
       reason: expect.stringContaining('no longer steerable'),
     });
   });
+
+  it('settles an abrupt CLI exit and reaps its child even when inherited pipes stay open', async () => {
+    const childPidFile = path.join(tempDir, 'abrupt-child.pid');
+    const events: any[] = [];
+    const controller = new AbortController();
+    let run: Promise<void> | undefined;
+    try {
+      run = codexBackend.run({
+        binPath: fakeCodexPath, customArgs: ['--exit-with-child', '--child-pid', childPidFile],
+        prompt: 'Run the fixture.', cwd: tempDir, signal: controller.signal,
+        onEvent: e => events.push(e), timeoutMs: 5_000,
+      });
+      await run;
+      const done = events.filter(e => e.type === 'done');
+      expect(done).toHaveLength(1);
+      expect(done[0]).toMatchObject({ status: 'failed' });
+      expect(done[0].error).toContain('exited with code 7');
+      const pid = Number(fs.readFileSync(childPidFile, 'utf8'));
+      expect(pid).toBeGreaterThan(0);
+      await expectProcessToExit(pid, 1_000);
+    } finally {
+      controller.abort();
+      if (fs.existsSync(childPidFile)) {
+        const pid = Number(fs.readFileSync(childPidFile, 'utf8'));
+        if (pid > 0) { try { process.kill(pid, 'SIGKILL'); } catch { /* fixture already gone */ } }
+      }
+      await run;
+    }
+  }, 8_000);
 
   it('terminates the child process when protocol initialization fails', async () => {
     const events: any[] = [];

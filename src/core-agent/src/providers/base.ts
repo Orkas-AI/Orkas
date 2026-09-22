@@ -19,10 +19,14 @@ export type ToolDefinition = {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /** Optional grammar input; the JSON schema remains the portable contract. */
+  constrainedSampling?: Extract<NonNullable<PiTool["constrainedSampling"]>, { type: "grammar" }>;
 };
 
 /** Parameters for an LLM completion request. */
 export type CompletionParams = {
+  /** Best-effort metadata observer, including attempts recovered by wrappers. Never sent to the API. */
+  onRequestFailure?: (failure: import("./request-diagnostics.js").ProviderRequestFailure) => void;
   model: string;
   messages: Message[];
   systemPrompt?: string;
@@ -56,6 +60,10 @@ export type CompletionParams = {
    * caller's session id so repeated turns on the same conversation hit the
    * same cache bucket. */
   sessionId?: string;
+  /** Opaque, in-memory identity of the active user turn. Transport adapters
+   * may associate private routing state with it; never serialize it into API
+   * payloads or persistence. Reuse for same-turn retries, not a new user turn. */
+  providerTurnContext?: object;
   /** Host-private metadata for provider adapters. Generic providers must not
    * forward this wholesale; adapters may pick specific fields for their own
    * trusted endpoints. */

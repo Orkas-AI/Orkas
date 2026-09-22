@@ -4,7 +4,6 @@ const {
   STORAGE_KEY,
   readCollapsedState,
   initSidebarSections,
-  trackSidebarSectionToggle,
 } = require('../../src/renderer/modules/sidebar-sections.js');
 
 function createClassList() {
@@ -166,19 +165,6 @@ describe('sidebar top-level section collapse', () => {
 
     expect(toggles).toEqual([{ name: 'tasks', collapsed: false }]);
     expect(harness.tasksBody.hidden).toBe(false);
-  });
-
-  it('tracks the resulting open or close state with a bounded section name', () => {
-    const calls: unknown[][] = [];
-    const monitor = { click: (...args: unknown[]) => calls.push(args) };
-
-    trackSidebarSectionToggle({ name: 'projects', collapsed: true }, monitor);
-    trackSidebarSectionToggle({ name: 'tasks', collapsed: false }, monitor);
-
-    expect(calls).toEqual([
-      ['sidebar_section_toggle', { section: 'projects', control_state: 'close' }],
-      ['sidebar_section_toggle', { section: 'tasks', control_state: 'open' }],
-    ]);
   });
 
   it('treats corrupt or non-boolean stored values as expanded', () => {

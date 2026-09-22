@@ -14,26 +14,16 @@ const PROJECT_LIBRARY_INTERNAL_DRAG_TYPE = 'application/x-project-library-path';
 // Keep DOM drag uploads aligned with the native project-file picker and the
 // main-process allow-list. Project Libraries additionally support video files.
 const PROJECT_LIBRARY_ALLOWED_EXTS = [
-  '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt', '.json', '.yaml', '.yml', '.log',
   '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
   '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
   '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
   '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
   '.sql', '.graphql', '.gql',
-  '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm',
+  '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.pptm',
   '.png', '.jpg', '.jpeg', '.webp', '.gif',
   '.mp4', '.webm', '.mov', '.m4v', '.ogv',
 ];
-
-function _projectTrackClick(action, data) {
-  void action;
-  void data;
-}
-
-function _projectTrackEvent(action, data) {
-  void action;
-  void data;
-}
 
 function _projectLogFailure(action, data) {
   _projectDetailLog.warn('project detail operation failed', { action, ...(data || {}) });
@@ -473,7 +463,6 @@ function _bindProjectAutoAddBtn() {
   btn.dataset.bound = '1';
   btn.addEventListener('click', () => {
     if (!_projectDetailPid || typeof openAutoTaskDialog !== 'function') return;
-    _projectTrackClick('project_auto_task_open', {});
     openAutoTaskDialog({
       projectId: _projectDetailPid,
       onSaved: () => {
@@ -486,6 +475,11 @@ function _bindProjectAutoAddBtn() {
 // ── Project instructions (user-authored ORKAS.md) ─────────────────────────
 // The user's own rules for this project — injected into every conversation
 // in the project. User-owned: saved only from here, agents just read it.
+//
+// The rail reads: it shows the last saved rules as copy. Editing happens in
+// a dialog, so a draft is never mistaken for what conversations actually get.
+
+let _projectInstructionsStatusTimer = 0;
 
 function _renderProjectInstructions() {
   const input = document.getElementById('project-instructions-input');
@@ -499,7 +493,75 @@ function _renderProjectInstructions() {
   // Instructions failed to load (e.g. legacy main) → disable rather than
   // let a save blank out content we never saw.
   input.disabled = !meta;
+  _renderProjectInstructionsRead();
   _updateProjectInstructionsFoot();
+}
+
+/** Mirror the saved rules into the rail. Reads `savedValue`, never the live
+ *  textarea, so an open draft cannot leak into the read view. */
+function _renderProjectInstructionsRead() {
+  const input = document.getElementById('project-instructions-input');
+  const readEl = document.getElementById('project-instructions-read');
+  const emptyEl = document.getElementById('project-instructions-empty');
+  const headEl = document.querySelector('.project-side-instructions-panel .project-context-section-head');
+  const editBtn = document.getElementById('project-instructions-edit-btn');
+  const setupBtn = document.getElementById('project-instructions-setup-btn');
+  if (!readEl) return;
+  const saved = String(input?.dataset.savedValue || '');
+  const hasContent = !!saved.trim();
+  readEl.textContent = saved;
+  readEl.hidden = !hasContent;
+  if (emptyEl) emptyEl.hidden = hasContent;
+  // With no rules yet the empty state owns the call to action, so the
+  // "rules in effect" heading and its Edit button step aside.
+  if (headEl) headEl.hidden = !hasContent;
+  const locked = !input || input.disabled;
+  if (editBtn) editBtn.disabled = locked;
+  if (setupBtn) setupBtn.disabled = locked;
+}
+
+function _setProjectInstructionsStatus(text) {
+  const el = document.getElementById('project-instructions-status');
+  if (!el) return;
+  el.textContent = text || '';
+  clearTimeout(_projectInstructionsStatusTimer);
+  if (text) _projectInstructionsStatusTimer = setTimeout(() => { el.textContent = ''; }, 2400);
+}
+
+function _openProjectInstructionsEditor() {
+  const modal = document.getElementById('project-instructions-modal');
+  const input = document.getElementById('project-instructions-input');
+  if (!modal || !input || input.disabled) return;
+  input.value = input.dataset.savedValue || '';
+  _setProjectInstructionsStatus('');
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  _updateProjectInstructionsFoot();
+  input.focus();
+  const end = input.value.length;
+  input.setSelectionRange(end, end);
+}
+
+/** Close the editor. An unsaved draft asks first; `force` is for the path
+ *  that already persisted the content. */
+async function _closeProjectInstructionsEditor({ force = false } = {}) {
+  const modal = document.getElementById('project-instructions-modal');
+  const input = document.getElementById('project-instructions-input');
+  if (!modal || !modal.classList.contains('open')) return;
+  const saved = input ? (input.dataset.savedValue || '') : '';
+  const dirty = !!input && !input.disabled && input.value !== saved;
+  if (!force && dirty && typeof uiConfirm === 'function') {
+    const ok = await uiConfirm(t('project.instructions.discard_confirm'));
+    if (!ok) return;
+  }
+  if (input) input.value = saved;
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+  _updateProjectInstructionsFoot();
+  const returnTo = saved.trim()
+    ? document.getElementById('project-instructions-edit-btn')
+    : document.getElementById('project-instructions-setup-btn');
+  returnTo?.focus();
 }
 
 function _updateProjectInstructionsFoot() {
@@ -524,6 +586,30 @@ function _bindProjectInstructions() {
   if (!input || input.dataset.bound === '1') return;
   input.dataset.bound = '1';
   input.addEventListener('input', _updateProjectInstructionsFoot);
+  input.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey)) return;
+    if (saveBtn?.disabled) return;
+    e.preventDefault();
+    saveBtn?.click();
+  });
+  document.getElementById('project-instructions-edit-btn')?.addEventListener('click', _openProjectInstructionsEditor);
+  document.getElementById('project-instructions-setup-btn')?.addEventListener('click', _openProjectInstructionsEditor);
+  document.getElementById('project-instructions-cancel-btn')?.addEventListener('click', () => {
+    _closeProjectInstructionsEditor();
+  });
+  document.getElementById('project-instructions-close-btn')?.addEventListener('click', () => {
+    _closeProjectInstructionsEditor();
+  });
+  document.getElementById('project-instructions-modal')?.addEventListener('mousedown', (e) => {
+    if (e.target === e.currentTarget) _closeProjectInstructionsEditor();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229 || e.key !== 'Escape') return;
+    if (!document.getElementById('project-instructions-modal')?.classList.contains('open')) return;
+    e.preventDefault();
+    _closeProjectInstructionsEditor();
+  });
   saveBtn?.addEventListener('click', async () => {
     if (!_projectDetailPid || input.disabled) return;
     const projectId = _projectDetailPid;
@@ -534,37 +620,23 @@ function _bindProjectInstructions() {
       const res = await window.orkas.invoke('projects.instructions.set', { projectId, content });
       if (!res?.ok) {
         const failure = _projectDetailFailure(res, 'instructions_save_failed');
-        _projectTrackEvent('project_instructions_update_result', {
-          result: 'failure',
-          source: 'detail',
-          duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-          ...failure,
-        });
         _projectLogFailure('project_instructions_update', { source: 'detail', ...failure });
         if (typeof uiAlert === 'function') uiAlert(t('project.instructions.save_failed'));
         _updateProjectInstructionsFoot();
         return;
       }
       // The user may switch projects while this save is in flight. The
-      // mutation still belongs to the captured project and its telemetry is
+      // mutation still belongs to the captured project and its result is
       // valid, but the shared detail input may already render another one.
       if (input.dataset.projectId === projectId) input.dataset.savedValue = content;
       if (projectId === _projectDetailPid && _projectDetailMeta?.instructions) {
         _projectDetailMeta.instructions.content = content;
       }
-      _projectTrackEvent('project_instructions_update_result', {
-        result: 'success',
-        source: 'detail',
-        duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-      });
+      _renderProjectInstructionsRead();
+      _closeProjectInstructionsEditor({ force: true });
+      _setProjectInstructionsStatus(t('project.instructions.saved'));
     } catch (err) {
       const failure = _projectDetailFailure(err, 'instructions_save_exception');
-      _projectTrackEvent('project_instructions_update_result', {
-        result: 'failure',
-        source: 'detail',
-        duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-        ...failure,
-      });
       _projectLogFailure('project_instructions_update', { source: 'detail', ...failure });
       _projectDetailLog.warn('save project instructions failed', err);
       if (typeof uiAlert === 'function') uiAlert(t('project.instructions.save_failed'));
@@ -746,14 +818,14 @@ function _renderProjectMemoryList() {
 
     const actions = document.createElement('div');
     actions.className = 'project-memory-item-actions';
+    // Written-out verbs, not glyphs: these two sit under body copy the user
+    // is reading, and a pencil next to a paragraph reads as decoration.
     const edit = document.createElement('button');
     edit.type = 'button';
     edit.className = 'project-memory-item-action';
     edit.dataset.action = 'project-memory-edit';
     edit.dataset.memoryIndex = String(index);
-    edit.title = t('project.memory.edit');
-    edit.setAttribute('aria-label', edit.title);
-    edit.innerHTML = typeof uiIconHtml === 'function' ? uiIconHtml('edit-pencil') : '✎';
+    edit.textContent = t('project.memory.edit');
     actions.appendChild(edit);
 
     const remove = document.createElement('button');
@@ -761,9 +833,7 @@ function _renderProjectMemoryList() {
     remove.className = 'project-memory-item-action is-danger';
     remove.dataset.action = 'project-memory-delete';
     remove.dataset.memoryIndex = String(index);
-    remove.title = t('project.memory.delete');
-    remove.setAttribute('aria-label', remove.title);
-    remove.innerHTML = typeof uiIconHtml === 'function' ? uiIconHtml('x') : '×';
+    remove.textContent = t('project.memory.delete');
     actions.appendChild(remove);
     row.appendChild(actions);
 
@@ -773,6 +843,10 @@ function _renderProjectMemoryList() {
   listEl.style.display = shown ? '' : 'none';
   if (countEl) countEl.textContent = shown > 0 ? String(shown) : '';
   if (emptyEl) emptyEl.style.display = shown ? 'none' : '';
+  // Guidance until there is something saved, heading after — the same swap
+  // the goals-and-rules panel makes.
+  const headEl = document.getElementById('project-memory-section-head');
+  if (headEl) headEl.hidden = !shown;
 }
 
 function _updateProjectMemoryEditor() {
@@ -894,27 +968,23 @@ async function _saveProjectMemoryEditor() {
     isEdit ? 'memory.replace' : 'memory.add',
     isEdit ? { oldText, content } : { content },
   );
-  _projectTrackEvent('memory_entry_save_result', {
-    result: outcome.ok ? 'success' : 'failure',
-    target: 'project',
-    mode: isEdit ? 'edit' : 'add',
-    duration_ms: Math.max(0, Date.now() - startedAt),
-    ...(outcome.ok ? {
-      chars: content.length,
-      char_count: content.length,
-    } : outcome.failure),
-  });
   if (outcome.ok) _closeProjectMemoryEditor();
 }
 
 function _bindProjectMemory() {
-  const add = document.getElementById('project-memory-add-btn');
+  // Two ways in, one action: the header button once entries exist, and the
+  // empty state's own call to action before that.
+  const addButtons = [
+    document.getElementById('project-memory-add-btn'),
+    document.getElementById('project-memory-add-empty-btn'),
+  ];
   const input = document.getElementById('project-memory-editor-input');
   const cancel = document.getElementById('project-memory-editor-cancel');
   const save = document.getElementById('project-memory-editor-save');
   const list = document.getElementById('project-memory-list');
 
-  if (add && add.dataset.bound !== '1') {
+  for (const add of addButtons) {
+    if (!add || add.dataset.bound === '1') continue;
     add.dataset.bound = '1';
     add.addEventListener('click', () => _openProjectMemoryEditor('add'));
   }
@@ -963,12 +1033,6 @@ function _bindProjectMemory() {
       if (!confirmed) return;
       const startedAt = Date.now();
       const outcome = await _mutateProjectMemory('memory.remove', { oldText: text });
-      _projectTrackEvent('memory_entry_delete_result', {
-        result: outcome.ok ? 'success' : 'failure',
-        target: 'project',
-        duration_ms: Math.max(0, Date.now() - startedAt),
-        ...(!outcome.ok ? outcome.failure : {}),
-      });
       if (outcome.ok && _projectMemoryEditor?.oldText === text) _closeProjectMemoryEditor();
     });
   }
@@ -1149,12 +1213,12 @@ function _renderTodoCard(task, context) {
   statusSel.innerHTML = '<span class="project-todo-status-dot"></span>'
     + `<span class="project-todo-status-label">${escapeHtml(t('project.todo.status_' + status))}</span>`
     + (typeof uiIconHtml === 'function' ? uiIconHtml('chevron-down', 'project-todo-status-caret') : '');
-  const titleEl = document.createElement('button');
-  titleEl.type = 'button';
-  titleEl.dataset.action = 'todo-edit';
-  titleEl.className = 'project-todo-title';
-  titleEl.textContent = task.title || '';
-  row.appendChild(titleEl);
+  const content = document.createElement('button');
+  content.type = 'button';
+  content.dataset.action = 'todo-edit';
+  content.className = 'project-todo-title';
+  content.textContent = task.content || '';
+  row.appendChild(content);
   const menuBtn = document.createElement('button');
   menuBtn.type = 'button';
   menuBtn.className = 'project-todo-menu';
@@ -1166,12 +1230,6 @@ function _renderTodoCard(task, context) {
     ? uiIconHtml('more-horizontal', 'project-todo-menu-icon')
     : '…';
   row.appendChild(menuBtn);
-  if (task.detail) {
-    const detail = document.createElement('p');
-    detail.className = 'todo-card-detail';
-    detail.textContent = task.detail;
-    row.appendChild(detail);
-  }
   row.dataset.pid = context.pid || '';
   row.dataset.todoScope = context.global ? 'global' : 'project';
   const metaRow = context.showProject ? document.createElement('div') : null;
@@ -1204,8 +1262,7 @@ function _renderTodoCard(task, context) {
     appendMeta(att);
   }
 
-  // A task keeps the first conversation that created/worked it. Expose that
-  // durable back-link directly on every board that renders the task.
+  // Open the latest successfully dispatched execution on every todo board.
   const conversationId = typeof task.origin_cid === 'string' ? task.origin_cid.trim() : '';
   if (conversationId) {
     const conversation = document.createElement('button');
@@ -1279,7 +1336,7 @@ function _updateProjectTodoEditor() {
   if (!input) return;
   if (counter) counter.textContent = `${input.value.length}/${input.maxLength}`;
   const busy = _projectTodoMutating || _todoEditorAttachments.some((a) => a.status === 'uploading');
-  if (save) save.disabled = busy || !input.value.trim();
+  if (save) save.disabled = busy || !input.value.trim() || input.value.length > input.maxLength;
   const cancel = document.getElementById('project-todo-cancel');
   if (cancel) cancel.disabled = busy;
   const project = document.getElementById('project-todo-project');
@@ -1469,7 +1526,7 @@ async function _removeTodoEditorAttachment(name) {
 }
 
 // The shared dialog doubles as the create and edit surface. A task
-// argument switches it to edit mode (pre-filled title, Save updates that task);
+// argument switches it to edit mode (pre-filled content, Save updates that task);
 // no argument is create mode. _todoEditorTaskId is the current edit target.
 function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 'todo') {
   const editor = document.getElementById('project-todo-add');
@@ -1488,7 +1545,7 @@ function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 
   _ensureTodoEditorSelects();
   _todoEditorOwnerChanged = false;
   void _loadTodoEditorAgents(task);
-  input.value = _todoEditorTaskId && task ? (task.title || '') : '';
+  input.value = _todoEditorTaskId && task ? (task.content || '') : '';
   const existing = (_todoEditorTaskId && task && Array.isArray(task.attachments)) ? task.attachments : [];
   _setTodoEditorAttachments(existing.map((name) => ({ name, displayName: name, kind: _todoAttachKind(name), status: 'ready' })));
   if (_todoEditorStatusSelect) {
@@ -1527,7 +1584,7 @@ function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 
   _updateProjectTodoEditor();
   setTimeout(() => {
     input.focus();
-    // Edit: select the whole title for quick replace. Create: caret at end.
+    // Edit: select the whole content for quick replace. Create: caret at end.
     if (_todoEditorTaskId) input.setSelectionRange(0, input.value.length);
     else { const end = input.value.length; input.setSelectionRange(end, end); }
   }, 0);
@@ -1599,8 +1656,8 @@ async function _todoMutate(fn, pid = _projectDetailPid) {
 
 async function _saveProjectTodoEditor() {
   const input = document.getElementById('project-todo-input');
-  const title = String(input?.value || '').trim();
-  if (!title || _todoEditorPid === null || _projectTodoMutating || _todoEditorAttachments.some((a) => a.status === 'uploading')) return;
+  const content = String(input?.value || '').trim();
+  if (!content || _todoEditorPid === null || _projectTodoMutating || _todoEditorAttachments.some((a) => a.status === 'uploading')) return;
   const pid = _todoEditorPid;
   const generation = _todoEditorGeneration;
   const status = _todoEditorStatusSelect?.getValue?.() || 'todo';
@@ -1618,23 +1675,17 @@ async function _saveProjectTodoEditor() {
     ? window.orkas.invoke('projects.tasks.update', {
       projectId: pid,
       taskId,
-      title,
+      content,
       ...(status !== _todoEditorInitial?.status ? { status } : {}),
       ...owner,
     })
     : window.orkas.invoke('projects.tasks.create', {
       projectId: pid,
-      title,
+      content,
       status,
       ...owner,
       ...(_todoEditorTid ? { taskId: _todoEditorTid } : {}),
     })), pid);
-  _projectTrackEvent('project_todo_action_result', {
-    result: outcome.ok ? 'success' : 'failure',
-    action: taskId ? 'edit' : 'create',
-    duration_ms: Math.max(0, Date.now() - startedAt),
-    ...(!outcome.ok ? outcome.failure : {}),
-  });
   if (!outcome.ok) {
     _projectLogFailure('project_todo_action', { action: taskId ? 'edit' : 'create', ...outcome.failure });
   } else if (generation === _todoEditorGeneration) {
@@ -1670,13 +1721,6 @@ async function _setTodoStatus(tid, status, context = _projectTodoContext()) {
     taskId: tid,
     status,
   }), context.pid);
-  _projectTrackEvent('project_todo_toggle_result', {
-    result: outcome.ok ? 'success' : 'failure',
-    from_status: fromStatus,
-    to_status: status,
-    duration_ms: Date.now() - startedAt,
-    ...(!outcome.ok ? outcome.failure : {}),
-  });
   if (!outcome.ok) {
     _projectLogFailure('project_todo_toggle', {
       from_status: fromStatus, to_status: status, ...outcome.failure,
@@ -1711,12 +1755,6 @@ async function _assignTodoAgent(tid, agent, context = _projectTodoContext()) {
     owner_agent: agent ? String(agent.name || '') : '',
     owner_agent_id: agent ? String(agent.agent_id || '') : '',
   }), context.pid);
-  _projectTrackEvent('project_todo_assign_result', {
-    result: outcome.ok ? 'success' : 'failure',
-    action: agent ? 'assign' : 'clear',
-    duration_ms: Date.now() - startedAt,
-    ...(!outcome.ok ? outcome.failure : {}),
-  });
   if (!outcome.ok) {
     _projectLogFailure('project_todo_assign', {
       action: agent ? 'assign' : 'clear', ...outcome.failure,
@@ -1753,10 +1791,6 @@ async function _runTodoTask(tid, context = _projectTodoContext()) {
   } finally {
     _projectTodoRunning = false;
   }
-  _projectTrackEvent('project_todo_run_result', {
-    result: ok ? 'success' : 'failure',
-    duration_ms: Date.now() - startedAt,
-  });
   if (!ok) {
     _projectLogFailure('project_todo_run', { error_type: 'run_failed' });
     if (typeof uiAlert === 'function') uiAlert(t('project.todo.run_failed'));
@@ -1989,9 +2023,6 @@ function _bindProjectDriver() {
     } finally {
       _projectDriverMutating = false;
     }
-    _projectTrackEvent('project_driver_toggle_result', {
-      result: ok ? 'success' : 'failure', enabled: next, duration_ms: Date.now() - startedAt,
-    });
     if (!ok) _projectLogFailure('project_driver_toggle', { enabled: next, error_type: 'set_failed' });
   });
 }
@@ -2139,9 +2170,6 @@ async function _removeProjectAgent(agentId) {
   if (!_projectDetailPid || !agentId) return;
   const projectId = _projectDetailPid;
   const startedAt = performance.now();
-  // One terminal result at the binding write boundary (analytics contract);
-  // the presentation refresh that follows is not part of the outcome.
-  _projectTrackClick('project_binding_remove', { binding_kind: 'agent' });
   let removed = false;
   try {
     const res = await window.orkas.invoke('projects.bindings.remove', {
@@ -2151,19 +2179,8 @@ async function _removeProjectAgent(agentId) {
     });
     if (!res?.ok) throw res || new Error('remove_failed');
     removed = true;
-    _projectTrackEvent('project_binding_remove_result', {
-      binding_kind: 'agent',
-      result: 'success',
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
   } catch (err) {
     const failure = _projectDetailFailure(err, 'binding_remove_failed');
-    _projectTrackEvent('project_binding_remove_result', {
-      binding_kind: 'agent',
-      result: 'failure',
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_binding_remove', { binding_kind: 'agent', ...failure });
     _projectDetailLog.warn('remove project agent failed', err);
     return;
@@ -2251,11 +2268,25 @@ function _projectLibraryEntryPaths(nodes, out = []) {
   return out;
 }
 
+// Comparable timestamp for ordering. Same seconds-or-milliseconds tolerance as
+// `_projectFormatMtime`; entries without a usable mtime rank last within their group.
+function _projectMtimeRank(mtime) {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n > 100000000000 ? n : n * 1000;
+}
+
+// Recency-first, matching the global Library tree: a deliverable saved or
+// replaced just now sits at the top instead of sinking to wherever its name
+// sorts. Folders still lead, ordered by their own mtime; name breaks ties.
 function _sortProjectLibraryNodes(nodes) {
   return (nodes || []).slice().sort((a, b) => {
     const at = a?.type === 'dir';
     const bt = b?.type === 'dir';
     if (at !== bt) return at ? -1 : 1;
+    const aTime = _projectMtimeRank(a?.mtime);
+    const bTime = _projectMtimeRank(b?.mtime);
+    if (aTime !== bTime) return bTime - aTime;
     const an = a?.name || _projectBasename(_projectLibraryRel(a));
     const bn = b?.name || _projectBasename(_projectLibraryRel(b));
     return an.localeCompare(bn, undefined, { sensitivity: 'base', numeric: true });
@@ -2271,6 +2302,7 @@ function _buildProjectKbStatusMap(files, statusRows) {
       status: row.status,
       chunks: row.chunks,
       error: row.error,
+      errorCode: row.errorCode,
       kind: row.kind,
     };
   }
@@ -2354,6 +2386,9 @@ function _projectKbStatusChipHtml(name) {
     return `<span class="ctx-kb-chip is-processing" title="${escapeHtml(label)}"><span class="ctx-kb-spinner"></span></span>`;
   }
   if (st.status === 'failed') {
+    if (st.errorCode === 'E_LIBRARY_FILE_TOO_LARGE' && st.error) {
+      return `<span class="ctx-kb-chip is-failed" title="${escapeHtml(st.error)}">!</span>`;
+    }
     return `<span class="ctx-kb-chip is-failed" data-action="project-file-reprocess" title="${escapeHtml(t('contexts.kb.failed'))}">!</span>`;
   }
   return '';
@@ -2763,7 +2798,6 @@ async function _openProjectFile(name, options = {}) {
   const row = _findProjectFileRow(name);
   const kind = row?.dataset?.projectFileKind || '';
   if (options.trackIntent !== false) {
-    _projectTrackClick('project_file_open', { file_kind: kind || 'other' });
   }
   _projectLibraryActiveName = name;
   _markProjectLibraryActive();
@@ -3027,7 +3061,6 @@ async function _reprocessProjectFile(name) {
   if (!_projectDetailPid || !name) return;
   const projectId = _projectDetailPid;
   const startedAt = performance.now();
-  _projectTrackClick('project_file_reprocess', {});
   try {
     _projectKbStatusByName[name] = {
       ...(_projectKbStatusByName[name] || {}),
@@ -3040,17 +3073,8 @@ async function _reprocessProjectFile(name) {
       name,
     });
     if (!res?.ok) throw res || new Error('reprocess_failed');
-    _projectTrackEvent('project_file_reprocess_result', {
-      result: 'success',
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
   } catch (err) {
     const failure = _projectDetailFailure(err, 'reprocess_failed');
-    _projectTrackEvent('project_file_reprocess_result', {
-      result: 'failure',
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_reprocess', failure);
     _projectDetailLog.warn('reprocess project file failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('project.files.reprocess_failed'));
@@ -3069,9 +3093,6 @@ async function _deleteProjectFile(name) {
     : t('contexts.file.del_confirm', { name: _projectBasename(name) });
   if (!(await uiConfirm(prompt))) return;
   const startedAt = performance.now();
-  _projectTrackClick('project_file_delete', {
-    file_kind: kind || 'other',
-  });
   let res;
   try {
     res = await window.orkas.invoke('projects.files.delete', {
@@ -3081,23 +3102,11 @@ async function _deleteProjectFile(name) {
     if (!res?.ok) throw res || new Error('delete_failed');
   } catch (err) {
     const failure = _projectDetailFailure(err, 'delete_failed');
-    _projectTrackEvent('project_file_delete_result', {
-      result: 'failure',
-      file_kind: kind || 'other',
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_delete', { file_kind: kind || 'other', ...failure });
     _projectDetailLog.warn('delete project file failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('project.files.delete_failed'));
     return;
   }
-
-  _projectTrackEvent('project_file_delete_result', {
-    result: 'success',
-    file_kind: kind || 'other',
-    duration_ms: Math.round(performance.now() - startedAt),
-  });
   try {
     if (_projectLibraryActiveName === name || _projectLibraryActiveName.startsWith(`${name}/`)) {
       for (const key of Array.from(_projectLibraryDrafts.keys())) {
@@ -3371,6 +3380,19 @@ async function _runProjectLibraryRootAction(action) {
 async function _openProjectLibraryTransfer(paths, entryPoint) {
   if (!_projectDetailPid || !window.LibraryTransfer?.open || !paths?.length) return;
   const sourceProjectId = _projectDetailPid;
+  const owner = typeof currentUserId === 'string' ? currentUserId : '';
+  if (!await window.LibraryTransfer.confirmUnsaved({
+    paths,
+    drafts: _projectLibraryDrafts,
+    getActivePath: () => _projectLibraryActiveName,
+    getController: () => _projectLibraryMveController,
+    openFile: async (name) => {
+      _projectLibraryActiveName = name;
+      await _showProjectTextViewer(name);
+    },
+    isCurrent: () => _projectDetailPid === sourceProjectId
+      && (typeof currentUserId === 'string' ? currentUserId : '') === owner,
+  })) return;
   await window.LibraryTransfer.open({
     source: { scope: 'project', projectId: sourceProjectId },
     paths,
@@ -3406,9 +3428,6 @@ async function _createProjectTextFile(parentDir = '') {
   const stem = t('contexts.new.untitled_stem');
   const fullPath = _projectJoinPath(parentDir, `${stem}.md`);
   const startedAt = performance.now();
-  _projectTrackClick('project_file_create_text', {
-    has_target_dir: !!parentDir,
-  });
   let createdName = fullPath;
   try {
     const res = await window.orkas.invoke('projects.files.createText', {
@@ -3419,23 +3438,11 @@ async function _createProjectTextFile(parentDir = '') {
     createdName = res.info?.relPath || res.info?.name || fullPath;
   } catch (err) {
     const failure = _projectDetailFailure(err, 'create_text_failed');
-    _projectTrackEvent('project_file_create_text_result', {
-      result: 'failure',
-      has_target_dir: !!parentDir,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_create_text', { has_target_dir: !!parentDir, ...failure });
     _projectDetailLog.warn('create project text failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('contexts.file.create_failed'));
     return;
   }
-
-  _projectTrackEvent('project_file_create_text_result', {
-    result: 'success',
-    has_target_dir: !!parentDir,
-    duration_ms: Math.round(performance.now() - startedAt),
-  });
   try {
     if (parentDir) _projectLibraryExpanded.add(parentDir);
     _projectLibraryActiveName = createdName;
@@ -3458,9 +3465,6 @@ async function _createProjectDir(parentDir = '') {
   }
   const rel = _projectJoinPath(parentDir, nameRaw);
   const startedAt = performance.now();
-  _projectTrackClick('project_folder_create', {
-    has_target_dir: !!parentDir,
-  });
   let createdPath = rel;
   try {
     const res = await window.orkas.invoke('projects.files.mkdir', {
@@ -3471,23 +3475,11 @@ async function _createProjectDir(parentDir = '') {
     createdPath = res.path || rel;
   } catch (err) {
     const failure = _projectDetailFailure(err, 'create_folder_failed');
-    _projectTrackEvent('project_folder_create_result', {
-      result: 'failure',
-      has_target_dir: !!parentDir,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_folder_create', { has_target_dir: !!parentDir, ...failure });
     _projectDetailLog.warn('create project folder failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('contexts.dir.create_failed'));
     return;
   }
-
-  _projectTrackEvent('project_folder_create_result', {
-    result: 'success',
-    has_target_dir: !!parentDir,
-    duration_ms: Math.round(performance.now() - startedAt),
-  });
   try {
     if (parentDir) _projectLibraryExpanded.add(parentDir);
     _projectLibraryExpanded.add(createdPath);
@@ -3556,13 +3548,6 @@ async function _handleProjectLibraryMove(srcName, targetDir) {
   const next = _projectJoinPath(targetDir, base);
   if (next === srcName) return;
   if (targetDir === srcName || targetDir.startsWith(`${srcName}/`)) {
-    _projectTrackEvent('project_file_move_result', {
-      result: 'blocked',
-      entry_type: 'dir',
-      has_target_dir: !!targetDir,
-      error_code: 'invalid_target',
-      error_type: 'validation',
-    });
     if (typeof uiAlert === 'function') await uiAlert(t('contexts.dnd.invalid_self'));
     return;
   }
@@ -3580,13 +3565,6 @@ async function _handleProjectLibraryMove(srcName, targetDir) {
     actual = res.name || next;
   } catch (err) {
     const failure = _projectDetailFailure(err, 'move_failed');
-    _projectTrackEvent('project_file_move_result', {
-      result: 'failure',
-      entry_type: entryType,
-      has_target_dir: !!targetDir,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_move', {
       entry_type: entryType,
       has_target_dir: !!targetDir,
@@ -3601,13 +3579,6 @@ async function _handleProjectLibraryMove(srcName, targetDir) {
     }
     return;
   }
-
-  _projectTrackEvent('project_file_move_result', {
-    result: 'success',
-    entry_type: entryType,
-    has_target_dir: !!targetDir,
-    duration_ms: Math.round(performance.now() - startedAt),
-  });
   try {
     _applyProjectLibraryPathChange(srcName, actual, targetDir);
     if (projectId === _projectDetailPid) await loadProjectDetail(projectId);
@@ -3636,9 +3607,6 @@ async function _renameProjectFile(name) {
   const kind = row?.dataset?.projectFileKind || '';
   const startedAt = performance.now();
   let failureKey = 'contexts.entry.rename_failed';
-  _projectTrackClick('project_file_rename', {
-    file_kind: kind || 'other',
-  });
   let actual = next;
   try {
     const res = await window.orkas.invoke('projects.files.rename', {
@@ -3653,23 +3621,11 @@ async function _renameProjectFile(name) {
     actual = res.name || next;
   } catch (err) {
     const failure = _projectDetailFailure(err, 'rename_file_failed');
-    _projectTrackEvent('project_file_rename_result', {
-      result: 'failure',
-      file_kind: kind || 'other',
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_rename', { file_kind: kind || 'other', ...failure });
     _projectDetailLog.warn('rename project file failed', err);
     if (typeof uiAlert === 'function') uiAlert(t(failureKey));
     return;
   }
-
-  _projectTrackEvent('project_file_rename_result', {
-    result: 'success',
-    file_kind: kind || 'other',
-    duration_ms: Math.round(performance.now() - startedAt),
-  });
   try {
     _applyProjectLibraryPathChange(name, actual, parentDir);
     if (projectId === _projectDetailPid) await loadProjectDetail(projectId);
@@ -3707,6 +3663,7 @@ function _applyProjectKbEvent(ev) {
       status: ev.status,
       ...(ev.chunks != null ? { chunks: ev.chunks } : {}),
       ...(ev.error ? { error: ev.error } : {}),
+      ...(ev.errorCode ? { errorCode: ev.errorCode } : {}),
       ...(ev.kind ? { kind: ev.kind } : {}),
     };
   }
@@ -3790,7 +3747,6 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
   if (targetDir) _projectLibraryExpanded.add(targetDir);
   const payload = _projectFileUploadPayload(files, source, targetDir);
   const startedAt = performance.now();
-  _projectTrackClick('project_file_upload', payload);
   _setProjectFilesStatus(t('project.files.uploading'));
   const hiddenRejected = files
     .filter((file) => _projectUploadHasHiddenPath(file))
@@ -3845,15 +3801,6 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
       error_type: rejectedCount && !failed.length ? 'validation' : 'operation',
     }
     : {};
-  _projectTrackEvent('project_file_upload_result', {
-    ...payload,
-    result: unsuccessfulCount ? (unsuccessfulCount < files.length ? 'partial_failure' : 'failure') : 'success',
-    uploaded_count: Math.max(0, uploadable.length - failed.length),
-    failed_count: unsuccessfulCount,
-    rejected_count: rejectedCount,
-    duration_ms: Math.round(performance.now() - startedAt),
-    ...uploadFailure,
-  });
   if (unsuccessfulCount) {
     _projectLogFailure('project_file_upload', {
       source,
@@ -3889,7 +3836,6 @@ async function _uploadProjectFilesNative(targetDir = '') {
   if (targetDir) _projectLibraryExpanded.add(targetDir);
   const payload = { source: 'picker', has_target_dir: !!targetDir };
   const startedAt = performance.now();
-  _projectTrackClick('project_file_upload', payload);
   _setProjectFilesStatus(t('project.files.uploading'));
   let data;
   try {
@@ -3900,14 +3846,6 @@ async function _uploadProjectFilesNative(targetDir = '') {
   } catch (err) {
     _setProjectFilesStatus('');
     const failure = _projectDetailFailure(err, 'picker_failed');
-    _projectTrackEvent('project_file_upload_result', {
-      ...payload,
-      result: 'failure',
-      uploaded_count: 0,
-      failed_count: 1,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_upload', { source: 'picker', ...failure });
     if (typeof uiAlert === 'function') {
       await uiAlert(t('contexts.upload_picker_failed'));
@@ -3917,42 +3855,16 @@ async function _uploadProjectFilesNative(targetDir = '') {
   _setProjectFilesStatus('');
   if (!data?.ok) {
     const failure = _projectDetailFailure(data, 'picker_failed');
-    _projectTrackEvent('project_file_upload_result', {
-      ...payload,
-      result: 'failure',
-      uploaded_count: 0,
-      failed_count: 1,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_upload', { source: 'picker', ...failure });
     if (typeof uiAlert === 'function') await uiAlert(t('contexts.upload_picker_failed'));
     return;
   }
   if (data.cancelled) {
-    _projectTrackEvent('project_file_upload_result', {
-      ...payload,
-      result: 'cancelled',
-      uploaded_count: 0,
-      failed_count: 0,
-      file_count: 0,
-      duration_ms: Math.round(performance.now() - startedAt),
-      error_code: 'picker_cancelled',
-    });
     return;
   }
   const rows = Array.isArray(data && data.files) ? data.files : [];
   const failed = rows.filter((r) => !r || r.ok === false);
   const pickerFailure = failed.length ? { error_code: 'upload_failed', error_type: 'operation' } : {};
-  _projectTrackEvent('project_file_upload_result', {
-    ...payload,
-    result: failed.length ? (failed.length < rows.length ? 'partial_failure' : 'failure') : 'success',
-    uploaded_count: Math.max(0, rows.length - failed.length),
-    failed_count: failed.length,
-    file_count: rows.length,
-    duration_ms: Math.round(performance.now() - startedAt),
-    ...pickerFailure,
-  });
   if (failed.length) {
     _projectLogFailure('project_file_upload', {
       source: 'picker',
@@ -3998,39 +3910,7 @@ async function _submitProjectChat() {
     ? _chatAttachList(draftCid)
     : [];
   let intendedAttachmentCount = draftItems.filter((item) => item && item.status !== 'error').length;
-  const modelTelemetry = typeof _chatModelTelemetryContext === 'function'
-    ? _chatModelTelemetryContext()
-    : {};
-  const sendAttemptStartedAt = performance.now();
-  const commonSendPayload = {
-    source_view: 'project',
-    content_length: requestText.length,
-    recipient_type: recipientType,
-    has_skill: pendingUseSelections.some((sel) => sel.kind === 'skill'),
-    has_connector: pendingUseSelections.some((sel) => sel.kind === 'connector'),
-    attachment_count: intendedAttachmentCount,
-    ...modelTelemetry,
-  };
-  _projectTrackClick('project_chat_send', {
-    ...commonSendPayload,
-  });
-  _projectTrackClick('chat_send', commonSendPayload);
   if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) {
-    const resultPayload = {
-      result: 'failure',
-      source_view: 'project',
-      content_length: requestText.length,
-      attachment_count: intendedAttachmentCount,
-      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
-      failure_stage: 'preflight',
-      failure_reason: 'model_not_configured',
-      ...modelTelemetry,
-    };
-    if (typeof _trackChatSendResult === 'function') {
-      _trackChatSendResult('failure', resultPayload);
-    } else {
-      _projectTrackEvent('chat_send_result', resultPayload);
-    }
     return;
   }
   const releaseAttachmentSend = typeof _chatAttachTryBeginSend === 'function'
@@ -4039,21 +3919,6 @@ async function _submitProjectChat() {
       ? null
       : (() => {}));
   if (!releaseAttachmentSend) {
-    const resultPayload = {
-      result: 'failure',
-      source_view: 'project',
-      content_length: requestText.length,
-      attachment_count: intendedAttachmentCount,
-      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
-      failure_stage: 'preflight',
-      failure_reason: 'attachment_uploading',
-      ...modelTelemetry,
-    };
-    if (typeof _trackChatSendResult === 'function') {
-      _trackChatSendResult('failure', resultPayload);
-    } else {
-      _projectTrackEvent('chat_send_result', resultPayload);
-    }
     if (typeof uiAlert === 'function') await uiAlert(t('chat.attach_still_uploading'));
     return;
   }
@@ -4062,21 +3927,6 @@ async function _submitProjectChat() {
     : { ok: true, items: draftItems };
   if (!attachmentSnapshot.ok) {
     releaseAttachmentSend();
-    const resultPayload = {
-      result: 'failure',
-      source_view: 'project',
-      content_length: requestText.length,
-      attachment_count: intendedAttachmentCount,
-      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
-      failure_stage: 'preflight',
-      failure_reason: 'attachment_adopt_failed',
-      ...modelTelemetry,
-    };
-    if (typeof _trackChatSendResult === 'function') {
-      _trackChatSendResult('failure', resultPayload);
-    } else {
-      _projectTrackEvent('chat_send_result', resultPayload);
-    }
     if (typeof uiAlert === 'function') await uiAlert(t('chat.attach_sync_failed'));
     return;
   }
@@ -4123,21 +3973,6 @@ async function _submitProjectChat() {
     }
     createdConversation = conv;
   } catch (err) {
-    const resultPayload = {
-      result: 'failure',
-      source_view: 'project',
-      content_length: requestText.length,
-      attachment_count: intendedAttachmentCount,
-      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
-      failure_stage: 'conversation_create',
-      failure_reason: 'conversation_create_failed',
-      ...modelTelemetry,
-    };
-    if (typeof _trackChatSendResult === 'function') {
-      _trackChatSendResult('failure', resultPayload);
-    } else {
-      _projectTrackEvent('chat_send_result', resultPayload);
-    }
     if (typeof uiAlert === 'function') {
       await uiAlert(t('chat.create_conv_failed_with_reason', { reason: err?.message || err }));
     }
@@ -4193,21 +4028,6 @@ async function _submitProjectChat() {
       _projectDetailLog.warn('discard empty project conversation failed', {
         error_code: 'discard_empty_failed',
       });
-    }
-    const resultPayload = {
-      result: 'failure',
-      source_view: 'project',
-      content_length: requestText.length,
-      attachment_count: intendedAttachmentCount,
-      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
-      failure_stage: 'preflight',
-      failure_reason: 'attachment_adopt_failed',
-      ...modelTelemetry,
-    };
-    if (typeof _trackChatSendResult === 'function') {
-      _trackChatSendResult('failure', resultPayload);
-    } else {
-      _projectTrackEvent('chat_send_result', resultPayload);
     }
     if (typeof uiAlert === 'function') {
       await uiAlert(t('chat.attach_adopt_failed', { reason: adoptionError }));
@@ -4305,11 +4125,6 @@ function _projectBindingSourceHtml(source) {
 async function _openAddPicker() {
   // Dispose any previously-open picker so re-clicks don't stack.
   document.getElementById('project-binding-picker-overlay')?.remove();
-  // `binding_kind` stays on the wire as a constant so the existing PMS
-  // Project funnel keeps reading these rows across the removal.
-  _projectTrackClick('project_binding_picker_open', {
-    binding_kind: 'agent',
-  });
 
   let candidates;
   try {
@@ -4403,19 +4218,11 @@ async function _openAddPicker() {
         const k = row.dataset.kind;
         const projectId = _projectDetailPid;
         const startedAt = performance.now();
-        _projectTrackClick('project_binding_add', {
-          binding_kind: k,
-        });
         try {
           const res = await window.orkas.invoke('projects.bindings.add', {
             projectId, kind: k, id,
           });
           if (!res?.ok) throw res || new Error('add_failed');
-          _projectTrackEvent('project_binding_add_result', {
-            binding_kind: k,
-            result: 'success',
-            duration_ms: Math.round(performance.now() - startedAt),
-          });
           // Drop the picked id from the local candidate set so it
           // disappears from subsequent renders without a server round-trip.
           candidates = candidates.filter((c) => {
@@ -4430,12 +4237,6 @@ async function _openAddPicker() {
           }
         } catch (err) {
           const failure = _projectDetailFailure(err, 'binding_add_failed');
-          _projectTrackEvent('project_binding_add_result', {
-            binding_kind: k,
-            result: 'failure',
-            duration_ms: Math.round(performance.now() - startedAt),
-            ...failure,
-          });
           _projectLogFailure('project_binding_add', { binding_kind: k, ...failure });
           _projectDetailLog.warn('add binding failed', err);
         }
@@ -4493,9 +4294,6 @@ async function _commitRename(newName) {
   let failure = null;
   const startedAt = performance.now();
   _projectRenameCommitInFlight = true;
-  _projectTrackClick('project_rename_submit', {
-    source: 'detail',
-  });
   try {
     const res = await window.orkas.invoke('projects.rename', {
       projectId: _projectDetailPid, name: trimmed,
@@ -4504,11 +4302,6 @@ async function _commitRename(newName) {
       code = (res && res.error) || 'generic';
       failure = _projectDetailFailure(res, 'rename_failed');
     } else {
-      _projectTrackEvent('project_rename_result', {
-        result: 'success',
-        source: 'detail',
-        duration_ms: Math.round(performance.now() - startedAt),
-      });
       _projectDetailMeta.project = res.project;
       if (typeof loadProjects === 'function') loadProjects(true);
       _exitRenameMode();
@@ -4520,12 +4313,6 @@ async function _commitRename(newName) {
     code = (err && err.message) || 'generic';
     failure = _projectDetailFailure(err, 'rename_exception');
   }
-  _projectTrackEvent('project_rename_result', {
-    result: 'failure',
-    source: 'detail',
-    duration_ms: Math.round(performance.now() - startedAt),
-    ...(failure || _projectDetailFailure(null, 'rename_failed')),
-  });
   _projectLogFailure('project_rename', {
     source: 'detail',
     ...(failure || _projectDetailFailure(null, 'rename_failed')),

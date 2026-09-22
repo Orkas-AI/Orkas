@@ -116,6 +116,27 @@ describe('PptMaker built-in agent evaluation', () => {
     expect(planningContract).toMatch(/QUICK[^.]*?(?:never skip|not skip|cannot skip)/i);
   });
 
+  it('makes review guidance available before output inspection across all artifact routes', () => {
+    const router = readSkill('ppt-router');
+    for (const route of ['CREATE', 'EDIT', 'REVIEW']) {
+      const routeLine = router.split('Populate `next_skills` progressively:')[1].split('\n').find((line) => line.startsWith(`- \`${route}\`:`));
+      expect(routeLine, `${route} review timing`).toMatch(/`ppt-review` before[^.]*quality review/i);
+    }
+    const outline = router.split('\n').find((line) => line.startsWith('- `OUTLINE`: `ppt-planner`'));
+    expect(outline).toContain('only');
+    expect(outline).not.toContain('ppt-review');
+    const craft = readSkill('ppt-craft');
+    const review = readSkill('ppt-review');
+    // Reject the former conflicting ordering even if an earlier rule says "before".
+    expect([router, craft, review].join('\n')).not.toMatch(
+      /ppt-review` (?:only )?after validation|Read this skill only after current|before loading `ppt-review`/i,
+    );
+    // Craft hands off; one on-demand owner defines the durable page record.
+    expect(craft).not.toContain('## Generated-deck handoff audit');
+    expect(craft).not.toContain('P1 | Content:');
+    expect(review).toContain('## Delivery gate');
+  });
+
   it('keeps internal routing private and uses plain-language progress updates', () => {
     const agent = JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8')) as {
       standards: string[];
@@ -141,7 +162,7 @@ describe('PptMaker built-in agent evaluation', () => {
       standards: string[];
     };
     const craft = readSkill('ppt-craft');
-    const combined = [agent.workflow, agent.standards.join('\n'), craft].join('\n');
+    const combined = [agent.workflow, agent.standards.join('\n'), craft, readSkill('ppt-review')].join('\n');
 
     for (const tool of [
       'create_pptx',
@@ -155,10 +176,10 @@ describe('PptMaker built-in agent evaluation', () => {
     expect(craft).toMatch(/Call it exactly once with the complete slide array/i);
     expect(craft).toContain('issue a second create call for the same deck');
     expect(craft).toContain('complete slide array and `preview:false`');
-    expect(craft).toContain('`office_review` once on that exact path');
-    expect(craft).toContain('`action:"check_and_render"`');
-    expect(craft).toContain('every required initial slide in `pages`');
-    expect(craft).toContain('`analysis_mode:"quality_review"`');
+    expect(craft).toMatch(/read `ppt-review` before the first output quality review/i);
+    expect(readSkill('ppt-review')).toContain('`action:"check_and_render"`');
+    expect(readSkill('ppt-review')).toContain('For a new deck, render every slide');
+    expect(readSkill('ppt-review')).toContain('`analysis_mode:"quality_review"`');
     expect(craft).toContain('default `analysis_mode:"understand"`');
     expect(craft).toContain('Do not infer a construction failure from equal strings alone');
     expect(craft).toContain('accidental overlap or redundant visual hierarchy');
@@ -263,7 +284,7 @@ describe('PptMaker built-in agent evaluation', () => {
     const review = readSkill('ppt-review');
     const combined = [agent.workflow, agent.standards.join('\n'), review].join('\n');
 
-    expect(review).toContain('only after current `office_review` structural output');
+    expect(review).toMatch(/Read this skill before the first[^.]*quality review/i);
     expect(review).toContain('For a new deck, render every slide');
     expect(review).toContain('After a repair affects multiple pages');
     expect(review).toContain('together in one `office_review` call');
@@ -272,8 +293,11 @@ describe('PptMaker built-in agent evaluation', () => {
     expect(review).toContain('default `understand` mode');
     expect(review).toContain('One collected image set');
     expect(review).toContain('retry only that page');
-    expect(review).toContain('Rendered image blocks are transient after the next assistant response');
-    expect(review).toContain('write one concise plain-language evidence sentence before any follow-up tool calls');
+    expect(review).not.toMatch(/transient after the next assistant response/i);
+    expect(review).toMatch(/first response[^.]*record concrete findings[^.]*before follow-up tool calls/is);
+    expect(review).toMatch(/supporting observations[^.]*repair or retain/i);
+    expect(review).toMatch(/Update only the affected findings[^.]*current render/i);
+    expect(review).not.toContain('write one concise plain-language evidence sentence');
     expect(review).toContain('do not rerender an unchanged `artifact_revision`');
     expect(review).toContain('keeps the same `image_revision`, do not claim a visual repair');
     expect(review).toContain('### Content');
@@ -298,10 +322,34 @@ describe('PptMaker built-in agent evaluation', () => {
     expect(review).toContain('reference_fit');
     expect(review).toContain('Checklist results are diagnostic evidence');
     expect(review).toContain('Do not include numeric aesthetic scores');
-    expect(review).toContain('Design\nPASS/WARNING/BLOCKER');
+    expect(review).toContain('P1 | Content: PASS — evidence | Design: WARNING — evidence | Coherence: PASS — evidence');
     expect(combined).toContain('invalid OpenXML');
     expect(review).toContain('Publish only when:');
     expect(review).toContain('no blocker remains');
-    expect(combined).toContain('target-viewer review');
+    expect(review).toContain('仍需在目标查看器核验的内容');
+  });
+
+  it('assembles the complete handoff independently of intermediate note formatting', () => {
+    const review = readSkill('ppt-review');
+    const evidence = review.split('## Evidence set')[1].split('## Two review layers')[0];
+    const delivery = review.split('## Delivery gate')[1];
+    // The final contract still requires every page; an absent early table must
+    // trigger evidence reconciliation rather than silently dropping the audit.
+    expect(evidence).not.toContain('P1 | Content:');
+    expect(evidence).not.toMatch(/one concise audit row per reviewed page/i);
+    expect(delivery).toMatch(/whether or not[^.]*earlier audit\s+table/is);
+    expect(delivery).toMatch(/Reuse available[^.]*evidence/is);
+    expect(delivery).toMatch(/missing[^.]*verify only[^.]*missing evidence/is);
+    expect(delivery).toMatch(/never default[^.]*PASS/is);
+    expect(delivery).toMatch(/every\s+page number appears exactly once/is);
+    expect(delivery).toMatch(/Missing, duplicate, or deck-level-only audit\s+evidence blocks publication/is);
+    const template = delivery.split('```text')[1].split('```')[0];
+    for (const field of ['内容：', '设计：', '连贯性：', '最弱页面', '定向修复', '剩余', 'P# —', 'Content:', 'Design:', 'Coherence:', '来源事实']) {
+      expect(template, `handoff field: ${field}`).toContain(field);
+    }
+    // Preserve the read-only route and the visual-unavailability boundary.
+    expect(delivery).toContain('leave the source byte-identical');
+    expect(review).toContain('mark visual checks `not_run`');
+    expect(delivery).not.toMatch(/Then reuse the latest audit rows/i);
   });
 });

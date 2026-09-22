@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { trustedIpcSender } from '../../helpers/trusted-ipc-sender';
+import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
 
 vi.mock('electron', () => ({
   app: { isPackaged: false },
@@ -28,10 +29,12 @@ vi.mock('../../../src/main/features/search', () => ({
 
 vi.mock('../../../src/main/features/kb_vector', () => ({
   findBySha1: vi.fn(() => null),
+  setFileStatus: vi.fn(async () => {}),
 }));
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let closeLogWorkers: () => Promise<void>;
 const TEST_UID = 'uContextPickUpload';
 
 beforeEach(async () => {
@@ -39,12 +42,14 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  closeLogWorkers = await captureMainLogWorkers();
   vi.clearAllMocks();
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await closeLogWorkers();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -64,6 +69,19 @@ async function invoke(channel: string, payload: any): Promise<any> {
 }
 
 describe('contexts.pickAndUpload', () => {
+  it('offers XLS in the native Library picker and imports it without modifying bytes', async () => {
+    const bytes = fs.readFileSync(path.join(__dirname, '../../fixtures/xls/inventory.xls'));
+    const source = path.join(tmpDir, 'inventory.xls');
+    fs.writeFileSync(source, bytes);
+    const electron = await import('electron') as any;
+    electron.dialog.showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [source] });
+    const result = await invoke('contexts.pickAndUpload', {});
+    expect(result.ok).toBe(true);
+    const options = electron.dialog.showOpenDialog.mock.calls[0][0];
+    expect(options.filters[0].extensions).toContain('xls');
+    expect(fs.readFileSync(path.join(contextsRoot(), 'inventory.xls'))).toEqual(bytes);
+  });
+
   it('returns an explicit cancelled outcome when the native picker closes', async () => {
     const res = await invoke('contexts.pickAndUpload', {});
 
@@ -104,6 +122,9 @@ describe('contexts.pickAndUpload', () => {
     expect(fs.existsSync(path.join(contextsRoot(), '.orkas-native-deps-verified.json'))).toBe(false);
     expect(fs.existsSync(path.join(contextsRoot(), 'tool.exe'))).toBe(false);
     expect(fs.readFileSync(path.join(contextsRoot(), 'note.md'), 'utf8')).toBe('# note');
+    const kb = await import('../../../src/main/features/kb_vector');
+    expect(kb.setFileStatus).toHaveBeenCalledExactlyOnceWith(TEST_UID, 'note.md', 'pending',
+      expect.objectContaining({ bytes: Buffer.byteLength('# note') }));
   });
 
   it.runIf(process.platform === 'darwin')('does not seed the native picker with a macOS media-library workspace', async () => {

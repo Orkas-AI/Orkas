@@ -1,3 +1,4 @@
+import { yieldReflectionForTask } from '../reflection-coordination';
 /**
  * MessageBus — the actor / message-passing core of group chat.
  *
@@ -14,9 +15,9 @@
  * rules — same-actor serial (hard, per-actor stateful sessions), session
  * agent cap, and the per-conversation named-task gate (D10).
  * Commander executions occupy neither cap nor gate (they are per-actor
- * serial anyway). Dispatch fan-out still happens in-process inside a turn
- * (`runNestedDispatch`, bounded by `workerSlots`), invisible to the
- * scheduler.
+ * serial anyway). Dispatch fan-out and bounded internal review happen
+ * in-process inside a turn (`runNestedDispatch`, bounded by `workerSlots`),
+ * invisible to the scheduler.
  *
  * Routing: bus only ever routes based on the resolved `to[]` from
  * `router.resolveRecipients`. Messages with `user` in `to[]` are written
@@ -42,7 +43,7 @@ import { sanitizeLogTextForUpload } from '../../util/log-sanitize';
 import { redactPaths } from '../../util/redact';
 import { chatMediaCidUrl, versionChatMediaLocalUrlsInText } from '../../util/chat-media-url';
 import {
-  workerSlots,
+  workerSlots, acquireWithAbort, type Releaser,
 } from '../../util/locks';
 import {
   isOverTaskBudget,
@@ -51,11 +52,12 @@ import {
   taskTokens,
 } from '../../util/conversation-cost-meter';
 import {
-  appendJsonlAtomic, genId12, nowIso, readJsonl, readJsonlPage, safeId,
+  appendJsonlAtomic, genId12, localIsoAt, nowIso, readJsonl, readJsonlPage, rewriteJsonlLine, safeId,
 } from '../../storage';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { inspectCodingDirectory } from '../local_agents/project-directory';
+import { getActiveUserId } from '../users';
 import type {
   LocalActiveRunIngress,
   LocalActiveRunInput,
@@ -71,7 +73,7 @@ import {
 } from './state';
 import type { StateFile } from './state';
 import { maxToolLoopsForActorKind } from './actor-budgets';
-import { resolveDeliveryChecks } from './terminal-checks';
+import { historicalSkillImportAuthorization } from './skill_import_sources';
 import {
   GroupMessage,
   buildGroupConversationHistoryTail,
@@ -92,10 +94,9 @@ import {
   type HandbackReason, type PlanInteractionStatus,
 } from './router';
 import * as skillsFeat from '../skills';
-import * as autoTasksFeat from '../auto_tasks';
 import * as planExecutor from './plan_executor';
 import * as taskBoard from './task_board';
-import { registerCliAsyncInput, answerCliAsyncInput, closeCliAsyncInputs, finishCliAsyncInputs } from './cli_async_input';
+import { registerCliAsyncInput, answerCliAsyncInput, cancelCliAsyncInput, closeCliAsyncInputs, finishCliAsyncInputs } from './cli_async_input';
 import { emitTaskIntervention } from '../../util/task-intervention-events';
 import {
   userSkillsDir, userAgentsDir,
@@ -109,12 +110,13 @@ import {
 import { isPathAllowed } from '../../util/path-sandbox';
 import * as agentsFeat from '../agents';
 import * as runtimeContentPublish from '../runtime_content_publish';
-import { indexChatMessage } from '../search/indexer';
+import { indexChatMessageDeferred } from '../search/indexer';
 import * as commanderRuntimeStats from '../commander_runtime_stats';
 import type { AgentRunStatus } from '../agent_runtime_stats';
 import { isAgentEnabled, readDisabledSets } from '../component_enabled';
-import { finalizeProducedFile } from '../produced_output_hooks';
+import { finalizeProducedFile, recordProducedFile } from '../produced_output_hooks';
 import { selectVisibleProducedFiles } from '../produced_files';
+import { excludeUnchangedInputs } from '../produced_input_guard';
 import { buildLanguageDirective, normalizeLang, t, type Lang } from '../../i18n';
 import { resolveLanguageForUser } from '../config';
 import * as marketplaceFeat from '../marketplace';
@@ -133,7 +135,7 @@ import { buildConnectorSetupTool } from './connector_setup_tool';
 import { createSkillTurnBuffer, onAgentTurnEnd, onUserMessage } from '../expert_signals/turn_hooks';
 import {
   bindRuntimeSkillTarget,
-  compactPromptDescription,
+  compactAgentPromptDescription,
   pickPromptDescription,
   getSystemPromptBlock,
   listAgentOwnedSkillIds,
@@ -148,6 +150,7 @@ import {
 } from '../../model/core-agent/skill-registry';
 import { AGENT_DESCRIPTION_ROSTER_MAX_CHARS } from '../../util/skill-description-policy';
 import * as connectorActionConfirm from '../connectors/action_confirm';
+import * as webAssistActionConfirm from '../web_assist_confirm';
 import * as bashPermissions from '../../model/core-agent/bash-permissions';
 import { toolExecutionFactKind } from '../../model/core-agent/tool-catalog';
 import {
@@ -167,7 +170,6 @@ import {
 } from '../local_agents/registry';
 import {
   appendPhasedText,
-  commentaryForTerminalReplacement,
   createPhasedTextState,
   resolvedPhasedText,
   resolvedUnsuccessfulPhasedText,
@@ -179,6 +181,7 @@ import {
 } from '../local_agents/public-output';
 import {
   buildCliConversationContext,
+  CLI_HISTORY_MAX_TURNS,
   buildCliDurableInstructions,
   buildCliTurnPrompt,
   createCliContextPlan,
@@ -436,37 +439,6 @@ function _appendSkillRefs(base: readonly string[], extra: readonly string[]): st
   return out;
 }
 
-// Latin verbs are word-bounded — bare substrings over-trigger badly ("because"
-// and "user" both contain "use"). CJK verbs stay plain: \b does not work at
-// CJK boundaries. Source string (not a literal) so the adjacency scan below
-// can re-instantiate it with the `g` flag without sharing lastIndex state.
-const SKILL_USE_INTENT_VERB_SRC = '\\b(?:use|run|call|execute)\\b|使用|调用|運行|运行|执行';
-
-function _hasSkillUseIntent(text: string): boolean {
-  return new RegExp(SKILL_USE_INTENT_VERB_SRC, 'i').test(text);
-}
-
-/** How close (in normalized chars) a disabled-skill mention must sit to an
- *  intent verb before the pre-LLM hard block fires. Mere co-occurrence in a
- *  long message ("because <skill> is broken we failed") must not block. */
-const SKILL_INTENT_ADJACENCY_CHARS = 20;
-
-function _mentionNearUseIntent(haystack: string, needle: string): boolean {
-  const verbRe = new RegExp(SKILL_USE_INTENT_VERB_SRC, 'gi');
-  const verbSpans: Array<[number, number]> = [];
-  for (let m = verbRe.exec(haystack); m; m = verbRe.exec(haystack)) {
-    verbSpans.push([m.index, m.index + m[0].length]);
-  }
-  if (!verbSpans.length) return false;
-  for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
-    const end = at + needle.length;
-    if (verbSpans.some(([vs, ve]) => (
-      vs < end + SKILL_INTENT_ADJACENCY_CHARS && ve > at - SKILL_INTENT_ADJACENCY_CHARS
-    ))) return true;
-  }
-  return false;
-}
-
 async function _runtimeSkillListForAgent(uid: string, agent: agentsFeat.Agent): Promise<string[] | undefined> {
   // Owner-scoped: a private (`ownerAgent`) skill of another agent never
   // resolves here, so it can't enter this agent's runtime skill list.
@@ -488,32 +460,6 @@ async function _runtimeSkillListForAgent(uid: string, agent: agentsFeat.Agent): 
     return [] as string[];
   });
   return _appendSkillRefs(resolved, owned);
-}
-
-async function _findDisabledSkillUseRequest(uid: string, text: string):
-  Promise<{ id: string; name: string } | null> {
-  if (!_hasSkillUseIntent(text)) return null;
-  let skills: skillsFeat.SkillListing[];
-  try {
-    skills = await skillsFeat.listSkills();
-  } catch (err) {
-    log.warn(`disabled skill request scan failed uid=${uid}: ${(err as Error).message}`);
-    return null;
-  }
-  const haystack = _normaliseSkillMentionText(text);
-  for (const skill of skills) {
-    if (skill.enabled !== false) continue;
-    const needles = [skill.id, skill.name]
-      .map((s) => _normaliseSkillMentionText(s))
-      .filter((s, idx, arr) => s.length >= 2 && arr.indexOf(s) === idx);
-    // Adjacency, not mere co-occurrence: the mention must sit next to an
-    // intent verb, otherwise questions ABOUT a disabled skill would be
-    // hard-blocked before the model ever sees them.
-    if (needles.some((needle) => _mentionNearUseIntent(haystack, needle))) {
-      return { id: skill.id, name: skill.name || skill.id };
-    }
-  }
-  return null;
 }
 
 /** Render a quality-validator rejection as a friendly user warning followed
@@ -853,10 +799,7 @@ export type GroupEvent =
   | { type: 'message'; cid: string; msg: GroupMessage; turn_end?: boolean; turn_id?: string; seg?: number }
   /** Streaming work belongs to the same numbered reasoning segment as the
    * message that eventually persists that segment. */
-  | { type: 'process'; cid: string; actor: string; turn_id?: string; seg?: number; data: Record<string, unknown> }
-  /** Low-volume model run telemetry. Emitted live for analytics only; never
-   * persisted as process history and never rendered in the process rail. */
-  | { type: 'agent_run_result'; cid: string; actor: string; actor_type: 'commander' | 'agent'; turn_id?: string; data: Record<string, unknown> }
+  | { type: 'process'; cid: string; actor: string; turn_id?: string; seg?: number; display_seq?: number; data: Record<string, unknown> }
   /** A `create_artifact` tool call finished writing its bundle. The final
    * end-of-turn message still carries `msg.artifacts` for persistence; this
    * live event lets the renderer mount the iframe immediately instead of
@@ -880,7 +823,7 @@ export type GroupEvent =
   /** Conversation task-board lifecycle (task_board.ts). `task_created` fires
    * once when a row enters the board; `task_state` on every deterministic
    * status transition (running / waiting_input / done / stopped / failed / cancelled).
-   * Distinct from the privacy-safe `taskRun` terminal telemetry above — these
+   * Distinct from the privacy-safe `taskRun` terminal state above — these
    * carry the task snapshot for the board UI. */
   | { type: 'task_created'; cid: string; task: taskBoard.ConversationTask }
   | { type: 'task_state'; cid: string; task: taskBoard.ConversationTask };
@@ -1011,6 +954,12 @@ interface QueueItem {
    * self-deduplicates. A cancelled or dropped item never fires it — the
    * message then exists only as the cancelled row's instruction text. */
   deferredBubble?: { persist: () => Promise<void> };
+  /** Authored metadata for editing an unclaimed user task. Shared source
+   * messages must not be rewritten when a sibling has already entered history. */
+  sourceMessage?: GroupMessage;
+  sharedSourceMessage?: boolean;
+  sendNowPending?: boolean;
+  composerEditing?: boolean;
 }
 
 interface WorkerState {
@@ -1095,6 +1044,10 @@ function stageAppNavRequest(
 }
 
 interface CidState {
+  // Read the existing public process trail only when a view is rebuilt. These
+  // closures own no second event log and are released with their actor turn.
+  liveDisplays?: Map<string, () => GroupMessage[]>;
+  displaySequence?: number;
   /** Test-only phantom Agent executions counted against the session cap. */
   reservedAgentSlotsForTest?: number;
   uid: string;
@@ -1485,6 +1438,7 @@ function _emitTaskRunTerminal(state: CidState, status: TaskTerminalStatus): void
   // the worker finishes unwinding.
   bashPermissions.cancelForCid(state.cid);
   connectorActionConfirm.cancelForCid(state.cid);
+  webAssistActionConfirm.cancelForCid(state.cid);
   const recovered = status === 'completed' && run.internalFailureObserved === true;
   const event: TaskTerminalEvent = {
     run_id: run.runId,
@@ -1546,6 +1500,9 @@ function _emitTaskRunTerminalIfQuiescent(state: CidState, stateFile?: StateFile)
 }
 
 function emit(state: CidState, ev: GroupEvent): void {
+  if (ev.type === 'process') {
+    ev.display_seq = state.displaySequence = (state.displaySequence || 0) + 1;
+  }
   // Single chokepoint feeding the `after` admission gate: every task
   // terminal — turn settlement, queue drops, per-task cancel, waiting_input
   // resolution — already flows through a task_state emit, so recording
@@ -1686,6 +1643,21 @@ export function runtimeSnapshot(uid: string, cid: string): { processing: boolean
   };
 }
 
+/** Public presentation only: never a model-context or execution replay. The
+ * synchronous read and watermark describe the same point in the event stream. */
+export function liveDisplaySnapshot(uid: string, cid: string) {
+  const state = _cids.get(cidKey(uid, cid));
+  const activeTurns = state ? activeTurnsForState(state) : [];
+  return {
+    sequence: state?.displaySequence || 0,
+    active_turns: activeTurns,
+    turns: activeTurns.flatMap((turn) => {
+      const read = state?.liveDisplays?.get(turn.turn_id);
+      return read ? [{ ...turn, records: read() }] : [];
+    }),
+  };
+}
+
 /** Recompute the on-disk `status` field based on actual worker / queue
  *  state. Honors the sticky `aborted` flag — once aborted, ONLY an
  *  explicit USER `enqueue` clears it (so the interrupted-status reply
@@ -1718,12 +1690,16 @@ async function appendMain(
   cid: string,
   msg: GroupMessage,
   participantActivity: import('../chats').ConversationParticipantActivity,
-): Promise<void> {
+): Promise<number> {
   const layout = conversationLayout(uid, cid);
   const file = layout.messageFile;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const { msgIndex } = await appendJsonlAtomic<GroupMessage>(file, msg);
-  await indexChatMessage(uid, cid, msgIndex, msg);
+  // The record is durable here. Search indexing is derived state that fails
+  // soft and self-heals through `reconcileChatsIndex`, so it must not sit
+  // between the append and the caller — a user bubble is only painted once
+  // this returns, and a large index snapshot made that wait ~1s.
+  indexChatMessageDeferred(uid, cid, msgIndex, msg);
   // Stamp `updated_at` on this cid's _index.json row so the sidebar can sort
   // by real last-activity time rather than file mtime (which sync clobbers
   // when pulling from another device — see chats.ts::listConversations).
@@ -1734,6 +1710,7 @@ async function appendMain(
   } catch (err) {
     log.warn('bumpConversationActivity failed', { uid, cid, error: (err as Error)?.message });
   }
+  return msgIndex;
 }
 
 /** Persist a native question beside the active reply without settling it. */
@@ -1750,13 +1727,23 @@ async function publishCliAsyncQuestion(
     text: typeof data.text === 'string' ? data.text : '',
     ...(questions.length ? { cli_question: { questions } } : {}),
   };
-  await appendMain(uid, cid, message, { senderKind: actor.kind, senderId: actor.id, agentIds: [actor.id] });
+  const messageIndex = await appendMain(uid, cid, message, { senderKind: actor.kind, senderId: actor.id, agentIds: [actor.id] });
   if (questions.length) registerCliAsyncInput({
     uid, cid, turnId, messageId: message.id, questions, inputId: genId12(),
     ingress: () => {
       const live = _executionForActor(state, actor.id);
       return !state.terminating && live?.running && live.currentTurnId === turnId
         ? live.currentTurnIngress || null : null;
+    },
+    saveCancelled: async () => {
+      // Use the original line and verify its identity under the storage lock.
+      // A question may be older than the history reader's default tail window.
+      const result = await rewriteJsonlLine<GroupMessage>(conversationLayout(uid, cid).messageFile, messageIndex,
+        current => current.id === message.id && current.cli_question
+          ? { ...current, cli_question: { ...current.cli_question, cancelled: true } } : null);
+      if (!result.ok) throw new Error('question cancellation could not be saved');
+      emit(state, { type: 'message', cid, msg: result.record, turn_end: false });
+      return result.record;
     },
     save: async (text, answers, inputId) => {
       // An index write may fail after the append succeeded. Re-read by the
@@ -1781,14 +1768,16 @@ async function publishCliAsyncQuestion(
   });
 }
 
-export async function submitCliAsyncInput(uid: string, cid: string, messageId: string, answers: unknown) {
+export async function submitCliAsyncInput(uid: string, cid: string, messageId: string, answers: unknown, cancelled = false) {
   if (!safeId(cid) || !safeId(messageId)) return { ok: false as const, error: 'expired' };
   const rows = await readJsonl<GroupMessage>(conversationMessageReadFile(uid, cid));
   const existing = rows.find(row => row.from === USER_ID && row.cli_answer?.message_id === messageId);
-  if (existing) return JSON.stringify(existing.cli_answer!.answers) === JSON.stringify(answers)
+  if (existing) return cancelled || JSON.stringify(existing.cli_answer!.answers) === JSON.stringify(answers)
     ? { ok: true as const, message: existing }
     : { ok: false as const, error: 'already_answered' };
-  return answerCliAsyncInput(uid, cid, messageId, answers);
+  const question = rows.find(row => row.id === messageId && row.cli_question?.cancelled === true);
+  if (question) return cancelled ? { ok: true as const, message: question } : { ok: false as const, error: 'cancelled' };
+  return cancelled ? cancelCliAsyncInput(uid, cid, messageId) : answerCliAsyncInput(uid, cid, messageId, answers);
 }
 
 type CommanderHistoryCheckpointV1 = {
@@ -1923,14 +1912,15 @@ async function readCommanderHistoryTail(
 
 /** Bounded backward read of the canonical log for a CLI turn.
  *
- *  The CLI compiler keeps at most CLI_HISTORY_MAX_TURNS user turns / a byte
+ *  The CLI compiler keeps at most CLI_HISTORY_MAX_TURNS user turns / a token
  *  cap, but the turn used to parse the WHOLE log (every terminal record
  *  carries its process trail) on every CLI turn — O(conversation bytes) per
  *  turn on the main thread. Page back from the tail until the turn boundary,
  *  the stored history cursor (when the binding has one) and enough prior user
- *  turns are in hand. A boundary that never shows up reads the whole log. */
+ *  turns are in hand. A missing boundary is unavailable history, not permission
+ *  to replay the whole log as prior context. */
 const CLI_CANONICAL_TAIL_PAGE = 256;
-const CLI_CANONICAL_TAIL_USER_TURNS = 40;
+const CLI_CANONICAL_TAIL_USER_TURNS = CLI_HISTORY_MAX_TURNS;
 async function _readCliCanonicalTail(
   file: string,
   opts: { boundaryId: string; anchorId?: string | null },
@@ -1954,6 +1944,7 @@ async function _readCliCanonicalTail(
     if (page.nextCursor === null) break;
     before = page.nextCursor;
   }
+  if (!boundarySeen) throw new Error('Canonical conversation history turn boundary is unavailable.');
   return pages.flat();
 }
 
@@ -2001,6 +1992,7 @@ async function buildGroupHistoryForTurn(params: {
   const source = groupConversationHistorySource(cid, actorId);
   const file = conversationMessageReadFile(uid, cid);
   const fileIdentity = commanderHistoryFileIdentity(file);
+  if (!fileIdentity) throw new Error('Canonical conversation history is unavailable.');
   const sessions = await import('../../model/core-agent/session-store');
   const session = await sessions.getSessionForUser(uid, sessionId);
   const checkpoint = parseCommanderHistoryCheckpoint(
@@ -2070,8 +2062,12 @@ async function buildGroupHistoryForTurn(params: {
 
   const rows = await readJsonl<GroupMessage>(file, 0);
   const currentIndex = rows.findIndex((message) => message.id === currentMsgId);
-  const throughCurrent = currentIndex >= 0 ? rows.slice(0, currentIndex + 1) : rows;
-  const priorRows = currentIndex >= 0 ? rows.slice(0, currentIndex) : rows;
+  // Storage's tolerant readers also return [] for an unreadable/missing file.
+  // Every admitted turn has a persisted trigger, including the first turn;
+  // without it neither a full rebase nor a new checkpoint is trustworthy.
+  if (currentIndex < 0) throw new Error('Canonical conversation history turn boundary is unavailable.');
+  const throughCurrent = rows.slice(0, currentIndex + 1);
+  const priorRows = rows.slice(0, currentIndex);
   const userRows = throughCurrent.filter((message) => message.from === USER_ID);
   const latestUser = userRows.at(-1);
   const nextCheckpoint = latestUser ? JSON.stringify({
@@ -2125,7 +2121,7 @@ export interface EnqueueParams {
   /** Renderer-generated id for a user send; persisted verbatim so the
    * optimistic bubble can be claimed by identity. See GroupMessage. */
   client_msg_id?: string;
-  /** Structured source for a user-visible failure. This controls analytics
+  /** Structured source for a user-visible failure. This controls diagnostics
    * taxonomy only; the rendered text still controls failure actions/UI. */
   failure_kind?: GroupMessageFailureKind;
   failure_code?: string;
@@ -2138,7 +2134,7 @@ export interface EnqueueParams {
   failedTurnRetryMode?: 'resume' | 'restart';
   retrySourceMessageId?: string;
   /** Host-computed count of possibly non-idempotent operations whose outcome
-   * is unknown. Telemetry-only; never persisted into message content. */
+   * is unknown. Diagnostic-only; never persisted into message content. */
   retryUncertainOperationCount?: number;
   attachments?: string[];
   use_selections?: ChatUseSelection[];
@@ -2170,7 +2166,7 @@ export interface EnqueueParams {
    * first mid-turn message wrongly consumes the placeholder and post-tool
    * process events recreate a new one that ends up stuck. */
   turn_end?: boolean;
-  /** Host-only settlement hint for a tool-owned user-input boundary. This
+  /** Host-only settlement hint for an explicit user-input boundary. This
    * process reply must not be counted as a completed answer. */
   waitingForInput?: boolean;
   /** QueueItem.turnId for the actor execution that produced this official
@@ -2263,6 +2259,8 @@ export async function enqueue(params: EnqueueParams): Promise<GroupMessage> {
   // late in this body. Reset in `finally` to cover throws.
   state.pendingEnqueues += 1;
   try {
+    const reflectionWrites = yieldReflectionForTask(uid);
+    if (reflectionWrites) await reflectionWrites;
     if (_enqueueAdmissionGateForTest) await _enqueueAdmissionGateForTest();
     return await _enqueueBody(params, state);
   } finally {
@@ -2576,6 +2574,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
 
   const msg: GroupMessage = {
     id: msgId, ts, from: fromActorId, to,
+    ...(fromKind === 'user' ? { received_at_ms: Date.now() } : {}),
     ...(unknown.length ? { unknown_mentions: unknown } : {}),
     ...(mentions.length ? { mentions } : {}),
     text: persistedText,
@@ -2629,49 +2628,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     && to.some((actorId) => actorId !== USER_ID);
 
   let bubblePersisted = false;
-  let bubblePersistPromise: Promise<void> | null = null;
-  const persistUserBubble = (): Promise<void> => {
-    // Every recipient of one source message observes the same terminal
-    // persistence result. Keeping the promise (including its rejection)
-    // prevents a sibling from treating a failed/partial write as success.
-    if (!bubblePersistPromise) bubblePersistPromise = (async () => {
-      // The message enters history HERE, so its timestamp is the entry moment,
-      // not the enqueue moment. Keeping the enqueue stamp wrote a row whose ts
-      // predated the reply already above it in the jsonl, and every reader that
-      // orders by ts (renderer live insert + the history load's defensive sort)
-      // pulled the bubble back over that reply — two user bubbles stacked with
-      // a single reply under them (on-device 2026-08-28). The queue wait stays
-      // legible on the board row, whose `created_at` is the send moment.
-      msg.ts = nowIso();
-      await appendMain(uid, cid, msg, {
-        senderKind: fromKind,
-        senderId: fromActorId,
-        agentIds: to.filter((id) => !RESERVED_IDS.has(id)),
-      });
-      bubblePersisted = true;
-      emit(state, {
-        type: 'message',
-        cid,
-        msg,
-        ...(params.turn_id ? { turn_id: params.turn_id } : {}),
-        ...(params.seg !== undefined ? { seg: params.seg } : {}),
-      });
-      log.info('deferred user message persisted', {
-        user_id: maskId(uid),
-        cid: maskId(cid),
-        message_id: maskId(msgId),
-        text_chars: persistedText.length,
-      });
-      // Phase-0 expert-signal chokepoint fires when the message actually
-      // enters the conversation — a cancelled queued message never spoke.
-      onUserMessage({ uid, cid, userMsg: { id: msgId, text: persistedText } })
-        .catch((err) => log.warn('user-message signal processing failed', {
-          cid: maskId(cid),
-          error: logErrorSummary(err),
-        }));
-    })();
-    return bubblePersistPromise;
-  };
+  const persistUserBubble = deferredUserBubble(state, msg, () => { bubblePersisted = true; }).persist;
 
   if (!deferBubble) {
     // Persist the canonical conversation record before publishing the event.
@@ -2705,8 +2662,19 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     bubble_deferred: deferBubble,
   });
 
+  // Diagnostic (2026-09-20): a deferred bubble is only painted once admission
+  // persists it, so everything between here and `_admissionSettled` is latency
+  // the sender sees as "my message has no bubble yet". Production logs put the
+  // p90 at ~270ms with two tight clusters and no records in between, which the
+  // e2e harness does not reproduce — so mark each hop and report the split.
+  // Durations only; ids stay masked.
+  const bubbleClock = deferBubble
+    ? { start: Date.now(), members: 0, board: 0, state: 0 }
+    : null;
+
   // Dispatch to non-user recipients.
   const refreshed = await readMembers(uid, cid);
+  if (bubbleClock) bubbleClock.members = Date.now();
   // P3 true form resume: a user form submission targeted at an agent
   // RE-ENTERS its form-parked task (same task_id back to running) instead of
   // creating a new row. Decoded once; submissions are single-recipient.
@@ -2784,6 +2752,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
         ...(boardTaskId ? { taskId: boardTaskId } : {}),
         ...(afterTaskId ? { afterTaskId } : {}),
         sourceText: seg.instruction,
+        sourceMessage: msg,
+        sharedSourceMessage: segmentPlan.segments.length > 1,
         sourceRecipients: msg.to.slice(),
         llmPayload: composeLlmTurnPayload(uid, fromActorId, msg, seg.instruction),
         ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
@@ -2858,6 +2828,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       ...(deferBubble ? { deferredBubble: { persist: persistUserBubble } } : {}),
       ...(boardTaskId ? { taskId: boardTaskId } : {}),
       sourceText: persistedText,
+      ...(deferBubble ? { sourceMessage: msg, sharedSourceMessage: to.length > 1 } : {}),
       sourceRecipients: msg.to.slice(),
       llmPayload: composeLlmTurnPayload(uid, fromActorId, msg),
       ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
@@ -2884,12 +2855,26 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
 
   }
 
+  if (bubbleClock) bubbleClock.board = Date.now();
+
   if (state.queue.some((item) => item.msgId === msgId)) {
-    await commitRecipient();
+    // The accepted queue item already owns its target. A default-selection or
+    // state-notification failure must not strand it or report a failed send
+    // that the user can duplicate by retrying.
+    try {
+      await commitRecipient();
+      await emitStateChanged(state);
+    } catch (err) {
+      /* timing mark below still runs via the finally */
+      log.warn('queued send recipient state update failed', {
+        cid: maskId(cid), error: logErrorSummary(err),
+      });
+    } finally {
+      if (bubbleClock) bubbleClock.state = Date.now();
+    }
     for (const item of state.queue) {
       if (item.msgId === msgId) item.floorRevision = floorRevision;
     }
-    await emitStateChanged(state);
   }
   _scheduleAdmissions(state);
 
@@ -2917,15 +2902,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // echo and the downstream dispatch, which is exactly how form submissions
   // ended up as fake loading bubbles until history polling caught up.
   if (fromActorId === USER_ID && !deferBubble) {
-    // Phase-0 chokepoint (was lost from commit 76358a8e per
-    // `docs/plans/expert-signals-phase0-wiring-gaps.md`): cancels pending
-    // silence check + extracts text-class signals (accept / correction /
-    // reject / edit) against the cached last agent message. Fire-and-
-    // forget; correctionDetected return value is intentionally unused
-    // here — the correction signal is consumed inside onUserMessage's
-    // extraction, and the second consumer this note once cited (the
-    // runner's RunMetrics/shouldReflect scorer) was deleted 2026-08-16.
-    // Deferred-bubble sends fire it inside persistUserBubble instead.
+    // Cancel the inactivity observation on a real user message. Deferred
+    // bubbles do the same inside persistUserBubble.
     onUserMessage({ uid, cid, userMsg: { id: msgId, text: persistedText } })
       .catch((err) => log.warn(`onUserMessage threw cid=${cid}: ${(err as Error).message}`));
   }
@@ -2937,6 +2915,24 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     // claim — never observe a started turn whose user message is missing.
     // A busy conversation's wave leaves the item queued and returns fast.
     await _admissionSettled(state);
+    if (bubbleClock) {
+      // The recipient/state update only runs while the item is still queued;
+      // when it is skipped the segment is empty, not missing.
+      if (!bubbleClock.state) bubbleClock.state = bubbleClock.board;
+      const done = Date.now();
+      log.info('deferred bubble timing', {
+        cid: maskId(cid),
+        message_id: maskId(msgId),
+        members_ms: bubbleClock.members - bubbleClock.start,
+        board_ms: bubbleClock.board - bubbleClock.members,
+        state_ms: bubbleClock.state - bubbleClock.board,
+        admit_ms: done - bubbleClock.state,
+        total_ms: done - bubbleClock.start,
+        // false → still queued behind a running turn, so the wait is the
+        // designed queued-until-execution window rather than a stall.
+        persisted: bubblePersisted,
+      });
+    }
     // Tell the sending renderer whether the message is already in history
     // (admitted immediately — the send raced the previous turn's settlement,
     // or the conversation was simply idle) or still queued behind other work
@@ -3165,6 +3161,40 @@ function _buildNestedDispatchSourceContext(params: {
     originMessageId: currentMessageId,
     ...(references.length ? { references } : {}),
   };
+}
+
+/** One source message shares one persistence result, including failures.
+ * Its entry timestamp is assigned when execution starts, never at enqueue. */
+function deferredUserBubble(
+  state: CidState,
+  msg: GroupMessage,
+  onPersisted?: () => void,
+): { persist: () => Promise<void> } {
+  let pending: Promise<void> | undefined;
+  return { persist: () => {
+    if (!pending) pending = (async () => {
+      msg.ts = nowIso();
+      await appendMain(state.uid, state.cid, msg, {
+        senderKind: 'user', senderId: USER_ID,
+        agentIds: msg.to.filter((id) => !RESERVED_IDS.has(id)),
+      });
+      onPersisted?.();
+      emit(state, {
+        type: 'message', cid: state.cid, msg,
+        ...(msg.turn_id ? { turn_id: msg.turn_id } : {}),
+        ...(msg.seg !== undefined ? { seg: msg.seg } : {}),
+      });
+      log.info('deferred user message persisted', {
+        user_id: maskId(state.uid), cid: maskId(state.cid),
+        message_id: maskId(msg.id), text_chars: msg.text.length,
+      });
+      onUserMessage({ uid: state.uid, cid: state.cid, userMsg: { id: msg.id, text: msg.text } })
+        .catch((err) => log.warn('user-message signal processing failed', {
+          cid: maskId(state.cid), error: logErrorSummary(err),
+        }));
+    })();
+    return pending;
+  } };
 }
 
 function composeLlmTurnPayload(
@@ -3714,6 +3744,11 @@ async function _admitLoop(state: CidState): Promise<void> {
     for (;;) {
       if (state.terminating) return;
       if (state.queue.length === 0) return;
+      const reflectionWrites = yieldReflectionForTask(state.uid);
+      if (reflectionWrites) await reflectionWrites;
+      if (state.terminating) return;
+      // Preserve FIFO while a queued message is owned by the composer.
+      if (state.queue.some((item) => item.composerEditing)) return;
       // Runaway/cost backstops (conversation level, same thresholds as the
       // old loop): halt admission, drop the queue visibly, notify once.
       if (state.turnsThisActivation >= MAX_WORKER_TURNS) {
@@ -3728,7 +3763,6 @@ async function _admitLoop(state: CidState): Promise<void> {
       }
       if (isOverTaskBudget(state.cid)) {
         log.error(`task cost backstop hit cid=${state.cid}: ${taskTokens(state.cid)} >= ${maxTaskTokens()} tokens — dropping queue + halting`);
-        resetTaskTokens(state.cid);
         _recordTaskRunOutcome(state, 'failed');
         await _haltPendingAndNotify(state, 'chat.cost_limit_reached');
         return;
@@ -4891,6 +4925,19 @@ async function runActorTurn(
   item: QueueItem,
   turnStartedAt: number,
 ): Promise<ActorTurnResult> {
+  try {
+    return await runActorTurnWithDisplay(state, w, item, turnStartedAt);
+  } finally {
+    state.liveDisplays?.delete(item.turnId);
+  }
+}
+
+async function runActorTurnWithDisplay(
+  state: CidState,
+  w: WorkerState,
+  item: QueueItem,
+  turnStartedAt: number,
+): Promise<ActorTurnResult> {
   const { uid, cid, actor } = w;
   const { agentExecutionDeadline } = await import('../../util/agent-execution-budget');
   const executionDeadlineAt = agentExecutionDeadline(turnStartedAt);
@@ -5004,7 +5051,14 @@ async function runActorTurn(
       });
     }
   } catch (err) {
-    log.warn(`conversation history build failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
+    log.warn('conversation history build failed', {
+      cid: maskId(cid), actor: maskId(actor.id), error: logErrorSummary(err),
+    });
+    // Keep the prior session/checkpoint; report the gap only on this turn.
+    messageText = '<history-availability status="unavailable">'
+      + 'Canonical conversation history could not be refreshed for this turn. '
+      + 'Any retained history may be incomplete or stale; this is not evidence of empty history.'
+      + '</history-availability>\n' + messageText;
   }
 
   // Attach a `<attachments>` manifest block listing files uploaded on this
@@ -5022,8 +5076,8 @@ async function runActorTurn(
   const turnHistoryResources: HistoryResource[] = [];
   // Capture the process trail to persist on the end-of-turn message so
   // history reload can rerender the rail (renderer accumulates it live, but
-  // without persistence it vanishes on refresh). Cap the array so a runaway
-  // tool storm can't bloat the jsonl. Skip `delta` and `assistant` events.
+  // without persistence it vanishes on refresh). Public commentary is merged
+  // while adjacent; non-ephemeral process records remain complete.
   const processItems: ProcessItem[] = [];
   if (item.attachments && item.attachments.length) {
     try {
@@ -5109,42 +5163,12 @@ async function runActorTurn(
     log.warn(`conversation attachment index build failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
   }
 
-  if (isCommander && item.fromActorId === USER_ID) {
-    const disabledSkill = await _findDisabledSkillUseRequest(uid, item.llmPayload);
-    if (disabledSkill) {
-      const reply = `<span style="color:var(--danger)">${escapeHtmlForBubble(t('component.skill_disabled_request', { name: disabledSkill.name || disabledSkill.id }))}</span>`;
-      log.info(`blocked disabled skill request cid=${cid} skill=${disabledSkill.id}`);
-      w.abortController = null;
-      await markInFlight(uid, cid, actor.id, false);
-      await emitStateChanged(state);
-      await enqueue({
-        uid, cid,
-        fromActorId: actor.id,
-        text: reply,
-        failure_kind: 'dependency',
-        failure_code: 'skill_disabled',
-        forceTo: [USER_ID],
-        turn_end: true,
-        turn_id: item.turnId,
-        source_message_id: item.msgId,
-      });
-      await _syncStateStatus(state);
-      log.info(`turn-end user=${uid} cid=${cid} actor=${actor.id} ms=${Date.now() - turnStartedAt} outcome=disabled_skill_request`);
-      return {
-        kind: 'early',
-        terminalStatus: 'failed',
-        failure: _taskFailureDiagnostic('dependency', 'skill_disabled', 'preflight'),
-      };
-    }
-  }
+  // Skill enablement is enforced by selection, discovery, read and execution
+  // gates. A mention in user prose does not authorize use or fail the turn.
 
   // Build system prompt + extra tools per role.
   let systemPrompt: string;
   let extraTools: AgentTool[] = [];
-  // Host-side terminal delivery guard, selected by the agent spec's
-  // `delivery_checks` (in-process named agents only). Undefined for the
-  // commander, workers, and agents that declare no checks.
-  let terminalTextGuard: ((text: string) => string | null) | undefined;
   const toolCreatedSkills: Array<{
     skill_id: string;
     name: string;
@@ -5324,7 +5348,6 @@ async function runActorTurn(
         && !item.terminalHandoff;
       if (!item.nested) await emitStateChanged(state);
       systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir, turnLanguage);
-      terminalTextGuard = resolveDeliveryChecks(agent.delivery_checks);
       // skill_list supplies default shared dependencies; owned private Skills
       // are added by the registry/runtime. It is not an authorization boundary:
       // other shared Skills, including undeclared builtins, remain search-only.
@@ -5403,13 +5426,16 @@ async function runActorTurn(
     turnProduced.add(normalized);
     state.producedPaths.add(normalized);
     if (isPathInVersionControlledTree(normalized)) sourceTreePaths.add(normalized);
+    if (isPathAllowed(normalized, managedRoots) && !sourceTreePaths.has(normalized)) {
+      await recordProducedFile(normalized, { userId: uid, cid, source: 'group_chat.file_written' }, info);
+    }
   };
   // Refinement-vs-collision signal for write tools' uniquify: any path the
   // model has produced in this conversation (this turn or earlier) is
   // "ours" → overwrite in place. Files the user pre-created remain foreign
   // and still get `-2 / -3 / ...` suffixed via `util/uniquify-path`.
   const hasProducedPath = (absPath: string) => state.producedPaths.has(path.resolve(absPath));
-  const onOutputsPublished = (absPaths: string[]): string[] => {
+  const onOutputsPublished = async (absPaths: string[]): Promise<string[]> => {
     const accepted: string[] = [];
     for (const raw of absPaths) {
       const absPath = path.resolve(raw);
@@ -5484,15 +5510,33 @@ async function runActorTurn(
   // the fallback for mid-stream failures and tells abort settlement whether a
   // status row is needed, without promoting the partial text to a final answer.
   let streamingText = '';
+  let unphasedTextWasStreamed = false;
+  let cliDisplayText = '';
+  const nativeDisplaySegments: GroupMessage[] = [];
+  if (actor.kind !== 'worker') {
+    state.liveDisplays ||= new Map();
+    state.liveDisplays.set(item.turnId, () => [
+      ...nativeDisplaySegments,
+      {
+        id: '', from: actor.id, to: [USER_ID],
+        ts: localIsoAt(turnStartedAt), turn_id: item.turnId, seg: segState.seg,
+        source_message_id: item.msgId,
+        text: cliAgent ? cliDisplayText : streamingText.slice(segState.segStart),
+        process: processItems.slice(segState.processStart),
+      },
+    ]);
+  }
   let errText: string | null = null;
   let aborted = false;
   let turnFailureKind: GroupMessageFailureKind | undefined;
   let turnFailureCode = '';
   let turnFailurePhase: TaskFailurePhase | undefined;
+  let turnFailureRetryExhausted = false;
   const markTurnFailure = (
     kind: GroupMessageFailureKind,
     code: string,
     phase?: unknown,
+    retryExhausted?: boolean,
   ) => {
     // Preserve the first causal failure. Later host-side validation warnings
     // must not overwrite an already-recorded provider/config/CLI failure.
@@ -5500,6 +5544,7 @@ async function runActorTurn(
     turnFailureKind = kind;
     turnFailureCode = code;
     turnFailurePhase = _taskFailurePhase(phase);
+    turnFailureRetryExhausted = retryExhausted === true;
   };
   let agentRunTimingData: Record<string, unknown> | undefined;
   // Wire the commander segment flush now that `streamingText` exists. Called
@@ -5724,6 +5769,7 @@ async function runActorTurn(
         throw new Error('Canonical conversation history could not be read.');
       }
       let persistedLiveCommentary = false;
+      let cliMessageWrites = Promise.resolve();
       const cliOut = await _runCliAgentTurn({
         uid, cid, actor, agent: cliAgent,
         item, canonicalRows, workingDir: cliWorkingDir, projectDirectoryIssue,
@@ -5756,7 +5802,41 @@ async function runActorTurn(
             if (ingress) _scheduleCliSteerDrain(state, w);
           },
         } : {}),
+        onNativeMessage: (text, meta) => {
+          const message: GroupMessage = {
+            id: genId12(),
+            // A native message is flushed only when the NEXT one starts, so
+            // stamping the write time would date every earlier message at the
+            // moment its successor began (a message written before a two-minute
+            // tool loop would show the time that loop ended). Stamp the moment
+            // its first token arrived instead; the transcript then keeps the
+            // order and spacing the user watched.
+            ts: meta && meta.startedAtMs > 0 ? localIsoAt(meta.startedAtMs) : nowIso(),
+            from: actor.id, to: [USER_ID],
+            turn_id: item.turnId, seg: segState.seg, text,
+            source_message_id: item.msgId,
+            process: processItems.slice(segState.processStart),
+          };
+          nativeDisplaySegments.push(message);
+          cliDisplayText = '';
+          segState.seg += 1;
+          segState.processStart = processItems.length;
+          // Capture identity synchronously before the next delta, then serialize
+          // storage. This is a message boundary, not a tool/publication boundary.
+          cliMessageWrites = cliMessageWrites.then(async () => {
+            await appendMain(uid, cid, message, {
+              senderKind: actor.kind, senderId: actor.id, agentIds: [actor.id],
+            });
+            emit(state, { type: 'message', cid, msg: message, turn_end: false });
+          });
+          return cliMessageWrites;
+        },
         onProcess: data => {
+          if (data.type === 'delta' && data.phase !== 'commentary' && typeof data.text === 'string') {
+            cliDisplayText += data.text;
+          } else if (data.type === 'commentary-finalized') {
+            cliDisplayText = '';
+          }
           // Mirror the LLM path: count every event for activity. Commentary
           // deltas are merged only while adjacent, so a tool/status event
           // between text chunks retains its real chronological position in
@@ -5807,7 +5887,7 @@ async function runActorTurn(
         },
       });
       for (const p of cliOut.produced || []) await onFileWritten(p);
-      if (cliOut.published?.length) onOutputsPublished(cliOut.published);
+      if (cliOut.published !== undefined) await onOutputsPublished(cliOut.published);
       finalText = cliOut.text;
       streamingText = cliOut.text;
       cliCommanderHandoff = cliOut.commanderHandoff || null;
@@ -5858,7 +5938,6 @@ async function runActorTurn(
         ...(conversationHistory ? { conversationHistory } : {}),
         agentName: actor.name || actor.id,
         ...(actor.kind === 'agent' ? { agentId: actor.id } : {}),
-        ...(terminalTextGuard ? { terminalTextGuard } : {}),
         cid,
         ...(turnConversationTitle ? { conversationTitle: turnConversationTitle } : {}),
         ...(turnConversationTitleUpdatedAt ? { conversationTitleUpdatedAt: turnConversationTitleUpdatedAt } : {}),
@@ -5881,6 +5960,11 @@ async function runActorTurn(
             });
           },
         } : {}),
+        // The retired `<auto-task>` container offered this route from the bus;
+        // the tool is the only writer now, so it reports the save instead.
+        onAutoTaskSaved: (taskId: string) => {
+          stageAppNavRequest(w, { surface_id: 'auto', action: 'configure', target_id: taskId });
+        },
         onSkillAdvertised: (id, sys) => skillBuffer.recordAdvertised(id, sys),
         onSkillInvoked: (id, sys, trig) => skillBuffer.recordInvoked(id, sys, trig),
         // Top-level group turns (commander / member) keep their large cached
@@ -5939,6 +6023,21 @@ async function runActorTurn(
       // Stream events → process channel.
       if (ev.type === 'final') {
         finalText = ev.text || '';
+      } else if (ev.type === 'commentary-finalized') {
+        const text = ev.text || '';
+        // The draft was already visible. Move only this round's suffix into
+        // process history; previous settled display segments retain their text.
+        if (text && streamingText.endsWith(text)) {
+          streamingText = streamingText.slice(0, -text.length);
+        }
+        appendChronologicalCommentary(processItems, text);
+        if (actor.kind !== 'worker') {
+          emit(state, {
+            type: 'process', cid, actor: actor.id,
+            turn_id: item.turnId, seg: segState.seg,
+            data: ev as unknown as Record<string, unknown>,
+          });
+        }
       } else if (ev.type === 'delta') {
         // Pulled out of the generic branch below so we can mirror the text
         // into `streamingText` for failure/abort settlement. The activity++ +
@@ -5947,6 +6046,7 @@ async function runActorTurn(
         const piece = (ev as { text?: string }).text;
         const phase = (ev as { phase?: unknown }).phase;
         if (typeof piece === 'string') {
+          if (phase === 'pending' && piece) unphasedTextWasStreamed = true;
           if (phase === 'commentary') {
             appendChronologicalCommentary(processItems, piece);
           } else {
@@ -5978,24 +6078,15 @@ async function runActorTurn(
             ev.failureKind || 'model',
             ev.failureCode || 'model_stream_error',
             ev.failurePhase,
+            ev.retryExhausted,
           );
         }
         log.warn('stream error', { cid, actor: actor.id, aborted, error: logErrorRef(errText) });
-      } else if (ev.type === 'event' && (ev.event as { stream?: unknown } | undefined)?.stream === 'agent_run_result') {
+      } else if (ev.type === 'event' && (ev.event as { stream?: unknown } | undefined)?.stream === 'agent_run_terminal') {
         const inner = (ev.event as { data?: unknown } | undefined)?.data;
         agentRunTimingData = inner && typeof inner === 'object'
           ? inner as Record<string, unknown>
           : undefined;
-        if (actor.kind !== 'worker') {
-          emit(state, {
-            type: 'agent_run_result',
-            cid,
-            actor: actor.id,
-            actor_type: actor.kind === 'commander' ? 'commander' : 'agent',
-            turn_id: item.turnId,
-            data: inner && typeof inner === 'object' ? (inner as Record<string, unknown>) : {},
-          });
-        }
       } else if (ev.type !== 'done') {
         activityEvents += 1;
         void touchActivity(uid, cid);
@@ -6072,13 +6163,23 @@ async function runActorTurn(
     // duplicate it. Keep the honest failure bubble and require manual retry.
     const toolPhaseHang = turnFailureCode === 'idle_timeout'
       && (turnFailurePhase === 'tool' || turnFailurePhase === 'tool_input');
-    if (!aborted
+    const canRetryChannel = !aborted
         && !w.stopRequested
         && !toolPhaseHang
-        && errText
+        && !!errText
         && CHANNEL_RETRY_FAILURE_CODES.has(turnFailureCode)
+        && !unphasedTextWasStreamed
         && !streamingText.trim()
-        && !finalText.trim()) {
+        && !finalText.trim();
+    if (canRetryChannel && turnFailureRetryExhausted) {
+      log.info('in-turn channel retry skipped', {
+        cid: maskId(cid),
+        actor: actor.id,
+        failure_code: turnFailureCode,
+        reason: 'inner_retry_exhausted',
+      });
+    }
+    if (canRetryChannel && !turnFailureRetryExhausted) {
       log.info('in-turn channel retry', {
         cid: maskId(cid),
         actor: actor.id,
@@ -6101,6 +6202,7 @@ async function runActorTurn(
       turnFailureKind = undefined;
       turnFailureCode = '';
       turnFailurePhase = undefined;
+      turnFailureRetryExhausted = false;
       w.abortController = new AbortController();
       await markInFlight(uid, cid, actor.id, true);
       await emitStateChanged(state);
@@ -6151,14 +6253,6 @@ async function runActorTurn(
     existing.name = skill.name;
     if (existing.kind !== 'created') existing.kind = skill.kind;
   };
-  if ((actor.kind === 'agent' || isCommander) && workingText) {
-    // The `Produced files:` footer belongs to the host, which renders it from
-    // the structured `produced` list for agent-facing context only. A line in
-    // the actor's own prose imitating that format is counterfeit: in the same
-    // run the host's own list was empty while the reply carried a footer
-    // naming the file that was never made.
-    workingText = stripCounterfeitProducedFilesFooter(workingText);
-  }
 
   if (actor.kind === 'agent' && actorInteractive && workingText) {
     const pi = extractPlanInteractionFromFinal(workingText);
@@ -6390,9 +6484,9 @@ async function runActorTurn(
     }
   } else if (isCommander && workingText && !aborted) {
     // `!aborted`: a user Stop is the single stop path — never apply container
-    // mutations (create/overwrite agent, write+validate skill, CRUD auto-task)
-    // from a salvaged partial reply, even if a complete container was emitted
-    // before Stop. Mirrors the sync-conflict guard above. The raw container
+    // mutations (create/overwrite agent, write+validate skill) from a salvaged
+    // partial reply, even if a complete container was emitted before Stop.
+    // Mirrors the sync-conflict guard above. The raw container
     // markup left in workingText is stripped on display by the renderer's
     // _stripSurvivingStructuralBlocks, so the aborted bubble stays clean.
     const commanderMutationNotices: string[] = [];
@@ -6562,6 +6656,8 @@ async function runActorTurn(
     // covers built-in / not-found / charset / collision cases — bus only
     // appends the pill.
     const skillR = extractSkillContainers(workingText);
+    let skillCorrectionAttempted = false;
+    let skillCorrectionSucceeded = false;
     if (skillR.containers.length) {
       workingText = skillR.cleanText;
       // Apply each `<skill>` container independently. A failed container
@@ -6569,7 +6665,56 @@ async function runActorTurn(
       // the chip slot only fills when the spec was actually written.
       for (const container of skillR.containers) {
         try {
-          const result = await skillsFeat.applySkillContainerFromCommander(container);
+          let result = await skillsFeat.applySkillContainerFromCommander(container);
+          if (!result.ok && !errText && !aborted && !w.stopRequested
+              && skillR.containers.length === 1 && !r.blocks.length
+              && !toolCreatedSkills.length && !terminalHandoffCompleted
+              && !item.llmPayload.includes(AGENT_MUTATION_FEEDBACK_TAG)) {
+            const correction = await import('./skill-creation-correction');
+            const message = correction.skillCreationCorrectionMessage(container, result, messageText);
+            if (message && !w.stopRequested && getActiveUserId() === uid && Date.now() < executionDeadlineAt) {
+              skillCorrectionAttempted = true;
+              const controller = new AbortController();
+              w.abortController = controller;
+              const timeout = setTimeout(() => controller.abort(),
+                Math.max(0, Math.min(60_000, executionDeadlineAt - Date.now())));
+              const progress = { type: 'progress' as const, text: t('chat.skill_creation_correcting', undefined, turnLanguage) };
+              appendProcessItem(processItems, progress);
+              emit(state, { type: 'process', cid, actor: actor.id, turn_id: item.turnId,
+                seg: segState.seg, data: progress });
+              let detachAbort = () => {};
+              try {
+                await markInFlight(uid, cid, actor.id, true);
+                await emitStateChanged(state);
+                const { completeSkillCreationCorrection } = await import('../../model/core-agent/runner');
+                const cancelled = new Promise<never>((_, reject) => {
+                  const onAbort = () => reject(new Error('Skill correction cancelled'));
+                  controller.signal.addEventListener('abort', onAbort, { once: true });
+                  detachAbort = () => controller.signal.removeEventListener('abort', onAbort);
+                  if (controller.signal.aborted) onAbort();
+                });
+                const text = await Promise.race([
+                  completeSkillCreationCorrection({ userId: uid, cid, turnId: item.turnId,
+                    message, signal: controller.signal }),
+                  cancelled,
+                ]);
+                const corrected = await correction.applySkillCreationCorrection(text, container, uid, controller.signal);
+                if (corrected) result = corrected;
+                skillCorrectionSucceeded = result.ok && !result.rejected?.length && !result.validation_failed?.length;
+              } catch {
+                // Preserve the original actionable rejection. No raw content or
+                // provider errors enter diagnostics, and no second correction.
+                log.warn('Skill creation correction did not complete');
+              } finally {
+                clearTimeout(timeout);
+                detachAbort();
+                w.abortController = null;
+                aborted ||= w.stopRequested;
+                await markInFlight(uid, cid, actor.id, false);
+                await emitStateChanged(state);
+              }
+            }
+          }
           if (result.ok && result.skillId && result.name && result.kind) {
             recordCreatedSkill({ skill_id: result.skillId, name: result.name, kind: result.kind });
             if (result.rejected && result.rejected.length) {
@@ -6622,48 +6767,12 @@ async function runActorTurn(
       }
     }
 
-    // `<auto-task>` container — commander-only automation CRUD. The skill
-    // teaches the model the field protocol; bus executes it through
-    // features/auto_tasks so renderer and model mutations share validation.
-    const autoR = autoTasksFeat.extractAutoTaskContainers(workingText);
-    if (autoR.containers.length) {
-      workingText = autoR.cleanText;
-      for (const container of autoR.containers) {
-        try {
-          const result = await autoTasksFeat.applyAutoTaskContainerFromCommander(uid, container, {
-            sourceAttachmentCid: cid,
-            projectId: turnProjectId,
-          });
-          if (result.ok) {
-            const name = escapeHtmlForBubble(result.title || result.taskId || 'auto task');
-            const verb = result.kind || 'updated';
-            const label = verb === 'created' ? 'created'
-              : verb === 'updated' ? 'updated'
-                : verb === 'deleted' ? 'deleted'
-                  : verb === 'enabled' ? 'enabled'
-                    : 'disabled';
-            appendCommanderMutationNotice(`<span>Automation ${label}: ${name}</span>`);
-            // Keep a successful direct operation inspectable. Creation and
-            // updates run through the full auto_tasks feature above; this
-            // sidecar only offers the user a click-to-open route to the
-            // resulting business object after that workflow has succeeded.
-            if (result.taskId && result.kind !== 'deleted') {
-              stageAppNavRequest(w, {
-                surface_id: 'auto',
-                action: 'configure',
-                target_id: result.taskId,
-              });
-            }
-          } else {
-            markTurnFailure('operation', 'auto_task_operation_failed');
-            appendCommanderMutationNotice(`<span style="color:var(--danger)">⚠️ Automation operation failed: ${escapeHtmlForBubble(result.error || 'unknown error')}</span>`);
-          }
-        } catch (err) {
-          log.error(`auto-task container failed cid=${cid}: ${(err as Error).message}`);
-          markTurnFailure('operation', 'auto_task_operation_failed');
-          appendCommanderMutationNotice(`<span style="color:var(--danger)">⚠️ Automation operation failed: ${escapeHtmlForBubble((err as Error).message)}</span>`);
-        }
-      }
+    if (skillCorrectionAttempted) {
+      // Only a single Skill operation enters correction. Its draft success
+      // claim cannot override the host result; preserve concrete diagnostics.
+      workingText = [t(skillCorrectionSucceeded ? 'chat.skill_creation_corrected'
+        : 'chat.skill_creation_correction_failed', undefined, turnLanguage),
+      ...commanderMutationNotices].join('\n\n');
     }
 
     // Rejected mutation prose is host-owned. The model may have claimed
@@ -6957,7 +7066,9 @@ async function runActorTurn(
       turn_end: true,
       turn_id: item.turnId,
       source_message_id: item.msgId,
-      ...(runtimeWaitingForInput ? { waitingForInput: true } : {}),
+      // The parsed prose marker must survive visible-reply classification;
+      // otherwise task-run aggregation mistakes this waiting reply for success.
+      ...(reviewGateOpen ? { waitingForInput: true } : {}),
       ...(item.taskId ? { task_id: item.taskId } : {}),
     });
     await registerFinalOutputResources(outcome.produced || []);
@@ -7309,7 +7420,7 @@ async function buildAgentsIndexBlock(
     if (!list.length) return `${header}(no agents)`;
     const entries = list.map((a: any) => {
       const name = a.name || a.agent_id;
-      const description = compactPromptDescription(
+      const description = compactAgentPromptDescription(
         pickPromptDescription(a),
         AGENT_DESCRIPTION_ROSTER_MAX_CHARS,
       );
@@ -7513,23 +7624,6 @@ function _toolJson(data: unknown): { content: string } {
   return { content: JSON.stringify(data) };
 }
 
-/** Remove a `Produced files: [...]` line the actor wrote itself.
- *
- *  The host owns that footer: it renders one from the structured `produced`
- *  list, which only ever contains paths that exist. A line matching its shape
- *  inside the reply text is therefore always authored by the model, and on
- *  2026-08-07 one named an mp4 the host had published nothing for.
- *
- *  Anchored to the line start and to the bracketed-array shape so ordinary
- *  prose mentioning produced files is untouched. */
-function stripCounterfeitProducedFilesFooter(text: string): string {
-  if (!text.includes('Produced files:')) return text;
-  return text
-    .replace(/^[ \t]*Produced files:[ \t]*\[[^\n]*\][ \t]*$/gm, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
 /** Resolve one name / ID with an optional display-mention prefix. Both named
  * dispatch tools share this lookup; callers still reject reserved actors. */
 async function resolveDispatchTarget(cid: string, toRaw: string): Promise<string | null> {
@@ -7656,8 +7750,8 @@ interface NestedDispatchOutcome {
   taskId?: string;
 }
 
-/** G8d step 3: run a dispatched sub-actor's turn IN-PROCESS, synchronously,
- * inside the caller's (commander's) turn, and return its result as a
+/** G8d step 3: run a sub-actor's turn IN-PROCESS, synchronously, inside the
+ * caller's turn, and return its result as a
  * `<worker-result>` block — the dispatch tool returns this as its tool result,
  * so the commander's stream resumes with the sub-run's full reply in context.
  * This is the single-layer replacement for the old stage → turn-end flush →
@@ -7692,10 +7786,7 @@ async function runNestedDispatch(
     }
   }
   const ac = new AbortController();
-  if (parentSignal) {
-    if (parentSignal.aborted) ac.abort();
-    else parentSignal.addEventListener('abort', () => ac.abort(), { once: true });
-  }
+  const onParentAbort = () => ac.abort(parentSignal?.reason);
   // Synthetic, throwaway WorkerState — runActorTurn only reads uid/cid/actor +
   // abortController off it on the worker path; it is never added to
   // `state.executions`, so quiescence / abort enumeration / the scheduler
@@ -7756,35 +7847,41 @@ async function runNestedDispatch(
     });
   }
   // Bound concurrent nested dispatches: when the commander fans out several
-  // run_worker/dispatch_to calls in one turn (G4 runs them concurrently),
-  // workerSlots caps how many actually run at once — the bound that replaces
-  // the global slot these nested runs skip (charter §6/§9). Acquired only here
-  // (the commander dispatches; workers/agents have no dispatch tools), so it is
-  // never re-entrant → no deadlock.
-  const [, releaseDispatch] = await workerSlots.acquire();
-  const nestedTurnStartedAtMs = Date.now();
-  log.info(`nested-dispatch start cid=${state.cid} worker=${actor.id} kind=${actor.kind}`);
-  // Surface a VISIBLE nested agent (`dispatch_to`; named `run_worker` is a
-  // compatibility path) as an active turn BEFORE its inference begins, so the
-  // renderer paints its "thinking" placeholder during the gap between the commander's
-  // narration and the agent's first token — instead of an empty pause. Anonymous
-  // workers (kind:'worker') stay silent (their stream is suppressed + handed
-  // back to the commander), so they are not surfaced. The bus already runs
-  // runActorTurn directly here (bypassing runTurn's markInFlight/emitStateChanged),
-  // which is exactly why no start-of-turn state_changed listed this actor before.
-  const surfaced = actor.kind === 'agent';
-  if (surfaced) {
-    state.nestedTurns.set(item.turnId, {
-      actor: actor.id,
-      turn_id: item.turnId,
-      msg_id: item.msgId,
-      steerable: false,
-      started_at_ms: nestedTurnStartedAtMs,
-      order: ++state.nextTurnOrder,
-    });
-    await emitStateChanged(state);
-  }
+  // run_worker/dispatch_to calls, or a named Agent invokes a host-owned
+  // internal review, workerSlots caps how many actually run at once — the
+  // bound that replaces the global slot these nested runs skip (charter
+  // §6/§9). Anonymous workers cannot invoke either path, so this is never
+  // re-entrant and cannot deadlock.
+  let releaseDispatch: Releaser | undefined;
+  let surfaced = false;
   try {
+    if (parentSignal?.aborted) onParentAbort();
+    else parentSignal?.addEventListener('abort', onParentAbort, { once: true });
+    releaseDispatch = await acquireWithAbort(async () => (await workerSlots.acquire())[1], ac.signal);
+    ac.signal.throwIfAborted();
+    const nestedTurnStartedAtMs = Date.now();
+    log.info(`nested-dispatch start cid=${state.cid} worker=${actor.id} kind=${actor.kind}`);
+    // Surface a VISIBLE nested agent (`dispatch_to`; named `run_worker` is a
+    // compatibility path) as an active turn BEFORE its inference begins, so the
+    // renderer paints its "thinking" placeholder during the gap between the commander's
+    // narration and the agent's first token — instead of an empty pause. Anonymous
+    // workers (kind:'worker') stay silent (their stream is suppressed + handed
+    // back to the commander), so they are not surfaced. The bus already runs
+    // runActorTurn directly here (bypassing runTurn's markInFlight/emitStateChanged),
+    // which is exactly why no start-of-turn state_changed listed this actor before.
+    surfaced = actor.kind === 'agent';
+    if (surfaced) {
+      state.nestedTurns.set(item.turnId, {
+        actor: actor.id,
+        turn_id: item.turnId,
+        msg_id: item.msgId,
+        steerable: false,
+        started_at_ms: nestedTurnStartedAtMs,
+        order: ++state.nextTurnOrder,
+      });
+      await emitStateChanged(state);
+    }
+    ac.signal.throwIfAborted();
     let r: ActorTurnResult;
     try {
       r = await runActorTurn(state, w, item, nestedTurnStartedAtMs);
@@ -7841,16 +7938,22 @@ async function runNestedDispatch(
       aborted: false,
       ...(form ? { form } : {}),
     };
-  } finally {
-    if (surfaced) {
-      // Turn ended (its bubble was already emitted + consumed the placeholder
-      // inside runActorTurn). Drop the mirror and re-emit so the commander
-      // re-enters active_turns for its post-dispatch synthesis, or the
-      // renderer's sweep clears any stray empty bubble after a failed sub-run.
-      state.nestedTurns.delete(item.turnId);
-      await emitStateChanged(state);
+  } catch (err) {
+    if (ac.signal.aborted || parentSignal?.aborted) {
+      return { payload: buildWorkerAbortPayload(actor.name || actor.id), aborted: true };
     }
-    releaseDispatch();
+    throw err;
+  } finally {
+    parentSignal?.removeEventListener('abort', onParentAbort);
+    try {
+      if (surfaced) {
+        // Drop the active-turn mirror even when setup or inference failed.
+        state.nestedTurns.delete(item.turnId);
+        await emitStateChanged(state);
+      }
+    } finally {
+      releaseDispatch?.();
+    }
   }
 }
 
@@ -7960,6 +8063,10 @@ async function runScheduledDispatch(
       ? { references: dispatchMessage.references.slice() }
       : {}),
   });
+  if (opts.backlogTask && !parentSignal?.aborted) {
+    const { recordTaskExecution } = await import('../project_tasks');
+    await recordTaskExecution(state.uid, opts.backlogTask.project_id, opts.backlogTask.task_id, state.cid);
+  }
   _scheduleAdmissions(state);
   const onParentAbort = () => {
     void cancelConversationTask(state.uid, state.cid, taskId).catch((err) => {
@@ -8319,7 +8426,7 @@ async function buildCommanderExtraTools(
     name: 'import_skill_package',
     description: [
       'Import Skills from a local directory or ZIP while preserving package files.',
-      'Use only when the current user turn explicitly requests import and supplies the exact absolute source path.',
+      'Use only on the user\'s import request. Supply an exact current-turn source, or the unique unchanged source the user supplied earlier in this conversation.',
       'The package must contain SKILL.md; each Skill is validated independently and rejected items are rolled back.',
     ].join(' '),
     inputSchema: {
@@ -8327,7 +8434,7 @@ async function buildCommanderExtraTools(
       properties: {
         source_path: {
           type: 'string',
-          description: 'Exact absolute directory or .zip path copied verbatim from the current user turn.',
+          description: 'Exact absolute directory or .zip path supplied by the user in this conversation.',
         },
       },
       required: ['source_path'],
@@ -8349,14 +8456,23 @@ async function buildCommanderExtraTools(
       if (!_currentTurnAuthorizesImportPath(
         currentTurnPayload, sourcePath, currentTurnAttachmentPaths,
       )) {
-        return {
-          content: JSON.stringify({
-            ok: false,
-            code: 'source_path_not_authorized',
-            error: 'source_path must be copied verbatim from the current user turn',
-          }),
-          isError: true,
-        };
+        const authorization = await historicalSkillImportAuthorization(uid, cid, currentTurnMessageId, sourcePath)
+          .catch(() => 'missing' as const);
+        if (authorization !== 'authorized') {
+          return {
+            content: JSON.stringify({
+              ok: false,
+              code: authorization === 'ambiguous' ? 'source_path_ambiguous'
+                : authorization === 'changed' ? 'source_path_changed' : 'source_path_not_authorized',
+              error: authorization === 'ambiguous'
+                ? 'Multiple earlier sources are available. Ask the user to specify the exact source path or attach the package again.'
+                : authorization === 'changed'
+                  ? 'The earlier source changed or its freshness cannot be verified. Ask the user to specify the source path or attach the package again.'
+                  : 'Ask the user to supply the exact source path or attach the package; no unique unchanged user-supplied source was verified in this conversation.',
+            }),
+            isError: true,
+          };
+        }
       }
 
       const result = await skillsFeat.importSkillPackageFromPath(sourcePath);
@@ -8838,10 +8954,14 @@ async function buildCommanderExtraTools(
             code: ctx?.signal?.aborted ? 'E_HANDOFF_CANCELLED' : 'E_HANDOFF_NOT_QUEUED',
           });
         }
+        if (backlog.task) {
+          const { recordTaskExecution } = await import('../project_tasks');
+          await recordTaskExecution(uid, backlog.task.project_id, backlog.task.task_id, cid);
+        }
         // endTurn: the Agent's queued turn is now the user-facing owner. No
         // child result is returned to this Commander model invocation.
         onTerminalHandoff?.();
-        return { content: JSON.stringify({ ok: true, handed_off_to: resolvedId }), endTurn: true };
+        return { content: JSON.stringify({ ok: true, handed_off_to: resolvedId }), endTurn: true, endTurnReason: 'handed_off' };
       } catch (err) {
         if (dispatchMessageId) _removeQueuedDispatch(state, dispatchMessageId, resolvedId);
         if (admission) {
@@ -9087,6 +9207,7 @@ export async function abort(uid: string, cid: string): Promise<void> {
   }
   // Abandon any pending custom-connector install confirmation for this
   // conversation — the agent that requested it is being stopped.
+  webAssistActionConfirm.cancelForCid(cid);
   try {
     const installConfirm = await import('../connectors/install_confirm');
     installConfirm.cancelForCid(cid);
@@ -9136,6 +9257,83 @@ export async function abort(uid: string, cid: string): Promise<void> {
   log.info(`abort user=${uid} cid=${cid} clearedQueue=${cleared} abortedWorkers=${aborted} abortedModelSessions=${abortedModelSessions}`);
 }
 
+/** Edit only an unclaimed user task. The board transaction rechecks the
+ * runtime queue synchronously, so a claim/cancel/send-now that won the race
+ * cannot leave the displayed text different from the actual execution. */
+export function beginConversationTaskEdit(uid: string, cid: string, taskId: string) {
+  const state = _cids.get(cidKey(uid, cid));
+  const item = state?.queue.find((candidate) => candidate.taskId === taskId);
+  if (!state || state.terminating || !item) return { ok: false, error: 'not_queued' };
+  if (item.fromActorId !== USER_ID || item.nested || item.commanderSubtask || item.terminalHandoff
+    || item.steerActiveTurn || item.sendNowPending || !item.sourceMessage || !item.deferredBubble) {
+    return { ok: false, error: 'not_editable' };
+  }
+  if (state.queue.some((candidate) => candidate !== item && candidate.composerEditing)) {
+    return { ok: false, error: 'edit_in_progress' };
+  }
+  item.composerEditing = true;
+  return { ok: true, message: { ...item.sourceMessage, text: item.sourceText },
+    recipient: { kind: item.actor.kind, id: item.actor.id, name: item.actor.name } };
+}
+
+export function cancelConversationTaskEdit(uid: string, cid: string, taskId: string) {
+  const state = _cids.get(cidKey(uid, cid));
+  const item = state?.queue.find((candidate) => candidate.taskId === taskId);
+  if (item) delete item.composerEditing;
+  if (state) _scheduleAdmissions(state);
+  return { ok: true };
+}
+
+export async function editConversationTask(
+  uid: string, cid: string, taskId: string,
+  instruction: string, expectedInstruction: string,
+  resources?: Pick<GroupMessage, 'attachments' | 'references' | 'use_selections'>,
+): Promise<{ ok: boolean; error?: string; task?: taskBoard.ConversationTask }> {
+  const state = _cids.get(cidKey(uid, cid));
+  if (!state || state.terminating) return { ok: false, error: 'not_queued' };
+  const result = await taskBoard.editQueued(uid, cid, taskId, instruction, expectedInstruction, () => {
+    const item = state.queue.find((candidate) => candidate.taskId === taskId);
+    if (state.terminating || !item) return { error: 'not_queued' };
+    if (item.fromActorId !== USER_ID || item.nested || item.commanderSubtask || item.terminalHandoff
+      || item.steerActiveTurn || item.sendNowPending || !item.sourceMessage || !item.deferredBubble) {
+      return { error: 'not_editable' };
+    }
+    // Editing a segmented send affects this task only. Its siblings can
+    // already have persisted the original message; never rewrite that history.
+    const msg: GroupMessage = {
+      ...item.sourceMessage,
+      ...(resources || {}),
+      id: item.sharedSourceMessage ? genId12() : item.msgId,
+      to: [item.actor.id], text: instruction,
+      ...(item.sharedSourceMessage ? { task_id: taskId } : {}),
+    };
+    delete msg.model_text;
+    delete msg.display_text;
+    delete msg.unknown_mentions;
+    delete msg.mentions;
+    msg.use_selections = _normalizeUseSelections(msg.use_selections);
+    const mentions = parseMentions(instruction);
+    if (mentions.length) msg.mentions = mentions;
+    if (item.sharedSourceMessage) delete msg.client_msg_id;
+    const payload = composeLlmTurnPayload(uid, USER_ID, msg);
+    item.msgId = msg.id;
+    item.sourceText = instruction;
+    item.sourceMessage = msg;
+    item.sharedSourceMessage = false;
+    item.llmPayload = payload;
+    item.attachments = msg.attachments?.slice();
+    item.references = msg.references?.slice();
+    item.useSelections = _normalizeUseSelections(msg.use_selections);
+    item.deferredBubble = deferredUserBubble(state, msg);
+    delete item.composerEditing;
+    return { sourceMsgId: msg.id, attachments: msg.attachments };
+  });
+  if (!result.task) return { ok: false, error: result.error };
+  emit(state, { type: 'task_state', cid, task: result.task });
+  _scheduleAdmissions(state);
+  return { ok: true, task: result.task };
+}
+
 /** Fold an already-queued user task into its assignee's live turn.
  *
  * This mutates the existing QueueItem instead of persisting a second user
@@ -9153,6 +9351,7 @@ export async function sendConversationTaskNow(
   if (!state || state.terminating) return { ok: false, error: 'runtime_unavailable' };
   const item = state.queue.find((candidate) => candidate.taskId === taskId);
   if (!item) return { ok: false, error: 'not_queued' };
+  if (item.composerEditing) return { ok: false, error: 'edit_in_progress' };
   if (item.fromActorId !== USER_ID || item.nested || item.commanderSubtask || item.terminalHandoff) {
     return { ok: false, error: 'not_sendable' };
   }
@@ -9161,12 +9360,14 @@ export async function sendConversationTaskNow(
     return { ok: false, error: 'turn_not_steerable' };
   }
   if (item.steerActiveTurn) return { ok: true, turn_id: live.currentTurnId };
+  if (item.sendNowPending) return { ok: false, error: 'send_in_progress' };
 
   // D21 queued-until-execution: folding into the live turn IS the moment the
   // message's work starts — persist the deferred bubble before delivery so
   // the transcript carries the message the runtime is about to consume. An
   // unfolded leftover later claimed as its own turn is already persisted.
   if (item.deferredBubble) {
+    item.sendNowPending = true;
     try {
       await item.deferredBubble.persist();
     } catch (err) {
@@ -9175,6 +9376,8 @@ export async function sendConversationTaskNow(
         error: logErrorSummary(err),
       });
       return { ok: false, error: 'persist_failed' };
+    } finally {
+      delete item.sendNowPending;
     }
     delete item.deferredBubble;
   }
@@ -9225,6 +9428,7 @@ export async function cancelConversationTask(
       if (changed) emit(state, { type: 'task_state', cid, task: changed });
       emit(state, { type: 'turn_silent', cid, actor: item.actor.id, turn_id: item.turnId });
       log.info(`task cancel user=${uid} cid=${cid} task=${maskId(taskId)} scope=queued`);
+      _scheduleAdmissions(state);
       return { ok: true, scope: 'queued' };
     }
     for (const [, w] of state.executions) {
@@ -9588,6 +9792,7 @@ async function _runCliAgentTurn(opts: {
   deadlineAt?: number;
   onActiveRunIngress?: (ingress: LocalActiveRunIngress | null) => void;
   onProcess: (data: Record<string, unknown>) => void;
+  onNativeMessage: (text: string, meta: { startedAtMs: number }) => Promise<void>;
 }): Promise<{
   text: string;
   error?: string;
@@ -9722,7 +9927,6 @@ async function _runCliAgentTurn(opts: {
     context_protocol: contextPlan.version,
   });
   const promptText = materializedContext.prompt;
-  const publicTaskBody = _resolveCliTaskBody(opts.item, opts.canonicalRows, opts.agent);
   // When the context compiler took the slash-command fast-path, promptText is
   // the raw `/cmd …` we forwarded. Remember the command name so the
   // success-return path below can swap CLI's (no content)/empty result
@@ -9734,7 +9938,10 @@ async function _runCliAgentTurn(opts: {
   const runner = await import('../local_agents/runner');
 
   const textState = createPhasedTextState();
-  const bufferPublicOutput = runtime.cli === 'hermes';
+  let claudeMessageId = '';
+  let claudeMessageText = '';
+  /** Wall-clock moment the current native message's first token arrived. */
+  let claudeMessageStartedAtMs = 0;
   const codexStreamFilter = runtime.cli === 'codex'
     ? new CodexFileCitationStreamFilter()
     : null;
@@ -9749,7 +9956,7 @@ async function _runCliAgentTurn(opts: {
     const text = codexStreamFilter.flush();
     const phase = codexBufferedPhase;
     codexBufferedPhase = undefined;
-    if (!text || slashCommandName || bufferPublicOutput) return;
+    if (!text || slashCommandName) return;
     opts.onProcess({
       type: 'delta',
       text,
@@ -9761,6 +9968,7 @@ async function _runCliAgentTurn(opts: {
   let backendSessionId: string | undefined;
   let resolvedCliModel = '';
   const produced = new Set<string>();
+  let declaredOutputs: string[] | undefined;
   const inlineGeneratedImages = new Set<string>();
   const inlineRemoteMedia = new Map<string, {
     uri: string;
@@ -9796,6 +10004,10 @@ async function _runCliAgentTurn(opts: {
     signal: opts.signal,
     deadlineAt: opts.deadlineAt,
     onActiveRunIngress: opts.onActiveRunIngress,
+    onOutputsPublished: (paths) => {
+      declaredOutputs = paths.filter((p) => produced.has(p) && isExistingProducedFile(p));
+      return [...declaredOutputs];
+    },
     onEvent: e => {
       if (e.type !== 'text-delta' && e.type !== 'done') {
         flushCodexBufferedText();
@@ -9816,12 +10028,25 @@ async function _runCliAgentTurn(opts: {
         case 'text-delta':
           if (typeof (e as any).text === 'string') {
             const text = (e as any).text as string;
-            // Claude exposes a canonical terminal result but no token-level
-            // final-answer phase. Its streamed prose is working commentary;
-            // treating it as such prevents a failed/timeout turn from copying
-            // the same text into both the process rail and the final body.
-            const sourcePhase = (e as any).phase
-              || (runtime.cli === 'claude' ? 'commentary' : undefined);
+            // Native message ids delimit public assistant messages. No text
+            // inspection or invented commentary/final phase is involved.
+            if (runtime.cli === 'claude' && !slashCommandName) {
+              const messageId = typeof e.itemId === 'string' ? e.itemId : '';
+              if (messageId && claudeMessageId && messageId !== claudeMessageId) {
+                const write = opts.onNativeMessage(claudeMessageText, { startedAtMs: claudeMessageStartedAtMs });
+                void write.catch(() => {});
+                asyncMessageWrites = asyncMessageWrites.then(() => write);
+                claudeMessageText = '';
+              }
+              if (messageId && messageId !== claudeMessageId) {
+                claudeMessageId = messageId;
+                claudeMessageStartedAtMs = Date.now();
+              } else if (!claudeMessageStartedAtMs) {
+                claudeMessageStartedAtMs = Date.now();
+              }
+              claudeMessageText += text;
+            }
+            const sourcePhase = e.phase;
             const phased = appendPhasedText(textState, text, sourcePhase);
             if (codexStreamFilter
                 && codexBufferedPhase
@@ -9838,7 +10063,7 @@ async function _runCliAgentTurn(opts: {
             // one shot as the final msg.text. Streaming would otherwise
             // flash the CLI's "(no content)" before our substitution
             // lands, since renderer commits each delta to the bubble.
-            if (!slashCommandName && !bufferPublicOutput) {
+            if (!slashCommandName) {
               if (phased.commentaryToFinalize) {
                 opts.onProcess({
                   type: 'commentary-finalized',
@@ -9848,8 +10073,7 @@ async function _runCliAgentTurn(opts: {
                 });
               }
               if (streamText) {
-                const presentationPhase = phased.phase
-                  || (runtime.cli === 'claude' ? 'commentary' : undefined);
+                const presentationPhase = phased.phase;
                 opts.onProcess({
                   type: 'delta',
                   text: streamText,
@@ -9978,22 +10202,13 @@ async function _runCliAgentTurn(opts: {
             }
           }
           if (typeof (e as any).output === 'string') resultText = (e as any).output as string;
-          // Claude Code has no token-level commentary/final phase, but its
-          // successful terminal `result` is canonical. Freeze the complete
-          // body that streamed before it into process history, then let the
-          // normal turn-end message repaint the body with `resultText`.
-          if (runtime.cli === 'claude'
-              && (e as any).status === 'completed'
-              && !slashCommandName) {
-            const commentary = commentaryForTerminalReplacement(textState, resultText);
-            if (commentary) {
-              opts.onProcess({
-                type: 'commentary-finalized',
-                text: commentary,
-                from: 'stream',
-                to: 'result',
-              });
-            }
+          // Background runs retain combined output for runner consumers; this
+          // bubble owns only the last native result, earlier messages have rows.
+          if (runtime.cli === 'claude' && claudeMessageId
+              && typeof e.finalMessageText === 'string') resultText = e.finalMessageText;
+          if (runtime.cli === 'claude' && (e as any).status !== 'completed'
+              && claudeMessageText && !slashCommandName) {
+            opts.onProcess({ type: 'commentary-finalized', text: claudeMessageText });
           }
           if ((e as any).status === 'cancelled') aborted = true;
           if (typeof (e as any).sessionId === 'string') backendSessionId = (e as any).sessionId as string;
@@ -10121,9 +10336,9 @@ async function _runCliAgentTurn(opts: {
   const publicOutput = normalizeLocalAgentPublicOutput({
     cli: runtime.cli as LocalCliType,
     text: unsuccessfulRun
-      ? resolvedUnsuccessfulPhasedText(textState, resultText)
-      : resolvedPhasedText(textState, resultText),
-    userTask: publicTaskBody,
+      ? (runtime.cli === 'claude' && claudeMessageText
+          ? '' : resolvedUnsuccessfulPhasedText(textState, resultText))
+      : resolvedPhasedText(textState, resultText || claudeMessageText),
     workingDir: opts.workingDir,
     producedPaths: Array.from(produced),
   });
@@ -10133,12 +10348,13 @@ async function _runCliAgentTurn(opts: {
     opts.cid,
     inlineRemoteMedia.values(),
   );
+  const publishedOutputs = declaredOutputs ?? (publicOutput.publishedPaths.length ? publicOutput.publishedPaths : undefined);
   if (result.status === 'cancelled') {
     return {
       text: publicText,
       aborted: true,
       produced: Array.from(produced),
-      published: publicOutput.publishedPaths,
+      published: publishedOutputs,
     };
   }
   if (result.status === 'failed' || result.status === 'timeout') {
@@ -10158,7 +10374,7 @@ async function _runCliAgentTurn(opts: {
       text: publicText,
       error: detail,
       produced: Array.from(produced),
-      published: publicOutput.publishedPaths,
+      published: publishedOutputs,
       failureKind: 'runtime',
       failureCode: result.status === 'timeout'
         ? (result.timeoutKind === 'wall' ? 'cli_wall_timeout' : result.timeoutKind === 'idle' ? 'cli_idle_timeout' : 'cli_timeout')
@@ -10170,14 +10386,14 @@ async function _runCliAgentTurn(opts: {
     return {
       text: t('cli_agent.slash_no_output', { cmd: slashCommandName }),
       produced: Array.from(produced),
-      published: publicOutput.publishedPaths,
+      published: publishedOutputs,
       ...(result.commanderHandoff ? { commanderHandoff: result.commanderHandoff } : {}),
     };
   }
   return {
     text: finalText,
     produced: Array.from(produced),
-    published: publicOutput.publishedPaths,
+    published: publishedOutputs,
     historySyncEligible: !contextPlan.passthrough,
     ...(result.commanderHandoff ? { commanderHandoff: result.commanderHandoff } : {}),
   };

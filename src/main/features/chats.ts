@@ -121,10 +121,19 @@ export function normalizeConnectorSetupAssistance(raw: unknown): ConnectorSetupA
   return { kind: 'connector_setup', connector_id: value.connector_id };
 }
 
+export type ConversationAssistance = ConnectorSetupAssistance | { kind: 'app_creation' };
+
+/** Persist only known entry metadata, never caller-authored model instructions. */
+export function normalizeConversationAssistance(raw: unknown): ConversationAssistance | undefined {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)
+    && (raw as Record<string, unknown>).kind === 'app_creation') return { kind: 'app_creation' };
+  return normalizeConnectorSetupAssistance(raw);
+}
+
 export interface Conversation {
   conversation_id: string;
-  /** Historical setup target only; does not imply active work, success, or permission. */
-  assistance?: ConnectorSetupAssistance;
+  /** Historical task entry association; does not imply active work, success, or permission. */
+  assistance?: ConversationAssistance;
   title: string;
   kind: ConversationKind;
   /** Optional starting agent — UI can suggest "@<this agent>" on the input
@@ -409,7 +418,7 @@ async function _runBounded<T>(
 
 function _cleanConversation(c: Conversation): Conversation {
   const { processing, processing_since, last_active_at, ...rest } = c;
-  const assistance = normalizeConnectorSetupAssistance(c.assistance);
+  const assistance = normalizeConversationAssistance(c.assistance);
   if (assistance) rest.assistance = assistance;
   else delete rest.assistance;
   return rest;
@@ -444,7 +453,7 @@ function _normaliseConversation(raw: any, fallbackCid = ''): Conversation | null
   };
   if (typeof raw.project_id === 'string' && raw.project_id) out.project_id = raw.project_id;
   if (typeof raw.origin_auto_task_id === 'string' && raw.origin_auto_task_id) out.origin_auto_task_id = raw.origin_auto_task_id;
-  const assistance = normalizeConnectorSetupAssistance(raw.assistance);
+  const assistance = normalizeConversationAssistance(raw.assistance);
   if (assistance) out.assistance = assistance;
   if (typeof raw.pinned_at === 'string' && raw.pinned_at) out.pinned_at = raw.pinned_at;
   if (typeof raw.pin_state_updated_at === 'string' && raw.pin_state_updated_at) out.pin_state_updated_at = raw.pin_state_updated_at;
@@ -1934,8 +1943,8 @@ export async function getConversationMetadata(
 }
 
 export interface CreateConversationOptions {
-  /** Catalog-validated by the setup entry boundary; persisted without private values. */
-  assistance?: ConnectorSetupAssistance;
+  /** Validated by the owning task entry boundary; persisted without private values. */
+  assistance?: ConversationAssistance;
   kind?: ConversationKind;
   agentId?: string;
   skillId?: string;
@@ -1963,7 +1972,7 @@ function normaliseConversationTitle(raw: unknown): string {
 export async function createConversation(userId: string, {
   kind = 'normal', agentId = '', skillId = '', title = '', projectId = '', conversationId = '', originAutoTaskId = '', assistance: rawAssistance,
 }: CreateConversationOptions = {}): Promise<Conversation> {
-  const assistance = normalizeConnectorSetupAssistance(rawAssistance);
+  const assistance = normalizeConversationAssistance(rawAssistance);
   const explicitCid = conversationId && safeId(conversationId) ? conversationId : '';
   const outcome = await _withConversationIndexStore(userId, async (store) => {
     if (explicitCid) {
@@ -2061,7 +2070,7 @@ export async function updateConversation(
       updated_at: updatedAt,
       ...(summaryWasFresh ? { participant_summary_updated_at: updatedAt } : {}),
     });
-    const assistance = normalizeConnectorSetupAssistance(next.assistance);
+    const assistance = normalizeConversationAssistance(next.assistance);
     if (assistance) next.assistance = assistance;
     else delete next.assistance;
     delete next.deleted_at;
@@ -2164,10 +2173,14 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, remov
   for (const sessionsDir of projectSessionRoots(userId, cid)) {
     try {
       const names = await fsp.readdir(sessionsDir);
-      for (const n of names) {
-        if (!n.startsWith(gmemberPrefix) || !n.endsWith('.jsonl')) continue;
-        purgeSession(userId, n.slice(0, -'.jsonl'.length));
+      const sessionIds = new Set<string>();
+      for (const name of names) {
+        if (!name.startsWith(gmemberPrefix)) continue;
+        // A model-state reset can leave only retained historical outputs.
+        const suffix = ['.jsonl', '.tool-results'].find((ext) => name.endsWith(ext));
+        if (suffix) sessionIds.add(name.slice(0, -suffix.length));
       }
+      for (const sessionId of sessionIds) purgeSession(userId, sessionId);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
         log.warn(`gmember sweep user=${userId} cid=${cid}: ${(err as Error).message}`);

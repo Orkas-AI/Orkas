@@ -202,13 +202,13 @@ describe('PC core regression unit coverage', () => {
     const savedApps = await import('../../src/main/features/saved_apps');
     const cid = 'cid_artifact_regression';
 
-    const created = artifacts.createArtifact(TEST_UID, cid, 'RegressionAgent', {
+    const created = (await artifacts.createArtifact(TEST_UID, cid, 'RegressionAgent', {
       title: 'Regression App',
       files: [
         { path: 'index.html', content: '<!doctype html><script src="assets/app.js"></script><h1>Regression</h1>' },
         { path: 'assets/app.js', content: 'window.result = 42;' },
       ],
-    });
+    }));
     expect(created.ok).toBe(true);
     if (!created.ok) return;
 
@@ -220,7 +220,7 @@ describe('PC core regression unit coverage', () => {
     }
     expect(artifacts.resolveArtifactFilePath(TEST_UID, cid, created.artifactId, '../secrets.txt').ok).toBe(false);
 
-    const saved = savedApps.saveFromArtifact(TEST_UID, cid, created.artifactId);
+    const saved = (await savedApps.saveFromArtifact(TEST_UID, cid, created.artifactId));
     expect(saved.ok).toBe(true);
     if (!saved.ok) return;
     expect(savedApps.listSavedApps(TEST_UID).map((app) => app.title)).toEqual(['Regression App']);

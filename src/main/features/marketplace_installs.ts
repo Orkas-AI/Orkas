@@ -51,7 +51,6 @@ import { Mutex } from 'async-mutex';
 import { userMarketplaceInstallsFile, userMarketplaceDirCloud } from '../paths';
 import { safeId } from '../storage';
 import { createLogger } from '../logger';
-import { isExpiredMsTombstone } from '../util/tombstone_retention';
 import { minAppVersionFrom, type MinAppVersionSource } from '../util/app-version-compat';
 
 const log = createLogger('marketplace_installs');
@@ -74,6 +73,11 @@ function _getWriteLock(uid: string): Mutex {
   let m = _writeLocks.get(uid);
   if (!m) { m = new Mutex(); _writeLocks.set(uid, m); }
   return m;
+}
+
+/** Serializes only manifest read/commit work, never network or package staging. */
+export function withMarketplaceManifestLock<T>(uid: string, fn: () => Promise<T>): Promise<T> {
+  return _getWriteLock(uid).runExclusive(fn);
 }
 
 export interface AgentInstall {
@@ -139,6 +143,7 @@ export interface InstallsManifest {
   version: typeof CURRENT_VERSION;
   agents: AgentInstall[];
   skills: SkillInstall[];
+  /** Durable user intent; unlike file tombstones, this never expires. */
   _deleted_at?: {
     agents?: Record<string, number>;
     skills?: Record<string, number>;
@@ -156,7 +161,7 @@ export function normalizeInstallVersion(value: unknown): string {
 
 export async function readInstalls(uid: string): Promise<InstallsManifest> {
   const file = userMarketplaceInstallsFile(uid);
-  if (!fs.existsSync(file)) return { ...EMPTY };
+  if (!fs.existsSync(file)) return { ...EMPTY, agents: [], skills: [] };
   try {
     const text = await fsp.readFile(file, 'utf8');
     const parsed = JSON.parse(text) as Partial<InstallsManifest> & { version?: unknown };
@@ -171,22 +176,63 @@ export async function readInstalls(uid: string): Promise<InstallsManifest> {
       // parsedVersion. For now there's no v0, so this branch is documentation-only.
       log.info(`installs.json schema v${parsedVersion} < v${CURRENT_VERSION}; no migration needed yet`);
     }
+    const deletedAt = _readDeletedAt(parsed);
     return {
       version: CURRENT_VERSION,
-      agents: Array.isArray(parsed.agents) ? parsed.agents.filter(_isAgentRow).map(_normalizeAgentRow) : [],
-      skills: Array.isArray(parsed.skills) ? parsed.skills.filter(_isSkillRow).map(_normalizeSkillRow) : [],
-      ...(_readDeletedAt(parsed) ? { _deleted_at: _readDeletedAt(parsed) } : {}),
+      agents: Array.isArray(parsed.agents) ? parsed.agents.filter(_isAgentRow).filter((r) => !(Number(deletedAt?.agents?.[r.id]) >= r.installed_at)).map(_normalizeAgentRow) : [],
+      skills: Array.isArray(parsed.skills) ? parsed.skills.filter(_isSkillRow).filter((r) => !(Number(deletedAt?.skills?.[r.id]) >= r.installed_at)).map(_normalizeSkillRow) : [],
+      ...(deletedAt ? { _deleted_at: deletedAt } : {}),
     };
   } catch (err) {
     log.warn(`read ${file} failed: ${(err as Error).message}`);
-    return { ...EMPTY };
+    return { ...EMPTY, agents: [], skills: [] };
   }
 }
 
 /** Atomic write: temp file + rename. Caller is the single writer in this process.
  *  Always stamps `version: CURRENT_VERSION` regardless of the passed-in manifest's `version`
  *  field — guarantees forward-only schema progression even if a reader passes a stale value. */
-export async function writeInstalls(uid: string, manifest: InstallsManifest): Promise<void> {
+/** IDs intentionally replaced by a migration, with the installation clock it read.
+ * Missing rows in a background snapshot alone never authorize removing an install. */
+export type InstallSnapshotRemovals = Partial<Record<'agents' | 'skills', Record<string, number>>>;
+
+export async function writeInstalls(uid: string, manifest: InstallsManifest, removals: InstallSnapshotRemovals = {}): Promise<void> {
+  await withMarketplaceManifestLock(uid, async () => {
+    const current = await readInstalls(uid);
+    const next: InstallsManifest = { ...manifest, agents: [...manifest.agents], skills: [...manifest.skills],
+      _deleted_at: { agents: { ...manifest._deleted_at?.agents }, skills: { ...manifest._deleted_at?.skills } } };
+    for (const kind of ['agents', 'skills'] as const) {
+      for (const [id, deletedAt] of Object.entries(current._deleted_at?.[kind] || {})) {
+        next._deleted_at![kind]![id] = Math.max(deletedAt, next._deleted_at![kind]![id] || 0);
+      }
+    }
+    next.agents = _preserveBulkInstallIntent(next.agents, current.agents, next._deleted_at!.agents!, current._deleted_at?.agents, removals.agents);
+    next.skills = _preserveBulkInstallIntent(next.skills, current.skills, next._deleted_at!.skills!, current._deleted_at?.skills, removals.skills);
+    _pruneDeletedAt(next);
+    await _writeInstalls(uid, next);
+  });
+}
+
+// A bulk seed/resolution snapshot is not a new user action. Keep newer install
+// rows and do not let its stale deletion erase a deliberate reinstall.
+function _preserveBulkInstallIntent<T extends { id: string; installed_at: number }>(
+  rows: T[], current: T[], deletes: Record<string, number>, currentDeletes: Record<string, number> = {},
+  removals: Record<string, number> = {},
+): T[] {
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  for (const row of current) {
+    const candidate = byId.get(row.id);
+    if (candidate && row.installed_at > candidate.installed_at) {
+      byId.set(row.id, row);
+    } else if (!candidate && removals[row.id] !== row.installed_at) {
+      byId.set(row.id, row);
+    }
+    if (row.installed_at > (deletes[row.id] || Infinity)) delete deletes[row.id];
+  }
+  return [...byId.values()].filter((row) => !currentDeletes[row.id]);
+}
+
+async function _writeInstalls(uid: string, manifest: InstallsManifest): Promise<void> {
   await fsp.mkdir(userMarketplaceDirCloud(uid), { recursive: true });
   const file = userMarketplaceInstallsFile(uid);
   const tmp = `${file}.tmp`;
@@ -196,45 +242,69 @@ export async function writeInstalls(uid: string, manifest: InstallsManifest): Pr
   _markInstallsDirty();
 }
 
-export async function addAgentInstall(uid: string, row: Omit<AgentInstall, 'installed_at'> & { installed_at?: number }): Promise<void> {
+/** Background work may refresh an existing installation or seed a never-uninstalled id.
+ * Only an explicit install may clear durable uninstall intent. */
+export interface InstallWriteOptions {
+  mode?: 'install' | 'update' | 'seed' | 'restore';
+}
+
+export async function addAgentInstall(uid: string, row: Omit<AgentInstall, 'installed_at'> & { installed_at?: number }, opts: InstallWriteOptions = {}): Promise<boolean> {
   _assertSafeMarketplaceId(row.id);
-  await _getWriteLock(uid).runExclusive(async () => {
+  return _getWriteLock(uid).runExclusive(async () => {
     const manifest = await readInstalls(uid);
     const idx = manifest.agents.findIndex((a) => a.id === row.id);
     const previous = idx >= 0 ? manifest.agents[idx] : null;
+    const deletedAt = manifest._deleted_at?.agents?.[row.id] || 0;
+    const mode = opts.mode || 'install';
+    if (mode !== 'install' && deletedAt > 0
+      && !(mode === 'restore' && Number(row.installed_at) > deletedAt)) return false;
+    if (mode === 'update' && (!previous
+      || (row.installed_at !== undefined && row.installed_at !== previous.installed_at))) return false;
     const entry: AgentInstall = _normalizeAgentRow({
       ...(previous || {}),
       ...row,
       version: normalizeInstallVersion(row.version || previous?.version),
-      installed_at: row.installed_at || previous?.installed_at || Date.now(),
+      installed_at: mode === 'install' && deletedAt > 0
+        ? Math.max(Date.now(), deletedAt + 1)
+        : (mode === 'update' ? previous!.installed_at : (row.installed_at || previous?.installed_at || Date.now())),
     } as AgentInstall & MinAppVersionSource);
     if (idx >= 0) manifest.agents[idx] = entry;
     else manifest.agents.push(entry);
     delete manifest._deleted_at?.agents?.[row.id];
     _pruneDeletedAt(manifest);
-    await writeInstalls(uid, manifest);
+    await _writeInstalls(uid, manifest);
     log.info(`agent installed id=${row.id} v${entry.version}`);
+    return true;
   });
 }
 
-export async function addSkillInstall(uid: string, row: Omit<SkillInstall, 'installed_at'> & { installed_at?: number }): Promise<void> {
+export async function addSkillInstall(uid: string, row: Omit<SkillInstall, 'installed_at'> & { installed_at?: number }, opts: InstallWriteOptions = {}): Promise<boolean> {
   _assertSafeMarketplaceId(row.id);
-  await _getWriteLock(uid).runExclusive(async () => {
+  return _getWriteLock(uid).runExclusive(async () => {
     const manifest = await readInstalls(uid);
     const idx = manifest.skills.findIndex((s) => s.id === row.id);
     const previous = idx >= 0 ? manifest.skills[idx] : null;
+    const deletedAt = manifest._deleted_at?.skills?.[row.id] || 0;
+    const mode = opts.mode || 'install';
+    if (mode !== 'install' && deletedAt > 0
+      && !(mode === 'restore' && Number(row.installed_at) > deletedAt)) return false;
+    if (mode === 'update' && (!previous
+      || (row.installed_at !== undefined && row.installed_at !== previous.installed_at))) return false;
     const entry: SkillInstall = _normalizeSkillRow({
       ...(previous || {}),
       ...row,
       version: normalizeInstallVersion(row.version || previous?.version),
-      installed_at: row.installed_at || previous?.installed_at || Date.now(),
+      installed_at: mode === 'install' && deletedAt > 0
+        ? Math.max(Date.now(), deletedAt + 1)
+        : (mode === 'update' ? previous!.installed_at : (row.installed_at || previous?.installed_at || Date.now())),
     } as SkillInstall & MinAppVersionSource);
     if (idx >= 0) manifest.skills[idx] = entry;
     else manifest.skills.push(entry);
     delete manifest._deleted_at?.skills?.[row.id];
     _pruneDeletedAt(manifest);
-    await writeInstalls(uid, manifest);
+    await _writeInstalls(uid, manifest);
     log.info(`skill installed id=${row.id} v${entry.version}`);
+    return true;
   });
 }
 
@@ -243,12 +313,12 @@ export async function removeAgentInstall(uid: string, id: string): Promise<boole
   return _getWriteLock(uid).runExclusive(async () => {
     const manifest = await readInstalls(uid);
     const before = manifest.agents.length;
+    const installedAt = manifest.agents.find((row) => row.id === id)?.installed_at || 0;
     manifest.agents = manifest.agents.filter((a) => a.id !== id);
-    if (manifest.agents.length === before) return false;
-    _markDeleted(manifest, 'agents', id);
-    await writeInstalls(uid, manifest);
+    _markDeleted(manifest, 'agents', id, installedAt);
+    await _writeInstalls(uid, manifest);
     log.info(`agent uninstalled id=${id}`);
-    return true;
+    return manifest.agents.length !== before;
   });
 }
 
@@ -257,12 +327,12 @@ export async function removeSkillInstall(uid: string, id: string): Promise<boole
   return _getWriteLock(uid).runExclusive(async () => {
     const manifest = await readInstalls(uid);
     const before = manifest.skills.length;
+    const installedAt = manifest.skills.find((row) => row.id === id)?.installed_at || 0;
     manifest.skills = manifest.skills.filter((s) => s.id !== id);
-    if (manifest.skills.length === before) return false;
-    _markDeleted(manifest, 'skills', id);
-    await writeInstalls(uid, manifest);
+    _markDeleted(manifest, 'skills', id, installedAt);
+    await _writeInstalls(uid, manifest);
     log.info(`skill uninstalled id=${id}`);
-    return true;
+    return manifest.skills.length !== before;
   });
 }
 
@@ -335,7 +405,6 @@ function _readDeletedAt(parsed: Partial<InstallsManifest> & { version?: unknown 
     const clean: Record<string, number> = {};
     for (const [id, value] of Object.entries(bucket as Record<string, unknown>)) {
       const n = Number(value);
-      if (isExpiredMsTombstone(n)) continue;
       if (safeId(id) && Number.isFinite(n) && n > 0) clean[id] = n;
     }
     if (Object.keys(clean).length > 0) out[kind] = clean;
@@ -347,10 +416,10 @@ function _assertSafeMarketplaceId(id: string): void {
   if (!safeId(id)) throw new Error('invalid marketplace id');
 }
 
-function _markDeleted(manifest: InstallsManifest, kind: 'agents' | 'skills', id: string): void {
+function _markDeleted(manifest: InstallsManifest, kind: 'agents' | 'skills', id: string, installedAt: number): void {
   manifest._deleted_at = manifest._deleted_at || {};
   manifest._deleted_at[kind] = manifest._deleted_at[kind] || {};
-  manifest._deleted_at[kind]![id] = Date.now();
+  manifest._deleted_at[kind]![id] = Math.max(Date.now(), installedAt + 1, manifest._deleted_at[kind]![id] || 0);
 }
 
 function _pruneDeletedAt(manifest: InstallsManifest): void {

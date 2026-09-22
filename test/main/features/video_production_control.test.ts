@@ -20,6 +20,7 @@ import {
   VIDEO_PRODUCTION_GENERATE_SPEC_ALLOWED_FIELDS,
 } from '../../../src/main/features/video_production_control';
 import { GENERATE_SPEC_ALLOWED_FIELDS } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edl';
+import { videoProductionIsGeneration } from '../../../src/main/features/video_production_mode';
 
 let root = '';
 let planPath = '';
@@ -77,6 +78,80 @@ afterEach(() => {
 });
 
 describe('VideoStudio project production control', () => {
+  it('recomputes the current video mode across caption revisions, restart and another video without invalidating approval for an annotation', async () => {
+    const approved = await approveVideoProductionPlan({ statePath, planPath, turnId: 'approved' });
+    const direct = plan();
+    direct._runtime = { is_generation: false };
+    writePlan(direct);
+    const before = await validateVideoProductionPlanApproval({ statePath, planPath });
+    expect(before.identity.signature).toBe(approved.identity.signature);
+    expect(videoProductionControlSummary(before.identity, before.state).is_generation).toBe(true);
+
+    await approveVideoProductionGeneration({ statePath, planPath, turnId: 'generate' });
+    const outputPath = path.join(root, 'shot-1.mp4');
+    const generation = { statePath, planPath, segmentId: 'shot-1', kind: 'video' as const, outputPath, request: request() };
+    const begun = await beginVideoProductionGeneration(generation);
+    if (begun.status !== 'started') throw new Error('expected first generation');
+    fs.writeFileSync(outputPath, 'original-generated-video');
+    await finishVideoProductionGeneration({
+      ...generation, transactionId: begun.transaction.transaction_id,
+      ok: true, providerTaskId: 'original-provider-task',
+    });
+    Object.assign((direct.segments as Array<Record<string, unknown>>)[0], { status: 'done', produced_path: outputPath });
+
+    // A stale true annotation must not exempt the new local caption operation.
+    direct._runtime = { is_generation: true };
+    direct.tracks = { captions: { lines: [{ text: '$19.99', start_sec: 0, target_sec: 5 }] } };
+    writePlan(direct);
+    const current = await readVideoProductionPlanIdentity(planPath);
+    const resumed = await readVideoProductionControlState(statePath, planPath);
+    const summary = videoProductionControlSummary(current, resumed);
+    expect(summary).toMatchObject({ is_generation: false, plan_approval_current: false });
+    expect(current.signature).not.toBe(before.identity.signature);
+
+    // Approving only the caption amendment preserves completed footage and its
+    // provenance without authorizing another paid generation of that footage.
+    const amended = await approveVideoProductionPlan({ statePath, planPath, turnId: 'caption-request' });
+    expect(videoProductionControlSummary(amended.identity, amended.state)).toMatchObject({
+      is_generation: false, plan_approval_current: true, generation_approval_current: false,
+    });
+    expect(amended.identity.generation_intents).toEqual(before.identity.generation_intents);
+    expect(amended.state.transaction_history).toContainEqual(expect.objectContaining({
+      transaction_id: begun.transaction.transaction_id, status: 'completed',
+      output_path: outputPath, provider_task_id: 'original-provider-task',
+    }));
+    await expect(beginVideoProductionGeneration(generation)).rejects.toThrow(/E_VIDEO_PRODUCTION_GATE_C_REQUIRED/);
+    expect(fs.readFileSync(outputPath, 'utf8')).toBe('original-generated-video');
+
+    const anotherPath = path.join(root, 'another-video.json');
+    fs.writeFileSync(anotherPath, JSON.stringify(plan()));
+    const another = await readVideoProductionPlanIdentity(anotherPath);
+    expect(videoProductionControlSummary(another, await readVideoProductionControlState(path.join(root, 'another-state.json'), anotherPath)))
+      .toMatchObject({ is_generation: true, plan_approval_current: false });
+  });
+
+  it('classifies executable output work rather than route, reference inputs or a claimed flag', () => {
+    const direct = plan();
+    const segment = (direct.segments as Array<Record<string, any>>)[0];
+    segment.spec.reference_image_paths = ['project/prepared-product.png'];
+    segment.spec.reference_video_paths = ['project/trimmed-reference.mp4'];
+    direct.tracks = { narration: null, music: {}, captions: null };
+    direct.route = 'EDIT';
+    segment.spec.operation = 'edit';
+    expect(videoProductionIsGeneration(direct)).toBe(true);
+    for (const source of ['compose', 'edit', 'provided']) {
+      expect(videoProductionIsGeneration({ ...direct, is_generation: true,
+        segments: [{ ...segment, source }] })).toBe(false);
+    }
+    expect(videoProductionIsGeneration({ ...direct, segments: [segment, { ...segment, id: 'shot-2' }] })).toBe(false);
+    expect(videoProductionIsGeneration({ ...direct, segments: [segment, { ...segment, layer: 'overlay', id: 'logo' }] })).toBe(false);
+    expect(videoProductionIsGeneration({ ...direct, segments: [{ ...segment, spec: { media_kind: 'image' } }] })).toBe(false);
+    for (const tracks of [null, [], { music: { path: 'bed.mp3' } }, { narration: { segments: [] } }, { captions: { from: 'speech' } }]) {
+      expect(videoProductionIsGeneration({ ...direct, tracks })).toBe(false);
+    }
+    expect(videoProductionIsGeneration({ is_generation: true })).toBe(false);
+  });
+
   it('keeps the script and native Gate B on the same generate-field contract', () => {
     expect(VIDEO_PRODUCTION_GENERATE_SPEC_ALLOWED_FIELDS).toEqual(GENERATE_SPEC_ALLOWED_FIELDS);
   });

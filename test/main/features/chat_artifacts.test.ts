@@ -1,3 +1,4 @@
+import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -10,16 +11,19 @@ const AGENT = 'helper';
 let tmpDir: string;
 let prevWs: string | undefined;
 
+let closeLogWorkers: () => Promise<void>;
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-chatart-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  closeLogWorkers = await captureMainLogWorkers();
   const users = await import('../../../src/main/features/users');
   users.activateUser(UID);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await closeLogWorkers();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -49,10 +53,10 @@ describe('chat_artifacts › bridge injection', () => {
 
   it('gives an ordinary artifact the auto-sizing bridge without being asked', async () => {
     const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, {
+    const r = (await m.createArtifact(UID, CID, AGENT, {
       title: 'Sized',
       files: [{ path: 'index.html', content: '<!doctype html><html><head><title>a</title></head><body><button>go</button></body></html>' }],
-    });
+    }));
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const html = readEntry(path.join(cidDir(), r.artifactId));
@@ -66,7 +70,7 @@ describe('chat_artifacts › bridge injection', () => {
   it('does not inject twice when the artifact already loads the bridge', async () => {
     const m = await loadMod();
     const authored = `<!doctype html><html><head>${m.BRIDGE_SCRIPT_TAG}</head><body><button>go</button></body></html>`;
-    const r = m.createArtifact(UID, CID, AGENT, { title: 'Own bridge', files: [{ path: 'index.html', content: authored }] });
+    const r = (await m.createArtifact(UID, CID, AGENT, { title: 'Own bridge', files: [{ path: 'index.html', content: authored }] }));
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const html = readEntry(path.join(cidDir(), r.artifactId));
@@ -79,7 +83,7 @@ describe('chat_artifacts › bridge injection', () => {
     const authored = '<!doctype html><html><head><script>'
       + 'parent.postMessage({ __orkasArtifact: true, type: "resize", height: 300 }, "*");'
       + '</script></head><body><button>go</button></body></html>';
-    const r = m.createArtifact(UID, CID, AGENT, { title: 'Self sizing', files: [{ path: 'index.html', content: authored }] });
+    const r = (await m.createArtifact(UID, CID, AGENT, { title: 'Self sizing', files: [{ path: 'index.html', content: authored }] }));
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(readEntry(path.join(cidDir(), r.artifactId))).not.toContain(m.BRIDGE_RELPATH);
@@ -87,10 +91,10 @@ describe('chat_artifacts › bridge injection', () => {
 
   it('places the tag in a fragment that has no head or body', async () => {
     const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, {
+    const r = (await m.createArtifact(UID, CID, AGENT, {
       title: 'Fragment',
       files: [{ path: 'index.html', content: '<h1>hi</h1><button>go</button>' }],
-    });
+    }));
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const html = readEntry(path.join(cidDir(), r.artifactId));
@@ -101,13 +105,13 @@ describe('chat_artifacts › bridge injection', () => {
   it('only touches the entry file', async () => {
     const m = await loadMod();
     const helper = 'export const value = 1;\n';
-    const r = m.createArtifact(UID, CID, AGENT, {
+    const r = (await m.createArtifact(UID, CID, AGENT, {
       title: 'Multi',
       files: [
         { path: 'index.html', content: '<!doctype html><html><body><button>go</button></body></html>' },
         { path: 'app.js', content: helper },
       ],
-    });
+    }));
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const dir = path.join(cidDir(), r.artifactId);
@@ -128,7 +132,7 @@ describe('chat_artifacts › bridge injection', () => {
 describe('chat_artifacts › createArtifact', () => {
   it('accepts a minimal one-file app, stamps meta, returns the id', async () => {
     const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, { title: 'Tip calc', files: MIN_FILES });
+    const r = (await m.createArtifact(UID, CID, AGENT, { title: 'Tip calc', files: MIN_FILES }));
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.artifactId).toMatch(/^[A-Za-z0-9_-]{8,}$/);
@@ -145,14 +149,14 @@ describe('chat_artifacts › createArtifact', () => {
 
   it('accepts a multi-file app with a nested asset', async () => {
     const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, {
+    const r = (await m.createArtifact(UID, CID, AGENT, {
       title: 'Dash',
       files: [
         { path: 'index.html', content: '<!doctype html><script src="assets/app.js"></script>' },
         { path: 'assets/app.js', content: 'console.log(1)' },
         { path: 'style.css', content: 'body{margin:0}' },
       ],
-    });
+    }));
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const dir = path.join(cidDir(), r.artifactId);
@@ -162,8 +166,8 @@ describe('chat_artifacts › createArtifact', () => {
 
   it('discards one failed candidate without removing sibling artifacts', async () => {
     const m = await loadMod();
-    const first = m.createArtifact(UID, CID, AGENT, { title: 'First', files: MIN_FILES });
-    const second = m.createArtifact(UID, CID, AGENT, { title: 'Second', files: MIN_FILES });
+    const first = (await m.createArtifact(UID, CID, AGENT, { title: 'First', files: MIN_FILES }));
+    const second = (await m.createArtifact(UID, CID, AGENT, { title: 'Second', files: MIN_FILES }));
     expect(first.ok).toBe(true);
     expect(second.ok).toBe(true);
     if (!first.ok || !second.ok) return;
@@ -185,12 +189,12 @@ describe('chat_artifacts › createArtifact', () => {
   it('accepts base64-encoded binary content for an image asset', async () => {
     const m = await loadMod();
     const pngB64 = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64');
-    const r = m.createArtifact(UID, CID, AGENT, {
+    const r = (await m.createArtifact(UID, CID, AGENT, {
       files: [
         { path: 'index.html', content: '<!doctype html><img src="logo.png">' },
         { path: 'logo.png', content: pngB64, encoding: 'base64' },
       ],
-    });
+    }));
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const buf = fs.readFileSync(path.join(cidDir(), r.artifactId, 'logo.png'));
@@ -199,7 +203,7 @@ describe('chat_artifacts › createArtifact', () => {
 
   it('rejects: no index.html', async () => {
     const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, { files: [{ path: 'main.html', content: 'x' }] });
+    const r = (await m.createArtifact(UID, CID, AGENT, { files: [{ path: 'main.html', content: 'x' }] }));
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.error).toMatch(/index\.html/);
@@ -207,82 +211,77 @@ describe('chat_artifacts › createArtifact', () => {
 
   it('rejects: empty / non-array files', async () => {
     const m = await loadMod();
-    expect((m.createArtifact(UID, CID, AGENT, { files: [] }) as { ok: boolean }).ok).toBe(false);
-    expect((m.createArtifact(UID, CID, AGENT, { files: 'nope' as unknown as [] }) as { ok: boolean }).ok).toBe(false);
+    expect(((await m.createArtifact(UID, CID, AGENT, { files: [] })) as { ok: boolean }).ok).toBe(false);
+    expect(((await m.createArtifact(UID, CID, AGENT, { files: 'nope' as unknown as [] })) as { ok: boolean }).ok).toBe(false);
   });
 
   it('rejects: path traversal in a file path', async () => {
     const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, {
+    const r = (await m.createArtifact(UID, CID, AGENT, {
       files: [{ path: 'index.html', content: 'x' }, { path: '../escape.js', content: 'x' }],
-    });
+    }));
     expect(r.ok).toBe(false);
   });
 
   it('rejects: absolute file path', async () => {
     const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, {
+    const r = (await m.createArtifact(UID, CID, AGENT, {
       files: [{ path: 'index.html', content: 'x' }, { path: '/etc/passwd', content: 'x' }],
-    });
+    }));
     // leading slash is stripped → "etc/passwd" with no extension → unsupported ext
     expect(r.ok).toBe(false);
   });
 
   it('rejects: reserved __orkas-meta.json / __orkas/ paths', async () => {
     const m = await loadMod();
-    expect((m.createArtifact(UID, CID, AGENT, { files: [{ path: 'index.html', content: 'x' }, { path: '__orkas-meta.json', content: '{}' }] }) as { ok: boolean }).ok).toBe(false);
-    expect((m.createArtifact(UID, CID, AGENT, { files: [{ path: 'index.html', content: 'x' }, { path: '__orkas/bridge.js', content: 'x' }] }) as { ok: boolean }).ok).toBe(false);
+    expect(((await m.createArtifact(UID, CID, AGENT, { files: [{ path: 'index.html', content: 'x' }, { path: '__orkas-meta.json', content: '{}' }] })) as { ok: boolean }).ok).toBe(false);
+    expect(((await m.createArtifact(UID, CID, AGENT, { files: [{ path: 'index.html', content: 'x' }, { path: '__orkas/bridge.js', content: 'x' }] })) as { ok: boolean }).ok).toBe(false);
   });
 
   it('rejects: disallowed extension', async () => {
     const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, {
+    const r = (await m.createArtifact(UID, CID, AGENT, {
       files: [{ path: 'index.html', content: 'x' }, { path: 'evil.exe', content: 'AA==', encoding: 'base64' }],
-    });
+    }));
     expect(r.ok).toBe(false);
   });
 
-  it('rejects: too many files', async () => {
+  it('publishes a large multi-file app completely without blocking host progress', async () => {
     const m = await loadMod();
-    const files = [{ path: 'index.html', content: 'x' }];
-    for (let i = 0; i < 25; i++) files.push({ path: `f${i}.js`, content: 'x' });
-    const r = m.createArtifact(UID, CID, AGENT, { files });
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.error).toMatch(/too many files/);
+    const files = [{ path: 'index.html', content: '<h1>Large app</h1>' },
+      ...Array.from({ length: 25 }, (_, i) => ({ path: `assets/f${i}.js`, content: String(i) + 'x'.repeat(300 * 1024) }))];
+    let ticks = 0;
+    const timer = setInterval(() => { ticks++; }, 0);
+    const r = await m.createArtifact(UID, CID, AGENT, { files });
+    clearInterval(timer);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error(r.error);
+    expect(ticks).toBeGreaterThan(0);
+    for (const file of files.slice(1)) {
+      const served = m.resolveArtifactFilePath(UID, CID, r.artifactId, file.path);
+      expect(served.ok).toBe(true);
+      expect(fs.readFileSync(path.join(cidDir(), r.artifactId, file.path), 'utf8')).toBe(file.content);
+    }
+    expect(fs.readdirSync(cidDir())).toEqual([r.artifactId]);
   });
 
-  it('rejects: a single file over the per-file cap', async () => {
+  it('cleans staged files on an incomplete write and allows a fresh creation', async () => {
     const m = await loadMod();
-    const big = 'a'.repeat(300 * 1024);
-    const r = m.createArtifact(UID, CID, AGENT, { files: [{ path: 'index.html', content: '<x>' }, { path: 'big.js', content: big }] });
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.error).toMatch(/per-file cap/);
-  });
-
-  it('rejects: bundle over the total cap', async () => {
-    const m = await loadMod();
-    const chunk = 'a'.repeat(200 * 1024);
-    const r = m.createArtifact(UID, CID, AGENT, {
-      files: [
-        { path: 'index.html', content: '<x>' },
-        { path: 'a.js', content: chunk },
-        { path: 'b.js', content: chunk },
-        { path: 'c.js', content: chunk },
-        { path: 'd.js', content: chunk },
-        { path: 'e.js', content: chunk },
-        { path: 'f.js', content: chunk },
-      ],
-    });
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.error).toMatch(/total cap/);
+    // A file/directory collision happens after index.html has been staged.
+    const failed = await m.createArtifact(UID, CID, AGENT, { files: [
+      ...MIN_FILES, { path: 'asset.js', content: 'file' }, { path: 'asset.js/child.js', content: 'cannot write' },
+    ] });
+    expect(failed.ok).toBe(false);
+    expect(fs.readdirSync(cidDir())).toEqual([]);
+    const retry = await m.createArtifact(UID, CID, AGENT, { files: MIN_FILES });
+    expect(retry.ok).toBe(true);
+    if (!retry.ok) throw new Error(retry.error);
+    expect(fs.readdirSync(cidDir())).toEqual([retry.artifactId]);
   });
 
   it('rejects: utf8-encoded content for a binary extension', async () => {
     const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, { files: [{ path: 'index.html', content: '<x>' }, { path: 'logo.png', content: 'not base64 binary' }] });
+    const r = (await m.createArtifact(UID, CID, AGENT, { files: [{ path: 'index.html', content: '<x>' }, { path: 'logo.png', content: 'not base64 binary' }] }));
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.error).toMatch(/base64/);
@@ -290,7 +289,7 @@ describe('chat_artifacts › createArtifact', () => {
 
   it('rejects: duplicate file paths (case-insensitive)', async () => {
     const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, { files: [{ path: 'index.html', content: 'x' }, { path: 'Index.HTML', content: 'y' }] });
+    const r = (await m.createArtifact(UID, CID, AGENT, { files: [{ path: 'index.html', content: 'x' }, { path: 'Index.HTML', content: 'y' }] }));
     expect(r.ok).toBe(false);
   });
 });
@@ -298,12 +297,12 @@ describe('chat_artifacts › createArtifact', () => {
 describe('chat_artifacts › resolveArtifactFilePath', () => {
   async function seed() {
     const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, {
+    const r = (await m.createArtifact(UID, CID, AGENT, {
       files: [
         { path: 'index.html', content: '<!doctype html><h1>hi</h1>' },
         { path: 'assets/app.js', content: 'console.log(2)' },
       ],
-    });
+    }));
     if (!r.ok) throw new Error('seed failed: ' + r.error);
     return { m, artifactId: r.artifactId };
   }
@@ -395,8 +394,8 @@ describe('chat_artifacts › resolveArtifactFilePath', () => {
 describe('chat_artifacts › purgeByCid', () => {
   it('removes the whole chat_artifacts/<cid>/ tree', async () => {
     const m = await loadMod();
-    expect(m.createArtifact(UID, CID, AGENT, { files: MIN_FILES }).ok).toBe(true);
-    expect(m.createArtifact(UID, CID, AGENT, { files: MIN_FILES }).ok).toBe(true);
+    expect((await m.createArtifact(UID, CID, AGENT, { files: MIN_FILES })).ok).toBe(true);
+    expect((await m.createArtifact(UID, CID, AGENT, { files: MIN_FILES })).ok).toBe(true);
     expect(fs.existsSync(cidDir())).toBe(true);
     const n = await m.purgeByCid(UID, CID);
     expect(n).toBe(2);
@@ -404,4 +403,16 @@ describe('chat_artifacts › purgeByCid', () => {
     // Idempotent.
     expect(await m.purgeByCid(UID, CID)).toBe(0);
   });
+});
+
+it('creates and serves the same media/model/font resources accepted by saved apps', async () => {
+  const mod=await loadMod();
+  const resources=[['sound.mp3','audio/mpeg'],['movie.mp4','video/mp4'],['scene.glb','model/gltf-binary'],['font.otf','font/otf'],['image.avif','image/avif']];
+  const created=await mod.createArtifact(UID,CID,AGENT,{files:[...MIN_FILES,...resources.map(([name])=>({path:name,content:'AAE=',encoding:'base64'}))]});
+  expect(created.ok).toBe(true);if(!created.ok)throw new Error(created.error);
+  for(const [name,mime] of resources){
+    const result=mod.resolveArtifactFilePath(UID,CID,created.artifactId,name);
+    expect(result).toMatchObject({ok:true,mime});
+    if(result.ok)expect(fs.readFileSync(result.absPath)).toEqual(Buffer.from([0,1]));
+  }
 });

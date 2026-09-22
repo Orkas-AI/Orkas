@@ -217,7 +217,7 @@ for (const row of page.records) text(row.value);` }, ctx());
         path: { type: "string" },
       },
     });
-    expect(runProgram.inputSchema).not.toHaveProperty("oneOf");
+    expect(runProgram.inputSchema.oneOf).toBeUndefined();
     const pathDescription = (runProgram.inputSchema.properties as Record<string, { description: string }>).path.description;
     expect(pathDescription).toContain("Workspace-visible UTF-8 QuickJS source");
     expect(pathDescription).toContain("Use instead of code, not together");
@@ -563,9 +563,8 @@ if (!saved.ok) {
   });
 
   it("bounds a synchronous stretch separately from the wall clock", async () => {
-    // QuickJS runs on the host thread: a hot loop freezes every window until
-    // the interrupt fires, so a program may not run synchronously for longer
-    // than the slice even though the wall-clock budget is minutes.
+    // Worker isolation preserves the independent guest CPU bound, even when
+    // the program's total budget includes minutes of asynchronous tool waits.
     const sliced = tool({ limits: { maxSyncSliceMs: 40, maxWallMs: 5_000 } });
     const startedAt = Date.now();
     const spun = await sliced.execute({ code: "while (true) {}" }, ctx());
@@ -610,6 +609,8 @@ if (!saved.ok) {
   it("cancels an in-flight child call through the linked signal", async () => {
     const controller = new AbortController();
     let childObservedAbort = false;
+    let markChildStarted!: () => void;
+    const childStarted = new Promise<void>((resolve) => { markChildStarted = resolve; });
     const runProgram = tool({
       names: ["slow_read"],
       invoke: async (_name, _input, childCtx) => new Promise((resolve) => {
@@ -617,12 +618,16 @@ if (!saved.ok) {
           childObservedAbort = true;
           resolve({ status: "aborted", code: "E_PROGRAM_ABORTED", reason: "cancelled" });
         }, { once: true });
+        markChildStarted();
       }),
     });
     const pending = runProgram.execute({
       code: "await tools.slow_read({}); text('unreachable');",
     }, ctx(controller.signal));
-    setTimeout(() => controller.abort(), 10);
+    // This case owns in-flight cancellation. A timer can fire during VM setup
+    // under load, exercising pre-start cancellation instead of this boundary.
+    await childStarted;
+    controller.abort();
 
     const result = await pending;
     expect(incomplete(result).reason).toBe("E_PROGRAM_ABORTED");
@@ -647,6 +652,76 @@ if (!saved.ok) {
     }, ctx());
     expect(result.content).toContain("returned early");
     expect(childObservedAbort).toBe(true);
+  });
+
+  it("closes unawaited queued child calls and ignores their late results after completion", async () => {
+    const started: number[] = [];
+    let finishChild!: () => void;
+    let childAborted = false;
+    const runProgram = tool({
+      names: ["write"],
+      limits: { maxConcurrentToolCalls: 1 },
+      invoke: async (_name, input, childCtx) => {
+        started.push(Number(input.id));
+        childCtx.signal?.addEventListener("abort", () => { childAborted = true; }, { once: true });
+        await new Promise<void>((resolve) => { finishChild = resolve; });
+        return { status: "completed", result: { content: "late result", observations: {
+          fileChanges: [{ operation: "create", sourcePath: "/tmp/late.txt", beforeExists: false, afterExists: true }],
+        } } };
+      },
+    });
+    const result = await runProgram.execute({
+      code: "for (let id = 0; id < 3; id++) tools.write({id}); text('returned early');",
+    }, ctx());
+    expect(result.content).toContain("returned early");
+    expect(started).toEqual([0]);
+    expect(childAborted).toBe(true);
+    const terminalSnapshot = JSON.stringify(result);
+    finishChild();
+    // Drain callbacks from the deliberately non-cooperative child. Neither
+    // queued operations nor post-terminal observation mutations are allowed.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(started).toEqual([0]);
+    expect(JSON.stringify(result)).toBe(terminalSnapshot);
+    expect((await runProgram.execute({ code: "text('next program');" }, ctx())).content)
+      .toContain("next program");
+  });
+
+  it("rejects oversized child arguments before they reach the host and remains usable", async () => {
+    let calls = 0;
+    const runProgram = tool({
+      names: ["write"],
+      invoke: async () => { calls++; return { status: "completed", result: { content: "written" } }; },
+    });
+    const result = await runProgram.execute({
+      code: "await tools.write({data: 'x'.repeat(8 * 1024 * 1024)}); text('unreachable');",
+    }, ctx());
+    expect(incomplete(result).reason).toBe("E_PROGRAM_TOOL_INPUT_LIMIT");
+    expect(calls).toBe(0);
+    const next = await runProgram.execute({ code: "await tools.write({data: 'small'}); text('saved');" }, ctx());
+    expect(next.isError).not.toBe(true);
+    expect(calls).toBe(1);
+  });
+
+  it("bounds cumulative child arguments even when the program catches the quota error", async () => {
+    let calls = 0;
+    const runProgram = tool({
+      names: ["write"],
+      invoke: async () => { calls++; return { status: "completed", result: { content: "written" } }; },
+    });
+    const result = await runProgram.execute({ code: `
+try {
+  for (let index = 0; index < 11; index++) {
+    await tools.write({data: 'x'.repeat(3 * 1024 * 1024)});
+  }
+} catch {}
+text('caught quota error');
+` }, ctx());
+    // Ten 3 MiB batches fit; the eleventh crosses the 32 MiB total even
+    // though every individual operation is below the 8 MiB message limit.
+    expect(calls).toBe(10);
+    expect(incomplete(result).reason).toBe("E_PROGRAM_TOOL_INPUT_LIMIT");
+    expect((await runProgram.execute({ code: "text('recovered');" }, ctx())).isError).not.toBe(true);
   });
 
   it("preserves child file observations and returns a bounded changed-file receipt", async () => {
@@ -818,4 +893,20 @@ if (!saved.ok) {
     const silentFailure = await failedChild.execute({ code: "await tools.write({ path: 'out.txt' });" }, ctx());
     expect(incomplete(silentFailure).reason).toBe("E_PROGRAM_NO_OUTPUT");
   });
+});
+
+it('accepts an empty alternate source but never executes conflicting or malformed sources', async () => {
+  let loads = 0;
+  const runProgram = tool({ loadSourceFile: async () => {
+    loads++;
+    return { status: 'completed', source: "text('saved-source')", resolvedPath: '/tmp/report.js' };
+  } });
+  expect((await runProgram.execute({ code: "text('inline-source')", path: '' }, ctx())).content).toContain('inline-source');
+  expect(loads).toBe(0);
+  expect((await runProgram.execute({ code: '', path: 'report.js' }, ctx())).content).toContain('saved-source');
+  expect(loads).toBe(1);
+  for (const args of [{ code: "text('wrong')", path: 'report.js' }, { code: {}, path: 'report.js' }, { code: "text('wrong')", path: 42 }]) {
+    expect(incomplete(await runProgram.execute(args, ctx())).reason).toBe('E_PROGRAM_BAD_INPUT');
+  }
+  expect(loads).toBe(1);
 });

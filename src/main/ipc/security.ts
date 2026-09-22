@@ -29,15 +29,14 @@ function recordPayload(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
-/** Only the packaged/dev renderer entry is allowed to reach privileged IPC. */
+/** Only bundled trusted renderer entries may reach privileged IPC. */
 export function isTrustedIpcSender(sender: IpcSenderLike | null | undefined): boolean {
   if (!sender || typeof sender.getURL !== 'function') return false;
   try {
     const url = new URL(sender.getURL());
     if (url.protocol !== 'file:') return false;
     const candidate = path.resolve(fileURLToPath(url));
-    const expected = path.resolve(SRC_ROOT, 'renderer', 'index.html');
-    return candidate === expected;
+    return ['index.html', 'preview.html'].some(entry => candidate === path.resolve(SRC_ROOT, 'renderer', entry));
   } catch {
     return false;
   }

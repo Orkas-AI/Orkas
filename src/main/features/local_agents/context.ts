@@ -1,3 +1,6 @@
+import { fitHistoryTextSuffix } from '../../util/history-text-window';
+import { estimateBudgetTokens } from '../../util/token-estimate';
+import { projectHistoryMediaText } from '../../util/history-media';
 /**
  * Semantic context compiler for external CLI-backed agents.
  *
@@ -19,9 +22,8 @@ import * as crypto from 'node:crypto';
 import type { Lang } from '../../i18n.js';
 import { localCliCapabilities } from './registry.js';
 
-export const CLI_RECOVERY_MAX_BYTES = 16 * 1024;
-export const CLI_HISTORY_MAX_TURNS = 20;
-export const CLI_HISTORY_MAX_MESSAGE_BYTES = 8 * 1024;
+export const CLI_HISTORY_MAX_TURNS = 5;
+export const CLI_HISTORY_MAX_TOKENS = 30_000;
 
 export interface CliHistoryTurn {
   id: string;
@@ -124,66 +126,42 @@ export function buildCliTurnPrompt(input: {
   return blocks.join('\n\n');
 }
 
-/**
- * Render complete, newest-first-selected conversation turns under both count
- * and byte limits. The caller supplies canonical-log rows already grouped into
- * turns; this layer owns only transport limits, so CLI backends all receive the
- * same bounded semantics.
- */
+/** Canonical recovery/delta uses the same five-turn / 30K-token ceilings as
+ * in-process history. Native CLI session history and compaction remain CLI-owned;
+ * adapters do not currently expose trustworthy remaining-window capacity. */
 export function buildCliConversationContext(input: {
   turns: CliHistoryTurn[];
   mode: 'recovery' | 'incremental';
-  maxBytes?: number;
-  maxTurns?: number;
-  maxMessageBytes?: number;
 }): string {
-  const maxBytes = Math.max(1024, input.maxBytes || CLI_RECOVERY_MAX_BYTES);
-  const maxTurns = Math.max(1, input.maxTurns || CLI_HISTORY_MAX_TURNS);
-  const maxMessageBytes = Math.max(256, input.maxMessageBytes || CLI_HISTORY_MAX_MESSAGE_BYTES);
   const allTurns = input.turns
     .map((turn) => ({
       id: String(turn.id || '').trim() || 'unknown',
       messages: turn.messages
-        .map((message) => truncateUtf8(String(message || '').trim(), maxMessageBytes))
+        .map((message) => projectHistoryMediaText(String(message || '').trim()))
         .filter(Boolean),
     }))
     .filter((turn) => turn.messages.length > 0);
   if (allTurns.length === 0) return '';
 
-  const omittedByCount = Math.max(0, allTurns.length - maxTurns);
-  const kept = allTurns.slice(-maxTurns);
+  const kept = allTurns.slice(-CLI_HISTORY_MAX_TURNS);
   const title = input.mode === 'incremental'
     ? '## Conversation updates since the previous CLI turn'
     : '## Conversation context recovered by Orkas';
-  let omittedByBytes = 0;
-
-  const render = (turns: typeof kept, oversizedBody?: string) => {
-    const omitted = omittedByCount + omittedByBytes;
+  const entries = kept.flatMap((turn, turnIndex) => turn.messages.map((text, messageIndex) => ({ text, turnIndex, messageIndex })));
+  return fitHistoryTextSuffix(entries.map(entry => entry.text), CLI_HISTORY_MAX_TOKENS, (first, boundaryText) => {
+    const boundary = entries[first];
+    const firstTurn = boundary?.turnIndex ?? kept.length;
+    const omitted = allTurns.length - kept.length + firstTurn;
     const marker = omitted > 0 ? `\n[${omitted} older turn${omitted === 1 ? '' : 's'} omitted]` : '';
-    const body = oversizedBody ?? turns
-      .map((turn) => `### Turn ${turn.id}\n${turn.messages.join('\n')}`)
-      .join('\n\n');
-    return `${title}${marker}\n${body}`;
-  };
-
-  let rendered = render(kept);
-  while (Buffer.byteLength(rendered, 'utf8') > maxBytes && kept.length > 1) {
-    kept.shift();
-    omittedByBytes += 1;
-    rendered = render(kept);
-  }
-  if (Buffer.byteLength(rendered, 'utf8') <= maxBytes) return rendered;
-
-  // A single pathological turn may itself exceed the transport budget. Keep
-  // its newest bounded representation and make the truncation explicit.
-  const only = kept[0];
-  const prefix = render([{ ...only, messages: [] }], '').replace(/\n$/, '');
-  const available = Math.max(0, maxBytes - Buffer.byteLength(`${prefix}\n`, 'utf8'));
-  const body = truncateUtf8(
-    `### Turn ${only.id}\n${only.messages.join('\n')}`,
-    available,
-  );
-  return `${prefix}\n${body}`;
+    const body = kept.slice(firstTurn).map((turn, offset) => {
+      const messages = offset === 0 && boundary
+        ? turn.messages.slice(boundary.messageIndex).map((text, index) => index === 0 ? boundaryText ?? text : text)
+        : turn.messages;
+      return `### Turn ${turn.id}\n${messages.join('\n')}`;
+    }).join('\n\n');
+    const status = '[History window: this block contains recent dialogue and references, not a full execution transcript. Earlier dialogue and public tool records may be available via chat_history.]';
+    return `${title}${marker}\n${status}\n${body}`;
+  }, estimateBudgetTokens, '');
 }
 
 export function createCliContextPlan(input: {
@@ -247,7 +225,7 @@ export function materializeCliContext(
 }
 
 function buildCompactCliLanguageInstruction(lang: Lang): string {
-  const names: Record<Lang, string> = {
+  const names: Partial<Record<Lang, string>> = {
     zh: 'Chinese (简体中文)',
     en: 'English',
     ja: 'Japanese (日本語)',
@@ -269,23 +247,6 @@ function uniqueNonEmpty(values: string[]): string[] {
     out.push(normalized);
   }
   return out;
-}
-
-function truncateUtf8(value: string, maxBytes: number): string {
-  if (maxBytes <= 0) return '';
-  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
-  const marker = '\n[… message truncated by Orkas …]\n';
-  const markerBytes = Buffer.byteLength(marker, 'utf8');
-  if (markerBytes >= maxBytes) {
-    return Buffer.from(value, 'utf8').subarray(0, maxBytes).toString('utf8').replace(/\uFFFD+$/u, '');
-  }
-  const budget = maxBytes - markerBytes;
-  const headBytes = Math.ceil(budget / 2);
-  const tailBytes = Math.floor(budget / 2);
-  const raw = Buffer.from(value, 'utf8');
-  const head = raw.subarray(0, headBytes).toString('utf8').replace(/\uFFFD+$/u, '');
-  const tail = raw.subarray(Math.max(0, raw.length - tailBytes)).toString('utf8').replace(/^\uFFFD+/u, '');
-  return `${head}${marker}${tail}`;
 }
 
 function joinBlocks(...values: string[]): string {

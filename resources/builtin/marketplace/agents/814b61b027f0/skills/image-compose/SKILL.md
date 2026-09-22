@@ -15,7 +15,9 @@ Create or repair `image-manifest.json` and `index.html` with `write_file` / `edi
 
 This production skill is the earliest point at which a `COMPOSE` manifest may be created. Initialize it from the `Canonical image-manifest v1` block in `image-router`; that block is the single structural source, so do not redefine or reconstruct the manifest shape here. Replace every example value with the current brief and planning output. Keep its nesting and value types exactly: `brief.purpose` and every `art_direction` field are required by native inspection, and any region coordinates belong under `visual_plan.regions[].bounds`.
 
-For `HYBRID`, `GENERATE`, or `EDIT`, set the locked lowercase route and the approved nonzero generation budget, then add the route-specific reference and request fields required by `image-router` / `image-generate`. After the first write, read the manifest back once and repair it with `edit_file` if needed before calling `project.inspect`.
+For `HYBRID`, `GENERATE`, or `EDIT`, keep the locked lowercase route and the approved generation budget (zero for deterministic EDIT), then add the route-specific reference and request fields required by `image-router` / `image-generate`. After the first write, read the manifest back once and repair it with `edit_file` if needed before calling `project.inspect`.
+
+Declare one final source: `entry` for an HTML composition, or `raster_source` for a finished raster. Remove the other final-source field when the candidate changes form; keep generated layers as local HTML assets. Set `entry` explicitly for HTML work under EDIT or GENERATE. After a script transform, bind its actual output as `raster_source` and inspect that path.
 
 ## Authoring contract
 
@@ -25,6 +27,7 @@ For `HYBRID`, `GENERATE`, or `EDIT`, set the locked lowercase route and the appr
 - For a multi-image set, reuse the first passing image's concrete CSS/SVG design decisions—palette variables, type roles, spacing/grid, radii, strokes, icon treatment, material effects, and signature device—in every later member. Change the content and the layout details needed by that content; do not redesign the visual system per image.
 - Use semantic HTML for text and SVG for geometry, diagrams, strokes, charts, patterns, and masks. Use CSS for layout, texture, lighting, and controlled effects.
 - Preserve every required-copy string exactly in visible DOM text. Keep important text out of raster assets.
+- For COMPOSE copy revisions in a supplied raster, cover only the old text area and typeset the replacement as a complete glyph or text run; guessing extra strokes onto raster digits can leave the old number readable. Match the original typeface, weight, size, color and baseline, and preserve the surrounding pixels. Verify the replacement in the current snapshot at export size against the source: dimensions, a changed-pixel box, and image metadata do not prove that the visible wording or its styling is correct.
 - Preserve natural English casing: use sentence case or natural title case for titles and sentence case for body, captions, labels, and CTAs. Keep all caps only when that exact casing is explicit in required user copy or an external brand/source, and then only for one short metadata label, acronym, or code. Never apply `text-transform: uppercase` through a broad selector or use multiple all-caps text roles; create hierarchy with family, width, weight, scale, color, or spacing.
 - Use only local relative assets inside the project directory. Do not use scripts, CDNs, remote fonts, remote images, iframes, embedded pages, autoplay media, or a local server.
 - In `HYBRID`, use the generated raster as one deliberate layer and let HTML/SVG own copy, logo placement, framing, and layout.
@@ -61,8 +64,10 @@ If the required authoring, snapshot, or export tools are unavailable, do not cla
 ## Native workflow
 
 1. Call `image_studio` with `project.inspect` after the manifest and entry exist. Repair all structural blockers before creating visual evidence. A failed structural inspection carries no model image. The native tool is a stable capture/evidence/export security kernel, not an authoring library registry.
-2. Only after inspection passes, call `image_studio` with `project.snapshot` and an output path. The passing snapshot attaches the exact full-color candidate as model-visible evidence. Inspect that attachment directly; do not reopen the same path through generic `read_files`, which is not the design-evidence transport.
-3. Apply one coherent repair batch if required, then repeat inspect and snapshot. Do not make serial cosmetic tweaks without new evidence.
+2. For an HTML final source, only after inspection passes, call `image_studio` with `project.snapshot` and an output path. The passing snapshot attaches the exact full-color candidate as model-visible evidence. Inspect that attachment directly; do not reopen the same path through generic `read_files`, which is not the design-evidence transport.
+For a raster final source, `project.inspect` supplies the evidence and next operation directly. The host derives `is_generation` from verified production records: direct model outputs and verified format/proportional-size normalization may remain generation artifacts; crop, mask, overlays and composites do not inherit that exemption. Do not write this host property into the manifest. Follow the returned next operation, skipping the scored-review steps only for `is_generation:true`.
+
+3. For each repair, identify a concrete issue in the current evidence, make a change that can affect it, then capture fresh evidence through inspect (raster) or inspect and snapshot (HTML) to check the result. Continue while a concrete issue remains and a viable new correction exists, even across several rounds. Once requirements pass, deliver; optional polish must not delay delivery.
 4. Inspect the current evidence and submit a structured verdict with `project.submit_design_review`.
 5. Call `project.export` only after a passing review of the exact current signature.
 
@@ -70,7 +75,9 @@ If the required authoring, snapshot, or export tools are unavailable, do not cla
 
 The first `project.export` call must use an explicit workspace-relative `output_path` ending in `.png`. After success, answer with the image instead of handing a completed direct request back to Commander.
 
-In the final delivery, briefly name the concrete checks that passed, not only the overall review score: exact copy/content, hierarchy or thumbnail legibility, contrast, safe margins and clipping/overflow, and export dimensions/format. Put those facts before the first preview. Show only exported final deliverables unless the user asks for review evidence, and write nothing after the last preview; the host may add its own produced-file footer.
+Put essential export dimensions/format before the first preview. Show only exported final deliverables unless the user asks for review evidence, and write nothing after the last preview; the host may add its own produced-file footer.
+
+Before repeating a failed operation, check whether its relevant files, parameters, or environment changed. Retry after a relevant correction; if the same failure recurs under unchanged conditions, diagnose its cause or choose a supported alternative first. A missing dependency requires an available capability, not repeated parameter changes against the unavailable tool. Preserve the candidate and report the blocker when no supported repair remains.
 
 On a recoverable inspection, snapshot, review, or export result, use
 `project.status.current_candidate` and `recovery_context` to resume from the

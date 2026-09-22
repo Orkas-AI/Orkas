@@ -4,7 +4,7 @@
 //
 // Interactions:
 //   - × button / Esc                         → close
-//   - Wheel                                   → zoom (cursor-anchored)
+//   - Left / Right arrows / side buttons      → previous / next chat image
 //   - + / =                                   → zoom in (around image center)
 //   - - / _                                   → zoom out
 //   - 0                                       → reset to 1× and re-center
@@ -28,6 +28,8 @@ let _lightboxKeyHandler = null;
 let _lightboxCurrentFile = null;
 let _lightboxLoadSeq = 0;
 let _lightboxLoadCleanup = null;
+let _lightboxGallery = null;
+let _lightboxPreviousFocus = null;
 
 // Zoom / pan state. Reset on every close so the next open starts at 1×.
 let _scale = 1;
@@ -200,6 +202,140 @@ function _onMouseUp() {
   _applyTransform();
 }
 
+// Keep the gallery scoped to the source transcript, including offscreen messages.
+// Recollect after history pagination or streaming replaces message DOM nodes.
+function _lightboxGalleryItems(gallery) {
+  if (gallery.items) return gallery.items;
+  const occurrences = new Map();
+  return Array.from(gallery.root.querySelectorAll('img.chat-md-img, .chat-msg-attach')).flatMap((node) => {
+    const attachment = node.classList.contains('chat-msg-attach');
+    const img = attachment ? node.querySelector('img.chat-attach-thumb') : node;
+    const src = img && img.getAttribute('src');
+    if (!src) return [];
+    const message = node.closest?.('.chat-message');
+    const identity = message?.dataset.renderKey || message?.dataset.msgId || '';
+    const base = `${identity}:${src}`;
+    const occurrence = occurrences.get(base) || 0;
+    occurrences.set(base, occurrence + 1);
+    return [{
+      node, src, key: `${base}:${occurrence}`, absPath: _absPathFromChatMediaLocalUrl(src) || undefined,
+      alt: attachment ? node.dataset.attachName || '' : (img.alt || ''),
+      cid: attachment ? node.dataset.attachCid || gallery.cid : gallery.cid,
+      attachmentName: attachment ? node.dataset.attachName : null,
+    }];
+  });
+}
+
+function _lightboxGalleryIndex(gallery, items) {
+  if (gallery.items) return items.findIndex(item => item.key === gallery.selectedKey);
+  const exact = items.findIndex((item) => item.node === gallery.source);
+  if (exact >= 0) return exact;
+  return items.findIndex((item) => item.src === gallery.src);
+}
+
+function _lightboxEarlierRow(gallery) {
+  if (gallery.items) return gallery.nextCursor != null ? { dataset: { cursor: String(gallery.nextCursor) } } : null;
+  if (gallery.root.id !== 'chat-history' || typeof _loadOlderConversationHistory !== 'function') return null;
+  return gallery.root.querySelector('.chat-history-load-earlier');
+}
+
+function _updateLightboxNavigation() {
+  if (!_lightboxEl) return;
+  const gallery = _lightboxGallery;
+  const items = gallery ? _lightboxGalleryItems(gallery) : [];
+  const index = gallery ? _lightboxGalleryIndex(gallery, items) : -1;
+  const earlier = gallery && _lightboxEarlierRow(gallery);
+  const visible = index >= 0 && (items.length > 1 || !!earlier);
+  for (const [direction, key] of [['previous', 'chat.lightbox_previous'], ['next', 'chat.lightbox_next']]) {
+    const button = _lightboxEl.querySelector(`.chat-lightbox-${direction}`);
+    button.hidden = !visible;
+    button.disabled = !visible || !!gallery?.busy || (direction === 'previous'
+      ? index === 0 && !earlier : index === items.length - 1);
+    button.setAttribute('aria-label', t(key));
+    button.title = t(key);
+  }
+}
+
+function _disposeLightboxGallery() {
+  _lightboxGallery?.observer?.disconnect();
+  _lightboxGallery = null;
+}
+
+function _createLightboxGallery(source, src, opts) {
+  if (opts?.gallery?.items) return opts.gallery;
+  const root = source?.closest('.chat-history');
+  if (!root) return null;
+  const cid = opts?.cid || (typeof currentCid !== 'undefined' ? currentCid : null);
+  const gallery = { root, cid, source, src, busy: false };
+  const items = _lightboxGalleryItems(gallery);
+  // Produced-file chips open the same image already expanded in their bubble.
+  if (_lightboxGalleryIndex(gallery, items) < 0 && opts?.absPath) {
+    const item = items.find((entry) => _absPathFromChatMediaLocalUrl(entry.src) === opts.absPath);
+    if (item) { gallery.source = item.node; gallery.src = item.src; }
+  }
+  gallery.observer = new MutationObserver(() => {
+    if (typeof currentCid !== 'undefined' && gallery.root.id === 'chat-history' && currentCid !== gallery.cid) {
+      closeChatImageLightbox();
+      return;
+    }
+    _updateLightboxNavigation();
+  });
+  gallery.observer.observe(root, { childList: true, subtree: true });
+  return gallery;
+}
+
+async function _navigateLightbox(direction) {
+  const gallery = _lightboxGallery;
+  if (!gallery || gallery.busy || !_isOpen()) return;
+  const active = () => _lightboxGallery === gallery && _isOpen() && (gallery.items || (gallery.root.isConnected
+    && (gallery.root.id !== 'chat-history' || typeof currentCid === 'undefined' || currentCid === gallery.cid)));
+  if (!active()) return;
+  gallery.busy = true;
+  _updateLightboxNavigation();
+  try {
+    let items = _lightboxGalleryItems(gallery);
+    let index = _lightboxGalleryIndex(gallery, items);
+    // Walk text-only older pages too, using the transcript owner's existing
+    // loader so visibility rules, ordering, and reading position stay intact.
+    while (direction < 0 && index === 0 && _lightboxEarlierRow(gallery)) {
+      const row = _lightboxEarlierRow(gallery);
+      const cursor = row.dataset.cursor;
+      _setLightboxLoading(true);
+      if (gallery.items) await window.OrkasPreviewHost.loadGalleryPage(gallery, Number(cursor));
+      else await _loadOlderConversationHistory(gallery.cid, Number(cursor));
+      if (!active()) return;
+      const nextRow = _lightboxEarlierRow(gallery);
+      if (nextRow && nextRow.dataset.cursor === cursor) {
+        if (typeof uiToast === 'function') uiToast(t('chat.lightbox_history_failed'), { variant: 'warning' });
+        return;
+      }
+      items = _lightboxGalleryItems(gallery);
+      index = _lightboxGalleryIndex(gallery, items);
+    }
+    const item = index >= 0 ? items[index + direction] : null;
+    if (!item) return;
+    let fileOpts = { cid: item.cid, absPath: item.absPath };
+    if (item.attachmentName) {
+      _setLightboxLoading(true);
+      try {
+        const result = await window.orkas.invoke('attachments.absPath', { cid: item.cid, name: item.attachmentName });
+        if (result?.ok && result.path) fileOpts.absPath = result.path;
+      } catch (_) { /* The image URL still supplies a preview or its native error state. */ }
+      if (!active()) return;
+    }
+    gallery.source = item.node;
+    gallery.src = item.src;
+    gallery.selectedKey = item.key;
+    openChatImageLightbox(item.src, item.alt, { ...fileOpts, gallery });
+  } finally {
+    gallery.busy = false;
+    if (active()) {
+      if (gallery.src === _lightboxImg.getAttribute('src') && !_lightboxLoadCleanup) _setLightboxLoading(false);
+      _updateLightboxNavigation();
+    }
+  }
+}
+
 function _ensureLightbox() {
   if (_lightboxEl) return _lightboxEl;
   const root = document.createElement('div');
@@ -220,11 +356,14 @@ function _ensureLightbox() {
   root.innerHTML = `
     <div class="chat-lightbox-backdrop"></div>
     <div class="chat-lightbox-stage">
+      <div class="chat-lightbox-title"></div>
+      <button type="button" class="chat-lightbox-nav chat-lightbox-previous" hidden>${typeof window.uiIconHtml === 'function' ? window.uiIconHtml('chevron-left', 'ui-icon') : ''}</button>
+      <button type="button" class="chat-lightbox-nav chat-lightbox-next" hidden>${typeof window.uiIconHtml === 'function' ? window.uiIconHtml('chevron-right', 'ui-icon') : ''}</button>
       <div class="chat-lightbox-loading" role="status" aria-live="polite" hidden>
         <span class="chat-file-viewer-loading-spinner" aria-hidden="true"></span>
         <span class="chat-lightbox-loading-label">${_lightboxEscapeHtml(_lightboxLoadingLabel())}</span>
       </div>
-      <img class="chat-lightbox-img" alt="" draggable="false" data-monitor-resource="chat-image-lightbox" />
+      <img class="chat-lightbox-img" alt="" draggable="false" />
       <div class="chat-lightbox-actions">
         <button type="button" class="chat-lightbox-add-library" aria-label="${addLabel}" title="${addLabel}" hidden>
           ${libraryIcon}
@@ -263,6 +402,7 @@ function _ensureLightbox() {
     }
     const loading = _lightboxEl.querySelector('.chat-lightbox-loading-label');
     if (loading) loading.textContent = _lightboxLoadingLabel();
+    _updateLightboxNavigation();
   });
   _lightboxEl = root;
   _lightboxImg = root.querySelector('.chat-lightbox-img');
@@ -291,6 +431,7 @@ async function _onLightboxReveal(e) {
   e.stopPropagation();
   if (!_lightboxCurrentFile || !_lightboxRevealBtn || _lightboxRevealBtn.disabled) return;
   const file = _lightboxCurrentFile;
+  const sequence = _lightboxLoadSeq;
   _lightboxRevealBtn.disabled = true;
   try {
     const payload = { path: file.absPath };
@@ -305,7 +446,7 @@ async function _onLightboxReveal(e) {
       if (typeof uiAlert === 'function') await uiAlert(message && message !== 'conversation_info.file_reveal_failed' ? message : reason);
     } catch (_) { /* best-effort; reveal failures are already non-destructive */ }
   } finally {
-    if (_lightboxRevealBtn) _lightboxRevealBtn.disabled = false;
+    if (_lightboxRevealBtn && sequence === _lightboxLoadSeq) _lightboxRevealBtn.disabled = false;
   }
 }
 
@@ -315,6 +456,7 @@ async function _onLightboxAddLibrary(e) {
   const file = _lightboxCurrentFile;
   if (!_lightboxCanAddToLibrary(file)) return;
   const original = _lightboxAddLibraryBtn.innerHTML;
+  const sequence = _lightboxLoadSeq;
   _lightboxAddLibraryBtn.disabled = true;
   try {
     const payload = { path: file.absPath };
@@ -325,7 +467,8 @@ async function _onLightboxAddLibrary(e) {
     const checkIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
       ? window.uiIconHtml('check', 'chat-lightbox-library-icon')
       : '';
-    _lightboxAddLibraryBtn.innerHTML = checkIcon;
+    window.OrkasPreviewHost?.filesChanged();
+    if (sequence === _lightboxLoadSeq) _lightboxAddLibraryBtn.innerHTML = checkIcon;
     if (res.scope === 'global' && typeof currentView !== 'undefined' && currentView === 'contexts' && typeof loadContexts === 'function') loadContexts();
     if (res.scope === 'project' && res.projectId && typeof currentView !== 'undefined' && currentView === 'project' && typeof loadProjectDetail === 'function') {
       loadProjectDetail(res.projectId).catch(() => {});
@@ -339,7 +482,7 @@ async function _onLightboxAddLibrary(e) {
     if (typeof uiAlert === 'function') await uiAlert(message);
   } finally {
     setTimeout(() => {
-      if (!_lightboxAddLibraryBtn) return;
+      if (!_lightboxAddLibraryBtn || sequence !== _lightboxLoadSeq) return;
       _lightboxAddLibraryBtn.innerHTML = original;
       _lightboxAddLibraryBtn.disabled = false;
     }, 1500);
@@ -348,12 +491,28 @@ async function _onLightboxAddLibrary(e) {
 
 function openChatImageLightbox(src, alt, opts) {
   if (!src) return;
+  if (window.OrkasPreviewWindows) return window.OrkasPreviewWindows.image(src, alt, opts);
+  const wasOpen = _isOpen();
+  if (!wasOpen) _lightboxPreviousFocus = document.activeElement;
   const el = _ensureLightbox();
+  if (!opts?.gallery || opts.gallery !== _lightboxGallery) {
+    _disposeLightboxGallery();
+    _lightboxGallery = _createLightboxGallery(opts?.sourceElement, src, opts);
+  }
+  _isPanning = false;
+  _panStart = null;
+  _lightboxImg.style.transition = '';
+  _lightboxAddLibraryBtn.disabled = false;
+  _lightboxAddLibraryBtn.innerHTML = typeof window.uiIconHtml === 'function' ? window.uiIconHtml('database', 'chat-lightbox-library-icon') : '';
+  _lightboxRevealBtn.disabled = false;
   _lightboxLoadSeq += 1;
   const loadSeq = _lightboxLoadSeq;
   _clearLightboxLoadListeners();
   _resetZoom();
   _lightboxImg.alt = alt || '';
+  const title = el.querySelector('.chat-lightbox-title');
+  if (title) title.textContent = alt || '';
+  if (window.OrkasPreviewHost) document.title = alt || 'Orkas';
   _setLightboxLoading(true);
   const settle = () => {
     if (loadSeq !== _lightboxLoadSeq) return;
@@ -371,7 +530,7 @@ function openChatImageLightbox(src, alt, opts) {
   const fallbackCid = (typeof currentCid !== 'undefined' && currentCid) ? currentCid : null;
   const fileOpts = (opts && opts.absPath)
     ? opts
-    : (inferredAbsPath ? { absPath: inferredAbsPath, cid: fallbackCid } : null);
+    : (inferredAbsPath ? { absPath: inferredAbsPath, cid: opts?.cid || fallbackCid } : null);
   _lightboxCurrentFile = fileOpts && fileOpts.absPath ? {
     absPath: fileOpts.absPath,
     cid: fileOpts.cid || null,
@@ -381,10 +540,17 @@ function openChatImageLightbox(src, alt, opts) {
   if (_lightboxRevealBtn) _lightboxRevealBtn.hidden = !_lightboxCurrentFile;
   el.classList.add('is-open');
   el.setAttribute('aria-hidden', 'false');
+  if (!wasOpen) el.querySelector('.chat-lightbox-close').focus({ preventScroll: true });
+  _updateLightboxNavigation();
   if (!_lightboxKeyHandler) {
     _lightboxKeyHandler = (e) => {
-      if (!_isOpen()) return;
-      if (e.key === 'Escape') {
+      if (!_isOpen() || e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        if (e.target?.closest?.('input, textarea, select, [contenteditable="true"], [role="dialog"]')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        void _navigateLightbox(e.key === 'ArrowLeft' ? -1 : 1);
+      } else if (e.key === 'Escape') {
         closeChatImageLightbox();
       } else if (e.key === '+' || e.key === '=') {
         _setScale(_scale * ZOOM_STEP);
@@ -426,6 +592,9 @@ function closeChatImageLightbox() {
     _lightboxImg.style.transition = '';
   }
   _lightboxCurrentFile = null;
+  _disposeLightboxGallery();
+  if (_lightboxPreviousFocus?.isConnected) _lightboxPreviousFocus.focus({ preventScroll: true });
+  _lightboxPreviousFocus = null;
   if (_lightboxAddLibraryBtn) _lightboxAddLibraryBtn.hidden = true;
   if (_lightboxRevealBtn) _lightboxRevealBtn.hidden = true;
   _isPanning = false;
@@ -434,6 +603,7 @@ function closeChatImageLightbox() {
     document.removeEventListener('keydown', _lightboxKeyHandler);
     _lightboxKeyHandler = null;
   }
+  window.OrkasPreviewHost?.close();
 }
 
 // Document-level delegation: any markdown-rendered chat image
@@ -449,5 +619,5 @@ document.addEventListener('click', (e) => {
   if (!img.classList || !img.classList.contains('chat-md-img')) return;
   if (!img.src) return;
   e.preventDefault();
-  openChatImageLightbox(img.src, img.alt || '');
+  openChatImageLightbox(img.src, img.alt || '', { sourceElement: img });
 });

@@ -3,13 +3,13 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   hardenedWebPreferences,
   installExternalNavigationGuard,
-  installOfflineHtmlPreviewNavigationGuard,
-  isOfflineHtmlPreviewUrl,
-  OFFLINE_HTML_PREVIEW_CSP,
+  installHtmlPreviewNavigationGuard,
+  isHtmlPreviewUrl,
+  HTML_PREVIEW_CSP,
   safeExternalHttpUrl,
   safeExternalUserActionUrl,
   safeLocalCliAuthUrl,
-  withOfflineHtmlPreviewPolicy,
+  withHtmlPreviewPolicy,
 } from '../../../src/main/util/window-security';
 
 describe('window security baseline', () => {
@@ -168,8 +168,8 @@ describe('window security baseline', () => {
   });
 });
 
-describe('offline local HTML preview policy', () => {
-  it('preserves the streamed response while allowing inline code and denying network egress', async () => {
+describe('local HTML preview policy', () => {
+  it('preserves the streamed response while allowing Web resources and preserving response metadata', async () => {
     const original = new Response('preview body', {
       status: 206,
       statusText: 'Partial Content',
@@ -181,7 +181,7 @@ describe('offline local HTML preview policy', () => {
       },
     });
 
-    const secured = withOfflineHtmlPreviewPolicy(original);
+    const secured = withHtmlPreviewPolicy(original);
 
     expect(secured.status).toBe(206);
     expect(secured.statusText).toBe('Partial Content');
@@ -189,11 +189,11 @@ describe('offline local HTML preview policy', () => {
     expect(secured.headers.get('Cache-Control')).toBe('no-cache');
     expect(secured.headers.get('Content-Range')).toBe('bytes 0-11/12');
     expect(secured.headers.get('Content-Type')).toBe('text/html');
-    expect(secured.headers.get('Content-Security-Policy')).toBe(OFFLINE_HTML_PREVIEW_CSP);
-    expect(OFFLINE_HTML_PREVIEW_CSP).toContain("script-src 'unsafe-inline'");
-    expect(OFFLINE_HTML_PREVIEW_CSP).toContain("connect-src 'none'");
-    expect(OFFLINE_HTML_PREVIEW_CSP).toContain('img-src chat-media://local data: blob:');
-    expect(OFFLINE_HTML_PREVIEW_CSP).toContain("frame-src 'none'");
+    expect(secured.headers.get('Content-Security-Policy')).toBe(HTML_PREVIEW_CSP);
+    expect(HTML_PREVIEW_CSP).toContain("script-src chat-media://local http: https: 'unsafe-inline'");
+    expect(HTML_PREVIEW_CSP).toContain('connect-src chat-media://local http: https: ws: wss:');
+    expect(HTML_PREVIEW_CSP).toContain('img-src chat-media://local http: https: data: blob:');
+    expect(HTML_PREVIEW_CSP).toContain('frame-src chat-media://local http: https:');
     expect(secured.headers.get('Referrer-Policy')).toBe('no-referrer');
     expect(secured.headers.get('X-Content-Type-Options')).toBe('nosniff');
     expect(await secured.text()).toBe('preview body');
@@ -204,7 +204,7 @@ describe('offline local HTML preview policy', () => {
     'chat-media://local/C:/Users/test/preview.HTM?v=2#slide',
     'chat-media://local/Users/test/preview%2Ehtml',
   ])('recognizes the validated local HTML route: %s', (url) => {
-    expect(isOfflineHtmlPreviewUrl(url)).toBe(true);
+    expect(isHtmlPreviewUrl(url)).toBe(true);
   });
 
   it.each([
@@ -215,10 +215,10 @@ describe('offline local HTML preview policy', () => {
     'data:text/html,preview',
     'chat-media://local/Users/test/%E0%A4%A.html',
   ])('rejects route look-alikes: %s', (url) => {
-    expect(isOfflineHtmlPreviewUrl(url)).toBe(false);
+    expect(isHtmlPreviewUrl(url)).toBe(false);
   });
 
-  it('blocks an HTML subframe from navigating off the local protocol', () => {
+  it('allows HTTP navigation while blocking privileged document schemes', () => {
     let navigate!: (event: {
       preventDefault(): void;
       url: string;
@@ -226,7 +226,7 @@ describe('offline local HTML preview policy', () => {
       frame?: { url: string } | null;
       initiator?: { url: string } | null;
     }) => void;
-    installOfflineHtmlPreviewNavigationGuard({
+    installHtmlPreviewNavigationGuard({
       on: (_event, handler) => { navigate = handler; },
     });
 
@@ -237,7 +237,7 @@ describe('offline local HTML preview policy', () => {
       frame: { url: 'chat-media://local/Users/test/preview.html' },
     };
     navigate(remote);
-    expect(remote.preventDefault).toHaveBeenCalledOnce();
+    expect(remote.preventDefault).not.toHaveBeenCalled();
 
     const fetchLikeDataNavigation = {
       preventDefault: vi.fn(),
@@ -257,7 +257,7 @@ describe('offline local HTML preview policy', () => {
       frame?: { url: string } | null;
       initiator?: { url: string } | null;
     }) => void;
-    installOfflineHtmlPreviewNavigationGuard({
+    installHtmlPreviewNavigationGuard({
       on: (_event, handler) => { navigate = handler; },
     });
 

@@ -61,16 +61,7 @@
   // contexts row menus); the acting context is stashed per-open.
   let _menuEl = null;
   let _menuCtx = null;     // { frame, cid, artifactId, title } of the open menu
-  let _menuAnchor = null;  // the ⋯ button that opened it
-
-  function _track(action, data) {
-    try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-  }
-
-  function _trackEvent(action, data) {
-    void action;
-    void data;
-  }
+  let _menuAnchor = null;
 
   function _logArtifactFailure(action, data) {
     try { _convLog.warn('chat artifact operation failed', { action, ...(data || {}) }); } catch (_) {}
@@ -99,7 +90,7 @@
     }
   }
 
-  function _trackArtifactSaveResult(startedAt, result, sourceView, failure = {}) {
+  function _logArtifactSaveResult(startedAt, result, sourceView, failure = {}) {
     if (result === 'success') return;
     _logArtifactFailure('artifact_save', {
       source_view: sourceView,
@@ -115,14 +106,6 @@
   let _viewerFrame = null;
   let _viewerTitle = null;
   let _viewerKeyHandler = null;
-
-  // chat-app://cid/<encCid>/<encArtifactId>/index.html
-  function _artifactUrl(cid, artifactId, rel) {
-    const parts = ['chat-app://cid', encodeURIComponent(String(cid)), encodeURIComponent(String(artifactId))];
-    if (rel) parts.push(String(rel).split('/').map(encodeURIComponent).join('/'));
-    else parts.push('index.html');
-    return parts.join('/');
-  }
 
   function _clampHeight(px) {
     const n = Number(px);
@@ -174,6 +157,7 @@
       const agentId = frame.dataset.artifactAgent || '';
       const title = frame.dataset.artifactTitle || '';
       const type = String(data.type || '');
+      if (window.OrkasWebAppHost.isManaged(frame) && type !== 'resize') return;
       if (type === 'resize') {
         if (frame.classList && frame.classList.contains('chat-artifact-viewer-frame')) return;
         frame.style.height = `${_clampHeight(data.height)}px`;
@@ -211,6 +195,7 @@
     if (!_viewerEl) return;
     _viewerEl.classList.remove('is-open');
     if (_viewerFrame) {
+      window.OrkasWebAppHost.release(_viewerFrame);
       _viewerFrame.removeAttribute('src');
       _viewerFrame.removeAttribute('title');
       _viewerFrame.dataset.artifactCid = '';
@@ -222,6 +207,7 @@
       document.removeEventListener('keydown', _viewerKeyHandler);
       _viewerKeyHandler = null;
     }
+    window.OrkasPreviewHost?.close();
   }
 
   function _ensureViewer() {
@@ -233,7 +219,10 @@
       <div class="chat-artifact-viewer-stage" role="dialog" aria-modal="true">
         <div class="chat-artifact-viewer-header">
           <div class="chat-artifact-viewer-title"></div>
-          <button type="button" class="modal-close-btn chat-artifact-viewer-close" aria-label="${_esc(_t('common.close', 'Close'))}" title="${_esc(_t('common.close', 'Close'))}">${typeof window.uiIconHtml === 'function' ? window.uiIconHtml('x', 'modal-close-icon') : '×'}</button>
+          <div class="chat-file-viewer-actions">
+            <button type="button" class="chat-file-viewer-save-app chat-artifact-viewer-save">${window.uiIconHtml('layout-grid', 'chat-file-viewer-save-app-icon')}</button>
+            <button type="button" class="modal-close-btn chat-artifact-viewer-close">${window.uiIconHtml('x', 'modal-close-icon')}</button>
+          </div>
         </div>
         <iframe class="chat-artifact-viewer-frame chat-artifact-frame" sandbox="${SANDBOX}" referrerpolicy="no-referrer"></iframe>
       </div>`;
@@ -241,12 +230,36 @@
     _viewerEl = el;
     _viewerFrame = el.querySelector('.chat-artifact-viewer-frame');
     _viewerTitle = el.querySelector('.chat-artifact-viewer-title');
+    const updateLabels = () => {
+      for (const [action, key, fallback] of [
+        ['save', 'artifact.menu_save', 'Save as app'],
+        ['close', 'common.close', 'Close'],
+      ]) {
+        const button = el.querySelector(`.chat-artifact-viewer-${action}`);
+        const label = _t(key, fallback);
+        button.setAttribute('aria-label', label);
+        button.setAttribute('title', label);
+        button.dataset.tooltip = label;
+      }
+    };
+    updateLabels();
+    window.addEventListener('i18n-change', updateLabels);
     el.querySelector('.chat-artifact-viewer-close')?.addEventListener('click', _closeViewer);
+    const saveButton = el.querySelector('.chat-artifact-viewer-save');
+    saveButton.addEventListener('click', async () => {
+      if (saveButton.disabled || !_viewerFrame?.dataset.artifactId) return;
+      saveButton.disabled = true;
+      try {
+        await _doSave({ cid: _viewerFrame.dataset.artifactCid, artifactId: _viewerFrame.dataset.artifactId });
+      } finally { saveButton.disabled = false; }
+    });
     return el;
   }
 
   function _openViewer(ctx) {
     if (!ctx || !ctx.cid || !ctx.artifactId) return;
+    if (window.OrkasPreviewWindows) return window.OrkasPreviewWindows.open({ kind: 'artifact', cid: ctx.cid, artifactId: ctx.artifactId, agentId: ctx.agentId || '', title: ctx.title || _t('artifact.title', 'Interactive app') });
+    _bindGlobalListener();
     const el = _ensureViewer();
     const title = ctx.title || _t('artifact.title', 'Interactive app');
     if (_viewerTitle) _viewerTitle.textContent = title;
@@ -256,11 +269,11 @@
       _viewerFrame.dataset.artifactAgent = String(ctx.agentId || '');
       _viewerFrame.dataset.artifactTitle = title;
       _viewerFrame.setAttribute('title', title);
-      _viewerFrame.src = _artifactUrl(ctx.cid, ctx.artifactId);
+      window.OrkasWebAppHost.open(_viewerFrame, { cid: ctx.cid, artifactId: ctx.artifactId });
     }
     el.classList.add('is-open');
     if (!_viewerKeyHandler) {
-      _viewerKeyHandler = (e) => { if (e.key === 'Escape') _closeViewer(); };
+      _viewerKeyHandler = (e) => { if (e.key === 'Escape' && !document.querySelector('.chat-share-overlay')) _closeViewer(); };
       document.addEventListener('keydown', _viewerKeyHandler);
     }
   }
@@ -409,7 +422,7 @@
     // private` and dev reload ignores cache; this just re-runs the app).
     _clearArtifactUnavailable(f);
     f.style.height = `${DEFAULT_FRAME_HEIGHT}px`;
-    f.src = _artifactUrl(ctx.cid, ctx.artifactId);
+    window.OrkasWebAppHost.open(f, { cid: ctx.cid, artifactId: ctx.artifactId });
     _checkArtifactAvailability(f, ctx);
   }
 
@@ -421,7 +434,6 @@
   async function _doSave(ctx) {
     const startedAt = Date.now();
     const sourceView = _artifactSaveSourceView(ctx?.cid);
-    _track('artifact_save', { surface: 'conversation', source_view: sourceView });
     let r;
     try {
       r = await window.orkas.invoke('conversations.artifacts.save', {
@@ -429,26 +441,27 @@
       });
     } catch (err) {
       const failure = _artifactSaveFailure(err, 'ipc');
-      _trackArtifactSaveResult(startedAt, 'failure', sourceView, failure);
+      _logArtifactSaveResult(startedAt, 'failure', sourceView, failure);
       _logArtifactSaveFailure(failure);
       _notifyFail(_t('apps.save_failed', 'Could not save the app'), err);
       return;
     }
     if (!r || r.ok === false) {
       const failure = _artifactSaveFailure(r, 'operation');
-      _trackArtifactSaveResult(startedAt, 'failure', sourceView, failure);
+      _logArtifactSaveResult(startedAt, 'failure', sourceView, failure);
       _logArtifactSaveFailure(failure);
       _notifyFail(_t('apps.save_failed', 'Could not save the app'), { message: (r && r.error) || 'save failed' });
       return;
     }
 
-    _trackArtifactSaveResult(startedAt, 'success', sourceView);
+    _logArtifactSaveResult(startedAt, 'success', sourceView);
     try {
-      const message = _t('apps.saved_toast', 'Saved to My Apps');
+      const message = _t('apps.saved_toast', 'Saved to Apps');
       if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
       else if (typeof uiAlert === 'function') uiAlert(message);
       // Refresh the "My Apps" tab if its module is loaded.
-      if (typeof loadSavedApps === 'function') loadSavedApps(true);
+      if (window.OrkasPreviewHost) window.OrkasPreviewHost.filesChanged();
+      else if (typeof loadSavedApps === 'function') loadSavedApps(true);
     } catch (_) {
       _logArtifactSaveFailure({
         error_type: 'presentation',
@@ -498,7 +511,7 @@
     frame.dataset.artifactAgent = String(ctx.agentId || '');
     frame.dataset.artifactTitle = title;
     frame.style.height = `${DEFAULT_FRAME_HEIGHT}px`;
-    frame.src = _artifactUrl(ctx.cid, ctx.artifactId);
+    window.OrkasWebAppHost.open(frame, { cid: ctx.cid, artifactId: ctx.artifactId });
 
     moreBtn.addEventListener('click', (e) => {
       e.stopPropagation();

@@ -3,14 +3,15 @@ import { createReadStream, createWriteStream } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { defineTool, type AgentTool, type ToolContext } from "./base.js";
+import { defineTool, type AgentTool, type ToolContext, type ToolResult } from "./base.js";
 import { SandboxExecutor } from "../sandbox/executor.js";
 import {
   discardStreamedToolOutput,
   type StreamedToolOutput,
 } from "../sandbox/output-capture.js";
 import { applyPatchTool } from "./apply-patch.js";
-import { getProcessSessionTools } from "./process-session.js";
+import { commandSessionWait, managedCommandsEnabled, startCommandSession } from "./command-sessions.js";
+import { processSessionCapacityError, getProcessSessionTools } from "./process-session.js";
 import { workspaceDiffTool } from "./workspace-diff.js";
 import { webFetchTool } from "./web-fetch.js";
 import { webSearchTool } from "./web-search.js";
@@ -231,17 +232,23 @@ export function normalizeBashTimeoutMs(
     : timeoutMs;
 }
 
+// Sequential by default: the core package has no way to prove a command
+// read-only, and two shell commands that overlap in one cwd can race on the
+// same file or on the ordering the model assumed (2026-09-18 decision,
+// superseding the 2026-09-17 unconditional opt-in). A host that can prove a
+// command reads only supplies `executionMode: "parallel"` + `parallelWhen`.
 export const bashTool: AgentTool = defineTool({
   name: "bash",
-  description: "Execute a shell command in a sandboxed environment and return its output. Node.js is available as `node`; use scripts and files for general or potentially large data processing. For GUI apps, browsers, servers, watchers, or any command you would normally background with `&`, set run_in_background=true instead of shell-backgrounding it; inherited stdout/stderr can otherwise keep the tool waiting.",
+  description: "Start a shell command and return its result, or a running session after the bounded wait. Continue a returned session with process_session. Node.js is available as `node`; use run_in_background only for explicit detached execution.",
   inputSchema: {
     type: "object",
     properties: {
       command: { type: "string", description: "The shell command to execute." },
+      yield_time_ms: { type: "integer", minimum: 0, maximum: 30000, default: 10000, description: "Initial wait in milliseconds before returning a running session; does not change the total timeout." },
       timeoutMs: { type: "number", description: "Timeout in milliseconds (default: 3600000 = 60 min). Pass a larger value for unusually long-running commands like full builds, large installs, network fetches, video processing." },
       run_in_background: {
         type: "boolean",
-        description: "Run detached and return immediately with pid + log path. Use for long builds, renders, downloads, or servers. Poll by reading the log; stop with `kill <pid>`. It keeps running after the conversation ends.",
+        description: "Set true only when the task requires the process to keep running after the conversation ends. Returns pid + log path; timeoutMs does not apply. Otherwise omit for long tasks and temporary services; continue any returned session_id with process_session.",
       },
     },
     required: ["command"],
@@ -249,6 +256,13 @@ export const bashTool: AgentTool = defineTool({
   async execute(input, ctx) {
     const command = input.command as string;
     const timeoutMs = normalizeBashTimeoutMs(input.timeoutMs);
+    const managed = managedCommandsEnabled(ctx) && input.run_in_background !== true;
+    const waitMs = commandSessionWait(input.yield_time_ms);
+    if (waitMs === null) return { content: "E_BAD_INPUT: yield_time_ms must be an integer from 0 to 30000", isError: true };
+    if (managed) {
+      const capacityError = processSessionCapacityError(ctx);
+      if (capacityError) return capacityError;
+    }
     const sandboxAllowedDirs = Array.isArray(ctx.state.sandboxAllowedDirs)
       ? ctx.state.sandboxAllowedDirs.filter((v): v is string => typeof v === "string" && v.length > 0)
       : undefined;
@@ -258,7 +272,9 @@ export const bashTool: AgentTool = defineTool({
       timeoutMs,
       env: ctx.state.sandboxEnv as Record<string, string> | undefined,
       allowedDirs: sandboxAllowedDirs,
-      signal: ctx.signal,
+      signal: managed && ctx.state.commandSessionSignal instanceof AbortSignal
+        ? AbortSignal.any([ctx.signal, ctx.state.commandSessionSignal].filter((s): s is AbortSignal => !!s))
+        : ctx.signal,
       ...(typeof ctx.state.toolResultSpoolDir === "string"
         ? { outputSpoolDir: ctx.state.toolResultSpoolDir }
         : {}),
@@ -281,6 +297,8 @@ export const bashTool: AgentTool = defineTool({
       };
     }
 
+    if (managed) return startCommandSession(sandbox, command, ctx, waitMs, formatCommandResult);
+
     const stopHeartbeat = startBashHeartbeat(ctx, timeoutMs);
     let result;
     try {
@@ -289,46 +307,54 @@ export const bashTool: AgentTool = defineTool({
       stopHeartbeat();
     }
 
-    const status = result.startFailed
-      ? "start_failed" as const
-      : result.timedOut
-        ? "timed_out" as const
-        : result.outputLimitExceeded
-          ? "output_limit" as const
-          : result.exitCode === 0
-            ? "succeeded" as const
-            : "failed" as const;
-    const streamedOutput = await aggregateCommandStreams(result);
-    return {
-      content: renderCommandResult(result, status),
-      ...(streamedOutput ? { streamedOutput } : {}),
-      observations: {
-        execution: {
-          status,
-          exitCode: result.exitCode,
-          durationMs: result.durationMs,
-          timedOut: result.timedOut,
-          outputLimitExceeded: result.outputLimitExceeded,
-          stdout: {
-            bytes: result.stdoutBytes,
-            truncated: !!result.stdoutStreamedOutput,
-          },
-          stderr: {
-            bytes: result.stderrBytes,
-            truncated: !!result.stderrStreamedOutput,
-          },
-        },
-      },
-      ...(status !== "succeeded" ? { isError: true } : {}),
-    };
+    return formatCommandResult(result);
   },
 });
 
+async function formatCommandResult(result: CommandCapture): Promise<ToolResult> {
+  const status = result.startFailed
+    ? "start_failed" as const
+    : result.timedOut
+      ? "timed_out" as const
+      : result.outputLimitExceeded
+        ? "output_limit" as const
+        : result.aborted
+          ? "aborted" as const
+          : result.exitCode === 0
+            ? "succeeded" as const
+            : "failed" as const;
+  const streamedOutput = await aggregateCommandStreams(result);
+  return {
+    content: renderCommandResult(result, status),
+    ...(streamedOutput ? { streamedOutput } : {}),
+    observations: {
+      execution: {
+        status,
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+        timedOut: result.timedOut,
+        outputLimitExceeded: result.outputLimitExceeded,
+        stdout: {
+          bytes: result.stdoutBytes,
+          truncated: !!result.stdoutStreamedOutput,
+        },
+        stderr: {
+          bytes: result.stderrBytes,
+          truncated: !!result.stderrStreamedOutput,
+        },
+      },
+    },
+    ...(status !== "succeeded" ? { isError: true } : {}),
+  };
+}
+
 type CommandCapture = Awaited<ReturnType<SandboxExecutor["execute"]>>;
 
-function renderCommandResult(
-  result: CommandCapture,
-  status: "succeeded" | "failed" | "timed_out" | "output_limit" | "start_failed",
+export function renderCommandResult(
+  result: Pick<CommandCapture,
+    "exitCode" | "durationMs" | "timedOut" | "outputLimitExceeded"
+    | "stdoutBytes" | "stderrBytes" | "stdout" | "stderr">,
+  status: "succeeded" | "failed" | "timed_out" | "output_limit" | "start_failed" | "aborted",
 ): string {
   const header =
     `<command-result status="${status}" exit_code="${result.exitCode ?? "null"}" `

@@ -126,7 +126,28 @@ async function callGroupChatSend(payload: Record<string, unknown>): Promise<Reco
   );
 }
 
-describe('connector assistance creation boundary', () => {
+describe('conversation assistance creation boundary', () => {
+  it('accepts the app creation entry without persisting caller-authored guidance', async () => {
+    const created = await invokeHandler!({ sender: trustedIpcSender() }, {
+      channel: 'conversations.create', payload: { title: 'Unit converter', assistance: {
+        kind: 'app_creation', prompt: 'UNTRUSTED_INSTRUCTIONS', connector_id: 'notion',
+      } },
+    });
+    expect(created).toMatchObject({ ok: true, conversation: {
+      title: 'Unit converter', assistance: { kind: 'app_creation' },
+    } });
+    expect((created.conversation as any).assistance).toEqual({ kind: 'app_creation' });
+    const chats = await import('../../../src/main/features/chats');
+    const cid = (created.conversation as any).conversation_id;
+    chats.invalidateConversationCaches(TEST_UID);
+    expect((await chats.getConversationMetadata(TEST_UID, cid))?.assistance).toEqual({ kind: 'app_creation' });
+    const rejected = await invokeHandler!({ sender: trustedIpcSender() }, {
+      channel: 'conversations.create', payload: { assistance: { kind: 'app-creation' } },
+    });
+    expect(rejected.ok).toBe(false);
+    expect(await chats.listConversations(TEST_UID)).toHaveLength(1);
+  });
+
   it('persists only a validated target and rejects forged setup metadata before creating a conversation', async () => {
     const invokeCreate = (assistance: unknown) => invokeHandler!(
       { sender: trustedIpcSender() }, { channel: 'conversations.create', payload: { title: 'Set up seller', assistance } },

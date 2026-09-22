@@ -46,10 +46,6 @@ const PROCESS_OWNER_SUITE: Record<string, ProcessOwner> = {
     suite: 'test/main/features/notification_permissions.test.ts',
     evidence: 'windowsNotificationPermissionProbe',
   },
-  'src/main/features/ocr_runtime.ts': {
-    suite: 'test/main/features/ocr_runtime.test.ts',
-    evidence: '_ensureOcrRuntimeForTest',
-  },
   'src/main/features/office/office_engine.ts': {
     suite: 'test/main/features/office/office_engine.test.ts',
     evidence: 'runOfficeCli',
@@ -77,6 +73,10 @@ const PROCESS_OWNER_SUITE: Record<string, ProcessOwner> = {
   'src/main/model/core-agent/repository-search.ts': {
     suite: 'test/main/model/core-agent/file-tools.test.ts',
     evidence: 'include_ignored',
+  },
+  'src/main/util/extract-xls.ts': {
+    suite: 'test/main/util/extract-xls.test.ts',
+    evidence: 'xlsBufferToMarkdown',
   },
   'src/main/util/media_probe.ts': {
     suite: 'test/main/util/media_probe.test.ts',

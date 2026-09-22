@@ -272,8 +272,9 @@ export async function checkServerUpdatesForInstalls(
       try { _assertContinue(opts); } catch { return { updated_agents, updated_skills }; }
       // Replace content identity only for a strict version upgrade. agent_json_url is reused (server
       // overwrites the same COS key on republish — see Server `api/marketplace.py::upload_agent`).
-      await addAgentInstall(uid, {
+      const applied = await addAgentInstall(uid, {
         id: a.id,
+        installed_at: a.installed_at,
         version: contentUpgrade ? server.version : a.version,
         published_at: contentUpgrade ? server.published_at : a.published_at,
         ...((contentUpgrade ? server.updated_at : a.updated_at) !== undefined
@@ -286,7 +287,8 @@ export async function checkServerUpdatesForInstalls(
         ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
         ...(typeof server.status === 'string' ? { status: server.status } : {}),
         ...(typeof server.min_app_version === 'string' ? { min_app_version: server.min_app_version } : {}),
-      });
+      }, { mode: 'update' });
+      if (!applied) continue;
       if (!contentUpgrade && (defaultInstallChanged || statusChanged || minAppVersionChanged)) {
         await withMarketplaceInstallLock(uid, 'agent', a.id, async () => {
           await _patchInstallMeta(userMarketplaceAgentDir(uid, a.id), {
@@ -323,8 +325,9 @@ export async function checkServerUpdatesForInstalls(
         log.info(`server-update skill ${s.id}: v${s.version} → v${server.version}`);
       }
       try { _assertContinue(opts); } catch { return { updated_agents, updated_skills }; }
-      await addSkillInstall(uid, {
+      const applied = await addSkillInstall(uid, {
         id: s.id,
+        installed_at: s.installed_at,
         version: contentUpgrade ? server.version : s.version,
         published_at: contentUpgrade ? server.published_at : s.published_at,
         ...((contentUpgrade ? server.updated_at : s.updated_at) !== undefined
@@ -335,7 +338,8 @@ export async function checkServerUpdatesForInstalls(
         ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
         ...(typeof server.status === 'string' ? { status: server.status } : {}),
         ...(typeof server.min_app_version === 'string' ? { min_app_version: server.min_app_version } : {}),
-      });
+      }, { mode: 'update' });
+      if (!applied) continue;
       if (!contentUpgrade && (defaultInstallChanged || statusChanged || minAppVersionChanged)) {
         await withMarketplaceInstallLock(uid, 'skill', s.id, async () => {
           await _patchInstallMeta(userMarketplaceSkillDir(uid, s.id), {
@@ -644,65 +648,75 @@ async function _reconcileLocalOnlyInstalls(
   for (const id of _localInstallIds(userMarketplaceAgentsDir(uid))) {
     _assertContinue(opts);
     if (manifestAgents.has(id)) continue;
-    const dir = userMarketplaceAgentDir(uid, id);
-    const meta = _readInstallMeta(dir);
-    const tombstone = manifest._deleted_at?.agents?.[id] || 0;
-    const activeAt = _localInstallActiveAt(dir, meta);
-    if (tombstone > 0 && tombstone >= activeAt) {
-      await fsp.rm(dir, { recursive: true, force: true });
-      counts.pruned_agents++;
-      log.info(`pruned local-only marketplace agent ${id} (manifest tombstone wins)`);
-      continue;
-    }
-    if (_canRestoreAgentInstall(meta)) {
-      _assertContinue(opts);
-      await addAgentInstall(uid, {
-        id,
-        version: meta.version,
-        published_at: meta.published_at,
-        ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
-        agent_json_url: meta.agent_json_url!,
-        ...(typeof meta.agent_skills_bundle_url === 'string' ? { agent_skills_bundle_url: meta.agent_skills_bundle_url } : {}),
-        installed_at: meta.installed_at!,
-        create_uid: meta.create_uid || '',
-        ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
-        ...(meta.status ? { status: meta.status } : {}),
-        ...(meta.min_app_version ? { min_app_version: meta.min_app_version } : {}),
-      });
-      counts.restored_agents++;
-      log.info(`restored local-only marketplace agent ${id} into installs manifest`);
-    }
+    await withMarketplaceInstallLock(uid, 'agent', id, async () => {
+      const dir = userMarketplaceAgentDir(uid, id);
+      const meta = _readInstallMeta(dir);
+      const latest = await readInstalls(uid);
+      if (latest.agents.some((row) => row.id === id)) return;
+      const tombstone = latest._deleted_at?.agents?.[id] || 0;
+      const activeAt = _installActiveAt(meta);
+      if (tombstone > 0 && tombstone >= activeAt) {
+        await fsp.rm(dir, { recursive: true, force: true });
+        counts.pruned_agents++;
+        log.info(`pruned local-only marketplace agent ${id} (manifest tombstone wins)`);
+        return;
+      }
+      if (_canRestoreAgentInstall(meta)) {
+        _assertContinue(opts);
+        const applied = await addAgentInstall(uid, {
+          id,
+          version: meta.version,
+          published_at: meta.published_at,
+          ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
+          agent_json_url: meta.agent_json_url!,
+          ...(typeof meta.agent_skills_bundle_url === 'string' ? { agent_skills_bundle_url: meta.agent_skills_bundle_url } : {}),
+          installed_at: meta.installed_at!,
+          create_uid: meta.create_uid || '',
+          ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
+          ...(meta.status ? { status: meta.status } : {}),
+          ...(meta.min_app_version ? { min_app_version: meta.min_app_version } : {}),
+        }, { mode: 'restore' });
+        if (!applied) return;
+        counts.restored_agents++;
+        log.info(`restored local-only marketplace agent ${id} into installs manifest`);
+      }
+    });
   }
   for (const id of _localInstallIds(userMarketplaceSkillsDir(uid))) {
     _assertContinue(opts);
     if (manifestSkills.has(id)) continue;
-    const dir = userMarketplaceSkillDir(uid, id);
-    const meta = _readInstallMeta(dir);
-    const tombstone = manifest._deleted_at?.skills?.[id] || 0;
-    const activeAt = _localInstallActiveAt(dir, meta);
-    if (tombstone > 0 && tombstone >= activeAt) {
-      await fsp.rm(dir, { recursive: true, force: true });
-      counts.pruned_skills++;
-      log.info(`pruned local-only marketplace skill ${id} (manifest tombstone wins)`);
-      continue;
-    }
-    if (_canRestoreSkillInstall(meta)) {
-      _assertContinue(opts);
-      await addSkillInstall(uid, {
-        id,
-        version: meta.version,
-        published_at: meta.published_at,
-        ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
-        bundle_url: meta.bundle_url!,
-        installed_at: meta.installed_at!,
-        create_uid: meta.create_uid || '',
-        ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
-        ...(meta.status ? { status: meta.status } : {}),
-        ...(meta.min_app_version ? { min_app_version: meta.min_app_version } : {}),
-      });
-      counts.restored_skills++;
-      log.info(`restored local-only marketplace skill ${id} into installs manifest`);
-    }
+    await withMarketplaceInstallLock(uid, 'skill', id, async () => {
+      const dir = userMarketplaceSkillDir(uid, id);
+      const meta = _readInstallMeta(dir);
+      const latest = await readInstalls(uid);
+      if (latest.skills.some((row) => row.id === id)) return;
+      const tombstone = latest._deleted_at?.skills?.[id] || 0;
+      const activeAt = _installActiveAt(meta);
+      if (tombstone > 0 && tombstone >= activeAt) {
+        await fsp.rm(dir, { recursive: true, force: true });
+        counts.pruned_skills++;
+        log.info(`pruned local-only marketplace skill ${id} (manifest tombstone wins)`);
+        return;
+      }
+      if (_canRestoreSkillInstall(meta)) {
+        _assertContinue(opts);
+        const applied = await addSkillInstall(uid, {
+          id,
+          version: meta.version,
+          published_at: meta.published_at,
+          ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
+          bundle_url: meta.bundle_url!,
+          installed_at: meta.installed_at!,
+          create_uid: meta.create_uid || '',
+          ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
+          ...(meta.status ? { status: meta.status } : {}),
+          ...(meta.min_app_version ? { min_app_version: meta.min_app_version } : {}),
+        }, { mode: 'restore' });
+        if (!applied) return;
+        counts.restored_skills++;
+        log.info(`restored local-only marketplace skill ${id} into installs manifest`);
+      }
+    });
   }
   return counts;
 }
@@ -927,7 +941,7 @@ async function _ensureAgentSkillDependencies(
         ...((meta.status || meta.state) ? { status: meta.status || meta.state } : {}),
         ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
       };
-      await addSkillInstall(uid, row);
+      if (!await addSkillInstall(uid, row, { mode: 'seed' })) throw new ReconcileCancelled();
       manifestSkills.set(skillId, row);
     }
     if (!row.bundle_url) throw new Error(`dependency skill ${skillId} missing bundle_url`);
@@ -1012,15 +1026,8 @@ function _installStatus(row: { status?: string; state?: string }): string {
   return (row.status || row.state || '').trim();
 }
 
-function _installActiveAt(dir: string, row: InstallMeta | AgentInstall | SkillInstall | null): number {
-  const installedAt = typeof row?.installed_at === 'number' ? row.installed_at : 0;
-  const freshness = row ? _freshnessAt(row) : 0;
-  if (installedAt > 0 || freshness > 0) return Math.max(installedAt, freshness);
-  try { return fs.statSync(dir).mtimeMs; } catch { return 0; }
-}
-
-function _localInstallActiveAt(dir: string, meta: InstallMeta | null): number {
-  return _installActiveAt(dir, meta);
+function _installActiveAt(row: InstallMeta | AgentInstall | SkillInstall | null): number {
+  return typeof row?.installed_at === 'number' ? row.installed_at : 0;
 }
 
 function _canRestoreAgentInstall(meta: InstallMeta | null): meta is InstallMeta & { agent_json_url: string; installed_at: number } {
@@ -1115,6 +1122,14 @@ function _hasDownloadUrl(value: unknown): value is string {
   }
 }
 
+async function _assertInstallCurrent(uid: string, kind: 'agents' | 'skills', row: AgentInstall | SkillInstall): Promise<void> {
+  const manifest = await readInstalls(uid);
+  const current = manifest[kind].find((entry) => entry.id === row.id);
+  if (!current || current.installed_at !== row.installed_at || current.version !== row.version) {
+    throw new ReconcileCancelled();
+  }
+}
+
 /** Fetch agent.json from the cloud URL recorded in the manifest, write to the per-machine
  *  install target. Wipe-and-replace so a previous version doesn't leave stale fields. */
 async function _pullAgent(uid: string, row: AgentInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
@@ -1122,6 +1137,7 @@ async function _pullAgent(uid: string, row: AgentInstall, opts: MarketplaceRecon
 }
 
 async function _pullAgentLocked(uid: string, row: AgentInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
+  await _assertInstallCurrent(uid, 'agents', row);
   let current = row;
   _assertContinue(opts);
   let res = _hasDownloadUrl(current.agent_json_url)
@@ -1187,6 +1203,7 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
     opts,
   );
 
+  await _assertInstallCurrent(uid, 'agents', row);
   const dir = userMarketplaceAgentDir(uid, row.id);
   await replaceDirectoryAtomically(dir, async (staged) => {
     _assertContinue(opts);
@@ -1220,7 +1237,7 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
     });
   }, async () => {
     _assertContinue(opts);
-    await addAgentInstall(uid, current);
+    if (!await addAgentInstall(uid, current, { mode: 'update' })) throw new ReconcileCancelled();
   }, { assertReady: () => _assertContinue(opts) });
 }
 
@@ -1232,6 +1249,7 @@ async function _pullSkill(uid: string, row: SkillInstall, opts: MarketplaceRecon
 }
 
 async function _pullSkillLocked(uid: string, row: SkillInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
+  await _assertInstallCurrent(uid, 'skills', row);
   let current = row;
   _assertContinue(opts);
   let downloaded = _hasDownloadUrl(current.bundle_url)
@@ -1282,6 +1300,7 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
     throw new Error(`skill ${row.id} requires Orkas >= ${minAppVersion} (current ${_currentAppVersion() || 'unknown'})`);
   }
 
+  await _assertInstallCurrent(uid, 'skills', row);
   const dir = userMarketplaceSkillDir(uid, row.id);
   await replaceDirectoryAtomically(dir, async (staged) => {
     _assertContinue(opts);
@@ -1310,7 +1329,7 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
     });
   }, async () => {
     _assertContinue(opts);
-    await addSkillInstall(uid, current);
+    if (!await addSkillInstall(uid, current, { mode: 'update' })) throw new ReconcileCancelled();
   }, { assertReady: () => _assertContinue(opts) });
 }
 

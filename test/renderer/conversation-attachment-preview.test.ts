@@ -34,7 +34,7 @@ type AttachmentItem = {
   status?: string;
 };
 
-type OpenPreview = (cid: string, item: AttachmentItem | null) => Promise<void>;
+type OpenPreview = (cid: string, item: AttachmentItem | null, sourceElement?: object) => Promise<void>;
 
 function renderMessageAttachments(names: string[], cid: string): string {
   const context = vm.createContext({
@@ -111,6 +111,17 @@ describe('pending attachment preview', () => {
       { cid: 'main_chat' },
     );
     expect(harness.showFileMissingToast).not.toHaveBeenCalled();
+  });
+
+  it('preserves a sent attachment source so preview navigation stays in its transcript', async () => {
+    const harness = createPreviewHarness();
+    const sourceElement = { dataset: { attachName: 'reference.png' } };
+
+    await harness.openPreview('task-a', { name: 'reference.png', status: 'ready' }, sourceElement);
+
+    expect(harness.openChatFileViewer).toHaveBeenCalledWith(
+      '/safe/draft-note.md', 'reference.png', { cid: 'task-a', sourceElement },
+    );
   });
 
   it('falls back to the stored name when no separate display name exists', async () => {

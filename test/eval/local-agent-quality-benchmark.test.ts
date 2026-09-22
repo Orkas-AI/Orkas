@@ -65,6 +65,9 @@ describe('Local Agent quality benchmark contract', () => {
       'local-agent-current-history-reference',
       'local-agent-open-skill-read',
       'local-agent-commander-owned-mutations',
+      'local-agent-skill-source-edit',
+      'local-agent-skill-source-and-install',
+      'local-agent-builtin-skill-source-edit',
       'local-agent-project-task-delivery',
       'local-agent-project-task-approval',
       'local-agent-project-task-missing-evidence',
@@ -93,6 +96,64 @@ describe('Local Agent quality benchmark contract', () => {
     expect(openSkill.agents).toEqual(['claude', 'codex']);
     expect(Object.keys(openSkill.bridgeSkills)).toEqual(['benchmark-lookup']);
     expect(openSkill.prompt).not.toContain('SKILL-CEDAR-71');
+    expect(LOCAL_AGENT_BENCHMARK_SCENARIOS.filter((item: any) => item.permissionPolicy === 'full_access')
+      .map((item: any) => item.id)).toEqual([
+      'local-agent-commander-owned-mutations',
+      'local-agent-skill-source-edit',
+      'local-agent-skill-source-and-install',
+      'local-agent-builtin-skill-source-edit',
+    ]);
+  });
+
+  it('requires completed source edits and distinguishes installation from workspace authoring', () => {
+    const files = {
+      'src/sdk.ts': 'export const timeoutMs = 2000;\n',
+      'skills/source-helper/SKILL.md': '---\nname: source-helper\ndescription: Explain the SDK timeout.\n---\n\nThe SDK timeout is 2000 ms.\n',
+      'docs/guide.md': '# SDK guide\n\nThe SDK timeout is 2000 ms.\n',
+    };
+    const handoff = { reason: 'Install source-helper in Orkas', context: 'Use the updated skills/source-helper directory.' };
+    const toolNames = ['mcp__orkas__orkas_handoff_to_commander'];
+    for (const id of ['local-agent-skill-source-edit', 'local-agent-skill-source-and-install']) {
+      const install = id.endsWith('-install');
+      const observation = { status: 'completed', files, toolNames: install ? toolNames : [],
+        commanderHandoff: install ? handoff : null, handoffWorkspaceSnapshots: install ? [files] : [] };
+      expect(allChecksPass(id, observation)).toBe(true);
+      expect(allChecksPass(id, { ...observation, files: scenario(id).seedFiles })).toBe(false);
+      expect(allChecksPass(id, { ...observation, files: { ...files, 'docs/guide.md': scenario(id).seedFiles['docs/guide.md'] } })).toBe(false);
+      expect(allChecksPass(id, { ...observation, workspaceFiles: [...Object.keys(files), 'extra.md'] })).toBe(false);
+      expect(allChecksPass(id, { ...observation, toolNames: install ? [] : toolNames, commanderHandoff: install ? null : handoff })).toBe(false);
+      if (install) {
+        expect(allChecksPass(id, { ...observation, handoffWorkspaceSnapshots: [scenario(id).seedFiles] })).toBe(false);
+        expect(allChecksPass(id, { ...observation, handoffWorkspaceSnapshots: [] })).toBe(false);
+        expect(allChecksPass(id, { ...observation, toolNames: [...toolNames, ...toolNames] })).toBe(false);
+        expect(allChecksPass(id, { ...observation, commanderHandoff: { reason: 'Install a Skill' } })).toBe(false);
+      }
+    }
+  });
+
+  it('rejects the reported built-in Skill handback and partial SDK-only repair', () => {
+    const id = 'local-agent-builtin-skill-source-edit';
+    const files = {
+      'src/sdk.ts': 'export const timeoutMs = 2000;\n',
+      'resources/builtin/system/skills/sdk/SKILL.md': '---\nname: sdk\ndescription: Explain the SDK timeout.\n---\n\nThe SDK timeout is 2000 ms.\n',
+      'resources/builtin/system/skills/orkas-guide/SKILL.md': '---\nname: orkas-guide\ndescription: Guide to SDK usage.\n---\n\nThe SDK timeout is 2000 ms.\n',
+    };
+    const observation = { status: 'completed', files, toolNames: [], commanderHandoff: null };
+    expect(allChecksPass(id, observation)).toBe(true);
+    // Give the model the user's vocabulary, not a file-path or routing answer.
+    expect(scenario(id).prompt).toContain('内置 SDK Skill');
+    expect(scenario(id).prompt).not.toContain('resources/');
+    expect(scenario(id).prompt).not.toContain('Commander');
+    for (const file of Object.keys(files)) {
+      expect(allChecksPass(id, { ...observation, files: { ...files, [file]: scenario(id).seedFiles[file] } })).toBe(false);
+      expect(allChecksPass(id, { ...observation, files: { ...files, [file]: null } })).toBe(false);
+    }
+    expect(allChecksPass(id, { ...observation, files: scenario(id).seedFiles, output: '全部完成' })).toBe(false);
+    expect(allChecksPass(id, { ...observation, files: { ...scenario(id).seedFiles, 'src/sdk.ts': files['src/sdk.ts'] } })).toBe(false);
+    expect(allChecksPass(id, { ...observation, toolNames: ['orkas.orkas_handoff_to_commander'],
+      commanderHandoff: { reason: 'Built-in Skill changes belong to Commander' } })).toBe(false);
+    expect(allChecksPass(id, { ...observation, status: 'aborted' })).toBe(false);
+    expect(allChecksPass(id, { ...observation, workspaceFiles: [...Object.keys(files), 'custom-replacement/SKILL.md'] })).toBe(false);
   });
 
   it('scores task verification from persisted state and rejects false completion or manufactured evidence', () => {

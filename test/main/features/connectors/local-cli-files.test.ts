@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -146,9 +147,50 @@ describe('local CLI attachment journeys and input boundaries', () => {
     expect(execute).toHaveBeenCalledOnce();
   });
 
+  it.each(['cancel', 'deadline'])('preserves %s during attachment staging before any business execution', async (outcome) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const env = envFor('lark');
+    const controller = new AbortController();
+    const execute = vi.fn(() => ok({ ok: true }));
+    const open = fs.promises.open.bind(fs.promises);
+    const makeDirectory = fs.mkdtempSync.bind(fs);
+    let staging = '';
+    vi.spyOn(fs, 'mkdtempSync').mockImplementation((prefix: any, options: any) => {
+      const directory = makeDirectory(prefix, options);
+      if (String(prefix).includes('orkas-cli-input-')) staging = String(directory);
+      return directory;
+    });
+    let entered!: () => void;
+    let release!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(fs.promises, 'open').mockImplementation(async (file, ...args) => {
+      const handle = await open(file, ...args);
+      if (file === fs.realpathSync(source)) {
+        entered();
+        await held;
+      }
+      return handle;
+    });
+    const pending = adapter.executeAction('H', { action: 'im.+messages-send', parameters: {
+      user_id: 'ou_fixture', file: source,
+    } }, { runner: runnerFor(execute), signal: controller.signal }, env).catch((error: Error) => error);
+    try {
+      await waiting;
+      if (outcome === 'cancel') controller.abort();
+      else await vi.advanceTimersByTimeAsync(600_000);
+      release();
+      expect(await pending).toMatchObject({ code: outcome === 'cancel' ? 'E_TOOL_CALL_CANCELLED' : 'ETIMEDOUT' });
+      expect(execute).not.toHaveBeenCalled();
+      expect(staging).not.toBe('');
+      expect(fs.existsSync(staging)).toBe(false);
+      expect(fs.readFileSync(source)).toEqual(bytes);
+    } finally { release(); await pending; vi.useRealTimers(); }
+  });
+
   it.each(['ordinary', 'transfer'])('gives %s execution its own bounded deadline', async (kind) => {
     const execute = vi.fn((_args: string[], options: any) => {
-      expect(options.timeout).toBe(kind === 'transfer' ? 600_000 : 60_000);
+      expect(options.timeout).toBe(600_000);
       return ok({ ok: true });
     });
     await adapter.executeAction('H', { action: 'im.+messages-send', parameters: {
@@ -364,6 +406,35 @@ describe('reauthorization across business domains and CLI providers', () => {
       fs.symlinkSync(outside, file);
     } else fs.writeFileSync(file, variant === 'malformed' ? '{' : JSON.stringify(value));
     expect(permissions.readPermissionRequest(env)).toBeNull();
+  });
+
+  it.each(['unavailable', 'malformed', 'verified'])('reports %s permission verification through the real child entry point without authorizing', mode => {
+    const baseEnv = envFor('lark');
+    const env = { ...baseEnv, ORKAS_LOCAL_CLI_BRAND: 'feishu',
+      ORKAS_LOCAL_CLI_INTEGRITY_MARKER: path.join(baseEnv.ORKAS_LOCAL_CLI_RUNTIME_DIR, '.orkas-cli-integrity.json') };
+    const npx = path.join(root, 'fake-npx.cjs');
+    const calls = path.join(root, 'calls.json');
+    fs.writeFileSync(npx, `const fs = require('node:fs');
+fs.writeFileSync(process.env.FIXTURE_CALLS, JSON.stringify(process.argv.slice(2)));
+if (process.env.FIXTURE_MODE === 'unavailable') process.exit(1);
+process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.stringify({ identities: { user: { available: true, verified: true, scope: 'docx:document:readonly im:message.send_as_user' } } }));`);
+    auth.writeIntegrityMarker(auth.MANIFESTS.lark, env);
+    permissions.rememberPermissionRequest({ provider_error: { type: 'authorization', identity: 'user', missing_scopes: ['docx:document:readonly'] } }, env);
+    const file = path.join(env.ORKAS_LOCAL_CLI_RUNTIME_DIR, '.orkas-user-permissions.json');
+    const original = fs.readFileSync(file, 'utf8');
+    const result = spawnSync(process.env.ORKAS_TEST_NODE || process.execPath, [path.resolve(__dirname, '../../../../bin/local-cli-auth.cjs')], {
+      env: { ...process.env, ...env, ORKAS_NODE: process.env.ORKAS_TEST_NODE || process.execPath,
+        ORKAS_LOCAL_CLI_NPX_CLI: npx, ORKAS_LOCAL_CLI_CHECK_PERMISSIONS_ONLY: '1', ORKAS_LOCAL_CLI_INSTALL_ONLY: '0',
+        FIXTURE_MODE: mode, FIXTURE_CALLS: calls }, encoding: 'utf8', timeout: 5_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(calls, 'utf8')).slice(3)).toEqual(['auth', 'status', '--profile', 'file-contract', '--verify', '--json']);
+    expect(result.status).toBe(mode === 'verified' ? 0 : 1);
+    if (mode === 'verified') expect(permissions.readPermissionRequest(env)).toBeNull();
+    else {
+      expect(fs.readFileSync(file, 'utf8')).toBe(original);
+      expect(result.stderr).toContain('permission verification unavailable');
+    }
   });
 
   it('discovers missing send permission without logging in, preserves other grants and removes the notice after a confirmed grant', () => {

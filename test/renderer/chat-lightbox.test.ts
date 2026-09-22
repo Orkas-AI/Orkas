@@ -25,6 +25,21 @@ function loadLightbox() {
 }
 
 describe('chat image lightbox file ownership', () => {
+  it('forwards an outside image path when the user clicks reveal and re-enables the button', async () => {
+    const context = loadLightbox();
+    const invoke = vi.fn(async () => ({ ok: true }));
+    context.window.orkas = { invoke };
+    vm.runInContext(`
+      _lightboxCurrentFile = { absPath: '/external project/封面.png', cid: 'image-chat' };
+      _lightboxRevealBtn = { disabled: false };
+    `, context);
+    await context._onLightboxReveal({ stopPropagation: vi.fn() });
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('workspace.revealPath', {
+      path: '/external project/封面.png', cid: 'image-chat',
+    });
+    expect(vm.runInContext('_lightboxRevealBtn.disabled', context)).toBe(false);
+  });
+
   it('releases the preview source without resolving an empty URL to the current page', () => {
     const context = loadLightbox();
     let emptyAssignmentResolvedCurrentPage = false;

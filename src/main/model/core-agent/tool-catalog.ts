@@ -114,10 +114,10 @@ export const TOOL_GROUPS: readonly ToolGroupEntry[] = [
   { id: 'orchestration', title: 'Orchestration', summary: 'Commander delegation, handoff, and anonymous worker controls.', activation: 'host-managed', agentDependency: false },
   { id: 'management', title: 'Management', summary: 'App support, Skill, marketplace, and automation management controls.', activation: 'loadable', agentDependency: false },
   { id: 'management.app', title: 'App support', summary: 'Navigate supported Orkas screens and inspect sanitized app health.', parent: 'management', activation: 'loadable', agentDependency: false },
-  { id: 'management.projects', title: 'Project tasks', summary: 'Find an existing project and read or update its task backlog.', parent: 'management', activation: 'loadable', agentDependency: false },
+  { id: 'management.projects', title: 'Project tasks', summary: 'Find an existing project and read or update its task backlog.', parent: 'management', activation: 'loadable', agentDependency: true },
   { id: 'management.skills', title: 'Skill management', summary: 'Search available shared Skills or import a user-requested Skill package.', parent: 'management', activation: 'loadable', agentDependency: false },
   { id: 'management.marketplace', title: 'Marketplace management', summary: 'Search the Marketplace and request a confirmed installation.', parent: 'management', activation: 'loadable', agentDependency: false },
-  { id: 'management.automation', title: 'Automation management', summary: 'Manage scheduled automations.', parent: 'management', activation: 'loadable', agentDependency: false },
+  { id: 'management.automation', title: 'Automation management', summary: 'Manage scheduled automations.', parent: 'management', activation: 'loadable', agentDependency: true },
   { id: 'runtime', title: 'Runtime', summary: 'Tool-surface, learned-skill, and oversized-result runtime controls.', activation: 'host-managed', agentDependency: false },
 ] as const;
 
@@ -153,7 +153,6 @@ export const TOOL_GROUP_ALIASES: Readonly<Record<string, ToolGroupId>> = Object.
 export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'read_files', loadGroups: ['workspace.read'], programmatic: { mode: 'allow' }, summary: 'Read one or more files, ranges, images, or prepared document metadata.' },
   { name: 'list_files', loadGroups: ['workspace.read'], programmatic: { mode: 'allow' }, summary: 'List the workspace directory tree.' },
-  { name: 'ocr_file', loadGroups: ['workspace.read'], programmatic: { mode: 'allow' }, summary: 'OCR PDF pages or image files.' },
   { name: 'search_files', loadGroups: ['workspace.read'], programmatic: { mode: 'allow' }, summary: 'Find files by name or glob.' },
   { name: 'grep_files', loadGroups: ['workspace.read'], programmatic: { mode: 'allow' }, summary: 'Search text across workspace and attachment files.' },
 
@@ -163,13 +162,13 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'append_file', loadGroups: ['workspace.write.output'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Append a checked chunk to a text file.' },
   { name: 'publish_outputs', loadGroups: ['workspace.write.output'], summary: 'Declare final file deliverables for the turn.' },
   { name: 'library_save', loadGroups: ['workspace.write.output'], permission: 'localExec', summary: 'Save a produced project file into the durable user Library.' },
-  { name: 'apply_patch', loadGroups: ['workspace.write.edit'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Apply a transactional multi-file patch.' },
+  { name: 'apply_patch', loadGroups: ['workspace.write.edit'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Apply a transactional patch to one or more files.' },
   { name: 'edit_file', loadGroups: ['workspace.write.edit'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Replace exact text in an existing file.' },
   { name: 'delete_file', loadGroups: ['workspace.write.edit'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Delete one file, requesting confirmation only outside the active workspace scope.' },
   { name: 'workspace_diff', loadGroups: ['workspace.write.edit'], programmatic: { mode: 'allow' }, summary: 'Read observed workspace changes.' },
 
-  { name: 'bash', loadGroups: ['workspace.execute.command'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Run shell commands or Python/Node scripts for deterministic local and batch processing.' },
-  { name: 'process_session', loadGroups: ['workspace.execute.session'], permission: 'localExec', summary: 'Manage a persistent process session.' },
+  { name: 'bash', loadGroups: ['workspace.execute.command', 'workspace.execute.session'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Run shell commands or Python/Node scripts for deterministic local and batch processing.' },
+  { name: 'process_session', loadGroups: ['workspace.execute.command', 'workspace.execute.session'], permission: 'localExec', summary: 'Manage a persistent process session.' },
   { name: 'interactive_cli', loadGroups: ['workspace.execute.session'], permission: 'localExec', summary: 'Manage a live user-input CLI session.' },
   { name: 'create_artifact', loadGroups: ['workspace.artifact'], permission: 'localExec', summary: 'Build an interactive HTML/CSS/JS artifact.' },
   { name: 'html_preview', loadGroups: ['workspace.artifact'], permission: 'localExec', summary: 'Audit local HTML at desktop or mobile targets.' },
@@ -188,7 +187,7 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'research_verify_citations', loadGroups: ['web'], ownerAgent: [...DEEP_RESEARCH_AGENT_IDS], programmatic: { mode: 'conditional', policy: 'network-read' }, summary: 'Verify research claims against fetched source text.' },
   { name: 'web_search', loadGroups: ['web'], programmatic: { mode: 'conditional', policy: 'network-read' }, summary: 'Search the web.' },
   { name: 'web_fetch', loadGroups: ['web'], programmatic: { mode: 'conditional', policy: 'network-read' }, summary: 'Fetch the body of a URL.' },
-  { name: 'browser', loadGroups: ['web'], summary: 'Control visible browser tabs shared with the user in the current task.' },
+  { name: 'inner_browser', loadGroups: ['web'], summary: 'Control visible browser tabs shared with the user in the current task.' },
 
   { name: 'generate_image', loadGroups: ['media.image'], permission: 'localExec', summary: 'Generate an image into the workspace.' },
   { name: 'image_studio', loadGroups: ['media.image'], permission: 'localExec', ownerAgent: IMAGE_STUDIO_AGENT_ID, summary: 'ImageStudio-owned QA and export runtime.' },
@@ -419,7 +418,7 @@ export function getLoadableToolGroupsSystemPromptBlock(input: {
     purpose !== 'agent-authoring'
       ? (purpose === 'agent-runtime'
         ? 'Fallback only: if the current tools cannot complete an in-domain request, load the smallest sufficient groups in one call. Loads last for this user turn only.'
-        : 'Use `tool_load` for the groups containing needed tools that are not currently exposed. Load all clearly needed groups in one call; choose the smallest sufficient groups, and remember that a parent loads all children. Loads last for the current user turn only. Runtime-only groups must not be written into an Agent dependency list.')
+        : 'Load the smallest sufficient groups; a parent includes all child groups.')
       : 'Use these exact group ids when authoring an Agent\'s built-in tool dependencies. This directory does not change the current session\'s tool surface.',
     '',
   ];
@@ -444,12 +443,8 @@ export function getLoadableToolGroupsSystemPromptBlock(input: {
       parent = GROUP_BY_ID.get(parent)?.parent;
     }
     const indent = '  '.repeat(depth);
-    const markers = purpose === 'runtime' && !group.agentDependency
-      ? ['runtime only; not an Agent dependency']
-      : [];
-    const status = markers.length ? ` (${markers.join('; ')})` : '';
     if (purpose === 'runtime') {
-      lines.push(`${indent}- \`${group.id}\`${status} — ${group.title}.`);
+      lines.push(`${indent}- \`${group.id}\` — ${group.title}.`);
       for (const entry of TOOL_CATALOG) {
         if (available.has(entry.name)
           && !initiallyActive.has(entry.name)
@@ -460,7 +455,7 @@ export function getLoadableToolGroupsSystemPromptBlock(input: {
       continue;
     }
     const members = directTools.length ? ` Tools: ${directTools.join(', ')}.` : '';
-    lines.push(`${indent}- \`${group.id}\`${status} — ${group.summary}${members}`);
+    lines.push(`${indent}- \`${group.id}\` — ${group.title}${members}`);
   }
   return lines.join('\n');
 }

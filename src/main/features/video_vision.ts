@@ -20,7 +20,7 @@
  *  3. DEGRADE. If no model can see the frames (non-multimodal model, no VLM
  *     profile, or the call fails), `analyzeFrames` returns ok:false with a
  *     reason. Callers must degrade — mark the read as unverified and proceed on
- *     probe / transcript / OCR evidence — never crash and never silently
+ *     probe / transcript / user-supplied evidence — never crash and never silently
  *     pretend the frames were seen.
  *
  * Cost note: frames are downscaled to a long edge of 1024px before sending, so

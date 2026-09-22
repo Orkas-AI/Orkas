@@ -223,16 +223,12 @@ export function parseEbur128Summary(stderr: string): LoudnessResult | null {
   };
 }
 
-/** Escape a filesystem path for use as one ffmpeg filter option value. */
+/** Escape an unquoted option value through both FFmpeg parsers: the option
+ * parser consumes colon/backslash/quote escapes after the filtergraph parser. */
 export function escapeFfmpegFilterValue(value: string): string {
   return value
-    .replace(/\\/g, '\\\\')
-    .replace(/:/g, '\\:')
-    .replace(/'/g, "\\'")
-    .replace(/,/g, '\\,')
-    .replace(/;/g, '\\;')
-    .replace(/\[/g, '\\[')
-    .replace(/\]/g, '\\]');
+    .replace(/[\\':\s]/g, '\\$&')
+    .replace(/[\\'\[\],;\s]/g, '\\$&');
 }
 
 /** Round to 2 decimals (display-friendly seconds). */
@@ -857,28 +853,6 @@ export async function probeMediaDurationSec(inputAbsPath: string, signal?: Abort
   if (!bins) return null;
   const d = await probeDurationSec(bins.ffprobe, inputAbsPath, signal);
   return d > 0 ? d : null;
-}
-
-export type ExtractFrameResult = { ok: true } | { ok: false; errorCode: string; message: string };
-
-/** Extract a single frame at `atSec` to `outAbsPath` (format by extension) using
- *  the bundled ffmpeg. Reused by analyze_media op:"ocr" to sample frames for
- *  on-screen-text grounding without going through the full edit_video tool. */
-export async function extractFrameAt(
-  inputAbsPath: string,
-  atSec: number,
-  outAbsPath: string,
-  signal?: AbortSignal,
-): Promise<ExtractFrameResult> {
-  const bins = resolveBins();
-  if (!bins) return { ok: false, errorCode: 'E_EDIT_FFMPEG_MISSING', message: 'Bundled ffmpeg/ffprobe not found.' };
-  const at = Number.isFinite(atSec) && atSec > 0 ? atSec : 0;
-  const r = await run(bins.ffmpeg, ['-y', '-ss', String(at), '-i', inputAbsPath, '-frames:v', '1', '-update', '1', outAbsPath], signal);
-  if (r.code !== 0) {
-    const f = ffmpegFailure('extract_frame', r) as { errorCode: string; message: string };
-    return { ok: false, errorCode: f.errorCode, message: f.message };
-  }
-  return { ok: true };
 }
 
 export type SilenceMeasureResult =

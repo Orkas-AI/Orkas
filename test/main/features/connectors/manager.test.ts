@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { captureMainLogWorkers } from '../../../helpers/capture-main-log-workers';
 
 const TEST_UID = 'u-connectors-manager';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let closeLogWorkers: () => Promise<void>;
 
 // ── Mock binding: ONE hoisted controller, mocked ONCE at top level ──────────
 // Previously each test re-mocked mcp-client / oauth / oauth-dcr with per-test
@@ -436,12 +438,14 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  closeLogWorkers = await captureMainLogWorkers();
   vi.clearAllMocks();
   resetMockBehaviors();
   await writeGoogleConnectorsConfig({ google: 'enabled', gmail: 'enabled' });
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await closeLogWorkers();
   if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -457,9 +461,9 @@ describe('features/connectors/manager authorization recovery', () => {
     const { default: electronLog } = await import('electron-log/main');
     const records: Array<{ level: string; data: unknown[] }> = [];
     const capture = (message: any, transport: unknown) => {
-      // electron-log runs hooks separately for file/console/IPC. Observe one
-      // actual output transport, not three copies of the same log invocation.
-      if (transport === electronLog.transports.console && message.data[0] === 'connector request completed') {
+      // Direct sinks are disabled: observe the single background-worker
+      // transport instead of the obsolete console transport.
+      if (transport === (electronLog.transports as any).background && message.data[0] === 'connector request completed') {
         records.push({ level: message.level, data: message.data });
       }
       return message;
@@ -2061,6 +2065,38 @@ describe('OAuth refresh ownership', () => {
     expect(mocks.mcp.callTool).not.toHaveBeenCalled();
   });
 
+  it('authorizes Color Me after prerequisite setup, reports one terminal and restores its fixed endpoint without tenant fields', async () => {
+    mocks.dcr.startMcpDcrOAuth = vi.fn(async () => ({
+      grant: { access_token: 'private-colorme-token', refresh_token: null,
+        expires_at: Date.now() + 3_600_000, scopes: ['openid', 'read_products', 'read_sales', 'read_shop_coupons',
+          'write_products', 'write_sales', 'write_shop_coupons', 'offline_access'], token_type: 'Bearer',
+        server_grant_id: 'private-colorme-grant', server_managed: true },
+      client: { client_id: 'fixture-client', authorization_endpoint: 'https://agent.colorme.app/api/auth/oauth2/authorize',
+        token_endpoint: 'https://agent.colorme.app/api/auth/oauth2/token' },
+    }));
+    mocks.mcp.listTools = vi.fn(async () => [
+      { name: 'getShop', description: 'Read shop.', input_schema: {} },
+      { name: 'updateProduct', description: 'Update product.', input_schema: {} },
+      { name: 'unreviewedAction', description: 'Unknown upstream addition.', input_schema: {} },
+    ]);
+    const transports: any[] = [];
+    mocks.mcp.connect = vi.fn(function (this: any) { transports.push(this.__transport); return Promise.resolve(); });
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const started = manager.beginOAuthConnect(TEST_UID, 'colorme-shop', {});
+    await vi.waitFor(() => expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({ attempt_id: started.attempt_id, result: 'success' }),
+    ));
+    const stored = registry.load(TEST_UID).connections['colorme-shop'];
+    expect(stored.connection_parameters).toBeUndefined();
+    expect(stored.tools_cache.map(tool => tool.name)).toEqual(['getShop', 'updateProduct']);
+    expect(stored.tools_cache[1].orkas_action_policy).toMatchObject({ risk: 'H', confirmation: 'fresh' });
+    await manager.refreshTools(TEST_UID, 'colorme-shop');
+    expect(transports).toHaveLength(2);
+    expect(transports.every(transport => transport.url === 'https://agent.colorme.app/api/mcp')).toBe(true);
+    expect(mocks.dcr.startMcpDcrOAuth).toHaveBeenCalledOnce();
+  });
+
   it('binds NetSuite OAuth and reconnects to the validated account-specific standard SuiteApp', async () => {
     mocks.dcr.startMcpDcrOAuth = vi.fn(async () => ({
       grant: {
@@ -2275,9 +2311,8 @@ describe('OAuth refresh ownership', () => {
     expect(mocks.mcp.callTool).toHaveBeenCalledOnce();
     const options = mocks.mcp.callTool.mock.calls[0][2];
     expect(options.signal).toBe(controller.signal);
-    // A stalled transport fails promptly; only adapter progress extends the wait.
-    expect(options.timeoutMs).toBe(90_000);
-    expect(options.maxTotalTimeoutMs).toBe(13 * 60_000);
+    // Local CLI uses the same fixed deadline as all other MCP calls.
+    expect(options).toEqual({ signal: controller.signal });
   });
 
   it('keeps legacy standalone Lark installs mutually exclusive with the unified Feishu entry', async () => {

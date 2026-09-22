@@ -536,7 +536,7 @@ function createPdfRenderTool(opts: PdfToolsOpts): AgentTool {
     name: 'pdf_render',
     executionMode: 'parallel',
     description:
-      'Render one PDF page to a PNG for visual QA of layout, overlays, clipping, or page selection. Use read_files or ocr_file for text extraction.',
+      'Render one PDF page to a PNG for reading scanned pages or checking layout, overlays, and clipping. Use read_files for extractable PDF text.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,

@@ -62,6 +62,23 @@ describe("anchoredRequestTokens", () => {
       .toBe("estimated");
   });
 
+  it("de-biases the estimate fallback with the session calibration", () => {
+    // A fold discarded the anchor, so the whole request is estimated. The
+    // estimator runs ~1.28x high here; without calibration a 790K estimate
+    // trips the 0.82 x 922K = 756K emergency line though the real request is
+    // ~615K (observed 2026-09-17 on a 1M window). Calibration de-biases it.
+    const cal = 0.779;
+    expect(anchoredRequestTokens(null, 789_958, 0, cal)).toEqual({ tokens: Math.round(789_958 * cal), source: "estimated" });
+    expect(Math.round(789_958 * cal)).toBeLessThan(Math.round(922_000 * 0.82));
+    // Epoch mismatch takes the same calibrated fallback.
+    expect(anchoredRequestTokens(anchor, 30_000, 4, 0.5)).toEqual({ tokens: 15_000, source: "estimated" });
+    // The anchored branch is real and is never scaled by calibration.
+    expect(anchoredRequestTokens(anchor, 95_000, 3, 0.5)).toEqual({ tokens: 45_000, source: "anchored" });
+    // Default calibration (1) preserves the raw estimate for callers that
+    // do not pass one.
+    expect(anchoredRequestTokens(null, 12_345, 0).tokens).toBe(12_345);
+  });
+
   it("never goes negative", () => {
     expect(anchoredRequestTokens({ realTokens: 100, estimatedTokens: 50_000, contentEpoch: 1 }, 10, 1).tokens).toBe(0);
   });

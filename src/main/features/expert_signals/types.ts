@@ -9,7 +9,7 @@
  * See `Common/docs/plans/expert-signals-phase-0.md` for the rule catalog.
  */
 
-/** Phase 0 signal kinds (T0 system events + T1 text rules).
+/** Signal kinds, including legacy text-inferred records for read compatibility.
  *  Phase 1 adds T2 semantic kinds (accept_with_caveat / domain_constraint_revealed / …).
  *  When adding a new T0/T1 kind: extend this union, add an extractor case,
  *  add a positive + negative fixture (CLAUDE.md §9). */
@@ -17,10 +17,10 @@ export type SignalType =
   | 'form_left_blank'    // T0: required field unfilled / default unchanged on submit
   | 'silence'            // T0: agent message followed by ≥ N min of no user response
   | 'tool_failure'       // T0: session jsonl has tool_result.isError=true unrecovered
-  | 'accept'             // T1: silent or explicit acceptance of agent output
-  | 'correction'         // T1: user message matched correction patterns
-  | 'reject'             // T1: user message matched rejection patterns
-  | 'edit'               // T1: user message token-diffed significantly from agent's last text
+  | 'accept'             // Legacy feedback record; preserved for historical readers
+  | 'correction'         // Legacy text-inferred correction
+  | 'reject'             // Legacy text-inferred rejection
+  | 'edit'               // Legacy text-inferred edit
   | 'skill_advertised'   // T0: skills entered system prompt index at turn start (per system)
   | 'skill_invoked'      // T0: agent read_file'd a SKILL.md body during the turn
   | 'skill_ineffective'; // T0: skill_invoked in a turn that ended with a non-transient, non-aborted error

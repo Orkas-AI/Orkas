@@ -8,7 +8,7 @@ const transfer = require('../../src/renderer/modules/library-transfer.js') as {
   _folderRows: (nodes: unknown[]) => Array<{ path: string; name: string; depth: number }>;
   _projectsFromResponse: (response: unknown) => unknown[];
   _canSubmitTransfer: (state: { loading: boolean; destinationReady: boolean }) => boolean;
-  _transferFailureTelemetry: (error: unknown) => Record<string, unknown>;
+  _transferFailureDetails: (error: unknown) => Record<string, unknown>;
   _createLatestFolderLoader: (
     loadTree: (ref: { scope: string; projectId?: string }) => Promise<unknown[]>,
     handlers: {
@@ -133,8 +133,8 @@ describe('shared Library transfer dialog', () => {
     expect(events.at(-1)).toBe('finish:latest');
   });
 
-  it('does not put raw IPC failures or local paths into telemetry', () => {
-    const payload = transfer._transferFailureTelemetry(
+  it('does not put raw IPC failures or local paths into diagnostic details', () => {
+    const payload = transfer._transferFailureDetails(
       new Error('copy failed at /Users/test/customer-plan.md'),
     );
 
@@ -144,19 +144,19 @@ describe('shared Library transfer dialog', () => {
   });
 
   it('keeps stable transfer failures queryable without raw backend details', () => {
-    expect(transfer._transferFailureTelemetry({ error: 'target_exists' })).toEqual({
+    expect(transfer._transferFailureDetails({ error: 'target_exists' })).toEqual({
       error_code: 'target_exists',
       error_type: 'conflict',
     });
-    expect(transfer._transferFailureTelemetry({ error: 'invalid_batch' })).toEqual({
+    expect(transfer._transferFailureDetails({ error: 'invalid_batch' })).toEqual({
       error_code: 'invalid_batch',
       error_type: 'validation',
     });
-    expect(transfer._transferFailureTelemetry('source_delete_failed')).toEqual({
+    expect(transfer._transferFailureDetails('source_delete_failed')).toEqual({
       error_code: 'source_delete_failed',
       error_type: 'operation',
     });
-    expect(transfer._transferFailureTelemetry({
+    expect(transfer._transferFailureDetails({
       code: 'E_IPC_REQUEST',
       error: 'private backend detail',
     })).toEqual({

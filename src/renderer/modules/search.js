@@ -17,6 +17,8 @@ let _searchTab = 'all';             // 'all' | 'chat' | 'agent' | 'skill' | 'con
 let _searchResults = [];
 let _searchActiveIdx = -1;
 let _searchLastQuery = '';
+let _searchChatIndexComplete = true;
+let _searchLoading = false;
 const _SEARCH_FAILURE_DEDUPE_MS = 60 * 1000;
 const _SEARCH_FAILURE_MAX_KEYS = 16;
 const _SEARCH_FAILURE_STAGES = new Set(['request', 'response', 'partial']);
@@ -71,13 +73,6 @@ function _reportGlobalSearchFailure(stage, error, fallbackCode) {
     ...(suppressed > 0 ? { suppressed_count: suppressed } : {}),
   });
   return { stage: safeStage, error_code: errorCode };
-}
-
-// Search-result telemetry is commercial-only. Keep a stable local hook so
-// shared control flow can report outcomes without coupling OSS search to the
-// private Monitor runtime.
-function _trackGlobalSearchResult() {
-  // Intentionally empty in the open build.
 }
 
 function _bindGlobalSearch() {
@@ -135,14 +130,17 @@ function openGlobalSearch(entryPoint = 'unknown') {
   const input = document.getElementById('search-input');
   if (input) {
     input.value = '';
+    _searchLoading = false;
     _searchResults = [];
     _searchActiveIdx = -1;
     _searchLastQuery = '';
+    _searchChatIndexComplete = true;
     _searchSeq++;    // invalidate any in-flight query from a previous session
     _setSearchTab('all');           // reset to default tab each open
     _setSearchTabsVisible(false);   // hide tabs while empty/history state is shown
     setTimeout(() => input.focus(), 30);
     _renderSearchEmptyState();
+    void _refreshSearchIndexStatus(_searchSeq, '', { active: true });
   }
 }
 
@@ -163,12 +161,18 @@ function closeGlobalSearch() {
   // flight so it cannot repaint hidden state or report a failure the user no
   // longer encountered.
   _searchSeq++;
+  _searchLoading = false;
   overlay.style.display = 'none';
   if (_searchTimer) { clearTimeout(_searchTimer); _searchTimer = null; }
 }
 
 function _scheduleSearch(query) {
   if (_searchTimer) clearTimeout(_searchTimer);
+  _searchTimer = null;
+  // Invalidate at input time, including the debounce window.
+  _searchSeq++;
+  if (!query.trim()) { void _runSearchNow(''); return; }
+  _showSearchLoading(query.trim());
   // Library body search embeds the settled query once. A slightly longer
   // debounce avoids running native inference for every intermediate IME or
   // fast-typing state while keeping filename/chat feedback responsive.
@@ -188,22 +192,61 @@ function _activeProjectIdForSearch() {
   return '';
 }
 
+// Coverage must not wait for the all-scope query (including embeddings and
+// snippets). A late status response must never overwrite newer query results.
+async function _refreshSearchIndexStatus(seq, query, pending) {
+  try {
+    const response = await apiFetch('/api/search/status');
+    const data = await response.json();
+    if (seq !== _searchSeq || !pending.active || !data.ok) return;
+    _searchChatIndexComplete = data.chat_index_complete !== false;
+    if (!_searchChatIndexComplete) {
+      if (query) {
+        if (query !== _searchLastQuery) {
+          _searchResults = [];
+          _searchVisibleResults = [];
+        }
+        _searchLastQuery = query;
+        _setSearchTabsVisible(true);
+        _renderSearchResults(query);
+      } else _renderSearchEmptyState();
+    }
+  } catch (_) { /* the result response remains the authoritative fallback */ }
+}
+
+function _showSearchLoading(query) {
+  _searchLoading = true;
+  _searchResults = [];
+  _searchVisibleResults = [];
+  _searchActiveIdx = -1;
+  _searchLastQuery = query;
+  _setSearchTabsVisible(true);
+  _renderSearchResults(query);
+}
+
 async function _runSearchNow(queryArg) {
+  if (_searchTimer) { clearTimeout(_searchTimer); _searchTimer = null; }
   const input = document.getElementById('search-input');
   const query = (queryArg !== undefined ? queryArg : (input?.value || '')).trim();
   if (!query) {
+    _searchLoading = false;
     _searchSeq++;
     _searchResults = [];
     _searchVisibleResults = [];
     _searchActiveIdx = -1;
     _searchLastQuery = '';
+    _searchChatIndexComplete = true;
     _setSearchTabsVisible(false);
     _renderSearchEmptyState();
+    void _refreshSearchIndexStatus(_searchSeq, '', { active: true });
     return;
   }
   const seq = ++_searchSeq;
   const startedAt = Date.now();
   const projectId = _activeProjectIdForSearch();
+  _showSearchLoading(query);
+  const pending = { active: true };
+  void _refreshSearchIndexStatus(seq, query, pending);
   try {
     const res = await apiFetch('/api/search/global', {
       method: 'POST',
@@ -217,18 +260,11 @@ async function _runSearchNow(queryArg) {
     });
     const data = await res.json();
     if (seq !== _searchSeq) {
-      _trackGlobalSearchResult('cancelled', 'superseded', startedAt, {
-        has_project: !!projectId,
-      });
       return;     // a newer query arrived; drop this
     }
+    _searchLoading = false;
     if (!data.ok) {
       const failure = _reportGlobalSearchFailure('response', data, 'search_rejected');
-      _trackGlobalSearchResult('failure', failure.stage, startedAt, {
-        has_project: !!projectId,
-        error_type: 'http',
-        error_code: failure.error_code,
-      });
       _renderSearchError(data.error);
       return;
     }
@@ -238,42 +274,27 @@ async function _runSearchNow(queryArg) {
         code: _searchDegradationErrorCode(data.degradation_code),
       }, 'search_degraded');
     }
+    _searchChatIndexComplete = data.chat_index_complete !== false;
     _searchResults = data.results || [];
     _searchLastQuery = query;
     _setSearchTabsVisible(true);
     _renderSearchResults(query);
-    _trackGlobalSearchResult(
-      degradation ? 'partial_failure' : 'success',
-      degradation ? 'partial' : 'complete',
-      startedAt,
-      {
-        item_count: _searchResults.length,
-        has_project: !!projectId,
-        ...(degradation ? {
-          error_type: 'runtime',
-          error_code: degradation.error_code,
-        } : {}),
-      },
-    );
   } catch (e) {
     if (seq !== _searchSeq) {
-      _trackGlobalSearchResult('cancelled', 'superseded', startedAt, {
-        has_project: !!projectId,
-      });
       return;
     }
+    _searchLoading = false;
     const failure = _reportGlobalSearchFailure('request', e, 'search_request_failed');
-    _trackGlobalSearchResult('failure', failure.stage, startedAt, {
-      has_project: !!projectId,
-      error_type: 'network',
-      error_code: failure.error_code,
-    });
     _renderSearchError(e.message || String(e));
+  } finally {
+    pending.active = false;
   }
 }
 
 // Split results into 4 buckets per the tab-grouping spec:
-//   - chats:    main-conversation messages, sorted by time DESC (recency)
+//   - chats:    main-conversation messages, sorted by relevance
+//               (query coverage, then score) — see _sectionRows for why the
+//               displayed rows are then re-ordered by recency
 //   - agents:   agent body matches, sorted by score DESC then name
 //   - skills:   skill body matches, sorted by score DESC then name
 //   - contexts: Library filename/body matches, sorted by relevance then path
@@ -283,7 +304,9 @@ function _partitionSearchResults(results) {
   const chats = results
     .filter((r) => r.kind === 'chat')
     .slice()
-    .sort((a, b) => String(b.time || '').localeCompare(String(a.time || '')));
+    .sort((a, b) => ((Number(b.term_coverage) || 0) - (Number(a.term_coverage) || 0))
+      || ((b.score || 0) - (a.score || 0))
+      || String(b.time || '').localeCompare(String(a.time || '')));
   const agents = results
     .filter((r) => r.kind === 'agent')
     .slice()
@@ -323,7 +346,9 @@ function _renderSearchEmptyState() {
         ${history.map((q) => `<button class="search-history-item" data-history-q="${escapeHtml(q)}">${escapeHtml(q)}</button>`).join('')}
       </div>`
     : '';
-  body.innerHTML = historyHtml || `<div class="search-empty">${escapeHtml(t('search.empty_hint'))}</div>`;
+  const notice = !_searchChatIndexComplete
+    ? `<div class="search-section-label is-status" role="status">${escapeHtml(t('search.history_indexing'))}</div>` : '';
+  body.innerHTML = notice + (historyHtml || (notice ? '' : `<div class="search-empty">${escapeHtml(t('search.empty_hint'))}</div>`));
   body.querySelectorAll('[data-history-q]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const q = btn.dataset.historyQ;
@@ -415,17 +440,45 @@ function _renderSearchRow(r, dataIdx, query) {
 // `_searchVisibleResults` as "what the user sees".
 let _searchVisibleResults = [];
 
+// Which rows a section shows, and in what order.
+//
+// Chats are *picked* by relevance and *shown* newest-first. The "all" tab has
+// room for _SEARCH_ALL_PER_SECTION rows only, so picking them by recency
+// buries the actual answer under whatever the user happened to discuss last —
+// the backend already ranked the bucket, and the cut has to respect that
+// ranking. Reading a chat list by time is still what the user expects, so the
+// rows that survive the cut are re-ordered by recency for display.
+function _sectionRows(section, tab) {
+  const rows = tab === 'all'
+    ? section.bucket.slice(0, _SEARCH_ALL_PER_SECTION)
+    : section.bucket.slice();
+  if (section.tab === 'chat') {
+    rows.sort((a, b) => String(b.time || '').localeCompare(String(a.time || '')));
+  }
+  return rows;
+}
+
 function _renderSearchResults(query) {
   const body = document.getElementById('search-body');
   if (!body) return;
   body.classList.remove('is-start-state');
+  const indexing = !_searchChatIndexComplete && (_searchTab === 'all' || _searchTab === 'chat');
+  const notice = indexing
+    ? `<div class="search-section-label is-status" role="status">${escapeHtml(t('search.history_indexing'))}</div>`
+    : '';
+  if (_searchLoading) {
+    body.innerHTML = notice + `<div class="search-empty search-loading" role="status"><span class="search-loading-spinner" aria-hidden="true"></span><span>${escapeHtml(t('common.loading'))}</span></div>`;
+    return;
+  }
   if (!_searchResults.length) {
     _searchVisibleResults = [];
-    body.innerHTML = `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
+    body.innerHTML = indexing
+      ? `<div class="search-empty" role="status">${escapeHtml(t('search.history_indexing'))}</div>`
+      : `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
     return;
   }
   const { chats, agents, skills, contexts } = _partitionSearchResults(_searchResults);
-  const parts = [];
+  const parts = [notice];
   const visible = [];
 
   // "All" tab order: chats → agents → skills → Library; each
@@ -441,7 +494,7 @@ function _renderSearchResults(query) {
   ];
   for (const s of sections) {
     if (_searchTab !== 'all' && _searchTab !== s.tab) continue;
-    const slice = _searchTab === 'all' ? s.bucket.slice(0, _SEARCH_ALL_PER_SECTION) : s.bucket;
+    const slice = _sectionRows(s, _searchTab);
     if (!slice.length) continue;
     parts.push(`<div class="search-section-label">${escapeHtml(t(s.labelKey))}</div>`);
     for (const r of slice) { parts.push(_renderSearchRow(r, visible.length, query)); visible.push(r); }
@@ -452,7 +505,9 @@ function _renderSearchResults(query) {
 
   _searchVisibleResults = visible;
   if (!visible.length) {
-    body.innerHTML = `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
+    body.innerHTML = indexing
+      ? `<div class="search-empty" role="status">${escapeHtml(t('search.history_indexing'))}</div>`
+      : `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
     _searchActiveIdx = -1;
     return;
   }
@@ -532,6 +587,7 @@ async function _gotoSearchResult(r) {
     setView('contexts');
     const loader = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
     if (typeof loader === 'function') await loader('contexts');
+    if (typeof switchCtxProject === 'function' && await switchCtxProject('') === false) return;
     if (typeof loadContexts === 'function') await loadContexts();
     if (typeof openCtxFile === 'function') openCtxFile(r.path);
   } else if (r.kind === 'chat') {
@@ -604,3 +660,13 @@ function _saveSearchHistoryEntry(query) {
   cur.unshift(q);
   _saveSearchHistory(cur.slice(0, _SEARCH_HISTORY_MAX));
 }
+
+// Search results are cached across tab switches; refresh their status copy
+// with the active locale as well.
+document.addEventListener('i18n-change', () => {
+  const overlay = document.getElementById('search-overlay');
+  if (overlay && overlay.style.display !== 'none') {
+    if (_searchLastQuery) _renderSearchResults(_searchLastQuery);
+    else _renderSearchEmptyState();
+  }
+});

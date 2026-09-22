@@ -156,7 +156,7 @@ function minimizeOrders(value) {
 async function readBody(response) {
   if (!response.body?.getReader) {
     const text = await response.text();
-    if (Buffer.byteLength(text) > MAX_BYTES) throw new Error('oversized');
+    if (Buffer.byteLength(text) > MAX_BYTES) throw Object.assign(new Error('oversized'), { code: 'E_CONNECTOR_RESPONSE_TOO_LARGE' });
     return text;
   }
   const reader = response.body.getReader();
@@ -167,7 +167,11 @@ async function readBody(response) {
       const { value, done } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > MAX_BYTES) { await reader.cancel(); throw new Error('oversized'); }
+      if (size > MAX_BYTES) {
+        try { await reader.cancel(); } finally {
+          throw Object.assign(new Error('oversized'), { code: 'E_CONNECTOR_RESPONSE_TOO_LARGE' });
+        }
+      }
       chunks.push(Buffer.from(value));
     }
   } finally { reader.releaseLock(); }

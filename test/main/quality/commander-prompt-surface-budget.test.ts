@@ -81,7 +81,7 @@ describe('Commander resident prompt surface', () => {
     // ownership, execution, and recovery. Scoping these assertions to this
     // section catches clauses being moved to a lazy or lower-priority surface.
     expect(routing).toMatch(/resolve the current intent[\s\S]{0,100}before choosing an owner/i);
-    expect(routing).toMatch(/light outcome[\s\S]{0,300}Complete it directly/i);
+    expect(routing).toMatch(/Complete a \*\*light outcome\*\* directly: one low-stakes deliverable/i);
     expect(routing).toMatch(/Prefer a high-confidence enabled Agent match/i);
     expect(routing).toMatch(/Do not read a regular Skill for Agent-owned work/i);
     expect(routing).toMatch(/one Agent owns the remaining user-visible outcome/i);
@@ -99,12 +99,14 @@ describe('Commander resident prompt surface', () => {
   it('keeps routing decisions ordered and recovery gates single-sourced', () => {
     const { routing } = readSurfaces();
     const orderedMarkers = [
+      '### Choose the owner',
       'Resolve the current intent',
-      '2. **Route after intent, before drafting.**',
-      '### Delegation shapes',
-      '### Sequencing and boundaries',
-      '### Delegation loop discipline',
-      '### Common routes',
+      'Honor an explicit agent / skill / connector pick',
+      'Complete a **light outcome** directly',
+      'Prefer a high-confidence enabled Agent match',
+      'Otherwise Commander owns the outcome',
+      '### Delegate',
+      '### Sequence and recover',
     ];
     const positions = orderedMarkers.map((marker) => routing.indexOf(marker));
 
@@ -112,6 +114,13 @@ describe('Commander resident prompt surface', () => {
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
     expect(routing.match(/host or workspace blocker/g)).toHaveLength(1);
     expect(routing.match(/Fresh user evidence/g)).toHaveLength(1);
+    // The three-stage kernel keeps selection, execution and recovery resident
+    // without a second fallback route or a second blocked-input rule.
+    expect(routing.match(/^### /gm)).toHaveLength(3);
+    expect(routing.match(/light outcome/g)).toHaveLength(1);
+    expect(routing.match(/stop dependent work/g)).toHaveLength(1);
+    expect(routing).not.toContain('Answer directly after routing');
+    expect(routing).not.toContain('Use anonymous workers only for generic isolated work');
   });
 
   it('would reject re-adding the removed duplicate delegation block', () => {

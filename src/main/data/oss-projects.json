@@ -1,9 +1,61 @@
 {
   "categories": [
-    { "code": "anim", "name_zh": "动画 / 视频", "name_en": "Animation / Video", "name_ja": "アニメ / 動画", "name_pt": "Animação / Vídeo", "sort_order": 10 },
-    { "code": "browser", "name_zh": "浏览器", "name_en": "Browser", "name_ja": "ブラウザ", "name_pt": "Navegador", "sort_order": 30 },
-    { "code": "office", "name_zh": "办公", "name_en": "Office", "name_ja": "オフィス", "name_pt": "Escritório", "sort_order": 60 },
-    { "code": "slides", "name_zh": "演示 / PPT", "name_en": "Slides / PPT", "name_ja": "スライド / PPT", "name_pt": "Slides / PPT", "sort_order": 70 }
+    {
+      "code": "anim",
+      "name_zh": "动画 / 视频",
+      "name_en": "Animation / Video",
+      "name_ja": "アニメ / 動画",
+      "name_pt": "Animação / Vídeo",
+      "sort_order": 10,
+      "name_es": "Animación / Video",
+      "name_fr": "Animation / Vidéo",
+      "name_ko": "애니메이션 / 동영상",
+      "name_de": "Animation / Video",
+      "name_ru": "Анимация / Видео",
+      "name_it": "Animazione / Video"
+    },
+    {
+      "code": "browser",
+      "name_zh": "浏览器",
+      "name_en": "Browser",
+      "name_ja": "ブラウザ",
+      "name_pt": "Navegador",
+      "sort_order": 30,
+      "name_es": "Navegador",
+      "name_fr": "Navigateur",
+      "name_ko": "브라우저",
+      "name_de": "Browser",
+      "name_ru": "Браузер",
+      "name_it": "Browser"
+    },
+    {
+      "code": "office",
+      "name_zh": "办公",
+      "name_en": "Office",
+      "name_ja": "オフィス",
+      "name_pt": "Escritório",
+      "sort_order": 60,
+      "name_es": "Oficina",
+      "name_fr": "Bureautique",
+      "name_ko": "사무",
+      "name_de": "Büro",
+      "name_ru": "Офис",
+      "name_it": "Ufficio"
+    },
+    {
+      "code": "slides",
+      "name_zh": "演示 / PPT",
+      "name_en": "Slides / PPT",
+      "name_ja": "スライド / PPT",
+      "name_pt": "Slides / PPT",
+      "sort_order": 70,
+      "name_es": "Diapositivas / PPT",
+      "name_fr": "Diapositives / PPT",
+      "name_ko": "슬라이드 / PPT",
+      "name_de": "Folien / PPT",
+      "name_ru": "Слайды / PPT",
+      "name_it": "Diapositive / PPT"
+    }
   ],
   "projects": [
     {
@@ -19,7 +71,13 @@
       "description_zh": "生成开场动画和短视频, 装好后 Orkas 会自动调用。",
       "description_en": "Generate intro animations and short videos; Orkas uses it automatically once installed.",
       "task_zh": "帮我做一段产品开场动画",
-      "task_en": "Make a product intro animation for me"
+      "task_en": "Make a product intro animation for me",
+      "description_es": "Genera animaciones de introducción y videos cortos; Orkas lo usa automáticamente una vez instalado.",
+      "description_fr": "Générez des animations d’introduction et de courtes vidéos ; Orkas l’utilise automatiquement une fois installé.",
+      "description_ko": "인트로 애니메이션과 짧은 동영상을 생성합니다. 설치 후 Orkas가 자동으로 사용합니다.",
+      "description_de": "Erstellen Sie Intro-Animationen und kurze Videos; Orkas nutzt es nach der Installation automatisch.",
+      "description_ru": "Создавайте вступительные анимации и короткие видео; после установки Orkas использует инструмент автоматически.",
+      "description_it": "Genera animazioni introduttive e brevi video; Orkas lo usa automaticamente dopo l’installazione."
     },
     {
       "id": "browser-use",
@@ -34,7 +92,13 @@
       "description_zh": "让 AI 直接帮你操作浏览器、点击和填写网页。",
       "description_en": "Let AI operate the browser for you - click and fill in pages.",
       "task_zh": "登录网页、点击按钮和填写表单",
-      "task_en": "Sign in, click buttons, and fill web forms"
+      "task_en": "Sign in, click buttons, and fill web forms",
+      "description_es": "Deja que la IA maneje el navegador por ti: hace clic y rellena campos en las páginas.",
+      "description_fr": "Laissez l’IA utiliser le navigateur pour vous : cliquer et remplir les champs des pages.",
+      "description_ko": "AI가 대신 브라우저를 조작하여 웹페이지를 클릭하고 입력합니다.",
+      "description_de": "Lassen Sie KI den Browser für Sie bedienen: auf Webseiten klicken und Felder ausfüllen.",
+      "description_ru": "Поручите ИИ работу в браузере: нажатия и заполнение полей на страницах.",
+      "description_it": "Lascia che l’IA usi il browser per te: fa clic e compila i campi delle pagine."
     },
     {
       "id": "ppt-master",
@@ -49,7 +113,13 @@
       "description_zh": "用一段大纲或要点自动生成可编辑的 PPT 演示文稿。",
       "description_en": "Generate an editable slide deck from an outline or a few bullet points.",
       "task_zh": "把要点做成一份 PPT",
-      "task_en": "Turn my outline into a slide deck"
+      "task_en": "Turn my outline into a slide deck",
+      "description_es": "Genera una presentación editable a partir de un esquema o de unos pocos puntos clave.",
+      "description_fr": "Générez une présentation modifiable à partir d’un plan ou de quelques points clés.",
+      "description_ko": "개요나 몇 가지 핵심 내용을 바탕으로 편집 가능한 슬라이드 자료를 생성합니다.",
+      "description_de": "Erstellen Sie eine bearbeitbare Präsentation aus einer Gliederung oder wenigen Stichpunkten.",
+      "description_ru": "Создавайте редактируемую презентацию по плану или нескольким тезисам.",
+      "description_it": "Genera una presentazione modificabile da una scaletta o da pochi punti chiave."
     },
     {
       "id": "OfficeCLI",
@@ -64,7 +134,13 @@
       "description_zh": "让 AI 读写、生成和预览 Word、Excel、PowerPoint 文件, 无需本机安装 Office。",
       "description_en": "Create, read, edit, and preview Word, Excel, and PowerPoint files without a local Office installation.",
       "task_zh": "帮我生成或修改一份 Office 文档",
-      "task_en": "Create or edit an Office document"
+      "task_en": "Create or edit an Office document",
+      "description_es": "Crea, lee, edita y previsualiza archivos de Word, Excel y PowerPoint sin instalar Office en el equipo.",
+      "description_fr": "Créez, lisez, modifiez et prévisualisez des fichiers Word, Excel et PowerPoint sans installation locale d’Office.",
+      "description_ko": "로컬에 Office를 설치하지 않고 Word, Excel, PowerPoint 파일을 만들고 읽고 편집하고 미리 봅니다.",
+      "description_de": "Erstellen, lesen und bearbeiten Sie Word-, Excel- und PowerPoint-Dateien und zeigen Sie eine Vorschau an, ohne Office lokal zu installieren.",
+      "description_ru": "Создавайте, читайте, редактируйте и просматривайте файлы Word, Excel и PowerPoint без локальной установки Office.",
+      "description_it": "Crea, leggi, modifica e visualizza in anteprima file Word, Excel e PowerPoint senza installare Office in locale."
     },
     {
       "id": "Lark-CLI",
@@ -79,7 +155,13 @@
       "description_zh": "飞书官方 CLI 与 Agent Skills，接入文档、表格、多维表格、消息、日历、任务和会议纪要。",
       "description_en": "Official Lark/Feishu CLI and Agent Skills for Docs, Sheets, Base, messages, calendar, tasks, and meeting notes.",
       "task_zh": "连接飞书文档、消息、日历和任务",
-      "task_en": "Connect Lark docs, messages, calendars, and tasks"
+      "task_en": "Connect Lark docs, messages, calendars, and tasks",
+      "description_es": "CLI oficial de Lark/Feishu y habilidades para agentes para Docs, Sheets, Base, mensajes, calendario, tareas y notas de reuniones.",
+      "description_fr": "CLI officielle Lark/Feishu et Skills pour agents : Docs, Sheets, Base, messages, calendrier, tâches et notes de réunion.",
+      "description_ko": "Docs, Sheets, Base, 메시지, 캘린더, 작업, 회의록을 위한 공식 Lark/Feishu CLI와 에이전트 스킬입니다.",
+      "description_de": "Offizielle Lark/Feishu-CLI und Agenten-Skills für Docs, Sheets, Base, Nachrichten, Kalender, Aufgaben und Besprechungsnotizen.",
+      "description_ru": "Официальные CLI Lark/Feishu и навыки для агентов: Docs, Sheets, Base, сообщения, календарь, задачи и заметки встреч.",
+      "description_it": "CLI ufficiale Lark/Feishu e abilità per agenti per Docs, Sheets, Base, messaggi, calendario, attività e note delle riunioni."
     },
     {
       "id": "crawl4ai",
@@ -94,7 +176,13 @@
       "description_zh": "抓取网页正文并整理成干净的文档或结构化数据, 装好后 Orkas 会自动调用。",
       "description_en": "Extract a web page's main content into a clean document or structured data; Orkas uses it automatically once installed.",
       "task_zh": "批量抓取网页并输出结构化数据",
-      "task_en": "Batch-extract web pages into structured data"
+      "task_en": "Batch-extract web pages into structured data",
+      "description_es": "Extrae el contenido principal de una página web y lo convierte en un documento limpio o en datos estructurados; Orkas lo usa automáticamente una vez instalado.",
+      "description_fr": "Extrayez le contenu principal d’une page web dans un document épuré ou des données structurées ; Orkas l’utilise automatiquement une fois installé.",
+      "description_ko": "웹페이지의 본문을 추출해 깔끔한 문서나 구조화된 데이터로 정리합니다. 설치 후 Orkas가 자동으로 사용합니다.",
+      "description_de": "Extrahieren Sie den Hauptinhalt einer Webseite als bereinigtes Dokument oder strukturierte Daten; Orkas nutzt es nach der Installation automatisch.",
+      "description_ru": "Извлекайте основное содержимое веб-страницы в чистый документ или структурированные данные; после установки Orkas использует инструмент автоматически.",
+      "description_it": "Estrai il contenuto principale di una pagina web in un documento pulito o in dati strutturati; Orkas lo usa automaticamente dopo l’installazione."
     }
   ]
 }

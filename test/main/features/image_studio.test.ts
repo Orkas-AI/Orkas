@@ -1,14 +1,16 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import sharp from 'sharp';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   assertImageQualityVerdict,
   compileImageQualityScorecard,
-  imageStudioEvidenceReviewRequired,
+  imageStudioEvidenceIsGeneration,
   inspectImageStudioProject,
+  normalizeImageStudioSnapshot,
   requiredCopyLayoutIssues,
   validateImageStudioManifest,
 } from '../../../src/main/features/image_studio';
@@ -50,12 +52,41 @@ afterEach(() => {
 });
 
 describe('ImageStudio project contract', () => {
-  it('never review-gates generated or edited raster evidence, including legacy state', () => {
-    expect(imageStudioEvidenceReviewRequired(null)).toBe(false);
-    expect(imageStudioEvidenceReviewRequired({ route: 'generate' } as any)).toBe(false);
-    expect(imageStudioEvidenceReviewRequired({ route: 'edit', review_required: true } as any)).toBe(false);
-    expect(imageStudioEvidenceReviewRequired({ route: 'compose' } as any)).toBe(true);
-    expect(imageStudioEvidenceReviewRequired({ route: 'hybrid', review_required: true } as any)).toBe(true);
+  it('delivers exact canvas pixels at normal, fractional and retina display densities without cropping product geometry', async () => {
+    for (const density of [1, 1.25, 2]) {
+      const captured = await sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${400 * density}" height="${240 * density}" viewBox="0 0 400 240">
+        <rect x="0" y="0" width="200" height="240" fill="#2468ae"/>
+        <rect x="200" y="0" width="200" height="240" fill="#b82e37"/>
+      </svg>`)).png().toBuffer();
+      const delivered = await normalizeImageStudioSnapshot(captured, { width: 400, height: 240 });
+      const decoded = await sharp(delivered).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+      expect(decoded.info).toMatchObject({ width: 400, height: 240, channels: 4 });
+      const pixel = (x: number, y: number) => [...decoded.data.subarray((y * 400 + x) * 4, (y * 400 + x) * 4 + 4)];
+      expect(pixel(100, 120)).toEqual([36, 104, 174, 255]);
+      expect(pixel(300, 120)).toEqual([184, 46, 55, 255]);
+      const repeat = await normalizeImageStudioSnapshot(delivered, { width: 400, height: 240 });
+      expect(await sharp(repeat).raw().toBuffer()).toEqual(await sharp(delivered).raw().toBuffer());
+    }
+  });
+
+  it('only exempts verified raster provenance, independent of route and legacy flags', () => {
+    expect(imageStudioEvidenceIsGeneration(null)).toBe(false);
+    expect(imageStudioEvidenceIsGeneration({ route: 'generate' } as any)).toBe(false);
+    expect(imageStudioEvidenceIsGeneration({ route: 'edit', review_required: false } as any)).toBe(false);
+    expect(imageStudioEvidenceIsGeneration({ route: 'edit', source_kind: 'html', is_generation: true } as any)).toBe(false);
+    expect(imageStudioEvidenceIsGeneration({ route: 'hybrid', source_kind: 'raster', is_generation: true } as any)).toBe(true);
+  });
+
+  it('supports zero-call source edits and requires actionable reproduction constraints', () => {
+    const reference = { id: 'source', path: 'source.png', role: 'edit_source', strength: 1, required: true, preserve: ['product', 'layout'], may_change: ['headline'], region_ids: [] };
+    for (const route of ['compose', 'edit']) {
+      expect(validateImageStudioManifest(manifest({ route, entry: 'index.html', references: [reference], reference_intent: { mode: 'edit', basis: 'user', instructions: ['Replace only the headline'], minimum_score: 80 } })).issues).toEqual([]);
+    }
+    const intent = { mode: 'reproduce', basis: 'user', instructions: [], minimum_score: 85 };
+    expect(validateImageStudioManifest(manifest({ references: [], reference_intent: intent })).issues.map(item => item.code)).toContain('E_MANIFEST_REPRODUCE_REFERENCE_REQUIRED');
+    expect(validateImageStudioManifest(manifest({ references: [{ ...reference, role: 'composition', preserve: [] }], reference_intent: intent })).issues.map(item => item.code)).toContain('E_MANIFEST_REPRODUCE_BOUNDARY_REQUIRED');
+    expect(validateImageStudioManifest(manifest({ references: [{ ...reference, role: 'composition' }], reference_intent: intent })).issues).toEqual([]);
+    expect(validateImageStudioManifest(manifest({ entry: 'index.html', raster_source: 'source.png' })).issues.map(item => item.code)).toContain('E_MANIFEST_FINAL_SOURCE_CONFLICT');
   });
 
   it('compiles an evidence scorecard and enforces reference-specific scoring', () => {

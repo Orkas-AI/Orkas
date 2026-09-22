@@ -1044,6 +1044,8 @@ export function authoredAbsoluteTimelinePositions(
   return found;
 }
 
+// Initial hiding uses opacity: inherited visibility:hidden makes staggered GSAP
+// child entrances infer an invisible end state before their scene is revealed.
 export function buildCompositionScaffold(manifest: CompositionManifest): string {
   const { composition } = manifest;
   const clips = manifest.scenes.map((scene) => {
@@ -1070,7 +1072,7 @@ export function buildCompositionScaffold(manifest: CompositionManifest): string 
     * { box-sizing: border-box; }
     html, body { width: ${composition.width}px; height: ${composition.height}px; margin: 0; overflow: hidden; background: #000; color: #fff; }
     [data-composition-id="${escapeHtml(composition.id)}"] { position: relative; width: 100%; height: 100%; overflow: hidden; }
-    .clip { position: absolute; inset: 0; opacity: 0; visibility: hidden; }
+    .clip { position: absolute; inset: 0; opacity: 0; }
     .scene-content { width: 100%; height: 100%; padding: 96px; display: flex; flex-direction: column; justify-content: center; gap: 32px; }
     h1 { margin: 0; font-size: 96px; }
   </style>

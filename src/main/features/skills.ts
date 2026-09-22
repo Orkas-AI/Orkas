@@ -1098,7 +1098,7 @@ function normalizePlatformSkillMdForWrite(content: string, fallbackName = ''): s
   return normalizeSkillMdForWrite(content, fallbackName);
 }
 
-async function _getCustomSkillForUser(skillId: string, userId: string): Promise<CustomSkill | null> {
+function _getCustomSkillForUser(skillId: string, userId: string): CustomSkill | null {
   const d = customSkillDir(skillId, userId);
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) return null;
   if (!hasSkillMd(d)) return null;
@@ -1159,6 +1159,14 @@ async function _listSkillFilesAt(skillDir: string): Promise<SkillFileInfo[]> {
 export async function createCustomSkill(
   name: string, description: string, category = '',
 ): Promise<CustomSkill | null> {
+  return _createCustomSkillSync(name, description, category);
+}
+
+// Keep allocation and the commander's validated file writes in one synchronous
+// commit section; an account switch or Stop cannot interleave with a seed.
+function _createCustomSkillSync(
+  name: string, description: string, category = '',
+): CustomSkill | null {
   const err = validateSkillName(name);
   if (err) throw new Error(err);
   const d = customSkillDir(name);
@@ -1190,7 +1198,7 @@ export async function createCustomSkill(
   log.info(`created name=${name} category=${category || '(none)'}`);
   _invalidateSkillListCache();
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
-  return getCustomSkill(name);
+  return _getCustomSkillForUser(name, getActiveUserId());
 }
 
 export async function updateCustomSkill(
@@ -1730,6 +1738,7 @@ async function _installSourceSkillRoots(
     force?: boolean;
     continueOnError?: boolean;
     rejectExisting?: boolean;
+    requireSkillMd?: boolean;
   } = {},
 ): Promise<ImportResult> {
   const reserved = new Set<string>();
@@ -1775,6 +1784,27 @@ async function _installSourceSkillRoots(
       : _sourceSkillImportDescription(sourceSkillMd, t('skills.import.default_desc_dir'));
     let created: CustomSkill | null = null;
     try {
+      if (opts.requireSkillMd) {
+        // Check the source before normalization can fill a missing name or
+        // description. Native import accepts an existing Skill, not a draft.
+        const report = validateSkillFile({ relpath: 'SKILL.md', content: fs.readFileSync(sourceSkillMd, 'utf8') });
+        const invalidIdentity = report.violations.some((violation) =>
+          violation.rule === 'frontmatter_name_invalid'
+          || (violation.rule === 'frontmatter_description_missing'
+            && !_sourceSkillImportDescription(sourceSkillMd, '')));
+        if (!report.ok || invalidIdentity) {
+          report.ok = false;
+          const failure: ImportFailure = {
+            sourceName, skillId: effectiveName, error: t('skills.errors.validation_blocked'), report,
+          };
+          failures.push(failure);
+          if (!opts.continueOnError) {
+            await rollbackCreated();
+            return { ok: false, error: failure.error, report, failures };
+          }
+          continue;
+        }
+      }
       created = await createCustomSkill(effectiveName, effectiveDesc);
       if (!created) throw new Error(t('skills.errors.create_failed'));
 
@@ -2056,6 +2086,7 @@ export async function createFromDir(
         force: opts.force,
         continueOnError: opts.continueOnError,
         rejectExisting: opts.rejectExisting,
+        requireSkillMd: opts.requireSkillMd,
       },
     );
   }
@@ -2936,6 +2967,9 @@ function _visibleInlineSkillEditText(text: string, currentSkillId: string): stri
 
 export interface SkillContainerResult {
   ok: boolean;
+  /** Structured, pre-write creation failures. Correction additionally requires
+   * an unbound container; the legacy missing-edit-target fallback is excluded. */
+  creationError?: 'container_no_blocks' | 'missing_skill_md' | 'missing_name' | 'invalid_name' | 'invalid_frontmatter';
   /** 'created' for the no-skill-id branch; 'updated' for the edit branch.
    *  Undefined on `ok: false`. */
   kind?: 'created' | 'updated';
@@ -2981,6 +3015,8 @@ export async function applySkillContainerFromCommander(
     // into re-sending the same malformed blocks.
     return {
       ok: false,
+      ...(!container.skillId && (container.raw || '').trim()
+        ? { creationError: 'container_no_blocks' as const } : {}),
       error: (container.raw || '').trim()
         ? t('skills.errors.container_no_blocks')
         : t('skills.errors.container_empty'),
@@ -3007,13 +3043,13 @@ async function _applySkillContainerCreate(
   // SKILL.md is mandatory in the create branch — that's where the skill id
   // (frontmatter `name`) and bilingual descriptions are sourced from.
   const skillMd = files.find((f) => f.path.toUpperCase() === 'SKILL.MD');
-  if (!skillMd) return { ok: false, error: t('skills.errors.create_missing_skill_md') };
+  if (!skillMd) return { ok: false, creationError: 'missing_skill_md', error: t('skills.errors.create_missing_skill_md') };
   const { meta } = splitSkillMd(skillMd.content || '');
   const rawName = (meta.name || '');
   const name = rawName.trim();
-  if (!name) return { ok: false, error: t('skills.errors.create_missing_name') };
+  if (!name) return { ok: false, creationError: 'missing_name', error: t('skills.errors.create_missing_name') };
   const validateErr = validateSkillName(rawName);
-  if (validateErr) return { ok: false, error: validateErr };
+  if (validateErr) return { ok: false, creationError: 'invalid_name', error: validateErr };
   // Collision checks — same gates as the IPC create path so commander and
   // detail panel produce identical failure modes.
   if (fs.existsSync(customSkillDir(name))) {
@@ -3044,6 +3080,10 @@ async function _applySkillContainerCreate(
       ok: false,
       error: t('skills.errors.validation_blocked'),
       validation_failed: validationFailed,
+      ...(validationFailed.every((entry) => entry.path === 'SKILL.md'
+        && entry.report.violations.filter((v) => v.level === 'EXTREME')
+          .every((v) => v.rule === 'frontmatter_unparseable'))
+        ? { creationError: 'invalid_frontmatter' as const } : {}),
     };
   }
 
@@ -3053,7 +3093,7 @@ async function _applySkillContainerCreate(
   const metadataSidecar = metadata ? _skillSidecarPatchFromMetadataUpdate(metadata) : {};
   const fileSidecar = _skillSidecarPatchFromFrontmatter(meta);
   const seedCategory = String(metadataSidecar.category || fileSidecar.category || '');
-  const created = await createCustomSkill(name, seedDescription, seedCategory);
+  const created = _createCustomSkillSync(name, seedDescription, seedCategory);
   if (!created) return { ok: false, error: t('skills.errors.create_failed') };
 
   const written: string[] = [];

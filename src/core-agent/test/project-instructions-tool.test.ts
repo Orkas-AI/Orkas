@@ -1,5 +1,6 @@
+import { estimateTextTokens } from '../src/shared/token-estimate.js';
 import { describe, it, expect } from 'vitest';
-import { TOOL_DESCRIPTION_SOFT_BUDGET_CHARS, toToolDefinition } from '../src/tools/base.js';
+import { TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS, toToolDefinition } from '../src/tools/base.js';
 import { createProjectInstructionsTool, type ProjectInstructionsToolHandler } from '../src/tools/project-instructions-tool';
 
 const ctx = {} as any;
@@ -23,7 +24,7 @@ describe('project_instructions tool', () => {
   it('keeps replacement and adjacent-state selection boundaries in the right contract layers', () => {
     const def = toToolDefinition(createProjectInstructionsTool(stubHandler().handler));
     const instructions = (def.inputSchema.properties as any).instructions;
-    expect(def.description.length).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_CHARS);
+    expect(estimateTextTokens(def.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
     expect(def.description).toContain('standing goal and rules');
     expect(def.description).toContain('todo_tasks');
     expect(def.description).toContain('project memory');

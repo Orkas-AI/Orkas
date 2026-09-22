@@ -215,12 +215,12 @@ setInterval(() => {}, 1000);
     expect(performance.now() - startedAt).toBeLessThan(5_000);
 
     const pid = Number(fs.readFileSync(pidFile, 'utf8'));
-    const deadline = Date.now() + 2_000;
-    let alive = true;
-    while (alive && Date.now() < deadline) {
-      try { process.kill(pid, 0); } catch { alive = false; }
-      if (alive) await new Promise(resolve => setTimeout(resolve, 25));
+    // A completed probe releases its fixture/installation to the caller.
+    // Returning before taskkill finishes races that cleanup with a live tree.
+    try {
+      expect(() => process.kill(pid, 0)).toThrow();
+    } finally {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
     }
-    expect(alive).toBe(false);
   });
 });

@@ -80,6 +80,14 @@ describe('marketplace projects catalog', () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it('searches translated descriptions in the offline catalog', async () => {
+    const marketplace = await loadMarketplace();
+    for (const query of ['editable', 'modifiable', '편집 가능한', 'bearbeitbare', 'редактируемую', 'modificabile']) {
+      const data = await marketplace.listMarketplaceProjects({ local_only: true, q: query });
+      expect(data.list.map((p) => p.id), query).toContain('ppt-master');
+    }
+  });
+
   it('sends If-None-Match and replays the cached list on a 304', async () => {
     process.env.ORKAS_API_BASE_URL = 'https://marketplace.test/api';
     const fetchMock = vi.fn(async (_url: unknown, init: RequestInit) => {

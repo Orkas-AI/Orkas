@@ -121,6 +121,32 @@ function renderFilesHtml(snapshot: {
 }
 
 describe('ConversationInfo files tab', () => {
+  it('only reveals a task-scoped browser in the currently displayed and bound task', async () => {
+    await renderFilesResult({ history: [], files: { items: [] } }, context => {
+      const info = context.window.ConversationInfo;
+      const panel = context.document.getElementById('conversation-info-panel');
+      context.currentView = 'conversation';
+      context.currentCid = 'b';
+      info.bind('b');
+      info.openAndSetTab('browser', 'a');
+      expect(panel.hidden).toBe(true);
+      // During navigation the panel can still be bound to the previous task.
+      info.bind('a');
+      info.openAndSetTab('browser', 'a');
+      expect(panel.hidden).toBe(true);
+      context.currentView = 'settings';
+      context.currentCid = 'a';
+      info.openAndSetTab('browser', 'a');
+      expect(panel.hidden).toBe(true);
+      context.currentView = 'conversation';
+      expect(info.openAndSetTab('browser', 'a')).toBe(true);
+      expect(panel.hidden).toBe(false);
+      info.close();
+      info.openAndSetTab('files');
+      expect(panel.hidden).toBe(false);
+    });
+  });
+
   // Membership now arrives already merged from
   // `features/conversation_outputs.ts`; what the panel still owns is where each
   // entry lands. A file written outside the workspace has no tree position, and

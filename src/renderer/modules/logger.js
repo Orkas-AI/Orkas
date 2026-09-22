@@ -36,7 +36,9 @@ const createLogger = (function () {
   const CLOUD_PATH_RE = new RegExp(`\\bcloud\\/[^\\n\\r)'",;]+?${PATH_END}`, 'g');
 
   function sanitizeText(value) {
-    return String(value ?? '')
+    const text = typeof value === 'string' ? value : String(value ?? '');
+    if (text.length > 4096) return '[oversized text omitted]';
+    return text
       .replace(/Bearer\s+[A-Za-z0-9._\-~+/=]+/gi, 'Bearer ***')
       .replace(/Basic\s+[A-Za-z0-9+/=]+/gi, 'Basic ***')
       .replace(/\beyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b/g, '***JWT***')
@@ -50,9 +52,15 @@ const createLogger = (function () {
       .replace(/\b(1[3-9]\d)\d{4}(\d{4})\b/g, '$1****$2');
   }
 
-  function sanitizeValue(value, seen) {
+  function sanitizeValue(value, seen, budget, depth = 0) {
+    if (++budget.nodes > 128 || depth > 6) return '[truncated]';
     if (value == null) return value;
-    if (typeof value === 'string') return sanitizeText(value);
+    if (typeof value === 'string') {
+      if (budget.chars + value.length > 16384) return '[oversized text omitted]';
+      budget.chars += value.length;
+      return sanitizeText(value);
+    }
+    if (typeof value === 'function' || typeof value === 'symbol') return '[unsupported]';
     if (typeof value !== 'object') return value;
     if (seen.has(value)) return '[circular]';
     seen.add(value);
@@ -63,50 +71,69 @@ const createLogger = (function () {
         stack: value.stack ? sanitizeText(value.stack) : undefined,
       };
     }
-    if (Array.isArray(value)) return value.map((it) => sanitizeValue(it, seen));
+    if (Array.isArray(value)) {
+      const items = [];
+      for (let i = 0; i < Math.min(value.length, 32); i++) {
+        const element = Object.getOwnPropertyDescriptor(value, String(i));
+        items.push(element && 'value' in element ? sanitizeValue(element.value, seen, budget, depth + 1) : '[accessor]');
+      }
+      return items;
+    }
     const out = {};
-    Object.entries(value).forEach(([k, v]) => {
+    let keys = 0;
+    for (const k in value) {
+      if (++keys > 32 || budget.nodes >= 128) { out.truncated = true; break; }
+      if (k.length > 128 || k === '__proto__') continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, k);
+      if (!descriptor) continue;
+      const v = 'value' in descriptor ? descriptor.value : '[accessor]';
       if (SECRET_KEY_RE.test(k)) out[k] = '***REDACTED***';
       else if (PRIVATE_FILE_KEY_RE.test(k) && typeof v === 'string') out[k] = '***REDACTED_PATH***';
-      else out[k] = sanitizeValue(v, seen);
-    });
+      else out[k] = sanitizeValue(v, seen, budget, depth + 1);
+    }
     return out;
   }
 
-  function send(level, module, message, args) {
-    try {
-      if (window.orkas && typeof window.orkas.log === 'function') {
-        window.orkas.log({
-          level,
-          module,
-          message: sanitizeText(message),
-          data: args.map((arg) => sanitizeValue(arg, new WeakSet())),
-        });
-      }
-    } catch (_) { /* never let logging crash the UI */ }
+  const pending = [];
+  let timer = null;
+  let dropped = 0;
+  function flush() {
+    timer = null;
+    const batch = pending.splice(0, 8);
+    if (dropped) {
+      batch.push({ level: 'warn', module: 'logger', message: 'Log buffer full', data: [{ dropped }] });
+      dropped = 0;
+    }
+    for (const record of batch) {
+      try {
+        const fn = console[record.level] || console.log;
+        fn.call(console, `[${record.module}]`, record.message, ...record.data);
+      } catch (_) { /* Console failures cannot prevent file delivery. */ }
+      try {
+        if (window.orkas && typeof window.orkas.log === 'function') window.orkas.log(record);
+      } catch (_) { /* Logging cannot fail the user action. */ }
+    }
+    if (pending.length) timer = setTimeout(flush, 0);
   }
-
-  // Console mirror — helps debugging while DevTools are open. Keeps the
-  // [module] prefix so the two streams read the same way.
-  function mirror(level, module, message, args) {
+  function enqueue(level, module, message, args) {
     try {
-      const tag = `[${module}]`;
-      const safeMessage = sanitizeText(message);
-      const safeArgs = args.map((arg) => sanitizeValue(arg, new WeakSet()));
-      // eslint-disable-next-line no-console
-      const fn = console[level] || console.log;
-      if (safeArgs.length) fn.call(console, tag, safeMessage, ...safeArgs);
-      else                 fn.call(console, tag, safeMessage);
-    } catch (_) { /* noop */ }
+      const limit = level === 'warn' || level === 'error' ? 256 : 192;
+      if (pending.length >= limit) { dropped += 1; return; }
+      // Snapshot once before crossing the async boundary; later caller changes
+      // must not change the diagnostic or introduce private data.
+      pending.push({ level, module, message: sanitizeText(message),
+        data: sanitizeValue(args.slice(0, 16), new WeakSet(), { nodes: 0, chars: 0 }) });
+      if (timer === null) timer = setTimeout(flush, 0);
+    } catch (_) { /* Never let logging crash the UI. */ }
   }
 
   return function createLogger(moduleName) {
-    const m = String(moduleName || 'app').trim() || 'app';
+    const m = typeof moduleName === 'string' && moduleName.length <= 128 ? sanitizeText(moduleName.trim()) || 'app' : 'app';
     return {
-      error: (msg, ...args) => { mirror('error', m, msg, args); send('error', m, msg, args); },
-      warn:  (msg, ...args) => { mirror('warn',  m, msg, args); send('warn',  m, msg, args); },
-      info:  (msg, ...args) => { mirror('info',  m, msg, args); send('info',  m, msg, args); },
-      debug: (msg, ...args) => { mirror('debug', m, msg, args); send('debug', m, msg, args); },
+      error: (msg, ...args) => { enqueue('error', m, msg, args); },
+      warn:  (msg, ...args) => { enqueue('warn', m, msg, args); },
+      info:  (msg, ...args) => { enqueue('info', m, msg, args); },
+      debug: (msg, ...args) => { enqueue('debug', m, msg, args); },
     };
   };
 })();
@@ -126,6 +153,13 @@ const createLogger = (function () {
 
   window.addEventListener('error', (ev) => {
     try {
+      // Chromium delivers these notifications without an application exception.
+      // Keep them visible, while retaining real callback exceptions as errors.
+      if (!ev.error && (ev.message === 'ResizeObserver loop completed with undelivered notifications.'
+        || ev.message === 'ResizeObserver loop limit exceeded')) {
+        rootLog.warn('browser resize notification', { message: ev.message });
+        return;
+      }
       rootLog.error('uncaught error', {
         message: ev.message,
         source: ev.filename,

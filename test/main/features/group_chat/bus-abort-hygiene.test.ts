@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 
 /**
  * Post-abort work hygiene: a user Stop is the single stop path — no salvaged
@@ -109,6 +110,7 @@ afterEach(async () => {
     }
   } catch { /* ignore */ }
   await new Promise((r) => setTimeout(r, 30));
+  await drainMainRuntimeForTest();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });

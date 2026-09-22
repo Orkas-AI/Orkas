@@ -2,7 +2,7 @@ import * as users from './users';
 import * as builtinMarketplace from './builtin_marketplace';
 import * as runtimeContentPublish from './runtime_content_publish';
 import { createLogger } from '../logger';
-import { maskId } from '../util/log-redact';
+import { logErrorSummary, maskId } from '../util/log-redact';
 import type { BuiltinMarketplaceSeedResult } from './builtin_marketplace';
 
 const log = createLogger('builtin-marketplace');
@@ -63,7 +63,7 @@ export async function seedBuiltinMarketplaceForActiveUser(
     log.warn('builtin marketplace seed for active user failed', {
       reason: opts.reason,
       uid: maskId(uid),
-      error: (err as Error).message,
+      error: logErrorSummary(err),
     });
     return null;
   });

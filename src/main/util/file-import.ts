@@ -119,3 +119,29 @@ export async function copyLocalFileAtomic(
     await fsp.rm(temp, { force: true }).catch(() => {});
   }
 }
+
+export async function isUtf8File(absPath: string): Promise<boolean> {
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+  const stream = fs.createReadStream(absPath);
+  try {
+    for await (const chunk of stream) {
+      decoder.decode(chunk as Buffer, { stream: true });
+    }
+    decoder.decode();
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') {
+      return false;
+    }
+    throw err;
+  } finally {
+    // An invalid chunk ends iteration before the asynchronous handle close.
+    // Callers must be able to remove or replace the rejected source at once.
+    if (!stream.closed) {
+      await new Promise<void>((resolve) => {
+        stream.once('close', resolve);
+        stream.destroy();
+      });
+    }
+  }
+}

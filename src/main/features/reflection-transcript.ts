@@ -1,18 +1,6 @@
-/**
- * Build a chronological activity transcript for reflection.
- *
- * Replaces `reflection-digest.ts` per `Common/docs/plans/reflection-redesign.md`.
- * Reads the target agent's recent conversations, time-interleaves user
- * voice (from gconv) with agent replies (from gmember), injects four
- * system-event signal types (retry / skip / form_left_blank / silence),
- * and applies a double cap (≤5 conversations AND ≤16K tokens).
- *
- * Output is a plain string for the reflection LLM prompt — no aggregation,
- * no structured fields, just light annotation. Reflection LLM judges raw
- * patterns from the text. T0/T1 signals other than the 4 inlined kinds are
- * NOT consumed here (those serve future critic / weekly-review consumers).
- *
- * Pure side-effect-free; safe to call from anywhere with active uid.
+/** Reflection evidence from complete task conversations, bounded across the batch.
+ * Canonical conversation records own dialogue; old session-only histories remain
+ * readable. Cropping affects this projection only, never persisted messages.
  */
 
 import * as fs from 'node:fs';
@@ -20,34 +8,19 @@ import * as path from 'node:path';
 import { userSessionsDir, projectSessionsDir } from '../paths';
 import { cloudSessionFileFor, listProjectIds } from '../util/project-layout';
 import { createLogger } from '../logger';
-import { ACCURATE_CJK_WEIGHT, estimateTokensWithWeight } from '../util/token-estimate';
+import { estimateBudgetTokens, estimateBudgetTokenQuarters } from '../util/token-estimate';
+import { historyMessageIndex, historyMessages, historyRecordText } from './chat-history-records';
 import { listConversations, type Conversation } from './chats';
-import { buildGmemberSessionId } from './group_chat/state';
 import { querySignalsForUser, type Signal, type SignalType } from './expert_signals';
 
 const log = createLogger('reflection-transcript');
 
-// ── Caps (per plan §2.2) ────────────────────────────────────────────────
+// ── Evidence caps ────────────────────────────────────────────────
 
 export const MAX_CONVS = 5;
-export const MAX_TOKENS = 16_000;
-export const MAX_AGENT_REPLY_CHARS = 800;
+export const MAX_TOKENS = 150_000;
 const SYSTEM_EVENT_TYPES: SignalType[] = ['form_left_blank', 'silence'];
-
-// ── Token estimation (CJK-aware) ────────────────────────────────────────
-
-/** Estimate token count for the transcript caps.
- *
- *  Uses the accurate CJK weight, not the conservative one the context budget
- *  uses: this bounds how much material a reflection prompt carries inside a
- *  much larger window, so over-estimating silently halves the evidence for a
- *  Chinese-heavy account while under-estimating only makes one section of a
- *  roomy prompt slightly larger. Shares the classifier with the rest of main
- *  — the previous local copy also missed CJK punctuation (、。「」), which
- *  charged ordinary Chinese text at the Latin rate. */
-export function estimateTokens(text: string): number {
-  return estimateTokensWithWeight(text, ACCURATE_CJK_WEIGHT);
-}
+export const estimateTokens = estimateBudgetTokens;
 
 // ── Filesystem-based agent participation discovery ──────────────────────
 
@@ -90,6 +63,7 @@ export function listAgentGmemberFiles(
 interface TranscriptEntry {
   ts: number;
   kind: 'user' | 'agent' | 'system';
+  actor?: string;
   text: string;
 }
 
@@ -135,8 +109,7 @@ function extractUserEntries(messages: any[]): TranscriptEntry[] {
 
 /** Extract agent-reply entries from a session jsonl. Filters to role=assistant
  *  text blocks only — drops thinking / tool_use / tool_result (those are
- *  intermediate work, not the final user-facing output). Caps each entry
- *  text at MAX_AGENT_REPLY_CHARS. */
+ *  intermediate work, not the final user-facing output). */
 function extractAgentEntries(messages: any[]): TranscriptEntry[] {
   const out: TranscriptEntry[] = [];
   for (const m of messages) {
@@ -150,10 +123,7 @@ function extractAgentEntries(messages: any[]): TranscriptEntry[] {
       if (trimmed) texts.push(trimmed);
     }
     if (!texts.length) continue;
-    let text = texts.join('\n');
-    if (text.length > MAX_AGENT_REPLY_CHARS) {
-      text = text.slice(0, MAX_AGENT_REPLY_CHARS) + '…(truncated)';
-    }
+    const text = texts.join('\n');
     out.push({ ts: m.ts, kind: 'agent', text });
   }
   return out;
@@ -206,7 +176,7 @@ function formatTs(ts: number): string {
 function renderEntry(e: TranscriptEntry): string {
   const ts = formatTs(e.ts);
   if (e.kind === 'system') return `[${ts} system event] ${e.text}`;
-  return `[${ts} ${e.kind}]\n${e.text}`;
+  return `[${ts} ${e.actor || e.kind}]\n${e.text}`;
 }
 
 function formatConvSection(section: ConvSection): string {
@@ -230,6 +200,8 @@ export interface TranscriptResult {
    *  "nothing happened". Callers must treat this as a transient failure worth
    *  retrying rather than as an examined-and-empty window. */
   unavailable?: boolean;
+  /** Evidence existed, but no complete message fit the input budget. */
+  capacityExceeded?: boolean;
   /** Sanity-check counters for callers / observability. */
   stats: {
     convsConsidered: number;
@@ -245,12 +217,14 @@ export interface TranscriptResult {
  *
  * @param uid       active user id
  * @param agentId   `_default` (no-agent / commander-only conversations) or a specific agent_id
- * @param sinceMs   lower bound for activity inclusion (typically lastReflectedAt epoch ms)
+ * @param sinceMs   selects recently active tasks; selected dialogue includes earlier messages
+ * @param maxTokens safe conversation capacity after fixed prompt/tool/output reservations
  */
 export async function buildTranscript(
   uid: string,
   agentId: string,
   sinceMs: number,
+  maxTokens = MAX_TOKENS,
 ): Promise<TranscriptResult> {
   const isDefault = agentId === '_default';
 
@@ -302,79 +276,110 @@ export async function buildTranscript(
     log.warn(`querySignals failed: ${(err as Error).message}`);
   }
 
-  const sections: ConvSection[] = [];
-  for (const conv of matched) {
-    const gconvMsgs = readSessionJsonl(uid, conv.session_id);
-    if (!gconvMsgs.length) continue;
-
-    // Activity gate: skip conv whose newest msg predates the window.
-    const maxTs = gconvMsgs.reduce((acc, m) => Math.max(acc, typeof m.ts === 'number' ? m.ts : 0), 0);
-    if (maxTs < sinceMs) continue;
-
-    const userEntries = extractUserEntries(gconvMsgs).filter((e) => e.ts >= sinceMs);
-
-    let agentEntries: TranscriptEntry[];
-    if (isDefault) {
-      // No agent worker — commander's reply IS the response shown to user.
-      agentEntries = extractAgentEntries(gconvMsgs).filter((e) => e.ts >= sinceMs);
-    } else {
-      const gmemberSid = buildGmemberSessionId(conv.conversation_id, agentId);
-      const gmemberMsgs = readSessionJsonl(uid, gmemberSid);
-      agentEntries = extractAgentEntries(gmemberMsgs).filter((e) => e.ts >= sinceMs);
+  // Index metadata first; read canonical bodies only for the five selected tasks.
+  // A present canonical file is authoritative even if all its rows were deleted.
+  const candidates: Array<{ conv: Conversation; lastTs: number;
+    source: Awaited<ReturnType<typeof historyMessageIndex>>; legacy?: TranscriptEntry[] }> = [];
+  try {
+    for (const conv of matched) {
+      const source = await historyMessageIndex(uid, conv.conversation_id);
+      const legacy = source.stamp ? undefined : legacyConversationEntries(uid, conv);
+      const lastTs = source.stamp
+        ? source.entries.reduce((last, row) => row.metadata.deleted_at ? last
+          : Math.max(last, Date.parse(row.metadata.ts) || 0), 0)
+        : legacy!.reduce((last, entry) => Math.max(last, entry.ts), 0);
+      if (lastTs >= sinceMs && (source.entries.length || legacy?.length)) {
+        candidates.push({ conv, lastTs, source, legacy });
+      }
     }
-
-    const sigEntries = windowSignals
-      .filter((s) => s.cid === conv.conversation_id)
-      .map(renderSignalEntry)
-      .filter((e): e is TranscriptEntry => e !== null)
-      .filter((e) => e.ts >= sinceMs);
-
-    const entries = [...userEntries, ...agentEntries, ...sigEntries]
-      .sort((a, b) => a.ts - b.ts);
-
-    if (!entries.length) continue;
-    sections.push({ conv, entries });
+    candidates.sort((a, b) => b.lastTs - a.lastTs || a.conv.conversation_id.localeCompare(b.conv.conversation_id));
+    const sections: ConvSection[] = [];
+    for (const candidate of candidates.slice(0, MAX_CONVS)) {
+      const { conv, source } = candidate;
+      const entries: TranscriptEntry[] = candidate.legacy ?? (await historyMessages(uid, conv.conversation_id,
+        source.entries.filter((row) => !row.metadata.deleted_at).map((row) => row.index), source))
+        .flatMap((message): TranscriptEntry[] => {
+          const ts = Date.parse(message.ts);
+          const text = historyRecordText(message);
+          if (!Number.isFinite(ts) || !text.trim() || message.deleted_at) return [];
+          return [{ ts, kind: message.from === 'user' ? 'user' : 'agent', actor: message.from, text }];
+        });
+      for (const signal of windowSignals) {
+        if (signal.cid !== conv.conversation_id) continue;
+        const entry = renderSignalEntry(signal);
+        if (entry) entries.push(entry);
+      }
+      entries.sort((a, b) => a.ts - b.ts);
+      if (entries.length) sections.push({ conv, entries });
+    }
+    return fitTranscript(sections, candidates.length, agentId, sinceMs, maxTokens);
+  } catch {
+    log.warn('Reflection conversation source unavailable');
+    return { ..._empty(), unavailable: true };
   }
+}
 
+/** Legacy-only recovery: read all participating actors, never duplicate an
+ * existing canonical conversation with injected private session history. */
+function legacyConversationEntries(uid: string, conv: Conversation): TranscriptEntry[] {
+  const gconv = readSessionJsonl(uid, conv.session_id);
+  const entries = [...extractUserEntries(gconv),
+    ...extractAgentEntries(gconv).map((entry) => ({ ...entry, actor: 'commander' }))];
+  const directory = path.dirname(cloudSessionFileFor(uid, conv.session_id));
+  const prefix = `gmember-${conv.conversation_id}-`;
+  let names: string[] = [];
+  try { names = fs.readdirSync(directory); } catch { return entries; }
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith('.jsonl')) continue;
+    const actor = name.slice(prefix.length, -6);
+    entries.push(...extractAgentEntries(readSessionJsonl(uid, name.slice(0, -6)))
+      .map((entry) => ({ ...entry, actor })));
+  }
+  return entries;
+}
+
+/** Oldest task first, then oldest whole message. Token scans are linear in
+ * rendered input size; deletion never rescans all remaining message bodies. */
+function fitTranscript(sections: ConvSection[], considered: number, agentId: string, sinceMs: number, maxTokens: number): TranscriptResult {
   if (!sections.length) return _empty();
-
-  // Sort by most-recent-activity desc and apply MAX_CONVS cap.
-  sections.sort((a, b) => _lastTs(b) - _lastTs(a));
-  const convsConsidered = sections.length;
-  let convsTruncated = Math.max(0, sections.length - MAX_CONVS);
-  let kept = sections.slice(0, MAX_CONVS);
-
-  // Render in chronological order (oldest first) and drop oldest sections
-  // until token budget is met. Always keep at least one section (the most
-  // recent) so a single oversized conv still produces output rather than ''.
-  kept.sort((a, b) => _lastTs(a) - _lastTs(b));
-
-  const sinceLabel = _fmtSinceLabel(sinceMs);
-  const header = `## Activity since ${sinceLabel}`;
-
-  while (kept.length > 1) {
-    const full = `${header}\n\n${kept.map(formatConvSection).join('\n\n')}`;
-    if (estimateTokens(full) <= MAX_TOKENS) {
-      return _result(full, convsConsidered, kept.length, convsTruncated);
+  const budget = Number.isFinite(maxTokens) ? Math.max(0, Math.min(MAX_TOKENS, Math.floor(maxTokens))) : 0;
+  const created = (section: ConvSection) => {
+    const ts = Date.parse(section.conv.created_at);
+    return Number.isFinite(ts) ? ts : section.entries[0].ts;
+  };
+  sections.sort((a, b) => created(a) - created(b) || a.conv.conversation_id.localeCompare(b.conv.conversation_id));
+  const actor = agentId === '_default' ? 'commander' : agentId;
+  const header = `## Task conversations for ${actor} (activity since ${_fmtSinceLabel(sinceMs)}; earlier dialogue included)\n\n`;
+  const omission = '[Earlier messages omitted to fit the reflection input budget.]\n\n';
+  const rows = sections.map((section) => {
+    const heading = formatConvSection({ ...section, entries: [] }) + '\n\n';
+    const messages = section.entries.map((entry) => renderEntry(entry) + '\n\n');
+    return { heading, headingCost: estimateBudgetTokenQuarters(heading), messages,
+      costs: messages.map((text) => estimateBudgetTokenQuarters(text)), start: 0 };
+  });
+  let quarters = estimateBudgetTokenQuarters(header) + rows.reduce((sum, row) =>
+    sum + row.headingCost + row.costs.reduce((a, b) => a + b, 0), 0) - 2; // Final two newlines are not emitted.
+  let removed = false;
+  if (quarters > budget * 4) {
+    quarters += estimateBudgetTokenQuarters(omission);
+    for (const row of rows) {
+      while (row.start < row.messages.length && quarters > budget * 4) {
+        quarters -= row.costs[row.start++];
+        removed = true;
+        if (row.start === row.messages.length) quarters -= row.headingCost;
+      }
+      if (quarters <= budget * 4) break;
     }
-    kept.shift();
-    convsTruncated += 1;
   }
-
-  // Single section remaining — emit even if it exceeds budget (logged).
-  const full = `${header}\n\n${formatConvSection(kept[0])}`;
-  const tokens = estimateTokens(full);
-  if (tokens > MAX_TOKENS) {
-    log.warn(`transcript exceeds token cap: ${tokens} > ${MAX_TOKENS} (single conv ${kept[0].conv.conversation_id} kept)`);
-  }
-  return _result(full, convsConsidered, kept.length, convsTruncated);
+  const kept = rows.filter((row) => row.start < row.messages.length);
+  const dropped = Math.max(0, considered - sections.length) + rows.filter((row) => row.start > 0).length;
+  if (!kept.length) return { ..._result('', considered, 0, dropped), capacityExceeded: true };
+  const text = (header + (removed ? omission : '') + kept.map((row) =>
+    row.heading + row.messages.slice(row.start).join('')).join('')).trimEnd();
+  return _result(text, considered, kept.length, dropped);
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
-
-function _lastTs(s: ConvSection): number {
-  return s.entries[s.entries.length - 1].ts;
-}
 
 function _fmtSinceLabel(ms: number): string {
   return new Date(ms).toISOString().slice(0, 16).replace('T', ' ');
@@ -387,7 +392,7 @@ function _empty(): TranscriptResult {
 function _result(text: string, considered: number, included: number, truncated: number): TranscriptResult {
   const estimatedTokens = estimateTokens(text);
   if (truncated > 0) {
-    log.info(`transcript: ${included}/${considered} convs included, ${truncated} dropped (caps), ~${estimatedTokens} tokens`);
+    log.info(`transcript: ${included}/${considered} convs included, ${truncated} omitted or cropped (caps), ~${estimatedTokens} tokens`);
   }
   return { text, stats: { convsConsidered: considered, convsIncluded: included, convsTruncated: truncated, estimatedTokens } };
 }
@@ -395,6 +400,7 @@ function _result(text: string, considered: number, included: number, truncated: 
 // ── Test seam ───────────────────────────────────────────────────────────
 
 export const _internals = {
+  fitTranscript,
   parseMsgWrapper,
   extractUserEntries,
   extractAgentEntries,

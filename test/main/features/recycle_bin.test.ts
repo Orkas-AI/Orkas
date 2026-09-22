@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
 
 vi.mock('../../../src/main/logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
@@ -71,7 +72,8 @@ beforeEach(() => {
   vi.resetModules();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await drainMainRuntimeForTest();
   if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });

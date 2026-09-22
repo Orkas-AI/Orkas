@@ -28,7 +28,7 @@ const _wsInfoByTarget = {
   project: { currentPath: '', defaultPath: '', isDefault: true, recentPaths: [], scope: 'default' },
 };
 
-function _trackWorkspaceOpenFolderResult(target, result, startedAt, errorCode = '') {
+function _logWorkspaceOpenFolderResult(target, result, startedAt, errorCode = '') {
   if (result !== 'failure') return;
   _wsLog.warn('workspace open folder failed', {
     target,
@@ -233,14 +233,14 @@ async function _openWorkspaceFolder(target) {
   try {
     const result = await window.orkas.invoke('workspace.openPath', hint);
     if (result && result.ok) {
-      _trackWorkspaceOpenFolderResult(target, 'success', startedAt, '', result);
+      _logWorkspaceOpenFolderResult(target, 'success', startedAt, '', result);
       _wsLog.info('workspace opened', { target });
     } else {
-      _trackWorkspaceOpenFolderResult(target, 'failure', startedAt, 'open_rejected');
+      _logWorkspaceOpenFolderResult(target, 'failure', startedAt, 'open_rejected');
       _wsLog.warn('workspace open rejected', { target, error_code: 'open_rejected' });
     }
   } catch (err) {
-    _trackWorkspaceOpenFolderResult(target, 'failure', startedAt, 'invoke_failed');
+    _logWorkspaceOpenFolderResult(target, 'failure', startedAt, 'invoke_failed');
     _wsLog.error('workspace open failed', {
       target,
       error_type: err && typeof err.name === 'string' ? err.name : 'unknown',

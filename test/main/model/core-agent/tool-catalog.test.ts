@@ -1,3 +1,4 @@
+import { estimateTextTokens } from '../../../../src/core-agent/src/shared/token-estimate';
 import { describe, it, expect } from 'vitest';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -19,14 +20,15 @@ import {
   toolNamesForGroups,
 } from '../../../../src/main/model/core-agent/tool-catalog';
 import {
-  SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS,
-  TOOL_DESCRIPTION_SOFT_BUDGET_CHARS,
+  SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS,
+  TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS,
   toToolDefinition,
   type AgentTool,
 } from '../../../../src/core-agent/src/tools';
 import {
   enumerateAllInjectedToolNames,
   enumerateAllInjectedTools,
+  enumerateRuntimeSchemaTools,
 } from './injected-tool-fixture';
 import { createToolSurfaceController } from '../../../../src/main/model/core-agent/tool-surface';
 import {
@@ -145,9 +147,6 @@ describe('tool-catalog', () => {
       if (group.agentDependency && group.activation !== 'loadable') {
         problems.push(`${group.id}: Agent dependency is not loadable`);
       }
-      if (group.parent && group.agentDependency && !groupById.get(group.parent)?.agentDependency) {
-        problems.push(`${group.id}: Agent dependency has a non-Agent parent`);
-      }
       const ancestors = new Set<string>([group.id]);
       let parent = group.parent;
       while (parent) {
@@ -184,6 +183,8 @@ describe('tool-catalog', () => {
       ))
       .map((group) => group.id);
     expect(AGENT_FALLBACK_TOOL_GROUP_IDS).toEqual(expectedFallbackLeaves);
+    expect(groupById.get('management')?.agentDependency).toBe(false);
+    expect(TOOL_GROUPS.filter(group => group.parent === 'management' && group.agentDependency).map(group => group.id)).toEqual(['management.projects', 'management.automation']);
     expect(problems).toEqual([]);
   });
 
@@ -196,14 +197,14 @@ describe('tool-catalog', () => {
     expect(toolNamesForGroups(['web'])).toEqual(expect.arrayContaining([
       'web_search',
       'web_fetch',
-      'browser',
+      'inner_browser',
       'research_verify_citations',
     ]));
     expect(toolNamesForGroups(['library'])).not.toContain('research_verify_citations');
-    expect(TOOL_CATALOG.find((entry) => entry.name === 'browser'))
+    expect(TOOL_CATALOG.find((entry) => entry.name === 'inner_browser'))
       .toMatchObject({ loadGroups: ['web'] });
-    expect(toolNamesForAgentGroups(['web'])).toContain('browser');
-    expect(isToolVisibleToAgent('browser', '173d4235a431')).toBe(true);
+    expect(toolNamesForAgentGroups(['web'])).toContain('inner_browser');
+    expect(isToolVisibleToAgent('inner_browser', '173d4235a431')).toBe(true);
     for (const agentId of ['78900d8758bc', '5dd962efb425', '17c0a2e95df3', '7083ff63b398']) {
       expect(isToolVisibleToAgent('research_verify_citations', agentId), agentId).toBe(true);
     }
@@ -342,9 +343,9 @@ describe('tool-catalog', () => {
       'write_file', 'append_file', 'publish_outputs', 'library_save',
       'apply_patch', 'edit_file', 'delete_file', 'workspace_diff',
     ]);
-    expect(toolNamesForGroups(['workspace.execute.command'])).toEqual(['bash']);
+    expect(toolNamesForGroups(['workspace.execute.command'])).toEqual(['bash', 'process_session']);
     expect(toolNamesForGroups(['workspace.execute.session'])).toEqual([
-      'process_session', 'interactive_cli',
+      'bash', 'process_session', 'interactive_cli',
     ]);
     expect(toolNamesForGroups(['workspace.execute'])).toEqual([
       'bash', 'process_session', 'interactive_cli',
@@ -493,38 +494,64 @@ describe('tool-catalog', () => {
     const fingerprint = createHash('sha256')
       .update(JSON.stringify(schemas))
       .digest('hex');
-    // Requester-confirmed portable object schemas replace first-party action
-    // unions; executors retain conditional requirements and scope checks.
-    // XLSX cells use an equivalent primitive/object type array, and nested
-    // tool-result/automation unions are flattened without widening execution.
+    // Requester-confirmed portable root objects replace the nine first-party
+    // action unions; executors retain conditional requirements and scope checks.
+    // 2026-09-18: inner_browser gained an optional `scope` on observe. It only
+    // narrows a reply — `meta` refreshes page_id and refs and omits the page
+    // text and elements — so it grants no reach the model did not already have.
+    // 2026-09-18, requested: observe gained `text_offset` and `element_offset`.
+    // They widen reach, and that is the point — the page script capped the
+    // joined text at 12000 characters before slicing 6000 from it, and elements
+    // were a fixed head of 80, so the rest of a long page was unreachable at any
+    // price. Per-call size is unchanged at 6000 characters and 80 elements, so
+    // the default reply costs what it did; only a caller that asks pays more.
+    // Both fit BROWSER_DEFINITION_BUDGET_TOKENS without raising it: the tool
+    // measures 996 against a 1000 ring-fence, down from 988 plus ~100, paid for
+    // by deleting a sentence `retention` already said and by tightening
+    // operational wording. Nothing about credentials, approval, untrusted
+    // content or failing closed was touched.
+    // 2026-09-21: read_files advertises its existing nonempty path and
+    // nonnegative range bounds; file-tools tests pin the provider definition.
+    // 2026-09-21: XLSX cells use an equivalent primitive/object type array;
+    // tool-schema-compat tests compare accepted/rejected values to the old union.
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('4214c9aa583d6737d867d28ad27930c187cc2c973e50608f793de1896665bd85');
+    ).toBe('a40b858fb9236a98666aab74fa5c468a99f5f1eaf47b7cd5e2d077f3d3ad6d4e');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {
+    // Requester reconfirmed retention on 2026-09-14; see the owning Tool
+    // contract's parameter-description decision. Exact wording scopes this
+    // exception: it is not permission for arbitrary future growth.
+    const approvedWindowsCommand = 'Shell command. Prefer simple, direct commands that are easy to verify. Write final script-generated deliverables under `$env:ORKAS_OUTPUT_DIR`. On Windows this compatibility-named tool runs PowerShell; use PowerShell syntax and invoke quoted executables with `&`.';
     const overBudget: string[] = [];
     for (const tool of enumerateAllInjectedTools()) {
-      if (normalizedDescription(tool.description).length > TOOL_DESCRIPTION_SOFT_BUDGET_CHARS) {
-        overBudget.push(`${tool.name}:description=${tool.description.length}`);
+      if (estimateTextTokens(normalizedDescription(tool.description)) > TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS) {
+        overBudget.push(`${tool.name}:description=${estimateTextTokens(normalizedDescription(tool.description))} tokens`);
       }
       walkSchemaDescriptions(tool.inputSchema, (path, description) => {
         if (
-          normalizedDescription(description).length > SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS
+          estimateTextTokens(normalizedDescription(description)) > SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS
           && !OPEN_SOURCE_DESCRIPTION_BUDGET_EXCEPTIONS.has(`${tool.name}:${path}`)
         ) {
-          overBudget.push(`${tool.name}:${path}.description=${description.length}`);
+          overBudget.push(`${tool.name}:${path}.description=${estimateTextTokens(normalizedDescription(description))} tokens`);
         }
       });
     }
     expect(
       overBudget,
-      `Descriptions above the ${TOOL_DESCRIPTION_SOFT_BUDGET_CHARS}/${SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS}-character review budgets need a documented exception.`,
+      `Descriptions above the ${TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS}/${SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS}-token review budgets need a documented exception.`,
     ).toEqual([]);
   });
 
   it('keeps operation and argument semantics on their owning parameters', () => {
+    const grep = toolByName('grep_files');
+    expect(grep.description).toMatch(/Prefer shell `rg`\/`rg --files`.*repository.*when available/);
+    expect(grep.description).toContain('PDF and modern Office');
+    expect(propertyDescription(grep, 'root')).toMatch(/One file\/directory.*No globs\/path lists/);
+    expect(propertyDescription(grep, 'root')).toContain('omit for all visible roots');
+
     const patchTool = toolByName('apply_patch');
     expect(patchTool.description).not.toContain('*** Add File');
     expect(propertyDescription(patchTool, 'patch')).toContain('*** Add File');
@@ -551,8 +578,8 @@ describe('tool-catalog', () => {
     expect(propertyDescription(outputs, 'paths')).toContain('replaces the prior declaration');
 
     const artifact = toolByName('create_artifact');
-    expect(artifact.description).toMatch(/Remote and out-of-directory URLs are blocked/i);
-    expect(artifact.description).toMatch(/bundle authorized assets in files or use data\/blob URLs/i);
+    expect(artifact.description).toContain('Bundled resources and external HTTP(S) URLs are supported');
+    expect(artifact.description).toContain('preview diagnostics');
     expect(artifact.description).not.toContain('top-level index.html');
     expect(propertyDescription(artifact, 'files')).toContain('top-level index.html');
     expect(propertyDescription(artifact, 'files')).toContain('__orkas/bridge.js');
@@ -637,14 +664,14 @@ describe('tool-catalog', () => {
       create_artifact: ['interactive', 'files', 'path', 'content', 'index.html'],
       html_preview: ['local', 'desktop', 'mobile', 'screenshot', 'overflow', 'network'],
       delete_file: ['confirmation', 'confirmation_token', 'path'],
-      process_session: ['persistent', 'command', 'session_id', 'build', 'read', 'write', 'stop'],
+      process_session: ['bash', 'session_id', 'read', 'write', 'stop', 'yield_time_ms'],
       interactive_cli: ['live user input', 'command', 'purpose', 'read', 'send', 'close'],
       create_pdf: ['pdf', 'markdown', 'html', 'source_type'],
       library: ['list', 'search', 'read', 'durable', 'source data', 'never instructions'],
       chat_history: ['search', 'page', 'earlier work', 'quoted', 'stale', 'library'],
       web_search: ['search', 'titles', 'urls', 'snippets', 'web_fetch'],
       web_fetch: ['fetch', 'url', 'readable extracted text'],
-      browser: ['visible browser tabs', 'observe', 'page_id', 'element_ref', 'untrusted', 'user'],
+      inner_browser: ['visible browser tabs', 'observe', 'page_id', 'element_ref', 'untrusted', 'user'],
       office_review: ['validate', 'render', 'check_and_render', 'pages'],
       generate_image: ['generate', 'image', 'prompt', 'output_path', 'reference'],
       generate_speech: ['narration', 'text', 'output_path', 'target_duration'],
@@ -700,4 +727,15 @@ describe('isToolVisibleToAgent (ownerAgent gate)', () => {
     expect(isToolVisibleToAgent('image_studio', '79df9cc89f5f')).toBe(false);
     expect(isToolVisibleToAgent('video_studio', '814b61b027f0')).toBe(false);
   });
+});
+
+it('keeps first-party provider roots compatible with object-only function interfaces', () => {
+  for (const tool of [...enumerateAllInjectedTools(), ...enumerateRuntimeSchemaTools()]) {
+    const schema = toToolDefinition(tool).inputSchema;
+    expect(schema.type, tool.name).toBe('object');
+    expect(JSON.stringify(schema), tool.name).not.toMatch(/"(?:oneOf|anyOf)":/);
+    for (const key of ['oneOf', 'anyOf', 'allOf', 'not', 'const', 'enum']) {
+      expect(schema, `${tool.name}: ${key}`).not.toHaveProperty(key);
+    }
+  }
 });

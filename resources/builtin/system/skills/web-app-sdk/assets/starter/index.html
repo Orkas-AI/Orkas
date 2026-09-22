@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Text notebook</title>
+  <script src="/__orkas/sdk.js"></script>
+  <style>
+    body { max-width: 48rem; margin: 2rem auto; padding: 0 1rem; font: 16px system-ui; }
+    textarea { width: 100%; min-height: 9rem; box-sizing: border-box; }
+    button { margin: .6rem .3rem .6rem 0; padding: .6rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1 data-label="title">Text notebook</h1>
+  <label data-label="draft" for="draft">Text to summarize</label>
+  <textarea id="draft"></textarea>
+  <div>
+    <button id="open" disabled>Open text file</button>
+    <button id="save" disabled>Save draft</button>
+    <button id="generate" disabled>Summarize</button>
+    <button id="cancel" disabled>Cancel generation</button>
+    <button id="export" disabled>Export result</button>
+  </div>
+  <aside role="note" data-label="note">Selected files are read-only. Export creates a new file.</aside>
+  <p id="status" role="status">Connecting to Orkas…</p>
+  <pre id="output" aria-label="Summary"></pre>
+  <script>
+    const api = window.orkasApp;
+    const draft = document.querySelector('#draft');
+    const output = document.querySelector('#output');
+    const status = document.querySelector('#status');
+    const buttons = Object.fromEntries(['open','save','generate','cancel','export'].map(id => [id, document.getElementById(id)]));
+    const labels = {
+      "en": [
+        "Text notebook",
+        "Text to summarize",
+        "Open text file",
+        "Save draft",
+        "Summarize",
+        "Cancel generation",
+        "Export result",
+        "Summary",
+        "Selected files are read-only. Export creates a new file."
+      ],
+      "zh": [
+        "文本笔记",
+        "要总结的文本",
+        "打开文本文件",
+        "保存草稿",
+        "总结",
+        "取消生成",
+        "导出结果",
+        "摘要",
+        "所选文件只读。导出会创建新文件。"
+      ],
+      "ja": [
+        "テキストノート",
+        "要約するテキスト",
+        "テキストファイルを開く",
+        "下書きを保存",
+        "要約",
+        "生成をキャンセル",
+        "結果をエクスポート",
+        "要約結果",
+        "選択したファイルは読み取り専用です。エクスポートで新しいファイルを作成します。"
+      ],
+      "pt": [
+        "Bloco de notas",
+        "Texto para resumir",
+        "Abrir arquivo de texto",
+        "Salvar rascunho",
+        "Resumir",
+        "Cancelar geração",
+        "Exportar resultado",
+        "Resumo",
+        "Arquivos selecionados são somente leitura. A exportação cria um novo arquivo."
+      ]
+    };
+    const messages = {
+      "zh": {
+        "Permission denied. You can try again when ready.": "权限被拒绝。准备好后可以重试。",
+        "Cancelled. A model request may already have consumed tokens.": "已取消。模型请求可能已经消耗 token。",
+        "This session ended. Close and reopen the app.": "此会话已结束，请关闭并重新打开应用。",
+        "Open this app inside Orkas.": "请在 Orkas 中打开此应用。",
+        "Configure a model in Orkas, then reopen this app.": "请在 Orkas 中配置模型，然后重新打开应用。",
+        "Action failed. Check the input or choose a new export filename before trying again.": "操作失败。请检查输入或选择新的导出文件名后重试。",
+        "File selection cancelled.": "已取消文件选择。",
+        "File loaded. The original is unchanged.": "文件已加载，原文件未修改。",
+        "Draft saved.": "草稿已保存。",
+        "Enter some text first.": "请先输入文本。",
+        "Waiting for model output…": "正在等待模型输出…",
+        "Incomplete: output token limit reached.": "未完成：已达到输出 token 上限。",
+        "Summary ready.": "摘要已生成。",
+        "Export saved.": "导出已保存。",
+        "Export cancelled.": "已取消导出。",
+        "Ready. Model use may incur charges.": "已就绪。使用模型可能收费。",
+        "Ready for files and drafts. Configure a model in Orkas, then reopen to summarize.": "可以使用文件和草稿。请在 Orkas 中配置模型并重新打开应用后进行总结。",
+        "Preview: temporary drafts only; file dialogs and models are unavailable.": "预览：仅临时草稿可用，文件对话框和模型不可用。"
+      },
+      "ja": {
+        "Permission denied. You can try again when ready.": "許可されませんでした。準備ができたら再試行できます。",
+        "Cancelled. A model request may already have consumed tokens.": "キャンセルしました。モデルが既にトークンを消費した可能性があります。",
+        "This session ended. Close and reopen the app.": "セッションが終了しました。アプリを開き直してください。",
+        "Open this app inside Orkas.": "Orkas 内でこのアプリを開いてください。",
+        "Configure a model in Orkas, then reopen this app.": "Orkas でモデルを設定してからアプリを開き直してください。",
+        "Action failed. Check the input or choose a new export filename before trying again.": "操作に失敗しました。入力を確認するか、新しい出力ファイル名で再試行してください。",
+        "File selection cancelled.": "ファイル選択をキャンセルしました。",
+        "File loaded. The original is unchanged.": "ファイルを読み込みました。元ファイルは変更していません。",
+        "Draft saved.": "下書きを保存しました。",
+        "Enter some text first.": "先にテキストを入力してください。",
+        "Waiting for model output…": "モデル出力を待っています…",
+        "Incomplete: output token limit reached.": "未完了：出力トークンの上限に達しました。",
+        "Summary ready.": "要約ができました。",
+        "Export saved.": "エクスポートを保存しました。",
+        "Export cancelled.": "エクスポートをキャンセルしました。",
+        "Ready. Model use may incur charges.": "準備完了。モデル利用には料金が発生する場合があります。",
+        "Ready for files and drafts. Configure a model in Orkas, then reopen to summarize.": "ファイルと下書きを利用できます。要約するには Orkas でモデルを設定して開き直してください。",
+        "Preview: temporary drafts only; file dialogs and models are unavailable.": "プレビュー：一時下書きのみ。ファイル選択とモデルは利用できません。"
+      },
+      "pt": {
+        "Permission denied. You can try again when ready.": "Permissão negada. Tente novamente quando quiser.",
+        "Cancelled. A model request may already have consumed tokens.": "Cancelado. A solicitação pode já ter consumido tokens.",
+        "This session ended. Close and reopen the app.": "Esta sessão terminou. Feche e reabra o app.",
+        "Open this app inside Orkas.": "Abra este app dentro do Orkas.",
+        "Configure a model in Orkas, then reopen this app.": "Configure um modelo no Orkas e reabra este app.",
+        "Action failed. Check the input or choose a new export filename before trying again.": "Falha na ação. Confira a entrada ou escolha um novo nome de exportação e tente novamente.",
+        "File selection cancelled.": "Seleção de arquivo cancelada.",
+        "File loaded. The original is unchanged.": "Arquivo carregado. O original não foi alterado.",
+        "Draft saved.": "Rascunho salvo.",
+        "Enter some text first.": "Digite algum texto primeiro.",
+        "Waiting for model output…": "Aguardando a resposta do modelo…",
+        "Incomplete: output token limit reached.": "Incompleto: limite de tokens de saída atingido.",
+        "Summary ready.": "Resumo pronto.",
+        "Export saved.": "Exportação salva.",
+        "Export cancelled.": "Exportação cancelada.",
+        "Ready. Model use may incur charges.": "Pronto. Usar o modelo pode gerar custos.",
+        "Ready for files and drafts. Configure a model in Orkas, then reopen to summarize.": "Arquivos e rascunhos disponíveis. Configure um modelo no Orkas e reabra para resumir.",
+        "Preview: temporary drafts only; file dialogs and models are unavailable.": "Prévia: apenas rascunhos temporários; diálogos de arquivo e modelos indisponíveis."
+      }
+    };
+    let language = 'en';
+    const t = text => messages[language]?.[text] || text;
+    function localize(locale) {
+      language = Object.hasOwn(labels, locale) ? locale : 'en';
+      document.documentElement.lang = language;
+      const [title, draftLabel, ...rest] = labels[language];
+      document.title = title;
+      document.querySelector('[data-label="title"]').textContent = title;
+      document.querySelector('[data-label="draft"]').textContent = draftLabel;
+      ['open','save','generate','cancel','export'].forEach((id, i) => { buttons[id].textContent = rest[i]; });
+      output.setAttribute('aria-label', rest[5]);
+      document.querySelector('[role="note"]').textContent = rest[6];
+    }
+    let controller;
+    let methods = [];
+    let busy = false;
+    function refresh() {
+      const names = {open:'files.pick',save:'storage.set',generate:'ai.generate',export:'files.saveAs'};
+      for (const [id, name] of Object.entries(names)) {
+        const method = methods.find(item => item.name === name);
+        buttons[id].disabled = busy || !method || !method.supported || !method.declared || !method.available;
+      }
+      buttons.cancel.disabled = !controller;
+    }
+    async function action(work) {
+      if (busy) return;
+      busy = true; refresh();
+      try { await work(); }
+      catch (error) {
+        const recovery = {
+          E_DENIED:t("Permission denied. You can try again when ready."),
+          E_CANCELLED:t("Cancelled. A model request may already have consumed tokens."),
+          E_CLOSED:t("This session ended. Close and reopen the app."),
+          E_HOST_UNAVAILABLE:t("Open this app inside Orkas."),
+          E_UNAVAILABLE:t("Configure a model in Orkas, then reopen this app.")
+        };
+        status.textContent = recovery[error.code] || t("Action failed. Check the input or choose a new export filename before trying again.") + " (" + (error.code || "unknown") + ")";
+      }
+      finally { controller = null; busy = false; refresh(); }
+    }
+    buttons.open.onclick = () => action(async () => {
+      const file = await api.files.pick();
+      if (!file) { status.textContent = t("File selection cancelled."); return; }
+      try {
+        const {text} = await api.files.readText({handle:file.handle});
+        draft.value = text; status.textContent = t("File loaded. The original is unchanged.");
+      } finally { await api.files.release({handle:file.handle}); }
+    });
+    buttons.save.onclick = () => action(async () => {
+      await api.storage.set({key:'draft',value:draft.value,scope:'cloud'});
+      status.textContent = t("Draft saved.");
+    });
+    buttons.generate.onclick = () => action(async () => {
+      if (!draft.value.trim()) { status.textContent = t("Enter some text first."); return; }
+      controller = new AbortController(); refresh(); output.textContent = '';
+      status.textContent = t("Waiting for model output…");
+      const result = await api.ai.generate({prompt:'Summarize this text. Respond in ' + language + ':\n' + draft.value,maxTokens:512}, {
+        signal:controller.signal,onProgress:event => { output.textContent += event.text || ''; }
+      });
+      output.textContent = result.text;
+      status.textContent = result.stopReason === 'max_tokens' ? t("Incomplete: output token limit reached.") : t("Summary ready.");
+    });
+    buttons.cancel.onclick = () => { if (controller) controller.abort(); };
+    buttons.export.onclick = () => action(async () => {
+      const result = await api.files.saveAs({name:'summary.txt',text:output.textContent});
+      status.textContent = result ? t("Export saved.") : t("Export cancelled.");
+    });
+    action(async () => {
+      if (!api) throw Object.assign(new Error(), {code:'E_HOST_UNAVAILABLE'});
+      const context = await api.host.getContext(); localize(context.language);
+      methods = (await api.capabilities.list()).methods;
+      const method = methods.find(item => item.name === 'storage.get');
+      if (method && method.declared && method.available) {
+        const stored = await api.storage.get({key:'draft',scope:'cloud'});
+        if (typeof stored.value === 'string') draft.value = stored.value;
+      }
+      const model = methods.find(item => item.name === 'ai.generate');
+      status.textContent = context.mode === "preview" ? t("Preview: temporary drafts only; file dialogs and models are unavailable.") : model && model.available
+        ? t("Ready. Model use may incur charges.")
+        : t("Ready for files and drafts. Configure a model in Orkas, then reopen to summarize.");
+    });
+  </script>
+</body>
+</html>

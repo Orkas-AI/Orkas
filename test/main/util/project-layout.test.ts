@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import * as paths from '../../../src/main/paths';
 import {
   conversationLayout,
+  cachedChatAttachmentDirForConversation,
   findProjectIdForConversation,
   listCloudSessionToolResultsDirs,
   projectIdForConversationHint,
@@ -33,6 +34,20 @@ afterEach(() => {
 });
 
 describe('project layout conversation ownership', () => {
+  it('offers only a warmed ownership hint to diagnostics and expires global hints', () => {
+    vi.useFakeTimers();
+    const uid = 'layout-diagnostic', cid = 'abc123def456', pid = '123456abcdef';
+    createdUsers.push(uid);
+    expect(cachedChatAttachmentDirForConversation(uid, cid)).toBeNull();
+    projectIdForConversationHint(uid, cid, null);
+    expect(cachedChatAttachmentDirForConversation(uid, cid)).toBe(paths.chatAttachmentDir(uid, cid));
+    vi.advanceTimersByTime(2001);
+    expect(cachedChatAttachmentDirForConversation(uid, cid)).toBeNull();
+    seedProject(uid, pid, [{ conversation_id: cid }]);
+    projectIdForConversationHint(uid, cid, pid);
+    expect(cachedChatAttachmentDirForConversation(uid, cid)).toBe(paths.projectChatAttachmentDir(uid, pid, cid));
+  });
+
   it('treats an explicit null hint as global without falling back to project indexes', () => {
     const uid = 'layout-explicit-global';
     const cid = 'abcdef123456';

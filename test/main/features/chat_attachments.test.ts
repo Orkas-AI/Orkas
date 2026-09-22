@@ -57,6 +57,48 @@ async function makePng(color = 0xAACCEEFF): Promise<Buffer> {
   return await img.getBuffer('image/png');
 }
 
+describe('chat_attachments › legacy spreadsheet input', () => {
+  it('uploads XLS unchanged, exposes it to the model, and lazily reads both sheets', async () => {
+    const bytes = fs.readFileSync(path.join(__dirname, '../../fixtures/xls/inventory.xls'));
+    const m = await loadMod();
+    expect(await m.uploadAttachment(UID, CID, 'inventory.XLS', bytes)).toMatchObject({ ok: true, info: { kind: 'spreadsheet' } });
+    const manifest = await m.buildAttachmentManifest(UID, CID, ['inventory.XLS']);
+    expect(manifest.manifest).toContain('kind="spreadsheet"');
+    expect(manifest.manifest).not.toContain('model_readable="false"');
+    const indexer = await import('../../../src/main/features/file_indexer');
+    const file = path.join(attDir(), 'inventory.XLS');
+    expect(indexer.getCachedMeta(UID, file)).toBeNull();
+    await indexer.statFile(UID, file);
+    const result = await indexer.readRange(UID, file);
+    expect(result.content).toContain('冷却泵');
+    expect(result.content).toContain('Inventory sentinel 8384');
+    expect(fs.readFileSync(file)).toEqual(bytes);
+    expect((await indexer.readRange(UID, file)).content).toBe(result.content);
+  });
+});
+
+describe('chat_attachments › common text inputs', () => {
+  it.each(['csv', 'tsv', 'html', 'xml', 'jsonl', 'ndjson', 'toml', 'py', 'js', 'css', 'rst', 'tex', 'srt', 'vtt'])(
+    'imports and reads %s as literal UTF-8 without modifying the source', async (ext) => {
+      const m = await loadMod();
+      const name = `input.${ext}`;
+      const text = '<b>中文 & literal</b>\n001,"a,b",0\n';
+      const source = path.join(tmpDir, name);
+      fs.writeFileSync(source, text);
+      expect(await m.importAttachmentFromPath(UID, CID, source)).toMatchObject({ ok: true, info: { kind: 'text' } });
+      const indexer = await import('../../../src/main/features/file_indexer');
+      expect((await indexer.readRange(UID, path.join(attDir(), name))).content).toBe(text);
+      expect(fs.readFileSync(source, 'utf8')).toBe(text);
+      expect(m.resolveAttachmentAbsPath(UID, CID, name).ok).toBe(true);
+    },
+  );
+  it('rejects a binary file disguised as a newly supported text format without storing it', async () => {
+    const m = await loadMod();
+    expect(await m.uploadAttachment(UID, CID, 'input.jsonl', Buffer.from([0xff, 0xfe, 0]))).toMatchObject({ ok: false });
+    expect(m.listAttachments(UID, CID)).toEqual([]);
+  });
+});
+
 describe('chat_attachments › diagnostic privacy', () => {
   async function captureDiagnostics(): Promise<unknown[][]> {
     const logger = await import('../../../src/main/logger');
@@ -242,17 +284,14 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(fs.existsSync(path.join(attDir(), 'oversized-skills.zip'))).toBe(false);
   });
 
-  it('rejects legacy Office binary formats before they enter the attachment pool', async () => {
+  it('rejects legacy Word and PowerPoint before they enter the attachment pool', async () => {
     const m = await loadMod();
     const doc = await m.uploadAttachment(UID, CID, 'old.doc', Buffer.from('legacy'));
-    const xls = await m.uploadAttachment(UID, CID, 'old.xls', Buffer.from('legacy'));
     const ppt = await m.uploadAttachment(UID, CID, 'old.ppt', Buffer.from('legacy'));
 
     expect(doc.ok).toBe(false);
-    expect(xls.ok).toBe(false);
     expect(ppt.ok).toBe(false);
     expect(fs.existsSync(path.join(attDir(), 'old.doc'))).toBe(false);
-    expect(fs.existsSync(path.join(attDir(), 'old.xls'))).toBe(false);
     expect(fs.existsSync(path.join(attDir(), 'old.ppt'))).toBe(false);
   });
 
@@ -922,7 +961,7 @@ describe('chat_attachments › resolveAttachmentAbsPath', () => {
 
   it('refuses non-whitelisted extensions', async () => {
     const m = await loadMod();
-    const r = m.resolveAttachmentAbsPath(UID, CID, 'script.sh');
+    const r = m.resolveAttachmentAbsPath(UID, CID, 'program.exe');
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.code).toBe('bad_input');
@@ -1017,6 +1056,24 @@ describe('chat_attachments › resolveLocalMediaPath', () => {
     expect(r.absPath).toBe(path.resolve(p));
     expect(mod.ALLOWED_EXTENSIONS.has('.svg')).toBe(false);
     fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it.each([
+    ['apng', 'image', 'image/apng'], ['jpe', 'image', 'image/jpeg'],
+    ['jfif', 'image', 'image/jpeg'], ['avif', 'image', 'image/avif'],
+    ['bmp', 'image', 'image/bmp'], ['ico', 'image', 'image/x-icon'],
+    ['oga', 'audio', 'audio/ogg'], ['weba', 'audio', 'audio/webm'],
+  ])('serves local .%s previews with the correct kind, MIME and size limit', async (ext, kind, mime) => {
+    const { mod, sandbox } = await setup();
+    try {
+      const p = path.join(sandbox, `preview.${ext}`);
+      fs.writeFileSync(p, 'fixture');
+      expect(mod.resolveLocalMediaPath(p)).toMatchObject({ ok: true, kind });
+      expect(mod.localMediaMimeFor(p)).toBe(mime);
+      // Sparse files exercise admission without allocating large payloads.
+      fs.truncateSync(p, (kind === 'image' ? 20 : 50) * 1024 * 1024 + 1);
+      expect(mod.resolveLocalMediaPath(p).ok).toBe(false);
+    } finally { fs.rmSync(sandbox, { recursive: true, force: true }); }
   });
 
   it('inlines relative raster references when serving a legacy local SVG', async () => {
@@ -1346,12 +1403,12 @@ describe('chat_attachments › buildAttachmentManifest', () => {
   it('skips legacy Office names if a stale caller tries to build a manifest for them', async () => {
     const m = await loadMod();
 
-    const r = await m.buildAttachmentManifest(UID, CID, ['old.xls']);
+    const r = await m.buildAttachmentManifest(UID, CID, ['old.doc']);
 
     expect(r.manifest).toBe('');
     expect(r.images).toEqual([]);
     expect(r.skipped).toHaveLength(1);
-    expect(r.skipped[0].name).toBe('old.xls');
+    expect(r.skipped[0].name).toBe('old.doc');
     expect(r.skipped[0].reason).toMatch(/unsupported|不支持|未対応/i);
   });
 
@@ -1422,6 +1479,47 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).toMatch(/name="img6\.png"/);
     expect(r.skipped).toEqual([]);
     expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['image'] });
+  });
+
+  it.each([
+    { label: 'small opaque', width: 240, height: 120, transparent: false },
+    { label: 'large transparent', width: 1600, height: 800, transparent: true },
+  ])('preserves reference colors on first delivery and reread for $label images', async ({ width, height, transparent }) => {
+    const { Jimp } = await import('jimp' as any);
+    const source: any = new Jimp({ width, height, color: transparent ? 0x00000000 : 0xFFFFFFFF });
+    // The source palette, not a second production transform, is the oracle.
+    const palette = [0xDC2020FF, 0x20B040FF, 0x2040DCFF];
+    palette.forEach((color, index) => {
+      const patch: any = new Jimp({ width: width / 5, height: height / 2, color });
+      source.composite(patch, Math.floor(width * (index + 0.5) / 4), height / 4);
+    });
+    const png: Buffer = await source.getBuffer('image/png');
+    const m = await loadMod();
+    expect(await m.uploadAttachment(UID, CID, 'reference.png', png)).toMatchObject({ ok: true });
+    const delivered = await m.buildAttachmentManifest(UID, CID, ['reference.png']);
+    expect(delivered.skipped).toEqual([]);
+    expect(delivered.images).toHaveLength(1);
+    const indexer = await import('../../../src/main/features/file_indexer');
+    const reread = await indexer.readImageAsJpeg(UID, path.join(attDir(), 'reference.png'));
+    for (const data of [delivered.images[0].data, reread.base64]) {
+      const decoded: any = await Jimp.read(Buffer.from(data, 'base64'));
+      expect(decoded.bitmap.width).toBe(Math.min(width, 1024));
+      expect(decoded.bitmap.height).toBe(Math.min(height, 512));
+      for (const [index, color] of palette.entries()) {
+        const actual = decoded.getPixelColor(
+          Math.floor(decoded.bitmap.width * ((index + 0.5) / 4 + 0.1)),
+          decoded.bitmap.height / 2,
+        );
+        for (const shift of [24, 16, 8]) {
+          expect(Math.abs(((actual >>> shift) & 0xFF) - ((color >>> shift) & 0xFF))).toBeLessThan(15);
+        }
+      }
+      // Transparent backgrounds must still flatten onto white for JPEG.
+      const background = decoded.getPixelColor(5, 5);
+      for (const shift of [24, 16, 8]) expect((background >>> shift) & 0xFF).toBeGreaterThan(240);
+    }
+    expect(fs.readFileSync(path.join(attDir(), 'reference.png'))).toEqual(png);
+    expect(fs.readdirSync(attDir())).toEqual(['reference.png']);
   });
 
   it('skips missing files gracefully', async () => {

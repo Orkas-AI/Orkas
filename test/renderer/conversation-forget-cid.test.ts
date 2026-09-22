@@ -32,6 +32,8 @@ describe('conversation › _forgetCidRecipient', () => {
       setGroupConversationBusy: vi.fn(),
       _latestInFlight: new Map([['c1', 1]]),
       _latestActiveTurns: new Map([['c1', 1]]),
+      _liveDisplayWatermarks: new Map([['c1', 1], ['c2', 2]]),
+      _offViewLiveDisplayDirty: new Set(['c1', 'c2']),
       _conversationInfoFileRefreshTimers: new Map(),
       clearTimeout,
       _quotesByCid: new Map([['c1', 1]]),
@@ -45,6 +47,8 @@ describe('conversation › _forgetCidRecipient', () => {
 
     forget('c1');
     expect(globals.window.CliAsyncInput.forget).toHaveBeenCalledExactlyOnceWith('c1');
+    expect([...globals._liveDisplayWatermarks]).toEqual([['c2', 2]]);
+    expect([...globals._offViewLiveDisplayDirty]).toEqual(['c2']);
 
     expect(globals._serverFloorRevisionByCid.has('c1')).toBe(false);
     expect(globals._serverFloorRevisionByCid.get('c2')).toBe(1);

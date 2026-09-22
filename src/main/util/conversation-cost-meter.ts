@@ -12,12 +12,11 @@
  * price by model; it only catches the pathological "this single task burned a
  * huge amount" case.
  *
- * Accumulation happens at the model-run chokepoint (model/core-agent/client.ts),
- * the only place that sees EVERY run — top-level, commander, agents, and the
- * in-process nested/anonymous workers. Reset happens on each new USER message (a
- * fresh task gets a fresh allowance). Lives in util/ so both the model layer
- * (recorder) and the group-chat feature (enforcer) can use it without a
- * dependency-direction violation. Pure in-memory; nothing is persisted.
+ * Each native provider request records usage when it settles, and subsequent
+ * requests check this same meter (including retries and nested workers with a
+ * cid). The group-chat admission gate also stops queued runs. New USER messages
+ * reset the allowance; CLI usage is outside this backstop. Pure in-memory, with
+ * no task identity, per-agent allocation or persistence.
  */
 
 /** Default per-task ceiling (input+output tokens). Generous on purpose — far
@@ -36,7 +35,7 @@ function resolveMaxTaskTokens(): number {
 // cid → cumulative in+out tokens for the current task.
 const _taskTokens = new Map<string, number>();
 
-/** Record one model run's token usage against a conversation's current task.
+/** Record one model request's token usage against a conversation's current task.
  *  No-op without a cid (anonymous/reflection/memory sessions that don't belong
  *  to a user conversation). Uses input+output as the cost proxy: cache-read
  *  tokens are ~10% the price, so excluding them keeps the meter aligned with

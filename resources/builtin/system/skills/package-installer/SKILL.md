@@ -1,7 +1,7 @@
 ---
 name: package-installer
-description_zh: "把用户提供的 GitHub 仓库或本地 Git 目录安装、更新或移除为 Orkas 外部包，并接入其中的 Skill 或命令行工具；用于安装或连接项目/包，不用于创建或导入自定义 Skill。"
-description_en: "Install, update, or remove a user-supplied GitHub repository or local Git directory as an Orkas external package, exposing its Skills or CLI tools. Use for installing or connecting a project or package; not for creating or importing a custom Skill."
+description_zh: "安装、更新或移除用户提供的 GitHub 仓库或本地 Git 目录，将其中的 Skill 或 CLI 接入为 Orkas 外部包；不用于创建或导入自定义 Skill。"
+description_en: "Install, update or remove supplied GitHub repositories or local Git directories as Orkas external packages with Skills or CLIs; not custom Skill creation or import."
 category: "general"
 ---
 

@@ -4,6 +4,8 @@ import * as crypto from 'node:crypto';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { BrowserWindow as ElectronBrowserWindow, NativeImage as ElectronNativeImage } from 'electron';
 
@@ -12,6 +14,7 @@ import { sha256OfFileStream } from '../util/sha256';
 import { versionedChatMediaLocalUrl } from '../util/chat-media-url';
 import { redactPaths } from '../util/redact';
 import { logErrorSummary } from '../util/log-redact';
+import { isPathAllowed } from '../util/path-sandbox';
 import { createLogger } from '../logger';
 import { writeJson } from '../storage';
 import { prepareProducedFileForInput } from './produced_output_hooks';
@@ -87,7 +90,9 @@ const COMPOSITION_CAPTURE_TIMEOUT_MS = Number(process.env.ORKAS_VIDEO_STUDIO_CAP
 const COMPOSITION_RENDER_FRAME_TIMEOUT_MS = Number(process.env.ORKAS_VIDEO_STUDIO_RENDER_FRAME_TIMEOUT_MS) || 20_000;
 
 export type VideoStudioOp =
+  | 'reference.inspect'
   | 'production.status'
+  | 'production.edit'
   | 'production.approve_plan'
   | 'production.approve_generation'
   | 'production.segment_qa'
@@ -582,7 +587,8 @@ export function buildRenderReuseKey(input: {
   format: string | undefined;
 }): string {
   const canonical = JSON.stringify({
-    v: 1,
+    // Pre-offscreen captures can contain pixels from the previous scene.
+    v: 2,
     visual_signature: input.visualSignature,
     windows: input.windows.map((window) => [window.id, window.start, window.duration]),
     width: input.width,
@@ -1247,9 +1253,17 @@ export async function prepareComposition(p: CompositionOptions): Promise<VideoSt
       next_allowed_ops: ['composition.prepare'],
     };
   }
+  const contract = prepared.manifest
+    ? manifestAsDesignContract(prepared.manifest, (await loadDesignContract(p.compositionDirAbs)).value)
+    : (await loadDesignContract(p.compositionDirAbs)).value;
+  const referenceAuthoring = await writeReferenceFrames({
+    compositionDirAbs: p.compositionDirAbs, reviewInputs: contract,
+    purpose: 'authoring', signal: p.signal,
+  });
   return {
     ok: true,
     op: 'composition.prepare',
+    ...(referenceAuthoring ? { reference_authoring: referenceAuthoring } : {}),
     status: 'passed',
     stage: 'manifest',
     manifest_path: prepared.manifest_path,
@@ -1493,6 +1507,7 @@ export async function withVideoStudioTimeout<T>(
  * inspect, snapshot, audio-only track reuse) is deliberately not gated. */
 let compositionRenderSlotTail: Promise<void> = Promise.resolve();
 const RENDER_SLOT_WAIT_PROGRESS_INTERVAL_MS = 30_000;
+const softwareOnscreenCompositionWindows = new WeakSet<ElectronBrowserWindow>();
 
 export async function acquireCompositionRenderSlot(input: {
   signal?: AbortSignal;
@@ -1540,8 +1555,13 @@ async function withCompositionWindow<T>(
   fn: (win: ElectronBrowserWindow) => Promise<T>,
 ): Promise<T> {
   const electron = await import('electron');
-  const { BrowserWindow, session } = electron;
+  const { BrowserWindow, session, app } = electron;
   if (!BrowserWindow) throw new Error('Electron BrowserWindow unavailable');
+  const observedGpuMode = await observeElectronGpuMode();
+  const softwareRendering = observedGpuMode === 'software'
+    || app.commandLine.hasSwitch('disable-gpu')
+    || process.argv.includes('--disable-gpu');
+  const useOffscreenPainting = !(process.platform === 'win32' && softwareRendering);
   const partition = `video-studio-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const ses = session.fromPartition(partition);
   ses.webRequest.onBeforeRequest((details, callback) => {
@@ -1562,8 +1582,14 @@ async function withCompositionWindow<T>(
     backgroundColor: '#000000',
     webPreferences: hardenedWebPreferences({
       session: ses,
+      // Offscreen painting fixes stale hidden-window captures on hardware and
+      // macOS software compositors. Windows software compositing has the
+      // inverse defect: its offscreen surface retains the prior scene while a
+      // hidden on-screen surface tracks timeline seeks correctly.
+      offscreen: useOffscreenPainting,
     }),
   });
+  if (!useOffscreenPainting) softwareOnscreenCompositionWindows.add(win);
   try {
     // Electron centers new Windows/Linux windows within the display work
     // area, which can shrink even a useContentSize window (1920x1080 became
@@ -1766,6 +1792,11 @@ new Promise((resolve) => requestAnimationFrame(() => {
 `, true), COMPOSITION_SCRIPT_TIMEOUT_MS, 'E_COMPOSITION_PAINT_TIMEOUT', 'composition paint did not settle before capture.', () => {
     try { win.destroy(); } catch { /* best effort */ }
   });
+  // On Windows the software compositor needs an on-screen backing surface and
+  // a short post-RAF grace period before capturePage observes its invalidation.
+  if (softwareOnscreenCompositionWindows.has(win)) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 }
 
 /** How many times a capture may be retaken when the pixels contradict the DOM.
@@ -3211,7 +3242,8 @@ export function buildSceneSegmentKey(input: {
   format: string | undefined;
 }): string {
   return crypto.createHash('sha256').update(JSON.stringify({
-    v: 2,
+    // Do not assemble segments captured by the old on-screen compositor.
+    v: 3,
     scene: input.sceneId,
     window: [input.window.start, input.window.duration],
     frames: input.frameRange,
@@ -3367,6 +3399,7 @@ async function renderSceneSegmentIntoCache(input: {
       if (p.signal?.aborted) throw new Error('render aborted');
       const t = Math.min(frame / fps, Math.max(0, meta.durationSec - 0.001));
       await seek(win, t);
+      await settleCompositionPaint(win);
       const plan = planByFrame.get(frame);
       const semanticEvidence = plan ? await readFrameSemanticEvidence(win) : null;
       const capturedImage = await withVideoStudioTimeout(
@@ -4076,6 +4109,215 @@ export async function writeProductionContactSheet(input: {
   return writeFrameContactSheet(input.outputDirAbs, samples, { labelOnly: true });
 }
 
+/** On-demand source evidence before authoring. Read grants never become write
+ * grants: freeze the source under the composition, then decode only that copy.
+ * No shell, provider, manifest/approval mutation, or semantic verdict is involved. */
+export async function inspectVideoReference(input: {
+  inputAbsPath: string;
+  compositionDirAbs: string;
+  readRoots: readonly string[];
+  writeRoots: readonly string[];
+  sampleTimes?: unknown;
+  signal?: AbortSignal;
+}): Promise<VideoStudioResult> {
+  const fail = (errorCode: string, message: string): VideoStudioResult => ({ ok: false, op: 'reference.inspect', errorCode, message });
+  const base = path.join(input.compositionDirAbs, 'assets', 'references');
+  if (!isPathAllowed(input.inputAbsPath, input.readRoots)) return fail('E_PATH_OUT_OF_SCOPE', 'Reference source is outside the readable scope.');
+  if (!isPathAllowed(base, input.writeRoots)) {
+    return fail('E_PATH_OUT_OF_SCOPE', 'Reference evidence must be written inside the writable workspace.');
+  }
+  const ext = path.extname(input.inputAbsPath).toLowerCase();
+  const demuxer = ({ '.mp4': 'mov', '.mov': 'mov', '.m4v': 'mov', '.webm': 'matroska', '.mkv': 'matroska', '.ogv': 'ogg' } as Record<string, string>)[ext];
+  if (!demuxer) return fail('E_REFERENCE_FORMAT', 'Unsupported reference video container.');
+  const supplied = input.sampleTimes;
+  if (supplied !== undefined && (!Array.isArray(supplied) || supplied.length < 1 || supplied.length > 6
+    || supplied.some(t => typeof t !== 'number' || !Number.isFinite(t) || t < 0)
+    || new Set(supplied).size !== supplied.length)) {
+    return fail('E_REFERENCE_TIMES', 'sample_times must contain one to six distinct non-negative seconds.');
+  }
+  const maxBytes = 256 * 1024 * 1024;
+  const stat = await fs.stat(input.inputAbsPath).catch(() => null);
+  if (!stat?.isFile()) return fail('E_REFERENCE_MISSING', 'Reference video file is unavailable.');
+  if (stat.size > maxBytes) return fail('E_REFERENCE_SIZE', 'Reference inspection supports files up to 256 MiB.');
+  if (input.signal?.aborted) return fail('E_REFERENCE_CANCELLED', 'Reference inspection was cancelled.');
+  const bins = bundledFfmpegPaths();
+  if (!bins.ffmpeg || !bins.ffprobe) return fail('E_REFERENCE_DECODER', 'Bundled video decoder is unavailable.');
+  const timeout = new AbortController();
+  const signal = input.signal ? AbortSignal.any([input.signal, timeout.signal]) : timeout.signal;
+  const timer = setTimeout(() => timeout.abort(), 30_000);
+  timer.unref?.();
+  let dir = '';
+  let completed = false;
+  try {
+    await fs.mkdir(base, { recursive: true });
+    dir = await fs.mkdtemp(path.join(base, 'inspect-'));
+    const source = path.join(dir, `source${ext}`);
+    const hash = crypto.createHash('sha256');
+    let bytes = 0;
+    await pipeline(fss.createReadStream(input.inputAbsPath), new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        bytes += chunk.length;
+        if (bytes > maxBytes) { callback(new Error('reference size limit')); return; }
+        hash.update(chunk);
+        callback(null, chunk);
+      },
+    }), fss.createWriteStream(source, { flags: 'wx' }), { signal });
+    // Explicit demuxer + protocol allow-list excludes disguised playlists and
+    // network indirection. MOV external data references remain disabled.
+    const safeInput = ['-protocol_whitelist', 'file,pipe', '-f', demuxer, '-i', source];
+    const probe = await runProcess(bins.ffprobe, ['-v', 'error', ...safeInput,
+      '-select_streams', 'v:0', '-show_entries', 'stream=width,height,duration:format=duration', '-of', 'json'],
+    { signal, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 });
+    if (signal.aborted) return fail('E_REFERENCE_CANCELLED', 'Reference inspection was cancelled or timed out.');
+    if (probe.code !== 0) return fail('E_REFERENCE_DECODE', 'Reference video could not be decoded.');
+    const metadata = JSON.parse(probe.stdout);
+    const stream = metadata.streams?.[0];
+    const duration = Number(stream?.duration || metadata.format?.duration);
+    const width = Number(stream?.width), height = Number(stream?.height);
+    if (!Number.isFinite(duration) || duration <= 0 || !width || !height) return fail('E_REFERENCE_DECODE', 'Reference has no usable video stream or duration.');
+    const times = (supplied as number[] | undefined) || [0, 0.2, 0.4, 0.6, 0.8, 0.98].map(f => f * duration);
+    if (times.some(t => t >= duration)) return { ...fail('E_REFERENCE_TIMES', 'Requested sample is outside the video duration.'), duration_sec: duration };
+    const samples: Array<Pick<FrameSampleEvidence, 'label' | 'time_seconds' | 'path'>> = [];
+    for (const time of times) {
+      const still = path.join(dir, `frame-${samples.length}.png`);
+      const decoded = await runProcess(bins.ffmpeg, ['-y', '-loglevel', 'error', '-threads', '2', '-ss', String(time), ...safeInput,
+        '-frames:v', '1', '-threads', '2', '-vf', 'scale=960:540:force_original_aspect_ratio=decrease', still],
+      { signal, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 });
+      if (signal.aborted) return fail('E_REFERENCE_CANCELLED', 'Reference inspection was cancelled or timed out.');
+      if (decoded.code !== 0 || !(await fs.stat(still).catch(() => null))?.size) {
+        return fail('E_REFERENCE_DECODE', 'Requested reference frame is unavailable.');
+      }
+      samples.push({ label: `source @ ${time.toFixed(3)}s`, time_seconds: time, path: still });
+    }
+    const contactSheet = await writeFrameContactSheet(dir, samples, { labelOnly: true });
+    if (signal.aborted) return fail('E_REFERENCE_CANCELLED', 'Reference inspection was cancelled or timed out.');
+    completed = true;
+    return { ok: true, op: 'reference.inspect', composition_dir: input.compositionDirAbs,
+      input_path: input.inputAbsPath, source_path: source, reference_path: path.relative(input.compositionDirAbs, source).split(path.sep).join('/'),
+      source_sha256: hash.digest('hex'), bytes, duration_sec: duration, width, height, samples, contact_sheet: contactSheet,
+      evidence_scope: 'Sampled source stills only. Unseen intervals, motion, speech and target-product facts are not established.' };
+  } catch {
+    return fail(signal.aborted ? 'E_REFERENCE_CANCELLED' : 'E_REFERENCE_DECODE',
+      signal.aborted ? 'Reference inspection was cancelled or timed out.' : 'Reference evidence could not be prepared.');
+  } finally {
+    clearTimeout(timer);
+    if (!completed && dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/** Advisory reference evidence, captured from local media at declared anchors.
+ * A paired still can expose palette/layout drift; it cannot certify motion or
+ * similarity. Keep missing evidence explicit without inventing a new QA gate. */
+export async function writeReferenceComparison(input: {
+  compositionDirAbs: string;
+  reviewInputs: unknown;
+  frameEvidence: unknown;
+  evidenceRoots?: readonly string[];
+  signal?: AbortSignal;
+}): Promise<Record<string, unknown> | null> {
+  return writeReferenceFrames({ ...input, purpose: 'comparison' });
+}
+
+/** Source geometry is input to authoring, not only post-render evidence. Both
+ * paths use the same scoped decoder, anchor selection and bounded sheet. */
+async function writeReferenceFrames(input: {
+  compositionDirAbs: string;
+  reviewInputs: unknown;
+  frameEvidence?: unknown;
+  evidenceRoots?: readonly string[];
+  signal?: AbortSignal;
+  purpose: 'authoring' | 'comparison';
+}): Promise<Record<string, unknown> | null> {
+  const authoring = input.purpose === 'authoring';
+  const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
+  const review = record(input.reviewInputs);
+  const references = Array.isArray(review.references) ? review.references : [];
+  if (!references.length) return null;
+  const evidence = record(input.frameEvidence);
+  const samples = Array.isArray(evidence.samples) ? evidence.samples as FrameSampleEvidence[] : [];
+  const issues: Array<{ reference_id: string; reason: string }> = [];
+  const pairs: Record<string, unknown>[] = [];
+  const cells: Array<Pick<FrameSampleEvidence, 'label' | 'time_seconds' | 'path'>> = [];
+  const deadline = Date.now() + 30_000;
+  const bins = bundledFfmpegPaths();
+  // Unique evidence per call: a failed recapture must never reuse an old sheet.
+  const base = path.join(input.compositionDirAbs, 'preview', authoring ? 'reference-authoring' : 'reference-comparison');
+  if (!isPathAllowed(base, [input.compositionDirAbs])) {
+    return { status: 'unavailable', issues: [{ reason: 'output_out_of_scope' }], pairs: [], attached: false };
+  }
+  await fs.mkdir(base, { recursive: true });
+  const dir = await fs.mkdtemp(path.join(base, 'capture-'));
+  let omitted = 0;
+  for (const raw of references.slice(0, 24)) {
+    const ref = record(raw);
+    const id = String(ref.id || '');
+    const fail = (reason: string) => { if (issues.length < 24) issues.push({ reference_id: id, reason }); };
+    const source = typeof ref.path === 'string' ? ref.path : '';
+    const sourcePath = path.resolve(input.compositionDirAbs, source);
+    if (!source || path.isAbsolute(source) || !isPathAllowed(sourcePath, [input.compositionDirAbs])) {
+      fail('source_out_of_scope'); continue;
+    }
+    const sourceStat = await fs.stat(sourcePath).catch(() => null);
+    if (!sourceStat?.isFile()) { fail('source_missing'); continue; }
+    if (sourceStat.size > 256 * 1024 * 1024) { fail('source_too_large'); continue; }
+    // Only self-contained raster/video files; no playlists, SVG resources or URLs.
+    const demuxer = ({ '.mp4': 'mov', '.mov': 'mov', '.m4v': 'mov', '.mkv': 'matroska', '.webm': 'matroska',
+      '.png': 'png_pipe', '.jpg': 'jpeg_pipe', '.jpeg': 'jpeg_pipe', '.webp': 'webp_pipe' } as Record<string, string>)[path.extname(source).toLowerCase()];
+    if (!demuxer) { fail('unsupported_source'); continue; }
+    const anchors = ref.media_type === 'video'
+      ? (Array.isArray(ref.temporal_anchors) ? ref.temporal_anchors : [])
+      : ref.media_type === 'image' && Array.isArray(ref.target_scene_ids)
+        ? ref.target_scene_ids.map(target_scene_id => ({ target_scene_id })) : [];
+    if (!anchors.length) { fail('anchors_missing'); continue; }
+    for (const rawAnchor of anchors.slice(0, 24)) {
+      if (pairs.length >= 6) { omitted += 1; continue; }
+      const anchor = record(rawAnchor);
+      const scene = String(anchor.target_scene_id || '');
+      const start = Number(anchor.source_start_sec);
+      const end = Number(anchor.source_end_sec);
+      if (!scene || (ref.media_type === 'video' && (!Number.isFinite(start) || start < 0 || !Number.isFinite(end) || end <= start))) {
+        fail('anchor_invalid'); continue;
+      }
+      const target = samples.find(sample => sample.expected_scene_id === scene && /mid/i.test(sample.label))
+        || samples.find(sample => sample.expected_scene_id === scene);
+      if (!authoring && (!target || !isPathAllowed(target.path, input.evidenceRoots || [input.compositionDirAbs])
+        || !(await fs.stat(target.path).catch(() => null))?.isFile())) { fail('target_frame_unavailable'); continue; }
+      if (input.signal?.aborted) { fail('cancelled'); break; }
+      if (!bins.ffmpeg || Date.now() >= deadline) { fail(bins.ffmpeg ? 'time_budget_exhausted' : 'decoder_unavailable'); break; }
+      const sourceTime = ref.media_type === 'video' ? (start + end) / 2 : 0;
+      const still = path.join(dir, `source-${pairs.length}.png`);
+      const extracted = await runProcess(bins.ffmpeg, [
+        '-y', '-loglevel', 'error', '-protocol_whitelist', 'file,pipe',
+        ...(ref.media_type === 'video' ? ['-ss', String(sourceTime)] : []),
+        '-f', demuxer, '-i', sourcePath, '-frames:v', '1', '-vf', 'scale=960:540:force_original_aspect_ratio=decrease', still,
+      ], { signal: input.signal, timeoutMs: Math.max(1, Math.min(10_000, deadline - Date.now())), maxOutputBytes: 64 * 1024 });
+      if (extracted.code !== 0 || !(await fs.stat(still).catch(() => null))?.isFile()) {
+        fail(extracted.aborted ? 'cancelled' : 'source_frame_unavailable'); continue;
+      }
+      pairs.push({ reference_id: id, source_path: sourcePath, source_time_sec: sourceTime,
+        source_frame: still, target_scene_id: scene,
+        ...(!authoring && target ? { target_time_sec: target.time_seconds, target_frame: target.path } : {}),
+        intent: ref.intent || 'guide', roles: ref.roles || [], preserve: ref.preserve || [], may_change: ref.may_change || [] });
+      cells.push({ path: still, time_seconds: sourceTime, label: `${id} @ ${sourceTime}s → ${scene}` });
+      if (!authoring && target) cells.push({ ...target, label: `${scene} target @ ${target.time_seconds}s` });
+    }
+    omitted += Math.max(0, anchors.length - 24);
+  }
+  omitted += Math.max(0, references.length - 24);
+  let contactSheet = '';
+  if (cells.length) {
+    try { contactSheet = await writeFrameContactSheet(dir, cells, { labelOnly: true, columns: 2 }); }
+    catch { issues.push({ reference_id: '', reason: 'comparison_sheet_unavailable' }); }
+  }
+  return { status: contactSheet ? (issues.length || omitted ? 'partial' : 'available') : 'unavailable',
+    contact_sheet: contactSheet, pairs, issues, omitted, attached: false,
+    reference_fidelity: review.reference_fidelity || null,
+    evidence_scope: authoring
+      ? 'Source stills at planned anchors for scene authoring; labels map source times to target scenes. Unseen motion is not established.'
+      : 'Paired source/target stills only; motion and semantic fidelity require visual review, not a native QA pass.' };
+}
+
 export async function renderComposition(p: CompositionOptions): Promise<VideoStudioResult> {
   const loaded = await loadCompositionMeta(p.compositionDirAbs);
   if (!loaded.meta) {
@@ -4198,19 +4440,9 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
         if (p.signal?.aborted) throw new Error('render aborted');
         const t = frame / fps;
         await seek(win, Math.min(t, Math.max(0, loaded.meta!.durationSec - 0.001)));
-        if (frame === 0) {
-          // The first capture races the compositor: seek(0) applies the
-          // scene-reveal styles, but capturePage returns the last composited
-          // frame, and nothing has painted since the window loaded with every
-          // scene scaffold-hidden. The snapshot path settles before every
-          // capture and its frame 0 passes; this loop skipped settling for
-          // throughput and its frame 0 captured the pre-reveal state — a
-          // blank opening at background luminance on an HTML whose snapshot
-          // had just passed QA (2026-08-07). Later frames are safe: each
-          // capture composites the previous frame's already-painted state,
-          // one frame apart at most. Only the first needs the explicit wait.
-          await settleCompositionPaint(win);
-        }
+        // Every encoded frame must paint at its requested time, including
+        // scene boundaries; a previous-scene bitmap can be nonblank and pass QA.
+        await settleCompositionPaint(win);
         const sample = sampleByFrame.get(frame);
         const semanticEvidence = sample ? await readFrameSemanticEvidence(win) : null;
         const captureFrame = async (): Promise<ReturnType<typeof normalizeCapturedFrame>> => {
@@ -4539,6 +4771,10 @@ function startRawFrameEncoder(opts: FrameEncoderOptions): {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let settled = false;
+  let terminating = false;
+  let childClosed = false;
+  let treeCleanupComplete = false;
+  let cleanupTimer: NodeJS.Timeout | null = null;
   let timedOut = false;
   let bytesWritten = 0;
   const stdout: string[] = [];
@@ -4554,6 +4790,7 @@ function startRawFrameEncoder(opts: FrameEncoderOptions): {
     if (settled) return;
     settled = true;
     if (timer) clearTimeout(timer);
+    if (cleanupTimer) clearTimeout(cleanupTimer);
     timer = null;
     opts.signal?.removeEventListener('abort', onAbort);
     if (errorMessage) stderr.push(errorMessage);
@@ -4566,17 +4803,27 @@ function startRawFrameEncoder(opts: FrameEncoderOptions): {
     });
   };
   const terminate = () => {
-    try { killProcessTree(child, 'SIGKILL'); } catch { /* best effort */ }
+    if (terminating || settled) return;
+    terminating = true;
+    cleanupTimer = setTimeout(() => {
+      settle(-1, 'FFmpeg process cleanup did not confirm exit within 10 seconds.');
+    }, 10_000);
+    const complete = () => {
+      treeCleanupComplete = true;
+      if (!child.stdin.destroyed) child.stdin.destroy();
+      if (childClosed) settle(-1);
+    };
+    // Closing stdin first lets FFmpeg exit before Windows can identify its
+    // process tree. Keep the pipe open until the bounded tree cleanup completes.
+    try { killProcessTree(child, 'SIGKILL', { onComplete: complete }); }
+    catch { complete(); }
   };
   const onAbort = () => {
-    if (!child.stdin.destroyed) child.stdin.destroy();
     terminate();
-    settle(-1);
   };
   timer = setTimeout(() => {
     timedOut = true;
     terminate();
-    settle(-1);
   }, RENDER_TIMEOUT_MS);
   timer.unref?.();
   opts.signal?.addEventListener('abort', onAbort, { once: true });
@@ -4585,11 +4832,15 @@ function startRawFrameEncoder(opts: FrameEncoderOptions): {
   child.stderr?.on('data', (chunk: Buffer) => appendBounded(stderr, chunk));
   child.stdin?.on('error', () => { /* write callbacks surface EPIPE to the render loop */ });
   child.on('error', (err: Error) => settle(-1, err.message));
-  child.on('close', (code) => settle(code));
+  child.on('close', (code) => {
+    childClosed = true;
+    if (!terminating) settle(code);
+    else if (treeCleanupComplete) settle(-1);
+  });
 
   return {
     writeFrame: (bitmap: Buffer) => new Promise<void>((resolve, reject) => {
-      if (settled || child.stdin.destroyed || !child.stdin.writable) {
+      if (settled || terminating || child.stdin.destroyed || !child.stdin.writable) {
         reject(new Error('ffmpeg frame pipe closed before all frames were written.'));
         return;
       }
@@ -4600,17 +4851,11 @@ function startRawFrameEncoder(opts: FrameEncoderOptions): {
       });
     }),
     finish: async () => {
-      if (!child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.end();
+      if (!terminating && !child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.end();
       return done;
     },
     wait: () => done,
-    cancel: () => {
-      if (!child.stdin.destroyed) child.stdin.destroy();
-      if (!settled) {
-        terminate();
-        settle(-1);
-      }
-    },
+    cancel: terminate,
     bytesWritten: () => bytesWritten,
   };
 }
@@ -5408,6 +5653,8 @@ export function buildSpeechTranscribeArgs(
   const timestampDetail = options.timestamps === 'word' ? 'word' : 'segment';
   const args = ['-m', modelPath, '-f', wavPath, timestampDetail === 'word' ? '-ojf' : '-oj', '-of', outBase, '-np'];
   args.push('-l', options.language?.trim() || 'auto');
+  // Match offline audio projects: the bundled Intel macOS Metal path can corrupt recognition.
+  if (process.platform === 'darwin' && process.arch === 'x64') args.push('-ng');
   if (timestampDetail === 'word') {
     const dtwModel = whisperDtwModel(modelPath);
     if (dtwModel) args.push('-dtw', dtwModel);

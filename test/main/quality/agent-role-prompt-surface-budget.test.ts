@@ -22,10 +22,12 @@ const AGENT_PROMPT = path.join(
 // owner in shared rules, so its removed role-local copy releases this budget.
 // 2026-09-08: the memory "when to write" rule moved to the tool contract
 // (single owner), releasing ~250 characters; the ceiling follows the surface.
-const WHOLE_PROMPT_CEILING = 6_600;
-// Destinations, hand-off, and the success claim stay resident; the durability
-// decision is owned by the `cross_session_memory` description (2026-09-08).
-const MEMORY_SECTION_CEILING = 560;
+// Shared retrieval owns the trigger; removing the stale shared-history
+// compaction claim and duplicate routing prose releases another 82 characters.
+const WHOLE_PROMPT_CEILING = 6_500;
+// The tool owns durability, destinations and write permissions. The role keeps
+// scope preservation and the success claim; generic mechanics own handback.
+const MEMORY_SECTION_CEILING = 340;
 
 function section(body: string, heading: string): string {
   const start = body.indexOf(`## ${heading}`);
@@ -50,9 +52,10 @@ describe('group Agent resident role prompt surface', () => {
     const body = fs.readFileSync(AGENT_PROMPT, 'utf8');
     const memory = section(body, 'Cross-session memory');
     expect(memory.length).toBeLessThanOrEqual(MEMORY_SECTION_CEILING);
-    expect(memory).toMatch(/Use `agent` for a convention limited to this Agent/i);
-    expect(memory).toMatch(/use `user` for a preference meant across Agents/i);
-    expect(memory).toMatch(/choose other destinations from the tool contract/i);
+    expect(memory).toMatch(/tool contract owns durability, destination, and write permissions/i);
+    expect(memory).toMatch(/Preserve the intended scope/i);
+    expect(memory).not.toMatch(/use `(?:agent|user|shared)`/i);
+    expect(memory).not.toContain('<handback');
     expect(memory).not.toMatch(/`target: "(?:agent|user|shared|project)"`\s*=/i);
   });
 

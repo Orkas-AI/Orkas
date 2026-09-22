@@ -4,6 +4,17 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import AdmZip from 'adm-zip';
 
+// Each case resets modules and deletes its workspace. Keep diagnostics visible
+// without starting file-log workers that can recreate that workspace at teardown.
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: (scope: string) => ({
+    debug: (...args: unknown[]) => console.debug(`[${scope}]`, ...args),
+    info: (...args: unknown[]) => console.info(`[${scope}]`, ...args),
+    warn: (...args: unknown[]) => console.warn(`[${scope}]`, ...args),
+    error: (...args: unknown[]) => console.error(`[${scope}]`, ...args),
+  }),
+}));
+
 // skills.ts pulls path constants + the module-level _skillListCache at load.
 // Reset ORKAS_WORKSPACE_ROOT + module graph per test for isolation.
 
@@ -1458,6 +1469,7 @@ describe('skills › createFromDir', () => {
         'skills/bad-skill/scripts/run.js',
         Buffer.from('module.exports = async () => ({ ok: true });\n'),
       );
+      zip.addFile('skills/not-a-skill/SKILL.md', Buffer.from('A document renamed to SKILL.md.'));
       zip.writeZip(archive);
 
       const s = await loadSkills();
@@ -1481,6 +1493,8 @@ describe('skills › createFromDir', () => {
         'utf8',
       )).toBe('preserved reference\n');
       expect(fs.existsSync(path.join(customSkillsDir(), 'bad-skill'))).toBe(false);
+      expect(fs.existsSync(path.join(customSkillsDir(), 'not-a-skill'))).toBe(false);
+      expect(result.failures?.some((failure: any) => failure.sourceName === 'not-a-skill')).toBe(true);
     } finally {
       fs.rmSync(srcParent, { recursive: true, force: true });
     }
@@ -1540,6 +1554,57 @@ describe('skills › createFromDir', () => {
       expect(result.ok).toBe(false);
       expect(result.error).toMatch(/SKILL\.md/i);
       expect(fs.existsSync(path.join(customSkillsDir(), 'plain-notes'))).toBe(false);
+    } finally {
+      fs.rmSync(srcParent, { recursive: true, force: true });
+    }
+  });
+
+  it('retains native import compatibility with legacy sidecar descriptions', async () => {
+    const src = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-package-legacy-'));
+    try {
+      fs.writeFileSync(path.join(src, 'SKILL.md'), '---\nname: legacy-package\n---\n# Instructions\nSummarize a document.');
+      fs.writeFileSync(path.join(src, '_meta.json'), JSON.stringify({
+        descriptions: { en: 'A legacy Skill package', zh: '旧版技能包' }, category: 'general',
+      }));
+      const s = await loadSkills();
+      const result = await s.importSkillPackageFromPath(src);
+      expect(result.ok).toBe(true);
+      expect(result.skills?.map((skill: any) => skill.id)).toEqual(['legacy-package']);
+    } finally {
+      fs.rmSync(src, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['plain-text', 'A document renamed to SKILL.md.'],
+    ['empty', ''],
+    ['missing-name', '---\ndescription: A description without Skill identity\n---\nInstructions'],
+    ['missing-description', '---\nname: incomplete-skill\n---\nInstructions'],
+    ['invalid-name', '---\nname: [invalid\ndescription: Malformed identity\n---\nInstructions'],
+    ['unterminated', '---\nname: incomplete-skill\ndescription: Missing closing fence'],
+  ])('rejects non-Skill source metadata before normalization: %s', async (_shape, content) => {
+    const srcParent = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-package-format-'));
+    try {
+      const src = path.join(srcParent, 'incomplete-skill');
+      fs.mkdirSync(src);
+      fs.writeFileSync(path.join(src, 'SKILL.md'), content);
+      const s = await loadSkills();
+      for (const archive of [false, true]) {
+        const zipPath = path.join(srcParent, 'source.zip');
+        if (archive) {
+          const zip = new AdmZip();
+          zip.addFile('incomplete-skill/SKILL.md', Buffer.from(content));
+          zip.writeZip(zipPath);
+        }
+        const result = await s.importSkillPackageFromPath(archive ? zipPath : src);
+        expect(result.ok).toBe(false);
+        expect(result.skills || []).toHaveLength(0);
+        expect(result.failures).toEqual([expect.objectContaining({
+          sourceName: 'incomplete-skill', report: expect.objectContaining({ ok: false }),
+        })]);
+        expect(fs.existsSync(path.join(customSkillsDir(), 'incomplete-skill'))).toBe(false);
+        expect(fs.readFileSync(path.join(src, 'SKILL.md'), 'utf8')).toBe(content);
+      }
     } finally {
       fs.rmSync(srcParent, { recursive: true, force: true });
     }
@@ -2111,7 +2176,7 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
       yield {
         type: 'event',
         event: {
-          stream: 'agent_run_result',
+          stream: 'agent_run_terminal',
           data: {
             result: 'success',
             terminal_status: terminalStatus,
@@ -2131,7 +2196,7 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
     }
 
     expect(events).not.toContainEqual(expect.objectContaining({
-      event: expect.objectContaining({ stream: 'agent_run_result' }),
+      event: expect.objectContaining({ stream: 'agent_run_terminal' }),
     }));
     expect(events).toContainEqual(expect.objectContaining({
       type: 'event',
@@ -2633,3 +2698,110 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
 // (The legacy marketplace-sentinel sync tests are gone. Marketplace installs now live at
 // `<uid>/local/marketplace/skills/<id>/` and are reconciled from
 // the cloud-synced `installs.json` manifest — see features/marketplace_*.ts.)
+
+describe('skills › bounded creation correction', () => {
+  const md = '---\nname: repaired-skill\ndescription: Summarize supplied notes\n---\n\n# Instructions\nRead the supplied notes and summarize them.';
+  const block = (entry = md, extra = '') => `<skill>\n<<<skill-file path=SKILL.md\n${entry}\n>>>\n${extra}\n</skill>`;
+  const note = '<<<skill-file path=notes.txt\nRetain these source notes.\n>>>';
+
+  it('reports structured pre-write failures and preserves an existing file when adding the missing entry', async () => {
+    const s = await loadSkills();
+    const repair = await import('../../../src/main/features/group_chat/skill-creation-correction');
+    const original = s.extractSkillContainers(`<skill>\n${note}\n</skill>`).containers[0];
+    const rejected = await s.applySkillContainerFromCommander(original);
+    expect(rejected).toMatchObject({ ok: false, creationError: 'missing_skill_md' });
+    expect(fs.readdirSync(customSkillsDir())).toEqual([]);
+    expect(repair.skillCreationCorrectionMessage(original, rejected, 'Create a notes Skill')).toContain('missing_skill_md');
+    const result = await repair.applySkillCreationCorrection(block(md, note), original, TEST_UID, new AbortController().signal);
+    expect(result).toMatchObject({ ok: true, kind: 'created', written: ['SKILL.md', 'notes.txt'] });
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'repaired-skill', 'notes.txt'), 'utf8')).toBe('Retain these source notes.');
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'repaired-skill', 'SKILL.md'), 'utf8')).toContain('Read the supplied notes');
+    // A replay encounters the original collision guard, never overwrites.
+    const again = await repair.applySkillCreationCorrection(block(md, note), original, TEST_UID, new AbortController().signal);
+    expect(again?.ok).toBe(false);
+    expect(again?.creationError).toBeUndefined();
+    expect(fs.readdirSync(customSkillsDir())).toEqual(['repaired-skill']);
+  });
+
+  it.each([
+    ['missing name', '---\ndescription: Notes\n---\n# Instructions\nSummarize notes.', 'missing_name'],
+    ['invalid name', '---\nname: bad/name\ndescription: Notes\n---\n# Instructions\nSummarize notes.', 'invalid_name'],
+  ])('corrects %s without allocating a rejected seed', async (_, input, code) => {
+    const s = await loadSkills();
+    const repair = await import('../../../src/main/features/group_chat/skill-creation-correction');
+    const original = s.extractSkillContainers(block(input)).containers[0];
+    const rejected = await s.applySkillContainerFromCommander(original);
+    expect(rejected).toMatchObject({ ok: false, creationError: code });
+    expect(fs.readdirSync(customSkillsDir())).toEqual([]);
+    expect(repair.skillCreationCorrectionMessage(original, rejected, 'Create a notes Skill')).not.toBeNull();
+    expect(await repair.applySkillCreationCorrection(block(), original, TEST_UID, new AbortController().signal))
+      .toMatchObject({ ok: true, skillId: 'repaired-skill' });
+  });
+
+  it.each([
+    ['changed retained file', block(md, note.replace('Retain', 'Discard'))],
+    ['extra file', block(md, note + '\n<<<skill-file path=unexpected.txt\nnew\n>>>')],
+    ['edit target', block(md, note).replace('<skill>', '<skill>\n<skill_id>existing</skill_id>')],
+    ['another Skill', block(md, note) + block(md.replace('repaired-skill', 'another-skill'))],
+    ['Agent mutation', block(md, note) + '<agent><operation>create</operation><name>Unexpected</name></agent>'],
+    ['unsupported path', block(md, note + '\n<<<skill-file path=../escape.txt\nescape\n>>>')],
+    ['case alias', block(md, note + '\n<<<skill-file path=skill.md\n' + md + '\n>>>')],
+    ['file directory conflict', block(md, note + '\n<<<skill-file path=notes.txt/child\nnew\n>>>')],
+    ['invalid corrected entry', block('Still missing frontmatter', note)],
+    ['prose-only refusal', 'Insufficient information to produce a Skill.'],
+  ])('rejects %s before any corrected files are written', async (_, text) => {
+    const s = await loadSkills();
+    const repair = await import('../../../src/main/features/group_chat/skill-creation-correction');
+    const original = s.extractSkillContainers(`<skill>\n${note}\n</skill>`).containers[0];
+    expect(await repair.applySkillCreationCorrection(text, original, TEST_UID, new AbortController().signal)).toBeNull();
+    expect(fs.readdirSync(customSkillsDir())).toEqual([]);
+    expect(fs.existsSync(path.join(tmpDir, TEST_UID, 'cloud', 'escape.txt'))).toBe(false);
+  });
+
+  it.each([
+    ['traversal', '<<<skill-file path=../escape.txt\nescape\n>>>'],
+    ['Windows device', '<<<skill-file path=CON.txt\ndevice\n>>>'],
+    ['case alias', '<<<skill-file path=skill.md\n' + md + '\n>>>'],
+    ['file/directory conflict with a sibling', '<<<skill-file path=notes\nfile\n>>>\n<<<skill-file path=notes-extra\nsibling\n>>>\n<<<skill-file path=notes/child\nchild\n>>>'],
+  ])('rejects %s even when the original file blocks were unparseable', async (_, extra) => {
+    const repair = await import('../../../src/main/features/group_chat/skill-creation-correction');
+    expect(await repair.applySkillCreationCorrection(block(md, extra), { files: [] }, TEST_UID, new AbortController().signal)).toBeNull();
+    expect(fs.readdirSync(customSkillsDir())).toEqual([]);
+  });
+
+  it('repairs a malformed container without replaying its surrounding prose', async () => {
+    const s = await loadSkills();
+    const repair = await import('../../../src/main/features/group_chat/skill-creation-correction');
+    const original = s.extractSkillContainers('<skill>```markdown\n' + md + '\n```</skill>').containers[0];
+    const failure = await s.applySkillContainerFromCommander(original);
+    expect(failure).toMatchObject({ ok: false, creationError: 'container_no_blocks' });
+    expect(repair.skillCreationCorrectionMessage(original, failure, 'Create a notes Skill')).not.toBeNull();
+    expect(await repair.applySkillCreationCorrection(block(), original, TEST_UID, new AbortController().signal))
+      .toMatchObject({ ok: true, skillId: 'repaired-skill' });
+  });
+
+  it('does not offer correction for unsafe files, edits, collisions or oversized requests', async () => {
+    const s = await loadSkills();
+    const repair = await import('../../../src/main/features/group_chat/skill-creation-correction');
+    const unsafe = { files: [{ path: 'scripts/run.py', content: 'eval(input())' }] };
+    expect(repair.skillCreationCorrectionMessage(unsafe, await s.applySkillContainerFromCommander(unsafe), 'Create')).toBeNull();
+    const edit = { skillId: 'missing-target', files: [] };
+    expect(repair.skillCreationCorrectionMessage(edit, await s.applySkillContainerFromCommander(edit), 'Edit')).toBeNull();
+    writeCustomSkill('repaired-skill');
+    const existing = s.extractSkillContainers(block()).containers[0];
+    expect(repair.skillCreationCorrectionMessage(existing, await s.applySkillContainerFromCommander(existing), 'Create')).toBeNull();
+    const original = s.extractSkillContainers(`<skill>\n${note}\n</skill>`).containers[0];
+    expect(repair.skillCreationCorrectionMessage(original, await s.applySkillContainerFromCommander(original), 'x'.repeat(64_000))).toBeNull();
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'repaired-skill', 'SKILL.md'), 'utf8')).toContain('# body');
+  });
+
+  it.each(['cancelled', 'account switched'])('discards a valid correction when %s', async reason => {
+    const repair = await import('../../../src/main/features/group_chat/skill-creation-correction');
+    const controller = new AbortController();
+    if (reason === 'cancelled') controller.abort();
+    else (await import('../../../src/main/features/users')).activateUser('another-account');
+    expect(await repair.applySkillCreationCorrection(block(), { files: [] }, TEST_UID, controller.signal)).toBeNull();
+    expect(fs.readdirSync(customSkillsDir())).toEqual([]);
+    expect(fs.existsSync(path.join(tmpDir, 'another-account', 'cloud', 'skills', 'repaired-skill'))).toBe(false);
+  });
+});

@@ -33,6 +33,8 @@ Read only the relevant artifacts:
 - For fallback review, sampled evidence frames from the draft report: `contact_sheet`, `frame_paths`, first frame, one mid-frame per scene, and payoff/closing frame
 - The approved script only when a finding depends on message intent
 
+For reference fidelity, apply [the preview comparison](../stage-compose/references/render-and-preview.md#reference-comparison) to the observed source and the user's requested changes.
+
 ## Findings Rubric
 
 Tag each finding as `blocker`, `fix`, or `polish`.
@@ -45,7 +47,7 @@ Blockers:
 - Text is unreadable in the supplied evidence frame, hides the approved promise/CTA, or materially blocks comprehension because of size, safe-zone, overlap, occlusion, or contrast.
 - The draft report's `contract_html` step says approved scene copy, canvas, assets, or runtime dependencies do not match the model-authored HTML.
 - Visual language contradicts an explicit style source or ignores required brand tokens.
-- A reference image or video loses a declared preserve axis, changes something outside `may_change`, violates layout/temporal anchors, or misses a requested edit.
+- A reference image or video fails the preview comparison, violates layout/temporal anchors, or misses a requested edit.
 - The piece reads as a slideshow when the approved promise was motion graphics.
 - Motion hides the message, distracts from the focal point, or breaks narration timing.
 - A protected logo/asset/layout was copied without ownership or permission.
@@ -80,12 +82,6 @@ Use `narration-map.json` only to diagnose detailed narration-line alignment. Do 
 
 Do not solve design problems by only nudging pixels. If the issue is "too generic", change the signature device or scene grammar. If the issue is "too dense", remove or split content.
 
-## Output Format
+## Continue after review
 
-Summarize your pass in a few bullets before continuing:
-
-- `blockers`: all concrete locations + evidence + repair, not only the first finding
-- `fixes`: concrete location + repair applied
-- `polish`: optional notes that travel with the Gate D note
-
-Then repair and re-run inspect + snapshot, or — when the frames read well — hand readiness to `gate-control`. There is no score to compute and nothing to submit: quality is judged by what is visibly broken in a specific frame, never by a number.
+Keep the review internal. Repair the collected findings and re-run inspect + snapshot, or — when the frames read well — hand readiness to `gate-control`. There is no score to compute and nothing to submit: quality is judged by what is visibly broken in a specific frame, never by a number.

@@ -385,12 +385,12 @@ function missingScopes(grantedText, required) {
   return required.filter((scope) => !granted.has(scope));
 }
 
-const BROWSER_OAUTH_PROVIDERS = new Set(['ebay', 'etsy', 'mercado_libre', 'taobao_top', 'alibaba_1688', 'jd_jos', 'pinduoduo', 'kuaishou_shop', 'lazada', 'shein', 'alibaba_icbu', 'aliexpress']);
-const SELF_AUTH_PROVIDERS = new Set(['douyin_shop', 'youzan', 'weimob_wos', 'xiaohongshu_ark', 'bigcommerce', 'shopline', 'shoplazza', 'magento', 'temu']);
+const BROWSER_OAUTH_PROVIDERS = new Set(['yahoo_shopping', 'base_shop', 'ebay', 'etsy', 'mercado_libre', 'taobao_top', 'alibaba_1688', 'jd_jos', 'pinduoduo', 'kuaishou_shop', 'lazada', 'shein', 'alibaba_icbu', 'aliexpress']);
+const SELF_AUTH_PROVIDERS = new Set(['rakuten_rms', 'futureshop', 'qoo10_japan', 'douyin_shop', 'youzan', 'weimob_wos', 'xiaohongshu_ark', 'bigcommerce', 'shopline', 'shoplazza', 'magento', 'temu']);
 
 // One URL builder serves the desktop relay and the legacy CLI fallback.
 function authorizationRequest(env, state, verifier) {
-  if (['lazada', 'shein', 'alibaba_icbu', 'aliexpress'].includes(env.provider)) return require('./merchant-platform-api.cjs').authorizeUrl(env, state);
+  if (['yahoo_shopping', 'base_shop', 'lazada', 'shein', 'alibaba_icbu', 'aliexpress'].includes(env.provider)) return require('./merchant-platform-api.cjs').authorizeUrl(env, state);
   const c = env.credentials;
   const redirect_uri = c.redirect_uri;
   let base;

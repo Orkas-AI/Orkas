@@ -1,14 +1,18 @@
 [
   {
     "id": "agent-creator",
-    "update_at": 1788369718929
+    "update_at": 1789463573592
   },
   {
     "id": "package-installer",
-    "update_at": 1786867800000
+    "update_at": 1789463573592
   },
   {
     "id": "skill-creator",
-    "update_at": 1788864369300
+    "update_at": 1789705002665
+  },
+  {
+    "id": "web-app-sdk",
+    "update_at": 1789990251573
   }
 ]

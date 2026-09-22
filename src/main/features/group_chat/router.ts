@@ -447,8 +447,8 @@ export function segmentUserMentions(
 
 import * as crypto from 'node:crypto';
 import {
-  type AgentInput,
-  validateAgentInputs,
+  type ChatFormField,
+  validateChatFormFields,
   type ExtractedFields,
 } from '../agents';
 import { createLogger } from '../../logger';
@@ -463,7 +463,7 @@ export interface ChatFormPayload {
   /** Executor-created user forms use this to bind the form submission to
    *  the exact plan step it is allowed to complete. Agent forms omit it. */
   plan_step_index?: number;
-  fields: AgentInput[];
+  fields: ChatFormField[];
   submitted: boolean;
   values?: Record<string, unknown>;
   submitted_at?: string;
@@ -484,7 +484,7 @@ const FORM_FENCE_RE_LEGACY = /(?:^|\n)```\s*agent[\s\-]*input[\s\-]*form[ \t]*\r
 
 export interface ExtractFormResult {
   cleanText: string;
-  form?: { agent_id: string; fields: AgentInput[] };
+  form?: { agent_id: string; fields: ChatFormField[] };
 }
 
 export type PlanInteractionStatus = 'open' | 'closed';
@@ -526,7 +526,7 @@ export function extractFormFromFinal(text: string, defaultAgentId?: string): Ext
   if (!agentId || !safeId(agentId)) {
     log.warn(`form agent_id invalid: ${JSON.stringify(obj.agent_id)}`); return { cleanText: text };
   }
-  const fields = validateAgentInputs(obj.fields);
+  const fields = validateChatFormFields(obj.fields);
   if (!fields.length) {
     log.warn(`form has no valid fields (agent_id=${agentId})`); return { cleanText: text };
   }
@@ -613,7 +613,7 @@ export function extractPlanInteractionFromFinal(text: string): ExtractPlanIntera
   return status ? { cleanText, status } : { cleanText: text };
 }
 
-export function computeFormId(cid: string, msgId: string, agentId: string, fields: AgentInput[]): string {
+export function computeFormId(cid: string, msgId: string, agentId: string, fields: ChatFormField[]): string {
   const h = crypto.createHash('sha1');
   h.update(cid); h.update('|');
   h.update(msgId); h.update('|');
@@ -650,9 +650,9 @@ export function decodeSubmission(text: string): DecodedSubmission | null {
 /** Format a single submitted value for the human-readable summary that
  *  travels above the XML tag. Optional blanks are intentionally rendered as
  *  empty text, not "(unfilled)", so the user-visible replay mirrors the form. */
-export function formatValueForSummary(field: AgentInput, raw: unknown): string {
+export function formatValueForSummary(field: ChatFormField, raw: unknown): string {
   const fallback = '';
-  if (raw === undefined || raw === null) return fallback;
+  if (raw === undefined || raw === null || raw === '') return fallback;
   if (field.type === 'boolean') return raw === true ? 'yes' : 'no';
   if (field.type === 'select') {
     const opt = (field.options || []).find((o) => o.value === raw);
@@ -678,7 +678,7 @@ export function formatValueForSummary(field: AgentInput, raw: unknown): string {
 }
 
 export function encodeSubmission(
-  form: { form_id: string; agent_id: string; fields: AgentInput[] },
+  form: { form_id: string; agent_id: string; fields: ChatFormField[] },
   values: Record<string, unknown>,
 ): string {
   const summaryLines = form.fields.map((f) => {
@@ -687,6 +687,33 @@ export function encodeSubmission(
   });
   const tag = `<agent-input-submission form_id="${form.form_id}" agent_id="${form.agent_id}">\n${JSON.stringify(values)}\n</agent-input-submission>`;
   return `${summaryLines.join('\n')}\n\n${tag}`;
+}
+
+/** Validate answers against the persisted question, without inventing values
+ * from defaults. False and zero are answers; null/absence are not. */
+export function validateFormAnswers(fields: ChatFormField[], values: Record<string, unknown>): boolean {
+  if (!values || typeof values !== 'object' || Array.isArray(values)) return false;
+  return fields.every(field => {
+    const value = Object.hasOwn(values, field.id) ? values[field.id] : undefined;
+    const empty = value === undefined || value === null
+      || (typeof value === 'string' && !value.trim())
+      || ((field.type === 'multiselect' || (field.type === 'file' && field.multiple))
+        && Array.isArray(value) && value.length === 0);
+    if (empty) return !field.required;
+    switch (field.type) {
+      case 'number': return typeof value === 'number' && Number.isFinite(value)
+        && !(typeof field.min === 'number' && value < field.min)
+        && !(typeof field.max === 'number' && value > field.max);
+      case 'boolean': return typeof value === 'boolean';
+      case 'select': return typeof value === 'string' && !!field.options?.some(o => o.value === value);
+      case 'multiselect': return Array.isArray(value)
+        && value.every(v => typeof v === 'string' && field.options?.some(o => o.value === v));
+      case 'file': return field.multiple
+        ? Array.isArray(value) && value.every(v => typeof v === 'string' && !!v.trim())
+        : typeof value === 'string';
+      default: return typeof value === 'string';
+    }
+  });
 }
 
 // ── Agent-container parser (re-exported from features/agents) ────────────

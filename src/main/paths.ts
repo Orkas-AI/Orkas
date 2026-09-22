@@ -149,6 +149,15 @@ export const artifactDir          = (uid: string, cid: string, artifactId: strin
 export const userSavedAppsDir = (uid: string) => path.join(userCloudRoot(uid), 'saved_apps');
 export const savedAppDir      = (uid: string, appId: string) => path.join(userSavedAppsDir(uid), appId);
 
+// App data in either scope is never served or copied with an immutable bundle.
+export type WebAppStorageScope = 'local' | 'cloud';
+export const webAppSandboxRoot = (uid: string, key: string, scope: WebAppStorageScope) => {
+  if (!/^[a-f0-9]{64}$/.test(key)) throw new Error('invalid app storage key');
+  return path.join(scope === 'cloud' ? userCloudRoot(uid) : userLocalRoot(uid), 'web_apps', key);
+};
+export const webAppDataFile = (uid: string, key: string, scope: WebAppStorageScope = 'local') =>
+  path.join(webAppSandboxRoot(uid, key, scope), 'state.json');
+
 // core-agent session jsonl (LLM-view). Two regions:
 //   cloud/sessions/  — "resumable" kinds: gconv / gmember / skill / agent.
 //     The user (or the system on the user's behalf) may continue these

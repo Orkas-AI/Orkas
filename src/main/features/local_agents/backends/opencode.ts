@@ -3,14 +3,15 @@
  *
  * OpenCode runs through its one-shot NDJSON transport in automatic mode:
  *
- *   opencode run --auto --format json --dir <absolute-cwd> [--session <id>] <prompt>
+ *   opencode run --auto --format json --dir <absolute-cwd> [--session <id>]
  *
  * The run protocol cannot carry an interactive permission decision back to
  * the CLI. Orkas therefore treats this adapter as fixed full access instead
  * of presenting an approval selector that could leave the process blocked.
  *
  * Notes:
- *   - Prompt is passed as the LAST positional argv (NOT stdin).
+ *   - Prompt is sent over stdin, avoiding OS command-line length limits and
+ *     keeping user content out of process arguments.
  *   - The selected project directory is passed explicitly because OpenCode
  *     otherwise prefers an inherited PWD over the process cwd.
  *   - Model selection is left to OpenCode's own configuration.
@@ -72,8 +73,9 @@ const opencodeRunBackend: LocalBackend = {
       lastEventAt: opts.lastEventAt,
     });
 
-    // opencode reads prompt from argv; close stdin so it doesn't wait.
-    child.stdin.end();
+    // Native `run` reads piped input through EOF (including resumed runs).
+    // Do not truncate long history or reinterpret prompt text as CLI options.
+    child.stdin.end(opts.prompt, 'utf8');
 
     const splitter = new LineSplitter();
     child.stdout.setEncoding('utf8');
@@ -217,7 +219,6 @@ export function buildOpencodeArgs(opts: Pick<BackendRunOptions,
   if (opts.customArgs && opts.customArgs.length) {
     args.push(...withoutCustomProjectDir(opts.customArgs));
   }
-  args.push(opts.prompt);
   return args;
 }
 

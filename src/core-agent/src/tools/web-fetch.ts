@@ -352,6 +352,13 @@ export type FetchContentIssue = {
   message: string;
 };
 
+const BOT_CHECK_ISSUE: FetchContentIssue = {
+  code: "WAF_OR_BOT_CHECK",
+  message:
+    "The site returned an anti-bot/WAF challenge instead of readable page content. " +
+    "Do not retry the same web_fetch URL repeatedly; use search snippets, an accessible mirror/official source, or ask the user to provide the page text.",
+};
+
 export function classifyFetchContent(url: string, title: string | undefined, raw: string, text: string): FetchContentIssue | null {
   const head = `${title || ""}\n${raw.slice(0, 6000)}\n${text.slice(0, 3000)}`;
   const compactText = text.replace(/\s+/g, "");
@@ -365,12 +372,7 @@ export function classifyFetchContent(url: string, title: string | undefined, raw
   // covers AWS WAF interstitials ("Verifying your connection...", "Please wait
   // while we verify your browser"), which share no wording with Cloudflare's.
   if (/_waf_[a-z0-9]+|cf-browser-verification|__cf_chl|cf_chl_opt|Attention Required!\s*\|\s*Cloudflare|Cloudflare Ray ID|Checking your browser before access|verif(?:y|ying)\s+(?:your\s+)?(?:browser|connection)|Just a moment\.\.\.|Enable JavaScript and cookies to continue|Verify (?:you are|you're)(?: a)? human|complete the security check|you don'?t have permission to access|人机(?:身份)?验证|安全验证|访问验证|滑动验证|请完成验证|反爬/i.test(head)) {
-    return {
-      code: "WAF_OR_BOT_CHECK",
-      message:
-        "The site returned an anti-bot/WAF challenge instead of readable page content. " +
-        "Do not retry the same web_fetch URL repeatedly; use search snippets, an accessible mirror/official source, or ask the user to provide the page text.",
-    };
+    return BOT_CHECK_ISSUE;
   }
 
   if (/页面不见了|页面找不到了|你访问的页面不见了|内容不存在|该内容已删除|404\s*(?:not found|页面)|page not found/i.test(head)) {
@@ -466,17 +468,32 @@ async function httpFetchPage(url: string, signal?: AbortSignal): Promise<DirectF
       redirect: "follow",
     });
     const body = await readWebFetchResponse(response);
+    // SSE's CDN can return a cookie challenge with HTTP 200 and no readable
+    // body markers. Use its explicit response diagnostic, not the server brand
+    // or a guessed interpretation of the obfuscated JavaScript.
+    const headerChallenge = response.headers.get("x-tengine-error")?.trim().toLowerCase() === "denied by bot"
+      ? BOT_CHECK_ISSUE : null;
     if ("error" in body) {
       const base = body.error.startsWith("HTTP") ? `${body.error} for ${url}` : body.error;
-      // A blocked response only identifies itself as an anti-bot challenge in
-      // its markup, so classify the body before reporting a bare status.
-      const challenge = body.errorBody
+      // Preserve explicit header or markup challenge evidence instead of
+      // reporting only a bare status.
+      const challenge = (body.error.startsWith("HTTP") ? headerChallenge : null) ?? (body.errorBody
         ? classifyFetchContent(url, extractTitle(body.errorBody), body.errorBody, htmlToText(body.errorBody))
-        : null;
+        : null);
       if (!challenge) return { result: { content: base, isError: true }, browserRecoverable: false };
       return {
         result: { content: `${base}\n${challenge.code}: ${challenge.message}`, isError: true },
         browserRecoverable: challenge.code === "WAF_OR_BOT_CHECK",
+      };
+    }
+
+    if (headerChallenge) {
+      return {
+        result: {
+          content: pageHeader({ url: response.url || url }) + `${headerChallenge.code}: ${headerChallenge.message}`,
+          isError: true,
+        },
+        browserRecoverable: true,
       };
     }
 
@@ -633,6 +650,9 @@ export const webFetchTool: AgentTool = defineTool({
       ? fetchCache.get(`github:${githubResource.key}`)
       : undefined;
     if (githubResource && githubResource.kind !== "repository" && priorGitHubSnapshot) {
+      // A pending or failed root fetch is not successful source evidence.
+      const result = await priorGitHubSnapshot.result;
+      if (result.isError) return applyExplicitCharacterLimit(result, maxChars);
       log.info("github repository alias cache hit; skipped network request", {
         repository: githubResource.key,
         requestedKind: githubResource.kind,
@@ -651,7 +671,7 @@ export const webFetchTool: AgentTool = defineTool({
     }
 
     const request = githubResource?.kind === "repository"
-      ? fetchGitHubRepositorySnapshot(githubResource)
+      ? fetchGitHubRepositorySnapshot(githubResource, ctx.signal)
       : fetchGeneralUrl(url, ctx.signal);
     const cacheEntry = { epoch, result: request };
     fetchCache.set(requestKey, cacheEntry);

@@ -8,6 +8,10 @@
  * cache; reconcile happens on first successful reconnect).
  */
 
+import type { Lang } from '../../i18n';
+
+type LocalizedCatalogCopy<Field extends string> = Partial<Record<`${Field}_${Lang}`, string>>;
+
 export type Transport =
   | StdioTransport
   | StreamableHttpTransport;
@@ -197,22 +201,18 @@ export type TransportTemplate =
       oauth_header_key?: string;
     };
 
-export interface CatalogConnectionField {
+export interface CatalogConnectionField extends LocalizedCatalogCopy<'label' | 'help'> {
   key: string;
   input: 'text' | 'secret' | 'choice';
   label_zh: string;
   label_en: string;
-  label_ja?: string;
-  label_pt?: string;
   help_zh?: string;
   help_en?: string;
-  help_ja?: string;
-  help_pt?: string;
   required: boolean;
   /** Local-API fields marked credential are encrypted in the device-only connector store and
    *  never copied into the synced connector registry. */
   storage?: 'metadata' | 'credential';
-  options?: Array<{ value: string; label_zh: string; label_en: string; label_ja?: string; label_pt?: string }>;
+  options?: Array<{ value: string; label_zh: string; label_en: string } & LocalizedCatalogCopy<'label'>>;
   /** Named validator/normalizer owned by the desktop. Catalog data never supplies executable
    *  regexes or callbacks. */
   format:
@@ -230,6 +230,10 @@ export interface CatalogConnectionField {
     | 'shopline_store_domain'
     | 'shoplazza_store_domain'
     | 'magento_store_url'
+    | 'futureshop_api_origin'
+    | 'yahoo_seller_id'
+    | 'yahoo_public_key'
+    | 'yahoo_key_version'
     | 'temu_region'
     | 'lazada_country'
     | 'walmart_market'
@@ -264,21 +268,17 @@ export interface CatalogConnectionField {
     | 'sandbox_or_live';
 }
 
-export interface CatalogConnectionSetup {
+export interface CatalogConnectionSetup extends LocalizedCatalogCopy<'callback_help' | 'instructions' | 'guide_label'> {
   fields: CatalogConnectionField[];
   /** App-owned, read-only provider-console value; never submitted as user credentials. */
   callback_url?: string;
   callback_help_zh?: string;
   callback_help_en?: string;
-  callback_help_ja?: string;
-  callback_help_pt?: string;
   /** Material provider-side work that must be visible before the user starts entering fields. */
   requirement?: 'provider_application' | 'business_qualification';
   /** Localized, provider-authored prerequisites shown above the combined setup form. */
   instructions_zh?: string;
   instructions_en?: string;
-  instructions_ja?: string;
-  instructions_pt?: string;
   /**
    * Optional first-party setup guide. A direct user click opens the system
    * browser; Commander-originated guidance opens the isolated Web Assist
@@ -287,20 +287,14 @@ export interface CatalogConnectionSetup {
   guide_url?: string;
   guide_label_zh?: string;
   guide_label_en?: string;
-  guide_label_ja?: string;
-  guide_label_pt?: string;
 }
 
-export interface CatalogConnectionVariant {
+export interface CatalogConnectionVariant extends LocalizedCatalogCopy<'label' | 'description'> {
   catalog_id: string;
   label_zh: string;
   label_en: string;
-  label_ja?: string;
-  label_pt?: string;
   description_zh?: string;
   description_en?: string;
-  description_ja?: string;
-  description_pt?: string;
 }
 
 // ── OAuth ───────────────────────────────────────────────────────────────
@@ -414,6 +408,11 @@ export interface LocalCliConfig {
 
 export interface LocalApiConfig {
   provider:
+    | 'rakuten_rms'
+    | 'base_shop'
+    | 'futureshop'
+    | 'yahoo_shopping'
+    | 'qoo10_japan'
     | 'bigcommerce'
     | 'shopline'
     | 'shoplazza'
@@ -477,7 +476,7 @@ export interface ConnectorUsageMetering {
 
 
 
-export interface CatalogEntry {
+export interface CatalogEntry extends LocalizedCatalogCopy<'description'> {
   /** Stable id; doubles as the installed instance id (one install per catalog entry in Phase 0).
    *  Lowercase, [a-z0-9_-]+; used as the `<inst>__<tool>` prefix. */
   id: string;
@@ -501,8 +500,6 @@ export interface CatalogEntry {
   category: CatalogCategory;
   description_zh: string;
   description_en: string;
-  description_ja?: string;
-  description_pt?: string;
   /** Sole display switch for the shared credit tag. Runtime metering fields do not affect it. */
   requires_credits?: boolean;
   /** Which OAuth pathway this provider needs — see the `// ── OAuth ──` section above. */

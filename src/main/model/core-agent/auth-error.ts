@@ -55,6 +55,7 @@
  */
 
 import { isProviderSafetyError } from '../../../core-agent/src/shared/errors';
+import { providerCredentialFailure, providerErrorFacts } from '../../../core-agent/src/shared/provider-error-facts';
 
 export type KeyFailureKind = 'auth' | 'permission' | 'rate_limit' | 'balance' | 'network';
 
@@ -177,35 +178,11 @@ export function classifyKeyFailure(err: unknown): KeyFailureKind | null {
   // so rotation cannot bypass a structured safety code.
   if (isProviderSafetyError(err)) return null;
 
+  const credentialKind = providerCredentialFailure(err);
+  if (credentialKind) return credentialKind;
+  const { status, codes } = providerErrorFacts(err);
+  if (status !== undefined) return null;
   const msg = collectMessages(err);
-  const status = collectStatus(err);
-  const codes = collectCodes(err);
-  const hasBalanceSignal = BALANCE_RE.test(msg) || codes.some((c) => BALANCE_RE.test(c));
-  const structuredCodeKind: KeyFailureKind | null = codes.some((c) => BALANCE_RE.test(c))
-    ? 'balance'
-    : codes.some((c) => AUTH_CODE_RE.test(c))
-      ? 'auth'
-      : codes.some((c) => RATE_RE.test(c))
-        ? 'rate_limit'
-        : codes.some((c) => PERM_RE.test(c))
-          ? 'permission'
-          : null;
-
-  if (status === 402) return 'balance';
-  if (structuredCodeKind) return structuredCodeKind;
-
-  if (status === 401) return 'auth';
-  if (status === 403) return /rate|throttl|quota/i.test(msg) ? 'rate_limit' : 'permission';
-  if (status === 429) return hasBalanceSignal ? 'balance' : 'rate_limit';
-
-  if (status === 400 || status === 404 || (typeof status === 'number' && status >= 500)) return null;
-
-  if (hasBalanceSignal) return 'balance';
-  if (RATE_RE.test(msg))    return 'rate_limit';
-  if (PERM_RE.test(msg))    return 'permission';
-  if (AUTH_RE.test(msg))    return 'auth';
-
-  if (NON_KEY_RE.test(msg)) return null;
 
   // Network-layer last — checked after auth-style classifications so a
   // "fetch failed" wrapping a 401 (rare but possible) still ends up as auth.

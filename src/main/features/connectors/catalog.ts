@@ -12,7 +12,7 @@
  * spawning. Refresh is lazy — checked at boot / `connectors.refresh` / when the model's tool
  * call surfaces a 401.
  */
-import { getServerConnectorCatalogConfig } from '../client_config';
+import { getRemoteConfigRevision, getServerConnectorCatalogConfig } from '../client_config';
 import { COMPOSIO_COMMERCE_ENTRIES } from './catalog-commerce';
 import { COMPOSIO_MANAGED_ENTRIES } from './catalog-managed';
 import { DIRECT_COMMERCE_ENTRIES } from './catalog-direct-commerce';
@@ -20,6 +20,7 @@ import { DOMESTIC_COLLABORATION_ENTRIES } from './catalog-domestic';
 import { GOOGLE_ENTRIES } from './catalog-google';
 import { LOCAL_COMMERCE_ENTRIES } from './catalog-local-commerce';
 import { REMOTE_COMMERCE_ENTRIES } from './catalog-remote-commerce';
+import { JAPAN_COMMERCE_ENTRIES } from './catalog-japan-commerce';
 import type { CatalogEntry } from './types';
 
 const GOOGLE_DRIVE_ICON_SVG = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#1e88e5" d="M4.5 20.5h15L24 12.7h-15z"/><path fill="#fbc02d" d="M9 12.7h15L16.5 0h-15z"/><path fill="#43a047" d="M0 20.5h4.5L16.5 0H12z"/></svg>';
@@ -49,6 +50,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '搜索、读取、创建和整理 Google Drive 文件。',
     description_en: 'Search, read, create, and organize Google Drive files.',
+    description_es: "Busca, lee, crea y organiza archivos de Google Drive.",
+    description_fr: "Recherchez, consultez, créez et organisez des fichiers Google Drive.",
+    description_ko: "Google Drive 파일을 검색하고 읽고 만들고 정리합니다.",
+    description_de: "Suchen, lesen, erstellen und organisieren Sie Google Drive-Dateien.",
+    description_ru: "Ищите, читайте, создавайте и упорядочивайте файлы Google Drive.",
+    description_it: "Cerca, leggi, crea e organizza file di Google Drive.",
     description_ja: "Google Drive のファイルを検索・読み取り・作成・整理します。",
     description_pt: "Pesquise, leia, crie e organize arquivos Google Drive.",
   }),
@@ -59,6 +66,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'communication',
     description_zh: '读取 Outlook 个人资料、联系人、邮箱设置和任务。',
     description_en: 'Read Outlook profile, contacts, mailbox settings, and tasks.',
+    description_es: "Consulta el perfil, los contactos, la configuración del buzón y las tareas de Outlook.",
+    description_fr: "Consultez le profil Outlook, les contacts, les paramètres de la boîte aux lettres et les tâches.",
+    description_ko: "Outlook 프로필, 연락처, 사서함 설정, 작업을 읽습니다.",
+    description_de: "Lesen Sie Outlook-Profil, Kontakte, Postfacheinstellungen und Aufgaben.",
+    description_ru: "Читайте профиль Outlook, контакты, настройки почтового ящика и задачи.",
+    description_it: "Leggi il profilo, i contatti, le impostazioni della casella di posta e le attività di Outlook.",
     description_ja: "Outlook のプロフィール、連絡先、メールボックス設定、タスクを読み取ります。",
     description_pt: "Leia perfil, contatos, configurações de caixa de correio e tarefas do Outlook.",
   }),
@@ -69,6 +82,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'communication',
     description_zh: '搜索、读取、撰写和发送 Microsoft 365 邮件。',
     description_en: 'Search, read, draft, and send Microsoft 365 mail.',
+    description_es: "Busca, lee, redacta y envía correos de Microsoft 365.",
+    description_fr: "Recherchez, lisez, rédigez et envoyez des e-mails Microsoft 365.",
+    description_ko: "Microsoft 365 메일을 검색하고 읽고 초안을 작성하고 보냅니다.",
+    description_de: "Suchen, lesen, entwerfen und senden Sie Microsoft 365-E-Mails.",
+    description_ru: "Ищите и читайте письма Microsoft 365, создавайте черновики и отправляйте письма.",
+    description_it: "Cerca, leggi, prepara bozze e invia email di Microsoft 365.",
     description_ja: "Microsoft 365 のメールを検索・読み取り・下書き・送信します。",
     description_pt: "Pesquise, leia, redija e envie e-mails Microsoft 365.",
   }),
@@ -79,6 +98,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '查看、创建和更新 Microsoft 365 日历事件。',
     description_en: 'View, create, and update Microsoft 365 calendar events.',
+    description_es: "Consulta, crea y actualiza eventos del calendario de Microsoft 365.",
+    description_fr: "Consultez, créez et mettez à jour les événements du calendrier Microsoft 365.",
+    description_ko: "Microsoft 365 캘린더 일정을 조회하고 만들고 업데이트합니다.",
+    description_de: "Sehen Sie Microsoft 365-Kalendertermine ein, erstellen und aktualisieren Sie sie.",
+    description_ru: "Просматривайте, создавайте и обновляйте события календаря Microsoft 365.",
+    description_it: "Visualizza, crea e aggiorna eventi del calendario di Microsoft 365.",
     description_ja: "Microsoft 365 のカレンダー予定を表示・作成・更新します。",
     description_pt: "Consulte, crie e atualize eventos de calendário Microsoft 365.",
   }),
@@ -89,6 +114,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '搜索、读取、上传和更新 OneDrive 文件。',
     description_en: 'Search, read, upload, and update OneDrive files.',
+    description_es: "Busca, lee, carga y actualiza archivos de OneDrive.",
+    description_fr: "Recherchez, consultez, importez et mettez à jour des fichiers OneDrive.",
+    description_ko: "OneDrive 파일을 검색하고 읽고 업로드하고 업데이트합니다.",
+    description_de: "Suchen, lesen und aktualisieren Sie OneDrive-Dateien und laden Sie sie hoch.",
+    description_ru: "Ищите, читайте, загружайте и обновляйте файлы OneDrive.",
+    description_it: "Cerca, leggi, carica e aggiorna file di OneDrive.",
     description_ja: "OneDrive のファイルを検索・読み取り・アップロード・更新します。",
     description_pt: "Pesquise, leia, envie e atualize arquivos OneDrive.",
   }),
@@ -96,6 +127,7 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
   ...COMPOSIO_MANAGED_ENTRIES,
   ...DIRECT_COMMERCE_ENTRIES,
   ...REMOTE_COMMERCE_ENTRIES,
+  ...JAPAN_COMMERCE_ENTRIES,
   ...LOCAL_COMMERCE_ENTRIES,
   ...DOMESTIC_COLLABORATION_ENTRIES,
   {
@@ -105,6 +137,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '查找和管理代码仓库、Issue、PR、文件与代码。',
     description_en: 'Find and manage repositories, issues, PRs, files, and code.',
+    description_es: "Busca y administra repositorios, incidencias, solicitudes de incorporación de cambios, archivos y código.",
+    description_fr: "Recherchez et gérez des dépôts, des tickets, des PR, des fichiers et du code.",
+    description_ko: "저장소, 이슈, PR, 파일, 코드를 찾고 관리합니다.",
+    description_de: "Suchen und verwalten Sie Repositorys, Issues, PRs, Dateien und Code.",
+    description_ru: "Находите репозитории, задачи, PR, файлы и код и управляйте ими.",
+    description_it: "Trova e gestisci repository, segnalazioni, richieste di pull, file e codice.",
     description_ja: "リポジトリ、Issue、PR、ファイル、コードを検索・管理します。",
     description_pt: "Encontre e gerencie repositórios, issues, PRs, arquivos e código.",
     auth_mode: 'server_bridge',
@@ -126,6 +164,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '查找、阅读和更新 Notion 页面、数据库与内容块。',
     description_en: 'Find, read, and update Notion pages, databases, and blocks.',
+    description_es: "Busca, lee y actualiza páginas, bases de datos y bloques de Notion.",
+    description_fr: "Recherchez, consultez et mettez à jour les pages, les bases de données et les blocs Notion.",
+    description_ko: "Notion 페이지, 데이터베이스, 블록을 찾고 읽고 업데이트합니다.",
+    description_de: "Suchen, lesen und aktualisieren Sie Notion-Seiten, Datenbanken und Blöcke.",
+    description_ru: "Находите, читайте и обновляйте страницы, базы данных и блоки Notion.",
+    description_it: "Trova, leggi e aggiorna pagine, database e blocchi di Notion.",
     description_ja: "Notion のページ、データベース、ブロックを検索・読み取り・更新します。",
     description_pt: "Encontre, leia e atualize páginas, bancos de dados e blocos Notion.",
     // DCR — Notion hosts an MCP-spec OAuth authorization server. No Orkas-side pre-registered
@@ -146,6 +190,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '查找、创建和更新 Linear Issue、项目、周期与评论。',
     description_en: 'Find, create, and update Linear issues, projects, cycles, and comments.',
+    description_es: "Busca, crea y actualiza incidencias, proyectos, ciclos y comentarios de Linear.",
+    description_fr: "Recherchez, créez et mettez à jour les tickets, les projets, les cycles et les commentaires Linear.",
+    description_ko: "Linear 이슈, 프로젝트, 사이클, 댓글을 찾고 만들고 업데이트합니다.",
+    description_de: "Suchen, erstellen und aktualisieren Sie Linear-Issues, Projekte, Zyklen und Kommentare.",
+    description_ru: "Находите, создавайте и обновляйте задачи, проекты, циклы и комментарии Linear.",
+    description_it: "Trova, crea e aggiorna segnalazioni, progetti, cicli e commenti di Linear.",
     description_ja: "Linear の Issue、プロジェクト、サイクル、コメントを検索・作成・更新します。",
     description_pt: "Encontre, crie e atualize issues, projetos, ciclos e comentários Linear.",
     auth_mode: 'mcp_dcr',
@@ -162,6 +212,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '连接 Jira、Confluence 等 Atlassian 工作数据，搜索、读取并更新 issue、页面与项目上下文。',
     description_en: 'Connect Jira, Confluence, and other Atlassian work data to search, read, and update issues, pages, and project context.',
+    description_es: "Conecta Jira, Confluence y otros datos de trabajo de Atlassian para buscar, leer y actualizar incidencias, páginas y contexto de proyectos.",
+    description_fr: "Connectez Jira, Confluence et d’autres données de travail Atlassian pour rechercher, consulter et mettre à jour les tickets, les pages et le contexte des projets.",
+    description_ko: "Jira, Confluence 및 기타 Atlassian 업무 데이터를 연결해 이슈, 페이지, 프로젝트 맥락을 검색하고 읽고 업데이트합니다.",
+    description_de: "Verbinden Sie Jira, Confluence und andere Atlassian-Arbeitsdaten, um Issues, Seiten und Projektkontext zu suchen, zu lesen und zu aktualisieren.",
+    description_ru: "Подключите Jira, Confluence и другие рабочие данные Atlassian для поиска, чтения и обновления задач, страниц и контекста проектов.",
+    description_it: "Collega Jira, Confluence e altri dati di lavoro di Atlassian per cercare, leggere e aggiornare segnalazioni, pagine e informazioni di contesto dei progetti.",
     description_ja: "Jira、Confluence などの Atlassian 業務データに接続し、課題、ページ、プロジェクト情報を検索・読み取り・更新します。",
     description_pt: "Conecte dados de trabalho Jira, Confluence e outros produtos Atlassian para pesquisar, ler e atualizar issues, páginas e contexto de projetos.",
     auth_mode: 'mcp_dcr',
@@ -178,6 +234,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'data',
     description_zh: '查询和更新 Airtable bases、tables、records 与评论。',
     description_en: 'Query and update Airtable bases, tables, records, and comments.',
+    description_es: "Consulta y actualiza bases, tablas, registros y comentarios de Airtable.",
+    description_fr: "Interrogez et mettez à jour les bases, les tables, les enregistrements et les commentaires Airtable.",
+    description_ko: "Airtable 베이스, 테이블, 레코드, 댓글을 조회하고 업데이트합니다.",
+    description_de: "Fragen Sie Airtable-Bases, Tabellen, Datensätze und Kommentare ab und aktualisieren Sie sie.",
+    description_ru: "Запрашивайте и обновляйте базы, таблицы, записи и комментарии Airtable.",
+    description_it: "Consulta e aggiorna basi, tabelle, record e commenti di Airtable.",
     description_ja: "Airtable のベース、テーブル、レコード、コメントを検索・更新します。",
     description_pt: "Consulte e atualize bases, tabelas, registros e comentários Airtable.",
     auth_mode: 'mcp_dcr',
@@ -194,6 +256,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '连接 GitLab.com 项目、Issue、Merge Request、Pipeline 与代码上下文。',
     description_en: 'Connect GitLab.com projects, issues, merge requests, pipelines, and code context.',
+    description_es: "Conecta proyectos, incidencias, solicitudes de fusión, canalizaciones y contexto de código de GitLab.com.",
+    description_fr: "Connectez les projets, les tickets, les demandes de fusion, les pipelines et le contexte de code GitLab.com.",
+    description_ko: "GitLab.com 프로젝트, 이슈, 병합 요청, 파이프라인, 코드 맥락을 연결합니다.",
+    description_de: "Verbinden Sie GitLab.com-Projekte, Issues, Merge Requests, Pipelines und Codekontext.",
+    description_ru: "Подключите проекты, задачи, запросы на слияние, конвейеры и контекст кода GitLab.com.",
+    description_it: "Collega progetti, segnalazioni, richieste di merge, pipeline e informazioni di contesto del codice di GitLab.com.",
     description_ja: "GitLab.com のプロジェクト、Issue、マージリクエスト、パイプライン、コード情報に接続します。",
     description_pt: "Conecte projetos, issues, merge requests, pipelines e contexto de código do GitLab.com.",
     auth_mode: 'mcp_dcr',
@@ -210,6 +278,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '查询 Sentry 组织、项目、错误事件与调试上下文，并执行受控修复工作流。',
     description_en: 'Query Sentry organizations, projects, issues, and debugging context, with controlled remediation workflows.',
+    description_es: "Consulta organizaciones, proyectos, incidencias y contexto de depuración de Sentry, con flujos de trabajo de corrección controlados.",
+    description_fr: "Interrogez les organisations, les projets, les tickets et le contexte de débogage Sentry, avec des processus de correction contrôlés.",
+    description_ko: "Sentry 조직, 프로젝트, 이슈, 디버깅 맥락을 조회하고 통제된 문제 해결 워크플로를 사용합니다.",
+    description_de: "Fragen Sie Sentry-Organisationen, Projekte, Issues und Debugging-Kontext ab, mit kontrollierten Abläufen zur Fehlerbehebung.",
+    description_ru: "Запрашивайте организации, проекты, проблемы и контекст отладки Sentry с контролируемыми процессами устранения проблем.",
+    description_it: "Consulta organizzazioni, progetti, segnalazioni e informazioni di contesto per il debug di Sentry, con flussi di lavoro controllati per la risoluzione dei problemi.",
     description_ja: "Sentry の組織、プロジェクト、Issue、デバッグ情報を検索し、制御された修復ワークフローを利用します。",
     description_pt: "Consulte organizações, projetos, issues e contexto de depuração Sentry com fluxos controlados de correção.",
     auth_mode: 'mcp_dcr',
@@ -226,6 +300,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '连接 Cloudflare API MCP，管理 DNS、Workers、Zero Trust、WAF、账号资源与平台上下文。',
     description_en: 'Connect Cloudflare API MCP for DNS, Workers, Zero Trust, WAF, account resources, and platform context.',
+    description_es: "Conecta Cloudflare API MCP para DNS, Workers, Zero Trust, WAF, recursos de la cuenta y contexto de la plataforma.",
+    description_fr: "Connectez Cloudflare API MCP pour DNS, Workers, Zero Trust, WAF, les ressources du compte et le contexte de la plateforme.",
+    description_ko: "DNS, Workers, Zero Trust, WAF, 계정 리소스, 플랫폼 맥락을 위해 Cloudflare API MCP를 연결합니다.",
+    description_de: "Verbinden Sie Cloudflare API MCP für DNS, Workers, Zero Trust, WAF, Kontoressourcen und Plattformkontext.",
+    description_ru: "Подключите Cloudflare API MCP для DNS, Workers, Zero Trust, WAF, ресурсов аккаунта и контекста платформы.",
+    description_it: "Collega Cloudflare API MCP per DNS, Workers, Zero Trust, WAF, risorse dell'account e informazioni di contesto della piattaforma.",
     description_ja: "Cloudflare API MCP に接続し、DNS、Workers、Zero Trust、WAF、アカウントリソース、プラットフォーム情報を扱います。",
     description_pt: "Conecte o Cloudflare API MCP para DNS, Workers, Zero Trust, WAF, recursos da conta e contexto da plataforma.",
     auth_mode: 'mcp_dcr',
@@ -242,6 +322,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '查询和操作 Stripe 支付、客户、订阅、发票与开发者上下文。',
     description_en: 'Query and operate on Stripe payments, customers, subscriptions, invoices, and developer context.',
+    description_es: "Consulta y realiza operaciones sobre pagos, clientes, suscripciones, facturas y contexto de desarrollo de Stripe.",
+    description_fr: "Interrogez les paiements, les clients, les abonnements, les factures et le contexte développeur Stripe, et effectuez des opérations sur ces éléments.",
+    description_ko: "Stripe 결제, 고객, 구독, 청구서, 개발자 맥락을 조회하고 관련 작업을 수행합니다.",
+    description_de: "Fragen Sie Stripe-Zahlungen, Kunden, Abonnements, Rechnungen und Entwicklerkontext ab und führen Sie Vorgänge damit aus.",
+    description_ru: "Запрашивайте и обрабатывайте платежи, клиентов, подписки, счета и контекст разработчика Stripe.",
+    description_it: "Consulta e gestisci pagamenti, clienti, abbonamenti, fatture e informazioni di contesto per gli sviluppatori di Stripe.",
     description_ja: "Stripe の支払、顧客、サブスクリプション、請求書、開発者情報を検索・操作します。",
     description_pt: "Consulte e opere pagamentos, clientes, assinaturas, faturas e contexto de desenvolvimento Stripe.",
     auth_mode: 'mcp_dcr',
@@ -261,6 +347,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '连接 Supabase 项目、数据库、Edge Functions、Storage 与平台上下文。',
     description_en: 'Connect Supabase projects, databases, Edge Functions, Storage, and platform context.',
+    description_es: "Conecta proyectos, bases de datos, Edge Functions, Storage y contexto de la plataforma de Supabase.",
+    description_fr: "Connectez les projets, les bases de données, Edge Functions, Storage et le contexte de la plateforme Supabase.",
+    description_ko: "Supabase 프로젝트, 데이터베이스, Edge Functions, Storage, 플랫폼 맥락을 연결합니다.",
+    description_de: "Verbinden Sie Supabase-Projekte, Datenbanken, Edge Functions, Storage und Plattformkontext.",
+    description_ru: "Подключите проекты, базы данных, Edge Functions, Storage и контекст платформы Supabase.",
+    description_it: "Collega progetti, database, Edge Functions, Storage e informazioni di contesto della piattaforma Supabase.",
     description_ja: "Supabase のプロジェクト、データベース、Edge Functions、Storage、プラットフォーム情報に接続します。",
     description_pt: "Conecte projetos, bancos de dados, Edge Functions, Storage e contexto da plataforma Supabase.",
     auth_mode: 'mcp_dcr',
@@ -277,6 +369,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '查询和更新 Close CRM leads、contacts、opportunities、tasks 与沟通记录。',
     description_en: 'Query and update Close CRM leads, contacts, opportunities, tasks, and communication records.',
+    description_es: "Consulta y actualiza clientes potenciales, contactos, oportunidades, tareas y registros de comunicación de Close CRM.",
+    description_fr: "Interrogez et mettez à jour les prospects, les contacts, les opportunités, les tâches et les enregistrements de communication Close CRM.",
+    description_ko: "Close CRM 잠재 고객, 연락처, 영업 기회, 작업, 커뮤니케이션 기록을 조회하고 업데이트합니다.",
+    description_de: "Fragen Sie Close CRM-Leads, Kontakte, Verkaufschancen, Aufgaben und Kommunikationsaufzeichnungen ab und aktualisieren Sie sie.",
+    description_ru: "Запрашивайте и обновляйте потенциальных клиентов, контакты, возможности продаж, задачи и записи общения Close CRM.",
+    description_it: "Consulta e aggiorna potenziali clienti, contatti, opportunità, attività e registri delle comunicazioni di Close CRM.",
     description_ja: "Close CRM の見込み客、連絡先、商談、タスク、連絡記録を検索・更新します。",
     description_pt: "Consulte e atualize leads, contatos, oportunidades, tarefas e registros de comunicação Close CRM.",
     auth_mode: 'mcp_dcr',
@@ -293,6 +391,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '查看和更新 Webflow 站点、页面、CMS 内容、SEO 信息与资源文件。',
     description_en: 'View and update Webflow sites, pages, CMS content, SEO metadata, and assets.',
+    description_es: "Consulta y actualiza sitios, páginas, contenido del CMS, metadatos SEO y recursos de Webflow.",
+    description_fr: "Consultez et mettez à jour les sites, les pages, le contenu CMS, les métadonnées SEO et les ressources Webflow.",
+    description_ko: "Webflow 사이트, 페이지, CMS 콘텐츠, SEO 메타데이터, 에셋을 조회하고 업데이트합니다.",
+    description_de: "Sehen Sie Webflow-Websites, Seiten, CMS-Inhalte, SEO-Metadaten und Assets ein und aktualisieren Sie sie.",
+    description_ru: "Просматривайте и обновляйте сайты, страницы, контент CMS, метаданные SEO и ресурсы Webflow.",
+    description_it: "Visualizza e aggiorna siti, pagine, contenuti CMS, metadati SEO e risorse di Webflow.",
     description_ja: "Webflow のサイト、ページ、CMS コンテンツ、SEO メタデータ、アセットを表示・更新します。",
     description_pt: "Consulte e atualize sites, páginas, conteúdo CMS, metadados SEO e recursos Webflow.",
     auth_mode: 'mcp_dcr',
@@ -309,6 +413,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'communication',
     description_zh: '发消息、读频道、自动化工作区任务。',
     description_en: 'Post messages, browse channels, automate workspace tasks.',
+    description_es: "Publica mensajes, explora canales y automatiza tareas del espacio de trabajo.",
+    description_fr: "Publiez des messages, parcourez les canaux et automatisez les tâches de l’espace de travail.",
+    description_ko: "메시지를 게시하고 채널을 살펴보고 워크스페이스 작업을 자동화합니다.",
+    description_de: "Veröffentlichen Sie Nachrichten, durchsuchen Sie Kanäle und automatisieren Sie Aufgaben im Arbeitsbereich.",
+    description_ru: "Публикуйте сообщения, просматривайте каналы, автоматизируйте задачи рабочего пространства.",
+    description_it: "Pubblica messaggi, esplora i canali, automatizza le attività dell'area di lavoro.",
     description_ja: "メッセージを投稿し、チャンネルを閲覧して、ワークスペースの作業を自動化します。",
     description_pt: "Publique mensagens, navegue por canais e automatize tarefas do espaço de trabalho.",
     auth_mode: 'server_bridge',
@@ -330,6 +440,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'communication',
     description_zh: '读 / 发邮件、整理收件箱。',
     description_en: 'Read and send mail, organize the inbox.',
+    description_es: 'Lee y envía correos, y organiza la bandeja de entrada.',
+    description_fr: 'Lisez et envoyez des e-mails, et organisez la boîte de réception.',
+    description_ko: '메일을 읽고 보내고 받은편지함을 정리합니다.',
+    description_de: 'Lesen und senden Sie E-Mails und organisieren Sie den Posteingang.',
+    description_ru: 'Читайте и отправляйте письма, упорядочивайте входящие.',
+    description_it: 'Leggi e invia email, organizza la posta in arrivo.',
     description_ja: 'メールを読み取り・送信し、受信トレイを整理します。',
     description_pt: 'Leia e envie e-mails e organize a caixa de entrada.',
     requires_credits: true,
@@ -345,6 +461,12 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'data',
     description_zh: '查看 Bing 搜索流量：关键词、点击/曝光/排名、各页面表现（ChatGPT/Copilot 检索基于 Bing 索引）。',
     description_en: 'View Bing search traffic — queries, clicks/impressions/position and per-page stats (ChatGPT/Copilot retrieval runs on the Bing index).',
+    description_es: "Consulta el tráfico de búsqueda de Bing: consultas, clics/impresiones/posición y estadísticas por página (la recuperación de información de ChatGPT/Copilot utiliza el índice de Bing).",
+    description_fr: "Consultez le trafic de recherche Bing : requêtes, clics, impressions, position et statistiques par page (la recherche de ChatGPT/Copilot s’appuie sur l’index Bing).",
+    description_ko: "Bing 검색 트래픽의 검색어, 클릭수·노출수·순위, 페이지별 통계를 확인합니다(ChatGPT/Copilot 검색은 Bing 색인을 사용합니다).",
+    description_de: "Sehen Sie Bing-Suchzugriffe ein: Suchanfragen, Klicks/Impressionen/Position und Statistiken pro Seite (die Informationssuche von ChatGPT/Copilot nutzt den Bing-Index).",
+    description_ru: "Просматривайте поисковый трафик Bing: запросы, клики, показы, позиции и статистику по страницам (поиск ChatGPT/Copilot работает на индексе Bing).",
+    description_it: "Visualizza il traffico di ricerca di Bing — ricerche, clic/impressioni/posizione e statistiche per pagina (il recupero delle informazioni di ChatGPT/Copilot si basa sull'indice di Bing).",
     description_ja: "Bing の検索クエリ、クリック数、表示回数、順位、ページ別統計を確認します（ChatGPT/Copilot の検索は Bing インデックスを使用します）。",
     description_pt: "Consulte tráfego de pesquisa Bing: consultas, cliques, impressões, posição e estatísticas por página (a busca do ChatGPT/Copilot usa o índice Bing).",
     auth_mode: 'server_bridge',
@@ -363,8 +485,13 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
   },
 ];
 
-export function connectorCatalog(): CatalogEntry[] {
-  const byId = new Map(CONNECTOR_CATALOG.map((entry) => [entry.id, entry]));
+let catalogSnapshot: { revision: number; byId: Map<string, CatalogEntry> } | undefined;
+
+function catalogIndex(): Map<string, CatalogEntry> {
+  const revision = getRemoteConfigRevision();
+  if (catalogSnapshot?.revision === revision) return catalogSnapshot.byId;
+  const byId = new Map<string, CatalogEntry>();
+  for (const entry of CONNECTOR_CATALOG) byId.set(entry.id, entry);
   for (const entry of getServerConnectorCatalogConfig()) {
     const existing = byId.get(entry.id);
     const serverEntry = entry as CatalogEntry;
@@ -385,9 +512,16 @@ export function connectorCatalog(): CatalogEntry[] {
     }
     byId.set(entry.id, serverEntry);
   }
-  return Array.from(byId.values());
+  catalogSnapshot = { revision, byId };
+  return byId;
+}
+
+export function connectorCatalog(): CatalogEntry[] {
+  return structuredClone(Array.from(catalogIndex().values()));
 }
 
 export function findCatalogEntry(id: string): CatalogEntry | null {
-  return connectorCatalog().find((e) => e.id === id) || null;
+  const entry = catalogIndex().get(id);
+  // Callers may prepare transport/policy data locally without changing future lookups.
+  return entry ? structuredClone(entry) : null;
 }

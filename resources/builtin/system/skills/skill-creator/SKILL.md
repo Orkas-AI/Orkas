@@ -1,7 +1,7 @@
 ---
 name: skill-creator
-description_zh: "通过 `<skill>` 容器和文件块创建、编辑或忠实导入用户明确要求的自定义 Skill；用于新建、修改或导入 Skill，不用于普通任务执行或单纯安装外部包。"
-description_en: "Author, edit, or faithfully import an explicitly requested custom Skill through `<skill>` containers and file blocks. Use when the user asks to create, revise, or import a Skill; not for ordinary task execution or plain external-package installation."
+description_zh: "创建、编辑或忠实导入用户明确要求的自定义 Skill；不用于普通任务执行或单纯安装外部包。"
+description_en: "Create, edit or faithfully import explicitly requested custom Skills; not ordinary task execution or plain external-package installation."
 ---
 
 # skill-creator
@@ -27,12 +27,12 @@ Do not read unrelated references. A category-only edit needs only `metadata.md`;
 
 - **Use host-owned mutation paths only.** Use `import_skill_package` for an explicitly supplied local Skill directory/ZIP when available, metadata tags for metadata-only changes, and `<<<skill-file>>>` for changed file content. Never use `edit_file`, `write_file`, or shell redirects under the Skill directory.
 - **Whole-file replacement.** Every `<<<skill-file>>>` block replaces one complete relative file. Read an existing file before changing it; a partial body erases omitted content.
-- **Protocol completeness beats prose depth.** Close every file block with `>>>` on its own line and close the outer `</skill>` before optional user-visible prose. If response space is tight, shorten the Skill body; never truncate or omit a protocol delimiter.
+- **Protocol completeness beats prose depth.** Close every file block with `>>>` on its own line and close the outer `</skill>` before user-visible prose. If response space is tight, shorten the Skill body; never truncate or omit a protocol delimiter.
 - **No protocol files.** Do not dump `<skill>`, `<skill-meta>`, or file blocks into the workspace. The host parses them inline.
 - **One container per Skill.** Multiple containers are legal only when the request or source contains multiple distinct Skills. Never merge multiple source `SKILL.md` files into one Skill.
 - **Skills are independent.** Do not name, invoke, or read another Skill from this Skill's body, references, scripts, or examples. Orchestration belongs to the caller.
 - **Use the user's UI language** for newly authored human-readable instructions and user-visible prose. Keep frontmatter keys, identifiers, paths, commands, and code unchanged. Imported prose remains faithful by default.
-- **The host owns completion.** A valid `<skill>` container or file block only requests a mutation. Only a successful host result proves it was applied; before that, or after a failed or omitted mutation, never say the Skill is created, updated, saved, ready, or available. If visible prose is useful, use pending wording such as “将创建” or “已提交，等待应用”.
+- **The host owns completion.** A valid `<skill>` container or file block only requests a mutation. Only a successful host result proves it was applied; before that, or after a failed or omitted mutation, never say the Skill is created, updated, saved, ready, or available. Describe pending mutations as “将创建” or “已提交，等待应用”.
 
 ## Decide create versus edit
 
@@ -96,7 +96,7 @@ description: compact current-language routing description
 3. Read the current Skill and any user-supplied source material.
 4. Preserve source or design the smallest self-contained capability; choose guide versus script deliberately. For a straightforward guide, prefer the required use/non-use boundary, preconditions, 3–7 steps, and output shape over a long tutorial or repeated examples.
 5. Validate metadata, category, runner commands, safety, relative links, and the final resource inventory.
-6. Emit only the minimal metadata tags and complete changed files, then stop for the host result.
+6. Emit minimal metadata tags and complete changed files, follow User-visible prose below, then stop for the host result.
 
 ## Safety gate
 
@@ -104,4 +104,6 @@ Do not author credential-store reads, dynamic or decoded execution, download-and
 
 ## User-visible prose
 
-State only what the Skill now does, when it is used, which meaningful files changed, and any required next step. Do not expose protocol tags, frontmatter mechanics, internal modes, ids, or design jargon. Do **not** show source provenance by default. Mention it only when asked or when a failed read/import needs repair.
+If a requested requirement remains unmet or the result changes the required usage conditions, explain that difference and any required next step through the session's user-visible reply channel, outside mutation and file blocks. Writing it inside the Skill does not inform the user. Otherwise, omit redundant completion prose when the host result suffices.
+
+Keep explanations concise and about the user's outcome. Do not expose protocol tags, frontmatter mechanics, internal modes, ids, or design jargon. Do **not** show source provenance by default. Mention it only when asked or when a failed read/import needs repair.

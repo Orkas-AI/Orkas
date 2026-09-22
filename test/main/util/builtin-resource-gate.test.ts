@@ -12,6 +12,7 @@ const gate = require('../../../bin/builtin-resource-gate.cjs') as {
       system_skills: unknown[];
       marketplace_agents: Array<{
         id: string;
+        name: string;
         icon: string;
         color: string;
         updated_at: string;
@@ -68,7 +69,28 @@ describe('builtin-resource-gate', () => {
     expect(manifest.inventory.marketplace_skills.map((row) => row.id).sort())
       .toEqual([...gate.REQUIRED_BUILTIN_INVENTORY.marketplace_skills].sort());
     expect(manifest.inventory.marketplace_agents)
-      .not.toContainEqual(expect.objectContaining({ id: '1040b336306f' }));
+      .toContainEqual(expect.objectContaining({
+        id: '1040b336306f',
+        name: 'StockAnalyser',
+        icon: 'chart',
+        color: 'mint',
+        skill_list: [
+          'investment-report',
+          'market-data',
+          'portfolio-risk',
+          'quant-lab',
+          'security-research',
+          'trade-control',
+        ],
+        embedded_skills: [
+          'investment-report',
+          'market-data',
+          'portfolio-risk',
+          'quant-lab',
+          'security-research',
+          'trade-control',
+        ],
+      }));
     expect(manifest.inventory.marketplace_agents)
       .toContainEqual(expect.objectContaining({
         id: '173d4235a431',
@@ -77,6 +99,36 @@ describe('builtin-resource-gate', () => {
         color: 'lavender',
         skill_list: ['9dfbd4e00c0d'],
       }));
+    expect(manifest.inventory.marketplace_agents
+      .filter((row) => row.name.startsWith('ECommerce'))
+      .map(({ id, name, skill_list }) => ({ id, name, skill_list })))
+      .toEqual([
+        {
+          id: '5a1d43c2f28a',
+          name: 'ECommerceResearcher',
+          skill_list: ['272355bc883d', '6743aa0797a2', 'e7f5c0e6f1be', 'e8868f762c1d'],
+        },
+        {
+          id: 'a4930d19ba6c',
+          name: 'ECommerceReviewer',
+          skill_list: ['59d186285161', 'de52c67d49dd', 'e7f5c0e6f1be', 'e8868f762c1d'],
+        },
+        {
+          id: 'bc7e2a904d18',
+          name: 'ECommerceAnalyzer',
+          skill_list: ['c91a84e7b206'],
+        },
+        {
+          id: 'e0f3a98c624b',
+          name: 'ECommerceOperator',
+          skill_list: ['d47b20f9a631'],
+        },
+        {
+          id: 'fa3e1f2f9e07',
+          name: 'ECommerceWriter',
+          skill_list: ['59d186285161', 'de52c67d49dd', 'e8868f762c1d'],
+        },
+      ]);
     expect(manifest.inventory.marketplace_agents)
       .toContainEqual(expect.objectContaining({
         id: '78900d8758bc',
@@ -147,6 +199,7 @@ describe('builtin-resource-gate', () => {
       ['string number', (agent) => { agent.inputs[3].default = '60'; }, /finite number/],
       ['unknown select default', (agent) => { agent.inputs[1].default = 'portrait'; }, /default must match an option/],
       ['unknown locale default', (agent) => { agent.inputs[2].default_by_ui_language.zh = 'cn'; }, /invalid zh language default/],
+      ['unsupported UI locale', (agent) => { agent.inputs[2].default_by_ui_language.nl = 'en'; }, /invalid nl language default/],
       ['non-boolean required', (agent) => { agent.inputs[0].required = 1; }, /required must be boolean/],
       ['ignored textarea bound', (agent) => { agent.inputs[0].min = 1; }, /must not declare numeric bounds/],
     ];
@@ -159,6 +212,15 @@ describe('builtin-resource-gate', () => {
         label,
       ).toThrow(expected);
     }
+  });
+
+  it('allows valid select defaults for every newly supported UI language', () => {
+    const candidate = readBuiltinAgent('79df9cc89f5f');
+    const inputs = candidate.inputs as Array<Record<string, unknown>>;
+    inputs[2].default_by_ui_language = Object.fromEntries(
+      ['es', 'fr', 'ko', 'de', 'ru', 'it'].map((language) => [language, 'en']),
+    );
+    expect(gate.validateBuiltinAgentContract(candidate, '79df9cc89f5f')).toBe(true);
   });
 
   it('rejects missing primary files before a release can be signed', () => {

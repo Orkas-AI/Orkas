@@ -8,6 +8,8 @@
   const drafts = new Map();
   const replies = new Map();
   const pendingSaves = new Set();
+  const cancelledQuestions = new Set();
+  const pendingCancels = new Set();
   const mounts = new Map();
   const activeTurns = new Map();
   const dockEntries = new Map();
@@ -19,7 +21,7 @@
     // `pending` marks a blocking request: the CLI holds its turn open until the
     // answer arrives, so the card stays until it is answered or cancelled.
     const visible = [...dockEntries.values()].filter(entry => entry.cid === visibleCid
-      && !entry.saved && !entry.cancelling && (entry.pending || entry.savePending || entry.submitting
+      && !entry.saved && !entry.cancelled && !entry.cancelling && (entry.pending || entry.savePending || entry.submitting
         || (!entry.closed && activeTurns.has(entry.cid))));
     const hosts = new Set(visible.map(entry => entry.host));
     for (const child of [...dock.children]) if (!hosts.has(child)) child.remove();
@@ -37,6 +39,7 @@
   function showQuestion(message, opts) {
     const questions = message.cli_question?.questions;
     if (!Array.isArray(questions) || !questions.length) return;
+    observe(opts.cid, message);
     const key = keyFor(opts.cid, message.id || message._msg_id);
     let entry = dockEntries.get(key);
     if (!entry) {
@@ -57,6 +60,13 @@
   const keyFor = (cid, id) => JSON.stringify([cid, id]);
 
   function observe(cid, message) {
+    if (message?.cli_question?.cancelled === true) {
+      const key = keyFor(cid, message.id || message._msg_id);
+      cancelledQuestions.add(key);
+      drafts.delete(key);
+      pendingSaves.delete(key);
+      refresh(key);
+    }
     const answer = message && message.cli_answer;
     if (!answer || !Array.isArray(answer.answers)) return;
     const key = keyFor(cid, answer.message_id);
@@ -84,6 +94,7 @@
     const turnId = message.turn_id || message._turn_id;
     const actor = message.from || message._from;
     const key = keyFor(cid, messageId);
+    observe(cid, message);
     let submitting = false;
     let error = '';
     let expired = false;
@@ -95,9 +106,11 @@
       host.replaceChildren();
       host.classList.add('chat-input-form');
       const saved = replies.get(key);
+      const cancelled = cancelledQuestions.has(key);
+      const cancelling = pendingCancels.has(key);
       const savePending = pendingSaves.has(key);
       const answers = saved || drafts.get(key) || questions.map(() => '');
-      if (!saved) drafts.set(key, answers);
+      if (!saved && !cancelled) drafts.set(key, answers);
       const turns = activeTurns.get(cid);
       const closed = expired || (Array.isArray(turns) && !turns.some(turn =>
         turn.actor === actor && turn.turn_id === turnId && turn.steerable === true));
@@ -122,7 +135,7 @@
         input.rows = 2;
         input.maxLength = 4000;
         input.value = answers[i] || '';
-        input.disabled = !!saved || submitting || savePending;
+        input.disabled = !!saved || submitting || savePending || cancelled || cancelling;
         input.setAttribute('aria-label', q.title);
         input.placeholder = t('chat.cli_question.placeholder');
         const choose = value => {
@@ -136,7 +149,7 @@
           button.type = 'button';
           button.className = 'btn';
           button.textContent = option;
-          button.disabled = !!saved || submitting || savePending;
+          button.disabled = !!saved || submitting || savePending || cancelled || cancelling;
           button.addEventListener('click', () => choose(option));
           choices.appendChild(button);
         }
@@ -155,10 +168,42 @@
       submit.className = 'btn btn-primary';
       submit.textContent = t('chat.cli_question.send');
       function updateSubmit() {
-        submit.disabled = !!saved || submitting || (closed && !savePending) || answers.some(value => !String(value).trim());
+        submit.disabled = !!saved || submitting || cancelled || cancelling || (closed && !savePending) || answers.some(value => !String(value).trim());
       }
       updateSubmit();
-      if (!saved) host.appendChild(submit);
+      const actions = document.createElement('div');
+      actions.className = 'cli-question-actions';
+      const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.className = 'btn';
+      cancel.textContent = t('common.cancel');
+      cancel.disabled = !!saved || submitting || savePending || closed || cancelled || cancelling;
+      if (!saved && !cancelled) {
+        actions.appendChild(submit);
+        actions.appendChild(cancel);
+        host.appendChild(actions);
+      }
+      cancel.addEventListener('click', async () => {
+        if (cancel.disabled || pendingCancels.has(key)) return;
+        pendingCancels.add(key);
+        error = '';
+        refresh(key);
+        try {
+          const result = await window.orkas.invoke('localAgents.asyncInputResponse', {
+            cid, message_id: messageId, cancelled: true,
+          });
+          if (result?.ok === true) observe(cid, result.message);
+          else {
+            expired = result?.error === 'expired';
+            error = t('chat.cli_question.cancel_failed');
+          }
+        } catch (_) {
+          error = t('chat.cli_question.cancel_failed');
+        } finally {
+          pendingCancels.delete(key);
+          refresh(key);
+        }
+      });
       submit.addEventListener('click', async () => {
         if (submit.disabled || submitting) return;
         submitting = true;
@@ -169,7 +214,8 @@
             cid, message_id: messageId, answers: answers.slice(),
           });
           if (!result || result.ok !== true) {
-            expired = result && result.error === 'expired';
+            expired = result && (result.error === 'expired' || result.error === 'cancelled');
+            if (result?.error === 'cancelled') cancelledQuestions.add(key);
             if (result && result.error === 'save_failed') pendingSaves.add(key);
             error = t(expired ? 'chat.cli_question.expired'
               : result && result.error === 'save_failed' ? 'chat.cli_question.save_failed'
@@ -185,7 +231,7 @@
           paint();
         }
       });
-      opts.onState?.({ saved, savePending, submitting, closed });
+      opts.onState?.({ saved, savePending, submitting, closed, cancelled, cancelling });
     }
     paint();
   }
@@ -442,7 +488,7 @@
       activeTurns.delete(cid);
       for (const [key, entry] of dockEntries) if (entry.cid === cid) dockEntries.delete(key);
       syncDock();
-      for (const collection of [drafts, replies, mounts, pendingSaves]) {
+      for (const collection of [drafts, replies, mounts, pendingSaves, cancelledQuestions, pendingCancels]) {
         for (const key of collection.keys()) if (JSON.parse(key)[0] === cid) collection.delete(key);
       }
     },

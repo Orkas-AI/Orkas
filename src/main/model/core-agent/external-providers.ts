@@ -45,6 +45,7 @@ import {
   type CustomOpenAICompatibleRuntimeConfig,
 } from '../provider_catalog';
 import { repairOpenAIToolMessageOrder } from './openai-payload';
+import { createCustomOutputLimitCompatibility } from './custom-output-limit';
 import {
   ORKAS_API_BASE_URL,
   ORKAS_API_PROVIDER,
@@ -129,6 +130,43 @@ export function repairDeepSeekPayload(params: unknown): unknown {
 
 export function repairOpenAICompatiblePayload(params: unknown): unknown {
   return repairOpenAIToolMessageOrder(params);
+}
+
+/** Remove an output limit the host added from its own model-default
+ * reservation so selected providers can apply their native output default. */
+function omitReservedOutputLimit(
+  params: unknown,
+  reservation: number | undefined,
+  outputLimitSource: unknown,
+): unknown {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return params;
+  if (!Number.isFinite(reservation) || Number(reservation) <= 0) return params;
+  if (outputLimitSource !== 'model_default') return params;
+  const reserved = Math.trunc(Number(reservation));
+  const payload = params as Record<string, unknown>;
+  const keys = ['max_tokens', 'max_completion_tokens', 'max_output_tokens']
+    .filter((key) => payload[key] === reserved);
+  if (!keys.length) return params;
+  const result = { ...payload };
+  for (const key of keys) delete result[key];
+  return result;
+}
+
+const PROVIDER_DEFAULT_OUTPUT_LIMIT_PROVIDERS: ReadonlySet<string> = new Set(['openai', 'openai-codex']);
+
+type PayloadHookModel = { api?: string; id?: string; provider?: string; maxTokens?: number };
+
+export function omitReservedOutputLimitForProvider(
+  providerId: string,
+  inner: (params: unknown, model: PayloadHookModel, requestMetadata?: unknown) => unknown,
+): (params: unknown, model: PayloadHookModel, requestMetadata?: unknown) => unknown {
+  if (!PROVIDER_DEFAULT_OUTPUT_LIMIT_PROVIDERS.has(providerId)) return inner;
+  return (params, model, requestMetadata) => {
+    const metadata = requestMetadata && typeof requestMetadata === 'object' && !Array.isArray(requestMetadata)
+      ? requestMetadata as Record<string, unknown>
+      : {};
+    return inner(omitReservedOutputLimit(params, model?.maxTokens, metadata.outputLimitSource), model, requestMetadata);
+  };
 }
 
 // ── Orkas public API ───────────────────────────────────────────────────
@@ -292,7 +330,9 @@ export function buildMoonshotModel(
     // affect the actual request. Filling 0 means "not accounted for here";
     // users check the actual price on their Moonshot bill.
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: configuredPositiveInteger(curated?.contextWindow, moonshotContextWindow(modelId)),
+    contextWindow: modelId === 'kimi-k3'
+      ? moonshotContextWindow(modelId)
+      : configuredPositiveInteger(curated?.contextWindow, moonshotContextWindow(modelId)),
     maxTokens: configuredPositiveInteger(curated?.maxTokens, moonshotMaxOutputTokens(modelId)),
     ...(nativeModel?.headers ? { headers: { ...nativeModel.headers } } : {}),
     ...(protocol?.compat ? { compat: { ...protocol.compat } } : {}),
@@ -392,8 +432,12 @@ export function buildDeepSeekModel(modelId: string): Model<'openai-completions'>
       ? ['text', 'image']
       : ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: configuredPositiveInteger(curated?.contextWindow, deepseekContextWindow(modelId)),
-    maxTokens: configuredPositiveInteger(curated?.maxTokens, deepseekMaxOutputTokens(modelId)),
+    contextWindow: Object.prototype.hasOwnProperty.call(DEEPSEEK_CONTEXT_WINDOW, modelId)
+      ? deepseekContextWindow(modelId)
+      : configuredPositiveInteger(curated?.contextWindow, deepseekContextWindow(modelId)),
+    maxTokens: Object.prototype.hasOwnProperty.call(DEEPSEEK_MAX_OUTPUT_TOKENS, modelId)
+      ? deepseekMaxOutputTokens(modelId)
+      : configuredPositiveInteger(curated?.maxTokens, deepseekMaxOutputTokens(modelId)),
   };
 }
 
@@ -542,7 +586,7 @@ export function buildCustomOpenAICompatibleModel(
       supportsStore: false,
       supportsReasoningEffort: !!config.reasoningEffort,
       supportsStrictMode: false,
-      maxTokensField: 'max_tokens',
+      supportsLongCacheRetention: false,
     },
   };
 }
@@ -562,11 +606,14 @@ export async function createCustomOpenAICompatibleProvider(
   if (!config.modelId) throw new Error('custom: modelId required');
   if (!config.baseUrl) throw new Error('custom: baseUrl required');
   const mod = await ca();
+  const compatibility = createCustomOutputLimitCompatibility(config);
   return mod.createPiProvider({
     provider: 'custom',
     apiKey: config.apiKey,
     customModel: buildCustomOpenAICompatibleModel(config.modelId, config),
-    onPayload: repairOpenAICompatiblePayload,
+    normalizeLiteralLeadingThinkText: true,
+    onPayload: payload => compatibility.onPayload(repairOpenAICompatiblePayload(payload)),
+    wrapFetch: compatibility.wrapFetch,
     ...(config.reasoningEffort ? { defaultReasoning: config.reasoningEffort } : {}),
   });
 }

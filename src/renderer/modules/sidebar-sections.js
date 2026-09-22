@@ -59,17 +59,6 @@
     );
   }
 
-  function trackSidebarSectionToggle(detail, monitor) {
-    try {
-      if (monitor && typeof monitor.click === 'function') {
-        monitor.click('sidebar_section_toggle', {
-          section: detail.name,
-          control_state: detail.collapsed ? 'close' : 'open',
-        });
-      }
-    } catch (_) {}
-  }
-
   function initSidebarSections(doc, storage, translate, onToggle) {
     const state = readCollapsedState(storage);
     const applyAll = () => SECTION_CONFIG.forEach((config) => {
@@ -99,7 +88,6 @@
       localStorage,
       (key, params) => t(key, params),
       (detail) => {
-        trackSidebarSectionToggle(detail, window.Monitor);
         window.dispatchEvent(new CustomEvent('sidebar-section-toggle', { detail }));
       },
     );
@@ -113,7 +101,6 @@
       readCollapsedState,
       applySectionState,
       initSidebarSections,
-      trackSidebarSectionToggle,
     };
   }
   if (typeof document !== 'undefined') {

@@ -299,6 +299,7 @@ async function runQualityBenchmark(
         let terminalEvent: any = null;
         const toolNames: string[] = [];
         const historyReadModes: string[] = [];
+        const handoffWorkspaceSnapshots: Record<string, string | null>[] = [];
         const t0 = Date.now();
         const result = await run({
           uid,
@@ -307,7 +308,9 @@ async function runQualityBenchmark(
           agentName: `Benchmark ${entry.type}`,
           currentMessageId,
           cli: entry.type,
-          ...(projectId ? { projectId, permissionPolicy: 'full_access' } : {}),
+          ...(projectId ? { projectId } : {}),
+          // These isolated fixtures test capability selection, not unattended approval UI.
+          ...(projectId || (scenario as any).permissionPolicy === 'full_access' ? { permissionPolicy: 'full_access' } : {}),
           ...(entry.type === 'codex' ? { modelOverride: process.env.EVAL_MODEL || 'gpt-5.5', customArgs: ['-c', 'model_provider="openai"'] } : {}),
           prompt: scenario.prompt,
           cwd,
@@ -317,6 +320,15 @@ async function runQualityBenchmark(
             if (event?.type === 'done') terminalEvent = event;
             if (event?.type === 'tool-event' && event?.phase === 'use' && event?.tool) {
               toolNames.push(String(event.tool));
+              if (scenario.id === 'local-agent-skill-source-and-install'
+                && /orkas_handoff_to_commander$/i.test(String(event.tool))) {
+                const snapshot: Record<string, string | null> = {};
+                for (const relPath of scenario.observedFiles) {
+                  try { snapshot[relPath] = fs.readFileSync(path.join(cwd, relPath), 'utf8'); }
+                  catch { snapshot[relPath] = null; }
+                }
+                handoffWorkspaceSnapshots.push(snapshot);
+              }
               const historyReadMode = classifyCurrentHistoryReadMode(event.tool, event.input);
               if (historyReadMode) historyReadModes.push(historyReadMode);
             }
@@ -341,6 +353,7 @@ async function runQualityBenchmark(
           workspaceFiles: listWorkspaceFiles(cwd),
           toolNames,
           historyReadModes,
+          handoffWorkspaceSnapshots,
           commanderHandoff: result.commanderHandoff || null,
         });
         const cliLogAnalysis = cliLogs.finish();

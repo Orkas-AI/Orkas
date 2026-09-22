@@ -191,7 +191,6 @@ function loadHarness(
   elements.set(send.id, send);
 
   const invokeCalls: Array<{ channel: string; payload: any }> = [];
-  const monitor = { event: vi.fn(), error: vi.fn() };
   const warn = vi.fn();
   let sendClicks = 0;
   send.click = async () => { sendClicks += 1; };
@@ -265,7 +264,6 @@ function loadHarness(
       createElement: (tagName: string) => makeEl(tagName),
     },
     window: {
-      Monitor: true,
       orkas: {
         invoke: async (channel: string, payload: any) => {
           invokeCalls.push({ channel, payload });
@@ -273,7 +271,6 @@ function loadHarness(
         },
       },
     },
-    Monitor: monitor,
   };
   context.window.window = context.window;
   vm.createContext(context);
@@ -288,7 +285,6 @@ function loadHarness(
     input,
     send,
     invokeCalls,
-    monitor,
     warn,
     flushTimers,
     get sendClicks() { return sendClicks; },
@@ -326,18 +322,6 @@ describe('delete-file-confirm batching', () => {
     expect(h.input.value).toBe('Confirmed, please continue.');
     expect(card.classList.contains('is-confirmed')).toBe(true);
     expect(card.querySelector('.delete-confirm-result')?.textContent).toBe('Deletion confirmed for 2 files');
-    expect(h.monitor.event).toHaveBeenCalledOnce();
-    expect(h.monitor.event).toHaveBeenCalledWith(
-      'delete_file_confirmation_result',
-      expect.objectContaining({
-        result: 'success',
-        decision: 'allow',
-        file_count: 2,
-        failed_count: 0,
-      }),
-    );
-    expect(JSON.stringify(h.monitor.event.mock.calls)).not.toContain('tok-a');
-    expect(JSON.stringify(h.monitor.event.mock.calls)).not.toContain('a.txt');
   });
 
   it('cancels every token in the grouped card without auto-continuing', async () => {
@@ -373,7 +357,7 @@ describe('delete-file-confirm batching', () => {
     expect(pathTexts(h.history.children[1])).toEqual(['new.txt']);
   });
 
-  it('aggregates response failures without leaking confirmation ids or paths', async () => {
+  it('contains response failures without leaking confirmation ids or paths', async () => {
     const h = loadHarness(async (channel, payload) => {
       if (channel === 'delete_file.respond' && payload.confirm_id === 'private-token-b') {
         return { ok: false, error: '/Users/test/private/secret.txt' };
@@ -389,24 +373,8 @@ describe('delete-file-confirm batching', () => {
     });
     await h.history.children[0].querySelector('[data-delete-act="cancel"]')!.click();
 
-    expect(h.monitor.event).toHaveBeenCalledWith(
-      'delete_file_confirmation_result',
-      expect.objectContaining({
-        result: 'failure',
-        decision: 'deny',
-        file_count: 2,
-        failed_count: 1,
-        error_type: 'ipc',
-        error_code: 'response_failed',
-      }),
-    );
-    expect(h.monitor.error).not.toHaveBeenCalled();
-    const diagnostics = JSON.stringify([
-      h.monitor.event.mock.calls,
-      h.monitor.error.mock.calls,
-      h.warn.mock.calls,
-    ]);
-    expect(diagnostics).not.toContain('/Users/alice');
+    const diagnostics = JSON.stringify(h.warn.mock.calls);
+    expect(diagnostics).not.toContain('/Users/test/private');
     expect(diagnostics).not.toContain('private-token');
     expect(diagnostics).not.toContain('private-cid');
   });
