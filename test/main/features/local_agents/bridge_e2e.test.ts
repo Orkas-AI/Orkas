@@ -476,6 +476,9 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         expect(await autoTasks.getTask(TEST_UID, automationId)).toMatchObject({ project_id: pid, enabled: false });
         const { createAutoTasksTool } = await import('../../../../src/main/features/auto_tasks_tool');
         const nativeAuto = createAutoTasksTool({ userId: TEST_UID, projectId: pid });
+        const automationSchema = listed.result.tools.find((t: any) => t.name === 'auto_tasks').inputSchema;
+        expect(automationSchema).toEqual(nativeAuto.inputSchema);
+        expect(JSON.stringify(listed.result.tools)).not.toMatch(/"(?:oneOf|anyOf)":/);
         const queryAuto = { action: 'list', enabled: false, offset: 0, limit: 1 };
         const autoPage = await client.request(90, 'tools/call', { name: 'auto_tasks', arguments: queryAuto });
         const nativeAutoPage = JSON.parse((await nativeAuto.execute(queryAuto, { state: {} })).content);

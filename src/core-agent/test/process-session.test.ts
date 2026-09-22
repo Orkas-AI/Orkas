@@ -94,16 +94,8 @@ describe("persistent process sessions", () => {
   it("advertises action requirements and rejects fields from another lifecycle action", async () => {
     const processSession = tool("process_session");
     const schema = processSession.inputSchema as any;
-    const branches = Object.fromEntries(schema.oneOf.map((branch: any) => [
-      branch.properties.action.enum[0],
-      branch.required,
-    ]));
-    expect(branches).toEqual({
-      start: ["action", "command"],
-      read: ["action", "session_id"],
-      write: ["action", "session_id", "chars"],
-      stop: ["action", "session_id"],
-    });
+    expect(schema.required).toEqual(["action"]);
+    expect(schema).not.toHaveProperty("oneOf");
 
     const rejected = await processSession.execute({
       action: "read",

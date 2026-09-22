@@ -283,15 +283,13 @@ describe('persisted tool-result retrieval', () => {
 
   it('explains record-relative explode syntax at the provider boundary', () => {
     const schema = toToolDefinition(getTool(tools, 'tool_result')).inputSchema as any;
-    const structured = schema.properties.requests.items.oneOf.find(
-      (shape: any) => shape.properties.explode,
-    );
-    const description = structured.properties.explode.description;
+    const request = schema.properties.requests.items;
+    const description = request.properties.explode.description;
     expect(description).toMatch(/record-relative/i);
     expect(description).toMatch(/no dataset prefix or \[\]/i);
-    expect(structured.description).toMatch(/With explode, field, filters.field and group_by/);
-    expect(structured.description).toMatch(/\$item\.<field>[\s\S]*\$parent\.<field>[\s\S]*\$index/);
-    expect(structured.description).toContain('scalar items use $item');
+    expect(description).toMatch(/With explode, field, filters.field and group_by/);
+    expect(description).toMatch(/\$item\.<field>[\s\S]*\$parent\.<field>[\s\S]*\$index/);
+    expect(description).toContain('scalar items use $item');
     expect(description).not.toContain('Subsequent paths');
   });
 
@@ -411,7 +409,6 @@ describe('persisted tool-result retrieval', () => {
       pattern?: string;
       properties?: Record<string, Schema>;
       items?: Schema;
-      oneOf?: Schema[];
     };
     const definitions = tools.map(toToolDefinition);
     const refs: Schema[] = [];
@@ -420,12 +417,10 @@ describe('persisted tool-result retrieval', () => {
       if (schema.properties?.ref) refs.push(schema.properties.ref);
       for (const property of Object.values(schema.properties ?? {})) visit(property);
       visit(schema.items);
-      for (const branch of schema.oneOf ?? []) visit(branch);
     };
     for (const tool of definitions) visit(tool.inputSchema as Schema);
 
-    // search, structured aggregate, text count, read, materialize: one ref each.
-    expect(refs).toHaveLength(5);
+    expect(refs).toHaveLength(1);
     for (const schema of refs) {
       expect(schema.pattern).toBe(TOOL_RESULT_REF_SCHEMA_PATTERN);
       expect(schema.description).toMatch(/persisted-output/i);
@@ -439,45 +434,29 @@ describe('persisted tool-result retrieval', () => {
     }
   });
 
-  it('advertises one action-discriminated canonical batch request', async () => {
+  it('advertises one portable canonical batch request', async () => {
     expect(tools.map((tool) => tool.name)).toEqual(['tool_result']);
     const schema = getTool(tools, 'tool_result').inputSchema as any;
-    const branches = Object.fromEntries(schema.oneOf.map((branch: any) => [
-      branch.properties.action.enum[0], branch,
-    ]));
 
     expect(schema.required).toEqual(['action', 'requests']);
     expect(schema.properties.action.enum).toEqual(['search', 'query', 'read', 'materialize']);
-    // The action branches only bind `action`; the request shapes are advertised
-    // once as the `requests.items` union (the per-action pairing is enforced at
-    // runtime, see the rejected-shape case below).
-    expect(Object.keys(branches).sort()).toEqual(['materialize', 'query', 'read', 'search']);
-    for (const branch of Object.values(branches) as any[]) {
-      expect(Object.keys(branch.properties)).toEqual(['action']);
-    }
-    const shapes = schema.properties.requests.items.oneOf as any[];
-    expect(shapes).toHaveLength(5);
-    const byKeys = (keys: string[]) => shapes.find(
-      (shape) => JSON.stringify(Object.keys(shape.properties).sort()) === JSON.stringify([...keys].sort()),
-    );
-    expect(byKeys(['ref', 'query'])).toBeTruthy();
-    expect(byKeys(['ref', 'cursor', 'max_tokens'])).toBeTruthy();
-    expect(byKeys(['ref'])).toBeTruthy();
-    const structured = shapes.find((shape) => shape.properties.operation?.enum?.includes('sum'));
-    const textCount = shapes.find((shape) => shape.properties.match);
-    expect(structured.properties.operation.enum).toEqual(['count', 'sum', 'average', 'minimum', 'maximum']);
-    expect(structured.required).toEqual(['ref', 'operation']);
-    expect(structured.properties).not.toHaveProperty('match');
-    expect(structured.properties).not.toHaveProperty('count_unit');
-    expect(structured.description)
-      .toMatch(/\$item[\s\S]*\$parent[\s\S]*\$index/);
-    expect(textCount.required).toEqual(['ref', 'operation', 'match', 'count_unit']);
-    expect(textCount.properties).not.toHaveProperty('dataset');
+    expect(schema).not.toHaveProperty('oneOf');
+    const request = schema.properties.requests.items;
+    expect(request.required).toEqual(['ref']);
+    expect(request.additionalProperties).toBe(false);
+    expect(request).not.toHaveProperty('oneOf');
+    expect(request).not.toHaveProperty('anyOf');
+    expect(request.properties.operation.enum).toEqual(['count', 'sum', 'average', 'minimum', 'maximum']);
+    expect(request.properties).toEqual(expect.objectContaining({
+      ref: expect.any(Object), query: expect.any(Object), cursor: expect.any(Object),
+      max_tokens: expect.any(Object), operation: expect.any(Object), match: expect.any(Object),
+      count_unit: expect.any(Object), dataset: expect.any(Object),
+    }));
     expect(getTool(tools, 'tool_result').description).toMatch(/at most one tool_result call per model step/i);
-    expect(branches.materialize.properties.action.description)
+    expect(schema.properties.action.description)
       .toMatch(/full-data calculations.*query cannot express/);
-    expect(branches.read.properties.action.description).toMatch(/source excerpts/);
-    expect(branches.read.properties.action.description).not.toMatch(/query\/search cannot answer/);
+    expect(schema.properties.action.description).toMatch(/source excerpts/);
+    expect(schema.properties.action.description).not.toMatch(/query\/search cannot answer/);
 
     const invalid = await getTool(tools, 'tool_result').execute({
       action: 'unknown',

@@ -493,13 +493,14 @@ describe('tool-catalog', () => {
     const fingerprint = createHash('sha256')
       .update(JSON.stringify(schemas))
       .digest('hex');
-    // Requester-confirmed schema repair: chat_history closes each action
-    // branch so search/read cannot advertise fields the executor rejects.
-    // Existing runtime operations, scope grants, and legacy calls are unchanged.
+    // Requester-confirmed portable object schemas replace first-party action
+    // unions; executors retain conditional requirements and scope checks.
+    // XLSX cells use an equivalent primitive/object type array, and nested
+    // tool-result/automation unions are flattened without widening execution.
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('5606c89ec9be9bfc0d7a6c09b67c98940ed36a4e14381294b741e4434a93f76c');
+    ).toBe('4214c9aa583d6737d867d28ad27930c187cc2c973e50608f793de1896665bd85');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {

@@ -60,7 +60,8 @@ describe('todo_tasks tool', () => {
     const tool = createProjectTasksTool(handler);
     const schema = tool.inputSchema as any;
     expect(schema.additionalProperties).toBe(false);
-    expect(schema.oneOf).toHaveLength(5);
+    expect(schema).not.toHaveProperty('oneOf');
+    expect(schema.required).toEqual(['action']);
     expect(schema.properties.action.description).toContain('Omit unrelated fields');
 
     const result = await tool.execute({ action: 'complete', task_id: 't_9', status: 'done' }, ctx);

@@ -304,21 +304,13 @@ async function buildBashTool() {
 }
 
 describe('local-tools › interactive CLI action contract', () => {
-  it('advertises branch requirements and rejects cross-action fields before session lookup', async () => {
+  it('advertises a portable action schema and rejects cross-action fields before session lookup', async () => {
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
     const interactive = createLocalTools({ userId: UID, cid: CID })
       .find((tool) => tool.name === 'interactive_cli')!;
     const schema = interactive.inputSchema as any;
-    const branches = Object.fromEntries(schema.oneOf.map((branch: any) => [
-      branch.properties.action.enum[0],
-      branch.required,
-    ]));
-    expect(branches).toEqual({
-      start: ['action', 'command'],
-      read: ['action', 'session_id'],
-      send: ['action', 'session_id', 'input'],
-      close: ['action', 'session_id'],
-    });
+    expect(schema.required).toEqual(['action']);
+    expect(schema).not.toHaveProperty('oneOf');
 
     const rejected = await interactive.execute({
       action: 'close',

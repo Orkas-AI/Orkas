@@ -216,8 +216,8 @@ for (const row of page.records) text(row.value);` }, ctx());
         code: { type: "string" },
         path: { type: "string" },
       },
-      oneOf: [{ required: ["code"] }, { required: ["path"] }],
     });
+    expect(runProgram.inputSchema).not.toHaveProperty("oneOf");
     const pathDescription = (runProgram.inputSchema.properties as Record<string, { description: string }>).path.description;
     expect(pathDescription).toContain("Workspace-visible UTF-8 QuickJS source");
     expect(pathDescription).toContain("Use instead of code, not together");

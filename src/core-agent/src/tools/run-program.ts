@@ -235,13 +235,14 @@ export function createRunProgramTool(opts: CreateRunProgramToolOptions): AgentTo
     inputSchema: {
       type: "object",
       properties,
-      ...(supportsSourcePath
-        ? { oneOf: [{ required: ["code"] }, { required: ["path"] }] }
-        : { required: ["code"] }),
+      ...(!supportsSourcePath ? { required: ["code"] } : {}),
       additionalProperties: false,
     },
     executionTimeoutOwner: "executor",
     async execute(input, ctx) {
+      if ([input.code, input.path].some((value) => value != null && typeof value !== "string")) {
+        return incompleteResult("E_PROGRAM_BAD_INPUT", "`code` and `path` must be strings when supplied.", 0);
+      }
       const inlineCode = typeof input.code === "string" ? input.code : "";
       const requestedPath = typeof input.path === "string" ? input.path.trim() : "";
       if (Boolean(inlineCode.trim()) === Boolean(requestedPath)) {

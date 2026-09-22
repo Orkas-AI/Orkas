@@ -279,7 +279,7 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
     },
     explode: {
       type: 'string',
-      description: 'Expand one advertised array by its record-relative path; no dataset prefix or [].',
+      description: 'Expand one advertised array by its record-relative path; no dataset prefix or []. With explode, field, filters.field and group_by use $item.<field>, $parent.<field>, or $index; scalar items use $item.',
     },
     field: {
       type: 'string',
@@ -364,27 +364,28 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
     },
     required: ['ref', 'cursor'],
   };
-  const materializeRequest = {
-    type: 'object',
-    additionalProperties: false,
-    properties: { ref: refProperty() },
-    required: ['ref'],
-  };
   const actionProperty = {
     type: 'string',
     enum: ['search', 'query', 'read', 'materialize'],
-    description: 'Choose exactly one operation and use only that action\'s request fields.',
+    description: 'search: narrow text lookup; query: deterministic aggregates; read: exact source excerpts; materialize: session-scoped UTF-8 copies for full-data calculations that query cannot express. Use one operation per call.',
   };
-  // The request shapes are advertised once, as the union of `requests.items`;
-  // the action branches below only bind `action` to its purpose. Pairing each
-  // action with its request shape is enforced at runtime
-  // (`toolResultActionRequestError`), so repeating the full item schema per
-  // branch bought no enforcement and cost ~1,100 tokens on every model request.
-  const actionBranch = (action: ToolResultAction, description: string) => ({
+  // Conditional requirements and incompatible fields remain enforced by the
+  // selected action's executor. Keep one portable closed object for provider
+  // admission instead of nested union composition.
+  const requestSchema = {
+    type: 'object',
+    additionalProperties: false,
     properties: {
-      action: { type: 'string', enum: [action], description },
+      ...structuredRequest.properties,
+      query: searchRequest.properties.query,
+      match: textCountRequest.properties.match,
+      count_unit: textCountRequest.properties.count_unit,
+      cursor: readRequest.properties.cursor,
+      max_tokens: readRequest.properties.max_tokens,
     },
-  });
+    required: ['ref'],
+    description: 'Use only fields for the selected action. materialize takes ref only.',
+  };
   return {
     name: 'tool_result',
     description:
@@ -399,16 +400,10 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
           minItems: 1,
           maxItems: TOOL_RESULT_BATCH_MAX_ITEMS,
           description: 'One to eight same-action requests using only that action\'s fields (search: ref+query; query: ref+operation…; read: ref+cursor; materialize: ref). Retrieval actions share one 4K-token model-step budget.',
-          items: { oneOf: [searchRequest, structuredRequest, textCountRequest, readRequest, materializeRequest] },
+          items: requestSchema,
         },
       },
       required: ['action', 'requests'],
-      oneOf: [
-        actionBranch('search', 'Search 1-8 narrow text expressions; do not include cursor or aggregate fields.'),
-        actionBranch('query', 'Run 1-8 deterministic aggregates matching the marker data type.'),
-        actionBranch('read', 'Read 1-8 exact source excerpts by cursor for inspection; do not prefetch sequential chunks.'),
-        actionBranch('materialize', 'Create 1-8 session-scoped UTF-8 working copies for full-data calculations that query cannot express; process them with an available local runtime.'),
-      ],
     },
     async execute(input, ctx) {
       const action = String(input.action ?? '') as ToolResultAction;

@@ -674,7 +674,8 @@ describe('chat-history-tools › shape', () => {
     expect(schema.properties.scope.enum).toEqual(['current', 'all']);
     expect(chatHistory.inputSchema.required).toEqual(['action']);
     expect(JSON.stringify(chatHistory.inputSchema)).not.toMatch(/project/i);
-    expect(schema.oneOf).toHaveLength(2);
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema).not.toHaveProperty('oneOf');
   });
 
   it.each([false, true])('keeps action-specific schema validation aligned with execution (currentOnly=%s)', async (currentOnly) => {
@@ -708,25 +709,27 @@ describe('chat-history-tools › shape', () => {
       expect(result.isError).toBeFalsy();
       expect(result.content).toContain('contractword');
     }
-    // These are valid field types but belong to a different action. The
-    // sampled search+cid failure must be excluded by the advertised schema.
+    // Portable schemas admit known fields independently of the selected
+    // action; the executor still rejects cross-action combinations.
     for (const invalid of [
       { ...search, cid: 'sibling' },
       { ...read, query: 'contractword' },
       { ...read, k: 2 },
       { ...read, include_current: true },
-      { ...search, unknown_field: true },
     ]) {
-      expect(schema.Check(invalid), JSON.stringify(invalid)).toBe(false);
+      const hiddenFromCurrentOnly = currentOnly && ('cid' in invalid || 'include_current' in invalid);
+      expect(schema.Check(invalid), JSON.stringify(invalid)).toBe(!hiddenFromCurrentOnly);
       const result = await tool.execute(invalid, ctxFor());
       expect(result.isError).toBe(true);
       expect(result.content).toContain('unsupported field(s)');
     }
-    expect(schema.Check({ action: 'search', scope })).toBe(false);
+    const unknown = { ...search, unknown_field: true };
+    expect(schema.Check(unknown)).toBe(false);
+    expect((await tool.execute(unknown, ctxFor())).isError).toBe(true);
+    expect(schema.Check({ action: 'search', scope })).toBe(true);
+    expect((await tool.execute({ action: 'search', scope }, ctxFor())).isError).toBe(true);
     expect(schema.Check({ ...search, action: 'invalid' })).toBe(false);
-    // Legacy search+page is still tolerated at execution, but must not be
-    // advertised to models generating new calls.
-    expect(schema.Check({ ...search, page: read.page })).toBe(false);
+    expect(schema.Check({ ...search, page: read.page })).toBe(true);
   });
 
   it('keeps action guidance on the tool and paging semantics on their fields', async () => {
@@ -780,10 +783,8 @@ describe('chat-history-tools › shape', () => {
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', text: 'find schemaunionword here' },
     ]);
     const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
-    const searchBranch = (chatHistory.inputSchema as any).oneOf.find(
-      (branch: any) => branch.properties.action.enum[0] === 'search',
-    );
-    expect(searchBranch.properties).not.toHaveProperty('page');
+    expect((chatHistory.inputSchema as any).properties).toHaveProperty('page');
+    expect((chatHistory.inputSchema as any)).not.toHaveProperty('oneOf');
 
     const result = await chatHistory.execute({
       action: 'search',

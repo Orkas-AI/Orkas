@@ -25,7 +25,7 @@ describe('createMetacognitionTool', () => {
     expect((tool.inputSchema as any).properties.target).toBeDefined();
     expect((tool.inputSchema as any).required).toEqual(['action', 'target']);
     expect((tool.inputSchema as any).additionalProperties).toBe(false);
-    expect((tool.inputSchema as any).oneOf).toHaveLength(2);
+    expect((tool.inputSchema as any)).not.toHaveProperty('oneOf');
     expect((tool.inputSchema as any).properties.action.description)
       .toContain('Omit unrelated fields');
   });

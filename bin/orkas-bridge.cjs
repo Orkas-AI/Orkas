@@ -520,6 +520,19 @@ if (hasCapability('commander.handoff')) {
 
 async function main() {
   const transport = new StdioServerTransport();
+  if (hasCapability('automation')) {
+    const inputSchema = require('./auto-tasks-contract.cjs').inputSchema(z, true);
+    const send = transport.send.bind(transport);
+    // MCP's Zod conversion emits unions. Project only this owned discovery
+    // definition; keep the registered strict Zod validator for tools/call.
+    transport.send = (message, options) => send(
+      Array.isArray(message.result?.tools)
+        ? { ...message, result: { ...message.result, tools: message.result.tools.map(tool =>
+          tool.name === 'auto_tasks' ? { ...tool, inputSchema } : tool) } }
+        : message,
+      options,
+    );
+  }
   await server.connect(transport);
 }
 

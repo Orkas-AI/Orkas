@@ -536,10 +536,6 @@ export function createLibraryTool(opts: KbToolsOpts): AgentTool {
     type: 'string',
     description: 'Search: optional exact-path filter. Read: required Library-relative path. Omit for list.',
   };
-  const branch = (action: LibraryAction, required: string[]) => ({
-    properties: { action: { enum: [action] } },
-    required: ['action', ...required],
-  });
 
   return {
     name: 'library',
@@ -562,11 +558,6 @@ export function createLibraryTool(opts: KbToolsOpts): AgentTool {
         path: pathProperty,
       },
       required: ['action'],
-      oneOf: [
-        branch('list', (list.inputSchema.required as string[] | undefined) ?? []),
-        branch('search', (search.inputSchema.required as string[] | undefined) ?? []),
-        branch('read', (read.inputSchema.required as string[] | undefined) ?? []),
-      ],
     },
     async execute(input, ctx) {
       const action = String(input.action ?? '').trim() as LibraryAction;

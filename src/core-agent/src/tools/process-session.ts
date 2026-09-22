@@ -567,12 +567,6 @@ export const processSessionTool: AgentTool = defineTool({
       add_newline: { type: "boolean", description: "Write only. Append a newline; default false." },
     },
     required: ["action"],
-    oneOf: [
-      { properties: { action: { enum: ["start"] } }, required: ["action", "command"] },
-      { properties: { action: { enum: ["read"] } }, required: ["action", "session_id"] },
-      { properties: { action: { enum: ["write"] } }, required: ["action", "session_id", "chars"] },
-      { properties: { action: { enum: ["stop"] } }, required: ["action", "session_id"] },
-    ],
   },
   executionMode: "parallel",
   async execute(input, ctx) {
