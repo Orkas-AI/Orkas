@@ -116,15 +116,30 @@ export function localCliReauthorizationRequired(uid: string, catalogId: string):
 
 /** Only missing scope identifiers may cross IPC; never return granted scopes or identities. */
 export function localCliMissingPermissions(uid: string, catalogId: string): string[] | null {
-  if (!uid || !['feishu', 'lark', 'dingtalk', 'wecom', 'xero'].includes(catalogId)) return null;
+  return localCliPermissionRecovery(uid, catalogId).missingPermissions;
+}
+
+/** One bounded local read for both consent and advisory state. Only closed
+ * recovery kinds and missing user scopes cross IPC, never provider details. */
+export function localCliPermissionRecovery(uid: string, catalogId: string): {
+  missingPermissions: string[] | null; accessAdvisories: string[];
+} {
+  const empty = { missingPermissions: null, accessAdvisories: [] };
+  if (!uid || !['feishu', 'lark', 'dingtalk', 'wecom', 'xero'].includes(catalogId)) return empty;
   const contract = require(path.join(pcDirForChild(), 'bin/local-cli-permissions.cjs')) as {
     readPermissionRequest: (env: Record<string, string>) => { scopes: string[]; pat_scopes?: string[] } | null;
+    larkAccessIssues: (pending: unknown) => Array<{ recovery: string }>;
   };
   const pending = contract.readPermissionRequest({
     ORKAS_LOCAL_CLI_RUNTIME_DIR: localCliRuntimeDir(uid, catalogId),
     ORKAS_LOCAL_CLI_PROFILE: localCliProfileName(uid, catalogId),
   });
-  return pending ? [...new Set([...pending.scopes, ...(pending.pat_scopes || [])])].sort() : null;
+  if (!pending) return empty;
+  if (catalogId === 'feishu' || catalogId === 'lark') return {
+    missingPermissions: pending.scopes.length ? pending.scopes : null,
+    accessAdvisories: [...new Set(contract.larkAccessIssues(pending).map(issue => issue.recovery))],
+  };
+  return { missingPermissions: [...new Set([...pending.scopes, ...(pending.pat_scopes || [])])].sort(), accessAdvisories: [] };
 }
 
 const permissionChecks = new Map<string, { checkedAt: number; running?: Promise<void>; abort: AbortController }>();

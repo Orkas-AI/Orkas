@@ -482,9 +482,12 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     const env = envFor(provider as string);
     const runner = vi.fn(() => ({ status: 1, stdout: JSON.stringify(payload), stderr: '' }));
     await expect(adapter.inspectAction(provider === 'xero' ? 'contacts.list' : provider === 'dingtalk' ? 'doc.get' : provider === 'wecom' ? 'contact.get-user' : 'docs.+fetch', { runner }, env))
-      .rejects.toMatchObject({ code: 'connector_permission_denied', provider_error: { recovery: 'reauthorize' } });
+      .rejects.toMatchObject({ code: 'connector_permission_denied', provider_error: {
+        recovery: provider === 'lark' ? 'check_resource_access' : 'reauthorize',
+      } });
     expect(runner).toHaveBeenCalledOnce();
     expect(permissions.readPermissionRequest(env)).toMatchObject({ reauthorize: true, scopes: [] });
+    if (provider === 'lark') expect(permissions.structuredPermissionFailure(runner(), provider).message).not.toContain('reauthorize');
   });
 
   it.each([
@@ -526,19 +529,21 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     },
   );
 
-  it('still offers reauthorization when the accumulated scope list exceeds the bounded explicit request', () => {
+  it('retains an access advisory when the accumulated Lark scope list exceeds the bounded explicit request', () => {
     const env = envFor('lark');
     permissions.rememberPermissionRequest({ provider_error: { type: 'authorization', identity: 'user',
       missing_scopes: Array.from({ length: 51 }, (_, index) => `resource:scope${index}`),
     } }, env);
-    expect(permissions.readPermissionRequest(env)).toMatchObject({ reauthorize: true, scopes: [] });
+    expect(permissions.readPermissionRequest(env)).toMatchObject({ reauthorize: true, scopes: [],
+      access_issues: [{ recovery: 'check_resource_access' }] });
   });
 
-  it.each([230013, 99991679])('retains Lark API permission code %s and offers reauthorization', code => {
+  it.each([230013, 99991679])('retains Lark API permission code %s with the applicable access recovery', code => {
     const env = envFor('lark');
     const error = lark.structuredFailure({ status: 1, stdout: JSON.stringify({ ok: false, error: { type: 'api', code } }), stderr: '' });
     permissions.rememberPermissionRequest(error, env);
-    expect(error).toMatchObject({ code: 'connector_permission_denied', provider_error: { type: 'api', code, recovery: 'reauthorize' } });
+    expect(error).toMatchObject({ code: 'connector_permission_denied', provider_error: { type: 'api', code,
+      recovery: code === 230013 ? 'check_bot_availability' : 'check_resource_access' } });
     expect(permissions.readPermissionRequest(env)).toMatchObject({ reauthorize: true, scopes: [] });
   });
 
@@ -698,7 +703,7 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     expect(execute.mock.calls).toEqual(Array(3).fill([['auth', 'init', '--noninteractive', '--no-browser']]));
   });
 
-  it('forces Lark authorization without missing scope names and preserves old grants through cancellation and retry', async () => {
+  it('preserves cancellation and old grants without mistaking unknown Lark access for an authorization failure', async () => {
     const env = envFor('lark');
     permissions.rememberPermissionRequest({ code: 'connector_permission_denied' }, env);
     const oldScopes = ['im:message.send_as_user', 'offline_access'];
@@ -708,7 +713,7 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     await expect(auth.authorizeLark('', '', auth.MANIFESTS.lark, env, deps)).rejects.toThrow('cancelled');
     expect(permissions.readPermissionRequest(env)).not.toBeNull();
     execute.mockImplementation(async () => undefined);
-    await expect(auth.authorizeLark('', '', auth.MANIFESTS.lark, env, deps)).rejects.toThrow('permissions could not be verified');
+    await expect(auth.authorizeLark('', '', auth.MANIFESTS.lark, env, deps)).resolves.toBeUndefined();
     expect(execute).toHaveBeenCalledTimes(2);
     expect(execute).toHaveBeenLastCalledWith([...auth.MANIFESTS.lark.login(env)[1], '--scope', oldScopes.join(' ')]);
     expect(authorizationReady).toHaveBeenLastCalledWith(oldScopes);
@@ -722,21 +727,39 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     }) });
   }
 
-  it('keeps a Lark bot visibility denial after confirming the requested user scope', async () => {
+  it('completes Lark user authorization while retaining the separate bot access advisory', async () => {
     const env = envFor('lark');
     lark.rememberPermissionRequest(permissionError('bot'), env);
     lark.rememberPermissionRequest(permissionError('user'), env);
     const execute = vi.fn(async () => undefined);
     await expect(auth.authorizeLark('', '', auth.MANIFESTS.lark, env, {
       execute, authorizationReady: () => true, authorizationScopes: () => ['offline_access'],
-    })).rejects.toThrow('permissions could not be verified');
+    })).resolves.toBeUndefined();
     expect(execute).toHaveBeenCalledExactlyOnceWith([
       'auth', 'login', '--profile', 'file-contract', '--scope', 'im:message.send_as_user offline_access',
     ]);
+    expect(permissions.readPermissionRequest(env)).toMatchObject({ scopes: [], unresolved_access: true,
+      access_issues: [{ identity: 'bot', recovery: 'check_app_permissions' }] });
     auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, () => ok({ identities: { user: {
       available: true, verified: true, scope: 'im:message.send_as_user offline_access',
     } } }));
     expect(permissions.readPermissionRequest(env)).toMatchObject({ scopes: [], unresolved_access: true });
+  });
+
+  it('recovers a legacy stuck Lark record without treating unknown access as restored', async () => {
+    const env = envFor('lark');
+    fs.writeFileSync(path.join(env.ORKAS_LOCAL_CLI_RUNTIME_DIR, '.orkas-user-permissions.json'), JSON.stringify({
+      profile: env.ORKAS_LOCAL_CLI_PROFILE, reauthorize: true, scopes: [], unresolved_access: true,
+    }));
+    const execute = vi.fn(async () => undefined);
+    const deps = { execute, authorizationReady: () => true,
+      authorizationScopes: () => ['im:message.send_as_user', 'offline_access'] };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(auth.authorizeLark('', '', auth.MANIFESTS.lark, env, deps)).resolves.toBeUndefined();
+      expect(permissions.readPermissionRequest(env)).toMatchObject({ scopes: [], unresolved_access: true,
+        access_issues: [{ identity: 'unknown', recovery: 'check_resource_access' }] });
+    }
+    expect(execute.mock.calls.every(([args]: any) => args[0] === 'auth' && args[1] === 'login')).toBe(true);
   });
 
   it.each(['missing_scope', 'token_scope_insufficient'])(
@@ -829,23 +852,57 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     expect(lark.readPermissionRequest(env)?.scopes).toEqual(['im:message.send_as_user']);
   });
 
-  it('offers reauthorization without inventing scopes when the provider supplies no scope list', () => {
+  it('retains an unknown access advisory without inventing scopes when the provider supplies no scope list', () => {
     const env = envFor('lark');
     const error = permissionError();
     delete error.provider_error.missing_scopes;
     lark.rememberPermissionRequest(error, env);
     expect(lark.readPermissionRequest(env)?.scopes).toEqual([]);
+    expect(error.provider_error.recovery).toBe('check_resource_access');
   });
 
   it.each([['bot', 'missing_scope'], ['bot', 'token_scope_insufficient'], ['', 'missing_scope'],
     ['user', 'app_scope_not_applied'], ['user', 'access_denied']])(
-    'offers reauthorization for %s/%s without requiring IM scope metadata', (identity, subtype) => {
+    'separates business access recovery for %s/%s from user consent', (identity, subtype) => {
       const env = envFor('lark');
-      lark.rememberPermissionRequest(permissionError(identity, subtype), env);
-      expect(lark.readPermissionRequest(env)?.reauthorize).toBe(true);
-      if (identity !== 'user') expect(lark.readPermissionRequest(env)?.scopes).toEqual([]);
+      const error = permissionError(identity, subtype);
+      lark.rememberPermissionRequest(error, env);
+      const recovery = identity === 'bot' || subtype === 'app_scope_not_applied'
+        ? 'check_app_permissions' : 'check_resource_access';
+      expect(error.provider_error.recovery).toBe(recovery);
+      expect(lark.readPermissionRequest(env)).toMatchObject({ scopes: [], access_issues: [{ recovery }] });
     },
   );
+
+  it.each(['same-scope', 'bot-access'])('preserves a newer %s denial arriving during successful Lark authorization', async variant => {
+    const env = envFor('lark');
+    permissions.rememberPermissionRequest(permissionError(), env);
+    let newer;
+    const execute = vi.fn(async () => {
+      permissions.rememberPermissionRequest(permissionError(variant === 'same-scope' ? 'user' : 'bot'), env);
+      newer = permissions.readPermissionRequest(env);
+    });
+    await auth.authorizeLark('', '', auth.MANIFESTS.lark, env, {
+      execute, authorizationReady: () => true, authorizationScopes: () => ['offline_access'],
+    });
+    expect(permissions.readPermissionRequest(env)).toEqual(newer);
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('bounds repeated bot denials and retains their structured reason without provider prose', () => {
+    const env = envFor('lark');
+    for (let index = 0; index < 100; index++) {
+      const error = lark.structuredFailure({ status: 1, stderr: '', stdout: JSON.stringify({
+        ok: false, identity: 'bot', error: { type: 'api', code: 230013, message: `private-recipient-${index}` },
+      }) });
+      permissions.rememberPermissionRequest(error, env);
+      expect(error.provider_error.recovery).toBe('check_bot_availability');
+    }
+    const pending = permissions.readPermissionRequest(env);
+    expect(pending.access_issues).toEqual([{ identity: 'bot', recovery: 'check_bot_availability', code: 230013 }]);
+    expect(JSON.stringify(pending)).not.toContain('private-recipient');
+    expect(Buffer.byteLength(JSON.stringify(pending))).toBeLessThan(1024);
+  });
 
   it('verifies requested scope membership as well as the user identity', () => {
     const env = envFor('lark');

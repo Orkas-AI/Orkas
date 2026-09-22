@@ -117,6 +117,23 @@ describe('connector setup assistance', () => {
     expect(ordinary.innerHTML).not.toContain('permission-notice');
   });
 
+  it.each(['check_bot_availability', 'check_app_permissions', 'check_resource_access'])(
+    'shows %s guidance without offering OAuth for a business-only advisory', recovery => {
+      const ctx = loadConnectorsRenderer();
+      const entry = { id: 'feishu', display_name: 'Feishu', auth_mode: 'local_cli' };
+      const instance = { id: 'feishu', status: { kind: 'connected' }, access_advisories: [recovery, '<untrusted>'] };
+      const card = ctx._renderCatalogCard(entry, instance);
+      expect(card.innerHTML).toContain('data-act="use-connector"');
+      expect(card.innerHTML).not.toContain('connectors.action.authorize_permissions');
+      expect(card.querySelector('[data-role="access-notice"]').textContent).toBe('connectors.permissions.' + recovery);
+      const mixed = ctx._renderCatalogCard(entry, { ...instance, reauthorization_required: true,
+        missing_permissions: ['im:message.send_as_user'] });
+      expect(mixed.innerHTML).toContain('connectors.action.authorize_permissions');
+      expect(mixed.innerHTML).toContain('data-role="permission-notice"');
+      expect(mixed.querySelector('[data-role="access-notice"]').textContent).toBe('connectors.permissions.' + recovery);
+    },
+  );
+
   it('names DingTalk message permission and preserves unknown identifiers as text', () => {
     const ctx = loadConnectorsRenderer();
     ctx.t = (key: string, args: any = {}) => `${key} ${args.permissions || ''}`.trim();
