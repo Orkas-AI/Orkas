@@ -2073,7 +2073,6 @@ describe('runner › scoped tool loading', () => {
         description: string;
         inputSchema: {
           properties?: Record<string, { description?: string }>;
-          oneOf?: Array<{ required: string[] }>;
         };
       }>;
     };
@@ -2094,10 +2093,7 @@ describe('runner › scoped tool loading', () => {
     expect(programDefinition().inputSchema.properties?.path?.description)
       .toContain('execute exactly as saved');
     expect(programDefinition().description).not.toContain('read_files raw_text:true');
-    expect(programDefinition().inputSchema.oneOf).toEqual([
-      { required: ['code'] },
-      { required: ['path'] },
-    ]);
+    expect(programDefinition().inputSchema).not.toHaveProperty('oneOf');
     const savedResult = await runner.tools.get('run_program')?.execute(
       { path: 'saved-program.js' },
       { workingDir: workspace, state: {}, signal: undefined },

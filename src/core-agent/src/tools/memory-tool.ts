@@ -118,12 +118,6 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
         },
       },
       required: ['action'],
-      oneOf: [
-        { properties: { action: { const: 'add' } }, required: ['content'] },
-        { properties: { action: { const: 'replace' } }, required: ['old_text', 'content'] },
-        { properties: { action: { const: 'remove' } }, required: ['old_text'] },
-        { properties: { action: { const: 'list' } } },
-      ],
     },
 
     async execute(input: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {

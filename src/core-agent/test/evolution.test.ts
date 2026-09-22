@@ -451,12 +451,8 @@ describe("Evolution: skill_manage tool", () => {
     expect(action.description).toContain("list: no fields");
     expect(action.description).toContain("create: id/name/description/body");
     expect(action.description).toContain("patch: id/old_string/new_string");
-    const branches = Object.fromEntries(schema.oneOf.map((branch: any) => [
-      branch.properties.action.enum[0],
-      branch.required,
-    ]));
-    expect(branches.patch).toEqual(["action", "id", "old_string", "new_string"]);
-    expect(branches.create).toEqual(["action", "id", "name", "description", "body"]);
+    expect(schema.required).toEqual(["action"]);
+    expect(schema).not.toHaveProperty("oneOf");
   });
 
   it("rejects fields from another skill action", async () => {

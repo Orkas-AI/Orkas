@@ -1,6 +1,5 @@
 /** One host-bound automation executor shared by Commander, named Agents, and CLI. */
 import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 import type { AgentTool } from '../../core-agent/src/tools/base';
 import * as autoTasks from './auto_tasks';
 import { projectExists } from './projects';
@@ -31,7 +30,7 @@ export function createAutoTasksTool(opts: { userId: string; cid?: string; projec
   return {
     name: 'auto_tasks',
     description: contract.description,
-    inputSchema: zodToJsonSchema(schema) as any,
+    inputSchema: contract.inputSchema(z, !!opts.projectId),
     async execute(input) {
       const fail = (error: string) => ({ content: JSON.stringify({ ok: false, error }), isError: true });
       const parsed = schema.safeParse(input);

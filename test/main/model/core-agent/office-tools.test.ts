@@ -204,8 +204,9 @@ describe('Office built-in tools', () => {
     });
     expect(Object.keys(schema.properties)).toEqual(['path', 'sheets', 'preview']);
     const sheetProps = schema.properties.sheets.items.properties;
-    const cellObjectSchema = sheetProps.rows.items.items.oneOf.find((item: any) => item.type === 'object');
-    const cellProps = cellObjectSchema.properties;
+    const cellSchema = sheetProps.rows.items.items;
+    expect(cellSchema.type).toEqual(['string', 'number', 'boolean', 'object']);
+    const cellProps = cellSchema.properties;
     const chartProps = sheetProps.charts.items.properties;
     expect(cellProps).toEqual(expect.objectContaining({
       formula: expect.any(Object),
@@ -818,8 +819,7 @@ describe('Office built-in tools', () => {
   it('shares the XLSX cell property contract between create_xlsx and XLSX edit operations', () => {
     const create = getTool('create_xlsx').inputSchema as any;
     const edit = getTool('edit_office').inputSchema as any;
-    const createCell = create.properties.sheets.items.properties.rows.items.items.oneOf
-      .find((item: any) => item.type === 'object').properties;
+    const createCell = create.properties.sheets.items.properties.rows.items.items.properties;
     const editProps = edit.properties.operations.items.properties.props;
 
     for (const key of ['value', 'formula', 'format', 'type', 'bold', 'italic', 'fill', 'font.name', 'font.color']) {

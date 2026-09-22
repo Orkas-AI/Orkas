@@ -123,14 +123,6 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
         result_ref: { type: 'string', description: "Delivering conversation, artifact, or file reference. In a Project conversation, save produced project files with library_save and use its returned path; outside one, use the file path." },
       },
       required: ['action'],
-      oneOf: actions.map((action) => ({
-        properties: { action: { const: action } },
-        required: [
-          ...(selector && action !== 'list_projects' ? ['project'] : []),
-          ...(action === 'create' ? ['title'] : []),
-          ...(['get', 'update', 'complete'].includes(action) ? ['task_id'] : []),
-        ],
-      })),
     },
 
     async execute(input: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {

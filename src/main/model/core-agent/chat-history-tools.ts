@@ -726,27 +726,8 @@ export function createChatHistoryTool(opts: ChatHistoryToolsOpts): AgentTool {
         ...readProperties,
         scope: scopeProperty,
       },
+      additionalProperties: false,
       required: currentOnly ? ['action', 'scope'] : ['action'],
-      oneOf: [
-        {
-          // The root owns field types/descriptions; each closed branch owns
-          // which fields its action accepts. An action enum alone does not
-          // exclude the other action's root-level properties.
-          properties: {
-            action: { enum: ['search'] },
-            ...Object.fromEntries(Object.keys(searchProperties).map((key) => [key, {}])),
-          },
-          additionalProperties: false,
-          required: ['query'],
-        },
-        {
-          properties: {
-            action: { enum: ['read'] },
-            ...Object.fromEntries(Object.keys(readProperties).map((key) => [key, {}])),
-          },
-          additionalProperties: false,
-        },
-      ],
     },
     async execute(input, ctx) {
       const action = String(input.action ?? '').trim() as ChatHistoryAction;

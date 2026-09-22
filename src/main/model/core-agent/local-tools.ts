@@ -4392,12 +4392,6 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
         reason: { type: 'string', description: 'Close only. Brief reason for a forced close.' },
       },
       required: ['action'],
-      oneOf: [
-        { properties: { action: { enum: ['start'] } }, required: ['action', 'command'] },
-        { properties: { action: { enum: ['read'] } }, required: ['action', 'session_id'] },
-        { properties: { action: { enum: ['send'] } }, required: ['action', 'session_id', 'input'] },
-        { properties: { action: { enum: ['close'] } }, required: ['action', 'session_id'] },
-      ],
     },
     async execute(input, ctx) {
       const action = String(input.action ?? '') as InteractiveCliAction;

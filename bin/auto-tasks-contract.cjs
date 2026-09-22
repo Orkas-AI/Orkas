@@ -29,3 +29,38 @@ exports.shape = (z, bound) => {
     limit: z.number().int().min(1).max(50).optional().describe('List only; default 20. Pages may be smaller to bound result size.'),
   };
 };
+
+/** Portable discovery only; shape() remains the strict execution validator. */
+exports.inputSchema = (z, bound) => {
+  const { zodToJsonSchema } = require('zod-to-json-schema');
+  const schema = zodToJsonSchema(z.object(exports.shape(z, bound)).strict(), { $refStrategy: 'none' });
+  const fields = schema.properties;
+  const flatten = (union, discriminator, description) => ({
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      ...Object.assign({}, ...union.anyOf.map(branch => branch.properties)),
+      [discriminator]: {
+        type: 'string',
+        enum: union.anyOf.map(branch => branch.properties[discriminator].const),
+        description,
+      },
+    },
+    required: [discriminator],
+    ...(union.description ? { description: union.description } : {}),
+  });
+  fields.schedule = flatten(fields.schedule, 'type', 'one_time requires at; hourly requires interval_hours; daily requires hour/minute; weekly also requires weekday; monthly also requires day. Omit fields belonging to other types.');
+  fields.recipient = flatten(fields.recipient, 'kind', 'commander takes kind only; agent also requires id and name.');
+  const cutoff = fields.end_condition;
+  fields.end_condition = {
+    ...flatten(cutoff.anyOf[0], 'type', 'date requires date; count requires max_runs. Omit fields belonging to the other type.'),
+    type: ['object', 'null'],
+    description: cutoff.description,
+  };
+  for (const name of ['project_id', 'skill', 'connector']) {
+    if (!fields[name]) continue;
+    const { anyOf, ...metadata } = fields[name];
+    fields[name] = { ...anyOf[0], ...metadata, type: [anyOf[0].type, 'null'] };
+  }
+  return schema;
+};

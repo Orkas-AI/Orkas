@@ -56,7 +56,7 @@ describe('createCrossSessionMemoryTool', () => {
       expect(properties.action.description).toContain('use list only');
       expect(properties.action.description).toContain('Omit unrelated fields');
       expect(def.inputSchema.additionalProperties).toBe(false);
-      expect(def.inputSchema.oneOf).toHaveLength(4);
+      expect(def.inputSchema).not.toHaveProperty('oneOf');
       expect(warn).not.toHaveBeenCalled();
     } finally {
       warn.mockRestore();

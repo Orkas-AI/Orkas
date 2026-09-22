@@ -58,10 +58,6 @@ export function createMetacognitionTool(
         },
       },
       required: ['action', 'target'],
-      oneOf: [
-        { properties: { action: { const: 'read' } } },
-        { properties: { action: { const: 'write' } }, required: ['content'] },
-      ],
     },
 
     async execute(input: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {
