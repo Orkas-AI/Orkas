@@ -1,11 +1,15 @@
-import { createAutoTasksTool } from '../../../../src/main/features/auto_tasks_tool';
 import {
   createExecutionPlanTool,
   getBuiltinTools,
   type AgentTool,
 } from '../../../../src/core-agent/src/tools';
+import { createSkillManageTool } from '../../../../src/core-agent/src/evolution/skill-tools';
+import type { SkillStore } from '../../../../src/core-agent/src/evolution/skill-store';
 import { createCrossSessionMemoryTool } from '../../../../src/core-agent/src/tools/memory-tool';
 import { createMetacognitionTool } from '../../../../src/core-agent/src/tools/metacognition-tool';
+import { createProjectTasksTool } from '../../../../src/core-agent/src/tools/project-tasks-tool';
+import { createRunProgramTool } from '../../../../src/core-agent/src/tools/run-program';
+import { createAutoTasksTool } from '../../../../src/main/features/auto_tasks_tool';
 import { createChatHistoryTool } from '../../../../src/main/model/core-agent/chat-history-tools';
 import { createFileTools, createLocalTools } from '../../../../src/main/model/core-agent/local-tools';
 import { createGenerateSpeechTool } from '../../../../src/main/model/core-agent/generate-speech-tool';
@@ -15,12 +19,8 @@ import { createLibraryTool } from '../../../../src/main/model/core-agent/kb-tool
 import { createOfficeTools } from '../../../../src/main/model/core-agent/office-tools';
 import { createPdfTools } from '../../../../src/main/model/core-agent/pdf-tools';
 import { createVideoGenTool } from '../../../../src/main/model/core-agent/video-gen-tool';
-import { buildBrowserTool } from '../../../../src/main/features/group_chat/browser_tool';
-import { createSkillManageTool } from '../../../../src/core-agent/src/evolution/skill-tools';
-import type { SkillStore } from '../../../../src/core-agent/src/evolution/skill-store';
-import { createRunProgramTool } from '../../../../src/core-agent/src/tools/run-program';
-import { createProjectTasksTool } from '../../../../src/core-agent/src/tools/project-tasks-tool';
 import { createToolResultTools } from '../../../../src/main/model/core-agent/tool-result-tools';
+import { buildBrowserTool } from '../../../../src/main/features/group_chat/browser_tool';
 
 /** Late/runtime definitions omitted from the common actor-budget corpus below.
  * Dependencies fail closed: schema inspection must not read or mutate state. */
@@ -32,7 +32,11 @@ export function enumerateRuntimeSchemaTools(): AgentTool[] {
     createAutoTasksTool({ userId: 'schema-probe' }),
     createProjectTasksTool({ list: fail, get: fail, create: fail, update: fail, complete: fail }),
     createRunProgramTool({ listToolNames: () => [], invokeTool: fail, loadSourceFile: fail }),
-    ...createToolResultTools({ toolResultsDir: '/unused', materializeDir: '/unused', isProgrammaticToolCallContext: () => false }),
+    ...createToolResultTools({
+      toolResultsDir: '/unused',
+      materializeDir: '/unused',
+      isProgrammaticToolCallContext: () => false,
+    }),
   ];
 }
 

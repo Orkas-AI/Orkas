@@ -761,8 +761,7 @@ function chatHistoryActionError(
   input: Record<string, unknown>,
 ): string | null {
   const unexpected = Object.keys(input).filter(
-    (key) => !Object.values(CHAT_HISTORY_ACTION_FIELDS).some((fields) => fields.has(key))
-      || (action === 'search' && ['cid', 'record_id', 'turn_id', 'tool_call_id'].includes(key)),
+    (key) => !CHAT_HISTORY_ACTION_FIELDS[action].has(key),
   );
   if (!unexpected.length) return null;
   return `chat_history(${action}): unsupported field(s): ${unexpected.sort().join(', ')}`;

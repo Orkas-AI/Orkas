@@ -206,6 +206,7 @@ describe('Office built-in tools', () => {
     expect(Object.keys(schema.properties)).toEqual(['path', 'sheets', 'preview']);
     const sheetProps = schema.properties.sheets.items.properties;
     const cellObjectSchema = sheetProps.rows.items.items;
+    expect(cellObjectSchema.type).toEqual(['string', 'number', 'boolean', 'object']);
     const cellProps = cellObjectSchema.properties;
     const chartProps = sheetProps.charts.items.properties;
     expect(cellProps).toEqual(expect.objectContaining({

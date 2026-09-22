@@ -753,6 +753,7 @@ describe('chat-history-tools › shape', () => {
     expect(chatHistory.inputSchema.required).toEqual(['action']);
     expect(JSON.stringify(chatHistory.inputSchema)).not.toMatch(/project/i);
     expect(schema.oneOf).toBeUndefined();
+    expect(schema.additionalProperties).toBe(false);
   });
 
   it.each([false, true])('keeps common schema types and execution-time action checks (currentOnly=%s)', async (currentOnly) => {
@@ -786,22 +787,27 @@ describe('chat-history-tools › shape', () => {
       expect(result.isError).toBeFalsy();
       expect(result.content).toContain('contractword');
     }
-    for (const harmless of [{ ...read, query: 'contractword' }, { ...read, k: 2 }, ...(!currentOnly ? [{ ...read, include_current: true }] : []), { ...search, page: read.page }]) {
-      expect(schema.Check(harmless)).toBe(true);
-      const result = await tool.execute(harmless, ctxFor());
-      expect(result.isError).toBeFalsy();
-      expect(result.content).toContain('contractword');
-    }
-    for (const invalid of [{ ...search, cid: 'sibling' }, ...['record_id', 'turn_id', 'tool_call_id'].map(key => ({ ...search, [key]: 'selected-record' })), { ...search, unknown_field: true }]) {
+    // Portable schemas admit known fields independently of the selected
+    // action; the executor still rejects cross-action combinations.
+    for (const invalid of [
+      { ...search, cid: 'sibling' },
+      ...['record_id', 'turn_id', 'tool_call_id'].map(key => ({ ...search, [key]: 'selected-record' })),
+      { ...read, query: 'contractword' },
+      { ...read, k: 2 },
+      { ...read, include_current: true },
+    ]) {
+      const hiddenFromCurrentOnly = currentOnly && ('cid' in invalid || 'include_current' in invalid);
+      expect(schema.Check(invalid), JSON.stringify(invalid)).toBe(!hiddenFromCurrentOnly);
       const result = await tool.execute(invalid, ctxFor());
       expect(result.isError).toBe(true);
       expect(result.content).toContain('unsupported field(s)');
     }
+    const unknown = { ...search, unknown_field: true };
+    expect(schema.Check(unknown)).toBe(false);
+    expect((await tool.execute(unknown, ctxFor())).isError).toBe(true);
     expect(schema.Check({ action: 'search', scope })).toBe(true);
     expect((await tool.execute({ action: 'search', scope }, ctxFor())).isError).toBe(true);
     expect(schema.Check({ ...search, action: 'invalid' })).toBe(false);
-    // Optional fields coexist in the portable schema; execution owns their action semantics.
-    expect(schema.Check({ ...search, page: read.page })).toBe(true);
   });
 
   it('keeps action guidance on the tool and paging semantics on their fields', async () => {
@@ -841,7 +847,7 @@ describe('chat-history-tools › shape', () => {
     expect((chatHistory.inputSchema as any).required).toEqual(['action', 'scope']);
   });
 
-  it('rejects a missing action and preserves exact read lookup despite extra search text', async () => {
+  it('rejects a missing action and cross-action read fields', async () => {
     const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
     const missingAction = await chatHistory.execute({ query: 'x' }, ctxFor());
     const crossActionField = await chatHistory.execute({
@@ -850,7 +856,7 @@ describe('chat-history-tools › shape', () => {
     expect(missingAction.isError).toBe(true);
     expect(missingAction.content).toContain('`action`');
     expect(crossActionField.isError).toBe(true);
-    expect(crossActionField.content).not.toContain('unsupported field(s)');
+    expect(crossActionField.content).toContain('unsupported field(s)');
   });
 
   it('retains runtime compatibility for legacy search calls that carried read paging metadata', async () => {
@@ -858,6 +864,8 @@ describe('chat-history-tools › shape', () => {
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', text: 'find schemaunionword here' },
     ]);
     const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
+    expect((chatHistory.inputSchema as any).properties).toHaveProperty('page');
+    expect((chatHistory.inputSchema as any)).not.toHaveProperty('oneOf');
 
     const result = await chatHistory.execute({
       action: 'search',

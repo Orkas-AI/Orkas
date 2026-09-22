@@ -413,11 +413,13 @@ async function buildBashTool() {
 }
 
 describe('local-tools › interactive CLI action contract', () => {
-  it('uses a portable schema and ignores send fields during close', async () => {
+  it('advertises a portable action schema and rejects cross-action fields before session lookup', async () => {
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
     const interactive = createLocalTools({ userId: UID, cid: CID })
       .find((tool) => tool.name === 'interactive_cli')!;
     const schema = interactive.inputSchema as any;
+    expect(schema.required).toEqual(['action']);
+    expect(schema).not.toHaveProperty('oneOf');
 
     const rejected = await interactive.execute({
       action: 'close',

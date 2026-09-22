@@ -2368,7 +2368,6 @@ describe('runner › scoped tool loading', () => {
         description: string;
         inputSchema: {
           properties?: Record<string, { description?: string }>;
-          oneOf?: Array<{ required: string[] }>;
         };
       }>;
     };

@@ -340,7 +340,7 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
   const actionProperty = {
     type: 'string',
     enum: ['search', 'query', 'read', 'materialize'],
-    description: 'search: narrow text lookup; query: deterministic aggregates; read: exact source excerpts; materialize: session-scoped UTF-8 copies for calculations query cannot express. Use one operation per call.',
+    description: 'search: narrow text lookup; query: deterministic aggregates; read: exact source excerpts; materialize: session-scoped UTF-8 copies for full-data calculations that query cannot express. Use one operation per call.',
   };
   return {
     name: 'tool_result',

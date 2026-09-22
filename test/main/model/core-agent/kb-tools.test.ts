@@ -467,7 +467,7 @@ describe('kb-tools › shape', () => {
     expect(library.inputSchema.required).toEqual(['action']);
   });
 
-  it('uses a portable schema and ignores search text on exact reads', async () => {
+  it('advertises one portable schema while enforcing action-specific fields', async () => {
     const library = await createLibrary();
     const schema = library.inputSchema as any;
     expect(schema.properties).toHaveProperty('scope');
@@ -475,6 +475,7 @@ describe('kb-tools › shape', () => {
     expect(schema.properties).toHaveProperty('path');
     expect(schema.additionalProperties).toBe(false);
     expect(schema.oneOf).toBeUndefined();
+    expect(schema.required).toEqual(['action']);
 
     const missingAction = await library.execute({ query: 'alpha' }, ctxFor());
     await seedFiles();
