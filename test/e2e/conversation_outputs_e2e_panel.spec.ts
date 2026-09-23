@@ -79,6 +79,50 @@ function wavBytes(): Buffer {
 
 test.describe.configure({ timeout: 120_000 });
 
+test('task details remembers open and closed panels and each selected tab across navigation', async ({ orkas }) => {
+  const page = orkas.page!;
+  const first = (await orkas.invoke<any>('conversations.create', { title: 'Details state first' })).conversation.conversation_id;
+  const second = (await orkas.invoke<any>('conversations.create', { title: 'Details state second' })).conversation.conversation_id;
+  await page.evaluate(() => (window as any).loadConversations());
+  const enter = (cid: string) => page.evaluate(id => (window as any).setView('conversation', id), cid);
+  const panel = page.locator('#conversation-info-panel');
+  const toggle = page.locator('#conversation-info-toggle');
+  const tab = (name: string) => panel.locator(`[data-info-tab="${name}"]`);
+
+  await enter(first);
+  await expect(panel).toBeHidden();
+  await toggle.click();
+  await tab('attachments').click();
+  await enter(second);
+  await expect(panel).toBeHidden();
+  await toggle.click();
+  await expect(tab('files')).toHaveClass(/is-active/);
+  await tab('browser').click();
+  await expect(page.locator('.web-assist-shell')).toBeVisible();
+  await enter(first);
+  await expect(panel).toBeVisible();
+  await expect(tab('attachments')).toHaveClass(/is-active/);
+  await expect(page.locator('.web-assist-shell')).toBeHidden();
+  await page.locator('#conversation-info-close').click();
+  await enter(second);
+  await expect(panel).toBeVisible();
+  await expect(tab('browser')).toHaveClass(/is-active/);
+  await expect(page.locator('.web-assist-shell')).toBeVisible();
+  await enter(first);
+  await expect(panel).toBeHidden();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await toggle.click();
+  await expect(tab('attachments')).toHaveClass(/is-active/);
+  await page.evaluate(() => (window as any).setView('connectors'));
+  await enter(first);
+  await expect(panel).toBeVisible();
+  await expect(tab('attachments')).toHaveClass(/is-active/);
+  await toggle.click();
+  await page.evaluate(() => (window as any).setView('connectors'));
+  await enter(first);
+  await expect(panel).toBeHidden();
+});
+
 test('surfaces produced files, outside files, and artifacts for one conversation', async ({ orkas }, testInfo) => {
   const page = orkas.page!;
   const uid = 'account-e2e';
