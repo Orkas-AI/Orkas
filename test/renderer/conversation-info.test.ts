@@ -121,6 +121,38 @@ function renderFilesHtml(snapshot: {
 }
 
 describe('ConversationInfo files tab', () => {
+  it('restores each task panel visibility and selected tab after switching away and back', async () => {
+    await renderFilesResult({ history: [], files: { items: [] } }, context => {
+      const info = context.window.ConversationInfo;
+      const panel = context.document.getElementById('conversation-info-panel');
+      const body = context.document.getElementById('conversation-info-body');
+      info.openAndSetTab('browser');
+      info.bind('c2');
+      expect(panel.hidden).toBe(true);
+      expect(body.hidden).toBe(false);
+      info.openAndSetTab('attachments');
+      info.bind('c1');
+      expect(panel.hidden).toBe(false);
+      expect(body.hidden).toBe(true);
+      info.close();
+      info.bind('c2');
+      expect(panel.hidden).toBe(false);
+      expect(body.hidden).toBe(false);
+      info.bind('c1');
+      expect(panel.hidden).toBe(true);
+      info.open();
+      expect(body.hidden).toBe(true);
+      info.unbind();
+      expect(panel.hidden).toBe(true);
+      info.bind('c1');
+      expect(panel.hidden).toBe(false);
+      expect(body.hidden).toBe(true);
+      // A same-task view refresh must also preserve visibility.
+      info.bind('c1');
+      expect(panel.hidden).toBe(false);
+    });
+  });
+
   it('only reveals a task-scoped browser in the currently displayed and bound task', async () => {
     await renderFilesResult({ history: [], files: { items: [] } }, context => {
       const info = context.window.ConversationInfo;

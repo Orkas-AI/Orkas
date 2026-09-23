@@ -17,6 +17,8 @@ const ConversationInfo = (() => {
   let _cid = null;
   let _open = false;
   let _activeTab = 'files';
+  // Renderer-session preferences belong to each task, not the shared panel DOM.
+  const _panelStateByCid = new Map();
   let _panelResize = null;
   let _seq = 0;
   let _fileSeq = 0;
@@ -853,8 +855,13 @@ const ConversationInfo = (() => {
   }
 
   function bind(cid) {
+    if (_cid) _panelStateByCid.set(_cid, { open: _open, tab: _activeTab });
+    _panelResize?.finish();
     _cid = cid || null;
-    _open = false;
+    const saved = _cid ? _panelStateByCid.get(_cid) : null;
+    _open = saved?.open || false;
+    _activeTab = saved?.tab || 'files';
+    if (_open) window.VideoReviewPanel?.close();
     _expandedDirectoryPaths.clear();
     _snapshot = { conversation: null, history: [], files: [], filesTruncated: false, filesCount: 0, filesScanSkipped: false, syncEnabled: false, attachments: [] };
     _error = '';
