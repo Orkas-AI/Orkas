@@ -54,6 +54,28 @@ async function createProject(orkas: OrkasTestApp, name: string): Promise<void> {
 }
 
 test.describe('projects', () => {
+  test('keeps member invitation visible as a commercial download guide', async ({ orkas }) => {
+    const projectName = 'E2E Invite Guide';
+    await createProject(orkas, projectName);
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    const row = page.locator('.project-row', {
+      has: page.locator('.project-name', { hasText: projectName }),
+    });
+    await row.hover();
+    await row.locator('[data-project-menu]').click();
+    const invite = page.locator('#project-row-menu [data-action="invite-members"]');
+    await expect(invite).toBeVisible();
+    await invite.click();
+    const dialog = page.locator('.ui-dialog-overlay:visible');
+    const guidance = await page.evaluate(() => (globalThis as any).t('project.invite_members.commercial_only'));
+    await expect(dialog.locator('.ui-dialog-message')).toHaveText(guidance);
+    await expect(dialog.locator('[data-act="ok"]')).toBeVisible();
+    await dialog.locator('[data-act="cancel"]').click();
+    await expect(page.locator('.ui-dialog-overlay:visible')).toHaveCount(0);
+    await expect(row).toHaveCount(1);
+  });
+
   test('creates a project and keeps it after an app relaunch', async ({ orkas }) => {
     const projectName = 'E2E Persistent Project';
     await createProject(orkas, projectName);

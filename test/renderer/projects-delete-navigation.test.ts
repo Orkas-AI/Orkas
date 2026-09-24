@@ -95,6 +95,80 @@ function loadProjectsRenderer(options: {
 }
 
 describe('project delete navigation', () => {
+  it('offers member invitation, explains the commercial membership, and opens the localized download page only on consent', async () => {
+    const context = loadProjectsRenderer({ afterProjects: [], afterConversations: [] });
+    const dialogs: any[] = [];
+    const opened: any[] = [];
+    context.getLang = () => 'zh';
+    context.uiConfirm = async (options: any) => { dialogs.push(options); return true; };
+    context.window.orkas.invoke = async (channel: string, payload: any) => {
+      opened.push({ channel, payload });
+      return { ok: true };
+    };
+    const item: any = {
+      dataset: { action: 'invite-members' },
+      addEventListener(_type: string, listener: (event: any) => void) { this.click = listener; },
+    };
+    const menu: any = {
+      dataset: {}, style: { display: 'none' }, innerHTML: '',
+      querySelectorAll: () => [item],
+      getBoundingClientRect: () => ({ width: 160, height: 90 }),
+    };
+    context.document.getElementById = () => menu;
+    context.document.querySelectorAll = () => [];
+    context.window.innerWidth = 1024;
+    context.window.innerHeight = 768;
+    const anchor = {
+      closest: () => null,
+      getBoundingClientRect: () => ({ left: 100, right: 140, top: 100, bottom: 120 }),
+    };
+
+    context._openProjectRowMenu(anchor, 'private-project');
+    expect(menu.innerHTML).toContain('data-action="invite-members"');
+    expect(menu.innerHTML).toContain('project.menu.invite_members');
+    await item.click({ stopPropagation() {} });
+
+    expect(dialogs).toEqual([{
+      message: 'project.invite_members.commercial_only',
+      okLabel: 'project.invite_members.download',
+      cancelLabel: 'common.cancel',
+    }]);
+    expect(opened).toEqual([{
+      channel: 'auth.openExternal',
+      payload: { url: 'https://orkas.ai/download/?lang=zh' },
+    }]);
+    for (const lang of ['en', 'zh', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it']) {
+      const locale = JSON.parse(fs.readFileSync(path.join(__dirname, `../../src/renderer/locales/${lang}.json`), 'utf8'));
+      expect(locale['project.menu.invite_members']).toBeTruthy();
+      expect(locale['project.invite_members.commercial_only']).toBeTruthy();
+      expect(locale['project.invite_members.download']).toBeTruthy();
+      expect(locale['project.invite_members.open_failed']).toBeTruthy();
+    }
+  });
+
+  it('does not open a commercial page on cancel and reports an open failure', async () => {
+    const context = loadProjectsRenderer({ afterProjects: [], afterConversations: [] });
+    const opened: any[] = [];
+    const alerts: string[] = [];
+    context.getLang = () => 'en';
+    context.uiAlert = async (message: string) => { alerts.push(message); };
+    context.uiConfirm = async () => false;
+    context.window.orkas.invoke = async (channel: string, payload: any) => {
+      opened.push({ channel, payload });
+      return { ok: false };
+    };
+
+    await context._runProjectMenuAction('invite-members', 'private-project');
+    expect(opened).toEqual([]);
+    context.uiConfirm = async () => true;
+    await context._runProjectMenuAction('invite-members', 'private-project');
+    expect(opened).toEqual([{
+      channel: 'auth.openExternal',
+      payload: { url: 'https://orkas.ai/download/?lang=en' },
+    }]);
+    expect(alerts).toEqual(['project.invite_members.open_failed']);
+  });
+
   it('renders a running-count mount beside each idle Project title', () => {
     const context = loadProjectsRenderer({
       afterProjects: [],
