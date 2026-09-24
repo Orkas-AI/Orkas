@@ -1662,7 +1662,7 @@ function createTabWithinLimit(
   const removable = tabCapacityVictims(record, conversationId, openerId);
   if (!removable) return null;
   // Allocate first: a native-view creation failure must not lose existing work.
-  // createTab does not emit state, so the renderer never sees an eleventh tab.
+  // createTab does not emit state, so the renderer never sees tabs beyond the limit.
   const tab = createTab(record, conversationId, label, createdBy, options);
   for (const old of removable) removeTab(record, old, false);
   return { tab, closedTabIds: removable.map(old => old.id) };
@@ -1671,7 +1671,7 @@ function createTabWithinLimit(
 function tabLimitFailure() {
   return {
     ok: false as const, code: 'too_many_tabs', tab_limit: MAX_TABS_PER_CONVERSATION,
-    error: 'This task has reached its 10-tab limit with no safely removable old model tab. Reuse an existing tab with navigate, or close an unneeded tab before opening another.',
+    error: `This task has reached its ${MAX_TABS_PER_CONVERSATION}-tab limit with no safely removable old model tab. Reuse an existing tab with navigate, or close an unneeded tab before opening another.`,
   };
 }
 
