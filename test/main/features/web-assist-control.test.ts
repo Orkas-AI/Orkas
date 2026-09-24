@@ -1603,7 +1603,7 @@ describe('Web Assist controlled connector lifecycle', () => {
     if (!created.at(-1)?.ok) throw new Error('tab setup failed');
     expect(created.at(-1)!.state.tabs).toHaveLength(TAB_LIMIT);
     expect(addWebAssistTab('u1', renderer, { conversationId: 'c-limit' }))
-      .toMatchObject({ ok: false, code: 'too_many_tabs' });
+      .toMatchObject({ ok: false, code: 'too_many_tabs', error: expect.stringContaining(`${TAB_LIMIT}-tab limit`) });
     await expect(openWebAssist('u1', renderer, {
       conversationId: 'c-limit',
       url: 'https://example.com/eleventh',
