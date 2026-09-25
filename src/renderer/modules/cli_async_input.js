@@ -155,6 +155,11 @@
         }
         row.appendChild(choices);
         input.addEventListener('input', () => choose(input.value));
+        input.addEventListener('keydown', event => {
+          if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;
+          event.preventDefault();
+          submit.click();
+        });
         row.appendChild(input);
         host.appendChild(row);
       }
@@ -336,6 +341,11 @@
         if (picks[index].join(', ') !== input.value) picks[index] = [];
         paintOptions(index);
         updateSubmit();
+      });
+      input.addEventListener('keydown', event => {
+        if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;
+        event.preventDefault();
+        submit.click();
       });
       row.appendChild(input);
       host.appendChild(row);
