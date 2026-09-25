@@ -11042,6 +11042,7 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   min-width: 0;
 }
 .skill-picker-item-meta .skill-picker-item-name {
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
