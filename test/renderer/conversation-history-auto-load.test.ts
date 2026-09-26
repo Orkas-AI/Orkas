@@ -85,6 +85,46 @@ describe('conversation history auto-load', () => {
     expect(calls).toBe(0);
   });
 
+  it('loads older history on user gestures during the search jump scroll grace', () => {
+    const listeners: Record<string, (event?: { deltaY?: number }) => void> = {};
+    const calls: Array<[string, number]> = [];
+    const row = { dataset: { state: 'idle', cursor: '120', cid: 'c1' } };
+    const container = {
+      scrollTop: 0,
+      querySelector: () => row,
+      addEventListener: (name: string, listener: (event?: { deltaY?: number }) => void) => {
+        listeners[name] = listener;
+      },
+    };
+    const context: any = {
+      Number,
+      String,
+      currentCid: 'c1',
+      HISTORY_AUTO_LOAD_THRESHOLD: 48,
+      _isProgrammaticStickyScroll: () => true,
+      _loadOlderConversationHistory: (cid: string, cursor: number) => {
+        calls.push([cid, cursor]);
+      },
+      _setEarlierHistoryLoaderState: () => {},
+    };
+    vm.createContext(context);
+    vm.runInContext([
+      extractFunction('_historyNextCursor'),
+      extractFunction('_maybeAutoLoadEarlierHistory'),
+      extractFunction('_bindAutoLoadEarlierHistory'),
+    ].join('\n'), context);
+
+    context._bindAutoLoadEarlierHistory(container);
+    listeners.scroll();
+    expect(calls).toEqual([]);
+    listeners.wheel({ deltaY: 1 });
+    expect(calls).toEqual([]);
+    listeners.wheel({ deltaY: -1 });
+    expect(calls).toEqual([['c1', 120]]);
+    listeners.touchmove();
+    expect(calls).toEqual([['c1', 120], ['c1', 120]]);
+  });
+
   it('keeps the previous reading anchor after prepending older content', () => {
     const context: any = { Number, Math };
     vm.createContext(context);
