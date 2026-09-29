@@ -1578,6 +1578,7 @@ function _settingsBuildCustomModelPayload(values) {
   const maxTokens = String(values.maxTokens ?? '').trim();
   return {
     label: String(values.label || '').trim(),
+    protocol: values.protocol === 'anthropic' ? 'anthropic' : 'openai',
     baseUrl: _settingsNormalizeCustomBaseUrl(values.baseUrl),
     model: String(values.model || '').trim(),
     apiKey: String(values.apiKey || '').trim(),
@@ -1605,6 +1606,13 @@ function _settingsShowCustomModelForm(provider) {
       <input type="text" class="custom-label-input form-input" placeholder="${escapeHtml(t('settings.custom.label_placeholder'))}" autocomplete="off" spellcheck="false" />
     </div>
     <div class="form-row">
+      <label>${escapeHtml(t('settings.custom.protocol'))}</label>
+      <select class="custom-protocol-input form-input">
+        <option value="openai">OpenAI-compatible</option>
+        <option value="anthropic">Anthropic Messages</option>
+      </select>
+    </div>
+    <div class="form-row">
       <label>${escapeHtml(t('settings.custom.base_url'))}</label>
       <input type="text" class="custom-base-url-input form-input" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" />
     </div>
@@ -1626,6 +1634,7 @@ function _settingsShowCustomModelForm(provider) {
   actions.innerHTML = '';
 
   const labelInput = body.querySelector('.custom-label-input');
+  const protocolInput = body.querySelector('.custom-protocol-input');
   const baseUrlInput = body.querySelector('.custom-base-url-input');
   const modelInput = body.querySelector('.custom-model-input');
   const maxTokensInput = body.querySelector('.custom-max-tokens-input');
@@ -1644,6 +1653,7 @@ function _settingsShowCustomModelForm(provider) {
     const startedAt = Date.now();
     const payload = _settingsBuildCustomModelPayload({
       label: labelInput.value,
+      protocol: protocolInput.value,
       baseUrl: baseUrlInput.value,
       model: modelInput.value,
       maxTokens: maxTokensInput.value,
@@ -1692,7 +1702,8 @@ function _settingsShowCustomModelForm(provider) {
       if (e.key === 'Enter') { next.focus(); e.preventDefault(); }
     });
   };
-  focusNextOnEnter(labelInput, baseUrlInput);
+  focusNextOnEnter(labelInput, protocolInput);
+  focusNextOnEnter(protocolInput, baseUrlInput);
   focusNextOnEnter(baseUrlInput, modelInput);
   focusNextOnEnter(modelInput, maxTokensInput);
   focusNextOnEnter(maxTokensInput, keyInput);

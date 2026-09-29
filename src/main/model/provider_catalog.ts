@@ -707,6 +707,8 @@ export function providerUsesCustomOpenAIConfig(id: string): boolean {
 }
 
 export interface CustomOpenAICompatibleRuntimeConfig {
+  /** Wire protocol; omitted legacy configs use OpenAI-compatible chat completions. */
+  protocol?: 'openai' | 'anthropic';
   baseUrl: string;
   contextWindow: number;
   maxTokens: number;
