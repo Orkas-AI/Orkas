@@ -591,6 +591,31 @@ export function buildCustomOpenAICompatibleModel(
   };
 }
 
+export function buildCustomAnthropicModel(
+  modelId: string,
+  config: CustomOpenAICompatibleRuntimeConfig,
+): Model<'anthropic-messages'> {
+  return {
+    id: modelId,
+    name: modelId,
+    api: 'anthropic-messages',
+    provider: 'custom' as any,
+    baseUrl: config.baseUrl,
+    reasoning: config.supportsReasoning === true,
+    input: config.supportsVision === false ? ['text'] : ['text', 'image'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: config.contextWindow,
+    maxTokens: config.maxTokens,
+    compat: {
+      supportsDeveloperRole: false,
+      supportsStore: false,
+      supportsReasoningEffort: false,
+      supportsStrictMode: false,
+      supportsLongCacheRetention: false,
+    },
+  };
+}
+
 export async function createCustomOpenAICompatibleProvider(
   config: CreateCustomOpenAICompatibleProviderConfig,
 ): Promise<LLMProvider> {
@@ -607,12 +632,17 @@ export async function createCustomOpenAICompatibleProvider(
   if (!config.baseUrl) throw new Error('custom: baseUrl required');
   const mod = await ca();
   const compatibility = createCustomOutputLimitCompatibility(config);
+  const isAnthropic = config.protocol === 'anthropic';
   return mod.createPiProvider({
     provider: 'custom',
     apiKey: config.apiKey,
-    customModel: buildCustomOpenAICompatibleModel(config.modelId, config),
+    customModel: isAnthropic
+      ? buildCustomAnthropicModel(config.modelId, config)
+      : buildCustomOpenAICompatibleModel(config.modelId, config),
     normalizeLiteralLeadingThinkText: true,
-    onPayload: payload => compatibility.onPayload(repairOpenAICompatiblePayload(payload)),
+    onPayload: payload => isAnthropic
+      ? compatibility.onPayload(payload)
+      : compatibility.onPayload(repairOpenAICompatiblePayload(payload)),
     wrapFetch: compatibility.wrapFetch,
     ...(config.reasoningEffort ? { defaultReasoning: config.reasoningEffort } : {}),
   });

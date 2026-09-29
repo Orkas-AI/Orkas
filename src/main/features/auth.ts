@@ -187,8 +187,9 @@ interface ApiKeyProfile {
   provider: string;
   label: string;
   key: string;
-  /** Present only for the `custom` OpenAI-compatible provider. */
+  /** Present only for the custom provider. */
   baseUrl?: string;
+  protocol?: 'openai' | 'anthropic';
   contextWindow?: number;
   maxTokens?: number;
   supportsReasoning?: boolean;
@@ -1050,6 +1051,7 @@ function customRuntimeConfigFromProfile(
   if (!profile || profile.type !== 'api_key' || profile.provider !== CUSTOM_MODEL_PROVIDER) return null;
   try {
     const baseUrl = normalizeCustomModelBaseUrl(profile.baseUrl || '');
+    const protocol = profile.protocol === 'anthropic' ? 'anthropic' : 'openai';
     const contextWindow = normalizeCustomTokenLimit(
       profile.contextWindow,
       DEFAULT_CUSTOM_CONTEXT_WINDOW,
@@ -1065,6 +1067,7 @@ function customRuntimeConfigFromProfile(
       ? profile.reasoningEffort as 'low' | 'medium' | 'high'
       : undefined;
     return {
+      protocol,
       baseUrl,
       contextWindow,
       maxTokens,
@@ -1432,6 +1435,7 @@ export async function addApiKeyEntry(
 
 export interface AddCustomModelEntryInput {
   label?: string;
+  protocol?: 'openai' | 'anthropic' | string;
   baseUrl: string;
   model: string;
   apiKey: string;
@@ -1448,6 +1452,7 @@ export async function addCustomModelEntry(
 ): Promise<{ profileId: string; entryId: string }> {
   const rawLabel = String(input?.label || '').trim();
   const model = String(input?.model || '').trim();
+  const protocol = input?.protocol === 'anthropic' ? 'anthropic' : 'openai';
   const key = String(input?.apiKey || '').trim();
   if (!model) throw customConfigError('CUSTOM_MODEL_REQUIRED', 'Model ID required');
   if (!key) throw customConfigError('CUSTOM_API_KEY_REQUIRED', 'API key required');
@@ -1508,6 +1513,7 @@ export async function addCustomModelEntry(
     label: chosenLabel,
     key,
     baseUrl,
+    protocol,
     contextWindow,
     ...(maxTokens !== undefined ? { maxTokens } : {}),
     ...(input.supportsReasoning === true ? { supportsReasoning: true } : {}),

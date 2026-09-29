@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildCustomOpenAICompatibleModel,
+  buildCustomAnthropicModel,
   buildDeepSeekModel,
   buildDoubaoModel,
   buildMoonshotModel,
@@ -56,6 +57,22 @@ describe('external-providers › custom OpenAI-compatible model', () => {
     })).toMatchObject({
       reasoning: true,
       compat: { supportsReasoningEffort: true },
+    });
+  });
+});
+
+describe('external-providers › custom Anthropic model', () => {
+  it('uses the native Anthropic Messages API and preserves custom limits', () => {
+    expect(buildCustomAnthropicModel('claude-3-7-sonnet', {
+      baseUrl: 'https://gateway.example.test',
+      contextWindow: 200_000,
+      maxTokens: 8_192,
+    })).toMatchObject({
+      api: 'anthropic-messages',
+      baseUrl: 'https://gateway.example.test',
+      input: ['text', 'image'],
+      contextWindow: 200_000,
+      maxTokens: 8_192,
     });
   });
 });

@@ -416,6 +416,24 @@ describe('auth › listProviders grouping', () => {
 });
 
 describe('auth › custom OpenAI-compatible model configuration', () => {
+  it('persists Anthropic protocol and returns it in the runtime choice', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const added = await a.addCustomModelEntry({
+      protocol: 'anthropic',
+      baseUrl: 'https://gateway.example.test',
+      model: 'claude-3-7-sonnet',
+      apiKey: 'sk-custom-anthropic-xxxxxxxx',
+    });
+    expect((await a.pickChatEntryGroup()).find((entry) => entry.entryId === added.entryId)).toEqual(
+      expect.objectContaining({
+        customConfig: expect.objectContaining({
+          protocol: 'anthropic',
+          baseUrl: 'https://gateway.example.test',
+        }),
+      }),
+    );
+  });
+
   it('atomically stores endpoint metadata and carries it into the runtime choice', async () => {
     const a = await import('../../../src/main/features/auth');
     const added = await a.addCustomModelEntry({
