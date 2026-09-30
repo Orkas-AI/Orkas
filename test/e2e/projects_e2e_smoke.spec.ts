@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { expect, test, type OrkasTestApp } from './fixtures/orkas';
@@ -12,6 +12,16 @@ async function expectProjectFileReady(orkas: OrkasTestApp, projectId: string, fi
     const file = status.files.find((item) => item.path === fileName);
     return { status: file?.status, error: file?.error || null };
   }, { timeout: 40_000 }).toEqual({ status: 'ready', error: null });
+}
+
+/** The unprojected `cloud/chats` dir of whichever account the run activated. */
+function globalChatsDir(workspaceRoot: string): string {
+  for (const entry of readdirSync(workspaceRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const candidate = path.join(workspaceRoot, entry.name, 'cloud', 'chats');
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error('global chats dir not found');
 }
 
 async function createProject(orkas: OrkasTestApp, name: string): Promise<void> {
@@ -156,6 +166,8 @@ test.describe('projects', () => {
     await orkas.invoke('projects.tasks.delete', { projectId, taskId });
     await expect(todo).toHaveCount(0);
     await page.locator('[data-project-tab="tasks"]').click();
+    // Memory actions become interactive when the user hovers the entry.
+    await memory.hover();
     await memory.locator('[data-action="project-memory-delete"]').click();
     await expect(page.locator('.ui-dialog-overlay:visible .ui-dialog')).toBeVisible();
     await page.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
@@ -438,16 +450,21 @@ test.describe('projects', () => {
     const concurrentUiEdit = `${replacement}\nUse the July launch checklist.`;
     const staleModelReplacement = `${replacement}\nPublish on Friday.`;
     const conflictReply = 'E2E stale project-instructions replacement was rejected.';
-    modelOrkas.setProjectInstructionsScenario(staleModelReplacement, conflictReply, {
-      toolDelayMs: 750,
-    });
+    // Hold the tool response until the concurrent edit is actually persisted.
+    // A fixed delay races the IPC round trip on a busy host and can test the
+    // opposite ordering, where accepting the tool write is correct.
+    let releaseTool!: () => void;
+    const beforeTool = new Promise<void>((resolve) => { releaseTool = resolve; });
+    modelOrkas.setProjectInstructionsScenario(staleModelReplacement, conflictReply, { beforeTool });
     await page.locator('#chat-input').fill('Also add that publishing happens on Friday.');
     await page.locator('#chat-send-btn').click();
-    await expect.poll(() => modelOrkas.modelRequests.length).toBe(4);
-    await modelOrkas.invoke('projects.instructions.set', {
-      projectId,
-      content: concurrentUiEdit,
-    });
+    try {
+      await expect.poll(() => modelOrkas.modelRequests.length).toBe(4);
+      await modelOrkas.invoke('projects.instructions.set', {
+        projectId,
+        content: concurrentUiEdit,
+      });
+    } finally { releaseTool(); }
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
       hasText: conflictReply,
     })).toBeVisible({ timeout: 20_000 });
@@ -556,6 +573,12 @@ test.describe('projects', () => {
     const picker = page.locator('#project-binding-picker-overlay');
     await expect(picker).toBeVisible();
     const pickerDialog = picker.locator('.project-binding-picker-modal');
+    const headerCenters = await pickerDialog.evaluate((dialog) => {
+      const title = dialog.querySelector('.project-binding-picker-title')!.getBoundingClientRect();
+      const close = dialog.querySelector('.project-binding-picker-close')!.getBoundingClientRect();
+      return [title.top + title.height / 2, close.top + close.height / 2];
+    });
+    expect(Math.abs(headerCenters[0] - headerCenters[1])).toBeLessThan(2);
     const searchInput = picker.locator('#project-binding-picker-search-input');
     const initialPickerHeight = await pickerDialog.evaluate((element) => element.getBoundingClientRect().height);
     await expect(searchInput).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
@@ -780,4 +803,268 @@ test.describe('projects', () => {
     const relaunchedPage = await orkas.relaunch();
     await expect(relaunchedPage.locator('.project-name', { hasText: projectName })).toHaveCount(1);
   });
+
+  // Filing a loose task under a project relocates its messages, sessions,
+  // attachments and artifacts on disk, so the check is that the task still
+  // opens and reads the same afterwards — not just that a row moved.
+  test('keeps the conversation project picker modal and settles replaced pickers', async ({ orkas }) => {
+    const page = orkas.page!;
+    await page.evaluate(() => {
+      const host = window as any;
+      host.__pickerResult = 'pending';
+      host._openConversationProjectPicker([{ project_id: 'p_one', name: 'One' }])
+        .then((result: unknown) => { host.__pickerResult = result; });
+    });
+    const overlay = page.locator('#conv-project-picker-overlay');
+    const row = overlay.locator('.conv-project-pick-row');
+    await expect(row).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(overlay.locator('[data-act="cancel"]')).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(row).toBeFocused();
+    await page.evaluate(() => {
+      const host = window as any;
+      host.__replacementResult = 'pending';
+      host._openConversationProjectPicker([{ project_id: 'p_two', name: 'Two' }])
+        .then((result: unknown) => { host.__replacementResult = result; });
+    });
+    await expect.poll(() => page.evaluate(() => (window as any).__pickerResult)).toBe(null);
+    await expect(overlay.locator('.conv-project-pick-row')).toHaveText('Two');
+    await page.keyboard.press('Escape');
+    await expect(overlay).toHaveCount(0);
+    await expect.poll(() => page.evaluate(() => (window as any).__replacementResult)).toBe(null);
+    await page.evaluate(() => { (window as any)._openConversationProjectPicker([]); });
+    await expect(overlay.locator('[data-act="new"]')).toBeFocused();
+    await expect(overlay.locator('[data-act="ok"]')).toBeDisabled();
+    await page.keyboard.press('Escape');
+    await expect(overlay).toHaveCount(0);
+
+  });
+
+  test('hides commander-only agents and scrolls long project and agent lists inside the panel', async ({ orkas }, testInfo) => {
+    const page = orkas.page!;
+    const { conversation } = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', { title: 'Commander only' });
+    await page.evaluate(() => (window as any).loadConversations());
+    const row = page.locator(`#conversation-list .conv-item[data-cid="${conversation.conversation_id}"]`);
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="to-project"]').click();
+    const picker = page.locator('#conv-project-picker-overlay');
+    await expect(picker).toBeVisible();
+    await expect(picker.locator('.conv-project-agents')).toHaveCount(0);
+    await page.keyboard.press('Escape');
+
+    await page.setViewportSize({ width: 1000, height: 600 });
+    await page.evaluate(() => {
+      const host = window as any;
+      host.__longPickerResult = null;
+      host._openConversationProjectPicker(
+        Array.from({ length: 20 }, (_, index) => ({ project_id: `p_${index}`, name: `Project ${index + 1}` })),
+        Array.from({ length: 20 }, (_, index) => ({ id: `agent_${index}`, name: `Agent ${index + 1}` })),
+      ).then((result: unknown) => { host.__longPickerResult = result; });
+    });
+    await expect(picker.getByRole('checkbox')).toHaveCount(20);
+    for (const [selector, max] of [['.conv-project-pick-list', 252], ['.conv-project-agent-list', 150]] as const) {
+      const list = picker.locator(selector);
+      const metrics = await list.evaluate((el) => ({ height: el.clientHeight, content: el.scrollHeight }));
+      expect(metrics.height).toBeGreaterThan(0);
+      expect(metrics.height).toBeLessThanOrEqual(max);
+      expect(metrics.content).toBeGreaterThan(metrics.height);
+      await list.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+      expect(await list.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+    }
+    await picker.locator('.conv-project-pick-row').last().click();
+    await picker.getByRole('checkbox').last().uncheck();
+    const bounds = await picker.locator('[role="dialog"]').evaluate((el) => ({
+      top: el.getBoundingClientRect().top, bottom: el.getBoundingClientRect().bottom,
+      height: el.clientHeight, content: el.scrollHeight,
+    }));
+    expect(bounds.top).toBeGreaterThanOrEqual(0);
+    expect(bounds.bottom).toBeLessThanOrEqual(600);
+    expect(bounds.content).toBeLessThanOrEqual(bounds.height + 1);
+    const agentBottom = await picker.locator('.conv-project-agent-list').evaluate((el) => el.getBoundingClientRect().bottom);
+    const actionsTop = await picker.locator('.modal-actions').evaluate((el) => el.getBoundingClientRect().top);
+    expect(agentBottom).toBeLessThanOrEqual(actionsTop);
+    await page.evaluate(() => (window as any).setLang('zh'));
+    await picker.locator('[role="dialog"]').screenshot({ path: testInfo.outputPath('add-to-project-scroll-zh.png') });
+    await picker.locator('[data-act="ok"]').click();
+    await expect.poll(() => page.evaluate(() => (window as any).__longPickerResult)).toEqual({
+      projectId: 'p_19', agentIds: Array.from({ length: 19 }, (_, index) => `agent_${index}`),
+    });
+  });
+
+  test('files a loose task into new and existing projects with the selected agents', async ({ orkas }, testInfo) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const agent = await orkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+      name: 'E2EFilingAgent',
+      description: 'Takes part in the task being filed.',
+      category: 'general',
+    });
+    const agentId = agent.agent.agent_id;
+    const optionalAgent = await orkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+      name: 'E2EOptionalAgent', description: 'Can be excluded when filing.', category: 'general',
+    });
+    const optionalId = optionalAgent.agent.agent_id;
+
+    const loose = await orkas.invoke<{ conversation: { conversation_id: string } }>(
+      'conversations.create', { title: 'Loose filing task' });
+    const cid = loose.conversation.conversation_id;
+    const second = await orkas.invoke<{ conversation: { conversation_id: string } }>(
+      'conversations.create', { title: 'Second loose task' });
+
+    // The participant roster is what the new-project flow binds. Seeding it is
+    // the deterministic stand-in for an @-mention turn.
+    const chatsDir = globalChatsDir(orkas.workspaceRoot);
+    mkdirSync(path.join(chatsDir, cid), { recursive: true });
+    writeFileSync(path.join(chatsDir, cid, 'members.json'), JSON.stringify({
+      version: 1,
+      actors: [
+        { kind: 'agent', id: agentId, name: 'E2EFilingAgent', joined_at: new Date().toISOString() },
+        { kind: 'agent', id: optionalId, name: 'E2EOptionalAgent', joined_at: new Date().toISOString() },
+      ],
+    }));
+    writeFileSync(path.join(chatsDir, `${cid}.jsonl`),
+      `${JSON.stringify({ from: 'user', text: 'filed message body', ts: new Date().toISOString() })}\n`);
+
+    mkdirSync(path.join(chatsDir, second.conversation.conversation_id), { recursive: true });
+    writeFileSync(path.join(chatsDir, second.conversation.conversation_id, 'members.json'), JSON.stringify({
+      version: 1, actors: [
+        { kind: 'agent', id: agentId, name: 'E2EFilingAgent' },
+        { kind: 'agent', id: optionalId, name: 'E2EOptionalAgent' },
+      ],
+    }));
+    const page = await orkas.relaunch();
+    const row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await expect(row).toHaveCount(1);
+
+    // A running task keeps a visible, disabled entry. Finishing the task
+    // enables the already-open menu without reopening or navigating away.
+    await page.evaluate((taskId) => {
+      (window as any).setGroupConversationBusy(taskId, true);
+    }, cid);
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    const moveItem = page.locator('#conversation-action-menu [data-action="to-project"]');
+    await expect(moveItem).toHaveAttribute('aria-disabled', 'true');
+    await expect(moveItem).toHaveClass(/is-disabled/);
+    await moveItem.dispatchEvent('click');
+    await expect(page.locator('#conv-project-picker-overlay')).toHaveCount(0);
+    await page.evaluate((taskId) => {
+      (window as any).setGroupConversationBusy(taskId, false);
+      (window as any)._updateConvSidebarBadge(taskId);
+    }, cid);
+    await expect(moveItem).toHaveAttribute('aria-disabled', 'false');
+    await row.locator('.conv-item-menu').click();
+
+    // New project: name it, and the task plus its agent land inside.
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await expect(page.locator('#conversation-action-menu [data-action="to-new-project"]')).toHaveCount(0);
+    await page.locator('#conversation-action-menu [data-action="to-project"]').click();
+    const firstPicker = page.locator('#conv-project-picker-overlay');
+    await expect(firstPicker.locator('.avatar-circle svg')).toHaveCount(2);
+    await expect(firstPicker.locator('.conv-project-agents .conv-project-picker-hint')).toHaveCount(0);
+    await expect(firstPicker.getByRole('checkbox', { name: 'E2EFilingAgent', exact: true })).toBeChecked();
+    await expect(firstPicker.getByRole('checkbox', { name: 'E2EOptionalAgent', exact: true })).toBeChecked();
+    await firstPicker.getByRole('checkbox', { name: 'E2EOptionalAgent', exact: true }).uncheck();
+    await firstPicker.locator('[data-act="new"]').click();
+    const promptInput = page.locator('.ui-dialog-overlay:visible .ui-dialog-input');
+    await expect(promptInput).toBeVisible();
+    await promptInput.fill('E2E Filed Project');
+    await page.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
+
+    const projects = page.locator('.project-row', {
+      has: page.locator('.project-name', { hasText: 'E2E Filed Project' }),
+    });
+    await expect(projects).toHaveCount(1);
+    await expect(page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`)).toHaveCount(0);
+    await expect.poll(async () => {
+      const list = await orkas.invoke<{ conversations: Array<{ conversation_id: string; project_id?: string }> }>(
+        'conversations.list');
+      return list.conversations.find((c) => c.conversation_id === cid)?.project_id || '';
+    }, { timeout: 15_000 }).not.toBe('');
+
+    const all = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const projectId = all.projects.find((p) => p.name === 'E2E Filed Project')?.project_id;
+    expect(projectId).toBeTruthy();
+    await expect.poll(async () => {
+      const bindings = await orkas.invoke<{ bindings: { agents: string[] } }>(
+        'projects.bindings.list', { projectId });
+      return bindings.bindings.agents;
+    }, { timeout: 15_000 }).toContain(agentId);
+
+    const initialBindings = await orkas.invoke<{ bindings: { agents: string[] } }>('projects.bindings.list', { projectId });
+    expect(initialBindings.bindings.agents).not.toContain(optionalId);
+
+    // The history moved with it: reading the task through the normal path
+    // still returns the message that was written before the move.
+    const history = await orkas.invoke<{ history: Array<{ text?: string }> }>(
+      'conversations.history', { cid });
+    expect(history.history.some((m) => String(m.text || '').includes('filed message body'))).toBe(true);
+
+    // Add to project: the second loose task joins the same project, and the
+    // menu no longer offers filing for a task that already has one.
+    const secondRow = page.locator(`#conversation-list .conv-item[data-cid="${second.conversation.conversation_id}"]`);
+    await secondRow.hover();
+    await secondRow.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="to-project"]').click();
+    const picker = page.locator('#conv-project-picker-overlay');
+    await expect(picker).toBeVisible();
+    // The primary action stays out of reach until a row is chosen, so a stray
+    // click cannot move the task.
+    const confirm = picker.locator('[data-act="ok"]');
+    await expect(confirm).toBeDisabled();
+    await picker.locator('.conv-project-pick-row', { hasText: 'E2E Filed Project' }).click();
+    await expect(confirm).toBeEnabled();
+    await expect(picker.getByRole('checkbox', { name: 'E2EFilingAgent', exact: true })).toBeChecked();
+    await expect(picker.getByRole('checkbox', { name: 'E2EOptionalAgent', exact: true })).toBeChecked();
+    // Capture the actual localized panel, then keep the selection while switching back.
+    await page.evaluate(() => (window as any).setLang('zh'));
+    await expect(picker.locator('legend')).toHaveText('同时添加任务中的 Agent');
+    await picker.locator('[role="dialog"]').screenshot({ path: testInfo.outputPath('add-to-project-zh.png') });
+    await page.evaluate(() => (window as any).setLang('en'));
+    await picker.getByRole('checkbox', { name: 'E2EFilingAgent', exact: true }).uncheck();
+    await confirm.click();
+    await expect(secondRow).toHaveCount(0);
+    await expect.poll(async () => (await orkas.invoke<{ bindings: { agents: string[] } }>(
+      'projects.bindings.list', { projectId })).bindings.agents.sort()).toEqual([agentId, optionalId].sort());
+
+    const filedRow = page.locator(`.conv-item[data-cid="${cid}"]`).first();
+    await filedRow.hover();
+    await filedRow.locator('.conv-item-menu').click();
+    await expect(page.locator('#conversation-action-menu [data-action="to-new-project"]')).toHaveCount(0);
+    await expect(page.locator('#conversation-action-menu [data-action="to-project"]')).toHaveCount(0);
+  });
+  test('keeps a filed task and reports an agent disabled after the picker opened', async ({ orkas }) => {
+    const { project } = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: 'Partial filing' });
+    const { agent } = await orkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+      name: 'UnavailableAgent', description: 'Disabled after selection.', category: 'general',
+    });
+    const { conversation } = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+      title: 'Partial filing task',
+    });
+    // Conversation creation does not accept an agent. Seed the persisted roster
+    // as in the filing happy path, then restart to discard any roster cache.
+    const rosterDir = path.join(globalChatsDir(orkas.workspaceRoot), conversation.conversation_id);
+    mkdirSync(rosterDir, { recursive: true });
+    writeFileSync(path.join(rosterDir, 'members.json'), JSON.stringify({
+      version: 1, actors: [{ kind: 'agent', id: agent.agent_id, name: 'UnavailableAgent' }],
+    }));
+    const page = await orkas.relaunch();
+    const row = page.locator(`#conversation-list .conv-item[data-cid="${conversation.conversation_id}"]`);
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="to-project"]').click();
+    const picker = page.locator('#conv-project-picker-overlay');
+    await expect(picker.getByRole('checkbox', { name: 'UnavailableAgent' })).toBeChecked();
+    await orkas.invoke('agents.setEnabled', { agent_id: agent.agent_id, enabled: false });
+    await picker.locator('.conv-project-pick-row', { hasText: 'Partial filing' }).click();
+    await picker.locator('[data-act="ok"]').click();
+    await expect(page.locator('.ui-toast')).toContainText('1 agent(s) could not be added');
+    const list = await orkas.invoke<{ conversations: Array<{ conversation_id: string; project_id?: string }> }>('conversations.list');
+    expect(list.conversations.find((item) => item.conversation_id === conversation.conversation_id)?.project_id).toBe(project.project_id);
+    const bindings = await orkas.invoke<{ bindings: { agents: string[] } }>('projects.bindings.list', { projectId: project.project_id });
+    expect(bindings.bindings.agents).not.toContain(agent.agent_id);
+  });
+
 });

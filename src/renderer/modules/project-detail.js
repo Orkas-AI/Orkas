@@ -2,8 +2,8 @@
 // Drives `#panel-project`: shows the project composer, task panes, and a
 // right-side rail for project agents + files.
 //
-// Header carries Rename / Delete. The "Back" button was intentionally
-// removed — the sidebar IS the back navigation.
+// Header carries Rename / Delete. The "Back" button
+// was intentionally removed — the sidebar IS the back navigation.
 //
 // Add picker and project-file viewer are centered modals (`.modal-overlay`)
 // so they don't get clipped by the project panel's scrolling regions.
@@ -93,6 +93,7 @@ let _projectKbStatusRefreshTimer = null;
 let _projectKbReconcileInFlight = false;
 let _projectKbReconciledLoadSeq = -1;
 let _projectDetailLoadSeq = 0;
+let _projectDetailResolvedPid = '';
 let _projectAutoTabLoad = null;
 let _projectAutoLoadedSeq = 0;
 let _projectRenameCommitInFlight = false;
@@ -105,7 +106,6 @@ function _projectCachedSummary(pid) {
 function _setProjectDetailBusy(busy) {
   const content = document.getElementById('project-detail-content');
   if (!content) return;
-  content.classList.toggle('is-loading', !!busy);
   content.setAttribute('aria-busy', busy ? 'true' : 'false');
 }
 
@@ -114,7 +114,11 @@ function _setProjectDetailBusy(busy) {
 /** Called by boot.js setView('project', pid) on entry. */
 async function loadProjectDetail(pid) {
   const loadSeq = ++_projectDetailLoadSeq;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  const isCurrent = () => loadSeq === _projectDetailLoadSeq && pid === _projectDetailPid
+    && account === (typeof currentUserId === 'string' ? currentUserId : '');
   const prevPid = _projectDetailPid;
+  if (prevPid !== pid) _projectDetailResolvedPid = '';
   if (prevPid && prevPid !== pid) {
     _projectLibraryDrafts.clear();
     _projectLibraryExpanded.clear();
@@ -123,6 +127,7 @@ async function loadProjectDetail(pid) {
     _clearProjectLibraryViewer();
   }
   _projectDetailPid = pid || '';
+  composerBindOwner('project-chat-input', _projectDetailPid);
   if (!_projectDetailPid) {
     _setProjectDetailBusy(false);
     _renderProjectDetailEmpty();
@@ -147,8 +152,8 @@ async function loadProjectDetail(pid) {
       instructions: null,
     };
     _setProjectAutoTabCount(0);
-    // Paint the existing project shell immediately. Secondary cards remain in
-    // their empty/loading state while independent main-process work proceeds.
+    // Paint the project shell immediately while independent local reads fill
+    // its cards without loading placeholders.
     _renderProjectDetail({ hydrateSecondary: false });
     if (_projectDetailActiveTab === 'auto') {
       _ensureProjectAutoTabLoaded(_projectDetailPid);
@@ -181,21 +186,52 @@ async function loadProjectDetail(pid) {
     // off the bindings response alone rather than the whole batch below:
     // waiting for a large library's file tree would leave the stale target
     // sendable for that long.
-    const bindingsCall = window.orkas.invoke('projects.bindings.list', { projectId: pid });
+    const getCall = window.orkas.invoke('projects.get', { projectId: pid });
+    const bindingsCall = window.orkas.invoke('projects.bindings.list', { projectId: pid, localOnly: true });
+    const filesCall = window.orkas.invoke('projects.files.tree', { projectId: pid });
+    const instructionsCall = window.orkas.invoke('projects.instructions.get', { projectId: pid })
+      .catch((err) => ({ ok: false, error: err?.message || String(err) }));
     bindingsCall.then((res) => {
-      if (loadSeq !== _projectDetailLoadSeq || pid !== _projectDetailPid) return;
+      if (!isCurrent()) return;
       if (!res?.ok || typeof validateRecipientAgainstProject !== 'function') return;
       validateRecipientAgainstProject('project', pid, (res.bindings && res.bindings.agents) || []);
     }).catch(() => { /* the batch below owns the load failure */ });
+    // Paint the Agent rail as soon as its own data is ready. A large file tree
+    // or slow secondary card must not delay a newly added binding from showing.
+    Promise.all([getCall, bindingsCall]).then(([getRes, listRes]) => {
+      if (!isCurrent()) return;
+      if (!getRes?.ok || !listRes?.ok || !_projectDetailMeta) return;
+      _projectDetailMeta = {
+        ..._projectDetailMeta,
+        project: getRes.project,
+        agentDetails: Array.isArray(listRes.agentDetails) ? listRes.agentDetails : [],
+      };
+      _renderProjectAgents();
+    }).catch(() => { /* the batch below owns the load failure */ });
+    void _loadProjectMemory(pid);
+    // These cards read persisted project files. Show each answer as soon as it
+    // arrives, even if an unrelated card or startup refresh is still pending.
+    instructionsCall.then((res) => {
+      if (!isCurrent() || !res?.ok || !_projectDetailMeta) return;
+      _projectDetailMeta.instructions = { content: String(res.content || ''), limit: Number(res.limit) || 4000 };
+      _renderProjectInstructions();
+    }).catch(() => { /* the batch below owns the load failure */ });
+    filesCall.then((res) => {
+      if (!isCurrent() || !res?.ok || !_projectDetailMeta) return;
+      _projectDetailMeta.files = Array.isArray(res.tree) ? res.tree : [];
+      _renderProjectFiles(_projectDetailMeta.files);
+      _bindProjectFileRows();
+      if (typeof hydrateUiIcons === 'function') hydrateUiIcons(document.getElementById('project-files-list'));
+    }).catch(() => { /* the batch below owns the load failure */ });
     const [getRes, listRes, filesRes, kbRes, instrRes, autoRes] = await Promise.all([
-      window.orkas.invoke('projects.get', { projectId: pid }),
+      getCall,
       bindingsCall,
-      window.orkas.invoke('projects.files.tree', { projectId: pid }),
+      filesCall,
       window.orkas.invoke('projects.files.status', { projectId: pid, skipReconcile: true }).catch((err) => ({ ok: false, error: err?.message || String(err) })),
-      window.orkas.invoke('projects.instructions.get', { projectId: pid }).catch((err) => ({ ok: false, error: err?.message || String(err) })),
+      instructionsCall,
       window.orkas.invoke('autoTasks.list', { projectId: pid }).catch((err) => ({ ok: false, error: err?.message || String(err) })),
     ]);
-    if (loadSeq !== _projectDetailLoadSeq || pid !== _projectDetailPid) return;
+    if (!isCurrent()) return;
     if (!getRes?.ok || !listRes?.ok || !filesRes?.ok) {
       throw new Error((getRes && getRes.error) || (listRes && listRes.error) || (filesRes && filesRes.error) || 'load_failed');
     }
@@ -209,17 +245,19 @@ async function loadProjectDetail(pid) {
       libraryStatus: kbRes?.ok ? kbRes : null,
       instructions: instrRes?.ok ? { content: String(instrRes.content || ''), limit: Number(instrRes.limit) || 4000 } : null,
     };
-    _renderProjectDetail();
+    _projectDetailResolvedPid = pid;
+    _renderProjectDetail({ refreshMemory: false });
     _setProjectAutoTabCount(Array.isArray(autoRes?.tasks) ? autoRes.tasks.length : 0);
     _kickProjectKbReconcileIfNeeded();
     _scheduleProjectKbStatusRefreshIfNeeded();
+    _setProjectDetailBusy(false);
   } catch (err) {
-    if (loadSeq !== _projectDetailLoadSeq || pid !== _projectDetailPid) return;
+    if (!isCurrent()) return;
     _projectDetailLog.warn('load project detail failed', err);
     if (typeof setView === 'function') setView('new-chat');
     if (typeof uiAlert === 'function') uiAlert(t('project.detail_load_failed'));
   } finally {
-    if (loadSeq === _projectDetailLoadSeq && pid === _projectDetailPid) {
+    if (isCurrent()) {
       _setProjectDetailBusy(false);
     }
   }
@@ -246,9 +284,32 @@ function _renderProjectDetailEmpty() {
   if (typeof _refreshUnreadTaskIndicators === 'function') _refreshUnreadTaskIndicators('');
 }
 
-function _renderProjectDetail({ hydrateSecondary = true } = {}) {
+function _renderProjectAgents() {
+  const agentDetails = _projectDetailMeta?.agentDetails || [];
+  const hasAgents = agentDetails.length > 0;
+  const agentsList = document.getElementById('project-agents-list');
+  if (agentsList) {
+    agentsList.innerHTML = _renderProjectAgentCards(agentDetails);
+    agentsList.style.display = hasAgents ? '' : 'none';
+  }
+  const agentsEmpty = document.getElementById('project-agents-empty');
+  if (agentsEmpty) agentsEmpty.style.display = hasAgents ? 'none' : '';
+  _setCardCount('project-detail-agents-count', agentDetails.length);
+  _bindProjectAgentCards();
+}
+
+function _renderProjectDetail({ hydrateSecondary = true, refreshMemory = hydrateSecondary } = {}) {
   if (!_projectDetailMeta) { _renderProjectDetailEmpty(); return; }
-  const { project, agentDetails, files } = _projectDetailMeta;
+  const { project, files } = _projectDetailMeta;
+  const renameBtn = document.getElementById('project-action-rename');
+  const deleteBtn = document.getElementById('project-action-delete');
+  const addAgentBtn = document.getElementById('project-add-agent-btn');
+  if (renameBtn) renameBtn.hidden = false;
+  if (deleteBtn) {
+    deleteBtn.hidden = false;
+    deleteBtn.setAttribute('data-i18n', 'project.action.delete');
+  }
+  if (addAgentBtn) addAgentBtn.hidden = false;
 
   const titleEl = document.getElementById('project-detail-title');
   if (titleEl) titleEl.textContent = project?.name || '';
@@ -256,14 +317,7 @@ function _renderProjectDetail({ hydrateSecondary = true } = {}) {
     _refreshUnreadTaskIndicators(_projectDetailPid);
   }
 
-  const agentsList = document.getElementById('project-agents-list');
-  const hasAgents = (agentDetails || []).length > 0;
-  if (agentsList) {
-    agentsList.innerHTML = _renderProjectAgentCards(agentDetails || []);
-    agentsList.style.display = hasAgents ? '' : 'none';
-  }
-  const agentsEmpty = document.getElementById('project-agents-empty');
-  if (agentsEmpty) agentsEmpty.style.display = hasAgents ? 'none' : '';
+  _renderProjectAgents();
   _renderProjectFiles(files || []);
   _renderProjectAllTasks();
   _renderProjectInstructions();
@@ -277,17 +331,15 @@ function _renderProjectDetail({ hydrateSecondary = true } = {}) {
   _bindProjectDriver();
   if (hydrateSecondary) {
     _loadProjectTodos(_projectDetailPid).catch(() => { /* ignore */ });
-    _loadProjectMemory(_projectDetailPid).catch(() => { /* ignore */ });
+    if (refreshMemory) _loadProjectMemory(_projectDetailPid).catch(() => { /* ignore */ });
     _loadProjectDriver(_projectDetailPid).catch(() => { /* ignore */ });
   }
 
   // Per-card count chips beside each card title.
-  _setCardCount('project-detail-agents-count', (agentDetails || []).length);
   _setCardCount('project-detail-files-count', _flattenProjectLibraryFiles(files || []).length);
 
   applyDomI18n();
   _setProjectDetailRenameMode(_isProjectDetailRenameMode());
-  _bindProjectAgentCards();
   _bindProjectFileRows();
   if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
   if (typeof hydrateUiIcons === 'function') hydrateUiIcons(document.getElementById('project-detail-content'));
@@ -318,6 +370,7 @@ function _bindProjectDetailTabs() {
           // Re-read the persisted project setting on entry so a change made by
           // another surface/device is reflected by this tab's toggle.
           _loadProjectDriver(_projectDetailPid);
+          void _loadProjectTodos(_projectDetailPid);
         }
       });
       tab.addEventListener('keydown', (event) => {
@@ -341,10 +394,6 @@ async function _ensureProjectAutoTabLoaded(pid) {
   // share one list refresh even when the first request finishes very quickly.
   if (_projectAutoLoadedSeq === _projectDetailLoadSeq) return;
   if (_projectAutoTabLoad?.pid === pid) return _projectAutoTabLoad.promise;
-  const listEl = document.getElementById('project-auto-list');
-  if (listEl && typeof loadProjectAutoList !== 'function') {
-    listEl.innerHTML = `<div class="empty muted">${escapeHtml(t('chat.loading'))}</div>`;
-  }
   const run = (async () => {
     const loader = typeof loadRendererFeature === 'function'
       ? loadRendererFeature
@@ -486,8 +535,10 @@ function _renderProjectInstructions() {
   if (!input) return;
   const meta = _projectDetailMeta?.instructions;
   const limit = (meta && Number(meta.limit)) || 4000;
-  input.value = meta ? meta.content : '';
-  input.dataset.savedValue = input.value;
+  const editing = input.dataset.projectId === _projectDetailPid
+    && document.getElementById('project-instructions-modal')?.classList.contains('open');
+  if (!editing) input.value = meta ? meta.content : '';
+  input.dataset.savedValue = meta ? meta.content : '';
   input.dataset.projectId = String(_projectDetailPid || '');
   input.dataset.limit = String(limit);
   // Instructions failed to load (e.g. legacy main) → disable rather than
@@ -778,22 +829,29 @@ function _setProjectAutoTabCount(n) {
 //    dispatched project agents receive it as read-only context.
 let _projectMemory = [];
 let _projectMemoryLoadSeq = 0;
+let _projectMemoryLoadedPid = '';
 let _projectMemoryEditor = null; // { mode:'add'|'edit', oldText:string } | null
 let _projectMemoryMutating = false;
 
 async function _loadProjectMemory(pid) {
   const loadSeq = ++_projectMemoryLoadSeq;
+  _projectMemoryLoadedPid = '';
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
   if (!pid) { _projectMemory = []; _renderProjectMemoryList(); return; }
   let nextMemory = [];
+  let loaded = false;
   try {
     const res = await window.orkas.invoke('memory.list', { target: 'project', projectId: pid });
-    nextMemory = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
+    loaded = !!res?.ok && Array.isArray(res.entries);
+    nextMemory = loaded ? res.entries : [];
   } catch (err) {
     _projectDetailLog.warn('load project memory failed', err);
     nextMemory = [];
   }
-  if (loadSeq !== _projectMemoryLoadSeq || pid !== _projectDetailPid) return;
+  if (loadSeq !== _projectMemoryLoadSeq || pid !== _projectDetailPid
+      || account !== (typeof currentUserId === 'string' ? currentUserId : '')) return;
   _projectMemory = nextMemory;
+  _projectMemoryLoadedPid = loaded ? pid : '';
   _renderProjectMemoryList();
 }
 
@@ -818,14 +876,14 @@ function _renderProjectMemoryList() {
 
     const actions = document.createElement('div');
     actions.className = 'project-memory-item-actions';
-    // Written-out verbs, not glyphs: these two sit under body copy the user
-    // is reading, and a pencil next to a paragraph reads as decoration.
     const edit = document.createElement('button');
     edit.type = 'button';
     edit.className = 'project-memory-item-action';
     edit.dataset.action = 'project-memory-edit';
     edit.dataset.memoryIndex = String(index);
-    edit.textContent = t('project.memory.edit');
+    edit.title = t('project.memory.edit');
+    edit.setAttribute('aria-label', edit.title);
+    edit.innerHTML = _projectUiIconHtml('edit-pencil');
     actions.appendChild(edit);
 
     const remove = document.createElement('button');
@@ -833,7 +891,9 @@ function _renderProjectMemoryList() {
     remove.className = 'project-memory-item-action is-danger';
     remove.dataset.action = 'project-memory-delete';
     remove.dataset.memoryIndex = String(index);
-    remove.textContent = t('project.memory.delete');
+    remove.title = t('project.memory.delete');
+    remove.setAttribute('aria-label', remove.title);
+    remove.innerHTML = _projectUiIconHtml('trash');
     actions.appendChild(remove);
     row.appendChild(actions);
 
@@ -1063,6 +1123,8 @@ let _todoEditorAgentLoading = false;
 // same shape the composer/auto editors use so the chip render can be shared.
 let _todoEditorTid = null;
 let _todoEditorAttachments = [];
+// Existing tasks keep their files until the user commits the editor.
+let _todoEditorRemovedAttachments = new Set();
 let _todoEditorSavedTid = false; // true once a create-draft's files are adopted
 
 // A fresh `t_<12hex>` matching the backend TASK_ID_RE, so the editor can stage
@@ -1183,16 +1245,17 @@ function _setTodoLoadError(failed) {
 }
 
 function _renderProjectTodosList() {
-  const tasks = _projectTodos || [];
+  let tasks = _projectTodos || [];
   const countEl = document.getElementById('project-todo-count');
   if (countEl) countEl.textContent = String(tasks.length);
   const listEl = document.getElementById('project-todo-list');
   if (!listEl) return;
   listEl.innerHTML = '';
   listEl.style.display = '';
+  const context = _projectTodoContext();
   // The board always renders its four columns; each column carries its own
   // empty hint, so there is no list-level empty element.
-  listEl.appendChild(_renderTodoBoard(tasks, _projectTodoContext(), 'project:' + _projectDetailPid));
+  listEl.appendChild(_renderTodoBoard(tasks, context, 'project:' + _projectDetailPid));
 }
 
 function _renderTodoCard(task, context) {
@@ -1254,9 +1317,12 @@ function _renderTodoCard(task, context) {
   // get copied into the conversation the task starts, like a chat attachment).
   const attachCount = Array.isArray(task.attachments) ? task.attachments.length : 0;
   if (attachCount > 0) {
-    const att = document.createElement('span');
+    const att = document.createElement('button');
+    att.type = 'button';
+    att.dataset.action = 'todo-attachments';
     att.className = 'project-todo-attach-badge';
     att.title = t('project.todo.attach_count', { n: attachCount });
+    att.setAttribute('aria-label', att.title);
     att.innerHTML = (typeof uiIconHtml === 'function' ? uiIconHtml('paperclip', 'project-todo-attach-badge-icon') : '')
       + `<span>${attachCount}</span>`;
     appendMeta(att);
@@ -1395,7 +1461,7 @@ async function _loadTodoEditorAgents(task) {
   _updateProjectTodoEditor();
   try {
     const res = await window.orkas.invoke(pid ? 'projects.bindings.list' : 'agents.list',
-      pid ? { projectId: pid } : { summary: true });
+      pid ? { projectId: pid, localOnly: true } : { summary: true });
     if (seq !== _todoEditorAgentLoadSeq || generation !== _todoEditorGeneration || pid !== _todoEditorPid) return;
     const agents = pid ? res?.agentDetails : res?.agents;
     if (res?.ok === false || !Array.isArray(agents)) throw new Error('load_failed');
@@ -1438,16 +1504,52 @@ function _renderTodoEditorAttachments() {
     const label = escapeHtml(displayName);
     const spinner = busy ? `<span class="chat-attach-spinner" aria-label="${escapeHtml(t('chat.attach_uploading'))}"></span>` : '';
     const removeBtn = busy ? '' : `<span class="chat-attach-remove" data-idx="${idx}" title="${escapeHtml(t('chat.attach_remove_title'))}">×</span>`;
-    return `<div class="chat-attach-chip${busy ? ' is-uploading' : ''}" data-idx="${idx}" data-name="${escapeHtml((a && a.name) || '')}" title="${label}">`
+    return `<div class="chat-attach-chip${busy ? ' is-uploading' : ''}"${busy ? '' : ' role="button" tabindex="0"'} data-idx="${idx}" data-name="${escapeHtml((a && a.name) || '')}" title="${label}">`
       + `<span class="chat-attach-icon">${icon}</span>`
       + `<span class="chat-attach-label">${label}</span>${spinner}${removeBtn}</div>`;
   }).join('');
+  for (const chip of wrap.querySelectorAll('.chat-attach-chip:not(.is-uploading)')) {
+    const preview = (event) => {
+      if (event.target?.closest?.('.chat-attach-remove')) return;
+      if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      event.stopPropagation();
+      const item = _todoEditorAttachments[Number(chip.dataset.idx)];
+      if (item?.status === 'ready') void _previewTodoAttachment(_todoEditorPid, _todoEditorTid, item.name, chip);
+    };
+    chip.addEventListener('click', preview);
+    chip.addEventListener('keydown', preview);
+  }
   for (const rm of wrap.querySelectorAll('.chat-attach-remove')) {
-    rm.addEventListener('click', () => {
+    rm.addEventListener('click', (event) => {
+      event.stopPropagation();
       const item = _todoEditorAttachments[Number(rm.dataset.idx)];
       if (item && item.name) _removeTodoEditorAttachment(item.name);
     });
   }
+}
+
+async function _previewTodoAttachment(pid, taskId, name, sourceElement) {
+  if (pid === null || !taskId || !name || typeof openChatFileViewer !== 'function') return;
+  try {
+    const result = await window.orkas.invoke('projects.tasks.attachments.absPath', { projectId: pid, taskId, name });
+    if (!result?.ok || !result.path) throw new Error('attachment_unavailable');
+    await openChatFileViewer(result.path, name, { projectId: pid || null, cid: null, readOnly: true, sourceElement });
+  } catch (_) {
+    _projectDetailLog.warn('todo attachment preview failed');
+    if (typeof uiAlert === 'function') await uiAlert(t('chat.file_missing_toast', { name }));
+  }
+}
+
+function _openTodoAttachments(event, task, context) {
+  const names = Array.isArray(task?.attachments) ? task.attachments : [];
+  if (!names.length) return;
+  const source = event.target?.closest?.('[data-action="todo-attachments"]');
+  if (names.length === 1) return _previewTodoAttachment(context.pid || '', task.id, names[0], source);
+  if (typeof showContextMenu === 'function') showContextMenu(event, names.map((name) => ({
+    label: name,
+    onClick: () => _previewTodoAttachment(context.pid || '', task.id, name, source),
+  })));
 }
 
 function _setTodoEditorAttachments(items) {
@@ -1460,7 +1562,7 @@ function _setTodoEditorAttachments(items) {
 // task's (possibly draft) attachment dir, showing an optimistic uploading chip.
 async function _todoPickAndUploadFiles(fileList) {
   const files = Array.from(fileList || []).filter(Boolean);
-  if (!files.length || _todoEditorPid === null) return;
+  if (!files.length || _todoEditorPid === null || _projectTodoMutating) return;
   const pid = _todoEditorPid;
   const generation = _todoEditorGeneration;
   const accept = _todoAttachAccept();
@@ -1472,7 +1574,7 @@ async function _todoPickAndUploadFiles(fileList) {
     pending.push(file);
   }
   if (rejected.length && typeof uiAlert === 'function') await uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
-  if (!pending.length || generation !== _todoEditorGeneration) return;
+  if (!pending.length || generation !== _todoEditorGeneration || _projectTodoMutating) return;
 
   const tid = _ensureTodoEditorTid();
   const placeholders = pending.map((file) => {
@@ -1501,15 +1603,22 @@ async function _todoPickAndUploadFiles(fileList) {
     const next = _todoEditorAttachments.slice();
     const idx = next.findIndex((it) => it && it.tempId === p.tempId);
     if (idx < 0) return;
-    if (ok) next[idx] = { name: finalName, displayName: p.displayName, kind: _todoAttachKind(finalName), bytes: p.file.size || 0, status: 'ready' };
-    else next.splice(idx, 1);
+    if (ok) {
+      _todoEditorRemovedAttachments.delete(finalName);
+      next[idx] = { name: finalName, displayName: p.displayName, kind: _todoAttachKind(finalName), bytes: p.file.size || 0, status: 'ready' };
+    } else next.splice(idx, 1);
     _setTodoEditorAttachments(next);
     _updateProjectTodoEditor();
   }));
 }
 
 async function _removeTodoEditorAttachment(name) {
-  if (!name || _todoEditorPid === null || !_todoEditorTid) return;
+  if (!name || _todoEditorPid === null || !_todoEditorTid || _projectTodoMutating) return;
+  if (_todoEditorTaskId) {
+    _todoEditorRemovedAttachments.add(name);
+    _setTodoEditorAttachments(_todoEditorAttachments.filter((a) => !a || a.name !== name));
+    return;
+  }
   const generation = _todoEditorGeneration;
   try {
     const res = await window.orkas.invoke('projects.tasks.attachments.delete', {
@@ -1537,7 +1646,8 @@ function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 
   _todoEditorPid = context.pid || '';
   _todoEditorReturnFocus = document.activeElement;
   _todoEditorTaskId = task && task.id ? task.id : null;
-  _todoEditorInitial = task ? { status: task.status || 'todo', owner_agent: task.owner_agent, owner_agent_id: task.owner_agent_id } : null;
+  _todoEditorInitial = task ? { status: task.status || 'todo', owner_agent: task.owner_agent,
+    owner_agent_id: task.owner_agent_id, } : null;
   // Edit stages attachments onto the real task; create lazily allocates a draft
   // id on first attach (adopted by create on save, discarded on cancel).
   _todoEditorTid = _todoEditorTaskId;
@@ -1600,7 +1710,7 @@ function _closeProjectTodoEditor() {
   _todoEditorReleaseFocus?.();
   _todoEditorReleaseFocus = null;
   // Create-mode cancel with staged-but-unsaved files: drop the draft dir so the
-  // uploads aren't orphaned. Edit-mode attachment changes are already persisted.
+  // uploads aren't orphaned. Edit-mode removals are only committed by Save.
   if (!_todoEditorSavedTid && !_todoEditorTaskId && _todoEditorTid && _todoEditorPid !== null) {
     window.orkas.invoke('projects.tasks.attachments.discardDraft', { projectId: _todoEditorPid, taskId: _todoEditorTid })
       .catch((err) => _projectDetailLog.warn('todo draft discard failed', err));
@@ -1612,6 +1722,7 @@ function _closeProjectTodoEditor() {
   _todoEditorInitial = null;
   _todoEditorTid = null;
   _todoEditorSavedTid = false;
+  _todoEditorRemovedAttachments.clear();
   _setTodoEditorAttachments([]);
   const editor = document.getElementById('project-todo-add');
   const input = document.getElementById('project-todo-input');
@@ -1646,7 +1757,7 @@ async function _todoMutate(fn, pid = _projectDetailPid) {
   if (!ok && typeof uiAlert === 'function') uiAlert(t('project.todo.failed'));
   try {
     if (pid && pid === _projectDetailPid) await _loadProjectTodos(pid);
-    if (typeof _refreshGlobalTodos === 'function') await _refreshGlobalTodos(pid);
+    if (typeof _refreshGlobalTodos === 'function') void _refreshGlobalTodos(pid).catch(() => {});
   } finally {
     _projectTodoMutating = false;
     _updateProjectTodoEditor();
@@ -1671,21 +1782,36 @@ async function _saveProjectTodoEditor() {
   const startedAt = Date.now();
   // Create passes the pre-allocated draft id when files were staged so the
   // persisted task adopts them. Edits update the existing task in place.
-  const outcome = await _todoMutate(() => (taskId
-    ? window.orkas.invoke('projects.tasks.update', {
-      projectId: pid,
-      taskId,
-      content,
-      ...(status !== _todoEditorInitial?.status ? { status } : {}),
-      ...owner,
-    })
-    : window.orkas.invoke('projects.tasks.create', {
-      projectId: pid,
-      content,
-      status,
-      ...owner,
-      ...(_todoEditorTid ? { taskId: _todoEditorTid } : {}),
-    })), pid);
+  const outcome = await _todoMutate(async () => {
+    const result = await (taskId
+      ? window.orkas.invoke('projects.tasks.update', {
+        projectId: pid,
+        taskId,
+        content,
+        ...(status !== _todoEditorInitial?.status ? { status } : {}),
+        ...owner,
+      })
+      : window.orkas.invoke('projects.tasks.create', {
+        projectId: pid,
+        content,
+        status,
+        ...owner,
+        ...(_todoEditorTid ? { taskId: _todoEditorTid } : {}),
+      }));
+    if (result?.ok === false) return result;
+    // Save content first: a rejected edit must not delete any attachment.
+    // Retain only unsuccessful removals so a retry cannot delete a file again.
+    if (taskId) {
+      for (const name of _todoEditorRemovedAttachments) {
+        const removed = await window.orkas.invoke('projects.tasks.attachments.delete', {
+          projectId: pid, taskId, name,
+        });
+        if (!removed?.ok) return { ok: false, error: 'attachment_delete_failed' };
+        _todoEditorRemovedAttachments.delete(name);
+      }
+    }
+    return result;
+  }, pid);
   if (!outcome.ok) {
     _projectLogFailure('project_todo_action', { action: taskId ? 'edit' : 'create', ...outcome.failure });
   } else if (generation === _todoEditorGeneration) {
@@ -1955,7 +2081,10 @@ function _bindTodoListActions(listEl, resolveContext) {
     if (!tid || _projectTodoMutating) return;
     const context = resolveContext(row.dataset.pid);
     if (!_todoContextHasScope(context)) return;
-    if (e.target.closest('[data-action="todo-project"]')) {
+    if (e.target.closest('[data-action="todo-attachments"]')) {
+      e.stopPropagation();
+      void _openTodoAttachments(e, context.tasks.find((task) => task.id === tid), context);
+    } else if (e.target.closest('[data-action="todo-project"]')) {
       _projectDetailActiveTab = 'todo';
       setView('project', context.pid);
     } else if (e.target.closest('[data-action="todo-conversation"]')) {
@@ -3889,7 +4018,9 @@ async function _submitProjectChat() {
   const projectId = _projectDetailPid;
   const input = document.getElementById('project-chat-input');
   const btn = document.getElementById('project-chat-send-btn');
-  const raw = (input?.value || '').trim();
+  const submittedDraft = composerSnapshot(input);
+  const navigationEpoch = _composerNavigationEpoch;
+  const raw = submittedDraft.text().trim();
   const draftCid = _projectChatDraftCid(projectId);
   const quotes = (typeof _getQuotes === 'function') ? _getQuotes(draftCid).slice() : [];
   if (!raw && !quotes.length) return;
@@ -3967,9 +4098,10 @@ async function _submitProjectChat() {
     const conv = data.conversation;
     convId = conv.conversation_id;
     if (titleText) {
-      conv.title = (typeof _autoTitle === 'function')
-        ? _autoTitle(titleText)
-        : (titleText.length > 25 ? `${titleText.slice(0, 25)}…` : titleText);
+      // Optimistic only: the persisted title comes from the backend
+      // `autoTitle`. Without the shared helper loaded there is no width table
+      // to cut against, so show the text as typed until the backend replies.
+      conv.title = (typeof _autoTitle === 'function') ? _autoTitle(titleText) : titleText;
     }
     createdConversation = conv;
   } catch (err) {
@@ -4046,25 +4178,28 @@ async function _submitProjectChat() {
     if (typeof loadProjects === 'function') loadProjects(true);
   }
   if (typeof consumeChatUseSelections === 'function') consumeChatUseSelections('project');
-  if (typeof _clearQuotes === 'function') _clearQuotes(draftCid);
+  _consumeSubmittedQuotes(draftCid, quotes);
 
-  if (input) {
-    input.value = '';
+  const ownsDraft = submittedDraft.matches();
+  const openCreated = ownsDraft && navigationEpoch === _composerNavigationEpoch;
+  if (ownsDraft) {
+    composerSetText(input, '');
     if (typeof _draftHadRecipient !== 'undefined') _draftHadRecipient.delete('project');
-    if (typeof autoGrow === 'function') autoGrow(input, 180);
+    if (typeof _updateComposerSeqToggle === 'function') _updateComposerSeqToggle('project');
   }
-  if (typeof _updateComposerSeqToggle === 'function') _updateComposerSeqToggle('project');
-  const chatInput = document.getElementById('chat-input');
-  if (chatInput) {
-    chatInput.value = '';
-    if (typeof autoGrow === 'function') autoGrow(chatInput, 200);
+  if (recipient) {
+    _recipientByCid[convId] = recipient.defaultRecipient || recipient;
+    _saveRecipientMap();
   }
-  if (typeof setView === 'function') setView('conversation', convId, { skipLoad: true });
-  if (recipient && typeof setChatRecipient === 'function') {
-    setChatRecipient('conversation', recipient.defaultRecipient || recipient);
+  if (openCreated) {
+    if (currentCid) _flushDraftSave(currentCid);
+    composerBindOwner('chat-input', convId);
+    composerSetText('chat-input', '');
+    setView('conversation', convId, { skipLoad: true });
+    if (recipient) setChatRecipient('conversation', recipient.defaultRecipient || recipient);
   }
   if (btn) btn.disabled = false;
-  if (typeof sendInCurrentConversation === 'function') {
+  if (typeof sendInConversation === 'function') {
     const extra = {
       title_text: titleText,
       ...commanderDisplay,
@@ -4081,7 +4216,11 @@ async function _submitProjectChat() {
         attachments: _adopted.map((name) => ({ name })),
       });
     }
-    await sendInCurrentConversation(content, Object.keys(extra).length ? extra : undefined, { restoreComposerOnFailure: true });
+    await sendInConversation(convId, content, Object.keys(extra).length ? extra : undefined, {
+      restoreComposerOnFailure: true,
+      source_view: 'project',
+      content_length: requestText.length,
+    });
   }
 }
 
@@ -4132,7 +4271,9 @@ async function _openAddPicker() {
       projectId: _projectDetailPid,
     });
     if (!res?.ok) throw new Error(res?.error || 'load_failed');
-    candidates = (res.agents || []).slice().sort(_byDisplayName);
+    // Group custom agents first; retain the existing name order within each source.
+    candidates = (res.agents || []).slice().sort((a, b) =>
+      Number(b.source === 'custom') - Number(a.source === 'custom') || _byDisplayName(a, b));
   } catch (err) {
     _projectDetailLog.warn('load candidates failed', err);
     return;
@@ -4194,13 +4335,14 @@ async function _openAddPicker() {
       const descHtml = desc ? `<div class="project-binding-desc muted">${escapeHtml(desc)}</div>` : '';
       const source = _projectBindingSourceHtml(c.source);
       return `
-        <div class="project-binding-picker-item" data-kind="agent" data-id="${escapeHtml(id)}">
+        <div class="project-binding-picker-item" data-kind="agent" data-id="${escapeHtml(id)}" data-source="${escapeHtml(c.source || '')}">
           <div class="project-binding-main">
             <div class="project-binding-head">
               <span class="project-binding-name">${name}</span>
               ${source}
             </div>
             ${descHtml}
+
           </div>
           <button type="button" class="btn btn-sm" data-action="pick" aria-label="Add">+</button>
         </div>
@@ -4218,6 +4360,8 @@ async function _openAddPicker() {
         const k = row.dataset.kind;
         const projectId = _projectDetailPid;
         const startedAt = performance.now();
+        btn.disabled = true;
+        btn.textContent = t('common.processing');
         try {
           const res = await window.orkas.invoke('projects.bindings.add', {
             projectId, kind: k, id,
@@ -4236,9 +4380,12 @@ async function _openAddPicker() {
             loadProjectDetail(projectId).catch((err) => _projectDetailLog.warn('refresh failed', err));
           }
         } catch (err) {
+          btn.disabled = false;
+          btn.textContent = '+';
           const failure = _projectDetailFailure(err, 'binding_add_failed');
           _projectLogFailure('project_binding_add', { binding_kind: k, ...failure });
           _projectDetailLog.warn('add binding failed', err);
+          await uiAlert(t('project.bindings.add_failed'));
         }
       });
     });
@@ -4282,6 +4429,7 @@ function _onRenameAction() {
 
 async function _commitRename(newName) {
   if (!_projectDetailPid || !_projectDetailMeta || _projectRenameCommitInFlight) return;
+  const projectId = _projectDetailPid;
   const old = _projectDetailMeta.project?.name || '';
   let trimmed = String(newName || '').trim();
   if (typeof window.limitNameDisplayText === 'function') trimmed = window.limitNameDisplayText(trimmed);
@@ -4296,7 +4444,7 @@ async function _commitRename(newName) {
   _projectRenameCommitInFlight = true;
   try {
     const res = await window.orkas.invoke('projects.rename', {
-      projectId: _projectDetailPid, name: trimmed,
+      projectId, name: trimmed,
     });
     if (!res || !res.ok) {
       code = (res && res.error) || 'generic';
@@ -4397,6 +4545,8 @@ function _initProjectDetailBindings() {
     window.orkas.onPushEvent('projects:advance', _onProjectAdvance);
     window.orkas.onPushEvent('projects:tasks-changed', _onProjectTasksChanged);
   }
+  window.addEventListener('i18n-change', () => {
+  });
   document.getElementById('project-add-agent-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     _openAddPicker();
@@ -4438,17 +4588,10 @@ function _initProjectDetailBindings() {
   });
   const projectInput = document.getElementById('project-chat-input');
   if (projectInput) {
-    projectInput.addEventListener('input', () => {
+    projectInput.addEventListener(composerChangeEvent(projectInput), () => {
       if (typeof autoGrow === 'function') autoGrow(projectInput, 180);
     });
-    projectInput.addEventListener('keydown', (e) => {
-      if (e.isComposing || e.keyCode === 229) return;
-      if (_handleModifiedComposerEnter(e)) return;
-      if (_isPlainComposerEnter(e)) {
-        e.preventDefault();
-        _submitProjectChat();
-      }
-    });
+
   }
   document.getElementById('project-chat-send-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();

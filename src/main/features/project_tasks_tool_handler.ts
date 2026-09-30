@@ -8,6 +8,7 @@ import { getActiveUserId } from './users';
 export function createProjectTasksHandler(
   uid: string, pid: string, cid: string, agentDisplayNameById: ReadonlyMap<string, string>,
   execution: BacklogRunIdentity = {},
+  files: { sourceProjectId?: string; workingDir?: string } = {},
 ): ProjectTasksToolHandler {
   const toView = (task: projectTasks.ProjectTask) => ({
     ...projectTasks.taskView(task),
@@ -34,7 +35,7 @@ export function createProjectTasksHandler(
         || normalizeOwnerKey(agent.name) === key);
       return owner
         ? { fields: { owner_agent: owner.name, owner_agent_id: owner.agent_id } }
-        : { error: `unknown owner "${ownerRaw}" — assign an enabled agent in this account` };
+        : { error: `unknown owner "${ownerRaw}" — no matching enabled agent in this account` };
     }
     const { getBindings } = await import('./projects');
     let bound: string[];
@@ -58,7 +59,7 @@ export function createProjectTasksHandler(
       const validOwners = bound.map((id) => names.get(id) || id);
       return {
         error: validOwners.length
-          ? `unknown owner "${ownerRaw}" — assign one of the scope's available agents by display name: ${validOwners.join(', ')}`
+          ? `unknown owner "${ownerRaw}" — available agent display names in this scope: ${validOwners.join(', ')}`
           : `unknown owner "${ownerRaw}" — this scope has no available agents to own tasks`,
       };
     }
@@ -67,6 +68,16 @@ export function createProjectTasksHandler(
     };
   };
   return {
+    delete: async (taskId) => {
+      if (getActiveUserId() !== uid) return { ok: false, error: 'account_changed' };
+      const result = await projectTasks.deleteTask(uid, pid, taskId);
+      return result.ok ? { ok: true, task_id: taskId, deleted: true } : result;
+    },
+    addAttachment: async (taskId, sourcePath) => {
+      const { addTaskAttachmentFromPath } = await import('./project_task_attachment_tool');
+      const result = await addTaskAttachmentFromPath(uid, pid, cid, taskId, sourcePath, files);
+      return result.ok ? { ok: true, task: toView(result.task) } : result;
+    },
     list: async (query = {}) => {
       const tasks = await projectTasks.listTasks(uid, pid);
       const executions = backlogExecutionSnapshot(uid, pid, cid, execution);
@@ -126,7 +137,7 @@ export function createProjectTasksHandler(
       return r.ok === true ? { ok: true, task: toView(r.task) } : {
         ok: false,
         error: r.error === 'content_required_for_update'
-          ? 'This task uses content; read it with get and send the complete replacement in content.'
+          ? 'This task uses content; title/detail updates are not supported. The content field requires the complete replacement.'
           : r.error,
       };
     },

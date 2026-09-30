@@ -1583,14 +1583,14 @@ async function _listAgentSpecs(): Promise<Agent[]> {
  * Agents-tab contract. */
 export type AgentSummary = Pick<
   Agent,
-  'agent_id' | 'name' | 'source' | 'icon' | 'color' | 'category' | 'runtime'
+  'agent_id' | 'name' | 'source' | 'seed_source' | 'icon' | 'color' | 'category' | 'runtime'
 > & { enabled: boolean };
 
 /** Minimal data needed for global agent search. This deliberately avoids the
  * full-list enrichments (workflow display skills, memory and runtime stats). */
 export type AgentSearchListing = Pick<
   Agent,
-  'agent_id' | 'name' | 'source' | 'description_zh' | 'description_en'
+  'agent_id' | 'name' | 'source' | 'seed_source' | 'runtime' | 'description_zh' | 'description_en'
 > & { enabled: boolean };
 
 export async function listAgentSummaries(): Promise<AgentSummary[]> {
@@ -1600,6 +1600,7 @@ export async function listAgentSummaries(): Promise<AgentSummary[]> {
     agent_id: agent.agent_id,
     name: agent.name,
     source: agent.source,
+    seed_source: agent.seed_source,
     icon: agent.icon,
     color: agent.color,
     category: agent.category,
@@ -1615,6 +1616,8 @@ export async function listAgentSearchListings(): Promise<AgentSearchListing[]> {
     agent_id: agent.agent_id,
     name: agent.name,
     source: agent.source,
+    seed_source: agent.seed_source,
+    runtime: agent.runtime,
     description_zh: agent.description_zh,
     description_en: agent.description_en,
     enabled: !disabledAgentIds.has(agent.agent_id),

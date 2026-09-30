@@ -276,9 +276,7 @@ function _renderProjectRow(p, convs) {
   const expanded = !!_projectsExpanded[p.project_id];
   const selected = _isProjectSelected(p.project_id);
   const editing = _projectsInlineRenamePid === p.project_id;
-  const folderIcon = expanded
-    ? _projectUiIconHtml('folder-open', 'project-folder-icon')
-    : _projectUiIconHtml('folder', 'project-folder-icon');
+  const folderIcon = _projectUiIconHtml('folder', 'project-folder-icon');
   const moreTitle = escapeHtml(t('project.menu.more_actions'));
   const safeName = escapeHtml(p.name || '');
   const renameErrorClass = editing && _projectsInlineRenameError ? ' is-error' : '';
@@ -778,23 +776,6 @@ async function _runProjectMenuAction(action, pid) {
   if (action === 'delete') return _confirmDeleteProject(pid);
 }
 
-async function _showProjectMemberInviteGate() {
-  const download = await uiConfirm({
-    message: t('project.invite_members.commercial_only'),
-    okLabel: t('project.invite_members.download'),
-    cancelLabel: t('common.cancel'),
-  });
-  if (!download) return;
-  const lang = getLang();
-  const url = `https://orkas.ai/download/?lang=${encodeURIComponent(lang)}`;
-  try {
-    const result = await window.orkas.invoke('auth.openExternal', { url });
-    if (!result?.ok) throw new Error('open rejected');
-  } catch (_) {
-    await uiAlert(t('project.invite_members.open_failed'));
-  }
-}
-
 // ── Delete flow ─────────────────────────────────────────────────────────
 
 function _pickProjectDeleteFallback(deletedPid, projectsBeforeDelete, projectsAfterDelete, conversationsAfterDelete) {
@@ -1010,3 +991,20 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 if (typeof window !== 'undefined') window.primeProjectDetailShell = primeProjectDetailShell;
+
+async function _showProjectMemberInviteGate() {
+  const download = await uiConfirm({
+    message: t('project.invite_members.commercial_only'),
+    okLabel: t('project.invite_members.download'),
+    cancelLabel: t('common.cancel'),
+  });
+  if (!download) return;
+  const lang = getLang();
+  const url = `https://orkas.ai/download/?lang=${encodeURIComponent(lang)}`;
+  try {
+    const result = await window.orkas.invoke('auth.openExternal', { url });
+    if (!result?.ok) throw new Error('open rejected');
+  } catch (_) {
+    await uiAlert(t('project.invite_members.open_failed'));
+  }
+}

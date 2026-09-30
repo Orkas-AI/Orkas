@@ -552,6 +552,7 @@ async function loadAgents(forceRefresh, opts = {}) {
           return ka < kb ? -1 : ka > kb ? 1 : 0;
         });
         _agentsCache = sortedAgents;
+        if (typeof refreshAllChatComposers === 'function') refreshAllChatComposers();
         _agentsCacheIsSummary = summary;
         if (typeof _renderRecipientChip === 'function') {
           _renderRecipientChip();
@@ -3852,7 +3853,11 @@ async function _openAgentPicker(anchorBtn, entryPoint = 'unknown') {
   // own their script/data loads and cannot delay this first frame.
   _setAgentPickerTab('agents', { focusSearch: false });
   _positionPopoverAboveOrBelow(picker, anchorBtn);
-  setTimeout(() => document.getElementById('agent-picker-search')?.focus(), 30);
+  setTimeout(() => {
+    if (openSeq === _agentPickerOpenSeq && picker.style.display !== 'none') {
+      document.getElementById('agent-picker-search')?.focus();
+    }
+  }, 30);
   // Project bindings affect Agent visibility, so refresh them independently
   // and repaint only if this picker session is still current.
   projectContextPromise.then(() => {
@@ -4233,7 +4238,9 @@ function _renderLibraryPickerList(listEl, filterText, anchorId) {
       const picker = document.getElementById('agent-picker');
       if (!picker || picker.style.display === 'none' || _agentPickerTab !== 'library') return;
       const search = document.getElementById('agent-picker-search');
-      _renderLibraryPickerList(listEl, search ? search.value : filterText, anchorId);
+      // Use the shared repaint boundary so placement measures the loaded rows,
+      // not the shorter loading shell that was visible before this response.
+      _renderAgentPickerList(search ? search.value : filterText);
     });
     return;
   }
@@ -4570,39 +4577,46 @@ let _atKeyMark = null; // { inputId, posAfter } | null
 function _insertInlineMention(name) {
   const m = _atKeyMark;
   _atKeyMark = null;
-  if (!m || !name) return;
+  if (!m || !name || (m.snapshot && !m.snapshot.matches())) return;
   const ta = document.getElementById(m.inputId);
   if (!ta) return;
   const atIdx = m.posAfter - 1;
-  if (atIdx < 0 || ta.value.charAt(atIdx) !== '@') return;
+  if (atIdx < 0 || composerText(ta).charAt(atIdx) !== '@') return;
   const insert = `${name} `;
-  ta.value = ta.value.slice(0, m.posAfter) + insert + ta.value.slice(m.posAfter);
+  composerSetText(ta, composerText(ta).slice(0, m.posAfter) + insert + composerText(ta).slice(m.posAfter));
   const caret = m.posAfter + insert.length;
-  try { ta.setSelectionRange(caret, caret); } catch (_) {}
+  try { composerSetSelection(ta, caret, caret); } catch (_) {}
   if (typeof autoGrow === 'function') autoGrow(ta, 200);
-  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  composerNotify(ta);
   _focusInput(ta);
 }
 
 function _consumeAtKeyChar() {
   const m = _atKeyMark;
   _atKeyMark = null;
-  if (!m) return null;
+  if (!m || (m.snapshot && !m.snapshot.matches())) return null;
   const ta = document.getElementById(m.inputId);
   if (!ta) return null;
   const atIdx = m.posAfter - 1;
-  if (atIdx < 0 || ta.value.charAt(atIdx) !== '@') return null;
-  ta.value = ta.value.slice(0, atIdx) + ta.value.slice(atIdx + 1);
-  try { ta.setSelectionRange(atIdx, atIdx); } catch (_) {}
+  if (atIdx < 0 || composerText(ta).charAt(atIdx) !== '@') return null;
+  composerSetText(ta, composerText(ta).slice(0, atIdx) + composerText(ta).slice(atIdx + 1));
+  try { composerSetSelection(ta, atIdx, atIdx); } catch (_) {}
   if (typeof autoGrow === 'function') autoGrow(ta, 200);
-  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  composerNotify(ta);
   return ta;
 }
 
 function _focusInput(input) {
   // Defer to the next tick so the picker's outside-click handler can finish
   // closing first; otherwise focus jumps back to the picker on some browsers.
+  const active = document.activeElement;
+  const owner = _composerApi(input), epoch = owner?.epoch;
   setTimeout(() => {
+    // A native key/click may already have focused the editor and moved its
+    // caret before selectionchange reaches the model. Re-focusing would write
+    // the older model selection over that newer native selection.
+    if (document.activeElement === input || owner && owner.epoch !== epoch) return;
+    if (document.activeElement && document.activeElement !== active && document.activeElement !== document.body) return;
     try {
       if (typeof focusChatRichComposer === 'function' && focusChatRichComposer(input)) return;
       input.focus();
@@ -4632,18 +4646,22 @@ function _recipientTextareaFromEventTarget(target) {
 
 function _atKeyOpener(chipId) {
   return (e) => {
-    if (e.key !== '@') return;
+    if (e.key !== '@' || e.isComposing || e.keyCode === 229) return;
     const btn = document.getElementById(chipId);
     if (!btn) return;
     const ta = _recipientTextareaFromEventTarget(e.currentTarget);
     if (!ta) return;
+    const owner = _composerApi(ta);
+    const epoch = owner?.epoch;
     setTimeout(() => {
+      if (owner && owner.epoch !== epoch) return;
       try {
         if (typeof getChatRichComposerSelection === 'function') getChatRichComposerSelection(ta);
       } catch (_) {}
       _atKeyMark = {
         inputId: ta.id || '',
-        posAfter: typeof ta.selectionStart === 'number' ? ta.selectionStart : 0,
+        snapshot: composerSnapshot(ta),
+        posAfter: typeof composerSelection(ta).start === 'number' ? composerSelection(ta).start : 0,
       };
       _openAgentPicker(btn, 'at_key');
     }, 0);

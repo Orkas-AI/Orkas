@@ -38,10 +38,14 @@ import {
   userTasksDir,
   userTaskFile,
   userTaskAttachmentsDir,
+  userCloudRoot,
 } from '../paths';
 import { nowIso, readJson, writeJson } from '../storage';
 import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
+import { taskContent } from '../util/project-task-content';
+import { clampStr, normaliseTask as _normaliseTask, sanitiseTaskAttachmentName as _sanitiseAttachmentName,
+  TASK_RESULT_REF_MAX, TASK_STATUSES as STATUSES } from './project_task_record';
 import { ALLOWED_EXTENSIONS } from './chat_attachments';
 import * as projects from './projects';
 import * as agents from './agents';
@@ -50,12 +54,11 @@ import { getActiveUserId } from './users';
 const log = createLogger('project-tasks');
 
 export type TaskStatus = 'todo' | 'progress' | 'review' | 'done';
-const STATUSES: readonly TaskStatus[] = ['todo', 'progress', 'review', 'done'];
 // Review is unfinished work awaiting confirmation, so it counts as open.
 const OPEN_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>(['todo', 'progress', 'review']);
 
 export const TASK_CONTENT_MAX = 4000;
-export const TASK_RESULT_REF_MAX = 400;
+export { TASK_RESULT_REF_MAX } from './project_task_record';
 
 export interface ProjectTask {
   id: string;
@@ -121,13 +124,6 @@ function genTaskId(): string {
   return 't_' + crypto.randomBytes(6).toString('hex');
 }
 
-function clampStr(v: unknown, max: number): string | undefined {
-  if (typeof v !== 'string') return undefined;
-  const s = v.trim();
-  if (!s) return undefined;
-  return s.length > max ? s.slice(0, max) : s;
-}
-
 function canonicalOpenTaskContent(content: string): string {
   let normalized = content.normalize('NFKC').trim();
   const wrappingQuotes: ReadonlyArray<readonly [string, string]> = [
@@ -140,13 +136,6 @@ function canonicalOpenTaskContent(content: string): string {
     }
   }
   return normalized.replace(/\s+/g, ' ').toLowerCase();
-}
-
-/** Legacy fields are read-only aliases; canonical content always wins. */
-function taskContent(input: { content?: unknown; title?: unknown; detail?: unknown }): string | undefined {
-  if (input.content !== undefined) return typeof input.content === 'string' ? input.content.trim() : undefined;
-  return [input.title, input.detail].filter((value): value is string => typeof value === 'string')
-    .map((value) => value.trim()).filter(Boolean).join('\n');
 }
 
 /** Input-only compatibility for older clients; never persisted or returned. */
@@ -184,61 +173,6 @@ async function withTaskUpdateLock<T>(uid: string, pid: string, tid: string, fn: 
   } finally {
     if (_taskUpdateLocks.get(key) === lock && !lock.isLocked()) _taskUpdateLocks.delete(key);
   }
-}
-
-/** Coerce a persisted (possibly hand-edited / synced / older-shape) record into
- *  a valid ProjectTask, or null if unusable. Never throws on bad input. */
-function _normaliseTask(raw: any): ProjectTask | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const id = typeof raw.id === 'string' ? raw.id : '';
-  if (!TASK_ID_RE.test(id)) return null;
-  const content = taskContent(raw);
-  if (!content) return null;
-  // Older names retain their stage; retired blocked/cancelled tasks reopen as
-  // todo. Reads preserve the source file; an ordinary edit persists the mapping.
-  const storedStatus = raw.status === 'in_progress' ? 'progress'
-    : raw.status === 'in_review' ? 'review' : raw.status;
-  const status: TaskStatus = STATUSES.includes(storedStatus) ? storedStatus : 'todo';
-  const now = nowIso();
-  const t: ProjectTask = {
-    id,
-    content,
-    status,
-    created_by: typeof raw.created_by === 'string' && raw.created_by ? raw.created_by : 'user',
-    created_at: typeof raw.created_at === 'string' ? raw.created_at : now,
-    updated_at: typeof raw.updated_at === 'string' ? raw.updated_at : now,
-  };
-  const owner = clampStr(raw.owner_agent, 200);
-  if (owner) t.owner_agent = owner;
-  if (typeof raw.owner_agent_id === 'string' && raw.owner_agent_id) t.owner_agent_id = raw.owner_agent_id;
-  if (Array.isArray(raw.depends_on)) {
-    const depCandidates: string[] = raw.depends_on.filter(
-      (d: unknown): d is string => typeof d === 'string' && TASK_ID_RE.test(d),
-    );
-    const deps = [...new Set(depCandidates)];
-    if (deps.length) t.depends_on = deps;
-  }
-  const resultRef = clampStr(raw.result_ref, TASK_RESULT_REF_MAX);
-  if (resultRef) t.result_ref = resultRef;
-  if (typeof raw.origin_cid === 'string' && raw.origin_cid) t.origin_cid = raw.origin_cid;
-  if (Array.isArray(raw.attachments)) {
-    const names = [...new Set(
-      raw.attachments.map((n: unknown) => _sanitiseAttachmentName(n)).filter((n: string): n is string => !!n),
-    )] as string[];
-    if (names.length) t.attachments = names;
-  }
-  if (status === 'done' && typeof raw.done_at === 'string' && raw.done_at) t.done_at = raw.done_at;
-  return t;
-}
-
-// Attachment names cross OS boundaries via IPC and cloud-synced task JSON. Treat
-// both separator styles as directory boundaries, take the basename, and reject
-// traversal / dotfiles — host-independent, mirroring auto_tasks._sanitiseFilename.
-function _sanitiseAttachmentName(name: unknown): string {
-  if (typeof name !== 'string') return '';
-  const base = path.posix.basename(name.replace(/\\/g, '/')).trim();
-  if (!base || base === '.' || base === '..' || base.startsWith('.')) return '';
-  return base.length > 200 ? base.slice(0, 200) : base;
 }
 
 function _attachmentExtOk(name: string): boolean {
@@ -383,6 +317,7 @@ export interface ProjectTaskView {
   status: TaskStatus;
   owner_agent?: string;
   depends_on?: string[];
+  attachments?: string[];
   result_ref?: string;
   origin_cid?: string;
   created_by: string;
@@ -397,6 +332,7 @@ export function taskView(t: ProjectTask): ProjectTaskView {
     status: t.status,
     ...(t.owner_agent ? { owner_agent: t.owner_agent } : {}),
     ...(t.depends_on?.length ? { depends_on: [...t.depends_on] } : {}),
+    ...(t.attachments?.length ? { attachments: [...t.attachments] } : {}),
     ...(t.result_ref ? { result_ref: t.result_ref } : {}),
     ...(t.origin_cid ? { origin_cid: t.origin_cid } : {}),
     created_by: t.created_by,
@@ -654,10 +590,24 @@ export async function listTaskAttachments(uid: string, pid: string, tid: string)
   return _scanAttachmentsDir(uid, pid, tid);
 }
 
+/** Resolve an existing local file for preview, including unsaved task drafts.
+ * No copy/download is needed; reject redirects outside its exact account scope. */
+export async function resolveTaskAttachmentPath(uid: string, pid: string, tid: string, name: string): Promise<string | null> {
+  if (!TASK_ID_RE.test(tid) || !name || _sanitiseAttachmentName(name) !== name || !(await _scopeExists(uid, pid))) return null;
+  const file = path.join(_taskAttachmentsDir(uid, pid, tid), name);
+  try {
+    const cloud = userCloudRoot(uid);
+    const expected = path.join(await fsp.realpath(cloud), path.relative(cloud, file));
+    if (await fsp.realpath(file) !== expected || !(await fsp.lstat(file)).isFile()) return null;
+    return file;
+  } catch { return null; }
+}
+
 /** Stage one attachment under the task (draft-safe: the task JSON need not exist
  *  yet). Validates the name + type against the composer's whitelist. */
 export async function uploadTaskAttachment(
   uid: string, pid: string, tid: string, name: string, buf: Buffer,
+  options: { overwrite?: boolean } = {},
 ): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
   if (!TASK_ID_RE.test(tid)) return { ok: false, error: 'invalid_task_id' };
   if (!(await _scopeExists(uid, pid))) return { ok: false, error: 'project_not_found' };
@@ -668,8 +618,15 @@ export async function uploadTaskAttachment(
   const dir = _taskAttachmentsDir(uid, pid, tid);
   try {
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, safe), buf);
+    if (options.overwrite === false) {
+      const temp = path.join(dir, `.pending-${crypto.randomBytes(16).toString('hex')}`);
+      try {
+        await fsp.writeFile(temp, buf, { flag: 'wx' });
+        await fsp.link(temp, path.join(dir, safe));
+      } finally { await fsp.rm(temp, { force: true }); }
+    } else fs.writeFileSync(path.join(dir, safe), buf);
   } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') return { ok: false, error: 'attachment_already_exists' };
     log.warn('attachment upload', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), attachment: logPathRef(safe), error: logErrorSummary(err) });
     return { ok: false, error: 'write_failed' };
   }

@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -50,10 +51,13 @@ type Recipient = { kind: string; id?: string; name?: string };
 /** Let pending microtasks and the IPC promise chain settle. */
 const settle = () => new Promise((resolve) => { setTimeout(resolve, 0); });
 
-function mountProjectDetail(bindings: Bindings, held: string[] = []) {
+function mountProjectDetail(bindings: Bindings, held: string[] = [], agentDetails: Record<string, Array<{ agent_id: string; name: string }>> = {}) {
   const holdSet = new Set(held);
   const gates: Record<string, Array<() => void>> = {};
   const bindingCalls: string[] = [];
+  const agentList = { innerHTML: '', style: {}, querySelectorAll() { return []; } };
+  const agentEmpty = { style: {} };
+  const agentCount = { textContent: '' };
   const answer = (channel: string, value: unknown) => {
     if (!holdSet.has(channel)) return Promise.resolve(value);
     return new Promise((resolve) => {
@@ -62,11 +66,17 @@ function mountProjectDetail(bindings: Bindings, held: string[] = []) {
   };
   const context = vm.createContext({
     console,
+    currentUserId: 'project-recipient-fixture',
     createLogger: () => ({ warn() {}, info() {}, error() {} }),
     document: {
       readyState: 'loading',
       addEventListener() {},
-      getElementById() { return null; },
+      getElementById(id: string) {
+        if (id === 'project-agents-list') return agentList;
+        if (id === 'project-agents-empty') return agentEmpty;
+        if (id === 'project-detail-agents-count') return agentCount;
+        return null;
+      },
       querySelectorAll() { return []; },
       createElement() { return { appendChild() {}, className: '', dataset: {}, style: {} }; },
     },
@@ -83,7 +93,7 @@ function mountProjectDetail(bindings: Bindings, held: string[] = []) {
               return answer(channel, {
                 ok: true,
                 bindings: { agents: bindings[pid] || [] },
-                agentDetails: [],
+                agentDetails: agentDetails[pid] || [],
               });
             case 'projects.files.tree':
               return answer(channel, { ok: true, tree: [] });
@@ -99,10 +109,12 @@ function mountProjectDetail(bindings: Bindings, held: string[] = []) {
       },
     },
     t: (key: string) => key,
+    escapeHtml: (value: unknown) => String(value ?? ''),
     uiAlert() {},
     setTimeout,
     clearTimeout,
   });
+  vm.runInContext(composerAccessorSource, context);
   vm.runInContext(projectDetailSource, context, { filename: 'project-detail.js' });
   vm.runInContext(
     'const _COMMANDER = { kind: "commander", id: "", name: "" }; const _composerAgentScopes = new Map();\n'
@@ -126,11 +138,14 @@ function mountProjectDetail(bindings: Bindings, held: string[] = []) {
     function __readProjectRecipient() { return JSON.parse(JSON.stringify(__projectRecipient)); }
     function __pickProjectAgent(id, name) { __projectRecipient = { kind: 'agent', id, name }; }
     _renderProjectDetail = function () {};
+    _bindProjectAgentCards = function () {};
     _setProjectAutoTabCount = function () {};
     _kickProjectKbReconcileIfNeeded = function () {};
     _scheduleProjectKbStatusRefreshIfNeeded = function () {};
   `, context);
   return {
+    agentList,
+    agentCount,
     bindingCalls,
     pickAgent(id: string, name: string) {
       vm.runInContext(`__pickProjectAgent(${JSON.stringify(id)}, ${JSON.stringify(name)})`, context);
@@ -155,6 +170,22 @@ function mountProjectDetail(bindings: Bindings, held: string[] = []) {
 const COMMANDER: Recipient = { kind: 'commander' };
 
 describe('project composer recipient follows the open project', () => {
+  it('shows a bound Agent while a large project library is still loading', async () => {
+    const panel = mountProjectDetail(
+      { p_alpha: ['agent_writer'] },
+      ['projects.files.tree'],
+      { p_alpha: [{ agent_id: 'agent_writer', name: 'Writer' }] },
+    );
+    const opening = panel.open('p_alpha');
+    await settle();
+
+    expect(panel.agentList.innerHTML).toContain('Writer');
+    expect(panel.agentCount.textContent).toBe('1');
+
+    panel.release('projects.files.tree');
+    await opening;
+  });
+
   it('drops an agent the newly opened project is not bound to', async () => {
     const panel = mountProjectDetail({ p_alpha: ['agent_writer'], p_beta: ['agent_coder'] });
     await panel.open('p_alpha');
@@ -213,6 +244,8 @@ describe('project composer recipient follows the open project', () => {
     const panel = mountProjectDetail(
       { p_alpha: ['agent_writer'], p_beta: ['agent_coder'] },
       ['projects.bindings.list'],
+      { p_alpha: [{ agent_id: 'agent_writer', name: 'Writer' }],
+        p_beta: [{ agent_id: 'agent_coder', name: 'Coder' }] },
     );
     const first = panel.open('p_alpha');
     const second = panel.open('p_beta');
@@ -222,6 +255,8 @@ describe('project composer recipient follows the open project', () => {
     await Promise.all([first, second]);
 
     expect(panel.recipient()).toEqual({ kind: 'agent', id: 'agent_coder', name: 'Coder' });
+    expect(panel.agentList.innerHTML).toContain('Coder');
+    expect(panel.agentList.innerHTML).not.toContain('Writer');
     expect(panel.bindingCalls).toEqual(['p_alpha', 'p_beta']);
   });
 

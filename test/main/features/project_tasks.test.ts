@@ -67,6 +67,121 @@ function globalAttachDir(tid: string): string {
 }
 
 describe('project_tasks › global scope', () => {
+  it.each(['project', 'global'])('copies a chat attachment through the todo tool into durable %s storage', async (scope) => {
+    const { pt, pid: projectId } = await setup();
+    const pid = scope === 'global' ? '' : projectId;
+    const { chatAttachmentDirForConversation } = await import('../../../src/main/util/project-layout');
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const { createProjectTasksTool } = await import('../../../src/core-agent/src/tools/project-tasks-tool');
+    const sourceDir = chatAttachmentDirForConversation(TEST_UID, 'c-attachment');
+    fs.mkdirSync(sourceDir, { recursive: true });
+    const source = path.join(sourceDir, 'brief.txt');
+    fs.writeFileSync(source, 'The actual document, not just its name.');
+    const tool = createProjectTasksTool(createProjectTasksHandler(TEST_UID, pid, 'c-attachment', new Map()));
+    const receipt = JSON.parse((await tool.execute({ action: 'create', content: 'Review attached brief' }, { state: {} })).content);
+    const added = await tool.execute({ action: 'add_attachment', task_id: receipt.task.id, source_path: source }, { state: {} });
+    expect(added.isError).toBe(false);
+    expect(JSON.parse(added.content).task.attachments).toEqual(['brief.txt']);
+    const dir = pid ? path.join(path.dirname(taskFile(pid, receipt.task.id)), '..', 'task_attachments', receipt.task.id) : globalAttachDir(receipt.task.id);
+    expect(fs.readFileSync(path.join(dir, 'brief.txt'), 'utf8')).toBe('The actual document, not just its name.');
+    fs.writeFileSync(source, 'Must not replace the saved document');
+    const repeat = await tool.execute({ action: 'add_attachment', task_id: receipt.task.id, source_path: source }, { state: {} });
+    expect(repeat.isError).toBe(true);
+    expect(JSON.parse(repeat.content).error).toBe('attachment_already_exists');
+    fs.unlinkSync(source);
+    expect(fs.readFileSync(path.join(dir, 'brief.txt'), 'utf8')).toBe('The actual document, not just its name.');
+    expect(await pt.getTask(TEST_UID, pid, receipt.task.id)).toMatchObject({ attachments: ['brief.txt'], status: 'todo' });
+    expect(JSON.parse((await tool.execute({ action: 'get', task_id: receipt.task.id }, { state: {} })).content).task.attachments).toEqual(['brief.txt']);
+    const deleted = await tool.execute({ action: 'delete', task_id: receipt.task.id }, { state: {} });
+    expect(JSON.parse(deleted.content)).toEqual({ ok: true, task_id: receipt.task.id, deleted: true });
+    expect(await pt.getTask(TEST_UID, pid, receipt.task.id)).toBeNull();
+    expect(fs.existsSync(dir)).toBe(false);
+
+  });
+
+  it('rejects foreign files, symlink escapes, missing files, unsupported files and oversized inputs without changing a todo', async () => {
+    const { pt, pid } = await setup();
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const workspace = path.join(tmpDir, 'allowed');
+    fs.mkdirSync(workspace);
+    const outside = path.join(tmpDir, 'foreign.txt');
+    fs.writeFileSync(outside, 'private');
+    fs.symlinkSync(outside, path.join(workspace, 'escape.txt'));
+    fs.writeFileSync(path.join(workspace, 'program.exe'), 'exe');
+    const oversized = path.join(workspace, 'big.txt');
+    fs.writeFileSync(oversized, '');
+    fs.truncateSync(oversized, pt.TASK_ATTACHMENT_MAX_BYTES + 1);
+    const created = await pt.createTask(TEST_UID, pid, { content: 'No attachment on failure' });
+    if (!created.ok) throw new Error('fixture failed');
+    const handler = createProjectTasksHandler(TEST_UID, pid, '', new Map(), {}, { workingDir: workspace });
+    for (const source of [outside, path.join(workspace, 'escape.txt'), path.join(workspace, 'missing.txt'),
+      path.join(workspace, 'program.exe'), oversized, 'relative.txt']) {
+      expect((await handler.addAttachment!(created.task.id, source)).ok).toBe(false);
+      expect(await pt.getTask(TEST_UID, pid, created.task.id)).toEqual(created.task);
+      expect(await pt.listTaskAttachments(TEST_UID, pid, created.task.id)).toEqual([]);
+    }
+    const valid = path.join(workspace, 'valid.txt'); fs.writeFileSync(valid, 'Valid');
+    expect((await handler.addAttachment!('t_000000000000', valid)).error).toBe('task_not_found');
+    const users = await import('../../../src/main/features/users');
+    users.activateUser('other');
+    expect((await handler.addAttachment!(created.task.id, valid)).error).toBe('account_changed');
+  });
+
+  it('preserves the first attachment when two additions race for the same name', async () => {
+    const { pt, pid } = await setup();
+    const task = await pt.createTask(TEST_UID, pid, { content: 'Race attachment' });
+    if (!task.ok) throw new Error('fixture failed');
+    const results = await Promise.all(['First', 'Second'].map(value =>
+      pt.uploadTaskAttachment(TEST_UID, pid, task.task.id, 'brief.txt', Buffer.from(value), { overwrite: false })));
+    expect(results.filter(r => r.ok)).toHaveLength(1);
+    expect(results.filter(r => !r.ok)).toEqual([{ ok: false, error: 'attachment_already_exists' }]);
+    expect(await pt.listTaskAttachments(TEST_UID, pid, task.task.id)).toEqual(['brief.txt']);
+  });
+
+  it('removes partial attachment bytes after a disk failure and permits a clean retry', async () => {
+    const { pt, pid } = await setup();
+    const created = await pt.createTask(TEST_UID, pid, { content: 'Recoverable attachment' });
+    if (!created.ok) throw new Error('fixture failed');
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const source = path.join(tmpDir, 'brief.txt'); fs.writeFileSync(source, 'Complete bytes');
+    const handler = createProjectTasksHandler(TEST_UID, pid, '', new Map(), {}, { workingDir: tmpDir });
+    const original = nativeFs.promises.writeFile;
+    const spy = vi.spyOn(nativeFs.promises, 'writeFile').mockImplementation(async (target, body, options) => {
+      if (String(target).includes('.pending-')) {
+        await original(target, 'partial', options);
+        throw Object.assign(new Error('injected disk full'), { code: 'ENOSPC' });
+      }
+      return original(target, body, options);
+    });
+    syncBuiltinESMExports();
+    try {
+      expect(await handler.addAttachment!(created.task.id, source)).toEqual({ ok: false, error: 'write_failed' });
+      expect(await pt.listTaskAttachments(TEST_UID, pid, created.task.id)).toEqual([]);
+      expect(fs.readdirSync(path.join(path.dirname(taskFile(pid, created.task.id)), '..', 'task_attachments', created.task.id))).toEqual([]);
+      expect(await pt.getTask(TEST_UID, pid, created.task.id)).toEqual(created.task);
+      expect(taskLogs.some(args => args[0] === 'warn' && args[1] === 'attachment upload')).toBe(true);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect((await handler.addAttachment!(created.task.id, source)).ok).toBe(true);
+  });
+
+  it('does not gain access to the destination project workspace when attaching from a different conversation scope', async () => {
+    const { pt, pid } = await setup();
+    const { setWorkspacePath } = await import('../../../src/main/features/user_workspace');
+    const current = path.join(tmpDir, 'current-workspace'), other = path.join(tmpDir, 'other-workspace');
+    fs.mkdirSync(current); fs.mkdirSync(other);
+    setWorkspacePath(TEST_UID, current); setWorkspacePath(TEST_UID, other, pid);
+    const source = path.join(current, 'brief.txt'), foreign = path.join(other, 'private.txt');
+    fs.writeFileSync(source, 'Current conversation document'); fs.writeFileSync(foreign, 'Unrelated document');
+    const created = await pt.createTask(TEST_UID, pid, { content: 'Receive the current document' });
+    if (!created.ok) throw new Error('fixture failed');
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const handler = createProjectTasksHandler(TEST_UID, pid, '', new Map(), {}, { sourceProjectId: '' });
+    expect((await handler.addAttachment!(created.task.id, foreign)).ok).toBe(false);
+    expect((await handler.addAttachment!(created.task.id, source)).ok).toBe(true);
+    expect(await pt.listTaskAttachments(TEST_UID, pid, created.task.id)).toEqual(['brief.txt']);
+  });
+
+
   it('records attachment success and disk failure without disclosing the local identity or filename', async () => {
     const pt = await import('../../../src/main/features/project_tasks');
     const tid = 't_aabbccddeeff';
@@ -633,6 +748,24 @@ function attachDir(pid: string, tid: string): string {
 }
 
 describe('project_tasks › attachments', () => {
+  it('opens draft attachments only at their exact local account path', async () => {
+    const { pt, pid } = await setup();
+    const tid = 't_0123456789ab';
+    expect(await pt.uploadTaskAttachment(TEST_UID, pid, tid, 'draft.txt', Buffer.from('Draft bytes'))).toEqual({ ok: true, name: 'draft.txt' });
+    const expected = path.join(attachDir(pid, tid), 'draft.txt');
+    expect(await pt.resolveTaskAttachmentPath(TEST_UID, pid, tid, 'draft.txt')).toBe(expected);
+    for (const name of ['../draft.txt', 'sub/draft.txt', '.hidden', 'missing.txt']) {
+      expect(await pt.resolveTaskAttachmentPath(TEST_UID, pid, tid, name)).toBeNull();
+    }
+    expect(await pt.resolveTaskAttachmentPath('other-account', pid, tid, 'draft.txt')).toBeNull();
+    const foreign = path.join(tmpDir, 'outside.txt');
+    fs.writeFileSync(foreign, 'Outside bytes');
+    fs.unlinkSync(expected);
+    fs.symlinkSync(foreign, expected);
+    expect(await pt.resolveTaskAttachmentPath(TEST_UID, pid, tid, 'draft.txt')).toBeNull();
+    expect(fs.readFileSync(foreign, 'utf8')).toBe('Outside bytes');
+  });
+
   it('uploads a file, caches the name on the task, and lists it', async () => {
     const { pt, pid } = await setup();
     const created = await pt.createTask(TEST_UID, pid, { content: 'with files' });
