@@ -5,6 +5,8 @@ import { expect, vi } from 'vitest';
 export async function captureMainLogWorkers(): Promise<() => Promise<void>> {
   type DeliveryModule = typeof import('../../src/main/util/log-delivery');
   const deliveries: ReturnType<DeliveryModule['createLogDelivery']>[] = [];
+  const previousDisable = process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
+  process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = '0';
   // A persistent module mock, rather than a spy on one module instance, also
   // captures workers created after a case calls resetModules() again.
   vi.doMock('../../src/main/util/log-delivery', async importOriginal => {
@@ -27,6 +29,8 @@ export async function captureMainLogWorkers(): Promise<() => Promise<void>> {
     } finally {
       await Promise.all(deliveries.map(delivery => delivery.close()));
       vi.doUnmock('../../src/main/util/log-delivery');
+      if (previousDisable === undefined) delete process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
+      else process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = previousDisable;
     }
   };
 }

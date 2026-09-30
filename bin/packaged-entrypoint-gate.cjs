@@ -234,7 +234,18 @@ const PACKAGED_MCP_RUNTIME_FILES = Object.freeze([
   // declares; the verifier reads that `type` instead of assuming CommonJS.
   { lockPath: 'node_modules/@nodable/entities', packageName: '@nodable/entities', entries: ['src/index.js'] },
   { lockPath: 'node_modules/path-expression-matcher', packageName: 'path-expression-matcher', entries: ['lib/pem.cjs'] },
-  { lockPath: 'node_modules/strnum', packageName: 'strnum', entries: ['strnum.js'] },
+  {
+    lockPath: 'node_modules/strnum',
+    packageName: 'strnum',
+    entries: ['strnum.js'],
+    // electron-builder can hoist COS's strnum 1.x and move the XML parser's
+    // locked 2.x beside its consumer. Check the nearest package first, just
+    // as Node does; an invalid nested package must not fall back to the root.
+    packagedPaths: [
+      'node_modules/fast-xml-parser/node_modules/strnum',
+      'node_modules/strnum',
+    ],
+  },
   { lockPath: 'node_modules/xml-naming', packageName: 'xml-naming', entries: ['src/index.js'] },
 ]);
 
@@ -620,7 +631,9 @@ function verifyPackagedEntrypointPayload(pcRoot, options = {}) {
   }
 
   for (const spec of PACKAGED_MCP_RUNTIME_FILES) {
-    const packageDir = path.join(pcRoot, ...(spec.packagedPath || spec.lockPath).split('/'));
+    const candidates = (spec.packagedPaths || [spec.packagedPath || spec.lockPath])
+      .map((relativePath) => path.join(pcRoot, ...relativePath.split('/')));
+    const packageDir = candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
     const packageJson = readJson(`${spec.packageName} package.json`, path.join(packageDir, 'package.json'));
     const expectedVersion = packageLockPathVersion(packageLock, spec.lockPath);
     if (String(packageJson.version || '') !== expectedVersion) {

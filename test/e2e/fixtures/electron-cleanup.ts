@@ -11,6 +11,14 @@ type OwnedApplication = {
 /** Run quit on the normal event loop, outside the inspector evaluation stack.
  * Keep Electron's before-quit flushes and wait for the actual application close. */
 export async function requestElectronQuit(app: ElectronApplication): Promise<void> {
+  // Closing the final window already starts normal shutdown on Windows/Linux.
+  // The inspector may disconnect before a second app.quit() can be evaluated.
+  if (process.platform !== 'darwin' && app.windows().length === 0) {
+    const child = app.process();
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    await new Promise<void>(resolve => child.once('exit', () => resolve()));
+    return;
+  }
   let closed = false;
   let complete!: () => void;
   const completion = new Promise<void>(resolve => { complete = resolve; });

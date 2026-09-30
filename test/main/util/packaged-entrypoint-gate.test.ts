@@ -145,6 +145,48 @@ describe('packaged-entrypoint-gate', () => {
       .toEqual(gate.requiredPackagedEntrypointVerificationEntries());
   });
 
+  it('accepts the XML parser dependency nested beside a different hoisted strnum version', () => {
+    const pcRoot = packagedFixture();
+    const root = path.join(pcRoot, 'node_modules', 'strnum');
+    const nested = path.join(pcRoot, 'node_modules', 'fast-xml-parser', 'node_modules', 'strnum');
+    fs.mkdirSync(path.dirname(nested), { recursive: true });
+    fs.renameSync(root, nested);
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'strnum', version: '1.1.2' }));
+    fs.writeFileSync(path.join(root, 'strnum.js'), 'module.exports = {};\n');
+
+    expect(gate.verifyPackagedEntrypointPayload(pcRoot, { projectRoot: process.cwd() }))
+      .toEqual(gate.requiredPackagedEntrypointVerificationEntries());
+
+    fs.rmSync(nested, { recursive: true });
+    expect(() => gate.verifyPackagedEntrypointPayload(pcRoot, { projectRoot: process.cwd() }))
+      .toThrow(/strnum version mismatch/);
+  });
+
+  it('rejects an incorrect parser-local strnum even when the hoisted version matches', () => {
+    const pcRoot = packagedFixture();
+    const nested = path.join(pcRoot, 'node_modules', 'fast-xml-parser', 'node_modules', 'strnum');
+    fs.mkdirSync(nested, { recursive: true });
+    fs.writeFileSync(path.join(nested, 'package.json'), JSON.stringify({ name: 'strnum', version: '1.1.2' }));
+    fs.writeFileSync(path.join(nested, 'strnum.js'), 'module.exports = {};\n');
+
+    expect(() => gate.verifyPackagedEntrypointPayload(pcRoot, { projectRoot: process.cwd() }))
+      .toThrow(/strnum version mismatch/);
+  });
+
+  it.each(['missing', 'invalid'] as const)('rejects a %s nested strnum entry without falling back', (failure) => {
+    const pcRoot = packagedFixture();
+    const nested = path.join(pcRoot, 'node_modules', 'fast-xml-parser', 'node_modules', 'strnum');
+    fs.mkdirSync(path.dirname(nested), { recursive: true });
+    fs.cpSync(path.join(pcRoot, 'node_modules', 'strnum'), nested, { recursive: true });
+    const entry = path.join(nested, 'strnum.js');
+    if (failure === 'missing') fs.rmSync(entry);
+    else fs.writeFileSync(entry, 'module.exports = {;\n');
+
+    expect(() => gate.verifyPackagedEntrypointPayload(pcRoot, { projectRoot: process.cwd() }))
+      .toThrow(failure === 'missing' ? /missing strnum runtime/ : /invalid strnum runtime/);
+  });
+
   it('rejects build-only or newly introduced files in the packaged bin tree', () => {
     const pcRoot = packagedFixture();
     fs.writeFileSync(path.join(pcRoot, 'bin', 'runtime-gate.cjs'), 'module.exports = {};\n');

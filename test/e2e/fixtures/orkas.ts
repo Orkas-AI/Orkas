@@ -61,6 +61,11 @@ type OrkasOptions = {
   updateStub?: boolean;
   metacognitionEnabled?: boolean;
   enableSystemProxy?: boolean;
+  /** Language persisted before launch. `null` deliberately leaves the
+   * preference absent so boot must detect Electron's system locale. */
+  seedLanguage?: 'en' | 'zh' | 'ja' | 'pt' | null;
+  /** Process-local system language override for deterministic first-boot E2E. */
+  appLocale?: string;
 };
 
 export type CliStubInvocation = {
@@ -217,7 +222,7 @@ type ModelToolScenario =
     kind: 'project-instructions';
     instructions: string;
     finalText: string;
-    toolDelayMs: number;
+    beforeTool?: Promise<void>;
   }
   | {
     kind: 'knowledge-base';
@@ -712,20 +717,20 @@ input.on('line', line => {
 });
 `;
 }
-function seedUserWorkspace(workspaceRoot: string, userId: string): void {
+function seedUserWorkspace(workspaceRoot: string, userId: string, seedLanguage: OrkasOptions['seedLanguage'] = 'en'): void {
   writeJson(path.join(workspaceRoot, userId, 'cloud', 'config', 'preferences.json'), {
-    language: 'en', task_notifications_enabled: true,
+    ...(seedLanguage ? { language: seedLanguage } : {}), task_notifications_enabled: true,
     metacognition_enabled: false, global_skill_roots_enabled: false,
   });
 }
 
-function seedWorkspace(workspaceRoot: string): void {
+function seedWorkspace(workspaceRoot: string, seedLanguage: OrkasOptions['seedLanguage'] = 'en'): void {
   const userId = LOCAL_USER_ID;
   writeJson(path.join(workspaceRoot, 'open-users.json'), {
     open_current_user_id: userId,
     users: [{ user_id: userId, created_at: '2026-01-01T00:00:00.000Z' }],
   });
-  seedUserWorkspace(workspaceRoot, userId);
+  seedUserWorkspace(workspaceRoot, userId, seedLanguage);
 }
 
 
@@ -743,6 +748,7 @@ export class OrkasTestApp {
   readonly updateStub: boolean;
   readonly metacognitionEnabled: boolean;
   readonly enableSystemProxy: boolean;
+  readonly appLocale: string;
   readonly cliStatePath: string;
   readonly fakeOpenCodePath: string | null;
   readonly fakeHermesPath: string | null;
@@ -828,6 +834,7 @@ export class OrkasTestApp {
     this.updateStub = options.updateStub === true;
     this.metacognitionEnabled = options.metacognitionEnabled === true;
     this.enableSystemProxy = options.enableSystemProxy === true;
+    this.appLocale = options.appLocale || '';
     this.root = mkdtempSync(path.join(options.rootParent ?? tmpdir(), 'orkas-e2e-'));
     this.workspaceRoot = path.join(this.root, 'workspace');
     this.userWorkspaceRoot = path.join(this.root, 'userWorkSpace');
@@ -861,7 +868,7 @@ export class OrkasTestApp {
         modelListResponses: 0,
       } satisfies CliStubState);
     }
-    seedWorkspace(this.workspaceRoot);
+    seedWorkspace(this.workspaceRoot, options.seedLanguage);
     if (this.updateStub) {
       writeJson(
         path.join(this.workspaceRoot, this.activeUserId, 'local', 'config', 'remote-config.json'),
@@ -939,9 +946,14 @@ export class OrkasTestApp {
     // observed request metadata depend on the developer's terminal.
     delete environment.ORKAS_CLIENT_CHANNEL;
     delete environment.ORKAS_CHANNEL;
-
+    // Chromium's --lang does not change getPreferredSystemLanguages() on macOS.
+    // Override this process's AppleLanguages too, without changing host defaults.
+    const localeArgs = this.appLocale ? [
+      `--lang=${this.appLocale}`,
+      ...(process.platform === 'darwin' ? ['-AppleLanguages', `(${this.appLocale})`] : []),
+    ] : [];
     const app = await electron.launch({
-      args: ['.'],
+      args: [...(this.options.softwareRendering ? ['--disable-gpu'] : []), ...(this.options.captureRendererErrorWindows ? ['--require', path.join(__dirname, 'preview-recovery-preload.cjs')] : []), '.', ...localeArgs],
       cwd: PC_ROOT,
       env: environment,
       timeout: 30_000,
@@ -1560,11 +1572,10 @@ export class OrkasTestApp {
   setProjectInstructionsScenario(
     instructions: string,
     finalText: string,
-    options: { toolDelayMs?: number } = {},
+    options: { beforeTool?: Promise<void> } = {},
   ): void {
     if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
-    const toolDelayMs = options.toolDelayMs ?? 0;
-    if (!instructions.trim() || !finalText.trim() || toolDelayMs < 0) {
+    if (!instructions.trim() || !finalText.trim()) {
       throw new Error('The project-instructions scenario requires full replacement text and a final reply');
     }
     this.modelToolScenarioRequestStart = this.modelRequests.length;
@@ -1572,7 +1583,7 @@ export class OrkasTestApp {
       kind: 'project-instructions',
       instructions,
       finalText,
-      toolDelayMs,
+      beforeTool: options.beforeTool,
     };
   }
 
@@ -3019,10 +3030,10 @@ export class OrkasTestApp {
               'project_instructions',
               { instructions: scenario.instructions },
             );
-            if (scenario.toolDelayMs > 0) {
-              setTimeout(() => {
+            if (scenario.beforeTool) {
+              void scenario.beforeTool.then(() => {
                 if (!response.destroyed) finishImmediately(eventsForTool);
-              }, scenario.toolDelayMs);
+              });
             } else {
               finishImmediately(eventsForTool);
             }

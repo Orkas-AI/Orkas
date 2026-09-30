@@ -62,7 +62,7 @@ describe('ensure-deps package-tree health', () => {
       packageName: 'electron',
     });
 
-    expect(lockedVersion).toBe('42.8.0');
+    expect(lockedVersion).toBe('42.11.9');
     expect(packageJson.devDependencies?.electron).toBe(lockedVersion);
   });
 

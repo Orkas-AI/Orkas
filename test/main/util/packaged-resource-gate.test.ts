@@ -115,8 +115,8 @@ describe('packaged-resource-gate', () => {
     expect(() => verifyMacLocalizedMetadataRoot(root)).toThrow(/content mismatch/);
 
     fs.cpSync(path.join(process.cwd(), 'resources', 'mac-locales'), root, { recursive: true, force: true });
-    fs.mkdirSync(path.join(root, 'ar.lproj'));
-    fs.writeFileSync(path.join(root, 'ar.lproj', 'InfoPlist.strings'), '"key" = "value";\n');
+    fs.mkdirSync(path.join(root, 'nl.lproj'));
+    fs.writeFileSync(path.join(root, 'nl.lproj', 'InfoPlist.strings'), '"key" = "value";\n');
     expect(() => verifyMacLocalizedMetadataRoot(root)).toThrow(/unexpected mac localized metadata locale/);
   });
 
