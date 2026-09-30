@@ -9,8 +9,11 @@ import type { BrowserWindow as ElectronBrowserWindow, Session } from 'electron';
 import { createPreviewSdk, previewBundle, previewPreload, type PreviewSdkEvidence } from './web_apps/preview';
 import type { Bundle } from './web_apps/runtime';
 import { ARTIFACT_FRAME } from './chat_artifacts';
+import * as chatAttachments from './chat_attachments';
+import { chatMediaLocalPathFromUrl, chatMediaLocalUrl } from '../util/chat-media-url';
+import { serveFileRange } from '../util/http-range';
 import { isPathAllowed } from '../util/path-sandbox';
-import { hardenedWebPreferences } from '../util/window-security';
+import { hardenedWebPreferences, withHtmlPreviewAssetPolicy, withHtmlPreviewPolicy } from '../util/window-security';
 
 const HTML_PREVIEW_TIMEOUT_MS = 20_000;
 const HTML_PREVIEW_MAX_BLOCKED_RESOURCE_SAMPLES = 8;
@@ -132,6 +135,10 @@ export interface HtmlPreviewRuntimeDeps {
 
 export interface HtmlPreviewRenderOptions {
   interactions?: boolean;
+  /** Check a plain page the way the chat file viewer shows it: through
+   *  `chat-media://local` with the viewer's sandbox (no storage, CORS-gated
+   *  assets). Generated artifacts render in `chat-app://` and keep the default. */
+  fileViewer?: boolean;
 }
 
 type PageEvidence = Omit<
@@ -739,6 +746,7 @@ function blockedResourceLabel(raw: string): string {
   try {
     const url = new URL(raw);
     if (url.protocol === 'file:') return 'file:outside-entry-directory';
+    if (url.protocol === 'chat-media:') return 'chat-media:outside-entry-directory';
     if (url.protocol === 'http:' || url.protocol === 'https:') return `${url.protocol}//${url.host}`;
     return url.protocol || 'unknown:';
   } catch {
@@ -748,6 +756,10 @@ function blockedResourceLabel(raw: string): string {
 
 function allowedPreviewRequest(raw: string, entryRootReal: string): boolean {
   if (/^(?:https?|wss?|data|blob|about):/i.test(raw)) return true;
+  if (raw.startsWith('chat-media:')) {
+    const requested = chatMediaLocalPathFromUrl(raw);
+    return !!requested && isPathAllowed(requested, [entryRootReal]);
+  }
   if (!raw.startsWith('file:')) return false;
   try {
     const requested = fs.realpathSync(fileURLToPath(raw));
@@ -782,6 +794,64 @@ function registerNetworkIsolation(
   });
 }
 
+function previewFailureStatus(code: string | undefined): number {
+  if (code === 'bad_input') return 400;
+  if (code === 'forbidden') return 403;
+  if (code === 'too_large') return 413;
+  return 404;
+}
+
+/**
+ * Serve a plain HTML entry the way the chat file viewer does: through
+ * `chat-media://local`, with the viewer's CSP and iframe sandbox applied to the
+ * document and same-folder assets granted CORS. Storage and host access fail
+ * here exactly as they do for the user. Unlike the viewer, local files stay
+ * confined to the entry directory.
+ */
+function servePreviewRequest(request: Request, entryRootReal: string): Response {
+  const requested = chatMediaLocalPathFromUrl(request.url);
+  if (!requested) return new Response('bad request', { status: 400 });
+  if (!isPathAllowed(requested, [entryRootReal])) return new Response('outside the entry directory', { status: 403 });
+  const media = chatAttachments.resolveLocalMediaPath(requested);
+  if (media.ok) {
+    if (path.extname(media.absPath).toLowerCase() === '.svg') {
+      const svg = chatAttachments.materializeLocalDisplaySvg(media.absPath);
+      if (!svg.ok) return new Response('', { status: previewFailureStatus((svg as { code?: string }).code) });
+      return new Response(svg.body, { headers: { 'Content-Type': chatAttachments.localMediaMimeFor(media.absPath) } });
+    }
+    const st = fs.statSync(media.absPath);
+    return serveFileRange(request, media.absPath, chatAttachments.localMediaMimeFor(media.absPath), st.size, st.mtimeMs);
+  }
+  if ((media as { code?: string }).code !== 'bad_input') {
+    return new Response('', { status: previewFailureStatus((media as { code?: string }).code) });
+  }
+  const doc = chatAttachments.resolveLocalPreviewPath(requested);
+  if (doc.ok) {
+    const st = fs.statSync(doc.absPath);
+    const response = serveFileRange(request, doc.absPath, chatAttachments.localMediaMimeFor(doc.absPath), st.size, st.mtimeMs);
+    return doc.kind === 'html' ? withHtmlPreviewPolicy(response, { sandboxDocument: true }) : response;
+  }
+  if ((doc as { code?: string }).code !== 'bad_input') {
+    return new Response('', { status: previewFailureStatus((doc as { code?: string }).code) });
+  }
+  const asset = chatAttachments.resolveHtmlPreviewAssetWithinRoots(requested, [entryRootReal]);
+  if (!asset.ok) return new Response('', { status: previewFailureStatus((asset as { code?: string }).code) });
+  const st = fs.statSync(asset.absPath);
+  return withHtmlPreviewAssetPolicy(serveFileRange(
+    request, asset.absPath, chatAttachments.localPreviewAssetMimeFor(asset.absPath), st.size, st.mtimeMs,
+  ));
+}
+
+function registerLocalPreviewProtocol(ses: Session, entryRootReal: string): void {
+  ses.protocol.handle('chat-media', (request) => {
+    try {
+      return servePreviewRequest(request, entryRootReal);
+    } catch {
+      return new Response('error', { status: 500 });
+    }
+  });
+}
+
 function registerPermissionIsolation(ses: Session): void {
   // Electron grants permission requests by default unless the application
   // installs handlers. Previewed HTML is untrusted local content, so it must
@@ -799,6 +869,7 @@ function registerPermissionIsolation(ses: Session): void {
 
 async function clearPreviewSession(ses: Session): Promise<void> {
   try { ses.webRequest.onBeforeRequest(null); } catch { /* best effort */ }
+  try { if (ses.protocol?.isProtocolHandled('chat-media')) ses.protocol.unhandle('chat-media'); } catch { /* best effort */ }
   try { ses.removeAllListeners('will-download'); } catch { /* best effort */ }
   try { ses.setPermissionCheckHandler(null); } catch { /* best effort */ }
   try { ses.setPermissionRequestHandler(null); } catch { /* best effort */ }
@@ -936,6 +1007,9 @@ async function renderViewport(
 /**
  * Render one local HTML entry at one or more declared viewports using the
  * packaged Electron runtime. Web resources are allowed; local files remain confined to the entry directory.
+ * With `fileViewer`, a plain page loads through `chat-media://local` with the
+ * file viewer's sandbox, so storage use and CORS gaps show up as they would for
+ * the user.
  */
 export async function renderResponsiveHtmlPreview(
   entryPath: string,
@@ -962,6 +1036,9 @@ export async function renderResponsiveHtmlPreview(
   registerPermissionIsolation(ses);
   try {
     registerNetworkIsolation(ses, entryRootReal, blocked, sdkOrigin);
+    // SDK app bundles keep their own shell (see createPreviewSdk).
+    const fileViewer = !bundle && options.fileViewer === true;
+    if (fileViewer) registerLocalPreviewProtocol(ses, entryRootReal);
     const downloads: HtmlPreviewDownloadEvidence[] = [];
     ses.on('will-download', (event, item) => {
       const rawUrl = String(item.getURL?.() || '');
@@ -982,7 +1059,7 @@ export async function renderResponsiveHtmlPreview(
       }
       event.preventDefault();
     });
-    const entryUrl = pathToFileURL(entryReal).toString();
+    const entryUrl = fileViewer ? chatMediaLocalUrl(entryReal) : pathToFileURL(entryReal).toString();
     const rendered: Array<{
       evidence: HtmlPreviewViewportEvidence;
       screenshot: Buffer;

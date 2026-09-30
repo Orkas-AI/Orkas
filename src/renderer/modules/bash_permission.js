@@ -130,23 +130,6 @@ function _bashAgentLabel(info) {
   return name || id || t('bash.permission.agent_fallback');
 }
 
-function _bashPermissionConversationTitle(info) {
-  const direct = String(info && info.conversation_title || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 160);
-  if (direct) return direct;
-  const cid = String(info && info.cid || '').trim();
-  try {
-    const conv = cid && typeof conversations !== 'undefined' && Array.isArray(conversations)
-      ? conversations.find((item) => item && item.conversation_id === cid)
-      : null;
-    return String(conv && conv.title || '').replace(/\s+/g, ' ').trim().slice(0, 160);
-  } catch (_) {
-    return '';
-  }
-}
-
 async function _getBashPermissionCurrentMode() {
   try {
     const res = await window.orkas.invoke('permissions.getLocalExec');
@@ -172,6 +155,7 @@ async function _setBashPermissionMode(mode) {
 function _showBashPermissionModeDialog({
   title,
   message,
+  context,
   details,
   detailsLabel,
   currentMode,
@@ -224,6 +208,7 @@ function _showBashPermissionModeDialog({
     overlay.innerHTML = `
       <div class="modal modal-standard ui-dialog bash-permission-dialog" role="dialog" aria-modal="true" aria-label="${_bashEscapeHtml(title)}">
         ${titleHtml}
+        ${_uiDialogContextHtml(context)}
         <div class="modal-body ui-dialog-message bash-permission-message">${msgHtml}${detailsHtml}</div>
         <div class="bash-permission-footer">
           <div class="modal-actions bash-permission-actions">
@@ -241,6 +226,7 @@ function _showBashPermissionModeDialog({
       </div>
     `;
     document.body.appendChild(overlay);
+    const releaseContext = _uiBindDialogContext(overlay, context);
     const selectedMode = () => {
       return modeValidator(selectedModeValue) ? selectedModeValue : safeCurrentMode;
     };
@@ -336,6 +322,7 @@ function _showBashPermissionModeDialog({
       document.removeEventListener('click', onDocClick, true);
       if (requestId) _bashPermDialogClosers.delete(requestId);
       const mode = selectedMode();
+      releaseContext();
       overlay.remove();
       resolve({ choice, mode, cancelled });
     };
@@ -379,6 +366,25 @@ function _webAssistActionMessage(info) {
   ].join('\n');
 }
 
+function _bashKeyFactsText(info) {
+  const facts = Array.isArray(info.key_facts) ? info.key_facts.slice(0, 6) : [];
+  const lines = [];
+  for (const fact of facts) {
+    if (!fact || !['risk', 'read', 'write', 'remove'].includes(fact.kind)) continue;
+    const operation = String(fact.operation || '');
+    if (fact.kind === 'risk') {
+      lines.push(`${_bashReasonText([fact.reason])} · ${operation}`);
+    } else {
+      lines.push(`${t(`bash.permission.key_${fact.kind}`)} · ${operation}: ${String(fact.target || '')}${fact.unresolved ? ` (${t('bash.permission.key_unresolved')})` : ''}`);
+    }
+    if (fact.detail) lines.push(`${t('bash.permission.key_evidence')}: ${String(fact.detail)}`);
+  }
+  if (info.unresolved_paths === true) lines.push(t('bash.permission.key_unknown_note'));
+  if (info.working_directory) lines.push(`${t('bash.permission.working_directory')}: ${String(info.working_directory)}`);
+  if (Number(info.facts_omitted) > 0) lines.push(t('bash.permission.key_more', { count: Number(info.facts_omitted) }));
+  return lines.join('\n');
+}
+
 async function _showBashPermissionDialog(info) {
   const requestId = String(info.request_id || '');
   if (_bashPermCancelled.delete(requestId)) {
@@ -396,13 +402,14 @@ async function _showBashPermissionDialog(info) {
   const operation = String(info.operation || '').trim();
   const subject = String(info.subject || '').trim();
   const isAction = isConnector || isWebAssist || !!(operation || subject);
+  const keyFactsText = !isAction ? _bashKeyFactsText(info) : '';
   const baseMessage = isWebAssist ? _webAssistActionMessage(info) : isConnector ? _connectorActionMessage(info) : isAction
     ? t('bash.permission.action_message', {
       agent,
       operation: operation || t('bash.permission.action_fallback'),
       reasons: reasonsText,
     }) + (subject ? `\n\n${subject}` : '')
-    : t('bash.permission.message', { agent, reasons: reasonsText }) + '\n\n' + command;
+    : t('bash.permission.message', { agent, reasons: reasonsText }) + '\n\n' + (keyFactsText || command);
   const externalMutationText = _bashExternalMutationText(info.external_mutations);
 
   const currentMode = await _getBashPermissionCurrentMode();
@@ -416,6 +423,7 @@ async function _showBashPermissionDialog(info) {
     baseMessage,
     _bashIrreversibleText(info, currentMode),
     externalMutationText,
+    ...(!isConnector && !isWebAssist && info.can_allow_run === true ? [t('bash.permission.grant_scope')] : []),
   ].filter(Boolean).join('\n\n');
   const isSensitiveApproval = isConnector || isWebAssist || (Array.isArray(info.reasons)
     && info.reasons.some((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason)));
@@ -435,10 +443,12 @@ async function _showBashPermissionDialog(info) {
         title: t(isWebAssist ? 'web_assist.action_confirm.title'
           : isAction ? 'bash.permission.action_title' : 'bash.permission.title'),
         message,
+        context: info,
         ...(isConnector ? {
           details: _connectorActionDetails(info),
           detailsLabel: t('connectors.action_confirm.details'),
         } : {}),
+        ...(keyFactsText && command ? { details: command, detailsLabel: t('bash.permission.command_preview') } : {}),
         currentMode,
         requestId,
         allowRun: canAllowRun,
@@ -522,7 +532,6 @@ async function _showLocalAgentPermissionDialog(info) {
   const requestId = String(info && info.request_id || '');
   if (_bashPermCancelled.delete(requestId)) return;
   const agent = _bashAgentLabel(info);
-  const conversationTitle = _bashPermissionConversationTitle(info);
   const action = String(info && (info.tool || info.description) || '').trim()
     || t('agents.cli_permission_action_fallback');
   const details = [];
@@ -536,10 +545,7 @@ async function _showLocalAgentPermissionDialog(info) {
     .map((value) => String(value || '').replace(/\s+/g, ' ').trim())
     .filter((value, index, values) => value && values.indexOf(value) === index)
     .join(' · ');
-  const message = [
-    t('agents.cli_permission_task', { title: conversationTitle || t('chat.new_conv_title') }),
-    t('agents.cli_permission_requested', { permission }),
-  ].join('\n');
+  const message = t('agents.cli_permission_requested', { permission });
   const currentMode = _bashIsCliPermissionPolicy(info && info.permission_policy)
     ? info.permission_policy
     : 'inherit';
@@ -547,6 +553,7 @@ async function _showLocalAgentPermissionDialog(info) {
   const result = await _showBashPermissionModeDialog({
     title: t('agents.cli_permission_prompt_title'),
     message,
+    context: info,
     currentMode,
     requestId,
     allowRun: info && info.can_allow_run === true,
@@ -588,7 +595,7 @@ function _cancelBashPermissionRequests(payload, kind) {
     : [];
   const cancelled = new Set(ids);
   for (const id of ids) {
-    if (kind === 'connector' && payload.approved === true) _bashPermTaskApproved.add(id);
+    if ((kind === 'connector' || kind === undefined) && payload.approved === true) _bashPermTaskApproved.add(id);
     _bashPermCancelled.add(id);
     const close = _bashPermDialogClosers.get(id);
     if (close) close();

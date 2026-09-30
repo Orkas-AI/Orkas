@@ -451,6 +451,98 @@ describe('Web Assist renderer wiring', () => {
     expect(openAndSetTab).toHaveBeenCalledOnce();
   });
 
+  it('keeps full screen tied to the visible Browser tab and restores the button copy', () => {
+    const start = webAssistSource.indexOf('  function refreshExpandCopy() {');
+    const end = webAssistSource.indexOf('  function ensureDefaultTab() {', start);
+    const classes = new Set<string>();
+    const span = { textContent: '' };
+    const focus = vi.fn();
+    const attributes: Record<string, string> = {};
+    const expandBtn = {
+      innerHTML: '', title: '', focus,
+      querySelector: () => span,
+      setAttribute: (name: string, value: string) => { attributes[name] = value; },
+    };
+    const panel = { classList: { toggle: (name: string, on: boolean) => {
+      if (on) classes.add(name); else classes.delete(name);
+    } }, closest: () => app, parentElement: null as any };
+    const background = { inert: false };
+    const alreadyInert = { inert: true };
+    const app = { children: [panel, background, alreadyInert] };
+    panel.parentElement = app;
+    const scheduleLayout = vi.fn();
+    const syncVisibility = vi.fn();
+    const context = vm.createContext({
+      expanded: false, expandedInerted: new Set(), expandBtn,
+      panelOpen: true, panelTab: 'browser', activeView: 'conversation',
+      document: { getElementById: () => panel }, icon: (name: string) => name,
+      label: (_key: string, fallback: string) => fallback, scheduleLayout, syncVisibility,
+    });
+    vm.runInContext(webAssistSource.slice(start, end), context);
+
+    context.setExpanded(true);
+    expect(classes.has('is-web-assist-expanded')).toBe(true);
+    expect(background.inert).toBe(true);
+    expect(alreadyInert.inert).toBe(true);
+    expect([span.textContent, expandBtn.title, attributes['aria-pressed']])
+      .toEqual(['Exit full screen', 'Exit full screen', 'true']);
+    // The page is placed by rectangle, so the native view must follow.
+    expect(scheduleLayout).toHaveBeenCalledOnce();
+    expect(syncVisibility).toHaveBeenCalledOnce();
+    context.setExpanded(true);
+    expect(scheduleLayout).toHaveBeenCalledOnce();
+
+    // Closing task details, selecting another tab or leaving the task must
+    // never leave a full-screen drawer covering the app.
+    for (const leave of [
+      () => { context.panelOpen = false; },
+      () => { context.panelTab = 'files'; },
+      () => { context.activeView = 'connectors'; },
+    ]) {
+      context.expanded = true;
+      classes.add('is-web-assist-expanded');
+      leave();
+      context.setExpanded(true);
+      expect(classes.has('is-web-assist-expanded')).toBe(false);
+      expect(context.expanded).toBe(false);
+      expect(background.inert).toBe(false);
+      expect(alreadyInert.inert).toBe(true);
+      context.panelOpen = true;
+      context.panelTab = 'browser';
+      context.activeView = 'conversation';
+    }
+
+    expect(span.textContent).toBe('Full screen');
+    expect(attributes['aria-pressed']).toBe('false');
+    expect(focus).not.toHaveBeenCalled();
+    context.setExpanded(true);
+    context.setExpanded(false, true);
+    expect(background.inert).toBe(false);
+    expect(alreadyInert.inert).toBe(true);
+    expect(focus).toHaveBeenCalledOnce();
+  });
+
+  it('treats a rendered dialog as open even when the browser has no page rectangle', () => {
+    // modalIsOpen() answers "is the native page occluded" and is false while
+    // the browser has no page; a dialog above the app still owns Escape then.
+    const start = webAssistSource.indexOf('  function dialogIsOpen() {');
+    const end = webAssistSource.indexOf('  function modalIsOpen() {', start);
+    const overlays: Array<{ hidden: boolean; rects: number }> = [];
+    const context = vm.createContext({
+      document: { querySelectorAll: () => overlays.map((overlay) => ({
+        hidden: overlay.hidden, getClientRects: () => new Array(overlay.rects).fill({}),
+      })) },
+    });
+    vm.runInContext(webAssistSource.slice(start, end), context);
+
+    expect(context.dialogIsOpen()).toBe(false);
+    overlays.push({ hidden: true, rects: 1 });
+    overlays.push({ hidden: false, rects: 0 });
+    expect(context.dialogIsOpen()).toBe(false);
+    overlays.push({ hidden: false, rects: 1 });
+    expect(context.dialogIsOpen()).toBe(true);
+  });
+
   it('creates default tabs only in visible empty task browsers, deduplicates requests, and permits failure recovery', async () => {
     const start = webAssistSource.indexOf('  function ensureDefaultTab() {');
     const end = webAssistSource.indexOf('  async function addTab()', start);

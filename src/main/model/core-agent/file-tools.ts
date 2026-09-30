@@ -1147,11 +1147,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           isError: true,
         };
       }
-      const requests = input.paths.map((entry) => (
-        entry && typeof entry === 'object' && !Array.isArray(entry)
-          ? entry as Record<string, unknown>
-          : {}
-      ));
+      const requests: unknown[] = input.paths;
       const rawText = input.raw_text === true;
       if (rawText && input.metadata_only === true) {
         return {
@@ -1165,15 +1161,22 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
       // Validation failures use the same ordered per-item results as missing
       // or unreadable files. Invalid items never reach the scoped reader.
       const itemErrors: Array<ToolResult | undefined> = [];
-      const normalized = requests.map((request, index) => {
+      const normalized = requests.map((entry, index) => {
+        const request = entry && typeof entry === 'object' && !Array.isArray(entry)
+          ? entry as Record<string, unknown>
+          : undefined;
         const invalid = (message: string, diagnostic?: FileFailureDiagnostic) => {
           itemErrors[index] = {
             content: errText('E_BAD_INPUT', `read_files item ${index + 1}: ${message}`),
             isError: true,
             ...(diagnostic ? { observations: { fileFailure: { ...diagnostic, item_index: index } } } : {}),
           };
-          return { path: typeof request.path === 'string' ? request.path : '' };
+          return { path: typeof request?.path === 'string' ? request.path : '' };
         };
+        if (!request) {
+          const receivedType = entry === null ? 'null' : Array.isArray(entry) ? 'array' : typeof entry;
+          return invalid(`paths[${index}]: expected an object containing "path"; received ${receivedType}. Expected item shape: {"path":"<file-path>"}.`);
+        }
         if (typeof request.path !== 'string' || !request.path) {
           return invalid('`path` must be a non-empty string');
         }

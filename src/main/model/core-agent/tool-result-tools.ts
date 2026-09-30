@@ -335,7 +335,7 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
       },
     },
     required: ['ref'],
-    description: 'Use only fields for the selected action. materialize takes ref only.',
+    description: 'Use only fields for the selected action. materialize takes ref only. Ignored legacy read/query fields are listed by request in ignored_fields; other incompatible fields are errors.',
   };
   const actionProperty = {
     type: 'string',
@@ -373,15 +373,33 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
       }
       const shapeError = toolResultActionRequestError(action, requests);
       if (shapeError) return shapeError;
-      if (action === 'search') return search.execute({ queries: requests }, ctx);
-      if (action === 'query') return query.execute({ queries: requests }, ctx);
+      const ignored = Array.isArray(requests) ? requests.flatMap((item, index) => {
+        const fields = Object.keys(item).filter((key) => !TOOL_RESULT_ACTION_REQUEST_FIELDS[action].has(key)).sort();
+        return fields.length ? [{ request: index + 1, fields }] : [];
+      }) : [];
+      const notice = ignored.length ? `ignored_fields: ${JSON.stringify(ignored)}\n` : '';
+      const effectiveRequests = Array.isArray(requests)
+        ? requests.map((item) => Object.fromEntries(Object.entries(item).filter(([key]) => TOOL_RESULT_ACTION_REQUEST_FIELDS[action].has(key))))
+        : requests;
+      if (action === 'search') return search.execute({ queries: effectiveRequests, notice }, ctx);
+      if (action === 'query') return query.execute({ queries: effectiveRequests, notice }, ctx);
       if (action === 'read') {
-        const chunks = Array.isArray(requests)
-          ? requests.map((item) => ({ ...item, maxTokens: item.max_tokens }))
-          : requests;
-        return read.execute({ chunks }, ctx);
+        const chunks = Array.isArray(effectiveRequests)
+          ? effectiveRequests.map((item) => ({ ...item, maxTokens: item.max_tokens }))
+          : effectiveRequests;
+        return read.execute({ chunks, notice }, ctx);
       }
-      if (action === 'materialize') return materializeToolResults(opts, requests);
+      if (action === 'materialize') {
+        const result = await materializeToolResults(opts, effectiveRequests);
+        if (!notice) return result;
+        try {
+          const payload: unknown = JSON.parse(result.content);
+          if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+            return { ...result, content: JSON.stringify({ ...payload, ignored_fields: ignored }) };
+          }
+        } catch { /* Preserve non-JSON errors with a text receipt. */ }
+        return { ...result, content: `${result.content}\n${notice.trimEnd()}` };
+      }
       return error('E_BAD_INPUT', '`action` must be search, query, read, or materialize.');
     },
   };
@@ -489,7 +507,7 @@ function createQueryTool(opts: ToolResultToolsOpts): AgentTool {
       const queryExecutor = opts.queryExecutor ?? worker!.query.bind(worker);
       try {
         return await executeBatch(batch.items, ledger, (item, maxOutputTokens) =>
-          executeQueryItem(opts, item, ledger, maxOutputTokens, queryExecutor, ctx.signal));
+          executeQueryItem(opts, item, ledger, maxOutputTokens, queryExecutor, ctx.signal), String(input.notice ?? ''));
       } finally {
         try {
           await worker?.dispose();
@@ -536,7 +554,7 @@ function createSearchTool(opts: ToolResultToolsOpts): AgentTool {
       const batch = batchItems(input, 'queries', ['ref', 'query']);
       if (batch.error) return batch.error;
       return executeBatch(batch.items, ledger, (item, maxOutputTokens) =>
-        executeSearchItem(opts, item, ledger, maxOutputTokens));
+        executeSearchItem(opts, item, ledger, maxOutputTokens), String(input.notice ?? ''));
     },
   };
 }
@@ -577,7 +595,7 @@ function createReadChunkTool(opts: ToolResultToolsOpts): AgentTool {
       const batch = batchItems(input, 'chunks', ['ref', 'cursor']);
       if (batch.error) return batch.error;
       return executeBatch(batch.items, ledger, (item, maxOutputTokens) =>
-        executeReadChunkItem(opts, item, ledger, maxOutputTokens));
+        executeReadChunkItem(opts, item, ledger, maxOutputTokens), String(input.notice ?? ''));
     },
   };
 }
@@ -624,6 +642,7 @@ async function executeBatch(
     item: Record<string, unknown>,
     maxOutputTokens: number,
   ) => RetrievalItemResult | Promise<RetrievalItemResult>,
+  notice = '',
 ): Promise<RetrievalItemResult> {
   const outputs: string[] = [];
   let successes = 0;
@@ -632,7 +651,8 @@ async function executeBatch(
     TOOL_RESULT_ROUND_MAX_TOKENS,
     ledger?.remainingTokens ?? TOOL_RESULT_ROUND_MAX_TOKENS,
   );
-  remainingOutputTokens = Math.max(0, remainingOutputTokens - estimateToolResultTokens(`\n<retrieval-batch next_request="done"/>`));
+  const noticeTokens = estimateToolResultTokens(notice);
+  remainingOutputTokens = Math.max(0, remainingOutputTokens - estimateToolResultTokens(`\n<retrieval-batch next_request="done"/>`) - noticeTokens);
   for (let index = 0; index < items.length; index++) {
     const item = items[index];
     const separatorTokens = outputs.length ? estimateToolResultTokens('\n') : 0;
@@ -656,9 +676,13 @@ async function executeBatch(
     requested: items.length, attempted: outputs.length, succeeded: successes,
     failed: failures.length, skipped: items.length - outputs.length, failures,
   } };
-  if (!outputs.length) return { ...budgetError(), observations };
+  if (notice && ledger) ledger.remainingTokens = Math.max(0, ledger.remainingTokens - noticeTokens);
+  if (!outputs.length) {
+    const result = budgetError();
+    return { ...result, content: notice ? `${result.content}\n${notice.trimEnd()}` : result.content, observations };
+  }
   return {
-    content: outputs.join('\n') + `\n<retrieval-batch next_request="${outputs.length < items.length ? outputs.length : 'done'}"/>`,
+    content: outputs.join('\n') + '\n' + notice + `<retrieval-batch next_request="${outputs.length < items.length ? outputs.length : 'done'}"/>`,
     observations,
     ...(successes === 0 ? { isError: true as const } : {}),
   };

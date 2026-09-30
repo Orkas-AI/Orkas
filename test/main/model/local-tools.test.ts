@@ -507,6 +507,97 @@ describe('local-tools › bash access modes', () => {
 });
 
 describe('local-tools › bash filesystem mutation scope', () => {
+
+  it.each([
+    ["printf '%s\\n' 'use sudo apt install'", 'darwin'],
+    ['rsync -a src/ dst/', 'darwin'],
+    ['cp /etc/hosts ./hosts-copy', 'darwin'],
+    ['git log --grep push', 'darwin'],
+    ['git push --help', 'darwin'],
+    ['chmod u+w notes.txt', 'darwin'],
+    ['Start-Process -FilePath calc.exe -WhatIf', 'win32'],
+  ] as const)('admits an ordinary operation through the full host risk gate: %s', async (command, hostPlatform) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_approval'); await setTmpWorkspace();
+    const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(bashTool, 'execute').mockResolvedValue({ content: 'executed once' });
+    const requests: any[] = [];
+    bp._setBroadcastForTest((channel, info: any) => {
+      if (channel === 'bash:permission') { requests.push(info); bp.respond(info.request_id, 'deny'); }
+    });
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform }).find(t => t.name === 'bash')!;
+      const result = await bash.execute({ command }, makeCtx());
+      expect(result.isError, result.content).toBeFalsy();
+      expect(requests).toEqual([]); expect(execute).toHaveBeenCalledOnce();
+    } finally { execute.mockRestore(); bp._resetForTest(); bp._setBroadcastForTest(null); }
+  });
+
+  it.each(['-t ', '-t', '--target-directory='])('checks a POSIX copy destination selected by %s', async flag => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval'); await setTmpWorkspace();
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(bashTool, 'execute').mockResolvedValue({ content: 'accepted' });
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'darwin' }).find(t => t.name === 'bash')!;
+    try {
+      const result = await bash.execute({ command: `cp ${flag}'${path.dirname(tmpDir)}' source.txt` }, makeCtx());
+      expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(execute).not.toHaveBeenCalled();
+    } finally { execute.mockRestore(); }
+  });
+
+  it.each(['bash', 'process_session'] as const)('checks New-Item targets and resolves pure Join-Path before %s execution', async toolName => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval'); await setTmpWorkspace();
+    const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const { processSessionTool } = await import('../../../src/core-agent/src/tools/process-session');
+    const execute = vi.spyOn(toolName === 'bash' ? bashTool : processSessionTool, 'execute').mockResolvedValue({ content: 'accepted' });
+    const tool = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'win32' }).find(t => t.name === toolName)!;
+    const outside = path.join(path.dirname(tmpDir), 'orkas-outside-target.txt');
+    const asks: any[] = [];
+    bp._setBroadcastForTest((channel, info: any) => {
+      if (channel === 'bash:permission') { asks.push(info); bp.respond(info.request_id, 'deny'); }
+    });
+    try {
+      for (const command of [
+        "$base='project'; $out=Join-Path $base 'build'; New-Item -ItemType Directory -Force -Path $out",
+        "$base='project'; $out=Join-Path -ChildPath 'result.txt' -Path $BASE; Set-Content -LiteralPath $out -Value ok",
+        "$out=Join-Path 'root' 'computed.txt'; New-Item -Path $out -ItemType File",
+        "New-Item -Path '.' -Name 'note.txt' -ItemType File -Value ok",
+      ]) {
+        execute.mockClear();
+        const result = await tool.execute({ action: 'start', command }, makeCtx());
+        expect(result.isError, result.content).toBeFalsy(); expect(execute).toHaveBeenCalledOnce();
+      }
+      expect(asks).toEqual([]);
+      for (const command of [
+        `New-Item -ItemType File -Path '${outside}' -Value ok`,
+        `$base='${path.dirname(tmpDir)}'; $out=Join-Path $base 'orkas-outside-target.txt'; New-Item -Path $out -ItemType File`,
+      ]) {
+        execute.mockClear();
+        const result = await tool.execute({ action: 'start', command }, makeCtx());
+        expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE'); expect(execute).not.toHaveBeenCalled();
+      }
+      for (const command of [
+        "$out=Join-Path (Get-Location) 'result.txt'; New-Item -Path $out -ItemType File",
+        "$out=Join-Path $unknown 'result.txt'; Set-Content -LiteralPath $out -Value ok",
+        "$out=Join-Path 'root' 'result.txt' -Resolve; New-Item -Path $out -ItemType File",
+        "$out=Join-Path 'C:' 'result.txt'; New-Item -Path $out -ItemType File",
+        "$out=Join-Path 'C:folder' 'result.txt'; New-Item -Path $out -ItemType File",
+        "New-Item -Path 'HKCU:\\Software\\ReviewFixture'",
+      ]) {
+        execute.mockClear();
+        const result = await tool.execute({ action: 'start', command }, makeCtx());
+        expect(result.content).toContain('E_BASH_RISK_DENIED'); expect(execute).not.toHaveBeenCalled();
+        expect(asks.at(-1)).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+        expect(asks.at(-1).key_facts).toContainEqual(expect.objectContaining({ kind: 'write', unresolved: true }));
+      }
+      expect(asks[0].key_facts[0].detail).toContain('Get-Location');
+    } finally { execute.mockRestore(); bp._resetForTest(); bp._setBroadcastForTest(null); }
+  });
+
   it('allows explicit write targets inside the workspace', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('all_files_auto');
@@ -1200,8 +1291,6 @@ describe('local-tools › bash filesystem mutation scope', () => {
   });
 
   it.each([
-    '$script=Join-Path "root" "computed.txt"',
-    '$script =Join-Path "root" "computed.txt"',
     '$script=$unknown',
     '$script=Get-Location',
     '$script="safe.txt" + $unknown',

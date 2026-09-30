@@ -44,6 +44,6 @@ describe('rendered PPT text collision evidence', () => {
       expect(results.budget.status).toBe('partial');
       expect(results.budget.skipped.collection_budget).toBeGreaterThan(0);
       expect(JSON.stringify(results.budget).length).toBeLessThan(12000);
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }
   }, 40_000);
 });

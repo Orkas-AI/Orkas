@@ -292,19 +292,19 @@
     const input = _el('chat-input');
     if (!input) return;
     const merged = _mergeComposerInstruction({
-      current: input.value,
+      current: composerText(input),
       full: spec.full,
       short: spec.short,
       production: spec.production,
       otherProductions: _otherProductionNames(spec.production),
     });
-    input.value = merged.value;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
+    composerSetText(input, merged.value);
+    composerNotify(input);
     input.focus();
     // After focus, so the caret lands on the line this click owns rather than
     // wherever the composer last left it.
-    if (typeof input.setSelectionRange === 'function') {
-      input.setSelectionRange(merged.selectionStart, merged.selectionStart);
+    if (input) {
+      composerSetSelection(input, merged.selectionStart, merged.selectionStart);
     }
   }
 

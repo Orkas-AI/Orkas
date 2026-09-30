@@ -46,12 +46,25 @@ const WAITING_HEARTBEAT_MS = 25_000;
 const COMMAND_PREVIEW_MAX = 800;
 // ── Pending requests ─────────────────────────────────────────────────────────
 
+export interface BashPermissionFact {
+  kind: 'risk' | 'read' | 'write' | 'remove';
+  operation: string;
+  target?: string;
+  reason?: RiskCategory;
+  unresolved?: boolean;
+  detail?: string;
+}
+
 export interface BashPermissionInfo {
   request_id: string;
   agent_id: string;
   agent_name: string;
   /** Truncated for display; the user sees what is about to run. */
   command: string;
+  /** Host-derived key facts, independent of the bounded command preview. */
+  key_facts?: BashPermissionFact[];
+  facts_omitted?: number;
+  working_directory?: string;
   /** Optional non-shell operation name, e.g. read_file/list_files. */
   operation?: string;
   /** Optional subject for non-shell operations, typically a path. */
@@ -83,6 +96,35 @@ interface Pending {
 const _pending = new Map<string, Pending>();
 type RunGrant = { uid: string; cid: string; agentId: string; reasons: Set<RiskCategory> };
 const _runGrants = new Map<string, RunGrant>();
+
+/** Summary and preview have separate bounded purposes. Prioritize uncertainty
+ * and actual risk evidence, not the first lines of a possibly long script. */
+function boundedPermissionFacts(input: readonly BashPermissionFact[]): Pick<BashPermissionInfo, 'key_facts' | 'facts_omitted'> {
+  if (!input.length) return {};
+  const clip = (value: string, limit: number) => {
+    const text = value.replace(/[\x00-\x1f\x7f]/g, ' ');
+    return text.length <= limit ? text : `${text.slice(0, Math.floor(limit / 2))}…${text.slice(-Math.floor(limit / 2) + 1)}`;
+  };
+  const unique = [...new Map(input.map(fact => [JSON.stringify(fact), fact])).values()];
+  const rank = (fact: BashPermissionFact) => fact.unresolved ? 0 : fact.kind === 'risk' ? 1 : fact.kind === 'read' ? 3 : 2;
+  unique.sort((a, b) => rank(a) - rank(b));
+  const facts: BashPermissionFact[] = [];
+  let budget = 800;
+  for (const fact of unique) {
+    if (facts.length >= 6) break;
+    const bounded = {
+      ...fact,
+      operation: clip(fact.operation, 48),
+      ...(fact.target ? { target: clip(fact.target, 180) } : {}),
+      ...(fact.detail ? { detail: clip(fact.detail, 160) } : {}),
+    };
+    const cost = bounded.operation.length + (bounded.target?.length ?? 0) + (bounded.detail?.length ?? 0);
+    if (cost > budget) break;
+    budget -= cost;
+    facts.push(bounded);
+  }
+  return { key_facts: facts, ...(unique.length > facts.length ? { facts_omitted: unique.length - facts.length } : {}) };
+}
 
 function runGrantKey(uid: string, cid: string, agentId: string): string {
   return JSON.stringify([uid, cid, agentId]);
@@ -157,6 +199,8 @@ export async function requestBashDecision(opts: {
   irreversible?: IrreversibleAction[];
   unresolvedPaths?: boolean;
   externalMutations?: ExternalMutationFinding[];
+  keyFacts?: BashPermissionFact[];
+  workingDirectory?: string;
   onWaiting?: (elapsedMs: number) => void;
 }): Promise<BashDecision> {
   const reasons = [...new Set(opts.reasons)];
@@ -180,6 +224,8 @@ export async function requestBashDecision(opts: {
     agent_id: opts.agentId,
     agent_name: opts.agentName || opts.agentId,
     command,
+    ...boundedPermissionFacts(opts.keyFacts ?? []),
+    ...(opts.workingDirectory ? { working_directory: opts.workingDirectory.length <= 240 ? opts.workingDirectory : `${opts.workingDirectory.slice(0, 120)}…${opts.workingDirectory.slice(-119)}` } : {}),
     ...(opts.operation ? { operation: opts.operation } : {}),
     ...(opts.subject ? { subject: opts.subject } : {}),
     reasons,
@@ -253,6 +299,17 @@ export function respond(requestId: string, decision: BashDecision): boolean {
       };
       for (const reason of pending.reasons) grant.reasons.add(reason);
       _runGrants.set(key, grant);
+      const covered: string[] = [];
+      for (const [id, queued] of _pending) {
+        if (!queued.canAllowRun || queued.uid !== pending.uid || queued.cid !== pending.cid
+          || queued.agentId !== pending.agentId
+          || !isCoveredByRunGrant(queued.uid, queued.cid, queued.agentId, queued.reasons)) continue;
+        _pending.delete(id);
+        if (queued.heartbeat) clearInterval(queued.heartbeat);
+        covered.push(id);
+        queued.resolve('allow_run');
+      }
+      if (covered.length) _broadcast('bash:permission_cancelled', { request_ids: covered, cid: pending.cid, approved: true });
     }
   }
   pending.resolve(effectiveDecision);

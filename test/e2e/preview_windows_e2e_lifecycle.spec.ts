@@ -120,9 +120,7 @@ test('image window keeps its original gallery after task switching and loads old
   const win = await orkas.electronApp!.browserWindow(preview);
   await win.evaluate(w => w.setBounds({ x: 120, y: 100, width: 740, height: 540 }));
   expect(await win.evaluate(w => w.getBounds())).toMatchObject({ x: 120, y: 100, width: 740, height: 540 });
-  await preview.locator('.chat-lightbox-share').click();
-  await expect(preview.locator('.chat-share-overlay')).toBeVisible();
-  await expect(page.locator('.chat-share-overlay')).toHaveCount(0);
+  await expect(preview.locator('.chat-lightbox-share')).toHaveCount(0);
   await win.evaluate(w => w.close());
   await expect.poll(() => preview.isClosed()).toBe(true);
   expect(page.isClosed()).toBe(false);

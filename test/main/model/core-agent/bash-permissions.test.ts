@@ -176,7 +176,7 @@ describe('bash-permissions', () => {
 
   });
 
-  it('does not settle an already queued same-category request when a task grant is created', async () => {
+  it('settles queued requests covered by the same actor and task grant', async () => {
     const first = ask({
       command: 'rm first.txt',
       reasons: ['destructive'],
@@ -192,10 +192,47 @@ describe('bash-permissions', () => {
     bp.respond(requests[0].payload.request_id, 'allow_run');
     expect(await first).toBe('allow_run');
     await Promise.resolve();
-    expect(secondSettled).toBe(false);
+    expect(secondSettled).toBe(true);
+    expect(await second).toBe('allow_run');
+    expect(pushed).toContainEqual({ channel: 'bash:permission_cancelled', payload: {
+      request_ids: [requests[1].payload.request_id], cid: 'c1', approved: true,
+    } });
+    expect(bp.respond(requests[1].payload.request_id, 'deny')).toBe(false);
+  });
 
+  it.each([
+    { uid: 'other' }, { cid: 'other' }, { agentId: 'other' },
+    { reasons: ['sensitive_path'] }, { reasons: ['external_mutation'] }, { unresolvedPaths: true },
+  ] as Array<Parameters<typeof ask>[0]>)('does not settle a queued request outside the exact grant: %j', async other => {
+    const first = ask({ reasons: ['network_egress'] });
+    const second = ask({ reasons: ['network_egress'], ...other });
+    const requests = permissionPushes();
+    let settled = false;
+    second.then(() => { settled = true; });
+    bp.respond(requests[0].payload.request_id, 'allow_run');
+    await first; await Promise.resolve();
+    expect(settled).toBe(false);
     bp.respond(requests[1].payload.request_id, 'deny');
     expect(await second).toBe('deny');
+  });
+
+  it('prioritizes actual risk and unknown targets over a long harmless prefix within bounded evidence', async () => {
+    const pending = ask({
+      command: 'echo harmless; '.repeat(100) + 'rm -rf "$target"', unresolvedPaths: true,
+      keyFacts: [
+        ...Array.from({ length: 12 }, (_, i) => ({ kind: 'read' as const, operation: 'cat', target: `input-${i}.txt` })),
+        { kind: 'remove', operation: 'rm', target: '$target', unresolved: true },
+        { kind: 'risk', operation: 'rm', reason: 'destructive', detail: 'rm -rf "$target"' },
+      ],
+    });
+    const info = permissionPushes()[0].payload;
+    expect(info.command.length).toBeLessThanOrEqual(801);
+    expect(info.command).not.toContain('rm -rf');
+    expect(info.key_facts[0]).toMatchObject({ target: '$target', unresolved: true });
+    expect(info.key_facts[1]).toMatchObject({ reason: 'destructive', detail: 'rm -rf "$target"' });
+    expect(info.key_facts).toHaveLength(6);
+    expect(info.facts_omitted).toBe(8);
+    bp.respond(info.request_id, 'deny'); await pending;
   });
 
   it('ignores stale response ids without settling the live request', async () => {

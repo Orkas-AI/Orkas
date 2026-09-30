@@ -6,13 +6,53 @@
  * receives only short snapshot-scoped references.
  */
 
+const HIGH_IMPACT_CONTROL_SCRIPT = String.raw`
+  const highImpactControl = (element) => {
+    const tag = element.tagName.toLowerCase();
+    const role = String(element.getAttribute('role') || '').toLowerCase();
+    if (!['a', 'button', 'input'].includes(tag) && !['button', 'link', 'menuitem'].includes(role)) return false;
+    const label = labelFor(element).toLowerCase();
+    const terms = [
+      'delete', 'remove', 'buy', 'purchase', 'pay', 'checkout', 'place order',
+      'post', 'publish', 'authorize', 'approve',
+      'grant access', 'allow access', 'transfer', 'trade', 'book',
+      'reserve', 'subscribe', 'unsubscribe', 'cancel subscription', 'captcha',
+      '删除', '移除', '购买', '支付', '下单', '结账', '发布',
+      '授权', '同意', '转账', '交易', '预订', '预约', '验证码',
+      '削除', '購入', '支払', '注文', '公開', '投稿', '承認',
+      '振込', '予約', 'excluir', 'remover', 'comprar', 'pagar',
+      'finalizar pedido', 'publicar', 'autorizar',
+      'aprovar', 'transferir', 'reservar',
+    ];
+    const href = String(element.getAttribute('href') || '');
+    const navigation = tag === 'a' && role !== 'button' && /^(?:https?:|[/.#])/i.test(href)
+      && !element.getAttribute('onclick')
+      && !['post', 'put', 'patch', 'delete'].includes(String(element.getAttribute('data-method') || '').toLowerCase());
+    return terms.some((term) => {
+      // Latin word fragments such as Facebook, Bookmarks and payroll are not
+      // action verbs. Keep CJK matching, where spaces do not delimit words.
+      if (!/^[a-z ]+$/.test(term)) return label.includes(term);
+      if (term === 'post' && navigation && /^posts?\s+(?:history|archive|list|feed)\b/.test(label)) return false;
+      let offset = label.indexOf(term);
+      while (offset >= 0) {
+        const before = label.slice(offset - 1, offset);
+        const after = label.slice(offset + term.length, offset + term.length + 1);
+        if ((!before || !/[\p{L}\p{N}_]/u.test(before)) && (!after || !/[\p{L}\p{N}_]/u.test(after))) return true;
+        offset = label.indexOf(term, offset + 1);
+      }
+      return false;
+    });
+  };
+`;
+
 export type WebAssistPageAction =
   | 'click'
   | 'fill'
   | 'select'
   | 'check'
   | 'uncheck'
-  | 'scroll';
+  | 'scroll'
+  | 'drag';
 
 export interface WebAssistElementSignature {
   tag: string;
@@ -147,25 +187,7 @@ export function webAssistObserveScript(
     return (tag === 'button' && type === 'submit')
       || (tag === 'input' && (type === 'submit' || type === 'image'));
   };
-  const highImpactControl = (element) => {
-    const tag = element.tagName.toLowerCase();
-    const role = String(element.getAttribute('role') || '').toLowerCase();
-    if (!['a', 'button', 'input'].includes(tag) && !['button', 'link', 'menuitem'].includes(role)) return false;
-    const label = labelFor(element).toLowerCase();
-    const terms = [
-      'delete', 'remove', 'buy', 'purchase', 'pay', 'checkout', 'place order',
-      'post', 'publish', 'authorize', 'approve',
-      'grant access', 'allow access', 'transfer', 'trade', 'book',
-      'reserve', 'subscribe', 'unsubscribe', 'cancel subscription', 'captcha',
-      '删除', '移除', '购买', '支付', '下单', '结账', '发布',
-      '授权', '同意', '转账', '交易', '预订', '预约', '验证码',
-      '削除', '購入', '支払', '注文', '公開', '投稿', '承認',
-      '振込', '予約', 'excluir', 'remover', 'comprar', 'pagar',
-      'finalizar pedido', 'publicar', 'autorizar',
-      'aprovar', 'transferir', 'reservar',
-    ];
-    return terms.some((term) => label.includes(term));
-  };
+${HIGH_IMPACT_CONTROL_SCRIPT}
   const sensitiveFormSubmission = (element) => {
     if (!submitControl(element) || !element.form || !element.form.elements) return false;
     return Array.from(element.form.elements).some((control) => (
@@ -176,7 +198,7 @@ export function webAssistObserveScript(
     'a[href]', 'button', 'input', 'select', 'textarea', '[contenteditable="true"]',
     '[role="button"]', '[role="link"]', '[role="checkbox"]', '[role="radio"]',
     '[role="tab"]', '[role="menuitem"]', '[role="combobox"]',
-    '[role="treeitem"]', '[role="option"]', '[role="switch"]', '[role="menuitemcheckbox"]',
+    '[role="slider"]', '[draggable="true"]', '[role="treeitem"]', '[role="option"]', '[role="switch"]', '[role="menuitemcheckbox"]',
   ].join(',');
   const candidates = [];
   const seen = new Set();
@@ -357,6 +379,8 @@ export function buildWebAssistActionScript(input: {
 }, scope: WebAssistPageScope = 'browser', options: {
   /** The user approved this exact control for this page in a host dialog. */
   grantedProtectedAction?: boolean;
+  /** Prepare a checked pointer target for the host's native input path. */
+  preparePointer?: boolean;
 } = {}): string {
   const payload = scriptJson(input);
   return String.raw`
@@ -364,6 +388,7 @@ export function buildWebAssistActionScript(input: {
   const request = ${payload};
   const protectHighImpactActions = ${scope !== 'connector_setup'};
   const grantedProtectedAction = ${options.grantedProtectedAction === true};
+  const preparePointer = ${options.preparePointer === true};
   const normalize = (value, cap = 240) => String(value == null ? '' : value)
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .replace(/\s+/g, ' ')
@@ -411,25 +436,7 @@ export function buildWebAssistActionScript(input: {
     return (tag === 'button' && type === 'submit')
       || (tag === 'input' && (type === 'submit' || type === 'image'));
   };
-  const highImpactControl = (element) => {
-    const tag = element.tagName.toLowerCase();
-    const role = String(element.getAttribute('role') || '').toLowerCase();
-    if (!['a', 'button', 'input'].includes(tag) && !['button', 'link', 'menuitem'].includes(role)) return false;
-    const label = labelFor(element).toLowerCase();
-    const terms = [
-      'delete', 'remove', 'buy', 'purchase', 'pay', 'checkout', 'place order',
-      'post', 'publish', 'authorize', 'approve',
-      'grant access', 'allow access', 'transfer', 'trade', 'book',
-      'reserve', 'subscribe', 'unsubscribe', 'cancel subscription', 'captcha',
-      '删除', '移除', '购买', '支付', '下单', '结账', '发布',
-      '授权', '同意', '转账', '交易', '预订', '预约', '验证码',
-      '削除', '購入', '支払', '注文', '公開', '投稿', '承認',
-      '振込', '予約', 'excluir', 'remover', 'comprar', 'pagar',
-      'finalizar pedido', 'publicar', 'autorizar',
-      'aprovar', 'transferir', 'reservar',
-    ];
-    return terms.some((term) => label.includes(term));
-  };
+${HIGH_IMPACT_CONTROL_SCRIPT}
   const sensitiveFormSubmission = (element) => {
     if (!submitControl(element) || !element.form || !element.form.elements) return false;
     return Array.from(element.form.elements).some((control) => (
@@ -438,9 +445,9 @@ export function buildWebAssistActionScript(input: {
   };
   if (request.action === 'scroll') {
     const distance = Math.max(240, Math.floor(window.innerHeight * 0.72));
-    if (request.direction === 'top') window.scrollTo({ top: 0, behavior: 'smooth' });
-    else if (request.direction === 'bottom') window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
-    else window.scrollBy({ top: request.direction === 'up' ? -distance : distance, behavior: 'smooth' });
+    if (request.direction === 'top') window.scrollTo({ top: 0, behavior: 'instant' });
+    else if (request.direction === 'bottom') window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' });
+    else window.scrollBy({ top: request.direction === 'up' ? -distance : distance, behavior: 'instant' });
     return { ok: true, outcome: 'acted', action: request.action };
   }
   const element = resolvePath(request.ref.path);
@@ -459,9 +466,27 @@ export function buildWebAssistActionScript(input: {
   if (element.disabled || element.getAttribute('aria-disabled') === 'true') {
     return { ok: false, code: 'element_disabled', error: 'This element is disabled.' };
   }
-  element.scrollIntoView({ block: 'center', inline: 'nearest' });
-  if (request.action === 'click') {
+  element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+  const pointerTarget = () => {
+    const rect = element.getBoundingClientRect();
+    const left = Math.max(0, rect.left), top = Math.max(0, rect.top);
+    const right = Math.min(window.innerWidth, rect.right), bottom = Math.min(window.innerHeight, rect.bottom);
+    if (right <= left || bottom <= top) return { ok: false, code: 'element_not_visible', error: 'The control is not visible in the page.' };
+    const x = (left + right) / 2, y = (top + bottom) / 2;
+    let hit = document.elementFromPoint(x, y);
+    while (hit && hit.shadowRoot) {
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    if (!hit || (hit !== element && !element.contains(hit))) return { ok: false, code: 'element_obscured', error: 'Another element covers this control.' };
+    return { ok: true, pointer: { x, y, width: window.innerWidth, height: window.innerHeight } };
+  };
+  if (request.action === 'click' || request.action === 'drag') {
     const isFile = current.tag === 'input' && current.type === 'file';
+    if (request.action === 'drag' && sensitiveControl(element)) {
+      return { ok: false, code: 'user_action_required', reason: 'sensitive_input', error: 'The user must complete this action directly in Web Assist.' };
+    }
     // Ordinary submissions run on their own; what is left for the user is a
     // high-impact control, and a host approval releases exactly that. It never
     // releases a submission carrying a password, OTP or card number.
@@ -478,6 +503,8 @@ export function buildWebAssistActionScript(input: {
         error: 'The user must complete this action directly in Web Assist.',
       };
     }
+    if (preparePointer) return pointerTarget();
+    if (request.action === 'drag') return { ok: false, code: 'invalid_action', error: 'Drag requires native page input.' };
     element.focus();
     element.click();
     return { ok: true, outcome: 'acted', action: request.action };
@@ -508,7 +535,12 @@ export function buildWebAssistActionScript(input: {
     }
     const textEntry = current.tag === 'textarea' || element.isContentEditable
       || (current.tag === 'input' && ['text', 'search', 'tel', 'url', 'email', 'number'].includes(current.type));
-    if (textEntry) {
+    if (current.tag === 'textarea' && text.length > 2000) {
+      // Large multiline insertText commands repeatedly relayout textareas.
+      // Use the native value setter and the input event consumed by controlled fields.
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(element, text);
+      element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: text }));
+    } else if (textEntry) {
       if (element.isContentEditable) {
         const range = document.createRange();
         range.selectNodeContents(element);
@@ -519,7 +551,14 @@ export function buildWebAssistActionScript(input: {
       // Chromium's editing command emits the native InputEvent understood by
       // controlled inputs and editors. It stays in this reviewed, synchronous
       // script so a focus change cannot redirect a later host insertText call.
-      const edited = document.execCommand(text ? 'insertText' : 'delete', false, text);
+      // A single multiline insertText repeatedly lays out each new paragraph.
+      // Escaped plain text via insertHTML keeps Chromium's native editing events
+      // and undo transaction while parsing all long-editor line breaks together.
+      const longEditor = element.isContentEditable && text.length > 2000;
+      const insertion = longEditor
+        ? text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>')
+        : text;
+      const edited = document.execCommand(text ? (longEditor ? 'insertHTML' : 'insertText') : 'delete', false, insertion);
       if (!edited) return { ok: false, code: 'fill_rejected', error: 'The page did not accept the edit; observe it again.' };
     } else if (current.tag === 'textarea' || current.tag === 'input') {
       const proto = current.tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -567,6 +606,7 @@ export function buildWebAssistActionScript(input: {
           error: 'The user must complete this action directly in Web Assist.',
         };
       }
+      if (preparePointer) return pointerTarget();
       element.click();
     }
     return { ok: true, outcome: 'acted', action: request.action };

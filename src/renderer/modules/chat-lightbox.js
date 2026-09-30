@@ -411,6 +411,8 @@ function _ensureLightbox() {
 
   // × closes; backdrop clicks are ignored to avoid accidental dismissals.
   root.querySelector('.chat-lightbox-close').addEventListener('click', closeChatImageLightbox);
+  root.querySelector('.chat-lightbox-previous').addEventListener('click', () => { void _navigateLightbox(-1); });
+  root.querySelector('.chat-lightbox-next').addEventListener('click', () => { void _navigateLightbox(1); });
   _lightboxAddLibraryBtn.addEventListener('click', _onLightboxAddLibrary);
   _lightboxRevealBtn.addEventListener('click', _onLightboxReveal);
 

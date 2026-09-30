@@ -35,8 +35,10 @@ export interface BrowserToolCallbacks {
     tabId?: string;
     pageId: string;
     elementRef?: string;
-    action: 'click' | 'fill' | 'select' | 'check' | 'uncheck' | 'scroll';
+    action: 'click' | 'fill' | 'select' | 'check' | 'uncheck' | 'scroll' | 'drag';
     text?: string;
+    dragDeltaX?: number;
+    dragDeltaY?: number;
     direction?: 'up' | 'down' | 'top' | 'bottom';
   }, signal?: AbortSignal) => Promise<Record<string, unknown>>;
   wait: (input: {
@@ -66,7 +68,7 @@ function optionalString(value: unknown): string | undefined {
 
 const OPERATIONS = new Set(['tabs', 'open', 'navigate', 'observe', 'act', 'wait', 'close', 'retain']);
 const NAVIGATION_ACTIONS = new Set(['goto', 'back', 'forward', 'reload']);
-const PAGE_ACTIONS = new Set(['click', 'fill', 'select', 'check', 'uncheck', 'scroll']);
+const PAGE_ACTIONS = new Set(['click', 'fill', 'select', 'check', 'uncheck', 'scroll', 'drag']);
 const DIRECTIONS = new Set(['up', 'down', 'top', 'bottom']);
 const OBSERVE_SCOPES = new Set(['full', 'meta']);
 
@@ -132,16 +134,19 @@ export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
           if ((pageAction === 'fill' || pageAction === 'select') && typeof input.text !== 'string') {
             return error(`\`text\` is required for ${pageAction}`);
           }
-          if (typeof input.text === 'string' && input.text.length > 2000) {
-            return error('`text` must be at most 2000 characters');
+          if (typeof input.text === 'string' && input.text.length > contract.MAX_PAGE_ACTION_TEXT_LENGTH) {
+            return error(`\`text\` must be at most ${contract.MAX_PAGE_ACTION_TEXT_LENGTH} characters`);
           }
+          if (pageAction === 'drag' && (typeof input.drag_delta_x !== 'number' || typeof input.drag_delta_y !== 'number'
+              || (input.drag_delta_x === 0 && input.drag_delta_y === 0))) return error('drag requires nonzero movement and both drag_delta_x and drag_delta_y');
           const direction = optionalString(input.direction);
           if (direction && !DIRECTIONS.has(direction)) return error('unsupported scroll direction');
           return output(await callbacks.act({
             ...(tabId ? { tabId } : {}),
             pageId,
             ...(elementRef ? { elementRef } : {}),
-            action: pageAction as 'click' | 'fill' | 'select' | 'check' | 'uncheck' | 'scroll',
+            ...(pageAction === 'drag' ? { dragDeltaX: Number(input.drag_delta_x), dragDeltaY: Number(input.drag_delta_y) } : {}),
+            action: pageAction as 'click' | 'fill' | 'select' | 'check' | 'uncheck' | 'scroll' | 'drag',
             ...(typeof input.text === 'string' ? { text: input.text } : {}),
             ...(direction ? { direction: direction as 'up' | 'down' | 'top' | 'bottom' } : {}),
           }, context?.signal));

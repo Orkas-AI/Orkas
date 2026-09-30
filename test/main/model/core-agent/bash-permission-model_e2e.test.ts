@@ -117,6 +117,33 @@ function assertOutput(name = 'report.txt') {
 }
 
 describe('bash permission journey — deterministic native execution', () => {
+  it.each(['workspace_approval', 'all_files_auto'] as const)(
+    'cleans a task-created build tree without a dialog and preserves a later user file in %s', async mode => {
+      const permissions = await import('../../../../src/main/features/permissions');
+      permissions.setLocalExecMode(mode);
+      pendingDecision = 'deny';
+      const create = process.platform === 'win32'
+        ? "New-Item -ItemType Directory -Path task-build; Set-Content -LiteralPath task-build/output.txt -Value generated"
+        : "mkdir task-build; printf generated > task-build/output.txt";
+      const remove = process.platform === 'win32'
+        ? 'Remove-Item -LiteralPath task-build -Recurse -Force' : 'rm -rf task-build';
+      expect((await bash.execute({ command: create }, context())).isError).toBeFalsy();
+      const foreign = path.join(workspace, 'task-build', 'user.txt');
+      fs.writeFileSync(foreign, 'keep user work');
+      const denied = await bash.execute({ command: remove }, context());
+      expect(denied.isError).toBe(true);
+      expect(requests).toHaveLength(1);
+      expect(fs.readFileSync(foreign, 'utf8')).toBe('keep user work');
+      // The user removes their file; the remaining tree is the observed output.
+      fs.unlinkSync(foreign);
+      const cleaned = await bash.execute({ command: remove }, context());
+      expect(cleaned.isError, cleaned.content).toBeFalsy();
+      expect(cleaned.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+      expect(requests).toHaveLength(1);
+      expect(fs.existsSync(path.join(workspace, 'task-build'))).toBe(false);
+      expect(fs.readFileSync(path.join(workspace, 'input-a.txt'), 'utf8')).toBe('alpha\n');
+    },
+  );
   it.runIf(process.platform !== 'win32').each(['workspace_approval', 'all_files_approval'] as const)(
     'runs verification and empty-directory cleanup together in %s', async (mode) => {
       const permissions = await import('../../../../src/main/features/permissions');
@@ -569,6 +596,159 @@ describe('bash permission journey — deterministic native execution', () => {
       expect(fs.readFileSync(path.join(workspace, 'executed.txt'), 'utf8')).toBe('once');
     },
   );
+
+  it.runIf(process.platform !== 'win32')('writes a quoted cat heredoc as source data without treating its SQLite calls as execution', async () => {
+    const source = 'import sqlite3\nsqlite3.connect("/tmp/outside.db").execute("CREATE TABLE dogs (id integer)")';
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command: `cat > generated_test.py <<'PY'\n${source}\nPY` }, context());
+    expect(result.isError, result.content).toBeFalsy();
+    expect(requests).toHaveLength(0);
+    expect(fs.readFileSync(path.join(workspace, 'generated_test.py'), 'utf8')).toBe(`${source}\n`);
+
+    const execution = await bash.execute({ command: 'python generated_test.py' }, context());
+    expect(execution.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('external_mutation');
+  });
+
+  it.runIf(process.platform !== 'win32').each(['print', 'second-write', 'same-line', 'test-module'])(
+    'keeps quoted source data inert before a subsequent %s command', async (next) => {
+      const source = 'def remove(connection):\n    connection.execute("DELETE FROM records")';
+      const first = `cat > source.py <<'PY'\n${source}\nPY`;
+      const test = 'import unittest\nclass Smoke(unittest.TestCase):\n    def test_value(self):\n        self.assertEqual(2 + 2, 4)';
+      const suffix = next === 'print' ? 'printf done'
+        : next === 'second-write' ? `cat > second.txt <<'TXT'\n${source}\nTXT`
+          : `cat > test_source.py <<'TEST'\n${test}\nTEST\npython -m unittest discover -v`;
+      pendingDecision = 'deny';
+      const command = next === 'same-line'
+        ? `cat > source.py <<'PY'; printf done\n${source}\nPY`
+        : `${first}\n${suffix}`;
+      const result = await bash.execute({ command }, context());
+      expect(result.isError, result.content).toBeFalsy();
+      expect(requests).toHaveLength(0);
+      expect(fs.readFileSync(path.join(workspace, 'source.py'), 'utf8')).toBe(`${source}\n`);
+      if (next === 'second-write') expect(fs.readFileSync(path.join(workspace, 'second.txt'), 'utf8')).toBe(`${source}\n`);
+      if (next === 'test-module') expect(result.content).toContain('Ran 1 test');
+      else expect(result.observations?.execution?.stderr.bytes).toBe(0);
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')('keeps shell-looking entrypoints in quoted file contents inert', async () => {
+    const source = 'connection.execute("DELETE FROM records")';
+    fs.writeFileSync(path.join(workspace, 'remote.py'), source);
+    pendingDecision = 'deny';
+    const result = await bash.execute({
+      command: `cat <<'TEXT' > "notes with spaces.txt"\npython remote.py\nTEXT\nprintf done`,
+    }, context());
+    expect(result.isError, result.content).toBeFalsy();
+    expect(requests).toHaveLength(0);
+    expect(fs.readFileSync(path.join(workspace, 'notes with spaces.txt'), 'utf8')).toBe('python remote.py\n');
+  });
+
+  it.runIf(process.platform !== 'win32')('checks newly written script bytes before executing a combined command', async () => {
+    // A harmless old version must not hide the mutation in the pending write.
+    fs.writeFileSync(path.join(workspace, 'generated_test.py'), 'print("old")');
+    const source = 'connection.execute("DELETE FROM records")';
+    pendingDecision = 'deny';
+    const result = await bash.execute({
+      command: `cat > generated_test.py <<'PY'\n${source}\nPY\npython generated_test.py`,
+    }, context());
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('external_mutation');
+    expect(fs.readFileSync(path.join(workspace, 'generated_test.py'), 'utf8')).toBe('print("old")');
+  });
+
+  it.runIf(process.platform !== 'win32').each([
+    'python - < generated.txt',
+    'python generated.txt',
+    'cat generated.txt | python',
+    'python "$PENDING_SCRIPT"',
+    'python generated-alias.txt',
+    'source generated.txt',
+  ])('checks a pending source file consumed by %s', async (execution) => {
+    sandboxEnv.PENDING_SCRIPT = 'generated.txt';
+    if (execution.includes('generated-alias.txt')) {
+      fs.writeFileSync(path.join(workspace, 'generated.txt'), 'print("old")');
+      fs.symlinkSync('generated.txt', path.join(workspace, 'generated-alias.txt'));
+    }
+    pendingDecision = 'deny';
+    const result = await bash.execute({
+      command: `cat > generated.txt <<'PY'\nconnection.execute("DELETE FROM records")\nPY\n${execution}`,
+    }, context());
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('external_mutation');
+    if (execution.includes('generated-alias.txt')) {
+      expect(fs.readFileSync(path.join(workspace, 'generated.txt'), 'utf8')).toBe('print("old")');
+    } else expect(fs.existsSync(path.join(workspace, 'generated.txt'))).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32')('does not grant local SQLite proof through a pending shadow module', async () => {
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command: [
+      "cat > sqlite3.py <<'MODULE'", 'raise RuntimeError("shadow")', 'MODULE',
+      "cat > generated.py <<'SCRIPT'", 'import sqlite3', 'c = sqlite3.connect(":memory:")',
+      'c.execute("CREATE TABLE records (id integer)")', 'SCRIPT', 'python generated.py',
+    ].join('\n') }, context());
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('external_mutation');
+    expect(fs.existsSync(path.join(workspace, 'generated.py'))).toBe(false);
+    expect(fs.existsSync(path.join(workspace, 'sqlite3.py'))).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32')('retains approval for a real external action after an inert file write', async () => {
+    pendingDecision = 'deny';
+    const result = await bash.execute({
+      command: `cat > notes.txt <<'TEXT'\nplain text\nTEXT\ngit push origin main`,
+    }, context());
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('external_mutation');
+    expect(fs.existsSync(path.join(workspace, 'notes.txt'))).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32').each([
+    { name: 'interpreter receiver', command: (source: string) => `python - <<'PY'\n${source}\nPY` },
+    { name: 'interpreter pipeline', command: (source: string) => `cat <<'PY' | python\n${source}\nPY` },
+    { name: 'subsequent execution', command: (source: string) => `cat > generated_test.py <<'PY'\n${source}\nPY\npython generated_test.py` },
+    { name: 'unquoted delimiter', command: (source: string) => `cat > generated_test.py <<PY\n${source}\nPY` },
+  ])('still asks permission for heredoc source with $name', async ({ command }) => {
+    const source = 'import sqlite3\nsqlite3.connect("/tmp/outside.db").execute("CREATE TABLE dogs (id integer)")';
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command: command(source) }, context());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('external_mutation');
+    expect(fs.existsSync(path.join(workspace, 'generated_test.py'))).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32')('keeps dynamic and outside cat heredoc targets under the path gate', async () => {
+    expectedMainWarnings.push('bash filesystem mutation scope reject');
+    pendingDecision = 'deny';
+    const dynamic = await bash.execute({ command: "cat > \"$TARGET\" <<'PY'\nprint('data')\nPY" }, context());
+    expect(dynamic.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+
+    const outside = path.join(root, 'outside.py');
+    const scoped = await bash.execute({ command: `cat > ${outside} <<'PY'\nprint('data')\nPY` }, context());
+    expect(scoped.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+    expect(requests).toHaveLength(1);
+    expect(fs.existsSync(outside)).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32')('still requires sensitive-path approval for a literal cat heredoc target', async () => {
+    expectedMainWarnings.push('bash filesystem mutation scope reject');
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command: "cat > .env <<'DATA'\nSECRET=example\nDATA" }, context());
+    expect(result.content).toContain('E_SENSITIVE_PATH_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('sensitive_path');
+    expect(fs.existsSync(path.join(workspace, '.env'))).toBe(false);
+  });
 
   it('denies an outside SQLite write, then executes it once after explicit approval', async () => {
     const permissions = await import('../../../../src/main/features/permissions');

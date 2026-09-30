@@ -30,6 +30,37 @@ async function run(tool: ReturnType<typeof buildBrowserTool>, input: Record<stri
 }
 
 describe('browser model tool', () => {
+  it('passes a complete long article and rejects oversized input before page mutation', async () => {
+    const deps = callbacks();
+    const tool = buildBrowserTool(deps);
+    const action = { operation: 'act', page_id: 'page-1', element_ref: 'e1', page_action: 'fill' };
+    const text = '# 中文文章\n\n```js\nconst value = "完整";\n```\n'.repeat(3000).slice(0, 100000);
+    expect(text.length).toBe(100000);
+    expect(tool.inputSchema).toMatchObject({ properties: { text: { maxLength: 100000 } } });
+    expect((await run(tool, { ...action, text })).body.ok).toBe(true);
+    expect(deps.act).toHaveBeenCalledExactlyOnceWith({
+      pageId: 'page-1', elementRef: 'e1', action: 'fill', text,
+    }, undefined);
+    expect((await run(tool, { ...action, text: text + 'x' })).result.isError).toBe(true);
+    expect(deps.act).toHaveBeenCalledTimes(1);
+    expect((await run(tool, { operation: 'wait', wait_condition: 'text', text: 'x'.repeat(241) })).result.isError).toBe(true);
+    expect(deps.wait).not.toHaveBeenCalled();
+  });
+
+  it('validates drag vectors before dispatch and forwards CSS pixel movement', async () => {
+    const deps = callbacks();
+    const tool = buildBrowserTool(deps);
+    const action = { operation: 'act', page_id: 'page-1', element_ref: 'e1', page_action: 'drag' };
+    for (const vector of [{}, { drag_delta_x: 20 }, { drag_delta_x: 0, drag_delta_y: 0 },
+      { drag_delta_x: 4097, drag_delta_y: 0 }, { drag_delta_x: '20', drag_delta_y: 0 },
+      { drag_delta_x: NaN, drag_delta_y: 0 }]) {
+      expect((await run(tool, { ...action, ...vector })).result.isError).toBe(true);
+    }
+    expect(deps.act).not.toHaveBeenCalled();
+    expect((await run(tool, { ...action, drag_delta_x: -160, drag_delta_y: 20 })).body.ok).toBe(true);
+    expect(deps.act).toHaveBeenCalledWith({ pageId: 'page-1', elementRef: 'e1', action: 'drag', dragDeltaX: -160, dragDeltaY: 20 }, undefined);
+  });
+
   it('defaults observe to full scope and passes meta through', async () => {
     const observe = vi.fn(async () => ({ ok: true, page_id: 'page-1', untrusted_content: true }));
     const tool = buildBrowserTool(callbacks({ observe }));
@@ -103,7 +134,7 @@ describe('browser model tool', () => {
   it('publishes one closed multi-operation contract with explicit trust and safety boundaries', () => {
     const tool = buildBrowserTool(callbacks());
     expect(tool.name).toBe('inner_browser');
-    expect(tool.description).toContain('visible Browser tabs shared with the user');
+    expect(tool.description).toContain('task Browser tabs shared with the user');
     expect(tool.description).toContain('untrusted data');
     expect(tool.description).toContain('high-impact actions');
     expect(tool.description).toContain('Automate non-sensitive form submissions');
@@ -111,15 +142,15 @@ describe('browser model tool', () => {
     expect(tool.description).toMatch(/Credentials, OTP, card entry, uploads, CAPTCHA and submissions carrying secrets stay user-operated/);
     expect(tool.description).not.toContain('high-impact actions and sensitive form submissions remain user-operated');
     expect(tool.inputSchema).toMatchObject({ properties: {
-      page_action: { description: expect.stringContaining('host approval or Trusted') },
+      page_action: { description: expect.stringContaining('never retry a manual handback') },
     } });
     expect(tool.description).not.toContain('final submission/authorization');
     // This is a calling/selection contract, not evidence of model execution.
-    expect(tool.description).toContain('dynamic pages that web_fetch cannot render');
+    expect(tool.description).toContain('dynamic pages unsupported by web_fetch');
     expect(tool.description).toContain('smallest user action at an observed blocker');
     expect(tool.inputSchema).toMatchObject({ properties: {
-      operation: { description: expect.stringContaining('At most 30 tabs per task. Prefer navigate to reuse tabs') },
-      retention: { description: expect.stringContaining('deliverable/handoff also prevent capacity cleanup') },
+      operation: { description: expect.stringContaining('30 tabs/task; reuse via navigate') },
+      retention: { description: expect.stringContaining('deliverable/handoff prevent eviction') },
     } });
     expect(tool.inputSchema).toMatchObject({
       type: 'object',
@@ -129,7 +160,7 @@ describe('browser model tool', () => {
         operation: { enum: ['tabs', 'open', 'navigate', 'observe', 'act', 'wait', 'close', 'retain'] },
         retention: { enum: ['deliverable', 'handoff', 'temporary'] },
         navigation: { enum: ['goto', 'back', 'forward', 'reload'] },
-        page_action: { enum: ['click', 'fill', 'select', 'check', 'uncheck', 'scroll'] },
+        page_action: { enum: ['click', 'fill', 'select', 'check', 'uncheck', 'scroll', 'drag'] },
         timeout_ms: { minimum: 250, maximum: 15000 },
       },
     });

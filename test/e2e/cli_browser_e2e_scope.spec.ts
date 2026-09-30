@@ -29,7 +29,7 @@ test('native and CLI browsers submit ordinary forms once while protecting sensit
       <label>Extra field<input id="conditional" form="question"></label>
       <form id="credentials"><button>Continue</button></form>
       <label>Password<input id="password" type="password" form="credentials" value="fixture-private-value"></label>
-      <button id="purchase" type="button">Confirm payment</button>
+      <button id="purchase" type="button">Pay now</button>
       <label>Attachment<input id="upload" type="file"></label>
       <script>
         window.protectedActions = 0;
@@ -144,10 +144,11 @@ test('native and CLI browsers submit ordinary forms once while protecting sensit
         observed = await submitCall({ operation: 'observe', tab_id: tabId });
         expect(observed.text).toContain('Received: orkas');
 
+        // High-impact labels match whole action words, as in web_assist.test.ts.
         for (const [label, action, reason] of [
           ['Password', 'fill', 'sensitive_input'],
           ['Continue', 'click', 'sensitive_form_submission'],
-          ['Confirm payment', 'click', 'high_impact_action'],
+          ['Pay now', 'click', 'high_impact_action'],
           ['Attachment', 'click', 'file_upload'],
         ] as const) {
           const control = observed.elements.find((element: any) => element.label === label);
