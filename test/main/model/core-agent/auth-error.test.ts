@@ -13,8 +13,30 @@ import {
 } from '../../../../src/core-agent/src/shared/errors';
 
 describe('auth-error › classifyKeyFailure › status code fast path', () => {
+  it.each([
+    'Not authorized to operate on this resource',
+    'Unable to generate this resource',
+    'Quota is not the reason this operation was denied',
+  ])('keeps a 403 permission failure despite incidental wording: %s', (message) => {
+    expect(classifyKeyFailure({ status: 403, message })).toBe('permission');
+  });
+
+  it('uses an explicit rate-limit code even when its HTTP envelope is 403', () => {
+    expect(classifyKeyFailure({ status: 403, code: 'rate_limit_error', message: 'opaque' })).toBe('rate_limit');
+  });
   it('401 → auth', () => {
     const err = Object.assign(new Error('Unauthorized'), { status: 401 });
+    expect(classifyKeyFailure(err)).toBe('auth');
+  });
+
+  it('401 + invalid_request_error + token_invalidated → auth（具体凭证信号优先）', () => {
+    const err = Object.assign(new Error(JSON.stringify({
+      error: {
+        message: 'Encountered invalidated oauth token for user, failing request',
+        type: 'invalid_request_error',
+        code: 'token_invalidated',
+      },
+    })), { status: 401, code: 'token_invalidated' });
     expect(classifyKeyFailure(err)).toBe('auth');
   });
 
@@ -23,8 +45,8 @@ describe('auth-error › classifyKeyFailure › status code fast path', () => {
     expect(classifyKeyFailure(err)).toBe('permission');
   });
 
-  it('403 带 rate/quota 字样 → 归到 rate_limit（一些云商用 403 返限速）', () => {
-    // 例：Google Vertex AI 偶发 403 "Resource has been exhausted (e.g. check quota)"
+  it('keeps a 403 as permission without an explicit throttling code', () => {
+    // Prose alone cannot override the HTTP status.
     const err = Object.assign(new Error('Resource has been exhausted: quota'), { status: 403 });
     expect(classifyKeyFailure(err)).toBe('permission');
   });
@@ -34,70 +56,65 @@ describe('auth-error › classifyKeyFailure › status code fast path', () => {
     expect(classifyKeyFailure(err)).toBe('rate_limit');
   });
 
+  it('429 + insufficient_quota → balance（余额不足，不是限流）', () => {
+    const err = Object.assign(new Error('429 {"error":{"message":"积分不足","type":"insufficient_quota","code":"orkas_llm_quota_exceeded"}}'), { status: 429, code: 'insufficient_quota' });
+    expect(classifyKeyFailure(err)).toBe('balance');
+  });
+
+  it('429 + code=insufficient_quota → balance', () => {
+    const err = Object.assign(new Error('429'), { status: 429, code: 'insufficient_quota' });
+    expect(classifyKeyFailure(err)).toBe('balance');
+  });
+
+  it('does not override HTTP 429 with a message-only balance claim', () => {
+    expect(classifyKeyFailure({ status: 429, message: '429 积分不足' })).toBe('rate_limit');
+  });
+
   it('402 → balance', () => {
     const err = Object.assign(new Error('Payment Required'), { status: 402 });
     expect(classifyKeyFailure(err)).toBe('balance');
   });
-});
 
-describe('auth-error › classifyKeyFailure › 跨模块边界 (message-only)', () => {
-  // 故意不用 instanceof — pi-provider 在 ESM 加载 AuthError，我们在 CJS 加载，
-  // 跨模块 instanceof 返 false。靠 err.message / err.status 分类。
-  it('pi-provider 的 wrapError 产物 "auth failed" 前缀 → auth', () => {
-    // pi-provider.ts::wrapError 构造的 message 格式
-    const err = new Error('openai auth failed: 401 Incorrect API key provided: sk-xxx');
-    expect(classifyKeyFailure(err)).toBeNull();
+  it('402 + generic quota_exceeded code → balance（HTTP payment status wins）', () => {
+    const err = Object.assign(new Error('quota exceeded'), {
+      status: 402,
+      code: 'orkas_llm_quota_exceeded',
+    });
+    expect(classifyKeyFailure(err)).toBe('balance');
   });
 
-  it('"auth failed" 前缀带 permission 关键词 → permission', () => {
-    const err = new Error('anthropic auth failed: forbidden: subscription expired');
-    expect(classifyKeyFailure(err)).toBeNull();
-  });
-
-  it('rate_limit message', () => {
-    expect(classifyKeyFailure(new Error('rate limited: too many requests per minute'))).toBeNull();
-  });
-
-  it('context_length_exceeded → null（不换 key，换了一样溢出）', () => {
-    expect(classifyKeyFailure(new Error('context_length_exceeded: max 8k'))).toBeNull();
-  });
-
-  it('request timed out → "network"（同 key 重试无用，但换 endpoint 有救）', () => {
-    expect(classifyKeyFailure(new Error('request timed out after 30s'))).toBe('network');
+  it('Orkas quota business code remains balance even without an HTTP status', () => {
+    const err = Object.assign(new Error('upstream rejected request'), {
+      code: 'orkas_llm_quota_exceeded',
+    });
+    expect(classifyKeyFailure(err)).toBe('balance');
   });
 });
 
-describe('auth-error › classifyKeyFailure › message fallback', () => {
-  it('Kimi/Anthropic 风格的 authentication_error JSON 体', () => {
-    // 这正是用户看到的 401 报文
-    const body = '401 {"error":{"type":"authentication_error","message":"The API Key appears to be invalid or may have expired. Please verify your credentials and try again."},"type":"error"}';
-    const err = new ProviderError(body, 'kimi-coding');
-    expect(classifyKeyFailure(err)).toBe('auth');
+describe('auth-error structured evidence and unclassified diagnostics', () => {
+
+  it.each([
+    ['auth', { code: 'AUTH_ERROR', message: 'opaque' }],
+    ['rate_limit', { code: 'RATE_LIMIT', message: 'opaque' }],
+    ['auth', { error: { type: 'invalid_request_error', code: 'token_invalidated' } }],
+    ['auth', { error: { message: 'Missing Authentication header', code: 401 } }],
+    ['auth', new ProviderError('opaque', 'custom', 401)],
+    ['permission', { status: 403, code: 'unrecognized_gateway_code', message: 'opaque' }],
+  ] as const)('preserves %s through typed or nested protocol metadata', (kind, error) => {
+    expect(classifyKeyFailure(error)).toBe(kind);
   });
 
-  it('中文"余额不足"', () => {
-    const err = new ProviderError('账户余额不足，请充值后重试', 'moonshot');
-    expect(classifyKeyFailure(err)).toBeNull();
-  });
+  it.each(['constructor', '__proto__', 'not_a_rate_limit_error', 'quota_exceeded'])(
+    'does not invent an account cause for unknown code %s', (code) => {
+      expect(classifyKeyFailure({ code, message: 'opaque' })).toBeNull();
+    },
+  );
 
-  it('OpenAI "insufficient_quota"', () => {
-    const err = new Error('You exceeded your current quota — insufficient_quota');
-    expect(classifyKeyFailure(err)).toBeNull();
-  });
-
-  it('permission error 不带状态码也能识别', () => {
-    const err = new Error('permission_error: this API key does not have access to the requested model');
-    expect(classifyKeyFailure(err)).toBeNull();
-  });
-
-  it('rate limit 英文报文', () => {
-    const err = new Error('rate_limit_error: too many requests per minute');
-    expect(classifyKeyFailure(err)).toBeNull();
-  });
-
-  it('balance 关键词排在 auth 前面（"insufficient credits" 不应误判为 invalid）', () => {
-    const err = new Error('Your request was blocked: insufficient credits');
-    expect(classifyKeyFailure(err)).toBeNull();
+  it('bounds parsing and handles a cyclic plain-object cause', () => {
+    const error: { message: string; cause?: unknown } = { message: 'opaque' };
+    error.cause = error;
+    expect(classifyKeyFailure(error)).toBeNull();
+    expect(classifyKeyFailure(new Error('{"code":"rate_limit_error","message":"' + 'x'.repeat(65_536) + '"}'))).toBeNull();
   });
 });
 
@@ -114,6 +131,13 @@ describe('auth-error › classifyKeyFailure › 反例（不触发轮转）', ()
 
   it('content_filter → null', () => {
     const err = new Error('Response blocked: content_filter triggered');
+    expect(classifyKeyFailure(err)).toBeNull();
+  });
+
+  it('structured safety code wins over incidental balance wording', () => {
+    const err = Object.assign(new Error('Request requires more credits to evaluate'), {
+      code: 'ResponsibleAIPolicyViolation',
+    });
     expect(classifyKeyFailure(err)).toBeNull();
   });
 
@@ -144,9 +168,9 @@ describe('auth-error › classifyKeyFailure › 反例（不触发轮转）', ()
     expect(classifyKeyFailure(Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }))).toBe('network');
   });
 
-  it('"fetch failed" 仅消息无 cause code → "network"（消息正则兜底）', () => {
+  it('keeps a message-only fetch failure unclassified', () => {
     const err = new TypeError('fetch failed');
-    expect(classifyKeyFailure(err)).toBe('network');
+    expect(classifyKeyFailure(err)).toBeNull();
   });
 
   it('"fetch failed" 包裹 401 cause → 仍然按 auth 分类（网络判断在最后）', () => {

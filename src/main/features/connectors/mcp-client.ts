@@ -1,10 +1,10 @@
 /**
  * MCP client wrapper.
  *
- * Owns the underlying `@modelcontextprotocol/sdk` `Client` for one connector instance. Two
- * transports supported in Phase 0: `stdio` (local subprocess via SDK's StdioClientTransport)
- * and `streamable-http` (remote HTTP). SSE transport is intentionally not implemented — the
- * MCP spec has deprecated it in favor of streamable HTTP.
+ * Owns the underlying `@modelcontextprotocol/sdk` `Client` for one connector instance.
+ * Local stdio and remote Streamable HTTP use the official SDK transports. Custom remote
+ * servers can fall back to the SDK's legacy SSE transport when their endpoint rejects the
+ * Streamable HTTP handshake with a transport-shape 4xx response.
  *
  * Why this file is the sole spawn site for MCP child processes: PC/CLAUDE.md §1 calls out
  * `features/local_agents/` as the only spawn entry for coding-CLI dispatches. MCP servers are
@@ -87,21 +87,24 @@ interface SdkBundle {
   Client: typeof import('@modelcontextprotocol/sdk/client/index.js').Client;
   StdioClientTransport: typeof import('@modelcontextprotocol/sdk/client/stdio.js').StdioClientTransport;
   StreamableHTTPClientTransport: typeof import('@modelcontextprotocol/sdk/client/streamableHttp.js').StreamableHTTPClientTransport;
+  SSEClientTransport: typeof import('@modelcontextprotocol/sdk/client/sse.js').SSEClientTransport;
 }
 
 let _sdk: SdkBundle | null = null;
 
 async function _loadSdk(): Promise<SdkBundle> {
   if (_sdk) return _sdk;
-  const [clientMod, stdioMod, httpMod] = await Promise.all([
+  const [clientMod, stdioMod, httpMod, sseMod] = await Promise.all([
     import('@modelcontextprotocol/sdk/client/index.js'),
     import('@modelcontextprotocol/sdk/client/stdio.js'),
     import('@modelcontextprotocol/sdk/client/streamableHttp.js'),
+    import('@modelcontextprotocol/sdk/client/sse.js'),
   ]);
   _sdk = {
     Client: clientMod.Client,
     StdioClientTransport: stdioMod.StdioClientTransport,
     StreamableHTTPClientTransport: httpMod.StreamableHTTPClientTransport,
+    SSEClientTransport: sseMod.SSEClientTransport,
   };
   return _sdk;
 }
@@ -142,6 +145,7 @@ export class McpConnection {
     if (this._connected) return;
     const startedAt = Date.now();
     const sdk = await _loadSdk();
+    let activeTransportKind: Transport['kind'] | 'sse' = this.transport.kind;
     let transport: import('@modelcontextprotocol/sdk/shared/transport.js').Transport;
     if (this.transport.kind === 'stdio') {
       const proxyEnv = await buildChildProxyEnvironment(this.transport.proxyTargetUrl);
@@ -177,33 +181,62 @@ export class McpConnection {
       }
       transport = new sdk.StreamableHTTPClientTransport(url, opts);
     }
-    const client = new sdk.Client(CLIENT_INFO, {});
-    try {
-      // Bound process/transport startup and initialization together. Pass the same budget
-      // to the SDK so its default handshake timeout cannot terminate a configured wait early.
-      const connectTimeoutMs = resolveMcpConnectTimeoutMs(this.transport.kind);
+    let client = new sdk.Client(CLIENT_INFO, {});
+    const connectTimeoutMs = resolveMcpConnectTimeoutMs(this.transport.kind);
+    let connectDeadline = 0;
+    const connectAttempt = async (
+      nextClient: typeof client,
+      nextTransport: typeof transport,
+    ): Promise<void> => {
+      if (!connectDeadline) connectDeadline = Date.now() + connectTimeoutMs;
+      const remaining = Math.max(1, connectDeadline - Date.now());
       let to: NodeJS.Timeout | undefined;
       const timeout = new Promise<never>((_resolve, reject) => {
         const seconds = Math.round(connectTimeoutMs / 1000);
-        to = setTimeout(() => reject(new Error(`MCP connect timed out (>${seconds}s); likely npx/network is slow or the server crashed on launch`)), connectTimeoutMs);
+        to = setTimeout(() => reject(new Error(`MCP connect timed out (>${seconds}s); likely npx/network is slow or the server crashed on launch`)), remaining);
       });
       try {
-        await Promise.race([client.connect(transport, { timeout: connectTimeoutMs }), timeout]);
+        await Promise.race([nextClient.connect(nextTransport, { timeout: remaining }), timeout]);
       } finally {
         if (to) clearTimeout(to);
+      }
+    };
+    try {
+      try {
+        await connectAttempt(client, transport);
+      } catch (error) {
+        const status = (error as { code?: unknown } | null)?.code;
+        // A legacy SSE endpoint commonly rejects the initial JSON-RPC POST. A 401/403
+        // is authorization, and 5xx/network failures are not evidence of legacy SSE.
+        // Catalog entries declare their own protocol and must not silently change it.
+        if (this.id.startsWith('custom-') && this.transport.kind === 'streamable-http'
+          && (status === 400 || status === 404 || status === 405)) {
+          try { await transport.close?.(); } catch { /* preserve the original handshake result */ }
+          log.info('retrying custom MCP endpoint with legacy SSE', { id: 'custom' });
+          const url = new URL(this.transport.url);
+          const headers = this.transport.headers;
+          transport = new sdk.SSEClientTransport(url, {
+            ...(headers && Object.keys(headers).length ? { requestInit: { headers } } : {}),
+          });
+          activeTransportKind = 'sse';
+          client = new sdk.Client(CLIENT_INFO, {});
+          await connectAttempt(client, transport);
+        } else {
+          throw error;
+        }
       }
       this._client = client;
       this._connected = true;
       log.info('MCP connect ok', {
         id: this.id.startsWith('custom-') ? 'custom' : this.id,
-        transport: this.transport.kind,
+        transport: activeTransportKind,
         duration_ms: Date.now() - startedAt,
         timeout_ms: connectTimeoutMs,
       });
     } catch (err) {
       log.warn('connect failed', {
         id: this.id.startsWith('custom-') ? 'custom' : this.id,
-        transport: this.transport.kind,
+        transport: activeTransportKind,
         duration_ms: Date.now() - startedAt,
         error: logErrorSummary(err),
       });

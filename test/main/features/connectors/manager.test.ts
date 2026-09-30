@@ -2376,6 +2376,36 @@ describe('OAuth refresh ownership', () => {
     );
   });
 
+  it.each(['mercado-libre-global-selling', 'tiktok-shop'])('retains the previous %s binding and credentials when reauthorization is cancelled', async id => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const binding = id === 'tiktok-shop' ? { shop_id: '12345', region: 'us' } : { user_id: '12345' };
+    mocks.localApi.authorize = vi.fn(async () => binding);
+    mocks.mcp.listTools = vi.fn(async () => [{ name: 'execute_read', description: 'Read', input_schema: {} }]);
+    await manager.connectViaOAuth(TEST_UID, id, { connectionParameters: {} });
+    const previous = registry.load(TEST_UID).connections[id];
+    mocks.localApi.authorize = vi.fn(async () => { throw Object.assign(new Error('Cancelled'), { code: 'user_cancelled' }); });
+    mocks.localApi.remove.mockClear();
+    await expect(manager.connectViaOAuth(TEST_UID, id, { connectionParameters: {} })).rejects.toMatchObject({ code: 'user_cancelled' });
+    expect(mocks.localApi.authorize).toHaveBeenCalledWith(TEST_UID, expect.objectContaining({ id }), {}, expect.objectContaining({ existingBinding: binding }));
+    expect(mocks.localApi.remove).not.toHaveBeenCalled();
+    expect(registry.load(TEST_UID).connections[id]).toEqual(previous);
+  });
+
+  it('retains the installed WooCommerce store when a replacement authorization is cancelled', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    mocks.localApi.authorize = vi.fn(async () => ({ store_url: 'https://shop.example.com' }));
+    mocks.mcp.listTools = vi.fn(async () => [{ name: 'execute_read', description: 'Read', input_schema: {} }]);
+    await manager.connectViaOAuth(TEST_UID, 'woocommerce', { connectionParameters: {} });
+    const previous = registry.load(TEST_UID).connections.woocommerce;
+    mocks.localApi.authorize = vi.fn(async () => { throw Object.assign(new Error('Cancelled'), { code: 'user_cancelled' }); });
+    mocks.localApi.remove.mockClear();
+    await expect(manager.connectViaOAuth(TEST_UID, 'woocommerce', { connectionParameters: {} })).rejects.toMatchObject({ code: 'user_cancelled' });
+    expect(mocks.localApi.remove).not.toHaveBeenCalled();
+    expect(registry.load(TEST_UID).connections.woocommerce).toEqual(previous);
+  });
+
   it('keeps direct-commerce credentials device-local across connect, refresh, list, and removal', async () => {
     const liveTransports: any[] = [];
     mocks.mcp.connect = vi.fn(function (this: any) {

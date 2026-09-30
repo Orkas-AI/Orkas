@@ -208,6 +208,31 @@ async function runTool(
   return tool.execute(input, { workingDir: '.', signal } as any);
 }
 
+it('cleans only a native draft created by this task, revoking that proof at task end', async () => {
+  const tools = ['create_draft', 'delete_draft'].map(name => ({ name, description: '', input_schema: { type: 'object', properties: { id: { type: 'string' } } } }));
+  fixtures.instances = [makeInstance({ id: 'gmail', tools })];
+  fixtures.actionApproved = false;
+  const dispatched: string[] = [];
+  fixtures.callTool = async (_uid, _id, name) => {
+    dispatched.push(name);
+    return { content: [{ type: 'text', text: JSON.stringify(name === 'create_draft'
+      ? { id: 'draft-owned', messageId: 'message-owned' } : { ok: true }) }] };
+  };
+  const { createConnectorMetaTools } = await loadModule();
+  const [, call] = await createConnectorMetaTools({ userId: UID, cid: 'draft-task' });
+  const invoke = (tool_name: string, id?: string) => runTool(call, { connector_id: 'gmail', tool_name, args: id ? { id } : {} });
+  expect((await invoke('create_draft')).isError).toBeFalsy();
+  expect((await invoke('delete_draft', 'draft-owned')).isError).toBeFalsy();
+  expect(fixtures.actionConfirmCalls).toHaveLength(0);
+  expect((await invoke('delete_draft', 'existing-user-draft')).isError).toBe(true);
+  await invoke('create_draft');
+  const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+  confirm.cancelForCid('draft-task');
+  expect((await invoke('delete_draft', 'draft-owned')).isError).toBe(true);
+  expect(dispatched).toEqual(['create_draft', 'delete_draft', 'create_draft']);
+  expect(fixtures.actionConfirmCalls).toHaveLength(2);
+});
+
 // ── connectorExposureFromSessionId (the runner.ts session-kind gate) ────
 //
 // session_id is now `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id, since the

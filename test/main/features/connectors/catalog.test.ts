@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import sharp from 'sharp';
+import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
 
@@ -30,6 +31,20 @@ describe('connector catalog', () => {
     // Negative control: a single omitted form label must be detected, even if English exists.
     const broken = [{ id: 'canary', connection_setup: { fields: [{ label_en: 'Shop ID', label_zh: '店铺 ID', label_pt: 'ID da loja', label_es: 'ID de la tienda', label_fr: 'ID de la boutique', label_ko: '상점 ID', label_de: 'Shop-ID', label_ru: 'ID магазина', label_it: 'ID del negozio' }] } }];
     expect(missingCopy(broken)).toEqual(['canary.connection_setup.fields.0.label_ja']);
+  });
+
+  it('provides renderer-only catalog descriptions for every supported UI locale', async () => {
+    const { CONNECTOR_CATALOG } = await import('../../../../src/main/features/connectors/catalog');
+    const { SUPPORTED_LANGS } = await import('../../../../src/main/i18n');
+    for (const language of SUPPORTED_LANGS) {
+      const table = JSON.parse(readFileSync(new URL(`../../../../src/renderer/locales/${language}.json`, import.meta.url), 'utf8'));
+      for (const entry of CONNECTOR_CATALOG) {
+        const key = `connectors.catalog.${entry.id}.description`;
+        expect(typeof table[key], `${language}/${key}`).toBe('string');
+        expect(table[key].trim(), `${language}/${key}`).not.toBe('');
+        if (language === 'en') expect(table[key], key).toBe(entry.description_en);
+      }
+    }
   });
 
   it('provides a localized HTTPS guide for every built-in connector that requires setup fields', async () => {
@@ -426,11 +441,11 @@ describe('connector catalog', () => {
       ]) },
     });
     expect(catalog.findCatalogEntry('woocommerce')).toMatchObject({
-      description_en: expect.stringContaining('Read/Write REST API key'),
+      auth_mode: 'local_api',
       connection_setup: { fields: expect.arrayContaining([
         expect.objectContaining({ key: 'store_url', storage: 'metadata', format: 'woocommerce_store_url' }),
-        expect.objectContaining({ key: 'consumer_key', storage: 'credential', format: 'woocommerce_consumer_key' }),
-        expect.objectContaining({ key: 'consumer_secret', input: 'secret', storage: 'credential', format: 'woocommerce_consumer_secret' }),
+        expect.objectContaining({ key: 'consumer_key', storage: 'credential', format: 'woocommerce_consumer_key', required: false }),
+        expect.objectContaining({ key: 'consumer_secret', input: 'secret', storage: 'credential', format: 'woocommerce_consumer_secret', required: false }),
       ]) },
     });
     expect(catalog.findCatalogEntry('walmart-marketplace')).toMatchObject({

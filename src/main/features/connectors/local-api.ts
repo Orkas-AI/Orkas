@@ -12,13 +12,19 @@ import { resolveBackgroundNodeRuntime, withBackgroundNodeEnv } from '../../util/
 import { buildChildProxyEnvironment } from '../../util/proxy-dispatcher';
 import { getLanguageForUser } from '../config';
 import { t } from '../../i18n';
+import { createLogger } from '../../logger';
+import { logErrorSummary } from '../../util/log-redact';
+import { authorizeWooCommerce } from './woocommerce-auth';
 import { startLocalApiBrowserOAuth, startLocalApiCredentialAuthorization } from './oauth-dcr';
 import { LOCAL_API_REDIRECT_URI } from './oauth-redirect';
+import { requestAccountChoice, type AccountChoice } from './account-choice';
 import {
   startInteractiveCliSession,
   waitInteractiveCliSession,
 } from '../../model/core-agent/interactive-cli-sessions';
 import type { CatalogConnectionField, CatalogEntry, LocalApiConfig, Transport } from './types';
+
+const log = createLogger('connectors:local-api');
 
 const CREDENTIAL_KEY_NAMESPACE = 'connectors.local-api-key';
 const PAYLOAD_PREFIX = 'ORKAPI1:';
@@ -286,6 +292,10 @@ export function normalizeLocalApiConnectionInput(entry: CatalogEntry, raw: unkno
     const value = normalizeField(field, raw[field.key]);
     (field.storage === 'credential' ? credentials : metadata)[field.key] = value;
   }
+  if (entry.local_api?.provider === 'woocommerce'
+      && Boolean(credentials.consumer_key) !== Boolean(credentials.consumer_secret)) {
+    throw new Error(t('connectors.woocommerce.credentials_incomplete'));
+  }
   if (PRODUCTION_ONLY_LOCAL_API_PROVIDERS.has(entry.local_api!.provider)) metadata.environment = 'live';
   if (entry.local_api?.provider === 'ebay') {
     require(path.join(pcDirForChild(), 'bin/ebay-signature.cjs')).signingKey(credentials);
@@ -446,10 +456,16 @@ export async function authorizeLocalApi(
   uid: string,
   entry: CatalogEntry,
   raw: unknown,
-  opts: { attemptId?: string } = {},
+  opts: { attemptId?: string; existingBinding?: Record<string, string> } = {},
 ): Promise<Record<string, string>> {
   const config = requireLocalApi(entry);
   const normalized = normalizeLocalApiConnectionInput(entry, raw);
+  // A reconnect without a typed ID keeps the previously selected account/store.
+  const bindingKey = config.provider === 'mercado_libre' ? 'user_id' : config.provider === 'tiktok_shop' ? 'shop_id' : null;
+  if (bindingKey && !normalized.metadata[bindingKey] && opts.existingBinding?.[bindingKey]) {
+    const field = entry.connection_setup!.fields.find(candidate => candidate.key === bindingKey)!;
+    normalized.metadata[bindingKey] = normalizeField(field, opts.existingBinding[bindingKey]);
+  }
   const userAppAuth = require(path.join(pcDirForChild(), 'bin/local-api-auth.cjs'));
   if (userAppAuth.BROWSER_OAUTH_PROVIDERS.has(config.provider) || userAppAuth.SELF_AUTH_PROVIDERS.has(config.provider)) {
     try {
@@ -460,7 +476,18 @@ export async function authorizeLocalApi(
         credentials = await startLocalApiBrowserOAuth(entry.id, (state, redirectUri) => {
           flow = userAppAuth.createBrowserAuthorization(env, state, redirectUri);
           return flow.url;
-        }, (code) => flow.complete(code), opts);
+        }, async (code, signal) => {
+          const authorized = await flow.complete(code);
+          if (config.provider === 'mercado_libre' && !normalized.metadata.user_id) {
+            const identity = authorized.identity as { user_id: string; nickname?: string };
+            const id = await requestAccountChoice(uid, entry.id, [{
+              id: identity.user_id,
+              label: `${String(identity.nickname || entry.display_name).slice(0, 120)} (${identity.user_id})`,
+            }], signal);
+            normalized.metadata.user_id = id;
+          }
+          return authorized;
+        }, opts);
       } else {
         credentials = await startLocalApiCredentialAuthorization(entry.id, () => userAppAuth.authorizeConfigured(env), opts);
       }
@@ -469,6 +496,7 @@ export async function authorizeLocalApi(
     } catch (error) {
       const code = (error as { code?: string })?.code;
       if (code === 'user_cancelled') throw error;
+      log.warn('local API authorization failed', { id: entry.id, provider: config.provider, ...logErrorSummary(error) });
       if (code?.startsWith('storefront_')) {
         const key = code === 'storefront_permission_denied' ? 'permission_denied'
           : code === 'storefront_binding_mismatch' ? 'binding_mismatch' : 'request_failed';
@@ -485,16 +513,34 @@ export async function authorizeLocalApi(
     try {
       const credentials = await startLocalApiBrowserOAuth(entry.id, (state, redirectUri) => sellerApi.authorizeUrl(
         config.provider, normalized.metadata, normalized.credentials, state, redirectUri,
-      ), (code) => sellerApi.authorize(config.provider, normalized.metadata, normalized.credentials, code), opts);
+      ), (code, signal) => sellerApi.authorize(config.provider, normalized.metadata, normalized.credentials, code, undefined,
+        (choices: AccountChoice[]) => requestAccountChoice(uid, entry.id, choices, signal)), opts);
+      if (config.provider === 'tiktok_shop' && !normalized.metadata.shop_id) {
+        normalized.metadata.shop_id = (credentials.identity as { binding_shop_id: string }).binding_shop_id;
+      }
       saveCredentials(uid, entry, credentials);
       return normalized.metadata;
     } catch (error) {
       const code = (error as { code?: string })?.code;
       if (code === 'user_cancelled') throw error;
+      log.warn('local API authorization failed', { id: entry.id, provider: config.provider, ...logErrorSummary(error) });
       const key = code === 'seller_shop_mismatch' ? 'shop_mismatch'
         : code === 'seller_request_failed' ? 'request_failed' : 'authorization_failed';
       throw Object.assign(new Error(t(`connectors.seller.${key}`, {}, getLanguageForUser(uid))), {
         code: code || 'local_api_authorization_failed',
+      });
+    }
+  }
+  if (config.provider === 'woocommerce' && !normalized.credentials.consumer_key) {
+    try {
+      const credentials = await authorizeWooCommerce(entry.id, normalized.metadata.store_url, opts);
+      saveCredentials(uid, entry, credentials);
+      return normalized.metadata;
+    } catch (error) {
+      if ((error as { code?: string })?.code === 'user_cancelled') throw error;
+      log.warn('local API authorization failed', { id: entry.id, provider: config.provider, ...logErrorSummary(error) });
+      throw Object.assign(new Error(t('connectors.woocommerce.authorization_failed', {}, getLanguageForUser(uid))), {
+        code: 'local_api_authorization_failed',
       });
     }
   }

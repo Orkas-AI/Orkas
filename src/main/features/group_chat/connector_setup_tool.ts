@@ -222,18 +222,68 @@ function searchText(entry: CatalogEntry, catalog: readonly CatalogEntry[]): stri
       variant.description_it,
     );
   }
-  return normalizeSearch([...parts, ...additionalLocalizedParts].filter(Boolean).join(' '));
+  // Aliases go last for the same offset-stability reason; name ranking covers exact alias hits.
+  return normalizeSearch([...parts, ...additionalLocalizedParts, ...(entry.search_aliases || [])]
+    .filter(Boolean).join(' '));
 }
 
-function searchRank(entry: CatalogEntry, query: string, catalog: readonly CatalogEntry[]): number {
+/** 0 = exact id, 1 = exact name or alias, 2 = id/name/alias prefix, null = text match only. */
+function nameRank(entry: CatalogEntry, query: string): number | null {
   const normalizedId = normalizeSearch(entry.id);
-  const names = [entry.display_name, entry.display_name_zh, entry.display_name_en]
+  const names = [entry.display_name, entry.display_name_zh, entry.display_name_en, ...(entry.search_aliases || [])]
     .map(normalizeSearch)
     .filter(Boolean);
   if (normalizedId === query) return 0;
   if (names.includes(query)) return 1;
   if (normalizedId.startsWith(query) || names.some((name) => name.startsWith(query))) return 2;
-  return 3 + Math.max(0, searchText(entry, catalog).indexOf(query));
+  return null;
+}
+
+function searchRank(entry: CatalogEntry, query: string, catalog: readonly CatalogEntry[]): number {
+  return nameRank(entry, query) ?? 3 + Math.max(0, searchText(entry, catalog).indexOf(query));
+}
+
+interface SearchMatch {
+  entry: CatalogEntry;
+  /** Present only for any-term fallback results. */
+  matchedTerms?: string[];
+}
+
+/**
+ * Every term must match one entry. When no entry contains all terms (a service name mixed with
+ * descriptive words, or several services in one query), fall back to entries matching any term:
+ * exact id/name/alias hits first, then more matched terms, then the best single-term rank.
+ */
+function matchConnectorSetups(query: string, catalog: readonly CatalogEntry[]): SearchMatch[] {
+  const normalizedQuery = normalizeSearch(query).trim();
+  const terms = [...new Set(normalizedQuery.split(/\s+/).filter(Boolean))];
+  const candidates = catalog
+    .filter((entry) => !entry.catalog_parent_id)
+    .map((entry) => ({ entry, haystack: searchText(entry, catalog) }));
+  const complete = candidates
+    .filter(({ haystack }) => terms.every((term) => haystack.includes(term)))
+    .map(({ entry }) => entry)
+    .sort((a, b) => (
+      searchRank(a, normalizedQuery, catalog) - searchRank(b, normalizedQuery, catalog)
+      || a.id.localeCompare(b.id)
+    ));
+  if (complete.length || terms.length < 2) return complete.map((entry) => ({ entry }));
+  return candidates
+    .map(({ entry, haystack }) => {
+      const matchedTerms = terms.filter((term) => haystack.includes(term));
+      const bestRank = Math.min(...matchedTerms.map((term) => (
+        nameRank(entry, term) ?? 3 + Math.max(0, haystack.indexOf(term))
+      )));
+      return { entry, matchedTerms, bestRank };
+    })
+    .filter(({ matchedTerms }) => matchedTerms.length > 0)
+    .sort((a, b) => (
+      Number(b.bestRank <= 1) - Number(a.bestRank <= 1)
+      || b.matchedTerms.length - a.matchedTerms.length
+      || a.bestRank - b.bestRank
+      || a.entry.id.localeCompare(b.entry.id)
+    ))
+    .map(({ entry, matchedTerms }) => ({ entry, matchedTerms }));
 }
 
 export function searchConnectorSetups(
@@ -243,20 +293,9 @@ export function searchConnectorSetups(
   instances: readonly ConnectorInstance[],
   enabledSnapshot: Pick<ComponentEnabledFile, 'connectors'>,
 ): Array<Record<string, unknown>> {
-  const normalizedQuery = normalizeSearch(query).trim();
-  const terms = normalizedQuery.split(/\s+/).filter(Boolean);
-  return catalog
-    .filter((entry) => !entry.catalog_parent_id)
-    .filter((entry) => {
-      const haystack = searchText(entry, catalog);
-      return terms.every((term) => haystack.includes(term));
-    })
-    .sort((a, b) => (
-      searchRank(a, normalizedQuery, catalog) - searchRank(b, normalizedQuery, catalog)
-      || a.id.localeCompare(b.id)
-    ))
+  return matchConnectorSetups(query, catalog)
     .slice(0, SEARCH_RESULT_CAP)
-    .map((entry) => ({
+    .map(({ entry, matchedTerms }) => ({
       connector_id: entry.id,
       name: localized(entry as unknown as Record<string, unknown>, 'display_name', language),
       category: entry.category,
@@ -264,6 +303,7 @@ export function searchConnectorSetups(
       requires_extra_configuration: connectorSetupKind(entry) !== 'one_click_oauth',
       can_start: entry.availability !== 'visible_disabled' && !entry.unavailable_reason,
       ...publicStatus(entry, catalog, instances, enabledSnapshot),
+      ...(matchedTerms ? { matched_terms: matchedTerms } : {}),
     }));
 }
 

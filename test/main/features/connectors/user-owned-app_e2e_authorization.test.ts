@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // Journey coverage: combined setup -> browser -> relay -> shop verification -> encrypted
 // grant -> existing MCP actions. External boundaries are fake; no real store is contacted.
 const mocks = vi.hoisted(() => ({ open: vi.fn(async (_url: string) => undefined) }));
+vi.mock('../../../../src/main/features/users', () => ({ getActiveUserId: () => 'user-app-e2e-test' }));
 vi.mock('electron', () => ({ app: { isPackaged: false }, shell: { openExternal: mocks.open } }));
 vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({ accountApiBase: () => 'https://orkas.ai/api', tokenStore: { getDeviceId: () => 'seller-test-device', authHeaders: () => ({}) } }));
 vi.mock('../../../../src/main/features/config', () => ({ getLanguage: () => 'en', getLanguageForUser: () => 'en' }));
@@ -25,6 +26,7 @@ vi.mock('../../../../src/main/model/core-agent/interactive-cli-sessions', () => 
   waitInteractiveCliSession: vi.fn(),
 }));
 
+import { _setBroadcastForTest, respondAccountChoice } from '../../../../src/main/features/connectors/account-choice';
 import { findCatalogEntry } from '../../../../src/main/features/connectors/catalog';
 import { authorizeLocalApi, hasLocalApiAuthorization, localApiRuntimeDir, localApiTransport,
   normalizeLocalApiConnectionInput, removeLocalApiAuthorization } from '../../../../src/main/features/connectors/local-api';
@@ -92,12 +94,83 @@ const callback = () => handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callba
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => {
   cancelDcrOAuth();
+  _setBroadcastForTest();
   for (const row of cases) removeLocalApiAuthorization(UID, findCatalogEntry(row.id)!);
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
 describe('user-owned app authorization journey', () => {
+  it('discovers and confirms the Mercado Libre owner without a manually supplied ID', async () => {
+    const row = cases.find(row => row.provider === 'mercado_libre')!;
+    const requests = boundary(row);
+    let choice: any;
+    _setBroadcastForTest((channel, payload) => { if (channel === 'connectors:account-choice') choice = payload; return true; });
+    const entry = findCatalogEntry(row.id)!;
+    const flow = authorizeLocalApi(UID, entry, client);
+    const completion = callback();
+    await vi.waitFor(() => expect(choice).toBeDefined());
+    expect(choice.choices).toEqual([{ id: '12345', label: 'Fixture seller (12345)' }]);
+    expect(JSON.stringify(choice)).not.toMatch(/private|secret|token/);
+    expect(hasLocalApiAuthorization(UID, entry)).toBe(false);
+    respondAccountChoice(UID, choice.request_id, '12345');
+    await completion;
+    const metadata = await flow;
+    expect(metadata).toEqual({ user_id: '12345' });
+    expect(requests.mock.calls).toHaveLength(3);
+    const transport = await localApiTransport(UID, entry, metadata);
+    if (transport.kind !== 'stdio') throw new Error('Expected stdio');
+    expect(adapter.configured(transport.env).credentials.identity.user_id).toBe('12345');
+  });
+
+  it('does not save a newly discovered Mercado Libre grant when the user declines the account', async () => {
+    const row = cases.find(row => row.provider === 'mercado_libre')!;
+    boundary(row);
+    let choice: any;
+    _setBroadcastForTest((channel, payload) => { if (channel === 'connectors:account-choice') choice = payload; return true; });
+    const entry = findCatalogEntry(row.id)!;
+    const flow = authorizeLocalApi(UID, entry, client);
+    const rejected = expect(flow).rejects.toMatchObject({ code: 'user_cancelled' });
+    const completion = callback();
+    await vi.waitFor(() => expect(choice).toBeDefined());
+    respondAccountChoice(UID, choice.request_id, null);
+    await completion; await rejected;
+    expect(hasLocalApiAuthorization(UID, entry)).toBe(false);
+  });
+
+  it.each([undefined, 'different', 9007199254740992])('rejects invalid discovered Mercado Libre identity %s', async userId => {
+    const row = cases.find(row => row.provider === 'mercado_libre')!;
+    boundary({ ...row, replies: [{ ...grant, user_id: userId }, { id: 12345 }] });
+    const shown = vi.fn(() => true);
+    _setBroadcastForTest(shown);
+    const entry = findCatalogEntry(row.id)!;
+    const flow = authorizeLocalApi(UID, entry, client);
+    const rejected = expect(flow).rejects.toThrow('Could not authorize');
+    await callback(); await rejected;
+    expect(shown).not.toHaveBeenCalled();
+    expect(hasLocalApiAuthorization(UID, entry)).toBe(false);
+  });
+
+  it('checks the discovered owner against the account endpoint and preserves explicit or existing bindings', async () => {
+    const row = cases.find(row => row.provider === 'mercado_libre')!;
+    const entry = findCatalogEntry(row.id)!;
+    for (const [input, existingBinding, replies, accepts] of [
+      [client, undefined, [{ ...grant, user_id: 12345 }, { id: 54321 }], false],
+      [client, { user_id: '54321' }, row.replies, false],
+      [client, { user_id: '12345' }, row.replies, true],
+      [{ ...client, user_id: '54321' }, undefined, row.replies, false],
+    ] as const) {
+      boundary({ ...row, replies: [...replies] });
+      const shown = vi.fn(() => true); _setBroadcastForTest(shown);
+      const flow = authorizeLocalApi(UID, entry, input, { existingBinding });
+      const outcome = accepts ? expect(flow).resolves.toEqual({ user_id: '12345' }) : expect(flow).rejects.toThrow('Could not authorize');
+      await callback(); await outcome;
+      expect(shown).not.toHaveBeenCalled();
+      expect(hasLocalApiAuthorization(UID, entry)).toBe(accepts);
+      removeLocalApiAuthorization(UID, entry);
+    }
+  });
+
   it('exposes the complete credential panel and pins callbacks only for browser providers', () => {
     // Short copy is intentional; assert the platform prerequisite, not prose length.
     const prerequisites: Record<string, [RegExp, RegExp]> = {
@@ -119,7 +192,7 @@ describe('user-owned app authorization journey', () => {
       const setup = entry.connection_setup!;
       const optionalKeys = row.id === 'ebay-seller' ? ['signing_key_jwe', 'signing_private_key'] : [];
       expect(setup.fields.map((field) => field.key).sort()).toEqual([...Object.keys(row.input), ...optionalKeys].sort());
-      expect(setup.fields.filter((field) => field.required).map((field) => field.key).sort()).toEqual(Object.keys(row.input).sort());
+      expect(setup.fields.filter((field) => field.required).map((field) => field.key).sort()).toEqual(Object.keys(row.input).filter(key => !(row.id === 'mercado-libre-global-selling' && key === 'user_id')).sort());
       for (const key of optionalKeys) {
         expect(setup.fields.find((field) => field.key === key)).toMatchObject({ required: false, input: 'secret', storage: 'credential' });
       }

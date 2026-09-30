@@ -5,6 +5,8 @@ export {
   beginOAuthConnect,
   connectViaOAuth,
   addCustomInstance,
+  authorizeCustomInstance,
+  beginCustomOAuthConnect,
   removeInstance,
   removeApiKeyConnectors,
   refreshTools,

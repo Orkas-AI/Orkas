@@ -36,7 +36,7 @@ function shopeeNumber(value, zero = false) {
   return result;
 }
 
-function validateSetup(provider, metadata, credentials) {
+function validateSetup(provider, metadata, credentials, discoverShop = false) {
   if (!isSellerProvider(provider)) throw new Error('Unsupported seller provider');
   if (provider === 'shopee') {
     shopeeNumber(metadata.shop_id);
@@ -47,7 +47,8 @@ function validateSetup(provider, metadata, credentials) {
     if (typeof credentials.partner_key !== 'string' || credentials.partner_key.length < 8) throw new Error('Invalid Shopee Partner Key');
   } else {
     // Seller Center shop codes may be alphanumeric; the API shop ID is resolved after consent.
-    if (!/^[A-Za-z0-9_-]{3,64}$/.test(metadata.shop_id || '') || !['us', 'row'].includes(metadata.region)) {
+    if ((!(discoverShop && !metadata.shop_id) && !/^[A-Za-z0-9_-]{3,64}$/.test(metadata.shop_id || ''))
+        || !['us', 'row'].includes(metadata.region)) {
       throw new Error('Invalid TikTok Shop code or authorization region');
     }
     numericId(credentials.service_id);
@@ -85,7 +86,7 @@ function apiBase(provider, metadata) {
 }
 
 function authorizeUrl(provider, metadata, credentials, state, redirectUri) {
-  validateSetup(provider, metadata, credentials);
+  validateSetup(provider, metadata, credentials, true);
   let url;
   if (provider === 'shopee') {
     const suffix = metadata.region === 'cn' ? 'cn' : metadata.region === 'br' ? 'com.br' : 'com';
@@ -228,12 +229,38 @@ async function shopIdentity(config, fetchImpl) {
   return { shop_id: shop.id, shop_name: shop.name, shop_region: shop.region, shop_cipher: shop.cipher };
 }
 
-async function authorize(provider, metadata, credentials, code, fetchImpl) {
-  validateSetup(provider, metadata, credentials);
-  const config = { provider, metadata, credentials };
+async function authorize(provider, metadata, credentials, code, fetchImpl, selectShop) {
+  validateSetup(provider, metadata, credentials, true);
+  const config = { provider, metadata: { ...metadata }, credentials };
   config.credentials = tokensFrom(provider, await tokenRequest(config, code, false, fetchImpl), { provider, ...credentials });
-  const identity = await shopIdentity(config, fetchImpl);
-  config.credentials.identity = { ...identity, binding_shop_id: metadata.shop_id, region: metadata.region,
+  let identity;
+  if (provider === 'tiktok_shop' && !metadata.shop_id) {
+    const data = await tikTokRequest(config, '/authorization/202309/shops', {}, undefined, config.credentials.access_token, fetchImpl, false);
+    if (!Array.isArray(data.shops) || !data.shops.length || data.shops.length > 100) {
+      throw failure('No authorized shops are available.', 'seller_shop_mismatch');
+    }
+    // Validate identities before offering a choice; never select the first matching row.
+    const ids = new Set();
+    for (const shop of data.shops) {
+      if (!shop || typeof shop !== 'object') throw failure('Invalid authorized shop.', 'seller_shop_mismatch');
+      numericId(shop.id);
+      if (ids.has(shop.id) || typeof shop.region !== 'string' || !/^[A-Z]{2}$/.test(shop.region)
+          || typeof shop.cipher !== 'string' || !shop.cipher || typeof shop.name !== 'string' || !shop.name) {
+        throw failure('Invalid authorized shop.', 'seller_shop_mismatch');
+      }
+      ids.add(shop.id);
+    }
+    const shops = data.shops.filter(shop => (metadata.region === 'us') === (shop.region === 'US'));
+    if (!shops.length || typeof selectShop !== 'function') throw failure('Select an authorized shop in this market.', 'seller_shop_mismatch');
+    const selectedId = await selectShop(shops.map(shop => ({ id: shop.id, label: `${shop.name.slice(0, 120)} (${shop.id})` })));
+    const shop = shops.find(candidate => candidate.id === selectedId);
+    if (!shop) throw failure('The selected shop is not authorized.', 'seller_shop_mismatch');
+    config.metadata.shop_id = shop.id;
+    identity = { shop_id: shop.id, shop_name: shop.name, shop_region: shop.region, shop_cipher: shop.cipher };
+  } else {
+    identity = await shopIdentity(config, fetchImpl);
+  }
+  config.credentials.identity = { ...identity, binding_shop_id: config.metadata.shop_id, region: metadata.region,
     ...(provider === 'shopee' ? { environment: metadata.environment } : {}) };
   return config.credentials;
 }

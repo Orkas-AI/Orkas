@@ -586,8 +586,8 @@ async function authorizeEtsy(env) {
 
 async function authorizeMercadoLibre(env) {
   const { client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri } = env.credentials;
-  const userId = String(env.metadata.user_id || '');
-  if (!clientId || !clientSecret || !redirectUri || !/^[1-9][0-9]{0,18}$/.test(userId)) {
+  const expectedUserId = String(env.metadata.user_id || '');
+  if (!clientId || !clientSecret || !redirectUri || (expectedUserId && !/^[1-9][0-9]{0,18}$/.test(expectedUserId))) {
     throw new Error('incomplete Mercado Libre authorization input');
   }
   const { code, verifier } = await authorizationCode(env);
@@ -598,14 +598,22 @@ async function authorizeMercadoLibre(env) {
   if (!token.access_token || !token.refresh_token || !token.user_id) {
     throw new Error('Mercado Libre token exchange returned incomplete credentials');
   }
-  if (String(token.user_id) !== userId) throw new Error('Mercado Libre authorization returned a different seller');
+  const userId = String(token.user_id);
+  if (!/^[1-9][0-9]{0,18}$/.test(userId)
+      || (typeof token.user_id !== 'string' && !Number.isSafeInteger(token.user_id))) {
+    throw new Error('Mercado Libre authorization returned an invalid seller');
+  }
+  if (expectedUserId && userId !== expectedUserId) throw new Error('Mercado Libre authorization returned a different seller');
   const missing = missingScopes(token.scope, MERCADO_LIBRE_SCOPES);
   if (missing.length) throw new Error(`Mercado Libre authorization is missing required scopes: ${missing.join(', ')}`);
   const identity = await readJson(await fetch('https://api.mercadolibre.com/users/me', {
     headers: { authorization: `Bearer ${token.access_token}`, accept: 'application/json' },
     redirect: 'error', signal: AbortSignal.timeout(60_000),
   }), 'Mercado Libre seller verification');
-  if (String(identity.id || '') !== userId) throw new Error('Mercado Libre authorization returned a different seller');
+  if (String(identity.id || '') !== userId
+      || (typeof identity.id !== 'string' && !Number.isSafeInteger(identity.id))) {
+    throw new Error('Mercado Libre authorization returned a different seller');
+  }
   return {
     provider: 'mercado_libre', client_id: clientId, client_secret: clientSecret,
     redirect_uri: redirectUri, access_token: token.access_token, refresh_token: token.refresh_token,

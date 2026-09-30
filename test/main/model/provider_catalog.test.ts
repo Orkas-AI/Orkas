@@ -151,19 +151,11 @@ describe('provider_catalog › CURATED_MODELS', () => {
   });
 
   it('exposes GPT-6 and the current GPT-5.6 family for OpenAI and OpenAI Codex', () => {
-    const expected = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+    const expected = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
     expect((CURATED_MODELS.openai || []).map((m) => m.id)).toEqual(expected);
     expect((CURATED_MODELS['openai-codex'] || []).map((m) => m.id)).toEqual(expected);
   });
 
-  it('natively resolves the GPT-5.6 family and retained 5.5/5.4 generations', () => {
-    const expected = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4'];
-    for (const provider of ['openai', 'openai-codex'] as const) {
-      for (const modelId of expected) {
-        expect(getBuiltinModel(provider, modelId)).toBeDefined();
-      }
-    }
-  });
 
   it('openrouter catalog includes DeepSeek / Qwen / GLM / Kimi / MiniMax', () => {
     const ids = (CURATED_MODELS.openrouter || []).map((m) => m.id);
@@ -181,9 +173,11 @@ describe('provider_catalog › CURATED_MODELS', () => {
       .map((m) => m.id)
       .filter((id) => id.includes('/claude-'));
     expect(claudeIds).toEqual([
+      'anthropic/claude-opus-5.5',
       'anthropic/claude-opus-5',
       'anthropic/claude-fable-5.1',
       'anthropic/claude-fable-5',
+      'anthropic/claude-sonnet-5.5',
       'anthropic/claude-sonnet-5',
     ]);
   });
@@ -194,6 +188,9 @@ describe('provider_catalog › CURATED_MODELS', () => {
       .filter((id) => id.startsWith('openai/gpt-'));
     expect(ids).toEqual([
       'openai/gpt-6-astra',
+      'openai/gpt-6.1-sol',
+      'openai/gpt-6-sol',
+      'openai/gpt-6-luna',
       'openai/gpt-5.6-sol',
       'openai/gpt-5.6-terra',
       'openai/gpt-5.6-luna',
@@ -592,3 +589,59 @@ describe('provider_catalog › pickLatestGenerations (fallback)', () => {
     expect(pickLatestGenerations(null as any, 2)).toEqual([]);
   });
 });
+
+  it('natively resolves GPT-6 tiers and every retained GPT-5.6 tier', () => {
+    const expected = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+    expect((CURATED_MODELS.openai || []).map((m) => m.id)).toEqual(expected);
+    expect((CURATED_MODELS['openai-codex'] || []).map((m) => m.id)).toEqual(expected);
+
+    for (const provider of ['openai', 'openai-codex'] as const) {
+      for (const modelId of expected) {
+        expect(getBuiltinModel(provider, modelId)).toBeDefined();
+      }
+    }
+
+    expect(getBuiltinModel('openai', 'gpt-6-astra')).toMatchObject({
+      id: 'gpt-6-astra',
+      provider: 'openai',
+      api: 'openai-responses',
+      reasoning: true,
+      input: ['text', 'image'],
+      maxTokens: 128_000,
+      thinkingLevelMap: { off: null, minimal: null, low: 'low', max: 'max' },
+      compat: { supportsExplicitPromptCacheMode: true },
+    });
+    expect(getBuiltinModel('openai-codex', 'gpt-6-astra')).toMatchObject({
+      id: 'gpt-6-astra',
+      provider: 'openai-codex',
+      api: 'openai-codex-responses',
+      reasoning: true,
+      input: ['text', 'image'],
+      maxTokens: 128_000,
+    });
+    for (const id of ['gpt-6-sol', 'gpt-6-luna']) {
+      expect(getBuiltinModel('openai', id)).toMatchObject({
+        id, api: 'openai-responses', contextWindow: 272_000, maxTokens: 128_000,
+      });
+      expect(getBuiltinModel('openai-codex', id)).toMatchObject({
+        id, api: 'openai-codex-responses', contextWindow: 272_000, maxTokens: 128_000,
+      });
+    }
+  });
+
+  it('inherits each GPT provider window from pi-ai while retaining output reservations', () => {
+    const catalog = { getPiModel: getBuiltinModel as any };
+    const ids = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+    for (const provider of ['openai', 'openai-codex', 'openrouter']) {
+      for (const id of ids) {
+        const modelId = provider === 'openrouter' ? `openai/${id}` : id;
+        const sdk = (getBuiltinModel as any)(provider, modelId);
+        const resolved = resolveConfiguredPiModel(catalog, provider, modelId);
+        expect(resolved?.model.contextWindow, `${provider}/${id}`).toBe(sdk.contextWindow);
+        expect(resolved?.model.maxTokens).toBe(
+          provider === 'openrouter' ? sdk.maxTokens : id === 'gpt-6-astra' ? 128_000 : 64_000,
+        );
+        expect(resolved?.needsCustomModel).toBe(true);
+      }
+    }
+  });

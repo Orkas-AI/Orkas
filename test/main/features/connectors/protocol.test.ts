@@ -5,6 +5,7 @@ const electronMock = vi.hoisted(() => {
   const window = {
     isDestroyed: vi.fn(() => false),
     isMinimized: vi.fn(() => true),
+    isFocusable: vi.fn(() => true),
     restore: vi.fn(),
     show: vi.fn(),
     focus: vi.fn(),
@@ -39,6 +40,7 @@ describe('connector callback protocol', () => {
     vi.clearAllMocks();
     electronMock.listeners.clear();
     electronMock.app.isReady.mockReturnValue(true);
+    electronMock.window.isFocusable.mockReturnValue(true);
   });
 
   it('accepts only connector OAuth callbacks', async () => {
@@ -67,6 +69,19 @@ describe('connector callback protocol', () => {
     expect(preventDefault).toHaveBeenCalledTimes(2);
     expect(electronMock.window.restore).toHaveBeenCalled();
     expect(electronMock.window.focus).toHaveBeenCalled();
+  });
+
+  it('keeps a non-focusable background window hidden while still delivering callbacks', async () => {
+    electronMock.window.isFocusable.mockReturnValue(false);
+    const protocol = await import('../../../../src/main/features/connectors/protocol');
+    protocol.registerConnectorProtocol();
+    const secondInstance = electronMock.listeners.get('second-instance')!;
+    secondInstance({}, [], '');
+    secondInstance({}, ['orkas://connectors/oauth/callback?exchange_code=background'], '');
+    await vi.waitFor(() => expect(connectorMock.handleCallbackUrl).toHaveBeenCalledOnce());
+    expect(electronMock.window.restore).not.toHaveBeenCalled();
+    expect(electronMock.window.show).not.toHaveBeenCalled();
+    expect(electronMock.window.focus).not.toHaveBeenCalled();
   });
 
   it('does not intercept stripped account-login links', async () => {

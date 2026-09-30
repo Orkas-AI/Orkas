@@ -110,11 +110,11 @@ async function _assistConnectorSetup(entry, button, onReady) {
     if (!started) {
       if (cid && currentCid === cid) {
         const input = document.getElementById('chat-input');
-        if (input && !input.value) {
-          input.value = t('connectors.setup.assist_request', {
+        if (input && !composerText(input)) {
+          composerSetText(input, t('connectors.setup.assist_request', {
             name: _connectorDisplayName(entry) || entry.id, id: entry.id,
-          });
-          input.dispatchEvent(new Event('input', { bubbles: true }));
+          }));
+          composerNotify(input);
         }
       }
       await uiAlert(t('connectors.setup.assist_failed'));
@@ -175,6 +175,8 @@ let _connectorsState = {
 };
 let _connectorsSearchQuery = '';
 let _connectorsActiveCategory = '';
+let _connectorsHighlightedId = '';
+let _connectorsHighlightTimer = null;
 
 // Reuse the Agent category vocabulary with a connector-specific browse order. Classify the
 // exposed capability: General holds cross-domain services, Office holds work/organization flows,
@@ -364,23 +366,29 @@ function _sanitizeConnectorArray(value, options = {}) {
   return arr.filter((item) => !(item.status && item.status.kind === 'error'));
 }
 
-function _hydrateConnectorsRenderCache() {
-  if (_connectorsState.catalog.length || _connectorsState.instances.length) return false;
+function _readConnectorsRenderCache() {
   try {
     const raw = localStorage.getItem(_connectorsRenderCacheKey());
-    if (!raw) return false;
+    if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (!parsed || parsed.version !== _CONNECTORS_RENDER_CACHE_VERSION) return false;
-    if (Date.now() - Number(parsed.updated_at || 0) > _CONNECTORS_RENDER_CACHE_TTL_MS) return false;
+    if (!parsed || parsed.version !== _CONNECTORS_RENDER_CACHE_VERSION) return null;
+    if (Date.now() - Number(parsed.updated_at || 0) > _CONNECTORS_RENDER_CACHE_TTL_MS) return null;
     const catalog = _sanitizeConnectorArray(parsed.catalog);
     const instances = _sanitizeConnectorArray(parsed.instances, { dropErrored: true });
-    if (!catalog.length && !instances.length) return false;
-    _connectorsState.catalog = catalog;
-    _connectorsState.instances = instances;
-    return true;
+    if (!catalog.length && !instances.length) return null;
+    return { catalog, instances };
   } catch (_) {
-    return false;
+    return null;
   }
+}
+
+function _hydrateConnectorsRenderCache() {
+  if (_connectorsState.catalog.length || _connectorsState.instances.length) return false;
+  const cached = _readConnectorsRenderCache();
+  if (!cached) return false;
+  _connectorsState.catalog = cached.catalog;
+  _connectorsState.instances = cached.instances;
+  return true;
 }
 
 function _persistConnectorsRenderCache() {
@@ -470,10 +478,68 @@ function _connectorDisplayName(entry) {
     : (entry.display_name_en || entry.display_name || entry.id || '');
 }
 
+// Chat configure cards name the connector they open. They read the page catalog when it is
+// loaded, else the page's render cache, else one catalog fetch per session; none of these
+// changes Connectors page state. A compatibility child is labeled as the card it opens.
+let _connectorNavCatalog = null;
+let _connectorNavCatalogLoad = null;
+
+function _connectorNavTargetIn(catalog, id) {
+  const find = (key) => catalog.find((entry) => entry && entry.id === key) || null;
+  let entry = find(id);
+  if (entry && entry.catalog_parent_id) entry = find(entry.catalog_parent_id) || entry;
+  const name = _connectorDisplayName(entry);
+  if (!name) return null;
+  const iconSvg = typeof sanitizeSvgIconHtml === 'function' ? sanitizeSvgIconHtml(entry.icon_svg) : '';
+  return { name, iconSvg };
+}
+
+window.connectorNavTarget = function connectorNavTarget(id) {
+  const targetId = String(id || '').trim();
+  if (!targetId) return null;
+  if (_connectorsState.catalog.length) return _connectorNavTargetIn(_connectorsState.catalog, targetId);
+  if (!_connectorNavCatalog) {
+    const cached = _readConnectorsRenderCache();
+    if (cached && cached.catalog.length) _connectorNavCatalog = cached.catalog;
+  }
+  return _connectorNavCatalog ? _connectorNavTargetIn(_connectorNavCatalog, targetId) : null;
+};
+
+window.loadConnectorNavTarget = async function loadConnectorNavTarget(id) {
+  const now = window.connectorNavTarget(id);
+  if (now) return now;
+  if (!_connectorNavCatalogLoad) {
+    _connectorNavCatalogLoad = Promise.resolve()
+      .then(() => window.orkas.invoke('connectors.catalog', {}))
+      .then((res) => (res && res.ok && Array.isArray(res.catalog) ? _sanitizeConnectorArray(res.catalog) : null))
+      .catch(() => null)
+      .then((catalog) => {
+        // A failed fetch may be retried by a later card; a completed one is reused.
+        if (catalog) _connectorNavCatalog = catalog;
+        else _connectorNavCatalogLoad = null;
+        return catalog;
+      });
+  }
+  await _connectorNavCatalogLoad;
+  return window.connectorNavTarget(id);
+};
+
 // Connector catalog copy supports all UI locales; agent/skill description fallback is separate.
 function _connectorCopy(item, field, lang) {
   if (!item) return '';
-  const locale = String(lang || ((typeof getLang === 'function') ? getLang() : 'en')).toLowerCase().split(/[-_]/)[0];
+  const currentLanguage = (typeof getLang === 'function') ? getLang() : 'en';
+  const normalizeCopyLocale = value => {
+    const tag = String(value).toLowerCase().replace(/_/g, '-');
+    return ['zh-tw', 'pt-pt', 'es-419'].includes(tag) ? tag : tag.split('-')[0];
+  };
+  const locale = normalizeCopyLocale(lang || currentLanguage);
+  // Renderer-only copy leaves shared catalog setup guidance and model tool output intact.
+  if (field === 'description' && item.id && !item._custom && typeof t === 'function'
+      && locale === normalizeCopyLocale(currentLanguage)) {
+    const key = `connectors.catalog.${item.id}.description`;
+    const translated = t(key);
+    if (translated && translated !== key) return translated;
+  }
   return item[`${field}_${locale}`] || item[`${field}_en`] || item[`${field}_zh`] || '';
 }
 
@@ -494,6 +560,7 @@ function _connectorSearchText(entry) {
     entry.display_name,
     entry.display_name_zh,
     entry.display_name_en,
+    _connectorCopy(entry, 'description'),
     entry.description_zh,
     entry.description_en,
     entry.description_ja,
@@ -515,6 +582,7 @@ function _connectorSearchText(entry) {
           concrete.display_name,
           concrete.display_name_zh,
           concrete.display_name_en,
+          _connectorCopy(concrete, 'description'),
           concrete.description_zh,
           concrete.description_en,
           concrete.description_ja,
@@ -538,6 +606,7 @@ function _connectorSearchText(entry) {
       concrete.display_name,
       concrete.display_name_zh,
       concrete.display_name_en,
+      _connectorCopy(concrete, 'description'),
       concrete.description_zh,
       concrete.description_en,
       concrete.description_ja,
@@ -559,6 +628,7 @@ function _connectorSearchText(entry) {
           member.display_name,
           member.display_name_zh,
           member.display_name_en,
+          _connectorCopy(member, 'description'),
           member.description_zh,
           member.description_en,
           member.description_ja,
@@ -732,17 +802,33 @@ window.focusConnectorById = async function focusConnectorById(id) {
   // nothing has been painted yet or a load is still in flight, whose final
   // paint would replace the card about to be focused.
   if (!_connectorsState.catalog.length || _connectorsState.loading) await loadConnectors();
+  const uiId = _catalogUiId(targetId);
+  const bundle = _connectorsState.catalog.find((entry) => Array.isArray(entry.bundle_member_ids)
+    && entry.bundle_member_ids.includes(uiId));
+  const cardId = bundle ? bundle.id : uiId;
   // An explicit navigation target must not depend on previous browse filters.
+  const hadFilters = !!(_connectorsSearchQuery || _connectorsActiveCategory);
   _connectorsSearchQuery = '';
   _connectorsActiveCategory = '';
   const search = document.getElementById('connectors-search-input');
   if (search) search.value = '';
-  _renderConnectorsGrid();
+  // Loading already paints the grid. Reuse its nodes unless clearing filters changes the list.
+  if (hadFilters) _renderConnectorsGrid();
   const card = Array.from(document.querySelectorAll('.connector-card[data-id]'))
-    .find((candidate) => candidate.dataset.id === targetId);
+    .find((candidate) => candidate.dataset.id === cardId);
   if (!card) return false;
+  clearTimeout(_connectorsHighlightTimer);
+  document.querySelectorAll('.connector-card.is-highlighted').forEach((el) => el.classList.remove('is-highlighted'));
+  _connectorsHighlightedId = cardId;
+  card.classList.add('is-highlighted');
+  _connectorsHighlightTimer = setTimeout(() => {
+    _connectorsHighlightedId = '';
+    _connectorsHighlightTimer = null;
+    document.querySelectorAll('.connector-card.is-highlighted').forEach((el) => el.classList.remove('is-highlighted'));
+  }, 2500);
   card.setAttribute('tabindex', '-1');
-  card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  // Position synchronously: starting OAuth can repaint the grid and open the browser immediately.
+  card.scrollIntoView({ block: 'center', behavior: 'instant' });
   card.focus({ preventScroll: true });
   return true;
 };
@@ -762,6 +848,7 @@ window.openConnectorSetupById = async function openConnectorSetupById(id) {
   if (!entry || (installed && !installed.reauthorization_required && !_isReconnectableError(entry, installed))) {
     return window.focusConnectorById(entry ? entry.id : targetId);
   }
+  await window.focusConnectorById(entry.id);
   // The protected form is owned by the catalog, not by a filtered DOM card.
   // A user opening it must not reopen the guide and revoke Commander control.
   _runConnect(entry, 'agent').catch(() => uiAlert(t('connectors.errors.connect_failed')));
@@ -1116,7 +1203,8 @@ function _renderCatalogCard(entry, instance) {
     : true;
 
   const card = document.createElement('div');
-  card.className = `connector-card${connected && !enabledFlag ? ' is-disabled' : ''}${degraded ? ' is-unverified' : ''}`;
+  // Connection progress replaces card nodes; keep the navigation cue until its original timer ends.
+  card.className = `connector-card${connected && !enabledFlag ? ' is-disabled' : ''}${degraded ? ' is-unverified' : ''}${e.id === _connectorsHighlightedId ? ' is-highlighted' : ''}`;
   card.dataset.id = e.id;
 
   // Brand-color square per design (Surface E) — applied ONLY to the
@@ -1200,11 +1288,9 @@ function _renderCatalogCard(entry, instance) {
     // pointless re-authorization for what is usually a server-side outage.
     action = `<button class="btn btn-sm btn-primary" data-act="retry-degraded">${escapeHtml(t('connectors.action.retry'))}</button>`;
   } else if (e._custom) {
-    // Custom server, not connected: retry probes the stored transport
-    // (`connectors.refresh`), never OAuth. Disconnect stays available so a
-    // dead entry can be removed.
+    // OAuth servers need a new browser authorization when their grant is rejected.
     action = `
-      <button class="btn btn-sm btn-primary" data-act="retry-custom">${escapeHtml(t('connectors.action.retry'))}</button>
+      <button class="btn btn-sm btn-primary" data-act="${instance?.custom_auth_mode === 'oauth' ? 'authorize-custom' : 'retry-custom'}">${escapeHtml(t(instance?.custom_auth_mode === 'oauth' ? 'connectors.custom.reauthorize' : 'connectors.action.retry'))}</button>
       <button class="btn btn-sm btn-danger" data-act="disconnect">${escapeHtml(t('connectors.action.disconnect'))}</button>`;
   } else if (_isReconnectableError(e, instance)) {
     action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.connect'))}</button>`;
@@ -1298,6 +1384,7 @@ function _renderCatalogCard(entry, instance) {
       else if (act === 'menu') _openCardMenu(btn, e, instance);
       else if (act === 'use-connector' && enabledFlag) _useConnector(e, instance);
       else if (act === 'retry-custom') _retryConnect(e, 'connector_custom_retry', instance);
+      else if (act === 'authorize-custom') _authorizeCustom(e, instance);
       else if (act === 'retry-degraded') _retryConnect(e, 'connector_degraded_retry', instance);
     });
   });
@@ -1714,6 +1801,7 @@ function _handleOAuthConnectResult(info) {
   }
   if (busyChanged) _renderConnectorsGrid();
   if (pending) _pendingConnectAttempts.delete(info.attempt_id);
+  _connectorsState.connecting.delete(uiCatalogId);
   const entry = _connectorsState.catalog.find((item) => item && item.id === info.catalog_id) || { id: info.catalog_id };
   if (info.result !== 'success') {
     const errLike = {
@@ -1803,7 +1891,8 @@ function _parseEnvLines(text) {
 // Add-custom-MCP-server dialog. The form IS the consent surface (plan §C3):
 // for stdio the user types the exact command that will run on their machine,
 // and the warning line states that plainly. Submission funnels into the
-// single validated IPC route `connectors.add_custom`.
+// single validated IPC route `connectors.add_custom`. Remote OAuth starts
+// asynchronously and finishes through the shared connector OAuth result event.
 function _customConnectorMarkup() {
   return `
     <div class="modal modal-standard ui-dialog connector-custom-dialog" role="dialog" aria-modal="true" aria-labelledby="connector-custom-title">
@@ -1824,6 +1913,13 @@ function _customConnectorMarkup() {
         <div class="form-row">
           <label>${escapeHtml(t('connectors.custom.url_label'))}</label>
           <input type="text" data-f="url" placeholder="https://example.com/mcp" />
+        </div>
+        <div class="form-row">
+          <label>${escapeHtml(t('connectors.custom.auth_label'))}</label>
+          <select data-f="auth_mode">
+            <option value="none">${escapeHtml(t('connectors.custom.auth_none'))}</option>
+            <option value="oauth">${escapeHtml(t('connectors.custom.auth_oauth'))}</option>
+          </select>
         </div>
         <div class="form-row">
           <label>${escapeHtml(t('connectors.custom.headers_label'))}</label>
@@ -1861,6 +1957,7 @@ function _openAddCustomDialog() {
   document.body.appendChild(overlay);
 
   const f = (name) => overlay.querySelector(`[data-f="${name}"]`);
+  let oauthInFlight = false;
   const secHttp = overlay.querySelector('[data-sec="http"]');
   const secStdio = overlay.querySelector('[data-sec="stdio"]');
   f('kind').addEventListener('change', () => {
@@ -1876,6 +1973,7 @@ function _openAddCustomDialog() {
   };
   window.addEventListener('i18n-change', onLanguageChanged);
   const close = () => {
+    if (oauthInFlight) void window.orkas.invoke('connectors.cancel_oauth', {});
     document.removeEventListener('keydown', onKey, true);
     window.removeEventListener('i18n-change', onLanguageChanged);
     overlay.remove();
@@ -1913,14 +2011,20 @@ function _openAddCustomDialog() {
     }
     okBtn.disabled = true;
     okBtn.textContent = t('connectors.action.connecting');
+    oauthInFlight = kind === 'streamable-http' && f('auth_mode').value === 'oauth';
     let added = false;
     try {
       const res = await window.orkas.invoke('connectors.add_custom', {
         display_name: f('name').value.trim(),
         transport,
+        auth_mode: kind === 'streamable-http' ? f('auth_mode').value : 'none',
       });
       if (res && res.ok && res.instance) {
+        if (res.started && typeof res.attempt_id === 'string') {
+          _pendingConnectAttempts.set(res.attempt_id, { uiCatalogId: res.instance.id });
+        }
         added = true;
+        oauthInFlight = false;
         close();
         const st = res.instance.status || {};
         if (st.kind === 'connected') {
@@ -1940,12 +2044,31 @@ function _openAddCustomDialog() {
       _connectorsLog.warn('custom connector add failed', _connectorFailureDetail(err, 'custom_add_exception'));
       uiAlert(_formatConnectError(err));
     } finally {
+      oauthInFlight = false;
       okBtn.disabled = false;
       okBtn.textContent = t('connectors.custom.submit');
     }
     if (added) await loadConnectors();
   });
   setTimeout(() => f('name').focus(), 0);
+}
+
+async function _authorizeCustom(entry, instance) {
+  _connectorsState.connecting.add(entry.id);
+  _renderConnectorsGrid();
+  try {
+    const res = await window.orkas.invoke('connectors.authorize_custom', { id: instance.id });
+    if (res && res.ok && res.started && typeof res.attempt_id === 'string') {
+      _pendingConnectAttempts.set(res.attempt_id, { uiCatalogId: instance.id });
+    } else {
+      uiAlert(_formatConnectError(res));
+      _connectorsState.connecting.delete(entry.id);
+    }
+  } catch (err) {
+    uiAlert(_formatConnectError(err));
+    _connectorsState.connecting.delete(entry.id);
+  }
+  await loadConnectors();
 }
 
 function _connectorStructuredErrorCode(errLike) {
@@ -1976,7 +2099,7 @@ function _formatConnectError(errLike, fallbackKey = 'connectors.errors.connect_f
   if (/HTTP 5\d{2}|exchange_http_5xx/i.test(marker)) return _connectorErrorFallback('network');
   if (/fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound|socket|connection (closed|reset|dropped)|terminated|refresh_failed|刷新授权失败|failed to refresh authorization|認証の更新に失敗|Falha ao atualizar a autorização/i.test(marker)) return _connectorErrorFallback('network');
   if (/composio_not_configured|discord_client_invalid|unsupported_provider|invalid_catalog_id/i.test(marker)) return t('connectors.errors.service_configuration');
-  if (/does not advertise registration_endpoint|DCR unsupported|protected resource metadata missing|compatible token_endpoint_auth_method/i.test(marker)) return t('connectors.errors.service_configuration');
+  if (/does not advertise registration_endpoint|does not support client metadata or DCR registration|DCR unsupported|protected resource metadata missing|compatible token_endpoint_auth_method/i.test(marker)) return t('connectors.errors.service_configuration');
   if (/DCR registration failed|token endpoint HTTP 4\d{2}|HTTP 40[13]/i.test(marker)) return t('connectors.errors.authorization_failed');
   if (/state_expired|invalid_state|bad_state|oauth_code_invalid|exchange_http_4xx|missing_exchange_code/i.test(marker)) return t('connectors.errors.authorization_expired');
   if (/local_api_authorization_failed|seller_authorization_failed/i.test(marker)) return t('connectors.seller.authorization_failed');
@@ -2060,6 +2183,7 @@ async function _drainConnectorInstallQueue() {
       if (controller) _connectorInstallControllers.set(requestId, controller);
       try {
         ok = await uiConfirm({
+          context: info,
           message: `${t('connectors.install_confirm.message', { name: info.display_name })}\n\n${typeof info.target === 'string' ? t(info.kind === 'stdio' ? 'connectors.install_confirm.stdio_summary' : 'connectors.install_confirm.http_summary', { target: info.target }) : info.summary}${warn}`,
           okLabel: t('connectors.install_confirm.approve'),
           cancelLabel: t('connectors.install_confirm.decline'),

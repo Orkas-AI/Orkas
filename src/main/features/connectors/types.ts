@@ -124,10 +124,11 @@ export interface ConnectorInstance {
   display_name: string;
   /** Where the instance came from. Missing/undefined = 'catalog' (pre-existing rows).
    *  'custom' = user-supplied MCP server (id always carries the `custom-` prefix so it can
-   *  never collide with a catalog entry id); its transport is used verbatim — no catalog
-   *  template, no OAuth grant, no server-side refresh. See `CLAUDE.md` under
+   *  never collide with a catalog entry id); its transport is user-supplied. See `CLAUDE.md` under
    *  "Connectors And Knowledge Base". */
   origin?: 'catalog' | 'custom';
+  /** Optional MCP OAuth for a user-supplied streamable HTTP server. */
+  custom_auth_mode?: 'oauth';
   transport: Transport;
   /** Tool subset to expose. `null` = all reported tools; `string[]` = whitelist of tool names. */
   enabled_subtools: string[] | null;
@@ -144,6 +145,8 @@ export interface ConnectorInstance {
    *  The manager rewrites the transport env at spawn time using `oauth_grant.access_token`;
    *  refresh logic in `oauth.ts::refreshIfStale` runs before connect / after a 401. */
   oauth_grant?: OAuthGrant;
+  /** Legacy incoming-webhook targets retained for decrypting existing connections. */
+  discord_webhook_targets?: DiscordWebhookTarget[];
   /** DCR-issued client identity for MCP-spec auth (`auth_mode === 'mcp_dcr'`). The public build
    *  stores this with the grant inside the encrypted local registry and never uploads it to the
    *  Orkas account service. */
@@ -333,9 +336,9 @@ export interface OAuthConfig {
   provider_id: string;
 }
 
-/** Dynamic Client Registration result (RFC 7591) for MCP-spec OAuth providers. Stored locally
- *  with the connector's encrypted secrets. All endpoints are captured at first connect —
- *  re-discovery on every refresh would add latency and assumes stable provider endpoints. */
+/** MCP OAuth client identity from DCR (RFC 7591) or a Client ID Metadata Document.
+ * Stored with the grant in the encrypted local registry. Discovery endpoints are retained
+ * for refresh without repeating discovery. */
 export interface DcrClientCredentials {
   client_id: string;
   /** Most providers issue one; some omit (public clients). */
@@ -485,6 +488,10 @@ export interface CatalogEntry extends LocalizedCatalogCopy<'description'> {
    *  uses `display_name_en`. `display_name` remains the stable persisted/default fallback. */
   display_name_zh?: string;
   display_name_en?: string;
+  /** Other product names people use for this exact service (for example "Outlook" for the
+   *  Microsoft 365 mail toolkit). Commander's connector search matches them like display names;
+   *  they are never displayed. List only names of this service, not category words. */
+  search_aliases?: string[];
   /** Inline SVG markup for the brand logo. Required on every shipped catalog entry — the
    *  renderer draws this on a white rounded square. Keep the inner SVG `width` / `height`
    *  either absent or `100%` so CSS-set 40×40 card box governs the rendered size.
@@ -557,4 +564,18 @@ export interface CatalogEntry extends LocalizedCatalogCopy<'description'> {
    *  and the manager clones the resulting grant into each member instance. See
    *  `manager.ts::connectViaOAuth`. */
   bundle_member_ids?: string[];
+}
+
+export interface DiscordWebhookTarget {
+  id: string;
+  webhook_id: string;
+  webhook_token?: string;
+  webhook_url: string;
+  guild_id?: string;
+  guild_name?: string;
+  channel_id?: string;
+  channel_name?: string;
+  name?: string;
+  created_at: string;
+  updated_at: string;
 }

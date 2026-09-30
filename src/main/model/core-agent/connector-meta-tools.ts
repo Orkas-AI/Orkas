@@ -38,6 +38,7 @@ import { validateCustomTransport, validateDisplayName, CustomTransportError } fr
 import { requestInstallConfirm } from '../../features/connectors/install_confirm';
 import { requestActionConfirm, connectorAccountKey, type AppUsageScope } from '../../features/connectors/action_confirm';
 import { connectorActionRisk, isConnectorActionBlocked } from '../../features/connectors/action_policy';
+import { observeTaskDraftResult } from '../../features/connectors/task-created-drafts';
 import { findCatalogEntry } from '../../features/connectors/catalog';
 import { resolveLanguageForUser } from '../../features/config';
 import { descriptionLang } from '../../i18n';
@@ -436,7 +437,9 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
             `This connector action accepts at most ${policy.max_batch_size} items in any array argument. Split the request into smaller batches.`,
           );
         }
-        const actionRisk = connectorActionRisk(match.instance, toolMatch, normalizedArgs);
+        const draftScope = !opts.appUsage && !match.instance.composio_grant && opts.cid
+          ? { uid: opts.userId, cid: opts.cid, connectorId: cid, accountKey: connectorAccountKey(match.instance) } : undefined;
+        const actionRisk = connectorActionRisk(match.instance, toolMatch, normalizedArgs, draftScope);
         if (actionRisk.risk === 'H' || actionRisk.risk === 'D') {
           const approved = await requestActionConfirm({
             userId: opts.userId,
@@ -466,6 +469,7 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
           }
         }
         const raw = await manager.callTool(opts.userId, cid, toolName, normalizedArgs, { signal: ctx.signal });
+        if (!ctx.signal?.aborted) observeTaskDraftResult(draftScope, toolName, normalizedArgs, raw);
         const content = stringifyMcpResult(raw);
         const protocolError = !!raw && typeof raw === 'object' && (raw as { isError?: unknown }).isError === true;
         return protocolError ? { content, isError: true } : { content };

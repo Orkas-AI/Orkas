@@ -4,6 +4,7 @@ function _connectorActionMessage(info) {
   const displayName = catalogEntry ? _connectorDisplayName(catalogEntry) : (info.display_name || info.connector_id);
   return [
     `${t('connectors.action_confirm.connector')}: ${displayName}`,
+    ...(info.account_label ? [`${t('connectors.action_confirm.account')}: ${info.account_label}`] : []),
     `${t('connectors.action_confirm.action')}: ${info.action_name || info.tool_name}`,
   ].join('\n');
 }
