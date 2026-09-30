@@ -1178,6 +1178,7 @@ export class AgentRunner {
   /** Models already reported as too small for layered compaction (once per run). */
   private readonly windowTooSmallReported = new Set<string>();
   private readonly config: CoreAgentConfig;
+  private readonly idleNow: () => number;
   private readonly providers: ProviderRegistry;
   private readonly tools: Map<string, AgentTool> = new Map();
   private readonly isToolActive: ((name: string) => boolean) | null;
@@ -1196,6 +1197,8 @@ export class AgentRunner {
 
   constructor(opts: {
     config: CoreAgentConfig;
+    /** Elapsed clock for idle budgets; the desktop host excludes OS sleep. */
+    idleNow?: () => number;
     providers?: ProviderRegistry;
     tools?: AgentTool[];
     session?: Session;
@@ -1240,6 +1243,7 @@ export class AgentRunner {
     programSourceLoader?: ProgramSourceLoader;
   }) {
     this.config = opts.config;
+    this.idleNow = opts.idleNow ?? (() => Date.now());
     this.providers = opts.providers ?? new ProviderRegistry(opts.config);
     this.session = opts.session ?? new Session();
     this.skillAllowlist = opts.skillAllowlist;
@@ -1405,6 +1409,7 @@ export class AgentRunner {
         ...parentCtx.state,
       }),
       toolIdleTimeoutMs: this.config.agent.toolIdleTimeoutMs,
+      idleNow: this.idleNow,
       // Raw child data stays inside the program. Only run_program's final
       // result crosses the host transformer and may enter model context.
       transformResult: null,
@@ -2700,6 +2705,7 @@ export class AgentRunner {
               signal: params.signal,
               state: toolState,
               toolIdleTimeoutMs: this.config.agent.toolIdleTimeoutMs,
+              idleNow: this.idleNow,
               transformResult: this.transformToolResult,
               includeFileObservations: true,
               emitEvent: pushToolEvent,
@@ -2844,6 +2850,7 @@ export class AgentRunner {
               signal: params.signal,
               state: toolState,
               toolIdleTimeoutMs: this.config.agent.toolIdleTimeoutMs,
+              idleNow: this.idleNow,
               transformResult: this.transformToolResult,
               includeFileObservations: true,
               emitEvent: (event) => {
@@ -3947,7 +3954,7 @@ export class AgentRunner {
       retryContext: opts.retryContext,
       providerTurnContext: this.session.getProviderTurnContext(),
       requestMetadata: { outputLimitSource: "provider_default" },
-    }, remainingMs, opts.onProviderEmpty);
+    }, remainingMs, opts.onProviderEmpty, this.idleNow);
     throwIfAborted(opts.signal);
     const text = result.content
       .filter((c) => c.type === "text")
@@ -4144,6 +4151,7 @@ export class AgentRunner {
               signal,
               this.config.agent.toolIdleTimeoutMs,
               this.transformToolResult,
+              this.idleNow,
             );
             throwIfAborted(signal);
             reflectSession.addToolResult(call.id, toolResult.content, toolResult.images, toolResult.isError, undefined, toolResult.imageRetention);
@@ -4239,6 +4247,7 @@ async function runToolWithWatchdog(opts: {
   signal?: AbortSignal;
   state: ToolContext["state"];
   toolIdleTimeoutMs: number;
+  idleNow: () => number;
   transformResult?: ToolResultTransformer | null;
   /** Only the model-facing outer result; nested run_program callers receive
    * the original callable-tool value and aggregate observations separately. */
@@ -4305,7 +4314,7 @@ async function runToolWithWatchdog(opts: {
   // generic no-progress watchdog as well can false-kill healthy child work.
   const toolIdle = tool.executionTimeoutOwner === "executor"
     ? null
-    : createToolIdleWatchdog(toolIdleTimeoutMs);
+    : createToolIdleWatchdog(toolIdleTimeoutMs, opts.idleNow);
   const abortWait = waitForAbort(signal);
   let acceptingProgress = true;
   const toolCtx: ToolContext = {
@@ -4441,6 +4450,7 @@ async function executeReflectionTool(
   signal: AbortSignal | undefined,
   toolIdleTimeoutMs: number,
   transformResult: ToolResultTransformer | null,
+  idleNow: () => number,
 ): Promise<ToolResult> {
   const outcome = await runToolWithWatchdog({
     call: { type: "tool_use", id: "reflection", name: tool.name, input },
@@ -4448,6 +4458,7 @@ async function executeReflectionTool(
     signal,
     state,
     toolIdleTimeoutMs,
+    idleNow,
     transformResult,
     emitEvent: () => undefined,
   });
@@ -4490,7 +4501,8 @@ async function streamCompletionWithDeadline(
   provider: LLMProvider,
   params: CompletionParams,
   timeoutMs: number,
-  onProviderEmpty?: (event: Extract<StreamEvent, { type: "provider_empty" }>) => void,
+  onProviderEmpty: ((event: Extract<StreamEvent, { type: "provider_empty" }>) => void) | undefined,
+  idleNow: () => number,
 ): Promise<CompletionResult> {
   throwIfAborted(params.signal);
   const parentSignal = params.signal;
@@ -4511,15 +4523,14 @@ async function streamCompletionWithDeadline(
     rejectGate(error);
   }, Math.max(1, timeoutMs));
   if (typeof overallTimer.unref === "function") overallTimer.unref();
-  let idleTimer: NodeJS.Timeout | null = null;
+  let cancelIdleTimer: (() => void) | undefined;
   const refreshIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
+    cancelIdleTimer?.();
+    cancelIdleTimer = startIdleTimer(CONTEXT_COMPACTION_IDLE_TIMEOUT_MS, idleNow, () => {
       const error = new ContextCompactionIdleTimeoutError(CONTEXT_COMPACTION_IDLE_TIMEOUT_MS);
       controller.abort(error);
       rejectGate(error);
-    }, CONTEXT_COMPACTION_IDLE_TIMEOUT_MS);
-    if (typeof idleTimer.unref === "function") idleTimer.unref();
+    });
   };
 
   let iterator: AsyncIterator<StreamEvent> | undefined;
@@ -4567,7 +4578,7 @@ async function streamCompletionWithDeadline(
     throw error;
   } finally {
     clearTimeout(overallTimer);
-    if (idleTimer) clearTimeout(idleTimer);
+    cancelIdleTimer?.();
     parentSignal?.removeEventListener("abort", onParentAbort);
     if (!iteratorDone) {
       try {
@@ -4621,31 +4632,44 @@ function createChildAbortController(parent: AbortSignal | undefined): {
   };
 }
 
-function createToolIdleWatchdog(timeoutMs: number): {
+/** A due timer is only a wake-up: the host clock decides whether idle time
+ * really elapsed. Re-arm the remaining allowance after authoritative sleep. */
+function startIdleTimer(ms: number, now: () => number, onTimeout: () => void): () => void {
+  const deadline = now() + ms;
+  let cancelled = false;
+  let timer: NodeJS.Timeout;
+  const check = () => {
+    if (cancelled) return;
+    const remaining = deadline - now();
+    if (remaining > 0) arm(remaining);
+    else onTimeout();
+  };
+  const arm = (delay: number) => {
+    timer = setTimeout(check, delay);
+    timer.unref?.();
+  };
+  arm(ms);
+  return () => { cancelled = true; clearTimeout(timer); };
+}
+
+function createToolIdleWatchdog(timeoutMs: number, now: () => number): {
   promise: Promise<"tool_idle">;
   reset: (nextTimeoutMs?: number) => void;
   cancel: () => void;
 } {
-  let timer: NodeJS.Timeout | null = null;
+  let cancelTimer: (() => void) | undefined;
   let settled = false;
   let resolveIdle!: (value: "tool_idle") => void;
-  const promise = new Promise<"tool_idle">((resolve) => {
-    resolveIdle = resolve;
-  });
+  const promise = new Promise<"tool_idle">((resolve) => { resolveIdle = resolve; });
   const reset = (nextTimeoutMs = timeoutMs) => {
     if (settled) return;
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => {
+    cancelTimer?.();
+    cancelTimer = startIdleTimer(nextTimeoutMs, now, () => {
       settled = true;
       resolveIdle("tool_idle");
-    }, nextTimeoutMs);
-    if (typeof timer.unref === "function") timer.unref();
+    });
   };
-  const cancel = () => {
-    settled = true;
-    if (timer) clearTimeout(timer);
-    timer = null;
-  };
+  const cancel = () => { settled = true; cancelTimer?.(); };
   reset();
   return { promise, reset, cancel };
 }

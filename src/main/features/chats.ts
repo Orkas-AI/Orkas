@@ -19,21 +19,31 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { turnIndexRequest } from './conversation-history-client';
 
 import {
   userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile,
-  userConversationTurnIndexPath, WS_ROOT,
+  WS_ROOT,
   localCliDirectoryFile,
 } from '../paths';
 import {
   conversationLayout,
+  assertConversationRelocationReady,
+  setConversationRelocationBlocked,
   chatAttachmentDirForConversation,
   conversationMessageFile,
   conversationMessageReadFile,
+  invalidateConversationProjectCache,
   listProjectIds,
   projectSessionRoots,
 } from '../util/project-layout';
+import {
+  relocateConversationIntoProject,
+  recoverConversationRelocation,
+  commitConversationRelocation,
+  type RelocatedPaths,
+} from '../util/conversation-relocate';
 import { evictSession, deleteSessionFileForUser } from '../model/core-agent/session-store';
 import {
   nowIso, genConversationId, genId12, safeId,
@@ -44,7 +54,7 @@ import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { t } from '../i18n';
 import {
-  ZH_FILLER_RE, EN_FILLER_RE, TITLE_MAX,
+  ZH_FILLER_RE, EN_FILLER_RE, truncateTitleToWidth,
 } from '../util/auto-title';
 import { isExpiredIsoTombstone, pruneExpiredDeletedRecords } from '../util/tombstone_retention';
 import {
@@ -61,7 +71,7 @@ import {
   sanitizePersistedCodexFileCitations,
 } from './local_agents/public-output';
 import {
-  projectConversationHistoryRecords,
+  readConversationHistoryWindow,
   purgeConversationHistoryCache,
   readConversationHistoryPage,
 } from './conversation_history_cache';
@@ -1651,6 +1661,7 @@ class ConversationIndexStore {
   }
 
   private async targetInRoot(rootKey: string, cid: string): Promise<ConversationIndexTarget | null> {
+    assertConversationRelocationReady(this.userId, cid);
     const rows = await this.readRoot(rootKey);
     const index = rows.findIndex((row) => row.conversation_id === cid);
     if (index < 0) return null;
@@ -1704,6 +1715,11 @@ class ConversationIndexStore {
     const newRoot = _conversationRootKey(next.project_id);
     const changedRoots = new Set<string>([oldRoot, newRoot]);
     const oldRows = await this.readRoot(oldRoot);
+    // A project move spans two atomic files. Keep their rows until both writes
+    // and the recovery meta commit succeed; restoring bytes alone loses ownership.
+    const rollbackRoots = oldRoot !== newRoot
+      ? new Map([[oldRoot, [...oldRows]], [newRoot, [...await this.readRoot(newRoot)]]])
+      : null;
     const oldIndex = oldRows.findIndex((row) => row.conversation_id === next.conversation_id);
     if (oldRoot === newRoot) {
       if (oldIndex >= 0) oldRows[oldIndex] = next;
@@ -1718,19 +1734,27 @@ class ConversationIndexStore {
       }
       newRows.unshift(next);
     }
-    await this.commitRoots(changedRoots);
-    if (isDeletedConversation(next)) {
-      try { await fsp.unlink(_conversationMetaFileForRoot(this.userId, next.conversation_id, newRoot)); }
-      catch { /* missing is fine */ }
-    } else {
-      await _writeJsonIfChanged(
-        _conversationMetaFileForRoot(this.userId, next.conversation_id, newRoot),
-        _cleanConversationMeta(next),
-      );
-    }
-    if (oldRoot !== newRoot) {
-      try { await fsp.unlink(_conversationMetaFileForRoot(this.userId, next.conversation_id, oldRoot)); }
-      catch { /* missing is fine */ }
+    try {
+      await this.commitRoots(changedRoots);
+      if (isDeletedConversation(next)) {
+        try { await fsp.unlink(_conversationMetaFileForRoot(this.userId, next.conversation_id, newRoot)); }
+        catch { /* missing is fine */ }
+      } else {
+        await _writeJsonIfChanged(
+          _conversationMetaFileForRoot(this.userId, next.conversation_id, newRoot),
+          _cleanConversationMeta(next),
+        );
+      }
+      if (oldRoot !== newRoot) {
+        try { await fsp.unlink(_conversationMetaFileForRoot(this.userId, next.conversation_id, oldRoot)); }
+        catch { /* missing is fine */ }
+      }
+    } catch (error) {
+      if (rollbackRoots) {
+        for (const [key, rows] of rollbackRoots) this.roots.set(key, rows);
+        await this.commitRoots(changedRoots);
+      }
+      throw error;
     }
   }
 
@@ -1749,12 +1773,15 @@ class ConversationIndexStore {
   }
 
   private async commitRoots(rootKeys: ReadonlySet<string>): Promise<void> {
-    await Promise.all(Array.from(rootKeys, async (rootKey) => {
+    const results = await Promise.allSettled(Array.from(rootKeys, async (rootKey) => {
       const rows = await this.readRoot(rootKey);
       const cleaned = pruneExpiredDeletedRecords(rows.map(_cleanConversation)) as Conversation[];
       await writeJson(conversationIndexFile(this.userId, rootKey || null), cleaned);
       _notifyChatIndexDirty(rootKey || undefined);
     }));
+    // A rejected sibling must not keep writing after rollback has begun.
+    const failed = results.find((result) => result.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
   }
 }
 
@@ -2122,6 +2149,93 @@ export async function setConversationPinned(
   });
 }
 
+export type ConversationMoveResult =
+  | { ok: true; conversation: Conversation }
+  | { ok: false; error: 'not_found' | 'already_in_project' | 'has_running_conv' | 'move_failed' };
+
+/**
+ * Move an unprojected conversation into `projectId`.
+ *
+ * Membership is a storage location rather than a field, so this relocates the
+ * messages, group dir, commander and per-agent sessions, attachments and
+ * artifacts before it touches the index row. A durable journal restores the
+ * original ownership on activation unless the commit marker was published.
+ *
+ * The caller validates that the project exists: `projects.ts` imports this
+ * module, so the check cannot live here without a cycle.
+ */
+export async function moveConversationToProject(
+  userId: string,
+  cid: string,
+  projectId: string,
+): Promise<ConversationMoveResult> {
+  if (!safeId(cid) || !safeId(projectId)) return { ok: false, error: 'not_found' };
+  return _withConversationIndexStore(userId, async (store) => {
+    const target = await store.findTarget(cid, null);
+    if (!target || isDeletedConversation(target.conversation)) return { ok: false, error: 'not_found' };
+    if (target.conversation.project_id) return { ok: false, error: 'already_in_project' };
+
+    // A live turn holds its session files open and has already resolved a
+    // workspace root from the conversation's current project. Moving either
+    // out from under it corrupts the run, so refuse the way project deletion
+    // refuses rather than racing it.
+    try {
+      const state = await readState(userId, cid, null);
+      const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
+      if (state.status === 'running' || state.in_flight.length > 0 || !bus.isQuiescent(userId, cid)) {
+        return { ok: false, error: 'has_running_conv' };
+      }
+    } catch { return { ok: false, error: 'move_failed' }; }
+
+    // Caches keyed by the old absolute message path have to be dropped with
+    // that path, before it stops existing.
+    const oldMessageFile = conversationMessageFile(userId, cid, null);
+
+    // Reuse the recovery guard during the live transaction too: index writes
+    // yield after rename, while concurrent senders still know the old root.
+    setConversationRelocationBlocked(userId, cid, true);
+    let moved: RelocatedPaths[];
+    try {
+      moved = relocateConversationIntoProject(userId, cid, projectId, { ..._cleanConversation(target.conversation) });
+    } catch (err) {
+      try { recoverConversationRelocation(userId, cid); }
+      catch (recoveryErr) {
+        // The journal and both copies stay for activation-time recovery.
+        log.warn('conversation move recovery failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(recoveryErr) });
+      }
+      log.warn('conversation move relocate failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(err) });
+      return { ok: false, error: 'move_failed' };
+    }
+
+    const next = _stampConversationSync(userId, { ...target.conversation, project_id: projectId });
+    try {
+      await store.persistTarget(target, next);
+      commitConversationRelocation(userId, cid);
+    } catch (err) {
+      try { recoverConversationRelocation(userId, cid); }
+      catch (recoveryErr) {
+        // Recovery retries on activation.
+        log.warn('conversation move recovery failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(recoveryErr) });
+      }
+      log.warn('conversation move commit failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(err) });
+      return { ok: false, error: 'move_failed' };
+    }
+
+    invalidateConversationProjectCache(userId, cid);
+    setConversationRelocationBlocked(userId, cid, false);
+    await purgeConversationHistoryCache(userId, oldMessageFile);
+    invalidateLineCount(oldMessageFile);
+    // A move rewrites both chat roots and can add the first conversation to a
+    // brand-new project, which is exactly the source-layout change the chat
+    // search index fingerprints. Without this the index stays technically
+    // complete but is no longer trusted, so search shows "still preparing"
+    // until something else happens to schedule a catch-up pass.
+    search.invalidateChatsIndex(userId);
+    log.info(`conversation moved user=${maskId(userId)} cid=${maskId(cid)} pid=${maskId(projectId)} paths=${moved.length}`);
+    return { ok: true, conversation: next };
+  });
+}
+
 /** Drop a session jsonl + its in-memory cache entry. Routes through
  *  resolveSessionPath so kind (cloud vs local) is respected. */
 function purgeSession(userId: string, sessionId: string): void {
@@ -2305,11 +2419,7 @@ export async function getMessagesPage(
   return { history: history.map((message) => _messageForDisplay(message, displayContext)), nextCursor };
 }
 
-/** Load from the fixed-size page containing a search hit through the newest
- * record. The search index gives us the absolute record index, so this is one
- * direct forward read rather than a renderer-driven chain of older-page IPC
- * requests. `nextCursor` still points immediately before the target page so
- * normal upward pagination remains available. */
+/** Load only the page containing a search hit, with cursors in both directions. */
 export async function getMessagesPageAtIndex(
   userId: string,
   cid: string,
@@ -2320,25 +2430,25 @@ export async function getMessagesPageAtIndex(
     /** Renderer projection (process-output spill to lazy files + display
      *  citation sanitizing). Model-facing readers that consume only text/ids
      *  pass `false`: the spill writes cache files and hashes every large
-     *  output on the main thread for a view nothing reads. */
+     *  output for a view nothing reads. */
     project?: boolean;
   },
 ): Promise<{
   history: MessageRecord[];
   historyIndexes: number[];
   nextCursor: number | null;
+  followingCursor: number | null;
   pageStart: number;
 }> {
   const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
   const index = Math.max(0, Math.floor(Number(messageIndex) || 0));
   const pageStart = Math.floor(index / wanted) * wanted;
-  const page = await readJsonlWindow<MessageRecord>(sourceFile, pageStart, Number.MAX_SAFE_INTEGER);
   const project = opts?.project !== false;
-  const projected = project
-    ? projectConversationHistoryRecords(userId, sourceFile, page.records)
-    : page.records;
-  const visible = projected
+  const page = project
+    ? await readConversationHistoryWindow(userId, sourceFile, pageStart, wanted)
+    : await readJsonlWindow<MessageRecord>(sourceFile, pageStart, wanted);
+  const visible = page.records
     .map((message, offset) => ({ message, index: pageStart + offset }))
     .filter(({ message }) => !message.deleted_at);
   const displayContext = project ? await _messageDisplayContext(userId, cid, projectIdHint) : null;
@@ -2352,8 +2462,30 @@ export async function getMessagesPageAtIndex(
     // remaining page-relative offsets.
     historyIndexes: visible.map(({ index: recordIndex }) => recordIndex),
     nextCursor: page.previousCursor,
+    followingCursor: page.followingCursor,
     pageStart,
   };
+}
+
+/** Continue a search window without rescanning the prefix on each page. */
+export async function getMessagesPageAfter(
+  userId: string, cid: string, after: number, limit = 10, projectIdHint?: string | null,
+): Promise<{ history: MessageRecord[]; nextCursor: number | null; followingCursor: number | null }> {
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  let cursor: number | null = after;
+  let previousCursor: number | null = null;
+  const records: MessageRecord[] = [];
+  do {
+    const page = await readConversationHistoryWindow(userId, sourceFile, 0, wanted - records.length, cursor);
+    if (previousCursor === null) previousCursor = page.previousCursor;
+    records.push(...page.records.filter(message => !message.deleted_at));
+    if (page.followingCursor === cursor) throw new Error('History cursor did not advance');
+    cursor = page.followingCursor;
+  } while (cursor !== null && records.length < wanted);
+  const context = await _messageDisplayContext(userId, cid, projectIdHint);
+  return { history: records.map(message => _messageForDisplay(message, context)),
+    nextCursor: previousCursor, followingCursor: cursor };
 }
 
 /** Resolve a stable message id only when an index-based anchor became stale
@@ -2409,468 +2541,22 @@ export async function findMessageIndexById(
   return null;
 }
 
-// ── Compact conversation-turn navigation index ──────────────────────────
+// Navigation work owns a separate lazy worker lane: a cold index must not
+// block main or delay the ordinary ten-message history page behind its scan.
+export { CONVERSATION_TURN_PAGE_SIZE, CONVERSATION_TURN_USER_PREVIEW_CHARS,
+  CONVERSATION_TURN_ASSISTANT_PREVIEW_CHARS } from './conversation-turn-types';
+export type { ConversationTurnIndexEntry, ConversationTurnPageEntry,
+  ConversationTurnPage } from './conversation-turn-types';
 
-/**
- * The transcript stays tail-paged, but its navigation rail needs one stable
- * address for every user turn. This machine-local derived index is deliberately
- * compact and rebuildable: it never enters sync or the conversation metadata.
- */
-const CONVERSATION_TURN_INDEX_VERSION = 2;
-const CONVERSATION_TURN_FINGERPRINT_BYTES = 4 * 1024;
-export const CONVERSATION_TURN_PAGE_SIZE = 15;
-export const CONVERSATION_TURN_USER_PREVIEW_CHARS = 40;
-export const CONVERSATION_TURN_ASSISTANT_PREVIEW_CHARS = 80;
-
-export interface ConversationTurnIndexEntry {
-  messageId: string;
-  clientMessageId: string;
-  messageIndex: number;
-  userPreview: string;
-  assistantPreview: string;
-}
-
-interface ConversationTurnIndexSource {
-  owner: string;
-  size: number;
-  mtimeMs: number;
-  ctimeMs: number;
-  ino: number;
-}
-
-interface ConversationTurnIndexFile {
-  version: number;
-  source: ConversationTurnIndexSource;
-  recordCount: number;
-  tailHash: string;
-  turns: ConversationTurnIndexEntry[];
-}
-
-export interface ConversationTurnPageEntry extends ConversationTurnIndexEntry {
-  turnNo: number;
-}
-
-export interface ConversationTurnPage {
-  turns: ConversationTurnPageEntry[];
-  total: number;
-  nextCursor: number | null;
-  pageSize: number;
-}
-
-const _conversationTurnIndexMemory = new Map<string, ConversationTurnIndexFile>();
-/** Whole turn indexes stay resident per visited conversation and were only
- *  dropped on delete; keep the most recently used ones instead. */
-const CONVERSATION_TURN_INDEX_MEMORY_MAX = 64;
-
-function _rememberConversationTurnIndex(key: string, index: ConversationTurnIndexFile): void {
-  _conversationTurnIndexMemory.delete(key);
-  if (_conversationTurnIndexMemory.size >= CONVERSATION_TURN_INDEX_MEMORY_MAX) {
-    const oldest = _conversationTurnIndexMemory.keys().next().value;
-    if (oldest !== undefined) _conversationTurnIndexMemory.delete(oldest);
-  }
-  _conversationTurnIndexMemory.set(key, index);
-}
-
-export function _conversationTurnIndexMemorySizeForTest(): number {
-  return _conversationTurnIndexMemory.size;
-}
-const _conversationTurnIndexBuilds = new Map<string, Promise<ConversationTurnIndexFile>>();
-
-function _conversationTurnIndexKey(userId: string, cid: string): string {
-  return `${userId}\u0000${cid}`;
-}
-
-function _conversationTurnSourceOwner(projectIdHint?: string | null): string {
-  return projectIdHint ? `project:${projectIdHint}` : 'global';
-}
-
-async function _conversationTurnSource(
-  file: string,
-  projectIdHint?: string | null,
-): Promise<ConversationTurnIndexSource> {
-  try {
-    const stat = await fsp.stat(file);
-    return {
-      owner: _conversationTurnSourceOwner(projectIdHint),
-      size: stat.size,
-      mtimeMs: stat.mtimeMs,
-      ctimeMs: stat.ctimeMs,
-      ino: Number(stat.ino) || 0,
-    };
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn('conversation turn source stat failed', {
-        file: logPathRef(file),
-        error: logErrorSummary(err),
-      });
-      throw err;
-    }
-    return {
-      owner: _conversationTurnSourceOwner(projectIdHint),
-      size: 0,
-      mtimeMs: 0,
-      ctimeMs: 0,
-      ino: 0,
-    };
-  }
-}
-
-function _sameConversationTurnSource(
-  left: ConversationTurnIndexSource | null | undefined,
-  right: ConversationTurnIndexSource,
-): boolean {
-  return !!left
-    && left.owner === right.owner
-    && Number(left.size) === right.size
-    && Number(left.mtimeMs) === right.mtimeMs
-    && Number(left.ctimeMs) === right.ctimeMs
-    && Number(left.ino || 0) === right.ino;
-}
-
-function _truncateConversationTurnPreview(value: string, maximum: number): string {
-  const chars = Array.from(String(value || ''));
-  if (chars.length <= maximum) return chars.join('');
-  return `${chars.slice(0, Math.max(1, maximum - 1)).join('')}…`;
-}
-
-function _conversationTurnPreviewText(raw: unknown): string {
-  return String(raw || '')
-    .replace(/!\[([^\]]*)\]\([^\s)]+(?:\s+[^)]*)?\)/g, '$1')
-    .replace(/\[([^\]]+)\]\([^\s)]+(?:\s+[^)]*)?\)/g, '$1')
-    .replace(/<[^>\n]+>/g, ' ')
-    .replace(/(^|\s)(?:#{1,6}|>|[-+*]|\d+[.)])\s+/gm, '$1')
-    .replace(/[`*_~]+/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function _isConversationTurnUserRecord(record: any): boolean {
-  return String(record?.from || record?.role || '') === 'user';
-}
-
-function _isConversationTurnVisibleAssistantRecord(record: any): boolean {
-  if (!record || record.deleted_at || record.dispatch) return false;
-  const role = String(record.from || record.role || '');
-  return role !== 'user';
-}
-
-interface ConversationTurnIndexScanOptions {
-  start?: number;
-  end?: number;
-  seed?: ConversationTurnIndexFile;
-}
-
-interface ConversationTurnIndexScanResult {
-  turns: ConversationTurnIndexEntry[];
-  recordCount: number;
-}
-
-async function _scanConversationTurnIndex(
-  file: string,
-  options: ConversationTurnIndexScanOptions = {},
-): Promise<ConversationTurnIndexScanResult> {
-  let stream: fs.ReadStream | null = null;
-  let lines: readline.Interface | null = null;
-  const turns = options.seed
-    ? options.seed.turns.map((turn) => ({ ...turn }))
-    : [];
-  let current: ConversationTurnIndexEntry | null = turns.pop() ?? null;
-  let recordIndex = options.seed?.recordCount ?? 0;
-  let malformedRecordReported = false;
-  try {
-    const start = Math.max(0, Math.floor(Number(options.start) || 0));
-    const requestedEnd = Number(options.end);
-    stream = fs.createReadStream(file, {
-      encoding: 'utf8',
-      ...(start > 0 ? { start } : {}),
-      ...(Number.isSafeInteger(requestedEnd) && requestedEnd >= start
-        ? { end: requestedEnd }
-        : {}),
-    });
-    lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    for await (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let record: any;
-      try { record = JSON.parse(trimmed); } catch (err) {
-        if (!malformedRecordReported) {
-          malformedRecordReported = true;
-          log.warn('conversation turn index skipped malformed records', {
-            file: logPathRef(file),
-            error: logErrorSummary(err),
-          });
-        }
-        continue;
-      }
-      const sourceIndex = recordIndex;
-      recordIndex += 1;
-      if (!record || record.deleted_at) continue;
-      if (_isConversationTurnUserRecord(record)) {
-        if (current) turns.push(current);
-        current = {
-          messageId: typeof record.id === 'string' ? record.id : '',
-          clientMessageId: typeof record.client_msg_id === 'string' ? record.client_msg_id : '',
-          messageIndex: sourceIndex,
-          userPreview: _truncateConversationTurnPreview(
-            _conversationTurnPreviewText(_messageText(record)),
-            CONVERSATION_TURN_USER_PREVIEW_CHARS,
-          ),
-          assistantPreview: '',
-        };
-        continue;
-      }
-      if (!current || !_isConversationTurnVisibleAssistantRecord(record)) continue;
-      const reply = _conversationTurnPreviewText(_messageText(record));
-      if (!reply) continue;
-      const combined = current.assistantPreview
-        ? `${current.assistantPreview} · ${reply}`
-        : reply;
-      current.assistantPreview = _truncateConversationTurnPreview(
-        combined,
-        CONVERSATION_TURN_ASSISTANT_PREVIEW_CHARS,
-      );
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-  } finally {
-    lines?.close();
-    stream?.destroy();
-  }
-  if (current) turns.push(current);
-  return { turns, recordCount: recordIndex };
-}
-
-function _isConversationTurnIndexFile(value: any): value is ConversationTurnIndexFile {
-  return value?.version === CONVERSATION_TURN_INDEX_VERSION
-    && value.source && typeof value.source === 'object'
-    && Number.isSafeInteger(value.recordCount) && value.recordCount >= 0
-    && typeof value.tailHash === 'string' && /^[a-f0-9]{64}$/.test(value.tailHash)
-    && Array.isArray(value.turns)
-    && value.turns.every((turn: any) => (
-      turn && typeof turn === 'object'
-      && typeof turn.messageId === 'string'
-      && typeof turn.clientMessageId === 'string'
-      && Number.isSafeInteger(turn.messageIndex) && turn.messageIndex >= 0
-      && typeof turn.userPreview === 'string'
-      && typeof turn.assistantPreview === 'string'
-    ));
-}
-
-async function _conversationTurnTailFingerprint(
-  file: string,
-  endExclusive: number,
-): Promise<{ hash: string; endsWithNewline: boolean }> {
-  const end = Math.max(0, Math.floor(Number(endExclusive) || 0));
-  if (end === 0) {
-    return {
-      hash: createHash('sha256').update('').digest('hex'),
-      endsWithNewline: true,
-    };
-  }
-  const handle = await fsp.open(file, 'r');
-  try {
-    const start = Math.max(0, end - CONVERSATION_TURN_FINGERPRINT_BYTES);
-    const buffer = Buffer.allocUnsafe(end - start);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-    const tail = buffer.subarray(0, bytesRead);
-    return {
-      hash: createHash('sha256').update(tail).digest('hex'),
-      endsWithNewline: tail.length > 0 && tail[tail.length - 1] === 0x0a,
-    };
-  } finally {
-    await handle.close();
-  }
-}
-
-function _canExtendConversationTurnIndex(
-  index: ConversationTurnIndexFile,
-  source: ConversationTurnIndexSource,
-): boolean {
-  return index.source.owner === source.owner
-    && index.source.ino > 0
-    && index.source.ino === source.ino
-    && index.source.size >= 0
-    && source.size > index.source.size;
-}
-
-async function _extendConversationTurnIndex(
-  userId: string,
-  cid: string,
-  file: string,
-  base: ConversationTurnIndexFile,
-  source: ConversationTurnIndexSource,
-  projectIdHint?: string | null,
-): Promise<ConversationTurnIndexFile | null> {
-  const startedAt = Date.now();
-  const previousTail = await _conversationTurnTailFingerprint(file, base.source.size);
-  // Same inode + a larger size normally means append. Verify the old tail as
-  // well so ordinary in-place truncate/rewrite paths are not mistaken for one.
-  if (previousTail.hash !== base.tailHash || !previousTail.endsWithNewline) return null;
-
-  const scan = await _scanConversationTurnIndex(file, {
-    start: base.source.size,
-    end: source.size - 1,
-    seed: base,
-  });
-  const sourceAfter = await _conversationTurnSource(file, projectIdHint);
-  if (!_sameConversationTurnSource(source, sourceAfter)) return null;
-  const tail = await _conversationTurnTailFingerprint(file, sourceAfter.size);
-  const sourceVerified = await _conversationTurnSource(file, projectIdHint);
-  if (!_sameConversationTurnSource(sourceAfter, sourceVerified) || !tail.endsWithNewline) return null;
-
-  const index: ConversationTurnIndexFile = {
-    version: CONVERSATION_TURN_INDEX_VERSION,
-    source: sourceVerified,
-    recordCount: scan.recordCount,
-    tailHash: tail.hash,
-    turns: scan.turns,
-  };
-  await writeJson(userConversationTurnIndexPath(userId, cid), index);
-  _rememberConversationTurnIndex(_conversationTurnIndexKey(userId, cid), index);
-  log.info('conversation turn index extended', {
-    cid: maskId(cid),
-    ms: Date.now() - startedAt,
-    appended_bytes: sourceVerified.size - base.source.size,
-    records: index.recordCount - base.recordCount,
-    turns: index.turns.length,
-  });
-  return index;
-}
-
-async function _buildConversationTurnIndex(
-  userId: string,
-  cid: string,
-  file: string,
-  projectIdHint?: string | null,
-): Promise<ConversationTurnIndexFile> {
-  const startedAt = Date.now();
-  // A sync pull or live append can move the source while the lazy legacy scan
-  // is running. Retry once so the atomically-published index describes one
-  // coherent file revision rather than a mixed snapshot.
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const sourceBefore = await _conversationTurnSource(file, projectIdHint);
-    const scan = await _scanConversationTurnIndex(file);
-    const sourceAfter = await _conversationTurnSource(file, projectIdHint);
-    if (!_sameConversationTurnSource(sourceBefore, sourceAfter)) {
-      if (attempt === 0) continue;
-      throw new Error('conversation turn index source did not stabilize');
-    }
-    const tail = await _conversationTurnTailFingerprint(file, sourceAfter.size);
-    const sourceVerified = await _conversationTurnSource(file, projectIdHint);
-    if (!_sameConversationTurnSource(sourceAfter, sourceVerified)) {
-      if (attempt === 0) continue;
-      throw new Error('conversation turn index source did not stabilize');
-    }
-    const index: ConversationTurnIndexFile = {
-      version: CONVERSATION_TURN_INDEX_VERSION,
-      source: sourceVerified,
-      recordCount: scan.recordCount,
-      tailHash: tail.hash,
-      turns: scan.turns,
-    };
-    await writeJson(userConversationTurnIndexPath(userId, cid), index);
-    _rememberConversationTurnIndex(_conversationTurnIndexKey(userId, cid), index);
-    log.info('conversation turn index rebuilt', {
-      cid: maskId(cid),
-      ms: Date.now() - startedAt,
-      bytes: sourceVerified.size,
-      records: index.recordCount,
-      turns: index.turns.length,
-    });
-    return index;
-  }
-  throw new Error('conversation turn index source did not stabilize');
-}
-
-async function _getConversationTurnIndex(
-  userId: string,
-  cid: string,
-  projectIdHint?: string | null,
-): Promise<ConversationTurnIndexFile> {
-  const key = _conversationTurnIndexKey(userId, cid);
-  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
-  const source = await _conversationTurnSource(sourceFile, projectIdHint);
-  const memory = _conversationTurnIndexMemory.get(key);
-  if (_isConversationTurnIndexFile(memory)
-      && _sameConversationTurnSource(memory.source, source)) {
-    _rememberConversationTurnIndex(key, memory);
-    return memory;
-  }
-
-  const persisted = await readJson<ConversationTurnIndexFile>(
-    userConversationTurnIndexPath(userId, cid),
-  );
-  if (_isConversationTurnIndexFile(persisted)
-      && _sameConversationTurnSource(persisted.source, source)) {
-    _rememberConversationTurnIndex(key, persisted);
-    return persisted;
-  }
-
-  const existingBuild = _conversationTurnIndexBuilds.get(key);
-  if (existingBuild) return existingBuild;
-  const appendBase = [memory, persisted]
-    .filter(_isConversationTurnIndexFile)
-    .filter((index) => _canExtendConversationTurnIndex(index, source))
-    .sort((left, right) => right.source.size - left.source.size)[0];
-  const build = (async () => {
-    if (appendBase) {
-      const extended = await _extendConversationTurnIndex(
-        userId, cid, sourceFile, appendBase, source, projectIdHint,
-      );
-      if (extended) return extended;
-    }
-    return _buildConversationTurnIndex(userId, cid, sourceFile, projectIdHint);
-  })();
-  _conversationTurnIndexBuilds.set(key, build);
-  try {
-    return await build;
-  } finally {
-    if (_conversationTurnIndexBuilds.get(key) === build) {
-      _conversationTurnIndexBuilds.delete(key);
-    }
-  }
-}
-
-/** Return one newest-tail page of compact user-turn navigation entries. */
 export async function getConversationTurnPage(
-  userId: string,
-  cid: string,
-  before?: number | null,
-  projectIdHint?: string | null,
-): Promise<ConversationTurnPage> {
-  const index = await _getConversationTurnIndex(userId, cid, projectIdHint);
-  const total = index.turns.length;
-  const requestedEnd = Number(before);
-  const end = Number.isSafeInteger(requestedEnd) && requestedEnd >= 0
-    ? Math.min(requestedEnd, total)
-    : total;
-  const start = Math.max(0, end - CONVERSATION_TURN_PAGE_SIZE);
-  return {
-    turns: index.turns.slice(start, end).map((turn, offset) => ({
-      ...turn,
-      turnNo: start + offset + 1,
-    })),
-    total,
-    nextCursor: start > 0 ? start : null,
-    pageSize: CONVERSATION_TURN_PAGE_SIZE,
-  };
+  userId: string, cid: string, before?: number | null, projectIdHint?: string | null,
+): Promise<import('./conversation-turn-types').ConversationTurnPage> {
+  return turnIndexRequest({ kind: 'turns', userId, cid, before, projectIdHint,
+    sourceFile: conversationMessageReadFile(userId, cid, projectIdHint) });
 }
 
 export async function purgeConversationTurnIndex(userId: string, cid: string): Promise<void> {
-  const key = _conversationTurnIndexKey(userId, cid);
-  _conversationTurnIndexMemory.delete(key);
-  _conversationTurnIndexBuilds.delete(key);
-  try {
-    await fsp.unlink(userConversationTurnIndexPath(userId, cid));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn('conversation turn index purge failed', {
-        user_id: maskId(userId),
-        cid: maskId(cid),
-        error: logErrorSummary(err),
-      });
-    }
-  }
+  await turnIndexRequest({ kind: 'turn-purge', userId, cid, sourceFile: '' });
 }
 
 /** Drop every conversation belonging to `userId`. Loops `deleteConversation`
@@ -2941,7 +2627,7 @@ export function autoTitle(content: string): string {
   // the original trimmed input so the sidebar still shows what the user
   // actually typed.
   if (!text) text = raw;
-  if (text.length > TITLE_MAX) text = text.slice(0, TITLE_MAX) + '…';
+  text = truncateTitleToWidth(text);
   return text || t('chat.default_title');
 }
 
@@ -2956,6 +2642,16 @@ interface ConversationStateCandidate {
   journalTracked?: boolean;
 }
 
+/** A conversation blocked by pending move recovery has no resolvable layout.
+ * Skip it so one blocked cid cannot abort the sweep for every other run. */
+function _stateCandidateFile(uid: string, cid: string, projectId: string | null | undefined): string | null {
+  try { return conversationLayout(uid, cid, projectId ?? null).stateFile; }
+  catch (err) {
+    log.warn('stale sweep skipped a blocked conversation', { user: maskId(uid), cid: maskId(cid), ...logErrorSummary(err) });
+    return null;
+  }
+}
+
 async function _conversationStateCandidates(uid: string): Promise<ConversationStateCandidate[]> {
   const out: ConversationStateCandidate[] = [];
   for (const root of conversationRoots(uid)) {
@@ -2964,11 +2660,9 @@ async function _conversationStateCandidates(uid: string): Promise<ConversationSt
     catch { continue; }
     for (const entry of entries) {
       if (!entry.isDirectory() || !isConversationMetaDirName(entry.name)) continue;
-      out.push({
-        uid,
-        cid: entry.name,
-        file: conversationLayout(uid, entry.name, root.projectId).stateFile,
-      });
+      const file = _stateCandidateFile(uid, entry.name, root.projectId);
+      if (!file) continue;
+      out.push({ uid, cid: entry.name, file });
     }
   }
   return out;
@@ -2981,11 +2675,9 @@ async function _indexedConversationStateCandidates(uid: string): Promise<Convers
   for (const row of rows) {
     if (!safeId(row.conversation_id) || seen.has(row.conversation_id)) continue;
     seen.add(row.conversation_id);
-    out.push({
-      uid,
-      cid: row.conversation_id,
-      file: conversationLayout(uid, row.conversation_id, row.project_id ?? null).stateFile,
-    });
+    const file = _stateCandidateFile(uid, row.conversation_id, row.project_id);
+    if (!file) continue;
+    out.push({ uid, cid: row.conversation_id, file });
   }
   return out;
 }
@@ -3038,14 +2730,9 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
       // Normal pre-window path: one compact read, then only the handful of
       // conversations that were actually running when the process stopped.
       for (const item of tracked.items) {
-        candidates.push({
-          uid: activeUserId,
-          cid: item.conversation_id,
-          file: conversationLayout(
-            activeUserId, item.conversation_id, item.project_id,
-          ).stateFile,
-          journalTracked: true,
-        });
+        const file = _stateCandidateFile(activeUserId, item.conversation_id, item.project_id);
+        if (!file) continue;
+        candidates.push({ uid: activeUserId, cid: item.conversation_id, file, journalTracked: true });
       }
     } else {
       // One-time upgrade/corruption fallback. Establish the marker first so
@@ -3067,12 +2754,9 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
       const tracked = await readRunningConversationRegistry(uid);
       if (tracked.valid) {
         for (const item of tracked.items) {
-          candidates.push({
-            uid,
-            cid: item.conversation_id,
-            file: conversationLayout(uid, item.conversation_id, item.project_id).stateFile,
-            journalTracked: true,
-          });
+          const file = _stateCandidateFile(uid, item.conversation_id, item.project_id);
+          if (!file) continue;
+          candidates.push({ uid, cid: item.conversation_id, file, journalTracked: true });
         }
         continue;
       }
@@ -3143,8 +2827,8 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
         model_text: 'The previous assistant run was interrupted by an application exit or crash before it produced a complete reply. Do not assume the interrupted operation completed; recover durable state before continuing.',
       };
       const layout = conversationLayout(uid, cid);
-      const { msgIndex } = await appendJsonlAtomic<GroupMessage>(layout.messageFile, interruptedMessage);
-      await search.indexChatMessage(uid, cid, msgIndex, interruptedMessage);
+      const { msgIndex, source } = await appendJsonlAtomic<GroupMessage>(layout.messageFile, interruptedMessage, true);
+      await search.indexChatMessage(uid, cid, msgIndex, source ?? interruptedMessage);
       const senderKind = members.actors.find((actor) => actor.id === senderId)?.kind
         || (senderId === 'commander' ? 'commander' : 'agent');
       await bumpConversationActivity(uid, cid, ts, {

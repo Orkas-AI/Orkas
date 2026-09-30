@@ -45,8 +45,10 @@ import { fileFailureKind, type FileFailureKind } from '../util/app-error';
 import * as fs from 'node:fs';
 import { isUtf8File } from '../util/file-import';
 import { MAX_TEXT_FILE_BYTES } from '../util/file-size-limits';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { isPathAllowed } from '../util/path-sandbox';
 
 import { chatAttachmentDir, chatAttachmentDraftDir, userChatAttachmentsDir } from '../paths';
 import {
@@ -1129,6 +1131,113 @@ export function localMediaMimeFor(name: string): string {
   const alias = aliases[path.extname(name).toLowerCase()];
   if (alias) return alias;
   return mediaMimeFor(name);
+}
+
+/**
+ * Same-folder web assets of an HTML page previewed through `chat-media://local`
+ * (stylesheets, scripts, JSON data, fonts). Unlike the media and preview
+ * document routes above, these are served only below a folder the host file
+ * viewer granted for the page it is about to open. A previewed page therefore
+ * cannot widen its own reach, for example by framing another local document.
+ */
+const PREVIEW_ASSET_EXTS: ReadonlySet<string> = new Set([
+  '.css', '.js', '.mjs', '.json', '.woff', '.woff2', '.ttf', '.otf',
+]);
+const PREVIEW_ASSET_ROOT_TTL_MS = 12 * 60 * 60 * 1000;
+const PREVIEW_ASSET_ROOT_LIMIT = 64;
+const previewAssetRoots = new Map<string, number>();
+
+type PreviewAssetResult =
+  | { ok: true; absPath: string; kind: 'asset' }
+  | { ok: false; code: 'bad_input' | 'not_found' | 'forbidden'; error: string };
+
+function previewAssetRootTooBroad(rootReal: string): boolean {
+  if (rootReal === path.parse(rootReal).root) return true;
+  let home = os.homedir();
+  try { home = fs.realpathSync(home); } catch { /* keep the unresolved home */ }
+  // The home folder, or anything above it, would expose every project below it.
+  return !!home && isPathAllowed(home, [rootReal]);
+}
+
+/** Let the HTML page at `htmlAbsPath` load assets from its own folder tree. */
+export function grantLocalHtmlPreviewAssets(
+  htmlAbsPath: string,
+  now = Date.now(),
+): { ok: true; root: string } | { ok: false; code: 'bad_input' | 'not_found' | 'forbidden'; error: string } {
+  const doc = resolveLocalPreviewPath(htmlAbsPath);
+  if (!doc.ok) {
+    const err = doc as { code: 'bad_input' | 'not_found'; error: string };
+    return { ok: false, code: err.code, error: err.error };
+  }
+  if (doc.kind !== 'html') return { ok: false, code: 'bad_input', error: 'not an HTML document' };
+  let root: string;
+  try { root = fs.realpathSync(path.dirname(doc.absPath)); }
+  catch { return { ok: false, code: 'not_found', error: 'not found' }; }
+  if (previewAssetRootTooBroad(root)) {
+    return { ok: false, code: 'forbidden', error: 'folder is too broad to share with a preview' };
+  }
+  previewAssetRoots.delete(root);
+  previewAssetRoots.set(root, now);
+  while (previewAssetRoots.size > PREVIEW_ASSET_ROOT_LIMIT) {
+    const oldest = previewAssetRoots.keys().next().value;
+    if (oldest === undefined) break;
+    previewAssetRoots.delete(oldest);
+  }
+  return { ok: true, root };
+}
+
+/**
+ * Resolve an asset below one of `rootsReal` (real paths). Containment is checked before
+ * existence, so a page cannot probe for files outside its folder. Hidden
+ * folders and files below the root (`.git`, `.env*`, …) are never served.
+ */
+export function resolveHtmlPreviewAssetWithinRoots(absPath: string, rootsReal: readonly string[]): PreviewAssetResult {
+  if (typeof absPath !== 'string' || !absPath) return { ok: false, code: 'bad_input', error: 'path required' };
+  if (!path.isAbsolute(absPath)) return { ok: false, code: 'bad_input', error: 'path must be absolute' };
+  const normalized = path.resolve(absPath);
+  const ext = path.extname(normalized).toLowerCase();
+  if (!PREVIEW_ASSET_EXTS.has(ext)) {
+    return { ok: false, code: 'bad_input', error: `unsupported extension: ${ext || '(none)'}` };
+  }
+  const outside = { ok: false, code: 'forbidden', error: 'outside the previewed page folder' } as const;
+  if (!rootsReal.length || !isPathAllowed(normalized, rootsReal)) return outside;
+  let real: string;
+  let stat: fs.Stats;
+  try {
+    real = fs.realpathSync(normalized);
+    stat = fs.statSync(real);
+  } catch {
+    return { ok: false, code: 'not_found', error: 'not found' };
+  }
+  if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file' };
+  const root = rootsReal.find((candidate) => isPathAllowed(real, [candidate]));
+  if (!root) return outside;
+  const rel = path.relative(root, real);
+  if (rel.split(path.sep).some((segment) => segment.startsWith('.'))) {
+    return { ok: false, code: 'forbidden', error: 'hidden path' };
+  }
+  return { ok: true, absPath: real, kind: 'asset' };
+}
+
+/** Resolve an asset for a page the file viewer granted with `grantLocalHtmlPreviewAssets`. */
+export function resolveLocalHtmlPreviewAssetPath(absPath: string, now = Date.now()): PreviewAssetResult {
+  for (const [root, grantedAt] of previewAssetRoots) {
+    if (now - grantedAt > PREVIEW_ASSET_ROOT_TTL_MS) previewAssetRoots.delete(root);
+  }
+  return resolveHtmlPreviewAssetWithinRoots(absPath, [...previewAssetRoots.keys()]);
+}
+
+/** Content types for same-folder preview assets. */
+export function localPreviewAssetMimeFor(name: string): string {
+  const ext = path.extname(name).toLowerCase();
+  if (ext === '.css') return 'text/css; charset=utf-8';
+  if (ext === '.js' || ext === '.mjs') return 'text/javascript; charset=utf-8';
+  if (ext === '.json') return 'application/json; charset=utf-8';
+  if (ext === '.woff') return 'font/woff';
+  if (ext === '.woff2') return 'font/woff2';
+  if (ext === '.ttf') return 'font/ttf';
+  if (ext === '.otf') return 'font/otf';
+  return 'application/octet-stream';
 }
 
 function imageMimeFromExt(ext: string): ImageMimeType {

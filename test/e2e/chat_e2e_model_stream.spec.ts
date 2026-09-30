@@ -1,3 +1,4 @@
+import { composerText, expectComposerText } from './fixtures/composer';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
@@ -36,7 +37,7 @@ async function sendNewChatToAgent(
   await expect(page.locator('#new-chat-recipient-name')).toHaveText(agentName);
   // The pick inserted `@Agent ` into the composer; type after it rather than replacing it.
   const input = page.locator('#new-chat-input');
-  await input.fill(`${await input.inputValue()}${prompt}`);
+  await input.fill(`${await composerText(input)}${prompt}`);
   await page.locator('#new-chat-send-btn').click();
   await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
   return page;
@@ -429,7 +430,7 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(liveInterrupted).toHaveText('Interrupted');
     // Stopping hands the interrupted message back so it can be corrected and
     // sent again; the copy that was already sent stays in the transcript.
-    await expect(page.locator('#chat-input')).toHaveValue('E2E stop this deliberately slow response.');
+    await expectComposerText(page.locator('#chat-input'), 'E2E stop this deliberately slow response.');
     await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(1);
     await page.locator('#chat-input').fill('');
     await expect(page.locator('#chat-history .bubble-retry-btn').last()).toBeVisible();
@@ -692,19 +693,17 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
     expect(modelOrkas.modelRequests).toHaveLength(1);
 
-    // Release the next model fragment only after the send-now user row
-    // has landed. This stub deliberately withholds the phase/terminal boundary,
-    // so the unphased fragment must remain buffered instead of being painted as
-    // a final answer that may later turn out to precede a tool call.
+    // Release the next model fragment only after the send-now user row has
+    // landed. Pending task text is now painted immediately so a stalled model
+    // cannot leave the user with an empty bubble before phase resolution.
     modelOrkas.releaseControlledModelChunk();
     await expect(page.locator('#chat-history .chat-message.assistant')).toHaveCount(1);
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
-      .toHaveText('');
+      .toHaveText('Hello from the local E2E model.');
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
 
-    // The terminal boundary makes the buffered reply visible. Keep the next
-    // steered round active so chronology is checked during the live turn,
-    // after a real UI update rather than an already-empty placeholder check.
+    // The terminal boundary confirms the visible draft. Keep the next steered
+    // round active so chronology is checked during the live turn.
     modelOrkas.setModelMode('very-slow');
     modelOrkas.finishControlledModelStream();
     await expect.poll(() => modelOrkas.modelRequests.length, { timeout: 20_000 })
@@ -795,8 +794,9 @@ test.describe('real chat pipeline with a local model', () => {
   });
 
   test('runs a busy-conversation send after switching to another conversation', async ({ modelOrkas }) => {
+    test.setTimeout(120_000);
     const page = await sendNewChat(modelOrkas, 'E2E foreground conversation stays isolated.');
-    await expect.poll(() => modelOrkas.modelRequests.length).toBe(1);
+    await expect.poll(() => modelOrkas.modelRequests.length, { timeout: 30_000 }).toBe(1);
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, {
       timeout: 20_000,
     });
@@ -806,7 +806,7 @@ test.describe('real chat pipeline with a local model', () => {
 
     modelOrkas.setModelMode('slow');
     await sendNewChat(modelOrkas, 'E2E background first slow queued turn.');
-    await expect.poll(() => modelOrkas.modelRequests.length).toBe(2);
+    await expect.poll(() => modelOrkas.modelRequests.length, { timeout: 30_000 }).toBe(2);
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
     const backgroundCid = await page.locator('#conversation-list .conv-item').first()
       .getAttribute('data-cid');

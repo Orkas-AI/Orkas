@@ -1583,3 +1583,122 @@ describe('chat_attachments › buildConversationAttachmentIndex', () => {
     expect(index).not.toContain('name="current.md"');
   });
 });
+
+describe('chat_attachments › HTML preview assets', () => {
+  // Same-folder stylesheets, scripts, data and fonts of a page opened in the
+  // file viewer. Unlike the media route, nothing is served until the viewer
+  // grants the page's folder, and hidden or outside files never are.
+  let prevHome: string | undefined;
+  beforeEach(() => { prevHome = process.env.HOME; });
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+  });
+
+  async function setup() {
+    const mod = await loadMod();
+    const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-preview-assets-')));
+    const page = path.join(sandbox, 'site');
+    fs.mkdirSync(path.join(page, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(page, 'index.html'), '<!doctype html><link rel="stylesheet" href="style.css">');
+    fs.writeFileSync(path.join(page, 'style.css'), 'body{}');
+    fs.writeFileSync(path.join(page, 'assets', 'icons.js'), 'window.icons = 1;');
+    fs.writeFileSync(path.join(page, 'data.json'), '{}');
+    return { mod, sandbox, page };
+  }
+
+  it('serves nothing until the viewer grants the page folder, then its whole tree', async () => {
+    const { mod, sandbox, page } = await setup();
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'style.css'))).toMatchObject({ ok: false, code: 'forbidden' });
+
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'index.html'))).toEqual({ ok: true, root: page });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'style.css')))
+      .toEqual({ ok: true, absPath: path.join(page, 'style.css'), kind: 'asset' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'assets', 'icons.js')))
+      .toMatchObject({ ok: true, absPath: path.join(page, 'assets', 'icons.js') });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'data.json')).ok).toBe(true);
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('keeps hidden paths, other folders, unsupported types and missing files out', async () => {
+    const { mod, sandbox, page } = await setup();
+    fs.writeFileSync(path.join(page, '.env.json'), '{"token":"x"}');
+    fs.mkdirSync(path.join(page, '.cache'));
+    fs.writeFileSync(path.join(page, '.cache', 'bundle.js'), '');
+    fs.mkdirSync(path.join(sandbox, 'other'));
+    fs.writeFileSync(path.join(sandbox, 'other', 'theme.css'), '');
+    fs.writeFileSync(path.join(page, 'notes.txt'), 'x');
+    fs.mkdirSync(path.join(page, 'folder.css'));
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'index.html')).ok).toBe(true);
+
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, '.env.json'))).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, '.cache', 'bundle.js'))).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(sandbox, 'other', 'theme.css'))).toMatchObject({ ok: false, code: 'forbidden' });
+    // Containment is decided before existence: outside files are not probed.
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(sandbox, 'other', 'missing.css'))).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'notes.txt'))).toMatchObject({ ok: false, code: 'bad_input' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'missing.css'))).toMatchObject({ ok: false, code: 'not_found' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'folder.css'))).toMatchObject({ ok: false, code: 'not_found' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath('style.css')).toMatchObject({ ok: false, code: 'bad_input' });
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it.skipIf(process.platform === 'win32')('does not follow a symlink out of the granted folder', async () => {
+    const { mod, sandbox, page } = await setup();
+    fs.writeFileSync(path.join(sandbox, 'secret.json'), '{"secret":1}');
+    fs.symlinkSync(path.join(sandbox, 'secret.json'), path.join(page, 'linked.json'));
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'index.html')).ok).toBe(true);
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'linked.json'))).toMatchObject({ ok: false, code: 'forbidden' });
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('refuses to grant the home folder or anything above it, and non-HTML files', async () => {
+    const { mod, sandbox, page } = await setup();
+    fs.writeFileSync(path.join(sandbox, 'index.html'), '<!doctype html>');
+    process.env.HOME = sandbox;
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(sandbox, 'index.html'))).toMatchObject({ ok: false, code: 'forbidden' });
+    process.env.HOME = path.join(page, 'assets');
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'index.html'))).toMatchObject({ ok: false, code: 'forbidden' });
+    process.env.HOME = prevHome;
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'style.css'))).toMatchObject({ ok: false, code: 'bad_input' });
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'gone.html'))).toMatchObject({ ok: false, code: 'not_found' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'style.css'))).toMatchObject({ ok: false, code: 'forbidden' });
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('expires grants and keeps only the most recent folders', async () => {
+    const { mod, sandbox, page } = await setup();
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'index.html'), 0).ok).toBe(true);
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'style.css'), 12 * 60 * 60 * 1000).ok).toBe(true);
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'style.css'), 12 * 60 * 60 * 1000 + 1))
+      .toMatchObject({ ok: false, code: 'forbidden' });
+
+    const now = Date.now();
+    for (let index = 0; index < 65; index += 1) {
+      const dir = path.join(sandbox, `page-${index}`);
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, 'index.html'), '<!doctype html>');
+      fs.writeFileSync(path.join(dir, 'app.js'), '');
+      expect(mod.grantLocalHtmlPreviewAssets(path.join(dir, 'index.html'), now).ok).toBe(true);
+    }
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(sandbox, 'page-0', 'app.js'), now))
+      .toMatchObject({ ok: false, code: 'forbidden' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(sandbox, 'page-64', 'app.js'), now).ok).toBe(true);
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('labels asset content types so browsers apply them', async () => {
+    const mod = await loadMod();
+    expect(['a.css', 'a.js', 'a.mjs', 'a.json', 'a.woff', 'a.woff2', 'a.ttf', 'a.otf', 'a.txt'].map(mod.localPreviewAssetMimeFor)).toEqual([
+      'text/css; charset=utf-8',
+      'text/javascript; charset=utf-8',
+      'text/javascript; charset=utf-8',
+      'application/json; charset=utf-8',
+      'font/woff',
+      'font/woff2',
+      'font/ttf',
+      'font/otf',
+      'application/octet-stream',
+    ]);
+  });
+});

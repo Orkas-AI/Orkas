@@ -2,7 +2,8 @@ import * as fs from 'node:fs';
 import { parentPort, workerData } from 'node:worker_threads';
 import { historyRecordText } from '../chat-history-records';
 import * as store from './chat_store';
-import type { ChatRebuildFile, ChatRebuildBatch } from './chat-rebuild';
+import type { ChatRebuildFile, ChatRebuildBatch, ChatLiveMessage } from './chat-rebuild';
+import type { JsonlAppendSource } from '../../storage';
 
 const uid: string = workerData.userId;
 // Bound ordinary transactions by both record count and extracted characters.
@@ -56,10 +57,58 @@ function rebuildBatch(file: ChatRebuildFile): ChatRebuildBatch {
   return { valid, complete, next };
 }
 
+function validSource(source: JsonlAppendSource): boolean {
+  try {
+    const stat = fs.statSync(source.file);
+    return stat.dev === source.dev && stat.ino === source.ino && stat.size >= source.size
+      && (stat.size > source.size || stat.mtimeMs === source.mtime)
+      && source.offset + source.bytes === source.size;
+  } catch { return false; }
+}
+
+function indexMessage(command: ChatLiveMessage): boolean {
+  const source = command.source;
+  const invalidate = () => {
+    store.dropFileWatermark(uid, command.cid);
+    store.writeSourceStamp(uid, undefined);
+    return false;
+  };
+  let msg: any = command.message;
+  if (source) {
+    if (!validSource(source)) return invalidate();
+    const fd = fs.openSync(source.file, 'r');
+    try {
+      const bytes = Buffer.allocUnsafe(source.bytes);
+      let read = 0;
+      while (read < bytes.length) {
+        const count = fs.readSync(fd, bytes, read, bytes.length - read, source.offset + read);
+        if (!count) return invalidate();
+        read += count;
+      }
+      msg = JSON.parse(bytes.toString('utf8'));
+    } finally { fs.closeSync(fd); }
+    if (!validSource(source)) return invalidate();
+  }
+  const text = msg ? historyRecordText(msg, true) : '';
+  const complete = store.writeLiveMessage(uid, command.cid, command.msgIndex,
+    text ? { cid: command.cid, msgIndex: command.msgIndex, text,
+      role: msg.from || msg.role || '', time: msg.ts || msg.time || '' } : undefined,
+    source ? { mtime: source.mtime, size: source.size, next: command.msgIndex + 1 } : command.mark,
+    source ? { size: source.offset, mtime: source.beforeMtime } : undefined);
+  return source && !validSource(source) ? invalidate() : complete;
+}
+
 parentPort!.on('message', (command) => {
   try {
     let value: unknown;
     if (command.kind === 'batch') value = rebuildBatch(command.file);
+    else if (command.kind === 'live') value = indexMessage(command);
+    else if (command.kind === 'invalidate') {
+      if (command.cid) store.dropFileWatermark(uid, command.cid);
+      store.writeSourceStamp(uid, undefined);
+    } else if (command.kind === 'delete') store.deleteConversation(uid, command.cid);
+    else if (command.kind === 'compact') store.compact(uid);
+    else if (command.kind === 'complete') store.markRebuildComplete(uid, command.stamp);
     else if (command.kind === 'prune') {
       const seen = new Set<string>(command.seen);
       let deleted = 0;

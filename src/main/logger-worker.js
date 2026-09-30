@@ -34,7 +34,15 @@ Object.assign(log, { processInternalErrorFn: () => { writeFailed = true; } });
 for (const stream of [process.stdout, process.stderr]) {
   stream.on('error', () => { safeConsole.level = false; consoleTransport.level = false; });
 }
-try { sweepLogDirectory(workerData.directory, workerData.retainDays, workerData.totalMaxBytes); } catch (_) { /* Failure to sweep must not disable new logs. */ }
+function sweep() {
+  try { sweepLogDirectory(workerData.directory, workerData.retainDays, workerData.totalMaxBytes); }
+  catch (_) { /* Failure to sweep must not disable new logs. */ }
+}
+sweep();
+// An app left running for weeks must still honour the age and size caps, so
+// the boot sweep repeats on a coarse interval that never wakes an idle worker
+// often enough to matter.
+setInterval(sweep, workerData.sweepIntervalMs || 6 * 60 * 60 * 1000).unref();
 
 parentPort.on('message', (message) => {
   // The parent caps messages including those already sent to this port.

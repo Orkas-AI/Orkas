@@ -1,4 +1,4 @@
-import { providerCredentialFailure } from "./provider-error-facts.js";
+import { providerCredentialFailure, providerErrorFacts } from "./provider-error-facts.js";
 
 /** Base error class for core-agent errors. */
 export class CoreAgentError extends Error {
@@ -132,6 +132,7 @@ export type RetryableErrorKind =
 
 export interface RetryErrorPolicyConfig {
   permanent_statuses: number[];
+  /** Deprecated wire compatibility only; never used for retry decisions. */
   permanent_message_patterns: string[];
   permanent_code_patterns: string[];
 }
@@ -172,7 +173,7 @@ const DEFAULT_PERMANENT_PROVIDER_STATUS = [
 ] as const;
 
 const TRANSIENT_CODE_RE =
-  /^(UND_ERR_|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENETDOWN|ENETUNREACH|EPIPE|EAI_AGAIN|ERR_STREAM_PREMATURE_CLOSE|PROVIDER_EMPTY_TRANSPORT)/i;
+  /^(?:UND_ERR_(?:SOCKET|CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT)|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETDOWN|ENETUNREACH|EPIPE|EAI_AGAIN|ERR_STREAM_PREMATURE_CLOSE|PROVIDER_EMPTY_TRANSPORT)$/i;
 
 const TRANSIENT_MESSAGE_REASON_PATTERNS: Array<[RetryableErrorKind, RegExp]> = [
   [
@@ -197,26 +198,19 @@ const TRANSIENT_MESSAGE_REASON_PATTERNS: Array<[RetryableErrorKind, RegExp]> = [
   ],
 ];
 
-const DEFAULT_PERMANENT_MESSAGE_PATTERNS = [
-  /^(?:http\s*)?(?:400|401|402|403|404|405|406|410|411|413|414|415|422)\b|messages?\s+with\s+role\s+['"]?tool['"]?\s+must\s+be\s+a\s+response\s+to\s+a\s+preceding\s+message\s+with\s+['"]?tool_calls/i.source,
-  /insufficient[_\s-]?(balance|quota|credits|funds)|payment[_\s-]?required|balance[_\s-]?not[_\s-]?enough|余额不足|账户余额|积分不足|out of credits|credit[_\s-]?exhausted/i.source,
-  /invalid[_\s-]?api[_\s-]?key|incorrect[_\s-]?api[_\s-]?key|authentication[_\s-]?error|\bunauthorized\b|invalidated[_\s-]+oauth[_\s-]+token|oauth[_\s-]+token.{0,80}\b(invalid|invalidated|expired|revoked)\b|\bforbidden\b|permission[_\s-]?denied|permission[_\s-]?error|access[_\s-]?denied|not[_\s-]?logged[_\s-]?in|sign[_\s-]?in required|session expired|invalid[_\s-]?request(?:[_\s-]?error)?|bad[_\s-]?request|invalid[_\s-]?(argument|parameter|schema|tool)|schema[_\s-]?(validation|error|mismatch)|unsupported[_\s-]?model|model[_\s-]?not[_\s-]?found|no model found|context[_\s-]?(length|overflow|too[_\s-]?long)|prompt (is )?too long|request (entity )?too large|content[_\s-]?policy|content[_\s-]?filter|safety[_\s-]?(violation|policy)|blocked by policy|user (abort|aborted|cancelled|canceled|declined|denied)|request (?:was )?(abort|aborted|cancelled|canceled)|operation (?:was )?(abort|aborted|cancelled|canceled)|aborted by user|abort[_\s-]?error|cancel(?:led|ed)|confirmation required|permission required|tool execution access|path outside|e_path_out_of_scope/i.source,
-];
-
 const DEFAULT_PERMANENT_CODE_PATTERNS = [
-  /^(AUTH_ERROR|CONTEXT_OVERFLOW|OUTPUT_LIMIT|PROVIDER_(NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|EMPTY_NORMAL|EMPTY_SAFETY|EMPTY_UNKNOWN|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)|ABORT_ERR|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|ERR_INVALID_|INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|MODEL_NOT_FOUND|UNSUPPORTED_MODEL|E_PATH_OUT_OF_SCOPE)/i.source,
+  /^(AUTH_ERROR|CONTEXT_OVERFLOW|OUTPUT_LIMIT|PROVIDER_(NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|EMPTY_NORMAL|EMPTY_SAFETY|EMPTY_UNKNOWN|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)|ABORT_ERR|UND_ERR_ABORTED|UND_ERR_INVALID_ARG|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|ERR_INVALID_|INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|MODEL_NOT_FOUND|UNSUPPORTED_MODEL|E_PATH_OUT_OF_SCOPE)/i.source,
 ];
 
 export const DEFAULT_RETRY_ERROR_POLICY: RetryErrorPolicyConfig = Object.freeze({
   permanent_statuses: [...DEFAULT_PERMANENT_PROVIDER_STATUS],
-  permanent_message_patterns: [...DEFAULT_PERMANENT_MESSAGE_PATTERNS],
+  permanent_message_patterns: [],
   permanent_code_patterns: [...DEFAULT_PERMANENT_CODE_PATTERNS],
 });
 
 interface CompiledRetryErrorPolicy {
   config: RetryErrorPolicyConfig;
   permanentProviderStatus: Set<number>;
-  permanentMessagePatterns: RegExp[];
   permanentCodePatterns: RegExp[];
 }
 
@@ -280,7 +274,6 @@ function compileRetryErrorPolicy(config?: Partial<RetryErrorPolicyConfig> | null
   return {
     config: normalized,
     permanentProviderStatus: new Set(normalized.permanent_statuses),
-    permanentMessagePatterns: normalized.permanent_message_patterns.map(compilePattern).filter(Boolean) as RegExp[],
     permanentCodePatterns: normalized.permanent_code_patterns.map(compilePattern).filter(Boolean) as RegExp[],
   };
 }
@@ -293,12 +286,6 @@ export function configureRetryErrorPolicy(config?: Partial<RetryErrorPolicyConfi
 
 export function getRetryErrorPolicy(): RetryErrorPolicyConfig {
   return cloneRetryErrorPolicyConfig(activeRetryErrorPolicy.config);
-}
-
-function isPermanentProviderStatus(policy: CompiledRetryErrorPolicy, statusCode: number | undefined, includeRequestStatus: boolean): boolean {
-  if (!statusCode) return false;
-  if (statusCode === 400) return includeRequestStatus && policy.permanentProviderStatus.has(statusCode);
-  return policy.permanentProviderStatus.has(statusCode);
 }
 
 function retryKindForMessage(message: string): RetryableErrorKind | null {
@@ -408,7 +395,7 @@ const STORAGE_FULL_MESSAGE_RE =
  * This is intentionally a hard runtime rule rather than part of the
  * server-configurable retry policy: retrying or switching model candidates
  * cannot restore writable space and only adds latency and duplicate spend. */
-export function isStorageFullError(err: unknown): boolean {
+export function isStorageFullError(err: unknown, includeDisplayText = true): boolean {
   let cur: unknown = err;
   let depth = 0;
   while (cur && depth < 8) {
@@ -418,7 +405,7 @@ export function isStorageFullError(err: unknown): boolean {
     if (code && STORAGE_FULL_CODE_RE.test(code)) return true;
 
     const message = errorMessageOf(cur);
-    if (message && STORAGE_FULL_MESSAGE_RE.test(message)) return true;
+    if (includeDisplayText && message && STORAGE_FULL_MESSAGE_RE.test(message)) return true;
 
     cur = errorCauseOf(cur);
     depth++;
@@ -426,40 +413,28 @@ export function isStorageFullError(err: unknown): boolean {
   return false;
 }
 
-function retryKindForStatusChain(err: unknown): RetryableErrorKind | null {
-  let cur: unknown = err;
-  let depth = 0;
-  while (cur && depth < 8) {
-    const statusKind = retryKindForProviderStatus(errorStatusOf(cur));
-    if (statusKind) return statusKind;
-    cur = errorCauseOf(cur);
-    depth++;
+function hasPermanentFailureSignal(policy: CompiledRetryErrorPolicy, err: unknown): boolean {
+  const { codes } = providerErrorFacts(err, false);
+  let current = err;
+  for (let depth = 0; current && depth < 8; depth++) {
+    const status = errorStatusOf(current);
+    if (status !== undefined && policy.permanentProviderStatus.has(status)) return true;
+    current = errorCauseOf(current);
   }
-  return null;
+  return codes.some(code =>
+    /^(?:AUTH_ERROR|CONTEXT_OVERFLOW|OUTPUT_LIMIT|RETRY_EXHAUSTED|SESSION_PERSISTENCE_FAILED|TASK_TOKEN_LIMIT_REACHED|TOOL_RESULT_PERSISTENCE_FAILED|ABORT_ERR|UND_ERR_ABORTED|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|PROVIDER_(?:NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|EMPTY_NORMAL|EMPTY_SAFETY|EMPTY_UNKNOWN|NETWORK_EXHAUSTED|RETRIES_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED))$/i.test(code)
+    || policy.permanentCodePatterns.some(pattern => pattern.test(code)));
 }
 
-function hasPermanentFailureSignal(policy: CompiledRetryErrorPolicy, err: unknown, includeRequestStatus: boolean): boolean {
-  let cur: unknown = err;
-  let depth = 0;
-  while (cur && depth < 8) {
-    const status = errorStatusOf(cur);
-    if (isPermanentProviderStatus(policy, status, includeRequestStatus)) return true;
-
-    const msg = errorMessageOf(cur);
-    if (msg && policy.permanentMessagePatterns.some((pattern) => pattern.test(msg))) return true;
-
-    const code = errorCodeOf(cur);
-    // The rotating provider already reached a terminal pre-commit outcome:
-    // either it exhausted its safe candidates/retries or deliberately stopped
-    // on an ambiguous empty response. Retrying at AgentRunner level would
-    // repeat that decision regardless of server-supplied policy overrides.
-    if (/^PROVIDER_(NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|EMPTY_NORMAL|EMPTY_SAFETY|EMPTY_UNKNOWN|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)$/.test(code)) return true;
-    if (code && policy.permanentCodePatterns.some((pattern) => pattern.test(code))) return true;
-
+/** Legacy display normalization only. Never use prose to decide retry/rotation. */
+export function classifyTransientNetworkErrorForDisplay(err: unknown): RetryableErrorKind | null {
+  let cur = err;
+  for (let depth = 0; cur && depth < 8; depth++) {
+    const kind = retryKindForMessage(errorMessageOf(cur));
+    if (kind) return kind;
     cur = errorCauseOf(cur);
-    depth++;
   }
-  return false;
+  return classifyTransientNetworkError(err);
 }
 
 export function classifyTransientNetworkError(err: unknown): RetryableErrorKind | null {
@@ -470,29 +445,22 @@ export function classifyTransientNetworkErrorWithPolicy(
   err: unknown,
   _config?: Partial<RetryErrorPolicyConfig> | null,
 ): RetryableErrorKind | null {
-  let cur: unknown = err;
-  let depth = 0;
-  while (cur && depth < 8) {
-    const msg = errorMessageOf(cur);
-    if (msg) {
-      const kind = retryKindForMessage(msg);
-      if (kind) return kind;
-    }
-    const code = errorCodeOf(cur);
-    if (code && TRANSIENT_CODE_RE.test(code)) {
-      if (/TIMED?OUT/i.test(code)) return "timeout";
-      if (/ECONNREFUSED|ENETUNREACH|ENETDOWN|EAI_AGAIN/i.test(code)) return "network";
+  const { status, codes } = providerErrorFacts(err, false);
+  const statusKind = retryKindForProviderStatus(status);
+  if (statusKind) return statusKind;
+  for (const code of codes) {
+    if (code === "TIMEOUT" || /^(?:ETIMEDOUT|UND_ERR_(?:CONNECT|HEADERS|BODY)_TIMEOUT)$/i.test(code)) return "timeout";
+    if (TRANSIENT_CODE_RE.test(code)) {
+      if (/^(?:ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|ENETDOWN|EAI_AGAIN)$/i.test(code)) return "network";
       return "connection_dropped";
     }
-    cur = errorCauseOf(cur);
-    depth++;
   }
   return null;
 }
 
 /** Only explicit throttling ends a run as a rate-limit failure. */
 export function isProviderRateLimitError(err: unknown): boolean {
-  return !isProviderSafetyError(err) && providerCredentialFailure(err) === "rate_limit";
+  return !isProviderSafetyError(err) && providerCredentialFailure(err, false) === "rate_limit";
 }
 
 export function classifyRetryableError(err: unknown): RetryableErrorKind | null {
@@ -527,19 +495,14 @@ export function classifyRetryableErrorWithPolicy(
 
   // Storage exhaustion is never retryable, even when a runtime policy
   // replaces the ordinary permanent-status/message/code blacklists.
-  if (isStorageFullError(err)) return null;
+  if (isStorageFullError(err, false)) return null;
 
-  // Hard permanent signals should win even if a wrapper adds generic text
-  // like "fetch failed" outside the real provider error.
-  if (hasPermanentFailureSignal(policy, err, false)) return null;
+  // Structured permanent facts take precedence over transient wrappers.
+  if (providerCredentialFailure(err, false)) return null;
+  if (hasPermanentFailureSignal(policy, err)) return null;
 
   const transientKind = classifyTransientNetworkError(err);
   if (transientKind) return transientKind;
-
-  const statusKind = retryKindForStatusChain(err);
-  if (statusKind) return statusKind;
-
-  if (hasPermanentFailureSignal(policy, err, true)) return null;
 
   if (err instanceof TimeoutError) return "timeout";
 
@@ -553,22 +516,7 @@ export function isRetryableError(err: unknown): boolean {
   return classifyRetryableError(err) !== null;
 }
 
-/**
- * Detect transient network / stream failures that warrant a retry:
- *   - slow first-byte / response-header waits: "Codex SSE response headers timed out after 10000ms"
- *   - undici SSE body cutoff: `TypeError { message: "terminated", cause: SocketError }`
- *   - Node fetch front-door: `TypeError { message: "fetch failed", cause: ... }`
- *   - WebSocket stream drops surfaced by hosted/OAuth transports as a bare
- *     "WebSocket error" / close marker
- *   - Provider/SDK stream-close variants: "connection closed", "stream
- *     disconnected", "ERR_STREAM_PREMATURE_CLOSE", "read ECONNRESET"
- *   - Raw socket codes: ECONNRESET / ETIMEDOUT / ECONNREFUSED / ENETDOWN / EPIPE / EAI_AGAIN
- *   - undici named codes: UND_ERR_SOCKET / UND_ERR_CONNECT_TIMEOUT / UND_ERR_HEADERS_TIMEOUT / UND_ERR_BODY_TIMEOUT
- *
- * Matches both `err.message` and the cause chain (depth-limited) because
- * pi-ai / pi-provider may have already wrapped the original error, losing
- * the instanceof relationship but preserving the string.
- */
+/** Detect transient status/code evidence through bounded SDK cause chains. */
 export function isTransientNetworkError(err: unknown): boolean {
   return classifyTransientNetworkError(err) !== null;
 }

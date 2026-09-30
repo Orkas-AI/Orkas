@@ -469,6 +469,16 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       expect(browserHost.openModelWebAssist).toHaveBeenCalledWith(TEST_UID, cid, { url: 'https://example.com/settings' });
       const observed = await call({ operation: 'observe', tab_id: '0123456789ab' });
       expect(JSON.parse(observed.content[0].text)).toMatchObject({ page_id: 'page-1', untrusted_content: true });
+      const article = '# 中文文章\n\n|字段|值|\n|---|---|\n|正文|完整|\n'.repeat(4000).slice(0, 100000);
+      expect(article.length).toBe(100000);
+      const fill = { operation: 'act', tab_id: '0123456789ab', page_id: 'page-1', element_ref: 'e1', page_action: 'fill' };
+      const filled = await call({ ...fill, text: article });
+      expect(filled.isError).toBeFalsy();
+      expect(browserHost.actOnModelWebAssist).toHaveBeenCalledWith(TEST_UID, cid,
+        expect.objectContaining({ action: 'fill', text: article }), expect.anything());
+      const dispatched = browserHost.actOnModelWebAssist.mock.calls.length;
+      expect((await call({ ...fill, text: article + 'x' })).isError).toBe(true);
+      expect(browserHost.actOnModelWebAssist).toHaveBeenCalledTimes(dispatched);
       // The host owns safety and stale-page decisions; MCP must preserve both
       // the error status and the actionable receipt instead of hiding its code.
       for (const code of ['stale_page', 'user_action_required', 'unknown_tab']) {
@@ -707,8 +717,8 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         expect(await autoTasks.getTask(TEST_UID, automationId)).toBeNull();
 
         await autoTasks.deleteTask(TEST_UID, global.task.id);
-        const empty = await client.request(3, 'tools/call', { name: 'todo_tasks', arguments: { action: 'list' } });
-        expect(JSON.parse(empty.result.content[0].text)).toMatchObject({ ok: true, tasks: [], next_offset: null });
+        const empty = await client.request(3, 'tools/call', { name: 'todo_tasks', arguments: { action: 'list', task_id: 'x' } });
+        expect(JSON.parse(empty.result.content[0].text)).toMatchObject({ ok: true, tasks: [], next_offset: null, ignored_fields: ['task_id'] });
         const foreignScope = bound ? '' : pid;
         const foreignTodo = await tasks.createTask(TEST_UID, foreignScope, { content: 'Foreign scope todo' });
         if (!foreignTodo.ok) throw new Error('foreign todo fixture failed');
@@ -720,15 +730,37 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
           expect(await tasks.getTask(TEST_UID, foreignScope, foreignTodo.task.id)).toEqual(foreignTodo.task);
         }
         await tasks.deleteTask(TEST_UID, foreignScope, foreignTodo.task.id);
-        const creation = await client.request(8, 'tools/call', { name: 'todo_tasks', arguments: { action: 'create', content: 'Read only when requested' } });
+        const creation = await client.request(8, 'tools/call', { name: 'todo_tasks', arguments: { action: 'create', task_id: '.', content: 'Read only when requested' } });
         expect(creation.result.isError).toBeFalsy();
+        expect(JSON.parse(creation.result.content[0].text)).toMatchObject({ ok: true, ignored_fields: ['task_id'], outcome: 'task_created' });
+        expect(JSON.parse(creation.result.content[0].text).task.id).not.toBe('.');
         const fresh = await client.request(4, 'tools/call', { name: 'todo_tasks', arguments: { action: 'list' } });
         expect(JSON.parse(fresh.result.content[0].text).tasks).toContainEqual(expect.objectContaining({ content: 'Read only when requested' }));
         const denied = await client.request(5, 'tools/call', { name: 'todo_tasks', arguments: { action: 'complete', task_id: 'forged' } });
         expect(denied.result?.isError || denied.error).toBeTruthy();
         const task = (await tasks.listTasks(TEST_UID, scope))[0];
         expect(task.status).toBe('todo');
+        expect(task).not.toHaveProperty('assignee_uid');
         expect(task.origin_cid).toBeUndefined();
+        const { chatAttachmentDirForConversation } = await import('../../../../src/main/util/project-layout');
+        const sourceDir = chatAttachmentDirForConversation(TEST_UID, `c-tasks-${bound}`);
+        fs.mkdirSync(sourceDir, { recursive: true });
+        const source = path.join(sourceDir, 'brief.txt');
+        fs.writeFileSync(source, 'Review these actual bytes');
+        expect(tool.inputSchema.properties.action.enum).toContain('add_attachment');
+        const attached = await client.request(2010, 'tools/call', { name: 'todo_tasks', arguments: {
+          action: 'add_attachment', task_id: task.id, source_path: source,
+        } });
+        expect(attached.result.isError).toBeFalsy();
+        expect(JSON.parse(attached.result.content[0].text).task.attachments).toEqual(['brief.txt']);
+        expect(await tasks.listTaskAttachments(TEST_UID, scope, task.id)).toEqual(['brief.txt']);
+        const foreignSource = path.join(tmpDir, 'foreign-file.txt'); fs.writeFileSync(foreignSource, 'private');
+        const refused = await client.request(2011, 'tools/call', { name: 'todo_tasks', arguments: {
+          action: 'add_attachment', task_id: task.id, source_path: foreignSource,
+        } });
+        expect(refused.result?.isError || refused.error).toBeTruthy();
+        expect(await tasks.listTaskAttachments(TEST_UID, scope, task.id)).toEqual(['brief.txt']);
+        const taskAfterAttachment = await tasks.getTask(TEST_UID, scope, task.id);
         let invalidStatusId = 29;
         for (const status of ['blocked', 'cancelled', 'in_progress', 'in_review']) {
           for (const args of [
@@ -737,12 +769,14 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
           ]) {
             const rejected = await client.request(invalidStatusId++, 'tools/call', { name: 'todo_tasks', arguments: args });
             expect(rejected.result?.isError || rejected.error).toBeTruthy();
-            expect(await tasks.listTasks(TEST_UID, scope)).toEqual([task]);
+            expect(await tasks.listTasks(TEST_UID, scope)).toEqual([taskAfterAttachment]);
           }
         }
         const update = await client.request(6, 'tools/call', { name: 'todo_tasks', arguments: { action: 'update', task_id: task.id, status: 'review', result_ref: 'artifact-1', content: 'Edited through MCP\nRetained requirement' } });
         expect(update.result.isError).toBeFalsy();
+        expect(JSON.parse(update.result.content[0].text)).toMatchObject({ ok: true });
         expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'review', result_ref: 'artifact-1', content: 'Edited through MCP\nRetained requirement' });
+        expect(await tasks.getTask(TEST_UID, scope, task.id)).not.toHaveProperty('assignee_uid');
         const complete = await client.request(7, 'tools/call', { name: 'todo_tasks', arguments: { action: 'complete', task_id: task.id, result_ref: 'verified-1' } });
         expect(complete.result.isError).toBeFalsy();
         expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'done', result_ref: 'verified-1' });
@@ -752,10 +786,20 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         expect(reopened.task).not.toHaveProperty('origin_cid');
         const reread = await client.request(28, 'tools/call', { name: 'todo_tasks', arguments: { action: 'list' } });
         expect(JSON.parse(reread.result.content[0].text).tasks).toContainEqual(expect.objectContaining({ id: task.id, status: 'todo' }));
-        const queryTodo = { action: 'list', offset: 0, limit: 50, status: 'todo' };
+        const queryTodo = { action: 'list', offset: 0, limit: 50, status: 'todo', task_id: 'x' };
         const page = await client.request(93, 'tools/call', { name: 'todo_tasks', arguments: queryTodo });
         expect(JSON.parse(page.result.content[0].text)).toEqual(JSON.parse((await native.execute(queryTodo, { state: {} })).content));
         expect(JSON.parse(page.result.content[0].text).tasks[0]).not.toHaveProperty('detail');
+        for (const task_id of ['', null, { unused: true }]) {
+          const ignored = await client.request(2000, 'tools/call', { name: 'todo_tasks', arguments: { action: 'list', task_id } });
+          expect(ignored.result.isError).toBeFalsy();
+          expect(JSON.parse(ignored.result.content[0].text)).toMatchObject({ ok: true, ignored_fields: ['task_id'], total: 1 });
+          for (const action of ['get', 'update', 'complete']) {
+            const invalid = await client.request(2001, 'tools/call', { name: 'todo_tasks', arguments: { action, task_id, ...(action === 'update' ? { status: 'done' } : {}) } });
+            expect(invalid.result?.isError || invalid.error).toBeTruthy();
+            expect((await tasks.getTask(TEST_UID, scope, task.id))?.status).toBe('todo');
+          }
+        }
         const detail = await client.request(94, 'tools/call', { name: 'todo_tasks', arguments: { action: 'get', task_id: task.id } });
         expect(JSON.parse(detail.result.content[0].text).task).toMatchObject({ content: 'Edited through MCP\nRetained requirement', result_ref: 'verified-1' });
         const legacy = await client.request(95, 'tools/call', { name: 'todo_tasks', arguments: {
@@ -771,6 +815,15 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         } });
         expect(rejectedScope.result.isError).toBe(true);
         expect((await tasks.listTasks(TEST_UID, scope)).some(item => item.content === 'Must not write')).toBe(false);
+        const deleted = await client.request(2012, 'tools/call', { name: 'todo_tasks', arguments: {
+          action: 'delete', task_id: task.id,
+        } });
+        expect(deleted.result.isError).toBeFalsy();
+        expect(JSON.parse(deleted.result.content[0].text)).toEqual({ ok: true, task_id: task.id, deleted: true });
+        expect(await tasks.getTask(TEST_UID, scope, task.id)).toBeNull();
+        expect(await tasks.listTaskAttachments(TEST_UID, scope, task.id)).toEqual([]);
+        expect((await tasks.listTasks(TEST_UID, scope)).map(item => item.id)).toEqual([migrated.id]);
+
       } finally {
         client.kill();
         await client.waitForExit();

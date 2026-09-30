@@ -47,6 +47,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await drainMainRuntimeForTest();
+  await (await import('../../../src/main/features/conversation-history-client')).closeConversationHistoryWorker();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -316,7 +317,7 @@ describe('chats › message history tombstones', () => {
     expect(earlier.nextCursor).toBeNull();
   });
 
-  it('loads from the search target page through the newest message', async () => {
+  it('bounds a search hit and reaches the remaining records through both cursors', async () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID, { title: 'search target' });
     const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
@@ -334,12 +335,17 @@ describe('chats › message history tombstones', () => {
     expect(page.pageStart).toBe(20);
     expect(page.history.map((row) => row.id)).toEqual([
       'm20', 'm21', 'm22', 'm23', 'm24', 'm25', 'm26', 'm27', 'm28', 'm29',
-      'm30', 'm31', 'm32', 'm33', 'm34',
     ]);
     expect(page.historyIndexes).toEqual([
-      20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+      20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
     ]);
     expect(page.nextCursor).not.toBeNull();
+    const following = await chats.getMessagesPageAfter(TEST_UID, conv.conversation_id, page.followingCursor!, 10);
+    expect(following.history.map(row => row.id)).toEqual(['m30', 'm31', 'm32', 'm33', 'm34']);
+    expect(following.followingCursor).toBeNull();
+    const preceding = await chats.getMessagesPage(TEST_UID, conv.conversation_id, 20, page.nextCursor);
+    expect([...preceding.history, ...page.history, ...following.history].map(row => row.id))
+      .toEqual(Array.from({ length: 35 }, (_, i) => `m${i}`));
   });
 
   it('keeps source indexes aligned when an anchored page contains tombstones or legacy rows', async () => {
@@ -360,7 +366,7 @@ describe('chats › message history tombstones', () => {
     expect(page.pageStart).toBe(20);
     expect(page.history.map((row) => row.text)).toContain('legacy target without identity');
     expect(page.historyIndexes).toEqual([
-      20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+      20, 22, 23, 24, 25, 26, 27, 28, 29,
     ]);
   });
 
@@ -454,18 +460,7 @@ describe('chats › conversation turn navigation index', () => {
     expect(Array.from(first.turns[0].assistantPreview)).toHaveLength(80);
     expect(first.turns[0].assistantPreview).not.toContain('hidden dispatch');
     expect(first.turns[0].messageIndex).toBe(0);
-    expect(loggerMocks.warn).toHaveBeenCalledWith(
-      'conversation turn index skipped malformed records',
-      expect.objectContaining({
-        file: expect.objectContaining({ path_hash: expect.any(String) }),
-        error: expect.objectContaining({
-          name: 'SyntaxError',
-          message_hash: expect.any(String),
-          message_chars: expect.any(Number),
-        }),
-      }),
-    );
-    expect(JSON.stringify(loggerMocks.warn.mock.calls)).not.toContain('{malformed');
+    // Worker-local diagnostic redaction is covered by conversation-turn-index.test.ts.
 
     const indexFile = path.join(
       tmpDir, TEST_UID, 'local', 'search', 'conversation-turns',
@@ -499,17 +494,7 @@ describe('chats › conversation turn navigation index', () => {
       userPreview: 'second',
       assistantPreview: 'second reply · extra detail',
     });
-    expect(loggerMocks.info).toHaveBeenCalledWith(
-      'conversation turn index extended',
-      expect.objectContaining({
-        appended_bytes: expect.any(Number),
-        records: 3,
-        turns: 2,
-      }),
-    );
-    expect(loggerMocks.info).not.toHaveBeenCalledWith(
-      'conversation turn index rebuilt', expect.anything(),
-    );
+    expect(JSON.parse(fs.readFileSync(indexFile, 'utf8')).recordCount).toBe(6);
     await expect(chats.findMessageIndexById(
       TEST_UID, conv.conversation_id, 'u2',
     )).resolves.toBe(3);
@@ -537,13 +522,6 @@ describe('chats › conversation turn navigation index', () => {
     const rebuilt = await chats.getConversationTurnPage(TEST_UID, conv.conversation_id);
     expect(rebuilt.total).toBe(2);
     expect(rebuilt.turns.map((turn) => turn.messageId)).toEqual(['new-u1', 'new-u2']);
-    expect(loggerMocks.info).toHaveBeenCalledWith(
-      'conversation turn index rebuilt',
-      expect.objectContaining({ records: 3, turns: 2 }),
-    );
-    expect(loggerMocks.info).not.toHaveBeenCalledWith(
-      'conversation turn index extended', expect.anything(),
-    );
   });
 
   it('purges the local derived turn index with its conversation', async () => {
@@ -2283,29 +2261,5 @@ describe('chats › message display context memo', () => {
       readSpy.mockRestore();
       syncBuiltinESMExports();
     }
-  });
-});
-
-
-describe('chats › conversation turn index memory', () => {
-  it('keeps only the most recently used turn indexes resident', async () => {
-    // A whole turn index per visited conversation stayed in memory until the
-    // conversation was deleted (D-10); the memory is now an LRU of 64.
-    const chats = await loadChats();
-    const cids: string[] = [];
-    for (let i = 0; i < 66; i += 1) {
-      const conv = await chats.createConversation(TEST_UID, { title: `turn memory ${i}` });
-      const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
-      fs.writeFileSync(file, `${JSON.stringify({
-        id: `u${i}`, ts: '2026-07-10T10:00:00Z', from: 'user', to: ['commander'], text: `turn ${i}`,
-      })}\n`);
-      cids.push(conv.conversation_id);
-    }
-    for (const cid of cids) await chats.getConversationTurnPage(TEST_UID, cid);
-    expect(chats._conversationTurnIndexMemorySizeForTest()).toBe(64);
-    // The most recent visit is the one still served from memory; the first
-    // two visits were evicted.
-    const page = await chats.getConversationTurnPage(TEST_UID, cids[65]);
-    expect(page.total).toBe(1);
   });
 });

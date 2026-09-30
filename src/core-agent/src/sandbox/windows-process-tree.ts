@@ -10,7 +10,10 @@ export function windowsTreeCleanupCommand(pid: number): string {
 
 const SCRIPT = String.raw`
 function Read-ProcessSnapshot {
-  $query = [System.Management.ManagementObjectSearcher]::new('SELECT ProcessId,ParentProcessId,CreationDate FROM Win32_Process')
+  # Older processes cannot descend from the pinned root. Filter at the WMI
+  # boundary so concurrent cancellations do not materialize every host process.
+  $since = [System.Management.ManagementDateTimeConverter]::ToDmtfDateTime($owned[$targetProcessId].Started)
+  $query = [System.Management.ManagementObjectSearcher]::new("SELECT ProcessId,ParentProcessId,CreationDate FROM Win32_Process WHERE CreationDate >= '$since'")
   $rows = $null
   try {
     $rows = $query.Get()
@@ -30,11 +33,13 @@ function Read-ProcessSnapshot {
 }
 $ErrorActionPreference = 'Stop'
 $owned = @{}
+$ordered = [Collections.Generic.List[object]]::new()
 $result = 1
 try {
   $root = [Diagnostics.Process]::GetProcessById($targetProcessId)
   $null = $root.Handle
   $owned[$targetProcessId] = @{ Process = $root; Started = $root.StartTime.ToUniversalTime() }
+  $ordered.Add($owned[$targetProcessId])
   [Console]::Out.WriteLine('ready')
   [Console]::Out.Flush()
   if ([Console]::In.ReadLine() -cne 'go') { $result = 0; return }
@@ -62,6 +67,7 @@ try {
           $ticks = $started.Ticks - ($started.Ticks % 10)
           if ($ticks -ne $row.CreationDate.ToUniversalTime().Ticks) { continue }
           $owned[$id] = @{ Process = $candidate; Started = $started }
+          $ordered.Add($owned[$id])
           $candidate = $null
           $added++
         } catch [ArgumentException] {
@@ -74,7 +80,9 @@ try {
 
     # Stop producers first, retaining their handles for the next snapshot.
     # A child created during this sweep remains linked to a pinned parent.
-    foreach ($entry in @($owned.Values | Sort-Object Started)) {
+    # Discovery only adds a child after its parent, so this order already
+    # stops producers first without a sort or PowerShell module auto-loading.
+    foreach ($entry in $ordered) {
       try {
         if (-not $entry.Process.HasExited) { $entry.Process.Kill() }
         if (-not $entry.Process.WaitForExit(500)) { throw 'termination_incomplete' }

@@ -46,6 +46,7 @@ function isProviderUrl(rawUrl: string): boolean {
     || isHostOrSubdomain(hostname, 'chatgpt.com')
     || isHostOrSubdomain(hostname, 'moonshot.cn')
     || isHostOrSubdomain(hostname, 'moonshot.ai')
+    || hostname === 'api.deepseek.com'
     || hostname === 'generativelanguage.googleapis.com'
     || hostname === 'aiplatform.googleapis.com'
     || hostname.endsWith('-aiplatform.googleapis.com')

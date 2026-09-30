@@ -66,8 +66,10 @@ function Read-ProcessSnapshot {
   $rows = @(& $script:originalSnapshot)
   # Model a stale parent id after PID reuse: this unrelated process predates
   # the owned root, so even a matching parent id must never authorize a kill.
-  $older = $rows | Where-Object { $_.ProcessId -eq ${sibling.pid} }
-  $rows += [pscustomobject]@{ ProcessId = ${sibling.pid}; ParentProcessId = ${root.pid}; CreationDate = $older.CreationDate }
+  $older = [Diagnostics.Process]::GetProcessById(${sibling.pid})
+  try {
+    $rows += [pscustomobject]@{ ProcessId = ${sibling.pid}; ParentProcessId = ${root.pid}; CreationDate = $older.StartTime.ToUniversalTime() }
+  } finally { $older.Dispose() }
   if (-not $script:triggered) {
     $script:triggered = $true
     [IO.File]::WriteAllText(${quote(path.join(dir, "snapshot.json"))}, (ConvertTo-Json -InputObject @($rows.ProcessId)))

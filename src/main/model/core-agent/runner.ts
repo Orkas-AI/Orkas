@@ -19,6 +19,7 @@
 
 import type { AgentTool, HistoryResource, LLMProvider, Message, ToolContext, ToolResult } from '#core-agent';
 import type { Api, Model } from '@earendil-works/pi-ai';
+import { getAgentIdleClock } from '../../util/system-activity';
 import { customModelImageSupport } from './custom-model-image-support';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -49,8 +50,8 @@ import {
   toolResultsDirForSession,
 } from './session-store';
 import {
-  removeEntry,
   listEntries,
+  removeEntry,
   formatForSystemPrompt as formatMemoryForSystemPrompt,
   type MemoryScope,
 } from '../../features/memory';
@@ -298,6 +299,8 @@ export interface BuildRunnerParams {
   /** Optional one-time soft convergence threshold. Undefined preserves the
    *  core-agent default; this does not change the hard tool-loop limit. */
   elapsedConvergenceMs?: number;
+  /** Host awake clock shared with the outer idle watchdog. */
+  idleNow?: () => number;
   /** Provider stream deadline before its first usable text/tool event. This
    * boundary is safe for fallback because no visible output has committed. */
   providerFirstEventTimeoutMs?: number;
@@ -721,7 +724,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   if (uid && memoryAgentScope && (params.projectId || isCommander || isGroupAgent)) {
     const cid = params.cid || '';
     const { createProjectTasksHandler: createBoundHandler } = await import('../../features/project_tasks_tool_handler');
-    const createProjectTasksHandler = (pid: string) => createBoundHandler(uid, pid, cid, agentDisplayNameById, { actorId: isCommander ? 'commander' : memoryAgentScope });
+    const createProjectTasksHandler = (pid: string) => createBoundHandler(uid, pid, cid, agentDisplayNameById,
+      { actorId: isCommander ? 'commander' : memoryAgentScope }, { sourceProjectId: params.projectId || '' });
     const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
     if (params.projectId || isGroupAgent) {
       injectedTools.push(createProjectTasksTool(createProjectTasksHandler(params.projectId || ''), {
@@ -753,8 +757,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
             return {
               ok: false,
               error: candidates.length
-                ? 'project_ambiguous: ask the user to choose a project, then use its project_id'
-                : 'project_not_found: use list_projects to find an existing project in this account',
+                ? 'project_ambiguous: multiple projects match this name'
+                : 'project_not_found: no matching project in this account',
               ...(candidates.length ? { candidates } : {}),
             };
           }
@@ -1598,6 +1602,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     : undefined;
 
   const runner = new mod.AgentRunner({
+    idleNow: params.idleNow ?? await getAgentIdleClock(),
     config,
     providers,
     session,

@@ -67,7 +67,7 @@ describe('createCrossSessionMemoryTool', () => {
       expect(properties.target.description).toContain('user: stable user-wide profile/preferences');
       expect(properties.action.description).toContain('already injected');
       expect(properties.action.description).toContain('use list only');
-      expect(properties.action.description).toContain('Omit unrelated fields');
+      expect(properties.action.description).toContain('ignored_fields');
       expect(def.inputSchema.additionalProperties).toBe(false);
       expect(def.inputSchema.oneOf).toBeUndefined();
       expect(warn).not.toHaveBeenCalled();
@@ -205,6 +205,8 @@ describe('cross_session_memory › list', () => {
     expect(handler.list).toHaveBeenCalledWith('user');
     expect(handler.add).not.toHaveBeenCalled();
     expect(handler.replace).not.toHaveBeenCalled();
+    expect(JSON.parse(result.content).ignored_fields).toEqual(['content']);
+    expect(result.content).not.toContain('unrelated');
   });
 });
 

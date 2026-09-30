@@ -27,7 +27,7 @@ function setup() {
       getConversationMetadata: vi.fn(async () => { clock = 100; return { project_id: null }; }),
       getMessagesPage: vi.fn(() => history),
     },
-    groupChat: { runtimeStatus: vi.fn(() => runtime), displaySnapshot: vi.fn(() => ({ sequence: 7, turns: [] })) },
+    groupChat: { runtimeStatus: vi.fn(() => runtime), displaySnapshot: vi.fn(async () => ({ sequence: 7, turns: [] })) },
   };
   const handler = vm.runInNewContext(`(${handlerSource})`, context);
   return {

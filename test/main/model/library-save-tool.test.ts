@@ -33,7 +33,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 const PID = 'p_aaaaaaaaaaaa';

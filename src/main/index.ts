@@ -29,7 +29,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { app, BrowserWindow, Menu, Notification, ipcMain, nativeImage, net, protocol, session, shell } from 'electron';
+import { app, BrowserWindow, Menu, Notification, type Tray, ipcMain, nativeImage, net, protocol, session, shell } from 'electron';
 // Side-effect import: at module-load time this resolves the install
 // container, runs the one-shot PC/data → <container>/data migration, and
 // sets process.env.ORKAS_WORKSPACE_ROOT. Must be the FIRST project import
@@ -39,11 +39,13 @@ import { app, BrowserWindow, Menu, Notification, ipcMain, nativeImage, net, prot
 // after paths.ts loads, which is too late to set the env var).
 import './install-data-root.cjs';
 import { resolveCliCommand } from './features/local_agents/spawn-command';
+import { createOptionalTray } from './util/app-tray';
 import { desktopPlatform, osVersion, preferredSystemLanguage } from './system_info';
 import {
   hardenedWebPreferences,
   installExternalNavigationGuard,
   installHtmlPreviewNavigationGuard,
+  withHtmlPreviewAssetPolicy,
   withHtmlPreviewPolicy,
 } from './util/window-security';
 import {
@@ -55,6 +57,7 @@ import {
 import { resolveContainedProtocolFile } from './util/protocol-path';
 
 const APP_USER_MODEL_ID = 'com.orkas.desktop';
+const APP_DISPLAY_NAME = 'Orkas';
 const E2E_USER_DATA_DIR = !app.isPackaged
   ? String(process.env.ORKAS_E2E_USER_DATA_DIR || '').trim()
   : '';
@@ -65,6 +68,9 @@ const PACKAGED_LAUNCH_SMOKE_FILE = app.isPackaged
   ? String(process.env.ORKAS_PACKAGED_LAUNCH_SMOKE_FILE || '').trim()
   : '';
 const IS_PACKAGED_LAUNCH_SMOKE = !!PACKAGED_LAUNCH_SMOKE_FILE;
+let appTray: Tray | null = null;
+const mainWindows = new Set<BrowserWindow>();
+let isQuitting = false;
 const MARKETPLACE_DEFAULTS_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const MARKETPLACE_SERVER_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const MARKETPLACE_DEFAULTS_RETRY_DELAYS_MS = [3_000, 3_000, 3_000] as const;
@@ -105,9 +111,12 @@ protocol.registerSchemesAsPrivileged([
   // `Accept-Ranges: bytes` and serve `206` itself (see `serveFileRange`).
   // Without that, `<video preload="metadata">` freezes a few seconds in
   // because Chromium can't resume past the cancelled metadata-probe fetch.
+  // `corsEnabled` lets an HTML preview (opaque-origin sandbox) load its
+  // same-folder fonts, module scripts and fetch() data; only responses that
+  // carry an explicit grant (`withHtmlPreviewAssetPolicy`) become readable.
   {
     scheme: 'chat-media',
-    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true },
   },
   // `chat-app://cid/<encCid>/<encArtifactId>/<relpath>` serves chat artifacts;
   // `chat-app://saved/<encAppId>/<relpath>` serves user-kept "My Apps" bundles.
@@ -178,7 +187,7 @@ void installEnvProxyDispatcher();
 import { installFetchDiag } from './model/core-agent/fetch-diag';
 installFetchDiag();
 
-import { subscribeTaskTerminals, type TaskTerminalEvent } from './features/group_chat/bus';
+import { hasActiveWork, subscribeTaskTerminals, type TaskTerminalEvent } from './features/group_chat/bus';
 import { setFetchImplementation } from './util/retry';
 setFetchImplementation((input, init) => net.fetch(input as Parameters<typeof net.fetch>[0], init));
 
@@ -208,7 +217,10 @@ import * as savedApps from './features/saved_apps';
 import { appResource } from './features/web_apps/host';
 import * as clientConfigFeature from './features/client_config';
 import * as connectorsFeature from './features/connectors';
+import * as windowState from './features/window_state';
+import { installWindowCloseConfirmation } from './features/window_close_confirmation';
 import * as taskNotifications from './features/task_notifications';
+import * as taskUnreadTray from './features/task_unread_tray';
 import * as notificationPermissions from './features/notification_permissions';
 import {
   startOpenLifecycleTracking,
@@ -218,7 +230,6 @@ import {
   consumeColdLaunchConnectorCallback,
   registerConnectorProtocol,
 } from './features/connectors/protocol';
-import * as windowState from './features/window_state';
 // Server-backed account, multi-device sync, remote-control relay, and
 // auto-update features are stripped in the open-source build. Connectors remain available
 // through the open server bridge.
@@ -290,6 +301,9 @@ function createWindow(): BrowserWindow {
       plugins: true,
     }),
   });
+  mainWindows.add(win);
+  win.on('focus', () => taskUnreadTray.refreshTaskUnreadTray());
+  installWindowCloseConfirmation(win, hasActiveWork, () => isQuitting);
   windowState.watchWindowState(win);
   // maximize() also shows a hidden native window.
   if (restored.isMaximized && !E2E_HIDE_WINDOW) win.maximize();
@@ -309,6 +323,7 @@ function createWindow(): BrowserWindow {
     mainRendererReady = false;
   });
   win.on('closed', () => {
+    mainWindows.delete(win);
     mainRendererReady = false;
   });
 
@@ -351,6 +366,28 @@ function createWindow(): BrowserWindow {
   });
 
   return win;
+}
+
+function showMainWindow(): BrowserWindow {
+  const win = [...mainWindows].find((candidate) => !candidate.isDestroyed()) || createWindow();
+  if (win.isFocusable()) {
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    win.focus();
+  }
+  return win;
+}
+
+function createAppTray(): void {
+  const iconPath = path.join(paths.SRC_ROOT, 'resources', 'icons',
+    process.platform === 'darwin' ? 'whaleTemplate.png' : 'icon.ico');
+  appTray = createOptionalTray({
+    platform: process.platform,
+    iconPath,
+    displayName: APP_DISPLAY_NAME,
+    onActivate: () => { showMainWindow(); },
+    warn: message => log.warn(message),
+  });
 }
 
 function openConversationFromTaskNotification(
@@ -1113,7 +1150,8 @@ function registerChatMediaProtocol(): void {
     try {
       // Two route shapes, dispatched by URL host:
       //   chat-media://cid/<encCid>/<encName>      — per-conversation attachment
-      //   chat-media://local/<abs-path-no-leading-slash>  — any local media file
+      //   chat-media://local/<abs-path-no-leading-slash>  — any local media file,
+      //     plus same-folder assets of an HTML page the file viewer granted
       let u: URL;
       try { u = new URL(reqUrl); }
       catch {
@@ -1161,6 +1199,24 @@ function registerChatMediaProtocol(): void {
           // path validation errors ('path must be absolute' / 'path required') re-raise.
           const previewTry = chatAttachments.resolveLocalPreviewPath(abs);
           if (previewTry.ok) resolved = previewTry;
+          else if ((previewTry as { code?: string }).code === 'bad_input') {
+            // Stylesheets, scripts, data and fonts next to a page the file
+            // viewer granted; other extensions keep the media rejection below.
+            const asset = chatAttachments.resolveLocalHtmlPreviewAssetPath(abs);
+            if (asset.ok) {
+              const st = fs.statSync(asset.absPath);
+              const contentType = chatAttachments.localPreviewAssetMimeFor(asset.absPath);
+              log.info('chat-media/local: serving preview asset', { media_kind: _mediaKindForContentType(contentType), bytes: st.size });
+              return withHtmlPreviewAssetPolicy(
+                serveFileRange(request, asset.absPath, contentType, st.size, st.mtimeMs, 'chat_local'),
+              );
+            }
+            const assetErr = asset as { code?: string; error?: string };
+            if (assetErr.code !== 'bad_input') {
+              log.warn('chat-media/local: reject preview asset', { error_code: assetErr.code || 'rejected' });
+              return new Response(String(assetErr.error || ''), { status: _statusFor(assetErr.code) });
+            }
+          }
         }
         if (!resolved.ok) {
           // Same `(x as {field?: T}).field` access pattern as the cid branch above —
@@ -1486,6 +1542,27 @@ if (!gotLock) {
       openLifecycleTracking = null;
     });
     await consumeColdLaunchConnectorCallback();
+    createAppTray();
+    if (process.platform === 'darwin' && appTray) {
+      const stopTaskUnreadTray = taskUnreadTray.startTaskUnreadTray({
+        tray: appTray,
+        getActiveUserId: () => users.getActiveUserId(),
+        isEnabled: () => appConfig.getTaskNotificationsEnabled(),
+        isMainWindowFocused: () => {
+          const focused = BrowserWindow.getFocusedWindow();
+          return !!focused && mainWindows.has(focused);
+        },
+        warn: message => log.warn(message),
+      });
+      app.once('before-quit', stopTaskUnreadTray);
+    }
+    // A scheduled fire or driver advance can reach the task browser with every
+    // window closed, which is routine on macOS. Hand Web Assist the ability to
+    // make one so the run is not simply told the browser is unavailable; it
+    // opens minimised and is surfaced only when a step needs a human.
+    void import('./features/web_assist')
+      .then(webAssist => webAssist.setAppWindowFactory(() => createWindow()))
+      .catch(err => log.warn('task browser window factory unavailable', { error: (err as Error).message }));
 
     // Boot tasks declared via util/boot_init.ts. Two phases × two modes:
     //
@@ -1612,6 +1689,7 @@ if (!gotLock) {
   let shutdownFlushed = false;
   let shutdownFlushPromise: Promise<void> | null = null;
   app.on('before-quit', async (e) => {
+    isQuitting = true;
     if (shutdownFlushed) return;
     e.preventDefault();
     if (shutdownFlushPromise) return;

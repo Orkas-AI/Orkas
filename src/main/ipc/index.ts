@@ -58,6 +58,7 @@ import * as ttsAuth from '../features/tts_auth';
 import * as permissions from '../features/permissions';
 import * as notificationPermissions from '../features/notification_permissions';
 import * as appConfig from '../features/config';
+import * as taskUnreadTray from '../features/task_unread_tray';
 import * as avatars from '../features/avatars';
 import * as commanderProfile from '../features/commander_profile';
 import * as commanderRuntimeStats from '../features/commander_runtime_stats';
@@ -619,6 +620,17 @@ async function _isAllowedFileActionPath(userId: string, payload: any, absPath: s
   return typeof cid === 'string' && !!cid && await _isConversationRecordedFile(userId, cid, absPath);
 }
 
+// Todo preview adds only an exact, existing attachment in the resolved scope.
+// Keep mutation/share authorization on the existing file-action boundary.
+async function _isAllowedPreviewFilePath(userId: string, payload: any, absPath: string): Promise<boolean> {
+  if (await _isAllowedFileActionPath(userId, payload, absPath)) return true;
+  const projectId = await _resolveWorkspaceScope(userId, payload);
+  const resolved = await projectTasks.resolveTaskAttachmentPath(
+    userId, projectId || '', path.basename(path.dirname(absPath)), path.basename(absPath),
+  );
+  return resolved === absPath;
+}
+
 type HtmlPreviewLayout = {
   kind: 'fixed-canvas';
   width: number;
@@ -1012,7 +1024,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   'conversations.history': async (args, ctx) => {
     const startedAt = performance.now();
-    const { cid, limit = 10, before, around_index, around_message_id } = args;
+    const { cid, limit = 10, before, after, around_index, around_message_id } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
     const projectIdHint = conversationProjectHint(args);
     const conv = await chats.getConversationMetadata(ctx.userId, cid, projectIdHint);
@@ -1025,6 +1037,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const agent_enabled = conv.agent_id ? isAgentEnabled(ctx.userId, conv.agent_id) : true;
     const requestedLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 10)));
     const requestedBefore = Number(before);
+    const requestedAfter = Number(after);
     const requestedAroundIndex = Number(around_index);
     const requestedAroundMessageId = typeof around_message_id === 'string' && safeId(around_message_id)
       ? around_message_id
@@ -1036,6 +1049,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const pagePromise = hasAroundIndex
       ? chats.getMessagesPageAtIndex(
         ctx.userId, cid, requestedAroundIndex, requestedLimit, resolvedProjectId)
+      : Number.isSafeInteger(requestedAfter) && requestedAfter >= 0
+      ? chats.getMessagesPageAfter(ctx.userId, cid, requestedAfter, requestedLimit, resolvedProjectId)
       : chats.getMessagesPage(
         ctx.userId,
         cid,
@@ -1075,8 +1090,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return {
       conversation: { ...conv, ...runtime, agent_enabled },
       history: page.history,
-      ...(args.live === '1' ? { live_display: groupChat.displaySnapshot(ctx.userId, cid, resolvedProjectId) } : {}),
+      ...(args.live === '1' ? { live_display: await groupChat.displaySnapshot(ctx.userId, cid, resolvedProjectId) } : {}),
       next_cursor: page.nextCursor,
+      following_cursor: 'followingCursor' in page ? page.followingCursor : null,
       ...(hasAroundIndex && 'pageStart' in page && 'historyIndexes' in page ? {
         page_start: page.pageStart,
         history_indexes: page.historyIndexes,
@@ -1184,6 +1200,23 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       ctx.userId, cid, title, conversationProjectHint(args));
     if (!conv) throw new Error('conversation not found');
     return { conversation: conv };
+  },
+
+  'conversations.move': async (args, ctx) => {
+    const { cid, projectId } = args;
+    if (!safeId(cid)) throw new Error('invalid cid');
+    // Unlike `conversations.create`, an unknown project is rejected rather
+    // than dropped: the user asked for this conversation to end up somewhere,
+    // and silently leaving it where it was would look like the move worked.
+    if (!projectId || typeof projectId !== 'string' || !safeId(projectId)) {
+      throw new Error('invalid projectId');
+    }
+    if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('project_not_found');
+    const result = await chats.moveConversationToProject(ctx.userId, cid, projectId);
+    // The repo builds without strictNullChecks, so a discriminated union does
+    // not narrow here; `projects.delete` reads its own result the same way.
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { conversation: (result as { conversation: chats.Conversation }).conversation };
   },
 
   'conversations.deleteAll': async (_args, ctx) => {
@@ -1390,6 +1423,13 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const scopeProjectId = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
     return { items: await projectTasks.listTaskAttachments(ctx.userId, scopeProjectId, taskId) };
+  },
+
+  'projects.tasks.attachments.absPath': async ({ projectId, taskId, name } = {}, ctx) => {
+    const pid = todoProjectScope(projectId);
+    if (typeof taskId !== 'string' || typeof name !== 'string') return { ok: false, error: 'not_found' };
+    const file = await projectTasks.resolveTaskAttachmentPath(ctx.userId, pid, taskId, name);
+    return file ? { ok: true, path: file } : { ok: false, error: 'not_found' };
   },
 
   'projects.tasks.attachments.upload': async ({ projectId, taskId, name, dataBase64 } = {}, ctx) => {
@@ -1659,7 +1699,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { bindings: result.bindings };
   },
 
-  // Candidates = enabled [builtin + custom] minus already-bound. Powers the
+  // Candidates = enabled Agents minus already-bound. Powers the
   // "Add" picker on the project detail page so disabled agents never appear
   // as addable project members.
   'projects.bindings.candidates': async ({ projectId }, ctx) => {
@@ -2167,6 +2207,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (typeof target !== 'string' || !target) throw new Error('missing path');
     const norm = path.resolve(target);
     if (!await _isAllowedFileActionPath(ctx.userId, payload, norm)) {
+      if (await _isAllowedPreviewFilePath(ctx.userId, payload, norm)) return { canSave: false };
       throw new Error('path is outside the user workspace');
     }
     return savedApps.inspectBundleFromPath(norm, {
@@ -2902,6 +2943,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'prefs.setTaskNotifications': async ({ enabled }) => {
     const previous = appConfig.getTaskNotificationsEnabled();
     const next = appConfig.setTaskNotificationsEnabled(!!enabled);
+    taskUnreadTray.refreshTaskUnreadTray();
     markPreferencesDirty();
     // Preference persistence must not wait for the platform permission probe.
     // On Windows that probe launches PowerShell and can take several seconds
@@ -3265,7 +3307,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       throw new Error('missing path');
     }
     const norm = path.resolve(target);
-    if (!await _isAllowedFileActionPath(ctx.userId, payload, norm)) {
+    if (!await _isAllowedPreviewFilePath(ctx.userId, payload, norm)) {
       throw new Error('path is outside the user workspace');
     }
     let st: fs.Stats;
@@ -3395,7 +3437,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       throw new Error('missing path');
     }
     const norm = path.resolve(target);
-    if (!await _isAllowedFileActionPath(ctx.userId, payload, norm)) {
+    if (!await _isAllowedPreviewFilePath(ctx.userId, payload, norm)) {
       throw new Error('path is outside the user workspace');
     }
     let st: fs.Stats;
@@ -3426,6 +3468,28 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: true, text, size: st.size };
   },
 
+  // The file viewer calls this before it loads an HTML page, so the page can
+  // use the stylesheets, scripts, data and fonts in its own folder. The page
+  // must pass the same scope as produced.readText; the grant itself is kept
+  // in main (see chatAttachments.grantLocalHtmlPreviewAssets).
+  'produced.grantHtmlPreviewAssets': async (payload, ctx) => {
+    const target = payload?.path;
+    if (typeof target !== 'string' || !target) {
+      throw new Error('missing path');
+    }
+    const norm = path.resolve(target);
+    if (!await _isAllowedFileActionPath(ctx.userId, payload, norm)) {
+      throw new Error('path is outside the user workspace');
+    }
+    const granted = chatAttachments.grantLocalHtmlPreviewAssets(norm);
+    if (!granted.ok) {
+      const code = (granted as { code?: string }).code || 'rejected';
+      log.info('html preview assets not granted', { error_code: code });
+      return { ok: false, error: code };
+    }
+    return { ok: true };
+  },
+
   // Convert modern Office files into a local, sandboxed HTML preview.
   // Word, spreadsheet, and presentation files use the bundled Office layout
   // renderer, with the lightweight content path retained as a failure fallback.
@@ -3436,7 +3500,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       throw new Error('missing path');
     }
     const norm = path.resolve(target);
-    if (!await _isAllowedFileActionPath(ctx.userId, payload, norm)) {
+    if (!await _isAllowedPreviewFilePath(ctx.userId, payload, norm)) {
       throw new Error('path is outside the user workspace');
     }
     const kind = sharedOfficePreviewKindForExt(path.extname(norm).toLowerCase());

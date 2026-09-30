@@ -10,6 +10,13 @@ import { checkLatencyBudget, FIRST_REQUEST_LATENCY_LIMIT_MS, type LatencySample 
 const logs = vi.hoisted(() => [] as Array<{
   level: string; message: string; at: number; payload?: Record<string, unknown>;
 }>);
+// Electron's Node-only test host has no powerMonitor. This latency scenario
+// runs while awake; suspend/fallback behavior belongs to the CLI runner cases.
+vi.mock('../../../../src/main/util/system-activity', async (original) => ({
+  ...await original<typeof import('../../../../src/main/util/system-activity')>(),
+  getSystemActivityClock: async () => () => Date.now(),
+  getAgentIdleClock: async () => () => Date.now(),
+}));
 vi.mock('../../../../src/main/logger', () => ({
   createLogger: () => Object.fromEntries(['debug', 'info', 'warn', 'error'].map(level => [
     level, (message: string, payload?: Record<string, unknown>) => logs.push({

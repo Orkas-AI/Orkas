@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import Database from 'better-sqlite3';
 
 // chat_store pulls its path constants from paths.ts at module load, so each
 // test points ORKAS_WORKSPACE_ROOT at a fresh workspace before resetting the
@@ -34,6 +35,45 @@ function doc(cid: string, msgIndex: number, text: string, role = 'user') {
 }
 
 describe('search/chat_store', () => {
+  it('keeps small free space reusable and reclaims substantial space after a rebuild', async () => {
+    const store = await loadStore();
+    store.upsertDoc(UID, doc('c1', 0, 'still searchable'));
+    const db = new Database(store.chatStorePath(UID));
+    try {
+      db.exec('CREATE TABLE spare (body BLOB); INSERT INTO spare VALUES (zeroblob(2000000)); DROP TABLE spare');
+      const smallFree = db.pragma('freelist_count', { simple: true }) as number;
+      expect(smallFree).toBeGreaterThan(100);
+      store.compact(UID);
+      expect(db.pragma('freelist_count', { simple: true })).toBe(smallFree);
+
+      db.exec('CREATE TABLE spare (body BLOB); INSERT INTO spare VALUES (zeroblob(40000000)); DROP TABLE spare');
+      const freePages = db.pragma('freelist_count', { simple: true }) as number;
+      const pages = db.pragma('page_count', { simple: true }) as number;
+      const pageSize = db.pragma('page_size', { simple: true }) as number;
+      expect(freePages * pageSize).toBeGreaterThan(32 * 1024 * 1024);
+      expect(freePages * 4).toBeGreaterThan(pages);
+      store.compact(UID);
+      expect(db.pragma('freelist_count', { simple: true })).toBe(0);
+      expect(store.postingsFor(UID, 'searchable')).toHaveLength(1);
+    } finally { db.close(); }
+  });
+
+  it('does not rewrite a mostly occupied database for a deletion', async () => {
+    const store = await loadStore();
+    store.docCount(UID);
+    const db = new Database(store.chatStorePath(UID));
+    try {
+      db.exec('CREATE TABLE retained (body BLOB); INSERT INTO retained VALUES (zeroblob(130000000))');
+      db.exec('CREATE TABLE removed (body BLOB); INSERT INTO removed VALUES (zeroblob(40000000)); DROP TABLE removed');
+      const freePages = db.pragma('freelist_count', { simple: true }) as number;
+      const pages = db.pragma('page_count', { simple: true }) as number;
+      expect(freePages * (db.pragma('page_size', { simple: true }) as number)).toBeGreaterThan(32 * 1024 * 1024);
+      expect(freePages * 4).toBeLessThan(pages);
+      store.compact(UID);
+      expect(db.pragma('freelist_count', { simple: true })).toBe(freePages);
+    } finally { db.close(); }
+  });
+
   it('rolls back a failed migration batch together with its cursor and resumes safely', async () => {
     const store = await loadStore();
     const prefix = { mtime: 42, size: 99, next: 1 };

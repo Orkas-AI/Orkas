@@ -20,6 +20,7 @@
  *   - Returned event shapes + final reply accumulation
  */
 
+import { getAgentIdleClock } from '../../util/system-activity';
 import {
   sessionLock, globalSlots, acquireWithAbort,
   type Releaser,
@@ -1660,6 +1661,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   // is a no-op.
   const controller = new AbortController();
   let idleTimer: NodeJS.Timeout | null = null;
+  let idleNow: () => number = () => Date.now();
   let idleHit = false;
   let wallHit = false;
   const userWaitingTools = new Set<string>();
@@ -1733,10 +1735,16 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // assembling. Preserve a true no-tool-delta deadline instead of extending
     // it for those events; only the timestamp updated by `tool_delta` renews it.
     const delayMs = assemblingToolCall && toolInputLastDeltaAt > 0
-      ? Math.max(0, (window * 1000) - (Date.now() - toolInputLastDeltaAt))
+      ? Math.max(0, (window * 1000) - (idleNow() - toolInputLastDeltaAt))
       : window * 1000;
-    idleTimer = setTimeout(() => {
+    const idleDeadline = idleNow() + delayMs;
+    const checkIdle = () => {
       if (controller.signal.aborted) return;
+      const remainingMs = idleDeadline - idleNow();
+      if (remainingMs > 0) {
+        idleTimer = setTimeout(checkIdle, remainingMs);
+        return;
+      }
       idleHit = true;
       idleHitWindow = window;
       idleHitPhase = phase;
@@ -1748,7 +1756,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       controller.abort();
       releaseSlotOnce('idle-watchdog');
       releaseSessionOnce('idle-watchdog');
-    }, delayMs);
+    };
+    idleTimer = setTimeout(checkIdle, delayMs);
   };
   let wallTimer: NodeJS.Timeout | null = null;
 
@@ -1809,6 +1818,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     });
     // Lock waiting is not provider/tool idleness. Arm the existing watchdogs
     // only after admission; cancellation remains active throughout the wait.
+    idleNow = await getAgentIdleClock();
+    controller.signal.throwIfAborted();
     resetIdle();
     wallTimer = setTimeout(() => {
       if (controller.signal.aborted) return;
@@ -1844,6 +1855,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       // tool fails as one recoverable tool error, never as a dead turn.
       toolIdleTimeoutMs,
       ...(elapsedConvergenceMs != null ? { elapsedConvergenceMs } : {}),
+      idleNow,
       providerFirstEventTimeoutMs: Math.max(1, streamIdleTimeout * 1000),
       ...(cid ? { cid } : {}),
       ...(conversationTitle ? { conversationTitle } : {}),
@@ -2057,7 +2069,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
         } else if (ev.type === 'tool_delta') {
           modelTextStreamActive = false;
           assemblingToolCallIds.add(ev.id || 'stream_tool');
-          toolInputLastDeltaAt = Date.now();
+          toolInputLastDeltaAt = idleNow();
         } else if (ev.type === 'tool_start') {
           modelTextStreamActive = false;
           assemblingToolCallIds.clear();

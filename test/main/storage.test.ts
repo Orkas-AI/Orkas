@@ -305,6 +305,119 @@ describe('storage › JSONL append/read', () => {
     expect(previousPage.records.map((row) => row.i)).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
   });
 
+  it('continues forward at byte boundaries across large Unicode records and an unterminated tail', async () => {
+    const p = path.join(tmpDir, 'forward-log.jsonl');
+    const text = '中文🙂'.repeat(20_000);
+    fs.writeFileSync(p, JSON.stringify({ i: 0, text }) + '\n{broken\n' +
+      JSON.stringify({ i: 1, text }) + '\n' + JSON.stringify({ i: 2, text }));
+    const first = await readJsonlWindow<{ i: number; text: string }>(p, 0, 1);
+    const second = await readJsonlWindow<{ i: number; text: string }>(p, 0, 1, undefined, first.followingCursor!);
+    const third = await readJsonlWindow<{ i: number; text: string }>(p, 0, 1, undefined, second.followingCursor!);
+    expect([first.records[0].i, second.records[0].i, third.records[0].i]).toEqual([0, 1, 2]);
+    expect(third.records[0].text).toBe(text);
+    expect(third.followingCursor).toBeNull();
+    expect((await readJsonlPage<{ i: number }>(p, 2, third.previousCursor)).records.map(row => row.i)).toEqual([0, 1]);
+  });
+
+  it('reads only the needed tail bytes of a large file, including an older page after new messages arrive', async () => {
+    const p = path.join(tmpDir, 'large-paged.jsonl');
+    const fd = fs.openSync(p, 'w');
+    try {
+      for (let i = 0; i < 1024; i++) fs.writeSync(fd, JSON.stringify({ i, text: 'x'.repeat(32768) }) + '\n');
+    } finally { fs.closeSync(fd); }
+    const size = fs.statSync(p).size;
+    expect(size).toBeGreaterThan(32 * 1024 * 1024);
+    const open = fs.promises.open.bind(fs.promises);
+    const readFile = fs.promises.readFile.bind(fs.promises);
+    let bytes = 0;
+    let lowestPosition = size;
+    const openSpy = vi.spyOn(fs.promises, 'open').mockImplementation(async (...args: any[]) => {
+      const handle = await (open as any)(...args);
+      if (String(args[0]) !== p) return handle;
+      const read = handle.read.bind(handle);
+      handle.read = async (...readArgs: any[]) => {
+        const [, , length, position] = readArgs;
+        expect(length).toBeLessThanOrEqual(1024 * 1024);
+        lowestPosition = Math.min(lowestPosition, position);
+        const result = await read(...readArgs);
+        bytes += result.bytesRead;
+        expect(bytes, 'A small page must not scan or allocate the complete conversation').toBeLessThan(1024 * 1024);
+        return result;
+      };
+      handle.readFile = async () => { throw new Error('Whole history read is forbidden'); };
+      return handle;
+    });
+    const fileSpy = vi.spyOn(fs.promises, 'readFile').mockImplementation((...args: any[]) => {
+      if (String(args[0]) === p) throw new Error('Whole history read is forbidden');
+      return (readFile as any)(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      const latest = await readJsonlPage<{ i: number }>(p, 10);
+      expect(latest.records.map(r => r.i)).toEqual([1014, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023]);
+      expect(bytes).toBeGreaterThan(0);
+      expect(lowestPosition).toBeGreaterThan(size - 1024 * 1024);
+      fs.appendFileSync(p, JSON.stringify({ i: 1024, text: 'arrived later' }) + '\n');
+      bytes = 0;
+      lowestPosition = size;
+      const older = await readJsonlPage<{ i: number }>(p, 10, latest.nextCursor);
+      expect(older.records.map(r => r.i)).toEqual([1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013]);
+      expect(bytes).toBeGreaterThan(0);
+      expect(lowestPosition).toBeGreaterThan(latest.nextCursor! - 1024 * 1024);
+      expect(older.nextCursor).toBeLessThan(latest.nextCursor!);
+    } finally { openSpy.mockRestore(); fileSpy.mockRestore(); syncBuiltinESMExports(); }
+  });
+
+  it('preserves a huge Unicode record across chunks, malformed rows, CRLF and an unterminated tail', async () => {
+    const p = path.join(tmpDir, 'unicode-pages.jsonl');
+    const text = '开头😀\n\\(x^2\\) ' + '中文🚀'.repeat(200_000) + ' 完整结尾';
+    const prefix = JSON.stringify({ i: 0, text: 'first' }) + '\r\n{malformed}\r\n\r\n';
+    const wide = JSON.stringify({ i: 1, text });
+    fs.writeFileSync(p, prefix + wide + '\r\n' + JSON.stringify({ i: 2, text: 'last' }));
+    const tail = await readJsonlPage<{ i: number; text: string }>(p, 1);
+    expect(tail.records).toEqual([{ i: 2, text: 'last' }]);
+    expect(tail.nextCursor).toBe(Buffer.byteLength(prefix + wide + '\r\n'));
+    const middle = await readJsonlPage<{ i: number; text: string }>(p, 1, tail.nextCursor);
+    expect(middle.records).toEqual([{ i: 1, text }]);
+    expect(middle.nextCursor).toBe(Buffer.byteLength(prefix));
+    const first = await readJsonlPage(p, 1, middle.nextCursor);
+    expect(first).toEqual({ records: [{ i: 0, text: 'first' }], nextCursor: null });
+  });
+
+  it('projects a search tail as it is read rather than retaining the entire raw window first', async () => {
+    const p = path.join(tmpDir, 'projected-window.jsonl');
+    const fd = fs.openSync(p, 'w');
+    try {
+      for (let i = 0; i < 100; i++) fs.writeSync(fd, JSON.stringify({ i, text: 'y'.repeat(65536) }) + '\n');
+    } finally { fs.closeSync(fd); }
+    const size = fs.statSync(p).size;
+    const open = fs.promises.open.bind(fs.promises);
+    let lastReadEnd = 0;
+    const spy = vi.spyOn(fs.promises, 'open').mockImplementation(async (...args: any[]) => {
+      const handle = await (open as any)(...args);
+      if (String(args[0]) !== p) return handle;
+      const read = handle.read.bind(handle);
+      handle.read = async (...readArgs: any[]) => {
+        const result = await read(...readArgs);
+        lastReadEnd = readArgs[3] + result.bytesRead;
+        return result;
+      };
+      return handle;
+    });
+    syncBuiltinESMExports();
+    try {
+      const projected = await readJsonlWindow<{ i: number; text: string }>(p, 2, Number.MAX_SAFE_INTEGER, record => {
+        if (record.i === 2) {
+          expect(lastReadEnd).toBeGreaterThan(0);
+          expect(lastReadEnd, 'Projection must begin before reading the rest of the source').toBeLessThan(size / 2);
+        }
+        return { i: record.i, text: 'preview' };
+      });
+      expect(projected.records).toEqual(Array.from({ length: 98 }, (_, i) => ({ i: i + 2, text: 'preview' })));
+      expect(projected.previousCursor).toBeGreaterThan(0);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  });
+
   it('readJsonl skips malformed lines silently', async () => {
     const p = path.join(tmpDir, 'log.jsonl');
     fs.writeFileSync(p, '{"i":1}\n{not json\n{"i":2}\n\n{"i":3}\n');
@@ -318,6 +431,23 @@ describe('storage › JSONL append/read', () => {
 });
 
 describe('storage › appendJsonlAtomic', () => {
+  it('returns durable UTF-8 byte ranges in append order without retaining message bodies', async () => {
+    const p = path.join(tmpDir, 'receipts.jsonl');
+    const messages = [{ text: '你好 🌊' }, { text: 'second' }, { text: '尾部' }];
+    const results = await Promise.all(messages.map(message => appendJsonlAtomic(p, message, true)));
+    results.sort((a, b) => a.msgIndex - b.msgIndex);
+    const bytes = fs.readFileSync(p);
+    const stat = fs.statSync(p);
+    expect(results.map(result => result.msgIndex)).toEqual([0, 1, 2]);
+    for (const [i, result] of results.entries()) {
+      const source = result.source!;
+      expect(JSON.parse(bytes.subarray(source.offset, source.offset + source.bytes).toString('utf8'))).toEqual(result.record);
+      expect(source).toMatchObject({ kind: 'jsonl-append', dev: stat.dev, ino: stat.ino });
+      expect(source.offset).toBe(i ? results[i - 1].source!.size : 0);
+      expect(source.size).toBe(source.offset + source.bytes);
+      expect(JSON.stringify(source)).not.toContain(result.record.text);
+    }
+  });
   it('returns monotonic msgIndex starting from 0 on fresh file', async () => {
     const p = path.join(tmpDir, 'log.jsonl');
     invalidateLineCount(p);

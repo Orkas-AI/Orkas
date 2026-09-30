@@ -97,24 +97,23 @@ describe("Errors", () => {
       expect(isRetryableError(new AuthError("auth"))).toBe(false);
     });
 
-    it("does not retry a statusless invalidated OAuth credential error", () => {
-      const err = new Error("Encountered invalidated oauth token for user, failing request");
-      expect(isRetryableError(err)).toBe(false);
-      expect(classifyRetryableError(err)).toBeNull();
+    it.each([
+      'Encountered invalidated oauth token for user, failing request',
+      'The authentication token is expired',
+      "400 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'",
+      'Stream ended without finish_reason', 'invalid argument',
+      'ENOSPC: no space left on device, write',
+      'Codex SSE response headers timed out after 10000ms',
+    ])('keeps message-only failures unknown: %s', message => {
+      const error = new ProviderError(message, 'fixture');
+      expect(classifyRetryableError(error)).toBe('network');
+      expect(classifyTransientNetworkError(error)).toBeNull();
     });
 
     it("returns false for 400 ProviderError", () => {
       expect(isRetryableError(new ProviderError("400", "test", 400))).toBe(false);
     });
 
-    it("returns false for statusless 400 tool-call contract errors", () => {
-      const err = new ProviderError(
-        "400 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'",
-        "deepseek",
-      );
-      expect(isRetryableError(err)).toBe(false);
-      expect(classifyRetryableError(err)).toBeNull();
-    });
 
     it("defaults unknown errors to retryable network failures", () => {
       expect(isRetryableError(new Error("plain"))).toBe(true);
@@ -128,12 +127,6 @@ describe("Errors", () => {
       expect(isRetryableError(new ProviderError("terminated", "openai-codex"))).toBe(true);
     });
 
-    it("returns true for streams that end without a final finish_reason", () => {
-      const err = new ProviderError("Stream ended without finish_reason", "openai-completions");
-      expect(isRetryableError(err)).toBe(true);
-      expect(classifyRetryableError(err)).toBe("connection_dropped");
-      expect(classifyTransientNetworkError(err)).toBe("connection_dropped");
-    });
 
     it("retries only transport-class empty responses", () => {
       const transport = Object.assign(new Error("empty response"), { code: "PROVIDER_EMPTY_TRANSPORT" });
@@ -153,11 +146,6 @@ describe("Errors", () => {
       expect(isRetryableError(new Error("WebSocket closed unexpectedly"))).toBe(true);
     });
 
-    it("returns true for slow SSE response-header timeouts", () => {
-      const err = new ProviderError("Codex SSE response headers timed out after 10000ms", "openai-codex");
-      expect(isRetryableError(err)).toBe(true);
-      expect(classifyRetryableError(err)).toBe("timeout");
-    });
 
     it("returns true for provider-agnostic stream/connection drops", () => {
       expect(isRetryableError(new ProviderError("Connection closed", "anthropic"))).toBe(true);
@@ -166,10 +154,8 @@ describe("Errors", () => {
       expect(isRetryableError(new Error("read ECONNRESET"))).toBe(true);
     });
 
-    it("falls through to message check when statusCode alone says not retryable", () => {
-      // ProviderError with statusCode=400 normally isn't retryable, but if
-      // the message is a transient-network marker, the fall-through must kick in
-      expect(isRetryableError(new ProviderError("terminated", "x", 400))).toBe(true);
+    it("keeps HTTP 400 terminal despite a transient-sounding message", () => {
+      expect(isRetryableError(new ProviderError("terminated", "x", 400))).toBe(false);
     });
 
     it("returns true for Node fetch 'fetch failed'", () => {
@@ -202,15 +188,12 @@ describe("Errors", () => {
       expect(isRetryableError(outer2)).toBe(true);
     });
 
-    it("returns false for unrelated TypeErrors", () => {
-      expect(isRetryableError(new TypeError("invalid argument"))).toBe(false);
-    });
 
     it("returns false for explicit permanent failures", () => {
       expect(isRetryableError(new ContextOverflowError("context_length_exceeded"))).toBe(false);
       expect(isRetryableError(new ProviderError("model_not_found", "test", 404))).toBe(false);
       expect(isRetryableError(new ProviderError("content_filter triggered", "test", 400))).toBe(false);
-      expect(isRetryableError(new Error("Request was aborted by user"))).toBe(false);
+      expect(isRetryableError(Object.assign(new Error("Request was aborted by user"), { name: "AbortError" }))).toBe(false);
 
       const wrappedAuth = Object.assign(new TypeError("fetch failed"), {
         cause: Object.assign(new Error("Unauthorized"), { status: 401 }),
@@ -256,7 +239,6 @@ describe("Errors", () => {
       expect(isRetryableError(enospc)).toBe(false);
       expect(isRetryableError(sqliteFull)).toBe(false);
       expect(isRetryableError(wrapped)).toBe(false);
-      expect(isRetryableError(new ProviderError("ENOSPC: no space left on device, write", "test-provider"))).toBe(false);
       expect(isRetryableError(new ProviderError("Insufficient Storage", "test-provider", 507))).toBe(false);
     });
 
@@ -313,14 +295,14 @@ describe("Errors", () => {
       )).toBeNull();
     });
 
-    it("allows runtime retry policy to add permanent message patterns", () => {
+    it("ignores legacy runtime message patterns in both configured and inline policies", () => {
       configureRetryErrorPolicy({
         permanent_message_patterns: ["custom_hard_stop"],
       });
-      expect(isRetryableError(new Error("custom_hard_stop"))).toBe(false);
+      expect(isRetryableError(new Error("custom_hard_stop"))).toBe(true);
       expect(classifyRetryableErrorWithPolicy(new Error("inline_hard_stop"), {
         permanent_message_patterns: ["inline_hard_stop"],
-      })).toBeNull();
+      })).toBe("network");
     });
 
     it("ignores invalid runtime regex patterns instead of throwing", () => {
@@ -359,8 +341,8 @@ describe("Errors", () => {
     });
 
     it("look-alike guard: plain network errors and un-coded summary text stay retryable", () => {
-      // A raw undici failure must keep its transient classification.
-      expect(classifyRetryableError(new TypeError("fetch failed"))).toBe("connection_dropped");
+      // Without a machine code, transport-looking prose remains unknown.
+      expect(classifyRetryableError(new TypeError("fetch failed"))).toBe("network");
       // The same summary WORDING without the RETRY_EXHAUSTED marker still
       // falls back to the retry-by-default policy — only the typed/coded
       // error is exempt from outer retries.
@@ -370,36 +352,34 @@ describe("Errors", () => {
     });
   });
 
+  it.each(['forbidden', 'invalid_request', '余额不足', '',
+    '{"error":{"code":"invalid_api_key"}}', 'fetch failed', 'no space left on device'])
+  ('ignores every diagnostic body when machine facts stay fixed: %s', message => {
+    const error = (status: number, type = 'upstream_error') => Object.assign(new Error(message), {
+      status, error: { type, message },
+    });
+    expect(classifyRetryableError(error(502))).toBe('service_unavailable');
+    expect(classifyRetryableError(error(400))).toBeNull();
+    expect(classifyRetryableError(error(502, 'invalid_request_error'))).toBeNull();
+    expect(classifyRetryableError(Object.assign(new Error(message), { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } }))).toBe('timeout');
+  });
+
+  it('keeps nested cancellation and spent budgets terminal under an empty remote policy', () => {
+    for (const cause of [{ name: 'AbortError' }, { code: 'UND_ERR_ABORTED' }, { code: 'RETRY_EXHAUSTED' },
+      { code: 'TASK_TOKEN_LIMIT_REACHED' }, { code: 'SESSION_PERSISTENCE_FAILED' }]) {
+      expect(classifyRetryableErrorWithPolicy({ message: '502', cause }, {
+        permanent_statuses: [], permanent_message_patterns: [], permanent_code_patterns: [],
+      })).toBeNull();
+    }
+  });
+
   describe("isTransientNetworkError", () => {
-    it("matches 'terminated' message", () => {
-      expect(isTransientNetworkError(new Error("terminated"))).toBe(true);
-    });
-
-    it("matches 'fetch failed'", () => {
-      expect(isTransientNetworkError(new Error("fetch failed"))).toBe(true);
-    });
-
-    it("matches websocket stream errors", () => {
-      expect(isTransientNetworkError(new Error("WebSocket error"))).toBe(true);
-      expect(isTransientNetworkError(new Error("ws closed unexpectedly"))).toBe(true);
-    });
-
-    it("matches slow SSE response-header timeouts", () => {
-      const err = new Error("Codex SSE response headers timed out after 10000ms");
-      expect(isTransientNetworkError(err)).toBe(true);
-      expect(classifyTransientNetworkError(err)).toBe("timeout");
-    });
-
-    it("matches generic stream/connection drops", () => {
-      expect(isTransientNetworkError(new Error("Connection closed"))).toBe(true);
-      expect(isTransientNetworkError(new Error("stream disconnected before completion"))).toBe(true);
-      expect(isTransientNetworkError(new Error("ERR_STREAM_PREMATURE_CLOSE"))).toBe(true);
-      expect(isTransientNetworkError(new Error("read ECONNRESET"))).toBe(true);
-    });
-
-    it("matches missing final stream markers", () => {
-      expect(isTransientNetworkError(new Error("Stream ended without finish_reason"))).toBe(true);
-      expect(classifyTransientNetworkError(new Error("missing final chunk"))).toBe("connection_dropped");
+    it.each(['terminated', 'fetch failed', 'WebSocket error', 'ws closed unexpectedly',
+      'Codex SSE response headers timed out after 10000ms', 'Connection closed',
+      'stream disconnected before completion', 'ERR_STREAM_PREMATURE_CLOSE',
+      'read ECONNRESET', 'Stream ended without finish_reason', 'missing final chunk'])
+    ('does not establish a transport cause from prose: %s', message => {
+      expect(isTransientNetworkError(new Error(message))).toBe(false);
     });
 
     it("matches via code on direct error", () => {

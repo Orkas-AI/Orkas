@@ -255,6 +255,10 @@ export const userProjectsDir       = (uid: string) => path.join(userCloudRoot(ui
 export const projectDir            = (uid: string, pid: string) => path.join(userProjectsDir(uid), pid);
 export const projectMetaFile       = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'project.json');
 export const projectBindingsFile   = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'bindings.json');
+// Member-private Agent choices for a shared project: personal cloud sync,
+// outside the shared project's Server/COS file allowlist.
+export const projectPrivateAgentFile = (uid: string, pid: string) =>
+  path.join(projectDir(uid, assertProjectSegment(pid)), 'agent_preferences', 'private-agents.json');
 /** Guard a project id used as a single path segment for project-scoped
  *  instructions/memory. The pid comes from the conv index / IPC (never
  *  model-supplied), but these paths are written to, so reject traversal /
@@ -418,6 +422,8 @@ export const userConnectorsConfigFile = (uid: string) => path.join(userCloudConf
 // activateUser(); both core-agent's auth store and the web-search provider
 // cache land in this same directory.
 export const userLocalConfigDir   = (uid: string) => path.join(userLocalRoot(uid), 'config');
+// Local transaction records survive process interruption without syncing partial moves.
+export const userConversationMovesDir = (uid: string) => path.join(userLocalRoot(uid), 'conversation-moves');
 // Keep a distinct filename from the pre-cloud legacy connectors.json migration.
 export const userDeviceConnectorsConfigFile = (uid: string) => path.join(userLocalConfigDir(uid), 'device-connectors.json');
 export const userDeviceConnectorEnabledFile = (uid: string) => path.join(userLocalConfigDir(uid), 'device-connector-enabled.json');

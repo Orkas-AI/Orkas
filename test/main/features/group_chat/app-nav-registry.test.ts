@@ -136,7 +136,15 @@ function rendererNavHarness(failingFeature = '') {
   };
 }
 
-function rendererMountHarness(failingFeature = '') {
+interface NavTargetLookups {
+  connectors?: Record<string, { name: string; iconSvg: string }>;
+  lateConnectors?: Record<string, { name: string; iconSvg: string }>;
+  throwingConnector?: string;
+  projects?: Array<{ project_id: string; name: string }>;
+  refreshedProjects?: Array<{ project_id: string; name: string }>;
+}
+
+function rendererMountHarness(failingFeature = '', lookups: NavTargetLookups = {}) {
   const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
   const start = source.indexOf('const _APP_NAV_SURFACES = {');
   const end = source.indexOf('function _mountMarketplaceInstallRequests', start);
@@ -147,9 +155,14 @@ function rendererMountHarness(failingFeature = '') {
     className = '';
     dataset: Record<string, string> = {};
     children: FakeElement[] = [];
-    textContent = '';
+    innerHTML = '';
     type = '';
     disabled = false;
+    private text = '';
+
+    // Like the DOM, assigning text replaces every child node.
+    get textContent() { return this.text; }
+    set textContent(value: string) { this.text = value; this.children = []; }
     private listeners = new Map<string, Array<() => void>>();
 
     appendChild(child: FakeElement) { this.children.push(child); return child; }
@@ -187,7 +200,19 @@ function rendererMountHarness(failingFeature = '') {
       createElement: () => new FakeElement(),
       getElementById: (id: string) => ({ click: () => calls.push(`click:${id}`) }),
     },
+    ...(lookups.projects ? { _projectsCache: lookups.projects } : {}),
+    loadProjects: async (force: boolean) => {
+      calls.push(`projects:load:${force}`);
+      return lookups.refreshedProjects ?? lookups.projects ?? [];
+    },
     window: {
+      uiIconHtml: (name: string) => `icon:${name}`,
+      connectorNavTarget: (id: string) => {
+        calls.push(`lookup:${id}`);
+        if (id === lookups.throwingConnector) throw new Error('catalog unavailable');
+        return lookups.connectors?.[id] ?? null;
+      },
+      loadConnectorNavTarget: async (id: string) => lookups.lateConnectors?.[id] ?? null,
       openConnectorSetupById: async (id: string) => { calls.push(`connector:guided:${id}`); return id !== 'missing'; },
       focusConnectorById: async (id: string) => { calls.push(`connector:configure:${id}`); return id !== 'missing'; },
       openAgentModal: () => calls.push('agent:create'),
@@ -209,7 +234,7 @@ function rendererMountHarness(failingFeature = '') {
     openMarketplace: (kind: string) => calls.push(`marketplace:${kind}`),
     setTimeout: (fn: () => void) => fn(),
     _quickStartText: (_key: string, fallback: string) => fallback,
-    t: (key: string, values: { name?: string } = {}) => `${key}:${values.name ?? ''}`,
+    t: (key: string, values: { name?: string; target?: string } = {}) => `${key}:${values.name ?? values.target ?? ''}`,
     uiToast: (message: string, opts: { variant?: string } = {}) => {
       toasts.push({ message, variant: opts.variant });
     },
@@ -223,6 +248,7 @@ function rendererMountHarness(failingFeature = '') {
     calls,
     toasts,
     host,
+    createHost: () => new FakeElement(),
     mount: (context as unknown as {
       __mountAppNavRequests: (target: FakeElement, message: Record<string, unknown>) => void;
     }).__mountAppNavRequests,
@@ -493,6 +519,105 @@ describe('group_chat app_nav registry', () => {
     ]);
   });
 
+  it('names each connector configure card with its brand icon so several cards stay distinguishable', async () => {
+    const { calls, host, mount } = rendererMountHarness('', {
+      connectors: {
+        gmail: { name: 'Gmail', iconSvg: '<svg>gmail</svg>' },
+        gcal: { name: 'Google Calendar', iconSvg: '' },
+      },
+      lateConnectors: { 'm365-mail': { name: 'Microsoft 365 Mail', iconSvg: '<svg>m365</svg>' } },
+      throwingConnector: 'broken',
+    });
+    mount(host, {
+      app_nav_requests: [
+        ...['gmail', 'gcal', 'm365-mail', 'retired', 'broken']
+          .map((id) => ({ surface_id: 'connectors', action: 'configure', target_id: id })),
+        // Other actions and surfaces keep their page labels, even for a known connector id.
+        { surface_id: 'connectors', action: 'add_custom' },
+        { surface_id: 'agents', action: 'configure', target_id: 'gmail' },
+      ],
+    });
+    const row = host.querySelector('.chat-app-nav-row')!;
+    const labels = () => row.children.map((button) => button.textContent);
+    // Resolved names paint at once; late lookups keep the page label until they resolve.
+    expect(labels()).toEqual([
+      'chat.app_nav_configure_target:Gmail',
+      'chat.app_nav_configure_target:Google Calendar',
+      'chat.app_nav_configure:Connectors',
+      'chat.app_nav_configure:Connectors',
+      'chat.app_nav_configure:Connectors',
+      'chat.app_nav_add_custom:Connectors',
+      'chat.app_nav_configure:AI Team',
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(labels()[2]).toBe('chat.app_nav_configure_target:Microsoft 365 Mail');
+    expect(labels().slice(3)).toEqual([
+      'chat.app_nav_configure:Connectors',
+      'chat.app_nav_configure:Connectors',
+      'chat.app_nav_add_custom:Connectors',
+      'chat.app_nav_configure:AI Team',
+    ]);
+    // Exactly one icon per card: the brand mark when the catalog ships one, else the page icon.
+    expect(row.children.map((button) => button.children.map((icon) => `${icon.className}|${icon.innerHTML}`)))
+      .toEqual([
+        ['chat-app-nav-btn-page-icon is-brand|<svg>gmail</svg>'],
+        ['chat-app-nav-btn-page-icon|icon:panel-list'],
+        ['chat-app-nav-btn-page-icon is-brand|<svg>m365</svg>'],
+        ['chat-app-nav-btn-page-icon|icon:panel-list'],
+        ['chat-app-nav-btn-page-icon|icon:panel-list'],
+        ['chat-app-nav-btn-page-icon|icon:panel-list'],
+        ['chat-app-nav-btn-page-icon|icon:panel-list'],
+      ]);
+    expect(calls.filter((call) => call.startsWith('lookup:')))
+      .toEqual(['lookup:gmail', 'lookup:gcal', 'lookup:m365-mail', 'lookup:retired', 'lookup:broken']);
+
+    row.children[2].click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls.at(-1)).toBe('connector:guided:m365-mail');
+  });
+
+  it('names project configure cards and refreshes the project list at most once per unseen project', async () => {
+    const { calls, host, createHost, mount } = rendererMountHarness('', {
+      projects: [{ project_id: 'p1', name: 'Weekly report' }],
+      refreshedProjects: [
+        { project_id: 'p1', name: 'Weekly report' },
+        { project_id: 'p2', name: 'Launch plan' },
+      ],
+    });
+    const request = (id: string) => ({ surface_id: 'projects', action: 'configure', target_id: id });
+    mount(host, { app_nav_requests: [request('p1'), request('p2'), request('deleted')] });
+    const row = host.querySelector('.chat-app-nav-row')!;
+    expect(row.children.map((button) => button.textContent)).toEqual([
+      'chat.app_nav_configure_target:Weekly report',
+      'chat.app_nav_configure:Projects',
+      'chat.app_nav_configure:Projects',
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(row.children.map((button) => button.textContent)).toEqual([
+      'chat.app_nav_configure_target:Weekly report',
+      'chat.app_nav_configure_target:Launch plan',
+      'chat.app_nav_configure:Projects',
+    ]);
+    expect(calls).toEqual(['projects:load:true', 'projects:load:true']);
+
+    // Repainting history must not reload the list again for a project that is already known missing.
+    const repaint = createHost();
+    mount(repaint, { app_nav_requests: [request('deleted')] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toEqual(['projects:load:true', 'projects:load:true']);
+    expect(repaint.querySelector('.chat-app-nav-row')!.children[0].textContent)
+      .toBe('chat.app_nav_configure:Projects');
+  });
+
+  it('ships a named configure label with its target placeholder in every renderer locale', () => {
+    const localeDir = path.join(path.dirname(RENDERER_CONVERSATION), '..', 'locales');
+    for (const file of fs.readdirSync(localeDir).filter((name) => name.endsWith('.json'))) {
+      const table = JSON.parse(fs.readFileSync(path.join(localeDir, file), 'utf8'));
+      expect(table['chat.app_nav_configure_target'], file).toContain('{target}');
+      expect(table['chat.app_nav_configure_target'], file).not.toBe(table['chat.app_nav_configure']);
+    }
+  });
+
   it('keeps navigation cards independent of private onboarding telemetry', () => {
     const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
     const start = source.indexOf('function _mountAppNavRequests');
@@ -530,6 +655,7 @@ describe('group_chat app_nav registry', () => {
     const calls: string[] = [];
     const cards = ['connector-1', 'connector-2'].map((id) => ({
       dataset: { id },
+      classList: { add: () => {}, remove: () => {} },
       setAttribute: (name: string, value: string) => calls.push(`attr:${id}:${name}:${value}`),
       scrollIntoView: () => calls.push(`scroll:${id}`),
       focus: () => calls.push(`focus:${id}`),
@@ -537,6 +663,12 @@ describe('group_chat app_nav registry', () => {
     const context = {
       loadConnectors: async () => { calls.push('load'); },
       _connectorsSearchQuery: 'previous search',
+      _connectorsActiveCategory: 'previous category',
+      _connectorsHighlightedId: '',
+      _connectorsHighlightTimer: null,
+      _catalogUiId: (id: string) => id,
+      setTimeout: () => 1,
+      clearTimeout: () => {},
       _renderConnectorsGrid: () => {},
       document: { querySelectorAll: () => cards, getElementById: () => null },
       // Cold grid: nothing painted yet, so the helper must load first.
@@ -548,6 +680,8 @@ describe('group_chat app_nav registry', () => {
 
     expect(await focusConnector(' connector-2 ')).toBe(true);
     expect(context._connectorsSearchQuery).toBe('');
+    expect(context._connectorsActiveCategory).toBe('');
+    expect(context._connectorsHighlightedId).toBe('connector-2');
     expect(calls).toEqual([
       'load',
       'attr:connector-2:tabindex:-1',
@@ -603,6 +737,7 @@ describe('group_chat app_nav registry', () => {
     expect(await openConnectorSetup(' xiaohongshu-orders ')).toBe(true);
     expect(calls.splice(0)).toEqual([
       'load',
+      'focus:xiaohongshu-seller',
       'form:xiaohongshu-seller',
     ]);
 
@@ -612,6 +747,7 @@ describe('group_chat app_nav registry', () => {
     expect(await openConnectorSetup('errored-shop')).toBe(true);
     expect(calls.splice(0)).toEqual([
       'load',
+      'focus:errored-shop',
       'form:errored-shop',
     ]);
 

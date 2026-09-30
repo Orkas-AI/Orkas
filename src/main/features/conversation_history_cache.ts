@@ -13,6 +13,8 @@
  */
 
 import * as fs from 'node:fs';
+import { isMainThread } from 'node:worker_threads';
+import { historyRequest } from './conversation-history-client';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -21,8 +23,8 @@ import { userConversationHistoryCacheDir } from '../paths';
 import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef } from '../util/log-redact';
 import { persistToolResult } from '../util/tool-result-cap';
-import { readJson, readJsonlPageWithOffsets, writeJson } from '../storage';
-import type { JsonlPage, JsonlRecordWithOffset } from '../storage';
+import { readJson, readJsonlPageWithOffsets, readJsonlWindow, writeJson } from '../storage';
+import type { JsonlPage, JsonlRecordWithOffset, JsonlWindow } from '../storage';
 import type { GroupMessage } from './group_chat/visibility';
 
 const log = createLogger('conversation-history-cache');
@@ -387,8 +389,7 @@ async function readJsonlRangeWithOffsets<T>(
       const { bytesRead } = await handle.read(block, 0, bytes, position);
       if (bytesRead <= 0) break;
       let lineStart = 0;
-      for (let i = 0; i < bytesRead; i += 1) {
-        if (block[i] !== 0x0a) continue;
+      for (let i = block.indexOf(0x0a); i >= 0 && i < bytesRead; i = block.indexOf(0x0a, i + 1)) {
         const current = block.subarray(lineStart, i);
         const line = lineSegments.length
           ? Buffer.concat([...lineSegments, current])
@@ -591,6 +592,7 @@ export async function readConversationHistoryPage(
   limit: number,
   before?: number | null,
 ): Promise<JsonlPage<GroupMessage>> {
+  if (isMainThread) return historyRequest({ kind: 'page', userId, sourceFile, limit, before });
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
   if ((before === undefined || before === null) && wanted <= LATEST_PAGE_MAX_RECORDS) {
     return latestPage(userId, sourceFile, wanted);
@@ -611,7 +613,30 @@ export async function purgeConversationHistoryCache(
   userId: string,
   sourceFile: string,
 ): Promise<void> {
+  if (isMainThread) return historyRequest({ kind: 'purge', userId, sourceFile });
   const key = `${userId}\u0000${path.resolve(sourceFile)}`;
   await builds.get(key)?.catch(() => {});
   await fsp.rm(cachePaths(userId, sourceFile).entryDir, { recursive: true, force: true });
+}
+
+/** Project a bounded search/forward window in the worker. */
+export async function readConversationHistoryWindow(
+  userId: string, sourceFile: string, start: number, limit = 10, after = 0,
+): Promise<JsonlWindow<GroupMessage>> {
+  if (isMainThread) return historyRequest({ kind: 'window', userId, sourceFile, start, limit, after });
+  const { toolResultsDir } = cachePaths(userId, sourceFile);
+  return readJsonlWindow<GroupMessage>(sourceFile, start, limit,
+    record => projectConversationHistoryRecord(record, toolResultsDir), after);
+}
+
+/** Active turns have no complete disk snapshot yet. Clone one record at a time
+ * so the host never queues multiple large live trails for projection. */
+export async function projectLiveConversationHistoryRecords(
+  userId: string, sourceFile: string, records: GroupMessage[],
+): Promise<GroupMessage[]> {
+  const projected: GroupMessage[] = [];
+  for (const record of records) {
+    projected.push(...await historyRequest<GroupMessage[]>({ kind: 'project', userId, sourceFile, records: [record] }));
+  }
+  return projected;
 }

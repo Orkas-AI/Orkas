@@ -4095,10 +4095,10 @@ describe("AgentRunner", () => {
           return;
         }
         if (call === 2) {
-          // Exercise the provider serialization boundary as well as recovery.
+          // Exercise the structured provider boundary as well as recovery.
           throw wrapErrorForTest(new ProviderError(
             '400: {"code":"context_length_exceeded","message":"Request rejected"}',
-            "mock",
+            "mock", 400, Object.assign(new Error('opaque'), { code: 'context_length_exceeded' }),
           ), "mock");
         }
         yield { type: "text_delta" as const, text: "done" };
@@ -4524,8 +4524,11 @@ describe("AgentRunner", () => {
     });
   });
 
-  it("stops a started compaction after 60 seconds without new content and opens the run-local circuit", async () => {
+  it.each([0, 120_000])("stops a started compaction after 60 awake seconds without new content (sleep: %sms)", async (suspendMs) => {
     vi.useFakeTimers();
+    let frozen: number | undefined;
+    let suspended = 0;
+    const idleNow = () => frozen ?? Date.now() - suspended;
     try {
       let receivedSignal: AbortSignal | undefined;
       let receivedFirstEventTimeoutMs: number | undefined;
@@ -4603,7 +4606,7 @@ describe("AgentRunner", () => {
         inputSchema: { type: "object", properties: {} },
         async execute() { return { content: "x".repeat(100_000) }; },
       });
-      const runner = new AgentRunner({ config, providers: registry, tools: [largeResult] });
+      const runner = new AgentRunner({ config, providers: registry, tools: [largeResult], idleNow });
       const session = runner.getSession();
       session.beginUserTurn([{ type: "text", text: "continue" }]);
       for (let i = 0; i < 5; i++) {
@@ -4618,6 +4621,13 @@ describe("AgentRunner", () => {
 
       await compactionStarted;
       await vi.advanceTimersByTimeAsync(0);
+      if (suspendMs) {
+        frozen = idleNow();
+        await vi.advanceTimersByTimeAsync(suspendMs);
+        expect(receivedSignal?.aborted).toBe(false);
+        suspended += suspendMs;
+        frozen = undefined;
+      }
       await vi.advanceTimersByTimeAsync(CONTEXT_COMPACTION_IDLE_TIMEOUT_MS + 1);
       await running;
 
@@ -4632,7 +4642,7 @@ describe("AgentRunner", () => {
         phase: "active_process_compaction_failed",
         data: expect.objectContaining({
           error: expect.stringContaining("Context compaction produced no new content"),
-          durationMs: CONTEXT_COMPACTION_IDLE_TIMEOUT_MS,
+          durationMs: CONTEXT_COMPACTION_IDLE_TIMEOUT_MS + suspendMs,
           disabledReason: "compaction_idle_timeout",
         }),
       }));
@@ -9283,4 +9293,96 @@ describe("runner persistence barriers", () => {
       expect(requests.join("\n")).not.toMatch(/SESSION_PERSISTENCE|EISDIR|could not be saved/);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   }, 15_000);
+});
+
+// The host supplies OS-aware elapsed time; every core tool execution lane
+// must preserve the remaining idle allowance without re-running the tool.
+it.each([
+  ['sequential', 'complete'], ['parallel', 'complete'], ['reflection', 'complete'],
+  ['programmatic', 'complete'], ['programmatic', 'idle'], ['programmatic', 'cancel'],
+] as const)('keeps %s tools bounded across suspension (%s)', async (lane, outcome) => {
+  vi.useFakeTimers();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let suspendedMs = 0;
+  let frozen: number | undefined;
+  const idleNow = () => frozen ?? Date.now() - suspendedMs;
+  const count = lane === 'parallel' ? 2 : 1;
+  const proposal = Array.from({ length: count }, (_, i) => ({ type: 'tool_use' as const, id: `sleep-${i}`, name: 'sleep_probe', input: {} }));
+  const requests: CompletionParams[] = [];
+  let started!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  const provider = createMockProvider([
+    { content: lane === 'programmatic' ? [{ type: 'tool_use', id: 'program', name: 'run_program', input: { code: 'json(await tools.sleep_probe({}));' } }] : proposal, stopReason: 'tool_use', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, model: 'mock-model' },
+    { content: [{ type: 'text', text: 'completed' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, model: 'mock-model' },
+  ], params => { requests.push(params); });
+  const complete = provider.complete.bind(provider);
+  provider.complete = params => { requests.push(params); return complete(params); };
+  const providers = new ProviderRegistry();
+  providers.registerFactory('mock', () => provider);
+  const signals: AbortSignal[] = [];
+  const execute = vi.fn(async (_input, ctx: ToolContext) => {
+    signals.push(ctx.signal!);
+    if (signals.length === count) started();
+    await gate;
+    return { content: 'saved once' };
+  });
+  const runner = new AgentRunner({
+    config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'mock-model', toolIdleTimeoutMs: 1000 } }),
+    providers, idleNow,
+    ...(lane === 'programmatic' ? { programmaticToolPolicy: { isEligible: (name: string) => name === 'sleep_probe', authorize: () => ({ allowed: true as const }) } } : {}),
+    tools: [defineTool({ name: 'sleep_probe', description: 'Persist one fixture result', inputSchema: { type: 'object', properties: {} },
+      executionMode: lane === 'parallel' ? 'parallel' : 'sequential', execute })],
+  });
+  const controller = new AbortController();
+  const events: AgentRunEvent[] = [];
+  let ended = false;
+  const run = (lane === 'reflection'
+    ? runner.runReflection('review', controller.signal)
+    : (async () => { for await (const event of runner.runStream({ message: 'work', signal: controller.signal })) events.push(event); return events.at(-1); })()
+  ).then(value => { ended = true; return value; });
+  try {
+    await ready;
+    await vi.advanceTimersByTimeAsync(200);
+    expect(execute).toHaveBeenCalledTimes(count);
+    frozen = idleNow();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ended).toBe(false);
+    expect(signals.every(signal => !signal.aborted)).toBe(true);
+    if (outcome === 'cancel') {
+      controller.abort();
+      await run;
+      expect(signals.every(signal => signal.aborted)).toBe(true);
+      expect(events.at(-1)).toMatchObject({ type: 'done', result: { meta: { aborted: true } } });
+      expect(requests).toHaveLength(1);
+      expect(execute).toHaveBeenCalledTimes(1);
+      return;
+    }
+    suspendedMs += 5000;
+    frozen = undefined;
+    await vi.advanceTimersByTimeAsync(799);
+    expect(signals.every(signal => !signal.aborted)).toBe(true);
+    if (outcome === 'idle') {
+      await vi.advanceTimersByTimeAsync(1);
+      expect(signals[0].aborted).toBe(true);
+    } else release();
+    await vi.advanceTimersByTimeAsync(0);
+    const result = await run;
+    if (lane === 'reflection') expect(result).toBe('completed');
+    else {
+      expect(events.filter(event => event.type === 'tool_end')).toHaveLength(count);
+      expect(events.filter(event => event.type === 'tool_end').every(event => !event.isError)).toBe(true);
+      if (lane === 'programmatic') {
+        const programEnd = events.find(event => event.type === 'tool_end' && event.name === 'run_program');
+        expect(programEnd).toMatchObject({ result: expect.stringContaining(outcome === 'idle' ? 'Tool execution stalled after 1000ms' : 'saved once') });
+        if (outcome === 'idle') expect(programEnd?.type === 'tool_end' && programEnd.result).toMatch(/\"ok\"\s*:\s*false/);
+      }
+      expect(events.at(-1)).toMatchObject({ type: 'done', result: { text: 'completed' } });
+    }
+    expect(execute).toHaveBeenCalledTimes(count);
+    expect(requests).toHaveLength(2);
+  } finally {
+    release(); controller.abort(); await run;
+    vi.clearAllTimers(); vi.useRealTimers();
+  }
 });

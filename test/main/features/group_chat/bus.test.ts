@@ -481,6 +481,7 @@ afterEach(async () => {
     // Some skipped/failed setup paths may not have loaded the bus module yet.
   }
   await drainMainRuntimeForTest();
+  await (await import('../../../../src/main/features/conversation-history-client')).closeConversationHistoryWorker();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -741,6 +742,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     cliRunMock.nextResult = { runId: 'display-test', status: 'completed', output: 'Complete reply', finalMessageText: 'Complete reply' };
     await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} inspect` });
     await waitForQuiescent(TEST_UID, cid);
+    recovered = await recovered;
     expect(recovered.turns).toHaveLength(1);
     const records = recovered.turns[0].records;
     expect(records.at(-1).text).toBe('Partial reply\n');

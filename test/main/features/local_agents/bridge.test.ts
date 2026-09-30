@@ -990,6 +990,31 @@ describe('local_agents/bridge › auth + skills', () => {
     }
   });
 
+  it('uses native draft creation evidence through the CLI bridge and retains confirmation for existing drafts', async () => {
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+      instance: { id: 'gmail', display_name: 'Gmail', origin: 'catalog', created_at: 1 },
+      tools: ['create_draft', 'delete_draft'].map(name => ({ name, description: '', input_schema: {} })),
+    }] as any);
+    bridgeConnectorMock.callTool.mockImplementation(async (_uid: any, _id: any, name: any) => ({
+      content: [{ type: 'text', text: JSON.stringify(name === 'create_draft'
+        ? { id: 'new-draft', messageId: 'new-message' } : { ok: true }) }],
+    }));
+    bridgeActionConfirmMock.request.mockResolvedValue(false);
+    const bridge = await startTestBridge({ runId: 'draft-cleanup' });
+    const call = async (tool_name: string, id?: string) => (await rpcOnce(bridge.socketPath, {
+      id: 1, token: bridge.token, method: 'connectors.call',
+      params: { connector_id: 'gmail', tool_name, args: id ? { id } : {} },
+    })).reply;
+    try {
+      expect(await call('create_draft')).toMatchObject({ ok: true });
+      expect(await call('delete_draft', 'new-draft')).toMatchObject({ ok: true });
+      expect(bridgeActionConfirmMock.request).not.toHaveBeenCalled();
+      expect(await call('delete_draft', 'user-draft')).toMatchObject({ ok: false });
+      expect(bridgeActionConfirmMock.request).toHaveBeenCalledOnce();
+      expect(bridgeConnectorMock.callTool).toHaveBeenCalledTimes(2);
+    } finally { await bridge.close(); }
+  });
+
   it('connectors.call normalizes schema field names and preserves explicit provider arguments', async () => {
     // A Gmail fetch from an external CLI must reach the provider with the same
     // request shape a built-in Agent produces: schema-declared snake_case keys.

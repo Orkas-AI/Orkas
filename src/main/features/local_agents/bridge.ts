@@ -74,6 +74,7 @@ import {
 import * as connectors from '../connectors';
 import { requestActionConfirm, connectorAccountKey } from '../connectors/action_confirm';
 import { connectorActionRisk, isConnectorActionBlocked } from '../connectors/action_policy';
+import { observeTaskDraftResult } from '../connectors/task-created-drafts';
 import {
   type LocalCliPermissionPolicy,
   type LocalCliType,
@@ -466,7 +467,9 @@ function _buildMethods(
         }
 
         if (call.signal.aborted) throw cancelled();
-        const actionRisk = connectorActionRisk(target.instance, tool, args);
+        const draftScope = !target.instance.composio_grant
+          ? { uid: opts.uid, cid: opts.cid, connectorId, accountKey: connectorAccountKey(target.instance) } : undefined;
+        const actionRisk = connectorActionRisk(target.instance, tool, args, draftScope);
         if (actionRisk.risk === 'H' || actionRisk.risk === 'D') {
           const resumeIdle = opts.onPermissionWaitStart?.();
           let approved: boolean;
@@ -498,6 +501,7 @@ function _buildMethods(
         const raw = await connectors.callTool(opts.uid, connectorId, toolName, args, {
           signal: call.signal,
         });
+        if (!call.signal.aborted) observeTaskDraftResult(draftScope, toolName, args, raw);
         const text = connectors.stringifyMcpResult(raw);
         assertActive();
         if (Buffer.byteLength(text, 'utf8') <= CONNECTOR_RESULT_CAP) return { text };
@@ -567,7 +571,7 @@ function _buildMethods(
       // Reads and writes share native validation, paging, scope and execution facts.
       const tool = createProjectTasksTool(createProjectTasksHandler(opts.uid, opts.projectId || '', opts.cid, names, {
         actorId: opts.agentId,
-      }), { readOnly, globalScope: !opts.projectId });
+      }, { sourceProjectId: opts.projectId || '', workingDir: opts.workingDir }), { readOnly, globalScope: !opts.projectId });
       const result = await tool.execute(params, { state: {} });
       const receipt = JSON.parse(result.content);
       if (result.isError) throw new Error(receipt.error || 'task operation failed');

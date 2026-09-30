@@ -7,7 +7,12 @@
 
 const { sweepLogDirectory } = require('./util/log-retention');
 
-import log from 'electron-log/main';
+import { isMainThread } from 'node:worker_threads';
+// Electron APIs are unavailable inside Node workers, including packaged ASAR
+// workers. Use the same transports/redaction with electron-log's Node adapter.
+const log: typeof import('electron-log/main').default = require(
+  isMainThread ? 'electron-log/main' : 'electron-log/node',
+);
 import type { LogMessage } from 'electron-log';
 
 import { LOGS_DIR } from './paths';
@@ -189,6 +194,10 @@ export function initLogger(): void {
   // Renderer logging already has its own bounded bridge and console mirror.
   // electron-log's implicit development IPC serializes raw data synchronously.
   if (log.transports.ipc) log.transports.ipc.level = false;
+  // Most Vitest cases reset the module graph against a short-lived workspace.
+  // A real background worker can outlive that workspace and recreate its logs
+  // during teardown. Dedicated delivery tests opt back in explicitly.
+  if (process.env.VITEST && process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY === '1') return;
   try {
     const delivery = createLogDelivery({
       directory: LOGS_DIR, fileLevel, consoleLevel,

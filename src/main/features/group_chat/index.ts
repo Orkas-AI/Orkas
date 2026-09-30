@@ -8,7 +8,7 @@
  *   - Abort group + drop on conv delete
  */
 
-import { projectConversationHistoryRecords } from '../conversation_history_cache';
+import { projectLiveConversationHistoryRecords } from '../conversation_history_cache';
 import { inspectCodingDirectory } from '../local_agents/project-directory';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
@@ -53,15 +53,15 @@ import {
 export const busIsQuiescent = isQuiescent;
 
 /** Reuse history's lazy tool-output projection for an active public turn. */
-export function displaySnapshot(userId: string, cid: string, projectIdHint?: string | null) {
+export async function displaySnapshot(userId: string, cid: string, projectIdHint?: string | null) {
   const snapshot = liveDisplaySnapshot(userId, cid);
   const source = conversationMessageReadFile(userId, cid, projectIdHint);
   return {
     ...snapshot,
-    turns: snapshot.turns.map((turn) => ({
+    turns: await Promise.all(snapshot.turns.map(async (turn) => ({
       ...turn,
-      records: projectConversationHistoryRecords(userId, source, turn.records),
-    })),
+      records: await projectLiveConversationHistoryRecords(userId, source, turn.records),
+    }))),
   };
 }
 
@@ -903,6 +903,7 @@ export async function setFloor(userId: string, cid: string, actorId: string | st
         const agentsFeat = await import('../agents');
         const agent = await agentsFeat.getAgent(id);
         if (!agent) return { ok: false as const, error: 'unknown agent' };
+
       } catch {
         return { ok: false as const, error: 'unknown agent' };
       }

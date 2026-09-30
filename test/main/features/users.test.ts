@@ -68,6 +68,17 @@ describe('features/users › activateUser', () => {
     }
   });
 
+  it('keeps activating when the move journal directory cannot be read', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const movesDir = paths.userConversationMovesDir('u1');
+    fs.mkdirSync(path.dirname(movesDir), { recursive: true });
+    fs.writeFileSync(movesDir, 'not a directory');
+
+    expect(() => users.activateUser('u1')).not.toThrow();
+    expect(users.getActiveUserId()).toBe('u1');
+  });
+
   it('pins CORE_AGENT_AUTH_DIR to <uid>/local/config/', async () => {
     const users = await import('../../../src/main/features/users');
     users.activateUser('u1');
