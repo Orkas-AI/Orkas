@@ -12,6 +12,53 @@ async function openGeneralSettings(page: Page): Promise<void> {
 
 test.describe('settings persistence', () => {
 
+  test('switches tabs immediately while settings loads and preserves the choice after repeated loads', async ({ orkas }) => {
+    const page = orkas.page!;
+    await page.evaluate(() => {
+      const root = window as any;
+      const original = root.loadRendererFeature;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      root.__releaseSettingsFeature = release;
+      root.__settingsFeatureHeld = false;
+      root.loadRendererFeature = async (name: string) => {
+        if (name === 'settings') { root.__settingsFeatureHeld = true; await gate; }
+        return original(name);
+      };
+    });
+    try {
+      await page.locator('#settings-btn').click();
+      const general = page.locator('.settings-tab[data-settings-tab="general"]');
+      const models = page.locator('.settings-tab[data-settings-tab="credentials"]');
+      await general.click();
+      await expect(general).toHaveAttribute('aria-selected', 'true');
+      await expect(page.locator('[data-settings-pane="general"]')).toBeVisible();
+      await expect.poll(() => page.evaluate(() => (window as any).__settingsFeatureHeld)).toBe(true);
+      expect(await page.evaluate(() => typeof (window as any).loadSettings)).toBe('undefined');
+      await general.press('ArrowLeft');
+      await expect(models).toBeFocused();
+      await expect(models).toHaveAttribute('aria-selected', 'true');
+      await expect(page.locator('[data-settings-pane="credentials"]')).toBeVisible();
+      await models.press('End');
+      await expect(general).toBeFocused();
+      await expect(general).toHaveAttribute('aria-selected', 'true');
+      await page.evaluate(async () => {
+        const root = window as any;
+        root.__releaseSettingsFeature();
+        await root.loadRendererFeature('settings');
+        await root.loadSettings();
+        await root.loadSettings();
+      });
+      await expect(general).toHaveAttribute('aria-selected', 'true');
+      await general.press('ArrowLeft');
+      await expect(models).toBeFocused();
+      await expect(models).toHaveAttribute('aria-selected', 'true');
+    } finally {
+      await page.evaluate(() => (window as any).__releaseSettingsFeature());
+    }
+  });
+
+
   test('persists the Agent self-evolution preference through the real settings UI', async ({ metacognitionOrkas }) => {
     if (!metacognitionOrkas.page) throw new Error('Orkas renderer is unavailable');
     await openGeneralSettings(metacognitionOrkas.page);

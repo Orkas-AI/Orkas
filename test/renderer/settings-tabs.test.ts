@@ -112,11 +112,12 @@ describe('settings tabs module', () => {
     expect(lazyFeatures).toContain("{ src: './modules/settings.js' }");
   });
 
-  it('binds clicks and toggles the matching settings pane', () => {
+  it('binds the first click eagerly and preserves selection on repeated initialization', () => {
     const { window, tabs, panes } = loadSettingsTabsModule();
 
-    window.initSettingsTabs();
     tabs[1].click();
+    window.initSettingsTabs();
+    window.initSettingsTabs();
 
     expect(tabs[0].classList.contains('is-active')).toBe(false);
     expect(tabs[1].classList.contains('is-active')).toBe(true);
@@ -134,6 +135,12 @@ describe('settings tabs module', () => {
     const { window, tabs, panes } = loadSettingsTabsModule();
 
     window.initSettingsTabs();
+    window.initSettingsTabs();
+    window.initSettingsTabs();
+    for (const tab of tabs) {
+      expect(tab.listeners.get('click')).toHaveLength(1);
+      expect(tab.listeners.get('keydown')).toHaveLength(1);
+    }
     const event = tabs[0].keydown('ArrowLeft');
 
     expect(event.preventDefault).toHaveBeenCalledOnce();
