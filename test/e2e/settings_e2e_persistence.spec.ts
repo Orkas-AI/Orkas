@@ -106,9 +106,37 @@ test.describe('settings persistence', () => {
     });
   }
 
-  test('changes all local execution modes in the UI and persists the selected mode', async ({ orkas }) => {
+  test('changes all local execution modes in the UI and persists the selected mode', async ({ orkas }, testInfo) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     await openGeneralSettings(orkas.page);
+
+    await orkas.page.locator('#settings-language-select .ai-select-trigger').click();
+    await orkas.page.locator('body > .ai-select-popover:not([hidden]) .ai-select-item').filter({ hasText: '简体中文' }).click();
+    await expect(orkas.page.locator('html')).toHaveAttribute('lang', 'zh-CN');
+
+    for (const width of [1280, 600]) {
+      await orkas.page.setViewportSize({ width, height: 900 });
+      const layout = await orkas.page.locator('#settings-localexec-modes').evaluate(list => {
+        const row = list.closest('.settings-row')!;
+        const title = row.querySelector('.settings-row-title')!;
+        const review = document.getElementById('settings-metacognition-title')!;
+        const rect = (node: Element) => { const box = node.getBoundingClientRect(); return { x: box.x, right: box.right, width: box.width }; };
+        return { title: rect(title), review: rect(review), list: rect(list), row: rect(row),
+          padding: parseFloat(getComputedStyle(row).paddingLeft),
+          options: Array.from(list.querySelectorAll('.settings-mode-opt'), rect) };
+      });
+      expect(Math.abs(layout.title.x - layout.review.x)).toBeLessThanOrEqual(1);
+      expect(Math.abs(layout.list.x - layout.title.x)).toBeLessThanOrEqual(1);
+      expect(layout.padding).toBe(width > 640 ? 18 : 16);
+      expect(Math.abs(layout.list.width - (layout.row.width - 2 * layout.padding))).toBeLessThanOrEqual(1);
+      for (const option of layout.options) {
+        expect(Math.abs(option.x - layout.title.x)).toBeLessThanOrEqual(1);
+        expect(option.right).toBeLessThanOrEqual(layout.row.right - layout.padding + 1);
+      }
+      await orkas.page.locator('.settings-section').filter({ has: orkas.page.locator('#settings-localexec-modes') })
+        .screenshot({ path: testInfo.outputPath(`settings-agent-behavior-${width}.png`) });
+    }
+    await orkas.page.setViewportSize({ width: 1280, height: 900 });
 
     const mode = (value: string) => orkas.page!.locator(
       `#settings-localexec-modes input[name="localexec-mode"][value="${value}"]`,

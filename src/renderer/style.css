@@ -14689,13 +14689,7 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 /* Rows inside the benefits wrapper always follow the status row, so they all
    carry a top hairline (the sibling rule below can't see across the wrapper). */
 
-@media (max-width: 640px) {
-  .settings-row { flex-wrap: wrap; padding: 14px 16px; }
-  .settings-row > .ai-select.settings-row-select { max-width: 100%; width: 100%; }
-  .settings-nav { padding: 18px 20px 0; }
-  .settings-body { padding: 0 20px; }
-  .settings-tabs { gap: 18px; }
-}
+
 
 /* Invite card (account tab). */
 /* Sync status pill (data tab). Variants: default = success / is-syncing =
@@ -14842,8 +14836,11 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 .settings-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 10px;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 15px 18px;
+  min-height: 58px;
+  margin-bottom: 0;
 }
 .settings-row[hidden] { display: none !important; }
 .settings-sheet > .settings-row { border-top: 0; }
@@ -14940,6 +14937,14 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 .settings-mode-desc { font-size: 12px; color: var(--text-2); line-height: 1.4; }
 .settings-mode-opt:has(input:checked) .settings-mode-label { color: var(--primary-text); }
 .settings-mode-opt:has(input:checked) { background: rgba(91, 87, 214, 0.06); }
+
+@media (max-width: 640px) {
+  .settings-row { flex-wrap: wrap; padding: 14px 16px; }
+  .settings-row > .ai-select.settings-row-select { max-width: 100%; width: 100%; }
+  .settings-nav { padding: 18px 20px 0; }
+  .settings-body { padding: 0 20px; }
+  .settings-tabs { gap: 18px; }
+}
 
 /* Old inline toggle label (kept for any remaining `label.settings-toggle`). */
 .settings-lang-opt {
@@ -19287,15 +19292,7 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
 .settings-row > label.settings-toggle input[type="checkbox"] { margin: 0; }
 .settings-row > label.settings-toggle.settings-toggle-tight { flex: 0 0 auto; }
 
-.settings-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-  padding: 15px 18px;
-  min-height: 58px;
-  margin-bottom: 0;
-}
+
 .settings-sheet > .settings-row:not([hidden]) ~ .settings-row { border-top: 1px solid var(--border); }
 .settings-row > .btn,
 .settings-row > .toggle-switch { flex: 0 0 auto; }
