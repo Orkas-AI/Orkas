@@ -283,7 +283,9 @@ describe('history refresh overlapping a Codex handback', () => {
     };
     for (const name of ['_setChatScrollOffset', '_ensureCreateAgentInlineObserver',
       '_ensureConvCreateAgentInline', '_syncFailedFromHistory',
-      '_setLoadEarlierHistory', '_scheduleConversationTurnNavigation', '_renderConvDisabledBanner',
+      '_setLoadEarlierHistory', '_setLoadNewerHistory', '_setHistoryLatestAction',
+      '_bindAutoLoadEarlierHistory',
+      '_scheduleConversationTurnNavigation', '_renderConvDisabledBanner',
       '_scrollToBottomNoAnim', '_observeConversationRunFromPlanAction', '_startRuntimeActorRecovery']) {
       context[name] = () => {};
     }

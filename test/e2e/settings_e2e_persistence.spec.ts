@@ -11,6 +11,7 @@ async function openGeneralSettings(page: Page): Promise<void> {
 }
 
 test.describe('settings persistence', () => {
+
   test('persists the Agent self-evolution preference through the real settings UI', async ({ metacognitionOrkas }) => {
     if (!metacognitionOrkas.page) throw new Error('Orkas renderer is unavailable');
     await openGeneralSettings(metacognitionOrkas.page);
@@ -69,26 +70,37 @@ test.describe('settings persistence', () => {
     await expect(relaunchedPage.locator('#settings-task-notifications-toggle')).not.toBeChecked();
   });
 
-  for (const [code, label] of [
+  for (const [code, label, htmlLang = code] of [
     ['es', 'Español'], ['fr', 'Français'], ['ko', '한국어'],
     ['de', 'Deutsch'], ['ru', 'Русский'], ['it', 'Italiano'],
+    ["ar", "العربية", "ar"],
+    ["zh-tw", "繁體中文", "zh-TW"],
+    ["hi", "हिन्दी", "hi"],
+    ["id", "Bahasa Indonesia", "id"],
+    ["pt-pt", "Português (Portugal)", "pt-PT"],
+    ["es-419", "Español (Latinoamérica)", "es-419"],
+    ["th", "ไทย", "th"],
+    ["tr", "Türkçe", "tr"],
+    ["vi", "Tiếng Việt", "vi"],
+
   ]) {
     test(`selects ${code} from the language menu and restores it on first paint`, async ({ orkas }, testInfo) => {
       const page = orkas.page!;
       await openGeneralSettings(page);
       const select = page.locator('#settings-language-select');
       await select.locator('.ai-select-trigger').click();
-      const option = page.locator('body > .ai-select-popover:not([hidden]) .ai-select-item').filter({ hasText: label });
+      const option = page.locator('body > .ai-select-popover:not([hidden]) .ai-select-item').getByText(label, { exact: true });
       await option.click();
-      await expect(page.locator('html')).toHaveAttribute('lang', code);
+      await expect(page.locator('html')).toHaveAttribute('lang', htmlLang);
       await expect(select).toHaveAttribute('data-value', code);
+      await expect(page.locator('html')).toHaveAttribute('dir', code === 'ar' ? 'rtl' : 'ltr');
       await page.locator('[data-settings-pane="general"]').screenshot({ path: testInfo.outputPath('settings-' + code + '.png') });
       const overflow = await page.locator('[data-settings-pane="general"]').evaluate((element) => {
         return element.scrollWidth > element.clientWidth + 1;
       });
       expect(overflow).toBe(false);
       const reopened = await orkas.relaunch();
-      await expect(reopened.locator('html')).toHaveAttribute('lang', code);
+      await expect(reopened.locator('html')).toHaveAttribute('lang', htmlLang);
       await openGeneralSettings(reopened);
       await expect(reopened.locator('#settings-language-select')).toHaveAttribute('data-value', code);
     });

@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -26,7 +27,7 @@ function extractFunction(name: string): string {
 function simulatePickerSearchDelete(searchValue: string, key: string) {
   const consumeAt = extractFunction('_consumeAtKeyChar');
   const bindPickers = extractFunction('bindAgentPickers');
-  return vm.runInNewContext(`
+  return vm.runInNewContext(composerAccessorSource + '\n' + (`
     let closed = 0;
     let prevented = false;
     let focused = false;
@@ -80,7 +81,7 @@ function simulatePickerSearchDelete(searchValue: string, key: string) {
       preventDefault() { prevented = true; },
     });
     ({ value: chatInput.value, closed, prevented, focused, events, mark: _atKeyMark });
-  `, {});
+  `), {});
 }
 
 describe('agent picker @ delete handling', () => {

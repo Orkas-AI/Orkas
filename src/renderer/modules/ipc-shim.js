@@ -22,6 +22,8 @@ let _ipcErrorSentCount = 0;
 //   - opts.stream: boolean (this call yields an SSE-style stream)
 //   - opts.wrapAsUpdates: wrap the whole body under `updates` key
 const _IPC_ROUTES = [
+  ['GET', '/api/projects/tasks/attachments/abs-path', 'projects.tasks.attachments.absPath'],
+  ['POST', '/api/connectors/account-choice-response', 'connectors.account_choice_response'],
   // Exact routes
   ['GET',    '/api/auth/status',              { fake: { ok: true, authenticated: true } }],
   ['GET',    '/api/user/init',                'user.init'],
@@ -71,6 +73,7 @@ const _IPC_ROUTES = [
   ['DELETE', /^\/api\/conversations\/([^/]+)$/,            'conversations.delete',       ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/pin$/,       'conversations.pin',          ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/rename$/,    'conversations.rename',       ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/move$/,      'conversations.move',         ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/history$/,   'conversations.history',      ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/turns$/,     'conversations.turns',        ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/files$/,     'conversations.files.list',   ['cid']],

@@ -226,12 +226,6 @@ describe('ConversationInfo produced-file Library import', () => {
     });
     expect(harness.uiToast).toHaveBeenCalledWith('Added to Project Library', { variant: 'success' });
     expect(harness.uiAlert).not.toHaveBeenCalled();
-    expect(harness.monitorEvent).toHaveBeenCalledWith('file_preview_add_library_result', expect.objectContaining({
-      result: 'success',
-      surface: 'conversation_info',
-      kind: 'image',
-      scope: 'project',
-    }));
   });
 
   it('uses the shipped Chinese copy to say the result was saved to Project Library', async () => {
@@ -271,14 +265,6 @@ describe('ConversationInfo produced-file Library import', () => {
 
     expect(harness.uiToast).not.toHaveBeenCalled();
     expect(harness.uiAlert).toHaveBeenCalledWith('Add to Library failed: not_found');
-    expect(harness.monitorEvent).toHaveBeenCalledWith('file_preview_add_library_result', expect.objectContaining({
-      result: 'failure',
-      surface: 'conversation_info',
-      kind: 'image',
-      error_type: 'operation',
-      error_code: 'source_not_found',
-    }));
-    expect(JSON.stringify(harness.monitorEvent.mock.calls)).not.toContain('/workspace/poster.png');
   });
 
   it('executes the project-only video action instead of silently returning', async () => {

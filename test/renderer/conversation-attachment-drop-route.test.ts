@@ -231,17 +231,6 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
         sha256: sha256Hex(file.bytes!),
         status: 'ready',
       })]);
-      expect(h.clicks).toEqual([{
-        name: 'chat_attachment_upload',
-        payload: { source: sourceName, target: 'conversation', file_count: 1 },
-      }]);
-      expect(h.events).toEqual([{
-        name: 'chat_attachment_upload_result',
-        payload: {
-          source: sourceName, target: 'conversation', file_count: 1,
-          result: 'success', uploaded_count: 1, failed_count: 0,
-        },
-      }]);
       expect(h.alerts).toEqual([]);
     },
   );
@@ -279,12 +268,9 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
       name: 'screenshot.png', kind: 'image', dataUrl: 'blob:screenshot.png',
       sha256: sha256Hex(blob.bytes!), status: 'ready',
     })]);
-    expect(h.events).toEqual([expect.objectContaining({
-      payload: expect.objectContaining({ result: 'success', uploaded_count: 1, failed_count: 0 }),
-    })]);
   });
 
-  it('splits one mixed drop into both routes under a single click/result telemetry pair', async () => {
+  it('splits one mixed drop into both routes without duplicate imports', async () => {
     const h = loadHarness();
     const osFile = fakeFile('notes.md', { localPath: '/tmp/notes.md' });
     const blob = fakeFile('pasted.png', { bytes: new Uint8Array([1, 2, 3, 4]) });
@@ -300,14 +286,6 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
       ['notes.md', 'ready'],
       ['pasted.png', 'ready'],
     ]);
-    expect(h.clicks).toHaveLength(1);
-    expect(h.events).toEqual([{
-      name: 'chat_attachment_upload_result',
-      payload: {
-        source: 'drop', target: 'conversation', file_count: 2,
-        result: 'success', uploaded_count: 2, failed_count: 0,
-      },
-    }]);
   });
 
   it('shows the same rejection outcome whether main refuses the file on the path route or the byte route', async () => {
@@ -335,9 +313,6 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
         'chat.attach_rejected_prefix:'
         + JSON.stringify({ list: 'chat.attach_upload_fail:' + JSON.stringify({ name: 'huge.zip', reason: 'errors.file_too_large_mb' }) }),
       ]);
-      expect(h.events).toEqual([expect.objectContaining({
-        payload: expect.objectContaining({ result: 'failure', uploaded_count: 0, failed_count: 1 }),
-      })]);
     }
   });
 
@@ -362,9 +337,6 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
     await done;
     expect(h.chips.get(CID)).toEqual([]);
     expect(h.context.URL.revokeObjectURL).toHaveBeenCalledExactlyOnceWith(`blob:${name}`);
-    expect(h.events).toEqual([expect.objectContaining({
-      payload: expect.objectContaining({ result: 'failure', failed_count: 1 }),
-    })]);
   });
 
   it.each(['ready', 'error'])('retains a preview while its %s chip remains available', async status => {
@@ -390,10 +362,6 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
 
     expect(h.uploads).toEqual([]);
     expect(h.chips.get(CID)!.map((c) => c.name)).toEqual(['a.txt']);
-    expect(h.events[1]).toEqual({
-      name: 'chat_attachment_upload_result',
-      payload: expect.objectContaining({ source: 'paste', result: 'skipped', uploaded_count: 0, failed_count: 0 }),
-    });
   });
 
   it('falls back to the byte upload when preload cannot resolve paths at all', async () => {
@@ -418,9 +386,6 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
     expect(h.chips.get(CID)).toEqual([expect.objectContaining({ name: 'kept.md', status: 'error' })]);
     expect(h.alerts).toHaveLength(1);
     expect(h.alerts[0]).toContain('ipc reply lost');
-    expect(h.events).toEqual([expect.objectContaining({
-      payload: expect.objectContaining({ result: 'failure', uploaded_count: 0, failed_count: 1 }),
-    })]);
   });
 
   it('still rejects unsupported extensions before either route runs', async () => {
@@ -433,8 +398,5 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
     expect(h.uploads).toEqual([]);
     expect(h.chips.get(CID)).toBeUndefined();
     expect(h.alerts[0]).toContain('chat.attach_unsupported');
-    expect(h.events).toEqual([expect.objectContaining({
-      payload: expect.objectContaining({ result: 'failure', uploaded_count: 0, failed_count: 1 }),
-    })]);
   });
 });

@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
@@ -143,7 +144,7 @@ function loadDrawer(input: {
     t: (key: string) => key,
     console,
   };
-  vm.runInNewContext(source, sandbox, { filename: 'chat-md-drawer.js' });
+  vm.runInNewContext(composerAccessorSource + '\n' + (source), sandbox, { filename: 'chat-md-drawer.js' });
   return {
     drawer: module.exports,
     document,

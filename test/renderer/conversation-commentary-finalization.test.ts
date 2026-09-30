@@ -42,8 +42,11 @@ function loadCommentaryHarness() {
     _paintStreamingFinalMarkdown: paint,
     requestAnimationFrame: (callback: () => void) => { callback(); return 1; },
     setTimeout,
+    clearTimeout,
   };
   const funcs = [
+    source.match(/^const STREAMING_MARKDOWN_PAINT_INTERVAL_MS = .*;$/m)![0],
+    extractFunction('_queueStreamingPaint'),
     extractFunction('_streamingFinalizeCommentary'),
     extractFunction('_streamingAppendFinalDelta'),
   ].join('\n');

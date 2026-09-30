@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -102,7 +103,7 @@ function loadQueueDraft(stored = new Map<string, string>()) {
       recipientsByCid.set(context.currentCid, recipient);
     }),
     focusChatRichComposer: vi.fn(() => false),
-    syncChatRichComposerFromTextarea: vi.fn(),
+    refreshChatComposer: vi.fn(),
     _chatAttachList: (cid: string) => attachmentsByCid.get(cid) || [],
     _chatAttachSet: (cid: string, items: any[]) => { attachmentsByCid.set(cid, items); },
     _chatAttachExtOf: (name: string) => {
@@ -134,6 +135,7 @@ function loadQueueDraft(stored = new Map<string, string>()) {
     _referenceSnapshotsForQuotes: (references: any[]) => references,
   };
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
   vm.runInContext(source, context, { filename: 'queue-draft.js' });
   return { context, input, stored, attachmentsByCid, recipientsByCid, quotesByCid };
 }
@@ -254,6 +256,7 @@ describe('stop and settlement wiring', () => {
       document: { getElementById: () => null },
     };
     vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(`
       ${extractFunction('_settleConversationPlaceholdersOnAbort')}
       ${extractFunction('abortConvStream')}
@@ -292,6 +295,7 @@ describe('stop and settlement wiring', () => {
       document: { getElementById: () => null },
     };
     vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(`${extractFunction('_finishStreamingMsg')}`, context, { filename: 'finish.js' });
 
     context._finishStreamingMsg('conv-a');

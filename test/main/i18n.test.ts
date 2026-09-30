@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   t, setCurrentLang, getCurrentLang,
   acceptLanguageHeader, detectSystemLang, descriptionLang, getRendererBootTables,
-  fallbackChain, isLang, _resetCacheForTests,
+  fallbackChain, isLang, normalizeLang, LOCALES, _resetCacheForTests,
 } from '../../src/main/i18n';
 
 beforeEach(() => {
@@ -12,17 +12,50 @@ beforeEach(() => {
 
 describe('i18n › detectSystemLang', () => {
   it.each([
-    ['es-MX', 'es'], ['fr-CA', 'fr'], ['ko-KR', 'ko'],
+    ['zh-TW', 'zh-tw'], ['zh_HK', 'zh-tw'], ['zh-MO', 'zh-tw'],
+    ['zh-Hant', 'zh-tw'], ['zh-Hant-CN', 'zh-tw'], ['zh-Hans-TW', 'zh'],
+    ['pt-PT', 'pt-pt'], ['pt_AO', 'pt-pt'], ['pt-BR', 'pt'],
+    ['es-419', 'es-419'], ['es-AR', 'es-419'], ['es-US', 'es-419'], ['es-ES', 'es'],
+    ['ar-SA', 'ar'], ['hi-IN', 'hi'], ['id-ID', 'id'], ['id', 'id'], ['th-TH', 'th'], ['tr-TR', 'tr'], ['vi-VN', 'vi'],
+    ['zh-Hant-TW-u-nu-latn', 'zh-tw'], ['pt-PT-u-hc-h23', 'pt-pt'],
+  ] as const)('selects the intended script/region for %s', (tag, expected) => {
+    expect(detectSystemLang(tag)).toBe(expected);
+    expect(fallbackChain(expected)).toEqual([expected, 'en']);
+  });
+
+  it('honors OS preference order, skipping unsupported entries before English fallback', () => {
+    expect(detectSystemLang(['nl-NL', 'zh-Hant-HK', 'en-US'])).toBe('zh-tw');
+    expect(detectSystemLang(['en-US', 'ar-SA'])).toBe('en');
+    expect(detectSystemLang(['nl', 'sv-SE'])).toBe('en');
+    expect(detectSystemLang([])).toBe('en');
+    for (const malformed of ['constructor', '__proto__', 'pt--PT', 'zh fake', 'es-419<script>']) {
+      expect(normalizeLang(malformed)).toBeNull();
+    }
+  });
+
+  it('keeps regional variants adjacent in English-name order and places Arabic last', () => {
+    expect(LOCALES.map(item => item.code)).toEqual([
+      'zh', 'zh-tw', 'en', 'fr', 'de', 'hi', 'id', 'it', 'ja', 'ko',
+      'pt', 'pt-pt', 'ru', 'es', 'es-419', 'th', 'tr', 'vi', 'ar',
+    ]);
+    expect(LOCALES.find(item => item.code === 'zh-tw')?.label).toBe('繁體中文');
+    expect(LOCALES.find(item => item.code === 'pt-pt')?.label).toBe('Português (Portugal)');
+    expect(LOCALES.find(item => item.code === 'id')?.label).toBe('Bahasa Indonesia');
+    expect(LOCALES.find(item => item.code === 'hi')?.label).toBe('हिन्दी');
+  });
+
+  it.each([
+    ['es-MX', 'es-419'], ['fr-CA', 'fr'], ['ko-KR', 'ko'],
     ['de-AT', 'de'], ['ru-RU', 'ru'], ['it-CH', 'it'],
   ] as const)('recognizes %s and negotiates the selected language', (tag, language) => {
     expect(detectSystemLang(tag)).toBe(language);
     expect(isLang(language)).toBe(true);
     expect(fallbackChain(language)).toEqual([language, 'en']);
-    expect(acceptLanguageHeader(language).split(',')[0].split('-')[0]).toBe(language);
+    expect(acceptLanguageHeader(language).split(',')[0]).toBe(LOCALES.find(item => item.code === language)?.intlLocale);
     expect(Object.keys(getRendererBootTables(language)).sort()).toEqual(['en', language].sort());
   });
-  it('maps zh* locales to zh', () => {
-    for (const v of ['zh', 'zh-CN', 'zh-TW', 'zh-HK', 'ZH-Hans']) {
+  it('maps Simplified Chinese locales to zh', () => {
+    for (const v of ['zh', 'zh-CN', 'zh-SG', 'ZH-Hans', 'zh-Hans-HK']) {
       expect(detectSystemLang(v)).toBe('zh');
     }
   });
@@ -40,7 +73,7 @@ describe('i18n › detectSystemLang', () => {
   });
 
   it('falls back to en for non-supported / malformed / empty', () => {
-    for (const v of ['en-US', 'ar', '', null, undefined, 42]) {
+    for (const v of ['en-US', 'nl', '', null, undefined, 42]) {
       expect(detectSystemLang(v)).toBe('en');
     }
   });
@@ -53,7 +86,8 @@ describe('i18n › isLang', () => {
     expect(isLang('ja')).toBe(true);
     expect(isLang('pt')).toBe(true);
     expect(isLang('ZH')).toBe(false);
-    expect(isLang('ar')).toBe(false);
+    expect(isLang('ar')).toBe(true);
+    expect(isLang('nl')).toBe(false);
     expect(isLang('')).toBe(false);
     expect(isLang(null)).toBe(false);
   });

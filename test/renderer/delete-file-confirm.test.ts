@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, it, expect, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -274,6 +275,7 @@ function loadHarness(
   };
   context.window.window = context.window;
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
   const code = fs.readFileSync(
     path.join(__dirname, '../../src/renderer/modules/delete-file-confirm.js'),
     'utf8',

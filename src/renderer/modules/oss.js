@@ -358,17 +358,17 @@ function prefillCommander(text, attribution, opts = {}) {
     });
     return false;
   }
-  input.value = value;
+  composerSetText(input, value);
   if (attribution) _setOssCommanderAttribution(input, attribution);
   const m = opts.trackPlaceholder === false ? null : value.match(/\[[^\]]*\]/);
   if (m) input.dataset.ossTemplatePlaceholder = m[0];
   else delete input.dataset.ossTemplatePlaceholder;
   input.focus();
   try {
-    if (m && typeof m.index === 'number') input.setSelectionRange(m.index, m.index + m[0].length);
-    else input.setSelectionRange(value.length, value.length);
+    if (m && typeof m.index === 'number') composerSetSelection(input, m.index, m.index + m[0].length);
+    else composerSetSelection(input, value.length, value.length);
   } catch (_e) { /* selection unsupported */ }
-  input.dispatchEvent(new Event('input', { bubbles: true })); // triggers autoGrow + chip state
+  composerNotify(input); // triggers autoGrow + chip state
   input.classList.add('is-prefilled');
   setTimeout(() => input.classList.remove('is-prefilled'), 1200);
   return true;
@@ -383,14 +383,14 @@ function unresolvedOssTemplatePlaceholder(input) {
   if (!input || !input.dataset) return '';
   const marker = String(input.dataset.ossTemplatePlaceholder || '');
   if (!marker) return '';
-  const value = String(input.value || '');
+  const value = String(composerText(input) || '');
   if (!value.includes(marker)) {
     delete input.dataset.ossTemplatePlaceholder;
     return '';
   }
   const start = value.indexOf(marker);
   input.focus();
-  try { input.setSelectionRange(start, start + marker.length); } catch (_) { /* unsupported */ }
+  try { composerSetSelection(input, start, start + marker.length); } catch (_) { /* unsupported */ }
   return marker;
 }
 
@@ -398,7 +398,7 @@ function unresolvedOssTemplatePlaceholder(input) {
 // It preserves a manual or Quick start draft and avoids nesting OSS wrappers.
 function _ossPromptForComposer(p, input) {
   const prompt = ossPromptFor(p);
-  const existing = String((input && input.value) || '').trim();
+  const existing = String((input && composerText(input)) || '').trim();
   const existingEntryPoint = String((input && input.dataset && input.dataset.commanderEntryPoint) || '');
   if (!existing || existingEntryPoint === 'oss_tool') return prompt;
   if (/\[[^\]]*\]/.test(prompt)) return prompt.replace(/\[[^\]]*\]/, () => existing);

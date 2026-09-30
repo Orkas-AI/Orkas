@@ -8,46 +8,6 @@ let _conversationBucketDateKey = _conversationLocalDateKey();
 let _conversationBucketDateRefreshTimer = null;
 let _conversationBucketDateRefreshBound = false;
 
-function _logConversationManageResult(action, startedAt, result, errorCode = '', extra = {}) {
-  const payload = {
-    action: String(action || 'unknown'),
-    result: String(result || 'failure'),
-    duration_ms: Math.max(0, Date.now() - startedAt),
-    ...(errorCode ? { error_code: String(errorCode) } : {}),
-    ...(extra || {}),
-  };
-  try {
-    const level = result === 'failure' ? 'warn' : 'info';
-    _convLog[level]('conversation management result', payload);
-  } catch (_) {}
-}
-
-function _taskTerminalHandlePresentation(payload) {
-  if (!payload || typeof payload !== 'object') return;
-  if (typeof _syncFailedFromTaskTerminal === 'function') {
-    _syncFailedFromTaskTerminal(payload);
-  }
-  if (typeof _handleTaskTerminalUnread === 'function') {
-    _handleTaskTerminalUnread(payload);
-  }
-}
-
-function _conversationMediaHandleMaterialized(payload) {
-  const ownerUid = String(payload?.user_id || '');
-  const cid = String(payload?.conversation_id || '');
-  if (!ownerUid || ownerUid !== String(currentUserId || '')) return;
-  if (!cid || cid !== String(currentCid || '')) return;
-  if (typeof _applyMaterializedMarkdownMedia !== 'function') return;
-  _applyMaterializedMarkdownMedia(payload, document);
-}
-
-try {
-  if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
-    window.orkas.onPushEvent('conversation:media_materialized', _conversationMediaHandleMaterialized);
-    window.orkas.onPushEvent('conversation:task_terminal', _taskTerminalHandlePresentation);
-  }
-} catch (_) {}
-
 function _uiIconHtml(name, className) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') return window.uiIconHtml(name, className || 'ui-icon');
   return '';
@@ -1584,7 +1544,7 @@ function _replaceKnownSkillIdsIn(rootEl, skills) {
 // no-op for already-clean text; pinned in `strip-structural-blocks.test.ts`
 // fixture A6 (commander `<agent>` container with `<agent_id>` /
 // `<description_*>` / `<workflow>` sub-tags).
-function _renderMessageMarkdown(text) {
+function _renderMessageMarkdown(text, blockCache) {
   const skills = _skillsForDisplayNameRewrite();
   const cleaned = (typeof _stripSurvivingStructuralBlocks === 'function')
     ? _stripSurvivingStructuralBlocks(String(text || ''))
@@ -1593,7 +1553,12 @@ function _renderMessageMarkdown(text) {
   const displayText = (skills.length && typeof _simplifyKnownSkillFollowPhrasesForDisplay === 'function')
     ? _simplifyKnownSkillFollowPhrasesForDisplay(raw, skills)
     : raw;
-  const html = renderMarkdownFull(displayText);
+  if (blockCache) return renderMarkdownBlocks(displayText, blockCache)
+    .map(html => _decorateMessageMarkdown(html, skills));
+  return _decorateMessageMarkdown(renderMarkdownFull(displayText), skills);
+}
+
+function _decorateMessageMarkdown(html, skills) {
   const needsSkillRewrite = _htmlMayContainKnownSkillIdForDisplay(html, skills);
   // Mention highlighting requires DOM walking — do it on a detached
   // container, then return its innerHTML for the bubble to embed.
@@ -1605,222 +1570,43 @@ function _renderMessageMarkdown(text) {
   return tmp.innerHTML;
 }
 
-// Build the mention-highlight portion of the textarea mirror. Escapes
-// everything EXCEPT `@<token>` matches, which become accent-coloured spans.
-function _buildMentionMirrorHtml(text) {
-  if (!text) return '';
-  const re = _buildMentionRe();
-  let html = '';
-  let last = 0;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const beforeStart = last;
-    const beforeEnd = m.index + m[1].length;
-    if (beforeEnd > beforeStart) html += escapeHtml(text.slice(beforeStart, beforeEnd));
-    html += `<span class="msg-mention">${escapeHtml(m[2])}</span>`;
-    last = re.lastIndex;
-  }
-  if (last < text.length) html += escapeHtml(text.slice(last));
-  return html;
-}
-
-const _chatRichComposers = new Map();
-
-function _chatRichInputId(inputOrId) {
-  if (!inputOrId) return '';
-  if (typeof inputOrId === 'string') return inputOrId;
-  return inputOrId.id || inputOrId.dataset?.richInputId || '';
-}
-
-function getChatRichComposerEditor(inputOrId) {
-  const id = _chatRichInputId(inputOrId);
-  return id ? (_chatRichComposers.get(id)?.editor || null) : null;
-}
-
-function getChatRichComposerSelection(inputOrId) {
-  const id = _chatRichInputId(inputOrId);
-  const api = id ? _chatRichComposers.get(id) : null;
-  if (!api) return null;
-  api.syncTextareaSelectionFromEditor();
-  return {
-    start: api.input.selectionStart || 0,
-    end: api.input.selectionEnd || api.input.selectionStart || 0,
-  };
-}
-
+function getChatRichComposerEditor(inputOrId) { return _composerApi(inputOrId)?.editor || null; }
+function getChatRichComposerSelection(inputOrId) { return _composerApi(inputOrId) ? composerSelection(inputOrId) : null; }
 function focusChatRichComposer(inputOrId) {
-  const id = _chatRichInputId(inputOrId);
-  const api = id ? _chatRichComposers.get(id) : null;
+  const api = _composerApi(inputOrId);
   if (!api) return false;
   api.focus();
   return true;
 }
-
-/** True when the composer (its textarea or the rich editor standing in for it)
- *  already holds focus. */
 function _chatComposerHasFocus(inputOrId) {
-  const active = document.activeElement;
-  if (!active) return false;
-  const id = _chatRichInputId(inputOrId);
-  if (!id) return false;
-  if (active.id === id) return true;
-  const api = _chatRichComposers.get(id);
-  return !!api && api.editor === active;
+  return document.activeElement === _composerElement(inputOrId);
 }
-
-/**
- * Give the composer focus only when nothing else holds it.
- *
- * Entering a conversation and refreshing the send button both want the composer
- * ready for typing, but both fire on timers/re-renders that can land after the
- * user has moved focus elsewhere — global search focuses its box on its own
- * 30ms timer, so an unconditional focus here silently pulls the caret back into
- * the chat box and the user's keystrokes go to the wrong field. Convenience
- * focus must never take focus away from a control the user is already in.
- */
 function focusChatComposerIfIdle(inputOrId) {
   const active = document.activeElement;
-  const idle = !active
-    || active === document.body
-    || _chatComposerHasFocus(inputOrId);
-  if (!idle) return false;
-  const el = typeof inputOrId === 'string' ? document.getElementById(inputOrId) : inputOrId;
+  if (active && active !== document.body && !_chatComposerHasFocus(inputOrId)) return false;
+  const el = _composerElement(inputOrId);
   if (!el) return false;
-  if (focusChatRichComposer(el)) return true;
-  el.focus();
+  if (!focusChatRichComposer(el)) el.focus();
   return true;
 }
-
-function syncChatRichComposerFromTextarea(inputOrId) {
-  const id = _chatRichInputId(inputOrId);
-  const api = id ? _chatRichComposers.get(id) : null;
+function refreshAllChatComposers() {
+  for (const api of _composerInputs.values()) api.refresh();
+}
+function refreshChatComposer(inputOrId) {
+  const api = _composerApi(inputOrId);
   if (!api) return false;
-  api.renderFromTextarea();
+  api.refresh();
   return true;
 }
-
 function syncChatRichComposerHeight(inputOrId, maxPx) {
-  const id = _chatRichInputId(inputOrId);
-  const api = id ? _chatRichComposers.get(id) : null;
+  const api = _composerApi(inputOrId);
   if (!api) return false;
-  api.renderFromTextarea();
   api.autoGrow(maxPx);
   return true;
 }
-
 function insertChatUseTokenIntoComposer(inputOrId, selection) {
-  const id = _chatRichInputId(inputOrId);
-  const api = id ? _chatRichComposers.get(id) : null;
-  if (!api) return false;
-  return api.insertUse(selection);
+  return _composerApi(inputOrId)?.insertUse(selection) || false;
 }
-
-function _chatRichSerializeNode(node, isRoot = true) {
-  if (!node) return '';
-  if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || '';
-  if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return '';
-  if (node.nodeType === Node.ELEMENT_NODE) {
-    const el = node;
-    if (el.dataset?.chatUseChip === '1') return el.dataset.token || '';
-    // A "bogus" <br> is a display-only filler that renders the trailing empty
-    // line contenteditable would otherwise collapse; it carries no value, so a
-    // render→serialize round-trip must not turn it back into a newline.
-    if (el.tagName === 'BR') return el.dataset?.chatBogus === '1' ? '' : '\n';
-  }
-  let out = '';
-  node.childNodes.forEach((child) => { out += _chatRichSerializeNode(child, false); });
-  // The DIV/P newline separates *sibling* blocks (e.g. browser line-wrapping
-  // divs). It must not fire for the root editor itself, or every non-empty
-  // value would gain a phantom trailing "\n" that (a) makes "abc" and "abc\n"
-  // serialize identically and (b) can't be told apart from a real trailing
-  // newline when we decide whether to render a filler line.
-  if (!isRoot && node.nodeType === Node.ELEMENT_NODE && /^(DIV|P)$/i.test(node.tagName || '')) {
-    if (out && !out.endsWith('\n')) out += '\n';
-  }
-  return out;
-}
-
-function _chatRichTextLength(node) {
-  return _chatRichSerializeNode(node).length;
-}
-
-function _chatRichRangeLength(editor, container, offset) {
-  try {
-    const range = document.createRange();
-    range.selectNodeContents(editor);
-    range.setEnd(container, offset);
-    const len = _chatRichSerializeNode(range.cloneContents()).length;
-    if (typeof range.detach === 'function') range.detach();
-    return len;
-  } catch (_) {
-    return editor ? _chatRichSerializeNode(editor).length : 0;
-  }
-}
-
-function _chatRichSelectionIndexes(editor) {
-  const sel = window.getSelection ? window.getSelection() : null;
-  if (!sel || sel.rangeCount < 1) return null;
-  const range = sel.getRangeAt(0);
-  if (!editor.contains(range.startContainer) || !editor.contains(range.endContainer)) return null;
-  const start = _chatRichRangeLength(editor, range.startContainer, range.startOffset);
-  const end = _chatRichRangeLength(editor, range.endContainer, range.endOffset);
-  return { start: Math.min(start, end), end: Math.max(start, end) };
-}
-
-function _chatRichFindPosition(root, index) {
-  let left = Math.max(0, Number(index) || 0);
-  const visit = (node) => {
-    if (node.nodeType === Node.TEXT_NODE) {
-      const len = (node.nodeValue || '').length;
-      if (left <= len) return { type: 'text', node, offset: left };
-      left -= len;
-      return null;
-    }
-    if (node.nodeType === Node.ELEMENT_NODE) {
-      const el = node;
-      if (el.dataset?.chatUseChip === '1' || el.tagName === 'BR') {
-        const len = _chatRichTextLength(el);
-        if (left <= len) return left <= len / 2
-          ? { type: 'before', node: el }
-          : { type: 'after', node: el };
-        left -= len;
-        return null;
-      }
-    }
-    for (const child of Array.from(node.childNodes || [])) {
-      const found = visit(child);
-      if (found) return found;
-    }
-    return null;
-  };
-  return visit(root) || { type: 'end', node: root };
-}
-
-function _chatRichApplyBoundary(range, boundary, which) {
-  const fn = which === 'start' ? 'setStart' : 'setEnd';
-  if (!boundary || boundary.type === 'end') {
-    range[fn](boundary?.node || range.commonAncestorContainer, (boundary?.node || range.commonAncestorContainer).childNodes.length);
-  } else if (boundary.type === 'text') {
-    range[fn](boundary.node, boundary.offset);
-  } else if (boundary.type === 'before') {
-    which === 'start' ? range.setStartBefore(boundary.node) : range.setEndBefore(boundary.node);
-  } else if (boundary.type === 'after') {
-    which === 'start' ? range.setStartAfter(boundary.node) : range.setEndAfter(boundary.node);
-  }
-}
-
-function _chatRichSetSelection(editor, start, end = start) {
-  if (!editor || !window.getSelection) return;
-  const range = document.createRange();
-  const startPos = _chatRichFindPosition(editor, start);
-  const endPos = _chatRichFindPosition(editor, end);
-  _chatRichApplyBoundary(range, startPos, 'start');
-  _chatRichApplyBoundary(range, endPos, 'end');
-  const sel = window.getSelection();
-  sel.removeAllRanges();
-  sel.addRange(range);
-}
-
 function _chatRichLabelParts(selection) {
   if (selection?.kind === 'agent' || selection?.kind === 'commander') {
     const name = selection.name || selection.id || '';
@@ -1858,51 +1644,6 @@ function _chatRichCreateUseChip(selection, rawToken) {
   return chip;
 }
 
-// contenteditable + `white-space: pre-wrap` collapses a trailing newline: a
-// value ending in "\n" (or a lone "\n" just typed) renders no empty last line,
-// so the caret can't sit on it and the box never grows/scrolls to reveal it.
-// Browsers solve this with a filler <br>; we mirror that with a marked "bogus"
-// <br> that serialization drops (see _chatRichSerializeNode). Keep exactly one,
-// always at the very end, and only when the content actually ends in a newline.
-function _chatRichHasAuthoredContent(node) {
-  if (!node) return false;
-  if (node.nodeType === Node.TEXT_NODE) return !!(node.nodeValue || '');
-  if (node.nodeType === Node.ELEMENT_NODE && node.dataset?.chatUseChip === '1') return true;
-  return Array.from(node.childNodes || []).some((child) => _chatRichHasAuthoredContent(child));
-}
-
-function _chatRichEnsureTrailingBreak(editor) {
-  if (!editor) return;
-  const stale = editor.querySelector ? editor.querySelector('br[data-chat-bogus="1"]') : null;
-  if (stale && stale.parentNode) stale.parentNode.removeChild(stale);
-  // Chromium represents an emptied contenteditable as <br> (and sometimes
-  // <div><br></div>) so the caret still has a line box. That node is browser
-  // chrome, not user input: serializing it as "\n" makes an emptied composer
-  // one line taller and persists a phantom newline in the hidden textarea.
-  // Real newlines in this editor are text nodes created by render/keydown/paste,
-  // so they count as authored content and remain intact.
-  if (!_chatRichHasAuthoredContent(editor)) {
-    if (editor.childNodes?.length) editor.textContent = '';
-    return;
-  }
-  if (_chatRichSerializeNode(editor).endsWith('\n')) {
-    const br = document.createElement('br');
-    br.dataset.chatBogus = '1';
-    editor.appendChild(br);
-  }
-}
-
-/** Reconcile every non-IME native edit before serializing it. The display-only trailing filler can
- * become stale when the user types after a trailing newline or deletes that newline with Backspace;
- * leaving it in the DOM creates a phantom visual line even though serialization correctly drops it. */
-function _chatRichHandleEditorInput(api) {
-  if (!api || api.composing) return;
-  api.ensureTrailingBreak();
-  api.syncFromEditor(true);
-}
-
-// Recipient chips keep their original @ text for routing. Resource chips keep
-// their existing metadata token; only rendering and atomic editing are shared.
 function _findChatComposerTokens(text, inputId = '') {
   const src = String(text || '');
   const resources = typeof _findChatUseTokens === 'function' ? _findChatUseTokens(src) : [];
@@ -1917,31 +1658,6 @@ function _findChatComposerTokens(text, inputId = '') {
       selection: mention.recipient,
     }));
   return resources.concat(mentions).sort((a, b) => a.start - b.start);
-}
-
-function _chatRichChipsMatchValue(editor, value) {
-  const tokens = _findChatComposerTokens(value, editor.dataset.richInputId);
-  const chips = Array.from(editor.querySelectorAll('[data-chat-use-chip="1"]'));
-  return chips.length === tokens.length && chips.every((chip, i) => {
-    const token = tokens[i];
-    return chip.dataset.token === token.raw && chip.dataset.kind === token.selection.kind
-      && chip.dataset.itemId === (token.selection.id || token.selection.name || '')
-      && chip.dataset.name === (token.selection.name || token.selection.id || '');
-  });
-}
-
-function _chatRichRenderValue(editor, value) {
-  const src = String(value || '');
-  editor.textContent = '';
-  const tokens = _findChatComposerTokens(src, editor.dataset.richInputId);
-  let last = 0;
-  tokens.forEach((token) => {
-    if (token.start > last) editor.appendChild(document.createTextNode(src.slice(last, token.start)));
-    editor.appendChild(_chatRichCreateUseChip(token.selection, token.raw));
-    last = token.end;
-  });
-  if (last < src.length) editor.appendChild(document.createTextNode(src.slice(last)));
-  _chatRichEnsureTrailingBreak(editor);
 }
 
 function _chatRichAutoGrowMax(inputId) {
@@ -1982,340 +1698,16 @@ function _chatRichUploadPasteFiles(inputId, files) {
   return false;
 }
 
-function _chatRichInsertText(editor, text) {
-  const sel = window.getSelection ? window.getSelection() : null;
-  if (!sel || sel.rangeCount < 1 || !editor.contains(sel.anchorNode)) {
-    editor.focus();
-    _chatRichSetSelection(editor, _chatRichSerializeNode(editor).length);
+function _initChatComposers() {
+  for (const el of document.querySelectorAll('[data-composer]')) {
+    _initComposerInput(el);
+    const chipId = _chatRichRecipientChipId(el.id);
+    if (chipId && typeof bindRecipientAnchor === 'function') bindRecipientAnchor(chipId, el.id);
   }
-  const range = window.getSelection().getRangeAt(0);
-  range.deleteContents();
-  const node = document.createTextNode(String(text || ''));
-  range.insertNode(node);
-  range.setStart(node, node.nodeValue.length);
-  range.setEnd(node, node.nodeValue.length);
-  const next = window.getSelection();
-  next.removeAllRanges();
-  next.addRange(range);
 }
-
-function _chatRichCreateApi(textarea, editor) {
-  const nativeSetSelectionRange = typeof textarea.setSelectionRange === 'function'
-    ? textarea.setSelectionRange.bind(textarea)
-    : null;
-  const nativeFocus = typeof textarea.focus === 'function' ? textarea.focus.bind(textarea) : null;
-  const api = {
-    input: textarea,
-    editor,
-    lastValue: null,
-    pendingSelection: null,
-    syncingFromEditor: false,
-    // True between compositionstart/compositionend (IME). While composing we
-    // must not rebuild the editor DOM or thrash its layout, or the in-flight
-    // composition gets dropped and the user has to retype — hence the guards in
-    // renderFromTextarea/the input listeners and a single reconcile on end.
-    composing: false,
-    focus() {
-      editor.focus();
-      const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : (textarea.value || '').length;
-      const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
-      _chatRichSetSelection(editor, start, end);
-    },
-    setTextareaSelection(start, end = start, opts = {}) {
-      const next = { start, end: typeof end === 'number' ? end : start };
-      if (nativeSetSelectionRange) {
-        try { nativeSetSelectionRange(next.start, next.end); } catch (_) {}
-      } else {
-        textarea.selectionStart = next.start;
-        textarea.selectionEnd = next.end;
-      }
-      if (!opts || opts.pending !== false) {
-        this.pendingSelection = next;
-      }
-    },
-    syncTextareaSelectionFromEditor() {
-      const sel = _chatRichSelectionIndexes(editor);
-      if (!sel) return;
-      // This mirrors the browser-owned contenteditable caret into the hidden
-      // textarea. It must not schedule a reverse editor selection update,
-      // otherwise normal ArrowLeft/ArrowRight movement gets snapped back by
-      // the next sync tick.
-      this.setTextareaSelection(sel.start, sel.end, { pending: false });
-    },
-    renderFromTextarea(opts = {}) {
-      // Rebuilding the contenteditable mid-composition drops the IME buffer;
-      // compositionend runs one reconcile once the text has committed.
-      if (this.composing) return;
-      const value = String(textarea.value || '');
-      const changed = value !== this.lastValue || !_chatRichChipsMatchValue(editor, value);
-      let shouldAutoGrow = !!(opts && opts.forceHeight);
-      if (changed) {
-        shouldAutoGrow = true;
-        this.lastValue = value;
-        const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : value.length;
-        const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
-        _chatRichRenderValue(editor, value);
-        // Restoring a DOM selection also focuses contenteditable in Chromium.
-        // Panel edits keep their focus; apply the pending caret on editor focus.
-        if (document.activeElement === editor) {
-          const sel = this.pendingSelection || { start, end };
-          _chatRichSetSelection(editor, sel.start, sel.end);
-          this.pendingSelection = null;
-        }
-      } else if (this.pendingSelection && document.activeElement === editor) {
-        _chatRichSetSelection(editor, this.pendingSelection.start, this.pendingSelection.end);
-        this.pendingSelection = null;
-      }
-      if (shouldAutoGrow) this.autoGrow(_chatRichAutoGrowMax(textarea.id));
-    },
-    syncFromEditor(emit) {
-      const selection = _chatRichSelectionIndexes(editor);
-      const value = _chatRichSerializeNode(editor);
-      if (value === this.lastValue && !emit) return;
-      this.lastValue = value;
-      textarea.value = value;
-      // Assigning textarea.value moves its caret to the end. Preserve the
-      // native editor selection before normalizing typed/pasted @ mentions.
-      if (selection) this.setTextareaSelection(selection.start, selection.end, { pending: false });
-      this.syncingFromEditor = true;
-      if (emit) {
-        try { textarea.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
-      }
-      this.syncingFromEditor = false;
-      this.renderFromTextarea();
-      this.autoGrow(_chatRichAutoGrowMax(textarea.id));
-    },
-    autoGrow(maxPx) {
-      const max = Number(maxPx) || _chatRichAutoGrowMax(textarea.id);
-      editor.style.height = 'auto';
-      const next = Math.min(editor.scrollHeight || 0, max);
-      if (next > 0) editor.style.height = `${next}px`;
-      const overflow = (editor.scrollHeight || 0) > max;
-      editor.style.overflowY = overflow ? 'auto' : 'hidden';
-      // Once the editor scrolls internally, growing/wrapping no longer keeps the
-      // caret in view on its own (resetting height to 'auto' above also resets
-      // scrollTop), so the newly typed line ends up clipped below the fold.
-      if (overflow && document.activeElement === editor) this.scrollCaretIntoView();
-    },
-    // Keep the caret's line inside the scroll viewport. Range client rects are
-    // empty exactly at a trailing <br> boundary (the just-created empty line),
-    // so fall back to scrolling to the bottom when the caret is at content end.
-    scrollCaretIntoView() {
-      const sel = window.getSelection ? window.getSelection() : null;
-      if (!sel || sel.rangeCount < 1) return;
-      const range = sel.getRangeAt(0);
-      if (!editor.contains(range.endContainer)) return;
-      const editorRect = editor.getBoundingClientRect();
-      const rects = range.getClientRects();
-      let rect = rects && rects.length ? rects[rects.length - 1] : null;
-      if (!rect || !rect.height) {
-        const bounding = range.getBoundingClientRect();
-        if (bounding && bounding.height) rect = bounding;
-      }
-      if (rect && rect.height) {
-        if (rect.bottom > editorRect.bottom) editor.scrollTop += (rect.bottom - editorRect.bottom) + 2;
-        else if (rect.top < editorRect.top) editor.scrollTop -= (editorRect.top - rect.top) + 2;
-        return;
-      }
-      const idx = _chatRichSelectionIndexes(editor);
-      if (idx && idx.end >= _chatRichSerializeNode(editor).length) editor.scrollTop = editor.scrollHeight;
-    },
-    ensureTrailingBreak() {
-      _chatRichEnsureTrailingBreak(editor);
-    },
-    insertUse(selection) {
-      if (typeof _chatUseTokenFor !== 'function') return false;
-      const token = _chatUseTokenFor(selection);
-      if (!token) return false;
-      this.syncTextareaSelectionFromEditor();
-      const value = String(textarea.value || '');
-      const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : value.length;
-      const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
-      const before = value.slice(0, start);
-      const after = value.slice(end);
-      const leading = before && !/\s$/.test(before) ? ' ' : '';
-      const trailing = after && /^\s/.test(after) ? '' : ' ';
-      const replacement = `${leading}${token}${trailing}`;
-      textarea.value = `${before}${replacement}${after}`;
-      const caret = start + replacement.length;
-      this.setTextareaSelection(caret, caret);
-      this.lastValue = null;
-      this.renderFromTextarea();
-      try { textarea.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
-      return true;
-    },
-  };
-
-  textarea.addEventListener('input', () => {
-    if (api.syncingFromEditor || api.composing) return;
-    api.renderFromTextarea();
-  });
-  editor.addEventListener('input', () => {
-    // Native IME keeps mutating the editor while composing; stay out of its way
-    // and reconcile once on compositionend.
-    _chatRichHandleEditorInput(api);
-  });
-  editor.addEventListener('compositionstart', () => { api.composing = true; });
-  editor.addEventListener('compositionend', () => {
-    api.composing = false;
-    // The committed text is now in the editor DOM; mirror it into the textarea
-    // and recompute height/scroll exactly once.
-    api.ensureTrailingBreak();
-    api.syncFromEditor(true);
-  });
-  editor.addEventListener('focus', () => {
-    api.renderFromTextarea();
-    api.syncTextareaSelectionFromEditor();
-  });
-  editor.addEventListener('keyup', () => api.syncTextareaSelectionFromEditor());
-  editor.addEventListener('mouseup', () => api.syncTextareaSelectionFromEditor());
-  editor.addEventListener('paste', (e) => {
-    const cd = e.clipboardData;
-    if (cd?.files?.length && _chatRichUploadPasteFiles(textarea.id, cd.files)) {
-      e.preventDefault();
-      return;
-    }
-    const text = cd?.getData ? cd.getData('text/plain') : '';
-    if (!text) return;
-    e.preventDefault();
-    _chatRichInsertText(editor, text);
-    api.ensureTrailingBreak();
-    api.syncFromEditor(true);
-  });
-  editor.addEventListener('keydown', (e) => {
-    if (e.isComposing || e.keyCode === 229) return;
-    api.syncTextareaSelectionFromEditor();
-    if ((e.key === 'Backspace' || e.key === 'Delete') && typeof _deleteChatUseTokenAtCaret === 'function') {
-      const direction = e.key === 'Delete' ? 'forward' : 'backward';
-      if (_deleteChatUseTokenAtCaret(textarea, direction)) {
-        e.preventDefault();
-        return;
-      }
-    }
-    if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey
-        && typeof _moveChatUseTokenCaret === 'function') {
-      const direction = e.key === 'ArrowRight' ? 'forward' : 'backward';
-      if (_moveChatUseTokenCaret(textarea, direction)) {
-        e.preventDefault();
-        api.pendingSelection = {
-          start: textarea.selectionStart || 0,
-          end: textarea.selectionEnd || textarea.selectionStart || 0,
-        };
-        api.renderFromTextarea();
-        return;
-      }
-    }
-    if (e.key !== 'Enter') return;
-    if (textarea.id === 'auto-task-input') return;
-    if (e.shiftKey || e.metaKey || e.ctrlKey) {
-      e.preventDefault();
-      _chatRichInsertText(editor, '\n');
-      // A lone trailing "\n" renders no line; add the filler <br> before we
-      // measure height so the new line shows and the caret scrolls into view.
-      api.ensureTrailingBreak();
-      api.syncFromEditor(true);
-      return;
-    }
-    if (e.altKey) return;
-    e.preventDefault();
-    if (textarea.id === 'new-chat-input' && typeof handleNewChatSubmit === 'function') handleNewChatSubmit();
-    else if (textarea.id === 'project-chat-input' && typeof _submitProjectChat === 'function') _submitProjectChat();
-    else if (typeof handleChatSubmit === 'function') handleChatSubmit();
-  });
-
-  if (nativeFocus) {
-    try {
-      textarea.focus = function focus(options) {
-        if (editor.isConnected) {
-          api.focus();
-          return;
-        }
-        nativeFocus(options);
-      };
-    } catch (_) {}
-  }
-  if (nativeSetSelectionRange) {
-    try {
-      textarea.setSelectionRange = function setSelectionRange(start, end, direction) {
-        nativeSetSelectionRange(start, end, direction);
-        api.pendingSelection = { start, end: typeof end === 'number' ? end : start };
-        if (document.activeElement === editor) {
-          _chatRichSetSelection(editor, api.pendingSelection.start, api.pendingSelection.end);
-          api.pendingSelection = null;
-        }
-      };
-    } catch (_) {}
-  }
-  return api;
-}
-
-// Replace the old transparent-textarea mirror with a real rich editor. The
-// textarea remains the source-of-truth compatibility layer for send/draft/
-// voice code; the visible caret and chip blocks now belong to contenteditable
-// DOM, so browser selection can cross non-editable chips atomically.
-function _initMentionMirror(textarea) {
-  if (!textarea || textarea.dataset.mentionMirror === '1') return;
-  if (!textarea.parentNode) return;
-  textarea.dataset.mentionMirror = '1';
-
-  const wrap = document.createElement('div');
-  wrap.className = 'chat-input-rich-wrap';
-  const editor = document.createElement('div');
-  editor.className = 'chat-rich-editor';
-  editor.contentEditable = 'true';
-  editor.setAttribute('role', 'textbox');
-  editor.setAttribute('aria-multiline', 'true');
-  editor.dataset.richInputId = textarea.id || '';
-  editor.dataset.placeholder = textarea.getAttribute('placeholder') || '';
-
-  // Insert wrap in place of textarea, move textarea inside.
-  textarea.parentNode.insertBefore(wrap, textarea);
-  wrap.appendChild(editor);
-  wrap.appendChild(textarea);
-  textarea.classList.add('chat-rich-source');
-
-  let lastPlaceholder = '';
-  const api = _chatRichCreateApi(textarea, editor);
-  _chatRichComposers.set(textarea.id, api);
-  const sync = () => {
-    const placeholder = textarea.getAttribute('placeholder') || '';
-    if (placeholder !== lastPlaceholder) {
-      lastPlaceholder = placeholder;
-      editor.dataset.placeholder = placeholder;
-    }
-    api.renderFromTextarea();
-  };
-  window.addEventListener('i18n-change', () => {
-    api.lastValue = null;
-    sync();
-  });
-  const chipId = _chatRichRecipientChipId(textarea.id);
-  if (chipId && typeof bindRecipientAnchor === 'function') {
-    try { bindRecipientAnchor(chipId, textarea.id); } catch (_) {}
-  }
-  // Programmatic value changes (send-clears the input, agent-picker
-  // inserts `@<name>`, draft restore on conv switch) don't fire `input`
-  // natively. Most call sites dispatch one explicitly, but a 100ms
-  // safety poll catches any we missed without per-callsite plumbing.
-  // String-compare cost is negligible; we only do real work when the
-  // value actually drifted from the last paint.
-  setInterval(sync, 100);
-  sync();
-}
-
-// Set up rich composers for the chat panels that participate in the group-
-// chat `@` semantics. Other chat panels (skill-edit, agent-edit) don't route
-// via the bus's mention parser, so they keep the plain textarea.
-function _initAllMentionMirrors() {
-  const chatInput = document.getElementById('chat-input');
-  if (chatInput) _initMentionMirror(chatInput);
-  const newChatInput = document.getElementById('new-chat-input');
-  if (newChatInput) _initMentionMirror(newChatInput);
-  const projectChatInput = document.getElementById('project-chat-input');
-  if (projectChatInput) _initMentionMirror(projectChatInput);
-  const autoTaskInput = document.getElementById('auto-task-input');
-  if (autoTaskInput) _initMentionMirror(autoTaskInput);
-}
+window.addEventListener('i18n-change', () => {
+  for (const api of _composerInputs.values()) api.refresh();
+});
 
 const CHAT_INPUT_RESERVE_FALLBACK = 140;
 let _chatInputReserveLast = 0;
@@ -2353,11 +1745,11 @@ function _initChatInputReserveObserver() {
 if (typeof window !== 'undefined') {
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
-      _initAllMentionMirrors();
+      _initChatComposers();
       _initChatInputReserveObserver();
     }, { once: true });
   } else {
-    _initAllMentionMirrors();
+    _initChatComposers();
     _initChatInputReserveObserver();
   }
 }
@@ -2500,7 +1892,7 @@ async function validateRecipientAgainstProject(target, pid, boundAgentIds) {
     pendingScope.ids = bound;
     _renderRecipientChip(target);
     const input = _composerRecipientInput(target);
-    if (input && typeof syncChatRichComposerFromTextarea === 'function') syncChatRichComposerFromTextarea(input);
+    if (input && typeof refreshChatComposer === 'function') refreshChatComposer(input);
     if (typeof _updateComposerSeqToggle === 'function') _updateComposerSeqToggle(target);
     const cur = _activeRecipient(target);
     const recipients = _recipientList(cur);
@@ -2656,7 +2048,7 @@ function _composerDispatchShapeFor(target) {
   const row = _COMPOSER_SEQ_TOGGLES.find(([tg]) => tg === target);
   const ta = row ? document.getElementById(row[2]) : null;
   return _composerDispatchShape(
-    ta ? ta.value : '',
+    ta ? composerText(ta) : '',
     undefined, target,
   );
 }
@@ -2787,7 +2179,7 @@ function _composerMessageRecipients(target, text, forSend = false) {
 }
 
 function _composerSelectedRecipients(target) {
-  const text = _composerRecipientInput(target)?.value || '';
+  const text = composerText(_composerRecipientInput(target)) || '';
   const recipients = _composerMessageRecipients(target, text);
   return recipients;
 }
@@ -2795,12 +2187,12 @@ function _composerSelectedRecipients(target) {
 function _toggleComposerRecipient(target, recipient) {
   const ta = _composerRecipientInput(target);
   if (!ta) return;
-  let text = String(ta.value || '');
+  let text = String(composerText(ta) || '');
   const spans = _resolvedMentionSpans(text, undefined, target);
   const matches = (r) => r.kind === recipient.kind && r.id === recipient.id;
   const matching = spans.filter(({ recipient: r }) => matches(r));
-  let caret = typeof ta.selectionStart === 'number' ? ta.selectionStart : text.length;
-  let selectionEnd = typeof ta.selectionEnd === 'number' ? ta.selectionEnd : caret;
+  let caret = typeof composerSelection(ta).start === 'number' ? composerSelection(ta).start : text.length;
+  let selectionEnd = typeof composerSelection(ta).end === 'number' ? composerSelection(ta).end : caret;
   if (matching.length) {
     for (const span of matching.reverse()) {
       const end = text[span.end] === ' ' ? span.end + 1 : span.end;
@@ -2827,10 +2219,10 @@ function _toggleComposerRecipient(target, recipient) {
       selectionEnd = caret;
     }
   }
-  ta.value = text;
-  try { ta.setSelectionRange(caret, selectionEnd); } catch (_) {}
+  composerSetText(ta, text);
+  try { composerSetSelection(ta, caret, selectionEnd); } catch (_) {}
   if (!_explicitMentionRecipients(text, target).length) setChatRecipient(target, _COMMANDER);
-  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  composerNotify(ta);
   if (typeof autoGrow === 'function') autoGrow(ta, 200);
 }
 
@@ -2838,7 +2230,7 @@ const _draftHadRecipient = new Map();
 
 function _syncComposerRecipientInput(target) {
   const ta = _composerRecipientInput(target);
-  if (_draftHadRecipient.get(target) && !_explicitMentionRecipients(ta?.value || '', target).length) {
+  if (_draftHadRecipient.get(target) && !_explicitMentionRecipients(composerText(ta) || '', target).length) {
     setChatRecipient(target, _COMMANDER);
   }
   _renderRecipientChip(target);
@@ -2859,7 +2251,7 @@ function _mentionPreviewRecipients(target) {
     ? 'new-chat-input'
     : (target === 'project' ? 'project-chat-input' : 'chat-input');
   const ta = document.getElementById(id);
-  const text = ta ? String(ta.value || '') : '';
+  const text = ta ? String(composerText(ta) || '') : '';
   return _explicitMentionRecipients(text, target).length ? _composerMessageRecipients(target, text) : [];
 }
 
@@ -2875,7 +2267,7 @@ function _textCarriesRoutingMention(text, target = 'conversation') {
 function _renderRecipientChip(target) {
   const targets = target ? [target] : ['conversation', 'new-chat', 'project'];
   for (const tg of targets) {
-    _draftHadRecipient.set(tg, _explicitMentionRecipients(_composerRecipientInput(tg)?.value || '', tg).length > 0);
+    _draftHadRecipient.set(tg, _explicitMentionRecipients(composerText(_composerRecipientInput(tg)) || '', tg).length > 0);
     const id = tg === 'new-chat'
       ? 'new-chat-recipient-name'
       : (tg === 'project' ? 'project-chat-recipient-name' : 'chat-recipient-name');
@@ -2935,7 +2327,7 @@ function onEnterNewChatView() {
   // anything, treat that as an in-progress message whose target they
   // already chose, and leave the chip alone.
   const input = document.getElementById('new-chat-input');
-  const hasDraft = !!(input && input.value);
+  const hasDraft = !!(input && composerText(input));
   if (!hasDraft) _newChatRecipient = { ..._COMMANDER };
   _renderRecipientChip('new-chat');
   // Keep the empty-state heading aligned with the current locale.
@@ -3116,11 +2508,6 @@ function _setQuickStartItems(raw, source) {
   return !!normalized;
 }
 
-function _commanderAttributionId(value) {
-  const text = String(value || '').trim();
-  return /^[A-Za-z0-9._-]{1,64}$/.test(text) ? text : '';
-}
-
 function _normalizeCommanderTemplateAttribution(raw, defaultManual = false) {
   const src = raw && typeof raw === 'object' ? raw : {};
   const entryPoint = String(src.entry_point || src.entryPoint || '').trim();
@@ -3168,7 +2555,7 @@ function _clearCommanderTemplateAttribution(input) {
 }
 
 function _readCommanderTemplateAttribution(input) {
-  if (!input || !String(input.value || '').trim()) return { entry_point: 'manual' };
+  if (!input || !String(composerText(input) || '').trim()) return { entry_point: 'manual' };
   const dataset = input.dataset || {};
   return _normalizeCommanderTemplateAttribution({
     entry_point: dataset.commanderEntryPoint,
@@ -3184,14 +2571,14 @@ function _bindCommanderTemplateAttributionReset(input) {
   if (!input || !input.dataset || input.dataset.commanderAttributionBound === '1'
       || typeof input.addEventListener !== 'function') return;
   input.dataset.commanderAttributionBound = '1';
-  input.addEventListener('input', () => {
-    const value = String(input.value || '');
-    if (!value.trim()) {
+  input.addEventListener(composerChangeEvent(input), () => {
+    if (!input.dataset.commanderEntryPoint) return;
+    if (!composerHasText(input)) {
       _clearCommanderTemplateAttribution(input);
       return;
     }
     const marker = String(input.dataset.commanderQuickStartPlaceholder || '');
-    if (marker && !value.includes(marker)) {
+    if (marker && !composerIncludes(input, marker)) {
       delete input.dataset.commanderQuickStartPlaceholder;
     }
   });
@@ -3218,121 +2605,20 @@ function _unresolvedQuickStartPlaceholder(input) {
   if (!input || !input.dataset) return '';
   const marker = String(input.dataset.commanderQuickStartPlaceholder || '');
   if (!marker) return '';
-  const value = String(input.value || '');
+  const value = String(composerText(input) || '');
   const start = value.indexOf(marker);
   if (start < 0) {
     delete input.dataset.commanderQuickStartPlaceholder;
     return '';
   }
   input.focus();
-  try { input.setSelectionRange(start, start + marker.length); } catch (_) {}
+  try { composerSetSelection(input, start, start + marker.length); } catch (_) {}
   return marker;
 }
 
 function _quickStartText(key, fallback) {
   const value = key ? t(key) : '';
   return value && value !== key ? value : fallback;
-}
-
-function _quickStartThumbHtml(thumb) {
-  switch (thumb) {
-    case 'web':
-      return `
-        <span class="quick-thumb-art quick-thumb-web">
-          <span class="quick-thumb-browser-bar"><i></i><i></i><i></i></span>
-          <span class="quick-thumb-web-hero">
-            <i class="quick-thumb-web-title"></i>
-            <i class="quick-thumb-web-copy"></i>
-            <i class="quick-thumb-web-button"></i>
-          </span>
-          <span class="quick-thumb-web-menu"><i></i><i></i><i></i></span>
-        </span>`;
-    case 'research':
-      return `
-        <span class="quick-thumb-art quick-thumb-research">
-          <span class="quick-thumb-paper">
-            <i class="quick-thumb-paper-title"></i>
-            <i class="quick-thumb-paper-line is-wide"></i>
-            <i class="quick-thumb-paper-line is-medium"></i>
-            <i class="quick-thumb-paper-line is-short"></i>
-          </span>
-          <i class="quick-thumb-research-lens"></i>
-        </span>`;
-    case 'login':
-      return `
-        <span class="quick-thumb-art quick-thumb-login">
-          <span class="quick-thumb-window-bar"><i></i><i></i><i></i></span>
-          <i class="quick-thumb-login-visual"></i>
-          <span class="quick-thumb-login-form">
-            <i class="quick-thumb-login-title"></i>
-            <i class="quick-thumb-login-field"></i>
-            <i class="quick-thumb-login-field"></i>
-            <i class="quick-thumb-login-button"></i>
-          </span>
-        </span>`;
-    case 'video':
-      return `
-        <span class="quick-thumb-art quick-thumb-video">
-          <i class="quick-thumb-video-glow"></i>
-          <i class="quick-thumb-video-subject"></i>
-          <i class="quick-thumb-play">${_uiIconHtml('play-triangle', 'quick-thumb-play-icon')}</i>
-          <i class="quick-thumb-video-caption"></i>
-          <span class="quick-thumb-video-progress"><i></i></span>
-        </span>`;
-    case 'chart':
-      return `
-        <span class="quick-thumb-art quick-thumb-chart">
-          <span class="quick-thumb-chart-head"><i></i><b></b></span>
-          <span class="quick-thumb-chart-bars"><i></i><i></i><i></i><i></i><i></i></span>
-          <i class="quick-thumb-chart-trend"></i>
-        </span>`;
-    case 'presentation':
-      return `
-        <span class="quick-thumb-art quick-thumb-presentation">
-          <span class="quick-thumb-presentation-rail"><i></i><i></i><i></i></span>
-          <span class="quick-thumb-presentation-slide">
-            <i class="quick-thumb-presentation-title"></i>
-            <i class="quick-thumb-presentation-copy"></i>
-            <span class="quick-thumb-presentation-chart"><i></i><i></i><i></i></span>
-          </span>
-        </span>`;
-    case 'poster':
-      return `
-        <span class="quick-thumb-art quick-thumb-poster">
-          <i class="quick-thumb-poster-orb"></i>
-          <i class="quick-thumb-poster-product"></i>
-          <span class="quick-thumb-poster-copy"><i></i><i></i></span>
-          <i class="quick-thumb-poster-tag"></i>
-        </span>`;
-    case 'article':
-      return `
-        <span class="quick-thumb-art quick-thumb-article">
-          <i class="quick-thumb-article-cover"></i>
-          <span class="quick-thumb-article-body">
-            <i class="quick-thumb-article-kicker"></i>
-            <i class="quick-thumb-article-title"></i>
-            <i class="quick-thumb-article-line"></i>
-            <i class="quick-thumb-article-line is-short"></i>
-          </span>
-        </span>`;
-    case 'seo':
-      return `
-        <span class="quick-thumb-art quick-thumb-seo">
-          <span class="quick-thumb-search-bar"><i></i><b></b></span>
-          <span class="quick-thumb-search-result"><i></i><i></i></span>
-          <span class="quick-thumb-search-result is-second"><i></i><i></i></span>
-          <span class="quick-thumb-rank"><i></i><b></b><em></em></span>
-        </span>`;
-    default:
-      return `
-        <span class="quick-thumb-art quick-thumb-research">
-          <span class="quick-thumb-paper">
-            <i class="quick-thumb-paper-title"></i>
-            <i class="quick-thumb-paper-line is-wide"></i>
-            <i class="quick-thumb-paper-line is-medium"></i>
-          </span>
-        </span>`;
-  }
 }
 
 function _renderQuickStartScenarios() {
@@ -3613,7 +2899,7 @@ function _bindEmptyStateScenarioButtons(row) {
         _convLog.warn('Commander quick-start composer missing', { resource_id: id, position });
         return;
       }
-      input.value = tmpl;
+      composerSetText(input, tmpl);
       _setCommanderTemplateAttribution(input, {
         entry_point: 'quick_start',
         ...attribution,
@@ -3629,15 +2915,15 @@ function _bindEmptyStateScenarioButtons(row) {
       const placeholder = _findQuickStartPlaceholder(tmpl);
       if (editableSubject) {
         delete input.dataset.commanderQuickStartPlaceholder;
-        input.setSelectionRange(editableSubject.start, editableSubject.end);
+        composerSetSelection(input, editableSubject.start, editableSubject.end);
       } else if (placeholder) {
         input.dataset.commanderQuickStartPlaceholder = placeholder.text;
-        input.setSelectionRange(placeholder.start, placeholder.end);
+        composerSetSelection(input, placeholder.start, placeholder.end);
       } else {
         delete input.dataset.commanderQuickStartPlaceholder;
-        input.setSelectionRange(tmpl.length, tmpl.length);
+        composerSetSelection(input, tmpl.length, tmpl.length);
       }
-      try { input.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+      try { composerNotify(input); } catch (_) {}
     });
   });
 }
@@ -3652,15 +2938,6 @@ function _initEmptyStateScenarios() {
   if (typeof initOssQuickTask === 'function') initOssQuickTask();
   _refreshQuickStartConfig(row);
 }
-
-window.addEventListener('i18n-change', () => {
-  const row = document.getElementById('new-chat-scenarios');
-  if (!row) return;
-  _renderEmptyStateHeading();
-  _renderQuickStartScenarios();
-  _bindEmptyStateScenarioButtons(row);
-  if (typeof initOssQuickTask === 'function') initOssQuickTask();
-});
 function onEnterConversationView() {
   if (_messageSelectionState && _messageSelectionState.cid !== currentCid) _exitMessageSelection();
   _renderRecipientChip('conversation');
@@ -4276,7 +3553,7 @@ function _normaliseRecipientSnapshot(snapshot) {
 
 function _recipientSnapshotForSend(target) {
   const tg = target || 'conversation';
-  const r = _recipientSet(_composerMessageRecipients(tg, _composerRecipientInput(tg)?.value || '', true));
+  const r = _recipientSet(_composerMessageRecipients(tg, composerText(_composerRecipientInput(tg)) || '', true));
   const snap = _normaliseRecipientSnapshot(r) || { ..._COMMANDER, resetFloor: false };
   snap.defaultRecipient = { ..._activeRecipient(tg) };
   snap.preserveFloorSource = tg === 'conversation';
@@ -4343,8 +3620,8 @@ if (typeof window !== 'undefined') {
   const initChip = () => {
     _renderRecipientChip();
     _renderQuotePreview();
-    // D9 routing preview and multi-dispatch eligibility follow every
-    // keystroke (cheap: one regex pass each).
+    // Routing previews settle after a typing burst; send captures current state
+    // independently and never depends on this presentation debounce.
     for (const [inputId, tg] of [
       ['chat-input', 'conversation'],
       ['new-chat-input', 'new-chat'],
@@ -4353,9 +3630,13 @@ if (typeof window !== 'undefined') {
       const ta = document.getElementById(inputId);
       if (!ta || ta.dataset.mentionPreviewWired) continue;
       ta.dataset.mentionPreviewWired = '1';
-      ta.addEventListener('input', () => {
-        _syncComposerRecipientInput(tg);
-        _updateComposerSeqToggle(tg);
+      let previewTimer = 0;
+      ta.addEventListener(composerChangeEvent(ta), () => {
+        clearTimeout(previewTimer);
+        previewTimer = setTimeout(() => {
+          _syncComposerRecipientInput(tg);
+          _updateComposerSeqToggle(tg);
+        }, 180);
       });
     }
     for (const [tg, btnId] of _COMPOSER_SEQ_TOGGLES) {
@@ -4576,6 +3857,7 @@ async function _refreshGroupMembers(cid) {
     const data = await res.json();
     if (data?.ok && Array.isArray(data.actors)) {
       _groupMembersCache.set(cid, data.actors);
+      if (cid === currentCid) refreshChatComposer('chat-input');
       _refreshActorPlaceholders(cid);
       _refreshMountedConversationActorIdentities(cid);
       // Chat header's actor stack reads from the same cache. Without this
@@ -4627,6 +3909,7 @@ function _rememberGroupActor(cid, actor) {
   if (idx >= 0) next[idx] = { ...next[idx], ...actor };
   else next.push(actor);
   _groupMembersCache.set(cid, next);
+  if (cid === currentCid) refreshChatComposer('chat-input');
   _refreshActorPlaceholders(cid, actor.id);
   if (cid === currentCid) {
     try { _refreshChatHeader(); } catch (_) { /* not yet bound */ }
@@ -5770,38 +5053,6 @@ function _addReadyDraftAttachment(cid, info) {
 // draft chip. No conversation is created — the user's first message creates it
 // and adopts the draft attachments.
 window.COMMANDER_DRAFT_CID = DRAFT_CID;
-window.attachKbFileToDraft = async function attachKbFileToDraft(channel, payload, draftCid, afterNavigate) {
-  const finishOperation = _chatAttachBeginOperation(draftCid);
-  let stage = 'draft_lock';
-  try {
-    if (!finishOperation) throw new Error(t('chat.attach_send_in_progress'));
-    stage = 'ipc_request';
-    const data = await window.orkas.invoke(channel, { ...(payload || {}), cid: draftCid });
-    if (!data || !data.ok) {
-      const error = new Error((data && data.error) || 'failed');
-      error.failure_stage = data && data.failure_stage;
-      error.failure_kind = data && data.failure_kind;
-      throw error;
-    }
-    stage = 'navigation';
-    if (typeof afterNavigate === 'function') afterNavigate();
-    stage = 'draft_render';
-    _addReadyDraftAttachment(draftCid, data.info);
-  } catch (error) {
-    const safeStage = error && error.failure_stage;
-    const safeKind = error && error.failure_kind;
-    const failure_stage = ['input_validation', 'source_resolve', 'attachment_import'].includes(safeStage) ? safeStage : stage;
-    const failure_kind = ['not_found', 'permission_denied', 'disk_full'].includes(safeKind) ? safeKind : 'operation_failed';
-    // Keep the UI's original message; diagnostics receive only the enums.
-    const wrapped = new Error((error && error.message) || String(error));
-    wrapped.failure_stage = failure_stage;
-    wrapped.failure_kind = failure_kind;
-    _convLog.warn('library attachment failed', { failure_stage, failure_kind });
-    throw wrapped;
-  } finally {
-    if (finishOperation) finishOperation();
-  }
-};
 
 async function _chatAttachRefreshFromServer(cid) {
   // Navigation restores this selection from the edit marker. Pending files
@@ -5996,6 +5247,39 @@ function _mountMessageRunFactsFooter(msgDiv, facts) {
   if (factsNode) bubble.appendChild(factsNode);
 }
 
+
+
+// Resolve only attachment references that could overlap a produced file. The
+// basename filter avoids unrelated IPC; only the resolved full path establishes
+// identity. Never infer attachment storage layout in the renderer.
+async function _resolveBubbleAttachmentMediaPaths(bubble, absPaths, shown) {
+  const names = new Set(absPaths.map(_producedBaseName));
+  const refs = new Map();
+  bubble.querySelectorAll('img[src], video[src], audio[src]').forEach((el) => {
+    try {
+      const url = new URL(el.getAttribute('src'));
+      if (url.protocol !== 'chat-media:' || url.hostname !== 'cid') return;
+      const parts = url.pathname.split('/');
+      if (parts.length !== 3) return;
+      const cid = decodeURIComponent(parts[1]);
+      const name = decodeURIComponent(parts[2]);
+      if (!cid || !name || /[\\/]/.test(cid + name) || !names.has(name)) return;
+      refs.set(JSON.stringify([cid, name]), { cid, name });
+    } catch (_) { /* Malformed URLs cannot establish a file identity. */ }
+  });
+  // Sequential, unique lookups keep IPC work bounded by matching references,
+  // without a persistent cache that could survive account or project changes.
+  for (const ref of refs.values()) {
+    try {
+      const result = await window.orkas.invoke('attachments.absPath', ref);
+      if (result?.ok && typeof result.path === 'string' && result.path) {
+        shown.add(_producedMediaPathKey(result.path));
+      }
+    } catch (_) { /* Keep the preview when identity cannot be verified. */ }
+  }
+  return shown;
+}
+
 function _mountMessageProducedFooter(msgDiv, absPaths) {
   if (!msgDiv || !Array.isArray(absPaths) || !absPaths.length) return;
   const bubble = msgDiv.querySelector('.chat-bubble');
@@ -6014,16 +5298,28 @@ function _mountMessageProducedFooter(msgDiv, absPaths) {
     if (createdResourceFooter) bubble.insertBefore(child, createdResourceFooter);
     else bubble.appendChild(child);
   };
-  const mediaHtml = _renderProducedMediaHtml(absPaths, _bubbleRenderedMediaPaths(bubble));
-  if (mediaHtml) {
-    const mediaWrap = document.createElement('div');
-    mediaWrap.innerHTML = mediaHtml;
-    const mediaNode = mediaWrap.firstElementChild;
-    if (mediaNode) appendBeforeCreatedResources(mediaNode);
-  }
+  const shown = _bubbleRenderedMediaPaths(bubble);
+  const mountMedia = (resolved) => {
+    // A streaming replacement can detach the old footer while IPC is pending.
+    if (node.parentNode !== bubble || msgDiv.querySelector('.chat-bubble') !== bubble) return;
+    const mediaHtml = _renderProducedMediaHtml(absPaths, resolved);
+    if (mediaHtml) {
+      const mediaWrap = document.createElement('div');
+      mediaWrap.innerHTML = mediaHtml;
+      const mediaNode = mediaWrap.firstElementChild;
+      if (mediaNode) bubble.insertBefore(mediaNode, node);
+    }
+  };
   appendBeforeCreatedResources(node);
   msgDiv.dataset.produced = JSON.stringify(absPaths);
   _hydrateMessageProducedChips(msgDiv);
+  // Keep the normal local-only path synchronous. Attachment previews wait for
+  // identity resolution so the duplicate never flashes before disappearing.
+  if (bubble.querySelector('[src^="chat-media://cid/"]')) {
+    void _resolveBubbleAttachmentMediaPaths(bubble, absPaths, shown).then(mountMedia);
+  } else {
+    mountMedia(shown);
+  }
 }
 
 // Render one or more "view details" chips on an assistant bubble — one chip
@@ -6638,14 +5934,15 @@ function _convRowStatusHtml(c) {
 // Reads the same `_convRowStatus` the static renderer uses, so the in-session
 // failed overlay and any backend `c.status` both flow through here. Called by
 // `_updateConvSidebarBadge` once no live run badge is showing.
-function _repaintConvRowStatus(cid) {
+function _repaintConvRowStatus(cid, snapshot) {
   if (!cid || typeof document === 'undefined') return;
-  const conv = (Array.isArray(conversations) ? conversations : []).find(
+  const conv = snapshot ? snapshot.conversation : (Array.isArray(conversations) ? conversations : []).find(
     (x) => x && x.conversation_id === cid,
   );
   const status = _convRowStatus(conv || { conversation_id: cid });
   const wantLabel = _CONV_ROW_LABEL_STATUSES.has(status);
-  document.querySelectorAll(`.conv-item[data-cid="${CSS.escape(cid)}"]`).forEach((item) => {
+  const items = snapshot ? snapshot.items : document.querySelectorAll(`.conv-item[data-cid="${CSS.escape(cid)}"]`);
+  items.forEach((item) => {
     const row = item.querySelector(':scope > .conv-item-row');
     if (!row) return;
     row.querySelector(':scope > .conv-item-status-dot')?.remove();
@@ -7029,6 +6326,18 @@ function _conversationActionItems(cid, opts = {}) {
     label: t('chat.conv_rename_title'),
     onClick: () => opts.renameInHeader ? _startConversationHeaderRename(cid) : _renameConversation(cid, opts),
   });
+  // Filing a task under a project relocates it on disk, so it is offered only
+  // where it means something: a conversation that is not in one already.
+  if (conv && !conv.project_id) {
+    if (typeof _moveConversationToExistingProject === 'function') {
+      items.push({
+        action: 'to-project',
+        label: t('chat.conv_to_project'),
+        disabled: isConvPending(cid),
+        onClick: () => _moveConversationToExistingProject(cid),
+      });
+    }
+  }
   items.push({
     action: 'delete',
     label: t('chat.conv_del_title'),
@@ -7061,7 +6370,7 @@ function _openConversationActionMenu(anchorBtn, cid, opts = {}) {
     anchorListId: anchorList && anchorList.id ? anchorList.id : '',
   });
   menu.innerHTML = items.map((it, idx) =>
-    `<div class="ctx-row-menu-item${it.danger ? ' is-danger' : ''}" data-action="${escapeHtml(it.action)}" data-action-idx="${idx}">${escapeHtml(it.label)}</div>`
+    `<div class="ctx-row-menu-item${it.danger ? ' is-danger' : ''}${it.disabled ? ' is-disabled' : ''}" aria-disabled="${!!it.disabled}" data-action="${escapeHtml(it.action)}" data-action-idx="${idx}">${escapeHtml(it.label)}</div>`
   ).join('');
   menu.dataset.cid = cid;
 
@@ -7088,6 +6397,7 @@ function _openConversationActionMenu(anchorBtn, cid, opts = {}) {
       e.stopPropagation();
       const idx = Number(item.dataset.actionIdx);
       const action = items[idx];
+      if (action && action.action === 'to-project' && isConvPending(cid)) return;
       _closeConversationActionMenu();
       if (action && typeof action.onClick === 'function') action.onClick();
     });
@@ -7284,7 +6594,7 @@ function _ensureConvCreateAgentInline() {
       if (!currentCid) return;
       const input = document.getElementById('chat-input');
       if (!input) return;
-      input.value = t('chat.create_agent_message');
+      composerSetText(input, t('chat.create_agent_message'));
       autoGrow(input, 200);
       handleChatSubmit();
     });
@@ -7504,14 +6814,180 @@ function _maybeAutoLoadEarlierHistory(container, userGesture = false) {
 function _bindAutoLoadEarlierHistory(container) {
   if (!container || container._historyAutoLoadBound) return;
   container._historyAutoLoadBound = true;
-  container.addEventListener('scroll', () => _maybeAutoLoadEarlierHistory(container), { passive: true });
+  container.addEventListener('scroll', () => {
+    _maybeAutoLoadEarlierHistory(container);
+    _maybeAutoLoadNewerHistory(container);
+  }, { passive: true });
   // A wheel/touch gesture at scrollTop=0 does not always emit another scroll
   // event. Listen for the user's continued upward intent so short pages can
   // still advance without a button.
   container.addEventListener('wheel', (event) => {
     if (Number(event?.deltaY || 0) < 0) _maybeAutoLoadEarlierHistory(container, true);
+    if (Number(event?.deltaY || 0) > 0) _maybeAutoLoadNewerHistory(container, true);
   }, { passive: true });
   container.addEventListener('touchmove', () => _maybeAutoLoadEarlierHistory(container, true), { passive: true });
+}
+
+function _setLoadNewerHistory(container, cid, nextCursor, boundaryTime = Infinity) {
+  const cursor = _historyNextCursor(nextCursor);
+  let row = container.querySelector('.chat-history-load-newer');
+  if (cursor === null) {
+    row?.remove();
+    return;
+  }
+  if (!row) {
+    row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'btn btn-sm chat-history-load-newer';
+    const later = Array.from(container.querySelectorAll(':scope > .chat-message')).find(message => Number(message.dataset.ts) > boundaryTime);
+    container.insertBefore(row, later || null);
+    row.addEventListener('click', () => void _loadNewerConversationHistory(cid));
+  }
+  row.dataset.cursor = String(cursor);
+  row.dataset.cid = cid;
+  row.dataset.state = 'idle';
+  row.dataset.i18n = 'chat.history_load_newer';
+  row.textContent = t('chat.history_load_newer');
+  _bindAutoLoadEarlierHistory(container);
+}
+
+function _maybeAutoLoadNewerHistory(container, userGesture = false) {
+  if (!userGesture && _isProgrammaticStickyScroll(container)) return;
+  const row = container.querySelector('.chat-history-load-newer');
+  if (!row || row.dataset.state !== 'idle') return;
+  const rect = row.getBoundingClientRect();
+  const bounds = container.getBoundingClientRect();
+  if (rect.top <= bounds.bottom + HISTORY_AUTO_LOAD_THRESHOLD && rect.bottom >= bounds.top) {
+    void _loadNewerConversationHistory(row.dataset.cid);
+  }
+}
+
+async function _loadNewerConversationHistory(cid) {
+  const container = document.getElementById('chat-history');
+  const row = container?.querySelector('.chat-history-load-newer');
+  if (!row || cid !== currentCid || row.dataset.cid !== cid || row.dataset.state === 'loading') return;
+  row.dataset.state = 'loading';
+  row.dataset.i18n = 'chat.loading';
+  row.textContent = t('chat.loading');
+  try {
+    let cursor = _historyNextCursor(row.dataset.cursor);
+    let messages = [];
+    while (cursor !== null && !messages.length) {
+      const res = await apiFetch(`${_historyRequestUrl(cid)}&after=${cursor}`);
+      const data = await res.json();
+      if (cid !== currentCid || row.parentElement !== container) return;
+      if (_isConversationMissingResponse(data)) {
+        await _recoverMissingConversation(cid, 'newer_history');
+        return;
+      }
+      if (!data?.ok) throw new Error('History load failed');
+      const next = _historyNextCursor(data.following_cursor);
+      if (next === cursor) throw new Error('History cursor did not advance');
+      // Live messages can arrive while this page is in flight. Deduplicate
+      // against the current transcript, not the pre-request snapshot.
+      const knownIds = new Set(Array.from(container.querySelectorAll('.chat-message[data-msg-id]'), el => el.dataset.msgId));
+      const raw = Array.isArray(data.history) ? data.history : [];
+      raw.forEach(message => window.CliAsyncInput?.observe(cid, message));
+      messages = _collapseSupersededInterruptionRecords(_mergeNativeSegmentRecords(
+        raw.filter(gm => _isVisibleGroupHistoryRecord(gm) && (!gm.id || !knownIds.has(String(gm.id)))), cid,
+      )).map(_groupMsgToLegacy);
+      cursor = next;
+    }
+    const top = container.scrollTop;
+    // The user may have sent a message and scrolled beyond the gap while the
+    // read was pending. Keep that live row in view when filling the gap above
+    // it; an absolute scrollTop would pull the viewport back into old history.
+    let anchor = row.nextElementSibling;
+    while (anchor && (!anchor.classList.contains('chat-message')
+        || anchor.getBoundingClientRect().bottom <= container.getBoundingClientRect().top)) {
+      anchor = anchor.nextElementSibling;
+    }
+    if (anchor && anchor.getBoundingClientRect().top >= container.getBoundingClientRect().bottom) anchor = null;
+    const anchorTop = anchor?.getBoundingClientRect().top;
+    const followBottom = !!anchor && !container._stickyUserPaused && _isNearBottom(container);
+    const fragment = document.createDocumentFragment();
+    messages.forEach(message => {
+      const added = appendChatMessage(message, false, { cid, container: fragment, historyHydration: true });
+      if (added) _joinNewerHistoryTurn(container, added);
+    });
+    container.insertBefore(fragment, row);
+    _setLoadNewerHistory(container, cid, cursor);
+    _setHistoryLatestAction(container, cid);
+    _markProgrammaticStickyScroll(container);
+    const behavior = container.style.scrollBehavior;
+    container.style.scrollBehavior = 'auto';
+    container.scrollTop = followBottom ? container.scrollHeight
+      : top + (anchor?.isConnected ? anchor.getBoundingClientRect().top - anchorTop : 0);
+    container.style.scrollBehavior = behavior;
+    if (!anchor) {
+      container._stickyEnabled = false;
+      container._stickyUserPaused = true;
+    }
+    if (_messageSelectionState?.cid === cid) _syncMessageSelectionUi();
+  } catch (_) {
+    if (row.parentElement === container) {
+      row.dataset.state = 'error';
+      row.dataset.i18n = 'chat.history_retry_newer';
+      row.textContent = t('chat.history_retry_newer');
+    }
+  }
+}
+
+// A forward page can continue a native turn whose earlier segments are already
+// painted. Move those rendered blocks, including their formula nodes, into the
+// final row rather than rendering the earlier content again.
+function _joinNewerHistoryTurn(container, added) {
+  const actor = added.dataset.fromActor;
+  const turn = added.dataset.turnId;
+  if (!turn || !_isFoldableSegmentActor(actor) || _rowSegmentIndex(added) < 0) return;
+  const prior = Array.from(container.querySelectorAll('.chat-message[data-turn-id]')).find(row =>
+    row !== added && row.dataset.turnId === turn && row.dataset.fromActor === actor
+    && row.dataset.msgId && _rowSegmentIndex(row) < _rowSegmentIndex(added));
+  if (!prior) return;
+  const previousBounds = prior.getBoundingClientRect();
+  const viewportBounds = container.getBoundingClientRect();
+  const wasVisible = previousBounds.bottom > viewportBounds.top && previousBounds.top < viewportBounds.bottom;
+  const bubble = added.querySelector('.chat-bubble');
+  const oldBubble = prior.querySelector('.chat-bubble');
+  if (!bubble || !oldBubble) return;
+  const anchor = bubble.querySelector('.chat-turn-narration, .markdown-body');
+  for (const block of oldBubble.querySelectorAll(':scope > .chat-turn-narration')) bubble.insertBefore(block, anchor);
+  const body = oldBubble.querySelector(':scope > .markdown-body');
+  const narration = [...(prior._narration || [])];
+  if (body) {
+    const block = document.createElement('div');
+    block.className = 'chat-turn-narration';
+    block.dataset.narrationSeg = String(_rowSegmentIndex(prior));
+    block.appendChild(body);
+    bubble.insertBefore(block, anchor);
+    narration.push({ seg: _rowSegmentIndex(prior), text: prior._historyLegacyMessage?.content || body.textContent });
+  }
+  added._narration = narration.concat(added._narration || []);
+  const process = [...(prior._persistedProcessItems || []), ...(added._persistedProcessItems || [])];
+  if (process.length) {
+    const expanded = prior.querySelector('.stream-process')?.open === true;
+    added.querySelector('.stream-process')?.remove();
+    _renderPersistedProcess(added, process, { expanded });
+  }
+  // Loading the continuation must not suddenly fold the answer being read.
+  // An explicit fold choice still takes precedence inside _applyNarrationFold.
+  added.dataset.narrationExpanded = wasVisible ? '1' : prior.dataset.narrationExpanded || '0';
+  _applyNarrationFold(added);
+  prior.replaceWith(added);
+}
+
+function _setHistoryLatestAction(container, cid) {
+  let button = document.getElementById('chat-history-latest');
+  if (!button) {
+    button = document.createElement('button');
+    button.id = 'chat-history-latest';
+    button.className = 'btn btn-sm';
+    container.after(button);
+    button.addEventListener('click', () => void loadConversationHistory(currentCid));
+  }
+  button.textContent = t('chat.history_latest');
+  button.dataset.i18n = 'chat.history_latest';
+  button.hidden = !container.querySelector('.chat-history-load-newer');
 }
 
 function _setLoadEarlierHistory(container, cid, nextCursor) {
@@ -7810,7 +7286,6 @@ function _restoreLiveDisplaySnapshot(cid, snapshot) {
       row._narration = [];
       row._commentaryLine = null;
       row._commentaryBuf = '';
-      row._commentaryRafScheduled = false;
       delete row._processDisplayContext;
       delete row._reasoningSummaryById;
       for (const key of ['narrationSegs', 'streamBuf', 'finalText', 'streamDisplay',
@@ -8080,8 +7555,12 @@ async function loadConversationHistory(cid, opts = {}) {
     // Reflect a persisted latest-reply failure on the sidebar row when a
     // conversation is (re)opened — the failure lives in the history message,
     // not the conversation index. See `_syncFailedFromHistory`.
-    _syncFailedFromHistory(cid, history);
+    if (!_historyNextCursor(data.following_cursor)) _syncFailedFromHistory(cid, history);
     _setLoadEarlierHistory(container, cid, data.next_cursor);
+    _setLoadNewerHistory(container, cid, data.following_cursor,
+      Math.max(0, ...(data.history || []).map(message => _msTs(message.ts || message.time))));
+    _setHistoryLatestAction(container, cid);
+    _bindAutoLoadEarlierHistory(container);
     const searchTargetRevealed = opts.searchTarget
       ? _revealConversationHistorySearchTarget(cid, opts.searchTarget)
       : false;
@@ -8877,6 +8356,7 @@ function _streamingRestoreStableMedia(nextRoot, stable) {
 
 function _setStreamingFinalHtml(finalEl, html) {
   if (!finalEl) return;
+  delete finalEl._streamMarkdown;
   if (
     typeof document === 'undefined'
     || !document.createElement
@@ -8900,6 +8380,156 @@ function _setStreamingFinalHtml(finalEl, html) {
   if (typeof _hydrateMarkdownHtmlEmbeds === 'function') _hydrateMarkdownHtmlEmbeds(finalEl);
 }
 
+// Reconcile balanced parser blocks, keeping the live DOM for identical blocks.
+// Cache entries belong to this element's current document; a pending math job
+// owns only its one candidate version and commits through the existing token.
+function _prepareStreamingMarkdown(finalEl, display) {
+  const previous = finalEl._streamMarkdown;
+  const state = previous?.body?.parentNode === finalEl ? previous
+    : { body: null, blocks: [], cache: {} };
+  const available = new Map();
+  for (const block of state.blocks) {
+    const queue = available.get(block.html) || { blocks: [], index: 0 };
+    queue.blocks.push(block);
+    available.set(block.html, queue);
+  }
+  const blocks = _renderMessageMarkdown(display, state.cache).map(html => {
+    const queue = available.get(html);
+    return queue && queue.index < queue.blocks.length ? queue.blocks[queue.index++] : { html, nodes: null };
+  });
+  return { state, blocks };
+}
+
+function _streamingFormulaKey(node) {
+  if (node?.nodeName !== 'MJX-CONTAINER') return '';
+  const math = node.querySelector('mjx-assistive-mml');
+  return math ? `${node.getAttribute('display') || ''}:${math.innerHTML}` : '';
+}
+
+function _patchStreamingMarkdownNode(existing, fresh) {
+  if (!existing || existing.nodeType !== fresh.nodeType || existing.nodeName !== fresh.nodeName) return fresh;
+  if (existing.isEqualNode(fresh)) return existing;
+  if (fresh.nodeType === 3) { existing.nodeValue = fresh.nodeValue; return existing; }
+  if (fresh.nodeType !== 1) return fresh;
+  if (fresh.nodeName === 'MJX-CONTAINER') {
+    const key = _streamingFormulaKey(fresh);
+    return key && key === _streamingFormulaKey(existing) ? existing : fresh;
+  }
+  // Media owns load/playback/iframe state, which cannot be reconstructed from
+  // attributes. Sync metadata through the same helpers as the full-render path.
+  for (const [selector, mediaSelector, sync] of [
+    ['.chat-md-img-shell', 'img[src]', _streamingSyncStableImageNode],
+    ['.chat-md-video-shell', 'video[src]', _streamingSyncStableMediaNode],
+    ['.chat-md-audio-card', 'audio[src]', _streamingSyncStableMediaNode],
+  ]) {
+    if (!fresh.matches(selector)) continue;
+    if (existing.matches(selector) && existing.querySelector(mediaSelector)?.getAttribute('src') === fresh.querySelector(mediaSelector)?.getAttribute('src')) {
+      return sync(existing, fresh);
+    }
+    return fresh;
+  }
+  if (fresh.matches('.chat-md-html-embed')) {
+    return existing.matches('.chat-md-html-embed') && existing.getAttribute('data-html-src') === fresh.getAttribute('data-html-src') ? existing : fresh;
+  }
+  _streamingCopyElementAttributes(existing, fresh);
+  const oldChildren = Array.from(existing.childNodes);
+  const children = Array.from(fresh.childNodes).map((node, i) => _patchStreamingMarkdownNode(oldChildren[i], node));
+  _placeStreamingMarkdownNodes(existing, children);
+  return existing;
+}
+
+function _placeStreamingMarkdownNodes(parent, nodes, cursor = parent.firstChild, end = null) {
+  for (const node of nodes) {
+    if (cursor === node) cursor = cursor.nextSibling;
+    else parent.insertBefore(node, cursor);
+  }
+  while (cursor && cursor !== end) {
+    const next = cursor.nextSibling;
+    cursor.remove();
+    cursor = next;
+  }
+}
+
+function _commitStreamingMarkdown(finalEl, prepared, suffixHtml = '') {
+  const { state, blocks } = prepared;
+  let body = state.body;
+  let oldBlocks = state.blocks;
+  let uncachedNodes = null;
+  let uncachedIndex = 0;
+  if (!body || body.parentNode !== finalEl) {
+    oldBlocks = [];
+    body = Array.from(finalEl.children).find(node => node.classList.contains('markdown-body'));
+    if (body) {
+      // Terminal rows release parser caches. A subsequent authoritative reply
+      // (for example recovery after an error) must still preserve live math
+      // and media even though block metadata is no longer retained.
+      uncachedNodes = Array.from(body.childNodes);
+    } else {
+      body = document.createElement('div');
+      body.className = 'markdown-body';
+      finalEl.replaceChildren(body);
+    }
+  }
+  const reused = new Set(blocks.filter(block => block.nodes));
+  const changed = [];
+  blocks.forEach((block, i) => {
+    if (block.nodes) return;
+    const tmp = document.createElement('div');
+    tmp.innerHTML = block.rendered ?? block.html;
+    const old = state.blocks[i];
+    const candidates = old && !reused.has(old) ? old.nodes : [];
+    block.nodes = Array.from(tmp.childNodes).map((node, j) => _patchStreamingMarkdownNode(
+      uncachedNodes ? uncachedNodes[uncachedIndex++] : candidates?.[j], node,
+    ));
+    changed.push(block);
+    delete block.rendered;
+  });
+  // Avoid even walking the stable DOM prefix: on a long reply the many
+  // thousands of childNodes/sibling reads alone can cost a frame.
+  let first = 0;
+  while (first < oldBlocks.length && first < blocks.length && oldBlocks[first] === blocks[first]) first++;
+  let oldEnd = oldBlocks.length;
+  let nextEnd = blocks.length;
+  while (oldEnd > first && nextEnd > first && oldBlocks[oldEnd - 1] === blocks[nextEnd - 1]) { oldEnd--; nextEnd--; }
+  const firstNode = (from) => {
+    for (let i = from; i < oldBlocks.length; i++) if (oldBlocks[i].nodes.length) return oldBlocks[i].nodes[0];
+    return null;
+  };
+  _placeStreamingMarkdownNodes(body, blocks.slice(first, nextEnd).flatMap(block => block.nodes),
+    uncachedNodes ? body.firstChild : firstNode(first), firstNode(oldEnd));
+  // Error suffixes are outside Markdown and may have been shown immediately
+  // while math was pending. An authoritative final reply removes them.
+  for (const child of Array.from(finalEl.childNodes)) if (child !== body) child.remove();
+  if (suffixHtml) finalEl.insertAdjacentHTML('beforeend', suffixHtml);
+  if (!finalEl._streamMarkdownComplete) finalEl._streamMarkdown = { body, blocks, cache: state.cache };
+  else delete finalEl._streamMarkdown;
+  if (typeof _hydrateMarkdownHtmlEmbeds === 'function') changed.forEach(block => block.nodes.forEach(node => _hydrateMarkdownHtmlEmbeds(node)));
+}
+
+function _releaseStreamingMarkdown(finalEl) {
+  if (!finalEl) return;
+  finalEl._streamMarkdownComplete = true;
+  delete finalEl._streamMarkdown;
+}
+
+function _paintStreamingMarkdownBlocks(msg, finalEl, display, { stickBottom, suffixHtml }) {
+  const prepared = _prepareStreamingMarkdown(finalEl, display);
+  const dirtyMath = prepared.blocks.filter(block => !block.nodes && _streamMathSignatureForText(block.html));
+  if (!dirtyMath.length || typeof typesetMathHtml !== 'function') {
+    _invalidateStreamingMathPaint(msg);
+    _commitStreamingMarkdown(finalEl, prepared, suffixHtml);
+    msg.dataset.streamPaintedDisplay = display;
+    if (dirtyMath.length && typeof typesetMath === 'function') typesetMath(finalEl);
+    if (stickBottom) _stickBottomFromMsg(msg);
+    return;
+  }
+  const token = (msg._streamMathPaintToken || 0) + 1;
+  msg._streamMathPaintToken = token;
+  const html = dirtyMath.map((block, i) => `<div data-stream-math-block="${i}" class="markdown-body">${block.html}</div>`).join('');
+  msg._streamMathLatestPaint = { token, finalEl, display, html, prepared, dirtyMath, stickBottom, suffixHtml };
+  _scheduleStreamingMathPaint(msg);
+}
+
 function _invalidateStreamingMathPaint(msg) {
   if (!msg) return;
   if (msg._streamMathTimer) {
@@ -8921,10 +8551,14 @@ function _scheduleStreamingMathPaint(msg) {
 async function _flushStreamingMathPaint(msg) {
   const job = msg?._streamMathLatestPaint;
   if (!msg || !job || !job.finalEl) return;
+  if (job.finalEl.isConnected === false) {
+    _invalidateStreamingMathPaint(msg);
+    return;
+  }
   msg._streamMathPaintBusy = true;
   let rendered = job.html;
   try {
-    rendered = await typesetMathHtml(job.html);
+    rendered = await typesetMathHtml(job.html, { cache: !job.prepared });
   } catch (_) {
     rendered = job.html;
   } finally {
@@ -8932,13 +8566,28 @@ async function _flushStreamingMathPaint(msg) {
   }
 
   const latest = msg._streamMathLatestPaint;
+  // Switching tasks can detach the target while MathJax is still working.
+  // Discard it instead of retrying the same invisible result every 40 ms.
+  if (latest?.finalEl.isConnected === false) {
+    _invalidateStreamingMathPaint(msg);
+    return;
+  }
   if (
     latest
     && latest.token === job.token
     && latest.finalEl === job.finalEl
     && job.finalEl.isConnected !== false
   ) {
-    _setStreamingFinalHtml(job.finalEl, rendered);
+    if (job.prepared) {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = rendered;
+      job.dirtyMath.forEach((block, i) => {
+        block.rendered = tmp.querySelector(`[data-stream-math-block="${i}"]`)?.innerHTML ?? block.html;
+      });
+      _commitStreamingMarkdown(job.finalEl, job.prepared, job.suffixHtml);
+    } else {
+      _setStreamingFinalHtml(job.finalEl, rendered);
+    }
     msg.dataset.streamPaintedDisplay = job.display;
     msg._streamMathLatestPaint = null;
     if (job.stickBottom) _stickBottomFromMsg(msg);
@@ -8948,9 +8597,23 @@ async function _flushStreamingMathPaint(msg) {
   if (msg._streamMathLatestPaint) _scheduleStreamingMathPaint(msg);
 }
 
-function _paintStreamingFinalMarkdown(msg, finalEl, display, { stickBottom = false } = {}) {
+function _paintStreamingFinalMarkdown(msg, finalEl, display, { stickBottom = false, suffixHtml = '' } = {}) {
   if (!msg || !finalEl) return;
-  const html = _streamingMarkdownBodyHtml(display);
+  // Structural blocks can grow without changing their visible placeholder.
+  // Keep the DOM (and already-typeset formulas) untouched in that case.
+  if (!suffixHtml && msg.dataset.streamPaintedDisplay === display
+      && finalEl.querySelector?.('.markdown-body') && !finalEl.querySelector?.('.msg-error')) {
+    _invalidateStreamingMathPaint(msg);
+    return;
+  }
+  if (!suffixHtml && msg._streamMathLatestPaint?.display === display
+      && !msg._streamMathLatestPaint.suffixHtml
+      && msg._streamMathLatestPaint.finalEl === finalEl) return;
+  if (typeof renderMarkdownBlocks === 'function' && typeof finalEl.insertBefore === 'function') {
+    _paintStreamingMarkdownBlocks(msg, finalEl, display, { stickBottom, suffixHtml });
+    return;
+  }
+  const html = _streamingMarkdownBodyHtml(display) + suffixHtml;
   const sig = _streamMathSignatureForText(display);
   if (!sig || typeof typesetMathHtml !== 'function') {
     _invalidateStreamingMathPaint(msg);
@@ -8963,7 +8626,7 @@ function _paintStreamingFinalMarkdown(msg, finalEl, display, { stickBottom = fal
 
   const token = (msg._streamMathPaintToken || 0) + 1;
   msg._streamMathPaintToken = token;
-  msg._streamMathLatestPaint = { token, finalEl, display, html, stickBottom };
+  msg._streamMathLatestPaint = { token, finalEl, display, html, stickBottom, suffixHtml };
   _scheduleStreamingMathPaint(msg);
 }
 
@@ -9038,6 +8701,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   const role = message.role === 'assistant' ? 'assistant' : 'user';
   const msgDiv = document.createElement('div');
   msgDiv.className = `chat-message ${role}`;
+  if (historyHydration) msgDiv._historyLegacyMessage = message;
   // Sender id stamp — used by `_ensureConvCreateAgentInline` to detect
   // whether any agent (≠ user / commander) has spoken in this conversation.
   // Empty when unknown (e.g. stale records lacking _from); the inline button
@@ -9148,7 +8812,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     _hydrateMarkdownHtmlEmbeds(msgDiv);
   }
   if (!isHtmlSnippet && typeof typesetMath === 'function') {
-    const md = msgDiv.querySelector('.markdown-body');
+    const md = msgDiv.querySelector('.chat-bubble > .markdown-body');
     if (md) typesetMath(md);
   }
   if (attachmentsHtml) _hydrateMessageAttachments(msgDiv, attachmentCid);
@@ -9725,12 +9389,18 @@ function _mountAppNavRequests(host, message) {
           ? 'chat.app_nav_configure'
           : 'chat.app_nav_open';
     const label = t(labelKey, { name });
-    btn.textContent = label && label !== labelKey ? label : `Open ${name}`;
-    if (typeof window.uiIconHtml === 'function') {
-      const pageIcon = document.createElement('span');
-      pageIcon.className = 'chat-app-nav-btn-page-icon';
-      pageIcon.innerHTML = window.uiIconHtml('panel-list', 'ui-icon chat-app-nav-btn-page-icon-svg');
-      btn.appendChild(pageIcon);
+    const pageLabel = label && label !== labelKey ? label : `Open ${name}`;
+    const paintTarget = (target) => {
+      const targetName = target && typeof target.name === 'string' ? target.name : '';
+      const targetLabel = targetName ? t('chat.app_nav_configure_target', { target: targetName }) : '';
+      if (!targetLabel || targetLabel === 'chat.app_nav_configure_target') return false;
+      _paintAppNavButton(btn, targetLabel, target.iconSvg || '');
+      return true;
+    };
+    const target = action === 'configure' ? _appNavConfigureTarget(surfaceId, targetId) : null;
+    if (!(target && typeof target.then !== 'function' && paintTarget(target))) {
+      _paintAppNavButton(btn, pageLabel, '');
+      if (target && typeof target.then === 'function') target.then(paintTarget);
     }
     btn.addEventListener('click', async () => {
       btn.disabled = true;
@@ -9745,6 +9415,45 @@ function _mountAppNavRequests(host, message) {
     });
     row.appendChild(btn);
   }
+}
+
+// Several configure cards can arrive in one reply, so connector and project cards name their
+// exact target. Returns `{ name, iconSvg? }`, a Promise of it, or null (keep the page label).
+const _appNavProjectRefreshes = new Set();
+
+function _appNavConfigureTarget(surfaceId, targetId) {
+  if (surfaceId === 'connectors') {
+    let now = null;
+    try {
+      now = typeof window.connectorNavTarget === 'function' ? window.connectorNavTarget(targetId) : null;
+    } catch (_) { /* fall through to the async lookup */ }
+    if (now) return now;
+    return typeof window.loadConnectorNavTarget === 'function'
+      ? Promise.resolve(window.loadConnectorNavTarget(targetId)).catch(() => null)
+      : null;
+  }
+  if (surfaceId !== 'projects') return null;
+  const named = (projects) => {
+    const project = Array.isArray(projects)
+      ? projects.find((item) => item && item.project_id === targetId)
+      : null;
+    const name = project && typeof project.name === 'string' ? project.name.trim() : '';
+    return name ? { name } : null;
+  };
+  const now = named(typeof _projectsCache !== 'undefined' ? _projectsCache : null);
+  // A project created in this turn may not be in the sidebar list yet; refresh once per id.
+  if (now || typeof loadProjects !== 'function' || _appNavProjectRefreshes.has(targetId)) return now;
+  _appNavProjectRefreshes.add(targetId);
+  return Promise.resolve(loadProjects(true)).then(named).catch(() => null);
+}
+
+function _paintAppNavButton(btn, label, iconSvg) {
+  btn.textContent = label;
+  if (!iconSvg && typeof window.uiIconHtml !== 'function') return;
+  const pageIcon = document.createElement('span');
+  pageIcon.className = iconSvg ? 'chat-app-nav-btn-page-icon is-brand' : 'chat-app-nav-btn-page-icon';
+  pageIcon.innerHTML = iconSvg || window.uiIconHtml('panel-list', 'ui-icon chat-app-nav-btn-page-icon-svg');
+  btn.appendChild(pageIcon);
 }
 
 function _mountMarketplaceInstallRequests(host, msgDiv, message, opts) {
@@ -10000,6 +9709,14 @@ function _removeQuoteAt(cid, index) {
   _renderQuotePreview(cid);
 }
 function _getQuotes(cid) { return cid ? _quotesByCid.get(cid) || [] : []; }
+function _consumeSubmittedQuotes(cid, submitted) {
+  const sent = new Set(submitted.map(_quoteIdentity));
+  const remaining = _getQuotes(cid).filter(quote => !sent.has(_quoteIdentity(quote)));
+  if (remaining.length) _quotesByCid.set(cid, remaining);
+  else _quotesByCid.delete(cid);
+  if (typeof _persistQuoteDraft === 'function') _persistQuoteDraft(cid);
+  _renderQuotePreview(cid);
+}
 function _clearQuotes(cid) {
   if (!cid) return;
   _quotesByCid.delete(cid);
@@ -10198,10 +9915,55 @@ function _attachAssistantActions(msgDiv, getContent, opts = {}) {
 
 let _messageSelectionState = null; // { cid, selected:Set<string> }
 
-function _selectedMessageElements() {
-  if (!_messageSelectionState || _messageSelectionState.cid !== currentCid) return [];
-  return Array.from(document.querySelectorAll('#chat-history .chat-message[data-msg-id]'))
-    .filter((msg) => _messageSelectionState.selected.has(msg.dataset.msgId || ''));
+async function _selectedMessagePayloads() {
+  const state = _messageSelectionState;
+  if (!state || state.cid !== currentCid) return null;
+  const mounted = new Map(Array.from(document.querySelectorAll('#chat-history .chat-message[data-msg-id]'),
+    row => [row.dataset.msgId, row]));
+  const payloads = [];
+  for (const id of Array.from(state.selected)) {
+    if (state !== _messageSelectionState || state.cid !== currentCid) return null;
+    let row = mounted.get(id);
+    const message = state.records?.get(id) || row?._historyLegacyMessage;
+    if (!row) {
+      if (!message) throw new Error('Selected message unavailable');
+      row = document.createElement('div');
+      row.className = `chat-message ${message.role === 'user' ? 'user' : 'assistant'}`;
+      Object.assign(row.dataset, { msgId: id, ts: String(_msTs(message.time)),
+        fromActor: message._from || '', attachments: JSON.stringify(message.attachments || []),
+        references: JSON.stringify(message.references || []), produced: JSON.stringify(message.produced || []) });
+      let html = _messageDisplayProjection(message).contentHtml;
+      if (message._narration?.length) html = message._narration.map(item =>
+        `<div class="chat-turn-narration"><div class="markdown-body">${_renderMessageMarkdown(item.text)}</div></div>`).join('') + html;
+      if (typeof typesetMathHtml === 'function') html = await typesetMathHtml(html);
+      if (message.artifacts?.length) html += message.artifacts.map(artifact =>
+        `<div class="chat-artifact-host">${escapeHtml(artifact.title || t('artifact.title'))}</div>`).join('');
+      row.innerHTML = `<span class="chat-msg-from">${escapeHtml(_groupActorLabel(message._from) || message._from_label || t('chat.from_agent_unknown'))}</span><div class="chat-bubble">${html}</div>`;
+    }
+    payloads.push({ ts: Number(row.dataset.ts || 0), reference: _messageReferencePayload(row) });
+    // Release the temporary body and let input/paint run between batches.
+    if (payloads.length % 10 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  if (state !== _messageSelectionState || state.cid !== currentCid) return null;
+  return payloads.sort((a, b) => a.ts - b.ts);
+}
+
+async function _prepareSelectedMessagePayloads() {
+  const state = _messageSelectionState;
+  if (!state || state.cid !== currentCid || state.preparing || state.loadingAll) return null;
+  state.preparing = true;
+  _updateMessageSelectionToolbar();
+  try {
+    return await _selectedMessagePayloads();
+  } catch (_) {
+    if (state === _messageSelectionState && state.cid === currentCid) {
+      uiToast(t('chat.message_prepare_failed'), { variant: 'error' });
+    }
+    return null;
+  } finally {
+    state.preparing = false;
+    if (state === _messageSelectionState) _updateMessageSelectionToolbar();
+  }
 }
 
 function _messageReferencePayload(msgDiv) {
@@ -10391,27 +10153,28 @@ function _updateMessageSelectionToolbar() {
   if (!bar || !_messageSelectionState) return;
   const count = _messageSelectionState.selected.size;
   const countEl = bar.querySelector('[data-selection-count]');
-  if (countEl) countEl.textContent = t('chat.message_selected_count', { count });
+  if (countEl) countEl.textContent = _messageSelectionState.preparing
+    ? t('chat.loading') : t('chat.message_selected_count', { count });
   const selectAll = bar.querySelector('[data-selection-all]');
   if (selectAll) {
     selectAll.textContent = _messageSelectionState.loadingAll ? t('chat.loading')
       : t(_allMessagesSelected() ? 'chat.message_deselect_all' : 'chat.message_select_all');
-    selectAll.disabled = !!_messageSelectionState.loadingAll;
+    selectAll.disabled = !!_messageSelectionState.loadingAll || !!_messageSelectionState.preparing;
   }
   bar.querySelectorAll('[data-requires-selection]').forEach((btn) => {
-    btn.disabled = count === 0 || !!_messageSelectionState.loadingAll;
+    btn.disabled = count === 0 || !!_messageSelectionState.loadingAll || !!_messageSelectionState.preparing;
   });
 }
 
 function _allMessagesSelected() {
-  if (!_messageSelectionState || document.querySelector('#chat-history .chat-history-load-earlier')) return false;
-  const messages = Array.from(document.querySelectorAll('#chat-history .chat-message[data-msg-id]'));
-  return messages.length > 0 && messages.every((msg) => _messageSelectionState.selected.has(msg.dataset.msgId));
+  const state = _messageSelectionState;
+  return !!state?.records?.size && state.records.size === state.selected.size
+    && Array.from(state.records.keys()).every(id => state.selected.has(id));
 }
 
 async function _toggleAllMessageSelection() {
   const state = _messageSelectionState;
-  if (!state || state.cid !== currentCid || state.loadingAll) return;
+  if (!state || state.cid !== currentCid || state.loadingAll || state.preparing) return;
   if (_allMessagesSelected()) {
     state.selected.clear();
     _syncMessageSelectionUi();
@@ -10420,24 +10183,27 @@ async function _toggleAllMessageSelection() {
   state.loadingAll = true;
   _updateMessageSelectionToolbar();
   try {
-    // Complete paginated history before committing the selection. A failed
-    // page keeps the previous selection and the existing history retry UI.
-    while (state === _messageSelectionState && state.cid === currentCid) {
-      const row = document.querySelector('#chat-history .chat-history-load-earlier');
-      if (!row) break;
-      const cursor = _historyNextCursor(row.dataset.cursor);
-      if (cursor === null || row.dataset.cid !== state.cid) return;
-      await _loadOlderConversationHistory(state.cid, cursor);
+    const pages = [];
+    const visited = new Set();
+    let cursor = null;
+    do {
+      const res = await apiFetch(_historyRequestUrl(state.cid, cursor, 100));
+      const data = await res.json();
       if (state !== _messageSelectionState || state.cid !== currentCid) return;
-      const next = document.querySelector('#chat-history .chat-history-load-earlier');
-      if (next && (next.dataset.state === 'error' || _historyNextCursor(next.dataset.cursor) === cursor)) {
-        uiToast(t('chat.message_select_all_failed'), { variant: 'error' });
-        return;
-      }
-    }
-    if (state !== _messageSelectionState || state.cid !== currentCid) return;
-    state.selected = new Set(Array.from(document.querySelectorAll('#chat-history .chat-message[data-msg-id]'))
-      .map((msg) => msg.dataset.msgId).filter(Boolean));
+      if (!data?.ok) throw new Error('History selection load failed');
+      pages.push(Array.isArray(data.history) ? data.history : []);
+      cursor = _historyNextCursor(data.next_cursor);
+      if (cursor !== null && visited.has(cursor)) throw new Error('History cursor did not advance');
+      visited.add(cursor);
+    } while (cursor !== null);
+    const records = _collapseSupersededInterruptionRecords(_mergeNativeSegmentRecords(
+      pages.reverse().flat().filter(_isVisibleGroupHistoryRecord), state.cid, { rebuild: true },
+    )).map(_groupMsgToLegacy);
+    // Commit atomically: failed/cancelled reads leave the prior selection intact.
+    state.records = new Map(records.filter(message => message._msg_id).map(message => [String(message._msg_id), message]));
+    state.selected = new Set(state.records.keys());
+  } catch (_) {
+    if (state === _messageSelectionState && state.cid === currentCid) uiToast(t('chat.message_select_all_failed'), { variant: 'error' });
   } finally {
     state.loadingAll = false;
     if (state === _messageSelectionState) _syncMessageSelectionUi();
@@ -10446,7 +10212,7 @@ async function _toggleAllMessageSelection() {
 
 function _toggleMessageSelection(msg) {
   const id = msg?.dataset?.msgId || '';
-  if (!id || !_messageSelectionState || _messageSelectionState.cid !== currentCid) return;
+  if (!id || !_messageSelectionState || _messageSelectionState.cid !== currentCid || _messageSelectionState.preparing) return;
   if (_messageSelectionState.selected.has(id)) _messageSelectionState.selected.delete(id);
   else _messageSelectionState.selected.add(id);
   _syncMessageSelectionUi();
@@ -10508,9 +10274,9 @@ function _syncMessageSelectionUi() {
     const wrapper = pane.querySelector('.chat-input-wrapper');
     wrapper.insertBefore(bar, wrapper.querySelector('.chat-input-area'));
     bar.querySelector('[data-selection-cancel]').addEventListener('click', _exitMessageSelection);
-    bar.querySelector('[data-selection-reference]').addEventListener('click', () => {
-      const payloads = _selectedMessageElements().map(_messageReferencePayload).filter(Boolean);
-      _openReferenceTargetPicker(payloads);
+    bar.querySelector('[data-selection-reference]').addEventListener('click', async () => {
+      const payloads = await _prepareSelectedMessagePayloads();
+      if (payloads) _openReferenceTargetPicker(payloads.map(payload => payload.reference).filter(Boolean));
     });
   }
   _updateMessageSelectionToolbar();
@@ -10804,7 +10570,10 @@ let _newChatSubmitting = false;
 async function handleNewChatSubmit() {
   if (_newChatSubmitting) return;
   const input = document.getElementById('new-chat-input');
-  const raw = (input.value || '').trim();
+  const submittedDraft = composerSnapshot(input);
+  const navigationEpoch = _composerNavigationEpoch;
+  const recipientSnapshot = _recipientSnapshotForSend('new-chat');
+  const raw = submittedDraft.text().trim();
   const quotes = _getQuotes(DRAFT_CID).slice();
   if (!raw && !quotes.length) return;
   const requestText = raw || t('chat.reference_default_prompt');
@@ -10843,7 +10612,6 @@ async function handleNewChatSubmit() {
   const useSelections = pendingUseSelections;
   // Snapshot the new-chat recipient *now* so a stray view-change between
   // here and conv-create doesn't reset it before we can transfer.
-  const recipientSnapshot = _recipientSnapshotForSend('new-chat');
   _pendingNewChatRecipient = _normaliseRecipientSnapshot(recipientSnapshot) || { ..._COMMANDER };
   // Keep the title seed separate from transport content. The body carries
   // routing mentions (panel-inserted or typed) and `content` may gain an
@@ -10966,31 +10734,26 @@ async function handleNewChatSubmit() {
   _chatAttachClear(DRAFT_CID);
   _chatAttachClear(convId);
   releaseAttachmentSend();
-  _clearQuotes(DRAFT_CID);
+  _consumeSubmittedQuotes(DRAFT_CID, quotes);
 
-  _clearCommanderTemplateAttribution(input);
-  input.value = '';
-  _draftHadRecipient.delete('new-chat');
-  autoGrow(input, 260);
-  _updateComposerSeqToggle('new-chat');
-  // Composer is empty now — a repeat Enter re-entry no-ops on the empty check,
-  // so the gate can drop before the (long) send await below.
-  _newChatSubmitting = false;
-  // Also clear the conversation-view input. setView with skipLoad:true
-  // bypasses _restoreDraft, so without this the new conv would inherit
-  // whatever draft text the previously-active conversation left behind in
-  // #chat-input — and the next keystroke would save that stale text under
-  // the new cid's draft key.
-  const chatInput = document.getElementById('chat-input');
-  if (chatInput) {
-    chatInput.value = '';
-    autoGrow(chatInput, 200);
+  const ownsDraft = submittedDraft.matches();
+  const openCreated = ownsDraft && navigationEpoch === _composerNavigationEpoch;
+  if (ownsDraft) {
+    _clearCommanderTemplateAttribution(input);
+    composerSetText(input, '');
+    _draftHadRecipient.delete('new-chat');
+    _updateComposerSeqToggle('new-chat');
   }
-  setView('conversation', convId, { skipLoad: true });
-  // Carry the new-chat recipient pick into the new conv's per-cid state so
-  // the chip keeps the chosen agent instead of snapping back to commander.
+  _newChatSubmitting = false;
   _transferNewChatRecipientTo(convId);
-  _renderRecipientChip('conversation');
+  if (openCreated) {
+    // Save the previous task before reusing its visible editor.
+    if (currentCid) _flushDraftSave(currentCid);
+    composerBindOwner('chat-input', convId);
+    composerSetText('chat-input', '');
+    setView('conversation', convId, { skipLoad: true });
+    _renderRecipientChip('conversation');
+  }
   if (newBtn) newBtn.disabled = false;
   const extra = {
     title_text: titleText,
@@ -11010,35 +10773,12 @@ async function handleNewChatSubmit() {
       attachments: attachments.map((name) => ({ name })),
     });
   }
-  await sendInCurrentConversation(content, Object.keys(extra).length ? extra : undefined, { restoreComposerOnFailure: true });
-}
-
-// Consume only the draft submitted by this request. Attachment preparation and
-// acceptance can both finish after another draft was typed or a tab switched.
-function _consumeSubmittedComposer(cid, submittedText, submittedQuotes) {
-  const input = cid === currentCid ? document.getElementById('chat-input') : null;
-  const stored = input ? null : _readDraftData(cid);
-  let text = input ? input.value : String((stored && stored.text) || '');
-  if (text === submittedText) {
-    text = '';
-    if (input) {
-      input.value = '';
-      _draftHadRecipient.delete('conversation');
-      autoGrow(input, 200);
-      _updateComposerSeqToggle();
-    }
-  }
-  const submittedQuoteIds = new Set(submittedQuotes.map(_quoteIdentity));
-  const remainingQuotes = _getQuotes(cid).filter((quote) => !submittedQuoteIds.has(_quoteIdentity(quote)));
-  if (remainingQuotes.length) _quotesByCid.set(cid, remainingQuotes);
-  else _quotesByCid.delete(cid);
-  _renderQuotePreview(cid);
-  if (text || remainingQuotes.length) {
-    _cancelDraftSave(cid);
-    _writeDraftData(cid, text, remainingQuotes);
-  } else {
-    _clearDraft(cid);
-  }
+  await sendInConversation(convId, content, Object.keys(extra).length ? extra : undefined, {
+    restoreComposerOnFailure: true,
+    source_view: 'new_chat',
+    content_length: requestText.length,
+    ...entryAttribution,
+  });
 }
 
 async function handleChatSubmit() {
@@ -11047,8 +10787,9 @@ async function handleChatSubmit() {
     return;
   }
   const input = document.getElementById('chat-input');
-  const submittedText = input.value || '';
-  const raw = submittedText.trim();
+  const submittedDraft = composerSnapshot(input);
+  const authoredText = submittedDraft.text();
+  const raw = authoredText.trim();
   if (!currentCid) return;
   // A bare quote with no extra text is a legitimate "look at this" forward;
   // only reject when both the textarea AND the quote are empty.
@@ -11077,6 +10818,20 @@ async function handleChatSubmit() {
   // Single-target sends carry no cross-group ordering override.
   const multiDispatch = _composerEffectiveDispatchMode('conversation');
   const pendingFloorSync = _floorSyncByCid.get(cid);
+  const clearSubmittedComposer = () => {
+    const ownsVisibleDraft = currentCid === cid && submittedDraft.matches();
+    if (ownsVisibleDraft) {
+      _clearCommanderTemplateAttribution(input);
+      composerSetText(input, '');
+      _draftHadRecipient.delete('conversation');
+      autoGrow(input, 200);
+      _updateComposerSeqToggle();
+    }
+    // Navigation saves the old draft under cid; never clear a newer draft
+    // authored in this same composer while the send was waiting.
+    if (ownsVisibleDraft) _clearDraft(cid);
+    else if (typeof _discardSubmittedDraft === 'function') _discardSubmittedDraft(cid, submittedDraft);
+  };
   const attachmentSnapshot = await _chatAttachSnapshotForSend(cid);
   if (!attachmentSnapshot.ok) {
     releaseAttachmentSend();
@@ -11155,7 +10910,8 @@ async function handleChatSubmit() {
       releaseAttachmentSend();
       return;
     }
-    _consumeSubmittedComposer(cid, submittedText, quotes);
+    clearSubmittedComposer();
+    _consumeSubmittedQuotes(cid, quotes);
     if (attachments.length) _chatAttachClear(cid);
     releaseAttachmentSend();
     return;
@@ -11175,7 +10931,10 @@ async function handleChatSubmit() {
       attachments: attachList.filter((attachment) => attachment.status !== 'error'),
     });
   }
-  _consumeSubmittedComposer(cid, submittedText, quotes);
+  clearSubmittedComposer();
+  // Persist remaining references after clearing the accepted text, so a quote
+  // added during preflight also survives reload.
+  _consumeSubmittedQuotes(cid, quotes);
   // Clear chip area immediately — the server will return with the final
   // attachment state tied to the user message record. If the send fails or
   // is aborted, the files remain on disk but the user can re-attach via the
@@ -11205,6 +10964,25 @@ const _convChatCtrls = new Map();  // cid → controller
 
 function _observerShouldDeferCleanup(cid, allowWithController) {
   return !!allowWithController && _convChatCtrls.has(cid);
+}
+
+function _taskTerminalHandlePresentation(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  if (typeof _syncFailedFromTaskTerminal === 'function') {
+    _syncFailedFromTaskTerminal(payload);
+  }
+  if (typeof _handleTaskTerminalUnread === 'function') {
+    _handleTaskTerminalUnread(payload);
+  }
+}
+
+function _conversationMediaHandleMaterialized(payload) {
+  const ownerUid = String(payload?.user_id || '');
+  const cid = String(payload?.conversation_id || '');
+  if (!ownerUid || ownerUid !== String(currentUserId || '')) return;
+  if (!cid || cid !== String(currentCid || '')) return;
+  if (typeof _applyMaterializedMarkdownMedia !== 'function') return;
+  _applyMaterializedMarkdownMedia(payload, document);
 }
 
 function _notifyAgentRunFinished(agentId, payload = {}) {
@@ -12330,7 +12108,12 @@ function _setProcessCommentaryLineContent(line, text) {
   line.className = 'stream-process-commentary';
   line.dataset.processText = body;
   if (typeof renderMarkdownFull === 'function') {
-    line.innerHTML = `<div class="stream-process-commentary-text markdown-body">${_renderMessageMarkdown(body)}</div>`;
+    if (typeof renderMarkdownBlocks === 'function' && typeof line.insertBefore === 'function') {
+      _commitStreamingMarkdown(line, _prepareStreamingMarkdown(line, body));
+      line.firstElementChild.className = 'stream-process-commentary-text markdown-body';
+    } else {
+      line.innerHTML = `<div class="stream-process-commentary-text markdown-body">${_renderMessageMarkdown(body)}</div>`;
+    }
   } else {
     line.innerHTML = `<span class="stream-process-commentary-text">${escapeHtml(body)}</span>`;
   }
@@ -13041,11 +12824,8 @@ function _streamingUpdateActivityFromEvent(msg) {
 // (`_streamingSetError` / `_streamingMarkAborted` paths).
 function _cancelPendingStreamRaf(msg) {
   if (!msg) return;
-  if (msg._streamRafHandle != null && typeof cancelAnimationFrame === 'function') {
-    cancelAnimationFrame(msg._streamRafHandle);
-  }
-  msg._streamRafHandle = null;
-  msg._streamRafScheduled = false;
+  _cancelStreamingPaint(msg, 'final');
+  _cancelStreamingPaint(msg, 'commentary');
   _invalidateStreamingMathPaint(msg);
 }
 
@@ -13064,10 +12844,12 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
   const display = _stripSurvivingStructuralBlocks(text);
   const alreadyPainted = finalEl.style.display !== 'none'
     && msg.dataset.streamPaintedDisplay === display
-    && !!finalEl.querySelector('.markdown-body');
+    && !!finalEl.querySelector('.markdown-body')
+    && !finalEl.querySelector('.msg-error');
   if (!alreadyPainted) {
     _paintStreamingFinalMarkdown(msg, finalEl, display);
   }
+  _releaseStreamingMarkdown(finalEl);
   finalEl.style.display = '';
   msg.dataset.finalText = display || '';
   delete msg.dataset.streamBuf;
@@ -13168,20 +12950,30 @@ function _streamingSetError(msg, text) {
   // the error pill underneath. Without this, mid-stream errors wipe the
   // visible turn entirely and the user only sees the error pill.
   const partial = String(msg.dataset.streamBuf || '');
-  let bodyHtml = '';
+  let display = '';
   if (partial) {
-    const display = _stripSurvivingStructuralBlocks(partial);
+    display = _stripSurvivingStructuralBlocks(partial);
     if (display) {
-      bodyHtml = _streamingMarkdownBodyHtml(display);
       msg.dataset.finalText = display;
     }
   }
   const errPill = `<div class="msg-error" style="color:var(--danger);margin-top:6px">${escapeHtml(t('chat.send_failed', { msg: text }))}</div>`;
-  finalEl.innerHTML = bodyHtml + errPill;
+  if (display) {
+    // Keep the last rendered formulas visible while the complete partial
+    // reply is typeset offscreen. Show the failure immediately; never expose
+    // raw TeX by typesetting a replacement on the live message element.
+    if (_streamMathSignatureForText(display) && typeof typesetMathHtml === 'function') {
+      finalEl.querySelector?.('.msg-error')?.remove();
+      finalEl.insertAdjacentHTML('beforeend', errPill);
+    }
+    _paintStreamingFinalMarkdown(msg, finalEl, display, { suffixHtml: errPill });
+  } else {
+    finalEl.innerHTML = errPill;
+  }
   finalEl.style.display = '';
   delete msg.dataset.streamBuf;
   delete msg._processDisplayContext;
-  if (bodyHtml && typeof typesetMath === 'function') typesetMath(finalEl);
+  _releaseStreamingMarkdown(finalEl);
   _attachFailedAssistantActions(msg, () => _messageTextForActions(msg, msg.dataset.finalText || ''));
 }
 
@@ -13205,6 +12997,7 @@ function _streamingMarkAborted(msg) {
   const finalEl = msg.querySelector('[data-role="final"]');
   if (finalEl) {
     _paintStreamingFinalMarkdown(msg, finalEl, interruptedText);
+    _releaseStreamingMarkdown(finalEl);
     finalEl.style.display = '';
   }
   msg.dataset.finalText = interruptedText;
@@ -13375,7 +13168,7 @@ function createChatController(config) {
   const sendBtnEl = typeof config.sendBtnEl === 'string'
     ? document.getElementById(config.sendBtnEl)
     : config.sendBtnEl;
-  let idlePlaceholder = inputEl ? (inputEl.placeholder || '') : '';
+  let idlePlaceholder = inputEl ? (composerPlaceholder(inputEl) || '') : '';
 
   // ── Optional queue module (features.queue enabled) ──────────────────
   // Mirrors the main-chat queue (stacked while a reply is streaming,
@@ -13558,16 +13351,16 @@ function createChatController(config) {
     const item = _qGet(id).find(m => m.id === qid);
     if (!item || !inputEl || _qEditingItem(id)) return;
     item.composer_edit = {
-      previous_input: inputEl.value || '',
+      previous_input: composerText(inputEl) || '',
       draft_content: item.content || '',
     };
     _qSave(id, _qGet(id));
-    inputEl.value = item.content || '';
+    composerSetText(inputEl, item.content || '');
     autoGrow(inputEl, 160);
     renderQueue();
     _updateSendUI();
     inputEl.focus();
-    inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+    composerSetSelection(inputEl, composerText(inputEl).length, composerText(inputEl).length);
   }
   function _qRestoreEditingInput(id) {
     const item = id ? _qEditingItem(id) : null;
@@ -13575,7 +13368,7 @@ function createChatController(config) {
     const draftContent = typeof item.composer_edit.draft_content === 'string'
       ? item.composer_edit.draft_content
       : (item.content || '');
-    inputEl.value = draftContent;
+    composerSetText(inputEl, draftContent);
     autoGrow(inputEl, 160);
   }
   function _qFinishEdit(content) {
@@ -13601,7 +13394,7 @@ function createChatController(config) {
     delete item.composer_edit;
     _qSave(id, _qGet(id));
     if (inputEl) {
-      inputEl.value = previousInput;
+      composerSetText(inputEl, previousInput);
       autoGrow(inputEl, 160);
     }
     renderQueue();
@@ -13651,14 +13444,14 @@ function createChatController(config) {
     if (inputEl) {
       const replyingText = t('chat.replying');
       if (editing) {
-        inputEl.placeholder = t('chat.queue_editing_placeholder');
+        composerSetPlaceholder(inputEl, t('chat.queue_editing_placeholder'));
       } else if (busy) {
-        if (inputEl.placeholder && inputEl.placeholder !== replyingText) {
-          idlePlaceholder = inputEl.placeholder;
+        if (composerPlaceholder(inputEl) && composerPlaceholder(inputEl) !== replyingText) {
+          idlePlaceholder = composerPlaceholder(inputEl);
         }
-        inputEl.placeholder = replyingText;
+        composerSetPlaceholder(inputEl, replyingText);
       } else {
-        inputEl.placeholder = idlePlaceholder || inputEl.placeholder;
+        composerSetPlaceholder(inputEl, idlePlaceholder || composerPlaceholder(inputEl));
       }
     }
   }
@@ -14007,7 +13800,7 @@ function createChatController(config) {
   //   - idle + empty queue → send directly
   async function _submitFromInput() {
     if (!inputEl) return;
-    const content = inputEl.value;
+    const content = composerText(inputEl);
     if (!content.trim()) return;
     const id = config.getCurrentId();
     if (features.queue && id && _qEditingItem(id)) {
@@ -14019,7 +13812,7 @@ function createChatController(config) {
       ? await hooks.buildExtraBody(content, id, { pending: !!pending, hasQueue: !!hasQueue })
       : undefined;
     if (extraBody === null) return;
-    inputEl.value = '';
+    composerSetText(inputEl, '');
     autoGrow(inputEl, 160);
     if (pending || hasQueue) {
       if (features.queue) enqueue(content, extraBody ? { extraBody } : {});
@@ -14042,11 +13835,11 @@ function createChatController(config) {
     }
     if (inputEl && !inputEl.dataset.ctrlBound) {
       inputEl.dataset.ctrlBound = '1';
-      inputEl.addEventListener('input', () => {
+      inputEl.addEventListener(composerChangeEvent(inputEl), () => {
         const id = config.getCurrentId();
         const item = id ? _qEditingItem(id) : null;
         if (!item) return;
-        item.composer_edit.draft_content = inputEl.value || '';
+        item.composer_edit.draft_content = composerText(inputEl) || '';
         _qSave(id, _qGet(id));
       });
       inputEl.addEventListener('keydown', (e) => {
@@ -15892,13 +15685,61 @@ function _streamingDisplayText(buf, phase = '') {
   return phase === 'commentary' ? _formatStreamingCommentary(rawDisplay) : rawDisplay;
 }
 
+// Leave time for input and scrolling between full Markdown passes. The first
+// paint uses the next frame; later deltas share one trailing paint of the
+// latest buffer. Measure the interval after work completes so a costly paint
+// cannot immediately enqueue another full pass. Terminal paths bypass this.
+const STREAMING_MARKDOWN_PAINT_INTERVAL_MS = 80;
+
+function _cancelStreamingPaint(msg, slot) {
+  const state = msg?._streamPaints?.[slot];
+  if (!state) return;
+  delete msg._streamPaints[slot];
+  if (state.timer != null) clearTimeout(state.timer);
+  if (state.frame != null && typeof cancelAnimationFrame === 'function') {
+    cancelAnimationFrame(state.frame);
+  }
+}
+
+function _queueStreamingPaint(msg, slot, paint) {
+  const slots = msg._streamPaints || (msg._streamPaints = Object.create(null));
+  const state = slots[slot] || (slots[slot] = { pending: false, finishedAt: null });
+  if (state.pending) return;
+  state.pending = true;
+  const flush = () => {
+    // Identity also protects runtimes where cancellation cannot remove an
+    // already-dispatched callback, and rows reused after history recovery.
+    if (slots[slot] !== state || !state.pending) return;
+    state.pending = false;
+    state.frame = null;
+    state.timer = null;
+    if (msg.isConnected === false) return;
+    try { paint(); } finally { state.finishedAt = Date.now(); }
+  };
+  const frame = () => {
+    state.timer = null;
+    if (slots[slot] !== state) return;
+    if (typeof requestAnimationFrame === 'function') state.frame = requestAnimationFrame(flush);
+    else state.timer = setTimeout(flush, 0);
+  };
+  const delay = state.finishedAt == null ? 0
+    : Math.min(STREAMING_MARKDOWN_PAINT_INTERVAL_MS,
+      Math.max(0, STREAMING_MARKDOWN_PAINT_INTERVAL_MS - (Date.now() - state.finishedAt)));
+  if (delay) state.timer = setTimeout(frame, delay);
+  else frame();
+}
+
 function _sealStreamingCommentary(msg) {
   if (!msg) return;
   // A frame-deferred repaint must not race the seal: paint the full buffered
   // text now so the sealed row holds everything that streamed into it.
+  _cancelStreamingPaint(msg, 'commentary');
   _flushStreamingCommentaryPaint(msg);
   const line = msg._commentaryLine;
-  if (line) _setProcessClassFlag(line, 'stream-process-commentary-live', false);
+  if (line) {
+    _setProcessClassFlag(line, 'stream-process-commentary-live', false);
+    _releaseStreamingMarkdown(line);
+  }
   msg._commentaryLine = null;
   msg._commentaryBuf = '';
 }
@@ -15907,11 +15748,12 @@ function _sealStreamingCommentary(msg) {
 // sealed (`_commentaryLine` cleared), which also disarms a stale rAF callback.
 function _flushStreamingCommentaryPaint(msg) {
   if (!msg) return;
-  msg._commentaryRafScheduled = false;
   const line = msg._commentaryLine;
   if (!line) return;
   const display = _streamingDisplayText(String(msg._commentaryBuf || ''), 'commentary');
+  if (line._streamPaintedDisplay === display) return;
   _setProcessCommentaryLineContent(line, display);
+  line._streamPaintedDisplay = display;
   _setProcessClassFlag(line, 'stream-process-commentary-live', true);
   const body = msg.querySelector?.('[data-role="process"]');
   if (body) _stickProcessBottomIfPinned(body);
@@ -15924,8 +15766,8 @@ function _flushStreamingCommentaryPaint(msg) {
 // at its true position in time.
 //
 // Same render-throttle contract as the final-answer stream: deltas accumulate
-// synchronously, but the markdown repaint (O(buffer)) runs once per animation
-// frame. Without rAF (renderer test bridge, non-browser) the repaint stays
+// synchronously, but full markdown repaints share a bounded cadence. Without
+// rAF (renderer test bridge, non-browser) the repaint stays
 // synchronous so callers observe settled DOM.
 function _streamingAppendCommentaryDelta(msg, piece) {
   if (!msg || !piece) return;
@@ -15947,12 +15789,7 @@ function _streamingAppendCommentaryDelta(msg, piece) {
   msg._commentaryBuf = String(msg._commentaryBuf || '') + piece;
   msg.dataset.commentaryStreamed = '1';
   if (typeof requestAnimationFrame === 'function') {
-    if (!msg._commentaryRafScheduled) {
-      msg._commentaryRafScheduled = true;
-      requestAnimationFrame(() => {
-        if (msg._commentaryRafScheduled) _flushStreamingCommentaryPaint(msg);
-      });
-    }
+    _queueStreamingPaint(msg, 'commentary', () => _flushStreamingCommentaryPaint(msg));
   } else {
     _flushStreamingCommentaryPaint(msg);
   }
@@ -15973,6 +15810,7 @@ function _streamingAppendFinalDelta(msg, piece, phase = '') {
   }
   const finalEl = msg.querySelector('[data-role="final"]');
   if (!finalEl) return;
+  finalEl._streamMarkdownComplete = false;
   if (phase) msg.dataset.streamPhase = String(phase);
   const prev = msg.dataset.streamBuf || '';
   // Fold at the first body token, then respect manual reopening while the
@@ -15987,21 +15825,12 @@ function _streamingAppendFinalDelta(msg, piece, phase = '') {
   msg.dataset.streamBuf = next;
   msg.dataset.finalText = next;
   if (finalEl.style.display === 'none') finalEl.style.display = '';
-  if (msg._streamRafScheduled) return;
-  msg._streamRafScheduled = true;
-  const flush = () => {
-    msg._streamRafScheduled = false;
-    msg._streamRafHandle = null;
+  _queueStreamingPaint(msg, 'final', () => {
     const buf = msg.dataset.streamBuf || '';
     const display = _streamingDisplayText(buf, msg.dataset.streamPhase);
     msg.dataset.streamDisplay = display;
     _paintStreamingFinalMarkdown(msg, finalEl, display, { stickBottom: true });
-  };
-  if (typeof requestAnimationFrame === 'function') {
-    msg._streamRafHandle = requestAnimationFrame(flush);
-  } else {
-    setTimeout(flush, 0);
-  }
+  });
 }
 
 // Format a raw openclaw event into one process-pane line. Returns null for
@@ -16710,8 +16539,8 @@ function _updateConvSendUI(cid) {
     sendBtn.disabled = saving;
     sendBtn.title = t('chat.queue_save');
     if (input) {
-      input.disabled = saving;
-      input.placeholder = t('chat.queue_editing_placeholder');
+      composerSetDisabled(input, saving);
+      composerSetPlaceholder(input, t('chat.queue_editing_placeholder'));
     }
     return;
   }
@@ -16732,17 +16561,17 @@ function _updateConvSendUI(cid) {
     sendBtn.disabled = true;
     sendBtn.title = t('component.send_blocked_disabled');
     if (input) {
-      input.disabled = true;
-      input.placeholder = t('component.send_blocked_disabled');
+      composerSetDisabled(input, true);
+      composerSetPlaceholder(input, t('component.send_blocked_disabled'));
     }
     return;
   }
-  if (input) input.disabled = false;
+  if (input) composerSetDisabled(input, false);
   sendBtn.classList.toggle('streaming', pending);
   sendBtn.disabled = false;
   sendBtn.title = pending ? t('chat.stop_reply') : t('chat.send_title');
   if (input) {
-    input.placeholder = pending ? t('chat.input_placeholder_queue') : t('chat.input_placeholder');
+    composerSetPlaceholder(input, pending ? t('chat.input_placeholder_queue') : t('chat.input_placeholder'));
   }
   if (!pending) focusChatComposerIfIdle(input);
 }
@@ -16870,10 +16699,21 @@ function abortConvStream(cid, options = {}) {
 // reflects the streaming state. The second arg is ignored (kept for
 // call-site compatibility) — state is computed from pendingConvs directly so
 // callers don't have to stay in sync. The internal third arg lets a bulk
-// repaint defer the shared count pass. Queued work lives on the task board
+// repaint defer the shared count pass; the fourth supplies that refresh's
+// row/metadata snapshot. Queued work lives on the task board
 // (server-side); a conversation with queued rows is running, so the
 // streaming badge already covers it.
-function _updateConvSidebarBadge(cid, _unused, deferRunningChips) {
+function _updateConvSidebarBadge(cid, _unused, deferRunningChips, snapshot) {
+  const menu = document.getElementById('conversation-action-menu');
+  if (menu && menu.dataset.cid === cid) {
+    const move = menu.querySelector('[data-action="to-project"]');
+    if (move) {
+      const disabled = isConvPending(cid);
+      move.classList.toggle('is-disabled', disabled);
+      move.setAttribute('aria-disabled', String(disabled));
+    }
+  }
+
   if (!deferRunningChips) _refreshSidebarRunningChips();
   // Chat header's status pill follows the same per-conversation signal.
   if (cid === currentCid) {
@@ -16882,9 +16722,8 @@ function _updateConvSidebarBadge(cid, _unused, deferRunningChips) {
   // A task can be mounted in several sidebar copies at once (the Today
   // aggregate plus its Project or the Tasks list); every copy shows the same
   // live state, so paint all of them rather than the first match.
-  const items = document.querySelectorAll(`.conv-item[data-cid="${CSS.escape(cid)}"]`);
+  const items = snapshot ? snapshot.items : document.querySelectorAll(`.conv-item[data-cid="${CSS.escape(cid)}"]`);
   if (!items.length) return;
-  items.forEach((item) => item.querySelector('.conv-status-badge')?.remove());
   // Treat aborted-but-still-draining as not streaming. `pendingConvs` only
   // clears when main emits `done`, which can trail the stop click; until then
   // the bubble already shows the "stopped" state so the streaming badge would lie.
@@ -16894,10 +16733,15 @@ function _updateConvSidebarBadge(cid, _unused, deferRunningChips) {
     // No live badge → reflect the resting abnormal status (failed / backend).
     // The failed mark is maintained by the structured hooks
     // (`_finalizeActorPlaceholder`, history sync, onDone) — nothing to derive here.
-    _repaintConvRowStatus(cid);
+    items.forEach((item) => item.querySelector('.conv-status-badge')?.remove());
+    _repaintConvRowStatus(cid, snapshot);
     return;
   }
   items.forEach((item) => {
+    const existing = item.querySelector('.conv-status-badge');
+    // Preserve an unchanged running indicator and its breathing animation.
+    if (existing?.classList.contains('is-streaming')) return;
+    existing?.remove();
     const badge = document.createElement('span');
     badge.className = 'conv-status-badge is-streaming';
     badge.innerHTML = '<span class="conv-status-dot"></span>';
@@ -16916,11 +16760,21 @@ function _updateConvSidebarBadge(cid, _unused, deferRunningChips) {
 // Repaint badges on every visible conversation item. Called after re-render
 // of the sidebar list so previously-known pending/queued state is reapplied.
 function _refreshAllConvBadges() {
-  const cids = new Set();
+  // One refresh-local snapshot avoids a full DOM and metadata scan per task.
+  // Never retain it across paints: lists can remount and accounts can change.
+  const metadata = new Map();
+  for (const conversation of Array.isArray(conversations) ? conversations : []) {
+    const cid = conversation && conversation.conversation_id;
+    if (cid && !metadata.has(cid)) metadata.set(cid, conversation);
+  }
+  const rows = new Map();
   document.querySelectorAll('.conv-item').forEach((el) => {
-    if (el.dataset.cid) cids.add(el.dataset.cid);
+    const cid = el.dataset.cid;
+    if (!cid) return;
+    if (!rows.has(cid)) rows.set(cid, { items: [], conversation: metadata.get(cid) });
+    rows.get(cid).items.push(el);
   });
-  cids.forEach((cid) => _updateConvSidebarBadge(cid, undefined, true));
+  rows.forEach((snapshot, cid) => _updateConvSidebarBadge(cid, undefined, true, snapshot));
   _refreshSidebarRunningChips();
   if (typeof _refreshUnreadTaskIndicators === 'function') _refreshUnreadTaskIndicators();
 }
@@ -17075,3 +16929,744 @@ async function readConversationPreviewImages(cid, before) {
   const items = _lightboxGalleryItems({ root: template.content, cid }).map(({ node, ...item }) => item);
   return { ok: true, items, nextCursor: data.next_cursor ?? null };
 }
+
+function _logConversationManageResult(action, startedAt, result, errorCode = '', extra = {}) {
+  const payload = {
+    action: String(action || 'unknown'),
+    result: String(result || 'failure'),
+    duration_ms: Math.max(0, Date.now() - startedAt),
+    ...(errorCode ? { error_code: String(errorCode) } : {}),
+    ...(extra || {}),
+  };
+  try {
+    const level = result === 'failure' ? 'warn' : 'info';
+    _convLog[level]('conversation management result', payload);
+  } catch (_) {}
+}
+
+// Build the mention-highlight portion of the textarea mirror. Escapes
+// everything EXCEPT `@<token>` matches, which become accent-coloured spans.
+function _buildMentionMirrorHtml(text) {
+  if (!text) return '';
+  const re = _buildMentionRe();
+  let html = '';
+  let last = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const beforeStart = last;
+    const beforeEnd = m.index + m[1].length;
+    if (beforeEnd > beforeStart) html += escapeHtml(text.slice(beforeStart, beforeEnd));
+    html += `<span class="msg-mention">${escapeHtml(m[2])}</span>`;
+    last = re.lastIndex;
+  }
+  if (last < text.length) html += escapeHtml(text.slice(last));
+  return html;
+}
+
+const _chatRichComposers = new Map();
+
+function _chatRichInputId(inputOrId) {
+  if (!inputOrId) return '';
+  if (typeof inputOrId === 'string') return inputOrId;
+  return inputOrId.id || inputOrId.dataset?.richInputId || '';
+}
+
+function syncChatRichComposerFromTextarea(inputOrId) {
+  const id = _chatRichInputId(inputOrId);
+  const api = id ? _chatRichComposers.get(id) : null;
+  if (!api) return false;
+  api.renderFromTextarea();
+  return true;
+}
+
+function _chatRichSerializeNode(node, isRoot = true) {
+  if (!node) return '';
+  if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || '';
+  if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return '';
+  if (node.nodeType === Node.ELEMENT_NODE) {
+    const el = node;
+    if (el.dataset?.chatUseChip === '1') return el.dataset.token || '';
+    // A "bogus" <br> is a display-only filler that renders the trailing empty
+    // line contenteditable would otherwise collapse; it carries no value, so a
+    // render→serialize round-trip must not turn it back into a newline.
+    if (el.tagName === 'BR') return el.dataset?.chatBogus === '1' ? '' : '\n';
+  }
+  let out = '';
+  node.childNodes.forEach((child) => { out += _chatRichSerializeNode(child, false); });
+  // The DIV/P newline separates *sibling* blocks (e.g. browser line-wrapping
+  // divs). It must not fire for the root editor itself, or every non-empty
+  // value would gain a phantom trailing "\n" that (a) makes "abc" and "abc\n"
+  // serialize identically and (b) can't be told apart from a real trailing
+  // newline when we decide whether to render a filler line.
+  if (!isRoot && node.nodeType === Node.ELEMENT_NODE && /^(DIV|P)$/i.test(node.tagName || '')) {
+    if (out && !out.endsWith('\n')) out += '\n';
+  }
+  return out;
+}
+
+function _chatRichTextLength(node) {
+  return _chatRichSerializeNode(node).length;
+}
+
+function _chatRichRangeLength(editor, container, offset) {
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.setEnd(container, offset);
+    const len = _chatRichSerializeNode(range.cloneContents()).length;
+    if (typeof range.detach === 'function') range.detach();
+    return len;
+  } catch (_) {
+    return editor ? _chatRichSerializeNode(editor).length : 0;
+  }
+}
+
+function _chatRichSelectionIndexes(editor) {
+  const sel = window.getSelection ? window.getSelection() : null;
+  if (!sel || sel.rangeCount < 1) return null;
+  const range = sel.getRangeAt(0);
+  if (!editor.contains(range.startContainer) || !editor.contains(range.endContainer)) return null;
+  const start = _chatRichRangeLength(editor, range.startContainer, range.startOffset);
+  const end = _chatRichRangeLength(editor, range.endContainer, range.endOffset);
+  return { start: Math.min(start, end), end: Math.max(start, end) };
+}
+
+function _chatRichFindPosition(root, index) {
+  let left = Math.max(0, Number(index) || 0);
+  const visit = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const len = (node.nodeValue || '').length;
+      if (left <= len) return { type: 'text', node, offset: left };
+      left -= len;
+      return null;
+    }
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const el = node;
+      if (el.dataset?.chatUseChip === '1' || el.tagName === 'BR') {
+        const len = _chatRichTextLength(el);
+        if (left <= len) return left <= len / 2
+          ? { type: 'before', node: el }
+          : { type: 'after', node: el };
+        left -= len;
+        return null;
+      }
+    }
+    for (const child of Array.from(node.childNodes || [])) {
+      const found = visit(child);
+      if (found) return found;
+    }
+    return null;
+  };
+  return visit(root) || { type: 'end', node: root };
+}
+
+function _chatRichApplyBoundary(range, boundary, which) {
+  const fn = which === 'start' ? 'setStart' : 'setEnd';
+  if (!boundary || boundary.type === 'end') {
+    range[fn](boundary?.node || range.commonAncestorContainer, (boundary?.node || range.commonAncestorContainer).childNodes.length);
+  } else if (boundary.type === 'text') {
+    range[fn](boundary.node, boundary.offset);
+  } else if (boundary.type === 'before') {
+    which === 'start' ? range.setStartBefore(boundary.node) : range.setEndBefore(boundary.node);
+  } else if (boundary.type === 'after') {
+    which === 'start' ? range.setStartAfter(boundary.node) : range.setEndAfter(boundary.node);
+  }
+}
+
+function _chatRichSetSelection(editor, start, end = start) {
+  if (!editor || !window.getSelection) return;
+  const range = document.createRange();
+  const startPos = _chatRichFindPosition(editor, start);
+  const endPos = _chatRichFindPosition(editor, end);
+  _chatRichApplyBoundary(range, startPos, 'start');
+  _chatRichApplyBoundary(range, endPos, 'end');
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+// contenteditable + `white-space: pre-wrap` collapses a trailing newline: a
+// value ending in "\n" (or a lone "\n" just typed) renders no empty last line,
+// so the caret can't sit on it and the box never grows/scrolls to reveal it.
+// Browsers solve this with a filler <br>; we mirror that with a marked "bogus"
+// <br> that serialization drops (see _chatRichSerializeNode). Keep exactly one,
+// always at the very end, and only when the content actually ends in a newline.
+function _chatRichHasAuthoredContent(node) {
+  if (!node) return false;
+  if (node.nodeType === Node.TEXT_NODE) return !!(node.nodeValue || '');
+  if (node.nodeType === Node.ELEMENT_NODE && node.dataset?.chatUseChip === '1') return true;
+  return Array.from(node.childNodes || []).some((child) => _chatRichHasAuthoredContent(child));
+}
+
+function _chatRichEnsureTrailingBreak(editor) {
+  if (!editor) return;
+  const stale = editor.querySelector ? editor.querySelector('br[data-chat-bogus="1"]') : null;
+  if (stale && stale.parentNode) stale.parentNode.removeChild(stale);
+  // Chromium represents an emptied contenteditable as <br> (and sometimes
+  // <div><br></div>) so the caret still has a line box. That node is browser
+  // chrome, not user input: serializing it as "\n" makes an emptied composer
+  // one line taller and persists a phantom newline in the hidden textarea.
+  // Real newlines in this editor are text nodes created by render/keydown/paste,
+  // so they count as authored content and remain intact.
+  if (!_chatRichHasAuthoredContent(editor)) {
+    if (editor.childNodes?.length) editor.textContent = '';
+    return;
+  }
+  if (_chatRichSerializeNode(editor).endsWith('\n')) {
+    const br = document.createElement('br');
+    br.dataset.chatBogus = '1';
+    editor.appendChild(br);
+  }
+}
+
+/** Reconcile every non-IME native edit before serializing it. The display-only trailing filler can
+ * become stale when the user types after a trailing newline or deletes that newline with Backspace;
+ * leaving it in the DOM creates a phantom visual line even though serialization correctly drops it. */
+function _chatRichHandleEditorInput(api) {
+  if (!api || api.composing) return;
+  api.ensureTrailingBreak();
+  api.syncFromEditor(true);
+}
+
+function _chatRichChipsMatchValue(editor, value) {
+  const tokens = _findChatComposerTokens(value, editor.dataset.richInputId);
+  const chips = Array.from(editor.querySelectorAll('[data-chat-use-chip="1"]'));
+  return chips.length === tokens.length && chips.every((chip, i) => {
+    const token = tokens[i];
+    return chip.dataset.token === token.raw && chip.dataset.kind === token.selection.kind
+      && chip.dataset.itemId === (token.selection.id || token.selection.name || '')
+      && chip.dataset.name === (token.selection.name || token.selection.id || '');
+  });
+}
+
+function _chatRichRenderValue(editor, value) {
+  const src = String(value || '');
+  editor.textContent = '';
+  const tokens = _findChatComposerTokens(src, editor.dataset.richInputId);
+  let last = 0;
+  tokens.forEach((token) => {
+    if (token.start > last) editor.appendChild(document.createTextNode(src.slice(last, token.start)));
+    editor.appendChild(_chatRichCreateUseChip(token.selection, token.raw));
+    last = token.end;
+  });
+  if (last < src.length) editor.appendChild(document.createTextNode(src.slice(last)));
+  _chatRichEnsureTrailingBreak(editor);
+}
+
+function _chatRichInsertText(editor, text) {
+  const sel = window.getSelection ? window.getSelection() : null;
+  if (!sel || sel.rangeCount < 1 || !editor.contains(sel.anchorNode)) {
+    editor.focus();
+    _chatRichSetSelection(editor, _chatRichSerializeNode(editor).length);
+  }
+  const range = window.getSelection().getRangeAt(0);
+  range.deleteContents();
+  const node = document.createTextNode(String(text || ''));
+  range.insertNode(node);
+  range.setStart(node, node.nodeValue.length);
+  range.setEnd(node, node.nodeValue.length);
+  const next = window.getSelection();
+  next.removeAllRanges();
+  next.addRange(range);
+}
+
+function _chatRichCreateApi(textarea, editor) {
+  const nativeSetSelectionRange = typeof textarea.setSelectionRange === 'function'
+    ? textarea.setSelectionRange.bind(textarea)
+    : null;
+  const nativeFocus = typeof textarea.focus === 'function' ? textarea.focus.bind(textarea) : null;
+  const api = {
+    input: textarea,
+    editor,
+    lastValue: null,
+    pendingSelection: null,
+    syncingFromEditor: false,
+    // True between compositionstart/compositionend (IME). While composing we
+    // must not rebuild the editor DOM or thrash its layout, or the in-flight
+    // composition gets dropped and the user has to retype — hence the guards in
+    // renderFromTextarea/the input listeners and a single reconcile on end.
+    composing: false,
+    focus() {
+      editor.focus();
+      const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : (textarea.value || '').length;
+      const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
+      _chatRichSetSelection(editor, start, end);
+    },
+    setTextareaSelection(start, end = start, opts = {}) {
+      const next = { start, end: typeof end === 'number' ? end : start };
+      if (nativeSetSelectionRange) {
+        try { nativeSetSelectionRange(next.start, next.end); } catch (_) {}
+      } else {
+        textarea.selectionStart = next.start;
+        textarea.selectionEnd = next.end;
+      }
+      if (!opts || opts.pending !== false) {
+        this.pendingSelection = next;
+      }
+    },
+    syncTextareaSelectionFromEditor() {
+      const sel = _chatRichSelectionIndexes(editor);
+      if (!sel) return;
+      // This mirrors the browser-owned contenteditable caret into the hidden
+      // textarea. It must not schedule a reverse editor selection update,
+      // otherwise normal ArrowLeft/ArrowRight movement gets snapped back by
+      // the next sync tick.
+      this.setTextareaSelection(sel.start, sel.end, { pending: false });
+    },
+    renderFromTextarea(opts = {}) {
+      // Rebuilding the contenteditable mid-composition drops the IME buffer;
+      // compositionend runs one reconcile once the text has committed.
+      if (this.composing) return;
+      const value = String(textarea.value || '');
+      const changed = value !== this.lastValue || !_chatRichChipsMatchValue(editor, value);
+      let shouldAutoGrow = !!(opts && opts.forceHeight);
+      if (changed) {
+        shouldAutoGrow = true;
+        this.lastValue = value;
+        const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : value.length;
+        const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
+        _chatRichRenderValue(editor, value);
+        // Restoring a DOM selection also focuses contenteditable in Chromium.
+        // Panel edits keep their focus; apply the pending caret on editor focus.
+        if (document.activeElement === editor) {
+          const sel = this.pendingSelection || { start, end };
+          _chatRichSetSelection(editor, sel.start, sel.end);
+          this.pendingSelection = null;
+        }
+      } else if (this.pendingSelection && document.activeElement === editor) {
+        _chatRichSetSelection(editor, this.pendingSelection.start, this.pendingSelection.end);
+        this.pendingSelection = null;
+      }
+      if (shouldAutoGrow) this.autoGrow(_chatRichAutoGrowMax(textarea.id));
+    },
+    syncFromEditor(emit) {
+      const selection = _chatRichSelectionIndexes(editor);
+      const value = _chatRichSerializeNode(editor);
+      if (value === this.lastValue && !emit) return;
+      this.lastValue = value;
+      textarea.value = value;
+      // Assigning textarea.value moves its caret to the end. Preserve the
+      // native editor selection before normalizing typed/pasted @ mentions.
+      if (selection) this.setTextareaSelection(selection.start, selection.end, { pending: false });
+      this.syncingFromEditor = true;
+      if (emit) {
+        try { textarea.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+      }
+      this.syncingFromEditor = false;
+      this.renderFromTextarea();
+      this.autoGrow(_chatRichAutoGrowMax(textarea.id));
+    },
+    autoGrow(maxPx) {
+      const max = Number(maxPx) || _chatRichAutoGrowMax(textarea.id);
+      editor.style.height = 'auto';
+      const next = Math.min(editor.scrollHeight || 0, max);
+      if (next > 0) editor.style.height = `${next}px`;
+      const overflow = (editor.scrollHeight || 0) > max;
+      editor.style.overflowY = overflow ? 'auto' : 'hidden';
+      // Once the editor scrolls internally, growing/wrapping no longer keeps the
+      // caret in view on its own (resetting height to 'auto' above also resets
+      // scrollTop), so the newly typed line ends up clipped below the fold.
+      if (overflow && document.activeElement === editor) this.scrollCaretIntoView();
+    },
+    // Keep the caret's line inside the scroll viewport. Range client rects are
+    // empty exactly at a trailing <br> boundary (the just-created empty line),
+    // so fall back to scrolling to the bottom when the caret is at content end.
+    scrollCaretIntoView() {
+      const sel = window.getSelection ? window.getSelection() : null;
+      if (!sel || sel.rangeCount < 1) return;
+      const range = sel.getRangeAt(0);
+      if (!editor.contains(range.endContainer)) return;
+      const editorRect = editor.getBoundingClientRect();
+      const rects = range.getClientRects();
+      let rect = rects && rects.length ? rects[rects.length - 1] : null;
+      if (!rect || !rect.height) {
+        const bounding = range.getBoundingClientRect();
+        if (bounding && bounding.height) rect = bounding;
+      }
+      if (rect && rect.height) {
+        if (rect.bottom > editorRect.bottom) editor.scrollTop += (rect.bottom - editorRect.bottom) + 2;
+        else if (rect.top < editorRect.top) editor.scrollTop -= (editorRect.top - rect.top) + 2;
+        return;
+      }
+      const idx = _chatRichSelectionIndexes(editor);
+      if (idx && idx.end >= _chatRichSerializeNode(editor).length) editor.scrollTop = editor.scrollHeight;
+    },
+    ensureTrailingBreak() {
+      _chatRichEnsureTrailingBreak(editor);
+    },
+    insertUse(selection) {
+      if (typeof _chatUseTokenFor !== 'function') return false;
+      const token = _chatUseTokenFor(selection);
+      if (!token) return false;
+      this.syncTextareaSelectionFromEditor();
+      const value = String(textarea.value || '');
+      const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : value.length;
+      const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
+      const before = value.slice(0, start);
+      const after = value.slice(end);
+      const leading = before && !/\s$/.test(before) ? ' ' : '';
+      const trailing = after && /^\s/.test(after) ? '' : ' ';
+      const replacement = `${leading}${token}${trailing}`;
+      textarea.value = `${before}${replacement}${after}`;
+      const caret = start + replacement.length;
+      this.setTextareaSelection(caret, caret);
+      this.lastValue = null;
+      this.renderFromTextarea();
+      try { textarea.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+      return true;
+    },
+  };
+
+  textarea.addEventListener('input', () => {
+    if (api.syncingFromEditor || api.composing) return;
+    api.renderFromTextarea();
+  });
+  editor.addEventListener('input', () => {
+    // Native IME keeps mutating the editor while composing; stay out of its way
+    // and reconcile once on compositionend.
+    _chatRichHandleEditorInput(api);
+  });
+  editor.addEventListener('compositionstart', () => { api.composing = true; });
+  editor.addEventListener('compositionend', () => {
+    api.composing = false;
+    // The committed text is now in the editor DOM; mirror it into the textarea
+    // and recompute height/scroll exactly once.
+    api.ensureTrailingBreak();
+    api.syncFromEditor(true);
+  });
+  editor.addEventListener('focus', () => {
+    api.renderFromTextarea();
+    api.syncTextareaSelectionFromEditor();
+  });
+  editor.addEventListener('keyup', () => api.syncTextareaSelectionFromEditor());
+  editor.addEventListener('mouseup', () => api.syncTextareaSelectionFromEditor());
+  editor.addEventListener('paste', (e) => {
+    const cd = e.clipboardData;
+    if (cd?.files?.length && _chatRichUploadPasteFiles(textarea.id, cd.files)) {
+      e.preventDefault();
+      return;
+    }
+    const text = cd?.getData ? cd.getData('text/plain') : '';
+    if (!text) return;
+    e.preventDefault();
+    _chatRichInsertText(editor, text);
+    api.ensureTrailingBreak();
+    api.syncFromEditor(true);
+  });
+  editor.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    api.syncTextareaSelectionFromEditor();
+    if ((e.key === 'Backspace' || e.key === 'Delete') && typeof _deleteChatUseTokenAtCaret === 'function') {
+      const direction = e.key === 'Delete' ? 'forward' : 'backward';
+      if (_deleteChatUseTokenAtCaret(textarea, direction)) {
+        e.preventDefault();
+        return;
+      }
+    }
+    if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey
+        && typeof _moveChatUseTokenCaret === 'function') {
+      const direction = e.key === 'ArrowRight' ? 'forward' : 'backward';
+      if (_moveChatUseTokenCaret(textarea, direction)) {
+        e.preventDefault();
+        api.pendingSelection = {
+          start: textarea.selectionStart || 0,
+          end: textarea.selectionEnd || textarea.selectionStart || 0,
+        };
+        api.renderFromTextarea();
+        return;
+      }
+    }
+    if (e.key !== 'Enter') return;
+    if (textarea.id === 'auto-task-input') return;
+    if (e.shiftKey || e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      _chatRichInsertText(editor, '\n');
+      // A lone trailing "\n" renders no line; add the filler <br> before we
+      // measure height so the new line shows and the caret scrolls into view.
+      api.ensureTrailingBreak();
+      api.syncFromEditor(true);
+      return;
+    }
+    if (e.altKey) return;
+    e.preventDefault();
+    if (textarea.id === 'new-chat-input' && typeof handleNewChatSubmit === 'function') handleNewChatSubmit();
+    else if (textarea.id === 'project-chat-input' && typeof _submitProjectChat === 'function') _submitProjectChat();
+    else if (typeof handleChatSubmit === 'function') handleChatSubmit();
+  });
+
+  if (nativeFocus) {
+    try {
+      textarea.focus = function focus(options) {
+        if (editor.isConnected) {
+          api.focus();
+          return;
+        }
+        nativeFocus(options);
+      };
+    } catch (_) {}
+  }
+  if (nativeSetSelectionRange) {
+    try {
+      textarea.setSelectionRange = function setSelectionRange(start, end, direction) {
+        nativeSetSelectionRange(start, end, direction);
+        api.pendingSelection = { start, end: typeof end === 'number' ? end : start };
+        if (document.activeElement === editor) {
+          _chatRichSetSelection(editor, api.pendingSelection.start, api.pendingSelection.end);
+          api.pendingSelection = null;
+        }
+      };
+    } catch (_) {}
+  }
+  return api;
+}
+
+// Replace the old transparent-textarea mirror with a real rich editor. The
+// textarea remains the source-of-truth compatibility layer for send/draft/
+// voice code; the visible caret and chip blocks now belong to contenteditable
+// DOM, so browser selection can cross non-editable chips atomically.
+function _initMentionMirror(textarea) {
+  if (!textarea || textarea.dataset.mentionMirror === '1') return;
+  if (!textarea.parentNode) return;
+  textarea.dataset.mentionMirror = '1';
+
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-input-rich-wrap';
+  const editor = document.createElement('div');
+  editor.className = 'chat-rich-editor';
+  editor.contentEditable = 'true';
+  editor.setAttribute('role', 'textbox');
+  editor.setAttribute('aria-multiline', 'true');
+  editor.dataset.richInputId = textarea.id || '';
+  editor.dataset.placeholder = textarea.getAttribute('placeholder') || '';
+
+  // Insert wrap in place of textarea, move textarea inside.
+  textarea.parentNode.insertBefore(wrap, textarea);
+  wrap.appendChild(editor);
+  wrap.appendChild(textarea);
+  textarea.classList.add('chat-rich-source');
+
+  let lastPlaceholder = '';
+  const api = _chatRichCreateApi(textarea, editor);
+  _chatRichComposers.set(textarea.id, api);
+  const sync = () => {
+    const placeholder = textarea.getAttribute('placeholder') || '';
+    if (placeholder !== lastPlaceholder) {
+      lastPlaceholder = placeholder;
+      editor.dataset.placeholder = placeholder;
+    }
+    api.renderFromTextarea();
+  };
+  window.addEventListener('i18n-change', () => {
+    api.lastValue = null;
+    sync();
+  });
+  const chipId = _chatRichRecipientChipId(textarea.id);
+  if (chipId && typeof bindRecipientAnchor === 'function') {
+    try { bindRecipientAnchor(chipId, textarea.id); } catch (_) {}
+  }
+  // Programmatic value changes (send-clears the input, agent-picker
+  // inserts `@<name>`, draft restore on conv switch) don't fire `input`
+  // natively. Most call sites dispatch one explicitly, but a 100ms
+  // safety poll catches any we missed without per-callsite plumbing.
+  // String-compare cost is negligible; we only do real work when the
+  // value actually drifted from the last paint.
+  setInterval(sync, 100);
+  sync();
+}
+
+// Set up rich composers for the chat panels that participate in the group-
+// chat `@` semantics. Other chat panels (skill-edit, agent-edit) don't route
+// via the bus's mention parser, so they keep the plain textarea.
+function _initAllMentionMirrors() {
+  const chatInput = document.getElementById('chat-input');
+  if (chatInput) _initMentionMirror(chatInput);
+  const newChatInput = document.getElementById('new-chat-input');
+  if (newChatInput) _initMentionMirror(newChatInput);
+  const projectChatInput = document.getElementById('project-chat-input');
+  if (projectChatInput) _initMentionMirror(projectChatInput);
+  const autoTaskInput = document.getElementById('auto-task-input');
+  if (autoTaskInput) _initMentionMirror(autoTaskInput);
+}
+
+function _commanderAttributionId(value) {
+  const text = String(value || '').trim();
+  return /^[A-Za-z0-9._-]{1,64}$/.test(text) ? text : '';
+}
+
+function _quickStartThumbHtml(thumb) {
+  switch (thumb) {
+    case 'web':
+      return `
+        <span class="quick-thumb-art quick-thumb-web">
+          <span class="quick-thumb-browser-bar"><i></i><i></i><i></i></span>
+          <span class="quick-thumb-web-hero">
+            <i class="quick-thumb-web-title"></i>
+            <i class="quick-thumb-web-copy"></i>
+            <i class="quick-thumb-web-button"></i>
+          </span>
+          <span class="quick-thumb-web-menu"><i></i><i></i><i></i></span>
+        </span>`;
+    case 'research':
+      return `
+        <span class="quick-thumb-art quick-thumb-research">
+          <span class="quick-thumb-paper">
+            <i class="quick-thumb-paper-title"></i>
+            <i class="quick-thumb-paper-line is-wide"></i>
+            <i class="quick-thumb-paper-line is-medium"></i>
+            <i class="quick-thumb-paper-line is-short"></i>
+          </span>
+          <i class="quick-thumb-research-lens"></i>
+        </span>`;
+    case 'login':
+      return `
+        <span class="quick-thumb-art quick-thumb-login">
+          <span class="quick-thumb-window-bar"><i></i><i></i><i></i></span>
+          <i class="quick-thumb-login-visual"></i>
+          <span class="quick-thumb-login-form">
+            <i class="quick-thumb-login-title"></i>
+            <i class="quick-thumb-login-field"></i>
+            <i class="quick-thumb-login-field"></i>
+            <i class="quick-thumb-login-button"></i>
+          </span>
+        </span>`;
+    case 'video':
+      return `
+        <span class="quick-thumb-art quick-thumb-video">
+          <i class="quick-thumb-video-glow"></i>
+          <i class="quick-thumb-video-subject"></i>
+          <i class="quick-thumb-play">${_uiIconHtml('play-triangle', 'quick-thumb-play-icon')}</i>
+          <i class="quick-thumb-video-caption"></i>
+          <span class="quick-thumb-video-progress"><i></i></span>
+        </span>`;
+    case 'chart':
+      return `
+        <span class="quick-thumb-art quick-thumb-chart">
+          <span class="quick-thumb-chart-head"><i></i><b></b></span>
+          <span class="quick-thumb-chart-bars"><i></i><i></i><i></i><i></i><i></i></span>
+          <i class="quick-thumb-chart-trend"></i>
+        </span>`;
+    case 'presentation':
+      return `
+        <span class="quick-thumb-art quick-thumb-presentation">
+          <span class="quick-thumb-presentation-rail"><i></i><i></i><i></i></span>
+          <span class="quick-thumb-presentation-slide">
+            <i class="quick-thumb-presentation-title"></i>
+            <i class="quick-thumb-presentation-copy"></i>
+            <span class="quick-thumb-presentation-chart"><i></i><i></i><i></i></span>
+          </span>
+        </span>`;
+    case 'poster':
+      return `
+        <span class="quick-thumb-art quick-thumb-poster">
+          <i class="quick-thumb-poster-orb"></i>
+          <i class="quick-thumb-poster-product"></i>
+          <span class="quick-thumb-poster-copy"><i></i><i></i></span>
+          <i class="quick-thumb-poster-tag"></i>
+        </span>`;
+    case 'article':
+      return `
+        <span class="quick-thumb-art quick-thumb-article">
+          <i class="quick-thumb-article-cover"></i>
+          <span class="quick-thumb-article-body">
+            <i class="quick-thumb-article-kicker"></i>
+            <i class="quick-thumb-article-title"></i>
+            <i class="quick-thumb-article-line"></i>
+            <i class="quick-thumb-article-line is-short"></i>
+          </span>
+        </span>`;
+    case 'seo':
+      return `
+        <span class="quick-thumb-art quick-thumb-seo">
+          <span class="quick-thumb-search-bar"><i></i><b></b></span>
+          <span class="quick-thumb-search-result"><i></i><i></i></span>
+          <span class="quick-thumb-search-result is-second"><i></i><i></i></span>
+          <span class="quick-thumb-rank"><i></i><b></b><em></em></span>
+        </span>`;
+    default:
+      return `
+        <span class="quick-thumb-art quick-thumb-research">
+          <span class="quick-thumb-paper">
+            <i class="quick-thumb-paper-title"></i>
+            <i class="quick-thumb-paper-line is-wide"></i>
+            <i class="quick-thumb-paper-line is-medium"></i>
+          </span>
+        </span>`;
+  }
+} // { cid, selected:Set<string> }
+
+function _selectedMessageElements() {
+  if (!_messageSelectionState || _messageSelectionState.cid !== currentCid) return [];
+  return Array.from(document.querySelectorAll('#chat-history .chat-message[data-msg-id]'))
+    .filter((msg) => _messageSelectionState.selected.has(msg.dataset.msgId || ''));
+}
+
+// Consume only the draft submitted by this request. Attachment preparation and
+// acceptance can both finish after another draft was typed or a tab switched.
+function _consumeSubmittedComposer(cid, submittedText, submittedQuotes) {
+  const input = cid === currentCid ? document.getElementById('chat-input') : null;
+  const stored = input ? null : _readDraftData(cid);
+  let text = input ? composerText(input) : String((stored && stored.text) || '');
+  if (text === submittedText) {
+    text = '';
+    if (input) {
+      composerSetText(input, '');
+      _draftHadRecipient.delete('conversation');
+      autoGrow(input, 200);
+      _updateComposerSeqToggle();
+    }
+  }
+  const submittedQuoteIds = new Set(submittedQuotes.map(_quoteIdentity));
+  const remainingQuotes = _getQuotes(cid).filter((quote) => !submittedQuoteIds.has(_quoteIdentity(quote)));
+  if (remainingQuotes.length) _quotesByCid.set(cid, remainingQuotes);
+  else _quotesByCid.delete(cid);
+  _renderQuotePreview(cid);
+  if (text || remainingQuotes.length) {
+    _cancelDraftSave(cid);
+    _writeDraftData(cid, text, remainingQuotes);
+  } else {
+    _clearDraft(cid);
+  }
+}
+
+
+window.attachKbFileToDraft = async function attachKbFileToDraft(channel, payload, draftCid, afterNavigate) {
+  const finishOperation = _chatAttachBeginOperation(draftCid);
+  let stage = 'draft_lock';
+  try {
+    if (!finishOperation) throw new Error(t('chat.attach_send_in_progress'));
+    stage = 'ipc_request';
+    const data = await window.orkas.invoke(channel, { ...(payload || {}), cid: draftCid });
+    if (!data || !data.ok) {
+      const error = new Error((data && data.error) || 'failed');
+      error.failure_stage = data && data.failure_stage;
+      error.failure_kind = data && data.failure_kind;
+      throw error;
+    }
+    stage = 'navigation';
+    if (typeof afterNavigate === 'function') afterNavigate();
+    stage = 'draft_render';
+    _addReadyDraftAttachment(draftCid, data.info);
+  } catch (error) {
+    const safeStage = error && error.failure_stage;
+    const safeKind = error && error.failure_kind;
+    const failure_stage = ['input_validation', 'source_resolve', 'attachment_import'].includes(safeStage) ? safeStage : stage;
+    const failure_kind = ['not_found', 'permission_denied', 'disk_full'].includes(safeKind) ? safeKind : 'operation_failed';
+    // Keep the UI's original message; diagnostics receive only the enums.
+    const wrapped = new Error((error && error.message) || String(error));
+    wrapped.failure_stage = failure_stage;
+    wrapped.failure_kind = failure_kind;
+    _convLog.warn('library attachment failed', { failure_stage, failure_kind });
+    throw wrapped;
+  } finally {
+    if (finishOperation) finishOperation();
+  }
+};
+
+
+
+try {
+  if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
+    window.orkas.onPushEvent('conversation:media_materialized', _conversationMediaHandleMaterialized);
+    window.orkas.onPushEvent('conversation:task_terminal', _taskTerminalHandlePresentation);
+  }
+} catch (_) {}

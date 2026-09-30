@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -77,6 +78,7 @@ function boot() {
   };
   context.window.window = context.window;
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
   vm.runInContext(SOURCE, context);
 
   // Neutralize only the collaborators outside this behavior. Recipient

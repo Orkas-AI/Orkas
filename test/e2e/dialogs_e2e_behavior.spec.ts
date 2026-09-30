@@ -1,6 +1,52 @@
 import { expect, test } from './fixtures/orkas';
 
 test.describe('shared dialog behavior', () => {
+  test.describe('async actions', () => {
+
+
+    test('keeps an async danger confirmation busy, shows failure inline, and closes only after a successful retry', async ({ appPage }, testInfo) => {
+      await appPage.evaluate(async () => {
+        const root = window as any;
+        await root.setLang('zh');
+        root.__dangerAttempts = 0;
+        root.__dangerResult = null;
+        root.uiConfirmDanger({
+          title: root.t('project.action.delete'),
+          message: root.t('project.delete_confirm_body_empty'),
+          dangerLabel: root.t('project.action.delete'),
+          errorMessage: root.t('project.delete_failed_generic'),
+          onConfirm: () => {
+            root.__dangerAttempts++;
+            return new Promise((resolve, reject) => { root.__finishDanger = resolve; root.__failDanger = reject; });
+          },
+        }).then((result: boolean) => { root.__dangerResult = result; });
+      });
+      const dialog = appPage.getByRole('alertdialog');
+      const ok = dialog.locator('[data-act="ok"]');
+      const cancel = dialog.locator('[data-act="cancel"]');
+      await ok.click();
+      await expect(ok).toBeDisabled();
+      await expect(ok).toHaveClass(/is-loading/);
+      await expect(ok).toHaveText('处理中…');
+      await expect(ok).toHaveAttribute('aria-busy', 'true');
+      await expect(cancel).toBeDisabled();
+      await appPage.keyboard.press('Escape');
+      await expect(dialog).toBeVisible();
+      await dialog.screenshot({ path: testInfo.outputPath('project-delete-loading.png') });
+      await appPage.evaluate(() => (window as any).__failDanger(new Error('network unavailable')));
+      await expect(dialog.locator('.ui-dialog-error')).toHaveText('删除项目失败，请重试');
+      await expect(ok).toBeEnabled();
+      await expect(cancel).toBeEnabled();
+      await expect(ok).toBeFocused();
+      await ok.click();
+      await expect(ok).toBeDisabled();
+      expect(await appPage.evaluate(() => (window as any).__dangerAttempts)).toBe(2);
+      await appPage.evaluate(() => (window as any).__finishDanger());
+      await expect(dialog).toHaveCount(0);
+      expect(await appPage.evaluate(() => (window as any).__dangerResult)).toBe(true);
+    });
+  });
+
   test('docks native questions above the execution panel without overlapping attachments and retracts at turn end', async ({ orkas: app }, testInfo) => {
     const appPage = app.page!;
     const created = await app.invoke<{ conversation: { conversation_id: string } }>('conversations.create', { title: 'Native question layout' });
@@ -381,4 +427,115 @@ test.describe('shared dialog behavior', () => {
     }
   });
 
+});
+
+
+test('global requests show their source task across navigation, locales and narrow windows', async ({ orkas: app }, testInfo) => {
+  const page = app.page!;
+  const title = '发送每周进展给项目成员 · Review the weekly release progress';
+  const created = await app.invoke<{ conversation: { conversation_id: string } }>('conversations.create', { title });
+  const cid = created.conversation.conversation_id;
+  await page.evaluate(() => (window as any).setView('settings'));
+  await page.setViewportSize({ width: 760, height: 600 });
+  // Deliver the same host push that a pending operation uses. Only UI and
+  // read-only title lookup are exercised; no connector or shell action runs.
+  const push = async (channel: string, payload: Record<string, unknown>) => {
+    await app.electronApp!.evaluate(({ BrowserWindow }, { channel, payload }) => {
+      BrowserWindow.getAllWindows().find(win => win.webContents.getURL().includes('index.html'))!
+        .webContents.send(channel, payload);
+    }, { channel, payload });
+  };
+  await page.evaluate(() => (window as any).setLang('zh'));
+  await push('connectors:action-confirm', {
+    request_id: 'context-connector', cid, connector_id: 'gmail', display_name: 'Gmail',
+    account_label: 'work@example.test', tool_name: 'GMAIL_SEND_EMAIL', action_name: 'GMAIL_SEND_EMAIL',
+    can_allow_run: true, risk: 'H', arguments_preview: '{"subject":"Weekly progress"}',
+  });
+  const approval = page.locator('.bash-permission-dialog');
+  await expect(approval.locator('.ui-dialog-context')).toContainText(title);
+  await expect(approval).toContainText('work@example.test');
+  await expect(approval).toContainText('GMAIL_SEND_EMAIL');
+  await expect(approval.locator('details')).not.toHaveAttribute('open');
+  await approval.screenshot({ path: testInfo.outputPath('global-permission-context-zh.png') });
+  await page.evaluate(() => (window as any).setLang('en'));
+  await expect(approval.locator('.ui-dialog-context')).toHaveText(`Task: ${title}`);
+  await approval.locator('summary').click();
+  await expect(approval.locator('pre')).toBeVisible();
+  await expect(approval.locator('pre')).toContainText('Weekly progress');
+  expect(await approval.evaluate(node => {
+    const box = node.getBoundingClientRect();
+    return box.left >= 0 && box.right <= innerWidth && box.top >= 0 && box.bottom <= innerHeight
+      && [...node.querySelectorAll('button, .ui-dialog-context')].every(element => element.scrollWidth <= element.clientWidth + 1);
+  })).toBe(true);
+  await push('connectors:action-confirm-cancelled', { request_ids: ['context-connector'] });
+  await expect(approval).toHaveCount(0);
+
+  await push('connectors:install-confirm', {
+    request_id: 'context-install', cid, display_name: 'Project documents', kind: 'streamable-http',
+    target: 'https://example.test/mcp',
+  });
+  const install = page.getByRole('dialog');
+  await expect(install.locator('.ui-dialog-context')).toContainText(title);
+  await expect(install).toContainText('Project documents');
+  await expect(install).toContainText('https://example.test/mcp');
+  await push('connectors:install-confirm-cancelled', { request_ids: ['context-install'] });
+  await expect(install).toHaveCount(0);
+
+  await push('local-agent:user-input', {
+    request_id: 'context-secret', cid, agent_name: 'Orkas Codex',
+    questions: [{ id: 'token', question: 'Enter the deployment token', isSecret: true }],
+  });
+  const question = page.getByRole('dialog');
+  await expect(question.locator('.ui-dialog-context')).toContainText(title);
+  await expect(question.locator('.ui-dialog-context')).toContainText('Requested by: Orkas Codex');
+  await expect(question.locator('input')).toHaveAttribute('type', 'password');
+  await push('local-agent:user-input_cancelled', { request_ids: ['context-secret'] });
+  await expect(question).toHaveCount(0);
+
+  await push('bash:permission', {
+    request_id: 'context-long', cid, conversation_title: title.repeat(12), agent_name: 'Reviewer',
+    command: 'echo ready', reasons: ['network_egress'], can_allow_run: true,
+  });
+  await expect(approval).toBeVisible();
+  const cancel = approval.locator('[data-act="cancel"]');
+  await expect(cancel).toBeInViewport();
+  expect(await approval.locator('.ui-dialog-context').evaluate(node =>
+    node.scrollHeight > node.clientHeight && node.scrollWidth <= node.clientWidth + 1)).toBe(true);
+  await approval.screenshot({ path: testInfo.outputPath('global-permission-context-long.png') });
+  await push('bash:permission_cancelled', { request_ids: ['context-long'] });
+  await expect(approval).toHaveCount(0);
+});
+
+const permissionDialogTest = test;
+permissionDialogTest('unknown shell approval shows decision facts before the bounded preview in a narrow window', async ({ orkas: app }, testInfo) => {
+  const page = app.page!;
+  await page.setViewportSize({ width: 760, height: 600 });
+  await page.evaluate(() => (window as any).setLang('zh'));
+  await app.electronApp!.evaluate(({ BrowserWindow }) => {
+    BrowserWindow.getAllWindows().find(win => win.webContents.getURL().includes('index.html'))!
+      .webContents.send('bash:permission', {
+        request_id: 'unknown-summary-ui', agent_name: 'Commander', reasons: ['sensitive_path'],
+        unresolved_paths: true, can_allow_run: false,
+        command: '# preparation\n'.repeat(55).slice(0, 800) + '…',
+        working_directory: 'D:\\project with spaces',
+        key_facts: [{ kind: 'write', operation: 'file write', target: '$out', unresolved: true,
+          detail: "$out=Join-Path (Get-Location) 'result.txt'" }],
+      });
+  });
+  const dialog = page.locator('.bash-permission-dialog');
+  await expect(dialog).toContainText('Get-Location');
+  await expect(dialog).toContainText('$out');
+  await expect(dialog).toContainText('D:\\project with spaces');
+  await expect(dialog.locator('[data-id="allow_run"]')).toHaveCount(0);
+  await expect(dialog.locator('[data-id="allow_once"]')).toBeInViewport();
+  const preview = dialog.locator('.bash-permission-details');
+  await expect(preview).not.toHaveAttribute('open');
+  await expect(preview.locator('pre')).toBeHidden();
+  expect(await dialog.evaluate(node => node.scrollWidth <= node.clientWidth + 1)).toBe(true);
+  await dialog.screenshot({ path: testInfo.outputPath('unknown-shell-key-facts.png') });
+  await preview.locator('summary').click();
+  await expect(preview.locator('pre')).toBeVisible();
+  expect((await preview.locator('pre').textContent())!.length).toBeLessThanOrEqual(801);
+  await dialog.locator('[data-act="cancel"]').click();
+  await expect(dialog).toHaveCount(0);
 });

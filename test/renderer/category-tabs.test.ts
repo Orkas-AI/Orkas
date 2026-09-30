@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -112,12 +113,86 @@ function loadCategoryRenderers() {
     _mpShowReviewStatusUi: () => false,
   };
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
   for (const file of ['dropdown-placement.js', 'agents.js', 'skills.js']) {
     const code = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules', file), 'utf8');
     vm.runInContext(code, context, { filename: file });
   }
   return { context, el };
 }
+
+describe('Library picker asynchronous placement', () => {
+  function pendingLibrary() {
+    const h = loadCategoryRenderers();
+    const { context, el } = h;
+    const picker = el('agent-picker');
+    const list = el('agent-picker-list');
+    const anchor = el('chat-recipient-chip');
+    picker.style.display = 'flex';
+    picker.dataset.anchorId = 'chat-recipient-chip';
+    anchor.className = 'chat-input-area';
+    anchor.getBoundingClientRect = () => ({ left: 200, right: 320, top: 500, bottom: 620, width: 120, height: 120 });
+    context.window.innerHeight = 680;
+    // Model the loading shell and populated box sizes; production placement
+    // must measure again after the deferred response changes the content.
+    picker.getBoundingClientRect = () => {
+      const naturalHeight = list.innerHTML.includes('data-kind="library"') ? 560 : 120;
+      const height = Math.min(naturalHeight, parseFloat(picker.style.maxHeight) || Infinity);
+      const top = parseFloat(picker.style.top) || 0;
+      return { left: 200, right: 540, top, bottom: top + height, width: 340, height };
+    };
+    let resolveTree!: (value: unknown) => void;
+    const tree = new Promise((resolve) => { resolveTree = resolve; });
+    context.apiFetch = async () => ({ json: () => tree });
+    vm.runInContext('_agentPickerTab = "library"; _renderAgentPickerList("")', context);
+    return {
+      ...h, picker, list,
+      finish: async () => {
+        resolveTree({ ok: true, tree: [
+          { type: 'file', name: 'brief.md', relPath: 'brief.md' },
+          { type: 'file', name: 'notes.md', relPath: 'notes.md' },
+        ] });
+        await vm.runInContext('_pickerLibraryLoading', context);
+      },
+    };
+  }
+
+  it('keeps loaded files above the composer and within the viewport', async () => {
+    const h = pendingLibrary();
+    expect(h.list.innerHTML).toContain('加载中');
+    expect(h.picker.getBoundingClientRect().bottom).toBeLessThan(500);
+
+    await h.finish();
+
+    expect(h.list.innerHTML).toContain('brief.md');
+    expect(h.list.innerHTML).toContain('notes.md');
+    const bounds = h.picker.getBoundingClientRect();
+    expect(bounds.top).toBeGreaterThanOrEqual(12);
+    expect(bounds.bottom).toBeLessThanOrEqual(492);
+    expect(h.picker.dataset.placement).toBe('top');
+  });
+
+  it('uses the current search when files arrive and repositions the result', async () => {
+    const h = pendingLibrary();
+    (h.el('agent-picker-search') as any).value = 'brief';
+    h.context._renderAgentPickerList('brief');
+    await h.finish();
+    expect(h.list.innerHTML).toContain('brief.md');
+    expect(h.list.innerHTML).not.toContain('notes.md');
+    expect(h.picker.getBoundingClientRect().bottom).toBeLessThanOrEqual(492);
+  });
+
+  it.each(['close', 'switch tab'])('does not revive Library after %s while loading', async (action) => {
+    const h = pendingLibrary();
+    if (action === 'close') h.context._closeAgentPicker();
+    else vm.runInContext('_agentPickerTab = "connectors"; _renderAgentPickerList("")', h.context);
+    const content = h.list.innerHTML;
+    const style = { ...h.picker.style };
+    await h.finish();
+    expect(h.list.innerHTML).toBe(content);
+    expect(h.picker.style).toEqual(style);
+  });
+});
 
 describe('agent and skill category tabs', () => {
   it('maps missing and non-registry agent categories to General instead of Unknown', () => {

@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -67,6 +68,7 @@ function pickerHarness(anchorId: string, atKey: boolean) {
   };
   context.window = context;
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
   vm.runInContext(source, context);
   if (atKey) vm.runInContext(`_atKeyMark = { inputId: ${JSON.stringify(inputId)}, posAfter: ${input.value.length} };`, context);
   context._refreshAgentPickerSelection();
@@ -115,6 +117,24 @@ describe('agent picker selection display', () => {
     list.children[2].handlers.keydown({ key: 'Enter', preventDefault, ...composition });
     expect(select).not.toHaveBeenCalled();
     expect(preventDefault).not.toHaveBeenCalled();
+  });
+
+  it.each(['already-focused', 'another-control', 'another-task', 'unchanged-picker'])
+  ('returns focus without overwriting a newer user action: %s', state => {
+    const { context, input, picker } = pickerHarness('new-chat-recipient-chip', false);
+    let pending: Function | undefined;
+    context.setTimeout = (fn: Function) => { pending = fn; };
+    context.document.activeElement = picker;
+    context.document.body = {};
+    const owner = { epoch: 1 };
+    context._composerApi = () => owner;
+    context.focusChatRichComposer = vi.fn(() => true);
+    context._focusInput(input);
+    if (state === 'already-focused') context.document.activeElement = input;
+    if (state === 'another-control') context.document.activeElement = {};
+    if (state === 'another-task') owner.epoch++;
+    pending!();
+    expect(context.focusChatRichComposer).toHaveBeenCalledTimes(state === 'unchanged-picker' ? 1 : 0);
   });
 
   it('keeps automation outside the multi-recipient display', () => {

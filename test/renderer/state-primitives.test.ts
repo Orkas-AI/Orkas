@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
@@ -23,6 +24,7 @@ describe('shared Renderer state primitives', () => {
     const dispatched = vi.fn();
     const sandbox: any = { Event };
     vm.createContext(sandbox);
+  vm.runInContext(composerAccessorSource, sandbox);
     vm.runInContext([
       extractFunction('_insertComposerNewline'),
       extractFunction('_handleModifiedComposerEnter'),
@@ -53,6 +55,7 @@ describe('shared Renderer state primitives', () => {
   it('recognizes only unmodified Enter as the send gesture', () => {
     const sandbox: any = {};
     vm.createContext(sandbox);
+  vm.runInContext(composerAccessorSource, sandbox);
     vm.runInContext(extractFunction('_isPlainComposerEnter'), sandbox);
 
     expect(sandbox._isPlainComposerEnter({
@@ -78,6 +81,7 @@ describe('shared Renderer state primitives', () => {
   it('keeps group activity scoped to a non-empty conversation id', () => {
     const sandbox: any = { groupBusyConvs: new Map() };
     vm.createContext(sandbox);
+  vm.runInContext(composerAccessorSource, sandbox);
     vm.runInContext([
       extractFunction('isGroupConversationBusy'),
       extractFunction('setGroupConversationBusy'),

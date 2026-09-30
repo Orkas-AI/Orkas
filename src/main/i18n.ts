@@ -18,7 +18,7 @@ import * as fs from 'node:fs';
 import { SRC_ROOT } from './paths';
 import { buildLanguageDirectiveText } from './prompts/chat_prompt_composer';
 
-export type Lang = 'zh' | 'en' | 'ja' | 'pt' | 'es' | 'fr' | 'ko' | 'de' | 'ru' | 'it';
+export type Lang = 'ar' | 'zh' | 'zh-tw' | 'en' | 'fr' | 'de' | 'hi' | 'id' | 'it' | 'ja' | 'ko' | 'pt' | 'pt-pt' | 'ru' | 'es' | 'es-419' | 'th' | 'tr' | 'vi';
 
 export interface LocaleMeta {
   code: Lang;
@@ -29,45 +29,27 @@ export interface LocaleMeta {
   fallback: Lang | null;
 }
 
+// English-name order with adjacent regional variants; Arabic is last by product choice.
 export const LOCALES: readonly LocaleMeta[] = [
-  {
-    code: 'zh',
-    label: '简体中文',
-    htmlLang: 'zh-CN',
-    intlLocale: 'zh-CN',
-    llmName: 'Chinese (简体中文)',
-    fallback: 'en',
-  },
-  {
-    code: 'en',
-    label: 'English',
-    htmlLang: 'en',
-    intlLocale: 'en-US',
-    llmName: 'English',
-    fallback: null,
-  },
-  {
-    code: 'ja',
-    label: '日本語',
-    htmlLang: 'ja',
-    intlLocale: 'ja-JP',
-    llmName: 'Japanese (日本語)',
-    fallback: 'en',
-  },
-  {
-    code: 'pt',
-    label: 'Português (Brasil)',
-    htmlLang: 'pt-BR',
-    intlLocale: 'pt-BR',
-    llmName: 'Brazilian Portuguese (Português do Brasil)',
-    fallback: 'en',
-  },
-  { code: 'es', label: 'Español', htmlLang: 'es', intlLocale: 'es-ES', llmName: 'Spanish (Español)', fallback: 'en' },
-  { code: 'fr', label: 'Français', htmlLang: 'fr', intlLocale: 'fr-FR', llmName: 'French (Français)', fallback: 'en' },
-  { code: 'ko', label: '한국어', htmlLang: 'ko', intlLocale: 'ko-KR', llmName: 'Korean (한국어)', fallback: 'en' },
-  { code: 'de', label: 'Deutsch', htmlLang: 'de', intlLocale: 'de-DE', llmName: 'German (Deutsch)', fallback: 'en' },
-  { code: 'ru', label: 'Русский', htmlLang: 'ru', intlLocale: 'ru-RU', llmName: 'Russian (Русский)', fallback: 'en' },
-  { code: 'it', label: 'Italiano', htmlLang: 'it', intlLocale: 'it-IT', llmName: 'Italian (Italiano)', fallback: 'en' },
+  {"code": "zh", "label": "简体中文", "htmlLang": "zh-CN", "intlLocale": "zh-CN", "llmName": "Chinese (简体中文)", "fallback": "en"},
+  {"code": "zh-tw", "label": "繁體中文", "htmlLang": "zh-TW", "intlLocale": "zh-TW", "llmName": "Traditional Chinese (繁體中文)", "fallback": "en"},
+  {"code": "en", "label": "English", "htmlLang": "en", "intlLocale": "en-US", "llmName": "English", "fallback": null},
+  {"code": "fr", "label": "Français", "htmlLang": "fr", "intlLocale": "fr-FR", "llmName": "French (Français)", "fallback": "en"},
+  {"code": "de", "label": "Deutsch", "htmlLang": "de", "intlLocale": "de-DE", "llmName": "German (Deutsch)", "fallback": "en"},
+  {"code": "hi", "label": "हिन्दी", "htmlLang": "hi", "intlLocale": "hi-IN", "llmName": "Hindi (हिन्दी)", "fallback": "en"},
+  {"code": "id", "label": "Bahasa Indonesia", "htmlLang": "id", "intlLocale": "id-ID", "llmName": "Indonesian (Bahasa Indonesia)", "fallback": "en"},
+  {"code": "it", "label": "Italiano", "htmlLang": "it", "intlLocale": "it-IT", "llmName": "Italian (Italiano)", "fallback": "en"},
+  {"code": "ja", "label": "日本語", "htmlLang": "ja", "intlLocale": "ja-JP", "llmName": "Japanese (日本語)", "fallback": "en"},
+  {"code": "ko", "label": "한국어", "htmlLang": "ko", "intlLocale": "ko-KR", "llmName": "Korean (한국어)", "fallback": "en"},
+  {"code": "pt", "label": "Português (Brasil)", "htmlLang": "pt-BR", "intlLocale": "pt-BR", "llmName": "Brazilian Portuguese (Português do Brasil)", "fallback": "en"},
+  {"code": "pt-pt", "label": "Português (Portugal)", "htmlLang": "pt-PT", "intlLocale": "pt-PT", "llmName": "European Portuguese (Português de Portugal)", "fallback": "en"},
+  {"code": "ru", "label": "Русский", "htmlLang": "ru", "intlLocale": "ru-RU", "llmName": "Russian (Русский)", "fallback": "en"},
+  {"code": "es", "label": "Español", "htmlLang": "es", "intlLocale": "es-ES", "llmName": "Spanish (Español)", "fallback": "en"},
+  {"code": "es-419", "label": "Español (Latinoamérica)", "htmlLang": "es-419", "intlLocale": "es-419", "llmName": "Latin American Spanish (Español latinoamericano)", "fallback": "en"},
+  {"code": "th", "label": "ไทย", "htmlLang": "th", "intlLocale": "th-TH", "llmName": "Thai (ไทย)", "fallback": "en"},
+  {"code": "tr", "label": "Türkçe", "htmlLang": "tr", "intlLocale": "tr-TR", "llmName": "Turkish (Türkçe)", "fallback": "en"},
+  {"code": "vi", "label": "Tiếng Việt", "htmlLang": "vi", "intlLocale": "vi-VN", "llmName": "Vietnamese (Tiếng Việt)", "fallback": "en"},
+  {"code": "ar", "label": "العربية", "htmlLang": "ar", "intlLocale": "ar-SA", "llmName": "Arabic (العربية)", "fallback": "en"},
 ] as const;
 
 export const SUPPORTED_LANGS: readonly Lang[] = LOCALES.map((l) => l.code);
@@ -81,12 +63,18 @@ export function isLang(v: unknown): v is Lang {
 }
 
 export function normalizeLang(rawLocale: unknown): Lang | null {
-  const s = typeof rawLocale === 'string' ? rawLocale.trim().toLowerCase() : '';
-  if (!s) return null;
-  for (const lang of SUPPORTED_LANGS) {
-    if (s === lang || s.startsWith(`${lang}-`) || s.startsWith(`${lang}_`)) return lang;
-  }
-  return null;
+  const value = typeof rawLocale === 'string' ? rawLocale.trim().replace(/_/g, '-') : '';
+  if (!value) return null;
+  const exact = value.toLowerCase();
+  if (isLang(exact)) return exact;
+  try {
+    const locale = new Intl.Locale(value);
+    const base = locale.language;
+    if (base === 'zh') return locale.maximize().script === 'Hant' ? 'zh-tw' : 'zh';
+    if (base === 'pt' && locale.region && locale.region !== 'BR') return 'pt-pt';
+    if (base === 'es' && ['419', 'AR', 'BO', 'BR', 'BZ', 'CL', 'CO', 'CR', 'CU', 'DO', 'EC', 'GT', 'HN', 'MX', 'NI', 'PA', 'PE', 'PR', 'PY', 'SV', 'US', 'UY', 'VE'].includes(locale.region || '')) return 'es-419';
+    return isLang(base) ? base : null;
+  } catch { return null; }
 }
 
 export function getLocaleMeta(lang: Lang): LocaleMeta {
@@ -125,7 +113,12 @@ export function descriptionLang(lang: Lang): 'zh' | 'en' {
  * space. Unknown input falls back to English.
  */
 export function detectSystemLang(rawLocale: unknown): Lang {
-  return normalizeLang(rawLocale) ?? 'en';
+  const preferences = Array.isArray(rawLocale) ? rawLocale : [rawLocale];
+  for (const candidate of preferences) {
+    const lang = normalizeLang(candidate);
+    if (lang) return lang;
+  }
+  return 'en';
 }
 
 // ── Table loading ────────────────────────────────────────────────────────

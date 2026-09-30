@@ -134,7 +134,6 @@ describe('agent picker › coding-CLI entry hand-off', () => {
     };
     context.window = context;
     vm.createContext(context);
-    vm.runInContext(extractFunction('_agentsTrackClick'), context);
     vm.runInContext(extractFunction('bindAgentPickers'), context);
     vm.runInContext('bindAgentPickers();', context);
     return { context, cliEntry };

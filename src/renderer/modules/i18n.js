@@ -35,17 +35,27 @@ let _languageRequestSeq = 0;
 let _languageMutationQueue = Promise.resolve();
 let _languageRefreshSeq = 0;
 
+// English-name order with adjacent regional variants; Arabic is last by product choice.
 const _LOCALES = [
-  { code: 'zh', label: '简体中文', htmlLang: 'zh-CN', intlLocale: 'zh-CN', fallback: 'en' },
-  { code: 'en', label: 'English', htmlLang: 'en', intlLocale: 'en-US', fallback: null },
-  { code: 'ja', label: '日本語', htmlLang: 'ja', intlLocale: 'ja-JP', fallback: 'en' },
-  { code: 'pt', label: 'Português (Brasil)', htmlLang: 'pt-BR', intlLocale: 'pt-BR', fallback: 'en' },
-  { code: 'es', label: 'Español', htmlLang: 'es', intlLocale: 'es-ES', fallback: 'en' },
-  { code: 'fr', label: 'Français', htmlLang: 'fr', intlLocale: 'fr-FR', fallback: 'en' },
-  { code: 'ko', label: '한국어', htmlLang: 'ko', intlLocale: 'ko-KR', fallback: 'en' },
-  { code: 'de', label: 'Deutsch', htmlLang: 'de', intlLocale: 'de-DE', fallback: 'en' },
-  { code: 'ru', label: 'Русский', htmlLang: 'ru', intlLocale: 'ru-RU', fallback: 'en' },
-  { code: 'it', label: 'Italiano', htmlLang: 'it', intlLocale: 'it-IT', fallback: 'en' },
+  {"code": "zh", "label": "简体中文", "htmlLang": "zh-CN", "intlLocale": "zh-CN", "fallback": "en"},
+  {"code": "zh-tw", "label": "繁體中文", "htmlLang": "zh-TW", "intlLocale": "zh-TW", "fallback": "en"},
+  {"code": "en", "label": "English", "htmlLang": "en", "intlLocale": "en-US", "fallback": null},
+  {"code": "fr", "label": "Français", "htmlLang": "fr", "intlLocale": "fr-FR", "fallback": "en"},
+  {"code": "de", "label": "Deutsch", "htmlLang": "de", "intlLocale": "de-DE", "fallback": "en"},
+  {"code": "hi", "label": "हिन्दी", "htmlLang": "hi", "intlLocale": "hi-IN", "fallback": "en"},
+  {"code": "id", "label": "Bahasa Indonesia", "htmlLang": "id", "intlLocale": "id-ID", "fallback": "en"},
+  {"code": "it", "label": "Italiano", "htmlLang": "it", "intlLocale": "it-IT", "fallback": "en"},
+  {"code": "ja", "label": "日本語", "htmlLang": "ja", "intlLocale": "ja-JP", "fallback": "en"},
+  {"code": "ko", "label": "한국어", "htmlLang": "ko", "intlLocale": "ko-KR", "fallback": "en"},
+  {"code": "pt", "label": "Português (Brasil)", "htmlLang": "pt-BR", "intlLocale": "pt-BR", "fallback": "en"},
+  {"code": "pt-pt", "label": "Português (Portugal)", "htmlLang": "pt-PT", "intlLocale": "pt-PT", "fallback": "en"},
+  {"code": "ru", "label": "Русский", "htmlLang": "ru", "intlLocale": "ru-RU", "fallback": "en"},
+  {"code": "es", "label": "Español", "htmlLang": "es", "intlLocale": "es-ES", "fallback": "en"},
+  {"code": "es-419", "label": "Español (Latinoamérica)", "htmlLang": "es-419", "intlLocale": "es-419", "fallback": "en"},
+  {"code": "th", "label": "ไทย", "htmlLang": "th", "intlLocale": "th-TH", "fallback": "en"},
+  {"code": "tr", "label": "Türkçe", "htmlLang": "tr", "intlLocale": "tr-TR", "fallback": "en"},
+  {"code": "vi", "label": "Tiếng Việt", "htmlLang": "vi", "intlLocale": "vi-VN", "fallback": "en"},
+  {"code": "ar", "label": "العربية", "htmlLang": "ar", "intlLocale": "ar-SA", "fallback": "en"},
 ];
 const _LOCALE_BY_CODE = _LOCALES.reduce((acc, meta) => {
   acc[meta.code] = meta;
@@ -53,7 +63,7 @@ const _LOCALE_BY_CODE = _LOCALES.reduce((acc, meta) => {
 }, {});
 
 function isSupportedLang(lang) {
-  return !!_LOCALE_BY_CODE[lang];
+  return Object.prototype.hasOwnProperty.call(_LOCALE_BY_CODE, lang);
 }
 
 function getSupportedLanguages() {
@@ -61,7 +71,7 @@ function getSupportedLanguages() {
 }
 
 function getLocaleMeta(lang) {
-  return _LOCALE_BY_CODE[lang] || _LOCALE_BY_CODE.en;
+  return isSupportedLang(lang) ? _LOCALE_BY_CODE[lang] : _LOCALE_BY_CODE.en;
 }
 
 function fallbackChain(lang) {
@@ -78,6 +88,7 @@ function fallbackChain(lang) {
 
 function _setDocumentLang(lang) {
   document.documentElement.setAttribute('lang', getLocaleMeta(lang).htmlLang);
+  document.documentElement.setAttribute('dir', lang === 'ar' ? 'rtl' : 'ltr');
 }
 
 function _applyLanguage(lang) {

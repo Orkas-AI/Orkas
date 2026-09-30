@@ -15,7 +15,7 @@
 // Media markup and URL encoding come from the real `utils.js` helpers rather
 // than stubs, so these cases fail if either side of the duplicate check drifts.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -31,8 +31,9 @@ const utilsSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/mod
 
 function extractFunction(name: string): string {
   const marker = `function ${name}`;
-  const start = source.indexOf(marker);
-  if (start < 0) throw new Error(`missing ${name}`);
+  const markerStart = source.indexOf(marker);
+  const start = source.slice(markerStart - 6, markerStart) === 'async ' ? markerStart - 6 : markerStart;
+  if (markerStart < 0) throw new Error(`missing ${name}`);
   const braceStart = source.indexOf('{', start);
   if (braceStart < 0) throw new Error(`missing body for ${name}`);
   let depth = 0;
@@ -218,8 +219,7 @@ describe('produced media preview', () => {
     expect(source).toContain('function _bubbleRenderedMediaPaths');
     // Media block is appended first so the reading order stays
     // "reply text -> what it produced -> the file rows".
-    expect(source.indexOf('if (mediaNode) appendBeforeCreatedResources(mediaNode);'))
-      .toBeLessThan(source.indexOf('appendBeforeCreatedResources(node);'));
+    expect(source).toContain('if (mediaNode) bubble.insertBefore(mediaNode, node);');
     expect(source).toContain("if (!bubble || bubble.querySelector('.chat-msg-produced')) return;");
     expect(styleSource).toContain('.chat-msg-produced-media {');
   });
@@ -331,11 +331,163 @@ describe('chat video layout', () => {
   it('wires expanded markdown and floating-player surfaces to the shared playback toggle', () => {
     expect(source).not.toContain('data-chat-video-playback-surface="attachment_bubble"');
     expect(utilsSource).toContain('data-chat-video-playback-surface="markdown_bubble"');
+    // Both floating-player video wraps must carry the surface marker. The
+    // viewer builds them via DOM (`dataset.chatVideoPlaybackSurface`), which
+    // sets the same data attribute an innerHTML template would; accept either
+    // spelling so a template<->DOM refactor cannot fail this while the
+    // delegated toggle in utils.js keeps working.
     expect((viewerSource.match(
       /data-chat-video-playback-surface="floating_player"|chatVideoPlaybackSurface = 'floating_player'/g,
     ) || [])).toHaveLength(2);
     expect(utilsSource).toContain("target.closest('[data-chat-video-playback-surface]')");
     expect(utilsSource).toContain('_toggleChatVideoFromSurface(e, surface)');
-    expect(utilsSource).not.toMatch(/Monitor\.click\(['"]chat_video_surface_toggle/);
+  });
+});
+
+// Exercise the shared mount used by history append and live finalization. Only
+// DOM insertion/query mechanics and IPC are fixtures; Markdown, media markup,
+// identity collection, footer mounting and repeat-mount guards are production.
+function footerHarness(markdown: string, resolve: (payload: { cid: string; name: string }) => Promise<unknown>) {
+  type Node = { html: string; parentNode: unknown };
+  const nodes: Node[] = [];
+  const body = utils.renderMarkdown(markdown);
+  const sources = Array.from(body.matchAll(/<(?:img|video|audio)\b[^>]*src="([^"]+)"/g), (m: any) => m[1]);
+  const bubble = {
+    querySelectorAll: () => sources.map(src => ({ getAttribute: () => src })),
+    querySelector: (selector: string) => selector === '.chat-msg-produced'
+      ? nodes.find(node => node.html.startsWith('<div class="chat-msg-produced">')) || null
+      : selector.startsWith('[src') ? sources.some(src => src.startsWith('chat-media://cid/')) : null,
+    appendChild(node: Node) { node.parentNode = bubble; nodes.push(node); },
+    insertBefore(node: Node, before: Node) {
+      node.parentNode = bubble;
+      nodes.splice(nodes.indexOf(before), 0, node);
+    },
+  };
+  let currentBubble: typeof bubble | null = bubble;
+  const message = { dataset: {}, querySelector: () => currentBubble };
+  const invoke = vi.fn((_channel: string, payload: { cid: string; name: string }) => resolve(payload));
+  const context = vm.createContext({
+    ...utils, URL, window: { orkas: { invoke } },
+    document: { createElement: () => ({
+      value: '',
+      set innerHTML(value: string) { this.value = value; },
+      get firstElementChild() { return { html: this.value, parentNode: null }; },
+    }) },
+    t: (key: string) => key, _uiIconHtml: () => '', _iconForProduced: () => '',
+    _hydrateMessageProducedChips: () => {},
+  });
+  vm.runInContext([
+    ...['CHAT_IMAGE_EXTS', 'CHAT_VIDEO_EXTS', 'CHAT_AUDIO_EXTS'].map(extractConstLine),
+    ...['_chatAttachExtOf', '_chatAttachKindFromExt', '_producedBaseName', '_producedMediaPathKey',
+      '_bubbleRenderedMediaPaths', '_resolveBubbleAttachmentMediaPaths', '_renderProducedMediaHtml',
+      '_renderMessageProducedHtml', '_mountMessageProducedFooter'].map(extractFunction),
+  ].join('\n'), context);
+  return {
+    invoke, body, nodes,
+    mount: (paths: string[]) => context._mountMessageProducedFooter(message, paths),
+    settle: () => new Promise(resolve => setTimeout(resolve, 0)),
+    replace: () => { currentBubble = null; },
+    html: () => body + nodes.map(node => node.html).join(''),
+  };
+}
+
+describe('attachment media in the produced footer', () => {
+  it('keeps the two body images but removes the third preview in the shared live/history mount', async () => {
+    const attachment = '/pool/chat/generated.png';
+    const h = footerHarness(
+      '[Download](chat-media://local/workspace/cover.png)\n\n![generated](chat-media://cid/chat/generated.png)',
+      async () => ({ ok: true, path: attachment }),
+    );
+    h.mount(['/workspace/cover.png', attachment]);
+    h.mount(['/workspace/cover.png', attachment]);
+    await h.settle();
+    expect(h.html().match(/<img\b/g)).toHaveLength(2);
+    expect(h.html().match(/chat-msg-produced-item/g)).toHaveLength(2);
+    expect(h.html()).toContain('data-produced-path="/pool/chat/generated.png"');
+    expect(h.invoke).toHaveBeenCalledExactlyOnceWith('attachments.absPath', { cid: 'chat', name: 'generated.png' });
+  });
+
+  it.each(['mp4', 'mp3'])('preserves the same attachment deduplication for %s players', async ext => {
+    const h = footerHarness(`![media](chat-media://cid/chat/output.${ext})`, async () => ({ ok: true, path: `/pool/chat/output.${ext}` }));
+    h.mount([`/pool/chat/output.${ext}`]);
+    await h.settle();
+    expect(h.html()).not.toContain('chat-msg-produced-media');
+    expect(h.html()).toContain('chat-msg-produced-item');
+  });
+
+  it('keeps same-name attachments from different conversations distinct', async () => {
+    const h = footerHarness('![one](chat-media://cid/one/cover.png)\n\n![two](chat-media://cid/two/cover.png)',
+      async ({ cid }) => ({ ok: true, path: `/pool/${cid}/cover.png` }));
+    h.mount(['/pool/one/cover.png', '/pool/two/cover.png', '/pool/three/cover.png']);
+    await h.settle();
+    expect(h.html().match(/<img\b/g)).toHaveLength(3);
+    expect(h.html().match(/chat-msg-produced-item/g)).toHaveLength(3);
+    expect(h.invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['/pool/other/same.png', '/workspace/same.png', 'C:\\workspace\\same.png'])(
+    'retains a same-name file at a different full path: %s', async (other) => {
+      const h = footerHarness('![image](chat-media://cid/chat/same.png)', async () => ({ ok: true, path: '/pool/chat/same.png' }));
+      h.mount(['/pool/chat/same.png', other]);
+      await h.settle();
+      expect(h.html().match(/<img\b/g)).toHaveLength(2);
+      expect(h.html().match(/chat-msg-produced-item/g)).toHaveLength(2);
+    },
+  );
+
+  it('matches encoded attachment names and Windows separators, resolving repeated references once', async () => {
+    const h = footerHarness(
+      '![one](chat-media://cid/chat/%E5%B0%81%E9%9D%A2%281%29.png?v=1)\n\n![two](chat-media://cid/chat/%E5%B0%81%E9%9D%A2%281%29.png?v=2)',
+      async () => ({ ok: true, path: 'C:/pool/chat/封面(1).png' }),
+    );
+    h.mount(['C:\\pool\\chat\\封面(1).png']);
+    await h.settle();
+    expect(h.html().match(/<img\b/g)).toHaveLength(2);
+    expect(h.invoke).toHaveBeenCalledTimes(1);
+    expect(h.html()).not.toContain('chat-msg-produced-media');
+  });
+
+  it.each(['missing', 'rejected'])('keeps the preview and chip when resolution is %s', async failure => {
+    const h = footerHarness('![image](chat-media://cid/chat/cover.png)', async () => {
+      if (failure === 'rejected') throw new Error('unavailable');
+      return { ok: false };
+    });
+    h.mount(['/workspace/cover.png']);
+    await h.settle();
+    expect(h.html().match(/<img\b/g)).toHaveLength(2);
+    expect(h.html()).toContain('data-produced-path="/workspace/cover.png"');
+  });
+
+  it('does not delay local-only previews or send IPC for unrelated attachment names', async () => {
+    const h = footerHarness('![local](chat-media://local/workspace/shown.png)', async () => { throw new Error('unexpected'); });
+    h.mount(['/workspace/shown.png', '/workspace/new.png']);
+    expect(h.html().match(/<img\b/g)).toHaveLength(2);
+    expect(h.invoke).not.toHaveBeenCalled();
+    const unrelated = footerHarness('![attachment](chat-media://cid/chat/other.png)', async () => { throw new Error('unexpected'); });
+    unrelated.mount(['/workspace/new.png']);
+    await unrelated.settle();
+    expect(unrelated.invoke).not.toHaveBeenCalled();
+    expect(unrelated.html().match(/<img\b/g)).toHaveLength(2);
+  });
+
+  it.each(['chat-media://cid/chat/a%2Fb.png', 'chat-media://cid/chat/%ZZ.png', 'chat-media://cid/chat/extra/cover.png'])(
+    'does not infer identity from malformed attachment route %s', async url => {
+      const h = footerHarness(`![image](${url})`, async () => { throw new Error('unexpected'); });
+      h.mount(['/workspace/cover.png']);
+      await h.settle();
+      expect(h.invoke).not.toHaveBeenCalled();
+      expect(h.html()).toContain('chat-msg-produced-media');
+    },
+  );
+
+  it('does not mount a stale preview after a streaming bubble has been replaced', async () => {
+    let finish!: (result: unknown) => void;
+    const h = footerHarness('![image](chat-media://cid/chat/cover.png)', () => new Promise(resolve => { finish = resolve; }));
+    h.mount(['/workspace/cover.png']);
+    expect(h.html()).not.toContain('chat-msg-produced-media');
+    h.replace();
+    finish({ ok: false });
+    await h.settle();
+    expect(h.html()).not.toContain('chat-msg-produced-media');
   });
 });
