@@ -7486,13 +7486,13 @@ function _setEarlierHistoryLoaderState(row, state, error = '') {
   row.textContent = '';
 }
 
-function _maybeAutoLoadEarlierHistory(container) {
+function _maybeAutoLoadEarlierHistory(container, userGesture = false) {
   if (!container || Number(container.scrollTop || 0) > HISTORY_AUTO_LOAD_THRESHOLD) {
     const row = container?.querySelector?.('.chat-history-load-earlier');
     if (row?.dataset.state === 'error') _setEarlierHistoryLoaderState(row, 'idle');
     return;
   }
-  if (_isProgrammaticStickyScroll(container)) return;
+  if (!userGesture && _isProgrammaticStickyScroll(container)) return;
   const row = container.querySelector('.chat-history-load-earlier');
   if (!row || row.dataset.state === 'loading' || row.dataset.state === 'error') return;
   const cursor = _historyNextCursor(row.dataset.cursor);
@@ -7509,9 +7509,9 @@ function _bindAutoLoadEarlierHistory(container) {
   // event. Listen for the user's continued upward intent so short pages can
   // still advance without a button.
   container.addEventListener('wheel', (event) => {
-    if (Number(event?.deltaY || 0) < 0) _maybeAutoLoadEarlierHistory(container);
+    if (Number(event?.deltaY || 0) < 0) _maybeAutoLoadEarlierHistory(container, true);
   }, { passive: true });
-  container.addEventListener('touchmove', () => _maybeAutoLoadEarlierHistory(container), { passive: true });
+  container.addEventListener('touchmove', () => _maybeAutoLoadEarlierHistory(container, true), { passive: true });
 }
 
 function _setLoadEarlierHistory(container, cid, nextCursor) {

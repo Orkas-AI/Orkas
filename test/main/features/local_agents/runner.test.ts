@@ -11,6 +11,14 @@ const mockDetect = vi.fn<[string], Promise<any>>();
 const mockCliFallback = vi.fn<[any], any>();
 const mockCliFailure = vi.fn();
 const mockCliSuccess = vi.fn();
+const suspensionClock = vi.hoisted(() => ({ suspended: 0, unavailable: false }));
+vi.mock('../../../../src/main/features/system_activity', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../../../src/main/features/system_activity')>(),
+  getSystemActivityClock: async () => {
+    if (suspensionClock.unavailable) throw new Error('fixture power monitor unavailable');
+    return () => Date.now() - suspensionClock.suspended;
+  },
+}));
 vi.mock('../../../../src/main/features/local_agents/registry', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../../src/main/features/local_agents/registry')>();
   return {
@@ -86,6 +94,8 @@ const PNG_1X1_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4
 const MP4_FTYP = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
 
 beforeEach(async () => {
+  suspensionClock.suspended = 0;
+  suspensionClock.unavailable = false;
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-runner-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
@@ -154,6 +164,34 @@ async function callRunnerBridge(
 }
 
 describe('local_agents/runner', () => {
+  it.each([false, true])('wires OS-aware idle time into the CLI, retaining wall time if monitoring is unavailable: %s', async unavailable => {
+    suspensionClock.unavailable = unavailable;
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    let now = Date.now();
+    const date = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    let backendCalls = 0;
+    mockBackendImpl = async opts => {
+      backendCalls++;
+      opts.onActivity();
+      now += 20 * 60_000;
+      expect(now - opts.lastEventAt()).toBe(1_200_000);
+      now += 60 * 60_000;
+      suspensionClock.suspended += 60 * 60_000;
+      expect(now - opts.lastEventAt()).toBe(unavailable ? 4_800_000 : 1_200_000);
+      opts.onActivity();
+      expect(now - opts.lastEventAt()).toBe(0);
+      opts.onEvent({ type: 'done', status: 'completed', output: 'done' });
+    };
+    try {
+      const result = await (await loadRunner()).run({
+        uid: TEST_UID, cid: 'c-suspend', agentId: 'a', cli: 'claude', prompt: 'work', cwd: tmpDir,
+        signal: new AbortController().signal, onEvent: () => {},
+      });
+      expect(result.status).toBe('completed');
+      expect(backendCalls).toBe(1);
+    } finally { date.mockRestore(); }
+  });
+
   it('advertises only granted bridge categories and directs Commander-only work to handoff', async () => {
     const runner = await loadRunner();
     const restricted = runner.buildBridgeSystemPrompt([
@@ -285,7 +323,7 @@ describe('local_agents/runner', () => {
       paths: ['/Users/test/private.txt', '/Users/test/other.txt'],
     }, 1170);
     runner.recordLocalAgentEventForLog(stats, { type: 'status', status: 'usage', usage: { input: 5, output: 7, secretText: 'nope' } }, 1180);
-    runner.recordLocalAgentEventForLog(stats, { type: 'done', status: 'completed', output: 'private final', usage: { input: 5, output: 8 } }, 1200);
+    runner.recordLocalAgentEventForLog(stats, { type: 'done', status: 'completed', output: 'private final', usage: { input: 5, output: 8 }, exitCode: 0, protocolRecordCount: 2, protocolErrorSeen: false }, 1200);
 
     const summary = runner.summarizeLocalAgentRunForLog(stats, 1300);
     expect(summary.eventCount).toBe(13);
@@ -298,6 +336,7 @@ describe('local_agents/runner', () => {
     expect(summary.fileChangePathCount).toBe(2);
     expect(summary.permissionAutoDeny).toBe(1);
     expect(summary.usage).toMatchObject({ input: 5, output: 8 });
+    expect(summary).toMatchObject({ exitCode: 0, protocolRecordCount: 2, protocolErrorSeen: false });
     expect(summary.toolTimeline).toEqual([
       '#1 +140ms bash use call=loca...3456',
       `#2 +150ms bash result call=loca...3456 error=true output_chars=${'private tool output'.length} spilled=true`,

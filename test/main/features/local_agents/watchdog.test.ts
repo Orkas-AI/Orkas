@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { armKillWatchdog } from '../../../../src/main/features/local_agents/backends/base';
+import { armKillWatchdog, bindAbort } from '../../../../src/main/features/local_agents/backends/base';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import {
   AGENT_EXECUTION_IDLE_MS,
@@ -8,6 +8,7 @@ import {
 } from '../../../../src/main/util/agent-execution-budget';
 import { resolveIdleKillMs } from '../../../../src/main/features/local_agents/runner';
 import { localCliCapabilities } from '../../../../src/main/features/local_agents/registry';
+import { SystemActivityTracker } from '../../../../src/main/features/system_activity';
 
 // Business invariants of the activity-aware kill watchdog
 // (backends/base.ts::armKillWatchdog). The bug class this guards: a
@@ -144,6 +145,113 @@ describe('armKillWatchdog', () => {
     await vi.advanceTimersByTimeAsync(300);
     expect(wd.fired()).toBe(null);
     expect(kill).not.toHaveBeenCalled();
+  });
+});
+
+// The OS event source is controlled; the real clock and watchdog decide
+// whether the child is killed. Wall-clock jumps without suspend are not sleep.
+function suspensionFixture() {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  const listeners = new Map<string, () => void>();
+  const system = new SystemActivityTracker({ on: (event, fn) => { listeners.set(event, fn); } });
+  system.start();
+  const awakeNow = () => {
+    const snapshot = system.snapshot();
+    return snapshot.wall_time_ms - snapshot.suspended_total_ms;
+  };
+  const clock = new AgentActivityClock(awakeNow);
+  const { child, kill } = fakeChild();
+  const wd = armKillWatchdog(child, {
+    timeoutMs: 86_400_000, idleKillMs: AGENT_EXECUTION_IDLE_MS, lastEventAt: clock.lastEventAt,
+  });
+  return { clock, wd, kill, child,
+    suspend: () => listeners.get('suspend')!(),
+    resume: () => listeners.get('resume')!(),
+    jump: (ms: number) => vi.setSystemTime(Date.now() + ms),
+  };
+}
+
+describe('CLI idle budget across system suspension', () => {
+  it('keeps user cancellation immediate while the system clock is suspended', () => {
+    const f = suspensionFixture();
+    const controller = new AbortController();
+    const unbind = bindAbort(f.child, controller.signal);
+    try {
+      f.suspend(); f.jump(3_600_000);
+      controller.abort();
+      expect(f.kill).toHaveBeenCalledWith('SIGTERM');
+      expect(f.kill).toHaveBeenCalledTimes(1);
+      expect(f.wd.fired()).toBeNull();
+    } finally { unbind(); f.wd.disarm(); }
+  });
+
+  it('preserves the remaining idle budget even if a watchdog tick precedes resume delivery', async () => {
+    const f = suspensionFixture();
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    f.suspend(); f.jump(60 * 60_000);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.kill).not.toHaveBeenCalled();
+    f.resume();
+    await vi.advanceTimersByTimeAsync(595_000);
+    expect(f.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.wd.fired()).toBe('idle');
+    expect(f.wd.reason()).toContain('no activity for 1800000ms');
+    expect(f.kill).toHaveBeenCalledTimes(1);
+    f.wd.disarm();
+  });
+
+  it('counts multiple suspensions once and lets real progress renew the awake idle budget', async () => {
+    const f = suspensionFixture();
+    await vi.advanceTimersByTimeAsync(600_000);
+    f.suspend(); f.jump(3_600_000); f.resume();
+    await vi.advanceTimersByTimeAsync(600_000);
+    f.suspend(); f.suspend(); f.jump(3_600_000); f.resume(); f.resume();
+    f.clock.progress();
+    await vi.advanceTimersByTimeAsync(1_795_000);
+    expect(f.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.wd.fired()).toBe('idle');
+    expect(f.kill).toHaveBeenCalledTimes(1);
+    f.wd.disarm();
+  });
+
+  it('does not deduct overlapping approval waits and system suspension twice', async () => {
+    const f = suspensionFixture();
+    await vi.advanceTimersByTimeAsync(1_200_000);
+    const first = f.clock.pause();
+    const second = f.clock.pause();
+    await vi.advanceTimersByTimeAsync(600_000);
+    f.suspend(); f.jump(3_600_000); f.resume();
+    first(); first();
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(f.kill).not.toHaveBeenCalled();
+    second();
+    await vi.advanceTimersByTimeAsync(595_000);
+    expect(f.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.wd.fired()).toBe('idle');
+    f.wd.disarm();
+  });
+
+  it('retains the absolute 24-hour cap during suspension and a pending approval', async () => {
+    const f = suspensionFixture();
+    const doneWaiting = f.clock.pause();
+    f.suspend(); f.jump(86_400_000);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.wd.fired()).toBe('wall');
+    expect(f.kill).toHaveBeenCalledTimes(1);
+    doneWaiting(); f.resume(); f.wd.disarm();
+  });
+
+  it('does not infer sleep from a silent CLI or an unaccompanied wall-clock jump', async () => {
+    const f = suspensionFixture();
+    f.jump(3_600_000);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.wd.fired()).toBe('idle');
+    expect(f.kill).toHaveBeenCalledTimes(1);
+    f.wd.disarm();
   });
 });
 

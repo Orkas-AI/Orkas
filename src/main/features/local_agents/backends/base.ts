@@ -95,6 +95,7 @@ export interface LocalEvent {
    *                        // silent spinner.
    *    done:               { status: 'completed'|'failed'|'cancelled'|'timeout'|
    *                                  'missing_cli', error?, durationMs?, sessionId?, usage?,
+   *                                  exitCode?, protocolRecordCount?, protocolErrorSeen?,
    *                                  finalMessageText?: string (Claude's last native result),
    *                                  timeoutPhase?: 'foreground'|'background',
    *                                  failureKind?: 'cli_spawn'|'cli_protocol', retrySafe?: boolean }

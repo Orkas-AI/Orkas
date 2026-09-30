@@ -10,24 +10,32 @@ export function agentExecutionDeadline(startedAt = Date.now()): number {
   return startedAt + AGENT_EXECUTION_MAX_MS;
 }
 
-/** Pause only the idle clock during an authoritative user interaction. Nested
- * waits are counted so one approval cannot resume another outstanding wait. */
+/** Measure idle time on the supplied clock (CLI hosts exclude OS suspension).
+ * Nested user waits pause that same clock, so sleep overlapping an approval is
+ * never deducted twice. Absolute execution deadlines remain wall-clock based. */
 export class AgentActivityClock {
-  private lastActivity = Date.now();
+  private lastActivity: number;
   private waitStarted = 0;
   private waits = 0;
 
-  progress(): void { this.lastActivity = Date.now(); }
-  lastEventAt = (): number => this.waits ? Date.now() : this.lastActivity;
+  constructor(private readonly now: () => number = () => Date.now()) {
+    this.lastActivity = now();
+  }
+
+  progress(): void { this.lastActivity = this.now(); }
+  // Preserve the watchdog's wall-timestamp contract without changing every
+  // backend: project only the remaining awake idle duration onto wall time.
+  lastEventAt = (): number => Date.now() - (this.waits ? 0 : Math.max(0, this.now() - this.lastActivity));
 
   pause(): () => void {
-    if (this.waits++ === 0) this.waitStarted = Date.now();
+    if (this.waits++ === 0) this.waitStarted = this.now();
     let released = false;
     return () => {
       if (released) return;
       released = true;
       if (--this.waits === 0) {
-        this.lastActivity = Math.min(Date.now(), this.lastActivity + Date.now() - this.waitStarted);
+        const now = this.now();
+        this.lastActivity = Math.min(now, this.lastActivity + now - this.waitStarted);
       }
     };
   }

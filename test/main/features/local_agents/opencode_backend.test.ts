@@ -23,6 +23,16 @@ function fixture() {
     process.stdin.on('end', () => {
       const input = Buffer.concat(chunks);
       const args = process.argv.slice(2);
+      if (args.includes('--fixture-silent-fail')) {
+        process.stderr.write('startup failed before JSON output\\n');
+        process.exitCode = 1;
+        return;
+      }
+      if (args.includes('--fixture-protocol-error')) {
+        process.stdout.write(JSON.stringify({ type: 'error', error: { data: { message: 'configured model unavailable' } } }) + '\\n');
+        process.exitCode = 1;
+        return;
+      }
       const text = JSON.stringify({ hash: createHash('sha256').update(input).digest('hex'), bytes: input.length, args });
       process.stdout.write(JSON.stringify({ type: 'text', part: { text } }) + '\\n');
       if (args.includes('--fixture-wait')) { setInterval(() => {}, 1000); return; }
@@ -76,5 +86,36 @@ describe('OpenCode prompt pipe transport', () => {
     expect(terminals).toHaveLength(1);
     expect(terminals[0].status).toBe(mode === 'cancel' ? 'cancelled' : 'failed');
     if (mode === 'fail') expect(terminals[0].error).toBe('opencode exited with code 7');
+  });
+
+  it('retains content-free evidence for a CLI that exits before its first protocol record', async () => {
+    const events: LocalEvent[] = [];
+    await opencodeBackend.run({
+      binPath: process.env.ORKAS_TEST_NODE || process.execPath,
+      cwd: fixture(), prompt: 'list files', customArgs: ['--fixture-silent-fail'],
+      signal: new AbortController().signal, timeoutMs: 10_000,
+      onEvent: event => events.push(event),
+    });
+    const done = events.find(event => event.type === 'done');
+    expect(done).toMatchObject({
+      status: 'failed', exitCode: 1, protocolRecordCount: 0,
+      protocolErrorSeen: false,
+    });
+    expect(events.some(event => event.type === 'stderr-line')).toBe(true);
+  });
+
+  it('distinguishes a structured CLI error from a silent startup failure', async () => {
+    const events: LocalEvent[] = [];
+    await opencodeBackend.run({
+      binPath: process.env.ORKAS_TEST_NODE || process.execPath,
+      cwd: fixture(), prompt: 'list files', customArgs: ['--fixture-protocol-error'],
+      signal: new AbortController().signal, timeoutMs: 10_000,
+      onEvent: event => events.push(event),
+    });
+    expect(events.find(event => event.type === 'done')).toMatchObject({
+      status: 'failed', exitCode: 1, protocolRecordCount: 1,
+      protocolErrorSeen: true, error: 'configured model unavailable',
+    });
+    expect(events.some(event => event.type === 'stderr-line')).toBe(false);
   });
 });

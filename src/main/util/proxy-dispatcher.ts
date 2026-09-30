@@ -318,14 +318,29 @@ function validBridgeToken(actual: string | string[] | undefined, expected: strin
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/** Chromium can reject a proxy connection with only a net error message.
+ * Add a transport code at the Electron boundary so provider retry accounting
+ * can use structured facts without interpreting arbitrary error prose. */
+export function normalizeElectronNetFetchError(error: unknown): unknown {
+  if (!(error instanceof Error) || error.name !== 'Error'
+    || error.message !== 'net::ERR_PROXY_CONNECTION_FAILED') return error;
+  const facts = error as Error & { code?: unknown; cause?: unknown };
+  if (facts.code != null || facts.cause != null) return error;
+  return Object.assign(new Error(error.message, { cause: error }), { code: 'ENETUNREACH' });
+}
+
 async function electronSystemFetch(): Promise<FetchLike> {
   const { net } = await import('electron');
-  return ((input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
+  return (async (input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
     const normalized = input instanceof URL ? input.href : input;
-    return net.fetch(
-      normalized as Parameters<typeof net.fetch>[0],
-      init as Parameters<typeof net.fetch>[1],
-    ) as Promise<Response>;
+    try {
+      return await net.fetch(
+        normalized as Parameters<typeof net.fetch>[0],
+        init as Parameters<typeof net.fetch>[1],
+      ) as Response;
+    } catch (error) {
+      throw normalizeElectronNetFetchError(error);
+    }
   }) as FetchLike;
 }
 

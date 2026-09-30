@@ -92,6 +92,84 @@ describe('chat-file-viewer › _kindOf', () => {
 });
 
 describe('file preview availability feedback', () => {
+  it.each(['stat', 'reveal', 'reveal-response'])('keeps private file details out of %s failure diagnostics', async (failure) => {
+    const privatePath = '/private/account/todo/brief.png';
+    const privateError = `EACCES: ${privatePath}`;
+    const warnings: unknown[] = [];
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'workspace.statPath') {
+        if (failure === 'stat') throw new Error(privateError);
+        return { ok: false, error: 'unavailable' };
+      }
+      if (failure === 'reveal-response') return { ok: false, error: privateError };
+      throw new Error(privateError);
+    });
+    const openChatImageLightbox = vi.fn();
+    const context = vm.createContext({
+      window: { orkas: { invoke } },
+      createLogger: () => ({ warn: (...args: unknown[]) => warnings.push(args), info: () => {}, error: () => {} }),
+      uiConfirm: vi.fn(async () => true),
+      openChatImageLightbox,
+      console,
+    });
+    vm.runInContext(readFileSync(require.resolve('../../src/renderer/modules/chat-file-viewer.js'), 'utf8'), context);
+    await context.openChatFileViewer(privatePath, 'brief.png');
+    expect(warnings).toHaveLength(1);
+    expect(JSON.stringify(warnings)).not.toContain(privatePath);
+    expect(JSON.stringify(warnings)).not.toContain('EACCES');
+    expect(warnings).toEqual([[expect.any(String), { error_code: failure === 'stat' ? 'stat_failed' : 'reveal_failed' }]]);
+    expect(openChatImageLightbox).toHaveBeenCalledTimes(failure === 'stat' ? 1 : 0);
+    expect(context.uiConfirm).toHaveBeenCalledTimes(failure === 'stat' ? 0 : 1);
+    expect(invoke.mock.calls.map(([channel]) => channel)).toEqual(failure === 'stat'
+      ? ['workspace.statPath'] : ['workspace.statPath', 'workspace.revealPath']);
+  });
+
+  it.each(['read', 'inspect', 'destroy'])('keeps %s failure diagnostics private while preserving recovery', async (failure) => {
+    const privatePath = '/private/account/todo/brief.txt';
+    const warnings: unknown[] = [];
+    const fail = () => { throw new Error(`EACCES: ${privatePath}`); };
+    const invoke = vi.fn(async () => fail());
+    const button = { hidden: false, disabled: false };
+    const classes = new Set(['is-open']);
+    const root = {
+      classList: {
+        contains: (name: string) => classes.has(name),
+        remove: (...names: string[]) => names.forEach((name) => classes.delete(name)),
+      },
+      setAttribute: vi.fn(),
+    };
+    const setDirty = vi.fn();
+    const context = vm.createContext({
+      window: { orkas: { invoke }, OrkasPreviewHost: { setDirty } },
+      createLogger: () => ({ warn: (...args: unknown[]) => warnings.push(args), info: () => {}, error: () => {} }),
+      uiConfirm: vi.fn(async () => false),
+      root, button, privatePath, fail, console,
+    });
+    vm.runInContext(readFileSync(require.resolve('../../src/renderer/modules/chat-file-viewer.js'), 'utf8'), context);
+    vm.runInContext('_viewerEl = root; _viewerCurrentPath = privatePath; _viewerSaveAppBtn = button;', context);
+    if (failure === 'read') {
+      expect(await context._readTextFile(privatePath, 'task', 'project')).toBeNull();
+      expect(classes.has('is-open')).toBe(false);
+      expect(context.uiConfirm).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        message: 'Could not read this file. Open the containing folder?',
+      }));
+      expect(invoke).toHaveBeenCalledExactlyOnceWith('produced.readText', { path: privatePath, cid: 'task', projectId: 'project' });
+    } else if (failure === 'inspect') {
+      await context._refreshSaveAppButton(privatePath);
+      expect(button).toEqual({ hidden: true, disabled: true });
+      expect(classes.has('is-open')).toBe(true);
+      expect(invoke).toHaveBeenCalledExactlyOnceWith('savedApps.inspectBundleFromPath', { path: privatePath });
+    } else {
+      vm.runInContext('_viewerEditController = { destroy: fail }; _viewerDirty = true;', context);
+      expect(await context.closeChatFileViewer({ force: true })).toBe(true);
+      expect(classes.has('is-open')).toBe(false);
+      expect(setDirty).toHaveBeenCalledExactlyOnceWith(false);
+      await context.closeChatFileViewer({ force: true });
+      expect(invoke).not.toHaveBeenCalled();
+    }
+    expect(warnings).toEqual([[expect.any(String), { error_code: `${failure}_failed` }]]);
+  });
+
   it.each([
     [{ ok: true, exists: false }, 'missing'],
     [{ ok: false, error: 'path is outside the user workspace' }, 'unreadable'],

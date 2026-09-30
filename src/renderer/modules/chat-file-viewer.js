@@ -593,7 +593,7 @@ function _teardownViewerContent(reason = 'replaced') {
   _viewerFinishHtmlPreview(reason);
   if (_viewerEditController) {
     try { _viewerEditController.destroy(); }
-    catch (err) { _viewerLog.warn('edit controller destroy threw', err); }
+    catch { _viewerLog.warn('edit controller destroy failed', { error_code: 'destroy_failed' }); }
   }
   _viewerEditController = null;
   _viewerDirty = false;
@@ -725,9 +725,9 @@ async function _refreshSaveAppButton(path) {
     if (!_isViewerOpen() || _viewerCurrentPath !== path) return;
     const canSave = !!(inspected && inspected.ok !== false && inspected.canSave);
     _setSaveAppVisible(canSave);
-  } catch (err) {
+  } catch {
     if (!_isViewerOpen() || _viewerCurrentPath !== path) return;
-    _viewerLog.warn('inspect app bundle failed', { path, error: String(err && err.message || err) });
+    _viewerLog.warn('inspect app bundle failed', { error_code: 'inspect_failed' });
     _setSaveAppVisible(false);
   }
 }
@@ -1314,9 +1314,9 @@ async function _readTextFile(absPath, cid, projectId, seq, preview) {
       });
     }
     return null;
-  } catch (e) {
+  } catch {
     if (seq && seq !== _viewerRenderSeq) return null;
-    _viewerLog.warn('readText threw', { path: absPath, error: String(e && e.message || e) });
+    _viewerLog.warn('readText failed', { error_code: 'read_failed' });
     await closeChatFileViewer({ force: true });
     await _showUnsupportedDialog(absPath, cid, projectId, {
       messageKey: 'chat.preview_read_failed_message',
@@ -1360,9 +1360,9 @@ async function _showUnsupportedDialog(absPath, cid, projectId, opts) {
     if (cid) payload.cid = cid;
     if (projectId) payload.projectId = projectId;
     const res = await window.orkas.invoke('workspace.revealPath', payload);
-    if (!res || !res.ok) _viewerLog.warn('fallback reveal failed', { path: absPath, error: res && res.error });
-  } catch (err) {
-    _viewerLog.warn('fallback reveal threw', { path: absPath, error: String(err && err.message || err) });
+    if (!res || !res.ok) _viewerLog.warn('fallback reveal failed', { error_code: 'reveal_failed' });
+  } catch {
+    _viewerLog.warn('fallback reveal failed', { error_code: 'reveal_failed' });
   }
 }
 
@@ -1392,8 +1392,8 @@ async function _ensureViewerFileExists(absPath, cid, projectId) {
     if (typeof uiToast === 'function') uiToast(message, { variant: 'warning' });
     else if (typeof uiAlert === 'function') await uiAlert(message);
     return false;
-  } catch (err) {
-    _viewerLog.warn('statPath threw', { path: absPath, error: String(err && err.message || err) });
+  } catch {
+    _viewerLog.warn('statPath failed', { error_code: 'stat_failed' });
     return true;
   }
 }

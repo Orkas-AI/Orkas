@@ -52,6 +52,7 @@ const opencodeRunBackend: LocalBackend = {
     let textOut = '';
     let resultStatus: 'completed' | 'failed' | undefined;
     let resultError: string | undefined;
+    let protocolRecordCount = 0;
     let observedSessionId: string | undefined;
     // Most-recent per-step usage snapshot; step_finish events fire
     // throughout the turn, each carrying the cumulative-so-far. We
@@ -91,6 +92,7 @@ const opencodeRunBackend: LocalBackend = {
           opts.onEvent({ type: 'raw-line', line: trimmed });
           return;
         }
+        protocolRecordCount = Math.min(1_000_000, protocolRecordCount + 1);
         const ev = mapOpencodeEvent(obj);
         if (ev?.captureSessionId) observedSessionId = ev.captureSessionId;
         const events = ev?.events || (ev?.event ? [ev.event] : []);
@@ -144,14 +146,22 @@ const opencodeRunBackend: LocalBackend = {
         });
       });
       child.on('close', code => {
+        const exitDiagnostic = {
+          exitCode: Number.isSafeInteger(code) && code !== null && code >= 0 && code <= 65535 ? code : null,
+          protocolRecordCount,
+          protocolErrorSeen: !!resultError,
+        };
         if (opts.signal.aborted) return finish('cancelled', { output: textOut });
-if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output: textOut, stderrTail: tail.toString() });
+        if (watchdog.fired()) return finish('timeout', {
+          timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`,
+          output: textOut, stderrTail: tail.toString(),
+        });
         if (code === 0 && (resultStatus === 'completed' || resultStatus === undefined)) {
-          return finish('completed', { output: textOut });
+          return finish('completed', { output: textOut, ...exitDiagnostic });
         }
         const err = resultError
           || (code !== 0 ? `opencode exited with code ${code}` : 'opencode closed without final event');
-        finish('failed', { error: err, output: textOut, stderrTail: tail.toString() });
+        finish('failed', { error: err, output: textOut, stderrTail: tail.toString(), ...exitDiagnostic });
       });
     });
   },

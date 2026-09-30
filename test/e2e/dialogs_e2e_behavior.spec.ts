@@ -208,10 +208,17 @@ test.describe('shared dialog behavior', () => {
     await card.getByRole('button', { name: 'Create origin/release_2.0.0', exact: true }).click();
     await expect(answer).toHaveValue('Create origin/release_2.0.0');
     await expect(send).toBeEnabled();
-    await send.click();
+    await answer.fill('Use the current branch');
+    await answer.press('Shift+Enter');
+    await expect(answer).toHaveValue('Use the current branch\n');
+    await answer.press('x');
+    await answer.dispatchEvent('keydown', { key: 'Enter', isComposing: true });
+    await answer.dispatchEvent('keydown', { key: 'Enter', keyCode: 229 });
+    expect(await appPage.evaluate(() => (window as any).__e2eBlockingAnswer)).toBeNull();
+    await answer.press('Enter');
 
     await expect.poll(() => appPage.evaluate(() => (window as any).__e2eBlockingAnswer))
-      .toEqual(['Create origin/release_2.0.0']);
+      .toEqual(['Use the current branch\nx']);
     await expect(card).toHaveCount(0);
   });
 

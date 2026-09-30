@@ -14,10 +14,12 @@ import {
   envProxyUrl,
   installEnvProxyDispatcher,
   installSystemProxyDispatcher,
+  normalizeElectronNetFetchError,
   parseResolvedProxyRoute,
   resolveProxyRouteForUrl,
   startChildFetchBridge,
 } from '../../../src/main/util/proxy-dispatcher';
+import { classifyTransientNetworkError } from '../../../src/core-agent/src/shared/errors';
 
 const hostFetch = globalThis.fetch;
 const proxyEnvKeys = [
@@ -50,6 +52,26 @@ afterEach(() => {
   }
   if (savedNoAutoProxy === undefined) delete process.env.ORKAS_NO_AUTO_PROXY;
   else process.env.ORKAS_NO_AUTO_PROXY = savedNoAutoProxy;
+});
+
+describe('Electron system-proxy transport failures', () => {
+  it('keeps a message-only Chromium proxy failure in the network exhaustion category', () => {
+    const rejection = new Error('net::ERR_PROXY_CONNECTION_FAILED');
+    expect(classifyTransientNetworkError(rejection)).toBeNull();
+
+    const normalized = normalizeElectronNetFetchError(rejection);
+    expect(normalized).toMatchObject({ code: 'ENETUNREACH', cause: rejection });
+    expect(classifyTransientNetworkError(normalized)).toBe('network');
+  });
+
+  it('leaves structured failures, aborts, and similar prose untouched', () => {
+    const structured = Object.assign(new Error('net::ERR_PROXY_CONNECTION_FAILED'), { code: 'ETIMEDOUT' });
+    const aborted = Object.assign(new Error('net::ERR_PROXY_CONNECTION_FAILED'), { name: 'AbortError' });
+    const prose = new Error('request failed: net::ERR_PROXY_CONNECTION_FAILED');
+    expect(normalizeElectronNetFetchError(structured)).toBe(structured);
+    expect(normalizeElectronNetFetchError(aborted)).toBe(aborted);
+    expect(normalizeElectronNetFetchError(prose)).toBe(prose);
+  });
 });
 
 describe('util/proxy-dispatcher environment configuration', () => {

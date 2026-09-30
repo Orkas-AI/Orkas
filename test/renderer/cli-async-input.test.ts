@@ -16,7 +16,7 @@ class Element {
   parentElement: Element | null = null;
   get firstElementChild() { return this.children[0]; }
   remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(el => el !== this); this.parentElement = null; }
-  listeners = new Map<string, () => any>();
+  listeners = new Map<string, (event?: any) => any>();
   constructor(public tagName = 'div') {}
   appendChild(el: Element) { el.remove(); this.children.push(el); el.parentElement = this; return el; }
   replaceChildren() { this.children = []; }
@@ -26,8 +26,9 @@ class Element {
   maxLength = 0;
   type = '';
   setAttribute(name?: string, value?: string) { if (name) this.attributes.set(name, String(value)); }
-  addEventListener(type: string, listener: () => any) { this.listeners.set(type, listener); }
-  async fire(type: string) { if (type !== 'click' || !this.disabled) await this.listeners.get(type)?.(); }
+  addEventListener(type: string, listener: (event?: any) => any) { this.listeners.set(type, listener); }
+  click() { if (!this.disabled) void this.listeners.get('click')?.(); }
+  async fire(type: string, event?: any) { if (type !== 'click' || !this.disabled) await this.listeners.get(type)?.(event); }
   all(tag: string): Element[] { return this.children.flatMap(el => [...(el.tagName === tag ? [el] : []), ...el.all(tag)]); }
 }
 
@@ -71,6 +72,45 @@ function loadRequest(questions: any[], overrides: Record<string, any> = {}) {
 }
 const cardButton = (host: Element, text: string) => host.all('button').find(el => el.textContent === text)!;
 const cardInputs = (host: Element) => host.all('textarea');
+
+describe.each(['blocking', 'async'])('%s question keyboard answers', kind => {
+  it('sends a typed answer once with Enter, preserves IME and Shift+Enter, and allows retry after failure', async () => {
+    const h = kind === 'blocking'
+      ? loadRequest([{ id: 'scope', question: 'Which scope?' }]) : load();
+    const deliver = 'submit' in h ? h.submit : h.invoke;
+    const input = cardInputs(h.host)[0];
+    input.value = 'Current folder';
+    await input.fire('input');
+    for (const modifier of [{ shiftKey: true }, { isComposing: true }, { keyCode: 229 }]) {
+      const event = { key: 'Enter', preventDefault: vi.fn(), ...modifier };
+      await input.fire('keydown', event);
+      expect(event.preventDefault).not.toHaveBeenCalled();
+      expect(deliver).not.toHaveBeenCalled();
+    }
+    let fail!: (result: any) => void;
+    deliver.mockImplementationOnce(() => new Promise(resolve => { fail = resolve; }) as any);
+    const event = { key: 'Enter', preventDefault: vi.fn() };
+    await input.fire('keydown', event);
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    await cardInputs(h.host)[0].fire('keydown', { key: 'Enter', preventDefault: vi.fn() });
+    expect(deliver).toHaveBeenCalledOnce();
+    fail(kind === 'blocking' ? false : { ok: false, error: 'delivery_failed' });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(cardInputs(h.host)[0].value).toBe('Current folder');
+    await cardInputs(h.host)[0].fire('keydown', { key: 'Enter', preventDefault: vi.fn() });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(deliver).toHaveBeenCalledTimes(2);
+    if ('submit' in h) {
+      expect(h.submit).toHaveBeenLastCalledWith(['Current folder'], [[]]);
+      expect(h.dock.children).toHaveLength(0);
+    } else {
+      expect(h.invoke).toHaveBeenLastCalledWith('localAgents.asyncInputResponse', {
+        cid: 'chat-1', message_id: 'question-1', answers: ['Current folder'],
+      });
+      expect(h.onAnswer).toHaveBeenCalledOnce();
+    }
+  });
+});
 
 describe('native asynchronous question drafts and delivery', () => {
   it('hides cancellation in flight, ignores duplicate clicks, and restores the draft on failure', async () => {
@@ -324,6 +364,8 @@ describe('blocking native request card', () => {
     expect(cardInputs(host)[0].value).toBe('Docs, Tests');
     // The second question is still unanswered, so nothing may be sent yet.
     expect(cardButton(host, 'chat.cli_question.send').disabled).toBe(true);
+    await cardInputs(host)[0].fire('keydown', { key: 'Enter', preventDefault: vi.fn() });
+    expect(submit).not.toHaveBeenCalled();
     cardInputs(host)[1].value = 'ship it';
     await cardInputs(host)[1].fire('input');
     await cardButton(host, 'chat.cli_question.send').fire('click');

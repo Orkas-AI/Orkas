@@ -22,7 +22,7 @@ export class SystemActivityTracker {
 
   constructor(
     private readonly monitor: PowerMonitorLike,
-    private readonly now: () => number = Date.now,
+    private readonly now: () => number = () => Date.now(),
   ) {}
 
   start(): void {
@@ -45,6 +45,13 @@ export class SystemActivityTracker {
     };
   }
 
+  /** Synchronous clock for idle budgets. Pending suspension is excluded even
+   * if a watchdog tick arrives before the OS resume event is delivered. */
+  awakeNow = (): number => {
+    const snapshot = this.snapshot();
+    return snapshot.wall_time_ms - snapshot.suspended_total_ms;
+  };
+
   private onSuspend(): void {
     if (this.suspendedAtMs != null) return;
     this.suspendedAtMs = this.now();
@@ -61,10 +68,21 @@ export class SystemActivityTracker {
 
 let trackerPromise: Promise<SystemActivityTracker> | null = null;
 
-export async function getSystemActivitySnapshot(): Promise<SystemActivitySnapshot> {
+async function getTracker(): Promise<SystemActivityTracker> {
   if (!trackerPromise) {
     trackerPromise = import('electron').then(({ powerMonitor }) => new SystemActivityTracker(powerMonitor));
   }
   const tracker = await trackerPromise;
-  return tracker.snapshot();
+  tracker.start();
+  return tracker;
+}
+
+export async function getSystemActivitySnapshot(): Promise<SystemActivitySnapshot> {
+  return (await getTracker()).snapshot();
+}
+
+/** Register authoritative OS events before starting CLI idle measurement.
+ * One process-wide tracker serves all runs; no per-run listeners or polling. */
+export async function getSystemActivityClock(): Promise<() => number> {
+  return (await getTracker()).awakeNow;
 }
