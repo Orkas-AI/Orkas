@@ -200,12 +200,17 @@ describe('avatar catalogs', () => {
       ['resources/builtin/marketplace/agents/5f890bd72ac4/agent.json', 'VoiceStudio', 'music', 'violet'],
       ['resources/builtin/marketplace/agents/814b61b027f0/agent.json', 'ImageStudio', 'image', 'violet'],
       ['resources/builtin/marketplace/agents/a19101ba698a/agent.json', 'OfficeWorker', 'briefcase', 'sky'],
-      ['resources/builtin/marketplace/agents/7e91cb9ec9e9/agent.json', 'PptMaker', 'presentation', 'violet'],
       ['resources/builtin/marketplace/agents/78900d8758bc/agent.json', 'DeepResearcher', 'search', 'sky'],
       ['resources/builtin/marketplace/agents/bcfcb4921dce/agent.json', 'UIDesigner', 'palette', 'violet'],
       ['resources/builtin/marketplace/agents/e064dca9e1bd/agent.json', 'SeoGeoAgent', 'target', 'gold'],
       ['resources/builtin/marketplace/agents/173d4235a431/agent.json', 'ContentWriter', 'document', 'lavender'],
       ['resources/builtin/marketplace/agents/a316881746f9/agent.json', 'ProductDeveloper', 'code', 'sage'],
+      ['resources/builtin/marketplace/agents/5a1d43c2f28a/agent.json', 'ECommerceResearcher', 'shopping-bag', 'lime'],
+      ['resources/builtin/marketplace/agents/7e91cb9ec9e9/agent.json', 'PptMaker', 'presentation', 'violet'],
+      ['resources/builtin/marketplace/agents/a4930d19ba6c/agent.json', 'ECommerceReviewer', 'shopping-bag', 'sky'],
+      ['resources/builtin/marketplace/agents/bc7e2a904d18/agent.json', 'ECommerceAnalyzer', 'shopping-bag', 'sky'],
+      ['resources/builtin/marketplace/agents/e0f3a98c624b/agent.json', 'ECommerceOperator', 'shopping-bag', 'lime'],
+      ['resources/builtin/marketplace/agents/fa3e1f2f9e07/agent.json', 'ECommerceWriter', 'shopping-bag', 'peach'],
     ] as const;
 
     const officialAgentFiles = [

@@ -277,6 +277,7 @@ describe('marketplace reconcile', () => {
             version: '1.0.0',
             published_at: 100,
             updated_at: 999,
+            agent_json_url: 'https://example.test/republished.json',
             agent_skills_bundle_url: 'https://example.test/private-v2.zip',
           }],
           total: 1,
@@ -285,6 +286,7 @@ describe('marketplace reconcile', () => {
       if (p === '/marketplace/skills/list') {
         return {
           list: [{
+            bundle_url: 'https://example.test/older.zip',
             id: 'skill-older',
             version: '0.9.0',
             published_at: 100,
@@ -322,12 +324,14 @@ describe('marketplace reconcile', () => {
     const manifest = await installs.readInstalls('u1');
     expect(manifest.agents[0]).toMatchObject({
       id: 'agent-private',
+      agent_json_url: 'https://example.test/agent.json',
       version: '1.0.0',
       updated_at: 100,
       agent_skills_bundle_url: 'https://example.test/private-v1.zip',
     });
     expect(manifest.skills[0]).toMatchObject({
       id: 'skill-older',
+      bundle_url: 'https://example.test/skill.zip',
       version: '1.0.0',
       updated_at: 100,
     });
@@ -1369,15 +1373,16 @@ describe('marketplace reconcile', () => {
       res.end('not found');
     });
     postJsonMock.mockImplementation(async (p: string, body: any) => {
-      if (p === '/marketplace/skills/bundle' && body?.id === 'dep-skill') {
-        return {
+      if (p === '/marketplace/skills/list' && body?.ids?.includes('dep-skill')) {
+        return { list: [{
+          id: 'dep-skill',
           bundle_url: `${base}/dep-skill.zip`,
           version: '1.0.0',
           published_at: 100,
           updated_at: 110,
           create_uid: '0',
           status: 'approved',
-        };
+        }], total: 1 };
       }
       throw new Error(`unexpected path ${p}`);
     });

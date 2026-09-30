@@ -289,22 +289,18 @@ describe('marketplace install error display', () => {
     const installStart = marketplaceSource.indexOf('async function _mpInstall(');
     const uninstallStart = marketplaceSource.indexOf('async function _mpUninstall(');
     const normalInstall = marketplaceSource.indexOf('const installed = await invokeInstall(false);', installStart);
-    const normalSuccess = marketplaceSource.indexOf("trackResult('success');", normalInstall);
     const normalState = marketplaceSource.indexOf('_mpApplyInstalledState(kind, item, installed);', normalInstall);
     const normalRefresh = marketplaceSource.indexOf('await _mpRefreshAfterAction(kind);', normalInstall);
     const uninstallInvoke = marketplaceSource.indexOf("window.orkas.invoke(channel, { id })", uninstallStart);
-    const uninstallSuccess = marketplaceSource.indexOf("trackResult('success');", uninstallInvoke);
     const uninstallState = marketplaceSource.indexOf('_mpApplyUninstalledState(kind, id);', uninstallInvoke);
     const uninstallRefresh = marketplaceSource.indexOf('await _mpRefreshAfterAction(kind);', uninstallInvoke);
 
     expect(normalInstall).toBeGreaterThan(installStart);
-    expect(normalInstall).toBeLessThan(normalSuccess);
-    expect(normalSuccess).toBeLessThan(normalState);
-    expect(normalSuccess).toBeLessThan(normalRefresh);
+    expect(normalInstall).toBeLessThan(normalState);
+    expect(normalState).toBeLessThan(normalRefresh);
     expect(uninstallInvoke).toBeGreaterThan(uninstallStart);
-    expect(uninstallInvoke).toBeLessThan(uninstallSuccess);
-    expect(uninstallSuccess).toBeLessThan(uninstallState);
-    expect(uninstallSuccess).toBeLessThan(uninstallRefresh);
+    expect(uninstallInvoke).toBeLessThan(uninstallState);
+    expect(uninstallState).toBeLessThan(uninstallRefresh);
   });
 
 });

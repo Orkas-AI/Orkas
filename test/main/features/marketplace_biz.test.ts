@@ -63,6 +63,11 @@ describe('marketplace category cache', () => {
     expect(list.map((entry) => entry.sort_order)).toEqual(
       [...list].map((entry) => entry.sort_order).sort((a, b) => a - b),
     );
+    for (const entry of list) {
+      for (const lang of ['ar', 'hi', 'th', 'tr', 'vi', 'zh-tw', 'pt-pt', 'es-419']) {
+        expect(entry[`name_${lang}` as keyof typeof entry], `${entry.code}/${lang}`).toBeTruthy();
+      }
+    }
     expect(runtime.fetchWithRetry).not.toHaveBeenCalled();
   });
 
@@ -139,6 +144,8 @@ describe('marketplace category cache', () => {
         name_en: 'Creation',
         name_es: 'Creación', name_fr: 'Création', name_ko: '창작',
         name_de: 'Kreation', name_ru: 'Творчество', name_it: 'Creazione',
+        name_ar: 'إبداع', name_hi: 'रचना', name_th: 'การสร้างสรรค์', name_tr: 'Yaratıcılık',
+        name_vi: 'Sáng tạo', 'name_zh-tw': '創作', 'name_pt-pt': 'Criação', 'name_es-419': 'Creación',
         sort_order: 40,
       },
       {
@@ -167,6 +174,8 @@ describe('marketplace category cache', () => {
     expect(list.find(entry => entry.code === 'creation')).toMatchObject({
       name_es: 'Creación', name_fr: 'Création', name_ko: '창작',
       name_de: 'Kreation', name_ru: 'Творчество', name_it: 'Creazione',
+        name_ar: 'إبداع', name_hi: 'रचना', name_th: 'การสร้างสรรค์', name_tr: 'Yaratıcılık',
+        name_vi: 'Sáng tạo', 'name_zh-tw': '創作', 'name_pt-pt': 'Criação', 'name_es-419': 'Creación',
     });
     expect(await marketplaceBiz.getMarketplaceCategories({ localOnly: true })).toEqual(list);
   });

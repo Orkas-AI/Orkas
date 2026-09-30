@@ -17,6 +17,7 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { app } from 'electron';
+import { Semaphore } from 'async-mutex';
 
 import {
   userMarketplaceAgentDir, userMarketplaceAgentSkillsDir, userMarketplaceSkillDir,
@@ -41,6 +42,7 @@ import { withMarketplaceInstallLock } from './marketplace_locks';
 import { agentPrivateSkillIdsFromBundle } from './marketplace_private_skills';
 import { downloadMarketplaceBundle, parseMarketplaceBundle } from './marketplace_bundle';
 import { createLogger } from '../logger';
+import { createMarketplaceCatalogReader, type MarketplaceCatalogReader, type MarketplaceCatalogRow } from './marketplace_catalog';
 import { fetchWithRetry } from '../util/retry';
 import { replaceDirectoryAtomically, sweepStaleReplacementArtifacts } from '../util/atomic-directory-replace';
 import {
@@ -53,6 +55,10 @@ import {
 
 const log = createLogger('marketplace_reconcile');
 const MARKETPLACE_AGENT_JSON_DOWNLOAD_TIMEOUT_MS = 60_000;
+const MAX_RECONCILE_JOBS = 4;
+// Shared across overlapping startup/sync passes. Dependencies run inside the
+// parent's slot; acquiring another slot there would deadlock four waiting agents.
+const reconcileSlots = new Semaphore(MAX_RECONCILE_JOBS);
 
 function _currentAppVersion(): string {
   try { return app.getVersion(); } catch { return ''; }
@@ -115,11 +121,18 @@ export interface ReconcileResult {
 }
 
 export interface MarketplaceReconcileOptions {
+  catalogReader?: MarketplaceCatalogReader;
   shouldContinue?: () => boolean;
   /** Skip network-heavy server catalog checks when a recent startup attempt already ran. */
   minIntervalMs?: number;
   /** Ignore `minIntervalMs`; used by explicit user actions and short retry loops. */
   force?: boolean;
+}
+
+interface ReconcilePassOptions extends MarketplaceReconcileOptions {
+  catalogReader: MarketplaceCatalogReader;
+  skillPulls: Map<string, Promise<boolean>>;
+  dependencies: Map<string, Promise<void>>;
 }
 
 interface ReconcileLocalState {
@@ -232,9 +245,10 @@ export async function checkServerUpdatesForInstalls(
   try {
     const agentIds = manifest.agents.map((a) => a.id).filter(Boolean);
     const skillIds = manifest.skills.map((s) => s.id).filter(Boolean);
+    const reader = opts.catalogReader || createMarketplaceCatalogReader(() => !opts.shouldContinue || opts.shouldContinue());
     [agentMap, skillMap] = await Promise.all([
-      agentIds.length ? _fetchServerCatalogMap('agents', agentIds) : Promise.resolve(new Map()),
-      skillIds.length ? _fetchServerCatalogMap('skills', skillIds) : Promise.resolve(new Map()),
+      agentIds.length ? _fetchServerCatalogMap('agents', agentIds, reader) : Promise.resolve(new Map()),
+      skillIds.length ? _fetchServerCatalogMap('skills', skillIds, reader) : Promise.resolve(new Map()),
     ]);
   } catch (err) {
     log.warn(`server-check fetch failed (offline?): ${(err as Error).message}`);
@@ -280,7 +294,7 @@ export async function checkServerUpdatesForInstalls(
         ...((contentUpgrade ? server.updated_at : a.updated_at) !== undefined
           ? { updated_at: contentUpgrade ? server.updated_at : a.updated_at }
           : {}),
-        agent_json_url: a.agent_json_url,
+        agent_json_url: contentUpgrade && server.agent_json_url ? server.agent_json_url : a.agent_json_url,
         ...(contentUpgrade && typeof server.agent_skills_bundle_url === 'string'
           ? { agent_skills_bundle_url: server.agent_skills_bundle_url }
           : (typeof a.agent_skills_bundle_url === 'string' ? { agent_skills_bundle_url: a.agent_skills_bundle_url } : {})),
@@ -333,7 +347,7 @@ export async function checkServerUpdatesForInstalls(
         ...((contentUpgrade ? server.updated_at : s.updated_at) !== undefined
           ? { updated_at: contentUpgrade ? server.updated_at : s.updated_at }
           : {}),
-        bundle_url: s.bundle_url,
+        bundle_url: contentUpgrade && server.bundle_url ? server.bundle_url : s.bundle_url,
         create_uid: s.create_uid,
         ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
         ...(typeof server.status === 'string' ? { status: server.status } : {}),
@@ -403,55 +417,48 @@ interface _CatalogRow {
   updated_at?: number;
   default_install?: boolean;
   status?: string;
+  agent_json_url?: string;
   agent_skills_bundle_url?: string;
+  bundle_url?: string;
   min_app_version?: string;
 }
 
-/** Paginate the public `/marketplace/{kind}/list` endpoint and collapse to (id → version + ts).
- *  The optional `ids` filter is supported by newer Servers. Older Servers ignore the extra body
- *  field, so we still page defensively; the client-side id set prevents unrelated rows from
- *  entering the update map. Page-size 100 × 20 pages = 2000 row cap. */
-async function _fetchServerCatalogMap(kind: 'agents' | 'skills', ids: string[]): Promise<Map<string, _CatalogRow>> {
+/** Normalize one pass's shared catalog for strict-version update checks. */
+async function _fetchServerCatalogMap(kind: 'agents' | 'skills', ids: string[], reader: MarketplaceCatalogReader): Promise<Map<string, _CatalogRow>> {
   const out = new Map<string, _CatalogRow>();
-  const PAGE_SIZE = 100;
-  const wanted = new Set(ids.filter(Boolean));
-  for (let page = 1; page <= 20; page++) {
-    const r = await postJson<{ list: Array<{ id?: string; version?: string; published_at?: number; updated_at?: number; default_install?: boolean | number; status?: string; state?: string; agent_skills_bundle_url?: string; min_app_version?: string; minAppVersion?: string }>; total?: number }>(
-      `/marketplace/${kind}/list`, { page, size: PAGE_SIZE, ids: [...wanted] },
-    );
-    const list = r.list || [];
-    for (const row of list) {
-      if (typeof row.id !== 'string' || !wanted.has(row.id)) continue;
-      if (typeof row.version === 'string' && typeof row.published_at === 'number'
-          && _isInstallRowVersionValid(row, kind === 'agents' ? 'agent' : 'skill')) {
-        out.set(row.id, {
-          version: row.version,
-          published_at: row.published_at,
-          ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
-          ...(typeof row.default_install === 'boolean' || typeof row.default_install === 'number'
-            ? { default_install: row.default_install === true || row.default_install === 1 }
-            : {}),
-          ...(typeof row.status === 'string' ? { status: row.status } : (
-            typeof row.state === 'string' ? { status: row.state } : {}
-          )),
-          ...(kind === 'agents' && typeof row.agent_skills_bundle_url === 'string'
-            ? { agent_skills_bundle_url: row.agent_skills_bundle_url }
-            : {}),
-          ...(_normalizeMinAppVersion(row) ? { min_app_version: _normalizeMinAppVersion(row) } : {}),
-        });
-      }
-    }
-    if (out.size >= wanted.size || list.length < PAGE_SIZE) break;
+  for (const row of (await reader.read(kind, ids)).values()) {
+    if (typeof row.version !== 'string' || typeof row.published_at !== 'number'
+        || !_isInstallRowVersionValid(row, kind === 'agents' ? 'agent' : 'skill')) continue;
+    out.set(row.id, {
+      version: row.version,
+      published_at: row.published_at,
+      ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
+      ...(typeof row.default_install === 'boolean' || typeof row.default_install === 'number'
+        ? { default_install: row.default_install === true || row.default_install === 1 } : {}),
+      ...(typeof row.status === 'string' ? { status: row.status } : (
+        typeof row.state === 'string' ? { status: row.state } : {}
+      )),
+      ...(typeof row.agent_json_url === 'string' ? { agent_json_url: row.agent_json_url } : {}),
+      ...(typeof row.agent_skills_bundle_url === 'string' ? { agent_skills_bundle_url: row.agent_skills_bundle_url } : {}),
+      ...(typeof row.bundle_url === 'string' ? { bundle_url: row.bundle_url } : {}),
+      ...(_normalizeMinAppVersion(row) ? { min_app_version: _normalizeMinAppVersion(row) } : {}),
+    });
   }
   return out;
 }
 
-/** Read manifest + reconcile every entry in parallel. Returns counts for logging. Emits status
+/** Read manifest + reconcile entries with bounded concurrency. Returns counts for logging. Emits status
  *  updates through the subscribe channel so the renderer can show a "syncing" banner. */
 export async function reconcileInstalls(
   uid: string,
-  opts: MarketplaceReconcileOptions = {},
+  options: MarketplaceReconcileOptions = {},
 ): Promise<ReconcileResult> {
+  const opts: ReconcilePassOptions = {
+    ...options,
+    catalogReader: options.catalogReader ?? createMarketplaceCatalogReader(options.shouldContinue),
+    skillPulls: new Map(),
+    dependencies: new Map(),
+  };
   try { _assertContinue(opts); } catch {
     return _emptyReconcileResult();
   }
@@ -539,32 +546,34 @@ export async function reconcileInstalls(
     });
   };
 
-  const agentTasks = agentsNeedingPull.map(async (row) => {
-    try {
-      _assertContinue(opts);
-      await _pullAgent(uid, row, opts);
-      pulled_agents++;
-      bumpProgress();
-    } catch (err) {
-      if (err instanceof ReconcileCancelled) return;
-      log.warn(`agent ${row.id} pull failed: ${(err as Error).message}`);
-      failed.push(`agent:${row.id}`);
+  const jobs = [
+    ...agentsNeedingPull.map(row => ({ kind: 'agent' as const, row })),
+    ...skillsNeedingPull.map(row => ({ kind: 'skill' as const, row })),
+  ];
+  let nextJob = 0;
+  await Promise.all(Array.from({ length: Math.min(MAX_RECONCILE_JOBS, total) }, async () => {
+    while (nextJob < jobs.length) {
+      if (opts.shouldContinue && !opts.shouldContinue()) return;
+      const job = jobs[nextJob++];
+      await reconcileSlots.runExclusive(async () => {
+        try {
+          _assertContinue(opts);
+          const pulled = job.kind === 'agent'
+            ? await _pullAgent(uid, job.row, opts)
+            : await _pullSkill(uid, job.row, opts);
+          if (pulled) {
+            if (job.kind === 'agent') pulled_agents++;
+            else pulled_skills++;
+            bumpProgress();
+          }
+        } catch (err) {
+          if (err instanceof ReconcileCancelled || (opts.shouldContinue && !opts.shouldContinue())) return;
+          log.warn(`${job.kind} ${job.row.id} pull failed: ${(err as Error).message}`);
+          failed.push(`${job.kind}:${job.row.id}`);
+        }
+      });
     }
-  });
-  const skillTasks = skillsNeedingPull.map(async (row) => {
-    try {
-      _assertContinue(opts);
-      await _pullSkill(uid, row, opts);
-      pulled_skills++;
-      bumpProgress();
-    } catch (err) {
-      if (err instanceof ReconcileCancelled) return;
-      log.warn(`skill ${row.id} pull failed: ${(err as Error).message}`);
-      failed.push(`skill:${row.id}`);
-    }
-  });
-
-  await Promise.all([...agentTasks, ...skillTasks]);
+  }));
 
   if (pulled_skills > 0) {
     try { clearSkillListCache(); } catch { /* list cache may not be loaded yet */ }
@@ -705,7 +714,7 @@ async function _reconcileLocalOnlyInstalls(
           version: meta.version,
           published_at: meta.published_at,
           ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
-          bundle_url: meta.bundle_url!,
+          bundle_url: meta.bundle_url,
           installed_at: meta.installed_at!,
           create_uid: meta.create_uid || '',
           ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
@@ -896,60 +905,94 @@ async function _ensureAgentSkillDependencies(
   uid: string,
   agentId: string,
   agentJson: Record<string, unknown>,
-  privateSkillIds: ReadonlySet<string> = new Set(),
-  opts: MarketplaceReconcileOptions = {},
+  privateSkillIds: ReadonlySet<string>,
+  opts: ReconcilePassOptions,
 ): Promise<void> {
   const skillList = _skillListFromAgentJson(agentJson)
-    .filter((skillId) => !privateSkillIds.has(skillId));
+    .filter((id) => !privateSkillIds.has(id) && (opts.dependencies.has(id) || !_skillDependencySatisfied(uid, id)));
   if (skillList.length === 0) return;
   const manifest = await readInstalls(uid);
   const manifestSkills = new Map(manifest.skills.map((s) => [s.id, s]));
+  const missingMetadata = skillList.filter(id => !opts.dependencies.has(id) && !manifestSkills.get(id)?.bundle_url);
+  // Resolve this agent's missing public dependencies together. Other agents share
+  // both the catalog snapshot and each dependency's install (including failures).
+  let metadata: Promise<Map<string, MarketplaceCatalogRow>> | undefined;
+  const readMetadata = () => metadata ??= opts.catalogReader.read('skills', missingMetadata);
   for (const skillId of skillList) {
     _assertContinue(opts);
-    if (_skillDependencySatisfied(uid, skillId)) continue;
-    let row = manifestSkills.get(skillId) || null;
-    if (row && _marketplaceStatus(row) && _marketplaceStatus(row) !== 'approved') {
-      throw new Error(`dependency skill ${skillId} is not approved (${_marketplaceStatus(row)})`);
+    let pending = opts.dependencies.get(skillId);
+    if (!pending) {
+      pending = _installDependencySkill(uid, skillId, readMetadata, opts);
+      opts.dependencies.set(skillId, pending);
     }
-    if (!row || !row.bundle_url) {
-      const meta = await postJson<{
-        bundle_url: string;
-        version: string;
-        published_at: number;
-        updated_at?: number;
-        create_uid?: string;
-        default_install?: boolean;
-        status?: string;
-        state?: string;
-        min_app_version?: string;
-        minAppVersion?: string;
-      }>('/marketplace/skills/bundle', { id: skillId });
+    await pending;
+    _assertContinue(opts);
+  }
+  log.info(`dependencies-ready for agent ${agentId}`);
+}
+
+async function _installDependencySkill(
+  uid: string,
+  skillId: string,
+  readMetadata: () => Promise<Map<string, MarketplaceCatalogRow>>,
+  opts: ReconcilePassOptions,
+): Promise<void> {
+  // Re-read under the same lock used by install/uninstall. Concurrent agents or
+  // passes must not reseed a dependency with a different installation clock.
+  const row = await withMarketplaceInstallLock(uid, 'skill', skillId, async () => {
+    _assertContinue(opts);
+    if (_skillDependencySatisfied(uid, skillId)) return null;
+    const manifest = await readInstalls(uid);
+    let current = manifest.skills.find(s => s.id === skillId);
+    if (current && _marketplaceStatus(current) && _marketplaceStatus(current) !== 'approved') {
+      throw new Error(`dependency skill ${skillId} is not approved (${_marketplaceStatus(current)})`);
+    }
+    if (!current?.bundle_url) {
+      let meta = (await readMetadata()).get(skillId);
+      _assertContinue(opts);
+      if (!meta) throw new Error(`dependency skill ${skillId} not found in marketplace`);
+      // Older servers do not return addresses in catalog rows. Explicitly empty
+      // addresses on current servers are not a reason for per-item lookups.
+      if (meta.bundle_url === undefined) {
+        meta = await postJson<MarketplaceCatalogRow>('/marketplace/skills/bundle', { id: skillId });
+        _assertContinue(opts);
+      }
+      if (meta.id && meta.id !== skillId) throw new Error(`dependency skill ${skillId} identity mismatch`);
       _assertApprovedDependencySkill(skillId, meta);
       const minAppVersion = _normalizeMinAppVersion(meta);
       if (!_isAppCompatible(minAppVersion)) {
         throw new Error(`dependency skill ${skillId} requires Orkas >= ${minAppVersion} (current ${_currentAppVersion() || 'unknown'})`);
       }
-      row = {
+      if (!parseSemver(meta.version)) throw new Error(`dependency skill ${skillId} has invalid marketplace version`);
+      if (!_hasDownloadUrl(meta.bundle_url)) throw new Error(`dependency skill ${skillId} missing bundle_url`);
+      if (current) {
+        _assertRefreshedVersion('skill', skillId, current.version, meta.version);
+        await _assertInstallCurrent(uid, 'skills', current);
+      }
+      current = {
         id: skillId,
-        version: meta.version || '1.0.0',
+        version: meta.version!,
         published_at: meta.published_at || 0,
         ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
-        bundle_url: meta.bundle_url || '',
-        installed_at: Date.now(),
+        bundle_url: meta.bundle_url,
+        installed_at: current?.installed_at || Date.now(),
         create_uid: meta.create_uid || '',
         ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
         ...((meta.status || meta.state) ? { status: meta.status || meta.state } : {}),
         ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
       };
-      if (!await addSkillInstall(uid, row, { mode: 'seed' })) throw new ReconcileCancelled();
-      manifestSkills.set(skillId, row);
+      if (!await addSkillInstall(uid, current, { mode: 'seed' })) throw new ReconcileCancelled();
     }
-    if (!row.bundle_url) throw new Error(`dependency skill ${skillId} missing bundle_url`);
-    await _pullSkill(uid, row, opts);
-    try { clearSkillListCache(); } catch { /* list cache may not be loaded yet */ }
-    try { invalidateCoreAgentSkills(); } catch { /* runner may not be loaded yet */ }
-    log.info(`dependency-installed skill ${skillId} for agent ${agentId}`);
+    return current;
+  });
+  if (!row) return;
+  if (!_isInstallRowVersionValid(row, 'skill') || !_isInstallRowAppCompatible(row, 'skill')) {
+    throw new Error(`dependency skill ${skillId} is not compatible`);
   }
+  // Release the metadata lock before joining the transfer's install lock.
+  await _pullSkill(uid, row, opts);
+  try { clearSkillListCache(); } catch { /* list cache may not be loaded yet */ }
+  try { invalidateCoreAgentSkills(); } catch { /* runner may not be loaded yet */ }
 }
 
 function _resourceSyncBlocksServerPull(dir: string): boolean {
@@ -1132,12 +1175,17 @@ async function _assertInstallCurrent(uid: string, kind: 'agents' | 'skills', row
 
 /** Fetch agent.json from the cloud URL recorded in the manifest, write to the per-machine
  *  install target. Wipe-and-replace so a previous version doesn't leave stale fields. */
-async function _pullAgent(uid: string, row: AgentInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
-  return withMarketplaceInstallLock(uid, 'agent', row.id, async () => _pullAgentLocked(uid, row, opts));
+async function _pullAgent(uid: string, row: AgentInstall, opts: ReconcilePassOptions): Promise<boolean> {
+  return withMarketplaceInstallLock(uid, 'agent', row.id, async () => {
+    _assertContinue(opts);
+    await _assertInstallCurrent(uid, 'agents', row);
+    if (!_agentNeedsPull(uid, row)) return false;
+    await _pullAgentLocked(uid, row, opts);
+    return true;
+  });
 }
 
-async function _pullAgentLocked(uid: string, row: AgentInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
-  await _assertInstallCurrent(uid, 'agents', row);
+async function _pullAgentLocked(uid: string, row: AgentInstall, opts: ReconcilePassOptions): Promise<void> {
   let current = row;
   _assertContinue(opts);
   let res = _hasDownloadUrl(current.agent_json_url)
@@ -1244,12 +1292,25 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
 /** Fetch the skill bundle zip from cloud URL + extract. Same wipe-and-replace semantics.
  *  `extractBundleSafely` enforces entry count + uncompressed size caps (zip-bomb defense)
  *  — shared with the marketplace install path. */
-async function _pullSkill(uid: string, row: SkillInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
-  return withMarketplaceInstallLock(uid, 'skill', row.id, async () => _pullSkillLocked(uid, row, opts));
+async function _pullSkill(uid: string, row: SkillInstall, opts: ReconcilePassOptions): Promise<boolean> {
+  const key = JSON.stringify([row.id, row.version, row.installed_at]);
+  let pending = opts.skillPulls.get(key);
+  if (!pending) {
+    pending = withMarketplaceInstallLock(uid, 'skill', row.id, async () => {
+      _assertContinue(opts);
+      await _assertInstallCurrent(uid, 'skills', row);
+      if (!_skillNeedsPull(uid, row)) return false;
+      await _pullSkillLocked(uid, row, opts);
+      return true;
+    });
+    // Keep rejected results for this pass too: four dependent agents must not
+    // each exhaust the same failing download's retry budget.
+    opts.skillPulls.set(key, pending);
+  }
+  return pending;
 }
 
-async function _pullSkillLocked(uid: string, row: SkillInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
-  await _assertInstallCurrent(uid, 'skills', row);
+async function _pullSkillLocked(uid: string, row: SkillInstall, opts: MarketplaceReconcileOptions): Promise<void> {
   let current = row;
   _assertContinue(opts);
   let downloaded = _hasDownloadUrl(current.bundle_url)

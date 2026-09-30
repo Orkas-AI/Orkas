@@ -20,7 +20,7 @@ beforeEach(async () => {
 afterEach(() => {
   if (previousWorkspaceRoot === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = previousWorkspaceRoot;
-  fs.rmSync(tempDir, { recursive: true, force: true });
+  fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 describe('marketplace content cache', () => {

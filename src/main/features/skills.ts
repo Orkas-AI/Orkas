@@ -133,8 +133,8 @@ export interface SkillListing {
   source: SkillSource;
   description_zh: string;
   description_en: string;
-  /** Marketplace category code. Empty string when the SKILL.md frontmatter doesn't set one —
-   *  UI treats that as "uncategorized". */
+  /** Marketplace category code. `_meta.json` is authoritative; legacy
+   *  frontmatter remains a fallback. Empty values render as "uncategorized". */
   category: string;
   /** **Computed at load time, not persisted.** Filled by `listSkills` from
    *  `features/component_enabled.ts`. Defaults to true unless the user has
