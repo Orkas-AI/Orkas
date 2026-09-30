@@ -261,6 +261,26 @@ describe('project delete navigation', () => {
 });
 
 describe('project create navigation', () => {
+  it('paints the local project shell without a network-style loading animation', () => {
+    const context = loadProjectsRenderer({ afterProjects: [], afterConversations: [] });
+    context.__setProjectsCache([{ project_id: 'p-local', name: 'Local project' }]);
+    const classes = new Set<string>();
+    const attributes = new Map<string, string>();
+    const title = { textContent: '' };
+    const content = {
+      classList: { add: (name: string) => classes.add(name) },
+      setAttribute: (name: string, value: string) => attributes.set(name, value),
+    };
+    context.document.getElementById = (id: string) => id === 'project-detail-title'
+      ? title : id === 'project-detail-content' ? content : null;
+
+    context.primeProjectDetailShell('p-local');
+
+    expect(title.textContent).toBe('Local project');
+    expect(attributes.get('aria-busy')).toBe('true');
+    expect(classes.has('is-loading')).toBe(false);
+  });
+
   it('keeps the last successful project list when a background refresh fails', async () => {
     const cached = [{ project_id: 'p-existing', name: 'Alpha', conv_count: 0 }];
     const context = loadProjectsRenderer({

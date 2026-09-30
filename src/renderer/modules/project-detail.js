@@ -4551,6 +4551,10 @@ function _initProjectDetailBindings() {
     e.stopPropagation();
     _openAddPicker();
   });
+  document.getElementById('project-action-invite')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    void _showProjectMemberInviteGate();
+  });
   document.getElementById('project-action-rename')?.addEventListener('mousedown', (e) => {
     if (_isProjectDetailRenameMode()) e.preventDefault();
   });

@@ -19033,27 +19033,6 @@ html[dir="rtl"] :is(pre, code, input[type="email"], input[type="url"]) {
 html[dir="rtl"] .ai-select-item-label { unicode-bidi: plaintext; text-align: start; }
 html[dir="rtl"] .sidebar-search-label { text-align: start; }
 
-.project-detail-content.is-loading .project-detail-header {
-  position: relative;
-}
-
-.project-detail-content.is-loading .project-detail-header::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -1px;
-  height: 2px;
-  background: linear-gradient(90deg, transparent, var(--primary), transparent);
-  animation: project-detail-loading-slide 1.1s ease-in-out infinite;
-}
-
-@keyframes project-detail-loading-slide {
-  0% { transform: scaleX(0.08); opacity: 0.35; }
-  50% { transform: scaleX(0.72); opacity: 0.9; }
-  100% { transform: scaleX(0.08); opacity: 0.35; }
-}
-
 .chat-input-area.is-project .chat-rich-editor {
   min-height: 64px;
   max-height: 220px;

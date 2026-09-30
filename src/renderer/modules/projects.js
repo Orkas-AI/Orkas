@@ -354,7 +354,6 @@ function primeProjectDetailShell(pid) {
   if (title) title.textContent = project?.name || '';
   if (typeof _refreshUnreadTaskIndicators === 'function') _refreshUnreadTaskIndicators(pid);
   if (content) {
-    content.classList.add('is-loading');
     content.setAttribute('aria-busy', 'true');
   }
 }

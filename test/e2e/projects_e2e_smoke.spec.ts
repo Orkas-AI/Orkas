@@ -64,26 +64,62 @@ async function createProject(orkas: OrkasTestApp, name: string): Promise<void> {
 }
 
 test.describe('projects', () => {
-  test('keeps member invitation visible as a commercial download guide', async ({ orkas }) => {
+  test('keeps member invitation visible as a commercial download guide', async ({ orkas }, testInfo) => {
     const projectName = 'E2E Invite Guide';
-    await createProject(orkas, projectName);
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;
+    const rendererRequests: string[] = [];
+    page.on('request', request => {
+      const url = new URL(request.url());
+      if (url.protocol === 'http:' || url.protocol === 'https:') rendererRequests.push(url.origin + url.pathname);
+    });
+    await orkas.electronApp!.evaluate(({ shell, net }) => {
+      const root = globalThis as any;
+      root.__projectInviteExternalUrls = [];
+      root.__projectEntryRequests = [];
+      shell.openExternal = async (url: string) => { root.__projectInviteExternalUrls.push(url); };
+      for (const owner of [root, net]) {
+        const original = owner.fetch;
+        owner.fetch = function (input: any, ...args: any[]) {
+          const url = new URL(typeof input === 'string' ? input : input.url || String(input));
+          root.__projectEntryRequests.push(url.origin + url.pathname);
+          return original.call(this, input, ...args);
+        };
+      }
+    });
+    await createProject(orkas, projectName);
+    await expect(page.locator('#project-detail-content')).toHaveAttribute('aria-busy', 'false');
+    await expect(page.locator('#project-detail-content')).not.toHaveClass(/\bis-loading\b/);
+    expect(await page.locator('#panel-project .project-detail-header').evaluate(header =>
+      getComputedStyle(header, '::after').animationName)).toBe('none');
     const row = page.locator('.project-row', {
       has: page.locator('.project-name', { hasText: projectName }),
     });
+    const guidance = await page.evaluate(() => (globalThis as any).t('project.invite_members.commercial_only'));
+    const inviteLabel = await page.evaluate(() => (globalThis as any).t('project.menu.invite_members'));
+    const headerInvite = page.locator('#panel-project .project-detail-actions').getByRole('button', { name: inviteLabel, exact: true });
+    await expect(headerInvite).toBeVisible();
+    await page.locator('#panel-project').screenshot({ path: testInfo.outputPath('project-member-invite-entry.png') });
+    const cancelGuide = async () => {
+      const dialog = page.locator('.ui-dialog-overlay:visible');
+      await expect(dialog.locator('.ui-dialog-message')).toHaveText(guidance);
+      await expect(dialog.locator('[data-act="ok"]')).toBeVisible();
+      await dialog.locator('[data-act="cancel"]').click();
+      await expect(page.locator('.ui-dialog-overlay:visible')).toHaveCount(0);
+      expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__projectInviteExternalUrls)).toEqual([]);
+      expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__projectEntryRequests)).toEqual([]);
+      expect(rendererRequests).toEqual([]);
+      await expect(page.locator('#project-detail-title')).toHaveText(projectName);
+      await expect(row).toHaveCount(1);
+    };
+    await headerInvite.click();
+    await cancelGuide();
     await row.hover();
     await row.locator('[data-project-menu]').click();
     const invite = page.locator('#project-row-menu [data-action="invite-members"]');
     await expect(invite).toBeVisible();
     await invite.click();
-    const dialog = page.locator('.ui-dialog-overlay:visible');
-    const guidance = await page.evaluate(() => (globalThis as any).t('project.invite_members.commercial_only'));
-    await expect(dialog.locator('.ui-dialog-message')).toHaveText(guidance);
-    await expect(dialog.locator('[data-act="ok"]')).toBeVisible();
-    await dialog.locator('[data-act="cancel"]').click();
-    await expect(page.locator('.ui-dialog-overlay:visible')).toHaveCount(0);
-    await expect(row).toHaveCount(1);
+    await cancelGuide();
   });
 
   test('creates a project and keeps it after an app relaunch', async ({ orkas }) => {
