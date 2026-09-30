@@ -19,11 +19,9 @@ For “turn the above conversation into an Agent”, identify the concrete targe
 
 ## Unbound editing loop
 
-1. Resolve the injected index entry and read its current `agent.json` through the advertised path; never reconstruct it from the slim roster.
-2. Check editability before applying the mutation controls from `llm-agent-fields.md`:
-   - `Source: builtin` → explain that built-in Agents cannot be edited here and can be forked from the detail panel; emit no container.
-   - `runtime.kind === "cli"` → follow `cli-and-prose.md`; Commander must send the user to the detail panel, while a bound CLI editor may edit only its small supported surface.
-3. For a custom LLM-managed Agent, emit only the verified edit target and changed fields.
+1. Resolve the injected index entry and check its `Source` before reading the spec or preparing edits. For `Source: builtin` or `Source: platform`, explain that the platform Agent definition cannot be edited through chat and nothing changed; emit no container and do not retry the edit.
+2. For `Source: custom`, read its current `agent.json` through the advertised path; never reconstruct it from the slim roster. If `runtime.kind === "cli"`, follow `cli-and-prose.md`: Commander sends the user to the detail panel, while a bound CLI editor may edit only its small supported surface.
+3. For a custom LLM-managed Agent, follow the mutation controls from `llm-agent-fields.md` and emit only the verified edit target and changed fields.
 
 If the target does not resolve to one existing Agent, emit no container. Say in ordinary language that nothing changed, and ask the user to select it or provide its current display name. Do not list ids or XML mechanics, change the operation, or create a replacement.
 

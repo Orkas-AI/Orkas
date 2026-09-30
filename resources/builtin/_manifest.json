@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "85d12c52d7415a07da70df23cf422dc950f2d8f6d8a3f6a25cb66e4af0d3a8e6",
+  "content_tree_sha256": "96453a1993464fe6a30f4f579f41b295c3ebe17be2040ddf065db53d34b2d456",
   "files": [
     {
       "path": "marketplace/agents/1040b336306f/agent.json",
@@ -844,8 +844,8 @@
     },
     {
       "path": "marketplace/skills/272355bc883d/_meta.json",
-      "bytes": 96,
-      "sha256": "6573bc20d2a77b6f4d893c44149e51356d1042a21b2ab018197ec8ec030b0e53"
+      "bytes": 97,
+      "sha256": "4321d18da7465e3a3fe83c578cba1498ce0ec094ce2228b54b9a5032c7ee87b9"
     },
     {
       "path": "marketplace/skills/272355bc883d/references/amazon-market-research.md",
@@ -874,8 +874,8 @@
     },
     {
       "path": "marketplace/skills/272355bc883d/SKILL.md",
-      "bytes": 4231,
-      "sha256": "76017b6c9fadde9a4129768253a04c5d75ee7a71f36a34ed3a674a8985b9afd6"
+      "bytes": 4211,
+      "sha256": "1aaab51d876312f8e25dd2dc9fdeadc3c178ec4e5b8fddaee75f191b817455bd"
     },
     {
       "path": "marketplace/skills/36bd44ae956c/_meta.json",
@@ -889,8 +889,8 @@
     },
     {
       "path": "marketplace/skills/59d186285161/_meta.json",
-      "bytes": 99,
-      "sha256": "7b8e1814e60855d95d136031baa2cbfb0a5d187bbb93a67fe2b2af88d105e7b0"
+      "bytes": 96,
+      "sha256": "45f76509f3bb86f53f083d8ad830acc03c208edd66dc88da18c55fd727f402bf"
     },
     {
       "path": "marketplace/skills/59d186285161/references/creative-compliance.md",
@@ -929,8 +929,8 @@
     },
     {
       "path": "marketplace/skills/59d186285161/SKILL.md",
-      "bytes": 1856,
-      "sha256": "c3c977d1ce61f16f83d7596abe6f27567cff98c93a8c2e102107bfe0f0472a2e"
+      "bytes": 1836,
+      "sha256": "1ee94e362212e7a97e7444f15e47d1721def9806f4c1f834e1f28f08482773da"
     },
     {
       "path": "marketplace/skills/6743aa0797a2/_meta.json",
@@ -1190,7 +1190,7 @@
     {
       "path": "marketplace/skills/c91a84e7b206/_meta.json",
       "bytes": 96,
-      "sha256": "9b388284994dc1f7a0369074903320011f33b4f439934f3a396601312489f646"
+      "sha256": "ca67877b5b5dcddcbf800bfe2fb859625ca273a3aa3c1d765b5650a4a59b7d56"
     },
     {
       "path": "marketplace/skills/c91a84e7b206/references/channel-mapping.md",
@@ -1204,13 +1204,13 @@
     },
     {
       "path": "marketplace/skills/c91a84e7b206/SKILL.md",
-      "bytes": 1768,
-      "sha256": "a65e33f2bb7e3072e6f4e73f718d1277cc488a718438778716b5752da2bd3afe"
+      "bytes": 1748,
+      "sha256": "540164aeaef1206eb5b72f36febd464175245c09f9c9bcc6a90d287b2cbe24e8"
     },
     {
       "path": "marketplace/skills/d47b20f9a631/_meta.json",
       "bytes": 96,
-      "sha256": "36cb5682f92c8d2100d3905f86ce551015e353accec5c66d896e563cef2ec502"
+      "sha256": "dc8833f6a5afe6db4140ade3790cc6eac1c5fbd1e0bc342c82e9f64bc3878874"
     },
     {
       "path": "marketplace/skills/d47b20f9a631/references/changes.md",
@@ -1219,13 +1219,13 @@
     },
     {
       "path": "marketplace/skills/d47b20f9a631/SKILL.md",
-      "bytes": 1937,
-      "sha256": "a1ccb3cc8088c7ff4bde2568eb858dd918a5e5f353f8f992e8d7de47de8704ed"
+      "bytes": 1917,
+      "sha256": "3e207cc03212bb4c98d5cf47aaddef462505a2335caa5a0cf2e2309b6df6162f"
     },
     {
       "path": "marketplace/skills/de52c67d49dd/_meta.json",
       "bytes": 97,
-      "sha256": "718b3b18cd4b62692d0fe00e040dd2046a7bb7a52c57309b0e13d92c39b40be0"
+      "sha256": "b2089c602f58b8e06298888745f92eac222703200a751d956189f0789ff59970"
     },
     {
       "path": "marketplace/skills/de52c67d49dd/references/amazon-listing-and-a-plus.md",
@@ -1264,8 +1264,8 @@
     },
     {
       "path": "marketplace/skills/de52c67d49dd/SKILL.md",
-      "bytes": 1546,
-      "sha256": "abeaa45ef62e9ada863f19d14f11033f1b184ed7849748835ea58eda3bc2a3b5"
+      "bytes": 1653,
+      "sha256": "3f2f2123cc315e598f89f7c8ed986e0f3d5c25047dea1459fd2c4341752e6256"
     },
     {
       "path": "marketplace/skills/e7f5c0e6f1be/_meta.json",
@@ -1320,7 +1320,7 @@
     {
       "path": "marketplace/skills/e8868f762c1d/_meta.json",
       "bytes": 96,
-      "sha256": "63f70c030c4cac08709c1cd798952d80cc7a94889aae7588e84c4bcad81277f5"
+      "sha256": "0470dcb0a1a8f3b7bd5a5ac30951e9a296582b99e01c666e9d51cde9b7e7034f"
     },
     {
       "path": "marketplace/skills/e8868f762c1d/references/review-data-privacy.md",
@@ -1344,8 +1344,8 @@
     },
     {
       "path": "marketplace/skills/e8868f762c1d/SKILL.md",
-      "bytes": 1619,
-      "sha256": "19e232cf38a542a9a0b6822c08f7884962f708c2d68aa69fc797e9caea0d3c62"
+      "bytes": 1599,
+      "sha256": "3d130c8974d15e1581a13391a7ef35d7d4fc8390bf927fdf881026f280264f92"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/_meta.json",
@@ -1770,7 +1770,7 @@
     {
       "path": "system/skills/_system.json",
       "bytes": 273,
-      "sha256": "fa87ccfc5f1efb3fe44fd71966f52948a3846ed8bae69aa72941d842fb612afb"
+      "sha256": "91a655ad1916b2d18e6883bac95da634dd550d9e3f3bea7fccf7cdb9af40155e"
     },
     {
       "path": "system/skills/agent-creator/references/cli-and-prose.md",
@@ -1784,8 +1784,8 @@
     },
     {
       "path": "system/skills/agent-creator/references/source-and-editing.md",
-      "bytes": 3193,
-      "sha256": "7a114a05d1e6b91d6f755050b6306dca0911a5944e9043a2a40ee5a0d784d5c1"
+      "bytes": 3291,
+      "sha256": "ebeac82549a40efdbaec53df941690742b43f287cd9ac8647c387c1b9fcbd7b3"
     },
     {
       "path": "system/skills/agent-creator/SKILL.md",
@@ -1819,8 +1819,8 @@
     },
     {
       "path": "system/skills/skill-creator/SKILL.md",
-      "bytes": 7384,
-      "sha256": "86924baa2ea6b48b83299f711b2b34d1e323f5aa601d0ad05c4da7a52572032f"
+      "bytes": 7594,
+      "sha256": "c1fe0da9045f469d9bf495fe12babd116cfeca8e44e40bb9d60967ea0f3d29f3"
     },
     {
       "path": "system/skills/web-app-sdk/assets/starter/index.html",
@@ -1847,7 +1847,7 @@
     "system_skills": [
       {
         "id": "agent-creator",
-        "update_at": 1789463573592
+        "update_at": 1790685144182
       },
       {
         "id": "package-installer",
@@ -1855,7 +1855,7 @@
       },
       {
         "id": "skill-creator",
-        "update_at": 1789705002665
+        "update_at": 1790685144182
       },
       {
         "id": "web-app-sdk",
@@ -2202,8 +2202,8 @@
       {
         "id": "272355bc883d",
         "name": "ecommerce-product-research",
-        "version": "1.1.9",
-        "updated_at": "2026-09-16T13:18:00.000Z"
+        "version": "1.1.10",
+        "updated_at": "2026-09-22T06:13:54.000Z"
       },
       {
         "id": "36bd44ae956c",
@@ -2214,8 +2214,8 @@
       {
         "id": "59d186285161",
         "name": "ecommerce-creative",
-        "version": "1.1.5",
-        "updated_at": "2026-09-15T11:49:34.911624Z"
+        "version": "1.1.6",
+        "updated_at": "2026-09-22T06:13:54.000Z"
       },
       {
         "id": "6743aa0797a2",
@@ -2268,20 +2268,20 @@
       {
         "id": "c91a84e7b206",
         "name": "ecommerce-analytics",
-        "version": "1.0.1",
-        "updated_at": "2026-09-12T03:21:47.770Z"
+        "version": "1.0.2",
+        "updated_at": "2026-09-22T06:13:54.000Z"
       },
       {
         "id": "d47b20f9a631",
         "name": "ecommerce-operations",
-        "version": "1.0.3",
-        "updated_at": "2026-09-12T03:32:09.066Z"
+        "version": "1.0.4",
+        "updated_at": "2026-09-22T06:13:54.000Z"
       },
       {
         "id": "de52c67d49dd",
         "name": "ecommerce-listing",
-        "version": "1.2.15",
-        "updated_at": "2026-09-17T02:52:44.766Z"
+        "version": "1.2.17",
+        "updated_at": "2026-09-22T06:34:08.000Z"
       },
       {
         "id": "e7f5c0e6f1be",
@@ -2292,8 +2292,8 @@
       {
         "id": "e8868f762c1d",
         "name": "ecommerce-review-analysis",
-        "version": "1.1.3",
-        "updated_at": "2026-09-12T04:42:13.015Z"
+        "version": "1.1.4",
+        "updated_at": "2026-09-22T06:13:54.000Z"
       },
       {
         "id": "ee99fbb42964",
