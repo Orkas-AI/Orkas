@@ -474,7 +474,7 @@ describe('connector catalog', () => {
       ]) },
     });
     expect(catalog.findCatalogEntry('amazon-seller-central')).toMatchObject({
-      description_en: expect.stringContaining('Buyer PII and RDT operations are not requested'),
+      description_en: expect.stringContaining('required business roles'),
       connection_setup: { fields: expect.arrayContaining([
         expect.objectContaining({ key: 'marketplace_id', storage: 'metadata', format: 'amazon_marketplace' }),
         expect.objectContaining({ key: 'seller_id', storage: 'metadata', format: 'amazon_seller_id' }),
@@ -482,6 +482,10 @@ describe('connector catalog', () => {
         expect.objectContaining({ key: 'refresh_token', input: 'secret', storage: 'credential', format: 'amazon_refresh_token' }),
       ]) },
     });
+    expect(catalog.findCatalogEntry('amazon-seller-central')?.connection_setup?.instructions_en)
+      .toContain('Order contacts require Amazon-approved roles');
+    expect(catalog.findCatalogEntry('amazon-seller-central')?.connection_setup?.instructions_en)
+      .toContain('additional RDT and grantless authorization workflows are excluded');
     expect(catalog.findCatalogEntry('amazon-seller-central')?.connection_setup?.fields
       .find((field) => field.key === 'marketplace_id')?.options).toHaveLength(23);
     expect(catalog.findCatalogEntry('mercado-libre-global-selling')).toMatchObject({
@@ -573,7 +577,21 @@ describe('connector catalog', () => {
         oauth_header_key: 'Authorization',
       },
     });
-    expect(paypal?.allowed_tools).toHaveLength(30);
+    expect(paypal?.allowed_tools).toHaveLength(46);
+    expect(paypal?.allowed_tools).not.toContain('update_product');
+    const additions = {
+      activate_recurring_series: 'H', cancel_invoice_auto_reminder: 'D',
+      cancel_recurring_series: 'D', create_conditional_rules_for_invoice: 'H',
+      create_recurring_series: 'W', delete_invoice: 'D', delete_recurring_series: 'D',
+      generate_invoice_number: 'W', get_merchant_insights: 'R', get_recurring_series: 'R',
+      record_payment_for_invoice: 'H', record_refund_for_invoice: 'H', search_invoicing: 'R',
+      setup_invoice_auto_reminders: 'H', update_invoice_auto_reminder: 'H',
+      update_invoicing: 'H', update_shipment_tracking: 'H',
+    };
+    for (const [name, risk] of Object.entries(additions)) {
+      expect(paypal?.allowed_tools).toContain(name);
+      expect(paypal?.tool_policies?.[name]?.risk).toBe(risk);
+    }
     expect(paypal?.allowed_tools).toEqual(expect.arrayContaining([
       'create_invoice',
       'pay_order',
@@ -606,8 +624,11 @@ describe('connector catalog', () => {
         url: 'https://mcp.sandbox.paypal.com/http',
       },
     });
-    expect(paypalSandbox?.allowed_tools).toEqual(paypal?.allowed_tools);
-    expect(paypalSandbox?.tool_policies).toEqual(paypal?.tool_policies);
+    expect(paypalSandbox?.allowed_tools).toEqual(paypal?.allowed_tools?.filter(name => name !== 'get_merchant_insights'));
+    expect(paypalSandbox?.allowed_tools).toHaveLength(45);
+    expect(paypalSandbox?.tool_policies).toEqual(Object.fromEntries(
+      Object.entries(paypal?.tool_policies || {}).filter(([name]) => name !== 'get_merchant_insights'),
+    ));
 
     const netsuite = catalog.findCatalogEntry('netsuite');
     expect(netsuite).toMatchObject({
@@ -655,7 +676,6 @@ describe('connector catalog', () => {
       return createHash('sha256').update(JSON.stringify(sorted)).digest('hex');
     };
     expect(policyHash(klaviyo)).toBe('594e57c7b0db79d1b027bd44dfa79bdbff7c8ac37a780cb11da9792c4f67a01b');
-    expect(policyHash(paypal)).toBe('e89b829d33d7f1dae254bf427a62fe2b1a60eca348fe40ea3476f86da7efc9b6');
 
     for (const [entry, hash] of [
       [klaviyo, '482faf16fa2b3b994b189126789c060c271491df4b1f473ff85917fa092ccc92'],

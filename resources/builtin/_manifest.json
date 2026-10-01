@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "96453a1993464fe6a30f4f579f41b295c3ebe17be2040ddf065db53d34b2d456",
+  "content_tree_sha256": "4dfcacd597ff853dc030ee0cd22c8497709c56a7cd11796833cfdd1e303fcb68",
   "files": [
     {
       "path": "marketplace/agents/1040b336306f/agent.json",
@@ -1770,7 +1770,7 @@
     {
       "path": "system/skills/_system.json",
       "bytes": 273,
-      "sha256": "91a655ad1916b2d18e6883bac95da634dd550d9e3f3bea7fccf7cdb9af40155e"
+      "sha256": "49902deb542035fe5932f425b439d3ce3d9722e852625cbf089d334da32a7e11"
     },
     {
       "path": "system/skills/agent-creator/references/cli-and-prose.md",
@@ -1834,8 +1834,8 @@
     },
     {
       "path": "system/skills/web-app-sdk/references/api.json",
-      "bytes": 17541,
-      "sha256": "6f7605ad0dfaf979378dbe70f35dd462e38be579d50d29f43504d3376dac9b1c"
+      "bytes": 17662,
+      "sha256": "74a8070aaa86a006d503d2dc20ca8469350dcae849e06c9e6e27e0098fdeee5d"
     },
     {
       "path": "system/skills/web-app-sdk/SKILL.md",
@@ -1859,7 +1859,7 @@
       },
       {
         "id": "web-app-sdk",
-        "update_at": 1789990251573
+        "update_at": 1790779866006
       }
     ],
     "marketplace_agents": [

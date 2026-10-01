@@ -8,7 +8,7 @@ exports.description = "Control task Browser tabs shared with the user, including
 exports.shape = (z) => ({
   operation: z.enum(["tabs","open","navigate","observe","act","wait","close","retain"])
     .describe("30 tabs/task; reuse via navigate. open evicts oldest inactive model tab at capacity. tabs: IDs; observe: act refs."),
-  tab_id: z.string().regex(new RegExp("^[0-9a-f]{12}$")).optional()
+  tab_id: z.string().regex(new RegExp("^[0-9a-f]{12}$"), 'must contain exactly 12 lowercase hexadecimal characters').optional()
     .describe("ID from tabs/open/observe; defaults to active. Required for close/retain."),
   retention: z.enum(["deliverable","handoff","temporary"]).optional()
     .describe("temporary closes at turn end; deliverable/handoff prevent eviction. Unmarked survives turns, allows eviction. Latest wins. Re-observe after handoff."),
@@ -20,7 +20,7 @@ exports.shape = (z) => ({
     .describe("navigate: goto needs url; others use history."),
   page_id: z.string().min(1).max(64).optional()
     .describe("act: current observe page_id. Page changes invalidate it."),
-  element_ref: z.string().regex(new RegExp("^e[1-9][0-9]*$")).max(16).optional()
+  element_ref: z.string().regex(new RegExp("^e[1-9][0-9]*$"), 'must be "e" followed by a positive integer without leading zeros').max(16).optional()
     .describe("Exact current observe ref; required except scroll."),
   page_action: z.enum(["click","fill","select","check","uncheck","scroll","drag"]).optional()
     .describe("act: never retry a manual handback."),

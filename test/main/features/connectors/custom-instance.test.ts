@@ -187,6 +187,44 @@ describe('connectors/manager › addCustomInstance', () => {
     await expect(manager.authorizeCustomInstance(TEST_UID, instance.id)).rejects.toThrow('HTTP 403');
   });
 
+  it('keeps a new authorization when an older refresh finishes afterward', async () => {
+    const transports: Array<{ headers?: Record<string, string> }> = [];
+    mockMcpClient({ onTransport: transport => transports.push(transport as { headers?: Record<string, string> }) });
+    const grant = (token: string) => ({ access_token: token, refresh_token: `${token}-refresh`,
+      expires_at: Date.now() + 3600_000, scopes: [], token_type: 'Bearer' });
+    const client = (id: string) => ({ client_id: id, token_endpoint: 'https://auth.example/token',
+      authorization_endpoint: 'https://auth.example/authorize', resource: 'https://mcp.example/mcp' });
+    let finishAuthorization!: (value: unknown) => void;
+    let finishRefresh!: (value: unknown) => void;
+    const start = vi.fn().mockResolvedValueOnce({ grant: grant('old'), client: client('old-client') })
+      .mockImplementationOnce(() => new Promise(resolve => { finishAuthorization = resolve; }));
+    const refresh = vi.fn(async (_client, current) => current.expires_at > Date.now() ? current
+      : new Promise(resolve => { finishRefresh = resolve; }));
+    vi.doMock('../../../../src/main/features/connectors/oauth-dcr', async importOriginal => ({
+      ...await importOriginal<typeof import('../../../../src/main/features/connectors/oauth-dcr')>(),
+      startCustomMcpOAuth: start, refreshDcrIfStale: refresh,
+    }));
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const instance = await manager.addCustomInstance(TEST_UID, { display_name: 'Rotating', auth_mode: 'oauth',
+      transport: { kind: 'streamable-http', url: 'https://mcp.example/mcp' } });
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    await registry.update(TEST_UID, instance.id, current => ({ ...current,
+      oauth_grant: { ...current.oauth_grant!, expires_at: Date.now() - 1 } }));
+    const authorization = manager.authorizeCustomInstance(TEST_UID, instance.id);
+    await vi.waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+    const refreshing = manager.refreshTools(TEST_UID, instance.id);
+    await vi.waitFor(() => expect(finishRefresh).toBeTypeOf('function'));
+    finishAuthorization({ grant: grant('new-authorization'), client: client('new-client') });
+    await vi.waitFor(() => expect(registry.load(TEST_UID).connections[instance.id]?.oauth_grant?.access_token).toBe('new-authorization'));
+    finishRefresh(grant('stale-refresh'));
+    await Promise.all([authorization, refreshing]);
+    expect(registry.load(TEST_UID).connections[instance.id]).toMatchObject({
+      oauth_grant: { access_token: 'new-authorization' }, dcr_client: { client_id: 'new-client' },
+    });
+    expect(transports.at(-1)?.headers?.Authorization).toBe('Bearer new-authorization');
+    expect(transports.some(t => t.headers?.Authorization === 'Bearer stale-refresh')).toBe(false);
+  });
+
   it('starts browser authorization after the add request returns and reports completion', async () => {
     mockMcpClient();
     let finish!: (result: unknown) => void;

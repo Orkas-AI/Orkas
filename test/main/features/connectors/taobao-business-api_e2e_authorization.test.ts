@@ -1,0 +1,34 @@
+import {createRequire} from 'node:module';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
+import {expect,it} from 'vitest';
+import {findCatalogEntry} from '../../../../src/main/features/connectors/catalog';
+const require=createRequire(import.meta.url),codec=require('../../../../bin/local-api-credential-codec.cjs');
+it('uses the bound TOP grant for full orders, stock readback, destructive approval and restart without replay',async()=>{
+ expect(findCatalogEntry('taobao-tmall-seller')!.allowed_tools).toContain('execute_destructive');
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orkas-top-native-')),file=path.join(dir,'grant.enc'),key=crypto.randomBytes(32).toString('base64url'),preload=path.join(dir,'provider.cjs'),state=path.join(dir,'state.json'),journal=path.join(dir,'journal.jsonl');
+ codec.writeCredentialFile(file,key,{provider:'taobao_top',app_key:'fixture-app',app_secret:'fixture-secret',access_token:'fixture-token',expires_at:Date.now()+3600000,identity:{user_id:'123',nick:'fixture-shop',seller_type:'B'}});fs.writeFileSync(state,JSON.stringify({stock:7,deleted:[]}));
+ fs.writeFileSync(preload,`
+ const fs=require('node:fs'),crypto=require('node:crypto');global.fetch=async(raw,init)=>{const url=new URL(String(raw)),p=new URLSearchParams(init.body);if(url.href!=='https://gw.api.taobao.com/router/rest'||init.method!=='POST'||init.redirect!=='manual'||p.get('session')!=='fixture-token'||p.get('app_key')!=='fixture-app'||p.get('simplify')!=='true')throw Error('Wrong bound TOP transport');const sign=p.get('sign');p.delete('sign');const signed=[...p.keys()].sort().map(k=>k+p.get(k)).join('');if(sign!==crypto.createHmac('sha256','fixture-secret').update(signed).digest('hex').toUpperCase())throw Error('Wrong signature');const method=p.get('method'),s=JSON.parse(fs.readFileSync(process.env.FIXTURE_STATE,'utf8'));fs.appendFileSync(process.env.FIXTURE_JOURNAL,JSON.stringify({method})+'\\n');const reply=b=>new Response(JSON.stringify(b));
+ if(method==='taobao.user.seller.get')return reply({user_seller_get_response:{user:{user_id:123,nick:'fixture-shop',type:'B'}}});
+ if(method==='taobao.trade.fullinfo.get'){if(p.get('tid')!=='9007199254740993'||!p.get('fields').includes('tid'))throw Error('Wrong order');return new Response('{"trade_fullinfo_get_response":{"trade":{"tid":9007199254740993,"receiver_name":"Fixture buyer","receiver_mobile":"13800138000","receiver_address":"Fixture road","seller_memo":"Keep note","orders":[{"oid":9007199254740994,"item_memo":"fragile"}]}}}');}
+ if(method==='taobao.item.seller.get')return reply({item_seller_get_response:{item:{num_iid:1234,num:s.stock}}});
+ if(method==='taobao.item.quantity.update'){if(p.get('num_iid')!=='1234'||p.get('type')!=='1')throw Error('Wrong stock target');s.stock=Number(p.get('quantity'));fs.writeFileSync(process.env.FIXTURE_STATE,JSON.stringify(s));return reply({item_quantity_update_response:{item:{num_iid:1234,num:s.stock}}});}
+ if(method==='taobao.item.delete'){s.deleted.push(p.get('num_iid'));fs.writeFileSync(process.env.FIXTURE_STATE,JSON.stringify(s));return reply({item_delete_response:{item:{num_iid:1234}}});}
+ if(method==='cainiao.waybill.ii.cancel')return reply({cainiao_waybill_ii_cancel_response:{cancel_result:false}});
+ throw Error('Unexpected TOP method');};`);
+ const clients:Client[]=[],stderr:string[]=[];const parsed=(r:any)=>JSON.parse(r.content[0].text);
+ const connect=async()=>{const c=new Client({name:'top-native',version:'1'});clients.push(c);const t=new StdioClientTransport({command:process.execPath,args:['--require',preload,path.resolve(__dirname,'../../../../bin/direct-commerce-mcp-server.cjs')],stderr:'pipe',env:{...Object.fromEntries(Object.entries(process.env).filter((x):x is[string,string]=>typeof x[1]==='string')),ELECTRON_RUN_AS_NODE:'1',ORKAS_LOCAL_API_PROVIDER:'taobao_top',ORKAS_LOCAL_API_METADATA_JSON:'{}',ORKAS_LOCAL_API_CREDENTIAL_FILE:file,ORKAS_LOCAL_API_CREDENTIAL_KEY:key,FIXTURE_STATE:state,FIXTURE_JOURNAL:journal}});t.stderr?.on('data',x=>stderr.push(String(x)));await c.connect(t);return c;};
+ try{
+  const c=await connect();expect((await c.listTools()).tools).toHaveLength(6);const directory=parsed(await c.callTool({name:'list_capabilities',arguments:{}}));expect(directory.actions).toHaveLength(400);const spec=parsed(await c.callTool({name:'describe_action',arguments:{action:'taobao.trade.fullinfo.get'}}));expect(spec.input_schema.properties).toHaveProperty('tid');
+  const read=await c.callTool({name:'execute_read',arguments:{action:'taobao.trade.fullinfo.get',parameters:{tid:'9007199254740993',fields:'receiver_name,receiver_mobile,receiver_address,seller_memo,orders'}}});expect(read.isError).not.toBe(true);expect(parsed(read).result.data.trade_fullinfo_get_response.trade).toMatchObject({tid:'9007199254740993',receiver_name:'Fixture buyer',receiver_mobile:'13800138000',seller_memo:'Keep note',orders:[{oid:'9007199254740994',item_memo:'fragile'}]});
+  const update={action:'taobao.item.quantity.update',parameters:{num_iid:'1234',quantity:0,type:1}};expect((await c.callTool({name:'execute_read',arguments:update})).isError).toBe(true);const changed=await c.callTool({name:'execute_high_impact',arguments:update});expect(changed.isError).not.toBe(true);expect(parsed(changed).result.status).toBe('accepted');
+  const del={action:'taobao.item.delete',parameters:{num_iid:'1234'}};expect((await c.callTool({name:'execute_high_impact',arguments:del})).isError).toBe(true);expect((await c.callTool({name:'execute_destructive',arguments:del})).isError).not.toBe(true);
+  const partial=await c.callTool({name:'execute_destructive',arguments:{action:'cainiao.waybill.ii.cancel',parameters:{cp_code:'ZTO',waybill_code:'WB1'}}});expect(partial.isError).toBe(true);expect(parsed(partial).result.status).toBe('partial_or_failed');
+  await c.close();const resumed=await connect(),after=await resumed.callTool({name:'execute_read',arguments:{action:'taobao.item.seller.get',parameters:{num_iid:'1234',fields:'num'}}});expect(after.isError).not.toBe(true);expect(parsed(after).result.data.item_seller_get_response.item.num).toBe(0);expect(JSON.parse(fs.readFileSync(state,'utf8'))).toEqual({stock:0,deleted:['1234']});const calls=fs.readFileSync(journal,'utf8').trim().split('\n').map(s=>JSON.parse(s));for(const method of ['taobao.item.quantity.update','taobao.item.delete','cainiao.waybill.ii.cancel'])expect(calls.filter(r=>r.method===method)).toHaveLength(1);expect(stderr).toEqual([]);expect(JSON.stringify([read,changed,partial,after])).not.toContain('fixture-token');expect(fs.readFileSync(file,'utf8')).not.toContain('fixture-secret');
+ }finally{await Promise.allSettled(clients.map(c=>c.close()));fs.rmSync(dir,{recursive:true,force:true});}
+},15000);

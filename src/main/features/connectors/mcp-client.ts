@@ -252,11 +252,28 @@ export class McpConnection {
 
   async listTools(opts: McpRequestOptions = {}): Promise<ToolSchema[]> {
     if (!this._client || !this._connected) throw new Error('not connected');
-    const res = await this._client.listTools(undefined, {
-      timeout: opts.timeoutMs || DEFAULT_LIST_TOOLS_TIMEOUT_MS,
-      ...(opts.signal ? { signal: opts.signal } : {}),
-    });
-    return (res.tools || []).map(normalizeMcpToolSchema);
+    // Collect the complete remote catalog before manager publishes its cache.
+    // All pages share one deadline; a server must not extend it with cursors.
+    const deadline = Date.now() + (opts.timeoutMs || DEFAULT_LIST_TOOLS_TIMEOUT_MS);
+    const tools: ToolSchema[] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      opts.signal?.throwIfAborted();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error('MCP tools/list discovery timed out');
+      const res = await this._client.listTools(cursor === undefined ? undefined : { cursor }, {
+        timeout: remaining,
+        ...(opts.signal ? { signal: opts.signal } : {}),
+      });
+      for (const tool of res.tools || []) tools.push(normalizeMcpToolSchema(tool));
+      cursor = res.nextCursor;
+      if (cursor !== undefined) {
+        if (seen.has(cursor)) throw new Error('MCP tools/list repeated a pagination cursor');
+        seen.add(cursor);
+      }
+    } while (cursor !== undefined);
+    return tools;
   }
 
   async callTool(name: string, args: Record<string, unknown>, opts: McpRequestOptions = {}): Promise<unknown> {

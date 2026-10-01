@@ -6,13 +6,13 @@ const crypto = require('node:crypto');
 const { XMLParser, XMLBuilder, XMLValidator } = require('fast-xml-parser');
 const { requestFetch, credentialOperation, requestFailureCode, httpFailureCode } = require('./commerce-request-context.cjs');
 const { validate, readBody, safeOutput } = require('./storefront-admin-api.cjs');
-const { readCredentialFile, writeCredentialFile } = require('./local-api-credential-codec.cjs');
+const { readCredentialFile, writeCredentialFile, rotateCredentialFile } = require('./local-api-credential-codec.cjs');
 const API = 'https://circus.shopping.yahooapis.jp/ShoppingWebService/V1';
 const SANDBOX_API = 'https://test.circus.shopping.yahooapis.jp/ShoppingWebService/V1';
 const AUTH = 'https://auth.login.yahoo.co.jp/yconnect/v2';
 const refreshes = new Map();
 const rate = new Map();
-const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
+const fail = (code, message, httpStatus) => { throw Object.assign(new Error(message), { code, ...(httpStatus ? { httpStatus } : {}) }); };
 const isProvider = provider => provider === 'yahoo_shopping';
 const validSecret = value => typeof value === 'string' && value.length >= 3 && value.length <= 4096 && !/[\s:\u0000-\u001f\u007f]/.test(value);
 function normalizePublicKey(value) {
@@ -57,23 +57,35 @@ function authorizeUrl(config, state) {
     redirect_uri: config.credentials.redirect_uri, scope: 'openid profile', bail: '1', state }).toString();
   return url.toString();
 }
-async function request(config, route, params = {}, { post = false, xml = false, token = false } = {}) {
+async function request(config, route, params = {}, { post = false, xml = false, token = false,
+  version = 'V1', method, json = false, responseJson = json, query = {}, noBody = false,
+  parseJson = JSON.parse, allowBusinessErrors = false } = {}) {
   setup(config);
   const c = config.credentials;
-  const url = new URL(token ? `${AUTH}/token` : `${apiBase(config.provider, config.metadata)}/${route}`);
+  const verb = method || (post ? 'POST' : 'GET');
+  if (!['V1', 'V2'].includes(version) || !['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(verb)
+    || (xml && json) || (!token && !/^[A-Za-z][A-Za-z0-9_/-]*$/.test(route))) fail('E_BAD_INPUT', 'Invalid Yahoo! Shopping request contract');
+  const base = apiBase(config.provider, config.metadata).replace(/\/V1$/, '/' + version);
+  const url = new URL(token ? `${AUTH}/token` : `${base}/${route}`);
+  const bodyEnabled = verb !== 'GET' && !noBody;
   const form = new URLSearchParams(Object.entries(params).map(([key, value]) => [key, String(value)]));
-  if (!post) url.search = form.toString();
+  if (!bodyEnabled) url.search = form.toString();
+  for (const [key, value] of Object.entries(query)) url.searchParams.set(key, String(value));
   if (!token) {
     const key = `${fingerprint(config)}:${route}`;
-    const delay = (rate.get(key) || 0) - Date.now();
-    if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+    const waitUntil = rate.get(key) || 0;
+    // Timers may wake early. Wait only for this captured deadline; a competing
+    // request that claims the next slot must still fail the admission check.
+    while (Date.now() < waitUntil) {
+      await new Promise(resolve => setTimeout(resolve, waitUntil - Date.now()));
+    }
     if (Date.now() < (rate.get(key) || 0)) fail('E_TOOL_CALL_RATE_LIMIT', 'Yahoo! Shopping permits one request per second to this API; try again shortly');
     if (!rate.has(key) && rate.size >= 1000) fail('E_TOOL_CALL_RATE_LIMIT', 'Too many active Yahoo! connections; restart the connector');
     rate.set(key, Date.now() + 1000);
   }
-  const headers = { accept: token ? 'application/json' : 'application/xml',
+  const headers = { accept: token || responseJson ? 'application/json' : 'application/xml',
     authorization: token ? `Basic ${Buffer.from(`${c.client_id}:${c.client_secret}`).toString('base64')}` : `Bearer ${c.access_token}`,
-    ...(post ? { 'content-type': xml ? 'application/xml; charset=UTF-8' : 'application/x-www-form-urlencoded' } : {}) };
+    ...(bodyEnabled ? { 'content-type': xml ? 'application/xml; charset=UTF-8' : json ? 'application/json' : 'application/x-www-form-urlencoded' } : {}) };
   if (xml && c.public_key) {
     headers['X-sws-signature'] = crypto.publicEncrypt({ key: crypto.createPublicKey({ key: Buffer.from(c.public_key, 'base64'), format: 'der', type: 'spki' }),
       padding: crypto.constants.RSA_PKCS1_PADDING }, Buffer.from(`${config.metadata.seller_id}:${Math.floor(Date.now() / 1000)}`)).toString('base64');
@@ -82,11 +94,11 @@ async function request(config, route, params = {}, { post = false, xml = false, 
   const deadline = AbortSignal.timeout(60000);
   let response;
   try {
-    response = await requestFetch(url.toString(), { method: post ? 'POST' : 'GET', headers, redirect: 'error', signal: deadline,
-      ...(post ? { body: xml ? new XMLBuilder().build(params) : form.toString() } : {}) });
+    response = await requestFetch(url.toString(), { method: verb, headers, redirect: 'error', signal: deadline,
+      ...(bodyEnabled ? { body: xml ? new XMLBuilder().build(params) : json ? JSON.stringify(params) : form.toString() } : {}) });
   } catch (error) { fail(requestFailureCode(error, deadline), 'Yahoo! Shopping request failed; inspect the shop before retrying an uncertain update'); }
-  if (!response.ok || response.status === 207) fail(response.status === 207 ? 'E_TOOL_CALL_UPSTREAM' : httpFailureCode(response.status),
-    `Yahoo! Shopping request failed (HTTP ${response.status}); check shop permission and order API IP registration`);
+  if (!response.ok || response.status === 207 && !allowBusinessErrors) fail(response.status === 207 ? 'E_TOOL_CALL_UPSTREAM' : httpFailureCode(response.status),
+    `Yahoo! Shopping request failed (HTTP ${response.status}); check shop permission and order API IP registration`, response.status);
   let source;
   try { source = await readBody(response); } catch (error) {
     fail(error?.code === 'E_CONNECTOR_RESPONSE_TOO_LARGE' ? 'E_TOOL_CALL_UPSTREAM' : requestFailureCode(error, deadline),
@@ -94,7 +106,7 @@ async function request(config, route, params = {}, { post = false, xml = false, 
   }
   let data;
   try {
-    if (token) data = JSON.parse(source);
+    if (token || responseJson) data = token ? JSON.parse(source) : parseJson(source);
     else {
       // Merchant XML needs CDATA/entities, but never DTDs or external entities.
       if (/<!DOCTYPE|<!ENTITY/i.test(source) || XMLValidator.validate(source) !== true) throw new Error();
@@ -102,8 +114,10 @@ async function request(config, route, params = {}, { post = false, xml = false, 
         parseAttributeValue: false, ignoreDeclaration: true, maxNestedTags: 32 }).parse(source);
     }
   } catch { fail('E_TOOL_CALL_UPSTREAM', 'Yahoo! Shopping returned invalid data'); }
-  if (!data || typeof data !== 'object' || data.error || data.Error || data.Result?.Status === 'NG' || data.ResultSet?.Error) fail(token ? 'E_TOOL_CALL_AUTH' : 'E_TOOL_CALL_UPSTREAM', 'Yahoo! Shopping rejected the request; check API permissions or reconnect');
-  return { data, public_key_authorized: xml && c.public_key ? response.headers.get('X-SWS-Authorize-Status') === 'authorized' : false };
+  if (!data || typeof data !== 'object' || token && Array.isArray(data)
+    || (token || !allowBusinessErrors) && (data.error || data.Error || data.Result?.Status === 'NG' || data.ResultSet?.Error)) fail(token ? 'E_TOOL_CALL_AUTH' : 'E_TOOL_CALL_UPSTREAM', 'Yahoo! Shopping rejected the request; check API permissions or reconnect');
+  return { data, public_key_authorized: xml && c.public_key ? response.headers.get('X-SWS-Authorize-Status') === 'authorized' : false,
+    ...(allowBusinessErrors ? { http_status: response.status } : {}) };
 }
 function tokens(config, data) {
   const refresh_token = data.refresh_token || config.credentials.refresh_token;
@@ -129,10 +143,10 @@ const ensureToken = credentialOperation(async config => {
   let pending = refreshes.get(config.credentialFile);
   if (!pending) {
     pending = (async () => {
-      const { data } = await request(config, '', { grant_type: 'refresh_token', refresh_token: config.credentials.refresh_token }, { token: true, post: true });
-      const next = { ...tokens(config, data), identity: config.credentials.identity };
-      await shop({ ...config, credentials: next });
-      writeCredentialFile(config.credentialFile, config.credentialKey, next);
+      await rotateCredentialFile(config, async () => {
+        const { data } = await request(config, '', { grant_type: 'refresh_token', refresh_token: config.credentials.refresh_token }, { token: true, post: true });
+        return { ...tokens(config, data), identity: config.credentials.identity };
+      }, shop);
     })();
     refreshes.set(config.credentialFile, pending);
   }
@@ -212,4 +226,4 @@ async function authorize(config) {
   credentials.identity = await shop({ ...config, credentials });
   return credentials;
 }
-module.exports = { isProvider, normalizePublicKey, apiBase, validateBinding, actionsFor, identity, execute, authorize, authorizeUrl };
+module.exports = { isProvider, normalizePublicKey, apiBase, validateBinding, actionsFor, identity, execute, authorize, authorizeUrl, ensureToken, request };

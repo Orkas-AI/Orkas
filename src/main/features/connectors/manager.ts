@@ -14,6 +14,7 @@
  */
 import * as crypto from 'node:crypto';
 import * as path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { app } from 'electron';
 
 import * as registry from './registry';
@@ -831,10 +832,18 @@ async function _resolveTransport(uid: string, inst: ConnectorInstance): Promise<
             const latest = registry.load(uid).connections[inst.id];
             if (!latest?.oauth_grant || !latest.dcr_client) throw new Error('custom OAuth grant missing; reconnect required');
             const next = await refreshDcrIfStale(latest.dcr_client, latest.oauth_grant, { strict: true });
+            let current = registry.load(uid).connections[inst.id];
             if (next !== latest.oauth_grant) {
-              await registry.update(uid, inst.id, (cur) => ({ ...cur, oauth_grant: next, updated_at: _nowIso() }));
+              current = await registry.update(uid, inst.id, (cur) => {
+                // Browser authorization can finish while the refresh is in flight.
+                // Never pair its new client with the old authorization's grant.
+                if (!isDeepStrictEqual(cur.oauth_grant, latest.oauth_grant)
+                  || !isDeepStrictEqual(cur.dcr_client, latest.dcr_client)) return cur;
+                return { ...cur, oauth_grant: next, updated_at: _nowIso() };
+              }) ?? undefined;
             }
-            return next;
+            if (!current?.oauth_grant || !current.dcr_client) throw new Error('custom OAuth grant missing; reconnect required');
+            return current.oauth_grant;
           } finally { if (_refreshLocks.get(key) === lock) _refreshLocks.delete(key); }
         })();
         lock.promise = pending;
@@ -1440,7 +1449,8 @@ export async function connectViaOAuth(
       return instance;
     } catch (error) {
       _assertRuntimeEpoch(runtimeEpoch);
-      if (authorizationCompleted || (!hasDiscoveredBinding && catalogEntry.local_api!.provider !== 'woocommerce')) {
+      // Preserve the previous installation when replacement authorization is cancelled.
+      if (authorizationCompleted) {
         removeLocalApiAuthorization(uid, catalogEntry);
         await registry.remove(uid, catalogEntry.id);
       }
@@ -2053,6 +2063,28 @@ export async function callTool(
       ? await conn.callTool(name, args, requestOpts)
       : await conn.callTool(name, args);
     _assertRuntimeEpoch(runtimeEpoch);
+    const adapterResult = result as { isError?: boolean; _meta?: { orkas?: { errorCode?: string } } } | null;
+    const adapterCode = adapterResult?._meta?.orkas?.errorCode;
+    const actionableAdapterCode = adapterCode && [
+      'E_TOOL_CALL_AUTH', 'E_TOOL_CALL_NETWORK', 'E_TOOL_CALL_TIMEOUT', 'E_TOOL_CALL_UPSTREAM', 'E_TOOL_CALL_RATE_LIMIT',
+      'storefront_permission_denied', 'storefront_binding_mismatch', 'storefront_invalid_credentials',
+      'storefront_network_failed', 'storefront_timeout', 'storefront_upstream_error', 'storefront_rate_limit',
+    ].includes(adapterCode);
+    if (entry?.auth_mode === 'local_api' && adapterResult?.isError && actionableAdapterCode) {
+      const authorizationFailure = ['E_TOOL_CALL_AUTH', 'storefront_permission_denied', 'storefront_binding_mismatch', 'storefront_invalid_credentials'].includes(adapterCode);
+      if (authorizationFailure) {
+        await _markAuthorizationError(uid, id, 'connector_reconnect_required', 'local_api_tool_auth_failed');
+      } else {
+        // Preserve the MCP failure and do not replay an operation. Keep the process
+        // alive so another request's rotating grant can finish reaching storage.
+        await _markDegradedOnTransientFailure(uid, registry.load(uid).connections[id] || inst,
+          Object.assign(new Error(adapterCode), { code: adapterCode, retryable: true }),
+          'local_api_tool_call');
+      }
+    } else if (entry?.auth_mode === 'local_api' && !adapterResult?.isError
+      && registry.load(uid).connections[id]?.status.kind === 'degraded') {
+      await registry.update(uid, id, cur => ({ ...cur, status: { kind: 'connected', since: _now() }, updated_at: _nowIso() }));
+    }
     return result;
   } catch (err) {
     _assertRuntimeEpoch(runtimeEpoch);

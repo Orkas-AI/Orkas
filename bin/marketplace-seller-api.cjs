@@ -19,8 +19,8 @@ const TTS_AUTH = 'https://auth.tiktok-shops.com/api/v2/token';
 const REFRESH_BUFFER = 120_000;
 const refreshes = new Map();
 
-function failure(message, code = 'local_api_authorization_failed') {
-  return Object.assign(new Error(message), { code });
+function failure(message, code = 'local_api_authorization_failed', httpStatus) {
+  return Object.assign(new Error(message), { code, ...(httpStatus ? { httpStatus } : {}) });
 }
 
 function numericId(value, zero = false) {
@@ -125,7 +125,7 @@ async function requestJson(url, init, provider, fetchImpl = globalThis.fetch) {
     throw failure(response.status === 401 || response.status === 403
       ? 'Check the app permissions and shop authorization, then reconnect.'
       : 'The platform request failed. Check its service status and try again.',
-    httpFailureCode(response.status));
+    httpFailureCode(response.status), response.status);
   }
   let text;
   try { text = await response.text(); }
@@ -275,7 +275,7 @@ const ensureToken = credentialOperation(async function ensureToken(config) {
   let refresh = refreshes.get(config.credentialFile);
   if (!refresh) {
     refresh = (async () => {
-      if (config.credentials.refresh_expires_at <= Date.now()) throw failure('Shop authorization expired. Reconnect.');
+      if (config.credentials.refresh_expires_at <= Date.now()) throw failure('Shop authorization expired. Reconnect.', 'E_TOOL_CALL_AUTH');
       const next = tokensFrom(config.provider, await tokenRequest(config, undefined, true), config.credentials);
       // Persist the rotating grant before another API call can fail. Writes are never retried.
       writeCredentialFile(config.credentialFile, config.credentialKey, next);

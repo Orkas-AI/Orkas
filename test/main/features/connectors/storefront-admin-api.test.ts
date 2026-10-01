@@ -146,6 +146,21 @@ describe('production storefront API contracts', () => {
     await expect(api.execute(config('shoplazza'), 'products.list')).rejects.toThrow(/error|shape|JSON/);
   });
 
+  it('accepts the official Shoplazza Success envelope while rejecting other business codes and preserving legacy success', async () => {
+    const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
+    for (const code of ['Success', '', 0]) {
+      fetch.mockResolvedValueOnce(reply({ code, data: { products: [] } }));
+      expect(await api.execute(config('shoplazza'), 'products.list')).toEqual({ data: { products: [] } });
+    }
+    for (const code of ['success', 'PermissionDenied', 'SuccessWithErrors']) {
+      fetch.mockResolvedValueOnce(reply({ code, data: { products: [] } }));
+      await expect(api.execute(config('shoplazza'), 'products.list')).rejects.toMatchObject({ code: 'storefront_request_failed' });
+    }
+    fetch.mockResolvedValueOnce(reply({ code: 'Success', products: [] }));
+    await expect(api.execute(config('shopline'), 'products.list')).rejects.toMatchObject({ code: 'storefront_request_failed' });
+    expect(fetch).toHaveBeenCalledTimes(7);
+  });
+
   it('preserves pagination and strips consumer details and secret echoes', async () => {
     const target = api.apiBase('shopline', metadata('shopline'));
     vi.stubGlobal('fetch', vi.fn(async () => reply({ orders: [{ id: '123', total_price: '10.00', email: 'buyer@private.test', shipping_address: { name: 'Buyer' }, customer: { phone: '123' }, private_token: TOKEN, line_items: [{ sku: 'sku-1', quantity: 1 }] }] }, 200,
