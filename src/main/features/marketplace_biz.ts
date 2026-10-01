@@ -19,11 +19,12 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { SUPPORTED_LANGS, type Lang } from '../i18n';
-import { marketplaceBizFile, userLocalBizDir } from '../paths';
+import { marketplaceBizFile } from '../paths';
 import { getActiveUserId } from './users';
 import { withCommonHeaders } from './api_common';
 import { apiBase } from './marketplace';
 import { createLogger } from '../logger';
+import { writeJson } from '../storage';
 import { fetchWithRetry } from '../util/retry';
 
 const log = createLogger('marketplace_biz');
@@ -146,10 +147,7 @@ async function _readPersisted(uid: string): Promise<PersistedBiz> {
 }
 
 async function _writePersisted(uid: string, data: PersistedBiz): Promise<void> {
-  const dir = userLocalBizDir(uid);
-  await fsp.mkdir(dir, { recursive: true });
-  const file = marketplaceBizFile(uid);
-  await fsp.writeFile(file, JSON.stringify(data, null, 2), 'utf8');
+  await writeJson(marketplaceBizFile(uid), data);
 }
 
 async function _fetchFromServer(): Promise<MarketplaceCategory[]> {
