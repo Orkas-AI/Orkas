@@ -794,6 +794,32 @@ describe('file viewer check', () => {
     expect(result.evidence.ok).toBe(false);
   });
 
+  it('confines linked media, documents and SVG image references to the entry directory', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-preview-linked-'));
+    try {
+      for (const name of ['image.png', 'document.html']) {
+        fs.writeFileSync(path.join(outside, name), name.endsWith('.png') ? png1x1 : 'outside document');
+        fs.symlinkSync(path.join(outside, name), path.join(root, name));
+      }
+      fs.writeFileSync(path.join(root, 'sheet.svg'), '<svg xmlns="http://www.w3.org/2000/svg"><image href="image.png"/></svg>');
+      fs.writeFileSync(path.join(root, 'inside.png'), png1x1);
+      fs.symlinkSync(path.join(root, 'inside.png'), path.join(root, 'alias.png'));
+      const linkedUrl = chatMediaLocalUrl(path.join(root, 'image.png'));
+      const runtime = fakeRuntime({ extraRequests: [linkedUrl] });
+      await renderResponsiveHtmlPreview(path.join(root, 'index.html'), desktop, runtime.deps, { fileViewer: true });
+      expect(runtime.requestDecisions).toContainEqual({ url: linkedUrl, cancel: true });
+      for (const name of ['image.png', 'document.html']) {
+        expect((await servedBy(runtime, path.join(root, name))).status).toBe(403);
+      }
+      const svg = await servedBy(runtime, path.join(root, 'sheet.svg'));
+      expect(svg.status).toBe(400);
+      expect(await svg.text()).not.toContain(png1x1.toString('base64'));
+      const inside = await servedBy(runtime, path.join(root, 'alias.png'));
+      expect(inside.status).toBe(200);
+      expect(Buffer.from(await inside.arrayBuffer())).toEqual(png1x1);
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+  });
+
   it('keeps file:// loading by default for generated artifact checks', async () => {
     const runtime = fakeRuntime();
     await renderResponsiveHtmlPreview(path.join(root, 'index.html'), desktop, runtime.deps);

@@ -65,6 +65,18 @@ describe('PDF built-in tools', () => {
     expect(rejected.content).toContain('edit_pdf(overlay_text) does not accept: input_paths');
   });
 
+  it.each([undefined, 'not-an-action'])('reports allowed PDF actions before writing for %s', async action => {
+    const source = path.join(root, 'source.pdf');
+    await makePdf(source);
+    const before = fs.readFileSync(source);
+    const result = await tool('edit_pdf').execute({ action, input_path: 'source.pdf', output_path: 'output.pdf' }, context());
+    expect(result.isError).toBe(true);
+    expect(result.content).toBe('E_BAD_INPUT: action must be one of: merge, extract_pages, delete_pages, reorder_pages, rotate_pages, watermark, overlay_text, overlay_image, fill_form');
+    expect(written).toEqual([]);
+    expect(fs.existsSync(path.join(root, 'output.pdf'))).toBe(false);
+    expect(fs.readFileSync(source)).toEqual(before);
+  });
+
   it('keeps heavyweight PDF and canvas runtimes behind execution-time imports', () => {
     const source = fs.readFileSync(
       path.resolve(__dirname, '../../../../src/main/model/core-agent/pdf-tools.ts'),

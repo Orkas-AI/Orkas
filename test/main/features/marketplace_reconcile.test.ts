@@ -268,6 +268,30 @@ describe('marketplace reconcile', () => {
     });
   });
 
+  it.each(['agent', 'skill'] as const)('preserves installed %s content when the catalog explicitly rejects its download URL', async (kind) => {
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const add = kind === 'agent' ? installs.addAgentInstall : installs.addSkillInstall;
+    const urlKey = kind === 'agent' ? 'agent_json_url' : 'bundle_url';
+    const previous = { id: 'item', version: '1.0.0', published_at: 100,
+      updated_at: 100, [urlKey]: 'https://example.test/old-content', status: 'approved' };
+    await add('u1', previous);
+    postJsonMock.mockResolvedValue({ list: [{ id: 'item', version: '2.0.0',
+      published_at: 200, updated_at: 200, [urlKey]: '', status: 'archived' }], total: 1 });
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    await reconcile.checkServerUpdatesForInstalls('u1');
+    const manifest = await installs.readInstalls('u1');
+    expect(manifest[kind === 'agent' ? 'agents' : 'skills'][0]).toMatchObject({
+      ...previous, status: 'archived',
+    });
+    // An unavailable new release must remain eligible for a later valid update.
+    postJsonMock.mockResolvedValue({ list: [{ id: 'item', version: '2.0.0',
+      published_at: 200, updated_at: 200, [urlKey]: 'https://example.test/new-content', status: 'approved' }], total: 1 });
+    await reconcile.checkServerUpdatesForInstalls('u1');
+    expect((await installs.readInstalls('u1'))[kind === 'agent' ? 'agents' : 'skills'][0]).toMatchObject({
+      version: '2.0.0', [urlKey]: 'https://example.test/new-content', status: 'approved',
+    });
+  });
+
   it('ignores catalog freshness and private bundle changes without a version bump', async () => {
     postJsonMock.mockImplementation(async (p: string) => {
       if (p === '/marketplace/agents/list') {

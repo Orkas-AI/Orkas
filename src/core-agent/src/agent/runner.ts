@@ -1805,6 +1805,7 @@ export class AgentRunner {
     // Every exit point yields `{ type: "done", result }` then returns so the
     // consumer sees a terminal event no matter which branch wins.
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      let providerOutput: Extract<AgentRunEvent, { type: "provider_call" }>["output"];
       if (params.signal?.aborted) {
         const e = this.errorResult(startTime, modelId, provider.id, {
           kind: "timeout",
@@ -1956,6 +1957,7 @@ export class AgentRunner {
           : persistedMessages;
         await this.session.flushPending(params.signal);
         activeProviderStartedAt = Date.now();
+        providerOutput = { terminalSeen: false, textChars: 0, thinkingChars: 0, toolCalls: 0 };
         const streamIter = provider.stream({
           model: modelId,
           // Only the real provider turn injects per-turn ephemeral context;
@@ -2004,6 +2006,7 @@ export class AgentRunner {
         for await (const ev of streamIter) {
           if (ev.type === "text_delta") {
             streamText += ev.text;
+            providerOutput.textChars += ev.text.length;
             // The original partial text is already visible. Buffer each
             // continuation until its prefix overlap is removed, then emit only
             // genuinely new text so the UI never flashes duplicated prose.
@@ -2016,6 +2019,7 @@ export class AgentRunner {
           } else if (ev.type === "thinking_delta") {
             const chars = Math.max(0, Math.round(Number(ev.chars) || 0));
             streamingThinkingChars += chars;
+            providerOutput.thinkingChars += chars;
             yield { type: "thinking", phase: "progress", chars, text: ev.text };
           } else if (ev.type === "thinking_end") {
             yield { type: "thinking", phase: "end", chars: streamingThinkingChars };
@@ -2041,6 +2045,7 @@ export class AgentRunner {
               inputBytes: streamingTool.inputBytes,
             };
           } else if (ev.type === "tool_use_end") {
+            providerOutput.toolCalls += 1;
             const id = ev.id || streamingTool?.id || "";
             if (id || streamingTool) {
               yield {
@@ -2084,6 +2089,18 @@ export class AgentRunner {
             };
           } else if (ev.type === "message_end") {
             streamStopReason = ev.stopReason;
+            providerOutput.terminalSeen = true;
+            providerOutput.stopReason = ev.stopReason;
+            if (ev.content) {
+              providerOutput.textChars = 0;
+              providerOutput.thinkingChars = 0;
+              providerOutput.toolCalls = 0;
+              for (const block of ev.content) {
+                if (block.type === "text") providerOutput.textChars += block.text.length;
+                else if (block.type === "thinking") providerOutput.thinkingChars += block.thinking.length;
+                else if (block.type === "tool_use") providerOutput.toolCalls += 1;
+              }
+            }
             if (ev.usage) {
               streamUsage = {
                 inputTokens: ev.usage.inputTokens ?? streamUsage.inputTokens,
@@ -2115,6 +2132,7 @@ export class AgentRunner {
           type: "provider_call",
           durationMs: providerCallDurationMs,
           outcome: "completed",
+          output: providerOutput,
           model: streamModel,
           stopReason: streamStopReason,
           ...((streamContent ? textFromContent(streamContent).length : streamText.length) > 0
@@ -3208,6 +3226,7 @@ export class AgentRunner {
             type: "provider_call",
             durationMs: providerCallDurationMs,
             outcome: "failed",
+            output: providerOutput,
             model: modelId,
           };
         }
@@ -3262,7 +3281,7 @@ export class AgentRunner {
             sessionId: this.session.getSessionId(),
             model: modelId,
             tokensBefore: overflowEstimateBefore,
-            overflowError: formatError(err),
+            overflowError: logErrorRef(err),
           };
           if (overflowRecoveryAttempted) {
             // Consecutive overflow with no completed call in between: the

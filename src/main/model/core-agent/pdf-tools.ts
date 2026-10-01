@@ -452,7 +452,7 @@ function createEditPdfTool(opts: PdfToolsOpts): AgentTool {
         'merge', 'extract_pages', 'delete_pages', 'reorder_pages', 'rotate_pages',
         'watermark', 'overlay_text', 'overlay_image', 'fill_form',
       ]);
-      if (!validActions.has(action)) return errResult('E_BAD_INPUT', 'unsupported PDF action');
+      if (!validActions.has(action)) return errResult('E_BAD_INPUT', `action must be one of: ${[...validActions].join(', ')}`);
       const unexpected = Object.keys(input).filter((key) => !PDF_ACTION_FIELDS[action].has(key)).sort();
       if (unexpected.length) {
         return errResult(

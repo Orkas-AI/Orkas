@@ -187,6 +187,20 @@ describe('browser model tool', () => {
     });
   });
 
+  it.each([
+    ['tab_id', ['bad', '0123456789AB', '0123456789abc'], { operation: 'observe' }, 'must contain exactly 12 lowercase hexadecimal characters'],
+    ['element_ref', ['bad', 'e0', 'e01'], { operation: 'act', page_id: 'page-1', page_action: 'click' }, 'must be "e" followed by a positive integer without leading zeros'],
+  ] as const)('reports the %s format before dispatch', async (field, values, input, message) => {
+    const deps = callbacks();
+    const tool = buildBrowserTool(deps);
+    for (const value of values) {
+      const { result, body } = await run(tool, { ...input, [field]: value });
+      expect(result.isError).toBe(true);
+      expect(body).toEqual({ ok: false, error: `${field}: ${message}` });
+    }
+    for (const callback of Object.values(deps)) expect(callback).not.toHaveBeenCalled();
+  });
+
   it('rejects missing conditional inputs before a browser callback runs', async () => {
     const deps = callbacks();
     const tool = buildBrowserTool(deps);

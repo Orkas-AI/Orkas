@@ -1026,7 +1026,7 @@ export function materializeLocalDisplaySvg(
       const decodedRef = ref.replace(/&amp;/g, '&');
       const imageAbs = path.resolve(root, decodedRef);
       const rel = path.relative(root, imageAbs);
-      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || !isPathAllowed(imageAbs, [root])) {
         inlineError = { code: 'bad_input', error: 'SVG image reference escapes its directory' };
         return full;
       }

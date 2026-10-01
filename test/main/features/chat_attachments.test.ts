@@ -1090,6 +1090,30 @@ describe('chat_attachments › resolveLocalMediaPath', () => {
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
+  it.skipIf(process.platform === 'win32')('rejects a legacy SVG raster symlink escape and recovers with a local image', async () => {
+    const { mod, sandbox } = await setup();
+    try {
+      const folder = path.join(sandbox, 'sheet');
+      fs.mkdirSync(folder);
+      const outside = path.join(sandbox, 'outside.png');
+      const bytes = await makePng();
+      fs.writeFileSync(outside, bytes);
+      const linked = path.join(folder, 'frame.png');
+      fs.symlinkSync(outside, linked);
+      const svg = path.join(folder, 'contact-sheet.svg');
+      fs.writeFileSync(svg, '<svg xmlns="http://www.w3.org/2000/svg"><image href="frame.png"/></svg>');
+      expect(mod.materializeLocalDisplaySvg(svg)).toEqual({
+        ok: false, code: 'bad_input', error: 'SVG image reference escapes its directory',
+      });
+      expect(fs.readFileSync(outside)).toEqual(bytes);
+      fs.unlinkSync(linked);
+      fs.writeFileSync(linked, bytes);
+      const recovered = mod.materializeLocalDisplaySvg(svg);
+      expect(recovered.ok).toBe(true);
+      if (recovered.ok) expect(recovered.body).toContain('href="data:image/png;base64,');
+    } finally { fs.rmSync(sandbox, { recursive: true, force: true }); }
+  });
+
   it('does not let legacy SVG image references escape their directory', async () => {
     const { mod, sandbox } = await setup();
     const p = path.join(sandbox, 'contact-sheet.svg');

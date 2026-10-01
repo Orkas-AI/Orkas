@@ -1,3 +1,4 @@
+import { terminalOutputSnapshot, type TerminalOutput } from '../../util/terminal-output-diagnostics';
 /**
  * core-agent-backed implementation of `chatWithModel` / `streamChatWithModel`.
  *
@@ -502,6 +503,7 @@ type RunTimelineLogEntry = {
 };
 
 export interface ModelRunLogDiagnostics {
+  terminalOutput?: TerminalOutput;
   startedAtMs: number;
   rawEventCount: number;
   streamEventCount: number;
@@ -1097,6 +1099,11 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       break;
     }
     case 'provider_call': {
+      const output = e.output as Record<string, unknown> | undefined;
+      stats.terminalOutput = terminalOutputSnapshot({ version: 1,
+        provider_terminal_seen: output?.terminalSeen, provider_stop_reason: output?.stopReason,
+        provider_text_chars: output?.textChars, provider_thinking_chars: output?.thinkingChars,
+        provider_tool_calls: output?.toolCalls });
       const durationMs = Math.max(0, Math.round(finiteNumber(e.durationMs) || 0));
       const usage = safeUsageForLog(e.usage);
       stats.providerCallCount += 1;
@@ -1222,6 +1229,7 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       stats.resultTextChars = typeof (e.result as { text?: unknown } | undefined)?.text === 'string'
         ? ((e.result as { text: string }).text.length)
         : stats.resultTextChars;
+      stats.terminalOutput = terminalOutputSnapshot({ ...stats.terminalOutput, version: 1, runner_text_chars: typeof (e.result as { text?: unknown } | undefined)?.text === 'string' ? stats.resultTextChars : undefined });
       stats.resultContentBlocks = Array.isArray((e.result as { content?: unknown } | undefined)?.content)
         ? ((e.result as { content: unknown[] }).content.length)
         : stats.resultContentBlocks;
@@ -1267,6 +1275,7 @@ export function recordModelStreamEventForLog(stats: ModelRunLogDiagnostics, ev: 
       stats.eventPayloads += 1;
       break;
     case 'final':
+      stats.terminalOutput = terminalOutputSnapshot({ ...stats.terminalOutput, version: 1, mapped_text_chars: typeof ev.text === 'string' ? ev.text.length : 0 });
       stats.finalEvents += 1;
       noteRunTimelineForLog(stats, 'client_final', nowMs, `chars=${typeof ev.text === 'string' ? ev.text.length : 0}`);
       break;
@@ -1275,6 +1284,13 @@ export function recordModelStreamEventForLog(stats: ModelRunLogDiagnostics, ev: 
       noteRunTimelineForLog(stats, 'client_error', nowMs, `chars=${typeof ev.text === 'string' ? ev.text.length : 0} aborted=${ev.aborted ? 'true' : 'false'}`);
       break;
     case 'done':
+      // A host abort/timeout may stop consuming a newer call before its receipt.
+      // Do not attribute the previous completed response to that terminal.
+      if (stats.doneRawEventMs === undefined) {
+        stats.terminalOutput = terminalOutputSnapshot({ version: 1,
+          mapped_text_chars: stats.terminalOutput?.mapped_text_chars });
+      }
+      stats.terminalOutput = terminalOutputSnapshot({ ...stats.terminalOutput, version: 1, mapped_text_chars: stats.terminalOutput?.mapped_text_chars ?? 0 });
       noteRunTimelineForLog(stats, 'client_done', nowMs);
       break;
     default:
@@ -1348,6 +1364,7 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     stopReason: stats.stopReason,
     errorKind: stats.errorKind,
     usage: stats.usage,
+    terminal_output: terminalOutputSnapshot(stats.terminalOutput),
     resultTextChars: stats.resultTextChars,
     resultContentBlocks: stats.resultContentBlocks,
     toolLoops: stats.toolLoops,

@@ -73,6 +73,64 @@ async function* streamCompletionResult(result: CompletionResult): AsyncIterable<
 }
 
 describe("runner error metadata", () => {
+  it.each(["recovered", "unrecoverable", "exhausted"] as const)(
+    "keeps provider error prose out of context-overflow logs (%s)", async mode => {
+      const privateMarker = "private-provider-echo@example.invalid";
+      const error = new ContextOverflowError(`request exceeds context window: ${privateMarker}`);
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Inspect sources" }]);
+      for (let round = 0; round < (mode === "unrecoverable" ? 1 : 2); round++) {
+        session.addAssistantMessage([{ type: "tool_use", id: `source-${round}`, name: "inspect", input: {} }]);
+        session.addToolResult(`source-${round}`, `${round}:${"x".repeat(2_000)}`);
+      }
+      let calls = 0;
+      const provider: LLMProvider = {
+        id: "mock", name: "Mock",
+        async complete() { throw new Error("must not summarize"); },
+        async *stream() {
+          calls++;
+          yield { type: "message_start" as const };
+          if (calls === 1 || mode !== "recovered") throw error;
+          yield { type: "message_end" as const, stopReason: "end_turn" as const,
+            content: [{ type: "text" as const, text: "done" }], model: "mock-model" };
+        },
+        async validateAuth() { return true; },
+      };
+      const registry = new ProviderRegistry();
+      registry.registerFactory("mock", () => provider);
+      const runner = new AgentRunner({ session, providers: registry, tools: [],
+        config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+          models: { catalog: { "mock-model": { provider: "mock", model: "mock-model",
+            contextWindow: 32_000, maxOutputTokens: 4_096 } } } }),
+      });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const failure = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const events: AgentRunEvent[] = [];
+        for await (const event of runner.runStream({ message: "Inspect sources", resumeActiveTurn: true })) events.push(event);
+        const done = events.find((e): e is Extract<AgentRunEvent, { type: "done" }> => e.type === "done");
+        expect(calls).toBe(mode === "unrecoverable" ? 1 : 2);
+        if (mode === "recovered") expect(done?.result.text).toBe("done");
+        else expect(done?.result.meta.error?.kind).toBe("context_overflow");
+        const logs = [...warn.mock.calls, ...failure.mock.calls];
+        const expected = mode === "recovered" ? "context overflow recovery applied"
+          : mode === "unrecoverable" ? "context overflow with nothing to recover"
+          : "context overflow after recovery";
+        const entry = logs.find(args => args[1] === expected);
+        expect(entry).toBeDefined();
+        expect(JSON.stringify(logs)).not.toContain(privateMarker);
+        expect(entry?.[2]).toMatchObject({ overflowError: {
+          name: "ContextOverflowError", code: "CONTEXT_OVERFLOW",
+          message_hash: createHash("sha256").update(error.message).digest("hex").slice(0, 12),
+          message_chars: error.message.length,
+        } });
+      } finally {
+        warn.mockRestore();
+        failure.mockRestore();
+      }
+    },
+  );
+
   it("prefers a nested provider business code over a generic wrapper code", () => {
     const original = Object.assign(new Error("积分不足"), {
       code: "orkas_llm_quota_exceeded",
@@ -5850,12 +5908,14 @@ describe("AgentRunner", () => {
     expect(collected.filter((event) => event.type === "provider_call")).toEqual([
       expect.objectContaining({
         outcome: "completed",
+        output: { terminalSeen: true, stopReason: "tool_use", textChars: 0, thinkingChars: 0, toolCalls: 1 },
         model: "mock-model",
         usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
         reasoningBoundary: { structured: true, literalLeadingText: false },
       }),
       expect.objectContaining({
         outcome: "completed",
+        output: expect.objectContaining({ terminalSeen: true, stopReason: "end_turn", toolCalls: 0 }),
         model: "mock-model",
         usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
         reasoningBoundary: { structured: false, literalLeadingText: true },
@@ -9386,3 +9446,64 @@ it.each([
     vi.clearAllTimers(); vi.useRealTimers();
   }
 });
+
+describe('terminal output evidence', () => {
+  it.each(['text', 'reasoning', 'empty', 'eof'] as const)('records %s without inferring tools or terminal events', async (kind) => {
+    const thought = '<dots_function_call><read_files>private</read_files></dots_function_call>';
+    const provider = createMockProvider([{ content: [], stopReason: 'end_turn',
+      model: 'mock-model', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }]);
+    provider.stream = async function* () {
+      if (kind === 'text' || kind === 'eof') yield { type: 'text_delta', text: 'hello' };
+      if (kind === 'reasoning') yield { type: 'thinking_delta', text: thought, chars: thought.length };
+      if (kind !== 'eof') yield { type: 'message_end', stopReason: 'end_turn', content:
+        kind === 'reasoning' ? [{ type: 'thinking', thinking: thought }] :
+        kind === 'text' ? [{ type: 'text', text: 'hello' }] : [] };
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory('mock', () => provider);
+    const runner = new AgentRunner({ providers: registry, tools: [], config: createConfig({
+      agent: { defaultProvider: 'mock', defaultModel: 'mock-model' },
+    }) });
+    const events = await collectRunEvents(runner, 'synthetic diagnostic boundary');
+    const calls = events.filter((event) => event.type === 'provider_call');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ output: {
+      terminalSeen: kind !== 'eof', textChars: kind === 'text' || kind === 'eof' ? 5 : 0,
+      thinkingChars: kind === 'reasoning' ? thought.length : 0, toolCalls: 0,
+      ...(kind !== 'eof' ? { stopReason: 'end_turn' } : {}),
+    } });
+    if (kind === 'eof') expect(calls[0].output).not.toHaveProperty('stopReason');
+    expect(events.filter((event) => event.type === 'tool_start')).toEqual([]);
+    expect(events.filter((event) => event.type === 'done')).toHaveLength(1);
+  });
+});
+
+  it('lets the production runner summarize after six executed rounds without executing the seventh proposal', async () => {
+    const { AgentRunner, ProviderRegistry, Session, createConfig } = await import('../src/index');
+    const config = createConfig({ agent: { defaultProvider: 'openai-codex', defaultModel: 'gpt-5.5', maxRetries: 0, maxToolLoops: 6 }, evolution: { enabled: false } });
+    const providers = new ProviderRegistry(config);
+    const diagnostics: string[] = [];
+    const warn = vi.spyOn(console, 'warn').mockImplementation((...args) => diagnostics.push(args.map(String).join(' ')));
+    let requests = 0;
+    const execute = vi.fn(async () => ({ content: '{}' }));
+    providers.registerFactory('openai-codex', () => ({ id: 'openai-codex', name: 'fixture', validateAuth: async () => true,
+      async *stream(): AsyncIterable<StreamEvent> {
+        requests++;
+        yield { type: 'message_end', stopReason: 'tool_use', model: 'gpt-5.5', content: [{ type: 'tool_use', id: String(requests), name: 'probe', input: { page: requests } }] };
+      },
+      async complete(params) {
+        requests++; expect(params.tools).toBeUndefined();
+        return { content: [{ type: 'text', text: 'No supported operation was found.' }], model: 'gpt-5.5', stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+      },
+    }));
+    try {
+      const runner = new AgentRunner({ config, providers, session: new Session(), tools: [{ name: 'probe', description: 'Read a fixture page', inputSchema: { type: 'object' }, execute }] });
+      let result: any;
+      for await (const event of runner.runStream({ message: 'Inspect the fixture', systemPrompt: 'Fixture instructions' })) if (event.type === 'done') result = event.result;
+      expect(requests).toBe(8); expect(execute).toHaveBeenCalledTimes(6);
+      expect(result.text).toBe('No supported operation was found.');
+      expect(result.meta.error).toBeUndefined();
+      expect(diagnostics.length).toBeGreaterThan(0);
+      expect(diagnostics.every(s => s.startsWith('[agent-runner] run_convergence: nudged model to finish near limit') || s.startsWith('[agent-runner] Run convergence tool-loop limit reached'))).toBe(true);
+    } finally { warn.mockRestore(); }
+  });

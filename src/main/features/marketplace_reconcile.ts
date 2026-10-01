@@ -272,7 +272,9 @@ export async function checkServerUpdatesForInstalls(
     if (!_isInstallRowAppCompatible({ id: a.id, min_app_version: server.min_app_version }, 'agent')) {
       continue;
     }
-    const contentUpgrade = compareVersions(server.version, a.version) === 1;
+    // Missing URLs are legacy responses; explicit empty URLs reject this release.
+    const contentUpgrade = compareVersions(server.version, a.version) === 1
+      && (server.agent_json_url === undefined || Boolean(server.agent_json_url));
     const defaultInstallChanged = typeof server.default_install === 'boolean'
       && a.default_install !== server.default_install;
     const currentStatus = a.status || a.state;
@@ -327,7 +329,9 @@ export async function checkServerUpdatesForInstalls(
     if (!_isInstallRowAppCompatible({ id: s.id, min_app_version: server.min_app_version }, 'skill')) {
       continue;
     }
-    const contentUpgrade = compareVersions(server.version, s.version) === 1;
+    // Missing URLs are legacy responses; explicit empty URLs reject this release.
+    const contentUpgrade = compareVersions(server.version, s.version) === 1
+      && (server.bundle_url === undefined || Boolean(server.bundle_url));
     const defaultInstallChanged = typeof server.default_install === 'boolean'
       && s.default_install !== server.default_install;
     const currentStatus = s.status || s.state;

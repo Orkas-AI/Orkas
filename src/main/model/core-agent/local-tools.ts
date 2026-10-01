@@ -101,6 +101,7 @@ import {
   type ExternalMutationFinding,
 } from './external-mutation-risk';
 import { requestBashDecision, type BashPermissionFact } from './bash-permissions';
+import { librarySaveFieldError } from '../../util/library-save-input';
 import { markdownToPdf, htmlToPdf } from '../../util/md-to-pdf';
 import { uniquifyPathForWrite, renderRenameSignal } from '../../util/uniquify-path';
 import { isPathAllowed, resolveSandboxEntry, resolveSandboxRoot, type PathAllowedOptions } from '../../util/path-sandbox';
@@ -5746,16 +5747,13 @@ function createLibrarySaveTool(opts: LocalToolsOpts): AgentTool {
       required: ['source_path'],
     },
     async execute(input, ctx): Promise<ToolResult> {
-      if (Object.keys(input).some((key) => !['source_path', 'name', 'action', 'expected_revision'].includes(key))
-          || (input.action !== undefined && input.action !== 'save' && input.action !== 'checkout')
-          || (input.expected_revision !== undefined && (typeof input.expected_revision !== 'string' || !input.expected_revision))) {
-        return { content: errText('E_BAD_INPUT', 'invalid library_save fields'), isError: true };
-      }
+      const fieldError = librarySaveFieldError(input);
+      if (fieldError) return { content: errText('E_BAD_INPUT', fieldError), isError: true };
       if (!opts.userId || !opts.projectId) {
         return { content: errText('E_NO_PROJECT', 'library_save is only available inside a project conversation'), isError: true };
       }
       const rawSource = typeof input.source_path === 'string' ? input.source_path.trim() : '';
-      if (!rawSource) return { content: errText('E_BAD_INPUT', '`source_path` is required'), isError: true };
+      if (!rawSource) return { content: errText('E_BAD_INPUT', 'source_path must be a non-empty string'), isError: true };
       const sourceAbs = resolveAbs(ctx, rawSource);
       // Path sandbox at entry: only a file the agent produced inside its own
       // workspace may be copied into the shared, synced project library.
@@ -5765,7 +5763,7 @@ function createLibrarySaveTool(opts: LocalToolsOpts): AgentTool {
       const name = typeof input.name === 'string' ? input.name.trim() : '';
       const targetName = name || path.basename(sourceAbs);
       if (input.action === 'checkout' && (!name || input.expected_revision !== undefined)) {
-        return { content: errText('E_BAD_INPUT', 'checkout requires name and does not accept expected_revision'), isError: true };
+        return { content: errText('E_BAD_INPUT', !name ? 'name must be a non-empty string for checkout' : 'expected_revision is not accepted for checkout'), isError: true };
       }
       if (input.action === 'checkout' || input.expected_revision !== undefined) {
         const result = input.action === 'checkout'
