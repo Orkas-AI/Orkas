@@ -16,6 +16,87 @@ function functionSource(name: string): string {
 }
 
 describe('Main task-terminal UI delivery', () => {
+  it('delivers successful filing only while its owner is active', () => {
+    let activeUser = 'owner-a';
+    let notify!: (event: any) => void;
+    const delivered: unknown[] = [];
+    const ast = ts.createSourceFile('index.ts', mainSource, ts.ScriptTarget.Latest, true);
+    let registration = '';
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && node.expression.getText(ast) === 'conversationFiling.onConversationFiled') {
+        registration = node.getText(ast);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+    expect(registration).not.toBe('');
+    const context = vm.createContext({
+      users: { hasActiveUser: () => !!activeUser, getActiveUserId: () => activeUser },
+      ipc: { broadcastToRenderer: (channel: string, payload: unknown) => { delivered.push({ channel, payload }); return true; } },
+      conversationFiling: { onConversationFiled: (cb: typeof notify) => { notify = cb; } },
+    });
+    vm.runInContext(ts.transpileModule(`${registration};`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText, context);
+    const event = { userId: 'owner-a', conversation: { conversation_id: 'c1', project_id: 'p1', title: 'Private task' } };
+    notify(event);
+    expect(delivered).toEqual([{ channel: 'conversations:filed', payload: { conversation: event.conversation } }]);
+    activeUser = 'owner-b';
+    notify(event);
+    activeUser = '';
+    notify(event);
+    expect(delivered).toHaveLength(1);
+    activeUser = 'owner-a';
+    notify({ ...event, conversation: { ...event.conversation, project_id: '' } });
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toEqual({ channel: 'conversations:filed', payload: {
+      conversation: { ...event.conversation, project_id: '' },
+    } });
+  });
+
+  it('replays filing failure receipts for their owner and drops them after an account switch', () => {
+    let activeUser = 'owner-a';
+    let notify!: (event: any) => void;
+    const delivered: unknown[] = [];
+    const ast = ts.createSourceFile('index.ts', mainSource, ts.ScriptTarget.Latest, true);
+    let registration = '';
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && node.expression.getText(ast) === 'conversationFiling.onConversationFilingFailed') {
+        registration = node.getText(ast);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+    expect(registration).not.toBe('');
+    const context = vm.createContext({
+      createRendererChannel,
+      users: { hasActiveUser: () => !!activeUser, getActiveUserId: () => activeUser },
+      ipc: { broadcastToRenderer: (channel: string, payload: unknown) => { delivered.push({ channel, payload }); return true; } },
+      conversationFiling: { onConversationFilingFailed: (cb: typeof notify) => { notify = cb; } },
+    });
+    vm.runInContext(ts.transpileModule([
+      'let mainRendererReady = false;',
+      mainSource.slice(mainSource.indexOf('const rendererChannels:'), mainSource.indexOf('function emitTaskTerminalToRenderer(')),
+      `${registration};`,
+    ].join('\n'), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+    const event = { userId: 'owner-a', cid: 'c1', projectId: 'p1', projectName: 'Private project', todosCreated: 2 };
+    notify(event);
+    expect(delivered).toEqual([]);
+    vm.runInContext('mainRendererReady = true; for (const channel of rendererChannels) channel.flush();', context);
+    const expected = { ...event } as any;
+    delete expected.userId;
+    expect(delivered).toEqual([{ channel: 'conversations:filing-failed', payload: expected }]);
+
+    vm.runInContext('mainRendererReady = false;', context);
+    notify(event);
+    activeUser = 'owner-b';
+    vm.runInContext('mainRendererReady = true; for (const channel of rendererChannels) channel.flush();', context);
+    notify(event);
+    activeUser = '';
+    notify(event);
+    expect(delivered).toHaveLength(1);
+  });
+
   it('delivers task terminals through subframe loads and replays them after a main-document reload', () => {
     const delivered: unknown[] = [];
     const webContents = new EventEmitter();

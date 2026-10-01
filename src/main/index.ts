@@ -207,6 +207,7 @@ import * as reflectionOrchestrator from './features/reflection-orchestrator';
 import * as autoTasks from './features/auto_tasks';
 import * as projectDriverRunner from './features/project_driver_runner';
 import * as projectTasks from './features/project_tasks';
+import * as conversationFiling from './features/conversation_filing';
 import * as systemSkills from './features/system_skills';
 import * as bundledContentStartup from './features/bundled_content_startup';
 import * as builtinMarketplaceStartup from './features/builtin_marketplace_startup';
@@ -271,6 +272,7 @@ function rendererChannel(channel: string, options: RendererChannelOptions): Rend
   return created;
 }
 const taskTerminalUi = rendererChannel('conversation:task_terminal', { maxPending: 100, ownerScoped: true });
+const conversationFilingFailure = rendererChannel('conversations:filing-failed', { maxPending: 20, ownerScoped: true });
 
 function emitTaskTerminalToRenderer(event: TaskTerminalEvent): void {
   const { user_id: ownerUserId, ...terminal } = event;
@@ -426,6 +428,15 @@ function registerIpc(): void {
   projectTasks.onTasksChanged((e) => ipc.broadcastToRenderer('projects:tasks-changed', {
     projectId: e.pid,
   }));
+  // A conversation filed under a project by the host has no renderer request to
+  // answer, so the sidebar is told directly.
+  conversationFiling.onConversationFiled((e) => {
+    if (!users.hasActiveUser() || users.getActiveUserId() !== e.userId) return;
+    ipc.broadcastToRenderer('conversations:filed', { conversation: e.conversation });
+  });
+  conversationFiling.onConversationFilingFailed(({ userId, ...receipt }) => {
+    conversationFilingFailure.emit(receipt, userId);
+  });
   conversationTaskBoard.onBacklogExecutionChanged((e) => ipc.broadcastToRenderer('projects:tasks-changed', {
     projectId: e.pid,
   }));

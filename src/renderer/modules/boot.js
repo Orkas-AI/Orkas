@@ -154,6 +154,9 @@ async function bootApp() {
       if (typeof startAutoEventsSubscription === 'function') {
         startAutoEventsSubscription();
       }
+      if (typeof startConversationFiledSubscription === 'function') {
+        startConversationFiledSubscription();
+      }
     }, 2500);
     return true;
   } catch (err) {

@@ -249,6 +249,11 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // A timed-out hook can settle after the next fixture has started.
+  const cleanupRoot = tmpDir;
+  const restoreWorkspace = prevWs;
+  const restoreGlobalSkillsRoot = prevTestGlobalSkillsRoot;
+  const cleanupCids = new Set(cidsToDrop);
   _resetStreamGates();
   // Drop conv state so workers terminate before the tmpDir is rm'd —
   // otherwise a half-finished worker writes after dir removal and we get
@@ -258,15 +263,14 @@ afterEach(async () => {
     // Drop all known cids — the bus state map is module-internal but
     // _cidStateForTest exposes per-cid; iterate via `_cids` indirectly
     // by scanning the chats dir.
-    const paths = await import('../../../../src/main/paths');
-    const dir = paths.userChatsDir(TEST_UID);
+    const dir = path.join(cleanupRoot, TEST_UID, 'cloud', 'chats');
     if (fs.existsSync(dir)) {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       for (const e of entries) {
-        if (e.isDirectory()) cidsToDrop.add(e.name);
+        if (e.isDirectory()) cleanupCids.add(e.name);
       }
     }
-    for (const cid of cidsToDrop) await bus.dropConv(TEST_UID, cid);
+    for (const cid of cleanupCids) await bus.dropConv(TEST_UID, cid);
   } catch { /* ignore */ }
   try {
     const bashPermissions = await import('../../../../src/main/model/core-agent/bash-permissions');
@@ -279,10 +283,13 @@ afterEach(async () => {
   // touched after the first drain before Windows removes the temp workspace.
   await new Promise((resolve) => setTimeout(resolve, 50));
   await drainMainRuntimeForTest();
-  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  if (prevTestGlobalSkillsRoot === undefined) delete process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT;
-  else process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT = prevTestGlobalSkillsRoot;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  if (process.env.ORKAS_WORKSPACE_ROOT === cleanupRoot) {
+    if (restoreWorkspace === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
+    else process.env.ORKAS_WORKSPACE_ROOT = restoreWorkspace;
+    if (restoreGlobalSkillsRoot === undefined) delete process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT;
+    else process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT = restoreGlobalSkillsRoot;
+  }
+  fs.rmSync(cleanupRoot, { recursive: true, force: true });
 });
 
 async function waitForQuiescent(uid: string, cid: string, timeoutMs = 2000) {
@@ -8985,4 +8992,62 @@ describe('group_chat bus integration › Skill creation correction', () => {
     expect(fs.existsSync(path.join(paths.userSkillsDir(TEST_UID), 'recovered-notes'))).toBe(false);
     expect((await state.readState(TEST_UID, cid)).status).toBe('aborted');
   });
+});
+
+describe('group_chat bus integration › deferred conversation filing', () => {
+  // A tool can create the project during the turn but cannot relocate the
+  // conversation: the relocation refuses while the turn holds the session files
+  // open. The host finishes it at the quiescent boundary, and a cancelled run
+  // drops it — the reply that announced the project never reached the user.
+  it.each(['completed', 'cancelled'] as const)(
+    'a %s turn settles the pending filing at the quiescent boundary', async (outcome) => {
+      const stateMod = await import('../../../../src/main/features/group_chat/state');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const chats = await import('../../../../src/main/features/chats');
+      const filing = await import('../../../../src/main/features/conversation_filing');
+
+      const conv = await chats.createConversation(TEST_UID, { title: 'weekly competitor report' });
+      const cid = conv.conversation_id;
+      cidsToDrop.add(cid);
+      const filed = await filing.fileConversationUnderNewProject(
+        TEST_UID, cid, `Competitor tracking ${outcome}`, { moveNow: false },
+      );
+      expect(filed.ok).toBe(true);
+      const pid = (filed as { result: any }).result.project.project_id;
+      // Deferred means deferred: nothing moved while the turn had not started.
+      expect((await chats.getConversationMetadata(TEST_UID, cid))?.project_id).toBeFalsy();
+
+      const gateName = `filing-${outcome}`;
+      _holdStream(gateName);
+      _setScript(stateMod.buildGconvSessionId(cid), [
+        { type: '__wait_for_gate__', name: gateName },
+        ...(outcome === 'cancelled'
+          ? [{ type: '__wait_for_abort__' }]
+          : [{ type: 'final', text: 'Report delivered.' }]),
+      ]);
+      const terminals: any[] = [];
+      const unsubscribe = bus.subscribeTaskTerminals((event) => {
+        if (event.conversation_id === cid) terminals.push(event);
+      });
+      try {
+        await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Summarise this week.' });
+        _releaseStream(gateName);
+        if (outcome === 'cancelled') await bus.abort(TEST_UID, cid);
+        await waitForQuiescent(TEST_UID, cid, 4000);
+        expect(await waitUntil(() => terminals.length === 1)).toBe(true);
+        expect(terminals[0].status).toBe(outcome);
+        // Intent removal happens before relocation awaits storage. Await the
+        // actual tracked write rather than mistaking dequeue for completion.
+        const runtime = bus._cidStateForTest(TEST_UID, cid);
+        expect(runtime).not.toBeNull();
+        await Promise.all([...runtime!.backgroundWrites]);
+        expect(filing.hasPendingConversationFiling(TEST_UID, cid)).toBe(false);
+        const row = await chats.getConversationMetadata(TEST_UID, cid);
+        expect(row?.project_id || '').toBe(outcome === 'cancelled' ? '' : pid);
+      } finally {
+        unsubscribe();
+        _releaseStream(gateName);
+      }
+    },
+  );
 });

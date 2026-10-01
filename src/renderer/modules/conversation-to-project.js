@@ -21,6 +21,7 @@
 const _CONV_MOVE_ERROR_KEYS = {
   has_running_conv: 'chat.conv_move_running',
   already_in_project: 'chat.conv_move_already',
+  not_in_project: 'chat.conv_move_not_filed',
   project_not_found: 'chat.conv_move_no_project',
 };
 
@@ -306,3 +307,71 @@ async function _moveConversationToExistingProject(cid) {
   }
   await _finishConversationProjectMove(projectId, (picked && picked.name) || projectId, agentIds);
 }
+
+/** Take a conversation back out of its project.
+ *
+ * Filing can happen without a click, so the way back cannot be click-only. The
+ * relocation refuses while a turn is running and reports it, exactly as the
+ * filing direction does.
+ */
+async function _moveConversationOutOfProject(cid) {
+  const conv = _convMoveRow(cid);
+  if (!conv || !conv.project_id) return;
+  if (isConvPending(cid)) { uiToast(t('chat.conv_move_running')); return; }
+  let moved;
+  try {
+    const res = await window.orkas.invoke('conversations.moveOut', { cid });
+    if (!res || res.ok === false || !res.conversation) throw new Error((res && res.error) || 'move_failed');
+    moved = res.conversation;
+  } catch (err) {
+    uiToast(_convMoveErrorText(err && err.message));
+    return;
+  }
+  // The returned row simply omits project_id, so clear it explicitly: merging
+  // would otherwise leave the sidebar nesting the task under its old project.
+  await _applyConversationMoved(cid, { ...moved, project_id: '' });
+  uiToast(t('chat.conv_moved_out'));
+}
+
+/* The host files a conversation under a project on its own when a tool asked for
+ * it during a turn: the relocation only becomes legal once the turn is over, so
+ * there is no request whose result could re-home the sidebar row. Reuse the same
+ * local fix-up the picker applies. */
+let _convFiledWatchStarted = false;
+let _convFilingFailedWatchStarted = false;
+function startConversationFiledSubscription() {
+  _startConversationFilingFailureSubscription();
+  if (!window.orkas || typeof window.orkas.onPushEvent !== 'function') return;
+  if (!_convFiledWatchStarted) try {
+    window.orkas.onPushEvent('conversations:filed', (payload) => {
+      const moved = payload && payload.conversation;
+      if (!moved || !moved.conversation_id) return;
+      _applyConversationMoved(moved.conversation_id, { ...moved, project_id: moved.project_id || '' })
+        .catch(() => { /* the authoritative loaders correct it on the next load */ });
+    });
+    _convFiledWatchStarted = true;
+  } catch (_) { /* push channel unavailable in this build */ }
+}
+
+function _startConversationFilingFailureSubscription() {
+  if (_convFilingFailedWatchStarted || !window.orkas || typeof window.orkas.onPushEvent !== 'function') return;
+  try {
+    window.orkas.onPushEvent('conversations:filing-failed', (payload) => {
+      if (payload && payload.kind === 'unfile' && typeof payload.cid === 'string' && payload.cid) {
+        uiToast(t('chat.conv_move_failed'), { variant: 'warning', timeoutMs: 10000 });
+        return;
+      }
+      if (!payload || typeof payload.projectName !== 'string' || !payload.projectName
+        || !payload.cid || !payload.projectId
+        || !Number.isSafeInteger(payload.todosCreated) || payload.todosCreated < 0) return;
+      uiToast(t(payload.todosCreated > 0 ? 'chat.conv_filing_failed_with_todos' : 'chat.conv_filing_failed', {
+        name: payload.projectName, count: payload.todosCreated,
+      }), { variant: 'warning', timeoutMs: 10000 });
+    });
+    _convFilingFailedWatchStarted = true;
+  } catch (_) { /* push channel unavailable in this build */ }
+}
+
+// Host receipts flush at did-finish-load, before deferred boot subscriptions.
+// Register this passive sink while loading the script so reloads cannot lose it.
+if (typeof window !== 'undefined') _startConversationFilingFailureSubscription();

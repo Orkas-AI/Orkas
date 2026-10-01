@@ -1219,6 +1219,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { conversation: (result as { conversation: chats.Conversation }).conversation };
   },
 
+  // Filing a conversation under a project can happen without a click, so the
+  // way back cannot be click-only either. The relocation itself owns the
+  // running-turn refusal.
+  'conversations.moveOut': async (args, ctx) => {
+    const { cid } = args;
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const result = await chats.moveConversationOutOfProject(ctx.userId, cid);
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { conversation: (result as { conversation: chats.Conversation }).conversation };
+  },
+
   'conversations.deleteAll': async (_args, ctx) => {
     const convs = await chats.listConversations(ctx.userId);
     if (!convs.length) return { deleted: 0 };

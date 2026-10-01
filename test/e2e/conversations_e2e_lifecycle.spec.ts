@@ -312,7 +312,8 @@ test.describe('conversations and resource picker', () => {
     await picker.locator('.skill-picker-item[data-kind="skill"]', { hasText: 'picker-e2e-skill' }).click();
     const composerInput = page.locator('#new-chat-input');
     await expectComposerText(composerInput, /Skill: picker-e2e-skill/);
-    await composerInput.fill('');
+    await composerInput.press('ControlOrMeta+A');
+    await composerInput.press('Backspace');
     await expect.poll(() => composerText(composerInput)).not.toMatch(/picker-e2e-skill/);
 
     await page.locator('#new-chat-recipient-chip').click();

@@ -29,7 +29,11 @@ export async function requestElectronQuit(app: ElectronApplication): Promise<voi
       await app.evaluate(({ app }) => { setImmediate(() => app.quit()); });
     } catch (error) {
       // A fast successful exit may dispose the inspector before it replies.
-      if (!closed) throw error;
+      // Playwright can report this before delivering the application close event.
+      // Still require that event below; the fixture's close deadline stays active.
+      const inspectorDisposed = error instanceof Error && error.message ===
+        'electronApplication.evaluate: Execution context was destroyed, most likely because of a navigation.';
+      if (!closed && !inspectorDisposed) throw error;
     }
     await completion;
   } finally {
@@ -47,6 +51,7 @@ export async function closeElectronFixture(app: OwnedApplication, tracePath: str
   // Playwright disposes the application object on close; retain ownership first.
   const child = app.process();
   const failures: string[] = [];
+  const causes: unknown[] = [];
   const step = async (name: string, timeoutMs: number, action: () => Promise<void>) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     options.phase?.(name, 'started');
@@ -55,8 +60,9 @@ export async function closeElectronFixture(app: OwnedApplication, tracePath: str
         timer = setTimeout(() => reject(new Error('deadline')), timeoutMs);
       })]);
       options.phase?.(name, 'completed');
-    } catch {
+    } catch (error) {
       failures.push(name);
+      causes.push(error);
       options.phase?.(name, 'failed');
     } finally { clearTimeout(timer); }
   };
@@ -71,5 +77,5 @@ export async function closeElectronFixture(app: OwnedApplication, tracePath: str
       child.once('error', reject);
     }));
   }
-  if (failures.length) throw new Error(`Electron fixture cleanup failed: ${failures.join(', ')}`);
+  if (failures.length) throw new Error(`Electron fixture cleanup failed: ${failures.join(', ')}`, { cause: causes[0] });
 }

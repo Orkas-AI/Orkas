@@ -1,5 +1,5 @@
 /**
- * Moving an existing conversation into a project.
+ * Moving an existing conversation into a project, and back out of one.
  *
  * `project_id` used to be frozen at create time, and it is not just a field:
  * it decides where the messages, group companion dir, commander and per-agent
@@ -7,6 +7,10 @@
  * carrying the bytes leaves the user with a conversation that opens empty, so
  * these cases check the filesystem on both sides rather than the returned
  * record.
+ *
+ * Filing can happen automatically, so it has to be undoable; the unfiling cases
+ * cover the reverse direction, whose recovery has to restore the row to the
+ * project index rather than the global one.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -135,7 +139,8 @@ describe('chats › moveConversationToProject', () => {
     expect(projectRow?.title).toBe('loose task');
   });
 
-  it.each([false, true])('rejects admission during a move and resumes after commit or rollback (rollback: %s)', async (rollback) => {
+  it.each([{ rollback: false, out: false }, { rollback: true, out: false },
+    { rollback: false, out: true }, { rollback: true, out: true }])('rejects admission during a move and resumes after commit or rollback (%j)', async ({ rollback, out }) => {
     const chats = await import('../../../src/main/features/chats');
     const storage = await import('../../../src/main/storage');
     const bus = await import('../../../src/main/features/group_chat/bus');
@@ -144,7 +149,9 @@ describe('chats › moveConversationToProject', () => {
     const conv = await chats.createConversation(UID, { title: 'Move admission' });
     const cid = conv.conversation_id;
     seedConversationBytes(cid);
-    expect(layout.findProjectIdForConversation(UID, cid)).toBeNull();
+    if (out) expect((await chats.moveConversationToProject(UID, cid, PID)).ok).toBe(true);
+    const sourceRoot = out ? cloud('projects', PID, 'chats') : cloud('chats');
+    expect(layout.findProjectIdForConversation(UID, cid)).toBe(out ? PID : null);
     let entered!: () => void;
     let release!: () => void;
     const atCommit = new Promise<void>(resolve => { entered = resolve; });
@@ -154,16 +161,17 @@ describe('chats › moveConversationToProject', () => {
     const oldRootWrite = new Promise<'old-root-write'>(resolve => { sideEffect = () => resolve('old-root-write'); });
     let paused = false;
     vi.spyOn(storage, 'writeJson').mockImplementation(async (file, data) => {
-      if (!paused && file === cloud('chats', '_index.json')) {
+      if (!paused && file === path.join(sourceRoot, '_index.json')) {
         paused = true;
         entered();
         await resume;
         if (rollback) throw new Error('injected move commit failure');
       }
-      if (file.startsWith(cloud('chats', cid) + path.sep)) sideEffect();
+      if (file.startsWith(path.join(sourceRoot, cid) + path.sep)) sideEffect();
       return original(file, data);
     });
-    const moving = chats.moveConversationToProject(UID, cid, PID);
+    const moving = out ? chats.moveConversationOutOfProject(UID, cid)
+      : chats.moveConversationToProject(UID, cid, PID);
     let admission: Promise<unknown> | undefined;
     try {
       await atCommit;
@@ -173,15 +181,15 @@ describe('chats › moveConversationToProject', () => {
         forceTo: ['user'], text: 'must not land during relocation' })
         .then(() => 'accepted', () => 'rejected');
       expect(await Promise.race([admission, oldRootWrite])).toBe('rejected');
-      expect(fs.existsSync(cloud('chats', cid))).toBe(false);
-      expect(fs.existsSync(cloud('chats', `${cid}.jsonl`))).toBe(false);
+      expect(fs.existsSync(path.join(sourceRoot, cid))).toBe(false);
+      expect(fs.existsSync(path.join(sourceRoot, `${cid}.jsonl`))).toBe(false);
     } finally { release(); await moving; await admission; }
     expect(await moving).toMatchObject({ ok: !rollback });
     const delivered = await bus.enqueue({ uid: UID, cid, fromActorId: 'commander',
       forceTo: ['user'], text: 'sent after settled move' });
     expect(delivered.text).toBe('sent after settled move');
     const file = layout.conversationMessageReadFile(UID, cid);
-    expect(file).toBe(rollback ? cloud('chats', `${cid}.jsonl`)
+    expect(file).toBe(rollback !== out ? cloud('chats', `${cid}.jsonl`)
       : cloud('projects', PID, 'chats', `${cid}.jsonl`));
     expect(fs.readFileSync(file, 'utf8')).toContain('sent after settled move');
     expect(fs.readFileSync(file, 'utf8')).not.toContain('must not land');
@@ -436,4 +444,132 @@ describe('chats › moveConversationToProject', () => {
     expect(relocation.committedConversationRelocations(UID)).toEqual([]);
   });
 
+});
+
+describe('chats › moveConversationOutOfProject', () => {
+  it('brings every location back to the root and leaves nothing in the project', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    await seedProject();
+    const conv = await chats.createConversation(UID, { title: 'filed then undone' });
+    const cid = conv.conversation_id;
+    seedConversationBytes(cid);
+    expect((await chats.moveConversationToProject(UID, cid, PID)).ok).toBe(true);
+
+    // The filing left a committed receipt sync has not consumed — with sync
+    // disabled it never will — so the undo also proves that receipt does not
+    // block a second relocation of the same conversation.
+    const result = await chats.moveConversationOutOfProject(UID, cid);
+    expect(result.ok).toBe(true);
+    expect((result as { conversation: any }).conversation.project_id).toBeFalsy();
+
+    for (const file of globalPaths(cid)) expect({ file, exists: fs.existsSync(file) }).toEqual({ file, exists: true });
+    for (const file of projectPaths(cid)) expect({ file, exists: fs.existsSync(file) }).toEqual({ file, exists: false });
+    // Content, not just presence: a round trip that truncated a file would pass
+    // an existence check.
+    expect(fs.readFileSync(cloud('chats', `${cid}.jsonl`), 'utf-8'))
+      .toBe('{"from":"user","text":"hello"}\n');
+    expect(fs.readFileSync(cloud('chat_attachments', cid, 'note.txt'), 'utf-8')).toBe('attached');
+
+    // The row lives in exactly one index again.
+    expect(readIndex(cloud('projects', PID, 'chats', '_index.json')).some((r) => r.conversation_id === cid)).toBe(false);
+    const globalRow = readIndex(cloud('chats', '_index.json')).find((r) => r.conversation_id === cid);
+    expect(globalRow?.title).toBe('filed then undone');
+    expect(globalRow?.project_id).toBeFalsy();
+  });
+
+  it('refuses a conversation that is not in a project', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const conv = await chats.createConversation(UID, { title: 'never filed' });
+    const cid = conv.conversation_id;
+    seedConversationBytes(cid);
+
+    expect(await chats.moveConversationOutOfProject(UID, cid)).toEqual({ ok: false, error: 'not_in_project' });
+    for (const file of globalPaths(cid)) expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it('refuses while the conversation has a live turn', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    await seedProject();
+    const conv = await chats.createConversation(UID, { title: 'busy' });
+    const cid = conv.conversation_id;
+    seedConversationBytes(cid);
+    expect((await chats.moveConversationToProject(UID, cid, PID)).ok).toBe(true);
+    // A running turn holds the session files open; relocating them under it is
+    // the race the guard exists to prevent, in either direction.
+    write(cloud('projects', PID, 'chats', cid, 'state.json'),
+      JSON.stringify({ status: 'running', in_flight: [] }));
+
+    expect(await chats.moveConversationOutOfProject(UID, cid)).toEqual({ ok: false, error: 'has_running_conv' });
+    for (const file of projectPaths(cid)) expect(fs.existsSync(file)).toBe(true);
+    expect(readIndex(cloud('projects', PID, 'chats', '_index.json')).some((r) => r.conversation_id === cid)).toBe(true);
+  });
+
+  it('restores the project row and bytes after process exit mid-unfile', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    await seedProject();
+    const conv = await chats.createConversation(UID, { title: 'interrupted undo' });
+    const other = await chats.createConversation(UID, { title: 'unrelated', projectId: PID });
+    const cid = conv.conversation_id;
+    seedConversationBytes(cid);
+    expect((await chats.moveConversationToProject(UID, cid, PID)).ok).toBe(true);
+
+    const result = spawnSync(process.execPath, ['-r', 'tsx/cjs', '-e', `
+      const fs = require('node:fs');
+      const slash = file => file.split(require('node:path').sep).join('/');
+      const uid = ${JSON.stringify(UID)}, cid = ${JSON.stringify(cid)};
+      require('./src/main/features/users.ts').activateUser(uid);
+      const chats = require('./src/main/features/chats.ts');
+      const rename = fs.renameSync;
+      fs.renameSync = function(from, to) {
+        const out = rename(from, to);
+        if (slash(to).endsWith('/cloud/chats/' + cid + '.jsonl')) process.exit(73);
+        return out;
+      };
+      chats.moveConversationOutOfProject(uid, cid).then(() => process.exit(74));
+    `], {
+      cwd: path.resolve(__dirname, '../../..'),
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', ORKAS_WORKSPACE_ROOT: tmpDir },
+      encoding: 'utf8', timeout: 30_000,
+    });
+    expect({ status: result.status, stdout: result.stdout, stderr: result.stderr, error: result.error?.message })
+      .toEqual({ status: 73, stdout: '', stderr: '', error: undefined });
+    expect(fs.existsSync(path.join(tmpDir, UID, 'local', 'conversation-moves', `${cid}.json`))).toBe(true);
+
+    vi.resetModules();
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(UID);
+    const restarted = await import('../../../src/main/features/chats');
+    const layout = await import('../../../src/main/util/project-layout');
+    // Rolled back to the project: an uncommitted unfiling must not leave the row
+    // in the global index while its bytes sit under the project.
+    expect(layout.findProjectIdForConversation(UID, cid)).toBe(PID);
+    expect(fs.readFileSync(layout.conversationMessageReadFile(UID, cid), 'utf8'))
+      .toBe('{"from":"user","text":"hello"}\n');
+    const rows = await restarted.listConversations(UID);
+    expect(rows.filter(row => row.conversation_id === cid)).toHaveLength(1);
+    expect(rows.find(row => row.conversation_id === cid)?.project_id).toBe(PID);
+    expect(rows.find(row => row.conversation_id === other.conversation_id)?.project_id).toBe(PID);
+    for (const file of projectPaths(cid)) expect(fs.existsSync(file)).toBe(true);
+    // Still undoable after recovery.
+    expect((await restarted.moveConversationOutOfProject(UID, cid)).ok).toBe(true);
+  }, 40_000);
+
+  it('tells sync the project copies retired, not the ones that came back', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const { committedConversationRelocations } = await import('../../../src/main/util/conversation-relocate');
+    await seedProject();
+    const conv = await chats.createConversation(UID, { title: 'round trip' });
+    const cid = conv.conversation_id;
+    seedConversationBytes(cid);
+    expect((await chats.moveConversationToProject(UID, cid, PID)).ok).toBe(true);
+    expect((await chats.moveConversationOutOfProject(UID, cid)).ok).toBe(true);
+
+    // The surviving receipt is the undo's. Reporting the root paths as retired
+    // would tell sync to delete the bytes the user just got back.
+    const retired = committedConversationRelocations(UID).flatMap((item) => item.files);
+    expect(retired).toContain(`cloud/projects/${PID}/chats/${cid}.jsonl`);
+    expect(retired).toContain(`cloud/projects/${PID}/chat_attachments/${cid}/note.txt`);
+    expect(retired.some((file) => file === `cloud/chats/${cid}.jsonl`)).toBe(false);
+    expect(retired.every((file) => file.startsWith(`cloud/projects/${PID}/`))).toBe(true);
+  });
 });

@@ -1059,7 +1059,10 @@ describe('runner › scoped tool loading', () => {
     expect(built.runner.getActiveToolDefinitions().map((tool) => tool.name)).not.toContain('todo_tasks');
     const context = { workingDir: tmpDir, state: {} };
     const load = await runner.tools.get('tool_load').execute({ groups: ['management.projects'] }, context);
-    expect(JSON.parse(load.content)).toMatchObject({ ok: true, newly_activated_tools: ['todo_tasks'] });
+    // The same group carries the project-creation tool for Commander; both are
+    // dormant until this load, and neither is resident.
+    expect(JSON.parse(load.content))
+      .toMatchObject({ ok: true, newly_activated_tools: ['todo_tasks', 'project_setup'] });
     expect(names).not.toHaveBeenCalled();
     expect(built.runner.getActiveToolDefinitions().map((tool) => tool.name)).toContain('todo_tasks');
     const tool = runner.tools.get('todo_tasks');

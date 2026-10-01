@@ -812,6 +812,7 @@ export class OrkasTestApp {
   private readonly recoveredRendererErrors = new Set<number>();
   private readonly tracePaths: string[] = [];
   private traceNumber = 0;
+  private readonly appClosePromises = new WeakMap<ElectronApplication, Promise<void>>();
   private activeUserId: string;
   private readonly configuredModelSeededUsers = new Set<string>();
   private modelToolScenario: ModelToolScenario | null = null;
@@ -1798,21 +1799,31 @@ export class OrkasTestApp {
   private async closeCurrentApp(): Promise<void> {
     const app = this.electronApp;
     if (!app) return;
+    const existing = this.appClosePromises.get(app);
+    if (existing) return existing;
 
-    const tracePath = this.testInfo.outputPath(`trace-${++this.traceNumber}.zip`);
-    this.tracePaths.push(tracePath);
-    try {
-      await closeElectronFixture({
-        process: () => app.process(),
-        context: () => app.context(),
-        close: () => requestElectronQuit(app),
-      }, tracePath, {
-        phase: (phase, outcome) => this.recordCleanupPhase(phase, outcome),
-      });
-    } finally {
-      this.electronApp = null;
-      this.page = null;
-    }
+    // Relaunch and timeout teardown may overlap. Keep one trace and quit per
+    // captured application, including the same failure for every waiting caller.
+    const closing = Promise.resolve().then(async () => {
+      const tracePath = this.testInfo.outputPath(`trace-${++this.traceNumber}.zip`);
+      this.tracePaths.push(tracePath);
+      try {
+        await closeElectronFixture({
+          process: () => app.process(),
+          context: () => app.context(),
+          close: () => requestElectronQuit(app),
+        }, tracePath, {
+          phase: (phase, outcome) => this.recordCleanupPhase(phase, outcome),
+        });
+      } finally {
+        if (this.electronApp === app) {
+          this.electronApp = null;
+          this.page = null;
+        }
+      }
+    });
+    this.appClosePromises.set(app, closing);
+    return closing;
   }
 
   private async ensureStubServer(): Promise<void> {

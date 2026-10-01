@@ -53,14 +53,21 @@ describe('conversation entry assistance', () => {
     expect(await reloaded.resolveConversationAssistanceForTurn('u1', cid)).toEqual({ kind: 'app_creation', guidance: first });
   });
 
-  it('preserves connector guidance and leaves ordinary, unknown and deleted tasks empty', async () => {
+  it('preserves connector guidance, adds follow-up only to existing projectless conversations', async () => {
     const chats = await import('../../../src/main/features/chats');
     const context = await import('../../../src/main/features/conversation_assistance_context');
     const setup = await import('../../../src/main/features/connector_setup_context');
     for (const assistance of [undefined, { kind: 'app-creation' }, ['app_creation']]) {
       const conv = await chats.createConversation('u1', { assistance: assistance as any });
       expect(conv.assistance).toBeUndefined();
-      expect((await context.resolveConversationAssistanceForTurn('u1', conv.conversation_id)).guidance).toBe('');
+      // An unknown entry association contributes nothing; the follow-up guidance
+      // comes from the conversation having no project, not from entry metadata.
+      const { guidance } = await context.resolveConversationAssistanceForTurn('u1', conv.conversation_id);
+      expect(guidance).not.toContain('create_artifact');
+      expect(guidance).not.toContain('## Connector setup assistance');
+      expect(guidance).toBe(
+        fs.readFileSync(path.join(__dirname, '../../../src/main/prompts/followup_offer_guidance.md'), 'utf8').trim(),
+      );
     }
     const conv = await chats.createConversation('u1', {
       assistance: { kind: 'connector_setup', connector_id: 'notion' },
@@ -68,10 +75,40 @@ describe('conversation entry assistance', () => {
     const cid = conv.conversation_id;
     const original = await setup.formatConnectorSetupForTurn('u1', cid);
     expect(original).toContain('## Connector setup assistance');
-    expect((await context.resolveConversationAssistanceForTurn('u1', cid)).guidance).toBe(original);
+    const withFollowUp = (await context.resolveConversationAssistanceForTurn('u1', cid)).guidance;
+    expect(withFollowUp.startsWith(original)).toBe(true);
+    expect(withFollowUp).toContain('## Keeping work going');
     await chats.updateConversation('u1', cid, { assistance: { kind: 'app_creation' } });
     expect(await setup.formatConnectorSetupForTurn('u1', cid)).toBe('');
     await chats.deleteConversation('u1', cid);
     expect((await context.resolveConversationAssistanceForTurn('u1', cid)).guidance).toBe('');
+  });
+
+  it('stops offering a project once the conversation has one or is on its way', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const filing = await import('../../../src/main/features/conversation_filing');
+    const context = await import('../../../src/main/features/conversation_assistance_context');
+    const created = await projects.createProject('u1', 'Already a project');
+    const pid = (created as { project: any }).project.project_id;
+
+    const filed = await chats.createConversation('u1', { title: 'filed' });
+    expect((await chats.moveConversationToProject('u1', filed.conversation_id, pid)).ok).toBe(true);
+    // Filing is impossible from here, so repeating the offer would ask the model
+    // to do something the host would refuse.
+    expect((await context.resolveConversationAssistanceForTurn('u1', filed.conversation_id)).guidance)
+      .not.toContain('## Keeping work going');
+
+    const pending = await chats.createConversation('u1', { title: 'pending' });
+    expect((await context.resolveConversationAssistanceForTurn('u1', pending.conversation_id)).guidance)
+      .toContain('## Keeping work going');
+    const queued = await filing.fileConversationUnderNewProject(
+      'u1', pending.conversation_id, 'On its way', { moveNow: false },
+    );
+    expect(queued.ok).toBe(true);
+    // The relocation is recorded for the end of this turn; offering again in the
+    // same turn would produce a second project.
+    expect((await context.resolveConversationAssistanceForTurn('u1', pending.conversation_id)).guidance)
+      .not.toContain('## Keeping work going');
   });
 });

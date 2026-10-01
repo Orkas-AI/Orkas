@@ -705,6 +705,17 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     }));
   }
 
+  // Creating a project for this conversation and relocating it is Commander's
+  // decision; a named Agent or Worker never receives the executor.
+  if (uid && isCommander && params.cid) {
+    const { createProjectSetupTool } = await import('../../features/project_setup_tool');
+    injectedTools.push(createProjectSetupTool({
+      userId: uid,
+      cid: params.cid,
+      projectId: params.projectId || null,
+    }));
+  }
+
   if (uid && (isCommander || isGroupAgent)) {
     const { createAutoTasksTool } = await import('../../features/auto_tasks_tool');
     injectedTools.push(createAutoTasksTool({

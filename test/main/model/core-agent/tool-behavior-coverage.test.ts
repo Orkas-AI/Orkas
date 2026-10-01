@@ -59,6 +59,7 @@ const BEHAVIOR_SUITE_BY_TOOL: Record<string, string> = {
   cross_session_memory: 'src/core-agent/test/memory-tool.test.ts',
   project_instructions: 'src/core-agent/test/project-instructions-tool.test.ts',
   todo_tasks: 'src/core-agent/test/project-tasks-tool.test.ts',
+  project_setup: 'test/main/features/project-setup-tool.test.ts',
   metacognition: 'src/core-agent/test/metacognition-tool.test.ts',
   skill_manage: 'src/core-agent/test/evolution.test.ts',
   skill_search: 'test/main/features/group_chat/bus-integration.test.ts',

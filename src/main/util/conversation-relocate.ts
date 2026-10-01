@@ -1,5 +1,5 @@
 /**
- * Relocate one conversation's bytes from the unprojected root into a project.
+ * Relocate one conversation's bytes between the unprojected root and a project.
  *
  * Project membership is a storage location, not a field: messages, the group
  * companion dir, the commander and per-agent sessions, attachments and
@@ -7,6 +7,12 @@
  * to a project. The set moved here is the same set the boot migration moves
  * (`migrate-project-layout-v4.ts::migrateConversation`), which is the only
  * other code in the app that relocates a conversation.
+ *
+ * Either direction is the same prefix rewrite between `cloud/` and
+ * `cloud/projects/<pid>/`: both layouts use the same file names, so the pair
+ * list is built once from the two roots and oriented by `direction`. Filing a
+ * conversation is what the picker and the model-facing tool do; unfiling is how
+ * an automatic filing stays reversible.
  *
  * A local write-ahead record precedes every runtime move. An explicit commit
  * marker follows the index/meta writes; activation rolls back uncommitted
@@ -21,8 +27,7 @@ import {
   projectChatAttachmentDir,
   projectChatJsonlFile,
   projectGroupChatDir,
-  projectSessionCloudToolResultsDir,
-  projectSessionFile,
+  projectSessionsDir,
   userChatArtifactsDir,
   userChatAttachmentsDir,
   userChatsDir,
@@ -58,31 +63,30 @@ interface Pair {
 /** Session sidecars share a stem, so each is matched by its own suffix. */
 const SESSION_SUFFIXES = ['.jsonl', '.jsonl.context.json', '.tool-results'] as const;
 
-function sessionDestination(uid: string, pid: string, name: string): string | null {
-  for (const suffix of SESSION_SUFFIXES) {
-    if (!name.endsWith(suffix)) continue;
-    const sid = name.slice(0, -suffix.length);
-    if (suffix === '.tool-results') return projectSessionCloudToolResultsDir(uid, pid, sid);
-    if (suffix === '.jsonl.context.json') return `${projectSessionFile(uid, pid, sid)}.context.json`;
-    return projectSessionFile(uid, pid, sid);
-  }
-  return null;
-}
+/** `into` files a loose conversation under a project; `out` returns it to the
+ *  unprojected root. */
+export type RelocationDirection = 'into' | 'out';
 
 /**
  * Every source/destination pair for `cid`, whether or not the source exists.
  * Enumerating the session directory is the truth source: `members.json` can
  * already be gone or stale, which is what leaked orphan member sessions in the
- * delete path before it started globbing too.
+ * delete path before it started globbing too. The session directory to
+ * enumerate is the one the bytes currently sit in.
  */
-function relocationPairs(uid: string, cid: string, pid: string): Pair[] {
+function relocationPairs(
+  uid: string,
+  cid: string,
+  pid: string,
+  direction: RelocationDirection,
+): Pair[] {
   const chatRoot = userChatsDir(uid);
-  const pairs: Pair[] = [
-    { domain: 'chats', src: path.join(chatRoot, `${cid}.jsonl`), dst: projectChatJsonlFile(uid, pid, cid) },
-    { domain: 'chats', src: path.join(chatRoot, cid), dst: projectGroupChatDir(uid, pid, cid) },
+  const both: { domain: Pair['domain']; root: string; project: string }[] = [
+    { domain: 'chats', root: path.join(chatRoot, `${cid}.jsonl`), project: projectChatJsonlFile(uid, pid, cid) },
+    { domain: 'chats', root: path.join(chatRoot, cid), project: projectGroupChatDir(uid, pid, cid) },
   ];
 
-  const sessionsRoot = userSessionsDir(uid);
+  const sessionsRoot = direction === 'into' ? userSessionsDir(uid) : projectSessionsDir(uid, pid);
   let names: string[] = [];
   try { names = fs.readdirSync(sessionsRoot); } catch { names = []; }
   const commanderStem = `gconv-${cid}`;
@@ -93,21 +97,26 @@ function relocationPairs(uid: string, cid: string, pid: string): Pair[] {
       || name === `${commanderStem}.tool-results`
       || (name.startsWith(memberPrefix) && SESSION_SUFFIXES.some((suffix) => name.endsWith(suffix)));
     if (!owned) continue;
-    const dst = sessionDestination(uid, pid, name);
-    if (dst) pairs.push({ domain: 'sessions', src: path.join(sessionsRoot, name), dst });
+    both.push({
+      domain: 'sessions',
+      root: path.join(userSessionsDir(uid), name),
+      project: path.join(projectSessionsDir(uid, pid), name),
+    });
   }
 
-  pairs.push({
+  both.push({
     domain: 'chat_attachments',
-    src: path.join(userChatAttachmentsDir(uid), cid),
-    dst: projectChatAttachmentDir(uid, pid, cid),
+    root: path.join(userChatAttachmentsDir(uid), cid),
+    project: projectChatAttachmentDir(uid, pid, cid),
   });
-  pairs.push({
+  both.push({
     domain: 'chat_artifacts',
-    src: path.join(userChatArtifactsDir(uid), cid),
-    dst: projectChatArtifactCidDir(uid, pid, cid),
+    root: path.join(userChatArtifactsDir(uid), cid),
+    project: projectChatArtifactCidDir(uid, pid, cid),
   });
-  return pairs;
+  return both.map(({ domain, root, project }) => direction === 'into'
+    ? { domain, src: root, dst: project }
+    : { domain, src: project, dst: root });
 }
 
 function moveOne(pair: Pair): boolean {
@@ -124,17 +133,18 @@ function moveOne(pair: Pair): boolean {
 }
 
 /**
- * Move every byte of `cid` into `pid` and report what changed, so the caller
- * can tell sync which paths were retired and which appeared. Throws with the
- * filesystem left as it was found.
+ * Move every byte of `cid` between the root and `pid` and report what changed,
+ * so the caller can tell sync which paths were retired and which appeared.
+ * Throws with the filesystem left as it was found.
  */
-export function relocateConversationIntoProject(
+function relocateConversation(
   uid: string,
   cid: string,
   pid: string,
+  direction: RelocationDirection,
   original?: Record<string, unknown>,
 ): RelocatedPaths[] {
-  const pairs = relocationPairs(uid, cid, pid);
+  const pairs = relocationPairs(uid, cid, pid, direction);
   const files = new Map<Pair, string[]>();
   const collect = (file: string, out: string[]): void => {
     let stat: fs.Stats;
@@ -166,9 +176,23 @@ export function relocateConversationIntoProject(
   }
   if (original) {
     const file = journalPath(uid, cid);
-    if (fs.existsSync(file)) throw new Error('Conversation move recovery is pending');
+    if (fs.existsSync(file)) {
+      // A `prepared` record is an interrupted move whose rollback has not run;
+      // moving again would strand it. A `committed` record is only the receipt
+      // sync has not consumed yet, and with sync disabled it is never consumed,
+      // so an undo must not be blocked by it: the receipt written here
+      // supersedes it, and the consumer already skips a retired path whose
+      // source is back on disk. An unreadable record fails closed.
+      let superseded = false;
+      try { superseded = readJournal(uid, cid).phase === 'committed'; }
+      catch { superseded = false; }
+      if (!superseded) throw new Error('Conversation move recovery is pending');
+    }
     persistJournal(uid, {
-      version: 1, cid, pid, phase: 'prepared', original,
+      // A record an older build cannot interpret must be rejected outright, not
+      // rolled back the wrong way, so the reverse direction carries version 2.
+      ...(direction === 'into' ? { version: 1 as const } : { version: 2 as const, direction }),
+      cid, pid, phase: 'prepared', original,
       moved: planned.map(pair => ({ domain: pair.domain, from: cloudRelForAbs(uid, pair.src),
         to: cloudRelForAbs(uid, pair.dst), files: files.get(pair)! })),
     });
@@ -198,13 +222,39 @@ export function relocateConversationIntoProject(
   }));
 }
 
+/** File a loose conversation under `pid`. */
+export function relocateConversationIntoProject(
+  uid: string,
+  cid: string,
+  pid: string,
+  original?: Record<string, unknown>,
+): RelocatedPaths[] {
+  return relocateConversation(uid, cid, pid, 'into', original);
+}
+
+/** Return a conversation from `pid` to the unprojected root. */
+export function relocateConversationOutOfProject(
+  uid: string,
+  cid: string,
+  pid: string,
+  original?: Record<string, unknown>,
+): RelocatedPaths[] {
+  return relocateConversation(uid, cid, pid, 'out', original);
+}
+
 interface MoveJournal {
-  version: 1;
+  /** 1 is the original filing record and carries no `direction`; 2 adds it. */
+  version: 1 | 2;
   cid: string;
   pid: string;
+  direction?: RelocationDirection;
   phase: 'prepared' | 'committed';
   original: Record<string, unknown>;
   moved: RelocatedPaths[];
+}
+
+function journalDirection(journal: MoveJournal): RelocationDirection {
+  return journal.direction === 'out' ? 'out' : 'into';
 }
 
 function journalPath(uid: string, cid: string): string {
@@ -220,27 +270,39 @@ function persistJournal(uid: string, journal: MoveJournal): void {
 
 function readJournal(uid: string, cid: string): MoveJournal {
   const journal = JSON.parse(fs.readFileSync(journalPath(uid, cid), 'utf8')) as MoveJournal;
-  if (journal.version !== 1 || journal.cid !== cid || !safeId(cid) || !safeId(journal.pid)
+  const direction = journalDirection(journal);
+  // The version pins the direction: a filing record stays exactly what earlier
+  // builds wrote, and an unfiling record is unreadable to them.
+  const versionMatchesDirection = direction === 'into' ? journal.version === 1 : journal.version === 2;
+  // The row a rollback restores must belong where the bytes came from.
+  const originMatches = direction === 'into'
+    ? !journal.original?.project_id
+    : journal.original?.project_id === journal.pid;
+  if (!versionMatchesDirection || journal.cid !== cid || !safeId(cid) || !safeId(journal.pid)
     || !['prepared', 'committed'].includes(journal.phase)
-    || journal.original?.conversation_id !== cid || journal.original.project_id
+    || journal.original?.conversation_id !== cid || !originMatches
     || !Array.isArray(journal.moved)) throw new Error('Invalid conversation move recovery record');
+  const sourcePrefix = direction === 'into' ? 'cloud/' : `cloud/projects/${journal.pid}/`;
+  const targetPrefix = direction === 'into' ? `cloud/projects/${journal.pid}/` : 'cloud/';
   const roots: Record<RelocatedPaths['domain'], string[]> = {
-    chats: [`cloud/chats/${cid}`, `cloud/chats/${cid}.jsonl`],
+    chats: [`${sourcePrefix}chats/${cid}`, `${sourcePrefix}chats/${cid}.jsonl`],
     sessions: [],
-    chat_attachments: [`cloud/chat_attachments/${cid}`],
-    chat_artifacts: [`cloud/chat_artifacts/${cid}`],
+    chat_attachments: [`${sourcePrefix}chat_attachments/${cid}`],
+    chat_artifacts: [`${sourcePrefix}chat_artifacts/${cid}`],
   };
+  const sessionPrefix = `${sourcePrefix}sessions/`;
   const seen = new Set<string>();
   for (const item of journal.moved) {
     if (!item || typeof item.from !== 'string') throw new Error('Invalid conversation move recovery paths');
     const from = item.from;
-    const name = typeof from === 'string' ? from.slice('cloud/sessions/'.length) : '';
-    const session = item.domain === 'sessions' && from.startsWith('cloud/sessions/')
+    const name = from.startsWith(sessionPrefix) ? from.slice(sessionPrefix.length) : '';
+    const session = item.domain === 'sessions' && from.startsWith(sessionPrefix)
       && !name.includes('/') && !name.includes('\\') && !name.includes('..')
       && SESSION_SUFFIXES.some(suffix => name === `gconv-${cid}${suffix}`
         || (name.startsWith(`gmember-${cid}-`) && name.endsWith(suffix)));
     if ((!session && !roots[item.domain]?.includes(from)) || seen.has(from)
-      || item.to !== from.replace('cloud/', `cloud/projects/${journal.pid}/`)
+      || !from.startsWith(sourcePrefix)
+      || item.to !== `${targetPrefix}${from.slice(sourcePrefix.length)}`
       || !Array.isArray(item.files) || !item.files.every(file => typeof file === 'string'
         && (file === from || file.startsWith(`${from}/`))
         && !file.split('/').some(part => part === '..' || part === '.' || !part)
@@ -303,9 +365,17 @@ export function recoverConversationRelocation(uid: string, cid: string): void {
     fs.mkdirSync(path.dirname(from), { recursive: true });
     fs.renameSync(to, from);
   }
-  writeJsonSync(path.join(userChatsDir(uid), cid, 'meta.json'), journal.original);
-  writeJsonSync(globalIndex, [journal.original, ...globalRows]);
-  writeJsonSync(projectIndex, projectRows);
+  // Restore the row and its meta where the bytes came from; the other index
+  // loses it. Bytes alone do not carry ownership.
+  if (journalDirection(journal) === 'into') {
+    writeJsonSync(path.join(userChatsDir(uid), cid, 'meta.json'), journal.original);
+    writeJsonSync(globalIndex, [journal.original, ...globalRows]);
+    writeJsonSync(projectIndex, projectRows);
+  } else {
+    writeJsonSync(path.join(projectGroupChatDir(uid, journal.pid, cid), 'meta.json'), journal.original);
+    writeJsonSync(projectIndex, [journal.original, ...projectRows]);
+    writeJsonSync(globalIndex, globalRows);
+  }
   invalidateConversationProjectCache(uid, cid);
   fs.unlinkSync(journalPath(uid, cid));
   setConversationRelocationBlocked(uid, cid, false);

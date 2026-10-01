@@ -40,6 +40,7 @@ import {
 } from '../util/project-layout';
 import {
   relocateConversationIntoProject,
+  relocateConversationOutOfProject,
   recoverConversationRelocation,
   commitConversationRelocation,
   type RelocatedPaths,
@@ -2151,7 +2152,8 @@ export async function setConversationPinned(
 
 export type ConversationMoveResult =
   | { ok: true; conversation: Conversation }
-  | { ok: false; error: 'not_found' | 'already_in_project' | 'has_running_conv' | 'move_failed' };
+  | { ok: false; error: 'not_found' | 'already_in_project' | 'not_in_project'
+    | 'has_running_conv' | 'move_failed' };
 
 /**
  * Move an unprojected conversation into `projectId`.
@@ -2232,6 +2234,71 @@ export async function moveConversationToProject(
     // until something else happens to schedule a catch-up pass.
     search.invalidateChatsIndex(userId);
     log.info(`conversation moved user=${maskId(userId)} cid=${maskId(cid)} pid=${maskId(projectId)} paths=${moved.length}`);
+    return { ok: true, conversation: next };
+  });
+}
+
+/**
+ * Return a conversation to the unprojected root.
+ *
+ * Filing a conversation under a project can be automatic, so it has to be
+ * undoable; without this the only way back is deleting the project, which
+ * cascades the conversation with it. The guards mirror the filing direction:
+ * relocation moves the same bytes, so a live turn still refuses.
+ */
+export async function moveConversationOutOfProject(
+  userId: string,
+  cid: string,
+): Promise<ConversationMoveResult> {
+  if (!safeId(cid)) return { ok: false, error: 'not_found' };
+  return _withConversationIndexStore(userId, async (store) => {
+    const target = await store.findTarget(cid);
+    if (!target || isDeletedConversation(target.conversation)) return { ok: false, error: 'not_found' };
+    const projectId = target.conversation.project_id;
+    if (!projectId) return { ok: false, error: 'not_in_project' };
+
+    try {
+      const state = await readState(userId, cid, projectId);
+      const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
+      if (state.status === 'running' || state.in_flight.length > 0 || !bus.isQuiescent(userId, cid)) {
+        return { ok: false, error: 'has_running_conv' };
+      }
+    } catch { return { ok: false, error: 'move_failed' }; }
+
+    const oldMessageFile = conversationMessageFile(userId, cid, projectId);
+
+    setConversationRelocationBlocked(userId, cid, true);
+    let moved: RelocatedPaths[];
+    try {
+      moved = relocateConversationOutOfProject(userId, cid, projectId, { ..._cleanConversation(target.conversation) });
+    } catch (err) {
+      try { recoverConversationRelocation(userId, cid); }
+      catch (recoveryErr) {
+        log.warn('conversation unfile recovery failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(recoveryErr) });
+      }
+      log.warn('conversation unfile relocate failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(err) });
+      return { ok: false, error: 'move_failed' };
+    }
+
+    const next = _stampConversationSync(userId, { ...target.conversation, project_id: '' });
+    try {
+      await store.persistTarget(target, next);
+      commitConversationRelocation(userId, cid);
+    } catch (err) {
+      try { recoverConversationRelocation(userId, cid); }
+      catch (recoveryErr) {
+        log.warn('conversation unfile recovery failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(recoveryErr) });
+      }
+      log.warn('conversation unfile commit failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(err) });
+      return { ok: false, error: 'move_failed' };
+    }
+
+    invalidateConversationProjectCache(userId, cid);
+    setConversationRelocationBlocked(userId, cid, false);
+    await purgeConversationHistoryCache(userId, oldMessageFile);
+    invalidateLineCount(oldMessageFile);
+    search.invalidateChatsIndex(userId);
+    log.info(`conversation unfiled user=${maskId(userId)} cid=${maskId(cid)} pid=${maskId(projectId)} paths=${moved.length}`);
     return { ok: true, conversation: next };
   });
 }

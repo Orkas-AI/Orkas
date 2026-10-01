@@ -16250,7 +16250,6 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   background: var(--surface);
   border-color: var(--border-strong);
 }
-/* Create leads its cluster by one step in surface tone, not by a color. */
 .header-entry-btn:hover { background: var(--surface-2); }
 .header-entry-btn:active { background: var(--primary-soft); }
 .header-entry-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }

@@ -131,7 +131,10 @@ function rendererNavHarness(failingFeature = '') {
   return {
     calls,
     surfaces: (context as unknown as {
-      __appNavSurfaces: Record<string, { open: (request: Record<string, string>) => Promise<void> }>;
+      __appNavSurfaces: Record<string, {
+        createKey?: string;
+        open: (request: Record<string, string>) => Promise<void>;
+      }>;
     }).__appNavSurfaces,
   };
 }
@@ -625,6 +628,37 @@ describe('group_chat app_nav registry', () => {
     const mountBlock = source.slice(start, end);
     expect(mountBlock).not.toContain('_convTrackClick');
     expect(mountBlock).not.toContain('_onboardingTelemetryContext');
+  });
+
+  it('names create cards after what they create, not the page that hosts them', () => {
+    // A shared "Create in {name}" label read as "create inside a Project" on the Project card.
+    const { host, mount } = rendererMountHarness();
+    mount(host, {
+      app_nav_requests: ['projects', 'agents', 'skills', 'auto']
+        .map((surfaceId) => ({ surface_id: surfaceId, action: 'create' })),
+    });
+    expect(host.querySelector('.chat-app-nav-row')!.children.map((button) => button.textContent)).toEqual([
+      'sidebar.project_create_title:Projects',
+      'agent_modal.title:AI Team',
+      'skill_modal.title_create:Skills',
+      'auto.create_section_title:Auto',
+    ]);
+  });
+
+  it('ships create-card copy for every creatable surface in every renderer locale', () => {
+    const { surfaces } = rendererNavHarness();
+    const localeDir = path.join(path.dirname(RENDERER_CONVERSATION), '..', 'locales');
+    const tables: Record<string, Record<string, string>> = Object.fromEntries(fs.readdirSync(localeDir)
+      .filter((name) => name.endsWith('.json'))
+      .map((file) => [file, JSON.parse(fs.readFileSync(path.join(localeDir, file), 'utf8'))]));
+    for (const surface of APP_NAV_SURFACES.filter((item) => item.actions.includes('create'))) {
+      const key = surfaces[surface.id].createKey ?? '';
+      for (const [file, table] of Object.entries(tables)) {
+        expect(table[key]?.trim(), `${file}:${surface.id}`).toBeTruthy();
+      }
+    }
+    expect(tables['zh.json'][surfaces.projects.createKey ?? '']).toBe('新建项目');
+    expect(tables['en.json'][surfaces.projects.createKey ?? '']).toBe('New project');
   });
 
   it('keeps the page action compact, evenly spaced, regular-weight, and chevron-free', () => {

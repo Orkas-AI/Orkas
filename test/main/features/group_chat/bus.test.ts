@@ -2771,11 +2771,11 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     cidsToDrop.add(cid);
     const events: any[] = [];
     const unsub = bus.subscribe(TEST_UID, cid, event => events.push(event));
-    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Inspect this project.', forceTo: [AGENT_ID] });
-    await vi.waitFor(() => expect(cliRunMock.calls).toHaveLength(1));
-    cliRunMock.calls[0].onEvent({ type: 'async-message', itemId: 'native-question', text: 'Which scope?', questions: [{ title: 'Which scope?', options: ['Current', 'All'] }] });
-    await vi.waitFor(() => expect(events.some(event => event.msg?.cli_question)).toBe(true));
     try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Inspect this project.', forceTo: [AGENT_ID] });
+      await vi.waitFor(() => expect(cliRunMock.calls).toHaveLength(1));
+      cliRunMock.calls[0].onEvent({ type: 'async-message', itemId: 'native-question', text: 'Which scope?', questions: [{ title: 'Which scope?', options: ['Current', 'All'] }] });
+      await vi.waitFor(() => expect(events.some(event => event.msg?.cli_question)).toBe(true));
       const question = events.find(event => event.msg?.cli_question).msg;
       const payload = { cid, message_id: question.id, cancelled: true };
       expect(await respond(payload, { userId: 'other-account' })).toEqual({ ok: false, error: 'expired' });
@@ -2804,6 +2804,8 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       expect(cliRunMock.calls).toHaveLength(1);
       rewrite.mockRestore();
     } finally {
+      // A timed-out admission may reach the mock after this cleanup.
+      cliRunMock.activeIngress = null;
       cliRunMock.releaseActiveIngressRun?.();
       cliRunMock.releaseActiveIngressRun = null;
       unsub();

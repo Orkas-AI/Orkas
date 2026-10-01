@@ -2018,8 +2018,10 @@ describe('conversation sidebar task row actions', () => {
 
     expect(context._conversationActionItems('c1').map((it: any) => it.action))
       .toEqual(['pin', 'rename', 'to-project', 'delete']);
+    // Filing can happen without a click, so a filed task offers the way back
+    // rather than nothing. The two entries are mutually exclusive.
     expect(context._conversationActionItems('c2').map((it: any) => it.action))
-      .toEqual(['pin', 'rename', 'delete']);
+      .toEqual(['pin', 'rename', 'out-of-project', 'delete']);
     // Delete stays last, and stays the only destructive entry.
     const loose = context._conversationActionItems('c1');
     expect(loose[loose.length - 1].danger).toBe(true);
@@ -2029,12 +2031,14 @@ describe('conversation sidebar task row actions', () => {
     expect(context._conversationActionItems('c1').find((it: any) => it.action === 'to-project').disabled).toBe(true);
     vm.runInContext("groupBusyConvs.delete('c1'); pendingConvs.set('c1', { aborted: true })", context);
     expect(context._conversationActionItems('c1').find((it: any) => it.action === 'to-project').disabled).toBe(true);
-
+    // The relocation refuses in either direction while a turn is live.
+    vm.runInContext("groupBusyConvs.set('c2', true)", context);
+    expect(context._conversationActionItems('c2').find((it: any) => it.action === 'out-of-project').disabled).toBe(true);
   });
 });
 
 describe('conversation filing agent choices', () => {
-  function setup(choice: any, rejected: string[] = [], moveFails = false) {
+  function setup(choice: any, rejected: string[] = [], moveFails = false, onPushEvent?: Function) {
     const bindings = new Set(['already-bound']);
     const toasts: string[] = [];
     const ctx: any = {
@@ -2051,7 +2055,7 @@ describe('conversation filing agent choices', () => {
         if (moveFails) return { ok: false, error: 'has_running_conv' };
         return { ok: true, conversation: { conversation_id: 'c1', project_id: 'p1' } };
       } }),
-      window: { orkas: { invoke: vi.fn(async (channel: string, args: any) => {
+      window: { orkas: { onPushEvent, invoke: vi.fn(async (channel: string, args: any) => {
         if (channel === 'projects.list') return { projects: [{ project_id: 'p1', name: 'Existing project' }] };
         if (channel === 'projects.create') return { ok: true, project: { project_id: 'p1' } };
         if (channel === 'projects.bindings.add') {
@@ -2069,6 +2073,28 @@ describe('conversation filing agent choices', () => {
     return { ctx, bindings, toasts };
   }
 
+  it.each([0, 2])('explains retained setup and manual recovery without retrying automatically (%s todos)', (count) => {
+    const listeners = new Map<string, Function>();
+    const subscribe = vi.fn((channel: string, handler: Function) => listeners.set(channel, handler));
+    const { ctx, toasts } = setup(null, [], false, subscribe);
+    // A reload flushes host receipts at did-finish-load, before deferred boot
+    // subscriptions run. This passive sink must already be listening then.
+    expect(listeners.has('conversations:filing-failed')).toBe(true);
+    ctx.startConversationFiledSubscription();
+    ctx.startConversationFiledSubscription();
+    expect(ctx.window.orkas.onPushEvent).toHaveBeenCalledTimes(2);
+    const onFailure = listeners.get('conversations:filing-failed');
+    expect(onFailure).toBeTypeOf('function');
+    onFailure!({ cid: 'c1', projectId: 'p1', projectName: 'Created project 2', todosCreated: count });
+    expect(JSON.parse(toasts[0])).toEqual({
+      key: count ? 'chat.conv_filing_failed_with_todos' : 'chat.conv_filing_failed',
+      args: { name: 'Created project 2', count },
+    });
+    expect(ctx.conversations[0].project_id).toBeUndefined();
+    expect(ctx.window.orkas.invoke).not.toHaveBeenCalled();
+  });
+
+
   it.each([false, true])('adds only the chosen agents and preserves existing bindings (create=%s)', async (create) => {
     const { ctx, bindings, toasts } = setup({ create, projectId: 'p1', agentIds: ['a1', 'a3'] });
     await ctx._moveConversationToExistingProject('c1');
@@ -2079,6 +2105,62 @@ describe('conversation filing agent choices', () => {
     expect(offered.map((agent: any) => agent.id).sort()).toEqual(['a1', 'a2', 'a3']);
     expect(offered.find((agent: any) => agent.id === 'a3').name).toBe('Third');
     expect(offered.find((agent: any) => agent.id === 'a1')).toMatchObject({ icon: 'rocket', color: 'coral' });
+  });
+
+  it('takes a filed task back out and stops nesting it under the old project', async () => {
+    const { ctx, toasts } = setup(null);
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Filed', project_id: 'p1' }];
+    ctx.window.orkas.invoke = vi.fn(async (channel: string) => {
+      if (channel === 'conversations.moveOut') {
+        // The backend row simply omits project_id once the task is unfiled.
+        return { ok: true, conversation: { conversation_id: 'c1', title: 'Filed' } };
+      }
+      throw new Error(`unexpected channel ${channel}`);
+    });
+
+    await ctx._moveConversationOutOfProject('c1');
+
+    // Merging the returned row would leave the old project_id in the cache and
+    // the sidebar would keep the task nested under a project it left.
+    expect(ctx.conversations[0].project_id).toBe('');
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_moved_out');
+  });
+
+  it('updates the sidebar from a host unfile receipt and reports an unfile refusal without retrying', async () => {
+    const listeners = new Map<string, Function>();
+    const { ctx, toasts } = setup(null, [], false, (channel: string, handler: Function) => listeners.set(channel, handler));
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Filed', project_id: 'p1' }];
+    ctx.startConversationFiledSubscription();
+    listeners.get('conversations:filing-failed')!({ cid: 'c1', kind: 'unfile' });
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_move_failed');
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect(ctx.window.orkas.invoke).not.toHaveBeenCalled();
+    listeners.get('conversations:filed')!({ conversation: { conversation_id: 'c1', title: 'Filed' } });
+    await Promise.resolve();
+    expect(ctx.conversations[0].project_id).toBe('');
+    expect(ctx.conversations[0].title).toBe('Filed');
+  });
+
+  it('keeps a task where it is when the relocation is refused', async () => {
+    const { ctx, toasts } = setup(null);
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Filed', project_id: 'p1' }];
+    ctx.window.orkas.invoke = vi.fn(async () => { throw new Error('has_running_conv'); });
+
+    await ctx._moveConversationOutOfProject('c1');
+
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_move_running');
+  });
+
+  it('does nothing for a task that is not in a project', async () => {
+    const { ctx, toasts } = setup(null);
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Loose' }];
+    ctx.window.orkas.invoke = vi.fn(async () => { throw new Error('should not be called'); });
+
+    await ctx._moveConversationOutOfProject('c1');
+
+    expect(ctx.window.orkas.invoke).not.toHaveBeenCalled();
+    expect(toasts).toEqual([]);
   });
 
   it('omits the commander even when legacy summaries include its actor ids', async () => {
@@ -4552,15 +4634,15 @@ describe('conversation process metadata formatting', () => {
       path.join(__dirname, '../../bin/orkas-bridge.cjs'),
       'utf8',
     );
-    const registeredTools = (source: string) => [...source.matchAll(/server\.(?:tool|registerTool)\(\s*'([^']+)'/g)]
+    const registeredTools = (source: string) => [...source.matchAll(/(?:server\.(?:tool|registerTool)|\bregisterTool)\(\s*'([^']+)'/g)]
       .map((match) => match[1])
       .sort();
     const presentedTools = [...new Set(orkasBridgeCases.map(([tool]) => tool))].sort();
 
     expect(registeredTools(bridgeSource)).toEqual(presentedTools);
-    // An uncovered tool must invalidate the matrix with either SDK API.
-    for (const method of ['tool', 'registerTool']) {
-      const extendedSource = `${bridgeSource}\nserver.${method}('uncovered_tool', {}, () => {});`;
+    // An uncovered tool must invalidate the matrix through either SDK API or the input adapter.
+    for (const method of ['server.tool', 'server.registerTool', 'registerTool']) {
+      const extendedSource = `${bridgeSource}\n${method}('uncovered_tool', {}, () => {});`;
       expect(registeredTools(extendedSource)).toEqual([...presentedTools, 'uncovered_tool'].sort());
       expect(registeredTools(extendedSource)).not.toEqual(presentedTools);
     }
@@ -9935,6 +10017,20 @@ describe('chat attachment picker targeting', () => {
       expect(vm.runInContext("_chatAttachList('c1').map((item) => item.name)", context))
         .toEqual(['missing.txt', 'queued.txt']);
     } finally { release(); }
+  });
+
+  it('names each create card after its destination action and rejects unsupported create requests', () => {
+    const context = loadConversationRenderer();
+    const locale = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales/en.json'), 'utf8'));
+    context.t = (key: string) => locale[key] || key;
+    context.document.createElement = createProcessTestElement;
+    const host = createProcessTestElement();
+    context._mountAppNavRequests(host, { app_nav_requests: [
+      ...['projects', 'agents', 'skills', 'auto', 'settings'].map(surface_id => ({ surface_id, action: 'create' })),
+      { surface_id: 'projects', action: 'create', target_id: 'existing-project' },
+    ] });
+    expect(host.children[0].children.map((button: any) => button.textContent))
+      .toEqual(['New project', 'New agent', 'New skill', 'New auto task']);
   });
 
   it('summarizes app navigation failures without logging raw exception text', () => {

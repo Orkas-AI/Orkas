@@ -291,6 +291,14 @@ describe('tool-catalog', () => {
     expect(toolNamesForGroups(['management.marketplace'])).toEqual([
       'marketplace_search', 'marketplace_request_install',
     ]);
+    // Creating a project and relocating the conversation is Commander's call, so
+    // the shared backlog group must not carry it into an Agent dependency.
+    expect(toolNamesForGroups(['management.projects'])).toEqual(['todo_tasks', 'project_setup']);
+    expect(toolNamesForAgentGroups(['management.projects'])).toEqual(['todo_tasks']);
+    expect(TOOL_CATALOG.find((entry) => entry.name === 'project_setup'))
+      .toMatchObject({ loadGroups: ['management.projects'], agentAssignable: false });
+    // run_program is denied by omission: the tool relocates user data.
+    expect(TOOL_CATALOG.find((entry) => entry.name === 'project_setup')?.programmatic).toBeUndefined();
     expect(toolNamesForGroups(['management.automation'])).toEqual(['auto_tasks']);
     expect(toolNamesForGroups(['management.app'])).toEqual(['open_app_view', 'app_health']);
     // Keep the broad parent as an explicit compatibility alias while new
@@ -305,6 +313,7 @@ describe('tool-catalog', () => {
     ]);
     expect(toolNamesForGroups(['management'])).toEqual([
       'todo_tasks',
+      'project_setup',
       'skill_search',
       'import_skill_package',
       'marketplace_search',

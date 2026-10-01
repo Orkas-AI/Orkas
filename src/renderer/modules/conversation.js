@@ -6337,6 +6337,16 @@ function _conversationActionItems(cid, opts = {}) {
         onClick: () => _moveConversationToExistingProject(cid),
       });
     }
+  } else if (conv && conv.project_id) {
+    // Filing can happen without a click, so offer the way back the same way.
+    if (typeof _moveConversationOutOfProject === 'function') {
+      items.push({
+        action: 'out-of-project',
+        label: t('chat.conv_out_project'),
+        disabled: isConvPending(cid),
+        onClick: () => _moveConversationOutOfProject(cid),
+      });
+    }
   }
   items.push({
     action: 'delete',
@@ -9246,6 +9256,7 @@ const _APP_NAV_SURFACES = {
   projects: {
     nameKey: 'sidebar.projects',
     fallback: 'Projects',
+    createKey: 'sidebar.project_create_title',
     actions: ['open', 'create', 'configure'],
     open: (req) => {
       if (typeof window.openProjectsSurface !== 'function') return false;
@@ -9255,6 +9266,7 @@ const _APP_NAV_SURFACES = {
   agents: {
     nameKey: 'sidebar.agents',
     fallback: 'AI Team',
+    createKey: 'agent_modal.title',
     actions: ['open', 'create', 'configure'],
     open: (req) => _appNavOpenFeatureView('agents', 'agents', async () => {
       if (req.action === 'create' && typeof window.openAgentModal === 'function') {
@@ -9269,6 +9281,7 @@ const _APP_NAV_SURFACES = {
   skills: {
     nameKey: 'sidebar.skills',
     fallback: 'Skills',
+    createKey: 'skill_modal.title_create',
     actions: ['open', 'create'],
     open: (req) => _appNavOpenFeatureView('skills', 'skills', () => {
       if (req.action === 'create' && typeof window.openSkillModal === 'function') {
@@ -9281,6 +9294,7 @@ const _APP_NAV_SURFACES = {
   auto: {
     nameKey: 'sidebar.auto',
     fallback: 'Auto',
+    createKey: 'auto.create_section_title',
     actions: ['open', 'create', 'configure'],
     open: (req) => _appNavOpenFeatureView('auto', 'auto', async () => {
       if (req.action === 'create' && typeof window.openAutoTaskDialog === 'function') {
@@ -9381,8 +9395,9 @@ function _mountAppNavRequests(host, message) {
     btn.type = 'button';
     btn.className = 'btn btn-sm chat-app-nav-btn';
     btn.dataset.appNav = requestKey;
+    // Create cards reuse the matching create entry's own copy ("New project"), naming what gets created.
     const labelKey = action === 'create'
-      ? 'chat.app_nav_create'
+      ? surface.createKey
       : action === 'add_custom'
         ? 'chat.app_nav_add_custom'
         : action === 'configure'

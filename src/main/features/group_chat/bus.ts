@@ -1,4 +1,5 @@
 import { yieldReflectionForTask } from '../reflection-coordination';
+import { drainConversationFiling, hasPendingConversationFiling } from '../conversation_filing';
 /**
  * MessageBus — the actor / message-passing core of group chat.
  *
@@ -1446,6 +1447,17 @@ function _emitTaskRunTerminal(state: CidState, status: TaskTerminalStatus): void
   bashPermissions.cancelForCid(state.cid);
   connectorActionConfirm.cancelForCid(state.cid);
   webAssistActionConfirm.cancelForCid(state.cid);
+  // A tool that filed this conversation under a project could not relocate it
+  // from inside the turn: the relocation refuses while a turn holds the session
+  // files open. This is the first moment it is allowed to run. A cancelled run
+  // drops the intent instead — the reply that announced it never landed.
+  if (hasPendingConversationFiling(state.uid, state.cid)) {
+    trackBackgroundWrite(
+      state,
+      drainConversationFiling(state.uid, state.cid, status === 'cancelled'),
+      'pending conversation filing',
+    );
+  }
   const recovered = status === 'completed' && run.internalFailureObserved === true;
   const event: TaskTerminalEvent = {
     run_id: run.runId,
