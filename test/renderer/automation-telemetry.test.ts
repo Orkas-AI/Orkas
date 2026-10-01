@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -50,6 +51,7 @@ function createHarness(
     setTimeout,
     clearTimeout,
   });
+  vm.runInContext(composerAccessorSource, context);
   vm.runInContext(autoSource, context, { filename: 'auto.js' });
   context.__refreshImpl = refreshImpl;
   vm.runInContext(`

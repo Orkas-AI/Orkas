@@ -1,3 +1,4 @@
+import { composerText } from './fixtures/composer';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import type { Page } from '@playwright/test';
@@ -57,7 +58,7 @@ async function selectBuiltinAgent(
 
 async function fillSelectedAgentPrompt(page: Page, prompt: string): Promise<void> {
   const input = page.locator('#new-chat-input');
-  const recipientPrefix = await input.inputValue();
+  const recipientPrefix = await composerText(input);
   expect(recipientPrefix).toMatch(/^@\S+\s$/);
   await input.fill(`${recipientPrefix}${prompt}`);
 }

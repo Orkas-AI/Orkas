@@ -69,6 +69,7 @@ import {
 import { getActiveUserId, isAnonymousLocalId } from './users';
 import { withCommonHeaders } from './api_common';
 import { getLanguage } from './config';
+import type { Lang } from '../i18n';
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
 import {
   getSkillCacheDir, isCacheFresh, readAgentCache, touchCacheEntry,
@@ -137,7 +138,7 @@ export async function postJson<T>(p: string, body: unknown): Promise<T> {
 }
 
 // ── types ─────────────────────────────────────────────────────────────────
-export interface MarketplaceCategory {
+export interface MarketplaceCategory extends Partial<Record<`name_${Lang}`, string>> {
   code: string;
   name_zh: string;
   name_en: string;

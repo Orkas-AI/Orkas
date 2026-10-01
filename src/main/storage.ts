@@ -249,6 +249,20 @@ async function _loadLineCount(filePath: string): Promise<number> {
 export interface AtomicAppendResult<T = unknown> {
   record: T;
   msgIndex: number;
+  source?: JsonlAppendSource;
+}
+
+/** Small durable locator for consumers that must not clone a large record. */
+export interface JsonlAppendSource {
+  kind: 'jsonl-append';
+  file: string;
+  offset: number;
+  bytes: number;
+  dev: number;
+  ino: number;
+  beforeMtime: number;
+  mtime: number;
+  size: number;
 }
 
 /**
@@ -258,7 +272,7 @@ export interface AtomicAppendResult<T = unknown> {
  * no "count after append" race. Used by chat/skill/agent message writers so
  * the search indexer can be told the exact position without re-scanning.
  */
-export async function appendJsonlAtomic<T>(filePath: string, record: T): Promise<AtomicAppendResult<T>> {
+export async function appendJsonlAtomic<T>(filePath: string, record: T, withSource = false): Promise<AtomicAppendResult<T>> {
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
   const lock = _getLineLock(filePath);
   return lock.runExclusive(async () => {
@@ -269,10 +283,21 @@ export async function appendJsonlAtomic<T>(filePath: string, record: T): Promise
     }
     const finishIndex = await prepareIndexedJsonlAppend(filePath);
     const line = JSON.stringify(record) + '\n';
-    await fsp.appendFile(filePath, line, 'utf8');
+    let source: JsonlAppendSource | undefined;
+    if (withSource) {
+      const handle = await fsp.open(filePath, 'a');
+      try {
+        const before = await handle.stat();
+        await handle.writeFile(line, 'utf8');
+        const after = await handle.stat();
+        source = { kind: 'jsonl-append', file: filePath, offset: before.size,
+          bytes: Buffer.byteLength(line), dev: after.dev, ino: after.ino,
+          beforeMtime: before.mtimeMs, mtime: after.mtimeMs, size: after.size };
+      } finally { await handle.close(); }
+    } else await fsp.appendFile(filePath, line, 'utf8');
     await finishIndex(record, Buffer.byteLength(line));
     _lineCounts.set(filePath, count + 1);
-    return { record, msgIndex: count };
+    return { record, msgIndex: count, ...(source ? { source } : {}) };
   });
 }
 
@@ -385,6 +410,8 @@ export interface JsonlWindow<T> {
   records: T[];
   /** Byte offset immediately before this window; compatible with readJsonlPage. */
   previousCursor: number | null;
+  /** Exclusive byte offset for continuing forward; null at the current EOF. */
+  followingCursor: number | null;
 }
 
 /**
@@ -441,8 +468,8 @@ export async function readJsonlPageWithOffsets<T = Record<string, any>>(
       if (bytesRead <= 0) break;
 
       let end = bytesRead;
-      for (let i = bytesRead - 1; i >= 0 && newestFirst.length < wanted; i -= 1) {
-        if (block[i] !== 0x0a) continue; // '\n'
+      for (let i = block.lastIndexOf(0x0a, bytesRead - 1); i >= 0 && newestFirst.length < wanted;
+        i = i > 0 ? block.lastIndexOf(0x0a, i - 1) : -1) {
         const current = block.subarray(i + 1, end);
         const line = suffixSegments.length
           ? _concatJsonlSegments([current, ...suffixSegments.reverse()])
@@ -494,6 +521,8 @@ export async function readJsonlWindow<T = Record<string, any>>(
   filePath: string,
   startIndex: number,
   limit = 10,
+  projectRecord?: (record: T) => T,
+  after = 0,
 ): Promise<JsonlWindow<T>> {
   const first = Math.max(0, Math.floor(Number(startIndex) || 0));
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
@@ -501,16 +530,16 @@ export async function readJsonlWindow<T = Record<string, any>>(
   try {
     handle = await fsp.open(filePath, 'r');
   } catch {
-    return { records: [], previousCursor: null };
+    return { records: [], previousCursor: null, followingCursor: null };
   }
 
   try {
     const size = (await handle.stat()).size;
     const records: T[] = [];
     let recordIndex = 0;
-    let position = 0;
+    let position = Number.isSafeInteger(after) && after >= 0 ? Math.min(after, size) : 0;
     let lineSegments: Buffer[] = [];
-    let currentRecordStart = 0;
+    let currentRecordStart = position;
     let firstRecordStart = -1;
     let done = false;
 
@@ -519,7 +548,9 @@ export async function readJsonlWindow<T = Record<string, any>>(
       if (record === undefined) return false;
       if (recordIndex >= first && records.length < wanted) {
         if (firstRecordStart < 0) firstRecordStart = recordStart;
-        records.push(record);
+        // Project on consumption so a long search window retains only the
+        // display payload, never every raw execution trail at once.
+        records.push(projectRecord ? projectRecord(record) : record);
       }
       recordIndex += 1;
       return records.length >= wanted;
@@ -531,8 +562,7 @@ export async function readJsonlWindow<T = Record<string, any>>(
       const { bytesRead } = await handle.read(block, 0, bytes, position);
       if (bytesRead <= 0) break;
       let lineStart = 0;
-      for (let i = 0; i < bytesRead; i += 1) {
-        if (block[i] !== 0x0a) continue;
+      for (let i = block.indexOf(0x0a); i >= 0 && i < bytesRead; i = block.indexOf(0x0a, i + 1)) {
         const current = block.subarray(lineStart, i);
         const line = lineSegments.length
           ? _concatJsonlSegments([...lineSegments, current])
@@ -548,11 +578,13 @@ export async function readJsonlWindow<T = Record<string, any>>(
     }
     if (!done && lineSegments.length) {
       consumeLine(_concatJsonlSegments(lineSegments), currentRecordStart);
+      currentRecordStart = size;
     }
 
     return {
       records,
       previousCursor: firstRecordStart > 0 ? firstRecordStart : null,
+      followingCursor: currentRecordStart < size ? currentRecordStart : null,
     };
   } finally {
     await handle.close();
@@ -585,4 +617,25 @@ export async function readJsonl<T = Record<string, any>>(filePath: string, limit
   }
 
   return (await readJsonlPage<T>(filePath, limit)).records;
+}
+
+/** Read one immutable append receipt without scanning the conversation. */
+export async function readJsonlAppendRecord<T>(source: JsonlAppendSource): Promise<T> {
+  const handle = await fsp.open(source.file, 'r');
+  try {
+    const valid = (stat: import('node:fs').Stats) => stat.dev === source.dev && stat.ino === source.ino
+      && stat.size >= source.size && (stat.size > source.size || stat.mtimeMs === source.mtime)
+      && Number.isSafeInteger(source.offset) && Number.isSafeInteger(source.bytes)
+      && source.offset >= 0 && source.bytes > 0 && source.offset + source.bytes === source.size;
+    if (!valid(await handle.stat())) throw new Error('History receipt unavailable');
+    const buffer = Buffer.allocUnsafe(source.bytes);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, source.offset + offset);
+      if (!bytesRead) throw new Error('History receipt incomplete');
+      offset += bytesRead;
+    }
+    if (!valid(await handle.stat())) throw new Error('History receipt changed');
+    return JSON.parse(buffer.toString('utf8')) as T;
+  } finally { await handle.close(); }
 }

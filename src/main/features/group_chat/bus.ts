@@ -1,4 +1,5 @@
 import { yieldReflectionForTask } from '../reflection-coordination';
+import { drainConversationFiling, hasPendingConversationFiling } from '../conversation_filing';
 /**
  * MessageBus — the actor / message-passing core of group chat.
  *
@@ -41,6 +42,7 @@ import {
 } from '../../util/log-redact';
 import { sanitizeLogTextForUpload } from '../../util/log-sanitize';
 import { redactPaths } from '../../util/redact';
+import { capToolResultWithRetry, DEFAULT_INLINE_RESULT_TOKENS } from '../../util/tool-result-cap';
 import { chatMediaCidUrl, versionChatMediaLocalUrlsInText } from '../../util/chat-media-url';
 import {
   workerSlots, acquireWithAbort, type Releaser,
@@ -103,6 +105,7 @@ import {
   userMarketplaceSkillsDir, userMarketplaceAgentsDir,
 } from '../../paths';
 import {
+  assertConversationRelocationReady,
   chatAttachmentDirForConversation,
   conversationLayout,
   conversationMessageReadFile,
@@ -920,11 +923,13 @@ interface QueueItem {
    * as the attachment manifest. */
   predecessorContext?: string;
   /** P3: this execution is a commander-owned sub-task created by dispatch_to.
-   * It skips globalSlots (the parent commander turn holds one while awaiting
+   * Synchronous dispatch skips globalSlots (the parent holds one while awaiting
    * the child's terminal — same parent-holds/child-waits exemption as nested
    * runs; the named gate + session cap are its bound) and exposes no steer
    * surface (the user cancels, never co-writes the contract — §4.6.1). */
   commanderSubtask?: boolean;
+  /** Async dispatch does not borrow a waiting Commander model slot. */
+  asyncDispatch?: boolean;
   /** Persisted source text, carried for that lazy claim-time task creation
    * (same string reference as the persisted message body — no copy). */
   sourceText?: string;
@@ -1102,6 +1107,8 @@ interface CidState {
    * commander "thinking" placeholder must not sit above the delegated
    * agent's live reply. */
   awaitedChildTasks: number;
+  /** Live async dispatches, including their terminal-result delivery gap. */
+  asyncDispatches: Set<Promise<void>>;
   /** P3: full in-memory turn results stashed for awaiting dispatch tools
    * (only when a waiter exists). The commander's handback must carry the
    * EXECUTION result — including process files deliberately hidden from the
@@ -1274,6 +1281,7 @@ function getOrInitCid(uid: string, cid: string): CidState {
       taskWaiters: new Map(),
       dispatchResults: new Map(),
       awaitedChildTasks: 0,
+      asyncDispatches: new Set(),
       listeners: new Set(),
       pendingEnqueues: 0,
       terminating: false,
@@ -1439,6 +1447,17 @@ function _emitTaskRunTerminal(state: CidState, status: TaskTerminalStatus): void
   bashPermissions.cancelForCid(state.cid);
   connectorActionConfirm.cancelForCid(state.cid);
   webAssistActionConfirm.cancelForCid(state.cid);
+  // A tool that filed this conversation under a project could not relocate it
+  // from inside the turn: the relocation refuses while a turn holds the session
+  // files open. This is the first moment it is allowed to run. A cancelled run
+  // drops the intent instead — the reply that announced it never landed.
+  if (hasPendingConversationFiling(state.uid, state.cid)) {
+    trackBackgroundWrite(
+      state,
+      drainConversationFiling(state.uid, state.cid, status === 'cancelled'),
+      'pending conversation filing',
+    );
+  }
   const recovered = status === 'completed' && run.internalFailureObserved === true;
   const event: TaskTerminalEvent = {
     run_id: run.runId,
@@ -1499,7 +1518,7 @@ function _emitTaskRunTerminalIfQuiescent(state: CidState, stateFile?: StateFile)
   _emitTaskRunTerminal(state, status);
 }
 
-function emit(state: CidState, ev: GroupEvent): void {
+function emit(state: CidState, ev: GroupEvent, processItems?: ProcessItem[]): void {
   if (ev.type === 'process') {
     ev.display_seq = state.displaySequence = (state.displaySequence || 0) + 1;
   }
@@ -1597,7 +1616,7 @@ async function emitStateChanged(state: CidState): Promise<void> {
 export function isQuiescent(uid: string, cid: string): boolean {
   const s = _cids.get(cidKey(uid, cid));
   if (!s) return true;
-  if (s.pendingEnqueues > 0) return false;
+  if (s.pendingEnqueues > 0 || s.asyncDispatches.size > 0) return false;
   if (s.queue.length > 0) return false;
   // Spliced-but-not-yet-registered admissions (the admission loop's awaits
   // live between queue and executions) — without this latch the event
@@ -1694,12 +1713,12 @@ async function appendMain(
   const layout = conversationLayout(uid, cid);
   const file = layout.messageFile;
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const { msgIndex } = await appendJsonlAtomic<GroupMessage>(file, msg);
+  const { msgIndex, source } = await appendJsonlAtomic<GroupMessage>(file, msg, true);
   // The record is durable here. Search indexing is derived state that fails
   // soft and self-heals through `reconcileChatsIndex`, so it must not sit
   // between the append and the caller — a user bubble is only painted once
   // this returns, and a large index snapshot made that wait ~1s.
-  indexChatMessageDeferred(uid, cid, msgIndex, msg);
+  indexChatMessageDeferred(uid, cid, msgIndex, source ?? msg);
   // Stamp `updated_at` on this cid's _index.json row so the sidebar can sort
   // by real last-activity time rather than file mtime (which sync clobbers
   // when pulling from another device — see chats.ts::listConversations).
@@ -2214,6 +2233,8 @@ export interface EnqueueParams {
    * durable source row may already have been written, but an aborted caller
    * must never add fresh Agent work to the runtime queue. */
   dispatchSignal?: AbortSignal;
+  /** Reject a result delivery whose admission crossed whole-task Stop. */
+  dispatchEpoch?: number;
 }
 
 /**
@@ -2232,6 +2253,8 @@ export interface EnqueueParams {
  */
 export async function enqueue(params: EnqueueParams): Promise<GroupMessage> {
   const { uid, cid, fromActorId, text } = params;
+  // Reject before creating task runtime state or writing the old layout.
+  assertConversationRelocationReady(uid, cid);
   const state = getOrInitCid(uid, cid);
   if (state.terminating) {
     throw Object.assign(new Error('conversation runtime is terminating'), {
@@ -2767,7 +2790,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     log.info(`segmented dispatch cid=${cid} msg=${msgId} tasks=${segmentPlan.segments.length} groups=${groupCount} mode=${serialChain ? 'serial' : 'parallel'}`);
   } else for (const recipientId of to) {
     if (recipientId === USER_ID) continue;
-    if (params.dispatchSignal?.aborted) break;
+    if (params.dispatchSignal?.aborted
+        || (params.dispatchEpoch !== undefined && params.dispatchEpoch !== state.abortEpoch)) break;
     // Roster row preferred (name snapshot), registry-built actor as fallback
     // — membership is a record, not a dispatch precondition.
     const actor = refreshed.actors.find((a) => a.id === recipientId)
@@ -2818,6 +2842,15 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
           log.warn(`task-board create failed cid=${cid}: ${(err as Error).message}`);
         }
       }
+    }
+    // Admission may have awaited persistence while Stop or deletion ran.
+    if (state.terminating || params.dispatchSignal?.aborted
+        || (params.dispatchEpoch !== undefined && params.dispatchEpoch !== state.abortEpoch)) {
+      if (boardTaskId) {
+        const cancelled = await taskBoard.finishTask(uid, cid, boardTaskId, 'cancelled');
+        if (cancelled) emit(state, { type: 'task_state', cid, task: cancelled });
+      }
+      break;
     }
     state.queue.push({
       actor,
@@ -5110,7 +5143,7 @@ async function runActorTurnWithDisplay(
           // further down; hard-coding 0 keeps this emit outside its TDZ.
           seg: 0,
           data: { type: 'event', event: skippedEvent },
-        });
+        }, processItems);
         const skippedXml = skipped
           .map((s) => {
             const name = escapeXmlAttr(String(s.name || ''));
@@ -5604,7 +5637,7 @@ async function runActorTurnWithDisplay(
       // not to the next segment `segState.seg` advances to below.
       seg: segIndex,
       data: { type: 'event', event: segmentRuntime.event },
-    });
+    }, processItems);
     // A visible segment owns the process trail accumulated while that segment
     // was streaming. Snapshot it before enqueue and advance the cursor only
     // after the write succeeds. Keeping one whole-turn process array and
@@ -5883,7 +5916,7 @@ async function runActorTurnWithDisplay(
             turn_id: item.turnId,
             seg: segState.seg,
             data: data as unknown as Record<string, unknown>,
-          });
+          }, processItems);
         },
       });
       for (const p of cliOut.produced || []) await onFileWritten(p);
@@ -5983,8 +6016,9 @@ async function runActorTurnWithDisplay(
         // turn HOLDS a global slot while awaiting the child's terminal, so
         // children competing for global slots recreates the parent-holds /
         // child-waits deadlock nested runs were exempted for (charter §6).
-        // Their own bound is the per-conversation named-task gate + session cap.
-        ...(item.nested || item.commanderSubtask ? { nested: true } : {}),
+        // Async children own a global slot because their parent is not waiting.
+        // All named children retain the per-conversation gate + session cap.
+        ...(item.nested || (item.commanderSubtask && !item.asyncDispatch) ? { nested: true } : {}),
         // interrupt-steer (G9): on the top-level turn, fold user messages the
         // user sends mid-run into THIS run. Nested sub-runs (dispatched
         // workers) get no steer — the user can't address a worker, and their
@@ -6036,7 +6070,7 @@ async function runActorTurnWithDisplay(
             type: 'process', cid, actor: actor.id,
             turn_id: item.turnId, seg: segState.seg,
             data: ev as unknown as Record<string, unknown>,
-          });
+          }, processItems);
         }
       } else if (ev.type === 'delta') {
         // Pulled out of the generic branch below so we can mirror the text
@@ -6066,7 +6100,7 @@ async function runActorTurnWithDisplay(
             turn_id: item.turnId,
             seg: segState.seg,
             data: ev as unknown as Record<string, unknown>,
-          });
+          }, processItems);
         }
       } else if (ev.type === 'error') {
         // Capture so onTurnFinished can decide between surfacing a ⚠️
@@ -6118,7 +6152,7 @@ async function runActorTurnWithDisplay(
             turn_id: item.turnId,
             seg: segState.seg,
             data: ev as unknown as Record<string, unknown>,
-          });
+          }, processItems);
         }
       }
     }
@@ -6196,7 +6230,7 @@ async function runActorTurnWithDisplay(
           turn_id: item.turnId,
           seg: segState.seg,
           data: retryRow as unknown as Record<string, unknown>,
-        });
+        }, processItems);
       }
       errText = null;
       turnFailureKind = undefined;
@@ -6490,6 +6524,7 @@ async function runActorTurnWithDisplay(
     // markup left in workingText is stripped on display by the renderer's
     // _stripSurvivingStructuralBlocks, so the aborted bubble stays clean.
     const commanderMutationNotices: string[] = [];
+    let platformAgentEditRejections = 0;
     const appendCommanderMutationNotice = (notice: string): void => {
       commanderMutationNotices.push(notice);
       workingText = `${workingText}\n\n${notice}`;
@@ -6578,10 +6613,13 @@ async function runActorTurnWithDisplay(
                 true,
               );
             } else if (target.source !== 'custom') {
+              if (platformAgentEditRejections++ === 0) {
+                appendCommanderMutationNotice(`<span style="color:var(--danger)">${escapeHtmlForBubble(t('errors.builtin_agent_not_editable', undefined, turnLanguage))}</span>`);
+              }
               rejectAgentMutation(
                 'edit',
                 'edit_forbidden',
-                "Marketplace Agents can't be edited from the main chat; fork one in the detail panel and edit there.",
+                "Marketplace Agent definitions cannot be edited through chat. No change was applied to this Agent.",
                 false,
               );
             } else if (agentsFeat.isCliAgent(target)) {
@@ -6653,9 +6691,10 @@ async function runActorTurnWithDisplay(
     // effort: a rejected file path within the container does not abort the
     // remaining writes, mirroring the per-skill edit chat. The localized
     // error string returned by `applySkillContainerFromCommander` already
-    // covers built-in / not-found / charset / collision cases — bus only
-    // appends the pill.
+    // covers built-in / not-found / charset / collision cases. Preserve that
+    // result in the reply and keep successful mutations in their chips.
     const skillR = extractSkillContainers(workingText);
+    let skillMutationFailed = false;
     let skillCorrectionAttempted = false;
     let skillCorrectionSucceeded = false;
     if (skillR.containers.length) {
@@ -6681,7 +6720,7 @@ async function runActorTurnWithDisplay(
               const progress = { type: 'progress' as const, text: t('chat.skill_creation_correcting', undefined, turnLanguage) };
               appendProcessItem(processItems, progress);
               emit(state, { type: 'process', cid, actor: actor.id, turn_id: item.turnId,
-                seg: segState.seg, data: progress });
+                seg: segState.seg, data: progress }, processItems);
               let detachAbort = () => {};
               try {
                 await markInFlight(uid, cid, actor.id, true);
@@ -6735,6 +6774,7 @@ async function runActorTurnWithDisplay(
               appendCommanderMutationNotice(_formatValidationWarnings(result.validation_warnings));
             }
           } else {
+            skillMutationFailed = true;
             // Quality-blocked create: result has validation_failed even on
             // ok:false. Display the structured violations so the LLM sees
             // them in history and the user gets the same modal-style info.
@@ -6743,10 +6783,10 @@ async function runActorTurnWithDisplay(
             if (result.validation_failed && result.validation_failed.length) {
               markTurnFailure('validation', 'skill_mutation_rejected');
               appendCommanderMutationNotice(_formatValidationFailure(result.validation_failed));
-            } else if (!container.files.length && (container.raw || '').trim()) {
+            } else if (!container.files.length && !container.metadata && (container.raw || '').trim()) {
               // Shape error: the container carried a payload but no block
-              // parsed. Echo it back with the literal syntax so the next turn
-              // can correct itself instead of re-sending the same mistake.
+              // or metadata parsed. Valid metadata-only edits can fail for
+              // permissions; do not misreport those as file syntax errors.
               markTurnFailure('validation', 'skill_mutation_rejected');
               appendCommanderMutationNotice(_formatContainerParseFailure({
                 error: result.error || 'Skill operation failed.',
@@ -6759,6 +6799,7 @@ async function runActorTurnWithDisplay(
             }
           }
         } catch (err) {
+          skillMutationFailed = true;
           const verb = container.skillId ? 'edit' : 'create';
           log.error(`${verb}-skill failed cid=${cid}: ${(err as Error).message}`);
           markTurnFailure('validation', 'skill_mutation_rejected');
@@ -6773,6 +6814,10 @@ async function runActorTurnWithDisplay(
       workingText = [t(skillCorrectionSucceeded ? 'chat.skill_creation_corrected'
         : 'chat.skill_creation_correction_failed', undefined, turnLanguage),
       ...commanderMutationNotices].join('\n\n');
+    } else if (skillMutationFailed) {
+      // As with Agent rejections below, only host results can claim success.
+      // Keep applied siblings in their chips and failures in reply/history.
+      workingText = commanderMutationNotices.join('\n\n');
     }
 
     // Rejected mutation prose is host-owned. The model may have claimed
@@ -6795,7 +6840,12 @@ async function runActorTurnWithDisplay(
             : 'chat.agent_mutation_failed';
       const color = willRetry ? 'var(--muted)' : 'var(--danger)';
       const summary = `<span style="color:${color}">${escapeHtmlForBubble(t(key, undefined, turnLanguage))}</span>`;
-      workingText = [summary, ...commanderMutationNotices].join('\n\n');
+      // A permanent source restriction already has an actionable notice;
+      // the generic failure would incorrectly ask the user to retry it.
+      workingText = [
+        ...(platformAgentEditRejections === agentMutationRejections.length ? [] : [summary]),
+        ...commanderMutationNotices,
+      ].join('\n\n');
     }
   }
 
@@ -7011,7 +7061,7 @@ async function runActorTurnWithDisplay(
       turn_id: item.turnId,
       seg: segState.seg,
       data: { type: 'event', event: runtimeItem.event },
-    });
+    }, processItems);
   }
 
   let persistedMsg: GroupMessage | null = null;
@@ -7980,8 +8030,10 @@ async function runScheduledDispatch(
     /** 'final' for hand_off_to (the agent bubble IS the delivery, files
      * visible); default 'process' for dispatch_to (commander synthesises). */
     outputDelivery?: 'final' | 'process';
+    onScheduled?: (taskId: string) => void;
   } = {},
 ): Promise<NestedDispatchOutcome> {
+  const admissionEpoch = state.abortEpoch;
   if (actor.kind === 'agent') {
     try {
       const added = await ensureAgentMember(state.uid, state.cid, actor.id, actor.name);
@@ -8042,6 +8094,12 @@ async function runScheduledDispatch(
   });
   emit(state, { type: 'task_created', cid: state.cid, task: boardTask });
   const taskId = boardTask.task_id;
+  if (state.terminating || parentSignal?.aborted || state.abortEpoch !== admissionEpoch) {
+    const cancelled = await taskBoard.finishTask(state.uid, state.cid, taskId, 'cancelled');
+    if (cancelled) emit(state, { type: 'task_state', cid: state.cid, task: cancelled });
+    if (opts.onScheduled) throw new Error('Dispatch cancelled before admission.');
+    return { payload: buildWorkerAbortPayload(actor.name || actor.id), aborted: true, taskId };
+  }
   const terminalPromise = new Promise<taskBoard.ConversationTask | null>((resolve) => {
     let set = state.taskWaiters.get(taskId);
     if (!set) { set = new Set(); state.taskWaiters.set(taskId, set); }
@@ -8054,6 +8112,7 @@ async function runScheduledDispatch(
     fromActorId: COMMANDER_ID,
     taskId,
     commanderSubtask: true,
+    ...(opts.onScheduled ? { asyncDispatch: true } : {}),
     sourceText: task,
     sourceRecipients: [actor.id],
     llmPayload: composeLlmTurnPayload(state.uid, COMMANDER_ID, dispatchMessage),
@@ -8080,15 +8139,20 @@ async function runScheduledDispatch(
   log.info(`scheduled-dispatch start cid=${state.cid} agent=${maskId(actor.id)} task=${maskId(taskId)}`);
   // Suspend the commander's active-turn presence while it awaits the child
   // (renderer loop-order rule — see CidState.awaitedChildTasks).
-  state.awaitedChildTasks += 1;
-  await emitStateChanged(state).catch(() => {});
+  if (!opts.onScheduled) {
+    state.awaitedChildTasks += 1;
+    await emitStateChanged(state).catch(() => {});
+  }
+  opts.onScheduled?.(taskId);
   let settled: taskBoard.ConversationTask | null;
   try {
     settled = await terminalPromise;
   } finally {
     if (parentSignal) parentSignal.removeEventListener('abort', onParentAbort);
-    state.awaitedChildTasks = Math.max(0, state.awaitedChildTasks - 1);
-    await emitStateChanged(state).catch(() => {});
+    if (!opts.onScheduled) {
+      state.awaitedChildTasks = Math.max(0, state.awaitedChildTasks - 1);
+      await emitStateChanged(state).catch(() => {});
+    }
   }
 
   // Prefer the stashed EXECUTION result (unfiltered: hidden process files,
@@ -8764,16 +8828,20 @@ async function buildCommanderExtraTools(
     // sessions; member-seed + jsonl-append are lock-serialized.
     executionMode: 'parallel',
     // The nested Agent/CLI executor owns its bounded timeout and returns one
-    // terminal result; Commander still awaits that result synchronously.
+    // terminal result; async mode returns after admission instead.
     executionTimeoutOwner: 'executor',
     description: [
-      'NON-TERMINAL delegation: run one named agent synchronously and return its full result to the commander.',
+      'NON-TERMINAL delegation: run one named agent and return its full result to the commander; asynchronous execution returns an admission receipt first.',
       'Use only when the commander must consume that result for another dispatch, a tool call, or synthesis across at least two distinct results; delivering, formatting, approving, or summarizing one agent result is not a next action, so use hand_off_to instead.',
     ].join(' '),
     inputSchema: {
       type: 'object',
       properties: {
         ...backlogTaskSchema,
+        mode: {
+          type: 'string', enum: ['sync', 'async'], default: 'sync',
+          description: 'Sync waits for the full result. Async returns a queued task ID; each result independently schedules a Commander follow-up, so the current turn can finish while the task runs. Admission is not completion.',
+        },
         to: {
           type: 'string',
           description: 'Target agent name or agent_id. Commander and user aliases are invalid.',
@@ -8791,6 +8859,10 @@ async function buildCommanderExtraTools(
       additionalProperties: false,
     },
     async execute(input, ctx) {
+      if (input?.mode !== undefined && input.mode !== 'sync' && input.mode !== 'async') {
+        return _toolError('mode must be sync or async');
+      }
+      const asynchronous = input?.mode === 'async';
       const toRaw = String(input?.to || '').trim();
       const message = String(input?.message || '').trim();
       const resume = String(input?.resume || '').trim();
@@ -8823,9 +8895,12 @@ async function buildCommanderExtraTools(
       // this visible agent's reply lands AFTER it and the synthesis opens a fresh
       // bubble (commander loop bubbles).
       await onVisibleDispatch?.();
-      try {
+      const parentSignal = asynchronous ? (w.abortController?.signal || ctx?.signal) : ctx?.signal;
+      const abortEpoch = state.abortEpoch;
+      const executeDispatch = async (onScheduled?: (taskId: string) => void) => {
         const dispatchResult = await runScheduledDispatch(
-          state, ctx?.signal, dispatchActor, message, {
+          state, parentSignal, dispatchActor, message, {
+            ...(onScheduled ? { onScheduled } : {}),
             ...(backlog.task ? { backlogTask: backlog.task } : {}),
             attachments: currentTurnAttachments,
             sourceContext: {
@@ -8836,6 +8911,7 @@ async function buildCommanderExtraTools(
             ...(w.item?.taskId ? { parentTaskId: w.item.taskId } : {}),
           },
         );
+        if (asynchronous && (state.terminating || state.abortEpoch !== abortEpoch || parentSignal?.aborted)) return dispatchResult;
         try {
           await _setFormWaitLedgerFromWorkerResult({
             uid, cid,
@@ -8851,7 +8927,49 @@ async function buildCommanderExtraTools(
         } catch (err) {
           log.warn(`dispatch_to form ledger set failed cid=${cid}: ${(err as Error).message}`);
         }
-        return { content: dispatchResult.payload };
+        return dispatchResult;
+      };
+      if (!asynchronous) {
+        try { return { content: (await executeDispatch()).payload }; }
+        finally { onVisibleDispatchComplete?.(); }
+      }
+
+      let admitted!: (taskId: string) => void;
+      let rejected!: (error: unknown) => void;
+      const admission = new Promise<string>((resolve, reject) => { admitted = resolve; rejected = reject; });
+      // One terminal waiter owns one delivery. Completion notifications never
+      // replay the Agent and serialize through Commander's existing FIFO.
+      const pending = executeDispatch(admitted).then(async (result) => {
+        if (state.terminating || state.abortEpoch !== abortEpoch || parentSignal?.aborted) return;
+        // Async delivery bypasses the caller's tool-result transformer, so
+        // retain its lossless spill policy in the receiving Commander's store.
+        const { toolResultsDirForSession } = await import('../../model/core-agent/session-store');
+        const delivery = await capToolResultWithRetry('dispatch_to', { content: result.payload },
+          { signal: parentSignal, state: {} }, {
+            maxInlineTokens: DEFAULT_INLINE_RESULT_TOKENS,
+            toolResultsDir: toolResultsDirForSession(uid, actorSessionId(cid, w.actor)),
+          });
+        await enqueue({
+          uid, cid, fromActorId: resolvedId, forceTo: [COMMANDER_ID], dispatch: true,
+          text: `Dispatch result from @${dispatchAgent?.name || resolvedId}.`,
+          model_text: `<dispatch-result task_id="${escapeXmlAttr(result.taskId || '')}">\n${delivery.content}\n</dispatch-result>`,
+          dispatchSignal: parentSignal, dispatchEpoch: abortEpoch,
+        });
+      });
+      let tracked!: Promise<void>;
+      tracked = pending.catch((error) => {
+        rejected(error);
+        if (!state.terminating && state.abortEpoch === abortEpoch && !parentSignal?.aborted) {
+          log.error('async dispatch or result delivery failed', { error: logErrorSummary(error) });
+        }
+      }).finally(() => {
+        state.asyncDispatches.delete(tracked);
+        trackBackgroundWrite(state, _syncStateStatus(state), 'async dispatch settlement');
+      });
+      state.asyncDispatches.add(tracked);
+      try {
+        const taskId = await admission;
+        return { content: JSON.stringify({ ok: true, task_id: taskId, status: 'queued', mode: 'async', result_delivery: 'commander_followup' }) };
       } finally {
         onVisibleDispatchComplete?.();
       }
@@ -9664,6 +9782,7 @@ export async function dropConv(uid: string, cid: string): Promise<void> {
   }
   state.taskWaiters.clear();
   state.dispatchResults.clear();
+  await Promise.allSettled([...state.asyncDispatches]);
   while (state.backgroundWrites.size > 0) {
     await Promise.allSettled([...state.backgroundWrites]);
   }

@@ -43,6 +43,7 @@ import {
   type SkillInstall,
 } from './marketplace_installs';
 import { postJson } from './marketplace';
+import { createMarketplaceCatalogReader, type MarketplaceCatalogReader, type MarketplaceCatalogRow } from './marketplace_catalog';
 import { migrateComponentEnabledId } from './component_enabled';
 
 const log = createLogger('builtin-marketplace');
@@ -840,17 +841,7 @@ export async function seedBuiltinMarketplaceForUser(
   return result;
 }
 
-type CatalogRow = {
-  id?: string;
-  name?: string;
-  version?: string;
-  published_at?: number;
-  updated_at?: number;
-  create_uid?: string;
-  default_install?: boolean | number;
-  status?: string;
-  state?: string;
-};
+type CatalogRow = MarketplaceCatalogRow;
 
 function _isResolvedOfficialRow(row: CatalogRow | undefined, name?: string): row is Required<Pick<CatalogRow, 'id'>> & CatalogRow {
   if (!row || !row.id || !safeId(row.id)) return false;
@@ -859,33 +850,23 @@ function _isResolvedOfficialRow(row: CatalogRow | undefined, name?: string): row
   return String(row.name || '').trim() === name.trim();
 }
 
-async function _findCatalogRow(kind: 'agents' | 'skills', id: string, name: string): Promise<CatalogRow | null> {
-  if (safeId(id)) {
-    const byId = await postJson<{ list?: CatalogRow[] }>(
-      `/marketplace/${kind}/list`,
-      { page: 1, size: 100, ids: [id] },
-    );
-    const hit = (byId.list || []).find((row) => _isResolvedOfficialRow(row));
-    if (hit) return hit;
-  }
-  if (!name) return null;
-  const byName = await postJson<{ list?: CatalogRow[] }>(
-    `/marketplace/${kind}/list`,
-    { page: 1, size: 100, q: name },
-  );
-  return (byName.list || []).find((row) => _isResolvedOfficialRow(row, name)) || null;
-}
+type AgentCatalogLookup = { id: string; name: string };
 
-async function _resolveAgentInstall(uid: string, row: AgentInstall): Promise<AgentInstall | null> {
-  const dir = userMarketplaceAgentDir(uid, row.id);
-  const localJson = _readJsonObject(path.join(dir, 'agent.json')) || {};
-  const localName = _agentNameFromJson(localJson, row.id);
-  const declaredId = typeof localJson.agent_id === 'string' && safeId(localJson.agent_id)
-    ? localJson.agent_id
-    : row.id;
-  const catalog = await _findCatalogRow('agents', declaredId, localName);
-  if (!catalog?.id) return null;
-  const detail = await postJson<{
+async function _resolveAgentInstall(
+  row: AgentInstall,
+  lookup: AgentCatalogLookup,
+  rows: Map<string, MarketplaceCatalogRow>,
+  readNames: () => Promise<Map<string, MarketplaceCatalogRow>>,
+): Promise<AgentInstall | null> {
+  let catalog = rows.get(lookup.id);
+  if (!_isResolvedOfficialRow(catalog) && lookup.name) {
+    catalog = (await readNames()).get(lookup.name.trim());
+    if (!_isResolvedOfficialRow(catalog, lookup.name)) return null;
+  }
+  if (!_isResolvedOfficialRow(catalog)) return null;
+  // Legacy Servers omit the address from list responses. Only that compatibility
+  // path needs detail; an explicit empty address is invalid, not a retry signal.
+  const detail = catalog.agent_json_url !== undefined ? catalog : await postJson<{
     version?: string;
     published_at?: number;
     updated_at?: number;
@@ -895,7 +876,10 @@ async function _resolveAgentInstall(uid: string, row: AgentInstall): Promise<Age
     default_install?: boolean;
     status?: string;
     state?: string;
+    min_app_version?: string;
+    minAppVersion?: string;
   }>('/marketplace/agents/detail', { id: catalog.id });
+  if (!detail.agent_json_url) return null;
   return {
     id: catalog.id,
     version: normalizeInstallVersion(detail.version || catalog.version),
@@ -907,6 +891,7 @@ async function _resolveAgentInstall(uid: string, row: AgentInstall): Promise<Age
     )),
     agent_json_url: detail.agent_json_url || '',
     agent_skills_bundle_url: detail.agent_skills_bundle_url || '',
+    ...(minAppVersionFrom(detail, catalog) ? { min_app_version: minAppVersionFrom(detail, catalog) } : {}),
     installed_at: row.installed_at || Date.now(),
     create_uid: detail.create_uid || catalog.create_uid || BUILTIN_CREATE_UID,
     default_install: detail.default_install === true || catalog.default_install === true || catalog.default_install === 1,
@@ -916,10 +901,10 @@ async function _resolveAgentInstall(uid: string, row: AgentInstall): Promise<Age
   };
 }
 
-async function _resolveSkillInstall(uid: string, row: SkillInstall): Promise<SkillInstall | null> {
-  const catalog = await _findCatalogRow('skills', row.id, '');
-  if (!catalog?.id) return null;
-  const detail = await postJson<{
+async function _resolveSkillInstall(row: SkillInstall, rows: Map<string, MarketplaceCatalogRow>): Promise<SkillInstall | null> {
+  const catalog = rows.get(row.id);
+  if (!_isResolvedOfficialRow(catalog)) return null;
+  const detail = catalog.bundle_url !== undefined ? catalog : await postJson<{
     bundle_url?: string;
     version?: string;
     published_at?: number;
@@ -928,7 +913,10 @@ async function _resolveSkillInstall(uid: string, row: SkillInstall): Promise<Ski
     default_install?: boolean;
     status?: string;
     state?: string;
+    min_app_version?: string;
+    minAppVersion?: string;
   }>('/marketplace/skills/bundle', { id: catalog.id });
+  if (!detail.bundle_url) return null;
   return {
     id: catalog.id,
     version: normalizeInstallVersion(detail.version || catalog.version),
@@ -939,6 +927,7 @@ async function _resolveSkillInstall(uid: string, row: SkillInstall): Promise<Ski
       typeof catalog.updated_at === 'number' ? { updated_at: catalog.updated_at } : {}
     )),
     bundle_url: detail.bundle_url || '',
+    ...(minAppVersionFrom(detail, catalog) ? { min_app_version: minAppVersionFrom(detail, catalog) } : {}),
     installed_at: row.installed_at || Date.now(),
     create_uid: detail.create_uid || catalog.create_uid || BUILTIN_CREATE_UID,
     default_install: detail.default_install === true || catalog.default_install === true || catalog.default_install === 1,
@@ -974,7 +963,7 @@ async function _rewriteAgentSeedId(dir: string, id: string): Promise<void> {
 
 export async function resolveBuiltinMarketplaceInstalls(
   uid: string,
-  opts: BuiltinMarketplaceSeedOptions = {},
+  opts: BuiltinMarketplaceSeedOptions & { catalogReader?: MarketplaceCatalogReader } = {},
 ): Promise<BuiltinMarketplaceResolveResult> {
   const result: BuiltinMarketplaceResolveResult = {
     resolved_agents: 0,
@@ -987,13 +976,38 @@ export async function resolveBuiltinMarketplaceInstalls(
 
   const manifest = await readInstalls(uid);
   let changed = false;
+  const reader = opts.catalogReader || createMarketplaceCatalogReader(() => _canContinue(opts));
+  let agentsCatalog: Promise<Map<string, MarketplaceCatalogRow>> | undefined;
+  let skillsCatalog: Promise<Map<string, MarketplaceCatalogRow>> | undefined;
+  let agentNamesCatalog: Promise<Map<string, MarketplaceCatalogRow>> | undefined;
+  const agentLookups = new Map<string, AgentCatalogLookup>();
   const enabledIdMigrations: Array<{ kind: 'agent' | 'skill'; fromId: string; toId: string }> = [];
   const snapshotRemovals = { agents: {} as Record<string, number>, skills: {} as Record<string, number> };
   for (const row of [...manifest.agents]) {
     if (!_canContinue(opts)) return result;
     if (row.seed_source !== 'builtin' || row.agent_json_url) continue;
     try {
-      const resolved = await _resolveAgentInstall(uid, row);
+      if (!agentsCatalog) {
+        const ids = manifest.agents.map(agent => agent.id);
+        for (const agent of manifest.agents) {
+          if (agent.seed_source !== 'builtin' || agent.agent_json_url) continue;
+          const local = _readJsonObject(path.join(userMarketplaceAgentDir(uid, agent.id), 'agent.json')) || {};
+          const declared = local.agent_id;
+          const id = typeof declared === 'string' && safeId(declared) ? declared : agent.id;
+          agentLookups.set(agent.id, { id, name: _agentNameFromJson(local, agent.id) });
+          ids.push(id);
+        }
+        agentsCatalog = reader.read('agents', ids);
+      }
+      const rows = await agentsCatalog;
+      if (!_canContinue(opts)) return result;
+      const resolved = await _resolveAgentInstall(row, agentLookups.get(row.id)!, rows, () => {
+        agentNamesCatalog ||= reader.readAgentNames([...agentLookups.values()]
+          .filter(lookup => !_isResolvedOfficialRow(rows.get(lookup.id)))
+          .map(lookup => lookup.name));
+        return agentNamesCatalog;
+      });
+      if (!_canContinue(opts)) return result;
       if (!resolved) continue;
       const migrated = await _migrateDir('agent', uid, row.id, resolved.id);
       if (migrated === 'blocked') {
@@ -1010,6 +1024,7 @@ export async function resolveBuiltinMarketplaceInstalls(
       result.resolved_agents++;
       changed = true;
     } catch (err) {
+      if (!_canContinue(opts)) return result;
       result.failed.push(`agent:${row.id}`);
       log.warn(`resolve builtin agent ${row.id} failed`, { error: logErrorSummary(err) });
     }
@@ -1018,23 +1033,18 @@ export async function resolveBuiltinMarketplaceInstalls(
     if (!_canContinue(opts)) return result;
     if (row.seed_source !== 'builtin' || row.bundle_url) continue;
     try {
-      const resolved = await _resolveSkillInstall(uid, row);
+      skillsCatalog ||= reader.read('skills', manifest.skills.map(skill => skill.id));
+      const rows = await skillsCatalog;
+      if (!_canContinue(opts)) return result;
+      const resolved = await _resolveSkillInstall(row, rows);
+      if (!_canContinue(opts)) return result;
       if (!resolved) continue;
-      const migrated = await _migrateDir('skill', uid, row.id, resolved.id);
-      if (migrated === 'blocked') {
-        result.failed.push(`skill:${row.id}`);
-        continue;
-      }
-      if (migrated === 'moved') result.migrated_skills++;
-      manifest.skills = manifest.skills.filter((s) => s.id !== row.id && s.id !== resolved.id);
+      manifest.skills = manifest.skills.filter((s) => s.id !== row.id);
       manifest.skills.push(resolved);
-      if (row.id !== resolved.id) {
-        enabledIdMigrations.push({ kind: 'skill', fromId: row.id, toId: resolved.id });
-        snapshotRemovals.skills[row.id] = row.installed_at;
-      }
       result.resolved_skills++;
       changed = true;
     } catch (err) {
+      if (!_canContinue(opts)) return result;
       result.failed.push(`skill:${row.id}`);
       log.warn(`resolve builtin skill ${row.id} failed`, { error: logErrorSummary(err) });
     }

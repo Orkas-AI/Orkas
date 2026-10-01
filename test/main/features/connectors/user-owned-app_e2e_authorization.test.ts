@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // Journey coverage: combined setup -> browser -> relay -> shop verification -> encrypted
 // grant -> existing MCP actions. External boundaries are fake; no real store is contacted.
 const mocks = vi.hoisted(() => ({ open: vi.fn(async (_url: string) => undefined) }));
+vi.mock('../../../../src/main/features/users', () => ({ getActiveUserId: () => 'user-app-e2e-test' }));
 vi.mock('electron', () => ({ app: { isPackaged: false }, shell: { openExternal: mocks.open } }));
 vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({ accountApiBase: () => 'https://orkas.ai/api', tokenStore: { getDeviceId: () => 'seller-test-device', authHeaders: () => ({}) } }));
 vi.mock('../../../../src/main/features/config', () => ({ getLanguage: () => 'en', getLanguageForUser: () => 'en' }));
@@ -25,6 +26,7 @@ vi.mock('../../../../src/main/model/core-agent/interactive-cli-sessions', () => 
   waitInteractiveCliSession: vi.fn(),
 }));
 
+import { _setBroadcastForTest, respondAccountChoice } from '../../../../src/main/features/connectors/account-choice';
 import { findCatalogEntry } from '../../../../src/main/features/connectors/catalog';
 import { authorizeLocalApi, hasLocalApiAuthorization, localApiRuntimeDir, localApiTransport,
   normalizeLocalApiConnectionInput, removeLocalApiAuthorization } from '../../../../src/main/features/connectors/local-api';
@@ -59,11 +61,11 @@ const cases = [
     replies: [{ pop_auth_token_create_response: { ...grant, owner_id: '67890' } }, { mall_info_get_response: { mall_id: '67890', mall_name: 'Fixture shop' } }] },
   { id: 'kuaishou-shop-seller', provider: 'kuaishou_shop', host: 'open.kwaixiaodian.com',
     input: { ...app, sign_secret: 'private-sign-secret' },
-    replies: [{ ...grant, open_id: 'seller12345' }, { result: 1, data: { open_id: 'seller12345' } }, { result: 1, data: { shop_id: '67890' } }] },
+    replies: [{ result: 1, ...grant, open_id: 'seller12345', scopes: 'user_base,user_info,merchant_user,merchant_item,merchant_order,merchant_refund,merchant_logistics' }, { result: 1, data: { openId: 'seller12345', sellerId: 67890, name: 'Fixture seller' } }, { result: 1, data: { shopName: 'Fixture shop', shopType: 5 } }] },
   { id: 'douyin-shop-seller', provider: 'douyin_shop', host: '', input: { ...app, shop_id: '67890' },
     replies: [{ code: 10000, data: { ...grant, shop_id: '67890' } }, { code: 10000, data: { auth_id: '67890', status: 1 } }] },
   { id: 'youzan-seller', provider: 'youzan', host: '', input: { ...client, kdt_id: '67890' },
-    replies: [{ data: { ...grant, authority_id: '67890' } }, { data: { kdt_id: '67890', name: 'Fixture shop' } }] },
+    replies: [{ data: { ...grant, authority_id: '67890' } }, { data: { id: 67890, name: 'Fixture shop', type: 0 } }] },
   { id: 'weimob-wos-seller', provider: 'weimob_wos', host: '', input: { ...client, shop_id: '67890' },
     replies: [{ data: { ...grant, business_operation_system_id: '67890' } }, { code: { errcode: 0 }, data: { list: [] } }] },
   { id: 'xiaohongshu-seller', provider: 'xiaohongshu_ark', host: '', input: app,
@@ -92,12 +94,108 @@ const callback = () => handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callba
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => {
   cancelDcrOAuth();
+  _setBroadcastForTest();
   for (const row of cases) removeLocalApiAuthorization(UID, findCatalogEntry(row.id)!);
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
 describe('user-owned app authorization journey', () => {
+  it('binds official Kuaishou sellerId without numeric loss and never invents missing token scopes', async () => {
+    const auth = require('../../../../bin/local-api-auth.cjs');
+    const scopes = auth.KUAISHOU_SCOPES.join(',');
+    let token: any = { result: 1, ...grant, open_id: 'seller-exact', scopes };
+    const requests = vi.fn(async (raw: string | URL) => {
+      const url = new URL(String(raw));
+      if (url.pathname.endsWith('/access_token')) return new Response(JSON.stringify(token));
+      if (url.pathname.endsWith('/seller/get')) return new Response('{"result":1,"data":{"openId":"seller-exact","sellerId":9223372036854775807,"name":"Seller"}}');
+      return new Response('{"result":1,"data":{"shopName":"Shop","shopType":5}}');
+    });
+    vi.stubGlobal('fetch', requests);
+    const env = { provider: 'kuaishou_shop', metadata: {}, oauthCode: 'fixture-code', credentials: { ...app, sign_secret: 'fixture-sign', redirect_uri: LOCAL_API_REDIRECT_URI } };
+    const result = await auth.authorizeConfigured(env);
+    expect(result.identity).toMatchObject({ open_id: 'seller-exact', shop_id: '9223372036854775807', seller_name: 'Seller', shop_name: 'Shop' });
+    expect(result.scope.split(/[ ,]+/)).toEqual(auth.KUAISHOU_SCOPES);
+    expect(requests).toHaveBeenCalledTimes(3);
+    for (const invalid of [undefined, [], 'user_base', { merchant_item: true }]) {
+      token = { result: 1, ...grant, open_id: 'seller-exact', scopes: invalid, scope: scopes };
+      await expect(auth.authorizeConfigured(env)).rejects.toThrow(/scope/);
+    }
+    token = { result: 0, ...grant, open_id: 'seller-exact', scopes };
+    await expect(auth.authorizeConfigured(env)).rejects.toThrow();
+    expect(requests).toHaveBeenCalledTimes(8);
+  });
+
+  it('discovers and confirms the Mercado Libre owner without a manually supplied ID', async () => {
+    const row = cases.find(row => row.provider === 'mercado_libre')!;
+    const requests = boundary(row);
+    let choice: any;
+    _setBroadcastForTest((channel, payload) => { if (channel === 'connectors:account-choice') choice = payload; return true; });
+    const entry = findCatalogEntry(row.id)!;
+    const flow = authorizeLocalApi(UID, entry, client);
+    const completion = callback();
+    await vi.waitFor(() => expect(choice).toBeDefined());
+    expect(choice.choices).toEqual([{ id: '12345', label: 'Fixture seller (12345)' }]);
+    expect(JSON.stringify(choice)).not.toMatch(/private|secret|token/);
+    expect(hasLocalApiAuthorization(UID, entry)).toBe(false);
+    respondAccountChoice(UID, choice.request_id, '12345');
+    await completion;
+    const metadata = await flow;
+    expect(metadata).toEqual({ user_id: '12345' });
+    expect(requests.mock.calls).toHaveLength(3);
+    const transport = await localApiTransport(UID, entry, metadata);
+    if (transport.kind !== 'stdio') throw new Error('Expected stdio');
+    expect(adapter.configured(transport.env).credentials.identity.user_id).toBe('12345');
+  });
+
+  it('does not save a newly discovered Mercado Libre grant when the user declines the account', async () => {
+    const row = cases.find(row => row.provider === 'mercado_libre')!;
+    boundary(row);
+    let choice: any;
+    _setBroadcastForTest((channel, payload) => { if (channel === 'connectors:account-choice') choice = payload; return true; });
+    const entry = findCatalogEntry(row.id)!;
+    const flow = authorizeLocalApi(UID, entry, client);
+    const rejected = expect(flow).rejects.toMatchObject({ code: 'user_cancelled' });
+    const completion = callback();
+    await vi.waitFor(() => expect(choice).toBeDefined());
+    respondAccountChoice(UID, choice.request_id, null);
+    await completion; await rejected;
+    expect(hasLocalApiAuthorization(UID, entry)).toBe(false);
+  });
+
+  it.each([undefined, 'different', 9007199254740992])('rejects invalid discovered Mercado Libre identity %s', async userId => {
+    const row = cases.find(row => row.provider === 'mercado_libre')!;
+    boundary({ ...row, replies: [{ ...grant, user_id: userId }, { id: 12345 }] });
+    const shown = vi.fn(() => true);
+    _setBroadcastForTest(shown);
+    const entry = findCatalogEntry(row.id)!;
+    const flow = authorizeLocalApi(UID, entry, client);
+    const rejected = expect(flow).rejects.toThrow('Could not authorize');
+    await callback(); await rejected;
+    expect(shown).not.toHaveBeenCalled();
+    expect(hasLocalApiAuthorization(UID, entry)).toBe(false);
+  });
+
+  it('checks the discovered owner against the account endpoint and preserves explicit or existing bindings', async () => {
+    const row = cases.find(row => row.provider === 'mercado_libre')!;
+    const entry = findCatalogEntry(row.id)!;
+    for (const [input, existingBinding, replies, accepts] of [
+      [client, undefined, [{ ...grant, user_id: 12345 }, { id: 54321 }], false],
+      [client, { user_id: '54321' }, row.replies, false],
+      [client, { user_id: '12345' }, row.replies, true],
+      [{ ...client, user_id: '54321' }, undefined, row.replies, false],
+    ] as const) {
+      boundary({ ...row, replies: [...replies] });
+      const shown = vi.fn(() => true); _setBroadcastForTest(shown);
+      const flow = authorizeLocalApi(UID, entry, input, { existingBinding });
+      const outcome = accepts ? expect(flow).resolves.toEqual({ user_id: '12345' }) : expect(flow).rejects.toThrow('Could not authorize');
+      await callback(); await outcome;
+      expect(shown).not.toHaveBeenCalled();
+      expect(hasLocalApiAuthorization(UID, entry)).toBe(accepts);
+      removeLocalApiAuthorization(UID, entry);
+    }
+  });
+
   it('exposes the complete credential panel and pins callbacks only for browser providers', () => {
     // Short copy is intentional; assert the platform prerequisite, not prose length.
     const prerequisites: Record<string, [RegExp, RegExp]> = {
@@ -119,7 +217,7 @@ describe('user-owned app authorization journey', () => {
       const setup = entry.connection_setup!;
       const optionalKeys = row.id === 'ebay-seller' ? ['signing_key_jwe', 'signing_private_key'] : [];
       expect(setup.fields.map((field) => field.key).sort()).toEqual([...Object.keys(row.input), ...optionalKeys].sort());
-      expect(setup.fields.filter((field) => field.required).map((field) => field.key).sort()).toEqual(Object.keys(row.input).sort());
+      expect(setup.fields.filter((field) => field.required).map((field) => field.key).sort()).toEqual(Object.keys(row.input).filter(key => !(row.id === 'mercado-libre-global-selling' && key === 'user_id')).sort());
       for (const key of optionalKeys) {
         expect(setup.fields.find((field) => field.key === key)).toMatchObject({ required: false, input: 'secret', storage: 'credential' });
       }
@@ -186,6 +284,7 @@ describe('user-owned app authorization journey', () => {
     const config = adapter.configured(transport.env);
     expect(config.provider).toBe(row.provider);
     expect(config.credentials.provider).toBe(row.provider);
+    if (row.provider === 'youzan') expect(config.credentials.identity.type).toBe(0);
     // A fresh device-only transport can reopen the exact persisted grant.
     const second = await localApiTransport(UID, entry, metadata);
     expect(adapter.configured(second.env).credentials).toEqual(config.credentials);

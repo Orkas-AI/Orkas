@@ -41,6 +41,7 @@ import { tokenize } from '../../../core-agent/src/sandbox/shell-words';
 import {
   classifyExternalMutationCommand,
   classifyExternalMutationScript,
+  gitCommandAction,
   type ExternalMutationFinding,
 } from './external-mutation-risk';
 
@@ -68,11 +69,18 @@ export type RiskCategory =
  */
 export type IrreversibleAction = 'recursive_delete' | 'untargeted_process_kill';
 
+export interface BashRiskEvidence {
+  reason: RiskCategory;
+  operation: string;
+  detail: string;
+}
+
 export interface RiskResult {
   risky: boolean;
   reasons: RiskCategory[];
   externalMutations: ExternalMutationFinding[];
   irreversible: IrreversibleAction[];
+  evidence: BashRiskEvidence[];
 }
 
 const SEGMENT_SEPS = new Set([';', '&&', '||', '&']);
@@ -300,17 +308,7 @@ function hasHelpOrVersion(args: readonly string[]): boolean {
 }
 
 function gitAction(args: readonly string[]): { action?: string; index: number } {
-  const optionsWithValues = new Set(['-c', '-C', '--config-env', '--exec-path', '--git-dir', '--namespace', '--super-prefix', '--work-tree']);
-  let index = 0;
-  while (index < args.length) {
-    const arg = args[index];
-    if (arg === '--') { index++; break; }
-    if (!arg.startsWith('-')) break;
-    if (optionsWithValues.has(arg)) { index += 2; continue; }
-    if (/^--(?:config-env|exec-path|git-dir|namespace|super-prefix|work-tree)=/.test(arg)) { index++; continue; }
-    index++;
-  }
-  return { action: args[index]?.toLowerCase(), index };
+  return gitCommandAction(args);
 }
 
 function matchGitNetwork(args: readonly string[]): boolean {
@@ -350,6 +348,7 @@ function matchToolNetwork(cmd: string, args: readonly string[]): boolean {
 function matchNetwork(cmd: string, args: string[], seg: Segment): boolean {
   if (RAW_SOCKET_CMDS.has(cmd)) return true;
   if (cmd === 'ssh') return args.length > 0; // ssh host [cmd] — remote exec
+  if (cmd === 'sftp') return args.some((arg) => !arg.startsWith('-'));
   if (REMOTE_COPY_CMDS.has(cmd)) return args.some(looksRemote);
   if (matchToolNetwork(cmd, args)) return true;
   if (NET_DOWNLOADERS.has(cmd)) {
@@ -618,15 +617,16 @@ function matchIrreversible(cmd: string, args: string[]): IrreversibleAction | nu
 const CRED_PATH_RES: RegExp[] = [
   /(^|\/)\.ssh\//i,
   /(^|\/)\.ssh$/i,
-  /(^|\/)\.aws\/credentials/i,
+  /(^|\/)\.aws(\/|$)/i,
   /(^|\/)\.config\/gcloud/i,
   /(^|\/)\.gnupg(\/|$)/i,
   /(^|\/)\.docker\/config\.json/i,
-  /(^|\/)\.netrc$/i,
+  /(^|\/)\.(netrc|npmrc|pypirc|git-credentials)$/i,
+  /(^|\/)\.env(\.|$)/i,
   /(^|\/)\.kube\/config/i,
   /\bid_(rsa|dsa|ecdsa|ed25519)\b/i,
   /\.pem$/i,
-  /\/Keychains\//i,
+  /\/Keychains(\/|$)/i,
   /login\.keychain/i,
 ];
 
@@ -648,18 +648,45 @@ const WRITE_CMDS = new Set([
   'set-content', 'add-content', 'out-file', 'new-item', 'copy-item', 'move-item',
 ]);
 
-function matchSensitive(cmd: string, args: string[], seg: Segment, allWords: string[]): boolean {
+function sensitiveWriteOperands(cmd: string, args: readonly string[]): string[] {
+  if (!new Set(['cp', 'install', 'rsync', 'ln', 'copy-item']).has(cmd)) return args.filter((arg) => !isFlag(arg));
+  const positional: string[] = [];
+  const destinations: string[] = [];
+  const values = new Set(['-t', '--target-directory', '--suffix', '-S', '--backup', '--mode', '-m', '--owner', '-o', '--group', '-g', '--context', '-Z', '-path', '-literalpath', '-destination', '-filter', '-include', '-exclude', '-credential', '-erroraction']);
+  let end = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!end && arg === '--') { end = true; continue; }
+    const flag = cmd === 'copy-item' ? arg.toLowerCase() : arg;
+    if (!end && values.has(flag)) {
+      const value = args[++i];
+      if (value && ['-t', '--target-directory', '-destination'].includes(flag)) destinations.push(value);
+    } else if (!end && arg.startsWith('--target-directory=')) destinations.push(arg.slice(19));
+    else if (!end && /^-t.+/.test(arg)) destinations.push(arg.slice(2));
+    else if (!end && /^-destination:/i.test(arg)) destinations.push(arg.slice(13));
+    else if (end || !arg.startsWith('-')) positional.push(arg);
+  }
+  if (cmd === 'install' && args.some(arg => arg === '-d' || arg === '--directory')) return positional;
+  return destinations.length ? destinations : positional.slice(-1);
+}
+
+function matchSensitive(cmd: string, args: string[], seg: Segment): boolean {
   // macOS keychain dumping tool
   if (cmd === 'security' && args.some((a) => /^(dump-keychain|find-generic-password|find-internet-password|export)$/.test(a))) {
     return true;
   }
   // crontab install (-, or a file arg) ⇒ persistence
-  if (cmd === 'crontab' && (args.includes('-') || args.some((a) => !isFlag(a)))) return true;
+  if (cmd === 'crontab' && !hasHelpOrVersion(args)) {
+    if (args.some((arg) => /^-[^-]*[er]/.test(arg))) return true;
+    const operands = args.filter((arg, index) => !isFlag(arg) && args[index - 1] !== '-u');
+    if (args.includes('-') || operands.length) return true;
+  }
   if ((cmd === 'cmdkey' || cmd === 'cmdkey.exe') && args.some((arg) => /^\/list/i.test(arg))) return true;
   if ((cmd === 'vaultcmd' || cmd === 'vaultcmd.exe') && args.some((arg) => /^\/listcreds/i.test(arg))) return true;
 
-  // credential/key material: any token referencing it
-  for (const w of allWords) {
+  // Credential operands and redirection targets; printed literal text is not a read.
+  const printsArguments = ['echo', 'printf', 'write-output', 'write-host'].includes(cmd);
+  for (const w of [...seg.redirectTargets, ...(printsArguments ? [] : args)]) {
     const normalized = w.replace(/\\/g, '/');
     if (CRED_PATH_RES.some((re) => re.test(normalized))) return true;
   }
@@ -667,11 +694,11 @@ function matchSensitive(cmd: string, args: string[], seg: Segment, allWords: str
   // persistence/autostart + /etc: only when this segment WRITES.
   const writes = seg.redirectTargets.length > 0 || WRITE_CMDS.has(cmd);
   if (writes) {
-    const writeTargets = [...seg.redirectTargets, ...args.filter((a) => !isFlag(a))]
+    const writeTargets = [...seg.redirectTargets, ...sensitiveWriteOperands(cmd, args)]
       .map((target) => target.replace(/\\/g, '/'));
     for (const t of writeTargets) {
       if (PERSIST_PATH_RES.some((re) => re.test(t))) return true;
-      if (/^\/etc\//.test(t)) return true; // write under /etc (reads are not flagged)
+      if (/^\/etc(?:\/|$)/.test(t)) return true; // write under /etc (reads are not flagged)
     }
   }
   const normalizedArgs = args.join(' ').replace(/\\/g, '/');
@@ -698,7 +725,7 @@ function chmodWidensAccess(args: readonly string[]): boolean {
     const special = mode.length === 4 && mode[0] !== '0';
     return special || (digits[1] & 2) !== 0 || (digits[2] & 2) !== 0;
   }
-  return /(?:^|,)[augo]*\+[^,]*w/i.test(mode)
+  return /(?:^|,)(?:[augo]*[ago][augo]*|)\+[^,]*w/i.test(mode)
     || /(?:^|,)[ago]*=[^,]*w/i.test(mode)
     || /(?:^|,)[augo]*\+[^,]*[st]/i.test(mode);
 }
@@ -994,8 +1021,9 @@ function classifyBashCommandInternal(command: string, depth: number): RiskResult
   const reasons = new Set<RiskCategory>();
   const externalMutations: ExternalMutationFinding[] = [];
   const irreversible = new Set<IrreversibleAction>();
+  const evidence: BashRiskEvidence[] = [];
   const cmd = String(command ?? '');
-  if (!cmd.trim()) return { risky: false, reasons: [], externalMutations: [], irreversible: [] };
+  if (!cmd.trim()) return { risky: false, reasons: [], externalMutations: [], irreversible: [], evidence: [] };
 
   // Fork bomb — operator soup the tokenizer can't meaningfully decompose;
   // matched on the raw despaced string.
@@ -1006,15 +1034,15 @@ function classifyBashCommandInternal(command: string, depth: number): RiskResult
   for (const seg of segments) {
     if (matchPipeToShell(seg)) reasons.add('network_egress');
 
-    const allWords = seg.stages.flatMap((s) => s.words);
-
     for (const stage of seg.stages) {
       const eff = effectiveCommand(stage.words);
       if (!eff) continue;
       let { cmd: c, args } = eff;
+      const stageReasons = new Set<RiskCategory>();
+      const addRisk = (reason: RiskCategory) => { reasons.add(reason); stageReasons.add(reason); };
 
       if (matchPrivilegeEscalation(c, args, stage.words)) {
-        reasons.add('priv_esc');
+        addRisk('priv_esc');
         // inspect the inner command too: `sudo rm -rf /`
         if (PRIV_ESC_CMDS.has(c)) {
           const inner = effectivePrivilegeCommand(args);
@@ -1024,17 +1052,17 @@ function classifyBashCommandInternal(command: string, depth: number): RiskResult
 
       // Privilege wrappers are peeled above so the inner operation can add
       // its own security-boundary reason as well (for example `sudo chmod`).
-      if (matchSecurityWeakening(c, args, stage.words)) reasons.add('priv_esc');
+      if (matchSecurityWeakening(c, args, stage.words)) addRisk('priv_esc');
 
-      if (matchNetwork(c, args, seg)) reasons.add('network_egress');
-      if (matchDestructive(c, args, seg)) reasons.add('destructive');
+      if (matchNetwork(c, args, seg)) addRisk('network_egress');
+      if (matchDestructive(c, args, seg)) addRisk('destructive');
       const irreversibleAction = matchIrreversible(c, args);
       if (irreversibleAction) irreversible.add(irreversibleAction);
-      if (matchSensitive(c, args, seg, allWords)) reasons.add('sensitive_path');
-      if (matchSystemPackageChange(c, args)) reasons.add('system_package_change');
+      if (matchSensitive(c, args, seg)) addRisk('sensitive_path');
+      if (matchSystemPackageChange(c, args)) addRisk('system_package_change');
       const externalMutation = classifyExternalMutationCommand(c, args);
       if (externalMutation) {
-        reasons.add('external_mutation');
+        addRisk('external_mutation');
         externalMutations.push(externalMutation);
       }
       const inlineSource = inlineProgramSource(c, args);
@@ -1043,8 +1071,14 @@ function classifyBashCommandInternal(command: string, depth: number): RiskResult
           language: /^(?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?$/i.test(c)
             && !/[$`]/.test(inlineSource) ? 'python' : undefined,
         });
-        if (inlineMutations.length) reasons.add('external_mutation');
+        if (inlineMutations.length) addRisk('external_mutation');
         externalMutations.push(...inlineMutations);
+      }
+
+      for (const reason of stageReasons) {
+        // Display evidence only; it never participates in admission. The
+        // quoted argument view preserves literal data as data.
+        evidence.push({ reason, operation: eff.cmd, detail: stage.words.map(word => JSON.stringify(word)).join(' ') });
       }
 
       const wrapped = unwrapCommandShell(c, args);
@@ -1054,6 +1088,7 @@ function classifyBashCommandInternal(command: string, depth: number): RiskResult
         for (const reason of nested.reasons) reasons.add(reason);
         for (const action of nested.irreversible) irreversible.add(action);
         externalMutations.push(...nested.externalMutations);
+        evidence.push(...nested.evidence);
       }
     }
   }
@@ -1063,6 +1098,7 @@ function classifyBashCommandInternal(command: string, depth: number): RiskResult
     reasons: [...reasons],
     externalMutations,
     irreversible: [...irreversible],
+    evidence,
   };
 }
 

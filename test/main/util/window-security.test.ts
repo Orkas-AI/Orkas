@@ -6,11 +6,15 @@ import {
   installHtmlPreviewNavigationGuard,
   isHtmlPreviewUrl,
   HTML_PREVIEW_CSP,
+  HTML_PREVIEW_SANDBOX_FLAGS,
   safeExternalHttpUrl,
   safeExternalUserActionUrl,
   safeLocalCliAuthUrl,
+  withHtmlPreviewAssetPolicy,
   withHtmlPreviewPolicy,
 } from '../../../src/main/util/window-security';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 describe('window security baseline', () => {
   it('cannot be weakened by caller overrides', () => {
@@ -197,6 +201,43 @@ describe('local HTML preview policy', () => {
     expect(secured.headers.get('Referrer-Policy')).toBe('no-referrer');
     expect(secured.headers.get('X-Content-Type-Options')).toBe('nosniff');
     expect(await secured.text()).toBe('preview body');
+  });
+
+  it('applies the file viewer sandbox to a top-level preview document only on request', () => {
+    const page = () => new Response('<p>x</p>', { headers: { 'Content-Type': 'text/html' } });
+    expect(withHtmlPreviewPolicy(page()).headers.get('Content-Security-Policy')).toBe(HTML_PREVIEW_CSP);
+    expect(withHtmlPreviewPolicy(page(), { sandboxDocument: true }).headers.get('Content-Security-Policy'))
+      .toBe(`${HTML_PREVIEW_CSP}; sandbox ${HTML_PREVIEW_SANDBOX_FLAGS}`);
+    expect(HTML_PREVIEW_SANDBOX_FLAGS).not.toContain('allow-same-origin');
+    expect(HTML_PREVIEW_SANDBOX_FLAGS).not.toContain('allow-top-navigation');
+  });
+
+  it('keeps the file viewer iframe sandbox identical to the preview check sandbox', () => {
+    const viewer = fs.readFileSync(
+      path.resolve(__dirname, '../../../src/renderer/modules/chat-file-viewer.js'),
+      'utf8',
+    );
+    const htmlBody = viewer.slice(viewer.indexOf('async function _renderHtmlBody('));
+    expect(htmlBody).toContain(`const sandbox = '${HTML_PREVIEW_SANDBOX_FLAGS}';`);
+  });
+
+  it('grants CORS to preview assets without changing their bytes or range metadata', async () => {
+    const original = new Response('body{color:red}', {
+      status: 206,
+      statusText: 'Partial Content',
+      headers: { 'Content-Type': 'text/css; charset=utf-8', 'Content-Range': 'bytes 0-14/15' },
+    });
+
+    const granted = withHtmlPreviewAssetPolicy(original);
+
+    expect(granted.status).toBe(206);
+    expect(granted.statusText).toBe('Partial Content');
+    expect(granted.headers.get('Content-Type')).toBe('text/css; charset=utf-8');
+    expect(granted.headers.get('Content-Range')).toBe('bytes 0-14/15');
+    expect(granted.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(granted.headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(granted.headers.get('Content-Security-Policy')).toBeNull();
+    expect(await granted.text()).toBe('body{color:red}');
   });
 
   it.each([

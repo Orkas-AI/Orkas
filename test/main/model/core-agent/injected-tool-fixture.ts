@@ -125,6 +125,7 @@ export function enumerateAllInjectedToolNames(): Set<string> {
     'tool_result',
     'project_instructions',
     'todo_tasks',
+    'project_setup',
     'research_verify_citations',
     'video_studio',
     'list_connector_tools',

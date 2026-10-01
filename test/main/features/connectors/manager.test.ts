@@ -452,6 +452,40 @@ afterEach(async () => {
 });
 
 describe('features/connectors/manager authorization recovery', () => {
+  it.each(['shopify-admin', 'ebay-seller', 'base-shop'])('retains the installed %s when replacement authorization is cancelled', async id => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    mocks.mcp.listTools.mockResolvedValue([{ name: 'execute_read', description: 'Read', input_schema: {} }]);
+    await manager.connectViaOAuth(TEST_UID, id, { connectionParameters: {} });
+    const previous = registry.load(TEST_UID).connections[id];
+    mocks.localApi.authorize.mockRejectedValueOnce(Object.assign(new Error('Cancelled'), { code: 'user_cancelled' }));
+    mocks.localApi.remove.mockClear();
+    await expect(manager.connectViaOAuth(TEST_UID, id, { connectionParameters: {} })).rejects.toMatchObject({ code: 'user_cancelled' });
+    expect(registry.load(TEST_UID).connections[id]).toEqual(previous);
+    expect(mocks.localApi.remove).not.toHaveBeenCalled();
+  });
+
+  it.each(['E_TOOL_CALL_AUTH', 'E_TOOL_CALL_UPSTREAM', 'E_TOOL_CALL_NETWORK'])('updates the local API connection after structured error %s without replaying', async code => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    mocks.mcp.listTools.mockResolvedValue([{ name: 'execute_read', description: 'Read', input_schema: {} }]);
+    await manager.connectViaOAuth(TEST_UID, 'shopify-admin', { connectionParameters: {} });
+    const result = { isError: true, _meta: { orkas: { errorCode: code } }, content: [{ type: 'text', text: 'Fixture failure' }] };
+    mocks.mcp.callTool.mockResolvedValueOnce(result);
+    await expect(manager.callTool(TEST_UID, 'shopify-admin', 'execute_read', { action: 'products.list' })).resolves.toBe(result);
+    const current = registry.load(TEST_UID).connections['shopify-admin'];
+    expect(current.status.kind).toBe(code === 'E_TOOL_CALL_AUTH' ? 'error' : 'degraded');
+    expect(!!current.auth_error).toBe(code === 'E_TOOL_CALL_AUTH');
+    expect(current.tools_cache).toHaveLength(1);
+    expect(mocks.localApi.remove).not.toHaveBeenCalled();
+    expect(mocks.mcp.callTool).toHaveBeenCalledOnce();
+    if (code !== 'E_TOOL_CALL_AUTH') {
+      mocks.mcp.callTool.mockResolvedValueOnce({ content: [{ type: 'text', text: 'Recovered' }] });
+      await manager.callTool(TEST_UID, 'shopify-admin', 'execute_read', { action: 'products.list' });
+      expect(registry.load(TEST_UID).connections['shopify-admin'].status.kind).toBe('connected');
+    }
+  });
+
   it.each([
     ['storefront_request_failed', 'failure', 'E_TOOL_CALL_UPSTREAM', 'upstream', 'warn'],
     ['E_TOOL_CALL_CANCELLED', 'cancelled', 'E_TOOL_CALL_CANCELLED', 'cancelled', 'info'],
@@ -2014,6 +2048,10 @@ describe('OAuth refresh ownership', () => {
     mocks.mcp.listTools = vi.fn(async () => [
       { name: 'create_invoice', description: 'Create an invoice.', input_schema: {} },
       { name: 'create_refund', description: 'Refund a payment.', input_schema: {} },
+      { name: 'search_invoicing', description: 'Search invoice resources.', input_schema: { type: 'object', properties: { resource_type: { enum: ['invoice', 'recurring_series'] } } } },
+      { name: 'activate_recurring_series', description: 'Activate scheduled invoices.', input_schema: {} },
+      { name: 'delete_recurring_series', description: 'Delete a draft series.', input_schema: {} },
+      { name: 'update_product', description: 'Declared but missing official dispatcher.', input_schema: {} },
       { name: 'unreviewed_future_admin_action', description: 'Must stay hidden.', input_schema: {} },
     ]);
 
@@ -2031,7 +2069,12 @@ describe('OAuth refresh ownership', () => {
         name: 'create_refund',
         orkas_action_policy: expect.objectContaining({ risk: 'H', confirmation: 'fresh' }),
       }),
+      expect.objectContaining({ name: 'search_invoicing', input_schema: { type: 'object', properties: { resource_type: { enum: ['invoice', 'recurring_series'] } } }, orkas_action_policy: expect.objectContaining({ risk: 'R' }) }),
+      expect.objectContaining({ name: 'activate_recurring_series', orkas_action_policy: expect.objectContaining({ risk: 'H' }) }),
+      expect.objectContaining({ name: 'delete_recurring_series', orkas_action_policy: expect.objectContaining({ risk: 'D' }) }),
     ]);
+    expect(registry.load(TEST_UID).connections.paypal.tools_cache.map(t => t.name)).not.toContain('get_merchant_insights');
+    await expect(manager.callTool(TEST_UID, 'paypal', 'update_product', {})).rejects.toThrow('connector_tool_not_allowed');
     await expect(
       manager.callTool(TEST_UID, 'paypal', 'unreviewed_future_admin_action', {}),
     ).rejects.toThrow('connector_tool_not_allowed');
@@ -2374,6 +2417,36 @@ describe('OAuth refresh ownership', () => {
       TEST_UID,
       expect.objectContaining({ id: 'wecom' }),
     );
+  });
+
+  it.each(['mercado-libre-global-selling', 'tiktok-shop'])('retains the previous %s binding and credentials when reauthorization is cancelled', async id => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const binding = id === 'tiktok-shop' ? { shop_id: '12345', region: 'us' } : { user_id: '12345' };
+    mocks.localApi.authorize = vi.fn(async () => binding);
+    mocks.mcp.listTools = vi.fn(async () => [{ name: 'execute_read', description: 'Read', input_schema: {} }]);
+    await manager.connectViaOAuth(TEST_UID, id, { connectionParameters: {} });
+    const previous = registry.load(TEST_UID).connections[id];
+    mocks.localApi.authorize = vi.fn(async () => { throw Object.assign(new Error('Cancelled'), { code: 'user_cancelled' }); });
+    mocks.localApi.remove.mockClear();
+    await expect(manager.connectViaOAuth(TEST_UID, id, { connectionParameters: {} })).rejects.toMatchObject({ code: 'user_cancelled' });
+    expect(mocks.localApi.authorize).toHaveBeenCalledWith(TEST_UID, expect.objectContaining({ id }), {}, expect.objectContaining({ existingBinding: binding }));
+    expect(mocks.localApi.remove).not.toHaveBeenCalled();
+    expect(registry.load(TEST_UID).connections[id]).toEqual(previous);
+  });
+
+  it('retains the installed WooCommerce store when a replacement authorization is cancelled', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    mocks.localApi.authorize = vi.fn(async () => ({ store_url: 'https://shop.example.com' }));
+    mocks.mcp.listTools = vi.fn(async () => [{ name: 'execute_read', description: 'Read', input_schema: {} }]);
+    await manager.connectViaOAuth(TEST_UID, 'woocommerce', { connectionParameters: {} });
+    const previous = registry.load(TEST_UID).connections.woocommerce;
+    mocks.localApi.authorize = vi.fn(async () => { throw Object.assign(new Error('Cancelled'), { code: 'user_cancelled' }); });
+    mocks.localApi.remove.mockClear();
+    await expect(manager.connectViaOAuth(TEST_UID, 'woocommerce', { connectionParameters: {} })).rejects.toMatchObject({ code: 'user_cancelled' });
+    expect(mocks.localApi.remove).not.toHaveBeenCalled();
+    expect(registry.load(TEST_UID).connections.woocommerce).toEqual(previous);
   });
 
   it('keeps direct-commerce credentials device-local across connect, refresh, list, and removal', async () => {

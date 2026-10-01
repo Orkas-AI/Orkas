@@ -41,7 +41,7 @@ describe.each(['agent', 'skill'] as const)('marketplace %s download address reco
   const oldUrl = `https://marketplace.example.test/${id}/old`;
   const detailPath = `/marketplace/${plural}/${kind === 'agent' ? 'detail' : 'bundle'}`;
 
-  async function setup(url: string, localVersion = '1.0.0') {
+  async function setup(url: string, localVersion = '1.0.0', catalogAddress?: string) {
     const installs = await import('../../../src/main/features/marketplace_installs');
     const reconcile = await import('../../../src/main/features/marketplace_reconcile');
     const dir = path.join(root, 'u1', 'local', 'marketplace', plural, id);
@@ -68,7 +68,7 @@ describe.each(['agent', 'skill'] as const)('marketplace %s download address reco
       })();
     const fresh = { version: '2.0.0', published_at: 200, [urlKey]: freshUrl, create_uid: '0' };
     postJson.mockImplementation(async (endpoint: string) => {
-      if (endpoint === `/marketplace/${plural}/list`) return { list: [{ id, version: '2.0.0', published_at: 200 }], total: 1 };
+      if (endpoint === `/marketplace/${plural}/list`) return { list: [{ id, version: '2.0.0', published_at: 200, ...(catalogAddress === undefined ? {} : { [urlKey]: catalogAddress }) }], total: 1 };
       if (endpoint === detailPath) return fresh;
       throw new Error('Unexpected marketplace endpoint');
     });
@@ -92,6 +92,14 @@ describe.each(['agent', 'skill'] as const)('marketplace %s download address reco
     expect(JSON.parse(fs.readFileSync(path.join(ctx.dir, '_install.json'), 'utf8'))).toMatchObject({ version: '2.0.0', [urlKey]: freshUrl });
     expect(fs.readFileSync(path.join(ctx.dir, file), 'utf8')).toContain(kind === 'agent' ? 'Updated version' : 'updated-version');
   }
+
+  it('uses the batched upgrade address without a per-item detail request', async () => {
+    const ctx = await setup('', '1.0.0', freshUrl);
+    await expectUpdated(ctx);
+    expect(postJson).not.toHaveBeenCalled();
+    expect(ctx.download).toHaveBeenCalledTimes(1);
+    expect(warnings).not.toHaveBeenCalled();
+  });
 
   it.each(['', 'not-a-url', 'file:///fixture'])('upgrades a builtin with unresolved address %j through detail lookup', async (url) => {
     const ctx = await setup(url);

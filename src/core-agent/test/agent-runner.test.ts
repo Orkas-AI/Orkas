@@ -73,6 +73,64 @@ async function* streamCompletionResult(result: CompletionResult): AsyncIterable<
 }
 
 describe("runner error metadata", () => {
+  it.each(["recovered", "unrecoverable", "exhausted"] as const)(
+    "keeps provider error prose out of context-overflow logs (%s)", async mode => {
+      const privateMarker = "private-provider-echo@example.invalid";
+      const error = new ContextOverflowError(`request exceeds context window: ${privateMarker}`);
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Inspect sources" }]);
+      for (let round = 0; round < (mode === "unrecoverable" ? 1 : 2); round++) {
+        session.addAssistantMessage([{ type: "tool_use", id: `source-${round}`, name: "inspect", input: {} }]);
+        session.addToolResult(`source-${round}`, `${round}:${"x".repeat(2_000)}`);
+      }
+      let calls = 0;
+      const provider: LLMProvider = {
+        id: "mock", name: "Mock",
+        async complete() { throw new Error("must not summarize"); },
+        async *stream() {
+          calls++;
+          yield { type: "message_start" as const };
+          if (calls === 1 || mode !== "recovered") throw error;
+          yield { type: "message_end" as const, stopReason: "end_turn" as const,
+            content: [{ type: "text" as const, text: "done" }], model: "mock-model" };
+        },
+        async validateAuth() { return true; },
+      };
+      const registry = new ProviderRegistry();
+      registry.registerFactory("mock", () => provider);
+      const runner = new AgentRunner({ session, providers: registry, tools: [],
+        config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+          models: { catalog: { "mock-model": { provider: "mock", model: "mock-model",
+            contextWindow: 32_000, maxOutputTokens: 4_096 } } } }),
+      });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const failure = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const events: AgentRunEvent[] = [];
+        for await (const event of runner.runStream({ message: "Inspect sources", resumeActiveTurn: true })) events.push(event);
+        const done = events.find((e): e is Extract<AgentRunEvent, { type: "done" }> => e.type === "done");
+        expect(calls).toBe(mode === "unrecoverable" ? 1 : 2);
+        if (mode === "recovered") expect(done?.result.text).toBe("done");
+        else expect(done?.result.meta.error?.kind).toBe("context_overflow");
+        const logs = [...warn.mock.calls, ...failure.mock.calls];
+        const expected = mode === "recovered" ? "context overflow recovery applied"
+          : mode === "unrecoverable" ? "context overflow with nothing to recover"
+          : "context overflow after recovery";
+        const entry = logs.find(args => args[1] === expected);
+        expect(entry).toBeDefined();
+        expect(JSON.stringify(logs)).not.toContain(privateMarker);
+        expect(entry?.[2]).toMatchObject({ overflowError: {
+          name: "ContextOverflowError", code: "CONTEXT_OVERFLOW",
+          message_hash: createHash("sha256").update(error.message).digest("hex").slice(0, 12),
+          message_chars: error.message.length,
+        } });
+      } finally {
+        warn.mockRestore();
+        failure.mockRestore();
+      }
+    },
+  );
+
   it("prefers a nested provider business code over a generic wrapper code", () => {
     const original = Object.assign(new Error("积分不足"), {
       code: "orkas_llm_quota_exceeded",
@@ -4095,10 +4153,10 @@ describe("AgentRunner", () => {
           return;
         }
         if (call === 2) {
-          // Exercise the provider serialization boundary as well as recovery.
+          // Exercise the structured provider boundary as well as recovery.
           throw wrapErrorForTest(new ProviderError(
             '400: {"code":"context_length_exceeded","message":"Request rejected"}',
-            "mock",
+            "mock", 400, Object.assign(new Error('opaque'), { code: 'context_length_exceeded' }),
           ), "mock");
         }
         yield { type: "text_delta" as const, text: "done" };
@@ -4524,8 +4582,11 @@ describe("AgentRunner", () => {
     });
   });
 
-  it("stops a started compaction after 60 seconds without new content and opens the run-local circuit", async () => {
+  it.each([0, 120_000])("stops a started compaction after 60 awake seconds without new content (sleep: %sms)", async (suspendMs) => {
     vi.useFakeTimers();
+    let frozen: number | undefined;
+    let suspended = 0;
+    const idleNow = () => frozen ?? Date.now() - suspended;
     try {
       let receivedSignal: AbortSignal | undefined;
       let receivedFirstEventTimeoutMs: number | undefined;
@@ -4603,7 +4664,7 @@ describe("AgentRunner", () => {
         inputSchema: { type: "object", properties: {} },
         async execute() { return { content: "x".repeat(100_000) }; },
       });
-      const runner = new AgentRunner({ config, providers: registry, tools: [largeResult] });
+      const runner = new AgentRunner({ config, providers: registry, tools: [largeResult], idleNow });
       const session = runner.getSession();
       session.beginUserTurn([{ type: "text", text: "continue" }]);
       for (let i = 0; i < 5; i++) {
@@ -4618,6 +4679,13 @@ describe("AgentRunner", () => {
 
       await compactionStarted;
       await vi.advanceTimersByTimeAsync(0);
+      if (suspendMs) {
+        frozen = idleNow();
+        await vi.advanceTimersByTimeAsync(suspendMs);
+        expect(receivedSignal?.aborted).toBe(false);
+        suspended += suspendMs;
+        frozen = undefined;
+      }
       await vi.advanceTimersByTimeAsync(CONTEXT_COMPACTION_IDLE_TIMEOUT_MS + 1);
       await running;
 
@@ -4632,7 +4700,7 @@ describe("AgentRunner", () => {
         phase: "active_process_compaction_failed",
         data: expect.objectContaining({
           error: expect.stringContaining("Context compaction produced no new content"),
-          durationMs: CONTEXT_COMPACTION_IDLE_TIMEOUT_MS,
+          durationMs: CONTEXT_COMPACTION_IDLE_TIMEOUT_MS + suspendMs,
           disabledReason: "compaction_idle_timeout",
         }),
       }));
@@ -5840,12 +5908,14 @@ describe("AgentRunner", () => {
     expect(collected.filter((event) => event.type === "provider_call")).toEqual([
       expect.objectContaining({
         outcome: "completed",
+        output: { terminalSeen: true, stopReason: "tool_use", textChars: 0, thinkingChars: 0, toolCalls: 1 },
         model: "mock-model",
         usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
         reasoningBoundary: { structured: true, literalLeadingText: false },
       }),
       expect.objectContaining({
         outcome: "completed",
+        output: expect.objectContaining({ terminalSeen: true, stopReason: "end_turn", toolCalls: 0 }),
         model: "mock-model",
         usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
         reasoningBoundary: { structured: false, literalLeadingText: true },
@@ -9284,3 +9354,156 @@ describe("runner persistence barriers", () => {
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   }, 15_000);
 });
+
+// The host supplies OS-aware elapsed time; every core tool execution lane
+// must preserve the remaining idle allowance without re-running the tool.
+it.each([
+  ['sequential', 'complete'], ['parallel', 'complete'], ['reflection', 'complete'],
+  ['programmatic', 'complete'], ['programmatic', 'idle'], ['programmatic', 'cancel'],
+] as const)('keeps %s tools bounded across suspension (%s)', async (lane, outcome) => {
+  vi.useFakeTimers();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let suspendedMs = 0;
+  let frozen: number | undefined;
+  const idleNow = () => frozen ?? Date.now() - suspendedMs;
+  const count = lane === 'parallel' ? 2 : 1;
+  const proposal = Array.from({ length: count }, (_, i) => ({ type: 'tool_use' as const, id: `sleep-${i}`, name: 'sleep_probe', input: {} }));
+  const requests: CompletionParams[] = [];
+  let started!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  const provider = createMockProvider([
+    { content: lane === 'programmatic' ? [{ type: 'tool_use', id: 'program', name: 'run_program', input: { code: 'json(await tools.sleep_probe({}));' } }] : proposal, stopReason: 'tool_use', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, model: 'mock-model' },
+    { content: [{ type: 'text', text: 'completed' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, model: 'mock-model' },
+  ], params => { requests.push(params); });
+  const complete = provider.complete.bind(provider);
+  provider.complete = params => { requests.push(params); return complete(params); };
+  const providers = new ProviderRegistry();
+  providers.registerFactory('mock', () => provider);
+  const signals: AbortSignal[] = [];
+  const execute = vi.fn(async (_input, ctx: ToolContext) => {
+    signals.push(ctx.signal!);
+    if (signals.length === count) started();
+    await gate;
+    return { content: 'saved once' };
+  });
+  const runner = new AgentRunner({
+    config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'mock-model', toolIdleTimeoutMs: 1000 } }),
+    providers, idleNow,
+    ...(lane === 'programmatic' ? { programmaticToolPolicy: { isEligible: (name: string) => name === 'sleep_probe', authorize: () => ({ allowed: true as const }) } } : {}),
+    tools: [defineTool({ name: 'sleep_probe', description: 'Persist one fixture result', inputSchema: { type: 'object', properties: {} },
+      executionMode: lane === 'parallel' ? 'parallel' : 'sequential', execute })],
+  });
+  const controller = new AbortController();
+  const events: AgentRunEvent[] = [];
+  let ended = false;
+  const run = (lane === 'reflection'
+    ? runner.runReflection('review', controller.signal)
+    : (async () => { for await (const event of runner.runStream({ message: 'work', signal: controller.signal })) events.push(event); return events.at(-1); })()
+  ).then(value => { ended = true; return value; });
+  try {
+    await ready;
+    await vi.advanceTimersByTimeAsync(200);
+    expect(execute).toHaveBeenCalledTimes(count);
+    frozen = idleNow();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ended).toBe(false);
+    expect(signals.every(signal => !signal.aborted)).toBe(true);
+    if (outcome === 'cancel') {
+      controller.abort();
+      await run;
+      expect(signals.every(signal => signal.aborted)).toBe(true);
+      expect(events.at(-1)).toMatchObject({ type: 'done', result: { meta: { aborted: true } } });
+      expect(requests).toHaveLength(1);
+      expect(execute).toHaveBeenCalledTimes(1);
+      return;
+    }
+    suspendedMs += 5000;
+    frozen = undefined;
+    await vi.advanceTimersByTimeAsync(799);
+    expect(signals.every(signal => !signal.aborted)).toBe(true);
+    if (outcome === 'idle') {
+      await vi.advanceTimersByTimeAsync(1);
+      expect(signals[0].aborted).toBe(true);
+    } else release();
+    await vi.advanceTimersByTimeAsync(0);
+    const result = await run;
+    if (lane === 'reflection') expect(result).toBe('completed');
+    else {
+      expect(events.filter(event => event.type === 'tool_end')).toHaveLength(count);
+      expect(events.filter(event => event.type === 'tool_end').every(event => !event.isError)).toBe(true);
+      if (lane === 'programmatic') {
+        const programEnd = events.find(event => event.type === 'tool_end' && event.name === 'run_program');
+        expect(programEnd).toMatchObject({ result: expect.stringContaining(outcome === 'idle' ? 'Tool execution stalled after 1000ms' : 'saved once') });
+        if (outcome === 'idle') expect(programEnd?.type === 'tool_end' && programEnd.result).toMatch(/\"ok\"\s*:\s*false/);
+      }
+      expect(events.at(-1)).toMatchObject({ type: 'done', result: { text: 'completed' } });
+    }
+    expect(execute).toHaveBeenCalledTimes(count);
+    expect(requests).toHaveLength(2);
+  } finally {
+    release(); controller.abort(); await run;
+    vi.clearAllTimers(); vi.useRealTimers();
+  }
+});
+
+describe('terminal output evidence', () => {
+  it.each(['text', 'reasoning', 'empty', 'eof'] as const)('records %s without inferring tools or terminal events', async (kind) => {
+    const thought = '<dots_function_call><read_files>private</read_files></dots_function_call>';
+    const provider = createMockProvider([{ content: [], stopReason: 'end_turn',
+      model: 'mock-model', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }]);
+    provider.stream = async function* () {
+      if (kind === 'text' || kind === 'eof') yield { type: 'text_delta', text: 'hello' };
+      if (kind === 'reasoning') yield { type: 'thinking_delta', text: thought, chars: thought.length };
+      if (kind !== 'eof') yield { type: 'message_end', stopReason: 'end_turn', content:
+        kind === 'reasoning' ? [{ type: 'thinking', thinking: thought }] :
+        kind === 'text' ? [{ type: 'text', text: 'hello' }] : [] };
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory('mock', () => provider);
+    const runner = new AgentRunner({ providers: registry, tools: [], config: createConfig({
+      agent: { defaultProvider: 'mock', defaultModel: 'mock-model' },
+    }) });
+    const events = await collectRunEvents(runner, 'synthetic diagnostic boundary');
+    const calls = events.filter((event) => event.type === 'provider_call');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ output: {
+      terminalSeen: kind !== 'eof', textChars: kind === 'text' || kind === 'eof' ? 5 : 0,
+      thinkingChars: kind === 'reasoning' ? thought.length : 0, toolCalls: 0,
+      ...(kind !== 'eof' ? { stopReason: 'end_turn' } : {}),
+    } });
+    if (kind === 'eof') expect(calls[0].output).not.toHaveProperty('stopReason');
+    expect(events.filter((event) => event.type === 'tool_start')).toEqual([]);
+    expect(events.filter((event) => event.type === 'done')).toHaveLength(1);
+  });
+});
+
+  it('lets the production runner summarize after six executed rounds without executing the seventh proposal', async () => {
+    const { AgentRunner, ProviderRegistry, Session, createConfig } = await import('../src/index');
+    const config = createConfig({ agent: { defaultProvider: 'openai-codex', defaultModel: 'gpt-5.5', maxRetries: 0, maxToolLoops: 6 }, evolution: { enabled: false } });
+    const providers = new ProviderRegistry(config);
+    const diagnostics: string[] = [];
+    const warn = vi.spyOn(console, 'warn').mockImplementation((...args) => diagnostics.push(args.map(String).join(' ')));
+    let requests = 0;
+    const execute = vi.fn(async () => ({ content: '{}' }));
+    providers.registerFactory('openai-codex', () => ({ id: 'openai-codex', name: 'fixture', validateAuth: async () => true,
+      async *stream(): AsyncIterable<StreamEvent> {
+        requests++;
+        yield { type: 'message_end', stopReason: 'tool_use', model: 'gpt-5.5', content: [{ type: 'tool_use', id: String(requests), name: 'probe', input: { page: requests } }] };
+      },
+      async complete(params) {
+        requests++; expect(params.tools).toBeUndefined();
+        return { content: [{ type: 'text', text: 'No supported operation was found.' }], model: 'gpt-5.5', stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+      },
+    }));
+    try {
+      const runner = new AgentRunner({ config, providers, session: new Session(), tools: [{ name: 'probe', description: 'Read a fixture page', inputSchema: { type: 'object' }, execute }] });
+      let result: any;
+      for await (const event of runner.runStream({ message: 'Inspect the fixture', systemPrompt: 'Fixture instructions' })) if (event.type === 'done') result = event.result;
+      expect(requests).toBe(8); expect(execute).toHaveBeenCalledTimes(6);
+      expect(result.text).toBe('No supported operation was found.');
+      expect(result.meta.error).toBeUndefined();
+      expect(diagnostics.length).toBeGreaterThan(0);
+      expect(diagnostics.every(s => s.startsWith('[agent-runner] run_convergence: nudged model to finish near limit') || s.startsWith('[agent-runner] Run convergence tool-loop limit reached'))).toBe(true);
+    } finally { warn.mockRestore(); }
+  });

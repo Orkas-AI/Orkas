@@ -80,7 +80,7 @@
     return lines.filter(Boolean).join('\n');
   }
 
-  async function askQuestion(question, signal) {
+  async function askQuestion(question, signal, context) {
     const options = Array.isArray(question.options) ? question.options : [];
     if (options.length) {
       const choices = options.map((option, index) => ({
@@ -92,6 +92,7 @@
       }
       const selected = await uiChoice({
         title: t('agents.cli_user_input_title'),
+        context,
         message: questionMessage(question),
         choices,
         // A CLI question carries prose options (up to 12 of them, 160 chars
@@ -109,14 +110,14 @@
           return Number.isInteger(index) && options[index] ? String(options[index].label || '') : '';
         }).filter(Boolean);
         if (selected.includes('other')) {
-          const other = await uiPrompt(question.question || '', '', { signal, secret: question.isSecret === true });
+          const other = await uiPrompt(question.question || '', '', { signal, context, secret: question.isSecret === true });
           if (other === null) return null;
           if (String(other).trim()) answers.push(String(other));
         }
         return answers;
       }
       if (selected === 'other') {
-        const other = await uiPrompt(question.question || '', '', { signal, secret: question.isSecret === true });
+        const other = await uiPrompt(question.question || '', '', { signal, context, secret: question.isSecret === true });
         return other === null ? null : [String(other)];
       }
       const index = Number(String(selected).replace('option-', ''));
@@ -126,6 +127,7 @@
     }
     const value = await uiPrompt(questionMessage(question), '', {
       signal,
+      context,
       secret: question.isSecret === true,
     });
     return value === null ? null : [String(value)];
@@ -139,7 +141,7 @@
     try {
       const answers = {};
       for (const question of Array.isArray(info.questions) ? info.questions : []) {
-        const value = await askQuestion(question, controller.signal);
+        const value = await askQuestion(question, controller.signal, info);
         if (controller.signal.aborted) return;
         if (value === null) {
           await respond(requestId, {}, true);

@@ -12,6 +12,7 @@ const UID = 'system-skills-user';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let prevDisableDelivery: string | undefined;
 let logDeliveries: ReturnType<typeof import('../../../src/main/util/log-delivery').createLogDelivery>[];
 
 beforeEach(async () => {
@@ -19,7 +20,9 @@ beforeEach(async () => {
   vi.doUnmock('../../../src/main/paths');
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-system-skills-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
+  prevDisableDelivery = process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = '0';
   vi.resetModules();
   logDeliveries = [];
   const delivery = await import('../../../src/main/util/log-delivery');
@@ -39,6 +42,8 @@ afterEach(async () => {
   } finally { await Promise.all(logDeliveries.map(delivery => delivery.close())); }
   if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  if (prevDisableDelivery === undefined) delete process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
+  else process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = prevDisableDelivery;
   fs.rmSync(tmpDir, { recursive: true, force: true });
   vi.restoreAllMocks();
   vi.resetModules();

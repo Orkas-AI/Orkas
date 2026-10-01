@@ -1,3 +1,4 @@
+import { expectComposerText } from './fixtures/composer';
 import { expect, test } from './fixtures/orkas';
 
 function expectAppCreationContext(request: Record<string, unknown>) {
@@ -17,7 +18,7 @@ function expectAppCreationContext(request: Record<string, unknown>) {
 
 test.describe('My Apps', () => {
   for (const existingTaskCount of [0, 2]) {
-    test(`creates a separate task once with ${existingTaskCount} existing tasks and records bounded actions`, async ({ modelOrkas: orkas }) => {
+    test(`creates a separate task once with ${existingTaskCount} existing tasks`, async ({ modelOrkas: orkas }) => {
       const page = orkas.page!;
       orkas.setModelTextReplies(['APP_CREATE_ACK']);
       // Existing history must remain usable when a new app task is inserted
@@ -28,17 +29,6 @@ test.describe('My Apps', () => {
       await page.evaluate(() => (window as any).loadConversations());
       await expect(page.locator('#conversation-list .conv-item')).toHaveCount(existingTaskCount);
       await page.locator('.chat-rich-editor[data-rich-input-id="new-chat-input"]').fill('Unrelated home draft');
-      await page.evaluate(() => {
-        const w = window as any;
-        w.__appCreateEvents = [];
-        for (const kind of ['click', 'event']) {
-          const original = w.Monitor[kind];
-          w.Monitor[kind] = function(name: string, payload: unknown) {
-            if (name.startsWith('saved_app_create')) w.__appCreateEvents.push({ kind, name, payload });
-            return original.call(this, name, payload);
-          };
-        }
-      });
       await page.locator('#apps-btn').click();
       const opener = page.locator('#apps-create-btn');
       await opener.click();
@@ -96,16 +86,8 @@ test.describe('My Apps', () => {
         await expect(page.locator('#conversation-list')).toContainText(`Existing task ${i + 1}`);
       }
       expect(JSON.stringify(orkas.modelRequests)).not.toContain('Unrelated home draft');
-      const events = await page.evaluate(() => (window as any).__appCreateEvents);
-      expect(events.filter((e: any) => e.name === 'saved_app_create_result')).toEqual([{
-        kind: 'event', name: 'saved_app_create_result', payload: { result: 'success', template: 'custom', stage: 'send', duration_ms: expect.any(Number) },
-      }]);
-      expect(events.filter((e: any) => e.name === 'saved_app_create').map((e: any) => e.payload.action)).toEqual([
-        'open', 'cancel', 'open', 'template', 'template', 'template', 'template', 'cancel', 'open', 'submit',
-      ]);
-      expect(JSON.stringify(events)).not.toContain('family meals');
       await page.locator('#new-chat-btn').click();
-      await expect(page.locator('#new-chat-input')).toHaveValue('Unrelated home draft');
+      await expectComposerText(page.locator('#new-chat-input'), 'Unrelated home draft');
     });
   }
 
@@ -131,23 +113,14 @@ test.describe('My Apps', () => {
         }
         return fetch(...args);
       };
-      w.__creationResults = [];
-      const original = w.Monitor.event;
-      w.Monitor.event = function(name: string, payload: unknown) {
-        if (name === 'saved_app_create_result') w.__creationResults.push(payload);
-        return original.call(this, name, payload);
-      };
     });
     await panel.locator('[data-create-submit]').click();
     const alert = page.locator('.ui-dialog-overlay:visible').last();
     await expect(alert).toContainText('Could not start app creation');
     await alert.locator('[data-act="ok"]').click();
-    await expect(page.locator('#chat-input')).toHaveValue(description);
+    await expectComposerText(page.locator('#chat-input'), description);
     expect(orkas.modelRequests).toHaveLength(0);
     expect((await orkas.invoke<{ conversations: unknown[] }>('conversations.list')).conversations).toHaveLength(1);
-    expect(await page.evaluate(() => (window as any).__creationResults)).toEqual([{
-      result: 'failure', template: 'products', stage: 'send', duration_ms: expect.any(Number), error_code: 'send_not_started',
-    }]);
     await page.locator('#chat-send-btn').click();
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', { hasText: 'APP_RETRY_ACK' })).toBeVisible({ timeout: 20_000 });
     expect((await orkas.invoke<{ conversations: unknown[] }>('conversations.list')).conversations).toHaveLength(1);
@@ -256,7 +229,10 @@ test.describe('My Apps', () => {
     await expect(viewer).toHaveClass(/\bis-open\b/);
     await expect(viewer.locator('.saved-app-viewer-title')).toHaveText('E2E Saved App');
     const appFrame = viewer.locator('.saved-app-viewer-frame');
-    await expect(appFrame).toHaveAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms');
+    await expect(appFrame).toHaveAttribute(
+      'sandbox',
+      'allow-scripts allow-same-origin allow-forms allow-downloads allow-popups allow-modals',
+    );
     await expect(appFrame.contentFrame().locator('#app-title')).toHaveText('E2E App Running');
     expect(await appFrame.contentFrame().locator('body').evaluate(() => typeof (window as any).orkas)).toBe('undefined');
     await page.locator('#new-chat-btn').click();
@@ -289,12 +265,12 @@ test.describe('My Apps', () => {
     });
     await page.locator('.app-row-menu-item[data-action="edit"]').click();
     await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
-    await expect(page.locator('#chat-input')).toHaveValue(/E2E Renamed App/);
+    await expectComposerText(page.locator('#chat-input'), /E2E Renamed App/);
     await expect(page.locator('#chat-attachments')).toContainText('app-source.md');
     const editComposer = page.locator('.chat-rich-editor[data-rich-input-id="chat-input"]');
     await expect(editComposer).toBeFocused();
     await editComposer.fill('Change the app background to blue');
-    await expect(page.locator('#chat-input')).toHaveValue('Change the app background to blue');
+    await expectComposerText(page.locator('#chat-input'), 'Change the app background to blue');
     const notifications = await page.evaluate(() => (window as any).__savedAppEditNotifications);
     for (const notification of notifications) {
       expect(notification).toEqual({

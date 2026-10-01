@@ -34,7 +34,21 @@ import {
   projectAutoTaskConfigFile,
   projectAutoTaskAttachmentsDir,
 } from '../paths';
+import { t } from '../i18n';
 import { readJsonSync, safeId } from '../storage';
+
+const blockedConversations = new Map<string, Set<string>>();
+
+export function setConversationRelocationBlocked(uid: string, cid: string, blocked: boolean): void {
+  let ids = blockedConversations.get(uid);
+  if (!ids) { ids = new Set(); blockedConversations.set(uid, ids); }
+  if (blocked) ids.add(cid);
+  else ids.delete(cid);
+}
+
+export function assertConversationRelocationReady(uid: string, cid: string): void {
+  if (blockedConversations.get(uid)?.has(cid)) throw new Error(t('errors.conversation_recovery_conflict'));
+}
 
 const RESERVED_CHAT_DIRS = new Set(['agent', 'skill', 'subagents']);
 // `null` is cached briefly: most conversations live in the global root, but a
@@ -55,6 +69,17 @@ function rememberConversationProject(uid: string, cid: string, pid: string | nul
     projectId: pid,
     expiresAt: pid === null ? Date.now() + NEGATIVE_PROJECT_CACHE_TTL_MS : Number.POSITIVE_INFINITY,
   });
+}
+
+/**
+ * Forget a cached ownership answer. A positive pid is otherwise pinned for the
+ * life of the process, so relocating a conversation must call this or every
+ * path derived afterwards — messages, sessions, attachments, artifacts —
+ * resolves against the root the conversation just left.
+ */
+export function invalidateConversationProjectCache(uid: string, cid?: string): void {
+  if (!cid) { conversationProjectCache.delete(uid); return; }
+  conversationProjectCache.get(uid)?.delete(cid);
 }
 
 export function cloudRelForAbs(uid: string, absPath: string): string {
@@ -109,6 +134,7 @@ function listProjectConversationIds(uid: string): string[] {
 
 export function findProjectIdForConversation(uid: string, cid: string): string | null {
   if (!safeId(cid)) return null;
+  assertConversationRelocationReady(uid, cid);
   const cachedByCid = conversationProjectCache.get(uid);
   if (cachedByCid?.has(cid)) {
     const cached = cachedByCid.get(cid)!;
@@ -149,6 +175,7 @@ export function findProjectIdForConversation(uid: string, cid: string): string |
 }
 
 export function projectIdForConversationHint(uid: string, cid: string, projectHint?: string | null): string | null {
+  assertConversationRelocationReady(uid, cid);
   if (projectHint === null) {
     if (safeId(cid)) rememberConversationProject(uid, cid, null);
     return null;

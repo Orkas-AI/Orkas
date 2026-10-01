@@ -190,6 +190,10 @@ async function seedReviewedContract(root: string): Promise<string> {
 async function seedReviewedDeck(root: string): Promise<string> {
   const file = path.join(root, "annual-review.pptx");
   await checkedOfficeCli(["create", file, "--force", "--json"], root);
+  // A successful create can leave its resident alive briefly. Close it before
+  // the non-idempotent seed batch so full-suite contention cannot turn a
+  // fixture setup into an ambiguous delivery that would be unsafe to replay.
+  await closeFixtureOfficeFile(file, root);
   await batchOffice(file, root, [
     { command: "add", parent: "/", type: "slide", props: { title: "年度经营复盘", text: "管理层摘要" } },
     { command: "add", parent: "/", type: "slide", props: { title: "核心指标", text: "收入与利润趋势" } },

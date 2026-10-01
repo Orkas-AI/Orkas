@@ -68,6 +68,7 @@ const _recordedCalls = vi.hoisted(() => [] as Array<{
   // instead of opening a new one — the in-turn channel retry contract.
   resumeActiveTurn: boolean;
   executionDeadlineAt: number;
+  nested: boolean;
   // Tool names offered to this turn. Lets tests assert the Commander/named
   // Agent/anonymous-worker capability split.
   extraToolNames: string[];
@@ -120,6 +121,7 @@ vi.mock('../../../../src/main/model/client', () => ({
       terminalCorrectionAttached: typeof opts.terminalTextGuard === 'function',
       resumeActiveTurn: !!opts.resumeActiveTurn,
       executionDeadlineAt: opts.executionDeadlineAt,
+      nested: !!opts.nested,
       extraToolNames: (Array.isArray(opts.extraTools) ? opts.extraTools : []).map((t: any) => String(t?.name || '')),
       browserTool: opts.extraTools?.find((tool: any) => tool.name === 'inner_browser'),
       extraToolContracts: (Array.isArray(opts.extraTools) ? opts.extraTools : []).map((tool: any) => ({
@@ -247,6 +249,11 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // A timed-out hook can settle after the next fixture has started.
+  const cleanupRoot = tmpDir;
+  const restoreWorkspace = prevWs;
+  const restoreGlobalSkillsRoot = prevTestGlobalSkillsRoot;
+  const cleanupCids = new Set(cidsToDrop);
   _resetStreamGates();
   // Drop conv state so workers terminate before the tmpDir is rm'd —
   // otherwise a half-finished worker writes after dir removal and we get
@@ -256,15 +263,14 @@ afterEach(async () => {
     // Drop all known cids — the bus state map is module-internal but
     // _cidStateForTest exposes per-cid; iterate via `_cids` indirectly
     // by scanning the chats dir.
-    const paths = await import('../../../../src/main/paths');
-    const dir = paths.userChatsDir(TEST_UID);
+    const dir = path.join(cleanupRoot, TEST_UID, 'cloud', 'chats');
     if (fs.existsSync(dir)) {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       for (const e of entries) {
-        if (e.isDirectory()) cidsToDrop.add(e.name);
+        if (e.isDirectory()) cleanupCids.add(e.name);
       }
     }
-    for (const cid of cidsToDrop) await bus.dropConv(TEST_UID, cid);
+    for (const cid of cleanupCids) await bus.dropConv(TEST_UID, cid);
   } catch { /* ignore */ }
   try {
     const bashPermissions = await import('../../../../src/main/model/core-agent/bash-permissions');
@@ -277,10 +283,13 @@ afterEach(async () => {
   // touched after the first drain before Windows removes the temp workspace.
   await new Promise((resolve) => setTimeout(resolve, 50));
   await drainMainRuntimeForTest();
-  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  if (prevTestGlobalSkillsRoot === undefined) delete process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT;
-  else process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT = prevTestGlobalSkillsRoot;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  if (process.env.ORKAS_WORKSPACE_ROOT === cleanupRoot) {
+    if (restoreWorkspace === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
+    else process.env.ORKAS_WORKSPACE_ROOT = restoreWorkspace;
+    if (restoreGlobalSkillsRoot === undefined) delete process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT;
+    else process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT = restoreGlobalSkillsRoot;
+  }
+  fs.rmSync(cleanupRoot, { recursive: true, force: true });
 });
 
 async function waitForQuiescent(uid: string, cid: string, timeoutMs = 2000) {
@@ -3074,6 +3083,182 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(commanderTurns, 'commander should run exactly one turn (no re-wake)').toBe(1);
   }, 12_000);
 
+  it('async dispatch delivers a failed child while an independent long child is still running', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const board = await import('../../../../src/main/features/group_chat/task_board');
+    const paths = await import('../../../../src/main/paths');
+    const secondDir = paths.agentDir(TEST_UID, SECOND_AGENT_ID);
+    fs.mkdirSync(secondDir, { recursive: true });
+    fs.writeFileSync(path.join(secondDir, 'agent.json'), JSON.stringify({
+      agent_id: SECOND_AGENT_ID, name: SECOND_AGENT_NAME,
+      description: 'Researches things', workflow: 'research', created_at: 't', updated_at: 't',
+    }));
+    const commander = state.buildGconvSessionId(cid);
+    _holdStream('fast-failure');
+    _holdStream('slow-result');
+    _setScript(commander, [
+      { type: '__call_tool__', name: 'dispatch_to', input: { to: AGENT_NAME, message: 'Review the draft', mode: 'async' } },
+      { type: '__call_tool__', name: 'dispatch_to', input: { to: SECOND_AGENT_NAME, message: 'Gather sources', mode: 'async' } },
+      { type: 'final', text: 'Both tasks are underway.' },
+    ]);
+    _setScript(commander, [{ type: 'final', text: 'The review failed; source gathering continues.' }]);
+    _setScript(commander, [{ type: 'final', text: 'The sources are ready.' }]);
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+      { type: '__wait_for_gate__', name: 'fast-failure' },
+      { type: 'error', text: 'fixture rate limit', failureKind: 'runtime' },
+    ]);
+    _setScript(state.buildGmemberSessionId(cid, SECOND_AGENT_ID), [
+      { type: '__wait_for_gate__', name: 'slow-result' },
+      { type: 'final', text: 'Complete source evidence.' },
+    ]);
+    bus.subscribe(TEST_UID, cid, () => {});
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Review and research independently.' });
+      await vi.waitFor(() => expect(_recordedToolResults.filter(r => r.name === 'dispatch_to')).toHaveLength(2));
+      const receipts = _recordedToolResults.filter(r => r.name === 'dispatch_to').map(r => JSON.parse(r.content));
+      expect(receipts.every(r => r.mode === 'async' && r.status === 'queued' && r.task_id)).toBe(true);
+      expect(new Set(receipts.map(r => r.task_id)).size).toBe(2);
+      expect(bus.isQuiescent(TEST_UID, cid)).toBe(false);
+      _releaseStream('fast-failure');
+      await vi.waitFor(() => expect(_recordedCalls.filter(c => c.sid === commander)).toHaveLength(2));
+      const failure = _recordedCalls.filter(c => c.sid === commander)[1].message;
+      expect(failure).toContain('<worker-error');
+      expect(failure).toContain('fixture rate limit');
+      expect(failure).toContain(receipts[0].task_id);
+      expect(_streamGates.has('slow-result')).toBe(true);
+      _releaseStream('slow-result');
+      await waitForQuiescent(TEST_UID, cid, 5000);
+      const turns = _recordedCalls.filter(c => c.sid === commander);
+      expect(turns).toHaveLength(3);
+      expect(turns[2].message).toContain('Complete source evidence.');
+      expect(_recordedCalls.filter(c => c.sid === state.buildGmemberSessionId(cid, AGENT_ID))).toHaveLength(1);
+      expect(_recordedCalls.filter(c => c.sid === state.buildGmemberSessionId(cid, SECOND_AGENT_ID))).toHaveLength(1);
+      expect(_recordedCalls.filter(c => c.sid.startsWith('gmember-')).every(c => !c.nested)).toBe(true);
+      const rows = await board.listTasks(TEST_UID, cid);
+      expect(rows.find(r => r.task_id === receipts[0].task_id)?.status).toBe('failed');
+      expect(rows.find(r => r.task_id === receipts[1].task_id)?.status).toBe('done');
+      const messages = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+      const deliveries = messages.filter(m => m.dispatch && m.to.includes('commander') && m.model_text?.includes('<dispatch-result'));
+      expect(deliveries).toHaveLength(2);
+      expect(deliveries.some(m => m.model_text.includes('Complete source evidence.'))).toBe(true);
+    } finally { _releaseStream('fast-failure'); _releaseStream('slow-result'); }
+  }, 15000);
+
+  it.each(['child', 'conversation', 'deletion', 'account switch'] as const)('async dispatch handles %s cancellation without replay or an orphaned wait', async (scope) => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const commander = state.buildGconvSessionId(cid);
+    _setScript(commander, [
+      { type: '__call_tool__', name: 'dispatch_to', input: { to: AGENT_NAME, message: 'Wait for cancellation', mode: 'async' } },
+      { type: 'final', text: 'Task started.' },
+    ]);
+    _setScript(commander, [{ type: 'final', text: 'The child was stopped.' }]);
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [{ type: '__wait_for_abort__' }]);
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Start a long task.' });
+    await vi.waitFor(() => expect(_recordedCalls.some(c => c.sid === state.buildGmemberSessionId(cid, AGENT_ID))).toBe(true));
+    await vi.waitFor(() => expect(_recordedToolResults.filter(r => r.name === 'dispatch_to')).toHaveLength(1));
+    const taskId = JSON.parse(_recordedToolResults.find(r => r.name === 'dispatch_to')!.content).task_id;
+    if (scope === 'child') await bus.cancelConversationTask(TEST_UID, cid, taskId);
+    else if (scope === 'deletion') await bus.dropConv(TEST_UID, cid);
+    else if (scope === 'account switch') {
+      bus.cancelForUserSwitch(TEST_UID);
+      await vi.waitFor(() => expect(bus._cidStateForTest(TEST_UID, cid)).toBeNull());
+    } else await bus.abort(TEST_UID, cid);
+    await waitForQuiescent(TEST_UID, cid, 5000);
+    const turns = _recordedCalls.filter(c => c.sid === commander);
+    expect(turns).toHaveLength(scope === 'child' ? 2 : 1);
+    if (scope === 'child') expect(turns[1].message).toContain('aborted="true"');
+    expect(_recordedCalls.filter(c => c.sid === state.buildGmemberSessionId(cid, AGENT_ID))).toHaveLength(1);
+  }, 12000);
+
+  it.each(['child', 'result'] as const)('async dispatch cancels %s admission when Stop crosses its board write', async (phase) => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const board = await import('../../../../src/main/features/group_chat/task_board');
+    const commander = state.buildGconvSessionId(cid);
+    const createTask = board.createTask;
+    let intercepted = false;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const spy = vi.spyOn(board, 'createTask').mockImplementation(async (...args) => {
+      const row = await createTask(...args);
+      if (args[1] === cid && (phase === 'child'
+        ? args[2].assignee === AGENT_ID
+        : args[2].assignee === 'commander' && args[2].createdBy === 'system')) {
+        intercepted = true;
+        await gate;
+      }
+      return row;
+    });
+    _setScript(commander, [
+      { type: '__call_tool__', name: 'dispatch_to', input: { to: AGENT_NAME, message: 'Do one task', mode: 'async' } },
+      { type: 'final', text: 'Task accepted.' },
+    ]);
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [{ type: 'final', text: 'Task result.' }]);
+    bus.subscribe(TEST_UID, cid, () => {});
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Start one task.' });
+      await vi.waitFor(() => expect(intercepted).toBe(true));
+      const stopping = bus.abort(TEST_UID, cid);
+      release();
+      await stopping;
+      await waitForQuiescent(TEST_UID, cid, 5000);
+      expect(_recordedCalls.filter(c => c.sid === commander)).toHaveLength(1);
+      expect(_recordedCalls.filter(c => c.sid === state.buildGmemberSessionId(cid, AGENT_ID))).toHaveLength(phase === 'child' ? 0 : 1);
+      const rows = await board.listTasks(TEST_UID, cid);
+      const stopped = rows.find(r => phase === 'child' ? r.assignee === AGENT_ID : r.created_by === 'system');
+      expect(stopped?.status).toBe('cancelled');
+    } finally { release(); spy.mockRestore(); }
+  }, 12000);
+
+  it('async dispatch rejects an invalid mode before creating child work', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const board = await import('../../../../src/main/features/group_chat/task_board');
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: '__call_tool__', name: 'dispatch_to', input: { to: AGENT_NAME, message: 'Do one task', mode: 'background' } },
+      { type: 'final', text: 'Invalid mode.' },
+    ]);
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Start one task.' });
+    await waitForQuiescent(TEST_UID, cid, 5000);
+    expect(_recordedToolResults.find(r => r.name === 'dispatch_to')).toMatchObject({ isError: true });
+    expect((await board.listTasks(TEST_UID, cid)).filter(r => r.assignee === AGENT_ID)).toHaveLength(0);
+    expect(_recordedCalls).toHaveLength(1);
+  }, 12000);
+
+  it('async dispatch stores an oversized result losslessly in the receiving Commander result store', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const sessions = await import('../../../../src/main/model/core-agent/session-store');
+    const commander = state.buildGconvSessionId(cid);
+    const fullResult = 'Independent source evidence with exact original details.\n'.repeat(5000);
+    _setScript(commander, [
+      { type: '__call_tool__', name: 'dispatch_to', input: { to: AGENT_NAME, message: 'Gather complete evidence', mode: 'async' } },
+      { type: 'final', text: 'Evidence gathering started.' },
+    ]);
+    _setScript(commander, [{ type: 'final', text: 'Evidence is stored.' }]);
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [{ type: 'final', text: fullResult }]);
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Gather complete evidence.' });
+    await waitForQuiescent(TEST_UID, cid, 5000);
+    const turns = _recordedCalls.filter(c => c.sid === commander);
+    expect(turns).toHaveLength(2);
+    expect(turns[1].message).toContain('<persisted-output');
+    expect(turns[1].message.length).toBeLessThan(10000);
+    const store = sessions.toolResultsDirForSession(TEST_UID, commander);
+    const files = fs.readdirSync(store).filter(name => name.endsWith('.txt'));
+    expect(files).toHaveLength(1);
+    expect(fs.readFileSync(path.join(store, files[0]), 'utf8')).toContain(fullResult.trim());
+  }, 12000);
+
   it('an Agent retry restored after app restart wakes Commander for the lost dispatch_to continuation', async () => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');
@@ -3971,6 +4156,7 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     // The two segments must not be attributed to the same index, otherwise the
     // renderer would fold the synthesis into the pre-dispatch bubble.
     expect(new Set(segMessages.map((ev) => ev.msg.seg)).size).toBe(2);
+
   }, 12_000);
 
   // The inverse: an anonymous worker is the commander's invisible hands, so the
@@ -5761,6 +5947,268 @@ describe('group_chat bus integration › cost backstop', () => {
 });
 
 describe('group_chat bus integration › agent-mutation rejection feedback (W5-1)', () => {
+  // Persist the production denial so the next turn sees why nothing changed.
+  it.each(['builtin', 'resource'])('explains %s Agent edit denial without retrying and retains it in history', async (seedSource) => {
+    const cid = newCid();
+    const paths = await import('../../../../src/main/paths');
+    const agentId = 'platform-designer';
+    const dir = path.join(paths.userMarketplaceAgentsDir(TEST_UID), agentId);
+    fs.mkdirSync(dir, { recursive: true });
+    const original = JSON.stringify({ agent_id: agentId, name: 'UIDesigner', workflow: 'Original workflow' });
+    fs.writeFileSync(path.join(dir, 'agent.json'), original);
+    fs.writeFileSync(path.join(dir, '_install.json'), JSON.stringify({ seed_source: seedSource }));
+    const agents = await import('../../../../src/main/features/agents');
+    expect(agents.agentPrioritySource((await agents.getAgent(agentId))!))
+      .toBe(seedSource === 'builtin' ? 'builtin' : 'platform');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [{ type: 'final', text: `Updated UIDesigner.\n<agent><operation>edit</operation><agent_id>${agentId}</agent_id><workflow>Changed workflow</workflow></agent>` }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Update UIDesigner' });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(_recordedCalls.filter(call => call.sid === sid)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8')).toBe(original);
+    const replies = (await groupChat.readMessages(TEST_UID, cid)).filter(row => row.from === 'commander' && !row.dispatch);
+    expect(replies).toHaveLength(1);
+    expect(replies[0].text).toContain('Marketplace agents cannot be edited through chat');
+    expect(replies[0].text).not.toMatch(/Updated UIDesigner|try again|retry|fork/i);
+    expect(replies[0].created_agents).toBeUndefined();
+
+    _setScript(sid, [{ type: 'final', text: 'The platform definition cannot be changed here.' }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Continue' });
+    await waitForQuiescent(TEST_UID, cid);
+    const calls = _recordedCalls.filter(call => call.sid === sid);
+    expect(calls).toHaveLength(2);
+    expect(JSON.stringify(calls[1].conversationHistory)).toContain('Marketplace agents cannot be edited through chat');
+    expect(JSON.stringify(calls[1].conversationHistory)).not.toContain('Updated UIDesigner.');
+  }, 10_000);
+
+  it('retains custom Agent updates and platform Skill denial alongside platform Agent denial', async () => {
+    const cid = newCid();
+    const paths = await import('../../../../src/main/paths');
+    const agentDir = path.join(paths.userMarketplaceAgentsDir(TEST_UID), 'platform-designer');
+    const skillDir = path.join(paths.userMarketplaceSkillsDir(TEST_UID), 'platform-guide');
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.mkdirSync(skillDir, { recursive: true });
+    const originalAgent = JSON.stringify({ agent_id: 'platform-designer', name: 'UIDesigner', workflow: 'Original workflow' });
+    const originalSkill = '---\nname: platform-guide\ndescription: Platform guide\ncategory: general\n---\nOriginal instructions.\n';
+    fs.writeFileSync(path.join(agentDir, 'agent.json'), originalAgent);
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), originalSkill);
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const agents = await import('../../../../src/main/features/agents');
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [{ type: 'final', text: [
+      'Updated all definitions.',
+      '<agent><operation>edit</operation><agent_id>platform-designer</agent_id><workflow>Changed platform workflow</workflow></agent>',
+      `<agent><operation>edit</operation><agent_id>${AGENT_ID}</agent_id><workflow>Changed custom workflow</workflow></agent>`,
+      '<skill><skill_id>platform-guide</skill_id><category>data</category></skill>',
+    ].join('\n') }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Update the two Agents and the Skill' });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(_recordedCalls.filter(call => call.sid === sid)).toHaveLength(1);
+    expect(correctionModel).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8')).toBe(originalAgent);
+    expect(fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8')).toBe(originalSkill);
+    expect((await agents.getAgent(AGENT_ID))?.workflow).toBe('Changed custom workflow');
+    const rows = await (await import('../../../../src/main/features/group_chat')).readMessages(TEST_UID, cid);
+    const replies = rows.filter(row => row.from === 'commander' && !row.dispatch);
+    expect(replies).toHaveLength(1);
+    expect(replies[0].text).toContain('Marketplace agents cannot be edited through chat');
+    expect(replies[0].text).toContain('Marketplace skills cannot be edited through chat');
+    expect(replies[0].text).not.toMatch(/Updated all definitions|retry|fork/i);
+    expect(replies[0].created_agents).toEqual([{ agent_id: AGENT_ID, name: AGENT_NAME, kind: 'updated' }]);
+  }, 10_000);
+
+  // Unlike the mixed Agent/Skill case, these turns have no Agent rejection
+  // to replace premature success prose on the Skill's behalf.
+  it.each([
+    { seedSource: 'builtin', payload: 'metadata', language: 'en' as const },
+    { seedSource: 'builtin', payload: 'files', language: 'en' as const },
+    { seedSource: 'resource', payload: 'metadata', language: 'zh' as const },
+    { seedSource: 'resource', payload: 'files', language: 'zh' as const },
+  ])('reports standalone $seedSource Skill $payload denial in $language without side effects', async ({ seedSource, payload, language }) => {
+    const config = await import('../../../../src/main/features/config');
+    config.setLanguage(language);
+    const cid = newCid();
+    const paths = await import('../../../../src/main/paths');
+    const dir = path.join(paths.userMarketplaceSkillsDir(TEST_UID), 'platform-guide');
+    fs.mkdirSync(dir, { recursive: true });
+    const original = {
+      'SKILL.md': '---\nname: platform-guide\ndescription: Platform guide\n---\nOriginal instructions.\n',
+      '_meta.json': JSON.stringify({ category: 'general' }),
+      '_install.json': JSON.stringify({ seed_source: seedSource }),
+    };
+    for (const [file, body] of Object.entries(original)) fs.writeFileSync(path.join(dir, file), body);
+    const mutation = payload === 'metadata' ? '<category>data</category>' : [
+      '<<<skill-file path=SKILL.md',
+      '---\nname: platform-guide\ndescription: Revised guide\n---\nChanged instructions.',
+      '>>>',
+      '<<<skill-file path=references/new.md',
+      'New instructions that must not be written.',
+      '>>>',
+    ].join('\n');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [{ type: 'final', text: `Updated the platform guide.\n<skill>\n<skill_id>platform-guide</skill_id>\n${mutation}\n</skill>` }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Modify the platform guide' });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(_recordedCalls.filter(call => call.sid === sid)).toHaveLength(1);
+    expect(correctionModel).not.toHaveBeenCalled();
+    expect(fs.readdirSync(dir).sort()).toEqual(Object.keys(original).sort());
+    for (const [file, body] of Object.entries(original)) expect(fs.readFileSync(path.join(dir, file), 'utf8')).toBe(body);
+    expect(fs.existsSync(path.join(paths.userSkillsDir(TEST_UID), 'platform-guide'))).toBe(false);
+    const replies = (await groupChat.readMessages(TEST_UID, cid)).filter(row => row.from === 'commander' && !row.dispatch);
+    expect(replies).toHaveLength(1);
+    const reason = language === 'zh' ? '平台技能不可通过对话编辑' : 'Marketplace skills cannot be edited through chat';
+    expect(replies[0].text).toContain(reason);
+    expect(replies[0].text).not.toMatch(/Updated the platform guide|Required block shape|What you emitted|skill-file|retry|fork/i);
+    expect(replies[0].created_skills).toBeUndefined();
+
+    _setScript(sid, [{ type: 'final', text: 'The platform definition remains unchanged.' }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Continue' });
+    await waitForQuiescent(TEST_UID, cid);
+    const calls = _recordedCalls.filter(call => call.sid === sid);
+    expect(calls).toHaveLength(2);
+    const history = JSON.stringify(calls[1].conversationHistory);
+    expect(history).toContain(reason);
+    expect(history).not.toMatch(/Updated the platform guide|Required block shape/);
+  }, 10_000);
+
+  it.each([false, true])('preserves a successful custom Skill edit when a platform sibling is denied (custom first: %s)', async (customFirst) => {
+    const cid = newCid();
+    const paths = await import('../../../../src/main/paths');
+    const platformDir = path.join(paths.userMarketplaceSkillsDir(TEST_UID), 'platform-guide');
+    const customDir = path.join(paths.userSkillsDir(TEST_UID), 'custom-guide');
+    for (const [dir, name] of [[platformDir, 'platform-guide'], [customDir, 'custom-guide']]) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: Guide\n---\nOriginal instructions.\n`);
+      fs.writeFileSync(path.join(dir, '_meta.json'), JSON.stringify({ category: 'general' }));
+    }
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const sid = state.buildGconvSessionId(cid);
+    const ids = customFirst ? ['custom-guide', 'platform-guide'] : ['platform-guide', 'custom-guide'];
+    _setScript(sid, [{ type: 'final', text: 'Updated both guides.\n' + ids.map(id =>
+      `<skill><skill_id>${id}</skill_id><category>data</category></skill>`).join('\n') }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Change both guide categories' });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(_recordedCalls.filter(call => call.sid === sid)).toHaveLength(1);
+    expect(correctionModel).not.toHaveBeenCalled();
+    expect(JSON.parse(fs.readFileSync(path.join(platformDir, '_meta.json'), 'utf8')).category).toBe('general');
+    expect(JSON.parse(fs.readFileSync(path.join(customDir, '_meta.json'), 'utf8')).category).toBe('data');
+    const rows = await (await import('../../../../src/main/features/group_chat')).readMessages(TEST_UID, cid);
+    const replies = rows.filter(row => row.from === 'commander' && !row.dispatch);
+    expect(replies).toHaveLength(1);
+    expect(replies[0].text).toContain('Marketplace skills cannot be edited through chat');
+    expect(replies[0].text).not.toMatch(/Updated both guides|Required block shape|retry/i);
+    expect(replies[0].created_skills).toEqual([{ skill_id: 'custom-guide', name: 'custom-guide' }]);
+  }, 10_000);
+
+  it('corrects only the retryable Agent rejection in a batch with a permanent platform denial', async () => {
+    const cid = newCid();
+    const paths = await import('../../../../src/main/paths');
+    const dir = path.join(paths.userMarketplaceAgentsDir(TEST_UID), 'platform-designer');
+    fs.mkdirSync(dir, { recursive: true });
+    const original = JSON.stringify({ agent_id: 'platform-designer', name: 'UIDesigner', workflow: 'Original workflow' });
+    fs.writeFileSync(path.join(dir, 'agent.json'), original);
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [{ type: 'final', text: [
+      'Updated everything.',
+      '<agent><operation>edit</operation><agent_id>platform-designer</agent_id><workflow>Changed</workflow></agent>',
+      `<agent><operation>edit</operation><agent_id>${AGENT_ID}</agent_id><workflow>Custom revision</workflow></agent>`,
+      '<agent><operation>create</operation><name>Bad Name!</name><description>Review code</description><workflow>Review source changes</workflow><tools></tools></agent>',
+    ].join('\n') }]);
+    _setScript(sid, [{ type: 'final', text: '<agent><operation>create</operation><name>CodeReviewer</name><description>Review code</description><workflow>Review source changes</workflow><tools></tools></agent>' }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Update the designers and create a code reviewer' });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const calls = _recordedCalls.filter(call => call.sid === sid);
+    expect(calls).toHaveLength(2);
+    const feedback = JSON.parse(calls[1].message.split('<agent-mutation-feedback>')[1].split('</agent-mutation-feedback>')[0]);
+    expect(feedback.rejections).toHaveLength(1);
+    expect(feedback.rejections[0]).toMatchObject({ action: 'create', reason: expect.stringContaining('unsupported characters') });
+    expect(calls[1].message).not.toContain('Marketplace Agent definitions');
+    expect(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8')).toBe(original);
+    const agents = await import('../../../../src/main/features/agents');
+    expect((await agents.getAgent(AGENT_ID))?.workflow).toBe('Custom revision');
+    expect((await agents.listAgents()).filter(agent => agent.name === 'CodeReviewer')).toHaveLength(1);
+    const rows = await (await import('../../../../src/main/features/group_chat')).readMessages(TEST_UID, cid);
+    const replies = rows.filter(row => row.from === 'commander' && !row.dispatch);
+    expect(replies).toHaveLength(2);
+    expect(replies[0].text).toContain('Marketplace agents cannot be edited through chat');
+    expect(replies[0].text).toContain('Correcting the remaining changes automatically');
+    expect(replies[0].text).not.toContain('Updated everything.');
+    expect(replies.flatMap(row => row.created_agents || []).filter(agent => agent.agent_id === AGENT_ID))
+      .toEqual([{ agent_id: AGENT_ID, name: AGENT_NAME, kind: 'updated' }]);
+  }, 10_000);
+
+  it('deduplicates the platform Agent denial for multiple forbidden edits without creating shadows', async () => {
+    const cid = newCid();
+    const paths = await import('../../../../src/main/paths');
+    const originals = ['platform-one', 'platform-two'].map(id => ({ id,
+      content: JSON.stringify({ agent_id: id, name: id, workflow: 'Original workflow' }),
+    }));
+    for (const { id, content } of originals) {
+      const dir = path.join(paths.userMarketplaceAgentsDir(TEST_UID), id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'agent.json'), content);
+    }
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [{ type: 'final', text: originals.map(({ id }) =>
+      `<agent><operation>edit</operation><agent_id>${id}</agent_id><workflow>Changed</workflow></agent>`).join('\n') }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Revise both platform Agents' });
+    await waitForQuiescent(TEST_UID, cid);
+    expect(_recordedCalls.filter(call => call.sid === sid)).toHaveLength(1);
+    for (const { id, content } of originals) {
+      expect(fs.readFileSync(path.join(paths.userMarketplaceAgentsDir(TEST_UID), id, 'agent.json'), 'utf8')).toBe(content);
+      expect(fs.existsSync(paths.agentDir(TEST_UID, id))).toBe(false);
+    }
+    const rows = await (await import('../../../../src/main/features/group_chat')).readMessages(TEST_UID, cid);
+    const replies = rows.filter(row => row.from === 'commander' && !row.dispatch);
+    expect(replies).toHaveLength(1);
+    expect(replies[0].text.match(/Marketplace agents cannot be edited through chat/g)).toHaveLength(1);
+    expect(replies[0].text).not.toMatch(/try again|retry/i);
+    expect(replies[0].created_agents).toBeUndefined();
+  }, 10_000);
+
+  it('keeps malformed Skill edit diagnostics distinct from permission denials', async () => {
+    const cid = newCid();
+    const paths = await import('../../../../src/main/paths');
+    const dir = path.join(paths.userSkillsDir(TEST_UID), 'custom-guide');
+    fs.mkdirSync(dir, { recursive: true });
+    const original = '---\nname: custom-guide\ndescription: Guide\n---\nOriginal instructions.\n';
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), original);
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [{ type: 'final', text: 'Updated the guide.\n<skill><skill_id>custom-guide</skill_id>\n<<<skill-file path=SKILL.md one-line-invalid >>>\n</skill>' }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Revise the custom guide' });
+    await waitForQuiescent(TEST_UID, cid);
+    expect(_recordedCalls.filter(call => call.sid === sid)).toHaveLength(1);
+    expect(correctionModel).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8')).toBe(original);
+    const rows = await (await import('../../../../src/main/features/group_chat')).readMessages(TEST_UID, cid);
+    const replies = rows.filter(row => row.from === 'commander' && !row.dispatch);
+    expect(replies).toHaveLength(1);
+    expect(replies[0].text).toContain('Required block shape');
+    expect(replies[0].text).toContain('one-line-invalid');
+    expect(replies[0].text).not.toMatch(/Updated the guide|Marketplace skills cannot be edited/);
+    expect(replies[0].created_skills).toBeUndefined();
+  }, 10_000);
+
+
   // MetaBot case (2026-08 weekly review): the platform rejected an agent name,
   // the commander had already claimed success, and the rejection reason only
   // reached the model when the user hand-pasted the visible warning. The bus
@@ -8279,7 +8727,7 @@ describe('group_chat bus integration › P3 scheduled hand_off_to', () => {
 });
 
 describe('group_chat bus integration › P3 parallel form-wait redemption', () => {
-  it('two dispatched agents can block on forms in parallel; each submission wakes the commander with ITS OWN resume account', async () => {
+  it.each([undefined, 'async'] as const)('two dispatched agents can block on forms in parallel; each submission wakes the commander with ITS OWN resume account (mode: %s)', async (mode) => {
     // Scenario value: the cut-over's whole point — the single state.json
     // ledger field self-overwrote when a second dispatch parked on a form,
     // losing the first account. Task-row redemption keeps one account per
@@ -8306,8 +8754,8 @@ describe('group_chat bus integration › P3 parallel form-wait redemption', () =
     const formOf = (id: string) => ({ fields: [{ id, label: `Need ${id}`, type: 'text', required: true }] });
 
     _setScript(state.buildGconvSessionId(cid), [
-      { type: '__call_tool__', name: 'dispatch_to', input: { to: AGENT_NAME, message: 'collect requirement A', resume: 'RESUME_ALPHA: fold in the A answer' } },
-      { type: '__call_tool__', name: 'dispatch_to', input: { to: SECOND_AGENT_NAME, message: 'collect requirement B', resume: 'RESUME_BETA: fold in the B answer' } },
+      { type: '__call_tool__', name: 'dispatch_to', input: { to: AGENT_NAME, message: 'collect requirement A', resume: 'RESUME_ALPHA: fold in the A answer', ...(mode ? { mode } : {}) } },
+      { type: '__call_tool__', name: 'dispatch_to', input: { to: SECOND_AGENT_NAME, message: 'collect requirement B', resume: 'RESUME_BETA: fold in the B answer', ...(mode ? { mode } : {}) } },
       { type: 'final', text: 'both dispatched' },
     ]);
     _setScript(sidA, [{
@@ -8320,6 +8768,10 @@ describe('group_chat bus integration › P3 parallel form-wait redemption', () =
     }]);
     _setScript(sidA, [{ type: 'final', text: 'A done with the answer' }]);
     _setScript(sidB, [{ type: 'final', text: 'B done with the answer' }]);
+    if (mode === 'async') {
+      _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: 'A child needs input.' }]);
+      _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: 'Another child needs input.' }]);
+    }
     _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: 'resumed after B' }]);
     _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: 'resumed after A' }]);
 
@@ -8540,4 +8992,62 @@ describe('group_chat bus integration › Skill creation correction', () => {
     expect(fs.existsSync(path.join(paths.userSkillsDir(TEST_UID), 'recovered-notes'))).toBe(false);
     expect((await state.readState(TEST_UID, cid)).status).toBe('aborted');
   });
+});
+
+describe('group_chat bus integration › deferred conversation filing', () => {
+  // A tool can create the project during the turn but cannot relocate the
+  // conversation: the relocation refuses while the turn holds the session files
+  // open. The host finishes it at the quiescent boundary, and a cancelled run
+  // drops it — the reply that announced the project never reached the user.
+  it.each(['completed', 'cancelled'] as const)(
+    'a %s turn settles the pending filing at the quiescent boundary', async (outcome) => {
+      const stateMod = await import('../../../../src/main/features/group_chat/state');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const chats = await import('../../../../src/main/features/chats');
+      const filing = await import('../../../../src/main/features/conversation_filing');
+
+      const conv = await chats.createConversation(TEST_UID, { title: 'weekly competitor report' });
+      const cid = conv.conversation_id;
+      cidsToDrop.add(cid);
+      const filed = await filing.fileConversationUnderNewProject(
+        TEST_UID, cid, `Competitor tracking ${outcome}`, { moveNow: false },
+      );
+      expect(filed.ok).toBe(true);
+      const pid = (filed as { result: any }).result.project.project_id;
+      // Deferred means deferred: nothing moved while the turn had not started.
+      expect((await chats.getConversationMetadata(TEST_UID, cid))?.project_id).toBeFalsy();
+
+      const gateName = `filing-${outcome}`;
+      _holdStream(gateName);
+      _setScript(stateMod.buildGconvSessionId(cid), [
+        { type: '__wait_for_gate__', name: gateName },
+        ...(outcome === 'cancelled'
+          ? [{ type: '__wait_for_abort__' }]
+          : [{ type: 'final', text: 'Report delivered.' }]),
+      ]);
+      const terminals: any[] = [];
+      const unsubscribe = bus.subscribeTaskTerminals((event) => {
+        if (event.conversation_id === cid) terminals.push(event);
+      });
+      try {
+        await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Summarise this week.' });
+        _releaseStream(gateName);
+        if (outcome === 'cancelled') await bus.abort(TEST_UID, cid);
+        await waitForQuiescent(TEST_UID, cid, 4000);
+        expect(await waitUntil(() => terminals.length === 1)).toBe(true);
+        expect(terminals[0].status).toBe(outcome);
+        // Intent removal happens before relocation awaits storage. Await the
+        // actual tracked write rather than mistaking dequeue for completion.
+        const runtime = bus._cidStateForTest(TEST_UID, cid);
+        expect(runtime).not.toBeNull();
+        await Promise.all([...runtime!.backgroundWrites]);
+        expect(filing.hasPendingConversationFiling(TEST_UID, cid)).toBe(false);
+        const row = await chats.getConversationMetadata(TEST_UID, cid);
+        expect(row?.project_id || '').toBe(outcome === 'cancelled' ? '' : pid);
+      } finally {
+        unsubscribe();
+        _releaseStream(gateName);
+      }
+    },
+  );
 });

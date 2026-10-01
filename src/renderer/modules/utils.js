@@ -19,7 +19,8 @@ function normalizeDisplayText(value) {
 
 function pickLocalizedField(obj, base, lang, fallbackLang = 'en') {
   if (!obj || !base) return '';
-  const cur = _baseLang(lang);
+  const tag = String(lang || '').trim().toLowerCase().replace(/_/g, '-');
+  const cur = ['zh-tw', 'pt-pt', 'es-419'].includes(tag) ? tag : _baseLang(tag);
   const candidates = [
     `${base}_${cur}`,
     `${base}_${fallbackLang}`,
@@ -205,23 +206,35 @@ function catalogSourceLabel(source, kind = 'agents') {
 // Save/restore around the whole pass: `:::dashboard` bodies recurse back into
 // here, and a throw inside phase 2 must not leak one message's embed set into
 // the next render.
-function renderMarkdownFull(md) {
+function renderMarkdownFull(md, blockCache) {
   const prevEmbeddedMediaKeys = _mdEmbeddedMediaKeys;
   try {
-    return _renderMarkdownFullInner(md);
+    return _renderMarkdownFullInner(md, blockCache);
   } finally {
     _mdEmbeddedMediaKeys = prevEmbeddedMediaKeys;
   }
 }
 
-function _renderMarkdownFullInner(md) {
-  if (!md) return '';
+// A stream owns one cache of its current document, never a history of growing
+// replies. The canonical parser still resolves cross-line syntax and media
+// deduplication before deciding which balanced output blocks can be reused.
+function renderMarkdownBlocks(md, cache) {
+  renderMarkdownFull(md, cache);
+  return cache.blocks;
+}
+
+function _renderMarkdownFullInner(md, blockCache) {
+  if (!md) {
+    if (blockCache) { blockCache.blocks = []; blockCache.inline = new Map(); blockCache.sanitized = new Map(); }
+    return '';
+  }
 
   // Strip YAML frontmatter
   md = md.replace(/^---[\s\S]*?---\n?/, '');
 
   // ── Phase 1: protect code blocks & :::chart-bar directives ──
   const protectedBlocks = [];
+  let protectedHtmlContext = false;
   const protect = (html) => {
     const idx = protectedBlocks.length;
     protectedBlocks.push(html);
@@ -257,6 +270,10 @@ function _renderMarkdownFullInner(md) {
   md = md.replace(/:::chart-bar\s*\n([\s\S]*?)\n\s*:::/g, (_, body) => {
     try {
       const data = JSON.parse(body.trim());
+      // Legacy chart values are interpolated before the sanitizer (unlike
+      // labels/units). A nonnumeric value may carry raw HTML across blocks,
+      // including '<' decoded from a JSON unicode escape.
+      if (Array.isArray(data) && data.some(item => String(item?.value ?? '').includes('<'))) protectedHtmlContext = true;
       return protect(renderChartBar(data));
     } catch (e) {
       return protect(`<pre class="code-view"><code>${escapeHtml(body.trim())}</code></pre>`);
@@ -315,8 +332,31 @@ function _renderMarkdownFullInner(md) {
   // Collected after phase 1 so a fenced or inline-code `![](…)` sample — now a
   // placeholder — is not mistaken for an embed this message actually shows.
   _mdEmbeddedMediaKeys = _collectEmbeddedMediaKeys(md);
+  // Raw HTML (including '<' preserved inside TeX) can carry parser context
+  // across blocks. Generated code/dashboard HTML starts with a tag and is
+  // self-contained; plain protected TeX is not HTML-escaped by this renderer.
+  // Keep the canonical whole-document sanitize context for those inputs.
+  const splitBlocks = blockCache && !protectedHtmlContext && !md.includes('<')
+    && !protectedBlocks.some(block => !block.startsWith('<') && block.includes('<'));
+  const previousInline = blockCache?.inline;
+  const nextInline = blockCache ? new Map() : null;
+  const formatInline = (text) => {
+    // Media/link rendering can depend on whole-message deduplication and UI
+    // locale. Re-evaluate those lines; ordinary prose/code tokens are pure.
+    if (!nextInline || text.includes('[')) return inlineFormat(text);
+    const html = nextInline.get(text) ?? previousInline?.get(text) ?? inlineFormat(text);
+    nextInline.set(text, html);
+    return html;
+  };
   const lines = md.split('\n');
   const out = [];
+  const blockEnds = [];
+  let blockStart = 0;
+  const endBlock = () => {
+    if (!splitBlocks || out.length === blockStart) return;
+    blockEnds.push(out.length);
+    blockStart = out.length;
+  };
   // Stack of open lists: { type:'ul'|'ol', indent:number,
   //   siblingOpen:boolean }. Indent is measured in spaces (tabs → 2 spaces).
   const listStack = [];
@@ -328,6 +368,7 @@ function _renderMarkdownFullInner(md) {
     out.push(`</${top.type}>`);
   };
   const flushList = () => {
+    const hadList = listStack.length > 0;
     while (listStack.length) {
       const top = listStack.pop();
       closeList(top);
@@ -336,12 +377,14 @@ function _renderMarkdownFullInner(md) {
         listStack[listStack.length - 1].siblingOpen = false;
       }
     }
+    if (hadList) endBlock();
   };
-  const flushBQ = () => { if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; } };
+  const flushBQ = () => { if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; endBlock(); } };
   const flushTable = () => {
     if (!tableRows.length) return;
-    out.push(buildTable(tableRows));
+    out.push(buildTable(tableRows, formatInline));
     tableRows = [];
+    endBlock();
   };
   const openList = (type, indent, orderedStart) => {
     const start = type === 'ol' ? Number.parseInt(orderedStart || '1', 10) : 1;
@@ -351,6 +394,7 @@ function _renderMarkdownFullInner(md) {
   };
 
   for (let i = 0; i < lines.length; i++) {
+    if (!listStack.length && !inBlockquote && !tableRows.length) endBlock();
     const line = lines[i];
 
     // Table: detect rows starting and ending with |
@@ -366,7 +410,7 @@ function _renderMarkdownFullInner(md) {
     const hm = line.match(/^(#{1,6})\s+(.*)/);
     if (hm) {
       flushList(); flushBQ();
-      out.push(`<h${hm[1].length}>${inlineFormat(hm[2])}</h${hm[1].length}>`);
+      out.push(`<h${hm[1].length}>${formatInline(hm[2])}</h${hm[1].length}>`);
       continue;
     }
     // Horizontal rule
@@ -380,7 +424,7 @@ function _renderMarkdownFullInner(md) {
     if (bqm) {
       flushList();
       if (!inBlockquote) { out.push('<blockquote>'); inBlockquote = true; }
-      out.push(`<p>${inlineFormat(bqm[1])}</p>`);
+      out.push(`<p>${formatInline(bqm[1])}</p>`);
       continue;
     } else { flushBQ(); }
 
@@ -430,7 +474,7 @@ function _renderMarkdownFullInner(md) {
       const top = listStack[listStack.length - 1];
       if (top.siblingOpen) out.push('</li>');
 
-      out.push(`<li${liClass}>${taskHtml}${inlineFormat(content)}`);
+      out.push(`<li${liClass}>${taskHtml}${formatInline(content)}`);
       top.siblingOpen = true;
       continue;
     }
@@ -444,7 +488,7 @@ function _renderMarkdownFullInner(md) {
 
     flushList();
     if (!line.trim()) { out.push(''); continue; }
-    const inline = inlineFormat(line);
+    const inline = formatInline(line);
     // A line that held nothing but a dropped duplicate media link renders to
     // nothing; emitting `<p></p>` would leave its vertical margin as a gap
     // where the second copy of the image used to be.
@@ -452,8 +496,29 @@ function _renderMarkdownFullInner(md) {
     out.push(`<p>${inline}</p>`);
   }
   flushList(); flushBQ(); flushTable();
+  endBlock();
 
-  let html = out.join('\n');
+  if (blockCache) {
+    if (!splitBlocks) blockEnds.push(out.length);
+    const sanitized = new Map();
+    let start = 0;
+    blockCache.blocks = blockEnds.map(end => {
+      const raw = _restoreMarkdownBlocks((start ? '\n' : '') + out.slice(start, end).join('\n'), protectedBlocks);
+      start = end;
+      const html = sanitized.get(raw) ?? blockCache.sanitized?.get(raw) ?? sanitizeHtml(raw);
+      sanitized.set(raw, html);
+      return html;
+    });
+    blockCache.inline = nextInline;
+    blockCache.sanitized = sanitized;
+    return blockCache.blocks.join('');
+  }
+
+  // Every path sanitizes after restoring code/chart/math placeholders.
+  return sanitizeHtml(_restoreMarkdownBlocks(out.join('\n'), protectedBlocks));
+}
+
+function _restoreMarkdownBlocks(html, protectedBlocks) {
   // Restore protected blocks
   // Loop until all placeholders are resolved. A placeholder created late
   // can wrap an earlier-created one (e.g. inline code `$y$` wraps the math
@@ -462,29 +527,27 @@ function _renderMarkdownFullInner(md) {
   // aren't interpreted (breaks `$$...$$` display math otherwise).
   for (let guard = 0; guard < 16 && html.includes('\x00BLOCK'); guard++) {
     let changed = false;
-    protectedBlocks.forEach((block, idx) => {
-      const tok = `\x00BLOCK${idx}\x00`;
-      if (html.includes(tok)) {
-        html = html.replace(tok, () => block);
-        changed = true;
-      }
+    // Scan once per nesting level, not once per code/math block. Repeated
+    // whole-output searches become quadratic in long, code-heavy replies.
+    html = html.replace(/\x00BLOCK(0|[1-9]\d*)\x00/g, (token, index) => {
+      const block = protectedBlocks[Number(index)];
+      if (block === undefined) return token;
+      changed = true;
+      return block;
     });
     if (!changed) break;
   }
-  // Single sanitize chokepoint: every renderMarkdown caller (chat bubbles,
-  // skill detail, KB viewer, agent workflow, streaming finals) gets XSS-safe
-  // HTML. Runs after block restore so code/chart/math placeholders are intact.
-  return sanitizeHtml(html);
+  return html;
 }
 
 // ── Table builder ──
-function buildTable(rows) {
+function buildTable(rows, formatInline = inlineFormat) {
   // rows[0] = header, rows[1] = separator (---|---), rows[2..] = data
   const parseCells = (row) =>
     row.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
 
   if (rows.length < 2) {
-    return rows.map(r => `<p>${inlineFormat(escapeHtml(r))}</p>`).join('\n');
+    return rows.map(r => `<p>${formatInline(escapeHtml(r))}</p>`).join('\n');
   }
 
   const headerCells = parseCells(rows[0]);
@@ -504,7 +567,7 @@ function buildTable(rows) {
   let html = '<table><thead><tr>';
   headerCells.forEach((cell, ci) => {
     const a = aligns[ci] ? ` style="text-align:${aligns[ci]}"` : '';
-    html += `<th${a}>${inlineFormat(cell)}</th>`;
+    html += `<th${a}>${formatInline(cell)}</th>`;
   });
   html += '</tr></thead><tbody>';
 
@@ -513,7 +576,7 @@ function buildTable(rows) {
     html += '<tr>';
     cells.forEach((cell, ci) => {
       const a = aligns[ci] ? ` style="text-align:${aligns[ci]}"` : '';
-      html += `<td${a}>${inlineFormat(cell)}</td>`;
+      html += `<td${a}>${formatInline(cell)}</td>`;
     });
     html += '</tr>';
   }

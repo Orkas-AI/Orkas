@@ -481,6 +481,7 @@ afterEach(async () => {
     // Some skipped/failed setup paths may not have loaded the bus module yet.
   }
   await drainMainRuntimeForTest();
+  await (await import('../../../../src/main/features/conversation-history-client')).closeConversationHistoryWorker();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -741,6 +742,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     cliRunMock.nextResult = { runId: 'display-test', status: 'completed', output: 'Complete reply', finalMessageText: 'Complete reply' };
     await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} inspect` });
     await waitForQuiescent(TEST_UID, cid);
+    recovered = await recovered;
     expect(recovered.turns).toHaveLength(1);
     const records = recovered.turns[0].records;
     expect(records.at(-1).text).toBe('Partial reply\n');
@@ -2769,11 +2771,11 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     cidsToDrop.add(cid);
     const events: any[] = [];
     const unsub = bus.subscribe(TEST_UID, cid, event => events.push(event));
-    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Inspect this project.', forceTo: [AGENT_ID] });
-    await vi.waitFor(() => expect(cliRunMock.calls).toHaveLength(1));
-    cliRunMock.calls[0].onEvent({ type: 'async-message', itemId: 'native-question', text: 'Which scope?', questions: [{ title: 'Which scope?', options: ['Current', 'All'] }] });
-    await vi.waitFor(() => expect(events.some(event => event.msg?.cli_question)).toBe(true));
     try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Inspect this project.', forceTo: [AGENT_ID] });
+      await vi.waitFor(() => expect(cliRunMock.calls).toHaveLength(1));
+      cliRunMock.calls[0].onEvent({ type: 'async-message', itemId: 'native-question', text: 'Which scope?', questions: [{ title: 'Which scope?', options: ['Current', 'All'] }] });
+      await vi.waitFor(() => expect(events.some(event => event.msg?.cli_question)).toBe(true));
       const question = events.find(event => event.msg?.cli_question).msg;
       const payload = { cid, message_id: question.id, cancelled: true };
       expect(await respond(payload, { userId: 'other-account' })).toEqual({ ok: false, error: 'expired' });
@@ -2802,6 +2804,8 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       expect(cliRunMock.calls).toHaveLength(1);
       rewrite.mockRestore();
     } finally {
+      // A timed-out admission may reach the mock after this cleanup.
+      cliRunMock.activeIngress = null;
       cliRunMock.releaseActiveIngressRun?.();
       cliRunMock.releaseActiveIngressRun = null;
       unsub();

@@ -4,6 +4,9 @@
 let _globalTodoGroups = [];
 let _globalTodoProjects = [];
 let _globalTodoMode = 'project';
+// Presentation-only: the by-project view paints one scope at a time ('' is the
+// global scope). Never persisted, and never narrows what a load fetches.
+let _globalTodoActiveScope = null;
 let _globalTodoLoadSeq = 0;
 let _globalTodoRefreshTimer = null;
 // True until a full load commits (and again after any failed load): a change
@@ -213,6 +216,33 @@ function _renderGlobalTodoDriverBar(groups) {
   return bar;
 }
 
+function _renderGlobalTodoScopeSwitcher(groups) {
+  const nav = document.createElement('nav');
+  nav.className = 'todo-scope-switcher';
+  nav.setAttribute('aria-label', t('todo.by_project'));
+  for (const group of groups) {
+    const pid = group.project.project_id || '';
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'todo-scope-chip';
+    chip.dataset.pid = pid;
+    chip.setAttribute('aria-pressed', String(pid === _globalTodoActiveScope));
+    const folder = typeof uiIconHtml === 'function'
+      ? uiIconHtml('folder', 'todo-scope-chip-icon')
+      : '';
+    chip.innerHTML = folder
+      + `<span class="todo-scope-chip-name">${escapeHtml(group.project.name)}</span>`
+      + `<span class="todo-scope-chip-count">${group.tasks.length}</span>`;
+    chip.addEventListener('click', () => {
+      if (_globalTodoActiveScope === pid) return;
+      _globalTodoActiveScope = pid;
+      _renderGlobalTodos();
+    });
+    nav.appendChild(chip);
+  }
+  return nav;
+}
+
 function _renderGlobalTodos() {
   const host = document.getElementById('todos-content');
   if (!host) return;
@@ -237,36 +267,21 @@ function _renderGlobalTodos() {
     }, 'global:status'));
     return;
   }
+  const scopes = groups.map((group) => group.project.project_id || '');
+  // A scope that emptied out since the last paint drops off the switcher, so
+  // fall back to the first one rather than painting nothing.
+  if (!scopes.includes(_globalTodoActiveScope)) _globalTodoActiveScope = scopes[0];
+  host.appendChild(_renderGlobalTodoScopeSwitcher(groups));
   for (const group of groups) {
     const pid = group.project.project_id;
+    if ((pid || '') !== _globalTodoActiveScope) continue;
     const section = document.createElement('section');
-    section.className = 'todo-project-group auto-group';
+    section.className = 'todo-project-group';
     section.dataset.pid = pid;
-    const header = document.createElement('div');
-    header.className = 'todo-project-head auto-group-head';
-    const toggle = document.createElement('button');
-    toggle.type = 'button';
-    toggle.className = 'todo-collapse auto-group-toggle';
     const key = 'global:project:' + pid;
-    const collapsed = _todoCollapsed.get(key) || false;
-    toggle.setAttribute('aria-expanded', String(!collapsed));
-    const folder = typeof uiIconHtml === 'function'
-      ? `<span class="auto-group-icon">${uiIconHtml(collapsed ? 'folder' : 'folder-open', 'auto-group-folder-icon')}</span>`
-      : '';
-    toggle.innerHTML = folder + '<strong class="auto-group-name">' + escapeHtml(group.project.name)
-      + '</strong><span class="auto-group-count">' + group.tasks.length + '</span>';
     const board = _renderTodoBoard(group.tasks, _globalTodoContext(pid), key);
-    board.className += ' auto-group-list';
-    board.hidden = collapsed;
-    toggle.addEventListener('click', () => {
-      board.hidden = !board.hidden;
-      _todoCollapsed.set(key, board.hidden);
-      toggle.setAttribute('aria-expanded', String(!board.hidden));
-      if (typeof uiIconHtml === 'function') {
-        const icon = toggle.querySelector('.auto-group-icon');
-        if (icon) icon.innerHTML = uiIconHtml(board.hidden ? 'folder' : 'folder-open', 'auto-group-folder-icon');
-      }
-    });
+    const actions = document.createElement('div');
+    actions.className = 'todo-scope-actions';
     const add = document.createElement('button');
     add.type = 'button';
     add.className = 'project-todo-menu todo-project-add';
@@ -279,11 +294,10 @@ function _renderGlobalTodos() {
       // place for choosing a different project or the global scope.
       _openProjectTodoEditor(null, { ...context, projects: undefined });
     });
-    header.appendChild(toggle);
-    if (group === groups[0]) header.appendChild(_renderGlobalTodoDriverHint());
-    header.appendChild(_renderGlobalTodoDriverToggle(group, false));
-    header.appendChild(add);
-    section.appendChild(header);
+    actions.appendChild(_renderGlobalTodoDriverHint());
+    actions.appendChild(_renderGlobalTodoDriverToggle(group, false));
+    actions.appendChild(add);
+    section.appendChild(actions);
     section.appendChild(board);
     host.appendChild(section);
   }

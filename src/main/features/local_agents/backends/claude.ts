@@ -608,7 +608,11 @@ export const claudeBackend: LocalBackend = {
           // Tool calls never span turns; drop any callId whose result
           // never arrived so the map stays turn-scoped.
           partialState.toolNamesByCallId?.clear();
-          if (liveTasks.size > 0) {
+          // Only a successful foreground result can hand execution to live
+          // background work. A terminal failure must release the caller and
+          // retain its original error even if task retirement never arrives.
+          if (liveTasks.size > 0 && resultStatus === 'completed'
+              && !opts.signal.aborted && !backgroundTimedOut && !watchdog.fired()) {
             enterBackground();
             // `result` would otherwise be the latest activity row. Reassert the
             // phase after it so the always-visible label tells the user why the

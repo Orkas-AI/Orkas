@@ -465,6 +465,22 @@ describe('prompts ↔ code contract', () => {
     expect(agentCreator).toMatch(/ask one concise clarification and emit no container/i);
   });
 
+  it('creator skills check platform provenance before preparing unbound edits', () => {
+    const agentEditing = readFile('resources/builtin/system/skills/agent-creator/references/source-and-editing.md')
+      .split('## Unbound editing loop')[1].split('## Source-aware quality check')[0];
+    const skillEditing = readFile('resources/builtin/system/skills/skill-creator/SKILL.md')
+      .split('## Decide create versus edit')[1].split('## Metadata-only shape')[0];
+    for (const instructions of [agentEditing, skillEditing]) {
+      expect(instructions).toContain('Source: builtin');
+      expect(instructions).toContain('Source: platform');
+      expect(instructions).toMatch(/check its `Source`.*before reading/);
+      expect(instructions).toMatch(/cannot be edited through chat and nothing changed/);
+      expect(instructions).toMatch(/emit no (container|mutation protocol) and do not retry/);
+      expect(instructions).toContain('Source: custom');
+      expect(instructions).not.toMatch(/fork/i);
+    }
+  });
+
   it('creator skills own source reading while commander keeps only the shared gate', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
     const agentCreator = readFile('resources/builtin/system/skills/agent-creator/references/source-and-editing.md');
@@ -970,7 +986,7 @@ describe('prompts ↔ code contract', () => {
     // (a concise execution contract) plus the source context, never a
     // history recap.
     expect(bus).toMatch(/namedDispatchSourceContext[\s\S]+runScheduledDispatch/);
-    expect(bus).toMatch(/runScheduledDispatch\(\s*state, ctx\?\.signal, dispatchActor, message, \{[\s\S]{0,320}sourceContext:\s*\{\s*\.\.\.namedDispatchSourceContext/);
+    expect(bus).toMatch(/runScheduledDispatch\(\s*state, parentSignal, dispatchActor, message, \{[\s\S]{0,320}sourceContext:\s*\{\s*\.\.\.namedDispatchSourceContext/);
     expect(commanderPrompt).toMatch(/For a named Agent, send only a concise execution contract/i);
     expect(commanderPrompt).toMatch(/It already receives visible history, references, attachments, workspace access/i);
     expect(commanderPrompt).toMatch(/`run_worker` only for a bounded, self-contained, anonymous scan/i);

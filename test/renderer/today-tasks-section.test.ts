@@ -118,6 +118,8 @@ function loadTodayTasksRenderer() {
       },
       createElement: () => {
         const el: any = { className: '', innerHTML: '', parent: null };
+        // Mirror the live DOM's classList, including after className changes.
+        el.classList = { contains: (name: string) => el.className.split(/\s+/).includes(name) };
         el.remove = () => { if (el.parent) el.parent.children = el.parent.children.filter((child: any) => child !== el); };
         return el;
       },

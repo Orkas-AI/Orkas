@@ -19,7 +19,7 @@ import { WS_ROOT, userWebAssistProfileDir } from '../../../src/main/paths';
 
 function executeSubmitAction(options: {
   sensitive: boolean;
-  action?: 'click' | 'check' | 'uncheck';
+  action?: 'click' | 'check' | 'uncheck' | 'drag';
   checked?: boolean;
   scope?: WebAssistPageScope;
   tag?: 'button' | 'input';
@@ -107,6 +107,12 @@ function executeSubmitAction(options: {
 }
 
 describe('Web Assist security boundary', () => {
+  it('hands sensitive-field drags back without dispatching page input', () => {
+    const action = executeSubmitAction({ sensitive: false, action: 'drag', tag: 'input', type: 'password', label: 'Secret' });
+    expect(action.result).toMatchObject({ ok: false, code: 'user_action_required', reason: 'sensitive_input' });
+    expect(action.clicks).toBe(0);
+  });
+
   it('round-trips long complete addresses while retaining search limits and credential rejection', () => {
     const url = `https://example.com/work?q=${'a'.repeat(2200)}&x=one&x=two&encoded=%2F%26#section`;
     expect(normalizeWebAssistUserUrl(url)).toBe(url);
@@ -490,7 +496,9 @@ describe('Web Assist security boundary', () => {
     expect(action.clicks).toBe(0);
   });
 
-  it.each(['Purchase now', 'Confirm payment', '确认支付', '删除', 'Authorize', 'Publish', 'CAPTCHA'])(
+  // Latin label evidence uses whole action words; sensitive payment fields
+  // are covered independently by the form-submission cases above.
+  it.each(['Purchase now', 'Pay now', '确认支付', '删除', 'Authorize', 'Publish', 'CAPTCHA'])(
     'preserves the general browser handback for %s', (label) => {
       const action = executeSubmitAction({ sensitive: false, type: 'submit', label });
       expect(action.requiresUserAction).toBe(true);

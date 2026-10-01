@@ -28,7 +28,7 @@ import { isAtomicWriteTempPath, safeId, writeJson } from '../storage';
 import { t } from '../i18n';
 import { assertLocalImportTarget } from '../util/file-import';
 import {
-  EN_FILLER_RE, TITLE_MAX, ZH_FILLER_RE,
+  EN_FILLER_RE, truncateTitleToWidth, ZH_FILLER_RE,
 } from '../util/auto-title';
 import {
   logErrorRef,
@@ -1335,7 +1335,7 @@ function titleFromText(value: string): string {
   }
   text = text.trim();
   text = text || raw;
-  if (text.length > TITLE_MAX) text = text.slice(0, TITLE_MAX) + '…';
+  text = truncateTitleToWidth(text);
   return text || t('chat.default_title');
 }
 

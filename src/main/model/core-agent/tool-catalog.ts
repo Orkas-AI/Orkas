@@ -206,6 +206,9 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'metacognition', loadGroups: ['context'], summary: 'Read or update agent competence and strategies.' },
   { name: 'project_instructions', loadGroups: ['context'], summary: 'Update project standing instructions.' },
   { name: 'todo_tasks', loadGroups: ['management.projects'], programmatic: { mode: 'allow' }, summary: 'Manage a selected project backlog.' },
+  // Commander-only: it relocates this conversation, which is an orchestration
+  // decision, and `run_program` gets no access to that side effect.
+  { name: 'project_setup', loadGroups: ['management.projects'], agentAssignable: false, summary: "Create a project for this conversation's work, or undo that." },
 
   { name: 'dispatch_to', loadGroups: ['orchestration'], summary: 'Delegate visible work and continue the commander turn.' },
   { name: 'hand_off_to', loadGroups: ['orchestration'], summary: 'Transfer terminal ownership to another Agent.' },

@@ -252,6 +252,9 @@ export type AgentRunEvent =
       /** Low-cardinality timing for one main/final-summary provider request.
        * Internal telemetry only; host event mappers do not render it. */
       type: "provider_call";
+      /** Last response at the adapter boundary; counts only, no wire content.
+       * terminalSeen means message_end was observed, not a guessed default. */
+      output?: { terminalSeen: boolean; stopReason?: StopReason; textChars: number; thinkingChars: number; toolCalls: number };
       durationMs: number;
       outcome: "completed" | "failed";
       model: string;

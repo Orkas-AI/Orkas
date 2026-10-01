@@ -12,9 +12,9 @@ export const SHEIN_KEY = 'merchant-private-open-key';
 export const SHEIN_SECRET = 'merchant-private-shein-secret';
 export const rows = [
   { id: 'magento', provider: 'magento', count: 9, authCalls: 4, input: { store_url: 'https://shop.example.com/magento', consumer_key: APP, consumer_secret: SECRET, access_token: TOKEN, token_secret: REFRESH }, metadata: { store_url: 'https://shop.example.com/magento' }, host: '' },
-  { id: 'temu-seller', provider: 'temu', count: 7, authCalls: 3, input: { region: 'us', app_key: APP, app_secret: SECRET, access_token: TOKEN }, metadata: { region: 'us' }, host: '' },
-  { id: 'lazada-seller', provider: 'lazada', count: 7, authCalls: 4, input: { country: 'sg', app_key: APP, app_secret: SECRET }, metadata: { country: 'sg' }, host: 'auth.lazada.com' },
-  { id: 'shein-seller', provider: 'shein', count: 8, authCalls: 5, input: { app_id: APP, app_secret: SECRET }, metadata: {}, host: 'openapi-sem.sheincorp.com' },
+  { id: 'temu-seller', provider: 'temu', count: 127, authCalls: 3, input: { region: 'us', app_key: APP, app_secret: SECRET, access_token: TOKEN }, metadata: { region: 'us' }, host: '' },
+  { id: 'lazada-seller', provider: 'lazada', count: 231, authCalls: 4, input: { country: 'sg', app_key: APP, app_secret: SECRET }, metadata: { country: 'sg' }, host: 'auth.lazada.com' },
+  { id: 'shein-seller', provider: 'shein', count: 129, authCalls: 5, input: { app_id: APP, app_secret: SECRET }, metadata: {}, host: 'openapi-sem.sheincorp.com' },
   { id: 'alibaba-com-seller', provider: 'alibaba_icbu', count: 6, authCalls: 3, input: { app_key: APP, app_secret: SECRET }, metadata: {}, host: 'oauth.alibaba.com' },
   { id: 'aliexpress-seller', provider: 'aliexpress', count: 6, authCalls: 4, input: { app_key: APP, app_secret: SECRET }, metadata: {}, host: 'api-sg.aliexpress.com' },
 ] as const;

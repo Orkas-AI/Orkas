@@ -75,6 +75,16 @@ it('keeps Redis service shutdown behind one-time host approval without executing
 });
 
 describe('local-tools › Windows PowerShell compatibility preflight', () => {
+  it('advertises the actual host shell before command parameters on Windows only', async () => {
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const windows = createLocalTools({ hostPlatform: 'win32' }).find(tool => tool.name === 'bash')!;
+    const posix = createLocalTools({ hostPlatform: 'darwin' }).find(tool => tool.name === 'bash')!;
+    expect(windows.description).toContain('`bash` tool runs Windows PowerShell 5.1');
+    expect((windows.inputSchema.properties as any).command.description).toContain('use PowerShell syntax');
+    expect(posix.description).not.toContain('PowerShell');
+    expect((posix.inputSchema.properties as any).command.description).not.toContain('PowerShell');
+  });
+
   it('authorizes the original chain once before passing it to the shell adapter', async () => {
     await allFilesAuto();
     const core = await import('../../../../src/core-agent/src/tools/builtin');
@@ -132,10 +142,46 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     expect(windowsPowerShellCompatibilityError("cat <<'TEXT'\nnode run-skill.cjs missing-skill probe\nTEXT", 'win32')).toContain('POSIX heredoc');
     expect(windowsPowerShellCompatibilityError('export TOKEN=x; head -n 3 a.txt > /dev/null', 'win32')).toContain('source/export');
     expect(windowsPowerShellCompatibilityError('mkdir -p api core/data core/analysis', 'win32')).toContain('POSIX mkdir -p');
+    expect(windowsPowerShellCompatibilityError('curl -s http://localhost:8181/sse', 'win32')).toContain('curl.exe -s');
+    expect(windowsPowerShellCompatibilityError('Write-Output ready; curl -s https://example.com', 'win32')).toContain('Invoke-WebRequest');
+    expect(windowsPowerShellCompatibilityError('Write-Output "curl -s https://example.com"', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('curl.exe -s https://example.com', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('cmd /c curl -s https://example.com', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('curl -s https://example.com', 'darwin')).toBeNull();
+    const priorShell = process.env.ORKAS_WINDOWS_SHELL;
+    try {
+      process.env.ORKAS_WINDOWS_SHELL = 'pwsh.exe';
+      expect(windowsPowerShellCompatibilityError('curl -s https://example.com', 'win32')).toBeNull();
+      process.env.ORKAS_WINDOWS_SHELL = 'cmd.exe';
+      expect(windowsPowerShellCompatibilityError('curl -s https://example.com', 'win32')).toBeNull();
+    } finally {
+      if (priorShell === undefined) delete process.env.ORKAS_WINDOWS_SHELL;
+      else process.env.ORKAS_WINDOWS_SHELL = priorShell;
+    }
     expect(windowsPowerShellCompatibilityError('$env:TOKEN = "x"; Get-Content a.txt | Select-Object -First 3', 'win32')).toBeNull();
     expect(windowsPowerShellCompatibilityError('New-Item -ItemType Directory -Force -Path "api", "core/data"', 'win32')).toBeNull();
     expect(windowsPowerShellCompatibilityError('npm install && npm test', 'darwin')).toBeNull();
     expect(windowsPowerShellCompatibilityError('mkdir -p api core/data core/analysis', 'darwin')).toBeNull();
+  });
+
+  it('rejects the PowerShell curl alias before launching the command', async () => {
+    await allFilesAuto();
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const execute = vi.spyOn(core.bashTool, 'execute').mockImplementation(async () => {
+      throw new Error('The incompatible curl alias must not reach execution');
+    });
+    try {
+      const bash = createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' })
+        .find(tool => tool.name === 'bash')!;
+      const result = await bash.execute({ command: 'curl -s http://localhost:8181/sse' }, {
+        workingDir: tmpDir, state: {},
+      } as any);
+      expect(result).toMatchObject({ isError: true });
+      expect(result.content).toContain('E_SHELL_SYNTAX_MISMATCH');
+      expect(result.content).toContain('curl.exe -s');
+      expect(execute).not.toHaveBeenCalled();
+    } finally { execute.mockRestore(); }
   });
 
   it('blocks incompatible commands through bash and both persistent session starters before spawning them', async () => {
@@ -399,6 +445,116 @@ async function allFilesApproval() {
   perm.setLocalExecMode('all_files_approval');
 }
 
+describe('ordinary-operation host admission', () => {
+  it('does not exempt an installation through a symlink escape or override an explicit server policy', async () => {
+    await allFilesApproval();
+    const workspace = path.join(tmpDir, 'project'); const outside = path.join(tmpDir, 'other-project');
+    fs.mkdirSync(workspace); fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(workspace, '.venv'), process.platform === 'win32' ? 'junction' : 'dir');
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const bp = await import('../../../../src/main/model/core-agent/bash-permissions');
+    const config = await import('../../../../src/main/features/client_config');
+    const execute = vi.spyOn(core.bashTool, 'execute').mockResolvedValue({ content: 'must not execute' });
+    const requests: any[] = [];
+    bp._setBroadcastForTest((_channel, info: any) => { requests.push(info); bp.respond(info.request_id, 'deny'); });
+    try {
+      const tool = createLocalTools({ userId: UID, cid: CID, extraRoots: [workspace] }).find(t => t.name === 'bash')!;
+      const ctx = { workingDir: workspace, state: {} } as any;
+      expect((await tool.execute({ command: 'conda create -p .venv python' }, ctx)).isError).toBe(true);
+      config.clientConfig.applyServerPayload({ immediate: { 'local_access.sensitive_policy': {
+        sensitive_command_patterns: [{ category: 'network_egress', pattern: 'npm\\s+view' }],
+      } }, restart: {}, config_hash: 'sha256:ordinary-custom' }, 'ordinary-custom');
+      expect((await tool.execute({ command: 'npm view react version' }, ctx)).isError).toBe(true);
+      expect(requests).toHaveLength(2);
+      expect(execute).not.toHaveBeenCalled();
+      expect(fs.readdirSync(outside)).toEqual([]);
+    } finally { execute.mockRestore(); bp._setBroadcastForTest(null); bp._resetForTest(); }
+  });
+  it.each([
+    ['npm view react version', true], ['curl -q https://example.com/docs', true],
+    ['curl -q -L https://example.com/docs', true],
+    ['git ls-remote --heads https://github.com/example/repo', true],
+    ['gh pr view 42 --json title,state', true],
+    ['conda create -p .venv python=3.12 -y', false], ['cargo install --root .tools ripgrep', false],
+    ['git branch -d merged-topic', false], ['git branch -D work-in-progress', true],
+    ['curl -q -d @private.txt https://example.com', true], ['cargo install ripgrep', true],
+  ])('gates the actual invocation before execution: %s', async (command, shouldAsk) => {
+    await allFilesApproval();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const bp = await import('../../../../src/main/model/core-agent/bash-permissions');
+    const execute = vi.spyOn(core.bashTool, 'execute').mockResolvedValue({ content: 'completed' });
+    const requests: any[] = [];
+    bp._setBroadcastForTest((_channel, info: any) => { requests.push(info); bp.respond(info.request_id, 'deny'); });
+    try {
+      const tool = createLocalTools({ userId: UID, cid: CID, extraRoots: [tmpDir] }).find(t => t.name === 'bash')!;
+      const result = await tool.execute({ command }, { workingDir: tmpDir, state: {} } as any);
+      expect(requests.length).toBe(shouldAsk ? 1 : 0);
+      expect(!!result.isError).toBe(shouldAsk);
+      expect(execute).toHaveBeenCalledTimes(shouldAsk ? 0 : 1);
+    } finally { execute.mockRestore(); bp._setBroadcastForTest(null); bp._resetForTest(); }
+  });
+
+  it('cleans a new task tree, but preserves a changed artifact and earlier files', async () => {
+    await allFilesApproval();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bp = await import('../../../../src/main/model/core-agent/bash-permissions');
+    const requests: any[] = [];
+    bp._setBroadcastForTest((_channel, info: any) => { requests.push(info); bp.respond(info.request_id, 'deny'); });
+    try {
+      const tools = createLocalTools({ userId: UID, cid: CID, extraRoots: [tmpDir], hasProducedPath: () => true });
+      const write = tools.find(t => t.name === 'write_file')!;
+      const bash = tools.find(t => t.name === 'bash')!;
+      const ctx = { workingDir: tmpDir, state: {} } as any;
+      for (const dir of ['new-output', 'changed-output']) {
+        expect((await write.execute({ path: path.join(tmpDir, dir, 'file.txt'), content: 'new' }, ctx)).isError).toBeFalsy();
+      }
+      fs.writeFileSync(path.join(tmpDir, 'changed-output', 'file.txt'), 'user changes');
+      fs.mkdirSync(path.join(tmpDir, 'old-output')); fs.writeFileSync(path.join(tmpDir, 'old-output', 'file.txt'), 'keep');
+      const remove = (dir: string) => process.platform === 'win32'
+        ? `Remove-Item -LiteralPath '${dir}' -Recurse -Force` : `rm -rf ${dir}`;
+      const removed = await bash.execute({ command: remove('new-output') }, ctx);
+      expect(removed.isError).toBeFalsy();
+      expect(fs.existsSync(path.join(tmpDir, 'new-output'))).toBe(false);
+      expect(requests).toHaveLength(0);
+      for (const dir of ['changed-output', 'old-output']) {
+        const result = await bash.execute({ command: remove(dir) }, ctx);
+        expect(result.isError).toBe(true);
+        expect(fs.existsSync(path.join(tmpDir, dir, 'file.txt'))).toBe(true);
+      }
+      expect(requests).toHaveLength(2);
+    } finally { bp._setBroadcastForTest(null); bp._resetForTest(); }
+  });
+
+  it('retains ownership across a shell-produced tree and ordinary preview, without trusting an executable', async () => {
+    await allFilesApproval();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const bp = await import('../../../../src/main/model/core-agent/bash-permissions');
+    const requests: any[] = [];
+    bp._setBroadcastForTest((_channel, info: any) => { requests.push(info); bp.respond(info.request_id, 'deny'); });
+    const tools = createLocalTools({ userId: UID, cid: CID, extraRoots: [tmpDir] });
+    const bash = tools.find(t => t.name === 'bash')!;
+    const ctx = { workingDir: tmpDir, state: {} } as any;
+    const execute = vi.spyOn(core.bashTool, 'execute').mockImplementation(async () => {
+      fs.mkdirSync(path.join(tmpDir, 'build'));
+      fs.writeFileSync(path.join(tmpDir, 'build', 'report.pdf'), '%PDF-1.4 fixture');
+      return { content: 'completed' };
+    });
+    try {
+      await bash.execute({ command: 'node generate.js' }, ctx);
+      execute.mockResolvedValue({ content: 'completed' });
+      expect((await bash.execute({ command: 'open build/report.pdf' }, ctx)).isError).toBeFalsy();
+      expect((await bash.execute({ command: process.platform === 'win32'
+        ? 'Remove-Item -LiteralPath build -Recurse -Force' : 'rm -rf build' }, ctx)).isError).toBeFalsy();
+      expect(requests).toHaveLength(0);
+      expect((await bash.execute({ command: 'open -a Terminal build/report.pdf' }, ctx)).isError).toBe(true);
+      expect(requests).toHaveLength(1);
+    } finally { execute.mockRestore(); bp._setBroadcastForTest(null); bp._resetForTest(); }
+  });
+});
+
 async function run(tool: any, input: Record<string, any>) {
   const ctx = { workingDir: '.', signal: undefined, state: {} } as any;
   return await tool.execute(input, ctx);
@@ -430,6 +586,8 @@ describe('local-tools › interactive CLI action contract', () => {
     expect(schema.oneOf).toBeUndefined();
     expect(rejected.content).not.toContain('does not accept');
     expect(rejected.content).toMatch(/not found|unknown|not exist/i);
+    expect(rejected.content).toContain('ignored_fields: ["input"]');
+    expect(rejected.content).not.toContain('yes');
   });
 });
 
@@ -1542,46 +1700,67 @@ describe('local-tools › edit_file › sandbox', () => {
     expect(fs.existsSync(path.join(skillDir, 'extra.md'))).toBe(false);
   });
 
-  it('blocks direct local-tool mutation of marketplace installs in all-files mode', async () => {
+  it.each(['marketplace', 'metacognition', 'reference'] as const)('reports factual read-only errors for %s roots while preserving files in all-files mode', async (kind) => {
     await allFilesApproval();
     const paths = await import('../../../../src/main/paths');
     const localTools = await import('../../../../src/main/model/core-agent/local-tools');
-    const skillDir = paths.userMarketplaceSkillDir(UID, 'platform-skill');
-    fs.mkdirSync(skillDir, { recursive: true });
-    const skillFile = path.join(skillDir, 'SKILL.md');
-    fs.writeFileSync(skillFile, 'original skill');
+    const root = kind === 'marketplace' ? paths.userMarketplaceSkillsDir(UID)
+      : kind === 'metacognition' ? paths.userAgentsDir(UID)
+        : path.join(tmpDir, 'read-only-reference');
+    const protectedFile = kind === 'marketplace' ? path.join(root, 'platform-skill', 'SKILL.md')
+      : kind === 'metacognition' ? paths.agentCompetenceFile(UID, '_default')
+        : path.join(root, 'reference.md');
+    fs.mkdirSync(path.dirname(protectedFile), { recursive: true });
+    fs.writeFileSync(protectedFile, 'original content');
 
-    const tools = localTools.createLocalTools({ userId: UID, cid: CID });
+    const tools = localTools.createLocalTools({
+      userId: UID, cid: CID,
+      ...(kind === 'reference' ? { runtimeReadOnlyRoots: [root] } : {}),
+    });
     const edit = tools.find((t) => t.name === 'edit_file');
     const write = tools.find((t) => t.name === 'write_file');
     const del = tools.find((t) => t.name === 'delete_file');
     const bash = tools.find((t) => t.name === 'bash');
     if (!edit || !write || !del || !bash) throw new Error('expected local tools missing');
 
-    const editRes = await run(edit, { path: skillFile, old_string: 'original', new_string: 'mutated' });
+    // Error copy is the contract here: report the denied target and constraint,
+    // without prescribing a different tool, editing flow, or next action.
+    const expectedError = (target: string) => `E_PROTECTED_PATH_READ_ONLY: path is inside a protected read-only root and cannot be modified by local tools: ${target} (root: ${root}).`;
+    const editRes = await run(edit, { path: protectedFile, old_string: 'original', new_string: 'mutated' });
     expect(editRes.isError).toBe(true);
-    expect(editRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
-    expect(fs.readFileSync(skillFile, 'utf8')).toBe('original skill');
+    expect(editRes.content).toBe(expectedError(protectedFile));
+    expect(fs.readFileSync(protectedFile, 'utf8')).toBe('original content');
 
-    const newFile = path.join(skillDir, 'notes.md');
+    const newFile = path.join(path.dirname(protectedFile), 'notes.md');
     const writeRes = await run(write, { path: newFile, content: 'new bytes' });
     expect(writeRes.isError).toBe(true);
-    expect(writeRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
+    expect(writeRes.content).toBe(expectedError(newFile));
     expect(fs.existsSync(newFile)).toBe(false);
 
-    const deleteRes = await run(del, { path: skillFile });
+    const deleteRes = await run(del, { path: protectedFile });
     expect(deleteRes.isError).toBe(true);
-    expect(deleteRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
-    expect(fs.existsSync(skillFile)).toBe(true);
+    expect(deleteRes.content).toBe(expectedError(protectedFile));
+    expect(fs.existsSync(protectedFile)).toBe(true);
 
     const bashRes = await run(bash, {
       command: process.platform === 'win32'
-        ? `Set-Content -LiteralPath "${skillFile}" -Value hacked`
-        : `printf hacked > "${skillFile}"`,
+        ? `Set-Content -LiteralPath "${protectedFile}" -Value hacked`
+        : `printf hacked > "${protectedFile}"`,
     });
     expect(bashRes.isError).toBe(true);
-    expect(bashRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
-    expect(fs.readFileSync(skillFile, 'utf8')).toBe('original skill');
+    // Shell parsing may identify the full target or only the protected root;
+    // preserve either factual envelope without appending workflow advice.
+    expect(bashRes.content).toContain('E_PROTECTED_PATH_READ_ONLY: path is inside a protected read-only root and cannot be modified by local tools: ');
+    expect(bashRes.content.endsWith(`(root: ${root}).`)).toBe(true);
+    expect(fs.readFileSync(protectedFile, 'utf8')).toBe('original content');
+
+    const readRes = await run(bash, {
+      command: process.platform === 'win32'
+        ? `Get-Content -LiteralPath "${protectedFile}"`
+        : `cat "${protectedFile}"`,
+    });
+    expect(readRes.isError).toBeFalsy();
+    expect(readRes.content).toContain('original content');
   });
 
   it('allows provably read-only bash access to protected roots without weakening mutation guards', async () => {

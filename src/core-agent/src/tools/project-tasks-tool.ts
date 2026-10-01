@@ -28,6 +28,7 @@ export interface ProjectTaskView {
   is_current_run?: boolean;
   owner_agent?: string;
   depends_on?: string[];
+  attachments?: string[];
   result_ref?: string;
   origin_cid?: string;
   created_by?: string;
@@ -40,15 +41,24 @@ export interface ProjectTasksProgress { total: number; done: number; open: numbe
 
 export interface ProjectTasksQuery { offset?: number; limit?: number; status?: ProjectTaskStatus; }
 
+export interface ProjectTaskMutationReceipt {
+  ok: boolean;
+  error?: string;
+  task?: ProjectTaskView;
+  ignored_fields?: string[];
+}
+
 export interface ProjectTasksToolHandler {
+  delete?(taskId: string): Promise<{ ok: boolean; error?: string; task_id?: string; deleted?: boolean }>;
+  addAttachment?(taskId: string, sourcePath: string): Promise<ProjectTaskMutationReceipt>;
   list(query?: ProjectTasksQuery): Promise<{ ok: boolean; tasks: ProjectTaskView[]; progress: ProjectTasksProgress; total: number; next_offset: number | null }>;
   get(taskId: string): Promise<{ ok: boolean; error?: string; task?: ProjectTaskView }>;
   create(input: {
     content?: string; title?: string; detail?: string; owner?: string; status?: ProjectTaskStatus;
-  }): Promise<{ ok: boolean; error?: string; task?: ProjectTaskView; alreadyExists?: boolean }>;
+  }): Promise<ProjectTaskMutationReceipt & { alreadyExists?: boolean }>;
   update(taskId: string, patch: {
     content?: string; title?: string; detail?: string; status?: ProjectTaskStatus; owner?: string; result_ref?: string;
-  }): Promise<{ ok: boolean; error?: string; task?: ProjectTaskView }>;
+  }): Promise<ProjectTaskMutationReceipt>;
   complete(taskId: string, resultRef?: string): Promise<{ ok: boolean; error?: string; task?: ProjectTaskView }>;
 }
 
@@ -76,7 +86,7 @@ export interface CreateProjectTasksToolOptions {
 
 const READONLY_NOTE = `\n\nNOTE: this backlog is READ-ONLY for you. You can list/get tasks; deliver your result to the dispatching agent for a status update.`;
 
-type ProjectTaskAction = 'list_projects' | 'list' | 'get' | 'create' | 'update' | 'complete';
+type ProjectTaskAction = 'list_projects' | 'list' | 'get' | 'create' | 'update' | 'complete' | 'add_attachment' | 'delete';
 
 // Legacy text keys remain input-only compatibility; new schemas advertise content.
 const PROJECT_TASK_ACTION_FIELDS: Readonly<Record<ProjectTaskAction, ReadonlySet<string>>> = {
@@ -86,6 +96,8 @@ const PROJECT_TASK_ACTION_FIELDS: Readonly<Record<ProjectTaskAction, ReadonlySet
   create: new Set(['action', 'content', 'title', 'detail', 'status', 'owner']),
   update: new Set(['action', 'task_id', 'content', 'title', 'detail', 'status', 'owner', 'result_ref']),
   complete: new Set(['action', 'task_id', 'result_ref']),
+  add_attachment: new Set(['action', 'task_id', 'source_path']),
+  delete: new Set(['action', 'task_id']),
 };
 
 export function createProjectTasksTool(source: ProjectTasksToolHandler | ProjectTasksProjectSelector, opts: CreateProjectTasksToolOptions = {}): AgentTool {
@@ -93,7 +105,7 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
   const selector = 'resolveProject' in source ? source : undefined;
   if (readOnly && selector) throw new Error('Restricted project tasks require a bound project handler');
   const actions = readOnly ? ['list', 'get'] : [
-    ...(selector ? ['list_projects'] : []), 'list', 'get', 'create', 'update', 'complete',
+    ...(selector ? ['list_projects'] : []), 'list', 'get', 'create', 'update', 'complete', 'add_attachment', 'delete',
   ];
   return {
     name: 'todo_tasks',
@@ -107,7 +119,7 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
         action: {
           type: 'string',
           enum: actions,
-          description: 'list: tasks with content, matching total, next_offset, project-wide progress; get: full record. complete requires verified delivery. Omit unrelated fields.'
+          description: 'list: tasks with content, paging and progress; get: full task. complete needs verified delivery. Known unused fields appear in ignored_fields; scope/status conflicts fail.'
             + (selector
               ? ' Task actions need project; list_projects takes no extras.'
               : ''),
@@ -116,13 +128,14 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
           project: { type: 'string', minLength: 1, description: 'Exact project name or project_id from list_projects. Required for task actions; ambiguous names need an explicit id.' },
         } : {}),
         ...(opts.globalScope ? { project: { type: 'string', enum: ['__global__'] } } : {}),
-        task_id: { type: 'string', minLength: 1, description: 'Target task id (required for get, update and complete).' },
+        task_id: { type: 'string', minLength: 1, description: 'Required for get/update/complete/add_attachment/delete. Omit for list/create; ignored if supplied, reported in ignored_fields. Created task ids come from the result. delete also removes attachments.' },
         offset: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, description: 'List only; default 0. Continue with next_offset until null, keeping the same filters.' },
         limit: { type: 'integer', minimum: 1, maximum: 50, description: 'List only; default 20. Pages may be smaller to bound result size.' },
         content: { type: 'string', minLength: 1, maxLength: 4000, description: 'Complete work to be done, including requirements. Required for create; replaces the entire content on update.' },
         owner: { type: 'string', description: "Owner agent DISPLAY NAME (as shown in the agents list), not an id." },
         status: { type: 'string', enum: [...TASK_STATUSES], description: "List: filter by state; omitted includes all. Create/update: follow the run's target status. done requires verified delivery; review awaits required human approval. Keep failed or unverified work open." },
         result_ref: { type: 'string', description: "Delivering conversation, artifact, or file reference. In a Project conversation, save produced project files with library_save and use its returned path; outside one, use the file path." },
+        ...(!readOnly ? { source_path: { type: 'string', minLength: 1, description: 'For add_attachment, supply task_id and the absolute path of a file in the current workspace or conversation attachments. Copies into the task using its filename; existing names are rejected. Maximum 200 MiB.' } } : {}),
       },
       required: ['action'],
     },
@@ -141,10 +154,10 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
       if (opts.globalScope && input.project !== undefined && input.project !== '__global__') return fail('project_scope_mismatch');
       if (action === 'list_projects' && input.project !== undefined) return fail('list_projects does not accept a project filter');
       if (!selector && !opts.globalScope && input.project !== undefined) return fail('project_scope_mismatch');
-      if (action === 'complete' && input.status !== undefined && input.status !== 'done') return fail('complete conflicts with status; omit status or use done');
-      if (action === 'create' && input.task_id !== undefined) return fail('create cannot target an existing task; use update');
-      // A task selector on a list is a meaningful filter, not harmless metadata.
-      if (action === 'list' && input.task_id !== undefined) return fail('list does not accept task_id; use get');
+      if (action === 'complete' && input.status !== undefined && input.status !== 'done') return fail('complete conflicts with status; only done is valid');
+      // The selected action owns the effective fields; report every known
+      // unused key so the model never mistakes a dropped argument for a filter.
+      const ignoredFields = Object.keys(input).filter((key) => !allowedFields.has(key)).sort();
       const knownFields = new Set(Object.values(PROJECT_TASK_ACTION_FIELDS).flatMap((fields) => [...fields]));
       if (selector || opts.globalScope) knownFields.add('project');
       const unrelated = Object.keys(input).filter((key) => !knownFields.has(key));
@@ -157,6 +170,7 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
       const status = typeof input.status === 'string' ? input.status as ProjectTaskStatus : undefined;
       const owner = typeof input.owner === 'string' ? input.owner : undefined;
       const resultRef = typeof input.result_ref === 'string' ? input.result_ref : undefined;
+      if (action === 'add_attachment' && (typeof input.source_path !== 'string' || !input.source_path.trim())) return fail('source_path is required for add_attachment');
 
       for (const field of ['content', 'title', 'detail', 'owner', 'result_ref']) {
         if (input[field] !== undefined && typeof input[field] !== 'string') return fail(`${field} must be a string`);
@@ -170,19 +184,21 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
 
       try {
         if (selector && action === 'list_projects') {
-          return { content: JSON.stringify({ ok: true, projects: await selector.listProjects() }) };
+          return { content: JSON.stringify({ ok: true, projects: await selector.listProjects(),
+            ...(ignoredFields.length ? { ignored_fields: ignoredFields } : {}),
+          }) };
         }
         // Validate call prerequisites before project lookup or any mutation.
         const text = content !== undefined ? content : [title, detail].filter(Boolean).join('\n');
         if (action === 'create' && !text.trim()) return fail('"content" is required for create');
         if (content !== undefined && !content.trim()) return fail('content must not be empty');
         if (text.trim().length > 4000) return fail('content must be at most 4000 characters');
-        if (['get', 'update', 'complete'].includes(action) && !taskId.trim()) return fail('"task_id" is required for get, update and complete');
+        if (['get', 'update', 'complete', 'add_attachment', 'delete'].includes(action) && !taskId.trim()) return fail(`"task_id" is required for ${action}`);
         let handler: ProjectTasksToolHandler;
         let project: ProjectTaskProject | undefined;
         if (selector) {
           const reference = typeof input.project === 'string' ? input.project.trim() : '';
-          if (!reference) return fail('"project" is required; use an exact name or list_projects to find its id');
+          if (!reference) return fail('"project" is required and must be an exact project name or id');
           const selected = await selector.resolveProject(reference);
           if (!selected.ok) return { content: JSON.stringify(selected), isError: true };
           handler = selected.handler;
@@ -190,18 +206,28 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
         } else {
           handler = source as ProjectTasksToolHandler;
         }
-        const result = (r: { ok: boolean }): ToolResult => ({
-          content: JSON.stringify({ ...r, ...(project ? { project } : {}) }),
-          isError: !r.ok,
-        });
+        const result = (r: { ok: boolean; ignored_fields?: string[] }): ToolResult => {
+          const allIgnoredFields = [...new Set([...ignoredFields, ...(r.ignored_fields || [])])].sort();
+          return {
+            content: JSON.stringify({ ...r, ...(project ? { project } : {}), ...(allIgnoredFields.length ? { ignored_fields: allIgnoredFields } : {}) }),
+            isError: !r.ok,
+          };
+        };
         switch (action) {
+          case 'delete': return handler.delete
+            ? result(await handler.delete(taskId))
+            : fail('task deletion is unavailable in this host');
+          case 'add_attachment': return handler.addAttachment
+            ? result(await handler.addAttachment(taskId, input.source_path as string))
+            : fail('task attachments are unavailable in this host');
           case 'list': {
             const r = await handler.list({ offset: input.offset as number | undefined, limit: input.limit as number | undefined, status });
             return result(r);
           }
           case 'get': return result(await handler.get(taskId));
           case 'create': {
-            const r = await handler.create({ ...(content !== undefined ? { content } : { title, detail }), owner, status });
+            const r = await handler.create({ ...(content !== undefined ? { content } : { title, detail }), owner,
+              status });
             const receipt = r.ok
               ? {
                 ...r,
@@ -211,7 +237,8 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
             return result(receipt);
           }
           case 'update': {
-            const r = await handler.update(taskId, { ...(content !== undefined ? { content } : { title, detail }), status, owner, result_ref: resultRef });
+            const r = await handler.update(taskId, { ...(content !== undefined ? { content } : { title, detail }), status, owner,
+              result_ref: resultRef });
             return result(r);
           }
           case 'complete': {

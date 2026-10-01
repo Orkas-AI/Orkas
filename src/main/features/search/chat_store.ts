@@ -28,9 +28,9 @@
  * sampled terms and identical document lengths).
  *
  * Concurrency: better-sqlite3 is synchronous and every mutation here is a
- * single `db.transaction(...)`. The indexer admits exactly one writer: main
- * for live upserts, or a worker for reconciliation. WAL readers remain usable
- * during rebuilds; data_version invalidates their cached scoring aggregates.
+ * single `db.transaction(...)`. The indexer admits one serialized worker per
+ * account for live writes and reconciliation. WAL readers remain usable during
+ * writes; data_version invalidates their cached scoring aggregates.
  */
 
 import * as fs from 'node:fs';
@@ -267,6 +267,25 @@ export function upsertDoc(uid: string, doc: ChatDocInput): void {
   });
   run();
   handle.stats = null;
+}
+
+/** A crash must never certify a message whose postings did not commit. */
+export function writeLiveMessage(uid: string, cid: string, msgIndex: number,
+  doc: ChatDocInput | undefined, mark: ChatFileWatermark | undefined,
+  previous?: { size: number; mtime: number }): boolean {
+  const { db } = handleFor(uid);
+  return db.transaction(() => {
+    const known = readFileWatermark(uid, cid);
+    const contiguous = (known?.next ?? 0) === msgIndex
+      && (!previous || (known ? known.size === previous.size && known.mtime === previous.mtime : previous.size === 0));
+    if (doc) upsertDoc(uid, doc);
+    if (contiguous && mark) setFileWatermark(uid, cid, mark);
+    else {
+      dropFileWatermark(uid, cid);
+      writeSourceStamp(uid, undefined);
+    }
+    return contiguous && !!mark;
+  })();
 }
 
 /** Drop every document and posting of one conversation, plus its watermark. */
@@ -540,15 +559,18 @@ export function indexedConversationIds(uid: string): Set<string> {
 
 // ── Lifecycle ────────────────────────────────────────────────────────────
 
-/**
- * Reclaim free pages after a bulk rebuild. A migration rewrites every
- * conversation, which leaves the file roughly 40% larger than the pages it
- * actually uses (measured 259 MB against 185 MB of live pages on a 230 MB
- * corpus). Only worth running after a full reconcile, never per append.
- */
+/** Reclaim space after a rebuild only when enough of the database is empty.
+ * Small reconciliations need their index immediately, but rewriting the whole
+ * database to reclaim a few pages costs more I/O than leaving them reusable. */
 export function compact(uid: string): void {
   const handle = handleFor(uid);
   try {
+    const freePages = handle.db.pragma('freelist_count', { simple: true }) as number;
+    const pages = handle.db.pragma('page_count', { simple: true }) as number;
+    const pageSize = handle.db.pragma('page_size', { simple: true }) as number;
+    // The migration probe had 74 MB free in a 259 MB database. Both limits
+    // avoid a whole-file rewrite for routine edits and still reclaim that case.
+    if (freePages * pageSize < 32 * 1024 * 1024 || freePages * 4 < pages) return;
     handle.db.pragma('wal_checkpoint(TRUNCATE)');
     handle.db.exec('VACUUM');
   } catch (err) {

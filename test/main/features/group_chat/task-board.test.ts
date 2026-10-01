@@ -59,6 +59,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await (await board()).flushBoards();
   (await board())._resetForTest();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });

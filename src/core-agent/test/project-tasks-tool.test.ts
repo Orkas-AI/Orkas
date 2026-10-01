@@ -17,6 +17,43 @@ function stubHandler(): { handler: ProjectTasksToolHandler; calls: any[] } {
 }
 
 describe('todo_tasks tool', () => {
+  it('deletes only an explicitly identified task in the writable scope', async () => {
+    const { handler } = stubHandler();
+    const deleted: string[] = [];
+    handler.delete = async (id) => { deleted.push(id); return { ok: true, task_id: id, deleted: true }; };
+    const tool = createProjectTasksTool(handler);
+    for (const input of [{ action: 'delete' }, { action: 'delete', task_id: '' },
+      { action: 'delete', task_id: 't_a', project: 'foreign' }]) {
+      expect((await tool.execute(input, ctx)).isError).toBe(true);
+    }
+    expect((await createProjectTasksTool(handler, { readOnly: true }).execute({ action: 'delete', task_id: 't_a' }, ctx)).isError).toBe(true);
+    expect(deleted).toEqual([]);
+    const result = await tool.execute({ action: 'delete', task_id: 't_a' }, ctx);
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content)).toEqual({ ok: true, task_id: 't_a', deleted: true });
+    expect(deleted).toEqual(['t_a']);
+  });
+
+  it('adds a file to an existing task and rejects missing operands, foreign scope and read-only writes', async () => {
+    const { handler } = stubHandler();
+    const calls: unknown[] = [];
+    Object.assign(handler, { addAttachment: async (id: string, source: string) => {
+      calls.push([id, source]);
+      return { ok: true, task: { id, content: 'Review document', status: 'todo', attachments: ['brief.txt'] } };
+    } });
+    const tool = createProjectTasksTool(handler);
+    const args = { action: 'add_attachment', task_id: 't_a', source_path: '/workspace/brief.txt' };
+    const added = await tool.execute(args, ctx);
+    expect(added.isError).toBeFalsy();
+    expect(JSON.parse(added.content).task.attachments).toEqual(['brief.txt']);
+    expect(calls).toEqual([['t_a', '/workspace/brief.txt']]);
+    for (const bad of [{ ...args, task_id: '' }, { ...args, source_path: '' },
+      { ...args, source_path: 42 }, { ...args, project: 'foreign' }]) {
+      expect((await tool.execute(bad, ctx)).isError).toBe(true);
+    }
+    expect((await createProjectTasksTool(handler, { readOnly: true }).execute(args, ctx)).isError).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
   it('accepts paged status queries and read-only detail retrieval, rejecting invalid query fields before IO', async () => {
     const { handler, calls } = stubHandler();
     const tool = createProjectTasksTool(handler, { readOnly: true });
@@ -30,7 +67,6 @@ describe('todo_tasks tool', () => {
       { action: 'list', limit: 0 }, { action: 'list', limit: 51 },
       { action: 'list', limit: '20' }, { action: 'list', status: 'blocked' },
       { action: 'get' }, { action: 'get', task_id: ' ' },
- { action: 'list', task_id: 't_a' },
     ]) expect((await tool.execute(args, ctx)).isError).toBe(true);
     expect(calls).toEqual([]);
   });
@@ -41,6 +77,51 @@ describe('todo_tasks tool', () => {
     expect(res.isError).toBeFalsy();
     expect(calls[0][0]).toBe('list');
     expect(res.content).toContain('t_a');
+    expect(JSON.parse(res.content)).not.toHaveProperty('ignored_fields');
+  });
+
+  it('reports other known fields omitted by the selected action without changing its effective inputs', async () => {
+    const { handler, calls } = stubHandler();
+    const tool = createProjectTasksTool(handler);
+    const result = await tool.execute({ action: 'list', status: 'review', content: 'private unused work', owner: 'Writer' }, ctx);
+    expect(result.isError).toBeFalsy();
+    expect(JSON.parse(result.content).ignored_fields).toEqual(['content', 'owner']);
+    expect(result.content).not.toContain('private unused work');
+    expect(calls).toEqual([['list', { offset: undefined, limit: undefined, status: 'review' }]]);
+  });
+
+  it('ignores task_id on list/create, reports only its name, and preserves effective arguments', async () => {
+    for (const task_id of ['x', '.', 't_a', '', ' ', null, 123, { private: 'unused' }]) {
+      const { handler, calls } = stubHandler();
+      const tool = createProjectTasksTool(handler);
+      const listed = await tool.execute({ action: 'list', task_id, status: 'review', offset: 2, limit: 3 }, ctx);
+      expect(listed.isError).toBeFalsy();
+      expect(JSON.parse(listed.content)).toMatchObject({ ok: true, ignored_fields: ['task_id'], tasks: [{ id: 't_a' }] });
+      const created = await tool.execute({ action: 'create', task_id, content: 'New work', owner: 'Writer', status: 'progress' }, ctx);
+      expect(created.isError).toBeFalsy();
+      expect(JSON.parse(created.content)).toMatchObject({
+        ok: true, ignored_fields: ['task_id'], outcome: 'task_created', task: { id: 't_new' },
+      });
+      expect(calls).toEqual([
+        ['list', { status: 'review', offset: 2, limit: 3 }],
+        ['create', { content: 'New work', owner: 'Writer', status: 'progress' }],
+      ]);
+    }
+  });
+
+  it('does not let an ignored task_id bypass scope, input validation or handler failures', async () => {
+    const { handler, calls } = stubHandler();
+    const tool = createProjectTasksTool(handler, { globalScope: true });
+    for (const input of [
+      { action: 'list', project: 'foreign' }, { action: 'create', project: 'foreign', content: 'Work' },
+      { action: 'list', status: 'invalid' }, { action: 'list', offset: -1 },
+      { action: 'create' }, { action: 'create', content: 'Work', unknown: true },
+    ]) expect((await tool.execute({ ...input, task_id: 'x' }, ctx)).isError).toBe(true);
+    expect(calls).toEqual([]);
+    handler.create = async () => ({ ok: false, error: 'owner_not_bound' });
+    const failed = await tool.execute({ action: 'create', task_id: 'x', content: 'Work' }, ctx);
+    expect(failed.isError).toBe(true);
+    expect(JSON.parse(failed.content)).toEqual({ ok: false, error: 'owner_not_bound', ignored_fields: ['task_id'] });
   });
 
   it('keeps backlog selection and untrusted-data safety visible without assuming a preloaded list', () => {
@@ -61,7 +142,7 @@ describe('todo_tasks tool', () => {
     const schema = tool.inputSchema as any;
     expect(schema.additionalProperties).toBe(false);
     expect(schema.oneOf).toBeUndefined();
-    expect(schema.properties.action.description).toContain('Omit unrelated fields');
+    expect(schema.properties.action.description).toContain('ignored_fields');
 
     const result = await tool.execute({ action: 'complete', task_id: 't_9', status: 'done' }, ctx);
     expect(result.isError).toBeFalsy();
@@ -95,12 +176,13 @@ describe('todo_tasks tool', () => {
       alreadyExists: true,
     });
     const res = await createProjectTasksTool(handler).execute(
-      { action: 'create', content: 'do X' }, ctx);
+      { action: 'create', content: 'do X', task_id: 'x' }, ctx);
     expect(res.isError).toBeFalsy();
     expect(JSON.parse(res.content)).toMatchObject({
       ok: true,
       alreadyExists: true,
       outcome: 'existing_task_reused',
+      ignored_fields: ['task_id'],
       task: { id: 't_existing' },
     });
   });
@@ -116,11 +198,17 @@ describe('todo_tasks tool', () => {
     });
   });
 
-  it('update and complete require task_id', async () => {
-    const { handler } = stubHandler();
+  it('reports the failing action and constraint without prescribing another action', async () => {
+    const { handler, calls } = stubHandler();
     const tool = createProjectTasksTool(handler);
-    expect((await tool.execute({ action: 'update', status: 'done' }, ctx)).isError).toBe(true);
-    expect((await tool.execute({ action: 'complete' }, ctx)).isError).toBe(true);
+    for (const action of ['get', 'update', 'complete']) {
+      const result = await tool.execute({ action, ...(action === 'update' ? { status: 'done' } : {}) }, ctx);
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content).error).toBe(`"task_id" is required for ${action}`);
+    }
+    const conflict = await tool.execute({ action: 'complete', task_id: 't_a', status: 'progress' }, ctx);
+    expect(JSON.parse(conflict.content).error).toBe('complete conflicts with status; only done is valid');
+    expect(calls).toEqual([]);
   });
 
   it('complete forwards task_id + result_ref', async () => {
@@ -167,7 +255,7 @@ describe('todo_tasks tool › task management by named Agents and CLI executors'
     const { handler, calls } = stubHandler();
     const tool = createProjectTasksTool(handler);
     const schema = tool.inputSchema as any;
-    expect(schema.properties.action.enum).toEqual(['list', 'get', 'create', 'update', 'complete']);
+    expect(schema.properties.action.enum).toEqual(['list', 'get', 'create', 'update', 'complete', 'add_attachment', 'delete']);
     expect(schema.properties).not.toHaveProperty('project');
     for (const field of ['content', 'owner']) expect(schema.properties).toHaveProperty(field);
     expect((await tool.execute({ action: 'update', task_id: 't_1', status: 'review', result_ref: 'artifact-1' }, ctx)).isError).toBeFalsy();
@@ -228,7 +316,7 @@ describe('todo_tasks tool › read-only workers', () => {
   it('commander (default, readOnly omitted) keeps full write access', async () => {
     const { handler, calls } = stubHandler();
     const tool = createProjectTasksTool(handler);
-    expect((tool.inputSchema as any).properties.action.enum).toEqual(['list', 'get', 'create', 'update', 'complete']);
+    expect((tool.inputSchema as any).properties.action.enum).toEqual(['list', 'get', 'create', 'update', 'complete', 'add_attachment', 'delete']);
     const res = await tool.execute({ action: 'create', content: 'do X' }, ctx);
     expect(res.isError).toBeFalsy();
     expect(calls[0][0]).toBe('create');
@@ -251,11 +339,15 @@ describe('todo_tasks tool › explicit project selection', () => {
     expect((tool.inputSchema as any).properties.action.description).not.toMatch(/already injected/i);
     const discovery = await tool.execute({ action: 'list_projects' }, ctx);
     expect(JSON.parse(discovery.content)).toEqual({ ok: true, projects: [project] });
+    const redundantDiscovery = await tool.execute({ action: 'list_projects', content: 'unused' }, ctx);
+    expect(JSON.parse(redundantDiscovery.content)).toEqual({
+      ok: true, projects: [project], ignored_fields: ['content'],
+    });
     expect(references).toEqual([]);
-    const created = await tool.execute({ action: 'create', project: 'Launch', content: 'Ship it' }, ctx);
+    const created = await tool.execute({ action: 'create', project: 'Launch', content: 'Ship it', task_id: 'x' }, ctx);
     expect(references).toEqual(['Launch']);
     expect(JSON.parse(created.content)).toMatchObject({
-      ok: true, project, outcome: 'task_created', task: { content: 'Ship it' },
+      ok: true, project, outcome: 'task_created', task: { content: 'Ship it' }, ignored_fields: ['task_id'],
     });
     expect(calls).toHaveLength(1);
   });
@@ -349,7 +441,6 @@ it('validates only effective task parameters, preserving the bound target', asyn
   const tool = createProjectTasksTool(handler);
   expect((await tool.execute({ action: 'get', task_id: 't_a', limit: 'unused', content: {} }, ctx)).isError).toBeFalsy();
   expect(calls).toEqual([['get', 't_a']]);
-  expect((await tool.execute({ action: 'create', task_id: 't_a', content: 'new' }, ctx)).isError).toBe(true);
   expect((await tool.execute({ action: 'complete', task_id: 't_a', project: 'foreign' }, ctx)).isError).toBe(true);
   expect(calls).toHaveLength(1);
 });

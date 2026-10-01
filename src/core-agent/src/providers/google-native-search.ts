@@ -5,8 +5,9 @@
  */
 import { FunctionCallingConfigMode, GoogleGenAI, type GenerateContentParameters, type Part, type ThinkingLevel } from '@google/genai';
 import { convertMessages, convertTools, mapStopReason, resolveGoogleThinkingLevel } from '@earendil-works/pi-ai/api/google-shared';
+import { normalizeContext } from '@earendil-works/pi-ai/utils/transcript';
 import { sanitizeSurrogates } from '@earendil-works/pi-ai/utils/sanitize-unicode';
-import type { Model, Api, Context, AssistantMessage, AssistantMessageEvent } from '@earendil-works/pi-ai/compat';
+import type { Model, Api, Context, AssistantMessage, AssistantMessageEvent, JsonObject } from '@earendil-works/pi-ai/compat';
 import type { GoogleNativeReplay } from '../shared/types.js';
 
 export type GoogleReplayMessage = AssistantMessage & { googleNativeReplay?: GoogleNativeReplay };
@@ -39,11 +40,11 @@ export function hasGoogleNativeReplay(context: Context, model: Model<Api>): bool
 }
 
 function contentsWithReplay(model: GoogleModel, context: Context) {
-  const contents = convertMessages(model, context);
+  const contents = convertMessages(model, normalizeContext(context));
   const assistants = context.messages.filter(m => m.role === 'assistant');
   // The canonical serializer may omit empty assistant messages. Mirror that
   // selection through its exported converter instead of indexing raw history.
-  const rendered = assistants.filter(m => convertMessages(model, { messages: [m] }).some(c => c.role === 'model'));
+  const rendered = assistants.filter(m => convertMessages(model, normalizeContext({ messages: [m] })).some(c => c.role === 'model'));
   const nativeModels = contents.filter(c => c.role === 'model');
   if (nativeModels.length !== rendered.length) throw new Error('Google history projection mismatch');
   const originalIds = new Map<string, string>();
@@ -147,7 +148,7 @@ export async function* streamGoogleNativeSearch(modelInput: Model<Api>, context:
         // one would break the signed native context circulated next round.
         if (!call.id || !call.name || callIds.has(call.id)) throw new Error('Invalid Google function call');
         callIds.add(call.id);
-        const toolCall = { type: 'toolCall' as const, id: call.id, name: call.name, arguments: call.args ?? {},
+        const toolCall = { type: 'toolCall' as const, id: call.id, name: call.name, arguments: (call.args ?? {}) as JsonObject,
           ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}) };
         const contentIndex = output.content.length;
         output.content.push(toolCall);

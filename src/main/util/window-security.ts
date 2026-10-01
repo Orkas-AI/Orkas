@@ -155,11 +155,34 @@ interface GuardedWebContents {
 
 export const HTML_PREVIEW_CSP = webContentCsp('chat-media://local');
 
-/** Preserve streaming and local-file authorization while allowing Web resources. */
-export function withHtmlPreviewPolicy(response: Response): Response {
+/** Sandbox flags of the file viewer's HTML iframe (`chat-file-viewer.js`).
+ *  The page gets an opaque origin: no cookies, storage or host access. */
+export const HTML_PREVIEW_SANDBOX_FLAGS = 'allow-scripts allow-forms allow-downloads allow-popups allow-modals';
+
+/** Preserve streaming and local-file authorization while allowing Web resources.
+ *  `sandboxDocument` applies the viewer's iframe sandbox to a document that is
+ *  rendered top-level instead, so a preview check sees the same restrictions. */
+export function withHtmlPreviewPolicy(response: Response, options: { sandboxDocument?: boolean } = {}): Response {
   const headers = new Headers(response.headers);
-  headers.set('Content-Security-Policy', HTML_PREVIEW_CSP);
+  headers.set(
+    'Content-Security-Policy',
+    options.sandboxDocument ? `${HTML_PREVIEW_CSP}; sandbox ${HTML_PREVIEW_SANDBOX_FLAGS}` : HTML_PREVIEW_CSP,
+  );
   headers.set('Referrer-Policy', 'no-referrer');
+  headers.set('X-Content-Type-Options', 'nosniff');
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+/** Same-folder assets of a previewed page. The page runs from an opaque
+ *  origin, so fonts, module scripts and fetch() need an explicit CORS grant;
+ *  what may be served at all is decided by the caller's root check. */
+export function withHtmlPreviewAssetPolicy(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set('Access-Control-Allow-Origin', '*');
   headers.set('X-Content-Type-Options', 'nosniff');
   return new Response(response.body, {
     status: response.status,

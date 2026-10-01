@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -34,6 +34,8 @@ class FakeClassList {
 
 class FakeElement {
   disabled = false;
+  hidden = false;
+  textContent = '';
   className = '';
   id = '';
   value = '';
@@ -69,6 +71,12 @@ class FakeElement {
       const input = new FakeElement('input', this.ownerDocument);
       input.className = 'ui-dialog-input';
       this.appendChild(input);
+    }
+    if (value.includes('class="ui-dialog-error"')) {
+      const error = new FakeElement('div', this.ownerDocument);
+      error.className = 'ui-dialog-error';
+      error.hidden = true;
+      this.appendChild(error);
     }
   }
 
@@ -132,6 +140,9 @@ class FakeElement {
   }
 
   querySelector(selector: string): FakeElement | null {
+    if (selector === '.ui-dialog-error') {
+      return this.descendants().find((element) => element.classList.contains('ui-dialog-error')) || null;
+    }
     if (selector === '.ui-dialog-input') {
       return this.descendants().find((element) => element.classList.contains('ui-dialog-input')) || null;
     }
@@ -214,6 +225,7 @@ function loadDialogs() {
     t: (key: string) => ({
       'common.cancel': 'Cancel',
       'common.confirm': 'Confirm',
+      'common.processing': 'Processing…',
     } as Record<string, string>)[key] || key,
     escapeHtml: (value: unknown) => String(value ?? '')
       .replaceAll('&', '&amp;')
@@ -241,6 +253,50 @@ function overlays(ctx: any): FakeElement[] {
 }
 
 describe('shared renderer dialogs', () => {
+  it('keeps an async danger action visible and prevents duplicate confirmation or dismissal until it succeeds', async () => {
+    const ctx = loadDialogs();
+    let complete!: () => void;
+    const action = vi.fn(() => new Promise<void>((resolve) => { complete = resolve; }));
+    const result = ctx.uiConfirmDanger({ title: 'End sharing', onConfirm: action, errorMessage: 'Please retry.' });
+    const overlay = overlays(ctx)[0];
+    const ok = overlay.querySelector('[data-act="ok"]')!;
+    const cancel = overlay.querySelector('[data-act="cancel"]')!;
+    ok.click();
+    expect(ok.textContent).toBe('Processing…');
+    expect(ok.classList.contains('is-loading')).toBe(true);
+    expect(ok.attributes.get('aria-busy')).toBe('true');
+    expect(cancel.disabled).toBe(true);
+    ok.click();
+    cancel.click();
+    ctx._document.dispatchKey({ key: 'Escape' });
+    expect(action).toHaveBeenCalledTimes(1);
+    expect(overlays(ctx)).toHaveLength(1);
+    complete();
+    await expect(result).resolves.toBe(true);
+    expect(overlays(ctx)).toHaveLength(0);
+  });
+
+  it.each(['retry', 'cancel'])('keeps a failed danger action in the same dialog and allows %s', async (recovery) => {
+    const ctx = loadDialogs();
+    const action = vi.fn().mockRejectedValueOnce(new Error('private transport details')).mockResolvedValueOnce(undefined);
+    const result = ctx.uiConfirmDanger({ dangerLabel: 'End sharing', onConfirm: action, errorMessage: 'Could not end sharing. Please retry.' });
+    const overlay = overlays(ctx)[0];
+    const ok = overlay.querySelector('[data-act="ok"]')!;
+    ok.click();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(overlays(ctx)).toEqual([overlay]);
+    const error = overlay.querySelector('.ui-dialog-error')!;
+    expect(error.hidden).toBe(false);
+    expect(error.textContent).toBe('Could not end sharing. Please retry.');
+    expect(ok.textContent).toBe('End sharing');
+    expect(ok.disabled).toBe(false);
+    expect(ok.classList.contains('is-loading')).toBe(false);
+    if (recovery === 'retry') ok.click();
+    else overlay.querySelector('[data-act="cancel"]')!.click();
+    await expect(result).resolves.toBe(recovery === 'retry');
+    expect(action).toHaveBeenCalledTimes(recovery === 'retry' ? 2 : 1);
+  });
+
   it('lets a user select and deselect multiple choices, committing only on explicit confirmation', async () => {
     const ctx = loadDialogs();
     const result = ctx.uiChoice({ title: 'Checks', multiple: true, choices: [{ id: 'unit', label: 'Unit' }, { id: 'integration', label: 'Integration' }] });

@@ -123,7 +123,7 @@ test('shows preparation before full results, searches partial history, and resum
   } finally { await app.dispose(); }
 });
 
-test('runs rebuild and snippet workers from an ASAR with the shipped dependency layout', async ({}, testInfo) => {
+test('runs rebuild, live indexing and snippet workers from an ASAR with the shipped dependency layout', async ({}, testInfo) => {
   const app = new OrkasTestApp(testInfo, { configuredModel: false });
   try {
     const source = path.join(app.root, 'package-source');
@@ -169,6 +169,10 @@ test('runs rebuild and snippet workers from an ASAR with the shipped dependency 
       let snippetWorker: import('node:worker_threads').Worker | undefined;
       try {
         const batch = await worker.rebuildBatch({ file, fileKey: 'source', mtime: stat.mtimeMs, size: stat.size });
+        const storage = require(`${input.sourceRoot}/src/main/storage.ts`);
+        const appended = await storage.appendJsonlAtomic(file, { from: 'assistant', text: 'packagedlivemarker', ts: 't2' }, true);
+        const liveComplete = await worker.indexMessage({ cid: 'source', msgIndex: appended.msgIndex, source: appended.source });
+        await worker.compact();
         snippetWorker = new Worker(`${input.archive}/src/main/features/search/chat-snippet-entry.js`, {
           execArgv: [], env: { ...process.env },
         });
@@ -178,7 +182,7 @@ test('runs rebuild and snippet workers from an ASAR with the shipped dependency 
           snippetWorker.once('message', (message: any) => { clearTimeout(timeout); resolve(message.rows[0]?.[1]?.snippet); });
           snippetWorker.postMessage({ id: 1, file, indexes: [0], tokens: ['packagedmarker'] });
         });
-        return { complete: batch.complete, count: store.docCount('packaged-fixture'),
+        return { complete: batch.complete, liveComplete, liveMatches: store.postingsFor('packaged-fixture', 'packagedlivemarker').length, count: store.docCount('packaged-fixture'),
           matches: store.postingsFor('packaged-fixture', 'packagedmarker').length, snippet };
       } finally {
         await snippetWorker?.terminate();
@@ -188,6 +192,6 @@ test('runs rebuild and snippet workers from an ASAR with the shipped dependency 
         else process.env.ESBUILD_BINARY_PATH = old;
       }
     }, { archive, esbuild, sourceRoot: pcRoot });
-    expect(result).toEqual({ complete: true, count: 1, matches: 1, snippet: 'packagedmarker' });
+    expect(result).toEqual({ complete: true, liveComplete: true, liveMatches: 1, count: 2, matches: 1, snippet: 'packagedmarker' });
   } finally { await app.dispose(); }
 });

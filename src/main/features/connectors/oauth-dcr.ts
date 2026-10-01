@@ -1,10 +1,10 @@
 /**
- * MCP-spec OAuth (Dynamic Client Registration) client.
+ * MCP-spec OAuth client (Client ID Metadata Document or Dynamic Client Registration).
  *
  * For providers that host their own OAuth authorization server per the MCP authorization spec
  * (Notion, Atlassian, Cloudflare suite, …). Orkas has no pre-registered OAuth App at the
- * provider — PC self-registers at first connect via DCR (RFC 7591) and drives the initial
- * OAuth handshake from the PC side.
+ * provider — PC uses a public Client ID Metadata Document when available, otherwise
+ * self-registers via DCR (RFC 7591), then drives OAuth from the PC side.
  *
  * The Server-bridge in `oauth.ts` handles a different class of providers (GitHub Copilot MCP
  * today) where Orkas registered an OAuth App and Server holds the secret. The two flows live
@@ -24,6 +24,8 @@
 import * as crypto from 'node:crypto';
 import { URL, URLSearchParams } from 'node:url';
 import { shell } from 'electron';
+import { buildDiscoveryUrls, extractWWWAuthenticateParams } from '@modelcontextprotocol/sdk/client/auth.js';
+import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js';
 
 import { accountApiBase, tokenStore } from './_server_bridge';
 import { withCommonHeaders } from '../api_common';
@@ -54,6 +56,9 @@ interface PendingDcrFlow {
   kind: 'dcr';
   callbackStarted?: boolean;
   catalogId: string;
+  storeLocally?: boolean;
+  issuer?: string;
+  issuerRequired?: boolean;
   attemptId?: string;
   state: string;            // CSRF token — match incoming deep link
   codeVerifier: string;     // PKCE
@@ -73,7 +78,8 @@ interface PendingLocalApiFlow {
   state: string;
   relayBase: string;
   attemptId?: string;
-  exchange: (code: string) => Promise<Record<string, unknown>>;
+  controller: AbortController;
+  exchange: (code: string, signal: AbortSignal) => Promise<Record<string, unknown>>;
   resolve: (credentials: Record<string, unknown>) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
@@ -88,14 +94,15 @@ export function cancelDcrOAuth(): boolean {
   const pending = _pending;
   _pending = null;
   clearTimeout(pending.timer);
+  if (pending.kind === 'local_api') pending.controller.abort();
   pending.reject(Object.assign(new Error('Authorization cancelled'), { code: 'user_cancelled' }));
   return true;
 }
 
 export function startLocalApiBrowserOAuth(
   catalogId: string,
-  buildAuthorizeUrl: (state: string, redirectUri: string) => string,
-  exchange: (code: string) => Promise<Record<string, unknown>>,
+  buildAuthorizeUrl: (state: string, redirectUri: string, signal: AbortSignal) => string | Promise<string>,
+  exchange: (code: string, signal: AbortSignal) => Promise<Record<string, unknown>>,
   opts: { attemptId?: string } = {},
 ): Promise<Record<string, unknown>> {
   return _startLocalApiAuthorization(catalogId, exchange, opts, buildAuthorizeUrl);
@@ -112,16 +119,16 @@ export function startLocalApiCredentialAuthorization(
 
 function _startLocalApiAuthorization(
   catalogId: string,
-  exchange: (code: string) => Promise<Record<string, unknown>>,
+  exchange: (code: string, signal: AbortSignal) => Promise<Record<string, unknown>>,
   opts: { attemptId?: string },
-  buildAuthorizeUrl?: (state: string, redirectUri: string) => string,
+  buildAuthorizeUrl?: (state: string, redirectUri: string, signal: AbortSignal) => string | Promise<string>,
 ): Promise<Record<string, unknown>> {
   cancelDcrOAuth();
   const state = _localizedState();
-  const authorizeUrl = buildAuthorizeUrl?.(state, LOCAL_API_REDIRECT_URI);
   return new Promise((resolve, reject) => {
     const pending: PendingLocalApiFlow = {
       kind: 'local_api', catalogId, state, relayBase: 'https://orkas.ai/api', exchange, resolve, reject,
+      controller: new AbortController(),
       ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
       timer: setTimeout(() => {
         if (_pending === pending) _cancelPending('Authorization timed out; connect again');
@@ -129,12 +136,12 @@ function _startLocalApiAuthorization(
     };
     pending.timer.unref?.();
     _pending = pending;
-    if (!authorizeUrl) {
+    if (!buildAuthorizeUrl) {
       pending.callbackStarted = true;
       if (opts.attemptId) broadcastOAuthConnectProgress({ attempt_id: opts.attemptId, catalog_id: catalogId });
       Promise.resolve().then(() => {
         if (_pending !== pending) throw new Error('Authorization cancelled');
-        return exchange('');
+        return exchange('', pending.controller.signal);
       }).then((credentials) => {
         if (_pending !== pending) return;
         _pending = null;
@@ -148,9 +155,20 @@ function _startLocalApiAuthorization(
       });
       return;
     }
-    shell.openExternal(authorizeUrl).catch(() => {
-      if (_pending === pending) _cancelPending('Could not open the authorization page; connect again');
-    });
+    const open = (url: string) => {
+      if (_pending !== pending) return;
+      return shell.openExternal(url);
+    };
+    const failed = (error: unknown) => {
+      if (_pending !== pending) return;
+      log.warn('authorization page could not be prepared', { catalog_id: catalogId, ...logErrorSummary(error) });
+      _cancelPending('Could not open the authorization page; connect again');
+    };
+    try {
+      const url = buildAuthorizeUrl(state, LOCAL_API_REDIRECT_URI, pending.controller.signal);
+      if (typeof url === 'string') open(url)?.catch(failed);
+      else url.then(open).catch(failed);
+    } catch (error) { failed(error); }
   });
 }
 
@@ -159,6 +177,7 @@ function _cancelPending(reason: string): void {
   const p = _pending;
   _pending = null;
   clearTimeout(p.timer);
+  if (p.kind === 'local_api') p.controller.abort();
   p.reject(new Error(reason));
 }
 
@@ -170,6 +189,9 @@ interface ProtectedResourceMetadata {
 }
 
 interface AuthServerMetadata {
+  issuer?: string;
+  authorization_response_iss_parameter_supported?: boolean;
+  client_id_metadata_document_supported?: boolean;
   authorization_endpoint: string;
   token_endpoint: string;
   registration_endpoint?: string;
@@ -204,7 +226,7 @@ function _fetchDcr(label: string, url: string, init: RequestInit = {}): Promise<
 
 /** Fetch `<base>/.well-known/<name>`, falling back to root-level discovery if path-suffixed
  *  fails (per MCP authorization spec — providers can serve discovery at either location). */
-async function _fetchWellKnown<T>(mcpUrl: string, wellKnownName: string): Promise<T> {
+async function _fetchWellKnown<T>(mcpUrl: string, wellKnownName: string, strict = false): Promise<T> {
   const url = new URL(mcpUrl);
   // Path-suffixed first (e.g. https://mcp.notion.com/mcp/.well-known/oauth-protected-resource),
   // then root well-known with the MCP path appended (e.g. Atlassian's
@@ -217,7 +239,7 @@ async function _fetchWellKnown<T>(mcpUrl: string, wellKnownName: string): Promis
   let lastErr: Error | null = null;
   for (const cand of Array.from(new Set(candidates))) {
     try {
-      const r = await _fetchDcr(`DCR ${wellKnownName}`, cand);
+      const r = await _fetchDcr(`DCR ${wellKnownName}`, cand, strict ? { redirect: 'error' } : {});
       if (r.ok) return await r.json() as T;
       lastErr = new Error(`DCR ${wellKnownName} metadata HTTP ${r.status}`);
     } catch (err) {
@@ -227,11 +249,14 @@ async function _fetchWellKnown<T>(mcpUrl: string, wellKnownName: string): Promis
   throw lastErr || new Error(`failed to fetch ${wellKnownName}`);
 }
 
-async function _fetchAuthServerMetadata(authServer: string, mcpUrl: string): Promise<AuthServerMetadata> {
+async function _fetchAuthServerMetadata(authServer: string, mcpUrl: string, strict = false): Promise<AuthServerMetadata> {
   const url = new URL(authServer);
   const trimmed = url.pathname.replace(/\/+$/, '');
   const mcp = new URL(mcpUrl);
   const candidates = Array.from(new Set([
+    // For custom issuers, prefer the SDK's issuer-specific RFC 8414 and OIDC
+    // locations before a generic root document that may belong to another tenant.
+    ...(strict ? buildDiscoveryUrls(url).map(candidate => candidate.url.toString()) : []),
     ...(trimmed ? [`${url.origin}${trimmed}/.well-known/oauth-authorization-server`] : []),
     `${url.origin}/.well-known/oauth-authorization-server`,
     `${mcp.origin}/.well-known/oauth-authorization-server`,
@@ -240,7 +265,7 @@ async function _fetchAuthServerMetadata(authServer: string, mcpUrl: string): Pro
   for (const cand of candidates) {
     let r: Response;
     try {
-      r = await _fetchDcr('DCR auth server metadata', cand);
+      r = await _fetchDcr('DCR auth server metadata', cand, strict ? { redirect: 'error' } : {});
     } catch (err) {
       lastErr = _fmtFetchErr('DCR auth server metadata fetch failed', err);
       continue;
@@ -251,18 +276,79 @@ async function _fetchAuthServerMetadata(authServer: string, mcpUrl: string): Pro
   throw lastErr || new Error('failed to fetch auth server metadata');
 }
 
-async function _discoverAuthServer(mcpUrl: string): Promise<{ meta: AuthServerMetadata; resource: string }> {
-  const prm = await _fetchWellKnown<ProtectedResourceMetadata>(mcpUrl, 'oauth-protected-resource');
+/** Some MCP resources advertise a non-default PRM location only in the 401
+ * challenge. Probe with a standard initialize request without credentials;
+ * never follow redirects or treat an unprotected response as authorization. */
+async function _fetchChallengedResourceMetadata(mcpUrl: string): Promise<ProtectedResourceMetadata> {
+  const response = await _fetchDcr('MCP authorization challenge', mcpUrl, {
+    method: 'POST',
+    redirect: 'error',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+      protocolVersion: LATEST_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'orkas-pc', version: '0.1.0' },
+    } }),
+  });
+  try {
+    if (response.status !== 401) throw new Error('MCP server did not advertise OAuth resource metadata');
+    const resourceMetadataUrl = extractWWWAuthenticateParams(response).resourceMetadataUrl;
+    if (!resourceMetadataUrl) throw new Error('MCP authorization challenge lacks resource_metadata');
+    _validateCustomOAuthUrl(mcpUrl, resourceMetadataUrl.toString());
+    const metadataResponse = await _fetchDcr('MCP challenged resource metadata', resourceMetadataUrl.toString(), {
+      redirect: 'error',
+    });
+    if (!metadataResponse.ok) throw new Error(`MCP resource metadata HTTP ${metadataResponse.status}`);
+    return await metadataResponse.json() as ProtectedResourceMetadata;
+  } finally { await response.body?.cancel().catch(() => {}); }
+}
+
+async function _discoverAuthServer(mcpUrl: string, custom = false): Promise<{ meta: AuthServerMetadata; resource: string }> {
+  let prm: ProtectedResourceMetadata;
+  try {
+    prm = await _fetchWellKnown<ProtectedResourceMetadata>(mcpUrl, 'oauth-protected-resource', custom);
+  } catch (error) {
+    if (!custom) throw error;
+    prm = await _fetchChallengedResourceMetadata(mcpUrl);
+  }
   const authServer = prm.authorization_servers?.[0];
   if (!authServer) throw new Error('protected resource metadata missing authorization_servers');
+  if (custom) _validateCustomOAuthUrl(mcpUrl, authServer);
   // RFC 8707 resource indicator — the canonical resource URI from PRM. Required by the MCP
   // authorization spec on every authorize / token / refresh request, otherwise the issued
   // access_token isn't audience-bound to this MCP server and the server rejects it with
   // `invalid_token` at the first protected request. PRM is authoritative; fall back to
   // mcpUrl origin only when PRM omits the field (shouldn't happen per spec).
   const resource = Array.isArray(prm.resource) ? prm.resource[0] : prm.resource;
-  const meta = await _fetchAuthServerMetadata(authServer, mcpUrl);
+  const meta = await _fetchAuthServerMetadata(authServer, mcpUrl, custom);
+  if (custom && meta.issuer !== authServer) {
+    throw new Error('OAuth authorization server issuer mismatch');
+  }
   return { meta, resource: resource || new URL(mcpUrl).origin };
+}
+
+function _validateCustomOAuthUrl(mcpUrl: string, value: string): URL {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error('OAuth metadata contains invalid endpoint'); }
+  const host = new URL(mcpUrl).hostname;
+  const isLocal = (name: string) => ['localhost', '127.0.0.1', '[::1]'].includes(name)
+    || name.endsWith('.localhost');
+  if (url.username || url.password || url.hash || (url.protocol !== 'https:'
+    && !(url.protocol === 'http:' && isLocal(host) && isLocal(url.hostname)))) {
+    throw new Error('OAuth metadata contains insecure endpoint');
+  }
+  return url;
+}
+
+/** Custom-server metadata is untrusted, including every advertised OAuth endpoint. */
+function _validateCustomOAuthEndpoints(mcpUrl: string, meta: AuthServerMetadata, resource: string): void {
+  for (const value of [meta.authorization_endpoint, meta.token_endpoint, resource,
+    ...(meta.registration_endpoint ? [meta.registration_endpoint] : []),
+    ...(meta.issuer ? [meta.issuer] : [])]) {
+    if (typeof value !== 'string' || !value) throw new Error('OAuth metadata missing endpoint');
+    _validateCustomOAuthUrl(mcpUrl, value);
+  }
+  if (new URL(resource).origin !== new URL(mcpUrl).origin) {
+    throw new Error('OAuth resource does not match MCP server origin');
+  }
 }
 
 type DcrTokenAuthMethod = NonNullable<DcrClientCredentials['token_endpoint_auth_method']>;
@@ -311,17 +397,20 @@ async function _registerClient(
   registrationEndpoint: string,
   redirectUri: string,
   tokenEndpointAuthMethod: DcrTokenAuthMethod,
+  strict = false,
 ): Promise<{ client_id: string; client_secret?: string; token_endpoint_auth_method?: string }> {
   let r: Response;
   try {
     r = await _fetchDcr('DCR client registration', registrationEndpoint, {
       method: 'POST',
+      ...(strict ? { redirect: 'error' as const } : {}),
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({
         client_name: CLIENT_NAME,
         redirect_uris: [redirectUri],
         grant_types: ['authorization_code', 'refresh_token'],
         response_types: ['code'],
+        application_type: 'web',
         token_endpoint_auth_method: tokenEndpointAuthMethod,
       }),
     });
@@ -358,31 +447,54 @@ export async function startMcpDcrOAuth(
   if (!entry.transport_template || entry.transport_template.kind !== 'streamable-http') {
     throw new Error('DCR flow only supports streamable-http transports');
   }
+  return _startDcrOAuth(entry.id, entry.transport_template.url, entry.required_oauth_scopes || [], opts);
+}
+
+export async function startCustomMcpOAuth(
+  id: string,
+  mcpUrl: string,
+  opts: { attemptId?: string } = {},
+): Promise<{ grant: OAuthGrant; client: DcrClientCredentials }> {
+  return _startDcrOAuth(id, mcpUrl, [], opts, true);
+}
+
+async function _startDcrOAuth(
+  id: string,
+  mcpUrl: string,
+  scopes: string[],
+  opts: { attemptId?: string },
+  storeLocally = false,
+): Promise<{ grant: OAuthGrant; client: DcrClientCredentials }> {
   _cancelPending('superseded by a new DCR start');
   const generation = ++_startGeneration;
-
-  const mcpUrl = entry.transport_template.url;
-  log.info('DCR flow starting', { catalog_id: entry.id });
+  log.info('DCR flow starting', { catalog_id: storeLocally ? 'custom' : id });
 
   // Discover endpoints.
-  const { meta, resource } = await _discoverAuthServer(mcpUrl);
-  if (!meta.registration_endpoint) {
-    throw new Error(`provider ${entry.id} does not advertise registration_endpoint — DCR unsupported`);
+  const { meta, resource } = await _discoverAuthServer(mcpUrl, storeLocally);
+  if (storeLocally) _validateCustomOAuthEndpoints(mcpUrl, meta, resource);
+  if (storeLocally && meta.authorization_response_iss_parameter_supported && !meta.issuer) {
+    throw new Error('OAuth metadata missing issuer');
   }
-  const tokenEndpointAuthMethod = _chooseTokenAuthMethod(meta);
+  const redirectUri = `${accountApiBase().replace(/\/+$/, '')}/connectors/oauth/dcr-callback`;
+  const metadataUrl = `${accountApiBase().replace(/\/+$/, '')}/connectors/oauth/client-metadata`;
+  const useMetadata = storeLocally && meta.client_id_metadata_document_supported === true
+    && metadataUrl.startsWith('https://');
+  if (!useMetadata && !meta.registration_endpoint) throw new Error('provider does not support client metadata or DCR registration');
+  const tokenEndpointAuthMethod = useMetadata ? 'none' : _chooseTokenAuthMethod(meta);
   log.info('DCR endpoints discovered', {
-    catalog_id: entry.id,
-    has_registration_endpoint: true,
+    catalog_id: storeLocally ? 'custom' : id,
+    has_registration_endpoint: !!meta.registration_endpoint,
+    client_metadata: useMetadata,
     has_resource: !!resource,
     token_auth: tokenEndpointAuthMethod,
   });
 
-  // Register with the same Server environment that will exchange the callback.
-  // Source and packaged builds both use the production bridge.
-  const redirectUri = `${accountApiBase().replace(/\/+$/, '')}/connectors/oauth/dcr-callback`;
-  const registered = await _registerClient(meta.registration_endpoint, redirectUri, tokenEndpointAuthMethod);
+  // Source and packaged builds both use the production HTTPS callback bridge.
+  const registered = useMetadata
+    ? { client_id: metadataUrl, token_endpoint_auth_method: 'none' as const }
+    : await _registerClient(meta.registration_endpoint!, redirectUri, tokenEndpointAuthMethod, storeLocally);
   if (generation !== _startGeneration) throw Object.assign(new Error('Authorization superseded'), { code: 'user_cancelled' });
-  log.info('DCR registration done', { catalog_id: entry.id });
+  log.info('DCR registration done', { catalog_id: storeLocally ? 'custom' : id });
 
   const registeredTokenAuthMethod = registered.token_endpoint_auth_method === 'client_secret_basic'
     || registered.token_endpoint_auth_method === 'client_secret_post'
@@ -395,7 +507,7 @@ export async function startMcpDcrOAuth(
     token_endpoint_auth_method: registeredTokenAuthMethod,
     authorization_endpoint: meta.authorization_endpoint,
     token_endpoint: meta.token_endpoint,
-    registration_endpoint: meta.registration_endpoint,
+    ...(meta.registration_endpoint ? { registration_endpoint: meta.registration_endpoint } : {}),
     resource,
   };
 
@@ -410,10 +522,10 @@ export async function startMcpDcrOAuth(
   authUrl.searchParams.set('code_challenge', pkce.challenge);
   authUrl.searchParams.set('code_challenge_method', 'S256');
   authUrl.searchParams.set('resource', resource);
-  const requiredScopes = [...new Set(entry.required_oauth_scopes || [])];
+  const requiredScopes = [...new Set(scopes)];
   if (requiredScopes.length) authUrl.searchParams.set('scope', requiredScopes.join(' '));
 
-  log.info('opening DCR authorize URL', { catalog_id: entry.id });
+  log.info('opening DCR authorize URL', { catalog_id: storeLocally ? 'custom' : id });
 
   return new Promise<{ grant: OAuthGrant; client: DcrClientCredentials }>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -422,7 +534,10 @@ export async function startMcpDcrOAuth(
     timer.unref?.();
     const pending: PendingDcrFlow = {
       kind: 'dcr',
-      catalogId: entry.id,
+      catalogId: id,
+      storeLocally,
+      ...(meta.issuer ? { issuer: meta.issuer } : {}),
+      issuerRequired: meta.authorization_response_iss_parameter_supported === true,
       ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
       state,
       codeVerifier: pkce.verifier,
@@ -435,8 +550,8 @@ export async function startMcpDcrOAuth(
       timer,
     };
     _pending = pending;
-    shell.openExternal(authUrl.toString()).catch((err) => {
-      if (_pending === pending) _cancelPending(`failed to open browser: ${(err as Error).message}`);
+    shell.openExternal(authUrl.toString()).catch(() => {
+      if (_pending === pending) _cancelPending('failed to open authorization browser');
     });
   });
 }
@@ -472,7 +587,7 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
   // Pull {oauth_code, oauth_state} from Server. Server uses the namespaced keys (not bare
   // `code`/`state`) because `json_response` spreads data flat — a bare `code` key would
   // collide with the response status `code` field. See Server `api/connectors.py` comment.
-  let payload: { code: string; state: string };
+  let payload: { code: string; state: string; issuer?: string };
   try {
     const relayBase = pending.kind === 'local_api' ? pending.relayBase : accountApiBase();
     const res = await _fetchDcr('DCR exchange', `${relayBase}/connectors/oauth/dcr-exchange`, {
@@ -489,11 +604,13 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
       msg?: string;
       oauth_code?: string;
       oauth_state?: string;
+      oauth_issuer?: string;
     };
     if (body.code !== 0 || !body.oauth_code || !body.oauth_state) {
       throw new Error(body.msg || 'dcr exchange response invalid');
     }
-    payload = { code: body.oauth_code, state: body.oauth_state };
+    payload = { code: body.oauth_code, state: body.oauth_state,
+      ...(body.oauth_issuer ? { issuer: body.oauth_issuer } : {}) };
   } catch (err) {
     if (_pending === pending) _cancelPending(`dcr exchange failed: ${_fmtFetchErr('', err).message}`);
     return;
@@ -506,10 +623,15 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
     _cancelPending('state mismatch (CSRF guard)');
     return;
   }
+  if (pending.kind === 'dcr' && ((payload.issuer && payload.issuer !== pending.issuer)
+    || (pending.issuerRequired && !payload.issuer))) {
+    _cancelPending('authorization issuer mismatch');
+    return;
+  }
 
   if (pending.kind === 'local_api') {
     try {
-      const credentials = await pending.exchange(payload.code);
+      const credentials = await pending.exchange(payload.code, pending.controller.signal);
       if (_pending !== pending) return;
       _pending = null;
       clearTimeout(pending.timer);
@@ -534,6 +656,7 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
     });
     const res = await _fetchDcr('DCR token exchange', pending.client.token_endpoint, {
       method: 'POST',
+      ...(pending.storeLocally ? { redirect: 'error' as const } : {}),
       headers: tokenReq.headers,
       body: tokenReq.body.toString(),
     });
@@ -569,7 +692,7 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
     _pending = null;
     clearTimeout(pending.timer);
     log.info('DCR grant resolved', {
-      catalog_id: pending.catalogId,
+      catalog_id: pending.storeLocally ? 'custom' : pending.catalogId,
       has_refresh: !!localGrant.refresh_token,
       expires_in: tokens.expires_in ?? null,
     });
@@ -584,7 +707,7 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
 export async function refreshDcrIfStale(
   client: DcrClientCredentials,
   grant: OAuthGrant,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; strict?: boolean } = {},
 ): Promise<OAuthGrant> {
   if (!opts.force && !grant.expires_at) return grant;
   if (!opts.force && grant.expires_at - Date.now() > REFRESH_BUFFER_MS) return grant;
@@ -601,6 +724,7 @@ export async function refreshDcrIfStale(
   try {
     res = await _fetchDcr('DCR token refresh', client.token_endpoint, {
       method: 'POST',
+      ...(opts.strict ? { redirect: 'error' as const } : {}),
       headers: tokenReq.headers,
       body: tokenReq.body.toString(),
     });

@@ -1,3 +1,4 @@
+import { replayOrigin } from "../src/providers/replay-compatibility.js";
 import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -238,6 +239,7 @@ describe("output limit task recovery", () => {
   it.each(["text signature", "native replay"])("preserves %s message boundaries through recovery and later tool use", async (kind) => {
     const signedText = (value: string, id: string): MessageContent => ({
       type: "text", text: value,
+      replayOrigin: replayOrigin({ api: "google-generative-ai", provider: "google", id: "mock-model" }),
       ...(kind === "text signature"
         ? { textSignature: JSON.stringify({ id, phase: "commentary" }) }
         : { googleNativeReplay: { api: "google-generative-ai" as const, provider: "google", model: "mock-model", partsJson: JSON.stringify([{ text: value }]) } }),

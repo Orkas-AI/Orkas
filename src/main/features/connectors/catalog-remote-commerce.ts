@@ -107,21 +107,28 @@ const KLAVIYO_ALLOWED_TOOLS = [
   'get_form', 'get_forms', 'get_form_version', 'create_form', 'delete_form',
 ];
 
-// Exact action set in PayPal's official MCP tool reference on 2026-09-03. It includes the
-// complete merchant transaction loop; arbitrary API execution and any future upstream action are
-// denied by the shared catalog policy until separately reviewed.
+// Reviewed against PayPal agent-toolkit a3aa963 (2026-10-01). Remote discovery still
+// limits these names to the current token. update_product lacks an upstream dispatcher;
+// merchant insights is explicitly unavailable in the sandbox. Future names remain denied.
 const PAYPAL_ALLOWED_TOOLS = [
   'create_invoice', 'list_invoices', 'get_invoice', 'send_invoice', 'send_invoice_reminder',
   'cancel_sent_invoice', 'generate_invoice_qr_code',
   'create_order', 'get_order', 'pay_order', 'create_refund', 'get_refund',
   'list_disputes', 'get_dispute', 'accept_dispute_claim',
   'create_shipment_tracking', 'get_shipment_tracking',
-  'create_product', 'list_products', 'show_product_details', 'update_product',
+  'create_product', 'list_products', 'show_product_details',
   'create_subscription_plan', 'update_plan', 'list_subscription_plans',
   'show_subscription_plan_details', 'create_subscription', 'show_subscription_details',
   'update_subscription', 'cancel_subscription',
   'list_transactions',
+  'activate_recurring_series', 'cancel_invoice_auto_reminder', 'cancel_recurring_series',
+  'create_conditional_rules_for_invoice', 'create_recurring_series', 'delete_invoice',
+  'delete_recurring_series', 'generate_invoice_number', 'get_merchant_insights',
+  'get_recurring_series', 'record_payment_for_invoice', 'record_refund_for_invoice',
+  'search_invoicing', 'setup_invoice_auto_reminders', 'update_invoice_auto_reminder',
+  'update_invoicing', 'update_shipment_tracking',
 ];
+const PAYPAL_SANDBOX_ALLOWED_TOOLS = PAYPAL_ALLOWED_TOOLS.filter(name => name !== 'get_merchant_insights');
 
 type SensitiveOperation = 'money' | 'external_communication' | 'fulfillment'
   | 'consent' | 'bulk_or_automation' | 'business_record';
@@ -160,11 +167,19 @@ const PAYPAL_HIGH_IMPACT = new Map<string, SensitiveOperation>([
   ['create_subscription', 'money'],
   ['update_subscription', 'money'],
   ['create_shipment_tracking', 'fulfillment'],
+  ['update_shipment_tracking', 'fulfillment'],
+  ['activate_recurring_series', 'external_communication'],
+  ['setup_invoice_auto_reminders', 'external_communication'],
+  ['update_invoice_auto_reminder', 'external_communication'],
+  ['update_invoicing', 'external_communication'],
+  ['record_payment_for_invoice', 'business_record'],
+  ['record_refund_for_invoice', 'business_record'],
+  ['create_conditional_rules_for_invoice', 'bulk_or_automation'],
 ]);
 
 const PAYPAL_DESTRUCTIVE = new Set([
   'cancel_sent_invoice',
-  'cancel_subscription',
+  'cancel_subscription', 'cancel_recurring_series', 'cancel_invoice_auto_reminder',
 ]);
 
 // Oracle's standard SuiteApp intentionally exposes this 14-tool role-bounded surface. We pin the
@@ -211,7 +226,7 @@ function actionPolicy(
       risk: 'H', confirmation: 'fresh', sensitive_operation: sensitiveOperation, max_batch_size: 25,
     };
   }
-  if (READ_ACTION_RE.test(name) || name === 'generate_invoice_qr_code') {
+  if (READ_ACTION_RE.test(name) || name === 'generate_invoice_qr_code' || name === 'search_invoicing') {
     return { risk: 'R', confirmation: 'none', max_batch_size: 25 };
   }
   return { risk: 'W', confirmation: 'preview', max_batch_size: 25 };
@@ -309,8 +324,8 @@ export const REMOTE_COMMERCE_ENTRIES: CatalogEntry[] = [
     description_pt: "Gerencie pedidos de teste, pagamentos, reembolsos, faturas, disputas, rastreamento e assinaturas no PayPal Sandbox.",
     auth_mode: 'mcp_dcr',
     catalog_parent_id: 'paypal',
-    allowed_tools: PAYPAL_ALLOWED_TOOLS,
-    tool_policies: PAYPAL_TOOL_POLICIES,
+    allowed_tools: PAYPAL_SANDBOX_ALLOWED_TOOLS,
+    tool_policies: toolPolicies(PAYPAL_SANDBOX_ALLOWED_TOOLS, PAYPAL_HIGH_IMPACT, PAYPAL_DESTRUCTIVE),
     transport_template: {
       kind: 'streamable-http',
       url: 'https://mcp.sandbox.paypal.com/http',

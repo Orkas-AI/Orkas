@@ -9,6 +9,68 @@ import { describe, expect, it } from 'vitest';
 const require = createRequire(import.meta.url);
 
 describe('MCP stdio diagnostic boundary', () => {
+  it.each(['complete', 'cycle', 'failure', 'cancel', 'deadline'])('collects paged tools atomically through the real SDK: %s', mode => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mcp-pages-'));
+    const childPath = path.join(root, 'server.cjs');
+    const probePath = path.join(root, 'probe.cjs');
+    const eventsPath = path.join(root, 'pages.jsonl');
+    fs.writeFileSync(childPath, [
+      `const { Server } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/index.js'))});`,
+      `const { StdioServerTransport } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/stdio.js'))});`,
+      `const { ListToolsRequestSchema } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/types.js'))});`,
+      "const server = new Server({ name: 'paged', version: '1' }, { capabilities: { tools: {} } });",
+      'server.setRequestHandler(ListToolsRequestSchema, async request => {',
+      '  const cursor = request.params?.cursor;',
+      `  require('node:fs').appendFileSync(${JSON.stringify(eventsPath)}, JSON.stringify(cursor ?? null) + '\\n');`,
+      ...(mode === 'failure' ? ["  if (cursor) throw new Error('fixture page failed');"] : []),
+      ...(mode === 'deadline' ? ['  await new Promise(resolve => setTimeout(resolve, 180));'] : []),
+      ...(mode === 'cancel' ? ['  if (cursor) await new Promise(resolve => setTimeout(resolve, 2000));'] : []),
+      "  const index = cursor === undefined ? 0 : cursor === 'page-2' ? 1 : 2;",
+      "  return { tools: [{ name: 'read_' + index, inputSchema: { type: 'object' } }],",
+      mode === 'cycle' ? "    nextCursor: 'page-2' };" : "    ...(index < 2 ? { nextCursor: 'page-' + (index + 2) } : {}) };",
+      '});',
+      'process.stdin.once("end", () => { void server.close(); });',
+      'void server.connect(new StdioServerTransport());',
+    ].join('\n'));
+    fs.writeFileSync(probePath, [
+      `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/logger.ts'))})] = { exports: { createLogger: () => ({ info() {}, warn() {} }) } };`,
+      `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/util/proxy-dispatcher.ts'))})] = { exports: { buildChildProxyEnvironment: async () => ({}) } };`,
+      `const { McpConnection } = require(${JSON.stringify(path.resolve('src/main/features/connectors/mcp-client.ts'))});`,
+      `const connection = new McpConnection('fixture', { kind: 'stdio', command: process.execPath, args: [${JSON.stringify(childPath)}], env: { ELECTRON_RUN_AS_NODE: '1' } });`,
+      '(async () => {',
+      '  try {',
+      '    await connection.connect();',
+      '    const controller = new AbortController(); let timer;',
+      ...(mode === 'cancel' ? ['    timer = setTimeout(() => controller.abort(), 100);'] : []),
+      '    try {',
+      `      const tools = await connection.listTools({ signal: controller.signal, timeoutMs: ${mode === 'deadline' ? 300 : 3000} });`,
+      '      process.stdout.write(JSON.stringify({ tools }));',
+      '    } catch (error) { process.stdout.write(JSON.stringify({ failed: true, message: error.message })); }',
+      '    finally { clearTimeout(timer); }',
+      '  } finally { await connection.close(); }',
+      '})().catch(() => { process.exitCode = 1; });',
+    ].join('\n'));
+    try {
+      const result = spawnSync(process.execPath, ['-r', require.resolve('tsx/cjs'), probePath], {
+        cwd: root, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', ORKAS_WORKSPACE_ROOT: root },
+        encoding: 'utf8', timeout: 8000, maxBuffer: 1024 * 1024,
+      });
+      expect(result.status, result.stderr || result.stdout).toBe(0); expect(result.stderr).toBe('');
+      const outcome = JSON.parse(result.stdout);
+      const pages = fs.readFileSync(eventsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      if (mode === 'complete') {
+        expect(outcome.tools.map((tool: any) => tool.name)).toEqual(['read_0', 'read_1', 'read_2']);
+        expect(pages).toEqual([null, 'page-2', 'page-3']);
+      } else {
+        expect(outcome.failed).toBe(true); expect(outcome).not.toHaveProperty('tools');
+        expect(pages).toEqual([null, 'page-2']);
+        if (mode === 'cycle') expect(outcome.message).toContain('repeated a pagination cursor');
+        if (mode === 'failure') expect(outcome.message).toContain('fixture page failed');
+        if (mode === 'deadline') expect(outcome.message).toMatch(/timed out/i);
+      }
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each(['stdio', 'streamable-http'])('closes a %s channel that never completes initialization within 30s', (kind) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mcp-connect-'));
     const childPath = path.join(root, 'silent.cjs');

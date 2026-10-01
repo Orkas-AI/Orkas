@@ -26,7 +26,7 @@ afterEach(() => {
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   if (prevBuiltin === undefined) delete process.env.ORKAS_BUILTIN_ROOT;
   else process.env.ORKAS_BUILTIN_ROOT = prevBuiltin;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   vi.restoreAllMocks();
   vi.resetModules();
 });

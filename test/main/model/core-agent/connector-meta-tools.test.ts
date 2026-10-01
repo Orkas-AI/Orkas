@@ -208,6 +208,31 @@ async function runTool(
   return tool.execute(input, { workingDir: '.', signal } as any);
 }
 
+it('cleans only a native draft created by this task, revoking that proof at task end', async () => {
+  const tools = ['create_draft', 'delete_draft'].map(name => ({ name, description: '', input_schema: { type: 'object', properties: { id: { type: 'string' } } } }));
+  fixtures.instances = [makeInstance({ id: 'gmail', tools })];
+  fixtures.actionApproved = false;
+  const dispatched: string[] = [];
+  fixtures.callTool = async (_uid, _id, name) => {
+    dispatched.push(name);
+    return { content: [{ type: 'text', text: JSON.stringify(name === 'create_draft'
+      ? { id: 'draft-owned', messageId: 'message-owned' } : { ok: true }) }] };
+  };
+  const { createConnectorMetaTools } = await loadModule();
+  const [, call] = await createConnectorMetaTools({ userId: UID, cid: 'draft-task' });
+  const invoke = (tool_name: string, id?: string) => runTool(call, { connector_id: 'gmail', tool_name, args: id ? { id } : {} });
+  expect((await invoke('create_draft')).isError).toBeFalsy();
+  expect((await invoke('delete_draft', 'draft-owned')).isError).toBeFalsy();
+  expect(fixtures.actionConfirmCalls).toHaveLength(0);
+  expect((await invoke('delete_draft', 'existing-user-draft')).isError).toBe(true);
+  await invoke('create_draft');
+  const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+  confirm.cancelForCid('draft-task');
+  expect((await invoke('delete_draft', 'draft-owned')).isError).toBe(true);
+  expect(dispatched).toEqual(['create_draft', 'delete_draft', 'create_draft']);
+  expect(fixtures.actionConfirmCalls).toHaveLength(2);
+});
+
 // ── connectorExposureFromSessionId (the runner.ts session-kind gate) ────
 //
 // session_id is now `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id, since the
@@ -541,6 +566,78 @@ describe('getConnectorPromptBlock', () => {
 // ── list_connector_tools ────────────────────────────────────────────────
 
 describe('list_connector_tools', () => {
+  it('keeps catalog-excluded, blocked and disconnected actions out of global search', async () => {
+    const action = (name: string, description: string): ToolSchema => ({ name, description, input_schema: { type: 'object' } });
+    fixtures.instances = [
+      makeInstance({ id: 'gmail', tools: [action('GMAIL_DELETE_MESSAGE', 'blockedsecretmarker')] }),
+      makeInstance({ id: 'paypal', tools: [action('create_refund', 'Refund money'), action('unlisted_action', 'catalogsecretmarker')] }),
+      makeInstance({ id: 'custom-offline', origin: 'custom', status: { kind: 'disconnected' }, tools: [action('read_offline', 'offlinesecretmarker')] }),
+    ];
+    const [list] = await (await loadModule()).createConnectorMetaTools({ userId: UID });
+    for (const query of ['blockedsecretmarker', 'catalogsecretmarker', 'offlinesecretmarker']) {
+      expect(JSON.parse((await runTool(list, { query })).content).tools).toEqual([]);
+    }
+    expect(JSON.parse((await runTool(list, { query: 'refund money' })).content).tools[0].name).toBe('create_refund');
+  });
+
+  it('searches a large single connector directly, then honors action withdrawal without rebuilding the runner', async () => {
+    const tools: ToolSchema[] = Array.from({ length: 100 }, (_, i) => ({ name: `read_${i}`, description: 'Read an ordinary entry', input_schema: { type: 'object' } }));
+    tools.push({ name: 'lookup_invoice', description: 'Find overdue invoices', input_schema: { type: 'object', properties: { invoice_id: { type: 'string' } } } });
+    fixtures.instances = [makeInstance({ id: 'custom-discovery', origin: 'custom', tools })];
+    const [list] = await (await loadModule()).createConnectorMetaTools({ userId: UID });
+    const first = JSON.parse((await runTool(list, { connector_id: 'custom-discovery' })).content);
+    expect(first).toMatchObject({ mode: 'compact', total: 101, next_offset: 20 });
+    expect(first.tools).toHaveLength(20);
+    const search = JSON.parse((await runTool(list, { query: 'overdue invoices' })).content);
+    expect(search.tools.map((t: any) => t.name)).toEqual(['lookup_invoice']);
+    expect(search.tools[0].input_schema.properties).toHaveProperty('invoice_id');
+    expect(JSON.parse((await runTool(list, { query: 'overdue invoices 发票' })).content).tools[0].name).toBe('lookup_invoice');
+    expect(JSON.parse((await runTool(list, { query: 'VID-72' })).content)).toMatchObject({ tools: [], total: 0 });
+    expect(await runTool(list, { connector_id: 'custom-discovery', tool_name: 'read_72' })).toMatchObject({ content: expect.stringMatching(/read_72[\s\S]*Input schema:/) });
+    fixtures.instances[0].enabled_subtools = ['read_0'];
+    expect(JSON.parse((await runTool(list, { query: 'overdue invoices' })).content)).toMatchObject({ tools: [], search: { searched_tools: 1 }, guidance: expect.any(String) });
+    expect((await runTool(list, { connector_id: 'custom-discovery', tool_name: 'lookup_invoice' })).isError).toBe(true);
+  });
+
+  it('bounds a small catalog with a huge schema and expands the schema intact on request', async () => {
+    const huge = { ...NOTION_TOOLS[0], input_schema: { ...NOTION_TOOLS[0].input_schema, description: 'schema '.repeat(10_000) } };
+    fixtures.instances = [makeInstance({ id: 'notion', tools: [huge] })];
+    const [list] = await (await loadModule()).createConnectorMetaTools({ userId: UID });
+    const compact = await runTool(list, { connector_id: 'notion' });
+    expect(JSON.parse(compact.content)).toMatchObject({ mode: 'compact', schemas_included: false });
+    expect(compact.content.length).toBeLessThan(2_000);
+    const expanded = await runTool(list, { connector_id: 'notion', tool_name: 'search' });
+    expect(expanded.content).toContain(huge.input_schema.description);
+  });
+
+  it('returns every small-catalog schema even with an explicit covering limit', async () => {
+    fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
+    const [list] = await (await loadModule()).createConnectorMetaTools({ userId: UID });
+    const result = await runTool(list, { connector_id: 'notion', limit: 50, offset: 0 });
+    expect(result.content).toContain('### search');
+    expect(result.content).toContain('### create_page');
+    expect(result.content).toContain('"required"');
+    expect(result.content).toContain('"title"');
+    expect(list.inputSchema.properties.query.description).toContain('not record ids');
+    const [, call] = await (await loadModule()).createConnectorMetaTools({ userId: UID });
+    expect(call.description).toContain(require('../../../../bin/connector-discovery-contract.cjs').callSuitability);
+  });
+
+  it.each([
+    [{ query: ' ' }, 'query must be a non-empty string'],
+    [{ limit: 0 }, 'limit must be an integer from 1 to 50'],
+    [{ offset: -1 }, 'offset must be an integer from 0 to 9007199254740991'],
+    [{ query: 4 }, 'query must be a non-empty string'],
+    [{ connector_id: 'notion', tool_name: 'search', query: 'search' }, 'tool_name cannot be combined'],
+    [{ unknown: true }, 'unsupported discovery field "unknown"'],
+  ] as const)('rejects invalid discovery parameters: %j', async (input, message) => {
+    fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
+    const [list] = await (await loadModule()).createConnectorMetaTools({ userId: UID });
+    const result = await runTool(list, input);
+    expect(result).toMatchObject({ isError: true, content: expect.stringContaining('E_BAD_INPUT') });
+    expect(result.content).toContain(message);
+  });
+
   it('connected instance returns full tool schemas', async () => {
     fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
     const { createConnectorMetaTools } = await loadModule();

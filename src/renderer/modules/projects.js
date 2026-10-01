@@ -1,6 +1,6 @@
 // ─── Sidebar Projects section ────────────────────────────────────────────
 // Renders the "Projects" group above the conversation list. Each project
-// row supports collapse/expand, a ⋯ menu (rename / delete), and inline
+// row supports collapse/expand, a ⋯ menu (invite guide / rename / delete), and inline
 // rename. Conversations with a `project_id` field are nested under their
 // project; conversations without `project_id` stay in the existing
 // "Conversations" section (rendered by `conversation.js::renderConversationList`).
@@ -276,9 +276,7 @@ function _renderProjectRow(p, convs) {
   const expanded = !!_projectsExpanded[p.project_id];
   const selected = _isProjectSelected(p.project_id);
   const editing = _projectsInlineRenamePid === p.project_id;
-  const folderIcon = expanded
-    ? _projectUiIconHtml('folder-open', 'project-folder-icon')
-    : _projectUiIconHtml('folder', 'project-folder-icon');
+  const folderIcon = _projectUiIconHtml('folder', 'project-folder-icon');
   const moreTitle = escapeHtml(t('project.menu.more_actions'));
   const safeName = escapeHtml(p.name || '');
   const renameErrorClass = editing && _projectsInlineRenameError ? ' is-error' : '';
@@ -356,7 +354,6 @@ function primeProjectDetailShell(pid) {
   if (title) title.textContent = project?.name || '';
   if (typeof _refreshUnreadTaskIndicators === 'function') _refreshUnreadTaskIndicators(pid);
   if (content) {
-    content.classList.add('is-loading');
     content.setAttribute('aria-busy', 'true');
   }
 }
@@ -722,6 +719,7 @@ function _openProjectRowMenu(anchorBtn, pid) {
   _closeProjectRowMenu();
 
   const items = [
+    { action: 'invite-members', label: t('project.menu.invite_members') },
     { action: 'rename', label: t('project.menu.rename') },
     { action: 'delete', label: t('project.menu.delete'), danger: true },
   ];
@@ -772,6 +770,7 @@ function _closeProjectRowMenu() {
 }
 
 async function _runProjectMenuAction(action, pid) {
+  if (action === 'invite-members') return _showProjectMemberInviteGate();
   if (action === 'rename') return _startProjectInlineRename(pid);
   if (action === 'delete') return _confirmDeleteProject(pid);
 }
@@ -991,3 +990,20 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 if (typeof window !== 'undefined') window.primeProjectDetailShell = primeProjectDetailShell;
+
+async function _showProjectMemberInviteGate() {
+  const download = await uiConfirm({
+    message: t('project.invite_members.commercial_only'),
+    okLabel: t('project.invite_members.download'),
+    cancelLabel: t('common.cancel'),
+  });
+  if (!download) return;
+  const lang = getLang();
+  const url = `https://orkas.ai/download/?lang=${encodeURIComponent(lang)}`;
+  try {
+    const result = await window.orkas.invoke('auth.openExternal', { url });
+    if (!result?.ok) throw new Error('open rejected');
+  } catch (_) {
+    await uiAlert(t('project.invite_members.open_failed'));
+  }
+}

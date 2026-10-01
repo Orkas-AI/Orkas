@@ -67,7 +67,8 @@ beforeEach(() => {
   vi.resetModules();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await (await import('../../../src/main/features/conversation-history-client')).closeConversationHistoryWorker();
   process.env.ORKAS_WORKSPACE_ROOT = previousWorkspaceRoot;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -163,7 +164,7 @@ describe('conversation history projection cache', () => {
     expect(cached.records.map((entry: any) => entry.record.id)).toEqual(['m3', 'm4']);
   });
 
-  it('extends the cache across a multi-megabyte appended record with one assembly copy', async () => {
+  it('extends the cache across a multi-megabyte appended record without losing its projection', async () => {
     writeRows([message('m1')]);
     const { readConversationHistoryPage } = await import(
       '../../../src/main/features/conversation_history_cache'
@@ -173,15 +174,11 @@ describe('conversation history projection cache', () => {
       ok: true,
       content: 'x'.repeat(2 * 1024 * 1024),
     }))}\n`);
-    const concat = vi.spyOn(Buffer, 'concat');
-    try {
-      const page = await readConversationHistoryPage(TEST_UID, sourceFile, 2);
-
-      expect(page.records.map((record) => record.id)).toEqual(['m1', 'm2']);
-      expect(concat.mock.calls.length).toBeLessThanOrEqual(1);
-    } finally {
-      concat.mockRestore();
-    }
+    const page = await readConversationHistoryPage(TEST_UID, sourceFile, 2);
+    expect(page.records.map((record) => record.id)).toEqual(['m1', 'm2']);
+    expect((page.records[1].process as any[])[0].event.data.output).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(sourceFile, 'utf8').trim().split('\n')[1])
+      .process[0].event.data.output.content).toHaveLength(2 * 1024 * 1024);
   });
 
   it('expands a small cached page when a larger tail is requested', async () => {

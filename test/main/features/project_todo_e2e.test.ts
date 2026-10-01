@@ -24,6 +24,10 @@ vi.mock('../../../src/main/model/client', () => ({
   async *streamChatWithModel() { yield { type: 'final', text: '' }; yield { type: 'done' }; },
   async chatWithModel() { return { ok: true, text: '', error: '', aborted: false }; },
 }));
+// This deterministic trunk has no desktop window; browser input has its own suites.
+vi.mock('../../../src/main/features/web_assist', () => ({
+  bindHostStartedWebAssistConversation: () => false,
+}));
 vi.mock('../../../src/main/features/chats', () => ({
   createConversation: vi.fn(),
   deleteConversation: vi.fn(),

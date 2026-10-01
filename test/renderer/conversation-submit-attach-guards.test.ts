@@ -1,3 +1,4 @@
+import { composerAccessorSource, composerDraftSource } from './composer-test-source';
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -83,6 +84,7 @@ function loadConversation(overrides: Record<string, any> = {}) {
   context.window.window = context.window;
   const proxied = withNoopFallback(context);
   vm.createContext(proxied);
+  vm.runInContext(composerAccessorSource, proxied);
   vm.runInContext(conversationSource, proxied);
   return { context: proxied, revoked, elements };
 }
@@ -146,6 +148,151 @@ describe('new-chat submit re-entrancy gate', () => {
     void context.handleNewChatSubmit();
     await new Promise((r) => setTimeout(r, 0));
     expect(createCalls.filter((u) => u.includes('/conversations/create'))).toHaveLength(2);
+  });
+});
+
+describe('conversation send ownership across navigation', () => {
+  it.each(['attachments', 'floor', 'busy-response', 'unchanged', 'new-draft'])('keeps submission and draft ownership during %s', async (phase) => {
+    const sends: any[] = [];
+    const clearedDrafts: string[] = [];
+    let resume!: (value?: any) => void;
+    let reached!: () => void;
+    const waiting = new Promise<void>((resolve) => { reached = resolve; });
+    const held = new Promise<any>((resolve) => { resume = resolve; });
+    const { context, elements } = loadConversation({ currentCid: 'task-a' });
+    context._DRAFT_KEY = (cid: string) => `draft:${cid}`;
+    vm.runInContext(composerDraftSource, context);
+    const input = stubEl({ value: 'Review A' });
+    elements['chat-input'] = input;
+    context.ensureModelConfigured = () => true;
+    context._isQueueItemEditing = () => false;
+    context._getQuotes = () => [];
+    context._referenceSnapshotsForQuotes = () => [];
+    context.getChatUseSelections = () => [];
+    context._chatModelTelemetryContext = () => ({});
+    context._readConversationTemplateAttribution = () => ({});
+    context._unresolvedQuickStartPlaceholder = () => '';
+    context._chatAttachSnapshotForSend = async () => {
+      if (['attachments', 'unchanged', 'new-draft'].includes(phase)) { reached(); await held; }
+      return { ok: true, items: [{ name: 'a.txt', status: 'ready' }], names: ['a.txt'] };
+    };
+    context._recipientSnapshotForSend = () => ({ kind: 'agent', id: context.currentCid, name: context.currentCid });
+    context._commanderMentionDisplayForSend = () => ({});
+    context._applyRecipientPrefixWithSnapshot = (text: string, recipient: any) => `@${recipient.id} ${text}`;
+    context._composerEffectiveDispatchMode = () => undefined;
+    context.transformWithChatUse = (text: string) => text;
+    context.isConvPending = () => phase === 'busy-response';
+    context._clearDraft = (cid: string) => { clearedDrafts.push(cid); };
+    context._clearQuotes = () => {};
+    context.autoGrow = () => {};
+    context._updateComposerSeqToggle = () => {};
+    context._rememberSentComposerSnapshot = () => {};
+    context.sendInConversation = async (cid: string, content: string, extra: any) => {
+      sends.push({ cid, content, extra });
+      return { started: true };
+    };
+    context.apiFetch = async (url: string, options: any) => {
+      sends.push({ cid: url.split('/')[3], ...JSON.parse(options.body) });
+      reached();
+      await held;
+      return { json: async () => ({ ok: true }) };
+    };
+    if (phase === 'floor') {
+      context.floorWait = held.then(() => ({}));
+      vm.runInContext("_floorSyncByCid.set('task-a', floorWait)", context);
+      context._chatAttachSnapshotForSend = async () => {
+        reached();
+        return { ok: true, items: [], names: [] };
+      };
+    }
+    context._saveDraft('task-a');
+    const sending = context.handleChatSubmit();
+    await waiting;
+    // Let the attachment continuation reach the held floor write.
+    await Promise.resolve();
+    const navigates = !['unchanged', 'new-draft'].includes(phase);
+    if (navigates) {
+      context.currentCid = 'task-b';
+      input.value = 'Unsent B draft';
+    } else if (phase === 'new-draft') {
+      input.value = 'Updated A draft';
+      context._saveDraft('task-a'); // real composer-change listener records this edit
+    }
+    resume();
+    await sending;
+    expect(sends).toHaveLength(1);
+    expect(sends[0].cid).toBe('task-a');
+    expect(sends[0].content).toBe('@task-a Review A');
+    expect(input.value).toBe(navigates ? 'Unsent B draft' : phase === 'new-draft' ? 'Updated A draft' : '');
+    expect(clearedDrafts).toEqual(phase === 'new-draft' ? [] : ['task-a']);
+    expect(vm.runInContext("_chatAttachmentSendLocks.has('task-a')", context)).toBe(false);
+  });
+});
+
+describe('skill file body staleness guard', () => {
+  function loadSkills() {
+    const bodies: Record<string, any> = {};
+    const pending: Record<string, (v: any) => void> = {};
+    const elements: Record<string, any> = {
+      'skills-detail-body': stubEl(),
+      'skills-detail-name': stubEl(),
+      'skills-detail-source': stubEl(),
+      'skills-detail-content': stubEl(),
+      'skills-chat-col': stubEl(),
+    };
+    const context: any = {
+      console, setTimeout, clearTimeout, encodeURIComponent, URLSearchParams,
+      Date, JSON, Map, Set, Array, String, Number, RegExp, Promise,
+      createLogger: () => ({ warn() {}, info() {}, error() {}, debug() {} }),
+      escapeHtml,
+      t: (key: string) => key,
+      getLang: () => 'en',
+      pickDesc: () => '',
+      localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+      apiFetch: (url: string) => new Promise((resolve) => {
+        const m = /file=([^&]+)/.exec(url);
+        const file = m ? decodeURIComponent(m[1]) : url;
+        pending[file] = resolve;
+      }),
+      document: {
+        readyState: 'loading',
+        addEventListener() {},
+        querySelector: () => null,
+        querySelectorAll: () => [] as any[],
+        getElementById: (id: string) => elements[id] || null,
+        createElement: () => stubEl(),
+      },
+      window: { addEventListener() {} },
+      _renderSourceMetaHtml: () => '',
+      _mountDetailCategorySelect: () => {},
+    };
+    context.window.window = context.window;
+    const proxied = withNoopFallback(context);
+    vm.createContext(proxied);
+  vm.runInContext(composerAccessorSource, proxied);
+    vm.runInContext(skillsSource, proxied);
+    return { context: proxied, elements, pending, bodies };
+  }
+
+  it('a slower earlier file response never overwrites the newer selection body', async () => {
+    const { context, elements, pending } = loadSkills();
+    context._skillsCache = [{ id: 's1', source: 'custom', name: 'S1' }];
+
+    const selA = context.selectSkillFile('custom', 's1', 'a.md', null);
+    const selB = context.selectSkillFile('custom', 's1', 'b.md', null);
+    await new Promise((r) => setTimeout(r, 0));
+
+    // b.md resolves first (fast), then a.md's stale response arrives late.
+    pending['b.md']({ json: async () => ({ ok: true, content: 'BODY-B', ext: 'md' }) });
+    await new Promise((r) => setTimeout(r, 0));
+    const afterB = String(elements['skills-detail-body'].innerHTML || elements['skills-detail-body'].textContent || '');
+
+    pending['a.md']({ json: async () => ({ ok: true, content: 'BODY-A', ext: 'md' }) });
+    await Promise.allSettled([selA, selB]);
+
+    const finalBody = String(elements['skills-detail-body'].innerHTML || elements['skills-detail-body'].textContent || '');
+    expect(afterB).toBe(finalBody); // A's late reply changed nothing
+    expect(finalBody).not.toContain('BODY-A');
   });
 });
 
@@ -264,71 +411,5 @@ describe('submitted composer ownership across asynchronous sends', () => {
     expect(s.context._chatAttachList('c1')).toEqual([]);
     expect(s.context._readDraftData('c1')).toEqual({});
     expect(s.alerts).toHaveLength(1);
-  });
-});
-
-describe('skill file body staleness guard', () => {
-  function loadSkills() {
-    const bodies: Record<string, any> = {};
-    const pending: Record<string, (v: any) => void> = {};
-    const elements: Record<string, any> = {
-      'skills-detail-body': stubEl(),
-      'skills-detail-name': stubEl(),
-      'skills-detail-source': stubEl(),
-      'skills-detail-content': stubEl(),
-      'skills-chat-col': stubEl(),
-    };
-    const context: any = {
-      console, setTimeout, clearTimeout, encodeURIComponent, URLSearchParams,
-      Date, JSON, Map, Set, Array, String, Number, RegExp, Promise,
-      createLogger: () => ({ warn() {}, info() {}, error() {}, debug() {} }),
-      escapeHtml,
-      t: (key: string) => key,
-      getLang: () => 'en',
-      pickDesc: () => '',
-      localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
-      apiFetch: (url: string) => new Promise((resolve) => {
-        const m = /file=([^&]+)/.exec(url);
-        const file = m ? decodeURIComponent(m[1]) : url;
-        pending[file] = resolve;
-      }),
-      document: {
-        readyState: 'loading',
-        addEventListener() {},
-        querySelector: () => null,
-        querySelectorAll: () => [] as any[],
-        getElementById: (id: string) => elements[id] || null,
-        createElement: () => stubEl(),
-      },
-      window: { addEventListener() {} },
-      _renderSourceMetaHtml: () => '',
-      _mountDetailCategorySelect: () => {},
-    };
-    context.window.window = context.window;
-    const proxied = withNoopFallback(context);
-    vm.createContext(proxied);
-    vm.runInContext(skillsSource, proxied);
-    return { context: proxied, elements, pending, bodies };
-  }
-
-  it('a slower earlier file response never overwrites the newer selection body', async () => {
-    const { context, elements, pending } = loadSkills();
-    context._skillsCache = [{ id: 's1', source: 'custom', name: 'S1' }];
-
-    const selA = context.selectSkillFile('custom', 's1', 'a.md', null);
-    const selB = context.selectSkillFile('custom', 's1', 'b.md', null);
-    await new Promise((r) => setTimeout(r, 0));
-
-    // b.md resolves first (fast), then a.md's stale response arrives late.
-    pending['b.md']({ json: async () => ({ ok: true, content: 'BODY-B', ext: 'md' }) });
-    await new Promise((r) => setTimeout(r, 0));
-    const afterB = String(elements['skills-detail-body'].innerHTML || elements['skills-detail-body'].textContent || '');
-
-    pending['a.md']({ json: async () => ({ ok: true, content: 'BODY-A', ext: 'md' }) });
-    await Promise.allSettled([selA, selB]);
-
-    const finalBody = String(elements['skills-detail-body'].innerHTML || elements['skills-detail-body'].textContent || '');
-    expect(afterB).toBe(finalBody); // A's late reply changed nothing
-    expect(finalBody).not.toContain('BODY-A');
   });
 });

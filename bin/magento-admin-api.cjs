@@ -7,7 +7,7 @@ const { requestFetch } = require('./commerce-request-context.cjs');
 const crypto = require('node:crypto');
 const net = require('node:net');
 const dns = require('node:dns').promises;
-const { validate, readBody, safeOutput } = require('./storefront-admin-api.cjs');
+const { validate, readBody } = require('./storefront-admin-api.cjs');
 const fail = (kind, message) => { throw Object.assign(new Error(message), { code: `storefront_${kind}` }); };
 const isProvider = (provider) => provider === 'magento';
 const CREDENTIALS = ['consumer_key', 'consumer_secret', 'access_token', 'token_secret'];
@@ -92,19 +92,19 @@ async function request(config, path, { method = 'GET', query = {}, body } = {}) 
   } catch (error) { fail(['TimeoutError', 'AbortError'].includes(error?.name) ? 'timeout' : 'network_failed', `Magento request failed${method !== 'GET' ? '; check the store before retrying an uncertain write' : ''}`); }
   if (!response.ok) fail([401, 403].includes(response.status) ? 'permission_denied' : response.status === 429 ? 'rate_limit' : 'upstream_error', `Magento API failed (HTTP ${response.status}); check integration permissions and store availability`);
   let data;
-  try { data = JSON.parse(await readBody(response)); } catch { fail('upstream_error', 'Magento returned invalid or oversized JSON'); }
+  try { data = parse(await readBody(response)); } catch { fail('upstream_error', 'Magento returned invalid or oversized JSON'); }
   if (data === null || typeof data !== 'object' || data.message || data.errors) fail('upstream_error', 'Magento returned an unexpected response');
   return data;
 }
 
 function actionsFor() {
   return {
-    'shop.get': action('R', 'Read the verified Magento installation and store views without contact details.'),
-    'products.list': action('R', 'Read one product page, including total_count; stock and price use separate actions.', PAGE),
+    'shop.get': action('R', 'Read the verified Magento installation and complete store configuration.'),
+    'products.list': action('R', 'Read one complete product page, including total_count.', PAGE),
     'products.get': action('R', 'Read one product by SKU.', { sku: SKU }, ['sku']),
-    'orders.list': action('R', 'Read one order page with buyer and address information removed.', PAGE),
-    'orders.get': action('R', 'Read one order without buyer, address or payment details.', { order_id: { ...INTEGER, minimum: 1 } }, ['order_id']),
-    'sources.list': action('R', 'List inventory sources without address or contact details.', PAGE),
+    'orders.list': action('R', 'Read one complete order page, including fulfilment, buyer contacts and totals.', PAGE),
+    'orders.get': action('R', 'Read one complete order, including fulfilment, buyer contacts and payment metadata.', { order_id: { ...INTEGER, minimum: 1 } }, ['order_id']),
+    'sources.list': action('R', 'List complete inventory sources, including address and contact details.', PAGE),
     'inventory.list': action('R', 'Read physical source stock for one SKU; this is not salable stock after reservations.', { sku: SKU, ...PAGE }, ['sku']),
     'products.set_price': action('H', 'Set one base selling price after fresh confirmation. Supports simple, virtual, downloadable and fixed-price bundle products.', { sku: SKU, store_id: INTEGER, price: MONEY }, ['sku', 'store_id', 'price']),
     'inventory.set': action('H', 'Replace physical stock and availability at one source after fresh confirmation. Does not modify reservations. Never automatically retry an uncertain write.',
@@ -112,19 +112,37 @@ function actionsFor() {
   };
 }
 
-async function identity(config) {
+async function identity(config, includeData = false) {
   const data = await request(config, '/store/storeConfigs');
   if (!Array.isArray(data) || !data.length || data.some((s) => !Number.isSafeInteger(s.id) || typeof s.code !== 'string')) fail('invalid_response', 'Magento store identity is missing');
   const stores = data.map((s) => ({ id: s.id, code: s.code, website_id: s.website_id, currency: s.base_currency_code })).sort((a, b) => a.id - b.id);
   const fingerprint = crypto.createHash('sha256').update(JSON.stringify(stores.map(({ id, code, website_id }) => ({ id, code, website_id })))).digest('hex');
   if (config.credentials.identity && config.credentials.identity.fingerprint !== fingerprint) fail('binding_mismatch', 'Magento store views changed; reconnect to verify this installation');
-  return { binding: config.metadata.store_url, fingerprint, stores };
+  return { binding: config.metadata.store_url, fingerprint, stores, ...(includeData ? { data: sanitize(data, config.credentials) } : {}) };
 }
 
-function pick(value, keys) {
-  if (Array.isArray(value)) return value.map((v) => pick(v, keys));
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).filter(([k]) => keys.includes(k)).map(([k, v]) => [k, pick(v, keys)]));
+// Credentials are not business fields. Preserve contacts, fulfilment and module extensions.
+const secretFields = new Set(['consumer_key', 'consumer_secret', 'access_token', 'refresh_token', 'token_secret', 'oauth_token', 'oauth_signature', 'authorization', 'cookie', 'password', 'password_hash', 'api_key', 'api_secret']);
+function sanitize(value, credentials) {
+  const secrets = CREDENTIALS.map((key) => credentials[key]);
+  function clean(v, depth) {
+    if (depth > 40) fail('upstream_error', 'Magento response exceeds the nesting limit');
+    if (typeof v === 'string') { for (const secret of secrets) v = v.split(secret).join('[redacted]'); return v; }
+    if (Array.isArray(v)) return v.map((x) => clean(x, depth + 1));
+    if (!v || typeof v !== 'object') return v;
+    return Object.fromEntries(Object.entries(v).filter(([key]) => !secretFields.has(key.toLowerCase())).map(([key, child]) => [key, clean(child, depth + 1)]));
+  }
+  return clean(value, 0);
+}
+function parse(text) {
+  return JSON.parse(text, (_key, value, context) => {
+    if (typeof value === 'number' && !Number.isFinite(value)) fail('upstream_error', 'Magento returned a nonfinite number');
+    if (typeof value === 'number' && Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      if (!/^-?[0-9]+$/.test(context.source)) fail('upstream_error', 'Magento returned an imprecise number');
+      return context.source;
+    }
+    return value;
+  });
 }
 
 async function execute(config, name, parameters = {}) {
@@ -132,7 +150,7 @@ async function execute(config, name, parameters = {}) {
   const spec = actionsFor()[name];
   if (!spec) fail('validation_failed', 'Unreviewed Magento action');
   validate(parameters, spec.input_schema);
-  if (name === 'shop.get') return identity(config);
+  if (name === 'shop.get') return identity(config, true);
   const p = parameters;
   if (name === 'products.set_price' && p.store_id !== 0 && !config.credentials.identity.stores.some((store) => store.id === p.store_id)) fail('validation_failed', 'Magento price store ID must be 0 or one of the verified store views');
   const query = { 'searchCriteria[pageSize]': p.limit || 50, 'searchCriteria[currentPage]': p.page || 1 };
@@ -150,9 +168,7 @@ async function execute(config, name, parameters = {}) {
     return { status: 'completed' };
   }
   if (name.endsWith('.list') && (!Array.isArray(data.items) || !Number.isSafeInteger(data.total_count))) fail('invalid_response', 'Magento pagination is missing');
-  if (name.startsWith('orders.')) data = pick(data, ['items', 'total_count', 'entity_id', 'increment_id', 'status', 'state', 'created_at', 'updated_at', 'store_id', 'order_currency_code', 'grand_total', 'subtotal', 'tax_amount', 'discount_amount', 'shipping_amount', 'item_id', 'order_id', 'product_id', 'sku', 'name', 'qty_ordered', 'qty_shipped', 'qty_refunded', 'price', 'row_total']);
-  if (name === 'sources.list') data = pick(data, ['items', 'total_count', 'source_code', 'name', 'enabled']);
-  for (const key of CREDENTIALS) data = safeOutput(data, config.credentials[key]);
+  data = sanitize(data, config.credentials);
   return { data, ...(name.endsWith('.list') ? { page: p.page || 1, limit: p.limit || 50 } : {}) };
 }
 

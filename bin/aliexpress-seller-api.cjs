@@ -10,9 +10,9 @@ const { requestFetch, credentialOperation } = require('./commerce-request-contex
 // the current app does not support them. Never fall back to the old TOP gateway.
 const crypto = require('node:crypto');
 const { validate, readBody, safeOutput } = require('./storefront-admin-api.cjs');
-const { readCredentialFile, writeCredentialFile } = require('./local-api-credential-codec.cjs');
+const { readCredentialFile, writeCredentialFile, rotateCredentialFile, hasCredentialRotation } = require('./local-api-credential-codec.cjs');
 const refreshes = new Map();
-const fail = (kind, message) => { throw Object.assign(new Error(message), { code: `storefront_${kind}` }); };
+const fail = (kind, message, httpStatus) => { throw Object.assign(new Error(message), { code: `storefront_${kind}`, ...(httpStatus ? { httpStatus } : {}) }); };
 const isProvider = (provider) => provider === 'aliexpress';
 const hash = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const secret = (value, min = 8) => typeof value === 'string' && value.length >= min && value.length <= 4096 && !/[\s\u0000-\u001f\u007f]/.test(value);
@@ -48,10 +48,10 @@ function parseJSON(raw) {
     return value;
   });
 }
-async function request(config, method, parameters = {}, token = false, write = false) {
+async function request(config, method, parameters = {}, token = false, write = false, { simplify = false, businessSuccessCodes = [] } = {}) {
   setup(config);
   const values = { ...parameters, app_key: config.credentials.app_key, timestamp: String(Date.now()), sign_method: 'sha256',
-    ...(!token ? { method, session: config.credentials.access_token, format: 'json', simplify: 'false' } : {}) };
+    ...(!token ? { method, session: config.credentials.access_token, format: 'json', simplify: simplify ? 'true' : 'false' } : {}) };
   values.sign = sign(method, values, config.credentials.app_secret);
   const body = new URLSearchParams(Object.entries(values).map(([key, value]) => [key, String(value)])).toString();
   let response;
@@ -60,16 +60,21 @@ async function request(config, method, parameters = {}, token = false, write = f
       method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' }, body, redirect: 'error', signal: AbortSignal.timeout(60000),
     });
   } catch (error) { fail(['AbortError', 'TimeoutError'].includes(error?.name) ? 'timeout' : 'network_failed', `AliExpress request failed${write ? '; inspect stock before retrying an uncertain write' : ''}`); }
-  if (!response.ok) fail([401, 403].includes(response.status) ? 'permission_denied' : response.status === 429 ? 'rate_limit' : 'upstream_error', `AliExpress API failed (HTTP ${response.status})`);
+  if (!response.ok) fail([401, 403].includes(response.status) ? 'permission_denied' : response.status === 429 ? 'rate_limit' : 'upstream_error', `AliExpress API failed (HTTP ${response.status})`, response.status);
   let data;
   try { data = parseJSON(await readBody(response)); } catch { fail('invalid_response', 'AliExpress returned invalid, oversized or unsupported JSON'); }
-  const error = data?.error_response || (data?.code !== undefined && String(data.code) !== '0' ? data : null);
+  // Reviewed flat business responses can define their own success code.
+  // Named gateway errors and token/legacy response validation stay unchanged.
+  const businessCode = !token && simplify && businessSuccessCodes.includes(String(data?.code));
+  const error = data?.error_response || (data?.code !== undefined && String(data.code) !== '0' && !businessCode ? data : null);
   if (error) fail(/token|permission|auth|code|session/i.test(String(error.code)) ? 'permission_denied' : 'request_failed', 'AliExpress rejected the request; check the seller app permissions and reconnect if authorization expired');
   if (token) {
     if (String(data?.code) !== '0') fail('permission_denied', 'AliExpress authorization was not acknowledged');
     return data;
   }
-  const result = data?.[method.replaceAll('.', '_') + '_response'];
+  // Current SDK simplify mode returns flat objects and arrays. Legacy aliases
+  // retain their original named response envelope and DTO array wrappers.
+  const result = simplify ? data : data?.[method.replaceAll('.', '_') + '_response'];
   if (!object(result)) fail('invalid_response', 'AliExpress seller response is missing');
   return result;
 }
@@ -103,16 +108,16 @@ const ensureToken = credentialOperation(async function ensureToken(config) {
   const read = () => { if (config.credentialFile) config.credentials = readCredentialFile(config.credentialFile, config.credentialKey); validateBinding(config); };
   read();
   if (config.credentials.expires_at > Date.now() + 60000) return;
-  if (!config.credentialFile || config.credentials.refresh_expires_at <= Date.now() || !secret(config.credentials.refresh_token)) {
+  if (!hasCredentialRotation(config) && (!config.credentialFile || config.credentials.refresh_expires_at <= Date.now() || !secret(config.credentials.refresh_token))) {
     if (config.credentials.expires_at > Date.now()) return;
     fail('permission_denied', 'AliExpress authorization expired; reconnect');
   }
   let pending = refreshes.get(config.credentialFile);
   if (!pending) {
     pending = (async () => {
-      const next = tokens(config, await request(config, '/auth/token/refresh', { refresh_token: config.credentials.refresh_token }, true), config.credentials);
-      next.identity = redact(await profile({ ...config, credentials: next }), next);
-      writeCredentialFile(config.credentialFile, config.credentialKey, next);
+      await rotateCredentialFile(config,
+        async () => tokens(config, await request(config, '/auth/token/refresh', { refresh_token: config.credentials.refresh_token }, true), config.credentials),
+        async candidate => { candidate.credentials.identity = redact(await profile(candidate), candidate.credentials); });
     })();
     refreshes.set(config.credentialFile, pending);
   }
@@ -209,4 +214,4 @@ async function authorize(config) {
   await execute(bound, 'orders.list', { limit: 1, created_after: Math.floor(Date.now() / 1000) - 86400 });
   return credentials;
 }
-module.exports = { isProvider, apiBase, validateBinding, actionsFor, identity, execute, authorize, authorizeUrl, sign, parseJSON, pacificTime };
+module.exports = { isProvider, apiBase, validateBinding, actionsFor, identity, execute, authorize, authorizeUrl, sign, parseJSON, pacificTime, ensureToken, request };

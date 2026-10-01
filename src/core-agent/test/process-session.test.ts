@@ -187,6 +187,8 @@ describe("persistent process sessions", () => {
     expect(rejected).toMatchObject({ isError: true });
     expect(rejected.content).not.toContain("does not accept");
     expect(rejected.content).toMatch(/not found|unknown|not exist/i);
+    expect(rejected.content).toContain('ignored_fields: ["command"]');
+    expect(rejected.content).not.toContain('must-not-run');
   });
 
   it("streams cursor-based output across separate Agent tool contexts", async () => {

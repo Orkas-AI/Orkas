@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -30,7 +31,8 @@ function extractFunction(source: string, name: string): string {
 
 function peerCloseResult(activeKind: 'model' | 'recipient' | 'workspace') {
   const helper = extractFunction(modelSource, '_closeOtherComposerPopovers');
-  return vm.runInNewContext(`
+  return vm.runInNewContext(`${composerAccessorSource}
+
     const closed = { model: 0, recipient: 0, workspace: 0 };
     function _closeComposerModelMenu() { closed.model += 1; }
     function _closeAgentPicker() { closed.recipient += 1; }
@@ -52,7 +54,8 @@ function closeRecipientPicker(preserveAtKey: boolean) {
   const closeStart = agentsSource.indexOf('function _closeAgentPicker');
   const closeEnd = agentsSource.indexOf('\nfunction _renderAgentPickerList', closeStart);
   const close = agentsSource.slice(closeStart, closeEnd);
-  return vm.runInNewContext(`
+  return vm.runInNewContext(`${composerAccessorSource}
+
     const classes = new Set();
     const attributes = {};
     const anchor = {
@@ -139,6 +142,7 @@ function delayedModelPicker() {
     setTimeout: (fn: () => void) => { timers.push(fn); return timers.length; },
     clearTimeout() {},
   });
+  vm.runInContext(composerAccessorSource, context);
   vm.runInContext(modelSource, context);
   const api = vm.runInContext('({ open: _toggleComposerModelMenu, close: _closeComposerModelMenu, peer: _closeOtherComposerPopovers })', context);
   return {

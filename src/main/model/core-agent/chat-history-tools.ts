@@ -540,15 +540,15 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
               cid: {
                 type: 'string',
                 description: hasProjectScope
-                  ? 'Search cid; required for project/all, ignored for host-bound current.'
-                  : 'Search cid; required for all, ignored for host-bound current.',
+                  ? 'Read only: conversation ID from search. Required when reading project/all; ignored for host-bound current.'
+                  : 'Read only: conversation ID from search. Required when reading all; ignored for host-bound current.',
               },
             }
           : {}),
         page: chatReadPageSchema(),
-        record_id: { type: 'string', description: 'Exact message ID from search/read.' },
-        turn_id: { type: 'string', description: 'User message ID or execution turn_id.' },
-        tool_call_id: { type: 'string', description: 'Select a stored tool call and its input/output.' },
+        record_id: { type: 'string', description: 'Read only: exact message ID from search/read.' },
+        turn_id: { type: 'string', description: 'Read only: user message ID or execution turn_id.' },
+        tool_call_id: { type: 'string', description: 'Read only: select a stored tool call and its input/output.' },
         output_cursor: { type: 'integer', minimum: 0, description: 'Full tool_call_id output: start at 0, continue returned cursor.' },
         include_process: { type: 'boolean', description: 'Execution records: default true with tool_call_id, else false.' },
         cursor: { type: 'integer', minimum: 0, description: 'Partial-read character cursor.' },
@@ -761,7 +761,9 @@ function chatHistoryActionError(
   input: Record<string, unknown>,
 ): string | null {
   const unexpected = Object.keys(input).filter(
-    (key) => !CHAT_HISTORY_ACTION_FIELDS[action].has(key),
+    (key) => !Object.values(CHAT_HISTORY_ACTION_FIELDS).some((fields) => fields.has(key))
+      || (action === 'search' && ['cid', 'record_id', 'turn_id', 'tool_call_id'].includes(key)
+        && input[key] !== undefined && input[key] !== null && input[key] !== ''),
   );
   if (!unexpected.length) return null;
   return `chat_history(${action}): unsupported field(s): ${unexpected.sort().join(', ')}`;
@@ -796,7 +798,7 @@ export function createChatHistoryTool(opts: ChatHistoryToolsOpts): AgentTool {
         action: {
           type: 'string',
           enum: ['search', 'read'],
-          description: 'read: exact refs or latest for vague local references. Follow next_read. Omit other-action fields.',
+          description: 'search uses query/k; read uses cid/record_id/turn_id/tool_call_id or latest for vague local references. Follow next_read. Unused fields are reported in ignored_fields; nonempty search selectors are rejected to preserve scope.',
         },
         ...searchProperties,
         ...readProperties,
@@ -815,14 +817,30 @@ export function createChatHistoryTool(opts: ChatHistoryToolsOpts): AgentTool {
       }
       const fieldError = chatHistoryActionError(action, input);
       if (fieldError) return { content: fieldError, isError: true };
+      const effectiveFields = action === 'search'
+        ? new Set([...CHAT_HISTORY_ACTION_FIELDS.search].filter((key) => key !== 'page'))
+        : CHAT_HISTORY_ACTION_FIELDS.read;
+      const ignoredFields = Object.keys(input).filter((key) => !effectiveFields.has(key)).sort();
+      const effectiveInput = Object.fromEntries(Object.entries(input).filter(([key]) => effectiveFields.has(key)));
+      const notice = ignoredFields.length ? `ignored_fields: ${JSON.stringify(ignoredFields)}\n` : '';
+      const execute = async (ctx: ToolContext) => {
+        const budget = Number(ctx.state[RETRIEVAL_OUTPUT_BUDGET_KEY]);
+        const bounded = notice && Number.isFinite(budget)
+          ? { ...ctx, state: { ...ctx.state,
+              [RETRIEVAL_OUTPUT_BUDGET_KEY]: Math.max(0, budget - estimateToolResultTokens(notice)),
+            } }
+          : ctx;
+        const result = await operations[action].execute(effectiveInput, bounded);
+        return notice ? { ...result, content: notice + result.content } : result;
+      };
       if (opts.isProgrammaticToolCallContext?.(ctx)) {
         // Child observations stay inside run_program; only its final output
         // consumes the model-step ledger. The normal result ceiling still fits
         // each child receipt and retains exact pagination.
         const child = { ...ctx, state: { ...ctx.state, toolResultInlineLedger: undefined, toolResultReadLedger: undefined } };
-        return withRetrievalBudget(child, (bounded) => operations[action].execute(input, bounded));
+        return withRetrievalBudget(child, execute);
       }
-      return withRetrievalBudget(ctx, (child) => operations[action].execute(input, child));
+      return withRetrievalBudget(ctx, execute);
     },
   };
 }

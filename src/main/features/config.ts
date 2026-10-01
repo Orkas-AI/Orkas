@@ -65,10 +65,18 @@ function preferencesFile(): string {
   return userPreferencesFile(getActiveUserId());
 }
 
-function systemLanguage(): Lang {
+function systemLocales(): string | string[] {
+  try {
+    const preferred = app.getPreferredSystemLanguages();
+    if (Array.isArray(preferred) && preferred.length) return preferred;
+  } catch { /* older Electron or pre-ready/test host */ }
   let locale = '';
   try { locale = app.getLocale() || ''; } catch { /* pre-ready or test stub */ }
-  return detectSystemLang(locale);
+  return locale;
+}
+
+function systemLanguage(): Lang {
+  return detectSystemLang(systemLocales());
 }
 
 export function readPreferences(): UserPreferences {
@@ -154,7 +162,7 @@ export function refreshCurrentLanguageFromPreferences(): Lang {
  * Takes `systemLocale` explicitly so tests can exercise the branches without
  * pulling in Electron's `app`. Production caller is `initLanguageFromApp`.
  */
-export function initLanguage(systemLocale: string): Lang {
+export function initLanguage(systemLocale: string | string[]): Lang {
   const pref = readPreferences();
   if (isLang(pref.language)) {
     setCurrentLang(pref.language);
@@ -250,9 +258,7 @@ export function setTaskNotificationsEnabled(enabled: boolean): boolean {
 
 /** Production wrapper: reads the system locale from Electron's `app`. */
 export function initLanguageFromApp(): Lang {
-  let locale = '';
-  try { locale = app.getLocale() || ''; } catch { /* pre-ready or test stub */ }
-  return initLanguage(locale);
+  return initLanguage(systemLocales());
 }
 
 /** Re-export for callers that need it without pulling i18n directly. */

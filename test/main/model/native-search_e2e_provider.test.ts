@@ -1,3 +1,4 @@
+import { replayOrigin } from "../../../src/core-agent/src/providers/replay-compatibility";
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -31,7 +32,7 @@ describe('native search through the production payload hook and real SDK', () =>
       const provider = createPiProvider({ provider: providerId, apiKey: fakeToken,
         customModel: { id, name: id, api, provider: providerId, baseUrl: 'https://example.invalid',
           reasoning: true, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 272000, maxTokens: 128000, compat: { supportsToolSearch: true, supportsAdditionalTools } },
+          contextWindow: 272000, maxTokens: 128000, compat: { supportsToolSearch: true, supportsAdditionalTools, supportsMidConvoSystemMessages: true, supportsMidConvoToolAdditions: true } },
         onPayload: (payload, model) => {
           raw = structuredClone(payload);
           sent = hook(payload, model);
@@ -350,6 +351,7 @@ describe('Google server tool context through the SDK and durable session', () =>
       expect(JSON.stringify(body)).toContain('https://example.org/release');
       for (const partsJson of ['invalid-json', 'x'.repeat(2000001)]) {
         const messages: any[] = [{ role: 'assistant', content: [{ type: 'text', text: 'Previous answer',
+          replayOrigin: replayOrigin({ api: 'google-generative-ai', provider: 'google', id: 'gemini-3.8-flash', baseUrl: 'https://example.invalid/v1beta' }, 'fixture-key'),
           googleNativeReplay: { api: 'google-generative-ai', provider: 'google', model: 'gemini-3.8-flash', partsJson } }] }];
         await expect(provider.complete({ model: 'gemini-3.8-flash', tools: definitions, messages })).rejects.toThrow('Invalid Google tool context');
       }

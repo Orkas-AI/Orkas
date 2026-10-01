@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { ElectronApplication } from '@playwright/test';
@@ -11,6 +11,46 @@ const PNG_1X1 = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
   'base64',
 );
+
+// A multi-file page as agents usually produce it: sibling stylesheet, a
+// classic script in a subfolder, an ES module, fetched JSON and a local font.
+const SYSTEM_FONT = [
+  '/System/Library/Fonts/Supplemental/Arial.ttf',
+  'C:\\Windows\\Fonts\\arial.ttf',
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+].find((candidate) => existsSync(candidate));
+
+function createMultiFileSite(orkas: { createWorkspaceFile(relativePath: string, content: string | Buffer): string }, dir: string, useStorage: boolean): string {
+  orkas.createWorkspaceFile(`${dir}/style.css`, `${SYSTEM_FONT ? '@font-face{font-family:PreviewFont;src:url(fonts/preview.ttf)}' : ''}
+output#classic{color:rgb(10, 20, 30)}`);
+  orkas.createWorkspaceFile(`${dir}/assets/icons.js`, "window.__icons = 'icons ready';");
+  orkas.createWorkspaceFile(`${dir}/app.mjs`, "document.getElementById('module').textContent = 'module ran';");
+  orkas.createWorkspaceFile(`${dir}/data.json`, '{"label":"data loaded"}');
+  if (SYSTEM_FONT) orkas.createWorkspaceFile(`${dir}/fonts/preview.ttf`, readFileSync(SYSTEM_FONT));
+  return orkas.createWorkspaceFile(`${dir}/index.html`, `<!doctype html>
+<html><head><link rel="stylesheet" href="style.css"><script src="assets/icons.js"></script>
+<script type="module" src="app.mjs"></script></head><body>
+  <button>Refresh</button>
+  <output id="classic"></output><output id="module"></output><output id="data"></output>
+  <output id="font"></output><output id="storage"></output>
+  <script>
+    document.getElementById('classic').textContent = window.__icons || 'missing';
+    fetch('data.json').then((r) => r.json())
+      .then((d) => { document.getElementById('data').textContent = d.label; })
+      .catch((e) => { document.getElementById('data').textContent = e.name; });
+    document.fonts.load('16px PreviewFont').then((faces) => {
+      document.getElementById('font').textContent = faces.length ? 'font loaded' : 'no font';
+    });
+    try {
+      localStorage.setItem('draft', '1');
+      document.getElementById('storage').textContent = 'available';
+    } catch (e) {
+      document.getElementById('storage').textContent = e.name;
+      ${useStorage ? "console.error('draft storage unavailable: ' + e.message);" : ''}
+    }
+  </script>
+</body></html>`);
+}
 
 // Delay the actual document response, leaving layout IPC and the renderer's
 // native iframe load events intact. Each test owns an isolated Electron app.
@@ -33,6 +73,47 @@ async function holdFirstHtmlResponse(app: ElectronApplication, html: string) {
 }
 
 test.describe('local HTML preview', () => {
+  test('loads same-folder styles, scripts, modules, data and fonts while storage stays sandboxed', async ({ appPage, orkas }) => {
+    const entry = createMultiFileSite(orkas, 'site', false);
+    const preview = await orkas.openPreview(() => appPage.evaluate((p) => {
+      void (window as any).openChatFileViewer(p, 'index.html');
+    }, entry));
+    const frame = preview.locator('.chat-file-viewer-html').contentFrame();
+    await expect(frame.locator('#classic')).toHaveText('icons ready');
+    await expect(frame.locator('#classic')).toHaveCSS('color', 'rgb(10, 20, 30)');
+    await expect(frame.locator('#module')).toHaveText('module ran');
+    await expect(frame.locator('#data')).toHaveText('data loaded');
+    if (SYSTEM_FONT) await expect(frame.locator('#font')).toHaveText('font loaded');
+    await expect(frame.locator('#storage')).toHaveText('SecurityError');
+  });
+
+  test('checks a deliverable page under the file viewer sandbox and keeps artifact checks unchanged', async ({ orkas }) => {
+    const modulePath = path.resolve(__dirname, '../../src/main/features/html_preview.ts');
+    const clean = createMultiFileSite(orkas, 'check-clean', false);
+    const storage = createMultiFileSite(orkas, 'check-storage', true);
+    const check = (htmlPath: string, fileViewer: boolean) => orkas.electronApp!.evaluate(async (_, args) => {
+      const { renderResponsiveHtmlPreview } = (process as any).mainModule.require(args.modulePath);
+      const result = await renderResponsiveHtmlPreview(args.htmlPath, [
+        { name: 'desktop', width: 1280, height: 800 },
+      ], {}, { interactions: false, fileViewer: args.fileViewer });
+      return result.evidence;
+    }, { modulePath, htmlPath, fileViewer });
+
+    const cleanEvidence = await check(clean, true);
+    expect(cleanEvidence.viewports[0].consoleErrors).toEqual([]);
+    expect(cleanEvidence.blockedResourceCount).toBe(0);
+    expect(cleanEvidence.ok).toBe(true);
+
+    const storageEvidence = await check(storage, true);
+    expect(storageEvidence.ok).toBe(false);
+    expect(storageEvidence.viewports[0].consoleErrors.join(' ')).toMatch(/draft storage unavailable: .*sandboxed/);
+
+    // Generated artifacts run in chat-app:// with a real origin; their smoke
+    // check keeps the default loading and may use storage.
+    const artifactEvidence = await check(storage, false);
+    expect(artifactEvidence.viewports[0].consoleErrors).toEqual([]);
+  });
+
   test('audits filter panels after a dense graphic and retains missing effects as inconclusive', async ({ orkas }) => {
     const modulePath = path.resolve(__dirname, '../../src/main/features/html_preview.ts');
     for (const working of [true, false]) {

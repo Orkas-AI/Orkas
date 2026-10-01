@@ -56,6 +56,19 @@ describe('AliExpress seller authorization and protocol', () => {
     expect(() => api.parseJSON('{"id":9007199254740993 trailing}')).toThrow();
     expect(() => api.parseJSON('{"id":1e999}')).toThrow();
   });
+  it('uses the current SDK flat response mode only when requested and preserves direct arrays and exact IDs', async () => {
+    const { mock, c } = await connected();
+    mock.mockResolvedValueOnce(new Response('{"code":"0","aeop_post_category_list":[{"id":9007199254740993,"names":{"en":"Communication Equipment"}}],"request_id":"fixture"}'));
+    const result = await api.request(c, 'aliexpress.category.tree.list', {}, false, false, { simplify: true });
+    expect(result).toEqual({ code: '0', aeop_post_category_list: [{ id: '9007199254740993', names: { en: 'Communication Equipment' } }], request_id: 'fixture' });
+    const form = new URLSearchParams(mock.mock.calls[0][1]!.body as string);
+    expect(form.get('simplify')).toBe('true'); expect(form.get('session')).toBe(TOKEN);
+    const signed = Object.fromEntries(form);
+    expect(signed.sign).toBe(createHmac('sha256', SECRET).update(Object.keys(signed).filter(key => key !== 'sign').sort().map(key => key + signed[key]).join('')).digest('hex').toUpperCase());
+    mock.mockResolvedValueOnce(new Response(JSON.stringify({ code: 'InvalidParameter', msg: SECRET })));
+    await expect(api.request(c, 'aliexpress.category.tree.list', {}, false, false, { simplify: true })).rejects.toMatchObject({ message: expect.not.stringContaining(SECRET) });
+    expect(mock).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('AliExpress useful reads and safe stock writes', () => {
@@ -131,4 +144,22 @@ describe('AliExpress useful reads and safe stock writes', () => {
     await expect(api.execute(c, 'inventory.set', stock)).rejects.toMatchObject({ code: 'storefront_network_failed', message: expect.stringContaining('inspect stock') });
     expect(mock).toHaveBeenCalledTimes(2);
   });
+});
+
+
+it('distinguishes documented flat compliance business codes from gateway errors without weakening legacy replies', async () => {
+  const { mock, c } = await connected();
+  const method = 'aliexpress.trade.compliance.order.query';
+  const options = { simplify: true, businessSuccessCodes: ['200'] };
+  mock.mockResolvedValueOnce(new Response(JSON.stringify({ code: '200', success: true, data: [] })));
+  expect(await api.request(c, method, {}, false, false, options)).toMatchObject({ code: '200', success: true, data: [] });
+  for (const payload of [{ code: '400', success: false }, { code: '500', msg: SECRET }, { code: '200', success: true, error_response: { code: 'InsufficientPermission', msg: SECRET } }]) {
+    mock.mockResolvedValueOnce(new Response(JSON.stringify(payload)));
+    await expect(api.request(c, method, {}, false, false, options)).rejects.toMatchObject({ message: expect.not.stringContaining(SECRET) });
+  }
+  mock.mockResolvedValueOnce(new Response(JSON.stringify({ code: '200', success: true, data: [] })));
+  await expect(api.request(c, method, {}, false, false, { simplify: true })).rejects.toThrow();
+  mock.mockResolvedValueOnce(new Response(JSON.stringify({ code: '200', [method.replaceAll('.', '_') + '_response']: { success: true } })));
+  await expect(api.request(c, method, {}, false, false, { businessSuccessCodes: ['200'] })).rejects.toThrow();
+  expect(mock).toHaveBeenCalledTimes(6);
 });

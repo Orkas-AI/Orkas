@@ -28,6 +28,7 @@
  * extraction / CLI dispatch / reflect / anon stay free of connector exposure.
  */
 import type { AgentTool, ToolResult } from '#core-agent';
+import { createConnectorToolDiscovery, validateDiscoveryParams, ConnectorDiscoveryError } from '../../features/connectors/tool-discovery';
 
 import * as manager from '../../features/connectors/manager';
 import {
@@ -38,6 +39,7 @@ import { validateCustomTransport, validateDisplayName, CustomTransportError } fr
 import { requestInstallConfirm } from '../../features/connectors/install_confirm';
 import { requestActionConfirm, connectorAccountKey, type AppUsageScope } from '../../features/connectors/action_confirm';
 import { connectorActionRisk, isConnectorActionBlocked } from '../../features/connectors/action_policy';
+import { observeTaskDraftResult } from '../../features/connectors/task-created-drafts';
 import { findCatalogEntry } from '../../features/connectors/catalog';
 import { resolveLanguageForUser } from '../../features/config';
 import { descriptionLang } from '../../i18n';
@@ -46,7 +48,7 @@ import { logErrorRef, maskId } from '../../util/log-redact';
 import type { ConnectorInstance, ToolSchema } from '../../features/connectors/types';
 
 const log = createLogger('connector-meta-tools');
-const MAX_INLINE_CONNECTOR_TOOLS_CHARS = 30_000;
+const discoveryContract = require('../../../../bin/connector-discovery-contract.cjs');
 const MAX_RECOVERY_ACTIONS = 24;
 const MAX_RECOVERY_ACTION_LIST_CHARS = 3_000;
 
@@ -112,21 +114,6 @@ function _jsonStringify(value: unknown): string {
   }
 }
 
-function _schemaArgSummary(schema: Record<string, unknown> | undefined): string {
-  const props = schema?.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
-    ? schema.properties as Record<string, unknown>
-    : {};
-  const required = Array.isArray(schema?.required) ? new Set(schema.required.map(String)) : new Set<string>();
-  const keys = Object.keys(props).slice(0, 12).map((key) => required.has(key) ? key : `${key}?`);
-  const suffix = Object.keys(props).length > keys.length ? ', ...' : '';
-  return keys.length ? ` args: ${keys.join(', ')}${suffix}` : ' args: {}';
-}
-
-function _shortDescription(text: string | undefined): string {
-  const compact = String(text || '(no description)').replace(/\s+/g, ' ').trim();
-  return compact.length > 220 ? `${compact.slice(0, 217)}...` : compact;
-}
-
 function _renderSingleToolSchema(cid: string, tool: ToolSchema): string {
   return [
     `Action on connector "${cid}": ${tool.name}`,
@@ -140,19 +127,6 @@ function _renderSingleToolSchema(cid: string, tool: ToolSchema): string {
     _jsonStringify(tool.input_schema ?? {}),
     '```',
   ].join('\n').trimEnd();
-}
-
-function _renderCompactToolList(cid: string, tools: ToolSchema[]): string {
-  const lines: string[] = [
-    `Actions on connector "${cid}" (${tools.length}).`,
-    `Call \`list_connector_tools({connector_id: "${cid}", tool_name: "<name>"})\` to expand one action's JSON input schema, then invoke it via ` +
-      `\`call_connector_tool({connector_id: "${cid}", tool_name: "<name>", args: {…}})\`.`,
-    '',
-  ];
-  for (const t of tools) {
-    lines.push(`- **${t.name}** — ${_shortDescription(t.description)} (${_schemaArgSummary(t.input_schema)})`);
-  }
-  return lines.join('\n').trimEnd();
 }
 
 function _unavailableActionMessage(cid: string, requestedTool: string, tools: ToolSchema[]): string {
@@ -244,49 +218,48 @@ export async function getConnectorPromptBlock(uid: string): Promise<string> {
 }
 
 function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
+  const discover = createConnectorToolDiscovery();
   return {
     name: 'list_connector_tools',
     // Kept sequential to match the connector-tool rule in
     // core-agent/src/tools/base.ts (connector tools stay sequential). Although
     // discovery is read-only, aligning with the documented rule avoids a future
     // side-effectful connector tool inheriting `parallel` by copy-paste.
-    description:
-      'List visible connector ids when connector_id is omitted. With a connector_id, list its actions; add tool_name to return one action\'s full input schema before calling call_connector_tool.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        connector_id: {
-          type: 'string',
-          description: 'Optional visible connector id. Omit to discover valid ids.',
-        },
-        tool_name: {
-          type: 'string',
-          description: 'Optional action name. When provided, returns only that action with its full input schema.',
-        },
-      },
-      additionalProperties: false,
-    },
+    description: discoveryContract.description,
+    inputSchema: discoveryContract.inputSchema,
     async execute(input) {
-      const cid = typeof (input as { connector_id?: unknown }).connector_id === 'string'
-        ? ((input as { connector_id: string }).connector_id).trim()
-        : '';
-      const requestedTool = typeof (input as { tool_name?: unknown }).tool_name === 'string'
-        ? ((input as { tool_name: string }).tool_name).trim()
-        : '';
-      if (!cid && requestedTool) {
-        return errResult('E_BAD_INPUT', '`connector_id` is required when `tool_name` is provided');
+      let params: ReturnType<typeof validateDiscoveryParams>;
+      try { params = validateDiscoveryParams(input as Record<string, unknown>); }
+      catch (error) {
+        const code = error instanceof ConnectorDiscoveryError ? error.code : 'E_BAD_INPUT';
+        return errResult(code, (error as Error).message);
       }
+      const cid = params.connector_id || '';
+      const requestedTool = params.tool_name || '';
       const visible = await resolveVisibleConnectors(opts.userId);
       _recordVisibleConnectorDisplayNames(opts, visible);
+      if (params.query) {
+        try {
+          const result = discover(visible, params);
+          const content = JSON.stringify(result, null, 2);
+          return { content };
+        } catch (error) {
+          const code = error instanceof ConnectorDiscoveryError ? error.code : 'E_BAD_INPUT';
+          return errResult(code, (error as Error).message);
+        }
+      }
       if (!cid) {
+        const page = discover(visible, params);
+        const pageIds = new Set(page.connectors?.map(connector => connector.id));
         const content = visible.length
           ? [
             'Visible connectors. Choose an exact id, then call `list_connector_tools` again with `connector_id`.',
             '',
-            ...visible.map(({ instance }) => _renderConnectorLine(
+            ...visible.filter(v => pageIds.has(v.instance.id)).map(({ instance }) => _renderConnectorLine(
               instance,
               _descriptionLangForUser(opts.userId),
             )),
+            ...(page.next_offset !== null ? [`More connectors: list_connector_tools({offset: ${page.next_offset}, limit: ${params.limit ?? 20}}).`] : []),
           ].join('\n')
           : 'No connectors are currently visible to this Agent. Ask the user to select or enable one.';
         return { content };
@@ -318,26 +291,14 @@ function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
         return { content: _renderSingleToolSchema(cid, tool) };
       }
 
-      const lines: string[] = [
-        `Actions on connector "${cid}". Invoke any of them via ` +
-        `\`call_connector_tool({connector_id: "${cid}", tool_name: "<name>", args: {…}})\` — ` +
-        '`args` MUST match the listed input_schema verbatim. If this response is compact, call ' +
-        `\`list_connector_tools({connector_id: "${cid}", tool_name: "<name>"})\` for one action's schema.`,
-        '',
-      ];
-      for (const t of match.tools) {
-        lines.push(`### ${t.name}`);
-        lines.push(t.description || '(no description)');
-        lines.push('');
-        lines.push('Input schema:');
-        lines.push('```json');
-        lines.push(_jsonStringify(t.input_schema ?? {}));
-        lines.push('```');
-        lines.push('');
-      }
-      const full = lines.join('\n').trimEnd();
-      const compact = full.length > MAX_INLINE_CONNECTOR_TOOLS_CHARS;
-      const content = compact ? _renderCompactToolList(cid, match.tools) : full;
+      const result = discover(visible, params);
+      const compact = !result.schemas_included;
+      const content = compact
+        ? JSON.stringify(result, null, 2)
+        : [
+          `Actions on connector "${cid}". Invoke via call_connector_tool; args must match input_schema.`,
+          ...result.tools!.map(tool => `### ${tool.name}\n${tool.description || '(no description)'}\n\nInput schema:\n\`\`\`json\n${_jsonStringify(tool.input_schema)}\n\`\`\`\n`),
+        ].join('\n');
       return { content };
     },
   };
@@ -347,7 +308,7 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
   return {
     name: 'call_connector_tool',
     description:
-      'Invoke a connector action using the schema returned by list_connector_tools. A successful tool call confirms transport only; claim an external side effect completed only when the returned response explicitly confirms it.',
+      'Invoke a connector action using the schema returned by list_connector_tools. ' + discoveryContract.callSuitability + ' A successful tool call confirms transport only; claim an external side effect completed only when the returned response explicitly confirms it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -436,7 +397,9 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
             `This connector action accepts at most ${policy.max_batch_size} items in any array argument. Split the request into smaller batches.`,
           );
         }
-        const actionRisk = connectorActionRisk(match.instance, toolMatch, normalizedArgs);
+        const draftScope = !opts.appUsage && !match.instance.composio_grant && opts.cid
+          ? { uid: opts.userId, cid: opts.cid, connectorId: cid, accountKey: connectorAccountKey(match.instance) } : undefined;
+        const actionRisk = connectorActionRisk(match.instance, toolMatch, normalizedArgs, draftScope);
         if (actionRisk.risk === 'H' || actionRisk.risk === 'D') {
           const approved = await requestActionConfirm({
             userId: opts.userId,
@@ -466,6 +429,7 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
           }
         }
         const raw = await manager.callTool(opts.userId, cid, toolName, normalizedArgs, { signal: ctx.signal });
+        if (!ctx.signal?.aborted) observeTaskDraftResult(draftScope, toolName, normalizedArgs, raw);
         const content = stringifyMcpResult(raw);
         const protocolError = !!raw && typeof raw === 'object' && (raw as { isError?: unknown }).isError === true;
         return protocolError ? { content, isError: true } : { content };

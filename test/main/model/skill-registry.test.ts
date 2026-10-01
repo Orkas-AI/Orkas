@@ -118,6 +118,8 @@ describe('Agent authoring Skill candidates', () => {
       }
     }
     expect(specs.length).toBeGreaterThan(0);
+    const packagedIds = specs.map((spec) => spec.id).sort();
+    expect(new Set(packagedIds).size).toBe(packagedIds.length);
     const registry = await loadRegistry();
     const bindings = new Map<string, import('../../../src/main/model/core-agent/skill-registry').SkillRuntimeBinding>();
     const system = await registry.getSystemSkillsPromptBlock(TEST_UID, bindings);

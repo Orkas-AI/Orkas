@@ -646,8 +646,10 @@ describe('builtin skill inline budget', () => {
   it('keeps shared and System discovery descriptions compact without changing user-content limits', () => {
     const resident = groups.filter(group => group.kind !== 'agent').flatMap(group => group.specs);
     // A shipped-source growth alarm, not a runtime truncation or quality gate.
+    // 2026-09-22: six requester-approved ecommerce Skills moved into the
+    // resident shared roster without changing their descriptions (5,192 chars).
     const chars = resident.reduce((sum, spec) => sum + pickDescription(spec, 'en').length, 0);
-    expect(chars).toBeLessThanOrEqual(4_500);
+    expect(chars).toBeLessThanOrEqual(5_250);
     const creator = resident.find(spec => spec.name === 'agent-creator')!;
     const skillCreator = resident.find(spec => spec.name === 'skill-creator')!;
     expect(creator.description_en).not.toMatch(/inline.*container/i);

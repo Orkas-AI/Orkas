@@ -410,14 +410,14 @@ describe('search/indexer › indexChatMessageDeferred', () => {
 
   it('drains to completion even when an upsert fails', async () => {
     const ix = await loadIndexer();
-    // One upsert fails at the storage layer; its successor must still land.
-    const store = await loadChatStore();
-    const realUpsert = store.upsertDoc;
+    // A failed worker command must not poison the per-account queue.
+    const { ChatRebuildWorker } = await import('../../../../src/main/features/search/chat-rebuild');
+    const realUpsert = ChatRebuildWorker.prototype.indexMessage;
     let failed = false;
-    vi.spyOn(store, 'upsertDoc').mockImplementation(((uid: string, doc: never) => {
-      if (!failed) { failed = true; throw new Error('disk full'); }
-      return realUpsert(uid, doc);
-    }) as typeof store.upsertDoc);
+    vi.spyOn(ChatRebuildWorker.prototype, 'indexMessage').mockImplementation(function(message) {
+      if (!failed) { failed = true; return Promise.reject(new Error('injected storage failure')); }
+      return realUpsert.call(this, message);
+    });
 
     ix.indexChatMessageDeferred('u1', 'c1', 0, { role: 'user', content: 'alpha', time: 't1' });
     ix.indexChatMessageDeferred('u1', 'c1', 1, { role: 'user', content: 'beta', time: 't2' });

@@ -963,12 +963,18 @@ describe('search › startup reconcile', () => {
     fs.writeFileSync(`${snapshot}.tmp`, 'half-written flush');
 
     const chatStore = await import('../../../../src/main/features/search/chat_store');
-    const compact = vi.spyOn(chatStore, 'compact').mockImplementation(() => undefined);
+    // Seed real free pages: calling a method is not evidence of disk reclamation.
+    const { default: Database } = await import('better-sqlite3');
+    chatStore.docCount(TEST_UID);
+    const db = new Database(chatStore.chatStorePath(TEST_UID));
     const s = await loadSearch();
-    await s.reconcileActive();
-
-    expect(compact).toHaveBeenCalledTimes(1);
-    expect(compact).toHaveBeenCalledWith(TEST_UID);
+    try {
+      db.exec('CREATE TABLE reclaim_fixture (body BLOB); INSERT INTO reclaim_fixture VALUES (zeroblob(40000000)); DROP TABLE reclaim_fixture');
+      expect((db.pragma('freelist_count', { simple: true }) as number)
+        * (db.pragma('page_size', { simple: true }) as number)).toBeGreaterThan(32 * 1024 * 1024);
+      await s.reconcileActive();
+      expect(db.pragma('freelist_count', { simple: true })).toBe(0);
+    } finally { db.close(); }
     expect(fs.existsSync(snapshot), 'the retired snapshot is removed').toBe(false);
     expect(fs.existsSync(`${snapshot}.tmp`), 'and so is a half-written flush').toBe(false);
     const results = await s.searchChats(TEST_UID, 'quokka');

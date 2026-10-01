@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // Journey coverage: combined setup -> browser -> relay -> shop verification -> encrypted
 // grant -> existing MCP actions. External boundaries are fake; no real store is contacted.
 const mocks = vi.hoisted(() => ({ open: vi.fn(async (_url: string) => undefined) }));
+vi.mock('../../../../src/main/features/users', () => ({ getActiveUserId: () => 'seller-e2e-test' }));
 vi.mock('electron', () => ({ app: { isPackaged: false }, shell: { openExternal: mocks.open } }));
 vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({ accountApiBase: () => 'https://orkas.ai/api', tokenStore: { getDeviceId: () => 'seller-test-device', authHeaders: () => ({}) } }));
 vi.mock('../../../../src/main/features/config', () => ({ getLanguage: () => 'en', getLanguageForUser: () => 'en' }));
@@ -25,6 +26,7 @@ vi.mock('../../../../src/main/model/core-agent/interactive-cli-sessions', () => 
   waitInteractiveCliSession: vi.fn(),
 }));
 
+import { _setBroadcastForTest, respondAccountChoice } from '../../../../src/main/features/connectors/account-choice';
 import { findCatalogEntry } from '../../../../src/main/features/connectors/catalog';
 import { authorizeLocalApi, hasLocalApiAuthorization, localApiRuntimeDir, localApiTransport,
   normalizeLocalApiConnectionInput, removeLocalApiAuthorization } from '../../../../src/main/features/connectors/local-api';
@@ -77,12 +79,90 @@ const callback = () => handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callba
 beforeEach(() => { vi.clearAllMocks(); });
 afterEach(() => {
   cancelDcrOAuth();
+  _setBroadcastForTest();
   for (const id of Object.keys(inputs)) removeLocalApiAuthorization(UID, findCatalogEntry(id)!);
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
 describe('seller-owned marketplace authorization journey', () => {
+  it('chooses an authorized shop without a manually supplied ID and binds subsequent calls to it', async () => {
+    const entry = findCatalogEntry('tiktok-shop')!;
+    let choice: any;
+    _setBroadcastForTest((channel, payload) => { if (channel === 'connectors:account-choice') choice = payload; return true; });
+    const requests = relay('tiktok_shop', url => url.pathname.endsWith('/shops') ? json({ code: 0, data: { shops: [
+      ...identity('tiktok_shop').data!.shops!,
+      { id: '7495355150342452342', name: 'Other market', cipher: 'row-private', region: 'GB' },
+    ] } }) : undefined);
+    const { shop_id: _unused, ...input } = inputs['tiktok-shop'];
+    const flow = authorizeLocalApi(UID, entry, input);
+    const completion = callback();
+    await vi.waitFor(() => expect(choice).toBeDefined());
+    expect(choice.choices.map((item: any) => item.id)).toEqual(['7495355150342452340', '7495355150342452341']);
+    expect(JSON.stringify(choice)).not.toMatch(/cipher|access-test|refresh-test|Other market/);
+    expect(hasLocalApiAuthorization(UID, entry)).toBe(false);
+    expect(respondAccountChoice(UID, choice.request_id, '7495355150342452342')).toBe(false);
+    expect(respondAccountChoice(UID, choice.request_id, '7495355150342452341')).toBe(true);
+    await completion;
+    const metadata = await flow;
+    expect(metadata).toEqual({ region: 'us', shop_id: '7495355150342452341' });
+    const transport = await localApiTransport(UID, entry, metadata);
+    if (transport.kind !== 'stdio') throw new Error('Expected stdio');
+    const config = adapter.configured(transport.env);
+    expect(config.credentials.identity).toMatchObject({ binding_shop_id: metadata.shop_id, shop_cipher: 'other-private-cipher' });
+    await adapter.callTool('execute_read', { action: 'products.list' }, transport.env);
+    expect(new URL(requests.mock.calls.at(-1)![0]).searchParams.get('shop_cipher')).toBe('other-private-cipher');
+    expect(respondAccountChoice(UID, choice.request_id, metadata.shop_id)).toBe(false);
+  });
+
+  it('cancels shop selection without saving credentials and ignores a late response', async () => {
+    const entry = findCatalogEntry('tiktok-shop')!;
+    let choice: any;
+    const events: string[] = [];
+    _setBroadcastForTest((channel, payload) => { events.push(channel); if (channel === 'connectors:account-choice') choice = payload; return true; });
+    relay('tiktok_shop');
+    const { shop_id: _unused, ...input } = inputs['tiktok-shop'];
+    const flow = authorizeLocalApi(UID, entry, input);
+    const rejected = expect(flow).rejects.toMatchObject({ code: 'user_cancelled' });
+    const completion = callback();
+    await vi.waitFor(() => expect(choice).toBeDefined());
+    expect(cancelInFlightOAuth()).toBe(true);
+    await completion;
+    await rejected;
+    expect(events).toContain('connectors:account-choice-cancelled');
+    expect(respondAccountChoice(UID, choice.request_id, '7495355150342452340')).toBe(false);
+    expect(hasLocalApiAuthorization(UID, entry)).toBe(false);
+  });
+
+  it.each(['empty', 'wrong-market', 'duplicate', 'malformed'] as const)('rejects %s shop discovery before selection or persistence', async fault => {
+    const entry = findCatalogEntry('tiktok-shop')!;
+    const first = { id: '7495355150342452340', name: 'Fixture shop', cipher: 'private-cipher', region: 'US' };
+    const shops = fault === 'empty' ? [] : fault === 'wrong-market' ? [{ ...first, region: 'GB' }]
+      : fault === 'duplicate' ? [first, first] : [{ ...first, id: 7495355150342452340 }];
+    const shown = vi.fn(() => true);
+    _setBroadcastForTest(shown);
+    relay('tiktok_shop', url => url.pathname.endsWith('/shops') ? json({ code: 0, data: { shops } }) : undefined);
+    const { shop_id: _unused, ...input } = inputs['tiktok-shop'];
+    const flow = authorizeLocalApi(UID, entry, input);
+    const rejected = expect(flow).rejects.toThrow();
+    await callback(); await rejected;
+    expect(shown).not.toHaveBeenCalled();
+    expect(hasLocalApiAuthorization(UID, entry)).toBe(false);
+  });
+
+  it('retains an existing shop binding when reconnecting with an empty optional ID', async () => {
+    const entry = findCatalogEntry('tiktok-shop')!;
+    relay('tiktok_shop');
+    const shown = vi.fn(() => true);
+    _setBroadcastForTest(shown);
+    const flow = authorizeLocalApi(UID, entry, { ...inputs['tiktok-shop'], shop_id: '' }, {
+      existingBinding: { shop_id: 'USSELLERCODE', region: 'us' },
+    });
+    await callback();
+    await expect(flow).resolves.toEqual({ region: 'us', shop_id: 'USSELLERCODE' });
+    expect(shown).not.toHaveBeenCalled();
+  });
+
   it('accepts official local/global seller types and rejects creator, partner or malformed grants', async () => {
     const entry = findCatalogEntry('tiktok-shop')!;
     for (const userType of [0, 4, 5, 1, 2, 3, undefined]) {

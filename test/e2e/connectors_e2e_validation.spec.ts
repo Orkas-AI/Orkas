@@ -1,3 +1,4 @@
+import { expectComposerText } from './fixtures/composer';
 import { readFileSync, writeFileSync } from 'node:fs';
 
 import { expect, test, type OrkasTestApp } from './fixtures/orkas';
@@ -91,7 +92,7 @@ rl.on('line', (line) => {
       );
       await expect(connectorOption).toContainText('E2E Local MCP');
       await connectorOption.click();
-      await expect(page.locator('#new-chat-input')).toHaveValue(/Connector: E2E Local MCP/);
+      await expectComposerText(page.locator('#new-chat-input'), /Connector: E2E Local MCP/);
     };
   return { page, instance, card, callStatePath, startConnectorChat };
 }

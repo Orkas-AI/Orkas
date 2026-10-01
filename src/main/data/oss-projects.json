@@ -12,7 +12,16 @@
       "name_ko": "애니메이션 / 동영상",
       "name_de": "Animation / Video",
       "name_ru": "Анимация / Видео",
-      "name_it": "Animazione / Video"
+      "name_it": "Animazione / Video",
+      "name_zh-tw": "動畫／影片",
+      "name_pt-pt": "Animação / Vídeo",
+      "name_es-419": "Animación / Video",
+      "name_vi": "Hoạt hình / Video",
+      "name_tr": "Animasyon / Video",
+      "name_hi": "ऐनिमेशन / वीडियो",
+      "name_id": "Animasi / video",
+      "name_th": "แอนิเมชัน / วิดีโอ",
+      "name_ar": "الرسوم المتحركة / الفيديو"
     },
     {
       "code": "browser",
@@ -26,7 +35,16 @@
       "name_ko": "브라우저",
       "name_de": "Browser",
       "name_ru": "Браузер",
-      "name_it": "Browser"
+      "name_it": "Browser",
+      "name_zh-tw": "瀏覽器",
+      "name_pt-pt": "Navegador",
+      "name_es-419": "Navegador",
+      "name_vi": "Trình duyệt",
+      "name_tr": "Tarayıcı",
+      "name_hi": "ब्राउज़र",
+      "name_id": "Peramban",
+      "name_th": "เบราว์เซอร์",
+      "name_ar": "المتصفح"
     },
     {
       "code": "office",
@@ -40,7 +58,16 @@
       "name_ko": "사무",
       "name_de": "Büro",
       "name_ru": "Офис",
-      "name_it": "Ufficio"
+      "name_it": "Ufficio",
+      "name_zh-tw": "辦公",
+      "name_pt-pt": "Escritório",
+      "name_es-419": "Oficina",
+      "name_vi": "Văn phòng",
+      "name_tr": "Ofis",
+      "name_hi": "कार्यालय",
+      "name_id": "Perkantoran",
+      "name_th": "งานสำนักงาน",
+      "name_ar": "الأعمال المكتبية"
     },
     {
       "code": "slides",
@@ -54,7 +81,16 @@
       "name_ko": "슬라이드 / PPT",
       "name_de": "Folien / PPT",
       "name_ru": "Слайды / PPT",
-      "name_it": "Diapositive / PPT"
+      "name_it": "Diapositive / PPT",
+      "name_zh-tw": "簡報／PPT",
+      "name_pt-pt": "Diapositivos / PPT",
+      "name_es-419": "Diapositivas / PPT",
+      "name_vi": "Trang trình chiếu / PPT",
+      "name_tr": "Slaytlar / PPT",
+      "name_hi": "स्लाइड / PPT",
+      "name_id": "Slide / PPT",
+      "name_th": "สไลด์ / PPT",
+      "name_ar": "الشرائح / PPT"
     }
   ],
   "projects": [

@@ -731,6 +731,19 @@ describe('runner › scoped tool loading', () => {
     });
   }
 
+  it('injects one shared idle clock into every desktop actor, including direct reflection builds', async () => {
+    const uid = 'shared-agent-idle-clock';
+    await configureUser(uid);
+    const { getAgentIdleClock } = await import('../../../src/main/util/system-activity');
+    const clock = await getAgentIdleClock();
+    const { buildRunner } = await loadRunner();
+    for (const kind of ['gconv', 'gmember', 'gworker', 'agent', 'reflect']) {
+      const { runner } = await buildRunner({ sessionId: `${kind}-idle-clock`, userId: uid });
+      // Verify the host/runtime dependency boundary without invoking a model.
+      expect((runner as any).idleNow, kind).toBe(clock);
+    }
+  });
+
   it('keeps learned Skill creation pending until host Agent metadata is saved', async () => {
     const uid = 'learned-skill-drain';
     await configureUser(uid);
@@ -1046,7 +1059,10 @@ describe('runner › scoped tool loading', () => {
     expect(built.runner.getActiveToolDefinitions().map((tool) => tool.name)).not.toContain('todo_tasks');
     const context = { workingDir: tmpDir, state: {} };
     const load = await runner.tools.get('tool_load').execute({ groups: ['management.projects'] }, context);
-    expect(JSON.parse(load.content)).toMatchObject({ ok: true, newly_activated_tools: ['todo_tasks'] });
+    // The same group carries the project-creation tool for Commander; both are
+    // dormant until this load, and neither is resident.
+    expect(JSON.parse(load.content))
+      .toMatchObject({ ok: true, newly_activated_tools: ['todo_tasks', 'project_setup'] });
     expect(names).not.toHaveBeenCalled();
     expect(built.runner.getActiveToolDefinitions().map((tool) => tool.name)).toContain('todo_tasks');
     const tool = runner.tools.get('todo_tasks');
@@ -1169,7 +1185,7 @@ describe('runner › scoped tool loading', () => {
     expect(JSON.parse((await bound.execute({ action: 'list' }, context)).content).tasks)
       .toContainEqual(expect.objectContaining({ content: 'AGENT_BACKLOG_ON_DEMAND' }));
     expect(agent.runner.getActiveToolDefinitions().map((tool) => tool.name)).toContain('todo_tasks');
-    expect(bound.inputSchema.properties.action.enum).toEqual(['list', 'get', 'create', 'update', 'complete']);
+    expect(bound.inputSchema.properties.action.enum).toEqual(['list', 'get', 'create', 'update', 'complete', 'add_attachment', 'delete']);
     expect((await bound.execute({ action: 'update', task_id: agentTask.task.id, status: 'review', result_ref: 'artifact-1' }, context)).isError).toBeFalsy();
     expect(await tasks.getTask(uid, first.project.project_id, agentTask.task.id)).toMatchObject({ status: 'review', result_ref: 'artifact-1' });
     expect(await tasks.getTask(uid, first.project.project_id, agentTask.task.id)).not.toHaveProperty('origin_cid');
@@ -2924,7 +2940,8 @@ describe('runner › conversation-history scope exposure', () => {
       expect(prompt.indexOf('Use supplied context first')).toBeLessThan(prompt.indexOf('## Runtime injection'));
       expect(built.turnEphemeral).not.toContain('even without a user lookup request');
       const schema = built.toolDefs.find((tool) => tool.name === 'chat_history')!.inputSchema as any;
-      expect(schema.properties.action.description).toContain('exact refs or latest for vague local references');
+      expect(schema.properties.action.description).toContain('read uses cid/record_id/turn_id/tool_call_id');
+      expect(schema.properties.action.description).toContain('or latest for vague local references');
       expect(schema.properties.action.description).toContain('Follow next_read');
       expect(schema.properties.query.description).toContain('discriminative name, phrase, id, or fact');
     }

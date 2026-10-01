@@ -1300,10 +1300,39 @@ describe('agents › createCustomAgent', () => {
     expect(raw).not.toHaveProperty('description');
   });
 
-  it('defaults empty name to the localized no-space fallback', async () => {
+  it.each([
+    ['en', 'CodeReviewAssistant'],
+    ['ar', 'CodeReviewAssistant'],
+    ['hi', 'CodeReviewAssistant'],
+    ['th', 'CodeReviewAssistant'],
+    ['tr', 'KodIncelemeAsistani'],
+    ['vi', 'TroLyDanhGiaMa'],
+    ['zh-tw', '程式碼審查助手'],
+    ['pt-pt', 'AssistenteRevisaoCodigo'],
+    ['es-419', 'AsistenteRevisionCodigo'],
+  ] as const)('keeps default and suggested Agent names editable in %s', async (lang, suggestedName) => {
+    const { setLanguage } = await import('../../../src/main/features/config');
+    setLanguage(lang);
+    const mainTable = JSON.parse(fs.readFileSync(
+      path.resolve(__dirname, '../../../src/main/locales', `${lang}.json`), 'utf8',
+    ));
+    const rendererTable = JSON.parse(fs.readFileSync(
+      path.resolve(__dirname, '../../../src/renderer/locales', `${lang}.json`), 'utf8',
+    ));
     const a = await loadAgents();
     const agent = await a.createCustomAgent({ description: 'desc', category: 'general' });
-    expect(agent?.name).toBe('UntitledAgent');
+    expect(agent?.name).toBe(mainTable['agent.default_name']);
+    if (lang === 'en') expect(agent?.name).toBe('UntitledAgent');
+    // Creation applies the locale fallback after the initial name check. Saving
+    // that generated name exercises the real validator and @-mention contract.
+    const saved = await a.updateCustomAgent(agent!.agent_id, { name: agent!.name });
+    expect(saved?.name).toBe(agent!.name);
+    expect(rendererTable['agent_modal.name_placeholder'].endsWith(suggestedName)).toBe(true);
+    const renamed = await a.updateCustomAgent(agent!.agent_id, { name: suggestedName });
+    expect(renamed?.name).toBe(suggestedName);
+    expect(JSON.parse(fs.readFileSync(
+      path.join(customAgentsDir(), agent!.agent_id, 'agent.json'), 'utf8',
+    )).name).toBe(suggestedName);
   });
 
   it('stores workflow skill references by display name', async () => {
@@ -1732,6 +1761,7 @@ describe('agents › listAgents', () => {
     expect(searchListing).toMatchObject({
       agent_id: 'brief',
       name: 'Brief Agent',
+      runtime: { kind: 'cli', cli: 'codex' },
       description_zh: '',
       description_en: 'Test agent',
       enabled: false,

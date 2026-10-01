@@ -1,3 +1,4 @@
+import { composerText, expectComposerText } from './fixtures/composer';
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
@@ -102,7 +103,7 @@ test.describe('new chat composer', () => {
       await expect(first).toHaveText(`@${name} @DisplayWriter 你好`);
       await expect(page.locator('#chat-history .chat-message.user .markdown-body').last()).toHaveText(`@${name} continue`);
       await expect(editor.locator('.chat-use-inline-name')).toHaveText(name);
-      await expect(page.locator('#chat-input')).toHaveValue('@commander pending');
+      await expectComposerText(page.locator('#chat-input'), '@commander pending');
     }
     expect((await readHistory()).find((row) => row.from === 'user').display_text)
       .toBe('@指挥官 @DisplayWriter 你好');
@@ -163,7 +164,7 @@ test.describe('new chat composer', () => {
       element.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData }));
     });
     await expect(editor.locator('.chat-use-inline-name')).toHaveText('ScopedWriter');
-    await expect(page.locator('#project-chat-input')).toHaveValue('@ScopedWriter draft A; @OutsideResearcher research B');
+    await expectComposerText(page.locator('#project-chat-input'), '@ScopedWriter draft A; @OutsideResearcher research B');
     await page.locator('#project-chat-send-btn').click();
     await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
     const cid = await page.evaluate<string>('currentCid');
@@ -324,9 +325,9 @@ test.describe('new chat composer', () => {
     expect(await versionList.evaluate((element) => element.parentElement === document.body)).toBe(true);
     const parentHeightAfter = await parentMenu.evaluate((element) => element.getBoundingClientRect().height);
     expect(Math.abs(parentHeightAfter - parentHeightBefore)).toBeLessThan(1);
-    await expect(versionList.locator('.composer-model-menu-version-item')).toHaveCount(4);
+    await expect(versionList.locator('.composer-model-menu-version-item')).toHaveCount(7);
     await expect(versionList.locator('.composer-model-menu-version-label'))
-      .toHaveText(['GPT-6 Astra', 'GPT-5.6 Sol', 'GPT-5.6 Terra', 'GPT-5.6 Luna']);
+      .toHaveText(['GPT-6 Astra', 'GPT-6.1 Sol', 'GPT-6 Sol', 'GPT-6 Luna', 'GPT-5.6 Sol', 'GPT-5.6 Terra', 'GPT-5.6 Luna']);
     await expect(versionList.locator('.composer-model-menu-version-current-dot')).toHaveCount(1);
     await expect(versionList.locator('.composer-model-menu-version-check')).toHaveCount(0);
     await versionList.locator(
@@ -419,7 +420,7 @@ test.describe('new chat composer', () => {
     await search.fill('ComposerCli');
     for (const composition of [{ isComposing: true }, { keyCode: 229 }]) {
       await search.dispatchEvent('keydown', { key: 'Enter', ...composition });
-      await expect(input).toHaveValue('');
+      await expectComposerText(input, '');
       await expect(cliRow).toHaveAttribute('aria-checked', 'false');
     }
     await search.press('Enter');
@@ -428,7 +429,7 @@ test.describe('new chat composer', () => {
     await expect(cliRow).toHaveAttribute('aria-checked', 'true');
     await expect(cliRow.locator('.composer-model-menu-check')).toBeVisible();
     await expect(selected.getByRole('button', { name: 'Remove: ComposerCli', exact: true })).toBeVisible();
-    await expect(input).toHaveValue('@ComposerCli ');
+    await expectComposerText(input, '@ComposerCli ');
     await expect(appPage.locator('#new-chat-recipient-name')).toHaveText('ComposerCli');
     await expect(modelChip).toBeDisabled();
     await expect(modelChip).toBeVisible();
@@ -439,15 +440,15 @@ test.describe('new chat composer', () => {
     // Enter on a focused row uses the same selection toggle as a click.
     await cliRow.press('Enter');
     await expect(cliRow).toHaveAttribute('aria-checked', 'false');
-    await expect(input).toHaveValue('');
+    await expectComposerText(input, '');
     await cliRow.press('Enter');
     await expect(cliRow).toHaveAttribute('aria-checked', 'true');
-    await expect(input).toHaveValue('@ComposerCli ');
+    await expectComposerText(input, '@ComposerCli ');
     await search.fill('');
     await commanderRow.press('Space');
     await expect(commanderRow).toHaveAttribute('aria-checked', 'true');
     await expect(cliRow).toHaveAttribute('aria-checked', 'true');
-    await expect(input).toHaveValue('@ComposerCli @commander ');
+    await expectComposerText(input, '@ComposerCli @commander ');
     await expect(modelChip).toBeVisible();
     await expect(modelChip).toBeEnabled();
     await expect(selected.locator('.chat-recipient-name')).toHaveText(['ComposerCli', 'Commander']);
@@ -457,7 +458,7 @@ test.describe('new chat composer', () => {
     await picker.screenshot({ path: testInfo.outputPath('selected-agent-header.png') });
     await selected.getByRole('button', { name: 'Remove: Commander', exact: true }).click();
     await expect(picker).toBeVisible();
-    await expect(input).toHaveValue('@ComposerCli ');
+    await expectComposerText(input, '@ComposerCli ');
     await expect(modelChip).toBeVisible();
     await expect(modelChip).toBeDisabled();
     await search.fill('');
@@ -479,7 +480,7 @@ test.describe('new chat composer', () => {
     await expect(selected.getByRole('button', { name: 'Remove: ComposerCli', exact: true })).toBeVisible();
     await expect(commanderRow).toHaveAttribute('aria-checked', 'false');
     await commanderRow.press('Enter');
-    await expect(input).toHaveValue('@ComposerCli @commander ');
+    await expectComposerText(input, '@ComposerCli @commander ');
     await expect(modelChip).toBeEnabled();
     await expect(modelChip).toBeVisible();
     await expect(appPage.locator('#new-chat-recipient-name')).toHaveText('ComposerCli, Commander');
@@ -493,9 +494,9 @@ test.describe('new chat composer', () => {
     await search.fill('no matching Agent');
     await expect(picker.locator('.skill-picker-item')).toHaveCount(0);
     await selected.getByRole('button', { name: 'Remove: ComposerCli', exact: true }).click();
-    await expect(input).toHaveValue('@commander ');
+    await expectComposerText(input, '@commander ');
     await selected.getByRole('button', { name: 'Remove: Commander', exact: true }).press('Enter');
-    await expect(input).toHaveValue('');
+    await expectComposerText(input, '');
     await expect(selected.getByRole('button', { name: 'Remove: Commander', exact: true })).toBeVisible();
     await expect(selected.getByRole('button', { name: 'Remove: Commander', exact: true })).toBeFocused();
     await expect(picker).toBeVisible();
@@ -523,9 +524,9 @@ test.describe('new chat composer', () => {
     const selection = () => appPage.evaluate(() => (window as any).getChatRichComposerSelection('new-chat-input'));
     const setCaret = async (position: number) => {
       await appPage.evaluate((pos) => {
-        const input = document.getElementById('new-chat-input') as HTMLTextAreaElement;
+        const input = document.getElementById('new-chat-input') as HTMLDivElement;
         input.focus();
-        input.setSelectionRange(pos, pos);
+        (window as any).composerSetSelection(input, pos, pos);
       }, position);
     };
 
@@ -561,7 +562,7 @@ test.describe('new chat composer', () => {
     // Mouse clicks cannot place an editable caret inside any of the three chips.
     for (let i = 0; i < 3; i += 1) {
       const token = await chips.nth(i).getAttribute('data-token');
-      const value = await input.inputValue();
+      const value = await composerText(input);
       const start = value.indexOf(token!);
       await chips.nth(i).click();
       const caret = await selection();
@@ -587,7 +588,7 @@ test.describe('new chat composer', () => {
     await expect(editor.locator('[data-kind="commander"]')).toHaveCount(1);
     await setCaret('@OrkasCodex '.length);
     await editor.press('Backspace');
-    await expect(input).toHaveValue('@commander hello');
+    await expectComposerText(input, '@commander hello');
     await expect(appPage.locator('#new-chat-recipient-name')).toHaveText('Commander');
 
     // Drag across an Agent chip, then replace the selection with ordinary text.
@@ -602,14 +603,14 @@ test.describe('new chat composer', () => {
     expect(selected.end).toBeGreaterThanOrEqual('before @OrkasCodex'.length);
     await appPage.keyboard.type('replacement');
     await expect(agentChip).toHaveCount(0);
-    expect(await input.inputValue()).toMatch(/^before\s?replacement\s?after$/);
+    expect(await composerText(input)).toMatch(/^before\s?replacement\s?after$/);
 
     // Editing ordinary text beside an existing chip must preserve the caret.
     await editor.fill('@OrkasCodex tail');
     await setCaret(12);
     await editor.press('x');
     await editor.press('y');
-    await expect(input).toHaveValue('@OrkasCodex xytail');
+    await expectComposerText(input, '@OrkasCodex xytail');
     expect(await selection()).toEqual({ start: 14, end: 14 });
     expect(orkas.readCliState().invocations).toHaveLength(0);
   });
@@ -638,7 +639,7 @@ test.describe('new chat composer', () => {
     for (let i = 0; i < 5; i++) await editor.press('ArrowRight');
     await page.locator('#new-chat-recipient-chip').click();
     await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).click();
-    await expect(input).toHaveValue('@ComposerAlpha 你好， @ComposerBeta check the request');
+    await expectComposerText(input, '@ComposerAlpha 你好， @ComposerBeta check the request');
     await expect(page.locator('#new-chat-recipient-name')).toHaveText('ComposerAlpha, ComposerBeta');
     await expect(page.locator('.skill-picker-item[data-id="__commander__"]')).toHaveAttribute('aria-checked', 'false');
     await expect(page.locator('[data-composer-model-chip="new-chat"]')).toBeDisabled();
@@ -646,13 +647,13 @@ test.describe('new chat composer', () => {
     await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).press('Escape');
     await expect(editor).toBeFocused();
     await editor.press('X');
-    await expect(input).toHaveValue('@ComposerAlpha 你好， @ComposerBeta Xcheck the request');
+    await expectComposerText(input, '@ComposerAlpha 你好， @ComposerBeta Xcheck the request');
     // Reopening after moving to the end must use the new caret, including after cancellation.
     await editor.press('End');
     await page.locator('#new-chat-recipient-chip').click();
     await page.locator('#agent-picker-selected').getByRole('button', { name: 'Remove: ComposerBeta', exact: true }).click();
     await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).click();
-    await expect(input).toHaveValue('@ComposerAlpha 你好， Xcheck the request @ComposerBeta ');
+    await expectComposerText(input, '@ComposerAlpha 你好， Xcheck the request @ComposerBeta ');
     await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).press('Escape');
     await editor.pressSequentially('verify the result');
     await expect(page.locator('#new-chat-recipient-name')).toHaveText('ComposerAlpha, ComposerBeta');
@@ -702,9 +703,7 @@ test.describe('new chat composer', () => {
       {
         id: 'ecommerce',
         agentId: '5a1d43c2f28a',
-        // This offline GUI account has bundled Agents only; the real default-install
-        // owner is exercised by the renderer and production Agent evaluations.
-        agentName: 'Commander',
+        agentName: 'ECommerceResearcher',
         prompt: 'Assess whether pet water fountains are worth selling on Amazon US, with product selection and validation recommendations.',
       },
       {
@@ -753,7 +752,7 @@ test.describe('new chat composer', () => {
         prompt: 'Create an SEO and GEO plan for orkas.ai covering keywords, core pages, content, and priorities.',
       },
     ] as const;
-    const sourceBundledAgentIds = new Set<string>(cases.filter(item => item.id !== "ecommerce").map((item) => item.agentId));
+    const sourceBundledAgentIds = new Set<string>(cases.map((item) => item.agentId));
 
     await expect.poll(
       async () => {
@@ -848,13 +847,13 @@ test.describe('new chat composer', () => {
     const input = appPage.locator('#new-chat-input');
     for (const item of cases) {
       await appPage.locator(`.new-chat-scenario-chip[data-scenario="${item.id}"]`).click();
-      await expect(input, item.id).toHaveValue(item.prompt);
+      await expectComposerText(input, item.prompt);
       await expect(appPage.locator('#new-chat-recipient-name'), item.id).toHaveText(item.agentName);
       await expect.poll(
         () => input.evaluate((element) => ({
-          agentId: (element as HTMLTextAreaElement).dataset.commanderAgentId,
-          entryPoint: (element as HTMLTextAreaElement).dataset.commanderEntryPoint,
-          resourceId: (element as HTMLTextAreaElement).dataset.commanderResourceId,
+          agentId: (element as HTMLDivElement).dataset.commanderAgentId,
+          entryPoint: (element as HTMLDivElement).dataset.commanderEntryPoint,
+          resourceId: (element as HTMLDivElement).dataset.commanderResourceId,
         })),
         { message: `${item.id} quick-start attribution` },
       ).toEqual({
@@ -996,10 +995,12 @@ test.describe('new chat composer', () => {
   test('prefills a quick scenario and keeps modified Enter as a newline', async ({ appPage }) => {
     const input = appPage.locator('#new-chat-input');
     await appPage.locator('.new-chat-scenario-chip[data-scenario="data"]').click();
-    await expect(input).not.toHaveValue('');
+    await expect.poll(() => composerText(input)).not.toBe('');
     const selectedSubject = await input.evaluate((element) => {
-      const field = element as HTMLTextAreaElement;
-      return field.value.slice(field.selectionStart, field.selectionEnd);
+      const field = element as HTMLDivElement;
+      const w = window as any;
+      const selection = w.composerSelection(field);
+      return w.composerText(field).slice(selection.start, selection.end);
     });
     expect(selectedSubject).toBe('AI desktop apps');
 
@@ -1007,7 +1008,7 @@ test.describe('new chat composer', () => {
     await input.press('Shift+Enter');
     await input.type('second line');
 
-    await expect(input).toHaveValue('first line\nsecond line');
+    await expectComposerText(input, 'first line\nsecond line');
     await expect(appPage.locator('#panel-new-chat')).toHaveClass(/\bactive\b/);
     await expect(appPage.locator('.ui-dialog-overlay:visible')).toHaveCount(0);
   });

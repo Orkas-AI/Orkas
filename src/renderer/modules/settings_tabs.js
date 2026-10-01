@@ -1,8 +1,4 @@
-// Settings tab switching.
-//
-// PC's Settings tab binding lives in sync_settings.js, which is stripped from
-// the open-source build. Keep this tiny standalone module so the remaining local Settings
-// panes still bind after sync.
+// Local Settings tab binding. Hosted data hooks and telemetry are omitted.
 
 function activateSettingsTab(name) {
   const tabs = Array.from(document.querySelectorAll('.settings-tab'));
@@ -27,6 +23,8 @@ function activateSettingsTab(name) {
   });
 }
 
+const _settingsTabsBound = new WeakSet();
+
 function initSettingsTabs() {
   const tabs = document.querySelectorAll('.settings-tab');
   if (!tabs.length) return;
@@ -38,6 +36,8 @@ function initSettingsTabs() {
   };
 
   tabs.forEach((btn) => {
+    if (_settingsTabsBound.has(btn)) return;
+    _settingsTabsBound.add(btn);
     btn.addEventListener('click', () => switchTo(btn));
     btn.addEventListener('keydown', (event) => {
       if (!event || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
@@ -58,3 +58,6 @@ function initSettingsTabs() {
 
 window.initSettingsTabs = initSettingsTabs;
 window.activateSettingsTab = activateSettingsTab;
+
+// The settings shell is already parsed; bind before the lazy feature can load.
+initSettingsTabs();

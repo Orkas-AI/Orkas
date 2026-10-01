@@ -93,12 +93,15 @@ import {
 } from '../../features/permissions';
 import { classifyConfiguredBashCommand, sensitivePathReasons, type LocalAccessRiskCategory } from '../../features/local_access_policy';
 import { classifyBashCommand, hasDestructiveBashRedirection } from './bash-risk';
+import { ordinaryBashReasons } from './ordinary-shell-operations';
+import { CreationSnapshot, TaskFileOwnership } from './task-file-ownership';
 import {
   classifyExternalMutationScript,
   referencedExecutableScripts,
   type ExternalMutationFinding,
 } from './external-mutation-risk';
-import { requestBashDecision } from './bash-permissions';
+import { requestBashDecision, type BashPermissionFact } from './bash-permissions';
+import { librarySaveFieldError } from '../../util/library-save-input';
 import { markdownToPdf, htmlToPdf } from '../../util/md-to-pdf';
 import { uniquifyPathForWrite, renderRenameSignal } from '../../util/uniquify-path';
 import { isPathAllowed, resolveSandboxEntry, resolveSandboxRoot, type PathAllowedOptions } from '../../util/path-sandbox';
@@ -367,6 +370,8 @@ type BashFileSnapshotEntry = {
   binary: boolean;
 };
 type BashFileSnapshot = Map<string, BashFileSnapshotEntry>;
+const creationSnapshots = new WeakMap<BashFileSnapshot, CreationSnapshot>();
+const taskFileOwnership = new WeakMap<LocalToolsOpts, TaskFileOwnership>();
 type ProcessWorkspaceSnapshot = {
   root: string;
   command: string;
@@ -384,8 +389,10 @@ function shouldSkipBashProducedFile(name: string): boolean {
   return BASH_PRODUCED_SKIP_FILES.has(name) || name.startsWith(`${BASH_OUTPUT_MANIFEST_NAME}-`);
 }
 
-function collectBashFileSnapshot(root: string): BashFileSnapshot {
+function collectBashFileSnapshot(root: string, owner?: symbol): BashFileSnapshot {
   const out: BashFileSnapshot = new Map();
+  const creation = new CreationSnapshot(owner);
+  creationSnapshots.set(out, creation);
   const absRoot = path.resolve(root);
   let captureBytesRemaining = BASH_SNAPSHOT_TOTAL_MAX_BYTES;
   const visit = (dir: string) => {
@@ -393,6 +400,7 @@ function collectBashFileSnapshot(root: string): BashFileSnapshot {
     let entries: fs.Dirent[];
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
     catch { return; }
+    creation.directory(dir, entries);
     for (const ent of entries) {
       if (out.size >= BASH_PRODUCED_SCAN_LIMIT) return;
       const name = ent.name;
@@ -403,9 +411,10 @@ function collectBashFileSnapshot(root: string): BashFileSnapshot {
       if (!ent.isFile() || shouldSkipBashProducedFile(name)) continue;
       const abs = path.join(dir, name);
       let st: fs.Stats;
-      try { st = fs.statSync(abs); }
+      try { st = fs.lstatSync(abs); }
       catch { continue; }
       if (!st.isFile()) continue;
+      creation.node(abs, st);
       let hash: string | undefined;
       let content: string | undefined;
       let binary = kindOf(abs) !== 'text';
@@ -622,7 +631,7 @@ function protectedRootMentionedByCommand(opts: LocalToolsOpts, command: string):
 function protectedWriteError(abs: string, root: string): string {
   return errText(
     'E_PROTECTED_PATH_READ_ONLY',
-    `path is inside a protected read-only Orkas resource root and cannot be modified by local tools: ${abs} (root: ${root}). Use the agent/skill edit or fork flow instead.`,
+    `path is inside a protected read-only root and cannot be modified by local tools: ${abs} (root: ${root}).`,
   );
 }
 
@@ -705,7 +714,12 @@ async function emitBashProducedFiles(
   command: string,
   manifestedPaths: readonly string[] = [],
 ): Promise<FileChangeObservation[]> {
-  const after = collectBashFileSnapshot(root);
+  const after = collectBashFileSnapshot(root, taskFileOwnership.get(opts)?.token);
+  const beforeCreation = creationSnapshots.get(before);
+  const afterCreation = creationSnapshots.get(after);
+  if (beforeCreation && afterCreation && beforeCreation.owner === afterCreation.owner) {
+    taskFileOwnership.get(opts)?.observe(beforeCreation, afterCreation);
+  }
   const isExternalDownload = _buildExternalDownloadSkipper(command, root);
   const discovered = new Set<string>(manifestedPaths);
   for (const [abs, next] of after) {
@@ -1429,7 +1443,7 @@ async function executeCoreBashWithOutputTracking(
   }
   const manifestPath = path.join(outputDir, `${BASH_OUTPUT_MANIFEST_NAME}-${crypto.randomUUID()}`);
   try { fs.rmSync(manifestPath, { force: true }); } catch { /* stale cleanup */ }
-  const before = collectBashFileSnapshot(outputDir);
+  const before = collectBashFileSnapshot(outputDir, taskFileOwnership.get(opts)?.token);
   const restoreSkillRuntimeEnv = withRunSkillRuntimeEnv(ctx, skillRuntime.binding);
   const restoreEnv = withBashOutputEnv(ctx, outputDir, manifestPath);
   const restoreWritableRoots = withBashWritableRoots(ctx, bashWritableRootsFor(opts, workingDir));
@@ -1605,16 +1619,18 @@ type BashPathSegment = {
   redirectTargets: string[];
   inputTargets: string[];
   separatorAfter?: string;
+  pathExpressions?: Record<string, string>;
 };
 /** `removesSource` marks an operand the command takes AWAY from where it is
  *  now — an `rm`/`shred`/`Remove-Item` target, or an `mv` source. Those are
  *  deletes as far as the user's file is concerned, whatever verb spelled it. */
-type BashPathCandidate = { raw: string; abs?: string; reason: string; dynamic?: boolean; removesSource?: boolean; operatesOnEntry?: boolean };
+type BashPathCandidate = { raw: string; abs?: string; reason: string; dynamic?: boolean; removesSource?: boolean; operatesOnEntry?: boolean; detail?: string };
 type BashPathGateResult = { error: string | null; approvedReasons: LocalAccessRiskCategory[] };
 type BashFilesystemGuardResult = {
   result: ToolResult | null;
   approvedReasons: LocalAccessRiskCategory[];
   unresolvedPaths?: boolean;
+  keyFacts?: BashPermissionFact[];
 };
 
 const BASH_PATH_SEGMENT_OPS = new Set([';', '&&', '||', '|', '|&', '&']);
@@ -1702,7 +1718,41 @@ const POSIX_RM_SAFE_SWITCHES = new Set([
   '--preserve-root', '--no-preserve-root',
 ]);
 
-type BashHeredocSpec = { delimiter: string; stripTabs: boolean; shellPayload: boolean; expand: boolean; language?: 'python' };
+type BashHeredocSpec = { delimiter: string; stripTabs: boolean; shellPayload: boolean; expand: boolean; language?: 'python'; fileTarget?: string };
+
+/** Recognize a literal file consumer on this command line, independently of
+ * other heredocs/commands in the enclosing command list. Ambiguous receivers,
+ * pipelines, expansions and redirects retain conservative script inspection. */
+function bashHeredocFileTarget(line: string, opener: number): string | undefined {
+  let prefix: BashPathToken[] = [];
+  let piped = false;
+  for (const token of tokenizeBashPathGuard(line.slice(0, opener))) {
+    if (token.type === 'op' && BASH_PATH_SEGMENT_OPS.has(token.value)) {
+      prefix = [];
+      piped = token.value === '|' || token.value === '|&';
+    } else prefix.push(token);
+  }
+  const suffix = tokenizeBashPathGuard(line.slice(opener));
+  const end = suffix.findIndex(token => token.type === 'op' && BASH_PATH_SEGMENT_OPS.has(token.value));
+  if (piped || (end >= 0 && ['|', '|&'].includes(suffix[end].value))) return undefined;
+  const tokens = [...prefix, ...(end < 0 ? suffix : suffix.slice(0, end))];
+  const words: string[] = [];
+  let target: string | undefined;
+  let delimiter = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.type === 'word') { words.push(token.value); continue; }
+    const operand = tokens[++i];
+    if (!operand || operand.type !== 'word') return undefined;
+    if (token.value === '>' && target === undefined) {
+      if (!bashLiteralAssignmentValue(operand.value)) return undefined;
+      target = operand.value;
+    } else if (token.value === '<<' && !delimiter) {
+      delimiter = true;
+    } else return undefined;
+  }
+  return words.length === 1 && words[0] === 'cat' && delimiter ? target : undefined;
+}
 
 function bashHeredocReceiver(prefix: string): string | undefined {
   let words: string[] = [];
@@ -1845,6 +1895,7 @@ function bashHeredocSpecs(line: string): BashHeredocSpec[] {
         stripTabs,
         expand: !quotedDelimiter,
         language: quotedDelimiter && receiver && /^(?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?$/i.test(receiver) ? 'python' : undefined,
+        fileTarget: quotedDelimiter ? bashHeredocFileTarget(line, i) : undefined,
         shellPayload: (!!receiver && BASH_POSIX_SHELL_CMDS.has(receiver))
           || bashHeredocPipelineReachesShell(line.slice(i + 2)),
       });
@@ -1854,7 +1905,7 @@ function bashHeredocSpecs(line: string): BashHeredocSpec[] {
   return specs;
 }
 
-type BashHeredocAnalysis = { shellSurface: string; nonShellPayloads: Array<{ source: string; language?: 'python' }>; unquotedPayloads: string[] };
+type BashHeredocAnalysis = { shellSurface: string; nonShellPayloads: Array<{ source: string; language?: 'python'; fileTarget?: string }>; unquotedPayloads: string[] };
 
 /** Preserve shell command lines/newlines while blanking non-shell heredoc
  * payloads and terminator lines. Python/Node/etc. payloads are source code,
@@ -1869,7 +1920,7 @@ function analyzeBashHeredocs(command: string): BashHeredocAnalysis {
   const retainPayload = (current: BashHeredocSpec & { bodyLines: string[] }) => {
     if (!current.bodyLines.length) return;
     const source = current.bodyLines.join('\n');
-    if (!current.shellPayload) nonShellPayloads.push({ source, language: current.language });
+    if (!current.shellPayload) nonShellPayloads.push({ source, language: current.language, fileTarget: current.fileTarget });
     if (current.expand) unquotedPayloads.push(source);
   };
   let out = '';
@@ -2069,6 +2120,7 @@ function bashLiteralAssignmentValue(value: string): string | null {
 function bashPersistentLiteralAssignments(
   segment: BashPathSegment,
   hostPlatform: NodeJS.Platform,
+  env: Record<string, string>,
 ): Record<string, string | null> | null {
   if (hostPlatform === 'win32') {
     // Parse the original spelling: whitespace around '=' is optional, while a
@@ -2082,6 +2134,7 @@ function bashPersistentLiteralAssignments(
         && BASH_LITERAL_ASSIGNMENT_PERSIST_SEPARATORS.has(segment.separatorAfter)) {
         if (/^'(?:[^']|'')*'$/.test(raw)) literal = raw.slice(1, -1).replace(/''/g, "'");
         else if (/^"(?:[^"$`]|"")*"$/.test(raw)) literal = raw.slice(1, -1).replace(/""/g, '"');
+        else literal = powershellLiteralJoinPath(raw, env);
       }
       // Computed, compound, or pipeline assignments invalidate an earlier
       // literal. Never verify a later operation against the variable's old path.
@@ -2130,6 +2183,46 @@ function bashPersistentLiteralAssignments(
   return null;
 }
 
+/** Evaluate only the path-composition grammar, never a PowerShell command.
+ * No providers, substitutions, -Resolve, wildcards or unknown arguments are
+ * executed to discover a path. Preserve '..' for the existing symlink check. */
+function powershellLiteralJoinPath(raw: string, env: Record<string, string>): string | null {
+  const tokens = tokenizeBashPathGuard(raw);
+  if (tokens.length > 5 || tokens.some((token) => token.type !== 'word')
+    || tokens[0]?.value.toLowerCase() !== 'join-path') return null;
+  const atom = (token: BashPathToken): string | null => {
+    const source = token.raw ?? token.value;
+    let value: string | undefined;
+    if (/^'(?:[^']|'')*'$/.test(source)) value = source.slice(1, -1).replace(/''/g, "'");
+    else if (/^"[^"$`]*"$/.test(source)) value = source.slice(1, -1);
+    else {
+      const variable = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(source);
+      if (variable) value = Object.entries(env).find(([name]) => name.toLowerCase() === variable[1].toLowerCase())?.[1];
+    }
+    return value === undefined ? null : bashLiteralAssignmentValue(value);
+  };
+  const positional: string[] = [];
+  const named: Record<string, string> = {};
+  for (let i = 1; i < tokens.length; i++) {
+    const flag = tokens[i].value.toLowerCase();
+    if (flag.startsWith('-')) {
+      if (!['-path', '-childpath'].includes(flag) || named[flag] !== undefined || !tokens[i + 1]) return null;
+      const value = atom(tokens[++i]);
+      if (value === null) return null;
+      named[flag] = value;
+    } else {
+      const value = atom(tokens[i]);
+      if (value === null) return null;
+      positional.push(value);
+    }
+  }
+  const parent = named['-path'] ?? positional.shift();
+  const child = named['-childpath'] ?? positional.shift();
+  if (!parent || !child || positional.length || /^[\\/]|^[A-Za-z][A-Za-z0-9_-]*:/.test(child)
+    || /^[A-Za-z][A-Za-z0-9_-]+:/.test(parent) || /^[A-Za-z]:(?![\\/])/.test(parent)) return null;
+  return `${parent.replace(/[\\/]+$/, '')}${parent.includes('\\') ? '\\' : '/'}${child}`;
+}
+
 function updateBashPathEnv(env: Record<string, string>, assignments: Record<string, string | null>): void {
   for (const [name, value] of Object.entries(assignments)) {
     for (const existing of Object.keys(env)) {
@@ -2164,11 +2257,22 @@ function bashPathSegmentsWithEnv(
   hostPlatform: NodeJS.Platform = process.platform,
 ): Array<{ segment: BashPathSegment; env: Record<string, string> }> {
   const env = { ...baseEnv };
+  const expressions: Record<string, string> = {};
   const out: Array<{ segment: BashPathSegment; env: Record<string, string> }> = [];
   for (const segment of bashPathSegments(command)) {
+    segment.pathExpressions = { ...expressions };
     out.push({ segment, env: { ...env } });
-    const assignments = bashPersistentLiteralAssignments(segment, hostPlatform);
-    if (assignments) updateBashPathEnv(env, assignments);
+    const assignments = bashPersistentLiteralAssignments(segment, hostPlatform, env);
+    if (assignments) {
+      updateBashPathEnv(env, assignments);
+      for (const name of Object.keys(assignments)) {
+        const key = name.toLowerCase();
+        delete expressions[key];
+        if (Object.keys(expressions).length >= 64) delete expressions[Object.keys(expressions)[0]];
+        const source = segment.rawWords.join(' ');
+        expressions[key] = source.length > 240 ? source.slice(0, 120) + '…' + source.slice(-119) : source;
+      }
+    }
   }
   return out;
 }
@@ -2426,6 +2530,34 @@ function powershellContentWriteOperands(args: string[]): string[] {
   }
   if (explicit.length) return explicit;
   return bashNonFlagOperands(args, POWERSHELL_CONTENT_FLAGS_WITH_VALUE).slice(0, 1);
+}
+
+function powershellNewItemOperands(args: string[]): Array<{ raw: string; uncertain: boolean }> {
+  const paths: string[] = [];
+  const positional: string[] = [];
+  let name: string | undefined;
+  let uncertain = false;
+  const valueFlags = new Set([...POWERSHELL_DELETE_FLAGS_WITH_VALUE, '-name', '-itemtype', '-type', '-value', '-credential']);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith('-')) { positional.push(arg); continue; }
+    const colon = arg.indexOf(':');
+    const flag = (colon > 0 ? arg.slice(0, colon) : arg).toLowerCase();
+    if (valueFlags.has(flag)) {
+      const value = colon > 0 ? arg.slice(colon + 1) : args[++i];
+      if (value === undefined) { uncertain = true; continue; }
+      if (flag === '-path' || flag === '-literalpath') paths.push(value);
+      if (flag === '-name') name = value;
+    } else if (!['-force', '-whatif', '-confirm', '-verbose', '-debug'].includes(flag)) uncertain = true;
+  }
+  if (!paths.length) paths.push(...positional);
+  else if (positional.length) uncertain = true;
+  if (!paths.length) paths.push('.');
+  return paths.map((entry) => ({
+    raw: name ? `${entry.replace(/[\\/]+$/, '')}/${name}` : entry,
+    uncertain: uncertain || entry.includes(',') || !!name && /[\\/:,]/.test(name)
+      || /^(?:[^\\/:]{2,}:|[^\\/]+::)/.test(entry),
+  }));
 }
 
 function powershellDeleteOperands(args: string[]): string[] {
@@ -2725,6 +2857,7 @@ function bashMoveOperands(args: string[]): { sources: string[]; destination: str
       targetDir = a.slice('--target-directory='.length);
       continue;
     }
+    if (!endOfOptions && /^-t.+/.test(a)) { targetDir = a.slice(2); continue; }
     if (!endOfOptions && a.startsWith('-')) {
       if (a === '-t' || a === '--target-directory') {
         if (args[i + 1] !== undefined) targetDir = args[i + 1];
@@ -2845,6 +2978,7 @@ function collectBashMutationCandidates(
 ): BashPathCandidate[] {
   const out: BashPathCandidate[] = [];
   for (const { segment: seg, env: segmentEnv, workingDir: segmentDirectory } of bashGuardPathSegments(command, env, hostPlatform, workingDir)) {
+    const firstCandidate = out.length;
     for (const target of seg.redirectTargets) {
       if (isBashNullRedirection(target, hostPlatform)) continue;
       addBashCandidate(out, target, 'redirection', segmentDirectory, segmentEnv);
@@ -2853,7 +2987,12 @@ function collectBashMutationCandidates(
     if (!eff) continue;
     const { cmd, args } = eff;
 
-    if (POWERSHELL_CONTENT_WRITE_CMDS.has(cmd)) {
+    if (cmd === 'new-item' || (hostPlatform === 'win32' && cmd === 'ni')) {
+      for (const operand of powershellNewItemOperands(args)) {
+        if (operand.uncertain) out.push({ raw: operand.raw, reason: cmd, dynamic: true });
+        else addBashCandidate(out, operand.raw, cmd, segmentDirectory, segmentEnv);
+      }
+    } else if (POWERSHELL_CONTENT_WRITE_CMDS.has(cmd)) {
       for (const operand of powershellContentWriteOperands(args)) {
         addBashCandidate(out, operand, cmd, segmentDirectory, segmentEnv);
       }
@@ -2884,8 +3023,8 @@ function collectBashMutationCandidates(
           hostPlatform !== 'win32' && deletion?.kind === 'unlink' && isLiteralEntry(operand));
       }
     } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
-      const operands = bashNonFlagOperands(args);
-      if (operands.length) addBashCandidate(out, operands[operands.length - 1], cmd, segmentDirectory, segmentEnv);
+      const { destination } = bashMoveOperands(args);
+      if (destination !== null) addBashCandidate(out, destination, cmd, segmentDirectory, segmentEnv);
     } else if (cmd === 'tee') {
       for (const operand of bashNonFlagOperands(args, new Set(['-a', '-i', '-p', '--append', '--ignore-interrupts']))) {
         addBashCandidate(out, operand, 'tee output', segmentDirectory, segmentEnv);
@@ -2921,6 +3060,12 @@ function collectBashMutationCandidates(
       const dIdx = args.findIndex((a) => a === '-d');
       if (dIdx >= 0 && args[dIdx + 1]) addBashCandidate(out, args[dIdx + 1], 'unzip output directory', segmentDirectory, segmentEnv);
     }
+    for (const candidate of out.slice(firstCandidate)) {
+      if (!candidate.dynamic) continue;
+      const names = [...candidate.raw.matchAll(/\$(?:env:)?([A-Za-z_][A-Za-z0-9_]*)/gi)].slice(0, 4);
+      const expressions = names.map(match => seg.pathExpressions?.[match[1].toLowerCase()]).filter(Boolean);
+      if (expressions.length) candidate.detail = [...new Set(expressions)].join('; ');
+    }
   }
   return out;
 }
@@ -2933,6 +3078,7 @@ function collectBashReadCandidates(
 ): BashPathCandidate[] {
   const out: BashPathCandidate[] = [];
   for (const { segment: seg, env: segmentEnv, workingDir: segmentDirectory } of bashGuardPathSegments(command, env, hostPlatform, workingDir)) {
+    const firstCandidate = out.length;
     for (const target of seg.inputTargets) {
       if (hostPlatform !== 'win32' && isBashNullRedirection(target, hostPlatform)) continue;
       addBashCandidate(out, target, 'input redirection', segmentDirectory, segmentEnv);
@@ -2955,8 +3101,7 @@ function collectBashReadCandidates(
       const operand = bashNonFlagOperands(args)[0];
       if (operand) addBashCandidate(out, operand, cmd, segmentDirectory, segmentEnv);
     } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
-      const operands = bashNonFlagOperands(args);
-      for (const operand of operands.slice(0, -1)) addBashCandidate(out, operand, `${cmd} source`, segmentDirectory, segmentEnv);
+      for (const operand of bashMoveOperands(args).sources) addBashCandidate(out, operand, `${cmd} source`, segmentDirectory, segmentEnv);
     } else if (cmd === 'copy-item') {
       for (const operand of powershellTransferOperands(args).sources) {
         addBashCandidate(out, operand, 'copy-item source', segmentDirectory, segmentEnv);
@@ -2970,6 +3115,12 @@ function collectBashReadCandidates(
     } else if (cmd === 'unzip') {
       const operand = bashNonFlagOperands(args)[0];
       if (operand) addBashCandidate(out, operand, 'unzip archive', segmentDirectory, segmentEnv);
+    }
+    for (const candidate of out.slice(firstCandidate)) {
+      if (!candidate.dynamic) continue;
+      const names = [...candidate.raw.matchAll(/\$(?:env:)?([A-Za-z_][A-Za-z0-9_]*)/gi)].slice(0, 4);
+      const expressions = names.map(match => seg.pathExpressions?.[match[1].toLowerCase()]).filter(Boolean);
+      if (expressions.length) candidate.detail = [...new Set(expressions)].join('; ');
     }
   }
   return out;
@@ -3094,13 +3245,60 @@ const EXTERNAL_MUTATION_SCRIPT_MAX_BYTES = 512 * 1024;
 async function classifyBashRiskIncludingScripts(command: string, workingDir: string, opts: LocalToolsOpts, ctx?: ToolContext) {
   const heredocs = analyzeBashHeredocs(command);
   const base = classifyBashCommand(heredocs.shellSurface);
+  const ordinaryRoots = allowedRootsFor(opts);
+  if (!opts.userId) ordinaryRoots.push(workingDir);
+  const ordinary = ordinaryBashReasons(command, {
+    cwd: workingDir,
+    platform: opts.hostPlatform ?? process.platform,
+    canWrite: file => {
+      const abs = resolveSandboxRoot(file);
+      return !ordinaryRoots.some(root => resolveSandboxRoot(root) === abs)
+        && !protectedRootForPath(opts, abs) && isPathAllowed(abs, ordinaryRoots)
+        && sensitivePathReasons(abs, 'write', { trustedRoots: ordinaryRoots }).length === 0;
+    },
+    isProduced: file => opts.hasProducedPath?.(file) === true || taskFileOwnership.get(opts)?.canRemoveTree(file) === true,
+    ownsTree: file => taskFileOwnership.get(opts)?.canRemoveTree(file) === true,
+  });
+  base.reasons = base.reasons.filter(reason => !ordinary.has(reason));
+  if (ordinary.has('destructive')) base.irreversible = [];
+  if (ordinary.has('external_mutation')) base.externalMutations = [];
   let scope: ReturnType<typeof bashGuardPathSegments> | undefined;
-  const scriptScope = () => scope ??= bashGuardPathSegments(heredocs.shellSurface, bashEnvForPathResolution(ctx, workingDir), opts.hostPlatform ?? process.platform, workingDir);
+  // This parser masks heredocs itself; passing an already masked surface
+  // would lose its terminators and hide commands following the first body.
+  const scriptScope = () => scope ??= bashGuardPathSegments(command, bashEnvForPathResolution(ctx, workingDir), opts.hostPlatform ?? process.platform, workingDir);
   const externalMutations: ExternalMutationFinding[] = [...base.externalMutations];
   for (const payload of heredocs.nonShellPayloads) {
-    externalMutations.push(...classifyExternalMutationScript(payload.source, payload));
+    if (!payload.fileTarget) externalMutations.push(...classifyExternalMutationScript(payload.source, payload));
   }
-  const scriptRefs = referencedExecutableScripts(command);
+  // File contents cannot declare shell entrypoints. Inspect the shell surface
+  // and include not-yet-written sources when a script is invoked in this call.
+  const scriptRefs = referencedExecutableScripts(heredocs.shellSurface);
+  const filePayloads = heredocs.nonShellPayloads.filter(payload => payload.fileTarget);
+  if (filePayloads.length) {
+    const scopes = scriptScope();
+    const dirs = [...new Set(scopes.map(scope => scope.workingDir))];
+    const uncertain = dirs.includes(null) || dirs.length > 32
+      || scriptRefs.some(ref => bashLiteralAssignmentValue(ref) === null);
+    // A pipeline can feed a pending file into an interpreter without naming
+    // that file as its script operand. Preserve conservative inspection for
+    // these consumers instead of granting an exemption from a filename match.
+    const pipelineInterpreter = scopes.some(({ segment }, index) => {
+      const previous = scopes[index - 1]?.segment.separatorAfter;
+      const effective = bashEffectiveCommand(segment.words);
+      return (previous === '|' || previous === '|&') && effective
+        && /^(?:python(?:3(?:\.\d+)?)?|py|node|ruby|perl|php|bash|dash|ksh|sh|zsh|eval|source|\.)$/.test(effective.cmd);
+    });
+    const referenced = new Set(scriptRefs.flatMap(ref => (uncertain ? [workingDir] : dirs)
+      .map(dir => resolveSandboxRoot(path.resolve(dir!, ref)))));
+    for (const payload of filePayloads) {
+      if ((uncertain && scriptRefs.length) || pipelineInterpreter
+        || dirs.some(dir => dir !== null && referenced.has(resolveSandboxRoot(path.resolve(dir, payload.fileTarget!))))) {
+        externalMutations.push(...classifyExternalMutationScript(payload.source, {
+          language: path.extname(payload.fileTarget!) === '.py' ? 'python' : undefined,
+        }));
+      }
+    }
+  }
   for (const scriptRef of scriptRefs) {
     const abs = path.isAbsolute(scriptRef) ? path.resolve(scriptRef) : path.resolve(workingDir, scriptRef);
     try {
@@ -3130,7 +3328,9 @@ async function classifyBashRiskIncludingScripts(command: string, workingDir: str
     ...segments.flatMap(s => (s.env.PYTHONPATH || '').split(path.delimiter).filter(Boolean).map(p => path.resolve(s.workingDir || workingDir, p))),
   ])];
   const shadowedImport = externalMutations.some(f => f.resource) && (importRoots.length > 32 || importRoots.some(root =>
-    ['sqlite3.py', 'sqlite3/__init__.py', 'pathlib.py', 'pathlib/__init__.py'].some(name => fs.existsSync(path.join(root, name)))));
+    ['sqlite3.py', 'sqlite3/__init__.py', 'pathlib.py', 'pathlib/__init__.py'].some(name =>
+      fs.existsSync(path.join(root, name)) || filePayloads.some(payload =>
+        directories.some(dir => dir !== null && path.resolve(dir, payload.fileTarget!) === path.join(root, name))))));
   const localResources = new Map<string, boolean>();
   const isLocal = (database: string): boolean => {
     if (shadowedImport || uncertainDirectory || !directories.length || directories.some(dir => dir === null)) return false;
@@ -3220,7 +3420,16 @@ async function guardBashPathCandidates(
       return { result: { content: removal.error, isError: true }, approvedReasons };
     }
   }
-  return { result: null, approvedReasons, unresolvedPaths };
+  return {
+    result: null, approvedReasons, unresolvedPaths,
+    keyFacts: candidates.map((candidate) => ({
+      kind: candidate.removesSource ? 'remove' : access,
+      operation: candidate.reason,
+      target: candidate.abs || candidate.raw,
+      ...(candidate.detail ? { detail: candidate.detail } : {}),
+      ...((candidate.dynamic || !candidate.abs) ? { unresolved: true } : {}),
+    })),
+  };
 }
 
 /**
@@ -3284,7 +3493,10 @@ async function guardBashFilesystemTargets(
   );
   mergeRiskReasons(approvedReasons, read.approvedReasons);
   if (read.result) return { result: read.result, approvedReasons };
-  return { result: null, approvedReasons, unresolvedPaths: mutation.unresolvedPaths || read.unresolvedPaths };
+  return {
+    result: null, approvedReasons, unresolvedPaths: mutation.unresolvedPaths || read.unresolvedPaths,
+    keyFacts: [...(mutation.keyFacts ?? []), ...(read.keyFacts ?? [])],
+  };
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -3950,10 +4162,21 @@ export function windowsPowerShellCompatibilityError(
   if (/(?:^|[;\r\n]\s*)(?:source|export)\b/m.test(surface)) findings.push('source/export');
   if (/(?:^|[;|\r\n]\s*)head(?:\s|$)/m.test(surface)) findings.push('head');
   if (/(?:^|[;|\r\n]\s*)mktemp(?:\s|$)/m.test(surface)) findings.push('mktemp');
+  const configuredShell = process.env.ORKAS_WINDOWS_SHELL || 'powershell.exe';
+  const usesWindowsPowerShell51 = /(?:^|[\\/])powershell(?:\.exe)?$/i.test(configuredShell);
+  const curlAliasWithSilentFlag = usesWindowsPowerShell51
+    && /(?:^|[;|&\r\n]\s*)curl\s+-s(?=\s|$)/mi.test(surface);
+  if (curlAliasWithSilentFlag) findings.push('PowerShell curl alias with Unix -s');
   if (/(?:^|[;|&\r\n]\s*)mkdir\s+-p(?:\s|$)/m.test(surface)) findings.push('POSIX mkdir -p');
   if (/\/dev\/null\b/.test(surface)) findings.push('/dev/null');
   if (/^\s*[A-Za-z_][A-Za-z0-9_]*=[^\s;]+\s+\S/m.test(surface)) findings.push('POSIX inline environment assignment');
   if (!findings.length) return null;
+  if (curlAliasWithSilentFlag && findings.length === 1) {
+    return errText(
+      'E_SHELL_SYNTAX_MISMATCH',
+      'In Windows PowerShell 5.1, `curl` resolves to `Invoke-WebRequest`, so `curl -s` does not use curl flags. Use `curl.exe -s` or `Invoke-WebRequest` with PowerShell parameters.',
+    );
+  }
   return errText(
     'E_SHELL_SYNTAX_MISMATCH',
     `host shell is Windows PowerShell, but the command contains ${findings.join(', ')}. `
@@ -3962,16 +4185,18 @@ export function windowsPowerShellCompatibilityError(
     + 'Use `$env:NAME = value` for environment variables, '
     + '`$null` for discarded output, `Select-Object -First N` for head, and a `[System.IO.Path]::GetTempFileName()` or '
     + '`New-Item` temporary path. Create directories with `New-Item -ItemType Directory -Force -Path ...`. '
+    + (curlAliasWithSilentFlag ? 'In Windows PowerShell 5.1, `curl` resolves to `Invoke-WebRequest`; use `curl.exe -s` for curl flags or use `Invoke-WebRequest` parameters. ' : '')
     + 'For a multi-line script, write a `.ps1` file and invoke it with PowerShell.',
   );
 }
 
 /** Wrapped `bash` tool — identical schema, permission-gated, host-shell wording. */
 function createBashTool(opts: LocalToolsOpts): AgentTool {
-  const windowsShellDescription = process.platform === 'win32'
+  const hostPlatform = opts.hostPlatform ?? process.platform;
+  const windowsShellDescription = hostPlatform === 'win32'
     ? ' On Windows this compatibility-named tool runs PowerShell; use PowerShell syntax and invoke quoted executables with `&`.'
     : '';
-  const outputDirDescription = process.platform === 'win32'
+  const outputDirDescription = hostPlatform === 'win32'
     ? '`$env:ORKAS_OUTPUT_DIR`'
     : '`$ORKAS_OUTPUT_DIR`';
 
@@ -3984,7 +4209,9 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
     executionMode: 'parallel',
     parallelWhen: (input) => bashCommandIsProvablyReadOnly(String(input.command ?? '')),
     description:
-      'Run one shell command on the user\'s local machine and return its output. Built-in Python and Node.js are available as `python` and `node`; use a script for deterministic transformations over many local files or records, and a dedicated tool for a targeted operation. ' +
+      'Run one shell command on the user\'s local machine and return its output. '
+      + (hostPlatform === 'win32' ? 'On Windows, this compatibility-named `bash` tool runs Windows PowerShell 5.1 by default. ' : '')
+      + 'Built-in Python and Node.js are available as `python` and `node`; use a script for deterministic transformations over many local files or records, and a dedicated tool for a targeted operation. ' +
       'A running result includes a session_id for process_session; use interactive_cli for user-entered secrets or OAuth.',
     inputSchema: {
       ...(coreBashTool.inputSchema as Record<string, unknown>),
@@ -4122,6 +4349,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
         }
         const reasons = (approvalMode
           ? classifyConfiguredBashCommand(base.shellSurface, baseReasons, {
+            structuredDefaults: true,
             includePathPatterns: !pathApprovalCoveredSensitive,
           })
           : baseReasons
@@ -4135,6 +4363,11 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
             command,
             reasons,
             unresolvedPaths: filesystemGate.unresolvedPaths,
+            workingDirectory: workingDirForGuard,
+            keyFacts: [
+              ...(filesystemGate.keyFacts ?? []),
+              ...base.evidence.filter((fact) => reasons.includes(fact.reason)).map((fact) => ({ kind: 'risk' as const, ...fact })),
+            ],
             // Only meaningful while `destructive` survived the filter above;
             // the dialog uses it to say why a non-prompting mode is asking.
             ...(reasons.includes('destructive') && base.irreversible.length
@@ -4195,6 +4428,7 @@ async function gateInteractiveCliStart(
     workingDir?: string;
     approvedReasons?: readonly LocalAccessRiskCategory[];
     unresolvedPaths?: boolean;
+    keyFacts?: BashPermissionFact[];
   },
   ctx?: ToolContext,
 ): Promise<ToolResult | null> {
@@ -4278,6 +4512,7 @@ async function gateInteractiveCliStart(
     }
     const reasons = (approvalMode
       ? classifyConfiguredBashCommand(base.shellSurface, baseReasons, {
+        structuredDefaults: true,
         includePathPatterns: !approvedReasons.includes('sensitive_path'),
       })
       : baseReasons
@@ -4291,6 +4526,11 @@ async function gateInteractiveCliStart(
         command,
         reasons,
         unresolvedPaths: settings?.unresolvedPaths,
+        workingDirectory: workingDir,
+        keyFacts: [
+          ...(settings?.keyFacts ?? []),
+          ...base.evidence.filter((fact) => reasons.includes(fact.reason)).map((fact) => ({ kind: 'risk' as const, ...fact })),
+        ],
         ...(reasons.includes('destructive') && base.irreversible.length
           ? { irreversible: base.irreversible }
           : {}),
@@ -4425,6 +4665,7 @@ function createInteractiveCliStartTool(opts: LocalToolsOpts): AgentTool {
         workingDir,
         approvedReasons: removalGate.approvedReasons,
         unresolvedPaths: removalGate.unresolvedPaths,
+        keyFacts: removalGate.keyFacts,
       }, ctx);
       if (gate) return gate;
       try { fs.mkdirSync(workingDir, { recursive: true }); }
@@ -4606,7 +4847,7 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
         action: {
           type: 'string',
           enum: ['start', 'read', 'send', 'close'],
-          description: 'start: command; read: session_id; send: session_id/input; close: session_id/force/reason. Use only its action-specific fields.',
+          description: 'start: command; read: session_id; send: session_id/input; close: session_id/force/reason. Known unused fields are ignored and listed in ignored_fields; session_id selects an existing session.',
         },
         command: { type: 'string', description: 'Start only. Shell command to launch.' },
         max_lifetime_ms: {
@@ -4650,11 +4891,23 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
           isError: true,
         };
       }
+      const ignoredFields = Object.keys(input).filter((key) => !actionFields[action].has(key)).sort();
+      const notice = ignoredFields.length ? `ignored_fields: ${JSON.stringify(ignoredFields)}\n` : '';
       input = Object.fromEntries(Object.entries(input).filter(([key]) => actionFields[action].has(key)));
-      if (action === 'start') return start.execute(input, ctx);
-      if (action === 'read') return read.execute(input, ctx);
-      if (action === 'send') return send.execute(input, ctx);
-      if (action === 'close') return close.execute(input, ctx);
+      const withNotice = (result: ToolResult): ToolResult => {
+        if (!notice) return result;
+        try {
+          const payload: unknown = JSON.parse(result.content);
+          if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+            return { ...result, content: JSON.stringify({ ...payload, ignored_fields: ignoredFields }) };
+          }
+        } catch { /* Preserve non-JSON errors with a text receipt. */ }
+        return { ...result, content: `${notice}${result.content}` };
+      };
+      if (action === 'start') return withNotice(await start.execute(input, ctx));
+      if (action === 'read') return withNotice(await read.execute(input, ctx));
+      if (action === 'send') return withNotice(await send.execute(input, ctx));
+      if (action === 'close') return withNotice(await close.execute(input, ctx));
       return close.execute(input, ctx);
     },
   };
@@ -4756,13 +5009,14 @@ function createHostProcessTools(opts: LocalToolsOpts): AgentTool[] {
           workingDir,
           approvedReasons: filesystemGate.approvedReasons,
           unresolvedPaths: filesystemGate.unresolvedPaths,
+          keyFacts: filesystemGate.keyFacts,
         }, ctx);
         if (gate) return gate;
         pruneProcessWorkspaceSnapshots();
         const snapshot: ProcessWorkspaceSnapshot = {
           root: workingDir,
           command,
-          before: collectBashFileSnapshot(workingDir),
+          before: collectBashFileSnapshot(workingDir, taskFileOwnership.get(opts)?.token),
           createdAt: Date.now(),
         };
         const result = await coreTool.execute(input, processSessionContext(opts, ctx));
@@ -4812,19 +5066,21 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
       // Read before the write decides it: once uniquify has run, an overwrite
       // of the user's own file and a fresh create look identical on disk.
       const targetExistedBeforeWrite = fs.existsSync(inputAbs);
+      const ownership = taskFileOwnership.get(opts);
       // Probe+write hold one per-path lock: a concurrent same-target writer
       // (parallel agent turn in the same conversation workspace) must see this
       // write when it uniquifies, not race past the probe and clobber it.
       const { finalPath, renamed, result } = await uniquifyPathForWrite(
-        inputAbs,
-        isMineFor(opts),
-        async (decision) => ({
-          ...decision,
-          result: await coreWriteFileTool.execute(
+        inputAbs, isMineFor(opts),
+        async (decision) => {
+          const beforeCreation = ownership?.beforeWrite(decision.finalPath);
+          const result = await coreWriteFileTool.execute(
             decision.finalPath !== inputAbs ? { ...input, path: decision.finalPath } : input,
             ctx,
-          ),
-        }),
+          );
+          if (!result.isError && beforeCreation) ownership?.afterWrite(decision.finalPath, beforeCreation);
+          return { ...decision, result };
+        },
       );
       const rewritten = finalPath !== inputAbs
         ? { ...input, path: finalPath }
@@ -5491,16 +5747,13 @@ function createLibrarySaveTool(opts: LocalToolsOpts): AgentTool {
       required: ['source_path'],
     },
     async execute(input, ctx): Promise<ToolResult> {
-      if (Object.keys(input).some((key) => !['source_path', 'name', 'action', 'expected_revision'].includes(key))
-          || (input.action !== undefined && input.action !== 'save' && input.action !== 'checkout')
-          || (input.expected_revision !== undefined && (typeof input.expected_revision !== 'string' || !input.expected_revision))) {
-        return { content: errText('E_BAD_INPUT', 'invalid library_save fields'), isError: true };
-      }
+      const fieldError = librarySaveFieldError(input);
+      if (fieldError) return { content: errText('E_BAD_INPUT', fieldError), isError: true };
       if (!opts.userId || !opts.projectId) {
         return { content: errText('E_NO_PROJECT', 'library_save is only available inside a project conversation'), isError: true };
       }
       const rawSource = typeof input.source_path === 'string' ? input.source_path.trim() : '';
-      if (!rawSource) return { content: errText('E_BAD_INPUT', '`source_path` is required'), isError: true };
+      if (!rawSource) return { content: errText('E_BAD_INPUT', 'source_path must be a non-empty string'), isError: true };
       const sourceAbs = resolveAbs(ctx, rawSource);
       // Path sandbox at entry: only a file the agent produced inside its own
       // workspace may be copied into the shared, synced project library.
@@ -5510,7 +5763,7 @@ function createLibrarySaveTool(opts: LocalToolsOpts): AgentTool {
       const name = typeof input.name === 'string' ? input.name.trim() : '';
       const targetName = name || path.basename(sourceAbs);
       if (input.action === 'checkout' && (!name || input.expected_revision !== undefined)) {
-        return { content: errText('E_BAD_INPUT', 'checkout requires name and does not accept expected_revision'), isError: true };
+        return { content: errText('E_BAD_INPUT', !name ? 'name must be a non-empty string for checkout' : 'expected_revision is not accepted for checkout'), isError: true };
       }
       if (input.action === 'checkout' || input.expected_revision !== undefined) {
         const result = input.action === 'checkout'
@@ -5884,9 +6137,10 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
       }
 
       try {
+        // Deliverable pages open in the chat file viewer; check them under its sandbox.
         const rendered = input.interactions === false
-          ? await renderResponsiveHtmlPreview(abs, viewports, {}, { interactions: false })
-          : await renderResponsiveHtmlPreview(abs, viewports);
+          ? await renderResponsiveHtmlPreview(abs, viewports, {}, { interactions: false, fileViewer: true })
+          : await renderResponsiveHtmlPreview(abs, viewports, {}, { fileViewer: true });
         if (!rendered.evidence.ok) {
           return {
             content: JSON.stringify({
@@ -6287,6 +6541,9 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
 
 /** Build the array of local-machine tools for a single runner. */
 export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
+  // A fresh tools instance owns fresh evidence, even if a caller reuses opts.
+  opts = { ...opts };
+  taskFileOwnership.set(opts, new TaskFileOwnership());
   const tools: AgentTool[] = [
     createBashTool(opts),
     ...createHostProcessTools(opts),

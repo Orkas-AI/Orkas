@@ -34,11 +34,11 @@ export interface MemoryHandlerResult {
   evicted?: MemoryEvictionReport;
 }
 
-/** Hosts may consolidate asynchronously before committing a memory write. */
+/** Hosts may consolidate or publish asynchronously before completing a write. */
 export interface MemoryToolHandler {
   add(tier: MemoryTier, content: string, signal?: AbortSignal): MemoryHandlerResult | Promise<MemoryHandlerResult>;
   replace(tier: MemoryTier, oldText: string, content: string, signal?: AbortSignal): MemoryHandlerResult | Promise<MemoryHandlerResult>;
-  remove(tier: MemoryTier, oldText: string): MemoryHandlerResult;
+  remove(tier: MemoryTier, oldText: string): MemoryHandlerResult | Promise<MemoryHandlerResult>;
   list(tier: MemoryTier): MemoryHandlerResult;
 }
 
@@ -102,7 +102,7 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
         action: {
           type: 'string',
           enum: ['add', 'replace', 'remove', 'list'],
-          description: 'add: content; replace: old_text/content; remove: old_text; list: no content fields. target is optional. Omit unrelated fields. Non-empty entries are already injected; use list only for exact text.',
+          description: 'add: content; replace: old_text/content; remove: old_text; list: no content. target optional. Known unused fields appear in ignored_fields; nonempty add old_text conflicts. entries are already injected; use list only for exact text.',
         },
         target: {
           type: 'string',
@@ -141,6 +141,9 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
       if (action === 'add' && input.old_text != null && (typeof input.old_text !== 'string' || input.old_text.trim())) {
         return { content: JSON.stringify({ ok: false, error: 'add cannot match old_text; use replace to change an existing entry' }), isError: true };
       }
+      const ignoredFields = allowedFields
+        ? Object.keys(input).filter((key) => !allowedFields.has(key)).sort()
+        : [];
 
       if (!tiers.includes(target)) {
         return { content: JSON.stringify({ ok: false, error: `target must be one of: ${tiers.map(t => `"${t}"`).join(', ')}` }), isError: true };
@@ -168,7 +171,7 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
           break;
         case 'remove':
           if (!oldText.trim()) return { content: JSON.stringify({ ok: false, error: '"old_text" is required for remove' }), isError: true };
-          result = handler.remove(target, oldText);
+          result = await handler.remove(target, oldText);
           break;
         case 'list':
           result = handler.list(target);
@@ -178,7 +181,7 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
       }
 
       return {
-        content: JSON.stringify(result), isError: !result.ok,
+        content: JSON.stringify({ ...result, ...(ignoredFields.length ? { ignored_fields: ignoredFields } : {}) }), isError: !result.ok,
         ...(result.ok && (action === 'add' || action === 'replace') && typeof result.changed === 'boolean'
           ? { observations: { stateMutation: {
               scope: target,

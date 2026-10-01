@@ -68,6 +68,32 @@ describe('persisted tool-result retrieval', () => {
 
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
+  it('reports known unused request fields without echoing their values', async () => {
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'search',
+      requests: [{ ref, query: 'needle', cursor: 999_999, max_tokens: 256 }],
+    }, ctx);
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('ignored_fields');
+    expect(result.content).toContain('cursor');
+    expect(result.content).toContain('max_tokens');
+    expect(result.content).not.toContain('999999');
+    expect(estimateToolResultTokens(result.content)).toBeLessThanOrEqual(TOOL_RESULT_ROUND_MAX_TOKENS);
+  });
+
+  it('reserves retrieval budget for the ignored-field receipt on a large read', async () => {
+    const largeRef = toolResultRefForPath(persistToolResult(dir, 'large-receipt', '界'.repeat(15_000)));
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'read', requests: [{ ref: largeRef, cursor: 0, query: 'unused-query-value' }],
+    }, ctx);
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('ignored_fields');
+    expect(result.content).toContain('query');
+    expect(result.content).not.toContain('unused-query-value');
+    expect(result.content).toContain('next_cursor');
+    expect(estimateToolResultTokens(result.content)).toBeLessThanOrEqual(TOOL_RESULT_ROUND_MAX_TOKENS);
+  });
+
   it('rejects incomplete or incompatible requests after schema flattening without materializing files or marking data as retrieved', async () => {
     const tool = getTool(tools, 'tool_result');
     const before = fs.readdirSync(dir);

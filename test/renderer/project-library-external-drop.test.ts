@@ -294,7 +294,7 @@ describe('Project Library external file drag-and-drop', () => {
     expect(context.window.orkas.invoke).toHaveBeenCalledTimes(7);
   });
 
-  it('keeps telemetry and rejection alerts when the post-upload refresh fails', async () => {
+  it('keeps rejection alerts when the post-upload refresh fails', async () => {
     const context = loadProjectDetailScript();
     const file = { name: 'ok.md', arrayBuffer: vi.fn(async () => new ArrayBuffer(1)) };
     const rejected = { name: 'bad.zip', arrayBuffer: vi.fn() };
@@ -305,17 +305,10 @@ describe('Project Library external file drag-and-drop', () => {
     context._projectLogFailure = vi.fn();
 
     await expect(context._uploadProjectFiles([file, rejected], '', 'drop')).resolves.toBeUndefined();
-
-    expect(context._projectTrackEvent).toHaveBeenCalledWith('project_file_upload_result', expect.objectContaining({
-      result: 'partial_failure',
-      uploaded_count: 1,
-      rejected_count: 1,
-    }));
     expect(context._projectLogFailure).toHaveBeenCalledWith('project_file_upload', expect.objectContaining({
       error_code: 'files_rejected',
       error_type: 'validation',
     }));
-    expect(context._projectTrackEvent.mock.calls[0][1]).not.toHaveProperty('project_id');
     expect(context.uiAlert).toHaveBeenCalledWith(expect.stringContaining('bad.zip'));
   });
 });

@@ -14,6 +14,7 @@
  */
 import * as crypto from 'node:crypto';
 import * as path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { app } from 'electron';
 
 import * as registry from './registry';
@@ -24,7 +25,7 @@ import { applyTemplate } from './apply-template';
 import { resolveCatalogConnection } from './connection-parameters';
 import { assertConnectorRuntimeEnabled, isConnectorRuntimeEnabled } from './availability';
 import { startComposioConnect, startOAuth, refreshIfStale, startGoogleSheetsPicker } from './oauth';
-import { startMcpDcrOAuth, refreshDcrIfStale } from './oauth-dcr';
+import { startMcpDcrOAuth, startCustomMcpOAuth, refreshDcrIfStale } from './oauth-dcr';
 import { createLogger } from '../../logger';
 import { isConnectorActionBlocked } from './action_policy';
 import { logErrorSummary } from '../../util/log-redact';
@@ -37,7 +38,7 @@ import { preflightConnectorCredits } from './usage-metering';
 import { registerUserSwitchHook } from '../user-switch-hooks';
 import { broadcastOAuthConnectOutcome, broadcastOAuthConnectProgress, type OAuthConnectOutcome } from './oauth-events';
 import { sanitizeAuthorizationDetail } from './local-cli-auth-error';
-import { deriveCustomId, validateCustomTransport, validateDisplayName, type CustomConnectorInput } from './custom-transport';
+import { deriveCustomId, validateCustomAuthMode, validateCustomTransport, validateDisplayName, type CustomConnectorInput } from './custom-transport';
 import {
   authorizeLocalCli,
   checkLocalCliPermissions,
@@ -212,7 +213,7 @@ function _transportForPersistence(
   current: Transport,
   resolved: Transport,
 ): Transport {
-  return entry?.auth_mode === 'local_api' ? current : resolved;
+  return !entry || entry.auth_mode === 'local_api' ? current : resolved;
 }
 
 /** Apply the catalog's reviewed MCP action boundary before schemas reach persistence or the LLM.
@@ -813,13 +814,43 @@ async function _refreshGrantIfStale(
 }
 
 async function _resolveTransport(uid: string, inst: ConnectorInstance): Promise<{ transport: Transport; grant: OAuthGrant | null } | null> {
-  // Custom instances use their stored transport verbatim — no catalog
-  // template, no OAuth grant, no refresh cycle. The transport (incl. any
-  // API-key headers/env) lives inside secrets_enc like every other one.
   if (inst.origin === 'custom') {
     if (!inst.transport) {
       log.warn('custom instance has no transport', { id: inst.origin === 'custom' ? 'custom' : inst.id });
       return null;
+    }
+    if (inst.custom_auth_mode === 'oauth') {
+      if (inst.transport.kind !== 'streamable-http' || !inst.oauth_grant || !inst.dcr_client) return null;
+      const key = _runtimeKey(uid, inst.id);
+      const existing = _refreshLocks.get(key);
+      let grant: OAuthGrant;
+      if (existing) grant = await existing.promise;
+      else {
+        const lock: RefreshLock = { promise: Promise.resolve(null as never), force: false, attemptedRemote: false };
+        const pending = (async () => {
+          try {
+            const latest = registry.load(uid).connections[inst.id];
+            if (!latest?.oauth_grant || !latest.dcr_client) throw new Error('custom OAuth grant missing; reconnect required');
+            const next = await refreshDcrIfStale(latest.dcr_client, latest.oauth_grant, { strict: true });
+            let current = registry.load(uid).connections[inst.id];
+            if (next !== latest.oauth_grant) {
+              current = await registry.update(uid, inst.id, (cur) => {
+                // Browser authorization can finish while the refresh is in flight.
+                // Never pair its new client with the old authorization's grant.
+                if (!isDeepStrictEqual(cur.oauth_grant, latest.oauth_grant)
+                  || !isDeepStrictEqual(cur.dcr_client, latest.dcr_client)) return cur;
+                return { ...cur, oauth_grant: next, updated_at: _nowIso() };
+              }) ?? undefined;
+            }
+            if (!current?.oauth_grant || !current.dcr_client) throw new Error('custom OAuth grant missing; reconnect required');
+            return current.oauth_grant;
+          } finally { if (_refreshLocks.get(key) === lock) _refreshLocks.delete(key); }
+        })();
+        lock.promise = pending;
+        _refreshLocks.set(key, lock);
+        grant = await pending;
+      }
+      return { transport: { ...inst.transport, headers: { ...inst.transport.headers, Authorization: `Bearer ${grant.access_token}` } }, grant };
     }
     return { transport: inst.transport, grant: null };
   }
@@ -1402,9 +1433,15 @@ export async function connectViaOAuth(
     assertConnectorRuntimeEnabled(catalogId);
     await preflightConnectorCredits(catalogEntry, 'connect');
     _assertRuntimeEpoch(runtimeEpoch);
+    let authorizationCompleted = false;
+    const hasDiscoveredBinding = ['mercado_libre', 'tiktok_shop'].includes(catalogEntry.local_api!.provider);
+    const existingBinding = hasDiscoveredBinding ? registry.load(uid).connections[catalogId]?.connection_parameters : undefined;
     try {
-      const metadata = await authorizeLocalApi(uid, catalogEntry, opts.connectionParameters, { attemptId: opts.attemptId });
+      const metadata = await authorizeLocalApi(uid, catalogEntry, opts.connectionParameters, {
+        attemptId: opts.attemptId, ...(existingBinding ? { existingBinding } : {}),
+      });
       _assertRuntimeEpoch(runtimeEpoch);
+      authorizationCompleted = true;
       const instance = await _provisionLocalApiInstance(uid, catalogEntry, metadata, runtimeEpoch);
       if (instance.status.kind === 'error') {
         throw new Error(instance.status.message || 'local API account verification failed');
@@ -1412,8 +1449,11 @@ export async function connectViaOAuth(
       return instance;
     } catch (error) {
       _assertRuntimeEpoch(runtimeEpoch);
-      removeLocalApiAuthorization(uid, catalogEntry);
-      await registry.remove(uid, catalogEntry.id);
+      // Preserve the previous installation when replacement authorization is cancelled.
+      if (authorizationCompleted) {
+        removeLocalApiAuthorization(uid, catalogEntry);
+        await registry.remove(uid, catalogEntry.id);
+      }
       throw error;
     }
   }
@@ -1749,11 +1789,14 @@ async function _provisionLocalApiInstance(
  * instance in `error` status (visible in the UI, fixable by remove+re-add)
  * instead of silently discarding the user's input.
  */
-export async function addCustomInstance(uid: string, input: CustomConnectorInput): Promise<ConnectorInstance> {
+export async function addCustomInstance(
+  uid: string, input: CustomConnectorInput, opts: { deferOAuth?: boolean } = {},
+): Promise<ConnectorInstance> {
   if (!uid) throw new Error('uid required');
   const runtimeEpoch = _runtimeEpoch;
   const displayName = validateDisplayName(input?.display_name);
   const transport = validateCustomTransport(input?.transport);
+  const authMode = validateCustomAuthMode(input?.auth_mode, transport);
 
   // Unique id derived from the name; suffix on collision with an existing
   // row. The `custom-` prefix guarantees catalog ids can never be shadowed.
@@ -1766,6 +1809,7 @@ export async function addCustomInstance(uid: string, input: CustomConnectorInput
     id,
     display_name: displayName,
     origin: 'custom',
+    ...(authMode === 'oauth' ? { custom_auth_mode: 'oauth' as const } : {}),
     transport,
     enabled_subtools: null,
     tools_cache: [],
@@ -1776,7 +1820,74 @@ export async function addCustomInstance(uid: string, input: CustomConnectorInput
   };
   log.info('custom connector add', { id: 'custom', kind: transport.kind });
   await registry.upsert(uid, draft);
+  if (authMode === 'oauth') {
+    if (opts.deferOAuth) return draft;
+    try { return await authorizeCustomInstance(uid, id); }
+    catch { return registry.load(uid).connections[id] || draft; }
+  }
   return _connectAndCacheTools(uid, draft, undefined, runtimeEpoch);
+}
+
+/** Reauthorize a custom remote MCP server after its grant expires or was revoked. */
+export async function authorizeCustomInstance(
+  uid: string, id: string, opts: { attemptId?: string } = {},
+): Promise<ConnectorInstance> {
+  if (!uid) throw new Error('uid required');
+  const runtimeEpoch = _runtimeEpoch;
+  const inst = registry.load(uid).connections[id];
+  if (!inst || inst.origin !== 'custom' || inst.custom_auth_mode !== 'oauth'
+    || inst.transport?.kind !== 'streamable-http') throw new Error('custom OAuth connector not found');
+  await _closeDiscoveredConnection(uid, id, runtimeEpoch);
+  try {
+    const { grant, client } = await startCustomMcpOAuth(id, inst.transport.url, opts);
+    _assertRuntimeEpoch(runtimeEpoch);
+    const updated = await registry.update(uid, id, (cur) => ({
+      ...cur, oauth_grant: grant, dcr_client: client,
+      status: { kind: 'connecting' }, updated_at: _nowIso(),
+    }));
+    if (!updated) throw new Error('custom connector removed during authorization');
+    return _connectAndCacheTools(uid, updated, undefined, runtimeEpoch);
+  } catch (error) {
+    _assertRuntimeEpoch(runtimeEpoch);
+    const reason = String((error as Error | null)?.message || '');
+    const safeMessage = /^(DCR registration failed: HTTP [0-9]{3}|token endpoint HTTP [0-9]{3}|provider does not support client metadata or DCR registration)$/.test(reason)
+      ? reason : 'OAuth authorization failed; reconnect to try again';
+    await registry.update(uid, id, (cur) => ({ ...cur,
+      status: { kind: 'error', message: safeMessage, at: _now() },
+      updated_at: _nowIso(),
+    }));
+    throw error;
+  }
+}
+
+/** Browser OAuth runs after IPC returns; the callback/result uses the catalog event channel. */
+export function beginCustomOAuthConnect(uid: string, id: string): OAuthConnectStart {
+  const inst = uid ? registry.load(uid).connections[id] : null;
+  if (!inst || inst.origin !== 'custom' || inst.custom_auth_mode !== 'oauth'
+    || inst.transport?.kind !== 'streamable-http') throw new Error('custom OAuth connector not found');
+  const attemptId = crypto.randomUUID();
+  const startedAt = Date.now();
+  const runtimeEpoch = _runtimeEpoch;
+  void authorizeCustomInstance(uid, id, { attemptId }).then((result) => {
+    if (runtimeEpoch !== _runtimeEpoch) return;
+    const failed = result.status.kind !== 'connected';
+    broadcastOAuthConnectOutcome({ attempt_id: attemptId, catalog_id: id,
+      result: failed ? 'failure' : 'success', duration_ms: Date.now() - startedAt,
+      ...(failed ? { code: 'mcp_connect_failed', error: result.status.kind === 'error' || result.status.kind === 'degraded'
+        ? result.status.message : 'MCP connection failed' } : {}),
+    });
+  }).catch((error) => {
+    if (runtimeEpoch !== _runtimeEpoch) return;
+    const code = _oauthConnectErrorCode(error);
+    broadcastOAuthConnectOutcome({ attempt_id: attemptId, catalog_id: id,
+      result: code === 'user_cancelled' || code === 'superseded' ? 'cancelled' : 'failure',
+      duration_ms: Date.now() - startedAt, code,
+      error: registry.load(uid).connections[id]?.status.kind === 'error'
+        ? (registry.load(uid).connections[id]?.status as { message: string }).message
+        : 'OAuth authorization failed',
+    });
+  });
+  return { attempt_id: attemptId };
 }
 
 export async function removeInstance(
@@ -1952,6 +2063,28 @@ export async function callTool(
       ? await conn.callTool(name, args, requestOpts)
       : await conn.callTool(name, args);
     _assertRuntimeEpoch(runtimeEpoch);
+    const adapterResult = result as { isError?: boolean; _meta?: { orkas?: { errorCode?: string } } } | null;
+    const adapterCode = adapterResult?._meta?.orkas?.errorCode;
+    const actionableAdapterCode = adapterCode && [
+      'E_TOOL_CALL_AUTH', 'E_TOOL_CALL_NETWORK', 'E_TOOL_CALL_TIMEOUT', 'E_TOOL_CALL_UPSTREAM', 'E_TOOL_CALL_RATE_LIMIT',
+      'storefront_permission_denied', 'storefront_binding_mismatch', 'storefront_invalid_credentials',
+      'storefront_network_failed', 'storefront_timeout', 'storefront_upstream_error', 'storefront_rate_limit',
+    ].includes(adapterCode);
+    if (entry?.auth_mode === 'local_api' && adapterResult?.isError && actionableAdapterCode) {
+      const authorizationFailure = ['E_TOOL_CALL_AUTH', 'storefront_permission_denied', 'storefront_binding_mismatch', 'storefront_invalid_credentials'].includes(adapterCode);
+      if (authorizationFailure) {
+        await _markAuthorizationError(uid, id, 'connector_reconnect_required', 'local_api_tool_auth_failed');
+      } else {
+        // Preserve the MCP failure and do not replay an operation. Keep the process
+        // alive so another request's rotating grant can finish reaching storage.
+        await _markDegradedOnTransientFailure(uid, registry.load(uid).connections[id] || inst,
+          Object.assign(new Error(adapterCode), { code: adapterCode, retryable: true }),
+          'local_api_tool_call');
+      }
+    } else if (entry?.auth_mode === 'local_api' && !adapterResult?.isError
+      && registry.load(uid).connections[id]?.status.kind === 'degraded') {
+      await registry.update(uid, id, cur => ({ ...cur, status: { kind: 'connected', since: _now() }, updated_at: _nowIso() }));
+    }
     return result;
   } catch (err) {
     _assertRuntimeEpoch(runtimeEpoch);

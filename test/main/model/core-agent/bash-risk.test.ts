@@ -9,6 +9,30 @@ import { classifyBashCommand, type RiskCategory } from '../../../../src/main/mod
 
 // [command, expected category that MUST be present]
 const RISKY: Array<[string, RiskCategory]> = [
+  ['cp -t/etc source.txt', 'sensitive_path'],
+  ['install -d /etc/review-test ./local', 'sensitive_path'],
+  // Credential operands previously relied on the configured raw-pattern fallback.
+  // The structural classifier now owns that existing Host policy.
+  ['cat .env', 'sensitive_path'],
+  ['cat ./.env', 'sensitive_path'],
+  ['cat .env.local', 'sensitive_path'],
+  ['cat ~/.npmrc', 'sensitive_path'],
+  ['cat ~/.pypirc', 'sensitive_path'],
+  ['cat ~/.git-credentials', 'sensitive_path'],
+  ['cat ~/.aws/config', 'sensitive_path'],
+  ['crontab -r', 'sensitive_path'],
+  ['crontab -e', 'sensitive_path'],
+  ['crontab jobs.txt', 'sensitive_path'],
+  ['sftp user@host', 'network_egress'],
+  ["printf '%s' '~/.ssh/id_rsa'; cat ~/.ssh/id_rsa", 'sensitive_path'],
+  ['cp source.txt /etc/hosts', 'sensitive_path'],
+  ['cp -t /etc source.txt', 'sensitive_path'],
+  ['cp --target-directory=/etc/systemd source.txt', 'sensitive_path'],
+  ['chmod g+w notes.txt', 'priv_esc'],
+  ['chmod ug+w notes.txt', 'priv_esc'],
+  ['git -C --help push origin main', 'external_mutation'],
+  ['git push --receive-pack --help origin main', 'external_mutation'],
+  ['Start-Process -FilePath calc.exe -WhatIf:$false', 'external_mutation'],
   // network_egress — any explicit shell network access, including downloads.
   ['curl -O https://example.com/file.zip', 'network_egress'],
   ['curl -o out.json https://api.example.com/data', 'network_egress'],
@@ -198,6 +222,18 @@ const RISKY: Array<[string, RiskCategory]> = [
 
 // commands that MUST NOT be flagged (risky === false)
 const SAFE: string[] = [
+  'crontab -u user -l',
+  "printf '%s' '~/.ssh/id_rsa'",
+  "echo '~/.ssh/id_rsa' | cat",
+
+  'git log --grep push',
+  'git -C project log --grep push',
+  'git push --help',
+  'git --help push',
+  'cp /etc/hosts ./hosts-copy',
+  'chmod u+w notes.txt',
+  'chmod u=rw notes.txt',
+  'Start-Process -FilePath calc.exe -WhatIf',
   // Project-local execution and dependency changes remain routine workspace
   // operations; pair these against the explicit user/global cases above.
   'npm ci',
@@ -287,8 +323,6 @@ const SAFE: string[] = [
   'pkill --signal 0 -f chrome',
   'killall -l',
   // normal project files / reads
-  'cat ./.env',
-  'cat .env.local',
   'cat /etc/hosts',
   'cat /etc/os-release',
   'cp foo.txt ~/Desktop/',

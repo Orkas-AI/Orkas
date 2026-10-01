@@ -94,11 +94,11 @@ function _rememberMathHtml(key, value) {
   }
 }
 
-async function typesetMathHtml(html) {
+async function typesetMathHtml(html, { cache = true } = {}) {
   const key = String(html || '');
   if (!key) return '';
   if (!_containsMath(key)) return key;
-  const cached = _mathHtmlCache.get(key);
+  const cached = cache && _mathHtmlCache.get(key);
   if (cached) return cached;
   if (typeof document === 'undefined' || !document.createElement) return key;
   const host = document.createElement('div');
@@ -117,12 +117,16 @@ async function typesetMathHtml(html) {
     if (window.MathJax.typesetClear) window.MathJax.typesetClear([host]);
     await window.MathJax.typesetPromise([host]);
     const out = host.innerHTML;
-    _rememberMathHtml(key, out);
+    // Streaming blocks already retain their rendered DOM. Do not retain every
+    // intermediate version again in the session-wide HTML cache.
+    if (cache) _rememberMathHtml(key, out);
     return out;
   } catch (_err) {
     (_mathLog.warn || console.warn).call(_mathLog, 'typeset html failed');
     return key;
   } finally {
+    // Detached temporary hosts must not remain in MathJax's document registry.
+    window.MathJax?.typesetClear?.([host]);
     if (host.parentElement) host.parentElement.removeChild(host);
   }
 }

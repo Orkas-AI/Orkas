@@ -41,7 +41,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   if (previousRoot === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = previousRoot;
-  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 describe('device-local CLI connector lifecycle', () => {

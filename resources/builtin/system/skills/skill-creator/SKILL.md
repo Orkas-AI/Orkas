@@ -38,8 +38,7 @@ Do not read unrelated references. A category-only edit needs only `metadata.md`;
 
 - Bound Skill editor: mutate the current Skill without an outer `<skill>` wrapper for ordinary file/meta edits.
 - Unbound create: omit `<skill_id>` and include a complete new `SKILL.md` plus category.
-- Unbound edit: obtain `<skill_id>` from Available skills, read the current SKILL.md, and emit only changed metadata or whole files.
-- Built-in Skill: explain that it cannot be edited from this surface and can be forked; emit no mutation protocol.
+- Unbound edit: resolve the target and check its `Source` in Available skills or `skill_search` before reading files or preparing edits. For `Source: builtin` or `Source: platform`, explain that the platform Skill definition cannot be edited through chat and nothing changed; emit no mutation protocol and do not retry the edit. For `Source: custom`, obtain the current `<skill_id>`, read the current SKILL.md, and emit only changed metadata or whole files.
 - Pure discussion or no actual change: emit no protocol.
 
 Before a new Skill, compare its name and typical objects/actions with Available skills. If one substantially overlaps, stop and ask whether to use it or still create a new one. Otherwise create in the same turn.

@@ -36,6 +36,8 @@ function _isPlainComposerEnter(e) {
 }
 
 function _insertComposerNewline(el) {
+  const editor = _composerApi(el);
+  if (editor) { OrkasEditor.splitBlock(editor.view.state, editor.view.dispatch); return; }
   if (!el || typeof el.value !== 'string') return;
   const start = typeof el.selectionStart === 'number' ? el.selectionStart : el.value.length;
   const end = typeof el.selectionEnd === 'number' ? el.selectionEnd : start;
@@ -364,19 +366,8 @@ function bindStaticHandlers() {
   const newInput = document.getElementById('new-chat-input');
   const newBtn = document.getElementById('new-chat-send-btn');
   newBtn.addEventListener('click', handleNewChatSubmit);
-  newInput.addEventListener('keydown', (e) => {
-    // Plain Enter sends; Shift/Cmd/Ctrl+Enter inserts a newline. Skip while
-    // IME is composing — Chinese pinyin commit also fires Enter and would
-    // otherwise send a half-typed message.
-    // keyCode 229 catches older Electron / Safari builds (CLAUDE.md §8).
-    if (e.isComposing || e.keyCode === 229) return;
-    if (_handleModifiedComposerEnter(e)) return;
-    if (_isPlainComposerEnter(e)) {
-      e.preventDefault();
-      handleNewChatSubmit();
-    }
-  });
-  newInput.addEventListener('input', () => autoGrow(newInput, 260));
+
+  newInput.addEventListener(composerChangeEvent(newInput), () => autoGrow(newInput, 260));
   if (typeof _initNewChatAttachInput === 'function') _initNewChatAttachInput();
 
   // Conversation detail input
@@ -392,22 +383,8 @@ function bindStaticHandlers() {
       handleChatSubmit();
     }
   });
-  chatInput.addEventListener('keydown', (e) => {
-    // Plain Enter sends; Shift/Cmd/Ctrl+Enter inserts a newline. Skip IME
-    // (CLAUDE.md §8 — keyCode 229 belt-and-suspenders for older builds).
-    if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Escape' && _isQueueItemEditing(currentCid)) {
-      e.preventDefault();
-      void _cancelQueueItemEdit(currentCid);
-      return;
-    }
-    if (_handleModifiedComposerEnter(e)) return;
-    if (_isPlainComposerEnter(e)) {
-      e.preventDefault();
-      handleChatSubmit();
-    }
-  });
-  chatInput.addEventListener('input', () => {
+
+  chatInput.addEventListener(composerChangeEvent(chatInput), () => {
     autoGrow(chatInput, 200);
     _saveDraft(currentCid);
   });

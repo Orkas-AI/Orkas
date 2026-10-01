@@ -42,6 +42,7 @@
  * First request with a bad token destroys the connection.
  */
 
+import { librarySaveFieldError } from '../../util/library-save-input';
 import { addEntryWithMaintenance, replaceEntryWithMaintenance } from '../memory-maintenance';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
@@ -72,8 +73,10 @@ import {
   removeAgentEntry,
 } from '../memory';
 import * as connectors from '../connectors';
+import { createConnectorToolDiscovery, validateDiscoveryParams } from '../connectors/tool-discovery';
 import { requestActionConfirm, connectorAccountKey } from '../connectors/action_confirm';
 import { connectorActionRisk, isConnectorActionBlocked } from '../connectors/action_policy';
+import { observeTaskDraftResult } from '../connectors/task-created-drafts';
 import {
   type LocalCliPermissionPolicy,
   type LocalCliType,
@@ -386,20 +389,27 @@ function _buildMethods(
     },
   });
 
+  const discoverConnectorTools = createConnectorToolDiscovery();
   if (capabilities.has('connectors')) Object.assign(methods, {
-    'connectors.list': async () => {
+    'connectors.list': async (params) => {
+      const discoveryParams = validateDiscoveryParams(params);
       const visible = await connectors.resolveVisibleConnectors(opts.uid);
       assertActive();
       for (const { instance } of visible) {
         recordConnectorDisplayName(instance.id, instance.display_name);
       }
-      return {
-        connectors: visible.map(({ instance, tools }) => ({
-          id: instance.id,
-          name: instance.display_name,
-          tools: tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema })),
-        })),
-      };
+      const result = discoverConnectorTools(visible, discoveryParams);
+      const text = JSON.stringify(result, null, 2);
+      if (Buffer.byteLength(text) <= CONNECTOR_RESULT_CAP) return result;
+      // Only explicit single-action expansion can exceed the discovery budget.
+      // Reuse run-local result reads; retrieval must never invoke the provider.
+      const target = visible.find(v => v.instance.id === discoveryParams.connector_id);
+      if (result.mode !== 'schema' || !target || !discoveryParams.tool_name) throw new Error('connector discovery result exceeds the inline budget');
+      const file = persistToolResult(path.join(opts.configDir, '.orkas-bridge-results'), 'connector-schema', text);
+      const ref = crypto.randomBytes(16).toString('hex');
+      connectorResults.set(ref, { file, connectorId: target.instance.id, accountKey: connectorAccountKey(target.instance), toolName: discoveryParams.tool_name });
+      const page = readBridgeFilePage(file, {});
+      return { text: page.content, ...page, output_ref: ref };
     },
 
     'connectors.call': async (params, call) => {
@@ -466,7 +476,9 @@ function _buildMethods(
         }
 
         if (call.signal.aborted) throw cancelled();
-        const actionRisk = connectorActionRisk(target.instance, tool, args);
+        const draftScope = !target.instance.composio_grant
+          ? { uid: opts.uid, cid: opts.cid, connectorId, accountKey: connectorAccountKey(target.instance) } : undefined;
+        const actionRisk = connectorActionRisk(target.instance, tool, args, draftScope);
         if (actionRisk.risk === 'H' || actionRisk.risk === 'D') {
           const resumeIdle = opts.onPermissionWaitStart?.();
           let approved: boolean;
@@ -498,6 +510,7 @@ function _buildMethods(
         const raw = await connectors.callTool(opts.uid, connectorId, toolName, args, {
           signal: call.signal,
         });
+        if (!call.signal.aborted) observeTaskDraftResult(draftScope, toolName, args, raw);
         const text = connectors.stringifyMcpResult(raw);
         assertActive();
         if (Buffer.byteLength(text, 'utf8') <= CONNECTOR_RESULT_CAP) return { text };
@@ -567,7 +580,7 @@ function _buildMethods(
       // Reads and writes share native validation, paging, scope and execution facts.
       const tool = createProjectTasksTool(createProjectTasksHandler(opts.uid, opts.projectId || '', opts.cid, names, {
         actorId: opts.agentId,
-      }), { readOnly, globalScope: !opts.projectId });
+      }, { sourceProjectId: opts.projectId || '', workingDir: opts.workingDir }), { readOnly, globalScope: !opts.projectId });
       const result = await tool.execute(params, { state: {} });
       const receipt = JSON.parse(result.content);
       if (result.isError) throw new Error(receipt.error || 'task operation failed');
@@ -637,16 +650,15 @@ function _buildMethods(
         return result;
       },
       library_save: async (params: Record<string, unknown>) => {
-        if (Object.keys(params).some((key) => !['source_path', 'name', 'action', 'expected_revision'].includes(key))
-            || typeof params.source_path !== 'string' || !params.source_path.trim()
-            || (params.action !== undefined && params.action !== 'save' && params.action !== 'checkout')
-            || (params.expected_revision !== undefined && (typeof params.expected_revision !== 'string' || !params.expected_revision))) throw new Error('invalid library_save fields');
+        const fieldError = librarySaveFieldError(params);
+        if (fieldError) throw new Error(fieldError);
+        if (typeof params.source_path !== 'string' || !params.source_path.trim()) throw new Error('source_path must be a non-empty string');
         const source = path.resolve(workspace, params.source_path.trim());
         if (!isPathAllowed(source, [workspace])) throw new Error('source_path must be inside the current workspace');
         const name = typeof params.name === 'string' ? params.name.trim() : '';
         const target = name || path.basename(source);
         if (params.action === 'checkout') {
-          if (!name || params.expected_revision !== undefined) throw new Error('checkout requires name and does not accept expected_revision');
+          if (!name || params.expected_revision !== undefined) throw new Error(!name ? 'name must be a non-empty string for checkout' : 'expected_revision is not accepted for checkout');
           const result = await projectFiles.checkoutProjectFile(opts.uid, pid, name, source);
           return result.ok ? { ...result, path: result.name } : result;
         }

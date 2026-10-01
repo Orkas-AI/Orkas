@@ -33,6 +33,7 @@ vi.mock('../../../src/main/features/agents', () => ({
 }));
 vi.mock('../../../src/main/features/projects', () => ({
   projectExists: vi.fn(async () => true),
+  getProject: vi.fn(async () => ({ project_id: 'p_112233445566', owner_uid: 'uRUNNOW' })),
   getBindings: vi.fn(async () => ({ agents: ['a_owner'], skills: [] })),
   listProjects: vi.fn(async () => []),
 }));

@@ -19,6 +19,9 @@
   let activityEl = null;
   let activityListEl = null;
   let activityBtn = null;
+  let expandBtn = null;
+  let expanded = false;
+  const expandedInerted = new Set();
   let downloadPromptEl = null;
   let activeDownloadPrompt = null;
   let downloadRevealKey = '';
@@ -133,6 +136,7 @@
   }
 
   function assistantStatusText(tab) {
+    if (tab?.user_controlled) return label('web_assist.user_controlled', 'You are using this page; AI will resume after you stop');
     if (!tab?.assistant_controlled) return '';
     if (tab.assistant_action === 'observing') return label('web_assist.assistant_observing', 'An AI agent is reading this page…');
     if (tab.assistant_action === 'acting') return label('web_assist.assistant_acting', 'An AI agent is operating this page…');
@@ -188,8 +192,10 @@
       <div class="web-assist-tabbar">
         <div class="web-assist-tabs" role="tablist"></div>
         <button type="button" class="web-assist-add-tab" data-act="add">${icon('plus')}</button>
-        <button type="button" class="btn btn-ghost btn-sm web-assist-activity-btn" data-act="activity"
+        <button type="button" class="web-assist-activity-btn" data-act="activity"
                 aria-expanded="false" aria-controls="web-assist-activity">${icon('clock')}<span></span></button>
+        <button type="button" class="web-assist-expand-btn" data-act="expand"
+                aria-pressed="false">${icon('maximize')}<span></span></button>
       </div>
       <div class="web-assist-toolbar">
         <div class="web-assist-navigation" role="group">
@@ -246,18 +252,28 @@
     activityEl = shell.querySelector('.web-assist-activity-popover');
     activityListEl = shell.querySelector('.web-assist-trail-list');
     activityBtn = shell.querySelector('[data-act="activity"]');
+    expandBtn = shell.querySelector('[data-act="expand"]');
     downloadPromptEl = shell.querySelector('.web-assist-download-prompt');
     downloadPromptEl.querySelector('[data-act="deny-download"]').addEventListener('click', dismissDownloadPrompt);
     downloadPromptEl.querySelector('[data-act="allow-download"]').addEventListener('click', allowDownloadPrompt);
     activityBtn.addEventListener('click', () => setActivityOpen(activityEl.hidden));
+    expandBtn.addEventListener('click', () => setExpanded(!expanded));
     shell.querySelector('[data-act="close-activity"]').addEventListener('click', () => setActivityOpen(false, true));
     document.addEventListener('pointerdown', (event) => {
       if (!activityEl.hidden && !activityEl.contains(event.target) && !activityBtn.contains(event.target)) setActivityOpen(false);
     });
     document.addEventListener('keydown', (event) => {
-      if (event.isComposing || event.keyCode === 229 || event.key !== 'Escape' || activityEl.hidden) return;
+      if (event.isComposing || event.keyCode === 229 || event.key !== 'Escape') return;
+      if (!activityEl.hidden) {
+        event.preventDefault();
+        setActivityOpen(false, true);
+        return;
+      }
+      // A dialog above the page owns Escape until it is dismissed, including
+      // while the browser has no page and therefore no rectangle to occlude.
+      if (!expanded || modalIsOpen() || dialogIsOpen()) return;
       event.preventDefault();
-      setActivityOpen(false, true);
+      setExpanded(false, true);
     });
 
     shell.querySelector('[data-act="add"]').addEventListener('click', addTab);
@@ -337,6 +353,7 @@
     activityBtn.querySelector('span').textContent = label('web_assist.activity', 'Activity');
     shell.querySelector('#web-assist-activity-title').textContent = label('web_assist.activity', 'Activity');
     setButtonCopy(shell.querySelector('[data-act="close-activity"]'), 'web_assist.activity_close', 'Close activity');
+    refreshExpandCopy();
     if (!activityEl.hidden) renderActivity();
     renderState(currentState);
   }
@@ -589,6 +606,11 @@
     });
   }
 
+  function dialogIsOpen() {
+    return Array.from(document.querySelectorAll('.modal-overlay, [aria-modal="true"]'))
+      .some((overlay) => !overlay.hidden && overlay.getClientRects().length > 0);
+  }
+
   function modalIsOpen() {
     const browserRect = host?.getBoundingClientRect();
     if (!browserRect || browserRect.width <= 0 || browserRect.height <= 0) return false;
@@ -685,6 +707,55 @@
         log.warn('native view layout failed', { error: (error && error.message) || String(error) });
       });
     });
+  }
+
+  // In-app full screen. The browser fills the window while the task keeps its
+  // live page, tabs and session; the stored panel width is left untouched so
+  // returning restores the width the user chose.
+  function refreshExpandCopy() {
+    if (!expandBtn) return;
+    const key = expanded ? 'web_assist.exit_full_screen' : 'web_assist.full_screen';
+    const text = label(key, expanded ? 'Exit full screen' : 'Full screen');
+    // Markup comes from the trusted icon set, never from page-controlled text.
+    expandBtn.innerHTML = `${icon(expanded ? 'minimize' : 'maximize')}<span></span>`;
+    expandBtn.querySelector('span').textContent = text;
+    expandBtn.title = text;
+    expandBtn.setAttribute('aria-pressed', String(expanded));
+  }
+
+  function setExpandedBackgroundInert(panel, next) {
+    if (!next) {
+      for (const element of expandedInerted) element.inert = false;
+      expandedInerted.clear();
+      return;
+    }
+    const app = panel?.closest('.app-container');
+    if (!app) return;
+    // Leave body-level dialogs outside the app available while the browser
+    // covers the sidebar, composer and other app panels.
+    for (let current = panel; current !== app; current = current.parentElement) {
+      for (const sibling of current.parentElement.children) {
+        if (sibling === current || sibling.inert) continue;
+        sibling.inert = true;
+        expandedInerted.add(sibling);
+      }
+    }
+  }
+
+  function setExpanded(next, restoreFocus = false) {
+    const panel = document.getElementById('conversation-info-panel');
+    const wanted = !!panel && !!next && panelOpen && panelTab === 'browser' && activeView === 'conversation';
+    if (expanded !== wanted) {
+      expanded = wanted;
+      panel?.classList.toggle('is-web-assist-expanded', expanded);
+      setExpandedBackgroundInert(panel, expanded);
+      if (restoreFocus) expandBtn?.focus();
+      // The native page is placed by rectangle, so it has to follow the new
+      // host bounds even though visibility itself did not change.
+      syncVisibility();
+      scheduleLayout();
+    }
+    refreshExpandCopy();
   }
 
   function ensureDefaultTab() {
@@ -857,6 +928,7 @@
     contextEpoch += 1;
     clearPagePreview();
     setActivityOpen(false);
+    setExpanded(false);
     if (activityListEl) activityListEl.textContent = '';
   }
 
@@ -882,7 +954,10 @@
   function setPanelState(open, tab, cid) {
     panelOpen = !!open;
     panelTab = tab || 'files';
-    if (!panelOpen || panelTab !== 'browser') setActivityOpen(false);
+    if (!panelOpen || panelTab !== 'browser') {
+      setActivityOpen(false);
+      setExpanded(false);
+    }
     if (cid) updateContext(activeView, cid);
     ensureShell();
     renderState(currentState);

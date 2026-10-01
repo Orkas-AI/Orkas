@@ -73,7 +73,7 @@ describe.each(['open'])('remaining merchant journey (%s)', (channel) => {
     expect(encrypted).not.toMatch(/merchant-private|merchant-fixture-secret|one-use-code/);
     expect(JSON.stringify(metadata)).not.toMatch(/secret|token|identity/);
     const caps = await adapter.callTool('list_capabilities', {}, env);
-    expect(caps.actions).toHaveLength(row.count);
+    expect(caps.actions).toHaveLength(row.provider === 'base_shop' ? 27 : row.provider === 'aliexpress' ? 221 : row.provider === 'alibaba_icbu' ? 72 : row.count);
     expect(JSON.stringify(caps)).not.toMatch(/merchant-private|merchant-fixture-secret/);
     const read = await adapter.callTool('execute_read', { action: 'products.list', parameters: { limit: 1 } }, env);
     expect(JSON.stringify(read)).toContain('Fixture product');
@@ -83,6 +83,120 @@ describe.each(['open'])('remaining merchant journey (%s)', (channel) => {
     expect(fetchMock).toHaveBeenCalledTimes(before);
     removeLocalApiAuthorization(UID, entry(row));
     expect(hasLocalApiAuthorization(UID, entry(row))).toBe(false);
+  });
+});
+
+describe('Temu native merchant journey', () => {
+  it('uses a restarted encrypted grant for native product, stock and delete lanes and preserves partial reconciliation', async () => {
+    const row = rows[1];
+    const fetchMock = boundary(row);
+    const { env } = await connect(row);
+    const c = adapter.configured(env);
+    const scopes = ['bg.local.goods.spec.id.get', 'bg.local.goods.stock.edit', 'temu.local.goods.delete'];
+    codec.writeCredentialFile(c.credentialFile, c.credentialKey, {
+      ...c.credentials, identity: { ...c.credentials.identity, scopes: [...c.credentials.identity.scopes, ...scopes] },
+    });
+    fetchMock.mockClear();
+    const card = entry(row);
+    expect(card.allowed_tools).toEqual(expect.arrayContaining(['execute_write', 'execute_destructive']));
+    expect(card.tool_policies?.execute_destructive).toMatchObject({ risk: 'D', confirmation: 'destructive' });
+    const described = await adapter.callTool('describe_action', { action: scopes[0] }, env);
+    expect(described).toMatchObject({ risk: 'W', input_schema: { required: ['catId', 'parentSpecId', 'childSpecName'] } });
+    await expect(adapter.callTool('execute_read', { action: scopes[0], parameters: {} }, env)).rejects.toThrow(/risk mismatch/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ success: true, result: { specId: 15 } })));
+    const spec = await adapter.callTool('execute_write', { action: scopes[0], parameters: { catId: 1, parentSpecId: 2, childSpecName: 'Fixture variant' } }, env);
+    expect(spec.result).toMatchObject({ status: 'acknowledged', data: { specId: 15 } });
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ success: true, result: {
+      goodsId: 11, operateResult: true, skuStockEditStatusInfoList: [{ skuId: 12, stockEditStatus: false, errorCode: 500, errorMsg: TOKEN }],
+    } })));
+    const stock = CallToolResultSchema.parse(await adapter.callToolResult('execute_high_impact', {
+      action: scopes[1], parameters: { goodsId: 11, requestUniqueKey: 'fixture-stock-001', skuStockTargetList: [{ skuId: 12, stockTarget: 0 }] },
+    }, env));
+    expect(stock.isError).toBe(true);
+    expect(stock._meta).toMatchObject({ orkas: { errorCode: 'E_TOOL_CALL_UPSTREAM' } });
+    expect(JSON.parse(stock.content[0].text).result.data.skuStockEditStatusInfoList).toEqual([{ skuId: 12, stockEditStatus: false, errorCode: 500 }]);
+    expect(JSON.stringify(stock)).not.toContain(TOKEN);
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ success: true, result: { success: true } })));
+    const deleted = await adapter.callTool('execute_destructive', { action: scopes[2], parameters: { goodsId: 11 } }, env);
+    expect(deleted.result).toMatchObject({ status: 'acknowledged', data: { success: true } });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.map(([_url, init]) => JSON.parse(init!.body as string).type)).toEqual(scopes);
+    expect(fs.readFileSync(c.credentialFile, 'utf8')).not.toContain(TOKEN);
+  });
+});
+
+describe('SHEIN native merchant journey', () => {
+  it('uses the restarted encrypted seller grant for native reads, asset writes, price review and deletion lanes', async () => {
+    const row = rows[3], fetchMock = boundary(row);
+    const { env } = await connect(row);
+    const c = adapter.configured(env);
+    expect(fs.readFileSync(c.credentialFile, 'utf8')).toMatch(/^ORKAPI1:/);
+    fetchMock.mockClear();
+    const card = entry(row);
+    expect(card.allowed_tools).toEqual(expect.arrayContaining(['execute_write', 'execute_destructive']));
+    expect(card.tool_policies?.execute_destructive).toMatchObject({ risk: 'D', confirmation: 'destructive' });
+    const readAction = 'POST /open-api/order/order-detail';
+    expect(await adapter.callTool('describe_action', { action: readAction }, env)).toMatchObject({ risk: 'R', input_schema: { required: ['body'] } });
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ code: '0', info: [{ orderNo: 'O-11', receiveMsg: { phone: 'Fixture phone' }, productTotalPrice: 21 }] })));
+    const read = await adapter.callTool('execute_read', { action: readAction, parameters: { body: { orderNoList: ['O-11'] } } }, env);
+    expect(read.result.data[0]).toMatchObject({ receiveMsg: { phone: 'Fixture phone' }, productTotalPrice: 21 });
+    const writeAction = 'POST /open-api/goods/transform-pic';
+    await expect(adapter.callTool('execute_read', { action: writeAction, parameters: {} }, env)).rejects.toThrow(/risk mismatch/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ code: '0', info: { original: 'https://assets.example/image.jpg', transformed: 'https://img.shein.com/fixture.jpg', failure_reason: '' } })));
+    const asset = await adapter.callTool('execute_write', { action: writeAction, parameters: { body: { original_url: 'https://assets.example/image.jpg', image_type: 1 } } }, env);
+    expect(asset.result).toMatchObject({ status: 'acknowledged', data: { transformed: 'https://img.shein.com/fixture.jpg' } });
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ code: '0', info: { data: [{ productCode: 'SKU-11', site: 'shein-us', success: false, status: 0, message: SECRET }] } })));
+    const price = CallToolResultSchema.parse(await adapter.callToolResult('execute_high_impact', {
+      action: 'POST /open-api/openapi-business-backend/product/price/save',
+      parameters: { body: { productPriceList: [{ productCode: 'SKU-11', currencyCode: 'USD', shopPrice: 12, site: 'shein-us' }] } },
+    }, env));
+    expect(price.isError).toBe(true);
+    expect(price._meta).toMatchObject({ orkas: { errorCode: 'E_TOOL_CALL_UPSTREAM' } });
+    expect(JSON.stringify(price)).not.toContain(SECRET);
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ code: '0', info: { apply_no: 'DEL-1', deleted: false, id: 'SKC-11' } })));
+    const deletion = await adapter.callTool('execute_destructive', { action: 'DELETE /open-api/goods/delete/{skcName}', parameters: { path: { skcName: 'SKC-11' } } }, env);
+    expect(deletion.result).toMatchObject({ status: 'acknowledged', data: { apply_no: 'DEL-1', deleted: false } });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock.mock.calls.at(-1)![1]!.method).toBe('DELETE');
+    expect(fs.readFileSync(c.credentialFile, 'utf8')).not.toContain(SECRET);
+  });
+});
+
+describe('Lazada native merchant journey', () => {
+  it('uses the restarted encrypted country grant for native reads, image writes, partial shipment and deletion lanes', async () => {
+    const row = rows.find(row => row.provider === 'lazada')!, fetchMock = boundary(row);
+    const { env } = await connect(row);
+    const c = adapter.configured(env);
+    expect(fs.readFileSync(c.credentialFile, 'utf8')).toMatch(/^ORKAPI1:/);
+    fetchMock.mockClear();
+    const card = entry(row);
+    expect(card.allowed_tools).toEqual(expect.arrayContaining(['execute_write', 'execute_destructive']));
+    expect(card.tool_policies?.execute_destructive).toMatchObject({ risk: 'D', confirmation: 'destructive' });
+    expect(await adapter.callTool('describe_action', { action: 'GET /order/get' }, env)).toMatchObject({ risk: 'R', input_schema: { required: ['parameters'] } });
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ code: '0', data: { order_id: 11, address_shipping: { phone: 'Fixture phone' }, price: '21' } })));
+    const read = await adapter.callTool('execute_read', { action: 'GET /order/get', parameters: { parameters: { order_id: 11 } } }, env);
+    expect(read.result.data.data).toMatchObject({ address_shipping: { phone: 'Fixture phone' }, price: '21' });
+    await expect(adapter.callTool('execute_read', { action: 'POST /images/migrate', parameters: {} }, env)).rejects.toThrow(/risk mismatch/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ code: '0', batch_id: 'BATCH-1' })));
+    expect((await adapter.callTool('execute_write', { action: 'POST /images/migrate', parameters: { parameters: { payload: '<Request><Images><Image><Url>https://assets.example/fixture.jpg</Url></Image></Images></Request>' } } }, env)).result)
+      .toMatchObject({ status: 'acknowledged', data: { batch_id: 'BATCH-1' } });
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ code: '0', result: { success: true, data: { packages: [{ package_id: 'P1', item_err_code: '700020', msg: SECRET }] } } })));
+    const partial = CallToolResultSchema.parse(await adapter.callToolResult('execute_high_impact', {
+      action: 'POST /order/package/rts', parameters: { parameters: { readyToShipReq: { packages: [{ package_id: 'P1' }] } } },
+    }, env));
+    expect(partial.isError).toBe(true);
+    expect(partial._meta).toMatchObject({ orkas: { errorCode: 'E_TOOL_CALL_UPSTREAM' } });
+    expect(JSON.parse(partial.content[0].text).result.data.result.data.packages).toEqual([{ package_id: 'P1', item_err_code: '700020' }]);
+    expect(JSON.stringify(partial)).not.toContain(SECRET);
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ code: '0', data: { sku_list: [{ seller_sku: 'SKU-1' }] } })));
+    expect((await adapter.callTool('execute_destructive', { action: 'POST /product/remove', parameters: { parameters: { seller_sku_list: '["SKU-1"]' } } }, env)).result)
+      .toMatchObject({ status: 'acknowledged', data: { data: { sku_list: [{ seller_sku: 'SKU-1' }] } } });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock.mock.calls.every(([url]) => new URL(String(url)).hostname === 'api.lazada.sg')).toBe(true);
+    expect(fs.readFileSync(c.credentialFile, 'utf8')).not.toContain(SECRET);
   });
 });
 

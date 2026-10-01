@@ -47,10 +47,10 @@ const KUAISHOU_SCOPES = [
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-async function readJson(response, label) {
+async function readJson(response, label, parse = JSON.parse) {
   const text = await response.text();
   let body;
-  try { body = JSON.parse(text); } catch { throw new Error(`${label} returned an invalid response`); }
+  try { body = parse(text); } catch { throw new Error(`${label} returned an invalid response`); }
   if (!response.ok) throw new Error(`${label} failed (HTTP ${response.status})`);
   return body;
 }
@@ -241,6 +241,42 @@ async function douyinApi(appKey, appSecret, accessToken, pathName, method, param
   return result.data || result;
 }
 
+// Official merchant identity and grant fields are shared by initial and rotated grants.
+function parseKuaishouIdentityJson(text) {
+  return JSON.parse(text, (key, value, context) => {
+    if (key === 'sellerId' && typeof value === 'number' && !Number.isSafeInteger(value)) {
+      if (!context?.source || !/^[1-9][0-9]{0,18}$/.test(context.source)) throw new Error('Invalid Kuaishou seller identifier');
+      return context.source;
+    }
+    return value;
+  });
+}
+function kuaishouGrantedScope(token) {
+  const raw = token?.scopes;
+  const values = typeof raw === 'string' ? raw.split(/[ ,]+/).filter(Boolean) : raw;
+  if (!Array.isArray(values) || !values.length || values.some(value => typeof value !== 'string' || !/^[a-z][a-z0-9_]*$/.test(value))) {
+    throw new Error('Kuaishou Shop returned invalid or missing scopes; reconnect');
+  }
+  const granted = new Set(values);
+  if (KUAISHOU_SCOPES.some(value => !granted.has(value))) throw new Error('Kuaishou Shop authorization is missing required scopes');
+  return [...granted].join(',');
+}
+function kuaishouMerchantIdentity(seller, shop, expectedOpenId, expectedShopId) {
+  if (typeof seller?.openId !== 'string' || !seller.openId || seller.openId !== String(expectedOpenId)) {
+    throw new Error('Kuaishou Shop authorization returned a different seller');
+  }
+  const id = seller?.sellerId;
+  if ((typeof id !== 'string' && (typeof id !== 'number' || !Number.isSafeInteger(id)))
+      || !/^[1-9][0-9]{0,18}$/.test(String(id)) || BigInt(id) > 9223372036854775807n
+      || (expectedShopId !== undefined && String(id) !== String(expectedShopId))) {
+    throw new Error('Kuaishou Shop authorization returned a different shop');
+  }
+  if (typeof shop?.shopName !== 'string' || !shop.shopName || !Number.isInteger(shop.shopType)) {
+    throw new Error('Kuaishou Shop returned incomplete shop information');
+  }
+  return { open_id: seller.openId, shop_id: String(id), seller_name: String(seller.name || ''), shop_name: shop.shopName };
+}
+
 function signKuaishou(parameters, signSecret) {
   const message = Object.keys(parameters).sort()
     .map((key) => `${key}=${parameters[key]}`).join('&') + `&signSecret=${signSecret}`;
@@ -265,9 +301,9 @@ async function kuaishouApi(appKey, signSecret, accessToken, method, parameters =
     options.headers['content-type'] = 'application/x-www-form-urlencoded';
     options.body = new URLSearchParams(common).toString();
   }
-  const result = await readJson(await fetch(url, options), 'Kuaishou Shop seller verification');
-  if (result.result !== undefined && Number(result.result) !== 1 && String(result.result).toLowerCase() !== 'success') {
-    throw new Error(`Kuaishou Shop seller verification failed: ${String(result.error_msg || result.msg || result.error || result.result).slice(0, 160)}`);
+  const result = await readJson(await fetch(url, options), 'Kuaishou Shop seller verification', parseKuaishouIdentityJson);
+  if (![1, '1'].includes(result.result)) {
+    throw new Error('Kuaishou Shop seller verification failed; check merchant authorization');
   }
   return result.data || result;
 }
@@ -586,8 +622,8 @@ async function authorizeEtsy(env) {
 
 async function authorizeMercadoLibre(env) {
   const { client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri } = env.credentials;
-  const userId = String(env.metadata.user_id || '');
-  if (!clientId || !clientSecret || !redirectUri || !/^[1-9][0-9]{0,18}$/.test(userId)) {
+  const expectedUserId = String(env.metadata.user_id || '');
+  if (!clientId || !clientSecret || !redirectUri || (expectedUserId && !/^[1-9][0-9]{0,18}$/.test(expectedUserId))) {
     throw new Error('incomplete Mercado Libre authorization input');
   }
   const { code, verifier } = await authorizationCode(env);
@@ -598,14 +634,22 @@ async function authorizeMercadoLibre(env) {
   if (!token.access_token || !token.refresh_token || !token.user_id) {
     throw new Error('Mercado Libre token exchange returned incomplete credentials');
   }
-  if (String(token.user_id) !== userId) throw new Error('Mercado Libre authorization returned a different seller');
+  const userId = String(token.user_id);
+  if (!/^[1-9][0-9]{0,18}$/.test(userId)
+      || (typeof token.user_id !== 'string' && !Number.isSafeInteger(token.user_id))) {
+    throw new Error('Mercado Libre authorization returned an invalid seller');
+  }
+  if (expectedUserId && userId !== expectedUserId) throw new Error('Mercado Libre authorization returned a different seller');
   const missing = missingScopes(token.scope, MERCADO_LIBRE_SCOPES);
   if (missing.length) throw new Error(`Mercado Libre authorization is missing required scopes: ${missing.join(', ')}`);
   const identity = await readJson(await fetch('https://api.mercadolibre.com/users/me', {
     headers: { authorization: `Bearer ${token.access_token}`, accept: 'application/json' },
     redirect: 'error', signal: AbortSignal.timeout(60_000),
   }), 'Mercado Libre seller verification');
-  if (String(identity.id || '') !== userId) throw new Error('Mercado Libre authorization returned a different seller');
+  if (String(identity.id || '') !== userId
+      || (typeof identity.id !== 'string' && !Number.isSafeInteger(identity.id))) {
+    throw new Error('Mercado Libre authorization returned a different seller');
+  }
   return {
     provider: 'mercado_libre', client_id: clientId, client_secret: clientSecret,
     redirect_uri: redirectUri, access_token: token.access_token, refresh_token: token.refresh_token,
@@ -783,31 +827,23 @@ async function authorizeKuaishouShop(env) {
   const token = await readJson(await fetch(tokenUrl, {
     headers: { accept: 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(60_000),
   }), 'Kuaishou Shop token exchange');
+  if (![1, '1'].includes(token.result)) throw new Error('Kuaishou Shop token exchange was not acknowledged');
   const data = token.data || token;
   if (!data.access_token || !data.refresh_token || !data.open_id) {
     throw new Error('Kuaishou Shop token exchange returned incomplete credentials');
   }
-  const missing = missingScopes(data.scope || KUAISHOU_SCOPES.join(','), KUAISHOU_SCOPES);
-  if (missing.length) throw new Error(`Kuaishou Shop authorization is missing required scopes: ${missing.join(', ')}`);
+  const scope = kuaishouGrantedScope(data);
   const seller = await kuaishouApi(appKey, signSecret, data.access_token, 'open.user.seller.get');
   const shop = await kuaishouApi(appKey, signSecret, data.access_token, 'open.shop.info.get');
-  const returnedOpenId = String(seller.open_id || seller.openId || data.open_id || '');
-  if (returnedOpenId !== String(data.open_id)) {
-    throw new Error('Kuaishou Shop authorization returned a different seller');
-  }
-  const shopId = String(shop.shop_id || shop.shopId || shop.id || '');
-  if (!shopId) throw new Error('Kuaishou Shop authorization returned no shop identity');
+  const identity = kuaishouMerchantIdentity(seller, shop, data.open_id);
   return {
     provider: 'kuaishou_shop', app_key: appKey, app_secret: appSecret,
     sign_secret: signSecret, redirect_uri: redirectUri,
     access_token: data.access_token, refresh_token: data.refresh_token,
-    scope: data.scope || KUAISHOU_SCOPES.join(','),
+    scope,
     expires_at: expiryMs(data.expires_in, 48 * 60 * 60),
     refresh_expires_at: expiryMs(data.refresh_token_expires_in, 180 * 86_400),
-    identity: {
-      open_id: String(data.open_id), seller_name: String(seller.seller_name || seller.user_name || ''),
-      shop_id: shopId, shop_name: String(shop.shop_name || shop.name || ''),
-    },
+    identity,
   };
 }
 
@@ -830,6 +866,7 @@ async function authorizeYouzan(env) {
     identity: {
       kdt_id: kdtId, shop_name: String(identity.name || identity.shop_name || ''),
       authority_id: String(token.authority_id),
+      ...(Number.isInteger(identity.type) ? { type: identity.type } : {}),
     },
   };
 }
@@ -923,6 +960,7 @@ module.exports = {
   authorizeXiaohongshuArk,
   chinaTimestamp, signTaobao, sign1688, signJd, signPinduoduo, signDouyin, signKuaishou,
   stableJson, douyinApi, kuaishouApi, expiryMs, absoluteOrRelativeExpiryMs,
+  parseKuaishouIdentityJson, kuaishouGrantedScope, kuaishouMerchantIdentity,
   youzanAuthToken, youzanAuthApi, weimobAuthToken, weimobAuthApi,
   signXiaohongshu, xiaohongshuAuthApi,
   DEVICE_AUTHORIZE_URL: CONSTANT_CONTACT_DEVICE_URL,

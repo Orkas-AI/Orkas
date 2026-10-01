@@ -604,7 +604,7 @@ export const processSessionTool: AgentTool = defineTool({
       action: {
         type: "string",
         enum: ["read", "write", "stop"],
-        description: "read: session_id/cursor; write: session_id/chars; stop: session_id. Use only its action-specific fields.",
+        description: "read: session_id/cursor; write: session_id/chars; stop: session_id. Known unused fields are ignored and listed in ignored_fields; session_id always selects the existing session.",
       },
       session_id: { type: "string", description: "Required for read, write, and stop." },
       yield_time_ms: { type: "integer", minimum: 0, maximum: 30000, default: 10000, description: "Read only. Wait for new output or exit; zero polls immediately." },
@@ -627,17 +627,30 @@ export const processSessionTool: AgentTool = defineTool({
     }
     const fieldError = processSessionActionError(action, input);
     if (fieldError) return { content: fieldError, isError: true };
+    const ignoredFields = Object.keys(input).filter((key) => !PROCESS_SESSION_ACTION_FIELDS[action].has(key)).sort();
+    const notice = ignoredFields.length ? `ignored_fields: ${JSON.stringify(ignoredFields)}\n` : "";
+    input = Object.fromEntries(Object.entries(input).filter(([key]) => PROCESS_SESSION_ACTION_FIELDS[action].has(key)));
+    const withNotice = (result: ToolResult): ToolResult => {
+      if (!notice) return result;
+      try {
+        const payload: unknown = JSON.parse(result.content);
+        if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+          return { ...result, content: JSON.stringify({ ...payload, ignored_fields: ignoredFields }) };
+        }
+      } catch { /* Preserve non-JSON errors with a text receipt. */ }
+      return { ...result, content: `${notice}${result.content}` };
+    };
     if (action !== "start") {
       if (action === "read" && commandSessionWait(input.yield_time_ms) === null) {
         return { content: "E_BAD_INPUT: yield_time_ms must be an integer from 0 to 30000", isError: true };
       }
       const managed = await continueCommandSession(input, ctx);
-      if (managed) return managed;
+      if (managed) return withNotice(managed);
     }
-    if (action === "start") return processStartTool.execute(input, ctx);
-    if (action === "read") return processReadTool.execute({ ...input, yield_time_ms: input.yield_time_ms ?? 10_000 }, ctx);
-    if (action === "write") return processWriteTool.execute(input, ctx);
-    if (action === "stop") return processStopTool.execute(input, ctx);
+    if (action === "start") return withNotice(await processStartTool.execute(input, ctx));
+    if (action === "read") return withNotice(await processReadTool.execute({ ...input, yield_time_ms: input.yield_time_ms ?? 10_000 }, ctx));
+    if (action === "write") return withNotice(await processWriteTool.execute(input, ctx));
+    if (action === "stop") return withNotice(await processStopTool.execute(input, ctx));
     return processStopTool.execute(input, ctx);
   },
 });

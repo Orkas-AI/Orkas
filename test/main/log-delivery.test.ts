@@ -86,4 +86,18 @@ describe('log delivery isolation', () => {
       expect(consoleOutput).toContain('worker-smoke');
     } finally { await delivery.close(); rmSync(directory, { recursive: true, force: true }); }
   });
+
+  it('repeats retention while the worker stays alive instead of only at boot', async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'orkas-worker-log-'));
+    const delivery = createLogDelivery({ directory, fileLevel: 'info', consoleLevel: false,
+      retainDays: 7, totalMaxBytes: 100000, fileMaxBytes: 256, sweepIntervalMs: 20 },
+    (file, config) => new Worker(file, config));
+    try {
+      delivery.send({ level: 'info', scope: 'worker-sweep', date: new Date(), data: ['ready'] });
+      await vi.waitFor(() => expect(delivery.stats()).toMatchObject({ pending: 0, failed: false }), { timeout: 5000 });
+      // Expired after the boot sweep already ran: only a repeated sweep removes it.
+      writeFileSync(path.join(directory, '2000-01-02.log'), 'expired later');
+      await vi.waitFor(() => expect(readdirSync(directory)).not.toContain('2000-01-02.log'), { timeout: 5000 });
+    } finally { await delivery.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
 });

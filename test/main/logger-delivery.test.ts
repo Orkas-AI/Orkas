@@ -8,9 +8,11 @@ it('main and renderer records bypass direct file/console sinks and snapshot once
   const workspace = process.env.ORKAS_WORKSPACE_ROOT;
   const level = process.env.ORKAS_LOG_LEVEL;
   const devtools = process.env.ORKAS_DEVTOOLS;
+  const disableDelivery = process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
   const originalConsole = { info: console.info, warn: console.warn, error: console.error };
   process.env.ORKAS_WORKSPACE_ROOT = directory;
   process.env.ORKAS_LOG_LEVEL = 'info';
+  process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = '0';
   delete process.env.ORKAS_DEVTOOLS;
   const send = vi.fn(), canAccept = vi.fn(() => true), noteDrop = vi.fn();
   vi.doMock('../../src/main/util/log-delivery', () => ({ createLogDelivery: () => ({ send, canAccept, noteDrop }) }));
@@ -56,8 +58,29 @@ it('main and renderer records bypass direct file/console sinks and snapshot once
     if (workspace === undefined) delete process.env.ORKAS_WORKSPACE_ROOT; else process.env.ORKAS_WORKSPACE_ROOT = workspace;
     if (level === undefined) delete process.env.ORKAS_LOG_LEVEL; else process.env.ORKAS_LOG_LEVEL = level;
     if (devtools === undefined) delete process.env.ORKAS_DEVTOOLS; else process.env.ORKAS_DEVTOOLS = devtools;
+    if (disableDelivery === undefined) delete process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
+    else process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = disableDelivery;
     vi.doUnmock('../../src/main/util/log-delivery');
     vi.resetModules();
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it('does not start a background delivery worker for ordinary resettable Vitest cases', async () => {
+  const previousDisable = process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
+  process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = '1';
+  const createLogDelivery = vi.fn();
+  vi.doMock('../../src/main/util/log-delivery', () => ({ createLogDelivery }));
+  vi.resetModules();
+  try {
+    const logger = await import('../../src/main/logger');
+    logger.initLogger();
+    logger.createLogger('ordinary-test').info('no worker');
+    expect(createLogDelivery).not.toHaveBeenCalled();
+  } finally {
+    if (previousDisable === undefined) delete process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
+    else process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = previousDisable;
+    vi.doUnmock('../../src/main/util/log-delivery');
+    vi.resetModules();
   }
 });

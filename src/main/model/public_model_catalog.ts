@@ -42,9 +42,11 @@ export interface ProviderModelEntry {
 
 export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderModelEntry[]>> = {
   anthropic: [
+    { id: 'claude-opus-5-5', name: 'Claude Opus 5.5', maxInputImages: 20 },
     { id: 'claude-opus-5', name: 'Claude Opus 5', maxInputImages: 20 },
     { id: 'claude-fable-5-1', name: 'Claude Fable 5.1', maxInputImages: 20 },
     { id: 'claude-fable-5', name: 'Claude Fable 5', maxInputImages: 20 },
+    { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', maxInputImages: 20 },
     { id: 'claude-sonnet-5', name: 'Claude Sonnet 5', maxInputImages: 20 },
   ],
   'openai-codex': [
@@ -52,6 +54,9 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     // of the vendor ceiling; main turns send no output limit
     // (see omitReservedOutputLimitForProvider).
     { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
+    { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', maxTokens: 64_000, maxInputImages: 20 },
+    { id: 'gpt-6-sol', name: 'GPT-6 Sol', maxTokens: 64_000, maxInputImages: 20 },
+    { id: 'gpt-6-luna', name: 'GPT-6 Luna', maxTokens: 64_000, maxInputImages: 20 },
     { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
     { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
     { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
@@ -61,6 +66,9 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     // of the vendor ceiling; main turns send no output limit
     // (see omitReservedOutputLimitForProvider).
     { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
+    { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', maxTokens: 64_000, maxInputImages: 20 },
+    { id: 'gpt-6-sol', name: 'GPT-6 Sol', maxTokens: 64_000, maxInputImages: 20 },
+    { id: 'gpt-6-luna', name: 'GPT-6 Luna', maxTokens: 64_000, maxInputImages: 20 },
     { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
     { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
     { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
@@ -114,11 +122,16 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     // OpenRouter exposes hundreds of models. Prefer recent generations but
     // retain capability-driven exceptions such as Gemini 3.1 Pro. Settings
     // also accepts a user-entered model id.
+    { id: 'anthropic/claude-opus-5.5', name: 'Claude Opus 5.5', maxInputImages: 20 },
     { id: 'anthropic/claude-opus-5', name: 'Claude Opus 5', maxInputImages: 20 },
     { id: 'anthropic/claude-fable-5.1', name: 'Claude Fable 5.1', maxInputImages: 20 },
     { id: 'anthropic/claude-fable-5', name: 'Claude Fable 5', maxInputImages: 20 },
+    { id: 'anthropic/claude-sonnet-5.5', name: 'Claude Sonnet 5.5', maxInputImages: 20 },
     { id: 'anthropic/claude-sonnet-5', name: 'Claude Sonnet 5', maxInputImages: 20 },
     { id: 'openai/gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
+    { id: 'openai/gpt-6.1-sol', name: 'GPT-6.1 Sol', maxInputImages: 20 },
+    { id: 'openai/gpt-6-sol', name: 'GPT-6 Sol', maxInputImages: 20 },
+    { id: 'openai/gpt-6-luna', name: 'GPT-6 Luna', maxInputImages: 20 },
     { id: 'openai/gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'openai/gpt-5.5', maxInputImages: 20 },
     { id: 'openai/gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'openai/gpt-5.5', maxInputImages: 20 },
     { id: 'openai/gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'openai/gpt-5.5', maxInputImages: 20 },

@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -94,6 +95,7 @@ function loadOss(opts: LoadOpts = {}) {
   };
 
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
   const code = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/oss.js'), 'utf8');
   vm.runInContext(code, context, { filename: 'oss.js' });
   return { context, el, calls, invokeCount: () => invokeCount, invokeCalls };

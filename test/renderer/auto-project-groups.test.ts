@@ -12,17 +12,19 @@ const { _autoGroupTasks: groupTasks } = require('../../src/renderer/modules/auto
 
 /** The Auto tab against the real list renderer, with the sidebar project cache
  *  and view state controlled by the test. Rows are stubbed: the cases assert
- *  which group sections the user sees and what the sidebar was asked to do. */
+ *  the project switcher and the selected card scope. */
 function loadAutoTab(options: { projects: Project[] | null; view: string }) {
-  const sections: Array<{ projectId: string; name: string }> = [];
+  let scopes: any[] = [];
+  let selectedGroup: any = null;
   const list: any = {
     clears: 0,
     querySelectorAll: () => [],
-    appendChild(section: any) {
-      sections.push({ projectId: section.dataset.projectId, name: /auto-group-name">([^<]*)</.exec(section.innerHTML)?.[1] || '' });
+    appendChild(child: any) {
+      if (child.className.includes('auto-scope-switcher')) scopes = child.children;
+      if (child.className === 'auto-scope-group') selectedGroup = child;
     },
   };
-  Object.defineProperty(list, 'innerHTML', { set() { list.clears += 1; sections.length = 0; }, get() { return ''; } });
+  Object.defineProperty(list, 'innerHTML', { set() { list.clears += 1; scopes = []; selectedGroup = null; }, get() { return ''; } });
   const elements: Record<string, any> = {
     'auto-list': list,
     'auto-empty': { style: {} },
@@ -47,13 +49,13 @@ function loadAutoTab(options: { projects: Project[] | null; view: string }) {
       addEventListener() {},
       getElementById: (id: string) => elements[id] || null,
       querySelectorAll: () => [],
-      createElement: () => {
-        const el: any = { className: '', dataset: {}, innerHTML: '', appendChild() {} };
-        el.querySelector = (selector: string) => (selector === '.auto-group-list'
-          ? { id: '', hidden: false, innerHTML: '', appendChild() {} }
-          : { setAttribute() {}, getAttribute: () => 'true', addEventListener() {}, innerHTML: '' });
-        return el;
-      },
+      createElement: () => ({
+        className: '', dataset: {}, innerHTML: '', children: [] as any[], attributes: {} as Record<string, string>,
+        click: () => {},
+        appendChild(child: any) { this.children.push(child); },
+        setAttribute(name: string, value: string) { this.attributes[name] = value; },
+        addEventListener(name: string, fn: () => void) { if (name === 'click') this.click = fn; },
+      }),
     },
     window: {
       addEventListener() {},
@@ -74,7 +76,9 @@ function loadAutoTab(options: { projects: Project[] | null; view: string }) {
   return {
     context,
     sidebarLoads,
-    sectionNames: () => sections.map((section) => section.name),
+    scopeNames: () => scopes.map((scope) => /todo-scope-chip-name">([^<]*)</.exec(scope.innerHTML)?.[1] || ''),
+    activeScope: () => selectedGroup?.dataset.projectId,
+    selectScope: (id: string) => scopes.find((scope) => scope.dataset.projectId === id)?.click(),
     clears: () => list.clears,
   };
 }
@@ -86,7 +90,10 @@ describe('automation tab and the sidebar project cache', () => {
     await tab.context.loadAutoList(true);
 
     expect(tab.sidebarLoads).toEqual([]);
-    expect(tab.sectionNames()).toEqual(['auto.global', 'Alpha']);
+    expect(tab.scopeNames()).toEqual(['auto.global', 'Alpha']);
+    expect(tab.activeScope()).toBe('');
+    tab.selectScope('a');
+    expect(tab.activeScope()).toBe('a');
   });
 
   it('loads projects through the sidebar once when nothing is cached yet', async () => {
@@ -95,7 +102,7 @@ describe('automation tab and the sidebar project cache', () => {
     await tab.context.loadAutoList(true);
 
     expect(tab.sidebarLoads).toEqual([undefined]);
-    expect(tab.sectionNames()).toEqual(['auto.global', 'Loaded later']);
+    expect(tab.scopeNames()).toEqual(['auto.global', 'Loaded later']);
   });
 
   it('defers a projects-driven rebuild while the tab is hidden and paints it on the next visit', async () => {
@@ -107,12 +114,12 @@ describe('automation tab and the sidebar project cache', () => {
     tab.context._projectsCache[0].name = 'Renamed';
     tab.context.window.refreshAutoProjectGroups();
     expect(tab.clears()).toBe(paintsBefore);
-    expect(tab.sectionNames()).toEqual(['auto.global', 'Alpha']);
+    expect(tab.scopeNames()).toEqual(['auto.global', 'Alpha']);
 
     tab.context.currentView = 'auto';
     await tab.context.loadAutoList(false);
     expect(tab.clears()).toBe(paintsBefore + 1);
-    expect(tab.sectionNames()).toEqual(['auto.global', 'Renamed']);
+    expect(tab.scopeNames()).toEqual(['auto.global', 'Renamed']);
   });
 
   it('relabels a group at once when a project is renamed while the tab is visible', async () => {
@@ -122,7 +129,7 @@ describe('automation tab and the sidebar project cache', () => {
     tab.context._projectsCache[0].name = 'Renamed';
     tab.context.window.refreshAutoProjectGroups();
 
-    expect(tab.sectionNames()).toEqual(['auto.global', 'Renamed']);
+    expect(tab.scopeNames()).toEqual(['auto.global', 'Renamed']);
   });
 });
 

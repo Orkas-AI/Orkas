@@ -55,11 +55,31 @@ describe('Magento merchant-owned integration', () => {
     await expect(api.execute(bound, 'products.set_price', { sku: '24-UG04', store_id: 0, price: '12' })).rejects.toThrow(/acknowledged/);
   });
 
-  it('preserves order totals and pagination but excludes buyer/contact/payment/free-text fields', async () => {
+  it('preserves full order fulfilment, amounts, business notes and exact IDs while removing credentials', async () => {
     const fetchMock = fixture();
     const bound = { ...config(), credentials: await api.authorize(config()) };
-    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ items: [{ entity_id: 21, increment_id: '10021', grand_total: 49, customer_email: 'private@example.com', payment: { token: 'private' }, status_histories: [{ comment: 'private note' }], items: [{ sku: '24-UG04', qty_ordered: 2 }] }], total_count: 105 })));
-    expect(await api.execute(bound, 'orders.list', { page: 2, limit: 50 })).toEqual({ data: { items: [{ entity_id: 21, increment_id: '10021', grand_total: 49, items: [{ sku: '24-UG04', qty_ordered: 2 }] }], total_count: 105 }, page: 2, limit: 50 });
+    const order = { entity_id: 21, increment_id: '10021', grand_total: 49.25, customer_email: 'buyer@example.com', billing_address: { firstname: 'Fixture', street: ['Fixture road'], telephone: '1234567' }, payment: { method: 'checkmo', amount_ordered: 49.25, extension_attributes: { provider_reference: 'payment-1' }, access_token: 'not-for-output' }, status_histories: [{ comment: 'Keep this business note' }], extension_attributes: { shipping_assignments: [{ shipping: { address: { city: 'Fixture city' } } }] }, items: [{ sku: '24-UG04', qty_ordered: 2 }] };
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ items: [order], total_count: 105, search_criteria: { page_size: 50, current_page: 2 } })));
+    const result = await api.execute(bound, 'orders.list', { page: 2, limit: 50 });
+    const { access_token: ignored, ...payment } = order.payment; void ignored;
+    expect(result).toEqual({ data: { items: [{ ...order, payment }], total_count: 105, search_criteria: { page_size: 50, current_page: 2 } }, page: 2, limit: 50 });
+    fetchMock.mockResolvedValueOnce(new Response('{"entity_id":21,"extension_attributes":{"external_order_id":9007199254740993},"customer_note":"access-token-fixture should be redacted"}'));
+    expect(await api.execute(bound, 'orders.get', { order_id: 21 })).toEqual({ data: { entity_id: 21, extension_attributes: { external_order_id: '9007199254740993' }, customer_note: '[redacted] should be redacted' } });
+    fetchMock.mockResolvedValueOnce(new Response('{"entity_id":21,"extension_attributes":{"external_order_id":9.007199254740993e15}}'));
+    await expect(api.execute(bound, 'orders.get', { order_id: 21 })).rejects.toMatchObject({ code: 'storefront_upstream_error' });
+  });
+
+  it('returns complete sources, products and shop configuration without storing them in the credential identity', async () => {
+    const fetchMock = fixture();
+    const bound = { ...config(), credentials: await api.authorize(config()) };
+    expect(bound.credentials.identity).not.toHaveProperty('data');
+    expect(await api.execute(bound, 'shop.get')).toMatchObject({ data: stores, stores: [{ id: 1, code: 'default' }] });
+    const source = { source_code: 'default', name: 'Warehouse', email: 'warehouse@example.com', phone: '1234567', contact_name: 'Fixture operator', street: 'Fixture road', carrier_links: [{ carrier_code: 'flat_rate', position: 1 }], extension_attributes: { frontend_description: 'Pickup notes' } };
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ items: [source], total_count: 1 })));
+    expect((await api.execute(bound, 'sources.list')).data.items[0]).toEqual(source);
+    const product = { sku: '24-UG04', price: 12.25, custom_attributes: [{ attribute_code: 'manufacturer_email', value: 'factory@example.com' }], extension_attributes: { gift_note: 'Keep this note', consumer_secret: 'private' } };
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(product)));
+    expect((await api.execute(bound, 'products.get', { sku: '24-UG04' })).data).toEqual({ ...product, extension_attributes: { gift_note: 'Keep this note' } });
   });
 
   it('rejects changed binding and forged action parameters before side effects; uncertain writes are not retried', async () => {

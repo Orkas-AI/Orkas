@@ -191,33 +191,41 @@ test.describe('desktop shell', () => {
     await expect(appPage.locator('#auto-date-input')).toHaveValue('2099-08-30');
   });
 
-  test('navigates every primary sidebar view and settings tab', async ({ appPage }) => {
-    const destinations = [
-      ['auto-btn', 'panel-auto'],
-      ['agents-btn', 'panel-agents'],
-      ['skills-btn', 'panel-skills'],
-      ['connectors-btn', 'panel-connectors'],
-      ['contexts-btn', 'panel-contexts'],
-      ['apps-btn', 'panel-apps'],
-    ] as const;
+  test('navigates every primary sidebar view and settings tab', async ({}, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { marketplaceStub: true });
+    try {
+      await app.launch();
+      if (!app.page) throw new Error('Orkas renderer is unavailable');
+      const appPage = app.page;
+      const destinations = [
+        ['auto-btn', 'panel-auto'],
+        ['agents-btn', 'panel-agents'],
+        ['skills-btn', 'panel-skills'],
+        ['connectors-btn', 'panel-connectors'],
+        ['contexts-btn', 'panel-contexts'],
+        ['apps-btn', 'panel-apps'],
+      ] as const;
 
-    for (const [buttonId, panelId] of destinations) {
-      await appPage.locator(`#${buttonId}`).click();
-      await expect(appPage.locator(`#${buttonId}`)).toHaveClass(/\bactive\b/);
-      await expect(appPage.locator(`#${panelId}`)).toHaveClass(/\bactive\b/);
-      await expect(appPage.locator(`#${panelId}`)).toBeVisible();
+      for (const [buttonId, panelId] of destinations) {
+        await appPage.locator(`#${buttonId}`).click();
+        await expect(appPage.locator(`#${buttonId}`)).toHaveClass(/\bactive\b/);
+        await expect(appPage.locator(`#${panelId}`)).toHaveClass(/\bactive\b/);
+        await expect(appPage.locator(`#${panelId}`)).toBeVisible();
+      }
+
+      await appPage.locator('#settings-btn').click();
+      await expect(appPage.locator('#settings-btn')).toHaveClass(/\bactive\b/);
+      await expect(appPage.locator('#panel-settings')).toHaveClass(/\bactive\b/);
+      await expect(appPage.locator('#panel-settings')).toBeVisible();
+
+      const generalTab = appPage.locator('.settings-tab[data-settings-tab="general"]');
+      await generalTab.click();
+      await expect(generalTab).toHaveClass(/\bis-active\b/);
+      await expect(appPage.locator('[data-settings-pane="general"]')).toBeVisible();
+      await expect(appPage.locator('[data-settings-pane="account"]')).toBeHidden();
+    } finally {
+      await app.dispose();
     }
-
-    await appPage.locator('#settings-btn').click();
-    await expect(appPage.locator('#settings-btn')).toHaveClass(/\bactive\b/);
-    await expect(appPage.locator('#panel-settings')).toHaveClass(/\bactive\b/);
-    await expect(appPage.locator('#panel-settings')).toBeVisible();
-
-    const generalTab = appPage.locator('.settings-tab[data-settings-tab="general"]');
-    await generalTab.click();
-    await expect(generalTab).toHaveClass(/\bis-active\b/);
-    await expect(appPage.locator('[data-settings-pane="general"]')).toBeVisible();
-    await expect(appPage.locator('[data-settings-pane="account"]')).toBeHidden();
   });
 
 });

@@ -4,6 +4,7 @@
  */
 import { findCatalogEntry } from './catalog';
 import type { ConnectorInstance, ToolSchema } from './types';
+import { isTaskCreatedDraft, type DraftScope } from './task-created-drafts';
 
 export interface ConnectorActionRisk {
   risk: 'R' | 'W' | 'H' | 'D';
@@ -135,8 +136,12 @@ export function connectorActionRisk(
   instance: Pick<ConnectorInstance, 'id' | 'origin' | 'composio_grant'>,
   tool: ToolSchema,
   args: Record<string, unknown> = {},
+  taskScope?: DraftScope,
 ): ConnectorActionRisk {
   const base = baseConnectorActionRisk(instance, tool);
+  if (instance.origin !== 'custom' && !instance.composio_grant
+    && ['gmail', 'google-workspace'].includes(instance.id) && taskScope?.connectorId === instance.id
+    && tool.name === 'delete_draft' && isTaskCreatedDraft(taskScope, args.id)) return WRITE;
   // Never weaken a pinned destructive/sensitive policy or custom-tool distrust.
   if (base.risk === 'H' || base.risk === 'D') return base;
   // Fathom's GET actions can POST private meeting content to a caller's URL.

@@ -866,6 +866,21 @@ describe('local_agents/bridge › auth + skills', () => {
       for (const target of ['user', 'shared']) expect((await call('memory.agent', { action: 'add', target, content: 'Wrong scope' })).ok).toBe(false);
       expect((await call('memory.agent', { action: 'add', target: 'project', projectId: 'other', content: 'Wrong scope' })).ok).toBe(false);
       expect((await call('project_instructions', { instructions: 'Wrong scope', projectId: 'other' })).ok).toBe(false);
+      for (const [args, error] of [
+        [{ project_id: 'PRIVATE' }, 'unsupported field "project_id"'],
+        [{ action: 'overwrite' }, 'action must be "save" or "checkout"'],
+        [{ expected_revision: '' }, 'expected_revision must be a non-empty string'],
+        [{ source_path: '' }, 'source_path must be a non-empty string'],
+        [{ action: 'checkout' }, 'name must be a non-empty string for checkout'],
+        [{ action: 'checkout', name: 'report.md', expected_revision: 'PRIVATE' }, 'expected_revision is not accepted for checkout'],
+      ] as const) {
+        const failed = await call('library_save', { source_path: 'report.md', ...args });
+        expect(failed.ok).toBe(false);
+        expect(failed.error).toContain(error);
+        expect(failed.error).not.toContain('PRIVATE');
+      }
+      expect((await files.readProjectTextFile(TEST_UID, pid, 'report.md')).ok).toBe(false);
+      expect(fs.readFileSync(path.join(workingDir, 'report.md'), 'utf8')).toBe('First deliverable');
       expect((await call('library_save', { source_path: 'report.md' })).result).toMatchObject({ ok: true, path: 'report.md' });
       expect((await call('library_save', { source_path: 'report.md' })).result).toMatchObject({ ok: false, error: 'target_exists' });
       const checkout = (await call('library_save', { action: 'checkout', name: 'report.md', source_path: 'edit.md' })).result;
@@ -985,9 +1000,95 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(bridge.getConnectorDisplayName('slack')).toBe('Slack');
       expect(bridge.getConnectorDisplayName('unknown-connector')).toBeNull();
       expect(bridgeConnectorMock.resolveVisibleConnectors).toHaveBeenCalledWith(TEST_UID);
+      bridgeConnectorMock.resolveVisibleConnectors.mockClear();
+      for (const [params, message] of [
+        [{ limit: 51 }, 'limit must be an integer from 1 to 50'],
+        [{ offset: -1 }, 'offset must be an integer from 0 to 9007199254740991'],
+        [{ unknown: true }, 'unsupported discovery field "unknown"'],
+      ] as const) {
+        const { reply } = await rpcOnce(bridge.socketPath, { id: 43, token: bridge.token, method: 'connectors.list', params });
+        expect(reply).toMatchObject({ ok: false, error: expect.stringContaining(message) });
+      }
+      expect(bridgeConnectorMock.resolveVisibleConnectors).not.toHaveBeenCalled();
+      expect(bridgeConnectorMock.callTool).not.toHaveBeenCalled();
     } finally {
       await bridge.close();
     }
+  });
+
+  it('keeps business-number suffixes out of capability matches through connector RPC', async () => {
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+      instance: { id: 'custom-number-fixture', display_name: 'Fixture' },
+      tools: [
+        { name: 'read_metric_72', description: 'Read archived metrics.', input_schema: {} },
+        { name: 'read_invoice', description: 'Read invoice amount.', input_schema: {} },
+      ],
+    }] as any);
+    const bridge = await startTestBridge();
+    const list = async (params: Record<string, unknown>) => {
+      const { reply } = await rpcOnce(bridge.socketPath, { id: 42, token: bridge.token, method: 'connectors.list', params });
+      expect((reply as any).ok).toBe(true);
+      return (reply as any).result;
+    };
+    try {
+      expect(await list({ query: 'VID-72' })).toMatchObject({ total: 0, tools: [] });
+      expect((await list({ query: 'invoice INV-204' })).tools.map((t: any) => t.name)).toEqual(['read_invoice']);
+      expect((await list({ connector_id: 'custom-number-fixture', tool_name: 'read_metric_72' })).tools[0].name).toBe('read_metric_72');
+    } finally { await bridge.close(); }
+  });
+
+  it('retains a huge discovery schema without calling the provider and revalidates account/action for reads', async () => {
+    const instance = { id: 'slack', display_name: 'Slack', created_at: 1 };
+    const schema = { type: 'object', description: 'schema '.repeat(20_000) };
+    const scoped = [{ instance, tools: [{ name: 'search', description: 'Search', input_schema: schema }] }];
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue(scoped as any);
+    const bridge = await startTestBridge();
+    const rpc = async (method: string, params: object) => (await rpcOnce(bridge.socketPath, { id: 1, token: bridge.token, method, params })).reply as any;
+    try {
+      expect(await rpc('connectors.list', { limit: 0 })).toMatchObject({ ok: false });
+      expect(await rpc('connectors.list', { tool_name: 'search' })).toMatchObject({ ok: false });
+      const compact = await rpc('connectors.list', { connector_id: 'slack' });
+      expect(compact.result).toMatchObject({ mode: 'compact', schemas_included: false });
+      const expanded = await rpc('connectors.list', { connector_id: 'slack', tool_name: 'search' });
+      expect(expanded.ok).toBe(true); expect(expanded.result.output_ref).toMatch(/^[a-f0-9]{32}$/);
+      let current = expanded.result, text = current.text;
+      while (current.next_offset !== null) {
+        const read = await rpc('connectors.call', { action: 'read', output_ref: expanded.result.output_ref, offset: current.next_offset });
+        expect(read.ok).toBe(true); current = read.result; text += current.text;
+      }
+      expect(JSON.parse(text).tools[0].input_schema).toEqual(schema);
+      expect(bridgeConnectorMock.callTool).not.toHaveBeenCalled();
+      instance.created_at = 2;
+      expect(await rpc('connectors.call', { action: 'read', output_ref: expanded.result.output_ref })).toMatchObject({ ok: false, error: expect.stringContaining('no longer available') });
+      instance.created_at = 1; scoped[0].tools = [];
+      expect(await rpc('connectors.call', { action: 'read', output_ref: expanded.result.output_ref })).toMatchObject({ ok: false, error: expect.stringContaining('no longer available') });
+      expect(bridgeConnectorMock.callTool).not.toHaveBeenCalled();
+    } finally { await bridge.close(); }
+  });
+
+  it('uses native draft creation evidence through the CLI bridge and retains confirmation for existing drafts', async () => {
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+      instance: { id: 'gmail', display_name: 'Gmail', origin: 'catalog', created_at: 1 },
+      tools: ['create_draft', 'delete_draft'].map(name => ({ name, description: '', input_schema: {} })),
+    }] as any);
+    bridgeConnectorMock.callTool.mockImplementation(async (_uid: any, _id: any, name: any) => ({
+      content: [{ type: 'text', text: JSON.stringify(name === 'create_draft'
+        ? { id: 'new-draft', messageId: 'new-message' } : { ok: true }) }],
+    }));
+    bridgeActionConfirmMock.request.mockResolvedValue(false);
+    const bridge = await startTestBridge({ runId: 'draft-cleanup' });
+    const call = async (tool_name: string, id?: string) => (await rpcOnce(bridge.socketPath, {
+      id: 1, token: bridge.token, method: 'connectors.call',
+      params: { connector_id: 'gmail', tool_name, args: id ? { id } : {} },
+    })).reply;
+    try {
+      expect(await call('create_draft')).toMatchObject({ ok: true });
+      expect(await call('delete_draft', 'new-draft')).toMatchObject({ ok: true });
+      expect(bridgeActionConfirmMock.request).not.toHaveBeenCalled();
+      expect(await call('delete_draft', 'user-draft')).toMatchObject({ ok: false });
+      expect(bridgeActionConfirmMock.request).toHaveBeenCalledOnce();
+      expect(bridgeConnectorMock.callTool).toHaveBeenCalledTimes(2);
+    } finally { await bridge.close(); }
   });
 
   it('connectors.call normalizes schema field names and preserves explicit provider arguments', async () => {

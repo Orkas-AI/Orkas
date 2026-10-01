@@ -24,6 +24,8 @@ const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 
 export interface CustomConnectorInput {
   display_name: string;
+  /** Explicit browser OAuth opt-in for a remote MCP server. */
+  auth_mode?: 'none' | 'oauth';
   transport: {
     kind: 'stdio' | 'streamable-http';
     /** stdio */
@@ -35,6 +37,17 @@ export interface CustomConnectorInput {
     url?: string;
     headers?: Record<string, string>;
   };
+}
+
+export function validateCustomAuthMode(raw: unknown, transport: Transport): 'none' | 'oauth' {
+  if (raw === undefined || raw === 'none') return 'none';
+  if (raw !== 'oauth' || transport.kind !== 'streamable-http') {
+    throw new CustomTransportError('E_AUTH_MODE', 'OAuth is available only for remote HTTP MCP servers');
+  }
+  if (Object.keys(transport.headers || {}).some((name) => name.toLowerCase() === 'authorization')) {
+    throw new CustomTransportError('E_AUTH_MODE', 'OAuth cannot be combined with an Authorization header');
+  }
+  return 'oauth';
 }
 
 export class CustomTransportError extends Error {

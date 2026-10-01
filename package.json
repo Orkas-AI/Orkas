@@ -2,7 +2,7 @@
   "name": "orkas",
   "version": "2026.9.22",
   "private": true,
-  "description": "Orkas desktop — Electron + Node one-piece app",
+  "description": "Orkas desktop \u2014 Electron + Node one-piece app",
   "main": "bootstrap.cjs",
   "type": "commonjs",
   "packageManager": "npm@11.11.0",
@@ -56,7 +56,8 @@
     "prepare": "node scripts/install-git-hooks.mjs",
     "prepack": "node scripts/ensure-dev-dependencies.cjs && node bin/officecli-policy-gate.cjs --require-host-binary",
     "native:check": "node scripts/verify-native-dependencies.cjs",
-    "native:repair": "node scripts/verify-native-dependencies.cjs --host-only && npm install --include=optional --no-save && node bin/ensure-runtime.cjs --kind node && npm run native:check"
+    "native:repair": "node scripts/verify-native-dependencies.cjs --host-only && npm install --include=optional --no-save && node bin/ensure-runtime.cjs --kind node && npm run native:check",
+    "test:web-assist-input-canary": "node test/gui/run-web-assist-input-canary.mjs"
   },
   "devDependencies": {
     "@electron/asar": "3.4.1",
@@ -67,7 +68,7 @@
     "@types/node": "^25.6.0",
     "@vitest/coverage-v8": "^4.1.11",
     "7zip-bin": "^5.2.0",
-    "electron": "42.8.0",
+    "electron": "42.11.9",
     "ffmpeg-static": "^5.3.0",
     "semver": "7.8.5",
     "tar": "7.5.21",
@@ -75,9 +76,9 @@
     "vitest": "^4.1.11"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-ai": "^0.99.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "adm-zip": "^0.6.0",
+    "adm-zip": "^0.6.1",
     "async-mutex": "^0.5.0",
     "better-sqlite3": "^12.11.1",
     "electron-log": "^5.4.3",
@@ -91,8 +92,9 @@
     "socks-proxy-agent": "^8.0.5",
     "sqlite-vec": "^0.1.9",
     "tsx": "^4.21.0",
-    "undici": "^7.29.0",
-    "zod": "^3.24.0"
+    "undici": "^7.30.0",
+    "zod": "^3.24.0",
+    "fast-xml-parser": "5.7.3"
   },
   "overrides": {
     "@anush008/tokenizers": "0.6.0",
@@ -258,7 +260,16 @@
           "ko.lproj/InfoPlist.strings",
           "de.lproj/InfoPlist.strings",
           "ru.lproj/InfoPlist.strings",
-          "it.lproj/InfoPlist.strings"
+          "it.lproj/InfoPlist.strings",
+          "hi.lproj/InfoPlist.strings",
+          "id.lproj/InfoPlist.strings",
+          "th.lproj/InfoPlist.strings",
+          "tr.lproj/InfoPlist.strings",
+          "vi.lproj/InfoPlist.strings",
+          "zh-Hant.lproj/InfoPlist.strings",
+          "pt-PT.lproj/InfoPlist.strings",
+          "es-419.lproj/InfoPlist.strings",
+          "ar.lproj/InfoPlist.strings"
         ]
       }
     ],

@@ -1,14 +1,14 @@
-<!-- setup-guide: {"auth_modes":["local_api"],"provider":"woocommerce","catalog_reviewed_at":"2026-09-08","sources":[]} -->
+<!-- setup-guide: {"auth_modes":["local_api"],"provider":"woocommerce","catalog_reviewed_at":"2026-09-23","sources":["https://developer.woocommerce.com/docs/apis/rest-api/authentication/"]} -->
 # woocommerce
 
 ## Entry
-The target WordPress store admin → WooCommerce → Settings → Advanced → REST API.
+Enter the target store root in [[field:store_url]] and connect. Orkas opens that store's WooCommerce authorization page; no separate provider application is needed.
 
 ## Configure
-Inspect or prepare a key for a store user with the required capabilities and Read/Write access. Preserve the one-time secret in the protected form; no separate provider OAuth app is needed.
+Sign in as a store user with the required capabilities and approve Read/Write access for Orkas. WooCommerce generates the keys and sends them through the short-lived Orkas relay; the desktop verifies the store before saving the keys encrypted locally.
 
 ## Credentials
-Use [[field:store_url]], [[field:consumer_key]] and [[field:consumer_secret]]; the URL is the store root, not an API endpoint.
+Leave [[field:consumer_key]] and [[field:consumer_secret]] empty for browser authorization. Existing Read/Write keys can still be entered together in the protected form. Keep any WordPress subdirectory in the store URL; do not enter an API endpoint.
 
 ## Verify
-Read a bounded product list. On failure, check store URL, HTTPS reachability, key permissions and the issuing user before regenerating keys.
+Read a bounded product list. On failure, check the store URL, HTTPS reachability and the authorizing user's permissions. Keys can be revoked under WooCommerce → Settings → Advanced → REST API.

@@ -241,21 +241,23 @@ test.describe('shared Renderer primitives', () => {
     await expect(selected).toHaveCount(1);
     const selectedId = await selected.getAttribute('id');
 
-    await trigger.press('ArrowDown');
-    let activeId = await trigger.getAttribute('aria-activedescendant');
-    if (activeId === selectedId) {
-      await trigger.press('ArrowUp');
-      activeId = await trigger.getAttribute('aria-activedescendant');
+    // Exercise a known locale without freezing the growing language inventory.
+    const options = await listbox.locator('[role="option"][aria-disabled="false"]').evaluateAll(
+      nodes => nodes.map(node => ({ id: node.id, value: node.getAttribute('data-value') })),
+    );
+    const selectedIndex = options.findIndex(option => option.id === selectedId);
+    const targetIndex = options.findIndex(option => option.value === 'pt');
+    expect(selectedIndex).toBeGreaterThanOrEqual(0);
+    expect(targetIndex).toBeGreaterThanOrEqual(0);
+    expect(targetIndex).not.toBe(selectedIndex);
+    for (let step = 0; step < Math.abs(targetIndex - selectedIndex); step++) {
+      await trigger.press(targetIndex > selectedIndex ? 'ArrowDown' : 'ArrowUp');
     }
-    expect(activeId).toBeTruthy();
-    expect(activeId).not.toBe(selectedId);
-    const activeValue = await appPage.locator(`#${activeId}`).getAttribute('data-value');
-    expect(activeValue).toMatch(/^(en|zh|ja|pt)$/);
+    await expect(trigger).toHaveAttribute('aria-activedescendant', options[targetIndex].id);
     await trigger.press('Enter');
 
     await expect(trigger).toHaveAttribute('aria-expanded', 'false');
-    await expect(select).toHaveAttribute('data-value', activeValue as string);
-    const htmlLang = { en: 'en', zh: 'zh-CN', ja: 'ja', pt: 'pt-BR' }[activeValue as 'en' | 'zh' | 'ja' | 'pt'];
-    await expect(appPage.locator('html')).toHaveAttribute('lang', htmlLang);
+    await expect(select).toHaveAttribute('data-value', 'pt');
+    await expect(appPage.locator('html')).toHaveAttribute('lang', 'pt-BR');
   });
 });

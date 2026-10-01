@@ -2,6 +2,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { clientConfig } from './client_config';
+import { isVerifiedPublicMaterial } from '../util/public-material';
 
 export type LocalAccessRiskCategory =
   | 'network_egress'
@@ -203,9 +204,14 @@ export function sensitivePathReasons(
   const haystacks = pathHaystacks(absPath);
   const joinedHaystack = haystacks.join('\n');
   const insideTrustedRoot = pathIsWithinRoots(absPath, options.trustedRoots ?? []);
-  const readPatterns = insideTrustedRoot
+  let readPatterns = insideTrustedRoot
     ? policy.sensitive_path_patterns.filter((pattern) => !isWorkspaceLocationPattern(pattern, joinedHaystack))
     : policy.sensitive_path_patterns;
+  const publicPatterns = ['(^|/)\\.env(\\.|$)', '(^|/)id_(rsa|dsa|ecdsa|ed25519)(\\.pub)?$', '\\.pem$'];
+  if (access === 'read' && isVerifiedPublicMaterial(absPath)) {
+    readPatterns = readPatterns.filter(pattern => !publicPatterns.includes(pattern)
+      && !(pattern === '(^|/)\\.ssh(/|$)' && /\.pub$/i.test(absPath)));
+  }
   if (haystacks.some((haystack) => patternsMatch(readPatterns, haystack))) return ['sensitive_path'];
   if (access === 'write'
     && haystacks.some((haystack) => patternsMatch(policy.sensitive_write_path_patterns, haystack))) {
@@ -217,7 +223,7 @@ export function sensitivePathReasons(
 export function classifyConfiguredBashCommand(
   command: string,
   baseReasons: readonly LocalAccessRiskCategory[] = [],
-  options: { includePathPatterns?: boolean } = {},
+  options: { includePathPatterns?: boolean; structuredDefaults?: boolean } = {},
 ): LocalAccessRiskCategory[] {
   const policy = getLocalAccessSensitivePolicy();
   const enabled = new Set(policy.enabled_categories);
@@ -233,13 +239,21 @@ export function classifyConfiguredBashCommand(
   if (text.trim()) {
     for (const item of policy.sensitive_command_patterns) {
       if (!enabled.has(item.category)) continue;
+      // The host already classified executable positions and checked actual
+      // filesystem operands. Do not reintroduce shipped keyword false positives
+      // (including identical defaults delivered by an older Server). Explicit
+      // custom policy expressions retain their existing matching semantics.
+      if (options.structuredDefaults && DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY.sensitive_command_patterns
+        .some((base) => base.category === item.category && base.pattern === item.pattern)) continue;
       const re = compile(item.pattern);
       if (re?.test(text)) reasons.add(item.category);
     }
     if (options.includePathPatterns !== false && enabled.has('sensitive_path')) {
       const normalized = text.replace(/\\/g, '/');
-      if (patternsMatch(policy.sensitive_path_patterns, normalized)) reasons.add('sensitive_path');
-      if (patternsMatch(policy.sensitive_write_path_patterns, normalized)) reasons.add('sensitive_path');
+      const customOnly = (patterns: string[], defaults: string[]) => options.structuredDefaults
+        ? patterns.filter((pattern) => !defaults.includes(pattern)) : patterns;
+      if (patternsMatch(customOnly(policy.sensitive_path_patterns, DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY.sensitive_path_patterns), normalized)) reasons.add('sensitive_path');
+      if (patternsMatch(customOnly(policy.sensitive_write_path_patterns, DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY.sensitive_write_path_patterns), normalized)) reasons.add('sensitive_path');
     }
   }
 

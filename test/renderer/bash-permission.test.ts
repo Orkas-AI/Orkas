@@ -177,6 +177,7 @@ class FakeDocument {
 // rendered markup at the moment it is attached to the document.
 interface DialogView {
   title: string;
+  context: string;
   message: string;
   summary: string;
   currentMode: string;
@@ -194,6 +195,7 @@ function dialogView(overlay: FakeElement): DialogView {
   const choices = overlay.querySelectorAll('[data-act="choice"]').map((button) => button.dataset.id);
   return {
     title: text('.ui-dialog-title'),
+    context: text('.ui-dialog-context'),
     message: text('.bash-permission-message'),
     summary: (overlay.querySelector('.bash-permission-message')?.children ?? [])
       .filter((child) => typeof child === 'string' || child.tag !== 'details')
@@ -280,6 +282,8 @@ function loadHarness(
     String,
     Array,
     document,
+    conversations: ['c1', 'task', 'task-1', 'private-conversation-identifier'].map(conversation_id => ({ conversation_id, title: `Title for ${conversation_id}` })),
+    escapeHtml: (value: unknown) => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;'),
     createLogger: () => ({ warn, info() {}, error() {} }),
     t: (key: string, vars?: Record<string, unknown>) => {
       const dict: Record<string, string> = {
@@ -342,6 +346,7 @@ function loadHarness(
     window: {
       location: { pathname: options.preview ? '/preview.html' : '/index.html' },
       addEventListener() {},
+      removeEventListener() {},
       orkas: {
         invoke: vi.fn(async (channel: string, payload: any) => {
           invokeCalls.push({ channel, payload });
@@ -362,7 +367,7 @@ function loadHarness(
   };
   context.window.window = context.window;
   vm.createContext(context);
-  for (const module of ['dropdown-placement.js', ...(options.preview ? [] : ['connectors.js']), 'connector-action-dialog.js', 'bash_permission.js']) {
+  for (const module of ['dialogs.js', 'dropdown-placement.js', ...(options.preview ? [] : ['connectors.js']), 'connector-action-dialog.js', 'bash_permission.js']) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules', module), 'utf8'), context, { filename: module });
   }
   if (!options.preview && !pushHandler) throw new Error('bash:permission handler was not registered');
@@ -407,12 +412,13 @@ describe('connector actions share local operation permissions', () => {
     { locale: 'en', risk: 'D', connector: 'Connector', operation: 'Action', title: 'Allow this sensitive action?' },
     { locale: 'ja', risk: 'H', connector: 'コネクター', operation: '操作', title: 'この機密操作を許可しますか？' },
     { locale: 'pt', risk: 'D', connector: 'Conector', operation: 'Ação', title: 'Permitir esta ação sensível?' },
-  ] as const)('shows a localized two-line summary and collapsed details in $locale ($risk)', async ({ locale, risk, connector, operation, title }) => {
+  ] as const)('shows a localized action and account summary with collapsed details in $locale ($risk)', async ({ locale, risk, connector, operation, title }) => {
     const h = loadHarness('pending', undefined, { locale });
     h.emitPush('connectors:action-confirm', { ...action, risk, arguments_preview: '<img src=x onerror=alert(1)>' });
     await flush();
     expect(h.dialogs[0].title).toBe(title);
-    expect(h.dialogs[0].summary).toBe(`${connector}: Feishu\n${operation}: im.+messages-send`);
+    const table = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales', `${locale}.json`), 'utf8'));
+    expect(h.dialogs[0].summary).toBe(`${connector}: Feishu\n${table['connectors.action_confirm.account']}: Work account\n${operation}: im.+messages-send`);
     expect(h.document.body.textContent).not.toMatch(/connectors\.action_confirm\.|bash\.permission\./);
     const details = h.document.body.querySelector('.bash-permission-details')!;
     expect(details.tag).toBe('details');
@@ -458,11 +464,11 @@ describe('connector actions share local operation permissions', () => {
     });
   });
 
-  it('shows empty parameters without restoring removed metadata when the preview is missing', async () => {
+  it('keeps the account visible when the parameter preview is missing', async () => {
     const h = loadHarness('pending', undefined, { locale: 'zh' });
     h.emitPush('connectors:action-confirm', { ...action, arguments_preview: undefined });
     await flush();
-    expect(h.dialogs[0].message).toBe('连接器: Feishu\n操作: im.+messages-send查看详情{}');
+    expect(h.dialogs[0].message).toBe('连接器: Feishu\n账号: Work account\n操作: im.+messages-send查看详情{}');
     h.document.body.querySelector('[data-act="cancel"]')!.click();
     await flush();
     expect(h.openDialogs()).toBe(0);
@@ -520,7 +526,8 @@ describe('connector actions share local operation permissions', () => {
     for (const detail of ['Feishu', 'im.+messages-send', 'private-message']) {
       expect(h.dialogs[0].message).toContain(detail);
     }
-    expect(h.dialogs[0].message).not.toMatch(/Work account|execute_high_impact/);
+    expect(h.dialogs[0].message).toContain('Work account');
+    expect(h.dialogs[0].message).not.toContain('execute_high_impact');
     expect(h.invokeCalls).toEqual([
       { channel: 'permissions.getLocalExec', payload: undefined },
       { channel: 'connectors.action_confirm_response', payload: { request_id: action.request_id, approved: true } },
@@ -673,10 +680,8 @@ describe('renderer bash permission prompt', () => {
         { mode: 'full_access', label: 'Full access', desc: 'Automatically approve requests' },
       ],
     });
-    expect(h.dialogs[0].message).toBe([
-      'Task: Release checklist',
-      'Permission: command · Run the focused test suite · npm test · /selected/project',
-    ].join('\n'));
+    expect(h.dialogs[0].context).toContain('Task: Release checklist');
+    expect(h.dialogs[0].message).toBe('Permission: command · Run the focused test suite · npm test · /selected/project');
     expect(h.invokeCalls).toEqual([{
       channel: 'localAgents.permissionResponse',
       payload: {
@@ -721,10 +726,8 @@ describe('renderer bash permission prompt', () => {
       allowRun: true,
       showModeControl: true,
     });
-    expect(h.dialogs[0].message).toBe([
-      'Task: Send launch update',
-      'Permission: GMAIL_SEND_EMAIL · Gmail',
-    ].join('\n'));
+    expect(h.dialogs[0].context).toContain('Task: Send launch update');
+    expect(h.dialogs[0].message).toBe('Permission: GMAIL_SEND_EMAIL · Gmail');
     expect(h.invokeCalls).toEqual([{
       channel: 'localAgents.permissionResponse',
       payload: {
@@ -1361,4 +1364,134 @@ it('application windows ignore task prompts and cancellations while showing thei
   h.emitPush('connectors:action-confirm-cancelled', { request_ids: ['app-only'], usage_scope: true });
   await flush(); expect(h.openDialogs()).toBe(0);
   expect(h.invokeCalls.some(call => call.channel === 'connectors.action_confirm_response')).toBe(false);
+});
+
+
+describe('global request attribution', () => {
+  it.each(['bash:permission', 'connectors:action-confirm', 'web-assist:action-confirm', 'local-agent:permission'])(
+    'identifies the source of %s even while a different task is open', async channel => {
+      const h = loadHarness('pending', undefined, { locale: 'zh' });
+      h.context.currentConvId = 'unrelated';
+      h.context.conversations = [
+        { conversation_id: 'unrelated', title: '当前浏览的任务' },
+        { conversation_id: 'origin', title: '发送本周进展' },
+      ];
+      h.emitPush(channel, { request_id: 'source', cid: 'origin', agent_name: 'Researcher',
+        connector_id: 'gmail', display_name: 'Gmail', tool_name: 'GMAIL_SEND_EMAIL',
+        reasons: ['network_egress'], command: 'curl example.com', tool: 'command',
+        page_origin: 'https://example.com', control_label: 'Send' });
+      await flush();
+      expect(h.dialogs[0].context).toContain('发送本周进展');
+      expect(h.dialogs[0].context).toContain('Researcher');
+      expect(h.dialogs[0].context).not.toContain('当前浏览的任务');
+      h.document.body.querySelector('[data-act="cancel"]')!.click();
+      await flush();
+    },
+  );
+
+  it('resolves an unloaded task without delaying the decision and ignores a late result after cancellation', async () => {
+    let complete!: (value: any) => void;
+    const h = loadHarness('pending', async channel => {
+      if (channel === 'conversations.get') return new Promise(resolve => { complete = resolve; });
+      return { mode: 'all_files_approval', handled: true };
+    }, { locale: 'en' });
+    const info = { request_id: 'unloaded', cid: 'unloaded-task', command: 'echo ready', reasons: ['network_egress'] };
+    h.pushHandler!(info);
+    await flush();
+    expect(h.openDialogs()).toBe(1);
+    expect(h.dialogs[0].context).toContain('Unknown task');
+    complete({ conversation: { conversation_id: info.cid, title: 'Unloaded task title' } });
+    await flush();
+    expect(h.document.body.querySelector('.ui-dialog-context')!.textContent).toContain('Unloaded task title');
+    h.cancelHandler!({ request_ids: [info.request_id] });
+    await flush();
+    h.pushHandler!({ ...info, request_id: 'late' });
+    await flush();
+    h.cancelHandler!({ request_ids: ['late'] });
+    await flush();
+    complete({ conversation: { conversation_id: info.cid, title: 'Late title' } });
+    await flush();
+    expect(h.openDialogs()).toBe(0);
+    expect(h.invokeCalls.some(call => call.channel === 'bash.permission_response')).toBe(false);
+  });
+
+  it.each(['missing', 'wrong-task', 'failure'])('keeps unknown attribution on %s lookup without borrowing the current task', async outcome => {
+    const h = loadHarness('pending', async channel => {
+      if (channel === 'conversations.get') {
+        if (outcome === 'failure') throw new Error('unavailable');
+        return outcome === 'missing' ? {} : { conversation: { conversation_id: 'other', title: 'Wrong title' } };
+      }
+      return { mode: 'all_files_approval', handled: true };
+    }, { locale: 'en' });
+    h.pushHandler!({ request_id: 'unknown', cid: 'missing', command: 'echo ready' });
+    await flush();
+    expect(h.document.body.querySelector('.ui-dialog-context')!.textContent).toContain('Unknown task');
+    expect(h.document.body.textContent).not.toContain('Wrong title');
+    h.document.body.querySelector('[data-act="cancel"]')!.click();
+    await flush();
+    expect(h.invokeCalls.at(-1)).toEqual({ channel: 'bash.permission_response', payload: { request_id: 'unknown', decision: 'deny' } });
+  });
+
+  it('keeps queued request titles separate and renders hostile titles as text', async () => {
+    const h = loadHarness('pending', undefined, { locale: 'en' });
+    const title = '<img src=x onerror=alert(1)>';
+    h.pushHandler!({ request_id: 'first', cid: 'one', conversation_title: title, command: 'echo one' });
+    h.pushHandler!({ request_id: 'second', cid: 'two', conversation_title: 'Second task', command: 'echo two' });
+    await flush();
+    expect(h.dialogs[0].context).toContain(title);
+    expect([...h.document.body.descendants()].some(node => node.tag === 'img')).toBe(false);
+    h.document.body.querySelector('[data-act="cancel"]')!.click();
+    await flush();
+    expect(h.dialogs[1].context).toContain('Second task');
+    expect(h.dialogs[1].context).not.toContain(title);
+    h.document.body.querySelector('[data-act="cancel"]')!.click();
+    await flush();
+  });
+
+  it('identifies application usage without looking up a task even if a stale cid is attached', async () => {
+    const h = loadHarness('pending', undefined, { preview: true, locale: 'en' });
+    h.emitPush('connectors:action-confirm', { request_id: 'app-context', usage_scope: true, cid: 'stale',
+      conversation_title: 'Not this task', display_name: 'Gmail', tool_name: 'send' });
+    await flush();
+    expect(h.dialogs[0].context).toBe('Application request');
+    expect(h.invokeCalls.some(call => call.channel === 'conversations.get')).toBe(false);
+    h.document.body.querySelector('[data-act="cancel"]')!.click();
+    await flush();
+  });
+});
+
+describe('shell approval key facts and queued grants', () => {
+  it('shows the uncertain write, expression and folder ahead of the collapsed command preview', async () => {
+    const h = loadHarness('pending', undefined, { locale: 'zh' });
+    h.pushHandler({
+      request_id: 'key-facts', agent_name: 'Agent', command: 'echo harmless prefix',
+      reasons: [], unresolved_paths: true, can_allow_run: false, working_directory: '/project',
+      key_facts: [{ kind: 'write', operation: 'Set-Content', target: '$target', unresolved: true,
+        detail: '$target = Join-Path (Get-Location) "<img src=x>"' }],
+    });
+    await flush();
+    const summary = h.dialogs[0].summary;
+    for (const content of ['创建或修改', 'Set-Content', '$target', 'Get-Location', '目标未确定', '/project', '此次只能允许一次']) {
+      expect(summary).toContain(content);
+    }
+    expect(summary).not.toContain('echo harmless prefix');
+    expect(h.dialogs[0].allowRun).toBe(false);
+    const details = h.document.body.querySelector('.bash-permission-details')!;
+    expect(details.getAttribute('open')).toBeNull();
+    expect(details.textContent).toContain('echo harmless prefix');
+    expect([...h.document.body.descendants()].some(node => node.tag === 'img')).toBe(false);
+    h.cancelHandler({ request_ids: ['key-facts'] }); await flush();
+  });
+
+  it('removes an already queued covered shell request and records approval instead of denial', async () => {
+    const h = loadHarness('pending');
+    h.pushHandler({ request_id: 'open', reasons: ['network_egress'] });
+    h.pushHandler({ request_id: 'covered', reasons: ['sensitive_path'], command: 'private content' });
+    await flush();
+    h.cancelHandler({ request_ids: ['covered'], approved: true }); await flush();
+    expect(h.dialogs).toHaveLength(1);
+    h.cancelHandler({ request_ids: ['open'] }); await flush();
+    expect(h.dialogs).toHaveLength(1);
+    expect(h.invokeCalls.some(call => call.channel === 'bash.permission_response')).toBe(false);
+  });
 });

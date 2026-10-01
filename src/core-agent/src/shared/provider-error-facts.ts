@@ -22,7 +22,9 @@ const CODE_KINDS: Readonly<Record<string, ProviderCredentialFailure>> = Object.f
   orkas_credits_quota_exceeded: 'balance',
 });
 
-export function providerErrorFacts(error: unknown): { status?: number; codes: string[] } {
+/** Runtime callers disable legacy message decoding. It remains available for
+ * display of old saved errors, never as a source of retry/account decisions. */
+export function providerErrorFacts(error: unknown, includeSerializedMessages = true): { status?: number; codes: string[] } {
   let status: number | undefined;
   const codes: string[] = [];
   const pending: unknown[] = [error];
@@ -33,7 +35,7 @@ export function providerErrorFacts(error: unknown): { status?: number; codes: st
   };
   // Bound both wrapper traversal and serialized payload parsing on failure storms.
   const readSerialized = (message: unknown) => {
-    if (typeof message !== 'string' || message.length > 65_536) return;
+    if (!includeSerializedMessages || typeof message !== 'string' || message.length > 65_536) return;
     const text = message.trim();
     const prefix = /^(?:HTTP\s+)?([45]\d\d)(?::\s*|\s+)(\{[\s\S]*\})$/.exec(text)
       || /^OpenAI API error \(([45]\d\d)\):\s*(\{[\s\S]*\})$/.exec(text);
@@ -52,9 +54,11 @@ export function providerErrorFacts(error: unknown): { status?: number; codes: st
     if (!current || typeof current !== 'object' || seen.has(current)) continue;
     seen.add(current);
     const rec = current as Record<string, unknown>;
+    if (rec.name === 'AbortError') codes.push('ABORT_ERR');
     readStatus(rec.status);
     readStatus(rec.statusCode);
     readStatus(rec.http_status);
+    readStatus(rec.httpStatus);
     // Some API error envelopes use a numeric HTTP code instead of status.
     readStatus(rec.code);
     for (const field of ['code', 'type']) {
@@ -67,8 +71,8 @@ export function providerErrorFacts(error: unknown): { status?: number; codes: st
   return { status, codes };
 }
 
-export function providerCredentialFailure(error: unknown): ProviderCredentialFailure | null {
-  const { status, codes } = providerErrorFacts(error);
+export function providerCredentialFailure(error: unknown, includeSerializedMessages = true): ProviderCredentialFailure | null {
+  const { status, codes } = providerErrorFacts(error, includeSerializedMessages);
   if (status === 402) return 'balance';
   const kinds = new Set(codes.map((code) => {
     const key = code.toLowerCase();

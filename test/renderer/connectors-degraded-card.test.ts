@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 /**
  * A connector that cannot reach its backend must never render as "已连接".
  *
@@ -30,6 +31,13 @@ function makeElement(tag: string): any {
     _html: '',
     textContent: '',
     title: '',
+    scrollIntoView: vi.fn(),
+    focus: vi.fn(),
+    classList: {
+      add: (name: string) => { el.className = [...new Set([...el.className.split(' ').filter(Boolean), name])].join(' '); },
+      remove: (name: string) => { el.className = el.className.split(' ').filter((item: string) => item !== name).join(' '); },
+      contains: (name: string) => el.className.split(' ').includes(name),
+    },
     get innerHTML() { return el._html; },
     set innerHTML(v: string) { el._html = v; },
     appendChild: (c: any) => { el.children.push(c); return c; },
@@ -166,7 +174,7 @@ describe('connector setup assistance', () => {
     expect(html.includes('connectors.action.authorize_permissions')).toBe(required);
     expect(await ctx.window.openConnectorSetupById(entry.id)).toBe(true);
     expect(ctx._runConnect).toHaveBeenCalledTimes(required ? 1 : 0);
-    expect(ctx.window.focusConnectorById).toHaveBeenCalledTimes(required ? 0 : 1);
+    expect(ctx.window.focusConnectorById).toHaveBeenCalledExactlyOnceWith(entry.id);
   });
 
   it.each(['error', 'degraded'])('offers reauthorization from a %s CLI connection', kind => {
@@ -190,10 +198,16 @@ describe('connector setup assistance', () => {
     }
     for (const entry of [{ id: 'oauth', auth_mode: 'mcp_dcr' }, {
       ...complex, availability: 'visible_disabled',
-    }, { ...complex, _custom: true }]) {
+    }]) {
       expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('data-act="setup-assist"');
       expect(ctx._connectorSetupMarkup(entry, [], 'en', 'setup')).not.toContain('data-act="setup-assist"');
     }
+    // Custom cards are derived from installed instances, never catalog-only rows.
+    const custom = { ...complex, id: 'custom-fixture', _custom: true };
+    expect(ctx._renderCatalogCard(custom, {
+      id: custom.id, origin: 'custom', custom_auth_mode: 'none', status: { kind: 'disconnected' },
+    }).innerHTML).not.toContain('data-act="setup-assist"');
+    expect(ctx._connectorSetupMarkup(custom, [], 'en', 'setup')).not.toContain('data-act="setup-assist"');
     expect(ctx._renderCatalogCard(complex, { status: { kind: 'connected' } }).innerHTML)
       .not.toContain('data-act="setup-assist"');
     expect(ctx._connectorSetupMarkup(complex, [], 'en', 'setup')).toContain('data-act="setup-assist"');
@@ -404,6 +418,7 @@ function loadConnectorsRenderer(
   context.window.window = context.window;
   context.window.globalThis = context.globalThis;
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
   vm.runInContext(code, context, { filename: 'connectors.js' });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/connector-action-dialog.js'), 'utf8'), context);
   // `_connectorsState` is a top-level `let`, so it is NOT a property of the context object (only
@@ -483,6 +498,12 @@ function mountCategoryGrid(ctx: any) {
   let onInput = () => {};
   search.addEventListener = (_event: string, handler: () => void) => { onInput = handler; };
   ctx.document.getElementById = (id: string) => elements.get(id) || null;
+  ctx.document.querySelectorAll = (selector: string) => {
+    const cards = ['connected', 'available'].flatMap(group => elements.get(`connectors-grid-${group}`).children);
+    if (selector === '.connector-card[data-id]') return cards;
+    if (selector === '.connector-card.is-highlighted') return cards.filter(card => card.classList.contains('is-highlighted'));
+    return [];
+  };
   return {
     elements,
     categories: () => buttons.map(button => button.dataset.connectorsCat),
@@ -498,6 +519,102 @@ function mountCategoryGrid(ctx: any) {
 }
 
 describe('connector category browsing', () => {
+  it('reuses painted cards for repeated navigation in All without rebuilding the list or reloading data', async () => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const ctx = loadConnectorsRenderer(invoke);
+    const grid = mountCategoryGrid(ctx);
+    ctx.__setCatalog([
+      { id: 'github', display_name: 'GitHub', category: 'developer' },
+      { id: 'notion', display_name: 'Notion', category: 'productivity' },
+    ]);
+    ctx._renderConnectorsGrid();
+    const cards = [...grid.elements.get('connectors-grid-available').children];
+    const createElement = vi.spyOn(ctx.document, 'createElement');
+    for (const id of ['notion', 'github', 'notion']) {
+      expect(await ctx.window.focusConnectorById(id)).toBe(true);
+      const card = cards.find(item => item.dataset.id === id);
+      expect(card.classList.contains('is-highlighted')).toBe(true);
+      expect(card.scrollIntoView).toHaveBeenCalledWith({ block: 'center', behavior: 'instant' });
+      expect(card.focus).toHaveBeenCalledWith({ preventScroll: true });
+      expect(ctx.document.querySelectorAll('.connector-card.is-highlighted')).toEqual([card]);
+    }
+    ctx.__advanceTimers(2500);
+    expect(ctx.document.querySelectorAll('.connector-card.is-highlighted')).toEqual([]);
+    expect(createElement).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(grid.elements.get('connectors-grid-available').children[0]).toBe(cards[0]);
+  });
+
+  it('reveals and highlights a filtered setup target before OAuth, including the launch repaint', async () => {
+    let ctx: any;
+    let grid: ReturnType<typeof mountCategoryGrid>;
+    let revealed: any;
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'connectors.start_oauth') {
+        const card = grid.elements.get('connectors-grid-available').children.find((item: any) => item.dataset.id === 'notion');
+        expect(card.classList.contains('is-highlighted')).toBe(true);
+        expect(revealed.scrollIntoView).toHaveBeenCalledWith({ block: 'center', behavior: 'instant' });
+        return { ok: true, started: true, attempt_id: 'revealed-target' };
+      }
+      return { ok: true };
+    });
+    ctx = loadConnectorsRenderer(invoke);
+    grid = mountCategoryGrid(ctx);
+    ctx.__setCatalog([
+      { id: 'github', display_name: 'GitHub', category: 'developer' },
+      { id: 'notion', display_name: 'Notion', category: 'productivity', auth_mode: 'mcp_dcr' },
+    ]);
+    ctx.loadConnectors = vi.fn(async () => {});
+    ctx._renderConnectorsGrid();
+    grid.search('github');
+    grid.click('rnd');
+    ctx.document.createElement = (tag: string) => {
+      const card = makeElement(tag);
+      card.scrollIntoView = vi.fn(() => { revealed = card; });
+      return card;
+    };
+
+    expect(await ctx.window.openConnectorSetupById('notion')).toBe(true);
+    expect(grid.elements.get('connectors-search-input').value).toBe('');
+    expect(grid.active()).toBe('');
+    expect(revealed.focus).toHaveBeenCalledWith({ preventScroll: true });
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('connectors.start_oauth', { catalog_id: 'notion' });
+    expect(ctx.__alerts).toEqual([]);
+    ctx.__advanceTimers(2000);
+    expect(ctx.document.querySelectorAll('.connector-card.is-highlighted').map((card: any) => card.dataset.id)).toEqual(['notion']);
+    ctx.__advanceTimers(500);
+    expect(ctx.document.querySelectorAll('.connector-card.is-highlighted')).toEqual([]);
+    ctx._renderConnectorsGrid();
+    expect(ctx.document.querySelectorAll('.connector-card.is-highlighted')).toEqual([]);
+  });
+
+  it('locates visible parent and bundle cards, and gives only the latest target a full highlight interval', async () => {
+    const ctx = loadConnectorsRenderer();
+    mountCategoryGrid(ctx);
+    ctx.__setCatalog([
+      { id: 'feishu', display_name: 'Lark' },
+      { id: 'lark', catalog_parent_id: 'feishu' },
+      { id: 'workspace', display_name: 'Workspace', bundle_member_ids: ['sheet'] },
+      { id: 'sheet', display_name: 'Sheet' },
+    ]);
+    ctx._renderConnectorsGrid();
+    const highlighted = () => ctx.document.querySelectorAll('.connector-card.is-highlighted').map((card: any) => card.dataset.id);
+    expect(await ctx.window.focusConnectorById('lark')).toBe(true);
+    expect(highlighted()).toEqual(['feishu']);
+    ctx.__advanceTimers(2000);
+    expect(await ctx.window.focusConnectorById('sheet')).toBe(true);
+    expect(highlighted()).toEqual(['workspace']);
+    ctx.__advanceTimers(500);
+    expect(highlighted()).toEqual(['workspace']);
+    ctx.__setInstances([{ id: 'sheet', status: { kind: 'connected' } }]);
+    ctx._renderConnectorsGrid();
+    expect(highlighted()).toEqual(['workspace']);
+    ctx.__advanceTimers(2000);
+    expect(highlighted()).toEqual([]);
+    expect(await ctx.window.focusConnectorById('missing')).toBe(false);
+    expect(highlighted()).toEqual([]);
+  });
+
   it('makes every newly added OAuth service discoverable in exactly one category matching its purpose', async () => {
     const { COMPOSIO_MANAGED_ENTRIES } = await import('../../src/main/features/connectors/catalog-managed');
     // Purpose-based acceptance inventory for the 69-service expansion. Keep this independent
@@ -756,7 +873,7 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
       if (channel === 'connectors.list') return { ok: true, instances: [] };
       return { ok: true };
     });
-    const card = { dataset: { id: 'github' }, setAttribute() {}, scrollIntoView() {}, focus() {} };
+    const card = { ...makeElement('div'), dataset: { id: 'github' } };
     ctx.document.querySelectorAll = (selector: string) => (selector === '.connector-card[data-id]' ? [card] : []);
 
     // Cold state: the first focus request has to load (and is held at the gate).
@@ -839,6 +956,25 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     for (const lang of ['es', 'fr', 'ko', 'de', 'ru', 'it']) {
       expect(ctx._connectorCopy({ description_en: 'Remote fallback' }, 'description', lang)).toBe('Remote fallback');
     }
+  });
+
+  it('uses renderer-only descriptions while retaining regional tags and shared guidance fallback', () => {
+    const ctx = loadConnectorsRenderer();
+    const entry = { id: 'sample', description_en: 'English', description_ja: '日本語',
+      'description_zh-tw': '繁體中文', 'description_pt-pt': 'Portugal', 'description_es-419': 'Latinoamérica',
+      instructions_en: 'Shared setup guidance' };
+    ctx.t = (key: string) => key;
+    for (const [lang, expected] of [['ja-JP', '日本語'], ['zh-TW', '繁體中文'], ['pt_PT', 'Portugal'], ['es-419', 'Latinoamérica']]) {
+      expect(ctx._connectorCopy(entry, 'description', lang)).toBe(expected);
+    }
+    ctx.getLang = () => 'vi';
+    ctx.t = (key: string) => key === 'connectors.catalog.sample.description' ? 'Mô tả' : key;
+    expect(ctx._connectorCopy(entry, 'description')).toBe('Mô tả');
+    expect(ctx._connectorCopy(entry, 'instructions')).toBe('Shared setup guidance');
+    expect(ctx._connectorCopy(entry, 'description', 'ja-JP')).toBe('日本語');
+    expect(ctx._connectorCopy({ ...entry, _custom: true }, 'description')).toBe('English');
+    expect(ctx._connectorCopy({ id: 'remote', description_en: 'Remote English' }, 'description')).toBe('Remote English');
+    expect(ctx._connectorCopy(null, 'description')).toBe('');
   });
 
   it('shows the detailed authorization result once without sending provider text to telemetry', () => {
@@ -1026,7 +1162,7 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     const message = ctx._connectorActionMessage(info);
     const details = ctx._connectorActionDetails(info);
 
-    expect(message).toBe('connectors.action_confirm.connector: Shop\nconnectors.action_confirm.action: SHOP_DELETE_ORDER');
+    expect(message).toBe('connectors.action_confirm.connector: Shop\nconnectors.action_confirm.account: Store A\nconnectors.action_confirm.action: SHOP_DELETE_ORDER');
     expect(details).toBe('{"order_id":"private-order-1"}');
   });
 
@@ -1730,6 +1866,10 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
       expect(ctx._connectorMatchesSearch(workspace, query), query).toBe(true);
     }
     expect(ctx._connectorMatchesSearch(workspace, 'shopify')).toBe(false);
+    ctx.getLang = () => 'vi';
+    ctx.t = (key: string) => key === 'connectors.catalog.gmail.description' ? 'Đọc và gửi thư' : key;
+    expect(ctx._connectorMatchesSearch(gmail, 'gửi thư')).toBe(true);
+    expect(ctx._connectorMatchesSearch(workspace, 'gửi thư')).toBe(true);
   });
 
   it('filters the visible groups as the connector search input changes', () => {

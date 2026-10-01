@@ -1,0 +1,31 @@
+import {createRequire} from 'node:module';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
+import {expect,it} from 'vitest';
+const require=createRequire(import.meta.url),codec=require('../../../../bin/local-api-credential-codec.cjs');
+it('runs the current merchant grant over real six-tool MCP discovery, authorization boundaries and restart',async()=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orkas-douyin-journey-')),file=path.join(dir,'grant.enc'),key=crypto.randomBytes(32).toString('base64url'),preload=path.join(dir,'provider.cjs'),journal=path.join(dir,'wire.jsonl');
+ const metadata={shop_id:'12345'},grant={provider:'douyin_shop',app_key:'fixture-app-key',app_secret:'fixture-app-private',access_token:'fixture-access-private',refresh_token:'fixture-refresh-private',expires_at:Date.now()+3600000,refresh_expires_at:Date.now()+86400000,identity:{shop_id:'12345'}};codec.writeCredentialFile(file,key,grant);
+ fs.writeFileSync(preload,`
+ const fs=require('node:fs'),crypto=require('node:crypto');global.fetch=async(raw,init)=>{const u=new URL(raw),p=JSON.parse(init.body);if(u.origin!=='https://openapi-fxg.jinritemai.com'||u.searchParams.get('app_key')!=='fixture-app-key'||u.searchParams.get('param_json')!==init.body)throw Error('Unbound request');const message='app_keyfixture-app-keymethod'+u.searchParams.get('method')+'param_json'+init.body+'timestamp'+u.searchParams.get('timestamp')+'v2',signature=crypto.createHmac('sha256','fixture-app-private').update('fixture-app-private'+message+'fixture-app-private').digest('hex');if(u.searchParams.get('sign')!==signature)throw Error('Bad signature');if(u.pathname!=='/open/getAuthInfo'&&u.searchParams.get('access_token')!=='fixture-access-private')throw Error('Wrong token');fs.appendFileSync(process.env.FIXTURE_JOURNAL,JSON.stringify({route:u.pathname,params:p})+'\\n');const reply=data=>new Response(JSON.stringify({code:10000,msg:'success',...(data===undefined?{}:{data})}));
+ if(u.pathname==='/open/getAuthInfo'){if(p.auth_id!=='12345')throw Error('Wrong shop');return reply({auth_id:'12345',status:1});}
+ if(u.pathname==='/order/orderDetail')return reply({shop_order_detail:{order_id:'A',post_receiver:'Buyer',post_tel:'0123',post_addr:{detail:'Dock'},buyer_words:'Leave at reception'}});
+ if(u.pathname==='/order/addOrderRemark'){if(p.remark!=='Packed')throw Error('Lost note');return reply();}
+ if(u.pathname==='/product/launchProduct'){if(!init.body.includes('"product_id":9007199254740993'))throw Error('Lost exact numeric ID');return reply();}
+ if(u.pathname==='/product/batchOfflineProducts')return reply({resp_list:[{product_id:'1',code:0},{product_id:'2',code:123,msg:'private-failure-text'}]});
+ if(u.pathname==='/order/orderCancel')return reply();throw Error('Unexpected request');};`);
+ const clients:Client[]=[],stderr:string[]=[];async function connect(){const client=new Client({name:'douyin-merchant-journey',version:'1'});clients.push(client);const transport=new StdioClientTransport({command:process.execPath,args:['--require',preload,path.resolve(__dirname,'../../../../bin/direct-commerce-mcp-server.cjs')],stderr:'pipe',env:{...Object.fromEntries(Object.entries(process.env).filter((x):x is [string,string]=>typeof x[1]==='string')),ELECTRON_RUN_AS_NODE:'1',ORKAS_LOCAL_API_PROVIDER:'douyin_shop',ORKAS_LOCAL_API_CREDENTIAL_FILE:file,ORKAS_LOCAL_API_CREDENTIAL_KEY:key,ORKAS_LOCAL_API_METADATA_JSON:JSON.stringify(metadata),FIXTURE_JOURNAL:journal}});transport.stderr?.on('data',data=>stderr.push(String(data)));await client.connect(transport);return client;}
+ const read=(r:any)=>JSON.parse(r.content[0].text);
+ try{const client=await connect();expect((await client.listTools()).tools).toHaveLength(6);const directory=read(await client.callTool({name:'list_capabilities',arguments:{}}));expect(directory.actions).toHaveLength(361);expect(JSON.stringify(directory)).not.toContain('input_schema');const described=read(await client.callTool({name:'describe_action',arguments:{action:'product.launchProduct'}}));expect(described.input_schema.properties.recommend_ids).toBeDefined();
+ const order=await client.callTool({name:'execute_read',arguments:{action:'order.orderDetail',parameters:{shop_order_id:'A'}}});expect(order.isError).not.toBe(true);expect(read(order).result.data.data.shop_order_detail.post_addr.detail).toBe('Dock');
+ const note={action:'order.addOrderRemark',parameters:{order_id:'A',remark:'Packed'}};expect((await client.callTool({name:'execute_read',arguments:note})).isError).toBe(true);expect((await client.callTool({name:'execute_write',arguments:note})).isError).not.toBe(true);
+ const publish={action:'product.launchProduct',parameters:{product_id:'9007199254740993'}};expect((await client.callTool({name:'execute_write',arguments:publish})).isError).toBe(true);expect((await client.callTool({name:'execute_high_impact',arguments:publish})).isError).not.toBe(true);await client.close();const restarted=await connect();
+ const partial=await restarted.callTool({name:'execute_high_impact',arguments:{action:'product.batchOfflineProducts',parameters:{product_ids:['1','2']}}});expect(partial.isError).toBe(true);expect(read(partial).result.status).toBe('partial_or_failed');expect(JSON.stringify(partial)).not.toContain('private-failure-text');
+ const cancel={action:'order.orderCancel',parameters:{shop_order_id:'A',cancel_reason:'Buyer request'}};expect((await restarted.callTool({name:'execute_high_impact',arguments:cancel})).isError).toBe(true);expect((await restarted.callTool({name:'execute_destructive',arguments:cancel})).isError).not.toBe(true);
+ expect(fs.readFileSync(journal,'utf8').trim().split('\n').map(line=>JSON.parse(line).route)).toEqual(['/open/getAuthInfo','/open/getAuthInfo','/order/orderDetail','/order/addOrderRemark','/product/launchProduct','/product/batchOfflineProducts','/order/orderCancel']);expect(codec.readCredentialFile(file,key)).toEqual(grant);expect(stderr).toEqual([]);expect(JSON.stringify([order,partial])).not.toContain('fixture-access-private');
+ }finally{await Promise.allSettled(clients.map(c=>c.close()));fs.rmSync(dir,{recursive:true,force:true});}
+},20000);

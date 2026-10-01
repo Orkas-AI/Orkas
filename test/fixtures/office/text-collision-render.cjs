@@ -2,6 +2,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { app, BrowserWindow, session } = require('electron');
+// This is a layout oracle, not a GPU integration test. Software rendering also
+// avoids macOS SharedImage mailbox diagnostics that are unrelated to results.
+app.commandLine.appendSwitch('disable-gpu');
 const root = process.argv[2];
 require(path.join(root, 'node_modules/tsx/dist/cjs/index.cjs'));
 const { PPTX_TEXT_COLLISION_SCRIPT } = require(path.join(root, 'src/main/features/office/pptx_text_collision.ts'));

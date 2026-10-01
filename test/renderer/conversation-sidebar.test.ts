@@ -1,4 +1,5 @@
-import { describe, it, expect, vi } from 'vitest';
+import { composerAccessorSource, composerDraftSource } from './composer-test-source';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -299,11 +300,48 @@ function loadConversationRenderer() {
   };
   context.window.window = context.window;
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/strip-structural-blocks.js'), 'utf8'), context);
   const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
   vm.runInContext(source, context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/queue-draft.js'), 'utf8'), context);
   return context;
+}
+
+// History recovery exercises the real latest-page action and deferred layout.
+// Keep those browser APIs present so a caught fixture error cannot silently
+// skip the pending-row recovery this suite is meant to verify.
+function setupHistoryLayout(context: any, history: any) {
+  const siblings: any[] = [];
+  const frames: Function[] = [];
+  const warnings = vi.fn();
+  context.__historyWarnings = warnings;
+  vm.runInContext('_convLog.warn = __historyWarnings', context);
+  context.document.createElement = createProcessTestElement;
+  context.document.getElementById = (id: string) => id === 'chat-history'
+    ? history : siblings.find(node => node.id === id) || null;
+  history.after = (node: any) => { siblings.push(node); };
+  history.getBoundingClientRect = () => ({ top: 0, bottom: 100, height: 100 });
+  history.clientHeight = 100;
+  context.requestAnimationFrame = (fn: Function) => { frames.push(fn); return frames.length; };
+  return (expectedWarnings = 0, expectButton = true, unmatchedReplies = 0) => {
+    while (frames.length) frames.shift()!();
+    expect(warnings).toHaveBeenCalledTimes(expectedWarnings + unmatchedReplies);
+    const unmatched = warnings.mock.calls.filter(call => call[0] === 'keyed record found no live row');
+    expect(unmatched).toHaveLength(unmatchedReplies);
+    for (const call of unmatched) expect(call).toEqual(['keyed record found no live row', {
+      reason: 'no_live_row', render_key: 'm:a1', from_kind: 'commander',
+      seg: -1, unkeyed_content_rows: 0,
+    }]);
+    for (const call of warnings.mock.calls.filter(call => call[0] !== 'keyed record found no live row')) {
+      expect(call).toEqual(['conversation history load failed', expect.objectContaining({
+        failure_stage: expect.stringMatching(/^(history|post_paint)$/), has_arrivals: expect.any(Boolean),
+      })]);
+    }
+    if (!expectButton) return;
+    expect(siblings.filter(node => node.id === 'chat-history-latest')).toHaveLength(1);
+    expect(siblings[0].hidden).toBe(true);
+  };
 }
 
 function setupRunningObserverTestContext(context: any, cid = 'c1') {
@@ -723,7 +761,7 @@ describe('conversation history initial window', () => {
     context.convAgentEnabledByCid = new Map();
     context.pollMsgCounts = new Map();
     context.messageQueues = new Map();
-    context.document.getElementById = (id: string) => (id === 'chat-history' ? history : null);
+    const assertHistoryLayout = setupHistoryLayout(context, history);
     context._ensureCreateAgentInlineObserver = () => {};
     context._ensureConvCreateAgentInline = () => {};
     context._refreshGroupMembers = async () => [];
@@ -746,6 +784,7 @@ describe('conversation history initial window', () => {
     expect(agentLoadSettled).toBe(false);
     resolveAgents();
     await load;
+    assertHistoryLayout();
   });
 
   it('repaints mounted sender identity after the secondary Agent cache becomes ready', () => {
@@ -864,7 +903,7 @@ describe('conversation history initial window', () => {
       controller: { abort() {} },
       aborted: false,
     });
-    context.document.getElementById = (id: string) => (id === 'chat-history' ? history : null);
+    const assertHistoryLayout = setupHistoryLayout(context, history);
     context._ensureCreateAgentInlineObserver = () => {};
     context._ensureConvCreateAgentInline = () => {};
     context._refreshGroupMembers = async () => [];
@@ -885,6 +924,7 @@ describe('conversation history initial window', () => {
     context._bufferOffViewGroupProcessEvent('c1', processEvent);
 
     await context.loadConversationHistory('c1');
+    assertHistoryLayout();
 
     expect(msg.isConnected).toBe(true);
     expect(rendered).toEqual([['c1', msg, processEvent, { archive: true }]]);
@@ -938,7 +978,7 @@ describe('conversation history initial window', () => {
       controller: { abort() {} },
       aborted: false,
     });
-    context.document.getElementById = (id: string) => (id === 'chat-history' ? history : null);
+    const assertHistoryLayout = setupHistoryLayout(context, history);
     context._ensureCreateAgentInlineObserver = () => {};
     context._ensureConvCreateAgentInline = () => {};
     context._refreshGroupMembers = async () => [];
@@ -972,6 +1012,7 @@ describe('conversation history initial window', () => {
     });
 
     await context.loadConversationHistory('c1');
+    assertHistoryLayout();
 
     expect(appended, 'settled history-owned rows must never be reattached').not.toContain(staleCommander);
     expect(ensured).toHaveLength(1);
@@ -1075,6 +1116,8 @@ describe('conversation history response ordering', () => {
   const response = (history: any[], extra: any = {}) => ({
     json: async () => ({ ok: true, history, conversation: { processing: false }, next_cursor: null, ...extra }),
   });
+  let verifyLayout: (() => void) | undefined;
+  afterEach(() => { try { verifyLayout?.(); } finally { verifyLayout = undefined; } });
   function setup() {
     const context = loadConversationRenderer();
     const rows: any[] = [];
@@ -1095,7 +1138,9 @@ describe('conversation history response ordering', () => {
     context.convAgentEnabledByCid = new Map();
     context.pollMsgCounts = new Map();
     context.messageQueues = new Map();
-    context.document.getElementById = (id: string) => id === 'chat-history' ? history : null;
+    const assertLayout = setupHistoryLayout(context, history);
+    const expected = { warnings: 0, painted: true, unmatchedReplies: 0 };
+    verifyLayout = () => assertLayout(expected.warnings, expected.painted, expected.unmatchedReplies);
     context.document.createDocumentFragment = () => ({ children: [] });
     for (const name of ['_ensureCreateAgentInlineObserver', '_ensureConvCreateAgentInline',
       '_renderConvDisabledBanner', '_updateConvSendUI', '_scrollToBottomNoAnim',
@@ -1116,7 +1161,7 @@ describe('conversation history response ordering', () => {
     let reject!: (error: Error) => void;
     context.apiFetch = () => new Promise((res, rej) => { resolve = res; reject = rej; });
     return {
-      context, rows, history,
+      context, rows, history, expected,
       resolve: (value: any) => resolve(value), reject: (error: Error) => reject(error),
       ids: () => rows.map((row) => row.message._msg_id),
       receive: (gm: any, cid = 'c1') => context._handleGroupBusEvent(cid, null, {
@@ -1140,6 +1185,7 @@ describe('conversation history response ordering', () => {
 
   it.each([false, true])('retains a live reply and its sidecars without duplication (already in snapshot: %s)', async (included) => {
     const s = setup();
+    s.expected.unmatchedReplies = 1;
     const loading = s.context.loadConversationHistory('c1');
     s.receive(answer);
     expect(s.ids()).toEqual(['a1']);
@@ -1158,6 +1204,9 @@ describe('conversation history response ordering', () => {
 
   it('preserves a reply if the current history request fails after it arrives', async () => {
     const s = setup();
+    s.expected.unmatchedReplies = 1;
+    s.expected.warnings = 1;
+    s.expected.painted = false;
     const loading = s.context.loadConversationHistory('c1');
     s.receive(answer);
     s.reject(new Error('Synthetic IPC failure'));
@@ -1167,6 +1216,7 @@ describe('conversation history response ordering', () => {
 
   it('retains admitted user messages alongside new replies while history is loading', async () => {
     const s = setup();
+    s.expected.unmatchedReplies = 1;
     s.context._claimPersistedUserMessage = () => false;
     s.context._syncRenderedGroupMessageIdentity = () => {};
     s.context._moveUserBeforeOrphanLivePlaceholder = () => {};
@@ -1191,6 +1241,7 @@ describe('conversation history response ordering', () => {
 
   it('does not paint polled replies after switching conversations during member refresh', async () => {
     const s = setup();
+    s.expected.painted = false;
     let finishMembers!: () => void;
     s.context._refreshGroupMembers = () => new Promise<void>((resolve) => { finishMembers = resolve; });
     const polling = s.context._recoverPolledVisibleMessages('c1', [answer]);
@@ -1202,6 +1253,7 @@ describe('conversation history response ordering', () => {
 
   it('carries unpainted arrivals into a replacement history request', async () => {
     const s = setup();
+    s.expected.unmatchedReplies = 1;
     const older = s.context.loadConversationHistory('c1');
     const finishOlder = s.resolve;
     s.receive(answer);
@@ -1235,6 +1287,7 @@ describe('conversation history response ordering', () => {
 
   it('keeps a painted transcript if a secondary post-paint action rejects', async () => {
     const s = setup();
+    s.expected.warnings = 1;
     s.context.apiFetch = async () => response([question, answer]);
     s.context._evaluateAutoRecipient = async () => { throw new Error('Synthetic secondary failure'); };
     await s.context.loadConversationHistory('c1');
@@ -1947,6 +2000,203 @@ describe('conversation sidebar task row actions', () => {
       .toEqual(['Unpin', 'Rename', 'Delete']);
     expect(context._conversationActionItems('c1', { hidePin: true }).map((it: any) => it.label))
       .toEqual(['Rename', 'Delete']);
+  });
+
+  it('offers to file a task under a project only while it has none', () => {
+    // Filing relocates the conversation on disk, so the entry must not appear
+    // for a conversation that is already inside a project — the backend
+    // refuses that move and the user would be clicking a dead item.
+    const context = loadConversationRenderer();
+    vm.runInContext(
+      fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation-to-project.js'), 'utf8'),
+      context,
+    );
+    context.conversations = [
+      { conversation_id: 'c1', title: 'Loose' },
+      { conversation_id: 'c2', title: 'Filed', project_id: 'p1' },
+    ];
+
+    expect(context._conversationActionItems('c1').map((it: any) => it.action))
+      .toEqual(['pin', 'rename', 'to-project', 'delete']);
+    // Filing can happen without a click, so a filed task offers the way back
+    // rather than nothing. The two entries are mutually exclusive.
+    expect(context._conversationActionItems('c2').map((it: any) => it.action))
+      .toEqual(['pin', 'rename', 'out-of-project', 'delete']);
+    // Delete stays last, and stays the only destructive entry.
+    const loose = context._conversationActionItems('c1');
+    expect(loose[loose.length - 1].danger).toBe(true);
+    expect(loose.filter((it: any) => it.danger)).toHaveLength(1);
+    expect(loose.find((it: any) => it.action === 'to-project').disabled).toBe(false);
+    vm.runInContext("groupBusyConvs.set('c1', true)", context);
+    expect(context._conversationActionItems('c1').find((it: any) => it.action === 'to-project').disabled).toBe(true);
+    vm.runInContext("groupBusyConvs.delete('c1'); pendingConvs.set('c1', { aborted: true })", context);
+    expect(context._conversationActionItems('c1').find((it: any) => it.action === 'to-project').disabled).toBe(true);
+    // The relocation refuses in either direction while a turn is live.
+    vm.runInContext("groupBusyConvs.set('c2', true)", context);
+    expect(context._conversationActionItems('c2').find((it: any) => it.action === 'out-of-project').disabled).toBe(true);
+  });
+});
+
+describe('conversation filing agent choices', () => {
+  function setup(choice: any, rejected: string[] = [], moveFails = false, onPushEvent?: Function) {
+    const bindings = new Set(['already-bound']);
+    const toasts: string[] = [];
+    const ctx: any = {
+      Map, Set, console,
+      _isCommanderAgent: (id: string) => id === 'commander' || id === '__commander__',
+      conversations: [{ conversation_id: 'c1', agent_id: 'a1', agent_ids: ['a1', 'a2'] }],
+      isConvPending: () => false,
+      t: (key: string, args: unknown) => JSON.stringify({ key, args }),
+      uiToast: (message: string) => toasts.push(message),
+      uiPrompt: async () => 'Created project',
+      apiFetch: async (url: string) => ({ json: async () => {
+        if (url.includes('/members')) return { actors: [{ kind: 'agent', id: 'a3', name: 'Third' }] };
+        if (url.includes('/agents/list')) return { agents: [{ agent_id: 'a1', name: 'First', icon: 'rocket', color: 'coral' }] };
+        if (moveFails) return { ok: false, error: 'has_running_conv' };
+        return { ok: true, conversation: { conversation_id: 'c1', project_id: 'p1' } };
+      } }),
+      window: { orkas: { onPushEvent, invoke: vi.fn(async (channel: string, args: any) => {
+        if (channel === 'projects.list') return { projects: [{ project_id: 'p1', name: 'Existing project' }] };
+        if (channel === 'projects.create') return { ok: true, project: { project_id: 'p1' } };
+        if (channel === 'projects.bindings.add') {
+          if (rejected.includes(args.id)) throw new Error('agent_disabled');
+          bindings.add(args.id);
+          return { bindings: { agents: [...bindings] } };
+        }
+        throw new Error('unexpected channel');
+      }) } },
+    };
+    vm.createContext(ctx);
+  vm.runInContext(composerAccessorSource, ctx);
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation-to-project.js'), 'utf8'), ctx);
+    ctx._openConversationProjectPicker = vi.fn(async () => choice);
+    return { ctx, bindings, toasts };
+  }
+
+  it.each([0, 2])('explains retained setup and manual recovery without retrying automatically (%s todos)', (count) => {
+    const listeners = new Map<string, Function>();
+    const subscribe = vi.fn((channel: string, handler: Function) => listeners.set(channel, handler));
+    const { ctx, toasts } = setup(null, [], false, subscribe);
+    // A reload flushes host receipts at did-finish-load, before deferred boot
+    // subscriptions run. This passive sink must already be listening then.
+    expect(listeners.has('conversations:filing-failed')).toBe(true);
+    ctx.startConversationFiledSubscription();
+    ctx.startConversationFiledSubscription();
+    expect(ctx.window.orkas.onPushEvent).toHaveBeenCalledTimes(2);
+    const onFailure = listeners.get('conversations:filing-failed');
+    expect(onFailure).toBeTypeOf('function');
+    onFailure!({ cid: 'c1', projectId: 'p1', projectName: 'Created project 2', todosCreated: count });
+    expect(JSON.parse(toasts[0])).toEqual({
+      key: count ? 'chat.conv_filing_failed_with_todos' : 'chat.conv_filing_failed',
+      args: { name: 'Created project 2', count },
+    });
+    expect(ctx.conversations[0].project_id).toBeUndefined();
+    expect(ctx.window.orkas.invoke).not.toHaveBeenCalled();
+  });
+
+
+  it.each([false, true])('adds only the chosen agents and preserves existing bindings (create=%s)', async (create) => {
+    const { ctx, bindings, toasts } = setup({ create, projectId: 'p1', agentIds: ['a1', 'a3'] });
+    await ctx._moveConversationToExistingProject('c1');
+    expect([...bindings]).toEqual(['already-bound', 'a1', 'a3']);
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_moved');
+    const offered = ctx._openConversationProjectPicker.mock.calls[0][1];
+    expect(offered.map((agent: any) => agent.id).sort()).toEqual(['a1', 'a2', 'a3']);
+    expect(offered.find((agent: any) => agent.id === 'a3').name).toBe('Third');
+    expect(offered.find((agent: any) => agent.id === 'a1')).toMatchObject({ icon: 'rocket', color: 'coral' });
+  });
+
+  it('takes a filed task back out and stops nesting it under the old project', async () => {
+    const { ctx, toasts } = setup(null);
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Filed', project_id: 'p1' }];
+    ctx.window.orkas.invoke = vi.fn(async (channel: string) => {
+      if (channel === 'conversations.moveOut') {
+        // The backend row simply omits project_id once the task is unfiled.
+        return { ok: true, conversation: { conversation_id: 'c1', title: 'Filed' } };
+      }
+      throw new Error(`unexpected channel ${channel}`);
+    });
+
+    await ctx._moveConversationOutOfProject('c1');
+
+    // Merging the returned row would leave the old project_id in the cache and
+    // the sidebar would keep the task nested under a project it left.
+    expect(ctx.conversations[0].project_id).toBe('');
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_moved_out');
+  });
+
+  it('updates the sidebar from a host unfile receipt and reports an unfile refusal without retrying', async () => {
+    const listeners = new Map<string, Function>();
+    const { ctx, toasts } = setup(null, [], false, (channel: string, handler: Function) => listeners.set(channel, handler));
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Filed', project_id: 'p1' }];
+    ctx.startConversationFiledSubscription();
+    listeners.get('conversations:filing-failed')!({ cid: 'c1', kind: 'unfile' });
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_move_failed');
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect(ctx.window.orkas.invoke).not.toHaveBeenCalled();
+    listeners.get('conversations:filed')!({ conversation: { conversation_id: 'c1', title: 'Filed' } });
+    await Promise.resolve();
+    expect(ctx.conversations[0].project_id).toBe('');
+    expect(ctx.conversations[0].title).toBe('Filed');
+  });
+
+  it('keeps a task where it is when the relocation is refused', async () => {
+    const { ctx, toasts } = setup(null);
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Filed', project_id: 'p1' }];
+    ctx.window.orkas.invoke = vi.fn(async () => { throw new Error('has_running_conv'); });
+
+    await ctx._moveConversationOutOfProject('c1');
+
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_move_running');
+  });
+
+  it('does nothing for a task that is not in a project', async () => {
+    const { ctx, toasts } = setup(null);
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Loose' }];
+    ctx.window.orkas.invoke = vi.fn(async () => { throw new Error('should not be called'); });
+
+    await ctx._moveConversationOutOfProject('c1');
+
+    expect(ctx.window.orkas.invoke).not.toHaveBeenCalled();
+    expect(toasts).toEqual([]);
+  });
+
+  it('omits the commander even when legacy summaries include its actor ids', async () => {
+    const { ctx } = setup(null);
+    ctx.apiFetch = async () => ({ json: async () => ({ actors: [
+      { kind: 'commander', id: 'commander' }, { kind: 'user', id: 'user' },
+    ] }) });
+    expect(await ctx._convMoveAgents('c1', { agent_id: 'commander', agent_ids: ['__commander__'] })).toEqual([]);
+    const mixed = await ctx._convMoveAgents('c1', { agent_id: 'commander', agent_ids: ['a1', '__commander__'] });
+    expect(mixed.map((agent: any) => agent.id)).toEqual(['a1']);
+  });
+
+  it.each([['a2'], ['a1', 'a2']])('reports rejected selections without undoing the task move (%j)', async (...rejected) => {
+    const { ctx, bindings, toasts } = setup({ projectId: 'p1', agentIds: ['a1', 'a2'] }, rejected);
+    await ctx._moveConversationToExistingProject('c1');
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect(bindings.has('already-bound')).toBe(true);
+    expect(bindings.has('a1')).toBe(!rejected.includes('a1'));
+    expect(JSON.parse(toasts[0])).toEqual({ key: 'chat.conv_moved_agents_failed', args: { name: 'Existing project', count: rejected.length } });
+  });
+
+  it('allows filing with every agent unchecked', async () => {
+    const { ctx, bindings, toasts } = setup({ projectId: 'p1', agentIds: [] });
+    await ctx._moveConversationToExistingProject('c1');
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect([...bindings]).toEqual(['already-bound']);
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_moved');
+  });
+
+  it.each([null, { projectId: 'p1', agentIds: ['a1'] }])('does not change bindings on cancel or refused move (%j)', async (choice) => {
+    const { ctx, bindings, toasts } = setup(choice, [], true);
+    await ctx._moveConversationToExistingProject('c1');
+    expect(ctx.conversations[0].project_id).toBeUndefined();
+    expect([...bindings]).toEqual(['already-bound']);
+    expect(toasts.length).toBe(choice ? 1 : 0);
+    if (choice) expect(JSON.parse(toasts[0]).key).toBe('chat.conv_move_running');
   });
 });
 
@@ -4384,15 +4634,15 @@ describe('conversation process metadata formatting', () => {
       path.join(__dirname, '../../bin/orkas-bridge.cjs'),
       'utf8',
     );
-    const registeredTools = (source: string) => [...source.matchAll(/server\.(?:tool|registerTool)\(\s*'([^']+)'/g)]
+    const registeredTools = (source: string) => [...source.matchAll(/(?:server\.(?:tool|registerTool)|\bregisterTool)\(\s*'([^']+)'/g)]
       .map((match) => match[1])
       .sort();
     const presentedTools = [...new Set(orkasBridgeCases.map(([tool]) => tool))].sort();
 
     expect(registeredTools(bridgeSource)).toEqual(presentedTools);
-    // An uncovered tool must invalidate the matrix with either SDK API.
-    for (const method of ['tool', 'registerTool']) {
-      const extendedSource = `${bridgeSource}\nserver.${method}('uncovered_tool', {}, () => {});`;
+    // An uncovered tool must invalidate the matrix through either SDK API or the input adapter.
+    for (const method of ['server.tool', 'server.registerTool', 'registerTool']) {
+      const extendedSource = `${bridgeSource}\n${method}('uncovered_tool', {}, () => {});`;
       expect(registeredTools(extendedSource)).toEqual([...presentedTools, 'uncovered_tool'].sort());
       expect(registeredTools(extendedSource)).not.toEqual(presentedTools);
     }
@@ -8527,6 +8777,7 @@ describe('conversation auto recipient', () => {
 
   it.each([false, true])('keeps an admitted send in A and preserves B while attachment preparation awaits (busy=%s)', async busy => {
     const context = loadConversationRenderer();
+    context._DRAFT_KEY = (cid: string) => `draft:${cid}`;
     const input = { value: 'message for A', dataset: {}, dispatchEvent() {} };
     const sends: any[] = [];
     const clearedDrafts: string[] = [];
@@ -8553,6 +8804,7 @@ describe('conversation auto recipient', () => {
       return { json: async () => ({ ok: true }) };
     };
     context.sendInConversation = async (cid: string, content: string) => { sends.push({ cid, content }); };
+    context._saveDraft('conversation-a');
     const pending = context.handleChatSubmit();
     context.currentCid = 'conversation-b';
     input.value = 'unsent draft in B';
@@ -9767,6 +10019,20 @@ describe('chat attachment picker targeting', () => {
     } finally { release(); }
   });
 
+  it('names each create card after its destination action and rejects unsupported create requests', () => {
+    const context = loadConversationRenderer();
+    const locale = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales/en.json'), 'utf8'));
+    context.t = (key: string) => locale[key] || key;
+    context.document.createElement = createProcessTestElement;
+    const host = createProcessTestElement();
+    context._mountAppNavRequests(host, { app_nav_requests: [
+      ...['projects', 'agents', 'skills', 'auto', 'settings'].map(surface_id => ({ surface_id, action: 'create' })),
+      { surface_id: 'projects', action: 'create', target_id: 'existing-project' },
+    ] });
+    expect(host.children[0].children.map((button: any) => button.textContent))
+      .toEqual(['New project', 'New agent', 'New skill', 'New auto task']);
+  });
+
   it('summarizes app navigation failures without logging raw exception text', () => {
     const context = loadConversationRenderer();
     context.__navigationWarningRows = [];
@@ -9860,9 +10126,9 @@ describe('new chat quick-start scenarios', () => {
     expect(heading.textContent).toBe('Friend, what do you want to accomplish?');
     expect([...grid.innerHTML.matchAll(/data-scenario="([^"]+)"/g)].map((match) => match[1])).toEqual([
       'data',
-      'office',
+      'ecommerce',
       'ppt',
-      'creation',
+      'office',
       'image',
       'video',
       'ui_design',
@@ -9958,7 +10224,7 @@ describe('new chat quick-start scenarios', () => {
       }
       throw new Error(`unexpected request: ${url}`);
     };
-    context.sendInCurrentConversation = async (content: string, extra: any, options: any) => {
+    context.sendInConversation = async (_cid: string, content: string, extra: any, options: any) => {
       expect(options.restoreComposerOnFailure).toBe(true);
       sends.push({ content, extra });
     };
@@ -10014,7 +10280,7 @@ describe('new chat quick-start scenarios', () => {
       }
       throw new Error(`unexpected request: ${url}`);
     };
-    context.sendInCurrentConversation = async (content: string, extra: any) => {
+    context.sendInConversation = async (_cid: string, content: string, extra: any) => {
       sends.push({ content, extra });
     };
     const alerts: string[] = [];
@@ -10243,7 +10509,7 @@ describe('new chat quick-start scenarios', () => {
     expect(input.dataset.commanderQuickStartPlaceholder).toBeUndefined();
   });
 
-  it('binds content creation to the default-installed ContentWriter', async () => {
+  it('binds ecommerce research to the default-installed ECommerceResearcher', async () => {
     const context = loadConversationRenderer();
     const events: any[] = [];
     let clickHandler: Function | null = null;
@@ -10255,7 +10521,7 @@ describe('new chat quick-start scenarios', () => {
       dispatchEvent() {},
     };
     const card = {
-      dataset: { scenario: 'creation' },
+      dataset: { scenario: 'ecommerce' },
       addEventListener(type: string, fn: Function) {
         if (type === 'click') clickHandler = fn;
       },
@@ -10265,8 +10531,8 @@ describe('new chat quick-start scenarios', () => {
     };
 
     context._agentsCache = [{
-      agent_id: '173d4235a431',
-      name: 'ContentWriter',
+      agent_id: '5a1d43c2f28a',
+      name: 'ECommerceResearcher',
       enabled: true,
     }];
     context.Monitor = {
@@ -10290,10 +10556,10 @@ describe('new chat quick-start scenarios', () => {
 
     expect(context.getChatRecipient('new-chat')).toMatchObject({
       kind: 'agent',
-      id: '173d4235a431',
-      name: 'ContentWriter',
+      id: '5a1d43c2f28a',
+      name: 'ECommerceResearcher',
     });
-    expect(input.value).toContain('Write a social post');
+    expect(input.value).toContain('Assess whether pet water fountains');
   });
 
   it('binds software development to the default-installed ProductDeveloper', async () => {
@@ -10456,5 +10722,144 @@ describe('authoritative tool execution states', () => {
     expect(terminal).not.toContain('Failed');
     expect(terminal).not.toContain('private fact');
     expect(context._formatEventLine(skipped, display)).toBe(terminal);
+  });
+});
+
+describe('streaming repaint lifecycle', () => {
+  function setup() {
+    const context = loadConversationRenderer();
+    const final: any = { style: { display: 'none' }, innerHTML: '',
+      querySelector: () => final.innerHTML.includes('markdown-body') ? {} : null };
+    const msg: any = { dataset: {}, isConnected: true,
+      querySelector: (selector: string) => selector === '[data-role="final"]' ? final : null };
+    context.renderMarkdownFull = (text: string) => `<p>${escapeHtml(text)}</p>`;
+    context._attachAssistantActions = () => {};
+    context._attachFailedAssistantActions = () => {};
+    context._attachInterruptedAssistantActions = () => {};
+    return { context, final, msg };
+  }
+
+  it('shows first text promptly and eventually paints the last delta without another event', () => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      context._streamingAppendFinalDelta(msg, 'First', 'final_answer');
+      vi.advanceTimersByTime(1);
+      expect(final.innerHTML).toContain('First');
+      for (const piece of [' second', ' third', ' last']) {
+        context._streamingAppendFinalDelta(msg, piece, 'final_answer');
+        vi.advanceTimersByTime(10);
+      }
+      // Reading the first text must not see it blanked while updates collect.
+      expect(final.innerHTML).toContain('First');
+      vi.advanceTimersByTime(100);
+      expect(final.innerHTML).toContain('First second third last');
+      expect(msg.dataset.finalText).toBe('First second third last');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it.each(['final', 'error', 'stop'])('cancels trailing paints before %s, including the timer fallback', (terminal) => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      delete context.requestAnimationFrame;
+      context._streamingAppendFinalDelta(msg, 'Partial', 'final_answer');
+      vi.advanceTimersByTime(1);
+      context._streamingAppendFinalDelta(msg, ' latest', 'final_answer');
+      if (terminal === 'final') context._streamingSetFinal(msg, 'Canonical answer');
+      if (terminal === 'error') context._streamingSetError(msg, 'failure');
+      if (terminal === 'stop') context._streamingMarkAborted(msg);
+      const terminalHtml = final.innerHTML;
+      if (terminal === 'final') expect(terminalHtml).toContain('Canonical answer');
+      if (terminal === 'error') {
+        expect(terminalHtml).toContain('Partial latest');
+        expect(terminalHtml).toContain('msg-error');
+      }
+      if (terminal === 'stop') expect(terminalHtml).toContain('Interrupted');
+      vi.advanceTimersByTime(1000);
+      expect(final.innerHTML).toBe(terminalHtml);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('does not let an uncancellable old frame paint into a recovered row', () => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      const frames: Array<() => void> = [];
+      context.requestAnimationFrame = (fn: () => void) => { frames.push(fn); return frames.length; };
+      context._streamingAppendFinalDelta(msg, 'Old task', 'final_answer');
+      context._cancelPendingStreamRaf(msg);
+      msg.dataset.streamBuf = '';
+      context._streamingAppendFinalDelta(msg, 'Recovered task', 'final_answer');
+      frames[0]();
+      expect(final.innerHTML).toBe('');
+      frames[1]();
+      expect(final.innerHTML).toContain('Recovered task');
+      context._streamingAppendFinalDelta(msg, ' detached', 'final_answer');
+      msg.isConnected = false;
+      vi.advanceTimersByTime(100);
+      frames[2]();
+      expect(final.innerHTML).not.toContain('detached');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('lets an identical pending formula finish instead of invalidating its result', async () => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      let finish!: (html: string) => void;
+      context.typesetMathHtml = () => new Promise(resolve => { finish = resolve; });
+      context._paintStreamingFinalMarkdown(msg, final, '\\(a+b\\)');
+      await vi.advanceTimersByTimeAsync(50);
+      context._paintStreamingFinalMarkdown(msg, final, '\\(a+b\\)');
+      finish('<div class="markdown-body"><mjx-container>a+b</mjx-container></div>');
+      await vi.advanceTimersByTimeAsync(1);
+      expect(final.innerHTML).toContain('<mjx-container>a+b</mjx-container>');
+      expect(msg.dataset.streamPaintedDisplay).toBe('\\(a+b\\)');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('invalidates superseded math even when the newest display matches the visible content', async () => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      final.innerHTML = '<div class="markdown-body"><mjx-container>a+b</mjx-container></div>';
+      final.querySelector = (selector: string) => selector === '.markdown-body' ? {} : null;
+      msg.dataset.streamPaintedDisplay = '\\(a+b\\)';
+      let finish!: (html: string) => void;
+      context.typesetMathHtml = () => new Promise(resolve => { finish = resolve; });
+      context._paintStreamingFinalMarkdown(msg, final, '\\(obsolete\\)');
+      await vi.advanceTimersByTimeAsync(50);
+      context._paintStreamingFinalMarkdown(msg, final, '\\(a+b\\)');
+      finish('<mjx-container>obsolete</mjx-container>');
+      await vi.advanceTimersByTimeAsync(100);
+      expect(final.innerHTML).toContain('<mjx-container>a+b</mjx-container>');
+      expect(final.innerHTML).not.toContain('obsolete');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('stops offscreen formula work after the user leaves the message', async () => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      final.isConnected = true;
+      let finish!: (html: string) => void;
+      let typesets = 0;
+      context.typesetMathHtml = () => {
+        typesets++;
+        return typesets === 1 ? new Promise(resolve => { finish = resolve; })
+          : Promise.resolve('<mjx-container>a+b</mjx-container>');
+      };
+      context._paintStreamingFinalMarkdown(msg, final, '\\(a+b\\)');
+      await vi.advanceTimersByTimeAsync(50);
+      msg.isConnected = false;
+      final.isConnected = false;
+      finish('<mjx-container>a+b</mjx-container>');
+      await vi.advanceTimersByTimeAsync(500);
+      expect(final.innerHTML).toBe('');
+      // Detached tasks must not spend renderer time repeatedly typesetting
+      // a result that can no longer be displayed.
+      expect(typesets).toBe(1);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
   });
 });
