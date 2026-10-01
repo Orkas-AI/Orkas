@@ -1,8 +1,8 @@
 {
   "name": "orkas",
-  "version": "2026.9.22",
+  "version": "2026.10.1",
   "private": true,
-  "description": "Orkas desktop \u2014 Electron + Node one-piece app",
+  "description": "Orkas desktop — Electron + Node one-piece app",
   "main": "bootstrap.cjs",
   "type": "commonjs",
   "packageManager": "npm@11.11.0",
