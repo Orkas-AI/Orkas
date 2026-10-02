@@ -111,6 +111,7 @@ async function loadSettings() {
   _settingsRenderLocalExec();
   _settingsSyncLanguageRadio();
   await Promise.all([
+    _settingsSafeCall('custom validation refresh', _settingsRefreshOperatorPolicy),
     _settingsSafeCall('settings providers refresh', _settingsRefreshProviders),
     _settingsSafeCall('settings entries refresh', _settingsRefreshEntries),
     _settingsSafeCall('settings local execution refresh', _settingsRefreshLocalExec),
@@ -901,6 +902,7 @@ function _settingsSyncLanguageRadio() {
 // re-render sections whose text is written by JS (so their content
 // isn't refreshed by applyDomI18n's data-i18n sweep).
 window.addEventListener('i18n-change', () => {
+  void _settingsRefreshOperatorPolicy();
   _settingsSyncLanguageRadio();
   _settingsRenderLocalExec();
   _settingsRenderPicker();
@@ -3052,4 +3054,31 @@ function _settingsSelectedImageOptionId() {
   return _settingsState.imageProviderSel?.getValue()
     || document.getElementById('settings-image-provider')?.dataset?.value
     || '';
+}
+
+
+async function _settingsRefreshOperatorPolicy() {
+  const toggle = document.getElementById('settings-operator-toggle');
+  const status = document.getElementById('settings-operator-status');
+  if (!toggle || !status) return;
+  const render = (value) => {
+    toggle.checked = !!value.enabled;
+    status.textContent = t(`quality.operator.${value.state || 'invalid'}`, { count: value.ruleCount || 0 });
+  };
+  if (!toggle.dataset.bound) {
+    toggle.dataset.bound = '1';
+    toggle.addEventListener('change', async () => {
+      toggle.disabled = true;
+      try { render(await window.orkas.invoke('quality.setOperatorEnabled', { enabled: toggle.checked })); }
+      catch (_) { status.textContent = t('quality.operator.invalid'); }
+      finally { toggle.disabled = false; }
+    });
+    document.getElementById('settings-operator-file').addEventListener('click', async () => {
+      try { await window.orkas.invoke('quality.openOperatorFile'); }
+      catch (_) { status.textContent = t('quality.operator.invalid'); }
+    });
+    document.getElementById('settings-operator-reload').addEventListener('click', _settingsRefreshOperatorPolicy);
+  }
+  try { render(await window.orkas.invoke('quality.operatorStatus')); }
+  catch (_) { status.textContent = t('quality.operator.invalid'); }
 }

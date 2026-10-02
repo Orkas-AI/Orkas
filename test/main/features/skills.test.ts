@@ -1867,7 +1867,7 @@ describe('skills › discardImportDraftIfPristine', () => {
     await s.createCustomSkill('edited-draft', 'desc');
     markImportDraft('edited-draft');
 
-    expect(s.writeCustomSkillFile('edited-draft', 'notes.md', '# note')).toBe(true);
+    expect(await s.writeCustomSkillFile('edited-draft', 'notes.md', '# note')).toBe(true);
     const meta = JSON.parse(fs.readFileSync(path.join(customSkillsDir(), 'edited-draft', '_meta.json'), 'utf8'));
     expect(meta._import).toBeUndefined();
   });
@@ -1892,7 +1892,7 @@ describe('skills › writeCustomSkillFile (path safety)', () => {
   it('writes a file inside the skill dir', async () => {
     writeCustomSkill('alpha');
     const s = await loadSkills();
-    expect(s.writeCustomSkillFile('alpha', 'note.md', '# content')).toBe(true);
+    expect(await s.writeCustomSkillFile('alpha', 'note.md', '# content')).toBe(true);
     const written = fs.readFileSync(
       path.join(customSkillsDir(), 'alpha', 'note.md'), 'utf8');
     expect(written).toBe('# content');
@@ -1901,25 +1901,25 @@ describe('skills › writeCustomSkillFile (path safety)', () => {
   it('rejects path traversal attempts', async () => {
     writeCustomSkill('alpha');
     const s = await loadSkills();
-    expect(s.writeCustomSkillFile('alpha', '../../evil.md', 'x')).toBe(false);
-    expect(s.writeCustomSkillFile('alpha', 'sub/../../evil.md', 'x')).toBe(false);
+    expect(await s.writeCustomSkillFile('alpha', '../../evil.md', 'x')).toBe(false);
+    expect(await s.writeCustomSkillFile('alpha', 'sub/../../evil.md', 'x')).toBe(false);
   });
 
   it('rejects empty relpath', async () => {
     writeCustomSkill('alpha');
     const s = await loadSkills();
-    expect(s.writeCustomSkillFile('alpha', '', 'x')).toBe(false);
+    expect(await s.writeCustomSkillFile('alpha', '', 'x')).toBe(false);
   });
 
   it('returns false when skill does not exist', async () => {
     const s = await loadSkills();
-    expect(s.writeCustomSkillFile('ghost', 'note.md', 'x')).toBe(false);
+    expect(await s.writeCustomSkillFile('ghost', 'note.md', 'x')).toBe(false);
   });
 
   it('normalizes SKILL.md writes to Orkas-supported frontmatter fields', async () => {
     writeCustomSkill('alpha', 'name: "alpha"\ndescription_en: "old"\ncategory: "general"', 'old body');
     const s = await loadSkills();
-    const result = s.writeCustomSkillFileChecked('alpha', 'SKILL.md', [
+    const result = await s.writeCustomSkillFileChecked('alpha', 'SKILL.md', [
       '---',
       'name: "alpha"',
       'description: "Legacy English"',
@@ -2804,4 +2804,143 @@ describe('skills › bounded creation correction', () => {
     expect(fs.readdirSync(customSkillsDir())).toEqual([]);
     expect(fs.existsSync(path.join(tmpDir, 'another-account', 'cloud', 'skills', 'repaired-skill'))).toBe(false);
   });
+});
+
+describe('skills › operator policy write gates', () => {
+  function enablePolicy(rules: unknown[], raw?: string) {
+    const config = path.join(tmpDir, TEST_UID, 'local', 'config');
+    fs.mkdirSync(config, { recursive: true });
+    fs.writeFileSync(path.join(config, 'operator-policy-enabled.json'), '{"enabled":true}');
+    fs.writeFileSync(path.join(config, 'operator-policy.json'), raw ?? JSON.stringify({ version: 1, rules }));
+  }
+  const restriction = { id: 'private', level: 'EXTREME', pattern: 'private-resource', appliesTo: ['script', 'skill_meta'] };
+  it('keeps an existing file intact on invalid configuration and recovers after disable', async () => {
+    const s = await loadSkills();
+    writeCustomSkill('policy-edit');
+    const file = path.join(customSkillsDir(), 'policy-edit', 'run.sh');
+    fs.writeFileSync(file, 'original');
+    enablePolicy([], '{broken');
+    const blocked = await s.writeCustomSkillFileChecked('policy-edit', 'run.sh', 'replacement');
+    expect(blocked).toMatchObject({ ok: false, report: { violations: [expect.objectContaining({ rule: 'operator:incomplete' })] } });
+    expect(fs.readFileSync(file, 'utf8')).toBe('original');
+    const policy = await import('../../../src/main/features/operator-policy');
+    await policy.setOperatorPolicyEnabled(TEST_UID, false);
+    expect((await s.writeCustomSkillFileChecked('policy-edit', 'run.sh', 'replacement')).ok).toBe(true);
+    expect(fs.readFileSync(file, 'utf8')).toBe('replacement');
+  });
+  it('rejects a complete creation before allocation and cancels a clean proposal after async validation', async () => {
+    const s = await loadSkills();
+    enablePolicy([restriction]);
+    const proposal = { raw: '', files: [
+      { path: 'SKILL.md', content: '---\nname: policy-create\ndescription: Test\n---\nBody' },
+      { path: 'run.sh', content: 'echo private-resource' },
+    ] };
+    expect((await s.applySkillContainerFromCommander(proposal)).ok).toBe(false);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'policy-create'))).toBe(false);
+    proposal.files[1].content = 'echo harmless';
+    let cancelled = false;
+    const pending = s.applySkillContainerFromCommander(proposal, { isCancelled: () => cancelled });
+    cancelled = true;
+    expect((await pending).ok).toBe(false);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'policy-create'))).toBe(false);
+  });
+  it('rejects blocked imports even with force and publishes no partial Skill', async () => {
+    const s = await loadSkills();
+    const source = fs.mkdtempSync(path.join(process.cwd(), '.tmp-policy-import-'));
+    try {
+    fs.writeFileSync(path.join(source, 'SKILL.md'), '---\nname: policy-import\ndescription: Test\n---\nBody');
+    fs.writeFileSync(path.join(source, 'run.sh'), 'echo private-resource');
+    enablePolicy([restriction]);
+    const result = await s.createFromDir(null, null, source, { force: true });
+    expect(result.ok).toBe(false);
+    expect(result.report?.violations).toContainEqual(expect.objectContaining({ rule: 'operator:private' }));
+    expect(fs.readdirSync(customSkillsDir())).toEqual([]);
+    } finally { fs.rmSync(source, { recursive: true, force: true }); }
+  });
+  it('checks metadata before changing either Markdown or the sidecar', async () => {
+    const s = await loadSkills();
+    writeCustomSkill('policy-meta');
+    enablePolicy([restriction]);
+    const file = path.join(customSkillsDir(), 'policy-meta', 'SKILL.md');
+    const before = fs.readFileSync(file, 'utf8');
+    const result = await s.applySkillMetadataForEdit('policy-meta', { category: 'private-resource', description_en: 'new description' });
+    expect(result.ok).toBe(false);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'policy-meta', '_meta.json'))).toBe(false);
+  });
+});
+
+function enableCommitBoundaryPolicy(rules: unknown[]) {
+  const config = path.join(tmpDir, TEST_UID, 'local', 'config');
+  fs.mkdirSync(config, { recursive: true });
+  fs.writeFileSync(path.join(config, 'operator-policy-enabled.json'), '{"enabled":true}');
+  fs.writeFileSync(path.join(config, 'operator-policy.json'), JSON.stringify({version: 1, rules}));
+}
+describe('skills › operator policy commit boundary', () => {
+  it('applies the same policy to the canonical Skill path and its accepted write alias', async () => {
+    writeCustomSkill('alias');
+    enableCommitBoundaryPolicy([{id:'private',level:'EXTREME',pattern:'private-resource',appliesTo:['skill_md']}]);
+    const s = await loadSkills();
+    const payload = '---\nname: alias\ndescription: test\n---\n```bash\necho private-resource\n```';
+    expect((await s.writeCustomSkillFileChecked('alias', 'SKILL.md', payload)).ok).toBe(false);
+    for (const alias of ['/SKILL.md', ' skill.md ']) {
+      expect((await s.writeCustomSkillFileChecked('alias', alias, payload)).ok).toBe(false);
+    }
+    const persisted = fs.readFileSync(path.join(customSkillsDir(),'alias','SKILL.md'),'utf8');
+    expect(persisted).not.toContain('private-resource');
+  });
+  it('checks metadata aliases before replacing the canonical sidecar', async () => {
+    writeCustomSkill('meta-alias');
+    enableCommitBoundaryPolicy([{ id: 'private', level: 'EXTREME', pattern: 'private-resource', appliesTo: ['skill_meta'] }]);
+    const s = await loadSkills();
+    for (const alias of ['/_meta.json', '_META.JSON']) {
+      expect((await s.writeCustomSkillFileChecked('meta-alias', alias, '{"category":"private-resource"}')).ok).toBe(false);
+    }
+    expect(fs.existsSync(path.join(customSkillsDir(), 'meta-alias', '_meta.json'))).toBe(false);
+  });
+  it('checks normalized metadata bytes that will be persisted', async () => {
+    writeCustomSkill('category');
+    enableCommitBoundaryPolicy([{id:'no_creation',level:'EXTREME',pattern:'creation',appliesTo:['skill_meta']}]);
+    const s = await loadSkills();
+    const result = await s.applySkillMetadataForEdit('category', {category:'writing'});
+    const file=path.join(customSkillsDir(),'category','_meta.json');
+    const persisted=fs.existsSync(file) ? fs.readFileSync(file,'utf8') : '';
+    expect(result.ok).toBe(false);
+    expect(persisted).not.toContain('creation');
+  });
+  it('checks the final creation status from legacy frontmatter', async () => {
+    enableCommitBoundaryPolicy([{id:'no_draft',level:'EXTREME',pattern:'draft',appliesTo:['skill_meta']}]);
+    const s=await loadSkills();
+    const result=await s.applySkillContainerFromCommander({raw:'',files:[{path:'SKILL.md',content:'---\nname: status-case\ndescription: Test\nstatus: draft\n---\nBody'}]});
+    const file=path.join(customSkillsDir(),'status-case','_meta.json');
+    const persisted=fs.existsSync(file) ? fs.readFileSync(file,'utf8') : '';
+    expect(result.ok).toBe(false);
+    expect(persisted).not.toContain('draft');
+  });
+  for (const kind of ['file','metadata']) {
+    it(`does not persist inline ${kind} after Stop during policy validation`, async () => {
+      writeCustomSkill('cancelled');
+      enableCommitBoundaryPolicy([]);
+      const controller = new AbortController();
+      const policy = await import('../../../src/main/features/operator-policy');
+      const original = policy.validateWithOperatorPolicy;
+      const spy = vi.spyOn(policy, 'validateWithOperatorPolicy').mockImplementation(async (...args) => {
+        const result = await original(...args);
+        controller.abort();
+        return result;
+      });
+      streamImpl.current = async function* () {
+        yield {type:'final',text: kind === 'file'
+          ? '<<<skill-file path=notes.md\nchanged after stop\n>>>'
+          : '<skill-meta><category>data</category></skill-meta>'};
+      };
+      try {
+        const s = await loadSkills();
+        for await (const event of s.streamSendToSkillChat(TEST_UID,'cancelled','edit',{abortSignal:controller.signal})) {}
+        const target=path.join(customSkillsDir(),'cancelled',kind==='file'?'notes.md':'_meta.json');
+        expect(controller.signal.aborted).toBe(true);
+        expect(fs.existsSync(target)).toBe(false);
+      } finally { spy.mockRestore(); }
+    });
+  }
 });

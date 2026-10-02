@@ -2522,5 +2522,12 @@
   "chat.conv_moved_out": "Moved out of the project.",
   "chat.conv_filing_failed": "Project “{name}” was created, but the conversation could not be added. Use “Add to project” in its menu and select this project to try again.",
   "chat.conv_filing_failed_with_todos": "Project “{name}” and {count} to-dos were created, but the conversation could not be added. Use “Add to project” in its menu and select this project to try again.",
-  "chat.conv_move_not_filed": "This task is not in a project."
+  "chat.conv_move_not_filed": "This task is not in a project.",
+  "quality.operator.title": "Custom validation",
+  "quality.operator.scope": "Checks scripts, executable SKILL.md code blocks, metadata and Agent JSON before saving or installing. This is not a runtime sandbox.",
+  "quality.operator.file": "Rule file",
+  "quality.operator.reload": "Reload",
+  "quality.operator.disabled": "Disabled on this device.",
+  "quality.operator.ready": "Ready: {count} rules.",
+  "quality.operator.invalid": "Validation unavailable. Fix operator-policy.json or turn off custom validation, then retry."
 }

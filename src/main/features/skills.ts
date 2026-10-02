@@ -16,6 +16,7 @@
  * chat turn picks up the new / updated / removed skill.
  */
 
+import { validateWithOperatorPolicy, hasBlockingOperatorPolicy } from './operator-policy';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
@@ -66,7 +67,6 @@ import {
 import { findOuterTagRanges } from '../util/markdown-prose-code';
 import {
   validateSkillFile,
-  validateSkillDir,
   ValidationReport as QualityReport,
 } from '../quality';
 import { persistReport as persistQualityReport } from '../quality/report';
@@ -428,8 +428,7 @@ function readSkillOrkasMetaSync(dir: string): SkillOrkasMeta {
   }
 }
 
-function writeSkillOrkasMetaSync(dir: string, patch: SkillOrkasMeta): void {
-  const current = readSkillOrkasMetaSync(dir);
+function mergeSkillOrkasMeta(current: SkillOrkasMeta, patch: SkillOrkasMeta): SkillOrkasMeta {
   const next: SkillOrkasMeta = { ...current };
   if (Object.prototype.hasOwnProperty.call(patch, 'category')) {
     const raw = typeof patch.category === 'string' ? patch.category.trim() : '';
@@ -469,7 +468,11 @@ function writeSkillOrkasMetaSync(dir: string, patch: SkillOrkasMeta): void {
     if (clean) next.state = clean;
     else delete next.state;
   }
-  writeJsonSync(skillMetaFile(dir), next);
+  return next;
+}
+
+function writeSkillOrkasMetaSync(dir: string, patch: SkillOrkasMeta): void {
+  writeJsonSync(skillMetaFile(dir), mergeSkillOrkasMeta(readSkillOrkasMetaSync(dir), patch));
 }
 
 function _stripSkillSidecarDescriptions(meta: SkillOrkasMeta): SkillOrkasMeta {
@@ -1159,6 +1162,12 @@ async function _listSkillFilesAt(skillDir: string): Promise<SkillFileInfo[]> {
 export async function createCustomSkill(
   name: string, description: string, category = '',
 ): Promise<CustomSkill | null> {
+  const uid = getActiveUserId();
+  const reports = await validateWithOperatorPolicy(uid, { kind: 'files', files: [
+    { relpath: 'SKILL.md', content: skillMdContent(name, description, '', category, 'approved') },
+    { relpath: '_meta.json', content: JSON.stringify(mergeSkillOrkasMeta({}, { category, status: 'approved' }), null, 2) },
+  ] });
+  if (uid !== getActiveUserId() || reports.some(hasBlockingOperatorPolicy)) throw new Error(t('quality.operator.incomplete'));
   return _createCustomSkillSync(name, description, category);
 }
 
@@ -1210,7 +1219,7 @@ export async function updateCustomSkill(
     description_en?: string;
     category?: string;
   },
-  options: { skipRename?: boolean } = {},
+  options: { skipRename?: boolean; isCancelled?: () => boolean } = {},
 ): Promise<CustomSkill | null> {
   const userId = getActiveUserId();
   let d = customSkillDir(skillId, userId);
@@ -1242,6 +1251,17 @@ export async function updateCustomSkill(
     ? String(updates.category || '')
     : ((meta.category as string) || '');
 
+  const sidecar = readSkillOrkasMetaSync(d);
+  const proposedSidecar = _stripSkillSidecarDescriptions(mergeSkillOrkasMeta(sidecar, {
+    category: newCategory,
+    status: String(meta.status || meta.state || sidecar.status || 'approved'),
+  }));
+  delete proposedSidecar._import;
+  const policyReports = await validateWithOperatorPolicy(userId, { kind: 'files', files: [
+    { relpath: 'SKILL.md', content: skillMdContent(newName, { zh: newZh, en: newEn }, body) },
+    { relpath: '_meta.json', content: JSON.stringify(proposedSidecar, null, 2) },
+  ] });
+  if (userId !== getActiveUserId() || options.isCancelled?.() || policyReports.some(hasBlockingOperatorPolicy)) throw new Error(t('quality.operator.incomplete'));
   let currentId = skillId;
   // `skipRename` is the in-progress-edit hook used by the skill detail name
   // editor: while the user is typing, write the new `name:` into SKILL.md
@@ -1294,12 +1314,7 @@ export async function updateCustomSkill(
   }
 
   writeTextAtomicSync(md, skillMdContent(newName, { zh: newZh, en: newEn }, body));
-  writeSkillOrkasMetaSync(d, {
-    ...(newCategory ? { category: newCategory } : { category: '' }),
-    status: String(meta.status || meta.state || readSkillOrkasMetaSync(d).status || 'approved'),
-  });
-  removeSkillSidecarDescriptionsSync(d);
-  clearSkillImportDraftMarkerSync(currentId);
+  writeJsonSync(skillMetaFile(d), proposedSidecar);
   log.info(`updated name=${currentId} category=${newCategory || '(none)'}`);
   _invalidateSkillListCache({ userId });
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
@@ -1643,27 +1658,27 @@ function _filesForSourceSkillRoot(
     .filter((f) => f.rel && !f.rel.startsWith('..') && f.rel !== '.');
 }
 
-function _copyImportedSkillFilesPreservingSource(skillDir: string, files: { src: string; rel: string; size: number }[]): void {
+function _copyImportedSkillFilesPreservingSource(skillDir: string, files: { src: string; rel: string; size: number }[], fallbackName = path.basename(skillDir)): void {
   for (const { src, rel } of files) {
     const dst = path.join(skillDir, rel);
     fs.mkdirSync(path.dirname(dst), { recursive: true });
     if (rel.toUpperCase() === 'SKILL.MD') {
       const raw = fs.readFileSync(src, 'utf8');
-      writeTextAtomicSync(dst, normalizeSkillMdForWrite(raw, path.basename(skillDir)));
+      writeTextAtomicSync(dst, normalizeSkillMdForWrite(raw, fallbackName));
     } else {
       fs.copyFileSync(src, dst);
     }
   }
 }
 
-function _copyImportedDraftFiles(skillDir: string, files: { src: string; rel: string; size: number }[]): void {
+function _copyImportedDraftFiles(skillDir: string, files: { src: string; rel: string; size: number }[], fallbackName = path.basename(skillDir)): void {
   for (const { src, rel } of files) {
     if (path.basename(rel).toLowerCase() === '_meta.json') continue;
     const dst = path.join(skillDir, rel);
     fs.mkdirSync(path.dirname(dst), { recursive: true });
     if (rel.toUpperCase() === 'SKILL.MD') {
       const raw = fs.readFileSync(src, 'utf8');
-      writeTextAtomicSync(dst, normalizeSkillMdForWrite(raw, path.basename(skillDir)));
+      writeTextAtomicSync(dst, normalizeSkillMdForWrite(raw, fallbackName));
     } else {
       fs.copyFileSync(src, dst);
     }
@@ -1724,7 +1739,7 @@ async function _markSourceSkillMetadataSession(firstSkillId: string, targetSkill
 }
 
 function _hasNonOverrideableAuthoringViolation(report: QualityReport): boolean {
-  return report.violations.some((violation) => violation.rule === 'skill_script_requires_runner');
+  return hasBlockingOperatorPolicy(report) || report.violations.some((violation) => violation.rule === 'skill_script_requires_runner');
 }
 
 async function _installSourceSkillRoots(
@@ -1783,6 +1798,8 @@ async function _installSourceSkillRoots(
       ? (description || '').trim()
       : _sourceSkillImportDescription(sourceSkillMd, t('skills.import.default_desc_dir'));
     let created: CustomSkill | null = null;
+    const uid = getActiveUserId();
+    const staged = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-policy-import-'));
     try {
       if (opts.requireSkillMd) {
         // Check the source before normalization can fill a missing name or
@@ -1805,41 +1822,38 @@ async function _installSourceSkillRoots(
           continue;
         }
       }
-      created = await createCustomSkill(effectiveName, effectiveDesc);
-      if (!created) throw new Error(t('skills.errors.create_failed'));
-
-      const skillDir = customSkillDir(created.id);
       const rootFiles = _dropSourceMetaFiles(_filesForSourceSkillRoot(sourceRoot, files, sourceRoots));
-      fs.rmSync(skillMetaFile(skillDir), { force: true });
-      _copyImportedSkillFilesPreservingSource(skillDir, rootFiles);
-      writeSkillOrkasMetaFullSync(skillDir, _sourceSkillInstallMeta(sourceRoot, sourceSkillMd));
-
-      const report = validateSkillDir(skillDir);
+      _copyImportedSkillFilesPreservingSource(staged, rootFiles, effectiveName);
+      writeSkillOrkasMetaFullSync(staged, _sourceSkillInstallMeta(sourceRoot, sourceSkillMd));
+      const [report] = await validateWithOperatorPolicy(uid, { kind: 'directory', dir: staged });
+      if (uid !== getActiveUserId()) throw new Error(t('quality.operator.incomplete'));
       void persistQualityReport({
-        uid: getActiveUserId(), kind: 'skill', id: created.id, report,
+        uid: getActiveUserId(), kind: 'skill', id: effectiveName, report,
       });
       if (!report.ok && (opts.force !== true || _hasNonOverrideableAuthoringViolation(report))) {
         const failure: ImportFailure = {
           sourceName,
-          skillId: created.id,
+          skillId: effectiveName,
           error: t('skills.errors.validation_blocked'),
           report,
         };
         failures.push(failure);
-        try { await deleteCustomSkill(created.id); } catch { /* best-effort rollback */ }
         if (!opts.continueOnError) {
           await rollbackCreated();
           return {
             ok: false,
             error: failure.error,
             report,
-            skillId: created.id,
+            skillId: effectiveName,
             failures,
           };
         }
         continue;
       }
 
+      created = _createCustomSkillSync(effectiveName, effectiveDesc);
+      if (!created) throw new Error(t('skills.errors.create_failed'));
+      fs.cpSync(staged, customSkillDir(created.id), { recursive: true });
       const fresh = await getCustomSkill(created.id);
       if (!fresh) throw new Error(t('skills.errors.create_failed'));
       createdIds.push(created.id);
@@ -1865,7 +1879,7 @@ async function _installSourceSkillRoots(
         await rollbackCreated();
         return { ok: false, error: failure.error, failures };
       }
-    }
+    } finally { fs.rmSync(staged, { recursive: true, force: true }); }
   }
 
   if (createdSkills.length === 0) {
@@ -1908,35 +1922,27 @@ async function _createEditableDraftFromImportDir(
 ): Promise<ImportResult> {
   const effectiveName = (name || '').trim() || _defaultSkillNameFromDir(realSrc);
   const effectiveDesc = (description || '').trim() || t('skills.import.default_desc_dir');
-  const created = await createCustomSkill(effectiveName, effectiveDesc);
-  if (!created) return { ok: false, error: t('skills.errors.create_failed') };
-
-  const skillDir = customSkillDir(created.id);
+  const uid = getActiveUserId();
+  const staged = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-policy-draft-'));
+  let created: CustomSkill | null = null;
   try {
-    _copyImportedDraftFiles(skillDir, files);
-    markSkillImportDraftSync(skillDir, 'dir');
-  } catch (err) {
-    log.warn(`import-dir draft copy failed skill=${created.id}: ${(err as Error).message}`);
-    try { await deleteCustomSkill(created.id); } catch { /* ignore */ }
-    return { ok: false, error: t('skills.errors.copy_failed', { message: (err as Error).message }) };
-  }
-
+    writeTextAtomicSync(path.join(staged, 'SKILL.md'), skillMdContent(effectiveName, effectiveDesc, '', '', 'approved'));
+    _copyImportedDraftFiles(staged, files, effectiveName);
+    markSkillImportDraftSync(staged, 'dir');
+    const [report] = await validateWithOperatorPolicy(uid, { kind: 'directory', dir: staged });
+    void persistQualityReport({ uid, kind: 'skill', id: effectiveName, report });
+    if (uid !== getActiveUserId() || (!report.ok && (opts.force !== true || _hasNonOverrideableAuthoringViolation(report)))) {
+      return { ok: false, error: t('skills.errors.validation_blocked'), report, skillId: effectiveName };
+    }
+    created = _createCustomSkillSync(effectiveName, effectiveDesc);
+    if (!created) return { ok: false, error: t('skills.errors.create_failed') };
+    fs.cpSync(staged, customSkillDir(created.id), { recursive: true });
+  } catch {
+    if (created) await deleteCustomSkill(created.id);
+    return { ok: false, error: t('skills.errors.create_failed') };
+  } finally { fs.rmSync(staged, { recursive: true, force: true }); }
   _invalidateSkillListCache();
-  invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
-
-  const report = validateSkillDir(skillDir);
-  void persistQualityReport({
-    uid: getActiveUserId(), kind: 'skill', id: created.id, report,
-  });
-  if (!report.ok && (opts.force !== true || _hasNonOverrideableAuthoringViolation(report))) {
-    try { await deleteCustomSkill(created.id); } catch { /* best-effort rollback */ }
-    return {
-      ok: false,
-      error: t('skills.errors.validation_blocked'),
-      report,
-      skillId: created.id,
-    };
-  }
+  invalidateCoreAgentSkills().catch(() => {});
 
   const fresh = await getCustomSkill(created.id) || created;
   log.info('created-from-dir import draft', {
@@ -2188,7 +2194,8 @@ export async function importSkillPackageFromPath(sourcePath: string): Promise<Im
  *
  * Returns the new id if renamed, null otherwise.
  */
-async function _renameSkillByFrontmatterIfNeeded(currentId: string): Promise<string | null> {
+async function _renameSkillByFrontmatterIfNeeded(currentId: string, isCancelled?: () => boolean): Promise<string | null> {
+  if (isCancelled?.()) return null;
   const md = path.join(customSkillDir(currentId), 'SKILL.md');
   if (!fs.existsSync(md)) return null;
   let meta: SkillFrontmatter;
@@ -2201,7 +2208,7 @@ async function _renameSkillByFrontmatterIfNeeded(currentId: string): Promise<str
   if (fs.existsSync(customSkillDir(intended))) return null;
   if (fs.existsSync(path.join(userMarketplaceSkillsDir(getActiveUserId()), intended))) return null;
   try {
-    const updated = await updateCustomSkill(currentId, { name: intended });
+    const updated = await updateCustomSkill(currentId, { name: intended }, { isCancelled });
     if (updated) {
       log.info(`auto-renamed skill ${currentId} -> ${intended} (from SKILL.md frontmatter)`);
       return intended;
@@ -2235,24 +2242,48 @@ export interface WriteSkillFileResult {
  * `<<<skill-file>>>` apply path; future inline edit chat). Callers that
  * only need a yes/no go through the legacy `writeCustomSkillFile()` wrapper.
  */
-export function writeCustomSkillFileChecked(
+export async function writeCustomSkillFileChecked(
   skillId: string,
   relpath: string,
   content: string,
-): WriteSkillFileResult {
+  isCancelled?: () => boolean,
+): Promise<WriteSkillFileResult> {
+  const uid = getActiveUserId();
   const d = path.resolve(customSkillDir(skillId));
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) {
     return { ok: false, reason: 'missing_dir' };
   }
+  const canonicalPath = normalizeSkillWritePath(relpath);
+  if (!canonicalPath) return { ok: false, reason: 'invalid_path' };
+  relpath = canonicalPath;
   const isSkillMdWrite = relpath.toUpperCase() === 'SKILL.MD';
   let sidecarPatch: SkillOrkasMeta = {};
   if (isSkillMdWrite) {
     sidecarPatch = _skillSidecarPatchFromFrontmatter(splitSkillMd(content).meta);
   }
-  const contentForWrite = relpath.toUpperCase() === 'SKILL.MD'
-    ? normalizeSkillMdForWrite(content, skillId)
-    : content;
-  const report = validateSkillFile({ relpath, content: contentForWrite });
+  let contentForWrite = isSkillMdWrite ? normalizeSkillMdForWrite(content, skillId) : content;
+  const currentSidecar = readSkillOrkasMetaSync(d);
+  let proposedSidecar: SkillOrkasMeta | undefined;
+  if (relpath === '_meta.json') {
+    try {
+      const parsed = JSON.parse(contentForWrite);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed._import) {
+        delete parsed._import;
+        contentForWrite = JSON.stringify(parsed, null, 2);
+      }
+    } catch { /* The validator below reports malformed JSON. */ }
+  } else if ((isSkillMdWrite && _hasSkillSidecarPatch(sidecarPatch)) || currentSidecar._import) {
+    proposedSidecar = mergeSkillOrkasMeta(currentSidecar, sidecarPatch);
+    delete proposedSidecar._import;
+  }
+  const files = [{ relpath, content: contentForWrite }];
+  if (proposedSidecar) {
+    files.push({ relpath: '_meta.json', content: JSON.stringify(proposedSidecar, null, 2) });
+  }
+  const reports = await validateWithOperatorPolicy(uid, { kind: 'files', files });
+  const violations = reports.flatMap((r, index) => index === 0 ? r.violations : r.violations.filter(v => v.source === 'operator-policy'));
+  const report = { ...reports[0], violations, ok: !violations.some(v => v.level === 'EXTREME') };
+  if (uid !== getActiveUserId() || isCancelled?.() || !fs.existsSync(d)) return { ok: false, reason: 'missing_dir' };
   // Persist best-effort regardless of outcome — the report's also the input
   // for the future evolution / reflection signal stream.
   void persistQualityReport({
@@ -2263,10 +2294,7 @@ export function writeCustomSkillFileChecked(
   }
   const written = _writeSkillFileAt(d, relpath, contentForWrite, /* invalidateOnSkillMd */ true);
   if (!written) return { ok: false, report, reason: 'invalid_path' };
-  if (isSkillMdWrite && _hasSkillSidecarPatch(sidecarPatch)) {
-    writeSkillOrkasMetaSync(d, sidecarPatch);
-  }
-  clearSkillImportDraftMarkerSync(skillId);
+  if (proposedSidecar) writeJsonSync(skillMetaFile(d), proposedSidecar);
   return { ok: true, report };
 }
 
@@ -2274,12 +2302,25 @@ export function writeCustomSkillFileChecked(
  * Boolean-returning wrapper for callers that don't consume the quality
  * report. Internally delegates to `writeCustomSkillFileChecked`.
  */
-export function writeCustomSkillFile(
+export async function writeCustomSkillFile(
   skillId: string,
   relpath: string,
   content: string,
-): boolean {
-  return writeCustomSkillFileChecked(skillId, relpath, content).ok;
+): Promise<boolean> {
+  return (await writeCustomSkillFileChecked(skillId, relpath, content)).ok;
+}
+
+/** Use the writer's accepted path spelling for validation too. On Windows,
+ * separators must be canonical before checking components and file kinds. */
+function normalizeSkillWritePath(relpath: string): string | null {
+  const rel = relpath.trim().split(path.sep).join('/').replace(/^\/+/, '');
+  if (!rel || rel.startsWith('..')) return null;
+  if (rel.split('/').some(part => part === '' || part === '.' || part === '..')) return null;
+  // Win32 removes trailing dots/spaces and treats colons as alternate streams.
+  if (process.platform === 'win32' && rel.split('/').some(part => /[. ]$|:/.test(part))) return null;
+  if (rel.toLowerCase() === '_meta.json') return '_meta.json';
+  if (rel.toUpperCase() === 'SKILL.MD') return 'SKILL.md';
+  return rel;
 }
 
 /** Path-validated write into a resolved skill directory. Returns false on
@@ -2291,11 +2332,8 @@ export function _writeSkillFileAt(
   content: string,
   invalidateOnSkillMd = true,
 ): boolean {
-  if (!relpath) return false;
-  const rel = relpath.trim().replace(/^\/+/, '');
-  if (!rel || rel.startsWith('..')) return false;
-  const parts = rel.split('/');
-  if (parts.some((p) => p === '' || p === '.' || p === '..')) return false;
+  const rel = normalizeSkillWritePath(relpath);
+  if (!rel) return false;
   const target = path.resolve(resolvedDir, rel);
   try {
     const relative = path.relative(resolvedDir, target);
@@ -2323,6 +2361,7 @@ export async function writeSkillFileForEditChecked(
   skillId: string,
   relpath: string,
   content: string,
+  isCancelled?: () => boolean,
 ): Promise<WriteSkillFileResult> {
   const isSkillMdWrite = relpath.toUpperCase() === 'SKILL.MD';
   const sidecarPatch = isSkillMdWrite
@@ -2331,7 +2370,7 @@ export async function writeSkillFileForEditChecked(
   const contentForWrite = isSkillMdWrite ? normalizeSkillMdForWrite(content, skillId) : content;
   const customDir = customSkillDir(skillId);
   if (fs.existsSync(customDir) && fs.statSync(customDir).isDirectory()) {
-    return writeCustomSkillFileChecked(skillId, relpath, content);
+    return writeCustomSkillFileChecked(skillId, relpath, content, isCancelled);
   }
   if (isBuiltinSkill(skillId)) {
     return { ok: false };
@@ -2345,8 +2384,9 @@ export async function writeSkillFileForEdit(
   skillId: string,
   relpath: string,
   content: string,
+  isCancelled?: () => boolean,
 ): Promise<boolean> {
-  return (await writeSkillFileForEditChecked(skillId, relpath, content)).ok;
+  return (await writeSkillFileForEditChecked(skillId, relpath, content, isCancelled)).ok;
 }
 
 interface SkillMetadataApplyResult {
@@ -2361,48 +2401,52 @@ interface SkillMetadataApplyResult {
 export async function applySkillMetadataForEdit(
   skillId: string,
   updates: SkillMetadataUpdate,
-  opts: { replaceSidecar?: boolean } = {},
+  opts: { replaceSidecar?: boolean; isCancelled?: () => boolean } = {},
 ): Promise<SkillMetadataApplyResult> {
+  const uid = getActiveUserId();
   const skill = await getSkillForEdit(skillId);
-  if (!skill) return { ok: false, skillId, written: false, reason: 'missing_dir' };
+  if (!skill || uid !== getActiveUserId() || opts.isCancelled?.()) {
+    return { ok: false, skillId, written: false, reason: 'missing_dir' };
+  }
   const mdPath = path.join(skill.dir, 'SKILL.md');
   const current = fs.existsSync(mdPath) ? fs.readFileSync(mdPath, 'utf8') : '';
   const next = _applyMetadataToSkillMdContent(current, updates, skill.id, skill.source);
-  let report: QualityReport | undefined;
-  let wrote = false;
-
-  if (next !== current) {
-    const res = await writeSkillFileForEditChecked(skillId, 'SKILL.md', next);
-    if (!res.ok) {
-      return { ok: false, skillId, written: false, report: res.report, reason: res.reason };
-    }
-    report = res.report;
-    wrote = true;
-  }
-
   const rawSidecarPatch = _skillSidecarPatchFromMetadataUpdate(updates);
   const sidecarPatch = skill.source === 'marketplace'
     ? _stripSkillSidecarDescriptions(rawSidecarPatch)
     : rawSidecarPatch;
-  if (_hasSkillSidecarPatch(sidecarPatch)) {
-    if (opts.replaceSidecar) {
-      writeSkillOrkasMetaFullSync(
-        skill.dir,
-        _skillSidecarReplacementFromMetadataUpdate(updates, readSkillOrkasMetaSync(skill.dir)),
-      );
-    } else {
-      writeSkillOrkasMetaSync(skill.dir, sidecarPatch);
-    }
-    wrote = true;
+  const writesMarkdown = next !== current;
+  if (writesMarkdown && skill.source !== 'custom') return { ok: false, skillId, written: false };
+  const wrote = writesMarkdown || _hasSkillSidecarPatch(sidecarPatch);
+  const currentSidecar = readSkillOrkasMetaSync(skill.dir);
+  const proposedSidecar = opts.replaceSidecar && _hasSkillSidecarPatch(sidecarPatch)
+    ? _stripSkillSidecarDescriptions(_skillSidecarReplacementFromMetadataUpdate(updates, currentSidecar))
+    : mergeSkillOrkasMeta(currentSidecar, sidecarPatch);
+  if (wrote && skill.source === 'custom') delete proposedSidecar._import;
+  const policyReports = await validateWithOperatorPolicy(uid, { kind: 'files', files: [
+    { relpath: 'SKILL.md', content: next }, { relpath: '_meta.json', content: JSON.stringify(proposedSidecar, null, 2) },
+  ] });
+  const blocked = policyReports.find(hasBlockingOperatorPolicy)
+    || (writesMarkdown && !policyReports[0].ok ? policyReports[0] : undefined);
+  if (blocked || uid !== getActiveUserId() || opts.isCancelled?.() || !fs.existsSync(skill.dir)) {
+    return { ok: false, skillId, written: false, report: blocked };
+  }
+  const report = writesMarkdown ? policyReports[0] : undefined;
+  // No asynchronous yield between the final gate and these exact writes.
+  if (writesMarkdown && !_writeSkillFileAt(skill.dir, 'SKILL.md', next)) {
+    return { ok: false, skillId, written: false, report, reason: 'invalid_path' };
+  }
+  if (_hasSkillSidecarPatch(sidecarPatch) || (wrote && currentSidecar._import)) {
+    writeJsonSync(skillMetaFile(skill.dir), proposedSidecar);
     _invalidateSkillListCache();
     invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
   }
+  if (report) void persistQualityReport({ uid, kind: 'skill', id: skillId, report });
 
   let resolvedId = skillId;
   if (skill.source === 'custom') {
-    const newId = await _renameSkillByFrontmatterIfNeeded(skillId);
+    const newId = await _renameSkillByFrontmatterIfNeeded(skillId, opts.isCancelled);
     if (newId && newId !== skillId) resolvedId = newId;
-    if (wrote) clearSkillImportDraftMarkerSync(resolvedId);
   }
   const post = await getSkillForEdit(resolvedId);
   log.info(`skill=${skillId}${resolvedId !== skillId ? ` -> ${resolvedId}` : ''} metadata updated`);
@@ -3005,7 +3049,7 @@ export interface SkillContainerResult {
  *  `streamSendToSkillChat`'s file-by-file outcome). */
 export async function applySkillContainerFromCommander(
   container: SkillContainerExtracted,
-  opts: { replaceSidecar?: boolean } = {},
+  opts: { replaceSidecar?: boolean; isCancelled?: () => boolean } = {},
 ): Promise<SkillContainerResult> {
   const hasMetadata = _hasSkillMetadataUpdate(container.metadata);
   if (!container.files.length && !hasMetadata) {
@@ -3025,13 +3069,15 @@ export async function applySkillContainerFromCommander(
   if (container.skillId) {
     return _applySkillContainerEdit(container.skillId, container.files, container.metadata, opts);
   }
-  return _applySkillContainerCreate(container.files, container.metadata);
+  return _applySkillContainerCreate(container.files, container.metadata, opts);
 }
 
 async function _applySkillContainerCreate(
   files: SkillFileBlock[],
   metadata?: SkillMetadataUpdate,
+  opts: { isCancelled?: () => boolean } = {},
 ): Promise<SkillContainerResult> {
+  files = files.map(f => ({ ...f, path: normalizeSkillWritePath(f.path) || f.path }));
   files = files.map((f) => (
     f.path.toUpperCase() === 'SKILL.MD'
       ? {
@@ -3064,10 +3110,31 @@ async function _applySkillContainerCreate(
   // boilerplate SKILL.md remains and `listSkills` still shows the
   // half-created skill. Pre-validation moves the EXTREME gate to a single
   // decision point: any EXTREME → abort the whole create, no dir touched.
+  const uid = getActiveUserId();
+  const metadataSidecar = metadata ? _skillSidecarPatchFromMetadataUpdate(metadata) : {};
+  const fileSidecar = _skillSidecarPatchFromFrontmatter(meta);
+  const seedCategory = String(metadataSidecar.category || fileSidecar.category || '');
+  let proposedSidecar = mergeSkillOrkasMeta({}, { category: seedCategory, status: 'approved' });
+  for (const file of files) {
+    if (file.path !== '_meta.json') continue;
+    try {
+      const parsed = JSON.parse(file.content);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) proposedSidecar = parsed;
+    } catch { /* File validation below rejects malformed metadata. */ }
+  }
+  proposedSidecar = mergeSkillOrkasMeta(proposedSidecar, { ...fileSidecar, ...metadataSidecar });
+  const policyFiles = files.map(f => ({ relpath: f.path, content: f.path.toUpperCase() === 'SKILL.MD' ? normalizeSkillMdForWrite(f.content, name) : f.content }));
+  policyFiles.push({ relpath: '_meta.json', content: JSON.stringify(proposedSidecar, null, 2) });
+  const reports = await validateWithOperatorPolicy(uid, { kind: 'files', files: policyFiles });
+  if (uid !== getActiveUserId() || opts.isCancelled?.()) return { ok: false, error: t('skills.errors.validation_blocked') };
   const validationFailed: { path: string; report: QualityReport }[] = [];
   const validationWarnings: { path: string; report: QualityReport }[] = [];
-  for (const fb of files) {
-    const report = validateSkillFile({ relpath: fb.path, content: fb.content });
+  for (const [index, report] of reports.entries()) {
+    if (index === files.length) {
+      report.violations = report.violations.filter(v => v.source === 'operator-policy');
+      report.ok = !report.violations.some(v => v.level === 'EXTREME');
+    }
+    const fb = { path: policyFiles[index].relpath };
     if (!report.ok) {
       validationFailed.push({ path: fb.path, report });
     } else if (report.violations.length > 0) {
@@ -3090,9 +3157,6 @@ async function _applySkillContainerCreate(
   // All files passed EXTREME — proceed with the actual create.
   const desc = migrateDescriptionPair(meta as any);
   const seedDescription = desc.description_zh || desc.description_en || '';
-  const metadataSidecar = metadata ? _skillSidecarPatchFromMetadataUpdate(metadata) : {};
-  const fileSidecar = _skillSidecarPatchFromFrontmatter(meta);
-  const seedCategory = String(metadataSidecar.category || fileSidecar.category || '');
   const created = _createCustomSkillSync(name, seedDescription, seedCategory);
   if (!created) return { ok: false, error: t('skills.errors.create_failed') };
 
@@ -3100,9 +3164,9 @@ async function _applySkillContainerCreate(
   const rejected: string[] = [];
   for (const fb of files) {
     // After pre-validation passed, the only remaining reason to reject is
-    // a path-escape attempt (handled inside `writeCustomSkillFileChecked`).
-    const res = writeCustomSkillFileChecked(name, fb.path, fb.content);
-    if (res.ok) {
+    // a path-escape attempt (handled inside `_writeSkillFileAt`).
+    const content = fb.path.toUpperCase() === 'SKILL.MD' ? normalizeSkillMdForWrite(fb.content, name) : fb.content;
+    if (_writeSkillFileAt(customSkillDir(name), fb.path, content)) {
       written.push(fb.path);
     } else {
       rejected.push(fb.path);
@@ -3118,9 +3182,10 @@ async function _applySkillContainerCreate(
     try { fs.utimesSync(path.join(customSkillDir(name), w), stampNow, stampNow); }
     catch { /* best effort */ }
   }
-  if (_hasSkillSidecarPatch(metadataSidecar)) {
-    writeSkillOrkasMetaSync(customSkillDir(name), metadataSidecar);
-  }
+  writeJsonSync(skillMetaFile(customSkillDir(name)), proposedSidecar);
+  const violations = reports.flatMap(report => report.violations);
+  void persistQualityReport({ uid, kind: 'skill', id: name,
+    report: { ...reports[0], violations, ok: !violations.some(v => v.level === 'EXTREME') } });
   if (written.length) log.info(`commander created skill=${name} files=${written.length}`);
   return {
     ok: true,
@@ -3137,7 +3202,7 @@ async function _applySkillContainerEdit(
   skillId: string,
   files: SkillFileBlock[],
   metadata?: SkillMetadataUpdate,
-  opts: { replaceSidecar?: boolean } = {},
+  opts: { replaceSidecar?: boolean; isCancelled?: () => boolean } = {},
 ): Promise<SkillContainerResult> {
   const hasMetadata = _hasSkillMetadataUpdate(metadata);
   if (!files.length && !hasMetadata) {
@@ -3148,7 +3213,7 @@ async function _applySkillContainerEdit(
     const hasSkillMd = files.some((f) => f.path.toUpperCase() === 'SKILL.MD');
     if (hasSkillMd) {
       log.info(`commander target skill=${skillId} missing; treating SKILL.md payload as create`);
-      return _applySkillContainerCreate(files);
+      return _applySkillContainerCreate(files, undefined, opts);
     }
     return { ok: false, error: t('skills.errors.skill_not_found', { id: skillId }) };
   }
@@ -3167,7 +3232,7 @@ async function _applySkillContainerEdit(
   const validationWarnings: { path: string; report: QualityReport }[] = [];
   let touchedSkillMd = false;
   for (const fb of files) {
-    const res = await writeSkillFileForEditChecked(skillId, fb.path, fb.content);
+    const res = await writeSkillFileForEditChecked(skillId, fb.path, fb.content, opts.isCancelled);
     if (res.ok) {
       written.push(fb.path);
       if (fb.path.toUpperCase() === 'SKILL.MD') touchedSkillMd = true;
@@ -3194,7 +3259,7 @@ async function _applySkillContainerEdit(
   // same hook as the per-skill edit chat (`streamSendToSkillChat`).
   let resolvedId = skillId;
   if (touchedSkillMd) {
-    const newId = await _renameSkillByFrontmatterIfNeeded(skillId);
+    const newId = await _renameSkillByFrontmatterIfNeeded(skillId, opts.isCancelled);
     if (newId && newId !== skillId) resolvedId = newId;
   }
 
@@ -3605,7 +3670,7 @@ export async function* streamSendToSkillChat(
         let updatedMetadata = false;
         let usedImportDraftAsSkill = false;
         for (const fb of fileBlocks) {
-          if (await writeSkillFileForEdit(skillId, fb.path, fb.content)) {
+          if (await writeSkillFileForEdit(skillId, fb.path, fb.content, () => !!opts.abortSignal?.aborted || getActiveUserId() !== userId)) {
             written.push(fb.path);
             synthesizedProgress.push(t('process.skill.file_written', { path: fb.path }));
             if (fb.path.toUpperCase() === 'SKILL.MD') {
@@ -3628,8 +3693,8 @@ export async function* streamSendToSkillChat(
                 && container.files.some((f) => f.path.toUpperCase() === 'SKILL.MD');
               const targetBefore = currentSkillId;
               const res = useCurrentDraft
-                ? await _applySkillContainerEdit(currentSkillId, container.files, container.metadata)
-                : await applySkillContainerFromCommander(container);
+                ? await _applySkillContainerEdit(currentSkillId, container.files, container.metadata, { isCancelled: () => !!opts.abortSignal?.aborted || getActiveUserId() !== userId })
+                : await applySkillContainerFromCommander(container, { isCancelled: () => !!opts.abortSignal?.aborted || getActiveUserId() !== userId });
               if (res.ok && res.skillId) {
                 if (useCurrentDraft) {
                   usedImportDraftAsSkill = true;
@@ -3675,7 +3740,7 @@ export async function* streamSendToSkillChat(
                 container.skillId,
                 [],
                 metadataOnly,
-                { replaceSidecar: true },
+                { replaceSidecar: true, isCancelled: () => !!opts.abortSignal?.aborted || getActiveUserId() !== userId },
               );
               if (res.ok && res.skillId) {
                 createdSkills.push({
@@ -3704,7 +3769,7 @@ export async function* streamSendToSkillChat(
         // also need to rename src and data trees plus migrate user chat dirs.
         if (skill.source === 'custom') {
           for (const sid of skillsTouchingMd) {
-            const newId = await _renameSkillByFrontmatterIfNeeded(sid);
+            const newId = await _renameSkillByFrontmatterIfNeeded(sid, () => !!opts.abortSignal?.aborted || getActiveUserId() !== userId);
             if (newId && newId !== sid) {
               if (sid === currentSkillId) currentSkillId = newId;
               const evt = {
@@ -3720,7 +3785,7 @@ export async function* streamSendToSkillChat(
           const metaRes = await applySkillMetadataForEdit(
             currentSkillId,
             metadataUpdate,
-            { replaceSidecar: directImportMetadataOnly },
+            { replaceSidecar: directImportMetadataOnly, isCancelled: () => !!opts.abortSignal?.aborted || getActiveUserId() !== userId },
           );
           if (metaRes.ok) {
             updatedMetadata = true;

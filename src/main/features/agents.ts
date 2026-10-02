@@ -15,6 +15,7 @@
  * field.
  */
 
+import { validateWithOperatorPolicy } from './operator-policy';
 import { addEntryWithMaintenance, replaceEntryWithMaintenance } from './memory-maintenance';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
@@ -82,7 +83,7 @@ import {
 } from '../model/core-agent/skill-registry';
 import { readDisabledSets, setAgentEnabled } from './component_enabled';
 import { renameAgentInMembers } from './group_chat/state';
-import { validateAgentSpec, ValidationReport as QualityReport } from '../quality';
+import { ValidationReport as QualityReport } from '../quality';
 import { persistReport as persistQualityReport } from '../quality/report';
 import {
   DEFAULT_MARKETPLACE_CATEGORY_CODE,
@@ -1844,8 +1845,6 @@ export async function createCustomAgent(
   do { agentId = genAgentId(); }
   while (fs.existsSync(path.join(userMarketplaceAgentDir(userId, agentId), 'agent.json'))
       || fs.existsSync(agentDefinitionFile(userId, agentId)));
-  // mkdir <aid>/ first so writeJson on agent.json has a parent.
-  fs.mkdirSync(agentDir(userId, agentId), { recursive: true });
   const desc = resolveBilingualDescription(description, description_zh, description_en);
   const normalizedWorkflow = await _normalizeWorkflowSkillIds(String(workflow || ''), userId);
   const data: AgentRaw = {
@@ -1905,18 +1904,15 @@ export async function createCustomAgent(
   // flags in workflow text / etc.) block the write; MEDIUM warnings pass
   // through but are persisted for UI surfacing. Persist runs in both branches
   // so the latest report on disk always matches the most recent intent.
-  const report = validateAgentSpec({ agentJson: data });
+  const [report] = await validateWithOperatorPolicy(userId, { kind: 'agent', args: { agentJson: data } });
   void persistQualityReport({
     uid: userId, kind: 'agent', id: agentId, report,
   });
   if (!report.ok) {
-    // Roll back the freshly-mkdir'd directory so a rejected create doesn't
-    // leave behind an empty <aid>/ that would later confuse `listAgents`.
-    try { fs.rmSync(agentDir(userId, agentId), { recursive: true, force: true }); }
-    catch { /* tolerate cleanup failure */ }
     throw new Error(_validationErrorMessage(report));
   }
 
+  fs.mkdirSync(agentDir(userId, agentId), { recursive: true });
   await writeJson(agentDefinitionFile(userId, agentId), data);
   _invalidateAgentListCache({ userId });
   log.info('custom agent created', { agent_id: maskId(agentId) });
@@ -2127,7 +2123,7 @@ export async function updateCustomAgent(
   // Quality gate (same policy as createCustomAgent): EXTREME blocks the
   // write so the on-disk spec doesn't regress; MEDIUM persists but writes
   // through.
-  const report = validateAgentSpec({ agentJson: data });
+  const [report] = await validateWithOperatorPolicy(userId, { kind: 'agent', args: { agentJson: data } });
   void persistQualityReport({
     uid: userId, kind: 'agent', id: agentId, report,
   });

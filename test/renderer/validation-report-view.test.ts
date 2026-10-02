@@ -165,6 +165,20 @@ describe('quality validation report renderer', () => {
     expect(ctx._documentListeners.has('keydown')).toBe(false);
   });
 
+  it('shows operator guidance verbatim and removes the force action for policy failures', async () => {
+    const ctx = loadValidationReportView();
+    const result = ctx.showValidationReport({ report: { ok: false, violations: [{
+      rule: 'no_eval_with_external_input', source: 'operator-policy', level: 'EXTREME',
+      field: 'run.sh', snippet: '', suggested_fix: 'Operator <private> guidance',
+    }] }, forceLabel: 'Install anyway' });
+    const overlay = ctx._overlays[0] as FakeOverlay;
+    expect(overlay.innerHTML).toContain('Operator &lt;private&gt; guidance');
+    expect(overlay.innerHTML).not.toContain('Use a fixed command.');
+    expect(overlay.innerHTML).not.toContain('Install anyway');
+    overlay.okButton.click();
+    await expect(result).resolves.toBe('close');
+  });
+
   it('lets keyboard activation of the focused override button choose force', async () => {
     const ctx = loadValidationReportView();
     const result = ctx.showValidationReport({

@@ -20,6 +20,7 @@
  */
 
 import * as fs from 'node:fs';
+import { isMainThread } from 'node:worker_threads';
 import * as path from 'node:path';
 
 import { Violation, ValidationReport, ScanKind, RuleDef, VALIDATOR_VERSION } from './types';
@@ -44,6 +45,8 @@ import {
 // Re-export the types so callers only need one import path.
 export type { Violation, ValidationReport, Level } from './types';
 export { VALIDATOR_VERSION } from './types';
+export { runOperatorPolicy } from './operator-runner';
+export type { PolicyRequest, PolicyResult } from './operator-runner';
 export { parseOperatorPolicy } from './rules/operator-policy';
 export type { OperatorPolicyParseResult } from './rules/operator-policy';
 
@@ -144,6 +147,7 @@ export function validateSkillDir(
       violations.push(...validateSkillMeta(meta));
     }
   } catch (err) {
+    if (options.operatorRules !== undefined) throw err;
     violations.push(parseFailureViolation({
       kind: 'frontmatter',
       message: (err as Error).message,
@@ -162,7 +166,8 @@ export function validateSkillDir(
       const scanArgs: RuleScanArgs = { content, kind, field: rel };
       if (kind === 'script') violations.push(...scanRedFlags(scanArgs));
       violations.push(..._policyScan(options.operatorRules, scanArgs));
-    } catch {
+    } catch (err) {
+      if (options.operatorRules !== undefined) throw err;
       // unreadable file (binary / permission) — skip; no violation surfaced
     }
   }
@@ -256,6 +261,7 @@ function _policyScan(
   args: RuleScanArgs,
 ): Violation[] {
   if (!rules?.length) return [];
+  if (isMainThread) return [{ level: 'EXTREME', rule: 'operator:incomplete', source: 'operator-policy', field: '', snippet: '', suggested_fix: 'Custom policy requires asynchronous worker validation.' }];
   return scanRuleSet(rules, args, 'operator-policy');
 }
 

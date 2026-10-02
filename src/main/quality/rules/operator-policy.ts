@@ -1,12 +1,12 @@
 /**
  * Operator policy rules — additive red flags supplied by an operator at
  * runtime. RED_FLAGS stays the security floor: rules here can only ADD
- * findings, never suppress or downgrade a built-in one, and a colliding id is
- * rejected. Findings carry `source: 'operator-policy'`. Pure: no filesystem.
+ * findings, never suppress or downgrade a built-in one. Operator ids have their own
+ * namespace. Findings carry `source: 'operator-policy'`. Pure: no filesystem.
  */
 
 import { Level, RuleDef, ScanKind } from '../types';
-import { RED_FLAGS } from './red-flags';
+
 const KINDS: ReadonlyArray<ScanKind> = ['skill_md', 'skill_meta', 'script', 'agent_json'];
 const DEFAULT_APPLIES_TO: ScanKind[] = ['skill_md', 'script', 'agent_json'];
 const MAX_RULES = 50;
@@ -16,13 +16,13 @@ const ALLOWED_FLAGS = /^[imsu]*$/;
 
 export interface OperatorPolicyParseResult {
   rules: RuleDef[];
-  /** Reasons individual rules were skipped (never thrown). */
+  /** Configuration errors. Any error rejects the entire policy. */
   errors: string[];
 }
 
-/** Parse an operator rule file (`{ "rules": [ ... ] }`). Invalid rules are
- *  skipped and reported in `errors`; the rest still load. */
+/** Parse an operator rule file (`{ "rules": [ ... ] }`). Invalid configuration is rejected atomically; no partial rule set loads. */
 export function parseOperatorPolicy(content: string): OperatorPolicyParseResult {
+  if (content.length > 64 * 1024) return { rules: [], errors: ['operator policy exceeds 64 KiB'] };
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
@@ -32,15 +32,19 @@ export function parseOperatorPolicy(content: string): OperatorPolicyParseResult 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { rules: [], errors: ['operator policy must be a JSON object like { "rules": [...] }'] };
   }
-  const raw = (parsed as { rules?: unknown }).rules;
+  const config = parsed as Record<string, unknown>;
+  if (config.version !== 1) return { rules: [], errors: ['operator policy requires version 1'] };
+  if (Object.keys(config).some((key) => !['version', 'rules'].includes(key))) {
+    return { rules: [], errors: ['unknown operator policy field'] };
+  }
+  const raw = config.rules;
   if (!Array.isArray(raw)) {
     return { rules: [], errors: ['operator policy must contain a "rules" array'] };
   }
 
   const errors: string[] = [];
-  if (raw.length > MAX_RULES) errors.push(`operator policy has ${raw.length} rules; only the first ${MAX_RULES} load`);
+  if (raw.length > MAX_RULES) return { rules: [], errors: [`operator policy allows at most ${MAX_RULES} rules`] };
 
-  const builtinIds = new Set(RED_FLAGS.map((r) => r.id));
   const seen = new Set<string>();
   const rules: RuleDef[] = [];
 
@@ -50,9 +54,15 @@ export function parseOperatorPolicy(content: string): OperatorPolicyParseResult 
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) { fail('must be an object'); continue; }
     const r = entry as Record<string, unknown>;
 
+    if (Object.keys(r).some((key) => !['id', 'level', 'pattern', 'flags', 'message', 'appliesTo'].includes(key))) {
+      fail('unknown rule field'); continue;
+    }
+    if (r.flags !== undefined && typeof r.flags !== 'string') { fail('"flags" must be a string'); continue; }
+    if (r.message !== undefined && (typeof r.message !== 'string' || r.message.length > 300)) {
+      fail('"message" must be a string of at most 300 chars'); continue;
+    }
     const id = typeof r.id === 'string' ? r.id.trim() : '';
     if (!RULE_ID.test(id)) { fail(`"id" must match ${RULE_ID}`); continue; }
-    if (builtinIds.has(id)) { fail(`id "${id}" collides with a built-in rule; operator rules may not shadow the security floor`); continue; }
     if (seen.has(id)) { fail(`duplicate id "${id}"`); continue; }
 
     const level = r.level;
@@ -76,7 +86,7 @@ export function parseOperatorPolicy(content: string): OperatorPolicyParseResult 
 
     seen.add(id);
     rules.push({
-      id,
+      id: `operator:${id}`,
       level: level as Level,
       appliesTo,
       pattern,
@@ -85,7 +95,7 @@ export function parseOperatorPolicy(content: string): OperatorPolicyParseResult 
     });
   }
 
-  return { rules, errors };
+  return { rules: errors.length ? [] : rules, errors };
 }
 
 function _appliesTo(raw: unknown, where: string, errors: string[]): ScanKind[] | null {

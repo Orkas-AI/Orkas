@@ -2,124 +2,100 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-
-import { validateSkillFile, validateSkillDir, parseOperatorPolicy } from '../../../src/main/quality';
-
-type Rules = ReturnType<typeof parseOperatorPolicy>['rules'];
-
-const POLICY = JSON.stringify({ rules: [
-  { id: 'no_internal_bucket', level: 'EXTREME', pattern: 's3://acme-internal',
-    message: 'Internal buckets are off limits for skills.' },
-  { id: 'host_allowlist', level: 'MEDIUM', pattern: 'curl\\b[^\\n]*https?://(?!api\\.acme\\.example)',
-    appliesTo: ['script'] },
-] });
-
-const md = (b: string) => ['---', 'name: internal-report', 'description: Build the weekly report', '---', b].join('\n');
-
-function report(content: string, operatorRules?: Rules) {
-  const r = validateSkillFile({ relpath: 'SKILL.md', content, operatorRules });
-  return { ok: r.ok, violations: r.violations, validator_version: r.validator_version };
+import { parseOperatorPolicy, runOperatorPolicy, validateSkillFile } from '../../../src/main/quality';
+const rule = { id: 'internal_bucket', level: 'EXTREME', pattern: 's3://acme-internal', message: 'Internal buckets are off limits.' };
+const policy = (rules: unknown[] = [rule]) => JSON.stringify({ version: 1, rules });
+const md = (body: string) => `---\nname: weekly-report\ndescription: Build the weekly report\n---\n${body}`;
+async function scan(content: string, rules: unknown[] = [rule], relpath = 'scripts/run.sh') {
+  const result = await runOperatorPolicy(policy(rules), { kind: 'files', files: [{ relpath, content }] });
+  expect(result).toHaveProperty('reports');
+  if (!('reports' in result)) throw new Error('scan failed');
+  return result.reports[0];
 }
-describe('quality › operator policy rules', () => {
-  it('parses a valid rule file and applies the documented defaults', () => {
-    const { rules, errors } = parseOperatorPolicy(POLICY);
-    expect(rules.map((r) => r.id)).toEqual(['no_internal_bucket', 'host_allowlist']);
-    expect(rules[0].appliesTo).toEqual(['skill_md', 'script', 'agent_json']);
-    expect(rules[1].appliesTo).toEqual(['script']);
+describe('operator policy', () => {
+  it('loads versioned policy with a separate rule namespace and defaults', () => {
+    const parsed = parseOperatorPolicy(policy());
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.rules[0]).toMatchObject({ id: 'operator:internal_bucket', appliesTo: ['skill_md', 'script', 'agent_json'] });
   });
-
-  it('leaves the report byte-identical when no operator rules are configured', () => {
-    const content = md('```bash\naws s3 cp s3://acme-internal/x .\n```\n');
-    expect(report(content).violations).toEqual([]); // nothing on the built-in floor fires here
-    for (const rules of [undefined, []]) expect(report(content, rules)).toEqual(report(content));
-  });
-
-  it('adds an operator finding tagged source=operator-policy', () => {
-    const { rules } = parseOperatorPolicy(POLICY);
-    const r = validateSkillFile({
-      relpath: 'SKILL.md',
-      content: md('```bash\naws s3 cp s3://acme-internal/x .\n```\n'),
-      operatorRules: rules,
-    });
-    const hit = r.violations.find((v) => v.rule === 'no_internal_bucket');
-    expect(hit).toMatchObject({ level: 'EXTREME', source: 'operator-policy' });
-    expect(r.ok).toBe(false);
-  });
-
-  it('cannot suppress, downgrade, or rewrite a built-in finding', () => {
-    const { rules } = parseOperatorPolicy(JSON.stringify({ rules: [
-      { id: 'downgrade_attempt', level: 'LOW', pattern: 'security\\s+find-generic-password' }] }));
-    const content = md('```bash\nsecurity find-generic-password -s x -w\n```\n');
-    const before = report(content);
-    const after = report(content, rules);
-    expect(before.violations.find((v) => v.rule === 'no_credential_path_read')?.level).toBe('EXTREME');
-    // Operator rules only ever add: every built-in finding survives unchanged.
-    for (const v of before.violations) {
-      expect(after.violations.find((x) => x.rule === v.rule && x.field === v.field)).toEqual(v);
-    }
-    expect(after.ok).toBe(false);
-  });
-
-  it('rejects malformed rules and ids that would shadow the floor', () => {
-    expect(parseOperatorPolicy('{not json').errors[0]).toMatch(/not valid JSON/);
-    expect(parseOperatorPolicy('{}').errors[0]).toMatch(/"rules" array/);
-    const cases: Array<[unknown, RegExp]> = [
-      [{ id: 'no_credential_path_read', level: 'LOW', pattern: 'x' }, /collides with a built-in rule/],
-      [{ id: 'other_only', level: 'LOW', pattern: 'x', appliesTo: ['other'] }, /"appliesTo" must be a non-empty array/],
-    ];
-    for (const [rule, expected] of cases) {
-      const parsed = parseOperatorPolicy(JSON.stringify({ rules: [rule] }));
+  it('rejects the entire config for unsupported versions, typos, types, duplicates, regex syntax or excess rules', () => {
+    for (const config of [
+      { rules: [rule] }, { version: 2, rules: [rule] }, { version: 1, rules: [rule], typo: true },
+      ...[{ ...rule, flags: 5 }, { ...rule, message: false }, { ...rule, typo: 1 }, { ...rule, pattern: '(' },
+        { ...rule, flags: 'g' }, { ...rule, appliesTo: ['other'] }].map(bad => ({ version: 1, rules: [rule, bad] })),
+      { version: 1, rules: [rule, rule] }, { version: 1, rules: Array.from({ length: 51 }, (_, i) => ({ ...rule, id: `r${i}` })) },
+    ]) {
+      const parsed = parseOperatorPolicy(JSON.stringify(config));
+      expect(parsed.errors.length).toBeGreaterThan(0);
       expect(parsed.rules).toEqual([]);
-      expect(parsed.errors[0]).toMatch(expected);
     }
   });
-
-  it('honours skill_md rules on executable blocks and keeps script rules scoped to scripts', () => {
-    const content = md('```bash\necho acme-secret\n```\n');
-    const onlyMd = parseOperatorPolicy(JSON.stringify({ rules: [
-      { id: 'skill_md_only', level: 'MEDIUM', pattern: 'acme-secret', appliesTo: ['skill_md'] }] })).rules;
-    const onlyScript = parseOperatorPolicy(JSON.stringify({ rules: [
-      { id: 'script_only', level: 'MEDIUM', pattern: 'acme-secret', appliesTo: ['script'] }] })).rules;
-
-    expect(validateSkillFile({ relpath: 'SKILL.md', content, operatorRules: onlyMd }).violations)
-      .toEqual(expect.arrayContaining([expect.objectContaining({ rule: 'skill_md_only', source: 'operator-policy' })]));
-    expect(validateSkillFile({ relpath: 'SKILL.md', content, operatorRules: onlyScript }).violations)
-      .not.toEqual(expect.arrayContaining([expect.objectContaining({ rule: 'script_only' })]));
+  it('retains built-in findings verbatim and allows only additive policy findings', async () => {
+    const content = 'security find-generic-password -s x -w';
+    const before = validateSkillFile({ relpath: 'scripts/run.sh', content });
+    const after = await scan(content, [{ ...rule, id: 'no_credential_path_read', level: 'LOW', pattern: 'security' }]);
+    expect(after.ok).toBe(false);
+    for (const finding of before.violations) expect(after.violations).toContainEqual(finding);
+    expect(after.violations).toContainEqual(expect.objectContaining({ rule: 'operator:no_credential_path_read', source: 'operator-policy', level: 'LOW' }));
   });
-
-  it('applies skill_meta rules to file- and directory-level sidecar validation', () => {
-    const content = JSON.stringify({ category: 'acme-secret' });
-    const { rules } = parseOperatorPolicy(JSON.stringify({ rules: [
-      { id: 'meta_secret', level: 'MEDIUM', pattern: 'acme-secret', appliesTo: ['skill_meta'] }] }));
-
-    expect(validateSkillFile({ relpath: '_meta.json', content, operatorRules: rules }).violations)
-      .toEqual(expect.arrayContaining([expect.objectContaining({ rule: 'meta_secret', field: '_meta.json:1' })]));
-
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-op-meta-'));
-    fs.writeFileSync(path.join(dir, 'SKILL.md'), md('No executable content.'));
-    fs.writeFileSync(path.join(dir, '_meta.json'), content);
-    expect(validateSkillDir(dir, { operatorRules: rules }).violations)
-      .toEqual(expect.arrayContaining([expect.objectContaining({ rule: 'meta_secret', field: '_meta.json:1' })]));
+  it('routes only executable Markdown fences to skill_md, not prose or script-only rules', async () => {
+    const content = md('s3://acme-internal prose\n```bash\necho s3://acme-internal\n```');
+    expect((await scan(content, [rule], 'SKILL.md')).violations).toContainEqual(expect.objectContaining({ rule: 'operator:internal_bucket' }));
+    expect((await scan(content, [{ ...rule, appliesTo: ['script'] }], 'SKILL.md')).violations).toEqual([]);
+    expect((await scan(md('s3://acme-internal prose'), [rule], 'SKILL.md')).violations).toEqual([]);
   });
-
-  it('scans on-disk scripts, honours appliesTo, and never flips the floor verdict', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-op-'));
-    fs.writeFileSync(path.join(dir, 'SKILL.md'), md('See scripts/report.sh.'));
-    fs.mkdirSync(path.join(dir, 'scripts'));
-    fs.writeFileSync(path.join(dir, 'scripts', 'report.sh'), 'curl -fsS https://evil.example/x\n');
-
-    const base = validateSkillDir(dir);
-    const { rules } = parseOperatorPolicy(POLICY);
-    const withPolicy = validateSkillDir(dir, { operatorRules: rules });
-
-    expect(withPolicy.violations.find((v) => v.rule === 'host_allowlist')).toMatchObject({
-      level: 'MEDIUM', source: 'operator-policy', field: 'scripts/report.sh:1',
-    });
-    // MEDIUM is advisory: it must not flip the built-in verdict.
-    // appliesTo=['script'] keeps the rule out of a bare SKILL.md body.
-    const onlyMd = validateSkillFile({
-      relpath: 'SKILL.md', content: md('curl https://evil.example'), operatorRules: rules,
-    });
-    expect(onlyMd.violations).toEqual([]);
+  it('checks sidecar and Agent JSON using their own target kinds', async () => {
+    expect((await scan('{"category":"s3://acme-internal"}', [{ ...rule, appliesTo: ['skill_meta'] }], '_meta.json')).violations)
+      .toContainEqual(expect.objectContaining({ rule: 'operator:internal_bucket', source: 'operator-policy' }));
+    const result = await runOperatorPolicy(policy(), { kind: 'agent', args: { agentJson: { name: 'Writer', workflow: 's3://acme-internal' } } });
+    expect(result).toMatchObject({ reports: [{ ok: false, violations: expect.arrayContaining([expect.objectContaining({ rule: 'operator:internal_bucket' })]) }] });
+  });
+  it('scans directory scripts and sidecars and rejects unreadable or linked trees', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-dir-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'SKILL.md'), md('Body'));
+      fs.writeFileSync(path.join(dir, '_meta.json'), '{"category":"s3://acme-internal"}');
+      fs.mkdirSync(path.join(dir, 'scripts'));
+      fs.writeFileSync(path.join(dir, 'scripts/run.sh'), 'echo s3://acme-internal');
+      const result = await runOperatorPolicy(policy([{ ...rule, appliesTo: ['script', 'skill_meta'] }]), { kind: 'directory', dir });
+      expect(result).toMatchObject({ reports: [{ violations: expect.arrayContaining([
+        expect.objectContaining({ rule: 'operator:internal_bucket', field: '_meta.json:1' }),
+        expect.objectContaining({ rule: 'operator:internal_bucket', field: 'scripts/run.sh:1' }),
+      ]) }] });
+      fs.unlinkSync(path.join(dir, 'SKILL.md'));
+      expect(await runOperatorPolicy(policy(), { kind: 'directory', dir })).toEqual({ error: 'scan' });
+      fs.writeFileSync(path.join(dir, 'SKILL.md'), md('Body'));
+      fs.symlinkSync(path.join(dir, 'SKILL.md'), path.join(dir, 'link'));
+      expect(await runOperatorPolicy(policy(), { kind: 'directory', dir })).toEqual({ error: 'scan' });
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('terminates catastrophic regex without blocking the event loop and recovers on the next scan', async () => {
+    let ticks = 0;
+    const timer = setInterval(() => ticks++, 10);
+    const start = performance.now();
+    try {
+      const result = await runOperatorPolicy(policy([{ ...rule, pattern: '^(a+)+$' }]), { kind: 'files', files: [{ relpath: 'run.sh', content: 'a'.repeat(31) + '!' }] });
+      expect(result).toEqual({ error: 'timeout' });
+      expect(ticks).toBeGreaterThan(10);
+      expect(performance.now() - start).toBeLessThan(4000);
+      expect((await scan('echo harmless')).ok).toBe(true);
+    } finally { clearInterval(timer); }
+  }, 7000);
+  it('bounds concurrent work and input without spawning unbounded workers', async () => {
+    const slow = () => runOperatorPolicy(policy([{ ...rule, pattern: '^(a+)+$' }]), { kind: 'files', files: [{ relpath: 'run.sh', content: 'a'.repeat(31) + '!' }] });
+    const a = slow(); const b = slow();
+    expect(await slow()).toEqual({ error: 'busy' });
+    await Promise.all([a, b]);
+    expect(await runOperatorPolicy(policy(), { kind: 'files', files: [{ relpath: 'run.sh', content: 'x'.repeat(2 * 1024 * 1024) }] })).toEqual({ error: 'size' });
+  }, 7000);
+  it('bounds finding volume instead of returning an oversized partial report', async () => {
+    const rules = Array.from({ length: 50 }, (_, index) => ({ ...rule, id: `match${index}`, pattern: 'hit' }));
+    const result = await runOperatorPolicy(policy(rules), { kind: 'files', files: Array.from({ length: 12 }, (_, index) => ({ relpath: `run${index}.sh`, content: 'echo hit' })) });
+    expect(result).toEqual({ error: 'size' });
+  });
+  it('fails closed when a synchronous caller mistakenly supplies operator rules', () => {
+    const result = validateSkillFile({ relpath: 'run.sh', content: 'a'.repeat(31) + '!', operatorRules: parseOperatorPolicy(policy([{ ...rule, pattern: '^(a+)+$' }])).rules });
+    expect(result.ok).toBe(false);
+    expect(result.violations).toContainEqual(expect.objectContaining({ rule: 'operator:incomplete' }));
   });
 });

@@ -3288,3 +3288,22 @@ describe('agents › list cache invalidation', () => {
 // (The legacy marketplace-sentinel sync tests are gone. Marketplace installs now live at
 // `<uid>/local/marketplace/agents/<id>/` and are reconciled from
 // the cloud-synced `installs.json` manifest — see features/marketplace_*.ts.)
+
+describe('agents › operator policy', () => {
+  it('preserves rejected updates and allocates no rejected Agent, including colliding built-in names', async () => {
+    const a = await loadAgents();
+    const agent = await a.createCustomAgent({ name: 'Writer', description: 'Test' });
+    const file = path.join(customAgentsDir(), agent!.agent_id, 'agent.json');
+    const before = fs.readFileSync(file, 'utf8');
+    const ids = fs.readdirSync(customAgentsDir());
+    const config = path.join(tmpDir, TEST_UID, 'local', 'config');
+    fs.writeFileSync(path.join(config, 'operator-policy-enabled.json'), '{"enabled":true}');
+    fs.writeFileSync(path.join(config, 'operator-policy.json'), JSON.stringify({ version: 1, rules: [
+      { id: 'agent_name_missing', pattern: 'private-resource', level: 'EXTREME', message: 'Do not reference private-resource.' },
+    ] }));
+    await expect(a.updateCustomAgent(agent!.agent_id, { workflow: 'private-resource' })).rejects.toThrow('Do not reference private-resource.');
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    await expect(a.createCustomAgent({ name: 'Blocked', workflow: 'private-resource' })).rejects.toThrow('Do not reference private-resource.');
+    expect(fs.readdirSync(customAgentsDir())).toEqual(ids);
+  });
+});

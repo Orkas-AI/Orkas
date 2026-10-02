@@ -43,19 +43,46 @@ quality/
 
 ## Operator policy rules
 
-Teams can add their own red flags without forking: write a JSON rule file,
-parse it with `parseOperatorPolicy` (exported from `index.ts`; reading the
-file is the caller's job — `quality/` stays stateless), then pass the parsed
-rules as `operatorRules` to `validateSkillFile` / `validateSkillDir` /
-`validateAgentSpec` / `validateAgentDir`.
+Custom validation is disabled by default. In Settings → General, select **Rule
+file** to reveal the current account's device-local `operator-policy.json`, edit
+it, then enable custom validation. **Reload** checks the file again. The file is
+not synchronized. It has this format:
 
-The built-in rules stay the security floor: operator rules are additive only
-— they never suppress, downgrade or rewrite a built-in finding, and a
-colliding id is rejected. Their findings carry `source: 'operator-policy'`.
-`appliesTo` scopes operator rules by artifact: `skill_md` means executable
-fenced blocks in `SKILL.md`, `script` means standalone script files,
-`skill_meta` means `_meta.json`, and `agent_json` means an Agent spec. Still
-not a sandbox. Field reference lives in `rules/operator-policy.ts`.
+```json
+{"version":1,"rules":[{"id":"internal_bucket","level":"EXTREME","pattern":"s3://acme-internal","message":"Internal buckets are off limits."}]}
+```
+
+Up to 50 rules are accepted. Each pattern is at most 500 characters; optional
+flags are a unique subset of `imsu`, and messages are at most 300 characters.
+Unknown fields, wrong types, duplicate ids, unsupported versions and invalid
+regexes reject the entire file. Rule ids use `[a-z0-9][a-z0-9_.-]{0,63}` and
+findings use the separate `operator:` namespace with `source: 'operator-policy'`.
+Operator messages are displayed as text, never as a built-in translated hint.
+
+The `features/operator-policy.ts` coordinator owns configuration reads; the
+stateless `runOperatorPolicy` API executes compilation and validation in a
+terminable Worker. Direct synchronous validator calls with operator rules fail
+closed on the main thread. No custom regex executes there. Scans have a two-second
+wall deadline, two concurrent slots (no waiting queue), a 64 KiB policy limit,
+a 2 MiB input limit, at most 512 findings, and 512 directory entries with depth 32. Linked, oversized
+or unreadable directories fail closed. Limits apply only when enabled.
+
+`appliesTo` defaults to `skill_md`, `script`, and `agent_json`. `skill_md` scans
+executable fenced blocks, not prose; `script` scans recognized script extensions;
+`skill_meta` scans `_meta.json`; `agent_json` scans serialized Agent JSON. This is
+static content validation, not runtime access enforcement.
+
+Create, edit, directory/ZIP import and Marketplace installation use the shared
+coordinator. Imports validate staging before publication; Agent private Skills
+are checked with their owner. EXTREME operator findings, configuration errors,
+timeouts and overload cannot be bypassed with force. Repair the file or disable
+custom validation to recover. Built-in checks remain additive and unchanged
+when disabled; existing built-in-only force behavior remains compatible.
+
+This capability is host-only: configuration is a local desktop preference, not
+a Web application SDK or model-visible tool. It does not retroactively scan
+already installed content, global/external-package Skills, synchronization or
+runtime-generated learned Skills.
 
 ## Levels
 
