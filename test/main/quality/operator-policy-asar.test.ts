@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
+import { finished } from 'node:stream/promises';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -28,7 +29,10 @@ describe('operator policy packaged runtime', () => {
         copy(`node_modules/${dep}`);
       }
       const unpack = build.asarUnpack.map((pattern: string) => path.join(stage, pattern).replaceAll('\\', '/'));
-      await createPackageWithOptions(stage, archive, { unpack: `{${unpack.join(',')}}` });
+      // asar 3 returns its output stream before the archive handle closes.
+      // Windows must not read or remove the fixture until that close completes.
+      const output = await createPackageWithOptions(stage, archive, { unpack: `{${unpack.join(',')}}` });
+      await finished(output);
       expect(statFile(archive, 'src/main/quality/operator-worker.js').unpacked).not.toBe(true);
       const launcher = path.join(root, 'launch.cjs');
       fs.writeFileSync(launcher, `
@@ -63,6 +67,9 @@ describe('operator policy packaged runtime', () => {
       const result = spawnSync(process.execPath, [launcher], { cwd: root, env, encoding: 'utf8', timeout: 20000 });
       expect(result.status, result.stderr || result.stdout || String(result.error)).toBe(0);
       expect(result.stdout).toContain('POLICY_ASAR_OK');
-    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    } finally {
+      // Electron's fs wrapper treats ASARs as directories; delete the real archive.
+      require('original-fs').rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
   }, 30000);
 });
