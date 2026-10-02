@@ -62,3 +62,9 @@ jobs:
           test/main/util/ensure-deps.test.ts
           test/main/util/ensure-dev-dependencies.test.ts
           test/main/util/linux-source-dependencies.test.ts
+      - name: Verify operator policy Worker, ASAR runtime and write boundaries
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/quality/operator-policy.test.ts
+          test/main/quality/operator-policy-asar.test.ts
+          test/main/features/skills.test.ts
