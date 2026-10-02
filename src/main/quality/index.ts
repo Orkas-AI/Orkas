@@ -22,11 +22,13 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { Violation, ValidationReport, ScanKind, VALIDATOR_VERSION } from './types';
+import { Violation, ValidationReport, ScanKind, RuleDef, VALIDATOR_VERSION } from './types';
 import {
   scanRedFlags,
+  scanRuleSet,
   extractExecutableBlocks,
 } from './rules/red-flags';
+import type { RuleScanArgs } from './rules/red-flags';
 import {
   validateSkillFrontmatter,
   validateSkillMeta,
@@ -42,6 +44,8 @@ import {
 // Re-export the types so callers only need one import path.
 export type { Violation, ValidationReport, Level } from './types';
 export { VALIDATOR_VERSION } from './types';
+export { parseOperatorPolicy } from './rules/operator-policy';
+export type { OperatorPolicyParseResult } from './rules/operator-policy';
 
 export type SkillValidationSource =
   | 'custom'
@@ -55,6 +59,10 @@ export interface SkillValidationOptions {
    * required. System freshness belongs to its manifest; private-Skill
    * freshness and category belong to the parent Agent. */
   source?: SkillValidationSource;
+  /** Extra operator-supplied rules (see `parseOperatorPolicy`). Purely
+   *  additive: they add `source: 'operator-policy'` findings and can never
+   *  suppress or downgrade a built-in one. */
+  operatorRules?: ReadonlyArray<RuleDef>;
 }
 
 // ── File-level skill validation ─────────────────────────────────────────
@@ -66,20 +74,28 @@ export interface SkillValidationOptions {
 export function validateSkillFile(args: {
   relpath: string;
   content: string;
+  operatorRules?: ReadonlyArray<RuleDef>;
 }): ValidationReport {
   const violations: Violation[] = [];
   const kind = detectSkillFileKind(args.relpath);
 
   if (kind === 'skill_md') {
-    violations.push(..._scanSkillMd(args.content, args.relpath));
+    violations.push(..._scanSkillMd(args.content, args.relpath, {}, true, false, args.operatorRules));
   } else if (kind === 'skill_meta') {
     violations.push(..._scanSkillMeta(args.content));
+    violations.push(..._policyScan(args.operatorRules, {
+      content: args.content,
+      kind: 'skill_meta',
+      field: args.relpath,
+    }));
   } else if (kind === 'script') {
-    violations.push(...scanRedFlags({
+    const scanArgs: RuleScanArgs = {
       content: args.content,
       kind: 'script',
       field: args.relpath,
-    }));
+    };
+    violations.push(...scanRedFlags(scanArgs));
+    violations.push(..._policyScan(args.operatorRules, scanArgs));
   }
   // kind === 'other' (README / assets) → no scan
 
@@ -122,6 +138,7 @@ export function validateSkillDir(
       meta,
       options.enforceSkillRunner !== false,
       options.source === 'system',
+      options.operatorRules,
     ));
     if (options.source !== 'system' && options.source !== 'agent-private') {
       violations.push(...validateSkillMeta(meta));
@@ -134,15 +151,17 @@ export function validateSkillDir(
     return _finalize(violations);
   }
 
-  // Walk all other recognized files (scripts).
+  // Walk all other recognized files (scripts and _meta.json policy targets).
   for (const rel of _walkFiles(skillDir, '')) {
     if (rel.toUpperCase() === 'SKILL.MD') continue;
-    if (rel === '_meta.json') continue;
     const kind = detectSkillFileKind(rel);
-    if (kind !== 'script') continue;
+    if (kind !== 'script' && kind !== 'skill_meta') continue;
+    if (kind === 'skill_meta' && !options.operatorRules?.length) continue;
     try {
       const content = fs.readFileSync(path.join(skillDir, rel), 'utf8');
-      violations.push(...scanRedFlags({ content, kind: 'script', field: rel }));
+      const scanArgs: RuleScanArgs = { content, kind, field: rel };
+      if (kind === 'script') violations.push(...scanRedFlags(scanArgs));
+      violations.push(..._policyScan(options.operatorRules, scanArgs));
     } catch {
       // unreadable file (binary / permission) — skip; no violation surfaced
     }
@@ -160,6 +179,7 @@ export function validateSkillDir(
 export function validateAgentSpec(args: {
   agentJson: unknown;
   enforceSkillRunner?: boolean;
+  operatorRules?: ReadonlyArray<RuleDef>;
 }): ValidationReport {
   const violations: Violation[] = [];
   if (!args.agentJson || typeof args.agentJson !== 'object') {
@@ -180,11 +200,13 @@ export function validateAgentSpec(args: {
   // application uniform — we don't need per-field traversal at this scope.
   try {
     const serialized = JSON.stringify(obj);
-    violations.push(...scanRedFlags({
+    const scanArgs: RuleScanArgs = {
       content: serialized,
       kind: 'agent_json',
       field: 'agent.json',
-    }));
+    };
+    violations.push(...scanRedFlags(scanArgs));
+    violations.push(..._policyScan(args.operatorRules, scanArgs));
   } catch {
     // unserializable (cyclic) → not worth surfacing here, the shape check
     // above would have already failed on the broken structure
@@ -198,7 +220,7 @@ export function validateAgentSpec(args: {
  */
 export function validateAgentDir(
   agentDir: string,
-  options: { enforceSkillRunner?: boolean } = {},
+  options: { enforceSkillRunner?: boolean; operatorRules?: ReadonlyArray<RuleDef> } = {},
 ): ValidationReport {
   const file = path.join(agentDir, 'agent.json');
   if (!fs.existsSync(file)) {
@@ -222,10 +244,20 @@ export function validateAgentDir(
   return validateAgentSpec({
     agentJson: parsed,
     enforceSkillRunner: options.enforceSkillRunner,
+    operatorRules: options.operatorRules,
   });
 }
 
 // ── Internals ───────────────────────────────────────────────────────────
+
+/** Additive scan; empty input yields [] so opted-out callers stay identical. */
+function _policyScan(
+  rules: ReadonlyArray<RuleDef> | undefined,
+  args: RuleScanArgs,
+): Violation[] {
+  if (!rules?.length) return [];
+  return scanRuleSet(rules, args, 'operator-policy');
+}
 
 function detectSkillFileKind(relpath: string): ScanKind {
   const norm = relpath.replace(/\\/g, '/');
@@ -245,6 +277,7 @@ function _scanSkillMd(
   skillMeta: Record<string, unknown> = {},
   enforceSkillRunner = true,
   allowFrontmatterExtensions = false,
+  operatorRules?: ReadonlyArray<RuleDef>,
 ): Violation[] {
   const violations: Violation[] = [];
 
@@ -268,11 +301,13 @@ function _scanSkillMd(
 
   // Embedded executable code blocks: scan each for red flags.
   for (const block of extractExecutableBlocks(body)) {
-    violations.push(...scanRedFlags({
+    const scanArgs: RuleScanArgs = {
       content: block.content,
       kind: 'script',  // executable block → treat as script
       field: `${field}:${block.startLine} (\`\`\`${block.lang})`,
-    }));
+    };
+    violations.push(...scanRedFlags(scanArgs));
+    violations.push(..._policyScan(operatorRules, { ...scanArgs, kind: 'skill_md' }));
   }
 
   return violations;

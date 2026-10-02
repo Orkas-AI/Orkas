@@ -6,6 +6,10 @@
 
 export type Level = 'EXTREME' | 'MEDIUM' | 'LOW';
 
+/** Origin of a finding. Absent = the built-in rule set (the security floor).
+ *  'operator-policy' = added by an operator-supplied rule file at runtime. */
+export type ViolationSource = 'operator-policy';
+
 export interface Violation {
   level: Level;
   /** Stable rule id, e.g. "no_credential_path_read" — used by the LLM retry
@@ -20,6 +24,9 @@ export interface Violation {
   snippet: string;
   /** One-line repair guidance — written for the LLM author + human reader. */
   suggested_fix: string;
+  /** Set only for findings produced by operator-supplied policy rules. Built-in
+   *  findings leave this absent. */
+  source?: ViolationSource;
 }
 
 export interface ValidationReport {

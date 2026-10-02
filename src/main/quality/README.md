@@ -41,6 +41,22 @@ quality/
 3. Run `npm test` (NOT `npx vitest` — the wrapper runs Vitest through Electron's embedded Node so native addons use the app ABI).
 4. Bump `VALIDATOR_VERSION` in `types.ts` if the change is observable by callers (existing reports written under the old version stay valid).
 
+## Operator policy rules
+
+Teams can add their own red flags without forking: write a JSON rule file,
+parse it with `parseOperatorPolicy` (exported from `index.ts`; reading the
+file is the caller's job — `quality/` stays stateless), then pass the parsed
+rules as `operatorRules` to `validateSkillFile` / `validateSkillDir` /
+`validateAgentSpec` / `validateAgentDir`.
+
+The built-in rules stay the security floor: operator rules are additive only
+— they never suppress, downgrade or rewrite a built-in finding, and a
+colliding id is rejected. Their findings carry `source: 'operator-policy'`.
+`appliesTo` scopes operator rules by artifact: `skill_md` means executable
+fenced blocks in `SKILL.md`, `script` means standalone script files,
+`skill_meta` means `_meta.json`, and `agent_json` means an Agent spec. Still
+not a sandbox. Field reference lives in `rules/operator-policy.ts`.
+
 ## Levels
 
 | Level | Behavior |
@@ -66,7 +82,8 @@ There is intentionally NO override for EXTREME. If a real use case triggers a re
 - Capability cross-check against the tool catalog — deferred to phase 1.
 - Similarity check — deferred to phase 2 (embedding-based).
 - Outbound HTTP detection — deferred to phase 2 (runtime network sandbox is the right layer).
-- User-defined red flags — not exposed; the rule list is build-time only.
+- Rule *authoring* for the built-in floor is still build-time; teams that need
+  their own extra rules use the additive operator layer below.
 
 ## Tests
 

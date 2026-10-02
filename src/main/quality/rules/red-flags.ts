@@ -17,7 +17,7 @@
  *   ("this skill handles ssh config" ≠ "reads ssh private keys").
  */
 
-import { RuleDef, ScanKind, Violation } from '../types';
+import { RuleDef, ScanKind, Violation, ViolationSource } from '../types';
 
 // ── Rule list ────────────────────────────────────────────────────────────
 
@@ -108,18 +108,27 @@ export const RED_FLAGS: ReadonlyArray<RuleDef> = [
 
 // ── Application ──────────────────────────────────────────────────────────
 
-/**
- * Scan content + return violations from the matching rules.
- * `kind === 'other'` returns []; no scanning of prose / docs / assets.
- */
-export function scanRedFlags(args: {
+export interface RuleScanArgs {
   content: string;
   kind: ScanKind;
   field: string;       // path-like locator for the report
-}): Violation[] {
+}
+
+/**
+ * Scan content against an arbitrary rule list.
+ * `kind === 'other'` returns []; no scanning of prose / docs / assets.
+ *
+ * `source` tags the produced findings. Built-in callers omit it, so built-in
+ * violations stay byte-identical to previous validator versions.
+ */
+export function scanRuleSet(
+  rules: ReadonlyArray<RuleDef>,
+  args: RuleScanArgs,
+  source?: ViolationSource,
+): Violation[] {
   if (args.kind === 'other') return [];
   const out: Violation[] = [];
-  for (const rule of RED_FLAGS) {
+  for (const rule of rules) {
     if (!rule.appliesTo.includes(args.kind)) continue;
     const match = rule.pattern.exec(args.content);
     if (!match) continue;
@@ -131,12 +140,18 @@ export function scanRedFlags(args: {
       field: lineNo > 0 ? `${args.field}:${lineNo}` : args.field,
       snippet,
       suggested_fix: rule.suggested_fix,
+      ...(source ? { source } : {}),
     });
     // Reset stateful regex (`/g`) — we don't use /g but be safe across future
     // changes by zeroing lastIndex.
     rule.pattern.lastIndex = 0;
   }
   return out;
+}
+
+/** Scan content against the built-in red-flag floor. */
+export function scanRedFlags(args: RuleScanArgs): Violation[] {
+  return scanRuleSet(RED_FLAGS, args);
 }
 
 /**
