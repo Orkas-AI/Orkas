@@ -1855,7 +1855,7 @@
   "agent_modal.tab_external": "外部",
   "agent_modal.name": "名前",
   "agent_modal.category": "カテゴリ",
-  "agent_modal.name_placeholder": "例: コードレビューアシスタント",
+  "agent_modal.name_placeholder": "例: SNS担当",
   "agent_modal.desc": "概要",
   "agent_modal.desc_hint": "何をするかを 1 行で入力します。AI がワークフローを生成します",
   "agent_modal.desc_placeholder": "例: コミット前にコードをレビューし、ロジックバグとセキュリティ問題に注目する...",

@@ -218,7 +218,7 @@
   "attachments.skipped.too_many_images": "メッセージあたりの画像上限を超えました（{max}）",
   "attachments.skipped.compress_failed": "画像圧縮に失敗しました: {message}",
   "chat.default_title": "新しい会話",
-  "agent.default_name": "無題のエージェント",
+  "agent.default_name": "名称未設定",
   "dialog.choose_directory": "ディレクトリを選択",
   "dialog.choose_skill_source_directory": "インポートするスキルフォルダを選択",
   "contexts.index.heading": "ライブラリインデックス",
