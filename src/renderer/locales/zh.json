@@ -2522,5 +2522,12 @@
   "chat.conv_moved_out": "已移出项目。",
   "chat.conv_filing_failed": "项目「{name}」已创建，但对话未能加入项目。请通过对话菜单的「添加到项目」选择该项目重试。",
   "chat.conv_filing_failed_with_todos": "项目「{name}」及 {count} 项待办已创建，但对话未能加入项目。请通过对话菜单的「添加到项目」选择该项目重试。",
-  "chat.conv_move_not_filed": "这个任务不在任何项目里。"
+  "chat.conv_move_not_filed": "这个任务不在任何项目里。",
+  "quality.operator.title": "自定义校验",
+  "quality.operator.scope": "保存或安装前检查脚本、SKILL.md 可执行代码块、元数据及 Agent JSON；不限制运行时权限。",
+  "quality.operator.file": "规则文件",
+  "quality.operator.reload": "重新加载",
+  "quality.operator.disabled": "本机已停用。",
+  "quality.operator.ready": "已加载 {count} 条规则。",
+  "quality.operator.invalid": "校验不可用。请修复 operator-policy.json，或停用自定义校验后重试。"
 }

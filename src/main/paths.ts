@@ -430,6 +430,8 @@ export const userDeviceConnectorEnabledFile = (uid: string) => path.join(userLoc
 export const userAuthProfilesFile = (uid: string) => path.join(userLocalConfigDir(uid), 'auth-profiles.json');
 export const userWebSearchCache   = (uid: string) => path.join(userLocalConfigDir(uid), 'web-search-cache.json');
 export const userReflectionStateFile = (uid: string) => path.join(userLocalConfigDir(uid), 'reflection-state.json');
+export const userOperatorPolicyFile = (uid: string) => path.join(userLocalConfigDir(uid), 'operator-policy.json');
+export const userOperatorPolicyEnabledFile = (uid: string) => path.join(userLocalConfigDir(uid), 'operator-policy-enabled.json');
 export const userDevtoolsFile     = (uid: string) => path.join(userLocalConfigDir(uid), 'devtools.json');
 // Compact crash-recovery journal. Keeping this local avoids syncing transient
 // process state and lets startup inspect only conversations that were running.

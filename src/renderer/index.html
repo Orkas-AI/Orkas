@@ -1183,6 +1183,16 @@
                         <input type="checkbox" id="settings-task-notifications-toggle" checked aria-labelledby="settings-task-notifications-title" />
                       </label>
                     </div>
+                    <div class="settings-row">
+                      <div class="settings-row-copy">
+                        <div class="settings-row-title" id="settings-operator-title" data-i18n="quality.operator.title">Custom validation</div>
+                        <div class="settings-row-desc" data-i18n="quality.operator.scope">Checks scripts, executable SKILL.md code blocks, metadata and Agent JSON before saving or installing. This is not a runtime sandbox.</div>
+                        <div class="settings-row-desc" id="settings-operator-status" role="status" aria-live="polite"></div>
+                      </div>
+                      <button class="btn btn-sm" id="settings-operator-file" data-i18n="quality.operator.file">Rule file</button>
+                      <button class="btn btn-sm" id="settings-operator-reload" data-i18n="quality.operator.reload">Reload</button>
+                      <label class="toggle-switch settings-switch"><input type="checkbox" id="settings-operator-toggle" aria-labelledby="settings-operator-title" /></label>
+                    </div>
                     <div class="settings-row settings-task-notification-permission" id="settings-task-notification-permission" role="status" aria-live="polite" hidden>
                       <span class="settings-task-notification-permission-text" id="settings-task-notification-permission-text" data-i18n="settings.task_notifications.permission_disabled">系统已关闭 Orkas 的通知权限。请前往系统设置开启，否则无法收到任务进度提醒。</span>
                       <button type="button" class="btn btn-sm" id="settings-task-notification-open-settings" data-i18n="settings.task_notifications.open_settings">打开系统设置</button>

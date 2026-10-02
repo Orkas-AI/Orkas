@@ -6704,7 +6704,7 @@ async function runActorTurnWithDisplay(
       // the chip slot only fills when the spec was actually written.
       for (const container of skillR.containers) {
         try {
-          let result = await skillsFeat.applySkillContainerFromCommander(container);
+          let result = await skillsFeat.applySkillContainerFromCommander(container, { isCancelled: () => w.stopRequested || getActiveUserId() !== uid });
           if (!result.ok && !errText && !aborted && !w.stopRequested
               && skillR.containers.length === 1 && !r.blocks.length
               && !toolCreatedSkills.length && !terminalHandoffCompleted

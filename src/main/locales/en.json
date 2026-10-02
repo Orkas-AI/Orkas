@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "Cloud sync conflict resolution: {name}",
   "sync.conflict_resolution.title_batch": "Cloud sync conflict resolution: {count} conflicts",
   "sync.conflict_resolution.message_single": "Please help me resolve this cloud sync conflict.",
-  "sync.conflict_resolution.message_batch": "Please help me resolve these cloud sync conflicts."
+  "sync.conflict_resolution.message_batch": "Please help me resolve these cloud sync conflicts.",
+  "quality.operator.incomplete": "Custom validation did not complete. Fix the policy file or disable custom validation in Settings, then retry."
 }

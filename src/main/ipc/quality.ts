@@ -1,16 +1,6 @@
-/**
- * IPC handlers for the quality validator.
- *
- * Renderer reads persisted ValidationReports to display the violation list
- * when a write / install rejection happens. The validator runs in-process at
- * the chokepoints (see `features/skills.ts` + `features/agents.ts` +
- * `features/marketplace.ts`); these channels are read-only — never run the
- * validator on demand from the renderer.
- *
- * Logical channels:
- *   - `quality.readSkillReport`  → latest report for a skill id
- *   - `quality.readAgentReport`  → latest report for an agent id
- */
+import { shell } from 'electron';
+import { operatorPolicyStatus, setOperatorPolicyEnabled, prepareOperatorPolicyFile } from '../features/operator-policy';
+/** Quality reports and device-local custom-validation settings. */
 
 import { readReport } from '../quality/report';
 import { getActiveUserId } from '../features/users';
@@ -19,6 +9,18 @@ import { safeId } from '../storage';
 type InvokeHandler = (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
 export const invokeHandlers: Record<string, InvokeHandler> = {
+  'quality.operatorStatus': async () => operatorPolicyStatus(getActiveUserId()),
+  'quality.setOperatorEnabled': async ({ enabled }) => {
+    if (typeof enabled !== 'boolean') throw new Error('invalid enabled');
+    const uid = getActiveUserId();
+    await setOperatorPolicyEnabled(uid, enabled);
+    return operatorPolicyStatus(uid);
+  },
+  'quality.openOperatorFile': async () => {
+    const file = await prepareOperatorPolicyFile(getActiveUserId());
+    shell.showItemInFolder(file);
+    return { ok: true };
+  },
   'quality.readSkillReport': async ({ id }) => {
     if (typeof id !== 'string' || !safeId(id)) throw new Error('invalid id');
     const report = await readReport({ uid: getActiveUserId(), kind: 'skill', id });

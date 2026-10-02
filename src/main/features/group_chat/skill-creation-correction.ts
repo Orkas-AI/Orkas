@@ -83,7 +83,6 @@ export async function applySkillCreationCorrection(
   if (otherFiles.some(file => correctedByPath.get(file.path) !== file.content)) return null;
   if (original.files.length && corrected.files.some(file => file.path !== 'SKILL.md'
     && !originalPaths.has(file.path))) return null;
-  // Creation prevalidation, allocation and writes have no async yield. Existing
-  // identity collisions still reject; never turn a correction into an edit.
-  return applySkillContainerFromCommander(corrected);
+  // Async validation checks cancellation again before the synchronous commit.
+  return applySkillContainerFromCommander(corrected, { isCancelled: () => signal.aborted || getActiveUserId() !== userId });
 }

@@ -1,0 +1,31 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { expect, test } from './fixtures/orkas';
+
+test('custom policy settings persist and invalid configuration blocks forced Marketplace installation until disabled', async ({ marketplaceOrkas: app }) => {
+  const page = app.page!;
+  const user = await app.invoke<{ user_id: string }>('user.init');
+  const userRoot = path.join(app.workspaceRoot, user.user_id);
+  const config = path.join(userRoot, 'local', 'config');
+  fs.mkdirSync(config, { recursive: true });
+  fs.writeFileSync(path.join(config, 'operator-policy.json'), '{invalid');
+  await page.locator('#settings-btn').click();
+  await page.locator('.settings-tab[data-settings-tab="general"]').click();
+  const toggle = page.locator('#settings-operator-toggle');
+  await expect(toggle).not.toBeChecked();
+  await toggle.check();
+  await expect(page.locator('#settings-operator-status')).toContainText('Validation unavailable');
+  const result = await app.invoke<any>('marketplace.installSkill', { id: 'marketplace-e2e-skill', version: '1.0.0', published_at: 1, force: true });
+  expect(result.ok).toBe(false);
+  expect(result.qualityReport.violations).toContainEqual(expect.objectContaining({ rule: 'operator:incomplete' }));
+  expect(fs.existsSync(path.join(userRoot, 'local', 'marketplace', 'skills', 'marketplace-e2e-skill', 'SKILL.md'))).toBe(false);
+  const relaunched = await app.relaunch();
+  await relaunched.locator('#settings-btn').click();
+  await relaunched.locator('.settings-tab[data-settings-tab="general"]').click();
+  await expect(relaunched.locator('#settings-operator-toggle')).toBeChecked();
+  await relaunched.locator('#settings-operator-toggle').uncheck();
+  await expect(relaunched.locator('#settings-operator-status')).toContainText('Disabled');
+  const installed = await app.invoke<any>('marketplace.installSkill', { id: 'marketplace-e2e-skill', version: '1.0.0', published_at: 1 });
+  expect(installed.ok).not.toBe(false);
+  expect(fs.existsSync(path.join(userRoot, 'local', 'marketplace', 'skills', 'marketplace-e2e-skill', 'SKILL.md'))).toBe(true);
+});

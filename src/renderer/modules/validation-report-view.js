@@ -39,6 +39,7 @@ function _levelLabel(level) {
 
 function _suggestedFixText(v) {
   const rule = v && v.rule ? String(v.rule) : '';
+  if (v && v.source === 'operator-policy') return String(v.suggested_fix || '');
   if (rule) {
     const key = `quality.fix.${rule}`;
     try {
@@ -91,6 +92,7 @@ function showValidationReport({ title, report, okLabel, forceLabel } = {}) {
     overlay.className = 'modal-overlay ui-dialog-overlay open';
 
     const violations = _reportViolations(report);
+    if (violations.some(v => v.source === 'operator-policy' && v.level === 'EXTREME')) forceLabel = undefined;
     // Sort: EXTREME first, then MEDIUM, then LOW. Within a level keep
     // original order (the validator already emits them in detection order).
     const order = { EXTREME: 0, MEDIUM: 1, LOW: 2 };

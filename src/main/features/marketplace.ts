@@ -39,6 +39,7 @@
  * `marketplace_dev.ts` — excluded from packaged builds via `package.json::build.files`.
  */
 
+import { validateWithOperatorPolicy, hasBlockingOperatorPolicy } from './operator-policy';
 import AdmZip from 'adm-zip';
 import { app } from 'electron';
 import * as fs from 'node:fs';
@@ -89,7 +90,6 @@ import {
 } from './marketplace_bundle';
 import { createLogger } from '../logger';
 import {
-  validateAgentSpec, validateSkillDir,
   ValidationReport as QualityReport,
 } from '../quality';
 import { persistReport as persistQualityReport } from '../quality/report';
@@ -929,16 +929,16 @@ async function _installMarketplaceAgentLocked(
     //    on a fresh user account, and the validator is the choke point that
     //    catches it before write. EXTREME → abort + persist report; MEDIUM
     //    only persists the report and lets the install proceed.
-    const preReport = validateAgentSpec({
+    const [preReport] = await validateWithOperatorPolicy(uid, { kind: 'agent', args: {
       agentJson: detail.agent_json,
       // Installation restores published bytes verbatim. Runner compatibility
       // is enforced while authoring/publishing, not retroactively on install.
       enforceSkillRunner: false,
-    });
+    } });
     await persistQualityReport({
       uid, kind: 'agent', id: agentId, report: preReport,
     });
-    if (!preReport.ok && opts.force !== true) {
+    if (!preReport.ok && (opts.force !== true || hasBlockingOperatorPolicy(preReport))) {
       throw _qualityInstallError('agent', agentId, preReport);
     }
     // 4. Now materialize the agent: cache content → `<uid>/local/marketplace/agents/<id>/`.
@@ -955,6 +955,10 @@ async function _installMarketplaceAgentLocked(
         const privateSkillsDir = path.join(staged, 'skills');
         await fsp.mkdir(privateSkillsDir, { recursive: true });
         extractBundleSafely(privateSkillsZip, privateSkillsDir);
+        for (const privateId of privateSkillIds) {
+          const [report] = await validateWithOperatorPolicy(uid, { kind: 'directory', dir: path.join(privateSkillsDir, privateId), options: { source: 'agent-private', enforceSkillRunner: false } });
+          if (hasBlockingOperatorPolicy(report)) throw _qualityInstallError('agent', agentId, report);
+        }
       }
       // `_install.json` stores everything the in-app UI needs without re-hitting the network:
       // version pin for reconcile; freshness timestamps for catalog/cache metadata;
@@ -1084,16 +1088,16 @@ async function _installMarketplaceSkillLocked(
       // Validate the staged update before replacing a previously working
       // install. A rejected or malformed update must leave the old version
       // intact and retryable.
-      const skillReport = validateSkillDir(staged, {
+      const [skillReport] = await validateWithOperatorPolicy(uid, { kind: 'directory', dir: staged, options: {
         source: 'marketplace',
         // Installation restores published bytes verbatim. Runner compatibility
         // is enforced while authoring/publishing, not retroactively on install.
         enforceSkillRunner: false,
-      });
+      } });
       await persistQualityReport({
         uid, kind: 'skill', id: skillId, report: skillReport,
       });
-      if (!skillReport.ok && opts.force !== true) {
+      if (!skillReport.ok && (opts.force !== true || hasBlockingOperatorPolicy(skillReport))) {
         throw _qualityInstallError('skill', skillId, skillReport);
       }
 

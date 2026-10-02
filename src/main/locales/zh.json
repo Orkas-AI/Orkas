@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "云同步冲突处理：{name}",
   "sync.conflict_resolution.title_batch": "云同步冲突处理：{count} 条冲突",
   "sync.conflict_resolution.message_single": "请帮我处理这条云同步冲突。",
-  "sync.conflict_resolution.message_batch": "请帮我处理这些云同步冲突。"
+  "sync.conflict_resolution.message_batch": "请帮我处理这些云同步冲突。",
+  "quality.operator.incomplete": "自定义校验未完成。请修复规则文件，或在设置中停用自定义校验后重试。"
 }
