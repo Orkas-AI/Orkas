@@ -33,7 +33,7 @@ describe('operator policy packaged runtime', () => {
       // Windows must not read or remove the fixture until that close completes.
       const output = await createPackageWithOptions(stage, archive, { unpack: `{${unpack.join(',')}}` });
       await finished(output);
-      expect(statFile(archive, 'src/main/quality/operator-worker.js').unpacked).not.toBe(true);
+      expect(statFile(archive, path.join('src', 'main', 'quality', 'operator-worker.js')).unpacked).not.toBe(true);
       const launcher = path.join(root, 'launch.cjs');
       fs.writeFileSync(launcher, `
         require('node:module').createRequire(require('node:path').join(__dirname, 'app.asar', 'entry.cjs'))('tsx/cjs');
