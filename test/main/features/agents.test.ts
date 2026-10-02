@@ -1308,6 +1308,7 @@ describe('agents › createCustomAgent', () => {
     ['tr', 'KodIncelemeAsistani'],
     ['vi', 'TroLyDanhGiaMa'],
     ['zh-tw', '程式碼審查助手'],
+    ['ja', 'SNS担当'],
     ['pt-pt', 'AssistenteRevisaoCodigo'],
     ['es-419', 'AsistenteRevisionCodigo'],
   ] as const)('keeps default and suggested Agent names editable in %s', async (lang, suggestedName) => {
