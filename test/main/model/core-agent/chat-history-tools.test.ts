@@ -787,17 +787,22 @@ describe('chat-history-tools › shape', () => {
       expect(result.isError).toBeFalsy();
       expect(result.content).toContain('contractword');
     }
-    // Portable schemas admit known fields independently of the selected
-    // action; the executor still rejects cross-action combinations.
-    for (const invalid of [
-      { ...search, cid: 'sibling' },
-      ...['record_id', 'turn_id', 'tool_call_id'].map(key => ({ ...search, [key]: 'selected-record' })),
-      { ...read, query: 'contractword' },
-      { ...read, k: 2 },
-      { ...read, include_current: true },
-    ]) {
-      const hiddenFromCurrentOnly = currentOnly && ('cid' in invalid || 'include_current' in invalid);
-      expect(schema.Check(invalid), JSON.stringify(invalid)).toBe(!hiddenFromCurrentOnly);
+    const harmlessCases: Array<[Record<string, unknown>, string[]]> = [
+      [{ ...read, query: 'contractword' }, ['query']],
+      [{ ...read, k: 2 }, ['k']],
+      ...(!currentOnly ? [[{ ...read, include_current: true }, ['include_current']] as [Record<string, unknown>, string[]]] : []),
+      [{ ...search, page: read.page }, ['page']],
+      ...(!currentOnly ? [[{ ...search, cid: '' }, ['cid']] as [Record<string, unknown>, string[]]] : []),
+    ];
+    for (const [harmless, ignored] of harmlessCases) {
+      expect(schema.Check(harmless)).toBe(true);
+      const result = await tool.execute(harmless, ctxFor());
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toContain('contractword');
+      expect(result.content).toContain(`ignored_fields: ${JSON.stringify(ignored)}`);
+      expect(result.content).not.toContain('ignored_values');
+    }
+    for (const invalid of [{ ...search, cid: 'sibling' }, ...['record_id', 'turn_id', 'tool_call_id'].map(key => ({ ...search, [key]: 'selected-record' })), { ...search, unknown_field: true }]) {
       const result = await tool.execute(invalid, ctxFor());
       expect(result.isError).toBe(true);
       expect(result.content).toContain('unsupported field(s)');
@@ -819,9 +824,11 @@ describe('chat-history-tools › shape', () => {
     expect(properties.query.description).toContain('natural language or keywords');
     expect(properties.query.description).toContain('discriminative name, phrase, id, or fact');
     expect(properties.query.description).toContain('Search only');
-    expect(properties.action.description).toContain('Omit other-action fields');
-    expect(properties.action.description).toContain('exact refs or latest for vague local references');
+    expect(properties.action.description).toContain('Unused fields are reported in ignored_fields');
+    expect(properties.action.description).toContain('latest for vague local references');
     expect(properties.action.description).toContain('Follow next_read');
+    expect(properties.cid.description).toContain('Read only');
+    expect(properties.cid.description).toContain('conversation ID from search');
     expect(properties.page.description).toContain('Read only');
     expect(properties.page.properties.mode.description).toContain('latest: tail');
     expect(properties.page.properties.mode.description).toContain('around: centered on index');
@@ -847,11 +854,11 @@ describe('chat-history-tools › shape', () => {
     expect((chatHistory.inputSchema as any).required).toEqual(['action', 'scope']);
   });
 
-  it('rejects a missing action and cross-action read fields', async () => {
+  it('rejects a missing action and cross-action search locators', async () => {
     const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
     const missingAction = await chatHistory.execute({ query: 'x' }, ctxFor());
     const crossActionField = await chatHistory.execute({
-      action: 'read', cid: 'c1', query: 'x',
+      action: 'search', cid: 'c1', query: 'x',
     }, ctxFor());
     expect(missingAction.isError).toBe(true);
     expect(missingAction.content).toContain('`action`');

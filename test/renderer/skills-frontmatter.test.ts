@@ -132,7 +132,7 @@ describe('skills renderer frontmatter parsing', () => {
     expect(msgEl.textContent).toBe('skills.saving');
   });
 
-  it('tracks URL skill creation success', async () => {
+  it('opens the created URL skill after persistence', async () => {
     const context = loadSkillRendererHelpers();
     const monitorCalls: any[] = [];
     const calls: string[] = [];
@@ -140,11 +140,6 @@ describe('skills renderer frontmatter parsing', () => {
     const msgEl = { textContent: '', className: '' };
     context.__calls = calls;
     context.performance = { now: () => { now += 25; return now; } };
-    context.window.Monitor = {
-      click: (action: string, payload: any) => monitorCalls.push(['click', action, payload]),
-      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
-      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
-    };
     context.apiFetch = async (url: string, opts: any) => {
       calls.push(`api:${url}:${opts?.method || 'GET'}`);
       return {
@@ -164,16 +159,6 @@ describe('skills renderer frontmatter parsing', () => {
     `, context);
 
     await context._saveSkillFromUrl({ msgEl });
-
-    expect(monitorCalls).toEqual([
-      ['click', 'skill_create_submit', { creation_method: 'url' }],
-      ['event', 'skill_create_result', {
-        creation_method: 'url',
-        result: 'success',
-        duration_ms: 25,
-        skill_count: 1,
-      }],
-    ]);
     expect(calls).toEqual([
       'busy:true',
       'paint',
@@ -183,16 +168,11 @@ describe('skills renderer frontmatter parsing', () => {
     ]);
   });
 
-  it('tracks manual, URL, and directory client validation as blocked terminals', async () => {
+  it('shows recoverable validation errors without creating invalid skills', async () => {
     const context = loadSkillRendererHelpers();
     const monitorCalls: any[] = [];
     let now = 100;
     context.performance = { now: () => { now += 25; return now; } };
-    context.window.Monitor = {
-      click: (action: string, payload: any) => monitorCalls.push(['click', action, payload]),
-      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
-      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
-    };
     vm.runInContext(`
       document = {
         getElementById: () => ({ value: '', textContent: '', className: '', focus() {} }),
@@ -200,70 +180,23 @@ describe('skills renderer frontmatter parsing', () => {
     `, context);
     const msgEl = { textContent: '', className: '' };
 
+    context.apiFetch = () => { throw new Error('Invalid input must not create a skill'); };
     await context._saveSkillManual({ editId: '', msgEl });
+    expect(msgEl.textContent).toBe('skills.input_name_needed');
     await context._saveSkillFromUrl({ msgEl });
+    expect(msgEl.textContent).toBe('skill_modal.err_url_invalid');
     await context._saveSkillFromDir({ msgEl });
-
-    expect(monitorCalls).toEqual([
-      ['click', 'skill_create_submit', { creation_method: 'manual' }],
-      ['event', 'skill_create_result', {
-        creation_method: 'manual', result: 'blocked', duration_ms: 25, error_code: 'no_name',
-      }],
-      ['click', 'skill_create_submit', { creation_method: 'url' }],
-      ['event', 'skill_create_result', {
-        creation_method: 'url', result: 'blocked', duration_ms: 25, error_code: 'url_invalid',
-      }],
-      ['click', 'skill_create_submit', { creation_method: 'dir' }],
-      ['event', 'skill_create_result', {
-        creation_method: 'dir', result: 'blocked', duration_ms: 25, error_code: 'dir_missing',
-      }],
-    ]);
+    expect(msgEl.textContent).toBe('skill_modal.err_dir_missing');
+    expect(msgEl.className).toBe('form-msg err');
   });
 
-  it('keeps Skill create success authoritative and omits raw refresh errors', async () => {
+  it('shows a failed import and releases the busy state', async () => {
     const context = loadSkillRendererHelpers();
     const monitorCalls: any[] = [];
     let now = 100;
     context.performance = { now: () => { now += 25; return now; } };
-    context.window.Monitor = {
-      click: (action: string, payload: any) => monitorCalls.push(['click', action, payload]),
-      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
-      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
-    };
     context.apiFetch = async () => ({
-      json: async () => ({ ok: true, skill: { id: 'created', name: 'Private name' } }),
-    });
-    vm.runInContext(`
-      document = { getElementById: () => ({ value: 'https://example.com/private', focus() {} }) };
-      _setSkillModalBusy = () => {};
-      _waitForSkillModalBusyPaint = async () => {};
-      _afterSkillCreated = async () => { throw new Error('private refresh detail'); };
-    `, context);
-
-    await context._saveSkillFromUrl({ msgEl: { textContent: '', className: '' } });
-
-    expect(monitorCalls).toEqual([
-      ['click', 'skill_create_submit', { creation_method: 'url' }],
-      ['event', 'skill_create_result', {
-        creation_method: 'url', result: 'success', duration_ms: 25, skill_count: 1,
-      }],
-    ]);
-    expect(JSON.stringify(monitorCalls)).not.toContain('Private name');
-    expect(JSON.stringify(monitorCalls)).not.toContain('private refresh detail');
-  });
-
-  it('reports Skill create failures with a stable result code only', async () => {
-    const context = loadSkillRendererHelpers();
-    const monitorCalls: any[] = [];
-    let now = 100;
-    context.performance = { now: () => { now += 25; return now; } };
-    context.window.Monitor = {
-      click: (action: string, payload: any) => monitorCalls.push(['click', action, payload]),
-      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
-      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
-    };
-    context.apiFetch = async () => ({
-      json: async () => ({ ok: false, error: 'failed to import private-user/private-skill' }),
+      json: async () => ({ ok: false, error: 'Import failed' }),
     });
     vm.runInContext(`
       document = { getElementById: () => ({ value: 'https://example.com/private', focus() {} }) };
@@ -271,25 +204,18 @@ describe('skills renderer frontmatter parsing', () => {
       _waitForSkillModalBusyPaint = async () => {};
     `, context);
 
-    await context._saveSkillFromUrl({ msgEl: { textContent: '', className: '' } });
-
-    expect(monitorCalls).toEqual([
-      ['click', 'skill_create_submit', { creation_method: 'url' }],
-      ['event', 'skill_create_result', {
-        creation_method: 'url', result: 'failure', duration_ms: 25, error_code: 'import_failed',
-      }],
-    ]);
-    expect(JSON.stringify(monitorCalls)).not.toContain('private-user');
+    const msgEl = { textContent: '', className: '' };
+    const busy: boolean[] = [];
+    context._setSkillModalBusy = (value: boolean) => busy.push(value);
+    await context._saveSkillFromUrl({ msgEl });
+    expect(msgEl.className).toBe('form-msg err');
+    expect(msgEl.textContent).toBe('Import failed');
+    expect(busy[busy.length - 1]).toBe(false);
   });
 
   it('keeps Skill toggle and package mutation success authoritative across refresh failures', async () => {
     const context = loadSkillRendererHelpers();
     const monitorCalls: any[] = [];
-    context.window.Monitor = {
-      click: (action: string, payload: any) => monitorCalls.push(['click', action, payload]),
-      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
-      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
-    };
     context.Monitor = context.window.Monitor;
     context.window.orkas = { invoke: async () => ({ ok: true }) };
     context.uiAlert = async () => {};
@@ -310,16 +236,11 @@ describe('skills renderer frontmatter parsing', () => {
     );
     expect(skillResults).toHaveLength(0);
     expect(packageResults).toHaveLength(0);
-    expect(monitorCalls.some(([kind]) => kind === 'error')).toBe(false);
   });
 
   it('keeps a successful Skill delete authoritative when refresh fails', async () => {
     const context = loadSkillRendererHelpers();
     const monitorCalls: any[] = [];
-    context.window.Monitor = {
-      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
-      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
-    };
     context.Monitor = context.window.Monitor;
     context.uiConfirm = async () => true;
     context.uiAlert = async () => {};
@@ -337,7 +258,6 @@ describe('skills renderer frontmatter parsing', () => {
     );
     expect(results).toHaveLength(0);
     expect(vm.runInContext('_selectedSkill', context)).toBeNull();
-    expect(JSON.stringify(monitorCalls)).not.toContain('Private Skill');
   });
 
   it('sends forced import auto-seed even when edit chat history is not empty', async () => {

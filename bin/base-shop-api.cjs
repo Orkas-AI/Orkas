@@ -5,11 +5,11 @@
 const crypto = require('node:crypto');
 const { requestFetch, credentialOperation, requestFailureCode, httpFailureCode } = require('./commerce-request-context.cjs');
 const { validate, readBody, safeOutput } = require('./storefront-admin-api.cjs');
-const { readCredentialFile, writeCredentialFile } = require('./local-api-credential-codec.cjs');
+const { readCredentialFile, writeCredentialFile, rotateCredentialFile } = require('./local-api-credential-codec.cjs');
 const BASE = 'https://api.thebase.in/1';
 const SCOPES = ['read_users', 'read_items', 'read_orders', 'write_items'];
 const refreshes = new Map();
-const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
+const fail = (code, message, httpStatus) => { throw Object.assign(new Error(message), { code, ...(httpStatus ? { httpStatus } : {}) }); };
 const isProvider = provider => provider === 'base_shop';
 const validSecret = value => typeof value === 'string' && value.length >= 3 && value.length <= 4096 && !/[\s\u0000-\u001f\u007f]/.test(value);
 const fingerprint = c => crypto.createHash('sha256').update(c.client_id).digest('hex');
@@ -44,7 +44,7 @@ async function request(config, route, params = {}, post = false, token = false) 
   } catch (error) { fail(requestFailureCode(error, deadline), 'BASE request failed; check the connection. Inspect the shop before retrying an uncertain update'); }
   // BASE documents HTTP 400 for both invalid tokens and quota exhaustion.
   // Parse that bounded error envelope before applying the generic HTTP mapping.
-  if (!response.ok && response.status !== 400) fail(httpFailureCode(response.status), `BASE request failed (HTTP ${response.status}); check shop authorization and API access`);
+  if (!response.ok && response.status !== 400) fail(httpFailureCode(response.status), `BASE request failed (HTTP ${response.status}); check shop authorization and API access`, response.status);
   let source;
   try { source = await readBody(response); } catch (error) {
     fail(error?.code === 'E_CONNECTOR_RESPONSE_TOO_LARGE' ? 'E_TOOL_CALL_UPSTREAM' : requestFailureCode(error, deadline),
@@ -92,12 +92,12 @@ const ensureToken = credentialOperation(async config => {
   let pending = refreshes.get(config.credentialFile);
   if (!pending) {
     pending = (async () => {
-      const c = config.credentials;
-      const data = await request(config, '/oauth/token', { grant_type: 'refresh_token', client_id: c.client_id,
-        client_secret: c.client_secret, redirect_uri: c.redirect_uri, refresh_token: c.refresh_token }, true, true);
-      const next = { ...tokens(config, data), identity: c.identity };
-      await shop({ ...config, credentials: next });
-      writeCredentialFile(config.credentialFile, config.credentialKey, next);
+      await rotateCredentialFile(config, async () => {
+        const c = config.credentials;
+        const data = await request(config, '/oauth/token', { grant_type: 'refresh_token', client_id: c.client_id,
+          client_secret: c.client_secret, redirect_uri: c.redirect_uri, refresh_token: c.refresh_token }, true, true);
+        return { ...tokens(config, data), identity: c.identity };
+      }, shop);
     })();
     refreshes.set(config.credentialFile, pending);
   }
@@ -172,4 +172,4 @@ async function authorize(config) {
   for (const name of ['products.list', 'orders.list']) await execute(bound, name, { limit: 1 });
   return credentials;
 }
-module.exports = { isProvider, apiBase, actionsFor, validateBinding, identity, execute, authorize, authorizeUrl, SCOPES };
+module.exports = { isProvider, apiBase, actionsFor, validateBinding, ensureToken, identity, execute, authorize, authorizeUrl, SCOPES };

@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -9,7 +10,7 @@ const composerHelpers = [
   ['const _MENTION_FALLBACK_CLASS', 'function _highlightMentionsIn'],
   ['function _quotedLineRanges', 'function _composerDispatchShape'],
   ['function _resolvedMentionSpans', 'function _explicitMentionRecipients'],
-  ['function _findChatComposerTokens', 'function _chatRichChipsMatchValue'],
+  ['function _findChatComposerTokens', 'function _chatRichAutoGrowMax'],
 ].map(([start, end]) => {
   const from = conversationSource.indexOf(start);
   const to = conversationSource.indexOf(end, from);
@@ -22,7 +23,8 @@ function loadChatUseHelpers(projectId = '', boundIds: string[] = []) {
   const end = skillsSource.indexOf('// Chat composers are part of the startup shell', start);
   if (start < 0 || end < 0) throw new Error('missing chat use helper block');
   const block = skillsSource.slice(start, end);
-  return vm.runInNewContext(`
+  return vm.runInNewContext(`${composerAccessorSource}
+
     const currentCid = 'current';
     const conversations = [{ conversation_id: 'current', project_id: ${JSON.stringify(projectId)} }];
     const _projectDetailPid = ${JSON.stringify(projectId)};
@@ -72,8 +74,6 @@ function loadChatUseHelpers(projectId = '', boundIds: string[] = []) {
       transform: transformWithChatUse,
       display: formatChatUseTextForDisplay,
       mirror: _renderChatUseMirrorHtml,
-      deleteRange: _chatUseTokenDeleteRange,
-      moveTarget: _chatUseTokenMoveTarget,
       titleSeed: _titleSeedWithoutRoutingMentions,
     });
   `, {});
@@ -115,7 +115,7 @@ describe('chat use inline chips', () => {
     expect(h.transform(token)).toBe('Bing Webmaster Tools connector');
   });
 
-  it('renders tokens as inline chips in the textarea mirror', () => {
+  it('renders persisted token previews as escaped inline chips', () => {
     const h = loadChatUseHelpers();
     const text = `Use ${h.tokenFor({ kind: 'skill', name: 'Docs' })} now`;
 
@@ -187,37 +187,6 @@ describe('chat use inline chips', () => {
       .toBe('Use Reader skill: Summarize this');
   });
 
-  it('treats a token as one delete block from either side or inside it', () => {
-    const h = loadChatUseHelpers();
-    const token = h.tokenFor({ kind: 'connector', name: 'GitHub' });
-    const text = `Ask ${token} now`;
-    const start = text.indexOf(token);
-    const end = start + token.length;
-
-    expect(h.deleteRange({ value: text, selectionStart: end, selectionEnd: end }, 'backward'))
-      .toEqual({ start, end });
-    expect(h.deleteRange({ value: text, selectionStart: start, selectionEnd: start }, 'forward'))
-      .toEqual({ start, end });
-    expect(h.deleteRange({ value: text, selectionStart: start + 4, selectionEnd: start + 4 }, 'backward'))
-      .toEqual({ start, end });
-    expect(h.deleteRange({ value: text, selectionStart: start + 2, selectionEnd: start + 6 }, 'forward'))
-      .toEqual({ start, end });
-  });
-
-  it('moves the caret across a token as one chip block', () => {
-    const h = loadChatUseHelpers();
-    const token = h.tokenFor({ kind: 'skill', name: 'Docs' });
-    const text = `Ask ${token} now`;
-    const start = text.indexOf(token);
-    const end = start + token.length;
-
-    expect(h.moveTarget(text, start, 'forward')).toBe(end);
-    expect(h.moveTarget(text, start + 5, 'forward')).toBe(end);
-    expect(h.moveTarget(text, end, 'backward')).toBe(start);
-    expect(h.moveTarget(text, end + 1, 'backward')).toBe(start);
-    expect(h.moveTarget(text, 1, 'forward')).toBeNull();
-  });
-
   it('shares chip boundaries for full Agent names and resources without changing sent text', () => {
     const h = loadChatUseHelpers();
     const skill = h.tokenFor({ kind: 'skill', name: 'Docs @Orkas Codex' });
@@ -230,27 +199,10 @@ describe('chat use inline chips', () => {
     expect(h.partsFromText(text).filter((part: any) => part.type === 'use')).toHaveLength(1);
   });
 
-  it('moves and deletes Agent chips atomically, including a selection crossing a resource chip', () => {
-    const h = loadChatUseHelpers();
-    const skill = h.tokenFor({ kind: 'skill', name: 'Docs' });
-    const text = `@Orkas Codex ${skill} @写作助手 审核`;
-    const [agent, resource, writer] = h.composerTokens(text);
-    expect(h.moveTarget(text, agent.start, 'forward')).toBe(agent.end);
-    expect(h.moveTarget(text, agent.end + 1, 'backward')).toBe(agent.start);
-    for (const [position, direction] of [[agent.end, 'backward'], [agent.start, 'forward'], [agent.start + 4, 'backward']] as const) {
-      expect(h.deleteRange({ value: text, selectionStart: position, selectionEnd: position }, direction))
-        .toEqual({ start: agent.start, end: agent.end });
-    }
-    expect(h.deleteRange({ value: text, selectionStart: resource.start + 2, selectionEnd: writer.start + 2 }, 'forward'))
-      .toEqual({ start: resource.start, end: writer.end });
-  });
-
   it('leaves unknown, disabled, email and quoted lookalikes as ordinary editable text', () => {
     const h = loadChatUseHelpers();
     for (const text of ['@Unknown', '@Disabled', 'mail@Orkas Codex', '> @Orkas Codex', '  > @写作助手']) {
       expect(h.composerTokens(text)).toEqual([]);
-      expect(h.moveTarget(text, text.length, 'backward')).toBeNull();
-      expect(h.deleteRange({ value: text, selectionStart: text.length, selectionEnd: text.length }, 'backward')).toBeFalsy();
     }
     expect(h.composerTokens('@Orkas Codex', 'auto-task-input')).toEqual([]);
   });

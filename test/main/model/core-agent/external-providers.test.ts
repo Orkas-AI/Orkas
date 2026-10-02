@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   buildCustomOpenAICompatibleModel,
   buildDeepSeekModel,
@@ -6,6 +6,7 @@ import {
   buildMoonshotModel,
   buildOrkasApiModel,
   createMoonshotProvider,
+  repairDeepSeekPayload,
 } from '../../../../src/main/model/core-agent/external-providers';
 import { isSelectableModel, modelInputImageLimit } from '../../../../src/main/model/provider_catalog';
 
@@ -181,3 +182,70 @@ describe('external-providers › createMoonshotProvider', () => {
     expect(typeof p.validateAuth).toBe('function');
   });
 });
+
+describe('external-providers › DeepSeek request compatibility', () => {
+  it.each(['complete', 'stream'] as const)('omits unsupported cache controls from DeepSeek %s requests', async mode => {
+    const { createPiProvider } = await vi.importActual<typeof import('#core-agent')>('#core-agent');
+    for (const modelId of ['deepseek-flash', 'deepseek-v4-flash']) {
+      for (const cacheRetention of ['long', 'short', 'none'] as const) {
+        let wire: Record<string, unknown> | undefined;
+        const provider = createPiProvider({
+          provider: 'deepseek', apiKey: 'test',
+          customModel: buildDeepSeekModel(modelId),
+          onPayload: (payload, model, metadata) => {
+            wire = JSON.parse(JSON.stringify(repairDeepSeekPayload(payload)));
+            throw new Error('captured before network');
+          },
+        });
+        const request = {
+          model: modelId, sessionId: 'cache-contract', cacheRetention,
+          messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hello' }] }],
+        };
+        if (mode === 'complete') {
+          await expect(provider.complete(request)).rejects.toThrow('captured before network');
+        } else {
+          const events = [];
+          for await (const event of provider.stream(request)) events.push(event);
+          expect(events.some(event => event.type === 'error')).toBe(true);
+        }
+        expect(wire).toMatchObject({ model: modelId, stream: true });
+        expect(wire).not.toHaveProperty('prompt_cache_key');
+        expect(wire).not.toHaveProperty('prompt_cache_retention');
+        expect(wire).not.toHaveProperty('prompt_cache_options');
+      }
+    }
+  });
+});
+
+
+  it('preserves explicit effort across mixed history while repairing orphan receipts', () => {
+    const plainPayload = {
+      thinking: { type: 'enabled' },
+      reasoning_effort: 'low',
+      messages: [
+        { role: 'assistant', content: 'plain assistant message' },
+        { role: 'tool', tool_call_id: 'lost_call', content: 'tool output' },
+      ],
+    };
+    const mixedPayload = {
+      thinking: { type: 'enabled' },
+      reasoning_effort: 'medium',
+      messages: [
+        { role: 'assistant', content: 'reasoned answer', reasoning_content: 'reasoning' },
+        { role: 'assistant', content: 'plain fallback answer' },
+        { role: 'user', content: 'continue' },
+      ],
+    };
+
+    const repaired = repairDeepSeekPayload(plainPayload) as Record<string, unknown>;
+    const mixed = repairDeepSeekPayload(mixedPayload) as Record<string, unknown>;
+
+    expect(repaired.reasoning_effort).toBe('low');
+    expect(repaired.thinking).toEqual({ type: 'enabled' });
+    expect((repaired.messages as Array<Record<string, unknown>>)[1]).toMatchObject({
+      role: 'user',
+      content: expect.stringContaining('tool output'),
+    });
+    expect(mixed.reasoning_effort).toBe('medium');
+    expect(mixed.thinking).toEqual({ type: 'enabled' });
+  });

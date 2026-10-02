@@ -64,7 +64,7 @@ describe('Qoo10 Japan seller QAPI', () => {
         return reply([{ ItemCode: '123456789', ItemPrice: '1000' }]);
       }
       if (url.endsWith('GetGoodsInventoryInfo')) return reply([{ Name1: '色', Value1: '青', ItemTypeCode: 'BLUE', Qty: 3 }]);
-      if (url.endsWith('GetShippingInfo_v2')) return reply([{ orderNo: 123, orderQty: 2, total: 1000, Currency: 'JPY', buyer: 'Private', receiver: 'Private', shippingAddr: 'Private', ShippingMsg: 'Private' }]);
+      if (url.endsWith('GetShippingInfo_v2')) return reply([{ orderNo: 123, orderQty: 2, total: 1000, Currency: 'JPY', buyer: 'Buyer', receiver: 'Recipient', shippingAddr: 'Delivery address', receiverTel: '+81-000-fixture', ShippingMsg: 'Leave at door', certification_key: KEY, nested: { access_token: KEY, message: 'receipt ' + KEY } }]);
       if (url.endsWith('UpdateInventoryQtyUnit')) return reply(undefined);
       throw new Error('Unexpected method');
     });
@@ -83,7 +83,9 @@ describe('Qoo10 Japan seller QAPI', () => {
       for (const action of ['products.get', 'inventory.get']) await adapter.callTool('execute_read', { action, parameters: { item_code: '123456789' } }, env);
       const orders = await adapter.callTool('execute_read', { action: 'orders.list', parameters: { day: '20260916' } }, env);
       expect(JSON.stringify(orders)).toContain('orderNo');
-      expect(JSON.stringify(orders)).not.toMatch(/Private|buyer|receiver|ShippingMsg/);
+      expect(orders.result.data[0]).toMatchObject({ buyer: 'Buyer', receiver: 'Recipient', shippingAddr: 'Delivery address', receiverTel: '+81-000-fixture', ShippingMsg: 'Leave at door', nested: { message: 'receipt [redacted]' } });
+      expect(JSON.stringify(orders)).not.toContain(KEY);
+      expect(JSON.stringify(orders)).not.toMatch(/certification_key|access_token/);
       const before = fetchMock.mock.calls.length;
       await expect(adapter.callTool('execute_read', { action: 'inventory.set' }, env)).rejects.toThrow(/risk mismatch/);
       expect(fetchMock).toHaveBeenCalledTimes(before);

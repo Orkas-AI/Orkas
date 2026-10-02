@@ -1,6 +1,6 @@
 'use strict';
 
-const { requestFetch, credentialOperation } = require('./commerce-request-context.cjs');
+const { requestFetch, requestFailureCode, credentialOperation } = require('./commerce-request-context.cjs');
 
 // Lazada ABA merchant apps: production country binding, rotating OAuth grants,
 // and a closed seller surface behind the existing connector risk/secret owners.
@@ -9,7 +9,7 @@ const { validate, readBody, safeOutput } = require('./storefront-admin-api.cjs')
 const { readCredentialFile, writeCredentialFile } = require('./local-api-credential-codec.cjs');
 const HOSTS = { sg: 'api.lazada.sg', my: 'api.lazada.com.my', ph: 'api.lazada.com.ph', th: 'api.lazada.co.th', id: 'api.lazada.co.id', vn: 'api.lazada.vn' };
 const refreshes = new Map();
-const fail = (kind, message) => { throw Object.assign(new Error(message), { code: `storefront_${kind}` }); };
+const fail = (kind, message, httpStatus) => { throw Object.assign(new Error(message), { code: `storefront_${kind}`, ...(httpStatus ? { httpStatus } : {}) }); };
 const isProvider = (provider) => provider === 'lazada';
 const hash = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const secret = (value, min = 8) => typeof value === 'string' && value.length >= min && value.length <= 4096 && !/[\s\u0000-\u001f\u007f]/.test(value);
@@ -32,21 +32,39 @@ function sign(path, parameters, appSecret) {
   const text = Object.keys(parameters).filter((key) => key !== 'sign').sort().map((key) => key + String(parameters[key])).join('');
   return crypto.createHmac('sha256', appSecret).update(path + text).digest('hex').toUpperCase();
 }
-async function request(config, path, parameters = {}, token = false, write = false) {
+async function request(config, path, parameters = {}, token = false, write = false, contract) {
   setup(config);
   const values = { ...parameters, app_key: config.credentials.app_key, timestamp: String(Date.now()), sign_method: 'sha256', ...(!token ? { access_token: config.credentials.access_token } : {}) };
   values.sign = sign(path, values, config.credentials.app_secret);
   const encoded = new URLSearchParams(Object.entries(values).map(([key, value]) => [key, String(value)])).toString();
-  const post = token || write;
+  const post = contract ? contract.method === 'POST' : token || write;
   const url = (token ? 'https://auth.lazada.com/rest' : apiBase(config.provider, config.metadata)) + path + (post ? '' : `?${encoded}`);
+  const multipart = contract?.multipart === true;
+  const deadline = AbortSignal.timeout(multipart ? 600000 : 60000);
+  let body = encoded;
+  if (multipart) {
+    body = new FormData();
+    for (const [key,value] of Object.entries(values)) body.set(key,String(value));
+    for (const [key,value] of Object.entries(contract.files)) body.set(key,new Blob([value.bytes]),value.name);
+  }
+  const ioFailure = error => {
+    const code = requestFailureCode(error,deadline);
+    const message = `Lazada request failed${write ? '; inspect the affected resource before retrying an uncertain write' : ''}`;
+    if (code === 'E_TOOL_CALL_CANCELLED') throw Object.assign(new Error(message),{code});
+    fail(code === 'E_TOOL_CALL_TIMEOUT' ? 'timeout' : 'network_failed',message);
+  };
   let response;
-  try { response = await requestFetch(url, { method: post ? 'POST' : 'GET', headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' }, ...(post ? { body: encoded } : {}), redirect: 'error', signal: AbortSignal.timeout(60000) }); }
-  catch (error) { fail(['AbortError', 'TimeoutError'].includes(error?.name) ? 'timeout' : 'network_failed', `Lazada request failed${write ? '; inspect stock before retrying an uncertain write' : ''}`); }
-  if (!response.ok) fail([401, 403].includes(response.status) ? 'permission_denied' : response.status === 429 ? 'rate_limit' : 'upstream_error', `Lazada API failed (HTTP ${response.status})`);
-  let data;
-  try { data = JSON.parse(await readBody(response)); } catch { fail('upstream_error', 'Lazada returned invalid or oversized JSON'); }
+  try { response = await requestFetch(url, { method: post ? 'POST' : 'GET', headers: { accept: 'application/json', ...(!multipart ? { 'content-type':'application/x-www-form-urlencoded' } : {}) }, ...(post ? { body } : {}), redirect:'error', signal:deadline }); }
+  catch (error) { ioFailure(error); }
+  if (!response.ok) fail([401,403].includes(response.status) ? 'permission_denied' : response.status === 429 ? 'rate_limit' : 'upstream_error', `Lazada API failed (HTTP ${response.status})`,response.status);
+  let text,data;
+  try { text = await readBody(response); } catch (error) {
+    if (error?.code === 'E_CONNECTOR_RESPONSE_TOO_LARGE') fail('upstream_error','Lazada returned invalid or oversized JSON');
+    ioFailure(error);
+  }
+  try { data=JSON.parse(text); } catch { fail('upstream_error','Lazada returned invalid or oversized JSON'); }
   if (String(data?.code) !== '0') fail(['IllegalAccessToken', 'InvalidAccessToken', 'InsufficientPermission', 'InvalidRefreshToken', 'IllegalRefreshToken', 'AUTH_TYPE_UNSUPPORTED', 'InvalidCode'].includes(data?.code) ? 'permission_denied' : String(data?.code) === '901' ? 'rate_limit' : 'request_failed', 'Lazada rejected the request; check the app permissions, shop authorization and parameters');
-  return token ? data : data.data;
+  return token || contract ? data : data.data;
 }
 function tokens(config, data, previous) {
   const countries = previous ? data.country_user_info_list : data.country_user_info;
@@ -94,7 +112,7 @@ const ID = { type: 'string', minLength: 1, maxLength: 25, pattern: '^[1-9][0-9]*
 const PAGE = { offset: { type: 'integer', minimum: 0, maximum: 10000 }, limit: { type: 'integer', minimum: 1, maximum: 50 } };
 const DATE = { type: 'string', minLength: 25, maxLength: 25, pattern: '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}$', description: 'ISO 8601 timestamp including numeric timezone, e.g. 2026-09-01T00:00:00+00:00.' };
 const action = (risk, description, properties = {}, required = []) => ({ risk, description, input_schema: { type: 'object', properties, required, additionalProperties: false } });
-function actionsFor() {
+function legacyActionsFor() {
   return {
     'shop.get': action('R', 'Read and verify the Lazada seller bound to this production country, without contact details.'),
     'products.list': action('R', 'Read one product page including SKU prices and stock. Offset is capped at 10000; use updated_after/updated_before to continue larger catalogs.', { ...PAGE, updated_after: DATE, updated_before: DATE }),
@@ -105,6 +123,110 @@ function actionsFor() {
     'inventory.set': action('H', 'Replace sellable stock for one SKU in its default warehouse after fresh confirmation. For a multi-warehouse store, supply warehouse_code. Never automatically retry an uncertain write.',
       { item_id: ID, sku_id: ID, quantity: { type: 'integer', minimum: 0, maximum: 2147483647 }, warehouse_code: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9_-]+$' } }, ['item_id', 'sku_id', 'quantity']),
   };
+}
+let contracts,nativeActions,validator;
+const validators=new Map();
+function businessContracts() { return contracts ||= require('./lazada-api-contracts.cjs'); }
+function actionsFor() {
+  nativeActions ||= Object.fromEntries(Object.entries(businessContracts().methods).map(([name,m])=>[name,{risk:m.risk,description:m.description,input_schema:m.input_schema}]));
+  return {...legacyActionsFor(),...nativeActions};
+}
+function coverageFor() {
+  const source=businessContracts();
+  return {complete:false,documentation_snapshot:source.documentation_snapshot,scope:source.scope,
+    reviewed_business_methods:Object.keys(source.methods).length,unavailable_methods:{...source.unavailable_methods},max_inline_parameter_bytes:256*1024};
+}
+function validateNative(parameters,contract) {
+  let serialized;
+  try { serialized=JSON.stringify(parameters); } catch { fail('validation_failed','Invalid Lazada action parameters'); }
+  if (!serialized || Buffer.byteLength(serialized)>256*1024) fail('validation_failed','Invalid or oversized Lazada action parameters');
+  if (!validator) { const {AjvJsonSchemaValidator}=require('@modelcontextprotocol/sdk/validation/ajv');validator=new AjvJsonSchemaValidator(); }
+  let check=validators.get(contract.input_schema);
+  if (!check) { check=validator.getValidator(contract.input_schema);validators.set(contract.input_schema,check); }
+  if (!check(parameters).valid) fail('validation_failed','Invalid Lazada action parameters; check the described types and required fields');
+}
+const PRIVATE_FIELDS=new Set(['appkey','appsecret','accesstoken','refreshtoken','idtoken','clientsecret','authorization','signature','password','cookie',
+  'errormsg','errormessage','errormsgs','errmessage','resultmessage','displaymessage','logmessage','message','msg','retmsg','tipcontent']);
+function businessOutput(value,credentials) {
+  if (typeof value === 'string') return ['app_key','app_secret','access_token','refresh_token'].reduce((text,key)=>credentials[key] ? text.split(credentials[key]).join('[redacted]') : text,value);
+  if (Array.isArray(value)) return value.map(item=>businessOutput(item,credentials));
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).filter(([key])=>!PRIVATE_FIELDS.has(key.replace(/[_-]/g,'').toLowerCase()))
+    .map(([key,item])=>[key,businessOutput(item,credentials)]));
+}
+function atPath(value,path) {
+  if (!path.length) return [value];
+  if (path[0] === '*') return Array.isArray(value) ? value.flatMap(item=>atPath(item,path.slice(1))) : [];
+  return value && typeof value === 'object' && Object.hasOwn(value,path[0]) ? atPath(value[path[0]],path.slice(1)) : [];
+}
+function businessFailure(contract,data) {
+  return contract.outcomes.some(field=>atPath(data,field.path).some(value=> {
+    if (field.name === 'success') {
+      if (![true,false,'true','false','TRUE','FALSE'].includes(value)) fail('invalid_response','Lazada returned an invalid success acknowledgement');
+      return value === false || value === 'false' || value === 'FALSE';
+    }
+    if (field.name === 'not_success') return value === true || value === 'true';
+    if (value == null || value === '' || value === 0 || value === '0' || field.neutral_values.includes(value) || (field.name === 'result_code' && value === 'ok')) return false;
+    return typeof value === 'object' ? Object.keys(value).length>0 : true;
+  }));
+}
+function validateAcknowledgement(contract,data) {
+  const business=contract.outputs.filter(field=>!['error_code','error_msg','error_message','err_code','err_message','result_code','result_message','analyseTraceId','errorCode','errorMsg','msg'].includes(field.name));
+  const core=business.filter(field=>Object.hasOwn(data,field.name));
+  if (business.some(field=>field.required && !Object.hasOwn(data,field.name)) || !core.length) fail('invalid_response','Lazada returned a missing business acknowledgement');
+  for (const field of core) {
+    const value=data[field.name];
+    if (value == null && contract.path === '/order/reverse/onlyrefund/seller/decide' && field.name === 'data') continue;
+    const valid=field.type === 'Object' ? value !== null && typeof value === 'object' && !Array.isArray(value)
+      : field.type === 'Object[]' || field.type.endsWith('[]') ? Array.isArray(value)
+        : field.type === 'Boolean' || field.name === 'success' ? [true,false,'true','false','TRUE','FALSE'].includes(value)
+          : field.type === 'Number' ? typeof value === 'number' && Number.isFinite(value) : typeof value === 'string';
+    if (!valid) fail('invalid_response','Lazada returned an invalid business acknowledgement');
+  }
+}
+function requestedShipment(contract,p) {
+  if (contract.path === '/order/fulfill/pack') return p.packReq.pack_order_list.flatMap(order=>order.order_item_list.map(id=>`${order.order_id}/${id}`));
+  if (contract.path === '/order/package/rts') return p.readyToShipReq.packages.map(pkg=>pkg.package_id);
+}
+function reconcileShipment(contract,data,p) {
+  const requested=requestedShipment(contract,p);
+  if (!requested || [false,'false','FALSE'].includes(data.result?.success)) return;
+  const orders=data.result?.data?.pack_order_list,packages=data.result?.data?.packages;
+  const entries=contract.path === '/order/fulfill/pack'
+    ? Array.isArray(orders) ? orders.flatMap(order=>Array.isArray(order.order_item_list) ? order.order_item_list.map(item=>({key:`${order.order_id}/${item.order_item_id}`,code:item.item_err_code})) : []) : undefined
+    : Array.isArray(packages) ? packages.map(pkg=>({key:pkg.package_id,code:pkg.item_err_code})) : undefined;
+  const wanted=new Set(requested);
+  if (wanted.size !== requested.length || !Array.isArray(entries) || entries.length !== wanted.size
+      || new Set(entries.map(item=>item.key)).size !== entries.length
+      || entries.some(item=>!wanted.has(item.key) || !['string','number'].includes(typeof item.code))) {
+    fail('invalid_response','Lazada shipment was not fully acknowledged; inspect the affected orders before retrying');
+  }
+}
+async function executeNative(config,parameters,contract) {
+  validateNative(parameters,contract);
+  const p=parameters.parameters || {};
+  const requested=requestedShipment(contract,p);
+  if (requested && new Set(requested).size !== requested.length) fail('validation_failed','Duplicate Lazada shipment resources');
+  for (const key of ['seller_id','sellerId']) if (p[key] !== undefined && String(p[key]) !== config.credentials.identity.shop_id) fail('binding_mismatch','Lazada seller binding differs from the authorized shop');
+  if (contract.path === '/rc/sellerWarehouse/saveWarehouseInfo' && (String(p.ownerId) !== config.credentials.identity.shop_id || p.siteId.toLowerCase() !== config.metadata.country)) fail('binding_mismatch','Lazada warehouse binding differs from the authorized shop');
+  for (const key of ['created_after','created_before','update_after','update_before']) if (p[key] !== undefined && !Number.isFinite(Date.parse(p[key]))) fail('validation_failed','Invalid Lazada date');
+  for (const [start,end] of [['created_after','created_before'],['update_after','update_before']]) if (p[start] && p[end] && Date.parse(p[start])>=Date.parse(p[end])) fail('validation_failed','Invalid Lazada time range');
+  const args={},files={};
+  for (const [key,value] of Object.entries(p)) {
+    if (contract.input_schema.properties.parameters.properties[key].properties?.content_base64) {
+      const bytes=Buffer.from(value.content_base64,'base64');
+      if (bytes.toString('base64') !== value.content_base64) fail('validation_failed','Invalid Lazada upload parameters; use canonical base64');
+      files[key]={name:value.name,bytes};
+    } else args[key]=value && typeof value === 'object' ? JSON.stringify(value) : String(value);
+  }
+  await ensureToken(config);
+  const data=await request(config,contract.path,args,false,contract.risk !== 'R',{...contract,files});
+  const failed=businessFailure(contract,data);
+  if (!failed) validateAcknowledgement(contract,data);
+  reconcileShipment(contract,data,p);
+  const explicitFailure=contract.risk !== 'R' && (data.result === false || data.data === false || data.module?.result === false
+    || data.result?.module === false || data.data?.tip_type === 'error');
+  return {...(failed || explicitFailure ? {status:'partial_or_failed'} : contract.risk !== 'R' ? {status:'acknowledged'} : {}),data:businessOutput(data,config.credentials)};
 }
 const ORDER_KEYS = new Set(['orders', 'count', 'countTotal', 'order_id', 'order_number', 'created_at', 'updated_at', 'price', 'shipping_fee', 'items_count', 'statuses', 'status', 'order_item_id', 'sku', 'shop_sku', 'name', 'item_price', 'paid_price', 'quantity', 'currency', 'product_id', 'sku_id']);
 function orders(value) {
@@ -119,8 +241,10 @@ async function identity(config) {
 }
 async function execute(config, name, parameters = {}) {
   validateBinding(config);
-  const spec = actionsFor()[name];
+  const legacy = Object.hasOwn(legacyActionsFor(),name);
+  const spec = legacy ? legacyActionsFor()[name] : actionsFor()[name];
   if (!spec) fail('validation_failed', 'Unreviewed Lazada action');
+  if (!legacy) return executeNative(config,parameters,businessContracts().methods[name]);
   validate(parameters, spec.input_schema);
   const p = parameters;
   for (const key of ['updated_after', 'updated_before', 'created_after', 'created_before']) if (p[key] && !Number.isFinite(Date.parse(p[key]))) fail('validation_failed', 'Invalid Lazada date');
@@ -162,4 +286,4 @@ async function authorize(config) {
   await execute(bound, 'orders.list', { limit: 1, created_after: new Date(Date.now() - 86400000).toISOString().slice(0, 19) + '+00:00' });
   return credentials;
 }
-module.exports = { isProvider, apiBase, validateBinding, actionsFor, identity, execute, authorize, authorizeUrl, sign };
+module.exports = { isProvider, apiBase, validateBinding, actionsFor, coverageFor, identity, execute, authorize, authorizeUrl, sign };

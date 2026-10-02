@@ -1,19 +1,24 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const power = vi.hoisted(() => ({ listeners: new Map<string, () => void>(), on: vi.fn() }));
+const power = vi.hoisted(() => ({ listeners: new Map<string, () => void>(), on: vi.fn(), warn: vi.fn(), unavailable: false }));
+vi.mock('../../../src/main/logger', () => ({ createLogger: () => ({ warn: power.warn }) }));
 vi.mock('electron', () => ({ powerMonitor: { on: (event: string, fn: () => void) => {
+  if (power.unavailable) throw new Error('fixture OS events unavailable');
   power.on(event); power.listeners.set(event, fn);
 } } }));
-afterEach(() => { vi.useRealTimers(); });
+afterEach(() => { power.unavailable = false; vi.useRealTimers(); });
 
 describe('SystemActivityTracker', () => {
-  it('shares one registered OS clock across snapshot consumers and concurrent CLI runs, ignoring duplicate events', async () => {
+  it('shares one registered OS clock across telemetry and concurrent CLI runs, ignoring duplicate events', async () => {
     vi.resetModules();
     power.listeners.clear(); power.on.mockClear();
     vi.useFakeTimers(); vi.setSystemTime(1000);
     const { getSystemActivityClock, getSystemActivitySnapshot } = await import('../../../src/main/features/system_activity');
     const [first, second] = await Promise.all([getSystemActivityClock(), getSystemActivityClock()]);
     await getSystemActivitySnapshot();
+    const shared = await import('../../../src/main/util/system-activity');
+    expect(await shared.getAgentIdleClock()).toBe(first);
+    expect(await shared.getSystemActivityClock()).toBe(first);
     expect(power.on.mock.calls).toEqual([['suspend'], ['resume']]);
     expect(first()).toBe(1000);
     vi.setSystemTime(1100);
@@ -65,4 +70,19 @@ describe('SystemActivityTracker', () => {
       suspend_count: 1,
     });
   });
+});
+
+it('retains bounded wall-clock idle behavior when OS monitoring is unavailable, with one warning across actors', async () => {
+  vi.resetModules();
+  vi.useFakeTimers();
+  power.unavailable = true;
+  power.warn.mockClear();
+  const { getAgentIdleClock } = await import('../../../src/main/util/system-activity');
+  const clocks = await Promise.all([getAgentIdleClock(), getAgentIdleClock()]);
+  const start = clocks[0]();
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(clocks[0]()).toBe(start + 1000);
+  expect(clocks[1]).toBe(clocks[0]);
+  expect(power.warn).toHaveBeenCalledTimes(1);
+  expect(power.warn).toHaveBeenCalledWith('System suspension clock unavailable; retaining wall-clock Agent idle timeout');
 });

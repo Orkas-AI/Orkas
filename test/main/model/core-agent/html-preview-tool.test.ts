@@ -260,7 +260,7 @@ describe('html_preview tool', () => {
     });
     expect(render).toHaveBeenCalledWith(path.join(workspace, 'index.html'), [
       { name: 'desktop', width: 1440, height: 900 },
-    ]);
+    ], {}, { fileViewer: true });
   });
 
   it('returns inconclusive observations without a tool error and retains requested screenshots', async () => {
@@ -316,7 +316,7 @@ describe('html_preview tool', () => {
       entry,
       [{ name: 'desktop', width: 1440, height: 900 }],
       {},
-      { interactions: false },
+      { interactions: false, fileViewer: true },
     );
   });
 
@@ -364,7 +364,7 @@ describe('html_preview tool', () => {
     expect(render).toHaveBeenCalledWith(entry, [
       { name: 'desktop', width: 1440, height: 900 },
       { name: 'mobile', width: 390, height: 844 },
-    ]);
+    ], {}, { fileViewer: true });
   });
 
   it('returns deterministic diagnostics without model images when rendered checks fail', async () => {
@@ -418,7 +418,7 @@ describe('html_preview tool', () => {
     });
     expect(render).toHaveBeenCalledWith(path.join(workspace, 'index.html'), [
       { name: 'desktop', width: 1440, height: 900 },
-    ]);
+    ], {}, { fileViewer: true });
   });
 
   it('renders exactly one mobile screenshot for an explicitly mobile artifact', async () => {
@@ -441,7 +441,7 @@ describe('html_preview tool', () => {
     });
     expect(render).toHaveBeenCalledWith(path.join(workspace, 'index.html'), [
       { name: 'mobile', width: 390, height: 844 },
-    ]);
+    ], {}, { fileViewer: true });
   });
 
   it('defaults an omitted target to one lossless desktop screenshot', async () => {
@@ -460,7 +460,7 @@ describe('html_preview tool', () => {
     });
     expect(render).toHaveBeenCalledWith(path.join(workspace, 'index.html'), [
       { name: 'desktop', width: 1440, height: 900 },
-    ]);
+    ], {}, { fileViewer: true });
   });
 
   it('rejects an unknown target instead of silently treating it as responsive', async () => {
@@ -515,7 +515,7 @@ describe('html_preview tool', () => {
     expect(result.isError).toBeUndefined();
     expect(render).toHaveBeenCalledWith(path.join(workspace, 'index.html'), [
       { name: 'desktop', width: 1440, height: 900 },
-    ]);
+    ], {}, { fileViewer: true });
   });
 
   it('keeps responsive viewport order and applies both user-requested dimensions', async () => {
@@ -535,7 +535,7 @@ describe('html_preview tool', () => {
     expect(render).toHaveBeenCalledWith(path.join(workspace, 'index.html'), [
       { name: 'desktop', width: 1280, height: 720 },
       { name: 'mobile', width: 360, height: 780 },
-    ]);
+    ], {}, { fileViewer: true });
   });
 
   it('preserves browser-unavailable as an infrastructure-specific result code', async () => {

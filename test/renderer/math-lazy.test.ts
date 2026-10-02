@@ -46,6 +46,40 @@ function loadMathBridge({ failLoads = 0 } = {}) {
 }
 
 describe('renderer MathJax lazy loading', () => {
+  it('does not retain intermediate stream versions in the session HTML cache', async () => {
+    const { context, warn } = loadMathBridge();
+    context.document.createElement = () => ({ style: {}, innerHTML: '', parentElement: null });
+    context.window.MathJax.typesetPromise = async () => {};
+    await context.typesetMathHtml('$stable$');
+    for (let i = 0; i < 180; i++) await context.typesetMathHtml(`$x+${i}$`, { cache: false });
+    expect(vm.runInContext('Array.from(_mathHtmlCache.keys())', context)).toEqual(['$stable$']);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('releases temporary formula hosts after rendering (failure=%s)', async fail => {
+    const { context, warn } = loadMathBridge();
+    const retained = new Set();
+    const mounted = new Set();
+    context.document.createElement = () => ({ style: {}, innerHTML: '', parentElement: null });
+    context.document.body = {
+      appendChild(host: any) { mounted.add(host); host.parentElement = this; },
+      removeChild(host: any) { mounted.delete(host); host.parentElement = null; },
+    };
+    context.window.MathJax = {
+      typesetClear: (hosts: any[]) => hosts.forEach(host => retained.delete(host)),
+      typesetPromise: async (hosts: any[]) => {
+        hosts.forEach(host => retained.add(host));
+        if (fail) throw new Error('Fixture typesetting failure');
+        hosts[0].innerHTML = '<math><mi>x</mi></math>';
+      },
+    };
+    const result = await context.typesetMathHtml('$x$');
+    expect(result).toBe(fail ? '$x$' : '<math><mi>x</mi></math>');
+    expect(retained.size).toBe(0);
+    expect(mounted.size).toBe(0);
+    expect(warn.mock.calls).toEqual(fail ? [['typeset html failed']] : []);
+  });
+
   it('does not load the runtime for ordinary chat content', async () => {
     const { context, appended } = loadMathBridge();
     await context.window.typesetMath({ textContent: 'plain message', querySelectorAll: () => [] });

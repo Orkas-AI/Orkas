@@ -12,12 +12,9 @@ const mockCliFallback = vi.fn<[any], any>();
 const mockCliFailure = vi.fn();
 const mockCliSuccess = vi.fn();
 const suspensionClock = vi.hoisted(() => ({ suspended: 0, unavailable: false }));
-vi.mock('../../../../src/main/features/system_activity', async (importOriginal) => ({
-  ...await importOriginal<typeof import('../../../../src/main/features/system_activity')>(),
-  getSystemActivityClock: async () => {
-    if (suspensionClock.unavailable) throw new Error('fixture power monitor unavailable');
-    return () => Date.now() - suspensionClock.suspended;
-  },
+vi.mock('../../../../src/main/util/system-activity', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../../../src/main/util/system-activity')>(),
+  getAgentIdleClock: async () => () => Date.now() - (suspensionClock.unavailable ? 0 : suspensionClock.suspended),
 }));
 vi.mock('../../../../src/main/features/local_agents/registry', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../../src/main/features/local_agents/registry')>();

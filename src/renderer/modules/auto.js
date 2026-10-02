@@ -8,7 +8,7 @@
 // Layout:
 //   #panel-auto
 //     .auto-scroll
-//       .auto-list   global tasks first, then project groups in sidebar order
+//       .auto-list   project switcher and the selected scope's cards
 //
 // Create and edit share a modal with the project-detail Automation tab.
 //
@@ -158,8 +158,9 @@ function _autoAttachDisplayName(item) {
 
 let _autoTasks = [];           // last fetched global list
 let _autoLoadedOnce = false;
-// Presentation state belongs to this list, independently of sidebar expansion.
-const _autoCollapsedGroups = new Set();
+// Presentation-only: preserve the selected scope across list refreshes.
+let _autoActiveScope = null;
+const _autoExpandedRows = new Set();
 let _autoFormMounted = false;  // _aiSelectMount only once
 let _autoEditingTaskId = null; // null = create mode, taskId = edit mode
 // Current persistent installation identity — fetched lazily on first row
@@ -472,9 +473,7 @@ function _autoRenderRow(task, opts) {
   const moreTitle = escapeHtml(t('auto.more_menu'));
 
   // Conversation count labels the row's optional execution-history disclosure.
-  // The row itself is the disclosure surface; the redundant per-row chevron is
-  // intentionally omitted so project grouping remains the only visible
-  // expand/collapse control in the list.
+  // The row itself is the disclosure surface, with no extra chevron.
   const convCount = _autoCountConvsForTask(task.id);
 
   row.innerHTML = `
@@ -506,8 +505,8 @@ function _autoRenderRow(task, opts) {
     _openAutoRowMenu(moreBtn, task, opts);
   });
   // ── Execution-history disclosure ────────────────────────────────────
-  // Clicking the row still reveals its runs, but project grouping owns the
-  // only visible chevron. Interactive controls keep their own click semantics.
+  // Clicking the row reveals its runs. Interactive controls keep their own
+  // click semantics.
   const convsWrap = row.querySelector('.auto-row-convs');
   const convsList = row.querySelector('.auto-row-convs-list');
   const toggleExpand = () => {
@@ -968,7 +967,12 @@ function _autoRenderList() {
   // while another view is open waits for the next tab visit, which always
   // reloads and repaints from the current caches.
   if (typeof currentView !== 'undefined' && currentView !== 'auto') return;
-  const expandedIds = new Set(Array.from(listEl.querySelectorAll('.auto-row.is-expanded'), (row) => row.dataset.taskId));
+  for (const row of listEl.querySelectorAll('.auto-row')) {
+    if (row.classList.contains('is-expanded')) _autoExpandedRows.add(row.dataset.taskId);
+    else _autoExpandedRows.delete(row.dataset.taskId);
+  }
+  const taskIds = new Set(_autoTasks.map((task) => task.id));
+  for (const id of _autoExpandedRows) if (!taskIds.has(id)) _autoExpandedRows.delete(id);
   _closeAutoRowMenu();
   listEl.innerHTML = '';
   const headerCount = document.getElementById('auto-header-count');
@@ -982,48 +986,47 @@ function _autoRenderList() {
   const onEdit = (task) => openAutoTaskDialog({ task });
   const afterChange = () => loadAutoList(true);
   const projects = typeof _projectsCache !== 'undefined' && Array.isArray(_projectsCache) ? _projectsCache : [];
-  for (const group of _autoGroupTasks(_autoTasks, projects)) {
-    const section = document.createElement('section');
-    section.className = 'auto-group';
-    section.dataset.projectId = group.projectId;
+  const groups = _autoGroupTasks(_autoTasks, projects);
+  if (!groups.some((group) => group.projectId === _autoActiveScope)) _autoActiveScope = groups[0].projectId;
+  const switcher = document.createElement('nav');
+  switcher.className = 'todo-scope-switcher auto-scope-switcher';
+  switcher.setAttribute('aria-label', t('todo.by_project'));
+  for (const group of groups) {
     const name = group.projectId ? (group.name || t('auto.project_unavailable')) : t('auto.global');
-    const expanded = !_autoCollapsedGroups.has(group.projectId);
-    section.innerHTML = `
-      <div class="auto-group-head">
-        <button type="button" class="auto-group-toggle" aria-expanded="${expanded}">
-          <span class="auto-group-icon">${_autoUiIcon(expanded ? 'folder-open' : 'folder', 'auto-group-folder-icon')}</span>
-          <span class="auto-group-name">${escapeHtml(name)}</span>
-          <span class="auto-group-count">${group.tasks.length}</span>
-        </button>
-        ${!group.projectId || _autoProjectExists(group.projectId) ? `
-          <button type="button" class="project-todo-menu auto-group-add" aria-label="${escapeHtml(t('auto.create_btn') + ' · ' + name)}" title="${escapeHtml(t('auto.create_btn'))}">
-            ${_autoUiIcon('plus')}
-          </button>` : ''}
-      </div>
-      <div class="auto-group-list"${expanded ? '' : ' hidden'}></div>`;
-    const groupList = section.querySelector('.auto-group-list');
-    groupList.id = `auto-group-list-${group.projectId || 'global'}`;
-    const toggle = section.querySelector('.auto-group-toggle');
-    const add = section.querySelector('.auto-group-add');
-    if (add) add.addEventListener('click', () => openAutoTaskDialog({ initialProjectId: group.projectId }));
-    toggle.setAttribute('aria-controls', groupList.id);
-    toggle.addEventListener('click', () => {
-      const next = toggle.getAttribute('aria-expanded') !== 'true';
-      toggle.setAttribute('aria-expanded', String(next));
-      groupList.hidden = !next;
-      if (next) _autoCollapsedGroups.delete(group.projectId);
-      else _autoCollapsedGroups.add(group.projectId);
-      section.querySelector('.auto-group-icon').innerHTML = _autoUiIcon(next ? 'folder-open' : 'folder', 'auto-group-folder-icon');
-      _closeAutoRowMenu();
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'todo-scope-chip';
+    chip.dataset.projectId = group.projectId;
+    chip.setAttribute('aria-pressed', String(group.projectId === _autoActiveScope));
+    chip.innerHTML = _autoUiIcon('folder', 'todo-scope-chip-icon')
+      + `<span class="todo-scope-chip-name">${escapeHtml(name)}</span>`
+      + `<span class="todo-scope-chip-count">${group.tasks.length}</span>`;
+    chip.addEventListener('click', () => {
+      if (_autoActiveScope === group.projectId) return;
+      _autoActiveScope = group.projectId;
+      _autoRenderList();
     });
-    if (!group.tasks.length) {
-      groupList.innerHTML = `<div class="auto-group-empty">${escapeHtml(t('auto.global_empty'))}</div>`;
-    }
-    for (const task of group.tasks) {
-      groupList.appendChild(_autoRenderRow(task, { onEdit, afterChange, expanded: expandedIds.has(task.id) }));
-    }
-    listEl.appendChild(section);
+    switcher.appendChild(chip);
   }
+  listEl.appendChild(switcher);
+  const group = groups.find((item) => item.projectId === _autoActiveScope);
+  if (!group) return;
+  const section = document.createElement('section');
+  section.className = 'auto-scope-group';
+  section.dataset.projectId = group.projectId;
+  const cards = document.createElement('div');
+  cards.className = 'auto-scope-cards';
+  if (!group.tasks.length) {
+    const empty = document.createElement('div');
+    empty.className = 'auto-scope-empty empty muted';
+    empty.textContent = t('auto.global_empty');
+    section.appendChild(empty);
+  }
+  for (const task of group.tasks) {
+    cards.appendChild(_autoRenderRow(task, { onEdit, afterChange, expanded: _autoExpandedRows.has(task.id) }));
+  }
+  if (group.tasks.length) section.appendChild(cards);
+  listEl.appendChild(section);
 }
 
 // ─── Project-detail card ─────────────────────────────────────────────────
@@ -1593,10 +1596,10 @@ function _autoComposerValueForTask(task) {
 function _autoSetComposerValue(value) {
   const ta = document.getElementById('auto-task-input');
   if (!ta) return;
-  ta.value = String(value || '');
-  try { ta.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+  composerSetText(ta, String(value || ''));
+  try { composerNotify(ta); } catch (_) {}
   try {
-    if (typeof syncChatRichComposerFromTextarea === 'function') syncChatRichComposerFromTextarea(ta);
+    if (typeof refreshChatComposer === 'function') refreshChatComposer(ta);
   } catch (_) {}
 }
 
@@ -2268,6 +2271,7 @@ function _autoRepaintLabels() {
 }
 
 function _autoResetForm() {
+  composerBindOwner('auto-task-input', {});
   _autoEditingTaskId = null;
   _autoEditingProjectId = '';
   _autoEditingDeviceTask = null;
@@ -2375,6 +2379,7 @@ function _hideAutoDialog() {
 
 /** Hydrate the form fields from an existing task — used by edit mode. */
 function _autoFillForm(task) {
+  composerBindOwner('auto-task-input', {});
   _autoEditingTaskId = task.id;
   _autoEditingProjectId = task.project_id || '';
   _autoEditingDeviceTask = task;
@@ -2457,7 +2462,7 @@ async function _autoSubmitForm() {
   const endCountInput = document.getElementById('auto-end-count-input');
   if (!ta || !submitBtn || !_autoFreqSel || !_autoHourSel || !_autoMinuteSel) return;
 
-  const rawContent = (ta.value || '').trim();
+  const rawContent = (composerText(ta) || '').trim();
   const content = _autoStripComposerUseTokens(rawContent).trim();
   const messageParts = (typeof chatUseMessagePartsFromText === 'function')
     ? chatUseMessagePartsFromText(rawContent)

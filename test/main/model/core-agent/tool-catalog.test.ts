@@ -291,6 +291,14 @@ describe('tool-catalog', () => {
     expect(toolNamesForGroups(['management.marketplace'])).toEqual([
       'marketplace_search', 'marketplace_request_install',
     ]);
+    // Creating a project and relocating the conversation is Commander's call, so
+    // the shared backlog group must not carry it into an Agent dependency.
+    expect(toolNamesForGroups(['management.projects'])).toEqual(['todo_tasks', 'project_setup']);
+    expect(toolNamesForAgentGroups(['management.projects'])).toEqual(['todo_tasks']);
+    expect(TOOL_CATALOG.find((entry) => entry.name === 'project_setup'))
+      .toMatchObject({ loadGroups: ['management.projects'], agentAssignable: false });
+    // run_program is denied by omission: the tool relocates user data.
+    expect(TOOL_CATALOG.find((entry) => entry.name === 'project_setup')?.programmatic).toBeUndefined();
     expect(toolNamesForGroups(['management.automation'])).toEqual(['auto_tasks']);
     expect(toolNamesForGroups(['management.app'])).toEqual(['open_app_view', 'app_health']);
     // Keep the broad parent as an explicit compatibility alias while new
@@ -305,6 +313,7 @@ describe('tool-catalog', () => {
     ]);
     expect(toolNamesForGroups(['management'])).toEqual([
       'todo_tasks',
+      'project_setup',
       'skill_search',
       'import_skill_package',
       'marketplace_search',
@@ -514,10 +523,14 @@ describe('tool-catalog', () => {
     // nonnegative range bounds; file-tools tests pin the provider definition.
     // 2026-09-21: XLSX cells use an equivalent primitive/object type array;
     // tool-schema-compat tests compare accepted/rejected values to the old union.
+    // 2026-09-22: requested drag support adds bounded CSS-pixel deltas to
+    // inner_browser.act; browser-tool tests enforce conditional validation.
+    // 2026-09-23: long-article input raises inner_browser.text to 100000;
+    // native/MCP boundary tests and background Chromium editing pin the limit.
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('a40b858fb9236a98666aab74fa5c468a99f5f1eaf47b7cd5e2d077f3d3ad6d4e');
+    ).toBe('2a7ee706279c294c974bdf3e90bf2e1b4a09f1c3c41b446a1c9d9454b1c104c3');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {
@@ -642,7 +655,8 @@ describe('tool-catalog', () => {
     expect(officeOperation.action.description).toContain('omit unrelated fields');
 
     for (const name of ['process_session', 'interactive_cli']) {
-      expect(propertyDescription(toolByName(name), 'action')).toContain('only its action-specific fields');
+      expect(propertyDescription(toolByName(name), 'action')).toContain('ignored_fields');
+      expect(propertyDescription(toolByName(name), 'action')).toContain('session_id');
     }
 
     const pptx = toolByName('create_pptx');
@@ -671,7 +685,7 @@ describe('tool-catalog', () => {
       chat_history: ['search', 'page', 'earlier work', 'quoted', 'stale', 'library'],
       web_search: ['search', 'titles', 'urls', 'snippets', 'web_fetch'],
       web_fetch: ['fetch', 'url', 'readable extracted text'],
-      inner_browser: ['visible browser tabs', 'observe', 'page_id', 'element_ref', 'untrusted', 'user'],
+      inner_browser: ['task browser tabs', 'observe', 'page_id', 'element_ref', 'untrusted', 'user'],
       office_review: ['validate', 'render', 'check_and_render', 'pages'],
       generate_image: ['generate', 'image', 'prompt', 'output_path', 'reference'],
       generate_speech: ['narration', 'text', 'output_path', 'target_duration'],

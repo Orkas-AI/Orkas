@@ -24,6 +24,22 @@ function httpFailureCode(status) {
   return 'E_TOOL_CALL_UPSTREAM';
 }
 
+function tokenExpiryMs(value, fallbackSeconds) {
+  if (value !== undefined && typeof value !== 'number' && typeof value !== 'string') {
+    throw Object.assign(new Error('The platform returned an invalid token expiry'), { code: 'E_TOOL_CALL_UPSTREAM' });
+  }
+  const seconds = value === undefined ? fallbackSeconds : Number(value);
+  const expiry = Date.now() + seconds * 1000;
+  if (!Number.isSafeInteger(seconds) || seconds <= 0 || !Number.isSafeInteger(expiry)) {
+    throw Object.assign(new Error('The platform returned an invalid token expiry'), { code: 'E_TOOL_CALL_UPSTREAM' });
+  }
+  return expiry;
+}
+
+function httpFailure(status, message) {
+  return Object.assign(new Error(message), { code: httpFailureCode(status), httpStatus: status });
+}
+
 function credentialOperation(operation) {
   return async (...args) => {
     requestSignal.getStore()?.throwIfAborted();
@@ -45,4 +61,5 @@ function requestFetch(url, init = {}, fetchImpl = globalThis.fetch) {
   return fetchImpl(url, { ...init, signal });
 }
 
-module.exports = { withRequestSignal, credentialOperation, requestFetch, requestFailureCode, httpFailureCode };
+module.exports = { withRequestSignal, credentialOperation, requestFetch, requestFailureCode, httpFailureCode,
+  httpFailure, tokenExpiryMs };

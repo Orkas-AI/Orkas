@@ -44,11 +44,12 @@ import { providerLabel } from '../provider_catalog';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import {
-  classifyTransientNetworkError,
+  classifyTransientNetworkErrorForDisplay,
   isStorageFullError,
+  isProviderSafetyError,
 } from '../../../core-agent/src/shared/errors';
 import { classifyKeyFailure, type KeyFailureKind } from './auth-error';
-import { providerCredentialFailure } from '../../../core-agent/src/shared/provider-error-facts';
+import { providerCredentialFailure, providerErrorFacts } from '../../../core-agent/src/shared/provider-error-facts';
 import { sanitizeLogTextForUpload } from '../../util/log-sanitize';
 import { redactPaths } from '../../util/redact';
 
@@ -175,7 +176,7 @@ function modelFailureDetails(
     || code === 'RETRY_EXHAUSTED';
   const statusCode = typeof error.statusCode === 'number' ? error.statusCode : 0;
   const credentialKind = providerCredentialFailure(error);
-  const transientKind = classifyTransientNetworkError(error);
+  const transientKind = classifyTransientNetworkErrorForDisplay(error);
   let failureCode = 'provider_error';
   let failurePhase: NonNullable<StreamEvent['failurePhase']> = hasVisibleText ? 'model_text' : 'provider_wait';
 
@@ -422,7 +423,14 @@ function localizeKnownRunnerError(error: AgentErrorMeta, providerId?: string): s
       : t('errors.model_provider_balance_insufficient');
   }
   if (explicitKind === 'network') return t('errors.model_network_unavailable');
-  const transientKind = classifyTransientNetworkError(error);
+  // Unknown HTTP bodies can expose upstream route names and request details.
+  // Display only the structured status; keep provider safety refusals intact.
+  const status = providerErrorFacts(error).status;
+  if (status === 400 && !isProviderSafetyError(error)) return t('errors.model_request_rejected');
+  if (status === 404 || status === 410 || (status !== undefined && status >= 500 && status <= 599)) {
+    return t('errors.model_temporarily_unavailable');
+  }
+  const transientKind = classifyTransientNetworkErrorForDisplay(error);
   if (transientKind === 'connection_dropped' || transientKind === 'timeout' || transientKind === 'network') {
     return t('errors.model_network_unavailable');
   }

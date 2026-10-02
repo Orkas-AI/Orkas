@@ -1063,6 +1063,97 @@ describe('builtin marketplace seed', () => {
     });
   });
 
+  it('resolves a packaged catalog and checks updates with two metadata requests and no detail downloads', async () => {
+    const ids = Array.from({ length: 22 }, (_, i) => (i + 1).toString(16).padStart(12, '0'));
+    for (const id of ids) {
+      writeBuiltinAgent(id, { name: `Agent ${id}`, workflow: 'Write.' });
+      writeBuiltinSkill(id);
+    }
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const { createMarketplaceCatalogReader } = await import('../../../src/main/features/marketplace_catalog');
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    await seed.seedBuiltinMarketplaceForUser('u1');
+    postJsonMock.mockImplementation(async (endpoint: string, body: any) => {
+      if (!['/marketplace/agents/list', '/marketplace/skills/list'].includes(endpoint)) throw new Error('Unexpected detail download');
+      return { list: body.ids.map((id: string) => ({
+        id, name: `Agent ${id}`, version: '2.0.0', published_at: 100, updated_at: 200,
+        create_uid: '0', default_install: true, status: 'approved', min_app_version: '1.0.0',
+        ...(endpoint.includes('/agents/')
+          ? { agent_json_url: `https://cdn.test/${id}.json`, agent_skills_bundle_url: '' }
+          : { bundle_url: `https://cdn.test/${id}.zip` }),
+      })), total: body.ids.length };
+    });
+    const catalogReader = createMarketplaceCatalogReader();
+    expect(await seed.resolveBuiltinMarketplaceInstalls('u1', { catalogReader })).toMatchObject({
+      resolved_agents: 22, resolved_skills: 22, failed: [],
+    });
+    expect(await reconcile.checkServerUpdatesForInstalls('u1', { catalogReader })).toMatchObject({
+      updated_agents: 0, updated_skills: 0,
+    });
+    expect(postJsonMock).toHaveBeenCalledTimes(2);
+    expect(postJsonMock.mock.calls.map(([, body]) => body.ids.length)).toEqual([22, 22]);
+    const manifest = await installs.readInstalls('u1');
+    for (const kind of ['agents', 'skills'] as const) {
+      expect(manifest[kind]).toHaveLength(22);
+      for (const row of manifest[kind]) {
+        expect(row).toMatchObject({ version: '2.0.0', min_app_version: '1.0.0', create_uid: '0' });
+        expect(row.seed_source).toBeUndefined();
+      }
+    }
+    expect(await seed.resolveBuiltinMarketplaceInstalls('u1')).toMatchObject({ resolved_agents: 0, resolved_skills: 0, failed: [] });
+    expect(postJsonMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('batches absent Agent ids and their legacy name lookup instead of querying once per Agent', async () => {
+    const ids = Array.from({ length: 22 }, (_, i) => (i + 1).toString(16).padStart(12, '0'));
+    for (const id of ids) writeBuiltinAgent(id, { name: `Agent ${id}`, workflow: 'Write.' });
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await seed.seedBuiltinMarketplaceForUser('u1');
+    const before = await installs.readInstalls('u1');
+    postJsonMock.mockResolvedValue({ list: [], total: 0 });
+    expect(await seed.resolveBuiltinMarketplaceInstalls('u1')).toMatchObject({ resolved_agents: 0, failed: [] });
+    expect(postJsonMock).toHaveBeenCalledTimes(2);
+    expect(postJsonMock.mock.calls[0][1].ids).toEqual(ids);
+    expect(postJsonMock.mock.calls[1][1].names).toEqual(ids.map(id => `Agent ${id}`));
+    expect(await installs.readInstalls('u1')).toEqual(before);
+  });
+
+  it('does not publish stale catalog results or start another batch after an account switch', async () => {
+    writeBuiltinAgent(TEST_AGENT_ID, { name: 'Writer', workflow: 'Write.' });
+    writeBuiltinSkill('pending-skill');
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await seed.seedBuiltinMarketplaceForUser('u1');
+    const before = await installs.readInstalls('u1');
+    let active = true;
+    postJsonMock.mockImplementation(async () => {
+      active = false;
+      return { list: [{ id: TEST_AGENT_ID, version: '2.0.0', agent_json_url: 'https://cdn.test/agent.json' }], total: 1 };
+    });
+    expect(await seed.resolveBuiltinMarketplaceInstalls('u1', { shouldContinue: () => active })).toMatchObject({
+      resolved_agents: 0, resolved_skills: 0, failed: [],
+    });
+    expect(postJsonMock).toHaveBeenCalledTimes(1);
+    expect(await installs.readInstalls('u1')).toEqual(before);
+  });
+
+  it('keeps seeds intact when catalog installation addresses are explicitly unavailable', async () => {
+    writeBuiltinAgent(TEST_AGENT_ID, { name: 'Writer', workflow: 'Write.' });
+    writeBuiltinSkill('unavailable');
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await seed.seedBuiltinMarketplaceForUser('u1');
+    const before = await installs.readInstalls('u1');
+    postJsonMock.mockImplementation(async (_endpoint: string, body: any) => ({
+      list: body.ids.map((id: string) => ({ id, create_uid: '0', agent_json_url: '', bundle_url: '' })), total: body.ids.length,
+    }));
+    expect(await seed.resolveBuiltinMarketplaceInstalls('u1')).toMatchObject({ resolved_agents: 0, resolved_skills: 0 });
+    expect(await installs.readInstalls('u1')).toEqual(before);
+    expect(postJsonMock).toHaveBeenCalledTimes(2);
+  });
+
   it('resolves builtin skill seed rows to official marketplace rows by exact id', async () => {
     writeBuiltinSkill('seo-crawl', 'SEO Crawl');
     const seed = await import('../../../src/main/features/builtin_marketplace');
@@ -1197,7 +1288,7 @@ describe('builtin marketplace seed', () => {
       if (p === '/marketplace/agents/list' && Array.isArray(body?.ids)) {
         return { list: [], total: 0 };
       }
-      if (p === '/marketplace/agents/list' && body?.q === 'Writer') {
+      if (p === '/marketplace/agents/list' && body?.names?.includes('Writer')) {
         return {
           list: [{
             id: 'abc123def456',
@@ -1248,7 +1339,7 @@ describe('builtin marketplace seed', () => {
     expect(enabled.readEnabledMap('u1').agents).toEqual({ abc123def456: false });
   });
 
-  it('moves a disabled preference when a builtin skill resolves to a replacement id', async () => {
+  it('rejects unrelated catalog ids without moving a builtin skill or its disabled preference', async () => {
     writeBuiltinSkill('legacy-skill', 'Legacy Skill');
     const seed = await import('../../../src/main/features/builtin_marketplace');
     const paths = await import('../../../src/main/paths');
@@ -1273,32 +1364,22 @@ describe('builtin marketplace seed', () => {
           total: 1,
         };
       }
-      if (p === '/marketplace/skills/bundle' && body?.id === 'abc123def456') {
-        return {
-          bundle_url: 'https://cdn.test/abc123def456.zip',
-          version: '2.0.0',
-          published_at: 100,
-          updated_at: 200,
-          create_uid: '0',
-          default_install: true,
-          status: 'approved',
-        };
-      }
       throw new Error(`unexpected ${p}`);
     });
 
     await expect(seed.resolveBuiltinMarketplaceInstalls('u1')).resolves.toMatchObject({
-      resolved_skills: 1,
-      migrated_skills: 1,
+      resolved_skills: 0,
+      migrated_skills: 0,
       failed: [],
     });
 
-    expect(fs.existsSync(path.join(paths.userMarketplaceSkillDir('u1', 'legacy-skill'), 'SKILL.md'))).toBe(false);
-    expect(fs.existsSync(path.join(paths.userMarketplaceSkillDir('u1', 'abc123def456'), 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(paths.userMarketplaceSkillDir('u1', 'legacy-skill'), 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(paths.userMarketplaceSkillDir('u1', 'abc123def456'), 'SKILL.md'))).toBe(false);
     expect((await installs.readInstalls('u1')).skills).toEqual([
-      expect.objectContaining({ id: 'abc123def456' }),
+      expect.objectContaining({ id: 'legacy-skill', seed_source: 'builtin', bundle_url: '' }),
     ]);
-    expect(enabled.readEnabledMap('u1').skills).toEqual({ abc123def456: false });
+    expect(postJsonMock).toHaveBeenCalledTimes(1);
+    expect(enabled.readEnabledMap('u1').skills).toEqual({ 'legacy-skill': false });
   });
 
   it('does not delete a builtin agent seed when id migration destination already exists', async () => {
@@ -1326,7 +1407,7 @@ describe('builtin marketplace seed', () => {
       if (p === '/marketplace/agents/list' && Array.isArray(body?.ids)) {
         return { list: [], total: 0 };
       }
-      if (p === '/marketplace/agents/list' && body?.q === 'Writer') {
+      if (p === '/marketplace/agents/list' && body?.names?.includes('Writer')) {
         return {
           list: [{
             id: officialId,
@@ -1372,68 +1453,6 @@ describe('builtin marketplace seed', () => {
         seed_source: 'builtin',
       }),
     ]);
-  });
-
-  it('does not delete a builtin skill seed when id migration destination already exists', async () => {
-    writeBuiltinSkill('legacy-skill', 'Legacy Skill');
-    const seed = await import('../../../src/main/features/builtin_marketplace');
-    const paths = await import('../../../src/main/paths');
-    const installs = await import('../../../src/main/features/marketplace_installs');
-    const enabled = await import('../../../src/main/features/component_enabled');
-    await seed.seedBuiltinMarketplaceForUser('u1');
-    enabled.setSkillEnabled('u1', 'legacy-skill', false);
-
-    const officialDir = paths.userMarketplaceSkillDir('u1', 'official-skill');
-    fs.mkdirSync(officialDir, { recursive: true });
-    fs.writeFileSync(path.join(officialDir, 'SKILL.md'), '---\nname: existing\ndescription: keep\n---\n\nkeep\n', 'utf8');
-
-    postJsonMock.mockImplementation(async (p: string, body: any) => {
-      if (p === '/marketplace/skills/list' && Array.isArray(body?.ids)) {
-        return {
-          list: [{
-            id: 'official-skill',
-            name: 'Legacy Skill',
-            version: '2.0.0',
-            published_at: 100,
-            updated_at: 200,
-            create_uid: '0',
-            default_install: true,
-            status: 'approved',
-          }],
-          total: 1,
-        };
-      }
-      if (p === '/marketplace/skills/bundle' && body?.id === 'official-skill') {
-        return {
-          bundle_url: 'https://cdn.test/official-skill.zip',
-          version: '2.0.0',
-          published_at: 100,
-          updated_at: 200,
-          create_uid: '0',
-          default_install: true,
-          status: 'approved',
-        };
-      }
-      throw new Error(`unexpected ${p}`);
-    });
-
-    await expect(seed.resolveBuiltinMarketplaceInstalls('u1')).resolves.toMatchObject({
-      resolved_skills: 0,
-      migrated_skills: 0,
-      failed: ['skill:legacy-skill'],
-    });
-
-    expect(fs.existsSync(path.join(paths.userMarketplaceSkillDir('u1', 'legacy-skill'), 'SKILL.md'))).toBe(true);
-    expect(fs.readFileSync(path.join(officialDir, 'SKILL.md'), 'utf8')).toContain('keep');
-    const manifest = await installs.readInstalls('u1');
-    expect(manifest.skills).toEqual([
-      expect.objectContaining({
-        id: 'legacy-skill',
-        bundle_url: '',
-        seed_source: 'builtin',
-      }),
-    ]);
-    expect(enabled.readEnabledMap('u1').skills).toEqual({ 'legacy-skill': false });
   });
 
   it('renders installed agent-private builtin skills only for the owning agent', async () => {

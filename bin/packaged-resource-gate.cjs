@@ -114,6 +114,60 @@ const MAC_LOCALIZED_METADATA_CONTRACT = Object.freeze([
       NSMicrophoneUsageDescription: "Orkas usa il microfono per l’inserimento vocale.",
     }),
   }),
+  Object.freeze({
+    directory: "hi.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas वॉइस इनपुट के लिए माइक्रोफ़ोन का उपयोग करता है।",
+    }),
+  }),
+  Object.freeze({
+    directory: "id.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas menggunakan mikrofon untuk input suara.",
+    }),
+  }),
+  Object.freeze({
+    directory: "th.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas ใช้ไมโครโฟนสำหรับการป้อนข้อมูลด้วยเสียง",
+    }),
+  }),
+  Object.freeze({
+    directory: "tr.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas, sesli giriş için mikrofonu kullanır.",
+    }),
+  }),
+  Object.freeze({
+    directory: "vi.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas sử dụng micrô để nhập liệu bằng giọng nói.",
+    }),
+  }),
+  Object.freeze({
+    directory: "zh-Hant.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas 會使用麥克風進行語音輸入。",
+    }),
+  }),
+  Object.freeze({
+    directory: "pt-PT.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "O Orkas utiliza o microfone para a entrada de voz.",
+    }),
+  }),
+  Object.freeze({
+    directory: "es-419.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "Orkas usa el micrófono para la entrada de voz.",
+    }),
+  }),
+  Object.freeze({
+    directory: "ar.lproj",
+    values: Object.freeze({
+      NSMicrophoneUsageDescription: "يستخدم Orkas الميكروفون للإدخال الصوتي.",
+    }),
+  }),
 
 ]);
 

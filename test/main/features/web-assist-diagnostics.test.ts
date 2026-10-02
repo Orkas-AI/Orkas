@@ -5,7 +5,7 @@ import { createWebAssistDiagnostics } from '../../../src/main/features/web_assis
 
 afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); });
 
-describe('core browser incident sampling', () => {
+describe('local browser diagnostics', () => {
   it('merges repeated failures across tabs and admits later failures without URL or exception data', () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);

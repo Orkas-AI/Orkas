@@ -148,7 +148,14 @@ describe('Linux source dependency contract', () => {
     expect(workflow).toMatch(/run:\s+npm ci\s*$/m);
     expect(workflow).not.toContain('npm ci --ignore-scripts');
     expect(workflow).toContain('node scripts/ensure-dev-dependencies.cjs');
-    expect(workflow).toContain('xvfb-run --auto-servernum npm run test:platform-native');
+    const nativeLane = workflow.split('- name: Run Linux platform-native test lane')[1]?.split('- name:')[0] ?? '';
+    expect(nativeLane).toContain('xvfb-run --auto-servernum');
+    expect(nativeLane).toContain('openbox --sm-disable');
+    expect(nativeLane).toContain('xprop -root _NET_SUPPORTING_WM_CHECK');
+    expect(nativeLane).toContain('npm run test:platform-native');
+    expect(nativeLane.indexOf('xprop -root _NET_SUPPORTING_WM_CHECK')).toBeLessThan(
+      nativeLane.indexOf('npm run test:platform-native'),
+    );
     expect(workflow).toContain('ORKAS_E2E_SHOW_WINDOW=1 xvfb-run --auto-servernum');
     expect(workflow).toContain('test/e2e/app_e2e_smoke.spec.ts');
     expect(workflow).toContain('xvfb-run --auto-servernum npm run test:linux-source');
@@ -169,7 +176,7 @@ describe('Linux source dependency contract', () => {
     expect(dependencyProvisioner).toContain("run('Linux source dependencies'");
 
     expect(workflow.indexOf('node scripts/ensure-dev-dependencies.cjs')).toBeLessThan(
-      workflow.indexOf('xvfb-run --auto-servernum npm run test:platform-native'),
+      workflow.indexOf('npm run test:platform-native'),
     );
 
     const launcher = fs.readFileSync(path.join(process.cwd(), 'run.sh'), 'utf8');

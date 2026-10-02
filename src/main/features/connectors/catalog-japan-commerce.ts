@@ -31,11 +31,14 @@ function applicationCredentialHelp(platform: string, key: string) {
   };
 }
 
-// Reviewed against the official tools.json on 2026-09-16. Upstream additions
+// Reviewed against official tools.json and OAuth scopes in OpenAPI on 2026-10-01.
+// Template tools require additional scopes and remain excluded. Upstream additions
 // remain hidden until reviewed here; annotations cannot downgrade these policies.
 const read = ['getShop', 'getSales', 'statSale', 'getSale', 'getProducts', 'getProduct',
   'getProductVariants', 'getProductImages', 'getStocks', 'getReviews',
-  'getProductGroups', 'getProductGroup', 'getProductCategories', 'getCoupons', 'getCoupon'];
+  'getProductGroups', 'getProductGroup', 'getProductCategories', 'getCoupons', 'getCoupon',
+  'getCustomers', 'getCustomer', 'getProductAdvertisings', 'getPayments',
+  'getDeliveries', 'getDeliveryDateSetting', 'getGift'];
 const policies: Record<string, ConnectorActionPolicy> = Object.fromEntries(
   read.map(name => [name, { risk: 'R', confirmation: 'none', max_batch_size: 100 }]),
 );
@@ -45,6 +48,17 @@ for (const name of ['postProducts', 'updateProduct', 'updateSale', 'createCoupon
 policies.sendSalesMail = { risk: 'H', confirmation: 'fresh', sensitive_operation: 'external_communication', max_batch_size: 1 };
 policies.cancelSale = { risk: 'D', confirmation: 'destructive', sensitive_operation: 'money', max_batch_size: 1 };
 policies.deleteCoupon = { risk: 'D', confirmation: 'destructive', sensitive_operation: 'delete', max_batch_size: 1 };
+for (const name of ['postCustomerPoints', 'updateCustomerMembership']) {
+  policies[name] = { risk: 'H', confirmation: 'fresh', sensitive_operation: 'money', max_batch_size: 1 };
+}
+for (const name of ['postCustomers', 'updateCustomers', 'postProductPickup', 'putProductPickup',
+  'createProductGroup', 'updateProductGroup', 'createProductCategory', 'updateProductCategory',
+  'createProductCategoryChild', 'updateProductCategoryChild']) {
+  policies[name] = { risk: 'H', confirmation: 'fresh', sensitive_operation: 'external_or_workflow_change', max_batch_size: 1 };
+}
+for (const name of ['deleteCustomerGroupMembership', 'deleteProductPickup']) {
+  policies[name] = { risk: 'D', confirmation: 'destructive', sensitive_operation: 'delete', max_batch_size: 1 };
+}
 
 export const JAPAN_COMMERCE_ENTRIES: CatalogEntry[] = [{
   id: 'colorme-shop', display_name: 'Color Me Shop', category: 'commerce',

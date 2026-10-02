@@ -49,11 +49,11 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
-      - name: Install Xvfb when the runner image does not provide it
+      - name: Install the Linux test desktop when the runner image does not provide it
         run: |
-          if ! command -v xvfb-run >/dev/null 2>&1; then
+          if ! command -v xvfb-run >/dev/null 2>&1 || ! command -v openbox >/dev/null 2>&1 || ! command -v xprop >/dev/null 2>&1; then
             sudo apt-get update
-            sudo apt-get install --yes xvfb
+            sudo apt-get install --yes xvfb openbox x11-utils
           fi
 
       - name: Restore standard read-only system font permissions
@@ -66,7 +66,22 @@ jobs:
         run: node scripts/ensure-dev-dependencies.cjs
 
       - name: Run Linux platform-native test lane
-        run: xvfb-run --auto-servernum npm run test:platform-native
+        run: |
+          xvfb-run --auto-servernum bash -eu -c '
+            openbox --sm-disable &
+            window_manager_pid=$!
+            trap "kill $window_manager_pid 2>/dev/null || true" EXIT
+            # Xvfb supplies a display; minimization requires a ready window manager.
+            for attempt in {1..50}; do
+              kill -0 "$window_manager_pid"
+              if xprop -root _NET_SUPPORTING_WM_CHECK | grep -q "window id # 0x"; then
+                break
+              fi
+              sleep 0.1
+            done
+            xprop -root _NET_SUPPORTING_WM_CHECK | grep -q "window id # 0x"
+            npm run test:platform-native
+          '
 
       - name: Type-check
         run: node node_modules/typescript/bin/tsc --noEmit

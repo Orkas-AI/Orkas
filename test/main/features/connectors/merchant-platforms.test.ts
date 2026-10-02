@@ -13,7 +13,7 @@ const magento = require('../../../../bin/magento-admin-api.cjs');
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe.each(rows)('$provider merchant API contracts', (row) => {
-  it('verifies useful read permissions, binds the grant and exposes only reviewed R/H actions', async () => {
+  it('verifies useful read permissions, binds the grant and exposes reviewed business actions', async () => {
     const fetchMock = installFixture(row);
     const c = { ...config(row), credentials: await api.authorize(config(row)) };
     expect(fetchMock).toHaveBeenCalledTimes(row.authCalls);
@@ -23,7 +23,8 @@ describe.each(rows)('$provider merchant API contracts', (row) => {
     expect(JSON.stringify(c.credentials)).not.toContain('one-use-code');
     expect(JSON.stringify(c.credentials)).not.toContain('private@example.com');
     expect(Object.keys(api.actionsFor(row.provider))).toHaveLength(row.count);
-    expect(Object.values(api.actionsFor(row.provider)).every((spec: any) => ['R', 'H'].includes(spec.risk) && spec.input_schema.additionalProperties === false)).toBe(true);
+    const reviewedRisks = ['temu', 'shein', 'lazada'].includes(row.provider) ? ['R', 'W', 'H', 'D'] : ['R', 'H'];
+    expect(Object.values(api.actionsFor(row.provider)).every((spec: any) => reviewedRisks.includes(spec.risk) && spec.input_schema.additionalProperties === false)).toBe(true);
     const result = await api.execute(c, 'products.list', { limit: 1 });
     expect(JSON.stringify(result)).toContain('Fixture product');
     for (const [, init] of fetchMock.mock.calls) {

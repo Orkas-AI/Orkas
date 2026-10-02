@@ -15,6 +15,7 @@ const id = z.string().min(1).max(128);
 const options = z.object({
   cid: id.nullish(), projectId: id.nullish(), absPath: text.optional(),
   projectScoped: z.boolean().optional(), autoplay: z.boolean().optional(),
+  readOnly: z.boolean().optional(),
   startTime: z.number().finite().optional(), duration: z.number().finite().optional(), ended: z.boolean().optional(),
 }).strict();
 const imageItem = z.object({

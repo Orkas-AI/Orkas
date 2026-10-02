@@ -11,7 +11,7 @@ const i18nSource = fs.readFileSync(
   path.join(rendererRoot, 'modules', 'i18n.js'),
   'utf8',
 );
-const LANGS = ['en', 'zh', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it'] as const;
+const LANGS = ['en', 'zh', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it', 'ar', 'hi', 'id', 'th', 'tr', 'vi', 'zh-tw', 'pt-pt', 'es-419'] as const;
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -171,6 +171,21 @@ function sourceFiles(root: string): string[] {
 }
 
 describe('renderer i18n runtime', () => {
+  it('rejects prototype names as saved or selected languages and keeps English usable', async () => {
+    const setLanguage = vi.fn(async (language) => ({ ok: true, language }));
+    const { sandbox, events } = loadI18n({
+      boot: { lang: 'en', tables: { en: { hello: 'Hello' } } },
+      setLanguage,
+    });
+    for (const language of ['constructor', '__proto__', 'toString']) {
+      expect(sandbox.isSupportedLang(language)).toBe(false);
+      await expect(sandbox.setLang(language)).resolves.toBe('en');
+    }
+    expect(setLanguage).not.toHaveBeenCalled();
+    expect(sandbox.t('hello')).toBe('Hello');
+    expect(events).toEqual([]);
+  });
+
   it.each([
     ['es', 'Cancelar'], ['fr', 'Annuler'], ['ko', '취소'],
     ['de', 'Abbrechen'], ['ru', 'Отмена'], ['it', 'Annulla'],
@@ -433,6 +448,40 @@ describe('locale resource contract', () => {
           expect(placeholders(value), `${side}/${lang}:${key} placeholders`)
             .toEqual(placeholders(tables.en[key]));
         }
+      }
+    }
+  });
+
+  it('localizes the commercial invitation guide and omits hosted account and membership notices', () => {
+    const tables = localeTables('renderer');
+    const removed = [
+      "sidebar.alert_sync_pro_required",
+      "sidebar.alert_subscription_past_due",
+      "sidebar.alert_subscription_past_due_title",
+      "settings.account.page_sub",
+      "sidebar.alert_sync_delete_confirm",
+      "sidebar.alert_sync_delete_confirm_title",
+      "sidebar.alert_sync_conflicts",
+      "sidebar.alert_sync_conflicts_title",
+      "sidebar.alert_sync_failed",
+      "sidebar.alert_sync_network",
+      "sidebar.alert_sync_integrity",
+      "sidebar.alert_sync_quota_full",
+      "sidebar.alert_subscription_expiring",
+      "sidebar.alert_subscription_expiring_title",
+      "settings.account.signed_out_hint"
+    ];
+    const keys = Object.keys(tables.en).filter(key => key.startsWith('project.invite_members.')
+      || key === 'project.menu.invite_members' || key === 'project.bindings.add_failed');
+    for (const lang of LANGS) {
+      for (const key of removed) expect(Object.keys(tables[lang]), `${lang}:${key}`).not.toContain(key);
+      expect(Object.keys(tables[lang]).filter(key => key.startsWith('project.share.')
+        || key.startsWith('account.shared_projects_'))).toEqual([]);
+      if (lang === 'en') continue;
+      const { sandbox } = loadI18n({ boot: { lang, tables } });
+      for (const key of keys) {
+        expect(sandbox.t(key), `${lang}:${key} untranslated invitation/recovery copy`).not.toBe(tables.en[key]);
+        expect(sandbox.t(key), `${lang}:${key} selected language`).toBe(tables[lang][key]);
       }
     }
   });

@@ -12,6 +12,7 @@ const enqueueCalls: Array<{ userId: string; projectId: string; name: string; op:
 
 vi.mock('../../../src/main/features/projects', () => ({
   projectExists: async () => true,
+  getProject: async () => null,
 }));
 
 vi.mock('../../../src/main/features/project_library_indexer', () => ({

@@ -19,11 +19,12 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { SUPPORTED_LANGS, type Lang } from '../i18n';
-import { marketplaceBizFile, userLocalBizDir } from '../paths';
+import { marketplaceBizFile } from '../paths';
 import { getActiveUserId } from './users';
 import { withCommonHeaders } from './api_common';
 import { apiBase } from './marketplace';
 import { createLogger } from '../logger';
+import { writeJson } from '../storage';
 import { fetchWithRetry } from '../util/retry';
 
 const log = createLogger('marketplace_biz');
@@ -57,13 +58,13 @@ export function normalizeMarketplaceCategoryCode(
  *  on a cold start. Mirrors the server category registry so the UI behaves identically when
  *  the network blip clears. Keep in sync with `Server/biz/marketplace/marketplace_mgr.py`. */
 const FALLBACK_CATEGORIES: readonly MarketplaceCategory[] = [
-  { code: 'education', name_zh: '教育', name_en: 'Education',  name_ja: '教育',        name_pt: 'Educação',    sort_order: 10, name_es: "Educación", name_fr: "Éducation", name_ko: "교육", name_de: "Bildung", name_ru: "Образование", name_it: "Istruzione" },
-  { code: 'ecommerce', name_zh: '电商', name_en: 'E-commerce', name_ja: 'EC',          name_pt: 'E-commerce',  sort_order: 20, name_es: "Comercio electrónico", name_fr: "Commerce en ligne", name_ko: "전자상거래", name_de: "E-Commerce", name_ru: "Электронная торговля", name_it: "E-commerce" },
-  { code: 'rnd',       name_zh: '产研', name_en: 'R&D',        name_ja: '研究開発',    name_pt: 'P&D',         sort_order: 30, name_es: "I+D", name_fr: "R&D", name_ko: "연구 개발", name_de: "Forschung und Entwicklung", name_ru: "Исследования и разработка", name_it: "Ricerca e sviluppo" },
-  { code: 'creation',  name_zh: '创作', name_en: 'Creation',   name_ja: '創作',        name_pt: 'Criação',     sort_order: 40, name_es: "Creación", name_fr: "Création", name_ko: "창작", name_de: "Kreation", name_ru: "Творчество", name_it: "Creazione" },
-  { code: 'data',      name_zh: '数据', name_en: 'Data',       name_ja: 'データ',      name_pt: 'Dados',       sort_order: 50, name_es: "Datos", name_fr: "Données", name_ko: "데이터", name_de: "Daten", name_ru: "Данные", name_it: "Dati" },
-  { code: 'office',    name_zh: '办公', name_en: 'Office',     name_ja: 'オフィス',    name_pt: 'Escritório',  sort_order: 60, name_es: "Oficina", name_fr: "Bureautique", name_ko: "사무", name_de: "Büro", name_ru: "Офис", name_it: "Ufficio" },
-  { code: 'general',   name_zh: '通用', name_en: 'General',    name_ja: '汎用',        name_pt: 'Geral',       sort_order: 70, name_es: "General", name_fr: "Général", name_ko: "일반", name_de: "Allgemein", name_ru: "Общее", name_it: "Generale" },
+  { code: 'education', name_zh: '教育', name_en: 'Education',  name_ja: '教育',        name_pt: 'Educação',    sort_order: 10, name_es: "Educación", name_fr: "Éducation", name_ko: "교육", name_de: "Bildung", name_ru: "Образование", name_it: "Istruzione", "name_zh-tw": "教育", "name_pt-pt": "Educação", "name_es-419": "Educación", "name_vi": "Giáo dục", "name_tr": "Eğitim", "name_id": "Pendidikan", "name_hi": "शिक्षा", "name_th": "การศึกษา", "name_ar": "التعليم" },
+  { code: 'ecommerce', name_zh: '电商', name_en: 'E-commerce', name_ja: 'EC',          name_pt: 'E-commerce',  sort_order: 20, name_es: "Comercio electrónico", name_fr: "Commerce en ligne", name_ko: "전자상거래", name_de: "E-Commerce", name_ru: "Электронная торговля", name_it: "E-commerce", "name_zh-tw": "電子商務", "name_pt-pt": "Comércio eletrónico", "name_es-419": "Comercio electrónico", "name_vi": "Thương mại điện tử", "name_tr": "E-ticaret", "name_id": "E-commerce", "name_hi": "ई-कॉमर्स", "name_th": "อีคอมเมิร์ซ", "name_ar": "التجارة الإلكترونية" },
+  { code: 'rnd',       name_zh: '产研', name_en: 'R&D',        name_ja: '研究開発',    name_pt: 'P&D',         sort_order: 30, name_es: "I+D", name_fr: "R&D", name_ko: "연구 개발", name_de: "Forschung und Entwicklung", name_ru: "Исследования и разработка", name_it: "Ricerca e sviluppo", "name_zh-tw": "研發", "name_pt-pt": "Investigação e desenvolvimento", "name_es-419": "Investigación y desarrollo", "name_vi": "Nghiên cứu và phát triển", "name_tr": "Araştırma ve geliştirme", "name_id": "Penelitian dan pengembangan", "name_hi": "अनुसंधान और विकास", "name_th": "การวิจัยและพัฒนา", "name_ar": "البحث والتطوير" },
+  { code: 'creation',  name_zh: '创作', name_en: 'Creation',   name_ja: '創作',        name_pt: 'Criação',     sort_order: 40, name_es: "Creación", name_fr: "Création", name_ko: "창작", name_de: "Kreation", name_ru: "Творчество", name_it: "Creazione", "name_zh-tw": "創作", "name_pt-pt": "Criação", "name_es-419": "Creación", "name_vi": "Sáng tạo", "name_tr": "İçerik üretimi", "name_id": "Kreasi", "name_hi": "रचनात्मक कार्य", "name_th": "การสร้างสรรค์", "name_ar": "الإبداع" },
+  { code: 'data',      name_zh: '数据', name_en: 'Data',       name_ja: 'データ',      name_pt: 'Dados',       sort_order: 50, name_es: "Datos", name_fr: "Données", name_ko: "데이터", name_de: "Daten", name_ru: "Данные", name_it: "Dati", "name_zh-tw": "資料", "name_pt-pt": "Dados", "name_es-419": "Datos", "name_vi": "Dữ liệu", "name_tr": "Veri", "name_id": "Data", "name_hi": "डेटा", "name_th": "ข้อมูล", "name_ar": "البيانات" },
+  { code: 'office',    name_zh: '办公', name_en: 'Office',     name_ja: 'オフィス',    name_pt: 'Escritório',  sort_order: 60, name_es: "Oficina", name_fr: "Bureautique", name_ko: "사무", name_de: "Büro", name_ru: "Офис", name_it: "Ufficio", "name_zh-tw": "辦公", "name_pt-pt": "Escritório", "name_es-419": "Oficina", "name_vi": "Văn phòng", "name_tr": "Ofis", "name_id": "Perkantoran", "name_hi": "कार्यालय", "name_th": "งานสำนักงาน", "name_ar": "الأعمال المكتبية" },
+  { code: 'general',   name_zh: '通用', name_en: 'General',    name_ja: '汎用',        name_pt: 'Geral',       sort_order: 70, name_es: "General", name_fr: "Général", name_ko: "일반", name_de: "Allgemein", name_ru: "Общее", name_it: "Generale", "name_zh-tw": "通用", "name_pt-pt": "Geral", "name_es-419": "General", "name_vi": "Tổng quát", "name_tr": "Genel", "name_id": "Umum", "name_hi": "सामान्य", "name_th": "ทั่วไป", "name_ar": "عام" },
 ];
 
 interface PersistedBiz {
@@ -146,10 +147,7 @@ async function _readPersisted(uid: string): Promise<PersistedBiz> {
 }
 
 async function _writePersisted(uid: string, data: PersistedBiz): Promise<void> {
-  const dir = userLocalBizDir(uid);
-  await fsp.mkdir(dir, { recursive: true });
-  const file = marketplaceBizFile(uid);
-  await fsp.writeFile(file, JSON.stringify(data, null, 2), 'utf8');
+  await writeJson(marketplaceBizFile(uid), data);
 }
 
 async function _fetchFromServer(): Promise<MarketplaceCategory[]> {

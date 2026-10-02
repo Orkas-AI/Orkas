@@ -1,9 +1,7 @@
 // ─── Chat-input inline use chips ──────────────────────────────────────────
 //
-// Skills and connectors are stored directly in the textarea as compact tokens
-// and rendered by the conversation mirror as inline chips. The textarea stays
-// the source of truth, so native selection / IME / undo keep working while the
-// send path can expand tokens into localized plain text.
+// Skills and connectors use the established compact wire tokens at send and
+// draft boundaries. The composer document owns their atomic editing state.
 
 const _chatUse = { 'new-chat': null, 'conversation': null, project: null, auto: null };
 const _CHAT_USE_TOKEN_OPEN = '@{';
@@ -29,7 +27,7 @@ function bindSkillPicker() {
     const input = document.getElementById(id);
     if (!input || input.dataset.chatUseTokenBound === '1') return;
     input.dataset.chatUseTokenBound = '1';
-    input.addEventListener('keydown', _onChatUseTokenKeydown);
+    // Atomic token editing belongs to the editor state and its undo history.
   });
 }
 
@@ -295,7 +293,7 @@ function chatUseTextFromMessageParts(parts) {
 
 function getChatUseSelections(target) {
   const input = _chatUseInputForTarget(target);
-  const fromText = input ? _chatUseSelectionsFromText(input.value || '') : [];
+  const fromText = input ? _chatUseSelectionsFromText(composerText(input) || '') : [];
   const legacy = _normalizeChatUseSelection(_chatUse[target]);
   return legacy ? fromText.concat([legacy]) : fromText;
 }
@@ -385,7 +383,7 @@ function isChatUseAllowedForTarget(target, kind) {
 
 function _chatUseDispatchInput(input, target) {
   if (typeof autoGrow === 'function') autoGrow(input, _chatUseAutoGrowMax(target));
-  input.dispatchEvent(new Event('input', { bubbles: true }));
+  composerNotify(input);
 }
 
 function _insertChatUseToken(target, selection) {
@@ -398,9 +396,9 @@ function _insertChatUseToken(target, selection) {
   }
   const token = _chatUseTokenFor(sel);
   if (!token) return false;
-  const value = String(input.value || '');
-  const start = typeof input.selectionStart === 'number' ? input.selectionStart : value.length;
-  const end = typeof input.selectionEnd === 'number' ? input.selectionEnd : start;
+  const value = String(composerText(input) || '');
+  const start = typeof composerSelection(input).start === 'number' ? composerSelection(input).start : value.length;
+  const end = typeof composerSelection(input).end === 'number' ? composerSelection(input).end : start;
   const before = value.slice(0, start);
   const after = value.slice(end);
   const leading = before && !/\s$/.test(before) ? ' ' : '';
@@ -409,8 +407,8 @@ function _insertChatUseToken(target, selection) {
   if (typeof input.setRangeText === 'function') {
     input.setRangeText(replacement, start, end, 'end');
   } else {
-    input.value = `${before}${replacement}${after}`;
-    input.selectionStart = input.selectionEnd = start + replacement.length;
+    composerSetText(input, `${before}${replacement}${after}`);
+    composerSetSelection(input, start + replacement.length);
   }
   _chatUseDispatchInput(input, target);
   return true;
@@ -419,7 +417,7 @@ function _insertChatUseToken(target, selection) {
 function _removeChatUseTokensFromInput(target) {
   const input = _chatUseInputForTarget(target);
   if (!input) return false;
-  const value = String(input.value || '');
+  const value = String(composerText(input) || '');
   const tokens = _findChatUseTokens(value);
   if (!tokens.length) return false;
   let out = '';
@@ -429,10 +427,10 @@ function _removeChatUseTokensFromInput(target) {
     last = token.end;
   });
   out += value.slice(last);
-  input.value = out.replace(/[ \t]{2,}/g, ' ').trimStart();
+  composerSetText(input, out.replace(/[ \t]{2,}/g, ' ').trimStart());
   try {
-    const caret = Math.min(input.value.length, tokens[0].start);
-    input.setSelectionRange(caret, caret);
+    const caret = Math.min(composerText(input).length, tokens[0].start);
+    composerSetSelection(input, caret, caret);
   } catch (_) {}
   _chatUseDispatchInput(input, target);
   return true;
@@ -572,92 +570,6 @@ function _renderChatUseMirrorHtml(text, renderPlainHtml) {
   if (last < src.length) html += renderer(src.slice(last));
   return html;
 }
-
-function _chatUseEditingTokens(text, inputId) {
-  return typeof _findChatComposerTokens === 'function'
-    ? _findChatComposerTokens(text, inputId) : _findChatUseTokens(text);
-}
-
-function _chatUseTokenDeleteRange(input, direction) {
-  if (!input || typeof input.selectionStart !== 'number') return false;
-  const value = String(input.value || '');
-  const tokens = _chatUseEditingTokens(value, input.id);
-  if (!tokens.length) return false;
-
-  if (input.selectionStart !== input.selectionEnd) {
-    let start = input.selectionStart;
-    let end = input.selectionEnd;
-    let touched = false;
-    tokens.forEach((token) => {
-      if (token.start < end && start < token.end) {
-        start = Math.min(start, token.start);
-        end = Math.max(end, token.end);
-        touched = true;
-      }
-    });
-    return touched ? { start, end } : null;
-  }
-
-  const caret = input.selectionStart;
-  const hit = tokens.find((token) => {
-    if (caret > token.start && caret < token.end) return true;
-    if (direction === 'forward') return token.start === caret;
-    return token.end === caret || (caret === token.end + 1 && value.charAt(token.end) === ' ');
-  });
-  return hit ? { start: hit.start, end: hit.end } : null;
-}
-
-function _deleteChatUseTokenAtCaret(input, direction) {
-  const range = _chatUseTokenDeleteRange(input, direction);
-  if (!range) return false;
-  const value = String(input.value || '');
-  let { start, end } = range;
-  if (value.charAt(end) === ' ') end += 1;
-  else if (start > 0 && value.charAt(start - 1) === ' ') start -= 1;
-  input.value = value.slice(0, start) + value.slice(end);
-  try { input.setSelectionRange(start, start); } catch (_) {}
-  const target = input.id === 'new-chat-input'
-    ? 'new-chat'
-    : (input.id === 'project-chat-input' ? 'project' : (input.id === 'auto-task-input' ? 'auto' : 'conversation'));
-  _chatUseDispatchInput(input, target);
-  return true;
-}
-
-function _chatUseTokenMoveTarget(text, caret, direction, inputId) {
-  const value = String(text || '');
-  const pos = Number(caret);
-  if (!Number.isFinite(pos)) return null;
-  const tokens = _chatUseEditingTokens(value, inputId);
-  const hit = tokens.find((token) => {
-    if (direction === 'forward') return pos >= token.start && pos < token.end;
-    return (pos > token.start && pos <= token.end)
-      || (pos === token.end + 1 && value.charAt(token.end) === ' ');
-  });
-  if (!hit) return null;
-  return direction === 'forward' ? hit.end : hit.start;
-}
-
-function _moveChatUseTokenCaret(input, direction) {
-  if (!input || typeof input.selectionStart !== 'number') return false;
-  if (input.selectionStart !== input.selectionEnd) return false;
-  const next = _chatUseTokenMoveTarget(input.value || '', input.selectionStart, direction, input.id);
-  if (next === null || next === input.selectionStart) return false;
-  try { input.setSelectionRange(next, next); } catch (_) {}
-  return true;
-}
-
-function _onChatUseTokenKeydown(e) {
-  if (e.key !== 'Backspace' && e.key !== 'Delete' && e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-  if (e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
-  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
-    const direction = e.key === 'ArrowRight' ? 'forward' : 'backward';
-    if (_moveChatUseTokenCaret(e.currentTarget, direction)) e.preventDefault();
-    return;
-  }
-  const direction = e.key === 'Delete' ? 'forward' : 'backward';
-  if (_deleteChatUseTokenAtCaret(e.currentTarget, direction)) e.preventDefault();
-}
-
 
 // Chat composers are part of the startup shell even though the Skills page is
 // lazy. Bind token editing independently so opening Skills is never a

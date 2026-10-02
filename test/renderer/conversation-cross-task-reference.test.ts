@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -153,19 +153,20 @@ describe('conversation cross-task message reference UI', () => {
 // History is paginated: all-select must not silently omit older messages or
 // overwrite a new selection after the user cancels a pending load.
 function selectionHarness() {
-  const messages = [{ dataset: { msgId: 'latest' } }];
-  let row: any = { dataset: { cid: 'task', cursor: '20', state: 'idle' } };
   const context: any = {
     currentCid: 'task',
     t: (key: string) => key,
-    uiToast: () => {},
+    uiToast: vi.fn(),
     _messageSelectionState: { cid: 'task', selected: new Set(['latest']) },
-    document: {
-      querySelector: () => row,
-      querySelectorAll: () => messages,
-    },
+    _historyRequestUrl: (_cid: string, cursor: number) => cursor,
+    _isVisibleGroupHistoryRecord: (row: any) => !row.dispatch,
+    _collapseSupersededInterruptionRecords: (rows: any[]) => rows,
+    _mergeNativeSegmentRecords: (rows: any[]) => rows,
+    _groupMsgToLegacy: (row: any) => ({ _msg_id: row.id }),
     _updateMessageSelectionToolbar: () => {},
     _syncMessageSelectionUi: () => {},
+    // Select-all must never need a mounted row or create any transcript DOM.
+    document: new Proxy({}, { get() { throw new Error('Unexpected DOM access'); } }),
   };
   vm.createContext(context);
   vm.runInContext(conversationSource.slice(
@@ -175,50 +176,55 @@ function selectionHarness() {
     conversationSource.indexOf('function _allMessagesSelected('),
     conversationSource.indexOf('function _toggleMessageSelection('),
   ), context);
-  return { context, messages, getRow: () => row, setRow: (value: any) => { row = value; } };
+  return context;
 }
 
+const selectionPage = (ids: string[], next: number | null = null) => ({
+  json: async () => ({ ok: true, history: ids.map(id => ({ id })), next_cursor: next }),
+});
+
 describe('select all across conversation history pages', () => {
-  it('includes older pages before completing selection and can deselect the whole conversation', async () => {
-    const { context, messages, setRow } = selectionHarness();
-    context._loadOlderConversationHistory = async (_cid: string, cursor: number) => {
-      messages.unshift({ dataset: { msgId: cursor === 20 ? 'middle' : 'oldest' } });
-      setRow(cursor === 20 ? { dataset: { cid: 'task', cursor: '10', state: 'idle' } } : null);
-    };
+  it('selects the complete conversation without mounting rows and deselects it atomically', async () => {
+    const context = selectionHarness();
+    context.apiFetch = async (cursor: number | null) => cursor === null
+      ? selectionPage(['latest'], 20) : cursor === 20
+        ? selectionPage(['middle'], 10) : selectionPage(['oldest']);
     await context._toggleAllMessageSelection();
     expect(Array.from(context._messageSelectionState.selected)).toEqual(['oldest', 'middle', 'latest']);
+    expect(context.uiToast).not.toHaveBeenCalled();
     expect(context._messageSelectionState.loadingAll).toBe(false);
     await context._toggleAllMessageSelection();
     expect(context._messageSelectionState.selected.size).toBe(0);
   });
 
-  it('preserves the prior selection on a page failure and allows a complete retry', async () => {
-    const { context, messages, getRow, setRow } = selectionHarness();
-    context._loadOlderConversationHistory = async () => { getRow().dataset.state = 'error'; };
+  it.each(['failure', 'repeated cursor'])('preserves prior selection on %s and supports retry', async mode => {
+    const context = selectionHarness();
+    context.apiFetch = async (cursor: number | null) => {
+      if (cursor === null || mode === 'repeated cursor') return selectionPage(['latest'], 20);
+      throw new Error('Fixture read failure');
+    };
     await context._toggleAllMessageSelection();
     expect(Array.from(context._messageSelectionState.selected)).toEqual(['latest']);
     expect(context._messageSelectionState.loadingAll).toBe(false);
     expect(context._allMessagesSelected()).toBe(false);
-    context._loadOlderConversationHistory = async () => {
-      messages.unshift({ dataset: { msgId: 'oldest' } });
-      setRow(null);
-    };
+    expect(context.uiToast).toHaveBeenCalledTimes(1);
+    context.apiFetch = async () => selectionPage(['oldest', 'latest']);
     await context._toggleAllMessageSelection();
     expect(Array.from(context._messageSelectionState.selected)).toEqual(['oldest', 'latest']);
     expect(context._allMessagesSelected()).toBe(true);
   });
 
-  it('does not select messages in another task when a pending all-select is cancelled', async () => {
-    const { context, setRow } = selectionHarness();
-    let finish!: () => void;
-    context._loadOlderConversationHistory = () => new Promise<void>((resolve) => { finish = resolve; });
+  it('leaves the new task selection untouched when a pending read completes', async () => {
+    const context = selectionHarness();
+    let finish!: (value: any) => void;
+    context.apiFetch = () => new Promise(resolve => { finish = resolve; });
     const pending = context._toggleAllMessageSelection();
     expect(context._messageSelectionState.loadingAll).toBe(true);
     context.currentCid = 'other';
     context._messageSelectionState = { cid: 'other', selected: new Set(['chosen']) };
-    setRow(null);
-    finish();
+    finish(selectionPage(['oldest']));
     await pending;
     expect(Array.from(context._messageSelectionState.selected)).toEqual(['chosen']);
+    expect(context.uiToast).not.toHaveBeenCalled();
   });
 });

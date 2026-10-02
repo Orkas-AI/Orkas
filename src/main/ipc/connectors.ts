@@ -5,7 +5,8 @@
  *   connectors.catalog       → { catalog }
  *   connectors.list          → { instances }
  *   connectors.start_oauth   → { started, attempt_id }  (returns after accepting the browser flow)
- *   connectors.add_custom    → { instance }  (user-supplied MCP server; validated form input)
+ *   connectors.add_custom    → { instance, started?, attempt_id? } (custom MCP; OAuth detaches)
+ *   connectors.authorize_custom → { started, attempt_id } (reconnect custom OAuth)
  *   connectors.remove        → { removed }
  *   connectors.refresh       → { tools, instance }
  *   connectors.set_subtools  → { instance }
@@ -40,6 +41,7 @@ interface ClientConnectorInstance {
   id: string;
   display_name: string;
   origin?: 'catalog' | 'custom';
+  custom_auth_mode?: 'oauth';
   connection_environment?: 'sandbox' | 'live';
   transport?:
     | { kind: 'stdio'; summary: string; command?: string; argument_count?: number }
@@ -85,6 +87,7 @@ function toClientInstance(inst: ConnectorInstance, enabled?: boolean, uid?: stri
     id: inst.id,
     display_name: inst.display_name,
     ...(inst.origin ? { origin: inst.origin } : {}),
+    ...(inst.custom_auth_mode ? { custom_auth_mode: inst.custom_auth_mode } : {}),
     ...(transport ? { transport } : {}),
     enabled_subtools: inst.enabled_subtools,
     tools_cache: inst.tools_cache,
@@ -227,6 +230,13 @@ export const invokeHandlers = {
     return { handled: installConfirm.respond(payload.request_id, payload.approved) };
   },
 
+  'connectors.account_choice_response': async (payload: { request_id?: unknown; choice_id?: unknown }, ctx: { userId: string }) => {
+    if (typeof payload?.request_id !== 'string' || !/^[a-f0-9]{32}$/.test(payload.request_id)) throw new Error('invalid request_id');
+    if (payload.choice_id !== null && (typeof payload.choice_id !== 'string' || !/^[1-9][0-9]{0,24}$/.test(payload.choice_id))) throw new Error('invalid choice_id');
+    const { respondAccountChoice } = await import('../features/connectors/account-choice');
+    return { handled: respondAccountChoice(ctx.userId, payload.request_id, payload.choice_id as string | null) };
+  },
+
   /** Renderer answer to a per-action sensitive connector confirmation. */
   'connectors.action_confirm_response': async (payload: { request_id?: unknown; approved?: unknown; scope?: unknown }, ctx: { sender: { id: number } }) => {
     if (typeof payload?.request_id !== 'string' || !payload.request_id) throw new Error('invalid request_id');
@@ -238,7 +248,7 @@ export const invokeHandlers = {
   },
 
   'connectors.add_custom': async (
-    payload: { display_name?: unknown; transport?: unknown },
+    payload: { display_name?: unknown; transport?: unknown; auth_mode?: unknown },
     ctx: { userId: string },
   ) => {
     // Validation (shape, HTTPS/explicit-loopback rule, header/env hygiene) lives in
@@ -246,8 +256,18 @@ export const invokeHandlers = {
     const instance = await connectors.addCustomInstance(ctx.userId, {
       display_name: payload?.display_name as string,
       transport: payload?.transport as never,
-    });
-    return { instance: toClientInstance(instance, isConnectorEnabled(ctx.userId, instance.id), ctx.userId) };
+      auth_mode: payload?.auth_mode as 'none' | 'oauth',
+    }, { deferOAuth: payload?.auth_mode === 'oauth' });
+    const started = instance.custom_auth_mode === 'oauth'
+      ? connectors.beginCustomOAuthConnect(ctx.userId, instance.id) : null;
+    return { instance: toClientInstance(instance, isConnectorEnabled(ctx.userId, instance.id), ctx.userId),
+      ...(started ? { started: true, attempt_id: started.attempt_id } : {}) };
+  },
+
+  'connectors.authorize_custom': async (payload: { id?: unknown }, ctx: { userId: string }) => {
+    if (typeof payload?.id !== 'string' || !connectors.isValidInstanceId(payload.id)) throw new Error('invalid id');
+    const started = connectors.beginCustomOAuthConnect(ctx.userId, payload.id);
+    return { started: true, attempt_id: started.attempt_id };
   },
 
   'connectors.remove': async (payload: { id?: unknown }, ctx: { userId: string }) => {

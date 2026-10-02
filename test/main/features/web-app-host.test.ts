@@ -32,6 +32,33 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 describe('Web host reuses owning services', () => {
+  it('exposes bounded connector search through the existing Web tool adapter and rechecks visibility', async () => {
+    const tools = Array.from({ length: 100 }, (_, i) => ({ name: `read_${i}`, description: 'Read ordinary entry', input_schema: { type: 'object' } }));
+    const target = { name: 'find_invoice', description: 'Find overdue invoices', input_schema: { type: 'object', properties: { invoice_id: { type: 'string' } } } };
+    connector.instances = [{ id: 'custom-search', origin: 'custom', display_name: 'Search fixture', transport: { kind: 'streamable-http', url: 'https://example.invalid/mcp' },
+      enabled_subtools: null, tools_cache: [...tools, target], status: { kind: 'connected', since: 0 }, created_at: '', updated_at: '', tools_cached_at: 0 }];
+    const { appTools } = await import('../../../src/main/features/web_apps/host');
+    const list = (await appTools(uid)).find(t => t.name === 'list_connector_tools')!;
+    const invoke = (arguments_: object) => list.execute(arguments_ as any, new AbortController().signal);
+    expect(list.inputSchema.properties).toHaveProperty('query');
+    const first = JSON.parse((await invoke({ connector_id: 'custom-search' })).content);
+    expect(first).toMatchObject({ mode: 'compact', total: 101, next_offset: 20 });
+    const found = JSON.parse((await invoke({ query: 'overdue invoices', limit: 1 })).content);
+    expect(found.tools[0]).toMatchObject({ name: target.name, input_schema: target.input_schema });
+    expect(JSON.parse((await invoke({ query: 'overdue invoices 发票', limit: 1 })).content).tools[0].name).toBe(target.name);
+    expect(JSON.parse((await invoke({ query: 'VID-72' })).content)).toMatchObject({ tools: [], total: 0 });
+    expect(await invoke({ connector_id: 'custom-search', tool_name: 'read_72' })).toMatchObject({ content: expect.stringMatching(/read_72[\s\S]*Input schema:/) });
+    connector.instances[0].enabled_subtools = [target.name];
+    const full = await invoke({ connector_id: 'custom-search', limit: 50, offset: 0 });
+    expect(full.content).toContain('### find_invoice');
+    expect(full.content).toContain('Input schema:');
+    expect(connector.call).not.toHaveBeenCalled(); expect(connector.approve).not.toHaveBeenCalled();
+    connector.instances[0].enabled_subtools = ['read_0'];
+    expect(JSON.parse((await invoke({ query: 'overdue invoices' })).content)).toMatchObject({ tools: [], search: { searched_tools: 1 }, guidance: expect.any(String) });
+    expect(await invoke({ connector_id: 'custom-search', tool_name: target.name })).toMatchObject({ isError: true });
+    expect(await invoke({ query: ' ' })).toMatchObject({ isError: true });
+  });
+
   it('keeps same-bundle navigation usable and refuses look-alike destinations without closing it', async () => {
     const { createArtifact } = await import('../../../src/main/features/chat_artifacts');
     const { runtime, appResource } = await import('../../../src/main/features/web_apps/host');

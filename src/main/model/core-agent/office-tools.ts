@@ -1317,7 +1317,7 @@ function createOfficeReviewTool(opts: OfficeToolsOpts): AgentTool {
         action: {
           type: 'string',
           enum: ['check', 'render', 'check_and_render'],
-          description: 'check scans OpenXML with path only; render/check_and_render use pages/analysis_mode; omit unrelated fields. check_and_render stops on validation failure.',
+          description: 'check scans OpenXML with path only and reports ignored pages/analysis_mode; render/check_and_render use pages/analysis_mode. Omit unrelated fields. check_and_render stops on validation failure.',
         },
         path: { type: 'string', description: 'Existing .docx/.xlsx/.pptx path, absolute or workspace-relative.' },
         pages: {
@@ -1346,12 +1346,24 @@ function createOfficeReviewTool(opts: OfficeToolsOpts): AgentTool {
           ? new Set(['action', 'path', 'pages', 'analysis_mode'])
           : undefined;
       if (allowedFields) {
-        const unrelated = Object.keys(input).filter((key) => !allowedFields.has(key));
-        if (unrelated.length) {
-          return errResult('E_BAD_INPUT', `fields not allowed for ${action}: ${unrelated.sort().join(', ')}`);
+        const unrelated = Object.keys(input).filter((key) => !allowedFields.has(key)).sort();
+        const unexpected = unrelated.filter((key) => action !== 'check' || !['pages', 'analysis_mode'].includes(key));
+        if (unexpected.length) {
+          return errResult('E_BAD_INPUT', `fields not allowed for ${action}: ${unexpected.join(', ')}`);
         }
       }
-      if (action === 'check') return check.execute({ path: input.path }, ctx);
+      if (action === 'check') {
+        const ignoredFields = Object.keys(input).filter((key) => key === 'pages' || key === 'analysis_mode').sort();
+        const result = await check.execute({ path: input.path }, ctx);
+        if (!ignoredFields.length) return result;
+        try {
+          const payload: unknown = JSON.parse(result.content);
+          if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+            return { ...result, content: JSON.stringify({ ...payload, ignored_fields: ignoredFields }) };
+          }
+        } catch { /* Preserve non-JSON errors with a text receipt. */ }
+        return { ...result, content: `ignored_fields: ${JSON.stringify(ignoredFields)}\n${result.content}` };
+      }
       if (action !== 'render' && action !== 'check_and_render') {
         return errResult('E_BAD_INPUT', '`action` must be check, render, or check_and_render');
       }

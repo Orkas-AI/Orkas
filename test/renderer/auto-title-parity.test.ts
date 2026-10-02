@@ -35,7 +35,8 @@ const renderer: {
   _autoTitle: (text: string) => string;
   _AUTO_TITLE_ZH_FILLER: RegExp;
   _AUTO_TITLE_EN_FILLER: RegExp;
-  _AUTO_TITLE_MAX: number;
+  _AUTO_TITLE_MAX_UNITS: number;
+  _truncateTitleToWidth: (text: string) => string;
 } = rendererAutoTitle;
 
 describe('auto-title parity › regex source / flags match across main + renderer', () => {
@@ -55,8 +56,41 @@ describe('auto-title parity › regex source / flags match across main + rendere
     expect(renderer._AUTO_TITLE_EN_FILLER.flags).toBe(mainAutoTitle.EN_FILLER_RE.flags);
   });
 
-  it('TITLE_MAX matches', () => {
-    expect(renderer._AUTO_TITLE_MAX).toBe(mainAutoTitle.TITLE_MAX);
+  it('the display-width budget matches', () => {
+    expect(renderer._AUTO_TITLE_MAX_UNITS).toBe(mainAutoTitle.TITLE_MAX_UNITS);
+  });
+});
+
+/**
+ * The renderer cannot import `util/name-limit.ts`, so it carries its own copy
+ * of the width table. Equal budgets prove nothing if the tables disagree about
+ * which code points are double-width, and the optimistic renderer title would
+ * then flicker into a different string when the backend one arrives. One
+ * fixture per width class the table distinguishes.
+ */
+describe('auto-title parity › width table agrees on every script class', () => {
+  const widthCases: Array<[string, string]> = [
+    ['Han', '一'.repeat(40)],
+    ['Hangul', '가'.repeat(40)],
+    ['Hiragana', 'あ'.repeat(40)],
+    ['fullwidth Latin', 'Ａ'.repeat(40)],
+    ['halfwidth Latin', 'A'.repeat(80)],
+    ['emoji', '🙂'.repeat(40)],
+    ['emoji with a variation selector', '☘️'.repeat(40)],
+    ['combining marks', 'e\u0301'.repeat(60)],
+    ['mixed scripts at the boundary', `${'一'.repeat(20)}${'A'.repeat(12)}`],
+    ['CJK punctuation', '，'.repeat(40)],
+  ];
+
+  for (const [label, input] of widthCases) {
+    it(`agrees on ${label}`, () => {
+      expect(renderer._truncateTitleToWidth(input)).toBe(mainAutoTitle.truncateTitleToWidth(input));
+    });
+  }
+
+  it('the fixtures actually exercise truncation', () => {
+    const truncated = widthCases.filter(([, input]) => renderer._truncateTitleToWidth(input).endsWith('…'));
+    expect(truncated.length).toBe(widthCases.length - 1);
   });
 });
 
@@ -78,7 +112,8 @@ describe('auto-title parity › functional equivalence on representative inputs'
     '根据 https://orkas.ai，分析首页内容',
     'Review https://orkas.ai, then summarize',
     '检查 httpsx://orkas.ai 的内容',
-    '这是一个很长的对话标题，应该会被二十五字符的上限截断到刚好显示',
+    '这是一个很长的对话标题，应该会被显示宽度的上限截断到刚好显示，后面这些字就看不到了',
+    'Research the top five competitors in the AI coding agent space and summarize them',
     'AI，怎么样',
   ];
 

@@ -154,6 +154,9 @@ async function bootApp() {
       if (typeof startAutoEventsSubscription === 'function') {
         startAutoEventsSubscription();
       }
+      if (typeof startConversationFiledSubscription === 'function') {
+        startConversationFiledSubscription();
+      }
     }, 2500);
     return true;
   } catch (err) {
@@ -252,6 +255,20 @@ function _migrateLegacyLocalStorageKeys() {
   } catch (_) {
     /* localStorage unavailable / quota — skip; no-op next boot */
   }
+}
+
+function _retireProjectMemberLocalStorage() {
+  try {
+    const marker = '_project_member_cache_moved_v1';
+    if (localStorage.getItem(marker) === '1') return;
+    const oldKeys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key?.startsWith('orkas.projectMembers.v1.')) oldKeys.push(key);
+    }
+    for (const key of oldKeys) localStorage.removeItem(key);
+    localStorage.setItem(marker, '1');
+  } catch (_) { /* Retry cleanup on the next boot if browser storage is unavailable. */ }
 }
 
 // Persist the current view across reloads (localStorage keyed by user).
@@ -385,6 +402,11 @@ function setView(view, cid, opts = {}) {
   if (opts.forceEnter || currentView !== view || (view === 'conversation' && currentCid !== cid)) {
     _bootLog.info('view change', { view, cid: cid || undefined });
   }
+  if (view !== currentView || cid !== currentCid) _composerNavigationEpoch++;
+  if (currentCid && typeof _flushDraftSave === 'function') _flushDraftSave(currentCid);
+  composerBindOwner('chat-input', view === 'conversation' ? cid : null);
+  composerBindOwner('new-chat-input', view === 'new-chat' ? 'new-chat' : null);
+  composerBindOwner('project-chat-input', view === 'project' ? cid : null);
   currentView = view;
   window.WebAssist?.setContext(view, cid);
   _saveLastView(view, cid);
@@ -601,7 +623,7 @@ function setView(view, cid, opts = {}) {
     if (typeof primeProjectDetailShell === 'function') primeProjectDetailShell(cid || '');
     _deferSidebarNavWork('project-tab-load', () => {
       _loadViewFeature('project', 'project', () => {
-        if (typeof loadProjectDetail === 'function') loadProjectDetail(cid || '');
+        if (typeof loadProjectDetail === 'function') loadProjectDetail(cid || '', { refreshShared: true });
       });
     });
   } else {

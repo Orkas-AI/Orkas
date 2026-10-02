@@ -223,6 +223,37 @@ function shellLikeMutation(command: string): ExternalMutationFinding | null {
   return null;
 }
 
+/** Git global options bind values before the subcommand. Argument text (for
+ * example a log search for "push") does not select an operation. */
+export function gitCommandAction(args: readonly string[]): { action?: string; index: number } {
+  const values = new Set(['-c', '-C', '--config-env', '--exec-path', '--git-dir', '--namespace', '--super-prefix', '--work-tree']);
+  let index = 0;
+  while (index < args.length) {
+    const arg = args[index];
+    if (arg === '--') { index++; break; }
+    if (!arg.startsWith('-')) break;
+    if (values.has(arg)) { index += 2; continue; }
+    index++;
+  }
+  return { action: args[index]?.toLowerCase(), index };
+}
+
+function gitPushIsPreview(args: readonly string[], actionIndex: number): boolean {
+  const values = new Set(['--repo', '--receive-pack', '--exec', '--push-option', '-o']);
+  for (let i = actionIndex + 1; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--') break;
+    if (values.has(arg)) { i++; continue; }
+    if (['--help', '-h', '--dry-run', '-n'].includes(arg)) return true;
+  }
+  const globalValues = new Set(['-c', '-C', '--config-env', '--exec-path', '--git-dir', '--namespace', '--super-prefix', '--work-tree']);
+  for (let i = 0; i < actionIndex; i++) {
+    if (globalValues.has(args[i])) { i++; continue; }
+    if (args[i] === '--help' || args[i] === '--version') return true;
+  }
+  return false;
+}
+
 /** Classify one already-tokenized executable and its quote-stripped args. */
 export function classifyExternalMutationCommand(cmdRaw: string, args: readonly string[]): ExternalMutationFinding | null {
   const cmd = commandName(cmdRaw);
@@ -242,6 +273,7 @@ export function classifyExternalMutationCommand(cmdRaw: string, args: readonly s
     for (let index = 0; index < args.length; index++) {
       const arg = args[index];
       const lower = arg.toLowerCase();
+      if (lower === '-whatif' || lower === '-whatif:$true') return null;
       if (optionsWithValues.has(lower)) {
         if (lower === '-filepath') target = cleanTarget(args[index + 1]);
         index++;
@@ -329,8 +361,9 @@ export function classifyExternalMutationCommand(cmdRaw: string, args: readonly s
     if (dryRun || args.some((arg) => new Set(['--check', '--syntax-check', '--list-hosts', '--list-tasks', '--list-tags']).has(arg.toLowerCase()))) return null;
     return { kind: 'deployment_change', action: 'run playbook' };
   }
-  if (cmd === 'git' && args.some((arg) => arg.toLowerCase() === 'push') && !args.some((arg) => arg.toLowerCase() === '--dry-run' || arg.toLowerCase() === '-n')) {
-    return { kind: 'remote_publish', action: 'push' };
+  if (cmd === 'git') {
+    const { action, index } = gitCommandAction(args);
+    if (action === 'push' && !gitPushIsPreview(args, index)) return { kind: 'remote_publish', action: 'push' };
   }
   if ((cmd === 'docker' || cmd === 'podman') && args[0]?.toLowerCase() === 'push') return { kind: 'remote_publish', action: 'push image' };
   if ((cmd === 'npm' || cmd === 'pnpm' || cmd === 'yarn') && !dryRun && new Set(['publish', 'unpublish']).has((args[0] || '').toLowerCase())) {
@@ -517,10 +550,10 @@ function referencedExecutableScriptsInternal(command: string, depth: number): st
     const value = String(raw || '').trim().replace(/^['"]|['"]$/g, '');
     if (value && !results.includes(value)) results.push(value);
   };
-  const rawWords = command.match(/"(?:\\.|[^"])*"|'[^']*'|&&|\|\||[;&|]|[^\s;&|]+/g) || [];
-  const words = rawWords.map((raw) => raw.replace(/^['"]|['"]$/g, ''));
+  const rawWords = command.match(/"(?:\\.|[^"])*"|'[^']*'|&&|\|\||<<<|<<-?|>>|[\r\n;&|<>]|[^\s;&|<>]+/g) || [];
+  const words = rawWords.map((raw) => /^[\r\n]$/.test(raw) ? ';' : raw.replace(/^['"]|['"]$/g, ''));
   const separators = new Set([';', '&&', '||', '&', '|']);
-  const interpreters = /^(?:python(?:3(?:\.\d+)?)?|py|node|ruby|perl|php|bash|dash|ksh|sh|zsh|pwsh|powershell)(?:\.exe)?$/i;
+  const interpreters = /^(?:python(?:3(?:\.\d+)?)?|py|node|ruby|perl|php|bash|dash|ksh|sh|zsh|pwsh|powershell|source|\.)(?:\.exe)?$/i;
   const posixShells = /^(?:bash|dash|ksh|sh|zsh)(?:\.exe)?$/i;
   const powerShells = /^(?:pwsh|powershell)(?:\.exe)?$/i;
   const scriptExtension = /\.(?:py|js|cjs|mjs|ts|rb|pl|php|sh|bash|zsh|ps1)$/i;
@@ -536,6 +569,11 @@ function referencedExecutableScriptsInternal(command: string, depth: number): st
       continue;
     }
     if (!interpreters.test(executable)) continue;
+    // An interpreter may execute a script received through a file redirect,
+    // including a file produced earlier in the same shell invocation.
+    for (let j = i + 1; j < words.length && !separators.has(words[j]); j++) {
+      if (words[j] === '<' && words[j + 1]) add(words[++j]);
+    }
     if (depth < 4 && (posixShells.test(executable) || powerShells.test(executable))) {
       const commandIndex = words.findIndex((word, index) => (
         index > i && (posixShells.test(executable)
@@ -552,12 +590,13 @@ function referencedExecutableScriptsInternal(command: string, depth: number): st
       const lower = candidate.toLowerCase();
       if (lower === '-c' || lower === '--command' || lower === '-e' || lower === '--eval' || lower === '-m' || lower === '--module') break;
       if ((lower === '-file' || lower === '-f') && words[j + 1]) {
-        if (scriptExtension.test(words[j + 1])) add(words[j + 1]);
+        add(words[j + 1]);
         break;
       }
       if (optionsWithValues.has(lower)) { j++; continue; }
+      if (['<', '>', '>>', '<<', '<<-', '<<<'].includes(candidate)) { j++; continue; }
       if (candidate.startsWith('-')) continue;
-      if (scriptExtension.test(candidate)) add(candidate);
+      add(candidate);
       break;
     }
   }

@@ -144,6 +144,19 @@ describe('cross_session_memory tool › project tier exposure', () => {
 
 
 describe('cross_session_memory async persistence', () => {
+  it.each([true, false])('awaits shared deletion before reporting its outcome (success=%s)', async (ok) => {
+    const h = stubHandler();
+    let finish!: (value: any) => void;
+    h.remove = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+    const tool = createCrossSessionMemoryTool(h, { includeProjectTier: true });
+    const pending = tool.execute({ action: 'remove', target: 'project', old_text: 'obsolete fact' }, {} as any);
+    const receipt = { ok, ...(!ok ? { error: 'shared_sync_failed' } : {}), entries: [], usage: { current: 0, limit: 2500 } };
+    finish(receipt);
+    const result = await pending;
+    expect(result.isError).toBe(!ok);
+    expect(JSON.parse(result.content)).toEqual(receipt);
+  });
+
   it('awaits the durable result and forwards cancellation to consolidation', async () => {
     const h = stubHandler();
     const controller = new AbortController();

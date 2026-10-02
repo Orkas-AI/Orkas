@@ -90,7 +90,8 @@ describe.each(['open', 'commercial'])('storefront credential journey (%s channel
       expect(fs.statSync(localApiRuntimeDir(UID, e.id)).mode & 0o777).toBe(0o700);
     }
     const capabilities = await adapter.callTool('list_capabilities', {}, env);
-    expect(capabilities.actions).toHaveLength(provider === 'shoplazza' ? 11 : 10);
+    expect(capabilities.actions).toHaveLength(provider === 'bigcommerce' ? 618 : provider === 'shoplazza' ? 311 : 525);
+    expect(capabilities.actions.map((action: any) => action.action)).toEqual(expect.arrayContaining(['products.list', 'orders.list', 'inventory.set']));
     expect(capabilities.identity.shop_id).toBe('123');
     const read = await adapter.callTool('execute_read', { action: 'products.list', parameters: { limit: 1 } }, env);
     expect(JSON.stringify(read)).toContain('Product');

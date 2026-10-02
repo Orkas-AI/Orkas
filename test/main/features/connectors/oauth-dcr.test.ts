@@ -128,6 +128,200 @@ afterEach(() => {
 });
 
 describe('features/connectors/oauth-dcr', () => {
+  it('authorizes a custom MCP server with PKCE and keeps its rotating grant local', async () => {
+    const fetchMock = vi.fn(async (raw: string, init?: RequestInit) => {
+      const url = new URL(raw);
+      if (url.pathname.includes('oauth-protected-resource')) return jsonResponse({
+        authorization_servers: ['https://login.example.com'], resource: 'https://mcp.example.com/mcp',
+      });
+      if (url.pathname.includes('oauth-authorization-server')) return jsonResponse({
+        issuer: 'https://login.example.com',
+        authorization_endpoint: 'https://login.example.com/authorize',
+        token_endpoint: 'https://login.example.com/token',
+        registration_endpoint: 'https://login.example.com/register',
+      });
+      if (url.pathname === '/register') return jsonResponse({ client_id: 'dynamic-client' });
+      if (url.pathname.endsWith('/dcr-exchange')) return jsonResponse({ code: 0, oauth_code: 'auth-code',
+        oauth_state: new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('state') });
+      if (url.pathname === '/token') {
+        expect(String(init?.body)).toContain('code_verifier=');
+        return jsonResponse({ access_token: 'private-access', refresh_token: 'private-refresh', expires_in: 3600 });
+      }
+      throw new Error('Unexpected request');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const flow = oauth.startCustomMcpOAuth('custom-example', 'https://mcp.example.com/mcp');
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
+    const opened = new URL(String(electronMock.openExternal.mock.calls[0][0]));
+    expect(opened.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(opened.searchParams.get('resource')).toBe('https://mcp.example.com/mcp');
+    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=receipt');
+    await expect(flow).resolves.toMatchObject({ grant: { access_token: 'private-access', refresh_token: 'private-refresh' },
+      client: { client_id: 'dynamic-client' } });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/dcr-store'))).toBe(false);
+    expect(fetchMock.mock.calls.filter(([url]) => !String(url).endsWith('/dcr-exchange'))
+      .every(([, init]) => init?.redirect === 'error')).toBe(true);
+  });
+
+  it('rejects a custom OAuth authorization server that advertises an insecure URL', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (raw: string) => {
+      if (String(raw).includes('oauth-protected-resource')) return jsonResponse({
+        authorization_servers: ['http://private.example'], resource: 'https://mcp.example.com/mcp',
+      });
+      throw new Error('Authorization-server discovery must not be called');
+    }));
+    const { startCustomMcpOAuth } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    await expect(startCustomMcpOAuth('custom-example', 'https://mcp.example.com/mcp'))
+      .rejects.toThrow('insecure endpoint');
+    expect(electronMock.openExternal).not.toHaveBeenCalled();
+  });
+
+  it('discovers custom OAuth through a 401 resource challenge and path-based OIDC issuer', async () => {
+    const fetchMock = vi.fn(async (raw: string, init?: RequestInit) => {
+      const url = String(raw);
+      if (url.includes('oauth-protected-resource')) return jsonResponse({}, false, 404);
+      if (url === 'https://mcp.example.com/mcp') {
+        expect(init?.method).toBe('POST');
+        expect(JSON.parse(String(init?.body)).method).toBe('initialize');
+        return new Response(null, { status: 401, headers: {
+          'WWW-Authenticate': 'Bearer resource_metadata="https://mcp.example.com/auth/resource-metadata"',
+        } });
+      }
+      if (url === 'https://mcp.example.com/auth/resource-metadata') return jsonResponse({
+        resource: 'https://mcp.example.com/mcp', authorization_servers: ['https://login.example.com/tenant'],
+      });
+      if (url === 'https://login.example.com/.well-known/oauth-authorization-server') return jsonResponse({
+        authorization_endpoint: 'https://login.example.com/wrong-tenant',
+        token_endpoint: 'https://login.example.com/wrong-token',
+      });
+      if (url.includes('oauth-authorization-server') || url === 'https://login.example.com/.well-known/openid-configuration/tenant') {
+        if (url.includes('oauth-authorization-server')) return jsonResponse({}, false, 404);
+        return jsonResponse({
+          issuer: 'https://login.example.com/tenant',
+          authorization_endpoint: 'https://login.example.com/authorize',
+          token_endpoint: 'https://login.example.com/token',
+          registration_endpoint: 'https://login.example.com/register',
+        });
+      }
+      if (url === 'https://login.example.com/register') return jsonResponse({ client_id: 'client-1' });
+      throw new Error(`unexpected request ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const pending = oauth.startCustomMcpOAuth('custom-example', 'https://mcp.example.com/mcp');
+    const outcome = expect(pending).rejects.toThrow();
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
+    expect(new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('resource'))
+      .toBe('https://mcp.example.com/mcp');
+    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+    await outcome;
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === 'https://login.example.com/.well-known/openid-configuration/tenant'))
+      .toBe(true);
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === 'https://login.example.com/.well-known/oauth-authorization-server'))
+      .toBe(false);
+  });
+
+  it('rejects root metadata for a different tenant when custom issuer discovery falls back', async () => {
+    const fetchMock = vi.fn(async (raw: string) => {
+      const url = String(raw);
+      if (url.includes('oauth-protected-resource')) return jsonResponse({
+        authorization_servers: ['https://login.example.com/tenant'],
+        resource: 'https://mcp.example.com/mcp',
+      });
+      if (url === 'https://login.example.com/.well-known/oauth-authorization-server') return jsonResponse({
+        issuer: 'https://login.example.com',
+        authorization_endpoint: 'https://login.example.com/authorize',
+        token_endpoint: 'https://login.example.com/token',
+        registration_endpoint: 'https://login.example.com/register',
+      });
+      return jsonResponse({}, false, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { startCustomMcpOAuth } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    await expect(startCustomMcpOAuth('custom-example', 'https://mcp.example.com/mcp'))
+      .rejects.toThrow('issuer mismatch');
+    expect(electronMock.openExternal).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === 'https://login.example.com/register'))
+      .toBe(false);
+  });
+
+  it('rejects a challenge pointing at an insecure resource-metadata URL before fetching it', async () => {
+    const fetchMock = vi.fn(async (raw: string) => {
+      if (String(raw).includes('oauth-protected-resource')) return jsonResponse({}, false, 404);
+      if (String(raw) === 'https://mcp.example.com/mcp') return new Response(null, { status: 401, headers: {
+        'WWW-Authenticate': 'Bearer resource_metadata="http://other.example/private"',
+      } });
+      throw new Error('untrusted metadata URL must not be fetched');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { startCustomMcpOAuth } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    await expect(startCustomMcpOAuth('custom-example', 'https://mcp.example.com/mcp'))
+      .rejects.toThrow('insecure endpoint');
+    expect(electronMock.openExternal).not.toHaveBeenCalled();
+  });
+
+  it('prefers CIMD when advertised and rejects an issuer mismatch before token exchange', async () => {
+    const fetchMock = vi.fn(async (raw: string) => {
+      const url = new URL(raw);
+      if (url.pathname.includes('oauth-protected-resource')) return jsonResponse({
+        authorization_servers: ['https://login.example.com'], resource: 'https://mcp.example.com/mcp',
+      });
+      if (url.pathname.includes('oauth-authorization-server')) return jsonResponse({
+        issuer: 'https://login.example.com', authorization_response_iss_parameter_supported: true,
+        client_id_metadata_document_supported: true,
+        authorization_endpoint: 'https://login.example.com/authorize',
+        token_endpoint: 'https://login.example.com/token',
+      });
+      if (url.pathname.endsWith('/dcr-exchange')) return jsonResponse({ code: 0, oauth_code: 'auth-code',
+        oauth_state: new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('state'),
+        oauth_issuer: 'https://other.example.com' });
+      throw new Error('CIMD must not register or exchange a mismatched issuer');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const flow = oauth.startCustomMcpOAuth('custom-example', 'https://mcp.example.com/mcp');
+    const outcome = expect(flow).rejects.toThrow('issuer mismatch');
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
+    const opened = new URL(String(electronMock.openExternal.mock.calls[0][0]));
+    expect(opened.searchParams.get('client_id')).toBe('https://account.example/api/connectors/oauth/client-metadata');
+    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=receipt');
+    await outcome;
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/register'))).toBe(false);
+  });
+
+  it('completes a CIMD authorization without dynamic registration', async () => {
+    const fetchMock = vi.fn(async (raw: string, init?: RequestInit) => {
+      const url = new URL(raw);
+      if (url.pathname.includes('oauth-protected-resource')) return jsonResponse({
+        authorization_servers: ['https://login.example.com'], resource: 'https://mcp.example.com/mcp',
+      });
+      if (url.pathname.includes('oauth-authorization-server')) return jsonResponse({
+        issuer: 'https://login.example.com', authorization_response_iss_parameter_supported: true,
+        client_id_metadata_document_supported: true,
+        authorization_endpoint: 'https://login.example.com/authorize',
+        token_endpoint: 'https://login.example.com/token',
+      });
+      if (url.pathname.endsWith('/dcr-exchange')) return jsonResponse({ code: 0, oauth_code: 'auth-code',
+        oauth_state: new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('state'),
+        oauth_issuer: 'https://login.example.com' });
+      if (url.pathname === '/token') {
+        expect(new URLSearchParams(String(init?.body)).get('client_id'))
+          .toBe('https://account.example/api/connectors/oauth/client-metadata');
+        return jsonResponse({ access_token: 'cimd-access', refresh_token: 'cimd-refresh', expires_in: 3600 });
+      }
+      throw new Error('CIMD must not register a dynamic client');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const flow = oauth.startCustomMcpOAuth('custom-example', 'https://mcp.example.com/mcp');
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
+    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=receipt');
+    await expect(flow).resolves.toMatchObject({ grant: { access_token: 'cimd-access', refresh_token: 'cimd-refresh' },
+      client: { client_id: 'https://account.example/api/connectors/oauth/client-metadata', token_endpoint_auth_method: 'none' } });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/register'))).toBe(false);
+  });
+
   it.each(['complete', 'omitted', 'reduced'])('Color Me Shop requests pinned scopes and handles a %s grant before storage', async mode => {
     const { findCatalogEntry } = await import('../../../../src/main/features/connectors/catalog');
     const entry = findCatalogEntry('colorme-shop')!;

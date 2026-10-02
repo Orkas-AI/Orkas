@@ -1,3 +1,4 @@
+import { terminalOutputSnapshot, type TerminalOutput } from '../../util/terminal-output-diagnostics';
 /**
  * core-agent-backed implementation of `chatWithModel` / `streamChatWithModel`.
  *
@@ -20,6 +21,7 @@
  *   - Returned event shapes + final reply accumulation
  */
 
+import { getAgentIdleClock } from '../../util/system-activity';
 import {
   sessionLock, globalSlots, acquireWithAbort,
   type Releaser,
@@ -501,6 +503,7 @@ type RunTimelineLogEntry = {
 };
 
 export interface ModelRunLogDiagnostics {
+  terminalOutput?: TerminalOutput;
   startedAtMs: number;
   rawEventCount: number;
   streamEventCount: number;
@@ -1096,6 +1099,11 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       break;
     }
     case 'provider_call': {
+      const output = e.output as Record<string, unknown> | undefined;
+      stats.terminalOutput = terminalOutputSnapshot({ version: 1,
+        provider_terminal_seen: output?.terminalSeen, provider_stop_reason: output?.stopReason,
+        provider_text_chars: output?.textChars, provider_thinking_chars: output?.thinkingChars,
+        provider_tool_calls: output?.toolCalls });
       const durationMs = Math.max(0, Math.round(finiteNumber(e.durationMs) || 0));
       const usage = safeUsageForLog(e.usage);
       stats.providerCallCount += 1;
@@ -1221,6 +1229,7 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       stats.resultTextChars = typeof (e.result as { text?: unknown } | undefined)?.text === 'string'
         ? ((e.result as { text: string }).text.length)
         : stats.resultTextChars;
+      stats.terminalOutput = terminalOutputSnapshot({ ...stats.terminalOutput, version: 1, runner_text_chars: typeof (e.result as { text?: unknown } | undefined)?.text === 'string' ? stats.resultTextChars : undefined });
       stats.resultContentBlocks = Array.isArray((e.result as { content?: unknown } | undefined)?.content)
         ? ((e.result as { content: unknown[] }).content.length)
         : stats.resultContentBlocks;
@@ -1266,6 +1275,7 @@ export function recordModelStreamEventForLog(stats: ModelRunLogDiagnostics, ev: 
       stats.eventPayloads += 1;
       break;
     case 'final':
+      stats.terminalOutput = terminalOutputSnapshot({ ...stats.terminalOutput, version: 1, mapped_text_chars: typeof ev.text === 'string' ? ev.text.length : 0 });
       stats.finalEvents += 1;
       noteRunTimelineForLog(stats, 'client_final', nowMs, `chars=${typeof ev.text === 'string' ? ev.text.length : 0}`);
       break;
@@ -1274,6 +1284,13 @@ export function recordModelStreamEventForLog(stats: ModelRunLogDiagnostics, ev: 
       noteRunTimelineForLog(stats, 'client_error', nowMs, `chars=${typeof ev.text === 'string' ? ev.text.length : 0} aborted=${ev.aborted ? 'true' : 'false'}`);
       break;
     case 'done':
+      // A host abort/timeout may stop consuming a newer call before its receipt.
+      // Do not attribute the previous completed response to that terminal.
+      if (stats.doneRawEventMs === undefined) {
+        stats.terminalOutput = terminalOutputSnapshot({ version: 1,
+          mapped_text_chars: stats.terminalOutput?.mapped_text_chars });
+      }
+      stats.terminalOutput = terminalOutputSnapshot({ ...stats.terminalOutput, version: 1, mapped_text_chars: stats.terminalOutput?.mapped_text_chars ?? 0 });
       noteRunTimelineForLog(stats, 'client_done', nowMs);
       break;
     default:
@@ -1347,6 +1364,7 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     stopReason: stats.stopReason,
     errorKind: stats.errorKind,
     usage: stats.usage,
+    terminal_output: terminalOutputSnapshot(stats.terminalOutput),
     resultTextChars: stats.resultTextChars,
     resultContentBlocks: stats.resultContentBlocks,
     toolLoops: stats.toolLoops,
@@ -1660,6 +1678,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   // is a no-op.
   const controller = new AbortController();
   let idleTimer: NodeJS.Timeout | null = null;
+  let idleNow: () => number = () => Date.now();
   let idleHit = false;
   let wallHit = false;
   const userWaitingTools = new Set<string>();
@@ -1733,10 +1752,16 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // assembling. Preserve a true no-tool-delta deadline instead of extending
     // it for those events; only the timestamp updated by `tool_delta` renews it.
     const delayMs = assemblingToolCall && toolInputLastDeltaAt > 0
-      ? Math.max(0, (window * 1000) - (Date.now() - toolInputLastDeltaAt))
+      ? Math.max(0, (window * 1000) - (idleNow() - toolInputLastDeltaAt))
       : window * 1000;
-    idleTimer = setTimeout(() => {
+    const idleDeadline = idleNow() + delayMs;
+    const checkIdle = () => {
       if (controller.signal.aborted) return;
+      const remainingMs = idleDeadline - idleNow();
+      if (remainingMs > 0) {
+        idleTimer = setTimeout(checkIdle, remainingMs);
+        return;
+      }
       idleHit = true;
       idleHitWindow = window;
       idleHitPhase = phase;
@@ -1748,7 +1773,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       controller.abort();
       releaseSlotOnce('idle-watchdog');
       releaseSessionOnce('idle-watchdog');
-    }, delayMs);
+    };
+    idleTimer = setTimeout(checkIdle, delayMs);
   };
   let wallTimer: NodeJS.Timeout | null = null;
 
@@ -1809,6 +1835,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     });
     // Lock waiting is not provider/tool idleness. Arm the existing watchdogs
     // only after admission; cancellation remains active throughout the wait.
+    idleNow = await getAgentIdleClock();
+    controller.signal.throwIfAborted();
     resetIdle();
     wallTimer = setTimeout(() => {
       if (controller.signal.aborted) return;
@@ -1844,6 +1872,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       // tool fails as one recoverable tool error, never as a dead turn.
       toolIdleTimeoutMs,
       ...(elapsedConvergenceMs != null ? { elapsedConvergenceMs } : {}),
+      idleNow,
       providerFirstEventTimeoutMs: Math.max(1, streamIdleTimeout * 1000),
       ...(cid ? { cid } : {}),
       ...(conversationTitle ? { conversationTitle } : {}),
@@ -2057,7 +2086,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
         } else if (ev.type === 'tool_delta') {
           modelTextStreamActive = false;
           assemblingToolCallIds.add(ev.id || 'stream_tool');
-          toolInputLastDeltaAt = Date.now();
+          toolInputLastDeltaAt = idleNow();
         } else if (ev.type === 'tool_start') {
           modelTextStreamActive = false;
           assemblingToolCallIds.clear();

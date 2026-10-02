@@ -221,7 +221,7 @@ describe('renderer local Agent structured user input', () => {
     });
     await flush();
     expect(secret.requests).toHaveLength(0);
-    expect(secret.uiPrompt).toHaveBeenCalledWith('Paste the deploy token', '', { signal: expect.any(AbortSignal), secret: true });
+    expect(secret.uiPrompt).toHaveBeenCalledWith('Paste the deploy token', '', { signal: expect.any(AbortSignal), context: expect.objectContaining({ cid: 'chat-1' }), secret: true });
 
     const noDock = loadHarness({ dock: false });
     noDock.uiChoice.mockResolvedValue('option-0');
@@ -263,6 +263,7 @@ describe('renderer local Agent structured user input', () => {
 
     expect(harness.uiChoice).toHaveBeenCalledWith({
       title: 'agents.cli_user_input_title',
+      context: expect.objectContaining({ request_id: expect.any(String) }),
       message: 'Deployment\nChoose target\nStaging: Pre-production',
       // No free-text escape hatch unless the CLI asked for one.
       choices: [{ id: 'option-0', label: 'Staging' }, { id: 'option-1', label: 'Production' }],
@@ -272,7 +273,7 @@ describe('renderer local Agent structured user input', () => {
       choiceLayout: 'group',
       signal: expect.any(AbortSignal),
     });
-    expect(harness.uiPrompt).toHaveBeenCalledWith('Release note', '', { signal: expect.any(AbortSignal), secret: false });
+    expect(harness.uiPrompt).toHaveBeenCalledWith('Release note', '', { signal: expect.any(AbortSignal), context: expect.any(Object), secret: false });
     expect(harness.invoke).toHaveBeenCalledOnce();
     expect(harness.invoke).toHaveBeenCalledWith('localAgents.userInputResponse', {
       request_id: 'request-1',
@@ -297,7 +298,7 @@ describe('renderer local Agent structured user input', () => {
       { id: 'option-1', label: 'Production' },
       { id: 'other', label: 'agents.cli_user_input_other' },
     ]);
-    expect(harness.uiPrompt).toHaveBeenCalledWith('Choose target', '', { signal: expect.any(AbortSignal), secret: false });
+    expect(harness.uiPrompt).toHaveBeenCalledWith('Choose target', '', { signal: expect.any(AbortSignal), context: expect.any(Object), secret: false });
     expect(harness.invoke).toHaveBeenCalledWith('localAgents.userInputResponse', {
       request_id: 'request-other',
       answers: { environment: ['Canary ring'] },
@@ -316,7 +317,7 @@ describe('renderer local Agent structured user input', () => {
     await flush();
 
     expect(harness.uiChoice).not.toHaveBeenCalled();
-    expect(harness.uiPrompt).toHaveBeenCalledWith('Paste the deploy token', '', { signal: expect.any(AbortSignal), secret: true });
+    expect(harness.uiPrompt).toHaveBeenCalledWith('Paste the deploy token', '', { signal: expect.any(AbortSignal), context: expect.any(Object), secret: true });
     expect(harness.invoke).toHaveBeenCalledWith('localAgents.userInputResponse', {
       request_id: 'request-secret', answers: { token: ['hunter2'] }, cancelled: false,
     });
@@ -333,7 +334,7 @@ describe('renderer local Agent structured user input', () => {
     await flush();
     expect(harness.requests).toHaveLength(0);
     expect(harness.uiPrompt).toHaveBeenCalledWith('Choose target', '', {
-      signal: expect.any(AbortSignal), secret: true,
+      signal: expect.any(AbortSignal), context: expect.any(Object), secret: true,
     });
     expect(harness.invoke).toHaveBeenCalledExactlyOnceWith('localAgents.userInputResponse', {
       request_id: 'secret-option', cancelled: false,

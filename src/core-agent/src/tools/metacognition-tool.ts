@@ -42,7 +42,7 @@ export function createMetacognitionTool(
         action: {
           type: 'string',
           enum: ['read', 'write'],
-          description: 'read: target only; write: target/content. Omit unrelated fields.',
+          description: 'read: target only; write: target/content. Read ignores content and reports ignored_fields; unknown fields are errors.',
         },
         target: {
           type: 'string',
@@ -64,6 +64,13 @@ export function createMetacognitionTool(
       const action = input.action as string;
       const target = input.target as 'competence' | 'strategies';
       const content = typeof input.content === 'string' ? input.content : '';
+      const unknownFields = Object.keys(input).filter((key) => !['action', 'target', 'content'].includes(key)).sort();
+      if (unknownFields.length) {
+        return {
+          content: JSON.stringify({ ok: false, error: `unknown fields: ${unknownFields.join(', ')}` }),
+          isError: true,
+        };
+      }
 
       if (target !== 'competence' && target !== 'strategies') {
         return {
@@ -75,7 +82,9 @@ export function createMetacognitionTool(
       switch (action) {
         case 'read': {
           const result = handler.read(target);
-          return { content: JSON.stringify(result), isError: false };
+          return { content: JSON.stringify({ ...result,
+            ...(Object.hasOwn(input, 'content') ? { ignored_fields: ['content'] } : {}),
+          }), isError: false };
         }
         case 'write': {
           if (!content.trim()) {

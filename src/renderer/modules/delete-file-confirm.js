@@ -428,14 +428,14 @@ function _autoTriggerLLMContinue(text) {
     const btn = document.getElementById(sendId);
     if (!inp || !btn) continue;
     if (inp.offsetParent === null) continue;
-    if (inp.value && inp.value.trim()) return false;
+    if (composerText(inp) && composerText(inp).trim()) return false;
     // Suppress scroll-pin for this one send so the historic messages
     // (and the confirm card itself) stay in view instead of being pushed
     // off-screen by the 100vh spacer that pins the user message to top.
     const history = document.getElementById(historyId);
     if (history) history.dataset.suppressScrollPin = '1';
-    inp.value = text;
-    try { inp.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+    composerSetText(inp, text);
+    try { composerNotify(inp); } catch (_) {}
     // Mid-stream the button is a Stop button, so clicking it would abort.
     // Submit with Enter instead: main / skill / agent chats all route plain
     // Enter through their queue-aware send handler, which appends this tiny
@@ -443,8 +443,8 @@ function _autoTriggerLLMContinue(text) {
     if (btn.disabled || btn.classList.contains('streaming') || btn.classList.contains('aborting')) {
       const queued = _dispatchDeleteContinueEnter(inp);
       if (!queued) {
-        inp.value = '';
-        try { inp.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+        composerSetText(inp, '');
+        try { composerNotify(inp); } catch (_) {}
         if (history && history.dataset.suppressScrollPin === '1') delete history.dataset.suppressScrollPin;
       }
       return queued;

@@ -105,6 +105,7 @@ vi.mock('electron', () => {
   }
 
   class FakePage extends FakeEmitter {
+    ipc = new FakeEmitter();
     static nextId = 1;
     id = FakePage.nextId++;
     private url = '';
@@ -282,6 +283,7 @@ vi.mock('electron', () => {
   };
 
   const fakeSession = {
+    registerPreloadScript: vi.fn(),
     webRequest: { onBeforeRequest: (handler: any) => { electronMock.beforeRequest = handler; } },
     setPermissionCheckHandler: vi.fn(),
     setPermissionRequestHandler: vi.fn(),
@@ -384,6 +386,22 @@ describe('Web Assist controlled connector lifecycle', () => {
         ? waitForModelWebAssist('u1', cid, input)
         : waitForControlledWebAssist('u1', cid, 'shop', input);
     }
+
+    it('lets the default wait span the full human idle interval', async () => {
+      await openWait();
+      const page = electronMock.page;
+      page.emit('before-mouse-event', {}, { type: 'mouseWheel', x: 10, y: 10 });
+      let result: Record<string, unknown> | undefined;
+      const waiting = (scope === 'browser'
+        ? waitForModelWebAssist('u1', 'c-wait-deadline', {})
+        : waitForControlledWebAssist('u1', 'c-wait-deadline', 'shop', {}))
+        .then(value => { result = value; });
+      await vi.advanceTimersByTimeAsync(9999);
+      expect(result).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(201);
+      await waiting;
+      expect(result).toMatchObject({ ok: true });
+    });
 
     it.each(['pending', 'resolve', 'reject'] as const)('bounds a stalled native read with %s settlement and permits recovery', async (settlement) => {
       const wait = await openWait();
@@ -849,6 +867,7 @@ describe('Web Assist controlled connector lifecycle', () => {
   it.each([true, false])('allows one safe child authorization window with host focusability %s and rejects unsafe or nested navigation', async (focusable) => {
     const { renderer, owner } = electronMock;
     owner.isFocusable = () => focusable;
+    setActiveWebAssistConversation(renderer, 'c-popup');
     const opened = await openWebAssist('u1', renderer, {
       conversationId: 'c-popup',
       url: 'https://provider.example/settings',
@@ -892,6 +911,91 @@ describe('Web Assist controlled connector lifecycle', () => {
     const allowedNavigation = { preventDefault: vi.fn() };
     popupPage.emit('will-redirect', allowedNavigation, 'https://provider.example/callback');
     expect(allowedNavigation.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('automatically returns an idle page to AI after the last user input, requiring a fresh observation', async () => {
+    vi.useFakeTimers();
+    const { renderer } = electronMock;
+    try {
+      bindWebAssistConversation('u1', 'c-auto-resume', renderer);
+      const opened = await openModelWebAssist('u1', 'c-auto-resume', { url: 'https://example.com/draft' });
+      const tabId = opened.active_tab_id;
+      const page = electronMock.page;
+      vi.spyOn(page, 'reload');
+      const before = await observeModelWebAssist('u1', 'c-auto-resume', tabId);
+      page.emit('before-input-event', {}, { type: 'keyDown', code: 'KeyA', isComposing: false });
+      page.emit('before-input-event', {}, { type: 'keyUp', code: 'KeyA', isComposing: false });
+      const navigate = () => navigateModelWebAssist('u1', 'c-auto-resume', { tabId, action: 'reload' });
+      expect(await navigate()).toMatchObject({ ok: false, code: 'user_controlled' });
+      await vi.advanceTimersByTimeAsync(2500);
+      page.emit('before-mouse-event', {}, { type: 'mouseWheel', x: 10, y: 10 });
+      // Leaving this task must not require returning to a resume button.
+      setActiveWebAssistConversation(renderer, 'other-task');
+      await vi.advanceTimersByTimeAsync(9999);
+      expect(await navigate()).toMatchObject({ ok: false, code: 'user_controlled' });
+      expect(page.reload).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(listModelWebAssistTabs('u1', 'c-auto-resume')).toMatchObject({ tabs: [expect.not.objectContaining({ user_controlled: true })] });
+      const fill = (pageId: unknown) => actOnModelWebAssist('u1', 'c-auto-resume', {
+        tabId, pageId, elementRef: 'e1', action: 'fill', text: 'AI continues',
+      });
+      expect(await fill(before.page_id)).toMatchObject({ ok: false, code: 'stale_page' });
+      // A new user edit during an in-flight observation cannot mint usable refs.
+      const execute = page.executeJavaScriptInIsolatedWorld.bind(page);
+      vi.spyOn(page, 'executeJavaScriptInIsolatedWorld').mockImplementationOnce(async (...args: any[]) => {
+        const result = await execute(...args);
+        page.emit('before-input-event', {}, { type: 'keyDown', code: 'KeyB', isComposing: false });
+        page.emit('before-input-event', {}, { type: 'keyUp', code: 'KeyB', isComposing: false });
+        return result;
+      });
+      expect(await observeModelWebAssist('u1', 'c-auto-resume', tabId)).toMatchObject({ ok: false, code: 'page_changed' });
+      await vi.advanceTimersByTimeAsync(10_000);
+      const fresh = await observeModelWebAssist('u1', 'c-auto-resume', tabId);
+      expect(await fill(fresh.page_id)).toMatchObject({ ok: true });
+    } finally {
+      closeWebAssist(renderer);
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a temporary page after human takeover and task completion', async () => {
+    const { renderer } = electronMock;
+    bindWebAssistConversation('u1', 'c-takeover', renderer);
+    beginBrowserTaskRun('u1', 'c-takeover', 'takeover-run');
+    const opened = await openModelWebAssist('u1', 'c-takeover', { url: 'https://example.com/draft' });
+    const tabId = opened.active_tab_id;
+    expect(retainModelWebAssistTab('u1', 'c-takeover', tabId, 'temporary')).toMatchObject({ ok: true });
+    electronMock.page.emit('before-input-event', {}, { type: 'keyDown', code: 'KeyA' });
+    expect(retainModelWebAssistTab('u1', 'c-takeover', tabId, 'temporary')).toMatchObject({ ok: false, code: 'user_controlled' });
+    finishBrowserTaskRun('u1', 'c-takeover', 'takeover-run');
+    expect(electronMock.page.isDestroyed()).toBe(false);
+    expect(listModelWebAssistTabs('u1', 'c-takeover')).toMatchObject({ tabs: [{ tab_id: tabId, user_controlled: true }] });
+    closeWebAssistTab(renderer, tabId);
+  });
+
+  it('defers background authorization windows and reveals them without focus on return', async () => {
+    const { BrowserWindow } = await import('electron');
+    const { renderer, owner } = electronMock;
+    setActiveWebAssistConversation(renderer, 'other-task');
+    await openWebAssist('u1', renderer, { conversationId: 'c-popup', url: 'https://provider.example/settings' });
+    const parent = electronMock.page;
+    expect(parent.windowOpenHandler({ url: 'https://login.example/', disposition: 'new-window' }))
+      .toMatchObject({ action: 'allow', overrideBrowserWindowOptions: { show: false, focusable: true } });
+    const popup = { webContents: electronMock.createPage!(), isDestroyed: () => false,
+      setMenuBarVisibility: vi.fn(), showInactive: vi.fn(), focus: vi.fn() };
+    const lookup = vi.spyOn(BrowserWindow, 'fromWebContents').mockImplementation((contents: any) => (
+      contents === renderer ? owner : contents === popup.webContents ? popup as any : null
+    ));
+    try {
+      parent.emit('did-create-window', popup);
+      expect(popup.showInactive).not.toHaveBeenCalled();
+      setActiveWebAssistConversation(renderer, 'c-popup');
+      layoutWebAssist(renderer, { x: 0, y: 0, width: 600, height: 400 });
+      layoutWebAssist(renderer, { x: 0, y: 0, width: 600, height: 400 });
+      expect(popup.showInactive).toHaveBeenCalledOnce();
+      expect(popup.focus).not.toHaveBeenCalled();
+      expect(owner.focus).not.toHaveBeenCalled();
+    } finally { lookup.mockRestore(); }
   });
 
   it.each(['foreground-tab', 'background-tab', 'default'])('adopts %s pages into task tabs without reloading Chromium guests', async disposition => {
@@ -1202,6 +1306,24 @@ describe('Web Assist controlled connector lifecycle', () => {
     expect(visibility).toHaveBeenLastCalledWith(true);
   });
 
+  it('enforces the long-article bound in the host before running any page script', async () => {
+    const { renderer } = electronMock;
+    bindWebAssistConversation('u1', 'c-long-article', renderer);
+    const opened = await openModelWebAssist('u1', 'c-long-article', { url: 'https://example.com/editor' });
+    const tabId = opened.active_tab_id;
+    const observed = await observeModelWebAssist('u1', 'c-long-article', tabId);
+    const execute = vi.spyOn(electronMock.page, 'executeJavaScriptInIsolatedWorld');
+    const input = { tabId, pageId: observed.page_id, elementRef: 'e1', action: 'fill' };
+    for (const text of ['x'.repeat(100001), 'article\u0000body']) {
+      expect(await actOnModelWebAssist('u1', 'c-long-article', { ...input, text }))
+        .toMatchObject({ ok: false, code: 'invalid_text' });
+    }
+    expect(execute).not.toHaveBeenCalled();
+    expect(await actOnModelWebAssist('u1', 'c-long-article', { ...input, text: '文'.repeat(100000) }))
+      .toMatchObject({ ok: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
   it('navigates a background model tab without changing the foreground selection', async () => {
     const { renderer } = electronMock;
     bindWebAssistConversation('u1', 'c-navigation-background', renderer);
@@ -1330,7 +1452,7 @@ describe('Web Assist controlled connector lifecycle', () => {
       clicks = 0;
       constructor(public tagName: string, public type: string, public innerText: string) {}
       getAttribute(name: string): string | null { return name === 'type' ? this.type : null; }
-      getBoundingClientRect(): { width: number; height: number } { return { width: 100, height: 30 }; }
+      getBoundingClientRect() { return { left: 0, top: 0, right: 100, bottom: 30, width: 100, height: 30 }; }
       scrollIntoView(): void {}
       focus(): void {}
       click(): void { this.clicks += 1; }
@@ -1340,14 +1462,16 @@ describe('Web Assist controlled connector lifecycle', () => {
     submit.form = { elements: [field, submit] };
     const document = {
       title: 'Provider setup',
+      elementFromPoint: () => submit,
       children: [submit, field],
       querySelectorAll: (selector: string) => selector.startsWith('a[href]') ? [submit, field] : [],
     };
+    electronMock.page.debugger = { isAttached: () => false, attach() {}, detach() {}, sendCommand: async (_method: string, params: any) => { if (params.type === 'mouseReleased') submit.click(); } };
     submit.parentNode = document;
     field.parentNode = document;
     vi.spyOn(electronMock.page, 'executeJavaScriptInIsolatedWorld').mockImplementation(
       async (_worldId: unknown, scripts: Array<{ code: string }>) => vm.runInNewContext(scripts[0].code, {
-        document, Element: PageElement, ShadowRoot: class {},
+        document, window: { innerWidth: 1280, innerHeight: 800 }, Element: PageElement, ShadowRoot: class {},
         getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
       }),
     );
@@ -1379,6 +1503,101 @@ describe('Web Assist controlled connector lifecycle', () => {
     expect(submit.clicks).toBe(2);
   });
 
+  it.each([
+    { page: 'a rendering background', rendering: true, wakes: false, onScreen: false,
+      events: ['mouseMoved', 'mousePressed', 'mouseReleased'] },
+    { page: 'a never-rendered background', rendering: false, wakes: true, onScreen: false,
+      events: ['throttling:false', 'mouseMoved', 'mousePressed', 'mouseReleased'] },
+    { page: 'a background needing virtual focus', rendering: false, wakes: false, focusWakes: true, onScreen: false,
+      events: ['throttling:false', 'focus:true', 'focus:false', 'mouseMoved', 'mousePressed', 'mouseReleased'] },
+    { page: 'an unrenderable background', rendering: false, wakes: false, onScreen: false, refused: 'page_not_rendered',
+      events: ['throttling:false', 'focus:true', 'focus:false'] },
+    { page: 'a frameless on-screen', rendering: false, wakes: false, onScreen: true,
+      events: ['throttling:false', 'mouseMoved', 'mousePressed', 'mouseReleased'] },
+  ])('makes $page page render before native input or withholds the input', async ({ rendering: renderingAtStart, wakes, focusWakes, onScreen, refused, events }) => {
+    const { renderer } = electronMock;
+    const cid = 'c-render';
+    bindWebAssistConversation('u1', cid, renderer);
+    if (!onScreen) setActiveWebAssistConversation(renderer, 'other-task');
+    const opened = await openModelWebAssist('u1', cid, { url: 'https://example.com/report' });
+    const tabId = (opened as any).active_tab_id;
+    if (onScreen) layoutWebAssist(renderer, { x: 0, y: 0, width: 600, height: 400 });
+    class PageElement {
+      form: { elements: PageElement[] } | null = null;
+      parentNode: any = null;
+      disabled = false;
+      clicks = 0;
+      constructor(public tagName: string, public type: string, public innerText: string) {}
+      getAttribute(name: string): string | null { return name === 'type' ? this.type : null; }
+      getBoundingClientRect() { return { left: 0, top: 0, right: 100, bottom: 30, width: 100, height: 30 }; }
+      scrollIntoView(): void {}
+      focus(): void {}
+      click(): void { this.clicks += 1; }
+    }
+    const button = new PageElement('BUTTON', 'button', 'Continue');
+    const document = {
+      title: 'Report',
+      elementFromPoint: () => button,
+      children: [button],
+      querySelectorAll: (selector: string) => (selector.startsWith('a[href]') ? [button] : []),
+    };
+    button.parentNode = document;
+    let rendering = renderingAtStart;
+    const seen: string[] = [];
+    electronMock.page.setBackgroundThrottling = vi.fn((allowed: boolean) => {
+      seen.push(`throttling:${allowed}`);
+      if (!allowed && wakes) rendering = true;
+    });
+    let attached = false;
+    electronMock.page.debugger = { isAttached: () => attached, attach() { attached = true; }, detach() { attached = false; }, sendCommand: async (method: string, params: any) => {
+      if (method === 'Emulation.setFocusEmulationEnabled') {
+        seen.push(`focus:${params.enabled}`);
+        if (params.enabled && focusWakes) rendering = true;
+        return;
+      }
+      seen.push(params.type);
+      // Measured: an off-screen page that never rendered never acknowledges a mouse move.
+      if (!rendering && !onScreen) await new Promise(() => {});
+      if (params.type === 'mouseReleased') button.click();
+    } };
+    vi.spyOn(electronMock.page, 'executeJavaScriptInIsolatedWorld').mockImplementation(
+      async (_worldId: unknown, scripts: Array<{ code: string }>) => vm.runInNewContext(scripts[0].code, {
+        document, window: { innerWidth: 1280, innerHeight: 800 }, Element: PageElement, ShadowRoot: class {},
+        getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+        // A page without frames never runs this callback.
+        requestAnimationFrame: (callback: () => void) => { if (rendering) callback(); },
+      }),
+    );
+    const observation = await observeModelWebAssist('u1', cid, tabId);
+    vi.useFakeTimers();
+    try {
+      const click = async () => {
+        const pending = actOnModelWebAssist('u1', cid, {
+          tabId, pageId: (observation as any).page_id, elementRef: 'e1', action: 'click',
+        });
+        await vi.advanceTimersByTimeAsync(6000);
+        return pending;
+      };
+      const result = await click();
+      expect(attached).toBe(false);
+      expect(seen).toEqual(events);
+      if (refused) {
+        expect(result).toMatchObject({ ok: false, code: refused });
+        expect(button.clicks).toBe(0);
+        // Once the user shows the page, the same observation clicks exactly once.
+        rendering = true;
+        seen.length = 0;
+        await expect(click()).resolves.toMatchObject({ ok: true, outcome: 'acted' });
+        expect(seen).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased']);
+      } else {
+        expect(result).toMatchObject({ ok: true, outcome: 'acted', action: 'click' });
+      }
+      expect(button.clicks).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('turns a handed-back control into an approved click and repeats it under a task grant', async () => {
     const { renderer } = electronMock;
     bindWebAssistConversation('u1', 'c-approve', renderer);
@@ -1392,7 +1611,7 @@ describe('Web Assist controlled connector lifecycle', () => {
       clicks = 0;
       constructor(public tagName: string, public type: string, public innerText: string) {}
       getAttribute(name: string): string | null { return name === 'type' ? this.type : null; }
-      getBoundingClientRect(): { width: number; height: number } { return { width: 100, height: 30 }; }
+      getBoundingClientRect() { return { left: 0, top: 0, right: 100, bottom: 30, width: 100, height: 30 }; }
       scrollIntoView(): void {}
       focus(): void {}
       click(): void { this.clicks += 1; }
@@ -1403,14 +1622,16 @@ describe('Web Assist controlled connector lifecycle', () => {
     const remove = new PageElement('BUTTON', 'button', 'Delete chat');
     const document = {
       title: 'ChatGPT',
+      elementFromPoint: () => send,
       children: [send, remove],
       querySelectorAll: (selector: string) => (selector.startsWith('a[href]') ? [send, remove] : []),
     };
+    electronMock.page.debugger = { isAttached: () => false, attach() {}, detach() {}, sendCommand: async (_method: string, params: any) => { if (params.type === 'mouseReleased') send.click(); } };
     send.parentNode = document;
     remove.parentNode = document;
     vi.spyOn(electronMock.page, 'executeJavaScriptInIsolatedWorld').mockImplementation(
       async (_worldId: unknown, scripts: Array<{ code: string }>) => vm.runInNewContext(scripts[0].code, {
-        document, Element: PageElement, ShadowRoot: class {},
+        document, window: { innerWidth: 1280, innerHeight: 800 }, Element: PageElement, ShadowRoot: class {},
         getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
       }),
     );
@@ -1473,7 +1694,7 @@ describe('Web Assist controlled connector lifecycle', () => {
       clicks = 0;
       constructor(public tagName: string, public type: string, public innerText: string) {}
       getAttribute(name: string): string | null { return name === 'type' ? this.type : null; }
-      getBoundingClientRect(): { width: number; height: number } { return { width: 100, height: 30 }; }
+      getBoundingClientRect() { return { left: 0, top: 0, right: 100, bottom: 30, width: 100, height: 30 }; }
       scrollIntoView(): void {}
       focus(): void {}
       click(): void { this.clicks += 1; }
@@ -1484,14 +1705,16 @@ describe('Web Assist controlled connector lifecycle', () => {
     const remove = new PageElement('BUTTON', 'button', 'Delete chat');
     const document = {
       title: 'ChatGPT',
+      elementFromPoint: () => send,
       children: [send, remove],
       querySelectorAll: (selector: string) => (selector.startsWith('a[href]') ? [send, remove] : []),
     };
+    electronMock.page.debugger = { isAttached: () => false, attach() {}, detach() {}, sendCommand: async (_method: string, params: any) => { if (params.type === 'mouseReleased') send.click(); } };
     send.parentNode = document;
     remove.parentNode = document;
     vi.spyOn(electronMock.page, 'executeJavaScriptInIsolatedWorld').mockImplementation(
       async (_worldId: unknown, scripts: Array<{ code: string }>) => vm.runInNewContext(scripts[0].code, {
-        document, Element: PageElement, ShadowRoot: class {},
+        document, window: { innerWidth: 1280, innerHeight: 800 }, Element: PageElement, ShadowRoot: class {},
         getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
       }),
     );
@@ -1600,8 +1823,9 @@ describe('Web Assist controlled connector lifecycle', () => {
     ));
     expect(created.every(result => result.ok)).toBe(true);
     expect(created.at(-1)).toMatchObject({ ok: true, state: { tabs: expect.any(Array) } });
-    if (!created.at(-1)?.ok) throw new Error('tab setup failed');
-    expect(created.at(-1)!.state.tabs).toHaveLength(TAB_LIMIT);
+    const lastCreated = created.at(-1);
+    if (!lastCreated?.ok) throw new Error('tab setup failed');
+    expect(lastCreated.state.tabs).toHaveLength(TAB_LIMIT);
     expect(addWebAssistTab('u1', renderer, { conversationId: 'c-limit' }))
       .toMatchObject({ ok: false, code: 'too_many_tabs', error: expect.stringContaining(`${TAB_LIMIT}-tab limit`) });
     await expect(openWebAssist('u1', renderer, {
@@ -1713,7 +1937,8 @@ describe('Web Assist controlled connector lifecycle', () => {
         ? await openControlledWebAssist('u1', cid, { scope: 'connector_setup', scopeId: 'shop', url: 'https://example.com/login' })
         : await openModelWebAssist('u1', cid, { url: `https://example.com/${index}` });
       expect(opened.ok).toBe(true);
-      ids.push(String('state' in opened ? (opened.state as any).active_tab_id : opened.active_tab_id));
+      ids.push(String('state' in opened ? (opened.state as any).active_tab_id
+        : 'active_tab_id' in opened ? opened.active_tab_id : undefined));
       pages.push(electronMock.page);
       if (index === 1) expect(retainModelWebAssistTab('u1', cid, ids[index], 'handoff')).toMatchObject({ ok: true });
       if (index === 2) expect(retainModelWebAssistTab('u1', cid, ids[index], 'deliverable')).toMatchObject({ ok: true });
@@ -2066,10 +2291,10 @@ describe('host-started task browser binding', () => {
       expect(second.item.savePath).toBe(path.join(DOWNLOAD_ROOT, 'u1', cid, 'report.csv'));
       expect(fs.existsSync(path.join(DOWNLOAD_ROOT, 'u1', cid))).toBe(true);
       expect(webAssistDownloads('u1', cid).downloads.at(-1)).toMatchObject({ state: 'downloading' });
-      expect(listModelWebAssistTabs('u1', cid).downloads.at(-1)).not.toHaveProperty('path');
+      expect((listModelWebAssistTabs('u1', cid).downloads as unknown[]).at(-1)).not.toHaveProperty('path');
       second.item.received = 42;
       second.item.handlers.done({}, 'completed');
-      expect(listModelWebAssistTabs('u1', cid).downloads.at(-1)).toMatchObject({
+      expect((listModelWebAssistTabs('u1', cid).downloads as unknown[]).at(-1)).toMatchObject({
         state: 'saved', bytes: 42, path: path.join(DOWNLOAD_ROOT, 'u1', cid, 'report.csv'),
       });
       bindWebAssistConversation('u1', 'other-download-task', electronMock.renderer);
@@ -2227,7 +2452,7 @@ describe('host-started task browser binding', () => {
       tried.item.handlers.done({}, 'cancelled');
       expect(fs.existsSync(tried.item.savePath)).toBe(false);
       expect(webAssistDownloads('u1', cid).downloads.at(-1)).toMatchObject({ state: 'failed' });
-      expect(listModelWebAssistTabs('u1', cid).downloads.at(-1)).not.toHaveProperty('path');
+      expect((listModelWebAssistTabs('u1', cid).downloads as unknown[]).at(-1)).not.toHaveProperty('path');
     });
 
     it('keeps simultaneous exports with the same name separate before either file exists', () => {
@@ -2236,7 +2461,8 @@ describe('host-started task browser binding', () => {
       const second = attempt('https://files.example.com/report.csv', 'report.csv');
       expect(first.item.savePath).toBe(path.join(DOWNLOAD_ROOT, 'u1', cid, 'report.csv'));
       expect(second.item.savePath).toBe(path.join(DOWNLOAD_ROOT, 'u1', cid, 'report (1).csv'));
-      expect(listModelWebAssistTabs('u1', cid).downloads.every((entry: any) => entry.state === 'downloading' && !entry.path)).toBe(true);
+      expect((listModelWebAssistTabs('u1', cid).downloads as Array<Record<string, unknown>>)
+        .every(entry => entry.state === 'downloading' && !entry.path)).toBe(true);
     });
   });
 
@@ -2339,5 +2565,27 @@ describe('host-started task browser binding', () => {
     expect(listed.code).toBe('window_unavailable');
     expect(listed.error).toMatch(/No Orkas window is open/);
     expect(listed.error).not.toMatch(/Open this task in Orkas/);
+  });
+});
+
+
+describe('browser approval label evidence', () => {
+  it.each([
+    ['Facebook', false], ['Bookmarks', false], ['Payroll', false], ['Post history', false],
+    ['Publish', true], ['Delete account', true], ['Book now', true], ['Post comment', true],
+    ['Delete post history', true], ['删除账户', true], ['Authorize app', true],
+  ] as const)('classifies the actual navigation/control label: %s', async (label, sensitive) => {
+    const { buildWebAssistActionScript } = await import('../../../src/main/features/web_assist_page');
+    class PageElement {
+      tagName = 'A'; type = ''; disabled = false; clicks = 0; innerText = label;
+      getAttribute(name: string) { return name === 'href' ? '/view' : null; }
+      scrollIntoView() {} focus() {} click() { this.clicks++; }
+    }
+    const element = new PageElement();
+    const result = vm.runInNewContext(buildWebAssistActionScript({
+      action: 'click', ref: { path: [0], signature: { tag: 'a', type: '', role: '', label } },
+    } as any), { document: { children: [element] }, Element: PageElement });
+    if (sensitive) { expect(result.reason).toBe('high_impact_action'); expect(element.clicks).toBe(0); }
+    else { expect(result.ok).toBe(true); expect(element.clicks).toBe(1); }
   });
 });

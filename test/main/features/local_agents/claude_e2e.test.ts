@@ -249,10 +249,11 @@ process.stdin.once('data', () => {
     }
   });
 
-  itPosix('settles a failed result before a lingering CLI process exits', async () => {
+  itPosix.each([false, true])('settles a failed result before a lingering CLI process exits (live background task: %s)', async (liveBackgroundTask) => {
     const fake = writeNodeExecutable(tmpDir, 'claude', `
 process.stdin.once('data', () => {
   process.stdout.write('{"type":"system","subtype":"init","session_id":"sess-failed","cwd":"/x"}\\n');
+  ${liveBackgroundTask ? `process.stdout.write(JSON.stringify({ type: 'system', subtype: 'task_started', task_id: 'still-running', task_type: 'local_bash', description: 'Long-running fixture' }) + '\\n');` : ''}
   process.stdout.write('{"type":"result","subtype":"error_during_execution","errors":["network failed","retry limit reached"]}\\n');
   setInterval(() => {}, 1_000);
 });

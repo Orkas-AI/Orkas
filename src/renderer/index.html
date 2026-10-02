@@ -115,7 +115,7 @@
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
               </div>
               <div class="chat-quote-preview" id="new-chat-quote-preview" style="display:none"></div>
-              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="For example: Analyze this file, identify the key issues, and suggest improvements" rows="2"></textarea>
+              <div data-composer="1" id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="For example: Analyze this file, identify the key issues, and suggest improvements"></div>
               <!-- Composer bottom bar order matches PC/docs/design/PATTERNS.md
                    P11: [+] | divider | [To] | [workspace - JS-injected] |
                    [skill] | spacer | [send]. The open-source build strips
@@ -236,7 +236,7 @@
               </div>
               <div class="chat-input-area">
                 <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
-                <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
+                <div data-composer="1" id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors, Library files."></div>
                 <!-- Composer bottom bar order matches PC/docs/design/PATTERNS.md
                      P11: [+] | divider | [To] | [workspace - JS-injected] |
                      [skill] | spacer | [send].                      by `chat-send-btn { margin-left: auto }`. -->
@@ -668,7 +668,7 @@
             </header>
             <div class="todos-workarea">
               <div class="todo-load-error" id="todos-error" role="status" hidden><span data-i18n="todo.load_failed">Could not load tasks. Try again.</span><button class="btn btn-sm" id="todos-retry" data-i18n="chat.retry_btn">Retry</button></div>
-              <div class="todos-scroll" id="todos-content" aria-live="polite"><div class="empty muted" data-i18n="common.loading">Loading…</div></div>
+              <div class="todos-scroll" id="todos-content" aria-live="polite"></div>
             </div>
           </div>
         </div>
@@ -685,6 +685,7 @@
                 </div>
               </div>
               <div class="project-detail-actions">
+                <button type="button" class="btn btn-sm" id="project-action-invite" data-i18n="project.menu.invite_members">Invite project members</button>
                 <button type="button" class="btn btn-sm" id="project-action-rename" data-i18n="project.action.rename">Rename</button>
                 <button type="button" class="btn btn-sm btn-danger" id="project-action-delete" data-i18n="project.action.delete">Delete</button>
               </div>
@@ -700,7 +701,7 @@
                     <div class="chat-attachments" id="project-chat-attachments" style="display:none"></div>
                   </div>
                   <div class="chat-quote-preview" id="project-chat-quote-preview" style="display:none"></div>
-                  <textarea id="project-chat-input" data-i18n-placeholder="project.chat.placeholder" placeholder="Type @ to choose agents, skills, connectors, Library files." rows="2"></textarea>
+                  <div data-composer="1" id="project-chat-input" data-i18n-placeholder="project.chat.placeholder" placeholder="Type @ to choose agents, skills, connectors, Library files."></div>
                   <!-- Bottom bar: attach | divider | model (JS-injected) | recipient | workspace (JS-injected) | order toggle | skill | send. -->
                   <div class="chat-bottom-bar">
                     <button type="button" class="chat-attach-btn" id="project-chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
@@ -1048,13 +1049,13 @@
            opened from the project-detail page's Automation tab). -->
       <section class="panel" id="panel-auto">
         <div class="auto-view">
-          <div class="auto-header">
-            <div class="auto-header-title-row">
-              <h1 class="auto-title-text" data-i18n="auto.title">Auto</h1>
+          <header class="project-detail-header">
+            <div class="project-detail-header-title-row">
+              <h1 class="project-detail-title" data-i18n="auto.title">Auto</h1>
               <span class="auto-header-count" id="auto-header-count"></span>
             </div>
             <button type="button" class="btn btn-sm auto-header-add" id="auto-add-btn" data-i18n="auto.add_btn">+ Create</button>
-          </div>
+          </header>
           <div class="auto-scroll">
             <div class="auto-sync-note" id="auto-sync-note" hidden></div>
             <div class="auto-list" id="auto-list"></div>
@@ -1720,9 +1721,9 @@
             <div class="chat-input-overlay">
               <div class="chat-attachments" id="auto-task-attachments" style="display:none"></div>
             </div>
-            <textarea id="auto-task-input" rows="2" maxlength="8000"
+            <div data-composer="1" id="auto-task-input"
                       data-i18n-placeholder="auto.content_placeholder"
-                      placeholder="Type @ to choose agents, skills, connectors, Library files."></textarea>
+                      placeholder="Type @ to choose agents, skills, connectors, Library files."></div>
             <div class="chat-bottom-bar">
               <button type="button" class="chat-attach-btn" id="auto-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
               <span class="chat-composer-divider" aria-hidden="true"></span>
@@ -1949,7 +1950,10 @@
   <script src="./modules/conv-bucket.js"></script>
   <script src="./modules/today-tasks.js"></script>
   <script src="./modules/conversation-view-model.js"></script>
+  <script src="./vendor/prosemirror/prosemirror.min.js"></script>
+  <script src="./modules/composer-input.js"></script>
   <script src="./modules/conversation.js"></script>
+  <script src="./modules/conversation-to-project.js"></script>
   <script src="./modules/conversation-turn-nav.js"></script>
   <script src="./modules/web-app-host.js"></script>
   <script src="./modules/artifact-security.js"></script>
@@ -1959,6 +1963,7 @@
   <script src="./modules/queue-draft.js"></script>
   <script src="./modules/connectors.js"></script>
   <script src="./modules/connector-action-dialog.js"></script>
+  <script src="./modules/connector-account-dialog.js"></script>
   <script src="./modules/bash_permission.js"></script>
   <script src="./modules/interactive-cli.js"></script>
   <script src="./modules/search.js"></script>

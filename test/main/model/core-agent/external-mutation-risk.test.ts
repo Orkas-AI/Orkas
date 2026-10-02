@@ -170,6 +170,12 @@ print('cursor.execute("DELETE FROM users")')
     expect(referencedExecutableScripts('python -u "release jobs/deploy_apply.py"')).toEqual(['release jobs/deploy_apply.py']);
     expect(referencedExecutableScripts("bash -lc 'python deploy_apply.py'")).toEqual(['deploy_apply.py']);
     expect(referencedExecutableScripts('python -c "print(1)"')).toEqual([]);
+    expect(referencedExecutableScripts('python generated.txt')).toEqual(['generated.txt']);
+    expect(referencedExecutableScripts('python - < "generated source.txt"')).toEqual(['generated source.txt']);
+    expect(referencedExecutableScripts('python - <generated.py >output.txt')).toEqual(['generated.py']);
+    expect(referencedExecutableScripts('python -m unittest discover')).toEqual([]);
+    expect(referencedExecutableScripts('python -\ncat < data.txt')).toEqual([]);
+    expect(referencedExecutableScripts('source generated.txt')).toEqual(['generated.txt']);
   });
 
   it.each([

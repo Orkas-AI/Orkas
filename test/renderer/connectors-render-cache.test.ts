@@ -194,4 +194,56 @@ describe('connectors renderer cache', () => {
     expect(storage.has('orkas.connectors.renderCache.v4.u-cache')).toBe(true);
     expect(storage.has('some.other.key')).toBe(true);
   });
+  it('names chat configure cards from the render cache without hydrating Connectors page state', () => {
+    const { context, storage } = loadConnectorsRenderer();
+    context.sanitizeSvgIconHtml = (svg: string) => (svg ? `safe:${svg}` : '');
+    storage.set('orkas.connectors.renderCache.v4.u-cache', JSON.stringify({
+      version: 4,
+      updated_at: Date.now(),
+      catalog: [
+        { id: 'gmail', display_name: 'Gmail', icon_svg: '<svg id="gmail"/>' },
+        { id: 'feishu', display_name: 'Feishu', display_name_zh: '飞书', icon_svg: '<svg id="feishu"/>' },
+        // A hidden compatibility child opens its parent card, so it is labeled as that card.
+        { id: 'lark', display_name: 'Lark', catalog_parent_id: 'feishu' },
+      ],
+      instances: [],
+    }));
+
+    expect(context.window.connectorNavTarget('gmail')).toEqual({ name: 'Gmail', iconSvg: 'safe:<svg id="gmail"/>' });
+    expect(context.window.connectorNavTarget(' lark ')).toEqual({ name: '飞书', iconSvg: 'safe:<svg id="feishu"/>' });
+    expect(context.window.connectorNavTarget('unknown')).toBeNull();
+    expect(context.window.connectorNavTarget('')).toBeNull();
+    expect(vm.runInContext('_connectorsState.catalog.length', context)).toBe(0);
+  });
+
+  it('fetches the catalog once for chat card names and retries only after a failed fetch', async () => {
+    const { context } = loadConnectorsRenderer();
+    const requests: string[] = [];
+    let fail = true;
+    context.window.orkas.invoke = async (channel: string) => {
+      requests.push(channel);
+      if (fail) throw new Error('offline');
+      return { ok: true, catalog: [{ id: 'm365-mail', display_name: 'Microsoft 365 Mail' }] };
+    };
+
+    expect(await context.window.loadConnectorNavTarget('m365-mail')).toBeNull();
+    fail = false;
+    const [first, second, unknown] = await Promise.all([
+      context.window.loadConnectorNavTarget('m365-mail'),
+      context.window.loadConnectorNavTarget('m365-mail'),
+      context.window.loadConnectorNavTarget('unknown'),
+    ]);
+    expect(first).toEqual({ name: 'Microsoft 365 Mail', iconSvg: '' });
+    expect(second).toEqual(first);
+    expect(unknown).toBeNull();
+    expect(await context.window.loadConnectorNavTarget('unknown')).toBeNull();
+    expect(requests).toEqual(['connectors.catalog', 'connectors.catalog']);
+    expect(vm.runInContext('_connectorsState.catalog.length', context)).toBe(0);
+  });
+
+  it('prefers the loaded Connectors page catalog for chat card names', () => {
+    const { context } = loadConnectorsRenderer();
+    vm.runInContext(`_connectorsState.catalog = [{ id: 'gcal', display_name: 'Google Calendar' }];`, context);
+    expect(context.window.connectorNavTarget('gcal')).toEqual({ name: 'Google Calendar', iconSvg: '' });
+  });
 });

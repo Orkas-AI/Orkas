@@ -1,3 +1,4 @@
+import { expectComposerText } from './fixtures/composer';
 /**
  * Conversation task-board scheduling — real app, real bus, stubbed model.
  *
@@ -361,7 +362,7 @@ test.describe('task board scheduling (D18 serial chain)', () => {
       // This scenario prepares distinct accepted sends before testing drag
       // order. A key event alone does not await the async send: filling the
       // next draft early lets the previous acknowledgement clear that draft.
-      await expect(input).toHaveValue('');
+      await expectComposerText(input, '');
     };
     const row = (text: string) => rows.filter({ hasText: text });
     app.setModelMode('controlled-slow');
@@ -535,15 +536,15 @@ test.describe('task board scheduling (D18 serial chain)', () => {
       .toEqual(['task-send-now', 'task-edit', 'task-cancel']);
     await input.fill('Unsent composer draft stays intact');
     await oldRow.locator('[data-act="task-edit"]').click();
-    await expect(input).toHaveValue(/old pending wording/);
+    await expectComposerText(input, /old pending wording/);
     await expect(page.locator('.ui-dialog-overlay.open:visible')).toHaveCount(0);
     await expect(page.locator('#chat-send-btn')).toHaveClass(/queue-editing/);
     await input.fill('Discard these edits');
     await input.press('Escape');
-    await expect(input).toHaveValue('Unsent composer draft stays intact');
+    await expectComposerText(input, 'Unsent composer draft stays intact');
     await expect(oldRow).toBeVisible();
     await oldRow.locator('[data-act="task-edit"]').click();
-    await expect(input).toHaveValue(/old pending wording/);
+    await expectComposerText(input, /old pending wording/);
     const edited = 'Updated queued wording.\nKeep this second line.';
     await input.fill(edited);
     app.setModelMode('success');
@@ -556,11 +557,11 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     await expect(oldRow.locator('[data-act="task-cancel"]')).toBeEnabled();
     await expect(page.locator('#chat-queue-edit-delete-btn')).toHaveCount(0);
     expect(app.modelRequests).toHaveLength(before + 1);
-    await expect(input).toHaveValue(edited);
+    await expectComposerText(input, edited);
     await expect(page.locator('#chat-history')).not.toContainText('old pending wording.');
     await page.locator('#panel-conversation .chat-input-wrapper').screenshot({ path: testInfo.outputPath('queued-message-composer.png') });
     await page.locator('#chat-send-btn').click();
-    await expect(input).toHaveValue('Unsent composer draft stays intact');
+    await expectComposerText(input, 'Unsent composer draft stays intact');
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/queue-editing/);
     await expect.poll(() => app.modelRequests.length, { timeout: 20_000 }).toBe(before + 2);
     const request = JSON.stringify(app.modelRequests.at(-1));
@@ -590,7 +591,7 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     const cid = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
     await input.fill('Keep my separate draft');
     await row.locator('[data-act="task-edit"]').click();
-    await expect(input).toHaveValue(/cancel this queued message/);
+    await expectComposerText(input, /cancel this queued message/);
     await expect(row.locator('[data-act="task-send-now"]')).toHaveCount(0);
     await input.fill('Never send this unsaved revision');
     app.setModelMode('success');
@@ -601,7 +602,7 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     await expect(row).toBeVisible();
     expect(app.modelRequests).toHaveLength(before + 1);
     await row.locator('[data-act="task-cancel"]').click();
-    await expect(input).toHaveValue('Keep my separate draft');
+    await expectComposerText(input, 'Keep my separate draft');
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/queue-editing/);
     await expect(row).toHaveCount(0);
     const tasks = await app.invoke<{ tasks: Array<{ task_id: string; status: string }> }>('groupChat.tasks.list', { cid });
@@ -632,21 +633,21 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     const cid = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
     await input.fill('Separate composer draft');
     await row.locator('[data-act="task-edit"]').click();
-    await expect(input).toHaveValue(/original queued instruction/);
+    await expectComposerText(input, /original queued instruction/);
     const draft = 'My unsaved changes\nPreserve this second line.';
     await input.fill(draft);
     await page.reload();
     await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
-    await expect(input).toHaveValue(draft);
+    await expectComposerText(input, draft);
     await expect(page.locator('#chat-send-btn')).toHaveClass(/queue-editing/);
     expect(await app.invoke('groupChat.tasks.cancel', { cid, task_id: taskId })).toMatchObject({ ok: true });
     await page.locator('#chat-send-btn').click();
     const alert = page.locator('.ui-dialog-overlay.open:visible');
     await expect(alert).toContainText('no longer editable');
     await alert.locator('[data-act="ok"]').click();
-    await expect(input).toHaveValue(draft);
+    await expectComposerText(input, draft);
     await input.press('Escape');
-    await expect(input).toHaveValue('Separate composer draft');
+    await expectComposerText(input, 'Separate composer draft');
     app.setModelMode('success');
     app.releaseControlledModelChunk();
     app.finishControlledModelStream();

@@ -400,18 +400,14 @@ describe('auth › listProviders grouping', () => {
     expect(anth.supportsOAuth).toBe(true);
     expect(anth.oauthProvider).toBe('anthropic');
 
-    // openai — API-key only. OAuth lives on the separate `openai-codex`
-    // entry since the Codex endpoint is a different API surface.
+    // pi-ai 0.99.1 exposes native OpenAI OAuth alongside the Codex endpoint.
     const openai = providers.find((p) => p.id === 'openai')!;
     expect(openai.supportsApiKey).toBe(true);
-    expect(openai.supportsOAuth).toBe(false);
-
-    // openai-codex — surfaced as its own provider, OAuth only.
-    const codex = providers.find((p) => p.id === 'openai-codex');
-    expect(codex).toBeTruthy();
-    expect(codex!.supportsApiKey).toBe(false);
-    expect(codex!.supportsOAuth).toBe(true);
-    expect(codex!.oauthProvider).toBe('openai-codex');
+    expect(openai.supportsOAuth).toBe(true);
+    expect(openai.oauthProvider).toBe('openai');
+    expect(providers.find((p) => p.id === 'openai-codex')).toMatchObject({
+      supportsApiKey: false, supportsOAuth: true, oauthProvider: 'openai-codex',
+    });
   });
 });
 
@@ -1042,6 +1038,9 @@ describe('auth › listModels', () => {
     const a = await import('../../../src/main/features/auth');
     expect((await a.listModels('openai-codex')).models.map((model) => model.id)).toEqual([
       'gpt-6-astra',
+      'gpt-6.1-sol',
+      'gpt-6-sol',
+      'gpt-6-luna',
       'gpt-5.6-sol',
       'gpt-5.6-terra',
       'gpt-5.6-luna',

@@ -46,6 +46,7 @@ import { migrateLegacySessionIds } from '../util/migrate-session-ids';
 import { migrateChatsGhostCleanup } from '../util/migrate-chats-ghost-cleanup';
 import { migrateAgentLayout } from '../util/migrate-agent-layout';
 import { migrateKbToLocalContexts } from '../util/migrate-kb-to-local';
+import { recoverConversationRelocations } from '../util/conversation-relocate';
 import { migrateProjectLayoutV4 } from '../util/migrate-project-layout-v4';
 import { rekeyUserLocalSecretsAfterLocalIdChange } from '../util/rekey-user-local-secrets';
 import { maskId } from '../util/log-redact';
@@ -402,6 +403,17 @@ function activateUserInternal(uid: string, switchCleanupComplete: boolean): void
   }
 
   ensureUserLayout(uid);
+  // Recover before consumers inspect partial indexes. A conflict blocks only
+  // the affected conversation; unrelated tasks remain available.
+  let pendingMoves: number;
+  try {
+    pendingMoves = recoverConversationRelocations(uid);
+    if (pendingMoves) log.warn('conversation recovery pending', { count: pendingMoves });
+  } catch (err) {
+    // Fail closed: keep the layout migrations off until the journals can be read.
+    pendingMoves = 1;
+    log.warn('recoverConversationRelocations failed', { uid: maskId(uid), error: (err as Error).message });
+  }
 
   // Bound the machine-local Result Store on user activation: purge entries
   // older than 7 days, then evict oldest remaining session entries above the
@@ -435,14 +447,14 @@ function activateUserInternal(uid: string, switchCleanupComplete: boolean): void
   // v4 project-contained layout: move project-scoped conversations,
   // automation tasks, sessions, attachments/artifacts, and project Library
   // files under projects/<pid>/... before feature modules start using paths.
-  try { migrateProjectLayoutV4(uid); }
+  try { if (!pendingMoves) migrateProjectLayoutV4(uid); }
   catch (err) { log.warn('migrateProjectLayoutV4 failed', { uid: maskId(uid), error: (err as Error).message }); }
 
   // Convert old sync ghosts (index row exists, jsonl already gone) into
   // record-level tombstones so the new merge logic can propagate the delete.
   // Runs after project-layout migration so project-scoped rows are checked
   // in their new `projects/<pid>/chats/` home.
-  try { migrateChatsGhostCleanup(uid); }
+  try { if (!pendingMoves) migrateChatsGhostCleanup(uid); }
   catch (err) { log.warn('migrateChatsGhostCleanup failed', { uid: maskId(uid), error: (err as Error).message }); }
 
   // Pin core-agent's auth/state dir to this uid's local/config/.

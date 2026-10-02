@@ -1,3 +1,5 @@
+import { providerErrorFacts } from '../shared/provider-error-facts.js';
+
 /** Metadata only: this observer never changes errors used by retry policy. */
 export interface ProviderRequestFailure {
   phase: 'unknown' | 'before_request' | 'before_response' | 'after_response';
@@ -14,6 +16,7 @@ export interface ProviderRequestFailure {
   outputLimit?: number;
   budgetObserved?: boolean;
   contextBudget?: Record<string, number | string>;
+  responsesStatus?: Record<string, unknown>;
 }
 
 /** Existing runner observations, never a second scan of request content. */
@@ -52,24 +55,34 @@ const DIAGNOSTIC_CODES = new Set([
   'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
   'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT',
   'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'ERR_TLS_CERT_ALTNAME_INVALID',
+  'invalid_request_error', 'invalid_function_parameters', 'invalid_json_schema',
+  'unsupported_parameter', 'unsupported_value', 'missing_required_parameter',
+  'context_length_exceeded', 'model_not_found', 'authentication_error',
+  'permission_error', 'insufficient_quota', 'rate_limit_error', 'server_error',
+  'internal_server_error', 'service_unavailable', 'overloaded_error',
+  'content_filter', 'content_policy_violation', 'invalid_encrypted_content',
+  'invalid_value', 'upstream_error',
 ]);
 
 function safeCode(error: unknown): string {
   // Bound traversal even for cyclic causes. Never inspect messages or bodies.
   try {
-    for (let depth = 0; error && typeof error === 'object' && depth < 8; depth++) {
-      const item = error as { code?: unknown; cause?: unknown };
+    for (let itemError = error, depth = 0; itemError && typeof itemError === 'object' && depth < 8; depth++) {
+      const item = itemError as { code?: unknown; cause?: unknown };
       if (typeof item.code === 'string' && DIAGNOSTIC_CODES.has(item.code)) return item.code;
-      if (error instanceof ReferenceError) return 'REFERENCE_ERROR';
-      error = item.cause;
+      if (itemError instanceof ReferenceError) return 'REFERENCE_ERROR';
+      itemError = item.cause;
     }
+    // Reuse already captured machine fields, including nested HTTP error/type.
+    // Serialized display messages remain disabled at the diagnostic boundary.
+    return providerErrorFacts(error, false).codes.find(code => DIAGNOSTIC_CODES.has(code)) ?? 'unknown';
   } catch { /* Untrusted exception accessors are not diagnostic facts. */ }
   return 'unknown';
 }
 
 /** Request-local hooks supported by pi-ai. Observe headers without cloning,
- * buffering or wrapping the response body; post-header SDK-flattened causes
- * remain unknown instead of being guessed from prose. */
+ * buffering or wrapping the response body. The adapter supplies its existing
+ * captured cause; unavailable causes remain unknown instead of guessed prose. */
 export function createRequestDiagnostics(
   signal?: AbortSignal,
   onFailure?: (failure: ProviderRequestFailure) => void,
@@ -110,6 +123,7 @@ export function createRequestDiagnostics(
     }
   };
   return {
+    get sequence(): number | undefined { return requestSequence; },
     get observed(): boolean { return observed; },
     onResponse,
     observeBudget(payload: unknown, window: unknown): void {
@@ -140,11 +154,12 @@ export function createRequestDiagnostics(
         throw error;
       }
     },
-    report(error: unknown, aborted = false, boundary: ProviderFailureSource = 'unknown'): ProviderRequestFailure | undefined {
+    report(error: unknown, aborted = false, boundary: ProviderFailureSource = 'unknown', responsesStatus?: Record<string, unknown>): ProviderRequestFailure | undefined {
       if (reported) return undefined;
       reported = true;
       const failure: ProviderRequestFailure = {
         phase,
+        ...(!aborted && !signal?.aborted && responsesStatus ? { responsesStatus } : {}),
         ...(budgetObserved ? { budgetObserved, contextWindow, outputLimit } : {}),
         ...(typeof requestRef === 'string' && /^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestRef) ? { requestRef } : {}),
         source: source !== 'unknown' ? source : status !== undefined && status >= 400 ? 'http' : boundary,

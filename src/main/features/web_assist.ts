@@ -3,7 +3,8 @@
  *
  * The application renderer owns only trusted toolbar controls and a layout
  * placeholder. Third-party content runs in a main-process WebContentsView so
- * it never receives the Orkas preload, Node, or renderer IPC bridge. A
+ * it never receives the Orkas application preload, Node, or renderer IPC bridge.
+ * An isolated activity preload reports only trusted composition state and wheel activity. A
  * machine-local Chromium profile per Orkas user preserves provider login
  * state without sharing the system browser's profile or cloud-syncing it.
  */
@@ -29,7 +30,9 @@ import { genId12, safeId } from '../storage';
 import { createLogger } from '../logger';
 import { logErrorRef } from '../util/log-redact';
 import { prepareBrowserProxy } from '../util/browser-proxy';
-import { withOperationTimeout } from '../util/operation-timeout';
+import { OperationTimeoutError, withOperationTimeout } from '../util/operation-timeout';
+import { dispatchWebAssistPointer, wakeWebAssistRendering } from './web_assist_input';
+import { watchWebAssistUserActivity, WEB_ASSIST_USER_IDLE_MS } from './web_assist_activity';
 import { prepareWebAssistSession } from './web_assist_session';
 import { logWebAssistFailure } from './web_assist_diagnostics';
 import { registerUserSwitchHook } from './user-switch-hooks';
@@ -58,6 +61,9 @@ import {
 } from './web_assist_confirm';
 
 const log = createLogger('web-assist');
+const { MAX_PAGE_ACTION_TEXT_LENGTH } = require('../../../bin/browser-tool-contract.cjs') as {
+  MAX_PAGE_ACTION_TEXT_LENGTH: number;
+};
 const MAX_LABEL_LENGTH = 120;
 const MAX_SEARCH_INPUT_LENGTH = 2048;
 /** Raised from 10 on 2026-09-18. Idle reclamation, not this ceiling, governs
@@ -85,6 +91,7 @@ export interface WebAssistSnapshot {
   can_go_back: boolean;
   can_go_forward: boolean;
   assistant_controlled?: boolean;
+  user_controlled?: boolean;
   conversation_id?: string;
   assistant_action?: 'observing' | 'acting' | 'waiting';
   error_code?: 'page_load_failed' | 'page_unresponsive' | 'download_blocked';
@@ -108,6 +115,7 @@ export interface WebAssistTabSnapshot {
   can_go_forward: boolean;
   conversation_id: string;
   assistant_controlled?: boolean;
+  user_controlled?: boolean;
   assistant_action?: WebAssistSnapshot['assistant_action'];
   error_code?: WebAssistSnapshot['error_code'];
 }
@@ -202,6 +210,10 @@ interface WebAssistTabRecord {
   virtualViewportHeight?: number;
   lastUsedAt: number;
   activeOperations: number;
+  userControlled?: boolean;
+  userActivity?: ReturnType<typeof watchWebAssistUserActivity>;
+  controlRevision?: number;
+  inputBusy?: boolean;
   edited: boolean;
   replayable: boolean;
   relatedTabs: Set<string>;
@@ -523,6 +535,8 @@ function configureSession(userId: string, ses: Session): ReturnType<typeof prepa
   const existing = configuredSessions.get(ses);
   if (existing) return existing;
   const proxy = prepareBrowserProxy(ses);
+  ses.registerPreloadScript({ id: 'orkas-browser-activity', type: 'frame',
+    filePath: path.join(__dirname, 'web_assist_activity_preload.js') });
   const restored = prepareWebAssistSession(userId, ses);
   const ready = Promise.all([restored, proxy.ready]).then(([, proxyReady]) => proxyReady !== false, () => false);
   configuredSessions.set(ses, proxy);
@@ -667,6 +681,7 @@ function tabSnapshot(tab: WebAssistTabRecord): WebAssistTabSnapshot {
     can_go_forward: tab.suspended ? tab.suspended.index < tab.suspended.entries.length - 1 : !!live && contents.navigationHistory.canGoForward(),
     conversation_id: tab.conversationId,
     ...(tab.controlContext ? { assistant_controlled: true } : {}),
+    ...(tab.userControlled ? { user_controlled: true } : {}),
     ...(tab.assistantAction ? { assistant_action: tab.assistantAction } : {}),
     ...(tab.errorCode ? { error_code: tab.errorCode } : {}),
   };
@@ -772,6 +787,7 @@ function closeRecord(record: WebAssistRecord, notifyRenderer = false): void {
   record.owner.removeListener('closed', record.ownerClosed);
   if (notifyRenderer) emitClosed(record);
   for (const tab of record.tabs.values()) {
+    tab.userActivity?.dispose();
     forgetBrowserTab(record.ownerUserId, tab.conversationId, tab.id);
     clearWebAssistActionGrants({ tabId: tab.id });
     try { setTabVisible(tab, false); } catch { /* best effort */ }
@@ -795,10 +811,41 @@ function invalidateObservation(tab: WebAssistTabRecord): void {
   tab.observation = undefined;
 }
 
+function userControlResult(): Record<string, unknown> & { ok: false; code: string; error: string } {
+  return { ok: false, code: 'user_controlled', retry_after_ms: WEB_ASSIST_USER_IDLE_MS,
+    error: `User input temporarily paused this page. Control resumes after ${WEB_ASSIST_USER_IDLE_MS / 1000} seconds without input once held input ends. Wait, then observe the page before continuing.` };
+}
+
+function takePageControl(record: WebAssistRecord, tab: WebAssistTabRecord, controlled: boolean): void {
+  const changed = Boolean(tab.userControlled) !== controlled;
+  if (!changed && !controlled) return;
+  tab.userControlled = controlled;
+  // A user taking over a temporary page must not lose it when the task ends.
+  if (controlled && tab.lifetime.retention === 'temporary') tab.lifetime.retention = 'handoff';
+  tab.controlRevision = (tab.controlRevision || 0) + 1;
+  tab.lastUsedAt = Date.now();
+  invalidateObservation(tab);
+  if (changed) emit(record);
+}
+
 function setTabVisible(tab: WebAssistTabRecord, visible: boolean): void {
   if (tab.visible !== visible) tab.lastUsedAt = Date.now();
+  if (tab.visible && !visible) tab.userActivity?.release();
   tab.visible = visible;
   tab.view?.setVisible(visible);
+}
+
+const deferredAuthorizationPopups = new WeakSet<WebContents>();
+function revealDeferredAuthorizationPopups(record: WebAssistRecord, tab: WebAssistTabRecord): void {
+  if (!record.owner.isFocusable() || !taskIsForeground(record.owner.webContents, tab.conversationId)) return;
+  for (const contents of tab.authorizationPopups) {
+    if (!deferredAuthorizationPopups.has(contents)) continue;
+    const popup = BrowserWindow.fromWebContents(contents);
+    if (popup && !popup.isDestroyed()) {
+      deferredAuthorizationPopups.delete(contents);
+      popup.showInactive();
+    }
+  }
 }
 
 /** Lay every task page out at desktop width, scaled into whatever room the
@@ -892,6 +939,7 @@ function canUnloadTab(record: WebAssistRecord, tab: WebAssistTabRecord, now: num
   return records.get(record.owner.id) === record && record.tabs.get(tab.id) === tab
     && !!tab.view && !tab.view.webContents.isDestroyed() && !tab.suspended
     && !tab.visible && now - tab.lastUsedAt >= IDLE_PAGE_TIMEOUT_MS
+    && !tab.userControlled && !tab.inputBusy
     && !tab.loading && !tab.view.webContents.isLoading() && !tab.activeOperations
     && !tab.assistantAction && !tab.edited && tab.replayable
     && tab.lifetime.retention !== 'handoff' && tab.controlContext?.scope !== 'connector_setup'
@@ -1273,7 +1321,7 @@ function exposeTaskTabToModel(
   // A background task drives its own tab without selecting it or revealing the
   // panel over whatever the user is watching. The renderer re-reads state when
   // the user returns to this task, so nothing needs to be pushed now.
-  if (!taskIsForeground(sender, tab.conversationId)) return { ok: true };
+  if (tab.userControlled || !taskIsForeground(sender, tab.conversationId)) return { ok: true };
   record.activeTabId = tab.id;
   for (const candidate of record.tabs.values()) {
     if (candidate !== tab) setTabVisible(candidate, false);
@@ -1297,7 +1345,7 @@ async function withAssistantAction<T>(
   tab.lastUsedAt = Date.now();
   // Connector and generic browser work share the same selected tab and UI
   // activity signal. The renderer owns whether to reveal or keep it hidden.
-  if (activeConversationBySender.get(record.owner.webContents as unknown as object) === tab.conversationId) {
+  if (!tab.userControlled && activeConversationBySender.get(record.owner.webContents as unknown as object) === tab.conversationId) {
     record.activeTabId = tab.id;
     for (const candidate of record.tabs.values()) {
       if (candidate !== tab) setTabVisible(candidate, false);
@@ -1378,6 +1426,7 @@ function createRecord(owner: BrowserWindow, userId: string): WebAssistRecord {
 
 function removeTab(record: WebAssistRecord, tab: WebAssistTabRecord, notifyRenderer = true): void {
   if (record.tabs.get(tab.id) !== tab) return;
+  tab.userActivity?.dispose();
   forgetBrowserTab(record.ownerUserId, tab.conversationId, tab.id);
   clearWebAssistActionGrants({ tabId: tab.id });
   record.tabs.delete(tab.id);
@@ -1471,8 +1520,11 @@ function mountTab(
 
   const contents = view.webContents;
   proxy.attach(contents);
-  contents.on('before-input-event', () => { tab.lastUsedAt = Date.now(); tab.edited = true; });
-  contents.on('before-mouse-event', () => { tab.lastUsedAt = Date.now(); });
+  tab.userActivity = watchWebAssistUserActivity(contents, (controlled, edited) => {
+    if (tab.view !== view || record.tabs.get(tab.id) !== tab) return;
+    if (edited) tab.edited = true;
+    takePageControl(record, tab, controlled);
+  });
   contents.setWindowOpenHandler((details) => {
     const { url, disposition } = details;
     if (records.get(record.owner.id) !== record || record.tabs.get(tab.id) !== tab) {
@@ -1536,8 +1588,9 @@ function mountTab(
       overrideBrowserWindowOptions: {
         parent: record.owner,
         modal: false,
-        // Native authorization windows inherit the host's background E2E mode.
-        show: record.owner.isFocusable(),
+        // Background work must not activate an authorization window over the
+        // user's current task. Reveal it when they return to this browser.
+        show: record.owner.isFocusable() && taskIsForeground(record.owner.webContents, conversationId),
         focusable: record.owner.isFocusable(),
         autoHideMenuBar: true,
         backgroundColor: '#ffffff',
@@ -1551,6 +1604,7 @@ function mountTab(
   });
   contents.on('did-create-window', (popup) => {
     tab.authorizationPopups.add(popup.webContents);
+    if (!taskIsForeground(record.owner.webContents, conversationId)) deferredAuthorizationPopups.add(popup.webContents);
     popup.webContents.once('destroyed', () => tab.authorizationPopups.delete(popup.webContents));
     configureWebAssistPopup(popup, proxy);
   });
@@ -1646,6 +1700,7 @@ function tabCapacityVictims(
     && tab.lifetime.retention !== 'handoff'
     && tab.lifetime.retention !== 'deliverable'
     && tab.controlContext?.scope !== 'connector_setup'
+    && !tab.userControlled && !tab.inputBusy && !tab.activeOperations
     && !tab.loading && !tab.assistantAction && !tab.edited
     && !tab.authorizationPopups.size
   )).slice(0, needed);
@@ -1924,6 +1979,7 @@ async function observeWebAssistTab(
   if (tab.loading || contents.isLoading()) {
     return { ok: false, code: 'page_loading', error: 'The page is still loading; wait before observing it.' };
   }
+  const controlRevision = tab.controlRevision || 0;
   const currentUrl = safeWebAssistUrl(contents.getURL());
   if (!currentUrl) return { ok: false, code: 'page_unavailable', error: 'There is no controllable web page.' };
   try {
@@ -1932,9 +1988,10 @@ async function observeWebAssistTab(
     // have a zero-width Chromium viewport.
     applyDesktopViewport(tab);
     const raw = await withAssistantAction(record, tab, 'observing', () => (
-      executeWebAssistScript(contents, webAssistObserveScript(tab.controlContext?.scope, window))
+      withOperationTimeout(executeWebAssistScript(contents, webAssistObserveScript(tab.controlContext?.scope, window)),
+        { timeoutMs: 5000, code: 'observation_timeout', stage: 'browser observation' })
     ));
-    if (contents.isDestroyed() || contents.getURL() !== currentUrl) {
+    if (contents.isDestroyed() || contents.getURL() !== currentUrl || (tab.controlRevision || 0) !== controlRevision) {
       invalidateObservation(tab);
       return { ok: false, code: 'page_changed', error: 'The page changed while it was being observed; observe it again.' };
     }
@@ -1978,7 +2035,7 @@ export async function observeControlledWebAssist(
 }
 
 const PAGE_ACTIONS = new Set<WebAssistPageAction>([
-  'click', 'fill', 'select', 'check', 'uncheck', 'scroll',
+  'click', 'fill', 'select', 'check', 'uncheck', 'scroll', 'drag',
 ]);
 
 type CheckedWebAssistAction =
@@ -1989,6 +2046,7 @@ type CheckedWebAssistAction =
       text: string;
       direction: 'up' | 'down' | 'top' | 'bottom';
       ref?: WebAssistStoredElementRef;
+      drag?: { x: number; y: number };
     }
   | { ok: false; code: string; error: string };
 
@@ -2000,8 +2058,11 @@ function checkWebAssistAction(
     action?: unknown;
     text?: unknown;
     direction?: unknown;
+    dragDeltaX?: unknown;
+    dragDeltaY?: unknown;
   },
 ): CheckedWebAssistAction {
+  if (tab.userControlled) return userControlResult();
   const contents = tab.view?.webContents;
   const action = String(input.action || '') as WebAssistPageAction;
   if (!PAGE_ACTIONS.has(action)) {
@@ -2017,8 +2078,8 @@ function checkWebAssistAction(
     return { ok: false, code: 'stale_page', error: 'The page changed; observe it again before acting.' };
   }
   const text = typeof input.text === 'string' ? input.text : '';
-  if (text.length > 2_000 || /[\u0000]/u.test(text)) {
-    return { ok: false, code: 'invalid_text', error: 'Page action text must be at most 2000 characters.' };
+  if (text.length > MAX_PAGE_ACTION_TEXT_LENGTH || /[\u0000]/u.test(text)) {
+    return { ok: false, code: 'invalid_text', error: `Page action text must be at most ${MAX_PAGE_ACTION_TEXT_LENGTH} characters and contain no NUL characters.` };
   }
   const directionRaw = String(input.direction || 'down');
   if (!['up', 'down', 'top', 'bottom'].includes(directionRaw)) {
@@ -2035,8 +2096,14 @@ function checkWebAssistAction(
   if ((action === 'fill' || action === 'select') && typeof input.text !== 'string') {
     return { ok: false, code: 'text_required', error: `Text is required for ${action}.` };
   }
+  const drag = action === 'drag' ? { x: input.dragDeltaX, y: input.dragDeltaY } : undefined;
+  if (drag && (![drag.x, drag.y].every(value => typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= 4096)
+      || (drag.x === 0 && drag.y === 0))) {
+    return { ok: false, code: 'invalid_drag', error: 'Drag requires nonzero movement with drag_delta_x and drag_delta_y between -4096 and 4096 CSS pixels.' };
+  }
   return {
     ok: true,
+    ...(drag ? { drag: drag as { x: number; y: number } } : {}),
     contents,
     action,
     text,
@@ -2100,6 +2167,26 @@ interface WebAssistActionLifetime {
   isActive?: () => boolean;
 }
 
+const WEB_ASSIST_FRAME_SCRIPT = 'new Promise(resolve => requestAnimationFrame(() => resolve(true)))';
+
+async function webAssistFrameWithin(contents: WebContents, timeoutMs: number): Promise<boolean> {
+  try {
+    await withOperationTimeout(executeWebAssistScript(contents, WEB_ASSIST_FRAME_SCRIPT), {
+      timeoutMs, code: 'frame_timeout', stage: 'browser frame',
+    });
+  } catch (error) {
+    // Only a missing frame is evidence. A probe that cannot run leaves the
+    // page to the input path, which reports it as before.
+    if (error instanceof OperationTimeoutError) return false;
+  }
+  return true;
+}
+
+function tabOnScreen(record: WebAssistRecord, tab: WebAssistTabRecord): boolean {
+  const owner = record.owner;
+  return tab.visible && !owner.isDestroyed() && owner.isVisible() && !owner.isMinimized();
+}
+
 async function actOnWebAssistTab(
   record: WebAssistRecord,
   tab: WebAssistTabRecord,
@@ -2109,13 +2196,20 @@ async function actOnWebAssistTab(
     action?: unknown;
     text?: unknown;
     direction?: unknown;
+    dragDeltaX?: unknown;
+    dragDeltaY?: unknown;
   },
   lifetime: WebAssistActionLifetime = {},
 ): Promise<Record<string, unknown>> {
+  if (tab.inputBusy) return { ok: false, code: 'action_in_progress', error: 'An operation is already running on this page.' };
   const checked = checkWebAssistAction(tab, input);
   if (!checked.ok) return checked;
+  const revision = tab.controlRevision || 0;
+  let pointerDispatched = false;
   const context = tab.controlContext;
   const validate = (): Record<string, unknown> | null => {
+    if (tab.userControlled) return userControlResult();
+    if ((tab.controlRevision || 0) !== revision) return { ok: false, code: 'stale_page', error: 'User input changed this page; observe it again.' };
     if (lifetime.signal?.aborted || lifetime.isActive?.() === false) {
       return { ok: false, code: 'task_run_ended', error: 'This browser task turn has ended.' };
     }
@@ -2129,20 +2223,49 @@ async function actOnWebAssistTab(
   const runAction = async (grantedProtectedAction: boolean): Promise<Record<string, unknown>> => {
     const invalid = validate();
     if (invalid) return invalid;
-    const result = await withAssistantAction(record, tab, 'acting', () => executeWebAssistScript(
+    const prepare = () => executeWebAssistScript(
       checked.contents,
       buildWebAssistActionScript({
         ...(checked.ref ? { ref: checked.ref } : {}),
         action: checked.action,
         ...(typeof input.text === 'string' ? { text: checked.text } : {}),
         direction: checked.direction,
-      }, tab.controlContext?.scope, { grantedProtectedAction }),
+      }, tab.controlContext?.scope, { grantedProtectedAction, preparePointer: true }),
       true,
-    ));
+    ) as Promise<Record<string, unknown>>;
+    const result = await withAssistantAction(record, tab, 'acting', async () => {
+      if (['click', 'check', 'uncheck', 'drag'].includes(checked.action)) {
+        const rendering = await wakeWebAssistRendering(checked.contents,
+          timeoutMs => webAssistFrameWithin(checked.contents, timeoutMs),
+          () => !tabOnScreen(record, tab) && validate() === null);
+        // Waking did not make this off-screen page render. Refuse before any
+        // input, so a retry after the user shows it cannot click twice. On
+        // screen such a page is busy instead; the input path reports it as before.
+        if (rendering === 'not_rendered' && !tabOnScreen(record, tab)) {
+          log.warn('browser page is not rendering; pointer input withheld');
+          return { ok: false, code: 'page_not_rendered',
+            error: 'This page is not rendering while it is off screen, so the action was not sent. Ask the user to open this task and look at its browser once, then observe the page and retry.' };
+        }
+        const result = await dispatchWebAssistPointer(checked.contents, prepare, validate,
+          () => tab.virtualViewport && tab.bounds?.width ? tab.bounds.width / DESKTOP_VIEWPORT_WIDTH : 1,
+          checked.drag, () => { pointerDispatched = true; });
+        if (result.ok && ['check', 'uncheck'].includes(checked.action)) {
+          const verified = await withOperationTimeout(prepare(), {
+            timeoutMs: 2000, code: 'input_timeout', stage: 'browser control state',
+          });
+          if (verified.ok === false) return verified;
+          if (verified.pointer) return { ok: false, code: 'action_no_effect', error: 'The control did not reach the requested state; observe the page again.' };
+        }
+        return result.ok ? { ...result, action: checked.action } : result;
+      }
+      const timeoutMs = checked.action === 'fill' && checked.text.length > 2000 ? 30_000 : 5000;
+      return withOperationTimeout(prepare(), { timeoutMs, code: 'action_timeout', stage: 'browser action' });
+    });
     return result && typeof result === 'object'
       ? result as Record<string, unknown>
       : { ok: false, code: 'action_failed', error: 'The page action failed.' };
   };
+  tab.inputBusy = true;
   try {
     let publicResult = await runAction(false);
     if (publicResult.ok === false) {
@@ -2164,14 +2287,19 @@ async function actOnWebAssistTab(
       }
     }
     if (publicResult.ok === true) {
-      if (['fill', 'select', 'check', 'uncheck'].includes(checked.action)) tab.edited = true;
+      if (['fill', 'select', 'check', 'uncheck', 'drag'].includes(checked.action)) tab.edited = true;
       invalidateObservation(tab);
     }
     return publicResult;
   } catch (error) {
     log.warn('page action failed', { error: logErrorRef(error) });
     invalidateObservation(tab);
-    return { ok: false, code: 'action_failed', error: 'The page action failed.' };
+    return { ok: false, code: 'action_failed', error: 'The page action failed; observe it before deciding what to do next.' };
+  } finally {
+    // Even a cancelled pointer or a hover can change the page. Do not reuse
+    // references from before an attempted action, or replay uncertain input.
+    if (pointerDispatched) invalidateObservation(tab);
+    tab.inputBusy = false;
   }
 }
 
@@ -2185,6 +2313,8 @@ export async function actOnControlledWebAssist(
     action?: unknown;
     text?: unknown;
     direction?: unknown;
+    dragDeltaX?: unknown;
+    dragDeltaY?: unknown;
   },
 ): Promise<Record<string, unknown>> {
   const resolved = controlledRecord(userId, conversationId, scopeId);
@@ -2203,6 +2333,7 @@ export async function navigateControlledWebAssist(
   const resolved = controlledRecord(userId, conversationId, scopeId);
   if (!('record' in resolved)) return { ok: false, code: resolved.code, error: resolved.error };
   const { record, tab } = resolved;
+  if (tab.userControlled) return userControlResult();
   if (action === 'close') {
     removeTab(record, tab, true);
     return { ok: true, action: 'close', closed: true, tab_id: tab.id };
@@ -2232,7 +2363,7 @@ export async function waitForControlledWebAssist(
   const requestedTimeout = Number(input.timeoutMs);
   const timeoutMs = Number.isFinite(requestedTimeout)
     ? Math.max(250, Math.min(15_000, Math.round(requestedTimeout)))
-    : 8_000;
+    : initial.tab.userControlled ? Math.max(8_000, WEB_ASSIST_USER_IDLE_MS + 1000) : 8_000;
   const started = Date.now();
   return withAssistantAction(initial.record, initial.tab, 'waiting', async () => {
     while (Date.now() - started < timeoutMs) {
@@ -2242,8 +2373,8 @@ export async function waitForControlledWebAssist(
       let matched = false;
       try {
         if (condition === 'loaded') {
-          matched = !current.tab.loading && !contents.isLoading();
-        } else if (!current.tab.loading && !contents.isLoading()) {
+          matched = !current.tab.userControlled && !current.tab.loading && !contents.isLoading();
+        } else if (!current.tab.userControlled && !current.tab.loading && !contents.isLoading()) {
           matched = await readWebAssistTextCondition(contents, expectedText, started + timeoutMs) === true;
         }
       } catch {
@@ -2334,6 +2465,8 @@ export async function navigateModelWebAssist(
 ): Promise<Record<string, unknown>> {
   const resolved = taskTab(userId, conversationId, input.tabId);
   if (!resolved.ok) return resolved;
+  if (resolved.tab.userControlled) return userControlResult();
+  if (resolved.tab.inputBusy) return { ok: false, code: 'action_in_progress', error: 'An operation is already running on this page.' };
   const action = String(input.action || '').trim();
   if (!['goto', 'back', 'forward', 'reload'].includes(action)) {
     return { ok: false, code: 'invalid_action', error: 'Navigation must be goto, back, forward, or reload.' };
@@ -2386,11 +2519,15 @@ export async function actOnModelWebAssist(
     action?: unknown;
     text?: unknown;
     direction?: unknown;
+    dragDeltaX?: unknown;
+    dragDeltaY?: unknown;
   },
   lifetime: WebAssistActionLifetime = {},
 ): Promise<Record<string, unknown>> {
   const resolved = taskTab(userId, conversationId, input.tabId);
   if (!resolved.ok) return resolved;
+  // Reject competing input before exposure can replace the running action's authority.
+  if (resolved.tab.inputBusy) return { ok: false, code: 'action_in_progress', error: 'An operation is already running on this page.' };
   if (!PAGE_ACTIONS.has(String(input.action || '') as WebAssistPageAction)) return { ok: false, code: 'invalid_action', error: 'Unsupported Web Assist page action.' };
   ensureTabLoaded(resolved.record, resolved.tab);
   const checked = checkWebAssistAction(resolved.tab, input);
@@ -2418,7 +2555,7 @@ export async function waitForModelWebAssist(
   const requestedTimeout = Number(input.timeoutMs);
   const timeoutMs = Number.isFinite(requestedTimeout)
     ? Math.max(250, Math.min(15_000, Math.round(requestedTimeout)))
-    : 8_000;
+    : initial.tab.userControlled ? Math.max(8_000, WEB_ASSIST_USER_IDLE_MS + 1000) : 8_000;
   const exposed = exposeTaskTabToModel(initial);
   if (!exposed.ok) return exposed;
   const started = Date.now();
@@ -2430,8 +2567,8 @@ export async function waitForModelWebAssist(
       let matched = false;
       try {
         if (condition === 'loaded') {
-          matched = !current.tab.loading && !contents.isLoading();
-        } else if (!current.tab.loading && !contents.isLoading()) {
+          matched = !current.tab.userControlled && !current.tab.loading && !contents.isLoading();
+        } else if (!current.tab.userControlled && !current.tab.loading && !contents.isLoading()) {
           matched = await readWebAssistTextCondition(contents, expectedText, started + timeoutMs) === true;
         }
       } catch {
@@ -2462,6 +2599,7 @@ export function retainModelWebAssistTab(
   }
   const resolved = taskTab(userId, conversationId, tabId);
   if (!resolved.ok) return resolved;
+  if (resolved.tab.userControlled) return userControlResult();
   if (resolved.tab.lifetime.createdBy === 'user') {
     return { ok: false, code: 'user_owned_tab', error: 'User-created tabs already remain open without a retention mark.' };
   }
@@ -2479,6 +2617,7 @@ export function closeModelWebAssistTab(
 ): Record<string, unknown> {
   const resolved = taskTab(userId, conversationId, tabId);
   if (!resolved.ok) return resolved;
+  if (resolved.tab.userControlled) return userControlResult();
   const closedTabId = resolved.tab.id;
   removeTab(resolved.record, resolved.tab, true);
   return { ok: true, closed: true, tab_id: closedTabId };
@@ -2541,6 +2680,7 @@ export function layoutWebAssist(
   tab.view.setBounds(bounds);
   tab.bounds = bounds;
   setTabVisible(tab, true);
+  revealDeferredAuthorizationPopups(record, tab);
   // The drawer is user-draggable, so the room available changed with it.
   applyDesktopViewport(tab);
   return { ok: true, state: rendererSnapshot(record) };

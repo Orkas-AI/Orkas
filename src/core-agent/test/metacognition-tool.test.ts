@@ -27,7 +27,7 @@ describe('createMetacognitionTool', () => {
     expect((tool.inputSchema as any).additionalProperties).toBe(false);
     expect((tool.inputSchema as any).oneOf).toBeUndefined();
     expect((tool.inputSchema as any).properties.action.description)
-      .toContain('Omit unrelated fields');
+      .toContain('Read ignores content and reports ignored_fields');
   });
 
   it('omits the limit block when no limits are supplied', () => {
@@ -91,6 +91,8 @@ describe('metacognition › read', () => {
     expect(result.isError).toBeFalsy();
     expect(handler.read).toHaveBeenCalledWith('strategies');
     expect(handler.write).not.toHaveBeenCalled();
+    expect(JSON.parse(result.content).ignored_fields).toEqual(['content']);
+    expect(result.content).not.toContain('unused');
   });
 });
 
@@ -148,6 +150,16 @@ describe('metacognition › error handling', () => {
     );
     expect(result.isError).toBe(true);
     expect(JSON.parse(result.content).error).toMatch(/unknown action/);
+  });
+
+  it('rejects unknown fields without reading a target', async () => {
+    const handler = mockHandler();
+    const result = await createMetacognitionTool(handler).execute(
+      { action: 'read', target: 'competence', unknown: 'value' }, dummyCtx,
+    );
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content).error).toContain('unknown fields: unknown');
+    expect(handler.read).not.toHaveBeenCalled();
   });
 
   it('propagates handler write failure', async () => {

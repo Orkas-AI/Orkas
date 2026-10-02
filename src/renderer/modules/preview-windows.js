@@ -14,7 +14,7 @@
   }
   function options(opts) {
     const result = {};
-    for (const key of ['cid', 'projectId', 'absPath', 'autoplay', 'startTime', 'duration', 'ended']) {
+    for (const key of ['cid', 'projectId', 'absPath', 'readOnly', 'autoplay', 'startTime', 'duration', 'ended']) {
       const value = opts?.[key];
       if (value != null && (typeof value !== 'number' || Number.isFinite(value))) result[key] = value;
     }
@@ -23,7 +23,7 @@
   }
   function image(src, title, opts) {
     const root = opts?.sourceElement?.closest('.chat-history');
-    const cid = opts?.cid || (typeof currentCid !== 'undefined' ? currentCid : null);
+    const cid = opts?.cid !== undefined ? opts.cid : (typeof currentCid !== 'undefined' ? currentCid : null);
     let gallery = null;
     if (root && cid) {
       const nodes = _lightboxGalleryItems({ root, cid });

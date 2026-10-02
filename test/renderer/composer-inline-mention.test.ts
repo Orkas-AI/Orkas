@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -92,6 +93,7 @@ async function runComposer(inputId: string, chipId: string, script: Array<
   };
   context.window = context;
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
 
   const driver = script.map((step) => {
     if (step.type === 'type') {

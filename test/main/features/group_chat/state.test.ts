@@ -20,7 +20,7 @@ beforeEach(async () => {
 afterEach(() => {
   vi.restoreAllMocks();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 describe('group_chat state › sessionId builders', () => {

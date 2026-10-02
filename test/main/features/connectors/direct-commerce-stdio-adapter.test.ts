@@ -100,6 +100,19 @@ afterEach(() => {
 });
 
 describe('direct commerce stdio adapter', () => {
+  it('describes Shopify output types on demand without fetching or widening other actions', async () => {
+    const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
+    const env = envFor('shopify', { client_id: 'fixture-client', client_secret: 'fixture-secret' }, { shop_domain: 'fixture.myshopify.com' });
+    const action = await adapter.callTool('describe_action', { action: 'product' }, env);
+    expect(action.output_type).toBe('Product');
+    const type = await adapter.callTool('describe_action', { action: 'product', output_type: 'Product' }, env);
+    expect(JSON.stringify(type)).toContain('variants');
+    await expect(adapter.callTool('describe_action', { action: 'product', output_type: 'StorefrontAccessToken' }, env)).rejects.toMatchObject({ code: 'E_BAD_INPUT' });
+    await expect(adapter.callTool('describe_action', { action: 'shop.get', output_type: 'Shop' }, env)).rejects.toMatchObject({ code: 'E_BAD_INPUT' });
+    const other = envFor('constant_contact', { access_token: 'fixture-token' });
+    await expect(adapter.callTool('describe_action', { action: 'GET /contacts', output_type: 'Product' }, other)).rejects.toMatchObject({ code: 'E_BAD_INPUT' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
   it.each(['cancel', 'disconnect', 'continue'])('keeps pending token acquisition inside MCP request ownership: %s', async (mode) => {
     const env = envFor('shopify', { client_id: 'fixture-client', client_secret: 'fixture-secret' }, {
       shop_domain: 'fixture.myshopify.com',
@@ -234,7 +247,7 @@ describe('direct commerce stdio adapter', () => {
     });
     expect(adapter.LIGHTSPEED_ACTIONS).toMatchObject({
       'store.get': { risk: 'R' }, 'products.create': { risk: 'W' },
-      'sales.create': { risk: 'H' }, 'sales.delete': { risk: 'D' },
+      'sales.create': { risk: 'H' },
     });
     expect(adapter.RELOADLY_ACTIONS.giftcards).toMatchObject({
       'balance.get': { risk: 'R' }, 'orders.create': { risk: 'H' },
@@ -320,19 +333,19 @@ describe('direct commerce stdio adapter', () => {
       'inventory.adjust': { risk: 'H' }, 'shipments.offline': { risk: 'H' },
       'products.expire': { risk: 'H' }, 'products.delete': { risk: 'D' },
     });
-    expect(Object.keys(adapter.ALIBABA_1688_ACTIONS)).toHaveLength(12);
+    expect(Object.keys(adapter.ALIBABA_1688_ACTIONS)).toHaveLength(11);
     expect(Object.fromEntries(['R', 'W', 'H', 'D'].map((risk) => [
       risk, Object.values(adapter.ALIBABA_1688_ACTIONS).filter((spec) => spec.risk === risk).length,
-    ]))).toEqual({ R: 6, W: 0, H: 5, D: 1 });
+    ]))).toEqual({ R: 6, W: 0, H: 4, D: 1 });
     expect(adapter.JD_ACTIONS).toMatchObject({
-      'account.get': { risk: 'R' }, 'orders.list': { risk: 'R' },
+      'account.get': { risk: 'R' }, 'products.list_valid': { risk: 'R' },
       'orders.memo_update': { risk: 'W' }, 'inventory.set': { risk: 'H' },
       'refunds.decide': { risk: 'H' }, 'products.delete': { risk: 'D' },
     });
-    expect(Object.keys(adapter.JD_ACTIONS)).toHaveLength(23);
+    expect(Object.keys(adapter.JD_ACTIONS)).toHaveLength(21);
     expect(Object.fromEntries(['R', 'W', 'H', 'D'].map((risk) => [
       risk, Object.values(adapter.JD_ACTIONS).filter((spec) => spec.risk === risk).length,
-    ]))).toEqual({ R: 12, W: 2, H: 8, D: 1 });
+    ]))).toEqual({ R: 10, W: 2, H: 8, D: 1 });
     expect(adapter.PINDUODUO_ACTIONS).toMatchObject({
       'account.get': { risk: 'R' }, 'orders.list_basic': { risk: 'R' },
       'orders.note_update': { risk: 'W' }, 'inventory.update': { risk: 'H' },
@@ -842,6 +855,25 @@ describe('direct commerce stdio adapter', () => {
     }, env)).rejects.toThrow('either keywords or identifiers');
   });
 
+  it('searches all orders authorized by the Global Selling parent token without filtering by the parent seller ID', async () => {
+    const fetchMock = vi.fn(async (raw, init) => {
+      const url = new URL(String(raw));
+      expect(url.origin).toBe('https://api.mercadolibre.com');
+      expect(init.headers.authorization).toBe('Bearer mercado-parent-token');
+      return response(200, { results: url.searchParams.has('seller.id') ? [] : [{ id: 123, seller: { id: 456 } }] });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('mercado_libre', {
+      client_id: 'mercado-app-id', client_secret: 'mercado-client-secret',
+      access_token: 'mercado-parent-token', refresh_token: 'mercado-refresh', expires_at: Date.now() + 3_600_000,
+      scope: 'offline_access read write', identity: { user_id: '1305627900', site_id: 'CBT' },
+    }, { user_id: '1305627900' });
+    const result = await (adapter as any).executeMercadoLibre(adapter.configured(env), 'orders.search', { query: { 'seller.id': '999', sort: 'date_desc', limit: 10 } });
+    expect(result.results).toEqual([{ id: 123, seller: { id: 456 } }]);
+    expect(new URL(String(fetchMock.mock.calls[0][0])).searchParams.toString()).toBe('sort=date_desc&limit=10');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('rotates Mercado Libre refresh tokens atomically and binds seller-scoped routes', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(200, {
@@ -885,8 +917,7 @@ describe('direct commerce stdio adapter', () => {
       action: 'questions.delete', parameters: { question_id: '7000000001' },
     }, env);
     expect(fetchMock.mock.calls[2][0]).toContain('/marketplace/orders/search?');
-    expect(fetchMock.mock.calls[2][0]).toContain('seller.id=1305627900');
-    expect(fetchMock.mock.calls[2][0]).not.toContain('seller.id=999');
+    expect(new URL(String(fetchMock.mock.calls[2][0])).searchParams.has('seller.id')).toBe(false);
     expect(fetchMock.mock.calls[3][0]).toBe('https://api.mercadolibre.com/marketplace/answers');
     expect(JSON.parse(fetchMock.mock.calls[3][1]?.body)).toEqual({ question_id: 7000000001, text: 'Yes, it is available.' });
     expect(fetchMock.mock.calls[4][0]).toBe('https://api.mercadolibre.com/marketplace/questions/7000000001');
@@ -896,7 +927,15 @@ describe('direct commerce stdio adapter', () => {
     }, { user_id: '999999999' }))).toThrow('seller binding');
   });
 
-  it('signs fixed Taobao TOP actions, binds the seller identity, and excludes order PII fields', async () => {
+  it.each([[7, 'E_TOOL_CALL_RATE_LIMIT'], [11, 'E_TOOL_CALL_AUTH'], [25, 'E_TOOL_CALL_AUTH'], [26, 'E_TOOL_CALL_AUTH'], [27, 'E_TOOL_CALL_AUTH'], [29, 'E_TOOL_CALL_AUTH'], [41, 'E_TOOL_CALL_UPSTREAM']])('classifies official TOP gateway code %s without replay or raw diagnostics', async (code, expected) => {
+    const fetchMock = vi.fn(async () => response(200, { error_response: { code, msg: 'Private provider diagnostics', sub_msg: 'Private provider diagnostics' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('taobao_top', { app_key: 'fixture-app', app_secret: 'fixture-secret', access_token: 'fixture-token', expires_at: Date.now() + 3600000, identity: { user_id: '123', nick: 'Fixture shop' } });
+    await expect(adapter.callTool('execute_read', { action: 'account.get', parameters: {} }, env)).rejects.toMatchObject({ code: expected });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('signs fixed Taobao TOP actions, binds the seller identity, and requests complete fulfillment fields', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(200, { user_seller_get_response: { user: { user_id: 123456789, nick: 'merchant-shop', has_shop: true } } }))
       .mockResolvedValueOnce(response(200, { trades_sold_get_response: { trades: { trade: [{ tid: 90001, status: 'WAIT_SELLER_SEND_GOODS' }] } } }))
@@ -939,7 +978,7 @@ describe('direct commerce stdio adapter', () => {
     }
     const orderForm = new URLSearchParams(String(fetchMock.mock.calls[1][1]?.body));
     expect(orderForm.get('method')).toBe('taobao.trades.sold.get');
-    expect(orderForm.get('fields')).not.toMatch(/buyer|receiver|address|mobile|phone/i);
+    expect(orderForm.get('fields')?.split(',')).toEqual(expect.arrayContaining(['buyer_nick', 'receiver_address', 'receiver_mobile', 'orders.invoice_no', 'seller_memo']));
     expect(new URLSearchParams(String(fetchMock.mock.calls[2][1]?.body)).get('type')).toBe('1');
     expect(new URLSearchParams(String(fetchMock.mock.calls[3][1]?.body)).get('method')).toBe('taobao.item.delete');
 
@@ -949,6 +988,35 @@ describe('direct commerce stdio adapter', () => {
     });
     await expect(adapter.callTool('execute_read', { action: 'account.get' }, expired))
       .rejects.toThrow('reconnect this seller account');
+  });
+
+  it('omits 1688 industrial invitation-only product edits without verified enrollment', async () => {
+    const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('alibaba_1688', { app_key: 'fixture-app', app_secret: 'fixture-1688-secret',
+      access_token: 'fixture-1688-access', refresh_token: 'fixture-1688-refresh', expires_at: Date.now() + 3600000,
+      identity: { member_id: 'fixture-seller' } });
+    await expect(adapter.callTool('describe_action', { action: 'products.update' }, env)).rejects.toThrow('unknown action');
+    await expect(adapter.callTool('execute_high_impact', { action: 'products.update', parameters: { product_id: '123', subject: 'Updated' } }, env)).rejects.toThrow('unknown action');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['orders.list', 'refunds.list'])('preserves complete 1688 business fields through %s', async action => {
+    const fetchMock = vi.fn(async () => response(200, { success: true, result: { buyerMemo: 'Deliver in the morning',
+      buyerLoginId: 'Buyer', receiverInfo: { toFullName: 'Buyer', toMobile: '13800000000', toAddress: 'Delivery address' },
+      access_token: 'fixture-1688-access' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('alibaba_1688', { app_key: 'fixture-app', app_secret: 'fixture-1688-secret',
+      access_token: 'fixture-1688-access', refresh_token: 'fixture-1688-refresh', expires_at: Date.now() + 3600000,
+      identity: { member_id: 'fixture-seller' } });
+    const result = await adapter.callTool('execute_read', { action, parameters: {} }, env);
+    expect(result.result.result).toEqual({ buyerMemo: 'Deliver in the morning', buyerLoginId: 'Buyer',
+      receiverInfo: { toFullName: 'Buyer', toMobile: '13800000000', toAddress: 'Delivery address' } });
+    const form = new URLSearchParams(String(fetchMock.mock.calls[0][1]?.body));
+    if (action === 'orders.list') {
+      expect(form.get('needBuyerAddressAndPhone')).toBe('true');
+      expect(form.get('needMemoInfo')).toBe('true');
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('uses current 1688 param2 signing, rotates tokens, and fixes seller-safe order and fulfillment routes', async () => {
@@ -988,7 +1056,7 @@ describe('direct commerce stdio adapter', () => {
     const orderResult = await adapter.callTool('execute_read', {
       action: 'orders.list', parameters: { page: 1, page_size: 20, status: 'waitsellersend' },
     }, env);
-    expect(JSON.stringify(orderResult)).not.toMatch(/buyer-account|Buyer Name|13800000000|Buyer address/);
+    expect(orderResult.result.result[0]).toMatchObject({ buyerLoginId: 'buyer-account', receiverInfo: { toFullName: 'Buyer Name', toMobile: '13800000000', toAddress: 'Buyer address' } });
     expect(JSON.stringify(orderResult)).toContain('安全保留的商品名');
     await adapter.callTool('execute_high_impact', {
       action: 'shipments.offline', parameters: {
@@ -1012,8 +1080,8 @@ describe('direct commerce stdio adapter', () => {
       expect(form.has('url')).toBe(false);
     }
     const orderForm = new URLSearchParams(String(fetchMock.mock.calls[3][1]?.body));
-    expect(orderForm.get('needBuyerAddressAndPhone')).toBe('false');
-    expect(orderForm.get('needMemoInfo')).toBe('false');
+    expect(orderForm.get('needBuyerAddressAndPhone')).toBe('true');
+    expect(orderForm.get('needMemoInfo')).toBe('true');
     expect(orderForm.has('buyerLoginId')).toBe(false);
     const shipmentForm = new URLSearchParams(String(fetchMock.mock.calls[4][1]?.body));
     expect(JSON.parse(String(shipmentForm.get('extBody')))).toEqual({
@@ -1022,15 +1090,52 @@ describe('direct commerce stdio adapter', () => {
     expect(fetchMock.mock.calls[5][0]).toContain('/com.alibaba.product/alibaba.product.delete/87654321');
   });
 
-  it('signs fixed JD.com seller actions, binds the shop identity, and strips order PII', async () => {
+  it.each([
+    ['execute_read', 'products.list_valid', { keyword: 'Fixture', product_ids: ['11', '12'], page: 2 }, 'jingdong.ware.read.searchWare4Valid', { pageNo: 2, pageSize: 20, searchKey: 'Fixture', searchField: 'title', wareId: '11,12' }],
+    ['execute_read', 'skus.list', { product_ids: ['11'], sku_ids: ['12', '13'], page_size: 10 }, 'jingdong.sku.read.searchSkuList', { pageNo: 1, page_size: 10, wareId: '11', skuId: '12,13' }],
+    ['execute_read', 'inventory.get', { sku_ids: ['12', '13'] }, 'jingdong.sku.read.searchSkuList', { pageNo: 1, page_size: 20, skuId: '12,13' }],
+    ['execute_write', 'orders.memo_update', { order_id: '11', remark: 'Pack together' }, 'jingdong.pop.order.modifyVenderRemark', { order_id: 11, flag: 0, remark: 'Pack together' }],
+    ['execute_high_impact', 'prices.update', { sku_id: '12', price_yuan: 12.5 }, 'jingdong.price.write.updateSkuJdPrice', { skuId: 12, jdPrice: 12.5 }],
+    ['execute_high_impact', 'products.publish', { product_id: '11', reason: 'Ready' }, 'jingdong.ware.write.upOrDown', { wareId: 11, note: 'Ready', opType: 1 }],
+    ['execute_high_impact', 'shipments.create', { order_id: '11', logistics_id: '56', waybill: 'SF123' }, 'jingdong.pop.order.shipment', { orderId: 11, logiCoprId: '56', logiNo: 'SF123' }],
+    ['execute_high_impact', 'shipments.update', { order_id: '11', logistics_id: '56', waybill: 'SF123' }, 'jingdong.pop.order.sop.logistics.update', { oneGlobalOrderModelNoLogistic: { orderId: 11 }, logisticsGlobalModelList: [{ logiCoprId: 56, logiNoList: ['SF123'], logiScope: 0 }] }],
+    ['execute_high_impact', 'refunds.decide', { refund_id: '21', status: 1, operator_name: 'Merchant', remark: 'Approved' }, 'jingdong.pop.afs.soa.refundapply.replyRefund', { id: 21, status: 1, checkUserName: 'Merchant', remark: 'Approved' }],
+  ])('maps JD %s %s to its official public wire fields', async (tool, action, parameters, method, expected) => {
+    const fetchMock = vi.fn(async () => response(200, { result: { success: true } })); vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('jd_jos', { app_key: 'fixture-app', app_secret: 'fixture-secret', access_token: 'fixture-token', refresh_token: 'fixture-refresh', expires_at: Date.now() + 3600000, identity: { vender_id: '123', shop_id: '456' } });
+    await adapter.callTool(tool as string, { action, parameters }, env);
+    const form = new URLSearchParams(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(form.get('method')).toBe(method); expect(JSON.parse(form.get('360buy_param_json')!)).toEqual(expected); expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([['refunds.list', {}], ['refunds.get', { refund_id: '21' }]])('preserves JD %s fulfillment fields and exact response IDs without credentials', async (action, parameters) => {
+    const fetchMock = vi.fn(async () => new Response('{"result":{"id":9007199254740993,"buyerName":"Fixture buyer","receiverAddress":"Fixture road","remark":"Return label","access_token":"fixture-token"}}'));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('jd_jos', { app_key: 'fixture-app', app_secret: 'fixture-secret', access_token: 'fixture-token', refresh_token: 'fixture-refresh', expires_at: Date.now() + 3600000, identity: { vender_id: '123', shop_id: '456' } });
+    const result = await adapter.callTool('execute_read', { action, parameters }, env);
+    expect(result.result).toEqual({ result: { id: '9007199254740993', buyerName: 'Fixture buyer', receiverAddress: 'Fixture road', remark: 'Return label' } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves exact large JD numeric IDs in the signed legacy request', async () => {
+    const fetchMock = vi.fn(async () => response(200, { result: { success: true } })); vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('jd_jos', { app_key: 'fixture-app', app_secret: 'fixture-secret', access_token: 'fixture-token', refresh_token: 'fixture-refresh', expires_at: Date.now() + 3600000, identity: { vender_id: '123', shop_id: '456' } });
+    await adapter.callTool('execute_read', { action: 'skus.get', parameters: { sku_id: '9007199254740993' } }, env);
+    expect(new URLSearchParams(String(fetchMock.mock.calls[0]?.[1]?.body)).get('360buy_param_json')).toBe('{"skuId":9007199254740993}');
+  });
+
+  it.each(['orders.list', 'orders.get'])('does not advertise or dispatch JD %s that requires cloud deployment', async action => {
+    const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('jd_jos', { app_key: 'fixture-app', app_secret: 'fixture-secret', access_token: 'fixture-token', refresh_token: 'fixture-refresh', expires_at: Date.now() + 3600000, identity: { vender_id: '123', shop_id: '456' } });
+    await expect(adapter.callTool('describe_action', { action }, env)).rejects.toThrow('unknown action');
+    await expect(adapter.callTool('execute_read', { action, parameters: { order_id: '11', order_state: 'WAIT_SELLER_STOCK_OUT' } }, env)).rejects.toThrow('unknown action'); expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('signs fixed JD.com seller actions, binds the shop identity, and omits cloud-only order reads', async () => {
     const identity = { vender_id: 802001, shop_id: 900001, shop_name: '京东测试店' };
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(200, { jingdong_seller_vender_info_get_responce: { vender_info_result: identity } }))
-      .mockResolvedValueOnce(response(200, { jingdong_pop_order_search_responce: { searchorderinfo_result: {
-        orderInfoList: [{ orderId: '287901234567', orderState: 'WAIT_SELLER_STOCK_OUT', buyerPin: 'buyer-pin',
-          receiverInfo: { fullName: 'Buyer Name', mobile: '13800000000', address: 'Buyer address' },
-          itemInfoList: [{ skuId: '1002003', wareName: '安全保留的商品名' }] }],
-      } } }))
+      .mockResolvedValueOnce(response(200, { jingdong_ware_read_findWareById_responce: { ware: { wareId: '11', title: 'Fixture product' } } }))
       .mockResolvedValueOnce(response(200, { jingdong_ware_stock_sku_set_responce: { code: '0' } }))
       .mockResolvedValueOnce(response(200, { jingdong_pop_order_shipment_responce: { code: '0' } }))
       .mockResolvedValueOnce(response(200, { jingdong_ware_write_delete_responce: { code: '0' } }));
@@ -1045,16 +1150,14 @@ describe('direct commerce stdio adapter', () => {
     expect(capabilities).toMatchObject({
       provider: 'jd_jos', identity: { vender_id: 802001, shop_id: 900001 },
       actions: expect.arrayContaining([
-        expect.objectContaining({ action: 'orders.list', risk: 'R' }),
+        expect.objectContaining({ action: 'products.get', risk: 'R' }),
         expect.objectContaining({ action: 'inventory.set', risk: 'H' }),
         expect.objectContaining({ action: 'products.delete', risk: 'D' }),
       ]),
     });
-    const orderResult = await adapter.callTool('execute_read', {
-      action: 'orders.list', parameters: { order_state: 'WAIT_SELLER_STOCK_OUT', page: 1, page_size: 20 },
-    }, env);
-    expect(JSON.stringify(orderResult)).not.toMatch(/buyer-pin|Buyer Name|13800000000|Buyer address/);
-    expect(JSON.stringify(orderResult)).toContain('安全保留的商品名');
+    expect(capabilities.actions.some((row: any) => ['orders.list', 'orders.get'].includes(row.action))).toBe(false);
+    const productResult = await adapter.callTool('execute_read', { action: 'products.get', parameters: { product_id: '11' } }, env);
+    expect(JSON.stringify(productResult)).toContain('Fixture product');
     await adapter.callTool('execute_high_impact', {
       action: 'inventory.set', parameters: {
         update_mode: 'absolute', stock_reference_id: 'orkas-stock-20260904-1',
@@ -1076,17 +1179,41 @@ describe('direct commerce stdio adapter', () => {
       expect(form.get('sign')).toMatch(/^[A-F0-9]{32}$/);
       expect(form.has('url')).toBe(false);
     }
-    const orderForm = new URLSearchParams(String(fetchMock.mock.calls[1][1]?.body));
-    expect(orderForm.get('method')).toBe('jingdong.pop.order.search');
-    const orderParameters = JSON.parse(String(orderForm.get('360buy_param_json')));
-    expect(orderParameters.paramOrderJSFQuery.optional_fields).not.toMatch(/buyer|receiver|address|mobile|phone|invoice|pin/i);
+    expect(new URLSearchParams(String(fetchMock.mock.calls[1][1]?.body)).get('method')).toBe('jingdong.ware.read.findWareById');
     const stockParameters = JSON.parse(String(new URLSearchParams(String(fetchMock.mock.calls[2][1]?.body)).get('360buy_param_json')));
     expect(stockParameters.req).toMatchObject({ updateModel: 'fullStockIn', stockRfId: 'orkas-stock-20260904-1' });
     expect(new URLSearchParams(String(fetchMock.mock.calls[3][1]?.body)).get('method')).toBe('jingdong.pop.order.shipment');
     expect(new URLSearchParams(String(fetchMock.mock.calls[4][1]?.body)).get('method')).toBe('jingdong.ware.write.delete');
   });
 
-  it('signs fixed Pinduoduo actions, uses basic orders, and strips consumer information', async () => {
+  it.each([
+    ['orders.status', { order_ids: ['180928-547382874904289'] }, 'order_sns'],
+    ['refunds.get', { order_id: '200729-3865470571604253331' }, 'order_sn'],
+  ])('preserves official Pinduoduo order numbers in %s and all returned fulfillment fields', async (action, parameters, key) => {
+    const fetchMock = vi.fn(async () => response(200, { result: { receiver_address: 'Fixture road', receiver_phone: '000', buyer_name: 'Fixture buyer', note: 'Gift', access_token: 'fixture-token' } })); vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('pinduoduo', { client_id: 'fixture-client', client_secret: 'fixture-secret', access_token: 'fixture-token', refresh_token: 'fixture-refresh', expires_at: Date.now() + 3600000, identity: { mall_id: '123' } });
+    const result = await adapter.callTool('execute_read', { action, parameters }, env);
+    expect(new URLSearchParams(String(fetchMock.mock.calls[0]?.[1]?.body)).get(key as string)).toBe('order_ids' in parameters ? parameters.order_ids[0] : parameters.order_id);
+    expect(result.result).toEqual({ result: { receiver_address: 'Fixture road', receiver_phone: '000', buyer_name: 'Fixture buyer', note: 'Gift' } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns usable Pinduoduo merchant return addresses without credentials', async () => {
+    const fetchMock = vi.fn(async () => response(200, { refund_address_list_get_response: { address_list: [{ address: 'Fixture road', receiver_name: 'Warehouse', receiver_phone: '000', access_token: 'fixture-token' }] } })); vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('pinduoduo', { client_id: 'fixture-client', client_secret: 'fixture-secret', access_token: 'fixture-token', refresh_token: 'fixture-refresh', expires_at: Date.now() + 3600000, identity: { mall_id: '123' } });
+    const result = await adapter.callTool('execute_read', { action: 'refunds.return_addresses', parameters: {} }, env);
+    expect(result.result.refund_address_list_get_response.address_list).toEqual([{ address: 'Fixture road', receiver_name: 'Warehouse', receiver_phone: '000' }]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['../123', '180928-123,200729-456', '180928-', '123\n'])('rejects malformed Pinduoduo order number %j before IO', async order_id => {
+    const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('pinduoduo', { client_id: 'fixture-client', client_secret: 'fixture-secret', access_token: 'fixture-token', refresh_token: 'fixture-refresh', expires_at: Date.now() + 3600000, identity: { mall_id: '123' } });
+    await expect(adapter.callTool('execute_read', { action: 'refunds.get', parameters: { order_id } }, env)).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('signs fixed Pinduoduo actions and preserves complete authorized business fields', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(200, { mall_info_get_response: { mall_id: 700001, mall_name: '拼多多测试店', merchant_type: 1 } }))
       .mockResolvedValueOnce(response(200, { order_basic_list_get_response: { order_list: [{
@@ -1118,7 +1245,7 @@ describe('direct commerce stdio adapter', () => {
         start_confirmed_at: 1_788_451_200, end_confirmed_at: 1_788_537_600, order_status: 1, page: 1,
       },
     }, env);
-    expect(JSON.stringify(orderResult)).not.toMatch(/Buyer Name|13800000000|Buyer address/);
+    expect(orderResult.result.order_basic_list_get_response.order_list[0]).toMatchObject({ buyer_name: 'Buyer Name', receiver_phone: '13800000000', receiver_address: 'Buyer address' });
     expect(JSON.stringify(orderResult)).toContain('安全保留的商品名');
     await adapter.callTool('execute_high_impact', {
       action: 'inventory.update', parameters: { product_id: '10001', sku_id: '20002', quantity: 6, mode: 'absolute' },
@@ -1157,7 +1284,33 @@ describe('direct commerce stdio adapter', () => {
     }, env)).rejects.toThrow('order confirmation window');
   });
 
-  it('signs fixed Douyin Shop actions, binds the shop, separates risks, and strips order PII', async () => {
+  it.each([
+    ['orders.list', { query: { page: 0, size: 20 } }, '/order/searchList'],
+    ['orders.get', { order_id: '900000000000000001' }, '/order/orderDetail'],
+    ['refunds.list', { query: { page: 0, size: 20 } }, '/afterSale/List'],
+    ['refunds.get', { after_sale_id: '900000000000000001' }, '/afterSale/Detail'],
+  ])('preserves full authorized Douyin fields through %s while removing credential echoes', async (action, parameters, route) => {
+    const fetchMock = vi.fn().mockResolvedValue(response(200, { code: 10000, data: {
+      receiver_address: 'Buyer address', receiver_phone: '13800000000',
+      return_contact: { name: 'Buyer Name', phone: '13800000000' },
+      message: 'Please leave at desk', access_token: 'douyin-access-token',
+      custom_note: 'Echo douyin-app-secret', nested: { refresh_token: 'douyin-refresh-token' },
+    } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('douyin_shop', {
+      app_key: 'douyin-app-key', app_secret: 'douyin-app-secret',
+      access_token: 'douyin-access-token', refresh_token: 'douyin-refresh-token',
+      expires_at: Date.now() + 3_600_000, identity: { shop_id: '700000000000000001' },
+    }, { shop_id: '700000000000000001' });
+    const result = await adapter.callTool('execute_read', { action, parameters }, env);
+    expect(result.result).toEqual({ receiver_address: 'Buyer address', receiver_phone: '13800000000',
+      return_contact: { name: 'Buyer Name', phone: '13800000000' }, message: 'Please leave at desk', custom_note: 'Echo [redacted]', nested: {} });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(new URL(String(fetchMock.mock.calls[0][0])).pathname).toBe(route);
+    expect(JSON.stringify(result)).not.toMatch(/douyin-access-token|douyin-refresh-token|douyin-app-secret/);
+  });
+
+  it('signs fixed Douyin Shop actions, binds the shop, separates risks, and preserves authorized fulfillment fields', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(200, { code: 10000, data: {
         auth_id: '700000000000000001', status: 1, shop_name: '抖店测试店',
@@ -1191,7 +1344,7 @@ describe('direct commerce stdio adapter', () => {
     const orderResult = await adapter.callTool('execute_read', {
       action: 'orders.list', parameters: { query: { page: 0, size: 20 } },
     }, env);
-    expect(JSON.stringify(orderResult)).not.toMatch(/Buyer Name|13800000000|Buyer address/);
+    expect(orderResult.result.list[0]).toMatchObject({ buyer_name: 'Buyer Name', receiver_phone: '13800000000', receiver_address: 'Buyer address' });
     expect(JSON.stringify(orderResult)).toContain('安全保留的商品名');
     await adapter.callTool('execute_high_impact', {
       action: 'inventory.update', parameters: {
@@ -1221,25 +1374,75 @@ describe('direct commerce stdio adapter', () => {
     });
   });
 
-  it('signs fixed Kuaishou Shop actions, binds seller/shop, rotates tokens, and strips PII', async () => {
+  it.each([
+    ['orders.list', { query_type: 1, begin_time: Date.now() - 3600000, end_time: Date.now() }],
+    ['orders.get', { order_id: '11' }],
+    ['refunds.list', { query_type: 1, begin_time: Date.now() - 3600000, end_time: Date.now() }],
+    ['refunds.get', { refund_id: '12' }],
+    ['addresses.list', { address_type: 2 }],
+  ])('preserves authorized Kuaishou business fields in %s while removing credentials', async (action, parameters) => {
+    const fetchMock = vi.fn(async () => response(200, { result: 1, data: {
+      buyer_name: 'Buyer', receiver_mobile: '13800000000', receiver_address: 'Delivery address',
+      message: 'Business delivery instruction', access_token: 'fixture-kwai-access',
+    } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('kuaishou_shop', { app_key: 'fixture-kwai-app', app_secret: 'fixture-kwai-secret',
+      sign_secret: 'fixture-sign-secret', access_token: 'fixture-kwai-access', refresh_token: 'fixture-kwai-refresh',
+      expires_at: Date.now() + 3600000, identity: { open_id: 'fixture-seller', shop_id: '123' } });
+    const result = await adapter.callTool('execute_read', { action, parameters }, env);
+    expect(result.result).toEqual({ buyer_name: 'Buyer', receiver_mobile: '13800000000', receiver_address: 'Delivery address', message: 'Business delivery instruction' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves exact large Kuaishou order IDs in a legacy response', async () => {
+    const fetchMock = vi.fn(async () => new Response('{"result":1,"data":{"orderBaseInfo":{"oid":9007199254740993}}}'));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('kuaishou_shop', { app_key: 'fixture-kwai-app', app_secret: 'fixture-kwai-secret',
+      sign_secret: 'fixture-sign-secret', access_token: 'fixture-kwai-access', refresh_token: 'fixture-kwai-refresh',
+      expires_at: Date.now() + 3600000, identity: { open_id: 'fixture-seller', shop_id: '123' } });
+    const result = await adapter.callTool('execute_read', { action: 'orders.get', parameters: { order_id: '9007199254740993' } }, env);
+    expect(result.result.orderBaseInfo.oid).toBe('9007199254740993');
+    expect(new URL(String(fetchMock.mock.calls[0][0])).searchParams.get('param')).toBe('{"oid":9007199254740993}');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['execute_read', 'orders.list', { query_type: 1, cursor: 'NEXT-CURSOR', begin_time: Date.now() - 3600000, end_time: Date.now() }, { cursor: 'NEXT-CURSOR', orderViewStatus: 1, queryType: 1 }, 'pcursor'],
+    ['execute_high_impact', 'products.update', { item_id: '123', payload: { itemId: '999', title: 'Updated' } }, { itemId: 123, title: 'Updated' }, 'kwaiItemId'],
+    ['execute_read', 'refunds.list', { query_type: 1, begin_time: Date.now() - 3600000, end_time: Date.now() }, { type: 9 }, 'refund_type'],
+  ])('maps Kuaishou %s %s to the official required parameters', async (tool, action, parameters, expected, absent) => {
+    const fetchMock = vi.fn(async () => response(200, { result: 1, data: {} }));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('kuaishou_shop', { app_key: 'fixture-kwai-app', app_secret: 'fixture-kwai-secret',
+      sign_secret: 'fixture-sign-secret', access_token: 'fixture-kwai-access', refresh_token: 'fixture-kwai-refresh',
+      expires_at: Date.now() + 3600000, identity: { open_id: 'fixture-seller', shop_id: '123' } });
+    await adapter.callTool(tool as string, { action, parameters }, env);
+    const [raw, init] = fetchMock.mock.calls[0] as any;
+    const form = init.method === 'POST' ? new URLSearchParams(init.body) : new URL(raw).searchParams;
+    expect(JSON.parse(form.get('param'))).toMatchObject(expected);
+    expect(JSON.parse(form.get('param'))).not.toHaveProperty(absent as string);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('signs Kuaishou Shop actions, binds official merchant identity, rotates tokens, and preserves fulfillment fields', async () => {
     const now = Date.now();
     const scope = 'user_base,user_info,merchant_user,merchant_item,merchant_order,merchant_refund,merchant_logistics';
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(200, { result: 1, data: {
         access_token: 'kuaishou-access-new', refresh_token: 'kuaishou-refresh-new',
-        open_id: 'seller-open-id', expires_in: 172800, scope,
+        open_id: 'seller-open-id', expires_in: 172800, scopes: scope,
       } }))
       .mockResolvedValueOnce(response(200, { result: 1, data: {
-        open_id: 'seller-open-id', seller_name: '快手卖家',
+        openId: 'seller-open-id', sellerId: '800000000000000001', name: '快手卖家',
       } }))
       .mockResolvedValueOnce(response(200, { result: 1, data: {
-        shop_id: '800000000000000001', shop_name: '快手测试店',
+        shopName: '快手测试店', shopType: 5,
       } }))
       .mockResolvedValueOnce(response(200, { result: 1, data: {
-        open_id: 'seller-open-id', seller_name: '快手卖家',
+        openId: 'seller-open-id', sellerId: '800000000000000001', name: '快手卖家',
       } }))
       .mockResolvedValueOnce(response(200, { result: 1, data: {
-        shop_id: '800000000000000001', shop_name: '快手测试店',
+        shopName: '快手测试店', shopType: 5,
       } }))
       .mockResolvedValueOnce(response(200, { result: 1, data: { orderList: [{
         oid: '900000000000000001', buyer_name: 'Buyer Name',
@@ -1264,8 +1467,8 @@ describe('direct commerce stdio adapter', () => {
     expect(capabilities).toMatchObject({
       provider: 'kuaishou_shop',
       identity: {
-        seller: { open_id: 'seller-open-id' },
-        shop: { shop_id: '800000000000000001', shop_name: '快手测试店' },
+        seller: { openId: 'seller-open-id', sellerId: '800000000000000001' },
+        shop: { shopName: '快手测试店', shopType: 5 },
       },
       actions: expect.arrayContaining([
         expect.objectContaining({ action: 'orders.list', risk: 'R' }),
@@ -1279,7 +1482,7 @@ describe('direct commerce stdio adapter', () => {
         query_type: 1, begin_time: now - 86_400_000, end_time: now, page_size: 20,
       },
     }, env);
-    expect(JSON.stringify(orderResult)).not.toMatch(/Buyer Name|13800000000|Buyer address/);
+    expect((orderResult.result as any).orderList[0]).toMatchObject({ buyer_name: 'Buyer Name', receiver_mobile: '13800000000', receiver_address: 'Buyer address' });
     expect(JSON.stringify(orderResult)).toContain('安全保留的商品名');
     await adapter.callTool('execute_high_impact', {
       action: 'inventory.update', parameters: {
@@ -1319,6 +1522,11 @@ describe('direct commerce stdio adapter', () => {
     expect(new URL(String(fetchMock.mock.calls[5][0])).pathname).toBe('/open/order/cursor/list');
     const stock = new URLSearchParams(String(fetchMock.mock.calls[6][1]?.body));
     expect(stock.get('method')).toBe('open.item.sku.stock.update');
+    expect(stock.get('param')).toContain('"kwaiItemId":700000000000000001');
+    expect(stock.get('param')).toContain('"skuId":700000000000000002');
+    const rejection = new URLSearchParams(String(fetchMock.mock.calls[7][1]?.body));
+    expect(rejection.get('param')).toContain('"refundId":600000000000000001');
+    expect(JSON.parse(String(rejection.get('param'))).reasonCode).toBe(1001);
     expect(JSON.parse(String(stock.get('param')))).toMatchObject({
       skuChangeStock: 3, changeType: 2,
     });
@@ -1326,6 +1534,33 @@ describe('direct commerce stdio adapter', () => {
       .toBe('open.refund.reject');
     expect(new URLSearchParams(String(fetchMock.mock.calls[8][1]?.body)).get('method'))
       .toBe('open.item.delete');
+  });
+
+  it.each(['orders.list', 'orders.get'])('preserves complete Youzan business fields through %s', async action => {
+    const fetchMock = vi.fn(async () => response(200, { code: 200, success: true, data: { buyer_name: 'Buyer',
+      receiver_mobile: '13800000000', receiver_address: 'Delivery address', message: 'Leave at reception',
+      access_token: 'fixture-youzan-access' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('youzan', { client_id: 'fixture-youzan-client', client_secret: 'fixture-youzan-secret',
+      access_token: 'fixture-youzan-access', expires_at: Date.now() + 3600000,
+      identity: { kdt_id: '123', type: 0 } }, { kdt_id: '123' });
+    const result = await adapter.callTool('execute_read', { action, parameters: action === 'orders.get' ? { order_id: 'E20190509110527067500013' } : {} }, env);
+    expect(result.result).toEqual({ buyer_name: 'Buyer', receiver_mobile: '13800000000', receiver_address: 'Delivery address', message: 'Leave at reception' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['execute_read', 'orders.get', { order_id: 'E20190509110527067500013' }],
+    ['execute_high_impact', 'shipments.send', { order_id: 'E20250228101407093502010', payload: { tid: 'foreign-order', is_no_express: 1 } }],
+  ])('preserves official Youzan alphanumeric order identifiers for %s %s', async (tool, action, parameters) => {
+    const fetchMock = vi.fn(async () => response(200, { code: 200, success: true, data: { is_success: true } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('youzan', { client_id: 'fixture-youzan-client', client_secret: 'fixture-youzan-secret',
+      access_token: 'fixture-youzan-access', expires_at: Date.now() + 3600000,
+      identity: { kdt_id: '123', type: 0 } }, { kdt_id: '123' });
+    await adapter.callTool(tool as string, { action, parameters }, env);
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body)).tid).toBe(parameters.order_id);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('renews a store-bound Youzan token and exposes only fixed reviewed seller APIs', async () => {
@@ -1363,7 +1598,7 @@ describe('direct commerce stdio adapter', () => {
     const orders = await adapter.callTool('execute_read', {
       action: 'orders.list', parameters: { query: { page_no: 1, page_size: 20 } },
     }, env);
-    expect(JSON.stringify(orders)).not.toMatch(/Buyer Name|13800000000|Buyer address/);
+    expect(orders.result.items[0]).toMatchObject({ buyer_name: 'Buyer Name', receiver_mobile: '13800000000', receiver_address: 'Buyer address' });
     expect(JSON.stringify(orders)).toContain('安全保留的商品名');
     await adapter.callTool('execute_high_impact', {
       action: 'products.publish', parameters: { item_id: '700000001' },
@@ -1388,7 +1623,16 @@ describe('direct commerce stdio adapter', () => {
     )).toMatchObject({ access_token: 'youzan-access-new' });
   });
 
-  it('binds Weimob WOS identity, uses v2.0 fixed routes, and strips order PII', async () => {
+  it.each(['orders.list', 'orders.get', 'refunds.list', 'refunds.get'])('preserves full authorized Weimob business fields in %s while removing credentials', async action => {
+    const fetchMock = vi.fn(async () => response(200, { code: { errcode: '0' }, data: { buyer_name: 'Buyer', receiver_mobile: '13800000000', receiver_address: 'Delivery address', buyer_message: 'Deliver in the morning', access_token: 'fixture-token' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('weimob_wos', { client_id: 'fixture-app', client_secret: 'fixture-secret', access_token: 'fixture-token', expires_at: Date.now() + 3600000, identity: { business_operation_system_id: '123' } }, { shop_id: '123', shop_type: 'business_operation_system_id' });
+    const result = await adapter.callTool('execute_read', { action, parameters: { payload: {} } }, env);
+    expect(result.result).toEqual({ buyer_name: 'Buyer', receiver_mobile: '13800000000', receiver_address: 'Delivery address', buyer_message: 'Deliver in the morning' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('binds Weimob WOS identity, uses v2.0 fixed routes, and preserves fulfillment fields', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(200, { code: { errcode: '0', errmsg: 'success' }, data: {
         data: [{ vid: 6000321521837, vidName: '微盟测试店' }], pageNum: 1, pageSize: 100,
@@ -1422,7 +1666,7 @@ describe('direct commerce stdio adapter', () => {
     const orders = await adapter.callTool('execute_read', {
       action: 'orders.list', parameters: { payload: { pageNum: 1, pageSize: 20 } },
     }, env);
-    expect(JSON.stringify(orders)).not.toMatch(/Buyer Name|13800000000|Buyer address/);
+    expect(orders.result.list[0]).toMatchObject({ buyer_name: 'Buyer Name', receiver_mobile: '13800000000', receiver_address: 'Buyer address' });
     expect(JSON.stringify(orders)).toContain('安全保留的商品名');
     await adapter.callTool('execute_high_impact', {
       action: 'inventory.update', parameters: {
@@ -1485,7 +1729,7 @@ describe('direct commerce stdio adapter', () => {
     const orders = await adapter.callTool('execute_read', {
       action: 'orders.list', parameters: { query: { page_no: 1, page_size: 20 } },
     }, env);
-    expect(JSON.stringify(orders)).not.toMatch(/Buyer Name|13800000000|Buyer address/);
+    expect(orders.result).toEqual(expect.objectContaining({ packages: expect.arrayContaining([expect.objectContaining({ receiver_name: 'Buyer Name', receiver_mobile: '13800000000', receiver_address: 'Buyer address' })]) }));
     await expect(adapter.callTool('execute_read', {
       action: 'orders.export', parameters: { package_id: 'P10001' },
     }, env)).rejects.toThrow(/risk mismatch/);
@@ -1494,7 +1738,7 @@ describe('direct commerce stdio adapter', () => {
     }, env);
     expect(exported).toEqual({
       provider: 'xiaohongshu_ark', action: 'orders.export', risk: 'H',
-      result: { package_id: 'P10001', status: 'waiting' },
+      result: { package_id: 'P10001', status: 'waiting', buyer_name: 'Buyer Name', address: 'Buyer address' },
     });
     await adapter.callTool('execute_high_impact', {
       action: 'inventory.set', parameters: { item_id: 'ITEM10001', quantity: 8 },
@@ -1646,6 +1890,11 @@ describe('direct commerce stdio adapter', () => {
       provider: 'lightspeed', identity: { store_id: 'store-1' },
       actions: expect.arrayContaining([{ action: 'sales.create', risk: 'H', description: expect.any(String) }]),
     });
+    expect(adapter.LIGHTSPEED_ACTIONS['sales.delete']).toBeUndefined();
+    expect(result.actions.some((row: { action: string }) => row.action === 'sales.delete')).toBe(false);
+    expect(result.actions).toEqual(expect.arrayContaining([{ action: 'PUT /sales/{sale_id}', risk: 'D', description: expect.any(String) }]));
+    await expect(adapter.callTool('execute_destructive', { action: 'sales.delete', parameters: { id: 'sale-1' } }, env)).rejects.toThrow(/unknown action/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith(
       'https://merchant.retail.lightspeed.app/api/2.0/retailer',
       expect.objectContaining({
@@ -1795,6 +2044,20 @@ describe('direct commerce stdio adapter', () => {
       .toBe('https://mcp.instacart.com/mcp');
   });
 
+  it('describes all published Instacart page fields before a merchant submits a page', async () => {
+    const env = envFor('instacart', { api_key: 'keys.1234567890abcdef1234567890abcdef' }, { environment: 'sandbox' });
+    const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
+    const recipe = await adapter.callTool('describe_action', { action: 'recipe_page.create' }, env);
+    const shopping = await adapter.callTool('describe_action', { action: 'shopping_list_page.create' }, env);
+    // Independent published field inventories, not the runtime validator's keys.
+    expect(Object.keys(recipe.input_schema.properties.body.properties).sort()).toEqual(['author', 'content_creator_credit_info', 'cooking_time', 'expires_in', 'external_reference_id', 'image_url', 'ingredients', 'instructions', 'landing_page_configuration', 'servings', 'title']);
+    expect(Object.keys(shopping.input_schema.properties.body.properties).sort()).toEqual(['expires_in', 'image_url', 'instructions', 'landing_page_configuration', 'line_items', 'link_type', 'title']);
+    expect(Object.keys(recipe.input_schema.properties.body.properties.ingredients.items.properties).sort()).toEqual(['display_text', 'filters', 'measurements', 'name', 'product_ids', 'upcs']);
+    expect(Object.keys(shopping.input_schema.properties.body.properties.line_items.items.properties).sort()).toEqual(['display_text', 'filters', 'line_item_measurements', 'name', 'product_ids', 'quantity', 'unit', 'upcs']);
+    expect(recipe.input_schema.properties.body.properties.ingredients.items.properties.filters.properties.health_filters.items.enum).toEqual(['ORGANIC', 'GLUTEN_FREE', 'FAT_FREE', 'VEGAN', 'KOSHER', 'SUGAR_FREE', 'LOW_FAT']);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('uses only fixed Instacart shopper routes and fresh confirmation for shareable pages', async () => {
     const fetchMock = vi.fn(async (url: string) => {
       if (url.includes('/retailers?')) return response(200, { retailers: [{ retailer_key: 'market', name: 'Market' }] });
@@ -1833,6 +2096,18 @@ describe('direct commerce stdio adapter', () => {
     await expect(adapter.callTool('execute_write', {
       action: 'recipe_page.create', parameters: { body: { title: 'No', ingredients: [{ name: 'milk' }] } },
     }, env)).rejects.toThrow(/risk mismatch/);
+  });
+
+  it('requires the documented Instacart page link instead of treating an empty HTTP success as completion', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(response(200, {})).mockResolvedValueOnce(response(200, { products_link_url: '' }));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = envFor('instacart', { api_key: 'keys.1234567890abcdef1234567890abcdef' }, { environment: 'sandbox' });
+    for (const name of ['recipe_page.create', 'shopping_list_page.create']) {
+      await expect(adapter.callTool('execute_high_impact', { action: name, parameters: { body: {
+        title: 'Fixture', [name === 'recipe_page.create' ? 'ingredients' : 'line_items']: [{ name: 'milk' }],
+      } } }, env)).rejects.toMatchObject({ code: 'E_TOOL_CALL_UPSTREAM' });
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('rejects unsafe or ambiguous Instacart payloads and hides provider response bodies', async () => {

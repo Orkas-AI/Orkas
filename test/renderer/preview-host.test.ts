@@ -41,3 +41,20 @@ describe('native image history', () => {
     expect(gallery.items.map(i => i.key)).toEqual(['first', 'last']);
   });
 });
+
+describe('non-conversation image previews', () => {
+  it('does not inherit the selected chat when a todo explicitly has no conversation', async () => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const context: any = { currentCid: 'unrelated-chat', _viewerConversationIsProjectScoped: () => false,
+      window: { orkas: { invoke, onPushEvent: vi.fn() } } };
+    vm.runInNewContext(readFileSync(path.resolve(__dirname, '../../src/renderer/modules/preview-windows.js'), 'utf8'), context);
+    await context.window.OrkasPreviewWindows.image('chat-media://local/test.png', 'test.png', { cid: null, projectId: 'p_todo' });
+    expect(invoke.mock.calls[0]).toEqual(['previewWindows.open', expect.objectContaining({
+      options: { projectId: 'p_todo', projectScoped: true }, gallery: null,
+    })]);
+    await context.window.OrkasPreviewWindows.image('chat-media://local/chat.png', 'chat.png');
+    expect(invoke.mock.calls[1]).toEqual(['previewWindows.open', expect.objectContaining({
+      options: { cid: 'unrelated-chat', projectScoped: false },
+    })]);
+  });
+});

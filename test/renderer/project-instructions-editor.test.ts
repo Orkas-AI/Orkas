@@ -126,6 +126,18 @@ describe('project instructions editor', () => {
     expect(input.value).toBe('Original rules.');
   });
 
+  it('preserves an open draft when background refresh updates the saved rules', async () => {
+    const { context, elements } = mount('Original rules.');
+    context._openProjectInstructionsEditor();
+    elements['project-instructions-input'].value = 'My unsaved draft';
+    vm.runInContext('_projectDetailMeta.instructions.content = "Updated shared rules"', context);
+    context._renderProjectInstructions();
+    expect(elements['project-instructions-input'].value).toBe('My unsaved draft');
+    expect(elements['project-instructions-read'].textContent).toBe('Updated shared rules');
+    await context._closeProjectInstructionsEditor({ force: true });
+    expect(elements['project-instructions-input'].value).toBe('Updated shared rules');
+  });
+
   it('refuses to open the editor for instructions it could not load', () => {
     const { context, elements } = mount(null);
     context._openProjectInstructionsEditor();

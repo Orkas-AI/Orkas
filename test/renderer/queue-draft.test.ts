@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -63,7 +64,7 @@ function loadQueueDraft(stored = new Map<string, string>()) {
     _trackChatSendResult: vi.fn(),
     autoGrow: vi.fn(),
     setChatUseSelection: vi.fn(),
-    syncChatRichComposerFromTextarea: vi.fn(),
+    refreshChatComposer: vi.fn(),
     _chatAttachList: (cid: string) => attachmentsByCid.get(cid) || [],
     _chatAttachSet: (cid: string, items: any[]) => {
       attachmentsByCid.set(cid, items);
@@ -107,6 +108,7 @@ function loadQueueDraft(stored = new Map<string, string>()) {
     })),
   };
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
   vm.runInContext(source, context, { filename: 'queue-draft.js' });
   return {
     context,
@@ -147,6 +149,56 @@ describe('conversation draft ownership', () => {
       text: 'draft for B',
       references: [{ msg_id: 'quote-conversation-b' }],
     });
+  });
+
+  it('serializes only the latest immutable draft at flush and cancels obsolete work', () => {
+    vi.useFakeTimers();
+    const { context, stored } = loadQueueDraft();
+    const oldText = vi.fn(() => 'old text');
+    const newText = vi.fn(() => 'new text');
+    context.composerSnapshot = vi.fn()
+      .mockReturnValueOnce({ stamp: {}, text: oldText })
+      .mockReturnValueOnce({ stamp: {}, text: newText });
+    context._saveDraft('c1');
+    context._saveDraft('c1');
+    expect(oldText).not.toHaveBeenCalled();
+    expect(newText).not.toHaveBeenCalled();
+    context._flushDraftSave('c1');
+    expect(JSON.parse(stored.get('draft:c1')!)).toEqual({ text: 'new text' });
+    vi.advanceTimersByTime(1000);
+    expect(oldText).not.toHaveBeenCalled();
+    expect(newText).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears only the accepted revision even after persistence and a task switch', () => {
+    vi.useFakeTimers();
+    const { context, stored } = loadQueueDraft();
+    const oldDraft = { stamp: {}, text: () => 'same text' };
+    const newerDraft = { stamp: {}, text: () => 'same text' };
+    context.composerSnapshot = vi.fn().mockReturnValue(oldDraft);
+    context._saveDraft('c1');
+    context._flushDraftSave('c1');
+    context.composerSnapshot.mockReturnValue(newerDraft);
+    context._saveDraft('c1');
+    context._flushDraftSave('c1');
+    context.currentCid = 'c2';
+    context._discardSubmittedDraft('c1', oldDraft);
+    expect(JSON.parse(stored.get('draft:c1')!)).toEqual({ text: 'same text' });
+    context._discardSubmittedDraft('c1', newerDraft);
+    expect(stored.has('draft:c1')).toBe(false);
+  });
+
+  it('consumes a restored draft after a delayed send without requiring another keystroke', () => {
+    const stored = new Map([['draft:c1', JSON.stringify({ text: 'persisted draft' })]]);
+    const { context, input } = loadQueueDraft(stored);
+    const submitted = { stamp: {}, text: () => 'persisted draft' };
+    context.composerSnapshot = vi.fn().mockReturnValue(submitted);
+    context.currentCid = 'c1';
+    context._restoreDraft('c1');
+    expect(input.value).toBe('persisted draft');
+    context.currentCid = 'c2';
+    context._discardSubmittedDraft('c1', submitted);
+    expect(stored.has('draft:c1')).toBe(false);
   });
 
   it('does not let a pending debounce resurrect a deleted conversation draft', () => {
@@ -266,6 +318,7 @@ describe('queued message composer editing', () => {
     await context._startQueueItemEdit('c1', 'q1');
     input.value = 'my changes';
     context._saveDraft('c1');
+    context._flushDraftSave('c1'); // setView flushes before reusing the shared composer
     context.currentCid = 'c2'; input.value = 'other conversation';
     const reloaded = loadQueueDraft(stored);
     reloaded.context.currentCid = 'c1';

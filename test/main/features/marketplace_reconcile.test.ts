@@ -268,6 +268,30 @@ describe('marketplace reconcile', () => {
     });
   });
 
+  it.each(['agent', 'skill'] as const)('preserves installed %s content when the catalog explicitly rejects its download URL', async (kind) => {
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const add = kind === 'agent' ? installs.addAgentInstall : installs.addSkillInstall;
+    const urlKey = kind === 'agent' ? 'agent_json_url' : 'bundle_url';
+    const previous = { id: 'item', version: '1.0.0', published_at: 100,
+      updated_at: 100, [urlKey]: 'https://example.test/old-content', status: 'approved' };
+    await add('u1', previous);
+    postJsonMock.mockResolvedValue({ list: [{ id: 'item', version: '2.0.0',
+      published_at: 200, updated_at: 200, [urlKey]: '', status: 'archived' }], total: 1 });
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    await reconcile.checkServerUpdatesForInstalls('u1');
+    const manifest = await installs.readInstalls('u1');
+    expect(manifest[kind === 'agent' ? 'agents' : 'skills'][0]).toMatchObject({
+      ...previous, status: 'archived',
+    });
+    // An unavailable new release must remain eligible for a later valid update.
+    postJsonMock.mockResolvedValue({ list: [{ id: 'item', version: '2.0.0',
+      published_at: 200, updated_at: 200, [urlKey]: 'https://example.test/new-content', status: 'approved' }], total: 1 });
+    await reconcile.checkServerUpdatesForInstalls('u1');
+    expect((await installs.readInstalls('u1'))[kind === 'agent' ? 'agents' : 'skills'][0]).toMatchObject({
+      version: '2.0.0', [urlKey]: 'https://example.test/new-content', status: 'approved',
+    });
+  });
+
   it('ignores catalog freshness and private bundle changes without a version bump', async () => {
     postJsonMock.mockImplementation(async (p: string) => {
       if (p === '/marketplace/agents/list') {
@@ -277,6 +301,7 @@ describe('marketplace reconcile', () => {
             version: '1.0.0',
             published_at: 100,
             updated_at: 999,
+            agent_json_url: 'https://example.test/republished.json',
             agent_skills_bundle_url: 'https://example.test/private-v2.zip',
           }],
           total: 1,
@@ -285,6 +310,7 @@ describe('marketplace reconcile', () => {
       if (p === '/marketplace/skills/list') {
         return {
           list: [{
+            bundle_url: 'https://example.test/older.zip',
             id: 'skill-older',
             version: '0.9.0',
             published_at: 100,
@@ -322,12 +348,14 @@ describe('marketplace reconcile', () => {
     const manifest = await installs.readInstalls('u1');
     expect(manifest.agents[0]).toMatchObject({
       id: 'agent-private',
+      agent_json_url: 'https://example.test/agent.json',
       version: '1.0.0',
       updated_at: 100,
       agent_skills_bundle_url: 'https://example.test/private-v1.zip',
     });
     expect(manifest.skills[0]).toMatchObject({
       id: 'skill-older',
+      bundle_url: 'https://example.test/skill.zip',
       version: '1.0.0',
       updated_at: 100,
     });
@@ -1369,15 +1397,16 @@ describe('marketplace reconcile', () => {
       res.end('not found');
     });
     postJsonMock.mockImplementation(async (p: string, body: any) => {
-      if (p === '/marketplace/skills/bundle' && body?.id === 'dep-skill') {
-        return {
+      if (p === '/marketplace/skills/list' && body?.ids?.includes('dep-skill')) {
+        return { list: [{
+          id: 'dep-skill',
           bundle_url: `${base}/dep-skill.zip`,
           version: '1.0.0',
           published_at: 100,
           updated_at: 110,
           create_uid: '0',
           status: 'approved',
-        };
+        }], total: 1 };
       }
       throw new Error(`unexpected path ${p}`);
     });

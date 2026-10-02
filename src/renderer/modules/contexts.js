@@ -1786,7 +1786,7 @@ async function handleCtxNativeUpload(targetDir = '') {
   }
   let data;
   try {
-    data = await window.orkas.invoke('contexts.pickAndUpload', { targetDir });
+    data = await window.orkas.invoke(_ctxProjectId ? 'projects.files.pickAndUpload' : 'contexts.pickAndUpload', { targetDir, ...(_ctxProjectId ? { projectId: _ctxProjectId } : {}) });
   } catch (err) {
     _ctxLogUploadFailure({
       source_type: 'native',

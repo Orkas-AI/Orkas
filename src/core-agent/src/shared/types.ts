@@ -47,7 +47,7 @@ export type ToolResultContent = {
 };
 
 /** Reasoning / chain-of-thought block emitted by reasoning models.
- *  Must be round-tripped back to the API on the next turn — DeepSeek's
+ *  Must be round-tripped to its compatible issuing API on the next turn — DeepSeek's
  *  reasoner endpoints 400 with "reasoning_content in the thinking mode must
  *  be passed back" if the prior assistant turn's reasoning is dropped from
  *  history. `thinkingSignature` is opaque per-provider state: for OpenAI-
@@ -75,7 +75,17 @@ export type MessageContent = (
   | ImageContent
   | ToolUseContent
   | ToolResultContent
-  | ThinkingContent) & { googleNativeReplay?: GoogleNativeReplay };
+  | ThinkingContent) & {
+  googleNativeReplay?: GoogleNativeReplay;
+  /** Adapter-owned compatibility identity; absent in legacy JSONL.
+   * Never model input or an authorization credential. */
+  replayOrigin?: {
+    version: 1;
+    scope: string;
+    /** pi-ai's original assistant identity; optional for older saved blocks. */
+    source?: { api: string; provider: string; model: string };
+  };
+};
 
 export type MessageRole = "user" | "assistant" | "system" | "developer";
 

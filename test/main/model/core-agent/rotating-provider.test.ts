@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import { classifyTransientNetworkError } from '../../../../src/core-agent/src/shared/errors';
 import {
@@ -10,8 +10,10 @@ import {
   type RotatingCandidate,
 } from '../../../../src/main/model/core-agent/rotating-provider';
 import type { LLMProvider, StreamEvent, CompletionParams, CompletionResult } from '#core-agent';
-import { AgentRunner, createConfig, defineTool, ProviderError, ProviderRegistry } from '#core-agent';
+import { createPiProvider, AgentRunner, createConfig, defineTool, ProviderError, ProviderRegistry } from '#core-agent';
 import { _clearAll, getCooldown } from '../../../../src/main/model/core-agent/profile-cooldown';
+
+import { normalizeElectronNetFetchError } from '../../../../src/main/util/proxy-dispatcher';
 
 // ── Fake LLMProvider factory ────────────────────────────────────────────
 
@@ -395,7 +397,7 @@ describe('rotating-provider › rotatable stream failures', () => {
   });
 
   it('treats a 429 insufficient-quota response as balance exhaustion without a network retry', async () => {
-    const quotaErr = Object.assign(new Error('429 {"error":{"message":"insufficient quota","type":"insufficient_quota"}}'), { status: 429 });
+    const quotaErr = Object.assign(new Error('429 {"error":{"message":"insufficient quota","type":"insufficient_quota"}}'), { status: 429, code: 'insufficient_quota' });
     const p = createRotatingProvider({
       providerId: 'test',
       networkRetryDelayMs: () => 0,
@@ -460,7 +462,7 @@ describe('rotating-provider › rotatable stream failures', () => {
   });
 
   it('retries a fetch failure three times before moving to the next candidate', async () => {
-    const netErr = new TypeError('fetch failed');
+    const netErr = Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' });
     let p1Builds = 0;
     let p2Builds = 0;
     const p = createRotatingProvider({
@@ -537,7 +539,7 @@ describe('rotating-provider › rotatable stream failures', () => {
   });
 
   it('does not refresh the same-candidate retry budget during an AgentRunner recovery attempt', async () => {
-    const netErr = new TypeError('fetch failed');
+    const netErr = Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' });
     let primaryBuilds = 0;
     let fallbackBuilds = 0;
     const p = createRotatingProvider({
@@ -762,7 +764,7 @@ describe('rotating-provider › non-rotatable stream failures', () => {
     expect(getCooldown('p1')).toBeUndefined();
   });
 
-  it('Server retry policy can blacklist otherwise retryable pre-content errors', async () => {
+  it('legacy Server message patterns cannot suppress structured transient recovery', async () => {
     const users = await import('../../../../src/main/features/users');
     const paths = await import('../../../../src/main/paths');
     const storage = await import('../../../../src/main/storage');
@@ -788,7 +790,7 @@ describe('rotating-provider › non-rotatable stream failures', () => {
         providerId: 'test',
         networkRetryDelayMs: () => 0,
         candidates: [
-          candidate('p1', { throwBefore: new Error('custom_non_retryable') }),
+          candidate('p1', { throwBefore: Object.assign(new Error('custom_non_retryable'), { status: 503 }) }),
           {
             profileId: 'p2',
             providerId: 'test',
@@ -800,8 +802,10 @@ describe('rotating-provider › non-rotatable stream failures', () => {
           },
         ],
       });
-      await expect(collect(p.stream(PARAMS))).rejects.toThrow(/custom_non_retryable/);
-      expect(p2Called).toBe(false);
+      const events = await collect(p.stream(PARAMS));
+      expect(events.filter(event => event.type === 'retry')).toHaveLength(3);
+      expect(events.at(-1)).toMatchObject({ type: 'text_delta', text: 'ok' });
+      expect(p2Called).toBe(true);
       expect(getCooldown('p1')).toBeUndefined();
     } finally {
       fs.rmSync(path.dirname(file), { recursive: true, force: true });
@@ -1381,7 +1385,7 @@ describe('rotating-provider › exhausted stream candidates', () => {
   });
 
   it('retries each network-failing candidate and surfaces a stable exhausted error without cooldown', async () => {
-    const netErr = new TypeError('fetch failed');
+    const netErr = Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' });
     let p1Builds = 0;
     let p2Builds = 0;
     const p = createRotatingProvider({
@@ -1732,7 +1736,7 @@ describe('rotating-provider › complete calls and per-call stream policy', () =
   });
 
   it('complete does not refresh its retry budget during an AgentRunner recovery attempt', async () => {
-    const netErr = new TypeError('fetch failed');
+    const netErr = Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' });
     let primaryBuilds = 0;
     let fallbackBuilds = 0;
     const p = createRotatingProvider({
@@ -1857,7 +1861,7 @@ describe('rotating-provider › complete calls and per-call stream policy', () =
             completionCalls += 1;
             if (completionCalls === 1) {
               firstAttemptFailed.resolve();
-              throw new TypeError('fetch failed');
+              throw Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' });
             }
             return { content: [], stopReason: 'end_turn' } as any;
           },
@@ -2013,7 +2017,7 @@ it('latches a network-exhausted candidate out of later model rounds once a fallb
     // candidate-specific way (e.g. its fetch path ignores the proxy) re-pays
     // the full timeout/retry ladder on every remaining round of the turn
     // before reaching the fallback that actually serves the reply.
-    const netErr = new TypeError('fetch failed');
+    const netErr = Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' });
     let p1Builds = 0;
     let p2Builds = 0;
     const p = createRotatingProvider({
@@ -2058,7 +2062,7 @@ it('does not latch anything when every candidate fails network-class, so recover
     // this provider instance and swallows the exhausted error, so a transient
     // machine-local outage must leave the next call free to retry every
     // candidate. Only a sweep where a later candidate commits may latch.
-    const netErr = new TypeError('fetch failed');
+    const netErr = Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' });
     let p1Builds = 0;
     let p2Builds = 0;
     let blip = true;
@@ -2173,7 +2177,7 @@ it('complete() latches a network-exhausted candidate after a fallback succeeds, 
     // Equivalent-path invariant with stream(): auxiliary complete() callers
     // repeat within one run too, and must not re-pay a dead candidate's
     // retry ladder once a fallback has proven the failure candidate-specific.
-    const netErr = new TypeError('fetch failed');
+    const netErr = Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' });
     let p1Builds = 0;
     let p2Builds = 0;
     const okResult = { content: [{ type: 'text', text: 'ok' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, model: 'test' };
@@ -2229,4 +2233,173 @@ it('applies image limits to native tool-result images without mutating their rec
     expect(limited.at(-1)?.role).toBe('developer');
     expect(JSON.stringify(boundMessagesForImageLimit(messages, 0))).not.toContain('"data"');
     expect(messages).toEqual(before);
+  });
+
+describe('structured HTTP retry policy through the real SDK', () => {
+  it.each(['Upstream access forbidden, please contact administrator', 'invalid_request', '服务暂时不可用', ''])
+  ('recovers a 502 with the same bounded candidate sequence regardless of message: %s', async message => {
+    _clearAll();
+    const requests: string[] = [];
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchStub = vi.fn(async (input: string | URL | Request) => {
+      const endpoint = String(input);
+      requests.push(endpoint.includes('primary.invalid') ? 'primary' : 'fallback');
+      if (endpoint.includes('primary.invalid')) return new Response(JSON.stringify({
+        error: { type: 'upstream_error', message },
+      }), { status: 502, headers: { 'content-type': 'application/json' } });
+      return new Response('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: 'recovered' }, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n', {
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchStub);
+    try {
+      const provider = createRotatingProvider({
+        providerId: 'custom', networkRetryDelayMs: () => 0,
+        candidates: ['primary', 'fallback'].map(name => ({
+          profileId: name, providerId: 'custom', modelId: 'fixture',
+          build: async () => createPiProvider({ provider: 'custom', apiKey: 'fixture', customModel: {
+            id: 'fixture', name: 'fixture', provider: 'custom', api: 'openai-completions',
+            baseUrl: `https://${name}.invalid/v1`, reasoning: false, input: ['text'],
+            contextWindow: 128000, maxTokens: 4096,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          } }),
+        })),
+      });
+      const events = await collect(provider.stream({ ...PARAMS, model: 'fixture' }));
+      expect(requests).toEqual(['primary', 'primary', 'primary', 'primary', 'fallback']);
+      expect(events.filter(event => event.type === 'retry')).toHaveLength(3);
+      expect(events.some(event => event.type === 'text_delta' && event.text === 'recovered')).toBe(true);
+      expect(events.filter(event => event.type === 'message_end')).toHaveLength(1);
+      expect(getCooldown('primary')).toBeUndefined();
+      expect(getCooldown('fallback')).toBeUndefined();
+      // Expected HTTP failures are redacted diagnostic facts, never body text.
+      expect(warning.mock.calls).toHaveLength(4);
+      expect(JSON.stringify(warning.mock.calls)).not.toContain('administrator');
+    } finally { vi.unstubAllGlobals(); warning.mockRestore(); }
+  });
+});
+
+// Real SDK flattening must not turn an explicit rejection into network retries.
+describe('structured stream rejection through the real SDK', () => {
+  it.each(['complete', 'stream'] as const)('stops rejected requests and retains transient recovery in %s', async method => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      for (const api of ['openai-responses', 'openai-completions'] as const) {
+        for (const status of [400, 503]) {
+          _clearAll();
+          const requests: string[] = [];
+          vi.stubGlobal('fetch', vi.fn(async (_input, init) => {
+            requests.push(String(init?.body));
+            const error = { code: status === 400 ? 'invalid_request_error' : 'upstream_error', status,
+              message: 'Synthetic diagnostic including misleading 401 invalid_api_key' };
+            const body = api === 'openai-responses'
+              ? 'event: error\ndata: ' + JSON.stringify({ ...error, type: 'error' }) + '\n\n'
+              : 'data: ' + JSON.stringify({ error }) + '\n\ndata: [DONE]\n\n';
+            return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+          }));
+          const provider = createRotatingProvider({
+            providerId: 'custom', networkRetryDelayMs: () => 0,
+            candidates: [{ profileId: 'stream-rejection', providerId: 'custom', modelId: 'fixture',
+              build: async () => createPiProvider({ provider: 'custom', apiKey: 'fixture', customModel: {
+                id: 'fixture', name: 'fixture', api, provider: 'custom', baseUrl: 'https://fixture.invalid/v1',
+                reasoning: false, input: ['text'], contextWindow: 128000, maxTokens: 4096,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              } }),
+            }],
+          });
+          if (method === 'complete') await expect(provider.complete({ ...PARAMS, model: 'fixture' })).rejects.toThrow();
+          else {
+            const events: any[] = [];
+            const run = async () => { for await (const event of provider.stream({ ...PARAMS, model: 'fixture' })) events.push(event); };
+            await expect(run()).rejects.toThrow();
+            expect(events.filter(event => event.type === 'message_end')).toHaveLength(0);
+            expect(events.filter(event => event.type === 'retry')).toHaveLength(status === 400 ? 0 : 3);
+          }
+          expect(requests).toHaveLength(status === 400 ? 1 : 4);
+          expect(new Set(requests).size).toBe(1);
+          expect(getCooldown('stream-rejection')).toBeUndefined();
+        }
+      }
+      expect(warning.mock.calls.length).toBeGreaterThan(0);
+      expect(JSON.stringify(warning.mock.calls)).not.toContain('misleading');
+    } finally { vi.unstubAllGlobals(); warning.mockRestore(); _clearAll(); }
+  });
+});
+
+it('continues a real SDK tool round on a configured fallback without foreign ciphertext or a duplicate write', async () => {
+  _clearAll();
+  const wire: any[] = [];
+  let writes = 0;
+  const sse = (items: any[]) => {
+    const events: any[] = items.flatMap((item, output_index) => [
+      { type: 'response.output_item.added', output_index, item },
+      { type: 'response.output_item.done', output_index, item },
+    ]);
+    events.push({ type: 'response.completed', response: { id: 'resp_fixture', status: 'completed', output: items,
+      usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } } });
+    return new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''),
+      { headers: { 'content-type': 'text/event-stream' } });
+  };
+  const fetch = vi.fn(async (_url: unknown, init: any) => {
+    const payload = JSON.parse(init.body);
+    wire.push(payload);
+    if (wire.length === 1) return sse([
+      { type: 'reasoning', id: 'rs_fixture', status: 'completed', summary: [], encrypted_content: 'source-private-state' },
+      { type: 'function_call', id: 'fc_fixture', call_id: 'call_fixture', name: 'write_once', arguments: '{}' },
+    ]);
+    if (wire.length === 2) return new Response('{"error":{"type":"authentication_error","code":"invalid_api_key"}}',
+      { status: 401, headers: { 'content-type': 'application/json' } });
+    expect(payload.model).toBe('model-b');
+    expect(payload.input.some((i: any) => i.type === 'reasoning')).toBe(false);
+    expect(payload.input.filter((i: any) => i.type === 'function_call_output')).toEqual([
+      { type: 'function_call_output', call_id: 'call_fixture', output: 'saved-record-42' },
+    ]);
+    return sse([{ type: 'message', id: 'msg_fixture', role: 'assistant', status: 'completed',
+      content: [{ type: 'output_text', text: 'Saved once.', annotations: [] }] }]);
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetch;
+  try {
+    const rotating = createRotatingProvider({ providerId: 'mock', candidates: ['a', 'b'].map(id => ({
+      profileId: `replay-${id}`, providerId: 'openai', modelId: `model-${id}`,
+      build: async () => createPiProvider({ provider: 'openai', apiKey: `key-${id}`, customModel: {
+        api: 'openai-responses', provider: 'openai', id: `model-${id}`, name: 'fixture',
+        baseUrl: `https://${id}.invalid/v1`, reasoning: true, input: ['text'],
+        contextWindow: 128000, maxTokens: 1000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      } }),
+    })) });
+    const registry = new ProviderRegistry();
+    registry.registerFactory('mock', () => rotating);
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'model-a' } }),
+      providers: registry, evolution: { enabled: false },
+      tools: [defineTool({ name: 'write_once', description: 'Save fixture',
+        inputSchema: { type: 'object', properties: {} },
+        async execute() { writes++; return { content: 'saved-record-42' }; },
+      })],
+    });
+    const result = await runner.run({ message: 'Save the record and report the result.' });
+    expect(result.text).toBe('Saved once.');
+    expect(writes).toBe(1);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(wire[1].input.find((i: any) => i.type === 'reasoning')).toEqual({
+      type: 'reasoning', id: 'rs_fixture', summary: [], encrypted_content: 'source-private-state',
+    });
+  } finally { globalThis.fetch = originalFetch; _clearAll(); }
+});
+
+  it('reports a message-only Electron proxy outage as network exhaustion', async () => {
+    const transportError = normalizeElectronNetFetchError(new Error('net::ERR_PROXY_CONNECTION_FAILED'));
+    const p = createRotatingProvider({
+      providerId: 'test',
+      networkRetryDelayMs: () => 0,
+      networkRetryAttempts: 1,
+      candidates: [candidate('p1', { throwBefore: transportError })],
+    });
+
+    await expect(collect(p.stream(PARAMS))).rejects.toMatchObject({
+      code: 'PROVIDER_NETWORK_EXHAUSTED',
+      cause: transportError,
+    });
+    expect(getCooldown('p1')).toBeUndefined();
   });

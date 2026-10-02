@@ -1,3 +1,4 @@
+import { composerText, expectComposerText } from './fixtures/composer';
 import { expect, test } from './fixtures/orkas';
 
 test.describe('conversations and resource picker', () => {
@@ -21,7 +22,7 @@ test.describe('conversations and resource picker', () => {
     await expect(page.locator('#new-chat-recipient-name')).toHaveText(agentName);
     // The pick inserted `@Agent ` into the composer; the task text follows it.
     const input = page.locator('#new-chat-input');
-    await input.fill(`${await input.inputValue()}${taskText}`);
+    await input.fill(`${await composerText(input)}${taskText}`);
     await page.locator('#new-chat-send-btn').click();
 
     await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
@@ -254,27 +255,26 @@ test.describe('conversations and resource picker', () => {
 
     await page.evaluate(({ firstCid, secondCid }) => {
       const w = window as any;
-      const input = document.getElementById('chat-input') as HTMLTextAreaElement;
+      const input = document.getElementById('chat-input') as HTMLDivElement;
       w.setView('conversation', firstCid);
-      input.value = 'draft owned by conversation A';
-      input.dispatchEvent(new Event('input', { bubbles: true }));
+      const view = w._composerApi(input).view;
+      view.dispatch(view.state.tr.insertText('draft owned by conversation A'));
       // Switch before the 180 ms draft debounce fires, then type in B.
       w.setView('conversation', secondCid);
-      input.value = 'draft owned by conversation B';
-      input.dispatchEvent(new Event('input', { bubbles: true }));
+      view.dispatch(view.state.tr.insertText('draft owned by conversation B'));
     }, { firstCid, secondCid });
     await page.waitForTimeout(250);
 
     await page.evaluate((cid) => (window as any).setView('conversation', cid), firstCid);
-    await expect(page.locator('#chat-input')).toHaveValue('draft owned by conversation A');
+    await expectComposerText(page.locator('#chat-input'), 'draft owned by conversation A');
     await page.evaluate((cid) => (window as any).setView('conversation', cid), secondCid);
-    await expect(page.locator('#chat-input')).toHaveValue('draft owned by conversation B');
+    await expectComposerText(page.locator('#chat-input'), 'draft owned by conversation B');
 
     const relaunchedPage = await orkas.relaunch();
     await relaunchedPage.evaluate((cid) => (window as any).setView('conversation', cid), firstCid);
-    await expect(relaunchedPage.locator('#chat-input')).toHaveValue('draft owned by conversation A');
+    await expectComposerText(relaunchedPage.locator('#chat-input'), 'draft owned by conversation A');
     await relaunchedPage.evaluate((cid) => (window as any).setView('conversation', cid), secondCid);
-    await expect(relaunchedPage.locator('#chat-input')).toHaveValue('draft owned by conversation B');
+    await expectComposerText(relaunchedPage.locator('#chat-input'), 'draft owned by conversation B');
   });
 
   test('selects a shipped agent, custom skills, and Library files from the composer picker', async ({ orkas }) => {
@@ -311,9 +311,10 @@ test.describe('conversations and resource picker', () => {
     await picker.locator('[data-agent-picker-tab="skills"]').click();
     await picker.locator('.skill-picker-item[data-kind="skill"]', { hasText: 'picker-e2e-skill' }).click();
     const composerInput = page.locator('#new-chat-input');
-    await expect(composerInput).toHaveValue(/Skill: picker-e2e-skill/);
-    await composerInput.fill('');
-    await expect(composerInput).not.toHaveValue(/picker-e2e-skill/);
+    await expectComposerText(composerInput, /Skill: picker-e2e-skill/);
+    await composerInput.press('ControlOrMeta+A');
+    await composerInput.press('Backspace');
+    await expect.poll(() => composerText(composerInput)).not.toMatch(/picker-e2e-skill/);
 
     await page.locator('#new-chat-recipient-chip').click();
     await picker.locator('[data-agent-picker-tab="library"]').click();

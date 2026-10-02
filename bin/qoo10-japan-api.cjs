@@ -4,10 +4,19 @@
 // POST keeps the seller certification key out of URLs, including for read methods.
 const crypto = require('node:crypto');
 const { requestFetch, requestFailureCode, httpFailureCode } = require('./commerce-request-context.cjs');
-const { validate, readBody, safeOutput } = require('./storefront-admin-api.cjs');
+const { validate, readBody } = require('./storefront-admin-api.cjs');
 const BASE = 'https://api.qoo10.jp/GMKT.INC.Front.QAPIService/ebayjapan.qapi';
 const isProvider = provider => provider === 'qoo10_japan';
 const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
+const credentialKeys = new Set(['token', 'accesstoken', 'refreshtoken', 'certificationkey', 'giosiscertificationkey', 'secret', 'clientsecret', 'authorization', 'password', 'cookie']);
+function safeOutput(value, token) {
+  if (typeof value === 'string') return value.split(token).join('[redacted]');
+  if (Array.isArray(value)) return value.map(child => safeOutput(child, token));
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !credentialKeys.has(key.replace(/[_-]/g, '').toLowerCase()))
+    .map(([key, child]) => [key, safeOutput(child, token)]));
+}
 function apiBase(provider, metadata) {
   if (!isProvider(provider) || !metadata || Object.keys(metadata).length) fail('E_BAD_INPUT', 'Invalid Qoo10 Japan binding');
   return BASE;
@@ -58,16 +67,13 @@ function actionsFor() {
       { status: { type: 'string', minLength: 2, maxLength: 2, pattern: '^S[012358]$', description: 'S0 pending, S1 seller-stopped, S2 selling, S3 platform-stopped, S5 restricted, S8 rejected.' }, page: { type: 'integer', minimum: 1, maximum: 100000 } }, ['status']),
     'products.get': action('R', 'Read one Qoo10 product by platform item code.', { item_code: item }, ['item_code']),
     'inventory.get': action('R', 'Read the combination options and their absolute stock quantities for one product.', { item_code: item }, ['item_code']),
-    'orders.list': action('R', 'Read one Japan calendar day of orders, excluding buyer, recipient and payment details. By default only pending shipping states 1–3 are returned; select 4 for shipped or 5 for delivered. Large responses fail explicitly; no silent truncation.',
+    'orders.list': action('R', 'Read one Japan calendar day of orders with complete available fulfillment fields. By default only pending shipping states 1–3 are returned; select 4 for shipped or 5 for delivered. Large responses fail explicitly; no silent truncation.',
       { day, shipping_status: { type: 'string', enum: ['1', '2', '3', '4', '5'], description: '1 awaiting shipment, 2 shipping requested, 3 preparing, 4 shipped, 5 delivered. Omitted returns 1–3.' } }, ['day']),
     'inventory.set': action('H', 'Replace one existing combination option stock quantity. Use the exact option names, values and code from the shop. Never automatically retry an uncertain update.',
       { item_code: item, option_name: { ...text, maxLength: 50 }, option_value: text, option_code: text,
         quantity: { type: 'integer', minimum: 0, maximum: 2147483647 } }, ['item_code', 'option_name', 'option_value', 'option_code', 'quantity']),
   };
 }
-const ORDER_KEYS = new Set(['shippingStatus', 'packNo', 'orderDate', 'PaymentDate', 'EstShippingDate', 'ShippingDate', 'DeliveredDate',
-  'OrderType', 'orderNo', 'itemCode', 'sellerItemCode', 'itemTitle', 'optionCode', 'orderPrice', 'orderQty', 'discount', 'total',
-  'SellerDiscount', 'Currency', 'ShippingRate', 'shippingRateType', 'cod_price', 'Cart_Discount_Seller', 'Cart_Discount_Qoo10', 'SettlePrice']);
 async function execute(config, name, parameters = {}) {
   validateBinding(config);
   const spec = actionsFor()[name];
@@ -92,7 +98,6 @@ async function execute(config, name, parameters = {}) {
   if (name === 'products.list') {
     if (!Array.isArray(data?.Items) || !Number.isSafeInteger(data.TotalPages) || !Number.isSafeInteger(data.TotalItems)) fail('E_TOOL_CALL_UPSTREAM', 'Qoo10 product pagination is missing');
   } else if (!Array.isArray(data)) fail('E_TOOL_CALL_UPSTREAM', 'Qoo10 returned an incomplete list');
-  if (name === 'orders.list') data = data.map(row => Object.fromEntries(Object.entries(row).filter(([key]) => ORDER_KEYS.has(key))));
   return { data: safeOutput(data, config.credentials.certification_key),
     ...(name === 'orders.list' ? { shipping_status: p.shipping_status || '1-3' } : {}) };
 }

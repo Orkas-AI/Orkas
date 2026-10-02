@@ -57,7 +57,14 @@ describe('Chat Completions root-schema compatibility through the real SDK', () =
       const request = { model: 'schema-test', messages, tools: definitions() };
       const response = await provider.complete(request);
       const call = response.content.find(item => item.type === 'tool_use');
-      expect(call).toEqual({ type: 'tool_use', id: 'call_fixture', name: 'tool_result', input });
+      expect(call).toEqual({
+        type: 'tool_use', id: 'call_fixture', name: 'tool_result', input,
+        replayOrigin: {
+          version: 1,
+          scope: expect.stringMatching(/^[a-f0-9]{64}$/),
+          source: { api: 'openai-completions', model: 'schema-test', provider: 'custom' },
+        },
+      });
       if (!call || call.type !== 'tool_use') throw new Error('Expected executable tool call');
       const result = await tool.execute(call.input, { state: {} });
       expect(result.isError).toBeFalsy();

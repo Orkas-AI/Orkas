@@ -485,7 +485,13 @@ describe('kb-tools › shape', () => {
     expect(missingAction.isError).toBe(true);
     expect(missingAction.content).toContain('`action`');
     expect(crossActionField.isError).toBeFalsy();
+    expect(crossActionField.content).toContain('ignored_fields: ["query"]');
     expect(crossActionField.content).toContain('alpha content');
     expect(crossActionField.content).toContain('second chunk body');
+
+    const listed = await library.execute({ action: 'list', chunk: 2, window: 1 }, ctxFor());
+    expect(listed.isError).toBeFalsy();
+    expect(listed.content).toContain('ignored_fields: ["chunk","window"]');
+    expect(listed.content).toContain('Library files');
   });
 });

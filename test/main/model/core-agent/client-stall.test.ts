@@ -13,6 +13,7 @@ import * as path from 'node:path';
 // bus worker can run its finally and accept the next message.
 
 const h = vi.hoisted(() => ({
+  powerCallbacks: new Map<string, () => void>(),
   makeStream: null as null | (() => AsyncGenerator),
   buildError: null as Error | null,
   lastBuildRunnerParams: null as null | Record<string, unknown>,
@@ -32,6 +33,7 @@ vi.mock('../../../../src/main/logger', () => ({
 
 vi.mock('electron', () => ({
   app: { isPackaged: false },
+  powerMonitor: { on: (event: string, callback: () => void) => h.powerCallbacks.set(event, callback) },
   BrowserWindow: vi.fn(),
   dialog: {},
   shell: {},
@@ -1091,4 +1093,314 @@ describe('streamChatWithModel — post-run ephemeral session eviction', () => {
     expect(healIdx).toBeGreaterThanOrEqual(0);
     expect(evictIdx).toBeGreaterThan(healIdx);
   }, 8000);
+});
+
+
+// All host actors share this entry; sleep must preserve each phase's allowance.
+it.each([
+  ['gconv-sleep', 'provider_wait', 1000],
+  ['gmember-sleep', 'model_text', 1000],
+  ['gworker-sleep', 'tool_input', 1000],
+  ['agent-sleep', 'tool', 1150],
+] as const)('excludes OS suspension for %s in %s and retains the remaining idle allowance', async (sessionId, phase, windowMs) => {
+  await import('../../../../src/main/model/core-agent/client');
+  const { getAgentIdleClock } = await import('../../../../src/main/util/system-activity');
+  vi.useFakeTimers();
+  const awakeNow = await getAgentIdleClock();
+  h.makeStream = async function* () {
+    if (phase === 'model_text') yield { type: 'text_delta', text: 'partial' };
+    if (phase === 'tool_input') yield { type: 'tool_delta', id: 'sleep-call', delta: '{' };
+    if (phase === 'tool') yield { type: 'tool_start', id: 'sleep-call', name: 'bash', input: {} };
+    await new Promise(() => {});
+  };
+  const controller = new AbortController();
+  let ended = false;
+  const result = drain({ sessionId, idleTimeout: 1, abortSignal: controller.signal }).then(value => { ended = true; return value; });
+  try {
+    await vi.advanceTimersByTimeAsync(200);
+    expect(h.runStreamCalls).toBe(1);
+    const beforeSleep = awakeNow();
+    h.powerCallbacks.get('suspend')!();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(awakeNow()).toBe(beforeSleep);
+    expect(ended).toBe(false);
+    h.powerCallbacks.get('resume')!();
+    await vi.advanceTimersByTimeAsync(windowMs - 201);
+    expect(ended).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ended).toBe(true);
+    const { events } = await result;
+    expect(events.filter(event => event.type === 'error')).toEqual([
+      expect.objectContaining({ failureCode: 'idle_timeout', failurePhase: phase }),
+    ]);
+    expect(h.lastBuildRunnerParams?.idleNow).toBe(awakeNow);
+    expect(h.runStreamCalls).toBe(1);
+  } finally {
+    h.powerCallbacks.get('resume')!();
+    controller.abort();
+    await result;
+  }
+});
+
+it.each(['cancel', 'wall'] as const)('retains %s termination while the OS sleep clock is frozen', async (terminal) => {
+  await import('../../../../src/main/model/core-agent/client');
+  const { getAgentIdleClock } = await import('../../../../src/main/util/system-activity');
+  vi.useFakeTimers();
+  await getAgentIdleClock();
+  h.makeStream = async function* () { await new Promise(() => {}); };
+  const controller = new AbortController();
+  const result = drain({ idleTimeout: 1, abortSignal: controller.signal,
+    ...(terminal === 'wall' ? { executionDeadlineAt: Date.now() + 2000 } : {}) });
+  try {
+    await vi.advanceTimersByTimeAsync(200);
+    h.powerCallbacks.get('suspend')!();
+    if (terminal === 'cancel') controller.abort();
+    await vi.advanceTimersByTimeAsync(1800);
+    const { events } = await result;
+    expect(events.filter(event => event.type === 'error')).toEqual([
+      expect.objectContaining(terminal === 'cancel' ? { aborted: true } : { failureCode: 'execution_wall_timeout' }),
+    ]);
+    expect(h.runStreamCalls).toBe(1);
+  } finally { h.powerCallbacks.get('resume')!(); controller.abort(); await result; }
+});
+
+// Drive observable provider/tool events without making elapsed time emit progress.
+function controlledRawEvents() {
+  const queue: import('#core-agent').AgentRunEvent[] = [];
+  let wake: (() => void) | undefined;
+  let closed = false;
+  return {
+    push(...events: import('#core-agent').AgentRunEvent[]) { queue.push(...events); wake?.(); },
+    close() { closed = true; wake?.(); },
+    async *stream() {
+      while (!closed) {
+        if (!queue.length) await new Promise<void>(resolve => { wake = resolve; });
+        while (queue.length && !closed) yield queue.shift()!;
+      }
+    },
+  };
+}
+
+async function prepareSleepCase() {
+  await import('../../../../src/main/model/core-agent/client');
+  const { getAgentIdleClock } = await import('../../../../src/main/util/system-activity');
+  vi.useFakeTimers();
+  await getAgentIdleClock();
+  return {
+    suspend: () => h.powerCallbacks.get('suspend')!(),
+    resume: () => h.powerCallbacks.get('resume')!(),
+  };
+}
+
+it('isolates concurrent Agent idle allowances across sleep and releases both sessions for new work', async () => {
+  const power = await prepareSleepCase();
+  const channels = [controlledRawEvents(), controlledRawEvents()];
+  let next = 0;
+  h.makeStream = () => channels[next++].stream();
+  const controller = new AbortController();
+  const ended = [false, false];
+  const runs = channels.map((_, index) => drain({ sessionId: `gmember-concurrent-${index}`, idleTimeout: 1, abortSignal: controller.signal })
+    .then(result => { ended[index] = true; return result; }));
+  try {
+    await vi.advanceTimersByTimeAsync(200);
+    expect(h.runStreamCalls).toBe(2);
+    power.suspend();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ended).toEqual([false, false]);
+    power.resume();
+    channels[0].push({ type: 'text_delta', text: 'New result' });
+    await vi.advanceTimersByTimeAsync(799);
+    expect(ended).toEqual([false, false]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ended).toEqual([false, true]);
+    await vi.advanceTimersByTimeAsync(199);
+    expect(ended[0]).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ended).toEqual([true, true]);
+    const results = await Promise.all(runs);
+    expect(results.map(result => result.events.filter(event => event.type === 'error'))).toEqual([
+      [expect.objectContaining({ failureCode: 'idle_timeout', failurePhase: 'model_text' })],
+      [expect.objectContaining({ failureCode: 'idle_timeout', failurePhase: 'provider_wait' })],
+    ]);
+    h.makeStream = async function* () { yield completedEvent('fresh work'); };
+    for (const index of [0, 1]) {
+      const result = await drain({ sessionId: `gmember-concurrent-${index}`, idleTimeout: 1 });
+      expect(result.events.filter(event => event.type === 'error')).toEqual([]);
+      expect(result.events.find(event => event.type === 'final')).toMatchObject({ text: 'fresh work' });
+    }
+    expect(h.runStreamCalls).toBe(4);
+    expect(h.logEntries.filter(entry => entry.level === 'error')).toEqual([]);
+    expect(h.logEntries.filter(entry => entry.level === 'warn').map(entry => entry.message)).toEqual([
+      'idle-watchdog fired; aborting and releasing locks', 'idle-watchdog fired; aborting and releasing locks',
+    ]);
+  } finally { power.resume(); controller.abort(); channels.forEach(channel => channel.close()); await Promise.all(runs); }
+});
+
+it('renews only substantive tool progress across repeated sleep and ignores later UI heartbeats', async () => {
+  const power = await prepareSleepCase();
+  const channel = controlledRawEvents();
+  channel.push({ type: 'tool_start', id: 'work', name: 'bash', input: {} });
+  h.makeStream = () => channel.stream();
+  const controller = new AbortController();
+  let ended = false;
+  const run = drain({ idleTimeout: 1, abortSignal: controller.signal }).then(value => { ended = true; return value; });
+  try {
+    await vi.advanceTimersByTimeAsync(400);
+    power.suspend(); power.suspend();
+    await vi.advanceTimersByTimeAsync(5000);
+    power.resume(); power.resume();
+    expect(ended).toBe(false);
+    channel.push({ type: 'tool_progress', id: 'work', name: 'bash', message: 'Saved a result' });
+    await vi.advanceTimersByTimeAsync(500);
+    // Resume arrives before the old timer is delivered this time.
+    power.suspend(); vi.setSystemTime(Date.now() + 5000); power.resume();
+    channel.push({ type: 'tool_progress', id: 'work', name: 'bash', message: 'Still running', data: { heartbeat: true } });
+    await vi.advanceTimersByTimeAsync(649);
+    expect(ended).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ended).toBe(true);
+    const { events } = await run;
+    expect(events.filter(event => event.type === 'error')).toEqual([
+      expect.objectContaining({ failureCode: 'idle_timeout', failurePhase: 'tool' }),
+    ]);
+    expect(h.runStreamCalls).toBe(1);
+    expect(h.logEntries.filter(entry => entry.level === 'error')).toEqual([]);
+    expect(h.logEntries.filter(entry => entry.level === 'warn').map(entry => entry.message))
+      .toEqual(['idle-watchdog fired; aborting and releasing locks']);
+  } finally { power.resume(); controller.abort(); channel.close(); await run; }
+});
+
+it('keeps overlapping user waits paused through sleep until the last tool resumes', async () => {
+  const power = await prepareSleepCase();
+  const channel = controlledRawEvents();
+  for (const id of ['first', 'second']) channel.push(
+    { type: 'tool_start', id, name: 'bash', input: {} },
+    { type: 'tool_progress', id, name: 'bash', message: 'Waiting for input', data: { heartbeat: true, userAction: true } },
+  );
+  h.makeStream = () => channel.stream();
+  const controller = new AbortController();
+  let ended = false;
+  const run = drain({ idleTimeout: 1, abortSignal: controller.signal }).then(value => { ended = true; return value; });
+  try {
+    await vi.advanceTimersByTimeAsync(200);
+    power.suspend(); await vi.advanceTimersByTimeAsync(5000); power.resume();
+    channel.push({ type: 'tool_progress', id: 'first', name: 'bash', message: 'Running', data: { heartbeat: true } });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(ended).toBe(false);
+    channel.push({ type: 'tool_progress', id: 'second', name: 'bash', message: 'Running', data: { heartbeat: true } });
+    await vi.advanceTimersByTimeAsync(1149);
+    expect(ended).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ended).toBe(true);
+    const { events } = await run;
+    expect(events.filter(event => event.type === 'error')).toEqual([
+      expect.objectContaining({ failureCode: 'idle_timeout', failurePhase: 'tool' }),
+    ]);
+    expect(h.runStreamCalls).toBe(1);
+    expect(h.logEntries.filter(entry => entry.level === 'error')).toEqual([]);
+    expect(h.logEntries.filter(entry => entry.level === 'warn').map(entry => entry.message))
+      .toEqual(['idle-watchdog fired; aborting and releasing locks']);
+  } finally { power.resume(); controller.abort(); channel.close(); await run; }
+});
+
+it('hands timeout ownership back from mixed tools to delegation and then to the provider after sleep', async () => {
+  const power = await prepareSleepCase();
+  const channel = controlledRawEvents();
+  channel.push(
+    { type: 'tool_start', id: 'child', name: 'run_worker', input: {}, executionTimeoutOwner: 'executor' },
+    { type: 'tool_start', id: 'ordinary', name: 'bash', input: {} },
+  );
+  h.makeStream = () => channel.stream();
+  const controller = new AbortController();
+  let ended = false;
+  const run = drain({ idleTimeout: 1, abortSignal: controller.signal }).then(value => { ended = true; return value; });
+  try {
+    await vi.advanceTimersByTimeAsync(200);
+    power.suspend(); await vi.advanceTimersByTimeAsync(5000); power.resume();
+    expect(ended).toBe(false);
+    channel.push({ type: 'tool_end', id: 'ordinary', name: 'bash', result: 'done', isError: false });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(ended).toBe(false);
+    channel.push({ type: 'tool_end', id: 'child', name: 'run_worker', result: 'done', isError: false });
+    await vi.advanceTimersByTimeAsync(999);
+    expect(ended).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ended).toBe(true);
+    const { events } = await run;
+    expect(events.filter(event => event.type === 'error')).toEqual([
+      expect.objectContaining({ failureCode: 'idle_timeout', failurePhase: 'provider_wait' }),
+    ]);
+    expect(h.runStreamCalls).toBe(1);
+    expect(h.logEntries.filter(entry => entry.level === 'error')).toEqual([]);
+    expect(h.logEntries.filter(entry => entry.level === 'warn').map(entry => entry.message))
+      .toEqual(['idle-watchdog fired; aborting and releasing locks']);
+  } finally { power.resume(); controller.abort(); channel.close(); await run; }
+});
+
+it('lets the real inner tool watchdog recover after sleep before the host backstop can terminate the turn', async () => {
+  const power = await prepareSleepCase();
+  const { AgentRunner, ProviderRegistry, createConfig, defineTool } = await import('#core-agent');
+  let started!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  const requests: import('#core-agent').Message[][] = [];
+  const provider: import('#core-agent').LLMProvider = {
+    id: 'mock', name: 'Mock', async validateAuth() { return true; },
+    async complete() { throw new Error('Unexpected completion'); },
+    async *stream(params) {
+      requests.push(structuredClone(params.messages));
+      const content: import('#core-agent').MessageContent[] = requests.length === 1
+        ? [{ type: 'tool_use', id: 'wedged', name: 'sleep_tool', input: {} }]
+        : [{ type: 'text', text: 'Reported the tool failure' }];
+      yield { type: 'message_start' };
+      yield { type: 'message_end', content, stopReason: requests.length === 1 ? 'tool_use' : 'end_turn',
+        model: 'mock-model', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+    },
+  };
+  const providers = new ProviderRegistry();
+  providers.registerFactory('mock', () => provider);
+  let toolSignal: AbortSignal | undefined;
+  const execute = vi.fn(async (_input, ctx: import('#core-agent').ToolContext) => {
+    toolSignal = ctx.signal;
+    started();
+    return await new Promise<import('#core-agent').ToolResult>((_resolve, reject) => {
+      ctx.signal?.addEventListener('abort', () => reject(new Error('fixture tool cancelled')), { once: true });
+    });
+  });
+  const rawEvents: import('#core-agent').AgentRunEvent[] = [];
+  h.makeStream = async function* () {
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'mock-model', toolIdleTimeoutMs: h.lastBuildRunnerParams?.toolIdleTimeoutMs as number } }),
+      providers, idleNow: h.lastBuildRunnerParams?.idleNow as () => number,
+      tools: [defineTool({ name: 'sleep_tool', description: 'Controlled unresponsive tool', inputSchema: { type: 'object' }, execute })],
+    });
+    for await (const event of runner.runStream({ message: 'Run once', signal: h.lastRunStreamParams?.signal as AbortSignal })) {
+      rawEvents.push(event); yield event;
+    }
+  };
+  const controller = new AbortController();
+  const run = drain({ idleTimeout: 1, abortSignal: controller.signal });
+  try {
+    await ready;
+    await vi.advanceTimersByTimeAsync(200);
+    power.suspend(); await vi.advanceTimersByTimeAsync(5000); power.resume();
+    await vi.advanceTimersByTimeAsync(799);
+    expect(toolSignal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const { events } = await run;
+    expect(events.filter(event => event.type === 'error')).toEqual([]);
+    expect(events.find(event => event.type === 'final')).toMatchObject({ text: 'Reported the tool failure' });
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+    expect(rawEvents.filter(event => event.type === 'tool_end')).toEqual([
+      expect.objectContaining({ isError: true, errorCode: 'tool_execution_stalled' }),
+    ]);
+    expect(requests).toHaveLength(2);
+    expect(requests[1].flatMap(message => message.content).filter(content => content.type === 'tool_result')).toEqual([
+      expect.objectContaining({ toolUseId: 'wedged', isError: true, content: expect.stringContaining('stalled after 1000ms') }),
+    ]);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(h.logEntries.filter(entry => entry.message === 'idle-watchdog fired; aborting and releasing locks')).toEqual([]);
+    expect(h.logEntries.filter(entry => entry.level === 'error')).toEqual([]);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { power.resume(); controller.abort(); await run; }
 });

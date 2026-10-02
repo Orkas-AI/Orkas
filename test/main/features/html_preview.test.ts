@@ -6,6 +6,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ARTIFACT_FRAME } from '../../../src/main/features/chat_artifacts';
+import { chatMediaLocalPathFromUrl, chatMediaLocalUrl } from '../../../src/main/util/chat-media-url';
+import { HTML_PREVIEW_SANDBOX_FLAGS } from '../../../src/main/util/window-security';
 import {
   renderInteractiveHtmlSmoke,
   renderResponsiveHtmlPreview,
@@ -66,6 +68,7 @@ function fakeRuntime(options: {
   interactionWarningCount?: number;
   interactionWarnings?: string[];
   loadFailure?: boolean;
+  extraRequests?: string[];
 } = {}): {
   deps: HtmlPreviewRuntimeDeps;
   windows: Array<{ options: Record<string, any>; destroyed: boolean }>;
@@ -80,6 +83,8 @@ function fakeRuntime(options: {
   loadedEntryUrls: string[];
   bridgeAvailableAtLoad: boolean[];
   interactionExecutions: string[];
+  protocolHandlers: Map<string, (request: Request) => Response | Promise<Response>>;
+  registeredProtocolHandlers: Array<(request: Request) => Response | Promise<Response>>;
 } {
   const windows: Array<{ options: Record<string, any>; destroyed: boolean }> = [];
   const requestDecisions: Array<{ url: string; cancel: boolean }> = [];
@@ -93,6 +98,8 @@ function fakeRuntime(options: {
   const loadedEntryUrls: string[] = [];
   const bridgeAvailableAtLoad: boolean[] = [];
   const interactionExecutions: string[] = [];
+  const protocolHandlers = new Map<string, (request: Request) => Response | Promise<Response>>();
+  const registeredProtocolHandlers: Array<(request: Request) => Response | Promise<Response>> = [];
   let requestHandler: ((details: { url: string }, callback: (decision: { cancel: boolean }) => void) => void) | undefined;
   const sessionListeners = new Map<string, Function>();
   let tabKeyDowns = 0;
@@ -182,10 +189,13 @@ function fakeRuntime(options: {
 
     async loadURL(url: string) {
       loadedEntryUrls.push(url);
-      const entryPath = fileURLToPath(url);
+      const entryPath = url.startsWith('chat-media:') ? chatMediaLocalPathFromUrl(url) : fileURLToPath(url);
       bridgeAvailableAtLoad.push(fs.existsSync(path.join(path.dirname(entryPath), '__orkas', 'bridge.js')));
       requestHandler?.({ url }, (decision) => requestDecisions.push({ url, cancel: decision.cancel }));
       if (options.loadFailure) throw new Error('synthetic preview load failure');
+      for (const extra of options.extraRequests ?? []) {
+        requestHandler?.({ url: extra }, (decision) => requestDecisions.push({ url: extra, cancel: decision.cancel }));
+      }
       if (options.externalRequest) {
         const external = 'https://example.invalid/tracker.png';
         requestHandler?.(
@@ -231,6 +241,14 @@ function fakeRuntime(options: {
               });
             }
           },
+          protocol: {
+            handle: (scheme: string, handler: (request: Request) => Response | Promise<Response>) => {
+              protocolHandlers.set(scheme, handler);
+              registeredProtocolHandlers.push(handler);
+            },
+            unhandle: (scheme: string) => { protocolHandlers.delete(scheme); },
+            isProtocolHandled: (scheme: string) => protocolHandlers.has(scheme),
+          },
           clearCache: async () => { sessionCleanup.cache = true; },
           clearStorageData: async () => { sessionCleanup.storage = true; },
           webRequest: {
@@ -251,6 +269,8 @@ function fakeRuntime(options: {
     loadedEntryUrls,
     bridgeAvailableAtLoad,
     interactionExecutions,
+    protocolHandlers,
+    registeredProtocolHandlers,
   };
 }
 
@@ -689,5 +709,122 @@ describe('responsive HTML preview renderer', () => {
     expect(interactiveRuntime.loadedEntryUrls.every((url) => (
       !fs.existsSync(path.dirname(fileURLToPath(url)))
     ))).toBe(true);
+  });
+});
+
+describe('file viewer check', () => {
+  const desktop = [{ name: 'desktop' as const, width: 1440, height: 900 }];
+  const png1x1 = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6nKsAAAAASUVORK5CYII=',
+    'base64',
+  );
+
+  async function servedBy(runtime: ReturnType<typeof fakeRuntime>, absPath: string): Promise<Response> {
+    const [handler] = runtime.registeredProtocolHandlers;
+    return handler(new Request(chatMediaLocalUrl(absPath)));
+  }
+
+  it('loads a plain page through chat-media under the file viewer sandbox and releases the handler', async () => {
+    const runtime = fakeRuntime();
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'), desktop, runtime.deps, { fileViewer: true },
+    );
+
+    const entryUrl = chatMediaLocalUrl(fs.realpathSync(path.join(root, 'index.html')));
+    expect(result.evidence.ok).toBe(true);
+    expect(runtime.loadedEntryUrls).toEqual([entryUrl]);
+    expect(runtime.requestDecisions).toEqual([{ url: entryUrl, cancel: false }]);
+    expect(runtime.registeredProtocolHandlers).toHaveLength(1);
+    expect(runtime.protocolHandlers.size).toBe(0);
+
+    const doc = await servedBy(runtime, path.join(root, 'index.html'));
+    expect(doc.status).toBe(200);
+    expect(doc.headers.get('Content-Type')).toBe('text/html');
+    expect(doc.headers.get('Content-Security-Policy')).toContain("script-src chat-media://local");
+    expect(doc.headers.get('Content-Security-Policy')).toMatch(new RegExp(`; sandbox ${HTML_PREVIEW_SANDBOX_FLAGS}$`));
+    expect(await doc.text()).toContain('Preview');
+  });
+
+  it('serves same-folder assets with CORS and media without it, never hidden or outside files', async () => {
+    fs.writeFileSync(path.join(root, 'style.css'), 'main{color:red}');
+    fs.mkdirSync(path.join(root, 'assets'));
+    fs.writeFileSync(path.join(root, 'assets', 'app.mjs'), 'export {};');
+    fs.writeFileSync(path.join(root, 'data.json'), '{"a":1}');
+    fs.writeFileSync(path.join(root, 'logo.png'), png1x1);
+    fs.mkdirSync(path.join(root, '.git'));
+    fs.writeFileSync(path.join(root, '.git', 'config.json'), '{}');
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-html-preview-outside-'));
+    fs.writeFileSync(path.join(outside, 'leak.json'), '{"secret":1}');
+    try {
+      const runtime = fakeRuntime();
+      await renderResponsiveHtmlPreview(path.join(root, 'index.html'), desktop, runtime.deps, { fileViewer: true });
+
+      const css = await servedBy(runtime, path.join(root, 'style.css'));
+      expect(css.status).toBe(200);
+      expect(css.headers.get('Content-Type')).toBe('text/css; charset=utf-8');
+      expect(css.headers.get('Access-Control-Allow-Origin')).toBe('*');
+      expect(css.headers.get('X-Content-Type-Options')).toBe('nosniff');
+      const mod = await servedBy(runtime, path.join(root, 'assets', 'app.mjs'));
+      expect(mod.status).toBe(200);
+      expect(mod.headers.get('Content-Type')).toBe('text/javascript; charset=utf-8');
+      const data = await servedBy(runtime, path.join(root, 'data.json'));
+      expect(data.headers.get('Content-Type')).toBe('application/json; charset=utf-8');
+      expect(await data.json()).toEqual({ a: 1 });
+      const image = await servedBy(runtime, path.join(root, 'logo.png'));
+      expect(image.status).toBe(200);
+      expect(image.headers.get('Access-Control-Allow-Origin')).toBeNull();
+      expect((await servedBy(runtime, path.join(root, '.git', 'config.json'))).status).toBe(403);
+      expect((await servedBy(runtime, path.join(outside, 'leak.json'))).status).toBe(403);
+      expect((await servedBy(runtime, path.join(root, 'missing.css'))).status).toBe(404);
+      expect((await servedBy(runtime, path.join(root, 'notes.txt'))).status).toBe(400);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks and labels chat-media requests outside the entry folder', async () => {
+    const outsideUrl = chatMediaLocalUrl(path.join(os.tmpdir(), 'orkas-elsewhere', 'app.js'));
+    const runtime = fakeRuntime({ extraRequests: [outsideUrl] });
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'), desktop, runtime.deps, { fileViewer: true },
+    );
+
+    expect(runtime.requestDecisions).toContainEqual({ url: outsideUrl, cancel: true });
+    expect(result.evidence.blockedResourceSamples).toContain('chat-media:outside-entry-directory');
+    expect(result.evidence.ok).toBe(false);
+  });
+
+  it('confines linked media, documents and SVG image references to the entry directory', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-preview-linked-'));
+    try {
+      for (const name of ['image.png', 'document.html']) {
+        fs.writeFileSync(path.join(outside, name), name.endsWith('.png') ? png1x1 : 'outside document');
+        fs.symlinkSync(path.join(outside, name), path.join(root, name));
+      }
+      fs.writeFileSync(path.join(root, 'sheet.svg'), '<svg xmlns="http://www.w3.org/2000/svg"><image href="image.png"/></svg>');
+      fs.writeFileSync(path.join(root, 'inside.png'), png1x1);
+      fs.symlinkSync(path.join(root, 'inside.png'), path.join(root, 'alias.png'));
+      const linkedUrl = chatMediaLocalUrl(path.join(root, 'image.png'));
+      const runtime = fakeRuntime({ extraRequests: [linkedUrl] });
+      await renderResponsiveHtmlPreview(path.join(root, 'index.html'), desktop, runtime.deps, { fileViewer: true });
+      expect(runtime.requestDecisions).toContainEqual({ url: linkedUrl, cancel: true });
+      for (const name of ['image.png', 'document.html']) {
+        expect((await servedBy(runtime, path.join(root, name))).status).toBe(403);
+      }
+      const svg = await servedBy(runtime, path.join(root, 'sheet.svg'));
+      expect(svg.status).toBe(400);
+      expect(await svg.text()).not.toContain(png1x1.toString('base64'));
+      const inside = await servedBy(runtime, path.join(root, 'alias.png'));
+      expect(inside.status).toBe(200);
+      expect(Buffer.from(await inside.arrayBuffer())).toEqual(png1x1);
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+  });
+
+  it('keeps file:// loading by default for generated artifact checks', async () => {
+    const runtime = fakeRuntime();
+    await renderResponsiveHtmlPreview(path.join(root, 'index.html'), desktop, runtime.deps);
+
+    expect(runtime.loadedEntryUrls).toEqual([pathToFileURL(fs.realpathSync(path.join(root, 'index.html'))).toString()]);
+    expect(runtime.registeredProtocolHandlers).toHaveLength(0);
   });
 });

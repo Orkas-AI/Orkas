@@ -103,34 +103,14 @@ function configuredModelVisionDeclaration(model: {
   return undefined;
 }
 
-function alignDeepSeekReasoningPayload(params: unknown): unknown {
-  try {
-    const p = params as { reasoning_effort?: string; messages?: Array<{ role?: string; reasoning_content?: unknown; reasoning?: unknown }> };
-    const priorAssistants = (p.messages || []).filter((m) => m && m.role === 'assistant');
-    if (priorAssistants.length === 0) {
-      // No prior turns — nothing to be inconsistent with. Preserve an
-      // explicitly requested reasoning_effort; an omitted control remains
-      // omitted so DeepSeek applies the selected model's official defaults.
-      return params;
-    }
-    const allHaveReasoning = priorAssistants.every(
-      (m) => (typeof m.reasoning_content === 'string' && m.reasoning_content.length > 0)
-        || (typeof m.reasoning === 'string' && (m.reasoning as string).length > 0),
-    );
-    if (!allHaveReasoning && p.reasoning_effort !== undefined) {
-      delete p.reasoning_effort;
-    }
-  } catch { /* never let onPayload throw — pi-ai treats throw as fatal */ }
-  return params;
-}
-
-export function repairDeepSeekPayload(params: unknown): unknown {
-  return repairOpenAIToolMessageOrder(alignDeepSeekReasoningPayload(params));
-}
-
 export function repairOpenAICompatiblePayload(params: unknown): unknown {
   return repairOpenAIToolMessageOrder(params);
 }
+
+export function repairDeepSeekPayload(params: unknown): unknown {
+  return repairOpenAIToolMessageOrder(params);
+}
+
 
 /** Remove an output limit the host added from its own model-default
  * reservation so selected providers can apply their native output default. */
@@ -282,7 +262,8 @@ const MOONSHOT_K3_PROTOCOL_FALLBACK: Pick<
     supportsStrictMode: false,
     thinkingFormat: 'deepseek',
     requiresReasoningContentOnAssistantMessages: true,
-    deferredToolsMode: 'kimi',
+    supportsMidConvoSystemMessages: true,
+    supportsMidConvoToolAdditions: true,
   },
 };
 
@@ -421,9 +402,9 @@ export function buildDeepSeekModel(modelId: string): Model<'openai-completions'>
     api: 'openai-completions',
     provider: 'deepseek' as any,
     baseUrl: DEEPSEEK_BASE_URL,
-    // Keep V4 models and the V4.1 Flash alias reasoning-capable. This
-    // advertises support; it does not choose an effort level for the caller.
-    // createDeepSeekProvider preserves explicit choices through its payload hook.
+    // Keep the known Flash/V4 families reasoning-capable. The core adapter
+    // retains explicit choices and removes SDK-synthesized off controls only
+    // when the caller left thinking at the provider default.
     reasoning: modelId === 'deepseek-flash' || /^deepseek-v4-/.test(modelId),
     // Official Pro/Flash aliases remain text-only. Flash Vision and remotely
     // configured models can declare supportsVision explicitly; an omitted
@@ -438,6 +419,7 @@ export function buildDeepSeekModel(modelId: string): Model<'openai-completions'>
     maxTokens: Object.prototype.hasOwnProperty.call(DEEPSEEK_MAX_OUTPUT_TOKENS, modelId)
       ? deepseekMaxOutputTokens(modelId)
       : configuredPositiveInteger(curated?.maxTokens, deepseekMaxOutputTokens(modelId)),
+    compat: { supportsLongCacheRetention: false },
   };
 }
 
@@ -455,29 +437,7 @@ export async function createDeepSeekProvider(config: CreateDeepSeekProviderConfi
     provider: 'deepseek',
     apiKey: config.apiKey,
     customModel: model,
-    // DeepSeek V4 server-side validation has two symmetric failure modes
-    // with the same misleading error message ("reasoning_content in the
-    // thinking mode must be passed back to the API"):
-    //   A. `reasoning_effort` missing + history has
-    //      assistant.reasoning_content → 400
-    //   B. `reasoning_effort` present + history has an assistant message
-    //      missing reasoning_content → 400
-    // The actual rule is: the presence of `reasoning_effort` must match
-    // the presence of reasoning_content across all history (all-or-none);
-    // a "half-open" mix is rejected.
-    //
-    // Observed scenario B: rotating-provider falls over from primary
-    // candidate openai-codex to deepseek; pi-ai/transform-messages.js
-    // downgrades codex's `thinking` blocks to plain text on a
-    // cross-provider hop (losing thinkingSignature), so the history's
-    // assistant message has no reasoning_content. Adding reasoning_effort
-    // then triggers B.
-    //
-    // Fix: `onPayload` decides reasoning_effort dynamically — inspect
-    // every prior assistant turn for reasoning_content
-    // ("reasoning consistent"):
-    //   - all have  → keep an explicitly requested reasoning_effort
-    //   - not all   → drop only that explicit effort
+    // Replay compatibility is projected by the core adapter.
     onPayload: repairDeepSeekPayload,
   });
 }

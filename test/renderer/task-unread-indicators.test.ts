@@ -55,6 +55,7 @@ function loadUnreadRenderer(
   options: {
     focused?: boolean;
     loadConversations?: (context: any) => void | Promise<void>;
+    invoke?: (channel: string, payload: unknown) => Promise<unknown>;
   } = {},
 ) {
   let focused = options.focused !== false;
@@ -110,6 +111,7 @@ function loadUnreadRenderer(
     },
     window: {
       addEventListener: vi.fn(),
+      ...(options.invoke ? { orkas: { invoke: options.invoke } } : {}),
     },
   };
   context.window.window = context.window;
@@ -141,6 +143,33 @@ function loadUnreadRenderer(
 }
 
 describe('unread task reply indicators', () => {
+  it('keeps persisted sidebar unread state without repopulating the menu bar', async () => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const persisted = new Map([['task_unread_v1_u1', JSON.stringify({
+      unread: [{ cid: 'task-a', projectId: '', finishedAt: 100 }],
+      read: [],
+    })]]);
+    const context = loadUnreadRenderer(persisted, { invoke });
+    context.conversations.push({ conversation_id: 'task-a', project_id: '' });
+    context._restoreUnreadTaskState();
+    await new Promise(setImmediate);
+    expect(context._isConversationUnread('task-a')).toBe(true);
+    expect(invoke).not.toHaveBeenCalled();
+
+    context._markConversationRead('task-a', { readAt: 200 });
+    await new Promise(setImmediate);
+    expect(context._isConversationUnread('task-a')).toBe(false);
+    expect(invoke).not.toHaveBeenCalled();
+
+    context.conversations[0].project_id = 'p1';
+    context._markConversationUnread('task-a', { finishedAt: 300 });
+    await new Promise(setImmediate);
+    context._forgetUnreadProject('p1');
+    await new Promise(setImmediate);
+    expect(context._isConversationUnread('task-a')).toBe(false);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
   it('persists per-task state and aggregates global and project dots', () => {
     const persisted = new Map<string, string>();
     const context = loadUnreadRenderer(persisted);

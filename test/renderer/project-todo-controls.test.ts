@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -27,6 +28,7 @@ describe('project to-do controls', () => {
       t: (key: string) => key,
       setTimeout, clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context);
     context._openTodoRowMenu({}, 't_123456789abc', {
       pid: 'p_test', tasks: [{ id: 't_123456789abc', title: 'Continue work', status }],
@@ -86,6 +88,7 @@ describe('project to-do controls', () => {
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
 
     const card = context._renderTodoCard(task, { pid: 'p_test', tasks: [task], agents: [] });
@@ -178,6 +181,7 @@ describe('project to-do controls', () => {
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'; _bindProjectTodos();", context);
     await context._loadProjectTodos('p_test');
@@ -295,6 +299,7 @@ describe('project to-do controls', () => {
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext(
       "_projectDetailPid = 'p_test';"
@@ -414,6 +419,7 @@ describe('project to-do controls', () => {
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'; _bindProjectTodos();", context);
     await context._loadProjectTodos('p_test');
@@ -493,6 +499,7 @@ describe('project to-do controls', () => {
       uiAlert() {},
       setTimeout, clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test';", context);
 
@@ -574,6 +581,7 @@ describe('project to-do controls', () => {
       uiAlert() {},
       setTimeout, clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'; _bindProjectTodos();", context);
     context._openProjectTodoEditor();
@@ -587,9 +595,8 @@ describe('project to-do controls', () => {
     expect(attachWrap.innerHTML).toContain('brief.txt');
   });
 
-  it('keeps the next project editor intact when an earlier attachment deletion finishes late', async () => {
-    let resolveDelete!: (value: unknown) => void;
-    const deletion = new Promise((resolve) => { resolveDelete = resolve; });
+  it('discards staged attachment removals when switching to another project editor', async () => {
+    const deletions: string[] = [];
     const editor = { hidden: true };
     const input = { value: '', maxLength: 200, dataset: {}, focus() {}, setSelectionRange() {}, addEventListener() {} };
     const attachWrap = { innerHTML: '', hidden: true, querySelectorAll: () => [] as any[] };
@@ -604,13 +611,14 @@ describe('project to-do controls', () => {
       console,
       createLogger: () => ({ warn() {}, info() {}, error() {} }),
       document: { readyState: 'loading', addEventListener() {}, getElementById(id: string) { return elements[id] || null; } },
-      window: { addEventListener() {}, orkas: { async invoke(channel: string) { return channel === 'projects.tasks.attachments.delete' ? deletion : { ok: true }; } } },
+      window: { addEventListener() {}, orkas: { async invoke(channel: string) { if (channel === 'projects.tasks.attachments.delete') deletions.push(channel); return { ok: true }; } } },
       _chatFileIconHtml: () => '<svg></svg>',
       t: (key: string) => key,
       escapeHtml: (value: unknown) => String(value == null ? '' : value),
       uiIconHtml: () => '<svg></svg>',
       setTimeout, clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test';", context);
 
@@ -618,16 +626,18 @@ describe('project to-do controls', () => {
     expect(attachWrap.hidden).toBe(false);
     expect(attachWrap.innerHTML).toContain('a.txt');
     expect(attachWrap.innerHTML).toContain('b.png');
-    const pending = context._removeTodoEditorAttachment('a.txt');
+    await context._removeTodoEditorAttachment('a.txt');
     context._openProjectTodoEditor(
       { id: 't_defdefdefdef', title: 'Other project', status: 'todo', attachments: ['a.txt', 'c.png'] },
       { pid: 'p_other', tasks: [], agents: [] },
     );
-    resolveDelete({ ok: true });
-    await pending;
+    expect(deletions).toEqual([]);
     expect(attachWrap.innerHTML).toContain('a.txt');
     expect(attachWrap.innerHTML).toContain('c.png');
     expect(attachWrap.innerHTML).not.toContain('b.png');
+    input.value = 'Saved in the other project';
+    await context._saveProjectTodoEditor();
+    expect(deletions).toEqual([]);
   });
 
   it('confirms the auto-advance toggle with a toast', async () => {
@@ -666,6 +676,7 @@ describe('project to-do controls', () => {
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'; _bindProjectDriver();", context);
 
@@ -702,6 +713,7 @@ describe('project to-do controls', () => {
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
 
     // A background driver advance pushes its new conversation; it lands in the
@@ -744,6 +756,7 @@ describe('project to-do controls', () => {
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'; _projectDetailMeta = { project: {} };", context);
 
@@ -761,14 +774,8 @@ describe('project to-do controls', () => {
   });
 
   it('restores the send control when project conversation creation fails', async () => {
-    const events: any[] = [];
-    const clicks: any[] = [];
     const input = { value: 'project question' };
     const button = { disabled: false };
-    const Monitor = {
-      click(name: string, payload: any) { clicks.push({ name, payload }); },
-      event(name: string, payload: any) { events.push({ name, payload }); },
-    };
     const context = vm.createContext({
       console,
       performance,
@@ -782,14 +789,9 @@ describe('project to-do controls', () => {
           return null;
         },
       },
-      window: { addEventListener() {}, Monitor: true },
-      Monitor,
+      window: { addEventListener() {} },
       t: (key: string) => key,
       ensureModelConfigured: () => true,
-      _chatModelTelemetryContext: () => ({
-        provider: 'deepseek',
-        model: 'deepseek-v4-pro',
-      }),
       _getQuotes: () => [],
       _referenceSnapshotsForQuotes: () => [],
       consumeChatUseSelections: () => [],
@@ -801,12 +803,12 @@ describe('project to-do controls', () => {
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'", context);
 
     await context._submitProjectChat();
 
-    expect(events).toEqual([]);
     expect(button.disabled).toBe(false);
   });
 
@@ -830,6 +832,7 @@ describe('project to-do controls', () => {
       },
       window: { addEventListener() {} },
       conversations: [],
+      currentCid: null,
       t: (key: string) => key,
       ensureModelConfigured: () => true,
       _getQuotes: () => [],
@@ -849,16 +852,18 @@ describe('project to-do controls', () => {
       renderConversationList() {},
       loadProjects() {},
       _chatAttachList: () => [],
+      _consumeSubmittedQuotes() {},
       _clearQuotes() {},
       autoGrow() {},
       setView() {},
       setChatRecipient() {},
-      async sendInCurrentConversation(content: string, extra: Record<string, unknown>) {
+      async sendInConversation(_cid: string, content: string, extra: Record<string, unknown>) {
         sent.push({ content, extra });
       },
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'", context);
 
@@ -891,6 +896,7 @@ describe('project to-do controls', () => {
       },
       window: { addEventListener() {} },
       conversations: [],
+      currentCid: null,
       t: (key: string) => key,
       ensureModelConfigured: () => true,
       _getQuotes: () => [],
@@ -911,16 +917,18 @@ describe('project to-do controls', () => {
       renderConversationList() {},
       loadProjects() {},
       _chatAttachList: () => [],
+      _consumeSubmittedQuotes() {},
       _clearQuotes() {},
       autoGrow() {},
       setView() {},
       setChatRecipient() {},
-      async sendInCurrentConversation(content: string, extra: Record<string, unknown>) {
+      async sendInConversation(_cid: string, content: string, extra: Record<string, unknown>) {
         sent.push({ content, extra });
       },
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'", context);
 
@@ -954,6 +962,7 @@ describe('project to-do controls', () => {
       },
       window: { addEventListener() {} },
       conversations: [],
+      currentCid: null,
       t: (key: string) => key,
       ensureModelConfigured: () => true,
       _getQuotes: () => [],
@@ -970,6 +979,7 @@ describe('project to-do controls', () => {
         items: [{ name: 'diagram.png', kind: 'image', bytes: 42, status: 'ready' }],
       }),
       _chatAttachClear() {},
+      _consumeSubmittedQuotes() {},
       _clearQuotes() {},
       autoGrow() {},
       renderConversationList() {},
@@ -989,12 +999,13 @@ describe('project to-do controls', () => {
           items: [{ sourceName: 'diagram.png', targetName: 'diagram.png' }],
         }) };
       },
-      async sendInCurrentConversation(content: string, extra: any) {
+      async sendInConversation(_cid: string, content: string, extra: any) {
         sent.push({ content, extra });
       },
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'", context);
 
@@ -1011,7 +1022,6 @@ describe('project to-do controls', () => {
   });
 
   it('keeps the project composer intact and records failure when attachment adoption fails', async () => {
-    const events: any[] = [];
     const invocations: any[] = [];
     const alerts: string[] = [];
     const input = { value: 'Review the attached brief' };
@@ -1035,7 +1045,6 @@ describe('project to-do controls', () => {
       },
       window: {
         addEventListener() {},
-        Monitor: true,
         orkas: {
           async invoke(channel: string, payload: any) {
             invocations.push({ channel, payload });
@@ -1043,11 +1052,8 @@ describe('project to-do controls', () => {
           },
         },
       },
-      Monitor: {
-        click() {},
-        event(name: string, payload: any) { events.push({ name, payload }); },
-      },
       conversations: [],
+      currentCid: null,
       t: (key: string) => key,
       ensureModelConfigured: () => true,
       _getQuotes: () => [{ id: 'quote-1' }],
@@ -1060,6 +1066,7 @@ describe('project to-do controls', () => {
       applyRecipientPrefix: (value: string) => value,
       _chatAttachList: () => [{ name: 'brief.pdf', status: 'ready' }],
       _chatAttachClear: () => { clearedAttachments += 1; },
+      _consumeSubmittedQuotes: () => { clearedQuotes += 1; },
       _clearQuotes: () => { clearedQuotes += 1; },
       apiFetch: async (url: string) => ({
         json: async () => url.endsWith('/create')
@@ -1069,10 +1076,11 @@ describe('project to-do controls', () => {
       uiAlert: async (message: string) => { alerts.push(message); },
       renderConversationList() {},
       loadProjects() {},
-      async sendInCurrentConversation() { sends += 1; },
+      async sendInConversation() { sends += 1; },
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'", context);
 
@@ -1111,6 +1119,7 @@ describe('project to-do controls', () => {
       },
       window: { addEventListener() {} },
       conversations: [],
+      currentCid: null,
       t: (key: string) => key,
       ensureModelConfigured: () => true,
       _getQuotes: () => [],
@@ -1123,6 +1132,7 @@ describe('project to-do controls', () => {
       applyRecipientPrefix: (value: string) => value,
       _chatAttachList: () => [{ name: 'brief.pdf', status: 'ready' }],
       _chatAttachClear: (cid: string) => { cleared.push(cid); },
+      _consumeSubmittedQuotes() {},
       _clearQuotes() {},
       apiFetch: async (url: string) => ({
         json: async () => url.endsWith('/create')
@@ -1138,10 +1148,11 @@ describe('project to-do controls', () => {
       autoGrow() {},
       setView() {},
       setChatRecipient() {},
-      async sendInCurrentConversation(content: string, extra: any) { sent.push({ content, extra }); },
+      async sendInConversation(_cid: string, content: string, extra: any) { sent.push({ content, extra }); },
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'", context);
 
@@ -1154,15 +1165,11 @@ describe('project to-do controls', () => {
     expect(cleared).toEqual(['projchat-p_test']);
   });
 
-  it('blocks project chat when no model is configured without telemetry', async () => {
-    const events: any[] = [];
-    const clicks: any[] = [];
+  it('blocks project chat when no model is configured without creating a conversation', async () => {
     const input = { value: 'project question' };
-    const Monitor = {
-      click(name: string, payload: any) { clicks.push({ name, payload }); },
-      event(name: string, payload: any) { events.push({ name, payload }); },
-    };
+    let attempted = false;
     const apiFetch = async () => {
+      attempted = true;
       throw new Error('conversation creation must not run while blocked');
     };
     const context = vm.createContext({
@@ -1176,14 +1183,9 @@ describe('project to-do controls', () => {
           return id === 'project-chat-input' ? input : null;
         },
       },
-      window: { addEventListener() {}, Monitor: true },
-      Monitor,
+      window: { addEventListener() {} },
       t: (key: string) => key,
       ensureModelConfigured: () => false,
-      _chatModelTelemetryContext: () => ({
-        provider: 'deepseek',
-        model: 'deepseek-v4-pro',
-      }),
       _getQuotes: () => [],
       getChatUseSelections: () => [
         { kind: 'skill', id: 'review' },
@@ -1196,12 +1198,46 @@ describe('project to-do controls', () => {
       setTimeout,
       clearTimeout,
     });
+  vm.runInContext(composerAccessorSource, context);
     vm.runInContext(source, context, { filename: 'project-detail.js' });
     vm.runInContext("_projectDetailPid = 'p_test'", context);
 
     await context._submitProjectChat();
+    expect(attempted).toBe(false);
+    expect(input.value).toBe('project question');
 
-    expect(clicks).toEqual([]);
-    expect(events).toEqual([]);
+  });
+});
+
+describe('todo attachment preview recovery', () => {
+  it('reports an unavailable file without opening a viewer and permits a scoped retry', async () => {
+    let available = false;
+    const opened: any[] = [];
+    const alerts: string[] = [];
+    const warnings: string[] = [];
+    const calls: any[] = [];
+    const context = vm.createContext({
+      document: { readyState: 'loading', addEventListener() {} },
+      window: { addEventListener() {}, orkas: { async invoke(channel: string, payload: any) {
+        calls.push({ channel, payload });
+        return available ? { ok: true, path: '/fixture/brief.txt' } : { ok: false };
+      } } },
+      createLogger: () => ({ warn: (message: string) => warnings.push(message), info() {}, error() {} }),
+      openChatFileViewer: (...args: any[]) => opened.push(args),
+      uiAlert: (message: string) => alerts.push(message), t: (key: string) => key,
+    });
+    vm.runInContext(composerAccessorSource, context);
+    vm.runInContext(source, context);
+    await context._previewTodoAttachment('p_other', 't_123456abcdef', 'brief.txt');
+    expect(opened).toEqual([]);
+    expect(alerts).toEqual(['chat.file_missing_toast']);
+    expect(warnings).toEqual(['todo attachment preview failed']);
+    available = true;
+    await context._previewTodoAttachment('p_other', 't_123456abcdef', 'brief.txt');
+    expect(opened).toEqual([['/fixture/brief.txt', 'brief.txt', {
+      projectId: 'p_other', cid: null, readOnly: true, sourceElement: undefined,
+    }]]);
+    expect(calls.every(call => call.channel === 'projects.tasks.attachments.absPath'
+      && call.payload.projectId === 'p_other' && call.payload.taskId === 't_123456abcdef')).toBe(true);
   });
 });

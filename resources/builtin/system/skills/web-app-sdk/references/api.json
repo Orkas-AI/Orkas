@@ -522,7 +522,7 @@
     {
       "name": "tools.list",
       "capability": null,
-      "description": "Discover eligible existing Orkas tools and their original schemas. Does not grant execution.",
+      "description": "Discover eligible existing Orkas tools and their original schemas. Connector discovery supports BM25 query, bounded pages and full schemas for small catalogs through list_connector_tools. Does not grant execution.",
       "inputSchema": {
         "type": "object",
         "properties": {},

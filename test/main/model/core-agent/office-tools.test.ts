@@ -1616,21 +1616,21 @@ describe('Office built-in tools', () => {
     }
   });
 
-  it('rejects render-only fields on the check action', async () => {
+  it('ignores render-only fields on the check action and reports them', async () => {
     const file = path.join(h.workspace, 'existing.pptx');
     fs.writeFileSync(file, 'fixture');
     const review = getTool('office_review');
     const actionDescription = (review.inputSchema as any).properties.action.description;
     expect(actionDescription).toContain('path only');
-    expect(actionDescription).toContain('omit unrelated fields');
+    expect(actionDescription).toContain('Omit unrelated fields');
 
     const result = await review.execute({
       action: 'check',
       path: file,
       pages: ['1'],
     }, ctx());
-    expect(result).toMatchObject({ isError: true });
-    expect(result.content).toContain('fields not allowed for check');
-    expect(h.runOfficeCli).not.toHaveBeenCalled();
+    expect(result.content).toContain('ignored_fields');
+    expect(result.content).toContain('pages');
+    expect(h.runOfficeCli).toHaveBeenCalled();
   });
 });

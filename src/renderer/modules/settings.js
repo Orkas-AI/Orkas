@@ -94,8 +94,7 @@ async function _settingsSafeCall(label, fn) {
 }
 
 async function loadSettings() {
-  // 4-tab structure (batch 6). Initialize switching + activate default tab
-  // (通用 by default — matches the is-active class on the markup).
+  // Preserve the eager tab selection when deferred Settings content loads.
   if (typeof initSettingsTabs === 'function') initSettingsTabs();
   // Models pane chrome: purpose sub-tabs, the add dialog and cross-tab jumps.
   // Bound before the async reads so the first click is never lost.

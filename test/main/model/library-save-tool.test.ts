@@ -33,7 +33,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 const PID = 'p_aaaaaaaaaaaa';
@@ -123,15 +123,32 @@ describe('local-tools › library_save', () => {
   });
 
   it.each([
-    { action: 'checkout' },
-    { action: 'checkout', name: 'file.md', expected_revision: 'a'.repeat(64) },
-    { expected_revision: '' },
-    { action: 'overwrite' },
-    { project_id: 'p_forged' },
-    { action: 'checkout', name: 'file.md', source_path: '/etc/new.md' },
-  ])('rejects invalid editing arguments without calling storage: %j', async (args) => {
+    [{ action: 'checkout' }, 'name must be a non-empty string for checkout'],
+    [{ action: 'checkout', name: 'file.md', expected_revision: 'PRIVATE' }, 'expected_revision is not accepted for checkout'],
+    [{ expected_revision: '' }, 'expected_revision must be a non-empty string'],
+    [{ expected_revision: 7 }, 'expected_revision must be a non-empty string'],
+    [{ action: 'overwrite' }, 'action must be "save" or "checkout"'],
+    [{ project_id: 'PRIVATE' }, 'unsupported field "project_id"'],
+    [{ action: 'checkout', name: 'file.md', source_path: '/etc/new.md' }, 'E_PATH_OUT_OF_SCOPE'],
+  ])('identifies invalid editing arguments without calling storage: %j', async (args, message) => {
     const tool = await librarySaveTool(PID);
-    expect((await tool!.execute({ source_path: 'edit.md', ...args }, ctx())).isError).toBe(true);
+    const result = await tool!.execute({ source_path: 'edit.md', ...args }, ctx());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain(message);
+    expect(result.content).not.toContain('PRIVATE');
+    expect(copyMock).not.toHaveBeenCalled();
+    expect(checkoutMock).not.toHaveBeenCalled();
+    expect(replaceMock).not.toHaveBeenCalled();
+  });
+
+  it('bounds and escapes an unknown field name without echoing its value', async () => {
+    const tool = await librarySaveTool(PID);
+    const result = await tool!.execute({ source_path: 'file.md', ['x\n'.repeat(5000)]: 'PRIVATE' }, ctx());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('unsupported field "x\\nx');
+    expect(result.content).toContain('allowed fields: source_path, name, action, expected_revision');
+    expect(result.content).not.toContain('PRIVATE');
+    expect(result.content.length).toBeLessThan(650);
     expect(copyMock).not.toHaveBeenCalled();
     expect(checkoutMock).not.toHaveBeenCalled();
     expect(replaceMock).not.toHaveBeenCalled();

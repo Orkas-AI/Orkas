@@ -17,8 +17,12 @@ const notificationPermissionMocks = vi.hoisted(() => ({
   })),
   openSystemNotificationSettings: vi.fn(async () => true),
 }));
+const unreadTrayMocks = vi.hoisted(() => ({
+  refreshTaskUnreadTray: vi.fn(),
+}));
 
 vi.mock('../../../src/main/features/notification_permissions', () => notificationPermissionMocks);
+vi.mock('../../../src/main/features/task_unread_tray', () => unreadTrayMocks);
 
 vi.mock('electron', () => ({
   ipcMain: {
@@ -110,11 +114,19 @@ describe('ipc › permissions.* routes', () => {
 
   it('persists task-notification preference without waiting for the platform permission probe', async () => {
     notificationPermissionMocks.getSystemNotificationPermission.mockClear();
+    unreadTrayMocks.refreshTaskUnreadTray.mockClear();
 
     const res = await call('prefs.setTaskNotifications', { enabled: false });
 
     expect(res).toMatchObject({ ok: true, enabled: false });
     expect(notificationPermissionMocks.getSystemNotificationPermission).not.toHaveBeenCalled();
+    expect(unreadTrayMocks.refreshTaskUnreadTray).toHaveBeenCalledOnce();
+  });
+
+  it('rejects legacy snapshots so persisted unread tasks cannot repopulate the tray', async () => {
+    const res = await call('taskUnread.setSnapshot', { userId: TEST_UID, cids: ['old-task'] });
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/unknown channel/);
   });
 
   it('unknown permissions.* channel surfaces the router fallback error', async () => {

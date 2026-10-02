@@ -12,9 +12,10 @@ const TEST_UID = 'u-connectors-custom';
 let tmpDir: string;
 let prevWs: string | undefined;
 
-function mockMcpClient(behavior: { failConnect?: boolean } = {}) {
+function mockMcpClient(behavior: { failConnect?: boolean; onTransport?: (transport: unknown) => void } = {}) {
   vi.doMock('../../../../src/main/features/connectors/mcp-client', () => ({
-    McpConnection: vi.fn().mockImplementation(function MockMcpConnection() {
+    McpConnection: vi.fn().mockImplementation(function MockMcpConnection(_id: string, transport: unknown) {
+      behavior.onTransport?.(transport);
       return {
         connect: vi.fn(async () => {
           if (behavior.failConnect) throw new Error('boom: connection refused by test');
@@ -39,6 +40,8 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.doUnmock('../../../../src/main/features/connectors/mcp-client');
+  vi.doUnmock('../../../../src/main/features/connectors/oauth-dcr');
+  vi.doUnmock('../../../../src/main/features/connectors/oauth-events');
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -111,5 +114,145 @@ describe('connectors/manager › addCustomInstance', () => {
     });
     const result = await manager.callTool(TEST_UID, inst.id, 'noop', {});
     expect(result).toEqual({ content: [{ type: 'text', text: 'ok' }] });
+  });
+
+  it('rejects OAuth on stdio and conflicting Authorization headers', async () => {
+    mockMcpClient();
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await expect(manager.addCustomInstance(TEST_UID, {
+      display_name: 'Bad stdio OAuth', auth_mode: 'oauth',
+      transport: { kind: 'stdio', command: 'mcp-server' },
+    })).rejects.toMatchObject({ code: 'E_AUTH_MODE' });
+    await expect(manager.addCustomInstance(TEST_UID, {
+      display_name: 'Bad header OAuth', auth_mode: 'oauth',
+      transport: { kind: 'streamable-http', url: 'https://mcp.example/mcp', headers: { authorization: 'Bearer old' } },
+    })).rejects.toMatchObject({ code: 'E_AUTH_MODE' });
+  });
+
+  it('authorizes custom HTTP MCP, refreshes a rotating grant, and never persists a bearer header', async () => {
+    const transports: Array<{ headers?: Record<string, string> }> = [];
+    mockMcpClient({ onTransport: (transport) => transports.push(transport as { headers?: Record<string, string> }) });
+    const refresh = vi.fn(async (_client, grant) => grant.expires_at > Date.now()
+      ? grant
+      : { ...grant, access_token: 'new-access-secret', refresh_token: 'new-refresh-secret',
+        expires_at: Date.now() + 3600_000 });
+    vi.doMock('../../../../src/main/features/connectors/oauth-dcr', async (importOriginal) => ({
+      ...await importOriginal<typeof import('../../../../src/main/features/connectors/oauth-dcr')>(),
+      startCustomMcpOAuth: vi.fn(async () => ({
+        grant: { access_token: 'old-access-secret', refresh_token: 'old-refresh-secret',
+          expires_at: Date.now() + 3600_000, scopes: [], token_type: 'Bearer' },
+        client: { client_id: 'custom-client', token_endpoint: 'https://auth.example/token',
+          authorization_endpoint: 'https://auth.example/authorize', resource: 'https://mcp.example/mcp' },
+      })),
+      refreshDcrIfStale: refresh,
+    }));
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const instance = await manager.addCustomInstance(TEST_UID, {
+      display_name: 'OAuth MCP', auth_mode: 'oauth',
+      transport: { kind: 'streamable-http', url: 'https://mcp.example/mcp', headers: { 'X-Custom': 'ok' } },
+    });
+    expect(instance.status.kind).toBe('connected');
+    expect(instance.custom_auth_mode).toBe('oauth');
+    expect(transports[0]?.headers).toMatchObject({ Authorization: 'Bearer old-access-secret', 'X-Custom': 'ok' });
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const stored = registry.load(TEST_UID).connections[instance.id]!;
+    expect(stored.transport).toEqual(instance.transport);
+    expect((stored.transport as { headers?: Record<string, string> }).headers?.Authorization).toBeUndefined();
+    await registry.update(TEST_UID, instance.id, (current) => ({ ...current,
+      oauth_grant: { ...current.oauth_grant!, expires_at: Date.now() - 1 },
+    }));
+    await manager.refreshTools(TEST_UID, instance.id);
+    expect(transports.at(-1)?.headers?.Authorization).toBe('Bearer new-access-secret');
+    expect(registry.load(TEST_UID).connections[instance.id]?.oauth_grant?.refresh_token).toBe('new-refresh-secret');
+    const paths = await import('../../../../src/main/paths');
+    const rawDisk = fs.readFileSync(paths.userConnectorsConfigFile(TEST_UID), 'utf8');
+    expect(rawDisk).not.toMatch(/old-access-secret|old-refresh-secret|new-access-secret|new-refresh-secret/);
+  });
+
+  it('retains a failed OAuth registration as a reconnectable custom instance', async () => {
+    mockMcpClient();
+    vi.doMock('../../../../src/main/features/connectors/oauth-dcr', async (importOriginal) => ({
+      ...await importOriginal<typeof import('../../../../src/main/features/connectors/oauth-dcr')>(),
+      startCustomMcpOAuth: vi.fn(async () => { throw new Error('DCR registration failed: HTTP 403'); }),
+    }));
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const instance = await manager.addCustomInstance(TEST_UID, {
+      display_name: 'Restricted MCP', auth_mode: 'oauth',
+      transport: { kind: 'streamable-http', url: 'https://mcp.example/mcp' },
+    });
+    expect(instance).toMatchObject({ origin: 'custom', custom_auth_mode: 'oauth',
+      status: { kind: 'error', message: 'DCR registration failed: HTTP 403' } });
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    expect(registry.load(TEST_UID).connections[instance.id]?.custom_auth_mode).toBe('oauth');
+    await expect(manager.authorizeCustomInstance(TEST_UID, instance.id)).rejects.toThrow('HTTP 403');
+  });
+
+  it('keeps a new authorization when an older refresh finishes afterward', async () => {
+    const transports: Array<{ headers?: Record<string, string> }> = [];
+    mockMcpClient({ onTransport: transport => transports.push(transport as { headers?: Record<string, string> }) });
+    const grant = (token: string) => ({ access_token: token, refresh_token: `${token}-refresh`,
+      expires_at: Date.now() + 3600_000, scopes: [], token_type: 'Bearer' });
+    const client = (id: string) => ({ client_id: id, token_endpoint: 'https://auth.example/token',
+      authorization_endpoint: 'https://auth.example/authorize', resource: 'https://mcp.example/mcp' });
+    let finishAuthorization!: (value: unknown) => void;
+    let finishRefresh!: (value: unknown) => void;
+    const start = vi.fn().mockResolvedValueOnce({ grant: grant('old'), client: client('old-client') })
+      .mockImplementationOnce(() => new Promise(resolve => { finishAuthorization = resolve; }));
+    const refresh = vi.fn(async (_client, current) => current.expires_at > Date.now() ? current
+      : new Promise(resolve => { finishRefresh = resolve; }));
+    vi.doMock('../../../../src/main/features/connectors/oauth-dcr', async importOriginal => ({
+      ...await importOriginal<typeof import('../../../../src/main/features/connectors/oauth-dcr')>(),
+      startCustomMcpOAuth: start, refreshDcrIfStale: refresh,
+    }));
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const instance = await manager.addCustomInstance(TEST_UID, { display_name: 'Rotating', auth_mode: 'oauth',
+      transport: { kind: 'streamable-http', url: 'https://mcp.example/mcp' } });
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    await registry.update(TEST_UID, instance.id, current => ({ ...current,
+      oauth_grant: { ...current.oauth_grant!, expires_at: Date.now() - 1 } }));
+    const authorization = manager.authorizeCustomInstance(TEST_UID, instance.id);
+    await vi.waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+    const refreshing = manager.refreshTools(TEST_UID, instance.id);
+    await vi.waitFor(() => expect(finishRefresh).toBeTypeOf('function'));
+    finishAuthorization({ grant: grant('new-authorization'), client: client('new-client') });
+    await vi.waitFor(() => expect(registry.load(TEST_UID).connections[instance.id]?.oauth_grant?.access_token).toBe('new-authorization'));
+    finishRefresh(grant('stale-refresh'));
+    await Promise.all([authorization, refreshing]);
+    expect(registry.load(TEST_UID).connections[instance.id]).toMatchObject({
+      oauth_grant: { access_token: 'new-authorization' }, dcr_client: { client_id: 'new-client' },
+    });
+    expect(transports.at(-1)?.headers?.Authorization).toBe('Bearer new-authorization');
+    expect(transports.some(t => t.headers?.Authorization === 'Bearer stale-refresh')).toBe(false);
+  });
+
+  it('starts browser authorization after the add request returns and reports completion', async () => {
+    mockMcpClient();
+    let finish!: (result: unknown) => void;
+    const pending = new Promise((resolve) => { finish = resolve; });
+    const outcome = vi.fn();
+    vi.doMock('../../../../src/main/features/connectors/oauth-events', () => ({
+      broadcastOAuthConnectOutcome: outcome, broadcastOAuthConnectProgress: vi.fn(),
+    }));
+    vi.doMock('../../../../src/main/features/connectors/oauth-dcr', async (importOriginal) => ({
+      ...await importOriginal<typeof import('../../../../src/main/features/connectors/oauth-dcr')>(),
+      startCustomMcpOAuth: vi.fn(() => pending),
+    }));
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const draft = await manager.addCustomInstance(TEST_UID, {
+      display_name: 'Async OAuth MCP', auth_mode: 'oauth',
+      transport: { kind: 'streamable-http', url: 'https://mcp.example/mcp' },
+    }, { deferOAuth: true });
+    expect(draft.status.kind).toBe('connecting');
+    const started = manager.beginCustomOAuthConnect(TEST_UID, draft.id);
+    expect(started.attempt_id).toBeTruthy();
+    expect(outcome).not.toHaveBeenCalled();
+    finish({ grant: { access_token: 'access-secret', refresh_token: null, expires_at: null,
+      scopes: [], token_type: 'Bearer' }, client: { client_id: 'client', token_endpoint: 'https://login.example/token',
+      authorization_endpoint: 'https://login.example/authorize' } });
+    await vi.waitFor(() => expect(outcome).toHaveBeenCalledWith(expect.objectContaining({
+      attempt_id: started.attempt_id, catalog_id: draft.id, result: 'success',
+    })));
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    expect(registry.load(TEST_UID).connections[draft.id]?.status.kind).toBe('connected');
   });
 });

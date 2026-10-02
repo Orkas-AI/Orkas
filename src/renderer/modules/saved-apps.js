@@ -352,7 +352,7 @@
         const seed = _t('apps.edit_seed',
           'Modify the interactive app "{name}". Source: attached "{file}":',
           { name, file });
-        input.value = String(seed || '').trimEnd();
+        composerSetText(input, String(seed || '').trimEnd());
         if (typeof autoGrow === 'function') autoGrow(input, 200);
         if (typeof _saveDraft === 'function') _saveDraft(conv.conversation_id);
         setTimeout(() => { try { input.focus(); } catch (_) {} }, 60);

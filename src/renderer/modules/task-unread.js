@@ -15,7 +15,6 @@ let _taskUnreadScopeRefreshPromise = null;
 const _taskUnreadByCid = new Map(); // cid -> { projectId: string|null, finishedAt: number }
 const _taskReadAtByCid = new Map(); // cid -> last acknowledged terminal timestamp
 const _taskUnreadPendingTerminals = new Map(); // terminal events received before initUser
-
 function _taskUnreadCurrentUserId() {
   try {
     return typeof currentUserId === 'string' ? currentUserId.trim() : '';

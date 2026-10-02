@@ -8,7 +8,6 @@ const searchSource = fs.readFileSync(path.join(root, 'src/renderer/modules/searc
 const bootSource = fs.readFileSync(path.join(root, 'src/renderer/modules/boot.js'), 'utf8');
 const conversationSource = fs.readFileSync(path.join(root, 'src/renderer/modules/conversation.js'), 'utf8');
 const ipcSource = fs.readFileSync(path.join(root, 'src/main/ipc/index.ts'), 'utf8');
-const chatsSource = fs.readFileSync(path.join(root, 'src/main/features/chats.ts'), 'utf8');
 
 function extractFunction(source: string, name: string): string {
   const asyncMarker = `async function ${name}`;
@@ -490,9 +489,6 @@ describe('global search conversation navigation', () => {
     expect(Array.from(context._searchResults)).toEqual([]);
     expect(Array.from(context._searchVisibleResults)).toEqual([]);
     expect(context._searchActiveIdx).toBe(-1);
-    expect(trackResult).toHaveBeenCalledWith('cancelled', 'superseded', expect.any(Number), {
-      has_project: false,
-    });
   });
 
   it('invalidates an in-flight query when the search overlay closes', async () => {
@@ -583,9 +579,9 @@ describe('global search conversation navigation', () => {
     expect(bootSource).toContain('_revealConversationHistorySearchTarget(cid, opts.historyTarget)');
     expect(ipcSource).toContain('chats.getMessagesPageAtIndex(');
     expect(ipcSource).toContain('history_indexes: page.historyIndexes');
-    expect(chatsSource).toContain(
-      'readJsonlWindow<MessageRecord>(sourceFile, pageStart, Number.MAX_SAFE_INTEGER)',
-    );
+    // Bounded hit windows and complete bidirectional traversal are exercised
+    // against real history files in chats.test.ts. Do not require an unbounded
+    // target-to-latest read here: that is the retired search contract.
     const loadStart = conversationSource.indexOf('async function loadConversationHistory');
     const loadBody = conversationSource.slice(loadStart, conversationSource.indexOf('\nfunction _messageRecordHasMountedSidecars', loadStart));
     expect(loadBody).toContain('Array.isArray(data.history_indexes)');

@@ -14,6 +14,7 @@ import { getActiveUserId } from '../users';
 import { registerUserSwitchHook } from '../user-switch-hooks';
 import { findCatalogEntry } from './catalog';
 import type { ConnectorInstance } from './types';
+import { clearTaskCreatedDrafts } from './task-created-drafts';
 
 const log = createLogger('connector-action-confirm');
 const RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -268,6 +269,7 @@ export function respond(requestId: string, approved: boolean, scope: 'once' | 't
 }
 
 function cancelMatching(matches: (scope: GrantScope) => boolean, context: { cid?: string } = {}): void {
+  clearTaskCreatedDrafts(scope => matches({ ...scope, accountLabel: '' }));
   for (const [key, grant] of _taskGrants) {
     if (matches(grant)) _taskGrants.delete(key);
   }

@@ -161,15 +161,15 @@ function _sendDraftToChatInput(text) {
   if (!draft.trim()) return false;
   // Prepend a newline when there's already content so the snippet doesn't
   // smash into the existing draft.
-  const existing = input.value || '';
+  const existing = composerText(input) || '';
   const joiner = existing && !existing.endsWith('\n') ? '\n' : '';
-  input.value = `${existing}${joiner}${draft}`;
-  input.dispatchEvent(new Event('input', { bubbles: true }));
+  composerSetText(input, `${existing}${joiner}${draft}`);
+  composerNotify(input);
   input.focus();
   // Move caret to end so the user sees the inserted block.
   try {
-    const end = input.value.length;
-    input.setSelectionRange(end, end);
+    const end = composerText(input).length;
+    composerSetSelection(input, end, end);
   } catch (_) { /* old jsdom — ignore */ }
   return true;
 }

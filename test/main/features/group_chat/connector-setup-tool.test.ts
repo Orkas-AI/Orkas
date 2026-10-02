@@ -146,6 +146,91 @@ describe('connector_setup', () => {
     expect(stageConfigure).not.toHaveBeenCalled();
   });
 
+  // Queries below are verbatim from a live onboarding run (2026-09-29) against the real catalog.
+  function builtInSearchTool() {
+    const stageConfigure = vi.fn(() => ({ ok: true as const }));
+    const tool = buildConnectorSetupTool({
+      uid: 'u1', language: 'zh', stageConfigure,
+      dependencies: { catalog: () => CONNECTOR_CATALOG, instances: () => [],
+        enabledSnapshot: () => ({ connectors: {} }) },
+    });
+    const search = async (query: string) => (await run(tool, { operation: 'search', query }))
+      .result.results as Array<{ connector_id: string; name: string; matched_terms?: string[] }>;
+    return { search, stageConfigure };
+  }
+
+  it('offers mail-capable Microsoft access when Outlook or a mailbox is named, without renaming the card', async () => {
+    const { search, stageConfigure } = builtInSearchTool();
+    // The general Outlook entry reads profile, contacts, settings and tasks, not mail.
+    const outlook = await search('Outlook');
+    expect(outlook.map((item) => item.connector_id)).toEqual(expect.arrayContaining(['outlook', 'm365-mail']));
+    expect(outlook.find((item) => item.connector_id === 'm365-mail')?.name).toBe('Microsoft 365 Mail');
+    expect(outlook.some((item) => item.matched_terms)).toBe(false);
+    const mailbox = (await search('邮箱')).map((item) => item.connector_id);
+    expect(mailbox).toEqual(expect.arrayContaining(['gmail', 'm365-mail']));
+    expect(stageConfigure).not.toHaveBeenCalled();
+  });
+
+  it('names the non-mail Outlook entry by its scope so it is not taken for mail access', async () => {
+    for (const [language, expected] of [['zh', 'Outlook 联系人与任务'], ['en', 'Outlook Contacts & Tasks'], ['ja', 'Outlook Contacts & Tasks']] as const) {
+      const tool = buildConnectorSetupTool({
+        uid: 'u1', language, stageConfigure: vi.fn(() => ({ ok: true as const })),
+        dependencies: { catalog: () => CONNECTOR_CATALOG, instances: () => [], enabledSnapshot: () => ({ connectors: {} }) },
+      });
+      const results = (await run(tool, { operation: 'search', query: 'Outlook' })).result.results as Array<{ connector_id: string; name: string }>;
+      expect(results.find((item) => item.connector_id === 'outlook')?.name, language).toBe(expected);
+      expect(results.find((item) => item.connector_id === 'm365-mail')?.name, language).toBe('Microsoft 365 Mail');
+    }
+    // The stable fallback name, used by installed instances and older data, is unchanged.
+    expect(CONNECTOR_CATALOG.find((entry) => entry.id === 'outlook')?.display_name).toBe('Outlook');
+  });
+
+  it.each([
+    ['email Gmail Outlook 邮箱', ['gmail', 'outlook', 'm365-mail']],
+    ['Outlook Microsoft 365 mail calendar', ['m365-mail', 'outlook']],
+    ['Feishu 文档 日历 消息 企业协作', ['feishu']],
+    ['Notion documents workspace', ['notion']],
+    ['GitHub repositories issues pull requests', ['github']],
+  ])('ranks named services first when no connector contains every word of %s', async (query, named) => {
+    const { search, stageConfigure } = builtInSearchTool();
+    const results = await search(query);
+    expect(results.slice(0, named.length).map((item) => item.connector_id).sort()).toEqual([...named].sort());
+    for (const item of results) {
+      expect(item.matched_terms?.length).toBeGreaterThan(0);
+      expect(item.matched_terms!.every((term) => query.toLocaleLowerCase().split(/\s+/).includes(term))).toBe(true);
+    }
+    expect(stageConfigure).not.toHaveBeenCalled();
+  });
+
+  it('keeps precise and empty searches unchanged when the any-term fallback does not apply', async () => {
+    const { search } = builtInSearchTool();
+    // Every word matches one connector: no fallback candidates are mixed in.
+    expect(await search('飞书 Lark')).toEqual([expect.objectContaining({ connector_id: 'feishu' })]);
+    expect((await search('飞书 Lark'))[0]).not.toHaveProperty('matched_terms');
+    // A single unknown service name is still an empty result, not a guess.
+    expect(await search('twitter')).toEqual([]);
+    // Several words that match nothing stay empty too.
+    expect(await search('qzxv wkjp')).toEqual([]);
+  });
+
+  it('keeps hidden child entries out of any-term fallback results', async () => {
+    const tool = buildConnectorSetupTool({
+      uid: 'u1', language: 'en', stageConfigure: vi.fn(() => ({ ok: true as const })),
+      dependencies: {
+        catalog: () => [
+          entry({ id: 'parent', display_name: 'Parent', description_en: 'Team chat.' }),
+          entry({ id: 'child', catalog_parent_id: 'parent', display_name: 'Child', description_en: 'Legacy edition.' }),
+          entry({ id: 'other', display_name: 'Other', description_en: 'Chat archive.' }),
+        ],
+        instances: () => [], enabledSnapshot: () => ({ connectors: {} }),
+      },
+    });
+    const output = await run(tool, { operation: 'search', query: 'child chat calendar' });
+    expect(output.result.results.map((item: { connector_id: string }) => item.connector_id))
+      .toEqual(['parent', 'other']);
+    expect(output.result.results[0].matched_terms).toEqual(['child', 'chat']);
+  });
+
   it('keeps existing related-description search ordering when new translations have different lengths', async () => {
     const parent = (id: string, descriptionFr: string) => entry({
       id, display_name: 'Catalog', description_fr: descriptionFr,

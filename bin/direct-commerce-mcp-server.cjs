@@ -5,12 +5,43 @@ const sellerApi = require('./marketplace-seller-api.cjs');
 const storefrontApi = require('./merchant-platform-api.cjs');
 const shopifySetupRequirements = require('./shopify-setup-requirements.cjs');
 const { refundSignatureHeaders } = require('./ebay-signature.cjs');
-const { withRequestSignal, requestFetch, credentialOperation, requestFailureCode, httpFailureCode } = require('./commerce-request-context.cjs');
+const amazonBusiness = () => require('./amazon-business-api.cjs');
+const squareBusiness = () => require('./square-business-api.cjs');
+const ebayBusiness = () => require('./ebay-business-api.cjs');
+const etsyBusiness = () => require('./etsy-business-api.cjs');
+const bigcommerceBusiness = () => require('./bigcommerce-business-api.cjs');
+const constantContactBusiness = () => require('./constant-contact-business-api.cjs');
+const woocommerceBusiness = () => require('./woocommerce-business-api.cjs');
+const commerceLayerBusiness = () => require('./commercelayer-business-api.cjs');
+const shopifyBusiness = () => require('./shopify-business-api.cjs');
+const shoplineBusiness = () => require('./shopline-business-api.cjs');
+const shoplazzaBusiness = () => require('./shoplazza-business-api.cjs');
+const reloadlyBusiness = () => require('./reloadly-business-api.cjs');
+const lightspeedBusiness = () => require('./lightspeed-business-api.cjs');
+const shoplineGraphql = () => require('./shopline-graphql-api.cjs');
+const baseShopBusiness = () => require('./base-shop-business-api.cjs');
+const walmartBusiness = () => require('./walmart-business-api.cjs');
+const qoo10Business = () => require('./qoo10-business-api.cjs');
+const futureshopBusiness = () => require('./futureshop-business-api.cjs');
+const shopeeBusiness = () => require('./shopee-business-api.cjs');
+const tiktokShopBusiness = () => require('./tiktok-shop-business-api.cjs');
+const yahooShoppingBusiness = () => require('./yahoo-shopping-business-api.cjs');
+const douyinBusiness = () => require('./douyin-business-api.cjs');
+const kuaishouBusiness = () => require('./kuaishou-business-api.cjs');
+const alibaba1688Business = () => require('./alibaba-1688-business-api.cjs');
+const youzanBusiness = () => require('./youzan-business-api.cjs');
+const weimobBusiness = () => require('./weimob-business-api.cjs');
+const taobaoBusiness = () => require('./taobao-business-api.cjs');
+const jdBusiness = () => require('./jd-business-api.cjs');
+const icbuBusiness = () => require('./icbu-business-api.cjs');
+const aliexpressBusiness = () => require('./aliexpress-business-api.cjs');
+const mercadoLibreBusiness = () => require('./mercado-libre-business-api.cjs');
+const { withRequestSignal, requestFetch, credentialOperation, requestFailureCode, httpFailure, tokenExpiryMs } = require('./commerce-request-context.cjs');
 
 require('./proxy-bootstrap.cjs');
 const { createHash, createHmac, randomUUID } = require('node:crypto');
 const { isIP } = require('node:net');
-const { readCredentialFile, writeCredentialFile } = require('./local-api-credential-codec.cjs');
+const { readCredentialFile, writeCredentialFile, rotateCredentialFile, invalidateCredentialFile } = require('./local-api-credential-codec.cjs');
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const {
@@ -181,7 +212,6 @@ const LIGHTSPEED_ACTIONS = Object.freeze({
   'sales.get': action('R', 'Get one sale.', { id: ID }, ['id']),
   'sales.create': action('H', 'Create a sale.', { body: BODY }, ['body']),
   'sales.update': action('H', 'Update a sale.', { id: ID, body: BODY }, ['id', 'body']),
-  'sales.delete': action('D', 'Delete or void a sale.', { id: ID }, ['id']),
 });
 
 const RELOADLY_COMMON = {
@@ -329,13 +359,38 @@ const SQUARE_ACTIONS = Object.freeze({
   'payouts.get': action('R', 'Get one seller payout.', { id: ID }, ['id']),
 });
 
+// Public IDP fields; the existing page validator owns cross-item uniqueness,
+// URL validation and the distinct shopping-list/recipe compatibility aliases.
+function instacartPageSchema(recipe) {
+  const text = maxLength => ({ type: 'string', minLength: 1, maxLength });
+  const object = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
+  const array = (items, maxItems, minItems = 0) => ({ type: 'array', items, minItems, maxItems });
+  const measurement = object({ quantity: { type: 'number', exclusiveMinimum: 0 }, unit: text(64) });
+  const lineItem = object({
+    name: text(200), display_text: text(500),
+    product_ids: { ...array({ type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER }, 10, 1), uniqueItems: true, description: 'Mutually exclusive with upcs; identifiers must be unique across all line items.' },
+    upcs: { ...array({ type: 'string', pattern: '^(?:[0-9]{12}|[0-9]{14})$' }, 10, 1), uniqueItems: true, description: 'Mutually exclusive with product_ids; UPCs must be unique across all line items.' },
+    [recipe ? 'measurements' : 'line_item_measurements']: array(measurement, 10, 1),
+    ...(!recipe ? { quantity: { type: 'number', exclusiveMinimum: 0 }, unit: text(64) } : {}),
+    filters: object({ brand_filters: array(text(100), 10), health_filters: array({ type: 'string', enum: ['ORGANIC', 'GLUTEN_FREE', 'FAT_FREE', 'VEGAN', 'KOSHER', 'SUGAR_FREE', 'LOW_FAT'] }, 7) }),
+  }, ['name']);
+  return object({
+    title: text(200), image_url: { ...text(2048), description: 'HTTPS image URL, without embedded credentials.' },
+    expires_in: { type: 'integer', minimum: 1, maximum: 365 }, instructions: array(text(2000), 100),
+    ...(recipe ? { author: text(200), servings: { type: 'integer', minimum: 1, maximum: 10000 }, cooking_time: { type: 'integer', minimum: 1, maximum: 10000 }, external_reference_id: text(200), content_creator_credit_info: text(500) }
+      : { link_type: { type: 'string', enum: ['shopping_list'], description: 'Use recipe_page.create for a recipe.' } }),
+    [recipe ? 'ingredients' : 'line_items']: array(lineItem, 100, 1),
+    landing_page_configuration: object({ partner_linkback_url: { ...text(2048), description: 'HTTPS link back to your site, without embedded credentials.' }, enable_pantry_items: { type: 'boolean' } }),
+  }, ['title', recipe ? 'ingredients' : 'line_items']);
+}
+
 const INSTACART_ACTIONS = Object.freeze({
   'retailers.list': action('R', 'List nearby Instacart retailers for a US or Canadian postal code.', {
     postal_code: { type: 'string', minLength: 1, maxLength: 20 },
     country_code: { type: 'string', enum: ['US', 'CA'] },
   }, ['postal_code', 'country_code']),
-  'recipe_page.create': action('H', 'Create an externally visible Instacart recipe page and shareable cart-building link.', { body: BODY }, ['body']),
-  'shopping_list_page.create': action('H', 'Create an externally visible Instacart shopping-list page and shareable cart-building link.', { body: BODY }, ['body']),
+  'recipe_page.create': action('H', 'Create an externally visible Instacart recipe page and shareable cart-building link.', { body: instacartPageSchema(true) }, ['body']),
+  'shopping_list_page.create': action('H', 'Create an externally visible Instacart shopping-list page and shareable cart-building link.', { body: instacartPageSchema(false) }, ['body']),
 });
 
 const WOOCOMMERCE_ACTIONS = Object.freeze({
@@ -676,7 +731,7 @@ const ALIBABA_1688_ACTIONS = Object.freeze({
     order_direction: { type: 'string', enum: ['ASC', 'DESC'] },
   }),
   'products.get': action('R', 'Get one seller product.', { product_id: ID }, ['product_id']),
-  'orders.list': action('R', 'List seller orders without requesting buyer address or phone.', {
+  'orders.list': action('R', 'List authorized seller orders with complete returned fulfillment and memo fields.', {
     create_start: { type: 'string', minLength: 19, maxLength: 19 }, create_end: { type: 'string', minLength: 19, maxLength: 19 },
     modify_start: { type: 'string', minLength: 19, maxLength: 19 }, modify_end: { type: 'string', minLength: 19, maxLength: 19 },
     page: { type: 'integer', minimum: 1, maximum: 1000 }, page_size: { type: 'integer', minimum: 1, maximum: 20 },
@@ -697,10 +752,6 @@ const ALIBABA_1688_ACTIONS = Object.freeze({
   'inventory.adjust': action('H', 'Apply reviewed stock deltas to up to 20 products.', {
     changes: { type: 'array', minItems: 1, maxItems: 20, items: ALIBABA_1688_STOCK_CHANGE },
   }, ['changes']),
-  'products.update': action('H', 'Incrementally update buyer-visible title, description, or online-trade state.', {
-    product_id: ID, subject: { type: 'string', minLength: 1, maxLength: 120 },
-    description: { type: 'string', minLength: 1, maxLength: 100000 }, support_online_trade: { type: 'boolean' },
-  }, ['product_id']),
   'products.expire': action('H', 'Move up to 20 reviewed products to expired/off-sale state.', {
     product_ids: { type: 'array', minItems: 1, maxItems: 20, items: ID },
   }, ['product_ids']),
@@ -740,31 +791,22 @@ const JD_ACTIONS = Object.freeze({
     page: { type: 'integer', minimum: 1, maximum: 1000 }, page_size: { type: 'integer', minimum: 1, maximum: 50 },
   }),
   'skus.get': action('R', 'Get one seller SKU.', { sku_id: ID }, ['sku_id']),
-  'inventory.get': action('R', 'Get stock for up to 20 reviewed SKUs.', {
+  'inventory.get': action('R', 'Read national SOP stock for up to 20 SKUs in one request. Use the native stock query for partition or warehouse details.', {
     sku_ids: { type: 'array', minItems: 1, maxItems: 20, items: ID },
   }, ['sku_ids']),
-  'orders.list': action('R', 'List non-PII seller order data with reviewed filters.', {
-    order_state: { type: 'string', minLength: 1, maxLength: 64 },
-    start_date: { type: 'string', minLength: 19, maxLength: 19 }, end_date: { type: 'string', minLength: 19, maxLength: 19 },
-    page: { type: 'integer', minimum: 1, maximum: 1000 }, page_size: { type: 'integer', minimum: 1, maximum: 100 },
-    date_type: { type: 'integer', minimum: 0, maximum: 2 }, sort_type: { type: 'integer', minimum: 1, maximum: 2 },
-  }, ['order_state']),
-  'orders.get': action('R', 'Get one order without requesting buyer, consignee, invoice, or contact fields.', {
-    order_id: ID,
-  }, ['order_id']),
   'refunds.list': action('R', 'List after-sales refund applications.', {
-    page: { type: 'integer', minimum: 1, maximum: 1000 }, page_size: { type: 'integer', minimum: 1, maximum: 100 },
-    status: { type: 'integer', minimum: 1, maximum: 16 }, order_id: ID,
+    page: { type: 'integer', minimum: 1, maximum: 100 }, page_size: { type: 'integer', minimum: 1, maximum: 50 },
+    status: { type: 'integer', enum: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 27, 28] }, order_id: ID,
   }),
   'refunds.get': action('R', 'Get one after-sales refund application.', { refund_id: ID }, ['refund_id']),
   'refunds.waiting_count': action('R', 'Get the count of refund applications awaiting seller handling.'),
   'orders.memo_update': action('W', 'Update an internal seller remark on one order.', {
-    order_id: ID, remark: { type: 'string', minLength: 1, maxLength: 500 },
+    order_id: ID, remark: { type: 'string', minLength: 1, maxLength: 500 }, flag: { type: 'integer', minimum: 0, maximum: 5 },
   }, ['order_id', 'remark']),
   'products.recover': action('W', 'Recover one product from the seller recycle bin.', { product_id: ID }, ['product_id']),
-  'inventory.set': action('H', 'Set absolute stock or apply reviewed stock increments to up to 100 SKUs.', {
+  'inventory.set': action('H', 'Set absolute stock or apply reviewed stock increments to up to 30 SKUs.', {
     update_mode: { type: 'string', enum: ['absolute', 'increment'] }, stock_reference_id: { type: 'string', minLength: 1, maxLength: 128 },
-    sku_stocks: { type: 'array', minItems: 1, maxItems: 100, items: JD_SKU_STOCK },
+    sku_stocks: { type: 'array', minItems: 1, maxItems: 30, items: JD_SKU_STOCK },
   }, ['update_mode', 'stock_reference_id', 'sku_stocks']),
   'prices.update': action('H', 'Update the buyer-visible JD price for one SKU.', {
     sku_id: ID, price_yuan: { type: 'number', exclusiveMinimum: 0, maximum: 100000000 },
@@ -858,10 +900,10 @@ const DOUYIN_SHOP_ACTIONS = Object.freeze({
   'skus.list': action('R', 'List SKUs for one seller product.', { product_id: ID }, ['product_id']),
   'skus.get': action('R', 'Get one SKU for one seller product.', { product_id: ID, sku_id: ID }, ['product_id', 'sku_id']),
   'inventory.get': action('R', 'Get stock for one reviewed SKU.', { sku_id: ID }, ['sku_id']),
-  'orders.list': action('R', 'List orders using official reviewed filters; sensitive buyer and receiver fields are removed.', { query: BODY }),
-  'orders.get': action('R', 'Get one order with sensitive buyer and receiver fields removed.', { order_id: ID }, ['order_id']),
-  'refunds.list': action('R', 'List after-sales cases; sensitive return-contact fields are removed.', { query: BODY }),
-  'refunds.get': action('R', 'Get one after-sales case with sensitive return-contact fields removed.', { after_sale_id: ID }, ['after_sale_id']),
+  'orders.list': action('R', 'List authorized orders with complete returned fulfillment fields.', { query: BODY }),
+  'orders.get': action('R', 'Get one authorized order with complete returned fulfillment fields.', { order_id: ID }, ['order_id']),
+  'refunds.list': action('R', 'List authorized after-sales cases with complete returned business fields.', { query: BODY }),
+  'refunds.get': action('R', 'Get one authorized after-sales case with complete returned business fields.', { after_sale_id: ID }, ['after_sale_id']),
   'refunds.reject_reasons': action('R', 'List official rejection reasons for one after-sales case.', { after_sale_id: ID }, ['after_sale_id']),
   'orders.memo_update': action('W', 'Update one internal seller order remark.', {
     order_id: ID, remark: { type: 'string', minLength: 1, maxLength: 500 },
@@ -905,13 +947,13 @@ const KUAISHOU_SHOP_ACTIONS = Object.freeze({
     item_id: ID, external_sku_id: { type: 'string', maxLength: 128 },
     sku_status: { type: 'integer', enum: [1] },
   }, ['item_id']),
-  'orders.list': action('R', 'List orders in a reviewed seven-day window; sensitive buyer and receiver fields are removed.', {
+  'orders.list': action('R', 'List authorized orders in a seven-day window with complete returned fulfillment fields.', {
     cursor: { type: 'string', maxLength: 1024 }, order_view_status: { type: 'integer', minimum: 0, maximum: 7 },
     page_size: { type: 'integer', minimum: 1, maximum: 50 }, sort: { type: 'integer', enum: [1, 2] },
     query_type: { type: 'integer', enum: [1, 2] }, begin_time: { type: 'integer', minimum: 1 },
     end_time: { type: 'integer', minimum: 1 }, cps_type: { type: 'integer', enum: [0, 1, 2] },
   }, ['query_type', 'begin_time', 'end_time']),
-  'orders.get': action('R', 'Get one order with sensitive buyer and receiver fields removed.', { order_id: ID }, ['order_id']),
+  'orders.get': action('R', 'Get one authorized order with complete returned fulfillment fields.', { order_id: ID }, ['order_id']),
   'refunds.list': action('R', 'List after-sales cases in a reviewed one-day window.', {
     cursor: { type: 'string', maxLength: 1024 }, page: { type: 'integer', minimum: 1, maximum: 1000 },
     page_size: { type: 'integer', minimum: 1, maximum: 100 }, sort: { type: 'integer', enum: [1, 2] },
@@ -920,7 +962,7 @@ const KUAISHOU_SHOP_ACTIONS = Object.freeze({
     negotiate_status: { type: 'integer', enum: [1, 2, 3] },
     status: { type: 'integer', enum: [10, 12, 20, 30, 40, 45, 50, 60, 70] }, order_id: ID,
   }, ['query_type', 'begin_time', 'end_time']),
-  'refunds.get': action('R', 'Get one after-sales case with sensitive return-contact fields removed.', { refund_id: ID }, ['refund_id']),
+  'refunds.get': action('R', 'Get one authorized after-sales case with complete returned business fields.', { refund_id: ID }, ['refund_id']),
   'refunds.reject_reasons': action('R', 'List official rejection reasons for one after-sales case.', { refund_id: ID }, ['refund_id']),
   'addresses.list': action('R', 'List reviewed seller shipping or return addresses.', {
     address_type: { type: 'integer', enum: [2, 3] },
@@ -971,8 +1013,8 @@ const YOUZAN_ACTIONS = Object.freeze({
   'products.list_on_sale': action('R', 'List on-sale products with reviewed official filters.', { query: BODY }),
   'products.list_inventory': action('R', 'List off-sale or sold-out products with reviewed official filters.', { query: BODY }),
   'products.get': action('R', 'Get one seller product.', { item_id: ID }, ['item_id']),
-  'orders.list': action('R', 'List seller orders; sensitive buyer and receiver fields are removed.', { query: BODY }),
-  'orders.get': action('R', 'Get one order with sensitive buyer and receiver fields removed.', { order_id: ID }, ['order_id']),
+  'orders.list': action('R', 'List authorized seller orders with complete returned business fields.', { query: BODY }),
+  'orders.get': action('R', 'Get one authorized order with complete returned business fields.', { order_id: ID }, ['order_id']),
   'products.create': action('H', 'Create a buyer-visible product from a reviewed official item payload.', { payload: BODY }, ['payload']),
   'products.update': action('H', 'Update one buyer-visible product from a reviewed official item payload.', {
     item_id: ID, payload: BODY,
@@ -1017,6 +1059,81 @@ const WEIMOB_WOS_ACTIONS = Object.freeze({
   }, ['vid', 'goods_ids']),
 });
 
+// Query fields and provider limits: school.xiaohongshu.com/en/open/{product,package}/.
+const XHS_TIMESTAMP = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER };
+const XHS_PAGE = { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER };
+const XHS_PRODUCT_FILTERS = {
+  status: { type: 'string', enum: ['0', '1', '2'] },
+  page_no: XHS_PAGE, buyable: { type: 'boolean' },
+  create_time_from: XHS_TIMESTAMP, create_time_to: XHS_TIMESTAMP,
+  update_time_from: XHS_TIMESTAMP, update_time_to: XHS_TIMESTAMP,
+  stock_gte: { type: 'integer' }, stock_lte: { type: 'integer' },
+};
+const XHS_QUERIES = Object.freeze({
+  'products.list_lite': { type: 'object', additionalProperties: false, properties: {
+    ...XHS_PRODUCT_FILTERS, page_size: { type: 'integer', minimum: 1, maximum: 500, default: 50 },
+  } },
+  'products.list': { type: 'object', additionalProperties: false, properties: {
+    ...XHS_PRODUCT_FILTERS, page_size: { type: 'integer', minimum: 1, maximum: 50, default: 50 },
+  } },
+  'orders.list_latest': { type: 'object', additionalProperties: false, properties: {
+    order_time_from: XHS_TIMESTAMP, order_time_to: XHS_TIMESTAMP, page_no: XHS_PAGE,
+    page_size: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+  }, required: ['order_time_from', 'order_time_to'], description: 'Required Unix-second creation interval, at most 1800 seconds.' },
+  'orders.list': { type: 'object', additionalProperties: false, properties: {
+    logistics: { type: 'string', minLength: 1, maxLength: 100 },
+    status: { type: 'string', enum: ['waiting', 'shipped', 'received'] },
+    page_no: XHS_PAGE,
+    page_size: { type: 'integer', minimum: 1, maximum: 500, default: 50, description: 'Connector response budget: at most 500 records; the legacy provider guide gives no maximum.' },
+    start_time: XHS_TIMESTAMP, end_time: XHS_TIMESTAMP,
+    time_type: { type: 'string', enum: ['created_at', 'updated_at', 'confirmed_at'] },
+  } },
+  'cancellations.list': { type: 'object', additionalProperties: false, properties: {
+    logistics: { type: 'string', enum: ['red_auto', 'red_box'] },
+    status: { type: 'string', enum: ['unaudited', 'audited'] },
+    page_no: XHS_PAGE,
+    page_size: { type: 'integer', minimum: 1, maximum: 500, default: 50, description: 'Connector response budget: at most 500 records; the legacy provider guide gives no maximum.' },
+    start_time: XHS_TIMESTAMP, end_time: XHS_TIMESTAMP,
+  } },
+});
+
+// Official legacy product request tables; entity wrappers apply only to creation.
+// Keep forward-compatible extension fields accepted under the existing payload budget.
+const xhsObject = (properties) => ({ type: 'object', additionalProperties: true, properties });
+const XHS_TEXT = { type: 'string' };
+const XHS_IMAGES = { type: 'array', items: XHS_TEXT };
+const XHS_VARIANTS = { type: 'array', items: xhsObject({ id: XHS_TEXT, value: XHS_TEXT, value_id: XHS_TEXT }) };
+const XHS_SPU = xhsObject({ brand_id: XHS_TEXT, category_id: XHS_TEXT, name: XHS_TEXT,
+  ename: XHS_TEXT, short_name: { type: 'string', maxLength: 15 } });
+const XHS_SPL = xhsObject({ variants: XHS_VARIANTS });
+const XHS_SPL_ITEM = xhsObject({
+  image_urls: XHS_IMAGES, desc: XHS_TEXT, feature: XHS_TEXT,
+  attributes: { type: 'array', items: xhsObject({ property_id: XHS_TEXT, value: XHS_TEXT, value_id: XHS_TEXT }) },
+  faqs: { type: 'array', items: xhsObject({ question: XHS_TEXT, answer: XHS_TEXT }) },
+  user_guide: xhsObject({ image_urls: XHS_IMAGES }), image_desc: xhsObject({ image_urls: XHS_IMAGES }),
+});
+const XHS_SPV = xhsObject({
+  qty: { type: 'integer', description: 'Product content quantity, not saleable stock.' }, unit: XHS_TEXT,
+  net_weight: { type: 'number' }, gross_weight: { type: 'number' }, barcode: XHS_TEXT,
+  barcode_type: XHS_TEXT, country: XHS_TEXT, shelf_life: { type: 'integer' }, non_desc_variants: XHS_VARIANTS,
+});
+const XHS_CUSTOMS = xhsObject({ import_cost: { type: 'number' }, manufacturer: XHS_TEXT,
+  ingredient: XHS_TEXT, usage: XHS_TEXT, customs_photos_urls: XHS_IMAGES, customs_specification: XHS_TEXT });
+const XHS_SPV_CREATE = xhsObject({ ...XHS_SPV.properties, ...XHS_CUSTOMS.properties });
+const XHS_ITEM = xhsObject({ price: { type: 'number' }, original_price: { type: 'number' },
+  pre_tax_price: { type: 'number', description: 'Pre-tax price; required for applicable tax/logistics modes.' } });
+const XHS_PAYLOADS = Object.freeze({
+  'products.spu_create': xhsObject({ spu: XHS_SPU, spl: XHS_SPL, spl_item: XHS_SPL_ITEM, spv: XHS_SPV_CREATE, item: XHS_ITEM }),
+  'products.spl_create': xhsObject({ spl: XHS_SPL, spl_item: XHS_SPL_ITEM, spv: XHS_SPV_CREATE, item: XHS_ITEM }),
+  'products.spl_item_create': xhsObject({ spl_item: XHS_SPL_ITEM }),
+  'products.spv_create': xhsObject({ spv: XHS_SPV_CREATE, item: XHS_ITEM }),
+  'products.item_create': xhsObject({ item: XHS_ITEM }),
+  'products.spu_update': XHS_SPU, 'products.spl_update': XHS_SPL, 'products.spl_item_update': XHS_SPL_ITEM,
+  'products.spv_update': XHS_SPV, 'products.spv_customs_update': XHS_CUSTOMS, 'products.item_update': XHS_ITEM,
+  'products.item_logistics_update': xhsObject({ logistics_name: XHS_TEXT }),
+  'products.submit_review': { ...BODY, description: 'The legacy submission endpoint documents no request-body fields; omit this payload.' },
+});
+
 const XIAOHONGSHU_ARK_ACTIONS = Object.freeze({
   'connection.check': action('R', 'Verify the production Ark app credentials with a one-item lightweight product query.'),
   'catalog.brands.search': action('R', 'Search official Xiaohongshu brand IDs.', {
@@ -1032,36 +1149,36 @@ const XIAOHONGSHU_ARK_ACTIONS = Object.freeze({
   'catalog.attribute_values.list': action('R', 'List values for one official attribute.', { attribute_id: ID }, ['attribute_id']),
   'catalog.logistics_companies.list': action('R', 'List official express-company codes.'),
   'catalog.logistics_modes.list': action('R', 'List logistics modes available to the seller application.'),
-  'products.list_lite': action('R', 'List lightweight seller product records with reviewed filters.', { query: QUERY }),
-  'products.list': action('R', 'List complete seller product records with reviewed filters.', { query: QUERY }),
-  'products.get': action('R', 'Get one seller product by item ID.', { item_id: ID }, ['item_id']),
+  'products.list_lite': action('R', 'List lightweight seller product records with reviewed filters.', { query: XHS_QUERIES['products.list_lite'] }),
+  'products.list': action('R', 'List complete seller product records with reviewed filters.', { query: XHS_QUERIES['products.list'] }),
+  'products.get': action('R', 'Get one seller product by exactly one of item_id, barcode or skucode.', { item_id: ID, barcode: ID, skucode: ID }),
   'products.spu_get': action('R', 'Get one seller SPU.', { spu_id: ID }, ['spu_id']),
   'inventory.get': action('R', 'Get current inventory for one seller item.', { item_id: ID }, ['item_id']),
-  'orders.list_latest': action('R', 'List recent paid orders without consumer PII.', { query: QUERY }),
-  'orders.list': action('R', 'List orders without exporting them or exposing consumer PII.', { query: QUERY }),
+  'orders.list_latest': action('R', 'List all orders created within a required half-hour interval, including unpaid orders.', { query: XHS_QUERIES['orders.list_latest'] }, ['query']),
+  'orders.list': action('R', 'List orders with all business fields returned by the authorized platform.', { query: XHS_QUERIES['orders.list'] }),
   'orders.statuses_get': action('R', 'Get statuses for up to 10 package IDs.', { package_ids: IDS }, ['package_ids']),
-  'cancellations.list': action('R', 'List pending cancellation requests without consumer PII.', { query: QUERY }),
-  'products.spu_create': action('W', 'Create a non-published SPU from a reviewed official payload.', { payload: BODY }, ['payload']),
-  'products.spl_create': action('W', 'Create a non-published SPL under one SPU.', { spu_id: ID, payload: BODY }, ['spu_id', 'payload']),
-  'products.spl_item_create': action('W', 'Create non-published SPL item content.', { spl_id: ID, payload: BODY }, ['spl_id', 'payload']),
-  'products.spv_create': action('W', 'Create a non-published SPV under one SPL.', { spl_id: ID, payload: BODY }, ['spl_id', 'payload']),
-  'products.item_create': action('W', 'Create a non-published item under one SPV.', { spv_id: ID, payload: BODY }, ['spv_id', 'payload']),
-  'products.spu_update': action('H', 'Update one product SPU after reviewing its current buyer-visible state.', { spu_id: ID, payload: BODY }, ['spu_id', 'payload']),
-  'products.spl_update': action('H', 'Update one product SPL after reviewing its current buyer-visible state.', { spl_id: ID, payload: BODY }, ['spl_id', 'payload']),
-  'products.spl_item_update': action('H', 'Update buyer-visible SPL item content.', { spl_id: ID, payload: BODY }, ['spl_id', 'payload']),
-  'products.spv_update': action('H', 'Update one buyer-visible SPV.', { spv_id: ID, payload: BODY }, ['spv_id', 'payload']),
-  'products.spv_customs_update': action('H', 'Update customs data for one SPV.', { spv_id: ID, payload: BODY }, ['spv_id', 'payload']),
-  'products.item_update': action('H', 'Update one buyer-visible item, including reviewed price fields.', { item_id: ID, payload: BODY }, ['item_id', 'payload']),
-  'products.item_logistics_update': action('H', 'Update the logistics mode for one buyer-visible item.', { item_id: ID, payload: BODY }, ['item_id', 'payload']),
-  'products.submit_review': action('H', 'Submit one SPL item for platform review.', { spl_id: ID, payload: BODY }, ['spl_id']),
+  'cancellations.list': action('R', 'List cancellation requests with all business fields returned by the authorized platform.', { query: XHS_QUERIES['cancellations.list'] }),
+  'products.spu_create': action('W', 'Create a non-published SPU from a reviewed official payload.', { payload: XHS_PAYLOADS['products.spu_create'] }, ['payload']),
+  'products.spl_create': action('W', 'Create a non-published SPL under one SPU.', { spu_id: ID, payload: XHS_PAYLOADS['products.spl_create'] }, ['spu_id', 'payload']),
+  'products.spl_item_create': action('W', 'Create non-published SPL item content.', { spl_id: ID, payload: XHS_PAYLOADS['products.spl_item_create'] }, ['spl_id', 'payload']),
+  'products.spv_create': action('W', 'Create a non-published SPV under one SPL.', { spl_id: ID, payload: XHS_PAYLOADS['products.spv_create'] }, ['spl_id', 'payload']),
+  'products.item_create': action('W', 'Create a non-published item under one SPV.', { spv_id: ID, payload: XHS_PAYLOADS['products.item_create'] }, ['spv_id', 'payload']),
+  'products.spu_update': action('H', 'Update one product SPU after reviewing its current buyer-visible state.', { spu_id: ID, payload: XHS_PAYLOADS['products.spu_update'] }, ['spu_id', 'payload']),
+  'products.spl_update': action('H', 'Update one product SPL after reviewing its current buyer-visible state.', { spl_id: ID, payload: XHS_PAYLOADS['products.spl_update'] }, ['spl_id', 'payload']),
+  'products.spl_item_update': action('H', 'Update buyer-visible SPL item content.', { spl_id: ID, payload: XHS_PAYLOADS['products.spl_item_update'] }, ['spl_id', 'payload']),
+  'products.spv_update': action('H', 'Update one buyer-visible SPV.', { spv_id: ID, payload: XHS_PAYLOADS['products.spv_update'] }, ['spv_id', 'payload']),
+  'products.spv_customs_update': action('H', 'Update customs data for one SPV.', { spv_id: ID, payload: XHS_PAYLOADS['products.spv_customs_update'] }, ['spv_id', 'payload']),
+  'products.item_update': action('H', 'Update one buyer-visible item, including reviewed price fields.', { item_id: ID, payload: XHS_PAYLOADS['products.item_update'] }, ['item_id', 'payload']),
+  'products.item_logistics_update': action('H', 'Update the logistics mode for one buyer-visible item.', { item_id: ID, payload: XHS_PAYLOADS['products.item_logistics_update'] }, ['item_id', 'payload']),
+  'products.submit_review': action('H', 'Submit one SPL item for platform review.', { spl_id: ID, payload: XHS_PAYLOADS['products.submit_review'] }, ['spl_id']),
   'products.availability_set': action('H', 'Publish or unpublish one reviewed item.', { item_id: ID, available: { type: 'boolean' } }, ['item_id', 'available']),
-  'inventory.set': action('H', 'Set absolute inventory for one reviewed item.', {
-    item_id: ID, quantity: { type: 'integer', minimum: 0, maximum: 1_000_000_000 },
-  }, ['item_id', 'quantity']),
-  'inventory.adjust': action('H', 'Atomically increase or decrease inventory for one reviewed item.', {
-    item_id: ID, quantity_delta: { type: 'integer', minimum: -1_000_000_000, maximum: 1_000_000_000 },
-  }, ['item_id', 'quantity_delta']),
-  'orders.export': action('H', 'Export one order detail. This changes the buyer cancellation state; consumer PII is removed from output.', { package_id: ID }, ['package_id']),
+  'inventory.set': action('H', 'Set absolute inventory by exactly one of item_id or barcode. Unavailable for Red Express, Red Post and domestic-trade logistics.', {
+    item_id: ID, barcode: ID, quantity: { type: 'integer', minimum: 0, maximum: 1_000_000_000 },
+  }, ['quantity']),
+  'inventory.adjust': action('H', 'Atomically adjust inventory by exactly one of item_id or barcode. Unavailable for Red Express, Red Post and domestic-trade logistics.', {
+    item_id: ID, barcode: ID, quantity_delta: { type: 'integer', minimum: -1_000_000_000, maximum: 1_000_000_000 },
+  }, ['quantity_delta']),
+  'orders.export': action('H', 'Export one order detail. This changes the buyer cancellation state; preserves authorized business fields and platform masking.', { package_id: ID }, ['package_id']),
   'shipments.send': action('H', 'Ship one exported order with a reviewed express company and tracking number.', {
     package_id: ID, express_company_code: ID, express_no: ID,
   }, ['package_id', 'express_company_code', 'express_no']),
@@ -1227,41 +1344,57 @@ function configured(env = process.env) {
 }
 
 function actionsFor(config) {
-  if (storefrontApi.isProvider(config.provider)) return storefrontApi.actionsFor(config.provider);
+  if (config.provider === 'bigcommerce') return { ...storefrontApi.actionsFor(config.provider, config.metadata), ...bigcommerceBusiness().actionsFor() };
+  if (config.provider === 'shopline') return { ...storefrontApi.actionsFor(config.provider, config.metadata), ...shoplineBusiness().actionsFor(), ...shoplineGraphql().actionsFor() };
+  if (config.provider === 'shoplazza') return { ...storefrontApi.actionsFor(config.provider, config.metadata), ...shoplazzaBusiness().actionsFor() };
+  if (config.provider === 'base_shop') return { ...storefrontApi.actionsFor(config.provider, config.metadata), ...baseShopBusiness().actionsFor() };
+  if (config.provider === 'qoo10_japan') return { ...storefrontApi.actionsFor(config.provider, config.metadata), ...qoo10Business().actionsFor() };
+  if (config.provider === 'futureshop') return { ...storefrontApi.actionsFor(config.provider, config.metadata), ...futureshopBusiness().actionsFor() };
+  if (config.provider === 'yahoo_shopping') return { ...storefrontApi.actionsFor(config.provider, config.metadata), ...yahooShoppingBusiness().actionsFor(config) };
+  if (config.provider === 'aliexpress') return { ...storefrontApi.actionsFor(config.provider, config.metadata), ...aliexpressBusiness().actionsFor(config) };
+  if (config.provider === 'alibaba_icbu') return { ...storefrontApi.actionsFor(config.provider, config.metadata), ...icbuBusiness().actionsFor() };
+  if (storefrontApi.isProvider(config.provider)) return storefrontApi.actionsFor(config.provider, config.metadata);
+  if (config.provider === 'shopee') return { ...sellerApi.actionsFor(config.provider), ...shopeeBusiness().actionsFor(config) };
+  if (config.provider === 'tiktok_shop') return { ...sellerApi.actionsFor(config.provider), ...tiktokShopBusiness().actionsFor(config) };
   if (sellerApi.isSellerProvider(config.provider)) return sellerApi.actionsFor(config.provider);
-  if (config.provider === 'shopify') return SHOPIFY_ACTIONS;
-  if (config.provider === 'constant_contact') return CONSTANT_CONTACT_ACTIONS;
-  if (config.provider === 'commerce_layer') return COMMERCE_LAYER_ACTIONS;
-  if (config.provider === 'lightspeed') return LIGHTSPEED_ACTIONS;
-  if (config.provider === 'woocommerce') return WOOCOMMERCE_ACTIONS;
+  if (config.provider === 'shopify') return { ...SHOPIFY_ACTIONS, ...shopifyBusiness().actionsFor() };
+  if (config.provider === 'constant_contact') return { ...CONSTANT_CONTACT_ACTIONS, ...constantContactBusiness().actionsFor() };
+  if (config.provider === 'commerce_layer') return { ...COMMERCE_LAYER_ACTIONS, ...commerceLayerBusiness().actionsFor() };
+  if (config.provider === 'lightspeed') return { ...LIGHTSPEED_ACTIONS, ...lightspeedBusiness().actionsFor() };
+  if (config.provider === 'woocommerce') return { ...WOOCOMMERCE_ACTIONS, ...woocommerceBusiness().actionsFor() };
   if (config.provider === 'walmart') {
     const market = config.metadata.market;
     if (!['us', 'ca', 'mx', 'cl'].includes(market)) throw new Error('invalid Walmart market binding');
     if (config.metadata.environment === 'sandbox' && market !== 'us') {
       throw new Error('Walmart dynamic sandbox is available only for the US market');
     }
-    return market === 'us' || market === 'mx'
-      ? Object.freeze({ ...WALMART_COMMON_ACTIONS, ...WALMART_RETURN_ACTIONS })
-      : WALMART_COMMON_ACTIONS;
+    return { ...WALMART_COMMON_ACTIONS, ...((market === 'us' || market === 'mx') ? WALMART_RETURN_ACTIONS : {}), ...walmartBusiness().actionsFor(config) };
   }
-  if (config.provider === 'ebay') return EBAY_ACTIONS;
-  if (config.provider === 'etsy') return ETSY_ACTIONS;
-  if (config.provider === 'amazon_seller') return AMAZON_ACTIONS;
-  if (config.provider === 'mercado_libre') return MERCADO_LIBRE_ACTIONS;
-  if (config.provider === 'taobao_top') return TAOBAO_ACTIONS;
-  if (config.provider === 'alibaba_1688') return ALIBABA_1688_ACTIONS;
-  if (config.provider === 'jd_jos') return JD_ACTIONS;
+  if (config.provider === 'ebay') {
+    const actions = { ...EBAY_ACTIONS, ...ebayBusiness().actionsFor(config) };
+    // Old grants without stored scopes retain their compatibility contract.
+    // A known current grant must not advertise an unavailable finance action.
+    if (typeof config.credentials?.scope === 'string'
+        && !config.credentials.scope.split(/[ ,]+/).includes('https://api.ebay.com/oauth/api_scope/sell.finances')) delete actions['orders.issue_refund'];
+    return actions;
+  }
+  if (config.provider === 'etsy') return { ...ETSY_ACTIONS, ...etsyBusiness().actionsFor() };
+  if (config.provider === 'amazon_seller') return { ...AMAZON_ACTIONS, ...amazonBusiness().actionsFor() };
+  if (config.provider === 'mercado_libre') return { ...MERCADO_LIBRE_ACTIONS, ...mercadoLibreBusiness().actionsFor(config) };
+  if (config.provider === 'taobao_top') return { ...TAOBAO_ACTIONS, ...taobaoBusiness().actionsFor(config) };
+  if (config.provider === 'alibaba_1688') return { ...ALIBABA_1688_ACTIONS, ...alibaba1688Business().actionsFor(config) };
+  if (config.provider === 'jd_jos') return { ...JD_ACTIONS, ...jdBusiness().actionsFor(config) };
   if (config.provider === 'pinduoduo') return PINDUODUO_ACTIONS;
-  if (config.provider === 'douyin_shop') return DOUYIN_SHOP_ACTIONS;
-  if (config.provider === 'kuaishou_shop') return KUAISHOU_SHOP_ACTIONS;
-  if (config.provider === 'youzan') return YOUZAN_ACTIONS;
-  if (config.provider === 'weimob_wos') return WEIMOB_WOS_ACTIONS;
+  if (config.provider === 'douyin_shop') return { ...DOUYIN_SHOP_ACTIONS, ...douyinBusiness().actionsFor(config) };
+  if (config.provider === 'kuaishou_shop') return { ...KUAISHOU_SHOP_ACTIONS, ...kuaishouBusiness().actionsFor(config) };
+  if (config.provider === 'youzan') return { ...YOUZAN_ACTIONS, ...youzanBusiness().actionsFor(config) };
+  if (config.provider === 'weimob_wos') return { ...WEIMOB_WOS_ACTIONS, ...weimobBusiness().actionsFor(config) };
   if (config.provider === 'xiaohongshu_ark') return XIAOHONGSHU_ARK_ACTIONS;
-  if (config.provider === 'square') return SQUARE_ACTIONS;
+  if (config.provider === 'square') return { ...SQUARE_ACTIONS, ...squareBusiness().actionsFor() };
   if (config.provider === 'instacart') return INSTACART_ACTIONS;
   const actions = RELOADLY_ACTIONS[config.metadata.product];
   if (!actions) throw new Error('invalid Reloadly product binding');
-  return actions;
+  return { ...actions, ...reloadlyBusiness().actionsFor(config) };
 }
 
 function validateParameters(value) {
@@ -1387,11 +1520,11 @@ function redact(value) {
     .slice(0, MAX_OUTPUT_CHARS);
 }
 
-function commerceError(code, message) {
-  return Object.assign(new Error(message), { code });
+function commerceError(code, message, source) {
+  return Object.assign(new Error(message), { code, ...(source?.httpStatus ? { httpStatus: source.httpStatus } : {}) });
 }
 
-async function fetchJson(url, init = {}, providerName = 'provider') {
+async function fetchJson(url, init = {}, providerName = 'provider', parse = JSON.parse) {
   const deadline = AbortSignal.timeout(45_000);
   let response;
   try {
@@ -1404,22 +1537,54 @@ async function fetchJson(url, init = {}, providerName = 'provider') {
   try { text = await response.text(); }
   catch (error) { throw commerceError(requestFailureCode(error, deadline), `${providerName} response could not be read (HTTP ${response.status})`); }
   // HTTP status is authoritative even if an error body is HTML or oversized.
-  if (!response.ok) throw commerceError(httpFailureCode(response.status), `${providerName} request failed (HTTP ${response.status})`);
+  if (!response.ok) {
+    const error = httpFailure(response.status, `${providerName} request failed (HTTP ${response.status})`);
+    if (response.status === 400 && text.length <= MAX_OUTPUT_CHARS) {
+      let oauthError;
+      try { oauthError = JSON.parse(text)?.error; } catch { /* Non-OAuth errors retain the HTTP classification. */ }
+      if (['invalid_grant', 'invalid_token', 'invalid_client', 'unauthorized_client'].includes(oauthError)) error.code = 'E_TOOL_CALL_AUTH';
+    }
+    throw error;
+  }
   if (text.length > MAX_OUTPUT_CHARS) throw commerceError('E_TOOL_CALL_UPSTREAM', `${providerName} response is too large`);
   let body;
-  try { body = text ? JSON.parse(text) : { ok: true }; }
+  try { body = text ? parse(text) : { ok: true }; }
   catch { throw commerceError('E_TOOL_CALL_UPSTREAM', `${providerName} returned invalid JSON`); }
   return body;
 }
 
-async function fetchStatusOnlyJson(url, init, providerName) {
-  return fetchJson(url, init, providerName);
+async function fetchStatusOnlyJson(url, init, providerName, parse) {
+  return fetchJson(url, init, providerName, parse);
 }
 
 const tokenCache = new Map();
+const tokenAcquisitions = new Map();
+const credentialRefreshes = new Map();
+const tokenKey = config => `${config.provider}:${config.credentialFile}`;
+function sharedOperation(pending, key, operation) {
+  if (pending.has(key)) return pending.get(key);
+  const promise = Promise.resolve().then(operation).finally(() => {
+    if (pending.get(key) === promise) pending.delete(key);
+  });
+  pending.set(key, promise);
+  return promise;
+}
+function cachedTokenOperation(operation) {
+  return credentialOperation(config => sharedOperation(tokenAcquisitions, tokenKey(config), () => operation(config)));
+}
+function credentialTokenOperation(operation) {
+  return credentialOperation(async config => {
+    const token = await sharedOperation(credentialRefreshes, config.credentialFile, () => {
+      config.credentials = readCredentialFile(config.credentialFile, config.credentialKey);
+      return operation(config);
+    });
+    config.credentials = readCredentialFile(config.credentialFile, config.credentialKey);
+    return token;
+  });
+}
 
-async function shopifyToken(config) {
-  const cached = tokenCache.get('shopify');
+const shopifyToken = cachedTokenOperation(async function shopifyToken(config) {
+  const cached = tokenCache.get(tokenKey(config));
   if (cached && cached.expires_at > Date.now() + 300_000) return cached.access_token;
   const shop = config.metadata.shop_domain;
   if (!/^[a-z0-9][a-z0-9-]{0,62}\.myshopify\.com$/.test(shop || '')) throw new Error('invalid Shopify shop binding');
@@ -1441,12 +1606,12 @@ async function shopifyToken(config) {
     missing.push(`one of: ${fulfillmentScopes.join(' / ')}`);
   }
   if (!token.access_token || missing.length) throw new Error(`Shopify app is missing required Admin API scopes: ${missing.join(', ')}`);
-  const record = { access_token: token.access_token, expires_at: Date.now() + Math.max(60, Number(token.expires_in || 86400)) * 1000 };
-  tokenCache.set('shopify', record);
+  const record = { access_token: token.access_token, expires_at: tokenExpiryMs(token.expires_in, 86400) };
+  tokenCache.set(tokenKey(config), record);
   return record.access_token;
-}
+});
 
-const constantContactToken = credentialOperation(async function constantContactToken(config) {
+const constantContactToken = credentialTokenOperation(async function constantContactToken(config) {
   if (Number(config.credentials.expires_at || 0) > Date.now() + 300_000) return config.credentials.access_token;
   const token = await fetchJson('https://authz.constantcontact.com/oauth2/default/v1/token', {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
@@ -1460,12 +1625,12 @@ const constantContactToken = credentialOperation(async function constantContactT
   const granted = new Set(String(token.scope || config.credentials.scope || '').split(/[ ,]+/).filter(Boolean));
   const missing = ['account_read', 'contact_data', 'campaign_data', 'offline_access']
     .filter((scope) => !granted.has(scope));
-  if (missing.length) throw new Error(`Constant Contact authorization is missing required scopes: ${missing.join(', ')}`);
+  if (missing.length) throw commerceError('E_TOOL_CALL_AUTH', `Constant Contact authorization is missing required scopes: ${missing.join(', ')}`);
   config.credentials = {
     ...config.credentials,
     access_token: token.access_token, refresh_token: token.refresh_token,
     token_type: token.token_type || 'Bearer', scope: token.scope || config.credentials.scope,
-    expires_at: Date.now() + Math.max(60, Number(token.expires_in || 86400)) * 1000,
+    expires_at: tokenExpiryMs(token.expires_in, 86400),
   };
   try { writeCredentialFile(config.credentialFile, config.credentialKey, config.credentials); }
   catch { throw new Error('Constant Contact refreshed credentials could not be stored; reconnect this connector'); }
@@ -1480,8 +1645,8 @@ function reloadlyBase(config) {
   return `https://${roots[product]}${environment === 'sandbox' ? '-sandbox' : ''}.reloadly.com`;
 }
 
-async function reloadlyToken(config) {
-  const cached = tokenCache.get('reloadly');
+const reloadlyToken = cachedTokenOperation(async function reloadlyToken(config) {
+  const cached = tokenCache.get(tokenKey(config));
   if (cached && cached.expires_at > Date.now() + 300_000) return cached.access_token;
   const audience = reloadlyBase(config);
   const token = await fetchJson('https://auth.reloadly.com/oauth/token', {
@@ -1492,10 +1657,10 @@ async function reloadlyToken(config) {
     }),
   });
   if (!token.access_token) throw new Error('Reloadly token response is incomplete');
-  const record = { access_token: token.access_token, expires_at: Date.now() + Math.max(60, Number(token.expires_in || 86400)) * 1000 };
-  tokenCache.set('reloadly', record);
+  const record = { access_token: token.access_token, expires_at: tokenExpiryMs(token.expires_in, 86400) };
+  tokenCache.set(tokenKey(config), record);
   return record.access_token;
-}
+});
 
 async function shopifyGraphql(config, query, variables = {}) {
   const token = await shopifyToken(config);
@@ -1611,8 +1776,8 @@ function commerceLayerBase(config) {
   return `https://${slug}.commercelayer.io`;
 }
 
-async function commerceLayerToken(config) {
-  const cacheKey = `commerce_layer:${config.metadata.organization_slug}:${config.credentials.client_id}`;
+const commerceLayerToken = cachedTokenOperation(async function commerceLayerToken(config) {
+  const cacheKey = tokenKey(config);
   const cached = tokenCache.get(cacheKey);
   if (cached && cached.expires_at > Date.now() + 300_000) return cached.access_token;
   const token = await fetchJson('https://auth.commercelayer.io/oauth/token', {
@@ -1627,11 +1792,11 @@ async function commerceLayerToken(config) {
   if (!token.access_token) throw new Error('Commerce Layer token response is incomplete');
   const record = {
     access_token: token.access_token,
-    expires_at: Date.now() + Math.max(60, Number(token.expires_in || 7200)) * 1000,
+    expires_at: tokenExpiryMs(token.expires_in, 7200),
   };
   tokenCache.set(cacheKey, record);
   return record.access_token;
-}
+});
 
 function commerceLayerQuery(value) {
   if (value == null) return '';
@@ -1735,7 +1900,7 @@ async function executeLightspeed(config, name, p) {
     'customers.delete': () => ['DELETE', `/api/2.0/customers/${safeId(p.id)}`],
     'outlets.list': () => ['GET', '/api/2.0/outlets'], 'sales.list': () => ['GET', '/api/2.0/sales'],
     'sales.get': () => ['GET', `/api/2.0/sales/${safeId(p.id)}`], 'sales.create': () => ['POST', '/api/2.0/sales'],
-    'sales.update': () => ['PUT', `/api/2.0/sales/${safeId(p.id)}`], 'sales.delete': () => ['DELETE', `/api/2.0/sales/${safeId(p.id)}`],
+    'sales.update': () => ['PUT', `/api/2.0/sales/${safeId(p.id)}`],
   };
   const route = map[name]?.();
   if (!route) throw new Error('unsupported Lightspeed action');
@@ -1778,7 +1943,7 @@ async function woocommerceRequest(config, method, path, p = {}) {
     return await fetchJson(`${woocommerceBase(config)}${path}${queryString(p.query)}`, init);
   } catch (error) {
     const status = String(error?.message || '').match(/HTTP (\d{3})/)?.[1];
-    throw commerceError(error?.code, `WooCommerce request failed${status ? ` (HTTP ${status})` : ''}`);
+    throw commerceError(error?.code, `WooCommerce request failed${status ? ` (HTTP ${status})` : ''}`, error);
   }
 }
 
@@ -1873,8 +2038,8 @@ function walmartCredentialHeaders(config) {
   };
 }
 
-async function walmartToken(config) {
-  const cacheKey = `walmart:${config.metadata.environment}:${config.metadata.market}:${config.credentials.client_id}`;
+const walmartToken = cachedTokenOperation(async function walmartToken(config) {
+  const cacheKey = tokenKey(config);
   const cached = tokenCache.get(cacheKey);
   if (cached && cached.expires_at > Date.now() + 60_000) return cached.access_token;
   const headers = { ...walmartCredentialHeaders(config), 'content-type': 'application/x-www-form-urlencoded' };
@@ -1885,18 +2050,18 @@ async function walmartToken(config) {
     });
   } catch (error) {
     const status = String(error?.message || '').match(/HTTP (\d{3})/)?.[1];
-    throw commerceError(error?.code, `Walmart credential verification failed${status ? ` (HTTP ${status})` : ''}`);
+    throw commerceError(error?.code, `Walmart credential verification failed${status ? ` (HTTP ${status})` : ''}`, error);
   }
   if (typeof token.access_token !== 'string' || !token.access_token) {
     throw new Error('Walmart credential verification failed');
   }
   const record = {
     access_token: token.access_token,
-    expires_at: Date.now() + Math.max(60, Number(token.expires_in || 900)) * 1000,
+    expires_at: tokenExpiryMs(token.expires_in, 900),
   };
   tokenCache.set(cacheKey, record);
   return record.access_token;
-}
+});
 
 async function walmartTokenDetails(config) {
   let details;
@@ -1906,7 +2071,7 @@ async function walmartTokenDetails(config) {
     });
   } catch (error) {
     const status = String(error?.message || '').match(/HTTP (\d{3})/)?.[1];
-    throw commerceError(error?.code, `Walmart credential verification failed${status ? ` (HTTP ${status})` : ''}`);
+    throw commerceError(error?.code, `Walmart credential verification failed${status ? ` (HTTP ${status})` : ''}`, error);
   }
   const scopes = details?.scopes;
   const required = {
@@ -1950,7 +2115,7 @@ async function walmartRequest(config, method, path, p = {}) {
     return await fetchJson(`${walmartBase(config)}${path}${queryString(p.query)}`, init);
   } catch (error) {
     const status = String(error?.message || '').match(/HTTP (\d{3})/)?.[1];
-    throw commerceError(error?.code, `Walmart Marketplace request failed${status ? ` (HTTP ${status})` : ''}`);
+    throw commerceError(error?.code, `Walmart Marketplace request failed${status ? ` (HTTP ${status})` : ''}`, error);
   }
 }
 
@@ -2056,10 +2221,10 @@ function ebayAppAuthorization(config) {
   return `Basic ${Buffer.from(`${clientId}:${clientSecret}`, 'utf8').toString('base64')}`;
 }
 
-const ebayToken = credentialOperation(async function ebayToken(config) {
+const ebayToken = credentialTokenOperation(async function ebayToken(config) {
   if (Number(config.credentials.expires_at || 0) > Date.now() + 300_000) return config.credentials.access_token;
   if (Number(config.credentials.refresh_expires_at || Number.MAX_SAFE_INTEGER) <= Date.now()) {
-    throw new Error('eBay refresh token has expired; reconnect the seller account');
+    throw commerceError('E_TOOL_CALL_AUTH', 'eBay refresh token has expired; reconnect the seller account');
   }
   let token;
   try {
@@ -2068,22 +2233,23 @@ const ebayToken = credentialOperation(async function ebayToken(config) {
       headers: { authorization: ebayAppAuthorization(config), 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
       body: new URLSearchParams({
         grant_type: 'refresh_token', refresh_token: String(config.credentials.refresh_token || ''),
-        scope: EBAY_REQUIRED_SCOPES.join(' '),
+        scope: [...EBAY_REQUIRED_SCOPES, ...(String(config.credentials.scope || '').split(/[ ,]+/).includes('https://api.ebay.com/oauth/api_scope/sell.finances')
+          ? ['https://api.ebay.com/oauth/api_scope/sell.finances'] : [])].join(' '),
       }).toString(),
     });
   } catch (error) {
     const status = String(error?.message || '').match(/HTTP (\d{3})/)?.[1];
-    throw commerceError(error?.code, `eBay authorization refresh failed${status ? ` (HTTP ${status})` : ''}`);
+    throw commerceError(error?.code, `eBay authorization refresh failed${status ? ` (HTTP ${status})` : ''}`, error);
   }
   if (!token.access_token) throw new Error('eBay refresh returned incomplete credentials');
   const granted = new Set(String(token.scope || config.credentials.scope || '').split(/[ ,]+/).filter(Boolean));
   const missing = EBAY_REQUIRED_SCOPES.filter((scope) => !granted.has(scope));
-  if (missing.length) throw new Error(`eBay authorization is missing required scopes: ${missing.join(', ')}`);
+  if (missing.length) throw commerceError('E_TOOL_CALL_AUTH', `eBay authorization is missing required scopes: ${missing.join(', ')}`);
   config.credentials = {
     ...config.credentials, access_token: token.access_token,
     refresh_token: token.refresh_token || config.credentials.refresh_token,
     token_type: token.token_type || 'Bearer', scope: token.scope || config.credentials.scope,
-    expires_at: Date.now() + Math.max(60, Number(token.expires_in || 7200)) * 1000,
+    expires_at: tokenExpiryMs(token.expires_in, 7200),
   };
   writeCredentialFile(config.credentialFile, config.credentialKey, config.credentials);
   return config.credentials.access_token;
@@ -2091,6 +2257,10 @@ const ebayToken = credentialOperation(async function ebayToken(config) {
 
 async function ebayRequest(config, method, path, p = {}) {
   const token = await ebayToken(config);
+  if (method === 'POST' && path.endsWith('/issue_refund') && typeof config.credentials.scope === 'string'
+      && !config.credentials.scope.split(/[ ,]+/).includes('https://api.ebay.com/oauth/api_scope/sell.finances')) {
+    throw commerceError('E_TOOL_CALL_AUTH', 'The connected eBay grant does not permit refunds');
+  }
   const headers = {
     authorization: `Bearer ${token}`, accept: 'application/json',
     'X-EBAY-C-MARKETPLACE-ID': config.metadata.marketplace_id,
@@ -2109,7 +2279,7 @@ async function ebayRequest(config, method, path, p = {}) {
     return await fetchJson(url, init);
   } catch (error) {
     const status = String(error?.message || '').match(/HTTP (\d{3})/)?.[1];
-    throw commerceError(error?.code, `eBay request failed${status ? ` (HTTP ${status})` : ''}`);
+    throw commerceError(error?.code, `eBay request failed${status ? ` (HTTP ${status})` : ''}`, error);
   }
 }
 
@@ -2185,7 +2355,7 @@ function etsyApiKey(config) {
   return `${keystring}:${sharedSecret}`;
 }
 
-const etsyToken = credentialOperation(async function etsyToken(config) {
+const etsyToken = credentialTokenOperation(async function etsyToken(config) {
   if (Number(config.credentials.expires_at || 0) > Date.now() + 300_000) return config.credentials.access_token;
   let token;
   try {
@@ -2198,7 +2368,7 @@ const etsyToken = credentialOperation(async function etsyToken(config) {
     });
   } catch (error) {
     const status = String(error?.message || '').match(/HTTP (\d{3})/)?.[1];
-    throw commerceError(error?.code, `Etsy authorization refresh failed${status ? ` (HTTP ${status})` : ''}`);
+    throw commerceError(error?.code, `Etsy authorization refresh failed${status ? ` (HTTP ${status})` : ''}`, error);
   }
   if (!token.access_token || !token.refresh_token) throw new Error('Etsy refresh returned incomplete credentials');
   const refreshedUserId = String(token.access_token).split('.', 1)[0];
@@ -2208,11 +2378,11 @@ const etsyToken = credentialOperation(async function etsyToken(config) {
   }
   const granted = new Set(String(token.scope || config.credentials.scope || '').split(/[ ,]+/).filter(Boolean));
   const missing = ETSY_REQUIRED_SCOPES.filter((scope) => !granted.has(scope));
-  if (missing.length) throw new Error(`Etsy authorization is missing required scopes: ${missing.join(', ')}`);
+  if (missing.length) throw commerceError('E_TOOL_CALL_AUTH', `Etsy authorization is missing required scopes: ${missing.join(', ')}`);
   config.credentials = {
     ...config.credentials, access_token: token.access_token, refresh_token: token.refresh_token,
     token_type: token.token_type || 'Bearer', scope: token.scope || config.credentials.scope,
-    expires_at: Date.now() + Math.max(60, Number(token.expires_in || 3600)) * 1000,
+    expires_at: tokenExpiryMs(token.expires_in, 3600),
   };
   writeCredentialFile(config.credentialFile, config.credentialKey, config.credentials);
   return config.credentials.access_token;
@@ -2252,7 +2422,7 @@ async function etsyRequest(config, method, path, p = {}) {
     return await fetchJson(`https://openapi.etsy.com/v3/application${path}${queryString(p.query)}`, init);
   } catch (error) {
     const status = String(error?.message || '').match(/HTTP (\d{3})/)?.[1];
-    throw commerceError(error?.code, `Etsy request failed${status ? ` (HTTP ${status})` : ''}`);
+    throw commerceError(error?.code, `Etsy request failed${status ? ` (HTTP ${status})` : ''}`, error);
   }
 }
 
@@ -2308,8 +2478,8 @@ function amazonBase(config) {
   return `https://${config.metadata.environment === 'sandbox' ? 'sandbox.' : ''}sellingpartnerapi-${region}.amazon.com`;
 }
 
-async function amazonToken(config) {
-  const cacheKey = `amazon:${config.credentialFile}`;
+const amazonToken = cachedTokenOperation(async function amazonToken(config) {
+  const cacheKey = tokenKey(config);
   const cached = tokenCache.get(cacheKey);
   if (cached && cached.expires_at > Date.now() + 300_000) return cached.access_token;
   const token = await fetchStatusOnlyJson('https://api.amazon.com/auth/o2/token', {
@@ -2323,11 +2493,11 @@ async function amazonToken(config) {
   if (!token.access_token) throw new Error('Amazon Seller authorization returned incomplete credentials');
   const cachedToken = {
     access_token: token.access_token,
-    expires_at: Date.now() + Math.max(60, Number(token.expires_in || 3600)) * 1000,
+    expires_at: tokenExpiryMs(token.expires_in, 3600),
   };
   tokenCache.set(cacheKey, cachedToken);
   return cachedToken.access_token;
-}
+});
 
 async function amazonRequest(config, method, path, p = {}) {
   const token = await amazonToken(config);
@@ -2432,7 +2602,6 @@ async function executeAmazon(config, name, p) {
 }
 
 const MERCADO_LIBRE_REQUIRED_SCOPES = Object.freeze(['offline_access', 'read', 'write']);
-const mercadoRefreshes = new Map();
 
 async function refreshMercadoLibreToken(config) {
   const token = await fetchStatusOnlyJson('https://api.mercadolibre.com/oauth/token', {
@@ -2447,25 +2616,21 @@ async function refreshMercadoLibreToken(config) {
   }
   const granted = new Set(String(token.scope || config.credentials.scope || '').split(/[ ,]+/).filter(Boolean));
   const missing = MERCADO_LIBRE_REQUIRED_SCOPES.filter((scope) => !granted.has(scope));
-  if (missing.length) throw new Error(`Mercado Libre authorization is missing required scopes: ${missing.join(', ')}`);
+  if (missing.length) throw commerceError('E_TOOL_CALL_AUTH', `Mercado Libre authorization is missing required scopes: ${missing.join(', ')}`);
   config.credentials = {
     ...config.credentials, access_token: token.access_token, refresh_token: token.refresh_token,
     token_type: token.token_type || 'Bearer', scope: token.scope || config.credentials.scope,
-    expires_at: Date.now() + Math.max(60, Number(token.expires_in || 21_600)) * 1000,
+    expires_at: tokenExpiryMs(token.expires_in, 21_600),
   };
   writeCredentialFile(config.credentialFile, config.credentialKey, config.credentials);
   return config.credentials.access_token;
 }
 
-const mercadoLibreToken = credentialOperation(async function mercadoLibreToken(config) {
+const mercadoLibreToken = credentialTokenOperation(async function mercadoLibreToken(config) {
   if (config.credentials.access_token && Number(config.credentials.expires_at || 0) > Date.now() + 300_000) {
     return config.credentials.access_token;
   }
-  const key = config.credentialFile;
-  if (mercadoRefreshes.has(key)) return mercadoRefreshes.get(key);
-  const pending = refreshMercadoLibreToken(config).finally(() => mercadoRefreshes.delete(key));
-  mercadoRefreshes.set(key, pending);
-  return pending;
+  return refreshMercadoLibreToken(config);
 });
 
 async function mercadoLibreRequest(config, method, path, p = {}) {
@@ -2491,7 +2656,9 @@ async function executeMercadoLibre(config, name, p) {
     'listings.update': () => ['PUT', `/global/items/${safeId(p.item_id, 'item_id')}`, { body: p.body }],
     'listings.pause': () => ['PUT', `/global/items/${safeId(p.item_id, 'item_id')}`, { body: { status: 'paused' } }],
     'listings.delete_marketplace': () => ['PUT', `/global/items/${safeId(p.item_id, 'item_id')}`, { body: { site_id: p.site_id, logistic_type: 'remote', deleted: true } }],
-    'orders.search': () => ['GET', '/marketplace/orders/search', { query: { ...p.query, 'seller.id': user } }],
+    // Global orders are scoped by the parent token. seller.id is an optional
+    // local child filter, so the parent ID would incorrectly hide its orders.
+    'orders.search': () => ['GET', '/marketplace/orders/search', { query: Object.fromEntries(Object.entries(p.query || {}).filter(([key]) => key !== 'seller.id')) }],
     'orders.get': () => ['GET', `/marketplace/orders/${safeId(p.order_id, 'order_id')}`, {}],
     'shipments.get': () => ['GET', `/marketplace/shipments/${safeId(p.shipment_id, 'shipment_id')}`, { headers: { 'x-format-new': 'true' } }],
     'shipments.items': () => ['GET', `/marketplace/shipments/${safeId(p.shipment_id, 'shipment_id')}/items`, {}],
@@ -2511,7 +2678,6 @@ async function executeMercadoLibre(config, name, p) {
 }
 
 const TAOBAO_API_URL = 'https://gw.api.taobao.com/router/rest';
-const taobaoRefreshes = new Map();
 
 function chinaTimestamp(now = Date.now()) {
   return new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' ');
@@ -2522,7 +2688,7 @@ function signTaobao(parameters, appSecret) {
   return createHmac('sha256', appSecret).update(message, 'utf8').digest('hex').toUpperCase();
 }
 
-async function taobaoRequestWithToken(config, accessToken, method, parameters = {}) {
+async function taobaoRequestWithToken(config, accessToken, method, parameters = {}, options = {}) {
   const form = {
     method, app_key: config.credentials.app_key, session: accessToken,
     timestamp: chinaTimestamp(), v: '2.0', sign_method: 'hmac-sha256',
@@ -2532,65 +2698,66 @@ async function taobaoRequestWithToken(config, accessToken, method, parameters = 
   const body = await fetchStatusOnlyJson(TAOBAO_API_URL, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded;charset=utf-8', accept: 'application/json' },
     body: new URLSearchParams(Object.fromEntries(Object.entries(form).map(([key, value]) => [key, String(value)]))).toString(),
-  }, 'Taobao');
+  }, 'Taobao', options.parseJson || JSON.parse);
   if (body?.error_response) {
-    throw new Error(`Taobao request failed (provider code ${String(body.error_response.code || 'unknown').slice(0, 40)})`);
+    const code = String(body.error_response.code);
+    throw commerceError(code === '7' ? 'E_TOOL_CALL_RATE_LIMIT'
+      : ['11', '25', '26', '27', '29'].includes(code) ? 'E_TOOL_CALL_AUTH' : 'E_TOOL_CALL_UPSTREAM',
+    'Taobao rejected the request; check application permissions, authorization and parameters');
   }
   return body;
 }
 
 async function refreshTaobaoToken(config) {
-  if (!config.credentials.refresh_token
-      || Number(config.credentials.refresh_expires_at || 0) <= Date.now() + 300_000) {
-    throw new Error('Taobao authorization expired; reconnect this seller account');
-  }
-  const token = await fetchStatusOnlyJson('https://oauth.taobao.com/token', {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token', refresh_token: String(config.credentials.refresh_token),
-      client_id: String(config.credentials.app_key), client_secret: String(config.credentials.app_secret),
-    }).toString(),
-  }, 'Taobao authorization');
-  if (!token.access_token
-      || (token.taobao_user_id && String(token.taobao_user_id) !== String(config.credentials.identity.user_id))
-      || (config.credentials.identity.open_uid && token.taobao_open_uid
-        && String(token.taobao_open_uid) !== String(config.credentials.identity.open_uid))) {
-    throw new Error('Taobao refresh returned incomplete or mismatched credentials');
-  }
-  const identityResponse = await taobaoRequestWithToken(config, token.access_token, 'taobao.user.seller.get', {
-    fields: 'user_id,nick,type,has_shop',
+  return rotateCredentialFile(config, async () => {
+    if (!config.credentials.refresh_token
+        || Number(config.credentials.refresh_expires_at || 0) <= Date.now() + 300_000) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'Taobao authorization expired; reconnect this seller account');
+    }
+    const token = await fetchStatusOnlyJson('https://oauth.taobao.com/token', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token', refresh_token: String(config.credentials.refresh_token),
+        client_id: String(config.credentials.app_key), client_secret: String(config.credentials.app_secret),
+      }).toString(),
+    }, 'Taobao authorization');
+    if (!token.access_token
+        || (token.taobao_user_id && String(token.taobao_user_id) !== String(config.credentials.identity.user_id))
+        || (config.credentials.identity.open_uid && token.taobao_open_uid
+          && String(token.taobao_open_uid) !== String(config.credentials.identity.open_uid))) {
+      throw new Error('Taobao refresh returned incomplete or mismatched credentials');
+    }
+    const next = {
+      ...config.credentials, access_token: token.access_token,
+      refresh_token: token.refresh_token || config.credentials.refresh_token,
+      expires_at: tokenExpiryMs(token.expires_in, 86_400),
+      refresh_expires_at: token.re_expires_in
+        ? tokenExpiryMs(token.re_expires_in)
+        : config.credentials.refresh_expires_at,
+      identity: {
+        ...config.credentials.identity,
+        ...(token.taobao_open_uid ? { open_uid: String(token.taobao_open_uid) } : {}),
+      },
+    };
+    return next;
+  }, async config => {
+    const identityResponse = await taobaoRequestWithToken(config, config.credentials.access_token, 'taobao.user.seller.get', {
+      fields: 'user_id,nick,type,has_shop',
+    });
+    const identity = identityResponse.user_seller_get_response?.user || identityResponse.user || {};
+    if (!identity.nick || String(identity.user_id || '') !== String(config.credentials.identity.user_id)) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'Taobao refresh returned a different seller');
+    }
   });
-  const identity = identityResponse.user_seller_get_response?.user || identityResponse.user || {};
-  if (!identity.nick || String(identity.user_id || '') !== String(config.credentials.identity.user_id)) {
-    throw new Error('Taobao refresh returned a different seller');
-  }
-  config.credentials = {
-    ...config.credentials, access_token: token.access_token,
-    refresh_token: token.refresh_token || config.credentials.refresh_token,
-    expires_at: Date.now() + Math.max(60, Number(token.expires_in || 86_400)) * 1000,
-    refresh_expires_at: token.re_expires_in
-      ? Date.now() + Math.max(60, Number(token.re_expires_in)) * 1000
-      : config.credentials.refresh_expires_at,
-    identity: {
-      ...config.credentials.identity,
-      ...(token.taobao_open_uid ? { open_uid: String(token.taobao_open_uid) } : {}),
-    },
-  };
-  writeCredentialFile(config.credentialFile, config.credentialKey, config.credentials);
-  return config.credentials.access_token;
 }
 
-const taobaoToken = credentialOperation(async function taobaoToken(config) {
+const taobaoToken = credentialTokenOperation(async function taobaoToken(config) {
   if (Number(config.credentials.expires_at || 0) > Date.now() + 300_000) return config.credentials.access_token;
-  const key = config.credentialFile;
-  if (taobaoRefreshes.has(key)) return taobaoRefreshes.get(key);
-  const pending = refreshTaobaoToken(config).finally(() => taobaoRefreshes.delete(key));
-  taobaoRefreshes.set(key, pending);
-  return pending;
+  return refreshTaobaoToken(config);
 });
 
-async function taobaoRequest(config, method, parameters = {}) {
-  return taobaoRequestWithToken(config, await taobaoToken(config), method, parameters);
+async function taobaoRequest(config, method, parameters = {}, options = {}) {
+  return taobaoBusiness().sanitize(await taobaoRequestWithToken(config, await taobaoToken(config), method, parameters, { parseJson: taobaoBusiness().parse, ...options }), config.credentials);
 }
 
 function sellerDate(value, name) {
@@ -2599,20 +2766,19 @@ function sellerDate(value, name) {
 }
 
 async function executeTaobao(config, name, p) {
-  const itemFields = 'num_iid,title,price,num,outer_id,cid,modified,list_time,delist_time,approve_status,has_discount,has_showcase,freight_payer,sku,skus';
-  const listFields = 'num_iid,title,price,num,outer_id,cid,modified,list_time,delist_time,approve_status';
-  if (name === 'account.get') return taobaoRequest(config, 'taobao.user.seller.get', { fields: 'user_id,nick,type,has_shop,consumer_protection,created,last_visit' });
+  const fieldsFor = taobaoBusiness().fieldsFor;
+  if (name === 'account.get') return taobaoRequest(config, 'taobao.user.seller.get', { fields: fieldsFor('taobao.user.seller.get') });
   if (name === 'listings.onsale' || name === 'listings.inventory') {
     return taobaoRequest(config, name === 'listings.onsale' ? 'taobao.items.onsale.get' : 'taobao.items.inventory.get', {
-      fields: listFields, page_no: String(p.page_no || 1), page_size: String(p.page_size || 40),
+      fields: fieldsFor(name === 'listings.onsale' ? 'taobao.items.onsale.get' : 'taobao.items.inventory.get'), page_no: String(p.page_no || 1), page_size: String(p.page_size || 40),
       ...(p.query ? { q: p.query } : {}), ...(p.order_by ? { order_by: p.order_by } : {}),
     });
   }
   if (name === 'listings.get') return taobaoRequest(config, 'taobao.item.seller.get', {
-    num_iid: safeNumericId(p.item_id, 'item_id'), fields: itemFields,
+    num_iid: safeNumericId(p.item_id, 'item_id'), fields: fieldsFor('taobao.item.seller.get'),
   });
   if (name === 'orders.list') return taobaoRequest(config, 'taobao.trades.sold.get', {
-    fields: 'tid,status,created,modified,payment,post_fee,num,num_iid,title,type,seller_nick,orders.oid,orders.num_iid,orders.sku_id,orders.outer_sku_id,orders.num,orders.title,orders.price,orders.total_fee,orders.payment,orders.status',
+    fields: fieldsFor('taobao.trades.sold.get'),
     page_no: String(p.page_no || 1), page_size: String(p.page_size || 40),
     ...(p.start_created ? { start_created: sellerDate(p.start_created, 'start_created') } : {}),
     ...(p.end_created ? { end_created: sellerDate(p.end_created, 'end_created') } : {}),
@@ -2639,7 +2805,6 @@ async function executeTaobao(config, name, p) {
   throw new Error('unsupported Taobao/Tmall action');
 }
 
-const alibaba1688Refreshes = new Map();
 
 function encode1688Parameter(value) {
   return typeof value === 'string' ? value : JSON.stringify(value);
@@ -2660,48 +2825,46 @@ async function alibaba1688RequestWithToken(config, accessToken, namespace, metho
     body: new URLSearchParams(Object.fromEntries(
       Object.entries(form).map(([key, value]) => [key, encode1688Parameter(value)]),
     )).toString(),
-  }, '1688');
+  }, '1688', text => alibaba1688Business().parse(text, method));
   if (body?.success === false) throw new Error(`1688 request failed (provider code ${String(body.errorCode || 'unknown').slice(0, 40)})`);
   return body;
 }
 
 async function refreshAlibaba1688Token(config) {
-  const token = await fetchStatusOnlyJson(
-    `https://gw.open.1688.com/openapi/http/1/system.oauth2/getToken/${encodeURIComponent(config.credentials.app_key)}`,
-    {
-      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token', client_id: String(config.credentials.app_key),
-        client_secret: String(config.credentials.app_secret), refresh_token: String(config.credentials.refresh_token),
-      }).toString(),
-    }, '1688 authorization',
-  );
-  if (!token.access_token || (token.memberId && String(token.memberId) !== String(config.credentials.identity.member_id))) {
-    throw new Error('1688 refresh returned incomplete or mismatched credentials');
-  }
-  const identityResponse = await alibaba1688RequestWithToken(
-    config, token.access_token, 'com.alibaba.account', 'alibaba.account.basic',
-  );
-  if (String(identityResponse?.result?.memberId || '') !== String(config.credentials.identity.member_id)) {
-    throw new Error('1688 refresh returned a different seller');
-  }
-  config.credentials = {
-    ...config.credentials, access_token: token.access_token,
-    refresh_token: token.refresh_token || config.credentials.refresh_token,
-    expires_at: Date.now() + Math.max(60, Number(token.expires_in || 36_000)) * 1000,
-    refresh_token_timeout: token.refresh_token_timeout || config.credentials.refresh_token_timeout,
-  };
-  writeCredentialFile(config.credentialFile, config.credentialKey, config.credentials);
-  return config.credentials.access_token;
+  return rotateCredentialFile(config, async () => {
+    const token = await fetchStatusOnlyJson(
+      `https://gw.open.1688.com/openapi/http/1/system.oauth2/getToken/${encodeURIComponent(config.credentials.app_key)}`,
+      {
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token', client_id: String(config.credentials.app_key),
+          client_secret: String(config.credentials.app_secret), refresh_token: String(config.credentials.refresh_token),
+        }).toString(),
+      }, '1688 authorization',
+    );
+    if (!token.access_token || (token.memberId && String(token.memberId) !== String(config.credentials.identity.member_id))) {
+      throw new Error('1688 refresh returned incomplete or mismatched credentials');
+    }
+    const next = {
+      ...config.credentials, access_token: token.access_token,
+      refresh_token: token.refresh_token || config.credentials.refresh_token,
+      expires_at: tokenExpiryMs(token.expires_in, 36_000),
+      refresh_token_timeout: token.refresh_token_timeout || config.credentials.refresh_token_timeout,
+    };
+    return next;
+  }, async config => {
+    const identityResponse = await alibaba1688RequestWithToken(
+      config, config.credentials.access_token, 'com.alibaba.account', 'alibaba.account.basic',
+    );
+    if (String(identityResponse?.result?.memberId || '') !== String(config.credentials.identity.member_id)) {
+      throw new Error('1688 refresh returned a different seller');
+    }
+  });
 }
 
-const alibaba1688Token = credentialOperation(async function alibaba1688Token(config) {
+const alibaba1688Token = credentialTokenOperation(async function alibaba1688Token(config) {
   if (Number(config.credentials.expires_at || 0) > Date.now() + 300_000) return config.credentials.access_token;
-  const key = config.credentialFile;
-  if (alibaba1688Refreshes.has(key)) return alibaba1688Refreshes.get(key);
-  const pending = refreshAlibaba1688Token(config).finally(() => alibaba1688Refreshes.delete(key));
-  alibaba1688Refreshes.set(key, pending);
-  return pending;
+  return refreshAlibaba1688Token(config);
 });
 
 async function alibaba1688Request(config, namespace, method, parameters = {}) {
@@ -2725,24 +2888,6 @@ function sendGoods(orderId, entries) {
   }];
 }
 
-const ALIBABA_1688_SENSITIVE_ORDER_FIELDS = new Set([
-  'address', 'buyeraddress', 'buyeralipayid', 'buyercontact', 'buyeremail', 'buyerloginid',
-  'buyermemo', 'buyermobile', 'buyername', 'buyerphone', 'buyeruserid', 'contact', 'email',
-  'idcard', 'identitycard', 'mobile', 'phone', 'receiver', 'receiveraddress', 'receiverinfo',
-  'receivermobile', 'receivername', 'receiverphone', 'toaddress', 'toarea', 'tofullname',
-  'tomobile', 'tophone', 'topost',
-]);
-
-function minimizeAlibaba1688OrderData(value) {
-  if (Array.isArray(value)) return value.map(minimizeAlibaba1688OrderData);
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).flatMap(([key, child]) => {
-    const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
-    return ALIBABA_1688_SENSITIVE_ORDER_FIELDS.has(normalized)
-      ? [] : [[key, minimizeAlibaba1688OrderData(child)]];
-  }));
-}
-
 async function executeAlibaba1688(config, name, p) {
   if (name === 'account.get') return alibaba1688Request(config, 'com.alibaba.account', 'alibaba.account.basic');
   if (name === 'products.list') return alibaba1688Request(config, 'com.alibaba.product', 'alibaba.product.list.get', {
@@ -2750,7 +2895,7 @@ async function executeAlibaba1688(config, name, p) {
     ...(p.status ? { statusList: [p.status] } : {}), ...(p.category_id ? { categoryId: safeNumericId(p.category_id, 'category_id') } : {}),
     ...(p.keyword ? { subjectKey: p.keyword } : {}), ...(p.product_ids ? { productIds: p.product_ids.map((id) => jsonLong(id, 'product_id')) } : {}),
     ...(p.order_by ? { orderByCondition: p.order_by } : {}), ...(p.order_direction ? { orderByType: p.order_direction } : {}),
-    needDetail: false, needFreight: false, needUserCategoryInfo: false,
+    needDetail: true, needFreight: true, needUserCategoryInfo: true,
   });
   if (name === 'products.get') return alibaba1688Request(config, 'com.alibaba.product', 'alibaba.product.get', {
     productID: safeNumericId(p.product_id, 'product_id'), webSite: '1688', scene: '1688',
@@ -2758,7 +2903,7 @@ async function executeAlibaba1688(config, name, p) {
   if (name === 'orders.list') {
     const response = await alibaba1688Request(config, 'com.alibaba.trade', 'alibaba.trade.getSellerOrderList', {
       page: String(p.page || 1), pageSize: String(p.page_size || 20),
-      needBuyerAddressAndPhone: false, needMemoInfo: false,
+      needBuyerAddressAndPhone: true, needMemoInfo: true,
       ...(p.create_start ? { createStartTime: sellerDate(p.create_start, 'create_start') } : {}),
       ...(p.create_end ? { createEndTime: sellerDate(p.create_end, 'create_end') } : {}),
       ...(p.modify_start ? { modifyStartTime: sellerDate(p.modify_start, 'modify_start') } : {}),
@@ -2766,7 +2911,7 @@ async function executeAlibaba1688(config, name, p) {
       ...(p.status ? { orderStatus: p.status } : {}), ...(p.refund_status ? { refundStatus: p.refund_status } : {}),
       ...(p.product_name ? { productName: p.product_name } : {}),
     });
-    return minimizeAlibaba1688OrderData(response);
+    return alibaba1688Business().sanitize(response, config.credentials);
   }
   if (name === 'refunds.list') {
     const response = await alibaba1688Request(config, 'com.alibaba.trade', 'alibaba.trade.refund.queryOrderRefundList', {
@@ -2778,7 +2923,7 @@ async function executeAlibaba1688(config, name, p) {
       ...(p.statuses ? { refundStatusSet: p.statuses } : {}), currentPageNum: String(p.page || 0),
       pageSize: String(p.page_size || 20), ...(p.dispute_type !== undefined ? { dipsuteType: String(p.dispute_type) } : {}),
     });
-    return minimizeAlibaba1688OrderData(response);
+    return alibaba1688Business().sanitize(response, config.credentials);
   }
   if (name === 'freight_templates.list') return alibaba1688Request(config, 'com.alibaba.logistics', 'alibaba.logistics.myFreightTemplate.list.get', {
     ...(p.template_id ? { templateId: safeNumericId(p.template_id, 'template_id') } : {}),
@@ -2794,16 +2939,6 @@ async function executeAlibaba1688(config, name, p) {
       })),
     })),
   });
-  if (name === 'products.update') {
-    if (p.subject === undefined && p.description === undefined && p.support_online_trade === undefined) {
-      throw new Error('at least one product field must be supplied');
-    }
-    return alibaba1688Request(config, 'com.alibaba.product', 'alibaba.product.incrementModify', {
-      productID: safeNumericId(p.product_id, 'product_id'), webSite: '1688',
-      ...(p.subject !== undefined ? { subject: p.subject } : {}), ...(p.description !== undefined ? { description: p.description } : {}),
-      ...(p.support_online_trade !== undefined ? { supportOnlineTrade: p.support_online_trade } : {}),
-    });
-  }
   if (name === 'products.expire') return alibaba1688Request(config, 'com.alibaba.product', 'alibaba.product.expire', {
     productIds: p.product_ids.map((id) => jsonLong(id, 'product_id')), webSite: '1688',
   });
@@ -2827,7 +2962,6 @@ async function executeAlibaba1688(config, name, p) {
   throw new Error('unsupported 1688 action');
 }
 
-const jdRefreshes = new Map();
 
 function encodeJdParameter(value) {
   return typeof value === 'string' ? value : JSON.stringify(value);
@@ -2842,13 +2976,14 @@ function signJd(parameters, appSecret) {
 async function jdRequestWithToken(config, accessToken, method, parameters = {}) {
   const form = {
     method, access_token: accessToken, app_key: config.credentials.app_key,
-    timestamp: chinaTimestamp(), '360buy_param_json': JSON.stringify(parameters), v: '2.0',
+    timestamp: chinaTimestamp(), '360buy_param_json': jdBusiness().isNative('api.' + method)
+      ? jdBusiness().serializeParameters(method, parameters) : JSON.stringify(parameters), v: '2.0',
   };
   form.sign = signJd(form, config.credentials.app_secret);
   const body = await fetchStatusOnlyJson('https://api.jd.com/routerjson', {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded;charset=utf-8', accept: 'application/json' },
     body: new URLSearchParams(form).toString(),
-  }, 'JD.com');
+  }, 'JD.com', jdBusiness().parse);
   if (body?.error_response) {
     throw new Error(`JD.com request failed (provider code ${String(body.error_response.code || 'unknown').slice(0, 40)})`);
   }
@@ -2863,49 +2998,50 @@ function jdSellerIdentity(body) {
 }
 
 async function refreshJdToken(config) {
-  const token = await fetchStatusOnlyJson('https://open-oauth.jd.com/oauth2/access_token', {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token', app_key: config.credentials.app_key,
-      app_secret: config.credentials.app_secret, refresh_token: config.credentials.refresh_token,
-    }).toString(),
-  }, 'JD.com authorization');
-  if (!token.access_token) throw new Error('JD.com refresh returned incomplete credentials');
-  if (token.xid && config.credentials.identity.xid && String(token.xid) !== String(config.credentials.identity.xid)) {
-    throw new Error('JD.com refresh returned a different seller');
-  }
-  const identity = jdSellerIdentity(await jdRequestWithToken(
-    config, token.access_token, 'jingdong.seller.vender.info.get',
-  ));
-  const venderId = String(identity.vender_id || identity.venderId || '');
-  const shopId = String(identity.shop_id || identity.shopId || '');
-  if (venderId !== String(config.credentials.identity.vender_id)
-      || shopId !== String(config.credentials.identity.shop_id)) {
-    throw new Error('JD.com refresh returned a different seller');
-  }
-  config.credentials = {
-    ...config.credentials, access_token: token.access_token,
-    refresh_token: token.refresh_token || config.credentials.refresh_token,
-    expires_at: Date.now() + Math.max(60, Number(token.expires_in || 31_536_000)) * 1000,
-    refresh_expires_at: token.refresh_token_expires_in
-      ? Date.now() + Math.max(60, Number(token.refresh_token_expires_in)) * 1000
-      : config.credentials.refresh_expires_at,
-  };
-  writeCredentialFile(config.credentialFile, config.credentialKey, config.credentials);
-  return config.credentials.access_token;
+  return rotateCredentialFile(config, async () => {
+    if (config.credentials.refresh_expires_at !== undefined && Number(config.credentials.refresh_expires_at) <= Date.now()) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'Shop authorization expired; reconnect');
+    }
+    const token = await fetchStatusOnlyJson('https://open-oauth.jd.com/oauth2/access_token', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token', app_key: config.credentials.app_key,
+        app_secret: config.credentials.app_secret, refresh_token: config.credentials.refresh_token,
+      }).toString(),
+    }, 'JD.com authorization');
+    if (!token.access_token) throw new Error('JD.com refresh returned incomplete credentials');
+    if (token.xid && config.credentials.identity.xid && String(token.xid) !== String(config.credentials.identity.xid)) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'JD.com refresh returned a different seller');
+    }
+    const next = {
+      ...config.credentials, access_token: token.access_token,
+      refresh_token: token.refresh_token || config.credentials.refresh_token,
+      expires_at: tokenExpiryMs(token.expires_in, 31_536_000),
+      refresh_expires_at: token.refresh_token_expires_in
+        ? tokenExpiryMs(token.refresh_token_expires_in)
+        : config.credentials.refresh_expires_at,
+    };
+    return next;
+  }, async config => {
+    const identity = jdSellerIdentity(await jdRequestWithToken(
+      config, config.credentials.access_token, 'jingdong.seller.vender.info.get',
+    ));
+    const venderId = String(identity.vender_id || identity.venderId || '');
+    const shopId = String(identity.shop_id || identity.shopId || '');
+    if (venderId !== String(config.credentials.identity.vender_id)
+        || shopId !== String(config.credentials.identity.shop_id)) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'JD.com refresh returned a different seller');
+    }
+  });
 }
 
-const jdToken = credentialOperation(async function jdToken(config) {
+const jdToken = credentialTokenOperation(async function jdToken(config) {
   if (Number(config.credentials.expires_at || 0) > Date.now() + 300_000) return config.credentials.access_token;
-  const key = config.credentialFile;
-  if (jdRefreshes.has(key)) return jdRefreshes.get(key);
-  const pending = refreshJdToken(config).finally(() => jdRefreshes.delete(key));
-  jdRefreshes.set(key, pending);
-  return pending;
+  return refreshJdToken(config);
 });
 
 async function jdRequest(config, method, parameters = {}) {
-  return jdRequestWithToken(config, await jdToken(config), method, parameters);
+  return jdBusiness().sanitize(await jdRequestWithToken(config, await jdToken(config), method, parameters), config.credentials);
 }
 
 const COMMERCE_SENSITIVE_FIELDS = new Set([
@@ -2931,63 +3067,38 @@ function minimizeCommerceSensitiveData(value) {
 function jdWareQuery(p) {
   return {
     pageNo: p.page || 1, pageSize: p.page_size || 20,
-    ...(p.keyword ? { searchKey: p.keyword, searchField: ['title'] } : {}),
-    ...(p.product_ids ? { wareIds: p.product_ids.map((id) => safeNumericId(id, 'product_id')) } : {}),
+    ...(p.keyword ? { searchKey: p.keyword, searchField: 'title' } : {}),
+    ...(p.product_ids ? { wareId: p.product_ids.map((id) => safeNumericId(id, 'product_id')).join(',') } : {}),
   };
 }
-
-const JD_ORDER_FIELDS = 'orderId,venderId,orderType,payType,totalOriginalPrice,totalSellerDiscount,totalSellerReceivable,shouldPay,actualPay,freightPrice,orderState,orderStartTime,orderEndTime,paymentConfirmTime,modified,itemInfoList';
 
 async function executeJd(config, name, p) {
   if (name === 'account.get') return jdRequest(config, 'jingdong.seller.vender.info.get');
   if (name === 'products.list_valid' || name === 'products.list_recycled') {
     return jdRequest(config, name === 'products.list_valid'
-      ? 'jingdong.ware.read.searchWare4Valid' : 'jingdong.ware.read.searchWare4Recycled', {
-      wareQuery: jdWareQuery(p), field: 'wareId,title,itemNum,wareStatus,categoryId,brandId,marketPrice,jdPrice,modified',
-    });
+      ? 'jingdong.ware.read.searchWare4Valid' : 'jingdong.ware.read.searchWare4Recycled', jdWareQuery(p));
   }
   if (name === 'products.get') return jdRequest(config, 'jingdong.ware.read.findWareById', {
-    wareId: safeNumericId(p.product_id, 'product_id'), field: 'wareId,title,itemNum,wareStatus,categoryId,brandId,marketPrice,jdPrice,modified',
+    wareId: safeNumericId(p.product_id, 'product_id'),
   });
-  if (name === 'skus.list') return jdRequest(config, 'jingdong.sku.read.searchSkuList', {
-    skuQuery: {
-      pageNo: p.page || 1, pageSize: p.page_size || 20,
-      ...(p.product_ids ? { wareIds: p.product_ids.map((id) => safeNumericId(id, 'product_id')) } : {}),
-      ...(p.sku_ids ? { skuIds: p.sku_ids.map((id) => safeNumericId(id, 'sku_id')) } : {}),
-    }, field: 'skuId,wareId,status,outerId,jdPrice,stockNum,modified',
+  if (name === 'skus.list' || name === 'inventory.get') return jdRequest(config, 'jingdong.sku.read.searchSkuList', {
+    pageNo: p.page || 1, page_size: p.page_size || 20,
+    ...(p.product_ids ? { wareId: p.product_ids.map((id) => safeNumericId(id, 'product_id')).join(',') } : {}),
+    ...(p.sku_ids ? { skuId: p.sku_ids.map((id) => safeNumericId(id, 'sku_id')).join(',') } : {}),
   });
   if (name === 'skus.get') return jdRequest(config, 'jingdong.sku.read.findSkuById', {
-    skuId: safeNumericId(p.sku_id, 'sku_id'), field: 'skuId,wareId,status,outerId,jdPrice,stockNum,modified',
+    skuId: safeNumericId(p.sku_id, 'sku_id'),
   });
-  if (name === 'inventory.get') return jdRequest(config, 'jingdong.stock.read.findSkuStock', {
-    skuIds: p.sku_ids.map((id) => safeNumericId(id, 'sku_id')),
-  });
-  if (name === 'orders.list') {
-    const response = await jdRequest(config, 'jingdong.pop.order.search', { paramOrderJSFQuery: {
-      order_state: p.order_state, optional_fields: JD_ORDER_FIELDS, page: p.page || 1, page_size: p.page_size || 20,
-      ...(p.start_date ? { start_date: sellerDate(p.start_date, 'start_date') } : {}),
-      ...(p.end_date ? { end_date: sellerDate(p.end_date, 'end_date') } : {}),
-      ...(p.date_type !== undefined ? { dateType: p.date_type } : {}),
-      ...(p.sort_type !== undefined ? { sortType: p.sort_type } : {}),
-    } });
-    return minimizeCommerceSensitiveData(response);
-  }
-  if (name === 'orders.get') {
-    const response = await jdRequest(config, 'jingdong.pop.order.get', {
-      orderId: safeNumericId(p.order_id, 'order_id'), optional_fields: JD_ORDER_FIELDS,
-    });
-    return minimizeCommerceSensitiveData(response);
-  }
-  if (name === 'refunds.list') return minimizeCommerceSensitiveData(await jdRequest(config, 'jingdong.pop.afs.soa.refundapply.queryPageList', {
+  if (name === 'refunds.list') return jdRequest(config, 'jingdong.pop.afs.soa.refundapply.queryPageList', {
     pageIndex: p.page || 1, pageSize: p.page_size || 20,
     ...(p.status !== undefined ? { status: p.status } : {}), ...(p.order_id ? { orderId: safeNumericId(p.order_id, 'order_id') } : {}),
-  }));
-  if (name === 'refunds.get') return minimizeCommerceSensitiveData(await jdRequest(config, 'jingdong.pop.afs.soa.refundapply.queryById', {
+  });
+  if (name === 'refunds.get') return jdRequest(config, 'jingdong.pop.afs.soa.refundapply.queryById', {
     id: safeNumericId(p.refund_id, 'refund_id'),
-  }));
+  });
   if (name === 'refunds.waiting_count') return jdRequest(config, 'jingdong.pop.afs.soa.refundapply.getWaitRefundNum');
   if (name === 'orders.memo_update') return jdRequest(config, 'jingdong.pop.order.modifyVenderRemark', {
-    orderId: safeNumericId(p.order_id, 'order_id'), remark: p.remark,
+    order_id: safeNumericId(p.order_id, 'order_id'), flag: p.flag ?? 0, remark: p.remark,
   });
   if (name === 'products.recover') return jdRequest(config, 'jingdong.ware.write.recoverWare', { wareId: safeNumericId(p.product_id, 'product_id') });
   if (name === 'inventory.set') return jdRequest(config, 'jingdong.ware.stock.sku.set', { req: {
@@ -3000,32 +3111,35 @@ async function executeJd(config, name, p) {
     })),
   } });
   if (name === 'prices.update') return jdRequest(config, 'jingdong.price.write.updateSkuJdPrice', {
-    skuPriceSetParam: { skuId: safeNumericId(p.sku_id, 'sku_id'), jdPrice: p.price_yuan },
+    skuId: safeNumericId(p.sku_id, 'sku_id'), jdPrice: p.price_yuan,
   });
   if (name === 'products.publish' || name === 'products.unpublish') return jdRequest(config, 'jingdong.ware.write.upOrDown', {
-    wareStatusChange: { wareId: safeNumericId(p.product_id, 'product_id'), ...(p.reason ? { opReason: p.reason } : {}) },
+    wareId: safeNumericId(p.product_id, 'product_id'), ...(p.reason ? { note: p.reason } : {}),
     opType: name === 'products.publish' ? 1 : 2,
   });
   if (name === 'products.title_update') return jdRequest(config, 'jingdong.ware.write.updateWareTitle', {
     wareId: safeNumericId(p.product_id, 'product_id'), title: p.title,
   });
-  if (name === 'shipments.create' || name === 'shipments.update') return jdRequest(config,
-    name === 'shipments.create' ? 'jingdong.pop.order.shipment' : 'jingdong.pop.order.sop.logistics.update', {
-      orderId: safeNumericId(p.order_id, 'order_id'), logisticsId: safeNumericId(p.logistics_id, 'logistics_id'), waybill: p.waybill,
-    });
+  if (name === 'shipments.create') return jdRequest(config, 'jingdong.pop.order.shipment', {
+    orderId: safeNumericId(p.order_id, 'order_id'), logiCoprId: safeNumericId(p.logistics_id, 'logistics_id'), logiNo: p.waybill,
+  });
+  if (name === 'shipments.update') return jdRequest(config, 'jingdong.pop.order.sop.logistics.update', {
+    oneGlobalOrderModelNoLogistic: { orderId: safeNumericId(p.order_id, 'order_id') },
+    logisticsGlobalModelList: [{ logiCoprId: safeNumericId(p.logistics_id, 'logistics_id'), logiNoList: [p.waybill], logiScope: 0 }],
+  });
   if (name === 'refunds.decide') {
     if (p.status === 2 && p.reject_type === undefined) throw new Error('reject_type is required when rejecting a JD.com refund');
-    return jdRequest(config, 'jingdong.pop.afs.soa.refundapply.replyRefund', { replyParam: {
+    if (p.status !== 9 && !p.remark?.trim()) throw commerceError('E_BAD_INPUT', 'Provide the required JD refund decision remark');
+    return jdRequest(config, 'jingdong.pop.afs.soa.refundapply.replyRefund', {
       id: safeNumericId(p.refund_id, 'refund_id'), status: p.status, checkUserName: p.operator_name,
       ...(p.remark ? { remark: p.remark } : {}), ...(p.reject_type !== undefined ? { rejectType: p.reject_type } : {}),
       ...(p.out_ware_status !== undefined ? { outWareStatus: p.out_ware_status } : {}),
-    } });
+    });
   }
   if (name === 'products.delete') return jdRequest(config, 'jingdong.ware.write.delete', { wareId: safeNumericId(p.product_id, 'product_id') });
   throw new Error('unsupported JD.com action');
 }
 
-const pinduoduoRefreshes = new Map();
 
 function encodePinduoduoParameter(value) {
   return typeof value === 'string' ? value : JSON.stringify(value);
@@ -3056,48 +3170,71 @@ async function pinduoduoRequestWithToken(config, accessToken, type, parameters =
 }
 
 async function refreshPinduoduoToken(config) {
-  const response = await pinduoduoRequestWithToken(config, '', 'pdd.pop.auth.token.refresh', {
-    refresh_token: config.credentials.refresh_token,
+  return rotateCredentialFile(config, async () => {
+    if (config.credentials.refresh_expires_at !== undefined && Number(config.credentials.refresh_expires_at) <= Date.now()) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'Shop authorization expired; reconnect');
+    }
+    const response = await pinduoduoRequestWithToken(config, '', 'pdd.pop.auth.token.refresh', {
+      refresh_token: config.credentials.refresh_token,
+    });
+    const token = response.pop_auth_token_refresh_response || response;
+    if (!token.access_token) throw new Error('Pinduoduo refresh returned incomplete credentials');
+    if (token.owner_id && String(token.owner_id) !== String(config.credentials.identity.mall_id)) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'Pinduoduo refresh returned a different merchant');
+    }
+    const next = {
+      ...config.credentials, access_token: token.access_token,
+      refresh_token: token.refresh_token || config.credentials.refresh_token,
+      scope: Array.isArray(token.scope) ? token.scope : config.credentials.scope,
+      expires_at: tokenExpiryMs(token.expires_in, 86_400),
+      refresh_expires_at: token.refresh_token_expires_in
+        ? tokenExpiryMs(token.refresh_token_expires_in)
+        : config.credentials.refresh_expires_at,
+    };
+    return next;
+  }, async config => {
+    const identityResponse = await pinduoduoRequestWithToken(config, config.credentials.access_token, 'pdd.mall.info.get');
+    if (String(identityResponse?.mall_info_get_response?.mall_id || '') !== String(config.credentials.identity.mall_id)) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'Pinduoduo refresh returned a different merchant');
+    }
   });
-  const token = response.pop_auth_token_refresh_response || response;
-  if (!token.access_token) throw new Error('Pinduoduo refresh returned incomplete credentials');
-  if (token.owner_id && String(token.owner_id) !== String(config.credentials.identity.mall_id)) {
-    throw new Error('Pinduoduo refresh returned a different merchant');
-  }
-  const identityResponse = await pinduoduoRequestWithToken(config, token.access_token, 'pdd.mall.info.get');
-  if (String(identityResponse?.mall_info_get_response?.mall_id || '') !== String(config.credentials.identity.mall_id)) {
-    throw new Error('Pinduoduo refresh returned a different merchant');
-  }
-  config.credentials = {
-    ...config.credentials, access_token: token.access_token,
-    refresh_token: token.refresh_token || config.credentials.refresh_token,
-    scope: Array.isArray(token.scope) ? token.scope : config.credentials.scope,
-    expires_at: Date.now() + Math.max(60, Number(token.expires_in || 86_400)) * 1000,
-    refresh_expires_at: token.refresh_token_expires_in
-      ? Date.now() + Math.max(60, Number(token.refresh_token_expires_in)) * 1000
-      : config.credentials.refresh_expires_at,
-  };
-  writeCredentialFile(config.credentialFile, config.credentialKey, config.credentials);
-  return config.credentials.access_token;
 }
 
-const pinduoduoToken = credentialOperation(async function pinduoduoToken(config) {
+const pinduoduoToken = credentialTokenOperation(async function pinduoduoToken(config) {
   if (Number(config.credentials.expires_at || 0) > Date.now() + 300_000) return config.credentials.access_token;
-  const key = config.credentialFile;
-  if (pinduoduoRefreshes.has(key)) return pinduoduoRefreshes.get(key);
-  const pending = refreshPinduoduoToken(config).finally(() => pinduoduoRefreshes.delete(key));
-  pinduoduoRefreshes.set(key, pending);
-  return pending;
+  return refreshPinduoduoToken(config);
 });
 
 async function pinduoduoRequest(config, type, parameters = {}) {
-  return pinduoduoRequestWithToken(config, await pinduoduoToken(config), type, parameters);
+  return sanitizePinduoduo(await pinduoduoRequestWithToken(config, await pinduoduoToken(config), type, parameters), config.credentials);
 }
 
 function pinduoduoWindow(start, end, maxSeconds, label) {
   if (!Number.isInteger(start) || !Number.isInteger(end) || end < start || end - start > maxSeconds) {
     throw new Error(`invalid Pinduoduo ${label} window`);
   }
+}
+
+function pinduoduoOrderId(value) {
+  const id = String(value || '');
+  // Official bill and decryption guides include YYMMDD-numeric order numbers.
+  if (!/^(?:[1-9][0-9]{0,18}|[0-9]{6}-[0-9]{1,25})$/.test(id) || id.includes('\n')) {
+    throw commerceError('E_BAD_INPUT', 'Invalid Pinduoduo order number');
+  }
+  return id;
+}
+
+function sanitizePinduoduo(value, credentials, depth = 0) {
+  if (depth > 40) throw commerceError('E_TOOL_CALL_UPSTREAM', 'Pinduoduo response is too deeply nested');
+  if (typeof value === 'string') return ['access_token', 'refresh_token', 'client_secret'].reduce((text, key) => {
+    const secret = credentials[key];
+    return typeof secret === 'string' && secret ? text.split(secret).join('[redacted]') : text;
+  }, value);
+  if (Array.isArray(value)) return value.map(item => sanitizePinduoduo(item, credentials, depth + 1));
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !['access_token', 'refresh_token', 'client_secret', 'authorization', 'password', 'cookie'].includes(key.toLowerCase()))
+    .map(([key, item]) => [key, sanitizePinduoduo(item, credentials, depth + 1)]));
 }
 
 async function executePinduoduo(config, name, p) {
@@ -3119,32 +3256,30 @@ async function executePinduoduo(config, name, p) {
       ...(p.trade_type !== undefined ? { trade_type: p.trade_type } : {}),
       ...(p.use_has_next !== undefined ? { use_has_next: p.use_has_next } : {}),
     });
-    return minimizeCommerceSensitiveData(response);
+    return response;
   }
-  if (name === 'orders.status') return minimizeCommerceSensitiveData(await pinduoduoRequest(config, 'pdd.order.status.get', {
-    order_sns: p.order_ids.map((id) => safeNumericId(id, 'order_id')).join(','),
-  }));
+  if (name === 'orders.status') return pinduoduoRequest(config, 'pdd.order.status.get', {
+    order_sns: p.order_ids.map((id) => pinduoduoOrderId(id)).join(','),
+  });
   if (name === 'logistics.companies') return pinduoduoRequest(config, 'pdd.logistics.companies.get');
   if (name === 'refunds.list') {
     pinduoduoWindow(p.start_updated_at, p.end_updated_at, 1_800, 'refund update');
-    return minimizeCommerceSensitiveData(await pinduoduoRequest(config, 'pdd.refund.list.increment.get', {
+    return pinduoduoRequest(config, 'pdd.refund.list.increment.get', {
       after_sales_status: p.after_sales_status, after_sales_type: p.after_sales_type,
       start_updated_at: p.start_updated_at, end_updated_at: p.end_updated_at,
       page: p.page || 1, page_size: p.page_size || 100,
-      ...(p.order_id ? { order_sn: safeNumericId(p.order_id, 'order_id') } : {}),
-    }));
+      ...(p.order_id ? { order_sn: pinduoduoOrderId(p.order_id) } : {}),
+    });
   }
-  if (name === 'refunds.get') return minimizeCommerceSensitiveData(await pinduoduoRequest(config, 'pdd.refund.information.get', {
-    order_sn: safeNumericId(p.order_id, 'order_id'),
+  if (name === 'refunds.get') return pinduoduoRequest(config, 'pdd.refund.information.get', {
+    order_sn: pinduoduoOrderId(p.order_id),
     ...(p.after_sales_id ? { after_sales_id: safeNumericId(p.after_sales_id, 'after_sales_id') } : {}),
-  }));
-  if (name === 'refunds.return_addresses') return minimizeCommerceSensitiveData(
-    await pinduoduoRequest(config, 'pdd.refund.address.list.get'),
-  );
+  });
+  if (name === 'refunds.return_addresses') return pinduoduoRequest(config, 'pdd.refund.address.list.get');
   if (name === 'orders.note_update') {
     if ((p.tag === undefined) !== (p.tag_name === undefined)) throw new Error('tag and tag_name must be supplied together');
     return pinduoduoRequest(config, 'pdd.order.note.update', {
-      order_sn: safeNumericId(p.order_id, 'order_id'), note: p.note,
+      order_sn: pinduoduoOrderId(p.order_id), note: p.note,
       ...(p.tag !== undefined ? { tag: p.tag, tag_name: p.tag_name } : {}),
     });
   }
@@ -3169,20 +3304,20 @@ async function executePinduoduo(config, name, p) {
     goods_id: safeNumericId(p.product_id, 'product_id'), is_onsale: name === 'products.publish' ? 1 : 0,
   });
   if (name === 'shipments.send' || name === 'shipments.update') return pinduoduoRequest(config, 'pdd.logistics.online.send', {
-    order_sn: safeNumericId(p.order_id, 'order_id'), logistics_id: safeNumericId(p.logistics_id, 'logistics_id'),
+    order_sn: pinduoduoOrderId(p.order_id), logistics_id: safeNumericId(p.logistics_id, 'logistics_id'),
     tracking_number: p.tracking_number, redelivery_type: name === 'shipments.send' ? 1 : 2,
     ...(p.refund_address_id ? { refund_address_id: safeNumericId(p.refund_address_id, 'refund_address_id') } : {}),
   });
   if (name === 'refunds.approve') return pinduoduoRequest(config, 'pdd.refund.agree', { request: {
-    order_sn: safeNumericId(p.order_id, 'order_id'), after_sales_id: safeNumericId(p.after_sales_id, 'after_sales_id'),
+    order_sn: pinduoduoOrderId(p.order_id), after_sales_id: safeNumericId(p.after_sales_id, 'after_sales_id'),
     ...(p.description ? { operate_desc: p.description } : {}),
   } });
   if (name === 'refunds.return_approve') return pinduoduoRequest(config, 'pdd.refund.returngoods.agree', { request: {
-    order_sn: safeNumericId(p.order_id, 'order_id'), after_sales_id: safeNumericId(p.after_sales_id, 'after_sales_id'),
+    order_sn: pinduoduoOrderId(p.order_id), after_sales_id: safeNumericId(p.after_sales_id, 'after_sales_id'),
     return_address_id: safeNumericId(p.return_address_id, 'return_address_id'), operate_desc: p.description || '',
   } });
   if (name === 'refunds.exchange_ship') return pinduoduoRequest(config, 'pdd.refund.exchange.shipping', { request: {
-    order_sn: safeNumericId(p.order_id, 'order_id'), after_sales_id: safeNumericId(p.after_sales_id, 'after_sales_id'),
+    order_sn: pinduoduoOrderId(p.order_id), after_sales_id: safeNumericId(p.after_sales_id, 'after_sales_id'),
     shipping_id: safeNumericId(p.logistics_id, 'logistics_id'), shipping_name: p.logistics_name, tracking_number: p.tracking_number,
   } });
   if (name === 'products.delete') return pinduoduoRequest(config, 'pdd.delete.goods.commit', {
@@ -3202,9 +3337,15 @@ function stableCommerceJson(value) {
 }
 
 function platformExpiryMs(value, fallbackSeconds) {
+  if (value === undefined) return tokenExpiryMs(undefined, fallbackSeconds);
+  if (typeof value !== 'number' && typeof value !== 'string') return tokenExpiryMs(value);
   const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) return Date.now() + fallbackSeconds * 1000;
-  return numeric >= 1_000_000_000 ? numeric * 1000 : Date.now() + numeric * 1000;
+  if (numeric < 1_000_000_000) return tokenExpiryMs(value);
+  const expiry = numeric * 1000;
+  if (!Number.isSafeInteger(numeric) || !Number.isSafeInteger(expiry) || expiry <= Date.now()) {
+    throw commerceError('E_TOOL_CALL_UPSTREAM', 'The platform returned an invalid token expiry');
+  }
+  return expiry;
 }
 
 function safePlatformNumericId(value, name = 'id') {
@@ -3213,7 +3354,6 @@ function safePlatformNumericId(value, name = 'id') {
   return id;
 }
 
-const douyinRefreshes = new Map();
 
 function signDouyin(appKey, method, paramJson, timestamp, appSecret) {
   const message = `app_key${appKey}method${method}param_json${paramJson}timestamp${timestamp}v2`;
@@ -3245,37 +3385,38 @@ async function douyinRequestWithToken(config, accessToken, pathName, method, par
 }
 
 async function refreshDouyinToken(config) {
-  const token = await douyinRequestWithToken(config, '', '/token/refresh', 'token.refresh', {
-    grant_type: 'refresh_token', refresh_token: config.credentials.refresh_token,
+  return rotateCredentialFile(config, async () => {
+    if (config.credentials.refresh_expires_at !== undefined && Number(config.credentials.refresh_expires_at) <= Date.now()) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'Shop authorization expired; reconnect');
+    }
+    const token = await douyinRequestWithToken(config, '', '/token/refresh', 'token.refresh', {
+      grant_type: 'refresh_token', refresh_token: config.credentials.refresh_token,
+    });
+    if (!token.access_token || !token.refresh_token) throw new Error('Douyin Shop refresh returned incomplete credentials');
+    if (token.shop_id && String(token.shop_id) !== String(config.credentials.identity.shop_id)) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'Douyin Shop refresh returned a different shop');
+    }
+    const next = {
+      ...config.credentials, access_token: token.access_token, refresh_token: token.refresh_token,
+      scope: token.scope || config.credentials.scope,
+      expires_at: platformExpiryMs(token.expires_in, 7 * 86_400),
+      refresh_expires_at: platformExpiryMs(token.refresh_expires_in, 14 * 86_400),
+    };
+    return next;
+  }, async config => {
+    const identity = await douyinRequestWithToken(config, '', '/open/getAuthInfo', 'open.getAuthInfo', {
+      auth_id: config.credentials.identity.shop_id, auth_subject_type: 'shop',
+    });
+    if (String(identity.auth_id || identity.shop_id || '') !== String(config.credentials.identity.shop_id)
+        || Number(identity.status) !== 1) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'Douyin Shop refresh returned an inactive or different shop');
+    }
   });
-  if (!token.access_token || !token.refresh_token) throw new Error('Douyin Shop refresh returned incomplete credentials');
-  if (token.shop_id && String(token.shop_id) !== String(config.credentials.identity.shop_id)) {
-    throw new Error('Douyin Shop refresh returned a different shop');
-  }
-  const identity = await douyinRequestWithToken(config, '', '/open/getAuthInfo', 'open.getAuthInfo', {
-    auth_id: config.credentials.identity.shop_id, auth_subject_type: 'shop',
-  });
-  if (String(identity.auth_id || identity.shop_id || '') !== String(config.credentials.identity.shop_id)
-      || Number(identity.status) !== 1) {
-    throw new Error('Douyin Shop refresh returned an inactive or different shop');
-  }
-  config.credentials = {
-    ...config.credentials, access_token: token.access_token, refresh_token: token.refresh_token,
-    scope: token.scope || config.credentials.scope,
-    expires_at: platformExpiryMs(token.expires_in, 7 * 86_400),
-    refresh_expires_at: platformExpiryMs(token.refresh_expires_in, 14 * 86_400),
-  };
-  writeCredentialFile(config.credentialFile, config.credentialKey, config.credentials);
-  return config.credentials.access_token;
 }
 
-const douyinToken = credentialOperation(async function douyinToken(config) {
+const douyinToken = credentialTokenOperation(async function douyinToken(config) {
   if (Number(config.credentials.expires_at || 0) > Date.now() + 300_000) return config.credentials.access_token;
-  const key = config.credentialFile;
-  if (douyinRefreshes.has(key)) return douyinRefreshes.get(key);
-  const pending = refreshDouyinToken(config).finally(() => douyinRefreshes.delete(key));
-  douyinRefreshes.set(key, pending);
-  return pending;
+  return refreshDouyinToken(config);
 });
 
 async function douyinRequest(config, pathName, method, parameters = {}, needsAccessToken = true) {
@@ -3284,6 +3425,7 @@ async function douyinRequest(config, pathName, method, parameters = {}, needsAcc
 }
 
 async function executeDouyinShop(config, name, p) {
+  const fullResult = data => douyinBusiness().sanitize({ data }, config.credentials).data;
   if (name === 'account.get') return douyinRequest(config, '/open/getAuthInfo', 'open.getAuthInfo', {
     auth_id: config.credentials.identity.shop_id, auth_subject_type: 'shop',
   }, false);
@@ -3301,16 +3443,16 @@ async function executeDouyinShop(config, name, p) {
   if (name === 'inventory.get') return douyinRequest(config, '/sku/stockNum', 'sku.stockNum', {
     sku_id: safePlatformNumericId(p.sku_id, 'sku_id'),
   });
-  if (name === 'orders.list') return minimizeCommerceSensitiveData(
+  if (name === 'orders.list') return fullResult(
     await douyinRequest(config, '/order/searchList', 'order.searchList', p.query || {}),
   );
-  if (name === 'orders.get') return minimizeCommerceSensitiveData(await douyinRequest(
+  if (name === 'orders.get') return fullResult(await douyinRequest(
     config, '/order/orderDetail', 'order.orderDetail', { shop_order_id: safePlatformNumericId(p.order_id, 'order_id') },
   ));
-  if (name === 'refunds.list') return minimizeCommerceSensitiveData(
+  if (name === 'refunds.list') return fullResult(
     await douyinRequest(config, '/afterSale/List', 'afterSale.List', p.query || {}),
   );
-  if (name === 'refunds.get') return minimizeCommerceSensitiveData(await douyinRequest(
+  if (name === 'refunds.get') return fullResult(await douyinRequest(
     config, '/afterSale/Detail', 'afterSale.Detail', { after_sale_id: safePlatformNumericId(p.after_sale_id, 'after_sale_id') },
   ));
   if (name === 'refunds.reject_reasons') return douyinRequest(
@@ -3353,12 +3495,6 @@ async function executeDouyinShop(config, name, p) {
   throw new Error('unsupported Douyin Shop action');
 }
 
-const kuaishouRefreshes = new Map();
-const KUAISHOU_REQUIRED_SCOPES = [
-  'user_base', 'user_info', 'merchant_user', 'merchant_item',
-  'merchant_order', 'merchant_refund', 'merchant_logistics',
-];
-
 function signKuaishou(parameters, signSecret) {
   const message = Object.keys(parameters).sort()
     .map((key) => `${key}=${parameters[key]}`).join('&') + `&signSecret=${signSecret}`;
@@ -3368,7 +3504,7 @@ function signKuaishou(parameters, signSecret) {
 async function kuaishouRequestWithToken(config, accessToken, method, parameters = {}, httpMethod = 'GET') {
   const common = {
     appkey: config.credentials.app_key, method, version: '1',
-    param: stableCommerceJson(parameters), access_token: accessToken,
+    param: kuaishouBusiness().serializeParameters(method, parameters), access_token: accessToken,
     timestamp: String(Date.now()), signMethod: 'HMAC_SHA256',
   };
   common.sign = signKuaishou(common, config.credentials.sign_secret);
@@ -3382,56 +3518,54 @@ async function kuaishouRequestWithToken(config, accessToken, method, parameters 
     init.headers['content-type'] = 'application/x-www-form-urlencoded';
     init.body = new URLSearchParams(common).toString();
   }
-  const body = await fetchStatusOnlyJson(url, init, 'Kuaishou Shop');
-  if (body?.result !== undefined && Number(body.result) !== 1
-      && String(body.result).toLowerCase() !== 'success') {
+  const body = await fetchStatusOnlyJson(url, init, 'Kuaishou Shop', kuaishouBusiness().parse);
+  if (![1, '1'].includes(body?.result)) {
     throw new Error(`Kuaishou Shop request failed (provider result ${String(body.result).slice(0, 40)})`);
   }
   return body?.data ?? body;
 }
 
 async function refreshKuaishouToken(config) {
-  const body = await fetchStatusOnlyJson('https://openapi.kwaixiaodian.com/oauth2/refresh_token', {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token', refresh_token: config.credentials.refresh_token,
-      app_id: config.credentials.app_key, app_secret: config.credentials.app_secret,
-    }).toString(),
-  }, 'Kuaishou Shop');
-  const token = body?.data ?? body;
-  if (!token.access_token || !token.refresh_token) throw new Error('Kuaishou Shop refresh returned incomplete credentials');
-  if (token.open_id && String(token.open_id) !== String(config.credentials.identity.open_id)) {
-    throw new Error('Kuaishou Shop refresh returned a different seller');
-  }
-  const granted = new Set(String(token.scope || config.credentials.scope || '').split(/[ ,]+/).filter(Boolean));
-  const missing = KUAISHOU_REQUIRED_SCOPES.filter((scope) => !granted.has(scope));
-  if (missing.length) throw new Error(`Kuaishou Shop authorization is missing required scopes: ${missing.join(', ')}`);
-  const seller = await kuaishouRequestWithToken(config, token.access_token, 'open.user.seller.get');
-  const shop = await kuaishouRequestWithToken(config, token.access_token, 'open.shop.info.get');
-  if ((seller.open_id || seller.openId)
-      && String(seller.open_id || seller.openId) !== String(config.credentials.identity.open_id)) {
-    throw new Error('Kuaishou Shop refresh returned a different seller');
-  }
-  if (String(shop.shop_id || shop.shopId || shop.id || '') !== String(config.credentials.identity.shop_id)) {
-    throw new Error('Kuaishou Shop refresh returned a different shop');
-  }
-  config.credentials = {
-    ...config.credentials, access_token: token.access_token, refresh_token: token.refresh_token,
-    scope: token.scope || config.credentials.scope,
-    expires_at: platformExpiryMs(token.expires_in, 48 * 60 * 60),
-    refresh_expires_at: platformExpiryMs(token.refresh_token_expires_in, 180 * 86_400),
-  };
-  writeCredentialFile(config.credentialFile, config.credentialKey, config.credentials);
-  return config.credentials.access_token;
+  return rotateCredentialFile(config, async () => {
+    if (config.credentials.refresh_expires_at !== undefined && Number(config.credentials.refresh_expires_at) <= Date.now()) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'Shop authorization expired; reconnect');
+    }
+    const body = await fetchStatusOnlyJson('https://openapi.kwaixiaodian.com/oauth2/refresh_token', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token', refresh_token: config.credentials.refresh_token,
+        app_id: config.credentials.app_key, app_secret: config.credentials.app_secret,
+      }).toString(),
+    }, 'Kuaishou Shop');
+    if (![1, '1'].includes(body?.result)) throw commerceError('E_TOOL_CALL_AUTH', 'Kuaishou Shop refresh was not acknowledged');
+    const token = body?.data ?? body;
+    if (!token.access_token || !token.refresh_token) throw new Error('Kuaishou Shop refresh returned incomplete credentials');
+    if (token.open_id && String(token.open_id) !== String(config.credentials.identity.open_id)) {
+      throw commerceError('E_TOOL_CALL_AUTH', 'Kuaishou Shop refresh returned a different seller');
+    }
+    let scope;
+    try { scope = require('./local-api-auth.cjs').kuaishouGrantedScope(token); }
+    catch { throw commerceError('E_TOOL_CALL_AUTH', 'Kuaishou Shop refresh is missing required scopes; reconnect'); }
+    const next = {
+      ...config.credentials, access_token: token.access_token, refresh_token: token.refresh_token,
+      scope,
+      expires_at: platformExpiryMs(token.expires_in, 48 * 60 * 60),
+      refresh_expires_at: token.refresh_token_expires_in === undefined
+        ? config.credentials.refresh_expires_at
+        : Math.min(platformExpiryMs(token.refresh_token_expires_in, 180 * 86_400), config.credentials.refresh_expires_at ?? Infinity),
+    };
+    return next;
+  }, async config => {
+    const seller = await kuaishouRequestWithToken(config, config.credentials.access_token, 'open.user.seller.get');
+    const shop = await kuaishouRequestWithToken(config, config.credentials.access_token, 'open.shop.info.get');
+    try { require('./local-api-auth.cjs').kuaishouMerchantIdentity(seller, shop, config.credentials.identity.open_id, config.credentials.identity.shop_id); }
+    catch (error) { throw commerceError('E_TOOL_CALL_AUTH', error.message); }
+  });
 }
 
-const kuaishouToken = credentialOperation(async function kuaishouToken(config) {
+const kuaishouToken = credentialTokenOperation(async function kuaishouToken(config) {
   if (Number(config.credentials.expires_at || 0) > Date.now() + 300_000) return config.credentials.access_token;
-  const key = config.credentialFile;
-  if (kuaishouRefreshes.has(key)) return kuaishouRefreshes.get(key);
-  const pending = refreshKuaishouToken(config).finally(() => kuaishouRefreshes.delete(key));
-  kuaishouRefreshes.set(key, pending);
-  return pending;
+  return refreshKuaishouToken(config);
 });
 
 async function kuaishouRequest(config, method, parameters = {}, httpMethod = 'GET') {
@@ -3448,6 +3582,7 @@ function assertKuaishouWindow(begin, end, maxMs, label) {
 }
 
 async function executeKuaishouShop(config, name, p) {
+  const fullResult = data => kuaishouBusiness().sanitize({ data }, config.credentials).data;
   if (name === 'account.get') return {
     seller: await kuaishouRequest(config, 'open.user.seller.get'),
     shop: await kuaishouRequest(config, 'open.shop.info.get'),
@@ -3472,39 +3607,39 @@ async function executeKuaishouShop(config, name, p) {
   });
   if (name === 'orders.list') {
     assertKuaishouWindow(p.begin_time, p.end_time, 7 * 86_400_000, 'order');
-    return minimizeCommerceSensitiveData(await kuaishouRequest(config, 'open.order.cursor.list', {
-      pcursor: p.cursor || '', queryType: p.query_type, beginTime: p.begin_time, endTime: p.end_time,
+    return fullResult(await kuaishouRequest(config, 'open.order.cursor.list', {
+      cursor: p.cursor || '', queryType: p.query_type, beginTime: p.begin_time, endTime: p.end_time,
       pageSize: p.page_size || 50, sort: p.sort || 1,
-      ...(p.order_view_status !== undefined ? { orderViewStatus: p.order_view_status } : {}),
+      orderViewStatus: p.order_view_status ?? 1,
       ...(p.cps_type !== undefined ? { cpsType: p.cps_type } : {}),
     }));
   }
-  if (name === 'orders.get') return minimizeCommerceSensitiveData(await kuaishouRequest(config, 'open.order.detail', {
+  if (name === 'orders.get') return fullResult(await kuaishouRequest(config, 'open.order.detail', {
     oid: safePlatformNumericId(p.order_id, 'order_id'),
   }));
   if (name === 'refunds.list') {
     assertKuaishouWindow(p.begin_time, p.end_time, 86_400_000, 'refund');
-    return minimizeCommerceSensitiveData(await kuaishouRequest(config, 'open.seller.order.refund.pcursor.list', {
+    return fullResult(await kuaishouRequest(config, 'open.seller.order.refund.pcursor.list', {
       pcursor: p.cursor || '', currentPage: p.page || 1, pageSize: p.page_size || 100,
       sort: p.sort || 1, queryType: p.query_type, beginTime: p.begin_time, endTime: p.end_time,
-      ...(p.refund_type !== undefined ? { type: p.refund_type } : {}),
+      type: p.refund_type ?? 9,
       ...(p.negotiate_status !== undefined ? { negotiateStatus: p.negotiate_status } : {}),
       ...(p.status !== undefined ? { status: p.status } : {}),
       ...(p.order_id ? { orderId: safePlatformNumericId(p.order_id, 'order_id') } : {}),
     }));
   }
-  if (name === 'refunds.get') return minimizeCommerceSensitiveData(await kuaishouRequest(
+  if (name === 'refunds.get') return fullResult(await kuaishouRequest(
     config, 'open.seller.order.refund.detail', { refundId: safePlatformNumericId(p.refund_id, 'refund_id') },
   ));
   if (name === 'refunds.reject_reasons') return kuaishouRequest(
     config, 'open.refund.reject.reason', { refundId: safePlatformNumericId(p.refund_id, 'refund_id') },
   );
-  if (name === 'addresses.list') return minimizeCommerceSensitiveData(await kuaishouRequest(
+  if (name === 'addresses.list') return fullResult(await kuaishouRequest(
     config, 'open.address.seller.list', { addressType: p.address_type },
   ));
   if (name === 'products.create') return kuaishouRequest(config, 'open.item.new', p.payload, 'POST');
   if (name === 'products.update') return kuaishouRequest(config, 'open.item.edit', {
-    ...p.payload, kwaiItemId: safePlatformNumericId(p.item_id, 'item_id'),
+    ...p.payload, itemId: safePlatformNumericId(p.item_id, 'item_id'),
   }, 'POST');
   if (name === 'products.publish' || name === 'products.unpublish') return kuaishouRequest(
     config, 'open.item.shelf.status.update', {
@@ -3559,15 +3694,17 @@ async function executeKuaishouShop(config, name, p) {
   throw new Error('unsupported Kuaishou Shop action');
 }
 
-const youzanRefreshes = new Map();
-const weimobRefreshes = new Map();
 
 function youzanExpiresAt(value) {
+  if (value === undefined) return tokenExpiryMs(undefined, 7 * 86_400);
+  if (typeof value !== 'number' && typeof value !== 'string') return tokenExpiryMs(value);
   const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) return Date.now() + 7 * 86_400_000;
-  if (numeric >= 1_000_000_000_000) return numeric;
-  if (numeric >= 1_000_000_000) return numeric * 1000;
-  return Date.now() + numeric * 1000;
+  if (numeric < 1_000_000_000) return tokenExpiryMs(value);
+  const expiry = numeric >= 1_000_000_000_000 ? numeric : numeric * 1000;
+  if (!Number.isSafeInteger(numeric) || !Number.isSafeInteger(expiry) || expiry <= Date.now()) {
+    throw commerceError('E_TOOL_CALL_UPSTREAM', 'Youzan returned an invalid token expiry');
+  }
+  return expiry;
 }
 
 async function youzanTokenRequest(config, refresh) {
@@ -3595,7 +3732,7 @@ async function youzanRequestWithToken(config, accessToken, method, version, para
   const body = await fetchStatusOnlyJson(url, {
     method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: JSON.stringify(parameters),
-  }, 'Youzan');
+  }, 'Youzan', youzanBusiness().parse);
   if (body?.success === false || (body?.code !== undefined && Number(body.code) !== 200)) {
     throw new Error(`Youzan request failed (provider code ${String(body.code || 'unknown').slice(0, 40)})`);
   }
@@ -3612,13 +3749,9 @@ async function refreshYouzanToken(config) {
   return config.credentials.access_token;
 }
 
-const youzanToken = credentialOperation(async function youzanToken(config) {
+const youzanToken = credentialTokenOperation(async function youzanToken(config) {
   if (Number(config.credentials.expires_at || 0) > Date.now() + 300_000) return config.credentials.access_token;
-  const key = config.credentialFile;
-  if (youzanRefreshes.has(key)) return youzanRefreshes.get(key);
-  const pending = refreshYouzanToken(config).finally(() => youzanRefreshes.delete(key));
-  youzanRefreshes.set(key, pending);
-  return pending;
+  return refreshYouzanToken(config);
 });
 
 async function youzanRequest(config, method, version, parameters = {}) {
@@ -3626,17 +3759,18 @@ async function youzanRequest(config, method, version, parameters = {}) {
 }
 
 async function executeYouzan(config, name, p) {
+  const fullResult = data => youzanBusiness().sanitize({ data }, config.credentials).data;
   if (name === 'account.get') return youzanRequest(config, 'youzan.shop.get', '3.0.0');
   if (name === 'products.list_on_sale') return youzanRequest(config, 'youzan.items.onsale.get', '3.0.0', p.query || {});
   if (name === 'products.list_inventory') return youzanRequest(config, 'youzan.items.inventory.get', '3.0.0', p.query || {});
   if (name === 'products.get') return youzanRequest(config, 'youzan.item.get', '3.0.0', {
     item_id: safePlatformNumericId(p.item_id, 'item_id'),
   });
-  if (name === 'orders.list') return minimizeCommerceSensitiveData(await youzanRequest(
+  if (name === 'orders.list') return fullResult(await youzanRequest(
     config, 'youzan.trades.sold.get', '4.0.0', p.query || {},
   ));
-  if (name === 'orders.get') return minimizeCommerceSensitiveData(await youzanRequest(
-    config, 'youzan.trade.get', '4.0.0', { tid: safePlatformNumericId(p.order_id, 'order_id') },
+  if (name === 'orders.get') return fullResult(await youzanRequest(
+    config, 'youzan.trade.get', '4.0.0', { tid: p.order_id },
   ));
   if (name === 'products.create') return youzanRequest(config, 'youzan.item.create', '3.0.0', p.payload);
   if (name === 'products.update') return youzanRequest(config, 'youzan.item.update', '3.0.0', {
@@ -3651,7 +3785,7 @@ async function executeYouzan(config, name, p) {
     '3.0.0', { item_id: safePlatformNumericId(p.item_id, 'item_id') },
   );
   if (name === 'shipments.send') return youzanRequest(config, 'youzan.logistics.online.confirm', '3.0.0', {
-    ...p.payload, tid: safePlatformNumericId(p.order_id, 'order_id'),
+    ...p.payload, tid: p.order_id,
   });
   if (name === 'products.delete') return youzanRequest(config, 'youzan.item.delete', '3.0.0', {
     item_id: safePlatformNumericId(p.item_id, 'item_id'),
@@ -3687,7 +3821,7 @@ async function weimobRequestWithToken(accessToken, pathName, parameters = {}) {
   const body = await fetchStatusOnlyJson(url, {
     method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: JSON.stringify(parameters),
-  }, 'Weimob WOS');
+  }, 'Weimob WOS', weimobBusiness().parse);
   const providerCode = body?.code?.errcode ?? body?.errcode;
   if (providerCode !== undefined && String(providerCode) !== '0') {
     throw new Error(`Weimob WOS request failed (provider code ${String(providerCode).slice(0, 40)})`);
@@ -3711,17 +3845,13 @@ async function refreshWeimobToken(config) {
   return config.credentials.access_token;
 }
 
-const weimobToken = credentialOperation(async function weimobToken(config) {
+const weimobToken = credentialTokenOperation(async function weimobToken(config) {
   if (Number(config.credentials.expires_at || 0) > Date.now() + 300_000) return config.credentials.access_token;
-  const key = config.credentialFile;
-  if (weimobRefreshes.has(key)) return weimobRefreshes.get(key);
-  const pending = refreshWeimobToken(config).finally(() => weimobRefreshes.delete(key));
-  weimobRefreshes.set(key, pending);
-  return pending;
+  return refreshWeimobToken(config);
 });
 
 async function weimobRequest(config, pathName, parameters = {}) {
-  return weimobRequestWithToken(await weimobToken(config), pathName, parameters);
+  return weimobBusiness().sanitize({ data: await weimobRequestWithToken(await weimobToken(config), pathName, parameters) }, config.credentials).data;
 }
 
 async function executeWeimobWos(config, name, p) {
@@ -3749,8 +3879,7 @@ async function executeWeimobWos(config, name, p) {
     config, 'weimob_shop/v2.0/stock/update', { ...p.payload, quantityEditType: 0 },
   );
   if (routes[name]) {
-    const result = await weimobRequest(config, routes[name], p.payload);
-    return /^(?:orders|refunds)\./.test(name) ? minimizeCommerceSensitiveData(result) : result;
+    return weimobRequest(config, routes[name], p.payload);
   }
   if (name === 'products.publish' || name === 'products.unpublish') return weimobRequest(
     config, 'weimob_shop/v2.0/goods/onlinestatus/update', {
@@ -3791,9 +3920,25 @@ function signXiaohongshu(pathName, query, appKey, timestamp, appSecret) {
   return createHash('md5').update(`${pathName}?${parameterString}${appSecret}`, 'utf8').digest('hex');
 }
 
+function sanitizeXiaohongshu(value, credentials) {
+  const secrets = [credentials.app_key, credentials.app_secret].filter((v) => typeof v === 'string' && v.length);
+  let nodes = 0;
+  const cleanText = (text) => secrets.reduce((out, secret) => out.split(secret).join('[redacted]'), text);
+  function visit(item, depth) {
+    if (++nodes > 50_000 || depth > 32) throw new Error('Xiaohongshu response structure exceeds the connector limit');
+    if (typeof item === 'string') return cleanText(item);
+    if (Array.isArray(item)) return item.map((child) => visit(child, depth + 1));
+    if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item)
+      .filter(([key]) => !['app_key', 'app-key', 'appKey', 'app_secret', 'appSecret', 'access_token', 'refresh_token', 'authorization'].includes(key))
+      .map(([key, child]) => [cleanText(key), visit(child, depth + 1)]));
+    return item;
+  }
+  return visit(value, 0);
+}
+
 async function xiaohongshuRequest(config, method, pathName, query = {}, body) {
   if (!['GET', 'POST', 'PUT', 'PATCH'].includes(method)
-      || !/^\/ark\/open_api\/v[01]\/[A-Za-z0-9_./-]{1,180}$/.test(pathName)
+      || !/^\/ark\/open_api\/v[01]\/(?:[A-Za-z0-9_./-]|%2F){1,180}$/.test(pathName)
       || pathName.includes('..')) throw new Error('invalid reviewed Xiaohongshu Ark destination');
   const reviewedQuery = xiaohongshuQuery(query);
   const timestamp = String(Math.floor(Date.now() / 1000));
@@ -3808,13 +3953,35 @@ async function xiaohongshuRequest(config, method, pathName, query = {}, body) {
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   }, 'Xiaohongshu Ark');
+  // This endpoint documents -7031 as a full batch failure whose map keys are the submitted IDs.
+  if (method === 'POST' && pathName === '/ark/open_api/v0/packages/transfer_batches'
+      && result?.success === false && Number(result.error_code) === -7031
+      && result.error_msg && typeof result.error_msg === 'object' && !Array.isArray(result.error_msg)) {
+    return { total: body.packages.length, success_count: 0, error_msgs: result.error_msg };
+  }
   if (result?.success === false || (result?.error_code !== undefined && Number(result.error_code) !== 0)) {
     throw new Error(`Xiaohongshu Ark request failed (provider code ${String(result.error_code || 'unknown').slice(0, 40)})`);
   }
-  return result?.data ?? result;
+  return sanitizeXiaohongshu(result?.data ?? result, config.credentials);
 }
 
 async function executeXiaohongshuArk(config, name, p) {
+  if (XHS_PAYLOADS[name]) validateActionParameters(XIAOHONGSHU_ARK_ACTIONS[name], p);
+  if (['products.get', 'inventory.set', 'inventory.adjust'].includes(name)) {
+    const targets = name === 'products.get' ? ['item_id', 'barcode', 'skucode'] : ['item_id', 'barcode'];
+    if (targets.filter((key) => p[key] !== undefined).length !== 1) {
+      throw new Error('Xiaohongshu action requires exactly one product identifier');
+    }
+  }
+  // Enforce the same declared query contract for direct owner callers and MCP.
+  if (XHS_QUERIES[name]) {
+    validateActionParameters(XIAOHONGSHU_ARK_ACTIONS[name], p);
+    p = { ...p, query: { page_no: 1, page_size: 50, ...p.query } };
+    if (name === 'orders.list_latest' && (p.query.order_time_to < p.query.order_time_from
+        || p.query.order_time_to - p.query.order_time_from > 1800)) {
+      throw new Error('Xiaohongshu order creation interval must be ordered and at most 1800 seconds');
+    }
+  }
   if (name === 'connection.check') return xiaohongshuRequest(
     config, 'GET', '/ark/open_api/v1/items/lite', { page_no: 1, page_size: 1 },
   );
@@ -3840,7 +4007,9 @@ async function executeXiaohongshuArk(config, name, p) {
     p.query || {},
   );
   if (name === 'products.get') return xiaohongshuRequest(
-    config, 'GET', '/ark/open_api/v1/items', { id: xiaohongshuRawId(p.item_id, 'item_id') },
+    config, 'GET', '/ark/open_api/v1/items', p.item_id !== undefined ? { id: xiaohongshuRawId(p.item_id, 'item_id') }
+      : p.barcode !== undefined ? { barcode: xiaohongshuRawId(p.barcode, 'barcode') }
+        : { skucode: xiaohongshuRawId(p.skucode, 'skucode') },
   );
   if (name === 'products.spu_get') return xiaohongshuRequest(
     config, 'GET', `/ark/open_api/v1/spu/${safeId(p.spu_id, 'spu_id')}`,
@@ -3852,13 +4021,13 @@ async function executeXiaohongshuArk(config, name, p) {
     const pathName = name === 'orders.list_latest' ? '/ark/open_api/v0/packages/latest_packages'
       : name === 'orders.list' ? '/ark/open_api/v0/packages'
         : '/ark/open_api/v0/packages/canceling/list';
-    return minimizeCommerceSensitiveData(await xiaohongshuRequest(config, 'GET', pathName, p.query || {}));
+    return xiaohongshuRequest(config, 'GET', pathName, p.query || {});
   }
-  if (name === 'orders.statuses_get') return minimizeCommerceSensitiveData(await xiaohongshuRequest(
+  if (name === 'orders.statuses_get') return xiaohongshuRequest(
     config, 'GET', '/ark/open_api/v0/packages/packages_status', {
       package_ids: p.package_ids.map((id) => xiaohongshuRawId(id, 'package_id')),
     },
-  ));
+  );
   const createRoutes = {
     'products.spu_create': () => '/ark/open_api/v1/spu',
     'products.spl_create': () => `/ark/open_api/v1/spu/${safeId(p.spu_id, 'spu_id')}/spl`,
@@ -3885,24 +4054,43 @@ async function executeXiaohongshuArk(config, name, p) {
   );
   if (name === 'inventory.set' || name === 'inventory.adjust') return xiaohongshuRequest(
     config, name === 'inventory.set' ? 'PUT' : 'PATCH',
-    `/ark/open_api/v0/inventories/item/${safeId(p.item_id, 'item_id')}`, {},
+    p.item_id !== undefined ? `/ark/open_api/v0/inventories/item/${safeId(p.item_id, 'item_id')}`
+      : `/ark/open_api/v0/inventories/${safeId(p.barcode, 'barcode')}`, {},
     { qty: name === 'inventory.set' ? p.quantity : p.quantity_delta },
   );
-  if (name === 'orders.export') return minimizeCommerceSensitiveData(await xiaohongshuRequest(
+  if (name === 'orders.export') return xiaohongshuRequest(
     config, 'GET', `/ark/open_api/v0/packages/${safeId(p.package_id, 'package_id')}`,
-  ));
+  );
   if (name === 'shipments.send') return xiaohongshuRequest(
     config, 'PUT', `/ark/open_api/v0/packages/${safeId(p.package_id, 'package_id')}`, {}, {
       status: 'shipped', express_company_code: p.express_company_code, express_no: p.express_no,
     },
   );
-  if (name === 'transfer_batches.create') return xiaohongshuRequest(
-    config, 'POST', '/ark/open_api/v0/packages/transfer_batches', {}, {
-      packages: p.packages.map((item) => ({
-        package_id: xiaohongshuRawId(item.package_id, 'package_id'), weight: item.weight,
-      })),
-    },
-  );
+  if (name === 'transfer_batches.create') {
+    const packages = p.packages.map((item) => ({
+      package_id: xiaohongshuRawId(item.package_id, 'package_id'), weight: item.weight,
+    }));
+    if (new Set(packages.map((item) => item.package_id)).size !== packages.length) {
+      throw new Error('Xiaohongshu transfer package IDs must be unique');
+    }
+    const data = await xiaohongshuRequest(config, 'POST', '/ark/open_api/v0/packages/transfer_batches', {}, { packages });
+    if (typeof data === 'string' && /^TPS[A-Za-z0-9_-]+$/.test(data)) return data;
+    // The official partial receipt is success:true with an error_msgs map.
+    const failedIds = data && typeof data.error_msgs === 'object' && !Array.isArray(data.error_msgs)
+      ? Object.keys(data.error_msgs) : [];
+    const expected = new Set(packages.map((item) => item.package_id));
+    if (!data || typeof data !== 'object' || !Number.isInteger(data.total)
+        || data.total !== packages.length || !Number.isInteger(data.success_count)
+        || data.success_count < 0 || data.success_count > data.total
+        || data.success_count + failedIds.length !== data.total
+        || failedIds.some((id) => !expected.has(id))
+        || (data.success_count > 0 && (typeof data.batch !== 'string' || !/^TPS[A-Za-z0-9_-]+$/.test(data.batch)))) {
+      throw new Error('Xiaohongshu transfer receipt is incomplete; reconcile the submitted packages before retrying');
+    }
+    return { status: failedIds.length ? 'partial_or_failed' : 'acknowledged', data: {
+      ...data, error_msgs: Object.fromEntries(failedIds.map((id) => [id, '[provider diagnostic omitted]'])),
+    } };
+  }
   if (name === 'transfer_batches.ship') return xiaohongshuRequest(
     config, 'PUT', `/ark/open_api/v0/packages/transfer_batches/${safeId(p.batch_no, 'batch_no')}`,
   );
@@ -4399,7 +4587,7 @@ async function instacartRequest(config, method, path, p = {}) {
     return await fetchJson(`${instacartBase(config)}${path}${queryString(p.query)}`, init);
   } catch (error) {
     const status = String(error?.message || '').match(/HTTP (\d{3})/)?.[1];
-    throw commerceError(error?.code, `Instacart request failed${status ? ` (HTTP ${status})` : ''}`);
+    throw commerceError(error?.code, `Instacart request failed${status ? ` (HTTP ${status})` : ''}`, error);
   }
 }
 
@@ -4415,11 +4603,46 @@ async function executeInstacart(config, name, p) {
   const body = validateInstacartPage(name, p.body);
   const path = name === 'recipe_page.create'
     ? '/idp/v1/products/recipe' : '/idp/v1/products/products_link';
-  return instacartRequest(config, 'POST', path, { body });
+  const result = await instacartRequest(config, 'POST', path, { body });
+  if (!result || typeof result.products_link_url !== 'string' || !result.products_link_url.trim()) {
+    throw commerceError('E_TOOL_CALL_UPSTREAM', 'Instacart did not return the created page link; check page state before retrying');
+  }
+  return result;
 }
 
 async function execute(config, name, parameters) {
+  if (config.provider === 'taobao_top' && taobaoBusiness().isNative(name)) return taobaoBusiness().execute(config, name, parameters, { request: (c, method, p) => taobaoRequest(c, method, p, { parseJson: taobaoBusiness().parse }) });
+  if (config.provider === 'jd_jos' && jdBusiness().isNative(name)) return jdBusiness().execute(config, name, parameters, { token: jdToken });
+  if (config.provider === 'weimob_wos' && weimobBusiness().isNative(name)) return weimobBusiness().execute(config, name, parameters, { token: weimobToken });
+  if (config.provider === 'kuaishou_shop' && kuaishouBusiness().isNative(name)) return kuaishouBusiness().execute(config, name, parameters, { token: kuaishouToken, sign: signKuaishou });
+  if (config.provider === 'alibaba_1688' && alibaba1688Business().isNative(name)) return alibaba1688Business().execute(config, name, parameters, { token: alibaba1688Token });
+  if (config.provider === 'youzan' && youzanBusiness().isNative(name)) return youzanBusiness().execute(config, name, parameters, { token: youzanToken });
+  if (config.provider === 'douyin_shop' && douyinBusiness().isNative(name)) return douyinBusiness().execute(config, name, parameters, { token: douyinToken, sign: signDouyin, timestamp: chinaTimestamp });
+  if (config.provider === 'aliexpress' && aliexpressBusiness().isNative(name)) return aliexpressBusiness().execute(config, name, parameters);
+  if (config.provider === 'mercado_libre' && mercadoLibreBusiness().isNative(name)) return mercadoLibreBusiness().execute(config, name, parameters, { token: mercadoLibreToken });
+  if (config.provider === 'shopee' && shopeeBusiness().isNative(name)) return shopeeBusiness().execute(config, name, parameters);
+  if (config.provider === 'tiktok_shop' && tiktokShopBusiness().isNative(name)) return tiktokShopBusiness().execute(config, name, parameters);
+  if (config.provider === 'yahoo_shopping' && yahooShoppingBusiness().isNative(name)) return yahooShoppingBusiness().execute(config, name, parameters);
+  if (config.provider === 'walmart' && walmartBusiness().isNative(name)) return walmartBusiness().execute(config, name, parameters, { base: walmartBase, token: walmartToken });
+  if (config.provider === 'qoo10_japan' && qoo10Business().isNative(name)) return qoo10Business().execute(config, name, parameters);
+  if (config.provider === 'futureshop' && futureshopBusiness().isNative(name)) return futureshopBusiness().execute(config, name, parameters);
+  if (config.provider === 'base_shop' && baseShopBusiness().isNative(name)) return baseShopBusiness().execute(config, name, parameters);
+  if (config.provider === 'lightspeed' && lightspeedBusiness().isNative(name)) return lightspeedBusiness().execute(config, name, parameters);
+  if (config.provider === 'shopline' && shoplineGraphql().isNative(name)) return shoplineGraphql().execute(config, name, parameters);
+  if (config.provider === 'shopline' && shoplineBusiness().isNative(name)) return shoplineBusiness().execute(config, name, parameters);
+  if (config.provider === 'shoplazza' && shoplazzaBusiness().isNative(name)) return shoplazzaBusiness().execute(config, name, parameters);
+  if (config.provider === 'reloadly' && reloadlyBusiness().isNative(name)) return reloadlyBusiness().execute(config, name, parameters, { base: reloadlyBase, token: reloadlyToken });
+  if (config.provider === 'shopify' && shopifyBusiness().isNative(name)) return shopifyBusiness().execute(config, name, parameters, { token: shopifyToken });
+  if (config.provider === 'constant_contact' && constantContactBusiness().isNative(name)) return constantContactBusiness().execute(config, name, parameters, { token: constantContactToken });
+  if (config.provider === 'woocommerce' && woocommerceBusiness().isNative(name)) return woocommerceBusiness().execute(config, name, parameters, { base: woocommerceBase });
+  if (config.provider === 'commerce_layer' && commerceLayerBusiness().isNative(name)) return commerceLayerBusiness().execute(config, name, parameters, { base: commerceLayerBase, token: commerceLayerToken });
+  if (config.provider === 'bigcommerce' && bigcommerceBusiness().isNative(name)) return bigcommerceBusiness().execute(config, name, parameters);
+  if (config.provider === 'alibaba_icbu' && icbuBusiness().isNative(name)) return icbuBusiness().execute(config, name, parameters, require('./alibaba-icbu-api.cjs'));
   if (storefrontApi.isProvider(config.provider)) return storefrontApi.execute(config, name, parameters);
+  if (config.provider === 'etsy' && etsyBusiness().isNative(name)) return etsyBusiness().execute(config, name, parameters, { token: etsyToken, apiKey: etsyApiKey });
+  if (config.provider === 'ebay' && ebayBusiness().isNative(name)) return ebayBusiness().execute(config, name, parameters, { base: ebayBase, token: ebayToken });
+  if (config.provider === 'square' && squareBusiness().isNative(name)) return squareBusiness().execute(config, name, parameters, { base: squareBase });
+  if (config.provider === 'amazon_seller' && amazonBusiness().isNative(name)) return amazonBusiness().execute(config, name, parameters, { base: amazonBase, token: amazonToken });
   const p = validateParameters(parameters);
   if (sellerApi.isSellerProvider(config.provider)) return sellerApi.execute(config, name, p);
   if (config.provider === 'shopify') return executeShopify(config, name, p);
@@ -4516,14 +4739,7 @@ async function verifyIdentity(config) {
   }
   if (config.provider === 'kuaishou_shop') {
     const identity = await executeKuaishouShop(config, 'account.get', {});
-    if ((identity.seller?.open_id || identity.seller?.openId)
-        && String(identity.seller.open_id || identity.seller.openId) !== String(config.credentials.identity.open_id)) {
-      throw new Error('Kuaishou Shop authorization belongs to a different seller');
-    }
-    if (String(identity.shop?.shop_id || identity.shop?.shopId || identity.shop?.id || '')
-        !== String(config.credentials.identity.shop_id)) {
-      throw new Error('Kuaishou Shop authorization belongs to a different shop');
-    }
+    require('./local-api-auth.cjs').kuaishouMerchantIdentity(identity.seller, identity.shop, config.credentials.identity.open_id, config.credentials.identity.shop_id);
     return identity;
   }
   if (config.provider === 'youzan') {
@@ -4563,7 +4779,7 @@ const EXECUTE_SCHEMA = Object.freeze({
 });
 const TOOLS = Object.freeze([
   tool('list_capabilities', 'List all exact reviewed actions available for this bound commerce account.', { type: 'object', properties: {}, additionalProperties: false }, { readOnlyHint: true, destructiveHint: false, openWorldHint: false }),
-  tool('describe_action', 'Describe one exact reviewed action, its parameters, and its risk lane.', { type: 'object', properties: { action: { type: 'string' } }, required: ['action'], additionalProperties: false }, { readOnlyHint: true, destructiveHint: false, openWorldHint: false }),
+  tool('describe_action', 'Describe one exact reviewed action, its parameters, and its risk lane.', { type: 'object', properties: { action: { type: 'string' }, output_type: { type: 'string', maxLength: 160, description: 'For native Shopify or SHOPLINE GraphQL actions, describe one reachable output type and its selectable fields.' } }, required: ['action'], additionalProperties: false }, { readOnlyHint: true, destructiveHint: false, openWorldHint: false }),
   tool('execute_read', 'Execute a reviewed read action.', EXECUTE_SCHEMA, { readOnlyHint: true, destructiveHint: false, openWorldHint: true }),
   tool('execute_write', 'Execute a reviewed ordinary write after preview.', EXECUTE_SCHEMA, { readOnlyHint: false, destructiveHint: false, openWorldHint: true }),
   tool('execute_high_impact', 'Execute a reviewed financial or externally visible action after fresh confirmation.', EXECUTE_SCHEMA, { readOnlyHint: false, destructiveHint: false, openWorldHint: true }),
@@ -4572,24 +4788,69 @@ const TOOLS = Object.freeze([
 
 async function callTool(name, args = {}, env = process.env) {
   const config = configured(env);
-  const actions = actionsFor(config);
-  if (name === 'list_capabilities') {
-    const identity = await verifyIdentity(config);
-    return { provider: config.provider, binding: config.metadata, identity, actions: Object.entries(actions).map(([actionName, spec]) => ({ action: actionName, risk: spec.risk, description: spec.description })) };
-  }
-  if (name === 'describe_action') {
-    const spec = actions[String(args.action || '')];
+  try {
+    const actions = actionsFor(config);
+    if (name === 'list_capabilities') {
+      const identity = await verifyIdentity(config);
+      const available = ['ebay', 'kuaishou_shop'].includes(config.provider) ? actionsFor(config) : actions;
+      return { provider: config.provider, binding: config.metadata, identity, actions: Object.entries(available).map(([actionName, spec]) => ({ action: actionName, risk: spec.risk, description: spec.description })) };
+    }
+    if (name === 'describe_action') {
+      const spec = actions[String(args.action || '')];
+      if (!spec) throw new Error('unreviewed or unknown action');
+      if (args.output_type !== undefined) {
+        const outputOwner = config.provider === 'shopify' ? shopifyBusiness() : config.provider === 'shopline' ? shoplineGraphql() : undefined;
+        if (!outputOwner?.isNative(String(args.action)) || typeof args.output_type !== 'string' || args.output_type.length > 160) throw Object.assign(new Error('Output type description is unavailable for this action'), { code: 'E_BAD_INPUT' });
+        return { provider: config.provider, action: args.action, ...outputOwner.describeOutputType(String(args.action), args.output_type) };
+      }
+      return { provider: config.provider, action: args.action, ...spec };
+    }
+    const expected = name === 'execute_read' ? 'R' : name === 'execute_write' ? 'W' : name === 'execute_high_impact' ? 'H' : name === 'execute_destructive' ? 'D' : '';
+    if (!expected) throw new Error('unknown tool');
+    const actionName = String(args.action || '');
+    const spec = actions[actionName];
     if (!spec) throw new Error('unreviewed or unknown action');
-    return { provider: config.provider, action: args.action, ...spec };
+    if (spec.risk !== expected) throw new Error(`action risk mismatch: ${actionName} is ${spec.risk}`);
+    const nativeContract = (config.provider === 'amazon_seller' && amazonBusiness().isNative(actionName))
+      || (config.provider === 'kuaishou_shop' && kuaishouBusiness().isNative(actionName))
+      || (config.provider === 'alibaba_1688' && alibaba1688Business().isNative(actionName))
+      || (config.provider === 'youzan' && youzanBusiness().isNative(actionName))
+      || (config.provider === 'weimob_wos' && weimobBusiness().isNative(actionName))
+      || (config.provider === 'taobao_top' && taobaoBusiness().isNative(actionName))
+      || (config.provider === 'jd_jos' && jdBusiness().isNative(actionName))
+      || (config.provider === 'douyin_shop' && douyinBusiness().isNative(actionName))
+      || (config.provider === 'alibaba_icbu' && icbuBusiness().isNative(actionName))
+      || (config.provider === 'aliexpress' && aliexpressBusiness().isNative(actionName))
+      || (config.provider === 'mercado_libre' && mercadoLibreBusiness().isNative(actionName))
+      || (config.provider === 'shopee' && shopeeBusiness().isNative(actionName))
+      || (config.provider === 'tiktok_shop' && tiktokShopBusiness().isNative(actionName))
+      || (config.provider === 'yahoo_shopping' && yahooShoppingBusiness().isNative(actionName))
+      || (config.provider === 'walmart' && walmartBusiness().isNative(actionName))
+      || (config.provider === 'qoo10_japan' && qoo10Business().isNative(actionName))
+      || (config.provider === 'futureshop' && futureshopBusiness().isNative(actionName))
+      || (config.provider === 'shopline' && shoplineBusiness().isNative(actionName))
+      || (config.provider === 'shoplazza' && shoplazzaBusiness().isNative(actionName))
+      || (config.provider === 'reloadly' && reloadlyBusiness().isNative(actionName))
+      || (config.provider === 'lightspeed' && lightspeedBusiness().isNative(actionName))
+      || (config.provider === 'base_shop' && baseShopBusiness().isNative(actionName))
+      || (config.provider === 'shopline' && shoplineGraphql().isNative(actionName))
+      || (config.provider === 'shopify' && shopifyBusiness().isNative(actionName))
+      || (config.provider === 'constant_contact' && constantContactBusiness().isNative(actionName))
+      || (config.provider === 'woocommerce' && woocommerceBusiness().isNative(actionName))
+      || (config.provider === 'commerce_layer' && commerceLayerBusiness().isNative(actionName))
+      || (config.provider === 'ebay' && ebayBusiness().isNative(actionName))
+      || (config.provider === 'etsy' && etsyBusiness().isNative(actionName))
+      || (config.provider === 'bigcommerce' && bigcommerceBusiness().isNative(actionName))
+      || (config.provider === 'square' && squareBusiness().isNative(actionName));
+    const supplied = nativeContract ? args.parameters ?? {} : validateActionParameters(spec, args.parameters);
+    return { provider: config.provider, action: actionName, risk: spec.risk, result: await execute(config, actionName, supplied) };
+  } catch (error) {
+    if (error?.httpStatus === 401) {
+      tokenCache.delete(tokenKey(config));
+      invalidateCredentialFile(config);
+    }
+    throw error;
   }
-  const expected = name === 'execute_read' ? 'R' : name === 'execute_write' ? 'W' : name === 'execute_high_impact' ? 'H' : name === 'execute_destructive' ? 'D' : '';
-  if (!expected) throw new Error('unknown tool');
-  const actionName = String(args.action || '');
-  const spec = actions[actionName];
-  if (!spec) throw new Error('unreviewed or unknown action');
-  if (spec.risk !== expected) throw new Error(`action risk mismatch: ${actionName} is ${spec.risk}`);
-  const supplied = validateActionParameters(spec, args.parameters);
-  return { provider: config.provider, action: actionName, risk: spec.risk, result: await execute(config, actionName, supplied) };
 }
 
 // Preserve the closed adapter reason out of band. The existing user-facing error
@@ -4610,7 +4871,7 @@ async function callToolResult(name, args = {}, env = process.env) {
     // Recognize the product-owned seller outcome and documented provider failure
     // arrays, never provider prose. Preserve reconciliation data and never retry
     // an update which may already have changed some resources.
-    const partial = (sellerApi.isSellerProvider(result.provider) && result.result?.status === 'partial_or_failed')
+    const partial = ((sellerApi.isSellerProvider(result.provider) || ['temu', 'shein', 'lazada', 'amazon_seller', 'square', 'ebay', 'etsy', 'bigcommerce', 'constant_contact', 'woocommerce', 'commerce_layer', 'shopify', 'shopline', 'shoplazza', 'reloadly', 'lightspeed', 'walmart', 'qoo10_japan', 'futureshop', 'yahoo_shopping', 'douyin_shop', 'aliexpress', 'mercado_libre', 'kuaishou_shop', 'alibaba_1688', 'youzan', 'weimob_wos', 'taobao_top', 'jd_jos', 'alibaba_icbu', 'xiaohongshu_ark'].includes(result.provider)) && result.result?.status === 'partial_or_failed')
       || (result.provider === 'square' && Array.isArray(result.result?.errors) && result.result.errors.length > 0)
       || (result.provider === 'weimob_wos' && result.action === 'inventory.update'
         && Array.isArray(result.result?.failList) && result.result.failList.length > 0);
@@ -4620,7 +4881,8 @@ async function callToolResult(name, args = {}, env = process.env) {
     return { isError: true,
       ...(DIAGNOSTIC_CODES.has(error?.code) ? { _meta: { orkas: { errorCode: error.code } } } : {}),
       content: [{ type: 'text', text: JSON.stringify({
-        error_code: /401|403|authoriz|credential|token|scope/i.test(String(error?.message)) ? 'connector_reconnect_required' : 'direct_commerce_action_failed',
+        error_code: (error?.code ? ['E_TOOL_CALL_AUTH', 'storefront_permission_denied', 'storefront_binding_mismatch', 'storefront_invalid_credentials'].includes(error.code)
+          : /401|403|authoriz|credential|token|scope/i.test(String(error?.message))) ? 'connector_reconnect_required' : 'direct_commerce_action_failed',
         message: redact(error?.message || error),
       }) }],
     };
@@ -4676,7 +4938,7 @@ module.exports = {
   amazonBase, amazonToken, amazonRequest, amazonCatalogQuery, executeAmazon,
   mercadoLibreToken, mercadoLibreRequest, executeMercadoLibre,
   chinaTimestamp, signTaobao, taobaoToken, taobaoRequest, executeTaobao,
-  sign1688, alibaba1688Token, alibaba1688Request, minimizeAlibaba1688OrderData, executeAlibaba1688,
+  sign1688, alibaba1688Token, alibaba1688Request, executeAlibaba1688,
   signJd, jdToken, jdRequest, executeJd, signPinduoduo, pinduoduoToken, pinduoduoRequest,
   minimizeCommerceSensitiveData, executePinduoduo,
   stableCommerceJson, signDouyin, douyinToken, douyinRequest, executeDouyinShop,

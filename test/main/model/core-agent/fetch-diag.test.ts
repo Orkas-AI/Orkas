@@ -75,7 +75,9 @@ describe('provider fetch diagnostics', () => {
     installFetchDiag();
 
     await globalThis.fetch('https://openai.com.evil.test/collect');
+    await globalThis.fetch('https://api.deepseek.com.evil.test/collect');
     await globalThis.fetch('https://www.googleapis.com/calendar/v3/events');
+    await globalThis.fetch('https://api.deepseek.com/v1/chat/completions');
     await globalThis.fetch('https://generativelanguage.googleapis.com/v1beta/models');
     await globalThis.fetch('https://bedrock-runtime.us-east-1.amazonaws.com/model/invoke');
 
@@ -83,6 +85,7 @@ describe('provider fetch diagnostics', () => {
       .filter(([message]) => message === 'provider fetch ok')
       .map(([, detail]) => detail.url);
     expect(loggedUrls).toEqual([
+      'https://api.deepseek.com/v1/chat/completions',
       'https://generativelanguage.googleapis.com/v1beta/models',
       'https://bedrock-runtime.us-east-1.amazonaws.com/model/invoke',
     ]);
@@ -118,11 +121,11 @@ describe('provider fetch diagnostics', () => {
     globalThis.fetch = vi.fn(async () => { throw failure; });
     installFetchDiag();
 
-    await expect(globalThis.fetch('https://api.moonshot.cn/v1/chat/completions'))
+    await expect(globalThis.fetch('https://api.deepseek.com/v1/chat/completions'))
       .rejects.toBe(failure);
 
     expect(mocks.warn).toHaveBeenCalledWith('provider fetch threw', {
-      url: 'https://api.moonshot.cn/v1/chat/completions',
+      url: 'https://api.deepseek.com/v1/chat/completions',
       ms: expect.any(Number),
       error: expect.objectContaining({ name: 'TypeError', message_hash: expect.any(String) }),
       cause: expect.objectContaining({ code: 'UND_ERR_SOCKET', message_hash: expect.any(String) }),

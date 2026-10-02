@@ -6,7 +6,7 @@
 // was used during development. Item 2.0, Inventory 2.1, Order 2.0 (SKU version 7).
 const crypto = require('node:crypto');
 const { requestFetch, requestFailureCode, httpFailureCode } = require('./commerce-request-context.cjs');
-const { validate, readBody, safeOutput } = require('./storefront-admin-api.cjs');
+const { validate, readBody } = require('./storefront-admin-api.cjs');
 const BASE = 'https://api.rms.rakuten.co.jp';
 const isProvider = provider => provider === 'rakuten_rms';
 const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
@@ -76,10 +76,10 @@ function actionsFor() {
     'products.get': action('R', 'Read one RMS product using its manageNumber, not the storefront itemNumber.', { manage_number: identifier }, ['manage_number']),
     'inventory.get': action('R', 'Read Inventory API 2.1 stock for one manageNumber and variantId from products.get.',
       { manage_number: identifier, variant_id: identifier }, ['manage_number', 'variant_id']),
-    'orders.list': action('R', 'Read one page of order numbers for one Japan calendar day (order date). Page defaults to 1. Use orders.get for a summary; no buyer information is returned. pagination_limited means the connector page limit was reached, not all orders were retrieved.', {
+    'orders.list': action('R', 'Read one page of order numbers for one Japan calendar day (order date). Page defaults to 1. Use orders.get for complete authorized order details. pagination_limited means the connector page limit was reached, not all orders were retrieved.', {
       day: { type: 'string', pattern: '^20[0-9]{2}-[0-9]{2}-[0-9]{2}$' }, page: { type: 'integer', minimum: 1, maximum: 10000 },
     }, ['day']),
-    'orders.get': action('R', 'Read one order status and totals using Order API SKU version 7. Buyer, recipient, payment details and free-form notes are excluded.',
+    'orders.get': action('R', 'Read complete authorized order fields, including buyer, recipient and fulfillment details, using Order API SKU version 7.',
       { order_number: orderNumber }, ['order_number']),
     'inventory.set': action('H', 'Replace one existing SKU stock quantity using ABSOLUTE mode, then read it back. No automatic retry. Concurrent orders may change stock; check the shop if confirmation fails.', {
       manage_number: identifier, variant_id: identifier, quantity: { type: 'integer', minimum: 0, maximum: 99999 },
@@ -90,9 +90,17 @@ function stock(data, p) {
   if (data.manageNumber !== p.manage_number || data.variantId !== p.variant_id || !Number.isSafeInteger(data.quantity)) {
     fail('E_TOOL_CALL_UPSTREAM', 'Rakuten RMS returned incomplete or mismatched stock');
   }
-  return { manageNumber: data.manageNumber, variantId: data.variantId, quantity: data.quantity };
+  return data;
 }
-const ORDER_FIELDS = ['orderNumber', 'orderProgress', 'orderDatetime', 'goodsPrice', 'goodsTax', 'postagePrice', 'paymentCharge', 'totalPrice', 'requestPrice'];
+const credentialFields = new Set(['servicesecret', 'licensekey', 'authorization', 'accesstoken', 'refreshtoken', 'password', 'cookie']);
+function sanitize(value, secrets, depth = 0) {
+  if (depth > 40) fail('E_TOOL_CALL_UPSTREAM', 'Rakuten RMS response is too deeply nested');
+  if (typeof value === 'string') return secrets.reduce((text, secret) => text.split(secret).join('[redacted]'), value);
+  if (Array.isArray(value)) return value.map(item => sanitize(item, secrets, depth + 1));
+  if (!object(value)) return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => !credentialFields.has(key.replace(/[_-]/g, '').toLowerCase()))
+    .map(([key, item]) => [key, sanitize(item, secrets, depth + 1)]));
+}
 async function execute(config, name, parameters = {}) {
   validateBinding(config);
   const spec = actionsFor()[name];
@@ -149,10 +157,9 @@ async function execute(config, name, parameters = {}) {
       fail('E_TOOL_CALL_UPSTREAM', 'Rakuten RMS did not return the requested order');
     }
     const row = data.OrderModelList[0];
-    result = { data: Object.fromEntries(ORDER_FIELDS.filter(key => Object.hasOwn(row, key) && ['number', 'string'].includes(typeof row[key])).map(key => [key, row[key]])) };
+    result = { data: row };
   }
-  for (const secret of [...secretKeys.map(key => config.credentials[key]), authorization(config).slice(4)]) result = safeOutput(result, secret);
-  return result;
+  return sanitize(result, [...secretKeys.map(key => config.credentials[key]), authorization(config).slice(4)]);
 }
 async function identity(config) {
   await execute(config, 'products.list', { limit: 1 });

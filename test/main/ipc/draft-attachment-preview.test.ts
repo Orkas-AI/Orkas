@@ -81,6 +81,52 @@ function call(channel: string, payload: unknown): ReturnType<InvokeFn> {
 }
 
 describe('IPC draft attachment preview scope', () => {
+  it.each(['global', 'project', 'draft'] as const)('previews a %s todo attachment through the real read-only IPC chain', async (scope) => {
+    const pt = await import('../../../src/main/features/project_tasks');
+    const project = scope === 'global' ? null : await call('projects.create', { name: `Todo preview ${scope}` });
+    const projectId = project ? (project.project as { project_id: string }).project_id : '';
+    const taskId = scope === 'draft' ? 't_aabbccddeeff'
+      : (await pt.createTask(TEST_UID, projectId, { content: 'Read document' }) as any).task.id;
+    await expect(call('projects.tasks.attachments.upload', {
+      projectId, taskId, name: 'brief.txt', dataBase64: Buffer.from('Todo document bytes').toString('base64'),
+    })).resolves.toMatchObject({ ok: true, name: 'brief.txt' });
+    const resolved = await call('projects.tasks.attachments.absPath', { projectId, taskId, name: 'brief.txt' });
+    expect(resolved.ok).toBe(true);
+    await expect(call('workspace.statPath', { projectId, path: resolved.path })).resolves.toMatchObject({ ok: true, isFile: true });
+    await expect(call('produced.readText', { projectId, path: resolved.path })).resolves.toMatchObject({ ok: true, text: 'Todo document bytes' });
+    await expect(call('savedApps.inspectBundleFromPath', { projectId, path: resolved.path })).resolves.toMatchObject({ ok: true, canSave: false });
+    // Preview permission must not also authorize editing the file through the viewer.
+    await expect(call('produced.writeText', { projectId, path: resolved.path, content: 'Changed' })).resolves.toMatchObject({ ok: false });
+    expect(fs.readFileSync(String(resolved.path), 'utf8')).toBe('Todo document bytes');
+    for (const name of ['../brief.txt', 'missing.txt', 'folder/brief.txt']) {
+      await expect(call('projects.tasks.attachments.absPath', { projectId, taskId, name })).resolves.toMatchObject({ ok: false });
+    }
+    if (projectId) {
+      await expect(call('produced.readText', { path: resolved.path })).resolves.toMatchObject({ ok: false });
+    }
+  });
+
+  it('denies attachment symlinks, foreign accounts and foreign project paths', async () => {
+    const pt = await import('../../../src/main/features/project_tasks');
+    const paths = await import('../../../src/main/paths');
+    const a = await call('projects.create', { name: 'Scope A' });
+    const b = await call('projects.create', { name: 'Scope B' });
+    const pid = (a.project as any).project_id;
+    const otherPid = (b.project as any).project_id;
+    const tid = 't_123456abcdef';
+    await pt.uploadTaskAttachment(TEST_UID, pid, tid, 'safe.txt', Buffer.from('Own bytes'));
+    const own = await call('projects.tasks.attachments.absPath', { projectId: pid, taskId: tid, name: 'safe.txt' });
+    await expect(call('produced.readText', { projectId: otherPid, path: own.path })).resolves.toMatchObject({ ok: false });
+    const foreign = paths.userTaskAttachmentsDir('foreign-preview-user', tid);
+    fs.mkdirSync(foreign, { recursive: true });
+    fs.writeFileSync(path.join(foreign, 'safe.txt'), 'Foreign bytes');
+    await expect(call('produced.readText', { path: path.join(foreign, 'safe.txt') })).resolves.toMatchObject({ ok: false });
+    const link = path.join(paths.projectTaskAttachmentsDir(TEST_UID, pid, tid), 'link.txt');
+    fs.symlinkSync(path.join(foreign, 'safe.txt'), link);
+    await expect(call('projects.tasks.attachments.absPath', { projectId: pid, taskId: tid, name: 'link.txt' })).resolves.toMatchObject({ ok: false });
+    await expect(call('produced.readText', { projectId: pid, path: link })).resolves.toMatchObject({ ok: false });
+  });
+
   async function uploadAndResolve(cid: string, name: string, body: string): Promise<string> {
     await expect(attachments.uploadAttachment(
       TEST_UID,

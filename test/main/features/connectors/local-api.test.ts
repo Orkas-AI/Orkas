@@ -406,6 +406,17 @@ describe('device-local commerce API credentials', () => {
     })).toThrow('unknown connector parameter: redirect_uri');
   });
 
+  it('allows WooCommerce owner consent without keys and rejects incomplete manual pairs', () => {
+    expect(normalizeLocalApiConnectionInput(entry('woocommerce'), {
+      store_url: 'https://shop.example.com/wordpress',
+    })).toEqual({ metadata: { store_url: 'https://shop.example.com/wordpress' }, credentials: {} });
+    for (const field of ['consumer_key', 'consumer_secret']) {
+      expect(() => normalizeLocalApiConnectionInput(entry('woocommerce'), {
+        store_url: 'https://shop.example.com', [field]: `${field === 'consumer_key' ? 'ck' : 'cs'}_${'a'.repeat(40)}`,
+      })).toThrow('Provide both WooCommerce credentials');
+    }
+  });
+
   it('binds direct-commerce network targets without exposing credentials', async () => {
     const commerceLayer = entry('commerce-layer');
     const commerceLayerMetadata = await authorizeLocalApi(TEST_UID, commerceLayer, {

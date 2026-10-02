@@ -70,7 +70,7 @@ function fixture() {
 afterEach(() => { removeLocalApiAuthorization(UID, entry); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('RMS merchant connection with local protocol fixtures (not provider sandbox)', () => {
-  it('connects from two protected merchant keys, reloads encrypted credentials and reads products, stock and paged order summaries', async () => {
+  it('connects from two protected merchant keys, reloads encrypted credentials and reads products, stock and complete authorized orders', async () => {
     const calls = fixture();
     const metadata = await authorizeLocalApi(UID, entry, fields);
     expect(metadata).toEqual({});
@@ -89,8 +89,10 @@ describe('RMS merchant connection with local protocol fixtures (not provider san
     const numbers = await adapter.callTool('execute_read', { action: 'orders.list', parameters: { day: '2026-09-16', page: 2 } }, env);
     expect(numbers.result).toEqual({ order_numbers: [order], total: 201, next_page: 3 });
     const summary = await adapter.callTool('execute_read', { action: 'orders.get', parameters: { order_number: order } }, env);
-    expect(summary.result).toEqual({ data: { orderNumber: order, orderProgress: 300, totalPrice: 1000 } });
-    expect(JSON.stringify(summary)).not.toMatch(/Private|remark|SettlementModel|MessageModelList/);
+    expect(summary.result).toEqual({ data: { orderNumber: order, orderProgress: 300, totalPrice: 1000,
+      OrdererModel: { familyName: 'Private buyer' }, remark: 'Private message', SettlementModel: { name: 'Private payment' } } });
+    expect(JSON.stringify(summary)).not.toContain(fields.license_key);
+    expect(JSON.stringify(summary)).not.toContain('MessageModelList');
     const before = calls.mock.calls.length;
     expect(connectorActionRisk({ id: entry.id, origin: 'catalog' }, {
       name: 'execute_high_impact', description: '', input_schema: {}, annotations: { readOnlyHint: true },
@@ -100,6 +102,20 @@ describe('RMS merchant connection with local protocol fixtures (not provider san
     const updated = await adapter.callTool('execute_high_impact', { action: 'inventory.set', parameters: { manage_number: 'item-1', variant_id: 'sku-1', quantity: 0 } }, env);
     expect(updated.result).toEqual({ status: 'completed', data: { manageNumber: 'item-1', variantId: 'sku-1', quantity: 0 } });
     expect(calls.mock.calls.slice(before).map(([, init]) => init.method)).toEqual(['GET', 'PUT', 'GET']);
+  });
+
+  it('preserves full product and inventory attributes while removing authentication material', async () => {
+    const calls = fixture();
+    const bound = { ...config(), credentials: await api.authorize(config()) };
+    calls.mockClear();
+    calls.mockResolvedValueOnce(reply({ ...product, contact: { email: 'fixture@example.test', phone: '000', address: 'Fixture road' },
+      noteAttributes: ['Gift'], service_secret: fields.service_secret, authorization: 'ESA fixture' }));
+    expect(await api.execute(bound, 'products.get', { manage_number: 'item-1' })).toEqual({ data: { ...product,
+      contact: { email: 'fixture@example.test', phone: '000', address: 'Fixture road' }, noteAttributes: ['Gift'] } });
+    calls.mockResolvedValueOnce(reply({ manageNumber: 'item-1', variantId: 'sku-1', quantity: 3, operationLeadTime: 2 }));
+    expect(await api.execute(bound, 'inventory.get', { manage_number: 'item-1', variant_id: 'sku-1' })).toEqual({
+      data: { manageNumber: 'item-1', variantId: 'sku-1', quantity: 3, operationLeadTime: 2 } });
+    expect(calls).toHaveBeenCalledTimes(2);
   });
 
   it('accepts a genuinely empty shop but does not persist rejected or incomplete authorization', async () => {

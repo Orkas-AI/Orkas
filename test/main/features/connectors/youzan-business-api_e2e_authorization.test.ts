@@ -1,0 +1,33 @@
+import {createRequire} from 'node:module';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
+import {expect,it} from 'vitest';
+import {findCatalogEntry} from '../../../../src/main/features/connectors/catalog';
+const require=createRequire(import.meta.url),codec=require('../../../../bin/local-api-credential-codec.cjs');
+it('keeps a bound shop grant across native discovery, exact stock, partial batches, destructive lane and restart',async()=>{
+ const card=findCatalogEntry('youzan-seller')!;expect(card.allowed_tools).toContain('execute_destructive');
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orkas-youzan-native-')),file=path.join(dir,'grant.enc'),key=crypto.randomBytes(32).toString('base64url'),preload=path.join(dir,'provider.cjs'),state=path.join(dir,'state.json'),journal=path.join(dir,'journal.jsonl');
+ codec.writeCredentialFile(file,key,{provider:'youzan',client_id:'fixture-app',client_secret:'fixture-secret',access_token:'fixture-token',expires_at:Date.now()+3600000,scope:['shop','item','trade'],identity:{kdt_id:'123',authority_id:'123',type:0}});fs.writeFileSync(state,JSON.stringify({stock:7,deleted:[],skuRequests:0}));
+ fs.writeFileSync(preload,`
+ const fs=require('node:fs');global.fetch=async(raw,init)=>{const url=new URL(String(raw));if(url.origin!=='https://open.youzanyun.com'||url.searchParams.get('access_token')!=='fixture-token'||init.method!=='POST'||init.redirect!==(url.pathname.includes('/youzan.shop.get/')?'manual':'error'))throw Error('Wrong shop transport');const method=url.pathname.split('/')[2],p=JSON.parse(init.body||'{}'),s=JSON.parse(fs.readFileSync(process.env.FIXTURE_STATE,'utf8'));fs.appendFileSync(process.env.FIXTURE_JOURNAL,JSON.stringify({method})+'\\n');const reply=data=>new Response(JSON.stringify({code:200,success:true,data}));
+ if(method==='youzan.shop.get')return reply({id:123,name:'Fixture shop',type:0});
+ if(method==='youzan.item.detail.get'){if(!init.body.includes('"item_id":9007199254740993'))throw Error('Rounded product ID');return new Response('{"code":200,"success":true,"data":{"item_id":9007199254740993,"title":"Fixture","sku_list":[{"sku_id":12,"stock_num":'+s.stock+'}],"buyer_email":"buyer@example.test"}}');}
+ if(method==='youzan.item.quantity.update'){if(typeof p.param!=='string'||!p.param.includes('"item_id":9007199254740993'))throw Error('Wrong DTO encoding');const v=JSON.parse(p.param);if(v.kdt_id!==123||v.sku_id!==12)throw Error('Wrong bound target');s.stock=v.stock_num;fs.writeFileSync(process.env.FIXTURE_STATE,JSON.stringify(s));return reply({success:true});}
+ if(method==='youzan.item.sku.batch.update'){s.skuRequests++;fs.writeFileSync(process.env.FIXTURE_STATE,JSON.stringify(s));return reply({fail_list:[{item_id:11,sku_list:[{sku_id:13,fail_info:'Item not eligible'}]}]});}
+ if(method==='youzan.item.delete'){if(p.item_id!==11)throw Error('Wrong deletion');s.deleted.push(11);fs.writeFileSync(process.env.FIXTURE_STATE,JSON.stringify(s));return reply({item_id:11,is_success:true});}
+ throw Error('Unexpected shop request');};`);
+ const clients:Client[]=[],stderr:string[]=[];const parsed=(r:any)=>JSON.parse(r.content[0].text);
+ const connect=async()=>{const c=new Client({name:'youzan-native',version:'1'});clients.push(c);const t=new StdioClientTransport({command:process.execPath,args:['--require',preload,path.resolve(__dirname,'../../../../bin/direct-commerce-mcp-server.cjs')],stderr:'pipe',env:{...Object.fromEntries(Object.entries(process.env).filter((x):x is[string,string]=>typeof x[1]==='string')),ELECTRON_RUN_AS_NODE:'1',ORKAS_LOCAL_API_PROVIDER:'youzan',ORKAS_LOCAL_API_METADATA_JSON:JSON.stringify({kdt_id:'123'}),ORKAS_LOCAL_API_CREDENTIAL_FILE:file,ORKAS_LOCAL_API_CREDENTIAL_KEY:key,FIXTURE_STATE:state,FIXTURE_JOURNAL:journal}});t.stderr?.on('data',x=>stderr.push(String(x)));await c.connect(t);return c;};
+ try{
+  const c=await connect();expect((await c.listTools()).tools).toHaveLength(6);const directory=parsed(await c.callTool({name:'list_capabilities',arguments:{}}));expect(directory.actions).toHaveLength(549);const spec=parsed(await c.callTool({name:'describe_action',arguments:{action:'youzan.item.quantity.update.v4_0_0'}}));expect(spec.input_schema.properties.param.properties).toHaveProperty('sku_id');expect(spec.requirements.billing.provider_billed).toBe(true);
+  const action='youzan.item.detail.get.v1_0_1',parameters={item_id:'9007199254740993'};const read=await c.callTool({name:'execute_read',arguments:{action,parameters}});expect(read.isError).not.toBe(true);expect(parsed(read).result.data.data).toMatchObject({item_id:'9007199254740993',buyer_email:'buyer@example.test'});
+  const update={action:'youzan.item.quantity.update.v4_0_0',parameters:{param:{kdt_id:'123',item_id:'9007199254740993',sku_id:'12',stock_num:'0'}}};expect((await c.callTool({name:'execute_read',arguments:update})).isError).toBe(true);const changed=await c.callTool({name:'execute_high_impact',arguments:update});expect(changed.isError).not.toBe(true);expect(parsed(changed).result.status).toBe('accepted');
+  const partial=await c.callTool({name:'execute_high_impact',arguments:{action:'youzan.item.sku.batch.update.v1_0_0',parameters:{item_skus_list:[{item_id:'11',skus:[{sku_id:'12',stock_num:'0'},{sku_id:'13',price:'100'}]}]}}});expect(partial.isError).toBe(true);expect(parsed(partial).result.status).toBe('partial_or_failed');
+  const del={action:'youzan.item.delete.v3_0_1',parameters:{item_id:'11'}};expect((await c.callTool({name:'execute_high_impact',arguments:del})).isError).toBe(true);expect((await c.callTool({name:'execute_destructive',arguments:del})).isError).not.toBe(true);
+  await c.close();const resumed=await connect(),after=await resumed.callTool({name:'execute_read',arguments:{action,parameters}});expect(parsed(after).result.data.data.sku_list[0].stock_num).toBe(0);expect(JSON.parse(fs.readFileSync(state,'utf8'))).toEqual({stock:0,deleted:[11],skuRequests:1});const calls=fs.readFileSync(journal,'utf8').trim().split('\n').map(s=>JSON.parse(s));for(const method of ['youzan.item.quantity.update','youzan.item.delete','youzan.item.sku.batch.update'])expect(calls.filter(r=>r.method===method)).toHaveLength(1);expect(stderr).toEqual([]);expect(JSON.stringify([read,changed,partial,after])).not.toContain('fixture-token');expect(fs.readFileSync(file,'utf8')).not.toContain('fixture-secret');
+ }finally{await Promise.allSettled(clients.map(c=>c.close()));fs.rmSync(dir,{recursive:true,force:true});}
+},15000);

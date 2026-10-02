@@ -1861,6 +1861,43 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(out[0].failureRawCode).toBeUndefined();
   });
 
+  it.each([400, 404, 502])('keeps a structured %s provider body out of the user-visible terminal error', async (status) => {
+    setCurrentLang('en');
+    try {
+      const out = await collect([
+        {
+          type: 'done',
+          result: {
+            text: '',
+            meta: {
+              provider: 'openai-compatible',
+              error: {
+                kind: 'provider_error',
+                message: `${status}: {"message":"No active credentials for provider: internal-route-fixture","request_id":"req_fixture_private"}`,
+                code: 'PROVIDER_ERROR',
+                statusCode: status,
+              },
+            },
+          },
+        },
+      ]);
+      expect(out).toEqual([expect.objectContaining({
+        type: 'error',
+        failureKind: 'model',
+        // The existing terminal taxonomy reserves provider_http_* for 4xx.
+        failureCode: status < 500 ? `provider_http_${status}` : 'provider_error',
+      })]);
+      expect(String(out[0].text || '')).toContain(status === 400
+        ? 'The model service rejected this request (HTTP 400).'
+        : 'temporarily unavailable');
+      expect(String(out[0].text || '')).not.toContain('internal-route-fixture');
+      expect(String(out[0].text || '')).not.toContain('No active credentials');
+      expect(String(out[0].text || '')).not.toContain('req_fixture_private');
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
   it('maps exhausted in-run candidates to actionable unavailable-model guidance', async () => {
     setCurrentLang('zh');
     try {

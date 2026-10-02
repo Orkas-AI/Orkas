@@ -8,7 +8,7 @@ import * as path from 'node:path';
 // `initLanguageFromApp`; this mock just keeps the top-level import from
 // exploding.
 vi.mock('electron', () => ({
-  app: { getLocale: vi.fn(() => '') },
+  app: { getLocale: vi.fn(() => ''), getPreferredSystemLanguages: vi.fn(() => []) },
 }));
 
 // Point WS_ROOT at a fresh tmp dir for each test, BEFORE loading paths /
@@ -25,6 +25,7 @@ beforeEach(async () => {
   vi.resetModules();
   const electron = await import('electron');
   (electron.app.getLocale as unknown as { mockReturnValue: (v: string) => void }).mockReturnValue('');
+  vi.mocked(electron.app.getPreferredSystemLanguages).mockReturnValue([]);
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
 });
@@ -132,6 +133,20 @@ describe('features/config › task notifications', () => {
 });
 
 describe('features/config › initLanguage', () => {
+  it('uses ordered OS preferences on first boot and preserves a later manual choice', async () => {
+    const { appConfig, i18n } = await load();
+    const electron = await import('electron');
+    vi.mocked(electron.app.getPreferredSystemLanguages).mockReturnValue(['nl-NL', 'zh-Hant-HK', 'en-US']);
+    vi.mocked(electron.app.getLocale).mockReturnValue('en-US');
+    expect(appConfig.initLanguageFromApp()).toBe('zh-tw');
+    expect(appConfig.readConfig().language).toBe('zh-tw');
+    appConfig.setLanguage('pt-pt');
+    expect(appConfig.initLanguageFromApp()).toBe('pt-pt');
+    expect(i18n.getCurrentLang()).toBe('pt-pt');
+    appConfig.setLanguage('en');
+    expect(appConfig.initLanguageFromApp()).toBe('en');
+  });
+
   it('uses persisted language when present (ignores system locale)', async () => {
     const { appConfig, i18n } = await load();
     appConfig.writeConfig({ language: 'zh' });
@@ -156,7 +171,7 @@ describe('features/config › initLanguage', () => {
   it('falls back to en for unsupported locales on first boot', async () => {
     const paths = await import('../../../src/main/paths');
     const prefPath = paths.userPreferencesFile(TEST_UID);
-    for (const locale of ['en-US', 'ar-SA', '']) {
+    for (const locale of ['en-US', 'nl-NL', '']) {
       fs.rmSync(prefPath, { force: true });
       vi.resetModules();
       const users = await import('../../../src/main/features/users');
@@ -170,9 +185,9 @@ describe('features/config › initLanguage', () => {
 
   it('overwrites corrupt language value with detected default', async () => {
     const { appConfig } = await load();
-    appConfig.writeConfig({ language: 'ar' as unknown as 'en' });
-    expect(appConfig.initLanguage('zh-HK')).toBe('zh');
-    expect(appConfig.readConfig().language).toBe('zh');
+    appConfig.writeConfig({ language: 'nl' as unknown as 'en' });
+    expect(appConfig.initLanguage('zh-HK')).toBe('zh-tw');
+    expect(appConfig.readConfig().language).toBe('zh-tw');
   });
 });
 
@@ -186,7 +201,7 @@ describe('features/config › setLanguage', () => {
 
   it('rejects unsupported languages', async () => {
     const { appConfig } = await load();
-    expect(() => appConfig.setLanguage('ar' as unknown as 'en')).toThrow();
+    expect(() => appConfig.setLanguage('nl' as unknown as 'en')).toThrow();
   });
 
   it('refreshes in-memory current lang from synced preferences without rewriting', async () => {

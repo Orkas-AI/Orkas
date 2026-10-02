@@ -66,7 +66,8 @@ describe('native patch input through the real provider SDK', () => {
       expect(events.filter(event => event.type === 'tool_use_end')).toHaveLength(1);
     }
     expect(requests[0].tools).toEqual([expect.objectContaining({ type: 'custom', name: 'apply_patch', format: expect.objectContaining({ type: 'grammar' }) })]);
-    expect(content).toEqual([{ type: 'tool_use', id: 'call_patch|ctc_patch', name: 'apply_patch', input: { patch } }]);
+    expect(content).toHaveLength(1);
+    expect(content).toMatchObject([{ type: 'tool_use', id: 'call_patch|ctc_patch', name: 'apply_patch', input: { patch } }]);
     const root = directory();
     const result = await tool.execute(content[0].type === 'tool_use' ? content[0].input : {}, { workingDir: root, state: {} });
     expect(result.isError).toBeUndefined();
@@ -95,13 +96,22 @@ describe('native patch input through the real provider SDK', () => {
     expect(requests[2].tools[0].type).toBe('function');
     expect(requests[2].input.find((row: any) => row.type === 'function_call').arguments).toBe(JSON.stringify({ patch }));
     expect(requests[2].input.find((row: any) => row.type === 'function_call_output').call_id).toBe('call_patch');
+    const otherConnection = createPiProvider({ provider: providerId, apiKey: fakeToken,
+      customModel: { ...getBuiltinModel(providerId, 'gpt-5.5'), baseUrl: 'https://other.invalid/v1' },
+      onPayload: payload => { requests.push(structuredClone(payload)); } });
+    await otherConnection.complete({ ...params, messages: history });
+    const foreignCall = requests[3].input.find((row: any) => row.type === 'custom_tool_call');
+    expect(foreignCall).toMatchObject({ call_id: 'call_patch', input: patch });
+    expect(foreignCall.id).toBeUndefined();
+    expect(requests[3].input.find((row: any) => row.type === 'custom_tool_call_output'))
+      .toMatchObject({ call_id: 'call_patch', output: result.content });
   });
 
   it.each([false, true])('keeps a deferred patch at its original insertion (additional tools=%s)', async supportsAdditionalTools => {
     const requests: any[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_url, init) => { requests.push(JSON.parse(typeof init.body === 'string' ? init.body : new TextDecoder().decode(init.body))); return response(); }));
     const provider = createPiProvider({ provider: 'openai', apiKey: fakeToken,
-      customModel: { ...getBuiltinModel('openai', 'gpt-5.5'), compat: { supportsOpenAIGrammarTools: true, supportsToolSearch: true, supportsAdditionalTools } } });
+      customModel: { ...getBuiltinModel('openai', 'gpt-5.5'), compat: { supportsOpenAIGrammarTools: true, supportsToolSearch: true, supportsAdditionalTools, supportsMidConvoSystemMessages: true, supportsMidConvoToolAdditions: true } } });
     const tools = [{ name: 'tool_load', description: 'Load tools.', inputSchema: { type: 'object' } }, toToolDefinition(tool)];
     const messages: Message[] = [...start,
       { role: 'assistant', content: [{ type: 'tool_use', id: 'call_load', name: 'tool_load', input: {} }] },

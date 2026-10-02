@@ -11,7 +11,7 @@ const resolve = (provider) => {
 module.exports = {
   isProvider: (provider) => modules.some((adapter) => adapter.isProvider(provider)),
   apiBase: (provider, metadata) => resolve(provider).apiBase(provider, metadata),
-  actionsFor: (provider) => resolve(provider).actionsFor(provider),
+  actionsFor: (provider, metadata) => provider === 'temu' ? resolve(provider).actionsFor(metadata) : resolve(provider).actionsFor(provider),
   validateBinding: (config) => resolve(config.provider).validateBinding(config),
   identity: (config) => resolve(config.provider).identity(config),
   execute: (config, name, parameters) => resolve(config.provider).execute(config, name, parameters),

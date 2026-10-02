@@ -30,9 +30,13 @@ test('publishes bundled resources before boot readiness across first use and res
   try {
     await app.launch();
     await expect(app.page!.locator('html')).toHaveAttribute('data-orkas-boot-ready', 'true');
-    const first = assertPublished('local');
+    const registryFile = path.join(app.workspaceRoot, 'open-users.json');
+    const uid = JSON.parse(readFileSync(registryFile, 'utf8')).open_current_user_id;
+    expect(uid).toBe('account-e2e');
+    const first = assertPublished(uid);
     await app.relaunch();
-    expect(assertPublished('local')).toBe(first);
+    expect(JSON.parse(readFileSync(registryFile, 'utf8')).open_current_user_id).toBe(uid);
+    expect(assertPublished(uid)).toBe(first);
     expect(app.modelRequests).toHaveLength(0);
   } finally {
     await app.dispose();

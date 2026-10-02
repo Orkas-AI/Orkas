@@ -35,6 +35,11 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+// Unit tests exercise logging through focused opt-in suites. Other cases reset
+// modules and temp workspaces freely, so do not start a worker that can outlive
+// the owning case and recreate files during teardown.
+process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = '1';
+
 // Register tsx/cjs so that any `require('./group_chat/bus')`-style CJS lookups
 // (used inside features/chats.ts to break the bus ↔ chats import cycle without
 // triggering the ESM dual-load bug described in 0268bce7) resolve `.ts` files

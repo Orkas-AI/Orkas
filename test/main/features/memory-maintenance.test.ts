@@ -5,6 +5,9 @@ import * as path from 'node:path';
 
 const runtime = vi.hoisted(() => ({ uid: 'memory-owner', idle: true }));
 vi.mock('../../../src/main/features/users', () => ({ getActiveUserId: () => runtime.uid }));
+// These isolated stores are private; shared membership/publication uses the
+// real project resolver in shared-project-memory.test.ts.
+vi.mock('../../../src/main/features/projects', () => ({ getProject: async () => null }));
 vi.mock('../../../src/main/util/boot_init', async (original) => ({
   ...await original<typeof import('../../../src/main/util/boot_init')>(),
   isBootAdmissionIdle: () => runtime.idle,

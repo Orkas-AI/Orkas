@@ -831,3 +831,37 @@ describe('core-agent client skill sandbox env', () => {
     }]);
   });
 });
+
+it('retains the last response boundary beyond the per-round evidence cap without inventing zeros', async () => {
+  const client = await import('../../../../src/main/model/core-agent/client');
+  const stats = client.createModelRunLogDiagnostics();
+  for (let i = 0; i < 100; i++) client.recordModelRawEventForLog(stats, {
+    type: 'provider_call', durationMs: 1, outcome: 'completed', model: 'synthetic',
+    output: { terminalSeen: true, stopReason: 'end_turn', textChars: 12, thinkingChars: 0, toolCalls: 0 },
+  });
+  client.recordModelRawEventForLog(stats, {
+    type: 'provider_call', durationMs: 1, outcome: 'completed', model: 'synthetic',
+    output: { terminalSeen: true, stopReason: 'end_turn', textChars: 0, thinkingChars: 188, toolCalls: 0 },
+  });
+  client.recordModelRawEventForLog(stats, { type: 'done', result: { text: '', content: [], meta: {} } });
+  client.recordModelStreamEventForLog(stats, { type: 'done' });
+  const snapshot = client.summarizeModelRunForLog(stats).terminal_output;
+  expect(snapshot).toMatchObject({ version: 1, provider_terminal_seen: true,
+    provider_stop_reason: 'end_turn', provider_text_chars: 0, provider_thinking_chars: 188,
+    provider_tool_calls: 0, runner_text_chars: 0, mapped_text_chars: 0, output_kind: 'reasoning_only' });
+  client.recordModelRawEventForLog(stats, { type: 'provider_call', durationMs: 1, outcome: 'failed', model: 'legacy' });
+  expect(client.summarizeModelRunForLog(stats).terminal_output).toMatchObject({ output_kind: 'unknown' });
+  expect(client.summarizeModelRunForLog(stats).terminal_output).not.toHaveProperty('provider_text_chars');
+});
+
+
+it('does not attribute a previous completed response to a host-interrupted run', async () => {
+  const client = await import('../../../../src/main/model/core-agent/client');
+  const stats = client.createModelRunLogDiagnostics(1000);
+  client.recordModelRawEventForLog(stats, { type: 'provider_call', outcome: 'completed', durationMs: 5,
+    output: { terminalSeen: true, stopReason: 'tool_use', textChars: 0, thinkingChars: 8, toolCalls: 1 } });
+  // The next call never delivers its receipt or runner done; host ends the stream.
+  client.recordModelStreamEventForLog(stats, { type: 'done' });
+  expect(client.summarizeModelRunForLog(stats).terminal_output)
+    .toEqual({ version: 1, output_kind: 'unknown', mapped_text_chars: 0 });
+});

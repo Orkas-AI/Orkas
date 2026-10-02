@@ -1025,8 +1025,9 @@ describe('scheduler dispatch', () => {
 
     await vi.advanceTimersByTimeAsync(3 * 60 * 60 * 1000);
     await waitForSchedulerOutcome(
-      () => autoRuntime.createConversation.mock.calls.length === 1,
-      'the sync-stable hourly occurrence to dispatch',
+      // Conversation creation precedes dispatch completion and timer rearming.
+      () => armedDueAtForTest(taskId) === new Date(2026, 4, 23, 8, 0, 0).getTime(),
+      'the sync-stable hourly occurrence to dispatch and rearm',
     );
 
     expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);

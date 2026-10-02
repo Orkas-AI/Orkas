@@ -6,7 +6,7 @@ const { requestFetch } = require('./commerce-request-context.cjs');
 // this module is consumed by the existing direct-commerce MCP and authorization owners.
 const PROVIDERS = new Set(['bigcommerce', 'shopline', 'shoplazza']);
 const SHOPLINE_VERSION = 'v20260901';
-const SHOPLAZZA_VERSION = '2026-01'; // The provider still labels 2026-07 unreleased.
+const SHOPLAZZA_VERSION = '2026-01'; // Pinned supported version with reviewed merchant contracts.
 const MAX_BYTES = 1024 * 1024;
 const ID = { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9_-]+$' };
 const CURSOR = { type: 'string', minLength: 1, maxLength: 2048 };
@@ -211,7 +211,8 @@ async function request(config, route) {
     body = JSON.parse(text);
   } catch { fail('storefront_upstream_error', 'Storefront API returned invalid or oversized JSON'); }
   if ((!object(body) && !Array.isArray(body)) || body.error || body.errors
-      || (body.code !== undefined && !['', '0'].includes(String(body.code)))) {
+      || (body.code !== undefined && !['', '0'].includes(String(body.code))
+        && !(config.provider === 'shoplazza' && body.code === 'Success'))) {
     fail('storefront_request_failed', 'Storefront API returned a business error; check store permissions and action parameters');
   }
   const data = config.provider === 'shoplazza' ? body.data : body;

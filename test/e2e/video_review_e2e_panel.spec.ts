@@ -1,3 +1,4 @@
+import { composerText, expectComposerText } from './fixtures/composer';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
@@ -273,19 +274,19 @@ test.describe('video review panel', () => {
     // The instruction leads with the position the user just clicked and keeps
     // the authoring id as the handle that binds the edit to the right scene
     // even if positions shift before it is sent.
-    await expect(composer).toHaveValue(/(scene|场景|シーン|cena)[^\n]*1/i);
-    await expect(composer).toHaveValue(/cover/);
+    await expectComposerText(composer, /(scene|场景|シーン|cena)[^\n]*1/i);
+    await expectComposerText(composer, /cover/);
     // The instruction names the video the way the panel titles it, so the user
     // can check what they are about to send against what they clicked.
-    await expect(composer).toHaveValue(/A 60-second Orkas product film/);
-    await expect(composer).not.toHaveValue(/project\/composition/);
+    await expectComposerText(composer, /A 60-second Orkas product film/);
+    await expect.poll(() => composerText(composer)).not.toMatch(/project\/composition/);
     expect(await page.locator('#chat-history .chat-message').count()).toBe(messagesBefore);
 
     // 7. A second entry accumulates instead of replacing the first, so one
     // message can carry several changes. The production is already named, so
     // the follow-up line drops the identifier rather than repeating it.
     await page.locator('.video-review-scene-actions button').nth(0).click();
-    const merged = await composer.inputValue();
+    const merged = await composerText(composer);
     expect(merged.split('\n').filter((line) => line.trim())).toHaveLength(2);
     expect(merged.match(/A 60-second Orkas product film/g)).toHaveLength(1);
     expect(await page.locator('#chat-history .chat-message').count()).toBe(messagesBefore);

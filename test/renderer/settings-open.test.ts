@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -112,6 +113,7 @@ function loadRendererNavigation() {
   };
 
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
   for (const file of ['state.js', 'boot.js']) {
     const source = fs.readFileSync(path.join(root, 'src/renderer/modules', file), 'utf8');
     vm.runInContext(source, context, { filename: file });

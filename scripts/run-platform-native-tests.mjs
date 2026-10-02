@@ -97,21 +97,30 @@ if (result.status !== 0) process.exit(result.status ?? 1);
 // not exist. Composition inspect measures frame 0 in a real window, so its
 // runtime probe — and every verdict that depends on measuring the page — is
 // unreachable from them and belongs in this lane, which already requires a
-// desktop host. Kept as its own step so a rendering regression reads as one
-// rather than being attributed to the Vitest run.
-console.log('[platform-native-tests] composition inspect canary (GUI Electron)');
-const canary = spawnSync(process.execPath, [resolve(pcRoot, 'test', 'gui', 'run-inspect-canary.mjs')], {
-  cwd: pcRoot,
-  env: { ...process.env, ORKAS_PLATFORM_NATIVE_TEST: '1' },
-  stdio: 'inherit',
-  windowsHide: true,
-});
+// desktop host. Background browser input needs a page that no automation
+// client keeps painting, which Playwright E2E cannot provide. Each canary is
+// its own step so a rendering regression reads as one rather than being
+// attributed to the Vitest run.
+let status = 0;
+for (const [label, script] of [
+  ['composition inspect canary', 'run-inspect-canary.mjs'],
+  ['background browser input canary', 'run-web-assist-input-canary.mjs'],
+]) {
+  console.log(`[platform-native-tests] ${label} (GUI Electron)`);
+  const canary = spawnSync(process.execPath, [resolve(pcRoot, 'test', 'gui', script)], {
+    cwd: pcRoot,
+    env: { ...process.env, ORKAS_PLATFORM_NATIVE_TEST: '1' },
+    stdio: 'inherit',
+    windowsHide: true,
+  });
 
-if (canary.error) throw canary.error;
-if (canary.status === 2) {
-  // Distinct from a failed case: this host gave the probe no window, so the
-  // lane proved nothing. Fail rather than skip — silence here is what let the
-  // gap live in the first place.
-  console.error('[platform-native-tests] inspect canary could not obtain a window; run it on a desktop session with a display');
+  if (canary.error) throw canary.error;
+  if (canary.status === 2) {
+    // Distinct from a failed case: this host gave the probe no window, so the
+    // lane proved nothing. Fail rather than skip — silence here is what let the
+    // gap live in the first place.
+    console.error(`[platform-native-tests] ${label} could not obtain a window; run it on a desktop session with a display`);
+  }
+  if (canary.status !== 0 && status === 0) status = canary.status ?? 1;
 }
-process.exit(canary.status ?? 1);
+process.exit(status);

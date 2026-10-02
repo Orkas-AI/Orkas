@@ -936,6 +936,15 @@ function _viewerMaybeRevealHtml(state, iframe, resource, seq) {
   });
 }
 
+async function _grantHtmlPreviewAssets(absPath, cid, projectId) {
+  if (!window.orkas || typeof window.orkas.invoke !== 'function') return;
+  const payload = { path: absPath };
+  if (cid) payload.cid = cid;
+  if (projectId) payload.projectId = projectId;
+  try { await window.orkas.invoke('produced.grantHtmlPreviewAssets', payload); }
+  catch (_) { /* only the page's same-folder assets stay unavailable */ }
+}
+
 async function _renderHtmlBody(absPath, displayName, cid, projectId) {
   const seq = await _openViewerShell(displayName, { kind: 'html', absPath, cid, projectId });
   if (!seq) return;
@@ -943,8 +952,11 @@ async function _renderHtmlBody(absPath, displayName, cid, projectId) {
   const url = _chatMediaLocalUrl(absPath);
   // sandbox: opaque origin. chat-media:// is a distinct origin from
   // file://, so SOP blocks parent.* access; we additionally forbid
-  // allow-same-origin (no cookie / localStorage / sibling-fetch reach),
-  // top navigation. Browser actions use existing host handlers.
+  // allow-same-origin (no cookie / localStorage) and top navigation.
+  // The page's own folder assets load through the grant below. Keep these
+  // flags equal to main's HTML_PREVIEW_SANDBOX_FLAGS: the agent-side HTML
+  // preview check applies the same sandbox. Browser actions use existing
+  // host handlers.
   const sandbox = 'allow-scripts allow-forms allow-downloads allow-popups allow-modals';
   const iframe = document.createElement('iframe');
   iframe.className = 'chat-file-viewer-html';
@@ -962,6 +974,10 @@ async function _renderHtmlBody(absPath, displayName, cid, projectId) {
     if (seq === _viewerRenderSeq) _viewerFinishLoading(frameHost);
   }, { once: true });
   _viewerShowLoading();
+  // Grant the page's same-folder stylesheets, scripts, data and fonts before
+  // its first request. A failed grant still previews the document itself.
+  await _grantHtmlPreviewAssets(absPath, cid, projectId);
+  if (seq !== _viewerRenderSeq || !_isViewerOpen()) return;
   // Set the destination while detached: mounting a frame without src emits
   // an about:blank load that consumes the one-shot readiness listener.
   // Navigation and the independent layout scan still run in parallel.
@@ -1209,7 +1225,7 @@ async function _renderAudioBody(absPath, displayName, cid, projectId) {
   audio.src = url;
 }
 
-async function _renderMarkdownBody(absPath, displayName, cid, projectId) {
+async function _renderMarkdownBody(absPath, displayName, cid, projectId, readOnly = false) {
   const seq = await _openViewerShell(displayName, { kind: 'markdown', absPath, cid, projectId });
   if (!seq) return;
   _viewerShowLoading();
@@ -1227,7 +1243,7 @@ async function _renderMarkdownBody(absPath, displayName, cid, projectId) {
     bodyEl: _viewerBody,
     actionsEl: _viewerMdActions,
     source: { kind: 'workspace', absPath, cid: cid || undefined, projectId: projectId || undefined },
-    capabilities: projectId
+    capabilities: projectId || readOnly
       ? { edit: false, save: false, delete: false, reveal: false, taskCheckbox: false }
       : { reveal: false, delete: false },
     initialMode: 'view',
@@ -1241,7 +1257,7 @@ async function _renderMarkdownBody(absPath, displayName, cid, projectId) {
   _typesetViewerMarkdown();
 }
 
-async function _renderTextBody(absPath, displayName, cid, projectId) {
+async function _renderTextBody(absPath, displayName, cid, projectId, readOnly = false) {
   const seq = await _openViewerShell(displayName, { kind: 'text', absPath, cid, projectId });
   if (!seq) return;
   _viewerShowLoading();
@@ -1265,7 +1281,7 @@ async function _renderTextBody(absPath, displayName, cid, projectId) {
     // Project Library files are read-only by design (the LLM owns project workspace
     // mutations); workspace / per-conv attachments allow edit + save.
     partial: preview.truncated === true,
-    capabilities: projectId || preview.truncated ? { edit: false, save: false } : { edit: true, save: true },
+    capabilities: projectId || readOnly || preview.truncated ? { edit: false, save: false } : { edit: true, save: true },
     initialMode: 'view',
     initialContent: text,
     actionIconOnly: true,
@@ -1428,8 +1444,8 @@ async function openChatFileViewer(absPath, displayName, opts) {
   if (kind === 'video')    return _renderVideoBody(absPath, name, cid, projectId, opts);
   if (kind === 'audio')    return _renderAudioBody(absPath, name, cid, projectId);
   if (kind === 'html')     return _renderHtmlBody(absPath, name, cid, projectId);
-  if (kind === 'markdown') return _renderMarkdownBody(absPath, name, cid, projectId);
-  if (kind === 'text')     return _renderTextBody(absPath, name, cid, projectId);
+  if (kind === 'markdown') return _renderMarkdownBody(absPath, name, cid, projectId, opts?.readOnly);
+  if (kind === 'text')     return _renderTextBody(absPath, name, cid, projectId, opts?.readOnly);
   // unsupported — go straight to the dialog, never open the shell.
   return _showUnsupportedDialog(absPath, cid, projectId, {});
 }

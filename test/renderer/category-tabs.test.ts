@@ -1,3 +1,4 @@
+import { composerAccessorSource } from './composer-test-source';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -112,6 +113,7 @@ function loadCategoryRenderers() {
     _mpShowReviewStatusUi: () => false,
   };
   vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
   for (const file of ['dropdown-placement.js', 'agents.js', 'skills.js']) {
     const code = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules', file), 'utf8');
     vm.runInContext(code, context, { filename: file });

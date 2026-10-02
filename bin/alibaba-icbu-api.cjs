@@ -4,11 +4,11 @@ const { requestFetch, credentialOperation } = require('./commerce-request-contex
 
 // Alibaba.com international seller APIs, not 1688 or Taobao shop APIs.
 const crypto = require('node:crypto');
-const { validate, readBody, safeOutput } = require('./storefront-admin-api.cjs');
+const { validate, readBody } = require('./storefront-admin-api.cjs');
 const { readCredentialFile, writeCredentialFile } = require('./local-api-credential-codec.cjs');
 const refreshes = new Map();
 const isProvider = (provider) => provider === 'alibaba_icbu';
-const fail = (kind, message) => { throw Object.assign(new Error(message), { code: `storefront_${kind}` }); };
+const fail = (kind, message, httpStatus) => { throw Object.assign(new Error(message), { code: `storefront_${kind}`, ...(httpStatus ? { httpStatus } : {}) }); };
 const hash = (text) => crypto.createHash('sha256').update(text).digest('hex');
 const validSecret = (text, min = 8) => typeof text === 'string' && text.length >= min && text.length <= 4096 && !/[\s\u0000-\u001f\u007f]/.test(text);
 function apiBase(provider, metadata) {
@@ -34,9 +34,9 @@ async function post(url, parameters, write = false) {
   let response;
   try { response = await requestFetch(url, { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(parameters).toString(), redirect: 'error', signal: AbortSignal.timeout(60000) }); }
   catch (error) { fail(['AbortError', 'TimeoutError'].includes(error?.name) ? 'timeout' : 'network_failed', `Alibaba.com request failed${write ? '; inspect product visibility before retrying an uncertain write' : ''}`); }
-  if (!response.ok) fail([401, 403].includes(response.status) ? 'permission_denied' : response.status === 429 ? 'rate_limit' : 'upstream_error', `Alibaba.com API failed (HTTP ${response.status})`);
+  if (!response.ok) fail([401, 403].includes(response.status) ? 'permission_denied' : response.status === 429 ? 'rate_limit' : 'upstream_error', `Alibaba.com API failed (HTTP ${response.status})`, response.status);
   let data;
-  try { data = JSON.parse(await readBody(response)); } catch { fail('upstream_error', 'Alibaba.com returned invalid or oversized JSON'); }
+  try { data = require('./icbu-business-api.cjs').parse(await readBody(response)); } catch { fail('upstream_error', 'Alibaba.com returned invalid or oversized JSON'); }
   if (!data || typeof data !== 'object' || Array.isArray(data)) fail('invalid_response', 'Invalid Alibaba.com response');
   if (data.error || data.error_response) fail('request_failed', 'Alibaba.com rejected the request; check the app permissions, authorization expiry and parameters');
   return data;
@@ -98,15 +98,10 @@ function actionsFor() {
     'account.get': action('R', 'Verify live product access and return the Alibaba.com account ID bound by official OAuth. Does not read a personal member profile.'),
     'products.list': action('R', 'Read one page of English Alibaba.com products, including opaque product_id for detail and visibility actions.', PAGE),
     'products.get': action('R', 'Read one Alibaba.com product by its opaque product_id, not its numeric id.', { product_id: ID }, ['product_id']),
-    'orders.list': action('R', 'Read one page of seller trade order IDs and timestamps; page starts at 1 in Orkas and is converted to provider start_page 0.', PAGE),
-    'orders.get': action('R', 'Read one trade order and product totals without buyer/contact/payment links.', { order_id: ID }, ['order_id']),
+    'orders.list': action('R', 'Read one page of complete authorized seller trade orders; page starts at 1 in Orkas and is converted to provider start_page 0.', PAGE),
+    'orders.get': action('R', 'Read one complete authorized seller trade order including fulfillment contact and payment fields.', { order_id: ID }, ['order_id']),
     'products.set_visibility': action('H', 'List or delist one existing product after fresh confirmation. Does not create, delete or change its price.', { product_id: ID, visibility: { type: 'string', minLength: 2, maxLength: 3, pattern: '^(on|off)$' } }, ['product_id', 'visibility']),
   };
-}
-const ORDER_KEYS = new Set(['trade_id', 'create_date', 'modify_date', 'timestamp', 'format_date', 'order_products', 'trade_ecology_order_product', 'name', 'quantity', 'sku_id', 'sku_code', 'unit', 'unit_price', 'product_id', 'product_total_amount', 'total_amount', 'shipment_fee', 'shipment_method', 'amount', 'currency', 'trade_status', 'trade_term', 'shipment_date', 'type', 'duration', 'date', 'advance_amount', 'balance_amount', 'discount_amount', 'pay_step', 'item_status', 'semi_manage']);
-function minimize(value) {
-  if (Array.isArray(value)) return value.map(minimize);
-  return value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).filter(([key]) => ORDER_KEYS.has(key)).map(([key, child]) => [key, minimize(child)])) : value;
 }
 async function execute(config, name, parameters = {}) {
   validateBinding(config);
@@ -133,17 +128,17 @@ async function execute(config, name, parameters = {}) {
     if (result?.success !== true) fail('request_failed', 'Alibaba.com seller order access failed; verify transaction API approval');
     const value = result.value, items = value?.order_list?.trade_ecology_order;
     if (!Number.isSafeInteger(value?.total_count) || (value.total_count > 0 && !Array.isArray(items)) || (items !== undefined && !Array.isArray(items))) fail('invalid_response', 'Alibaba.com order pagination is missing');
-    data = { orders: minimize(items || []), total: value.total_count, page, limit };
+    data = { orders: items || [], total: value.total_count, page, limit };
   } else if (name === 'orders.get') {
     const reply = await request(config, 'alibaba.seller.order.get', { e_trade_id: p.order_id, language: 'en_US' });
     if (!reply.value?.trade_id) fail('invalid_response', 'Alibaba.com order identity is missing');
-    data = minimize(reply.value);
+    data = reply.value;
   } else {
     const reply = await request(config, 'alibaba.icbu.product.batch.update.display', { new_display: p.visibility, product_id_list: p.product_id }, true);
     if (reply.sub_success !== true || reply.sub_error_code) fail('upstream_error', 'Alibaba.com visibility change was not fully acknowledged; inspect the product before retrying');
     data = { status: 'completed', product_id: p.product_id, visibility: p.visibility };
   }
-  for (const key of ['app_key', 'app_secret', 'access_token', 'refresh_token']) if (config.credentials[key]) data = safeOutput(data, config.credentials[key]);
+  data = require('./icbu-business-api.cjs').sanitize(data, config.credentials);
   return { data };
 }
 async function identity(config) {
@@ -159,4 +154,4 @@ async function authorize(config) {
   await execute(bound, 'orders.list', { limit: 1 });
   return credentials;
 }
-module.exports = { isProvider, apiBase, validateBinding, actionsFor, identity, execute, authorize, authorizeUrl, sign };
+module.exports = { isProvider, apiBase, validateBinding, actionsFor, identity, execute, authorize, authorizeUrl, sign, ensureToken, timestamp };

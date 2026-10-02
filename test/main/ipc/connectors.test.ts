@@ -47,6 +47,26 @@ function baseInstance(transport: any): any {
 }
 
 describe('ipc/connectors renderer DTO', () => {
+  it('validates account-choice responses and uses the host user rather than a payload identity', async () => {
+    const gate = await import('../../../src/main/features/connectors/account-choice');
+    const users = await import('../../../src/main/features/users');
+    users.activateUser('choice-ipc');
+    const { invokeHandlers } = await import('../../../src/main/ipc/connectors');
+    let info: any;
+    gate._setBroadcastForTest((channel, payload) => { if (channel === 'connectors:account-choice') info = payload; return true; });
+    const controller = new AbortController();
+    try {
+      const flow = gate.requestAccountChoice('choice-ipc', 'tiktok-shop', [{ id: '123', label: 'Shop' }], controller.signal);
+      const answer = (payload: any, userId = 'choice-ipc') => invokeHandlers['connectors.account_choice_response'](payload, { userId });
+      await expect(answer({ request_id: info.request_id, choice_id: {} })).rejects.toThrow('invalid choice_id');
+      await expect(answer({ request_id: 'bad', choice_id: '123' })).rejects.toThrow('invalid request_id');
+      await expect(answer({ request_id: info.request_id, choice_id: '456' })).resolves.toEqual({ handled: false });
+      await expect(answer({ request_id: info.request_id, choice_id: '123', userId: 'choice-ipc' }, 'other')).resolves.toEqual({ handled: false });
+      await expect(answer({ request_id: info.request_id, choice_id: '123' })).resolves.toEqual({ handled: true });
+      await expect(flow).resolves.toBe('123');
+    } finally { controller.abort(); gate._setBroadcastForTest(); }
+  });
+
   it('accepts one-time and task approval responses and rejects unknown scopes', async () => {
     // IPC deliberately uses CJS for the gate; share that module instance.
     const users = require('../../../src/main/features/users') as typeof import('../../../src/main/features/users');

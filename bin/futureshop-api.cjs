@@ -8,7 +8,7 @@ const net = require('node:net');
 const { requestFetch, credentialOperation, requestFailureCode, httpFailureCode } = require('./commerce-request-context.cjs');
 const { validate, readBody, safeOutput } = require('./storefront-admin-api.cjs');
 const { publicAddress } = require('./magento-admin-api.cjs');
-const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
+const fail = (code, message, httpStatus) => { throw Object.assign(new Error(message), { code, ...(httpStatus ? { httpStatus } : {}) }); };
 const isProvider = provider => provider === 'futureshop';
 const secrets = ['client_id', 'client_secret', 'shop_key'];
 const sessions = new Map();
@@ -54,7 +54,7 @@ function session(config) {
   }
   return sessions.get(key);
 }
-async function request(config, route, { query = {}, body, token = false } = {}) {
+async function request(config, route, { query = {}, body, token = false, method, parseJson = JSON.parse, allowBusinessErrors = false } = {}) {
   setup(config);
   const url = new URL(config.metadata.api_origin + route);
   Object.entries(query).forEach(([key, value]) => url.searchParams.set(key, String(value)));
@@ -70,7 +70,7 @@ async function request(config, route, { query = {}, body, token = false } = {}) 
   const deadline = AbortSignal.timeout(60000);
   let response;
   try {
-    response = await requestFetch(url.toString(), { method: body === undefined ? 'GET' : 'POST', redirect: 'error', signal: deadline,
+    response = await requestFetch(url.toString(), { method: method || (body === undefined ? 'GET' : 'POST'), redirect: 'error', signal: deadline,
       headers: { accept: 'application/json', 'X-SHOP-KEY': c.shop_key,
         authorization: token ? `Basic ${Buffer.from(`${c.client_id}:${c.client_secret}`).toString('base64')}` : `Bearer ${state.access_token}`,
         ...(body !== undefined ? { 'content-type': token ? 'application/x-www-form-urlencoded' : 'application/json' } : {}) },
@@ -78,7 +78,7 @@ async function request(config, route, { query = {}, body, token = false } = {}) 
   } catch (error) { fail(requestFailureCode(error, deadline), 'futureshop request failed; inspect the shop before retrying an uncertain update'); }
   if (!response.ok) {
     if (response.status === 401) { delete state.access_token; delete state.expires_at; }
-    fail(httpFailureCode(response.status), `futureshop request failed (HTTP ${response.status}); check API permissions and the registered outbound IP`);
+    fail(httpFailureCode(response.status), `futureshop request failed (HTTP ${response.status}); check API permissions and the registered outbound IP`, response.status);
   }
   let source;
   try { source = await readBody(response); } catch (error) {
@@ -86,8 +86,8 @@ async function request(config, route, { query = {}, body, token = false } = {}) 
       'futureshop response could not be read; inspect the shop before retrying an uncertain update');
   }
   let data;
-  try { data = JSON.parse(source); } catch { fail('E_TOOL_CALL_UPSTREAM', 'futureshop returned invalid data'); }
-  if (!data || typeof data !== 'object' || Array.isArray(data) || data.status === 'failed' || data.errors?.length) fail('E_TOOL_CALL_UPSTREAM', 'futureshop rejected the request; inspect the shop before retrying an update');
+  try { data = parseJson(source); } catch { fail('E_TOOL_CALL_UPSTREAM', 'futureshop returned invalid data'); }
+  if (!data || typeof data !== 'object' || Array.isArray(data) || !allowBusinessErrors && (data.status === 'failed' || data.errors?.length)) fail('E_TOOL_CALL_UPSTREAM', 'futureshop rejected the request; inspect the shop before retrying an update');
   return data;
 }
 const ensureToken = credentialOperation(async config => {
@@ -183,4 +183,5 @@ async function authorize(config) {
   await identity({ ...config, credentials });
   return credentials;
 }
-module.exports = { isProvider, normalizeBinding, apiBase, validateBinding, actionsFor, identity, execute, authorize };
+module.exports = { isProvider, normalizeBinding, apiBase, validateBinding, actionsFor, identity, execute, authorize,
+  ensureToken, request, getAccessToken: config => session(config).access_token };

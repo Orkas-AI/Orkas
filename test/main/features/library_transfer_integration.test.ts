@@ -16,6 +16,7 @@ vi.mock('../../../src/main/logger', () => ({
 
 vi.mock('../../../src/main/features/projects', () => ({
   projectExists: async () => true,
+  getProject: async () => ({ project_id: 'p1' }),
 }));
 
 vi.mock('../../../src/main/features/kb_indexer', () => ({

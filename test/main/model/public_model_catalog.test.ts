@@ -25,8 +25,8 @@ describe('public model catalog', () => {
     }
   });
 
-  it('keeps every variant in the curated current GPT generations', () => {
-    const expected = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+  it('offers GPT-6 tiers while retaining the GPT-5.6 selections', () => {
+    const expected = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
     expect(PUBLIC_PROVIDER_MODELS.openai?.map((model) => model.id)).toEqual(expected);
     expect(PUBLIC_PROVIDER_MODELS['openai-codex']?.map((model) => model.id)).toEqual(expected);
     expect(PUBLIC_PROVIDER_MODELS.openai?.every((model) => model.maxInputImages === 20)).toBe(true);
@@ -35,9 +35,11 @@ describe('public model catalog', () => {
 
   it('tracks recent Anthropic models and the Gemini 3.1 Pro exception', () => {
     expect(PUBLIC_PROVIDER_MODELS.anthropic?.map((model) => model.id)).toEqual([
+      'claude-opus-5-5',
       'claude-opus-5',
       'claude-fable-5-1',
       'claude-fable-5',
+      'claude-sonnet-5-5',
       'claude-sonnet-5',
     ]);
     expect(PUBLIC_PROVIDER_MODELS.google?.map((model) => model.id)).toEqual([
@@ -99,11 +101,16 @@ describe('public model catalog', () => {
 
   it('keeps the explicitly curated OpenRouter shortcut set', () => {
     expect(PUBLIC_PROVIDER_MODELS.openrouter?.map((model) => model.id)).toEqual([
+      'anthropic/claude-opus-5.5',
       'anthropic/claude-opus-5',
       'anthropic/claude-fable-5.1',
       'anthropic/claude-fable-5',
+      'anthropic/claude-sonnet-5.5',
       'anthropic/claude-sonnet-5',
       'openai/gpt-6-astra',
+      'openai/gpt-6.1-sol',
+      'openai/gpt-6-sol',
+      'openai/gpt-6-luna',
       'openai/gpt-5.6-sol',
       'openai/gpt-5.6-terra',
       'openai/gpt-5.6-luna',
@@ -140,7 +147,12 @@ describe('public model catalog', () => {
         maxTokens: 128_000,
         maxInputImages: 20,
       });
-      for (const model of PUBLIC_PROVIDER_MODELS[provider]?.slice(1, 4) || []) {
+      for (const model of PUBLIC_PROVIDER_MODELS[provider]?.filter((model) => /^gpt-6(?:\.1)?-(sol|luna)$/.test(model.id)) || []) {
+        expect(model.template).toBeUndefined();
+        expect(model.contextWindow).toBeUndefined();
+        expect(model.maxTokens).toBe(64_000);
+      }
+      for (const model of PUBLIC_PROVIDER_MODELS[provider]?.filter((model) => model.id.startsWith('gpt-5.6-')) || []) {
         expect(model.template).toBe('gpt-5.5');
         expect(model.contextWindow).toBeUndefined();
         // 64K is the host's output reservation, not

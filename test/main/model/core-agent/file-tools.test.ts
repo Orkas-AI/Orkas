@@ -1386,6 +1386,56 @@ describe('file-tools › read_file scope guards', () => {
 });
 
 describe('file-tools › read_files', () => {
+  it.each(['text', 'metadata', 'raw'] as const)('identifies malformed %s item shapes without reading them or losing valid siblings', async (mode) => {
+    const { tools, wsDir } = await buildTools();
+    const valid = path.join(wsDir, 'valid.txt');
+    const target = path.join(wsDir, 'shape-error.txt');
+    fs.writeFileSync(valid, 'VALID-SIBLING');
+    fs.writeFileSync(target, 'RECOVERED-CONTENT');
+    const read = getTool(tools, 'read_files');
+    const shapes = [target, null, [target], 42, true];
+    const types = ['string', 'null', 'array', 'number', 'boolean'];
+    const fault = faultStatForPath(target, 'EACCES');
+    try {
+      const result = await run(read, {
+        paths: [{ path: valid }, ...shapes, {}, { path: '' }, { path: valid }],
+        ...(mode === 'metadata' ? { metadata_only: true } : {}),
+        ...(mode === 'raw' ? { raw_text: true } : {}),
+      });
+      expect(result.isError).toBeFalsy();
+      expect(result.observations?.fileReadBatch).toEqual({
+        attempted: 9, succeeded: 2, failed: 7,
+        failures: [1, 2, 3, 4, 5, 6, 7].map(index => ({ index, code: 'E_BAD_INPUT' })),
+      });
+      const items = mode === 'raw'
+        ? JSON.parse(result.content).files.map((file: any) => file.error ?? file.content ?? '')
+        : [...result.content.matchAll(/<read-result index="\d+" ok="(?:true|false)">([\s\S]*?)<\/read-result>/g)].map(match => match[1]);
+      expect(items).toHaveLength(9);
+      for (const [index, type] of types.entries()) {
+        expect(items[index + 1]).toContain(`paths[${index + 1}]`);
+        expect(items[index + 1]).toContain('expected an object');
+        expect(items[index + 1]).toContain(`received ${type}`);
+        expect(items[index + 1]).toContain('{"path":"<file-path>"}');
+        expect(items[index + 1]).not.toContain('must be a non-empty string');
+      }
+      expect(items[6]).toContain('`path` must be a non-empty string');
+      expect(items[7]).toContain('`path` must be a non-empty string');
+      expect(result.content).not.toContain(target);
+      expect(result.content).not.toContain('RECOVERED-CONTENT');
+      expect(fault.statAttempts).toEqual([]);
+      expect(result.observations?.fileReads.map((item: any) => item.path)).toEqual(mode === 'metadata' ? [] : [valid, valid]);
+      if (mode !== 'metadata') {
+        expect(items[0]).toContain('VALID-SIBLING');
+        expect(items[8]).toContain('VALID-SIBLING');
+      }
+    } finally { fault.restore(); }
+
+    const recovered = await run(read, { paths: [{ path: target }] });
+    expect(recovered.isError).toBeFalsy();
+    expect(recovered.content).toContain('RECOVERED-CONTENT');
+    expect(recovered.observations?.fileReads.map((item: any) => item.path)).toEqual([target]);
+  });
+
   it.each(['text', 'metadata', 'raw'] as const)('keeps valid %s items before and after invalid inputs and missing files', async (mode) => {
     const { tools, wsDir } = await buildTools();
     const first = path.join(wsDir, 'first.txt');
