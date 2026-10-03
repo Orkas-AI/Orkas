@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "클라우드 동기화 충돌 해결: {name}",
   "sync.conflict_resolution.title_batch": "클라우드 동기화 충돌 해결: {count}건",
   "sync.conflict_resolution.message_single": "이 클라우드 동기화 충돌을 해결해 주세요.",
-  "sync.conflict_resolution.message_batch": "이 클라우드 동기화 충돌들을 해결해 주세요."
+  "sync.conflict_resolution.message_batch": "이 클라우드 동기화 충돌들을 해결해 주세요.",
+  "quality.operator.incomplete": "사용자 지정 검증이 완료되지 않았습니다. 규칙 파일을 수정하거나 설정에서 사용자 지정 검증을 끈 후 다시 시도하세요."
 }

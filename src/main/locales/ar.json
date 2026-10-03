@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "حل تعارض مزامنة السحابة: {name}",
   "sync.conflict_resolution.title_batch": "حل تعارض مزامنة السحابة: {count} تعارض",
   "sync.conflict_resolution.message_single": "يرجى مساعدتي في حل تعارض مزامنة السحابة هذا.",
-  "sync.conflict_resolution.message_batch": "يرجى مساعدتي في حل تعارضات مزامنة السحابة هذه."
+  "sync.conflict_resolution.message_batch": "يرجى مساعدتي في حل تعارضات مزامنة السحابة هذه.",
+  "quality.operator.incomplete": "لم يكتمل التحقق المخصص. أصلح ملف القواعد أو أوقف التحقق المخصص في الإعدادات، ثم أعد المحاولة."
 }

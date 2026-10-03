@@ -2522,5 +2522,12 @@
   "chat.conv_moved_out": "Aus dem Projekt verschoben.",
   "chat.conv_filing_failed": "Das Projekt „{name}“ wurde erstellt, aber die Unterhaltung konnte nicht hinzugefügt werden. Wählen Sie im Unterhaltungsmenü „Zu Projekt hinzufügen“ und dieses Projekt, um es erneut zu versuchen.",
   "chat.conv_filing_failed_with_todos": "Das Projekt „{name}“ und {count} Aufgaben wurden erstellt, aber die Unterhaltung konnte nicht hinzugefügt werden. Wählen Sie im Unterhaltungsmenü „Zu Projekt hinzufügen“ und dieses Projekt, um es erneut zu versuchen.",
-  "chat.conv_move_not_filed": "Diese Aufgabe gehört zu keinem Projekt."
+  "chat.conv_move_not_filed": "Diese Aufgabe gehört zu keinem Projekt.",
+  "quality.operator.title": "Benutzerdefinierte Validierung",
+  "quality.operator.scope": "Prüft Skripte, ausführbare Codeblöcke in SKILL.md, Metadaten und Agent-JSON vor dem Speichern oder Installieren. Dies ist keine Laufzeit-Sandbox.",
+  "quality.operator.file": "Regeldatei",
+  "quality.operator.reload": "Neu laden",
+  "quality.operator.disabled": "Auf diesem Gerät deaktiviert.",
+  "quality.operator.ready": "Bereit: {count} Regeln.",
+  "quality.operator.invalid": "Validierung nicht verfügbar. Korrigieren Sie operator-policy.json oder deaktivieren Sie die benutzerdefinierte Validierung und versuchen Sie es erneut."
 }

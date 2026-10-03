@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "Разрешение конфликта облачной синхронизации: {name}",
   "sync.conflict_resolution.title_batch": "Разрешение конфликтов облачной синхронизации: {count}",
   "sync.conflict_resolution.message_single": "Помогите мне разрешить этот конфликт облачной синхронизации.",
-  "sync.conflict_resolution.message_batch": "Помогите мне разрешить эти конфликты облачной синхронизации."
+  "sync.conflict_resolution.message_batch": "Помогите мне разрешить эти конфликты облачной синхронизации.",
+  "quality.operator.incomplete": "Пользовательская проверка не завершена. Исправьте файл правил или отключите пользовательскую проверку в настройках, затем повторите попытку."
 }

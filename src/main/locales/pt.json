@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "Resolver conflito de sincronização na nuvem: {name}",
   "sync.conflict_resolution.title_batch": "Resolver conflitos de sincronização na nuvem: {count}",
   "sync.conflict_resolution.message_single": "Ajude-me a resolver este conflito de sincronização na nuvem.",
-  "sync.conflict_resolution.message_batch": "Ajude-me a resolver estes conflitos de sincronização na nuvem."
+  "sync.conflict_resolution.message_batch": "Ajude-me a resolver estes conflitos de sincronização na nuvem.",
+  "quality.operator.incomplete": "A validação personalizada não foi concluída. Corrija o arquivo de regras ou desative a validação personalizada nas Configurações e tente novamente."
 }

@@ -2522,5 +2522,12 @@
   "chat.conv_moved_out": "Đã chuyển ra khỏi dự án.",
   "chat.conv_filing_failed": "Đã tạo dự án “{name}”, nhưng chưa thể thêm cuộc trò chuyện. Trong menu cuộc trò chuyện, chọn “Thêm vào dự án”, rồi chọn dự án này để thử lại.",
   "chat.conv_filing_failed_with_todos": "Đã tạo dự án “{name}” và {count} việc cần làm, nhưng chưa thể thêm cuộc trò chuyện. Trong menu cuộc trò chuyện, chọn “Thêm vào dự án”, rồi chọn dự án này để thử lại.",
-  "chat.conv_move_not_filed": "Tác vụ này không thuộc dự án nào."
+  "chat.conv_move_not_filed": "Tác vụ này không thuộc dự án nào.",
+  "quality.operator.title": "Kiểm tra tùy chỉnh",
+  "quality.operator.scope": "Kiểm tra tập lệnh, khối mã có thể thực thi trong SKILL.md, siêu dữ liệu và JSON của Agent trước khi lưu hoặc cài đặt. Đây không phải môi trường cách ly khi chạy.",
+  "quality.operator.file": "Tệp quy tắc",
+  "quality.operator.reload": "Tải lại",
+  "quality.operator.disabled": "Đã tắt trên thiết bị này.",
+  "quality.operator.ready": "Sẵn sàng: {count} quy tắc.",
+  "quality.operator.invalid": "Không thể kiểm tra. Sửa operator-policy.json hoặc tắt kiểm tra tùy chỉnh rồi thử lại."
 }

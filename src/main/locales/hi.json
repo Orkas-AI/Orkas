@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "क्लाउड सिंक टकराव का समाधान: {name}",
   "sync.conflict_resolution.title_batch": "क्लाउड सिंक टकराव का समाधान: {count} टकराव",
   "sync.conflict_resolution.message_single": "इस क्लाउड सिंक टकराव को सुलझाने में मेरी मदद करें।",
-  "sync.conflict_resolution.message_batch": "इन क्लाउड सिंक टकरावों को सुलझाने में मेरी मदद करें।"
+  "sync.conflict_resolution.message_batch": "इन क्लाउड सिंक टकरावों को सुलझाने में मेरी मदद करें।",
+  "quality.operator.incomplete": "कस्टम सत्यापन पूरा नहीं हुआ। नियम फ़ाइल ठीक करें या सेटिंग में कस्टम सत्यापन बंद करके फिर कोशिश करें।"
 }

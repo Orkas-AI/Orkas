@@ -2522,5 +2522,12 @@
   "chat.conv_moved_out": "プロジェクトから移しました。",
   "chat.conv_filing_failed": "プロジェクト「{name}」は作成されましたが、会話を追加できませんでした。会話メニューの「プロジェクトに追加」でこのプロジェクトを選び、再試行してください。",
   "chat.conv_filing_failed_with_todos": "プロジェクト「{name}」と {count} 件のタスクは作成されましたが、会話を追加できませんでした。会話メニューの「プロジェクトに追加」でこのプロジェクトを選び、再試行してください。",
-  "chat.conv_move_not_filed": "このタスクはどのプロジェクトにも属していません。"
+  "chat.conv_move_not_filed": "このタスクはどのプロジェクトにも属していません。",
+  "quality.operator.title": "カスタム検証",
+  "quality.operator.scope": "保存やインストールの前に、スクリプト、SKILL.md の実行可能なコードブロック、メタデータ、Agent JSON を確認します。実行時のサンドボックスではありません。",
+  "quality.operator.file": "ルールファイル",
+  "quality.operator.reload": "再読み込み",
+  "quality.operator.disabled": "このデバイスでは無効です。",
+  "quality.operator.ready": "準備完了：{count} 件のルール。",
+  "quality.operator.invalid": "検証を利用できません。operator-policy.json を修正するか、カスタム検証を無効にしてから再試行してください。"
 }

@@ -2522,5 +2522,12 @@
   "chat.conv_moved_out": "Movida fuera del proyecto.",
   "chat.conv_filing_failed": "Se creó el proyecto «{name}», pero no se pudo añadir la conversación. En su menú, elige «Añadir a un proyecto» y selecciona este proyecto para reintentar.",
   "chat.conv_filing_failed_with_todos": "Se crearon el proyecto «{name}» y {count} tareas, pero no se pudo añadir la conversación. En su menú, elige «Añadir a un proyecto» y selecciona este proyecto para reintentar.",
-  "chat.conv_move_not_filed": "Esta tarea no pertenece a ningún proyecto."
+  "chat.conv_move_not_filed": "Esta tarea no pertenece a ningún proyecto.",
+  "quality.operator.title": "Validación personalizada",
+  "quality.operator.scope": "Comprueba scripts, bloques de código ejecutables de SKILL.md, metadatos y JSON de Agentes antes de guardar o instalar. No es un entorno aislado de ejecución.",
+  "quality.operator.file": "Archivo de reglas",
+  "quality.operator.reload": "Recargar",
+  "quality.operator.disabled": "Desactivada en este dispositivo.",
+  "quality.operator.ready": "Lista: {count} reglas.",
+  "quality.operator.invalid": "Validación no disponible. Corrige operator-policy.json o desactiva la validación personalizada e inténtalo de nuevo."
 }

@@ -2522,5 +2522,12 @@
   "chat.conv_moved_out": "已移出專案。",
   "chat.conv_filing_failed": "專案「{name}」已建立，但對話未能加入專案。請在對話選單中按「新增到專案」，選擇此專案重試。",
   "chat.conv_filing_failed_with_todos": "專案「{name}」及 {count} 項待辦已建立，但對話未能加入專案。請在對話選單中按「新增到專案」，選擇此專案重試。",
-  "chat.conv_move_not_filed": "這個任務不在任何專案裡。"
+  "chat.conv_move_not_filed": "這個任務不在任何專案裡。",
+  "quality.operator.title": "自訂驗證",
+  "quality.operator.scope": "儲存或安裝前，檢查指令碼、SKILL.md 中可執行的程式碼區塊、中繼資料與 Agent JSON。這不是執行階段沙箱。",
+  "quality.operator.file": "規則檔案",
+  "quality.operator.reload": "重新載入",
+  "quality.operator.disabled": "已在此裝置停用。",
+  "quality.operator.ready": "已就緒：{count} 條規則。",
+  "quality.operator.invalid": "驗證無法使用。請修正 operator-policy.json 或停用自訂驗證後重試。"
 }

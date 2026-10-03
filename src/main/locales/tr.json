@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "Bulut eşitleme çakışmasını çözme: {name}",
   "sync.conflict_resolution.title_batch": "Bulut eşitleme çakışmalarını çözme: {count} çakışma",
   "sync.conflict_resolution.message_single": "Bu bulut eşitleme çakışmasını çözmeme yardım et.",
-  "sync.conflict_resolution.message_batch": "Bu bulut eşitleme çakışmalarını çözmeme yardım et."
+  "sync.conflict_resolution.message_batch": "Bu bulut eşitleme çakışmalarını çözmeme yardım et.",
+  "quality.operator.incomplete": "Özel doğrulama tamamlanamadı. Kural dosyasını düzeltin veya Ayarlar’dan özel doğrulamayı kapatıp yeniden deneyin."
 }

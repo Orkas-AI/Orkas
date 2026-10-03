@@ -2522,5 +2522,12 @@
   "chat.conv_moved_out": "Spostata fuori dal progetto.",
   "chat.conv_filing_failed": "Il progetto “{name}” è stato creato, ma non è stato possibile aggiungere la conversazione. Nel suo menu, scegli “Aggiungi a un progetto” e seleziona questo progetto per riprovare.",
   "chat.conv_filing_failed_with_todos": "Il progetto “{name}” e {count} attività sono stati creati, ma non è stato possibile aggiungere la conversazione. Nel suo menu, scegli “Aggiungi a un progetto” e seleziona questo progetto per riprovare.",
-  "chat.conv_move_not_filed": "Questa attività non appartiene a nessun progetto."
+  "chat.conv_move_not_filed": "Questa attività non appartiene a nessun progetto.",
+  "quality.operator.title": "Validazione personalizzata",
+  "quality.operator.scope": "Controlla script, blocchi di codice eseguibili in SKILL.md, metadati e JSON degli Agent prima del salvataggio o dell’installazione. Non è una sandbox di esecuzione.",
+  "quality.operator.file": "File delle regole",
+  "quality.operator.reload": "Ricarica",
+  "quality.operator.disabled": "Disattivata su questo dispositivo.",
+  "quality.operator.ready": "Pronta: {count} regole.",
+  "quality.operator.invalid": "Validazione non disponibile. Correggi operator-policy.json o disattiva la validazione personalizzata, quindi riprova."
 }

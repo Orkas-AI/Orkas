@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "แก้ไขข้อขัดแย้งการซิงค์คลาวด์: {name}",
   "sync.conflict_resolution.title_batch": "แก้ไขข้อขัดแย้งการซิงค์คลาวด์: {count} รายการ",
   "sync.conflict_resolution.message_single": "โปรดช่วยแก้ไขข้อขัดแย้งการซิงค์คลาวด์นี้",
-  "sync.conflict_resolution.message_batch": "โปรดช่วยแก้ไขข้อขัดแย้งการซิงค์คลาวด์เหล่านี้"
+  "sync.conflict_resolution.message_batch": "โปรดช่วยแก้ไขข้อขัดแย้งการซิงค์คลาวด์เหล่านี้",
+  "quality.operator.incomplete": "การตรวจสอบแบบกำหนดเองยังไม่เสร็จสิ้น แก้ไขไฟล์กฎหรือปิดการตรวจสอบแบบกำหนดเองในการตั้งค่า แล้วลองอีกครั้ง"
 }

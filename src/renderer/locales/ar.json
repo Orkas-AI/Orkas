@@ -2522,5 +2522,12 @@
   "chat.conv_moved_out": "تم النقل خارج المشروع.",
   "chat.conv_filing_failed": "تم إنشاء المشروع «{name}»، لكن تعذرت إضافة المحادثة إليه. من قائمة المحادثة، اختر «إضافة إلى مشروع» وحدد هذا المشروع للمحاولة مجددًا.",
   "chat.conv_filing_failed_with_todos": "تم إنشاء المشروع «{name}» و{count} مهام، لكن تعذرت إضافة المحادثة إليه. من قائمة المحادثة، اختر «إضافة إلى مشروع» وحدد هذا المشروع للمحاولة مجددًا.",
-  "chat.conv_move_not_filed": "هذه المهمة ليست في أي مشروع."
+  "chat.conv_move_not_filed": "هذه المهمة ليست في أي مشروع.",
+  "quality.operator.title": "التحقق المخصص",
+  "quality.operator.scope": "يفحص البرامج النصية وكتل التعليمات البرمجية القابلة للتنفيذ في SKILL.md والبيانات الوصفية وJSON للوكلاء قبل الحفظ أو التثبيت. ليس بيئة معزولة للتشغيل.",
+  "quality.operator.file": "ملف القواعد",
+  "quality.operator.reload": "إعادة التحميل",
+  "quality.operator.disabled": "معطل على هذا الجهاز.",
+  "quality.operator.ready": "جاهز: {count} قواعد.",
+  "quality.operator.invalid": "التحقق غير متاح. أصلح operator-policy.json أو أوقف التحقق المخصص، ثم أعد المحاولة."
 }

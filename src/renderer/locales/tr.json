@@ -2522,5 +2522,12 @@
   "chat.conv_moved_out": "Projeden çıkarıldı.",
   "chat.conv_filing_failed": "“{name}” projesi oluşturuldu, ancak sohbet eklenemedi. Sohbet menüsünden “Projeye ekle”yi ve bu projeyi seçerek yeniden deneyin.",
   "chat.conv_filing_failed_with_todos": "“{name}” projesi ve {count} görev oluşturuldu, ancak sohbet eklenemedi. Sohbet menüsünden “Projeye ekle”yi ve bu projeyi seçerek yeniden deneyin.",
-  "chat.conv_move_not_filed": "Bu görev bir projeye ait değil."
+  "chat.conv_move_not_filed": "Bu görev bir projeye ait değil.",
+  "quality.operator.title": "Özel doğrulama",
+  "quality.operator.scope": "Kaydetmeden veya yüklemeden önce betikleri, SKILL.md içindeki çalıştırılabilir kod bloklarını, meta verileri ve Agent JSON dosyalarını denetler. Bu bir çalışma zamanı korumalı alanı değildir.",
+  "quality.operator.file": "Kural dosyası",
+  "quality.operator.reload": "Yeniden yükle",
+  "quality.operator.disabled": "Bu cihazda devre dışı.",
+  "quality.operator.ready": "Hazır: {count} kural.",
+  "quality.operator.invalid": "Doğrulama kullanılamıyor. operator-policy.json dosyasını düzeltin veya özel doğrulamayı kapatıp yeniden deneyin."
 }
