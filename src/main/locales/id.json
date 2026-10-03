@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "Resolusi konflik sinkronisasi cloud: {name}",
   "sync.conflict_resolution.title_batch": "Resolusi konflik sinkronisasi cloud: konflik {count}",
   "sync.conflict_resolution.message_single": "Tolong bantu saya menyelesaikan konflik sinkronisasi cloud ini.",
-  "sync.conflict_resolution.message_batch": "Tolong bantu saya menyelesaikan konflik sinkronisasi cloud ini."
+  "sync.conflict_resolution.message_batch": "Tolong bantu saya menyelesaikan konflik sinkronisasi cloud ini.",
+  "quality.operator.incomplete": "Validasi kustom tidak selesai. Perbaiki file aturan atau nonaktifkan validasi kustom di Pengaturan, lalu coba lagi."
 }

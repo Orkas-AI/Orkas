@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "Giải quyết xung đột đồng bộ đám mây: {name}",
   "sync.conflict_resolution.title_batch": "Giải quyết xung đột đồng bộ đám mây: {count} xung đột",
   "sync.conflict_resolution.message_single": "Vui lòng giúp tôi giải quyết xung đột đồng bộ đám mây này.",
-  "sync.conflict_resolution.message_batch": "Vui lòng giúp tôi giải quyết các xung đột đồng bộ đám mây này."
+  "sync.conflict_resolution.message_batch": "Vui lòng giúp tôi giải quyết các xung đột đồng bộ đám mây này.",
+  "quality.operator.incomplete": "Kiểm tra tùy chỉnh chưa hoàn tất. Sửa tệp quy tắc hoặc tắt kiểm tra tùy chỉnh trong Cài đặt rồi thử lại."
 }

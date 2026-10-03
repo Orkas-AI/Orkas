@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "クラウド同期の競合解決：{name}",
   "sync.conflict_resolution.title_batch": "クラウド同期の競合解決：{count} 件",
   "sync.conflict_resolution.message_single": "このクラウド同期の競合を解決してください。",
-  "sync.conflict_resolution.message_batch": "これらのクラウド同期の競合を解決してください。"
+  "sync.conflict_resolution.message_batch": "これらのクラウド同期の競合を解決してください。",
+  "quality.operator.incomplete": "カスタム検証が完了しませんでした。ルールファイルを修正するか、設定でカスタム検証を無効にしてから再試行してください。"
 }

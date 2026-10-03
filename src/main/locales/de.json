@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "Cloud-Synchronisierungskonflikt lösen: {name}",
   "sync.conflict_resolution.title_batch": "Cloud-Synchronisierungskonflikte lösen: {count}",
   "sync.conflict_resolution.message_single": "Bitte helfen Sie mir, diesen Cloud-Synchronisierungskonflikt zu lösen.",
-  "sync.conflict_resolution.message_batch": "Bitte helfen Sie mir, diese Cloud-Synchronisierungskonflikte zu lösen."
+  "sync.conflict_resolution.message_batch": "Bitte helfen Sie mir, diese Cloud-Synchronisierungskonflikte zu lösen.",
+  "quality.operator.incomplete": "Die benutzerdefinierte Validierung wurde nicht abgeschlossen. Korrigieren Sie die Regeldatei oder deaktivieren Sie die benutzerdefinierte Validierung in den Einstellungen und versuchen Sie es erneut."
 }

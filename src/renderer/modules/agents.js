@@ -38,19 +38,11 @@ function _agentUiIconHtml(name, className) {
 // Mirror of `agents.ts::RESERVED_AGENT_NAMES` so the renderer can fail fast
 // without a round-trip. Server is still authoritative — this is just UX.
 const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'コマンダー', '司令官', 'commander']);
-/** Look up the localized "External · <Brand>" label for an agent runtime
- *  type. The external badge (formerly "CLI · X") is the single
- *  user-facing tag for cli-runtime agents — name surfaces consistently
- *  in cards, detail page, and edit form. */
+/** Return only the CLI brand name for the agent card's runtime chip. */
 function _cliBadgeLabel(type) {
   const key = 'agent.external_badge.' + type;
   const v = t(key);
-  if (!v || v === key) {
-    const externalWord = t('agent.external_word');
-    const word = (externalWord && externalWord !== 'agent.external_word') ? externalWord : 'External';
-    return word + ' · ' + type;
-  }
-  return v;
+  return (!v || v === key) ? type : v;
 }
 
 function _isReservedAgentName(name) {

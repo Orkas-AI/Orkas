@@ -280,5 +280,6 @@
   "sync.conflict_resolution.title_single": "雲端同步衝突處理：{name}",
   "sync.conflict_resolution.title_batch": "雲端同步衝突處理：{count} 條衝突",
   "sync.conflict_resolution.message_single": "請幫我處理這條雲端同步衝突。",
-  "sync.conflict_resolution.message_batch": "請幫我處理這些雲端同步衝突。"
+  "sync.conflict_resolution.message_batch": "請幫我處理這些雲端同步衝突。",
+  "quality.operator.incomplete": "自訂驗證未完成。請修正規則檔案，或在設定中停用自訂驗證後重試。"
 }
