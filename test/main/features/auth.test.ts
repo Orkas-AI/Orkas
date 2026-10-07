@@ -411,7 +411,77 @@ describe('auth › listProviders grouping', () => {
   });
 });
 
-describe('auth › custom OpenAI-compatible model configuration', () => {
+describe('auth › custom model configuration', () => {
+
+  it('retains legacy OpenAI configuration when protocol is absent after restart', async () => {
+    const paths = await import('../../../src/main/paths');
+    const secrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, secrets.encryptLocalSecret(
+      { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' },
+      JSON.stringify({ version: 6, profiles: { 'custom:legacy': {
+        type: 'api_key', provider: 'custom', label: 'legacy', key: 'synthetic-legacy-key',
+        baseUrl: 'https://gateway.example.test/v1', contextWindow: 131072,
+        createdAt: 1, lastUsed: 0,
+      } }, entries: [{ entryId: 'legacy-entry', provider: 'custom',
+        profileId: 'custom:legacy', model: 'legacy-model', lastUsed: 0 }] }),
+    ));
+    const auth = await import('../../../src/main/features/auth');
+    expect((await auth.pickChatEntryGroup())[0]).toMatchObject({
+      entryId: 'legacy-entry', model: 'legacy-model', apiKey: 'synthetic-legacy-key',
+      customConfig: { protocol: 'openai', baseUrl: 'https://gateway.example.test/v1',
+        contextWindow: 131072, maxTokens: 32768 },
+    });
+  });
+
+  it.each(['https://gateway.example.test/proxy',
+    'https://gateway.example.test/proxy/v1/',
+    'https://gateway.example.test/proxy/v1/messages/'])('saves an Anthropic SDK base from %s and reloads its protocol', async (baseUrl) => {
+    const auth = await import('../../../src/main/features/auth');
+    await auth.addCustomModelEntry({ protocol: 'anthropic', baseUrl,
+      model: 'claude-gateway-alias', apiKey: 'synthetic-anthropic-key' });
+    vi.resetModules();
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(TEST_UID);
+    const restarted = await import('../../../src/main/features/auth');
+    expect((await restarted.pickChatEntryGroup())[0]?.customConfig).toMatchObject({
+      protocol: 'anthropic', baseUrl: 'https://gateway.example.test/proxy',
+    });
+  });
+
+  it('does not normalize an already saved versioned gateway prefix a second time', async () => {
+    const auth = await import('../../../src/main/features/auth');
+    await auth.addCustomModelEntry({ protocol: 'anthropic',
+      baseUrl: 'https://gateway.example.test/proxy/v1/v1/messages',
+      model: 'claude-gateway-alias', apiKey: 'synthetic-prefix-key' });
+    expect((await auth.pickChatEntryGroup())[0]?.customConfig?.baseUrl)
+      .toBe('https://gateway.example.test/proxy/v1');
+    vi.resetModules();
+    const users = await import('../../../src/main/features/users'); users.activateUser(TEST_UID);
+    const restarted = await import('../../../src/main/features/auth');
+    expect((await restarted.pickChatEntryGroup())[0]?.customConfig?.baseUrl)
+      .toBe('https://gateway.example.test/proxy/v1');
+  });
+
+  it('persists Anthropic protocol and returns it in the runtime choice', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const added = await a.addCustomModelEntry({
+      protocol: 'anthropic',
+      baseUrl: 'https://gateway.example.test',
+      model: 'claude-3-7-sonnet',
+      apiKey: 'sk-custom-anthropic-xxxxxxxx',
+    });
+    expect((await a.pickChatEntryGroup()).find((entry) => entry.entryId === added.entryId)).toEqual(
+      expect.objectContaining({
+        customConfig: expect.objectContaining({
+          protocol: 'anthropic',
+          baseUrl: 'https://gateway.example.test',
+        }),
+      }),
+    );
+  });
+
   it('atomically stores endpoint metadata and carries it into the runtime choice', async () => {
     const a = await import('../../../src/main/features/auth');
     const added = await a.addCustomModelEntry({
@@ -444,6 +514,7 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
         model: 'acme/reasoner-v2',
         apiKey: 'sk-custom-runtime-xxxxxxxx',
         customConfig: {
+          protocol: 'openai',
           baseUrl: 'https://gateway.example.test/v1',
           contextWindow: 262_144,
           maxTokens: 16_384,
@@ -585,6 +656,7 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
     });
 
     expect((await a.pickChatEntryGroup())[0]?.customConfig).toEqual({
+      protocol: 'openai',
       baseUrl: 'http://127.0.0.1:11434/v1',
       contextWindow: 131_072,
       maxTokens: 32_768,

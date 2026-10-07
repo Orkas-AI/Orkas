@@ -61,6 +61,25 @@ async function loadRunner() {
 }
 
 describe('runner › buildRunner auth gate', () => {
+  it('propagates custom Anthropic metadata to the runner provider without catalog lookup', async () => {
+    const createPiProvider = vi.fn(({ customModel }: any) => ({
+      id: 'custom', name: 'Protocol fixture',
+      async *stream() { yield { type: 'text_delta' as const, text: 'ok' }; yield { type: 'message_end' as const, model: customModel.id, stopReason: 'end_turn' as const }; },
+      complete: vi.fn(), validateAuth: vi.fn(),
+    }));
+    vi.doMock('#core-agent', async () => ({ ...(await vi.importActual<any>('#core-agent')), createPiProvider }));
+    const uid = 'review-custom-anthropic';
+    const users = await import('../../../src/main/features/users'); users.activateUser(uid);
+    const auth = await import('../../../src/main/features/auth');
+    await auth.addCustomModelEntry({ protocol: 'anthropic', baseUrl: 'https://gateway.example.test', model: 'claude-gateway-alias', apiKey: 'synthetic-runner-review', contextWindow: 200000, maxTokens: 8192 });
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({ sessionId: 'gconv-review-custom-anthropic', userId: uid });
+    const provider = (built.runner as any).providers.get('custom');
+    for await (const _ of provider.stream({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] })) { }
+    expect(createPiProvider).toHaveBeenCalledWith(expect.objectContaining({ provider: 'custom', customModel: expect.objectContaining({ api: 'anthropic-messages', contextWindow: 200000, maxTokens: 8192 }) }));
+  });
+
+
   it('keeps BYO provider windows aligned with the public catalog across a remote refresh', async ({ signal }) => {
     const createPiProvider = vi.fn(({ customModel }: any) => ({
       id: 'anthropic', name: 'Anthropic',

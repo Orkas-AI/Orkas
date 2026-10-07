@@ -116,6 +116,7 @@ import {
   createDeepSeekProvider,
   createDoubaoProvider,
   buildCustomOpenAICompatibleModel,
+  buildCustomAnthropicModel,
   createCustomOpenAICompatibleProvider,
   omitReservedOutputLimitForProvider,
 } from './external-providers';
@@ -177,7 +178,11 @@ function buildExternalProviderModel(
     case 'doubao':
       return buildDoubaoModel(modelId);
     case 'custom':
-      return customConfig ? buildCustomOpenAICompatibleModel(modelId, customConfig) : null;
+      return customConfig
+        ? (customConfig.protocol === 'anthropic'
+          ? buildCustomAnthropicModel(modelId, customConfig)
+          : buildCustomOpenAICompatibleModel(modelId, customConfig))
+        : null;
     default:
       return null;
   }

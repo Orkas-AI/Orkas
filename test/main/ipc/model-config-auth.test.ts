@@ -82,8 +82,19 @@ function entryProviders(res: Record<string, unknown>): string[] {
   return ((res.entries || []) as Array<{ provider?: string }>).map((entry) => String(entry.provider || ''));
 }
 
-
 describe('ipc › model config auth lists', () => {
+
+  it('persists the selected Anthropic protocol and gateway prefix through settings IPC', async () => {
+    const added = await call('auth.addCustomModelEntry', {
+      protocol: 'anthropic', baseUrl: 'https://gateway.example.test/proxy/v1/messages',
+      model: 'claude-gateway-alias', apiKey: 'synthetic-ipc-protocol',
+    });
+    expect(added.ok).toBe(true);
+    const auth = await import('../../../src/main/features/auth');
+    expect((await auth.pickChatEntryGroup())[0]?.customConfig).toMatchObject({
+      protocol: 'anthropic', baseUrl: 'https://gateway.example.test/proxy',
+    });
+  });
 
   it('selects a custom entry and its catalog model version through one IPC call', async () => {
     const profile = await call('auth.addApiKey', {

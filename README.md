@@ -103,7 +103,7 @@ Orkas is an open-source, local-first multi-agent desktop app. A super-powered Co
 No. Orkas runs on your machine but calls the models you choose through your own API keys (or a local model endpoint). It orchestrates agents and tools — it is not itself a model.
 
 **Can I use local models like Ollama or LM Studio?**
-Yes. Add them under **Settings → AI Providers → Custom (OpenAI-compatible)** and point the base URL at your local endpoint. You can run one agent on a local model and another on a hosted one in the same chat.
+Yes. Open **Account settings → Models → Chat → Add model → Custom**, select **OpenAI-compatible** or **Anthropic Messages**, and enter the base URL, exact model ID, and API key. Choose the saved model from the task’s model control.
 
 **Where are my API keys and data stored?**
 On your disk. Conversations, files, knowledge bases, agents, and keys stay local; model calls go straight from your machine to the provider and are never proxied or archived by Orkas.

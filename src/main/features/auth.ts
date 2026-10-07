@@ -57,6 +57,7 @@
  *   unchanged from v2; see below.
  */
 
+import { normalizeAnthropicBaseUrl } from '../model/custom-model-url';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { shell } from 'electron';
@@ -187,8 +188,9 @@ interface ApiKeyProfile {
   provider: string;
   label: string;
   key: string;
-  /** Present only for the `custom` OpenAI-compatible provider. */
+  /** Present only for the custom provider. */
   baseUrl?: string;
+  protocol?: 'openai' | 'anthropic';
   contextWindow?: number;
   maxTokens?: number;
   supportsReasoning?: boolean;
@@ -1001,7 +1003,11 @@ function customConfigError(code: string, message: string): Error & { code: strin
   return Object.assign(new Error(message), { code });
 }
 
-export function normalizeCustomModelBaseUrl(raw: string): string {
+export function normalizeCustomModelBaseUrl(
+  raw: string,
+  protocol: 'openai' | 'anthropic' = 'openai',
+  normalizeEndpoint = true,
+): string {
   const value = String(raw || '').trim();
   if (!value) throw customConfigError('CUSTOM_BASE_URL_REQUIRED', 'API base URL required');
   if (value.length > 2048) throw customConfigError('CUSTOM_BASE_URL_INVALID', 'API base URL is too long');
@@ -1019,6 +1025,11 @@ export function normalizeCustomModelBaseUrl(raw: string): string {
       'CUSTOM_BASE_URL_INVALID',
       'API base URL cannot include credentials, query parameters, or a fragment',
     );
+  }
+  if (protocol === 'anthropic') {
+    // Stored Anthropic bases are already canonical. Repeated suffix removal
+    // can consume a gateway prefix that itself ends in /v1.
+    return normalizeEndpoint ? normalizeAnthropicBaseUrl(url.toString()) : url.toString().replace(/\/+$/, '');
   }
   const chatPathIndex = url.pathname.search(/\/chat(?:\/|$)/i);
   if (chatPathIndex >= 0) {
@@ -1049,7 +1060,8 @@ function customRuntimeConfigFromProfile(
 ): CustomOpenAICompatibleRuntimeConfig | null {
   if (!profile || profile.type !== 'api_key' || profile.provider !== CUSTOM_MODEL_PROVIDER) return null;
   try {
-    const baseUrl = normalizeCustomModelBaseUrl(profile.baseUrl || '');
+    const protocol = profile.protocol === 'anthropic' ? 'anthropic' : 'openai';
+    const baseUrl = normalizeCustomModelBaseUrl(profile.baseUrl || '', protocol, false);
     const contextWindow = normalizeCustomTokenLimit(
       profile.contextWindow,
       DEFAULT_CUSTOM_CONTEXT_WINDOW,
@@ -1065,6 +1077,7 @@ function customRuntimeConfigFromProfile(
       ? profile.reasoningEffort as 'low' | 'medium' | 'high'
       : undefined;
     return {
+      protocol,
       baseUrl,
       contextWindow,
       maxTokens,
@@ -1432,6 +1445,7 @@ export async function addApiKeyEntry(
 
 export interface AddCustomModelEntryInput {
   label?: string;
+  protocol?: 'openai' | 'anthropic' | string;
   baseUrl: string;
   model: string;
   apiKey: string;
@@ -1448,6 +1462,7 @@ export async function addCustomModelEntry(
 ): Promise<{ profileId: string; entryId: string }> {
   const rawLabel = String(input?.label || '').trim();
   const model = String(input?.model || '').trim();
+  const protocol = input?.protocol === 'anthropic' ? 'anthropic' : 'openai';
   const key = String(input?.apiKey || '').trim();
   if (!model) throw customConfigError('CUSTOM_MODEL_REQUIRED', 'Model ID required');
   if (!key) throw customConfigError('CUSTOM_API_KEY_REQUIRED', 'API key required');
@@ -1461,7 +1476,7 @@ export async function addCustomModelEntry(
   if (!isSelectableModel(CUSTOM_MODEL_PROVIDER, model)) {
     throw customConfigError('CUSTOM_MODEL_INVALID', 'Model ID is invalid');
   }
-  const baseUrl = normalizeCustomModelBaseUrl(input.baseUrl);
+  const baseUrl = normalizeCustomModelBaseUrl(input.baseUrl, protocol);
   const contextWindow = normalizeCustomTokenLimit(
     input.contextWindow,
     DEFAULT_CUSTOM_CONTEXT_WINDOW,
@@ -1508,6 +1523,7 @@ export async function addCustomModelEntry(
     label: chosenLabel,
     key,
     baseUrl,
+    protocol,
     contextWindow,
     ...(maxTokens !== undefined ? { maxTokens } : {}),
     ...(input.supportsReasoning === true ? { supportsReasoning: true } : {}),

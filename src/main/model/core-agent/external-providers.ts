@@ -516,7 +516,7 @@ export async function createDoubaoProvider(config: CreateDoubaoProviderConfig): 
   });
 }
 
-// ── User-configured OpenAI-compatible endpoint ──────────────────────────
+// ── User-configured endpoint ──────────────────────────
 
 export interface CreateCustomOpenAICompatibleProviderConfig
   extends CustomOpenAICompatibleRuntimeConfig {
@@ -551,6 +551,24 @@ export function buildCustomOpenAICompatibleModel(
   };
 }
 
+export function buildCustomAnthropicModel(
+  modelId: string,
+  config: CustomOpenAICompatibleRuntimeConfig,
+): Model<'anthropic-messages'> {
+  return {
+    id: modelId,
+    name: modelId,
+    api: 'anthropic-messages',
+    provider: 'custom' as any,
+    baseUrl: config.baseUrl,
+    reasoning: config.supportsReasoning === true,
+    input: config.supportsVision === false ? ['text'] : ['text', 'image'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: config.contextWindow,
+    maxTokens: config.maxTokens,
+  };
+}
+
 export async function createCustomOpenAICompatibleProvider(
   config: CreateCustomOpenAICompatibleProviderConfig,
 ): Promise<LLMProvider> {
@@ -566,14 +584,19 @@ export async function createCustomOpenAICompatibleProvider(
   if (!config.modelId) throw new Error('custom: modelId required');
   if (!config.baseUrl) throw new Error('custom: baseUrl required');
   const mod = await ca();
-  const compatibility = createCustomOutputLimitCompatibility(config);
+  const isAnthropic = config.protocol === 'anthropic';
+  const compatibility = isAnthropic ? null : createCustomOutputLimitCompatibility(config);
   return mod.createPiProvider({
     provider: 'custom',
     apiKey: config.apiKey,
-    customModel: buildCustomOpenAICompatibleModel(config.modelId, config),
-    normalizeLiteralLeadingThinkText: true,
-    onPayload: payload => compatibility.onPayload(repairOpenAICompatiblePayload(payload)),
-    wrapFetch: compatibility.wrapFetch,
+    customModel: isAnthropic
+      ? buildCustomAnthropicModel(config.modelId, config)
+      : buildCustomOpenAICompatibleModel(config.modelId, config),
+    normalizeLiteralLeadingThinkText: !isAnthropic,
+    ...(compatibility ? {
+      onPayload: (payload: unknown) => compatibility.onPayload(repairOpenAICompatiblePayload(payload)),
+      wrapFetch: compatibility.wrapFetch,
+    } : {}),
     ...(config.reasoningEffort ? { defaultReasoning: config.reasoningEffort } : {}),
   });
 }

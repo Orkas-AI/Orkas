@@ -125,7 +125,7 @@ export const CATALOG: readonly CatalogEntry[] = [
   { id: 'openrouter',         label: 'OpenRouter',    docsUrl: 'https://openrouter.ai/keys' },
   {
     id: 'custom',
-    label: 'Custom (OpenAI-compatible)',
+    label: 'Custom',
     labelKey: 'provider.custom.label',
     customOpenAICompatible: true,
   },
@@ -707,6 +707,8 @@ export function providerUsesCustomOpenAIConfig(id: string): boolean {
 }
 
 export interface CustomOpenAICompatibleRuntimeConfig {
+  /** Wire protocol; omitted legacy configs use OpenAI-compatible chat completions. */
+  protocol?: 'openai' | 'anthropic';
   baseUrl: string;
   contextWindow: number;
   maxTokens: number;

@@ -197,6 +197,23 @@ function loadSettingsClickHarness(
   return { context, elements, indexHtml, settingsSource: source, invoke, monitor };
 }
 
+it('submits the selected Anthropic protocol without losing a gateway prefix', async () => {
+  const { context, elements, invoke } = loadSettingsClickHarness();
+  const body = elements.get('add-account-body')!;
+  for (const [selector, value] of Object.entries({
+    '.custom-label-input': 'Gateway', '.custom-protocol-input': 'anthropic',
+    '.custom-base-url-input': 'https://gateway.example.test/proxy/v1/messages',
+    '.custom-model-input': 'claude-gateway-alias', '.custom-max-tokens-input': '8192',
+    '.custom-key-input': 'synthetic-form-key', '.form-msg': '',
+  })) { const field = new FakeElement(); field.value = value; body.setQueryResult(selector, field); }
+  context._settingsShowCustomModelForm({ id: 'custom', label: 'Custom' });
+  await elements.get('add-account-actions')!.children.at(-1)!.click();
+  expect(invoke).toHaveBeenCalledWith('auth.addCustomModelEntry', {
+    label: 'Gateway', protocol: 'anthropic', baseUrl: 'https://gateway.example.test/proxy/v1/messages',
+    model: 'claude-gateway-alias', maxTokens: '8192', apiKey: 'synthetic-form-key',
+  });
+});
+
 describe('settings model authorization add account', () => {
   it('uses the model options returned by imageAuth and preserves the selected model on save', async () => {
     const model = 'doubao-seedream-5-0-pro-260628';
@@ -289,6 +306,7 @@ describe('settings model authorization add account', () => {
     expect(invoke).not.toHaveBeenCalledWith('auth.addApiKeyEntry', expect.anything());
     const customBody = elements.get('add-account-body')!;
     for (const selector of [
+      '.custom-protocol-input',
       '.custom-label-input',
       '.custom-base-url-input',
       '.custom-model-input',
@@ -366,6 +384,7 @@ describe('settings model authorization add account', () => {
       })
     `, context)))).toEqual({
       label: '',
+      protocol: 'openai',
       baseUrl: 'http://127.0.0.1:8000/v1',
       model: 'qwen3-32b',
       apiKey: 'local-key',
@@ -380,6 +399,7 @@ describe('settings model authorization add account', () => {
       })
     `, context)))).toEqual({
       label: '',
+      protocol: 'openai',
       baseUrl: 'https://gateway.example.test/v1',
       model: 'reasoner',
       apiKey: 'key',
@@ -396,6 +416,7 @@ describe('settings model authorization add account', () => {
     const body = elements.get('add-account-body')!;
     const actions = elements.get('add-account-actions')!;
     const fields = {
+      '.custom-protocol-input': 'openai',
       '.custom-label-input': '',
       '.custom-base-url-input': 'https://gateway.example.test/v1',
       '.custom-model-input': 'acme/reasoner-v2',

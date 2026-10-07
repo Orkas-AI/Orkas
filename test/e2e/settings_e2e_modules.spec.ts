@@ -103,81 +103,98 @@ test.describe('settings modules and model guard', () => {
     })).toBeVisible();
   });
 
-  test('configures a custom endpoint without exposing its key or endpoint in Settings', async ({ orkas }) => {
-    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
-    const beforeSave = await orkas.invoke<{
-      entries: Array<{ entryId: string; provider: string }>;
-    }>('auth.listEntries', { includeUnavailable: true });
-    const beforeCustomIds = beforeSave.entries
-      .filter((entry) => entry.provider === 'custom')
-      .map((entry) => entry.entryId)
-      .sort();
-    await openSettingsTab(orkas.page, 'credentials');
-    await openAddModelDialog(orkas.page);
-    await orkas.page.locator('#settings-picker-provider .ai-select-trigger').click();
-    const popover = orkas.page.locator('.ai-select-popover:visible');
-    await popover.locator('.ai-select-item', { hasText: 'Custom' }).click();
-    await expect(orkas.page.locator('#settings-picker-model-row')).toBeHidden();
-    await orkas.page.locator('#settings-add-entry-btn').click();
+  for (const protocol of ['openai', 'anthropic'] as const) {
+    test(`configures a custom ${protocol} model without revealing its endpoint or key`, async ({ orkas }) => {
+      if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+      const beforeSave = await orkas.invoke<{
+        entries: Array<{ entryId: string; provider: string }>;
+      }>('auth.listEntries', { includeUnavailable: true });
+      const beforeCustomIds = beforeSave.entries
+        .filter((entry) => entry.provider === 'custom')
+        .map((entry) => entry.entryId)
+        .sort();
+      await openSettingsTab(orkas.page, 'credentials');
+      await openAddModelDialog(orkas.page);
+      await orkas.page.locator('#settings-picker-provider .ai-select-trigger').click();
+      const popover = orkas.page.locator('.ai-select-popover:visible');
+      await popover.locator('.ai-select-item', { hasText: 'Custom' }).click();
+      await expect(orkas.page.locator('#settings-picker-model-row')).toBeHidden();
+      await orkas.page.locator('#settings-add-entry-btn').click();
 
-    const modal = orkas.page.locator('#add-account-modal');
-    await expect(modal).toHaveClass(/\bopen\b/);
-    await expect(orkas.page.locator('#settings-add-modal')).not.toHaveClass(/\bopen\b/);
-    await expect(modal.locator('.custom-key-input')).toHaveAttribute('type', 'password');
-    await modal.locator('.custom-label-input').fill('E2E Private Gateway');
-    await modal.locator('.custom-base-url-input').fill(
-      'https://embedded:credential@gateway.example.invalid/v1',
-    );
-    await modal.locator('.custom-model-input').fill('acme/private-reasoner');
-    await modal.locator('.custom-key-input').fill('sk-custom-e2e-secret-xxxxxxxx');
-    await orkas.page.locator('#add-account-actions .btn-primary').click();
-    await expect(modal.locator('.form-msg')).toHaveClass(/\berror\b/);
-    await expect(modal.locator('.form-msg')).not.toBeEmpty();
-    await expect(modal).toHaveClass(/\bopen\b/);
-    const afterRejectedSave = await orkas.invoke<{
-      entries: Array<{ entryId: string; provider: string }>;
-    }>('auth.listEntries', { includeUnavailable: true });
-    expect(afterRejectedSave.entries
-      .filter((entry) => entry.provider === 'custom')
-      .map((entry) => entry.entryId)
-      .sort()).toEqual(beforeCustomIds);
+      const modal = orkas.page.locator('#add-account-modal');
+      await expect(modal).toHaveClass(/\bopen\b/);
+      await expect(orkas.page.locator('#settings-add-modal')).not.toHaveClass(/\bopen\b/);
+      await expect(modal.locator('.custom-key-input')).toHaveAttribute('type', 'password');
+      await expect(modal.locator('.custom-protocol-input')).toHaveValue('openai');
+      await modal.locator('.custom-protocol-input').selectOption(protocol);
+      await expect(modal.locator('.custom-base-url-input')).toHaveAttribute('placeholder',
+        protocol === 'anthropic' ? 'https://api.example.com' : 'https://api.example.com/v1');
+      await modal.locator('.custom-label-input').fill('E2E Private Gateway');
+      await modal.locator('.custom-base-url-input').fill(
+        'https://embedded:credential@gateway.example.invalid/v1',
+      );
+      await modal.locator('.custom-model-input').fill('acme/private-reasoner');
+      await modal.locator('.custom-key-input').fill('sk-custom-e2e-secret-xxxxxxxx');
+      await orkas.page.locator('#add-account-actions .btn-primary').click();
+      await expect(modal.locator('.form-msg')).toHaveClass(/\berror\b/);
+      await expect(modal.locator('.form-msg')).not.toBeEmpty();
+      await expect(modal).toHaveClass(/\bopen\b/);
+      const afterRejectedSave = await orkas.invoke<{
+        entries: Array<{ entryId: string; provider: string }>;
+      }>('auth.listEntries', { includeUnavailable: true });
+      expect(afterRejectedSave.entries
+        .filter((entry) => entry.provider === 'custom')
+        .map((entry) => entry.entryId)
+        .sort()).toEqual(beforeCustomIds);
 
-    await modal.locator('.custom-base-url-input').fill(
-      'https://gateway.example.invalid/v1/chat/completions',
-    );
-    await orkas.page.locator('#add-account-actions .btn-primary').click();
+      await modal.locator('.custom-base-url-input').fill(
+        protocol === 'anthropic' ? 'https://gateway.example.invalid/proxy/v1/v1/messages'
+          : 'https://gateway.example.invalid/v1/chat/completions',
+      );
+      await orkas.page.locator('#add-account-actions .btn-primary').click();
 
-    let row = orkas.page.locator('#settings-entries .entry-row', {
-      hasText: 'acme/private-reasoner',
+      let row = orkas.page.locator('#settings-entries .entry-row', {
+        hasText: 'acme/private-reasoner',
+      });
+      await expect(row).toContainText('Custom');
+      await expect(row).toContainText('E2E-Private-Gateway');
+      await expect(row).not.toContainText('sk-custom-e2e-secret-xxxxxxxx');
+      await expect(row).not.toContainText('gateway.example.invalid');
+      const entryId = await row.getAttribute('data-entry-id');
+      expect(entryId).toBeTruthy();
+
+      const listed = await orkas.invoke<{
+        entries: Array<Record<string, unknown>>;
+      }>('auth.listEntries', { includeUnavailable: true });
+      const customEntry = listed.entries.find((entry) => entry.entryId === entryId);
+      expect(customEntry).toMatchObject({
+        provider: 'custom',
+        model: 'acme/private-reasoner',
+        profileLabel: 'E2E-Private-Gateway',
+      });
+      expect(customEntry).not.toHaveProperty('apiKey');
+      expect(customEntry).not.toHaveProperty('baseUrl');
+
+      const relaunchedPage = await orkas.relaunch();
+      await openSettingsTab(relaunchedPage, 'credentials');
+      row = relaunchedPage.locator(`.entry-row[data-entry-id="${entryId}"]`);
+      await expect(row).toContainText('acme/private-reasoner');
+      const storedRuntime = await orkas.electronApp!.evaluate(async () => {
+        const auth = (process as any).mainModule.require(process.cwd() + '/src/main/features/auth.ts');
+        const choices = await auth.pickChatEntryGroup();
+        const choice = choices.find((value: { model: string }) => value.model === 'acme/private-reasoner');
+        return { protocol: choice?.customConfig?.protocol, baseUrl: choice?.customConfig?.baseUrl };
+      });
+      expect(storedRuntime).toEqual({ protocol, baseUrl: protocol === 'anthropic'
+        ? 'https://gateway.example.invalid/proxy/v1' : 'https://gateway.example.invalid/v1' });
+
+      await expect(row).not.toContainText('gateway.example.invalid');
+      await row.locator('.entry-actions .danger').click();
+      await relaunchedPage.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
+      await expect(row).toHaveCount(0);
     });
-    await expect(row).toContainText('Custom');
-    await expect(row).toContainText('E2E-Private-Gateway');
-    await expect(row).not.toContainText('sk-custom-e2e-secret-xxxxxxxx');
-    await expect(row).not.toContainText('gateway.example.invalid');
-    const entryId = await row.getAttribute('data-entry-id');
-    expect(entryId).toBeTruthy();
 
-    const listed = await orkas.invoke<{
-      entries: Array<Record<string, unknown>>;
-    }>('auth.listEntries', { includeUnavailable: true });
-    const customEntry = listed.entries.find((entry) => entry.entryId === entryId);
-    expect(customEntry).toMatchObject({
-      provider: 'custom',
-      model: 'acme/private-reasoner',
-      profileLabel: 'E2E-Private-Gateway',
-    });
-    expect(customEntry).not.toHaveProperty('apiKey');
-    expect(customEntry).not.toHaveProperty('baseUrl');
-
-    const relaunchedPage = await orkas.relaunch();
-    await openSettingsTab(relaunchedPage, 'credentials');
-    row = relaunchedPage.locator(`.entry-row[data-entry-id="${entryId}"]`);
-    await expect(row).toContainText('acme/private-reasoner');
-    await expect(row).not.toContainText('gateway.example.invalid');
-    await row.locator('.entry-actions .danger').click();
-    await relaunchedPage.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
-    await expect(row).toHaveCount(0);
-  });
+  }
 
   test('keeps an empty model state quiet until an LLM action needs configuration', async ({ appPage, orkas }) => {
     const listed = await orkas.invoke<{

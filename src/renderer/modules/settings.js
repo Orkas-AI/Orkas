@@ -1561,10 +1561,13 @@ function _settingsValidateCustomBaseUrl(value) {
   return '';
 }
 
-function _settingsNormalizeCustomBaseUrl(value) {
+function _settingsNormalizeCustomBaseUrl(value, protocol) {
   const raw = String(value || '').trim();
   try {
     const url = new URL(raw);
+    // Main owns Anthropic suffix conversion; sending its canonical result
+    // through that boundary again can remove part of a gateway prefix.
+    if (protocol === 'anthropic') return raw;
     const chatPathIndex = url.pathname.search(/\/chat(?:\/|$)/i);
     if (chatPathIndex >= 0) {
       url.pathname = url.pathname.slice(0, chatPathIndex).replace(/\/+$/, '') || '/';
@@ -1579,7 +1582,8 @@ function _settingsBuildCustomModelPayload(values) {
   const maxTokens = String(values.maxTokens ?? '').trim();
   return {
     label: String(values.label || '').trim(),
-    baseUrl: _settingsNormalizeCustomBaseUrl(values.baseUrl),
+    protocol: values.protocol === 'anthropic' ? 'anthropic' : 'openai',
+    baseUrl: _settingsNormalizeCustomBaseUrl(values.baseUrl, values.protocol),
     model: String(values.model || '').trim(),
     apiKey: String(values.apiKey || '').trim(),
     ...(maxTokens ? { maxTokens } : {}),
@@ -1606,6 +1610,13 @@ function _settingsShowCustomModelForm(provider) {
       <input type="text" class="custom-label-input form-input" placeholder="${escapeHtml(t('settings.custom.label_placeholder'))}" autocomplete="off" spellcheck="false" />
     </div>
     <div class="form-row">
+      <label>${escapeHtml(t('settings.custom.protocol'))}</label>
+      <select class="custom-protocol-input form-input">
+        <option value="openai">${escapeHtml(t('settings.custom.protocol_openai'))}</option>
+        <option value="anthropic">${escapeHtml(t('settings.custom.protocol_anthropic'))}</option>
+      </select>
+    </div>
+    <div class="form-row">
       <label>${escapeHtml(t('settings.custom.base_url'))}</label>
       <input type="text" class="custom-base-url-input form-input" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" />
     </div>
@@ -1627,11 +1638,16 @@ function _settingsShowCustomModelForm(provider) {
   actions.innerHTML = '';
 
   const labelInput = body.querySelector('.custom-label-input');
+  const protocolInput = body.querySelector('.custom-protocol-input');
   const baseUrlInput = body.querySelector('.custom-base-url-input');
   const modelInput = body.querySelector('.custom-model-input');
   const maxTokensInput = body.querySelector('.custom-max-tokens-input');
   const keyInput = body.querySelector('.custom-key-input');
   const msg = body.querySelector('.form-msg');
+  protocolInput.addEventListener('change', () => {
+    baseUrlInput.placeholder = protocolInput.value === 'anthropic'
+      ? 'https://api.example.com' : 'https://api.example.com/v1';
+  });
 
   const cancelBtn = document.createElement('button');
   cancelBtn.className = 'btn';
@@ -1645,6 +1661,7 @@ function _settingsShowCustomModelForm(provider) {
     const startedAt = Date.now();
     const payload = _settingsBuildCustomModelPayload({
       label: labelInput.value,
+      protocol: protocolInput.value,
       baseUrl: baseUrlInput.value,
       model: modelInput.value,
       maxTokens: maxTokensInput.value,
@@ -1693,7 +1710,8 @@ function _settingsShowCustomModelForm(provider) {
       if (e.key === 'Enter') { next.focus(); e.preventDefault(); }
     });
   };
-  focusNextOnEnter(labelInput, baseUrlInput);
+  focusNextOnEnter(labelInput, protocolInput);
+  focusNextOnEnter(protocolInput, baseUrlInput);
   focusNextOnEnter(baseUrlInput, modelInput);
   focusNextOnEnter(modelInput, maxTokensInput);
   focusNextOnEnter(maxTokensInput, keyInput);
