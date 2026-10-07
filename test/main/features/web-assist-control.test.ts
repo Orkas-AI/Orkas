@@ -504,6 +504,66 @@ describe('Web Assist controlled connector lifecycle', () => {
       vi.restoreAllMocks();
     });
 
+    it.each(['https://example.com/slow?item=1#section', '上海 天气'])(
+      'publishes the accepted address immediately while %s waits for its first document', async input => {
+        const cid = 'c-pending-address';
+        bindWebAssistConversation('u1', cid, electronMock.renderer);
+        const added = addWebAssistTab('u1', electronMock.renderer, { conversationId: cid });
+        if (!added.ok) throw new Error('Address fixture setup failed');
+        const tabId = added.state.active_tab_id;
+        const page = electronMock.page;
+        const nativeLoad = page.loadURL.bind(page);
+        let finish!: () => Promise<void>;
+        vi.spyOn(page, 'loadURL').mockImplementationOnce((url: string) => new Promise<void>(resolve => {
+          finish = async () => { await nativeLoad(url); resolve(); };
+        }));
+        const destination = input.startsWith('https:') ? input : 'https://www.bing.com/search?q=%E4%B8%8A%E6%B5%B7+%E5%A4%A9%E6%B0%94';
+        electronMock.renderer.send.mockClear();
+        const navigated = await navigateWebAssistTo(electronMock.renderer, { tabId, url: input });
+        expect(page.getURL()).toBe('');
+        expect(navigated).toMatchObject({ ok: true, state: { tabs: [{ loading: true, address_url: destination }] } });
+        const pushed = electronMock.renderer.send.mock.calls.filter(([event]: any[]) => event === 'web-assist:state');
+        expect(pushed.length).toBeGreaterThan(0);
+        for (const [, state] of pushed) expect(state.tabs[0].address_url).toBe(destination);
+        expect(webAssistState(electronMock.renderer).state.tabs[0].address_url).toBe(destination);
+        // Pending chrome state must not claim a document has committed to model consumers.
+        const listed = listModelWebAssistTabs('u1', cid);
+        expect(JSON.stringify(listed)).not.toContain('address_url');
+        expect(listed).toMatchObject({ tabs: [{ display_url: '' }] });
+        await finish();
+        expect(webAssistState(electronMock.renderer).state.tabs[0]).toMatchObject({ loading: false, address_url: destination });
+      },
+    );
+
+    it('replaces pending addresses per tab and resumes the committed address after cancellation or failure', async () => {
+      const cid = 'c-pending-recovery';
+      const opened = await openWebAssist('u1', electronMock.renderer, { conversationId: cid, url: 'https://example.com/ready' });
+      if (!opened.ok) throw new Error('Address recovery fixture setup failed');
+      const tabId = opened.state.active_tab_id;
+      const page = electronMock.page;
+      const nativeLoad = page.loadURL.bind(page);
+      const load = vi.spyOn(page, 'loadURL').mockImplementation(() => new Promise<void>(() => {}));
+      await navigateWebAssistTo(electronMock.renderer, { tabId, url: 'https://example.com/slow' });
+      const replaced = await openWebAssist('u1', electronMock.renderer, { conversationId: cid, tabId, url: 'https://example.com/replacement' });
+      expect(replaced).toMatchObject({ ok: true, state: { tabs: [{ address_url: 'https://example.com/replacement' }] } });
+      const blank = addWebAssistTab('u1', electronMock.renderer, { conversationId: cid });
+      if (!blank.ok) throw new Error('Blank tab fixture setup failed');
+      expect(blank.state.tabs.find(tab => tab.tab_id === blank.state.active_tab_id)?.address_url).toBe('');
+      expect(activateWebAssistTab(electronMock.renderer, tabId)).toMatchObject({ ok: true, state: { tabs: [
+        { address_url: 'https://example.com/replacement' }, { address_url: '' },
+      ] } });
+      page.emit('did-fail-load', {}, -3, 'ERR_ABORTED', 'https://example.com/slow', true);
+      expect(webAssistState(electronMock.renderer).state.tabs[0].address_url).toBe('https://example.com/replacement');
+      page.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', 'https://example.com/replacement', true);
+      page.emit('did-stop-loading');
+      expect(webAssistState(electronMock.renderer).state.tabs[0]).toMatchObject({
+        loading: false, error_code: 'page_load_failed', address_url: 'https://example.com/ready',
+      });
+      load.mockRestore();
+      await nativeLoad('https://example.com/recovered');
+      expect(webAssistState(electronMock.renderer).state.tabs[0]).toMatchObject({ loading: false, address_url: 'https://example.com/recovered' });
+    });
+
     it('keeps the visible native page mounted when reactivating or reopening the same tab', async () => {
       const opened = await openWebAssist('u1', electronMock.renderer, { conversationId: 'c-visible', url: 'https://example.com/ready' });
       if (!opened.ok) throw new Error('Visible page fixture setup failed');

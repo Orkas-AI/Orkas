@@ -222,6 +222,8 @@ interface WebAssistTabRecord {
   suspended?: { url: string; title: string; entries: Array<{ url: string; title: string }>; index: number };
   label: string;
   loading: boolean;
+  /** Accepted destination until commit; used only by trusted address chrome. */
+  pendingAddressUrl?: string;
   errorCode?: WebAssistSnapshot['error_code'];
   downloadRequest?: WebAssistTabSnapshot['download_request'];
   controlContext?: WebAssistControlContext;
@@ -740,7 +742,9 @@ function rendererSnapshot(record: WebAssistRecord): WebAssistSnapshot {
     tabs: state.tabs.map(tab => {
       const source = record.tabs.get(tab.tab_id)!;
       const contents = source.view?.webContents;
-      const rawUrl = contents && !contents.isDestroyed() ? contents.getURL() : source.suspended?.url || '';
+      const rawUrl = source.loading && source.pendingAddressUrl
+        ? source.pendingAddressUrl
+        : contents && !contents.isDestroyed() ? contents.getURL() : source.suspended?.url || '';
       return {
         ...tab,
         address_url: rawUrl === 'about:blank' ? rawUrl : safeWebAssistUrl(rawUrl) || '',
@@ -1010,6 +1014,7 @@ function ensureTabLoaded(record: WebAssistRecord, tab: WebAssistTabRecord, load 
     invalidateObservation(tab);
     const view = tab.view;
     if (!load) return true;
+    tab.pendingAddressUrl = saved.entries.length ? saved.entries[historyIndex ?? saved.index].url : saved.url;
     const loaded = saved.entries.length
       ? view.webContents.navigationHistory.restore({ entries: saved.entries, index: historyIndex ?? saved.index })
       : view.webContents.loadURL(saved.url);
@@ -1389,6 +1394,7 @@ function readWebAssistTextCondition(contents: WebContents, text: string, deadlin
 // must never overwrite the current page's state.
 function handleLoadFailure(record: WebAssistRecord, tab: WebAssistTabRecord, netCode: number): void {
   tab.loading = false;
+  tab.pendingAddressUrl = undefined;
   tab.errorCode = 'page_load_failed';
   logWebAssistFailure(record.owner.webContents, 'page_load_failed', netCode);
   emit(record);
@@ -1568,6 +1574,7 @@ function mountTab(
           if (!nativeOptions.webContents) {
             const post = details.postBody;
             child.loading = true;
+            child.pendingAddressUrl = url;
             child.view.webContents.loadURL(url, {
               httpReferrer: details.referrer,
               ...(post ? {
@@ -1617,7 +1624,10 @@ function mountTab(
     if (tab.view !== view) return;
     if (isMainFrame) {
       tab.lastUsedAt = Date.now();
-      if (!_isSameDocument) tab.edited = false;
+      if (!_isSameDocument) {
+        tab.edited = false;
+        tab.pendingAddressUrl = safeWebAssistUrl(_url) || undefined;
+      }
       invalidateObservation(tab);
     }
   });
@@ -1630,10 +1640,12 @@ function mountTab(
   contents.on('did-stop-loading', () => {
     if (tab.view !== view) return;
     tab.loading = false;
+    tab.pendingAddressUrl = undefined;
     emit(record);
   });
   contents.on('did-navigate', () => {
     if (tab.view !== view) return;
+    tab.pendingAddressUrl = undefined;
     // Error documents also emit did-finish-load; only a committed navigation
     // proves that a new page has replaced the previous load failure.
     if (tab.errorCode === 'page_load_failed') tab.errorCode = undefined;
@@ -1650,6 +1662,7 @@ function mountTab(
   });
   contents.on('did-navigate-in-page', () => {
     if (tab.view !== view) return;
+    tab.pendingAddressUrl = undefined;
     invalidateObservation(tab);
     emit(record);
   });
@@ -1666,6 +1679,7 @@ function mountTab(
   contents.on('render-process-gone', (_event, details) => {
     if (tab.view !== view) return;
     tab.loading = false;
+    tab.pendingAddressUrl = undefined;
     tab.errorCode = 'page_load_failed';
     if (details?.reason !== 'clean-exit') logWebAssistFailure(record.owner.webContents, 'renderer_gone');
     emit(record);
@@ -1798,6 +1812,7 @@ export async function openWebAssist(
   tab.assistantAction = undefined;
   invalidateObservation(tab);
   tab.loading = true;
+  tab.pendingAddressUrl = url;
   if (foreground) {
     record.activeTabId = tab.id;
     for (const candidate of record.tabs.values()) {
@@ -1878,6 +1893,7 @@ export async function navigateWebAssistTo(
   tab.assistantAction = undefined;
   invalidateObservation(tab);
   tab.loading = true;
+  tab.pendingAddressUrl = url;
   if (activate) record.activeTabId = tab.id;
   emit(record);
   tab.view.webContents.loadURL(url).catch(() => undefined);
