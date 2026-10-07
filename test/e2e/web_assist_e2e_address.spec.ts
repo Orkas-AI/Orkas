@@ -1,6 +1,87 @@
 import { createServer } from 'node:http';
 import { expect, test } from './fixtures/orkas';
 
+for (const kind of ['URL', 'search'] as const) {
+  test(`browser address stays visible while a ${kind} waits for its first response`, async ({ orkas }) => {
+    const cid = (await orkas.invoke<any>('conversations.create', { title: 'Pending browser address' })).conversation.conversation_id;
+    const page = orkas.page!;
+    let nativeId: number | undefined;
+    try {
+      await page.evaluate(async id => {
+        await (window as any).loadConversations();
+        (window as any).setView('conversation', id);
+        (window as any).ConversationInfo.openAndSetTab('browser');
+      }, cid);
+      await expect(page.locator('.web-assist-tab')).toHaveCount(1);
+      // Hold a real Chromium document response in this isolated browser session.
+      // Search remains deterministic and never contacts the public search service.
+      nativeId = await orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }) => {
+        const view = BrowserWindow.getAllWindows()[0].contentView.children.find(v => v instanceof WebContentsView && v.webContents.getURL() === '') as InstanceType<typeof WebContentsView>;
+        let release!: () => void;
+        const pending = new Promise<void>(resolve => { release = resolve; });
+        const gate = { release, requested: '' };
+        (view.webContents as any).__addressResponseGate = gate;
+        view.webContents.session.protocol.handle('https', async request => {
+          gate.requested = request.url;
+          await pending;
+          return new Response('<title>Address ready</title><h1>Navigation completed</h1>', {
+            headers: { 'Content-Type': 'text/html' },
+          });
+        });
+        return view.webContents.id;
+      });
+      const address = page.locator('.web-assist-address-input');
+      const destination = kind === 'URL' ? 'https://address.example.test/slow?item=1#section'
+        : 'https://www.bing.com/search?q=%E4%B8%8A%E6%B5%B7+%E5%A4%A9%E6%B0%94';
+      await address.fill(kind === 'URL' ? destination : '上海 天气');
+      await address.evaluate((node: HTMLInputElement) => {
+        const native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!;
+        (node as any).__addressUpdates = [];
+        Object.defineProperty(node, 'value', {
+          configurable: true,
+          get() { return native.get!.call(this); },
+          set(value) { (this as any).__addressUpdates.push(value); native.set!.call(this, value); },
+        });
+      });
+      await address.press('Enter');
+      await expect.poll(() => orkas.electronApp!.evaluate(({ webContents }, id) =>
+        Boolean((webContents.fromId(id) as any).__addressResponseGate.requested), nativeId!),
+      ).toBe(true);
+      expect(await orkas.electronApp!.evaluate(({ webContents }, id) => webContents.fromId(id)!.getURL(), nativeId)).toBe('');
+      await expect(address).toHaveValue(destination);
+      expect(await address.evaluate((node: HTMLInputElement) => (node as any).__addressUpdates)).not.toContain('');
+      // Blurring or changing tabs must keep the accepted address while loading.
+      await page.locator('.web-assist-add-tab').click();
+      await expect(address).toHaveValue('');
+      await page.locator('.web-assist-tab').first().click();
+      await expect(address).toHaveValue(destination);
+      await address.evaluate((node: HTMLInputElement) => { (node as any).__addressUpdates = []; });
+      const samples = await address.evaluate(async (node: HTMLInputElement) => {
+        const values: string[] = [];
+        for (let frame = 0; frame < 30; frame++) {
+          await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+          values.push(node.value);
+        }
+        return values;
+      });
+      expect(samples).toEqual(Array(30).fill(destination));
+      await orkas.electronApp!.evaluate(({ webContents }, id) => (webContents.fromId(id) as any).__addressResponseGate.release(), nativeId);
+      await expect.poll(() => orkas.electronApp!.evaluate(({ webContents }, id) => webContents.fromId(id)!.getTitle(), nativeId!)).toBe('Address ready');
+      await expect(address).toHaveValue(destination);
+      expect(await address.evaluate((node: HTMLInputElement) => (node as any).__addressUpdates)).not.toContain('');
+    } finally {
+      if (nativeId !== undefined) await orkas.electronApp!.evaluate(({ webContents }, id) => {
+        const contents = webContents.fromId(id);
+        if (contents) {
+          (contents as any).__addressResponseGate.release();
+          contents.session.protocol.unhandle('https');
+        }
+      }, nativeId);
+      await orkas.invoke('webAssist.close', {});
+    }
+  });
+}
+
 for (const key of ['Enter', 'Space']) {
   test(`focused browser close button closes its own tab with ${key}`, async ({ orkas }) => {
     const cid = (await orkas.invoke<any>('conversations.create', { title: 'Keyboard browser tabs' })).conversation.conversation_id;
@@ -54,8 +135,11 @@ test('browser address preserves query, fragment and long redirects through editi
     }, cid);
     const opened = await orkas.invoke<any>('webAssist.open', { conversationId: cid, url: origin + '/start?keep=1#initial' });
     expect(opened.ok).toBe(true);
-    await expect.poll(async () => (await orkas.invoke<any>('webAssist.state', {})).state.tabs
-      .find((tab: any) => tab.tab_id === opened.state.active_tab_id)?.address_url).toBe(origin + '/start?keep=1#initial');
+    await expect.poll(async () => {
+      const tab = (await orkas.invoke<any>('webAssist.state', {})).state.tabs
+        .find((tab: any) => tab.tab_id === opened.state.active_tab_id);
+      return { url: tab?.address_url, loading: tab?.loading };
+    }).toEqual({ url: origin + '/start?keep=1#initial', loading: false });
     const nativeId = await orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }, url) => {
       const view = BrowserWindow.getAllWindows()[0].contentView.children.find(v => v instanceof WebContentsView && v.webContents.getURL() === url) as InstanceType<typeof WebContentsView>;
       return view.webContents.id;
@@ -159,7 +243,10 @@ test('empty task browsers keep one blank new tab and preserve existing pages acr
     const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/keep?item=1#section`;
     await address.fill(url);
     await address.press('Enter');
-    await expect.poll(async () => (await taskTabs(cid))[0].address_url).toBe(url);
+    await expect.poll(async () => {
+      const tab = (await taskTabs(cid))[0];
+      return { url: tab?.address_url, loading: tab?.loading };
+    }).toEqual({ url, loading: false });
     const nativeId = await orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }, target) => {
       const view = BrowserWindow.getAllWindows()[0].contentView.children.find(v => v instanceof WebContentsView && v.webContents.getURL() === target) as InstanceType<typeof WebContentsView>;
       await view.webContents.executeJavaScript('document.querySelector("input").value = "Saved draft"');

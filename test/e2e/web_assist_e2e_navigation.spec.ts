@@ -22,8 +22,11 @@ test('replacing an in-flight navigation does not show failure, while real failur
     }, cid);
     const opened = await orkas.invoke<any>('webAssist.open', { conversationId: cid, url: origin + '/ready' });
     expect(opened.ok).toBe(true);
-    await expect.poll(async () => (await orkas.invoke<any>('webAssist.state', {})).state.tabs
-      .find((tab: any) => tab.tab_id === opened.state.active_tab_id)?.address_url).toBe(origin + '/ready');
+    await expect.poll(async () => {
+      const tab = (await orkas.invoke<any>('webAssist.state', {})).state.tabs
+        .find((tab: any) => tab.tab_id === opened.state.active_tab_id);
+      return { url: tab?.address_url, loading: tab?.loading };
+    }).toEqual({ url: origin + '/ready', loading: false });
     const nativeId = await orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }, url) => {
       const view = BrowserWindow.getAllWindows()[0].contentView.children.find(v => v instanceof WebContentsView && v.webContents.getURL() === url) as InstanceType<typeof WebContentsView>;
       const page = view.webContents;
