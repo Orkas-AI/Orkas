@@ -125,8 +125,28 @@ test.describe('settings modules and model guard', () => {
       await expect(modal).toHaveClass(/\bopen\b/);
       await expect(orkas.page.locator('#settings-add-modal')).not.toHaveClass(/\bopen\b/);
       await expect(modal.locator('.custom-key-input')).toHaveAttribute('type', 'password');
-      await expect(modal.locator('.custom-protocol-input')).toHaveValue('openai');
-      await modal.locator('.custom-protocol-input').selectOption(protocol);
+      const protocolPicker = modal.locator('.custom-protocol-input');
+      const protocolTrigger = protocolPicker.getByRole('combobox', { name: 'Protocol', exact: true });
+      await expect(protocolPicker).toHaveAttribute('data-value', 'openai');
+      await expect(protocolTrigger).toHaveText('OpenAI-compatible');
+      await protocolTrigger.click();
+      const protocolMenu = orkas.page.locator('.ai-select-popover:visible');
+      await expect(protocolMenu.getByRole('option', { name: 'Anthropic-compatible', exact: true })).toBeVisible();
+      await test.info().attach('custom-protocol-menu', {
+        body: await modal.screenshot(), contentType: 'image/png',
+      });
+      await orkas.page.keyboard.press('Escape');
+      await expect(protocolMenu).toHaveCount(0);
+      await expect(modal).toHaveClass(/\bopen\b/);
+      await protocolTrigger.click();
+      if (protocol === 'anthropic') await orkas.page.keyboard.press('ArrowDown');
+      await orkas.page.keyboard.press('Enter');
+      await expect(protocolMenu).toHaveCount(0);
+      await expect(protocolPicker).toHaveAttribute('data-value', protocol);
+      await expect(protocolTrigger).toHaveText(protocol === 'anthropic'
+        ? 'Anthropic-compatible' : 'OpenAI-compatible');
+      await orkas.page.keyboard.press('Tab');
+      await expect(modal.locator('.custom-base-url-input')).toBeFocused();
       await expect(modal.locator('.custom-base-url-input')).toHaveAttribute('placeholder',
         protocol === 'anthropic' ? 'https://api.example.com' : 'https://api.example.com/v1');
       await modal.locator('.custom-label-input').fill('E2E Private Gateway');

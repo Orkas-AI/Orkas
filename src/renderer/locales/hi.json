@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "अपने गेटवे का समर्थित प्रोटोकॉल चुनें। Anthropic के लिए गेटवे पथ उपसर्ग सहित सर्वर का आधार URL दर्ज करें।",
   "settings.custom.protocol": "प्रोटोकॉल",
   "settings.custom.protocol_openai": "OpenAI-संगत",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "Anthropic-संगत",
   "settings.custom.label": "लेबल (वैकल्पिक)",
   "settings.custom.label_placeholder": "जैसे: कंपनी गेटवे",
   "settings.custom.base_url": "API बेस URL",

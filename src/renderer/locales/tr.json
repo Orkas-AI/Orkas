@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "Ağ geçidinizin desteklediği protokolü seçin. Anthropic için ağ geçidi yol öneki dahil sunucunun temel URL’sini girin.",
   "settings.custom.protocol": "Protokol",
   "settings.custom.protocol_openai": "OpenAI uyumlu",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "Anthropic uyumlu",
   "settings.custom.label": "Etiket (isteğe bağlı)",
   "settings.custom.label_placeholder": "Örneğin: şirket ağ geçidi",
   "settings.custom.base_url": "API Temel URL'si",

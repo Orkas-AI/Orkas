@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "Elige el protocolo compatible con tu gateway. Para Anthropic, ingresa la URL base del servidor, incluido el prefijo de ruta del gateway.",
   "settings.custom.protocol": "Protocolo",
   "settings.custom.protocol_openai": "Compatible con OpenAI",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "Compatible con Anthropic",
   "settings.custom.label": "Etiqueta (opcional)",
   "settings.custom.label_placeholder": "Por ejemplo: pasarela de la empresa",
   "settings.custom.base_url": "URL base de la API",

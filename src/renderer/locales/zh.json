@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "选择网关支持的协议。Anthropic 请填写服务基础地址，保留网关路径前缀。",
   "settings.custom.protocol": "协议",
   "settings.custom.protocol_openai": "OpenAI 兼容",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "Anthropic 兼容",
   "settings.custom.label": "标签（可选）",
   "settings.custom.label_placeholder": "例如：公司网关",
   "settings.custom.base_url": "API Base URL",

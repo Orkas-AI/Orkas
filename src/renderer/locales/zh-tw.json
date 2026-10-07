@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "選擇閘道支援的協定。Anthropic 請填寫服務基礎位址，保留閘道路徑前綴。",
   "settings.custom.protocol": "協定",
   "settings.custom.protocol_openai": "OpenAI 相容",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "Anthropic 相容",
   "settings.custom.label": "標籤（可選）",
   "settings.custom.label_placeholder": "例如：公司閘道",
   "settings.custom.base_url": "API 基底 URL",

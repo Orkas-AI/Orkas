@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "Choisissez le protocole pris en charge par votre passerelle. Pour Anthropic, saisissez l’URL de base du serveur, avec le préfixe de chemin de la passerelle.",
   "settings.custom.protocol": "Protocole",
   "settings.custom.protocol_openai": "Compatible OpenAI",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "Compatible Anthropic",
   "settings.custom.label": "Libellé (facultatif)",
   "settings.custom.label_placeholder": "Par exemple : passerelle d’entreprise",
   "settings.custom.base_url": "URL de base de l’API",

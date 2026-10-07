@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "Chọn giao thức được cổng hỗ trợ. Với Anthropic, nhập URL cơ sở của máy chủ, gồm cả tiền tố đường dẫn của cổng.",
   "settings.custom.protocol": "Giao thức",
   "settings.custom.protocol_openai": "Tương thích OpenAI",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "Tương thích Anthropic",
   "settings.custom.label": "Nhãn (không bắt buộc)",
   "settings.custom.label_placeholder": "Ví dụ: cổng kết nối công ty",
   "settings.custom.base_url": "URL cơ sở API",

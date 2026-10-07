@@ -1609,12 +1609,9 @@ function _settingsShowCustomModelForm(provider) {
       <label>${escapeHtml(t('settings.custom.label'))}</label>
       <input type="text" class="custom-label-input form-input" placeholder="${escapeHtml(t('settings.custom.label_placeholder'))}" autocomplete="off" spellcheck="false" />
     </div>
-    <div class="form-row">
+    <div class="form-row settings-form-row">
       <label>${escapeHtml(t('settings.custom.protocol'))}</label>
-      <select class="custom-protocol-input form-input">
-        <option value="openai">${escapeHtml(t('settings.custom.protocol_openai'))}</option>
-        <option value="anthropic">${escapeHtml(t('settings.custom.protocol_anthropic'))}</option>
-      </select>
+      <div class="ai-select custom-protocol-input"></div>
     </div>
     <div class="form-row">
       <label>${escapeHtml(t('settings.custom.base_url'))}</label>
@@ -1644,8 +1641,16 @@ function _settingsShowCustomModelForm(provider) {
   const maxTokensInput = body.querySelector('.custom-max-tokens-input');
   const keyInput = body.querySelector('.custom-key-input');
   const msg = body.querySelector('.form-msg');
-  protocolInput.addEventListener('change', () => {
-    baseUrlInput.placeholder = protocolInput.value === 'anthropic'
+  const protocolSelect = _aiSelectMount(protocolInput, {
+    options: [
+      { value: 'openai', label: t('settings.custom.protocol_openai') },
+      { value: 'anthropic', label: t('settings.custom.protocol_anthropic') },
+    ],
+    value: 'openai',
+    ariaLabel: t('settings.custom.protocol'),
+  });
+  protocolSelect.onChange((value) => {
+    baseUrlInput.placeholder = value === 'anthropic'
       ? 'https://api.example.com' : 'https://api.example.com/v1';
   });
 
@@ -1661,7 +1666,7 @@ function _settingsShowCustomModelForm(provider) {
     const startedAt = Date.now();
     const payload = _settingsBuildCustomModelPayload({
       label: labelInput.value,
-      protocol: protocolInput.value,
+      protocol: protocolSelect.getValue(),
       baseUrl: baseUrlInput.value,
       model: modelInput.value,
       maxTokens: maxTokensInput.value,
@@ -1710,8 +1715,7 @@ function _settingsShowCustomModelForm(provider) {
       if (e.key === 'Enter') { next.focus(); e.preventDefault(); }
     });
   };
-  focusNextOnEnter(labelInput, protocolInput);
-  focusNextOnEnter(protocolInput, baseUrlInput);
+  focusNextOnEnter(labelInput, protocolInput.querySelector('.ai-select-trigger'));
   focusNextOnEnter(baseUrlInput, modelInput);
   focusNextOnEnter(modelInput, maxTokensInput);
   focusNextOnEnter(maxTokensInput, keyInput);

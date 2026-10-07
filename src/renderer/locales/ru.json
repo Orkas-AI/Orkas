@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "Выберите протокол, поддерживаемый шлюзом. Для Anthropic укажите базовый URL сервера, включая префикс пути шлюза.",
   "settings.custom.protocol": "Протокол",
   "settings.custom.protocol_openai": "Совместимый с OpenAI",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "Совместимый с Anthropic",
   "settings.custom.label": "Метка (необязательно)",
   "settings.custom.label_placeholder": "Например: шлюз компании",
   "settings.custom.base_url": "API Base URL",

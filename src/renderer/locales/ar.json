@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "اختر البروتوكول الذي تدعمه بوابتك. بالنسبة إلى Anthropic، أدخل عنوان URL الأساسي للخادم، بما في ذلك بادئة مسار البوابة.",
   "settings.custom.protocol": "البروتوكول",
   "settings.custom.protocol_openai": "متوافق مع OpenAI",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "متوافق مع Anthropic",
   "settings.custom.label": "التسمية (اختياري)",
   "settings.custom.label_placeholder": "مثلًا: بوابة الشركة",
   "settings.custom.base_url": "URL الأساسي لـ API",

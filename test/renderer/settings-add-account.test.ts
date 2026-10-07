@@ -21,6 +21,7 @@ class FakeElement {
   textContent = '';
   value = '';
   type = '';
+  placeholder = '';
   title = '';
   hidden = false;
   disabled = false;
@@ -125,17 +126,21 @@ function loadSettingsClickHarness(
     return { ok: true };
   });
 
+  const selects = new Map<FakeElement, any>();
   const aiSelectMount = (element: FakeElement, config: Record<string, unknown> = {}) => {
     let value = typeof config.value === 'string' ? config.value : '';
-    let options: Array<{ value: string }> = [];
+    let options = (config.options || []) as Array<{ value: string; label?: string }>;
     let changeHandler: (next: string) => unknown = () => undefined;
-    return {
+    element.dataset.value = value;
+    element.setQueryResult('.ai-select-trigger', new FakeElement());
+    const api = {
       setOptions(nextOptions: Array<{ value: string }>, next: { value?: string } = {}) {
         options = nextOptions || [];
         if (typeof next.value === 'string') value = next.value;
         if (value && !options.some((option) => option.value === value)) value = '';
         element.dataset.value = value;
       },
+      close: vi.fn(),
       getValue: () => value,
       getOptions: () => options,
       setAriaLabel() {},
@@ -150,6 +155,8 @@ function loadSettingsClickHarness(
         return changeHandler(next);
       },
     };
+    selects.set(element, api);
+    return api;
   };
   const monitor = { event: vi.fn(), error: vi.fn(), click: vi.fn() };
 
@@ -194,11 +201,11 @@ function loadSettingsClickHarness(
     }];
     _settingsState.modelsCache = {};
   `, context);
-  return { context, elements, indexHtml, settingsSource: source, invoke, monitor };
+  return { context, elements, indexHtml, settingsSource: source, invoke, monitor, selects };
 }
 
-it('submits the selected Anthropic protocol without losing a gateway prefix', async () => {
-  const { context, elements, invoke } = loadSettingsClickHarness();
+it('submits the shared protocol picker selection without losing a gateway prefix', async () => {
+  const { context, elements, invoke, selects } = loadSettingsClickHarness();
   const body = elements.get('add-account-body')!;
   for (const [selector, value] of Object.entries({
     '.custom-label-input': 'Gateway', '.custom-protocol-input': 'anthropic',
@@ -207,6 +214,10 @@ it('submits the selected Anthropic protocol without losing a gateway prefix', as
     '.custom-key-input': 'synthetic-form-key', '.form-msg': '',
   })) { const field = new FakeElement(); field.value = value; body.setQueryResult(selector, field); }
   context._settingsShowCustomModelForm({ id: 'custom', label: 'Custom' });
+  const protocolPicker = selects.get(body.querySelector('.custom-protocol-input')!);
+  expect(protocolPicker.getValue()).toBe('openai');
+  protocolPicker.emitChange('anthropic');
+  expect(body.querySelector('.custom-base-url-input')!.placeholder).toBe('https://api.example.com');
   await elements.get('add-account-actions')!.children.at(-1)!.click();
   expect(invoke).toHaveBeenCalledWith('auth.addCustomModelEntry', {
     label: 'Gateway', protocol: 'anthropic', baseUrl: 'https://gateway.example.test/proxy/v1/messages',

@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "ゲートウェイが対応するプロトコルを選択します。Anthropic ではゲートウェイのパス接頭辞を含むサーバーのベース URL を入力してください。",
   "settings.custom.protocol": "プロトコル",
   "settings.custom.protocol_openai": "OpenAI 互換",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "Anthropic 互換",
   "settings.custom.label": "ラベル（任意）",
   "settings.custom.label_placeholder": "例: 会社のゲートウェイ",
   "settings.custom.base_url": "API Base URL",

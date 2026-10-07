@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "Wählen Sie das Protokoll Ihres Gateways. Geben Sie für Anthropic die Basis-URL des Servers einschließlich des Gateway-Pfadpräfixes ein.",
   "settings.custom.protocol": "Protokoll",
   "settings.custom.protocol_openai": "OpenAI-kompatibel",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "Anthropic-kompatibel",
   "settings.custom.label": "Bezeichnung (optional)",
   "settings.custom.label_placeholder": "Zum Beispiel: Unternehmensgateway",
   "settings.custom.base_url": "API-Basis-URL",

@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "เลือกโปรโตคอลที่เกตเวย์รองรับ สำหรับ Anthropic ให้กรอก URL ฐานของเซิร์ฟเวอร์ รวมคำนำหน้าเส้นทางของเกตเวย์",
   "settings.custom.protocol": "โปรโตคอล",
   "settings.custom.protocol_openai": "เข้ากันได้กับ OpenAI",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "เข้ากันได้กับ Anthropic",
   "settings.custom.label": "ป้ายชื่อ (ไม่บังคับ)",
   "settings.custom.label_placeholder": "เช่น: เกตเวย์บริษัท",
   "settings.custom.base_url": "URL ฐาน ของ API",

@@ -1621,7 +1621,7 @@
   "settings.custom.compat_hint": "게이트웨이가 지원하는 프로토콜을 선택하세요. Anthropic은 게이트웨이 경로 접두사를 포함한 서버 기본 URL을 입력하세요.",
   "settings.custom.protocol": "프로토콜",
   "settings.custom.protocol_openai": "OpenAI 호환",
-  "settings.custom.protocol_anthropic": "Anthropic Messages",
+  "settings.custom.protocol_anthropic": "Anthropic 호환",
   "settings.custom.label": "라벨(선택 사항)",
   "settings.custom.label_placeholder": "예: 회사 게이트웨이",
   "settings.custom.base_url": "API Base URL",
