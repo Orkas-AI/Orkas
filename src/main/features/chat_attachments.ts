@@ -48,6 +48,7 @@ import { MAX_TEXT_FILE_BYTES } from '../util/file-size-limits';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isPathAllowed } from '../util/path-sandbox';
 
 import { chatAttachmentDir, chatAttachmentDraftDir, userChatAttachmentsDir } from '../paths';
@@ -1006,6 +1007,7 @@ export function materializeLocalDisplaySvg(
   catch (error) { return { ok: false, code: 'not_found', error: 'not found', diagnosticCode: mediaFileFailureCode(error) }; }
 
   const root = path.dirname(resolved.absPath);
+  const sourceUrl = pathToFileURL(resolved.absPath);
   let inlineError: { code: 'bad_input' | 'not_found' | 'too_large'; error: string; diagnosticCode?: MediaFileDiagnostic } | null = null;
   let refCount = 0;
   body = body.replace(
@@ -1023,8 +1025,15 @@ export function materializeLocalDisplaySvg(
         inlineError = { code: 'bad_input', error: 'unsupported SVG image reference' };
         return full;
       }
-      const decodedRef = ref.replace(/&amp;/g, '&');
-      const imageAbs = path.resolve(root, decodedRef);
+      let imageAbs: string;
+      try {
+        // SVG hrefs are URLs: decode filename bytes once and keep query/fragment
+        // outside the filesystem path before applying the existing confinement.
+        imageAbs = fileURLToPath(new URL(ref.replace(/&amp;/g, '&'), sourceUrl));
+      } catch {
+        inlineError = { code: 'bad_input', error: 'invalid SVG image reference' };
+        return full;
+      }
       const rel = path.relative(root, imageAbs);
       if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || !isPathAllowed(imageAbs, [root])) {
         inlineError = { code: 'bad_input', error: 'SVG image reference escapes its directory' };

@@ -1127,6 +1127,44 @@ describe('chat_attachments › resolveLocalMediaPath', () => {
   });
 
   it.each([
+    ['frame 01.png', 'frame%2001.png'],
+    ['帧#01.png', '%E5%B8%A7%2301.png'],
+    ['frame%20.png', 'frame%2520.png?revision=1'],
+  ])('embeds the exact raster bytes named by the SVG URL %s', async (name, href) => {
+    const mod = await loadMod();
+    const directory = path.join(tmpDir, 'svg-urls');
+    fs.mkdirSync(directory);
+    const bytes = await makePng();
+    fs.writeFileSync(path.join(directory, name), bytes);
+    const file = path.join(directory, 'sheet.svg');
+    const source = `<svg xmlns="http://www.w3.org/2000/svg"><image href="${href}"/></svg>`;
+    fs.writeFileSync(file, source);
+
+    const result = mod.materializeLocalDisplaySvg(file);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.body).toBe(`<svg xmlns="http://www.w3.org/2000/svg"><image href="data:image/png;base64,${bytes.toString('base64')}"/></svg>`);
+    expect(fs.readFileSync(file, 'utf8')).toBe(source);
+    expect(fs.readFileSync(path.join(directory, name))).toEqual(bytes);
+  });
+
+  it.each(['%2e%2e/outside.png', '..%2foutside.png', 'broken%ZZ.png'])(
+    'rejects an escaping or malformed SVG URL %s without returning file bytes', async (href) => {
+      const mod = await loadMod();
+      const directory = path.join(tmpDir, 'svg-urls');
+      fs.mkdirSync(directory);
+      const bytes = await makePng();
+      fs.writeFileSync(path.join(tmpDir, 'outside.png'), bytes);
+      const file = path.join(directory, 'sheet.svg');
+      fs.writeFileSync(file, `<svg xmlns="http://www.w3.org/2000/svg"><image href="${href}"/></svg>`);
+      const result = mod.materializeLocalDisplaySvg(file);
+      expect(result).toMatchObject({ ok: false, code: 'bad_input' });
+      expect(result).not.toHaveProperty('body');
+      expect(fs.readFileSync(path.join(tmpDir, 'outside.png'))).toEqual(bytes);
+    },
+  );
+
+  it.each([
     '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
     '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><div>unsafe</div></foreignObject></svg>',
     '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"></svg>',
