@@ -77,12 +77,26 @@ test.describe('projects', () => {
       const root = globalThis as any;
       root.__projectInviteExternalUrls = [];
       root.__projectEntryRequests = [];
+      root.__projectBackgroundRequests = [];
+      const backgroundRequests = new Set([
+        'GET /api/config/client',
+        'POST /api/marketplace/defaults',
+        'POST /api/marketplace/agents/list',
+        'POST /api/marketplace/agents/detail',
+        'POST /api/marketplace/skills/list',
+      ]);
       shell.openExternal = async (url: string) => { root.__projectInviteExternalUrls.push(url); };
       for (const owner of [root, net]) {
         const original = owner.fetch;
         owner.fetch = function (input: any, ...args: any[]) {
           const url = new URL(typeof input === 'string' ? input : input.url || String(input));
-          root.__projectEntryRequests.push(url.origin + url.pathname);
+          const method = String(args[0]?.method || input?.method || 'GET').toUpperCase();
+          // Startup refreshes can overlap this local project journey. Keep every
+          // other endpoint, origin and method in the prohibited-request ledger.
+          const isBackground = url.origin === 'https://orkas.ai'
+            && backgroundRequests.has(`${method} ${url.pathname}`);
+          (isBackground ? root.__projectBackgroundRequests : root.__projectEntryRequests)
+            .push(url.origin + url.pathname);
           return original.call(this, input, ...args);
         };
       }
