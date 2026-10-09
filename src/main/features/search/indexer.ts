@@ -280,6 +280,7 @@ export async function flushAll(): Promise<void> {
   for (const uid of _chatRepairTasks.keys()) cancelChatIndexRepair(uid);
   await Promise.allSettled([..._chatReconcileRuns.values()]);
   await drainDeferredChatWrites();
+  const trustedStamps = await _trustedChatSourceStamps();
   await Promise.all(Array.from(_cache.keys()).map((p) => flushOne(p).catch((err) => {
     log.warn('flushAll entry failed', { error: logErrorSummary(err) });
   })));
@@ -288,8 +289,44 @@ export async function flushAll(): Promise<void> {
   // per-test workspace teardown and an in-place repair.
   await Promise.allSettled([..._chatWorkers.values()].map(worker => worker.close()));
   _chatWorkers.clear();
+  _persistTrustedChatSourceStamps(trustedStamps);
   chatStore.closeAllChatStores();
   _closing = false;
+}
+
+/** The stored source stamp is otherwise written only by a completed full
+ * reconcile, while ordinary app writes move the conversation catalog. Every
+ * restart after normal use would then distrust a current index and wait for
+ * an idle repair. A clean quit records the catalog the process still trusts;
+ * a crash, a later write that moves the catalog, or any invalidation leaves
+ * the next start on the existing repair path. */
+function _canPersistChatTrust(uid: string): boolean {
+  return _currentChatIndexes.has(uid) && !_invalidatedChats.has(uid)
+    && !_chatReconcileRuns.has(uid) && !_migratingChats.has(uid)
+    && !(_pendingChatWrites.get(uid) || 0) && !_dirtyChats.get(uid)?.size;
+}
+
+async function _trustedChatSourceStamps(): Promise<Array<{ uid: string; revision: number; stamp: string }>> {
+  const out: Array<{ uid: string; revision: number; stamp: string }> = [];
+  for (const uid of [..._currentChatIndexes]) {
+    if (!_canPersistChatTrust(uid)) continue;
+    const revision = _chatRevisions.get(uid) || 0;
+    try { out.push({ uid, revision, stamp: await _chatSourceStamp(uid) }); }
+    catch (err) { log.warn('chat trust stamp read failed', { error: logErrorSummary(err) }); }
+  }
+  return out;
+}
+
+function _persistTrustedChatSourceStamps(
+  stamps: Array<{ uid: string; revision: number; stamp: string }>,
+): void {
+  for (const { uid, revision, stamp } of stamps) {
+    // Recheck synchronously: a write admitted while workers were closing
+    // either still counts as pending or already invalidated trust.
+    if (!_canPersistChatTrust(uid) || revision !== (_chatRevisions.get(uid) || 0)) continue;
+    try { chatStore.writeSourceStamp(uid, stamp); }
+    catch (err) { log.warn('chat trust stamp write failed', { error: logErrorSummary(err) }); }
+  }
 }
 
 /** Chain live writes per account so receipts reach the writer in admission
