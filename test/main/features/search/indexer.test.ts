@@ -598,3 +598,92 @@ describe('partial chat index deletion', () => {
     expect(Object.values(idx.docs).some(doc => doc.fileKey === 'removed')).toBe(false);
   });
 });
+
+// Scenario: the user searches after restarting the app. Ordinary use moves the
+// conversation catalog (activity bumps rewrite _index.json) while the process
+// keeps a verified index current through incremental writes. A clean quit must
+// carry that trust into the next start instead of showing "still preparing"
+// until an idle full repair runs. Anything the quitting process could not
+// vouch for must still send the next start down the repair path.
+describe('search/indexer › chat index trust across a clean restart', () => {
+  const catalog = () => path.join(tmpDir, 'u1', 'cloud', 'chats', '_index.json');
+  const moveCatalog = (title: string) => {
+    fs.writeFileSync(catalog(), JSON.stringify([{ conversation_id: 'c1', title }]));
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(catalog(), later, later);
+  };
+  async function restart() {
+    await (await loadIndexer()).flushAll();
+    vi.resetModules();
+    return loadIndexer();
+  }
+
+  it('trusts the index on the next start after normal writes and a clean quit', async () => {
+    writeChat('u1', 'c1', [{ from: 'user', ts: 't1', text: 'first message' }]);
+    let ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    expect(await ix.isChatsIndexCurrent('u1')).toBe(true);
+
+    const reply = { from: 'commander', ts: 't2', text: 'wombat migration plan' };
+    appendChat('u1', 'c1', reply);
+    await ix.indexChatMessage('u1', 'c1', 1, reply);
+    moveCatalog('activity bumped');
+    expect(ix.isChatsIndexTrusted('u1')).toBe(true);
+
+    ix = await restart();
+    expect(ix.isChatsIndexTrusted('u1')).toBe(false);
+    expect(await ix.isChatsIndexCurrent('u1')).toBe(true);
+    const search = await import('../../../../src/main/features/search/index');
+    const page = await search.searchChatsWithStatus('u1', 'wombat');
+    expect(page.indexComplete).toBe(true);
+    expect(page.results.map((hit) => hit.msg_index)).toEqual([1]);
+  });
+
+  it('keeps an index the quitting process no longer trusted on the repair path', async () => {
+    writeChat('u1', 'c1', [{ from: 'user', ts: 't1', text: 'first message' }]);
+    let ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    // Message 1 never reached the index, so message 2 cannot certify the file.
+    appendChat('u1', 'c1', { from: 'commander', ts: 't2', text: 'lost porcupine message' });
+    appendChat('u1', 'c1', { from: 'user', ts: 't3', text: 'later message' });
+    await ix.indexChatMessage('u1', 'c1', 2, { from: 'user', ts: 't3', text: 'later message' });
+    moveCatalog('activity bumped');
+    expect(ix.isChatsIndexTrusted('u1')).toBe(false);
+
+    ix = await restart();
+    expect(await ix.isChatsIndexCurrent('u1')).toBe(false);
+    await expect(ix.reconcileChatsIndex('u1')).resolves.toMatchObject({ complete: true, updated: 1 });
+    expect(await ix.isChatsIndexCurrent('u1')).toBe(true);
+  });
+
+  it('distrusts the index when the catalog moved after the clean quit', async () => {
+    writeChat('u1', 'c1', [{ from: 'user', ts: 't1', text: 'first message' }]);
+    let ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    moveCatalog('before quit');
+    ix = await restart();
+    expect(await ix.isChatsIndexCurrent('u1')).toBe(true);
+
+    // A sync pull or another writer changed history while the app was closed.
+    await ix.flushAll();
+    vi.resetModules();
+    const later = new Date(Date.now() + 10_000);
+    fs.writeFileSync(catalog(), JSON.stringify([{ conversation_id: 'c1', title: 'synced while closed' }]));
+    fs.utimesSync(catalog(), later, later);
+    ix = await loadIndexer();
+    expect(await ix.isChatsIndexCurrent('u1')).toBe(false);
+  });
+
+  it('does not carry trust for an account whose index was never verified this run', async () => {
+    writeChat('u1', 'c1', [{ from: 'user', ts: 't1', text: 'first message' }]);
+    let ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    moveCatalog('activity before restart');
+    ix = await restart();
+    // This run never checked the index; quitting must not certify the moved catalog.
+    expect(ix.isChatsIndexTrusted('u1')).toBe(false);
+    moveCatalog('activity in unverified run');
+    ix = await restart();
+    expect(await ix.isChatsIndexCurrent('u1')).toBe(false);
+  });
+});
