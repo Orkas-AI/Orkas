@@ -793,6 +793,7 @@ describe('group_chat app_nav registry', () => {
     const source = fs.readFileSync(RENDERER_PROJECTS, 'utf8');
     const fnSource = extractAssignedAsyncFunction(source, 'window.openProjectsSurface =');
     const calls: string[] = [];
+    const lookups: unknown[][] = [];
     let expanded = false;
     const toggle = {
       getAttribute: () => (expanded ? 'true' : 'false'),
@@ -806,10 +807,10 @@ describe('group_chat app_nav registry', () => {
         context._projectsInlineCreate = true;
         calls.push('create');
       },
-      loadProjects: async () => [
-        { project_id: 'project-1' },
-        { project_id: 'project-2' },
-      ],
+      loadProjects: async (...args: unknown[]) => {
+        lookups.push(args);
+        return [{ project_id: 'project-1' }, { project_id: 'project-2' }];
+      },
       setView: (view: string, id: string) => calls.push(`${view}:${id}`),
       document: { getElementById: () => toggle },
     };
@@ -825,6 +826,39 @@ describe('group_chat app_nav registry', () => {
     expect(calls.splice(0)).toEqual(['project:project-2']);
     expect(await openProjects({ action: 'configure', target_id: 'missing' })).toBe(false);
     expect(calls).toEqual([]);
+    expect(lookups).toEqual([[true, true], [true, true]]);
+  });
+
+  it('does not use a stale display cache as fresh project existence evidence', async () => {
+    const source = fs.readFileSync(RENDERER_PROJECTS, 'utf8');
+    const start = source.indexOf('async function loadProjects(');
+    const end = source.indexOf('/** One-shot:', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const stale = [{ project_id: 'deleted-project' }];
+    const warnings: string[] = [];
+    const context: any = {
+      _projectsCache: stale,
+      _projectsLoadRequestId: 0,
+      _projectsLog: { warn: (message: string) => warnings.push(message) },
+      renderProjectsSection: () => {},
+      window: { orkas: { invoke: async () => ({ ok: false, error: 'offline' }) } },
+    };
+    const loadProjects = vm.runInNewContext(`(${source.slice(start, end)})`, context) as (
+      forceRefresh: boolean, requireFresh?: boolean,
+    ) => Promise<Array<{ project_id: string }> | null>;
+    expect(await loadProjects(true, true)).toBeNull();
+    expect(await loadProjects(true)).toEqual(stale);
+    context.window.orkas.invoke = async () => { throw new Error('offline'); };
+    expect(await loadProjects(true, true)).toBeNull();
+    context.window.orkas.invoke = async () => {
+      context._projectsLoadRequestId += 1;
+      return { ok: true, projects: stale };
+    };
+    expect(await loadProjects(true, true)).toBeNull();
+    expect(warnings).toEqual([
+      'load projects rejected', 'load projects rejected', 'load projects failed',
+    ]);
   });
 
   it('opens the exact automation task through the production helper', async () => {
