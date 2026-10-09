@@ -101,34 +101,36 @@ let _projectsInlineRenameRerendering = false;
 
 // ── Public API: cache + render ──────────────────────────────────────────
 
-async function loadProjects(forceRefresh) {
+async function loadProjects(forceRefresh, requireFresh = false) {
   if (_projectsCache && !forceRefresh) {
     renderProjectsSection();
     return _projectsCache;
   }
   const requestId = ++_projectsLoadRequestId;
   const previousProjects = Array.isArray(_projectsCache) ? _projectsCache : [];
+  let refreshed = false;
   try {
     const res = await window.orkas.invoke('projects.list', {});
     if (requestId !== _projectsLoadRequestId) {
-      return Array.isArray(_projectsCache) ? _projectsCache : previousProjects;
+      return requireFresh ? null : Array.isArray(_projectsCache) ? _projectsCache : previousProjects;
     }
     if (res && res.ok && Array.isArray(res.projects)) {
       _projectsCache = res.projects;
+      refreshed = true;
     } else {
       _projectsLog.warn('load projects rejected', { error: res && res.error });
       _projectsCache = previousProjects;
     }
   } catch (err) {
     if (requestId !== _projectsLoadRequestId) {
-      return Array.isArray(_projectsCache) ? _projectsCache : previousProjects;
+      return requireFresh ? null : Array.isArray(_projectsCache) ? _projectsCache : previousProjects;
     }
     _projectsLog.warn('load projects failed', err);
     _projectsCache = previousProjects;
   }
   renderProjectsSection();
   if (typeof window.refreshAutoProjectGroups === 'function') window.refreshAutoProjectGroups();
-  return _projectsCache;
+  return requireFresh && !refreshed ? null : _projectsCache;
 }
 
 /** One-shot: ensure the project owning the active cid is expanded so the
@@ -950,7 +952,7 @@ window.openProjectsSurface = async function openProjectsSurface(request) {
   if (action === 'configure') {
     const projectId = String(request.target_id || '').trim();
     if (!projectId) return false;
-    const projects = await loadProjects(true);
+    const projects = await loadProjects(true, true);
     const exists = Array.isArray(projects)
       && projects.some((project) => project && project.project_id === projectId);
     if (!exists || typeof setView !== 'function') return false;
