@@ -43,6 +43,58 @@ test('CSV opens from task attachments and the Library without changing cell cont
     { timeout: 30_000 }).toBe('ready');
 });
 
+test('CSV and TSV use the available preview height after resizing and switching to source', async ({ orkas }, info) => {
+  const page = orkas.page!;
+  const assertFilled = async (body: import('@playwright/test').Locator, selector: string) => {
+    await expect.poll(() => body.evaluate((container, selector) => {
+      const content = container.querySelector(selector)!;
+      const preview = container.querySelector('.delimited-preview')!;
+      const bottom = container.getBoundingClientRect().bottom
+        - parseFloat(getComputedStyle(container).paddingBottom)
+        - parseFloat(getComputedStyle(preview).paddingBottom);
+      return Math.abs(bottom - content.getBoundingClientRect().bottom);
+    }, selector)).toBeLessThanOrEqual(1);
+    expect(await body.locator(selector).evaluate(el => el.scrollHeight > el.clientHeight)).toBe(true);
+  };
+  for (const [name, delimiter] of [['height.csv', ','], ['height.tsv', '\t']]) {
+    const content = Array.from({ length: 30 }, (_, index) =>
+      [String(index + 1), '中文样本', `"${'Wide cell '.repeat(4)}\nSecond line"`,
+        ...Array.from({ length: 12 }, (_, column) => `field-${column}`)].join(delimiter)).join('\n');
+    const file = orkas.createWorkspaceFile(name, content);
+    const preview = await orkas.openPreview(() => page.evaluate(args =>
+      (window as any).openChatFileViewer(args.file, args.name), { file, name }));
+    await expect(preview.locator('.delimited-preview tr')).toHaveCount(30);
+    const native = await orkas.electronApp!.browserWindow(preview);
+    const body = preview.locator('.chat-file-viewer-body');
+    for (const [width, height] of [[960, 720], [620, 900]]) {
+      await native.evaluate((win, size) => win.setSize(size.width, size.height), { width, height });
+      await assertFilled(body, '.delimited-preview-scroll');
+      const scroll = body.locator('.delimited-preview-scroll');
+      expect(await scroll.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
+      await scroll.evaluate(el => { el.scrollTop = el.scrollHeight; el.scrollLeft = el.scrollWidth; });
+      await expect(preview.locator('.delimited-preview tr').last().locator('th')).toBeInViewport();
+      await preview.screenshot({ path: info.outputPath(`${name}-${height}.png`) });
+      await preview.locator('[data-delimited-toggle]').click();
+      await assertFilled(body, 'pre');
+      await expect(body.locator('pre')).toHaveText(content);
+      await preview.locator('[data-delimited-toggle]').click();
+    }
+    await orkas.closePreview(preview);
+
+    expect((await orkas.invoke<any>('contexts.upload', { path: name, data: Buffer.from(content).toString('base64') })).ok).toBe(true);
+    await page.locator('#contexts-btn').click();
+    await page.locator(`.ctx-tree-wrap[data-path="${name}"] > .skill-tree-node`).click();
+    const libraryBody = page.locator('#contexts-viewer-body');
+    await expect(libraryBody.locator('.delimited-preview tr')).toHaveCount(30);
+    await assertFilled(libraryBody, '.delimited-preview-scroll');
+    await libraryBody.locator('[data-delimited-toggle]').click();
+    await assertFilled(libraryBody, 'pre');
+    await expect(libraryBody.locator('pre')).toHaveText(content);
+    await expect.poll(async () => (await orkas.invoke<any>('kb.status')).files.find((f: any) => f.path === name)?.status,
+      { timeout: 30_000 }).toBe('ready');
+  }
+});
+
 test('HTML attachments render offline interactions while the Library preserves editable source', async ({ orkas }, info) => {
   const page = orkas.page!;
   const source = readFileSync(path.resolve(__dirname, '../fixtures/files/sample.html'), 'utf8');
