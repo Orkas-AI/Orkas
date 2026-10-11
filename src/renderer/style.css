@@ -1122,7 +1122,6 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 }
 .project-detail-actions .btn[hidden] { display: none; }
 #project-add-agent-btn[hidden] { display: none; }
-#project-todo-member-field[hidden] { display: none; }
 .project-todo-agent-icon {
   flex: 0 0 18px;
   display: inline-flex;
@@ -2043,7 +2042,22 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 .todo-editor-composer.drag-over { border-color: var(--primary); background: var(--primary-soft); box-shadow: 0 0 0 3px var(--primary-soft); }
 .todo-editor-composer .chat-input-overlay { position: static; transform: none; align-items: flex-start; pointer-events: none; }
 .todo-editor-composer .chat-input-overlay > .chat-attachments { max-width: 100%; pointer-events: auto; }
-.todo-editor-composer textarea { min-height: 72px; padding: 2px; border: 0; border-radius: 0; resize: none; box-shadow: none; font-size: 14px; line-height: 1.55; }
+/* The content grows with its text from six lines up to what the dialog can
+   hold under the modal's 85vh cap (480px covers the header, an attachment
+   row, the fields and the actions), then scrolls inside. Shorter windows
+   fall back to the dialog's own scroll. */
+.todo-editor-composer textarea {
+  field-sizing: content;
+  min-height: 136px;
+  max-height: max(136px, calc(85vh - 480px));
+  padding: 2px;
+  border: 0;
+  border-radius: 0;
+  resize: none;
+  box-shadow: none;
+  font-size: 14px;
+  line-height: 1.55;
+}
 .todo-editor-composer textarea:focus { box-shadow: none; }
 .todo-editor-composer-bar { min-height: 30px; }
 .todo-editor-composer-bar .project-memory-editor-counter { margin-left: auto; padding-right: 2px; }

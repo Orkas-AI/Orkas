@@ -1,5 +1,61 @@
 import { expect, test } from './fixtures/orkas';
 
+for (const scope of ['global', 'project'] as const) {
+  test(`gives long ${scope} todo content room while keeping editor actions reachable`, async ({ orkas }, info) => {
+    const page = orkas.page!;
+    await page.evaluate(() => (window as any).setLang('en'));
+    const project = scope === 'project' ? await orkas.invoke<any>('projects.create', { name: 'Editor layout' }) : null;
+    const projectId = project?.project.project_id || '';
+    const content = Array.from({ length: 30 }, (_, index) => `Checklist item ${index + 1}: preserve the original task content.`).join('\n');
+    const created = await orkas.invoke<any>('projects.tasks.create', { projectId, content });
+    const taskId = created.task.id;
+    await orkas.invoke('projects.tasks.attachments.upload', {
+      projectId, taskId, name: 'brief.txt', dataBase64: Buffer.from('Original attachment').toString('base64'),
+    });
+    const before = await orkas.invoke('projects.tasks.list', { projectId });
+    if (projectId) {
+      await page.evaluate(async (pid) => { await (window as any).setView('project', pid); }, projectId);
+      await page.locator('[data-project-tab="todo"]').click();
+    } else await page.locator('#todos-btn').click();
+    const card = page.locator(`.project-todo-item[data-tid="${taskId}"]:visible`);
+    await card.locator('[data-action="todo-edit"]').click();
+    const field = page.locator('#project-todo-input');
+    await expect(field).toHaveValue(content);
+    await expect(page.locator('#project-todo-attachments')).toContainText('brief.txt');
+    const editorRoom = () => page.evaluate(() => {
+      const dialog = document.querySelector('#todo-editor-modal .todo-editor-dialog') as HTMLElement;
+      const input = document.getElementById('project-todo-input') as HTMLTextAreaElement;
+      return {
+        lines: Math.floor(input.clientHeight / parseFloat(getComputedStyle(input).lineHeight)),
+        fieldScrolls: input.scrollHeight > input.clientHeight,
+        dialogScrolls: dialog.scrollHeight > dialog.clientHeight + 1,
+      };
+    });
+    for (const [width, height, minimumLines] of [[1280, 800, 8], [1440, 900, 12]]) {
+      await page.setViewportSize({ width, height });
+      await expect.poll(async () => (await editorRoom()).lines).toBeGreaterThanOrEqual(minimumLines);
+      expect(await editorRoom()).toMatchObject({ fieldScrolls: true, dialogScrolls: false });
+      await expect(page.locator('#project-todo-save')).toBeInViewport();
+      await field.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+      expect(await field.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+      await page.screenshot({ path: info.outputPath(`todo-editor-${width}.png`) });
+    }
+    // Small windows may scroll the dialog; cancellation still reaches the action.
+    await page.setViewportSize({ width: 1024, height: 600 });
+    await page.locator('#project-todo-cancel').scrollIntoViewIfNeeded();
+    await expect(page.locator('#project-todo-cancel')).toBeInViewport();
+    await page.locator('#project-todo-cancel').click();
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.locator(projectId ? '#project-todo-add-btn' : '#todos-add-btn').click();
+    await expect(field).toHaveValue('');
+    expect(await editorRoom()).toEqual({ lines: 6, fieldScrolls: false, dialogScrolls: false });
+    await field.fill('A short draft');
+    expect(await editorRoom()).toEqual({ lines: 6, fieldScrolls: false, dialogScrolls: false });
+    await page.locator('#project-todo-cancel').click();
+    expect(await orkas.invoke('projects.tasks.list', { projectId })).toEqual(before);
+  });
+}
+
 // The assignment journey exercises both account-scoped agents and execution.
 
 
