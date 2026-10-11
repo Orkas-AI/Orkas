@@ -1122,7 +1122,6 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 }
 .project-detail-actions .btn[hidden] { display: none; }
 #project-add-agent-btn[hidden] { display: none; }
-#project-todo-member-field[hidden] { display: none; }
 .project-todo-agent-icon {
   flex: 0 0 18px;
   display: inline-flex;
