@@ -1478,6 +1478,7 @@
   "settings.search.sub": "การค้นหาจะใช้ตามลำดับนี้: บริการค้นหาที่ตั้งค่าไว้ การค้นหาในตัวโมเดล แล้วจึงใช้การค้นหาในเครื่องแบบฟรี",
   "settings.search.provider": "ผู้ให้บริการ",
   "settings.search.api_key": "คีย์ API",
+  "settings.search.api_key_optional": "ไม่บังคับ: เว้นว่างไว้เพื่อค้นหาโดยไม่ใช้คีย์ API",
   "settings.search.add": "+ เพิ่มคีย์ค้นหา",
   "settings.search.pick_provider": "— เลือกผู้ให้บริการค้นหา —",
   "settings.search.error_provider_needed": "เลือกผู้ให้บริการค้นหาก่อน",

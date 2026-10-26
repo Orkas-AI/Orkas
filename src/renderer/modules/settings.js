@@ -2499,11 +2499,21 @@ const _SEARCH_PROVIDER_OPTIONS = [
   { id: 'brave-search',      label: 'Brave', docs: 'https://brave.com/search/api/' },
   { id: 'baidu-ai-search',   label: 'Baidu', docs: 'https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk' },
   { id: 'metaso',            label: 'Metaso', docs: 'https://metaso.cn/' },
+  { id: 'keenable',          label: 'Keenable', docs: 'https://docs.keenable.ai/', keyOptional: true },
 ];
 
 function _searchProviderLabel(id) {
   const hit = _SEARCH_PROVIDER_OPTIONS.find((p) => p.id === id);
   return hit ? hit.label : id;
+}
+
+function _searchProviderKeyOptional(id) {
+  return !!_SEARCH_PROVIDER_OPTIONS.find((p) => p.id === id)?.keyOptional;
+}
+
+function _settingsSyncSearchKeyPlaceholder(provider) {
+  const input = document.getElementById('settings-search-key-input');
+  if (input) input.placeholder = _searchProviderKeyOptional(provider) ? t('settings.search.api_key_optional') : '';
 }
 
 async function _settingsRefreshSearchProfiles() {
@@ -2524,6 +2534,7 @@ function _settingsRenderSearchPicker() {
     _settingsState.searchProviderSel = _aiSelectMount(el, {
       placeholder: t('settings.search.pick_provider'),
     });
+    _settingsState.searchProviderSel.onChange(_settingsSyncSearchKeyPlaceholder);
   }
   // setOptions on every call — the second arg refreshes the placeholder so a
   // mid-session language switch updates the dropdown header text.
@@ -2532,6 +2543,7 @@ function _settingsRenderSearchPicker() {
     _SEARCH_PROVIDER_OPTIONS.map((p) => ({ value: p.id, label: p.label, hint: p.docs })),
     { value: prev || '', placeholder: t('settings.search.pick_provider') },
   );
+  _settingsSyncSearchKeyPlaceholder(_settingsState.searchProviderSel.getValue());
   const addBtn = document.getElementById('settings-search-add-btn');
   if (addBtn && !addBtn.dataset.bound) {
     addBtn.dataset.bound = '1';
@@ -2544,7 +2556,10 @@ async function _settingsClickAddSearchKey() {
   const input = document.getElementById('settings-search-key-input');
   const apiKey = (input?.value || '').trim();
   if (!provider) { _settingsSetStatus('settings-search-status', 'error', t('settings.search.error_provider_needed')); return; }
-  if (!apiKey)   { _settingsSetStatus('settings-search-status', 'error', t('settings.search.error_key_needed')); return; }
+  if (!apiKey && !_searchProviderKeyOptional(provider)) {
+    _settingsSetStatus('settings-search-status', 'error', t('settings.search.error_key_needed'));
+    return;
+  }
   _settingsSetStatus('settings-search-status', 'busy', t('settings.search.adding'));
   try {
     const res = await window.orkas.invoke('searchAuth.add', { provider, apiKey, label: 'default' });

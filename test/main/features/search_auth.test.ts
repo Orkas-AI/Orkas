@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../../../src/main/features/auth', () => ({
+  KEYLESS_SEARCH_PROVIDERS: new Set(['keenable']),
   loadSearchProfiles: () => mocks.profiles.map((profile) => ({ ...profile })),
   saveSearchProfiles: (profiles: Array<Record<string, any>>) => {
     mocks.profiles = profiles.map((profile) => ({ ...profile }));
@@ -16,6 +17,7 @@ vi.mock('../../../src/main/model/core-agent/search-adapters', () => ({
   searchAdaptersByProvider: {
     tavily: vi.fn(),
     serper: vi.fn(),
+    keenable: vi.fn(),
   },
   runSearchAdapter: mocks.runSearchAdapter,
 }));
@@ -51,6 +53,23 @@ describe('search credential profiles', () => {
     expect(first.ok).toBe(true);
     expect(second).toEqual(first);
     expect(mocks.profiles).toHaveLength(1);
+  });
+
+  it('stores a keyless row only for providers that answer without a key', async () => {
+    const searchAuth = await import('../../../src/main/features/search_auth');
+
+    expect(searchAuth.addSearchProfile({ provider: 'tavily', apiKey: '  ' })).toEqual({
+      ok: false,
+      error: 'apiKey required',
+    });
+    const keyless = searchAuth.addSearchProfile({ provider: 'keenable', apiKey: '' });
+    const again = searchAuth.addSearchProfile({ provider: 'keenable', apiKey: ' ' });
+
+    expect(keyless.ok).toBe(true);
+    expect(again).toEqual(keyless);
+    expect(mocks.profiles).toEqual([
+      expect.objectContaining({ provider: 'keenable', apiKey: '', label: 'default' }),
+    ]);
   });
 
   it('returns and logs a stable redacted failure when a provider echoes secrets or paths', async () => {

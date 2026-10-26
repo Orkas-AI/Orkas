@@ -1478,6 +1478,7 @@
   "settings.search.sub": "Pencarian menggunakan ini secara berurutan: layanan pencarian yang dikonfigurasi, pencarian bawaan model, lalu pencarian lokal gratis.",
   "settings.search.provider": "Penyedia",
   "settings.search.api_key": "Kunci API",
+  "settings.search.api_key_optional": "Opsional: biarkan kosong untuk mencari tanpa kunci API",
   "settings.search.add": "+ Tambahkan kunci pencarian",
   "settings.search.pick_provider": "— Pilih penyedia pencarian —",
   "settings.search.error_provider_needed": "Pilih penyedia pencarian terlebih dahulu",

@@ -1478,6 +1478,7 @@
   "settings.search.sub": "検索では、設定済みの検索サービス、モデル内蔵検索、無料のローカル検索の順に使用します。",
   "settings.search.provider": "プロバイダー",
   "settings.search.api_key": "API キー",
+  "settings.search.api_key_optional": "任意：空欄のままにすると API キーなしで検索します",
   "settings.search.add": "+ 検索キーを追加",
   "settings.search.pick_provider": "— 検索プロバイダーを選択 —",
   "settings.search.error_provider_needed": "先に検索プロバイダーを選択してください",

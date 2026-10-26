@@ -248,6 +248,29 @@ describe('settings model authorization add account', () => {
     expect(invoke).toHaveBeenCalledWith('imageAuth.add', { provider: 'doubao', model, apiKey: 'fixture-image-key', label: 'default' });
   });
 
+  it('adds Keenable search without a key while other search providers still need one', async () => {
+    const { context, elements, invoke, selects } = loadSettingsClickHarness();
+    const key = new FakeElement();
+    const status = new FakeElement();
+    elements.set('settings-search-provider', new FakeElement());
+    elements.set('settings-search-key-input', key);
+    elements.set('settings-search-status', status);
+    context._settingsRenderSearchPicker();
+    const picker = selects.get(elements.get('settings-search-provider')!);
+    expect(picker.getOptions()).toContainEqual(expect.objectContaining({ value: 'keenable', label: 'Keenable' }));
+
+    picker.emitChange('tavily');
+    expect(key.placeholder).toBe('');
+    await context._settingsClickAddSearchKey();
+    expect(status.textContent).toBe('settings.search.error_key_needed');
+    expect(invoke).not.toHaveBeenCalledWith('searchAuth.add', expect.anything());
+
+    picker.emitChange('keenable');
+    expect(key.placeholder).toBe('settings.search.api_key_optional');
+    await context._settingsClickAddSearchKey();
+    expect(invoke).toHaveBeenCalledWith('searchAuth.add', { provider: 'keenable', apiKey: '', label: 'default' });
+  });
+
   it('turns a rejected OAuth start IPC into the visible error state', async () => {
     const { context, elements } = loadSettingsClickHarness(async () => { throw new Error('fixture IPC failure'); });
     await expect(context._settingsStartOAuthFlow({ id: 'openai-codex', label: 'Codex' }, 'gpt-5.5')).resolves.toBeUndefined();

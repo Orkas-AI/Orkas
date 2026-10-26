@@ -1478,6 +1478,7 @@
   "settings.search.sub": "Tìm kiếm dùng theo thứ tự: dịch vụ tìm kiếm đã cấu hình, tìm kiếm tích hợp của mô hình, rồi tìm kiếm cục bộ miễn phí.",
   "settings.search.provider": "Nhà cung cấp",
   "settings.search.api_key": "Khóa API",
+  "settings.search.api_key_optional": "Không bắt buộc: để trống để tìm kiếm mà không cần khóa API",
   "settings.search.add": "+ Thêm khóa tìm kiếm",
   "settings.search.pick_provider": "— Chọn nhà cung cấp tìm kiếm —",
   "settings.search.error_provider_needed": "Chọn nhà cung cấp tìm kiếm trước",

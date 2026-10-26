@@ -377,6 +377,22 @@ describe('auth › multi-profile store (addApiKey / removeCredential / renamePro
   });
 });
 
+describe('auth › search profiles', () => {
+  it('reloads keyless rows only for search providers that answer without a key', async () => {
+    const a = await import('../../../src/main/features/auth');
+    a.saveSearchProfiles([
+      { id: 's-keenable', provider: 'keenable', apiKey: '', label: 'default', createdAt: 1 },
+      { id: 's-tavily', provider: 'tavily', apiKey: '', label: 'default', createdAt: 2 },
+      { id: 's-serper', provider: 'serper', apiKey: 'serper-key-xxxxxxxx', label: 'default', createdAt: 3 },
+    ]);
+
+    expect(a.loadSearchProfiles().map((profile) => [profile.id, profile.apiKey])).toEqual([
+      ['s-keenable', ''],
+      ['s-serper', 'serper-key-xxxxxxxx'],
+    ]);
+  });
+});
+
 describe('auth › listProviders grouping', () => {
   it('returns providers in catalog order regardless of insertion order', async () => {
     const a = await import('../../../src/main/features/auth');

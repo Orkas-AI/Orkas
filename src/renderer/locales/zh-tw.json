@@ -1478,6 +1478,7 @@
   "settings.search.sub": "搜尋時會依次使用：已設定的搜尋服務、模型自帶搜尋、本機免費搜尋。",
   "settings.search.provider": "服務供應商",
   "settings.search.api_key": "API 金鑰",
+  "settings.search.api_key_optional": "選填：留空即可不使用 API 金鑰搜尋",
   "settings.search.add": "+ 新增搜尋金鑰",
   "settings.search.pick_provider": "— 選擇搜尋服務 —",
   "settings.search.error_provider_needed": "請先選擇搜尋服務供應商",

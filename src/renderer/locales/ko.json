@@ -1478,6 +1478,7 @@
   "settings.search.sub": "검색은 설정된 검색 서비스, 모델의 내장 검색, 무료 로컬 검색 순서로 사용합니다.",
   "settings.search.provider": "제공업체",
   "settings.search.api_key": "API 키",
+  "settings.search.api_key_optional": "선택 사항: 비워 두면 API 키 없이 검색합니다",
   "settings.search.add": "+ 검색 키 추가",
   "settings.search.pick_provider": "— 검색 제공업체 선택 —",
   "settings.search.error_provider_needed": "먼저 검색 제공업체를 선택해 주세요",

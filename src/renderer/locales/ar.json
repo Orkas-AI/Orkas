@@ -1478,6 +1478,7 @@
   "settings.search.sub": "يستخدم البحث هذه الخيارات بالترتيب: خدمات البحث المضبوطة، ثم البحث المضمّن في النموذج، ثم البحث المحلي المجاني.",
   "settings.search.provider": "المزوّد",
   "settings.search.api_key": "مفتاح API",
+  "settings.search.api_key_optional": "اختياري: اتركه فارغًا للبحث بدون مفتاح API",
   "settings.search.add": "+ إضافة مفتاح بحث",
   "settings.search.pick_provider": "— اختر مزوّد بحث —",
   "settings.search.error_provider_needed": "اختر مزوّد بحث أولًا",

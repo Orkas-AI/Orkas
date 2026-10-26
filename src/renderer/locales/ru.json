@@ -1478,6 +1478,7 @@
   "settings.search.sub": "Поиск использует по порядку: настроенные поисковые сервисы, встроенный поиск модели, затем бесплатный локальный поиск.",
   "settings.search.provider": "Провайдер",
   "settings.search.api_key": "API-ключ",
+  "settings.search.api_key_optional": "Необязательно: оставьте пустым, чтобы искать без API-ключа",
   "settings.search.add": "+ Добавить ключ поиска",
   "settings.search.pick_provider": "— Выберите провайдера поиска —",
   "settings.search.error_provider_needed": "Сначала выберите провайдера поиска",

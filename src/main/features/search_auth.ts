@@ -10,6 +10,7 @@
  *   - serper            (https://serper.dev)
  *   - brave-search      (https://brave.com/search/api/)
  *   - baidu-ai-search   (https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk)
+ *   - keenable          (https://docs.keenable.ai/; API key optional)
  *
  * Bing Search API v7 is intentionally NOT supported here — Microsoft
  * retired it on 2025-08-11; the successor "Grounding with Bing Search" is
@@ -18,6 +19,7 @@
  */
 
 import {
+  KEYLESS_SEARCH_PROVIDERS,
   loadSearchProfiles,
   saveSearchProfiles,
   type SearchProfile,
@@ -68,7 +70,7 @@ export function addSearchProfile(input: AddSearchProfileInput): { ok: true; id: 
   const provider = String(input.provider || '').trim();
   const apiKey = String(input.apiKey || '').trim();
   if (!provider) return { ok: false, error: 'provider required' };
-  if (!apiKey) return { ok: false, error: 'apiKey required' };
+  if (!apiKey && !KEYLESS_SEARCH_PROVIDERS.has(provider)) return { ok: false, error: 'apiKey required' };
   if (!searchAdaptersByProvider[provider]) {
     return { ok: false, error: `unknown search provider "${provider}"` };
   }

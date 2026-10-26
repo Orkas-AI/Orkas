@@ -122,16 +122,97 @@ describe('open-source BYO search adapters', () => {
     expect(Object.keys(searchAdaptersByProvider).sort()).toEqual([
       'baidu-ai-search',
       'brave-search',
+      'keenable',
       'metaso',
       'orkas-api',
       'serper',
       'tavily',
     ]);
   });
+
+  it('searches Keenable without a key and reads the result text from snippet', async () => {
+    const pageText = `Line one of the page.\n\n  Line two.  ${'word '.repeat(200)}`;
+    const fetchStub = vi.fn(async () => new Response(JSON.stringify({
+      results: [
+        { title: 'Keenable', url: 'https://example.test/k', description: '', snippet: pageText },
+        { title: 'No URL', description: '', snippet: 'ignored' },
+      ],
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchStub);
+
+    const result = await runSearchAdapter({
+      id: 'keenable-a',
+      provider: 'keenable',
+      apiKey: '',
+      label: 'default',
+      createdAt: 0,
+    }, 'keyless query', 50);
+
+    expect(SEARCH_PROVIDER_LABEL.keenable).toBe('Keenable');
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchStub.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://api.keenable.ai/v1/search/public');
+    expect(init.method).toBe('POST');
+    expect(init.headers).toEqual({
+      'Content-Type': 'application/json',
+      'X-Keenable-Title': 'Orkas',
+    });
+    expect(JSON.parse(String(init.body))).toEqual({ query: 'keyless query', max_results: 20 });
+    expect(result.provider).toBe('keenable');
+    expect(result.results).toHaveLength(1);
+    const [hit] = result.results;
+    expect(hit).toMatchObject({ title: 'Keenable', url: 'https://example.test/k' });
+    expect(hit.snippet.startsWith('Line one of the page. Line two. word word')).toBe(true);
+    expect(hit.snippet).not.toMatch(/\n/);
+    expect(hit.snippet.endsWith('…')).toBe(true);
+    expect(hit.snippet.length).toBeLessThanOrEqual(501);
+  });
+
+  it('sends a user-owned Keenable key to the keyed endpoint only in its header', async () => {
+    const fetchStub = vi.fn(async () => new Response(JSON.stringify({
+      results: [{ title: 'Keyed', url: 'https://example.test/keyed', description: '', snippet: 'Short text' }],
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchStub);
+
+    const result = await runSearchAdapter({
+      id: 'keenable-b',
+      provider: 'keenable',
+      apiKey: ' user-owned-key ',
+      label: 'default',
+      createdAt: 0,
+    }, 'query', 3);
+
+    expect(fetchStub).toHaveBeenCalledWith(
+      'https://api.keenable.ai/v1/search',
+      expect.objectContaining({
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Keenable-Title': 'Orkas',
+          'X-API-Key': 'user-owned-key',
+        },
+      }),
+    );
+    expect(String((fetchStub.mock.calls[0] as unknown as [string, RequestInit])[1].body)).not.toContain('user-owned-key');
+    expect(result.results).toEqual([
+      { title: 'Keyed', url: 'https://example.test/keyed', snippet: 'Short text' },
+    ]);
+  });
+
+  it('reports a Keenable HTTP failure with its status for the fallback chain', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"detail":"Too Many Requests"}', { status: 429 })));
+
+    await expect(runSearchAdapter({
+      id: 'keenable-c',
+      provider: 'keenable',
+      apiKey: '',
+      label: 'default',
+      createdAt: 0,
+    }, 'query', 1)).rejects.toThrow('Keenable 429: {"detail":"Too Many Requests"}');
+  });
 });
 
 describe('search transfer deadlines', () => {
-  it.each(['orkas-api', 'tavily', 'serper', 'brave-search', 'baidu-ai-search', 'metaso'])('keeps the %s deadline active while reading the response body', async (provider) => {
+  it.each(['orkas-api', 'tavily', 'serper', 'brave-search', 'baidu-ai-search', 'metaso', 'keenable'])('keeps the %s deadline active while reading the response body', async (provider) => {
     vi.useFakeTimers();
     try {
       let responseSignal: AbortSignal | undefined;
