@@ -200,6 +200,12 @@ function createBridgeSkillRunner(options) {
     for (const key of Object.keys(env)) {
       if (key.startsWith('ORKAS_BRIDGE_')) delete env[key];
     }
+    // Unlike the bash-tool route, this runner bypasses SandboxExecutor.
+    // Apply the same host-selected runtime/package dirs for nested commands.
+    if (env.ORKAS_PATH_PREPEND) {
+      env.PATH = [env.ORKAS_PATH_PREPEND, env.PATH || env.Path || '']
+        .filter(Boolean).join(path.delimiter);
+    }
     env.ORKAS_RUN_SKILL_DIR = skillDir;
     return env;
   }

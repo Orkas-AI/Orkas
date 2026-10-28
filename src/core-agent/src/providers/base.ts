@@ -25,6 +25,17 @@ export type ToolDefinition = {
 
 /** Parameters for an LLM completion request. */
 export type CompletionParams = {
+  /** Request-local measurement from core preparation. Input references identify
+   * the unchanged request view; transformed inputs and foreign candidates must
+   * estimate afresh. Cloneable bookkeeping, never sent to an API or persisted. */
+  requestTokenEstimate?: {
+    model: string;
+    messages: Message[];
+    systemPrompt?: string;
+    tools?: ToolDefinition[];
+    tokens: number;
+    source: "anchored" | "estimated";
+  };
   /** Best-effort metadata observer, including attempts recovered by wrappers. Never sent to the API. */
   onRequestFailure?: (failure: import("./request-diagnostics.js").ProviderRequestFailure) => void;
   model: string;
@@ -56,10 +67,10 @@ export type CompletionParams = {
    * `"none"` disables caching. Provider-specific translation happens inside
    * pi-ai; providers without cache support ignore it. */
   cacheRetention?: "none" | "short" | "long";
-  /** Stable identifier used as `prompt_cache_key` (OpenAI / Codex / Azure /
-   * OpenRouter) and as cache-affinity hint (Mistral, others). Should be the
-   * caller's session id so repeated turns on the same conversation hit the
-   * same cache bucket. */
+  /** Conversation identifier forwarded to provider-specific cache metadata.
+   * The Codex SSE adapter separately scopes its HTTP cache-affinity header to
+   * the credential/endpoint/model; this id still owns its body cache key and
+   * request identity. Neither identifier guarantees a cache hit. */
   sessionId?: string;
   /** Opaque, in-memory identity of the active user turn. Transport adapters
    * may associate private routing state with it; never serialize it into API

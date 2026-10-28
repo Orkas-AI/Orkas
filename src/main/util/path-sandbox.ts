@@ -13,27 +13,43 @@
  *
  * Symlink handling: uses `fs.realpathSync` on both sides so a symlink
  * planted inside an allowed root cannot exfiltrate to /etc/passwd. If the
- * candidate doesn't exist yet (write path — not our case today), falls
- * back to lexical resolve so the check still works.
+ * candidate does not exist yet, resolves known links and its nearest existing
+ * ancestor. Truly unresolvable entries fail closed at authorization.
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-function realOrResolve(p: string): string {
+function realOrResolve(p: string, identityOnly = false, seenLinks?: Set<string>): string | null {
   try { return fs.realpathSync(p); }
   catch {
-    // Path doesn't exist — walk up until we hit an existing ancestor, realpath
-    // that, then rejoin the missing tail. Needed because macOS tmpdir
-    // (/var/folders/...) is itself a symlink to /private/var/..., so plain
-    // path.resolve on a nonexistent candidate wouldn't match a realpath-ed
-    // existing root.
+    // Missing descendants inherit the real existing ancestor. Existing links
+    // retain their actual target even when that target has not been created.
     const resolved = path.resolve(p);
     let existing = resolved;
     const missing: string[] = [];
     while (existing && existing !== path.dirname(existing)) {
       try { existing = fs.realpathSync(existing); break; }
       catch {
+        if (!identityOnly) {
+          let entry: fs.Stats | undefined;
+          try { entry = fs.lstatSync(existing); }
+          catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code !== 'ENOENT' && code !== 'ENOTDIR') return null;
+          }
+          if (entry) {
+            // Only a known symlink target can resolve an existing entry here.
+            // Cycles, inaccessible entries and non-directory ancestors deny.
+            const links = seenLinks ?? new Set<string>();
+            if (!entry.isSymbolicLink() || links.has(existing) || links.size >= 40) return null;
+            links.add(existing);
+            try {
+              const target = path.resolve(path.dirname(existing), fs.readlinkSync(existing), ...missing);
+              return realOrResolve(target, false, links);
+            } catch { return null; }
+          }
+        }
         missing.unshift(path.basename(existing));
         existing = path.dirname(existing);
       }
@@ -52,12 +68,15 @@ function comparisonKey(p: string): string {
  * realpath walk once and pass `{ rootsResolved: true }` afterwards.
  */
 export function resolveSandboxRoot(root: string): string {
-  return realOrResolve(root);
+  // Keep best-effort identity compatibility for an unresolvable root; the
+  // authorization check still resolves each candidate and rejects unknowns.
+  return realOrResolve(root) ?? realOrResolve(root, true) ?? path.resolve(root);
 }
 
 /** Resolve an unlink operand without following its final directory entry. */
 export function resolveSandboxEntry(candidate: string): string {
-  return path.join(realOrResolve(path.dirname(candidate)), path.basename(candidate));
+  const parent = path.dirname(candidate);
+  return path.join(realOrResolve(parent) ?? realOrResolve(parent, true) ?? path.resolve(parent), path.basename(candidate));
 }
 
 export interface PathAllowedOptions {
@@ -94,16 +113,21 @@ export function isPathAllowed(
     const parts = candidate.split(path.sep);
     if (!parts.at(-1) || parts.at(-1) === '.' || parts.includes('..')) return false;
   }
+  const realParent = options.followFinalSymlink === false
+    ? realOrResolve(path.dirname(candidate)) : null;
   const realCand = options.followFinalSymlink === false
-    ? resolveSandboxEntry(candidate)
+    ? (realParent ? path.join(realParent, path.basename(candidate)) : null)
     : realOrResolve(candidate);
+  if (!realCand) return false;
   const candidateKey = comparisonKey(realCand);
   for (const root of allowedRoots) {
     if (!root || !path.isAbsolute(root)) continue;
     const realRoot = options.rootsResolved ? root : realOrResolve(root);
+    if (!realRoot) continue;
     const rootKey = comparisonKey(realRoot);
     if (candidateKey === rootKey) return true;
-    if (candidateKey.startsWith(rootKey + path.sep)) return true;
+    const prefix = rootKey.endsWith(path.sep) ? rootKey : rootKey + path.sep;
+    if (candidateKey.startsWith(prefix)) return true;
   }
   return false;
 }

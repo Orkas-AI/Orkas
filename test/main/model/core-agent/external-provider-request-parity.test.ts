@@ -26,7 +26,7 @@ describe('external provider request policy', () => {
     expect(configs.at(-1).customModel).toMatchObject({ id: modelId, reasoning: true });
     if (modelId === 'deepseek-flash') {
       expect(configs.at(-1).customModel).toMatchObject({
-        name: 'DeepSeek V4.1 Flash', input: ['text', 'image'], contextWindow: 1_048_576, maxTokens: 384_000,
+        name: 'DeepSeek V4.1 Flash', input: ['text', 'image'], contextWindow: 1_000_000, maxTokens: 128_000,
       });
     }
   });

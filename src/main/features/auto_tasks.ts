@@ -5,8 +5,8 @@
  *   `<uid>/cloud/auto_tasks/<task_id>/` (global) or
  *   `<uid>/cloud/projects/<pid>/auto_tasks/<task_id>/` (project-scoped),
  * holding `config.json` (spec) + `attachments/<filename>` (per-task files
- * pre-staged by the user). Deletion is `rm -rf <task_id>/`; cloud sync
- * ships only the bytes that changed (no global file bottleneck).
+ * pre-staged by the user). Each task owns its config, attachments and handoff
+ * files; deletion removes that complete directory.
  *
  * Fire path: `chats.createConversation({projectId})` → copy attachments
  * into the new conv's resolved `chat_attachments/<cid>/` → `groupChat.send({text,
@@ -47,7 +47,6 @@ import {
 import {
   autoTaskLocationForTask,
   chatAttachmentDirForConversation,
-  cloudRelForAbs,
   findAutoTaskLocation,
   globalAutoTaskLocation,
   listAutoTaskLocations,
@@ -141,7 +140,7 @@ export interface AutoTask {
   scheduled_run_count?: number;
   attachments?: string[];                // file names under <task_dir>/attachments/
   /** Device the task is bound to — only this machine fires the schedule.
-   *  Every device can still read / edit the config (the file cloud-syncs).
+   *  The local installation can still read and edit the config.
    *  `device_id` is the persistent installation id from machine-global
    *  `device.json`; legacy releases stored a NIC MAC and migrate it only with
    *  local ownership evidence. `device_name` is display-only. */
@@ -150,6 +149,23 @@ export interface AutoTask {
   created_at: string;
   updated_at: string;
   last_run_at?: string;
+  /** Runs started (scheduled and manual) since this field existed. */
+  run_count?: number;
+  /** The most recent run and the one before it. A run stays `running` until
+   *  its own conversation reports a terminal; a restart can leave it there. */
+  last_run?: AutoTaskRun;
+  previous_run?: AutoTaskRun;
+}
+
+/** Terminal of one run as the group-chat bus reports it, plus `running`
+ *  before that and `unknown` for a terminal the bus could not classify. */
+export type AutoRunStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'stopped' | 'waiting_input' | 'unknown';
+
+export interface AutoTaskRun {
+  cid: string;
+  started_at: string;
+  ended_at?: string;
+  status: AutoRunStatus;
 }
 
 function genTaskId(): string { return 'at_' + crypto.randomBytes(4).toString('hex'); }
@@ -321,19 +337,8 @@ function _isValidTaskShape(t: any): t is AutoTask {
 // ── File IO (serialised per uid) ──────────────────────────────────────────
 
 const _tails = new Map<string, Promise<unknown>>();
-type SyncDirtyNotifier = (domain: string, relPath: string) => void;
-let _syncDirtyNotifierForTest: SyncDirtyNotifier | null = null;
-type SyncDeletedNotifier = (relPath: string) => void;
-let _syncDeletedNotifierForTest: SyncDeletedNotifier | null = null;
+
 let _markRanFailureForTest: Error | null = null;
-
-export function _setSyncDirtyNotifierForTest(fn: SyncDirtyNotifier | null): void {
-  _syncDirtyNotifierForTest = fn;
-}
-
-export function _setSyncDeletedNotifierForTest(fn: SyncDeletedNotifier | null): void {
-  _syncDeletedNotifierForTest = fn;
-}
 
 export function _setMarkRanFailureForTest(error: Error | null): void {
   _markRanFailureForTest = error;
@@ -356,6 +361,7 @@ async function _readOne(
     const raw: any = await readJson(cfg);
     if (!raw || typeof raw !== 'object') return null;
     if (!_isValidTaskShape(raw)) return null;
+    _dropMalformedRunFacts(raw as unknown as Record<string, unknown>);
     if (loc?.projectId && !raw.project_id) raw.project_id = loc.projectId;
     return raw;
   } catch (err) {
@@ -404,7 +410,7 @@ async function _writeOne(uid: string, task: AutoTask): Promise<void> {
     : null
   );
   if (prev && prev.dir !== loc.dir && fs.existsSync(prev.dir)) {
-    const prevRelPaths = _relFilesUnder(uid, prev.dir, prev.configRelPath);
+
     const retired = path.join(path.dirname(prev.dir), `.${task.id}.moved-${crypto.randomUUID()}`);
     await replaceDirectoryAtomically(loc.dir, async (staged) => {
       if (fs.existsSync(loc.dir)) fs.cpSync(loc.dir, staged, { recursive: true });
@@ -421,52 +427,14 @@ async function _writeOne(uid: string, task: AutoTask): Promise<void> {
     });
     try { fs.rmSync(retired, { recursive: true, force: true }); }
     catch (err) { log.warn('task migration source cleanup failed', logErrorSummary(err)); }
-    for (const relPath of prevRelPaths) _notifyDeleted(relPath);
-    _notifyDirty(loc.configRelPath);
+
     return;
   }
   fs.mkdirSync(loc.dir, { recursive: true });
   await writeJson(loc.configFile, task);
-  _notifyDirty(loc.configRelPath);
+
 }
 
-// Sync engine dirty signal (lazy-require: `features/sync` is stripped from
-// the open-source build). Auto tasks live in per-task directories, so a single path hint is
-// enough to wake the sync debounce; the engine still scans the whole cloud tree.
-function _notifyDirty(relPath: string): void {
-  if (_syncDirtyNotifierForTest) {
-    _syncDirtyNotifierForTest('auto_tasks', relPath);
-    return;
-  }
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('auto_tasks', relPath);
-  } catch { /* features/sync stripped */ }
-}
-
-function _notifyDeleted(relPath: string): void {
-  if (_syncDeletedNotifierForTest) {
-    _syncDeletedNotifierForTest(relPath);
-  }
-}
-
-function _relFilesUnder(uid: string, dir: string, fallback: string): string[] {
-  if (!fs.existsSync(dir)) return [fallback];
-  const out: string[] = [];
-  const walk = (absDir: string) => {
-    let entries: fs.Dirent[] = [];
-    try { entries = fs.readdirSync(absDir, { withFileTypes: true }); }
-    catch { return; }
-    for (const entry of entries) {
-      const abs = path.join(absDir, entry.name);
-      if (entry.isDirectory()) walk(abs);
-      else if (entry.isFile()) out.push(cloudRelForAbs(uid, abs));
-    }
-  };
-  walk(dir);
-  return out.length ? out : [fallback];
-}
 
 function _hasMatchingLocalLegacyClaim(uid: string, task: AutoTask): boolean {
   const assignedId = String(task.device_id || '').toLowerCase();
@@ -838,10 +806,10 @@ export async function deleteTask(uid: string, taskId: string, expectedProjectId?
     if (expectedProjectId !== undefined && ((await _readOne(uid, taskId))?.project_id ?? null) !== expectedProjectId) return { ok: false };
     const loc = findAutoTaskLocation(uid, taskId);
     if (!loc || !fs.existsSync(loc.dir)) return { ok: false };
-    const relPaths = _relFilesUnder(uid, loc.dir, loc.configRelPath);
+
     try {
       fs.rmSync(loc.dir, { recursive: true, force: true });
-      for (const relPath of relPaths) _notifyDeleted(relPath);
+
       _removeFireBoundaryClaimDir(uid, taskId);
       log.info(`task deleted uid=${maskId(uid)} id=${taskId}`);
       _onTaskMutated(uid, null, taskId);
@@ -928,7 +896,10 @@ export async function applyAutoTaskMutation(
       if (taskId && ((await getTask(uid, taskId))?.project_id ?? null) !== opts.projectId) return { ok: false, error: 'not_found' };
     }
     if (action === 'create') {
-      const result = await createTask(uid, { ...mutation.updates, ...(opts.projectId ? { project_id: opts.projectId } : {}) } as TaskDraft);
+      const result = await createTask(
+        uid,
+        { ...mutation.updates, ...(opts.projectId ? { project_id: opts.projectId } : {}) } as TaskDraft,
+      );
       if (!result.ok) return { ok: false, error: (result as { error: string }).error };
       await _stageMutationAttachments(uid, result.task.id, mutation, opts);
       return {
@@ -999,7 +970,7 @@ async function _stageMutationAttachments(
     if (!fs.existsSync(src)) continue;
     try {
       fs.copyFileSync(src, path.join(destDir, name));
-      _notifyDirty(`${loc.attachmentsRelBase}/${name}`);
+
     } catch (err) {
       log.warn(`attachment stage failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
     }
@@ -1037,6 +1008,121 @@ async function _markRan(
   });
 }
 
+// ── Run facts and handoff ────────────────────────────────────────────────
+//
+// A run opens a fresh conversation, so by itself it knows nothing about the
+// runs before it. The task record keeps a run count and the last two runs,
+// and each task owns one `handoff/` directory a run may read and write for
+// the next one. The turn guidance reads both; nothing else in the task
+// directory is writable from a run.
+
+export const AUTO_TASK_HANDOFF_NOTE = 'note.md';
+const RUN_STATUSES: ReadonlySet<string> = new Set<AutoRunStatus>([
+  'running', 'completed', 'failed', 'cancelled', 'stopped', 'waiting_input', 'unknown',
+]);
+
+function _isValidRun(run: unknown): run is AutoTaskRun {
+  if (!run || typeof run !== 'object') return false;
+  const r = run as Record<string, unknown>;
+  const isDate = (value: unknown) => typeof value === 'string' && !Number.isNaN(new Date(value).getTime());
+  return typeof r.cid === 'string' && safeId(r.cid)
+    && isDate(r.started_at)
+    && typeof r.status === 'string' && RUN_STATUSES.has(r.status)
+    && (r.ended_at === undefined || isDate(r.ended_at));
+}
+
+/** Run facts are additive: a malformed value is dropped instead of making
+ *  the task unreadable. */
+function _dropMalformedRunFacts(raw: Record<string, unknown>): void {
+  if (raw.run_count !== undefined
+      && !(Number.isSafeInteger(raw.run_count) && (raw.run_count as number) >= 0)) delete raw.run_count;
+  for (const key of ['last_run', 'previous_run'] as const) {
+    if (raw[key] !== undefined && !_isValidRun(raw[key])) delete raw[key];
+  }
+}
+
+/** The handoff note a run reads first and rewrites before it ends. */
+export function handoffNotePath(uid: string, task: Pick<AutoTask, 'id' | 'project_id'>): string {
+  return path.join(autoTaskLocationForTask(uid, task.id, task.project_id).handoffDir, AUTO_TASK_HANDOFF_NOTE);
+}
+
+/** Count the run and remember its conversation. The run before it moves to
+ *  `previous_run` so the new run can be told how that one ended. */
+export async function recordRunStart(uid: string, taskId: string, cid: string, startedAt: string): Promise<void> {
+  if (!_isValidTaskId(taskId) || !safeId(cid)) return;
+  await _runExclusive(uid, async () => {
+    const cur = await _readOne(uid, taskId);
+    if (!cur) return;
+    const next: AutoTask = {
+      ...cur,
+      run_count: (cur.run_count || 0) + 1,
+      ...(cur.last_run ? { previous_run: cur.last_run } : {}),
+      last_run: { cid, started_at: startedAt, status: 'running' },
+    };
+    await _writeOne(uid, next);
+  });
+}
+
+/** Close the run on record with the terminal of its own conversation. A
+ *  terminal for another conversation, or for a run no longer on record, is
+ *  ignored. */
+export async function recordRunTerminal(
+  uid: string, taskId: string, cid: string, status: AutoRunStatus, endedAt: string,
+): Promise<void> {
+  if (!_isValidTaskId(taskId) || !safeId(cid)) return;
+  await _runExclusive(uid, async () => {
+    const cur = await _readOne(uid, taskId);
+    if (!cur?.last_run || cur.last_run.cid !== cid) return;
+    await _writeOne(uid, { ...cur, last_run: { ...cur.last_run, status, ended_at: endedAt } });
+
+  });
+}
+
+/** Let the run's conversation write the task's handoff directory. The rest
+ *  of the task directory stays behind the automation tool. */
+async function _grantHandoffRoot(uid: string, task: AutoTask, cid: string): Promise<void> {
+  const loc = autoTaskLocationForTask(uid, task.id, task.project_id);
+  try {
+    fs.mkdirSync(loc.handoffDir, { recursive: true });
+    const state = await import('./group_chat/state');
+    await state.setToolExtraRoots(uid, cid, [loc.handoffDir]);
+  } catch (err) {
+    log.warn(`handoff root grant failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(err));
+  }
+}
+
+/** Observe before dispatch, but persist a terminal only after the admitted
+ *  run's start is durable. A fast run can finish before send returns. */
+function _watchRunTerminal(uid: string, taskId: string, cid: string): { admit(): void; cancel(): void } {
+  const subscribe = (groupChat as { subscribeTaskTerminals?: typeof import('./group_chat/bus').subscribeTaskTerminals })
+    .subscribeTaskTerminals;
+  if (typeof subscribe !== 'function') return { admit() {}, cancel() {} };
+  let admitted = false;
+  let pending: (() => void) | undefined;
+  const unsubscribe = subscribe((event) => {
+    // Each fire owns a newly created conversation. Its first terminal belongs
+    // to this admitted run; later chat can only finish after that terminal.
+    if (event.user_id !== uid || event.conversation_id !== cid) return;
+    unsubscribe();
+    const status = RUN_STATUSES.has(event.status) ? event.status as AutoRunStatus : 'unknown';
+    const finish = () => {
+      recordRunTerminal(uid, taskId, cid, status, new Date(event.finished_at_ms).toISOString())
+        .catch((err) => log.warn(`run terminal record failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err)));
+    };
+    if (admitted) finish();
+    else pending = finish;
+  });
+  return {
+    admit() {
+      admitted = true;
+      const finish = pending;
+      pending = undefined;
+      finish?.();
+    },
+    cancel() { unsubscribe(); pending = undefined; },
+  };
+}
+
 // ── Attachment management ────────────────────────────────────────────────
 
 export async function listAttachments(uid: string, taskId: string): Promise<string[]> {
@@ -1065,7 +1151,7 @@ export async function uploadAttachment(
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, safe), buf);
-    _notifyDirty(`${loc.attachmentsRelBase}/${safe}`);
+
     log.info(`attachment uploaded uid=${maskId(uid)} id=${taskId} bytes=${buf.length}`);
     return { ok: true, name: safe };
   } catch (err) {
@@ -1082,7 +1168,7 @@ export async function deleteAttachment(uid: string, taskId: string, name: string
   const target = path.join(loc.attachmentsDir, safe);
   try {
     if (fs.existsSync(target)) fs.unlinkSync(target);
-    _notifyDeleted(`${loc.attachmentsRelBase}/${safe}`);
+
     return { ok: true };
   } catch (err) {
     log.warn(`attachment delete failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
@@ -1503,6 +1589,9 @@ async function _fireTask(
     emitFailure('conv_create_failed');
     return { ok: false, error: 'conv_create_failed' };
   }
+  // The run may keep files for the next run in the task's handoff directory;
+  // grant it before the first turn so the turn's tools can already write there.
+  await _grantHandoffRoot(uid, task, cid);
   // Copy attachments into the new conversation's chat_attachments dir
   // BEFORE dispatch. The originals stay under the task's attachments/ so
   // recurring schedules re-use them next fire.
@@ -1517,18 +1606,37 @@ async function _fireTask(
   // automation that reads a page has no way to run at all. Binding stays out of
   // the foreground: the tab this fire opens must not take over the view.
   await _bindTaskBrowserWindow(uid, cid, task.id);
+  const terminal = _watchRunTerminal(uid, task.id, cid);
+  let preparingRun: Promise<void> | undefined;
+  const prepareRun = (): Promise<void> => preparingRun ||= (async () => {
+    // The accepted send prepares its facts before recipient work is queued:
+    // native and CLI context assembly can both run before send() returns.
+    try {
+      await recordRunStart(uid, task.id, cid, new Date(startedAt).toISOString());
+      terminal.admit();
+    } catch (err) {
+      terminal.cancel();
+      log.warn(`run start record failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
+    }
+  })();
   try {
     const res = await groupChat.send({
       userId: uid, cid, text,
+      beforeDispatch: prepareRun,
+      notificationKind: 'automation',
       ...(attachmentNames.length ? { attachments: attachmentNames } : {}),
     });
     if (!res.ok) {
+      terminal.cancel();
       log.warn(`fire send failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(res.error || 'unknown'));
       await rollbackEmptyConv('send_not_ok');
       emitFailure('send_not_ok');
       return { ok: false, error: 'send_not_ok' };
     }
     log.info(`fired uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)} project=${task.project_id || '-'} attachments=${attachmentNames.length}${catchUp ? ' catch_up=1' : ''}`);
+    // A successful send without recipient dispatch still counts as before.
+    // The shared promise prevents recording an ordinary dispatch twice.
+    await prepareRun();
     _emitFire({
       type: 'conv_created',
       source,
@@ -1540,6 +1648,7 @@ async function _fireTask(
     });
     return { ok: true, cid };
   } catch (err) {
+    terminal.cancel();
     log.error(`fire send threw uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(err));
     await rollbackEmptyConv('send_threw');
     emitFailure('send_threw');

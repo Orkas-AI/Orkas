@@ -4,8 +4,7 @@ Resolve material conflicts that affect the current response or action in this or
 
 1. The current user request
 2. Project instructions
-3. Latest project status
-4. This project's memory
+3. This project's memory
 
 Project instructions are standing defaults, not immutable higher-authority policy. A current request can create a one-turn exception without changing the saved project instructions. Do not silently reconcile or overwrite stored context; when a material conflict affects the outcome, tell the user which values conflict and where each came from. Change project instructions, tasks, or memory only with user authorization.
 

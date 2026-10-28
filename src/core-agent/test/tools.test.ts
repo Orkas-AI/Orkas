@@ -1188,7 +1188,7 @@ describe("Tools", () => {
       }
     });
 
-    it("returns a structured GitHub repository snapshot and caches its URL aliases", async () => {
+    it("returns a structured GitHub repository snapshot and caches its default API aliases", async () => {
       const metadata = {
         full_name: "example/project",
         description: "Example local-first project",
@@ -1239,7 +1239,7 @@ describe("Tools", () => {
           ctx,
         );
         const readmeAlias = await webFetch.execute(
-          { url: "https://raw.githubusercontent.com/example/project/main/README.md" },
+          { url: "https://api.github.com/repos/example/project/readme" },
           ctx,
         );
         const metadataAlias = await webFetch.execute(

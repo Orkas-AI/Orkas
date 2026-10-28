@@ -18,7 +18,7 @@
 import { appendInputReceipt } from '../../../bin/tool-input-compat.cjs';
 import * as fs from 'fs';
 import * as path from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { AgentTool, ToolResult, ToolContext } from '#core-agent';
 import { createLogger } from '../logger';
@@ -433,7 +433,7 @@ export function persistToolResult(
     .slice(0, TOOL_RESULT_REF_HASH_HEX);
   const abs = path.join(toolResultsDir, `${safeTool}.${id}.txt`);
   if (fs.existsSync(abs)) return abs;
-  const tmp = `${abs}.${process.pid}.tmp`;
+  const tmp = `${abs}.${process.pid}.${randomUUID()}.tmp`;
   try {
     fs.writeFileSync(tmp, content, { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmp, abs);

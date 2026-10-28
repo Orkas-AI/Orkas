@@ -1192,6 +1192,49 @@ describe('Office built-in tools', () => {
     });
   });
 
+  it.each(['docx', 'xlsx', 'pptx'])('preserves native numeric issue severity for %s review', async (extension) => {
+    const file = path.join(h.workspace, `numeric-review.${extension}`);
+    fs.writeFileSync(file, 'fixture');
+    // Pinned OfficeCLI v1.0.139 DocumentIssue.cs: Error=0, Warning=1, Info=2.
+    // Native values take precedence over the legacy subtype fallback.
+    for (const includeError of [false, true]) {
+      h.runOfficeCli.mockReset();
+      const issues = [
+        { severity: 1, type: 0, message: 'Body paragraph missing first-line indent' },
+        { severity: 2, type: 0, message: 'Mixed CJK/Latin punctuation' },
+        ...(includeError ? [{ severity: 0, subtype: 'formula_cache_stale' }] : []),
+      ];
+      h.runOfficeCli.mockImplementation(async (args: string[]) => ({
+        code: 0, stderr: '', stdout: JSON.stringify(args[0] === 'validate' ? { valid: true }
+          : args[2] === 'issues' ? { success: true, data: { count: issues.length, issues } }
+            : args[2] === 'stats' ? { success: true, data: { sheets: 1, totalCells: 1, formulaCells: 0, errorCells: 0 } }
+              : { success: true, data: { results: [] } }),
+      }));
+      const result = await getTool('office_review').execute({ action: 'check', path: file }, ctx());
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content)).toMatchObject({
+        valid: true,
+        issue_severity_counts: { blocker: includeError ? 1 : 0, warning: 1, info: 1, unknown: 0 },
+        structural_review_status: includeError ? 'blockers_found' : 'reviewed',
+      });
+      expect(fs.readFileSync(file, 'utf8')).toBe('fixture');
+    }
+  });
+
+  it('keeps unrecognized severity values and unreturned issues indeterminate', async () => {
+    const file = path.join(h.workspace, 'unknown-severity.docx');
+    fs.writeFileSync(file, 'fixture');
+    const issues = [3, -1, 1.5, '1', null, false, {}].map(severity => ({ severity }));
+    h.runOfficeCli
+      .mockResolvedValueOnce({ code: 0, stdout: '{"valid":true}', stderr: '' })
+      .mockResolvedValueOnce({ code: 0, stdout: JSON.stringify({ count: issues.length + 1, issues }), stderr: '' });
+    const result = await getTool('office_review').execute({ action: 'check', path: file }, ctx());
+    expect(JSON.parse(result.content)).toMatchObject({
+      valid: true, issue_severity_counts: { blocker: 0, warning: 0, info: 0, unknown: 8 },
+      structural_review_status: 'indeterminate',
+    });
+  });
+
   it('adds compact XLSX statistics and keeps incomplete issue severity explicit', async () => {
     const file = path.join(h.workspace, 'formula-review.xlsx');
     fs.writeFileSync(file, 'fixture');

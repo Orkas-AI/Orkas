@@ -28,8 +28,8 @@
  *   context_status → {type:'event', event:{stream:'context', data:{phase,...}}}
  *                    — semantic only; renderer localizes the phase
  *   compaction → {type:'progress', text: 'compacted <before>→<after> tokens'}
- *   done (ok)  → {type:'final', text} then {type:'done'}
- *   done (err) → {type:'error', text: meta.error.message} then {type:'done'}
+ *   done (ok)  → {type:'final', text}; the host owns stream completion
+ *   done (err) → {type:'error', text: localized error}; same completion owner
  *
  * The returned generator is ready to be `yield*`'d straight out of
  * `streamChatWithModel`.
@@ -197,6 +197,9 @@ function modelFailureDetails(
   }
   if (error.code === 'SESSION_PERSISTENCE_FAILED') {
     return { failureKind: 'model', failureCode: 'session_persistence_failed', retryExhausted: true };
+  }
+  if (error.code === 'CONTEXT_CAPACITY_INSUFFICIENT') {
+    return { failureKind: 'model', failureCode: 'context_capacity_insufficient', failurePhase: 'preflight' };
   }
   const rawCode = String(error.code || '').trim();
   const code = rawCode.toUpperCase();

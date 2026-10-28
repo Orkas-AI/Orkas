@@ -21,10 +21,40 @@ describe('parseDoubaoV3Ndjson', () => {
     if (r.ok) expect(r.audio.toString()).toBe('AAAABBBB');
   });
 
-  it('succeeds even without an explicit terminator line', () => {
+  it('rejects audio followed by clean EOF without an explicit terminator', () => {
     const r = parseDoubaoV3Ndjson(JSON.stringify({ code: 0, data: b64('hello') }));
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.audio.toString()).toBe('hello');
+    expect(r).toMatchObject({ ok: false, message: expect.stringMatching(/completion/i) });
+    expect(r).not.toHaveProperty('audio');
+  });
+
+  it.each([
+    '{"code":2000000}',
+    '{"code":20000001}',
+    '{"code":"20000000x"}',
+    '{"code":true}',
+    '{"code":[20000000]}',
+    '{"code":{"value":20000000}}',
+    '{"message":"20000000"}',
+    '[{"code":20000000}]',
+    '"{\\"code\\":20000000}"',
+    '{"code":20000000',
+  ])('does not accept a malformed or look-alike completion event: %s', tail => {
+    const r = parseDoubaoV3Ndjson(JSON.stringify({ code: 0, data: b64('partial') }) + '\n' + tail);
+    expect(r.ok).toBe(false);
+    expect(r).not.toHaveProperty('audio');
+  });
+
+  it.each(['', '\n', '\r\n'])('accepts complete CRLF/SSE input with final delimiter %j', delimiter => {
+    const raw = `data: {"code":"0","data":"${b64('voice')}"}\r\ndata: {"code":" 20000000 "}${delimiter}`;
+    expect(parseDoubaoV3Ndjson(raw)).toEqual({ ok: true, audio: Buffer.from('voice') });
+  });
+
+  it.each([false, true])('does not let completion hide a provider error (error follows completion: %s)', errorAfter => {
+    const error = '{"code":40000001,"message":"invalid speaker"}';
+    const done = '{"code":20000000}';
+    const raw = [JSON.stringify({ code: 0, data: b64('partial') }),
+      ...(errorAfter ? [done, error] : [error, done])].join('\n');
+    expect(parseDoubaoV3Ndjson(raw)).toEqual({ ok: false, message: 'Doubao TTS failed: invalid speaker' });
   });
 
   it('tolerates blank and stray non-JSON lines between data events', () => {
@@ -34,6 +64,7 @@ describe('parseDoubaoV3Ndjson', () => {
       JSON.stringify({ code: 0, data: b64('X') }),
       '   ',
       JSON.stringify({ code: 0, data: b64('Y') }),
+      JSON.stringify({ code: 20000000 }),
     ].join('\n');
     const r = parseDoubaoV3Ndjson(raw);
     expect(r.ok).toBe(true);
@@ -66,10 +97,22 @@ describe('parseDoubaoV3Ndjson', () => {
     expect(parseDoubaoV3Ndjson('').ok).toBe(false);
   });
 
+  it('ignores JSON values which are not events without losing adjacent audio', () => {
+    const raw = ['null', '[]', 'false', '42', '"stray"',
+      JSON.stringify({ code: 0, data: b64('voice') }), '{"code":20000000}',
+    ].join('\n');
+    expect(parseDoubaoV3Ndjson(raw)).toEqual({ ok: true, audio: Buffer.from('voice') });
+  });
+
+  it('does not turn a null-only response into audio or an uncaught exception', () => {
+    expect(parseDoubaoV3Ndjson('null')).toMatchObject({ ok: false });
+  });
+
   it('skips a code-0 line whose data is empty (not a chunk)', () => {
     const raw = [
       JSON.stringify({ code: 0, data: '' }),
       JSON.stringify({ code: 0, data: b64('Z') }),
+      JSON.stringify({ code: 20000000 }),
     ].join('\n');
     const r = parseDoubaoV3Ndjson(raw);
     expect(r.ok).toBe(true);

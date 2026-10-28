@@ -109,7 +109,7 @@ function attachmentDir(): string {
 
 function searchResults(content: string): {
   roots: string[];
-  files: Array<{ root: number; path: string; name: string; size: number; mtime: string; source: string; total_chars?: number }>;
+  files: Array<{ root: number; path: string; read_path: string; name: string; size: number; mtime: string; source: string; total_chars?: number }>;
 } {
   return JSON.parse(content.slice(content.indexOf('{')));
 }
@@ -348,6 +348,24 @@ describe('file-tools › working-directory-relative paths', () => {
 });
 
 describe('file-tools › list_files', () => {
+  it('advertises the existing nonempty path requirement while dot lists the current directory', async () => {
+    const { tools, wsDir } = await buildTools();
+    fs.writeFileSync(path.join(wsDir, 'accounts.csv'), 'customer,value\nAster,1500\n');
+    const tool = getTool(tools, 'list_files');
+    const ctx = { workingDir: wsDir, state: {} } as any;
+    const invalid = await tool.execute({ path: '' }, ctx);
+    expect(invalid.isError).toBe(true);
+    expect(invalid.content).toContain('E_BAD_INPUT');
+    const listed = await tool.execute({ path: '.' }, ctx);
+    expect(listed.isError).toBeFalsy();
+    expect(listed.content).toContain('f accounts.csv');
+    const { toToolDefinition } = await import('../../../../src/core-agent/src/tools');
+    const schema = toToolDefinition(tool).inputSchema as any;
+    expect(schema.required).toContain('path');
+    expect(schema.properties.path).toMatchObject({ type: 'string', minLength: 1 });
+    expect(schema.properties.path.description).toContain('use "." for that directory');
+  });
+
   it('treats a lazy, not-yet-created conversation cwd as an empty directory', async () => {
     const { tools, wsDir } = await buildTools();
     const lazyCwd = path.join(wsDir, 'new-conversation');
@@ -1171,7 +1189,8 @@ describe('file-tools › read_file scope guards', () => {
       const { roots, files } = searchResults(result.content);
       const address = path.posix.join(roots[files[0].root], files[0].path);
       expect(address).toBe('@skill/bundle/references/facts.md');
-      const read = await run(getTool(tools, 'read_files'), { paths: [{ path: address }] });
+      expect(files[0].read_path).toBe(address);
+      const read = await run(getTool(tools, 'read_files'), { paths: [{ path: files[0].read_path }] });
       expect(read.isError, read.content).toBeFalsy();
       expect(read.content).toContain('needle fact');
     }
@@ -2564,6 +2583,63 @@ describe('file-tools › read_files metadata_only', () => {
 });
 
 describe('file-tools › search_files', () => {
+  it.each(['account', 'project'])('reads discovered files directly from a nested %s conversation cwd', async (scope) => {
+    const { tools, wsDir, attDir } = scope === 'project' ? await buildProjectTools() : await buildTools();
+    const cwd = path.join(wsDir, 'conversation');
+    const sources = [
+      [path.join(cwd, 'accounts.csv'), 'current conversation'],
+      [path.join(cwd, 'conversation', 'accounts.csv'), 'real nested directory'],
+      [path.join(attDir, 'accounts.csv'), 'current attachment'],
+    ];
+    for (const [file, body] of sources) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, body);
+    }
+    const ctx = { workingDir: cwd, state: {} } as any;
+    const result = await getTool(tools, 'search_files').execute({ query: 'accounts.csv' }, ctx);
+    expect(result.isError, result.content).toBeFalsy();
+    const { roots, files } = searchResults(result.content);
+    expect(files).toHaveLength(sources.length);
+    for (const [file, body] of sources) {
+      const found = files.find(f => path.join(roots[f.root], f.path) === file)!;
+      expect(found, file).toBeDefined();
+      expect(found.read_path).toBe(file.startsWith(`${cwd}${path.sep}`) ? path.relative(cwd, file) : file);
+      const read = await getTool(tools, 'read_files').execute({ paths: [{ path: found.read_path }] }, ctx);
+      expect(read.isError, read.content).toBeFalsy();
+      expect(read.content).toContain(body);
+      expect(fs.readFileSync(file, 'utf8')).toBe(body);
+    }
+    // The old scan-relative path stays available, but is never silently repaired.
+    const current = files.find(f => f.read_path === 'accounts.csv')!;
+    expect(current.path).toBe(path.join('conversation', 'accounts.csv'));
+    fs.unlinkSync(path.join(cwd, 'conversation', 'accounts.csv'));
+    const wrong = await getTool(tools, 'read_files').execute({ paths: [{ path: current.path }] }, ctx);
+    expect(wrong.isError).toBe(true);
+    expect(wrong.content).toContain('E_NOT_FOUND');
+  });
+
+  it('keeps discovered read paths subject to the existing scope check', async () => {
+    const permissions = await import('../../../../src/main/features/permissions');
+    permissions.setLocalExecMode('workspace_approval');
+    const { tools, wsDir } = await buildTools();
+    const root = path.join(tmpDir, 'references');
+    const file = path.join(root, 'report.txt');
+    fs.mkdirSync(root);
+    fs.writeFileSync(file, 'visible report');
+    const { createFileTools } = await import('../../../../src/main/model/core-agent/file-tools');
+    const referenceTools = createFileTools({ userId: UID, cid: CID, readOnlyExtraRoots: [root] });
+    const ctx = { workingDir: wsDir, state: {} } as any;
+    const result = await getTool(referenceTools, 'search_files').execute({ query: 'report.txt' }, ctx);
+    const found = searchResults(result.content).files[0];
+    expect(found.read_path).toBe(file);
+    const allowed = await getTool(referenceTools, 'read_files').execute({ paths: [{ path: found.read_path }] }, ctx);
+    expect(allowed.isError, allowed.content).toBeFalsy();
+    expect(allowed.content).toContain('visible report');
+    const read = await getTool(tools, 'read_files').execute({ paths: [{ path: found.read_path }] }, ctx);
+    expect(read.isError).toBe(true);
+    expect(read.content).not.toContain('visible report');
+  });
+
   it.each(['native', 'fallback'])('finds a selective filename beyond the old enumeration cap (%s)', async (backend) => {
     const { tools, wsDir } = await buildTools();
     for (let i = 0; i < 2100; i++) fs.writeFileSync(path.join(wsDir, `source-${i}.ts`), 'needle\n');

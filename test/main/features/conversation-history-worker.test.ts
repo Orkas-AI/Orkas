@@ -22,6 +22,93 @@ const row = (id: string, output = '') => ({ id, from: 'commander', to: ['user'],
   text: `完整消息 ${id} \\(x^2\\)`, process: [{ type: 'event', event: { stream: 'tool',
     data: { name: 'bash', phase: 'end', output } } }] });
 
+it('keeps every live process item inline and isolates its queue from persisted-history reads', async () => {
+  const client = await import('../../../src/main/features/conversation-history-client');
+  const real = client.ConversationHistoryWorker.prototype.request;
+  const lanes: Record<string, unknown> = {};
+  const spy = vi.spyOn(client.ConversationHistoryWorker.prototype, 'request').mockImplementation(function(command) {
+    lanes[command.kind] = this;
+    return real.call(this, command);
+  });
+  try {
+    const cache = await import('../../../src/main/features/conversation_history_cache');
+    const process = Array.from({ length: 2500 }, (_, n) => ({ type: 'progress', text: `event-${n}` }));
+    const file = path.join(root, 'live.jsonl');
+    const [live] = await cache.projectLiveConversationHistoryRecords('user', file, [{ ...row(''), process } as any]);
+    await cache.readConversationHistoryPage('user', file, 10);
+    expect(live.process).toEqual(process);
+    expect(live.process_parts).toBeUndefined();
+    expect(lanes.project).not.toBe(lanes.page);
+    expect(fs.existsSync(file)).toBe(false);
+  } finally { spy.mockRestore(); }
+});
+
+it('orders cache clearing after already-admitted live projections', async () => {
+  const client = await import('../../../src/main/features/conversation-history-client');
+  const real = client.ConversationHistoryWorker.prototype.request;
+  let release!: () => void, purgePosted = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const spy = vi.spyOn(client.ConversationHistoryWorker.prototype, 'request').mockImplementation(function(command) {
+    if (command.kind === 'purge') purgePosted = true;
+    if (command.kind === 'project') return gate.then(() => real.call(this, command));
+    return real.call(this, command);
+  });
+  const cache = await import('../../../src/main/features/conversation_history_cache');
+  const file = path.join(root, 'clear-live.jsonl');
+  const projection = cache.projectLiveConversationHistoryRecords('user', file, [row('', 'complete output '.repeat(1000))]);
+  const purge = cache.purgeConversationHistoryCache('user', file);
+  try {
+    await Promise.resolve();
+    const ordered = !purgePosted;
+    release();
+    const [record] = await projection;
+    const output = (record.process![0] as any).event.data.result_path;
+    await purge;
+    expect(ordered).toBe(true);
+    expect(fs.existsSync(output)).toBe(false);
+  } finally { release(); await Promise.allSettled([projection, purge]); spy.mockRestore(); }
+});
+
+it('does not turn a failed cache clear into a live-query failure', async () => {
+  const client = await import('../../../src/main/features/conversation-history-client');
+  const real = client.ConversationHistoryWorker.prototype.request;
+  const spy = vi.spyOn(client.ConversationHistoryWorker.prototype, 'request').mockImplementation(function(command) {
+    return command.kind === 'purge' ? Promise.reject(new Error('injected clear failure')) : real.call(this, command);
+  });
+  try {
+    const cache = await import('../../../src/main/features/conversation_history_cache');
+    const file = path.join(root, 'failed-clear.jsonl');
+    const clear = cache.purgeConversationHistoryCache('user', file);
+    const live = cache.projectLiveConversationHistoryRecords('user', file, [row('unchanged')]);
+    await expect(clear).rejects.toThrow('injected clear failure');
+    expect((await live)[0].id).toBe('unchanged');
+  } finally { spy.mockRestore(); }
+});
+
+it('cancels delayed projection and clear work at shutdown without reopening a worker', async () => {
+  const client = await import('../../../src/main/features/conversation-history-client');
+  const real = client.ConversationHistoryWorker.prototype.request;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const commands: string[] = [];
+  const spy = vi.spyOn(client.ConversationHistoryWorker.prototype, 'request').mockImplementation(function(command) {
+    commands.push(command.kind);
+    return command.kind === 'project' ? gate.then(() => real.call(this, command)) : real.call(this, command);
+  });
+  const cache = await import('../../../src/main/features/conversation_history_cache');
+  const file = path.join(root, 'closing-live.jsonl');
+  const live = cache.projectLiveConversationHistoryRecords('user', file, [row('cancelled')]);
+  const clear = cache.purgeConversationHistoryCache('user', file);
+  const settled = Promise.allSettled([live, clear]);
+  try {
+    await client.closeConversationHistoryWorker();
+    release();
+    expect((await settled).every(result => result.status === 'rejected')).toBe(true);
+    expect(commands).toEqual(['project']);
+    expect((await cache.projectLiveConversationHistoryRecords('user', file, [row('fresh')]))[0].id).toBe('fresh');
+  } finally { release(); await settled; spy.mockRestore(); }
+});
+
 it('reads cold/older pages without main-thread spill I/O and preserves exact expandable output', async () => {
   const file = path.join(root, 'history.jsonl');
   const output = '完整工具输出\n'.repeat(20_000);

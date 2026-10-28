@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -8,7 +8,7 @@ const marketplaceSource = fs.readFileSync(
   'utf8',
 );
 
-function loadMarketplaceRenderer(): any {
+function loadMarketplaceRenderer(loadMarketplace = true): any {
   const userErrorCode = fs.readFileSync(
     path.join(__dirname, '../../src/renderer/modules/user-error.js'),
     'utf8',
@@ -65,8 +65,40 @@ function loadMarketplaceRenderer(): any {
   vm.createContext(context);
   vm.runInContext(semverCode, context, { filename: 'semver.js' });
   vm.runInContext(userErrorCode, context, { filename: 'user-error.js' });
-  vm.runInContext(marketplaceSource, context, { filename: 'marketplace.js' });
+  if (loadMarketplace) vm.runInContext(marketplaceSource, context, { filename: 'marketplace.js' });
   return context;
+}
+
+// Use the real isolated preload bridge: this notification must cross its
+// allow-list and IPC payload projection, not a renderer-only fake subscriber.
+function preloadPushBridge(invoke: (channel: string) => unknown) {
+  const listeners = new Map<string, (event: unknown, payload: unknown) => void>();
+  let api: any;
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../../src/main/preload.js'), 'utf8'), {
+    require: () => ({
+      contextBridge: { exposeInMainWorld: (key: string, value: unknown) => { if (key === 'orkas') api = value; } },
+      ipcRenderer: {
+        sendSync: () => null,
+        invoke: async (_channel: string, envelope: { channel: string }) => invoke(envelope.channel),
+        on: (channel: string, handler: (event: unknown, payload: unknown) => void) => listeners.set(channel, handler),
+        removeListener: (channel: string) => listeners.delete(channel),
+      },
+    }),
+    process: { argv: [] }, window: { addEventListener: () => {} }, document: { readyState: 'complete' },
+    console, Date, Error, Promise, Object, setTimeout, clearTimeout,
+  }, { filename: 'preload.js' });
+  return { api, emit: (channel: string, payload: unknown) => listeners.get(channel)?.({}, payload), listeners };
+}
+
+function loadEagerAgents(ctx: any) {
+  const warnings = vi.fn();
+  const errors = vi.fn();
+  ctx.createLogger = () => ({ info: vi.fn(), debug: vi.fn(), warn: warnings, error: errors });
+  ctx.URLSearchParams = URLSearchParams;
+  ctx.pinyinSortKey = (value: string) => value;
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/agents.js'), 'utf8'), ctx, { filename: 'agents.js' });
+  vm.runInContext('_refreshCommanderAgentState = async () => {}; renderAgentsList = rows => { presentedAgents = rows; };', ctx);
+  return { warnings, errors };
 }
 
 describe('marketplace install error display', () => {
@@ -301,6 +333,127 @@ describe('marketplace install error display', () => {
     expect(uninstallInvoke).toBeGreaterThan(uninstallStart);
     expect(uninstallInvoke).toBeLessThan(uninstallState);
     expect(uninstallState).toBeLessThan(uninstallRefresh);
+  });
+
+  it.each(['prune', 'restore', 'patch'] as const)('refreshes real installed-card state after local %s without pulled progress', async change => {
+    const ctx = loadMarketplaceRenderer();
+    const item = { id: 'content-writer', name: 'Writer', version: '1.0.2' };
+    let agents = change === 'restore' ? [] : [{ agent_id: item.id, source: 'marketplace', version: '1.0.1' }];
+    let skills: Array<{ id: string; source: string; version: string }> = [];
+    const bridge = preloadPushBridge(channel => {
+      if (channel === 'agents.list') return { agents };
+      if (channel === 'skills.list') return { skills };
+      return { state: 'idle', list: [] };
+    });
+    ctx.window.orkas = bridge.api;
+    loadEagerAgents(ctx);
+    vm.runInContext('_agentsCache = [];', ctx);
+    ctx._skillsCache = [];
+    ctx.refreshAgentsAfterMarketplaceReconcile = vi.fn(async () => {});
+    ctx.refreshSkillsAfterMarketplaceReconcile = vi.fn(async () => {});
+    ctx.escapeHtml = (value: unknown) => String(value ?? '');
+    ctx.pickDesc = () => '';
+    ctx.renderAvatarHtml = () => '';
+    ctx.document.getElementById = (id: string) => id === 'panel-marketplace'
+      ? { classList: { contains: (name: string) => name === 'active' } } : null;
+    ctx.testState = {
+      tab: 'agent', appVersion: '1.9.5', installing: new Set(),
+      installedAgentIds: new Set(), installedAgentMeta: new Map(),
+      installedSkillIds: new Set(), installedSkillMeta: new Map(),
+    };
+    vm.runInContext('_mpState = testState; _mpRender = () => {};', ctx);
+    await ctx._mpRefreshInstalledState();
+    const before = ctx._mpCardHtml(item, 'en');
+    expect(before).toContain(change === 'restore' ? '>Install</button>' : '>Update</button>');
+    await ctx._mpInitReconcileWatch();
+    agents = change === 'prune' ? [] : [{ agent_id: item.id, source: 'marketplace', version: '1.0.2' }];
+    skills = [{ id: 'restored-skill', source: 'marketplace', version: '2.0.0' }];
+    bridge.emit('marketplace:content-changed', {});
+    await vi.waitFor(() => {
+      expect(vm.runInContext('_mpState.installedAgentIds.has("content-writer")', ctx)).toBe(change !== 'prune');
+      expect(vm.runInContext('_mpState.installedSkillIds.has("restored-skill")', ctx)).toBe(true);
+      if (change !== 'prune') expect(vm.runInContext('_mpState.installedAgentMeta.get("content-writer").version', ctx)).toBe('1.0.2');
+    });
+    expect(ctx._mpCardHtml(item, 'en')).toContain(change === 'prune' ? '>Install</button>' : '>Installed</button>');
+    expect(ctx.refreshAgentsAfterMarketplaceReconcile).toHaveBeenCalledOnce();
+    expect(ctx.refreshSkillsAfterMarketplaceReconcile).toHaveBeenCalledOnce();
+    expect(vm.runInContext('_mpReconcileStatus.state', ctx)).toBe('idle');
+  });
+
+  it('refreshes a downloaded catalog once without using progress as another invalidation', async () => {
+    const ctx = loadMarketplaceRenderer();
+    const bridge = preloadPushBridge(() => ({ state: 'idle', list: [] }));
+    ctx.window.orkas = bridge.api;
+    loadEagerAgents(ctx);
+    vm.runInContext('_agentsCache = [];', ctx);
+    ctx._skillsCache = [];
+    ctx.refreshAgentsAfterMarketplaceReconcile = vi.fn(async () => {});
+    ctx.refreshSkillsAfterMarketplaceReconcile = vi.fn(async () => {});
+    await ctx._mpInitReconcileWatch();
+    bridge.emit('marketplace:reconcile-status', { state: 'running', pulled: 0 });
+    bridge.emit('marketplace:reconcile-status', { state: 'done', pulled: 1 });
+    bridge.emit('marketplace:content-changed', {});
+    await vi.waitFor(() => expect(ctx.refreshSkillsAfterMarketplaceReconcile).toHaveBeenCalledOnce());
+    expect(ctx.refreshAgentsAfterMarketplaceReconcile).toHaveBeenCalledOnce();
+    expect(vm.runInContext('_mpReconcileStatus.pulled', ctx)).toBe(1);
+  });
+
+  it.each(['prune', 'restore', 'patch'] as const)('updates the picker full cache on %s before any lazy marketplace load', async change => {
+    const ctx = loadMarketplaceRenderer(false);
+    let agents = change === 'restore' ? [] : [{ agent_id: 'writer', name: 'Writer', source: 'marketplace', version: '1.0.1' }];
+    const bridge = preloadPushBridge(() => ({}));
+    ctx.window.orkas = bridge.api;
+    const logs = loadEagerAgents(ctx);
+    ctx.loadRendererFeature = vi.fn();
+    ctx.apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true, agents }) }));
+    await ctx._ensureAgentPickerTabData('agents', 0);
+    expect(vm.runInContext('_agentsCacheIsSummary', ctx)).toBe(false);
+    expect(vm.runInContext('_agentsCache.map(row => row.version)', ctx)).toEqual(change === 'restore' ? [] : ['1.0.1']);
+    expect(vm.runInContext('typeof _mpState', ctx)).toBe('undefined');
+    agents = change === 'prune' ? [] : [{ agent_id: 'writer', name: 'Writer', source: 'marketplace', version: '1.0.2' }];
+    bridge.emit('marketplace:content-changed', {});
+    await vi.waitFor(() => expect(vm.runInContext('_agentsCache.map(row => row.version)', ctx)).toEqual(change === 'prune' ? [] : ['1.0.2']));
+    expect(ctx.apiFetch).toHaveBeenCalledWith('/api/agents/list?force=1');
+    const reads = ctx.apiFetch.mock.calls.length;
+    await ctx.loadAgents(false);
+    expect(ctx.apiFetch).toHaveBeenCalledTimes(reads);
+    expect(ctx.presentedAgents.map((row: any) => row.version)).toEqual(change === 'prune' ? [] : ['1.0.2']);
+    expect(ctx.loadRendererFeature).not.toHaveBeenCalled();
+    expect(vm.runInContext('typeof _mpState', ctx)).toBe('undefined');
+    expect(logs.warnings).not.toHaveBeenCalled();
+    expect(logs.errors).not.toHaveBeenCalled();
+  });
+
+  it('does not populate unused catalogs or load lazy features for an early content event', async () => {
+    const ctx = loadMarketplaceRenderer(false);
+    const bridge = preloadPushBridge(() => ({}));
+    ctx.window.orkas = bridge.api;
+    const logs = loadEagerAgents(ctx);
+    ctx.loadRendererFeature = vi.fn();
+    ctx.apiFetch = vi.fn();
+    bridge.emit('marketplace:content-changed', {});
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(ctx.apiFetch).not.toHaveBeenCalled();
+    expect(ctx.loadRendererFeature).not.toHaveBeenCalled();
+    expect(vm.runInContext('_agentsCache', ctx)).toBeNull();
+    expect(vm.runInContext('typeof _mpState', ctx)).toBe('undefined');
+    expect(logs.warnings).not.toHaveBeenCalled();
+  });
+  it('diagnoses a failed Agent presentation refresh while keeping other loaded catalogs current', async () => {
+    const ctx = loadMarketplaceRenderer();
+    const bridge = preloadPushBridge(channel => channel === 'skills.list' ? { skills: [] } : { agents: [] });
+    ctx.window.orkas = bridge.api;
+    const logs = loadEagerAgents(ctx);
+    vm.runInContext('_agentsCache = [];', ctx);
+    ctx._skillsCache = [];
+    ctx.refreshAgentsAfterMarketplaceReconcile = vi.fn(async () => { throw new Error('CONFIDENTIAL'); });
+    ctx.refreshSkillsAfterMarketplaceReconcile = vi.fn(async () => {});
+    bridge.emit('marketplace:content-changed', {});
+    await vi.waitFor(() => expect(logs.warnings).toHaveBeenCalledExactlyOnceWith('marketplace content refresh failed', { resource_kind: 'agents' }));
+    expect(ctx.refreshSkillsAfterMarketplaceReconcile).toHaveBeenCalledOnce();
+    expect(JSON.stringify(logs.warnings.mock.calls)).not.toContain('CONFIDENTIAL');
+    expect(logs.errors).not.toHaveBeenCalled();
   });
 
 });

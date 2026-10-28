@@ -4225,7 +4225,8 @@ describe("AgentRunner", () => {
   // recovery folds deterministically and retries the same request exactly
   // once. Before this path existed, a tracked session's overflow was a
   // terminal error — the one hole every peer product had covered.
-  it("recovers from a provider context overflow by folding and retrying once", async () => {
+  it.each(['context_length_exceeded', 'exceed_context_size_error'])(
+    'recovers from a provider context overflow by folding and retrying once (%s)', async type => {
     let streamCalls = 0;
     let summaryCalls = 0;
     const capturedRequests: Message[][] = [];
@@ -4258,8 +4259,8 @@ describe("AgentRunner", () => {
         if (call === 2) {
           // Exercise the structured provider boundary as well as recovery.
           throw wrapErrorForTest(new ProviderError(
-            '400: {"code":"context_length_exceeded","message":"Request rejected"}',
-            "mock", 400, Object.assign(new Error('opaque'), { code: 'context_length_exceeded' }),
+            'Request rejected',
+            "mock", 400, Object.assign(new Error('opaque'), { code: 400, type }),
           ), "mock");
         }
         yield { type: "text_delta" as const, text: "done" };
@@ -4278,11 +4279,14 @@ describe("AgentRunner", () => {
     // Modest by the estimator's measure — under every layered trigger — yet
     // the provider still refuses: exactly the blind-spot shape (image bytes,
     // a first call with no anchor) this recovery exists for.
+    const execute = vi.fn(async (input: Record<string, unknown>) => ({
+      content: `bulk\n${(input.round === 0 ? "z" : "y").repeat(20_000)}`,
+    }));
     const bulk = defineTool({
       name: "bulk",
       description: "emits a large observation",
       inputSchema: { type: "object", properties: { round: { type: "number" } } },
-      async execute(input) { return { content: `bulk\n${(input.round === 0 ? "z" : "y").repeat(20_000)}` }; },
+      execute,
     });
     const config = createConfig({
       agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 10 },
@@ -4319,6 +4323,7 @@ describe("AgentRunner", () => {
     expect(retried).not.toContain("z".repeat(1_000));
     expect(retried).toContain("y".repeat(20_000));
     expect(streamCalls).toBe(4);
+    expect(execute.mock.calls.map(([input]) => input.round)).toEqual([0, 1]);
     // The user's message is committed exactly once as message text — the
     // second textual occurrence in a request is the plan anchor's
     // deterministically derived objective, which is projection, not a
@@ -4327,7 +4332,10 @@ describe("AgentRunner", () => {
     expect(runner.getSession().hasTurnTracking()).toBe(true);
   });
 
-  it.each([100, 100_000])("preserves the only unread parallel round on overflow (result chars: %i)", async (chars) => {
+  it.each([
+    [100, 'context_length_exceeded'], [100_000, 'context_length_exceeded'],
+    [100, 'exceed_context_size_error'], [100_000, 'exceed_context_size_error'],
+  ] as const)('preserves the only unread parallel round on overflow (result chars: %i / %s)', async (chars, type) => {
     // Asserted: done.meta.error.kind === 'context_overflow' with one request.
     expectTestLog({ level: 'error', source: 'console', message: /^\[agent-runner\] context overflow with nothing to recover \{/ });
     const session = new Session();
@@ -4344,7 +4352,8 @@ describe("AgentRunner", () => {
       async *stream(params) {
         requests.push(params);
         yield { type: "message_start" as const };
-        throw new ContextOverflowError("request exceeds context window");
+        throw wrapErrorForTest(new ProviderError('Request rejected', 'mock', 400,
+          Object.assign(new Error('opaque'), { code: 400, type })), 'mock');
       },
       async validateAuth() { return true; },
     };
@@ -4368,7 +4377,8 @@ describe("AgentRunner", () => {
     expect(events.filter(e => e.type === "compaction")).toHaveLength(0);
   });
 
-  it("declines a consecutive overflow after recovery with no completed call between", async () => {
+  it.each(['context_length_exceeded', 'exceed_context_size_error'])(
+    'declines a consecutive overflow after recovery with no completed call between (%s)', async type => {
     // Asserted: error kind context_overflow whose message names the recovery.
     expectTestLog({ level: 'error', source: 'console', message: /^\[agent-runner\] context overflow after recovery \{/ });
     let streamCalls = 0;
@@ -4395,7 +4405,8 @@ describe("AgentRunner", () => {
           };
           return;
         }
-        throw new ContextOverflowError("request exceeds context window");
+        throw wrapErrorForTest(new ProviderError('Request rejected', 'mock', 400,
+          Object.assign(new Error('opaque'), { code: 400, type })), 'mock');
       },
       async validateAuth() { return true; },
     };
@@ -9115,6 +9126,50 @@ describe("AgentRunner", () => {
     expect(seen[1].runScopedLedger).toBe(seen[0].runScopedLedger);
   });
 
+  it("copies host-seeded read stamps into the run-scoped map without sharing the host's map", async () => {
+    // A host that showed a file whole in the turn seeds its read stamp so the
+    // first edit is not refused as unread. The runtime copies the entries:
+    // reads during the run must not leak back into the host's object, and a
+    // later run starts from the host's seed again, not from this run's reads.
+    const mockProvider = createMockProvider([
+      {
+        content: [{ type: "tool_use", id: "c1", name: "capture_state", input: {} }],
+        stopReason: "tool_use",
+        usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "done" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+        model: "mock-model",
+      },
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const seen: Map<string, unknown>[] = [];
+    const captureTool = defineTool({
+      name: "capture_state",
+      description: "capture readFileState for assertion",
+      inputSchema: { type: "object", properties: {} },
+      async execute(_input, ctx) {
+        const state = ctx.state.readFileState as Map<string, unknown>;
+        seen.push(state);
+        state.set("/tmp/read-during-run.md", { mtimeMs: 2, size: 2 });
+        return { content: "ok" };
+      },
+    });
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [captureTool] });
+    const seed = new Map<string, unknown>([["/tmp/handoff/note.md", { mtimeMs: 1, size: 10, hash: "sha256:abc" }]]);
+    await runner.run({ message: "edit the note", initialReadFileState: seed });
+
+    expect(seen[0].get("/tmp/handoff/note.md")).toEqual({ mtimeMs: 1, size: 10, hash: "sha256:abc" });
+    expect(seen[0]).not.toBe(seed);
+    expect(seed.has("/tmp/read-during-run.md")).toBe(false);
+    expect(seed.size).toBe(1);
+  });
+
   it("omits sandboxEnv from state when not provided", async () => {
     // Preserves the pre-change default: sandboxEnv is absent from state when the
     // caller didn't opt in (the run-scoped readFileState map is always present).
@@ -9381,6 +9436,45 @@ describe("continuation-aware loop protection", () => {
 });
 
 describe("runner persistence barriers", () => {
+  it("stops on HTTP 451 after a completed tool and preserves its receipt across reload", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runner-451-"));
+    const file = path.join(dir, "session.jsonl");
+    const session = new PersistentSession({ sessionFile: file });
+    let calls = 0, writes = 0;
+    const first = createMockProvider([{
+      content: [{ type: "tool_use", id: "write-once", name: "write_fixture", input: {} }],
+      stopReason: "tool_use", model: "mock-model", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    }]);
+    const provider: LLMProvider = {
+      id: "mock", name: "Mock",
+      async complete() { throw new Error("must not summarize a rejected request"); },
+      async *stream(params) {
+        if (++calls === 1) yield* first.stream(params);
+        else throw new ProviderError("opaque rejection", "mock", 451);
+      },
+      async validateAuth() { return true; },
+    };
+    const providers = new ProviderRegistry();
+    providers.registerFactory("mock", () => provider);
+    const runner = new AgentRunner({ session, providers, config: createConfig({ agent: {
+      defaultProvider: "mock", defaultModel: "mock-model", maxRetries: 1,
+    } }), tools: [defineTool({ name: "write_fixture", description: "Commit one operation", inputSchema: { type: "object", properties: {} },
+      execute: async () => { writes++; return { content: "committed-operation-receipt" }; },
+    })] });
+    try {
+      const events = await collectRunEvents(runner, "Perform the operation and report its outcome");
+      expect(calls).toBe(2);
+      expect(writes).toBe(1);
+      expect(events.some(event => event.type === "retry")).toBe(false);
+      const terminal = events.filter(event => event.type === "done");
+      expect(terminal).toHaveLength(1);
+      expect(terminal[0].result.meta.error?.statusCode).toBe(451);
+      const reloaded = new PersistentSession({ sessionFile: file });
+      expect(JSON.stringify(reloaded.getMessages())).toContain("committed-operation-receipt");
+      expect(reloaded.getCompletedWorkLedger()).toContainEqual(expect.objectContaining({ tool: "write_fixture", status: "succeeded" }));
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each(["first request", "completion"])("does not hide save failure at %s", async (phase) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runner-save-boundary-"));
     const file = path.join(dir, "session.jsonl");

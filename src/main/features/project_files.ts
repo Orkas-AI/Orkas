@@ -18,6 +18,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Semaphore } from 'async-mutex';
 
 import { projectFilesDir } from '../paths';
+import { writeBytesAtomicSync, writeTextAtomicSync } from '../storage';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { invalidateFileCache } from './file_indexer';
@@ -31,6 +32,7 @@ import { officeFileToPreviewHtml } from './office/office_preview_layout';
 import {
   assertLocalImportTarget,
   copyLocalFileAtomic,
+  copyLocalEntryExclusiveSync,
   inspectLocalImportSource,
   isUtf8File,
   withLocalImportLock,
@@ -212,11 +214,6 @@ async function ensureProjectFilesDir(userId: string, projectId: string): Promise
 
 function _notifyDirty(userId: string, projectId: string): void {
   invalidateProjectFileTree(userId, projectId);
-}
-
-function _notifyDeleted(projectId: string, relPath: string): void {
-  void projectId;
-  void relPath;
 }
 
 function infoFor(absPath: string, root?: string): ProjectFileInfo | null {
@@ -429,7 +426,7 @@ export async function uploadProjectFile(
   try { fs.mkdirSync(targetDir, { recursive: true }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   const target = uniqueTarget(targetDir, path.basename(safeName));
-  try { fs.writeFileSync(target, buf); }
+  try { writeBytesAtomicSync(target, buf); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
 
   const info = infoFor(target, dir);
@@ -553,7 +550,6 @@ export async function deleteProjectFile(userId: string, projectId: string, name:
   try { fs.unlinkSync(abs); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   projectLibraryIndexer.enqueue(userId, pid, safeName, 'delete');
-  _notifyDeleted(pid, safeName);
   try { invalidateFileCache(userId, abs); }
   catch (err) { log.warn('project file cache invalidation failed', { path: logPathRef(abs), error: logErrorSummary(err) }); }
   try {
@@ -589,7 +585,6 @@ export async function deleteProjectEntry(userId: string, projectId: string, name
 
   for (const file of files) {
     projectLibraryIndexer.enqueue(userId, pid, file.relPath, 'delete');
-    _notifyDeleted(pid, file.relPath);
     try { invalidateFileCache(userId, file.path); }
     catch (err) { log.warn('project file cache invalidation failed', { path: logPathRef(file.path), error: logErrorSummary(err) }); }
   }
@@ -735,15 +730,11 @@ export async function copyProjectEntryFromPath(
   if (fs.existsSync(targetAbs)) return { ok: false, error: 'target_exists' };
 
   try {
-    fs.cpSync(sourceAbs, targetAbs, {
-      recursive: sourceStat.isDirectory(),
-      errorOnExist: true,
-      force: false,
-      dereference: false,
-    });
+    copyLocalEntryExclusiveSync(sourceAbs, targetAbs, sourceStat.isDirectory());
   } catch (err) {
-    try { fs.rmSync(targetAbs, { recursive: true, force: true }); } catch { /* best-effort rollback */ }
-    return { ok: false, error: (err as Error).message };
+    const code = (err as NodeJS.ErrnoException).code;
+    return { ok: false, error: code === 'EEXIST' || code === 'ERR_FS_CP_EEXIST'
+      ? 'target_exists' : (err as Error).message };
   }
 
   const copiedFiles = await filesUnderEntry(targetAbs, root);
@@ -880,7 +871,10 @@ export async function updateProjectTextFile(
   if (bytes > MAX_BYTES_TEXT) {
     return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(MAX_BYTES_TEXT / 1024 / 1024) }) };
   }
-  try { fs.writeFileSync(r.absPath, body, 'utf8'); }
+  try {
+    fs.accessSync(r.absPath, fs.constants.W_OK);
+    writeTextAtomicSync(r.absPath, body, 'utf8', { mode: fs.statSync(r.absPath).mode & 0o777 });
+  }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   try { invalidateFileCache(userId, r.absPath); }
   catch (err) { log.warn('project file cache invalidation failed', { path: logPathRef(r.absPath), error: logErrorSummary(err) }); }
@@ -941,7 +935,6 @@ export async function renameProjectFile(
     catch (err) { log.warn('renamed project file cache invalidation failed', { path: logPathRef(file.relPath), error: logErrorSummary(err) }); }
     projectLibraryIndexer.enqueue(userId, pid, file.relPath, 'delete');
     projectLibraryIndexer.enqueue(userId, pid, nextRel, 'upsert');
-    _notifyDeleted(pid, file.relPath);
   }
   _notifyDirty(userId, pid);
   if (type === 'dir') return { ok: true, oldName: safeOld, name: safeNext, type };

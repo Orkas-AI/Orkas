@@ -3,6 +3,14 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
 
+import * as ts from 'typescript';
+
+const utilsSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/utils.js'), 'utf8');
+const utilsParsed = ts.createSourceFile('utils.js', utilsSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+const base64Utility = utilsParsed.statements.find(node =>
+  ts.isFunctionDeclaration(node) && node.name?.text === '_arrayBufferToBase64');
+if (!base64Utility) throw new Error('missing upload base64 utility');
+
 function loadProjectDetailScript() {
   const source = fs.readFileSync(
     path.join(__dirname, '../../src/renderer/modules/project-detail.js'),
@@ -32,12 +40,45 @@ function loadProjectDetailScript() {
     },
   };
   vm.createContext(context);
+  vm.runInContext(base64Utility.getText(utilsParsed), context, { filename: 'upload-base64-utility.js' });
   vm.runInContext(source, context, { filename: 'project-detail.js' });
   vm.runInContext("_projectDetailPid = 'project-1'", context);
   return context;
 }
 
 describe('Project Library popup copy', () => {
+  it.each([
+    ['project', 'success'], ['project', 'failure'], ['project', 'rejection'],
+    ['account', 'success'], ['account', 'failure'], ['account', 'rejection'],
+  ])('isolates a late %s deletion %s without replacing the active scope', async (scope, outcome) => {
+    const context = loadProjectDetailScript();
+    context.currentUserId = 'first';
+    context.uiConfirm = vi.fn(async () => true);
+    context.uiAlert = vi.fn(async () => {});
+    context._renderProjectFiles = vi.fn();
+    vm.runInContext(`_projectDetailResolvedPid = 'project-1';
+      _projectDetailMeta = { project: { project_id: 'project-1' }, files: [] };`, context);
+    let release!: () => void;
+    let started!: () => void;
+    const waiting = new Promise<void>(resolve => { started = resolve; });
+    const response = new Promise((resolve, reject) => {
+      release = () => outcome === 'rejection' ? reject(new Error('synthetic deletion failure'))
+        : resolve({ ok: outcome === 'success' });
+    });
+    context.window.orkas.invoke = vi.fn(() => { started(); return response; });
+    const deleting = context._deleteProjectFile('old.md');
+    await waiting;
+    if (scope === 'account') context.currentUserId = 'second';
+    else vm.runInContext(`_projectDetailPid = 'project-2'; _projectDetailResolvedPid = 'project-2';
+      _projectDetailMeta = { project: { project_id: 'project-2' }, files: [] };`, context);
+    release();
+    await deleting;
+    expect(context.uiAlert).not.toHaveBeenCalled();
+    expect(context._renderProjectFiles).not.toHaveBeenCalled();
+    expect(context.window.orkas.invoke).toHaveBeenCalledExactlyOnceWith('projects.files.delete', { projectId: 'project-1', name: 'old.md' });
+  });
+
+
   it.each([
     ['confirmation', 'project'], ['confirmation', 'account'],
     ['deletion', 'project'], ['deletion', 'account'],
@@ -130,6 +171,9 @@ describe('Project Library popup copy', () => {
 
     await context._uploadProjectFiles([file], '', 'drop');
 
+    expect(context.window.orkas.invoke).toHaveBeenCalledExactlyOnceWith('projects.files.upload', {
+      projectId: 'project-1', name: file.name, data: Buffer.alloc(12).toString('base64'),
+    });
     expect(context.uiAlert).toHaveBeenCalledOnce();
     const message = context.uiAlert.mock.calls[0][0];
     expect(message).toContain('contexts.upload_failed');

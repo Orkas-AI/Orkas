@@ -47,12 +47,8 @@
     return fallback;
   }
 
-  function _notifyFail(prefix, err) {
-    const msg = (err && err.message) ? err.message : String(err || '');
-    try {
-      if (typeof uiAlert === 'function') uiAlert(msg ? _t('artifact.failure_detail', `${prefix}: ${msg}`, { action: prefix, detail: msg }) : prefix);
-      else _convLog.warn(prefix, msg);
-    } catch (_) {}
+  function _notifyFail(prefix) {
+    try { if (typeof uiAlert === 'function') uiAlert(prefix); } catch (_) {}
   }
 
   // Card-header "⋯" popover state. One shared menu element appended to <body>,
@@ -214,7 +210,8 @@
         <div class="chat-artifact-viewer-header">
           <div class="chat-artifact-viewer-title"></div>
           <div class="chat-file-viewer-actions">
-            <button type="button" class="chat-file-viewer-save-app chat-artifact-viewer-save">${window.uiIconHtml('layout-grid', 'chat-file-viewer-save-app-icon')}</button>
+            <button type="button" class="chat-file-viewer-save-app chat-artifact-viewer-save" disabled>${window.uiIconHtml('layout-grid', 'chat-file-viewer-save-app-icon')}</button>
+            <button type="button" class="chat-file-viewer-save-new-app chat-artifact-viewer-save-new" hidden>${window.uiIconHtml('plus', 'chat-file-viewer-save-app-icon')}</button>
             <button type="button" class="modal-close-btn chat-artifact-viewer-close">${window.uiIconHtml('x', 'modal-close-icon')}</button>
           </div>
         </div>
@@ -226,7 +223,8 @@
     _viewerTitle = el.querySelector('.chat-artifact-viewer-title');
     const updateLabels = () => {
       for (const [action, key, fallback] of [
-        ['save', 'artifact.menu_save', 'Save as app'],
+        ['save', el.dataset.hasSaveTarget === 'true' ? 'apps.update_original' : 'artifact.menu_save', 'Save as app'],
+        ['save-new', 'apps.save_new', 'Save new app'],
         ['close', 'common.close', 'Close'],
       ]) {
         const button = el.querySelector(`.chat-artifact-viewer-${action}`);
@@ -236,26 +234,45 @@
         button.dataset.tooltip = label;
       }
     };
+    el._updateSaveLabels = updateLabels;
     updateLabels();
     window.addEventListener('i18n-change', updateLabels);
     el.querySelector('.chat-artifact-viewer-close')?.addEventListener('click', _closeViewer);
-    const saveButton = el.querySelector('.chat-artifact-viewer-save');
-    saveButton.addEventListener('click', async () => {
-      if (saveButton.disabled || !_viewerFrame?.dataset.artifactId) return;
-      saveButton.disabled = true;
-      try {
-        await _doSave({ cid: _viewerFrame.dataset.artifactCid, artifactId: _viewerFrame.dataset.artifactId });
-      } finally { saveButton.disabled = false; }
-    });
+    for (const action of ['save', 'save-new']) {
+      el.querySelector('.chat-artifact-viewer-' + action).addEventListener('click', async () => {
+        const save = el.querySelector('.chat-artifact-viewer-save');
+        const copy = el.querySelector('.chat-artifact-viewer-save-new');
+        if (save.disabled || !_viewerFrame?.dataset.artifactId) return;
+        const ctx = {cid:_viewerFrame.dataset.artifactCid, artifactId:_viewerFrame.dataset.artifactId,
+          saveMode:action === 'save-new' ? 'new' : el.dataset.hasSaveTarget === 'true' ? 'update' : 'auto'};
+        save.disabled = copy.disabled = true;
+        try { await _doSave(ctx); }
+        finally { await _refreshViewerSaveActions(); }
+      });
+    }
     return el;
+  }
+
+  async function _refreshViewerSaveActions() {
+    if (!_viewerEl || !_viewerFrame) return;
+    const cid = _viewerFrame.dataset.artifactCid, artifactId = _viewerFrame.dataset.artifactId;
+    const save = _viewerEl.querySelector('.chat-artifact-viewer-save');
+    const copy = _viewerEl.querySelector('.chat-artifact-viewer-save-new');
+    save.disabled = copy.disabled = true;
+    let target = null;
+    try { target = (await window.orkas.invoke('conversations.artifacts.editTarget', {cid,artifactId}))?.target; }
+    catch (_) { /* Saving still validates the source at the owning boundary. */ }
+    if (cid !== _viewerFrame.dataset.artifactCid || artifactId !== _viewerFrame.dataset.artifactId) return;
+    _viewerEl.dataset.hasSaveTarget = String(!!target);
+    copy.hidden = !target;
+    _viewerEl._updateSaveLabels();
+    save.disabled = copy.disabled = false;
   }
 
   async function _openViewer(ctx) {
     if (!ctx || !ctx.cid || !ctx.artifactId) return;
-    if (ctx.frame?._orkasCommercial || ctx.frame?.dataset.appType === 'web') return window.OrkasCommercialEntry.show();
     if (window.OrkasPreviewWindows) {
       const result = await window.OrkasPreviewWindows.open({ kind: 'artifact', cid: ctx.cid, artifactId: ctx.artifactId, agentId: ctx.agentId || '', title: ctx.title || _t('artifact.title', 'Interactive app') });
-      if (window.OrkasCommercialEntry.isFailure(result)) return window.OrkasCommercialEntry.show();
       return result;
     }
     _bindGlobalListener();
@@ -271,10 +288,11 @@
       _viewerFrame.setAttribute('title', title);
       window.OrkasWebAppHost.open(_viewerFrame, { cid: ctx.cid, artifactId: ctx.artifactId });
       _checkArtifactAvailability(_viewerFrame, ctx);
+      _refreshViewerSaveActions();
     }
     el.classList.add('is-open');
     if (!_viewerKeyHandler) {
-      _viewerKeyHandler = (e) => { if (e.key === 'Escape') _closeViewer(); };
+      _viewerKeyHandler = (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Escape') _closeViewer(); };
       document.addEventListener('keydown', _viewerKeyHandler);
     }
   }
@@ -299,7 +317,7 @@
       if (e.target && e.target.closest && e.target.closest('.chat-artifact-more')) return;
       _closeMenu();
     });
-    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && el.style.display !== 'none') _closeMenu(); });
+    document.addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Escape' && el.style.display !== 'none') _closeMenu(); });
     window.addEventListener('scroll', _closeMenu, true);
     window.addEventListener('resize', _closeMenu);
     window.addEventListener('i18n-change', _closeMenu);
@@ -355,6 +373,7 @@
     const el = _ensureMenuEl();
     if (el.style.display !== 'none' && _menuAnchor === anchorBtn) { _closeMenu(); return; }
     _closeMenu();
+    delete ctx.saveMode;
     _menuCtx = ctx;
     _menuAnchor = anchorBtn;
     anchorBtn.classList.add('is-menu-open');
@@ -363,9 +382,10 @@
     _renderMenuItems(el);
     _positionMenu(el, anchorBtn);
     try {
-      const result = await window.orkas.invoke('conversations.artifacts.editTarget', { cid: String(ctx.cid) });
+      const result = await window.orkas.invoke('conversations.artifacts.editTarget', { cid: String(ctx.cid), artifactId: String(ctx.artifactId) });
       if (result?.target && _menuCtx === ctx && el.style.display !== 'none') {
         const save = el.querySelector('[data-action="save"]');
+        ctx.saveMode = 'new';
         if (save) save.textContent = _t('apps.save_new', 'Save new app');
         const update = document.createElement('div');update.className='chat-artifact-menu-item';update.dataset.action='update';
         update.textContent=_t('apps.update_original', 'Update original app');update.title=result.target.title;
@@ -382,19 +402,6 @@
     if (panel && panel.remove) panel.remove();
     frame._orkasUnavailablePanel = null;
     frame.style.display = 'block';
-  }
-
-  function _showCommercialUnavailable(frame) {
-    frame._orkasCommercial = true;
-    frame.dataset.appType = 'web';
-    _updateAppTypeTag(frame.parentNode?.querySelector('.chat-app-type-tag'), 'web');
-    _clearArtifactUnavailable(frame);
-    const panel = document.createElement('div');
-    panel.className = 'chat-artifact-unavailable';
-    window.OrkasCommercialEntry.appendNotice(panel);
-    frame._orkasUnavailablePanel = panel;
-    frame.parentNode?.insertBefore(panel, frame.nextSibling);
-    frame.style.display = 'none';
   }
 
   function _showArtifactUnavailable(frame, reason, retry) {
@@ -433,11 +440,8 @@
 
   function _updateAppTypeTag(tag, type) {
     if (!tag) return;
-    if (type === 'cloud') type = 'web';
-    const known = type === 'local' || type === 'web';
-    tag.hidden = !known;
-    tag.dataset.appType = known ? type : '';
-    tag.textContent = known ? _t('apps.type_' + type, type === 'web' ? 'Web app' : 'Local app') : '';
+    tag.hidden = true;
+    tag.textContent = '';
   }
 
   async function _checkArtifactAvailability(frame, ctx) {
@@ -461,56 +465,56 @@
         _showArtifactUnavailable(frame, r.reason || '');
       } else if (r && r.ok === true && r.status === 'ok') {
         frame.dataset.appType = r.appType || '';
-        if (r.appType === 'web' || r.appType === 'cloud') { _showCommercialUnavailable(frame); return; }
         _clearArtifactUnavailable(frame);
         _updateAppTypeTag(frame.parentNode?.querySelector('.chat-app-type-tag'), r.appType);
       }
     } catch (err) {
-      _logArtifactFailure('artifact_inspect', { error_message: String(err && err.message || err) });
+      _logArtifactFailure('artifact_inspect', { error_code: 'artifact_operation_failed' });
     }
   }
 
   function _doReload(ctx) {
     const f = ctx && ctx.frame;
-    if (f?._orkasCommercial || f?.dataset.appType === 'web') return window.OrkasCommercialEntry.show();
     if (!f || !f.isConnected) return;
-    // Reset height to default; the artifact re-reports on load. Reassigning
-    // `src` forces a fresh load (the protocol handler sends `Cache-Control:
-    // private` and dev reload ignores cache; this just re-runs the app).
-    f._orkasLoadFailed = false;
+    // A reopened SDK instance has a new isolated origin. Start a fresh frame
+    // document so the old app's navigation guard keeps rejecting cross-app
+    // navigation; the card and its app/storage identity stay unchanged.
     _clearArtifactUnavailable(f);
-    f.style.height = `${DEFAULT_FRAME_HEIGHT}px`;
-    window.OrkasWebAppHost.open(f, { cid: ctx.cid, artifactId: ctx.artifactId });
-    _checkArtifactAvailability(f, ctx);
+    const next = f.cloneNode(false);
+    next.removeAttribute('src');
+    next.style.height = `${DEFAULT_FRAME_HEIGHT}px`;
+    _bindArtifactLoadFailure(next, ctx);
+    window.OrkasWebAppHost.release(f);
+    f.parentNode.replaceChild(next, f);
+    if (f === _viewerFrame) _viewerFrame = next;
+    if (_menuCtx?.frame === f) _menuCtx.frame = next;
+    window.OrkasWebAppHost.open(next, { cid: ctx.cid, artifactId: ctx.artifactId });
+    _checkArtifactAvailability(next, ctx);
+  }
+
+  function _bindArtifactLoadFailure(frame, ctx) {
+    frame.addEventListener('orkas-app-error', event => {
+      event.preventDefault();
+      frame._orkasLoadFailed = true;
+      _showArtifactUnavailable(frame, '', () => _doReload({ ...ctx, frame }));
+    });
   }
 
   async function _doOpen(ctx) {
     try { await _openViewer(ctx); }
-    catch (err) { _logArtifactFailure('artifact_open_viewer', { error_message: String(err && err.message || err) }); _notifyFail(_t('artifact.open_failed', 'Could not open'), err); }
+    catch (err) { _logArtifactFailure('artifact_open_viewer', { error_code: 'artifact_operation_failed' }); _notifyFail(_t('artifact.open_failed', 'Could not open'), err); }
   }
 
   async function _doSave(ctx) {
-    if (ctx.frame?._orkasCommercial || ctx.frame?.dataset.appType === 'web') return window.OrkasCommercialEntry.show();
 
 
     let r;
     try {
-      r = await window.orkas.invoke('conversations.artifacts.save', {
-        cid: String(ctx.cid), artifactId: String(ctx.artifactId),
-        mode: ctx.saveMode || 'new',
-      });
-      if(r?.code==='app_edit_data_migration'&&ctx.saveMode==='update'){
-        const args={cid:String(ctx.cid),artifactId:String(ctx.artifactId)};
-        const impact=await window.orkas.invoke('conversations.artifacts.dataImpact',args);
-        if(window.OrkasCommercialEntry.isFailure(impact)) return window.OrkasCommercialEntry.show();
-        if(impact.ok){
-          const scope=impact.tables.map(table=>`${table.name}: ${table.count} (${table.fields.join(', ')})`).join('\n');
-          const exportFirst=await uiConfirm({message:_t('apps.migration_export')+'\n'+scope,okLabel:_t('apps.migration_export_action'),cancelLabel:_t('apps.migration_continue')});
-          if(exportFirst){const exported=await window.orkas.invoke('conversations.artifacts.exportData',args);if(window.OrkasCommercialEntry.isFailure(exported)) return window.OrkasCommercialEntry.show();if(!exported.ok||exported.canceled){if(!exported.canceled)_logArtifactSaveFailure(_artifactSaveFailure(exported,'operation'));return;}}
-          const confirmed=await uiConfirmDanger({message:_t('apps.migration_clear')+'\n'+scope,dangerLabel:_t('apps.migration_retry')});
-          if(!confirmed){return;}
-          r=await window.orkas.invoke('conversations.artifacts.save',{...args,mode:'update',recovery:{clearVersion:impact.version,clearFingerprint:impact.fingerprint}});
-        }
+      r = await window.OrkasAppSave.save('conversations.artifacts.save', {
+        cid: String(ctx.cid), artifactId: String(ctx.artifactId), mode: ctx.saveMode || 'auto',
+      }, _t);
+      if (r?.canceled) {
+        return;
       }
     } catch (err) {
       const failure = _artifactSaveFailure(err, 'ipc');
@@ -520,7 +524,6 @@
       return;
     }
     if (!r || r.ok === false) {
-      if (window.OrkasCommercialEntry.isFailure(r)) return window.OrkasCommercialEntry.show();
       const failure = _artifactSaveFailure(r, 'operation');
 
       _logArtifactSaveFailure(failure);
@@ -595,18 +598,15 @@
     frame.dataset.artifactId = String(ctx.artifactId);
     frame.dataset.artifactAgent = String(ctx.agentId || '');
     frame.dataset.artifactTitle = title;
+    frame.dataset.artifactRevision = String(ctx.revision || 0);
     frame.style.height = `${DEFAULT_FRAME_HEIGHT}px`;
-    frame.addEventListener('orkas-app-error', event => {
-      event.preventDefault();
-      if (window.OrkasCommercialEntry.isFailure(event.detail)) { _showCommercialUnavailable(frame); return; }
-      frame._orkasLoadFailed = true;
-      _showArtifactUnavailable(frame, '', () => _doReload({ ...ctx, frame }));
-    });
+    _bindArtifactLoadFailure(frame, ctx);
     window.OrkasWebAppHost.open(frame, { cid: ctx.cid, artifactId: ctx.artifactId });
 
     moreBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      _openMenu(moreBtn, { frame, cid: ctx.cid, artifactId: ctx.artifactId, title, agentId: ctx.agentId || '' });
+      const currentFrame = card.querySelector('iframe.chat-artifact-frame');
+      _openMenu(moreBtn, { frame: currentFrame, cid: ctx.cid, artifactId: ctx.artifactId, title: currentFrame.dataset.artifactTitle, agentId: ctx.agentId || '' });
     });
 
     card.appendChild(header);
@@ -615,14 +615,26 @@
     _checkArtifactAvailability(frame, ctx);
   }
 
-  // Render every artifact on a message into the given bubble. Idempotent —
-  // skips ids already mounted in this bubble (the finalize / append paths
-  // can both touch the same bubble).
+  // One card per conversation/app identity. Revisions can arrive from live
+  // callbacks, final messages or history replay; only newer ones reload it.
   function mountMessageArtifacts(bubbleEl, artifacts, cid) {
     if (!bubbleEl || !Array.isArray(artifacts) || !artifacts.length) return;
     for (const a of artifacts) {
       if (!a || !a.id) continue;
-      if (bubbleEl.querySelector(`iframe.chat-artifact-frame[data-artifact-id="${CSS.escape(String(a.id))}"]`)) continue;
+      const selector = `iframe.chat-artifact-frame[data-artifact-id="${CSS.escape(String(a.id))}"]`;
+      const existing = bubbleEl.querySelector(selector)
+        || Array.from(document.querySelectorAll(selector)).find(frame => frame.dataset.artifactCid === String(cid));
+      if (existing && existing.dataset.artifactCid === String(cid)) {
+        const revision = Number.isSafeInteger(a.revision) && a.revision > 0 ? a.revision : 0;
+        if (revision > Number(existing.dataset.artifactRevision || 0)) {
+          existing.dataset.artifactRevision = String(revision);
+          existing.dataset.artifactTitle = a.title || _t('artifact.title', 'Interactive app');
+          const label = existing.parentNode.querySelector('.chat-artifact-title');
+          if (label) { label.textContent = existing.dataset.artifactTitle; label.title = existing.dataset.artifactTitle; }
+          _doReload({ frame: existing, cid, artifactId: a.id });
+        }
+        continue;
+      }
       const host = document.createElement('div');
       host.className = 'chat-artifact-host';
       bubbleEl.appendChild(host);
@@ -631,6 +643,7 @@
         artifactId: a.id,
         title: a.title || '',
         agentId: a.agent_id || '',
+        revision: a.revision,
       });
     }
   }

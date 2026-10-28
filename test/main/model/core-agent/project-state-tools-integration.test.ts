@@ -117,6 +117,8 @@ describe('project state tools → durable feature stores', () => {
     } finally { clock.mockRestore(); }
   });
 
+
+
   it('resolves global task owners only from the enabled account registry and rejects scope overrides', async () => {
     const agents = await import('../../../../src/main/features/agents');
     const users = await import('../../../../src/main/features/users');

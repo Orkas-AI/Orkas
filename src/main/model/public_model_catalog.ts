@@ -79,6 +79,7 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
   ],
   google: [
     { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', maxInputImages: 20 },
+    { id: 'gemini-4-argon', name: 'Gemini 4 Argon', maxInputImages: 20 },
     { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', maxInputImages: 20 },
     { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (preview)', maxInputImages: 20 },
     { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', maxInputImages: 20 },
@@ -98,16 +99,19 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'k2p7', name: 'Kimi K2.7 Code', hiddenFromPicker: true },
   ],
   'minimax-cn': [
+    { id: 'MiniMax-M3.1-Flash', name: 'MiniMax M3.1 Flash', template: 'MiniMax-M3', contextWindow: 1_000_000, maxTokens: 131072, maxInputImages: 20 },
     { id: 'MiniMax-M3', name: 'MiniMax 3' },
-    { id: 'MiniMax-M2.7', name: 'MiniMax 2.7' },
+    { id: 'MiniMax-M2.7', name: 'MiniMax 2.7', hiddenFromPicker: true },
   ],
   'minimax-portal': [
+    { id: 'MiniMax-M3.1-Flash', name: 'MiniMax M3.1 Flash', template: 'MiniMax-M3', contextWindow: 1_000_000, maxTokens: 131072, maxInputImages: 20 },
     { id: 'MiniMax-M3', name: 'MiniMax 3' },
-    { id: 'MiniMax-M2.7', name: 'MiniMax 2.7' },
+    { id: 'MiniMax-M2.7', name: 'MiniMax 2.7', hiddenFromPicker: true },
   ],
   'minimax-portal-cn': [
+    { id: 'MiniMax-M3.1-Flash', name: 'MiniMax M3.1 Flash', template: 'MiniMax-M3', contextWindow: 1_000_000, maxTokens: 131072, maxInputImages: 20 },
     { id: 'MiniMax-M3', name: 'MiniMax 3' },
-    { id: 'MiniMax-M2.7', name: 'MiniMax 2.7' },
+    { id: 'MiniMax-M2.7', name: 'MiniMax 2.7', hiddenFromPicker: true },
   ],
   deepseek: [
     { id: 'deepseek-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1_000_000, maxTokens: 128_000, supportsVision: true, maxInputImages: 600 },
@@ -143,6 +147,7 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'openai/gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'openai/gpt-5.5', maxInputImages: 20 },
     { id: 'openai/gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'openai/gpt-5.5', maxInputImages: 20 },
     { id: 'google/gemini-3.8-flash', name: 'Gemini 3.8 Flash', maxInputImages: 20 },
+    { id: 'google/gemini-4-argon', name: 'Gemini 4 Argon', maxInputImages: 20 },
     { id: 'google/gemini-3.7-flash', name: 'Gemini 3.7 Flash', maxInputImages: 20 },
     { id: 'google/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (preview)', maxInputImages: 20 },
     { id: 'google/gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', maxInputImages: 20 },

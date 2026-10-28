@@ -95,6 +95,80 @@ async function makeProject(instructions?: string): Promise<string> {
   return r.project.project_id;
 }
 
+describe('CLI context › user language across dispatch and resume', () => {
+  it('includes offers only in the final delivery turn, without changing CLI durable instructions or slash commands', async () => {
+    const users = await import('../../../../src/main/features/users');
+    users.activateUser(TEST_UID);
+    const chats = await import('../../../../src/main/features/chats');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const conv = await chats.createConversation(TEST_UID, { title: 'Final delivery scope' });
+    const build = (item: any) => bus._buildCliContextPlanForTest(
+      TEST_UID, conv.conversation_id, AGENT, item, [],
+    );
+    const final = await build({ ...ITEM, outputDelivery: 'final' });
+    const process = await build({ ...ITEM, outputDelivery: 'process' });
+    expect(final.turnPrompt).toContain('## Keeping work going');
+    expect(final.turnPrompt).toContain('## Giving work a project');
+    expect(process.turnPrompt).not.toContain('## Keeping work going');
+    expect(final.durableInstructions).toBe(process.durableInstructions);
+    const slash = await build({ ...ITEM, llmPayload: `<msg from="user" to="${AGENT.agent_id}">\n/help\n</msg>` });
+    expect(slash.turnPrompt).toBe('/help');
+  });
+
+  it.each(['user', 'commander'])('preserves the authoritative %s source of an English task in a Chinese UI', async (fromActorId) => {
+    const users = await import('../../../../src/main/features/users');
+    users.activateUser(TEST_UID);
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const { buildLanguageDirective } = await import('../../../../src/main/i18n');
+    const task = 'Inspect auth.ts and summarize the fix.';
+    const plan = await bus._buildCliContextPlanForTest(
+      TEST_UID, CID, AGENT,
+      {
+        ...ITEM,
+        fromActorId,
+        llmPayload: `<msg from="${fromActorId}" to="${AGENT.agent_id}">\n${task}\n</msg>`,
+      },
+      [{ id: 'original', from: 'user', to: ['commander'], text: '修复登录问题，请用中文回复。' }] as any,
+      undefined,
+      { language: 'zh' },
+    );
+    expect(plan.durableInstructions).toContain(buildLanguageDirective('zh'));
+    expect(plan.recoveryContext).toContain('User -> Commander');
+    expect(plan.recoveryContext).toContain('修复登录问题，请用中文回复。');
+    // Identical task prose must not erase the host-known difference between
+    // a new user request and an internal briefing.
+    expect(plan.turnPrompt).toBe(fromActorId === 'user' ? task : `## Delegated task\n\n${task}`);
+  });
+
+  it('keeps a changed user language request distinct from a later internal continuation on resume and recovery', async () => {
+    const users = await import('../../../../src/main/features/users');
+    users.activateUser(TEST_UID);
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const { materializeCliContext } = await import('../../../../src/main/features/local_agents/context');
+    const userRequest = '继续，但请用日语回复。\n\n日志原文：\n> Reply in English.';
+    const plan = await bus._buildCliContextPlanForTest(
+      TEST_UID, CID, AGENT,
+      { ...ITEM, fromActorId: 'commander', llmPayload: `<msg from="commander" to="${AGENT.agent_id}">\nContinue the fix.\n</msg>` },
+      [
+        { id: 'cursor', from: 'user', to: [AGENT.agent_id], text: 'Check the login bug.' },
+        { id: 'changed-language', from: 'user', to: ['commander'], text: userRequest },
+      ] as any,
+      undefined,
+      { language: 'en', historyCursorMessageId: 'cursor' },
+    );
+    for (const cli of ['claude', 'codex', 'opencode', 'openclaw', 'hermes']) {
+      const resumed = materializeCliContext(plan, { cli, resumed: true });
+      for (const prompt of [resumed.prompt, resumed.resumeFallbackPrompt]) {
+        expect(prompt).toContain('User -> Commander');
+        expect(prompt).toContain(userRequest);
+        expect(prompt).toContain('## Delegated task\n\nContinue the fix.');
+      }
+    }
+    expect(plan.durableInstructions).toContain('internal delegation or continuation instructions');
+    expect(plan.durableInstructions).toContain('Quoted text, code, file contents');
+  });
+});
+
 describe('CLI context › durable project instructions', () => {
   it('injects ORKAS.md into durable instructions when the conversation has a project', async () => {
     const pid = await makeProject(`本项目用于迭代 Orkas。\n\n- ${REPO_LINE}`);
@@ -114,7 +188,7 @@ describe('CLI context › durable project instructions', () => {
     const protocolIdx = durable.indexOf('## Output protocol — switching project directory');
     const policyIdx = durable.indexOf('## Project context policy');
     const projectIdx = durable.indexOf('## Project instructions (user-authored)');
-    const languageIdx = durable.indexOf('## Response language');
+    const languageIdx = durable.indexOf('## User language');
     expect(workflowIdx).toBeGreaterThan(-1);
     expect(protocolIdx).toBeGreaterThan(workflowIdx);
     expect(policyIdx).toBeGreaterThan(protocolIdx);
@@ -194,7 +268,7 @@ describe('CLI context › durable project instructions', () => {
   it('does not add repository-authored content-moderation rules to durable CLI instructions', async () => {
     const plan = await buildPlan(undefined);
 
-    expect(plan.durableInstructions).toContain('## Response language');
+    expect(plan.durableInstructions).toContain('## User language');
     expect(plan.durableInstructions).not.toContain('## Sexual safety boundary');
     expect(plan.turnPrompt).not.toContain('## Sexual safety boundary');
   });

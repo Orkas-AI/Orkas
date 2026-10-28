@@ -49,6 +49,20 @@ describe('operation timeout settlement', () => {
     vi.useFakeTimers();
   });
 
+  it('lets an owner cancel a silent operation without a timeout or late recovery', async () => {
+    const controller = new AbortController();
+    const recovery = vi.fn();
+    const request = withOperationTimeout(new Promise(() => {}), {
+      timeoutMs: 60_000, code: 'E_TIMEOUT', stage: 'extract',
+      signal: controller.signal, onLateSettlement: recovery,
+    });
+    const rejected = expect(request).rejects.toThrow('owner stopped');
+    controller.abort(new Error('owner stopped'));
+    await rejected;
+    expect(vi.getTimerCount()).toBe(0);
+    expect(recovery).not.toHaveBeenCalled();
+  });
+
   it('preserves a successful or failed operation that settles before its deadline', async () => {
     await expect(withOperationTimeout(Promise.resolve('ready'), {
       timeoutMs: 1_000,

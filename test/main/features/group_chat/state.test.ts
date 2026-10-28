@@ -42,6 +42,46 @@ describe('group_chat state › sessionId builders', () => {
   });
 });
 
+describe('group_chat state › durable executing turn identity', () => {
+  it('retains each turn across other state writes and clears only the settled actor', async () => {
+    const state = await import('../../../../src/main/features/group_chat/state');
+    await state.setStatus(TEST_UID, TEST_CID, 'running');
+    const a = { turn_id: 'turn-a', source_message_id: 'source-a' };
+    const b = { turn_id: 'turn-b', source_message_id: 'source-b' };
+    await state.markInFlight(TEST_UID, TEST_CID, 'agent-a', true, a);
+    await state.markInFlight(TEST_UID, TEST_CID, 'agent-b', true, b);
+    await state.markInFlight(TEST_UID, TEST_CID, 'agent-a', true);
+    await state.setActiveRecipient(TEST_UID, TEST_CID, 'agent-b', 'user_selection');
+    vi.resetModules();
+    const reloaded = await import('../../../../src/main/features/group_chat/state');
+    expect(await reloaded.readState(TEST_UID, TEST_CID)).toMatchObject({
+      in_flight: ['agent-a', 'agent-b'], in_flight_turns: { 'agent-a': a, 'agent-b': b },
+    });
+    await reloaded.markInFlight(TEST_UID, TEST_CID, 'agent-a', false);
+    expect(await reloaded.readState(TEST_UID, TEST_CID)).toMatchObject({
+      in_flight: ['agent-b'], in_flight_turns: { 'agent-b': b },
+    });
+    expect((await reloaded.readState(TEST_UID, TEST_CID)).in_flight_turns?.['agent-a']).toBeUndefined();
+    await reloaded.setStatus(TEST_UID, TEST_CID, 'idle');
+    expect((await reloaded.readState(TEST_UID, TEST_CID)).in_flight_turns).toBeUndefined();
+  });
+
+  it('reads legacy and malformed turn metadata without losing the actor roster or retaining foreign entries', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const file = paths.groupChatStateFile(TEST_UID, TEST_CID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    for (const metadata of [undefined, [], 'invalid', { 'agent-a': { turn_id: 'turn-a', source_message_id: 'source-a', extra: 'drop' },
+      'agent-b': { turn_id: '../bad', source_message_id: 'source-b' }, foreign: { turn_id: 'turn-c', source_message_id: 'source-c' } }]) {
+      fs.writeFileSync(file, JSON.stringify({ version: 1, status: 'running', in_flight: ['agent-a', 'agent-b'], in_flight_turns: metadata }));
+      const current = await state.readState(TEST_UID, TEST_CID);
+      expect(current.in_flight).toEqual(['agent-a', 'agent-b']);
+      expect(current.in_flight_turns).toEqual(metadata && !Array.isArray(metadata) && typeof metadata === 'object'
+        ? { 'agent-a': { turn_id: 'turn-a', source_message_id: 'source-a' } } : undefined);
+    }
+  });
+});
+
 describe('group_chat state › addMember + ensureAgentMember', () => {
   it('addMember idempotent — second call with same id returns false', async () => {
     const s = await import('../../../../src/main/features/group_chat/state');

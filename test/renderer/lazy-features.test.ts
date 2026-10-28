@@ -5,26 +5,15 @@ import * as vm from 'node:vm';
 
 function loadFeatureLoader(onAppend?: (script: any, context: any) => void) {
   const appended: any[] = [];
-  const telemetry = {
-    events: [] as Array<{ action: string; data: Record<string, unknown> }>,
-    errors: [] as Array<{ action: string; data: Record<string, unknown> }>,
-  };
+  const warnings: unknown[][] = [];
   const context: any = {
     Map,
     Promise,
     Error,
     Object,
     String,
-    window: {
-      Monitor: {
-        event(action: string, data: Record<string, unknown>) {
-          telemetry.events.push({ action, data });
-        },
-        error(action: string, data: Record<string, unknown>) {
-          telemetry.errors.push({ action, data });
-        },
-      },
-    },
+    window: {},
+    console: { warn: (...args: unknown[]) => warnings.push(args) },
     document: {
       createElement: () => ({ dataset: {} }),
       head: {
@@ -41,12 +30,12 @@ function loadFeatureLoader(onAppend?: (script: any, context: any) => void) {
   vm.createContext(context);
   const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/lazy-features.js'), 'utf8');
   vm.runInContext(source, context, { filename: 'lazy-features.js' });
-  return { context, appended, telemetry };
+  return { context, appended, warnings };
 }
 
 describe('renderer lazy feature loader', () => {
   it('loads the Settings bundle in declared classic-script order and shares concurrent work', async () => {
-    const { context, appended, telemetry } = loadFeatureLoader();
+    const { context, appended } = loadFeatureLoader();
 
     const first = context.loadRendererFeature('settings');
     const second = context.loadRendererFeature('settings');
@@ -59,12 +48,10 @@ describe('renderer lazy feature loader', () => {
       './modules/task-cleanup.js',
     ]);
     expect(appended.every((script) => script.async === false)).toBe(true);
-    expect(telemetry.events).toEqual([]);
-    expect(telemetry.errors).toEqual([]);
   });
 
   it('does not fail marketplace loading when the optional dev enhancer is absent', async () => {
-    const { context, appended, telemetry } = loadFeatureLoader((script) => {
+    const { context, appended } = loadFeatureLoader((script) => {
       if (script.src.endsWith('marketplace_dev.js')) script.onerror();
       else script.onload();
     });
@@ -74,8 +61,6 @@ describe('renderer lazy feature loader', () => {
       './modules/semver.js',
       './modules/marketplace.js',
     ]);
-    expect(telemetry.events).toEqual([]);
-    expect(telemetry.errors).toEqual([]);
   });
 
   it('loads public Agent and Skill surfaces without private publishing modules', async () => {
@@ -106,7 +91,7 @@ describe('renderer lazy feature loader', () => {
 
   it('retries a required script while reusing scripts that already loaded', async () => {
     let contextAttempts = 0;
-    const { context, appended, telemetry } = loadFeatureLoader((script) => {
+    const { context, appended } = loadFeatureLoader((script) => {
       if (script.src.endsWith('contexts.js') && contextAttempts++ === 0) script.onerror();
       else script.onload();
     });
@@ -119,17 +104,16 @@ describe('renderer lazy feature loader', () => {
       './modules/contexts.js',
       './modules/kb-picker.js',
     ]);
-    expect(telemetry.events).toEqual([]);
-    expect(telemetry.errors).toEqual([]);
   });
 
   it('collapses unknown feature names before reporting a bounded failure', async () => {
-    const { context, telemetry } = loadFeatureLoader();
+    const { context, warnings } = loadFeatureLoader();
 
     await expect(context.loadRendererFeature('private-feature-name')).rejects.toThrow('unknown renderer feature');
+    expect(warnings).toEqual([['[renderer-feature]', { result: 'failure', feature: 'unknown',
+      duration_ms: expect.any(Number), retry_count: 0, error_code: 'unknown_feature' }]]);
+    expect(JSON.stringify(warnings)).not.toContain('private-feature-name');
 
-    expect(telemetry.events).toEqual([]);
-    expect(telemetry.errors).toEqual([]);
   });
 
   it('keeps tab-only project, Library, apps, and devtools scripts out of the eager HTML', async () => {
@@ -161,6 +145,7 @@ describe('renderer lazy feature loader', () => {
     await context.loadRendererFeature('project');
     expect(appended.map((script) => script.src)).toEqual([
       './modules/library-transfer.js',
+      './modules/date-picker.js',
       './modules/project-detail.js',
       './modules/todos.js',
     ]);
@@ -169,6 +154,7 @@ describe('renderer lazy feature loader', () => {
 
     expect(appended.map((script) => script.src)).toEqual([
       './modules/library-transfer.js',
+      './modules/date-picker.js',
       './modules/project-detail.js',
       './modules/todos.js',
       './modules/auto.js',

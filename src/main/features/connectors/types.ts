@@ -88,6 +88,7 @@ export type ConnectorStatus =
    *  began again from zero. These two fields are persisted precisely so a cooldown survives restart. */
   | {
     kind: 'degraded';
+    /** Closed diagnostic only; older clients ignore this additive metadata. */
     message: string;
     at: number;
     last_verified_at?: number;

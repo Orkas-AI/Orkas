@@ -24,7 +24,6 @@ import {
   type BackendRunOptions,
   StderrTail,
   spawnCli,
-  bindAbort,
   armKillWatchdog,
   reapCliAfterProtocolTerminal,
   LineSplitter,
@@ -40,6 +39,9 @@ export interface AcpBackendDef {
   /** Use the stabilized `session/resume` lifecycle when the runner supplies a
    * native session id. Backends that omit this continue with fresh sessions. */
   resume?: boolean;
+  /** Fresh Hermes model selection rebuilds its Agent and loses session MCP tools.
+   * Rebind them through advertised session/load before the first prompt. */
+  refreshMcpAfterModelSelection?: boolean;
   /** Extra env vars to merge with `process.env` when spawning. */
   extraEnv?: Record<string, string> | ((opts: BackendRunOptions) => Record<string, string>);
 }
@@ -52,7 +54,6 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       const extraEnv = typeof def.extraEnv === 'function' ? def.extraEnv(opts) : def.extraEnv;
       const env = extraEnv ? { ...process.env, ...extraEnv } : process.env;
       const child = spawnCli(opts.binPath, argv, opts.cwd, env);
-      const detachAbort = bindAbort(child, opts.signal);
       const tail = new StderrTail();
       const startedAt = Date.now();
       const diagnostics = new AcpDiagnostics();
@@ -90,6 +91,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         deadlineAt: opts.deadlineAt,
         idleKillMs: opts.idleKillMs,
         lastEventAt: opts.lastEventAt,
+        terminate: () => cancelAndReap(),
       });
 
       const send = (msg: object) => {
@@ -99,6 +101,25 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         try { child.stdin.write(JSON.stringify(msg) + '\n'); }
         catch (err) { log.warn('acp stdin write failed', { error: logErrorSummary(err) }); }
       };
+
+      // Hermes foreground commands create their own POSIX process groups.
+      // The native ACP interrupt stops those tools; killing only the ACP
+      // process group first would orphan them. Bound native cleanup before
+      // retaining the existing TERM/KILL fallback for an unresponsive CLI.
+      let cancellationRequested = false;
+      const cancelAndReap = () => {
+        if (cancellationRequested) return;
+        cancellationRequested = true;
+        if (!exited && sessionId && promptSent) {
+          send({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
+          const cleanup = setTimeout(() => reapCliAfterProtocolTerminal(child), 500);
+          child.once('close', () => clearTimeout(cleanup));
+          cleanup.unref?.();
+        } else {
+          reapCliAfterProtocolTerminal(child);
+        }
+      };
+      const detachAbort = () => opts.signal.removeEventListener('abort', cancelAndReap);
 
       // Step 1: initialize
       send({
@@ -138,8 +159,10 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       const splitter = new LineSplitter();
       let modelSetTimer: NodeJS.Timeout | undefined;
       let promptSent = false;
+      if (opts.signal.aborted) cancelAndReap();
+      else opts.signal.addEventListener('abort', cancelAndReap, { once: true });
       const sendPrompt = (id: string) => {
-        if (promptSent) return;
+        if (promptSent || cancellationRequested || opts.signal.aborted || watchdog.fired()) return;
         promptSent = true;
         if (modelSetTimer) clearTimeout(modelSetTimer);
         send({
@@ -151,6 +174,9 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         });
       };
       let sessionConfiguration: any;
+      let supportsSessionLoad = false;
+      let needsMcpRefresh = false;
+      let mcpRefreshPending = false;
       let pendingSelection: { configId?: string; value: string } | undefined;
       const selections = [
         ...(opts.modelOverride ? [{ category: 'model', value: opts.modelOverride }] : []),
@@ -163,8 +189,20 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         finishProtocol();
       };
       const applyNextSelection = (id: string) => {
+        if (cancellationRequested || opts.signal.aborted || watchdog.fired()) return;
         const selection = selections.shift();
-        if (!selection) { sendPrompt(id); return; }
+        if (!selection) {
+          if (needsMcpRefresh && opts.bridge && def.refreshMcpAfterModelSelection && !requestedResumeId) {
+            if (!supportsSessionLoad) { failSelection('model'); return; }
+            needsMcpRefresh = false;
+            mcpRefreshPending = true;
+            send({ jsonrpc: '2.0', id: 4, method: 'session/load', params: { sessionId: id, cwd: opts.cwd, mcpServers } });
+            const remaining = opts.deadlineAt === undefined ? opts.timeoutMs : opts.deadlineAt - Date.now();
+            modelSetTimer = setTimeout(() => failSelection('model'), Math.max(1, Math.min(15_000, remaining)));
+            modelSetTimer.unref?.();
+          } else sendPrompt(id);
+          return;
+        }
         const configs = sessionConfiguration?.configOptions;
         if (Array.isArray(configs)) {
           const config = configs.find((option: any) => option?.category === selection.category
@@ -179,13 +217,17 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             || config.type !== 'select' || !values.some((option: any) => option?.value === selection.value)) {
             failSelection(selection.category); return;
           }
+          if (config.currentValue === selection.value) { applyNextSelection(id); return; }
           pendingSelection = { configId: config.id, value: selection.value };
+          if (selection.category === 'model') needsMcpRefresh = true;
           send({ jsonrpc: '2.0', id: 3, method: 'session/set_config_option',
             params: { sessionId: id, configId: config.id, value: selection.value } });
         } else if (selection.category === 'model') {
           // Legacy Hermes 0.9 exposes its setter without configOptions. A
           // rejection or absent acknowledgment must never run the default model.
+          if (sessionConfiguration?.models?.currentModelId === selection.value) { applyNextSelection(id); return; }
           pendingSelection = { value: selection.value };
+          needsMcpRefresh = true;
           send({ jsonrpc: '2.0', id: 3, method: 'session/set_model',
             params: { sessionId: id, modelId: selection.value } });
         } else { applyNextSelection(id); return; }
@@ -287,7 +329,16 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             }).finally(() => diagnostics.permissionEnded());
             return;
           }
-          if (Number(env.id) === 1 && !env.error) sendSessionStart();
+          if (Number(env.id) === 1 && !env.error) {
+            supportsSessionLoad = env.result?.agentCapabilities?.loadSession === true;
+            sendSessionStart();
+          }
+          if (Number(env.id) === 4 && sessionId && mcpRefreshPending) {
+            mcpRefreshPending = false;
+            if (modelSetTimer) clearTimeout(modelSetTimer);
+            if (env.error || !env.result || typeof env.result !== 'object') { failSelection('model'); return; }
+            sendPrompt(sessionId); return;
+          }
           if (Number(env.id) === 3 && sessionId && pendingSelection) {
             if (modelSetTimer) clearTimeout(modelSetTimer);
             const selection = pendingSelection; pendingSelection = undefined;
@@ -366,13 +417,18 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       const initTimer = setTimeout(sendSessionStart, 250);
       if (typeof initTimer.unref === 'function') initTimer.unref();
 
+      const stderrLines = new LineSplitter(64 * 1024);
+      const stderrLine = (line: string) => {
+        if (line) opts.onEvent({ type: 'stderr-line', line });
+      };
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', chunk => {
         if (exited) return;
         diagnostics.bytes('stderr');
         tail.push(chunk);
+        stderrLines.push(chunk, stderrLine);
+        // Preserve the existing error-hint interpretation on received chunks.
         for (const line of chunk.split(/\r?\n/)) {
-          if (line) opts.onEvent({ type: 'stderr-line', line });
           // Sniff for upstream-provider failures hermes prints just
           // before silently returning end_turn. The most useful line
           // is the "Error: HTTP 400: ..." one with the API's message;
@@ -391,6 +447,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) => {
           if (exited) return;
           exited = true;
+          stderrLines.flush(stderrLine);
           watchdog.disarm();
           clearTimeout(initTimer);
           if (modelSetTimer) clearTimeout(modelSetTimer);
@@ -414,6 +471,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         };
         finishProtocol = () => {
           if (exited) return;
+          stderrLines.flush(stderrLine);
           endReason = 'protocol';
           try {
             if (opts.signal.aborted) return finish('cancelled', { output: resultText });
@@ -436,7 +494,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             // The protocol response ends this one-shot dispatch. Cleanup owns
             // its own bounded lifetime; inherited pipes or a persistent server
             // must not keep the turn open or replace its outcome with timeout.
-            reapCliAfterProtocolTerminal(child);
+            if (!cancellationRequested) reapCliAfterProtocolTerminal(child);
           }
         };
         child.on('error', err => {
@@ -452,6 +510,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         });
         child.on('close', code => {
           if (exited) return;
+          stderrLines.flush(stderrLine);
           processState = 'close';
           if (opts.signal.aborted) return finish('cancelled', { output: resultText });
           if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output: resultText, stderrTail: tail.toString() });

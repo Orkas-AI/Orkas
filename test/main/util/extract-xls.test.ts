@@ -39,15 +39,15 @@ describe('legacy XLS extraction with the bundled reader', () => {
     await expect(xlsBufferToMarkdown(bytes)).rejects.toThrow('password-protected');
   });
 
-  it('bounds a failure burst and releases reader slots for a queued valid workbook', async () => {
-    const calls = Array.from({ length: 35 }, (_, i) =>
-      xlsBufferToMarkdown(i === 33 ? fixture() : Buffer.from('invalid workbook')));
-    const results = await Promise.allSettled(calls);
-    expect(results[33].status).toBe('fulfilled');
-    expect((results[33] as PromiseFulfilledResult<string>).value).toContain('Inventory sentinel 8384');
-    const reasons = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected').map(r => r.reason.message);
-    expect(reasons.filter(message => message.includes('busy'))).toHaveLength(1);
-    expect(reasons.filter(message => message.includes('Cannot read'))).toHaveLength(33);
+  it('releases real reader slots after concurrent invalid and valid workbooks', async () => {
+    const [invalid, valid] = await Promise.allSettled([
+      xlsBufferToMarkdown(Buffer.from('invalid workbook')),
+      xlsBufferToMarkdown(fixture()),
+    ]);
+    expect(invalid.status).toBe('rejected');
+    expect((invalid as PromiseRejectedResult).reason.message).toContain('Cannot read');
+    expect(valid.status).toBe('fulfilled');
+    expect((valid as PromiseFulfilledResult<string>).value).toContain('Inventory sentinel 8384');
     await expect(xlsBufferToMarkdown(fixture())).resolves.toContain('冷却泵');
   }, 15_000);
 

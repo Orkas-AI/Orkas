@@ -56,6 +56,15 @@ function stampFromStats(st: fs.Stats, hash?: string): ReadStamp {
   return { mtimeMs: st.mtimeMs, size: st.size, ...(hash ? { hash } : {}) };
 }
 
+/** The stamp a host seeds for a file whose complete decoded text it put in
+ *  front of the model itself (see `AgentRunParams.initialReadFileState`).
+ *  `hash` must be the same `sha256:` digest of the UTF-8 re-encoded text
+ *  that `edit_file` computes, so a later edit compares content, not only
+ *  metadata. */
+export function readStampFromStats(st: fs.Stats, hash: string): ReadStamp {
+  return stampFromStats(st, hash);
+}
+
 /** Record that `abs` was read (or written) at its current on-disk state, so a
  *  later `edit_file` accepts an edit built on these bytes. Best-effort: a stat
  *  failure is swallowed (the edit path re-stats and will reject if needed).

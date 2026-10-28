@@ -55,14 +55,13 @@ import { chatAttachmentDir, chatAttachmentDraftDir, userChatAttachmentsDir } fro
 import {
   chatAttachmentDirForConversation,
   cachedChatAttachmentDirForConversation,
-  chatAttachmentRelPath,
   conversationMessageReadFile,
 } from '../util/project-layout';
 import { createLogger } from '../logger';
-import { renameWithRetry } from '../storage';
+import { linkWithRetry, renameWithRetry, writeJsonSync } from '../storage';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { t } from '../i18n';
-import { toCompressedGrayJpeg } from '../util/image-transform';
+import { toCompressedJpeg } from '../util/image-transform';
 import {
   invalidateFileCache,
   purgeFileCacheByCid,
@@ -122,6 +121,7 @@ const MAX_BYTES_ARCHIVE = 8 * 1024 * 1024;
 
 const MAX_FILENAME_LEN = 200;
 const MAX_CONVERSATION_ATTACHMENT_INDEX_FILES = 40;
+const GENERATED_ATTACHMENTS_FILE = '.generated-attachments.json';
 /** Composer boundary: one unsent message may reference at most this many
  * distinct attachments. Enforced in the storage layer so IPC, drag/drop and
  * any future callers cannot bypass the UI. */
@@ -148,7 +148,11 @@ export interface AttachmentInfo {
   mtime: number;      // epoch seconds
 }
 
-export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string; failure_kind?: FileFailureKind };
+type AttachmentErrorCode = 'invalid_attachment' | 'file_too_large' | 'invalid_utf8'
+  | 'too_many_attachments' | 'source_unavailable' | 'not_file' | 'read_failed' | 'write_failed' | 'copy_failed';
+export type Result<T = {}> = ({ ok: true } & T) | {
+  ok: false; error: string; failure_kind?: FileFailureKind; error_code?: AttachmentErrorCode;
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -229,9 +233,6 @@ function migrateLegacyDraftCloudDir(userId: string, cid: string): void {
   if (!fs.existsSync(legacy)) return;
 
   const local = chatAttachmentDraftDir(userId, cid);
-  let names: string[] = [];
-  try { names = fs.readdirSync(legacy).filter((n) => !n.startsWith('.')); }
-  catch { /* ignore */ }
 
   try {
     if (!fs.existsSync(local)) {
@@ -255,7 +256,6 @@ function migrateLegacyDraftCloudDir(userId: string, cid: string): void {
     return;
   }
 
-  for (const name of names) notifyAttachmentDeleted(userId, cid, name);
 }
 
 function attachmentDirForCid(userId: string, cid: string): string {
@@ -272,24 +272,57 @@ function ensureDir(userId: string, cid: string): string {
   return dir;
 }
 
-function notifyAttachmentDirty(userId: string, cid: string, name: string): void {
-  void userId;
-  void cid;
-  void name;
+/** Durable output ownership is independent of whether a final reply exists.
+ * Older pools have no ledger and retain their history-based draft recovery. */
+function generatedAttachmentNames(userId: string, cid: string): Set<string> {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(
+      path.join(attachmentDirForCid(userId, cid), GENERATED_ATTACHMENTS_FILE), 'utf8',
+    ));
+    if (!Array.isArray(value)) throw new Error('invalid generated attachment ledger');
+    return new Set(value.filter((name): name is string => typeof name === 'string'
+      && path.basename(name) === name && !name.startsWith('.')));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('generated attachment ownership read failed', { error: logErrorSummary(error) });
+    }
+    return new Set();
+  }
 }
 
-function notifyAttachmentDeleted(userId: string, cid: string, name: string): void {
-  void userId;
-  void cid;
-  void name;
+function saveGeneratedAttachmentNames(userId: string, cid: string, names: Set<string>): void {
+  const file = path.join(attachmentDirForCid(userId, cid), GENERATED_ATTACHMENTS_FILE);
+  if (names.size) {
+    writeJsonSync(file, [...names]);
+  } else if (fs.existsSync(file)) {
+    fs.unlinkSync(file);
+  }
 }
 
-function notifyAttachmentDirtyIfSyncable(userId: string, cid: string, name: string): void {
-  if (!isDraftAttachmentCid(cid)) notifyAttachmentDirty(userId, cid, name);
+function clearGeneratedAttachment(userId: string, cid: string, name: string): void {
+  const generated = generatedAttachmentNames(userId, cid);
+  if (generated.delete(name)) saveGeneratedAttachmentNames(userId, cid, generated);
 }
 
-function notifyAttachmentDeletedIfSyncable(userId: string, cid: string, name: string): void {
-  if (!isDraftAttachmentCid(cid)) notifyAttachmentDeleted(userId, cid, name);
+/** Record only actual files directly in this conversation's attachment pool.
+ * Workspace outputs and existing user inputs do not change composer ownership. */
+export function recordGeneratedAttachment(userId: string, cid: string, absPath: string): void {
+  const safeConvId = safeCid(cid);
+  if (!path.isAbsolute(absPath)) return;
+  const root = path.resolve(attachmentDirForCid(userId, safeConvId));
+  const resolved = path.resolve(absPath);
+  if (path.dirname(resolved) !== root) return;
+  const name = path.basename(resolved);
+  if (name.startsWith('.') || !ALLOWED_EXTENSIONS.has(path.extname(name).toLowerCase())) return;
+  try { if (!fs.statSync(resolved).isFile()) return; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  const names = generatedAttachmentNames(userId, safeConvId);
+  if (names.has(name)) return;
+  names.add(name);
+  saveGeneratedAttachmentNames(userId, safeConvId, names);
 }
 
 function uniqueTarget(dir: string, name: string): string {
@@ -331,6 +364,42 @@ async function withAttachmentWriteLock<T>(
   }
 }
 
+/** Publish complete selected bytes, or reuse an existing validated duplicate. */
+async function publishSelectedAttachment(dir: string, name: string, stage: (temp: string) => Promise<string | void>): Promise<string> {
+  // A short basename also supports valid near-limit Unicode attachment names.
+  const temp = path.join(dir, `.attachment-import-${crypto.randomUUID()}.tmp`);
+  let staged = false;
+  let owned = true;
+  try {
+    const existing = await stage(temp);
+    staged = true;
+    if (existing) return existing;
+    // Reuse Library import's exclusive inode publication: neither an app
+    // producer nor another filesystem writer can replace the winning name.
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const target = uniqueTarget(dir, name);
+      try { await linkWithRetry(temp, target); return target; }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err; }
+    }
+    throw new Error('could not allocate a unique attachment filename');
+  } catch (err) {
+    // Exclusive creation failed before we owned this random path.
+    if (!staged && (err as NodeJS.ErrnoException)?.code === 'EEXIST') owned = false;
+    throw err;
+  } finally {
+    if (owned) {
+      try { await fs.promises.rm(temp, { force: true }); }
+      catch (cleanupError) {
+        log.warn('attachment import staging cleanup failed', { error: logErrorSummary(cleanupError) });
+      }
+    }
+  }
+}
+
+class StagedAttachmentAdmissionError extends Error {
+  constructor(readonly errorCode: 'file_too_large' | 'invalid_utf8', message: string) { super(message); }
+}
+
 function attachmentInfoForPath(absPath: string, name = path.basename(absPath)): AttachmentInfo | null {
   const ext = path.extname(name).toLowerCase();
   if (!ALLOWED_EXTENSIONS.has(ext)) return null;
@@ -344,6 +413,19 @@ function attachmentInfoForPath(absPath: string, name = path.basename(absPath)): 
     kind: kindOf(ext),
     mtime: Math.floor(st.mtimeMs / 1000),
   };
+}
+
+/** Only new owned outputs may roll back; existing user/media files stay intact. */
+function commitNewGeneratedAttachment(userId: string, cid: string, target: string): Result {
+  try { recordGeneratedAttachment(userId, cid, target); }
+  catch (err) {
+    try { fs.unlinkSync(target); }
+    catch (cleanupError) {
+      log.warn('generated media ownership rollback failed', { error: logErrorSummary(cleanupError) });
+    }
+    return { ok: false, error: (err as Error).message };
+  }
+  return { ok: true };
 }
 
 /** Shared synchronous storage boundary for validated generated media bytes. */
@@ -373,10 +455,16 @@ function saveGeneratedMediaBytes(
   let target = '';
   for (let attempt = 0; attempt < 4; attempt += 1) {
     target = uniqueTarget(dir, safeName);
+    const temp = path.join(dir, `.attachment-import-${crypto.randomUUID()}.tmp`);
+    let staged = false;
+    let owned = true;
     try {
-      fs.writeFileSync(target, buffer, { flag: 'wx' });
+      fs.writeFileSync(temp, buffer, { flag: 'wx' });
+      staged = true;
+      fs.linkSync(temp, target);
       break;
     } catch (err) {
+      if (!staged && (err as NodeJS.ErrnoException).code === 'EEXIST') owned = false;
       if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
         target = '';
         continue;
@@ -385,6 +473,13 @@ function saveGeneratedMediaBytes(
         if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
       } catch { /* best-effort */ }
       return { ok: false, error: (err as Error).message };
+    } finally {
+      if (owned) {
+        try { fs.rmSync(temp, { force: true }); }
+        catch (cleanupError) {
+          log.warn('generated media staging cleanup failed', { error: logErrorSummary(cleanupError) });
+        }
+      }
     }
   }
   if (!target) return { ok: false, error: `could not allocate a unique generated ${kind} filename` };
@@ -394,7 +489,8 @@ function saveGeneratedMediaBytes(
     try { fs.unlinkSync(target); } catch { /* best-effort */ }
     return { ok: false, error: `generated ${kind} could not be verified after writing` };
   }
-  notifyAttachmentDirtyIfSyncable(userId, safeConvId, info.name);
+  const committed = commitNewGeneratedAttachment(userId, safeConvId, target);
+  if (committed.ok === false) return committed;
   log.info('generated media attachment stored', { bytes: info.bytes, kind: info.kind });
   return { ok: true, absPath: target, info };
 }
@@ -464,6 +560,8 @@ export async function saveGeneratedMediaCacheAttachment(
       if (existing.kind !== kind || existing.bytes > cap) {
         return { ok: false, error: 'stable generated media target is invalid' };
       }
+      try { recordGeneratedAttachment(userId, safeConvId, target); }
+      catch (err) { return { ok: false, error: (err as Error).message }; }
       return { ok: true, absPath: target, info: existing, reused: true };
     }
 
@@ -483,7 +581,8 @@ export async function saveGeneratedMediaCacheAttachment(
       try { fs.unlinkSync(target); } catch { /* best-effort */ }
       return { ok: false, error: `generated ${kind} could not be verified after writing` };
     }
-    notifyAttachmentDirtyIfSyncable(userId, safeConvId, safeName);
+    const committed = commitNewGeneratedAttachment(userId, safeConvId, target);
+    if (committed.ok === false) return committed;
     log.info('generated media cache attachment stored', { bytes: info.bytes, kind: info.kind });
     return { ok: true, absPath: target, info };
   });
@@ -545,18 +644,18 @@ export async function uploadAttachment(
   try {
     safeName = safeAttachmentName(name);
     safeConvId = safeCid(cid);
-  } catch (err) { return { ok: false, error: (err as Error).message }; }
+  } catch (err) { return { ok: false, error: (err as Error).message, error_code: 'invalid_attachment' }; }
 
   const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw || []);
   const ext = path.extname(safeName).toLowerCase();
   const cap = maxBytesFor(ext);
   if (buf.length > cap) {
-    return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }) };
+    return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }), error_code: 'file_too_large' };
   }
   if (TEXT_EXTS.has(ext)) {
     const s = buf.toString('utf8');
     if (!Buffer.from(s, 'utf8').equals(buf)) {
-      return { ok: false, error: t('errors.not_utf8') };
+      return { ok: false, error: t('errors.not_utf8'), error_code: 'invalid_utf8' };
     }
   }
 
@@ -580,12 +679,14 @@ export async function uploadAttachment(
       return {
         ok: false,
         error: t('errors.too_many_attachments', { max: MAX_PENDING_ATTACHMENTS_PER_MESSAGE }),
+        error_code: 'too_many_attachments',
       };
     }
 
-    const target = uniqueTarget(dir, safeName);
-    const finalName = path.basename(target);
-    try { fs.writeFileSync(target, buf); }
+    let target: string;
+    // Only publish complete bytes. A failed direct write could leave a short
+    // file that pending-attachment recovery would treat as a successful add.
+    try { target = await publishSelectedAttachment(dir, safeName, temp => fs.promises.writeFile(temp, buf, { flag: 'wx' })); }
     catch (err) {
       // Roll back the mkdir from `ensureDir` if the directory ended up empty
       // (i.e., this was the first attachment for the cid and the write failed
@@ -594,20 +695,21 @@ export async function uploadAttachment(
       try {
         if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
       } catch { /* best-effort */ }
-      return { ok: false, error: (err as Error).message };
+      return { ok: false, error: (err as Error).message, error_code: 'write_failed', failure_kind: fileFailureKind(err) };
     }
 
-    // No upload-time preprocessing: extract / grayscale happen lazily in
+    // No upload-time preprocessing: extraction / image compression happen lazily in
     // features/file_indexer when the model's tools first touch this file.
     // Video is display-only and never preprocessed.
 
+    const finalName = path.basename(target);
     const st = fs.statSync(target);
     const kind = kindOf(ext);
+    clearGeneratedAttachment(userId, safeConvId, finalName);
     log.info('attachment uploaded', {
       user_id: maskId(userId), cid: maskId(safeConvId),
       file: logPathRef(finalName), kind, bytes: st.size,
     });
-    notifyAttachmentDirtyIfSyncable(userId, safeConvId, finalName);
     return {
       ok: true,
       info: {
@@ -634,25 +736,25 @@ export async function importAttachmentFromPath(
   try {
     safeName = safeAttachmentName(name || path.basename(sourcePath || ''));
     safeConvId = safeCid(cid);
-  } catch (err) { return { ok: false, error: (err as Error).message, failure_kind: fileFailureKind(err) }; }
+  } catch (err) { return { ok: false, error: (err as Error).message, error_code: 'invalid_attachment', failure_kind: fileFailureKind(err) }; }
 
   const absSource = path.resolve(String(sourcePath || ''));
   let sourceStat: fs.Stats;
   try { sourceStat = fs.statSync(absSource); }
-  catch (err) { return { ok: false, error: 'file not found', failure_kind: fileFailureKind(err) }; }
-  if (!sourceStat.isFile()) return { ok: false, error: 'file not found' };
+  catch (err) { return { ok: false, error: 'file not found', error_code: 'source_unavailable', failure_kind: fileFailureKind(err) }; }
+  if (!sourceStat.isFile()) return { ok: false, error: 'file not found', error_code: 'not_file' };
 
   const ext = path.extname(safeName).toLowerCase();
   const cap = maxBytesFor(ext);
   if (sourceStat.size > cap) {
-    return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }) };
+    return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }), error_code: 'file_too_large' };
   }
   if (TEXT_EXTS.has(ext)) {
     let validUtf8: boolean;
     try { validUtf8 = await isUtf8File(absSource); }
-    catch (err) { return { ok: false, error: (err as Error).message, failure_kind: fileFailureKind(err) }; }
+    catch (err) { return { ok: false, error: (err as Error).message, error_code: 'read_failed', failure_kind: fileFailureKind(err) }; }
     if (!validUtf8) {
-      return { ok: false, error: t('errors.not_utf8') };
+      return { ok: false, error: t('errors.not_utf8'), error_code: 'invalid_utf8' };
     }
   }
 
@@ -660,13 +762,13 @@ export async function importAttachmentFromPath(
     const dir = ensureDir(userId, safeConvId);
     let incomingHash: string;
     try { incomingHash = await hashFile(absSource); }
-    catch (err) { return { ok: false, error: (err as Error).message, failure_kind: fileFailureKind(err) }; }
+    catch (err) { return { ok: false, error: (err as Error).message, error_code: 'read_failed', failure_kind: fileFailureKind(err) }; }
 
     // Match uploadAttachment: a historical file needs a new pool entry so
     // the newly-selected pending item can be reconstructed after restart.
     const pending = listPendingAttachments(userId, safeConvId);
     const pendingNames = new Set(pending.map((item) => item.name));
-    const duplicate = await findDuplicateByHash(dir, sourceStat.size, incomingHash, pendingNames);
+    let duplicate = await findDuplicateByHash(dir, sourceStat.size, incomingHash, pendingNames);
     if (duplicate) {
       log.info('attachment import reused', {
         user_id: maskId(userId), cid: maskId(safeConvId),
@@ -678,26 +780,54 @@ export async function importAttachmentFromPath(
       return {
         ok: false,
         error: t('errors.too_many_attachments', { max: MAX_PENDING_ATTACHMENTS_PER_MESSAGE }),
+        error_code: 'too_many_attachments',
       };
     }
 
-    const target = uniqueTarget(dir, safeName);
-    const finalName = path.basename(target);
-    try { await fs.promises.copyFile(absSource, target); }
+    let target: string;
+    try {
+      // Keep in-flight and failed copies out of the public attachment pool.
+      target = await publishSelectedAttachment(dir, safeName, async temp => {
+        await fs.promises.copyFile(absSource, temp, fs.constants.COPYFILE_EXCL);
+        const copied = await fs.promises.stat(temp);
+        if (copied.size > cap) {
+          throw new StagedAttachmentAdmissionError('file_too_large',
+            t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }));
+        }
+        // The source may have changed after initial validation/hash. Bind
+        // admission and the dedupe receipt to the private completed snapshot.
+        // It can also change between UTF-8 preflight and the initial hash,
+        // so matching hashes cannot substitute for validating this snapshot.
+        if (TEXT_EXTS.has(ext) && !await isUtf8File(temp)) {
+          throw new StagedAttachmentAdmissionError('invalid_utf8', t('errors.not_utf8'));
+        }
+        const copiedHash = await hashFile(temp);
+        if (copiedHash !== incomingHash) {
+          incomingHash = copiedHash;
+          duplicate = await findDuplicateByHash(dir, copied.size, incomingHash, pendingNames);
+          if (duplicate) return path.join(dir, duplicate.name);
+        }
+      });
+    }
     catch (err) {
       try {
         if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
       } catch { /* best-effort */ }
-      return { ok: false, error: (err as Error).message, failure_kind: fileFailureKind(err) };
+      if (err instanceof StagedAttachmentAdmissionError) {
+        return { ok: false, error: err.message, error_code: err.errorCode };
+      }
+      return { ok: false, error: (err as Error).message, error_code: 'copy_failed', failure_kind: fileFailureKind(err) };
     }
 
+    if (duplicate) return { ok: true, info: duplicate, reused: true, sha256: incomingHash };
+    const finalName = path.basename(target);
     const st = fs.statSync(target);
     const kind = kindOf(ext);
+    clearGeneratedAttachment(userId, safeConvId, finalName);
     log.info('attachment imported', {
       user_id: maskId(userId), cid: maskId(safeConvId),
       file: logPathRef(finalName), kind, bytes: st.size,
     });
-    notifyAttachmentDirtyIfSyncable(userId, safeConvId, finalName);
     return {
       ok: true,
       info: {
@@ -747,12 +877,12 @@ export function listAttachments(userId: string, cid: string): AttachmentInfo[] {
  * already belong to prior messages.
  */
 export function listPendingAttachments(userId: string, cid: string): AttachmentInfo[] {
-  const all = listAttachments(userId, cid);
-  if (!all.length) return all;
-
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
-  catch { return all; }
+  catch { return []; }
+  const generated = generatedAttachmentNames(userId, safeConvId);
+  const all = listAttachments(userId, safeConvId).filter(item => !generated.has(item.name));
+  if (!all.length) return all;
 
   const jsonlPath = conversationMessageReadFile(userId, safeConvId);
   let raw: string;
@@ -853,6 +983,7 @@ export function deleteAttachment(userId: string, cid: string, name: string): Res
   if (!fs.existsSync(p)) return { ok: false, error: 'not found' };
   try { fs.unlinkSync(p); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
+  clearGeneratedAttachment(userId, safeConvId, safeName);
   // Drop the lazy file_cache entry for this source (if any was materialised).
   try { invalidateFileCache(userId, p); }
   catch (err) { log.warn('attachment cache invalidation failed', { file: logPathRef(p), error: logErrorSummary(err) }); }
@@ -862,7 +993,6 @@ export function deleteAttachment(userId: string, cid: string, name: string): Res
   try {
     if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
   } catch { /* best-effort */ }
-  notifyAttachmentDeletedIfSyncable(userId, safeConvId, safeName);
   return { ok: true };
 }
 
@@ -1330,6 +1460,7 @@ export async function adoptDraftAttachments(
     const src = attachmentDirForCid(userId, srcSafe);
     if (!fs.existsSync(src)) return { ok: true, count: 0, items: [] };
     const dst = chatAttachmentDirForConversation(userId, dstSafe);
+    const sourceGenerated = generatedAttachmentNames(userId, srcSafe);
     let sourceNames: string[] = [];
     try { sourceNames = fs.readdirSync(src).filter((n) => !n.startsWith('.')); }
     catch { /* ignore */ }
@@ -1343,6 +1474,7 @@ export async function adoptDraftAttachments(
         movedNames = sourceNames.map((name) => ({ source: name, target: name }));
       } else {
         for (const name of fs.readdirSync(src)) {
+          if (name === GENERATED_ATTACHMENTS_FILE) continue;
           const from = path.join(src, name);
           const target = uniqueTarget(dst, name);
           await moveDraftEntry(from, target);
@@ -1350,6 +1482,14 @@ export async function adoptDraftAttachments(
           if (!name.startsWith('.')) {
             movedNames.push({ source: name, target: path.basename(target) });
           }
+        }
+        if (sourceGenerated.size) {
+          const generated = generatedAttachmentNames(userId, dstSafe);
+          for (const item of movedNames) {
+            if (sourceGenerated.has(item.source)) generated.add(item.target);
+          }
+          saveGeneratedAttachmentNames(userId, dstSafe, generated);
+          fs.unlinkSync(path.join(src, GENERATED_ATTACHMENTS_FILE));
         }
         try { fs.rmdirSync(src); } catch { /* best-effort */ }
       }
@@ -1371,10 +1511,6 @@ export async function adoptDraftAttachments(
       return { ok: false, error: (err as Error).message };
     }
 
-    for (const name of movedNames) {
-      notifyAttachmentDeletedIfSyncable(userId, srcSafe, name.source);
-      notifyAttachmentDirty(userId, dstSafe, name.target);
-    }
     const count = movedNames.length;
     log.info('draft attachments adopted', {
       user_id: maskId(userId), from_cid: maskId(srcSafe), to_cid: maskId(dstSafe), count,
@@ -1412,7 +1548,6 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
   return withAttachmentWriteLock(userId, safeConvId, async () => {
     const dir = attachmentDirForCid(userId, safeConvId);
     let count = 0;
-    let names: string[] = [];
     try {
       const root = await fs.promises.lstat(dir).catch(err => {
         if (err.code === 'ENOENT') return null;
@@ -1433,14 +1568,11 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
         // rm removes links themselves; neither inventory nor removal follows
         // a linked directory into another task or an external workspace.
         await fs.promises.rm(dir, { recursive: true, force: true });
-        count = files.length;
-        names = files.filter(name => !name.split(path.sep).some(part => part.startsWith('.')))
-          .map(name => name.split(path.sep).join('/'));
+        count = files.filter(name => name !== GENERATED_ATTACHMENTS_FILE).length;
       }
     } catch (err) { log.warn('attachment purge failed', { cid: maskId(cid), error: logErrorSummary(err) }); }
     try { await purgeFileCacheByCid(userId, safeConvId); }
     catch (err) { log.warn('attachment cache purge failed', { cid: maskId(safeConvId), error: logErrorSummary(err) }); }
-    for (const name of names) notifyAttachmentDeletedIfSyncable(userId, safeConvId, name);
     return count;
   });
 }
@@ -1494,7 +1626,7 @@ export interface BuildConversationAttachmentIndexOpts {
  *                       let read_files prepare extraction. Never eagerly extract
  *                       here — upload stays zero-cost.
  *   - image           → compressed color JPEG via real-time
- *                       toCompressedGrayJpeg on the raw source → images[]
+ *                       toCompressedJpeg on the raw source → images[]
  *                       for pi-ai vision.
  *   - video/audio     → listed by path for media tools, without inline bytes.
  *   - archive         → listed by path only for a task-specific host tool;
@@ -1552,7 +1684,7 @@ export async function buildAttachmentManifest(
       try {
         const buf = fs.readFileSync(abs);
         // Preserve reference colors on first delivery, just as read_files does.
-        const compressed = await toCompressedGrayJpeg(buf, { maxDim: 1024, quality: 70, grayscale: false });
+        const compressed = await toCompressedJpeg(buf, { maxDim: 1024, quality: 70 });
         images.push({ data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' });
         // Candidate providers enforce their own N-image request limit after
         // this manifest is built. `image_order` preserves a deterministic

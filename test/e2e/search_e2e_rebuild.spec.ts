@@ -1,3 +1,4 @@
+import { finished } from 'node:stream/promises';
 import path from 'node:path';
 import { cpSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { createPackageWithOptions } from '@electron/asar';
@@ -177,7 +178,7 @@ test('runs rebuild, live indexing and snippet workers from an ASAR with the ship
     // Use the actual packaging rules, not a test-only unpack-all workaround.
     // asar matches absolute filenames; electron-builder's patterns are relative.
     const unpack = pkg.build.asarUnpack.map((pattern: string) => path.join(source, pattern).replaceAll('\\', '/'));
-    await createPackageWithOptions(source, archive, { unpack: `{${unpack.join(',')}}` });
+    await finished(await createPackageWithOptions(source, archive, { unpack: `{${unpack.join(',')}}` }));
     const esbuild = path.join(`${archive}.unpacked`, 'node_modules', '@esbuild',
       `${process.platform}-${process.arch}`, ...(process.platform === 'win32' ? ['esbuild.exe'] : ['bin', 'esbuild']));
     expect(existsSync(esbuild)).toBe(true);

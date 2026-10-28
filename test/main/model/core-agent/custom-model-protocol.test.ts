@@ -17,6 +17,67 @@ function anthropicSuccess() {
 }
 afterEach(() => vi.restoreAllMocks());
 describe('custom model protocol wire contract', () => {
+ it('round-trips custom Responses tools and images through the real SDK', async () => {
+  const wires: any[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+   wires.push(JSON.parse(String(init?.body)));
+   const first = wires.length === 1;
+   const item = first ? { type: 'function_call', id: 'fc_lookup', call_id: 'call_lookup', name: 'lookup', arguments: '{"key":"42"}', status: 'completed' }
+    : { type: 'message', id: 'msg_done', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Ready: 5827', annotations: [] }] };
+   const response = { id: 'resp_fixture', status: 'completed', model: config.modelId, output: [item], usage: { input_tokens: 3, output_tokens: 2 } };
+   const events = [{ type: 'response.created', response: { ...response, output: [] } },
+    { type: 'response.output_item.added', output_index: 0, item: first ? { ...item, arguments: '' } : { ...item, content: [] } },
+    ...(first ? [{ type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"key":"42"}' }]
+      : [{ type: 'response.content_part.added', output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } },
+         { type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: 'Ready: 5827' }]),
+    { type: 'response.output_item.done', output_index: 0, item }, { type: 'response.completed', response }];
+   return new Response(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+  });
+  const provider = await createCustomOpenAICompatibleProvider({ ...config, protocol: 'responses', supportsVision: true });
+  const schema = { type: 'object', properties: { key: { type: 'string' }, limit: { type: 'integer' } }, required: ['key'] };
+  const input: any = { model: config.modelId, maxTokens: 512,
+   tools: [{ name: 'lookup', description: 'Read status', inputSchema: schema }],
+   messages: [{ role: 'user', content: [{ type: 'text', text: 'Read status' }, { type: 'image', mediaType: 'image/png', data: 'aGVsbG8=' }] }] };
+  const first = await provider.complete(input);
+  const call: any = first.content.find(b => b.type === 'tool_use');
+  expect(call).toMatchObject({ name: 'lookup', input: { key: '42' } });
+  input.messages.push({ role: 'assistant', content: first.content }, { role: 'user', content: [{ type: 'tool_result', toolUseId: call.id, content: 'Ready: 5827' }] });
+  expect((await provider.complete(input)).content).toContainEqual(expect.objectContaining({ type: 'text', text: 'Ready: 5827' }));
+  expect(wires).toHaveLength(2);
+  expect(wires[0].tools[0]).toMatchObject({ type: 'function', name: 'lookup', strict: false, parameters: schema });
+  expect(wires[0].input[0].content).toContainEqual(expect.objectContaining({ type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' }));
+  const output = wires[1].input.find((x: any) => x.type === 'function_call_output');
+  expect(output).toMatchObject({ call_id: 'call_lookup', output: expect.stringContaining('5827') });
+ });
+ it.each(['complete', 'stream', 'validateAuth'] as const)('uses Responses for a custom %s without Chat compatibility rewriting', async mode => {
+  const calls: any[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+   calls.push({ url: String(url), body: JSON.parse(String(init?.body)), headers: new Headers(init?.headers) });
+   const response = { id: 'resp_fixture', object: 'response', status: 'completed', model: config.modelId,
+    output: [{ type: 'message', id: 'msg_fixture', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'hello', annotations: [] }] }],
+    usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } };
+   const events = [{ type: 'response.created', response: { ...response, status: 'in_progress', output: [] } },
+    { type: 'response.output_item.added', output_index: 0, item: { ...response.output[0], content: [] } },
+    { type: 'response.content_part.added', output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } },
+    { type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: 'hello' },
+    { type: 'response.output_item.done', output_index: 0, item: response.output[0] },
+    { type: 'response.completed', response }];
+   return new Response(events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+  });
+  const provider = await createCustomOpenAICompatibleProvider({ ...config, protocol: 'responses', supportsReasoning: true, reasoningEffort: 'medium' });
+  if (mode === 'complete') expect((await provider.complete(params)).content).toContainEqual(expect.objectContaining({ type: 'text', text: 'hello' }));
+  else if (mode === 'validateAuth') expect(await provider.validateAuth()).toBe(true);
+  else { const events = []; for await (const e of provider.stream(params)) events.push(e); expect(events).toContainEqual({ type: 'text_delta', text: 'hello' }); }
+  expect(calls).toHaveLength(1);
+  expect(new URL(calls[0].url).pathname).toBe('/responses');
+  expect(calls[0].headers.get('authorization')).toBe(`Bearer ${config.apiKey}`);
+  expect(calls[0].body.input).toBeInstanceOf(Array);
+  expect(calls[0].body.messages).toBeUndefined();
+  expect(calls[0].body.max_tokens).toBeUndefined();
+  expect(calls[0].body.max_completion_tokens).toBeUndefined();
+  expect(calls[0].body.max_output_tokens).toBe(mode === 'validateAuth' ? 16 : 512);
+  expect(calls[0].body.reasoning?.effort).toBe(mode === 'validateAuth' ? 'none' : 'medium');
+ });
  it.each(['complete', 'stream', 'validateAuth'] as const)('dispatches a clean Anthropic %s request through the real SDK', async mode => {
   const calls: any[] = [];
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {

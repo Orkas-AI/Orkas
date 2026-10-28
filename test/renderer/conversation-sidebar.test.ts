@@ -44,6 +44,10 @@ function createProcessTestElement(tagName = 'div'): any {
       if (index >= 0) parent.children.splice(index, 1);
       this.parentElement = null;
     },
+    contains(child: any) {
+      for (let parent = child; parent; parent = parent.parentElement) if (parent === this) return true;
+      return false;
+    },
     querySelector(selector: string) {
       const className = selector.startsWith('.') ? selector.slice(1) : '';
       for (const child of this.children) {
@@ -3576,6 +3580,21 @@ describe('conversation history reconcile', () => {
     expect(finalizeBody).toContain('_syncRenderedGroupMessageIdentity(ph, gm);');
   });
 
+  it('restores the running bubble header from its real turn start instead of the page reopen time', () => {
+    const context = loadConversationRenderer();
+    context.formatTime = (value: string) => value;
+    const header = { textContent: 'page reopen time' };
+    const startedAt = Date.parse('2026-10-21T12:26:52Z');
+    const row = {
+      dataset: { ts: String(Date.parse('2026-10-21T12:35:00Z')) },
+      parentElement: null,
+      querySelector: (selector: string) => selector === '.chat-msg-time' ? header : null,
+    };
+    context._anchorPlaceholderToTurnStart(row, startedAt);
+    expect(row.dataset.ts).toBe(String(startedAt));
+    expect(header.textContent).toBe('2026-10-21T12:26:52.000Z');
+  });
+
   it('moves a live AI bubble once after newer send-now user activity', () => {
     const context = loadConversationRenderer();
 
@@ -5245,6 +5264,51 @@ describe('conversation process metadata formatting', () => {
     expect(body.children[0]).toBe(group);
     expect(group._processCompactBody.children).toHaveLength(8);
     expect(group._processCompactSummary.innerHTML).toContain('Operations 8');
+  });
+
+  it('restores many tool calls with linear row inspection and updates their original terminal rows', () => {
+    const context = loadConversationRenderer();
+    let inspected = 0;
+    context.document.createElement = (tag: string) => {
+      const node = createProcessTestElement(tag);
+      node.children = new Proxy(node.children, { get(target, key, receiver) {
+        if (typeof key === 'string' && /^\d+$/.test(key)) inspected += 1;
+        return Reflect.get(target, key, receiver);
+      } });
+      return node;
+    };
+    const body = context.document.createElement('div');
+    for (let i = 0; i < 1000; i += 1) context._appendProcessTextLines(body, `Start ${i}`, 'tool', 'bash', `call-${i}`);
+    for (let i = 0; i < 1000; i += 1) context._appendProcessTextLines(body, `Done ${i}`, 'tool', 'bash', `call-${i}`, true);
+    expect(inspected).toBeLessThan(50_000);
+    const rows = body.children[0]._processCompactBody.children;
+    expect(rows).toHaveLength(1000);
+    expect(rows[0].dataset.processText).toBe('Done 0');
+    expect(rows[999].dataset.processTerminal).toBe('1');
+    expect(body.children[0]._processCompactSummary.innerHTML).toContain('Operations 1000');
+  });
+
+  it('keeps mixed narration, expanded groups and lifecycle identity after removal and replay', () => {
+    const context = loadConversationRenderer();
+    context.document.createElement = (tag: string) => createProcessTestElement(tag);
+    const body = createProcessTestElement();
+    context._appendProcessTextLines(body, 'Start A', 'tool', 'bash', 'a');
+    const first = body.children[0];
+    first.open = true;
+    context._appendProcessTextLines(body, 'Start B', 'tool', 'bash', 'b');
+    context._appendProcessCommentaryToBody(body, 'Checking');
+    context._appendProcessTextLines(body, 'Start C', 'tool', 'bash', 'c');
+    context._appendProcessTextLines(body, 'Done A', 'tool', 'bash', 'a', true);
+    context._appendProcessTextLines(body, 'Late progress', 'tool', 'bash', 'a');
+    expect(body.children[0]).toBe(first);
+    expect(first.open).toBe(true);
+    expect(first._processCompactBody.children.map((row: any) => row.dataset.processText)).toEqual(['Done A', 'Start B']);
+    expect(body.children).toHaveLength(3);
+    for (const child of [...body.children]) child.remove();
+    context._appendProcessTextLines(body, 'Replayed A', 'tool', 'bash', 'a', true);
+    expect(body.children).toHaveLength(1);
+    expect(body.children[0]._processCompactBody.children[0].dataset.processText).toBe('Replayed A');
+    expect(body.children[0]._processCompactSummary.innerHTML).toContain('Operations 1');
   });
 
   it('rescans a settled rail without re-reading the row list once per row', () => {
@@ -8030,6 +8094,11 @@ describe('conversation process metadata formatting', () => {
     expect(context._processSummaryRuntimeFromItems([
       { type: 'event', event: { stream: 'runtime', data: { durationMs: 1_234 } } },
     ])).toBe('1s');
+    const estimated = { stream: 'runtime', data: {
+      phase: 'interrupted', duration_ms: 36_831_876, duration_estimated: true,
+    } };
+    expect(context._processSummaryRuntimeFromItems([{ type: 'event', event: estimated }])).toBe('≈ 10h 13m 52s');
+    expect(context._formatEventLine(estimated)).toBe('Total time ≈ 10h 13m 52s');
     expect(context._processSummaryRuntimeFromItems([
       {
         type: 'event',
@@ -8985,6 +9054,31 @@ function setupConversationStatusController(context: any, cid = 'c1', options = {
 }
 
 describe('conversation controller settlement', () => {
+  it.each([{ superseded: false, observerOnly: false }, { superseded: false, observerOnly: true }, { superseded: true, observerOnly: true }])('reconciles idle recovery without retiring a newer pending state ($superseded, observer controller: $observerOnly)', async ({ superseded, observerOnly }) => {
+    const context = loadConversationRenderer();
+    setupRunningObserverTestContext(context);
+    if (observerOnly) vm.runInContext(`
+      const observer = { abort() {} };
+      _convChatCtrls.set('c1', observer);
+      _groupObserverReservations.set('c1', observer);
+      pendingConvs.get('c1').controller = observer;
+    `, context);
+    const order: string[] = [];
+    let release: (response: any) => void = () => {};
+    context.apiFetch = () => new Promise(resolve => { release = resolve; });
+    context._recoverObservedConversationHistory = async () => { order.push('canonical reply'); return true; };
+    context._stopGroupEventObserver = () => order.push('stop observer');
+    context._settleDanglingActorPlaceholders = () => {};
+    context._removeEmptyStreamingPlaceholder = () => {};
+    context._syncTaskBoardForRuntimeState = () => {};
+    context._finishStreamingMsg = () => order.push('finish');
+    const syncing = context._syncPendingActorsFromRuntime('c1', { allowController: true });
+    if (superseded) context.pendingConvs.set('c1', { controller: null, aborted: false });
+    release({ json: async () => ({ ok: true, processing: false, active_turns: [], in_flight: [] }) });
+    await syncing;
+    expect(order).toEqual(superseded ? [] : ['canonical reply', 'stop observer', 'finish']);
+  });
+
   it('restores a rejected send before snapshot cleanup and ignores stale controllers', () => {
     const context = loadConversationRenderer();
     const { hooks, msg } = setupConversationStatusController(context, 'c1', { restoreComposerOnFailure: true });
@@ -10950,5 +11044,89 @@ describe('streaming repaint lifecycle', () => {
       // a result that can no longer be displayed.
       expect(typesets).toBe(1);
     } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+});
+
+describe('selected Agent ordinary send completion', () => {
+  it('refreshes public Agent statistics without adding routing metadata to the model request', async () => {
+    const context = loadConversationRenderer();
+    const events = new EventTarget();
+    context.window.addEventListener = events.addEventListener.bind(events);
+    context.window.dispatchEvent = events.dispatchEvent.bind(events);
+    context.CustomEvent = CustomEvent;
+    context.window.orkas = { invoke: vi.fn() };
+    context._isCommanderAgent = (id: string) => id === 'commander';
+    context._isAgentProfileMock = () => false;
+    context._selectedAgent = null;
+    context._agentEditing = false;
+    let displayedDeliveries = 2;
+    context.loadAgents = vi.fn(async () => { displayedDeliveries = 3; });
+    const agentSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/agents.js'), 'utf8');
+    vm.runInContext(agentSource.slice(
+      agentSource.indexOf('async function _refreshAgentRuntimeStatsAfterRun('),
+      agentSource.indexOf('function _agentDeliveryCount('),
+    ), context);
+    context.performance = performance;
+    context.currentCid = 'c1';
+    context._agentsCache = [{ agent_id: 'writer', name: 'Writer' }];
+    context.setChatRecipient('conversation', { kind: 'agent', id: 'writer', name: 'Writer' });
+    const input = { value: 'review this', dataset: {}, dispatchEvent() {} };
+    context.document.getElementById = (id: string) => id === 'chat-input' ? input : null;
+    context.ensureModelConfigured = () => true;
+    context.transformWithChatUse = (text: string) => text;
+    context._chatAttachSnapshotForSend = async () => ({ ok: true, items: [], names: [] });
+    context._clearDraft = () => {};
+    context.autoGrow = () => {};
+    const sent: any[] = [];
+    context._makeConvChatController = (_cid: string, options: any) => ({
+      async send(content: string, extra: any) {
+        sent.push({ content, extra });
+        options.onStarted();
+        const terminal = { started: true, aborted: false, errored: false, accepted: true };
+        options.onDone(terminal);
+        return terminal;
+      },
+    });
+    await context.handleChatSubmit();
+    await Promise.resolve();
+    // The selected existing floor stays in main; ordinary follow-ups keep their text unchanged.
+    expect(sent).toEqual([{ content: 'review this', extra: undefined }]);
+    expect(context.loadAgents).toHaveBeenCalledExactlyOnceWith(true);
+    expect(displayedDeliveries).toBe(3);
+    expect(input.value).toBe('');
+  });
+});
+
+describe('preflight send controller ownership', () => {
+  it('keeps the newer active controller when an earlier no-start result settles', async () => {
+    const context = loadConversationRenderer();
+    context.performance = performance;
+    const newerResult = Promise.withResolvers<any>();
+    let number = 0;
+    let newer: any;
+    context._makeConvChatController = (_cid: string, options: any) => {
+      const ordinal = ++number;
+      const controller = {
+        abort: vi.fn(),
+        async send() {
+          if (ordinal === 1) return { started: false, reason: 'model_not_configured' };
+          options.onStarted();
+          return newerResult.promise;
+        },
+      };
+      if (ordinal === 2) newer = controller;
+      return controller;
+    };
+    // Both calls reach the public send entry before the resolved preflight
+    // result's await resumes. The second now owns the same conversation.
+    const rejected = context.sendInConversation('c1', 'earlier attempt');
+    const active = context.sendInConversation('c1', 'new attempt');
+    const first = await rejected;
+    expect(first.started).toBe(false);
+    expect(first.result).toBe('failure');
+    expect(vm.runInContext('_convChatCtrls.get("c1")', context)).toBe(newer);
+    expect(newer.abort).not.toHaveBeenCalled();
+    newerResult.resolve({ started: true, aborted: false, errored: false, accepted: true });
+    expect((await active).result).toBe('success');
   });
 });

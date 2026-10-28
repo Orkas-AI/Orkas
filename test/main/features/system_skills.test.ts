@@ -527,8 +527,8 @@ describe('system skill contracts', () => {
 
   it('pins agent-creator descriptions to current-language defaults and hidden provenance', () => {
     const md = packagedSystemSkillBundle('agent-creator');
-    expect(md).toContain('Use `<description_zh>` / `<description_en>` only when the user explicitly asks for multilingual/bilingual descriptions');
-    expect(md).toContain('Default: one current-language description only');
+    expect(md).toContain('Use `<description>` by default');
+    expect(md).toContain('explicit description-language request, otherwise the current UI language');
     expect(md).toContain('Do **not** show source provenance by default');
     expect(md).toContain('No container, no mutation, no success claim');
     expect(md).toContain('the number of valid containers must equal the number of Agents');

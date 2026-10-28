@@ -1,5 +1,5 @@
 import { docxBufferToHtml } from './extract-docx';
-import { pptxBufferToHtml, xlsxBufferToHtml } from './extract-office';
+import { extractOffice } from './office-extract';
 import { isZipSpreadsheet, xlsBufferToHtml } from './extract-xls';
 
 export type OfficePreviewKind = 'word' | 'spreadsheet' | 'presentation';
@@ -227,9 +227,9 @@ export async function officeBufferToPreviewHtml(
   if (kind === 'word') {
     fragment = await docxBufferToHtml(buf);
   } else if (kind === 'spreadsheet') {
-    fragment = isZipSpreadsheet(buf) ? xlsxBufferToHtml(buf) : await xlsBufferToHtml(buf);
+    fragment = isZipSpreadsheet(buf) ? await extractOffice('xlsx-html', buf) : await xlsBufferToHtml(buf);
   } else {
-    fragment = pptxBufferToHtml(buf);
+    fragment = await extractOffice('pptx-html', buf);
   }
   const previewHeight = estimateOfficePreviewHeight(kind, fragment);
   return {

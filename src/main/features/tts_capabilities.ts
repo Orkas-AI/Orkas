@@ -91,8 +91,8 @@ export function getTtsAvailabilityDetails(knownUsable?: boolean): TtsAvailabilit
       if (listUsableTtsProfiles().length > 0) {
         return { available: true, reason: 'available' };
       }
-    } catch (err) {
-      log.warn(`resolve TTS availability: ${(err as Error).message}`);
+    } catch {
+      log.warn('resolve TTS availability failed');
     }
   }
   return {
@@ -122,7 +122,8 @@ export function normalizeTtsLanguage(value: unknown): string {
     'en-us': 'en-US',
     'en-gb': 'en-GB',
   };
-  const alias = aliases[raw.toLowerCase()];
+  const key = raw.toLowerCase();
+  const alias = Object.hasOwn(aliases, key) ? aliases[key] : undefined;
   if (alias) return alias;
   if (!/^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8})*$/.test(raw)) return '';
   return raw.split('-').map((part, index) => (
@@ -247,7 +248,7 @@ export async function listTtsCapabilities(_signal?: AbortSignal): Promise<TtsRou
 
   let profiles: TtsProfile[] = [];
   try { profiles = listUsableTtsProfiles(); }
-  catch (err) { log.warn(`listTtsProfiles: ${(err as Error).message}`); }
+  catch { log.warn('list TTS profiles failed'); }
   return profiles.map(profileRoute);
 }
 

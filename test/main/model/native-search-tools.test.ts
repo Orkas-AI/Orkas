@@ -89,6 +89,7 @@ describe('native search eligibility for the actual request model', () => {
     expect(nativeSearchToolForModel({ ...model, api: 'openai-completions' }, {})).toBeUndefined();
     expect(nativeSearchToolForModel({ api: 'openai-responses' }, {})).toBeUndefined();
     expect(nativeSearchToolForModel({ provider: 'google', api: 'google-generative-ai', id: 'gemini-3.8-flash' }, {})).toEqual({ googleSearch: {} });
+    expect(nativeSearchToolForModel({ provider: 'google', api: 'google-generative-ai', id: 'gemini-4-argon' }, {})).toEqual({ googleSearch: {} });
     expect(nativeSearchToolForModel({ provider: 'google', api: 'google-generative-ai', id: 'gemini-1.5-pro' }, {})).toBeUndefined();
     for (const id of ['gemini-2.5-flash', 'gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gemini-unreviewed']) {
       expect(nativeSearchToolForModel({ provider: 'google', api: 'google-generative-ai', id }, {})).toBeUndefined();

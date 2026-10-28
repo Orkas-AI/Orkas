@@ -1,6 +1,6 @@
 'use strict';
 
-const { zodToJsonSchema } = require('zod-to-json-schema');
+const { schemaToJson } = require('./schema-to-json.cjs');
 
 const { projectToolInput } = require('./tool-input-compat.cjs');
 
@@ -10,14 +10,13 @@ exports.bridgeToolInput = (z, description, shape, handler, compatibilityFields =
   const inputSchema = z.object(shape).passthrough();
   let inputJson;
   let outputJson;
-  // SDK v2 consumes Standard Schema. Preserve the existing Zod v3 parser and
-  // JSON conversion so numeric defaults, legacy selectors and nested guards
-  // keep their contracts instead of migrating every shared tool schema.
+  // SDK v2 consumes Standard Schema. Keep discovery's optional defaults and
+  // preferred numeric bounds aligned with the existing execution contract.
   inputSchema['~standard'] = {
     ...inputSchema['~standard'],
     jsonSchema: {
-      input: () => inputJson ||= zodToJsonSchema(inputSchema, { strictUnions: true, pipeStrategy: 'input' }),
-      output: () => outputJson ||= zodToJsonSchema(inputSchema, { strictUnions: true, pipeStrategy: 'output' }),
+      input: () => inputJson ||= schemaToJson(inputSchema),
+      output: () => outputJson ||= schemaToJson(inputSchema),
     },
   };
   return [{

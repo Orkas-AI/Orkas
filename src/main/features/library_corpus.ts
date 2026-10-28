@@ -4,7 +4,7 @@
  *
  * This module owns everything that is corpus-independent — admission and
  * dedup, the two-stage extract/embed pipeline, reconcile diffing with crash
- * recovery, status events, and the vectorize analytics batch — so a fix lands
+ * recovery and status events — so a fix lands
  * once instead of in two indexers that had drifted into different
  * capabilities (pipelining and cancellable reconcile on one side, deletion
  * epochs and name safety on the other).
@@ -39,61 +39,6 @@ import * as vs from './vec_store';
 import * as kbEmbed from './kb_embed';
 
 const log = createLogger('library_corpus');
-
-interface LibraryVectorizeBatch {
-  startedAt: number;
-  fileCount: number;
-  succeededCount: number;
-  failedCount: number;
-  recoveredCount: number;
-  retryCount: number;
-  timeoutCount: number;
-  maxQueueWaitMs: number;
-}
-
-function createLibraryVectorizeBatch(_scope: 'global' | 'project', _uid: string): LibraryVectorizeBatch {
-  return {
-    startedAt: Date.now(), fileCount: 0, succeededCount: 0, failedCount: 0,
-    recoveredCount: 0, retryCount: 0, timeoutCount: 0, maxQueueWaitMs: 0,
-  };
-}
-
-function recordLibraryVectorizeOutcome(
-  batch: LibraryVectorizeBatch,
-  outcome: {
-    result: 'success' | 'failure';
-    stage?: 'extract' | 'embed' | 'persist';
-    reason: 'mutation' | 'reconcile' | 'crash_recovery' | 'late_recovery' | 'manual';
-    durationMs: number;
-    queueWaitMs: number;
-    attempt: number;
-    chunks?: number;
-    errorCode?: string;
-  },
-): void {
-  batch.fileCount += 1;
-  batch.maxQueueWaitMs = Math.max(batch.maxQueueWaitMs, Math.max(0, Math.round(outcome.queueWaitMs)));
-  batch.retryCount += Math.max(0, Math.round(outcome.attempt) - 1);
-  if (outcome.reason === 'crash_recovery' || outcome.reason === 'late_recovery') batch.recoveredCount += 1;
-  if (outcome.result === 'success') batch.succeededCount += 1;
-  else batch.failedCount += 1;
-  if (/timeout/i.test(String(outcome.errorCode || ''))) batch.timeoutCount += 1;
-}
-
-function flushLibraryVectorizeBatch(batch: LibraryVectorizeBatch): Record<string, number | string> | null {
-  if (batch.fileCount <= 0) return null;
-  return {
-    result: batch.failedCount <= 0 ? 'success' : batch.succeededCount > 0 ? 'partial_failure' : 'failure',
-    file_count: batch.fileCount,
-    succeeded_count: batch.succeededCount,
-    failed_count: batch.failedCount,
-    timeout_count: batch.timeoutCount,
-    recovered_count: batch.recoveredCount,
-    retry_count: batch.retryCount,
-    duration_ms: Math.max(0, Date.now() - batch.startedAt),
-    max_queue_wait_ms: batch.maxQueueWaitMs,
-  };
-}
 
 /** Embedding chunk budget. Kept well under bge-small-zh-v1.5's 512-token
  *  window so the embedder sees whole chunks instead of silently truncating,
@@ -167,7 +112,7 @@ export interface CorpusStatusEvent {
 export type CorpusJobReason = 'mutation' | 'reconcile' | 'crash_recovery' | 'late_recovery' | 'manual';
 
 export interface CorpusSpec {
-  /** Owner, for log redaction and analytics attribution only. */
+  /** Owner, for log redaction. */
   uid: string;
   /** Analytics label. */
   scope: 'global' | 'project';
@@ -222,6 +167,7 @@ export interface LibraryCorpus {
   statusSummary(): { total: number; ready: number; processing: number; pending: number; failed: number };
   /** Drop queued work for this corpus. The store itself is the caller's. */
   cancelQueued(): void;
+  close(): void;
 }
 
 interface Job {
@@ -263,38 +209,74 @@ interface ReconcileFileMeta {
   mtime: number;
 }
 
-const _corpora = new Map<string, LibraryCorpus>();
+const _corpora = new Map<string, { corpus: LibraryCorpus; spec: CorpusSpec }>();
+const _suspended = new Map<string, CorpusSpec>();
+let _closing = false;
 
 /** Open (or retrieve) the corpus for a dbDir. Corpora are cached so every
  *  caller shares one queue per index — two queues over one `vector.db` would
  *  interleave writes to the same rows. */
 export function openLibraryCorpus(spec: CorpusSpec): LibraryCorpus {
+  if (_closing) throw new Error('library indexing is closing');
   const cached = _corpora.get(spec.dbDir);
-  if (cached) return cached;
+  if (cached) return cached.corpus;
   const corpus = createCorpus(spec);
-  _corpora.set(spec.dbDir, corpus);
+  _corpora.set(spec.dbDir, { corpus, spec });
   return corpus;
 }
 
 /** Forget a corpus (deleted project, tests). Queued work is dropped; the
  *  vector store lifecycle belongs to the caller. */
 export function closeLibraryCorpus(dbDir: string): void {
-  const corpus = _corpora.get(dbDir);
-  if (corpus) corpus.cancelQueued();
+  const entry = _corpora.get(dbDir);
+  if (entry) entry.corpus.close();
   _corpora.delete(dbDir);
+  _suspended.delete(dbDir);
 }
 
 export function _resetLibraryCorporaForTests(): void {
-  for (const corpus of _corpora.values()) corpus.cancelQueued();
+  for (const { corpus } of _corpora.values()) corpus.close();
+  _corpora.clear();
+  _suspended.clear();
+  _closing = false;
+}
+
+/** Stop owners before their databases/model are closed. Late work cannot
+ * reopen a corpus or publish into a replacement application lifetime. */
+export function closeAllLibraryCorpora(): void {
+  _closing = true;
+  for (const [key, { corpus, spec }] of _corpora) {
+    corpus.close();
+    _suspended.set(key, spec);
+  }
   _corpora.clear();
 }
 
+/** A failed exit resumes durable pending sources automatically under fresh
+ * owners. Deleted/discarded projects must never be reopened by recovery. */
+export async function resumeLibraryAdmission(): Promise<void> {
+  _closing = false;
+  const specs = [..._suspended.values()];
+  _suspended.clear();
+  await Promise.all(specs.map(async spec => {
+    if (spec.discarded?.()) return;
+    try { await openLibraryCorpus(spec).reconcile(); }
+    catch (error) {
+      log.warn('library resume failed', { scope: spec.scope, error: logErrorSummary(error) });
+    }
+  }));
+}
+
 function createCorpus(spec: CorpusSpec): LibraryCorpus {
+  const lifetime = new AbortController();
   const queue: Queue = { jobs: [], running: false, scheduled: false, activePaths: new Map(), queuedKeys: new Set() };
   const epochOf = (): number => (spec.epoch ? spec.epoch() : 0);
-  const discarded = (): boolean => spec.discarded?.() === true;
+  const discarded = (): boolean => lifetime.signal.aborted || spec.discarded?.() === true;
   const storeExists = (): boolean => fs.existsSync(path.join(spec.dbDir, 'vector.db'));
-  const store = (): vs.VecStore => vs.openVecStore(spec.dbDir);
+  const store = (): vs.VecStore => {
+    if (discarded()) throw new Error('library corpus closed');
+    return vs.openVecStore(spec.dbDir);
+  };
   const jobIsCurrent = (job: Job): boolean => !discarded() && job.epoch === epochOf();
 
   function retain(relPath: string): void {
@@ -362,11 +344,17 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
   async function runQueue(): Promise<void> {
     if (queue.running) return;
     queue.running = true;
-    const batch = createLibraryVectorizeBatch(spec.scope, spec.uid);
+
     let chain: Promise<void> = Promise.resolve();
+    const preparing = new Set<Promise<void>>();
     try {
       while (true) {
         while (queue.jobs.length) {
+          if (discarded()) { queue.jobs = []; queue.queuedKeys.clear(); break; }
+          // At most two extracted documents survive a slow embedding call.
+          // Keep overlap, but do not extract an entire library into closures.
+          if (preparing.size >= 2) await Promise.race(preparing);
+          if (discarded()) { queue.jobs = []; queue.queuedKeys.clear(); break; }
           const job = queue.jobs.shift()!;
           queue.queuedKeys.delete(`${job.op}\u0000${job.relPath}`);
           if (!jobIsCurrent(job)) continue;
@@ -382,7 +370,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
           }
           retain(job.relPath);
           let extract: ExtractResult | null = null;
-          try { extract = await prepareAndExtract(job, batch); }
+          try { extract = await prepareAndExtract(job); }
           catch (err) {
             log.warn('library extract failed', {
               user_id: maskId(spec.uid),
@@ -390,7 +378,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
               path: logPathRef(job.relPath),
               error: logErrorSummary(err),
             });
-            await failUnexpectedJob(job, err, batch);
+            await failUnexpectedJob(job, err);
             release(job.relPath);
             continue;
           }
@@ -399,14 +387,16 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
             continue;
           }
           const ready = extract;
-          chain = chain.then(() => embedAndUpsert(ready, batch))
+          const pending = chain.then(() => embedAndUpsert(ready))
             .catch((err) => log.warn('library embed failed', {
               user_id: maskId(spec.uid),
               scope: spec.scope,
               path: logPathRef(ready.relPath),
               error: logErrorSummary(err),
             }))
-            .finally(() => { release(ready.relPath); });
+            .finally(() => { release(ready.relPath); preparing.delete(pending); });
+          preparing.add(pending);
+          chain = pending;
         }
         await chain;
         chain = Promise.resolve();
@@ -414,29 +404,14 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
       }
     } finally {
       queue.running = false;
-      const summary = flushLibraryVectorizeBatch(batch);
-      if (summary) {
-        log.info('library vectorization batch complete', {
-          user_id: maskId(spec.uid),
-          scope: spec.scope,
-          result: summary.result,
-          files: summary.file_count,
-          succeeded: summary.succeeded_count,
-          failed: summary.failed_count,
-          timeouts: summary.timeout_count,
-          recovered: summary.recovered_count,
-          retries: summary.retry_count,
-          duration_ms: summary.duration_ms,
-          max_queue_wait_ms: summary.max_queue_wait_ms,
-        });
-      }
+
     }
   }
 
   /** Foreground stage: stat + hash + cache check + extract. Null means the
    *  file needs no embedding (gone, cache hit, unsupported, or already
    *  reported as failed). */
-  async function prepareAndExtract(job: Job, batch: LibraryVectorizeBatch): Promise<ExtractResult | null> {
+  async function prepareAndExtract(job: Job): Promise<ExtractResult | null> {
     const { relPath } = job;
     const startedAt = Date.now();
     const abs = path.join(spec.sourceRoot, relPath);
@@ -488,7 +463,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
     // Empty content: embedding nothing produces a useless vector and can hang
     // the embedder. Mark it ready with zero chunks so the UI settles; adding
     // content changes the sha1 and re-admits it.
-    const isEmpty = stat.size === 0 || (kind === 'text' && buf.toString('utf8').trim() === '');
+    const isEmpty = (kind !== 'image' && stat.size === 0) || (kind === 'text' && buf.toString('utf8').trim() === '');
     if (isEmpty) {
       if (!jobIsCurrent(job)) return null;
       await store().upsertFile({
@@ -496,7 +471,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
       });
       if (!jobIsCurrent(job)) return null;
       spec.emit({ relPath, status: 'ready', kind, chunks: 0, stage: 'persist' });
-      recordOutcome(batch, job, startedAt, { result: 'success', stage: 'persist', chunks: 0 });
+
       return null;
     }
 
@@ -518,6 +493,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
           : {}),
       });
       const chunks = await withOperationTimeout(operation, {
+        signal: lifetime.signal,
         timeoutMs: EXTRACT_TIMEOUT_MS,
         code: 'E_LIBRARY_EXTRACT_TIMEOUT',
         stage: 'extract',
@@ -528,19 +504,20 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
       return { relPath, kind, bytes: stat.size, mtime: stat.mtimeMs / 1000, sha1, chunks, job, startedAt };
     } catch (err) {
       if (!jobIsCurrent(job)) return null;
-      await reportFailure(job, err, startedAt, 'extract', 'E_LIBRARY_EXTRACT_FAILED', kind, batch);
+      await reportFailure(job, err, startedAt, 'extract', 'E_LIBRARY_EXTRACT_FAILED', kind);
       return null;
     }
   }
 
   /** Background stage: embed + atomic upsert, one at a time process-wide. */
-  async function embedAndUpsert(ready: ExtractResult, batch: LibraryVectorizeBatch): Promise<void> {
+  async function embedAndUpsert(ready: ExtractResult): Promise<void> {
     let stage: 'embed' | 'persist' = 'embed';
     try {
       if (!jobIsCurrent(ready.job)) return;
       spec.emit({ relPath: ready.relPath, status: 'processing', kind: ready.kind, stage: 'embed' });
       const operation = kbEmbed.embedTexts(ready.chunks.map((c) => c.content));
       const vectors = await withOperationTimeout(operation, {
+        signal: lifetime.signal,
         timeoutMs: EMBED_TIMEOUT_MS,
         code: 'E_LIBRARY_EMBED_TIMEOUT',
         stage: 'embed',
@@ -558,16 +535,14 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
       });
       if (!jobIsCurrent(ready.job)) return;
       spec.emit({ relPath: ready.relPath, status: 'ready', kind: ready.kind, chunks: ready.chunks.length, stage: 'persist' });
-      recordOutcome(batch, ready.job, ready.startedAt, {
-        result: 'success', stage: 'persist', chunks: ready.chunks.length,
-      });
+
     } catch (err) {
       if (!jobIsCurrent(ready.job)) return;
       const resolved = err instanceof OperationTimeoutError && err.stage === 'embed' ? 'embed' : stage;
       await reportFailure(
         ready.job, err, ready.startedAt, resolved,
         resolved === 'embed' ? 'E_LIBRARY_EMBED_FAILED' : 'E_LIBRARY_PERSIST_FAILED',
-        ready.kind, batch,
+        ready.kind,
       );
     }
   }
@@ -579,7 +554,6 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
     stage: 'extract' | 'embed' | 'persist',
     fallbackCode: string,
     kind: ChunkableKind | undefined,
-    batch: LibraryVectorizeBatch,
   ): Promise<void> {
     const message = (err as Error).message || String(err);
     const errorCode = operationErrorCode(err, fallbackCode);
@@ -598,25 +572,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
     try { await store().setFileStatus(job.relPath, 'failed', { error: message }); }
     catch { /* the primary log already records the storage failure */ }
     spec.emit({ relPath: job.relPath, status: 'failed', error: message, ...(kind ? { kind } : {}), stage, errorCode });
-    recordOutcome(batch, job, startedAt, { result: 'failure', stage, errorCode });
-  }
 
-  function recordOutcome(
-    batch: LibraryVectorizeBatch,
-    job: Job,
-    startedAt: number,
-    terminal: { result: 'success' | 'failure'; stage: 'extract' | 'embed' | 'persist'; chunks?: number; errorCode?: string },
-  ): void {
-    recordLibraryVectorizeOutcome(batch, {
-      result: terminal.result,
-      stage: terminal.stage,
-      reason: job.reason,
-      chunks: terminal.chunks || 0,
-      durationMs: Math.max(0, Date.now() - startedAt),
-      queueWaitMs: Math.max(0, startedAt - job.enqueuedAt),
-      errorCode: terminal.errorCode || '',
-      attempt: job.attempt,
-    });
   }
 
   /** A timeout releases the queue but cannot stop native PDF/model work. Hold
@@ -647,7 +603,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
     }).finally(() => { release(job.relPath); });
   }
 
-  async function failUnexpectedJob(job: Job, err: unknown, batch: LibraryVectorizeBatch): Promise<void> {
+  async function failUnexpectedJob(job: Job, err: unknown): Promise<void> {
     if (job.op !== 'upsert' || !jobIsCurrent(job)) return;
     const row = storeExists() ? store().getFile(job.relPath) : null;
     const kind = libraryKindFor(job.relPath) || row?.kind;
@@ -659,7 +615,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
       relPath: job.relPath, status: 'failed', error: message,
       ...(kind ? { kind } : {}), stage: 'queue', errorCode,
     });
-    if (kind) recordOutcome(batch, job, Date.now(), { result: 'failure', stage: 'persist', errorCode });
+
   }
 
   async function processDelete(job: Job): Promise<void> {
@@ -672,6 +628,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
   // ── Reconcile ─────────────────────────────────────────────────────────
 
   async function reconcile(signal?: AbortSignal): Promise<CorpusReconcileResult> {
+    signal = AbortSignal.any([lifetime.signal, ...(signal ? [signal] : [])]);
     const startedAt = Date.now();
     if (discarded()) return { enqueuedUpsert: 0, enqueuedDelete: 0, unchanged: 0 };
     if (spec.exists && !(await spec.exists())) return { enqueuedUpsert: 0, enqueuedDelete: 0, unchanged: 0 };
@@ -683,6 +640,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
     const indexedRows = hadStore ? store().listFiles() : [];
     const indexedByPath = new Map(indexedRows.map((row) => [row.rel_path, row]));
     const scan = await walk(spec.sourceRoot, indexedByPath, signal);
+    if (discarded()) return { enqueuedUpsert: 0, enqueuedDelete: 0, unchanged: 0, cancelled: true };
 
     if (!scan.complete) {
       const cancelled = !!signal?.aborted;
@@ -710,12 +668,10 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
     let recoveredProcessing = 0;
 
     for (const [relPath, meta] of onDisk) {
+      if (discarded()) return { enqueuedUpsert, enqueuedDelete, unchanged, cancelled: true };
       const snapshotExisting = indexedByPath.get(relPath);
       // A processing job may settle while the filesystem walk is in flight.
-      // Re-read that one transient state before deciding ownership: otherwise
-      // the stale snapshot looks orphaned as soon as the worker releases the
-      // path, and reconcile schedules a duplicate job that can overwrite the
-      // just-persisted chunks (most visibly, an image model description).
+      // Re-read transient state so its settled chunks cannot be overwritten.
       const existing = snapshotExisting?.status === 'processing'
         ? store().getFile(relPath)
         : snapshotExisting;
@@ -900,5 +856,10 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
         : { total: 0, ready: 0, processing: 0, pending: 0, failed: 0 };
     },
     cancelQueued() { queue.jobs = []; queue.queuedKeys.clear(); },
+    close() {
+      lifetime.abort(new Error('library corpus closed'));
+      queue.jobs = [];
+      queue.queuedKeys.clear();
+    },
   };
 }

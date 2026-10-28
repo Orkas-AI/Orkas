@@ -18,7 +18,7 @@ test.describe('persistent sidebar', () => {
 });
 
 test.describe('new chat composer', () => {
-  test('groups both public Orkas API-key models as official models', async ({ appPage, orkas }) => {
+  test('groups both public Orkas API-key models as official models', async ({ appPage, orkas }, testInfo) => {
     const configured = await orkas.invoke<{ ok: boolean; configured: boolean }>(
       'orkasApi.configureAll',
       { apiKey: 'orkas-e2e-public-key-xxxxxxxx' },
@@ -37,17 +37,34 @@ test.describe('new chat composer', () => {
     await expect(officialRows.locator('.composer-model-menu-title-name'))
       .toHaveText(['Orkas-1.5', 'Orkas-1.5 Pro']);
     await expect(officialRows.nth(0).locator('.composer-model-menu-recommended'))
-      .toHaveText('Recommended');
+      .toHaveText('Recommended · up to 50% less');
     await expect(officialRows.nth(0).locator('.composer-model-menu-description'))
-      .toContainText('DeepSeek V4 · GPT-5.6 Luna · Claude-Sonnet-5 · Gemini-3.6 Flash');
+      .toContainText('DeepSeek V4.1 Flash · GPT-6 Luna · Claude-Sonnet-5 · Gemini-3.8 Flash');
     await expect(officialRows.nth(1).locator('.composer-model-menu-description'))
-      .toContainText('GPT-5.6 Sol · Claude Opus 5 · Kimi K3');
+      .toContainText('GPT-6.1 Sol · Claude Opus 5.5 · Kimi K3');
     const customGroup = appPage.locator(
       '.composer-model-menu-group[data-model-group="custom"]',
     );
     await expect(customGroup.locator('.composer-model-menu-group-label'))
       .toHaveText('Bring your own API Key');
+    await expect(customGroup.locator('.composer-model-menu-recommended')).toHaveCount(0);
+    await expect(officialRows.nth(1).locator('.composer-model-menu-recommended')).toHaveCount(0);
+    await officialGroup.screenshot({ path: testInfo.outputPath('official-models-en.png') });
     await appPage.keyboard.press('Escape');
+    await appPage.setViewportSize({ width: 620, height: 900 });
+    await appPage.evaluate(async () => { await (window as any).setLang('zh'); });
+    await modelChip.click();
+    const saving = officialRows.nth(0).locator('.composer-model-menu-recommended');
+    await expect(saving).toHaveText('推荐 · 较厂商 API 最高省 50%');
+    expect(await saving.evaluate(element => {
+      const box = element.getBoundingClientRect();
+      const row = element.closest('.composer-model-menu-item')!.getBoundingClientRect();
+      return box.left >= row.left && box.right <= row.right && element.scrollWidth <= element.clientWidth + 1;
+    })).toBe(true);
+    await officialGroup.screenshot({ path: testInfo.outputPath('official-models-zh-narrow.png') });
+    await appPage.keyboard.press('Escape');
+    await appPage.setViewportSize({ width: 1280, height: 900 });
+    await appPage.evaluate(async () => { await (window as any).setLang('en'); });
 
     await appPage.locator('#settings-btn').click();
     await appPage.locator('.settings-tab[data-settings-tab="credentials"]').click();
@@ -57,6 +74,13 @@ test.describe('new chat composer', () => {
     await expect(settingsOfficialRows).toHaveCount(2);
     await expect(settingsOfficialRows.locator('.entry-model-static-name'))
       .toHaveText(['Orkas-1.5', 'Orkas-1.5 Pro']);
+    await expect(settingsOfficialRows.nth(0).locator('.entry-model-recommended'))
+      .toHaveText('Recommended · up to 50% less');
+    await expect(settingsOfficialRows.nth(0).locator('.entry-included-models'))
+      .toContainText('DeepSeek V4.1 Flash · GPT-6 Luna · Claude-Sonnet-5 · Gemini-3.8 Flash');
+    await expect(settingsOfficialRows.nth(1).locator('.entry-included-models'))
+      .toContainText('GPT-6.1 Sol · Claude Opus 5.5 · Kimi K3');
+    await appPage.locator('#settings-entries').screenshot({ path: testInfo.outputPath('configured-models-en.png') });
   });
 
   test('keeps explicit Commander mentions visible through send and history reload', async ({ modelOrkas }, testInfo) => {
@@ -88,6 +112,7 @@ test.describe('new chat composer', () => {
     await editor.fill('');
     await editor.press('@');
     await page.locator('#agent-picker [data-id="__commander__"]').click();
+    await expect(editor).toBeFocused();
     await editor.pressSequentially('continue');
     await editor.press('Enter');
     await expect(page.locator('#chat-history .chat-message.user .markdown-body').last()).toHaveText('@Commander continue');
@@ -658,6 +683,7 @@ test.describe('new chat composer', () => {
     await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).click();
     await expectComposerText(input, '@ComposerAlpha 你好， Xcheck the request @ComposerBeta ');
     await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).press('Escape');
+    await expect(editor).toBeFocused();
     await editor.pressSequentially('verify the result');
     await expect(page.locator('#new-chat-recipient-name')).toHaveText('ComposerAlpha, ComposerBeta');
     await page.locator('#panel-new-chat .new-chat-input-wrapper').screenshot({ path: testInfo.outputPath('recipient-caret.png') });
@@ -1201,7 +1227,7 @@ test.describe('new chat composer', () => {
     await expect(page.locator('#new-chat-attachments .chat-attach-chip')).toHaveCount(3);
     await page.locator('#new-chat-input').fill('Use all deterministic E2E attachments.');
     await page.locator('#new-chat-send-btn').click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toContainText(
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(
       'Hello from the local E2E model.',
       { timeout: 20_000 },
     );
@@ -1272,4 +1298,81 @@ test('keeps all four recipient tabs on one row, including Library', async ({ app
   expect(Math.max(...boxes.map((box) => box.top)) - Math.min(...boxes.map((box) => box.top))).toBeLessThan(2);
   await tabs.filter({ hasText: 'Library' }).click();
   await expect(appPage.locator('[data-agent-picker-tab="library"]')).toHaveClass(/\bactive\b/);
+});
+
+test.describe('attachment adoption recovery', () => {
+  for (const entry of ['Commander', 'Project'] as const) for (const locale of ['en', 'zh'] as const) {
+    test(`keeps the ${entry} draft private and retryable after an adoption error (${locale})`, async ({ modelOrkas: orkas }, info) => {
+      const page = orkas.page!;
+      await page.evaluate(async (language) => (window as any).setLang(language), locale);
+      let projectId = '';
+      if (entry === 'Project') {
+        const created = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: 'Attachment recovery project' });
+        projectId = created.project.project_id;
+        await page.evaluate(async (pid) => {
+          await (window as any).loadProjects(true);
+          (window as any).setView('project', pid);
+        }, projectId);
+      }
+      const prefix = entry === 'Project' ? 'project-chat' : 'new-chat';
+      const draftCid = projectId ? `projchat-${projectId}` : 'main_chat';
+      const input = page.locator(`#${prefix}-input`);
+      const send = page.locator(`#${prefix}-send-btn`);
+      const fileName = 'Long attachment brief covering the complete recovery journey and retained draft.md';
+      const source = orkas.createFixtureFile(fileName, '# Retained attachment\nThe complete original bytes.\n');
+      await orkas.selectFilesOnNextDialog([source]);
+      await page.locator(`#${prefix}-attach-btn`).click();
+      const chip = page.locator(`#${prefix}-attachments .chat-attach-chip`, { hasText: fileName });
+      await expect(chip).toBeVisible();
+      await expect(chip).not.toHaveClass(/\bis-uploading\b/);
+      const draft = 'Review the complete long attachment and preserve this draft for retry.';
+      await input.fill(draft);
+      const before = await orkas.invoke<{ conversations: unknown[] }>('conversations.list');
+      // One explicit IPC failure models a locked filesystem. Everything after
+      // this response, including empty-task discard and retry, uses real IPC.
+      await orkas.electronApp!.evaluate(({ ipcMain }) => {
+        const original = (ipcMain as any)._invokeHandlers.get('orkas.invoke');
+        ipcMain.removeHandler('orkas.invoke');
+        ipcMain.handle('orkas.invoke', async (event, request) => {
+          if (request.channel === 'conversations.attachments.adopt') {
+            ipcMain.removeHandler('orkas.invoke');
+            ipcMain.handle('orkas.invoke', original);
+            return { ok: false, error: 'EPERM: rename C:\\PRIVATE_ATTACHMENT_PATH\\draft to conversation' };
+          }
+          return original(event, request);
+        });
+      });
+      await send.click();
+      const dialog = page.locator('.ui-dialog-overlay:visible .ui-dialog');
+      const copy = locale === 'zh' ? '无法确认附件状态，消息和文件均已保留，请重试。'
+        : 'Could not confirm the attachments. Your message and files are still here; try again.';
+      await expect(dialog).toContainText(copy);
+      await expect(dialog).not.toContainText(/PRIVATE_ATTACHMENT_PATH|EPERM|attachment_adopt/);
+      for (const width of [1280, 620]) {
+        await page.setViewportSize({ width, height: width === 1280 ? 800 : 780 });
+        expect(await dialog.evaluate((el) => {
+          const rect = el.getBoundingClientRect();
+          return rect.left >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight && el.scrollWidth <= el.clientWidth;
+        })).toBe(true);
+        await page.screenshot({ path: info.outputPath(`adoption-error-${entry}-${locale}-${width}.png`) });
+      }
+      await expect(dialog.locator('[data-act="ok"]')).toBeFocused();
+      await page.keyboard.press('Escape');
+      await expect(dialog).toHaveCount(0);
+      await expectComposerText(input, draft);
+      await expect(chip).toBeVisible();
+      await expect(send).toBeEnabled();
+      expect(orkas.modelRequests).toHaveLength(0);
+      expect((await orkas.invoke<{ conversations: unknown[] }>('conversations.list')).conversations).toHaveLength(before.conversations.length);
+      expect((await orkas.invoke<{ items: Array<{ name: string }> }>('conversations.attachments.list', { cid: draftCid })).items.map((item) => item.name)).toEqual([fileName]);
+      const reply = `RECOVERY_ACK_${entry}_${locale}`;
+      orkas.setModelTextReplies([reply]);
+      await send.click();
+      await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(reply, { timeout: 20_000 });
+      await expect(page.locator('#chat-history .chat-message.user')).toContainText(fileName);
+      expect(orkas.modelRequests).toHaveLength(1);
+      expect((await orkas.invoke<{ conversations: unknown[] }>('conversations.list')).conversations).toHaveLength(before.conversations.length + 1);
+      expect((await orkas.invoke<{ items: unknown[] }>('conversations.attachments.list', { cid: draftCid })).items).toEqual([]);
+    });
+  }
 });

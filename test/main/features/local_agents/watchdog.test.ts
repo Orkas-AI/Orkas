@@ -27,6 +27,18 @@ afterEach(() => {
 });
 
 describe('armKillWatchdog', () => {
+  it('reports the remaining inherited deadline rather than a fresh dispatch allowance', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    const { child, kill } = fakeChild();
+    const watchdog = armKillWatchdog(child, { timeoutMs: 180_000, deadlineAt: 145_000 });
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(watchdog.fired()).toBe('wall');
+    expect(kill).toHaveBeenCalledExactlyOnceWith('SIGTERM');
+    expect(watchdog.reason()).toBe('timed out: exceeded 45000ms wall-clock cap');
+    watchdog.disarm();
+  });
+
   it('retains the original 24-hour deadline across an internal retry, but a new dispatch gets a fresh budget', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);

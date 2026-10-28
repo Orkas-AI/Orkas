@@ -255,6 +255,8 @@ export function localCliSearchDirs(
 ): string[] {
   const dirs: string[] = [];
   const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  // The official installer adds this to shell profiles, which GUI apps do not load.
+  if (type === 'opencode' && home) dirs.push(pathApi.join(home, '.opencode', 'bin'));
   if (platform === 'win32') {
     const localAppData = env.LOCALAPPDATA || (home ? path.win32.join(home, 'AppData', 'Local') : '');
     const appData = env.APPDATA || (home ? path.win32.join(home, 'AppData', 'Roaming') : '');

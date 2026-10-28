@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { generateKeyPairSync } from 'node:crypto';
+import { syncBuiltinESMExports } from 'node:module';
+import { generateKeyPairSync, ECDH, X509Certificate } from 'node:crypto';
 
 const UID = 'localaccesspolicy001';
 
@@ -261,4 +262,165 @@ describe('local_access_policy', () => {
     expect(policy.classifyConfiguredBashCommand('git push origin main', ['external_mutation']))
       .toEqual(['external_mutation']);
   });
+});
+
+
+// A successful native parse may consume only an ASN.1 prefix. The entire
+// encoded file must be public. Preserve the desktop runtime's existing
+// decisions for legacy/BER variants as well as its supported encodings.
+describe('complete public material proof', () => {
+  function sample(shape: string): { label: string; bytes: Buffer } {
+    if (shape.startsWith('certificate')) {
+      const text = fs.readFileSync(path.join(__dirname, '../../fixtures/public-proof-certificate.pem'), 'utf8');
+      const bytes = new X509Certificate(text).raw;
+      if (shape === 'certificate-ber') {
+        const header = 2 + ((bytes[1] & 0x80) ? bytes[1] & 0x7f : 0);
+        return { label: 'CERTIFICATE', bytes: Buffer.concat([Buffer.from([0x30, 0x80]), bytes.subarray(header), Buffer.from([0, 0])]) };
+      }
+      return { label: 'CERTIFICATE', bytes };
+    }
+    if (shape.startsWith('rsa')) {
+      const key = generateKeyPairSync('rsa', { modulusLength: 2048 }).publicKey;
+      if (shape === 'rsa-pkcs1') return { label: 'RSA PUBLIC KEY', bytes: key.export({ type: 'pkcs1', format: 'der' }) };
+      const bytes = key.export({ type: 'spki', format: 'der' });
+      if (shape === 'rsa-absent-null') {
+        expect([...bytes.subarray(4, 6)]).toEqual([0x30, 13]);
+        expect([...bytes.subarray(17, 19)]).toEqual([5, 0]);
+        const legacy = Buffer.concat([bytes.subarray(0, 4), Buffer.from([0x30, 11]), bytes.subarray(6, 17), bytes.subarray(19)]);
+        legacy.writeUInt16BE(legacy.length - 4, 2);
+        return { label: 'PUBLIC KEY', bytes: legacy };
+      }
+      return { label: 'PUBLIC KEY', bytes };
+    }
+    if (shape.startsWith('ec')) {
+      const bytes = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).publicKey.export({ type: 'spki', format: 'der' });
+      if (shape === 'ec-compressed') {
+        const point = ECDH.convertKey(bytes.subarray(-65), 'prime256v1', undefined, undefined, 'compressed') as Buffer;
+        return { label: 'PUBLIC KEY', bytes: Buffer.concat([Buffer.from([0x30, 57]), bytes.subarray(2, 23), Buffer.from([3, 34, 0]), point]) };
+      }
+      return { label: 'PUBLIC KEY', bytes };
+    }
+    const bytes = generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' });
+    if (shape === 'ed25519-ber') return { label: 'PUBLIC KEY', bytes: Buffer.concat([Buffer.from([0x30, 0x80]), bytes.subarray(2), Buffer.from([0, 0])]) };
+    if (shape === 'ed25519-nested-ber') return { label: 'PUBLIC KEY', bytes: Buffer.concat([Buffer.from([0x30, 0x80, 0x30, 0x80]), bytes.subarray(4, 9), Buffer.from([0, 0]), bytes.subarray(9), Buffer.from([0, 0])]) };
+    return { label: 'PUBLIC KEY', bytes };
+  }
+  const pem = (label: string, bytes: Buffer) => `-----BEGIN ${label}-----\n${bytes.toString('base64')}\n-----END ${label}-----\n`;
+
+  it.each(['ed25519', 'rsa-spki', 'rsa-pkcs1', 'rsa-absent-null', 'ec', 'ec-compressed', 'ed25519-ber', 'ed25519-nested-ber', 'certificate', 'certificate-ber'])(
+    'preserves the native %s decision and rejects additional encoded data at both policy consumers', async shape => {
+      const { isVerifiedPublicMaterial } = await import('../../../src/main/util/public-material');
+      const policy = await import('../../../src/main/features/local_access_policy');
+      const { ordinaryBashReasons } = await import('../../../src/main/model/core-agent/ordinary-shell-operations');
+      const { label, bytes } = sample(shape);
+      const file = path.join(tmpDir, 'record.pem');
+      const valid = pem(label, bytes);
+      const ctx = { cwd: tmpDir, platform: 'linux' as const, canWrite: () => true, isProduced: () => false, ownsTree: () => false };
+      const supported = !['rsa-absent-null', 'ed25519-ber', 'ed25519-nested-ber', 'certificate-ber'].includes(shape);
+      fs.writeFileSync(file, valid);
+      expect(isVerifiedPublicMaterial(file)).toBe(supported);
+      expect(policy.sensitivePathReasons(file)).toEqual(supported ? [] : ['sensitive_path']);
+      expect(policy.sensitivePathReasons(file, 'write')).toEqual(['sensitive_path']);
+      expect(ordinaryBashReasons('cat record.pem', ctx).has('sensitive_path')).toBe(supported);
+      fs.writeFileSync(file, pem(label, Buffer.concat([bytes, Buffer.from('synthetic-private-marker')])));
+      expect({ proof: isVerifiedPublicMaterial(file), pathReasons: policy.sensitivePathReasons(file),
+        shellExemption: ordinaryBashReasons('cat record.pem', ctx).has('sensitive_path'),
+        powershellExemption: ordinaryBashReasons('Get-Content -Raw -LiteralPath record.pem', { ...ctx, platform: 'win32' }).has('sensitive_path'),
+      }).toEqual({ proof: false, pathReasons: ['sensitive_path'], shellExemption: false, powershellExemption: false });
+      fs.writeFileSync(file, valid);
+      expect(isVerifiedPublicMaterial(file)).toBe(supported);
+    },
+  );
+
+  it.each([
+    [], [0x30], [0x30, 0x82, 1], [0x30, 0x84, 255, 255, 255, 255],
+    [0x30, 0x80], [0x30, 0x80, 3, 0x80, 0, 0, 0, 0],
+    [0x30, 0x80, 0x1f, 0x81], [0x30, 0x80, 0x1f],
+    [0x30, 1, 0], [0x30, 0, 0, 0],
+  ].map(bytes => [bytes]))('does not grant public proof for truncated or malformed ASN.1 %j', async bytes => {
+    const { isVerifiedPublicMaterial } = await import('../../../src/main/util/public-material');
+    const file = path.join(tmpDir, 'malformed.pem');
+    fs.writeFileSync(file, pem('PUBLIC KEY', Buffer.from(bytes)));
+    expect(isVerifiedPublicMaterial(file)).toBe(false);
+  });
+
+  it('keeps public proof bounded to a single regular file and the 64 KiB limit', async () => {
+    const { isVerifiedPublicMaterial } = await import('../../../src/main/util/public-material');
+    const text = pem('PUBLIC KEY', sample('ed25519').bytes);
+    const file = path.join(tmpDir, 'bounded.pem');
+    const alias = path.join(tmpDir, 'alias.pem');
+    fs.mkdirSync(path.join(tmpDir, 'directory.pem'));
+    expect(isVerifiedPublicMaterial(path.join(tmpDir, 'directory.pem'))).toBe(false);
+    expect(isVerifiedPublicMaterial(file)).toBe(false);
+    fs.writeFileSync(file, text);
+    fs.symlinkSync(file, alias);
+    expect(isVerifiedPublicMaterial(alias)).toBe(false);
+    fs.unlinkSync(alias);
+    fs.linkSync(file, alias);
+    expect(isVerifiedPublicMaterial(file)).toBe(false);
+    fs.unlinkSync(alias);
+    expect(isVerifiedPublicMaterial(file)).toBe(true);
+    fs.writeFileSync(file, text.padEnd(64 * 1024, ' '));
+    expect(isVerifiedPublicMaterial(file)).toBe(true);
+    fs.appendFileSync(file, ' ');
+    expect(isVerifiedPublicMaterial(file)).toBe(false);
+    fs.writeFileSync(file, '');
+    expect(isVerifiedPublicMaterial(file)).toBe(false);
+    fs.writeFileSync(file, text);
+    expect(isVerifiedPublicMaterial(file)).toBe(true);
+  });
+
+  it.each(['open', 'fstat', 'read', 'short-read', 'changed-inode', 'changed-device', 'changed-size'])(
+    'denies unknown public content on %s, closes opened descriptors and recovers', async fault => {
+      const { isVerifiedPublicMaterial } = await import('../../../src/main/util/public-material');
+      const file = path.join(tmpDir, 'fault.pem');
+      fs.writeFileSync(file, pem('PUBLIC KEY', sample('ed25519').bytes));
+      const fail = () => { throw Object.assign(new Error('controlled unreadable fixture'), { code: 'EIO' }); };
+      const nodeFs = (await import('node:fs')).default;
+      const close = vi.spyOn(nodeFs, 'closeSync');
+      const originalStat = nodeFs.fstatSync;
+      let injected: { mockRestore(): void };
+      if (fault === 'open') injected = vi.spyOn(nodeFs, 'openSync').mockImplementation(fail);
+      else if (fault === 'read') injected = vi.spyOn(nodeFs, 'readSync').mockImplementation(fail);
+      else if (fault === 'short-read') injected = vi.spyOn(nodeFs, 'readSync').mockReturnValue(0);
+      else injected = vi.spyOn(nodeFs, 'fstatSync').mockImplementation(((fd: number) => {
+        if (fault === 'fstat') return fail();
+        const original = originalStat(fd);
+        const field = fault === 'changed-inode' ? 'ino' : fault === 'changed-device' ? 'dev' : 'size';
+        // NTFS inode numbers can exceed Number.MAX_SAFE_INTEGER; adding one
+        // may leave the value unchanged and fail to inject the intended race.
+        const changed = Number(original[field]) === 0 ? 1 : 0;
+        return { ...original, [field]: changed };
+      }) as typeof fs.fstatSync);
+      syncBuiltinESMExports();
+      try {
+        expect(isVerifiedPublicMaterial(file)).toBe(false);
+        expect(close).toHaveBeenCalledTimes(fault === 'open' ? 0 : 1);
+      } finally { injected.mockRestore(); close.mockRestore(); syncBuiltinESMExports(); }
+      expect(isVerifiedPublicMaterial(file)).toBe(true);
+    },
+  );
+
+  it.each(['ed25519', 'rsa-spki', 'rsa-pkcs1', 'ec', 'ec-compressed', 'certificate'])(
+    'rejects extra material around and inside the %s encoding', async shape => {
+      const { isVerifiedPublicMaterial } = await import('../../../src/main/util/public-material');
+      const { label, bytes } = sample(shape);
+      const file = path.join(tmpDir, 'encoding.pem');
+      const encoded = bytes.toString('base64');
+      const header = 2 + ((bytes[1] & 0x80) ? bytes[1] & 0x7f : 0);
+      const content = Buffer.concat([bytes.subarray(header), Buffer.from([4, 3, 65, 66, 67])]);
+      const length = content.length < 128 ? Buffer.from([content.length]) : Buffer.from([0x82, content.length >> 8, content.length & 255]);
+      for (const text of [
+        `-----BEGIN ${label}-----\n${encoded}QUJD\n-----END ${label}-----\n`,
+        `-----BEGIN ${label}-----\n${encoded}==\n-----END ${label}-----\n`,
+        pem(label, bytes) + pem(label, bytes),
+        pem(label, Buffer.concat([Buffer.from([0x30]), length, content])),
+      ]) {
+        fs.writeFileSync(file, text);
+        expect(isVerifiedPublicMaterial(file)).toBe(false);
+      }
+      fs.writeFileSync(file, pem(label, bytes));
+      expect(isVerifiedPublicMaterial(file)).toBe(true);
+    },
+  );
 });

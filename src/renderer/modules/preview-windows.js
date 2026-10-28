@@ -5,7 +5,6 @@
   async function open(source) {
     try {
       const result = await window.orkas.invoke('previewWindows.open', source);
-      if (window.OrkasCommercialEntry?.isFailure(result)) return result;
       if (!result?.ok) throw new Error('preview_open_failed');
       return result;
     } catch (_) {

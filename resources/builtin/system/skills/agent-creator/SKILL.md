@@ -25,7 +25,7 @@ Do not read unrelated references. A simple bound edit normally needs only `llm-a
 - **One container per Agent.** Multiple containers are legal only when the user asked to create or edit multiple distinct Agents, and the number of valid containers must equal the number of Agents you claim to have created. End the turn after emitting them; do not dispatch the Agent.
 - **Validate every container independently before sending.** Read its tags in order: every opening tag must have the exact matching closing tag, with no crossed, missing, or reused closer. For a multi-Agent reply, repeat this structural check for each container rather than copying an unchecked suffix.
 - **Read attachment sources.** For an injected attachment, missing inline body text is not a missing source; call `read_files` with the exact supplied path in `paths` and ask for another upload only if that read fails.
-- **Use the user's current UI language** for display copy and user-visible prose. Keep XML tags, tool/Skill names, paths, JSON keys, and closed-set values unchanged. Use localized description tags only when the user explicitly requests multilingual descriptions.
+- **Use the user's current UI language** for authored display copy other than descriptions. Keep XML tags, tool/Skill names, paths, JSON keys, and closed-set values unchanged.
 - **Keep user-visible prose outcome-based.** State what the Agent does, when to use it, and the substantive change; do not expose XML/field/schema/id mechanics or source provenance by default.
 - **Agent roles are not model runtimes.** Do not imitate or claim an unavailable provider by naming an ordinary role Agent after a model. Real external CLI runtimes are handled by their smaller editable contract.
 - **Do not hard-code other Agent display names** in authored content; describe downstream roles by capability.
@@ -45,6 +45,8 @@ Do not read unrelated references. A simple bound edit normally needs only `llm-a
 For a new Agent, first compare its name and its typical objects/actions with the injected Agent index. If an existing Agent substantially overlaps, stop and ask whether to use it or still create a new one. Otherwise create in the same turn.
 
 ## Routing descriptions
+
+Description language: explicit description-language request, otherwise the current UI language; the chat's response language does not select it. Use `<description>` by default and `<description_zh>` / `<description_en>` for explicitly requested Chinese/English variants.
 
 New or rewritten descriptions usually need one or two concise sentences: action, work object, deliverable, and any boundary needed to distinguish adjacent roles. Use natural routing terms; add an example only to resolve ambiguity, not a repeated keyword list. Keep execution steps out of the description. Do not shorten supplied or existing descriptions during unrelated edits or source-preserving imports.
 

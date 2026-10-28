@@ -1,8 +1,8 @@
 /**
  * Renderer notification channel with a bounded replay buffer.
  *
- * Main-process events that the renderer must see (telemetry rows, task
- * terminal projections, update notices) are emitted while the window may
+ * Main-process events that the renderer must see (task terminal
+ * projections and product notices) are emitted while the window may
  * be loading, reloading or gone. Each channel keeps the rows it could not
  * deliver and replays them on the next `flush()` (the window's
  * `did-finish-load`), newest-`maxPending` only.
@@ -39,6 +39,7 @@ export type RendererChannelOptions = {
 };
 
 export type RendererChannel = {
+  clear: () => void;
   readonly channel: string;
   /** Deliver now or buffer. `ownerUserId` is required on owner-scoped channels. */
   emit: (payload: unknown, ownerUserId?: string) => void;
@@ -90,5 +91,6 @@ export function createRendererChannel(
     }
   };
 
-  return { channel, emit, flush, pending: () => pending.length };
+  return { channel, emit, flush, pending: () => pending.length,
+    clear: () => { pending.length = 0; } };
 }

@@ -154,7 +154,7 @@ function createCleanupOwner(app: any) {
     ts.isClassDeclaration(node) && node.name?.text === 'OrkasTestApp');
   if (!owner) throw new Error('Missing fixture owner');
   const members = owner.members.filter(member =>
-    member.name && ['closeCurrentApp', 'appClosePromises', 'appTraceStops', 'stopAppTrace', 'prepareForNativeShutdown'].includes(member.name.getText(file)));
+    member.name && ['closeCurrentApp', 'appClosePromises', 'appTraceStops', 'nativeShutdownProcesses', 'stopAppTrace', 'prepareForNativeShutdown', 'launchAfterNativeExit', 'launchAfterCrash'].includes(member.name.getText(file)));
   const code = ts.transpileModule(`class CleanupOwner { ${members.map(m => m.getText(file)).join('\n')} }`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
@@ -238,4 +238,229 @@ it('leaves a replacement application and page owned after the old close finishes
   expect(owner.page).toBe(replacementPage);
   expect(replacement.stop).not.toHaveBeenCalled();
   expect(replacement.app.evaluate).not.toHaveBeenCalled();
+});
+
+
+it('reopens through fixture ownership after prepared clean native exit without a fallback quit', async () => {
+  const { app, stop, release } = controlledCleanupApp();
+  const owner = createCleanupOwner(app);
+  const child = app.process();
+  app.process = vi.fn(() => child);
+  release();
+  await owner.prepareForNativeShutdown();
+  app.process = vi.fn(() => { throw new Error('Disposed native application'); });
+  app.context = vi.fn(() => { throw new Error('Disposed native browser context'); });
+  const replacement = {};
+  const replacementPage = {};
+  owner.launch = vi.fn(async () => {
+    expect(owner.electronApp).toBeNull();
+    expect(owner.page).toBeNull();
+    owner.electronApp = replacement;
+    owner.page = replacementPage;
+  });
+  expect(await owner.launchAfterNativeExit(app)).toBe(replacementPage);
+  expect(stop).toHaveBeenCalledTimes(1);
+  expect(app.process).not.toHaveBeenCalled();
+  expect(app.context).not.toHaveBeenCalled();
+  expect(app.evaluate).not.toHaveBeenCalled();
+  expect(app.close).not.toHaveBeenCalled();
+  expect(owner.launch).toHaveBeenCalledTimes(1);
+  expect(owner.electronApp).toBe(replacement);
+  expect(owner.page).toBe(replacementPage);
+});
+
+it.each([
+  { exitCode: null, signalCode: null },
+  { exitCode: 2, signalCode: null },
+  { exitCode: null, signalCode: 'SIGKILL' },
+])('does not replace an unclean or still-running native owner: %j', async terminal => {
+  const { app, release } = controlledCleanupApp();
+  app.process = () => terminal;
+  const owner = createCleanupOwner(app);
+  const page = owner.page;
+  owner.launch = vi.fn();
+  release();
+  await owner.prepareForNativeShutdown();
+  await expect(owner.launchAfterNativeExit(app)).rejects.toThrow('has not exited cleanly');
+  expect(owner.electronApp).toBe(app);
+  expect(owner.page).toBe(page);
+  expect(owner.launch).not.toHaveBeenCalled();
+  expect(app.evaluate).not.toHaveBeenCalled();
+  expect(app.close).not.toHaveBeenCalled();
+});
+
+it('requires native trace preparation and preserves its export failure', async () => {
+  const { app } = controlledCleanupApp();
+  const owner = createCleanupOwner(app);
+  const page = owner.page;
+  owner.launch = vi.fn();
+  await expect(owner.launchAfterNativeExit(app)).rejects.toThrow('was not prepared');
+  const failure = new Error('controlled trace export failure');
+  app.context = () => ({ tracing: { stop: () => Promise.reject(failure) } });
+  await expect(owner.prepareForNativeShutdown()).rejects.toBe(failure);
+  await expect(owner.launchAfterNativeExit(app)).rejects.toBe(failure);
+  expect(owner.electronApp).toBe(app);
+  expect(owner.page).toBe(page);
+  expect(owner.launch).not.toHaveBeenCalled();
+  expect(app.evaluate).not.toHaveBeenCalled();
+  expect(app.close).not.toHaveBeenCalled();
+});
+
+it('preserves a replacement owner when native trace export settles late', async () => {
+  const { app, release } = controlledCleanupApp();
+  const owner = createCleanupOwner(app);
+  owner.launch = vi.fn();
+  const exporting = owner.prepareForNativeShutdown();
+  const reopening = owner.launchAfterNativeExit(app);
+  const rejected = expect(reopening).rejects.toThrow('ownership changed');
+  const replacement = {};
+  const replacementPage = {};
+  owner.electronApp = replacement;
+  owner.page = replacementPage;
+  release();
+  await exporting;
+  await rejected;
+  expect(owner.electronApp).toBe(replacement);
+  expect(owner.page).toBe(replacementPage);
+  expect(owner.launch).not.toHaveBeenCalled();
+  expect(app.evaluate).not.toHaveBeenCalled();
+  expect(app.close).not.toHaveBeenCalled();
+});
+
+it('does not bypass cleanup already owned by teardown after native exit', async () => {
+  const { app, release } = controlledCleanupApp();
+  const owner = createCleanupOwner(app);
+  owner.launch = vi.fn();
+  release();
+  await owner.prepareForNativeShutdown();
+  owner.appClosePromises.set(app, Promise.resolve());
+  await expect(owner.launchAfterNativeExit(app)).rejects.toThrow('cleanup already started');
+  expect(owner.electronApp).toBe(app);
+  expect(owner.launch).not.toHaveBeenCalled();
+});
+
+it('reopens only the prepared SIGKILL owner without querying its disposed channels or issuing quit', async () => {
+  const { app, stop, release } = controlledCleanupApp();
+  const child = { exitCode: null, signalCode: null as string | null };
+  app.process = () => child;
+  const owner = createCleanupOwner(app);
+  release();
+  await owner.prepareForNativeShutdown();
+  child.signalCode = 'SIGKILL';
+  app.process = vi.fn(() => { throw new Error('Disposed application process channel'); });
+  app.context = vi.fn(() => { throw new Error('Disposed tracing channel'); });
+  const replacement = {}, replacementPage = {};
+  owner.launch = vi.fn(async () => {
+    expect(owner.electronApp).toBeNull();
+    expect(owner.page).toBeNull();
+    owner.electronApp = replacement;
+    owner.page = replacementPage;
+  });
+  expect(await owner.launchAfterCrash(app)).toBe(replacementPage);
+  expect(stop).toHaveBeenCalledTimes(1);
+  expect(owner.launch).toHaveBeenCalledTimes(1);
+  expect(owner.electronApp).toBe(replacement);
+  expect(owner.page).toBe(replacementPage);
+  for (const operation of [app.process, app.context, app.evaluate, app.close]) expect(operation).not.toHaveBeenCalled();
+});
+
+it.each([
+  { exitCode: null, signalCode: null },
+  { exitCode: 0, signalCode: null },
+  { exitCode: 2, signalCode: null },
+  { exitCode: null, signalCode: 'SIGTERM' },
+  { exitCode: 1, signalCode: 'SIGKILL' },
+])('refuses crash reopen for any other native terminal state: %j', async terminal => {
+  const { app, release } = controlledCleanupApp();
+  app.process = () => terminal;
+  const owner = createCleanupOwner(app);
+  const page = owner.page;
+  owner.launch = vi.fn();
+  release();
+  await owner.prepareForNativeShutdown();
+  await expect(owner.launchAfterCrash(app)).rejects.toThrow('has not exited with SIGKILL');
+  expect(owner.electronApp).toBe(app);
+  expect(owner.page).toBe(page);
+  expect(owner.launch).not.toHaveBeenCalled();
+  expect(app.evaluate).not.toHaveBeenCalled();
+  expect(app.close).not.toHaveBeenCalled();
+});
+
+it('requires captured crash ownership and retains trace export failures without clearing the app', async () => {
+  const { app } = controlledCleanupApp();
+  app.process = () => ({ exitCode: null, signalCode: 'SIGKILL' });
+  const owner = createCleanupOwner(app);
+  const page = owner.page;
+  owner.launch = vi.fn();
+  await expect(owner.launchAfterCrash({})).rejects.toThrow('no longer owned');
+  await expect(owner.launchAfterCrash(app)).rejects.toThrow('was not prepared');
+  const failure = new Error('controlled crash trace failure');
+  app.context = () => ({ tracing: { stop: () => Promise.reject(failure) } });
+  await expect(owner.prepareForNativeShutdown()).rejects.toBe(failure);
+  await expect(owner.launchAfterCrash(app)).rejects.toBe(failure);
+  expect(owner.electronApp).toBe(app);
+  expect(owner.page).toBe(page);
+  expect(owner.launch).not.toHaveBeenCalled();
+  expect(app.evaluate).not.toHaveBeenCalled();
+  expect(app.close).not.toHaveBeenCalled();
+});
+
+it('preserves a replacement owner while the crashed app trace export settles', async () => {
+  const { app, release } = controlledCleanupApp();
+  app.process = () => ({ exitCode: null, signalCode: 'SIGKILL' });
+  const owner = createCleanupOwner(app);
+  owner.launch = vi.fn();
+  const exporting = owner.prepareForNativeShutdown();
+  const reopening = owner.launchAfterCrash(app);
+  const rejected = expect(reopening).rejects.toThrow('ownership changed');
+  const replacement = {}, replacementPage = {};
+  owner.electronApp = replacement;
+  owner.page = replacementPage;
+  release();
+  await exporting;
+  await rejected;
+  expect(owner.electronApp).toBe(replacement);
+  expect(owner.page).toBe(replacementPage);
+  expect(owner.launch).not.toHaveBeenCalled();
+  expect(app.evaluate).not.toHaveBeenCalled();
+  expect(app.close).not.toHaveBeenCalled();
+});
+
+it.each(['before', 'during'])('preserves teardown ownership acquired %s crash trace completion', async when => {
+  const { app, release } = controlledCleanupApp();
+  app.process = () => ({ exitCode: null, signalCode: 'SIGKILL' });
+  const owner = createCleanupOwner(app);
+  owner.launch = vi.fn();
+  const exporting = owner.prepareForNativeShutdown();
+  if (when === 'before') owner.appClosePromises.set(app, Promise.resolve());
+  const reopening = owner.launchAfterCrash(app);
+  const rejected = expect(reopening).rejects.toThrow(when === 'before' ? 'cleanup already started' : 'ownership changed');
+  if (when === 'during') owner.appClosePromises.set(app, Promise.resolve());
+  release();
+  await exporting;
+  await rejected;
+  expect(owner.electronApp).toBe(app);
+  expect(owner.launch).not.toHaveBeenCalled();
+  expect(app.evaluate).not.toHaveBeenCalled();
+  expect(app.close).not.toHaveBeenCalled();
+});
+
+it('allows at most one concurrent crash reopen after the same trace export', async () => {
+  const { app, release } = controlledCleanupApp();
+  app.process = () => ({ exitCode: null, signalCode: 'SIGKILL' });
+  const owner = createCleanupOwner(app);
+  const exporting = owner.prepareForNativeShutdown();
+  const replacement = {}, replacementPage = {};
+  owner.launch = vi.fn(async () => { owner.electronApp = replacement; owner.page = replacementPage; });
+  const outcomes = Promise.allSettled([owner.launchAfterCrash(app), owner.launchAfterCrash(app)]);
+  release();
+  await exporting;
+  const results = await outcomes;
+  expect(results.filter(result => result.status === 'fulfilled')).toEqual([{ status: 'fulfilled', value: replacementPage }]);
+  expect(results.filter(result => result.status === 'rejected')).toHaveLength(1);
+  expect(owner.launch).toHaveBeenCalledTimes(1);
+  expect(owner.electronApp).toBe(replacement);
+  expect(owner.page).toBe(replacementPage);
+  expect(app.evaluate).not.toHaveBeenCalled();
+  expect(app.close).not.toHaveBeenCalled();
 });

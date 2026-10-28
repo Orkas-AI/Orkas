@@ -543,6 +543,7 @@ function openChatImageLightbox(src, alt, opts) {
   if (title) title.textContent = alt || '';
   if (window.OrkasPreviewHost) document.title = alt || 'Orkas';
   _setLightboxLoading(true);
+  _releaseLightboxImage(_lightboxImg);
   const settle = () => {
     if (loadSeq !== _lightboxLoadSeq) return;
     _clearLightboxLoadListeners();
@@ -599,7 +600,7 @@ function _releaseLightboxImage(image) {
   image.removeAttribute('src');
 }
 
-function closeChatImageLightbox() {
+function closeChatImageLightbox(opts) {
   if (!_lightboxEl) return;
   _lightboxLoadSeq += 1;
   _clearLightboxLoadListeners();
@@ -627,7 +628,7 @@ function closeChatImageLightbox() {
     document.removeEventListener('keydown', _lightboxKeyHandler);
     _lightboxKeyHandler = null;
   }
-  window.OrkasPreviewHost?.close();
+  if (!opts?.force) window.OrkasPreviewHost?.close();
 }
 
 // Document-level delegation: any markdown-rendered chat image

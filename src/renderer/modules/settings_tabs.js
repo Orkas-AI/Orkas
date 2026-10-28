@@ -21,7 +21,10 @@ function activateSettingsTab(name) {
   panes.forEach((pane) => {
     pane.hidden = pane.dataset.settingsPane !== target;
   });
-  if (target === 'data' && typeof window.initTaskCleanup === 'function') window.initTaskCleanup();
+  if (target === 'data') {
+    if (typeof window.initRecycleBin === 'function') window.initRecycleBin();
+    if (typeof window.initTaskCleanup === 'function') window.initTaskCleanup();
+  }
 }
 
 const _settingsTabsBound = new WeakSet();

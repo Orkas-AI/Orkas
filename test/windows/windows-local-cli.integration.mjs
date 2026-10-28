@@ -7,11 +7,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-if (process.platform !== 'win32') {
-  console.log('[windows-local-cli] skipped: Windows-only official CLI canary');
-  process.exit(0);
-}
-
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pcRoot = path.resolve(here, '..', '..');
 const require = createRequire(import.meta.url);
@@ -37,7 +32,9 @@ function bundledNpxCli(nodeExecutable) {
   return candidate;
 }
 
-function sanitizedEnvironment(runtimeDir, provider, manifest, npxCli) {
+export function sanitizedEnvironment(runtimeDir, provider, manifest, npxCli, {
+  nodeExecutable = process.execPath, hostEnv = process.env,
+} = {}) {
   const home = path.join(runtimeDir, 'isolated home');
   const appData = path.join(home, 'AppData', 'Roaming');
   const localAppData = path.join(home, 'AppData', 'Local');
@@ -47,17 +44,29 @@ function sanitizedEnvironment(runtimeDir, provider, manifest, npxCli) {
   fs.mkdirSync(localAppData, { recursive: true });
   fs.mkdirSync(workDir, { recursive: true });
 
-  const env = { ...process.env };
+  const env = { ...hostEnv };
   for (const key of Object.keys(env)) {
-    if (/(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|AUTHORIZATION)/i.test(key)) delete env[key];
+    if (key.toUpperCase() === 'PATH'
+        || /(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|AUTHORIZATION)/i.test(key)) delete env[key];
   }
+  const systemRoot = hostEnv.SystemRoot || hostEnv.SYSTEMROOT;
+  requireCondition(typeof systemRoot === 'string' && path.win32.isAbsolute(systemRoot),
+    'the Windows CLI canary requires SystemRoot');
+  // CI and run.cmd already put Node on PATH. Exclude that ambient runtime and
+  // retain only the selected bundled Node plus Windows curl/PowerShell/tar.
+  const systemPath = [
+    path.win32.join(systemRoot, 'System32'),
+    path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0'),
+    systemRoot,
+  ];
   return {
     ...env,
+    PATH: [path.win32.dirname(nodeExecutable), ...systemPath].join(';'),
     HOME: home,
     USERPROFILE: home,
     APPDATA: appData,
     LOCALAPPDATA: localAppData,
-    ORKAS_NODE: process.execPath,
+    ORKAS_NODE: nodeExecutable,
     ORKAS_LOCAL_CLI_PROVIDER: provider,
     ORKAS_LOCAL_CLI_BRAND: provider === 'lark' ? 'feishu' : '',
     ORKAS_LOCAL_CLI_PACKAGE: manifest.package,
@@ -123,10 +132,24 @@ function installedPackage(runtimeDir, manifest) {
   return null;
 }
 
-function runProviderCanary(parent, provider, manifest, npxCli) {
+export function runProviderCanary(parent, provider, manifest, npxCli) {
   const runtimeDir = path.join(parent, `${provider} CLI 路径`);
   fs.mkdirSync(runtimeDir, { recursive: true });
   const env = sanitizedEnvironment(runtimeDir, provider, manifest, npxCli);
+  const withoutNode = { ...env, PATH: env.PATH.split(';').slice(1).join(';') };
+  const absent = spawnSync('node', ['--version'], {
+    cwd: env.ORKAS_LOCAL_CLI_WORK_DIR, env: withoutNode,
+    encoding: 'utf8', timeout: 10_000, windowsHide: true,
+  });
+  requireCondition(absent.error?.code === 'ENOENT' && !absent.stdout && !absent.stderr,
+    'the Windows CLI canary was contaminated by a non-bundled Node runtime');
+  const selected = spawnSync('node', ['-p', 'process.execPath'], {
+    cwd: env.ORKAS_LOCAL_CLI_WORK_DIR, env,
+    encoding: 'utf8', timeout: 10_000, windowsHide: true,
+  });
+  requireCondition(!selected.error && selected.status === 0 && selected.stderr === ''
+      && fs.realpathSync(selected.stdout.trim()) === fs.realpathSync(process.execPath),
+    'the Windows CLI canary did not resolve the selected bundled Node');
   const result = spawnSync(process.execPath, [authHelper], {
     cwd: env.ORKAS_LOCAL_CLI_WORK_DIR,
     env,
@@ -168,6 +191,7 @@ function runProviderCanary(parent, provider, manifest, npxCli) {
   fs.rmSync(runtimeDir, { recursive: true, force: true });
   requireCondition(!fs.existsSync(runtimeDir), `${PROVIDER_LABELS[provider]} runtime remained locked after CLI exit`);
   console.log(`[windows-local-cli] ${PROVIDER_LABELS[provider]} PASS`);
+  return { stdout: result.stdout, stderr: result.stderr };
 }
 
 function main() {
@@ -188,13 +212,21 @@ function main() {
   console.log(`[windows-local-cli] PASS providers=${EXPECTED_PROVIDERS.length}; architecture=${process.arch}`);
 }
 
-try {
-  main();
-} catch (error) {
-  const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
-  const message = error instanceof Error && error.publicCanaryMessage === true
-    ? error.message
-    : `native canary failed${code ? ` (${code})` : ''}`;
-  console.error(`[windows-local-cli] FAIL: ${message}`);
-  process.exit(1);
+export { MANIFESTS, bundledNpxCli };
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (process.platform !== 'win32') {
+    console.log('[windows-local-cli] skipped: Windows-only official CLI canary');
+  } else {
+    try {
+      main();
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+      const message = error instanceof Error && error.publicCanaryMessage === true
+        ? error.message
+        : `native canary failed${code ? ` (${code})` : ''}`;
+      console.error(`[windows-local-cli] FAIL: ${message}`);
+      process.exitCode = 1;
+    }
+  }
 }

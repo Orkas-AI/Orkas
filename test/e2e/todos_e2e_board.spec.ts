@@ -60,6 +60,91 @@ for (const scope of ['global', 'project'] as const) {
   });
 }
 
+for (const language of ['en', 'zh']) {
+test(`confirms red to-do deletion and preserves cancelled work across account and project boards (${language})`, async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  await page.evaluate(lang => (window as any).setLang(lang), language);
+  await page.setViewportSize({ width: language === 'en' ? 1440 : 1024, height: language === 'en' ? 900 : 720 });
+  const { project } = await orkas.invoke<any>('projects.create', { name: 'Release checks' });
+  for (const entry of ['account', 'project']) {
+    const projectId = entry === 'account' ? '' : project.project_id;
+    const content = language === 'en'
+      ? 'Review <release> & deployment notes before deleting this to-do\nKeep the remaining work intact.'
+      : '删除前核对 <发布> & 部署说明，确认这是要删除的待办\n其他待办应当保留。';
+    const { task } = await orkas.invoke<any>('projects.tasks.create', { projectId, content });
+    const { task: retained } = await orkas.invoke<any>('projects.tasks.create', { projectId, content: 'Keep this work' });
+    if (entry === 'account') await openSidebarEntry(page, '#todos-btn');
+    else {
+      await page.evaluate(async id => (window as any).setView('project', id), projectId);
+      await page.locator('[data-project-tab="todo"]').click();
+    }
+    const host = page.locator(entry === 'account' ? '#todos-content' : '#project-todo-list');
+    const card = host.locator(`.project-todo-item[data-tid="${task.id}"]`);
+    const menuButton = card.locator('[data-action="todo-menu"]');
+    const openDelete = async (keyboard = false) => {
+      await card.hover();
+      await menuButton.click();
+      const remove = page.getByRole('menuitem', { name: language === 'en' ? 'Delete' : '删除', exact: true });
+      await expect(remove).toHaveCSS('color', 'rgb(220, 38, 38)');
+      await expect(page.getByRole('menuitem', { name: language === 'en' ? 'Edit' : '编辑', exact: true }))
+        .not.toHaveCSS('color', 'rgb(220, 38, 38)');
+      await page.locator('.context-menu').screenshot({ path: testInfo.outputPath(`todo-delete-menu-${entry}-${language}.png`) });
+      if (keyboard) {
+        await page.keyboard.press('End');
+        await expect(remove).toBeFocused();
+        await expect(remove).toHaveCSS('color', 'rgb(220, 38, 38)');
+        await page.keyboard.press('Enter');
+      } else {
+        await remove.hover();
+        await expect(remove).toHaveCSS('color', 'rgb(220, 38, 38)');
+        await remove.click();
+      }
+    };
+    const dialog = page.getByRole('alertdialog');
+    const tasks = async () => (await orkas.invoke<any>('projects.tasks.list', { projectId })).tasks;
+    await openDelete();
+    await expect(dialog).toBeVisible();
+    await expect(dialog.locator('.ui-dialog-message')).toHaveText(content, { useInnerText: true });
+    await expect(dialog.locator('[data-act="cancel"]')).toBeFocused();
+    expect((await tasks()).map((item: any) => item.id)).toContain(task.id);
+    await dialog.screenshot({ path: testInfo.outputPath(`todo-delete-confirm-${entry}-${language}.png`) });
+    await dialog.locator('[data-act="cancel"]').click();
+    await expect(dialog).toHaveCount(0);
+    await expect(card).toBeVisible();
+    await expect(menuButton).toBeFocused();
+    expect((await tasks()).map((item: any) => item.id)).toContain(task.id);
+
+    await openDelete(true);
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await expect(menuButton).toBeFocused();
+    expect((await tasks()).map((item: any) => item.id)).toContain(task.id);
+
+    await openDelete(true);
+    const cancel = dialog.locator('[data-act="cancel"]');
+    await expect(cancel).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(dialog.locator('[data-act="ok"]')).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(cancel).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(dialog).toHaveCount(0);
+    await expect(menuButton).toBeFocused();
+    expect((await tasks()).map((item: any) => item.id)).toContain(task.id);
+
+    await openDelete();
+    const confirm = dialog.locator('[data-act="ok"]');
+    await expect(confirm).toHaveCSS('color', 'rgb(220, 38, 38)');
+    await confirm.click();
+    await expect(dialog).toHaveCount(0);
+    await expect(card).toHaveCount(0);
+    const remainingIds = (await tasks()).map((item: any) => item.id);
+    expect(remainingIds).not.toContain(task.id);
+    expect(remainingIds).toContain(retained.id);
+  }
+});
+}
+
 // The assignment journey exercises both account-scoped agents and execution.
 
 for (const language of ['en', 'zh']) {
@@ -446,13 +531,33 @@ test('reads full todo card text with repeatable mouse and keyboard disclosure on
     };
   });
   const longRoom = await editorRoom();
-  expect(longRoom.lines).toBeGreaterThanOrEqual(8);
+  // The date/member fields consume real space; grow to the actual dialog cap
+  // rather than assuming the previous form always had room for eight lines.
+  expect(longRoom.lines).toBeGreaterThan(6);
+  expect(await page.locator('#todo-editor-modal .todo-editor-dialog').evaluate(element =>
+    Math.abs(element.getBoundingClientRect().height - parseFloat(getComputedStyle(element).maxHeight)) < 2,
+  )).toBe(true);
   expect(longRoom).toMatchObject({ fieldScrolls: true, dialogScrolls: false });
+  await expect(page.locator('#project-todo-cancel')).toBeInViewport();
+  await expect(page.locator('#project-todo-save')).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath('todo-editor-long.png') });
   await page.locator('#project-todo-cancel').click();
   // An empty field still offers six lines.
   await page.locator('#project-todo-add-btn').click();
   await expect(page.locator('#project-todo-input')).toHaveValue('');
   expect(await editorRoom()).toEqual({ lines: 6, fieldScrolls: false, dialogScrolls: false });
+  await page.screenshot({ path: testInfo.outputPath('todo-editor-empty.png') });
+  for (const width of [1024, 480]) {
+    await page.setViewportSize({ width, height: 600 });
+    expect((await editorRoom()).lines).toBeGreaterThanOrEqual(6);
+    const inputBox = (await page.locator('#project-todo-composer').boundingBox())!;
+    const fieldsBox = (await page.locator('#todo-editor-modal .todo-editor-field-grid').boundingBox())!;
+    expect(inputBox.y + inputBox.height).toBeLessThanOrEqual(fieldsBox.y);
+    await page.locator('#project-todo-cancel').scrollIntoViewIfNeeded();
+    await expect(page.locator('#project-todo-cancel')).toBeInViewport();
+    await expect(page.locator('#project-todo-save')).toBeInViewport();
+    await page.screenshot({ path: testInfo.outputPath(`todo-editor-short-${width}.png`) });
+  }
   await page.locator('#project-todo-cancel').click();
   expect(await orkas.invoke('projects.tasks.list', { projectId: pid })).toEqual(before);
 });

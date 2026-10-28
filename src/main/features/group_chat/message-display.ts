@@ -18,6 +18,9 @@ export function classifyNativeCommentary(record: GroupMessage): GroupMessage {
  * public messages. Unknown shapes and active snapshots remain untouched.
  * Runs in the history projection owner and is retained in its disk cache. */
 export function normalizeNativeMessageDisplay(record: GroupMessage): GroupMessage {
+  // A host interruption receipt is already public reply content, not an
+  // unfinished native segment. Its clock may be absent or recovered later.
+  if (record.system_kind === 'reply_interrupted') return record;
   if (record.display_phase || !record.id || !record.source_message_id || !record.turn_id
       || typeof record.text !== 'string'
       || !record.from || record.from === 'user' || record.from === 'commander'

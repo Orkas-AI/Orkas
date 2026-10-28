@@ -46,7 +46,10 @@ async function configPathForRun(opts: BackendRunOptions): Promise<string> {
     });
     if (opts.signal.aborted) throw new Error('OpenClaw tool setup cancelled.');
     if (code !== 0 || timedOut || overflow) throw new Error(SETUP_ERROR);
-    const value = stripAnsi(stdout).trim();
+    // Native 2026.4.11 may print a doctor notice before the config location.
+    // The command's final nonempty line is the path; never select a path from
+    // an earlier diagnostic when the final line is invalid.
+    const value = stripAnsi(stdout).trim().split(/\r?\n/).at(-1)?.trim();
     if (!value || /[\r\n\0]/.test(value)) throw new Error(SETUP_ERROR);
     // Native `config file` displays home-relative paths as ~, or
     // $OPENCLAW_HOME when that override is set. Expand only these known forms.

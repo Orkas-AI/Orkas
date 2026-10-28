@@ -20,7 +20,7 @@ function completions(argumentsText?: string): Response {
   return new Response(chunks.map(chunk => `data: ${JSON.stringify({ id: 'fixture', model: 'fixture', ...chunk })}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
 }
 
-it.each([false, true])('keeps strict/partial input evidence through the real SDK and runner (partial=%s)', async partial => {
+it.each([false, true])('executes only strict final input through the real SDK and runner (partial=%s)', async partial => {
   const input = { paths: [{ path: '@skill/skill-creator},{' }] };
   const json = JSON.stringify(input);
   const wire = partial ? json.slice(0, -1) : json;
@@ -37,20 +37,30 @@ it.each([false, true])('keeps strict/partial input evidence through the real SDK
   const execute = vi.fn(async (received: Record<string, unknown>) => {
     expect(received).toEqual(input);
     expect(toolInputDiagnostic(received)).toMatchObject({
-      stream_json: partial ? 'non_strict' : 'strict', tolerant_parse: partial ? 'used' : 'not_used',
+      stream_json: 'strict', tolerant_parse: 'not_used',
     });
     return { content: 'E_SKILL_REF_INVALID: Use the advertised reference.', isError: true,
       observations: { fileFailure: { code: 'E_SKILL_REF_INVALID' as const, reason: 'skill_ref_format' as const, skill_ref_valid: false } } };
   });
   const session = new Session();
-  const runner = new AgentRunner({ session, config: createConfig({ agent: { defaultProvider: 'fixture', defaultModel: 'fixture' } }), providers: registry,
+  const runner = new AgentRunner({ session, config: createConfig({ agent: { defaultProvider: 'fixture', defaultModel: 'fixture', maxRetries: 0 } }), providers: registry,
     tools: [defineTool({ name: 'read_files', description: 'Read files.', inputSchema: { type: 'object' }, execute })] });
-  await runner.run({ message: 'Inspect the protocol.' });
+  const result = await runner.run({ message: 'Inspect the protocol.' });
+  if (partial) {
+    // SDK partial parsing is suitable for streaming previews. An incomplete
+    // final argument document must never reach the real tool executor.
+    expect(execute).not.toHaveBeenCalled();
+    expect(requests).toBe(1);
+    expect(result.meta.error).toMatchObject({ kind: 'provider_error' });
+    expect(result.meta.error?.message).toContain('Invalid tool call arguments');
+    expect(warning.mock.calls.filter(call => call[1] === 'Tool returned error')).toHaveLength(0);
+    return;
+  }
   expect(execute).toHaveBeenCalledOnce();
   expect(requests).toBe(2);
   const errors = warning.mock.calls.filter(call => call[1] === 'Tool returned error');
   expect(errors).toHaveLength(1);
-  expect(errors[0][2]).toMatchObject({ input_parse: { stream_json: partial ? 'non_strict' : 'strict', tolerant_parse: partial ? 'used' : 'not_used' }, file_failure: { code: 'E_SKILL_REF_INVALID', skill_ref_valid: false } });
+  expect(errors[0][2]).toMatchObject({ input_parse: { stream_json: 'strict', tolerant_parse: 'not_used' }, file_failure: { code: 'E_SKILL_REF_INVALID', skill_ref_valid: false } });
   expect(JSON.stringify(warning.mock.calls)).not.toContain('skill-creator');
   expect(JSON.stringify(session.getMessagesForModel())).not.toContain('tolerant_parse');
 });

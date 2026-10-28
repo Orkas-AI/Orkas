@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { makeSnippet, projectChatSnippet } from '../../../../src/main/features/search/snippet';
 import { tokenize } from '../../../../src/main/features/search/tokenize';
+import { historyProcessTextAt } from '../../../../src/main/features/chat-history-records';
 
 // Frozen pre-optimization display contract, independent of the lazy reader.
 function formerSnippet(text: string, query: string): string {
@@ -16,6 +17,16 @@ function formerSnippet(text: string, query: string): string {
 }
 
 describe('search snippet compatibility', () => {
+  it('projects one public process position without expanding unrelated payloads or exposing private reasoning/media', () => {
+    const unrelated = { type: 'event', get event(): never { throw new Error('Unrelated process payload expanded'); } };
+    const message = { process: [unrelated,
+      { type: 'event', event: { stream: 'reasoning', data: { text: 'PRIVATE' } } },
+      { type: 'progress', text: 'Report ![chart](data:image/png;base64,c2VjcmV0)' },
+    ] };
+    expect(historyProcessTextAt(message, 2)).toBe('[process 2] Report ![chart]([inline image/png data omitted from history])');
+    expect(historyProcessTextAt(message, 1)).toBeUndefined();
+    expect(historyProcessTextAt(message, 9)).toBeUndefined();
+  });
   it('preserves first-token windows, whitespace, Unicode and unmatched prefixes across lazy parts', () => {
     const atoms = ['', ' \t\n', '搜索资料', 'Orkas', 'İstanbul', '🧾', 'prefix '.repeat(25), 'tail '.repeat(25)];
     for (const a of atoms) for (const b of atoms) for (const c of ['', ' 搜索 Orkas ', '   tail']) {
@@ -36,6 +47,7 @@ describe('search snippet compatibility', () => {
       visible: true, msg_id: 'm1', has_process: true,
       snippet: formerSnippet(text, 'needle'),
       process_snippet: formerSnippet('[process 0] ' + first.event.data.output, 'needle'),
+      process_index: 0,
     });
   });
 
@@ -48,6 +60,7 @@ describe('search snippet compatibility', () => {
     ];
     const result = projectChatSnippet({ text: 'Done', process }, ['alpha', 'beta']);
     expect(result?.process_snippet).toBe('[process 2] alpha beta evidence');
+    expect(result?.process_index).toBe(2);
     expect(result?.snippet).not.toContain('private');
     expect(projectChatSnippet({ content: 'photo data:image/png;base64,c2VjcmV0' }, ['photo'])?.snippet)
       .toBe('photo [inline image/png data omitted from history]');

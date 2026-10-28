@@ -108,6 +108,56 @@ async function seedProject(): Promise<void> {
 }
 
 describe('chats › moveConversationToProject', () => {
+  it('keeps generated outputs out of restored drafts across filing and unfiling', async () => {
+    let chats = await import('../../../src/main/features/chats');
+    let attachments = await import('../../../src/main/features/chat_attachments');
+    let layout = await import('../../../src/main/util/project-layout');
+    await seedProject();
+    const { conversation_id: cid } = await chats.createConversation(UID, { title: 'media handover' });
+    const note = await attachments.uploadAttachment(UID, cid, 'notes.txt', Buffer.from('user draft'));
+    expect(note.ok).toBe(true);
+    const mediaBytes = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
+    const generated = attachments.saveGeneratedMediaAttachment(UID, cid, mediaBytes, 'preview.mp4', 'video');
+    expect(generated.ok).toBe(true);
+    if (!generated.ok) return;
+    const selected = await attachments.importAttachmentFromPath(UID, cid, generated.absPath);
+    expect(selected.ok).toBe(true);
+    if (!selected.ok) return;
+    const pending = ['notes.txt', selected.info.name].sort();
+    const inventory = [...pending, generated.info.name].sort();
+    const observe = () => {
+      expect(attachments.listPendingAttachments(UID, cid).map(item => item.name).sort()).toEqual(pending);
+      expect(attachments.listAttachments(UID, cid).map(item => item.name).sort()).toEqual(inventory);
+      const dir = layout.chatAttachmentDirForConversation(UID, cid);
+      expect(fs.readFileSync(path.join(dir, generated.info.name))).toEqual(mediaBytes);
+      expect(fs.readFileSync(path.join(dir, selected.info.name))).toEqual(mediaBytes);
+      expect(fs.readFileSync(path.join(dir, 'notes.txt'), 'utf8')).toBe('user draft');
+    };
+    const reopen = async () => {
+      await (await import('../../../src/main/features/search/indexer')).flushAll();
+      vi.resetModules();
+      chats = await import('../../../src/main/features/chats');
+      attachments = await import('../../../src/main/features/chat_attachments');
+      layout = await import('../../../src/main/util/project-layout');
+    };
+    observe();
+    expect((await chats.moveConversationToProject(UID, cid, PID)).ok).toBe(true);
+    await reopen();
+    observe();
+    // Known-bad calibration: intact output bytes alone cannot prove ownership.
+    // Losing the ledger would silently select the generated file on next send.
+    const ledger = path.join(layout.chatAttachmentDirForConversation(UID, cid), '.generated-attachments.json');
+    const ownership = fs.readFileSync(ledger);
+    fs.unlinkSync(ledger);
+    expect(attachments.listPendingAttachments(UID, cid).map(item => item.name).sort()).toEqual(inventory);
+    fs.writeFileSync(ledger, ownership);
+    observe();
+    expect((await chats.moveConversationOutOfProject(UID, cid)).ok).toBe(true);
+    await reopen();
+    observe();
+    expect(fs.existsSync(cloud('projects', PID, 'chat_attachments', cid))).toBe(false);
+  });
+
   it('carries every location into the project and leaves nothing behind', async () => {
     const chats = await import('../../../src/main/features/chats');
     await seedProject();

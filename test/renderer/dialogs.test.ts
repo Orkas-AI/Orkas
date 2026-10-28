@@ -112,6 +112,8 @@ class FakeElement {
     this.attributes.set(name, value);
   }
 
+  removeAttribute(name: string): void { this.attributes.delete(name); }
+
   addEventListener(type: string, listener: Listener): void {
     const listeners = this.listeners.get(type) || [];
     listeners.push(listener);
@@ -276,6 +278,27 @@ describe('shared renderer dialogs', () => {
     action.remove();
     ctx._uiRestoreDialogFocus(action);
     expect(ctx._document.activeElement).toBe(unrelated);
+  });
+
+  it('keeps browser-opening confirmation busy, then allows retry on failure', async () => {
+    const ctx = loadDialogs();
+    let finish!: (value: boolean) => void;
+    const open = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve; }));
+    const result = ctx.uiConfirm({ message: 'Subscribe', onConfirm: open });
+    const overlay = overlays(ctx)[0];
+    const button = overlay.querySelector('[data-act="ok"]')!;
+    button.click(); button.click();
+    ctx._document.dispatchKey({ key: 'Escape' });
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(button.disabled).toBe(true);
+    expect(button.classList.contains('is-loading')).toBe(true);
+    expect(overlays(ctx)).toEqual([overlay]);
+    finish(false); await new Promise<void>(resolve => setImmediate(resolve));
+    expect(button.disabled).toBe(false);
+    expect(button.classList.contains('is-loading')).toBe(false);
+    button.click(); finish(true);
+    expect(await result).toBe(true);
+    expect(overlays(ctx)).toHaveLength(0);
   });
 
   it('keeps an async danger action visible and prevents duplicate confirmation or dismissal until it succeeds', async () => {

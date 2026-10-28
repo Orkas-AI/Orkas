@@ -16,6 +16,11 @@ function setup(failOpen = false) {
       insertBefore(child: any) { this.appendChild(child); }, querySelector: () => null,
       setAttribute(k: string, v: string) { this[k] = v; }, getAttribute(k: string) { return this[k]; },
       appendChild(child: any) { this.children.push(child); child.parentNode = this; } };
+    e.cloneNode = () => Object.assign(element(tag), { dataset: { ...e.dataset }, style: { ...e.style }, className: e.className });
+    e.replaceChild = (next: any, previous: any) => {
+      e.children[e.children.indexOf(previous)] = next; next.parentNode = e;
+      previous.parentNode = null; previous.isConnected = false;
+    };
     if (tag === 'iframe') { e.contentWindow = {}; frames.push(e); }
     return e;
   }
@@ -80,8 +85,8 @@ it('keeps automatic failures in each card and retries only the selected card', a
   h.invoke.mockImplementation(async channel => channel === 'webApps.open'
     ? { ok: true, token: 'a'.repeat(32), url: 'chat-app://app-fixture/index.html' } : {});
   retry.dispatchEvent({ type: 'click' });
-  await vi.waitFor(() => expect(h.frame.src).toBe('chat-app://app-fixture/index.html'));
-  expect(h.frame._orkasUnavailablePanel).toBeNull();
+  await vi.waitFor(() => expect(h.frames.at(-1).src).toBe('chat-app://app-fixture/index.html'));
+  expect(h.frames.at(-1)._orkasUnavailablePanel).toBeFalsy();
   expect(h.frames[1]._orkasUnavailablePanel).toBeTruthy();
 });
 

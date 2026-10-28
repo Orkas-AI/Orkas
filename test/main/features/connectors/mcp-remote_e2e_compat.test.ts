@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
 
 /** A real loopback MCP peer verifies protocol fallback, credential propagation,
  * and the absence of a second connection on auth/server failures. */
-function probe(mode: 'modern' | 'legacy' | 'unauthorized' | 'broken' | 'catalog', status = 405) {
+function probe(mode: 'modern' | 'legacy' | 'unauthorized' | 'broken' | 'catalog' | 'redirect-same' | 'redirect-other', status = 405) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mcp-remote-'));
   const probePath = path.join(root, 'probe.cjs');
   fs.writeFileSync(probePath, [
@@ -21,10 +21,12 @@ function probe(mode: 'modern' | 'legacy' | 'unauthorized' | 'broken' | 'catalog'
     `const { ListToolsRequestSchema } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/types.js'))});`,
     "const http = require('node:http');",
     `const mode = ${JSON.stringify(mode)}; const status = ${status};`,
-    'const requests = []; let peer;',
+    'const requests = []; const sinkRequests = []; let peer;',
+    "const sink = http.createServer(async (req, res) => { const chunks = []; for await (const chunk of req) chunks.push(chunk); sinkRequests.push({ key: req.headers['x-api-key'], body: Buffer.concat(chunks).toString('utf8') }); res.writeHead(500); res.end(); });",
     "const server = http.createServer(async (req, res) => {",
-    "  requests.push({ method: req.method, path: req.url, authorization: req.headers.authorization || null, accept: req.headers.accept || null });",
-    "  if (mode === 'modern') {",
+    "  requests.push({ method: req.method, path: req.url, authorization: req.headers.authorization || null, key: req.headers['x-api-key'] || null, accept: req.headers.accept || null });",
+    "  if (mode.startsWith('redirect-') && req.url === '/sse') { res.writeHead(307, { location: mode === 'redirect-same' ? '/mcp' : 'http://127.0.0.1:' + sink.address().port + '/mcp' }); res.end(); return; }",
+    "  if (mode === 'modern' || mode === 'redirect-same') {",
     "    if (req.method === 'GET') { res.writeHead(405); res.end(); return; }",
     "    const chunks = []; for await (const chunk of req) chunks.push(chunk);",
     "    const message = JSON.parse(Buffer.concat(chunks).toString('utf8'));",
@@ -46,14 +48,15 @@ function probe(mode: 'modern' | 'legacy' | 'unauthorized' | 'broken' | 'catalog'
     '  res.writeHead(404); res.end();',
     '});',
     '(async () => {',
+    "  await new Promise(resolve => sink.listen(0, '127.0.0.1', resolve));",
     "  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));",
-    "  const conn = new McpConnection(mode === 'catalog' ? 'catalog-fixture' : 'custom-fixture', { kind: 'streamable-http', url: 'http://127.0.0.1:' + server.address().port + '/sse', headers: { Authorization: 'Bearer fixture-token' } });",
+    "  const conn = new McpConnection(mode === 'catalog' ? 'catalog-fixture' : 'custom-fixture', { kind: 'streamable-http', url: 'http://127.0.0.1:' + server.address().port + '/sse', headers: { Authorization: 'Bearer fixture-token', 'X-Api-Key': 'synthetic-fixture-key' } });",
     '  let tools, error;',
     '  try { await conn.connect(); tools = await conn.listTools();',
     "    if (mode === 'modern') await new Promise(resolve => { let waited = 0; const check = () => { if (requests.some(r => r.method === 'GET') || waited >= 500) resolve(); else { waited += 10; setTimeout(check, 10); } }; check(); });",
     '  } catch (e) { error = { code: e.code, name: e.name, message: e.message }; }',
-    '  finally { await conn.close(); if (peer) await peer.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }',
-    '  process.stdout.write(JSON.stringify({ tools, error, requests }));',
+    '  finally { await conn.close(); if (peer) await peer.close(); server.closeAllConnections(); sink.closeAllConnections(); await Promise.all([new Promise(resolve => server.close(resolve)), new Promise(resolve => sink.close(resolve))]); }',
+    '  process.stdout.write(JSON.stringify({ tools, error, requests, sinkRequests }));',
     '})().catch(error => { process.stderr.write(error.stack || String(error)); process.exitCode = 1; });',
   ].join('\n'));
   try {
@@ -67,7 +70,8 @@ function probe(mode: 'modern' | 'legacy' | 'unauthorized' | 'broken' | 'catalog'
     return JSON.parse(result.stdout) as {
       tools?: { name: string }[];
       error?: { code?: number; name: string };
-      requests: { method: string; path: string; authorization: string | null; accept: string | null }[];
+      requests: { method: string; path: string; authorization: string | null; key: string | null; accept: string | null }[];
+      sinkRequests: { key?: string; body: string }[];
     };
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -75,6 +79,23 @@ function probe(mode: 'modern' | 'legacy' | 'unauthorized' | 'broken' | 'catalog'
 }
 
 describe('custom MCP remote transport compatibility', () => {
+  it('preserves initialization, tool discovery and credentials across a same-origin redirect', () => {
+    const outcome = probe('redirect-same');
+    expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();
+    expect(outcome.tools?.map(tool => tool.name)).toEqual(['read_fixture']);
+    expect(outcome.requests.some(req => req.method === 'POST' && req.path === '/mcp')).toBe(true);
+    expect(outcome.requests.every(req => req.authorization === 'Bearer fixture-token' && req.key === 'synthetic-fixture-key')).toBe(true);
+    expect(outcome.sinkRequests).toEqual([]);
+  });
+
+  it('rejects a different-port redirect before sending custom credentials or the initialization body', () => {
+    const outcome = probe('redirect-other');
+    expect(outcome.error).toBeDefined();
+    expect(outcome.tools).toBeUndefined();
+    expect(outcome.requests.map(req => `${req.method} ${req.path}`)).toEqual(['POST /sse']);
+    expect(outcome.sinkRequests).toEqual([]);
+  });
+
   it('sends both required Accept types and tolerates a 405 on the optional HTTP GET stream', () => {
     const outcome = probe('modern');
     expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();

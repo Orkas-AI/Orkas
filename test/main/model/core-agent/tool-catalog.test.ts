@@ -13,6 +13,7 @@ import {
   canonicalizeAgentToolGroups,
   canonicalizeToolGroups,
   expandToolGroups,
+  getLoadableToolGroupsSystemPromptBlock,
   invalidAgentToolGroupRefs,
   invalidToolGroupRefs,
   isToolVisibleToAgent,
@@ -324,6 +325,28 @@ describe('tool-catalog', () => {
     ]);
   });
 
+  it('tells an unbound Commander that the to-do group also holds the global list', () => {
+    // Outside a project todo_tasks is dormant and the open-work block only
+    // appears once to-dos exist, so the directory line is the first place a
+    // Commander learns where "save this as a to-do" goes.
+    const directory = getLoadableToolGroupsSystemPromptBlock({
+      availableToolNames: ['todo_tasks', 'project_setup', 'tool_load'],
+      purpose: 'runtime',
+    });
+    const todoLine = directory.split('\n').find((line) => line.includes('`todo_tasks`')) || '';
+    expect(todoLine).toMatch(/global to-do list/);
+    expect(todoLine).toMatch(/project/);
+    expect(directory).toContain('`management.projects` — To-dos.');
+    // Inside a project the tool is resident, so the directory stops describing it.
+    const resident = getLoadableToolGroupsSystemPromptBlock({
+      availableToolNames: ['todo_tasks', 'project_setup', 'tool_load'],
+      initialActiveToolNames: ['todo_tasks'],
+      purpose: 'runtime',
+    });
+    expect(resident).not.toContain('`todo_tasks`');
+    expect(resident).toContain('`project_setup`');
+  });
+
   it('scopes Office leaves while preserving the parent and pdf alias', () => {
     expect(TOOL_GROUPS.filter((group) => group.parent === 'office').map((group) => group.id))
       .toEqual(['office.word', 'office.spreadsheet', 'office.presentation', 'office.pdf']);
@@ -500,9 +523,49 @@ describe('tool-catalog', () => {
     const schemas = enumerateAllInjectedTools()
       .map((tool) => ({ name: tool.name, inputSchema: withoutDescriptions(tool.inputSchema) }))
       .sort((left, right) => left.name.localeCompare(right.name));
+    // The approved Zod 4 migration changes JSON key order and adds the implicit
+    // safe-integer ceiling. Compare the browser with the bounded legacy schema
+    // oracle, then retain the original whole-corpus fingerprints below.
+    // Legacy Zod is used only to describe this static test fixture, never input.
+    const browser = schemas.find(tool => tool.name === 'inner_browser')!;
+    const browserSchema = structuredClone(browser.inputSchema) as any;
+    expect(browserSchema.properties.option_offset.maximum).toBe(Number.MAX_SAFE_INTEGER);
+    delete browserSchema.properties.option_offset.maximum;
+    const { z: legacyZod } = require('zod/v3');
+    const { zodToJsonSchema } = require('zod-to-json-schema');
+    const { $schema, ...legacyBrowserSchema } = zodToJsonSchema(legacyZod.object(
+      require('../../../../bin/browser-tool-contract.cjs').shape(legacyZod),
+    ).strict());
+    expect(browserSchema).toEqual(withoutDescriptions(legacyBrowserSchema));
+    browser.inputSchema = withoutDescriptions(legacyBrowserSchema);
+    // 2026-10-23: list_files advertises its existing runtime rejection of an
+    // empty path. Undo only that bound to retain the preceding corpus oracle.
+    const listFiles = schemas.find(tool => tool.name === 'list_files')!.inputSchema as any;
+    expect(listFiles.properties.path).toEqual({ type: 'string', minLength: 1 });
+    delete listFiles.properties.path.minLength;
+    // 2026-10-21, requester-confirmed: corrections retain the app identity.
+    const artifact = schemas.find(tool => tool.name === 'create_artifact')!.inputSchema as any;
+    expect(artifact.properties.artifact_id).toEqual({ type: 'string' });
+    delete artifact.properties.artifact_id;
+    // 2026-10-20, requester-confirmed: preview accepts path XOR artifact_id.
+    // Undo only that exact delta to keep the preceding corpus pinned.
+    const preview = schemas.find(tool => tool.name === 'html_preview')!.inputSchema as any;
+    expect(preview.properties.artifact_id).toEqual({ type: 'string' });
+    expect(preview.required).toEqual([]);
+    delete preview.properties.artifact_id;
+    preview.required = ['path'];
     const fingerprint = createHash('sha256')
       .update(JSON.stringify(schemas))
       .digest('hex');
+    // 2026-10-19, requester-confirmed: the sole structural addition is an
+    // optional history segment index. Removing it must reproduce the prior
+    // corpus exactly; unrelated names, defaults and permissions cannot drift.
+    const previousSchemas = structuredClone(schemas);
+    const history = previousSchemas.find(tool => tool.name === 'chat_history')!;
+    expect((history.inputSchema as any).properties.process_index).toEqual({ type: 'integer', minimum: 0 });
+    delete (history.inputSchema as any).properties.process_index;
+    expect(createHash('sha256').update(JSON.stringify(previousSchemas)).digest('hex'))
+      .toBe('74dd4963f96a37267a8bbb1080994ccba845619bb062ff77fe7f70f298bea84a');
     // Requester-confirmed portable root objects replace the nine first-party
     // action unions; executors retain conditional requirements and scope checks.
     // 2026-09-18: inner_browser gained an optional `scope` on observe. It only
@@ -544,7 +607,7 @@ describe('tool-catalog', () => {
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('74dd4963f96a37267a8bbb1080994ccba845619bb062ff77fe7f70f298bea84a');
+    ).toBe('9eef8d03356d5a886f545d8e88f1e3f97645f152e01cd2d71990ad096045aee6');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {
@@ -690,7 +753,7 @@ describe('tool-catalog', () => {
       edit_file: ['old_string', 'new_string', 'unique', 'optimistic concurrency'],
       publish_outputs: ['complete', 'final', 'paths', 'current turn'],
       create_artifact: ['interactive', 'files', 'path', 'content', 'index.html'],
-      html_preview: ['local', 'desktop', 'mobile', 'screenshot', 'overflow', 'network'],
+      html_preview: ['local', 'desktop', 'mobile', 'screenshot', 'overflow', 'isolated', 'artifact_id', 'current conversation', 'exactly one'],
       delete_file: ['confirmation', 'confirmation_token', 'path'],
       process_session: ['bash', 'session_id', 'read', 'write', 'stop', 'yield_time_ms'],
       interactive_cli: ['live user input', 'command', 'purpose', 'read', 'send', 'close'],

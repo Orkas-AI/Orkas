@@ -38,6 +38,48 @@ async function invoke(provider: LLMProvider, method: 'complete' | 'stream', para
 }
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
+// The history consumer must receive original plaintext even before any public
+// answer exists. Exercise both SDK entry points, observer hooks and disk reload.
+it.each(['complete', 'stream'] as const)('preserves plaintext-only Chat history on %s after reload', async method => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-chat-reasoning-'));
+  const file = path.join(directory, 'session.jsonl');
+  const chat = { ...model, api: 'openai-completions' as const, provider: 'custom' };
+  const session = new PersistentSession({ sessionFile: file });
+  session.beginUserTurn([{ type: 'text', text: 'Continue the calculation.' }]);
+  const fields = ['reasoning_content', 'reasoning', 'reasoning_text'];
+  for (const field of fields) {
+    session.addAssistantMessage([{ type: 'thinking', thinking: `Original ${field}.`,
+      thinkingSignature: field, replayOrigin: replayOrigin(chat, 'fixture') }]);
+  }
+  const messages = new PersistentSession({ sessionFile: file }).getMessagesForModel();
+  messages.push({ role: 'developer', content: [{ type: 'text', text: 'Use the preserved calculation.' }] });
+  const before = JSON.stringify(messages);
+  const wires: any[] = [], observed: any[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init: any) => {
+    wires.push(JSON.parse(init.body));
+    return new Response('data: {"choices":[{"index":0,"delta":{"content":"Seven."},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+      { headers: { 'content-type': 'text/event-stream' } });
+  }));
+  try {
+    const provider = createPiProvider({ provider: 'custom', apiKey: 'fixture', customModel: chat,
+      onPayload: async payload => { observed.push(structuredClone(payload)); } });
+    await invoke(provider, method, { messages, maxTokens: 73 });
+    expect(wires).toHaveLength(1);
+    expect(observed[0].messages).toEqual(wires[0].messages);
+    expect(wires[0].max_completion_tokens ?? wires[0].max_tokens).toBe(73);
+    expect(JSON.stringify(wires)).not.toContain('orkas-chat-replay:');
+    const assistants = wires[0].messages.filter((m: any) => m.role === 'assistant');
+    expect(assistants).toHaveLength(3);
+    fields.forEach((field, index) => {
+      expect(assistants[index][field]).toBe(`Original ${field}.`);
+      expect(assistants[index].content || '').toBe('');
+      expect(assistants[index]).not.toHaveProperty('tool_calls');
+    });
+    expect(JSON.stringify(messages)).toBe(before);
+    expect(fs.readFileSync(file, 'utf8')).not.toContain('orkas-chat-replay:');
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
 it.each(['complete', 'stream'] as const)('keeps managed replay provenance off direct %s requests', async method => {
   const marked = { ...reasoning, _orkas_replay: 'v1:synthetic-managed-source' };
   const messages: CompletionParams['messages'] = [

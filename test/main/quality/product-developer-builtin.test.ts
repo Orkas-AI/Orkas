@@ -104,14 +104,8 @@ describe('ProductDeveloper builtin contract', () => {
     const productUi = fs.readFileSync(
       path.join(builtinMarketplaceRoot, 'skills', 'fc125b9df078', 'SKILL.md'), 'utf8',
     );
-    expect(productUi).toContain('prefers-reduced-motion');
-    expect(productUi).toContain('copy-paste deployment steps');
-    expect(productUi).toContain('missing placeholder file');
-    expect(productUi).toContain('Add mobile or multi-device reflow only when the user requests it');
-    expect(productUi).toContain('screenshots:true');
-    expect(productUi).toContain('Tab-key focus traversal');
-    expect(productUi).toContain('observed download filenames');
-    expect(productUi).toContain('do not search for or install Playwright');
+    expect(productUi).toContain('references/ui-implementation.md');
+    expect(productUi).not.toContain('Tab-key focus traversal');
 
     const productDevRoot = path.join(builtinMarketplaceRoot, 'skills', '68fb048b85cb');
     const repositoryIntake = fs.readFileSync(path.join(productDevRoot, 'references', 'repository-intake.md'), 'utf8');
@@ -315,43 +309,27 @@ describe('ProductDeveloper builtin contract', () => {
     );
     expect(productUiSkill).toContain('standalone greenfield UI');
     expect(productUiSkill).toContain('Do not replace implementation with a handoff plan');
-    expect(productUiSkill).toContain('prefers-reduced-motion');
-    expect(productUiSkill).toContain('copy-paste deployment steps');
-    expect(productUiSkill).toContain('missing placeholder file');
-    expect(productUiSkill).toContain('target:"responsive"` only when the user explicitly requests');
-    expect(productUiSkill).toContain('otherwise omit target for desktop');
-    expect(productUiSkill).toContain('`screenshots` defaults to false');
-    expect(productUiSkill).toContain('`screenshots:true` only for the final visual review');
-    expect(productUiSkill).toContain('call `html_preview` on the actual entry before completion');
-    expect(productUiSkill).toContain('desktop by default');
-    expect(productUiSkill).not.toContain('include every requested section and reachable action, mobile reflow');
-    expect(productUiSkill).not.toContain('at least one desktop and one mobile viewport');
-    expect(productUiSkill).toContain('Do not hide overflow globally');
-    expect(productUiSkill).toContain('do not search for or install Playwright');
-    expect(productUiSkill).toContain('observed download filenames, MIME types, and byte sizes');
-    expect(productUiSkill).toContain('Rendered evidence belongs to the exact UI revision it captured');
-    expect(productUiSkill).toContain('report only that post-change evidence');
-    expect(productUiSkill).toContain('one source-to-target row per screen');
-    expect(productUiSkill).toContain('A partial result names every remaining screen');
-    expect(productUiSkill).toContain('reopens the full ledger');
-    expect(productUiSkill).not.toMatch(/#contact|390\s*[×x]\s*844|1440\s*[×x]\s*900/i);
-    expect(productUiImplementation).toContain('clear standalone greenfield UI artifact');
-    expect(productUiImplementation).toContain('explicitly targets an existing app');
+    // The implementation reference owns the procedure. The entry must route
+    // standalone and in-app work to it, rather than duplicate its checks.
+    expect(productUiSkill).toContain('including standalone');
+    expect(productUiSkill).toContain('references/ui-implementation.md');
+    expect(productUiSkill).not.toMatch(/screenshots:true|Tab-key focus traversal|observed download filenames/);
     expect(productUiImplementation).toContain('prefers-reduced-motion');
     expect(productUiImplementation).toContain('copy-paste deployment steps');
     expect(productUiImplementation).toContain('missing placeholder file');
-    expect(productUiImplementation).toContain('target:"responsive"` only for an explicit responsive, multi-device, or narrow-screen request');
+    expect(productUiImplementation).toContain('target:"responsive"');
     expect(productUiImplementation).toContain('otherwise omit target for desktop');
-    expect(productUiImplementation).toContain('`screenshots` defaults to false');
-    expect(productUiImplementation).toContain('`screenshots:true` only for the final visual review');
-    expect(productUiImplementation).toContain('call `html_preview`');
-    expect(productUiImplementation).toContain('Requested viewport targets');
+    expect(productUiImplementation).toContain('html_preview');
+    expect(productUiImplementation).toContain('screenshots:true');
     expect(productUiImplementation).toContain('overflow-x: hidden');
     expect(productUiImplementation).toContain('Do not search for or install another browser runtime');
-    expect(productUiImplementation).toContain('observed download filenames, MIME types, and byte sizes');
-    expect(productUiImplementation).toContain('separate `inspected`, `implemented`, and `compared` status');
+    expect(productUiImplementation).toContain('separate \u0060inspected\u0060, \u0060implemented\u0060, and \u0060compared\u0060 status');
     expect(productUiImplementation).toContain('compare every promised screen against a fresh rendered target');
     expect(productUiImplementation).toContain('reopen the full ledger');
+    expect(productUiImplementation).toContain('after the final relevant edit');
+    expect(productUiImplementation).toContain('actual result');
+    expect(productUiImplementation).toContain('unverified');
+    expect(productUiImplementation).not.toContain('Report Tab-key focus traversal and visible-focus counts');
 
     const reviewAndFinish = fs.readFileSync(
       path.join(productDevDir, 'references', 'review-and-finish.md'),

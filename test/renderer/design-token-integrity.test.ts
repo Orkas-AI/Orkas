@@ -19,8 +19,6 @@ const RUNTIME_INJECTED = new Set([
   '--oss-c', // modules/oss.js, modules/marketplace.js
   '--chat-image-aspect-ratio', // modules/utils.js
   '--chat-image-natural-width', // modules/utils.js
-  '--composer-model-marquee-distance', // modules/composer-model-picker.js
-  '--composer-model-marquee-duration', // modules/composer-model-picker.js
   '--turn-nav-preview-y', // modules/conversation-turn-nav.js
   '--activity-group-height', // modules/web-assist.js, set before `.is-contained` applies it
 ]);
@@ -29,19 +27,36 @@ function readRendererCss() {
   return fs.readFileSync(CSS_PATH, 'utf8');
 }
 
+function withoutCssLiterals(css: string) {
+  return css.replace(/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\*[\s\S]*?\*\//g, ' ');
+}
+
 function declaredProperties(css: string) {
   const names = new Set<string>();
-  for (const match of css.matchAll(/(?:^|[;{\s])(--[a-zA-Z0-9_-]+)\s*:/g)) names.add(match[1]);
+  for (const match of withoutCssLiterals(css).matchAll(/(?:^|[;{\s])(--[a-zA-Z0-9_-]+)\s*:/g)) names.add(match[1]);
   return names;
 }
 
 function referencedProperties(css: string) {
   const names = new Set<string>();
-  for (const match of css.matchAll(/var\(\s*(--[a-zA-Z0-9_-]+)/g)) names.add(match[1]);
+  for (const match of withoutCssLiterals(css).matchAll(/var\(\s*(--[a-zA-Z0-9_-]+)/g)) names.add(match[1]);
   return names;
 }
 
 describe('renderer design token integrity', () => {
+  it.each([
+    ['comment declaration', '/* --missing: red; */ .example { color: var(--missing); }', [], ['--missing']],
+    ['quoted declaration', '.example { content: " --missing: red;"; color: var(--missing); }', [], ['--missing']],
+    ['comment reference', '/* color: var(--ghost); */ .example { --real: black; color: var(--real); }', ['--real'], ['--real']],
+    ['quoted reference', '.example { content: "var(--ghost)"; --real: black; color: var(--real); }', ['--real'], ['--real']],
+    ['single-quoted literal', `.example { content: 'var(--ghost) --missing:red;'; --real: black; color: var(--real); }`, ['--real'], ['--real']],
+    ['escaped quote', String.raw`.example { content: "escaped \" var(--ghost) --missing:red;"; --real: black; color: var(--real); }`, ['--real'], ['--real']],
+    ['comment markers in a string', '.example { content: "/* --missing:red; */ var(--ghost)"; --real: black; color: var(--real); }', ['--real'], ['--real']],
+  ] as const)('counts executable CSS tokens only: %s', (_label, css, declarations, references) => {
+    expect([...declaredProperties(css)]).toEqual(declarations);
+    expect([...referencedProperties(css)]).toEqual(references);
+  });
+
   it('never references a custom property that nothing defines', () => {
     const css = readRendererCss();
     const declared = declaredProperties(css);
@@ -53,7 +68,7 @@ describe('renderer design token integrity', () => {
 
   it('keeps the palette entries TOKENS.md declares binding', () => {
     const css = readRendererCss();
-    const root = css.match(/:root\s*\{[\s\S]*?\}/)?.[0] || '';
+    const root = withoutCssLiterals(css).match(/:root\s*\{[\s\S]*?\}/)?.[0] || '';
     for (const [name, value] of [
       ['--primary', '#5b57d6'],
       ['--primary-soft', '#e8e8fe'],
@@ -68,7 +83,7 @@ describe('renderer design token integrity', () => {
   });
 
   it('does not reintroduce the retired ghost token names', () => {
-    const css = readRendererCss();
+    const css = withoutCssLiterals(readRendererCss());
     for (const ghost of [
       '--accent',
       '--accent-soft',

@@ -22,8 +22,8 @@ describe('Office preview fidelity contract', () => {
     expect(preview).toContain("if (kind === 'word') return '.docx'");
     expect(preview).toContain("if (kind === 'spreadsheet') return '.xlsx'");
     expect(preview).toContain('layoutRendered: true');
-    expect(preview).toContain("connect-src 'none'");
-    expect(preview).toContain("object-src 'none'");
+    // The dynamic rendered-preview owner asserts the actual hardened HTML.
+    expect(preview).toContain('hardenOfficeHtml(presentationSafeSource)');
     expect(ipc).toContain('officeFileToPreviewHtml(kind, path.basename(norm), norm, buf)');
     expect(contexts).toContain('officeFileToPreviewHtml(kind, path.basename(p), p, buf)');
     expect(projects).toContain('officeFileToPreviewHtml(kind, path.basename(r.absPath), r.absPath, buf)');

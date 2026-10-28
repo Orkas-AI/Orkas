@@ -83,6 +83,21 @@ describe('task_board › planned split note (D29)', () => {
 });
 
 describe('task_board › lifecycle', () => {
+  it('persists sent-message state without claiming execution and retains it on reload', async () => {
+    const tb = await board();
+    const task = await tb.createTask(TEST_UID, TEST_CID, {
+      assignee: 'commander', instruction: 'Correction', createdBy: 'user', sourceMsgId: 'm1',
+    });
+    const at = '2026-10-21T12:00:00Z';
+    expect(await tb.markMessageSent(TEST_UID, TEST_CID, task.task_id, at)).toMatchObject({
+      status: 'queued', message_sent_at: at,
+    });
+    expect((await readSnapshot())[0]).toMatchObject({ status: 'queued', message_sent_at: at });
+    tb._resetForTest();
+    const restored = (await tb.listTasks(TEST_UID, TEST_CID))[0];
+    expect(restored.message_sent_at).toBe(at);
+    expect(restored.absorbed_into_turn_id).toBeUndefined();
+  });
   it('reports listener failure privately and still persists the task and notifies other listeners', async () => {
     const tb = await board();
     const next = vi.fn();

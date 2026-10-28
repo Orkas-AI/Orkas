@@ -122,6 +122,11 @@ function officeIssueEntries(value: unknown): Array<Record<string, unknown>> {
 }
 
 function officeIssueSeverity(issue: Record<string, unknown>): OfficeIssueSeverity {
+  // Bundled OfficeCLI's IssueSeverity enum serializes as numbers:
+  // Error=0, Warning=1, Info=2. Preserve string/subtype compatibility below.
+  if (issue.severity === 0) return 'blocker';
+  if (issue.severity === 1) return 'warning';
+  if (issue.severity === 2) return 'info';
   const upstream = typeof issue.severity === 'string' ? issue.severity.trim().toLowerCase() : '';
   if (['blocker', 'error', 'fatal', 'critical'].includes(upstream)) return 'blocker';
   if (['warning', 'warn', 'advisory'].includes(upstream)) return 'warning';

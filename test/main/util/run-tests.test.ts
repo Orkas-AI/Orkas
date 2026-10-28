@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { findTestNpmCli } from '../../helpers/npm-cli';
 
 const pcRoot = path.resolve(__dirname, '../../..');
 const roots: string[] = [];
@@ -46,28 +47,8 @@ function fixture() {
   return root;
 }
 
-/** npm and direct Node launchers both use the installed npm CLI. Homebrew
- * and other split layouts can put npm outside the outer Node's prefix. */
-function npmCli(): string | undefined {
-  const bin = path.dirname(node);
-  const candidates = [
-    process.env.npm_execpath,
-    path.join(bin, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
-    path.join(bin, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
-  ];
-  for (const directory of String(process.env.PATH || '').split(path.delimiter)) {
-    if (!directory) continue;
-    try {
-      const entry = fs.realpathSync(path.join(directory, 'npm'));
-      if (path.basename(entry) === 'npm-cli.js') candidates.push(entry);
-    } catch { /* A PATH entry need not contain npm. */ }
-    candidates.push(path.join(directory, 'node_modules', 'npm', 'bin', 'npm-cli.js'));
-  }
-  return candidates.find((candidate): candidate is string => !!candidate && fs.existsSync(candidate));
-}
-
 function invoke(root: string, args: string[], env: Record<string, string> = {}) {
-  const npm = npmCli();
+  const npm = findTestNpmCli(node);
   if (!npm) throw new Error('No npm CLI found on PATH or beside the test Node.');
   const result = spawnSync(node, [npm, ...args], {
     cwd: root, env: { ...process.env, ...env }, encoding: 'utf8', timeout: 15_000,

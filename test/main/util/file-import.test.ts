@@ -3,11 +3,12 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   assertLocalImportTarget,
   copyLocalFileAtomic,
+  copyLocalEntryExclusiveSync,
   inspectLocalImportSource,
   withLocalImportLock,
 } from '../../../src/main/util/file-import';
@@ -152,4 +153,68 @@ describe('local file import locking', () => {
     await expect(withLocalImportLock('library-a', async () => 'recovered'))
       .resolves.toBe('recovered');
   });
+});
+
+
+describe('create-only entry copy failure recovery', () => {
+  it('removes only its claimed partial directory and can retry after an I/O failure', async () => {
+    const source = path.join(root, 'source'); const target = path.join(root, 'target');
+    fs.mkdirSync(source); fs.writeFileSync(path.join(source, 'note.md'), 'Original directory source');
+    const nodeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const error = Object.assign(new Error('Injected copy I/O failure'), { code: 'EIO' });
+    const spy = vi.spyOn(nodeFs, 'cpSync').mockImplementation(() => {
+      fs.writeFileSync(path.join(target, 'partial.md'), 'Incomplete copy'); throw error;
+    }); syncBuiltinESMExports();
+    try { expect(() => copyLocalEntryExclusiveSync(source, target, true)).toThrow(error); }
+    finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(fs.existsSync(target)).toBe(false);
+    expect(fs.readFileSync(path.join(source, 'note.md'), 'utf8')).toBe('Original directory source');
+    copyLocalEntryExclusiveSync(source, target, true);
+    expect(fs.readdirSync(target)).toEqual(['note.md']);
+    expect(fs.readFileSync(path.join(target, 'note.md'), 'utf8')).toBe('Original directory source');
+  });
+
+  it('leaves no target or source mutation when native file copying fails, then retries exact binary bytes', async () => {
+    const source = path.join(root, 'source.bin'); const target = path.join(root, 'target.bin');
+    const bytes = Buffer.from([0, 1, 255, 0, 200]); fs.writeFileSync(source, bytes);
+    const nodeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const error = Object.assign(new Error('Injected native copy failure'), { code: 'EIO' });
+    const spy = vi.spyOn(nodeFs, 'copyFileSync').mockImplementation(() => { throw error; });
+    syncBuiltinESMExports();
+    try { expect(() => copyLocalEntryExclusiveSync(source, target, false)).toThrow(error); }
+    finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(fs.existsSync(target)).toBe(false); expect(fs.readFileSync(source)).toEqual(bytes);
+    copyLocalEntryExclusiveSync(source, target, false);
+    expect(fs.readFileSync(target)).toEqual(bytes); expect(fs.readFileSync(source)).toEqual(bytes);
+  });
+});
+
+
+it.runIf(process.platform !== 'win32')('keeps private directory and nested file modes during a create-only copy', () => {
+  const source = path.join(root, 'private-source'), target = path.join(root, 'private-copy');
+  fs.mkdirSync(source, { mode: 0o700 }); fs.writeFileSync(path.join(source, 'note.md'), 'Private mode fixture', { mode: 0o600 });
+  copyLocalEntryExclusiveSync(source, target, true);
+  expect(fs.statSync(target).mode & 0o777).toBe(0o700);
+  expect(fs.statSync(path.join(target, 'note.md')).mode & 0o777).toBe(0o600);
+  expect(fs.readFileSync(path.join(target, 'note.md'), 'utf8')).toBe('Private mode fixture');
+});
+
+
+it('preserves a replacement destination root when partial-directory cleanup observes a different inode', async () => {
+  const source = path.join(root, 'source'), target = path.join(root, 'target'), displaced = path.join(root, 'displaced');
+  fs.mkdirSync(source); fs.writeFileSync(path.join(source, 'note.md'), 'Original source');
+  const nodeFs = (await import('node:fs')).default;
+  const { syncBuiltinESMExports } = await import('node:module');
+  const error = Object.assign(new Error('Injected copy interruption'), { code: 'EIO' });
+  const spy = vi.spyOn(nodeFs, 'cpSync').mockImplementation(() => {
+    fs.renameSync(target, displaced); fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'winner.md'), 'Replacement root winner'); throw error;
+  }); syncBuiltinESMExports();
+  try { expect(() => copyLocalEntryExclusiveSync(source, target, true)).toThrow(error); }
+  finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  expect(fs.readdirSync(target)).toEqual(['winner.md']);
+  expect(fs.readFileSync(path.join(target, 'winner.md'), 'utf8')).toBe('Replacement root winner');
+  expect(fs.readFileSync(path.join(source, 'note.md'), 'utf8')).toBe('Original source');
 });

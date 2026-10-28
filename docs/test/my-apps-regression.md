@@ -13,27 +13,26 @@ fixture does not establish model output quality or live third-party availability
   damaged-metadata, interrupted-write and denied-capability cases are negative
   controls; an unrelated warning remains a failure to investigate.
 
-## Commercial web application entry
+## Unified apps and publication guidance
 
-1. Activate the Web apps tab or the Web app creation option. The commercial
-   guidance appears before any conversation, model request, artifact, preview
-   or runtime instance is created. Cancel/Escape preserve the current local
-   view, draft and focus. Verify Chinese and English at normal and narrow sizes.
-2. Only an explicit Download action opens the official localized download URL.
-   An opener failure remains recoverable; cancel, page load and repeated model
-   failures never open the browser automatically.
-3. Direct IPC and tool requests for `web` or legacy `cloud` return the specific
-   `E_COMMERCIAL_REQUIRED` / `web_apps` receipt. Tool results are errors and keep
-   the receipt intact. A localized, nonblocking chat notice provides the download
-   action, once per turn, without relying on the model's wording.
-4. Retained web metadata, structured task bindings and edit snapshots remain
-   authoritative when a caller omits type or claims local. Save, update, edit,
-   preview, SDK and direct resource requests cannot execute that web source.
-   Compare all original files, metadata, databases and journals before/after,
-   including restart and background cleanup. They must remain unchanged.
-5. Corrupt/unreadable binding metadata cannot become local permission. Genuine
-   legacy local fallback remains available. Ordinary HTML, website authoring
-   and external resources in an authorized local application remain usable.
+1. Local, web and legacy cloud apps share one Apps list and creation dialog.
+   Create, save, update, edit, open, preview and local execution remain available
+   without a commercial-version dialog. Legacy metadata preserves its capability
+   identity; a web app still cannot invoke host-only SDK methods.
+2. Publish remains in every app menu. Invoking it opens the standard localized
+   Cancel / Download commercial version dialog. Cancellation preserves the app,
+   draft and invoking focus. Check English and Chinese at normal and narrow sizes.
+3. Only an explicit Download action opens the official download page with the
+   current supported Web language. An opener failure presents localized recovery
+   and preserves the app. Page load, creation and ordinary app errors never open
+   the browser or start publication.
+4. Direct existing publication IPC returns the explicit
+   `E_COMMERCIAL_REQUIRED` / `web_apps` failure before preparing a snapshot,
+   uploading or changing local state. Ordinary artifact tools remain usable;
+   no new model-visible publication tool is introduced.
+5. Corrupt or unreadable metadata cannot become local SDK permission. Reject
+   conflicting types on a bound editing source before writes. Genuine legacy
+   local fallback and ordinary local HTML remain compatible.
 
 ## Local creation, list and save
 
@@ -42,23 +41,24 @@ fixture does not establish model output quality or live third-party availability
   Cancel/backdrop/Escape retain a session draft; a reset clears it.
 - The list uses local metadata, preserves cards after a failed/malformed refresh,
   rejects a late stale listing after deletion, and confirms a genuine empty list.
-  Counts, type controls, menus and long titles remain stable at narrow widths.
+  Counts, one creation entry, menus and long titles remain stable at narrow widths.
 - Save an artifact and a complete file bundle, including a non-index entry,
   CSS/module/JSON/font/audio assets, binary content and ordinary long paths.
   Reject traversal, hidden/managed paths, symlinks, invalid encoding and oversized
   input before changing the destination. A workspace-root entry requires its own
-  folder. Show one confirmation after an actual successful save.
+  folder. Show one toast after an actual successful save.
 - Omitted or null type in an ordinary task retains local compatibility; conflicting
   types in a bound edit fail before writes. Saving a valid independent local copy
   must not overwrite its original or silently change identity.
 
 ## Open, edit and recovery
 
-- Open a local card with mouse, Enter and Space. One action opens one preview;
+- Open a card of any retained app type with mouse, Enter and Space. One action opens one preview;
   rename preserves identity and icon. Refresh/restart retain the saved result.
 - Editing creates a source-attached task with the exact original identity and
-  fingerprint. Conflicting source changes require an explicit recovery choice;
-  repeated or interrupted commits do not lose the original or duplicate data.
+  capability identity. Updating retains its ID and compatible records. Saving a new
+  app binds this source to an independent copy; a deleted destination creates a
+  new ID. Repeated or interrupted commits do not lose the original or duplicate data.
 - Exercise each save-journal crash point and cleanup failure. Recovery retains a
   usable source and only commits a complete replacement. Missing/damaged edit
   context produces a recoverable failure rather than an invented local binding.
@@ -89,9 +89,38 @@ fixture does not establish model output quality or live third-party availability
   Delete confirmation names the app and irreversible local records/private files.
   Cancel has initial focus and preserves data; success removes the card only
   after backend confirmation. Failure keeps the card and permits retry.
-- Check card dates, exact edit draft, app-type tags and failure copy in every
+- Check card dates, exact edit draft, unified icons and failure copy in every
   registered language. No untranslated key, private path or backend text appears
   in alerts. Long names and RTL layouts retain accessible buttons and local scroll.
 - Hosted publication, online data management and personal synchronization are
   unavailable. Their execution/recovery journeys are outside this build; the
   retained entry only explains how to obtain the commercial version.
+
+## Revision and save-destination continuity
+
+- Correcting an artifact retains its ID, saved destination, type and records.
+  Streamed and restored history refresh one existing card. Failed preparation
+  keeps the previous bundle; independent creations remain independent. An open
+  native preview follows only a newer revision of that same artifact.
+- After saving an artifact or workspace bundle, each source exposes Update
+  original app / Save new app. Reopening and sibling JS/CSS/directory discovery
+  recover the same destination. An explicit Save new changes only that source's
+  destination; a deleted destination never falls back to an unrelated original.
+- Simultaneous automatic saves and symlink aliases create one destination.
+  Canonical directory identity owns the save queue and binding. Conflicting old
+  lexical bindings require an explicit new copy; do not guess between old copies.
+- Saving a non-index HTML and later updating from sibling JS/CSS retains its
+  selected entry and title. A missing selected entry fails without replacing the
+  saved version. Explicit HTML selection may change the entry.
+- Both artifact and file save entries use the same record migration recovery.
+  Export failure/cancellation, clear cancellation, user change, stale data/code
+  and changed destination never clear records or replace code. Confirmed recovery
+  updates the same app and an exported SQLite file retains the original values.
+- Application shutdown closes data owners and waits for their SQLite checkpoints.
+  A compatible update and complete application restart retain formal records.
+  Preview records stay temporary.
+
+Owning evidence: `chat-artifact-revisions.test.ts`, `saved_apps.test.ts`,
+`web_apps.test.ts`, `preview-windows.test.ts`, `app-save-recovery.test.ts`,
+`artifact-revisions.test.ts`, `artifact_revisions_e2e_lifecycle.spec.ts`,
+`saved_apps_e2e_lifecycle.spec.ts` and `web_app_sdk_e2e_lifecycle.spec.ts`.

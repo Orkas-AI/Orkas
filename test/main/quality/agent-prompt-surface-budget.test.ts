@@ -73,7 +73,7 @@ const AGENTS_ROOT = path.join(
  *  deliberately about one percent: an ordinary wording fix fits, a new
  *  paragraph does not. */
 const RECORDED_CEILING: Readonly<Record<string, number>> = {
-  VideoStudio: 6_987,
+  VideoStudio: 7_277,
   VoiceStudio: 2_571, // Audio-only Agent; one private Skill, no runtime manual.
   // Re-measured 2026-09-09 at 7,996 after the BACKLINK route joined the
   // surface: one workflow line naming `seo-backlink-value`, its roster

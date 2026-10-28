@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -16,9 +16,10 @@ const { _autoGroupTasks: groupTasks } = require('../../src/renderer/modules/auto
 function loadAutoTab(options: { projects: Project[] | null; view: string }) {
   let scopes: any[] = [];
   let selectedGroup: any = null;
+  const rows = () => selectedGroup?.children.find((child: any) => child.className === 'auto-scope-cards')?.children || [];
   const list: any = {
     clears: 0,
-    querySelectorAll: () => [],
+    querySelectorAll: (selector: string) => rows().filter((row: any) => !selector.includes('.is-highlighted') || row.classList.contains('is-highlighted')),
     appendChild(child: any) {
       if (child.className.includes('auto-scope-switcher')) scopes = child.children;
       if (child.className === 'auto-scope-group') selectedGroup = child;
@@ -43,6 +44,13 @@ function loadAutoTab(options: { projects: Project[] | null; view: string }) {
     escapeHtml: (value: unknown) => String(value ?? ''),
     uiAlert() {},
     currentView: options.view,
+    renderTaskRow: (task: Task) => {
+      const classes = new Set<string>();
+      return { task, dataset: { taskId: task.id }, scrollIntoView: vi.fn(), classList: {
+        add: (name: string) => classes.add(name), remove: (name: string) => classes.delete(name),
+        contains: (name: string) => classes.has(name),
+      } };
+    },
     _projectsCache: options.projects,
     loadProjects: async (force?: boolean) => {
       sidebarLoads.push(force);
@@ -77,10 +85,11 @@ function loadAutoTab(options: { projects: Project[] | null; view: string }) {
     _refreshAutoSyncNotice = async () => {};
     _autoLoadTaskConversationCounts = async () => {};
     _closeAutoRowMenu = () => {};
-    _autoRenderRow = (task) => ({ task });
+    _autoRenderRow = renderTaskRow;
   `, context);
   return {
     context,
+    rows,
     create: () => elements['auto-add-btn'].click(),
     sidebarLoads,
     scopeNames: () => scopes.map((scope) => /todo-scope-chip-name">([^<]*)</.exec(scope.innerHTML)?.[1] || ''),
@@ -91,7 +100,109 @@ function loadAutoTab(options: { projects: Project[] | null; view: string }) {
   };
 }
 
+function deferredList() {
+  let respond!: (value: { ok: boolean; tasks: Task[] }) => void;
+  let notify!: () => void;
+  const response = new Promise<{ ok: boolean; tasks: Task[] }>(resolve => { respond = resolve; });
+  const started = new Promise<void>(resolve => { notify = resolve; });
+  return { started, respond, invoke: () => { notify(); return response; } };
+}
+
 describe('automation tab and the sidebar project cache', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('keeps the newer saved automation selected when the earlier lookup finishes last', async () => {
+    vi.useFakeTimers();
+    const tab = loadAutoTab({ projects: [{ project_id: 'a', name: 'Alpha' }], view: 'auto' });
+    await tab.context.loadAutoList(true);
+    const older = deferredList();
+    const newer = deferredList();
+    const requests = [older, newer];
+    tab.context.window.orkas.invoke = vi.fn(() => requests.shift()!.invoke());
+    const pendingOlder = tab.context.window.focusAutoTaskById('t1');
+    await older.started;
+    const pendingNewer = tab.context.window.focusAutoTaskById('t2');
+    await newer.started;
+    const snapshot = { ok: true, tasks: [{ id: 't1', project_id: 'a' }, { id: 't2' }] };
+    newer.respond(snapshot);
+    expect(await pendingNewer).toBe(true);
+    expect(tab.activeScope()).toBe('');
+    const highlighted = () => tab.rows().filter((row: any) => row.classList.contains('is-highlighted')).map((row: any) => row.task.id);
+    expect(highlighted()).toEqual(['t2']);
+    vi.advanceTimersByTime(1000);
+    older.respond(snapshot);
+    // The existing app-nav caller interprets false as an unavailable-target
+    // error. A superseded click is consumed without undoing the newer action.
+    expect(await pendingOlder).toBe(true);
+    expect(tab.activeScope()).toBe('');
+    expect(highlighted()).toEqual(['t2']);
+    vi.advanceTimersByTime(1500);
+    expect(highlighted()).toEqual([]);
+  });
+
+  it.each(['away', 'returned'] as const)('does not focus an old shortcut after navigation is %s', async state => {
+    vi.useFakeTimers();
+    const tab = loadAutoTab({ projects: [{ project_id: 'a', name: 'Alpha' }], view: 'auto' });
+    tab.context._composerNavigationEpoch = 10;
+    await tab.context.loadAutoList(true);
+    const request = deferredList();
+    tab.context.window.orkas.invoke = request.invoke;
+    const pending = tab.context.window.focusAutoTaskById('t1');
+    await request.started;
+    tab.context.currentView = 'project';
+    tab.context._composerNavigationEpoch++;
+    if (state === 'returned') {
+      tab.context.currentView = 'auto';
+      tab.context._composerNavigationEpoch++;
+    }
+    request.respond({ ok: true, tasks: [{ id: 't1', project_id: 'a' }, { id: 't2' }] });
+    expect(await pending).toBe(true);
+    expect(tab.context.currentView).toBe(state === 'returned' ? 'auto' : 'project');
+    expect(tab.activeScope()).toBe('');
+    expect(tab.rows().some((row: any) => row.classList.contains('is-highlighted'))).toBe(false);
+  });
+
+  it.each([
+    ['first visit', null, 't1', 'a'],
+    ['another project selected', [{ project_id: 'a', name: 'Alpha' }], 't2', ''],
+    ['global scope selected', [{ project_id: 'a', name: 'Alpha' }], 't1', 'a'],
+  ] as const)('reveals a saved automation without editing on %s and retains its cue across refresh', async (_name, projects, taskId, scope) => {
+    vi.useFakeTimers();
+    const tab = loadAutoTab({ projects: projects ? [...projects] : null, view: 'auto' });
+    tab.context.recordEditor = vi.fn();
+    vm.runInContext('openAutoTaskDialog = recordEditor', tab.context);
+    if (projects) {
+      await tab.context.loadAutoList(true);
+      tab.selectScope(scope ? '' : 'a');
+    }
+
+    expect(await tab.context.window.focusAutoTaskById(taskId)).toBe(true);
+    expect(tab.activeScope()).toBe(scope);
+    expect(tab.rows().filter((row: any) => row.classList.contains('is-highlighted')).map((row: any) => row.task.id)).toEqual([taskId]);
+    expect(tab.rows().find((row: any) => row.task.id === taskId).scrollIntoView).toHaveBeenCalledWith({ block: 'center' });
+    expect(tab.context.recordEditor).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(2000);
+    await tab.context.loadAutoList(true);
+    const refreshed = tab.rows().find((row: any) => row.task.id === taskId);
+    expect(refreshed.classList.contains('is-highlighted')).toBe(true);
+    vi.advanceTimersByTime(500);
+    expect(refreshed.classList.contains('is-highlighted')).toBe(false);
+  });
+
+  it('follows the current assignment and safely handles a removed automation', async () => {
+    vi.useFakeTimers();
+    const tab = loadAutoTab({ projects: [{ project_id: 'a', name: 'Alpha' }, { project_id: 'b', name: 'Beta' }], view: 'auto' });
+    await tab.context.loadAutoList(true);
+    tab.context.window.orkas.invoke = async () => ({ ok: true, tasks: [{ id: 't1', project_id: 'b' }, { id: 't2' }] });
+    expect(await tab.context.window.focusAutoTaskById('t1')).toBe(true);
+    expect(tab.activeScope()).toBe('b');
+    expect(await tab.context.window.focusAutoTaskById('missing')).toBe(false);
+    expect(await tab.context.window.focusAutoTaskById('')).toBe(false);
+    expect(tab.activeScope()).toBe('b');
+    vi.advanceTimersByTime(2500);
+    expect(tab.rows().some((row: any) => row.classList.contains('is-highlighted'))).toBe(false);
+  });
+
   it('initializes each new draft from the currently selected scope without locking its project', async () => {
     const tab = loadAutoTab({ projects: [{ project_id: 'a', name: 'Alpha' }], view: 'auto' });
     const opened: any[] = [];

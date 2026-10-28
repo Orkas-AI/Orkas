@@ -334,9 +334,9 @@ function _applyKbEvent(ev) {
       ...(ev.kind ? { kind: ev.kind } : {}),
     };
   }
-  // Minimal-churn update: find the single DOM row by path and replace its
-  // chip in place. Falls back to a full re-render only if the row isn't on
-  // screen (collapsed parent dir, etc.).
+  // Hidden/collapsed rows consume the latest state on their next ordinary
+  // render. Background indexing must not rebuild the entire tree per file.
+  if (typeof currentView !== 'undefined' && currentView !== 'contexts') return;
   const row = document.querySelector(`.contexts-tree .ctx-tree-wrap[data-path="${_cssEscape(p)}"] > .skill-tree-node`);
   if (row) {
     const existing = row.querySelector('.ctx-kb-chip');
@@ -348,8 +348,6 @@ function _applyKbEvent(ev) {
       const menuBtn = row.querySelector('.ctx-row-menu-btn');
       if (menuBtn) menuBtn.insertAdjacentHTML('beforebegin', html);
     }
-  } else {
-    renderCtxTree();
   }
   _scheduleKbStatusRefreshIfNeeded();
 }
@@ -388,6 +386,11 @@ function _kbStatusChipHtml(relpath) {
     return `<span class="ctx-kb-chip is-processing" title="${escapeHtml(label)}"><span class="ctx-kb-spinner"></span></span>`;
   }
   if (st.status === 'failed') {
+    if (st.kind === 'image') {
+      const label = t('contexts.kb.image_failed');
+      const hint = t('contexts.kb.image_failed_hint');
+      return `<button type="button" class="ctx-kb-chip is-failed is-image-failed" data-kb-reprocess title="${escapeHtml(hint)}" aria-label="${escapeHtml(label + ': ' + hint)}">${escapeHtml(label)}</button>`;
+    }
     return `<span class="ctx-kb-chip is-failed" data-kb-reprocess title="${escapeHtml(t('contexts.kb.failed'))}">!</span>`;
   }
   return '';
@@ -488,6 +491,14 @@ function renderCtxTree() {
   if (!container) {
     _refreshCtxCounts();
     return;
+  }
+  // A background refresh must not remove the live rename input: Electron
+  // emits blur on removal, which would submit a draft and interrupt IME.
+  // State keeps updating; submission/cancellation clears the pending rename
+  // and lets the next render apply the accumulated tree/status changes.
+  if (_ctxPendingRename) {
+    const input = container.querySelector('.ctx-tree-rename-input');
+    if (input?.closest('.ctx-tree-wrap')?.dataset.path === _ctxPendingRename.path) return;
   }
   if (!_ctxTree.length) {
     _ctxSelected.clear();
@@ -1113,6 +1124,8 @@ async function _openCtxTransfer(paths, entryPoint) {
     const sourceProjectId = _ctxProjectId;
     const generation = _ctxScopeGeneration;
     const owner = typeof currentUserId === 'string' ? currentUserId : '';
+    const isCurrent = () => _ctxProjectId === sourceProjectId && _ctxScopeGeneration === generation
+      && (typeof currentUserId === 'string' ? currentUserId : '') === owner;
     _ctxOpenSeq++;
     if (!await window.LibraryTransfer.confirmUnsaved({
       paths,
@@ -1120,14 +1133,14 @@ async function _openCtxTransfer(paths, entryPoint) {
       getActivePath: () => _ctxActive?.id,
       getController: () => _ctxMveController,
       openFile: openCtxFile,
-      isCurrent: () => _ctxProjectId === sourceProjectId && _ctxScopeGeneration === generation
-        && (typeof currentUserId === 'string' ? currentUserId : '') === owner,
-    })) return;
+      isCurrent,
+    }) || !isCurrent()) return;
     await window.LibraryTransfer.open({
       source: _ctxProjectId ? { scope: 'project', projectId: _ctxProjectId } : { scope: 'global' },
       paths,
       entryPoint,
       onComplete: async (result) => {
+        if (!isCurrent()) return;
         const successful = (result.results || []).filter((row) => row.ok);
         if (result.mode === 'move') {
           for (const row of successful) {
@@ -1228,23 +1241,20 @@ async function _handleCtxMove(srcRel, targetDir) {
       .find((el) => el.dataset.path === srcRel);
     const entryType = sourceWrap?.dataset?.type || 'file';
     const startedAt = performance.now();
-    const logResult = (result, errorCode, reportError = true) => {
+    const logFailure = (errorCode) => {
       const payload = {
-        result,
+        result: 'failure',
         entry_type: entryType,
         has_target_dir: !!targetDir,
         duration_ms: Math.round(performance.now() - startedAt),
         ...(errorCode ? { error_code: errorCode } : {}),
         ...(errorCode ? { error_type: _ctxFailureType(errorCode) } : {}),
       };
-      if (result === 'failure' && reportError) {
-        _contextsLog.warn('library file move failed', payload);
-      }
+      _contextsLog.warn('library file move failed', payload);
     };
     // Reject moves into self or own subtree (only meaningful for dirs but the
     // check is cheap and correct for files too).
     if (targetDir === srcRel || targetDir.startsWith(srcRel + '/')) {
-      logResult('failure', 'invalid_target', false);
       await uiAlert(t('contexts.dnd.invalid_self'));
       return;
     }
@@ -1257,20 +1267,19 @@ async function _handleCtxMove(srcRel, targetDir) {
       });
       data = await res.json();
     } catch (err) {
-      logResult('failure', 'move_failed');
+      logFailure('move_failed');
       await uiAlert(t('contexts.dnd.move_failed'));
       return;
     }
     if (!data?.ok) {
       const errorCode = data.error === 'destination already exists' ? 'target_exists' : 'move_failed';
-      logResult('failure', errorCode);
+      logFailure(errorCode);
       const message = errorCode === 'target_exists'
         ? t('contexts.dnd.target_exists', { name: base })
         : t('contexts.dnd.move_failed');
       await uiAlert(message);
       return;
     }
-    logResult('success');
     try {
       _applyCtxPathChange(srcRel, dst, targetDir);
       await loadContexts();
@@ -1778,94 +1787,99 @@ async function _ctxUploadMap(items, worker, concurrency) {
 }
 
 async function handleCtxNativeUpload(targetDir = '') {
-  if (targetDir) _ctxExpanded.add(targetDir);
-  const statusEl = document.getElementById('ctx-upload-status');
-  const labelEl = document.getElementById('ctx-upload-status-label');
-  if (statusEl && labelEl) {
-    labelEl.textContent = t('contexts.upload.in_progress', { count: 1 });
-    statusEl.style.display = '';
-  }
-  let data;
+  _ctxSetOperation(1);
   try {
-    data = await window.orkas.invoke(_ctxProjectId ? 'projects.files.pickAndUpload' : 'contexts.pickAndUpload', { targetDir, ...(_ctxProjectId ? { projectId: _ctxProjectId } : {}) });
-  } catch (err) {
-    _ctxLogUploadFailure({
-      source_type: 'native',
-      file_count: 0,
-      failed_count: 1,
-      error_code: 'picker_failed',
-      error_type: _ctxFailureType('picker_failed'),
-    });
-    await uiAlert(t('contexts.upload_picker_failed'));
-    return;
+    if (targetDir) _ctxExpanded.add(targetDir);
+    const statusEl = document.getElementById('ctx-upload-status');
+    const labelEl = document.getElementById('ctx-upload-status-label');
+    if (statusEl && labelEl) {
+      labelEl.textContent = t('contexts.upload.in_progress', { count: 1 });
+      statusEl.style.display = '';
+    }
+    let data;
+    try {
+      data = await window.orkas.invoke(_ctxProjectId ? 'projects.files.pickAndUpload' : 'contexts.pickAndUpload', { targetDir, ...(_ctxProjectId ? { projectId: _ctxProjectId } : {}) });
+    } catch (err) {
+      _ctxLogUploadFailure({
+        source_type: 'native',
+        file_count: 0,
+        failed_count: 1,
+        error_code: 'picker_failed',
+        error_type: _ctxFailureType('picker_failed'),
+      });
+      await uiAlert(t('contexts.upload_picker_failed'));
+      return;
+    } finally {
+      if (statusEl) statusEl.style.display = 'none';
+    }
+    if (!data?.ok) {
+      const errorCode = _ctxUploadErrorCode(data && (data.code || data.error));
+      _ctxLogUploadFailure({
+        source_type: 'native',
+        file_count: 0,
+        failed_count: 1,
+        error_code: errorCode,
+        error_type: _ctxFailureType(errorCode),
+      });
+      await uiAlert(t('contexts.upload_picker_failed'));
+      return;
+    }
+    if (data.cancelled) {
+      return;
+    }
+    const files = Array.isArray(data && data.files) ? data.files : [];
+    if (!files.length) {
+      const errorCode = 'picker_failed';
+      _ctxLogUploadFailure({
+        source_type: 'native',
+        file_count: 0,
+        failed_count: 1,
+        error_code: errorCode,
+        error_type: _ctxFailureType(errorCode),
+      });
+      await uiAlert(t('contexts.upload_picker_failed'));
+      return;
+    }
+    const failedRows = files.filter((r) => !r || r.ok === false);
+    const nativeErrorCodes = Array.from(new Set(failedRows.map((r) => _ctxUploadErrorCode(r && (r.code || r.reason || r.error)))));
+    const nativeErrorCode = nativeErrorCodes.length === 1 ? nativeErrorCodes[0] : nativeErrorCodes.length > 1 ? 'multiple' : '';
+    if (failedRows.length) {
+      _ctxLogUploadFailure({
+        source_type: 'native',
+        file_count: files.length,
+        failed_count: failedRows.length,
+        error_code: nativeErrorCode,
+        error_type: _ctxFailureType(nativeErrorCode || 'upload_failed'),
+      });
+    }
+    if (files.some((row) => row && row.ok)) {
+      try { await loadContexts(); }
+      catch (err) { _contextsLog.warn('refresh after native library upload failed', err); }
+    }
+    const extRejected = files.filter((r) => r && r.ok === false && r.reason === 'ext');
+    if (extRejected.length) {
+      await uiAlert(t('contexts.upload_rejected', {
+        list: extRejected.map((r) => r.name || '').join('\n'),
+      }));
+    }
+    const hiddenRejected = files.filter((r) => r && r.ok === false && r.reason === 'hidden');
+    if (hiddenRejected.length) {
+      await uiAlert(t('contexts.upload_hidden_rejected', {
+        list: hiddenRejected.map((r) => r.name || '').join('\n'),
+      }));
+    }
+    const duplicateRejected = files.filter((r) => r && r.ok === false && r.code === 'duplicate_content');
+    await _ctxAlertDuplicateUploads(duplicateRejected);
+    const failed = files.filter((r) => !r || (
+      r.ok === false
+      && r.reason !== 'ext'
+      && r.reason !== 'hidden'
+      && r.code !== 'duplicate_content'
+    ));
+    await _ctxAlertUploadFailures(failed);
   } finally {
-    if (statusEl) statusEl.style.display = 'none';
+    _ctxSetOperation(-1);
   }
-  if (!data?.ok) {
-    const errorCode = _ctxUploadErrorCode(data && (data.code || data.error));
-    _ctxLogUploadFailure({
-      source_type: 'native',
-      file_count: 0,
-      failed_count: 1,
-      error_code: errorCode,
-      error_type: _ctxFailureType(errorCode),
-    });
-    await uiAlert(t('contexts.upload_picker_failed'));
-    return;
-  }
-  if (data.cancelled) {
-    return;
-  }
-  const files = Array.isArray(data && data.files) ? data.files : [];
-  if (!files.length) {
-    const errorCode = 'picker_failed';
-    _ctxLogUploadFailure({
-      source_type: 'native',
-      file_count: 0,
-      failed_count: 1,
-      error_code: errorCode,
-      error_type: _ctxFailureType(errorCode),
-    });
-    await uiAlert(t('contexts.upload_picker_failed'));
-    return;
-  }
-  const failedRows = files.filter((r) => !r || r.ok === false);
-  const nativeErrorCodes = Array.from(new Set(failedRows.map((r) => _ctxUploadErrorCode(r && (r.code || r.reason || r.error)))));
-  const nativeErrorCode = nativeErrorCodes.length === 1 ? nativeErrorCodes[0] : nativeErrorCodes.length > 1 ? 'multiple' : '';
-  if (failedRows.length) {
-    _ctxLogUploadFailure({
-      source_type: 'native',
-      file_count: files.length,
-      failed_count: failedRows.length,
-      error_code: nativeErrorCode,
-      error_type: _ctxFailureType(nativeErrorCode || 'upload_failed'),
-    });
-  }
-  if (files.some((row) => row && row.ok)) {
-    try { await loadContexts(); }
-    catch (err) { _contextsLog.warn('refresh after native library upload failed', err); }
-  }
-  const extRejected = files.filter((r) => r && r.ok === false && r.reason === 'ext');
-  if (extRejected.length) {
-    await uiAlert(t('contexts.upload_rejected', {
-      list: extRejected.map((r) => r.name || '').join('\n'),
-    }));
-  }
-  const hiddenRejected = files.filter((r) => r && r.ok === false && r.reason === 'hidden');
-  if (hiddenRejected.length) {
-    await uiAlert(t('contexts.upload_hidden_rejected', {
-      list: hiddenRejected.map((r) => r.name || '').join('\n'),
-    }));
-  }
-  const duplicateRejected = files.filter((r) => r && r.ok === false && r.code === 'duplicate_content');
-  await _ctxAlertDuplicateUploads(duplicateRejected);
-  const failed = files.filter((r) => !r || (
-    r.ok === false
-    && r.reason !== 'ext'
-    && r.reason !== 'hidden'
-    && r.code !== 'duplicate_content'
-  ));
-  await _ctxAlertUploadFailures(failed);
 }
 
 // ── Viewer (right pane) ──
@@ -1977,8 +1991,8 @@ async function _showCtxPdfViewer(rel, seq = _ctxOpenSeq) {
   // already narrow.
   els.bodyEl.innerHTML = `<iframe class="ctx-viewer-pdf" src="${src}#toolbar=1&navpanes=0" title="${escapeHtml(rel)}"></iframe>`;
   els.actionsEl.innerHTML = `
-    <button class="btn btn-sm" id="ctx-viewer-reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>
-    <button class="btn btn-sm btn-danger" id="ctx-viewer-del">${escapeHtml(t('contexts.viewer.delete'))}</button>
+    <button class="btn btn-sm" id="ctx-viewer-reveal" data-i18n="contexts.viewer.open_system">${escapeHtml(t('contexts.viewer.open_system'))}</button>
+    <button class="btn btn-sm btn-danger" id="ctx-viewer-del" data-i18n="contexts.viewer.delete">${escapeHtml(t('contexts.viewer.delete'))}</button>
   `;
   els.actionsEl.querySelector('#ctx-viewer-reveal').addEventListener('click', () => revealCtxFile(rel));
   els.actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
@@ -1992,8 +2006,8 @@ function _showCtxDocxViewer(rel, html) {
   // the rest of the app chrome.
   els.bodyEl.innerHTML = `<div class="ctx-viewer-docx markdown-body">${html || `<p class="muted">${escapeHtml(t('contexts.viewer.docx_empty'))}</p>`}</div>`;
   els.actionsEl.innerHTML = `
-    <button class="btn btn-sm" id="ctx-viewer-reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>
-    <button class="btn btn-sm btn-danger" id="ctx-viewer-del">${escapeHtml(t('contexts.viewer.delete'))}</button>
+    <button class="btn btn-sm" id="ctx-viewer-reveal" data-i18n="contexts.viewer.open_system">${escapeHtml(t('contexts.viewer.open_system'))}</button>
+    <button class="btn btn-sm btn-danger" id="ctx-viewer-del" data-i18n="contexts.viewer.delete">${escapeHtml(t('contexts.viewer.delete'))}</button>
   `;
   els.actionsEl.querySelector('#ctx-viewer-reveal').addEventListener('click', () => revealCtxFile(rel));
   els.actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
@@ -2026,8 +2040,8 @@ async function _showCtxOfficeViewer(rel, seq = _ctxOpenSeq) {
     const sandbox = data.allowScripts === true ? 'allow-scripts' : '';
     els.bodyEl.innerHTML = `<iframe class="ctx-viewer-office" sandbox="${sandbox}" src="${_ctxOfficeBlobUrl}"${style} title="${escapeHtml(rel)}"></iframe>`;
     els.actionsEl.innerHTML = `
-      <button class="btn btn-sm" id="ctx-viewer-reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>
-      <button class="btn btn-sm btn-danger" id="ctx-viewer-del">${escapeHtml(t('contexts.viewer.delete'))}</button>
+      <button class="btn btn-sm" id="ctx-viewer-reveal" data-i18n="contexts.viewer.open_system">${escapeHtml(t('contexts.viewer.open_system'))}</button>
+      <button class="btn btn-sm btn-danger" id="ctx-viewer-del" data-i18n="contexts.viewer.delete">${escapeHtml(t('contexts.viewer.delete'))}</button>
     `;
     els.actionsEl.querySelector('#ctx-viewer-reveal').addEventListener('click', () => revealCtxFile(rel));
     els.actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
@@ -2157,8 +2171,8 @@ function _showCtxImageViewer(rel, base64, mediaType, bytes) {
     </div>
   `;
   els.actionsEl.innerHTML = `
-    <button class="btn btn-sm" id="ctx-viewer-reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>
-    <button class="btn btn-sm btn-danger" id="ctx-viewer-del">${escapeHtml(t('contexts.viewer.delete'))}</button>
+    <button class="btn btn-sm" id="ctx-viewer-reveal" data-i18n="contexts.viewer.open_system">${escapeHtml(t('contexts.viewer.open_system'))}</button>
+    <button class="btn btn-sm btn-danger" id="ctx-viewer-del" data-i18n="contexts.viewer.delete">${escapeHtml(t('contexts.viewer.delete'))}</button>
   `;
   els.actionsEl.querySelector('#ctx-viewer-reveal').addEventListener('click', () => revealCtxFile(rel));
   els.actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
@@ -2177,12 +2191,12 @@ function _showCtxBinaryViewer(rel, kind) {
       <div class="ctx-viewer-binary-icon">${icon}</div>
       <div class="ctx-viewer-binary-name">${escapeHtml(rel)}</div>
       <div class="ctx-viewer-binary-hint">${escapeHtml(t('contexts.viewer.binary_hint', { kind: kindLabel }))}</div>
-      <button class="btn btn-primary" id="ctx-viewer-reveal-big">${escapeHtml(t('contexts.viewer.open_system'))}</button>
+      <button class="btn btn-primary" id="ctx-viewer-reveal-big" data-i18n="contexts.viewer.open_system">${escapeHtml(t('contexts.viewer.open_system'))}</button>
     </div>
   `;
   els.actionsEl.innerHTML = `
-    <button class="btn btn-sm" id="ctx-viewer-reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>
-    <button class="btn btn-sm btn-danger" id="ctx-viewer-del">${escapeHtml(t('contexts.viewer.delete'))}</button>
+    <button class="btn btn-sm" id="ctx-viewer-reveal" data-i18n="contexts.viewer.open_system">${escapeHtml(t('contexts.viewer.open_system'))}</button>
+    <button class="btn btn-sm btn-danger" id="ctx-viewer-del" data-i18n="contexts.viewer.delete">${escapeHtml(t('contexts.viewer.delete'))}</button>
   `;
   const openHandler = () => revealCtxFile(rel);
   els.bodyEl.querySelector('#ctx-viewer-reveal-big')?.addEventListener('click', openHandler);

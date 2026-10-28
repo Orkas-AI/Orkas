@@ -22,6 +22,8 @@ let _ipcErrorSentCount = 0;
 //   - opts.stream: boolean (this call yields an SSE-style stream)
 //   - opts.wrapAsUpdates: wrap the whole body under `updates` key
 const _IPC_ROUTES = [
+  ['POST', '/api/apps/data-impact-from-path', 'savedApps.dataImpactFromPath'],
+  ['POST', '/api/apps/export-data-from-path', 'savedApps.exportDataFromPath'],
   ['POST', '/api/conversations/cleanup/preview', 'conversations.cleanup.preview'],
   ['POST', '/api/conversations/cleanup/page', 'conversations.cleanup.page'],
   ['POST', '/api/conversations/cleanup/remove', 'conversations.cleanup.remove'],

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, test, type Page } from '@playwright/test';
+import { loadRetainedFilePage } from './fixtures/retained-file-page';
 
 test.use({ launchOptions: { executablePath: process.env.ORKAS_E2E_BROWSER_PATH } });
 const renderer = path.resolve(__dirname, '../../src/renderer');
@@ -35,7 +36,7 @@ async function setup(page: Page, count: number) {
     <div id="today-list"></div><div id="conversation-list"></div>
     <div id="conversation-action-menu" data-cid="c2"><button data-action="to-project"></button></div>
     </body></html>`);
-  await page.goto(pathToFileURL(file).href);
+  await loadRetainedFilePage(page, file);
   await page.evaluate(count => {
     const w = window as any;
     w.metadataVisits = 0;

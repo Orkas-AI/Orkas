@@ -61,6 +61,69 @@ describe('local_agents/backends/openclaw › idle clock with a fake CLI', () => 
     for (const dir of tmpDirs) await fs.promises.rm(dir, { recursive: true, force: true });
   });
 
+  itPosix.each(['stdout', 'stderr'])('delivers one decoded native reply from %s without exposing its envelope as text or diagnostics', async stream => {
+    const fake = writeNodeExecutable(tmpDir, 'native-output', `
+const out = process[${JSON.stringify(stream)}];
+const bytes = Buffer.from(JSON.stringify({payloads:[{text:'Native reply: 中文 🌍'}],meta:{agentMeta:{sessionId:'native-reply'}}}) + '\\n');
+process.stderr.write('diagnostic-before-reply\\n');
+let offset=0;
+const timer=setInterval(()=>{if(offset>=bytes.length){clearInterval(timer);process.exit(0);return;}out.write(bytes.subarray(offset,offset+1));offset++;},1);
+`);
+    const events: any[] = [];
+    await openclawBackend.run({ binPath: fake, prompt: 'Return the native answer', cwd: tmpDir,
+      signal: new AbortController().signal, timeoutMs: 5000, onEvent: event => events.push(event) });
+    expect(events.filter(event => event.type === 'text-delta').map(event => event.text)).toEqual(['Native reply: 中文 🌍']);
+    expect(events.filter(event => event.type === 'stderr-line').map(event => event.line)).toEqual(['diagnostic-before-reply']);
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({type:'done',status:'completed',sessionId:'native-reply'});
+  });
+
+  itPosix('rejects a structured native failure even when stdout contains payload text and exit code is zero', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'native-error', `
+process.stdout.write(JSON.stringify({ok:false,error:{type:'model_unavailable',message:'Fixture unavailable'},payloads:[{text:'Incomplete reply'}]}));
+`);
+    const events: any[] = [];
+    await openclawBackend.run({binPath:fake,prompt:'Do work',cwd:tmpDir,signal:new AbortController().signal,
+      timeoutMs:5000,onEvent:event=>events.push(event)});
+    expect(events.at(-1)).toMatchObject({type:'done',status:'failed'});
+    expect(events.filter(event=>event.type==='text-delta').map(event=>event.text)).toEqual(['Incomplete reply']);
+    expect(events.filter(event=>event.type==='stderr-line')).toEqual([]);
+  });
+
+  itPosix('bounds runaway native output and fails without exposing a partial protocol envelope', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'native-overflow', `
+const child=require('node:child_process').spawn(process.execPath,['-e',"process.send('ready');setTimeout(()=>require('node:fs').writeFileSync('overflow-late-effect','survived'),1500)"],{detached:true,stdio:['ignore','ignore','ignore','ipc']});
+child.once('message',()=>process.stdout.write(JSON.stringify({payloads:[{text:'x'.repeat(10*1024*1024)}],meta:{}})));
+`);
+    const events: any[] = [];
+    await openclawBackend.run({binPath:fake,prompt:'Return bounded output',cwd:tmpDir,
+      signal:new AbortController().signal,timeoutMs:5000,onEvent:event=>events.push(event)});
+    await new Promise(resolve=>setTimeout(resolve,1800));
+    expect(fs.existsSync(path.join(tmpDir,'overflow-late-effect'))).toBe(false);
+    expect(events.at(-1)).toMatchObject({type:'done',status:'failed',error:'OpenClaw output exceeded the supported size.'});
+    expect(events.some(event=>event.type==='text-delta')).toBe(false);
+    expect(events.filter(event=>event.type==='done')).toHaveLength(1);
+  });
+
+  itPosix('reports the native data-directory lease refusal without retrying and recovers after release', async () => {
+    const fake=writeNodeExecutable(tmpDir,'native-busy',`
+const fs=require('node:fs');
+if(!fs.existsSync('lease-released')){process.stdout.write(JSON.stringify({ok:false,error:{type:'cli_error',message:'Another OpenClaw process is using your data. Wait for it to finish before trying again.'}}));process.exitCode=1;}
+else{fs.appendFileSync('completed-effect','once');process.stdout.write(JSON.stringify({payloads:[{text:'Ready after release'}],meta:{agentMeta:{sessionId:'released-session'}}}));}
+`);
+    const dispatch=async()=>{const events:any[]=[];await openclawBackend.run({binPath:fake,prompt:'Run once',cwd:tmpDir,
+      signal:new AbortController().signal,timeoutMs:5000,onEvent:event=>events.push(event)});return events;};
+    const busy=await dispatch();
+    expect(busy.at(-1)).toMatchObject({type:'done',status:'failed',error:expect.stringContaining('Wait for it to finish')});
+    expect(busy.filter(event=>event.type==='process-info')).toHaveLength(1);
+    expect(busy.some(event=>event.type==='text-delta')).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir,'completed-effect'))).toBe(false);
+    fs.writeFileSync(path.join(tmpDir,'lease-released'),'ready');
+    const recovered=await dispatch();
+    expect(recovered.at(-1)).toMatchObject({type:'done',status:'completed',sessionId:'released-session'});
+    expect(fs.readFileSync(path.join(tmpDir,'completed-effect'),'utf8')).toBe('once');
+  });
+
   itPosix('would kill a run that only speaks at startup, if it were given an idle clock', async () => {
     // The shape of a real long openclaw turn: skill/tool chatter, then nothing
     // at all until the trailing JSON. Arming the idle clock here — as the

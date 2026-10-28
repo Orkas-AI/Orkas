@@ -13,6 +13,43 @@ import { MIRRORED_PI_AI_SERIALIZER_VERSION, restoreHostMessageRoles } from "../s
 import * as fs from "node:fs";
 
 describe("Providers (pi-ai backed)", () => {
+  it.each(['complete', 'stream'] as const)('rejects malformed final tool arguments before returning an executable %s result', async (method) => {
+    const modelId = 'google/gemini-3.8-flash';
+    let rawArguments = '{"private_fixture":';
+    const fetchStub = vi.fn(async () => {
+      const frame = { id: 'fixture', model: modelId, choices: [{ index: 0,
+        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'call_bad', type: 'function', function: { name: 'lookup', arguments: rawArguments } }] },
+        finish_reason: 'tool_calls' }] };
+      return new Response(`data: ${JSON.stringify(frame)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+    });
+    vi.stubGlobal('fetch', fetchStub);
+    try {
+      const provider = createPiProvider({ provider: 'openrouter', model: modelId, apiKey: 'fixture' });
+      const params: CompletionParams = { messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }],
+        tools: [{ name: 'lookup', description: 'Lookup', inputSchema: { type: 'object', properties: {} } }],
+        onRequestFailure() {},
+      };
+      if (method === 'complete') {
+        await expect(provider.complete(params)).rejects.toThrow('Invalid tool call arguments');
+      } else {
+        const events: StreamEvent[] = [];
+        let failure: unknown;
+        try { for await (const event of provider.stream(params)) events.push(event); } catch (error) { failure = error; }
+        expect(events.some(event => event.type === 'message_end')).toBe(false);
+        expect(failure).toBeInstanceOf(ProviderError);
+        expect(String(failure)).toContain('Invalid tool call arguments');
+        expect(String(failure)).not.toContain('private_fixture');
+      }
+      expect(fetchStub).toHaveBeenCalledTimes(1);
+      // An intentionally empty object remains a valid call; no silent retry.
+      rawArguments = '{}';
+      expect((await provider.complete(params)).content).toEqual([
+        expect.objectContaining({ type: 'tool_use', name: 'lookup', input: {} }),
+      ]);
+      expect(fetchStub).toHaveBeenCalledTimes(2);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it.each([
     ['complete', 'openai-completions'], ['stream', 'openai-completions'],
     ['complete', 'openai-responses'], ['stream', 'openai-responses'],
@@ -1027,9 +1064,11 @@ describe("Providers (pi-ai backed)", () => {
         stream: true,
         prompt_cache_key: "gpt6-payload-contract",
         prompt_cache_options: { ttl: "30m" },
-        reasoning: { effort: "low", summary: "auto" },
+        reasoning: { effort: "medium", summary: "auto" },
         tools: [{ type: "function", name: "read_file" }],
       });
+      // pi-ai keeps the prefix stable; the native update carries the requested effort.
+      expect(payloads[0].input.at(-1)).toMatchObject({ type: "configuration_update", reasoning: { effort: "low" } });
       expect(payloads[0].prompt_cache_retention).toBeUndefined();
       expect(JSON.stringify(payloads[0].input)).toContain("input_image");
 
@@ -1220,6 +1259,11 @@ describe("Providers (pi-ai backed)", () => {
       ["openrouter", "openai/gpt-6.1-sol", "openai"],
       ["openrouter", "anthropic/claude-opus-5", "anthropic"],
       ["google", "gemini-3.8-flash", "google"],
+      ["google", "gemini-4-argon", "google"],
+      ["kimi-coding", "k3", "openai"],
+      ["kimi-coding", "k3-256k", "openai"],
+      ["kimi-coding", "kimi-for-coding", "openai"],
+      ["openrouter", "google/gemini-4-argon", "openai"],
       ["openrouter", "google/gemini-3.8-flash", "openai"],
     ])("round-trips %s %s through a fragmented tool stream and its follow-up result", async (providerId, modelId, protocol) => {
       const originalFetch = globalThis.fetch;
@@ -1272,7 +1316,9 @@ describe("Providers (pi-ai backed)", () => {
           tools: [{ name: "lookup", description: "Look up an item", inputSchema: { type: "object", properties: { item: { type: "string" } }, required: ["item"] } }],
           messages: [
             { role: "user", content: [{ type: "text", text: "Check this image" }, { type: "image", data: "aGVsbG8=", mediaType: "image/png" }] },
-            { role: "assistant", content: [{ type: "tool_use", id: "call_lookup", name: "lookup", input: { item: "sample" } }] },
+            { role: "assistant", content: [{ type: "tool_use", id: "call_lookup", name: "lookup", input: { item: "sample" },
+              ...(providerId === "kimi-coding" ? { replayOrigin: replayOrigin({ api: "anthropic-messages", provider: providerId, id: modelId }), thoughtSignature: "legacy-signature" } : {}),
+            }] },
             { role: "user", content: [{ type: "tool_result", toolUseId: "call_lookup", content: "item found" }] },
           ],
         };
@@ -1334,8 +1380,14 @@ describe("Providers (pi-ai backed)", () => {
             expect.objectContaining({ functionResponse: expect.objectContaining({ name: "lookup", response: { output: "follow-up found" } }) }),
           ]));
         } else {
-          expect(url).toBe("https://openrouter.ai/api/v1/chat/completions");
-          expect(body).toMatchObject({ model: modelId, reasoning: { effort: "low" } });
+          if (providerId === "kimi-coding") {
+            expect(url).toBe("https://api.kimi.com/coding/v1/chat/completions");
+            expect(body).toMatchObject({ model: modelId, reasoning_effort: "low" });
+            expect(JSON.stringify(body)).not.toContain("legacy-signature");
+          } else {
+            expect(url).toBe("https://openrouter.ai/api/v1/chat/completions");
+            expect(body).toMatchObject({ model: modelId, reasoning: { effort: "low" } });
+          }
           expect(body.messages[0].content).toContainEqual({ type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } });
           expect(body.messages[1].tool_calls[0]).toMatchObject({ id: "call_lookup", function: { name: "lookup", arguments: '{"item":"sample"}' } });
           expect(body.messages[2]).toMatchObject({ role: "tool", tool_call_id: "call_lookup", content: "item found" });
@@ -2125,15 +2177,56 @@ describe("Providers (pi-ai backed)", () => {
 });
 
 describe("pi-provider wrapError", () => {
-  it('keeps embedded accepted output out of context-overflow request recovery', () => {
+  it.each(['context_length_exceeded', 'exceed_context_size_error'])(
+    'keeps embedded accepted output out of context-overflow request recovery (%s)', code => {
     const original = Object.assign(new Error('Provider rejected the response'), {
-      status: 400, error: { code: 'context_length_exceeded' },
+      status: 400, error: { type: code },
       cause: { code: 'PROVIDER_OUTPUT_UNCERTAIN' },
     });
     const wrapped = wrapErrorForTest(original, 'custom');
     expect(wrapped).toBeInstanceOf(ProviderError);
     expect(wrapped).not.toBeInstanceOf(ContextOverflowError);
     expect(classifyRetryableError(wrapped)).toBeNull();
+  });
+
+  it.each([
+    ['complete', 400], ['stream', 400], ['complete', 200], ['stream', 200],
+  ] as const)('recognizes local context overflow through the real SDK (%s / HTTP %i)', async (method, status) => {
+    // llama.cpp's protocol uses a numeric code and a machine-readable type.
+    // The message deliberately contains no context-overflow wording.
+    const rejection = { code: 400, type: 'exceed_context_size_error', message: 'Request rejected',
+      n_prompt_tokens: 16764, n_ctx: 8192 };
+    const fetchStub = vi.fn(async () => new Response(status === 400
+      ? JSON.stringify({ error: rejection }) : `data: ${JSON.stringify({ error: rejection })}\n\n`, {
+      status, headers: { 'content-type': status === 400 ? 'application/json' : 'text/event-stream' },
+    }));
+    vi.stubGlobal('fetch', fetchStub);
+    try {
+      const provider = createPiProvider({ provider: 'custom', apiKey: 'fixture', customModel: {
+        id: 'fixture', name: 'fixture', provider: 'custom', api: 'openai-completions',
+        baseUrl: 'https://fixture.invalid/v1', reasoning: false, input: ['text'],
+        contextWindow: 131072, maxTokens: 32768,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      } });
+      const onRequestFailure = vi.fn();
+      const params: CompletionParams = { messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }],
+        onRequestFailure };
+      let delivered: unknown;
+      if (method === 'complete') {
+        delivered = await provider.complete(params).then(() => undefined, error => error);
+      } else {
+        const events: StreamEvent[] = [];
+        for await (const event of provider.stream(params)) events.push(event);
+        const errors = events.filter(event => event.type === 'error');
+        expect(errors).toHaveLength(1);
+        delivered = errors[0].error;
+        expect(events.some(event => event.type === 'message_end' || event.type === 'tool_use_start')).toBe(false);
+      }
+      expect(delivered).toBeInstanceOf(ContextOverflowError);
+      expect(classifyRetryableError(delivered)).toBeNull();
+      expect(fetchStub).toHaveBeenCalledTimes(1);
+      expect(onRequestFailure).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllGlobals(); }
   });
   it.each(['complete', 'stream'] as const)('retains host budget errors before SDK flattening in %s', async method => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -2199,6 +2292,10 @@ describe("pi-provider wrapError", () => {
   });
 
   it.each([
+    'exceed_context_size_error',
+    '400: {"error":{"type":"exceed_context_size_error"}}',
+    'Diagnostic example: exceed_context_size_error',
+    '400: {"error":{"type":"exceed_context_size_error"}',
     '400: {"code":"invalid_request_error","message":"context_length_exceeded"}',
     '400: {"message":"The request context is too long"}',
     '400: {"code":"context_length_exceeded"',
@@ -2207,6 +2304,15 @@ describe("pi-provider wrapError", () => {
   ])("preserves generic errors with missing, malformed, or quoted codes: %s", (diagnostic) => {
     const original = new ProviderError(diagnostic, "openai");
     expect(wrapErrorForTest(original, "openai")).toBe(original);
+  });
+
+  it('does not infer local context overflow from an error message or an unrelated field', () => {
+    const original = Object.assign(new ProviderError('exceed_context_size_error', 'custom', 400), {
+      error: { type: 'invalid_request_error', message: 'exceed_context_size_error',
+        param: 'exceed_context_size_error' },
+    });
+    expect(wrapErrorForTest(original, 'custom')).toBe(original);
+    expect(classifyRetryableError(original)).toBeNull();
   });
 
   it("preserves a statusless authentication diagnostic without inventing its type", () => {

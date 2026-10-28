@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { EventEmitter } from 'node:events';
+import { freezeFileMetadata } from '../../helpers/frozen-file-metadata';
 
 const connector = vi.hoisted(() => ({ instances: [] as any[], call: vi.fn(async () => ({ content: [{ type: 'text', text: 'Verified remote result' }] })), approve: vi.fn(async () => false) }));
 
@@ -93,7 +94,7 @@ describe('Web host reuses owning services', () => {
           ...(frameAvailable ? { frame: { url: app.url } } : { initiator: { url: app.url } }) };
         sender.emit('will-frame-navigate', event);
         expect(event.preventDefault.mock.calls.length).toBe(allowed ? 0 : 1);
-        if (allowed) expect(appResource(new Request(destination))).toMatchObject({ status: 200 });
+        if (allowed) expect(await appResource(new Request(destination))).toMatchObject({ status: 200 });
       }
     }
     // An external child navigating from about:blank must not revoke its parent.
@@ -139,10 +140,10 @@ describe('Web host reuses owning services', () => {
           frame.url = url; frame.processId = 30; frame.routingId += 1000;
           sender.emit('did-frame-navigate', {}, url, 200, 'OK', false, frame.processId, frame.routingId);
           await expect(runtime.call(uid, sender.id, app.token, 'after', 'storage.keys', {})).rejects.toMatchObject({ code: 'E_CLOSED' });
-          expect(appResource(new Request(app.url))).toEqual({ status: 403 });
+          expect(await appResource(new Request(app.url))).toEqual({ status: 403 });
         } else {
           expect(await runtime.call(uid, sender.id, app.token, 'after', 'storage.keys', {})).toEqual({ keys: [] });
-          expect(appResource(new Request(app.url))).toMatchObject({ status: 200 });
+          expect(await appResource(new Request(app.url))).toMatchObject({ status: 200 });
         }
       }
     }
@@ -216,14 +217,53 @@ describe('Web host reuses owning services', () => {
     const created: any = (await artifact.createArtifact(uid, 'cid-test', 'agent', { title: 'SDK', files: [...files,
       { path: 'orkas-app.json', content: JSON.stringify({ sdkVersion: 1, capabilities: ['storage'] }) }] }));
     const app: any = (await openApp(uid, 1, { cid: 'cid-test', artifactId: created.artifactId }));
-    expect(appResource(new Request(app.url))).toMatchObject({ status: 200, source: 'chat_app_artifact' });
-    const sdk: any = appResource(new Request(new URL('/__orkas/sdk.js', app.url)));
+    expect(await appResource(new Request(app.url))).toMatchObject({ status: 200, source: 'chat_app_artifact' });
+    const sdk: any = await appResource(new Request(new URL('/__orkas/sdk.js', app.url)));
     expect(sdk.body).toContain('"ai.generate"'); expect(sdk.headers['Access-Control-Allow-Origin']).toBeUndefined();
-    expect(appResource(new Request(app.url, { headers: { Origin: 'chat-app://foreign' } }))).toEqual({ status: 403 });
+    expect(await appResource(new Request(app.url, { headers: { Origin: 'chat-app://foreign' } }))).toEqual({ status: 403 });
     const file: any = artifact.resolveArtifactFilePath(uid, 'cid-test', created.artifactId, 'index.html');
     fs.writeFileSync(file.absPath, '<h1>Replaced code</h1>');
     await expect(runtime.call(uid, 1, app.token, 'stale', 'storage.keys', {})).rejects.toMatchObject({ code: 'E_CLOSED' });
-    expect(appResource(new Request(app.url))).toEqual({ status: 403 });
+    expect(await appResource(new Request(app.url))).toEqual({ status: 403 });
+  });
+  it.each([
+    ['artifact', 'write'], ['saved', 'write'], ['artifact', 'resource'], ['saved', 'resource'], ['artifact', 'submit'],
+  ] as const)('revokes %s authority at the %s boundary after a same-length source edit', async (kind, boundary) => {
+    const artifacts = await import('../../../src/main/features/chat_artifacts');
+    const saved = await import('../../../src/main/features/saved_apps');
+    const { openApp, appResource, runtime } = await import('../../../src/main/features/web_apps/host');
+    const created = await artifacts.createArtifact(uid, 'content-revision', 'agent', { files: [
+      { path: 'index.html', content: '<h1>Before</h1>' },
+      { path: 'orkas-app.json', content: JSON.stringify({ sdkVersion: 1, capabilities: ['storage'] }) },
+    ] });
+    if (!created.ok) throw new Error(created.error);
+    const copy = await saved.saveFromArtifact(uid, 'content-revision', created.artifactId);
+    if (!copy.ok) throw new Error(copy.error);
+    const source = kind === 'saved' ? { appId: copy.id } : { cid: 'content-revision', artifactId: created.artifactId };
+    const file = kind === 'saved' ? saved.resolveSavedAppFilePath(uid, copy.id, 'index.html')
+      : artifacts.resolveArtifactFilePath(uid, 'content-revision', created.artifactId, 'index.html');
+    if (!file.ok) throw new Error(file.error);
+    const before = fs.readFileSync(file.absPath, 'utf8');
+    const after = before.replace('Before', 'After!');
+    expect(after).not.toBe(before);
+    expect(Buffer.byteLength(after)).toBe(Buffer.byteLength(before));
+    const restore = freezeFileMetadata([file.absPath]);
+    try {
+      const app: any = await openApp(uid, 1, source);
+      expect(await runtime.call(uid, 1, app.token, 'before', 'storage.set', { key: 'value', value: 'KEEP' })).toEqual({ saved: true });
+      expect(await appResource(new Request(app.url))).toMatchObject({ status: 200 });
+      if (boundary === 'submit') expect(await runtime.canSubmitArtifact(uid, 1, app.token)).toBe(true);
+      fs.writeFileSync(file.absPath, after);
+      expect(fs.readFileSync(file.absPath, 'utf8')).toBe(after);
+      if (boundary === 'resource') expect(await appResource(new Request(app.url))).toEqual({ status: 403 });
+      else if (boundary === 'submit') expect(await runtime.canSubmitArtifact(uid, 1, app.token)).toBe(false);
+      else await expect(runtime.call(uid, 1, app.token, 'after', 'storage.set', { key: 'value', value: 'WRONG' }))
+          .rejects.toMatchObject({ code: 'E_CLOSED' });
+      await expect(runtime.call(uid, 1, app.token, 'still-closed', 'storage.keys', {})).rejects.toMatchObject({ code: 'E_CLOSED' });
+      expect(await appResource(new Request(app.url))).toEqual({ status: 403 });
+      const reopened: any = await openApp(uid, 1, source);
+      expect(await runtime.call(uid, 1, reopened.token, 'read', 'storage.get', { key: 'value' })).toEqual({ value: 'KEEP' });
+    } finally { restore(); }
   });
 });
 
@@ -250,19 +290,19 @@ it('isolates new ordinary objects and accounts with short stable origins and no 
     expect(app.url.length).toBeLessThan(50);
     expect(app).toMatchObject({ browserOnly: true });
     expect(app).not.toHaveProperty('sdkVersion');
-    expect(appResource(new Request(app.url))).toMatchObject({ status: 200 });
-    expect(appResource(new Request(new URL('__orkas/bridge.js', app.url)))).toMatchObject({ status: 200, body: artifacts.BRIDGE_JS });
+    expect(await appResource(new Request(app.url))).toMatchObject({ status: 200 });
+    expect(await appResource(new Request(new URL('__orkas/bridge.js', app.url)))).toMatchObject({ status: 200, body: artifacts.BRIDGE_JS });
     for (const rel of ['__orkas/sdk.js', '__orkas/capabilities.json'])
-      expect(appResource(new Request(new URL(rel, app.url)))).toMatchObject({ status: 403 });
-    expect(appResource(new Request(app.url, { headers: { Origin: 'chat-app://cid' } }))).toMatchObject({ status: 403 });
+      expect(await appResource(new Request(new URL(rel, app.url)))).toMatchObject({ status: 403 });
+    expect(await appResource(new Request(app.url, { headers: { Origin: 'chat-app://cid' } }))).toMatchObject({ status: 403 });
     await expect(runtime.call(uid, 1, app.token, 'probe', 'host.getContext', {})).rejects.toMatchObject({ code: 'E_UNAVAILABLE' });
     expect(() => runtime.cancel(uid, 1, app.token, 'probe')).toThrow('E_UNAVAILABLE');
     const second: any = await openApp(uid, 2, source);
     runtime.close(uid, 1, app.token);
     expect(second.url).toBe(app.url);
-    expect(appResource(new Request(second.url))).toMatchObject({ status: 200 });
+    expect(await appResource(new Request(second.url))).toMatchObject({ status: 200 });
     runtime.close(uid, 2, second.token);
-    expect(appResource(new Request(second.url))).toMatchObject({ status: 403 });
+    expect(await appResource(new Request(second.url))).toMatchObject({ status: 403 });
     expect((await openApp(uid, 1, source)).url).toBe(app.url);
   }
   expect(new Set(apps.map(a => new URL(a.url).host)).size).toBe(4);
@@ -270,10 +310,10 @@ it('isolates new ordinary objects and accounts with short stable origins and no 
   fs.mkdirSync(path.dirname(paths.savedAppDir(other, copy.id)), { recursive: true });
   fs.cpSync(paths.savedAppDir(uid, copy.id), paths.savedAppDir(other, copy.id), { recursive: true });
   users.activateUser(other);
-  expect(appResource(new Request(apps[3].url))).toMatchObject({ status: 403 });
+  expect(await appResource(new Request(apps[3].url))).toMatchObject({ status: 403 });
   const foreign: any = await openApp(other, 1, { appId: copy.id });
   expect(foreign.url).not.toBe(apps[3].url);
   users.activateUser(uid);
-  expect(appResource(new Request(foreign.url))).toMatchObject({ status: 403 });
+  expect(await appResource(new Request(foreign.url))).toMatchObject({ status: 403 });
   expect((await openApp(uid, 1, { appId: copy.id })).url).toBe(apps[3].url);
 });

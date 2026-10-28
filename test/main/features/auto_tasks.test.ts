@@ -75,9 +75,11 @@ import {
   applyAutoTaskMutation,
   getCurrentDevice,
   getTask,
+  handoffNotePath,
   isDue,
   listAttachments,
   listTasks,
+  recordRunTerminal,
   nextDueAfterRestoreForTest,
   nextDueAtForTest,
   pruneFireBoundaryClaimsForTest,
@@ -100,6 +102,7 @@ import {
   type AutoTask,
   type Schedule,
 } from '../../../src/main/features/auto_tasks';
+import { readState } from '../../../src/main/features/group_chat/state';
 import { setCurrentLang } from '../../../src/main/i18n';
 import { _setDeviceFingerprintForTests } from '../../../src/main/util/device';
 import { activateUser } from '../../../src/main/features/users';
@@ -109,6 +112,7 @@ const autoRuntime = vi.hoisted(() => ({
   deleteConversation: vi.fn(),
   send: vi.fn(),
   getAgent: vi.fn(),
+  terminalListeners: new Set<(event: Record<string, unknown>) => void>(),
 }));
 
 vi.mock('../../../src/main/features/chats', () => ({
@@ -118,6 +122,10 @@ vi.mock('../../../src/main/features/chats', () => ({
 
 vi.mock('../../../src/main/features/group_chat', () => ({
   send: autoRuntime.send,
+  subscribeTaskTerminals: (listener: (event: Record<string, unknown>) => void) => {
+    autoRuntime.terminalListeners.add(listener);
+    return () => { autoRuntime.terminalListeners.delete(listener); };
+  },
 }));
 
 vi.mock('../../../src/main/features/agents', () => ({
@@ -187,9 +195,13 @@ beforeEach(async () => {
   autoRuntime.createConversation.mockReset();
   autoRuntime.deleteConversation.mockReset();
   autoRuntime.send.mockReset();
+  autoRuntime.terminalListeners.clear();
   autoRuntime.createConversation.mockResolvedValue({ conversation_id: 'cid_auto' });
   autoRuntime.deleteConversation.mockResolvedValue(true);
-  autoRuntime.send.mockResolvedValue({ ok: true });
+  autoRuntime.send.mockImplementation(async input => {
+    await input.beforeDispatch?.();
+    return { ok: true };
+  });
   autoRuntime.getAgent.mockResolvedValue(null);
 });
 
@@ -903,6 +915,137 @@ describe('attachments', () => {
   });
 });
 
+describe('run facts and handoff', () => {
+  const daily = { type: 'daily', hour: 9, minute: 0 } as const;
+  const emitTerminal = (event: Record<string, unknown>) => {
+    for (const listener of [...autoRuntime.terminalListeners]) listener(event);
+  };
+  const untilStatus = async (taskId: string, status: string) => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await getTask(TEST_UID, taskId))?.last_run?.status === status) return;
+      await realDelay(10);
+    }
+    throw new Error(`run status never became ${status}`);
+  };
+
+  it.each(['during-send', 'during-start-save'])('retains a terminal received %s before fire preparation finishes', async timing => {
+    const taskId = 'at_61616161';
+    expect((await createTask(TEST_UID, { id: taskId, content: 'quick job', schedule: daily })).ok).toBe(true);
+    const endedAt = Date.now();
+    const terminal = () => emitTerminal({ user_id: TEST_UID, conversation_id: 'cid_auto',
+      status: 'failed', finished_at_ms: endedAt });
+    const writeJson = storage.writeJson;
+    let emitted = false;
+    const writing = vi.spyOn(storage, 'writeJson').mockImplementation(async (file, value) => {
+      await writeJson(file, value);
+      if (timing === 'during-start-save' && !emitted && (value as AutoTask)?.last_run?.status === 'running') {
+        emitted = true;
+        terminal();
+      }
+    });
+    if (timing === 'during-send') autoRuntime.send.mockImplementationOnce(async () => {
+      terminal();
+      return { ok: true };
+    });
+    try {
+      expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
+      await untilStatus(taskId, 'failed');
+      expect(await getTask(TEST_UID, taskId)).toMatchObject({ run_count: 1,
+        last_run: { cid: 'cid_auto', status: 'failed', ended_at: new Date(endedAt).toISOString() } });
+      expect(autoRuntime.terminalListeners.size).toBe(0);
+    } finally { writing.mockRestore(); }
+  });
+
+  it.each(['rejected', 'thrown'])('discards an early terminal when send is %s without counting a run', async outcome => {
+    const taskId = 'at_62626262';
+    expect((await createTask(TEST_UID, { id: taskId, content: 'not admitted', schedule: daily })).ok).toBe(true);
+    autoRuntime.send.mockImplementationOnce(async () => {
+      emitTerminal({ user_id: TEST_UID, conversation_id: 'cid_auto', status: 'failed', finished_at_ms: Date.now() });
+      if (outcome === 'thrown') throw new Error('dispatch unavailable');
+      return { ok: false, error: 'dispatch unavailable' };
+    });
+    expect(await runTaskNow(TEST_UID, taskId)).toMatchObject({ ok: false });
+    expect(await getTask(TEST_UID, taskId)).not.toHaveProperty('last_run');
+    expect(await getTask(TEST_UID, taskId)).not.toHaveProperty('run_count');
+    expect(autoRuntime.terminalListeners.size).toBe(0);
+  });
+
+  it('records each run it starts, keeps the one before it, and closes it on its own bus terminal', async () => {
+    const taskId = 'at_60606060';
+    expect((await createTask(TEST_UID, { id: taskId, content: 'weekly digest', schedule: daily })).ok).toBe(true);
+
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
+    const first = await getTask(TEST_UID, taskId);
+    expect(first?.run_count).toBe(1);
+    expect(first?.last_run).toMatchObject({ cid: 'cid_auto', status: 'running' });
+    expect(first?.previous_run).toBeUndefined();
+    // The run's conversation may write the task's handoff directory and
+    // nothing else of the task: config.json stays behind the tool.
+    const handoffDir = path.dirname(handoffNotePath(TEST_UID, first!));
+    expect(path.basename(handoffDir)).toBe('handoff');
+    expect(fs.existsSync(handoffDir)).toBe(true);
+    expect((await readState(TEST_UID, 'cid_auto')).tool_extra_roots).toEqual([handoffDir]);
+
+    // Terminals from another account or conversation cannot settle this run.
+    emitTerminal({ user_id: TEST_UID, conversation_id: 'cid_other', status: 'failed', finished_at_ms: Date.now() });
+    emitTerminal({ user_id: 'another-account', conversation_id: 'cid_auto', status: 'failed', finished_at_ms: Date.now() });
+    await realDelay(20);
+    expect((await getTask(TEST_UID, taskId))?.last_run?.status).toBe('running');
+    const endedAt = Date.UTC(2026, 4, 22, 9, 5, 0);
+    emitTerminal({ user_id: TEST_UID, conversation_id: 'cid_auto', status: 'completed', finished_at_ms: endedAt });
+    await untilStatus(taskId, 'completed');
+    const closed = await getTask(TEST_UID, taskId);
+    expect(closed?.last_run).toEqual({
+      cid: 'cid_auto', started_at: first!.last_run!.started_at, ended_at: new Date(endedAt).toISOString(), status: 'completed',
+    });
+    expect(autoRuntime.terminalListeners.size).toBe(0);
+    // A later chat in the same conversation has no remaining run listener.
+    emitTerminal({ user_id: TEST_UID, conversation_id: 'cid_auto', status: 'failed', finished_at_ms: Date.now() });
+    expect((await getTask(TEST_UID, taskId))?.last_run?.status).toBe('completed');
+
+    autoRuntime.createConversation.mockResolvedValue({ conversation_id: 'cid_auto_2' });
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto_2' });
+    const second = await getTask(TEST_UID, taskId);
+    expect(second?.run_count).toBe(2);
+    expect(second?.previous_run).toEqual(closed?.last_run);
+    expect(second?.last_run).toMatchObject({ cid: 'cid_auto_2', status: 'running' });
+    // A late terminal for a run no longer on record changes nothing.
+    await recordRunTerminal(TEST_UID, taskId, 'cid_auto', 'failed', new Date().toISOString());
+    expect((await getTask(TEST_UID, taskId))?.previous_run?.status).toBe('completed');
+    expect((await getTask(TEST_UID, taskId))?.last_run?.status).toBe('running');
+  });
+
+  it('preserves handoff files and drops malformed run facts on read', async () => {
+    try {
+      const taskId = 'at_61616161';
+      expect((await createTask(TEST_UID, { id: taskId, content: 'weekly digest', schedule: daily })).ok).toBe(true);
+      const notePath = handoffNotePath(TEST_UID, (await getTask(TEST_UID, taskId))!);
+      const handoffDir = path.dirname(notePath);
+      fs.mkdirSync(handoffDir, { recursive: true });
+      const stale = path.join(handoffDir, 'older.csv');
+      fs.writeFileSync(stale, 'a,b\n');
+      const earlier = new Date(Date.now() - 60_000);
+      fs.utimesSync(stale, earlier, earlier);
+
+      expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
+      fs.writeFileSync(notePath, '# handoff\nlast total 42\n');
+      await recordRunTerminal(TEST_UID, taskId, 'cid_auto', 'completed', new Date().toISOString());
+
+      // Malformed run facts are dropped on read; the task itself stays usable.
+      const raw = JSON.parse(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8'));
+      fs.writeFileSync(autoTaskConfigFile(TEST_UID, taskId), JSON.stringify({
+        ...raw, run_count: -1, last_run: 'yesterday', previous_run: { cid: '../x', status: 'completed', started_at: 'now' },
+      }));
+      const task = await getTask(TEST_UID, taskId);
+      expect(task?.content).toBe('weekly digest');
+      expect(task).not.toHaveProperty('run_count');
+      expect(task).not.toHaveProperty('last_run');
+      expect(task).not.toHaveProperty('previous_run');
+    } finally {
+      }
+  });
+});
+
 describe('scheduler dispatch', () => {
   it('stops after the configured scheduled-run count and ignores manual runs for that count', async () => {
     vi.useFakeTimers();
@@ -1441,6 +1584,10 @@ describe('scheduler dispatch', () => {
   it('fires a runnable due task while the screen is locked', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    let finishConversation!: (conversation: { conversation_id: string }) => void;
+    autoRuntime.createConversation.mockReturnValueOnce(new Promise(resolve => {
+      finishConversation = resolve;
+    }));
     const taskId = 'at_60606060';
     const created = await createTask(TEST_UID, {
       id: taskId,
@@ -1454,6 +1601,14 @@ describe('scheduler dispatch', () => {
     await waitForSchedulerOutcome(
       () => autoRuntime.createConversation.mock.calls.length === 1,
       'the locked-screen occurrence to dispatch',
+    );
+    expect(autoRuntime.send).not.toHaveBeenCalled();
+    finishConversation({ conversation_id: 'cid_auto' });
+    // Creation starts before handoff preparation and dispatch. Wait for the
+    // completed occurrence and its next boundary before inspecting or cleaning it.
+    await waitForSchedulerOutcome(
+      () => armedDueAtForTest(taskId) === new Date(2026, 4, 23, 9, 0, 0).getTime(),
+      'the locked-screen occurrence to finish and rearm',
     );
 
     expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
@@ -1592,6 +1747,8 @@ describe('scheduler dispatch', () => {
       userId: TEST_UID,
       cid: 'cid_auto',
       text: 'run on demand',
+
+      beforeDispatch: expect.any(Function), notificationKind: 'automation',
     });
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
@@ -1601,7 +1758,12 @@ describe('scheduler dispatch', () => {
       cid: 'cid_auto',
       task_id: taskId,
     });
-    expect(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8')).toBe(configBefore);
+    // The admitted run is counted and remembered; everything else in the
+    // record, including the scheduled-occurrence stamp, is untouched.
+    const { run_count, last_run, ...untouched } = JSON.parse(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8'));
+    expect(untouched).toEqual(JSON.parse(configBefore));
+    expect(run_count).toBe(1);
+    expect(last_run).toMatchObject({ cid: 'cid_auto', status: 'running' });
     expect(await getTask(TEST_UID, taskId)).toMatchObject({
       enabled: false,
       device_id: '11:22:33:44:55:66',
@@ -1676,6 +1838,7 @@ describe('scheduler dispatch', () => {
         if (mutation === 'edit') {
           expect(autoRuntime.send).toHaveBeenCalledExactlyOnceWith({
             userId: TEST_UID, cid: 'cid_auto', text: 'new report',
+            beforeDispatch: expect.any(Function), notificationKind: 'automation',
           });
           expect(saved?.last_run_at).toBe('2026-05-22T09:00:00.000Z');
         } else {
@@ -1701,13 +1864,15 @@ describe('scheduler dispatch', () => {
     const taskId = 'at_66666666';
     writeProject(TEST_UID, 'p_auto_project', ['agent_codex']);
     await uploadAttachment(TEST_UID, taskId, '../brief.md', Buffer.from('brief'));
+    await uploadAttachment(TEST_UID, taskId, 'z-first.txt', Buffer.from('first'));
+    await uploadAttachment(TEST_UID, taskId, 'a-last.txt', Buffer.from('last'));
 
     const created = await createTask(TEST_UID, {
       id: taskId,
       title: 'Morning run',
       content: 'send the morning report',
       project_id: 'p_auto_project',
-      attachments: ['brief.md', 'missing.md'],
+      attachments: ['z-first.txt', 'brief.md', 'missing.md', 'a-last.txt'],
       recipient: { kind: 'agent', id: 'agent_codex', name: 'Codex' },
       schedule: { type: 'one_time', at: '2026-05-22T08:59:00.000Z' },
     });
@@ -1726,7 +1891,9 @@ describe('scheduler dispatch', () => {
       userId: TEST_UID,
       cid: 'cid_auto',
       text: '@Codex send the morning report',
-      attachments: ['brief.md'],
+
+      beforeDispatch: expect.any(Function), notificationKind: 'automation',
+      attachments: ['z-first.txt', 'brief.md', 'a-last.txt'],
     });
     expect(autoRuntime.deleteConversation).not.toHaveBeenCalled();
     expect(events).toHaveLength(1);
@@ -1769,6 +1936,8 @@ describe('scheduler dispatch', () => {
       userId: TEST_UID,
       cid: 'cid_auto',
       text: '@Codex Renamed send the renamed-agent report',
+
+      beforeDispatch: expect.any(Function), notificationKind: 'automation',
     });
   });
 
@@ -2358,7 +2527,6 @@ describe('fire-boundary claim retention', () => {
   });
 });
 
-
 describe('automation › failed enable recovery', () => {
   it('keeps a failed enable disabled and unarmed, then preserves concurrent edits on retry', async () => {
     const created = await createTask(TEST_UID, {
@@ -2463,7 +2631,14 @@ describe('automation › recovery discovery sequences', () => {
       expect(events).toHaveLength(1);
       expect(events[0].type).toBe(outcome === 'success' ? 'conv_created' : 'fire_failed');
       expect(autoRuntime.deleteConversation).toHaveBeenCalledTimes(outcome === 'success' ? 0 : 1);
-      expect(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId))).toEqual(persisted);
+      // Only an admitted run adds run facts; the claimed occurrence and the
+      // rest of the record survive restoration either way.
+      const withoutRunFacts = (buffer: Buffer) => {
+        const { run_count, last_run, previous_run, ...rest } = JSON.parse(buffer.toString('utf8'));
+        return rest;
+      };
+      expect(withoutRunFacts(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId)))).toEqual(withoutRunFacts(persisted));
+      expect((await getTask(TEST_UID, taskId))?.run_count).toBe(outcome === 'success' ? 1 : undefined);
       stopScheduler();
       await rescheduleAllForTest(TEST_UID);
       await _onTimerFireForTest(TEST_UID, taskId);

@@ -80,11 +80,15 @@ export function normalizeMcpToolSchema(tool: McpToolLike): ToolSchema {
 import { createLogger } from '../../logger';
 import { buildChildProxyEnvironment } from '../../util/proxy-dispatcher';
 import { logErrorSummary } from '../../util/log-redact';
+import { captureWindowsShutdownProcesses, hasCapturedWindowsAppProcess } from '../../util/windows-shutdown-processes';
+import type { ShutdownProcesses } from '../../util/shutdown';
 
 const log = createLogger('connectors:mcp');
 
 interface SdkBundle {
   Client: typeof import('@modelcontextprotocol/sdk/client/index.js').Client;
+  StreamableHTTPError: typeof import('@modelcontextprotocol/sdk/client/streamableHttp.js').StreamableHTTPError;
+  SseError: typeof import('@modelcontextprotocol/sdk/client/sse.js').SseError;
   StdioClientTransport: typeof import('@modelcontextprotocol/sdk/client/stdio.js').StdioClientTransport;
   StreamableHTTPClientTransport: typeof import('@modelcontextprotocol/sdk/client/streamableHttp.js').StreamableHTTPClientTransport;
   SSEClientTransport: typeof import('@modelcontextprotocol/sdk/client/sse.js').SSEClientTransport;
@@ -102,11 +106,28 @@ async function _loadSdk(): Promise<SdkBundle> {
   ]);
   _sdk = {
     Client: clientMod.Client,
+    StreamableHTTPError: httpMod.StreamableHTTPError,
+    SseError: sseMod.SseError,
     StdioClientTransport: stdioMod.StdioClientTransport,
     StreamableHTTPClientTransport: httpMod.StreamableHTTPClientTransport,
     SSEClientTransport: sseMod.SSEClientTransport,
   };
   return _sdk;
+}
+
+/** Preserve HTTP meaning from SDK-owned error classes without parsing provider text.
+ * The SDK numeric code remains untouched for its transport fallback decisions. */
+function tagTransportFailure(error: unknown): void {
+  if (!_sdk || !(error instanceof _sdk.StreamableHTTPError || error instanceof _sdk.SseError)) return;
+  const status = error.code;
+  const diagnosticCode = status === 401 || status === 403 ? 'E_TOOL_CALL_AUTH'
+    : status === 429 ? 'E_TOOL_CALL_RATE_LIMIT'
+    : status === 408 || status === 504 ? 'E_TOOL_CALL_TIMEOUT'
+    : typeof status === 'number' && status >= 500 && status <= 599 ? 'E_TOOL_CALL_UPSTREAM'
+    : undefined;
+  if (diagnosticCode && Object.isExtensible(error)) {
+    Object.defineProperty(error, 'orkasErrorCode', { value: diagnosticCode, configurable: true });
+  }
 }
 
 const CLIENT_INFO = { name: 'orkas-pc', version: '0.1.0' };
@@ -131,10 +152,37 @@ function resolveMcpConnectTimeoutMs(kind: Transport['kind']): number {
 export interface McpRequestOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** Host-owned staging directory, supplied only to the local CLI adapter. */
+  localFileOutputDirectory?: string;
+}
+
+async function closeOwnedTransport(
+  transport: import('@modelcontextprotocol/sdk/shared/transport.js').Transport,
+  close: () => Promise<void>,
+): Promise<void> {
+  let processes: ShutdownProcesses | undefined;
+  try {
+    try {
+      if (process.platform === 'win32' && _sdk && transport instanceof _sdk.StdioClientTransport
+          && transport.pid && !hasCapturedWindowsAppProcess(transport.pid)) {
+        // SDK close ends stdin before killing its direct child. Pin descendants
+        // first: an EOF-aware wrapper can otherwise orphan a persistent server
+        // long before the application's final shutdown snapshot is taken.
+        processes = await captureWindowsShutdownProcesses('win32', transport.pid);
+      }
+    } finally {
+      // Always release the SDK channel, including when discovery is unavailable.
+      await close();
+    }
+    await processes?.terminate();
+  } finally {
+    processes?.dispose();
+  }
 }
 
 export class McpConnection {
   private _client: import('@modelcontextprotocol/sdk/client/index.js').Client | null = null;
+  private _closing: Promise<void> | null = null;
   private _connected = false;
 
   constructor(private readonly id: string, private readonly transport: Transport) {}
@@ -142,11 +190,13 @@ export class McpConnection {
   get isConnected(): boolean { return this._connected; }
 
   async connect(): Promise<void> {
+    if (this._closing) await this._closing;
     if (this._connected) return;
     const startedAt = Date.now();
     const sdk = await _loadSdk();
     let activeTransportKind: Transport['kind'] | 'sse' = this.transport.kind;
     let transport: import('@modelcontextprotocol/sdk/shared/transport.js').Transport;
+    let spawnFailure: Error | undefined;
     if (this.transport.kind === 'stdio') {
       const proxyEnv = await buildChildProxyEnvironment(this.transport.proxyTargetUrl);
       const envFull: Record<string, string> = { ...this.transport.env, ...proxyEnv };
@@ -166,6 +216,26 @@ export class McpConnection {
         stderr: 'pipe',
         ...(this.transport.cwd ? { cwd: this.transport.cwd } : {}),
       });
+      // On Windows the command shell can start before cross-spawn reports
+      // ENOENT. The SDK then rejects initialization as "Connection closed",
+      // losing the actionable launch error. Its protocol chains this handler.
+      stdioTransport.onerror = error => {
+        const systemError = error as NodeJS.ErrnoException;
+        if (['ENOENT', 'EACCES', 'EPERM'].includes(systemError.code || '')
+          && systemError.syscall?.startsWith('spawn')) spawnFailure = error;
+      };
+      if (process.platform === 'win32') {
+        const close = stdioTransport.close.bind(stdioTransport);
+        let closing: Promise<void> | null = null;
+        // The SDK also closes on failed initialization, before connect rejects.
+        // Guard the transport itself so every close pins the same process tree.
+        stdioTransport.close = () => closing ||= closeOwnedTransport(stdioTransport, close).catch(err => {
+          log.warn('stdio process cleanup failed', {
+            id: this.id.startsWith('custom-') ? 'custom' : this.id,
+            error: logErrorSummary(err),
+          });
+        });
+      }
       // Provider diagnostics can contain credentials or user data. Drain without
       // retaining them; lifecycle and request errors use the host's structured logs.
       stdioTransport.stderr?.on('data', () => {});
@@ -234,13 +304,15 @@ export class McpConnection {
         timeout_ms: connectTimeoutMs,
       });
     } catch (err) {
+      if (spawnFailure) err = spawnFailure;
+      tagTransportFailure(err);
       log.warn('connect failed', {
         id: this.id.startsWith('custom-') ? 'custom' : this.id,
         transport: activeTransportKind,
         duration_ms: Date.now() - startedAt,
         error: logErrorSummary(err),
       });
-      try { await transport.close?.(); } catch (closeErr) {
+      try { await transport.close(); } catch (closeErr) {
         log.warn('transport close after connect failure failed', {
           id: this.id.startsWith('custom-') ? 'custom' : this.id,
           error: logErrorSummary(closeErr),
@@ -265,7 +337,7 @@ export class McpConnection {
       const res = await this._client.listTools(cursor === undefined ? undefined : { cursor }, {
         timeout: remaining,
         ...(opts.signal ? { signal: opts.signal } : {}),
-      });
+      }).catch(error => { tagTransportFailure(error); throw error; });
       for (const tool of res.tools || []) tools.push(normalizeMcpToolSchema(tool));
       cursor = res.nextCursor;
       if (cursor !== undefined) {
@@ -279,7 +351,9 @@ export class McpConnection {
   async callTool(name: string, args: Record<string, unknown>, opts: McpRequestOptions = {}): Promise<unknown> {
     if (!this._client || !this._connected) throw new Error('not connected');
     const res = await this._client.callTool(
-      { name, arguments: args },
+      { name, arguments: args, ...(opts.localFileOutputDirectory ? {
+        _meta: { 'orkas/local-file-output-directory': opts.localFileOutputDirectory },
+      } : {}) },
       undefined,
       {
         timeout: opts.timeoutMs || DEFAULT_CALL_TOOL_TIMEOUT_MS,
@@ -287,19 +361,21 @@ export class McpConnection {
         onprogress: () => {},
         ...(opts.signal ? { signal: opts.signal } : {}),
       },
-    );
+    ).catch(error => { tagTransportFailure(error); throw error; });
     return res;
   }
 
-  async close(): Promise<void> {
-    if (!this._client) return;
-    try {
-      await this._client.close();
-    } catch (err) {
-      log.warn('close failed', { id: this.id.startsWith('custom-') ? 'custom' : this.id, error: logErrorSummary(err) });
-    } finally {
-      this._client = null;
-      this._connected = false;
-    }
+  close(): Promise<void> {
+    if (this._closing) return this._closing;
+    const client = this._client;
+    if (!client) return Promise.resolve();
+    this._client = null;
+    this._connected = false;
+    // Share the whole cleanup lifetime across disconnect/shutdown callers.
+    this._closing = Promise.resolve().then(() => client.close())
+      .catch(err => {
+        log.warn('close failed', { id: this.id.startsWith('custom-') ? 'custom' : this.id, error: logErrorSummary(err) });
+      }).finally(() => { this._closing = null; });
+    return this._closing;
   }
 }

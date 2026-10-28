@@ -22,6 +22,7 @@ vi.mock('electron', () => ({
 
 import {
   ClientConfigManager,
+  clientConfig,
   DEFAULT_PROVIDER_MODELS,
   clientConfigPlatform,
   refresh,
@@ -77,7 +78,7 @@ describe('client_config', () => {
       google: { model: 'fixture-image', api: 'gemini', supports_edit: true },
     } } }, restart: {}, config_hash: 'fixture-image-edit' }, 'fixture-image-edit');
     expect(getConfiguredImageGenCapability('google')).toMatchObject({ model: 'fixture-image', supportsEdit: true });
-    expect(DEFAULT_IMAGE_GEN_BY_PROVIDER.doubao.model).toBe('doubao-seedream-5-0-lite-260128');
+    expect(DEFAULT_IMAGE_GEN_BY_PROVIDER.doubao.model).toBe('doubao-seedream-5-0-flash-260915');
     // The normalized camelCase form is read again through the same catalog path.
     expect(getConfiguredImageGenCapability('google')).toMatchObject({ supportsEdit: true });
   });
@@ -495,6 +496,131 @@ describe('client_config', () => {
       expect(cache.fetched_at_ms).toBe(now);
     } finally {
       fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe('client config response ownership and deadline', () => {
+  afterEach(() => {
+    stop();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it.each(['local-profile', 'legacy-anonymous'] as const)('discards a body completed after switching to %s and permits a fresh owner request', async destination => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const oldUid = `clientconfigbodyold-${destination}`;
+    const newUid = destination === 'legacy-anonymous' ? users.ANONYMOUS_LOCAL_ID : 'clientconfigbodynew';
+    const manager = new ClientConfigManager();
+    users.activateUser(newUid);
+    manager.applyServerPayload({ immediate: { 'feature.owner': 'keep-new-owner' }, restart: {} }, 'new-owner-etag');
+    const newFile = paths.userRemoteConfigFile(newUid);
+    const before = fs.readFileSync(newFile);
+    users.activateUser(oldUid);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const response = new Response(JSON.stringify({
+      code: 0, immediate: { 'feature.owner': 'obsolete-owner' }, restart: {}, config_hash: 'obsolete-owner-hash',
+    }), { headers: { etag: 'obsolete-owner-etag' } });
+    const read = response.json.bind(response);
+    const json = vi.spyOn(response, 'json').mockImplementation(async () => { await gate; return read(); });
+    const fetchMock = vi.fn(async () => response);
+    vi.stubGlobal('fetch', fetchMock);
+    const changed = vi.fn();
+    const unsubscribe = clientConfig.subscribeAll(changed);
+    let pending: ReturnType<typeof refresh> | undefined;
+    try {
+      pending = refresh('manual', { force: true });
+      await waitForCondition(() => json.mock.calls.length > 0);
+      expect(json).toHaveBeenCalledOnce();
+      users.activateUser(newUid);
+      release();
+      const result = await pending;
+      expect({ result, newOwnerCacheUnchanged: fs.readFileSync(newFile).equals(before), notifications: changed.mock.calls.length })
+        .toEqual({ result: { updated: false, skipped: true, stale: true }, newOwnerCacheUnchanged: true, notifications: 0 });
+      users.activateUser(oldUid);
+      expect(manager.get('feature.owner')).toBeUndefined();
+      users.activateUser(newUid);
+      fetchMock.mockImplementation(async () => new Response(JSON.stringify({
+        code: 0, immediate: { 'feature.owner': 'fresh-new-owner' }, restart: {}, config_hash: 'fresh-owner-hash',
+      }), { headers: { etag: 'fresh-owner-etag' } }));
+      await refresh('manual', { force: true });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(manager.get('feature.owner')).toBe('fresh-new-owner');
+      expect(manager.readCache().etag).toBe('fresh-owner-etag');
+    } finally {
+      release(); await pending; unsubscribe();
+      for (const uid of [oldUid, newUid]) fs.rmSync(path.dirname(paths.userRemoteConfigFile(uid)), { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the cached value after malformed JSON without introducing body-parse retries', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const uid = 'clientconfigbodymalformed';
+    users.activateUser(uid);
+    const manager = new ClientConfigManager();
+    manager.applyServerPayload({ immediate: { 'feature.owner': 'keep-cached' }, restart: {} }, 'cached-etag');
+    const fetchMock = vi.fn(async () => new Response('{broken'));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      expect(await refresh('manual', { force: true })).toMatchObject({ updated: false, error: expect.any(String) });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(manager.get('feature.owner')).toBe('keep-cached');
+      expect(manager.readCache().etag).toBe('cached-etag');
+    } finally {
+      fs.rmSync(path.dirname(paths.userRemoteConfigFile(uid)), { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the request deadline active while a response body stalls and recovers on its bounded retry', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const uid = 'clientconfigbodydeadline';
+    users.activateUser(uid);
+    let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let firstSignal: AbortSignal | undefined;
+    let bodyAborts = 0;
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async (_input: unknown, init: RequestInit) => {
+        firstSignal = init.signal as AbortSignal;
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            bodyController = controller;
+            firstSignal!.addEventListener('abort', () => {
+              bodyAborts += 1;
+              controller.error(firstSignal!.reason);
+            }, { once: true });
+          },
+        }));
+      })
+      .mockImplementation(async () => new Response(JSON.stringify({
+        code: 0, immediate: { 'feature.deadline': 'recovered' }, restart: {}, config_hash: 'deadline-recovered',
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+    let pending: ReturnType<typeof refresh> | undefined;
+    try {
+      pending = refresh('manual', { force: true });
+      await waitForCondition(() => fetchMock.mock.calls.length > 0);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(bodyAborts).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(bodyAborts).toBe(1);
+      expect(firstSignal?.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(pending).resolves.toEqual({ updated: true });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(new ClientConfigManager().get('feature.deadline')).toBe('recovered');
+    } finally {
+      bodyController?.error(new Error('fixture cleanup'));
+      await vi.advanceTimersByTimeAsync(10_000);
+      await pending;
+      vi.useRealTimers();
+      fs.rmSync(path.dirname(paths.userRemoteConfigFile(uid)), { recursive: true, force: true });
     }
   });
 });

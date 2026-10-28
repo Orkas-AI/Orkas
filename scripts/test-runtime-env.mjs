@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 /** Keep deterministic evaluator fixtures on the same project interpreter as
  *  the test suite, including direct npm test invocations. Explicit evaluator
  *  overrides remain independent of the ordinary Python suite. */
-export function withTestPython(env, repoRoot = fileURLToPath(new URL('../../', import.meta.url)), platform = process.platform) {
+export function withTestPython(env, repoRoot = fileURLToPath(new URL('../', import.meta.url)), platform = process.platform) {
   const result = { ...env };
   const localPython = platform === 'win32'
     ? path.join(repoRoot, 'venv', 'Scripts', 'python.exe')

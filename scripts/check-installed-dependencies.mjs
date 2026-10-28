@@ -8,10 +8,10 @@
  * `provider_catalog` report that it could not resolve `claude-fable-5`, which
  * reads as a broken model catalog rather than an uninstalled dependency.
  *
- * Only direct dependencies are compared, and only their installed version
- * against the lockfile's resolved version. Transitive drift surfaces through
- * the same direct packages in practice, and walking the whole tree would cost
- * more than the check is worth on every test run.
+ * Compare every locked package at its resolved location, including nested
+ * copies. A security fix can advance a transitive package while its direct
+ * parent stays unchanged. Read only the locked package manifests; do not
+ * recursively walk node_modules or inspect package contents on test startup.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -36,18 +36,19 @@ export function installedDependencyDrift(pcRoot = DEFAULT_PC_ROOT) {
   const lock = readJson(path.join(pcRoot, 'package-lock.json'));
   if (!pkg || !lock?.packages) return { checked: 0, drifted: [] };
 
-  const declared = Object.keys({ ...pkg.dependencies, ...pkg.devDependencies });
   const drifted = [];
   let checked = 0;
 
-  for (const name of declared) {
-    const entry = lock.packages[`node_modules/${name}`];
+  for (const [location, entry] of Object.entries(lock.packages)) {
+    if (!location.startsWith('node_modules/') || entry.link) continue;
     const expected = entry?.version;
     if (!expected) continue;
-    // Optional packages are legitimately absent on platforms they do not build
-    // for, so their absence is not drift.
-    if (entry.optional) continue;
-    const installedPkg = readJson(path.join(pcRoot, 'node_modules', name, 'package.json'));
+    const manifest = path.join(pcRoot, location, 'package.json');
+    // Foreign-platform optionals may be absent. If installed, they must still
+    // match: optionality is not permission to run an outdated package.
+    if (entry.optional && !fs.existsSync(manifest)) continue;
+    const name = location.slice('node_modules/'.length);
+    const installedPkg = readJson(manifest);
     // A missing package.json means the dependency is absent entirely, which is
     // as much drift as a version mismatch.
     const installed = installedPkg?.version ?? null;

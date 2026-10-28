@@ -28,15 +28,34 @@ Run this checklist when the Office agent, Office skills, built-in Office tools, 
 Run from the repository root:
 
 ```bash
-npm run test:js -- test/main/model/core-agent/office-tools.test.ts test/main/model/core-agent/pdf-tools.test.ts test/main/model/core-agent/office-batch.test.ts test/main/model/core-agent/office-arg.test.ts test/main/features/office/office_engine.test.ts
+node scripts/run-tests.mjs run test/main/model/core-agent/office-tools.test.ts test/main/model/core-agent/pdf-tools.test.ts test/main/model/core-agent/office-batch.test.ts test/main/model/core-agent/office-arg.test.ts test/main/features/office/office_engine.test.ts test/main/util/officecli-fetch.test.ts test/main/model/core-agent/tool-catalog.test.ts test/main/avatar-catalogs.test.ts test/renderer/conversation-failed-retry.test.ts
 npm run test:office-artifacts
+node scripts/run-tests.mjs run test/main/features/office/office-readonly_e2e.test.ts
 ```
+
+`office-tools.test.ts` additionally treats `office_review` as one lifecycle:
+unknown actions must invoke neither validation nor rendering; `check_and_render`
+must stop before rendering on invalid OpenXML; a multi-page render with one
+failed page must retain successful page evidence while returning an overall
+failure, so callers can repair or retry without a false all-pages success.
+
+`office-readonly_e2e.test.ts` runs the real bundled engine and embedded Chromium
+through `office_review` and `edit_office`. Its five scenarios cover combined
+check/render, a missing page followed by a successful retry, cancellation after
+a completed issue scan, invalid OpenXML, and an intentional edit followed by
+review of the saved copy. They verify source bytes/mtime, receipt hashes, decoded
+PNG content, resident/window cleanup, and absence of write registrations during
+review. The missing-page and cancellation scenarios each assert one expected
+render warning; other application/browser logs and command stderr fail the run.
+The fixture replaces only the log sink and observes real command completion
+to trigger cancellation; it does not stub engine results or Chromium rendering.
+Run these cases after artifact provisioning.
 
 ## Real Binary Smoke
 
-`npm run test:office-artifacts` automates steps 1-6, verifies real HTML-path
-PNG renders, and generates the seven production-evaluation input fixtures on
-the current macOS/Windows host. It checks every fixture source hash before
+`npm run test:office-artifacts` automates steps 1-6 and 10, validates browserless
+HTML previews, and generates the seven production-evaluation input fixtures on
+the current supported host. It checks every fixture source hash before
 cleanup. It is a required cross-platform CI gate. Set
 `ORKAS_KEEP_OFFICE_SMOKE_ARTIFACTS=1` to retain successful output for manual
 visual review.
@@ -47,16 +66,45 @@ Use a temporary directory and the current-platform binary.
 2. Create one Chinese DOCX, XLSX, and PPTX through `create` plus a batch file.
 3. Read each through `view text` or `view outline` and confirm Chinese text and element paths.
 4. Run a successful multi-operation batch and confirm every change.
-5. Run a batch containing one invalid operation and confirm v1.0.139 atomic rollback leaves the file byte-identical.
+5. Run a batch containing one invalid operation and confirm atomic rollback leaves the file byte-identical.
 6. Run `validate` and `view issues --json` on every output.
-7. Render representative pages/slides with `view ... screenshot`; inspect for missing CJK glyphs, clipping, and obvious overlap.
+7. Render representative pages/slides with `view ... html` and inspect them through the embedded Electron preview for missing CJK glyphs, clipping, and obvious overlap.
 8. Seed the reviewed DOCX, identifier CSV, XLSM boundary package, reviewed
    PPTX, mixed-delivery CSV, WPS boundary file, and four-page PDF used by
    Production E2E; verify that integrity inspection leaves every source
    byte-identical.
-9. Repeat the artifact and render checks on macOS and Windows before a release that changes the OfficeCLI pin.
+9. Repeat the artifact and render checks on macOS, Windows and Linux before a release that changes the OfficeCLI pin. Record platform-specific gaps separately.
+10. Build DOCX inputs independently of OfficeCLI, including compressed XML
+    and spaced `<w:br />` / `<w:tab />` elements. Run `office_review check`
+    twice, `office_read`, and the browserless HTML preview on fresh inputs;
+    require unchanged source bytes/mtime and check receipts matching the
+    final source hash. Confirm a normal edit still persists after reopen,
+    and unversioned batch text newlines remain soft line breaks.
 
 Do not use a successful process exit as the only delivery signal. Preserve validation/issue output and visually inspect the rendered image.
+
+## Agent delivery journeys
+
+Exercise the shipped OfficeWorker with isolated workspace fixtures: edit an
+existing contract without changing its original, preserve identifier strings
+from CSV in an XLSX, prepare and revise an existing presentation, and deliver
+mixed document/spreadsheet/presentation outputs. Seed the reviewed DOCX,
+identifier CSV, XLSM boundary package, reviewed PPTX, mixed-delivery CSV, WPS
+boundary file and four-page PDF. Verify source hashes, expected output count,
+package structure and saved content independently of the Agent's final prose.
+
+A failed generation or invalid tool input must remain a failure until the
+actual output files have been verified. After a corrected explicit request,
+confirm recovery produces usable files and does not publish a placeholder or
+mistake seeded input for a new output. Model quality checks require their own
+authorized run; these scenarios do not claim a model pass in this build.
+
+For unsupported `.xlsm` and proprietary WPS inputs, the Agent must load the
+matching Skill and `stat_file` the actual source before returning the complete
+capability boundary through the group handback protocol. The Commander
+continuation treats that report as authoritative: it must not search for a
+shell/process conversion, publish an empty or placeholder output, or retry the
+same unsupported operation through another actor.
 
 ## Source-Safety And Fault Cases
 

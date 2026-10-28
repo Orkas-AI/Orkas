@@ -85,7 +85,7 @@ export {
   decodeCodexGeneratedImageResult,
   type CodexGeneratedImageDecodeResult,
 } from './media.js';
-import type { BridgeCapability, BridgeHandle, CommanderHandoffRequest } from './bridge.js';
+import type { BridgeCapability, BridgeHandle, BridgeCallObservation, CommanderHandoffRequest } from './bridge.js';
 import { registerUserSwitchHook } from '../user-switch-hooks.js';
 import {
   MAX_IMAGE_ATTACHMENT_BYTES,
@@ -497,6 +497,29 @@ function sanitizePublicToolInput(
   return safe;
 }
 
+/** Preserve only native severity/source/time before display redaction can
+ * truncate JSON. Never retain the original message or arbitrary native fields. */
+function nativeLogMetadata(value: unknown): { level: string; source: string; timestamp: string } | undefined {
+  if (typeof value !== 'string' || value.length > 64 * 1024 || !value.trimStart().startsWith('{')) return;
+  let record: any;
+  try { record = JSON.parse(value); } catch { return; }
+  if (!record || typeof record !== 'object') return;
+  const rust = typeof record.target === 'string'
+    && typeof (record.fields?.message ?? record.fields?.error) === 'string';
+  const openclaw = typeof record.subsystem === 'string' && typeof record.message === 'string';
+  if (!rust && !openclaw) return;
+  const level = typeof record.level === 'string' ? record.level.toLowerCase() : '';
+  if (!(rust ? /^(debug|info|warn|error)$/ : /^(trace|debug|info|warn|error|fatal)$/).test(level)) return;
+  const timestamp = rust ? record.timestamp : record.time;
+  const rawSource = rust ? record.target : record.subsystem;
+  if (typeof timestamp !== 'string' || !Number.isFinite(Date.parse(timestamp))
+      || rawSource.length > 160 || !/^[\w:./-]+$/.test(rawSource)) return;
+  const source = sanitizePublicDiagnostic(rawSource);
+  if (source !== rawSource) return;
+  return { level: level === 'fatal' ? 'error' : level === 'trace' ? 'debug' : level,
+    source, timestamp: new Date(timestamp).toISOString() };
+}
+
 /** Strip raw reasoning and machine diagnostics before events cross the runner
  * boundary. A backend may explicitly mark a model-authored reasoning summary;
  * it is bounded/redacted here while raw `text` is always removed. Persistence,
@@ -551,7 +574,9 @@ export function redactPrivateLocalAgentEvent(event: LocalEvent, workingDir?: str
     return { ...rest, ...(input !== undefined ? { input } : {}) } as LocalEvent;
   }
   if (event.type === 'stderr-line' || event.type === 'raw-line') {
-    return { ...event, line: sanitizePublicDiagnostic(event.line) };
+    const { nativeLog: _untrusted, ...rest } = event;
+    const nativeLog = event.type === 'stderr-line' ? nativeLogMetadata(event.line) : undefined;
+    return { ...rest, line: sanitizePublicDiagnostic(event.line), ...(nativeLog ? { nativeLog } : {}) };
   }
   if (event.type === 'log') {
     return { ...event, message: sanitizePublicDiagnostic(event.message) };
@@ -814,7 +839,7 @@ function noteElapsedOnce(target: LocalAgentRunLogDiagnostics, key: keyof LocalAg
 }
 
 function localToolCounter(stats: LocalAgentRunLogDiagnostics, rawName: unknown): LocalToolRunCounter {
-  const name = String(rawName || 'unknown').slice(0, 80) || 'unknown';
+  const name = safeToolNameForLog(rawName);
   if (!stats.toolCounts[name]) stats.toolCounts[name] = { use: 0, result: 0, other: 0 };
   return stats.toolCounts[name];
 }
@@ -823,7 +848,7 @@ const MAX_TOOL_TIMELINE_LOG_ENTRIES = 80;
 const MAX_EVENT_TIMELINE_LOG_ENTRIES = 120;
 
 function safeToolNameForLog(rawName: unknown): string {
-  return String(rawName || 'unknown').slice(0, 80) || 'unknown';
+  return sanitizeLogTextForUpload(String(rawName || 'unknown').slice(0, 4096)).slice(0, 80) || 'unknown';
 }
 
 function safeLocalToolPhaseForLog(rawPhase: unknown): LocalToolTimelineLogEntry['phase'] {
@@ -1119,6 +1144,8 @@ export interface RunCliAgentOpts {
   cwd: string;
   signal: AbortSignal;
   deadlineAt?: number;
+  /** Host-only audit of authenticated Orkas RPC calls, including opaque CLIs. */
+  onBridgeCallObserved?: (observation: BridgeCallObservation) => void;
   /** Forwarded each backend event verbatim, after persistence. */
   onEvent: (e: LocalEvent) => void;
   /** Active native-turn ingress lifecycle. The runner forwards backend
@@ -1964,6 +1991,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         runId: handle.runId,
         configDir: handle.dir,
         sandboxEnv: buildSkillSandboxEnv(opts.uid, opts.agentId),
+        onCallObserved: opts.onBridgeCallObserved,
         onPermissionWaitStart: () => activityClock.pause(),
         onPermissionWaiting: elapsedMs => onEvent({
           type: 'status',

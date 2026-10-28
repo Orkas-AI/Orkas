@@ -38,6 +38,9 @@ import {
   type ProviderModelEntry,
   getConfiguredImageGenCapability,
   getConfiguredProviderModels,
+  type OpenAICompatibleProviderConfig,
+  getConfiguredOpenAICompatibleProviders as getConfiguredOpenAICompatibleProviderConfigs,
+  getConfiguredOpenAICompatibleProvider as getConfiguredOpenAICompatibleProviderConfig,
 } from '../features/client_config';
 import type { Api, Model } from '@earendil-works/pi-ai';
 import {
@@ -102,7 +105,7 @@ export const CATALOG: readonly CatalogEntry[] = [
   // Moonshot has two independently-billed endpoints:
   //   - `moonshot` → https://api.moonshot.cn/v1 (OpenAI-compatible,
   //     pay-as-you-go open platform).
-  //   - `kimi-coding` → https://api.kimi.com/coding (Anthropic protocol,
+  //   - `kimi-coding` → https://api.kimi.com/coding/v1 (OpenAI-compatible,
   //     monthly subscription for Kimi Coding only).
   // Both bind to the same Moonshot account but have separate auth and
   // quota — a single key cannot be used on both. The UI shows them as
@@ -207,9 +210,6 @@ const PI_MODEL_TEMPLATE_ALIAS_LABEL: Readonly<Record<string, Readonly<Record<str
 };
 
 const MODEL_UPGRADE_ALIAS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
-  zai: {
-    'glm-5.1': 'glm-5.2',
-  },
   anthropic: {
     'claude-opus-4-7': 'claude-opus-5',
     'claude-opus-4-8': 'claude-opus-5',
@@ -218,16 +218,19 @@ const MODEL_UPGRADE_ALIAS: Readonly<Record<string, Readonly<Record<string, strin
   'openai-codex': {
     'gpt-5.6-luna': 'gpt-5.6-terra',
     'gpt-5.5': 'gpt-5.6-sol',
+    'gpt-5.4': 'gpt-5.6-sol',
   },
   openai: {
     'gpt-5.6-luna': 'gpt-5.6-terra',
     'gpt-5.5': 'gpt-5.6-sol',
+    'gpt-5.4': 'gpt-5.6-sol',
   },
   google: {
-    'gemini-3-flash-preview': 'gemini-3.6-flash',
-    'gemini-3.5-flash': 'gemini-3.6-flash',
-    'gemini-3-pro-preview': 'gemini-3.6-flash',
-    'gemini-3.1-pro-preview': 'gemini-3.6-flash',
+    'gemini-3-flash-preview': 'gemini-3.8-flash',
+    'gemini-3.5-flash': 'gemini-3.8-flash',
+    'gemini-3.6-flash': 'gemini-3.8-flash',
+    'gemini-3-pro-preview': 'gemini-3.8-flash',
+    'gemini-3.1-pro-preview': 'gemini-3.8-flash',
     'gemini-3.1-flash-lite-preview': 'gemini-3.5-flash-lite',
     'gemini-3.1-flash-lite': 'gemini-3.5-flash-lite',
   },
@@ -248,28 +251,35 @@ const MODEL_UPGRADE_ALIAS: Readonly<Record<string, Readonly<Record<string, strin
     'MiniMax-M2.7-highspeed': 'MiniMax-M3',
   },
   doubao: {
+    'doubao-seed-2-1-pro-260628': 'doubao-seed-2-1-pro-260915',
     'doubao-seed-2-0-lite-260215': 'doubao-seed-2-0-lite-260428',
+  },
+  zai: {
+    'glm-5.1': 'glm-5.2',
   },
   openrouter: {
     'anthropic/claude-opus-4.7': 'anthropic/claude-opus-5',
     'anthropic/claude-opus-4.8': 'anthropic/claude-opus-5',
     'anthropic/claude-sonnet-5': 'anthropic/claude-fable-5',
     'openai/gpt-5.5': 'openai/gpt-5.6-sol',
+    'openai/gpt-5.4': 'openai/gpt-5.6-sol',
     'openai/gpt-5.6-luna': 'openai/gpt-5.6-terra',
-    'google/gemini-3-flash-preview': 'google/gemini-3.6-flash',
-    'google/gemini-3.5-flash': 'google/gemini-3.6-flash',
-    'google/gemini-3-pro-preview': 'google/gemini-3.6-flash',
-    'google/gemini-3.1-pro-preview': 'google/gemini-3.6-flash',
+    'google/gemini-3-flash-preview': 'google/gemini-3.8-flash',
+    'google/gemini-3.5-flash': 'google/gemini-3.8-flash',
+    'google/gemini-3.6-flash': 'google/gemini-3.8-flash',
+    'google/gemini-3-pro-preview': 'google/gemini-3.8-flash',
+    'google/gemini-3.1-pro-preview': 'google/gemini-3.8-flash',
     'google/gemini-3.1-flash-lite-preview': 'google/gemini-3.5-flash-lite',
     'google/gemini-3.1-flash-lite': 'google/gemini-3.5-flash-lite',
     'deepseek/deepseek-v4-flash': 'deepseek/deepseek-v4-flash-0731',
     'moonshotai/kimi-k2.5': 'moonshotai/kimi-k3',
     'moonshotai/kimi-k2.6': 'moonshotai/kimi-k3',
     'moonshotai/kimi-k2.7-code': 'moonshotai/kimi-k3',
-    'qwen/qwen3-max': 'qwen/qwen3.7-max',
-    'qwen/qwen3-coder': 'qwen/qwen3.7-max',
-    'qwen/qwen3-coder-next': 'qwen/qwen3.7-max',
-    'qwen/qwen3.7-flash': 'qwen/qwen3.7-plus',
+    'qwen/qwen3-max': 'qwen/qwen3.8-max-0902',
+    'qwen/qwen3-coder': 'qwen/qwen3.8-max-0902',
+    'qwen/qwen3-coder-next': 'qwen/qwen3.8-max-0902',
+    'qwen/qwen3.7-max': 'qwen/qwen3.8-max-0902',
+    'qwen/qwen3.7-flash': 'qwen/qwen3.8-flash',
     'z-ai/glm-5.1': 'z-ai/glm-5.2',
     'minimax/minimax-m2.7': 'minimax/minimax-m3',
   },
@@ -383,6 +393,23 @@ function cloneModelWithId(
   return applyConfiguredModelOverrides(cloned, overrides);
 }
 
+/** Temporary metadata for the official Flash id until pi-ai includes it.
+ * M3 supplies the regional transport and input limits, not Flash's pricing or
+ * thinking controls. Exact future SDK entries bypass this fallback.
+ * https://platform.minimax.io/docs/api-reference/text-anthropic-api
+ */
+function applyMinimaxFlashFallback(model: Model<Api>, providerId: string): Model<Api> {
+  if (!['minimax-cn', 'minimax-portal', 'minimax-portal-cn'].includes(providerId)
+    || model.id !== 'MiniMax-M3.1-Flash' || model.api !== 'anthropic-messages') return model;
+  return {
+    ...model,
+    reasoning: true,
+    cost: { input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0 },
+    thinkingLevelMap: { off: null, minimal: 'low', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
+    compat: { ...model.compat, forceAdaptiveThinking: true, supportsTemperature: false },
+  };
+}
+
 function hasConfiguredModelOverrides(configured: ProviderModelEntry | undefined): boolean {
   return !!configured
     && (
@@ -489,7 +516,7 @@ export function resolveConfiguredPiModel(
         || PI_MODEL_TEMPLATE_ALIAS_LABEL[requestedProviderId]?.[requestedModelId]
         || requestedModelId;
       return {
-        model: cloneModelWithId(template, requestedModelId, name, configured),
+        model: applyMinimaxFlashFallback(cloneModelWithId(template, requestedModelId, name, configured), requestedProviderId),
         requestedProviderId,
         requestedModelId,
         catalogProviderId,
@@ -563,7 +590,7 @@ export function modelCatalogEntryFromModel(
   if (typeof model.contextWindow === 'number' && model.contextWindow > 0) {
     entry.contextWindow = model.contextWindow;
   }
-  if (typeof model.maxTokens === 'number' && model.maxTokens > 0) {
+  if (typeof model.maxTokens === 'number' && model.maxTokens > 0 && !modelOutputLimitExceedsWindow(model)) {
     entry.maxOutputTokens = model.maxTokens;
   }
   return Object.keys(entry).length ? entry : null;
@@ -602,7 +629,9 @@ export const VISIBLE_PROVIDERS: readonly string[] = CATALOG.map((p) => p.id);
 const CATALOG_ORDER = new Map<string, number>(CATALOG.map((p, i) => [p.id, i]));
 
 export function isVisibleProvider(id: string): boolean {
-  return CATALOG_ORDER.has(id);
+  const normalized = String(id || '').trim();
+  return CATALOG_ORDER.has(normalized)
+    || getConfiguredOpenAICompatibleProvider(normalized) !== null;
 }
 
 /** Providers understood by the runtime but intentionally absent from the
@@ -675,6 +704,8 @@ export const OAUTH_ALIAS_FOR: Readonly<Record<string, string>> = {
 export function providerLabel(id: string): string {
   const c = CATALOG.find((p) => p.id === id);
   if (c) return c.label;
+  const configured = getConfiguredOpenAICompatibleProvider(id);
+  if (configured) return configured.label;
   if (EXTRA_LABELS[id]) return EXTRA_LABELS[id];
   const oauth = OAUTH_PROVIDERS.find((p) => p.id === id);
   if (oauth) return oauth.label;
@@ -686,7 +717,8 @@ export function providerLabelKey(id: string): string | undefined {
 }
 
 export function providerDocsUrl(id: string): string | undefined {
-  return CATALOG.find((p) => p.id === id)?.docsUrl;
+  return CATALOG.find((p) => p.id === id)?.docsUrl
+    || getConfiguredOpenAICompatibleProvider(id)?.docsUrl;
 }
 
 export function providerSubscriptionNote(id: string): string | undefined {
@@ -708,7 +740,7 @@ export function providerUsesCustomOpenAIConfig(id: string): boolean {
 
 export interface CustomOpenAICompatibleRuntimeConfig {
   /** Wire protocol; omitted legacy configs use OpenAI-compatible chat completions. */
-  protocol?: 'openai' | 'anthropic';
+  protocol?: 'openai' | 'responses' | 'anthropic';
   baseUrl: string;
   contextWindow: number;
   maxTokens: number;
@@ -784,9 +816,20 @@ export function findImageGenCapability(providerId: string): ImageGenCapability |
  * at the bottom of the list.
  */
 export function sortProviderIds(ids: string[]): string[] {
+  const configuredOrder = new Map(
+    configuredOpenAICompatibleProviders().map((provider, index) => [provider.id, index]),
+  );
   return [...ids].sort((a, b) => {
-    const ra = CATALOG_ORDER.has(a) ? (CATALOG_ORDER.get(a) as number) : 1000;
-    const rb = CATALOG_ORDER.has(b) ? (CATALOG_ORDER.get(b) as number) : 1000;
+    const ra = CATALOG_ORDER.has(a)
+      ? (CATALOG_ORDER.get(a) as number)
+      : configuredOrder.has(a)
+        ? CATALOG.length + (configuredOrder.get(a) as number)
+        : 1000;
+    const rb = CATALOG_ORDER.has(b)
+      ? (CATALOG_ORDER.get(b) as number)
+      : configuredOrder.has(b)
+        ? CATALOG.length + (configuredOrder.get(b) as number)
+        : 1000;
     if (ra !== rb) return ra - rb;
     return a.localeCompare(b);
   });
@@ -931,4 +974,38 @@ function cleanName(raw: string): string {
     .replace(/\s*\(latest\)$/i, '')
     .replace(/\s*\(\d{4}-\d{2}-\d{2}\)$/, '')
     .trim();
+}
+
+function isReservedConfiguredProviderId(id: string): boolean {
+  return CATALOG_ORDER.has(id) || isOfficialModelProvider(id);
+}
+
+export function configuredOpenAICompatibleProviders(): OpenAICompatibleProviderConfig[] {
+  return getConfiguredOpenAICompatibleProviderConfigs().filter((provider) => (
+    !isReservedConfiguredProviderId(provider.id)
+    && curatedModelsFor(provider.id).length > 0
+  ));
+}
+
+export function getConfiguredOpenAICompatibleProvider(
+  providerId: string,
+): OpenAICompatibleProviderConfig | null {
+  const id = String(providerId || '').trim();
+  if (!id || isReservedConfiguredProviderId(id)) return null;
+  if (curatedModelsFor(id).length === 0) return null;
+  return getConfiguredOpenAICompatibleProviderConfig(id);
+}
+
+export function isExternalApiProvider(providerId: string): boolean {
+  const id = String(providerId || '').trim();
+  return EXTERNAL_API_PROVIDERS.includes(id)
+    || getConfiguredOpenAICompatibleProvider(id) !== null;
+}
+
+export function modelOutputLimitExceedsWindow(
+  model: { contextWindow?: number; maxTokens?: number } | null | undefined,
+): boolean {
+  if (!model) return false;
+  return typeof model.contextWindow === 'number' && model.contextWindow > 0
+    && typeof model.maxTokens === 'number' && model.maxTokens >= model.contextWindow;
 }

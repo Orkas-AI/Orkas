@@ -987,9 +987,10 @@ const ConversationInfo = (() => {
     const addLibraryLabel = _label('conversation_info.file_add_to_library_action', 'Add to Library');
     const saveAppLabel = _label('apps.save_from_file_action', 'Save as app');
     const deleteLabel = _label('common.delete', 'Delete');
-    let canSaveApp = false;
+    let canSaveApp = false, saveTarget = null;
     try {
       const inspected = await window.orkas.invoke('savedApps.inspectBundleFromPath', _fileActionPayload(absPath, targetCid));
+      saveTarget = inspected?.target;
       canSaveApp = !!(inspected && inspected.ok !== false && (inspected.canSave || inspected.reason === 'app_bundle_root'));
     } catch (_) { canSaveApp = false; }
     const addItem = entryKind === 'file' && _canAddEntryToChat(name || absPath)
@@ -999,7 +1000,7 @@ const ConversationInfo = (() => {
       ? `<div class="ctx-row-menu-item" data-action="add-to-library">${escapeHtml(addLibraryLabel)}</div>`
       : '';
     const saveAppItem = canSaveApp
-      ? `<div class="ctx-row-menu-item" data-action="save-as-app">${escapeHtml(saveAppLabel)}</div>`
+      ? `<div class="ctx-row-menu-item" data-action="save-as-app">${escapeHtml(saveTarget ? _label('apps.update_original', 'Update original app') : saveAppLabel)}</div>${saveTarget ? `<div class="ctx-row-menu-item" data-action="save-new-app">${escapeHtml(_label('apps.save_new', 'Save new app'))}</div>` : ''}`
       : '';
     menu.innerHTML = `
       <div class="ctx-row-menu-item" data-action="reveal">${escapeHtml(revealLabel)}</div>
@@ -1110,11 +1111,13 @@ const ConversationInfo = (() => {
     }
   }
 
-  async function _saveEntryAsApp(absPath, cidOverride) {
-
+  async function _saveEntryAsApp(absPath, cidOverride, resourceKind = 'file', mode = 'auto') {
     let res;
     try {
-      res = await window.orkas.invoke('savedApps.saveFromPath', _fileActionPayload(absPath, cidOverride));
+      res = await window.OrkasAppSave.save('savedApps.saveFromPath', {..._fileActionPayload(absPath, cidOverride), ...(mode === 'new' ? {mode} : {})}, _label);
+      if (res?.canceled) {
+        return;
+      }
     } catch (err) {
       _logSavedAppSaveFailure(_savedAppSaveFailure(err, 'ipc'));
       try {
@@ -1125,10 +1128,6 @@ const ConversationInfo = (() => {
           error_code: 'file_viewer_presentation_failed',
         });
       }
-      return;
-    }
-    if (window.OrkasCommercialEntry?.isFailure(res)) {
-      await window.OrkasCommercialEntry.show();
       return;
     }
     if (!res || res.ok === false) {
@@ -1202,7 +1201,8 @@ const ConversationInfo = (() => {
 
   async function _runFileMenuAction(action, absPath, displayName, kind, options = {}) {
     if (action === 'reveal') return _revealEntry(absPath, options.cid);
-    if (action === 'save-as-app') return _saveEntryAsApp(absPath, options.cid);
+    if (action === 'save-new-app') return _saveEntryAsApp(absPath, options.cid, kind, 'new');
+    if (action === 'save-as-app') return _saveEntryAsApp(absPath, options.cid, kind);
     if (action === 'add-to-library') return _addEntryToLibrary(absPath, options.cid);
     if (action === 'add-to-chat') return _addEntryToChat(absPath, kind, options.cid);
     if (action === 'delete') return _deleteEntry(absPath, displayName, kind, options);

@@ -21,6 +21,7 @@ import * as path from 'node:path';
 
 import { officeCliBinaryPath } from '../../paths';
 import { createLogger } from '../../logger';
+import { logErrorSummary, logPathRef } from '../../util/log-redact';
 import { killProcessTree } from '../../../core-agent/src/sandbox/executor';
 
 const log = createLogger('office-engine');
@@ -93,7 +94,7 @@ export function officeCliAvailable(): boolean {
   const bin = officeCliBinaryPath();
   const ok = !!bin && fs.existsSync(bin);
   if (ok) availableCache = true;
-  else log.warn(`OfficeCLI binary unavailable (${bin ?? `no asset for ${process.platform}-${process.arch}`})`);
+  else log.warn('OfficeCLI binary unavailable', { platform: process.platform, arch: process.arch });
   return ok;
 }
 
@@ -219,33 +220,34 @@ export async function closeOfficeFile(file: string, cwd: string): Promise<void> 
   try {
     await runOfficeCli(['close', file], { cwd, timeoutMs: 10_000 });
   } catch (err) {
-    log.warn(`close resident ${file}: ${(err as Error).message}`);
+    log.warn('OfficeCLI resident close failed', { file: logPathRef(file), error: logErrorSummary(err) });
   }
 }
 
 /** Reap ANY lingering OfficeCLI resident daemons. Per-file `closeOfficeFile`
  *  in each tool's `finally` covers the normal path; this is the backstop for a
  *  hard crash that skipped the finally. Call at startup (clean prior-session
- *  leaks) and on app quit. Synchronous + best-effort; single-instance lock
- *  guarantees no concurrent legitimate instance to disturb. */
+ *  leaks) and on app quit. Scope to the exact bundled executable and resident
+ *  mode: other installations and active document commands must survive. */
 export function closeAllOfficeResidents(): void {
   const bin = officeCliBinaryPath();
   if (!bin) return;
   try {
     if (process.platform === 'win32') {
-      // Match-by-cmdline is unreliable on Windows; at startup/quit killing every
-      // process of our bundled exe by image name is safe (no concurrent instance).
       const systemRoot = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
-      const taskkill = path.win32.join(systemRoot, 'System32', 'taskkill.exe');
-      // Use Windows path semantics explicitly. Besides making this branch
-      // deterministic in cross-host tests, it avoids ever passing a full
-      // `C:\\...` path to taskkill when the value originated outside the host
-      // path module (for example packaged metadata or a cross-build step).
-      spawnSync(taskkill, ['/F', '/T', '/IM', path.win32.basename(bin)], {
+      const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      // Keep the binary path out of executable code. Pin handles and compare
+      // creation times so an exited resident's recycled PID is never killed.
+      const result = spawnSync(powershell, [
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+        Buffer.from(WINDOWS_RESIDENT_CLEANUP, 'utf16le').toString('base64'),
+      ], {
+        env: { ...process.env, ORKAS_OFFICECLI_SWEEP_BINARY: bin },
         timeout: 5_000,
         stdio: 'ignore',
         windowsHide: true,
       });
+      if (result.error || result.status !== 0) throw new Error('OfficeCLI resident cleanup failed');
     } else {
       // Scope strictly to OUR binary's resident daemons, not any other officecli.
       // `pkill -f` treats the pattern as an extended regex, so escape the binary
@@ -255,6 +257,46 @@ export function closeAllOfficeResidents(): void {
       spawnSync('pkill', ['-f', `${escaped} __resident-serve__`], { timeout: 5_000, stdio: 'ignore' });
     }
   } catch (err) {
-    log.warn(`resident sweep: ${(err as Error).message}`);
+    log.warn('OfficeCLI resident sweep failed', { error: logErrorSummary(err) });
   }
 }
+
+const WINDOWS_RESIDENT_CLEANUP = String.raw`
+$ErrorActionPreference = 'Stop'
+$query = $null
+$rows = $null
+try {
+  $binary = [IO.Path]::GetFullPath($env:ORKAS_OFFICECLI_SWEEP_BINARY)
+  $name = [IO.Path]::GetFileName($binary).Replace("'", "''")
+  $query = [System.Management.ManagementObjectSearcher]::new("SELECT ProcessId,ExecutablePath,CommandLine,CreationDate FROM Win32_Process WHERE Name='$name'")
+  $rows = $query.Get()
+  $count = 0
+  foreach ($row in $rows) {
+    $candidate = $null
+    try {
+      if (++$count -gt 4096) { throw 'resident_limit' }
+      if (-not [string]::Equals([string]$row.ExecutablePath, $binary, [StringComparison]::OrdinalIgnoreCase)) { continue }
+      # Resident mode must be the first argument, not text in a document path.
+      if ([string]$row.CommandLine -notmatch '^\s*(?:"[^"]*"|\S+)\s+__resident-serve__(?:\s|$)') { continue }
+      try {
+        $candidate = [Diagnostics.Process]::GetProcessById([int]$row.ProcessId)
+        $null = $candidate.Handle
+        $started = $candidate.StartTime.ToUniversalTime()
+      } catch [ArgumentException] { continue }
+      catch [InvalidOperationException] { continue }
+      $snapshotStarted = [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$row.CreationDate).ToUniversalTime()
+      if (($started.Ticks - ($started.Ticks % 10)) -ne $snapshotStarted.Ticks) { continue }
+      if (-not $candidate.HasExited) { $candidate.Kill() }
+      if (-not $candidate.WaitForExit(500)) { throw 'resident_still_running' }
+    } finally {
+      if ($null -ne $candidate) { $candidate.Dispose() }
+      $row.Dispose()
+    }
+  }
+} catch { exit 1 }
+finally {
+  if ($null -ne $rows) { $rows.Dispose() }
+  if ($null -ne $query) { $query.Dispose() }
+}
+exit 0
+`;

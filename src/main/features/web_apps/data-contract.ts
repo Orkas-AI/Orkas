@@ -37,7 +37,7 @@ export const dataDefinitionSchema = z.object({version:z.literal(1),tables:z.arra
 });
 export type DataDefinition=z.infer<typeof dataDefinitionSchema>;
 const query=z.object({table:name,fields:z.array(name).max(130).optional(),include:z.array(name).max(4).optional(),filters:z.array(filter).max(16).optional(),limit:z.number().int().min(1).max(100).optional(),offset:z.number().int().min(0).max(100000).optional(),order:z.object({field:name,direction:z.enum(['asc','desc'])}).strict().optional()}).strict();
-const insert=z.object({table:name,values:z.record(z.unknown()),requestId:z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).optional()}).strict();
+const insert=z.object({table:name,values:z.record(z.string(), z.unknown()),requestId:z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).optional()}).strict();
 export const DATA_INPUTS={
   'data.query':query,
   'data.count':z.object({table:name,filters:z.array(filter).max(16).optional()}).strict(),

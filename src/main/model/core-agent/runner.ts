@@ -29,6 +29,7 @@ import {
   hasConfiguredModel,
   getConfiguredModelCooldown,
   getConfiguredModelOAuthExpiredMessage,
+  getConfiguredModelContextWindowMessage,
   type ChatEntryChoice,
 } from '../../features/auth';
 import {
@@ -111,11 +112,14 @@ import {
   buildMoonshotModel,
   buildDeepSeekModel,
   buildDoubaoModel,
+  buildConfiguredOpenAICompatibleModel,
+  createConfiguredOpenAICompatibleProvider,
   createMoonshotProvider,
   createDeepSeekProvider,
   createDoubaoProvider,
   buildCustomOpenAICompatibleModel,
   buildCustomAnthropicModel,
+  buildCustomResponsesModel,
   createCustomOpenAICompatibleProvider,
   omitReservedOutputLimitForProvider,
 } from './external-providers';
@@ -123,7 +127,7 @@ import { withTaskBudget } from './task-budget-provider';
 import { createRotatingProvider, type RotatingCandidate } from './rotating-provider';
 import { clearCooldown } from './profile-cooldown';
 import {
-  EXTERNAL_API_PROVIDERS,
+  isExternalApiProvider,
   resolveConfiguredPiModel,
   modelInputImageLimit,
 } from '../provider_catalog';
@@ -180,10 +184,12 @@ function buildExternalProviderModel(
       return customConfig
         ? (customConfig.protocol === 'anthropic'
           ? buildCustomAnthropicModel(modelId, customConfig)
-          : buildCustomOpenAICompatibleModel(modelId, customConfig))
+          : customConfig.protocol === 'responses'
+            ? buildCustomResponsesModel(modelId, customConfig)
+            : buildCustomOpenAICompatibleModel(modelId, customConfig))
         : null;
     default:
-      return null;
+      return buildConfiguredOpenAICompatibleModel(providerId, modelId);
   }
 }
 
@@ -274,11 +280,15 @@ export interface BuildRunnerParams {
   /** Stable inbound message id used as the exclusive upper bound for
    * current-conversation history tools. */
   historyBoundaryMessageId?: string;
+  /** Host-owned final delivery versus intermediate work for Commander. */
+  outputDelivery?: 'final' | 'process';
   /** Host-side post-success hook for a user-confirmed custom Connector. */
   onCustomConnectorAdded?: (connectorId: string) => void;
   /** Current real user text, used by tools that must bind an approval action
    * to explicit user intent rather than merely to the existence of a turn. */
   userMessage?: string;
+  /** Image-understanding calls must never fall back to a text-only request. */
+  requireImageInput?: boolean;
   /** Current-turn attachment kinds. Tool exposure uses this metadata without
    * inspecting attachment contents or eagerly running extraction. */
   attachmentMetadata?: { hasAttachments?: boolean; attachmentTypes?: readonly string[] };
@@ -375,7 +385,7 @@ export interface BuildRunnerParams {
   hasProducedPath?: (absPath: string) => boolean;
   /** Fires after each successful `create_artifact` call. See `model/client.ts`
    *  `ChatOptions.onArtifactCreated`. */
-  onArtifactCreated?: (a: { id: string; title: string }) => void;
+  onArtifactCreated?: (a: { id: string; title: string; revision?: number }) => void;
   /** Fires once per skill id rendered into the system-prompt skills index,
    *  with its source system. Called at runner build time (before the LLM
    *  sees the prompt). Bus collects per turn for `skill_advertised`. */
@@ -411,7 +421,7 @@ export interface NativeSearchInjectedInfo {
 function inputImageLimitForChoice(mod: CA, choice: ChatEntryChoice | undefined): number {
   const providerId = choice?.provider || 'anthropic';
   const modelId = choice?.model || 'claude-opus-4-8';
-  const model = EXTERNAL_API_PROVIDERS.includes(providerId)
+  const model = isExternalApiProvider(providerId)
     ? buildExternalProviderModel(providerId, modelId, choice?.customConfig)
     : resolveConfiguredPiModel(mod, providerId, modelId)?.model;
   return modelInputImageLimit(providerId, modelId, model);
@@ -463,6 +473,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
    *  forwards this as `runStream({ turnEphemeral })` so it rides this turn's
    *  user message instead. Empty for runs with no volatile blocks. */
   turnEphemeral: string;
+  /** Read stamps for files whose complete text `turnEphemeral` carries; the
+   *  caller forwards this as `runStream({ initialReadFileState })` so the
+   *  run's file tools treat them as read. Absent when nothing was shown whole. */
+  initialReadFileState?: ReadonlyMap<string, unknown>;
   entryId?: string;
   profileId?: string;
   providerId: string;
@@ -492,7 +506,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // resolve authentication method".
   const group = await pickChatEntryGroup();
   const primary: ChatEntryChoice | undefined = group[0];
-  if (!primary && !process.env.ANTHROPIC_API_KEY) {
+  if (!primary && (params.requireImageInput || !process.env.ANTHROPIC_API_KEY)) {
+    const contextWindowMessage = getConfiguredModelContextWindowMessage();
+    if (contextWindowMessage) throw new Error(contextWindowMessage);
     const oauthExpiredMessage = getConfiguredModelOAuthExpiredMessage();
     if (oauthExpiredMessage) throw new Error(oauthExpiredMessage);
     const cooldown = getConfiguredModelCooldown();
@@ -669,7 +685,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     }
   };
   const onArtifactCreatedForHistory = params.onArtifactCreated
-    ? (a: { id: string; title: string }) => {
+    ? (a: { id: string; title: string; revision?: number }) => {
         try {
           params.onArtifactCreated!(a);
         } finally {
@@ -734,63 +750,20 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     }));
   }
 
-  // Project sessions keep their bound backlog. A non-project Commander may
-  // dynamically load the same tool with an account-scoped project selector;
-  // other actors never receive that selector. Owner is a display NAME; the store only
-  // VALIDATES an already-resolved id (project_tasks.ts: "name→id resolution
-  // lives with the caller"), so this handler resolves name → bound agent id
-  // before persisting — unknown owners fail closed with the valid set.
+  // Backlogs follow the conversation scope. An unbound Commander uses the
+  // same global-only executor as an unbound named Agent; project selectors
+  // cannot widen either direct or programmatic calls.
   if (uid && memoryAgentScope && (params.projectId || isCommander || isGroupAgent)) {
-    const cid = params.cid || '';
-    const { createProjectTasksHandler: createBoundHandler } = await import('../../features/project_tasks_tool_handler');
-    const createProjectTasksHandler = (pid: string) => createBoundHandler(uid, pid, cid, agentDisplayNameById,
-      { actorId: isCommander ? 'commander' : memoryAgentScope }, { sourceProjectId: params.projectId || '' },
-      params.onTodoTaskSaved, params.onTodoTaskDeleted);
+    const { createProjectTasksHandler } = await import('../../features/project_tasks_tool_handler');
     const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
-    if (params.projectId || isGroupAgent) {
-      injectedTools.push(createProjectTasksTool(createProjectTasksHandler(params.projectId || ''), {
-        globalScope: !params.projectId,
-        readOnly: !isCommander && !isGroupAgent,
-      }));
-    } else {
-      const { listProjectNameRows } = await import('../../features/projects');
-      // No project scan or schema data in the initial prompt. Resolve locally
-      // on demand, using this runner's uid even if the active account changes.
-      // `__global__` is a stable tool-only selector for account-global todos.
-      // Its backing store still uses the canonical empty project scope; the
-      // synthetic id merely lets an unbound Commander address it explicitly.
-      const globalTasks = { project_id: '__global__', name: 'Global' };
-      const listProjects = async () => [
-        globalTasks,
-        ...(await listProjectNameRows(uid))
-          .sort((a, b) => a.name.localeCompare(b.name) || a.project_id.localeCompare(b.project_id)),
-      ];
-      injectedTools.push(createProjectTasksTool({
-        listProjects,
-        async resolveProject(reference) {
-          const rows = await listProjects();
-          const exactId = rows.find((row) => row.project_id === reference);
-          const candidates = exactId ? [exactId] : rows.filter((row) => (
-            row.name.toLocaleLowerCase() === reference.toLocaleLowerCase()
-          ));
-          if (candidates.length !== 1) {
-            return {
-              ok: false,
-              error: candidates.length
-                ? 'project_ambiguous: multiple projects match this name'
-                : 'project_not_found: no matching project in this account',
-              ...(candidates.length ? { candidates } : {}),
-            };
-          }
-          const project = candidates[0];
-          return {
-            ok: true,
-            project,
-            handler: createProjectTasksHandler(project.project_id === globalTasks.project_id ? '' : project.project_id),
-          };
-        },
-      }));
-    }
+    injectedTools.push(createProjectTasksTool(createProjectTasksHandler(
+      uid, params.projectId || '', params.cid || '', agentDisplayNameById,
+      { actorId: isCommander ? 'commander' : memoryAgentScope }, { sourceProjectId: params.projectId || '' },
+      params.onTodoTaskSaved, params.onTodoTaskDeleted,
+    ), {
+      globalScope: !params.projectId,
+      readOnly: !isCommander && !isGroupAgent,
+    }));
   }
 
   if (uid && memoryAgentScope && params.projectId) {
@@ -817,7 +790,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
           const error = writeError === 'conflict'
             ? 'conflict: project instructions changed after this turn started; retry in a new turn with the latest content'
             : writeError;
-          return { ok: false, error };
+          return { ...r, ok: false, error };
         },
       }));
     }
@@ -1287,8 +1260,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       ? ['workspace.read', 'connectors']
       : [];
   // Resolve trusted entry context once for both initial tools and turn guidance.
-  const conversationAssistance = (uid && params.cid && isCommander)
-    ? await (await import('../../features/conversation_assistance_context')).resolveConversationAssistanceForTurn(uid, params.cid)
+  const conversationAssistance = (uid && params.cid && (isCommander || (isGroupAgent && agentId)))
+    ? await (await import('../../features/conversation_assistance_context')).resolveConversationAssistanceForTurn(uid, params.cid, {
+        ...(isGroupAgent ? { agentId } : {}), outputDelivery: params.outputDelivery,
+      })
     : { kind: undefined, guidance: '' };
   const toolSurface = createToolSurfaceController({
     availableToolNames: surfaceAvailableToolNames,
@@ -1318,8 +1293,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
           // until the user clicks the staged card. App diagnosis stays behind
           // its focused Management child group.
           ...(isCommander && availableToolNames.includes('open_app_view') ? ['open_app_view'] : []),
-          // Preserve the existing project-bound backlog surface. Only the
-          // non-project Commander selector is deferred under Management.
+          // Preserve the existing project-bound backlog surface. The
+          // non-project global-only executor is deferred under Management.
           ...(params.projectId ? ['todo_tasks', ...((isCommander || isGroupAgent) ? ['auto_tasks'] : [])] : []),
           ...(params.onOutputsPublished ? ['publish_outputs'] : []),
         ],
@@ -1491,6 +1466,12 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     : '';
   // Entry guidance stays on the current turn, outside the stable system prefix.
   const conversationAssistanceBlock = conversationAssistance.guidance;
+  // A file the guidance showed whole is already read for this run: the file
+  // tools accept its first edit without an E_NOT_READ round, and still reject
+  // it as stale if the bytes change before then.
+  const initialReadFileState = conversationAssistance.readSeeds?.length
+    ? new Map<string, unknown>(conversationAssistance.readSeeds.map((seed) => [seed.path, seed.stamp]))
+    : undefined;
   const turnEphemeral = [
     orchestrationBlock,
     volatileTail,
@@ -1534,7 +1515,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const modelCatalog: Record<string, { provider: string; model: string; contextWindow?: number; maxOutputTokens?: number }> = {};
   for (const choice of group) {
     if (modelCatalog[choice.model]) continue;
-    const model = EXTERNAL_API_PROVIDERS.includes(choice.provider)
+    const model = isExternalApiProvider(choice.provider)
       ? buildExternalProviderModel(choice.provider, choice.model, choice.customConfig)
       : resolveConfiguredPiModel(mod, choice.provider, choice.model)?.model;
     if (modelOutputLimitExceedsWindow(model)) {
@@ -1602,6 +1583,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         turnId: params.turnId,
       },
       params.cid,
+      params.requireImageInput,
     );
     // Inject the rotating provider into BOTH the factory slot AND the
     // pre-built instance cache. ProviderRegistry.get() short-circuits on
@@ -1706,6 +1688,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     failureTrackingScope: session,
     resolvedSystemPrompt,
     turnEphemeral,
+    ...(initialReadFileState ? { initialReadFileState } : {}),
     entryId: primary?.entryId,
     profileId: primary?.profileId,
     providerId,
@@ -1801,7 +1784,7 @@ async function buildExternalProvider(
         ...choice.customConfig,
       });
     default:
-      throw new Error(`no external provider factory for "${providerId}"`);
+      return createConfiguredOpenAICompatibleProvider({ providerId, apiKey, modelId });
   }
 }
 
@@ -1837,11 +1820,12 @@ async function buildRotatingProvider(
   retryLimits?: { networkRetryAttempts: number; normalEmptyRetryAttempts: number },
   usageContext?: OrkasApiUsageContext,
   cid?: string,
+  requireImageInput = false,
 ): Promise<LLMProvider> {
   const candidates: RotatingCandidate[] = group.map((choice) => {
     const candProviderId = choice.provider;
     const candModelId = choice.model;
-    const isExternal = EXTERNAL_API_PROVIDERS.includes(candProviderId);
+    const isExternal = isExternalApiProvider(candProviderId);
     const resolvedModel = isExternal
       ? null
       : resolveConfiguredPiModel(mod, candProviderId, candModelId);
@@ -1867,9 +1851,15 @@ async function buildRotatingProvider(
         && candidateMaxTokens > 0
         ? { maxTokens: Math.trunc(candidateMaxTokens) }
         : {}),
+      ...(choice.refreshApiKey ? { refreshCredential: async () => {
+        const refreshed = await choice.refreshApiKey!(currentApiKey);
+        if (!refreshed) return false;
+        currentApiKey = refreshed;
+        return true;
+      } } : {}),
       build: async () => {
         if (isExternal) {
-          return withTaskBudget(await buildExternalProvider(choice, usageContext), cid);
+          return withTaskBudget(await buildExternalProvider({ ...choice, apiKey: currentApiKey }, usageContext), cid);
         }
         if (resolvedModel?.isConfiguredFallback) {
           log.info('using configured model fallback', {
@@ -1883,7 +1873,7 @@ async function buildRotatingProvider(
           provider: candProviderId,
           ...(resolvedModel?.needsCustomModel ? { customModel: resolvedModel.model } : { model: candModelId }),
           apiKey: currentApiKey,
-          onPayload: omitReservedOutputLimitForProvider(
+            onPayload: omitReservedOutputLimitForProvider(
             candProviderId,
             buildNativeSearchOnPayload(candProviderId, candModelId, onNativeSearchInjected),
           ),
@@ -1896,6 +1886,7 @@ async function buildRotatingProvider(
   return createRotatingProvider({
     providerId,
     candidates,
+    requireImageInput,
     ...retryLimits,
     ...(process.env.ORKAS_MODEL_EVAL_PINNED_ROUTE === '1'
       && providerId === 'custom'

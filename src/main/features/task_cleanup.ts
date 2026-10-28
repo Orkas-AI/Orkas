@@ -9,6 +9,7 @@ import * as chats from './chats';
 import * as recycle from './recycle_bin';
 import { getProject } from './projects';
 import { abort, isQuiescent } from './group_chat/bus';
+import { flushBoards } from './group_chat/task_board';
 import { hasPendingAttachmentsForCleanup } from './chat_attachments';
 import { conversationLayout, conversationMessageReadFile, chatAttachmentDirForConversation } from '../util/project-layout';
 import { indexedJsonlStamp } from '../util/indexed-jsonl';
@@ -209,6 +210,10 @@ export async function remove(uid: string, token: string, cid: string) {
       // Stop writes current activity timestamps. Keep that boundary for backup
       // retries, but never accept later execution writes or another live run.
       cutoff = Date.now() + 1;
+      // Stop's task-board terminal is coalesced asynchronously. Settle only
+      // this conversation before freezing the file revision; keep the activity
+      // cutoff at Stop completion so waiting does not admit later work.
+      await flushBoards({ uid, cid });
       s.stopped.set(cid, { cutoff, revision: await executionRevision(uid, cid, projectId) });
     }
     const canDelete = async (candidate: chats.Conversation | null) => {

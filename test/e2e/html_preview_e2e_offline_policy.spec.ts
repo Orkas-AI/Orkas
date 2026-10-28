@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
-import type { ElectronApplication } from '@playwright/test';
+import type { ConsoleMessage, ElectronApplication, Request, Response, WebError } from '@playwright/test';
 
 import { chatMediaLocalUrl } from '../../src/main/util/chat-media-url';
 import { expect, test } from './fixtures/orkas';
@@ -87,6 +87,40 @@ test.describe('local HTML preview', () => {
     await expect(frame.locator('#storage')).toHaveText('SecurityError');
   });
 
+  test('renders same-folder frames with production scheme privileges while keeping opaque-origin isolation', async ({ orkas }) => {
+    orkas.createWorkspaceFile('frame-check/child.html', `<!doctype html><style>html,body{margin:0;background:#00ff00}</style>
+      <script>parent.postMessage('child-ready','*')</script>`);
+    const entry = orkas.createWorkspaceFile('frame-check/index.html', `<!doctype html><style>html,body{margin:0;background:#ff0000}iframe{width:400px;height:400px;border:0}</style>
+      <output id="status">waiting</output><iframe src="child.html"></iframe><script>
+      addEventListener('message',event=>{if(event.data!=='child-ready')return;
+        let storageDenied=false,domDenied=false;
+        try{localStorage.setItem('probe','1')}catch{storageDenied=true}
+        try{domDenied=!document.querySelector('iframe').contentDocument}catch{domDenied=true}
+        document.getElementById('status').textContent='child-ready storage-denied:'+storageDenied+' dom-denied:'+domDenied;
+        if(storageDenied&&domDenied)document.body.style.background='#00ff00';
+      });</script>`);
+    const observed = await orkas.electronApp!.evaluate(async (_, args) => {
+      const { renderResponsiveHtmlPreview } = (process as any).mainModule.require(args.modulePath);
+      const { nativeImage } = (process as any).mainModule.require('electron');
+      const rendered = await renderResponsiveHtmlPreview(args.entry, [
+        { name: 'desktop', width: 960, height: 640 },
+      ], {}, { interactions: false, fileViewer: true });
+      const image = nativeImage.createFromBuffer(rendered.screenshots[0]);
+      return {
+        evidence: rendered.evidence,
+        pixel: Array.from(image.crop({ x: 200, y: 200, width: 1, height: 1 }).toBitmap()) as number[],
+        isolationPixel: Array.from(image.crop({ x: 600, y: 200, width: 1, height: 1 }).toBitmap()) as number[],
+      };
+    }, { modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts'), entry });
+    expect(observed.evidence.viewports[0].consoleErrors).toEqual([]);
+    // The child must paint green. The separate parent pixel turns green only
+    // after real postMessage delivery and both sandbox denials succeed.
+    for (const pixel of [observed.pixel, observed.isolationPixel]) {
+      expect(pixel[3]).toBe(255);
+      expect(pixel[1]).toBeGreaterThan(Math.max(pixel[0], pixel[2]));
+    }
+  });
+
   test('checks a deliverable page under the file viewer sandbox and keeps artifact checks unchanged', async ({ orkas }) => {
     const modulePath = path.resolve(__dirname, '../../src/main/features/html_preview.ts');
     const clean = createMultiFileSite(orkas, 'check-clean', false);
@@ -160,18 +194,70 @@ test.describe('local HTML preview', () => {
 <html><head>${blockers}<style>main { color: rgb(12, 34, 56); }</style></head>
 <body><main id="ready">${'preview-ready '.repeat(8_000)}</main></body></html>`);
 
-    const startedAt = Date.now();
-    const preview = await orkas.openPreview(() => appPage.evaluate((pathValue) => {
-      void (window as any).openChatFileViewer(pathValue, 'blocking-resource-preview.html');
-    }, htmlPath));
+    // The 32 absent assets are an intentional negative fixture. Record their
+    // real responses independently of the generic Chromium console text; any
+    // other response failure or renderer error still fails this case.
+    const context = orkas.electronApp!.context();
+    const expectedUrls = Array.from({ length: 16 }, (_, index) => ['js', 'css'].map(extension =>
+      new URL(`./blocked-${index}.${extension}`, chatMediaLocalUrl(htmlPath)).href)).flat().sort();
+    const expected = new Set(expectedUrls);
+    const responses: Array<{ url: string; status: number }> = [];
+    const consoleErrors: Array<{ text: string; url: string }> = [];
+    const requestFailures: Array<{ url: string; error: string | null; responseUrl: string | null; status: number | null }> = [];
+    const pageErrors: string[] = [];
+    const onResponse = (response: Response) => {
+      const url = response.url();
+      if (expected.has(url) || response.status() >= 400) responses.push({ url, status: response.status() });
+    };
+    const onConsole = (message: ConsoleMessage) => {
+      if (message.type() === 'error') consoleErrors.push({ text: message.text(), url: message.location().url });
+    };
+    const onRequestFailed = (request: Request) => {
+      // The custom-scheme missing script/style response supplies404 headers,
+      // then Chromium aborts its body. Pair the failure with THIS request's
+      // actual response, rather than accepting unrelated ERR_ABORTED events.
+      const response = request.existingResponse();
+      requestFailures.push({ url: request.url(), error: request.failure()?.errorText ?? null,
+        responseUrl: response?.url() ?? null, status: response?.status() ?? null });
+    };
+    const onWebError = (error: WebError) => pageErrors.push(error.error().message);
+    context.on('weberror', onWebError);
+    context.on('response', onResponse);
+    context.on('console', onConsole);
+    context.on('requestfailed', onRequestFailed);
+    try {
+      const startedAt = Date.now();
+      const preview = await orkas.openPreview(() => appPage.evaluate((pathValue) => {
+        void (window as any).openChatFileViewer(pathValue, 'blocking-resource-preview.html');
+      }, htmlPath));
 
-    const body = preview.locator('.chat-file-viewer-body');
-    await expect(body).not.toHaveAttribute('aria-busy', 'true', { timeout: 5_000 });
-    const elapsedMs = Date.now() - startedAt;
-    expect(elapsedMs).toBeLessThan(5_000);
-    const frame = preview.locator('.chat-file-viewer-html');
-    expect(await frame.getAttribute('src')).toMatch(/^chat-media:\/\/local\//);
-    await expect(frame.contentFrame().locator('#ready')).toContainText('preview-ready');
+      const body = preview.locator('.chat-file-viewer-body');
+      await expect(body).not.toHaveAttribute('aria-busy', 'true', { timeout: 5_000 });
+      const elapsedMs = Date.now() - startedAt;
+      expect(elapsedMs).toBeLessThan(5_000);
+      const frame = preview.locator('.chat-file-viewer-html');
+      expect(await frame.getAttribute('src')).toMatch(/^chat-media:\/\/local\//);
+      await expect(frame.contentFrame().locator('#ready')).toContainText('preview-ready');
+      await expect.poll(() => responses.length).toBe(32);
+      expect(responses.map(response => response.url).sort()).toEqual(expectedUrls);
+      expect(responses.every(response => response.status === 404)).toBe(true);
+      await expect.poll(() => consoleErrors.length).toBe(32);
+      expect(consoleErrors.every(error => error.text === 'Failed to load resource: the server responded with a status of 404 (Not Found)'
+        && (!error.url || expected.has(error.url)))).toBe(true);
+      await expect.poll(() => requestFailures.length).toBe(32);
+      expect(requestFailures.map(failure => failure.url).sort()).toEqual(expectedUrls);
+      expect(requestFailures.every(failure => failure.error === 'net::ERR_ABORTED'
+        && failure.status === 404 && failure.responseUrl === failure.url)).toBe(true);
+      expect(pageErrors).toEqual([]);
+    } finally {
+      context.off('weberror', onWebError);
+      context.off('response', onResponse);
+      context.off('console', onConsole);
+      context.off('requestfailed', onRequestFailed);
+      await test.info().attach('blocking-resource-receipt.json', { contentType: 'application/json', body: Buffer.from(JSON.stringify({
+        expectedUrls, responses, consoleErrors, requestFailures, pageErrors,
+      })) });
+    }
   });
 
   test('keeps the file-viewer loading state visible until layout and iframe are both ready', async ({

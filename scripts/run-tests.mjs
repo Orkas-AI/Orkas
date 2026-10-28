@@ -26,12 +26,28 @@ const require_ = createRequire(import.meta.url);
 const electronBin = require_('electron');
 const vitestBin = resolve(here, '..', 'node_modules', 'vitest', 'vitest.mjs');
 const testEnvironment = withTestPython(withWindowsGitOnPath(process.env));
+// Nested launcher calls must not overwrite their parent's checkpoint report.
+delete testEnvironment.ORKAS_TEST_BATCH_REPORT;
 
 // npm appends arguments to the final shell command of a compound script.
 // Own the suite here so filters reach Vitest without first running every JS
 // test or being interpreted by npm/pytest. No arguments retains the full suite.
 const suiteMode = process.argv[2] === 'suite';
-const args = process.argv.slice(suiteMode ? 3 : 2);
+let args = process.argv.slice(suiteMode ? 3 : 2);
+let checkpoint;
+let runCheckpoint;
+if (args.some(arg => arg === '--resume' || arg.startsWith('--checkpoint-dir') || arg.startsWith('--batch-count'))) {
+  try {
+    const helper = await import('./test-checkpoint.mjs');
+    checkpoint = helper.checkpointOptions(!suiteMode && args[0] === 'run' ? args.slice(1) : args);
+    if (!suiteMode && args[0] !== 'run') throw new Error('Checkpoint mode requires run or suite');
+    args = suiteMode ? checkpoint.args : ['run', ...checkpoint.args];
+    runCheckpoint = helper.runCheckpoint;
+  } catch (error) {
+    console.error(`[run-tests] ${error.message}`);
+    process.exit(2);
+  }
+}
 const commands = [{
   executable: electronBin,
   args: [vitestBin, ...(suiteMode ? ['run', ...args] : args)],
@@ -44,11 +60,14 @@ const commands = [{
     // outer npm/node executable as the explicit test-helper runtime.
     ORKAS_TEST_NODE: process.execPath,
   },
+  checkpoint,
 }];
 if (suiteMode && args.length === 0) {
   commands.push({
     executable: process.execPath,
-    args: [resolve(here, 'run-python-tests.mjs'), 'resources/builtin', 'resources/test', '-q'],
+    args: [resolve(here, 'run-python-tests.mjs'), 'resources/builtin', 'resources/test', '-q',
+      ...(checkpoint?.directory ? [`--checkpoint-dir=${resolve(checkpoint.directory)}`, `--batch-count=${checkpoint.batches}`,
+        ...(checkpoint.resume ? ['--resume'] : [])] : [])],
     env: testEnvironment,
   });
 }
@@ -74,11 +93,32 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) {
   process.on(signal, handler);
 }
 
-function runNext() {
+async function runNext() {
   const command = commands.shift();
   if (!command) {
     removeSignalHandlers();
     return;
+  }
+  if (command.checkpoint?.directory) {
+    let code;
+    try {
+      code = await runCheckpoint({ ...command.checkpoint, executable: electronBin, vitestBin,
+        env: command.env, onChild: active => { child = active; }, cancelled: () => forwardedSignal });
+    } catch (error) {
+      if (error.signal) forwardedSignal ||= error.signal;
+      else console.error(`[run-tests] ${error.message}`);
+      code = 1;
+    }
+    if (forwardedSignal) {
+      removeSignalHandlers();
+      process.kill(process.pid, forwardedSignal);
+      return;
+    }
+    if (code !== 0) {
+      removeSignalHandlers();
+      process.exit(code);
+    }
+    return runNext();
   }
   child = spawn(command.executable, command.args, { stdio: 'inherit', env: command.env });
   child.once('error', (error) => {

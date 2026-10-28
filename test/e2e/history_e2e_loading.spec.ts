@@ -1,3 +1,4 @@
+import { finished } from 'node:stream/promises';
 import { expectComposerText } from './fixtures/composer';
 import path from 'node:path';
 import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
@@ -730,7 +731,7 @@ test('loads and projects history from ASAR with the shipped dependency layout', 
       cpSync(path.join(pcRoot, 'node_modules', name), path.join(source, 'node_modules', name), { recursive: true, dereference: true });
     }
     const unpack = pkg.build.asarUnpack.map((p: string) => path.join(source, p).replaceAll('\\', '/'));
-    await createPackageWithOptions(source, archive, { unpack: `{${unpack.join(',')}}` });
+    await finished(await createPackageWithOptions(source, archive, { unpack: `{${unpack.join(',')}}` }));
     const esbuild = path.join(`${archive}.unpacked`, 'node_modules', '@esbuild', `${process.platform}-${process.arch}`,
       ...(process.platform === 'win32' ? ['esbuild.exe'] : ['bin', 'esbuild']));
     await app.launch();

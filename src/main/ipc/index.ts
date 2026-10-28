@@ -56,6 +56,7 @@ import * as searchAuth from '../features/search_auth';
 import * as videoAuth from '../features/video_auth';
 import * as videoStudioReview from '../features/video_studio_review';
 import * as ttsAuth from '../features/tts_auth';
+import * as voiceInput from '../features/voice_input';
 import * as permissions from '../features/permissions';
 import * as notificationPermissions from '../features/notification_permissions';
 import * as appConfig from '../features/config';
@@ -81,7 +82,7 @@ import { invokeHandlers as webAssistHandlers } from './web_assist';
 import { bindWebAssistConversation } from '../features/web_assist';
 import { invokeHandlers as memoryHandlers } from './memory';
 import { safeId, writeJson } from '../storage';
-import { commercialWebAppFailure, isCommercialWebAppFailure } from '../features/web_apps/commercial-entry';
+import { publishApp } from '../features/web_apps/commercial-entry';
 import { createLogger, logFromRenderer } from '../logger';
 import {
   cancelConfirmation as cancelDeleteConfirmation,
@@ -116,12 +117,56 @@ const IPC_RESULT_FAILURE_DEDUPE_MS = 60_000;
 const IPC_RESULT_FAILURE_MAX_KEYS = 512;
 const ipcResultFailureState = new Map<string, { at: number; suppressed: number }>();
 
+const attachmentAddChannels = new Set([
+  'conversations.attachments.upload', 'conversations.attachments.import',
+  'conversations.attachments.pickAndUpload', 'orkas.importLocalFiles',
+]);
+const attachmentFailureCodes = new Set([
+  'invalid_attachment', 'file_too_large', 'invalid_utf8', 'too_many_attachments',
+  'source_unavailable', 'not_file', 'read_failed', 'write_failed', 'copy_failed',
+  'E_NOT_LOGGED_IN', 'E_IPC_SENDER', 'E_IPC_REQUEST', 'E_STORAGE_FULL', 'mixed',
+]);
+
+function attachmentFailureDiagnostic(result: Record<string, unknown>): { code: string; failure_kind: string } {
+  const rawCode = result.error_code ?? result.code;
+  return {
+    code: typeof rawCode === 'string' && attachmentFailureCodes.has(rawCode) ? rawCode : 'attachment_failed',
+    failure_kind: result.failure_kind === 'mixed' ? 'mixed' : fileFailureKind(result),
+  };
+}
+
+/** Batch envelopes are successful even when individual selected files fail.
+ * Keep one content-free summary, using the existing bounded failure logger. */
+function logAttachmentBatchFailures(channel: string, failures: Record<string, unknown>[]): void {
+  if (!failures.length) return;
+  const codes = new Set<string>();
+  const kinds = new Set<string>();
+  for (const failure of failures.slice(0, 200)) {
+    const diagnostic = attachmentFailureDiagnostic(failure);
+    codes.add(diagnostic.code);
+    kinds.add(diagnostic.failure_kind);
+  }
+  logInvokeResultFailure(channel, {
+    code: failures.length > 200 || codes.size !== 1 ? 'mixed' : codes.values().next().value,
+    failure_kind: failures.length > 200 || kinds.size !== 1 ? 'mixed' : kinds.values().next().value,
+    failed_count: failures.length,
+  });
+}
+
+/**
+ * Handler-level business failures resolve as `{ ok:false }`, so they never
+ * reach the invoke catch below. Persist one bounded diagnostic per
+ * channel/code window without turning expected validation retries into a log
+ * storm. Renderer owners still decide whether the operation also merits a
+ * product result/error event.
+ */
 function logInvokeResultFailure(channel: string, result: Record<string, unknown>): void {
+  const attachment = attachmentAddChannels.has(channel) ? attachmentFailureDiagnostic(result) : null;
   const rawCode = result.code;
-  const code = typeof rawCode === 'string' || typeof rawCode === 'number'
+  const code = attachment ? attachment.code : typeof rawCode === 'string' || typeof rawCode === 'number'
     ? String(rawCode).slice(0, 80)
     : 'operation_rejected';
-  const key = `${channel}|${code}`;
+  const key = `${channel}|${code}${attachment ? `|${attachment.failure_kind}` : ''}`;
   const now = Date.now();
   const previous = ipcResultFailureState.get(key);
   if (previous && now - previous.at < IPC_RESULT_FAILURE_DEDUPE_MS) {
@@ -136,7 +181,10 @@ function logInvokeResultFailure(channel: string, result: Record<string, unknown>
   log.warn('invoke returned failure', {
     channel,
     code,
-    ...(channel === 'contexts.attachToDraft' || channel === 'projects.files.attachToDraft'
+    ...(attachment ? {
+      failure_kind: attachment.failure_kind,
+      ...(Number.isInteger(result.failed_count) ? { failed_count: result.failed_count } : {}),
+    } : channel === 'contexts.attachToDraft' || channel === 'projects.files.attachToDraft'
       ? { failure_stage: result.failure_stage, failure_kind: result.failure_kind }
       : { error: typeof result.error === 'string' ? result.error : 'operation rejected' }),
     ...(suppressed > 0 ? { suppressed_count: suppressed } : {}),
@@ -295,9 +343,10 @@ async function _importLocalFileEntries(payload: any, ctx: IpcContext): Promise<{
         const result = await chatAttachments.importAttachmentFromPath(ctx.userId, cid, entry.path, name);
         results.push({ ...index, name, ...result });
       } catch (err) {
-        results.push({ ...index, name, ok: false, error: (err as Error)?.message || String(err) });
+        results.push({ ...index, name, ok: false, error: (err as Error)?.message || String(err), failure_kind: fileFailureKind(err) });
       }
     }
+    logAttachmentBatchFailures('orkas.importLocalFiles', results.filter(result => result.ok === false));
     return { files: results };
   }
   if (scope === 'contexts') {
@@ -622,6 +671,15 @@ async function _isAllowedFileActionPath(userId: string, payload: any, absPath: s
   return typeof cid === 'string' && !!cid && await _isConversationRecordedFile(userId, cid, absPath);
 }
 
+async function _savedAppRecoverySource(userId:string,payload:any):Promise<{rootDir:string}> {
+  if(typeof payload?.path!=='string'||!payload.path)throw new Error('missing path');
+  const target=path.resolve(payload.path);
+  if(!await _isAllowedFileActionPath(userId,payload,target))throw new Error('path is outside the user workspace');
+  const inspected=await savedApps.inspectBundleFromPath(target,{fenceRoots:await _ipcFileSandboxAllowedRoots(userId,payload)});
+  if(!inspected.ok||!inspected.canSave)throw Object.assign(new Error('app_edit_target_missing'),{code:'app_edit_target_missing'});
+  return {rootDir:inspected.rootDir};
+}
+
 // Todo preview adds only an exact, existing attachment in the resolved scope.
 // Keep mutation/share authorization on the existing file-action boundary.
 async function _isAllowedPreviewFilePath(userId: string, payload: any, absPath: string): Promise<boolean> {
@@ -783,11 +841,11 @@ function _contextTreeHasPath(nodes: contexts.ContextNode[], relPath: string): bo
   return false;
 }
 
-function _uniqueContextImportPath(rawName: string): string {
+async function _uniqueContextImportPath(rawName: string): Promise<string> {
   const name = path.basename(String(rawName || '').trim() || 'artifact');
   const ext = path.extname(name);
   const stem = ext ? name.slice(0, -ext.length) : name;
-  const tree = contexts.listContextsTree();
+  const tree = await contexts.listContextsTree();
   if (!_contextTreeHasPath(tree, name)) return name;
   for (let i = 2; i < 1000; i += 1) {
     const candidate = `${stem}-${i}${ext}`;
@@ -846,7 +904,7 @@ async function _importProducedToLibrary(payload: any, ctx: IpcContext): Promise<
 
   const relPath = typeof payload?.targetPath === 'string' && payload.targetPath.trim()
     ? payload.targetPath.trim()
-    : _uniqueContextImportPath(targetName);
+    : await _uniqueContextImportPath(targetName);
   const result = contexts.uploadContextFile(relPath, buf);
   if (!result.ok) return result;
   return { ok: true, scope: 'global', path: result.path, bytes: result.bytes };
@@ -977,6 +1035,12 @@ async function _afterRecycleRestore(ctx: IpcContext, paths: string[]): Promise<v
 // merged into a `{ ok: true, ...result }` response. Throw to signal error.
 
 const invokeHandlers: Record<string, InvokeHandler> = {
+  'voiceInput.createSession': () => voiceInput.createVoiceSession(),
+  'voiceInput.ensureMicrophoneAccess': () => voiceInput.ensureMicrophoneAccess(),
+  'appPublishing.prepare': async () => publishApp(),
+  'appPublishing.publish': async () => publishApp(),
+  'appPublishing.recover': async () => publishApp(),
+  'appPublishing.unpublish': async () => publishApp(),
   ...webAppInvokeHandlers,
   'clientConfig.getQuickStart': async () => getQuickStartConfigState(),
   'user.init': async () => {
@@ -1186,7 +1250,6 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'conversations.create': async ({ title = '', projectId = '', assistance } = {}, ctx) => {
-    if (assistance?.kind === 'app_creation' && ['web', 'cloud'].includes(assistance.appType)) return commercialWebAppFailure();
     const normalizedAssistance = chats.normalizeConversationAssistance(assistance);
     const validatedAssistance = assistance === undefined ? undefined
       : normalizedAssistance?.kind === 'app_creation' ? normalizedAssistance
@@ -1336,7 +1399,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   'projects.rename': async ({ projectId, name }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
-    const result = await projects.renameProject(ctx.userId, projectId, name);
+    const result = await projects.renameProjectForUser(ctx.userId, projectId, name);
     if (!result.ok) throw new Error((result as { error: string }).error);
     return { project: result.project };
   },
@@ -1440,23 +1503,31 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return projectTasks.listOpenTasks(ctx.userId, all === true ? undefined : count);
   },
 
-  'projects.tasks.create': async ({ projectId, taskId, content, title, detail, status, owner_agent, owner_agent_id, depends_on } = {}, ctx) => {
+  'projects.tasks.create': async ({ projectId, taskId, content, title, detail, status, owner_agent, owner_agent_id, depends_on, attachment_order, due_at } = {}, ctx) => {
     const scopeProjectId = todoProjectScope(projectId);
     if (content !== undefined && typeof content !== 'string') throw new Error('invalid content');
+    if (attachment_order !== undefined && (!Array.isArray(attachment_order) || attachment_order.length > 200
+      || attachment_order.some((name: unknown) => typeof name !== 'string'))) throw new Error('invalid attachment order');
     const r = await projectTasks.createTask(ctx.userId, scopeProjectId, {
-      content, title, detail, status, owner_agent, owner_agent_id, depends_on, created_by: 'user',
+      attachment_order, content, title, detail, status, owner_agent, owner_agent_id, depends_on, created_by: 'user',
       // Optional pre-allocated id so the editor can stage attachments before the
       // task exists; create adopts whatever landed in that draft dir.
       ...(typeof taskId === 'string' && taskId ? { id: taskId } : {}),
+      ...(typeof due_at === 'string' && due_at ? { due_at } : {}),
     });
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { task: r.task, alreadyExists: r.alreadyExists };
   },
 
-  'projects.tasks.update': async ({ projectId, taskId, content, title, detail, status, owner_agent, owner_agent_id } = {}, ctx) => {
+  'projects.tasks.update': async ({ projectId, taskId, content, title, detail, status, owner_agent, owner_agent_id, attachment_order, due_at } = {}, ctx) => {
     const scopeProjectId = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
-    const r = await projectTasks.updateTask(ctx.userId, scopeProjectId, taskId, { content, title, detail, status, owner_agent, owner_agent_id });
+    if (attachment_order !== undefined && (!Array.isArray(attachment_order) || attachment_order.length > 200
+      || attachment_order.some((name: unknown) => typeof name !== 'string'))) throw new Error('invalid attachment order');
+    const r = await projectTasks.updateTask(ctx.userId, scopeProjectId, taskId, {
+      content, title, detail, status, owner_agent, owner_agent_id, attachment_order,
+      ...(due_at !== undefined ? { due_at: typeof due_at === 'string' && due_at ? due_at : null } : {}),
+    });
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { task: r.task };
   },
@@ -1746,7 +1817,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // `bindings.list` returns the bound ids JOINED with name/description so
   // the renderer can paint the detail page in one round-trip. A catalog scan
   // may miss an updating package or a concurrent addition; reads must not
-  // remove persisted bindings based on that snapshot.
+  // remove persisted bindings based on that snapshot. An unresolved binding
+  // is returned as an unavailable placeholder so the user can remove it.
   'projects.bindings.list': async ({ projectId }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
@@ -1756,8 +1828,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return {
       bindings,
       agentDetails: bindings.agents
-        .map((id) => agentById.get(id))
-        .filter(Boolean),
+        .map((id) => agentById.get(id) || {
+          agent_id: id, name: '',
+          enabled: false, unavailable: true,
+        }),
     };
   },
 
@@ -2207,17 +2281,18 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const picked = await _pickLocalFiles('Choose files', CHAT_PICK_EXTENSIONS, true);
     if (!picked.length) return { cancelled: true, items: [], failed: [] };
     const items = [];
-    const failed: Array<{ name: string; error: string }> = [];
+    const failed: Array<{ name: string; error: string; error_code?: string; failure_kind?: string }> = [];
     for (const filePath of picked) {
       const name = path.basename(filePath);
       try {
         const res = await chatAttachments.importAttachmentFromPath(ctx.userId, cid, filePath, name);
-        if (res.ok) items.push({ displayName: name, info: res.info, reused: !!res.reused });
-        else failed.push({ name, error: (res as any).error });
+        if (res.ok === true) items.push({ displayName: name, info: res.info, reused: !!res.reused });
+        else failed.push({ name, error: res.error, error_code: res.error_code, failure_kind: res.failure_kind });
       } catch (err) {
-        failed.push({ name, error: (err as Error)?.message || String(err) });
+        failed.push({ name, error: (err as Error)?.message || String(err), failure_kind: fileFailureKind(err) });
       }
     }
+    logAttachmentBatchFailures('conversations.attachments.pickAndUpload', failed);
     return { cancelled: false, items, failed };
   },
 
@@ -2274,25 +2349,42 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // Copy a chat artifact into the persistent "My Apps" pool
   // (`<uid>/cloud/saved_apps/<appId>/`). Surfaced as the artifact card's
   // `⋯` → "保存".
-  'conversations.artifacts.editTarget': async ({ cid }, ctx) => {
+  'conversations.artifacts.editTarget': async ({ cid, artifactId }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    return { target: await savedApps.getEditTarget(ctx.userId, String(cid)) };
+    return { target: artifactId ? await savedApps.getSaveTarget(ctx.userId,String(cid),{artifactId:String(artifactId)}) : await savedApps.getEditTarget(ctx.userId, String(cid)) };
   },
   'conversations.artifacts.save': async ({ cid, artifactId, mode, recovery }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    if (mode !== undefined && mode !== 'new' && mode !== 'update') throw new Error('invalid save mode');
-    const r = await savedApps.saveFromArtifact(ctx.userId, String(cid), String(artifactId || ''), mode || 'new',recovery);
-    if (isCommercialWebAppFailure(r)) return r;
+    if (mode !== undefined && !['new','update','auto'].includes(mode)) throw new Error('invalid save mode');
+    const r = await savedApps.saveFromArtifact(ctx.userId, String(cid), String(artifactId || ''), mode || 'auto',recovery);
     if (!r.ok) return { ok: false, code: (r as { error: string }).error };
     return { ok: true, id: (r as { id: string }).id, title: (r as { title: string }).title };
   },
 
   'conversations.artifacts.dataImpact': async ({cid,artifactId},ctx)=>savedApps.appDataImpact(ctx.userId,String(cid),String(artifactId)),
-  'conversations.artifacts.exportData': async ({cid,artifactId},ctx)=>{
+  'conversations.artifacts.exportData': async ({cid,artifactId,appId},ctx)=>{
     const impact=await savedApps.appDataImpact(ctx.userId,String(cid),String(artifactId));if(!impact.ok)return impact;
+    if(appId!==undefined&&impact.appId!==appId)return {ok:false,code:'app_edit_conflict'};
     const result=await dialog.showSaveDialog({defaultPath:'app-data.sqlite',filters:[{name:'SQLite',extensions:['sqlite']}]});
     if(result.canceled||!result.filePath)return {ok:true,canceled:true};if(users.getActiveUserId()!==ctx.userId)return {ok:false,code:'E_CLOSED'};
-    return savedApps.exportAppData(ctx.userId,String(cid),String(artifactId),result.filePath);
+    return savedApps.exportAppData(ctx.userId,String(cid),String(artifactId),result.filePath,impact.appId);
+  },
+
+  'savedApps.dataImpactFromPath': async (payload,ctx)=>{
+    const source=await _savedAppRecoverySource(ctx.userId,payload);
+    return savedApps.appDataImpact(ctx.userId,String(payload?.cid||''),source);
+  },
+  'savedApps.exportDataFromPath': async (payload,ctx)=>{
+    const source=await _savedAppRecoverySource(ctx.userId,payload);
+    const cid=String(payload?.cid||'');
+    const impact=await savedApps.appDataImpact(ctx.userId,cid,source);
+    if(!impact.ok)return impact;
+    if(payload?.appId!==impact.appId)return {ok:false,code:'app_edit_conflict'};
+    const result=await dialog.showSaveDialog({defaultPath:'app-data.sqlite',filters:[{name:'SQLite',extensions:['sqlite']}]});
+    if(result.canceled||!result.filePath)return {ok:true,canceled:true};
+    if(users.getActiveUserId()!==ctx.userId)return {ok:false,code:'E_CLOSED'};
+    const current=await _savedAppRecoverySource(ctx.userId,payload);
+    return savedApps.exportAppData(ctx.userId,cid,current,result.filePath,impact.appId);
   },
 
   'savedApps.inspectBundleFromPath': async (payload, ctx) => {
@@ -2303,12 +2395,14 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       if (await _isAllowedPreviewFilePath(ctx.userId, payload, norm)) return { canSave: false };
       throw new Error('path is outside the user workspace');
     }
-    return savedApps.inspectBundleFromPath(norm, {
+    const inspected = await savedApps.inspectBundleFromPath(norm, {
       fenceRoots: await _ipcFileSandboxAllowedRoots(ctx.userId, payload),
     });
+    return inspected.ok && inspected.canSave ? {...inspected,target:await savedApps.getSaveTarget(ctx.userId,String(payload?.cid || ''),{rootDir:inspected.rootDir})} : inspected;
   },
 
   'savedApps.saveFromPath': async (payload, ctx) => {
+    if (payload?.mode !== undefined && !['new','update','auto'].includes(payload.mode)) throw new Error('invalid save mode');
     const target = payload?.path;
     if (typeof target !== 'string' || !target) throw new Error('missing path');
     const norm = path.resolve(target);
@@ -2318,10 +2412,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const r = await savedApps.saveFromPath(ctx.userId, norm, {
       title: payload?.title,
       sourceCid: payload?.cid,
+      mode: payload?.mode || 'auto',
+      recovery: payload?.recovery,
       fenceRoots: await _ipcFileSandboxAllowedRoots(ctx.userId, payload),
     });
     if (!r.ok && (r as { error?: string }).error === 'app_bundle_root') return r;
-    if (isCommercialWebAppFailure(r)) return r;
+    if (!r.ok && (r as { error?: string }).error === 'app_edit_data_migration') return {ok:false,code:'app_edit_data_migration'};
     if (!r.ok) { const code = (r as { error?: string }).error || 'app_save_failed'; throw Object.assign(new Error(code), { code }); }
     return r;
   },
@@ -2332,8 +2428,6 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'savedApps.list': async (payload, ctx) => ({ apps: payload?.localOnly === true
     ? savedApps.listSavedApps(ctx.userId) : await savedApps.listResolvedSavedApps(ctx.userId) }),
   'savedApps.openExternal': async ({ appId }, ctx) => {
-    const type = await savedApps.resolveSavedAppType(ctx.userId, String(appId || ''));
-    if (type === 'web') return commercialWebAppFailure();
     const r = savedApps.resolveSavedAppIndex(ctx.userId, String(appId || ''));
     if (!r.ok) throw new Error((r as { error?: string }).error || 'app not found');
     const absPath = (r as { absPath: string }).absPath;
@@ -2347,7 +2441,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'previewWindows.open': async (payload, ctx) => previewWindows.openPreview(ctx.userId, ctx.sender, payload),
   'previewWindows.initialize': async (_payload, ctx) => previewWindows.initializePreview(ctx.userId, ctx.sender),
   'previewWindows.ready': async (_payload, ctx) => { previewWindows.readyPreview(ctx.userId, ctx.sender); return {}; },
-  'previewWindows.replace': async (payload, ctx) => { await previewWindows.replacePreview(ctx.userId, ctx.sender, payload.accepted); return {}; },
+  'previewWindows.replace': async (payload, ctx) => (await previewWindows.replacePreview(ctx.userId, ctx.sender, payload.accepted)) || {},
   'previewWindows.setDirty': async (payload, ctx) => { previewWindows.setPreviewDirty(ctx.userId, ctx.sender, payload.dirty); return {}; },
   'previewWindows.filesChanged': async (_payload, ctx) => { previewWindows.notifyPreviewFilesChanged(ctx.userId, ctx.sender); return {}; },
   'previewWindows.close': async (_payload, ctx) => { previewWindows.closePreview(ctx.userId, ctx.sender); return {}; },
@@ -2819,7 +2913,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   }),
 
   // ── Contexts (user-owned directory tree; vectorized via kb_indexer) ──
-  'contexts.tree': async () => ({ tree: contexts.listContextsTree() }),
+  'contexts.tree': async () => ({ tree: await contexts.listContextsTree() }),
 
   'contexts.read': async ({ path, preview }) => {
     return contexts.readContextFile(path || '', preview === true || preview === 'true');
@@ -3121,6 +3215,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // ── Orkas public API key quick setup (open-source build only) ──
   'orkasApi.configureAll': async ({ apiKey }) => auth.configureAllOrkasApiServices(apiKey),
   'orkasApi.getStatus': async () => auth.getOrkasApiCredentialStatus(),
+  'voiceInput.status': async () => voiceInput.getVoiceStatus(),
+  'voice.status': async () => voiceInput.getVoiceStatus(),
+  'voice.createSession': async () => voiceInput.createVoiceSession(),
+  'voice.ensureMicrophoneAccess': async () => voiceInput.ensureMicrophoneAccess(),
   'orkasApi.save': async ({ apiKey }, ctx) => {
     const credential = auth.prepareOrkasApiCredential(apiKey);
     const previousKey = auth.getOrkasApiKey();
@@ -4139,6 +4237,9 @@ export function register(): void {
     const envelope = parseInvokeEnvelope(request);
     if (!envelope) return { ok: false, error: 'invalid ipc request', code: 'E_IPC_REQUEST' };
     const { channel, payload } = envelope;
+    if ((channel.startsWith('voice.') || channel.startsWith('voiceInput.')) && (event.senderFrame !== event.sender.mainFrame || previewWindows.isPreviewContents(event.sender))) {
+      return { ok: false, code: 'E_IPC_SENDER' };
+    }
     if ((channel.startsWith('webApps.') || channel.startsWith('previewWindows.') || channel === 'savedApps.openInApp' || previewWindows.isPreviewContents(event.sender)) && event.senderFrame !== event.sender.mainFrame) return { ok: false, code: 'E_IPC_SENDER' };
     const handler = invokeHandlers[channel];
     if (!handler) return { ok: false, error: `unknown channel: ${channel}` };
@@ -4157,7 +4258,8 @@ export function register(): void {
         : (typeof rawCode === 'string' && /^\d+$/.test(rawCode.trim())
           ? Number(rawCode.trim())
           : (typeof rawCode === 'string' && rawCode ? rawCode : normalized.code));
-      log.error(`invoke ${channel} failed`, { error: normalized.error, code });
+      const attachment = attachmentAddChannels.has(channel) ? attachmentFailureDiagnostic({ code, failure_kind: fileFailureKind(err) }) : null;
+      log.error(`invoke ${channel} failed`, attachment || { error: normalized.error, code });
       const out: {
         ok: false;
         error: string;
@@ -4170,10 +4272,12 @@ export function register(): void {
         marketplaceMinAppVersion?: string;
         marketplaceCurrentAppVersion?: string;
         qualityReport?: unknown;
+        failure_kind?: string;
       } = {
         ok: false,
         error: normalized.error,
         code,
+        ...(attachment ? { failure_kind: attachment.failure_kind } : {}),
       };
       const qualityReport = (err as { qualityReport?: unknown }).qualityReport;
       if (qualityReport) out.qualityReport = qualityReport;

@@ -16,7 +16,6 @@ import type { AgentTool } from '#core-agent';
 import { appResource as scopedAppResource } from './resources';
 import { cancelForApp, type AppUsageScope } from '../connectors/action_confirm';
 import { bundleRevision } from './bundle-revision';
-import { requireLocalAppType, isCommercialWebAppFailure, commercialWebAppFailure } from './commercial-entry';
 
 let dialogBusy = false;
 async function nativeDialog<T>(run: () => Promise<T>): Promise<T> {
@@ -49,9 +48,6 @@ export async function appTools(uid: string, appUsage?: AppUsageScope): Promise<A
 }
 
 export const runtime = new WebAppRuntime({
-  // Orkas keeps Web apps local; the private cloud-sync dirty marker is
-  // intentionally absent while the runtime still receives its change hook.
-  storageChanged: () => {},
   activeUser: getActiveUserId,
   language: getLanguage,
   modelAvailable: () => hasConfiguredModel().configured,
@@ -92,11 +88,11 @@ export async function resolveBundle(uid: string, source: Source): Promise<{ bund
     : `chat-app://cid/${encodeURIComponent(source.cid)}/${encodeURIComponent(source.artifactId)}`;
   const url = base + '/' + entry.split('/').map(encodeURIComponent).join('/');
   const manifestFile = resolve(MANIFEST_FILE);
-  let appType: 'local'|'web'='local';
-  if (isSaved) appType = await saved.resolveSavedAppType(uid, source.appId);
-  else appType = await saved.resolveArtifactAppType(uid, source.cid, source.artifactId);
-  requireLocalAppType(appType);
-  if (!manifestFile && appType === 'local') {
+  // Publication governs online distribution, never local page availability.
+  // Missing identity limits SDK authority without blocking the document.
+  const appType = (isSaved ? saved.declaredSavedAppType(uid, source.appId)
+    : await saved.declaredArtifactAppType(uid, source.cid, source.artifactId)) ?? 'unresolved';
+  if (!manifestFile && appType !== 'web') {
     if (!hasIsolatedBrowserStorage(uid, source)) return { bundle: null, url, entry };
     const key = crypto.createHash('sha256').update(JSON.stringify(isSaved ? ['saved', source.appId] : ['artifact', source.cid, source.artifactId])).digest('hex');
     // Ordinary pages reuse resource lifetime tracking, without receiving SDK authority.
@@ -110,7 +106,8 @@ export async function resolveBundle(uid: string, source: Source): Promise<{ bund
   const stat = fs.statSync(manifestFile.absPath);
   if (stat.size > 64 * 1024) throw new AppError('E_MANIFEST');
   let manifest: unknown;
-  try { manifest = JSON.parse(fs.readFileSync(manifestFile.absPath, 'utf8')); } catch { throw new AppError('E_MANIFEST'); }
+  let manifestBytes: Buffer;
+  try { manifestBytes = fs.readFileSync(manifestFile.absPath); manifest = JSON.parse(manifestBytes.toString('utf8')); } catch { throw new AppError('E_MANIFEST'); }
   const key = crypto.createHash('sha256').update(JSON.stringify(isSaved ? ['saved', source.appId] : ['artifact', source.cid, source.artifactId])).digest('hex');
   let title = t('artifact.title');
   try {
@@ -120,19 +117,20 @@ export async function resolveBundle(uid: string, source: Source): Promise<{ bund
     if (typeof meta.title === 'string') title = meta.title.slice(0, 120);
   } catch { /* A missing legacy title uses the localized default. */ }
   let revision: Awaited<ReturnType<typeof bundleRevision>>;
-  try { revision = await bundleRevision(path.dirname(manifestFile.absPath), [initial.absPath, manifestFile.absPath]); }
+  try { revision = await bundleRevision(path.dirname(manifestFile.absPath), [initial.absPath, manifestFile.absPath], new Map([[manifestFile.absPath, manifestBytes]])); }
   catch { throw new AppError('E_BUNDLE'); }
-  return { url, entry, bundle: { appType, kind: isSaved ? 'saved' : 'artifact', key, title, entry, manifest, valid: () => revision.valid(),
+  return { url, entry, bundle: { appType, kind: isSaved ? 'saved' : 'artifact', key, title, entry, manifest,
+    current: () => revision.current(), valid: signal => revision.valid(signal),
     resolve: rel => { const file = resolve(rel); return file && revision.accept(file.absPath) ? file : null; } } };
 }
 export async function openApp(uid: string, owner: number, source: Source) {
   const found = await resolveBundle(uid, source);
+  if (getActiveUserId() !== uid) throw new AppError('E_CLOSED');
   return found.bundle ? runtime.open(uid, owner, found.bundle) : { url: found.url, entry: found.entry };
 }
 export { sdkScript, APP_CSP } from './resources';
 export function appResource(request: Request) { return scopedAppResource(request, runtime); }
 export function safeFailure(err: unknown) {
-  if (isCommercialWebAppFailure(err)) return commercialWebAppFailure();
   const code = err instanceof AppError ? err.code : (err as NodeJS.ErrnoException)?.code === 'EEXIST' ? 'E_EXISTS' : 'E_FAILED';
   const key=`web_apps.error_${code}`, message=t(key);
   return { code, message:message===key?t('web_apps.error_E_FAILED'):message };

@@ -136,23 +136,31 @@ it('keeps each original reasoning item through repeated truncation, later execut
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-it('replays original Chat reasoning after a truncated tool proposal without a placeholder', async () => {
+it.each([
+  { label: 'text control', text: 'Ready.', proposal: true, field: 'reasoning_content' },
+  { label: 'reasoning only', text: '', proposal: false, field: 'reasoning_content' },
+  { label: 'whitespace body', text: ' \n ', proposal: false, field: 'reasoning_content' },
+  { label: 'discarded tool without text', text: '', proposal: true, field: 'reasoning_content' },
+  { label: 'portable reasoning field', text: '', proposal: false, field: 'reasoning' },
+  { label: 'portable reasoning_text field', text: '', proposal: false, field: 'reasoning_text' },
+])('replays original Chat reasoning without a placeholder: $label', async scenario => {
   const bodies: any[] = [];
   let executed = 0;
   vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init: any) => {
     bodies.push(JSON.parse(init.body));
     expect(bodies.length).toBeLessThanOrEqual(2);
     const first = bodies.length === 1;
-    const delta = first ? { role: 'assistant', content: 'Ready.', reasoning_content: originalReason,
-      tool_calls: [{ index: 0, id: 'discard', type: 'function', function: { name: 'write_file', arguments: '{}' } }] }
+    const delta = first ? { role: 'assistant', content: scenario.text, [scenario.field]: originalReason,
+      ...(scenario.proposal ? { tool_calls: [{ index: 0, id: 'discard', type: 'function', function: { name: 'write_file', arguments: '{}' } }] } : {}) }
       : { role: 'assistant', content: 'Finished.' };
     return new Response(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: first ? 'length' : 'stop' }] })}\n\ndata: [DONE]\n\n`,
       { headers: { 'content-type': 'text/event-stream' } });
   }));
   const registry = new ProviderRegistry();
-  registry.registerFactory('deepseek', () => createPiProvider({ provider: 'deepseek', apiKey: 'synthetic',
-    customModel: { ...model, api: 'openai-completions', provider: 'deepseek' } }));
-  const runner = new AgentRunner({ config: createConfig({ agent: { defaultProvider: 'deepseek', defaultModel: 'fixture' } }),
+  const providerId = scenario.label === 'text control' ? 'deepseek' : 'custom';
+  registry.registerFactory(providerId, () => createPiProvider({ provider: providerId, apiKey: 'synthetic',
+    customModel: { ...model, api: 'openai-completions', provider: providerId } }));
+  const runner = new AgentRunner({ config: createConfig({ agent: { defaultProvider: providerId, defaultModel: 'fixture' } }),
     providers: registry, session: new Session(), evolution: { enabled: false }, tools: [defineTool({ name: 'write_file',
       description: 'Synthetic write counter.', inputSchema: { type: 'object' },
       execute: async () => { executed++; return { content: 'Unexpected.' }; } })] });
@@ -160,6 +168,8 @@ it('replays original Chat reasoning after a truncated tool proposal without a pl
   expect(executed).toBe(0);
   expect(bodies).toHaveLength(2);
   const assistant = bodies[1].messages.find((m: any) => m.role === 'assistant');
-  expect(assistant.reasoning_content).toBe(originalReason);
+  expect(assistant?.[scenario.field]).toBe(originalReason);
   expect(assistant).not.toHaveProperty('tool_calls');
+  expect(assistant.content || '').toBe(scenario.text.trim() ? scenario.text : '');
+  expect(JSON.stringify(bodies)).not.toContain('orkas-chat-replay:');
 });

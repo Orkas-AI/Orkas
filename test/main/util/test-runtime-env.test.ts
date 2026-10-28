@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -21,6 +23,25 @@ function temporaryRoot(): string {
 }
 
 describe('test runtime environment', () => {
+  it.each(['win32', 'darwin', 'linux'])('resolves the flat checkout default Python instead of its parent for %s', platform => {
+    const parent = fs.realpathSync(temporaryRoot());
+    const root = path.join(parent, 'app');
+    const suffix = platform === 'win32' ? ['venv', 'Scripts', 'python.exe'] : ['venv', 'bin', 'python'];
+    for (const directory of [parent, root]) {
+      const python = path.join(directory, ...suffix);
+      fs.mkdirSync(path.dirname(python), { recursive: true });
+      fs.writeFileSync(python, '');
+    }
+    const helper = path.join(root, 'scripts', 'test-runtime-env.mjs');
+    fs.mkdirSync(path.dirname(helper), { recursive: true });
+    fs.copyFileSync(path.resolve(__dirname, '../../../scripts/test-runtime-env.mjs'), helper);
+    const result = spawnSync(process.env.ORKAS_TEST_NODE || process.execPath,
+      ['--input-type=module', '-e', 'const { withTestPython } = await import(process.argv[1]); console.log(JSON.stringify(withTestPython({}, undefined, process.argv[2])));', pathToFileURL(helper).href, platform],
+      { encoding: 'utf8', timeout: 10_000 });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ ORKAS_TEST_PYTHON: path.join(root, ...suffix), ORKAS_EVAL_PYTHON: path.join(root, ...suffix) });
+  });
+
   it.each(['win32', 'darwin', 'linux'])('uses the repository virtual environment for %s fixture subprocesses', platform => {
     const root = temporaryRoot();
     const python = platform === 'win32'

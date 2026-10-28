@@ -10,7 +10,6 @@ import {
   isExpiredIsoTombstone,
   isExpiredMsTombstone,
   pruneExpiredDeletedRecords,
-  pruneExpiredManifestTombstones,
   TOMBSTONE_RETENTION_MS,
 } from '../../../src/main/util/tombstone_retention';
 
@@ -98,19 +97,4 @@ describe('shared tombstone retention', () => {
       .toEqual(['active', 'recent', 'malformed']);
   });
 
-  it('drops malformed manifest tombstones before they can delete local data', () => {
-    const recent = NOW - 1_000;
-    const tombstones = {
-      valid: { deleted_at_ms: recent, _v: 2, etag: 'keep-extra-compatible-fields' },
-      expired: { deleted_at_ms: NOW - TOMBSTONE_RETENTION_MS, _v: 3 },
-      missingRevision: { deleted_at_ms: recent },
-      zeroRevision: { deleted_at_ms: recent, _v: 0 },
-      stringTimestamp: { deleted_at_ms: String(recent), _v: 4 },
-      scalar: true,
-    };
-
-    expect(pruneExpiredManifestTombstones(tombstones, { nowMs: NOW })).toEqual({
-      valid: tombstones.valid,
-    });
-  });
 });

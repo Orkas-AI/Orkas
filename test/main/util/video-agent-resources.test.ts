@@ -24,6 +24,30 @@ const resolveGateTransition = (args: string[]) => JSON.parse(execFileSync(
 )) as Record<string, any>;
 
 describe('open-source VideoStudio resources', () => {
+  it('keeps setup and funding guidance compatible with the public external-provider path', () => {
+    const agent = JSON.parse(read('agent.json')) as {
+      workflow: string; skill_list: string[]; tool_list: string[];
+      runtime: { kind: string };
+    };
+    const confirmation = read('skills', 'gate-control', 'references', 'confirmation-artifacts.md');
+    // The open build has no official-account purchase flow or managed Video
+    // default. Generic quote/transaction evidence remains a valid contract.
+    expect(agent.workflow).not.toMatch(/Orkas\s*·\s*Video|Account settings|never to avoid credits/i);
+    expect(confirmation).not.toMatch(/purchase action Orkas shows|Account settings\s*>\s*Models\s*>\s*Video|never as a way to avoid credits/i);
+    expect(agent.runtime.kind).toBe('in_process');
+    expect(agent.tool_list).toContain('media');
+    expect(agent.skill_list).toEqual(expect.arrayContaining([
+      'video-router', 'gate-control', 'stage-compose', 'stage-plan', 'stage-generate', 'stage-edit', 'stage-assemble',
+    ]));
+    for (const line of ['COMPOSE', 'GENERATE', 'EDIT', 'AUTO']) expect(agent.workflow).toContain(line);
+    for (const skill of ['stage-plan', 'stage-generate', 'stage-assemble']) {
+      const body = read('skills', skill, 'SKILL.md');
+      expect(body).toMatch(/configured external provider/i);
+      expect(body).toMatch(/external-billing disclosure/i);
+      expect(body).toMatch(/cannot verify the provider's billing or balance locally/i);
+    }
+  });
+
   it('preserves natural English casing and bounds all-caps accents', () => {
     const agent = JSON.parse(read('agent.json')) as { standards?: string[] };
     const frontendDesign = read('skills', 'frontend-design', 'SKILL.md');

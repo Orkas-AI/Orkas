@@ -84,7 +84,7 @@ it('rechecks the original app when an edit context loses its type and refuses da
   fs.writeFileSync(f.metadata, JSON.stringify({ ...JSON.parse(fs.readFileSync(f.metadata, 'utf8')), appType: 'web' }));
   expect(await f.saved.boundAppType(wire.uid, cid)).toBe('web');
   expect(await f.artifacts.createArtifact(wire.uid, cid, 'helper', { appType: 'local', files: [] }))
-    .toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
+    .toMatchObject({ ok: false, error: 'app type must match the task or editing source' });
   fs.writeFileSync(contextFile, '{ damaged');
   await expect(f.saved.boundAppType(wire.uid, cid)).rejects.toMatchObject({ code: 'app_edit_context_unavailable' });
 });
@@ -94,7 +94,7 @@ it('keeps a local edit on its original type and writes nothing for a conflicting
   if (!edited.ok) throw new Error(edited.error);
   const cid = (edited.conversation as any).conversation_id;
   const denied = await f.artifacts.createArtifact(wire.uid, cid, 'helper', { appType: 'web', files: [{ path: 'index.html', content: '<h1>Other type</h1>' }] });
-  expect(denied).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
+  expect(denied).toMatchObject({ ok: false, error: 'app type must match the task or editing source' });
   expect(fs.existsSync(path.join(root, wire.uid, 'cloud/chat_artifacts', cid))).toBe(false);
   const inherited = await f.artifacts.createArtifact(wire.uid, cid, 'helper', { files: [{ path: 'index.html', content: '<h1>Same type</h1>' }] });
   if (!inherited.ok) throw new Error(inherited.error);

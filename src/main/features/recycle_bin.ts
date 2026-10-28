@@ -1558,6 +1558,7 @@ async function reactivateChatIndexRows(
     if (!bucket.changed) continue;
     for (const row of bucket.rows) {
       if (!row.deleted_at && cidToRelPath.has(row.conversation_id)) {
+        row.restored_at = restoredIso;
         bumpRecordSyncVersion(row, row._sync_device_id || '');
       }
     }

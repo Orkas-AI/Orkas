@@ -20,6 +20,7 @@ import { app } from 'electron';
 import * as registry from './registry';
 import * as paths from '../../paths';
 import { McpConnection } from './mcp-client';
+import { isLarkMessageDownload, receiveLocalCliDownload } from './local-cli-downloads';
 import { connectorCatalog, findCatalogEntry } from './catalog';
 import { applyTemplate } from './apply-template';
 import { resolveCatalogConnection } from './connection-parameters';
@@ -568,10 +569,12 @@ async function _markDegradedOnTransientFailure(
     error: logErrorSummary(err),
   });
   const current = registry.load(uid).connections[inst.id] || inst;
-  return _patchStatus(uid, current, (cur) => ({
-    ..._asDegradedFromCache(cur, message),
-    updated_at: _nowIso(),
-  }), statusPatches);
+  return _patchStatus(uid, current, (cur) => {
+    const degraded = _asDegradedFromCache(cur, message);
+    return { ...degraded,
+      updated_at: _nowIso(),
+    };
+  }, statusPatches);
 }
 
 function _normalizeTransientStatusForList(inst: ConnectorInstance): ConnectorInstance {
@@ -1995,7 +1998,7 @@ export async function callTool(
   id: string,
   name: string,
   args: Record<string, unknown>,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; conversationId?: string } = {},
 ): Promise<unknown> {
   if (!uid) throw new Error('uid required');
   if (isConnectorActionBlocked(id, name)) throw new Error('E_CONNECTOR_ACTION_UNAVAILABLE: this action is not available in Orkas');
@@ -2063,16 +2066,26 @@ export async function callTool(
       _connectAndCacheTools(uid, inst, undefined, runtimeEpoch), opts.signal,
     );
     conn = _conns.get(runtimeKey);
-    if (!conn?.isConnected) throw new Error(_connectFailureMessage(id, updated));
+    if (!conn?.isConnected) {
+      throw new Error(_connectFailureMessage(id, updated));
+    }
   }
   _assertRuntimeEpoch(runtimeEpoch);
   try {
     const requestOpts = {
       ...(opts.signal ? { signal: opts.signal } : {}),
     };
-    const result = Object.keys(requestOpts).length
-      ? await conn.callTool(name, args, requestOpts)
-      : await conn.callTool(name, args);
+    const invoke = (localFileOutputDirectory?: string) => {
+      const options = { ...requestOpts, ...(localFileOutputDirectory ? { localFileOutputDirectory } : {}) };
+      return Object.keys(options).length ? conn.callTool(name, args, options) : conn.callTool(name, args);
+    };
+    const result = entry?.auth_mode === 'local_cli' && entry.local_cli?.provider === 'lark'
+        && isLarkMessageDownload(name, args)
+      ? await receiveLocalCliDownload(uid, opts.conversationId, invoke, () => {
+        _assertRuntimeEpoch(runtimeEpoch);
+        if (opts.signal?.aborted) throw _connectorCancelledError(opts.signal.reason);
+      })
+      : await invoke();
     _assertRuntimeEpoch(runtimeEpoch);
     const adapterResult = result as { isError?: boolean; _meta?: { orkas?: { errorCode?: string } } } | null;
     const adapterCode = adapterResult?._meta?.orkas?.errorCode;

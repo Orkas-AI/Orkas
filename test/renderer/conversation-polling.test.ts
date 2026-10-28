@@ -62,6 +62,7 @@ describe('conversation polling cancellation', () => {
       Date,
       pollTimers: new Map(),
       pollInFlight: new Map(),
+      pendingConvs: new Map(),
       pollMsgCounts: new Map([['c1', 1]]),
       setInterval(fn: () => Promise<void>) {
         nextTimer += 1;
@@ -118,6 +119,7 @@ describe('conversation polling cancellation', () => {
       Date,
       pollTimers: new Map(),
       pollInFlight: new Map(),
+      pendingConvs: new Map(),
       pollMsgCounts: new Map([['c1', 1]]),
       setInterval(fn: () => Promise<void>) {
         nextTimer += 1;
@@ -175,6 +177,7 @@ describe('conversation polling cancellation', () => {
       Date,
       pollTimers: new Map(),
       pollInFlight: new Map(),
+      pendingConvs: new Map(),
       pollMsgCounts: new Map(),
       setInterval(fn: () => Promise<void>) {
         callbacks.set(1, fn);
@@ -236,6 +239,7 @@ describe('conversation polling stays out of live rendering', () => {
       Date,
       pollTimers: new Map(),
       pollInFlight: new Map(),
+      pendingConvs: new Map(),
       pollMsgCounts: new Map(),
       setInterval(fn: () => Promise<void>) {
         nextTimer += 1;
@@ -319,6 +323,92 @@ describe('conversation polling stays out of live rendering', () => {
       '/api/conversations/c1/history?limit=10',
     ]);
   });
+
+  it('leaves an admitted user tail to its still-live send instead of reporting interruption', async () => {
+    const { context, callbacks, recovered } = runPollContext([
+      { ok: true, processing: false },
+    ]);
+    const live = { controller: { isBusy: () => true } };
+    context.pendingConvs.set('c1', live);
+    context.apiFetch = async (url: string) => ({
+      ok: true,
+      json: async () => url.includes('/runtime?')
+        ? { ok: true, processing: false }
+        : { ok: true, history: [{ id: 'u2', from: 'user', text: 'follow-up' }] },
+    });
+    context.startPolling('c1');
+    await callbacks.get(1)!();
+
+    expect(recovered).toEqual([]);
+    expect(context.pendingConvs.get('c1')).toBe(live);
+    expect(context.pollTimers.has('c1')).toBe(true);
+    expect(context.pollInFlight.has('c1')).toBe(false);
+
+    // The same timer must still recover a completed reply after the send dies.
+    live.controller.isBusy = () => false;
+    context.apiFetch = async (url: string) => ({
+      ok: true,
+      json: async () => url.includes('/runtime?')
+        ? { ok: true, processing: false }
+        : { ok: true, history: HISTORY },
+    });
+    await callbacks.get(1)!();
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0][1]).toMatchObject({ id: 'a1' });
+  });
+
+  it.each(['runtime', 'history'])('discards a %s read when a newer send replaces its pending owner', async (stage) => {
+    const { context, callbacks, recovered } = runPollContext([
+      { ok: true, processing: false },
+    ]);
+    const delayed = deferred<any>();
+    const readStarted = deferred<void>();
+    const newer = { controller: { isBusy: () => true } };
+    context.pendingConvs.set('c1', {});
+    context.apiFetch = async (url: string) => ({
+      ok: true,
+      json: () => {
+        if (url.includes('/runtime?') === (stage === 'runtime')) {
+          readStarted.resolve();
+          return delayed.promise;
+        }
+        return Promise.resolve(url.includes('/runtime?')
+          ? { ok: true, processing: false }
+          : { ok: true, history: HISTORY });
+      },
+    });
+    context.startPolling('c1');
+    const tick = callbacks.get(1)!();
+    await readStarted.promise;
+    context.pendingConvs.set('c1', newer);
+    delayed.resolve(stage === 'runtime'
+      ? { ok: true, processing: false }
+      : { ok: true, history: HISTORY });
+    await tick;
+
+    expect(recovered).toEqual([]);
+    expect(context.pollTimers.has('c1')).toBe(true);
+    expect(context.pendingConvs.get('c1')).toBe(newer);
+    expect(context.pollInFlight.has('c1')).toBe(false);
+  });
+
+  it.each([undefined, { controller: { abort: vi.fn() } }, { controller: { isBusy: () => false } }])(
+    'still reports a lost user tail without an active primary send (%j)', async (state) => {
+      const { context, callbacks, recovered } = runPollContext([{ ok: true, processing: false }]);
+      if (state) context.pendingConvs.set('c1', state);
+      context.apiFetch = async (url: string) => ({
+        ok: true,
+        json: async () => url.includes('/runtime?')
+          ? { ok: true, processing: false }
+          : { ok: true, history: [{ id: 'u1', from: 'user', text: 'lost' }] },
+      });
+      context.startPolling('c1');
+      await callbacks.get(1)!();
+
+      expect(recovered).toEqual([['c1', 'chat.reply_interrupted', true]]);
+      expect(context.pollTimers.has('c1')).toBe(false);
+    },
+  );
 });
 
 describe('conversation polling history reconcile', () => {
@@ -347,7 +437,7 @@ describe('conversation polling history reconcile', () => {
 
     context._onPolledResponse('c1', { id: 'a1', from: 'commander', text: 'done' });
 
-    expect(historyLoads).toEqual([['c1', { preserveScroll: true }]]);
+    expect(historyLoads).toEqual([['c1', { preserveScroll: true, refreshDisplay: true }]]);
   });
 
   it('preserves scroll when a richer persisted final message needs reconciliation', () => {
@@ -371,7 +461,7 @@ describe('conversation polling history reconcile', () => {
       form: { title: 'Follow-up' },
     });
 
-    expect(historyLoads).toEqual([['c1', { preserveScroll: true }]]);
+    expect(historyLoads).toEqual([['c1', { preserveScroll: true, refreshDisplay: true }]]);
   });
 
   it('settles a background terminal repair without touching the visible transcript', async () => {

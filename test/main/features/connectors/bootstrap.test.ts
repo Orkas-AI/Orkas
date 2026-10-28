@@ -34,16 +34,33 @@ describe('connectors bootstrap lifecycle', () => {
     await feature.bootstrap('account-b');
     expect(mocks.bootstrap).toHaveBeenCalledTimes(2);
     expect(mocks.bootstrap).toHaveBeenNthCalledWith(2, 'account-b');
-    expect(mocks.appOn).toHaveBeenCalledTimes(1);
+    expect(mocks.appOn).not.toHaveBeenCalled();
   });
 
-  it('closes connector transports from the single process quit hook', async () => {
+  it('lets the shutdown coordinator await connector transport exit', async () => {
     const feature = await import('../../../../src/main/features/connectors/bootstrap');
     await feature.bootstrap('account-a');
-    const beforeQuit = mocks.appOn.mock.calls.find(([event]) => event === 'before-quit')?.[1];
-    expect(beforeQuit).toBeTypeOf('function');
+    let release!: () => void;
+    mocks.shutdownAll.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    let done = false;
+    const pending = feature.shutdown().then(() => { done = true; });
+    await Promise.resolve();
+    expect(done).toBe(false);
+    expect(mocks.shutdownAll).toHaveBeenCalledOnce();
+    release();
+    await pending;
+    expect(done).toBe(true);
+  });
 
-    beforeQuit();
-    await vi.waitFor(() => expect(mocks.shutdownAll).toHaveBeenCalledTimes(1));
+  it('bounds a stalled connector close so process cleanup can finish shutdown', async () => {
+    vi.useFakeTimers();
+    try {
+      const feature = await import('../../../../src/main/features/connectors/bootstrap');
+      mocks.shutdownAll.mockImplementationOnce(() => new Promise<void>(() => {}));
+      const pending = expect(feature.shutdown()).rejects.toThrow('Connector shutdown timed out');
+      await vi.advanceTimersByTimeAsync(5_000);
+      await pending;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
   });
 });

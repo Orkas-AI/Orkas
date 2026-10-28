@@ -112,6 +112,13 @@ describe('global recycle bin', () => {
     const [restoredRow] = JSON.parse(await fsp.readFile(index, 'utf8'));
     expect(restoredRow).toMatchObject({ conversation_id: cid, title: row.title, created_at: row.created_at });
     expect(restoredRow.project_id || null).toBe(project ? pid : null);
+    expect(Number.isFinite(Date.parse(restoredRow.restored_at))).toBe(true);
+    const chats = await import('../../../src/main/features/chats');
+    await chats.repairConversationIndex(UID);
+    expect((await chats.listCleanupConversationRows(UID)).map(row => row.conversation_id)).toContain(cid);
+    const [repairedRow] = JSON.parse(await fsp.readFile(index, 'utf8'));
+    expect(repairedRow.restored_at).toBe(restoredRow.restored_at);
+    expect(repairedRow.deleted_at).toBeUndefined();
     expect(fs.existsSync(path.join(root, 'chats', `${cid}.jsonl`))).toBe(false);
   });
 

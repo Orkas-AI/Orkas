@@ -25,7 +25,7 @@ import * as crypto from 'node:crypto';
 
 import { userSavedAppsDir, savedAppDir, userAppEditsDir,webAppSandboxRoot,userLocalRoot,userAppDeletesDir, userCloudRoot } from '../paths';
 import { metadataAppType, normalizeAppType, type AppType } from './web_apps/data-contract';
-import { commercialWebAppFailure, requireLocalAppType, storedAppType, isCommercialWebAppFailure } from './web_apps/commercial-entry';
+import { storedAppType } from './web_apps/commercial-entry';
 import * as chatArtifacts from './chat_artifacts';
 import * as chats from './chats';
 import { conversationLayout } from '../util/project-layout';
@@ -65,6 +65,7 @@ export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string; co
 type ResolveCode = 'bad_input' | 'forbidden' | 'not_found';
 
 export interface SavedAppMeta {
+  sourcePathKey?: string;
   browserStorage?: 'isolated-v1';
   appType?: AppType;
   description?: string;
@@ -138,7 +139,7 @@ function sweepStagingDirs(root: string, names: readonly string[], retained?: Rea
     if (!STAGING_DIR_RE.test(name)) continue;
     const dir = path.join(root, name);
     if (activeStagingDirs.has(dir) || retained?.has(dir)) continue;
-    try { const st = fs.lstatSync(dir); if (!st.isDirectory() || st.isSymbolicLink() || storedAppType(dir) === 'web') continue; }
+    try { const st = fs.lstatSync(dir); if (!st.isDirectory() || st.isSymbolicLink()) continue; }
     catch { continue; }
     activeStagingDirs.add(dir);
     void fsp.rm(dir, { recursive: true, force: true })
@@ -177,7 +178,12 @@ export function hasIsolatedBrowserStorage(uid: string, appId: string): boolean {
   } catch { return false; }
 }
 
-/** Persisted metadata owns type; legacy local apps have no type marker. */
+/** Read only bounded local metadata, including legacy app types. */
+export function declaredSavedAppType(uid: string, appId: string): AppType | undefined {
+  const dir = savedAppDir(uid, safeAppId(appId));
+  if (!isRealSavedAppDirectory(dir)) throw new Error('app not found');
+  return storedAppType(dir);
+}
 export async function resolveSavedAppType(uid: string, appId: string): Promise<AppType> {
   const id = safeAppId(appId), dir = savedAppDir(uid, id);
   if (!isRealSavedAppDirectory(dir)) throw new Error('app not found');
@@ -392,7 +398,7 @@ async function findBundleRoot(target: string, opts: BundleInspectOptions = {}): 
   return { ok: false, reason: 'no HTML entry found for this file' };
 }
 
-async function inspectBundle(targetPath: string, opts: BundleInspectOptions): Promise<BundleInspection & { files?: string[] }> {
+async function inspectBundle(targetPath: string, opts: BundleInspectOptions): Promise<BundleInspection & { files?: string[]; realRoot?:string }> {
   if (typeof targetPath !== 'string' || !targetPath.trim()) return { ok: false, error: 'path required' };
   const found = await findBundleRoot(targetPath, opts);
   if (!found.ok) return { ok: true, canSave: false, reason: (found as { ok: false; reason: string }).reason };
@@ -422,6 +428,7 @@ async function inspectBundle(targetPath: string, opts: BundleInspectOptions): Pr
     ok: true,
     canSave: true,
     rootDir,
+    realRoot,
     entry,
     title: await inferTitleFromHtml(entryAbs, rootDir),
     files: scanned.files,
@@ -431,7 +438,7 @@ async function inspectBundle(targetPath: string, opts: BundleInspectOptions): Pr
 }
 
 export async function inspectBundleFromPath(targetPath: string, opts: BundleInspectOptions = {}): Promise<BundleInspection> {
-  const { files: _files, ...inspection } = await inspectBundle(targetPath, opts);
+  const { files: _files, realRoot: _realRoot, ...inspection } = await inspectBundle(targetPath, opts);
   return inspection;
 }
 
@@ -462,13 +469,17 @@ function mintAppId(userId: string): { appId: string; destDir: string } {
 
 function localDatabase(uid:string,appId:string){const key=crypto.createHash('sha256').update(JSON.stringify(['saved',appId])).digest('hex');return {key,file:path.join(webAppSandboxRoot(uid,key,'local'),'data.sqlite')};}
 async function appDefinition(dir:string){try{const {manifestSchema}=await import('./web_apps/catalog');const file=path.join(dir,'orkas-app.json');if((await fsp.stat(file)).size>65536)throw new Error('app_edit_data_migration');const definition=manifestSchema.parse(JSON.parse(await fsp.readFile(file,'utf8'))).data;if(!definition)throw new Error('app_edit_data_migration');return definition;}catch{throw new Error('app_edit_data_migration');}}
+type DataSource = string | {rootDir:string};
+export type SaveRecovery = {appId?:string;clearVersion:number;clearFingerprint:string};
+async function dataTarget(uid:string,cid:string,source:DataSource) {
+  if(typeof source==='string'&&!chatArtifacts.resolveArtifactDir(uid,cid,source).ok)return null;
+  return getSaveTarget(uid,cid,typeof source==='string'?{artifactId:source}:source);
+}
 /** Author-only recovery facts; records never enter model context. */
-export async function appDataImpact(uid:string,cid:string,artifactId:string):Promise<Result<{records:number;version:number;fingerprint:string;tables:Array<{name:string;fields:string[];count:number}>}>>{
-  try { requireLocalAppType(await boundAppType(uid, cid)); requireLocalAppType(await resolveArtifactAppType(uid, cid, artifactId)); }
-  catch (error) { return isCommercialWebAppFailure(error) ? commercialWebAppFailure() : { ok: false, error: 'app_edit_target_missing' }; }
-  const context=readEditContext(uid,cid),artifact=chatArtifacts.resolveArtifactDir(uid,cid,artifactId);if(!context||!artifact.ok)return {ok:false,error:'app_edit_target_missing'};
+export async function appDataImpact(uid:string,cid:string,source:DataSource):Promise<Result<{appId:string;records:number;version:number;fingerprint:string;tables:Array<{name:string;fields:string[];count:number}>}>>{
+  const context=await dataTarget(uid,cid,source);if(!context)return {ok:false,error:'app_edit_target_missing'};
   let release:(()=>void)|undefined;
-  try{const dir=savedAppDir(uid,context.appId);if(fingerprintApp(dir)!==context.fingerprint)throw new Error('app_edit_conflict');const {key,file}=localDatabase(uid,context.appId);const runtime=await import('./web_apps/runtime');release=runtime.holdAppData(uid,key);await runtime.closeAppData(uid,key);const {LocalAppData}=await import('./web_apps/data');const database=new LocalAppData(file,userLocalRoot(uid),await appDefinition(dir));try{const info:any=await database.call('internal.inspect',{});return {ok:true,records:info.records,version:info.version,fingerprint:context.fingerprint,tables:info.tables};}finally{await database.close();}}
+  try{const dir=savedAppDir(uid,context.appId);const fingerprint=fingerprintApp(dir);const {key,file}=localDatabase(uid,context.appId);const runtime=await import('./web_apps/runtime');release=runtime.holdAppData(uid,key);await runtime.closeAppData(uid,key);const {LocalAppData}=await import('./web_apps/data');const database=new LocalAppData(file,userLocalRoot(uid),await appDefinition(dir));try{const info:any=await database.call('internal.inspect',{});return {ok:true,appId:context.appId,records:info.records,version:info.version,fingerprint,tables:info.tables};}finally{await database.close();}}
   catch{return {ok:false,error:'app_edit_conflict'};}finally{release?.();}
 }
 /** Consistent private SQLite export, create-only at the user-selected destination. */
@@ -479,10 +490,9 @@ async function removeAppDataBackup(file: string): Promise<void> {
   }
 }
 
-export async function exportAppData(uid:string,cid:string,artifactId:string,destination:string):Promise<Result>{
-  try { requireLocalAppType(await boundAppType(uid, cid)); requireLocalAppType(await resolveArtifactAppType(uid, cid, artifactId)); }
-  catch (error) { return isCommercialWebAppFailure(error) ? commercialWebAppFailure() : { ok: false, error: 'app_edit_target_missing' }; }
-  const context=readEditContext(uid,cid);if(!context||!chatArtifacts.resolveArtifactDir(uid,cid,artifactId).ok)return {ok:false,error:'app_edit_target_missing'};
+export async function exportAppData(uid:string,cid:string,source:DataSource,destination:string,expectedAppId?:string):Promise<Result>{
+  const context=await dataTarget(uid,cid,source);if(!context)return {ok:false,error:'app_edit_target_missing'};
+  if(expectedAppId!==undefined&&context.appId!==expectedAppId)return {ok:false,error:'app_edit_conflict'};
   let release:(()=>void)|undefined,temporary='';
   try{const {key,file}=localDatabase(uid,context.appId),runtime=await import('./web_apps/runtime');release=runtime.holdAppData(uid,key);await runtime.closeAppData(uid,key);temporary=file+'.backup-'+crypto.randomBytes(8).toString('hex');const {LocalAppData}=await import('./web_apps/data');const database=new LocalAppData(file,userLocalRoot(uid),await appDefinition(savedAppDir(uid,context.appId)));try{await database.call('internal.backup',{file:temporary});}finally{await database.close();}const users=await import('./users');if(users.getActiveUserId()!==uid)throw new Error('app_edit_conflict');await fsp.copyFile(temporary,destination,fs.constants.COPYFILE_EXCL);return {ok:true};}
   catch{return {ok:false,error:'app_edit_data_export_failed'};}
@@ -495,18 +505,78 @@ export async function exportAppData(uid:string,cid:string,artifactId:string,dest
 /** Copy a chat artifact bundle into a new `saved_apps/<appId>/`. */
 const activeEditSaves = new Map<string, number>();
 const deferredEditCleanup = new Set<string>();
-
-export async function saveFromArtifact(userId: string, cid: string, artifactId: string, mode: 'new' | 'update' = 'new', recovery?:{clearVersion:number;clearFingerprint:string}): Promise<Result<{ id: string; title: string }>> {
+type SaveMode = 'new' | 'update' | 'auto';
+type PathSource = { rootDir: string; bindingRoot: string; entry: string; explicitEntry: boolean; explicitTitle: boolean; title: string; files: string[]; appType: AppType; sourceCid: string };
+const saveQueues = new Map<string, Promise<unknown>>();
+const legacyPathSourceKey = (root: string) => crypto.createHash('sha256').update(path.resolve(root)).digest('hex');
+const pathSourceKey = (root: string) => legacyPathSourceKey(fs.realpathSync(root));
+const pathBindingFile = (uid: string, key: string) => path.join(userAppEditsDir(uid), `source-${key}.json`);
+function readPathBinding(uid:string,key:string):{version:1|2;appId:string}|null {
   try {
-    requireLocalAppType(await boundAppType(userId, cid));
-    requireLocalAppType(await resolveArtifactAppType(userId, cid, artifactId));
-  } catch (error) {
-    return isCommercialWebAppFailure(error) ? commercialWebAppFailure() : { ok: false, error: 'app_edit_target_missing' };
+    const binding=JSON.parse(fs.readFileSync(pathBindingFile(uid,key),'utf8'));
+    if(!binding||![1,2].includes(binding.version))throw new Error('invalid save binding');
+    return {version:binding.version,appId:safeAppId(binding.appId)};
+  } catch(error) {
+    if((error as NodeJS.ErrnoException).code==='ENOENT')return null;
+    throw new Error('app_save_binding_unavailable');
   }
+}
+
+/** A source owns its current save destination; conversation-wide edit bindings are only a fallback. */
+export async function getSaveTarget(uid: string, cid: string, source: {artifactId?: string; rootDir?: string; legacyRoot?: string}) {
+  let id: string | undefined;
+  if (source.artifactId) id = chatArtifacts.readArtifactMeta(uid, cid, source.artifactId, { strictSaveBinding: true })?.savedAppId;
+  else if (source.rootDir) {
+    const canonicalKey=pathSourceKey(source.rootDir),legacyKey=legacyPathSourceKey(source.legacyRoot??source.rootDir);
+    const canonical=readPathBinding(uid,canonicalKey);
+    // Version 2 explicitly owns every spelling, including a later Save as new.
+    // Version 1 aliases are migrated lazily; ambiguous old copies need a choice.
+    if(canonical?.version===2)id=canonical.appId;
+    else {
+      const legacy=legacyKey===canonicalKey?canonical:readPathBinding(uid,legacyKey);
+      if(canonical&&legacy&&canonical.appId!==legacy.appId)throw new Error('app_save_binding_unavailable');
+      id=canonical?.appId??legacy?.appId;
+    }
+  }
+  // A deleted explicit destination must not fall back to an unrelated original.
+  if (id) {
+    const dir = savedAppDir(uid, safeAppId(id));
+    if (!isRealSavedAppDirectory(dir)) return null;
+    const meta = readMeta(dir);
+    return { appId: id, title: sanitiseTitle(meta.title), appType: metadataAppType(meta.appType) ?? await resolveSavedAppType(uid, id) };
+  }
+  const edit = cid ? await getEditTarget(uid, cid) : null;
+  if (edit) return isRealSavedAppDirectory(savedAppDir(uid, edit.appId)) ? edit : null;
+  // Recover only unique historical provenance; duplicate copies are not a choice.
+  const sourceKeys=source.rootDir?[pathSourceKey(source.rootDir),legacyPathSourceKey(source.legacyRoot??source.rootDir)]:[];
+  const candidates = listSavedApps(uid).filter(app => {
+    let meta: Partial<SavedAppMeta>;
+    try { meta = readMeta(savedAppDir(uid, app.id)); } catch { return false; }
+    return source.artifactId ? meta.sourceCid === cid && meta.sourceArtifactId === source.artifactId
+      : sourceKeys.includes(meta.sourcePathKey!);
+  });
+  return candidates.length === 1 ? { appId: candidates[0].id, title: candidates[0].title,
+    appType: candidates[0].appType ?? await resolveSavedAppType(uid, candidates[0].id) } : null;
+}
+
+function bindSave(uid: string, cid: string, artifactId: string, appId: string, source?: PathSource) {
+  if (!source) return chatArtifacts.bindSavedApp(uid, cid, artifactId, appId);
+  fs.mkdirSync(userAppEditsDir(uid), {recursive:true});
+  writeTextAtomicSync(pathBindingFile(uid, pathSourceKey(source.rootDir)), JSON.stringify({version:2,appId}));
+}
+
+export async function saveFromArtifact(userId: string, cid: string, artifactId: string, mode: SaveMode = 'new', recovery?:SaveRecovery, source?: PathSource): Promise<Result<{ id: string; title: string; entry?:string }>> {
   const key = JSON.stringify([userId, cid]);
   activeEditSaves.set(key, (activeEditSaves.get(key) || 0) + 1);
-  try { return await saveArtifact(userId, cid, artifactId, mode, recovery); }
+  // Keep each conversation's recovery journal exclusive, and share the source
+  // queue when different conversations save the same workspace bundle.
+  const queueKeys = source ? [key, JSON.stringify([userId, 'source', pathSourceKey(source.rootDir)])] : [key];
+  const previous = queueKeys.map(queueKey => saveQueues.get(queueKey)?.catch(() => {}));
+  const saving = Promise.all(previous).then(() => saveArtifact(userId, cid, artifactId, mode, recovery, source));
+  for (const queueKey of queueKeys) saveQueues.set(queueKey, saving);
+  try { return await saving; }
   finally {
+    for (const queueKey of queueKeys) if (saveQueues.get(queueKey) === saving) saveQueues.delete(queueKey);
     const remaining = activeEditSaves.get(key)! - 1;
     if (remaining) activeEditSaves.set(key, remaining);
     else {
@@ -516,30 +586,40 @@ export async function saveFromArtifact(userId: string, cid: string, artifactId: 
   }
 }
 
-async function saveArtifact(userId: string, cid: string, artifactId: string, mode: 'new' | 'update', recovery?:{clearVersion:number;clearFingerprint:string}): Promise<Result<{ id: string; title: string }>> {
+async function saveArtifact(userId: string, cid: string, artifactId: string, mode: SaveMode, recovery?:SaveRecovery, source?: PathSource): Promise<Result<{ id: string; title: string; entry?:string }>> {
   recoverEditedSaves(userId);
-  const resolved = chatArtifacts.resolveArtifactDir(userId, cid, artifactId);
+  const resolved = source ? {ok:true as const,dirPath:source.rootDir} : chatArtifacts.resolveArtifactDir(userId, cid, artifactId);
   if (!resolved.ok) return { ok: false, error: (resolved as { error?: string }).error || 'artifact not found' };
   const srcDir = (resolved as { dirPath: string }).dirPath;
 
   const srcMeta = chatArtifacts.readArtifactMeta(userId, cid, artifactId);
-  const title = sanitiseTitle(srcMeta?.title);
-  const context = readEditContext(userId, cid);
-  // Only an untyped artifact consults the task binding, which must resolve or
-  // fail. An update must also keep the original app's trusted type: the
-  // untyped case inherits it, so only a typed artifact needs the comparison.
+  let title = sanitiseTitle(source?.title ?? srcMeta?.title);
+  const editContext = readEditContext(userId, cid);
+  let context: EditContext | null = null;
+  // Legacy type metadata remains readable; saving never changes application identity based on type.
   let appType: AppType;
   try {
-    appType = await resolveArtifactAppType(userId, cid, artifactId, srcMeta);
-    if (mode === 'update' && context && srcMeta?.appType) {
-      const original = (await getEditTarget(userId, cid))?.appType;
-      if (original && original !== appType) return { ok: false, error: 'app_type_mismatch' };
+    appType = source?.appType ?? await resolveArtifactAppType(userId, cid, artifactId, srcMeta);
+    if (mode !== 'new') {
+      const target = await getSaveTarget(userId, cid, source ? {rootDir:source.rootDir,legacyRoot:source.bindingRoot} : {artifactId});
+      if (target) {
+        // Updating a durable destination preserves its capability identity;
+        // another task's creation defaults belong only to new applications.
+        appType = target.appType;
+        context = {version:1,...target,fingerprint:fingerprintApp(savedAppDir(userId,target.appId))};
+      }
     }
   } catch (err) {
     log.warn('saveFromArtifact edit binding unavailable', { error: logErrorSummary(err) });
     return { ok: false, error: 'app_edit_target_missing' };
   }
-  if (mode === 'update' && !context) return { ok: false, error: 'app_edit_target_missing' };
+  if(recovery&&(!context||(source&&!recovery.appId)||(recovery.appId!==undefined&&recovery.appId!==context.appId)
+    ||!Number.isInteger(recovery.clearVersion)||typeof recovery.clearFingerprint!=='string'
+    ||recovery.clearFingerprint!==context.fingerprint))return {ok:false,error:'app_edit_conflict'};
+  mode = context ? 'update' : 'new';
+  const entry = source && context && !source.explicitEntry
+    ? normaliseEntryRel(readMeta(savedAppDir(userId,context.appId)).entry) : source?.entry ?? 'index.html';
+  if(source&&context&&!source.explicitEntry&&!source.explicitTitle)title=context.title;
 
   let appId = '';
   let destDir = '';
@@ -558,14 +638,21 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
   try {
     // Copy everything except the source `__orkas-meta.json` (we write a fresh
     // one stamped with the source provenance).
-    await fsp.cp(srcDir, tmpDir, {
+    if (source) {
+      await fsp.mkdir(tmpDir,{recursive:true});
+      await copyBundleFiles(srcDir,tmpDir,source.files);
+    } else await fsp.cp(srcDir, tmpDir, {
       recursive: true,
       filter: (src) => path.basename(src) !== META_FILENAME,
     });
     // Binary placeholders in the editing attachment are not replacement bytes.
     // Omitted binary resources survive; explicit artifact files take precedence.
-    if (context) {
-      const snapshot = path.join(editContextDir(userId, cid), 'snapshot');
+    if (editContext && !source) {
+      // Updates retain assets from their remembered destination, which can be
+      // an independently edited copy rather than the task's original snapshot.
+      const snapshot = mode === 'update' && context
+        ? savedAppDir(userId, context.appId)
+        : path.join(editContextDir(userId, cid), 'snapshot');
       for (const rel of listAppFilesRel(snapshot)) {
         if (rel === META_FILENAME || TEXT_LIKE_EXTS.has(path.extname(rel).toLowerCase())) continue;
         const target = path.join(tmpDir, rel);
@@ -577,15 +664,23 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
         }
       }
     }
-    if (!fs.existsSync(path.join(tmpDir, 'index.html'))) {
+    if (!fs.existsSync(path.join(tmpDir, entry))) {
       throw new Error('source artifact is missing index.html');
+    }
+    if (source && appType === 'web') {
+      const {manifestSchema} = await import('./web_apps/catalog');
+      const file = path.join(tmpDir,'orkas-app.json');
+      const manifest = manifestSchema.parse(fs.existsSync(file) ? JSON.parse(await fsp.readFile(file,'utf8')) : {sdkVersion:1,capabilities:[]});
+      if (manifest.capabilities.some(capability => capability !== 'data') || (manifest.capabilities.includes('data') && !manifest.data)) throw new Error('app_web_interfaces_required');
+      await fsp.writeFile(file,JSON.stringify({...manifest,minimumClient:'1.9.0'}));
     }
     const meta: SavedAppMeta = {
       ...(mode === 'new' || hasIsolatedBrowserStorage(userId, appId) ? { browserStorage: 'isolated-v1' as const } : {}),
       appType,
-      description: await readHtmlDescription(path.join(tmpDir, 'index.html')),
+      ...(source ? {sourcePathKey:pathSourceKey(source.rootDir),entry} : {}),
+      description: await readHtmlDescription(path.join(tmpDir, entry)),
       title,
-      sourceCid: typeof cid === 'string' ? cid : '',
+      sourceCid: source ? source.sourceCid : cid,
       sourceArtifactId: typeof artifactId === 'string' ? artifactId : '',
       savedAt: new Date().toISOString(),
     };
@@ -611,6 +706,7 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
       const backup = `${tmpDir}.previous`;
       const journal = {version:1,appId,temporary:path.basename(tmpDir),before:context.fingerprint,after:fingerprintApp(tmpDir),...(candidate?{dataCandidate:path.basename(candidate)}:{})};
       const journalPath=path.join(editContextDir(userId,cid),'save-journal.json');
+      fs.mkdirSync(path.dirname(journalPath),{recursive:true});
       const journalFd=fs.openSync(journalPath,'w',0o600);
       try { fs.writeFileSync(journalFd,JSON.stringify(journal));fs.fsyncSync(journalFd); } finally {fs.closeSync(journalFd);}
       fs.renameSync(destDir, backup);
@@ -619,7 +715,7 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
         if(candidate){fs.renameSync(dataFile,dataFile+'.previous');try{fs.renameSync(candidate,dataFile);}catch(error){fs.renameSync(dataFile+'.previous',dataFile);throw error;}}
       } catch (err) { if(fs.existsSync(destDir))fs.rmSync(destDir,{recursive:true,force:true});fs.renameSync(backup, destDir);throw err; }
       try {
-        refreshEditSnapshot(userId,cid,context,destDir);
+        if (editContext?.appId === appId) refreshEditSnapshot(userId,cid,context,destDir);
         fs.rmSync(backup, { recursive: true, force: true });
         if(candidate)fs.rmSync(dataFile+'.previous',{force:true});
         fs.rmSync(journalPath,{force:true});
@@ -629,7 +725,11 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
         // turn it into a failed save or remove the newly written application.
         log.warn('edited app post-save cleanup deferred', { error: logErrorSummary(err) });
       }
-    } else await fsp.rename(tmpDir, destDir);
+    } else {
+      await fsp.rename(tmpDir, destDir);
+      // Do not report a successful copy if its source association could not be persisted.
+      bindSave(userId,cid,artifactId,appId,source);
+    }
   } catch (err) {
     try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     if (mode !== 'update') {
@@ -648,6 +748,10 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
     try { if (candidate) await removeAppDataBackup(candidate); }
     finally { release?.(); }
   }
+  if (mode === 'update') {
+    try { bindSave(userId,cid,artifactId,appId,source); }
+    catch (error) { log.warn('saved app association recovery deferred',{error:logErrorSummary(error)}); }
+  }
   log.info('saveFromArtifact completed', {
     user_id: maskId(userId),
     app_id: maskId(appId),
@@ -655,27 +759,20 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
     artifact_id: maskId(artifactId),
     save_mode: mode,
   });
-  return { ok: true, id: appId, title };
+  return { ok: true, id: appId, title, ...(source?{entry}:{}) };
 }
 
 /** Copy a workspace/file-tab-discovered HTML app bundle into saved_apps. */
 export async function saveFromPath(
   userId: string,
   targetPath: string,
-  opts: BundleInspectOptions & { title?: unknown; sourceCid?: unknown } = {},
+  opts: BundleInspectOptions & { title?: unknown; sourceCid?: unknown; mode?: SaveMode; recovery?:SaveRecovery } = {},
 ): Promise<Result<{ id: string; title: string; rootDir: string; entry: string; fileCount: number; totalBytes: number }>> {
-  try {
-    if (typeof opts.sourceCid === 'string' && opts.sourceCid) requireLocalAppType(await boundAppType(userId, opts.sourceCid));
-    requireLocalAppType(await managedPathAppType(userId, targetPath));
-    requireLocalAppType(storedAppType(path.dirname(targetPath)));
-  } catch (error) {
-    return isCommercialWebAppFailure(error) ? commercialWebAppFailure() : { ok: false, error: 'app_edit_target_missing' };
-  }
   const inspected = await inspectBundle(targetPath, opts);
   if (!inspected.ok) return { ok: false, error: (inspected as { ok: false; error: string }).error };
   if (!inspected.canSave) return { ok: false, error: (inspected as { ok: true; canSave: false; reason: string }).reason };
-  try { requireLocalAppType(storedAppType(inspected.rootDir)); }
-  catch (error) { return isCommercialWebAppFailure(error) ? commercialWebAppFailure() : { ok: false, error: 'app_edit_target_missing' }; }
+  try { storedAppType(inspected.rootDir); }
+  catch { return { ok: false, error: 'app_edit_target_missing' }; }
 
   const title = sanitiseTitle(opts.title || inspected.title);
   const sourceCid=typeof opts.sourceCid==='string'?opts.sourceCid:'';
@@ -683,61 +780,16 @@ export async function saveFromPath(
   let editType:AppType|undefined;
   try{editType=sourceCid?(await getEditTarget(userId,sourceCid))?.appType:undefined;}
   catch(err){log.warn('saveFromPath edit binding unavailable',{error:logErrorSummary(err)});return {ok:false,error:'app_edit_target_missing'};}
-  const appType:AppType=editType??(assistance?.kind==='app_creation'?assistance.appType??'local':'local');
-  let appId = '';
-  let destDir = '';
-  try {
-    const minted = mintAppId(userId);
-    appId = minted.appId;
-    destDir = minted.destDir;
-  } catch (err) {
-    return { ok: false, error: (err as Error).message };
-  }
-
-  const tmpDir = stagingDir(destDir);
-  try {
-    await fsp.mkdir(tmpDir, { recursive: true });
-    const copied = await copyBundleFiles(inspected.rootDir, tmpDir, inspected.files!);
-    if (!fs.existsSync(path.join(tmpDir, inspected.entry))) throw new Error('bundle is missing its HTML entry');
-    if(appType==='web'){
-      const {manifestSchema}=await import('./web_apps/catalog');const file=path.join(tmpDir,'orkas-app.json');
-      const manifest=manifestSchema.parse(fs.existsSync(file)?JSON.parse(await fsp.readFile(file,'utf8')):{sdkVersion:1,capabilities:[]});
-      if(manifest.capabilities.some(capability=>capability!=='data')||(manifest.capabilities.includes('data')&&!manifest.data))throw new Error('app_web_interfaces_required');
-      await fsp.writeFile(file,JSON.stringify({...manifest,minimumClient:'1.9.0'}));
-    }
-    const meta: SavedAppMeta = {
-      browserStorage: 'isolated-v1',
-      appType,
-      description: await readHtmlDescription(path.join(tmpDir, inspected.entry)),
-      title,
-      sourceCid: typeof opts.sourceCid === 'string' ? opts.sourceCid : '',
-      sourceArtifactId: '',
-      entry: inspected.entry,
-      savedAt: new Date().toISOString(),
-    };
-    await fsp.writeFile(path.join(tmpDir, META_FILENAME), JSON.stringify(meta, null, 2));
-    await fsp.mkdir(path.dirname(destDir), { recursive: true });
-    await fsp.rename(tmpDir, destDir);
-    log.info('saveFromPath completed', {
-      user_id: maskId(userId),
-      app_id: maskId(appId),
-      root: logPathRef(inspected.rootDir),
-      entry: logPathRef(inspected.entry),
-      file_count: copied.fileCount,
-      total_bytes: copied.totalBytes,
-    });
-    return { ok: true, id: appId, title, rootDir: inspected.rootDir, entry: inspected.entry, ...copied };
-  } catch (err) {
-    try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    try { await fsp.rm(destDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    log.warn('saveFromPath failed', {
-      user_id: maskId(userId),
-      target: logPathRef(targetPath),
-      error: logErrorSummary(err),
-    });
-    return { ok: false, error: failureCode(err, 'app_save_failed') };
-  }
-  finally { activeStagingDirs.delete(tmpDir); }
+  const appType:AppType=editType??(assistance?.kind==='app_creation'?assistance.appType??'local':storedAppType(inspected.rootDir)??'local');
+  const realRoot=inspected.realRoot!;
+  const operationCid = sourceCid || `file-${pathSourceKey(realRoot)}`;
+  const result = await saveFromArtifact(userId,operationCid,'',opts.mode ?? 'new',opts.recovery,{
+    rootDir:realRoot,bindingRoot:inspected.rootDir,entry:inspected.entry,
+    explicitEntry:/\.html?$/i.test(targetPath)&&fs.statSync(targetPath).isFile(),
+    explicitTitle:!!opts.title,title,files:inspected.files!.map(file=>path.join(realRoot,path.relative(inspected.rootDir,file))),appType,sourceCid,
+  });
+  if (result.ok === false) return result;
+  return {...result,rootDir:inspected.rootDir,entry:result.entry!,fileCount:inspected.fileCount,totalBytes:inspected.totalBytes};
 }
 
 /** List the user's saved apps, newest save first. */
@@ -927,7 +979,12 @@ async function deleteLocalSavedApp(userId: string, safeId: string): Promise<Resu
     exists = true;
     if (!st.isDirectory() || st.isSymbolicLink()) return { ok: false, error: 'app not found' };
   } catch { /* idempotent missing delete */ }
-  const deleted = exists ? listAppFilesRel(dir) : [];
+  let deleted: string[];
+  try { deleted = exists ? listAppFilesRel(dir) : []; }
+  catch (err) {
+    log.warn('deleteSavedApp inventory unavailable', { user_id: maskId(userId), app_id: maskId(safeId), error: logErrorSummary(err) });
+    return { ok: false, error: 'app_delete_failed' };
+  }
   // The app folder moves aside atomically first and returns if its data cannot
   // be removed, so a failed delete leaves the app listed and sync untouched.
   // A durable intent recorded before anything moves lets a stopped delete finish.
@@ -1048,13 +1105,12 @@ function isSymlink(target: string): boolean {
 
 // ── "Edit in a new conversation" ─────────────────────────────────────────
 
-/** Recursively list a saved app's file paths (relative to its dir), sorted. */
+/** Integrity and deletion inventories must never turn unreadable data into
+ * an empty subtree. Callers own rollback or post-commit recovery. */
 function listAppFilesRel(dir: string): string[] {
   const out: string[] = [];
   const walk = (rel: string): void => {
-    let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(path.join(dir, rel), { withFileTypes: true }); }
-    catch { return; }
+    const entries = fs.readdirSync(path.join(dir, rel), { withFileTypes: true });
     for (const e of entries) {
       const childRel = rel ? `${rel}/${e.name}` : e.name;
       if (e.isDirectory()) walk(childRel);
@@ -1075,7 +1131,7 @@ function refreshEditSnapshot(uid: string,cid: string,context: EditContext,source
   if(fs.existsSync(snapshot))fs.renameSync(snapshot,previous);
   try {fs.renameSync(next,snapshot);} catch(error) {if(fs.existsSync(previous))fs.renameSync(previous,snapshot);throw error;}
   context.fingerprint=fingerprintApp(source);
-  fs.writeFileSync(path.join(root,'context.json'),JSON.stringify(context));
+  writeTextAtomicSync(path.join(root,'context.json'),JSON.stringify(context));
   fs.rmSync(previous,{recursive:true,force:true});
 }
 
@@ -1093,11 +1149,10 @@ function recoverEditedSaves(uid: string) {
       if(journal.version!==1||!new RegExp('^'+appId+'\\.tmp-[a-f0-9]{8}$').test(journal.temporary)
         || !/^[a-f0-9]{64}$/.test(journal.before)||!/^[a-f0-9]{64}$/.test(journal.after))throw new Error('invalid edit save journal');
       const destination=savedAppDir(uid,appId),temporary=path.join(userSavedAppsDir(uid),journal.temporary),backup=temporary+'.previous';
-      const existingContext = readEditContext(uid, cid);
-      if (existingContext?.appType === 'web' || [destination, temporary, backup, path.join(root, 'snapshot')]
-        .some(dir => isRealSavedAppDirectory(dir) && storedAppType(dir) === 'web')) {
-        retained.add(temporary); retained.add(backup); continue;
-      }
+      retained.add(temporary); retained.add(backup);
+      const current = isRealSavedAppDirectory(destination) ? fingerprintApp(destination) : null;
+      const rollback = isRealSavedAppDirectory(backup) ? fingerprintApp(backup) : null;
+      if (current !== journal.before && current !== journal.after && (current !== null || rollback !== journal.before)) throw new Error('app_edit_conflict');
       if(journal.dataCandidate){
         if(!/^data\.sqlite\.backup-[a-f0-9]{16}$/.test(journal.dataCandidate))throw new Error('invalid data save journal');
         const {file}=localDatabase(uid,appId),candidate=path.join(path.dirname(file),journal.dataCandidate);
@@ -1112,6 +1167,7 @@ function recoverEditedSaves(uid: string) {
         const context=readEditContext(uid,cid);if(context&&context.appId===appId)refreshEditSnapshot(uid,cid,context,destination);
       }
       fs.rmSync(temporary,{recursive:true,force:true});fs.rmSync(backup,{recursive:true,force:true});fs.rmSync(journalPath,{force:true});
+      retained.delete(temporary); retained.delete(backup);
       log.info('edited app save recovery completed');
     } catch(error) {log.warn('edited app save recovery deferred',{error:logErrorSummary(error)});}
   }
@@ -1140,8 +1196,6 @@ export function cleanupEditSnapshots(uid: string, background = false, cid?: stri
         for (const entry of candidates) {
           if (!entry.isDirectory() || !/^[A-Za-z0-9_-]{1,128}$/.test(entry.name) || retained.has(entry.name)) continue;
           const dir = editContextDir(uid, entry.name);
-          if (readEditContext(uid, entry.name)?.appType === 'web'
-            || storedAppType(path.join(dir, 'snapshot')) === 'web') continue;
           const activeKey = JSON.stringify([uid, entry.name]);
           if (activeEditSaves.has(activeKey)) { deferredEditCleanup.add(activeKey); continue; }
           try { await fsp.lstat(path.join(dir, 'save-journal.json')); continue; }
@@ -1170,6 +1224,19 @@ function fingerprintApp(dir: string): string {
   }
   return digest.digest('hex');
 }
+/** Same fingerprint spelling as save/recovery, without reading large source
+ * files synchronously while a user is opening the editor. */
+async function fingerprintAppAsync(dir: string): Promise<string> {
+  const digest = crypto.createHash('sha256');
+  for (const rel of listAppFilesRel(dir)) {
+    const target = path.join(dir, rel);
+    if (!isPathAllowed(target, [dir])) throw new Error('app_edit_snapshot_invalid');
+    digest.update(JSON.stringify(rel)).update('\0');
+    for await (const chunk of fs.createReadStream(target)) digest.update(chunk as Buffer);
+    digest.update('\0');
+  }
+  return digest.digest('hex');
+}
 function readEditContext(userId: string, cid: string): EditContext | null {
   try {
     const data = JSON.parse(fs.readFileSync(path.join(editContextDir(userId, cid), 'context.json'), 'utf8'));
@@ -1181,7 +1248,7 @@ function readEditContext(userId: string, cid: string): EditContext | null {
 }
 export async function getEditTarget(userId: string, cid: string): Promise<{ appId: string; title: string; appType: AppType } | null> {
   const context = readEditContext(userId, cid);
-  if (!context && fs.existsSync(editContextDir(userId, cid))) throw Object.assign(new Error(t('web_apps.error_E_CLOSED')), { code: 'app_edit_context_unavailable' });
+  if (!context && (fs.existsSync(path.join(editContextDir(userId, cid),'context.json')) || fs.existsSync(path.join(editContextDir(userId, cid),'snapshot')))) throw Object.assign(new Error(t('web_apps.error_E_CLOSED')), { code: 'app_edit_context_unavailable' });
   if (!context) return null;
   const dir = savedAppDir(userId, context.appId);
   const persisted = isRealSavedAppDirectory(dir) ? storedAppType(dir) : undefined;
@@ -1240,11 +1307,22 @@ export async function managedPathAppType(userId: string, file: string): Promise<
   return resolveArtifactAppType(userId, segments[start], segments[start + 1]);
 }
 
+/** Opening needs only local identity. An unresolved/damaged edit binding
+ *  can render, but must not inherit the ordinary new-artifact local authority. */
+export async function declaredArtifactAppType(userId:string,cid:string,artifactId:string):Promise<AppType|undefined>{
+  const meta=chatArtifacts.readArtifactMeta(userId,cid,artifactId);
+  if(meta?.appType)return meta.appType;
+  const context=readEditContext(userId,cid);
+  if(context)return context.appType??storedAppType(savedAppDir(userId,context.appId))??'local';
+  if(fs.existsSync(path.join(editContextDir(userId,cid),'context.json')) || fs.existsSync(path.join(editContextDir(userId,cid),'snapshot')))return undefined;
+  return await boundAppType(userId,cid)??'local';
+}
+
 /** Build the single-`.md` source bundle handed to the editing conversation as
  *  an attachment. Plain `FILE:` rules (not fenced code blocks) so the app's own
  *  source — which may contain ``` — can't break the bundle. Binary assets are
  *  represented as placeholder lines (a text bundle can't carry their bytes). */
-function buildSourceBundle(dir: string, title: string): string {
+async function buildSourceBundle(dir: string, title: string): Promise<string> {
   const files = listAppFilesRel(dir).filter((rel) => rel !== META_FILENAME);
   let entry = 'index.html';
   try {
@@ -1261,12 +1339,10 @@ function buildSourceBundle(dir: string, title: string): string {
     const abs = path.join(dir, rel);
     lines.push(`========== FILE: ${rel} ==========`);
     if (TEXT_LIKE_EXTS.has(path.extname(rel).toLowerCase())) {
-      let content = '<could not read this file>';
-      try { content = fs.readFileSync(abs, 'utf8'); } catch { /* keep placeholder */ }
-      lines.push(content);
+      lines.push(await fsp.readFile(abs, 'utf8'));
     } else {
       let kb = 1;
-      try { kb = Math.max(1, Math.round(fs.statSync(abs).size / 1024)); } catch { /* ignore */ }
+      try { kb = Math.max(1, Math.round((await fsp.stat(abs)).size / 1024)); } catch { /* ignore */ }
       lines.push(`[binary asset: ${rel} — ~${kb} KB; kept from the original app. To change it, re-supply it via create_artifact with "encoding":"base64".]`);
     }
     lines.push('');
@@ -1326,11 +1402,15 @@ export async function openForEditing(
     log.warn('saved app type recovery unavailable', { error: logErrorSummary(error) });
     return { ok: false, error: t('web_apps.error_E_FAILED') };
   }
-  if (appType === 'web') return commercialWebAppFailure();
   const resolvedEntry = resolveSavedAppIndex(userId, safeId);
   if (!resolvedEntry.ok) return { ok: false, error: 'app is missing its HTML entry' };
 
-  const originalFingerprint = fingerprintApp(dir);
+  let originalFingerprint: string;
+  try { originalFingerprint = await fingerprintAppAsync(dir); }
+  catch (err) {
+    log.warn('openForEditing snapshot failed', { error: logErrorSummary(err) });
+    return { ok: false, error: 'app_edit_snapshot_failed' };
+  }
 
   let conv: Awaited<ReturnType<typeof chats.createConversation>>;
   try {
@@ -1349,21 +1429,22 @@ export async function openForEditing(
 
   const editingDir = editContextDir(userId, conv.conversation_id);
   let bundle: string;
+  let up: Awaited<ReturnType<typeof chatAttachments.uploadAttachment>>;
   try {
     const snapshot = path.join(editingDir, 'snapshot');
     await fsp.cp(dir, snapshot, { recursive: true, dereference: false });
-    if (fingerprintApp(snapshot) !== originalFingerprint || fingerprintApp(dir) !== originalFingerprint) {
+    if (await fingerprintAppAsync(snapshot) !== originalFingerprint || await fingerprintAppAsync(dir) !== originalFingerprint) {
       throw new Error('app_edit_conflict');
     }
     const context: EditContext = { version: 1, appId: safeId, title, appType, fingerprint: originalFingerprint };
     await fsp.writeFile(path.join(editingDir, 'context.json'), JSON.stringify(context));
-    bundle = buildSourceBundle(snapshot, title);
+    bundle = await buildSourceBundle(snapshot, title);
+    up = await chatAttachments.uploadAttachment(userId, conv.conversation_id, SOURCE_BUNDLE_NAME, Buffer.from(bundle, 'utf8'));
   } catch (err) {
     log.warn('openForEditing snapshot failed', { error: logErrorSummary(err) });
     await rollbackEditConversation(userId, safeId, editingDir, conv);
     return { ok: false, error: 'app_edit_snapshot_failed' };
   }
-  const up = await chatAttachments.uploadAttachment(userId, conv.conversation_id, SOURCE_BUNDLE_NAME, Buffer.from(bundle, 'utf8'));
   if (!up.ok) {
     // Roll back the conversation we just created so no empty conv is orphaned.
     await rollbackEditConversation(userId, safeId, editingDir, conv);

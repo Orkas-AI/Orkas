@@ -67,34 +67,10 @@ describe('commercial entry actions', () => {
     expect(a).toBe(b); expect(h.confirm).toHaveBeenCalledOnce();
     finish(false); await a; expect(h.invoke).not.toHaveBeenCalled();
   });
-  it('shows one independent notice per turn for the structured rejected tool receipt', async () => {
+  it('recognizes only an explicit publication refusal receipt', () => {
     const h = harness();
-    const receipt = { ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps', message: 'Model may omit this message' };
-    const event = { stream: 'tool', data: { phase: 'end', name: 'create_artifact', isError: true, output: JSON.stringify(receipt) } };
-    const first = new Element(), second = new Element();
-    first.dataset.turnId = second.dataset.turnId = 'same-turn';
-    h.api.observeToolResult(first, event); h.api.observeToolResult(first, event); h.api.observeToolResult(second, event);
-    expect(first.children).toHaveLength(1); expect(second.children).toHaveLength(0);
-    const row = first.children[0];
-    expect(row.className).toBe('chat-app-nav-row');
-    expect(row.children[0].textContent).toBe(h.table['apps.commercial_required']);
-    expect(h.confirm).not.toHaveBeenCalled(); expect(h.invoke).not.toHaveBeenCalled();
-    await row.children[1].click();
-    expect(h.invoke).toHaveBeenCalledOnce();
-    const next = new Element(); next.dataset.turnId = 'next-turn'; h.api.observeToolResult(next, event);
-    expect(next.children).toHaveLength(1);
-  });
-  it('does not interpret model text, ordinary errors, successful tools or foreign features as authority', () => {
-    const h = harness(); const message = new Element();
-    for (const output of ['Web apps require commercial Orkas', '{bad JSON', JSON.stringify({ code: 'E_FAILED' }),
-      JSON.stringify({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'other' }),
-      JSON.stringify({ ok: true, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' }),
-      JSON.stringify({ code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' })]) {
-      h.api.observeToolResult(message, { stream: 'tool', data: { phase: 'end', name: 'create_artifact', isError: true, output } });
-    }
-    const output = JSON.stringify({ code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
-    h.api.observeToolResult(message, { stream: 'tool', data: { phase: 'end', name: 'read_files', isError: true, output } });
-    h.api.observeToolResult(message, { stream: 'tool', data: { phase: 'end', name: 'create_artifact', isError: false, output } });
-    expect(message.children).toHaveLength(0); expect(h.invoke).not.toHaveBeenCalled();
+    expect(h.api.isFailure({ok:false, code:'E_COMMERCIAL_REQUIRED', feature:'web_apps'})).toBe(true);
+    for (const value of ['Publish requires commercial Orkas', null, {ok:true,code:'E_COMMERCIAL_REQUIRED',feature:'web_apps'},
+      {ok:false,code:'E_COMMERCIAL_REQUIRED',feature:'other'}, {ok:false,code:'E_FAILED',feature:'web_apps'}]) expect(h.api.isFailure(value)).toBeFalsy();
   });
 });

@@ -7,6 +7,7 @@
  *
  * Supported search providers (one-shot adapters in `model/core-agent/search-tools.ts`):
  *   - tavily            (https://tavily.com)
+ *   - deepseek          (https://api-docs.deepseek.com/guides/search/)
  *   - serper            (https://serper.dev)
  *   - brave-search      (https://brave.com/search/api/)
  *   - baidu-ai-search   (https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk)

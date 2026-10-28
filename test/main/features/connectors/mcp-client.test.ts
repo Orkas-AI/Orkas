@@ -1,14 +1,264 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 const require = createRequire(import.meta.url);
 
 describe('MCP stdio diagnostic boundary', () => {
+  it.each(['spawn-rejection', 'sdk-closed-after-start'])(
+    'retains the real missing-executable failure through %s', mode => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mcp-missing-'));
+      const probePath = path.join(root, 'probe.cjs');
+      const missing = path.join(root, 'missing-server');
+      // Resolve the same public import export as McpConnection's dynamic
+      // import, rather than the distinct require-condition SDK class.
+      fs.symlinkSync(path.resolve('node_modules'), path.join(root, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+      fs.writeFileSync(probePath, [
+        'const warnings = [];',
+        `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/logger.ts'))})] = { exports: { createLogger: () => ({ info() {}, warn(message) { warnings.push(message); } }) } };`,
+        `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/util/proxy-dispatcher.ts'))})] = { exports: { buildChildProxyEnvironment: async () => ({}) } };`,
+        '(async () => {',
+        "  const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');",
+        "  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');",
+        '  const originalStart = StdioClientTransport.prototype.start;',
+        '  const originalConnect = Client.prototype.connect;',
+        '  let spawnCode, sdkRejectedCode, connectCalls = 0, sdkCloseDelivered = false;',
+        '  Client.prototype.connect = async function (...args) {',
+        '    connectCalls++;',
+        '    try { return await Reflect.apply(originalConnect, this, args); }',
+        '    catch (error) { sdkRejectedCode = error.code; throw error; }',
+        '  };',
+        ...(mode === 'sdk-closed-after-start' ? [
+          // Reproduce the Windows ordering while retaining a real failed OS
+          // spawn and the actual SDK Client/transport/close rejection path.
+          // The SDK has accepted start before the later spawn error arrives.
+          '  StdioClientTransport.prototype.start = function () {',
+          '    const onerror = this.onerror;',
+          '    this.onerror = error => { if (error.syscall?.startsWith("spawn")) spawnCode = error.code; onerror?.(error); };',
+          '    void originalStart.call(this).catch(() => { sdkCloseDelivered = true; this.onclose?.(); });',
+          '    return Promise.resolve();',
+          '  };',
+        ] : []),
+        `  const { McpConnection } = require(${JSON.stringify(path.resolve('src/main/features/connectors/mcp-client.ts'))});`,
+        `  const connection = new McpConnection('custom-missing', { kind: 'stdio', command: ${JSON.stringify(missing)}, args: [], env: {} });`,
+        '  try {',
+        '    try { await connection.connect(); throw new Error("missing executable unexpectedly connected"); }',
+        '    catch (error) { process.stdout.write(JSON.stringify({ code: error.code, syscall: error.syscall, connected: connection.isConnected, spawnCode, sdkRejectedCode, connectCalls, sdkCloseDelivered, warnings })); }',
+        '  } finally { await connection.close(); StdioClientTransport.prototype.start = originalStart; Client.prototype.connect = originalConnect; }',
+        '})().catch(error => { process.stderr.write(error.name); process.exitCode = 1; });',
+      ].join('\n'));
+      try {
+        const result = spawnSync(process.execPath, ['-r', require.resolve('tsx/cjs'), probePath], {
+          cwd: root, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', ORKAS_WORKSPACE_ROOT: root },
+          encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+        });
+        expect(result.status, result.stderr || result.stdout).toBe(0);
+        expect(result.stderr).toBe('');
+        const outcome = JSON.parse(result.stdout);
+        expect(outcome).toMatchObject({ code: 'ENOENT', connected: false, connectCalls: 1, warnings: ['connect failed'] });
+        expect(outcome.syscall).toBe(`spawn ${missing}`);
+        if (mode === 'sdk-closed-after-start') {
+          expect(outcome.spawnCode).toBe('ENOENT');
+          expect(outcome.sdkCloseDelivered).toBe(true);
+          expect(outcome.sdkRejectedCode).toBe(-32000);
+        }
+        // Retain the captured production warning for the default log review,
+        // without emitting the temporary executable path from syscall.
+        console.warn('MCP missing-executable diagnostic retained', {
+          mode, code: outcome.code, sdkRejectedCode: outcome.sdkRejectedCode,
+          warnings: outcome.warnings,
+        });
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    }, 15_000,
+  );
+
+  it.runIf(process.platform === 'darwin' || process.platform === 'win32')
+    .each(['graceful', 'ignores-eof', 'failed-initialize', 'reconnect'])(
+    'closes native stdio before shutdown or reconnect: %s', async mode => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mcp-native-close-'));
+      const serverPath = path.join(root, 'server.cjs');
+      const probePath = path.join(root, 'probe.cjs');
+      const pidsPath = path.join(root, 'pids.jsonl');
+      const receiptsPath = path.join(root, 'eof.jsonl');
+      fs.writeFileSync(serverPath, [
+        `const { Server } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/index.js'))});`,
+        `const { StdioServerTransport } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/stdio.js'))});`,
+        `require('node:fs').appendFileSync(${JSON.stringify(pidsPath)}, JSON.stringify(process.pid) + '\\n');`,
+        'process.stdin.on("end", () => {',
+        ...(mode === 'ignores-eof' ? [] : [
+          `  require('node:fs').appendFileSync(${JSON.stringify(receiptsPath)}, JSON.stringify(process.pid) + '\\n');`,
+          '  process.exit(0);',
+        ]),
+        '});',
+        'setTimeout(() => process.exit(1), 15000).unref();',
+        ...(mode === 'failed-initialize' ? ['process.stdin.resume();'] : [
+          "void new Server({ name: 'native-close', version: '1' }, { capabilities: {} }).connect(new StdioServerTransport());",
+        ]),
+        ...(mode === 'ignores-eof' ? ['setInterval(() => {}, 1000);'] : []),
+      ].join('\n'));
+      fs.writeFileSync(probePath, [
+        'const warnings = [];',
+        `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/logger.ts'))})] = { exports: { createLogger: () => ({ info() {}, warn(message) { warnings.push(message); } }) } };`,
+        `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/util/proxy-dispatcher.ts'))})] = { exports: { buildChildProxyEnvironment: async () => ({}) } };`,
+        `const { McpConnection } = require(${JSON.stringify(path.resolve('src/main/features/connectors/mcp-client.ts'))});`,
+        `const connection = new McpConnection('custom-native-close', { kind: 'stdio', command: ${JSON.stringify(process.env.ORKAS_TEST_NODE)}, args: [${JSON.stringify(serverPath)}], env: {} });`,
+        'const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };',
+        ...(mode === 'failed-initialize' ? [
+          'const originalSetTimeout = global.setTimeout;',
+          'global.setTimeout = (fn, ms, ...args) => originalSetTimeout(fn, ms === 30000 ? 1000 : ms, ...args);',
+        ] : []),
+        '(async () => {',
+        '  try {',
+        '    let connectFailed = false; try { await connection.connect(); } catch { connectFailed = true; }',
+        '    const closing = connection.close();',
+        '    const duplicate = connection.close();',
+        ...(mode === 'reconnect' ? ['    const reconnecting = connection.connect();'] : []),
+        '    await Promise.all([closing, duplicate]);',
+        ...(mode === 'reconnect' ? ['    await reconnecting; await connection.close();'] : []),
+        `    const pids = require('node:fs').readFileSync(${JSON.stringify(pidsPath)}, 'utf8').trim().split('\\n').map(JSON.parse);`,
+        `    const receipts = require('node:fs').existsSync(${JSON.stringify(receiptsPath)}) ? require('node:fs').readFileSync(${JSON.stringify(receiptsPath)}, 'utf8').trim().split('\\n').map(JSON.parse) : [];`,
+        '    process.stdout.write(JSON.stringify({ connectFailed, connected: connection.isConnected, sharedClose: connectFailed || closing === duplicate, count: pids.length, alive: pids.some(alive), graceful: pids.every(pid => receipts.includes(pid)), warnings }));',
+        '  } finally { await connection.close(); }',
+        '})().catch(error => { process.stderr.write(error.name); process.exitCode = 1; });',
+      ].join('\n'));
+      try {
+        const result = spawnSync(process.execPath, ['-r', require.resolve('tsx/cjs'), probePath], {
+          cwd: root, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', ORKAS_WORKSPACE_ROOT: root },
+          encoding: 'utf8', timeout: 12000, maxBuffer: 1024 * 1024,
+        });
+        expect(result.status, result.stderr || result.stdout).toBe(0);
+        expect(result.stderr).toBe('');
+        expect(JSON.parse(result.stdout)).toEqual({
+          connectFailed: mode === 'failed-initialize', connected: false, sharedClose: true,
+          count: mode === 'reconnect' ? 2 : 1, alive: false, graceful: mode !== 'ignores-eof',
+          warnings: mode === 'failed-initialize' ? ['connect failed'] : [],
+        });
+      } finally {
+        if (fs.existsSync(pidsPath)) for (const pid of fs.readFileSync(pidsPath, 'utf8').trim().split('\n').map(JSON.parse)) {
+          try { process.kill(pid, 'SIGKILL'); } catch { /* already closed */ }
+        }
+        await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      }
+    }, 15000,
+  );
+
+  it.runIf(process.platform === 'win32').each(['direct', 'cmd', 'failed-initialize', 'app-shutdown', 'app-late-connection', 'shared-runtime'])(
+    'releases a Windows MCP descendant file lock before disconnect completes: %s', async mode => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas MCP 更新 '));
+    const serverPath = path.join(root, 'server.cjs');
+    const probePath = path.join(root, 'probe.cjs');
+    const lockPath = path.join(root, 'runtime.exe');
+    const replacementPath = path.join(root, 'replacement.exe');
+    const pidPath = path.join(root, 'lock.pid');
+    const readyPath = path.join(root, 'lock.ready');
+    const foreignReadyPath = path.join(root, 'foreign.ready');
+    const shimPath = path.join(root, 'server.cmd');
+    fs.copyFileSync(process.env.ORKAS_TEST_NODE!, lockPath);
+    const unrelated = spawn(mode === 'shared-runtime' ? lockPath : process.env.ORKAS_TEST_NODE!, ['-e',
+      `require('node:fs').writeFileSync(${JSON.stringify(foreignReadyPath)}, 'ready'); setTimeout(() => {}, 30000);`,
+    ], {
+      windowsHide: true, stdio: 'ignore',
+    });
+    const unrelatedClosed = new Promise(resolve => unrelated.once('close', resolve));
+    fs.writeFileSync(replacementPath, 'new runtime');
+    const lockScript = `require('node:fs').writeFileSync(${JSON.stringify(readyPath)}, 'locked'); setTimeout(() => {}, 30000);`;
+    fs.writeFileSync(serverPath, [
+      `const { Server } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/index.js'))});`,
+      `const { StdioServerTransport } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/stdio.js'))});`,
+      `const child = require('node:child_process').spawn(${JSON.stringify(lockPath)}, ['-e', ${JSON.stringify(lockScript)}],`,
+      `  { windowsHide: true, detached: true, stdio: 'ignore' });`,
+      `require('node:fs').writeFileSync(${JSON.stringify(pidPath)}, String(child.pid));`,
+      'const timer = setInterval(() => {',
+      `  if (!require('node:fs').existsSync(${JSON.stringify(readyPath)})) return; clearInterval(timer);`,
+      "  const server = new Server({ name: 'tree', version: '1' }, { capabilities: {} });",
+      // The wrapper exits on EOF; Windows must still reap its non-cooperating child.
+      '  process.stdin.once("end", () => process.exit(0));',
+      mode === 'failed-initialize' ? '  process.stdin.resume();' : '  void server.connect(new StdioServerTransport());',
+      '}, 20);',
+    ].join('\n'));
+    fs.writeFileSync(shimPath, `@echo off\r\n"${process.env.ORKAS_TEST_NODE}" "%~dp0server.cjs"\r\n`);
+    fs.writeFileSync(probePath, [
+      'const warnings = [];',
+      `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/logger.ts'))})] = { exports: { createLogger: () => ({ info() {}, warn(message) { warnings.push(message); } }) } };`,
+      `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/util/proxy-dispatcher.ts'))})] = { exports: { buildChildProxyEnvironment: async () => ({}) } };`,
+      `const { McpConnection } = require(${JSON.stringify(path.resolve('src/main/features/connectors/mcp-client.ts'))});`,
+      'const childProcess = require("node:child_process"); const originalSpawn = childProcess.spawn; let processHelpers = 0;',
+      'childProcess.spawn = (...args) => { if (require("node:path").basename(args[0]).toLowerCase() === "powershell.exe") processHelpers++; return originalSpawn(...args); };',
+      `const connection = new McpConnection('custom-tree', { kind: 'stdio', command: ${JSON.stringify(mode === 'cmd' ? shimPath : process.env.ORKAS_TEST_NODE)}, args: ${JSON.stringify(mode === 'cmd' ? [] : [serverPath])}, env: {} });`,
+      ...(mode === 'failed-initialize' ? [
+        'const realSetTimeout = global.setTimeout;',
+        'global.setTimeout = (fn, ms, ...args) => realSetTimeout(fn, ms === 30000 ? 1500 : ms, ...args);',
+      ] : []),
+      '(async () => {',
+      '  let processSnapshot;',
+      '  try {',
+      ...(mode === 'app-late-connection' ? [
+        `  processSnapshot = await require(${JSON.stringify(path.resolve('src/main/util/windows-shutdown-processes.ts'))}).captureWindowsShutdownProcesses();`,
+      ] : []),
+      '  const connecting = connection.connect().then(() => false, () => true);',
+      `  const deadline = Date.now() + 3000; while (!require('node:fs').existsSync(${JSON.stringify(readyPath)})) { if (Date.now() > deadline) throw new Error('fixture not ready'); await new Promise(resolve => setTimeout(resolve, 20)); }`,
+      '  let wasLocked = false;',
+      `  try { require('node:fs').renameSync(${JSON.stringify(replacementPath)}, ${JSON.stringify(lockPath)}); } catch (error) { wasLocked = error.code === 'EPERM'; }`,
+      '  const connectFailed = await connecting;',
+      '  let sharedClose = false;',
+      '  const close = async () => { const first = connection.close(); const second = connection.close(); sharedClose = connectFailed || first === second; await Promise.all([first, second]); };',
+      ...(mode.startsWith('app-') || mode === 'shared-runtime' ? [
+        `  const { captureWindowsShutdownProcesses } = require(${JSON.stringify(path.resolve('src/main/util/windows-shutdown-processes.ts'))});`,
+        `  const { createShutdownCoordinator } = require(${JSON.stringify(path.resolve('src/main/util/shutdown.ts'))});`,
+        '  const shutdown = createShutdownCoordinator({ captureProcesses: () => processSnapshot || captureWindowsShutdownProcesses(), localTasks: [{ name: "connectors", run: close }], sync: async () => {}, onFailure: name => { throw new Error(name); } });',
+        '  await shutdown.prepare();',
+      ] : ['  await close();']),
+      `  const pid = Number(require('node:fs').readFileSync(${JSON.stringify(pidPath)}, 'utf8'));`,
+      '  let alive = false; try { process.kill(pid, 0); alive = true; } catch {}',
+      // The outer test represents another host. In shared-runtime mode it
+      // executes the exact locked binary and must survive app cleanup.
+      `  let unrelatedAlive = false; try { process.kill(${unrelated.pid}, 0); unrelatedAlive = true; } catch {}`,
+      '  let replaced = false;',
+      `  try { require('node:fs').renameSync(${JSON.stringify(replacementPath)}, ${JSON.stringify(lockPath)}); replaced = true; } catch {}`,
+      '  process.stdout.write(JSON.stringify({ wasLocked, alive, replaced, unrelatedAlive, connectFailed, sharedClose, warnings, processHelpers }));',
+      '  } finally { await connection.close(); processSnapshot?.dispose(); }',
+      '})().catch(error => { process.stderr.write(error.name); process.exitCode = 1; });',
+    ].join('\n'));
+    try {
+      await vi.waitFor(() => expect(fs.existsSync(foreignReadyPath)).toBe(true), { timeout: 3000, interval: 20 });
+      const result = spawnSync(process.execPath, ['-r', require.resolve('tsx/cjs'), probePath], {
+        cwd: root, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', ORKAS_WORKSPACE_ROOT: root },
+        encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024,
+      });
+      expect(result.status, result.stderr || result.stdout).toBe(0);
+      expect(result.stderr).toBe('');
+      const { processHelpers, ...outcome } = JSON.parse(result.stdout);
+      expect(outcome).toEqual({
+        wasLocked: true, alive: false, replaced: mode !== 'shared-runtime', unrelatedAlive: true,
+        connectFailed: mode === 'failed-initialize', sharedClose: true,
+        warnings: mode === 'failed-initialize' ? ['connect failed'] : [],
+      });
+      expect(processHelpers, 'only a connection created after the app snapshot needs another snapshot')
+        .toBeLessThanOrEqual(mode === 'app-late-connection' ? 2 : 1);
+      if (mode === 'shared-runtime') {
+        // Only the external host can release its remaining lock. Orkas must
+        // neither kill that host nor report the shared binary as replaceable.
+        unrelated.kill();
+        await unrelatedClosed;
+        fs.renameSync(replacementPath, lockPath);
+      }
+      expect(fs.readFileSync(lockPath, 'utf8')).toBe('new runtime');
+    } finally {
+      if (unrelated.exitCode === null && unrelated.signalCode === null) unrelated.kill();
+      await unrelatedClosed;
+      if (fs.existsSync(pidPath)) {
+        const pid = Number(fs.readFileSync(pidPath, 'utf8'));
+        try { process.kill(pid, 'SIGKILL'); } catch {}
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  }, 20000);
+
   it.each(['complete', 'cycle', 'failure', 'cancel', 'deadline'])('collects paged tools atomically through the real SDK: %s', mode => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mcp-pages-'));
     const childPath = path.join(root, 'server.cjs');
@@ -63,7 +313,14 @@ describe('MCP stdio diagnostic boundary', () => {
         expect(pages).toEqual([null, 'page-2', 'page-3']);
       } else {
         expect(outcome.failed).toBe(true); expect(outcome).not.toHaveProperty('tools');
-        expect(pages).toEqual([null, 'page-2']);
+        if (mode === 'deadline') {
+          // The 300ms operation budget covers two 180ms page delays. A busy
+          // host can expire on the first page; it must never complete all three
+          // or publish the partial catalog. Receipt of page two is not promised.
+          expect(pages.length).toBeGreaterThanOrEqual(1);
+          expect(pages.length).toBeLessThanOrEqual(2);
+          expect(pages).toEqual([null, 'page-2'].slice(0, pages.length));
+        } else expect(pages).toEqual([null, 'page-2']);
         if (mode === 'cycle') expect(outcome.message).toContain('repeated a pagination cursor');
         if (mode === 'failure') expect(outcome.message).toContain('fixture page failed');
         if (mode === 'deadline') expect(outcome.message).toMatch(/timed out/i);

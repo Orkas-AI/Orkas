@@ -40,6 +40,7 @@ export async function withOperationTimeout<T>(
     timeoutMs: number;
     code: string;
     stage: string;
+    signal?: AbortSignal;
     onLateSettlement?: (operation: Promise<T>) => void | Promise<void>;
   },
 ): Promise<T> {
@@ -48,6 +49,11 @@ export async function withOperationTimeout<T>(
   }
   let timer: NodeJS.Timeout | null = null;
   let timedOut = false;
+  const abort = (): void => abortReject(opts.signal?.reason || new Error('operation cancelled'));
+  let abortReject!: (reason: unknown) => void;
+  const cancelled = new Promise<never>((_resolve, reject) => { abortReject = reject; });
+  opts.signal?.addEventListener('abort', abort, { once: true });
+  if (opts.signal?.aborted) abort();
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       timedOut = true;
@@ -56,9 +62,10 @@ export async function withOperationTimeout<T>(
     timer.unref?.();
   });
   try {
-    return await Promise.race([operation, timeout]);
+    return await Promise.race([operation, timeout, cancelled]);
   } finally {
     if (timer) clearTimeout(timer);
+    opts.signal?.removeEventListener('abort', abort);
     if (timedOut && opts.onLateSettlement) {
       // Recovery bookkeeping must never replace or delay the stable timeout
       // seen by the queue. Observe both synchronous and asynchronous callback

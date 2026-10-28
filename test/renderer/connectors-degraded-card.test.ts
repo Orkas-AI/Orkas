@@ -2348,3 +2348,73 @@ describe('explicit connector failure codes', () => {
     if (error.code === 'storage_unavailable') expect(context.__alerts[0]).toBe(context.t('connectors.errors.storage_unavailable'));
   });
 });
+
+describe('first custom OAuth connection owns launch feedback', () => {
+  it.each([false, true])('keeps the accepted add busy, handles a synchronous close callback=%s, and rejects superseded results', async callbackOnClose => {
+    const entry = { id: 'custom-owned', display_name: 'Owned test connector', _custom: true };
+    const instance = { id: entry.id, origin: 'custom', custom_auth_mode: 'oauth', status: { kind: 'connecting' } };
+    let retries = 0;
+    const invoke = vi.fn(async channel => {
+      if (channel === 'connectors.add_custom') return { ok: true, instance, started: true, attempt_id: 'add-first' };
+      if (channel === 'connectors.authorize_custom') return { ok: true, started: true, attempt_id: `retry-${++retries}` };
+      return { ok: true };
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+    ctx.loadConnectors = vi.fn(async () => {});
+    const handlers = new Map<string, () => Promise<void>>();
+    const control = (key: string, value = '') => ({
+      value, style: {}, disabled: false, textContent: '', focus: vi.fn(),
+      addEventListener: (event: string, handler: () => Promise<void>) => handlers.set(`${key}:${event}`, handler),
+    });
+    const fields = new Map([
+      ['kind', control('kind', 'streamable-http')], ['auth_mode', control('auth_mode', 'oauth')],
+      ['name', control('name', entry.display_name)], ['url', control('url', 'https://connector.example/mcp')],
+      ['headers', control('headers')],
+    ]);
+    const submit = control('submit');
+    const overlay: any = { innerHTML: '', querySelector: (selector: string) => {
+      const field = selector.match(/^\[data-f="([^"]+)"\]$/)?.[1];
+      if (field) return fields.get(field);
+      if (selector === '[data-act="ok"]') return submit;
+      return control(selector);
+    }, remove: vi.fn(() => {
+      if (callbackOnClose) ctx.__emitPush('connectors:oauth-callback', { attempt_id: 'add-first', catalog_id: entry.id });
+    }) };
+    const createElement = ctx.document.createElement;
+    ctx.document.createElement = () => overlay;
+    ctx._openAddCustomDialog();
+    expect(overlay.innerHTML).toContain('data-act="ok"');
+    await handlers.get('submit:click')!();
+    ctx.document.createElement = createElement;
+    expect(overlay.remove).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('connectors.add_custom', {
+      display_name: entry.display_name, auth_mode: 'oauth',
+      transport: { kind: 'streamable-http', url: 'https://connector.example/mcp', headers: {} },
+    });
+    const card = () => ctx._renderCatalogCard(entry, instance).innerHTML;
+    expect(card()).toContain('is-loading');
+    expect(card()).toContain('disabled');
+    await ctx._authorizeCustom(entry, instance);
+    expect(retries).toBe(0);
+    ctx.__advanceTimers(2000);
+    if (callbackOnClose) {
+      await ctx._authorizeCustom(entry, instance);
+      expect(retries).toBe(0);
+      ctx.__emitPush('connectors:oauth-result', { attempt_id: 'add-first', catalog_id: entry.id, result: 'success' });
+    } else {
+      // No callback yet: an explicit retry after the throttle owns a new launch.
+      await ctx._authorizeCustom(entry, instance);
+      expect(retries).toBe(1);
+      ctx.__emitPush('connectors:oauth-result', { attempt_id: 'add-first', catalog_id: entry.id, result: 'cancelled', code: 'superseded' });
+      expect(card()).toContain('is-loading');
+      ctx.__emitPush('connectors:oauth-callback', { attempt_id: 'retry-1', catalog_id: entry.id });
+      ctx.__advanceTimers(2000);
+      await ctx._authorizeCustom(entry, instance);
+      expect(retries).toBe(1);
+      ctx.__emitPush('connectors:oauth-result', { attempt_id: 'retry-1', catalog_id: entry.id, result: 'success' });
+    }
+    expect(card()).not.toContain('is-loading');
+    expect(ctx.__alerts).toEqual([]);
+    expect(invoke.mock.calls.some(([channel]) => channel === 'connectors.cancel_oauth')).toBe(false);
+  });
+});

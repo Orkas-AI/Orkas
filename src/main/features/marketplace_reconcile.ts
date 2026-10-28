@@ -42,6 +42,7 @@ import { withMarketplaceInstallLock } from './marketplace_locks';
 import { agentPrivateSkillIdsFromBundle } from './marketplace_private_skills';
 import { downloadMarketplaceBundle, parseMarketplaceBundle } from './marketplace_bundle';
 import { createLogger } from '../logger';
+import { logErrorSummary, logPathRef } from '../util/log-redact';
 import { createMarketplaceCatalogReader, type MarketplaceCatalogReader, type MarketplaceCatalogRow } from './marketplace_catalog';
 import { fetchWithRetry } from '../util/retry';
 import { replaceDirectoryAtomically, sweepStaleReplacementArtifacts } from '../util/atomic-directory-replace';
@@ -466,13 +467,13 @@ export async function reconcileInstalls(
   try { _assertContinue(opts); } catch {
     return _emptyReconcileResult();
   }
-  // Staging/backup directories of an install that died mid-flight start with
-  // a dot, so the listings below never saw them and nothing reclaimed them.
+  // Reclaim abandoned staging; previous copies need positive commit evidence
+  // before they can be discarded, even when a target directory also exists.
   for (const root of [userMarketplaceAgentsDir(uid), userMarketplaceSkillsDir(uid)]) {
     const removed = await sweepStaleReplacementArtifacts(root, (err, artifact) => {
       log.warn('stale install artifact cleanup failed', {
-        artifact: path.basename(artifact),
-        error: (err as Error).message,
+        artifact: logPathRef(artifact),
+        error: logErrorSummary(err),
       });
     });
     if (removed.length) log.info(`swept ${removed.length} stale install artifact(s) under ${path.basename(root)}`);

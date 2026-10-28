@@ -16,7 +16,8 @@ export interface SearchFileHit {
  * JSON escaping preserves filenames that contain delimiters or newlines. */
 export function formatSearchFileResults(
   hits: readonly SearchFileHit[],
-  filesystemPaths: Pick<typeof path, 'relative'> = path,
+  filesystemPaths: Pick<typeof path, 'relative' | 'isAbsolute' | 'sep'> = path,
+  workingDir?: string,
 ): string {
   const roots: string[] = [];
   const rootIndexes = new Map<string, number>();
@@ -28,10 +29,18 @@ export function formatSearchFileResults(
       roots.push(hit.root);
     }
     // Logical Skill addresses always use '/', including on Windows hosts.
-    const paths = hit.root.startsWith('@skill/') ? path.posix : filesystemPaths;
+    const skillPath = hit.root.startsWith('@skill/');
+    const paths = skillPath ? path.posix : filesystemPaths;
+    let readPath = hit.path;
+    if (!skillPath && workingDir) {
+      const relative = filesystemPaths.relative(workingDir, hit.path);
+      if (relative !== '..' && !relative.startsWith(`..${filesystemPaths.sep}`)
+          && !filesystemPaths.isAbsolute(relative)) readPath = relative || '.';
+    }
     return JSON.stringify({
       root,
       path: paths.relative(hit.root, hit.path),
+      read_path: readPath,
       name: hit.name,
       size: hit.size,
       mtime: new Date(hit.mtime).toISOString(),
@@ -39,6 +48,6 @@ export function formatSearchFileResults(
       ...(hit.totalChars !== undefined ? { total_chars: hit.totalChars } : {}),
     });
   });
-  return 'File paths are relative to roots[file.root] (zero-based); join the root and path to read a file.\n'
+  return 'Use files[].read_path directly for file tools. files[].path is relative to roots[file.root] (zero-based).\n'
     + `{"roots":${JSON.stringify(roots)},"files":[\n${files.join(',\n')}\n]}`;
 }

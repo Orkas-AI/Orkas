@@ -29,6 +29,16 @@ export type GitHubRepositoryResource = {
   owner: string;
   repo: string;
   canonicalUrl: string;
+  /** Only the exact default API endpoints are represented by a root snapshot. */
+  snapshotComponent?: "metadata" | "readme";
+};
+
+type GitHubSnapshotComponent = { ok: true } | { ok: false; error: string };
+
+/** Component facts stay in the run cache, outside the model-visible result. */
+export type GitHubRepositorySnapshot = {
+  result: ToolResult;
+  components: Record<"metadata" | "readme", GitHubSnapshotComponent>;
 };
 
 function safePathPart(value: string): string | null {
@@ -84,6 +94,10 @@ export function identifyGitHubRepositoryResource(rawUrl: string): GitHubReposito
     owner,
     repo,
     canonicalUrl: `https://github.com/${owner}/${repo}`,
+    ...(parsed.origin === "https://api.github.com" && !parsed.search && !parsed.username && !parsed.password
+      && kind !== "repository"
+      && parsed.pathname === `/repos/${ownerPart}/${repoPart}${kind === "readme" ? "/readme" : ""}`
+      ? { snapshotComponent: kind } : {}),
   };
 }
 
@@ -316,8 +330,15 @@ export function renderGitHubSnapshotView(
 export async function fetchGitHubRepositorySnapshot(
   resource: GitHubRepositoryResource,
   signal?: AbortSignal,
-): Promise<ToolResult> {
-  const cancelled = (): ToolResult => ({
+): Promise<GitHubRepositorySnapshot> {
+  const failed = (result: ToolResult): GitHubRepositorySnapshot => ({
+    result,
+    components: {
+      metadata: { ok: false, error: result.content },
+      readme: { ok: false, error: result.content },
+    },
+  });
+  const cancelled = (): GitHubRepositorySnapshot => failed({
     content: `Fetch of ${resource.canonicalUrl} was cancelled`,
     isError: true,
   });
@@ -352,12 +373,18 @@ export async function fetchGitHubRepositorySnapshot(
 
     if ("error" in metadataBody && "error" in readmeBody) {
       return {
-        content: [
-          `Error fetching structured GitHub repository snapshot for ${resource.canonicalUrl}`,
-          `Metadata: ${metadataBody.error}`,
-          `README: ${readmeBody.error}`,
-        ].join("\n"),
-        isError: true,
+        result: {
+          content: [
+            `Error fetching structured GitHub repository snapshot for ${resource.canonicalUrl}`,
+            `Metadata: ${metadataBody.error}`,
+            `README: ${readmeBody.error}`,
+          ].join("\n"),
+          isError: true,
+        },
+        components: {
+          metadata: { ok: false, error: metadataBody.error },
+          readme: { ok: false, error: readmeBody.error },
+        },
       };
     }
 
@@ -365,7 +392,12 @@ export async function fetchGitHubRepositorySnapshot(
     let metadataWarning: string | null = null;
     if ("raw" in metadataBody) {
       try {
-        metadata = JSON.parse(metadataBody.raw) as GitHubMetadata;
+        const decoded: unknown = JSON.parse(metadataBody.raw);
+        if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+          metadataWarning = "GitHub metadata response was not a JSON object";
+        } else {
+          metadata = decoded as GitHubMetadata;
+        }
       } catch {
         metadataWarning = "GitHub metadata response was not valid JSON";
       }
@@ -388,6 +420,7 @@ export async function fetchGitHubRepositorySnapshot(
       // Keep the complete README in the run-cached result. web_fetch fits it
       // into each call's maxChars and serves later windows by offset.
       readme = normalizeGitHubReadme(readme);
+      if (!readme) readmeWarning = "GitHub README response was empty";
     } else {
       readmeWarning = readmeBody.error;
     }
@@ -401,46 +434,53 @@ export async function fetchGitHubRepositorySnapshot(
       ...(readmeWarning ? [`- README unavailable: ${readmeWarning}`] : []),
     ];
     return {
-      content: [
-        `Title: ${metadataValue(metadata.full_name)}`,
-        `URL: ${resource.canonicalUrl}`,
-        `Accessed at: ${new Date().toISOString()}`,
-        "Source type: structured GitHub repository snapshot",
-        `GitHub metadata API: ${metadataUrl}`,
-        `GitHub README API: ${readmeUrl}`,
-        "",
-        "Repository metadata (authoritative GitHub API values at access time):",
-        `- Full name: ${metadataValue(metadata.full_name)}`,
-        `- Description: ${metadataValue(metadata.description)}`,
-        `- License name: ${metadataValue(license?.name)}`,
-        `- License SPDX ID: ${metadataValue(license?.spdx_id)}`,
-        `- License API URL: ${metadataValue(license?.url)}`,
-        `- Created at: ${metadataValue(metadata.created_at)}`,
-        `- Updated at: ${metadataValue(metadata.updated_at)}`,
-        `- Pushed at: ${metadataValue(metadata.pushed_at)}`,
-        `- Archived: ${metadataValue(metadata.archived)}`,
-        `- Fork: ${metadataValue(metadata.fork)}`,
-        `- Default branch: ${metadataValue(metadata.default_branch)}`,
-        `- Stars: ${metadataValue(metadata.stargazers_count)}`,
-        `- Forks: ${metadataValue(metadata.forks_count)}`,
-        `- Open issues: ${metadataValue(metadata.open_issues_count)}`,
-        `- Homepage: ${metadataValue(metadata.homepage)}`,
-        `- Topics: ${topics || "Not provided"}`,
-        ...(warnings.length ? ["", "Snapshot warnings:", ...warnings] : []),
-        "",
-        GITHUB_README_MARKER,
-        readme || "README unavailable; do not infer README-backed claims.",
-      ].join("\n"),
+      components: {
+        metadata: metadataWarning ? { ok: false, error: metadataWarning } : { ok: true },
+        readme: readmeWarning ? { ok: false, error: readmeWarning } : { ok: true },
+      },
+      result: {
+        ...(metadataWarning && readmeWarning ? { isError: true } : {}),
+        content: [
+          `Title: ${metadataValue(metadata.full_name)}`,
+          `URL: ${resource.canonicalUrl}`,
+          `Accessed at: ${new Date().toISOString()}`,
+          "Source type: structured GitHub repository snapshot",
+          `GitHub metadata API: ${metadataUrl}`,
+          `GitHub README API: ${readmeUrl}`,
+          "",
+          "Repository metadata (authoritative GitHub API values at access time):",
+          `- Full name: ${metadataValue(metadata.full_name)}`,
+          `- Description: ${metadataValue(metadata.description)}`,
+          `- License name: ${metadataValue(license?.name)}`,
+          `- License SPDX ID: ${metadataValue(license?.spdx_id)}`,
+          `- License API URL: ${metadataValue(license?.url)}`,
+          `- Created at: ${metadataValue(metadata.created_at)}`,
+          `- Updated at: ${metadataValue(metadata.updated_at)}`,
+          `- Pushed at: ${metadataValue(metadata.pushed_at)}`,
+          `- Archived: ${metadataValue(metadata.archived)}`,
+          `- Fork: ${metadataValue(metadata.fork)}`,
+          `- Default branch: ${metadataValue(metadata.default_branch)}`,
+          `- Stars: ${metadataValue(metadata.stargazers_count)}`,
+          `- Forks: ${metadataValue(metadata.forks_count)}`,
+          `- Open issues: ${metadataValue(metadata.open_issues_count)}`,
+          `- Homepage: ${metadataValue(metadata.homepage)}`,
+          `- Topics: ${topics || "Not provided"}`,
+          ...(warnings.length ? ["", "Snapshot warnings:", ...warnings] : []),
+          "",
+          GITHUB_README_MARKER,
+          readme || "README unavailable; do not infer README-backed claims.",
+        ].join("\n"),
+      },
     };
   } catch (error) {
     if (signal?.aborted) return cancelled();
     const message = error instanceof Error ? error.message : String(error);
-    return {
+    return failed({
       content: message.includes("abort")
         ? `Timeout fetching structured GitHub repository snapshot (${DEFAULT_WEB_FETCH_TIMEOUT_MS}ms)`
         : `Error fetching structured GitHub repository snapshot: ${message}`,
       isError: true,
-    };
+    });
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", onAbort);
@@ -450,11 +490,12 @@ export async function fetchGitHubRepositorySnapshot(
 }
 
 export function compactGitHubSnapshotReplay(resource: GitHubRepositoryResource): ToolResult {
+  const component = resource.snapshotComponent === "metadata" ? "metadata" : "README";
   return {
     content: [
-      "GITHUB_REPOSITORY_SNAPSHOT_CACHE_HIT: this repository's metadata and README were already fetched in this run; no network request was made.",
+      `GITHUB_REPOSITORY_SNAPSHOT_CACHE_HIT: this repository's requested ${component} was already fetched in this run; no network request was made.`,
       `URL: ${resource.canonicalUrl}`,
-      "Use the earlier structured repository snapshot and durable evidence ledger. Do not fetch a GitHub HTML/API/README alias again; to read more of the README, call web_fetch on the repository URL with the offset its snapshot reported.",
+      "Use the earlier structured repository snapshot and durable evidence ledger. To read more of the snapshot, call web_fetch on the repository URL with the offset it reported.",
     ].join("\n"),
   };
 }

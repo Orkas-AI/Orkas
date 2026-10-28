@@ -203,10 +203,10 @@ vi.mock('../../../../src/main/model/client', () => ({
     if (isCommanderTurn && steerDispatchIndex >= 0) {
       const data = JSON.parse(Buffer.from(message.slice(steerDispatchIndex + steerDispatchMarker.length)
         .split(/\s/, 1)[0], 'base64').toString('utf8'));
-      const tool = _opts.extraTools.find((candidate: any) => candidate.name === 'dispatch_to');
+      const tool = _opts.extraTools.find((candidate: any) => candidate.name === (data.tool || 'dispatch_to'));
       const result = await tool.execute({ to: AGENT_NAME, message: data.task }, { signal: _opts.abortSignal });
       streamProbe.dispatchResults.push(String(result?.content || ''));
-      yield { type: 'final', text: 'Commander received the CLI result.' };
+      yield { type: 'final', text: data.tool === 'hand_off_to' ? '' : 'Commander received the CLI result.' };
       yield { type: 'done' };
       return;
     }
@@ -289,6 +289,7 @@ vi.mock('../../../../src/main/model/client', () => ({
       const encoded = message.slice(publishedIdx + publishedMarker.length).split(/\s/, 1)[0];
       const data = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
       for (const p of data.paths || []) await _opts?.onFileWritten?.(p);
+      if (data.holdAfterWrite && streamProbe.slowGate) await streamProbe.slowGate;
       const publications = Array.isArray(data.publications)
         ? data.publications
         : [data.published || []];
@@ -2460,6 +2461,79 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     }
   });
 
+  it('finalizes only the visible terminal deliverable, leaving supporting files untouched', async () => {
+    const hooks = await import('../../../../src/main/features/produced_output_hooks');
+    const finalized: string[] = [];
+    const unregister = hooks.registerProducedOutputHooks({
+      finalizeFile: async (file) => { finalized.push(file); },
+    });
+    let sourcePath = '';
+    let previewPath = '';
+    let finalPath = '';
+    try {
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const cid = 'cid-produced-finalization';
+      sourcePath = path.join(tmpDir, 'workspace', 'report.md');
+      previewPath = path.join(tmpDir, 'workspace', 'preview-cover.png');
+      finalPath = path.join(tmpDir, 'workspace', 'report.pdf');
+      for (const [file, body] of [
+        [sourcePath, '# source'],
+        [previewPath, 'preview'],
+        [finalPath, 'pdf'],
+      ] as const) {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, body);
+      }
+
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: `PRODUCED_FILTER_TEST:${Buffer.from(JSON.stringify({
+          paths: [sourcePath, previewPath, finalPath],
+        })).toString('base64')}`,
+      });
+      await waitForQuiescent(TEST_UID, cid);
+
+      expect(finalized).toEqual([finalPath]);
+      expect(fs.readFileSync(sourcePath, 'utf8')).toBe('# source');
+      expect(fs.readFileSync(previewPath, 'utf8')).toBe('preview');
+
+      expect(fs.readFileSync(finalPath, 'utf8')).toBe('pdf');
+    } finally {
+      unregister();
+    }
+  });
+
+  it('keeps a generated audio file out of the composer while its producing turn is still running', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const attachments = await import('../../../../src/main/features/chat_attachments');
+    const layout = await import('../../../../src/main/util/project-layout');
+    const cid = 'cid-live-generated-audio';
+    const audio = path.join(layout.chatAttachmentDirForConversation(TEST_UID, cid), 'narration.mp3');
+    fs.mkdirSync(path.dirname(audio), { recursive: true });
+    fs.writeFileSync(audio, 'generated audio bytes');
+    let release!: () => void;
+    streamProbe.slowGate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user',
+        text: `PUBLISHED_OUTPUT_TEST:${Buffer.from(JSON.stringify({
+          paths: [audio], published: [], holdAfterWrite: true,
+        })).toString('base64')}`,
+      });
+      await vi.waitFor(() => expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(audio)).toBe(true));
+      await vi.waitFor(() => expect(attachments.listPendingAttachments(TEST_UID, cid)).toEqual([]));
+      expect(attachments.listAttachments(TEST_UID, cid).map(item => item.name)).toEqual(['narration.mp3']);
+    } finally {
+      release();
+      await waitForQuiescent(TEST_UID, cid);
+      streamProbe.slowGate = null;
+    }
+    // Even an intermediate file omitted from the final deliverables remains
+    // an output, never an implicit attachment on the user's next message.
+    expect(attachments.listPendingAttachments(TEST_UID, cid)).toEqual([]);
+  });
+
   it('finalizes explicitly published exported videos on terminal delivery', async () => {
     const hooks = await import('../../../../src/main/features/produced_output_hooks');
     const finalized: string[] = [];
@@ -3128,7 +3202,10 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(rows[1].result_msg_id).toBe(rows[0].result_msg_id);
   });
 
-  it.each(['steered', 'queued_followup', 'unavailable'] as const)('Send now into a Commander-dispatched CLI preserves the task and result when ingress is %s', async (mode) => {
+  it.each([
+    ['dispatch_to', 'steered'], ['dispatch_to', 'queued_followup'], ['dispatch_to', 'unavailable'],
+    ['hand_off_to', 'steered'], ['hand_off_to', 'queued_followup'], ['hand_off_to', 'unavailable'],
+  ] as const)('Send now into a %s CLI preserves the task and result when ingress is %s', async (tool, mode) => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
     const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
@@ -3144,13 +3221,13 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     };
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const board = await import('../../../../src/main/features/group_chat/task_board');
-    const cid = `cid-dispatched-cli-steer-${mode}`;
+    const cid = `cid-${tool}-cli-steer-${mode}`;
     cidsToDrop.add(cid);
     const chats = await import('../../../../src/main/features/chats');
     await chats.createConversation(TEST_UID, { conversationId: cid });
     try {
       await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user',
-        text: `CLI_STEER_DISPATCH_TEST:${Buffer.from(JSON.stringify({ task: 'Implement the CLI feature.' })).toString('base64')}` });
+        text: `CLI_STEER_DISPATCH_TEST:${Buffer.from(JSON.stringify({ tool, task: 'Implement the CLI feature.' })).toString('base64')}` });
       await vi.waitFor(() => expect(cliRunMock.calls).toHaveLength(1));
       expect(bus.runtimeSnapshot(TEST_UID, cid).activeTurns).toEqual([
         expect.objectContaining({ actor: AGENT_ID, steerable: mode !== 'unavailable' }),
@@ -3158,6 +3235,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       const child = (await board.listTasks(TEST_UID, cid)).find(task => task.created_by === 'commander')!;
       await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Discuss the plan first.', forceTo: [AGENT_ID] });
       const queued = (await board.listTasks(TEST_UID, cid)).find(task => task.status === 'queued')!;
+      expect(cliRunMock.submittedSteers).toHaveLength(0);
       const promotion = await bus.sendConversationTaskNow(TEST_UID, cid, queued.task_id);
       if (mode === 'unavailable') {
         expect(promotion).toEqual({ ok: false, error: 'turn_not_steerable' });
@@ -3184,13 +3262,15 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       expect(settledChild).toMatchObject({ status: 'done', instruction: 'Implement the CLI feature.' });
       expect(update.status).toBe('done');
       expect(streamProbe.dispatchResults).toHaveLength(1);
-      expect(streamProbe.dispatchResults[0]).toContain('CLI task result.');
+      expect(streamProbe.dispatchResults[0]).toContain(tool === 'hand_off_to' ? '"ok":true' : 'CLI task result.');
       expect(cliRunMock.calls).toHaveLength(mode === 'steered' ? 1 : 2);
       if (mode === 'steered') expect(update.result_msg_id).toBe(settledChild.result_msg_id);
       else expect(cliRunMock.calls[1].prompt).toContain('Discuss the plan first.');
       const messages = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
         .split('\n').filter(Boolean).map(line => JSON.parse(line));
       expect(messages.filter(message => message.from === 'user' && message.text === 'Discuss the plan first.')).toHaveLength(1);
+      expect(messages.filter(message => message.from === AGENT_ID && message.turn_id === child.turn_id
+        && message.text === 'CLI task result.')).toHaveLength(1);
       expect(loggerMocks.warn).not.toHaveBeenCalled();
     } finally {
       cliRunMock.activeIngress = null;
@@ -3785,6 +3865,8 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const cliWireContext = `${cliRunMock.calls[0].systemPrompt || ''}\n${cliRunMock.calls[0].prompt || ''}`;
     expect(cliWireContext).toContain('COMMANDER_CLI_LEDGER_ROUTE_TEST');
     expect(cliWireContext).toContain('CLI_LEDGER_TASK_TEST');
+    expect(cliRunMock.calls[0].prompt).toContain('Return the result to Commander, who will continue the remaining work.');
+    expect(cliRunMock.calls[0].prompt).not.toContain('completion returns only the conversation floor');
     expect(cliRunMock.calls[0].prompt).not.toContain('<referenced-messages>');
     expect(cliWireContext.match(/COMMANDER_CLI_LEDGER_ROUTE_TEST/g)).toHaveLength(1);
     const resumeInput = streamProbe.messages.find((message) => (
@@ -3840,6 +3922,8 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 
     expect(cliRunMock.calls).toHaveLength(1);
     expect(cliRunMock.calls[0].prompt).toContain('## Return control to commander');
+    expect(cliRunMock.calls[0].prompt).toContain('Deliver the final result to the user; completion returns only the conversation floor to Commander.');
+    expect(cliRunMock.calls[0].prompt).not.toContain('who will continue the remaining work');
     expect(cliRunMock.calls[0].prompt).toContain('Use `<handback reason="completed_handoff" />` only to close this routed interaction.');
     expect(cliRunMock.calls[0].prompt).not.toContain('primary outcome exceeds');
     let floor = await state.readState(TEST_UID, cid);
@@ -5867,6 +5951,76 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 });
 
 describe('group_chat bus › abort', () => {
+  it.each(['commander', 'agent', 'codex'])(
+    'retains the executing %s through terminal persistence so crash recovery keeps its identity', async runtime => {
+      const paths = await import('../../../../src/main/paths');
+      const storage = await import('../../../../src/main/storage');
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const chats = await import('../../../../src/main/features/chats');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const actorId = runtime === 'commander' ? 'commander' : AGENT_ID;
+      if (runtime === 'codex') {
+        const file = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+        const spec = JSON.parse(fs.readFileSync(file, 'utf8'));
+        spec.runtime = { kind: 'cli', cli: 'codex' };
+        fs.writeFileSync(file, JSON.stringify(spec));
+      }
+      const cid = `cid-persist-owner-${runtime}`;
+      cidsToDrop.add(cid);
+      const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+      const originalAppend = storage.appendJsonlAtomic;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let entered = false;
+      const append = vi.spyOn(storage, 'appendJsonlAtomic').mockImplementation(async (...args) => {
+        const row = args[1] as any;
+        if (args[0] === mainFile && row.from === actorId && row.source_message_id) {
+          entered = true;
+          await gate;
+        }
+        return originalAppend(...args);
+      });
+      try {
+        await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', forceTo: [actorId],
+          text: 'NON_CLI_PHASED_TEXT_TEST' });
+        await vi.waitFor(() => expect(entered).toBe(true), { timeout: 5000 });
+        const durable = await state.readState(TEST_UID, cid);
+        expect(bus.runtimeSnapshot(TEST_UID, cid).processing).toBe(true);
+        const input = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map(line => JSON.parse(line)).find(row => row.from === 'user');
+        expect(durable.in_flight_turns?.[actorId]).toMatchObject({
+          source_message_id: input.id, turn_id: expect.any(String),
+        });
+
+        // Replay the actual pre-append disk snapshot under a separate cid:
+        // the recovery fixture supplies no actor that the real run lost.
+        const copy = await chats.createConversation(TEST_UID);
+        cidsToDrop.add(copy.conversation_id);
+        fs.copyFileSync(mainFile, path.join(paths.userChatsDir(TEST_UID), `${copy.conversation_id}.jsonl`));
+        fs.copyFileSync(paths.groupChatMembersFile(TEST_UID, cid), paths.groupChatMembersFile(TEST_UID, copy.conversation_id));
+        fs.writeFileSync(paths.groupChatStateFile(TEST_UID, copy.conversation_id), JSON.stringify({
+          ...durable, last_active_at: new Date(Date.now() - 60_000).toISOString(),
+        }));
+        const journalFile = paths.userRunningConversationsFile(TEST_UID);
+        const journal = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
+        journal.items.push({ conversation_id: copy.conversation_id });
+        fs.writeFileSync(journalFile, JSON.stringify(journal));
+        expect((await chats.sweepStaleProcessing(TEST_UID)).swept).toBe(1);
+        const recovered = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${copy.conversation_id}.jsonl`), 'utf8')
+          .trim().split('\n').map(line => JSON.parse(line));
+        expect(recovered.at(-1)).toMatchObject({ from: actorId, system_kind: 'reply_interrupted', ...durable.in_flight_turns?.[actorId] });
+        expect(durable.in_flight).toEqual([actorId]);
+      } finally {
+        release();
+        await waitForQuiescent(TEST_UID, cid, 5000);
+        append.mockRestore();
+      }
+      expect((await state.readState(TEST_UID, cid)).in_flight).toEqual([]);
+      expect((await state.readState(TEST_UID, cid)).in_flight_turns).toBeUndefined();
+      const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(rows.filter(row => row.from === actorId && row.source_message_id)).toHaveLength(1);
+    },
+  );
+
   it('flips state.json to aborted + clears the queue', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const state = await import('../../../../src/main/features/group_chat/state');
@@ -6352,7 +6506,7 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
     expect(streamProbe.messages.join('\n')).not.toContain('message that must never send');
   });
 
-  it('board send-now persists the queued message at the fold and absorbs its row', async () => {
+  it('board send-now publishes the sent message before model acceptance and later settles its row', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const taskBoard = await import('../../../../src/main/features/group_chat/task_board');
     const cid = 'cid-deferred-send-now';
@@ -6369,9 +6523,15 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
 
       const res = await bus.sendConversationTaskNow(TEST_UID, cid, queued!.task_id);
       expect(res).toMatchObject({ ok: true });
-      // Send-now IS the start of execution (D21): the message persists right
-      // here, while the live turn is still running. The board row survives as
-      // the durable record and settles through the absorbed/leftover path.
+      expect(res).toMatchObject({
+        message: { id: queued!.source_msg_id, from: 'user', text: 'fold me into the live turn' },
+        task: { task_id: queued!.task_id, status: 'queued', message_sent_at: expect.any(String) },
+      });
+      const sent = (await taskBoard.listTasks(TEST_UID, cid)).find(t => t.task_id === queued!.task_id)!;
+      expect(sent.message_sent_at).toBeTruthy();
+      expect(sent.absorbed_into_turn_id).toBeUndefined();
+      // Sending persists the bubble while the model is still held. It does
+      // not claim that the runtime consumed the update or started another turn.
       expect(await userRows(cid)).toEqual([
         'DEFERRED_SLOW_TURN_TEST live',
         'fold me into the live turn',
@@ -6391,6 +6551,37 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
     const settled = await taskBoard.listTasks(TEST_UID, cid);
     const promoted = settled.find((t) => t.instruction === 'fold me into the live turn');
     expect(['done', 'stopped', 'failed', 'cancelled']).toContain(promoted?.status);
+  });
+
+  it('keeps a send-now row unsent when message persistence fails', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const taskBoard = await import('../../../../src/main/features/group_chat/task_board');
+    const storage = await import('../../../../src/main/storage');
+    const cid = 'cid-send-now-persist-failure';
+    cidsToDrop.add(cid);
+    let release: () => void = () => {};
+    streamProbe.slowGate = new Promise<void>((resolve) => { release = resolve; });
+    let append: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'DEFERRED_SLOW_TURN_TEST live' });
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Unsent correction' });
+      const queued = (await taskBoard.listTasks(TEST_UID, cid)).find(t => t.status === 'queued')!;
+      append = vi.spyOn(storage, 'appendJsonlAtomic').mockRejectedValueOnce(new Error('injected history failure'));
+      expect(await bus.sendConversationTaskNow(TEST_UID, cid, queued.task_id))
+        .toMatchObject({ ok: false, error: 'persist_failed' });
+      const retained = (await taskBoard.listTasks(TEST_UID, cid)).find(t => t.task_id === queued.task_id)!;
+      expect(retained.status).toBe('queued');
+      expect(retained.message_sent_at).toBeUndefined();
+      expect(retained.absorbed_into_turn_id).toBeUndefined();
+      expect(await userRows(cid)).toEqual(['DEFERRED_SLOW_TURN_TEST live']);
+      expect(loggerMocks.warn).toHaveBeenCalledWith('task send-now persist failed', expect.any(Object));
+      await bus.cancelConversationTask(TEST_UID, cid, queued.task_id);
+    } finally {
+      append?.mockRestore();
+      release();
+      streamProbe.slowGate = null;
+    }
+    await waitForQuiescent(TEST_UID, cid, 5000);
   });
 
   it('creates no task when a planned send cannot persist its message', async () => {

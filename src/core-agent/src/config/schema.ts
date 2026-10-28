@@ -61,22 +61,22 @@ export const EvolutionConfigSchema = z.object({
   /** Maximum SKILL.md content length in characters. */
   maxSkillContentLength: z.number().int().positive().default(100_000),
   /** Metacognition subsystem. */
-  metacognition: MetacognitionConfigSchema.default({}),
+  metacognition: MetacognitionConfigSchema.prefault({}),
 });
 
 /** Top-level core-agent configuration schema. */
 export const CoreAgentConfigSchema = z.object({
-  agent: AgentConfigSchema.default({}),
+  agent: AgentConfigSchema.prefault({}),
   models: z
     .object({
-      providers: z.record(z.string(), ProviderConfigSchema).default({}),
-      catalog: z.record(z.string(), ModelConfigSchema).default({}),
+      providers: z.record(z.string(), ProviderConfigSchema).prefault({}),
+      catalog: z.record(z.string(), ModelConfigSchema).prefault({}),
     })
-    .default({}),
+    .prefault({}),
   // The `memory` retrieval-engine section was removed with the unwired
   // OpenClaw-ported engine (2026-08-16); the non-strict schema strips the key
   // from older config files.
-  evolution: EvolutionConfigSchema.default({}),
+  evolution: EvolutionConfigSchema.prefault({}),
 });
 
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;

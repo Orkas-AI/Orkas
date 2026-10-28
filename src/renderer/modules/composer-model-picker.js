@@ -4,6 +4,7 @@
 // remain owned by Settings > Models.
 
 let _composerModelEntries = [];
+let _composerModelEntriesEpoch = 0;
 let _composerModelMenu = null;
 let _composerModelOpening = null;
 let _composerModelBusy = false;
@@ -193,11 +194,10 @@ function _renderComposerModelChips() {
 }
 
 async function _refreshComposerModelEntries() {
+  const epoch = ++_composerModelEntriesEpoch;
   try {
     const res = await window.orkas.invoke('auth.listComposerEntries');
-    if (res && res.ok && Array.isArray(res.entries)) {
-      // Managed subscription models do not exist in the open-source build.
-      // Keep this boundary defensive so a stale profile cannot surface one.
+    if (epoch === _composerModelEntriesEpoch && res && res.ok && Array.isArray(res.entries)) {
       _composerModelEntries = res.entries.filter((entry) => entry && entry.profileType !== 'managed');
     }
   } catch (_) {
@@ -369,8 +369,16 @@ function _openComposerModelVersionMenu(owner, versionMenu, { focusFirst = false 
 }
 
 async function _selectComposerModel(entry) {
-  if (_composerModelBusy || !entry || !entry.entryId) return;
+  if (_composerModelBusy || !entry || !entry.entryId || entry.selectable === false) return;
   const requestedModel = String(entry.model || '').trim();
+  const activeEntry = _composerModelEntries.find((candidate) => (
+    candidate && candidate.selectable !== false
+  ));
+  if (
+    activeEntry
+    && activeEntry.entryId === entry.entryId
+    && (!requestedModel || requestedModel === String(activeEntry.model || '').trim())
+  ) return;
   _composerModelBusy = true;
   const previousEntries = _composerModelEntries.slice();
   try {
@@ -519,10 +527,13 @@ function _buildComposerModelMenuItem(entry, activeEntryId, anchor) {
     ? _composerModelEntryLabel(entry)
     : (_composerModelProviderLabel(entry) || _composerModelEntryLabel(entry));
   title.appendChild(titleName);
-  if (official && entry && entry.recommended === true) {
+  const hasSavings = official && entry.model === 'orkas-llm-1.5';
+  if (official && entry && (entry.recommended === true || hasSavings)) {
     const recommended = document.createElement('span');
     recommended.className = 'composer-model-menu-recommended';
-    recommended.textContent = t('new_chat.model_picker.recommended');
+    recommended.textContent = hasSavings
+      ? t('new_chat.model_picker.recommended_with_savings')
+      : t('new_chat.model_picker.recommended');
     title.appendChild(recommended);
   }
   copy.appendChild(title);
@@ -808,6 +819,7 @@ document.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('orkas:model-entries-changed', (event) => {
     const entries = event && event.detail && event.detail.entries;
     if (Array.isArray(entries)) {
+      _composerModelEntriesEpoch += 1;
       _composerModelEntries = entries.filter((entry) => entry && entry.profileType !== 'managed');
       _renderComposerModelChips();
     } else {

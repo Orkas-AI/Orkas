@@ -1,4 +1,5 @@
 import { createShutdownCoordinator } from './util/shutdown';
+import { scheduleChatApiPreload } from './features/model-api-preload';
 /**
  * Orkas — Electron main entry.
  *
@@ -42,6 +43,7 @@ import { installWindowPresentationEvents } from './util/window-presentation';
 import './install-data-root.cjs';
 import { resolveCliCommand } from './features/local_agents/spawn-command';
 import { createOptionalTray } from './util/app-tray';
+import { captureWindowsShutdownProcesses } from './util/windows-shutdown-processes';
 import { desktopPlatform, osVersion, preferredSystemLanguage } from './system_info';
 import {
   hardenedWebPreferences,
@@ -137,6 +139,7 @@ protocol.registerSchemesAsPrivileged([
 import * as paths from './paths';
 import { serveFileRange as serveFileRangeCore } from './util/http-range';
 import {
+  type BootResourceClass,
   configureBootAdmission,
   noteBootUserActivity,
   registerDeferred,
@@ -189,7 +192,7 @@ void installEnvProxyDispatcher();
 import { installFetchDiag } from './model/core-agent/fetch-diag';
 installFetchDiag();
 
-import { hasActiveWork, subscribeTaskTerminals, type TaskTerminalEvent } from './features/group_chat/bus';
+import { hasActiveWork, prepareForShutdown, subscribeTaskTerminals, type TaskTerminalEvent } from './features/group_chat/bus';
 import { setFetchImplementation } from './util/retry';
 setFetchImplementation((input, init) => net.fetch(input as Parameters<typeof net.fetch>[0], init));
 
@@ -209,11 +212,13 @@ import * as reflectionOrchestrator from './features/reflection-orchestrator';
 import * as autoTasks from './features/auto_tasks';
 import * as projectDriverRunner from './features/project_driver_runner';
 import * as projectTasks from './features/project_tasks';
+import * as projects from './features/projects';
 import * as conversationFiling from './features/conversation_filing';
 import * as systemSkills from './features/system_skills';
 import * as bundledContentStartup from './features/bundled_content_startup';
 import * as builtinMarketplaceStartup from './features/builtin_marketplace_startup';
 import type { BuiltinMarketplaceSeedResult } from './features/builtin_marketplace';
+import { createMarketplaceCatalogReader } from './features/marketplace_catalog';
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
 import * as savedApps from './features/saved_apps';
@@ -282,6 +287,8 @@ function emitTaskTerminalToRenderer(event: TaskTerminalEvent): void {
   taskTerminalUi.emit({ type: 'terminal', ...terminal }, ownerUserId);
 }
 
+let modelApiPreloadScheduled = false;
+
 function createWindow(): BrowserWindow {
   const dev = !app.isPackaged;
   const restored = windowState.restoreWindowState();
@@ -324,6 +331,15 @@ function createWindow(): BrowserWindow {
   win.webContents.on('did-finish-load', () => {
     mainRendererReady = true;
     for (const channel of rendererChannels) channel.flush();
+    if (!modelApiPreloadScheduled) {
+      modelApiPreloadScheduled = true;
+      scheduleChatApiPreload(async () => {
+        if (win.isDestroyed() || win.webContents.isDestroyed() || win.webContents.isLoadingMainFrame()) return false;
+        return await win.webContents.executeJavaScript(
+          'document.documentElement.dataset.orkasBootReady === "true"',
+        ) === true;
+      });
+    }
   });
   win.webContents.on('render-process-gone', () => {
     mainRendererReady = false;
@@ -427,7 +443,10 @@ function openConversationFromTaskNotification(
 
 /** `prepareShutdown` is the work a normal quit runs in `before-quit`; exits
  *  that bypass it (`app.exit`) run it themselves. */
-function registerIpc(prepareShutdown: () => Promise<void>): void {
+function registerIpc(
+  prepareShutdown: (mode?: 'quit' | 'relaunch') => Promise<void>,
+  isShutdownQuiescent: () => boolean,
+): void {
   ipc.register();
   // Subscribe before opening the renderer. The deferred driver scheduler must
   // not determine whether foreground or early background writes are visible.
@@ -442,6 +461,14 @@ function registerIpc(prepareShutdown: () => Promise<void>): void {
   });
   conversationFiling.onConversationFilingFailed(({ userId, ...receipt }) => {
     conversationFilingFailure.emit(receipt, userId);
+  });
+  conversationFiling.onConversationProjectRenamed((event) => {
+    if (!users.hasActiveUser() || users.getActiveUserId() !== event.userId) return;
+    ipc.broadcastToRenderer('projects:renamed', event);
+  });
+  projects.onProjectInstructionsChanged((event) => {
+    if (!users.hasActiveUser() || users.getActiveUserId() !== event.uid) return;
+    ipc.broadcastToRenderer('projects:instructions-changed', { projectId: event.projectId });
   });
   conversationTaskBoard.onBacklogExecutionChanged((e) => ipc.broadcastToRenderer('projects:tasks-changed', {
     projectId: e.pid,
@@ -556,6 +583,11 @@ function registerIpc(prepareShutdown: () => Promise<void>): void {
     ipcMain.handle('orkas.relaunch', async () => {
       const isWindows = process.platform === 'win32';
       const script = path.join(paths.PC_ROOT, isWindows ? 'run.cmd' : 'run.sh');
+      try {
+        if (!fs.statSync(script).isFile()) throw new Error('Invalid launcher');
+      } catch {
+        throw Object.assign(new Error('Relaunch could not start'), { code: 'E_RELAUNCH_START_FAILED' });
+      }
       const resolved = isWindows
         ? resolveCliCommand(script, [], process.platform, process.env)
         : { command: 'bash', args: [script], windowsVerbatimArguments: undefined };
@@ -566,17 +598,44 @@ function registerIpc(prepareShutdown: () => Promise<void>): void {
       delete childEnv.ORKAS_WORKSPACE_ROOT;
       delete childEnv.CORE_AGENT_AUTH_DIR;
       childEnv.ORKAS_RELAUNCH_OWNER_PID = String(process.pid);
-      const child = spawn(resolved.command, resolved.args, {
-        cwd: paths.PC_ROOT,
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-        windowsVerbatimArguments: resolved.windowsVerbatimArguments,
-        env: childEnv,
+      const child = await new Promise<ReturnType<typeof spawn>>((resolve, reject) => {
+        const launcher = spawn(resolved.command, resolved.args, {
+          cwd: paths.PC_ROOT,
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+          windowsVerbatimArguments: resolved.windowsVerbatimArguments,
+          env: childEnv,
+        });
+        launcher.once('error', reject);
+        launcher.once('spawn', () => { launcher.unref(); resolve(launcher); });
+      }).catch(() => {
+        throw Object.assign(new Error('Relaunch could not start'), { code: 'E_RELAUNCH_START_FAILED' });
       });
-      child.unref();
       log.info('relaunch via shell script');
-      await prepareShutdown();
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          prepareShutdown('relaunch'),
+          new Promise<void>((resolve, reject) => {
+            // run.sh/run.cmd give this owner 15 seconds to leave. Only bound
+            // local cleanup once critical active-task archival has settled.
+            timer = setTimeout(() => {
+              let quiescent = false;
+              try { quiescent = isShutdownQuiescent(); } catch { /* unknown phase retains the app */ }
+              if (quiescent) resolve();
+              else reject(Object.assign(new Error('Active task archival failed'), {
+                code: 'E_SHUTDOWN_ARCHIVE_FAILED',
+              }));
+            }, 10_000);
+          }),
+        ]);
+      } catch (error) {
+        if (child.exitCode === null && child.signalCode === null) {
+          try { child.kill(); } catch { /* retain the original archival failure */ }
+        }
+        throw error;
+      } finally { if (timer) clearTimeout(timer); }
       app.exit(0);
       return { ok: true };
     });
@@ -760,7 +819,7 @@ async function runBootMaintenanceSweeps(): Promise<void> {
 let marketplaceReconcileStatusSubscribed = false;
 let marketplaceReconcileInFlight: Promise<void> | null = null;
 let marketplaceReconcileInFlightKey = '';
-const marketplaceDefaultsRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const marketplaceDefaultsRetryTasks = new Map<string, ReturnType<typeof scheduleBootBackground>>();
 const marketplaceDefaultsRetryAttempts = new Map<string, number>();
 
 function subscribeMarketplaceReconcileStatus(m: typeof import('./features/marketplace_reconcile')): void {
@@ -797,6 +856,7 @@ function broadcastBuiltinMarketplaceSeedChanged(result: BuiltinMarketplaceSeedRe
     pulled,
     updated_at: Date.now(),
   });
+  ipc.broadcastToRenderer('marketplace:content-changed', {});
 }
 
 async function seedBuiltinMarketplaceForCurrentUser(
@@ -817,14 +877,13 @@ function marketplaceBootContextStillActive(uid: string): boolean {
 }
 
 function clearMarketplaceDefaultsRetry(runKey: string): void {
-  const timer = marketplaceDefaultsRetryTimers.get(runKey);
-  if (timer) clearTimeout(timer);
-  marketplaceDefaultsRetryTimers.delete(runKey);
+  marketplaceDefaultsRetryTasks.get(runKey)?.cancel();
+  marketplaceDefaultsRetryTasks.delete(runKey);
   marketplaceDefaultsRetryAttempts.delete(runKey);
 }
 
 function scheduleMarketplaceDefaultsRetry(runKey: string, uid: string, error: string): void {
-  if (marketplaceDefaultsRetryTimers.has(runKey)) return;
+  if (marketplaceDefaultsRetryTasks.has(runKey)) return;
   const attempt = marketplaceDefaultsRetryAttempts.get(runKey) || 0;
   const delayMs = MARKETPLACE_DEFAULTS_RETRY_DELAYS_MS[attempt];
   if (delayMs === undefined) {
@@ -833,122 +892,159 @@ function scheduleMarketplaceDefaultsRetry(runKey: string, uid: string, error: st
     return;
   }
   marketplaceDefaultsRetryAttempts.set(runKey, attempt + 1);
-  const timer = setTimeout(() => {
-    marketplaceDefaultsRetryTimers.delete(runKey);
-    if (!marketplaceBootContextStillActive(uid)) {
+  const task = scheduleBootBackground(`marketplace-defaults-retry:${runKey}`, async (signal) => {
+    marketplaceDefaultsRetryTasks.delete(runKey);
+    // A retry can become eligible while the earlier network phases drain.
+    // Start a fresh pass afterward instead of joining and losing this retry.
+    if (marketplaceReconcileInFlightKey === runKey) {
+      await marketplaceReconcileInFlight?.catch(() => undefined);
+    }
+    if (signal?.aborted || !marketplaceBootContextStillActive(uid)) {
       marketplaceDefaultsRetryAttempts.delete(runKey);
       return;
     }
-    runMarketplaceInstallReconcile('marketplace-defaults-retry').catch((err) => {
-      marketplaceBootLog.warn('marketplace default installs retry failed', {
-        error: (err as Error).message,
-      });
+    await runMarketplaceInstallReconcile('marketplace-defaults-retry', signal).catch((err) => {
+      marketplaceBootLog.warn('marketplace default installs retry failed', { error: (err as Error).message });
     });
-  }, delayMs);
-  timer.unref?.();
-  marketplaceDefaultsRetryTimers.set(runKey, timer);
+  }, delayMs, { preferIdle: true, maxUserDeferralMs: 30_000, maxSliceMs: 60_000 });
+  marketplaceDefaultsRetryTasks.set(runKey, task);
   marketplaceBootLog.info('scheduled marketplace default installs retry', {
-    attempt: attempt + 1,
-    delay_ms: delayMs,
-    error,
+    attempt: attempt + 1, delay_ms: delayMs, error,
   });
 }
 
-async function runMarketplaceInstallReconcile(reason: string): Promise<void> {
+async function runMarketplaceInstallReconcile(reason: string, signal?: AbortSignal): Promise<void> {
   const uid = users.getActiveUserId();
-  if (!marketplaceBootContextStillActive(uid)) {
+  if (signal?.aborted || !marketplaceBootContextStillActive(uid)) {
     marketplaceBootLog.info('skip marketplace reconcile: local user unavailable', { reason });
     return;
   }
-
   const runKey = uid;
   if (marketplaceReconcileInFlight && marketplaceReconcileInFlightKey === runKey) {
     await marketplaceReconcileInFlight;
     return;
   }
-
-  const shouldContinue = (): boolean => marketplaceBootContextStillActive(uid);
+  const shouldContinue = (): boolean => !signal?.aborted && marketplaceBootContextStillActive(uid);
+  // Network waits must not reserve the disk queue. Cancellation stops queued
+  // phases; active work drains before returning, guarding publication itself.
+  const runStep = async (name: string, resourceClass: BootResourceClass, fn: () => Promise<void>): Promise<void> => {
+    if (!shouldContinue()) return;
+    let operation: Promise<void> | undefined;
+    const scheduled = scheduleBootBackground(`marketplace:${name}`, () => {
+      if (shouldContinue()) return operation = fn();
+    }, 0, { resourceClass, preferIdle: true, maxUserDeferralMs: 30_000 });
+    const cancel = (): void => scheduled.cancel();
+    signal?.addEventListener('abort', cancel, { once: true });
+    if (signal?.aborted) cancel();
+    try {
+      await scheduled.promise;
+      await operation;
+    } finally {
+      signal?.removeEventListener('abort', cancel);
+    }
+  };
   marketplaceReconcileInFlightKey = runKey;
   marketplaceReconcileInFlight = (async () => {
     let defaultSeedStatusActive = false;
     let marketplaceReconcileModule: typeof import('./features/marketplace_reconcile') | null = null;
+    let marketplaceModule: typeof import('./features/marketplace') | null = null;
     const clearDefaultSeedStatus = (): void => {
       if (marketplaceReconcileModule && defaultSeedStatusActive) {
         marketplaceReconcileModule.setDefaultInstallSeedStatus(false);
         defaultSeedStatusActive = false;
       }
     };
-
     try {
-      const [mp, m] = await Promise.all([
-        import('./features/marketplace'),
-        import('./features/marketplace_reconcile'),
-      ]);
-      marketplaceReconcileModule = m;
-      subscribeMarketplaceReconcileStatus(m);
-
-      await seedBuiltinMarketplaceForCurrentUser(reason, shouldContinue);
-
-      if (await mp.hasKnownDefaultInstallWork(uid)) {
-        m.setDefaultInstallSeedStatus(true);
-        defaultSeedStatusActive = true;
-      }
-
-      if (!shouldContinue()) {
-        clearDefaultSeedStatus();
-        return;
-      }
-
-      const builtinMarketplace = await import('./features/builtin_marketplace');
-      await builtinMarketplace.resolveBuiltinMarketplaceInstalls(uid, { shouldContinue }).catch((err) => {
-        marketplaceBootLog.warn('builtin marketplace resolve failed', { error: logErrorSummary(err) });
+      await runStep('local-content', 'disk', async () => {
+        await seedBuiltinMarketplaceForCurrentUser(reason, shouldContinue);
+        if (!shouldContinue()) return;
+        const [mp, m] = await Promise.all([
+          import('./features/marketplace'), import('./features/marketplace_reconcile'),
+        ]);
+        if (!shouldContinue()) return;
+        marketplaceModule = mp;
+        marketplaceReconcileModule = m;
+        subscribeMarketplaceReconcileStatus(m);
+        if (await mp.hasKnownDefaultInstallWork(uid)) {
+          if (!shouldContinue()) return;
+          m.setDefaultInstallSeedStatus(true);
+          defaultSeedStatusActive = true;
+        }
       });
-      if (!shouldContinue()) {
-        clearDefaultSeedStatus();
-        return;
-      }
-
-      const forceMarketplaceNetwork = reason === 'marketplace-defaults-retry';
-      const seeded = await mp.ensureDefaultInstalls(uid, {
-        shouldContinue,
-        minIntervalMs: forceMarketplaceNetwork ? 0 : MARKETPLACE_DEFAULTS_REFRESH_INTERVAL_MS,
-        force: forceMarketplaceNetwork,
+      await runStep('network', 'network', async () => {
+        const catalogReader = createMarketplaceCatalogReader(shouldContinue);
+        const builtinMarketplace = await import('./features/builtin_marketplace');
+        if (!shouldContinue()) return;
+        await builtinMarketplace.resolveBuiltinMarketplaceInstalls(uid, { shouldContinue, catalogReader }).catch((err) => {
+          marketplaceBootLog.warn('builtin marketplace resolve failed', { error: logErrorSummary(err) });
+        });
+        if (!shouldContinue()) return;
+        try {
+          const mp = marketplaceModule || await import('./features/marketplace');
+          const forceMarketplaceNetwork = reason === 'marketplace-defaults-retry';
+          const seeded = await mp.ensureDefaultInstalls(uid, {
+            shouldContinue,
+            minIntervalMs: forceMarketplaceNetwork ? 0 : MARKETPLACE_DEFAULTS_REFRESH_INTERVAL_MS,
+            force: forceMarketplaceNetwork,
+          });
+          if (!shouldContinue()) return;
+          if (seeded.failed) {
+            clearDefaultSeedStatus();
+            scheduleMarketplaceDefaultsRetry(runKey, uid, seeded.error || 'unknown error');
+          } else {
+            clearMarketplaceDefaultsRetry(runKey);
+          }
+          if ((seeded.seeded_agents || seeded.seeded_skills) && marketplaceReconcileModule && !defaultSeedStatusActive) {
+            marketplaceReconcileModule.setDefaultInstallSeedStatus(true);
+            defaultSeedStatusActive = true;
+          }
+        } catch (err) {
+          clearDefaultSeedStatus();
+          marketplaceBootLog.warn('default installs seed failed', { error: (err as Error).message });
+          if (shouldContinue()) scheduleMarketplaceDefaultsRetry(runKey, uid, (err as Error).message);
+        }
+        if (!shouldContinue()) return;
+        try {
+          const m = marketplaceReconcileModule || await import('./features/marketplace_reconcile');
+          await m.checkServerUpdatesForInstalls(uid, {
+            shouldContinue, minIntervalMs: MARKETPLACE_SERVER_CHECK_INTERVAL_MS, catalogReader,
+          });
+        } catch (err) {
+          clearDefaultSeedStatus();
+          marketplaceBootLog.warn('marketplace update check failed', { reason, error: logErrorSummary(err) });
+        }
       });
-      if (seeded.failed) {
-        clearDefaultSeedStatus();
-        scheduleMarketplaceDefaultsRetry(runKey, uid, seeded.error || 'unknown error');
-      } else {
-        clearMarketplaceDefaultsRetry(runKey);
-      }
-      if ((seeded.seeded_agents || seeded.seeded_skills) && !defaultSeedStatusActive) {
-        m.setDefaultInstallSeedStatus(true);
-        defaultSeedStatusActive = true;
-      }
-
-      if (!shouldContinue()) {
-        clearDefaultSeedStatus();
-        return;
-      }
-
-      await m.checkServerUpdatesForInstalls(uid, {
-        shouldContinue,
-        minIntervalMs: MARKETPLACE_SERVER_CHECK_INTERVAL_MS,
+      await runStep('reconcile', 'network', async () => {
+        try {
+          const m = marketplaceReconcileModule || await import('./features/marketplace_reconcile');
+          const result = await m.reconcileInstalls(uid, { shouldContinue });
+          if (!shouldContinue()) return;
+          if (
+            result.pulled_agents || result.pulled_skills
+            || result.pruned_agents || result.pruned_skills
+            || result.restored_agents || result.restored_skills
+            || result.patched_agents || result.patched_skills
+          ) {
+            ipc.broadcastToRenderer('marketplace:content-changed', {});
+            marketplaceBootLog.info('marketplace install reconcile completed', { reason, ...result });
+          }
+        } catch (err) {
+          clearDefaultSeedStatus();
+          marketplaceBootLog.warn('marketplace reconcile failed', { reason, error: (err as Error).message });
+        }
       });
-      const result = await m.reconcileInstalls(uid, { shouldContinue });
-      if (
-        result.pulled_agents || result.pulled_skills
-        || result.pruned_agents || result.pruned_skills
-        || result.restored_agents || result.restored_skills
-        || result.patched_agents || result.patched_skills
-      ) {
-        marketplaceBootLog.info('marketplace install reconcile completed', { reason, ...result });
-      }
+      await runStep('local-repair', 'disk', async () => {
+        try {
+          const skills = await import('./features/skills');
+          if (shouldContinue()) await skills.repairLegacySkillEnabledIdsForActiveUser();
+        } catch (err) {
+          marketplaceBootLog.warn('legacy skill enabled-state repair failed', { error: logErrorSummary(err) });
+        }
+      });
     } catch (err) {
+      marketplaceBootLog.warn('marketplace install reconcile failed', { reason, error: (err as Error).message });
+    } finally {
       clearDefaultSeedStatus();
-      marketplaceBootLog.warn('marketplace install reconcile failed', {
-        reason,
-        error: (err as Error).message,
-      });
     }
   })().finally(() => {
     if (marketplaceReconcileInFlightKey === runKey) {
@@ -1318,7 +1414,7 @@ function registerChatAppProtocol(): void {
         log.warn('chat-app: unparseable URL', { error_code: 'invalid_url' });
         return new Response('bad request', { status: 400 });
       }
-      const sdkResource = appResource(request);
+      const sdkResource = await appResource(request);
       if (sdkResource) {
         if (sdkResource.status !== 200) return new Response('Application resource unavailable', { status: sdkResource.status });
         if ('body' in sdkResource) return new Response(sdkResource.body, {
@@ -1350,9 +1446,6 @@ function registerChatAppProtocol(): void {
           return new Response('bad request', { status: 400 });
         }
         const uid = users.getActiveUserId();
-        if (await savedApps.resolveSavedAppType(uid, appId) === 'web') {
-          return Response.json((await import('./features/web_apps/commercial-entry')).commercialWebAppFailure(), { status: 403 });
-        }
         if (hasIsolatedBrowserStorage(uid, { appId })) return new Response('Application origin required', { status: 403 });
         if (savedRelPath === chatArtifacts.BRIDGE_RELPATH) {
           return _withArtifactCors(new Response(chatArtifacts.BRIDGE_JS, {
@@ -1383,9 +1476,6 @@ function registerChatAppProtocol(): void {
       }
 
       const uid = users.getActiveUserId();
-      if (await savedApps.resolveArtifactAppType(uid, cid, artifactId) === 'web') {
-        return Response.json((await import('./features/web_apps/commercial-entry')).commercialWebAppFailure(), { status: 403 });
-      }
       if (hasIsolatedBrowserStorage(uid, { cid, artifactId })) return new Response('Application origin required', { status: 403 });
       // Reserved virtual path: the runtime bridge script (not on disk).
       if (relPath === chatArtifacts.BRIDGE_RELPATH) {
@@ -1422,16 +1512,58 @@ if (!gotLock) {
 } else {
 
   const shutdown = createShutdownCoordinator({
+    captureProcesses: () => captureWindowsShutdownProcesses(),
+    quiesce: async () => {
+      await Promise.all([
+        prepareForShutdown(),
+        import('./features/local_agents/runner.js').then(runner => runner.stopBackgroundRuns('the app is quitting')),
+      ]);
+      const boot = await import('./util/boot_init');
+      boot.stopBootWork();
+      const library = await import('./features/library_corpus');
+      library.closeAllLibraryCorpora();
+    },
     localTasks: [
       { name: 'open-lifecycle', run: async () => { await openLifecycleTracking?.flushQuit(); } },
+      { name: 'connectors', run: () => connectorsFeature.shutdown() },
       { name: 'search', run: () => searchFeature.flushAll() },
-      { name: 'kb_vector', run: async () => { (await import('./features/kb_vector')).closeAllKb(); } },
-      { name: 'kb_embed', run: async () => { (await import('./features/kb_embed')).closeEmbedder(); } },
-      { name: 'image-runtime', run: async () => { (await import('./util/sharp-runtime')).closeImageRuntime(); } },
-      { name: 'office-engine', run: () => sweepOfficeResidents('quit') },
-      { name: 'web-assist-session', run: async () => { await (await import('./features/web_assist_session')).flushWebAssistSessions(); } },
+      { name: 'kb_vector', run: async () => {
+        const kb = await import('./features/kb_vector');
+        kb.closeAllKb();
+      } },
+      { name: 'kb_embed', run: async () => {
+        // Kill the isolated embedder worker so it releases its model promptly.
+        const kbEmbed = await import('./features/kb_embed');
+        kbEmbed.closeEmbedder();
+      } },
+      { name: 'image-runtime', run: async () => {
+        const images = await import('./util/sharp-runtime');
+        images.closeImageRuntime();
+      } },
+      { name: 'office-engine', run: async () => {
+        const extraction = await import('./util/office-extract');
+        await extraction.closeOfficeExtraction();
+        const oe = await import('./features/office/office_engine');
+        oe.closeAllOfficeResidents();
+      } },
+      { name: 'web-assist-session', run: async () => {
+        const webAssistSessions = await import('./features/web_assist_session');
+        await webAssistSessions.flushWebAssistSessions();
+      } },
+      { name: 'web-app-data', run: async () => {
+        // Checkpoint local app databases before closing the application.
+        const apps = await import('./features/web_apps/host');
+        apps.runtime.closeUser(users.getActiveUserId());
+        await apps.runtime.drainData();
+      } },
     ],
     onFailure: name => createLogger(name).warn('shutdown preparation failed'),
+    onIncomplete: async () => {
+      const library = await import('./features/library_corpus');
+      await library.resumeLibraryAdmission();
+      const boot = await import('./util/boot_init');
+      boot.resumeBootAdmission();
+    },
   });
   const flushForShutdown = shutdown.prepare;
 
@@ -1480,12 +1612,26 @@ if (!gotLock) {
     registerKbFileProtocol();
     registerChatMediaProtocol();
     registerChatAppProtocol();
-    // Renderer permission gate. Voice input is stripped from the open-source build, so media
-    // capture is denied; clipboard permissions are kept for copy/paste flows.
-    session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
+    // Only the trusted main frame can capture audio. Previews and embedded apps
+    // retain their independent, default-deny permission handlers.
+    session.defaultSession.setPermissionCheckHandler((wc, permission, _origin, details) => {
+      if (permission === 'media') {
+        const owner = wc ? BrowserWindow.fromWebContents(wc) : null;
+        return !!owner && mainWindows.has(owner) && details.isMainFrame === true && details.mediaType === 'audio';
+      }
+      return permission === 'clipboard-read' || permission === 'clipboard-sanitized-write';
+    });
+    session.defaultSession.setPermissionRequestHandler((wc, permission, callback, details) => {
+      const owner = wc ? BrowserWindow.fromWebContents(wc) : null;
+      if (!owner || !mainWindows.has(owner) || !details.isMainFrame) { callback(false); return; }
+      if (permission === 'media') {
+        const mediaTypes = (details as Electron.MediaAccessPermissionRequest).mediaTypes || [];
+        callback(mediaTypes.length > 0 && mediaTypes.every((type) => type === 'audio'));
+        return;
+      }
       callback(permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');
     });
-    registerIpc(flushForShutdown);
+    registerIpc(flushForShutdown, () => shutdown.quiescent);
     const stopTaskNotifications = taskNotifications.startTaskNotifications({
       getActiveUserId: () => users.getActiveUserId(),
       isEnabled: () => appConfig.getTaskNotificationsEnabled(),
@@ -1534,16 +1680,6 @@ if (!gotLock) {
       openConversation: openConversationFromTaskNotification,
     });
     app.once('before-quit', stopTaskNotifications);
-    // A CLI agent's process is our child but its own process-group leader, so
-    // quitting without ending it leaves it running with nothing to report to.
-    // Fire-and-forget: Electron does not await this hook, and the deadline
-    // inside only decides whether the CLI gets to write a clean session state
-    // before the app goes.
-    app.once('before-quit', () => {
-      void import('./features/local_agents/runner.js')
-        .then(runner => runner.stopBackgroundRuns('the app is quitting'))
-        .catch(() => { /* nothing was running, or the module never loaded */ });
-    });
     const stopTaskTerminalUi = subscribeTaskTerminals(emitTaskTerminalToRenderer);
     app.once('before-quit', stopTaskTerminalUi);
     // Running Agent work keeps the machine out of idle sleep; an idle app holds nothing.
@@ -1551,6 +1687,11 @@ if (!gotLock) {
     app.once('before-quit', idleSleepGuard.stop);
     clientConfigFeature.clientConfig.subscribeAll((keys) => {
       ipc.broadcastToRenderer('client-config:changed', { keys });
+      if (keys.includes('connectors.catalog') || keys.includes('connectors.dcr_catalog')) {
+        connectorsFeature.refreshStaleToolCaches(users.getActiveUserId(), 'client_config_changed').catch((err) => {
+          log.warn('connector stale tool-cache refresh after client config change failed', { error: logErrorSummary(err) });
+        });
+      }
     });
     const BOOT_BACKGROUND_DEFER_MS = 6_000;
     const bootDevice = getBootDeviceProfile();
@@ -1569,12 +1710,9 @@ if (!gotLock) {
       startupDelayMs: CLIENT_CONFIG_STARTUP_DELAY_MS,
       forceStartupRefresh: false,
     });
-    const connectorsTimer = setTimeout(() => {
-      connectorsFeature.bootstrap(users.getActiveUserId()).catch(() => {
-        /* errors logged inside the feature; never block app startup */
-      });
-    }, CONNECTORS_BOOTSTRAP_DELAY_MS);
-    connectorsTimer.unref?.();
+    scheduleBootBackground('connectors:bootstrap', async () => {
+      await connectorsFeature.bootstrap(users.getActiveUserId());
+    }, CONNECTORS_BOOTSTRAP_DELAY_MS, { resourceClass: 'process', preferIdle: true, maxSliceMs: 30_000 });
     createWindow();
     openLifecycleTracking = startOpenLifecycleTracking({
       app,
@@ -1678,7 +1816,7 @@ if (!gotLock) {
       }));
       projectDriverRunner.startDriverScheduler();
     });
-    registerDeferred('marketplace:reconcile', () => runMarketplaceInstallReconcile('startup'));
+    registerDeferred('marketplace:reconcile', (signal) => runMarketplaceInstallReconcile('startup', signal));
 
     registerDeferred('boot:maintenance-sweeps', () => runBootMaintenanceSweeps(), 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
     registerDeferred('browser:http-cache', async (signal) => {
@@ -1744,6 +1882,12 @@ if (!gotLock) {
     isQuitting = true;
     if (shutdown.complete) return;
     e.preventDefault();
-    try { await flushForShutdown(); } finally { app.quit(); }
+    try {
+      await flushForShutdown();
+      app.quit();
+    } catch (error) {
+      isQuitting = false;
+      log.error('quit preparation failed', { error: logErrorSummary(error) });
+    }
   });
 }

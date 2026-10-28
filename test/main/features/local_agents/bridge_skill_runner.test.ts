@@ -72,12 +72,62 @@ function processIsAlive(pid: number): boolean {
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
 describe('CLI bridge Skill runner', () => {
+  it.each(['missing', 'shadowed', 'inherited'])('runs nested Skill commands when system Node is %s', async (systemNode) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skill runtime-'));
+    tempDirs.push(dir);
+    const runtimeDir = path.join(dir, 'runtime 工具 bin');
+    const hostDir = path.join(dir, 'host bin');
+    fs.mkdirSync(hostDir);
+    const node = process.env.ORKAS_TEST_NODE || process.execPath;
+    const name = process.platform === 'win32' ? 'node.exe' : 'node';
+    const runtimeNode = path.join(runtimeDir, name);
+    // Installed Node may need sibling shared libraries or DLLs. Keep the real
+    // runtime intact behind an isolated directory alias, as the connector
+    // lifecycle fixture does; missing/shadowed PATH still has no other Node.
+    fs.symlinkSync(path.dirname(fs.realpathSync(node)), runtimeDir, 'junction');
+    if (systemNode === 'shadowed') {
+      fs.writeFileSync(path.join(hostDir, name), 'invalid executable', { mode: 0o755 });
+    }
+    const skillDir = path.join(dir, 'skill');
+    fs.mkdirSync(path.join(skillDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'scripts', 'run.js'), `
+      module.exports = () => {
+        const result = require('node:child_process').spawnSync('node',
+          ['-e', 'process.stdout.write(JSON.stringify({ executable: process.execPath, value: 42 }))'],
+          { encoding: 'utf8', timeout: 5000 });
+        return { ok: result.status === 0, status: result.status, stdout: result.stdout,
+          stderr: result.stderr, errorCode: result.error?.code };
+      };
+    `);
+    const inheritedPath = systemNode === 'inherited' ? runtimeDir : hostDir;
+    vi.stubEnv('PATH', inheritedPath);
+    vi.stubEnv('ORKAS_PATH_PREPEND', systemNode === 'inherited' ? undefined : runtimeDir);
+    vi.stubEnv('ORKAS_PC_DIR', path.resolve('.'));
+    vi.stubEnv('ELECTRON_RUN_AS_NODE', undefined);
+    const runner = createBridgeSkillRunner({
+      outputDir: path.join(dir, 'output'), nodePath: node,
+      runnerPath: path.resolve('bin/run-skill.cjs'),
+    });
+    try {
+      const result = await runner.run({ skillRef: 'demo', scriptBase: 'run', skillDir });
+      expect(result.status).toBe('succeeded');
+      expect(result.stderr.text).toBe('');
+      const script = JSON.parse(result.stdout.text);
+      expect(script).toMatchObject({ ok: true, status: 0, stderr: '' });
+      expect(JSON.parse(script.stdout)).toEqual({ executable: fs.realpathSync(runtimeNode), value: 42 });
+      expect(process.env.PATH).toBe(inheritedPath);
+    } finally {
+      await runner.shutdown();
+    }
+  }, 15_000);
+
   it('does not expose MCP bridge credentials to Skill subprocesses', async () => {
     const previous = new Map<string, string | undefined>();
     const secrets = {

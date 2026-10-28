@@ -8,7 +8,7 @@ import type { BrowserWindow as ElectronBrowserWindow, Session } from 'electron';
 
 import { createPreviewSdk, previewBundle, previewPreload, type PreviewSdkEvidence } from './web_apps/preview';
 import type { Bundle } from './web_apps/runtime';
-import { ARTIFACT_FRAME } from './chat_artifacts';
+import { ARTIFACT_FRAME, mimeFor as artifactMimeFor } from './chat_artifacts';
 import * as chatAttachments from './chat_attachments';
 import { chatMediaLocalPathFromUrl, chatMediaLocalUrl } from '../util/chat-media-url';
 import { serveFileRange } from '../util/http-range';
@@ -18,6 +18,7 @@ import { hardenedWebPreferences, withHtmlPreviewAssetPolicy, withHtmlPreviewPoli
 const HTML_PREVIEW_TIMEOUT_MS = 20_000;
 const HTML_PREVIEW_MAX_BLOCKED_RESOURCE_SAMPLES = 8;
 const HTML_PREVIEW_MAX_DIAGNOSTICS = 12;
+const HTML_PREVIEW_MAX_INLINE_DOWNLOAD_URL_CHARS = 2 * 1024 * 1024;
 const HTML_PREVIEW_MAX_INTERACTION_SAMPLES = 10;
 const HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS = 400;
 const HTML_PREVIEW_DESIGN_MAX_ELEMENTS = 4_000;
@@ -149,6 +150,8 @@ export interface HtmlPreviewInteractionEvidence {
 
 export interface HtmlPreviewEvidence {
   sdk?: PreviewSdkEvidence;
+  /** Per-viewport observations, not a functional verdict or delivery gate. */
+  sdkByViewport?: Array<PreviewSdkEvidence & { viewport: HtmlPreviewViewportName }>;
   ok: boolean;
   entryPath: string;
   blockedResourceCount: number;
@@ -183,6 +186,8 @@ export interface HtmlPreviewRuntimeDeps {
 
 export interface HtmlPreviewRenderOptions {
   interactions?: boolean;
+  /** Host-owned chat artifact bridge, served without changing the artifact files. */
+  bridgeJavaScript?: string;
   /** Check a plain page the way the chat file viewer shows it: through
    *  `chat-media://local` with the viewer's sandbox (no storage, CORS-gated
    *  assets). Generated artifacts render in `chat-app://` and keep the default. */
@@ -763,6 +768,12 @@ const INTERACTION_SCRIPT = `(async () => {
     || element.tagName
     || 'control'
   ).replace(/\\s+/g, ' ').trim().slice(0, 120);
+  // SVG role controls have no HTMLElement.click(), but receive DOM click
+  // events. Keep native activation for HTML controls (forms and downloads).
+  const activateControl = (control) => {
+    if (typeof control.click === 'function') control.click();
+    else control.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+  };
   const failures = [];
   const warnings = [];
   const reportedTransforms = new Set();
@@ -906,7 +917,7 @@ const INTERACTION_SCRIPT = `(async () => {
   const downloadCandidates = downloadControls.map(label);
   for (const control of downloadControls) {
     try {
-      control.click();
+      activateControl(control);
       controlsExercised += 1;
       await sleep(120);
     } catch (error) {
@@ -1041,7 +1052,7 @@ const INTERACTION_SCRIPT = `(async () => {
           control.hasAttribute?.('aria-current')
           && control.getAttribute?.('aria-current') !== 'false'
         );
-      control.click();
+      activateControl(control);
       exercisedStateControls.add(control);
       controlsExercised += 1;
       stateControlsExercised += 1;
@@ -1285,9 +1296,15 @@ function registerNetworkIsolation(
   entryRootReal: string,
   blocked: { count: number; samples: string[] },
   sdkOrigin: { current?: string },
+  bridgeJavaScript?: string,
 ): void {
+  const bridgeUrl = pathToFileURL(path.join(entryRootReal, '__orkas', 'bridge.js')).href;
   ses.webRequest.onBeforeRequest((details, callback) => {
     const raw = String(details.url || '');
+    if (bridgeJavaScript && raw === bridgeUrl) {
+      callback({ cancel: false });
+      return;
+    }
     const allowed = sdkOrigin.current
       ? /^(?:https?|wss?|data|blob|about):/i.test(raw) || raw.startsWith(sdkOrigin.current + '/')
       : allowedPreviewRequest(raw, entryRootReal);
@@ -1302,6 +1319,25 @@ function registerNetworkIsolation(
       }
     }
     callback({ cancel: !allowed });
+  });
+}
+
+/** Serve the reserved host bridge without copying or modifying an app bundle. */
+function registerArtifactPreviewProtocol(ses: Session, entryRootReal: string, bridgeJavaScript: string): void {
+  const bridgePath = path.join(entryRootReal, '__orkas', 'bridge.js');
+  ses.protocol.handle('file', (request) => {
+    try {
+      const requested = fileURLToPath(request.url);
+      if (requested === bridgePath) {
+        return new Response(bridgeJavaScript, { headers: { 'Content-Type': 'text/javascript; charset=utf-8' } });
+      }
+      if (!isPathAllowed(requested, [entryRootReal])) return new Response('', { status: 403 });
+      const st = fs.statSync(requested);
+      if (!st.isFile()) return new Response('', { status: 404 });
+      return serveFileRange(request, requested, artifactMimeFor(requested), st.size, st.mtimeMs);
+    } catch {
+      return new Response('', { status: 404 });
+    }
   });
 }
 
@@ -1381,6 +1417,7 @@ function registerPermissionIsolation(ses: Session): void {
 async function clearPreviewSession(ses: Session): Promise<void> {
   try { ses.webRequest.onBeforeRequest(null); } catch { /* best effort */ }
   try { if (ses.protocol?.isProtocolHandled('chat-media')) ses.protocol.unhandle('chat-media'); } catch { /* best effort */ }
+  try { if (ses.protocol?.isProtocolHandled('file')) ses.protocol.unhandle('file'); } catch { /* best effort */ }
   try { ses.removeAllListeners('will-download'); } catch { /* best effort */ }
   try { ses.setPermissionCheckHandler(null); } catch { /* best effort */ }
   try { ses.setPermissionRequestHandler(null); } catch { /* best effort */ }
@@ -1556,11 +1593,13 @@ export async function renderResponsiveHtmlPreview(
   const ses = electronSession.fromPartition(partition);
   registerPermissionIsolation(ses);
   try {
-    registerNetworkIsolation(ses, entryRootReal, blocked, sdkOrigin);
+    registerNetworkIsolation(ses, entryRootReal, blocked, sdkOrigin, options.bridgeJavaScript);
     // SDK app bundles keep their own shell (see createPreviewSdk).
     const fileViewer = !bundle && options.fileViewer === true;
     if (fileViewer) registerLocalPreviewProtocol(ses, entryRootReal);
+    else if (!bundle && options.bridgeJavaScript) registerArtifactPreviewProtocol(ses, entryRootReal, options.bridgeJavaScript);
     const downloads: HtmlPreviewDownloadEvidence[] = [];
+    const inlineDownloadMeasurements: Promise<void>[] = [];
     ses.on('will-download', (event, item) => {
       const rawUrl = String(item.getURL?.() || '');
       const urlKind = rawUrl.startsWith('data:')
@@ -1571,12 +1610,25 @@ export async function renderResponsiveHtmlPreview(
             ? 'file'
             : 'other';
       if (downloads.length < HTML_PREVIEW_MAX_DIAGNOSTICS) {
-        downloads.push({
+        const download: HtmlPreviewDownloadEvidence = {
           filename: boundedDiagnostic(item.getFilename?.()),
           mimeType: boundedDiagnostic(item.getMimeType?.()),
           totalBytes: Math.max(0, Number(item.getTotalBytes?.()) || 0),
           urlKind,
-        });
+        };
+        downloads.push(download);
+        // Electron can report an unknown zero length for data: downloads at
+        // will-download. Decode only bounded inline data, without network I/O
+        // or saving a file; empty or invalid payloads still fail the same check.
+        if (urlKind === 'data' && download.totalBytes === 0
+          && rawUrl.length <= HTML_PREVIEW_MAX_INLINE_DOWNLOAD_URL_CHARS) {
+          inlineDownloadMeasurements.push(
+            fetch(rawUrl, { signal: AbortSignal.timeout(1000) })
+              .then(response => response.arrayBuffer())
+              .then(bytes => { download.totalBytes = bytes.byteLength; })
+              .catch(() => { /* retain the unavailable length */ }),
+          );
+        }
       }
       event.preventDefault();
     });
@@ -1604,6 +1656,7 @@ export async function renderResponsiveHtmlPreview(
       ));
     }
 
+    await Promise.all(inlineDownloadMeasurements);
     const blockers: string[] = [];
     const warnings: string[] = [];
     for (const item of rendered) {
@@ -1709,6 +1762,8 @@ export async function renderResponsiveHtmlPreview(
         ok: blockers.length === 0,
         entryPath: entryAbs,
         ...(rendered[0]?.sdk ? { sdk: rendered[0].sdk } : {}),
+        ...(rendered.some(item => item.sdk) ? { sdkByViewport: rendered.flatMap(item =>
+          item.sdk ? [{ ...item.sdk, viewport: item.evidence.name }] : []) } : {}),
         blockedResourceCount: blocked.count,
         blockedResourceSamples: blocked.samples,
         blockers,

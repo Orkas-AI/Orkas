@@ -279,14 +279,13 @@ export interface Agent {
   /** Marketplace category code. Empty string only for legacy/manual specs.
    *  Maintained by hidden create defaults and by the agent-edit LLM's `<category>` sub-tag. */
   category: string;
-  /** Output rendering preference — agent-level hint injected into the worker
-   *  system prompt at dispatch time. Four user-facing values, progressive
-   *  capability disclosure:
+  /** Output rendering preference — agent-level hint injected into the named Agent
+   *  system prompt at dispatch time. Four user-facing values:
    *    - `'auto'`: default. The model chooses the lightest useful
    *      presentation: plain text/Markdown, inline dashboard, or interactive app.
    *    - `'text'`: blocks `:::dashboard` + `create_artifact`. The plain-reply
    *      hard constraint.
-   *    - `'dashboard'`: allows `:::dashboard` blocks; still blocks `create_artifact`.
+   *    - `'dashboard'`: prefers `:::dashboard` for structured data.
    *    - `'artifact'`: allows both `:::dashboard` and `create_artifact`.
    *  Legacy aliases kept for back-compat: `'markdown_only'` (old name for
    *  `'text'`) and `'allow_artifacts'` (old name for `'artifact'`).
@@ -1387,9 +1386,9 @@ export async function setAgentCliProjectDir(
   return getCliProjectDirInfoForAgent(userId, agent);
 }
 
-// Bump when normalizeAgent's materialized schema changes so persisted rows are
-// rebuilt instead of bypassing read-time compatibility reconciliation.
-const AGENT_CATALOG_CACHE_VERSION = 3;
+// Bump when normalized rows or scan completeness changes. Version 4 rebuilds
+// snapshots that older tolerant reads could persist after a source failure.
+const AGENT_CATALOG_CACHE_VERSION = 4;
 const AGENT_ENRICHED_CACHE_TTL_MS = 2_000;
 
 interface AgentListCache { stamp: string; data: Agent[] }
@@ -1472,7 +1471,10 @@ function _agentDirStamp(): string {
   let stamp = '';
   for (const d of [CUSTOM_AGENTS_DIR(), userMarketplaceAgentsDir(getActiveUserId())]) {
     try { stamp += `${d}:${fs.statSync(d).mtimeMs};`; }
-    catch { stamp += `${d}:0;`; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw new Error('Agent catalog unavailable');
+      stamp += `${d}:0;`;
+    }
   }
   return stamp;
 }
@@ -1539,15 +1541,22 @@ async function _listAgentSpecs(): Promise<Agent[]> {
       const seen = new Set<string>();
       const sources: Array<[AgentSource, string]> = [['marketplace', userMarketplaceAgentsDir(getActiveUserId())], ['custom', CUSTOM_AGENTS_DIR()]];
       for (const [source, dir] of sources) {
-        if (!fs.existsSync(dir)) continue;
-        const entries = (await fsp.readdir(dir, { withFileTypes: true }))
+        const entries = (await fsp.readdir(dir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+          if (error?.code === 'ENOENT') return [];
+          throw new Error('Agent catalog unavailable');
+        }))
           .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
           .sort((a, b) => a.name.localeCompare(b.name));
         for (const e of entries) {
           const full = path.join(dir, e.name, 'agent.json');
-          if (!fs.existsSync(full)) continue;
           let data: AgentRaw;
-          try { data = await readJson<AgentRaw>(full); } catch { continue; }
+          try { data = await readJson<AgentRaw>(full, { strict: true }); }
+          catch (error) {
+            // A staging directory may not contain a definition yet. Existing
+            // but unreadable/malformed definitions make the scan incomplete.
+            if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
+            throw new Error('Agent catalog unavailable');
+          }
           const norm = normalizeAgent(data, source);
           if (!norm) continue;
           if (isMarketplaceSource(source)) {

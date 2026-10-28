@@ -25,6 +25,8 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -84,6 +86,45 @@ async function buildBlock(uid: string): Promise<string> {
 }
 
 describe('agents_index block — header + per-entry shape', () => {
+  it('rejects an inaccessible catalog stamp rather than treating the root as absent', async () => {
+    writeAgent(customAgentsDir(), 'kept', { name: 'Kept' });
+    const stat = nativeFs.statSync.bind(nativeFs);
+    const spy = vi.spyOn(nativeFs, 'statSync').mockImplementation(((...args: any[]) => {
+      if (args[0] === customAgentsDir()) throw Object.assign(new Error('private stamp failure'), { code: 'EACCES' });
+      return (stat as any)(...args);
+    }) as typeof fs.statSync);
+    syncBuiltinESMExports();
+    try { await expect(buildBlock(TEST_UID)).rejects.toThrow('Agent catalog unavailable'); }
+    finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(await buildBlock(TEST_UID)).toContain('@Kept');
+  });
+
+  it('keeps a disabled Agent out of a genuinely empty enabled roster', async () => {
+    writeAgent(customAgentsDir(), 'disabled', { name: 'Disabled' });
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    enabled.setAgentEnabled(TEST_UID, 'disabled', false);
+    const block = await buildBlock(TEST_UID);
+    expect(block).toContain('(no agents)');
+    expect(block).not.toContain('@Disabled');
+  });
+
+  it('rejects a catalog directory failure instead of advertising no agents, then recovers', async () => {
+    writeAgent(customAgentsDir(), 'healthy', { name: 'Healthy' });
+    writeAgent(builtinAgentsDir(), 'other', { name: 'Other' });
+    const read = fs.promises.readdir.bind(fs.promises);
+    const spy = vi.spyOn(fs.promises, 'readdir').mockImplementation((...args: any[]) => {
+      if (args[0] === customAgentsDir()) return Promise.reject(Object.assign(new Error('private directory failure'), { code: 'EACCES' }));
+      return (read as any)(...args);
+    });
+    syncBuiltinESMExports();
+    try { await expect(buildBlock(TEST_UID)).rejects.toThrow('Agent catalog unavailable'); }
+    finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    const block = await buildBlock(TEST_UID);
+    expect(block).toContain('@Healthy');
+    expect(block).toContain('@Other');
+    expect(block).not.toContain('(no agents)');
+  });
+
   it('exposes the complete built-in corpus with each authored description once and no workflows', async () => {
     const root = path.join(__dirname, '../../../../resources/builtin/marketplace/agents');
     const agents = fs.readdirSync(root).flatMap((id) => {
@@ -313,6 +354,14 @@ describe('Commander project-task prompt gating', () => {
     expect(nonProject).not.toContain('$project_tasks_rules');
     expect(project).toContain('### Project tasks (the work backlog)');
     expect(project).not.toContain('$project_tasks_rules');
+    const taskContract = "preserve the selected task's requirements unless the current request explicitly changes them";
+    const pauseContract = 'A review or pause applies to the work it names; a hold on dependent work does not suspend its authorized prerequisites';
+    const deliveryContract = 'Reconcile both direct and delegated delivery';
+    for (const contract of [taskContract, pauseContract, deliveryContract]) {
+      expect(project.split(contract)).toHaveLength(2);
+      expect(project.indexOf(contract)).toBeLessThan(project.indexOf('## Runtime injection'));
+      expect(nonProject).not.toContain(contract);
+    }
     expect(project.indexOf('### Project tasks (the work backlog)'))
       .toBeLessThan(project.indexOf('## Runtime injection'));
     expect(nonProject).not.toContain('## Orchestration continuity');

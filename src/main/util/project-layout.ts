@@ -351,6 +351,10 @@ export interface AutoTaskLocation {
   attachmentsDir: string;
   configRelPath: string;
   attachmentsRelBase: string;
+  /** What a run keeps for the next run. The only part of the task directory
+   *  a run's file tools may write; config.json stays behind the tool. */
+  handoffDir: string;
+  handoffRelBase: string;
 }
 
 export function globalAutoTaskLocation(uid: string, taskId: string): AutoTaskLocation {
@@ -362,6 +366,8 @@ export function globalAutoTaskLocation(uid: string, taskId: string): AutoTaskLoc
     attachmentsDir: autoTaskAttachmentsDir(uid, taskId),
     configRelPath: `cloud/auto_tasks/${taskId}/config.json`,
     attachmentsRelBase: `cloud/auto_tasks/${taskId}/attachments`,
+    handoffDir: path.join(autoTaskDir(uid, taskId), 'handoff'),
+    handoffRelBase: `cloud/auto_tasks/${taskId}/handoff`,
   };
 }
 
@@ -374,6 +380,8 @@ function projectAutoTaskLocation(uid: string, pid: string, taskId: string): Auto
     attachmentsDir: projectAutoTaskAttachmentsDir(uid, pid, taskId),
     configRelPath: `cloud/projects/${pid}/auto_tasks/${taskId}/config.json`,
     attachmentsRelBase: `cloud/projects/${pid}/auto_tasks/${taskId}/attachments`,
+    handoffDir: path.join(projectAutoTaskDir(uid, pid, taskId), 'handoff'),
+    handoffRelBase: `cloud/projects/${pid}/auto_tasks/${taskId}/handoff`,
   };
 }
 

@@ -321,6 +321,42 @@ describe('local_agents/backends/base', () => {
     },
   );
 
+  itPosix.each(['abort', 'terminal'] as const)('stops a detached tool process group on %s without touching unrelated work', async mode => {
+    const node = process.env.ORKAS_TEST_NODE || process.execPath;
+    const tool = "process.on('SIGTERM', () => {}); process.stdout.write('ready'); setInterval(() => {}, 1000);";
+    const source = [
+      "const { spawn } = require('node:child_process');",
+      `const tool = spawn(process.execPath, ['-e', ${JSON.stringify(tool)}], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });`,
+      "tool.stdout.once('data', () => process.stdout.write(String(tool.pid) + '\\n'));",
+      "setInterval(() => {}, 1000);",
+    ].join('\n');
+    const parent = spawnCli(node, ['-e', source], process.cwd());
+    const unrelated = spawn(node, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    let toolPid = 0;
+    let detach = () => {};
+    try {
+      const data = await once(parent.stdout, 'data', { signal: AbortSignal.timeout(5000) });
+      toolPid = Number(String(data[0]).trim());
+      expect(toolPid).toBeGreaterThan(0);
+      const closed = once(parent, 'close', { signal: AbortSignal.timeout(5000) });
+      if (mode === 'terminal') reapCliAfterProtocolTerminal(parent, 100);
+      else {
+        const controller = new AbortController();
+        detach = bindAbort(parent, controller.signal, 100);
+        controller.abort();
+      }
+      await closed;
+      await waitForProcessExit(toolPid, 1000);
+      expect(processIsAlive(toolPid)).toBe(false);
+      expect(processIsAlive(unrelated.pid!)).toBe(true);
+    } finally {
+      detach();
+      killProcessTree(parent, 'SIGKILL');
+      if (toolPid && processIsAlive(toolPid)) { try { process.kill(-toolPid, 'SIGKILL'); } catch {} }
+      unrelated.kill('SIGKILL');
+    }
+  });
+
   it('starts terminal tree termination before closing stdin can release the parent', () => {
     vi.useFakeTimers();
     const actions: string[] = [];

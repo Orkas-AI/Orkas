@@ -5,6 +5,10 @@ import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 import base from '../../../vitest.config';
 
+// Exercise checkpoint receipts through the real launcher without inheriting a
+// parent run's report destination.
+process.env.ORKAS_TEST_BATCH_REPORT = process.env.ORKAS_LOG_FIXTURE_BATCH_REPORT || '';
+
 const reporters = [...(base.test?.reporters as unknown[])];
 if (process.env.ORKAS_LOG_FIXTURE_JSON) reporters.push(['json', { outputFile: process.env.ORKAS_LOG_FIXTURE_JSON }]);
 

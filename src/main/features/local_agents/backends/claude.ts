@@ -677,14 +677,13 @@ export const claudeBackend: LocalBackend = {
       if (trimmed) emit({ type: 'text-delta', text: trimmed });
     }));
 
+    const stderrLines = new LineSplitter(64 * 1024);
+    const stderrLine = (line: string): void => { if (line) emit({ type: 'stderr-line', line }); };
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
       if (exited) return;
       tail.push(chunk);
-      // Emit one event per stderr line so live UI can show progress.
-      for (const line of chunk.split(/\r?\n/)) {
-        if (line) emit({ type: 'stderr-line', line });
-      }
+      stderrLines.push(chunk, stderrLine);
     });
 
     return new Promise<void>(resolve => {
@@ -692,6 +691,7 @@ export const claudeBackend: LocalBackend = {
         if (exited) return;
         publishActiveIngress(false);
         exited = true;
+        stderrLines.flush(stderrLine);
         cancelUserInputs();
         clearBackgroundTimer();
         if (gracefulStopTimer) {

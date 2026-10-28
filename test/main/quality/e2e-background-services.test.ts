@@ -25,6 +25,9 @@ describe('E2E background service contracts', () => {
       writeFileSync(file, 'local edit after catalog snapshot');
       expect(service.asset(new URL(detail.agent_json_url).pathname)?.toString()).toBe(original);
       expect(request('/defaults').body).toEqual({ code: 0, agents: [], skills: [] });
+      expect(request('/categories')).toEqual({ status: 200, body: { code: 0, list: [
+        { code: 'general', name_zh: '通用', name_en: 'General', sort_order: 10 },
+      ] } });
       expect(request('/agents/detail', { id: 'missing' }).status).toBe(404);
       expect(request('/undeclared').status).toBe(404);
       expect(service.marketplace('/agents/list', Buffer.from('not-json'), '').status).toBe(400);

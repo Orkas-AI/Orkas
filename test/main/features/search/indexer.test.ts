@@ -23,9 +23,8 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   return { ...actual, default: { ...actual, stat }, stat };
 });
 
-vi.mock('../../../../src/main/logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
-}));
+const searchDiagnosticLog = vi.hoisted(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
+vi.mock('../../../../src/main/logger', () => ({ createLogger: () => searchDiagnosticLog }));
 
 // indexer.ts pulls path constants from paths.ts at module load. Each test sets
 // ORKAS_WORKSPACE_ROOT before resetting the module graph so a fresh tmp WS
@@ -37,6 +36,7 @@ let prevWs: string | undefined;
 const TEST_UID = 'u1';
 
 beforeEach(async () => {
+  searchDiagnosticLog.info.mockClear(); searchDiagnosticLog.warn.mockClear();
   statHook.holdNextCatalogStat = false;
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-indexer-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
@@ -711,5 +711,38 @@ describe('search/indexer › chat index trust across a clean restart', () => {
     await ix.reindexChatConversation('u1', 'missing-conversation');
     expect(ix.isChatsIndexTrusted('u1')).toBe(false);
     expect(ix.hasPendingChatRepair('u1')).toBe(true);
+  });
+});
+
+
+async function publishedSearchDiagnostics(calls: unknown[][]): Promise<string> {
+  // Exercise the actual final logger redactor too: boundary tests must not
+  // report a leak that the real logger already removes.
+  const logger = await vi.importActual<typeof import('../../../../src/main/logger')>('../../../../src/main/logger');
+  return JSON.stringify(logger.redact(calls));
+}
+function privateReadFailure(): Error {
+  try { fs.readFileSync(path.join(tmpDir, "owner's-PRIVATE_SEARCH_DETAIL.txt")); }
+  catch (error) { return error as Error; }
+  throw new Error('Expected the private fixture file to be absent');
+}
+
+
+describe('context mutation diagnostic privacy', () => {
+  it.each(['upsert', 'drop'] as const)('keeps an unexpected %s storage failure private and permits a later retry', async operation => {
+    writeContext('private.md', 'unchanged source body');
+    const indexer = await loadIndexer(); const storage = await import('../../../../src/main/features/search/storage');
+    const loadFailure = vi.spyOn(storage, 'loadIndex').mockRejectedValueOnce(privateReadFailure());
+    try {
+      if (operation === 'upsert') indexer.upsertContext(TEST_UID, 'private.md');
+      else indexer.dropContext(TEST_UID, 'private.md');
+      await vi.waitFor(() => expect(searchDiagnosticLog.warn.mock.calls.some(call => String(call[0]).startsWith(operation + 'Context failed'))).toBe(true));
+      const records = searchDiagnosticLog.warn.mock.calls.filter(call => String(call[0]).startsWith(operation + 'Context failed'));
+      expect(await publishedSearchDiagnostics(records)).not.toContain('PRIVATE_SEARCH_DETAIL');
+    } finally { loadFailure.mockRestore(); }
+    expect(fs.readFileSync(path.join(tmpDir, TEST_UID, 'cloud', 'contexts', 'private.md'), 'utf8')).toBe('unchanged source body');
+    indexer.upsertContext(TEST_UID, 'private.md');
+    const paths = await import('../../../../src/main/paths');
+    await vi.waitFor(async () => expect((await indexer.getEntry(paths.userContextsIndexPath(TEST_UID), 'context')).idx.docs['private.md']).toBeDefined());
   });
 });

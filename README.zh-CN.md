@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | 内容与媒体 | **ContentWriter** | 将目标、来源或初稿写成可发布的帖子、文章、简报与案例 |
 | | **PptMaker** | 从主题、大纲或文档制作可编辑、可审核的 PPTX 幻灯片 |
 | | **ImageStudio** | 海报、封面、社媒图片与信息图 |
-| | **VideoStudio** | 视频制作与编辑，包括旁白、AI 主播、字幕、配音、片段提取与本地化 |
+| | **VideoStudio** | 视频制作与编辑，包括旁白、AI 主播、字幕、配音、片段提取、本地化，以及用自己的内容和素材复刻参考视频 |
 | | **VoiceStudio** | 旁白、多角色音频、转写与字幕、音频编辑和混音 |
 | | **UIDesigner** | 从产品目标、PRD、截图或 Figma 素材制作以 HTML 为主的可编辑 UI |
 | 开发与办公 | **ProductDeveloper** | 理解代码仓库，落实 PRD、修复缺陷、重构和审查代码，交付可验证的结果 |
@@ -63,6 +63,16 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 了解各智能体 → [orkas.ai/agents](https://orkas.ai/agents/?source=gh-orkas)
 
 </details>
+
+### 用自己的内容和素材复刻参考视频
+
+**VideoStudio** 可以参考爆款视频的叙事结构、视觉风格和剪辑节奏，换成你的产品、文案与素材制作新片。提供参考视频文件和自己的素材后，智能体会分析钩子、信息顺序、画面节拍与行动引导，先列出保留和替换的部分，再进入制作。
+
+适合文字动效讲解、SaaS 或 App 演示，以及用已有商品素材重做广告。单独制作的文字、字幕、配音和片段可以分别修改；AI 生成画面里嵌入的文字需要修改对应画面。
+
+> “参考 reference.mp4 做一条 30 秒竖屏宣传片，保留它的钩子、字体风格和节奏，换成我的产品与录屏。先给我看拆解和制作方案。”
+
+需要提供智能体可读取的视频文件，暂未内置社交平台分享链接下载；不保证精确运镜、真人表演或逐帧还原。详见[参考复刻工作流](./resources/builtin/marketplace/agents/79df9cc89f5f/skills/video-craft/references/reference-recreation.md)。
 
 ---
 

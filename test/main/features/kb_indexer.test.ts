@@ -333,7 +333,7 @@ describe('kb_indexer › enqueue + processJob', () => {
     expect(kb.getFileByPath(TEST_UID, 'short.md')?.chunks).toBe(1);
   });
 
-  it('uses a fallback chunk when image vision extraction fails', async () => {
+  it('marks failed image extraction durably without chunks and recovers on retry', async () => {
     const { Jimp } = await import('jimp' as any);
     const img: any = new Jimp({ width: 16, height: 16, color: 0x336699FF });
     writeCtxBuffer('photo.png', await img.getBuffer('image/png'));
@@ -350,10 +350,25 @@ describe('kb_indexer › enqueue + processJob', () => {
     await idx.drain(TEST_UID);
 
     const row = kb.getFileByPath(TEST_UID, 'photo.png');
-    expect(row?.status).toBe('ready');
-    expect(row?.chunks).toBe(1);
-    const chunks = kb.readFileChunks(TEST_UID, 'photo.png');
-    expect(chunks[0]?.content).toMatch(/automatic visual description is unavailable/);
+    expect(row?.status).toBe('failed');
+    expect(kb.readFileChunks(TEST_UID, 'photo.png')).toEqual([]);
+    expect(fs.existsSync(path.join(contextsRoot(), 'photo.png'))).toBe(true);
+    kb.closeAllKb();
+    expect(kb.getFileByPath(TEST_UID, 'photo.png')?.status).toBe('failed');
+    idx.enqueue(TEST_UID, 'photo.png');
+    await idx.drain(TEST_UID);
+    expect(kb.getFileByPath(TEST_UID, 'photo.png')).toMatchObject({ status: 'ready', error: null });
+    expect(kb.readFileChunks(TEST_UID, 'photo.png')[0]?.content).toBe('mock image description');
+  });
+
+  it('marks an empty image as failed without calling a model or declaring it ready', async () => {
+    writeCtxBuffer('empty.png', Buffer.alloc(0));
+    const idx = await import('../../../src/main/features/kb_indexer');
+    const kb = await import('../../../src/main/features/kb_vector');
+    idx.enqueue(TEST_UID, 'empty.png');
+    await idx.drain(TEST_UID);
+    expect(kb.getFileByPath(TEST_UID, 'empty.png')).toMatchObject({ status: 'failed', chunks: 0 });
+    expect(chatWithModelMock).not.toHaveBeenCalled();
   });
 
   it('times out stalled image vision before the extraction deadline and continues the queue', async () => {
@@ -373,12 +388,10 @@ describe('kb_indexer › enqueue + processJob', () => {
       await idx.drain(TEST_UID);
 
       expect(kb.getFileByPath(TEST_UID, 'stalled-photo.png')).toMatchObject({
-        status: 'ready',
-        chunks: 1,
+        status: 'failed',
+        chunks: 0,
       });
-      expect(kb.readFileChunks(TEST_UID, 'stalled-photo.png')[0]?.content).toMatch(
-        /automatic visual description is unavailable/,
-      );
+      expect(kb.readFileChunks(TEST_UID, 'stalled-photo.png')).toEqual([]);
       expect(kb.getFileByPath(TEST_UID, 'after-image.md')?.status).toBe('ready');
     } finally {
       delete process.env.ORKAS_LIBRARY_IMAGE_DESCRIBE_TIMEOUT_MS;

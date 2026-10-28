@@ -19,6 +19,15 @@ vi.mock('../../../src/main/model/client', () => ({
   async *streamChatWithModel() { yield { type: 'done' }; },
   async chatWithModel() { return { ok: true, text: '' }; },
 }));
+// Deletion now verifies publication for every saved app, including legacy local metadata.
+vi.mock('../../../src/main/features/account/state', () => ({ isSessionVerified: () => true }));
+vi.mock('../../../src/main/features/account/token_store', () => ({
+  getSession: () => ({ user_id: 'uSavedAppDeleteRecycle', session_id: 'synthetic' }),
+  isCurrentSession: () => true,
+}));
+vi.mock('../../../src/main/features/account/http', async original => ({
+  ...await original<any>(), getJson: async () => ({ok:true,data:{apps:[],quota:{tier:'lite',used:0,limit:3,deadline:0,excess:0}}}),
+}));
 vi.mock('node:fs/promises', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   return { ...actual, rm: vi.fn(actual.rm) };

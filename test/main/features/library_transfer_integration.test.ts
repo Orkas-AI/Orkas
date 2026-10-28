@@ -53,7 +53,7 @@ beforeEach(async () => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-library-transfer-'));
   previousWorkspace = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = root;
-  vi.resetModules();
+  vi.resetModules(); vi.clearAllMocks();
   const users = await import('../../../src/main/features/users');
   users.activateUser('u1');
 });
@@ -113,4 +113,90 @@ describe('library_transfer filesystem lifecycle', () => {
     expect(fs.readFileSync(globalPath('plan.md'), 'utf8')).toBe('source version');
     expect(fs.readFileSync(projectPath('plan.md'), 'utf8')).toBe('existing destination');
   });
+});
+
+
+it.each([
+  ['global', 'file'], ['global', 'directory'],
+  ['project', 'file'], ['project', 'directory'],
+] as const)('preserves move sources and concurrent destinations when copying into %s loses a %s allocation race', async (destinationScope, kind) => {
+  const destination = destinationScope === 'global' ? globalPath : projectPath;
+  const source = destinationScope === 'global' ? projectPath : globalPath;
+  const name = kind === 'file' ? 'source.md' : 'source-folder';
+  const sourceFile = kind === 'file' ? source(name) : source(`${name}/copied.md`);
+  const target = destination(`archive/${name}`);
+  const winner = kind === 'file' ? target : path.join(target, 'winner.md');
+  seed(sourceFile, 'Preserved move source'); fs.mkdirSync(destination('archive'), { recursive: true });
+  const transfer = await import('../../../src/main/features/library_transfer');
+  const nodeFs = (await import('node:fs')).default;
+  const { syncBuiltinESMExports } = await import('node:module');
+  const exists = nodeFs.existsSync; let checks = 0; let injected = false;
+  const spy = vi.spyOn(nodeFs, 'existsSync').mockImplementation((filename: any) => {
+    const present = exists(filename);
+    if (String(filename) === target && ++checks === (destinationScope === 'global' ? 1 : 2) && !present) {
+      if (kind === 'directory') fs.mkdirSync(target);
+      fs.writeFileSync(winner, 'Preserved destination winner'); injected = true;
+    }
+    return present;
+  }); syncBuiltinESMExports();
+  let result: any;
+  try {
+    result = await transfer.transferLibraryEntries('u1', {
+      mode: 'move', paths: [name],
+      source: destinationScope === 'global' ? { scope: 'project', projectId: 'p1' } : { scope: 'global' },
+      destination: destinationScope === 'global' ? { scope: 'global', dir: 'archive' }
+        : { scope: 'project', projectId: 'p1', dir: 'archive' },
+    });
+  } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  expect(injected).toBe(true);
+  expect({
+    result: { ok: result.ok, succeeded: result.succeeded, failed: result.failed, error: result.results[0]?.error },
+    source: fs.existsSync(sourceFile) ? fs.readFileSync(sourceFile, 'utf8') : null,
+    winner: fs.existsSync(winner) ? fs.readFileSync(winner, 'utf8') : null,
+    names: kind === 'directory' && fs.existsSync(target) ? fs.readdirSync(target).sort() : [],
+  }).toEqual({
+    result: { ok: true, succeeded: 0, failed: 1, error: 'target_exists' },
+    source: 'Preserved move source', winner: 'Preserved destination winner',
+    names: kind === 'directory' ? ['winner.md'] : [],
+  });
+  const kb = await import('../../../src/main/features/kb_indexer');
+  const projects = await import('../../../src/main/features/project_library_indexer');
+  expect(kb.enqueue).not.toHaveBeenCalled(); expect(projects.enqueue).not.toHaveBeenCalled();
+});
+
+
+it('continues a same-Library move batch after a recoverable parent-directory failure', async () => {
+  seed(globalPath('blocked.md'), 'Preserved failed source');
+  seed(globalPath('ready.md'), 'Successful move source');
+  fs.mkdirSync(globalPath('archive'), { recursive: true });
+  const transfer = await import('../../../src/main/features/library_transfer');
+  const nodeFs = (await import('node:fs')).default;
+  const { syncBuiltinESMExports } = await import('node:module');
+  const mkdir = nodeFs.mkdirSync; let failed = false;
+  const spy = vi.spyOn(nodeFs, 'mkdirSync').mockImplementation(((directory: any, ...args: any[]) => {
+    if (String(directory) === globalPath('archive') && !failed) {
+      failed = true; throw Object.assign(new Error('Injected parent failure'), { code: 'EACCES' });
+    }
+    return (mkdir as any)(directory, ...args);
+  }) as any); syncBuiltinESMExports();
+  let result: any;
+  try {
+    result = await transfer.transferLibraryEntries('u1', {
+      mode: 'move', source: { scope: 'global' }, paths: ['blocked.md', 'ready.md'],
+      destination: { scope: 'global', dir: 'archive' },
+    });
+  } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  expect(failed).toBe(true);
+  expect(result).toMatchObject({ ok: true, succeeded: 1, failed: 1, results: [
+    { source: 'blocked.md', ok: false, error: 'transfer_failed' },
+    { source: 'ready.md', ok: true },
+  ] });
+  expect(fs.readFileSync(globalPath('blocked.md'), 'utf8')).toBe('Preserved failed source');
+  expect(fs.existsSync(globalPath('archive/blocked.md'))).toBe(false);
+  expect(fs.existsSync(globalPath('ready.md'))).toBe(false);
+  expect(fs.readFileSync(globalPath('archive/ready.md'), 'utf8')).toBe('Successful move source');
+  const kb = await import('../../../src/main/features/kb_indexer');
+  expect(kb.enqueue).toHaveBeenCalledTimes(2);
+  expect(kb.enqueue).toHaveBeenNthCalledWith(1, 'u1', 'ready.md', 'delete');
+  expect(kb.enqueue).toHaveBeenNthCalledWith(2, 'u1', 'archive/ready.md', 'upsert');
 });

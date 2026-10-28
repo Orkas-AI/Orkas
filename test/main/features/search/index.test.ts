@@ -4,9 +4,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 
-vi.mock('../../../../src/main/logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
-}));
+const searchDiagnosticLog = vi.hoisted(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
+vi.mock('../../../../src/main/logger', () => ({ createLogger: () => searchDiagnosticLog }));
 
 // index.ts wraps indexer + BM25 scoring + snippet extraction. Each test sets
 // ORKAS_WORKSPACE_ROOT then resetModules so the module graph (paths +
@@ -17,6 +16,7 @@ let prevWs: string | undefined;
 const TEST_UID = 'u1';
 
 beforeEach(async () => {
+  searchDiagnosticLog.info.mockClear(); searchDiagnosticLog.warn.mockClear();
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-search-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
@@ -507,6 +507,37 @@ describe('search › searchAll', () => {
 });
 
 describe('search › searchContexts', () => {
+  it.each(['postings', 'document'] as const)(
+    'recovers a malformed %s snapshot even when source size and time are unchanged', async corruption => {
+      writeContext('needle.md', 'The user source remains authoritative and unchanged.');
+      const paths = await import('../../../../src/main/paths');
+      const storage = await import('../../../../src/main/features/search/storage');
+      const source = path.join(tmpDir, TEST_UID, 'cloud', 'contexts', 'needle.md');
+      const bytes = fs.readFileSync(source);
+      const stat = fs.statSync(source);
+      const snapshot = paths.userContextsIndexPath(TEST_UID);
+      fs.mkdirSync(path.dirname(snapshot), { recursive: true });
+      fs.writeFileSync(snapshot, JSON.stringify({
+        version: storage.SCHEMA_VERSION, kind: 'context',
+        files: { 'needle.md': { mtime: stat.mtimeMs, size: stat.size } },
+        docs: { 'needle.md': corruption === 'document' ? null : {
+          kind: 'context', fileKey: 'needle.md', path: 'needle.md', title: 'needle.md', len: 9,
+          _tokens: ['needle'],
+        } },
+        postings: { needle: corruption === 'postings' ? 'invalid' : [['needle.md', 1]] },
+      }));
+      const search = await loadSearch();
+      await expect(search.searchContexts('needle', TEST_UID)).resolves.toEqual([
+        expect.objectContaining({ kind: 'context', path: 'needle.md', title: 'needle.md' }),
+      ]);
+      expect(fs.readFileSync(source)).toEqual(bytes);
+      expect(fs.statSync(source).mtimeMs).toBe(stat.mtimeMs);
+      await (await import('../../../../src/main/features/search/indexer')).flushAll();
+      expect((await storage.loadIndex(snapshot, 'context')).postings.needle)
+        .toEqual([['needle.md', 1]]);
+    },
+  );
+
   it('returns empty when no contexts indexed', async () => {
     const s = await loadSearch();
     const r = await s.searchContexts('anything');
@@ -1017,5 +1048,73 @@ describe('search › re-exports from indexer', () => {
     // skill_chats / agent_chats search scopes (see `_unlinkLegacyIndexes`).
     // Don't add assertions for them back — those scopes are intentionally
     // out of search.
+  });
+});
+
+
+async function publishedSearchDiagnostics(calls: unknown[][]): Promise<string> {
+  // Exercise the actual final logger redactor too: boundary tests must not
+  // report a leak that the real logger already removes.
+  const logger = await vi.importActual<typeof import('../../../../src/main/logger')>('../../../../src/main/logger');
+  return JSON.stringify(logger.redact(calls));
+}
+function privateReadFailure(): Error {
+  try { fs.readFileSync(path.join(tmpDir, "owner's-PRIVATE_SEARCH_DETAIL.txt")); }
+  catch (error) { return error as Error; }
+  throw new Error('Expected the private fixture file to be absent');
+}
+
+
+describe('search diagnostic privacy', () => {
+  it('keeps the active account out of successful startup diagnostics after central redaction', async () => {
+    const uid = 'private_search_account_identifier';
+    (await import('../../../../src/main/features/users')).activateUser(uid);
+    const search = await loadSearch(); await search.reconcileActive();
+    const records = searchDiagnosticLog.info.mock.calls.filter(call => String(call[0]).startsWith('reconcileActive done'));
+    expect(records).toHaveLength(1);
+    expect(await publishedSearchDiagnostics(records)).not.toContain(uid);
+  });
+
+  it('keeps the active account out of failed startup diagnostics and preserves recovery', async () => {
+    const uid = 'private_search_account_identifier';
+    (await import('../../../../src/main/features/users')).activateUser(uid);
+    const search = await loadSearch(); const indexer = await import('../../../../src/main/features/search/indexer');
+    const repair = vi.spyOn(indexer, 'reconcileContextsIndex').mockRejectedValueOnce(privateReadFailure());
+    try {
+      await expect(search.reconcileActive()).resolves.toBeUndefined();
+      const records = searchDiagnosticLog.warn.mock.calls.filter(call => String(call[0]).startsWith('reconcile user'));
+      expect(records).toHaveLength(1);
+      expect(await publishedSearchDiagnostics(records)).not.toContain(uid);
+    } finally { repair.mockRestore(); }
+    await search.reconcileActive();
+  });
+
+  it('reports a project search failure without account, project or raw filesystem details', async () => {
+    const uid = 'private_search_account_identifier', pid = 'private_project_identifier';
+    const search = await loadSearch(); const files = await import('../../../../src/main/features/project_files');
+    const failure = vi.spyOn(files, 'listProjectFiles').mockRejectedValueOnce(privateReadFailure());
+    try {
+      await expect(search.searchProjectContexts(uid, pid, 'query')).resolves.toEqual([]);
+      const records = searchDiagnosticLog.warn.mock.calls.filter(call => String(call[0]).startsWith('project contexts search failed'));
+      expect(records).toHaveLength(1);
+      const published = await publishedSearchDiagnostics(records);
+      for (const value of [uid, pid, 'PRIVATE_SEARCH_DETAIL']) expect(published).not.toContain(value);
+    } finally { failure.mockRestore(); }
+  });
+
+  it('keeps a real legacy-index unlink failure private even when its source root contains an apostrophe', async () => {
+    const privateRoot = path.join(tmpDir, "owner's-PRIVATE_SEARCH_DETAIL");
+    fs.mkdirSync(privateRoot); process.env.ORKAS_WORKSPACE_ROOT = privateRoot; vi.resetModules();
+    (await import('../../../../src/main/features/users')).activateUser(TEST_UID);
+    const paths = await import('../../../../src/main/paths');
+    const legacy = path.join(paths.userSearchDir(TEST_UID), 'skill_chats.idx.json');
+    fs.mkdirSync(legacy, { recursive: true });
+    const search = await loadSearch(); await search.reconcileActive();
+    const records = searchDiagnosticLog.warn.mock.calls.filter(call => String(call[0]).startsWith('legacy idx unlink'));
+    expect(records).toHaveLength(1);
+    expect(await publishedSearchDiagnostics(records)).not.toContain('PRIVATE_SEARCH_DETAIL');
+    expect(fs.statSync(legacy).isDirectory()).toBe(true);
+    fs.rmdirSync(legacy); await search.reconcileActive();
+    expect(searchDiagnosticLog.warn.mock.calls.filter(call => String(call[0]).startsWith('legacy idx unlink'))).toHaveLength(1);
   });
 });

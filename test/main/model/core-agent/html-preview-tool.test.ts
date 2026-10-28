@@ -216,7 +216,7 @@ describe('html_preview tool', () => {
     const { tool } = await buildTool();
 
     expect(tool.inputSchema).toMatchObject({
-      required: ['path'],
+      required: [],
       properties: {
         target: {
           default: 'desktop',
@@ -233,12 +233,133 @@ describe('html_preview tool', () => {
       },
     });
     const properties = tool.inputSchema.properties as any;
-    expect(tool.description).toContain('isolated, network-blocked browser');
+    expect(tool.description).toContain('isolated browser');
+    expect(properties.artifact_id.description).toContain('current conversation');
     expect(properties.target.description).toContain('Defaults to desktop');
     expect(properties.target.description).toContain('responsive only when viewport-dependent reflow is explicitly requested');
     expect(properties.screenshots.description).toContain('Defaults to false');
     expect(properties.screenshots.description).toContain('never invokes a separate vision API');
     expect(properties.interactions.description).toContain('Set false for visual-only UI review');
+  });
+
+  it('previews a newly created conversation app by its durable ID without a workspace copy', async () => {
+    const { render, workspace, context, screenshots } = await buildTool();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    let artifactId = '';
+    const create = createLocalTools({
+      userId: UID, cid: CID,
+      artifactInteractionSmoke: async () => ({ ok: true, blockers: [], warnings: [] }),
+      onArtifactCreated: (artifact) => { artifactId = artifact.id; },
+    }).find(tool => tool.name === 'create_artifact')!;
+    const created = await create.execute({
+      files: [{ path: 'index.html', content: '<!doctype html><button>Preview</button><script src="__orkas/bridge.js"></script>' }],
+    }, context);
+    expect(created.isError).toBeUndefined();
+    expect(artifactId).not.toBe('');
+    expect(fs.existsSync(path.join(workspace, 'index.html'))).toBe(false);
+    const preview = createLocalTools({ userId: UID, cid: CID }).find(tool => tool.name === 'html_preview')!;
+    const result = await preview.execute({ artifact_id: artifactId, target: 'responsive', screenshots: true }, context);
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content)).toMatchObject({ ok: true, artifact_id: artifactId });
+    expect(JSON.parse(result.content)).not.toHaveProperty('entryPath');
+    const artifacts = await import('../../../../src/main/features/chat_artifacts');
+    const entry = artifacts.resolveArtifactFilePath(UID, CID, artifactId, 'index.html');
+    expect(entry.ok).toBe(true);
+    expect(render).toHaveBeenCalledWith((entry as { absPath: string }).absPath,
+      expect.arrayContaining([expect.objectContaining({ name: 'desktop' }), expect.objectContaining({ name: 'mobile' })]),
+      {}, expect.objectContaining({ bridgeJavaScript: expect.any(String) }));
+    expect(render.mock.calls[0][3]?.fileViewer).not.toBe(true);
+    expect(fs.existsSync(path.join(path.dirname((entry as { absPath: string }).absPath), '__orkas', 'bridge.js'))).toBe(false);
+    expect(result.content).not.toContain(root);
+    await expectLosslessImageMatch(result.images![0], screenshots[0]);
+  });
+
+  it.each([
+    {}, { artifact_id: '' }, { artifact_id: 123 }, { artifact_id: null },
+    { artifact_id: 'app', path: 'index.html' }, { artifact_id: 'app', path: '' },
+    { artifact_id: 'app', path: null },
+  ])('rejects missing or ambiguous preview sources before rendering: %j', async (input) => {
+    const { tool, render, context } = await buildTool();
+    const result = await tool.execute(input, context);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BAD_INPUT');
+    expect(render).not.toHaveBeenCalled();
+  });
+
+  it.each(['other-conversation', 'other-user', 'missing', '../index.html', 'symlink-entry', 'symlink-directory'])(
+    'does not render an inaccessible artifact (%s), even with broad local access', async (scenario) => {
+      const { tool, render, context } = await buildTool();
+      const permissions = await import('../../../../src/main/features/permissions');
+      permissions.setLocalExecMode('all_files_auto');
+      const artifacts = await import('../../../../src/main/features/chat_artifacts');
+      const uid = scenario === 'other-user' ? 'another-user' : UID;
+      const cid = scenario === 'other-conversation' ? 'another-conversation' : CID;
+      const created = await artifacts.createArtifact(uid, cid, '', {
+        files: [{ path: 'index.html', content: '<!doctype html><button>Private app</button>' }],
+      });
+      if (!created.ok) throw new Error('fixture creation failed');
+      const resolved = artifacts.resolveArtifactDir(uid, cid, created.artifactId);
+      if (!resolved.ok) throw new Error('fixture resolution failed');
+      if (scenario.startsWith('symlink')) {
+        const outside = path.join(root, 'outside-app');
+        fs.mkdirSync(outside);
+        fs.writeFileSync(path.join(outside, 'index.html'), '<button>Private</button>');
+        const target = scenario === 'symlink-entry' ? path.join(resolved.dirPath, 'index.html') : resolved.dirPath;
+        fs.rmSync(target, { recursive: true });
+        fs.symlinkSync(scenario === 'symlink-entry' ? path.join(outside, 'index.html') : outside, target);
+      }
+      const artifactId = scenario === 'missing' ? 'unknown-app' : scenario === '../index.html' ? scenario : created.artifactId;
+      const result = await tool.execute({ artifact_id: artifactId }, context);
+      expect(result.isError).toBe(true);
+      expect(result.content).not.toContain(root);
+      expect(render).not.toHaveBeenCalled();
+    },
+  );
+
+  it('requires a conversation binding for artifact IDs', async () => {
+    const { context, render } = await buildTool();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const tool = createLocalTools({ userId: UID }).find(tool => tool.name === 'html_preview')!;
+    const result = await tool.execute({ artifact_id: 'app' }, context);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_NO_CONVERSATION');
+    expect(render).not.toHaveBeenCalled();
+  });
+
+  it('rejects an app after the active account changes', async () => {
+    const { context, render, tool } = await buildTool();
+    const artifacts = await import('../../../../src/main/features/chat_artifacts');
+    const created = await artifacts.createArtifact(UID, CID, '', {
+      files: [{ path: 'index.html', content: '<button>Private app</button>' }],
+    });
+    if (!created.ok) throw new Error('fixture creation failed');
+    const users = await import('../../../../src/main/features/users');
+    users.activateUser('different-account');
+    const result = await tool.execute({ artifact_id: created.artifactId }, context);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_NO_CONVERSATION');
+    expect(render).not.toHaveBeenCalled();
+  });
+
+  it('retains app layout failures and withholds screenshots without exposing its storage path', async () => {
+    const { context, render, tool } = await buildTool({ ok: false, blockers: ['mobile: horizontal overflow is 28px'] });
+    const artifacts = await import('../../../../src/main/features/chat_artifacts');
+    const created = await artifacts.createArtifact(UID, CID, '', {
+      files: [{ path: 'index.html', content: '<button>App with overflow</button>' }],
+    });
+    if (!created.ok) throw new Error('fixture creation failed');
+    const result = await tool.execute({ artifact_id: created.artifactId, screenshots: true }, context);
+    expect(result.isError).toBe(true);
+    expect(result.images).toBeUndefined();
+    expect(JSON.parse(result.content)).toMatchObject({
+      artifact_id: created.artifactId, blockers: ['mobile: horizontal overflow is 28px'],
+      visual_evidence: { attached: false, reason: 'deterministic_checks_failed' },
+    });
+    expect(result.content).not.toContain(root);
+    render.mockRejectedValueOnce(new Error(`cannot load ${root}/private-artifact/index.html`));
+    const failed = await tool.execute({ artifact_id: created.artifactId }, context);
+    expect(failed.content).toContain('E_HTML_PREVIEW_FAILED');
+    expect(failed.content).not.toContain(root);
   });
 
   it('returns deterministic evidence without model images by default', async () => {

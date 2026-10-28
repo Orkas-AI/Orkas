@@ -126,6 +126,7 @@ import { enabledPackageSkillRoots } from '../../features/packages';
 import { getGlobalSkillRootsEnabledForUser } from '../../features/config';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import * as chatArtifacts from '../../features/chat_artifacts';
+import { getActiveUserId } from '../../features/users';
 import { finalizeProducedArtifact, producedDocumentFooterText } from '../../features/produced_output_hooks';
 import { readDisabledSets } from '../../features/component_enabled';
 import {
@@ -172,6 +173,7 @@ import {
 const log = createLogger('local-tools');
 
 export interface ArtifactInteractionSmokeResult {
+  sdkByViewport?: Array<{ viewport: string; calls: Array<{ method: string; code: string }> }>;
   ok: boolean;
   blockers: string[];
   /** Non-blocking embed findings worth telling the author about, e.g. content
@@ -255,7 +257,7 @@ export interface LocalToolsOpts {
   /** Fires after a successful `create_artifact` call. The caller (group_chat
    *  bus) collects these per turn and attaches `message.artifacts` to the
    *  assistant record so the renderer embeds each one in the bubble. */
-  onArtifactCreated?: (a: { id: string; title: string }) => void;
+  onArtifactCreated?: (a: { id: string; title: string; revision?: number }) => void;
   /** Internal override for deterministic tests. Production uses the packaged
    *  isolated-browser interaction smoke before exposing an artifact card. */
   artifactInteractionSmoke?: (entryPath: string) => Promise<ArtifactInteractionSmokeResult>;
@@ -5433,6 +5435,8 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
   });
   return {
     ...coreTool,
+    description:
+      'Apply multiple known edits in one transactional patch to one or more existing or new text files. Existing targets require an unchanged baseline from this run: read_files and successful file-tool writes establish it; bash reads/writes do not. Validation or conflicts leave every target unchanged. Use edit_file for one small replacement.',
     async execute(input, ctx) {
       const result = await coreTool.execute(input, ctx);
       if (result.isError) return result;
@@ -5473,7 +5477,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'edit_file',
     description:
-      'Replace one text pattern in an existing UTF-8 file. Requires an unchanged read/write baseline from this run or a matching expected_hash; earlier turns alone do not establish a baseline. Use write_file to create files and apply_patch for multiple known edits in one or more files.',
+      'Replace one text pattern in an existing UTF-8 file. Requires an unchanged baseline from this run or a matching expected_hash. read_files and successful file-tool writes establish a baseline; bash reads/writes and earlier turns alone do not. Use write_file to create files and apply_patch for multiple known edits in one or more files.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5608,7 +5612,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           };
         }
 
-        const next = replaceAll ? body.split(matchText).join(newStr) : body.replace(matchText, newStr);
+        const next = replaceAll ? body.split(matchText).join(newStr) : body.replace(matchText, () => newStr);
         const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchText(next);
         if (oauthClientMismatchErr) {
           log.warn('edit_file google oauth client/scope mismatch reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
@@ -6010,13 +6014,17 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'html_preview',
     description:
-      'Audit a local HTML entry in an isolated, network-blocked browser and return runtime, resource, overflow, layout, focus, and interaction findings.',
+      'Audit local HTML or a current-conversation app in an isolated browser and return runtime, resource, overflow, layout, focus, and interaction findings.',
     inputSchema: {
       type: 'object',
       properties: {
         path: {
           type: 'string',
-          description: 'Existing local .html/.htm entry path, absolute or relative to $working_dir.',
+          description: 'Existing local .html/.htm entry path, absolute or relative to $working_dir. Supply exactly one of path or artifact_id.',
+        },
+        artifact_id: {
+          type: 'string',
+          description: 'App ID returned by create_artifact in the current conversation. Previews its index.html. Supply exactly one of artifact_id or path.',
         },
         target: {
           type: 'string',
@@ -6051,21 +6059,41 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
           },
         },
       },
-      required: ['path'],
+      required: [],
     },
     async execute(input, ctx) {
-      const rawPath = String(input.path ?? '').trim();
-      if (!rawPath) {
-        return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
+      const artifactMode = input.artifact_id !== undefined;
+      if (artifactMode === (input.path !== undefined)) {
+        return { content: errText('E_BAD_INPUT', 'supply exactly one of `path` or `artifact_id`'), isError: true };
       }
-      const abs = resolveAbs(ctx, rawPath);
+      let abs: string;
+      let artifactId: string | undefined;
+      if (artifactMode) {
+        if (typeof input.artifact_id !== 'string' || !input.artifact_id.trim()) {
+          return { content: errText('E_BAD_INPUT', '`artifact_id` must be a non-empty app ID'), isError: true };
+        }
+        artifactId = input.artifact_id.trim();
+        if (!opts.userId || !opts.cid || getActiveUserId() !== opts.userId) {
+          return { content: errText('E_NO_CONVERSATION', 'artifact preview requires the current account and conversation'), isError: true };
+        }
+        const resolved = chatArtifacts.resolveArtifactFilePath(opts.userId, opts.cid, artifactId, 'index.html');
+        if (!resolved.ok) {
+          return { content: errText('E_HTML_PREVIEW_NOT_FOUND', 'app is unavailable in the current conversation'), isError: true };
+        }
+        abs = resolved.absPath;
+      } else {
+        const rawPath = String(input.path ?? '').trim();
+        if (!rawPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
+        abs = resolveAbs(ctx, rawPath);
+      }
       if (!/\.html?$/i.test(abs)) {
         return {
           content: errText('E_BAD_INPUT', '`path` must point to an .html or .htm file'),
           isError: true,
         };
       }
-      const scopeError = guardHtmlPreviewPath(opts, abs);
+      // Artifact access is confined by its owning resolver, independently of workspace access.
+      const scopeError = artifactMode ? null : guardHtmlPreviewPath(opts, abs);
       if (scopeError) return { content: scopeError, isError: true };
       const sensitiveError = await gateSensitiveLocalPath(
         opts,
@@ -6081,7 +6109,7 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
         stat = fs.lstatSync(abs);
       } catch (error) {
         return {
-          content: errText('E_HTML_PREVIEW_NOT_FOUND', (error as Error).message),
+          content: errText('E_HTML_PREVIEW_NOT_FOUND', artifactMode ? 'app entry is unavailable' : (error as Error).message),
           isError: true,
         };
       }
@@ -6138,14 +6166,17 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
       }
 
       try {
-        // Deliverable pages open in the chat file viewer; check them under its sandbox.
-        const rendered = input.interactions === false
-          ? await renderResponsiveHtmlPreview(abs, viewports, {}, { interactions: false, fileViewer: true })
-          : await renderResponsiveHtmlPreview(abs, viewports, {}, { fileViewer: true });
+        const options = artifactMode ? { bridgeJavaScript: chatArtifacts.BRIDGE_JS } : { fileViewer: true };
+        const rendered = await renderResponsiveHtmlPreview(abs, viewports, {}, {
+          ...options,
+          ...(input.interactions === false ? { interactions: false } : {}),
+        });
+        const { entryPath: _entryPath, ...artifactEvidence } = rendered.evidence;
+        const evidence = artifactMode ? { ...artifactEvidence, artifact_id: artifactId } : rendered.evidence;
         if (!rendered.evidence.ok) {
           return {
             content: JSON.stringify({
-              ...rendered.evidence,
+              ...evidence,
               visual_evidence: {
                 attached: false,
                 reason: 'deterministic_checks_failed',
@@ -6158,7 +6189,7 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
         if (input.screenshots !== true) {
           return {
             content: JSON.stringify({
-              ...rendered.evidence,
+              ...evidence,
               visual_evidence: {
                 attached: false,
                 reason: 'not_requested',
@@ -6172,7 +6203,7 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
         );
         return {
           content: JSON.stringify({
-            ...rendered.evidence,
+            ...evidence,
             visual_evidence: {
               attached: true,
               viewports: rendered.evidence.viewports.map((viewport) => viewport.name),
@@ -6192,7 +6223,7 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
         return {
           content: errText(
             code,
-            detail,
+            artifactMode ? 'app preview could not complete; retry after checking the app' : detail,
           ),
           isError: true,
         };
@@ -6215,8 +6246,9 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        title: { type: 'string', description: 'Short title shown above the embedded app. Optional; defaults to "Interactive app".' },
-        appType: {type:'string',enum:opts.lockedAppType?[opts.lockedAppType]:['local','web'],description:'Omit to inherit the selected creation task or editing source; otherwise defaults to local. Web apps use browser and common data interfaces only; read web-app-sdk for the matching contract.'},
+        artifact_id: { type: 'string', description: 'For a correction, an app ID returned to this creator in the current conversation. Replaces that app with the complete files array, retaining its identity; omit only to create a separate app.' },
+        title: { type: 'string', description: 'Short title above the embedded app. Omit to retain a revised app title; new apps default to "Interactive app".' },
+        appType: {type:'string',enum:opts.lockedAppType?[opts.lockedAppType]:['local','web'],description:'Omit to retain the revised app type or inherit the selected task/editing source; otherwise defaults to local. Web apps use browser and common data interfaces only; read web-app-sdk for the matching contract.'},
         files: {
           type: 'array',
           description: 'Relative app files with a top-level index.html. Local apps may load __orkas/bridge.js for send and resize.',
@@ -6239,15 +6271,18 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
       if (!uid || !cid) {
         return { content: errText('E_NO_CONVERSATION', 'create_artifact is only available inside a conversation.'), isError: true };
       }
+      let finalizationFailed = false;
       const r = await chatArtifacts.createArtifact(uid, cid, opts.agentId || '', {
+        artifactId: (input as { artifact_id?: unknown }).artifact_id,
         title: (input as { title?: unknown }).title,
         appType: (input as {appType?:unknown}).appType,
         files: (input as { files?: unknown }).files,
+      }, async (stagedDir, artifactId) => {
+        try {
+          await finalizeProducedArtifact(stagedDir, { userId: uid, cid, artifactId, source: 'create_artifact' });
+        } catch (err) { finalizationFailed = true; throw err; }
       });
       if (!r.ok) {
-        if ((await import('../../features/web_apps/commercial-entry')).isCommercialWebAppFailure(r)) {
-          return { content: JSON.stringify(r), isError: true };
-        }
         // Cast in the error branch — `strictNullChecks: false` keeps the
         // whole `Result<>` union here (codebase-wide workaround).
         const errMsg = (r as { error?: string }).error || 'invalid artifact';
@@ -6257,29 +6292,11 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
           agent_id: maskId(opts.agentId),
           error: logErrorRef(new Error(errMsg)),
         });
-        return { content: errText('E_BAD_ARTIFACT', errMsg), isError: true };
+        return { content: errText(finalizationFailed ? 'E_ARTIFACT_FINALIZE_FAILED' : 'E_BAD_ARTIFACT', errMsg), isError: true };
       }
       const resolved = chatArtifacts.resolveArtifactDir(uid, cid, r.artifactId);
       if (!resolved.ok) {
         return { content: errText('E_ARTIFACT_FINALIZE_FAILED', 'artifact directory could not be resolved after creation'), isError: true };
-      }
-      try {
-        await finalizeProducedArtifact(resolved.dirPath, {
-          userId: uid,
-          cid,
-          artifactId: r.artifactId,
-          source: 'create_artifact',
-        });
-      } catch (err) {
-        const discarded = chatArtifacts.discardArtifact(uid, cid, r.artifactId);
-        log.warn('create_artifact finalizer failed', {
-          user_id: maskId(uid),
-          cid: maskId(cid),
-          artifact_id: maskId(r.artifactId),
-          discarded: discarded.ok,
-          error: logErrorRef(err),
-        });
-        return { content: errText('E_ARTIFACT_FINALIZE_FAILED', (err as Error).message || 'artifact post-processing failed'), isError: true };
       }
       let smoke: ArtifactInteractionSmokeResult;
       try {
@@ -6290,6 +6307,7 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
           const interactions = rendered.evidence.interactions;
           return {
             ok: rendered.evidence.ok,
+            sdkByViewport: rendered.evidence.sdkByViewport,
             blockers: rendered.evidence.blockers,
             warnings: rendered.evidence.warnings,
             controlsExercised: interactions.controlsExercised,
@@ -6305,7 +6323,7 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
         smoke = { ok: false, blockers: ['Preview unavailable; verify the application in its window.'] };
       }
       if (opts.onArtifactCreated) {
-        try { opts.onArtifactCreated({ id: r.artifactId, title: r.title }); }
+        try { opts.onArtifactCreated({ id: r.artifactId, title: r.title, revision: r.revision }); }
         catch (err) { log.warn('onArtifactCreated callback failed', { artifact_id: maskId(r.artifactId), error: logErrorRef(err) }); }
       }
       log.info('create_artifact created', {
@@ -6320,13 +6338,19 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
       // artifact that does not know the box it lands in writes a full-screen
       // shell and ships it clipped.
       const smokeWarnings = [...smoke.blockers, ...(smoke.warnings ?? [])];
+      // Preserve bounded facts even when the app handles an SDK error itself.
+      // Neither denial nor unavailable preview capabilities block delivery.
+      const sdkObservations = [...new Set((smoke.sdkByViewport ?? []).flatMap(view =>
+        view.calls.filter(call => call.code !== 'OK').map(call => `${view.viewport} ${call.method}: ${call.code}`)))];
       const web=chatArtifacts.readArtifactMeta(uid,cid,r.artifactId)?.appType==='web';
       return {
         content:
-          `Artifact "${r.title}" created (id ${r.artifactId}); preview ${smoke.ok ? 'checks passed' : 'reported issues'} ` +
+          `Artifact "${r.title}" ${(input as { artifact_id?: unknown }).artifact_id !== undefined ? 'updated' : 'created'} (id ${r.artifactId}); revision ${r.revision}; preview ${smoke.ok ? 'completed' : 'reported issues'} ` +
           `(${smoke.controlsExercised ?? 0} control(s), ${smoke.observableEffects ?? 0} observable effect(s)) ` +
-          `at desktop, chat-embed, and mobile viewports. ` +
+          `at desktop, chat-embed, and mobile viewports. This bounded preview is not a full functional verification. ` +
+          (sdkObservations.length ? `SDK observations (temporary preview data): ${sdkObservations.slice(0, 12).join(' | ')}${sdkObservations.length > 12 ? ` | ${sdkObservations.length - 12} more observation(s)` : ''}. ` : '') +
           `It is now shown to the user inside this reply, so do NOT paste its HTML in your message. ` +
+          `For corrections, call create_artifact with artifact_id "${r.artifactId}" and the complete files array to update this same app. ` +
           `Frame: the card opens ${chatArtifacts.ARTIFACT_FRAME.defaultHeight}px tall and grows to at most ` +
           `${chatArtifacts.ARTIFACT_FRAME.maxHeight}px, at roughly ${chatArtifacts.ARTIFACT_FRAME.smokeWidth}px wide. ` +
           (web ? `Web app: use browser and common data interfaces. Keep content within the embedded frame; taller content scrolls. ` :

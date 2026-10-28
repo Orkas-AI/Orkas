@@ -1059,7 +1059,7 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
         `tool=${safeToolNameForLog(e.name)} call=${maskId(e.id)} error=${e.isError ? 'true' : 'false'}${e.errorSeverity ? ` severity=${e.errorSeverity}` : ''}`,
       );
       const runtimeException = ['tool_execution_exception', 'tool_execution_stalled', 'tool_result_processing_exception'].includes(String(e.errorCode || ''));
-      recordToolResultRecovery(stats, e, !!e.isError && e.errorSeverity !== 'recoverable' && !runtimeException);
+      recordToolResultRecovery(stats, e, !!e.isError && !e.executionCancelled && e.errorSeverity !== 'recoverable' && !runtimeException);
       const planMutation = safePlanMutationForLog(e);
       const providerRound = stats.providerRounds.at(-1);
       if (planMutation && providerRound) {
@@ -1588,6 +1588,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     conversationTitleUpdatedAt,
     turnId,
     historyBoundaryMessageId,
+    outputDelivery,
     projectId,
     onFileWritten,
     onOutputsPublished,
@@ -1886,8 +1887,10 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(conversationTitleUpdatedAt ? { conversationTitleUpdatedAt } : {}),
       ...(turnId ? { turnId } : {}),
       ...(historyBoundaryMessageId ? { historyBoundaryMessageId } : {}),
+      ...(outputDelivery ? { outputDelivery } : {}),
       ...(message ? { userMessage: message } : {}),
       ...(attachmentMetadata ? { attachmentMetadata } : {}),
+      ...(opts.requireImageInput ? { requireImageInput: true } : {}),
       ...(projectId ? { projectId } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
       ...(systemSkillList !== undefined ? { systemSkillList: [...systemSkillList] } : {}),
@@ -1950,6 +1953,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       toolSurfaceMode,
       resolvedSystemPrompt,
       turnEphemeral,
+      initialReadFileState,
       profileId,
       entryId,
       toolDefs,
@@ -2055,6 +2059,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       sandboxEnv,
       ...(workingDir ? { workingDir } : {}),
       ...(turnEphemeral ? { turnEphemeral } : {}),
+      ...(initialReadFileState?.size ? { initialReadFileState } : {}),
       ...(images && images.length ? { images } : {}),
       ...(historyResources && historyResources.length ? { historyResources } : {}),
       ...(Object.keys(requestMetadata).length ? { requestMetadata } : {}),

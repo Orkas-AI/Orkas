@@ -13,6 +13,7 @@ import { createLogger } from '../logger';
 import { killProcessTree } from '../../core-agent/src/sandbox/executor';
 import { getDeviceId } from './machine_device_id';
 import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
+import { bundledFfmpegPaths } from '../util/bundled-runtime';
 
 const log = createLogger('generation-reference-assets');
 
@@ -258,7 +259,7 @@ async function prepareVideo(
     return { buf: raw, mimeType, fileName: ensureExt(path.basename(localPath), extForVideoMime(mimeType)) };
   }
 
-  const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg';
+  const ffmpeg = process.env.FFMPEG_PATH || bundledFfmpegPaths().ffmpeg || 'ffmpeg';
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orkas-ref-video-'));
   const outPath = path.join(tmpDir, 'reference.mp4');
   try {

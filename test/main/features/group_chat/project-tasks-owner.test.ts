@@ -91,16 +91,44 @@ async function setupHandler(global = false): Promise<{ pid: string; projectTasks
     projectId: global ? undefined : pid,
   }).catch(() => {});
   if (!captured.handler) throw new Error('todo_tasks handler was not captured from buildRunner');
-  if (global) {
-    const resolved = await captured.handler.resolveProject('__global__');
-    expect(resolved.ok).toBe(true);
-    captured.handler = resolved.handler;
-  }
   const projectTasks = await import('../../../../src/main/features/project_tasks');
   return { pid: global ? '' : pid, projectTasks };
 }
 
 describe('runner › todo_tasks owner resolution', () => {
+  it.each([false, true])('does not write after the caller stopped waiting (global=%s)', async global => {
+    const { pid, projectTasks } = await setupHandler(global);
+    const task = await projectTasks.createTask(TEST_UID, pid, { content: 'Keep the original work' });
+    if (!task.ok) throw new Error('task fixture failed');
+    const controller = new AbortController(); controller.abort();
+    const { createProjectTasksHandler } = await import('../../../../src/main/features/project_tasks_tool_handler');
+    const handler = createProjectTasksHandler(TEST_UID, pid, 'cancelled-call', new Map(), {}, {}, undefined, undefined, controller.signal);
+    for (const operation of [
+      () => handler.create({ content: 'Late work' }),
+      () => handler.update(task.task.id, { content: 'Late replacement' }),
+      () => handler.complete(task.task.id),
+    ]) await expect(operation()).rejects.toThrow('E_BRIDGE_CALL_CANCELLED');
+    expect(await projectTasks.listTasks(TEST_UID, pid)).toEqual([task.task]);
+  }, 30_000);
+
+  it.each([false, true])('keeps reserved Commander ownership available without a roster entry (global=%s)', async global => {
+    const { pid, projectTasks } = await setupHandler(global);
+    const created = await captured.handler.create({ content: 'Continue the authorized task', owner: 'Commander' });
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    const expectedOwner = { owner_agent: 'Commander', owner_agent_id: 'commander' };
+    expect(await projectTasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject(expectedOwner);
+
+    expect((await captured.handler.update(created.task.id, { owner: BOUND_NAME })).ok).toBe(true);
+    expect((await captured.handler.update(created.task.id, { owner: 'commander', status: 'progress' })).ok).toBe(true);
+    expect(await projectTasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ ...expectedOwner, status: 'progress' });
+
+    // A reserved actor must not let a stale handler write after an account switch.
+    (await import('../../../../src/main/features/users')).activateUser('another-owner-account');
+    expect(await captured.handler.update(created.task.id, { owner: 'Commander', status: 'done' }))
+      .toEqual({ ok: false, error: 'account_changed' });
+    expect(await projectTasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ ...expectedOwner, status: 'progress' });
+  }, 30_000);
+
   it('assigns and reassigns global tasks to enabled account agents by name or id', async () => {
     const { pid, projectTasks } = await setupHandler(true);
     const created = await captured.handler.create({ title: 'Global work', owner: 're viewer' });

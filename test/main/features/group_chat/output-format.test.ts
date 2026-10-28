@@ -14,6 +14,15 @@ import {
 } from '../../../../src/main/features/local_agents/context';
 
 describe('group-chat response language', () => {
+  it('uses the reply-language contract for form labels even when it differs from the UI language', async () => {
+    const prompt = await _buildAgentInGroupSystemPromptForTest({
+      agent_id: 'form-language', name: 'FormLanguage', input_channel: 'form',
+    }, '/tmp/form-language', 'zh');
+    expect(prompt).toContain('form labels');
+    expect(prompt).toContain('current explicit request about reply language');
+    expect(prompt).not.toContain('label in user UI language');
+  });
+
   it('keeps prompt-internal descriptions in English while user language outranks the Chinese UI fallback', async () => {
     const prompt = await _buildAgentInGroupSystemPromptForTest({
       agent_id: 'language-contract-agent',
@@ -26,7 +35,7 @@ describe('group-chat response language', () => {
     expect(prompt).toContain('ENGLISH_DESCRIPTION_SHOULD_NOT_RENDER');
     expect(prompt).not.toContain('仅中文运行说明');
     expect(prompt).toContain('Fallback UI language: **Chinese (简体中文)**');
-    expect(prompt).toContain('a current explicit user language request');
+    expect(prompt).toContain('a current explicit request about reply language');
     expect(prompt).toContain("the clear language of the user's latest substantive prose");
     expect(prompt).toContain('Write all human-readable prose in the chosen language');
     expect(prompt.lastIndexOf('## User language'))
@@ -64,13 +73,13 @@ describe('named Agent execution ownership', () => {
       .toBeLessThan(prompt.indexOf('## Runtime injection'));
     expect(prompt).not.toContain('Plan/upstream/downstream state belongs to the bus/commander.');
     expect(prompt).not.toMatch(/current-task execution Plan|Use an execution Plan|manage_execution_plan/i);
-    const boundary = prompt.indexOf('or granted permissions, hand it back to the commander');
+    const boundary = prompt.indexOf('or granted permissions, you must hand the task back to the commander');
     expect(boundary).toBeGreaterThanOrEqual(0);
     expect(boundary).toBeLessThan(prompt.indexOf('## Runtime injection'));
     expect(prompt).toContain('preserved progress, and facts needed to continue');
-    expect(prompt).toContain('an operation reserved for another actor');
-    expect(prompt).toContain('that handing off cannot resolve is NOT a capability boundary');
-    expect(prompt).toContain('Do not hand back for missing input, a recoverable failure');
+    expect(prompt).toContain('The commander decides how to continue');
+    expect(prompt).toContain('that handing off cannot resolve');
+    expect(prompt).toContain('Do not hand back merely for missing input, a recoverable failure');
     expect(prompt).toContain('instead of silently substituting another choice');
     expect(prompt).toContain('Preserve the intended scope');
     expect(prompt).toContain('Claim a memory change only after the tool confirms success');
@@ -185,20 +194,38 @@ describe('group_chat output_format prompt hints', () => {
     }
   });
 
-  it('assembles the output selector before the shared format grammar', async () => {
+  it.each(['auto', undefined, 'future-mode', 'dashboard', 'artifact', 'allow_artifacts'])('retains rich-output grammar once in the stable prefix for %s', async (output_format) => {
     const prompt = await _buildAgentInGroupSystemPromptForTest({
       agent_id: 'output-contract-agent',
       name: 'OutputContractAgent',
       workflow: 'Return the requested result.',
-      output_format: 'auto',
+      output_format,
     }, '/tmp/output-contract-agent', 'en');
 
     const selector = prompt.indexOf('### Presentation preference');
     const grammar = prompt.indexOf('## Output formats');
     expect(selector).toBeGreaterThanOrEqual(0);
     expect(grammar).toBeGreaterThan(selector);
-    expect(prompt.match(/Automatic layout:/g)).toHaveLength(1);
-    expect(prompt).toContain('{"schema_version":1,"root":{"type":"Stack"');
+    expect(prompt.match(/\{"schema_version":1,"root":\{"type":"Stack"/g)).toHaveLength(1);
+    expect(prompt).toContain('**`create_artifact`** is a sandboxed app');
+    expect(prompt.indexOf('**`:::dashboard`**')).toBeLessThan(prompt.indexOf('## Runtime injection'));
+  });
+
+  it.each(['text', 'markdown_only'])('omits rich-output instructions for %s while retaining ordinary reply and execution rules', async (output_format) => {
+    const prompt = await _buildAgentInGroupSystemPromptForTest({
+      agent_id: 'text-output-contract-agent',
+      workflow: 'Return the requested result.',
+      output_format,
+    }, '/tmp/text-output-contract-agent', 'en');
+    expect(prompt).toContain('Do NOT emit `:::dashboard` blocks or call `create_artifact`');
+    expect(prompt).toContain('## Ordinary reply structure');
+    expect(prompt).toContain('Lead with the direct conclusion');
+    expect(prompt).toContain('Complete the authorized scope');
+    expect(prompt).toContain('Tool results are working data');
+    expect(prompt).not.toContain('**`:::dashboard`**');
+    expect(prompt).not.toContain('"schema_version":1,"root"');
+    expect(prompt).not.toContain('kind=line|bar|area|pie');
+    expect(prompt).not.toContain('**`create_artifact`** is a sandboxed app');
   });
 
   it('turns text and its legacy alias into a hard standard-reply instruction', () => {
@@ -214,15 +241,24 @@ describe('group_chat output_format prompt hints', () => {
     }
   });
 
-  it('turns dashboard into dashboard-preferred and artifact-blocked instructions', () => {
+  it('prefers dashboard data presentation without adding app instructions', async () => {
     const hint = _buildOutputFormatHintForTest('dashboard');
 
     expect(hint).toContain('### Presentation preference');
-    expect(hint).not.toContain('### Output format');
-    expect(hint).toContain('dashboard output');
-    expect(hint).toContain('read-only structured snapshots');
-    expect(hint).toContain('Follow the `Output formats` schema exactly');
-    expect(hint).toContain('NOT call `create_artifact`');
+    expect(hint).toMatch(/Prefer.*`:::dashboard`.*`Output formats`.*structured data/);
+    expect(hint).not.toMatch(/fenced|create_artifact|interactive apps/i);
+
+    const prompt = await _buildAgentInGroupSystemPromptForTest({
+      agent_id: 'dashboard-preference-agent',
+      name: 'DashboardPreferenceAgent',
+      workflow: 'Present the requested data.',
+      output_format: 'dashboard',
+    }, '/tmp/dashboard-preference-agent', 'en');
+    expect(prompt).toContain(hint);
+    expect(prompt.match(/## Output formats/g)).toHaveLength(1);
+    expect(prompt.indexOf(hint)).toBeLessThan(prompt.indexOf('## Output formats'));
+    expect(prompt).toContain('not a tool call or Markdown code fence');
+    expect(prompt).not.toMatch(/NOT call `create_artifact`|fenced `:::dashboard`/);
   });
 
   it('allows artifacts for both the current value and legacy alias', () => {
@@ -301,14 +337,14 @@ describe('group_chat CLI output_format prompt hints', () => {
     expect(rendered).not.toMatch(/\$output_[A-Za-z0-9_]+/);
   });
 
-  it('keeps only a compact language directive in durable CLI instructions', () => {
+  it('shares the language directive without adding runtime or date blocks to durable CLI instructions', () => {
     const durable = buildCliDurableInstructions({
       agentName: 'CliAgent',
       workflow: 'Run local CLI tasks.',
       language: 'zh',
     });
 
-    expect(durable).toContain('## Response language');
+    expect(durable).toContain('## User language');
     expect(durable).toContain('Chinese (简体中文)');
     expect(durable).not.toContain('## Runtime injection');
     expect(durable).not.toContain('## Current date');
@@ -320,19 +356,19 @@ describe('group_chat plan interaction prompt hints', () => {
     expect(_buildPlanInteractionHintForTest(false)).toBe('');
   });
 
-  it('tells interactive agents when to open plan interaction', () => {
+  it('keeps only the waiting and completion signals in the plan hint', () => {
     const hint = _buildPlanInteractionHintForTest(true);
 
     expect(hint).toContain('### Plan interaction');
-    expect(hint).toMatch(/insufficient-input reply contains only/i);
-    expect(hint).toMatch(/required internal result marker/i);
-    expect(hint).toMatch(/channel-specific input request above/i);
+    expect(hint).toMatch(/waiting for user input/i);
+    expect(hint).toMatch(/each reply that still requires input/i);
     expect(hint).toContain('<plan-interaction status="open" />');
-    expect(hint).toMatch(/recommendation, diagnosis, plan, report/i);
+    expect(hint).toMatch(/When the step is complete/i);
     expect(hint).toContain('<plan-interaction status="closed" />');
+    expect(hint).not.toMatch(/internal result marker|reply contains only|channel-specific input request|Do not add a recommendation/i);
   });
 
-  it('keeps the pause protocol for a prose-channel agent without teaching a form mandate', async () => {
+  it.each(['prose', 'form'] as const)('keeps the pause protocol separate from the %s input channel', async (channel) => {
     // The pause signal is the plan-interaction marker, which every consumer
     // accepts on its own (`!!form || planInteraction === 'open'`), so a
     // formless agent still pauses a plan step correctly.
@@ -341,12 +377,15 @@ describe('group_chat plan interaction prompt hints', () => {
       name: 'ProseInputAgent',
       workflow: 'Work interactively with the user.',
       interactive: true,
-      input_channel: 'prose',
+      input_channel: channel,
     }, '/tmp/prose-input-agent', 'en');
     expect(prompt).toContain('### Plan interaction');
     expect(prompt).toContain('<plan-interaction status="open" />');
+    expect(prompt).toContain('<plan-interaction status="closed" />');
+    expect(prompt).not.toContain('internal result marker');
     expect(prompt).toMatch(/at most 2-3 focused fields or questions/i);
-    expect(prompt).not.toMatch(/output exactly one `<agent-input-form>`/i);
+    expect(/output exactly one `<agent-input-form>`/i.test(prompt)).toBe(channel === 'form');
+    expect(prompt.indexOf('### Plan interaction')).toBeLessThan(prompt.indexOf('## Runtime injection'));
   });
 });
 

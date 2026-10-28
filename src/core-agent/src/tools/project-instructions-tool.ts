@@ -14,10 +14,11 @@
  */
 
 import type { AgentTool, ToolContext, ToolResult } from "./base.js";
+import { PROJECT_INSTRUCTIONS_TEXT_DESCRIPTION } from '../../../../bin/project-instructions-contract.cjs';
 
 export interface ProjectInstructionsToolHandler {
   /** Replace the project's instructions with `instructions` (full content). */
-  set(instructions: string): Promise<{ ok: boolean; error?: string }>;
+  set(instructions: string): Promise<{ ok: boolean; error?: string; limit?: number; actual?: number }>;
 }
 
 const TOOL_DESCRIPTION =
@@ -32,7 +33,7 @@ export function createProjectInstructionsTool(handler: ProjectInstructionsToolHa
       properties: {
         instructions: {
           type: 'string',
-          description: 'Complete replacement goal/rules text, including any existing content that still applies.',
+          description: PROJECT_INSTRUCTIONS_TEXT_DESCRIPTION,
         },
       },
       required: ['instructions'],

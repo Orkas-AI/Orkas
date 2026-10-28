@@ -48,6 +48,8 @@ const specialScenarios = [
   'mcp-elicitation',
   'unknown-request',
   'hang',
+  'native-interrupt',
+  'interrupt-ignored',
 ];
 const scenario = specialScenarios.find((name) => process.argv.includes('--' + name))
   || 'resume-fallback';
@@ -63,7 +65,17 @@ if (envTraceFlag >= 0) {
 const received = [];
 let buffer = '';
 let experimentalApiEnabled = false;
-const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n');
+const terminalAtFlag = process.argv.indexOf('--terminal-at');
+const terminalAtPath = terminalAtFlag >= 0 ? process.argv[terminalAtFlag + 1] : '';
+const send = (message) => {
+  const terminal = message.method === 'turn/completed' || message.method === 'thread/closed'
+    || (message.method === 'error' && message.params?.willRetry === false)
+    || (message.method === 'thread/status/changed' && ['idle', 'systemError'].includes(message.params?.status?.type));
+  // Record the first terminal candidate before delivery, retaining the pipe and
+  // system-error ordering window inside the settlement budget.
+  if (terminalAtPath && terminal && !fs.existsSync(terminalAtPath)) fs.writeFileSync(terminalAtPath, String(Date.now()));
+  process.stdout.write(JSON.stringify(message) + '\\n');
+};
 const record = (message) => {
   received.push(message);
   if (tracePath) fs.writeFileSync(tracePath, JSON.stringify(received));
@@ -124,6 +136,10 @@ process.stdin.on('data', (chunk) => {
         continue;
       }
       send({ jsonrpc: '2.0', id: message.id, result: { threadId: 'fresh-thread' } });
+    } else if (message.method === 'turn/interrupt') {
+      if (scenario === 'interrupt-ignored') continue;
+      send({ id: message.id, result: {} });
+      send({ method: 'turn/completed', params: { threadId: 'fresh-thread', turn: { id: 'turn-1', status: 'interrupted' } } });
     } else if (message.method === 'turn/start') {
       if (scenario === 'turn-start-hang') continue;
       if (rejectUnnegotiatedPermissions(message)) continue;
@@ -1645,13 +1661,13 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
   it('settles a fatal protocol error before a lingering CLI process exits', async () => {
     const events: any[] = [];
     let pid = -1;
-    const startedAt = Date.now();
+    const terminalAtFile = path.join(tempDir, 'fatal-terminal-at');
 
     try {
       await codexBackend.run({
         binPath: fakeCodexPath,
         prompt: 'fails after starting',
-        customArgs: ['--fatal-lingers'],
+        customArgs: ['--fatal-lingers', '--terminal-at', terminalAtFile],
         cwd: process.cwd(),
         signal: new AbortController().signal,
         timeoutMs: 5_000,
@@ -1661,7 +1677,9 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
         },
       });
 
-      expect(Date.now() - startedAt).toBeLessThan(750);
+      const terminalAt = Number(fs.readFileSync(terminalAtFile, 'utf8'));
+      expect(terminalAt).toBeGreaterThan(0);
+      expect(Date.now() - terminalAt).toBeLessThan(750);
       expect(events.at(-1)).toMatchObject({
         type: 'done',
         status: 'failed',
@@ -1706,13 +1724,13 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
   ])('settles $scenario from its authoritative terminal event', async ({ scenario, expected }) => {
     const events: any[] = [];
     let pid = -1;
-    const startedAt = Date.now();
+    const terminalAtFile = path.join(tempDir, `terminal-at-${scenario}`);
 
     try {
       await codexBackend.run({
         binPath: fakeCodexPath,
         prompt: 'terminal matrix',
-        customArgs: [`--${scenario}`],
+        customArgs: [`--${scenario}`, '--terminal-at', terminalAtFile],
         cwd: process.cwd(),
         signal: new AbortController().signal,
         timeoutMs: 5_000,
@@ -1722,7 +1740,9 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
         },
       });
 
-      expect(Date.now() - startedAt).toBeLessThan(750);
+      const terminalAt = Number(fs.readFileSync(terminalAtFile, 'utf8'));
+      expect(terminalAt).toBeGreaterThan(0);
+      expect(Date.now() - terminalAt).toBeLessThan(750);
       expect(events.at(-1)).toMatchObject({ type: 'done', ...expected });
       if (scenario === 'system-error-lingers') {
         expect(events.at(-1).error).toBeUndefined();
@@ -1798,6 +1818,38 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
     ]);
     expect(events.at(-1)).toMatchObject({ type: 'done', ...expected });
     expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+  });
+
+  it.each([
+    { scenario: 'native-interrupt', mode: 'abort', status: 'cancelled' },
+    { scenario: 'native-interrupt', mode: 'timeout', status: 'timeout' },
+    { scenario: 'interrupt-ignored', mode: 'abort', status: 'cancelled' },
+  ])('interrupts the active native turn before forced cleanup: $scenario / $mode', async ({ scenario, mode, status }) => {
+    const trace = path.join(tempDir, `interrupt-${scenario}-${mode}.json`);
+    const controller = new AbortController();
+    const events: any[] = [];
+    let pid = 0;
+    try {
+      await codexBackend.run({
+        binPath: fakeCodexPath, prompt: 'Wait for cancellation', cwd: tempDir,
+        customArgs: [`--${scenario}`, '--trace', trace], cliVersion: '0.145.0', modelOverride: 'fixture-model',
+        signal: controller.signal, timeoutMs: mode === 'timeout' ? 800 : 5000,
+        onEvent: event => {
+          events.push(event);
+          if (event.type === 'process-info') pid = Number(event.pid);
+          if (mode === 'abort' && event.type === 'status' && event.status === 'running') controller.abort();
+        },
+      });
+      const messages = JSON.parse(fs.readFileSync(trace, 'utf8'));
+      expect(messages.filter((message: any) => message.method === 'turn/interrupt')).toEqual([
+        { jsonrpc: '2.0', id: expect.any(Number), method: 'turn/interrupt', params: { threadId: 'fresh-thread', turnId: 'turn-1' } },
+      ]);
+      expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({ type: 'done', status });
+      await expectProcessToExit(pid);
+    } finally {
+      if (pid > 0) { try { process.kill(-pid, 'SIGKILL'); } catch {} }
+    }
   });
 
   it('reports cancellation when an in-flight Codex process is aborted', async () => {

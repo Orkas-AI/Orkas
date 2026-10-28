@@ -24,7 +24,9 @@ const AGENT_PROMPT = path.join(
 // (single owner), releasing ~250 characters; the ceiling follows the surface.
 // Shared retrieval owns the trigger; removing the stale shared-history
 // compaction claim and duplicate routing prose releases another 82 characters.
-const WHOLE_PROMPT_CEILING = 6_500;
+// The approved two-branch handback rewrite releases another 149 characters;
+// retain the same headroom rather than allowing removed procedures to regrow.
+const WHOLE_PROMPT_CEILING = 6_350;
 // The tool owns durability, destinations and write permissions. The role keeps
 // scope preservation and the success claim; generic mechanics own handback.
 const MEMORY_SECTION_CEILING = 340;

@@ -60,6 +60,7 @@ describe('Commander resident prompt surface', () => {
     const { whole } = readSurfaces();
     const combined = whole
       + fs.readFileSync(SHARED_RULES, 'utf8')
+      + fs.readFileSync(path.join(PROMPTS_DIR, 'chat_rich_output_rules.md'), 'utf8')
       + fs.readFileSync(USER_INTENT_RULES, 'utf8');
     expect(combined.length).toBeLessThanOrEqual(COMBINED_STATIC_CEILING);
   });

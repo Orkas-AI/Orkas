@@ -60,6 +60,7 @@ import { getLocaleMeta } from '../i18n';
 import { scheduleBootBackground, isBootAdmissionIdle, type ScheduledBootBackgroundTask } from '../util/boot_init';
 import { registerUserSwitchHook } from './user-switch-hooks';
 import { getActiveUserId } from './users';
+import { allConfiguredModelsCooledDown } from './auth';
 type ReflectionErrorCode =
   | 'transcript_unavailable'
   | 'empty_response'
@@ -597,9 +598,13 @@ async function runCycle(uid: string, opts: RunCycleOpts): Promise<number> {
   // backoff) for nothing, after paying the dirty scan and runner build. Skip
   // without touching any window; the cooldown is short next to the 14h
   // cadence. Nothing configured at all is left to `buildRunner`'s own gate.
-  // Managed-provider cooldown inspection is private. Orkas still honors
-  // the injectable gate used by deterministic tests and host integrations.
-  const isModelUsable = opts.isModelUsable ?? (() => true);
+  const isModelUsable = opts.isModelUsable ?? (() => {
+    try { return !allConfiguredModelsCooledDown(); }
+    catch (err) {
+      log.warn('model availability probe failed; running the cycle anyway', { error: logErrorSummary(err) });
+      return true;
+    }
+  });
   if (!isModelUsable()) {
     log.info('cycle: every configured model candidate is cooling down, skipping');
     return 0;

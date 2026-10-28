@@ -12,7 +12,7 @@ import { getActiveUserId, hasActiveUser } from './users';
 import { userRemoteConfigFile } from '../paths';
 import { readJsonSync, writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
-import { fetchWithRetry } from '../util/retry';
+import { fetchAndReadWithRetry } from '../util/retry';
 import { desktopPlatform } from '../system_info';
 import { withCommonHeaders } from './api_common';
 import { DEFAULT_RETRY_ERROR_POLICY, type RetryErrorPolicyConfig } from '../../core-agent/src/shared/errors';
@@ -54,6 +54,7 @@ type ElectronPowerMonitorLike = {
 };
 
 const log = createLogger('client-config');
+const CLIENT_CONFIG_REFRESH_TIMEOUT_MS = 60_000;
 const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const PROD_DEFAULT = 'https://orkas.ai/api';
 
@@ -468,7 +469,19 @@ export async function refresh(
       const { app } = runtimeApp ? { app: runtimeApp } : await loadElectronRuntime();
       const headers: Record<string, string> = withCommonHeaders();
       if (current.etag) headers['If-None-Match'] = current.etag;
-      const res = await fetchWithRetry('client-config:refresh', buildUrl(app), { method: 'GET', headers });
+      const { response: res, body: parsed } = await fetchAndReadWithRetry(
+        'client-config:refresh', buildUrl(app), { method: 'GET', headers },
+        async (response, signal) => {
+          if (!response.ok) return { ok: true, body: {} as Record<string, unknown> } as const;
+          try { return { ok: true, body: await response.json() as Record<string, unknown> } as const; }
+          catch (error) {
+            if (signal?.aborted) throw error;
+            // Keep malformed-body failures outside transport retries.
+            return { ok: false, error } as const;
+          }
+        },
+        { timeoutMs: CLIENT_CONFIG_REFRESH_TIMEOUT_MS },
+      );
       const etag = res.headers.get('etag') || '';
       if (activeConfigOwner() !== requestOwner) {
         log.info('stale client config response ignored after account switch', { reason });
@@ -480,7 +493,8 @@ export async function refresh(
         return { updated: false, notModified: true };
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const body = await res.json() as Record<string, unknown>;
+      if (!parsed.ok) throw parsed.error;
+      const body = parsed.body;
       if (body.code !== 0) throw new Error(String(body.msg || body.code || 'client config error'));
       return { updated: applyPayload(body, etag) };
     } catch (err) {
@@ -622,6 +636,7 @@ export interface QuickStartConfigState {
 
 interface ModelCatalogConfig {
   providers: Record<string, ProviderModelEntry[]>;
+  openAICompatibleProviders: Record<string, OpenAICompatibleProviderConfig>;
   imageGeneration: Record<string, ImageGenCapability>;
 }
 
@@ -640,7 +655,7 @@ export const DEFAULT_PROVIDER_MODELS = PUBLIC_PROVIDER_MODELS;
 export const DEFAULT_IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapability>> = {
   openai: { model: 'gpt-image-2', api: 'openai', supportsEdit: true },
   google: { model: 'gemini-nano-banana-2.1', api: 'gemini', supportsEdit: true },
-  doubao: { model: 'doubao-seedream-5-0-lite-260128', api: 'doubao', supportsEdit: true },
+  doubao: { model: 'doubao-seedream-5-0-flash-260915', api: 'doubao', supportsEdit: true },
 };
 
 /**
@@ -690,7 +705,7 @@ function mergeQuickStartConfig(baseRaw: unknown, overrideRaw: unknown): QuickSta
 }
 
 function emptyModelCatalog(): ModelCatalogConfig {
-  return { providers: {}, imageGeneration: {} };
+  return { providers: {}, openAICompatibleProviders: {}, imageGeneration: {} };
 }
 
 function normalizeProviderModels(value: unknown, providerId: string): ProviderModelEntry[] | null {
@@ -802,6 +817,7 @@ function normalizeModelCatalogConfig(raw: unknown): ModelCatalogConfig {
   if (!raw || typeof raw !== 'object') return out;
   const r = raw as Record<string, unknown>;
   mergeProviderSection(out.providers, r.providers ?? r.curated_models);
+  mergeOpenAICompatibleProviderSection(out.openAICompatibleProviders, r.openai_compatible_providers ?? r.openAICompatibleProviders);
   mergeImageGenerationSection(out.imageGeneration, r.image_generation ?? r.imageGeneration);
   return out;
 }
@@ -1033,6 +1049,10 @@ function mergeModelCatalogConfig(baseRaw: unknown, overrideRaw: unknown): ModelC
       ...base.providers,
       ...override.providers,
     },
+    openAICompatibleProviders: {
+      ...base.openAICompatibleProviders,
+      ...override.openAICompatibleProviders,
+    },
     imageGeneration: {
       ...base.imageGeneration,
       ...override.imageGeneration,
@@ -1178,4 +1198,94 @@ export function getRetryErrorPolicyConfig(): RetryErrorPolicyConfig {
     DEFAULT_RETRY_ERROR_POLICY,
     clientConfig.get('model.retry_error_policy', fallback),
   );
+}
+
+export interface OpenAICompatibleProviderConfig {
+  id: string;
+  label: string;
+  baseUrl: string;
+  docsUrl?: string;
+}
+
+const CONFIGURED_PROVIDER_ID_RE = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
+
+function normalizePublicHttpsUrl(
+  raw: unknown,
+  options: { baseUrl: boolean },
+): string | null {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value || value.length > 2048) return null;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  const hostname = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+  if (
+    url.protocol !== 'https:'
+    || !!url.username
+    || !!url.password
+    || !hostname
+    || !hostname.includes('.')
+    || hostname === 'localhost'
+    || hostname.endsWith('.localhost')
+    || hostname.endsWith('.local')
+    || /^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostname)
+    || hostname.includes(':')
+  ) return null;
+  if (options.baseUrl && (url.search || url.hash)) return null;
+  return options.baseUrl
+    ? url.toString().replace(/\/+$/, '')
+    : url.toString();
+}
+
+function normalizeOpenAICompatibleProvider(
+  rawId: string,
+  value: unknown,
+): OpenAICompatibleProviderConfig | null {
+  const id = normalizeKey(rawId).toLowerCase();
+  if (!CONFIGURED_PROVIDER_ID_RE.test(id)) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const label = typeof record.label === 'string' ? record.label.trim() : '';
+  if (!label || label.length > 80) return null;
+  const baseUrl = normalizePublicHttpsUrl(record.baseUrl, { baseUrl: true });
+  if (!baseUrl) return null;
+  const docsUrl = record.docsUrl === undefined
+    ? undefined
+    : normalizePublicHttpsUrl(record.docsUrl, { baseUrl: false });
+  if (record.docsUrl !== undefined && !docsUrl) return null;
+  return {
+    id,
+    label,
+    baseUrl,
+    ...(docsUrl ? { docsUrl } : {}),
+  };
+}
+
+function mergeOpenAICompatibleProviderSection(
+  target: Record<string, OpenAICompatibleProviderConfig>,
+  value: unknown,
+): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  for (const [rawId, rawProvider] of Object.entries(value as Record<string, unknown>)) {
+    const provider = normalizeOpenAICompatibleProvider(rawId, rawProvider);
+    if (provider) target[provider.id] = provider;
+  }
+}
+
+export function getConfiguredOpenAICompatibleProviders(): OpenAICompatibleProviderConfig[] {
+  return Object.values(loadModelCatalog().openAICompatibleProviders).map((provider) => ({
+    ...provider,
+  }));
+}
+
+export function getConfiguredOpenAICompatibleProvider(
+  providerId: string,
+): OpenAICompatibleProviderConfig | null {
+  const id = normalizeKey(providerId).toLowerCase();
+  if (!id) return null;
+  const provider = loadModelCatalog().openAICompatibleProviders[id];
+  return provider ? { ...provider } : null;
 }

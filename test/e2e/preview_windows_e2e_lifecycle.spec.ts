@@ -1,7 +1,7 @@
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
-import { expect, test } from './fixtures/orkas';
+import { expect, test, OrkasTestApp } from './fixtures/orkas';
 
 for (const locale of ['zh', 'en']) {
   test(`attachment markdown images retain local file actions without empty chrome (${locale})`, async ({ modelOrkas: orkas }, info) => {
@@ -68,6 +68,128 @@ for (const locale of ['zh', 'en']) {
     await orkas.electronApp!.evaluate(({ shell }) => { shell.showItemInFolder = (process as any).originalReveal; });
   });
 }
+
+test.describe('video replacement presentation', () => {
+  test.use({ orkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { nativeWindowVisible: true });
+    try { await app.launch(); await use(app); }
+    finally { await app.dispose(); }
+  } });
+
+  test('a second video never brings the previous video to the foreground while replacement is pending', async ({ orkas }, info) => {
+    const files = ['red', 'blue'].map(color => path.join(orkas.userWorkspaceRoot, `${color}.webm`));
+    await orkas.electronApp!.evaluate(async (_electron, args) => {
+      const req = (process as any).mainModule.require.bind((process as any).mainModule);
+      const { ffmpeg } = req(args.module).bundledFfmpegPaths();
+      for (const [index, file] of args.files.entries()) {
+        await new Promise<void>((resolve, reject) => req('node:child_process').execFile(ffmpeg, [
+          '-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
+          '-i', `color=c=${index ? 'blue' : 'red'}:size=1920x1080:rate=30`, '-t', '1', '-an',
+          '-c:v', 'libvpx', '-threads', '1', file,
+        ], { windowsHide: true, timeout: 30000 }, (error: Error | null) => error ? reject(error) : resolve()));
+      }
+    }, { module: path.resolve(__dirname, '../../src/main/util/bundled-runtime.ts'), files });
+    const open = (file: string) => orkas.page!.evaluate(args =>
+      (window as any).openChatVideoUrlViewer((window as any)._chatMediaLocalUrl(args.file), args.title, { autoplay: true }),
+    { file, title: path.basename(file) });
+    const preview = await orkas.openPreview(() => open(files[0]));
+    const native = await orkas.electronApp!.browserWindow(preview);
+    expect(await native.evaluate(win => win.isFocusable())).toBe(true);
+    await expect(preview.locator('video')).toBeVisible();
+    await expect.poll(() => preview.locator('video').evaluate((video: HTMLVideoElement) => video.readyState)).toBeGreaterThanOrEqual(2);
+    const originalBounds = await native.evaluate(win => win.getBounds());
+    await native.evaluate(win => {
+      (win as any).previewHideCount = 0;
+      (win as any).previewHideCalls = 0;
+      const hide = win.hide.bind(win);
+      win.hide = () => { (win as any).previewHideCalls += 1; hide(); };
+      win.on('hide', () => { (win as any).previewHideCount += 1; });
+    });
+    await expect(preview.locator('.chat-file-viewer-share')).toHaveCount(0);
+    // Hold the old document alive to expose the interval that used to flash.
+    await preview.evaluate(() => {
+      (window as any).previousVideo = document.querySelector('video');
+      const shell = document.querySelector('.chat-file-viewer')!;
+      (window as any).videoShellHidden = false;
+      (window as any).videoShellObserver = new MutationObserver(() => {
+        if (!shell.classList.contains('is-open')) (window as any).videoShellHidden = true;
+      });
+      (window as any).videoShellObserver.observe(shell, { attributes: true, attributeFilter: ['class'] });
+      (window as any)._confirmDiscardViewerEdits = () => new Promise(resolve => {
+        (window as any).releaseReplacement = () => {
+          (window as any)._confirmDiscardViewerEdits = async () => true;
+          resolve(true);
+        };
+      });
+    });
+    await open(files[1]);
+    await expect.poll(() => native.evaluate(win => win.isVisible())).toBe(true);
+    await expect(preview).toHaveTitle('red.webm');
+    await expect.poll(() => preview.evaluate(() => typeof (window as any).releaseReplacement)).toBe('function');
+    await preview.evaluate(() => (window as any).releaseReplacement());
+    await expect(preview).toHaveTitle('blue.webm');
+    await expect(preview.locator('.chat-share-overlay')).toHaveCount(0);
+    await expect.poll(() => native.evaluate(win => win.isVisible())).toBe(true);
+    await expect(preview.locator('video')).toBeVisible();
+    await expect.poll(() => preview.locator('video').evaluate((video: HTMLVideoElement) => video.readyState)).toBeGreaterThanOrEqual(2);
+    expect(await preview.locator('video').evaluate((video: HTMLVideoElement) => video.currentSrc)).toContain('blue.webm');
+    expect(await preview.evaluate(() => {
+      const old = (window as any).previousVideo as HTMLVideoElement;
+      return { connected: old.isConnected, paused: old.paused, source: old.getAttribute('src'), state: old.readyState };
+    })).toEqual({ connected: false, paused: true, source: null, state: 0 });
+    expect(await preview.evaluate(() => (window as any).videoShellHidden)).toBe(false);
+    await preview.evaluate(() => { (window as any).videoShellObserver.disconnect(); delete (window as any).previousVideo; });
+    expect(await native.evaluate(win => win.getBounds())).toEqual(originalBounds);
+    await preview.screenshot({ path: info.outputPath('replacement-video.png') });
+    await native.evaluate(win => win.setSize(480, 360));
+    await preview.screenshot({ path: info.outputPath('replacement-video-small.png') });
+    const cdp = await orkas.electronApp!.context().newCDPSession(preview);
+    const resources = async () => {
+      await cdp.send('HeapProfiler.collectGarbage');
+      const heap = await cdp.send('Runtime.getHeapUsage');
+      const dom = await cdp.send('Memory.getDOMCounters');
+      return { heapBytes: heap.usedSize, ...dom };
+    };
+    const cpu = async () => {
+      const pid = await native.evaluate(win => win.webContents.getOSProcessId());
+      return orkas.electronApp!.evaluate(({ app }, pid) => app.getAppMetrics().find(metric => metric.pid === pid)?.cpu.cumulativeCPUUsage || 0, pid);
+    };
+    const before = await resources();
+    const cpuBefore = await cpu();
+    const timeOrigin = await preview.evaluate(() => performance.timeOrigin);
+    await preview.evaluate(() => { (window as any).originalViewerShell = document.querySelector('.chat-file-viewer'); });
+    let documentLoads = 0;
+    preview.on('domcontentloaded', () => { documentLoads += 1; });
+    const latencyMs: number[] = [];
+    for (let index = 0; index < 12; index += 1) {
+      const file = files[index % 2];
+      const started = performance.now();
+      await open(file);
+      await preview.waitForFunction(title => {
+        const video = document.querySelector('video');
+        return document.title === title && video && video.readyState >= 2;
+      }, path.basename(file), { polling: 10 });
+      latencyMs.push(Math.round((performance.now() - started) * 10) / 10);
+    }
+    const after = await resources();
+    const visibility = await native.evaluate(win => ({ hideCalls: (win as any).previewHideCalls, hideEvents: (win as any).previewHideCount }));
+    const metrics = { visibility, switches: latencyMs.length, latencyMs, documentLoads, rendererCpuSeconds: (await cpu()) - cpuBefore, before, after };
+    writeFileSync(info.outputPath('video-switch-performance.json'), JSON.stringify(metrics, null, 2));
+    await info.attach('video-switch-performance', { body: JSON.stringify(metrics), contentType: 'application/json' });
+    expect(await preview.evaluate(() => performance.timeOrigin)).toBe(timeOrigin);
+    expect(await preview.evaluate(() => (window as any).originalViewerShell === document.querySelector('.chat-file-viewer'))).toBe(true);
+    expect(documentLoads).toBe(0);
+    expect(await native.evaluate(win => (win as any).previewHideCount)).toBe(0);
+    expect(await preview.locator('video').count()).toBe(1);
+    // After collection, switching must not retain a document or listener set per video.
+    expect(after.documents).toBeLessThanOrEqual(before.documents);
+    expect(after.jsEventListeners).toBeLessThanOrEqual(before.jsEventListeners + 2);
+    await cdp.detach();
+    // Native destruction may finish before Playwright receives the key-up ack.
+    await preview.keyboard.press('Escape').catch(error => { if (!preview.isClosed()) throw error; });
+    await expect.poll(() => preview.isClosed()).toBe(true);
+  });
+});
 
 test('task previews share one native window while different applications remain open together', async ({ orkas }, info) => {
   const page = orkas.page!;
@@ -372,5 +494,91 @@ test('presentation fills the native window and retains its slide content on resi
     expect(actions.x + actions.width).toBeLessThanOrEqual(width);
     await preview.screenshot({ path: info.outputPath(`ppt-window-${width}.png`) });
   }
+  const timeOrigin = await preview.evaluate(() => performance.timeOrigin);
+  const blob = await frame.getAttribute('src');
+  await preview.evaluate(() => {
+    (window as any).oldOfficeFrame = document.querySelector('.chat-file-viewer-office');
+    (window as any).revokedPreviewUrls = [];
+    const revoke = URL.revokeObjectURL.bind(URL);
+    URL.revokeObjectURL = url => { (window as any).revokedPreviewUrls.push(url); revoke(url); };
+  });
+  const note = orkas.createWorkspaceFile('after-office.txt', 'Office resources released');
+  await orkas.page!.evaluate(file => (window as any).openChatFileViewer(file), note);
+  await expect(preview.locator('.chat-file-viewer-body')).toContainText('Office resources released');
+  expect(await preview.evaluate(() => (window as any).revokedPreviewUrls)).toContain(blob);
+  expect(await preview.evaluate(() => (window as any).oldOfficeFrame.contentWindow === null)).toBe(true);
+  await orkas.page!.evaluate(file => (window as any).openChatFileViewer(file), file);
+  await expect(frame.contentFrame().locator('body')).toContainText('Quarterly review');
+  expect(await frame.getAttribute('src')).not.toBe(blob);
+  expect(await preview.evaluate(() => performance.timeOrigin)).toBe(timeOrigin);
   await orkas.closePreview(preview);
+});
+
+test('mixed file previews reuse shells and release retired images audio and iframe documents', async ({ orkas }, info) => {
+  const text = orkas.createWorkspaceFile('reuse.txt', 'Text preview remains readable');
+  const image = orkas.createWorkspaceFile('reuse.svg', '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600"><rect width="800" height="600" fill="#4263eb"/></svg>');
+  const html = orkas.createWorkspaceFile('reuse.html', '<!doctype html><h1>HTML preview</h1>');
+  const open = (file: string) => orkas.page!.evaluate(file => (window as any).openChatFileViewer(file, file.split(/[\\/]/).pop()), file);
+  const preview = await orkas.openPreview(() => open(text));
+  const settled = async (file: string) => {
+    await preview.waitForFunction(name => document.title === name && (
+      name.endsWith('.svg') ? !!document.querySelector<HTMLImageElement>('.chat-lightbox-img')?.naturalWidth
+      : name.endsWith('.html') ? !!document.querySelector('.chat-file-viewer-html:not(.chat-file-viewer-loading-resource)') && !document.querySelector('.chat-file-viewer-body[aria-busy]')
+      : document.querySelector('.chat-file-viewer-body')?.textContent?.includes('Text preview remains readable')
+    ), path.basename(file), { polling: 10 });
+  };
+  await settled(text);
+  // Warm both shells and the HTML parser before measuring repeated use.
+  for (const file of [image, html, text]) { await open(file); await settled(file); }
+  const cdp = await orkas.electronApp!.context().newCDPSession(preview);
+  const resources = async () => {
+    await cdp.send('HeapProfiler.collectGarbage');
+    return { ...(await cdp.send('Memory.getDOMCounters')), heapBytes: (await cdp.send('Runtime.getHeapUsage')).usedSize };
+  };
+  const native = await orkas.electronApp!.browserWindow(preview);
+  const pid = await native.evaluate(win => win.webContents.getOSProcessId());
+  const cpu = () => orkas.electronApp!.evaluate(({ app }, pid) => app.getAppMetrics().find(m => m.pid === pid)?.cpu.cumulativeCPUUsage || 0, pid);
+  const before = await resources(), cpuBefore = await cpu();
+  const timeOrigin = await preview.evaluate(() => performance.timeOrigin);
+  await preview.evaluate(() => { (window as any).originalShell = document.querySelector('.chat-file-viewer'); });
+  let documentLoads = 0;
+  preview.on('domcontentloaded', () => { documentLoads += 1; });
+  const latencyMs: number[] = [];
+  for (let index = 0; index < 12; index += 1) {
+    const file = [image, html, text][index % 3];
+    const started = performance.now();
+    await open(file); await settled(file);
+    latencyMs.push(Math.round((performance.now() - started) * 10) / 10);
+  }
+  const after = await resources();
+  const metrics = { latencyMs, documentLoads, rendererCpuSeconds: (await cpu()) - cpuBefore, before, after };
+  writeFileSync(info.outputPath('file-switch-performance.json'), JSON.stringify(metrics, null, 2));
+  await preview.screenshot({ path: info.outputPath('reused-text.png') });
+  expect(await preview.evaluate(() => performance.timeOrigin)).toBe(timeOrigin);
+  expect(await preview.evaluate(() => (window as any).originalShell === document.querySelector('.chat-file-viewer'))).toBe(true);
+  expect(documentLoads).toBe(0);
+  expect(after.documents).toBeLessThanOrEqual(before.documents);
+  expect(after.jsEventListeners).toBeLessThanOrEqual(before.jsEventListeners + 2);
+  await open(image); await settled(image);
+  await preview.screenshot({ path: info.outputPath('reused-image.png') });
+  await preview.evaluate(() => { (window as any).oldImage = document.querySelector('.chat-lightbox-img'); });
+  await open(html); await settled(html);
+  expect(await preview.evaluate(() => (window as any).oldImage.getAttribute('src'))).toBeNull();
+  await preview.screenshot({ path: info.outputPath('reused-html.png') });
+  await preview.evaluate(() => { (window as any).oldFrame = document.querySelector('iframe'); });
+  await open(text); await settled(text);
+  expect(await preview.evaluate(() => ({ connected: (window as any).oldFrame.isConnected, window: (window as any).oldFrame.contentWindow }))).toEqual({ connected: false, window: null });
+  const wav = path.join(orkas.userWorkspaceRoot, 'reuse.wav');
+  const bytes = Buffer.alloc(44 + 16000);
+  bytes.write('RIFF'); bytes.writeUInt32LE(bytes.length - 8, 4); bytes.write('WAVEfmt ', 8); bytes.writeUInt32LE(16, 16);
+  bytes.writeUInt16LE(1, 20); bytes.writeUInt16LE(1, 22); bytes.writeUInt32LE(8000, 24); bytes.writeUInt32LE(16000, 28);
+  bytes.writeUInt16LE(2, 32); bytes.writeUInt16LE(16, 34); bytes.write('data', 36); bytes.writeUInt32LE(16000, 40);
+  writeFileSync(wav, bytes);
+  await open(wav);
+  await expect(preview.locator('audio')).toBeVisible();
+  await preview.evaluate(async () => { const audio = document.querySelector('audio')!; (window as any).oldAudio = audio; await audio.play(); });
+  await open(text); await settled(text);
+  expect(await preview.evaluate(() => { const a = (window as any).oldAudio; return { paused: a.paused, source: a.getAttribute('src'), state: a.readyState, connected: a.isConnected }; }))
+    .toEqual({ paused: true, source: null, state: 0, connected: false });
+  await cdp.detach();
 });

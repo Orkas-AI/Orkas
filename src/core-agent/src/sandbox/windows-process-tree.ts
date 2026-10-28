@@ -87,6 +87,11 @@ try {
       }
     } while ($added -gt 0)
 
+    # The pinned root has already exited. If the first snapshot contains no
+    # live descendants, no owned producer can create another child. Avoid a
+    # redundant WMI query in this common shell-startup cancellation path.
+    if ($ordered.Count -eq 1) { $result = 0; break }
+
     # Stop producers first, retaining their handles for the next snapshot.
     # A child created during this sweep remains linked to a pinned parent.
     # Discovery only adds a child after its parent, so this order already

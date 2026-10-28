@@ -30,6 +30,8 @@ describe('project_instructions tool', () => {
     expect(def.description).toContain('project memory');
     expect(instructions.description).toContain('Complete replacement');
     expect(instructions.description).toContain('existing content that still applies');
+    expect(instructions.description).toContain('4000 UTF-16 code units');
+    expect(instructions.maxLength).toBeUndefined(); // JSON Schema counts code points.
   });
 
   it('dispatches to handler.set with the full content', async () => {

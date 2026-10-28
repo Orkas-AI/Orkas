@@ -6,9 +6,12 @@
 export async function drainMainRuntimeForTest(): Promise<void> {
   // `flushAll` settles deferred chat writes and releases the chat store's
   // SQLite handle, which Windows needs before the workspace can be removed.
-  const searchIndexer = await import('../../src/main/features/search/indexer');
-  await searchIndexer.flushAll();
-
-  const kbVector = await import('../../src/main/features/kb_vector');
-  kbVector.closeAllKb();
+  try {
+    const searchIndexer = await import('../../src/main/features/search/indexer');
+    await searchIndexer.flushAll();
+  }
+  finally {
+    const kbVector = await import('../../src/main/features/kb_vector');
+    kbVector.closeAllKb();
+  }
 }

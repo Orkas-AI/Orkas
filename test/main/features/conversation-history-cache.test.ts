@@ -75,6 +75,237 @@ afterEach(async () => {
 });
 
 describe('conversation history projection cache', () => {
+  it.each([
+    ['local seconds', '2026-10-26T14:31:24', '2026-10-26T14:31:11.226', '2026-10-26T14:31:24.602', 13374, true],
+    ['UTC seconds', '2026-10-26T06:31:24Z', '2026-10-26T06:31:11.226Z', '2026-10-26T06:31:24.602Z', 13374, true],
+    ['offset seconds', '2026-10-26T14:31:24+08:00', '2026-10-26T06:31:11.226Z', '2026-10-26T06:31:24.602Z', 13374, true],
+    ['last millisecond', '2026-10-26T06:31:24Z', '2026-10-26T06:31:11.226Z', '2026-10-26T06:31:24.999Z', 13773, true],
+    ['next second', '2026-10-26T06:31:24Z', '2026-10-26T06:31:11.226Z', '2026-10-26T06:31:25.000Z', 13774, false],
+    ['explicit milliseconds', '2026-10-26T06:31:24.000Z', '2026-10-26T06:31:11.226Z', '2026-10-26T06:31:24.602Z', 13374, false],
+    ['subsecond run', '2026-10-26T06:31:24Z', '2026-10-26T06:31:24.226Z', '2026-10-26T06:31:24.602Z', 374, true],
+    ['duration exceeds notice precision', '2026-10-26T06:31:24Z', '2026-10-26T06:31:11.226Z', '2026-10-26T06:31:24.602Z', 14000, false],
+  ] as const)('preserves an interrupted reply and its evidenced clock at timestamp precision boundaries: %s',
+    async (_shape, ts, startedAt, endedAt, durationMs, expectedClock) => {
+      const notice = { ...message('interrupted'), from: 'codex-agent', ts, text: 'The previous reply was interrupted.',
+        system_kind: 'reply_interrupted', turn_id: 'turn-cancelled', source_message_id: 'source', seg: 0,
+        process: [{ type: 'event', event: { stream: 'cli', data: { type: 'status', status: 'running' } } }] };
+      writeRows([{ ...message('source'), from: 'user', ts: startedAt }, notice]);
+      const original = fs.readFileSync(sourceFile, 'utf8');
+      const paths = await import('../../../src/main/paths');
+      const run = paths.localAgentRunDir(TEST_UID, '123456abcdef');
+      fs.mkdirSync(run, { recursive: true });
+      fs.writeFileSync(path.join(run, 'meta.json'), JSON.stringify({ cid: 'canonical', agentId: 'codex-agent', cli: 'codex',
+        currentMessageId: 'source', startedAt, endedAt, durationMs, status: 'cancelled' }));
+      const cache = await import('../../../src/main/features/conversation_history_cache');
+      const { records: [record] } = await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1);
+      const clocks = record.process?.filter(item => item.event?.stream === 'runtime') || [];
+      expect(clocks).toEqual(expectedClock ? [{ type: 'event', event: { stream: 'runtime', data: {
+        phase: 'interrupted', duration_ms: durationMs,
+      } } }] : []);
+      expect(record.display_phase).not.toBe('commentary');
+      expect(record.text).toBe(notice.text);
+      expect(record.process?.filter(item => item.event?.stream !== 'runtime')).toEqual(notice.process);
+      await (await import('../../../src/main/features/conversation-history-client')).closeConversationHistoryWorker();
+      expect((await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1)).records[0]).toEqual(record);
+      expect((await cache.readConversationHistoryWindowAtMessage(TEST_UID, sourceFile, notice.id, 1))?.records[0]).toEqual(record);
+      expect(fs.readFileSync(sourceFile, 'utf8')).toBe(original);
+    });
+
+  it.each(['inline', 'paged', 'already-timed', 'wrong-source', 'dispatch-source'])(
+    'fills only the missing interruption clock without duplicating saved process: %s', async shape => {
+      const saved = Array.from({ length: shape === 'paged' ? 1200 : 1 }, (_, i) => ({ type: 'progress', text: `Saved step ${i}` }));
+      const clock = { type: 'event', event: { stream: 'runtime', data: { phase: 'interrupted', duration_ms: 7000 } } };
+      writeRows([
+        { ...message('source'), from: shape === 'dispatch-source' ? 'commander' : 'user',
+          ...(shape === 'dispatch-source' ? { dispatch: true, to: ['codex-agent'] } : {}), ts: '2026-10-17T01:00:00Z' },
+        { ...message('interrupted'), from: 'codex-agent', ts: '2026-10-17T02:00:00Z',
+          source_message_id: 'source', system_kind: 'reply_interrupted', process: [...saved, ...(shape === 'already-timed' ? [clock] : [])] },
+      ]);
+      const original = fs.readFileSync(sourceFile, 'utf8');
+      const paths = await import('../../../src/main/paths');
+      const run = paths.localAgentRunDir(TEST_UID, '123456abcdef');
+      fs.mkdirSync(run, { recursive: true });
+      fs.writeFileSync(path.join(run, 'meta.json'), JSON.stringify({ cid: 'canonical', agentId: 'codex-agent', cli: 'codex',
+        currentMessageId: shape === 'wrong-source' ? 'different-source' : 'source',
+        startedAt: '2026-10-17T01:00:01Z', endedAt: '2026-10-17T01:00:11Z', durationMs: 10000 }));
+      fs.writeFileSync(path.join(run, 'events.jsonl'), JSON.stringify({ type: 'tool-event', phase: 'result', tool: 'bash', callId: 'duplicate', output: 'Duplicate' }) + '\n');
+      const cache = await import('../../../src/main/features/conversation_history_cache');
+      const { records: [record] } = await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1);
+      const clocks = record.process?.filter(item => item.event?.stream === 'runtime') || [];
+      expect(clocks).toEqual(shape === 'wrong-source' ? [] : [shape === 'already-timed' ? clock : {
+        type: 'event', event: { stream: 'runtime', data: { phase: 'interrupted', duration_ms: 10000 } },
+      }]);
+      const items: any[] = record.process_parts?.length ? [] : record.process || [];
+      for (const part of record.process_parts || []) {
+        if (!('ref' in part)) throw new Error('Expected a saved process page');
+        let cursor: number | null = 0;
+        do {
+          const page = await cache.readConversationProcessPage(TEST_UID, sourceFile, part.ref, cursor, record.id);
+          items.push(...page.items); cursor = page.nextCursor;
+        } while (cursor !== null);
+      }
+      expect(items.filter(item => item.type === 'progress')).toEqual(saved);
+      expect(JSON.stringify(items)).not.toContain('Duplicate');
+      await (await import('../../../src/main/features/conversation-history-client')).closeConversationHistoryWorker();
+      expect((await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1)).records[0]).toEqual(record);
+      expect(fs.readFileSync(sourceFile, 'utf8')).toBe(original);
+    });
+
+  it.each(['measured', 'estimated', 'missing', 'overlap'])(
+    'recovers an interruption clock across identified attempts without counting downtime: %s', async timing => {
+      writeRows([
+        { ...message('source'), from: 'user', ts: '2026-10-17T01:00:00Z' },
+        { ...message('interrupted'), from: 'codex-agent', ts: '2026-10-17T04:00:00Z', system_kind: 'reply_interrupted' },
+      ]);
+      const paths = await import('../../../src/main/paths');
+      for (const [id, startedAt, endedAt, durationMs] of [
+        ['123456abcdef', '2026-10-17T01:00:01Z', '2026-10-17T01:00:11Z', 10000],
+        ['abcdef123456', timing === 'overlap' ? '2026-10-17T01:00:06Z' : '2026-10-17T03:00:00Z',
+          timing === 'overlap' ? '2026-10-17T01:00:16Z' : '2026-10-17T03:00:05Z', timing === 'overlap' ? 10000 : 5000],
+      ] as const) {
+        const run = paths.localAgentRunDir(TEST_UID, id);
+        fs.mkdirSync(run, { recursive: true });
+        const last = id === 'abcdef123456';
+        fs.writeFileSync(path.join(run, 'meta.json'), JSON.stringify({ cid: 'canonical', agentId: 'codex-agent', cli: 'codex',
+          currentMessageId: 'source', startedAt, ...(!last || timing === 'measured' || timing === 'overlap' ? { endedAt, durationMs } : {}) }));
+        const file = path.join(run, 'events.jsonl');
+        fs.writeFileSync(file, timing === 'missing' && last ? '' : JSON.stringify({ type: 'tool-event', phase: 'result', tool: 'bash', callId: id, output: 'Saved' }) + '\n');
+        fs.utimesSync(file, new Date(endedAt), new Date(endedAt));
+      }
+      const cache = await import('../../../src/main/features/conversation_history_cache');
+      const { records: [record] } = await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1);
+      expect(record.process?.filter(item => item.event?.stream === 'runtime') || []).toEqual(timing === 'missing' ? [] : [{
+        type: 'event', event: { stream: 'runtime', data: { phase: 'interrupted', duration_ms: 15000,
+          ...(timing === 'estimated' ? { duration_estimated: true } : {}) } },
+      }]);
+      expect(record.process_parts).toHaveLength(timing === 'missing' ? 1 : 2);
+      expect(record.system_kind).toBe('reply_interrupted');
+    });
+
+  it('prefers the notice actor archive when a delegated CLI question is the last visible activity', async () => {
+    writeRows([
+      { ...message('user-1'), from: 'user', to: ['commander'], ts: '2026-10-17T01:00:00Z' },
+      { ...message('question-1'), from: 'codex-agent', ts: '2026-10-17T02:00:00Z', turn_id: 'nested-turn',
+        cli_question: { questions: [] } },
+      { ...message('interrupted'), ts: '2026-10-17T12:14:21Z', system_kind: 'reply_interrupted' },
+    ]);
+    const paths = await import('../../../src/main/paths');
+    for (const [id, agentId] of [['123456abcdef', 'commander'], ['abcdef123456', 'codex-agent']]) {
+      const run = paths.localAgentRunDir(TEST_UID, id);
+      fs.mkdirSync(run, { recursive: true });
+      fs.writeFileSync(path.join(run, 'meta.json'), JSON.stringify({ cid: 'canonical', agentId, cli: 'codex',
+        currentMessageId: 'user-1', startedAt: '2026-10-17T01:00:01Z', endedAt: '2026-10-17T12:00:01Z' }));
+      fs.writeFileSync(path.join(run, 'events.jsonl'), JSON.stringify({ type: 'tool-event', phase: 'result',
+        tool: 'bash', callId: agentId, output: `${agentId} saved work` }) + '\n');
+    }
+    const cache = await import('../../../src/main/features/conversation_history_cache');
+    const { records: [record] } = await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1);
+    expect(record.process_parts).toHaveLength(1);
+    const part = record.process_parts![0];
+    if (!('ref' in part)) throw new Error('Missing original actor process');
+    const { items } = await cache.readConversationProcessPage(TEST_UID, sourceFile, part.ref, 0, record.id);
+    expect(items.map(item => (item.event?.data as any)?.callId)).toEqual(['commander']);
+  });
+
+  it.each(['question', 'answer', 'direct', 'wrong-source', 'legacy', 'settled', 'commander', 'multiple-recipients'])(
+    'associates a fallback Commander interruption with only its explicitly addressed CLI run: %s', async variation => {
+      // Startup may have no in-flight actor and create a Commander notice.
+      // The original user destination and archive trigger, not the notice's
+      // fallback sender or free-form question text, identify the lost work.
+      const rows = [
+        { ...message('previous-user'), from: 'user', to: ['codex-agent'], ts: '2026-10-17T00:00:00Z' },
+        { ...message('previous-reply'), from: 'codex-agent', source_message_id: 'previous-user', ts: '2026-10-17T00:10:00Z' },
+        { ...message('user-1'), from: 'user', to: variation === 'commander' ? ['commander']
+          : variation === 'multiple-recipients' ? ['codex-agent', 'other-agent'] : ['codex-agent'], ts: '2026-10-17T01:00:00Z' },
+        ...(['direct', 'commander', 'multiple-recipients'].includes(variation) ? [] : [{
+          ...message('question-1'), from: 'codex-agent', ts: '2026-10-17T02:00:00Z', turn_id: 'active-turn',
+          cli_question: { questions: [] },
+        }]),
+        ...(variation === 'answer' ? [{ ...message('answer-1'), from: 'user', to: ['codex-agent'],
+          ts: '2026-10-17T02:01:00Z', cli_answer: { message_id: 'question-1', answers: {} } }] : []),
+        ...(variation === 'settled' ? [{ ...message('saved-reply'), from: 'codex-agent',
+          ts: '2026-10-17T03:00:00Z', source_message_id: 'user-1' }] : []),
+        { ...message('interrupted'), ts: '2026-10-17T12:14:21Z', system_kind: 'reply_interrupted' },
+      ];
+      writeRows(rows);
+      const original = fs.readFileSync(sourceFile, 'utf8');
+      const paths = await import('../../../src/main/paths');
+      const run = paths.localAgentRunDir(TEST_UID, '123456abcdef');
+      fs.mkdirSync(run, { recursive: true });
+      fs.writeFileSync(path.join(run, 'meta.json'), JSON.stringify({ cid: 'canonical',
+        agentId: 'codex-agent', cli: 'codex', startedAt: '2026-10-17T01:00:01Z',
+        endedAt: '2026-10-17T12:00:01Z', durationMs: 39_600_000,
+        ...(variation === 'legacy' ? {} : { currentMessageId: variation === 'wrong-source' ? 'previous-user' : 'user-1' }) }));
+      fs.writeFileSync(path.join(run, 'events.jsonl'), [
+        { type: 'text-delta', phase: 'commentary', text: 'Checking the remaining files.' },
+        { type: 'tool-event', phase: 'result', tool: 'bash', callId: 'current-run', output: 'Reviewed 42 files.' },
+      ].map(event => JSON.stringify(event)).join('\n') + '\n');
+      const cache = await import('../../../src/main/features/conversation_history_cache');
+      const { records: [record] } = await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1);
+      if (['question', 'answer', 'direct'].includes(variation)) {
+        expect(record.process).toContainEqual({ type: 'event', event: { stream: 'runtime', data: {
+          phase: 'interrupted', duration_ms: 39_600_000,
+        } } });
+        expect(record.process_parts).toHaveLength(1);
+        const part = record.process_parts![0];
+        if (!('ref' in part)) throw new Error('Missing recovered CLI process');
+        const { items } = await cache.readConversationProcessPage(TEST_UID, sourceFile, part.ref, 0, record.id);
+        expect(items[0]).toMatchObject({ type: 'progress', text: 'Checking the remaining files.' });
+        expect(items[1].event?.data).toMatchObject({ callId: 'current-run', output: 'Reviewed 42 files.' });
+        await (await import('../../../src/main/features/conversation-history-client')).closeConversationHistoryWorker();
+        expect((await cache.readConversationHistoryWindowAtMessage(TEST_UID, sourceFile, record.id, 1))?.records[0])
+          .toEqual(record);
+      } else {
+        expect(record.process_parts).toBeUndefined();
+        expect(record.process).toBeUndefined();
+      }
+      expect(record.from).toBe('commander');
+      expect(record.system_kind).toBe('reply_interrupted');
+      expect(record.text).toBe('message interrupted');
+      expect(fs.readFileSync(sourceFile, 'utf8')).toBe(original);
+    });
+
+  it.each(['last-write', 'done', 'retry-after-done', 'future-write', 'old-write', 'empty', 'timing-only'])(
+    'recovers interrupted timing without finalized metadata: %s', async timing => {
+      writeRows([
+        { ...message('user-1'), from: 'user', ts: '2026-10-17T01:00:00Z' },
+        { ...message('interrupted'), from: 'codex-agent', ts: '2026-10-17T12:14:21Z', system_kind: 'reply_interrupted' },
+      ]);
+      const paths = await import('../../../src/main/paths');
+      const run = paths.localAgentRunDir(TEST_UID, '123456abcdef');
+      fs.mkdirSync(run, { recursive: true });
+      fs.writeFileSync(path.join(run, 'meta.json'), JSON.stringify({ runId: '123456abcdef',
+        cid: 'canonical', agentId: 'codex-agent', cli: 'codex', currentMessageId: 'user-1',
+        startedAt: '2026-10-17T01:00:03.973Z',
+        ...(timing === 'timing-only' ? { durationMs: 40_430_000 } : {}) }));
+      const events = timing === 'empty' || timing === 'timing-only' ? [] : [
+        ...(timing === 'retry-after-done' ? [{ type: 'done', status: 'failed', durationMs: 1000 }] : []),
+        { type: 'tool-event', phase: 'result', tool: 'bash', callId: 'saved', durationMs: 25, output: 'Saved work' },
+        ...(timing === 'done' ? [{ type: 'done', status: 'cancelled', durationMs: 40_430_000 }] : []),
+      ];
+      const eventsFile = path.join(run, 'events.jsonl');
+      fs.writeFileSync(eventsFile, events.length ? events.map(e => JSON.stringify(e)).join('\n') + '\n' : '');
+      const writtenAt = new Date(timing === 'future-write' ? '2026-10-17T12:15:00Z'
+        : timing === 'old-write' ? '2026-10-17T00:00:00Z' : '2026-10-17T11:13:55.849Z');
+      fs.utimesSync(eventsFile, writtenAt, writtenAt);
+      const original = fs.readFileSync(sourceFile, 'utf8');
+      const cache = await import('../../../src/main/features/conversation_history_cache');
+      const { records: [record] } = await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1);
+      const runtimes = record.process?.filter(item => item.event?.stream === 'runtime') || [];
+      if (['last-write', 'retry-after-done', 'done', 'timing-only'].includes(timing)) {
+        const estimated = timing === 'last-write' || timing === 'retry-after-done';
+        expect(runtimes).toEqual([{ type: 'event', event: { stream: 'runtime', data: {
+          phase: 'interrupted', duration_ms: estimated ? 36_831_876 : 40_430_000,
+          ...(estimated ? { duration_estimated: true } : {}),
+        } } }]);
+        await (await import('../../../src/main/features/conversation-history-client')).closeConversationHistoryWorker();
+        expect((await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1)).records[0]).toEqual(record);
+      } else expect(runtimes).toEqual([]);
+      expect(record.system_kind).toBe('reply_interrupted');
+      expect(record.text).toBe('message interrupted');
+      expect(fs.readFileSync(sourceFile, 'utf8')).toBe(original);
+    });
+
   it.each(['timestamps', 'measured', 'missing-end', 'invalid-end'])(
     'restores only an evidenced elapsed duration for an interrupted run: %s', async timing => {
       writeRows([
@@ -444,18 +675,26 @@ describe('conversation history projection cache', () => {
     const cache = await import('../../../src/main/features/conversation_history_cache');
     await cache.readConversationHistoryPage(TEST_UID, sourceFile, 10);
     const entry = onlyCacheEntry();
-    fs.rmSync(path.join(entry, 'latest-page-v8.json'));
+    fs.rmSync(path.join(entry, 'latest-page-v12.json'));
     fs.writeFileSync(path.join(entry, 'latest-page.json'), JSON.stringify({ version: 4, unrelated: 'x'.repeat(1024 * 1024) }));
     fs.writeFileSync(path.join(entry, 'latest-page-v5.json'), JSON.stringify({ version: 5, unrelated: 'x'.repeat(1024 * 1024) }));
     fs.writeFileSync(path.join(entry, 'latest-page-v6.json'), JSON.stringify({ version: 6, unrelated: 'x'.repeat(1024 * 1024) }));
     fs.writeFileSync(path.join(entry, 'latest-page-v7.json'), JSON.stringify({ version: 7, unrelated: 'x'.repeat(1024 * 1024) }));
+    fs.writeFileSync(path.join(entry, 'latest-page-v8.json'), JSON.stringify({ version: 8, unrelated: 'x'.repeat(1024 * 1024) }));
+    fs.writeFileSync(path.join(entry, 'latest-page-v9.json'), JSON.stringify({ version: 9, unrelated: 'x'.repeat(1024 * 1024) }));
+    fs.writeFileSync(path.join(entry, 'latest-page-v10.json'), JSON.stringify({ version: 10, unrelated: 'x'.repeat(1024 * 1024) }));
+    fs.writeFileSync(path.join(entry, 'latest-page-v11.json'), JSON.stringify({ version: 11, unrelated: 'x'.repeat(1024 * 1024) }));
     const next = await cache.readConversationHistoryPage(TEST_UID, sourceFile, 10);
     expect(next.records.map(record => record.id)).toEqual(['latest']);
     expect(fs.existsSync(path.join(entry, 'latest-page.json'))).toBe(false);
     expect(fs.existsSync(path.join(entry, 'latest-page-v5.json'))).toBe(false);
     expect(fs.existsSync(path.join(entry, 'latest-page-v6.json'))).toBe(false);
     expect(fs.existsSync(path.join(entry, 'latest-page-v7.json'))).toBe(false);
-    expect(fs.statSync(path.join(entry, 'latest-page-v8.json')).size).toBeLessThan(4096);
+    expect(fs.existsSync(path.join(entry, 'latest-page-v8.json'))).toBe(false);
+    expect(fs.existsSync(path.join(entry, 'latest-page-v9.json'))).toBe(false);
+    expect(fs.existsSync(path.join(entry, 'latest-page-v10.json'))).toBe(false);
+    expect(fs.existsSync(path.join(entry, 'latest-page-v11.json'))).toBe(false);
+    expect(fs.statSync(path.join(entry, 'latest-page-v12.json')).size).toBeLessThan(4096);
   });
 
   it('keeps the answer available during a process-cache write failure and recovers its details', async () => {
@@ -506,7 +745,7 @@ describe('conversation history projection cache', () => {
     );
     expect(page.nextCursor).not.toBeNull();
     const cacheEntry = onlyCacheEntry();
-    const latestPageFile = path.join(cacheEntry, 'latest-page-v8.json');
+    const latestPageFile = path.join(cacheEntry, 'latest-page-v12.json');
     const cached = JSON.parse(fs.readFileSync(latestPageFile, 'utf8'));
     expect(cached.records).toHaveLength(10);
     expect(fs.statSync(latestPageFile).size).toBeLessThan(canonicalBytes / 20);
@@ -539,7 +778,7 @@ describe('conversation history projection cache', () => {
     const result = (page.records[0].process as any[])[0].event.data;
     expect(result.output).toBeUndefined();
     expect(result.outputPath).toBeUndefined();
-    expect(fs.statSync(path.join(onlyCacheEntry(), 'latest-page-v8.json')).size).toBeLessThan(4_000);
+    expect(fs.statSync(path.join(onlyCacheEntry(), 'latest-page-v12.json')).size).toBeLessThan(4_000);
 
     const canonical = JSON.parse(fs.readFileSync(sourceFile, 'utf8').trim());
     expect(canonical.process[0].event.data.output).toEqual(structuredOutput);
@@ -574,7 +813,7 @@ describe('conversation history projection cache', () => {
     const extended = await readConversationHistoryPage(TEST_UID, sourceFile, 2);
 
     expect(extended.records.map((record) => record.id)).toEqual(['m3', 'm4']);
-    const cached = JSON.parse(fs.readFileSync(path.join(onlyCacheEntry(), 'latest-page-v8.json'), 'utf8'));
+    const cached = JSON.parse(fs.readFileSync(path.join(onlyCacheEntry(), 'latest-page-v12.json'), 'utf8'));
     expect(cached.records.map((entry: any) => entry.record.id)).toEqual(['m3', 'm4']);
   });
 
@@ -607,7 +846,7 @@ describe('conversation history projection cache', () => {
     expect(expanded.records.map((record) => record.id)).toEqual(
       Array.from({ length: 8 }, (_, index) => `m${index + 5}`),
     );
-    const cached = JSON.parse(fs.readFileSync(path.join(onlyCacheEntry(), 'latest-page-v8.json'), 'utf8'));
+    const cached = JSON.parse(fs.readFileSync(path.join(onlyCacheEntry(), 'latest-page-v12.json'), 'utf8'));
     expect(cached.records).toHaveLength(8);
   });
 
@@ -625,7 +864,7 @@ describe('conversation history projection cache', () => {
     expect(whole.records.map((record) => record.id)).toEqual(
       Array.from({ length: 30 }, (_, index) => `m${index + 1}`),
     );
-    const cached = JSON.parse(fs.readFileSync(path.join(onlyCacheEntry(), 'latest-page-v8.json'), 'utf8'));
+    const cached = JSON.parse(fs.readFileSync(path.join(onlyCacheEntry(), 'latest-page-v12.json'), 'utf8'));
     expect(cached.records).toHaveLength(10);
   });
 
@@ -640,7 +879,7 @@ describe('conversation history projection cache', () => {
     );
 
     expect(pages.every((page) => page.records.length === 10)).toBe(true);
-    const cached = JSON.parse(fs.readFileSync(path.join(onlyCacheEntry(), 'latest-page-v8.json'), 'utf8'));
+    const cached = JSON.parse(fs.readFileSync(path.join(onlyCacheEntry(), 'latest-page-v12.json'), 'utf8'));
     expect(cached.records).toHaveLength(10);
   });
 

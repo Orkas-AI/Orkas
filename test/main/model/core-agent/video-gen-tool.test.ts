@@ -11,6 +11,10 @@ const h = vi.hoisted(() => ({
 vi.mock('../../../../src/main/features/video_gen', () => ({
   generateVideo: h.generateVideo,
 }));
+vi.mock('../../../../src/main/paths', async importOriginal => ({
+  ...await importOriginal(),
+  userLocalRoot: (uid: string) => path.join(h.workspace, '.local', uid),
+}));
 vi.mock('../../../../src/main/features/user_workspace', () => ({
   getWorkspacePath: () => h.workspace,
 }));
@@ -110,4 +114,46 @@ describe('generate_video tool in the open build', () => {
     expect(String(result.content)).toContain('E_CREDITS_EXHAUSTED');
     expect(String(result.content)).toContain('Do not retry');
   });
+  it.each([false, true, undefined])('preserves approval only for structured undispatched failure (dispatched=%s)',async dispatched=>{
+    const prompt='A red product rotates on a clean studio table';
+    const planPath=path.join(root,'plan.json');
+    fs.writeFileSync(planPath,JSON.stringify({aspect:'9:16',total_target_sec:5,language:'zh',
+      delivery_promise:{type:'motion_led',source_required:false,motion_min_ratio:1},
+      segments:[{id:'shot-1',order:1,role:'hook',layer:'primary',source:'generate',target_sec:5,
+        spec:{media_kind:'video',prompt,resolution:'720p',quality:'balanced',generate_audio:false}}],
+      cost_estimate:{billable_generations:1}}));
+    const control=await import('../../../../src/main/features/video_production_control');
+    const statePath=control.videoProductionControlStatePath({userId:'test-video-owner',planPath});
+    await control.approveVideoProductionPlan({statePath,planPath,turnId:'gate-b'});
+    await control.approveVideoProductionGeneration({statePath,planPath,turnId:'gate-c'});
+    const approved=await control.readVideoProductionControlState(statePath,planPath);
+    const tool=createVideoGenTool({userId:'test-video-owner',agentId:'79df9cc89f5f'});
+    const generateShot=()=>tool.execute({prompt,output_path:path.join(root,'shot-1.mp4'),ratio:'9:16',duration:5,
+      resolution:'720p',quality:'balanced',generate_audio:false,production_plan_path:planPath,production_segment_id:'shot-1'},
+      {workingDir:root} as any);
+    const error={ok:false,errorCode:'PROVIDER_API_ERROR',message:'fixture terminal failure',...(dispatched===undefined?{}:{dispatched})};
+    h.generateVideo.mockResolvedValueOnce(error);
+    const result=await generateShot();
+    expect(result).toMatchObject({isError:true,content:'[PROVIDER_API_ERROR] fixture terminal failure'});
+    const state=await control.readVideoProductionControlState(statePath,planPath);
+    expect(state.generation_approval).toEqual(approved.generation_approval);
+    if(dispatched===false){
+      expect(state.transactions['video:shot-1']).toBeUndefined();
+      expect(state.transaction_history).toEqual([expect.objectContaining({status:'released',error_code:'PROVIDER_API_ERROR',approval_id:approved.generation_approval!.approval_id})]);
+      // Same explicit approval may make one new attempt, never an automatic replay.
+      h.generateVideo.mockImplementationOnce(async()=>{
+        const active=await control.readVideoProductionControlState(statePath,planPath);
+        expect(active.transactions['video:shot-1']).toMatchObject({status:'pending',approval_id:approved.generation_approval!.approval_id});
+        return {...error,dispatched:true};
+      });
+      await generateShot();expect(h.generateVideo).toHaveBeenCalledTimes(2);
+    }else{
+      expect(state.transactions['video:shot-1']).toMatchObject({status:'failed',approval_id:approved.generation_approval!.approval_id});
+      expect(state.transaction_history).toEqual([]);
+    }
+    const blocked=await generateShot();expect(blocked.isError).toBe(true);
+    expect(blocked.content).toContain('E_VIDEO_PRODUCTION_GENERATION_REAPPROVAL_REQUIRED');
+    expect(h.generateVideo).toHaveBeenCalledTimes(dispatched===false?2:1);
+  });
+
 });

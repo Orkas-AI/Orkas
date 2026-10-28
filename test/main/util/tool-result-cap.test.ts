@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -597,6 +599,33 @@ describe('persisted result helpers', () => {
   let dir: string;
   beforeEach(() => { dir = makeTmpDir(); });
   afterEach(() => cleanup(dir));
+
+  it('keeps a successful publication intact when an overlapping writer fails after opening its temporary file', () => {
+    const write = nativeFs.writeFileSync;
+    const rename = nativeFs.renameSync;
+    let writes = 0, overlapped = false;
+    const writer = vi.spyOn(nativeFs, 'writeFileSync').mockImplementation(((file: any, ...args: any[]) => {
+      if (String(file).startsWith(dir) && ++writes === 2) {
+        write(file, '');
+        throw new Error('injected writer failure');
+      }
+      return (write as any)(file, ...args);
+    }) as any);
+    const publisher = vi.spyOn(nativeFs, 'renameSync').mockImplementation(((from: any, to: any) => {
+      if (!overlapped) {
+        overlapped = true;
+        expect(() => persistToolResult(dir, 'bash', 'complete receipt')).toThrow('injected writer failure');
+      }
+      return rename(from, to);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      const result = persistToolResult(dir, 'bash', 'complete receipt');
+      expect(overlapped).toBe(true);
+      expect(fs.readFileSync(result, 'utf8')).toBe('complete receipt');
+      expect(fs.readdirSync(dir)).toEqual([path.basename(result)]);
+    } finally { writer.mockRestore(); publisher.mockRestore(); syncBuiltinESMExports(); }
+  });
 
   it('uses a content-addressed name and deduplicates identical output', () => {
     const first = persistToolResult(dir, 'bash', 'same content');

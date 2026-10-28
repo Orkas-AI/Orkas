@@ -232,6 +232,32 @@ export function hasPendingConversationFiling(userId: string, cid: string): boole
   return _pendingFilings.has(_pendingKey(userId, cid));
 }
 
+/** Rename the conversation's existing project, including one just created in
+ * this turn. The host-bound conversation selects identity, never model input. */
+export async function renameConversationProject(userId: string, cid: string, name: string) {
+  const conversation = await chats.getConversationMetadata(userId, cid);
+  if (!conversation) return { ok: false as const, error: 'not_found' };
+  const pending = _pendingFilings.get(_pendingKey(userId, cid));
+  const projectId = pending?.kind === 'file' ? pending.projectId : conversation.project_id;
+  if (!projectId) return { ok: false as const, error: 'not_in_project' };
+  const result = await projects.renameProjectForUser(userId, projectId, name);
+  if (result.ok && pending?.kind === 'file') {
+    // A later filing failure must name the project the user can actually find.
+    pending.projectName = result.project.name;
+  }
+  if (result.ok) for (const cb of _projectRenamedListeners) {
+    try { cb({ userId, projectId, name: result.project.name }); } catch { /* UI notification cannot undo a saved name. */ }
+  }
+  return result;
+}
+
+type ProjectRenamedListener = (event: { userId: string; projectId: string; name: string }) => void;
+const _projectRenamedListeners: ProjectRenamedListener[] = [];
+
+export function onConversationProjectRenamed(cb: ProjectRenamedListener): void {
+  _projectRenamedListeners.push(cb);
+}
+
 /** Keep the setup receipt, not the requested backlog count. A failure at the
  *  boundary must still tell the user which existing project to choose. */
 export function setPendingConversationFilingTodoCount(

@@ -1084,6 +1084,33 @@ async function refreshAgentsAfterMarketplaceReconcile() {
   }
 }
 
+// Marketplace convergence can finish before its lazy browse UI is loaded.
+// This eager owner also covers the full catalog cached by the composer picker.
+async function _refreshMarketplaceCatalogsAfterChange() {
+  const jobs = [];
+  if (_agentsCache || _agentsLoadInFlight) {
+    jobs.push(['agents', () => refreshAgentsAfterMarketplaceReconcile()]);
+  }
+  if (typeof refreshSkillsAfterMarketplaceReconcile === 'function'
+      && ((typeof _skillsCache !== 'undefined' && _skillsCache)
+        || (typeof _skillsLoadInFlight !== 'undefined' && _skillsLoadInFlight))) {
+    jobs.push(['skills', () => refreshSkillsAfterMarketplaceReconcile()]);
+  }
+  if (typeof refreshMarketplaceAfterContentChange === 'function') {
+    jobs.push(['marketplace', () => refreshMarketplaceAfterContentChange()]);
+  }
+  await Promise.all(jobs.map(async ([kind, refresh]) => {
+    try { await refresh(); }
+    catch (_) { _agentsLog.warn('marketplace content refresh failed', { resource_kind: kind }); }
+  }));
+}
+
+if (typeof window.orkas?.onPushEvent === 'function') {
+  window.orkas.onPushEvent('marketplace:content-changed', () => {
+    _refreshMarketplaceCatalogsAfterChange();
+  });
+}
+
 /** Render the per-row "⋯" menu items based on the target agent's source +
  *  enabled state. Called fresh on each open so the toggle label is right
  *  and builtin agents see only the enable/disable item. */
@@ -1596,7 +1623,7 @@ function _renderAgentDetailMemory(agent, editing = false) {
 function _agentMemoryFailureText(res, fallback) {
   const error = String((res && res.error) || '');
   if (/^memory full/i.test(error)) return t('memory.error_full');
-  return error || fallback;
+  return fallback;
 }
 
 async function _agentMemoryAdd(agent, text) {
@@ -1620,6 +1647,27 @@ async function _agentMemoryRemove(agent, text) {
   return window.orkas.invoke('agents.memory.remove', { agent_id: agent.agent_id, old_text: text });
 }
 
+async function _applyAgentMemoryChange(agent, write) {
+  let res;
+  try {
+    res = await write();
+  } catch (_) {
+    uiAlert(t('memory.error_generic'));
+    return false;
+  }
+  if (!res || res.ok === false) {
+    uiAlert(_agentMemoryFailureText(res, t('memory.error_generic')));
+    return false;
+  }
+  try {
+    await loadAgents(true);
+    await _refreshAgentDetail(agent.agent_id);
+  } catch (_) {
+    _agentsLog.warn('agent memory refresh failed', { error_code: 'refresh_failed' });
+  }
+  return true;
+}
+
 function _wireAgentMemoryControls(host, agent) {
   host.querySelectorAll('[data-agent-memory-add]').forEach((btn) => {
     btn.addEventListener('click', async (e) => {
@@ -1630,17 +1678,7 @@ function _wireAgentMemoryControls(host, agent) {
         : window.prompt(label, '');
       const text = (content || '').trim();
       if (!text) return;
-      try {
-        const res = await _agentMemoryAdd(agent, text);
-        if (!res || res.ok === false) {
-          uiAlert(_agentMemoryFailureText(res, _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました')));
-          return;
-        }
-        await loadAgents(true);
-        await _refreshAgentDetail(agent.agent_id);
-      } catch (err) {
-        uiAlert((err && err.message) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
-      }
+      await _applyAgentMemoryChange(agent, () => _agentMemoryAdd(agent, text));
     });
   });
   host.querySelectorAll('[data-agent-memory-edit]').forEach((btn) => {
@@ -1654,17 +1692,7 @@ function _wireAgentMemoryControls(host, agent) {
         : window.prompt(label, oldText);
       const text = (content || '').trim();
       if (!text || text === oldText) return;
-      try {
-        const res = await _agentMemoryUpdate(agent, oldText, text);
-        if (!res || res.ok === false) {
-          uiAlert(_agentMemoryFailureText(res, _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました')));
-          return;
-        }
-        await loadAgents(true);
-        await _refreshAgentDetail(agent.agent_id);
-      } catch (err) {
-        uiAlert((err && err.message) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
-      }
+      await _applyAgentMemoryChange(agent, () => _agentMemoryUpdate(agent, oldText, text));
     });
   });
   host.querySelectorAll('[data-agent-memory-remove]').forEach((btn) => {
@@ -1681,17 +1709,7 @@ function _wireAgentMemoryControls(host, agent) {
           })
         : false;
       if (!ok) return;
-      try {
-        const res = await _agentMemoryRemove(agent, text);
-        if (!res || res.ok === false) {
-          uiAlert(_agentMemoryFailureText(res, _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました')));
-          return;
-        }
-        await loadAgents(true);
-        await _refreshAgentDetail(agent.agent_id);
-      } catch (err) {
-        uiAlert((err && err.message) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
-      }
+      await _applyAgentMemoryChange(agent, () => _agentMemoryRemove(agent, text));
     });
   });
 }
@@ -1927,7 +1945,6 @@ function _renderAgentOutputFormatSection(agent, editing = false) {
   }
 }
 
-
 /** Render the runtime control in the detail body.
  *
  *  The runtime "kind" is locked at create time:
@@ -1982,6 +1999,11 @@ async function _renderAgentDetailRuntime(agent) {
     pendingTrigger.setAttribute('aria-disabled', 'true');
     pendingTrigger.setAttribute('aria-busy', 'true');
   }
+  // Keep feedback mounted while discovery is pending so overlapping refreshes
+  // and locale updates retain the same control and its current upgrade state.
+  if (previousRuntimeKey === runtimeKey && previousUpgradeControl) {
+    slot.appendChild(previousUpgradeControl);
+  }
 
   // Share the process-lifetime discovery cache with the create panel.
   // Opening a detail must not synchronously force the same version processes
@@ -1996,7 +2018,8 @@ async function _renderAgentDetailRuntime(agent) {
       error_type: err && err.name ? String(err.name) : typeof err,
     });
   }
-  if (_selectedAgent?.id !== agent.agent_id || slot.dataset.runtimeKey !== runtimeKey) return;
+  if (_selectedAgent?.id !== agent.agent_id || slot.dataset.runtimeKey !== runtimeKey
+      || pendingMount.parentElement !== slot) return;
   slot.innerHTML = '';
 
   const available = entries.filter(e => e.available);
@@ -2672,7 +2695,6 @@ function _renderAgentEnabledButton(agent) {
   });
 }
 
-
 function _toggleAgentFieldEditable(on) {
   const nameEl = document.getElementById('agents-detail-name');
   const nameInput = document.getElementById('agents-detail-name-input');
@@ -2913,7 +2935,6 @@ function _switchAgentTab(tab) {
   // CLI discovery is process-heavy and belongs only to the External flow.
   // Start it when that panel actually becomes visible, not whenever the
   // default in-process create modal opens.
-  if (tab === 'external')
   if (tab === 'external' && typeof mountExternalCliSelect === 'function') {
     mountExternalCliSelect((cli) => _applyExternalCliDefaults(cli)).catch(() => {});
   }
@@ -3086,8 +3107,6 @@ function closeAgentModal(options = {}) {
 window.closeAgentModal = closeAgentModal;
 
 function cancelAgentModal() {
-  const activeTab = document.querySelector('#agent-modal-tabs .is-active')?.dataset.agentTab || 'create';
-  if (activeTab === 'external')
   closeAgentModal({ restoreFocus: true });
 }
 window.cancelAgentModal = cancelAgentModal;
@@ -4828,5 +4847,7 @@ window.addEventListener('local-cli-upgraded', async (event) => {
     void _renderAgentDetailRuntime(agent);
     void _renderAgentDetailCliSettings(agent, { refresh: true });
     void renderCliAccountUsage(agent, { force: true });
-  } catch (_) { /* next detail entry revalidates independently */ }
+  } catch (_) {
+    _agentsLog.warn('CLI account details refresh unavailable');
+  }
 });

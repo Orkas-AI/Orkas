@@ -1,9 +1,16 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
+import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { LOCALES } from '../../src/main/i18n';
 import { conversationRemovalSource } from './conversation-cache-test-source';
+
+const conversationSource = readFileSync(resolve(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
+const parsedConversation = ts.createSourceFile('conversation.js', conversationSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+const manageResultSource = parsedConversation.statements.filter(node =>
+  ts.isFunctionDeclaration(node) && node.name?.text === '_logConversationManageResult')
+  .map(node => node.getText(parsedConversation)).join('\n');
 
 function harness() {
   const listeners: Record<string, any> = {};
@@ -17,8 +24,9 @@ function harness() {
     : { ok: true, status: 'deleted' });
   const store = new Map<string, string>();
   const refresh = vi.fn(); const forgot = vi.fn();
+  const manageLog = { info: vi.fn(), warn: vi.fn() };
   const messages = JSON.parse(readFileSync(resolve(__dirname, '../../src/renderer/locales/en.json'), 'utf8'));
-  const scope: any = { currentUserId: 'u1', currentCid: '', conversations: [], currentView: 'settings',
+  const scope: any = { _convLog: manageLog, currentUserId: 'u1', currentCid: '', conversations: [], currentView: 'settings',
     window: { orkas: { invoke }, TaskUnread: { list: () => [], isUnread: () => false },
       addEventListener() {}, initRecycleBin: refresh },
     document: { getElementById: (id: string) => id === 'settings-task-cleanup-body' ? body : id === 'chat-cleanup-back' ? back : {},
@@ -35,15 +43,30 @@ function harness() {
     let _conversationRemovalRenderPending = false;
     const _conversationProjectPages = new Map();
     const _unprojectedConversationPage = { total: 0, nextOffset: null };
-    ${conversationRemovalSource}\n` + readFileSync(resolve(__dirname, '../../src/renderer/modules/task-cleanup.js'), 'utf8'), scope);
+    ${conversationRemovalSource}\n${manageResultSource}\n` + readFileSync(resolve(__dirname, '../../src/renderer/modules/task-cleanup.js'), 'utf8'), scope);
   const click = async (action: string, projectId = '') => listeners.click({ preventDefault: vi.fn(), target: { closest: () => ({ dataset: { cleanupAction: action, cleanupOwner: projectId } }) } });
   const check = async (cid: string | null, checked: boolean, projectId = '') => listeners.change({ target: {
     checked, getAttribute: (name: string) => name === 'data-cleanup-cid' ? cid : name === 'data-cleanup-project' ? projectId : null, hasAttribute: (name: string) => name === 'data-cleanup-all' && !cid && !projectId,
   } });
-  return { scope, body, back, invoke, store, picker, refresh, forgot, click, check,
+  return { scope, body, back, invoke, store, picker, refresh, forgot, click, check, manageLog,
     show: () => scope.window.initTaskCleanup() };
 }
 describe('inline history cleanup', () => {
+  it('reports a fresh remaining count without extending the confirmed selection to later arrivals', async () => {
+    const h = harness(); const original = h.invoke.getMockImplementation()!;
+    let previews = 0;
+    h.invoke.mockImplementation(async (channel, payload) => {
+      const response = await original(channel, payload);
+      if (channel.endsWith('preview') && ++previews > 1) return { ...response, total: 1, selectableTotal: 1,
+        entries: [{ cid: 'later-arrival', title: 'Later arrival', selectable: true }], treeTotal: 1 };
+      return response;
+    });
+    await h.show(); await h.check(null, true); await h.click('prepare'); await h.click('confirm');
+    expect(h.invoke.mock.calls.filter(([c]) => c.endsWith('remove')).map(([, p]: any) => p.cid)).toEqual(['one', 'two']);
+    expect(h.body.innerHTML).toContain('Recycled 2 · Skipped 0 · Failed 0');
+    expect(h.body.innerHTML).toContain('Still matching: 1. Review and select again to continue.');
+    expect(h.body.innerHTML).toContain('Clean up (0)');
+  });
   it.each([undefined, 'busy', 'unknown'])('opens a task with blocking state %s without selecting or deleting it', async blocked => {
     const h = harness();
     const original = h.invoke.getMockImplementation()!;
@@ -112,6 +135,46 @@ describe('inline history cleanup', () => {
     expect(h.invoke.mock.calls.filter(([c]) => c.endsWith('remove'))).toHaveLength(0);
     await h.click('confirm');
     expect(h.invoke.mock.calls.filter(([c]) => c.endsWith('remove')).map(([, p]: any) => p.cid)).toEqual(['one']);
+  });
+  it('logs the aggregate failure while preserving partial success and retry ownership', async () => {
+    const h = harness(); const original = h.invoke.getMockImplementation()!;
+    let fail = true;
+    h.invoke.mockImplementation(async (channel, payload) => {
+      if (channel.endsWith('remove') && payload.cid === 'two' && fail) throw new Error('synthetic-private-cleanup-marker');
+      return original(channel, payload);
+    });
+    await h.show(); await h.check(null, true); await h.click('prepare'); await h.click('confirm');
+    expect(h.body.innerHTML).toContain('Recycled 1 · Skipped 0 · Failed 1');
+    expect(h.forgot.mock.calls.map(([cid]) => cid)).toEqual(['one']);
+    expect(h.manageLog.warn).toHaveBeenCalledExactlyOnceWith('conversation management result', {
+      action: 'delete', result: 'failure', duration_ms: expect.any(Number), error_code: 'delete_failed',
+    });
+    expect(h.manageLog.info).not.toHaveBeenCalled();
+    expect(JSON.stringify(h.manageLog.warn.mock.calls)).not.toContain('synthetic-private-cleanup-marker');
+    fail = false; await h.click('retry');
+    expect(h.invoke.mock.calls.filter(([channel]) => channel.endsWith('remove')).map(([, payload]: any) => payload.cid)).toEqual(['one', 'two', 'two']);
+    expect(h.forgot.mock.calls.map(([cid]) => cid)).toEqual(['one', 'two']);
+    expect(h.manageLog.warn).toHaveBeenCalledTimes(1);
+    expect(h.manageLog.info).toHaveBeenCalledExactlyOnceWith('conversation management result', {
+      action: 'delete', result: 'success', duration_ms: expect.any(Number),
+    });
+  });
+  it('logs a failed cleanup page without attempting removals or exposing its error detail', async () => {
+    const h = harness(); const original = h.invoke.getMockImplementation()!;
+    h.invoke.mockImplementation(async (channel, payload) => {
+      if (channel.endsWith('page')) throw new Error('synthetic-private-page-marker');
+      return original(channel, payload);
+    });
+    await h.show(); await h.check('one', true); await h.click('prepare'); await h.click('confirm');
+    expect(h.invoke.mock.calls.filter(([channel]) => channel.endsWith('remove'))).toHaveLength(0);
+    expect(h.forgot).not.toHaveBeenCalled();
+    expect(h.body.innerHTML).toContain('role="alert"');
+    expect(h.body.innerHTML).toContain('Recycled 0 · Skipped 0 · Failed 0');
+    expect(h.body.innerHTML).not.toContain('synthetic-private-page-marker');
+    expect(h.manageLog.warn).toHaveBeenCalledExactlyOnceWith('conversation management result', {
+      action: 'delete', result: 'failure', duration_ms: expect.any(Number), error_code: 'delete_failed',
+    });
+    expect(h.manageLog.info).not.toHaveBeenCalled();
   });
   it('retries only failed tasks after a partial success', async () => {
     const h = harness(); await h.show(); await h.check(null, true);

@@ -147,6 +147,7 @@ test.describe('settings persistence', () => {
       const state = await metacognitionOrkas.invoke<{ enabled: boolean }>('prefs.getMetacognition');
       return state.enabled;
     }).toBe(true);
+    await expect(toggle).toBeEnabled();
 
     const relaunchedPage = await metacognitionOrkas.relaunch();
     await openGeneralSettings(relaunchedPage);

@@ -1044,6 +1044,116 @@ describe('historical execution retrieval and exact paging', () => {
 
 
 describe('chat history discovery and evidence recovery', () => {
+  it.each(['current', 'project', 'all'] as const)('executes unchanged continuation arguments for %s record pages', async scope => {
+    const originals = ['Start 🧾<&> '.repeat(800), 'Second exact record '.repeat(300)];
+    const cid = scope === 'current' ? 'current' : 'other';
+    writeConversation(cid, 'Paged report', originals.map((text, i) => ({ id: `report-${i}`, from: 'commander', text, turn_id: 'report-turn' })), 'p1');
+    writeConversation('current', 'Current task', [
+      ...(scope === 'current' ? originals.map((text, i) => ({ id: `report-${i}`, from: 'commander', text, turn_id: 'report-turn' })) : []),
+      { id: 'now', from: 'user', text: 'Recall the report' },
+    ], 'p1');
+    const [,,tool] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'current', currentMessageId: 'now', projectId: 'p1' });
+    const decode = (s: string) => s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    let args: any = { action: 'read', scope, ...(scope !== 'current' ? { cid } : {}), turn_id: 'report-turn', max_tokens: 1000 };
+    const restored = new Map<string, string>();
+    let pages = 0, done = false;
+    for (; pages < 30; pages++) {
+      const result = await tool.execute(args, ctxFor());
+      expect(result.isError).toBeFalsy();
+      for (const match of result.content.matchAll(/<msg[^>]*id="([^"]+)"[^>]*covered="(\d+)-(\d+)"[^>]*>\n([\s\S]*?)\n<\/msg>/g)) {
+        const previous = restored.get(match[1]) || '';
+        expect(Number(match[2])).toBe(previous.length);
+        restored.set(match[1], previous + decode(match[4]));
+      }
+      const next = decode(/<next_read>(.*?)<\/next_read>/.exec(result.content)![1]);
+      if (next === 'done') { done = true; break; }
+      args = JSON.parse(next);
+      expect(args).toMatchObject({ action: 'read', scope, turn_id: 'report-turn', max_tokens: 1000 });
+      expect(args.cid).toBe(scope === 'current' ? undefined : cid);
+    }
+    expect(done).toBe(true);
+    expect(pages).toBeGreaterThan(1);
+    expect([...restored.values()]).toEqual(originals);
+  });
+
+  it('reads a late process search hit directly and reconstructs its long Unicode text using unchanged locators', async () => {
+    const report = 'Cedar verified report 🧾 <exact>&\n' + '结果🧾不遗漏\n'.repeat(1500);
+    writeConversation('focused', 'Report', [{ id: 'report', from: 'commander', text: 'Done', process: [
+      { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'unrelated', output: 'UNRELATED_OUTPUT '.repeat(5000) } } },
+      { type: 'event', event: { stream: 'reasoning', data: { text: 'PRIVATE_REASONING Cedar verified report' } } },
+      { type: 'progress', text: report },
+    ] }, { id: 'now', from: 'user', text: 'Recall the report' }]);
+    const [,,tool] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'focused', currentMessageId: 'now', allowedScopes: ['current'] });
+    const hit = await tool.execute({ action: 'search', scope: 'current', query: 'Cedar verified report' }, ctxFor());
+    const locator = JSON.parse(/^    process_read: (.+)$/m.exec(hit.content)![1]);
+    expect(locator).toMatchObject({ action: 'read', scope: 'current', record_id: 'report', process_index: 2 });
+    const decode = (s: string) => s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    let args = { ...locator, max_tokens: 1000 }, restored = '', pages = 0, done = false;
+    const { estimateToolResultTokens } = await import('../../../../src/main/util/tool-result-cap');
+    for (; pages < 30; pages++) {
+      const result = await tool.execute(args, ctxFor());
+      expect(result.isError).toBeFalsy();
+      expect(estimateToolResultTokens(result.content)).toBeLessThanOrEqual(1000);
+      expect(result.content).not.toMatch(/UNRELATED_OUTPUT|PRIVATE_REASONING/);
+      if (pages === 0) expect(result.content).toContain('Cedar verified report');
+      const part = /covered="(\d+)-(\d+)" next_cursor="[^\"]+">\n([\s\S]*?)\n<\/msg>/.exec(result.content)!;
+      expect(Number(part[1])).toBe(restored.length);
+      restored += decode(part[3]);
+      const next = decode(/<next_read>(.*?)<\/next_read>/.exec(result.content)![1]);
+      if (next === 'done') { done = true; break; }
+      args = JSON.parse(next);
+      expect(args).toMatchObject({ action: 'read', scope: 'current', process_index: 2, max_tokens: 1000 });
+    }
+    expect(done).toBe(true);
+    expect(pages).toBeGreaterThan(1);
+    expect(restored).toBe('[process 2] ' + report);
+    // The original whole-record contract remains available alongside the focused entry.
+    const whole = await tool.execute(JSON.parse(/^    read: (.+)$/m.exec(hit.content)![1]), ctxFor());
+    expect(whole.content).toContain('UNRELATED_OUTPUT');
+  });
+
+  it('rejects private, missing, malformed and conflicting process selectors without falling back to whole-message text', async () => {
+    writeConversation('guarded', 'History', [{ id: 'report', from: 'commander', text: 'WHOLE_MESSAGE_SENTINEL', process: [
+      { type: 'event', event: { stream: 'reasoning', data: { text: 'PRIVATE_SENTINEL' } } },
+      { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'public-call', output: 'PUBLIC_SENTINEL' } } },
+    ] }, { id: 'now', from: 'user', text: 'Recall' }]);
+    const [,,tool] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'guarded', currentMessageId: 'now', allowedScopes: ['current'] });
+    for (const delta of [
+      { process_index: 0 }, { process_index: -1 }, { process_index: 1.5 }, { process_index: '1' }, { process_index: 9 },
+      { process_index: 1, record_id: undefined }, { process_index: 1, page: { mode: 'latest' } },
+      { process_index: 1, output_cursor: 0 }, { process_index: 1, tool_call_id: 'wrong-call' },
+      { process_index: 1, record_id: 'now' },
+    ]) {
+      const result = await tool.execute({ action: 'read', scope: 'current', record_id: 'report', ...delta }, ctxFor());
+      expect(result.isError, JSON.stringify(delta)).toBe(true);
+      expect(result.content).not.toMatch(/PRIVATE_SENTINEL|PUBLIC_SENTINEL|WHOLE_MESSAGE_SENTINEL/);
+    }
+    const valid = await tool.execute({ action: 'read', scope: 'current', record_id: 'report', process_index: 1, tool_call_id: 'public-call' }, ctxFor());
+    expect(valid.isError).toBeFalsy();
+    expect(valid.content).toContain('PUBLIC_SENTINEL');
+    expect(valid.content).not.toContain('WHOLE_MESSAGE_SENTINEL');
+  });
+
+  it('provides an executable retained-output read from the selected tool receipt without rerunning its producer', async () => {
+    const { cloudSessionToolResultsDirFor } = await import('../../../../src/main/util/project-layout');
+    const { persistToolResult } = await import('../../../../src/main/util/tool-result-cap');
+    const directory = cloudSessionToolResultsDirFor(TEST_UID, 'gconv-retained');
+    const file = persistToolResult(directory, 'lookup', 'FULL_RETAINED_OUTPUT ' + 'data '.repeat(3000));
+    writeConversation('retained', 'Receipt', [{ id: 'report', from: 'commander', text: 'Done', process: [
+      { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'call', name: 'lookup', result_preview: 'Short preview', result_path: file } } },
+    ] }, { id: 'now', from: 'user', text: 'Recall' }]);
+    const [,,tool] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'retained', currentMessageId: 'now', allowedScopes: ['current'] });
+    const receipt = await tool.execute({ action: 'read', scope: 'current', record_id: 'report', process_index: 0, max_tokens: 1000 }, ctxFor());
+    expect(receipt.isError).toBeFalsy();
+    const decode = (s: string) => s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    const locator = JSON.parse(decode(/<output_read>(.*?)<\/output_read>/.exec(receipt.content)![1]));
+    expect(locator).toMatchObject({ action: 'read', scope: 'current', record_id: 'report', tool_call_id: 'call', output_cursor: 0 });
+    expect(locator).not.toHaveProperty('process_index');
+    const output = await tool.execute(locator, ctxFor());
+    expect(output.isError).toBeFalsy();
+    expect(output.content).toContain('FULL_RETAINED_OUTPUT');
+  });
+
   it('searches and pages media-bearing history as text without returning image/video bytes', async () => {
     const original = {
       id: 'media-result', from: 'commander', text: 'Cedar poster ![chart](data:image/png;base64,' + 'AAAA'.repeat(40000) + ')',
@@ -1101,6 +1211,12 @@ describe('chat history discovery and evidence recovery', () => {
     const read = await tool.execute(locator, ctxFor());
     expect(read.isError).toBeFalsy();
     expect(read.content).toContain(facts);
+    const processLocator = JSON.parse(/^    process_read: (.+)$/m.exec(result.content)![1]);
+    expect(processLocator).toMatchObject({ cid: 'other', scope, record_id: 'answer', process_index: 1 });
+    const segment = await tool.execute(processLocator, ctxFor());
+    expect(segment.isError).toBeFalsy();
+    expect(segment.content).toContain(facts);
+    expect(segment.content).not.toContain('PRIVATE_CEDAR_REASONING');
   });
 
   it('offers an exact process read after a dialogue-only read without exposing private-only records', async () => {

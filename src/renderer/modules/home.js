@@ -255,9 +255,6 @@ function _homeTodoRowHtml(task, index) {
       'data-home-pid': pid,
       'data-home-status': status,
       'data-home-position': index + 1,
-      // The conversation this to-do belongs to (saved from it, or last run in
-      // it). Opening the row returns there when that conversation still exists.
-      ...(task.origin_cid ? { 'data-home-origin-cid': String(task.origin_cid) } : {}),
     },
     status,
     icon: 'clipboard-list',
@@ -265,9 +262,27 @@ function _homeTodoRowHtml(task, index) {
     source: pid
       ? t('new_chat.home.source.project_todo', { project: task.project_name || _homeProjectName(pid) })
       : t('new_chat.home.source.global_todo'),
-    details: [_homeTodoStatusLabel(status), updated ? t('new_chat.home.time.updated', { time: updated }) : ''],
+    details: [_homeTodoStatusLabel(status), _homeTodoDueLabel(task), updated ? t('new_chat.home.time.updated', { time: updated }) : ''],
     action: t('new_chat.home.action.view'),
   });
+}
+
+/** "Due Oct 25" or "Overdue since Oct 25" for a dated to-do; empty otherwise. */
+function _homeTodoDueLabel(task) {
+  const dueAt = typeof task.due_at === 'string' ? task.due_at : '';
+  const parts = /^\d{4}-\d{2}-\d{2}$/.test(dueAt) ? dueAt.split('-').map(Number) : null;
+  if (!parts) return '';
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, '0');
+  const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  const date = new Date(parts[0], parts[1] - 1, parts[2]);
+  let label = dueAt;
+  try {
+    label = new Intl.DateTimeFormat(_homeLocale(), {
+      month: 'short', day: 'numeric', ...(parts[0] === now.getFullYear() ? {} : { year: 'numeric' }),
+    }).format(date);
+  } catch (_) { /* keep the stored text */ }
+  return t(task.status !== 'done' && dueAt < today ? 'project.todo.due_overdue' : 'project.todo.due_on', { date: label });
 }
 
 function _homeRunRowHtml(run, section, index) {
@@ -349,7 +364,22 @@ function _homeRender() {
   // Groups keep this order; one without items is left out entirely.
   const sections = ['todos', 'automations', 'tasks'].filter((section) => counts[section] > 0);
   const host = document.getElementById('home-groups');
-  if (host) host.innerHTML = sections.map(_homeSectionHtml).join('');
+  if (host) {
+    // Background refreshes can arrive between focusing a control and pressing
+    // Enter. Preserve its identity across replacement without moving the view.
+    const active = document.activeElement;
+    const focusKey = active && host.contains(active)
+      ? ['homeToggle', 'homeAction', 'homeTodo', 'homeCid'].find(key => active.dataset[key])
+      : null;
+    const focusValue = focusKey ? active.dataset[focusKey] : '';
+    const focusProject = focusKey ? active.dataset.homePid : undefined;
+    host.innerHTML = sections.map(_homeSectionHtml).join('');
+    if (focusKey) {
+      const replacement = Array.from(host.querySelectorAll('button')).find(button =>
+        button.dataset[focusKey] === focusValue && button.dataset.homePid === focusProject);
+      replacement?.focus({ preventScroll: true });
+    }
+  }
   _homeApplyState(sections.length ? 'populated' : 'empty');
 }
 
@@ -377,34 +407,9 @@ function _homeOpenRun(row) {
   setView('conversation', cid, { entryPoint: 'home' });
 }
 
-// Whether a conversation can still be opened: the sidebar cache first, then one
-// read-only lookup. A failed lookup counts as missing so the row falls back to
-// the To-dos page.
-async function _homeConversationExists(cid) {
-  if (!cid) return false;
-  const rows = typeof conversations !== 'undefined' && Array.isArray(conversations) ? conversations : [];
-  if (rows.some((c) => c && c.conversation_id === cid)) return true;
-  try {
-    const res = await window.orkas.invoke('conversations.getMany', { cids: [cid] });
-    return ((res && res.conversations) || []).some((row) => row && row.conversation_id === cid);
-  } catch (err) {
-    _homeLog.warn('to-do conversation lookup failed', { error_type: _homeErrorType(err) });
-    return false;
-  }
-}
-
 async function _homeOpenTodo(row) {
   const pid = row.dataset.homePid || '';
   const id = row.dataset.homeTodo || '';
-  const originCid = row.dataset.homeOriginCid || '';
-  const openConversation = !!originCid && await _homeConversationExists(originCid);
-  // A to-do that belongs to a conversation returns the user there, so the
-  // work continues with that conversation's plan and history. Nothing is
-  // prefilled; the user decides what to send.
-  if (openConversation) {
-    setView('conversation', originCid, { entryPoint: 'home' });
-    return;
-  }
   // The To-dos page code loads with the page; load it first so the page can
   // open on this to-do.
   try {

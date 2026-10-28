@@ -26,6 +26,8 @@ function taskSummary(task: autoTasks.AutoTask) {
     ...(task.end_condition?.type === 'count' ? { scheduled_run_count: task.scheduled_run_count || 0 } : {}),
     created_at: task.created_at, updated_at: task.updated_at,
     ...(task.last_run_at ? { last_run_at: task.last_run_at } : {}),
+    ...(task.run_count ? { run_count: task.run_count } : {}),
+    ...(task.last_run ? { last_run_status: task.last_run.status } : {}),
   };
 }
 

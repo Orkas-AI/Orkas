@@ -23,6 +23,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { compareDueFirst } from './project_tasks';
 
 import {
   projectDriverFile,
@@ -193,11 +194,8 @@ export async function writeState(uid: string, pid: string, s: DriverState): Prom
 
 // ── Pure decision layer (unit-tested; fires nothing) ────────────────────────
 
-/** The next backlog task the loop should advance: the first `todo` task (in
- *  backlog order — callers pass listTasks output, sorted created_at asc) whose
- *  every dependency is resolved. Only done dependencies count as resolved; a
- *  missing dep id is treated as resolved so a stale reference cannot deadlock
- *  the loop. Returns null when nothing is actionable. */
+/** Select the eligible to-do with the earliest due date, retaining backlog
+ * order for equal or absent dates. Missing dependencies cannot deadlock it. */
 export function nextActionableTask(tasks: readonly ProjectTask[]): ProjectTask | null {
   const byId = new Map(tasks.map((t) => [t.id, t]));
   const resolved = (depId: string): boolean => {
@@ -205,11 +203,13 @@ export function nextActionableTask(tasks: readonly ProjectTask[]): ProjectTask |
     if (!d) return true;
     return d.status === 'done';
   };
+  let pick: ProjectTask | null = null;
   for (const t of tasks) {
     if (t.status !== 'todo') continue;
-    if ((t.depends_on || []).every(resolved)) return t;
+    if (!(t.depends_on || []).every(resolved)) continue;
+    if (!pick || compareDueFirst(t, pick) < 0) pick = t;
   }
-  return null;
+  return pick;
 }
 
 /**

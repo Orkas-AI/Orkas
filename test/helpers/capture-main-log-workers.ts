@@ -27,10 +27,12 @@ export async function captureMainLogWorkers(): Promise<() => Promise<void>> {
         expect(delivery.stats()).toMatchObject({ dropped: 0, failed: false });
       }
     } finally {
-      await Promise.all(deliveries.map(delivery => delivery.close()));
-      vi.doUnmock('../../src/main/util/log-delivery');
-      if (previousDisable === undefined) delete process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
-      else process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = previousDisable;
+      try { await Promise.all(deliveries.map(delivery => delivery.close())); }
+      finally {
+        vi.doUnmock('../../src/main/util/log-delivery');
+        if (previousDisable === undefined) delete process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
+        else process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = previousDisable;
+      }
     }
   };
 }

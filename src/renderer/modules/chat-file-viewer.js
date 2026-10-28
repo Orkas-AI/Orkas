@@ -49,6 +49,7 @@ let _viewerTitle = null;
 let _viewerRevealBtn = null;
 let _viewerAddLibraryBtn = null;
 let _viewerSaveAppBtn = null;
+let _viewerSaveNewAppBtn = null;
 let _viewerMdActions = null;
 let _viewerKeyHandler = null;
 let _viewerCurrentPath = null;
@@ -63,6 +64,9 @@ let _viewerDirty = false;
 let _viewerDiscardConfirmPending = false;
 let _viewerRenderSeq = 0;
 let _viewerBlobUrl = null;
+let _viewerMediaCleanup = null;
+let _viewerLibraryRestoreTimer = null;
+let _viewerSaveRestoreTimer = null;
 let _viewerHtmlCanvasResizeHandler = null;
 let _viewerPdfPreviewSeq = 0;
 let _viewerPdfPreviewState = null;
@@ -288,10 +292,12 @@ async function _viewerShowAlert(message, action) {
   }
 }
 
-function _scheduleAddLibraryButtonRestore(original) {
-  setTimeout(() => {
+function _scheduleAddLibraryButtonRestore(original, seq) {
+  if (seq !== _viewerRenderSeq) return;
+  clearTimeout(_viewerLibraryRestoreTimer);
+  _viewerLibraryRestoreTimer = setTimeout(() => {
     try {
-      if (!_viewerAddLibraryBtn) return;
+      if (!_viewerAddLibraryBtn || seq !== _viewerRenderSeq) return;
       _viewerAddLibraryBtn.innerHTML = original;
       _viewerAddLibraryBtn.disabled = false;
     } catch (_) {
@@ -303,10 +309,12 @@ function _scheduleAddLibraryButtonRestore(original) {
   }, 1500);
 }
 
-function _scheduleSaveAppButtonRestore(path, original) {
-  setTimeout(() => {
+function _scheduleSaveAppButtonRestore(path, original, seq) {
+  if (seq !== _viewerRenderSeq) return;
+  clearTimeout(_viewerSaveRestoreTimer);
+  _viewerSaveRestoreTimer = setTimeout(() => {
     try {
-      if (!_viewerSaveAppBtn) return;
+      if (!_viewerSaveAppBtn || seq !== _viewerRenderSeq) return;
       _viewerSaveAppBtn.innerHTML = original;
       _refreshSaveAppButton(path);
     } catch (_) {
@@ -475,6 +483,10 @@ function _setViewerButtonLabel(btn, label) {
 function _setSaveAppVisible(visible) {
   if (!_viewerSaveAppBtn) return;
   _viewerSaveAppBtn.hidden = !visible;
+  if (_viewerSaveNewAppBtn) {
+    _viewerSaveNewAppBtn.hidden = !visible || _viewerSaveAppBtn.dataset.hasTarget !== 'true';
+    _viewerSaveNewAppBtn.disabled = !visible;
+  }
   _viewerSaveAppBtn.disabled = !visible;
 }
 
@@ -526,6 +538,9 @@ function _ensureViewer() {
           <button type="button" class="chat-file-viewer-save-app" aria-label="${saveAppLabel}" title="${saveAppLabel}" data-tooltip="${saveAppLabel}" hidden>
             ${_viewerSaveAppButtonHtml(saveAppLabel)}
           </button>
+          <button type="button" class="chat-file-viewer-save-new-app" hidden>
+            ${_viewerSaveAppButtonHtml('', 'plus')}
+          </button>
           <button type="button" class="chat-file-viewer-reveal" aria-label="${revealLabel}" title="${revealLabel}" data-tooltip="${revealLabel}">${folderIcon}</button>
           <button type="button" class="modal-close-btn chat-file-viewer-close" aria-label="${closeLabel}" title="${closeLabel}" data-tooltip="${closeLabel}">${_viewerUiIconHtml('x', 'modal-close-icon')}</button>
         </div>
@@ -541,6 +556,8 @@ function _ensureViewer() {
   _viewerRevealBtn = root.querySelector('.chat-file-viewer-reveal');
   _viewerAddLibraryBtn = root.querySelector('.chat-file-viewer-add-library');
   _viewerSaveAppBtn = root.querySelector('.chat-file-viewer-save-app');
+  _viewerSaveNewAppBtn = root.querySelector('.chat-file-viewer-save-new-app');
+  _viewerSaveNewAppBtn.addEventListener('click', () => _onSaveAppClick('new'));
   _viewerMdActions = root.querySelector('.chat-file-viewer-md-actions');
 
   // i18n change → re-label the icon-only buttons. Same lazy listener pattern
@@ -555,7 +572,8 @@ function _ensureViewer() {
     const cl = _viewerLabel('chat.preview_close_title', 'Close');
     const rl = _viewerLabel('chat.preview_reveal_title', 'Open in folder');
     const al = _viewerLabel('chat.preview_add_library_title', 'Add to Library');
-    const sl = _viewerLabel('apps.save_from_file_action', 'Save as app');
+    const sl = s?.dataset.hasTarget === 'true' ? _viewerLabel('apps.update_original', 'Update original app') : _viewerLabel('apps.save_from_file_action', 'Save as app');
+    _setViewerButtonLabel(_viewerSaveNewAppBtn, _viewerLabel('apps.save_new', 'Save new app'));
     _setViewerButtonLabel(c, cl);
     _setViewerButtonLabel(r, rl);
     if (a) {
@@ -571,7 +589,7 @@ function _ensureViewer() {
   root.querySelector('.chat-file-viewer-close').addEventListener('click', closeChatFileViewer);
   _viewerRevealBtn.addEventListener('click', _onRevealClick);
   _viewerAddLibraryBtn.addEventListener('click', _onAddLibraryClick);
-  _viewerSaveAppBtn.addEventListener('click', _onSaveAppClick);
+  _viewerSaveAppBtn.addEventListener('click', () => _onSaveAppClick());
 
   return root;
 }
@@ -589,6 +607,11 @@ async function _confirmDiscardViewerEdits() {
 }
 
 function _teardownViewerContent(reason = 'replaced') {
+  clearTimeout(_viewerLibraryRestoreTimer);
+  clearTimeout(_viewerSaveRestoreTimer);
+  _viewerLibraryRestoreTimer = _viewerSaveRestoreTimer = null;
+  _viewerMediaCleanup?.();
+  _viewerMediaCleanup = null;
   _viewerFinishPdfPreview(reason);
   _viewerFinishHtmlPreview(reason);
   if (_viewerEditController) {
@@ -648,10 +671,10 @@ async function _onRevealClick() {
 }
 
 async function _onAddLibraryClick() {
+  const seq = _viewerRenderSeq;
   const p = _viewerCurrentPath;
   if (!p || !_viewerCurrentCid || !_viewerAddLibraryBtn || _viewerAddLibraryBtn.disabled) return;
   if (!_viewerCanAddToLibrary(p, { projectScoped: _viewerLibraryProjectScoped })) return;
-  const startedAt = Date.now();
   const label = _viewerLabel('chat.preview_add_library_title', 'Add to Library');
   const doneLabel = _viewerLabel('chat.preview_add_library_done', 'Added');
   const original = _viewerAddLibraryButtonHtml(label);
@@ -677,7 +700,7 @@ async function _onAddLibraryClick() {
     return;
   } finally {
     if (!res || !res.ok) {
-      _scheduleAddLibraryButtonRestore(original);
+      _scheduleAddLibraryButtonRestore(original, seq);
     }
   }
 
@@ -692,7 +715,7 @@ async function _onAddLibraryClick() {
   const scope = res.scope === 'project' ? 'project' : (res.scope === 'global' ? 'global' : 'unknown');
   window.OrkasPreviewHost?.filesChanged();
   try {
-    _viewerAddLibraryBtn.innerHTML = _viewerAddLibraryButtonHtml(doneLabel, 'check');
+    if (seq === _viewerRenderSeq) _viewerAddLibraryBtn.innerHTML = _viewerAddLibraryButtonHtml(doneLabel, 'check');
     if (scope === 'global' && typeof currentView !== 'undefined' && currentView === 'contexts' && typeof loadContexts === 'function') {
       loadContexts();
     }
@@ -705,7 +728,7 @@ async function _onAddLibraryClick() {
       error_code: 'file_viewer_presentation_failed',
     });
   } finally {
-    _scheduleAddLibraryButtonRestore(original);
+    _scheduleAddLibraryButtonRestore(original, seq);
   }
 }
 
@@ -717,22 +740,27 @@ function _viewerFileActionPayload(path) {
 }
 
 async function _refreshSaveAppButton(path) {
+  const seq = _viewerRenderSeq;
   if (!_viewerSaveAppBtn) return;
   _setSaveAppVisible(false);
   if (!path) return;
   try {
     const inspected = await window.orkas.invoke('savedApps.inspectBundleFromPath', _viewerFileActionPayload(path));
-    if (!_isViewerOpen() || _viewerCurrentPath !== path) return;
+    if (seq !== _viewerRenderSeq || !_isViewerOpen() || _viewerCurrentPath !== path) return;
     const canSave = !!(inspected && inspected.ok !== false && (inspected.canSave || inspected.reason === 'app_bundle_root'));
+    _viewerSaveAppBtn.dataset.hasTarget = String(!!inspected?.target);
+    _setViewerButtonLabel(_viewerSaveAppBtn, _viewerLabel(inspected?.target ? 'apps.update_original' : 'apps.save_from_file_action', 'Save as app'));
+    _setViewerButtonLabel(_viewerSaveNewAppBtn, _viewerLabel('apps.save_new', 'Save new app'));
     _setSaveAppVisible(canSave);
   } catch {
-    if (!_isViewerOpen() || _viewerCurrentPath !== path) return;
+    if (seq !== _viewerRenderSeq || !_isViewerOpen() || _viewerCurrentPath !== path) return;
     _viewerLog.warn('inspect app bundle failed', { error_code: 'inspect_failed' });
     _setSaveAppVisible(false);
   }
 }
 
-async function _onSaveAppClick() {
+async function _onSaveAppClick(mode = 'auto') {
+  const seq = _viewerRenderSeq;
   const p = _viewerCurrentPath;
   if (!p || !_viewerSaveAppBtn || _viewerSaveAppBtn.disabled) return;
   if (_viewerDirty) {
@@ -751,18 +779,17 @@ async function _onSaveAppClick() {
   }
   let res;
   try {
-    res = await window.orkas.invoke('savedApps.saveFromPath', _viewerFileActionPayload(p));
+    res = await window.OrkasAppSave.save('savedApps.saveFromPath', {..._viewerFileActionPayload(p), ...(mode === 'new' ? {mode} : {})}, _viewerLabel);
+    if (res?.canceled) {
+      _scheduleSaveAppButtonRestore(p, original, seq);
+      return;
+    }
   } catch (err) {
     const failure = _viewerStableFailure(err, 'saved_app_save_failed', 'ipc');
     _viewerLogFailure('file_preview_save_app', failure);
     // Raw errors may hold local paths; the failure is logged by code only.
     await _viewerShowAlert(_viewerLabel('apps.save_failed', 'Could not save the app'), 'file_preview_save_app_presentation');
-    _scheduleSaveAppButtonRestore(p, original);
-    return;
-  }
-  if (window.OrkasCommercialEntry?.isFailure(res)) {
-    _scheduleSaveAppButtonRestore(p, original);
-    await window.OrkasCommercialEntry.show();
+    _scheduleSaveAppButtonRestore(p, original, seq);
     return;
   }
   if (!res || res.ok === false) {
@@ -773,12 +800,12 @@ async function _onSaveAppClick() {
       ? _viewerLabel('apps.save_root_folder_required', 'Move the HTML and its resources into a separate folder, then save as an app again.')
       : _viewerLabel('apps.save_failed', 'Could not save the app');
     await _viewerShowAlert(message, 'file_preview_save_app_presentation');
-    _scheduleSaveAppButtonRestore(p, original);
+    _scheduleSaveAppButtonRestore(p, original, seq);
     return;
   }
   window.OrkasPreviewHost?.filesChanged();
   try {
-    _viewerSaveAppBtn.innerHTML = _viewerSaveAppButtonHtml(doneLabel, 'check');
+    if (seq === _viewerRenderSeq) _viewerSaveAppBtn.innerHTML = _viewerSaveAppButtonHtml(doneLabel, 'check');
     if (typeof uiToast === 'function') uiToast(doneLabel, { variant: 'success' });
     else if (typeof uiAlert === 'function') await uiAlert(doneLabel);
     if (typeof loadSavedApps === 'function') loadSavedApps(true);
@@ -788,7 +815,7 @@ async function _onSaveAppClick() {
       error_code: 'file_viewer_presentation_failed',
     });
   }
-  _scheduleSaveAppButtonRestore(p, original);
+  _scheduleSaveAppButtonRestore(p, original, seq);
 }
 
 async function _openViewerShell(displayName, opts) {
@@ -806,10 +833,13 @@ async function _openViewerShell(displayName, opts) {
   _viewerLibraryProjectScoped = !!projectId || _viewerConversationIsProjectScoped(cid);
   if (_viewerRevealBtn) _viewerRevealBtn.hidden = !absPath;
   if (_viewerAddLibraryBtn) {
+    _viewerAddLibraryBtn.disabled = false;
+    _viewerAddLibraryBtn.innerHTML = _viewerAddLibraryButtonHtml(_viewerLabel('chat.preview_add_library_title', 'Add to Library'));
     _viewerAddLibraryBtn.hidden = !cid || !_viewerCanAddToLibrary(absPath || displayName || kind, {
       projectScoped: _viewerLibraryProjectScoped,
     });
   }
+  if (_viewerSaveAppBtn) _viewerSaveAppBtn.innerHTML = _viewerSaveAppButtonHtml(_viewerLabel('apps.save_from_file_action', 'Save as app'));
   void _refreshSaveAppButton(_viewerCurrentPath);
   _viewerTitle.textContent = displayName || '';
   // `is-markdown` / `is-text` switch the body to a flex column so an editor
@@ -840,8 +870,12 @@ async function closeChatFileViewer(opts) {
   const force = !!(opts && opts.force);
   if (!force && !(await _confirmDiscardViewerEdits())) return false;
   _viewerRenderSeq += 1;
-  _viewerEl.classList.remove('is-open');
-  _viewerEl.setAttribute('aria-hidden', 'true');
+  // A video handoff replaces only the media surface; keep its shell visible
+  // throughout teardown so the compositor does not retire the entire viewer.
+  if (!force || !opts?.keepShell) {
+    _viewerEl.classList.remove('is-open');
+    _viewerEl.setAttribute('aria-hidden', 'true');
+  }
   // Drop iframe / blob src so big preview docs can be GC'd promptly when
   // the user closes the overlay. Without this, hidden iframes keep the
   // PDFium / HTML document alive in memory until the next reopen.
@@ -1133,40 +1167,13 @@ function _applyViewerVideoPlayback(video, opts) {
   };
   seek();
   if (playback.autoplay) play();
-  if (video.readyState < 1) {
-    video.addEventListener('loadedmetadata', () => {
-      seek();
-      play();
-    }, { once: true });
-  }
+  const onMetadata = () => { seek(); play(); };
+  if (video.readyState < 1) video.addEventListener('loadedmetadata', onMetadata, { once: true });
+  return () => video.removeEventListener('loadedmetadata', onMetadata);
 }
 
 async function _renderVideoBody(absPath, displayName, cid, projectId, playbackOpts) {
-  const seq = await _openViewerShell(displayName, { kind: 'video', absPath, cid, projectId });
-  if (!seq) return;
-  const url = _chatMediaLocalUrl(absPath);
-  const wrap = document.createElement('div');
-  wrap.className = 'chat-file-viewer-video-wrap';
-  wrap.dataset.chatVideoPlaybackSurface = 'floating_player';
-  const video = document.createElement('video');
-  video.className = 'chat-file-viewer-video';
-  video.controls = true;
-  video.setAttribute('controlslist', 'nodownload nofullscreen noremoteplayback');
-  video.setAttribute('disablepictureinpicture', '');
-  video.setAttribute('disableremoteplayback', '');
-  video.setAttribute('playsinline', '');
-  video.preload = 'metadata';
-  wrap.appendChild(video);
-  video.addEventListener('loadedmetadata', () => {
-    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
-  }, { once: true });
-  video.addEventListener('error', () => {
-    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
-  }, { once: true });
-  _viewerShowLoading();
-  _viewerAppendLoadingResource(wrap);
-  _applyViewerVideoPlayback(video, playbackOpts);
-  video.src = url;
+  return openChatVideoUrlViewer(_chatMediaLocalUrl(absPath), displayName, { ...playbackOpts, absPath, cid, projectId });
 }
 
 async function openChatVideoUrlViewer(src, displayName, opts) {
@@ -1190,15 +1197,25 @@ async function openChatVideoUrlViewer(src, displayName, opts) {
   video.setAttribute('playsinline', '');
   video.preload = 'metadata';
   wrap.appendChild(video);
-  video.addEventListener('loadedmetadata', () => {
+  const finish = () => {
     if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
-  }, { once: true });
-  video.addEventListener('error', () => {
-    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
-  }, { once: true });
+  };
+  video.addEventListener('loadedmetadata', finish, { once: true });
+  video.addEventListener('error', finish, { once: true });
   _viewerShowLoading();
   _viewerAppendLoadingResource(wrap);
-  _applyViewerVideoPlayback(video, opts);
+  const cancelPlayback = _applyViewerVideoPlayback(video, opts);
+  _viewerMediaCleanup = () => {
+    // Detaching a playing video alone does not release its decoder or cancel
+    // a pending metadata callback. Clear the source before removing the node.
+    wrap.classList.add('chat-file-viewer-loading-resource');
+    video.removeEventListener('loadedmetadata', finish);
+    video.removeEventListener('error', finish);
+    cancelPlayback?.();
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  };
   video.src = url;
 }
 
@@ -1219,14 +1236,20 @@ async function _renderAudioBody(absPath, displayName, cid, projectId) {
     </div>
   `;
   const audio = wrap.querySelector('.chat-file-viewer-audio');
-  audio.addEventListener('loadedmetadata', () => {
+  const finish = () => {
     if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
-  }, { once: true });
-  audio.addEventListener('error', () => {
-    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
-  }, { once: true });
+  };
+  audio.addEventListener('loadedmetadata', finish, { once: true });
+  audio.addEventListener('error', finish, { once: true });
   _viewerShowLoading();
   _viewerAppendLoadingResource(wrap);
+  _viewerMediaCleanup = () => {
+    audio.removeEventListener('loadedmetadata', finish);
+    audio.removeEventListener('error', finish);
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+  };
   audio.src = url;
 }
 
@@ -1426,9 +1449,8 @@ async function openChatFileViewer(absPath, displayName, opts) {
   if (window.OrkasPreviewWindows) {
     if (!(await _ensureViewerFileExists(absPath, opts?.cid, opts?.projectId))) return;
     if (_kindOf(absPath) === 'image') return window.OrkasPreviewWindows.image(_chatMediaLocalUrl(absPath), displayName || absPath.split(/[\\/]/).pop(), { ...opts, absPath });
-    const result = await window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: displayName || absPath.split(/[\\/]/).pop(), options: window.OrkasPreviewWindows.options(opts) });
-    if (window.OrkasCommercialEntry?.isFailure(result)) await window.OrkasCommercialEntry.show();
-    return result;
+    if (_kindOf(absPath) === 'video') return openChatVideoUrlViewer(_chatMediaLocalUrl(absPath), displayName || absPath.split(/[\\/]/).pop(), { ...opts, absPath });
+    return window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: displayName || absPath.split(/[\\/]/).pop(), options: window.OrkasPreviewWindows.options(opts) });
   }
   const cid = (opts && opts.cid) || null;
   const projectId = (opts && opts.projectId) || null;

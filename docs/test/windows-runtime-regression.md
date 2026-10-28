@@ -8,12 +8,12 @@ native smoke separately because it executes the bundled Whisper model.
 
 | Boundary | Windows difference and user risk | Automated regression / discovery probe | Packaged/manual residual |
 | --- | --- | --- | --- |
-| Paths and filesystems | Drive letters, case-insensitive NTFS, junctions, reserved names, quoted/space-containing PATH entries, file locks, and long paths can reject valid files, escape a workspace, or leave data undeletable. | Install pins accept only `<drive>:\.orkas`; path sandbox uses native case-insensitive containment and a real junction escape negative-control; conversation slugs reject reserved names; CLI lookup covers PATHEXT and quoted PATH; cleanup paths retry `EPERM`/`EBUSY`. | Exercise a non-ASCII/space-containing install and workspace, a path over 260 characters, OneDrive-controlled folders, and Defender-held temporary files. |
+| Paths and filesystems | Drive letters, case-insensitive NTFS, junctions, reserved names, quoted/space-containing PATH entries, file locks, and long paths can reject valid files, escape a workspace, or leave data undeletable. | Path sandbox uses native case-insensitive containment and a real junction escape negative-control; conversation slugs reject reserved names; CLI lookup covers PATHEXT and quoted PATH; cleanup paths retry `EPERM`/`EBUSY`; source-data migration preserves the prior copy on publication failure and redacts early-boot errors. | Exercise a non-ASCII/space-containing install and workspace, a path over 260 characters, OneDrive-controlled folders, and Defender-held temporary files. |
 | Processes and shells | PowerShell and cmd have different quoting, encoding, shim, signal, and descendant semantics; POSIX `mkdir -p` can bind as PowerShell `-Path` and fail after partial interpretation; killing the parent alone leaks work and locks files. | Preflight rejects high-confidence POSIX syntax (including `mkdir -p`) with PowerShell rewrite guidance; real PowerShell UTF-8 and npm-style `.cmd` argv round trips; OAuth and relaunch use bounded argv-only launch contracts; every production child-process owner has a focused suite in the serialized native lane; real parent/grandchild sentinels prove whole-tree termination. The local-CLI lane executes the governed Lark multiline/MCP stdio contracts with native Windows process semantics. | Inspect Task Manager after repeated cancel/timeout/relaunch cycles and confirm no console flashes, descendants, or locked work directories. |
-| Official connector CLIs | A package may advertise Node compatibility but omit its Windows executable, fail behind `npx`, emit a startup warning as false success, or leave its cache locked after exit. | A Windows x64 canary uses the production authorization helper and direct `node npx-cli.js` path to verify the exact integrity-pinned WeCom, Feishu/Lark, DingTalk, and Xero packages: registry integrity, isolated download, executable discovery, real `--help` startup, clean stderr, and immediate cache removal. | Real account authorization and business API calls require provider accounts and remain release canaries; verify browser/device login, one read, one confirmed write, logout, and reconnect for each provider without using personal production data. |
+| Official connector CLIs | A package may advertise Node compatibility but omit its Windows executable, fail behind `npx`, emit a startup warning as false success, or leave its cache locked after exit. | A Windows x64 canary uses the production authorization helper and direct `node npx-cli.js` path to verify the exact integrity-pinned WeCom, Feishu/Lark, DingTalk, and Xero packages: a child PATH containing only bundled Node and Windows system tools (never CI/system Node), a no-Node negative control, exact bundled-Node resolution, registry integrity, isolated download, executable discovery, real `--help` startup, clean stderr, and immediate cache removal. The owning cross-platform cases also run real offline npm lifecycle scripts with missing/shadowing system Node, space/non-ASCII runtime paths, install failure without a ready marker, and successful retry before authorization/MCP access. | Real account authorization and business API calls require provider accounts and remain release canaries; verify browser/device login, one read, one confirmed write, logout, and reconnect for each provider without using personal production data. |
 | Source startup without system Node | `run.cmd` must bootstrap the pinned runtime before any JavaScript can execute; a partial download, corrupt marker, bad hash, or failed directory swap can otherwise leave development startup permanently broken. | Cross-platform wiring/manifest contract plus a real Windows PowerShell integration using an actual zip and Node executable: first install, verified cache, corrupt-marker repair, hash rejection, temp cleanup, and failed-swap rollback. | On clean x64 and Arm64 hosts with Node removed from PATH, launch `run.cmd` through Explorer and a path containing spaces/non-ASCII characters. |
 | Window and OS integration | Negative monitor coordinates, DPI/topology changes, minimized close bounds, registry command parsing, AppUserModelID, notification policy, and protocol cold launch differ from macOS. | Window state preserves visible left-monitor coordinates, drops disconnected positions, and ignores minimized sentinel bounds; registry cleanup rejects executable look-alikes; notification probes are hidden/bounded and escape the app id; deep-link registration has argv/error coverage. | Verify mixed-DPI monitor removal/reconnect, sleep/resume, notification Group Policy, default-app changes, and cold/second-instance `orkas://` activation. |
-| Install, update, and packaging | NSIS pending-cache shape, app-local VC DLL closure, PE architecture, native ABI, signing, installer elevation, and antivirus scanning can make a build pass source tests but fail after install. | Windows pending `.exe` restore and stale/traversal rejection; PE/ABI/DLL/license/package gates; an unsigned release-shaped NSIS build runs packaged-app and native smokes in CI. | Test signed upgrade/downgrade/reinstall/uninstall as standard and admin users; verify data retention and rollback after interrupted install. |
+| Install and packaging | App-local VC DLL closure, PE architecture, native ABI, signing, installer elevation, and antivirus scanning can make a build pass source tests but fail after install. | PE/ABI/DLL/license/package gates; Windows shutdown and installer process ownership; NSIS compilation requires an installed public compiler; installer execution remains Windows-only. | Build the public Windows package and run packaged-app/native checks; test signed upgrade/downgrade/reinstall/uninstall as standard and admin users, including data retention and interrupted installation. |
 | Performance and recovery | Process creation is slower, file handles are retained longer, and native CPU dispatch can regress latency or destabilize concurrent tests. | Windows unit workers are serialized; native Whisper has a 60-second budget/90-second hard limit; high-risk process-tree cases repeat three times in isolated Vitest processes so forced handle closure cannot contaminate the next owner. | Record cold/warm startup, handle/process count, working set, Whisper latency, and cleanup time with Defender enabled and after sleep/resume. |
 
 ## Embedded-browser phone passkey canary (pending hardware)
@@ -52,14 +52,26 @@ results are recorded.
 
 ## Automated coverage
 
+`npm run test:runtime-path` runs the focused environment regression entry through
+the Electron test runner: missing/shadowing system Node, offline npm lifecycle
+scripts, space/non-ASCII runtime paths, nested Skill commands, and bundled
+runtime/reference-process contracts. This is a local focused entry; neither
+public workflow currently invokes it. `Native dependency repair` runs its listed
+native/ABI regression suites on Windows, macOS and Linux; `Linux source smoke`
+also runs the Linux desktop/native lane. Run and retain the Windows-native,
+stability and packaged-app checks separately; those workflows do not establish
+their results.
+
+The process-owner inventory covers shipped `bin` JavaScript helpers as well as
+`src` modules. A new child-process owner requires a behavioral suite in each
+applicable native lane; negative controls check discovery and failure propagation.
+
 - Process lifecycle: OfficeCLI, ffmpeg/ffprobe, VideoStudio native helpers,
   package commands, and local-agent version probes use hidden windows, bounded
   output, prompt timeout/abort settlement, and whole-tree termination. Real
   parent/grandchild cases verify that a descendant cannot outlive its parent and
   write a delayed sentinel file.
-- Windows paths: install pins reject UNC, device-namespace, nested, and
-  prefix-look-alike paths; the drive probe resolves through the actual
-  `SystemRoot`; registry cleanup matches the exact executable token; sandbox
+- Windows paths: sandbox
   containment and skill imports compare case-insensitively without prefix false
   positives; a real junction cannot escape the workspace.
 - Shell and launch integrity: local-agent `.cmd` shims round-trip hostile argv;
@@ -71,12 +83,14 @@ results are recorded.
 - No-Node source startup: `run.cmd` invokes the PowerShell bootstrap before
   dependency preparation; the pinned manifest selects x64/Arm64, cache reuse
   requires marker/files/executable version, and download size/SHA plus Node
-  self-check complete before an atomic swap. Windows native CI injects a failed
-  swap and proves the prior runnable payload returns.
-- Desktop state and updates: negative-coordinate monitor positions remain
-  usable, minimized shutdown does not persist Windows sentinel bounds, and a
-  packaged NSIS `.exe` is restored only from the validated updater pending
-  directory.
+  self-check complete before an atomic swap. The Windows bootstrap integration
+  injects a failed swap and requires the prior runnable payload to return. Run
+  it through `npm run test:windows-native` on Windows and retain its result;
+  the existing public CI workflows do not execute that integration.
+- Desktop state and installation: negative-coordinate monitor positions remain
+  usable and minimized shutdown does not persist Windows sentinel bounds.
+  Shutdown and installer cleanup target this installation's process tree;
+  failure and retry cases preserve unrelated running applications.
 - Document recognition: local OCR installation and execution are retired.
   Images use model input and scanned PDFs use bounded page rendering; a
   text-only model requests readable text or a vision-capable model.
@@ -92,9 +106,14 @@ Primary suites:
 
 - `src/core-agent/test/oauth-flow.test.ts`
 - `src/core-agent/test/process-session.test.ts`
-- `test/main/features/app_update.test.ts`
-- `test/main/features/account/windows_protocol.test.ts`
-- `test/main/features/dev_relaunch.test.ts`
+- `test/main/features/connectors/protocol.test.ts`
+- `test/main/features/connectors/oauth-dcr.test.ts`
+- `test/main/features/connectors/local-cli.test.ts`
+- `test/main/index-process.test.ts`
+- `test/main/util/shutdown.test.ts`
+- `test/main/util/windows-shutdown-processes.test.ts`
+- `test/main/util/windows-installer-processes.test.ts`
+- `test/main/util/nsis-installer-processes.test.ts`
 - `test/main/features/local_agents/version.test.ts`
 - `test/main/features/local_agents/which.test.ts`
 - `test/main/features/office/office_engine.test.ts`
@@ -104,7 +123,8 @@ Primary suites:
 - `test/main/features/video_gen.test.ts`
 - `test/main/features/video_studio_native_qa.test.ts`
 - `test/main/features/window_state.test.ts`
-- `test/main/install-data-root.test.ts`
+- `test/main/util/migrate-source-data-root.test.ts`
+- `test/main/ipc/app-data-root.test.ts`
 - `test/main/platform-process-coverage.test.ts`
 - `test/main/quality/report.test.ts`
 - `test/main/util/fetch-whisper.test.ts`
@@ -112,47 +132,55 @@ Primary suites:
 - `test/main/util/path-sandbox.test.ts`
 - `test/main/util/prepare-win-native-deps.test.ts`
 - `test/main/util/windows-node-bootstrap-contract.test.ts`
-- the separately authorized model canary
-- the separately authorized model canary
-- the separately authorized model canary
-- the separately authorized model canary
 - `test/windows/windows-node-bootstrap.integration.ps1` (real Windows lane)
 - `test/windows/windows-local-cli.integration.mjs` (real Windows x64 package lane)
 
 ## Required commands
 
+The compiled NSIS suite requires a working public `makensis` on PATH, or an
+absolute `ORKAS_TEST_MAKENSIS` path. For an extracted electron-builder NSIS
+toolchain, set `ELECTRON_BUILDER_NSIS_DIR` to its resource root; this also supplies
+`NSISDIR`. Tests do not download a compiler or depend on a private `product/`
+directory. Missing or failed compilation is a test infrastructure failure, not a
+skipped pass. macOS compiles the production hook and all four fault fixtures;
+only Windows executes the installers and verifies file-lock release and retry.
+
+On macOS 14 or newer, use a compiler containing the upstream
+[UTF-32 conversion fix](https://github.com/NSIS-Dev/nsis/commit/2532ccae34d3fdd183575177f2486bc9e2922642)
+and its [function-order correction](https://github.com/NSIS-Dev/nsis/commit/f0bfe3e0062c57dc1ef90f1d235c7c0bd5a43be4).
+Unpatched 3.13 can abort while generating language tables; a successful
+`makensis -VERSION` alone does not prove compilation works.
+
 1. Run `npm run typecheck`.
 2. Run `npm test` for the full JavaScript and Python resource suites.
-3. Run `npm run test:model-regression:windows` for the deterministic Windows
-   model-evaluation contracts and host-sensitive fixtures.
-4. Run `npm run eval:model:regression:windows:validate` to verify that every
-   required live case, Agent, fixture, tool, and reality contract is runnable.
-5. Run `npm run test:platform-native` so every system/command owner is repeated
-   in one serialized native-host process lane.
-6. Run `npm run test:coverage` and investigate every failure; do not accept a
+3. Run `npm run test:platform-native` in a desktop session. The serialized
+   native-host suites are followed by real Electron composition-inspect and
+   background-browser-input canaries; a missing display fails the lane.
+4. Run `npm run test:coverage` and investigate every failure; do not accept a
    worker crash, unhandled rejection, `EPERM`, or leaked-handle warning as an
    unrelated test issue.
-7. Run `npm run test:windows-native`. The real PowerShell no-Node bootstrap
+5. On Windows, run `npm run test:windows-native`. The real PowerShell no-Node bootstrap
    integration runs first; the Windows x64 connector canary then downloads and
    starts every exact official CLI package without accessing an account; bundled
    Whisper must finally finish within its 60-second performance budget and
    before the 90-second hard limit.
-8. Run `npm run test:windows-stability`. It repeats the real persistent-process
+6. On Windows, run `npm run test:windows-stability`. It repeats the real persistent-process
    and descendant-termination cases three times. After the loop, no test-owned
    `node.exe`, `cmd.exe`, ffmpeg, ffprobe, OfficeCLI, or delayed sentinel should
    remain.
 
-Before a Windows release, and whenever a listed Agent prompt, tool surface,
-fixture, native runtime, renderer, or acceptance contract changes, also run
-`npm run eval:model:regression:windows -- --save` and inspect the full model,
-tool, artifact, render, cleanup, and process logs.
+The Windows-only commands report a skip on other hosts; that is not Windows
+execution evidence. Record the actual OS, commands, skips, diagnostics and
+process cleanup for a Windows release. These deterministic/native commands do
+not call a chat or generation provider; the bundled Whisper smoke performs
+local inference. Real connector authorization and phone-passkey journeys remain
+the manual checks described above.
 
-The cross-platform unit workflow enforces type-checking, the native-host lane,
-the real bundled Windows Whisper smoke, and the repeated Windows stability
-lane. The `Windows release gates` workflow also runs Windows coverage on its
-scheduled/manual lane and builds an unsigned release-shaped NSIS package when
-packaging/runtime inputs change, weekly, or on demand. That package job uses the
-same final-artifact validators and packaged-app smokes as a local product build.
+The public `Native dependency repair` workflow exercises native repair and
+focused Electron regressions on Windows, macOS and Linux. The `Linux source
+smoke` workflow additionally runs the Linux desktop/native lane. Windows
+coverage, stability, native inference and packaged-app acceptance must be run
+and recorded separately; these workflows do not establish those results.
 
 The review found that `bootstrap-node.ps1` was a production startup entry with
 no test owner. It also exited the caller on a cache hit, preventing safe
@@ -164,7 +192,7 @@ cross-platform contract only guards wiring and pinned inventory.
 ## Manual packaged-app checks
 
 1. Launch from Explorer with no developer-shell PATH and confirm local CLIs,
-   registry protocol handling, notifications, OfficeCLI, ffmpeg/ffprobe, and
+   connector OAuth callbacks, notifications, OfficeCLI, ffmpeg/ffprobe, and
    Whisper resolve without a visible console window.
 2. Cancel and time out one Office, video, media-probe, and package operation.
    Confirm Task Manager shows no descendants and the working files can be

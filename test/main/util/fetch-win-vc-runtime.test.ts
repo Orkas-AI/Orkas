@@ -168,14 +168,17 @@ describe('fetch-win-vc-runtime', () => {
     expect(marker.sourceSha256).toBe(contract.source.sha256);
   });
 
-  it('copies the VC DLLs into the Windows app root and has no NSIS runtime installer hook', () => {
+  it('copies the VC DLLs into the Windows app root without invoking a runtime installer', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
     expect(pkg.build.win.extraFiles).toEqual([{
       from: 'resources/runtime/vc/win32-x64',
       to: '.',
       filter: ['*.dll'],
     }]);
-    expect(pkg.build.nsis?.include).toBeUndefined();
+    // The shared installer cleanup hook is independent of app-local VC deployment.
+    expect(pkg.build.nsis?.include).toBe('scripts/windows-installer.nsh');
+    const include = fs.readFileSync(path.join(process.cwd(), pkg.build.nsis.include), 'utf8');
+    expect(include).not.toMatch(/vc_?redist|whisper-runtime|msiexec/i);
     expect(fs.existsSync(path.join(process.cwd(), 'product', 'whisper-runtime.nsh'))).toBe(false);
   });
 

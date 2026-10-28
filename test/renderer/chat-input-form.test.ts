@@ -159,6 +159,40 @@ const baseMessage = {
 };
 
 describe('chat input form widget', () => {
+  it('preserves selection order across file fields, upload completion and draft rerender', async () => {
+    const context = loadFormModule();
+    const releases = new Map<string, () => void>();
+    let picked = ['z-first.png', 'm-second.png'];
+    context.window.orkas = { invoke: async () => ({ files: picked.map((name) => ({ name,
+      arrayBuffer: async () => new Uint8Array([1]).buffer })) }) };
+    context.apiFetch = async (_url: string, opts: any) => {
+      const name = decodeURIComponent(opts.headers['X-Filename']);
+      await new Promise<void>((resolve) => releases.set(name, resolve));
+      return { json: async () => ({ ok: true, info: { name } }) };
+    };
+    const form = { form_id: 'order1234', fields: [
+      { id: 'a', type: 'file', multiple: true }, { id: 'b', type: 'file', multiple: true },
+    ] };
+    const submissions: any[] = [];
+    const opts = { cid: 'order', onSubmit: (_text: string, values: any, attachments: string[]) => submissions.push({ values, attachments }) };
+    const container = new FakeElement('div');
+    context.window.renderChatInputForm(container, { form }, opts);
+    const pickers = container.querySelectorAll('button').filter((button) => button.className.includes('file-picker'));
+    const pick = async (index: number) => {
+      await pickers[index].dispatch('click');
+    };
+    await pick(1);
+    picked = ['a-third.png'];
+    await pick(0);
+    for (const name of ['a-third.png', 'm-second.png', 'z-first.png']) releases.get(name)!();
+    for (let i = 0; i < 8; i += 1) await Promise.resolve();
+    const restored = new FakeElement('div');
+    context.window.renderChatInputForm(restored, { form }, opts);
+    await restored.querySelectorAll('button').find((button) => button.textContent === 'Submit')!.dispatch('click');
+    expect(submissions).toEqual([{ values: { a: ['a-third.png'], b: ['z-first.png', 'm-second.png'] },
+      attachments: ['z-first.png', 'm-second.png', 'a-third.png'] }]);
+  });
+
   describe('PC unanswered values', () => {
     it('requires actual answers for missing typed values and preserves zero and false', async () => {
       const context = loadFormModule();

@@ -78,7 +78,22 @@ describe('todo editor assignment', () => {
     h.elements['project-todo-input'].value = 'New';
     await h.context._saveProjectTodoEditor();
     const patch = h.calls.find((c) => c.channel === 'projects.tasks.update').args;
-    expect(patch).toEqual({ projectId: '', taskId: 't_aabbccddeeff', content: 'New' });
+    expect(patch).toEqual({ projectId: '', taskId: 't_aabbccddeeff', content: 'New', attachment_order: [] });
+  });
+
+  it('keeps an unavailable project owner under its stored name without offering it as a new choice', async () => {
+    const h = harness(async (channel) => {
+      if (channel === 'projects.bindings.list') return { ok: true, agentDetails: [
+        { agent_id: 'removed', name: '', source: 'custom', enabled: false, unavailable: true },
+        { agent_id: 'a', name: 'Alpha' },
+      ] };
+      return { ok: true };
+    });
+    await h.open({ id: 't_aabbccddeeff', content: 'Old', status: 'todo', owner_agent_id: 'removed', owner_agent: 'Previous owner' }, 'p');
+    const options = h.selects['project-todo-agent'].state.options;
+    expect(options.map((o: any) => o.value)).toEqual(['', 'commander', 'a', 'removed']);
+    expect(options.find((o: any) => o.value === 'removed').label).toBe('Previous owner');
+    expect(h.selects['project-todo-agent'].getValue()).toBe('removed');
   });
 
   it('discards stale agent responses when the project changes and never carries an owner across scopes', async () => {

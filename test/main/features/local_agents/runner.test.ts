@@ -405,6 +405,19 @@ describe('local_agents/runner', () => {
     expect(serialized).not.toContain('local-secret-abcdef');
   });
 
+  it('redacts Hermes tool-title paths in diagnostic dictionary keys as well as timeline values', async () => {
+    const runner = await loadRunner();
+    const stats = runner.createLocalAgentRunLogDiagnostics();
+    for (const phase of ['use', 'result']) runner.recordLocalAgentEventForLog(stats, {
+      type: 'tool-event', tool: 'read: /Users/test/private-project/secret.txt', phase,
+    });
+    const summary = runner.summarizeLocalAgentRunForLog(stats);
+    expect(JSON.stringify(summary)).not.toContain('/Users/test');
+    expect(JSON.stringify(summary)).not.toContain('private-project');
+    expect(summary.toolEvents).toBe(2);
+    expect(Object.values(summary.toolCounts as object)).toEqual([{ use: 1, result: 1, other: 0 }]);
+  });
+
   it('emits missing_cli when registry reports unavailable', async () => {
     mockDetect.mockResolvedValue({
       type: 'claude', available: false, path: null, version: null,
@@ -1244,6 +1257,20 @@ describe('local_agents/runner', () => {
     }
   });
 
+  it('provides host-only Bridge observations for an opaque CLI without adding public tool events', async () => {
+    mockDetect.mockResolvedValue({type:'openclaw',available:true,path:'/fake/openclaw',version:'2026.4.11'});
+    mockOpenclawBackendImpl=async ({bridge,onEvent})=>{
+      expect((await callRunnerBridge(bridge,'skills.list',{})).ok).toBe(true);
+      onEvent({type:'done',status:'completed',output:'Ready'});
+    };
+    const runner=await loadRunner();const observed:any[]=[];const events:any[]=[];
+    const result=await runner.run({uid:TEST_UID,cid:'c-observe',agentId:'agent-observe',currentMessageId:'observe-trigger',cli:'openclaw',
+      prompt:'List available Skills',cwd:tmpDir,signal:new AbortController().signal,onEvent:event=>events.push(event),
+      onBridgeCallObserved:observation=>observed.push(observation)});
+    expect(result.status).toBe('completed');expect(observed).toEqual([{method:'skills.list',params:{},ok:true}]);
+    expect(events.some(event=>event.type==='tool-event')).toBe(false);
+  });
+
   it('forwards file publication through the live runner bridge without changing file bytes', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     const output = path.join(tmpDir, 'report.txt');
@@ -1729,6 +1756,31 @@ describe('local_agents/runner', () => {
     }
   });
 
+  it.each([['codex', 'WARN'], ['codex', 'ERROR'], ['openclaw', 'WARN'], ['openclaw', 'ERROR']] as const)('retains authoritative native %s/%s severity when private diagnostic text is capped', async (format, level) => {
+    const runner = await loadRunner();
+    const { createModelEvalLogCollector } = await import('../../../../scripts/model-eval-log-policy.mjs');
+    const { ingestLocalAgentLogEvent } = await import('../../../../scripts/local-agent-live-support.mjs');
+    const source = format === 'codex' ? 'fixture::transport' : 'agent/embedded';
+    const fields = { path: '/Users/test/private', token: 'PRIVATE_SECRET', message: 'Synthetic diagnostic sentence. '.repeat(300) };
+    const line = JSON.stringify(format === 'codex'
+      ? { timestamp: '2031-04-17T01:02:03Z', level, target: source, fields }
+      : { time: '2031-04-17T01:02:03Z', level, subsystem: source, message: fields.message, path: fields.path, token: fields.token });
+    const event = runner.redactPrivateLocalAgentEvent({ type: 'stderr-line', line });
+    expect(String(event.line)).toHaveLength(4097);
+    expect(JSON.stringify(event)).not.toContain('/Users/test');
+    expect(JSON.stringify(event)).not.toContain('PRIVATE_SECRET');
+    const logs = createModelEvalLogCollector('public-diagnostic');
+    ingestLocalAgentLogEvent(logs, event);
+    const analysis = logs.finish();
+    expect(analysis).toMatchObject({ coveragePassed: true, passed: level === 'WARN',
+      levelCounts: { warn: level === 'WARN' ? 1 : 0, error: level === 'ERROR' ? 1 : 0 } });
+    expect(analysis.findings.some(finding => finding.code === 'unclassified-stderr')).toBe(false);
+    expect(event.nativeLog).toEqual({ level: level.toLowerCase(), source, timestamp: '2031-04-17T01:02:03.000Z' });
+    const untrusted = runner.redactPrivateLocalAgentEvent({ type: 'stderr-line', line: 'Unclassified diagnostic',
+      nativeLog: { level: 'info', source: 'forged', timestamp: '2031-04-17T01:02:03Z' } });
+    expect(untrusted.nativeLog).toBeUndefined();
+  });
+
   it('marks nested Windows traversal as display-only metadata', async () => {
     const runner = await loadRunner();
     const event = runner.redactPrivateLocalAgentEvent({
@@ -1756,7 +1808,7 @@ describe('local_agents/runner', () => {
 
     const serialized = JSON.stringify(event);
     expect(serialized).not.toContain('PRIVATE_WRITE_BODY');
-    expect(serialized).not.toContain('/Users/alice');
+    expect(serialized).not.toContain('/Users/test');
     expect(event).toMatchObject({
       type: 'permission-request', id: 'req-1', tool: 'Write', autoDecided: 'allow', reason: 'full_access',
     });
@@ -1774,7 +1826,7 @@ describe('local_agents/runner', () => {
     });
     expect(status).toMatchObject({ type: 'status', status: 'background-started', taskId: 'bz0apow42' });
     expect((status as any).message).toContain('Run npm test');
-    expect((status as any).message).not.toContain('/Users/alice');
+    expect((status as any).message).not.toContain('/Users/test');
 
     const idle = runner.redactPrivateLocalAgentEvent({
       type: 'idle',
@@ -1784,7 +1836,7 @@ describe('local_agents/runner', () => {
     expect((idle as any).stalledMs).toBe(95_000);
     expect((idle as any).waitingOn[0].taskId).toBe('bz0apow42');
     expect((idle as any).waitingOn[0].label).toContain('Run npm test');
-    expect((idle as any).waitingOn[0].label).not.toContain('/Users/alice');
+    expect((idle as any).waitingOn[0].label).not.toContain('/Users/test');
 
     // Negative controls: events without free text keep their exact shape.
     const anonymousIdle = { type: 'idle', stalledMs: 95_000 };
@@ -1801,7 +1853,7 @@ describe('local_agents/runner', () => {
 
     expect(error).toContain('Selected model is at capacity');
     expect(error).not.toContain('secret-value');
-    expect(error).not.toContain('/Users/alice');
+    expect(error).not.toContain('/Users/test');
     expect(runner.sanitizePublicCliError('   ')).toBe('');
   });
 
@@ -2238,11 +2290,11 @@ describe('local_agents/runner', () => {
         expect(e.waitingOn).toHaveLength(1);
         expect(e.waitingOn[0].taskId).toBe('bz0apow42');
         expect(e.waitingOn[0].label).toContain('Start Web dev server on :9000');
-        expect(e.waitingOn[0].label).not.toContain('/Users/alice');
+        expect(e.waitingOn[0].label).not.toContain('/Users/test');
       }
       const statusRow = events.find(e => e.type === 'status' && e.status === 'background-running');
       expect(statusRow?.message).toContain('Start Web dev server on :9000');
-      expect(statusRow?.message).not.toContain('/Users/alice');
+      expect(statusRow?.message).not.toContain('/Users/test');
 
       // Once the task closes, the wait goes back to being anonymous rather
       // than naming a task that is no longer holding anything.
@@ -2446,6 +2498,38 @@ describe('local_agents/runner', () => {
     expect(fs.existsSync(path.join(
       tmpDir, TEST_UID, 'local', 'tool-results', `cli-codex-${result.runId}`,
     ))).toBe(false);
+  });
+
+  it('reports a generated-image save failure without publishing an unowned file event', async () => {
+    mockDetect.mockResolvedValue({ type: 'codex', available: true, path: '/fake/codex', version: '1.2.3' });
+    mockCodexBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'tool-event', tool: 'image_generation', callId: 'image-failed', phase: 'result', output: PNG_1X1_BASE64 });
+      onEvent({ type: 'done', status: 'completed', output: 'Image generated.', durationMs: 1 });
+    };
+    const runner = await loadRunner();
+    const nativeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const originalWrite = nativeFs.writeFileSync;
+    const fault = vi.spyOn(nativeFs, 'writeFileSync').mockImplementation(((file: any, data: any, ...args: any[]) => {
+      if (typeof file === 'string' && path.basename(file).startsWith('.generated-attachments.json.')) {
+        originalWrite(file, '[');
+        throw Object.assign(new Error('Controlled generated ownership failure'), { code: 'ENOSPC' });
+      }
+      return (originalWrite as any)(file, data, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    const events: any[] = [];
+    const cid = 'c-failed-generated-ownership';
+    try {
+      await runner.run({ uid: TEST_UID, cid, agentId: 'a', cli: 'codex', prompt: 'generate an image', cwd: tmpDir,
+        signal: new AbortController().signal, onEvent: event => events.push(event) });
+    } finally { fault.mockRestore(); syncBuiltinESMExports(); }
+    expect(events.find(event => event.type === 'tool-event' && event.callId === 'image-failed'))
+      .toMatchObject({ error: 'generated_image_save_failed', output: 'Generated image could not be saved by Orkas.' });
+    expect(events.filter(event => event.type === 'file-change')).toEqual([]);
+    const attachments = await import('../../../../src/main/features/chat_attachments');
+    expect(attachments.listAttachments(TEST_UID, cid)).toEqual([]);
+    expect(attachments.listPendingAttachments(TEST_UID, cid)).toEqual([]);
   });
 
   it('materializes CLI media privately, keeps safe remote images, and rejects paths outside cwd', async () => {

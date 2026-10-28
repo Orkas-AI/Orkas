@@ -747,6 +747,7 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
           assert(!scoped.isError);
           assert.deepEqual(JSON.parse(scoped.content[0].text).tasks.map(t => t.id), [task.id]);
           assert.deepEqual(JSON.parse(scoped.content.at(-1).text).ignored_fields, ['project_id']);
+          process.stderr.write('Native fixture diagnostic\\n');
           process.stderr.write(JSON.stringify({ payloads: [{ text: task.status }], meta: { agentMeta: { sessionId: 'openclaw-test-session' } } }));
         } finally { await client.close(); }
       })().catch(error => { process.stderr.write('OpenClaw MCP contract probe failed: ' + error.message); process.exitCode = 1; });
@@ -762,8 +763,7 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
         expect(events.find(event => event.type === 'done')).toMatchObject({ status: 'completed', output: status, sessionId: 'openclaw-test-session' });
         expect(events.filter(event => event.type === 'text-delta').map(event => event.text)).toEqual([status]);
         const diagnostics = events.filter(event => event.type === 'stderr-line').map(event => event.line);
-        expect(diagnostics).toHaveLength(1);
-        expect(JSON.parse(diagnostics[0]).payloads).toEqual([{ text: status }]);
+        expect(diagnostics).toEqual(['Native fixture diagnostic']);
         expect(fs.readFileSync(source, 'utf8')).toBe(original);
         expect(fs.readdirSync(tmpDir).filter(name => name.startsWith('.orkas-run-'))).toEqual([]);
       }
@@ -805,7 +805,7 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
         const { createProjectTasksHandler } = await import('../../../../src/main/features/project_tasks_tool_handler');
         const native = createProjectTasksTool(createProjectTasksHandler(TEST_UID, scope, 'c-tasks-true', new Map()));
         expect(native.inputSchema.properties).not.toHaveProperty('result_ref');
-        for (const field of ['offset', 'limit', 'status', 'task_id', 'content']) {
+        for (const field of ['offset', 'limit', 'status', 'task_id', 'content', 'due_at']) {
           expect(tool.inputSchema.properties[field]).toEqual((native.inputSchema as any).properties[field]);
         }
         const autoTasks = await import('../../../../src/main/features/auto_tasks');
@@ -927,10 +927,10 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
             expect(await tasks.listTasks(TEST_UID, scope)).toEqual([taskAfterAttachment]);
           }
         }
-        const update = await client.request(6, 'tools/call', { name: 'todo_tasks', arguments: { action: 'update', task_id: task.id, status: 'review', content: 'Edited through MCP\nRetained requirement' } });
+        const update = await client.request(6, 'tools/call', { name: 'todo_tasks', arguments: { action: 'update', task_id: task.id, status: 'review', content: 'Edited through MCP\nRetained requirement', owner: 'Commander' } });
         expect(update.result.isError).toBeFalsy();
         expect(JSON.parse(update.result.content[0].text)).toMatchObject({ ok: true });
-        expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'review', content: 'Edited through MCP\nRetained requirement' });
+        expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'review', content: 'Edited through MCP\nRetained requirement', owner_agent: 'Commander', owner_agent_id: 'commander' });
         expect(await tasks.getTask(TEST_UID, scope, task.id)).not.toHaveProperty('assignee_uid');
         const complete = await client.request(7, 'tools/call', { name: 'todo_tasks', arguments: { action: 'complete', task_id: task.id, result_ref: 'retired-library-pointer' } });
         expect(complete.result.isError).toBeFalsy();
@@ -1195,6 +1195,15 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
       expect(JSON.parse(updated.content.at(-1).text)).toEqual({ ignored_fields: ['future_option'] });
       expect(JSON.stringify(updated)).not.toContain('PRIVATE_VALUE');
       expect(await projects.readProjectInstructions(TEST_UID, pid)).toMatchObject({ content: 'Keep delivery accessible.' });
+      const instructionsSchema = listed.result.tools.find((tool: any) => tool.name === 'project_instructions').inputSchema.properties.instructions;
+      expect(instructionsSchema.description).toContain('4000 UTF-16 code units');
+      expect(instructionsSchema.maxLength).toBeUndefined();
+      const tooLong = await call('project_instructions', { instructions: '😀'.repeat(2000) + 'x' });
+      expect(tooLong.isError).toBe(true);
+      expect(JSON.parse(tooLong.content[0].text)).toEqual({ ok: false, error: 'too_long', limit: 4000, actual: 4001 });
+      expect(await projects.readProjectInstructions(TEST_UID, pid)).toMatchObject({ content: 'Keep delivery accessible.' });
+      expect((await call('project_instructions', { instructions: 'Corrected replacement.' })).isError).toBeFalsy();
+      expect(await projects.readProjectInstructions(TEST_UID, pid)).toMatchObject({ content: 'Corrected replacement.' });
       expect((await call('cross_session_memory', { action: 'add', target: 'project', content: 'The audience uses keyboards.' })).isError).toBeFalsy();
       expect(memory.listEntries(TEST_UID, { project: pid }).entries).toEqual(['The audience uses keyboards.']);
       const rejected = await call('library_save', { source_path: 'deliverable.md', expected_revision: '' });
@@ -1248,11 +1257,11 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
       const runner = built.runner as unknown as {
         activeTools(): Array<{ name: string; execute(input: Record<string, unknown>, ctx: unknown): Promise<{ content: string; isError?: boolean }> }>;
       };
-      return async (name: string, input: Record<string, unknown>) => {
+      return async (name: string, input: Record<string, unknown>, expectError = false) => {
         const tool = runner.activeTools().find((entry) => entry.name === name);
         expect(tool, `native turn must expose ${name}`).toBeDefined();
         const result = await tool!.execute(input, { workingDir: tmpDir, state: {} });
-        expect(result.isError, result.content).toBeFalsy();
+        expect(Boolean(result.isError), result.content).toBe(expectError);
         return JSON.parse(result.content);
       };
     };
@@ -1260,6 +1269,9 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
     const initialRules = 'Preserve keyboard access.';
     const initialFact = 'The supported locale is English.';
     await native('project_instructions', { instructions: initialRules });
+    expect(await native('project_instructions', { instructions: '😀'.repeat(2000) + 'x' }, true))
+      .toEqual({ ok: false, error: 'too_long', limit: 4000, actual: 4001 });
+    expect(await projects.readProjectInstructions(TEST_UID, pid)).toMatchObject({ content: initialRules });
     await native('cross_session_memory', { action: 'add', target: 'project', content: initialFact });
     await native('cross_session_memory', { action: 'add', target: 'agent', content: 'Native private note.' });
     fs.writeFileSync(path.join(tmpDir, 'shared.md'), 'Native draft.');
@@ -1735,7 +1747,7 @@ describe.each(['legacy', 'modern'] as const)('CLI history process discovery on %
     await createConversation(TEST_UID, { conversationId: 'history', title: 'Cedar export' });
     for (const row of [
       { id: 'earlier', from: 'commander', text: 'Cedar check finished. ' + 'detail '.repeat(900), process: [
-        { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'report', name: 'read_files', output: 'Cedar 通过7项，失败2项。' } } },
+        { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'report', name: 'read_files', output: 'Cedar 通过7项，失败2项。' + ' exact detail 🧾 '.repeat(300) + 'END_REPORT' } } },
         { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'preview', name: 'preview', output: { mimeType: 'video/mp4', data: 'PRIVATE_VIDEO_BYTES' } } } },
         { type: 'event', event: { stream: 'thinking', data: { text: 'PRIVATE_REASONING' } } },
       ] },
@@ -1772,11 +1784,28 @@ describe.each(['legacy', 'modern'] as const)('CLI history process discovery on %
         const next = decode(/<next_read>([\s\S]*?)<\/next_read>/.exec(text)![1]);
         if (next === 'done') break;
         continued = true;
-        args = { ...JSON.parse(next), action: 'read', scope: 'current', max_tokens: 800 };
+        args = JSON.parse(next);
       }
       expect(continued).toBe(true);
       expect(recovered).toContain('Cedar 通过7项，失败2项。');
       expect(recovered).not.toMatch(/PRIVATE_REASONING|PRIVATE_VIDEO_BYTES|CURRENT_TRIGGER|LATER_CONCURRENT/);
+      const focused = JSON.parse(/^    process_read: (.+)$/m.exec(search.result.content[0].text)![1]);
+      expect(focused).toMatchObject({ action: 'read', scope: 'current', record_id: 'earlier', process_index: 0 });
+      let focusedArgs = { ...focused, max_tokens: 800 }, focusedText = '', focusedDone = false, focusedPages = 0;
+      for (; focusedPages < 10; focusedPages++) {
+        const read = await client.request(50 + focusedPages, 'tools/call', { name: 'chat_history', arguments: focusedArgs });
+        expect(read.result.isError).not.toBe(true);
+        const text = read.result.content[0].text;
+        expect(estimateTextTokens(text)).toBeLessThanOrEqual(800);
+        expect(text).not.toMatch(/Cedar check finished|PRIVATE_REASONING|PRIVATE_VIDEO_BYTES|CURRENT_TRIGGER|LATER_CONCURRENT/);
+        focusedText += text;
+        const next = decode(/<next_read>([\s\S]*?)<\/next_read>/.exec(text)![1]);
+        if (next === 'done') { focusedDone = true; break; }
+        focusedArgs = JSON.parse(next);
+      }
+      expect(focusedDone).toBe(true);
+      expect(focusedPages).toBeGreaterThan(0);
+      expect(focusedText).toContain('END_REPORT');
       const denied = await client.request(20, 'tools/call', { name: 'chat_history', arguments: { ...locator, scope: 'all' } });
       const foreign = await client.request(21, 'tools/call', { name: 'chat_history', arguments: { ...locator, cid: 'foreign-conversation' } });
       expect(foreign.result.isError).toBe(true);
@@ -1806,6 +1835,7 @@ describe('orkas bridge modern protocol rejection and recovery', () => {
       const discovered = await client.request(2, 'server/discover', {});
       expect(discovered.result.supportedVersions).toContain('2026-07-28');
       const listed = await client.request(3, 'tools/list', {});
+      expect(listed.error).toBeUndefined();
       expect(listed.result.tools.some((tool: any) => tool.name === 'orkas_list_skills')).toBe(true);
       const invalid = await client.request(4, 'tools/call', { name: 'orkas_read_skill', arguments: { id: 4 } });
       expect(invalid.result.isError).toBe(true);

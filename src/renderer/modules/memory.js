@@ -10,8 +10,6 @@
 // `usage.limit` — never hardcoded here. Stored entries are plain text.
 
 const _MEM_LIMIT_WARN = 0.85; // usage bar turns warn above this fraction
-const _MEM_IPC_FAILURE_DEDUPE_MS = 60 * 1000;
-const _MEM_IPC_FAILURE_MAX_PER_SESSION = 20;
 const _MEM_IPC_CHANNELS = new Set([
   'memory.list',
   'memory.add',
@@ -24,8 +22,6 @@ const _MEM_IPC_CHANNELS = new Set([
 const _memLog = (typeof createLogger === 'function')
   ? createLogger('memory')
   : { info() {}, warn() {} };
-const _memIpcFailureState = new Map();
-let _memIpcFailureCount = 0;
 
 // Ordered scope descriptors for the current render:
 //   { key, kind:'user'|'shared', title, sub, icon }
@@ -50,39 +46,6 @@ function _memLogSafe(level, message, data) {
   try {
     if (_memLog && typeof _memLog[level] === 'function') _memLog[level](message, data || {});
   } catch (_) { /* diagnostics must not alter the operation result */ }
-}
-
-function _memLogResult(action, data) {
-  _memLogSafe('info', 'memory action result', { action, ...(data || {}) });
-}
-
-function _memLogReadResult(action, startedAt, results) {
-  const rows = Array.isArray(results) ? results : [];
-  const failures = rows.filter((row) => !row || row.ok !== true);
-  const successCount = rows.length - failures.length;
-  const payload = {
-    result: failures.length === 0
-      ? 'success'
-      : (successCount > 0 ? 'partial_failure' : 'failure'),
-    action: action === 'reveal' ? 'reveal' : 'list',
-    duration_ms: _memDuration(startedAt),
-    entry_count: rows.reduce((total, row) => (
-      total + (row && row.ok && Array.isArray(row.entries) ? row.entries.length : 0)
-    ), 0),
-    failed_count: failures.length,
-  };
-  if (failures.length > 0) {
-    const details = failures.map(_memFailureDetails);
-    const errorCodes = [...new Set(details.map((item) => item.error_code))];
-    const errorTypes = [...new Set(details.map((item) => item.error_type))];
-    payload.error_code = errorCodes.length === 1 ? errorCodes[0] : 'multiple';
-    payload.error_type = errorTypes.length === 1 ? errorTypes[0] : 'runtime';
-  }
-  _memLogResult('memory_read_result', payload);
-}
-
-function _memDuration(startedAt) {
-  return Math.max(0, Date.now() - startedAt);
 }
 
 function _memTarget(target) {
@@ -128,20 +91,7 @@ function _memFailureDetails(result) {
   return { error_type: 'runtime', error_code: 'memory_operation_failed' };
 }
 
-function _memReportIpcFailure(channel, result) {
-  const safeChannel = _memChannel(channel);
-  const details = _memFailureDetails(result);
-  const key = `${safeChannel}:${details.error_code}`;
-  const now = Date.now();
-  const previous = _memIpcFailureState.get(key) || 0;
-  if (now - previous < _MEM_IPC_FAILURE_DEDUPE_MS) return;
-  if (_memIpcFailureCount >= _MEM_IPC_FAILURE_MAX_PER_SESSION) return;
-  _memIpcFailureState.set(key, now);
-  _memIpcFailureCount += 1;
-}
-
-async function _memInvoke(channel, payload, options) {
-  const resultOwned = Boolean(options && options.resultOwned);
+async function _memInvoke(channel, payload) {
   if (!window.orkas || typeof window.orkas.invoke !== 'function') {
     const failure = {
       ok: false,
@@ -153,7 +103,6 @@ async function _memInvoke(channel, payload, options) {
       channel: _memChannel(channel),
       error_code: failure.__memory_error_code,
     });
-    if (!resultOwned) _memReportIpcFailure(channel, failure);
     return failure;
   }
 
@@ -172,7 +121,6 @@ async function _memInvoke(channel, payload, options) {
         error_type: details.error_type,
         error_code: details.error_code,
       });
-      if (!resultOwned) _memReportIpcFailure(channel, failure);
     }
     return failure;
   } catch (err) {
@@ -187,7 +135,6 @@ async function _memInvoke(channel, payload, options) {
       error_type: 'ipc',
       error_code: failure.__memory_error_code,
     });
-    if (!resultOwned) _memReportIpcFailure(channel, failure);
     return failure;
   }
 }
@@ -208,7 +155,6 @@ function _memScopePayload(key, extra) {
 // ── Data load ──────────────────────────────────────────────────────────────
 
 async function _memLoad() {
-  const startedAt = Date.now();
   _memScopes = [
     { key: 'user', kind: 'user', title: t('memory.section_user'), sub: t('memory.section_user_sub'), icon: 'users' },
     { key: 'shared', kind: 'shared', title: t('memory.section_shared'), sub: t('memory.section_shared_sub'), icon: 'sparkles' },
@@ -217,9 +163,7 @@ async function _memLoad() {
   const results = await Promise.all(_memScopes.map((s) => _memInvoke(
     'memory.list',
     _memParseScope(s.key),
-    { resultOwned: true },
   )));
-  _memLogReadResult('list', startedAt, results);
   _memData = {};
   _memScopes.forEach((s, i) => {
     const r = results[i];
@@ -228,13 +172,10 @@ async function _memLoad() {
 }
 
 async function _memReveal(target) {
-  const startedAt = Date.now();
   const result = await _memInvoke(
     'memory.reveal',
     _memParseScope(target),
-    { resultOwned: true },
   );
-  _memLogReadResult('reveal', startedAt, [result]);
   return result;
 }
 
@@ -474,32 +415,13 @@ async function _memSaveEditor(target) {
   const content = ta.value.trim();
   if (!content) return;
   const isEdit = _memEditor && _memEditor.mode === 'edit';
-  const mode = isEdit ? 'edit' : 'add';
-  const startedAt = Date.now();
   const res = isEdit
-    ? await _memInvoke('memory.replace', _memScopePayload(safeTarget, { oldText: _memEditor.oldText, content }), { resultOwned: true })
-    : await _memInvoke('memory.add', _memScopePayload(safeTarget, { content }), { resultOwned: true });
-  const durationMs = _memDuration(startedAt);
+    ? await _memInvoke('memory.replace', _memScopePayload(safeTarget, { oldText: _memEditor.oldText, content }))
+    : await _memInvoke('memory.add', _memScopePayload(safeTarget, { content }));
   if (!res.ok) {
-    const details = _memFailureDetails(res);
-    _memLogResult('memory_entry_save_result', {
-      result: 'failure',
-      target: safeTarget,
-      mode,
-      duration_ms: durationMs,
-      ...details,
-    });
     _memToast(_memErrorToText(res.error), 'error');
     return;
   }
-  _memLogResult('memory_entry_save_result', {
-    result: 'success',
-    target: safeTarget,
-    mode,
-    chars: content.length,
-    char_count: content.length,
-    duration_ms: durationMs,
-  });
   _memEditor = null;
   // Refresh just this scope from the op result (it already carries entries+usage).
   const prev = _memData[safeTarget] || {};
@@ -513,25 +435,11 @@ async function _memDelete(target, text) {
     ? await uiConfirm({ message: t('memory.delete_confirm'), okLabel: t('memory.delete'), cancelLabel: t('memory.cancel') })
     : true;
   if (!ok) return;
-  const startedAt = Date.now();
-  const res = await _memInvoke('memory.remove', _memScopePayload(safeTarget, { oldText: text }), { resultOwned: true });
-  const durationMs = _memDuration(startedAt);
+  const res = await _memInvoke('memory.remove', _memScopePayload(safeTarget, { oldText: text }));
   if (!res.ok) {
-    const details = _memFailureDetails(res);
-    _memLogResult('memory_entry_delete_result', {
-      result: 'failure',
-      target: safeTarget,
-      duration_ms: durationMs,
-      ...details,
-    });
     _memToast(_memErrorToText(res.error), 'error');
     return;
   }
-  _memLogResult('memory_entry_delete_result', {
-    result: 'success',
-    target: safeTarget,
-    duration_ms: durationMs,
-  });
   const prev = _memData[safeTarget] || {};
   _memData[safeTarget] = { entries: res.entries || [], usage: res.usage || prev.usage, path: prev.path };
   _memRerender();
@@ -548,7 +456,13 @@ function _memErrorToText(error) {
 
 // ── Modal shell ──────────────────────────────────────────────────────────────
 
+let _memModalKeyHandler = null;
+
 function _memCloseModal() {
+  if (_memModalKeyHandler) {
+    document.removeEventListener('keydown', _memModalKeyHandler);
+    _memModalKeyHandler = null;
+  }
   const host = document.getElementById('memory-modal-host');
   if (host) host.remove();
 }
@@ -563,8 +477,10 @@ function _memOpenModal(width, innerHtml) {
   if (typeof window.hydrateUiIcons === 'function') window.hydrateUiIcons(host);
   // Esc close. Backdrop clicks are ignored to avoid accidental dismissals.
   const onKey = (e) => {
-    if (e.key === 'Escape') { _memCloseModal(); document.removeEventListener('keydown', onKey); }
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Escape') _memCloseModal();
   };
+  _memModalKeyHandler = onKey;
   document.addEventListener('keydown', onKey);
   return host;
 }
@@ -766,33 +682,16 @@ function _memUpdateMergeSummary(host) {
 async function _memDoMerge() {
   const kept = _memImportItems.filter((it) => it.keep);
   if (!kept.length) return;
-  const startedAt = Date.now();
   let added = 0;
   let failed = 0;
-  const failureTypes = new Set();
   for (const it of kept) {
     // it.target is 'user' | 'shared' (a scope-key the backend accepts directly).
-    const res = await _memInvoke('memory.add', _memScopePayload(_memTarget(it.target), { content: it.text }), { resultOwned: true });
+    const res = await _memInvoke('memory.add', _memScopePayload(_memTarget(it.target), { content: it.text }));
     if (res.ok) added++;
     else {
       failed++;
-      failureTypes.add(_memFailureDetails(res).error_type);
     }
   }
-  const result = failed ? (added ? 'partial_failure' : 'failure') : 'success';
-  const resultPayload = {
-    result,
-    added_count: added,
-    failed_count: failed,
-    duration_ms: _memDuration(startedAt),
-  };
-  if (failed) {
-    resultPayload.error_type = failureTypes.size === 1 ? Array.from(failureTypes)[0] : 'unknown';
-    resultPayload.error_code = added ? 'memory_import_partial_failure' : 'memory_import_failed';
-  }
-  // Persistence is the terminal boundary. Modal/toast/render failures cannot
-  // erase or reverse the completed aggregate result.
-  _memLogResult('memory_import_result', resultPayload);
   _memCloseModal();
   if (added) _memToast(t('memory.merge_done', { n: added }), 'success');
   if (failed) _memToast(t('memory.merge_partial', { n: failed }), 'warning');

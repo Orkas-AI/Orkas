@@ -59,6 +59,9 @@ let _settingsState = {
   taskNotificationsToggleEpoch: 0,
   taskNotificationPermissionRefreshTimer: null,
   taskNotificationPermissionLogKey: '',
+  metacognition: null,
+  metacognitionToggleEpoch: 0,
+  localExecModeEpoch: 0,
   clientConfigBound: false,
   recycleBound: false,
   orkasApiCredential: null,
@@ -735,9 +738,9 @@ function _settingsBindRecycleBinOnce() {
 const _LOCALEXEC_MODES = ['workspace_approval', 'all_files_approval', 'all_files_auto'];
 
 async function _settingsRefreshLocalExec() {
-  const epoch = _settingsState.localExecToggleEpoch;
+  const epoch = _settingsState.localExecModeEpoch;
   const res = await window.orkas.invoke('permissions.getLocalExec');
-  if (epoch !== _settingsState.localExecToggleEpoch) return;
+  if (epoch !== _settingsState.localExecModeEpoch) return;
   const mode = (res && res.ok && _LOCALEXEC_MODES.includes(res.mode)) ? res.mode : 'all_files_approval';
   _settingsState.localExec = { mode };
   _settingsRenderLocalExec();
@@ -1552,6 +1555,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
   saveBtn.className = 'btn btn-primary';
   saveBtn.textContent = t('settings.save');
   const save = async () => {
+    if (saveBtn.disabled || overlay._onKey !== formOwner) return;
     const startedAt = Date.now();
     const resolvedModelId = _settingsResolveApiKeyModelId(provider.id, modelId, modelInput?.value);
     const label  = (labelInput.value || '').trim();
@@ -1580,6 +1584,10 @@ function _settingsShowApiKeyForm(provider, modelId) {
       });
     } catch (_) {
       addRes = { ok: false, code: 'invoke_failed' };
+    }
+    if (overlay._onKey !== formOwner) {
+      if (addRes && addRes.ok) await _settingsReload();
+      return;
     }
     if (!addRes || !addRes.ok) {
       saveBtn.disabled = false;
@@ -1611,6 +1619,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
   actions.appendChild(cancelBtn);
   actions.appendChild(saveBtn);
   _settingsOpenModal(overlay);
+  const formOwner = overlay._onKey;
   setTimeout(() => (modelInput || labelInput).focus(), 0);
 }
 
@@ -1656,7 +1665,7 @@ function _settingsNormalizeCustomBaseUrl(value, protocol) {
     const url = new URL(raw);
     // Main owns Anthropic suffix conversion; sending its canonical result
     // through that boundary again can remove part of a gateway prefix.
-    if (protocol === 'anthropic') return raw;
+    if (protocol === 'anthropic' || protocol === 'responses') return raw;
     const chatPathIndex = url.pathname.search(/\/chat(?:\/|$)/i);
     if (chatPathIndex >= 0) {
       url.pathname = url.pathname.slice(0, chatPathIndex).replace(/\/+$/, '') || '/';
@@ -1671,7 +1680,7 @@ function _settingsBuildCustomModelPayload(values) {
   const maxTokens = String(values.maxTokens ?? '').trim();
   return {
     label: String(values.label || '').trim(),
-    protocol: values.protocol === 'anthropic' ? 'anthropic' : 'openai',
+    protocol: values.protocol === 'anthropic' ? 'anthropic' : values.protocol === 'responses' ? 'responses' : 'openai',
     baseUrl: _settingsNormalizeCustomBaseUrl(values.baseUrl, values.protocol),
     model: String(values.model || '').trim(),
     apiKey: String(values.apiKey || '').trim(),
@@ -1733,6 +1742,7 @@ function _settingsShowCustomModelForm(provider) {
   const protocolSelect = _aiSelectMount(protocolInput, {
     options: [
       { value: 'openai', label: t('settings.custom.protocol_openai') },
+      { value: 'responses', label: t('settings.custom.protocol_responses') },
       { value: 'anthropic', label: t('settings.custom.protocol_anthropic') },
     ],
     value: 'openai',
@@ -1752,6 +1762,7 @@ function _settingsShowCustomModelForm(provider) {
   saveBtn.className = 'btn btn-primary';
   saveBtn.textContent = t('settings.save');
   const save = async () => {
+    if (saveBtn.disabled || overlay._onKey !== formOwner) return;
     const startedAt = Date.now();
     const payload = _settingsBuildCustomModelPayload({
       label: labelInput.value,
@@ -1780,6 +1791,10 @@ function _settingsShowCustomModelForm(provider) {
       addRes = await window.orkas.invoke('auth.addCustomModelEntry', payload);
     } catch (_) {
       addRes = { ok: false, code: 'invoke_failed' };
+    }
+    if (overlay._onKey !== formOwner) {
+      if (addRes && addRes.ok) await _settingsReload();
+      return;
     }
     if (!addRes || !addRes.ok) {
       saveBtn.disabled = false;
@@ -1816,6 +1831,7 @@ function _settingsShowCustomModelForm(provider) {
   actions.appendChild(cancelBtn);
   actions.appendChild(saveBtn);
   _settingsOpenModal(overlay);
+  const formOwner = overlay._onKey;
   setTimeout(() => labelInput.focus(), 0);
 }
 
@@ -1845,7 +1861,8 @@ function _settingsCloseModal(overlay) {
 
 let _oauthFlowPollTimer = null;
 let _oauthFlowId        = null;
-let _oauthFlowTarget    = null;
+let _oauthFlowTarget = null;
+let _oauthFlowOwner = null;
 
 async function _settingsStartOAuthFlow(provider, modelId) {
   const overlay   = document.getElementById('oauth-flow-modal');
@@ -1860,6 +1877,8 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   const aliased = oauthProviderId !== provider.id;
 
   _settingsCloseAddModal();
+  if (_oauthFlowOwner) _oauthFlowOwner.closeFlow();
+  const owner = { closeFlow: null, settling: false };
   _oauthFlowTarget = { provider, modelId, oauthProviderId };
   title.textContent = t('settings.oauth.title_prefix', { provider: provider.label || provider.id });
   const aliasTip = aliased
@@ -1869,23 +1888,36 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   overlay.classList.add('open');
 
   const closeFlow = () => {
+    if (_oauthFlowOwner !== owner) return;
     if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
     if (_oauthFlowId) {
       window.orkas.invoke('auth.cancelOAuthFlow', { flowId: _oauthFlowId }).catch(() => {});
     }
     _oauthFlowId = null;
     _oauthFlowTarget = null;
+    _oauthFlowOwner = null;
     overlay.classList.remove('open');
     document.removeEventListener('keydown', onKey, true);
   };
   const onKey = (e) => { if (e.key === 'Escape') closeFlow(); };
+  owner.closeFlow = closeFlow;
+  _oauthFlowOwner = owner;
   closeBtn.onclick = closeFlow;
   document.addEventListener('keydown', onKey, true);
 
   _settingsLog.info('oauth start', { provider: oauthProviderId });
-  let startRes;
-  try { startRes = await window.orkas.invoke('auth.startOAuth', { provider: oauthProviderId }); }
-  catch (_) { startRes = { ok: false, code: 'invoke_failed' }; }
+  let startRes = null;
+  try {
+    startRes = await window.orkas.invoke('auth.startOAuth', { provider: oauthProviderId });
+  } catch (_) {
+    startRes = { ok: false, code: 'invoke_failed' };
+  }
+  if (_oauthFlowOwner !== owner) {
+    if (startRes && startRes.ok && startRes.flowId) {
+      window.orkas.invoke('auth.cancelOAuthFlow', { flowId: startRes.flowId }).catch(() => {});
+    }
+    return;
+  }
   if (!startRes || !startRes.ok) {
     body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml((startRes && startRes.error) || t('settings.oauth.start_failed'))}</div>`;
     _settingsLog.warn('oauth start failed', { provider: oauthProviderId, error: startRes && startRes.error });
@@ -1895,8 +1927,9 @@ async function _settingsStartOAuthFlow(provider, modelId) {
 
   let lastKind = '';
   _oauthFlowPollTimer = setInterval(async () => {
-    if (!_oauthFlowId) return;
+    if (_oauthFlowOwner !== owner || !_oauthFlowId) return;
     const res = await window.orkas.invoke('auth.pollOAuthFlow', { flowId: _oauthFlowId });
+    if (_oauthFlowOwner !== owner) return;
     if (!res || !res.ok) return;
     const status = res.status || {};
     if (status.kind === lastKind && status.kind !== 'done' && status.kind !== 'error') return;
@@ -1908,6 +1941,9 @@ async function _settingsStartOAuthFlow(provider, modelId) {
 function _oauthFlowRender(provider, status, closeFlow) {
   const body = document.getElementById('oauth-flow-body');
   if (!body) return;
+  const owner = _oauthFlowOwner;
+  if (!owner || owner.closeFlow !== closeFlow || owner.settling) return;
+  const isCurrent = () => _oauthFlowOwner === owner;
 
   if (status.kind === 'starting' || status.kind === 'progress') {
     body.innerHTML = `<div class="oauth-flow-stage">${escapeHtml(status.message || t('settings.oauth.processing'))}</div>`;
@@ -1994,6 +2030,9 @@ function _oauthFlowRender(provider, status, closeFlow) {
   }
 
   if (status.kind === 'done') {
+    // Finish an admitted write and its failure cleanup with captured inputs;
+    // only its view updates belong to this dialog.
+    owner.settling = true;
     const target = _oauthFlowTarget;
     const profileId = status.profileId || '';
     body.innerHTML = `<div class="oauth-flow-stage ok">${escapeHtml(t('settings.oauth.success_writing'))}</div>`;
@@ -2005,7 +2044,9 @@ function _oauthFlowRender(provider, status, closeFlow) {
       };
       const failEntrySave = async (errorCode, message, logContext = {}) => {
         await removeNewCredential();
-        body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml(message || t('settings.add_entry_failed'))}</div>`;
+        if (isCurrent()) {
+          body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml(message || t('settings.add_entry_failed'))}</div>`;
+        }
         _settingsLog.warn('oauth entry save failed', {
           error_code: errorCode,
           ...logContext,
@@ -2056,13 +2097,14 @@ function _oauthFlowRender(provider, status, closeFlow) {
         });
         return;
       }
-      closeFlow();
+      if (isCurrent()) closeFlow();
       await _settingsReload();
     })();
     return;
   }
 
   if (status.kind === 'error') {
+    owner.settling = true;
     body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml(status.error || t('settings.oauth.auth_failed'))}</div>`;
     if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
     return;
@@ -2084,8 +2126,15 @@ function _settingsRenderEntries() {
   const displayedEntries = _settingsState.entries.filter((entry) => (
     entry && entry.profileType !== 'managed'
   ));
-  displayedEntries.forEach((entry, idx) => {
-    container.appendChild(_settingsRenderEntryRow(entry, idx));
+  const orderedEntries = [
+    ...displayedEntries.filter(entry => entry.availability !== 'context_too_small'),
+    ...displayedEntries.filter(entry => entry.availability === 'context_too_small'),
+  ];
+  let priorityIdx = 0;
+  orderedEntries.forEach(entry => {
+    const blocked = entry.availability === 'context_too_small';
+    container.appendChild(_settingsRenderEntryRow(entry, blocked ? null : priorityIdx));
+    if (!blocked) priorityIdx += 1;
   });
 }
 
@@ -2107,6 +2156,9 @@ function _settingsEntryModelState(entry, list) {
 }
 
 function _settingsEntryProblem(entry) {
+  if (entry.availability === 'context_too_small' && entry.availabilityReason) {
+    return entry.availabilityReason;
+  }
   if (entry.profileAvailable === false) {
     return t('settings.entries.credential_missing');
   }
@@ -2146,14 +2198,15 @@ async function _settingsUpdateEntryModel(entry, model, modelSel) {
 }
 
 function _settingsRenderEntryRow(entry, priorityIdx) {
+  const capacityBlocked = entry.availability === 'context_too_small';
   const row = document.createElement('div');
   row.className = 'entry-row' + (priorityIdx === 0 ? ' is-default' : '');
   row.dataset.entryId = entry.entryId;
-  row.draggable = true;
+  row.draggable = !capacityBlocked;
 
   const rank = document.createElement('div');
   rank.className = 'entry-rank';
-  rank.textContent = priorityIdx === 0
+  rank.textContent = capacityBlocked ? '' : priorityIdx === 0
     ? t('settings.entries.default_tag')
     : `#${priorityIdx + 1}`;
   row.appendChild(rank);
@@ -2165,7 +2218,9 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
   const providerName = entry.providerLabelKey ? t(entry.providerLabelKey) : (entry.providerLabel || entry.provider);
   const isOrkasApi = entry.provider === _ORKAS_API_PROVIDER_ID;
   const recommendedModelTag = isOrkasApi && entry.recommended === true
-    ? `<span class="entry-model-recommended">${escapeHtml(t('settings.orkas_api.recommended'))}</span>`
+    ? `<span class="entry-model-recommended">${escapeHtml(t(entry.model === 'orkas-llm-1.5'
+      ? 'new_chat.model_picker.recommended_with_savings'
+      : 'settings.orkas_api.recommended'))}</span>`
     : '';
   const modelControl = entry.modelEditable === false
     ? `<span class="entry-model-static"><span class="entry-model-static-name">${escapeHtml(entry.modelName || entry.model)}</span>${recommendedModelTag}</span>`
@@ -2264,10 +2319,12 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
 
   row.appendChild(actions);
 
-  _settingsAttachReorderDnd(row, {
+  if (!capacityBlocked) _settingsAttachReorderDnd(row, {
     kind: 'chat',
     id: entry.entryId,
-    getIds: () => _settingsState.entries.map((e) => e.entryId),
+    getIds: () => _settingsState.entries
+      .filter(entry => entry.availability !== 'context_too_small')
+      .map(entry => entry.entryId),
     ipcName: 'auth.reorderEntries',
     onSuccess: (res) => {
       _settingsState.entries = Array.isArray(res.entries) ? res.entries : _settingsState.entries;
@@ -2495,6 +2552,7 @@ function _settingsOrkasServiceLabel(service) {
 const _SEARCH_PROVIDER_OPTIONS = [
   { id: 'orkas-api',          label: _settingsOrkasServiceLabel('Search'), docs: _ORKAS_API_KEYS_URL },
   { id: 'tavily',            label: 'Tavily', docs: 'https://tavily.com/' },
+  { id: 'deepseek',          label: 'DeepSeek', docs: 'https://api-docs.deepseek.com/guides/search/' },
   { id: 'serper',            label: 'Serper', docs: 'https://serper.dev/' },
   { id: 'brave-search',      label: 'Brave', docs: 'https://brave.com/search/api/' },
   { id: 'baidu-ai-search',   label: 'Baidu', docs: 'https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk' },
@@ -2648,14 +2706,18 @@ function _settingsRenderSearchEntries() {
 // ── Image generation API key section ────────────────────────────────────
 //
 // Multi-model providers are flattened into individual choices. The picker
-// shows DouBao · Seedream 5.0 Lite / Pro directly, while the main process
+// shows DouBao · Seedream 5.0 Flash / Pro directly, while the main process
 // still persists provider=doubao plus the selected model id.
 
 const _IMAGE_PROVIDER_OPTIONS = [
-  { id: 'orkas-api', label: _settingsOrkasServiceLabel('Image'), docs: _ORKAS_API_KEYS_URL },
-  { id: 'openai',  label: 'OpenAI · GPT Image 2', docs: 'https://platform.openai.com/api-keys' },
-  { id: 'google',  label: 'Google · Nano Banana 2', docs: 'https://aistudio.google.com/app/apikey' },
-  { id: 'doubao',  label: 'DouBao · Seedream', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
+  { id: 'orkas-api', provider: 'orkas-api', model: 'orkas-image', label: _settingsOrkasServiceLabel('Image'), docs: _ORKAS_API_KEYS_URL },
+  {"id": "openai:gpt-image-2", "label": "OpenAI · GPT Image 2", "docs": "https://platform.openai.com/api-keys", "provider": "openai", "model": "gpt-image-2"},
+  {"id": "openai:gpt-image-2.5-flare", "label": "OpenAI · GPT Image 2.5 Flare", "docs": "https://platform.openai.com/api-keys", "provider": "openai", "model": "gpt-image-2.5-flare"},
+  {"id": "openai:gpt-image-2.5-sunburst", "label": "OpenAI · GPT Image 2.5 Sunburst", "docs": "https://platform.openai.com/api-keys", "provider": "openai", "model": "gpt-image-2.5-sunburst"},
+  {"id": "google:gemini-nano-banana-2.1", "label": "Google · Nano Banana 2.1", "docs": "https://aistudio.google.com/app/apikey", "provider": "google", "model": "gemini-nano-banana-2.1"},
+  {"id": "google:gemini-3.1-flash-image-preview", "label": "Google · Nano Banana 2", "docs": "https://aistudio.google.com/app/apikey", "provider": "google", "model": "gemini-3.1-flash-image-preview"},
+  {"id": "doubao:doubao-seedream-5-0-flash-260915", "label": "DouBao · Seedream 5.0 Flash", "docs": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey", "provider": "doubao", "model": "doubao-seedream-5-0-flash-260915"},
+  {"id": "doubao:doubao-seedream-5-0-pro-260628", "label": "DouBao · Seedream 5.0 Pro", "docs": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey", "provider": "doubao", "model": "doubao-seedream-5-0-pro-260628"},
 ];
 
 function _imageProviderLabel(provider, model) {
@@ -2757,6 +2819,12 @@ function _settingsRenderImageEntries() {
       ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
     `;
     main.appendChild(primary);
+    if (isOrkasApi) {
+      const model = document.createElement('div');
+      model.className = 'entry-included-models entry-media-model';
+      model.textContent = 'Seedream 5.0 Flash';
+      main.appendChild(model);
+    }
     row.appendChild(main);
 
     const actions = document.createElement('div');
@@ -2794,10 +2862,18 @@ function _settingsRenderImageEntries() {
 // ── Video generation API key section ────────────────────────────────────
 //
 // Dedicated BYO video-generation credentials. The open-source build exposes
-// User-owned provider keys only; bundled video providers stay stripped.
+// User-owned provider keys only; account-managed providers stay stripped.
 
 const _VIDEO_AUTH_PROVIDER_OPTIONS = [
-  { id: 'orkas-api', label: _settingsOrkasServiceLabel('Video'), docs: _ORKAS_API_KEYS_URL },
+  { id: 'orkas-api', provider: 'orkas-api', model: 'orkas-video', label: _settingsOrkasServiceLabel('Video'), docs: _ORKAS_API_KEYS_URL },
+  {"id": "doubao:doubao-seedance-2-0-260128", "label": "DouBao · Seedance 2.0", "docs": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey", "provider": "doubao", "model": "doubao-seedance-2-0-260128"},
+  {"id": "doubao:doubao-seedance-2-0-fast-260128", "label": "DouBao · Seedance 2.0 Fast", "docs": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey", "provider": "doubao", "model": "doubao-seedance-2-0-fast-260128"},
+  {"id": "doubao:doubao-seedance-2-0-mini", "label": "DouBao · Seedance 2.0 Mini", "docs": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey", "provider": "doubao", "model": "doubao-seedance-2-0-mini"},
+  {"id": "minimax", "label": "MiniMax · Hailuo 2.3", "docs": "https://platform.minimax.io/user-center/basic-information/interface-key", "provider": "minimax", "model": "MiniMax-Hailuo-2.3"},
+  {"id": "vidu", "label": "Vidu · Q3 Pro", "docs": "https://platform.vidu.com/", "provider": "vidu", "model": "viduq3-pro"},
+  {"id": "kling", "label": "Kling · 3.0 Turbo", "docs": "https://kling.ai/global/dev", "provider": "kling", "model": "kling-v3-0-turbo"},
+  {"id": "google", "label": "Google · Veo 3.1", "docs": "https://aistudio.google.com/app/apikey", "provider": "google", "model": "veo-3.1-generate-preview"},
+  {"id": "runway", "label": "Runway · Gen-4.5", "docs": "https://dev.runwayml.com/", "provider": "runway", "model": "gen4.5"},
 ];
 
 function _settingsVideoProviderOptions() {
@@ -2806,9 +2882,16 @@ function _settingsVideoProviderOptions() {
     : _VIDEO_AUTH_PROVIDER_OPTIONS;
 }
 
-function _videoProviderLabel(id) {
-  const hit = _settingsVideoProviderOptions().find((p) => p.id === id);
-  return hit ? hit.label : id;
+function _videoProviderLabel(provider, model) {
+  const hit = _settingsVideoProviderOptions().find((option) => (
+    (option.provider || option.id) === provider
+    && (!model || !option.model || option.model === model)
+  ));
+  return hit ? hit.label : provider;
+}
+
+function _videoProviderOption(id) {
+  return _settingsVideoProviderOptions().find((option) => option.id === id) || null;
 }
 
 function _settingsSelectedVideoProvider() {
@@ -2859,14 +2942,17 @@ function _settingsRenderVideoPicker() {
 }
 
 async function _settingsClickAddVideoKey() {
-  const provider = _settingsSelectedVideoProvider();
+  const option = _videoProviderOption(_settingsSelectedVideoProvider());
+  const provider = option?.provider || option?.id || '';
+  const model = option?.model || '';
   const input = document.getElementById('settings-video-key-input');
   const apiKey = (input?.value || '').trim();
   if (!provider) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_provider_needed')); return; }
+  if (!model && provider !== _ORKAS_API_PROVIDER_ID) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_model_needed')); return; }
   if (!apiKey) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_key_needed')); return; }
   _settingsSetStatus('settings-video-status', 'busy', t('settings.video.adding'));
   try {
-    const res = await window.orkas.invoke('videoAuth.add', { provider, apiKey, label: 'default' });
+    const res = await window.orkas.invoke('videoAuth.add', { provider, model, apiKey, label: 'default' });
     if (!res || !res.ok) {
       _settingsSetStatus('settings-video-status', 'error', (res && res.error) || t('settings.video.add_failed'));
       return;
@@ -2910,7 +2996,7 @@ function _settingsRenderVideoEntries() {
     const isOrkasApi = p.provider === _ORKAS_API_PROVIDER_ID;
     const providerLabel = isOrkasApi
       ? _settingsOrkasServiceLabel('Video')
-      : _videoProviderLabel(p.provider);
+      : _videoProviderLabel(p.provider, p.model);
     primary.innerHTML = `
       <span class="entry-provider">${escapeHtml(providerLabel)}</span>
       <span class="entry-sep">·</span>
@@ -2918,6 +3004,12 @@ function _settingsRenderVideoEntries() {
       ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
     `;
     main.appendChild(primary);
+    if (isOrkasApi) {
+      const model = document.createElement('div');
+      model.className = 'entry-included-models entry-media-model';
+      model.textContent = 'Seedance 2.0/2.5';
+      main.appendChild(model);
+    }
     if (!available) {
       const reason = document.createElement('div');
       reason.className = 'form-hint';

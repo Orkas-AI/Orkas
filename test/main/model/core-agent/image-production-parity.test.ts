@@ -49,6 +49,7 @@ vi.mock('../../../../src/main/util/chat-media-url', () => ({
 vi.mock('../../../../src/main/features/video_production_control', () => ({
   beginVideoProductionGeneration: vi.fn(),
   finishVideoProductionGeneration: vi.fn(),
+  releaseVideoProductionGeneration: vi.fn(),
   videoProductionControlStatePath: () => '/ws/production-state.json',
 }));
 vi.mock('../../../../src/main/logger', () => ({
@@ -364,6 +365,89 @@ describe('generate_image tool', () => {
       expect(h.beginImageGeneration).toHaveBeenCalledOnce();
       expect(h.generateImage).toHaveBeenCalledOnce();
       expect(h.finishImageGeneration).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+  it('keeps an ImageStudio attempt that never dispatched out of the turn budget, but not a dispatched one', async () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-image-gen-not-dispatched-'));
+    try {
+      const { createImageGenTool } = await import('../../../../src/main/model/core-agent/image-gen-tool');
+      const tool = createImageGenTool({ userId: 'u1', cid: 'c1', agentId: '814b61b027f0' });
+      const generate = () => tool.execute!({
+        prompt: 'a bird',
+        output_path: path.join(projectDir, 'bird.png'),
+        image_project_path: projectDir,
+        image_request_id: 'hero-initial',
+      }, ctx());
+
+      h.generateImage.mockResolvedValueOnce({
+        ok: false,
+        errorCode: 'NO_CAPABLE_MODEL',
+        message: 'no image model',
+        dispatched: false,
+      });
+      expect((await generate()).isError).toBe(true);
+      expect(h.finishImageGeneration).toHaveBeenLastCalledWith(expect.objectContaining({
+        ok: false,
+        errorCode: 'NO_CAPABLE_MODEL',
+        countsTowardBudget: false,
+      }));
+
+      h.generateImage.mockResolvedValueOnce({ ok: false, errorCode: 'PROVIDER_API_ERROR', message: 'boom' });
+      expect((await generate()).isError).toBe(true);
+      expect(h.finishImageGeneration.mock.lastCall?.[0]).not.toHaveProperty('countsTowardBudget');
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it('releases a VideoStudio still that failed before dispatch instead of demanding a new paid confirmation', async () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-image-gen-video-release-'));
+    try {
+      const planPath = path.join(projectDir, 'plan.json');
+      fs.writeFileSync(planPath, '{}', 'utf8');
+      const control = await import('../../../../src/main/features/video_production_control');
+      vi.mocked(control.releaseVideoProductionGeneration).mockReset();
+      vi.mocked(control.finishVideoProductionGeneration).mockReset();
+      vi.mocked(control.beginVideoProductionGeneration).mockReset().mockResolvedValue({
+        status: 'started',
+        transaction: { transaction_id: 'still-tx', segment_id: 'still-1' },
+      } as any);
+      const { createImageGenTool } = await import('../../../../src/main/model/core-agent/image-gen-tool');
+      const tool = createImageGenTool({ userId: 'u1', cid: 'c1', agentId: '79df9cc89f5f' });
+      const generate = () => tool.execute!({
+        prompt: 'a still',
+        output_path: path.join(projectDir, 'still.png'),
+        production_plan_path: planPath,
+        production_segment_id: 'still-1',
+      }, ctx());
+
+      h.generateImage.mockResolvedValueOnce({
+        ok: false,
+        errorCode: 'BAD_INPUT',
+        message: 'operation aborted',
+        dispatched: false,
+      });
+      const notSent = await generate();
+      expect(String(notSent.content)).toBe('[BAD_INPUT] operation aborted');
+      expect(control.releaseVideoProductionGeneration).toHaveBeenCalledWith(expect.objectContaining({
+        transactionId: 'still-tx',
+        segmentId: 'still-1',
+        kind: 'image',
+        errorCode: 'BAD_INPUT',
+      }));
+      expect(control.finishVideoProductionGeneration).not.toHaveBeenCalled();
+
+      h.generateImage.mockResolvedValueOnce({ ok: false, errorCode: 'PROVIDER_API_ERROR', message: 'boom' });
+      const sent = await generate();
+      expect(String(sent.content)).toBe('[PROVIDER_API_ERROR] boom');
+      expect(control.releaseVideoProductionGeneration).toHaveBeenCalledOnce();
+      expect(control.finishVideoProductionGeneration).toHaveBeenCalledWith(expect.objectContaining({
+        transactionId: 'still-tx',
+        ok: false,
+        errorCode: 'PROVIDER_API_ERROR',
+      }));
     } finally {
       fs.rmSync(projectDir, { recursive: true, force: true });
     }

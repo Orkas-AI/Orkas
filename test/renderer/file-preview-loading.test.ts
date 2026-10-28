@@ -43,7 +43,6 @@ describe('file preview loading states', () => {
       '_renderPdfBody',
       '_renderHtmlBody',
       '_renderOfficeBody',
-      '_renderVideoBody',
       'openChatVideoUrlViewer',
       '_renderAudioBody',
       '_renderMarkdownBody',

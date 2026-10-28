@@ -45,6 +45,7 @@ describe('public model catalog', () => {
     ]);
     expect(PUBLIC_PROVIDER_MODELS.google?.map((model) => model.id)).toEqual([
       'gemini-3.8-flash',
+      'gemini-4-argon',
       'gemini-3.7-flash',
       'gemini-3.1-pro-preview',
       'gemini-3.5-flash-lite',
@@ -117,6 +118,7 @@ describe('public model catalog', () => {
       'openai/gpt-5.6-terra',
       'openai/gpt-5.6-luna',
       'google/gemini-3.8-flash',
+      'google/gemini-4-argon',
       'google/gemini-3.7-flash',
       'google/gemini-3.1-pro-preview',
       'google/gemini-3.5-flash-lite',

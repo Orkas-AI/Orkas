@@ -44,7 +44,7 @@ const https = require('node:https');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
-const VERSION = 'v1.0.139';
+const VERSION = 'v1.0.142';
 const REPO = 'iOfficeAI/OfficeCLI';
 const RELEASE_BASE_URL = process.env.OFFICECLI_RELEASE_BASE_URL || `https://github.com/${REPO}/releases/download/${VERSION}`;
 const LICENSE_URL = process.env.OFFICECLI_LICENSE_URL || `https://raw.githubusercontent.com/${REPO}/${VERSION}/LICENSE`;
@@ -66,12 +66,12 @@ const ASSETS = {
 
 // Pinned sha256 for VERSION (from the release SHA256SUMS). Update with VERSION.
 const SHA256 = {
-  'officecli-linux-x64': 'da07d4f787d7c85724104294ac023c89971ddfaee93ebb183b289282b8f869cc',
-  'officecli-linux-arm64': '39008c7f76d202858637810553ef14e2cd3e7f61485fdcf2011f26967a7babd1',
-  'officecli-mac-arm64': '393874f79db58222bdbede7f4f942f2536580386923857d1b5ad9754efe80c19',
-  'officecli-mac-x64': '6a931d424975dded6ae413c8c1f63d00dfb30a4bd4bd50352964782d13299f5c',
-  'officecli-win-x64.exe': '864e0580c8e8c91a6aa4a4c1e8900551c8d4aa648ff10136ceed3a6ba5310888',
-  'officecli-win-arm64.exe': '6d80a93ba0c9cafb2b52048efbb403cd761b35126130fa8166383599aa91d96e',
+  'officecli-linux-x64': 'f78563abc13cf70dcd420644019d2f11dc36ea2957ac738613a6911d652b5541',
+  'officecli-linux-arm64': '260cdccd27f2e25902e9436e5e971c0ca5348ae3d36a54a3fbd794c452ba13f7',
+  'officecli-mac-arm64': '684ce214bb8d750003d521eea044a9199bcbdb870817dba5d3191b35715ea38c',
+  'officecli-mac-x64': 'd2d27d8203ec8fc178a6a55eb4ce0ca63696e4ceddb7f85eab359da77f343a91',
+  'officecli-win-x64.exe': '676e0acee691288968a31b9832299ad05599e83140e801c382b6fc4509622fe2',
+  'officecli-win-arm64.exe': '0926428513e15f2d1c6eb726a07b141f7f31d60360226daa7526e518213d3578',
 };
 
 function parseArgs(argv) {

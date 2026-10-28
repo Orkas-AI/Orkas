@@ -8,6 +8,7 @@
  */
 
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { macosTccSensitivePath } from '../util/macos-tcc';
@@ -37,10 +38,10 @@ function toPosixRel(rel: string): string {
   return rel.split(path.sep).filter(Boolean).join('/');
 }
 
-export function listWorkspaceFiles(
+export async function listWorkspaceFiles(
   root: string,
   opts: { maxFiles?: number; maxDepth?: number } = {},
-): ConversationWorkspaceFileList {
+): Promise<ConversationWorkspaceFileList> {
   const rootAbs = path.resolve(root || '');
   const maxFiles = Math.max(1, Math.floor(opts.maxFiles ?? DEFAULT_MAX_FILES));
   const maxDepth = Math.max(0, Math.floor(opts.maxDepth ?? DEFAULT_MAX_DEPTH));
@@ -61,7 +62,7 @@ export function listWorkspaceFiles(
   }
 
   let rootStat: fs.Stats;
-  try { rootStat = fs.statSync(rootAbs); }
+  try { rootStat = await fsp.stat(rootAbs); }
   catch {
     return { root: rootAbs, items, count: 0, truncated: false, rootExists: false };
   }
@@ -69,7 +70,7 @@ export function listWorkspaceFiles(
     return { root: rootAbs, items, count: 0, truncated: false, rootExists: false };
   }
 
-  const walk = (dir: string, depth: number): void => {
+  const walk = async (dir: string, depth: number): Promise<void> => {
     if (items.length >= maxFiles) {
       truncated = true;
       return;
@@ -80,7 +81,7 @@ export function listWorkspaceFiles(
     }
 
     let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); }
     catch { return; }
     entries.sort((a, b) => a.name.localeCompare(b.name));
 
@@ -89,14 +90,14 @@ export function listWorkspaceFiles(
       const abs = path.join(dir, e.name);
       if (e.isSymbolicLink()) continue;
       if (e.isDirectory()) {
-        walk(abs, depth + 1);
+        await walk(abs, depth + 1);
         if (items.length >= maxFiles) {
           truncated = true;
           return;
         }
       } else if (e.isFile()) {
         let st: fs.Stats;
-        try { st = fs.statSync(abs); }
+        try { st = await fsp.stat(abs); }
         catch { continue; }
         items.push({
           path: abs,
@@ -113,6 +114,6 @@ export function listWorkspaceFiles(
     }
   };
 
-  walk(rootAbs, 0);
+  await walk(rootAbs, 0);
   return { root: rootAbs, items, count: items.length, truncated, rootExists: true };
 }

@@ -1,4 +1,5 @@
 import { expect, test } from './fixtures/orkas';
+import path from 'node:path';
 
 // Commander home (PATTERNS.md P15): an open to-do or a finished run the user
 // has not opened turns the New task view into its populated state. The
@@ -132,4 +133,64 @@ test.describe('Commander home continuation', () => {
     await expect(appPage.locator('#panel-todos')).toHaveClass(/\bactive\b/);
     await expect(appPage.locator('#todos-content .project-todo-item.is-highlighted')).toHaveCount(1);
   });
+
+  for (const language of ['en', 'zh']) {
+    test(`opens linked to-dos on their cards and keeps the conversation as a card action (${language})`, async ({ orkas }, testInfo) => {
+      const page = orkas.page!;
+      await page.evaluate(lang => (window as any).setLang(lang), language);
+      await page.setViewportSize({ width: language === 'en' ? 1440 : 1024, height: language === 'en' ? 900 : 720 });
+      const { project } = await orkas.invoke<any>('projects.create', { name: language === 'en' ? 'Release checks' : '发布核对' });
+      const linked: Array<{ pid: string; tid: string; cid: string; title: string }> = [];
+      for (const pid of ['', project.project_id]) {
+        const title = pid ? 'Project execution history' : 'Global execution history';
+        const { conversation } = await orkas.invoke<any>('conversations.create', { title, projectId: pid });
+        const { task } = await orkas.invoke<any>('projects.tasks.create', { projectId: pid, status: 'progress',
+          content: language === 'en'
+            ? 'Review installation and cross-device synchronization before completing the release checklist'
+            : '核对安装流程与多设备同步状态，确认发布检查清单中的问题已处理完成' });
+        linked.push({ pid, tid: task.id, cid: conversation.conversation_id, title });
+      }
+      // Represent prior successful executions without running an agent. The
+      // actual task module saves these facts in the isolated installation.
+      await orkas.electronApp!.evaluate(async (_electron, input) => {
+        const load = (process as any).mainModule.require.bind((process as any).mainModule);
+        const path = load('node:path');
+        const uid = load(path.join(input.sourceRoot, 'features/users.ts')).getActiveUserId();
+        const { updateTask } = load(path.join(input.sourceRoot, 'features/project_tasks.ts'));
+        for (const row of input.linked) {
+          const result = await updateTask(uid, row.pid, row.tid, { origin_cid: row.cid });
+          if (!result.ok) throw new Error('Could not seed the prior execution link');
+        }
+      }, { sourceRoot: path.resolve(__dirname, '../../src/main'), linked });
+
+      for (const row of linked) {
+        await page.locator('#new-chat-btn').click();
+        // The page focuses its composer shortly after entry. Start keyboard
+        // navigation after that transition rather than racing its focus.
+        await expect(page.locator('#new-chat-input')).toBeFocused();
+        const shortcut = page.locator(`[data-home-todo="${row.tid}"]`);
+        await expect(shortcut).toBeVisible();
+        if (row.pid) await page.screenshot({ path: testInfo.outputPath(`home-linked-todos-${language}.png`) });
+        await shortcut.press('Enter');
+        await expect(page.locator('#panel-todos')).toHaveClass(/\bactive\b/);
+        const card = page.locator(`#todos-content .project-todo-item[data-tid="${row.tid}"]`);
+        await expect(card).toHaveClass(/\bis-highlighted\b/);
+        await expect(card).toBeInViewport();
+        if (row.pid) await page.screenshot({ path: testInfo.outputPath(`home-todo-card-${language}.png`) });
+
+        // A collapsed column must still reveal the target after a repeat visit.
+        await page.locator('#todos-content .todo-column.is-progress .todo-collapse').click();
+        await expect(card).toBeHidden();
+        await page.locator('#new-chat-btn').click();
+        await shortcut.click();
+        await expect(card).toBeVisible();
+        await expect(card).toHaveClass(/\bis-highlighted\b/);
+        const conversation = card.locator('[data-action="todo-conversation"]');
+        await expect(conversation).toBeVisible();
+        await conversation.press('Enter');
+        await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+        await expect(page.locator('#chat-header-title')).toHaveText(row.title);
+      }
+    });
+  }
 });

@@ -110,7 +110,7 @@ function writePin(container) {
       const winner = readPin();
       if (winner && pinIsLive(winner)) {
         _earlyWarn(
-          `[install-data-root] pin race: deferring to existing pin ${winner.container}\n`,
+          '[install-data-root] pin race: deferring to existing pin\n',
         );
         return winner.container;
       }
@@ -119,12 +119,12 @@ function writePin(container) {
         fs.writeFileSync(pinPath, JSON.stringify(body, null, 2), 'utf8');
       } catch (err2) {
         _earlyWarn(
-          `[install-data-root] failed to overwrite stale pin: ${err2.message}\n`,
+          '[install-data-root] failed to overwrite stale pin\n',
         );
       }
       return container;
     }
-    _earlyWarn(`[install-data-root] failed to write pin: ${err.message}\n`);
+    _earlyWarn('[install-data-root] failed to write pin\n');
     return container;
   }
 }
@@ -150,7 +150,7 @@ function resolveWindowsContainer() {
   if (pin && pinIsLive(pin)) return pin.container;
   if (pin) {
     _earlyWarn(
-      `[install-data-root] pinned container ${pin.container} unreachable; re-deciding\n`,
+      '[install-data-root] pinned container unreachable; re-deciding\n',
     );
   }
 
@@ -236,7 +236,7 @@ function listFixedDrivesWin() {
     migrateSourceDataRoot(container);
   } catch (err) {
     _earlyWarn(
-      `[install-data-root] source-run data migration failed: ${err.message}\n`,
+      '[install-data-root] source-run data migration failed\n',
     );
   }
 

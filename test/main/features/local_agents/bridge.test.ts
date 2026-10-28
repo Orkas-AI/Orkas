@@ -146,6 +146,7 @@ async function startTestBridge(opts: {
   onPermissionWaitStart?: () => () => void;
   permissionPolicy?: 'inherit' | 'ask' | 'full_access';
   cli?: 'claude' | 'codex' | 'openclaw' | 'opencode' | 'hermes';
+  onCallObserved?: (observation: any) => void;
 } = {}) {
   const { startBridge } = await import('../../../../src/main/features/local_agents/bridge');
   return startBridge({
@@ -155,6 +156,7 @@ async function startTestBridge(opts: {
     agentName: 'Agent One',
     conversationTitle: opts.conversationTitle,
     onPermissionWaitStart: opts.onPermissionWaitStart,
+    onCallObserved: opts.onCallObserved,
     cli: opts.cli || 'codex',
     permissionPolicy: opts.permissionPolicy || 'ask',
     currentMessageId: 'current-message',
@@ -232,6 +234,25 @@ async function seedCurrentConversation(): Promise<void> {
 }
 
 describe('local_agents/bridge › auth + skills', () => {
+  it('observes only authenticated executed calls without changing replies or capability grants', async () => {
+    const observed:any[]=[];
+    const bridge=await startTestBridge({onCallObserved:observation=>{observed.push(observation);if(observed.length===2)throw new Error('Observer failure');}});
+    try{
+      await rpcOnce(bridge.socketPath,{id:1,token:'wrong',method:'skills.list',params:{}});
+      expect(observed).toEqual([]);
+      const unknown=await rpcOnce(bridge.socketPath,{id:2,token:bridge.token,method:'not-granted',params:{}});
+      expect((unknown.reply as any).ok).toBe(false);expect(observed).toEqual([]);
+      for(const id of [3,4]){
+        const result=await rpcOnce(bridge.socketPath,{id,token:bridge.token,method:'skills.list',params:{}});
+        expect((result.reply as any).ok).toBe(true);
+      }
+      const rejected=await rpcOnce(bridge.socketPath,{id:5,token:bridge.token,method:'skills.read',params:{id:'absent'}});
+      expect((rejected.reply as any).ok).toBe(false);
+      expect(observed).toEqual([{method:'skills.list',params:{},ok:true},{method:'skills.list',params:{},ok:true},
+        {method:'skills.read',params:{id:'absent'},ok:false}]);
+    }finally{await bridge.close();}
+  });
+
   it('requires an exact id for same-name private Skills and never falls back after the selected source disappears', async () => {
     const privateRoot = path.join(tmpDir, TEST_UID, 'cloud', 'agents', 'a1', 'private_skills');
     writeSkill(privateRoot, 'helper-a', 'Same helper', 'ONLY_A');
@@ -1107,11 +1128,11 @@ describe('local_agents/bridge › auth + skills', () => {
     } finally { await bridge.close(); }
   });
 
-  it('connectors.call normalizes schema field names and preserves explicit provider arguments', async () => {
+  it('connectors.call applies the same argument defaults as the in-process connector tool', async () => {
     // A Gmail fetch from an external CLI must reach the provider with the same
-    // request shape a built-in Agent produces: schema-declared snake_case keys.
-    // The public adapter preserves explicit values and leaves omitted provider
-    // options to the provider's own defaults.
+    // request shape a built-in Agent produces: snake_case keys plus the Orkas
+    // defaults (user_id=me, verbose/include_payload=false). An explicit value
+    // is preserved (negative control).
     bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
       instance: { id: 'gmail', display_name: 'Gmail' },
       tools: [{
@@ -1131,7 +1152,7 @@ describe('local_agents/bridge › auth + skills', () => {
       });
       expect(first.reply).toMatchObject({ ok: true });
       expect(bridgeConnectorMock.callTool.mock.calls[0][3]).toEqual({
-        max_results: 5,
+        max_results: 5, user_id: 'me', verbose: false, include_payload: false,
       });
       const second = await rpcOnce(bridge.socketPath, {
         id: 62, token: bridge.token, method: 'connectors.call',
@@ -1139,7 +1160,7 @@ describe('local_agents/bridge › auth + skills', () => {
       });
       expect(second.reply).toMatchObject({ ok: true });
       expect(bridgeConnectorMock.callTool.mock.calls[1][3]).toEqual({
-        max_results: 2, verbose: true,
+        max_results: 2, verbose: true, user_id: 'me', include_payload: false,
       });
     } finally {
       await bridge.close();
@@ -1525,7 +1546,7 @@ describe('local_agents/bridge › auth + skills', () => {
           order_id: 'order-1',
           amount: 12.5,
         },
-        { signal: expect.any(AbortSignal) },
+        { signal: expect.any(AbortSignal), conversationId: 'c1' },
       );
     } finally {
       await bridge.close();

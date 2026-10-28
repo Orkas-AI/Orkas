@@ -125,6 +125,113 @@ function dropEvent(dataTransfer: any, closestRow: any = null) {
 }
 
 describe('Project Library external file drag-and-drop', () => {
+  it.each(['project', 'account'])('stops later upload dialogs after %s changes while the first message is open', async scope => {
+    const context = loadProjectDetailScript();
+    context.currentUserId = 'first';
+    context.window.orkas.invoke = vi.fn(async () => ({ ok: false }));
+    context.loadProjectDetail = vi.fn(async () => {});
+    let release!: () => void, shown!: () => void;
+    const waiting = new Promise<void>(resolve => { shown = resolve; });
+    context.uiAlert = vi.fn(() => { shown(); return new Promise<void>(resolve => { release = resolve; }); });
+    const files = [
+      { name: 'unsupported.zip', size: 1 }, { name: '.hidden.md', size: 1 },
+      { name: 'failed.md', size: 1, arrayBuffer: async () => new ArrayBuffer(1) },
+    ];
+    const uploading = context._uploadProjectFiles(files, '', 'drop');
+    await waiting;
+    expect(context.uiAlert.mock.calls[0][0]).toContain('contexts.upload_rejected');
+    if (scope === 'account') context.currentUserId = 'second';
+    else vm.runInContext("_projectDetailPid = 'project-2'", context);
+    release(); await uploading;
+    expect(context.uiAlert).toHaveBeenCalledOnce();
+    expect(context.loadProjectDetail).not.toHaveBeenCalled();
+    expect(context.window.orkas.invoke).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['drop', 'project', 'success'], ['drop', 'project', 'failure'], ['drop', 'project', 'rejection'],
+    ['drop', 'account', 'success'], ['drop', 'account', 'failure'], ['drop', 'account', 'rejection'],
+    ['native', 'project', 'success'], ['native', 'project', 'failure'], ['native', 'project', 'rejection'], ['native', 'project', 'cancelled'],
+    ['native', 'account', 'success'], ['native', 'account', 'failure'], ['native', 'account', 'rejection'], ['native', 'account', 'cancelled'],
+  ])('isolates late %s upload %s/%s from the current view and account', async (method, scope, outcome) => {
+    const context = loadProjectDetailScript();
+    context.currentUserId = 'first';
+    context.uiAlert = vi.fn(async () => {});
+    context.loadProjectDetail = vi.fn(async () => {});
+    context._setProjectFilesStatus = vi.fn();
+    vm.runInContext(`_projectDetailResolvedPid = 'project-1'; _projectDetailMeta = {
+      project: { project_id: 'project-1' } };`, context);
+    let release!: () => void, started!: () => void;
+    const waiting = new Promise<void>(resolve => { started = resolve; });
+    const response = new Promise((resolve, reject) => {
+      release = () => outcome === 'rejection' ? reject(new Error('synthetic upload failure'))
+        : resolve(outcome === 'cancelled' ? { ok: true, cancelled: true, files: [] }
+          : { ok: outcome === 'success', files: [{ ok: outcome === 'success', name: 'old.md' }] });
+    });
+    context.window.orkas.invoke = vi.fn((channel: string) => {
+      expect(channel).toBe(method === 'native' ? 'projects.files.pickAndUpload' : 'projects.files.upload');
+      started(); return response;
+    });
+    const file = { name: 'old.md', size: 1, arrayBuffer: async () => new ArrayBuffer(1) };
+    const uploading = method === 'native' ? context._uploadProjectFilesNative('')
+      : context._uploadProjectFiles([file], '', 'drop');
+    await waiting;
+    context._setProjectFilesStatus.mockClear();
+    if (scope === 'account') context.currentUserId = 'second';
+    else vm.runInContext(`_projectDetailPid = 'project-2'; _projectDetailResolvedPid = 'project-2';
+      _projectDetailMeta = { project: { project_id: 'project-2' } };`, context);
+    release(); await uploading;
+    expect(context._setProjectFilesStatus).not.toHaveBeenCalled();
+    expect(context.uiAlert).not.toHaveBeenCalled();
+    expect(context.loadProjectDetail).not.toHaveBeenCalled();
+    expect(context.window.orkas.invoke).toHaveBeenCalledExactlyOnceWith(
+      method === 'native' ? 'projects.files.pickAndUpload' : 'projects.files.upload',
+      method === 'native' ? { projectId: 'project-1', targetDir: '' }
+        : { projectId: 'project-1', name: 'old.md', data: 'AA==' },
+    );
+  });
+
+  it.each(['buffer', 'native-import'])('stops before fallback IPC when account changes during %s preparation', async phase => {
+    const context = loadProjectDetailScript();
+    context.currentUserId = 'first';
+    context.uiAlert = vi.fn(async () => {});
+    context.loadProjectDetail = vi.fn(async () => {});
+    let release!: (value: unknown) => void, started!: () => void;
+    const waiting = new Promise<void>(resolve => { started = resolve; });
+    const response = new Promise(resolve => { release = resolve; });
+    const file = { name: 'old.md', size: 1, arrayBuffer: vi.fn(async () => {
+      if (phase === 'buffer') { started(); return response; } return new ArrayBuffer(1);
+    }) };
+    if (phase === 'native-import') context.window.orkas.importLocalFiles = vi.fn(() => { started(); return response; });
+    const uploading = context._uploadProjectFiles([file], '', 'drop');
+    await waiting;
+    context.currentUserId = 'second';
+    release(phase === 'buffer' ? new ArrayBuffer(1) : {});
+    await uploading;
+    expect(context.window.orkas.invoke).not.toHaveBeenCalled();
+    expect(context.uiAlert).not.toHaveBeenCalled();
+    expect(context.loadProjectDetail).not.toHaveBeenCalled();
+  });
+
+  it('does not dispatch more files from an old account after the initial upload workers settle', async () => {
+    const context = loadProjectDetailScript();
+    context.currentUserId = 'first';
+    context.loadProjectDetail = vi.fn(async () => {});
+    let release!: (value: unknown) => void;
+    const response = new Promise(resolve => { release = resolve; });
+    context.window.orkas.importLocalFiles = vi.fn(() => response);
+    const files = Array.from({ length: 7 }, (_, i) => ({ name: `old-${i}.md`, size: 1 }));
+    const uploading = context._uploadProjectFiles(files, '', 'drop');
+    await vi.waitFor(() => expect(context.window.orkas.importLocalFiles).toHaveBeenCalledTimes(3));
+    context.currentUserId = 'second';
+    release({ ok: true, files: [{ ok: true }] });
+    await uploading;
+    expect(context.window.orkas.importLocalFiles).toHaveBeenCalledTimes(3);
+    expect(context.window.orkas.invoke).not.toHaveBeenCalled();
+    expect(context.loadProjectDetail).not.toHaveBeenCalled();
+  });
+
+
   it('uploads operating-system files into the hovered folder with copy semantics', async () => {
     const context = loadProjectDetailScript();
     const folder = makeRow('dir', 'Research/Notes');
@@ -301,7 +408,6 @@ describe('Project Library external file drag-and-drop', () => {
     context.window.orkas.invoke = vi.fn(async () => ({ ok: true }));
     context.loadProjectDetail = vi.fn(async () => { throw new Error('refresh failed'); });
     context.uiAlert = vi.fn(async () => undefined);
-    context._projectTrackEvent = vi.fn();
     context._projectLogFailure = vi.fn();
 
     await expect(context._uploadProjectFiles([file, rejected], '', 'drop')).resolves.toBeUndefined();

@@ -62,14 +62,17 @@
       && [...element.getClientRects()].some(rect => rect.width > 0 && rect.height > 0);
   }
 
+  function setWaiting(element, waiting) {
+    if (element.classList.contains('ui-overlay-waiting') !== waiting) {
+      element.classList.toggle('ui-overlay-waiting', waiting);
+    }
+  }
+
   function gatePendingLayers() {
     // Keep a newly opened surface unpainted until main has removed the native
     // pixels. Opacity does not change its geometry or the detection above.
     for (const element of candidates) {
-      const waiting = browserOpen && active.has(element) && !acknowledgedBlocked;
-      if (element.classList.contains('ui-overlay-waiting') !== waiting) {
-        element.classList.toggle('ui-overlay-waiting', waiting);
-      }
+      setWaiting(element, browserOpen && active.has(element) && !acknowledgedBlocked);
     }
   }
 
@@ -111,8 +114,12 @@
   function refresh() {
     const next = new Set();
     for (const element of candidates) {
-      if (!element.isConnected || !element.matches(selector)) candidates.delete(element);
-      else if (displayed(element)) next.add(element);
+      if (!element.isConnected || !element.matches(selector)) {
+        // Gating only revisits candidates. A page that drops its overlay
+        // modifier before acknowledgement must not stay unpainted.
+        candidates.delete(element);
+        setWaiting(element, false);
+      } else if (displayed(element)) next.add(element);
     }
     const changed = next.size !== active.size || [...next].some(element => !active.has(element));
     active = next;

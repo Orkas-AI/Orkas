@@ -114,8 +114,7 @@
               <div data-composer="1" id="new-chat-input" data-i18n-placeholder="new_chat.home.input_placeholder" placeholder="Describe what you want to accomplish, or attach the files to work on"></div>
               <!-- Composer bottom bar order matches PC/docs/design/PATTERNS.md
                    P11: [+] | divider | [To] | [workspace - JS-injected] |
-                   [skill] | spacer | [send]. The open-source build strips
-                   voice input, so send owns the right spacer. -->
+                   [skill] | spacer | [microphone] | [send]. -->
               <div class="chat-bottom-bar">
                 <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
                 <span class="chat-composer-divider" aria-hidden="true"></span>
@@ -133,6 +132,9 @@
                     <span data-ui-icon="x" data-ui-icon-class="chip-close-icon"></span>
                   </button>
                 </div>
+                <button type="button" class="chat-attach-btn chat-mic-btn" id="new-chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
+                  <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
+                </button>
                 <button id="new-chat-send-btn" class="chat-send-btn" data-i18n-title="new_chat.send_title" title="Send">
                   <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
                 </button>
@@ -266,7 +268,10 @@
                       <span data-ui-icon="x" data-ui-icon-class="chip-close-icon"></span>
                     </button>
                   </div>
-                  <button id="chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
+                  <button type="button" class="chat-attach-btn chat-mic-btn" id="chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
+                    <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
+                  </button>
+                <button id="chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
                     <span data-ui-icon="check" data-ui-icon-class="queue-save-icon"></span>
                     <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
                     <span data-ui-icon="stop" data-ui-icon-class="stop-icon"></span>
@@ -730,6 +735,9 @@
                         <span data-ui-icon="x" data-ui-icon-class="chip-close-icon"></span>
                       </button>
                     </div>
+                    <button type="button" class="chat-attach-btn chat-mic-btn" id="project-chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
+                      <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
+                    </button>
                     <button type="button" class="chat-send-btn" id="project-chat-send-btn" data-i18n-title="chat.send_title" title="Send">
                       <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
                     </button>
@@ -1088,17 +1096,12 @@
                 <h1 class="apps-page-header-title" data-i18n="apps.title">Apps</h1>
                 <span class="apps-page-header-count" id="apps-page-header-count"></span>
               </div>
-              <div class="apps-header-types">
-                <div class="apps-type-tabs" id="apps-type-tabs" role="tablist" data-i18n-aria-label="apps.title" aria-label="Apps"></div>
-                <span class="apps-type-description" id="apps-type-description"></span>
-              </div>
             </div>
             <button type="button" class="btn btn-sm" id="apps-create-btn" aria-haspopup="dialog">
               <span data-ui-icon="plus" aria-hidden="true"></span><span data-i18n="apps.create">Create</span>
             </button>
           </div>
-          <div class="agents-grid-scroll" id="apps-content" role="tabpanel" aria-labelledby="apps-tab-local">
-            <div class="app-publication-quota" id="apps-publication-quota" hidden></div>
+          <div class="agents-grid-scroll" id="apps-content">
             <div class="apps-grid" id="apps-grid"></div>
             <div class="agents-empty" id="apps-empty" data-i18n="apps.empty">No apps</div>
           </div>
@@ -1287,7 +1290,7 @@
               <div class="settings-page">
                 <header class="settings-page-head">
                   <h1 data-i18n="settings.tab.credentials">Models</h1>
-                  <p data-i18n="settings.models.page_sub">按用途配置服务，设置默认模型与备用顺序。</p>
+                  <p data-i18n="settings.models.page_sub">Configure services by purpose and set the default model and fallback order.</p>
                 </header>
 
                 <div class="settings-group settings-orkas-api-group" id="settings-orkas-api-group">
@@ -1295,7 +1298,7 @@
                     <div class="settings-group-head-main">
                       <div class="settings-orkas-api-title-row">
                         <div class="settings-group-title" data-i18n="settings.orkas_api.title">Orkas API Key</div>
-                        <span class="settings-orkas-api-savings" data-i18n="price_comparison.maximum">Model costs up to ~60% less than provider APIs</span>
+                        <span class="settings-orkas-api-savings" data-i18n="price_comparison.maximum">Model costs up to 50% less than provider API pricing</span>
                       </div>
                       <div class="settings-group-sub" data-i18n="settings.orkas_api.sub">Shared by Orkas models, search, images, speech, video, and credit-based connectors. The key is encrypted on this device.</div>
                     </div>
@@ -1444,6 +1447,13 @@
           <label class="todo-editor-field"><span data-i18n="todo.project">Project</span><span class="todo-editor-select" id="project-todo-project"></span></label>
           <label class="todo-editor-field"><span data-i18n="project.todo.assign">Agent</span><span class="todo-editor-select" id="project-todo-agent"></span></label>
           <label class="todo-editor-field"><span data-i18n="todo.status">Status</span><span class="todo-editor-select" id="project-todo-status"></span></label>
+          <div class="todo-editor-field" id="project-todo-due-field"><label for="project-todo-due" data-i18n="project.todo.due_label">Due date</label>
+            <div class="auto-date-picker todo-editor-date" id="project-todo-due-picker">
+              <input type="text" id="project-todo-due" inputmode="numeric" autocomplete="off" placeholder="YYYY-MM-DD" />
+              <button type="button" class="auto-date-picker-toggle" aria-haspopup="dialog" aria-controls="project-todo-due-popover" data-i18n-aria-label="auto.calendar_open" data-i18n-title="auto.calendar_open"></button>
+              <div class="auto-date-picker-popover" id="project-todo-due-popover" role="dialog" hidden></div>
+            </div>
+          </div>
         </div>
         <div class="modal-actions todo-editor-actions">
           <button type="button" class="btn" id="project-todo-cancel" data-i18n="project.todo.cancel">Cancel</button>
@@ -1500,9 +1510,8 @@
           </label>
           <div class="agent-cli-select-row">
             <div class="ai-select" id="agent-modal-ext-cli-select"></div>
-            <div id="agent-modal-ext-cli-upgrades"></div>
           </div>
-          <div id="agent-modal-ext-cli-upgrade-warning" class="agent-cli-selection-warning" role="status" hidden></div>
+          <div id="agent-modal-ext-cli-upgrades"></div>
             <span
               class="agent-cli-selection-warning"
               id="agent-modal-ext-cli-warning"
@@ -1779,6 +1788,9 @@
                 <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                 <span class="chat-recipient-name" id="auto-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
               </button>
+              <button type="button" class="chat-attach-btn chat-mic-btn" id="auto-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
+                <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
+              </button>
             </div>
           </div>
         </div>
@@ -1984,6 +1996,7 @@
   <script src="./modules/icons.js"></script>
   <script src="./modules/web-assist.js"></script>
   <script src="./modules/file-operation-policy.js"></script>
+  <script src="./modules/app-save-recovery.js"></script>
   <script src="./modules/chat-file-viewer.js"></script>
   <script src="./modules/preview-windows.js"></script>
   <script src="./modules/delimited-preview.js"></script>
@@ -2001,6 +2014,7 @@
   <script src="./modules/conversation-view-model.js"></script>
   <script src="./vendor/prosemirror/prosemirror.min.js"></script>
   <script src="./modules/composer-input.js"></script>
+  <script src="./modules/voice-input.js"></script>
   <script src="./modules/commercial-entry.js"></script>
   <script src="./modules/conversation.js"></script>
   <script src="./modules/conversation-to-project.js"></script>

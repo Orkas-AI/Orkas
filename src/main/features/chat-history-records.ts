@@ -39,19 +39,27 @@ export function hasHistoryProcess(message: { process?: unknown }): boolean {
   return Array.isArray(message.process) && message.process.some(isPublicProcessItem);
 }
 
-export function* historyProcessTexts(message: { process?: unknown }, contentOnly = false): Generator<string> {
+/** Exact source-array position, not the ordinal among public entries. Direct
+ * reads reuse the same privacy/media projection without expanding other items. */
+export function historyProcessTextAt(message: { process?: unknown }, index: number, contentOnly = false): string | undefined {
+  const item = Array.isArray(message.process) ? message.process[index] : undefined;
+  if (!isPublicProcessItem(item)) return undefined;
+  const data = item.event?.data;
+  const value = item.type === 'progress' ? item.text
+    : contentOnly ? data?.output ?? data?.input ?? data?.arguments ?? item.event : item.event;
+  return `[process ${index}] ${typeof value === 'string' ? projectHistoryMediaText(value) : stringifyHistoryMedia(value)}`;
+}
+
+export function* historyProcessEntries(message: { process?: unknown }, contentOnly = false): Generator<{ index: number; text: string }> {
   if (!Array.isArray(message.process)) return;
-  for (let i = 0; i < message.process.length; i++) {
-    const item = message.process[i];
-    if (isPublicProcessItem(item)) {
-      const data = item.event?.data;
-      // Snippets match payloads before transport metadata; exact reads retain
-      // captured event fields and stable process positions, omitting media bytes.
-      const value = item.type === 'progress' ? item.text
-        : contentOnly ? data?.output ?? data?.input ?? data?.arguments ?? item.event : item.event;
-      yield `[process ${i}] ${typeof value === 'string' ? projectHistoryMediaText(value) : stringifyHistoryMedia(value)}`;
-    }
+  for (let index = 0; index < message.process.length; index++) {
+    const text = historyProcessTextAt(message, index, contentOnly);
+    if (text !== undefined) yield { index, text };
   }
+}
+
+export function* historyProcessTexts(message: { process?: unknown }, contentOnly = false): Generator<string> {
+  for (const entry of historyProcessEntries(message, contentOnly)) yield entry.text;
 }
 
 /** Explicit process events are archived evidence, never inferred intent. Public

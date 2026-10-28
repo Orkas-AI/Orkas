@@ -78,6 +78,15 @@ export type AgentRunParams = {
    * helpers inheriting `ELECTRON_RUN_AS_NODE=1` crash at boot).
    */
   sandboxEnv?: Record<string, string>;
+  /**
+   * Read evidence the host already holds for this run, keyed by absolute
+   * path, copied into the run-scoped `ToolContext.state.readFileState` map
+   * before the first round. A host that injected a file's complete contents
+   * into the turn may seed its stamp so the first edit of that file is not
+   * refused as unread. Entries are opaque to the runtime; the file tools own
+   * their shape and still enforce path scope and staleness on every edit.
+   */
+  initialReadFileState?: ReadonlyMap<string, unknown>;
   /** Prompt-cache TTL policy forwarded to pi-ai. Default (undefined) lets
    * pi-ai pick `"short"`; set `"long"` for extended retention (Anthropic 1h
    * / OpenAI 24h), `"none"` to opt out. Provider-specific; providers without

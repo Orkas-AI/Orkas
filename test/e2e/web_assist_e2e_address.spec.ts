@@ -10,6 +10,74 @@ const test = base.extend({
   },
 });
 
+test('a scheme-less loopback address recovers after its local service becomes ready', async ({ orkas }) => {
+  let pageRequests = 0;
+  const server = createServer((req, res) => {
+    if (req.url === '/ready?item=one') pageRequests++;
+    res.setHeader('Content-Type', 'text/html');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end('<title>Local service ready</title><h1>Local service ready</h1>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  const page = orkas.page!;
+  const cid = (await orkas.invoke<any>('conversations.create', { title: 'Local service startup' })).conversation.conversation_id;
+  try {
+    await page.evaluate(async id => {
+      const app = window as any;
+      await app.loadConversations(); app.setView('conversation', id);
+      app.ConversationInfo.openAndSetTab('browser');
+    }, cid);
+    await expect(page.locator('.web-assist-tab')).toHaveCount(1);
+    const tabId = (await orkas.invoke<any>('webAssist.state')).state.active_tab_id;
+    const nativeId = await orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }) => {
+      const view = BrowserWindow.getAllWindows()[0].contentView.children.find(v => v instanceof WebContentsView && v.webContents.getURL() === '') as InstanceType<typeof WebContentsView>;
+      (globalThis as any).__loopbackNetErrors = [];
+      view.webContents.on('did-fail-load', (_event, code) => (globalThis as any).__loopbackNetErrors.push(code));
+      return view.webContents.id;
+    });
+    const address = page.locator('.web-assist-address-input');
+    const input = `127.0.0.1:${port}/ready?item=one#board`;
+    await address.fill(input); await address.press('Enter');
+    await expect.poll(async () => (await orkas.invoke<any>('webAssist.state')).state.error_code).toBe('page_load_failed');
+    expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__loopbackNetErrors)).toContain(-102);
+    const root = require('node:path').resolve(__dirname, '../..');
+    await orkas.electronApp!.evaluate(({ BrowserWindow }, args) => {
+      const require = (process as any).mainModule.require;
+      require(args.root + '/src/main/features/web_assist.ts').bindWebAssistConversation('account-e2e', args.cid, BrowserWindow.getAllWindows()[0].webContents);
+      require(args.root + '/src/main/features/web_assist_lifecycle.ts').beginBrowserTaskRun('account-e2e', args.cid, 'loopback-startup');
+      (globalThis as any).__loopbackWaitTool = require(args.root + '/src/main/features/group_chat/browser_tool.ts').buildConversationBrowserTool('account-e2e', args.cid);
+    }, { root, cid });
+    const wait = () => orkas.electronApp!.evaluate(async (_electron, tabId) => {
+      const result = await (globalThis as any).__loopbackWaitTool.execute({ operation: 'wait', tab_id: tabId, wait_condition: 'loaded', timeout_ms: 500 }, { state: {} });
+      return { ...JSON.parse(result.content), isError: result.isError === true };
+    }, tabId);
+    expect(await wait()).toMatchObject({ ok: false, code: 'page_load_failed', isError: true });
+    await new Promise<void>(resolve => server.listen(port, '127.0.0.1', resolve));
+    // Service readiness alone must not turn an un-retried error document into success.
+    expect(await wait()).toMatchObject({ ok: false, code: 'page_load_failed', isError: true });
+    expect(pageRequests).toBe(0);
+    await address.fill(input); await address.press('Enter');
+    await expect.poll(async () => {
+      const state = (await orkas.invoke<any>('webAssist.state')).state;
+      return { url: state.tabs.find((tab: any) => tab.tab_id === tabId)?.address_url, loading: state.loading, error: state.error_code || null };
+    }).toEqual({ url: `http://${input}`, loading: false, error: null });
+    expect(await wait()).toMatchObject({ ok: true, isError: false });
+    expect(await orkas.electronApp!.evaluate(async ({ webContents }, id) => webContents.fromId(id)!.executeJavaScript('document.querySelector("h1")?.textContent'), nativeId)).toBe('Local service ready');
+    expect(pageRequests).toBe(1);
+    await orkas.electronApp!.evaluate((_electron, args) => {
+      const require = (process as any).mainModule.require;
+      require(args.root + '/src/main/features/web_assist_lifecycle.ts').finishBrowserTaskRun('account-e2e', args.cid, 'loopback-startup');
+      delete (globalThis as any).__loopbackWaitTool;
+    }, { root, cid });
+  } finally {
+    await orkas.invoke('webAssist.close', {});
+    server.closeAllConnections();
+    if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 test('scrolled browser tabs stay in place through page updates, activation and tab changes', async ({ orkas }) => {
   const server = createServer((_req, res) => {
     res.setHeader('Content-Type', 'text/html');

@@ -220,6 +220,37 @@ describe('project_setup › create', () => {
     expect(await projects.listProjects(UID)).toHaveLength(2);
   });
 
+  it('saves the goal it is given as the project instructions every conversation receives, and refuses an unbounded one', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const changed: string[] = [];
+    projects.onProjectInstructionsChanged((event) => { changed.push(`${event.uid}:${event.projectId}`); });
+    const conv = await chats.createConversation(UID, { title: 'goal' });
+    const { body } = await call(conv.conversation_id, {
+      action: 'create', name: 'Launch plan', todos: ['Draft the brief'],
+      goal: '  三个月内把 Lumen 的上线邮件、定价页和发布会物料全部准备好。  ',
+    });
+    expect(body.ok).toBe(true);
+    expect(body.goal_saved).toBe(true);
+    // The rail and the open project page learn about the write from the host.
+    expect(await projects.readProjectInstructions(UID, body.project_id))
+      .toMatchObject({ ok: true, content: '三个月内把 Lumen 的上线邮件、定价页和发布会物料全部准备好。' });
+    expect(changed).toEqual([`${UID}:${body.project_id}`]);
+
+    // No goal means no instructions, not an empty placeholder.
+    const plain = await chats.createConversation(UID, { title: 'plain' });
+    const noGoal = await call(plain.conversation_id, { action: 'create', name: 'Plain' });
+    expect(noGoal.body.ok).toBe(true);
+    expect(noGoal.body).not.toHaveProperty('goal_saved');
+    expect((await projects.readProjectInstructions(UID, noGoal.body.project_id) as { content?: string }).content || '').toBe('');
+
+    // A goal past the bound is refused before any project exists.
+    const over = await chats.createConversation(UID, { title: 'over' });
+    const refused = await call(over.conversation_id, { action: 'create', name: 'Too long', goal: 'x'.repeat(401) });
+    expect(refused.raw.isError).toBe(true);
+    expect((await projects.listProjects(UID)).map((project) => project.name)).not.toContain('Too long');
+  });
+
   it('rejects an unbounded initial backlog before writing anything', async () => {
     const chats = await import('../../../src/main/features/chats');
     const projects = await import('../../../src/main/features/projects');
@@ -280,4 +311,89 @@ describe('project_setup › unfile', () => {
     expect(body.ok).toBe(true);
     expect(body.ignored_fields).toEqual(['name']);
   });
+});
+
+describe('project_setup › rename', () => {
+  async function filedProject(name = 'Original') {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const created = await projects.createProject(UID, name);
+    if (!created.ok) throw new Error('fixture project creation failed');
+    const pid = created.project.project_id;
+    const conv = await chats.createConversation(UID, { title: 'Rename this work' });
+    await chats.moveConversationToProject(UID, conv.conversation_id, pid);
+    return { chats, projects, pid, cid: conv.conversation_id };
+  }
+
+  it('renames the existing project durably without replacing its work or moving the conversation', async () => {
+    const { chats, projects, pid, cid } = await filedProject();
+    const tasks = await import('../../../src/main/features/project_tasks');
+    await tasks.createTask(UID, pid, { content: 'Keep this backlog' });
+    const beforeTasks = await tasks.listTasks(UID, pid);
+    const beforeConversation = await chats.getConversationMetadata(UID, cid);
+    const filing = await import('../../../src/main/features/conversation_filing');
+    const renamed = vi.fn();
+    filing.onConversationProjectRenamed(renamed);
+    const executor = await tool(cid, pid);
+    expect((executor.inputSchema as any).properties.action.enum).toContain('rename');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await executor.execute({ action: 'rename', name: 'Release readiness', todos: ['Ignored'] }, {} as never);
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content as string)).toMatchObject({
+        ok: true, action: 'rename', project_id: pid, project_name: 'Release readiness',
+        applies: 'now', ignored_fields: ['todos'],
+      });
+    }
+    const { projectMetaFile } = await import('../../../src/main/paths');
+    expect(JSON.parse(fs.readFileSync(projectMetaFile(UID, pid), 'utf8'))).toMatchObject({ project_id: pid, name: 'Release readiness' });
+    expect((await projects.listProjects(UID)).map(p => [p.project_id, p.name])).toEqual([[pid, 'Release readiness']]);
+    expect(await tasks.listTasks(UID, pid)).toEqual(beforeTasks);
+    expect(await chats.getConversationMetadata(UID, cid)).toEqual(beforeConversation);
+    expect(renamed).toHaveBeenCalledWith({ userId: UID, projectId: pid, name: 'Release readiness' });
+  });
+
+  it.each([false, true])('renames a newly created project before deferred filing completes (filing fails=%s)', async fails => {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const filing = await import('../../../src/main/features/conversation_filing');
+    const conv = await chats.createConversation(UID, { title: 'Create then correct the name' });
+    const cid = conv.conversation_id;
+    const { body: created } = await call(cid, { action: 'create', name: 'Draft' });
+    const failures = vi.fn();
+    filing.onConversationFilingFailed(failures);
+    const { body } = await call(cid, { action: 'rename', name: 'Approved plan' });
+    expect(body).toMatchObject({ ok: true, project_id: created.project_id, project_name: 'Approved plan', applies: 'now' });
+    expect((await chats.getConversationMetadata(UID, cid))?.project_id).toBeFalsy();
+    if (fails) vi.spyOn(chats, 'moveConversationToProject').mockResolvedValueOnce({ ok: false, error: 'move_failed' });
+    await filing.drainConversationFiling(UID, cid);
+    expect((await projects.listProjects(UID)).map(p => p.name)).toEqual(['Approved plan']);
+    if (fails) expect(failures).toHaveBeenCalledWith(expect.objectContaining({ projectId: created.project_id, projectName: 'Approved plan' }));
+    else expect((await chats.getConversationMetadata(UID, cid))?.project_id).toBe(created.project_id);
+  });
+
+  it('refuses duplicate or empty names without changing either project', async () => {
+    const { projects, pid, cid } = await filedProject();
+    await projects.createProject(UID, 'Taken');
+    for (const [name, error] of [['taken', 'name_dup'], ['   ', 'name_empty']]) {
+      const result = await call(cid, { action: 'rename', name }, pid);
+      expect(result.raw.isError).toBe(true);
+      expect(result.body).toMatchObject({ ok: false, error });
+    }
+    expect((await call(cid, { action: 'rename' }, pid)).raw.isError).toBe(true);
+    expect((await projects.listProjects(UID)).map(p => p.name).sort()).toEqual(['Original', 'Taken']);
+  });
+
+  it('cannot retarget another project or resurrect a missing conversation', async () => {
+    const { projects, pid, cid } = await filedProject();
+    const chats = await import('../../../src/main/features/chats');
+    const loose = await chats.createConversation(UID, { title: 'No project' });
+    expect((await call(loose.conversation_id, { action: 'rename', name: 'Other' })).body)
+      .toMatchObject({ ok: false, error: 'not_in_project' });
+    expect((await call(loose.conversation_id, { action: 'rename', name: 'Other', project_id: pid })).raw.isError).toBe(true);
+    expect((await call('missing_conversation', { action: 'rename', name: 'Other' }, pid)).body)
+      .toMatchObject({ ok: false, error: 'not_found' });
+    expect((await projects.getProject(UID, pid))?.name).toBe('Original');
+    expect((await chats.getConversationMetadata(UID, cid))?.project_id).toBe(pid);
+  });
+
 });

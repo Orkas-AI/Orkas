@@ -57,27 +57,3 @@ export function pruneExpiredDeletedRecords<T extends Record<string, any>>(
 ): T[] {
   return records.filter((record) => !isExpiredIsoTombstone(record?.deleted_at, opts));
 }
-
-export function pruneExpiredManifestTombstones<T extends Record<string, any>>(
-  tombstones: T,
-  opts?: RetentionOptions,
-): T {
-  return Object.fromEntries(
-    Object.entries(tombstones || {}).filter(([, value]) => {
-      if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-      const deletedAtMs = value.deleted_at_ms;
-      const revision = value._v;
-      if (
-        typeof deletedAtMs !== 'number'
-        || !Number.isFinite(deletedAtMs)
-        || deletedAtMs <= 0
-        || typeof revision !== 'number'
-        || !Number.isSafeInteger(revision)
-        || revision <= 0
-      ) {
-        return false;
-      }
-      return !isExpiredMsTombstone(deletedAtMs, opts);
-    }),
-  ) as T;
-}

@@ -25,6 +25,9 @@ export class BackgroundServices {
       body = JSON.parse(bytes.toString('utf8'));
       if (!body || Array.isArray(body) || typeof body !== 'object') throw new Error('invalid');
     } catch { return { status: 400, body: { code: 1, msg: 'invalid_payload' } }; }
+    if (route === '/categories') return { status: 200, body: { code: 0, list: [
+      { code: 'general', name_zh: '通用', name_en: 'General', sort_order: 10 },
+    ] } };
     const allowed = ['/agents/list', '/skills/list', '/agents/detail', '/skills/bundle', '/defaults'];
     if (!allowed.includes(route)) return { status: 404, body: { code: 404, msg: 'e2e_stub_route_not_found' } };
     if (!this.catalog) {

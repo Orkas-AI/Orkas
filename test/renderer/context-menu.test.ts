@@ -174,6 +174,18 @@ async function flushPromises(): Promise<void> {
 }
 
 describe('context menu', () => {
+  it('marks destructive actions while preserving neutral and disabled actions', () => {
+    const harness = createHarness();
+    harness.window.showContextMenu({ clientX: 20, clientY: 20 }, [
+      { label: 'Edit', onClick: vi.fn() },
+      { label: 'Delete', danger: true, onClick: vi.fn() },
+      { label: 'Unavailable', danger: true, disabled: true, onClick: vi.fn() },
+    ]);
+    const buttons = harness.menu()!.querySelectorAll('.context-menu-item');
+    expect(buttons.map(button => button.classList.contains('is-danger'))).toEqual([false, true, true]);
+    expect(buttons[2].disabled).toBe(true);
+  });
+
   it('filters invalid items, clamps to the viewport, and focuses the first enabled action', () => {
     const harness = createHarness();
     harness.window.showContextMenu(

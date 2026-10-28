@@ -19,6 +19,31 @@ const scenarios = [
 ];
 
 describe('streamed Markdown block compatibility', () => {
+  it.each(['directive', 'json-fence', 'standalone'])('keeps the source and surrounding reply when a %s dashboard cannot be rendered', kind => {
+    const sources = [
+      '{"root":' + '{"type":"Stack","children":['.repeat(10_000)
+        + '{"type":"Markdown","props":{"text":"<deep & leaf>"}}' + ']}'.repeat(10_000) + '}',
+      '{"root":{"type":"Grid","props":{"columns":{"toString":null,"valueOf":null}}}}',
+      '{"root":{"type":"Metric","props":{"value":{"toString":null}}}}',
+    ];
+    for (const source of sources) {
+      const body = kind === 'directive' ? `:::dashboard\n${source}\n:::`
+        : kind === 'json-fence' ? `\`\`\`json\n${source}\n\`\`\`` : source;
+      const markdown = `Before\n\n${body}\n\nAfter`;
+      const cache: any = {};
+      for (const blockCache of [undefined, cache]) {
+        let html = '';
+        expect(() => { html = renderMarkdown(markdown, blockCache); }).not.toThrow();
+        expect(html).toContain('<p>Before</p>');
+        expect(html).toContain('<p>After</p>');
+        expect(html).toContain('dashboard-render-error');
+        expect(html).toContain(source.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'));
+        if (blockCache) expect(blockCache.blocks.join('')).toBe(html);
+      }
+      expect(renderMarkdown('Recovered `$x$` and $y$', cache)).toBe(renderMarkdown('Recovered `$x$` and $y$'));
+    }
+  });
+
   it.each(scenarios)('preserves %s through every split and replacement', (_name, source) => {
     const cache: any = {};
     for (let end = 1; end <= source.length; end++) {

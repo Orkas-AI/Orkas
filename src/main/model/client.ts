@@ -94,6 +94,8 @@ export interface ChatOptions {
    * (no `data:` prefix). Used by `features/contexts_extract` for vision-based
    * description of uploaded images in the knowledge base staging area. */
   images?: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }>;
+  /** Image-understanding calls must never fall back to a text-only request. */
+  requireImageInput?: boolean;
   /** Current-turn attachment metadata forwarded only as provider request
    * metadata. Orkas-managed LLM uses it server-side to route model families;
    * third-party providers do not receive it. */
@@ -181,6 +183,8 @@ export interface ChatOptions {
   /** Stable id of the inbound conversation message that triggered this run.
    * Current-scope history tools stop strictly before this record. */
   historyBoundaryMessageId?: string;
+  /** Host-owned final delivery versus intermediate work for Commander. */
+  outputDelivery?: 'final' | 'process';
   /** Project id of the conversation, when it belongs to one. Threaded
    *  through to local-tools / file-tools / image-gen-tool so workspace
    *  resolution picks up the project-scoped selection. Caller (group_chat
@@ -234,7 +238,7 @@ export interface ChatOptions {
    *  artifact's id + title. `features/group_chat` collects these per turn
    *  and attaches a `artifacts[]` list to the assistant message so the
    *  renderer embeds each interactive web-app artifact in the bubble. */
-  onArtifactCreated?: (a: { id: string; title: string }) => void;
+  onArtifactCreated?: (a: { id: string; title: string; revision?: number }) => void;
   /** Host diagnostic delivery is independent of chat completion. The host
    * pins this promise to the originating task before the stream ends. */
   onDiagnosticsPending?: (result: Promise<StreamEvent | null>) => void;

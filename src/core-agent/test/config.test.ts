@@ -24,6 +24,18 @@ describe("Config", () => {
       expect(config.agent.maxRetries).toBe(3);
     });
 
+    it("fills nested defaults for omitted sections and older partial configuration files", () => {
+      for (const input of [{}, { agent: {}, models: {}, evolution: {} }, { evolution: { metacognition: {} } }]) {
+        const config = createConfig(input);
+        expect(config.models).toEqual({ providers: {}, catalog: {} });
+        expect(config.agent).toMatchObject({ maxRetries: 3, maxToolLoops: 500, toolIdleTimeoutMs: 1_800_000 });
+        expect(config.evolution).toEqual({
+          enabled: true, skillsDir: 'skills', maxSkills: 200, maxSkillContentLength: 100_000,
+          metacognition: { enabled: true, competenceCharLimit: 3000, strategiesCharLimit: 2500 },
+        });
+      }
+    });
+
     it("strips a legacy memory-engine section from older config files", () => {
       // The retrieval-engine config was removed with the unwired engine
       // (2026-08-16); a config.json written by an older build must still load.

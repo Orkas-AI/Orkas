@@ -24,6 +24,8 @@ import type { LocalCliPermissionPolicy } from '../registry.js';
 type KillableChild = Pick<ChildProcessWithoutNullStreams, 'kill' | 'pid'>;
 type SpawnFn = typeof spawn;
 const log = createLogger('local-agents:process');
+const spawnedCliRoots = new WeakSet<ChildProcessWithoutNullStreams>();
+const escapedToolCleanup = new WeakMap<ChildProcessWithoutNullStreams, Promise<void>>();
 
 /** All event types a backend can emit. The runner removes private fields,
  *  persists the normalized event to `events.jsonl`, and forwards that same
@@ -81,7 +83,7 @@ export interface LocalEvent {
    *    media-output:       { source, callId?, items: [{ data?, uri?, mediaType?, name?, localName? }] }
    *                        // private adapter payload; runner materializes or sanitizes it;
    *                        // normalized remote items retain uri and may name a stable background cache target
-   *    stderr-line:        { line }
+   *    stderr-line:        { line, nativeLog?: { level, source, timestamp } } // runner-validated metadata; no raw message
    *    status:             { status, usage? }   // usage carried for status:'usage' running counters
    *    file-change:        { paths: string[], scope?: 'conversation-media', source?: string }
    *                        // CLI-native file metadata, or host-materialized media output
@@ -347,6 +349,7 @@ export function spawnCli(
     windowsVerbatimArguments: launch.windowsVerbatimArguments,
     detached: process.platform !== 'win32',
   });
+  spawnedCliRoots.add(child);
   // Swallow EPIPE during cancel; the OS will close the pipe when the
   // child dies before we finish writing the prompt.
   child.stdin.on('error', () => { /* noop */ });
@@ -433,22 +436,84 @@ export function killProcessTree(
  * for a delayed signal after its original group may have disappeared. Windows
  * tree termination is already forceful and must start while the parent is live.
  */
+function stopEscapedToolGroups(child: ChildProcessWithoutNullStreams): Promise<void> {
+  const pending = escapedToolCleanup.get(child);
+  if (pending) return pending;
+  const cleanup = new Promise<void>(resolve => {
+    // Snapshot while the owned CLI parent is still alive. Hermes/OpenCode can
+    // put tools in separate groups, which a signal to -CLI_PID cannot reach.
+    const probe = spawn('/bin/ps', ['-axo', 'pid=,ppid=,pgid='], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+    let output = '';
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (ok && child.pid && child.exitCode === null && child.signalCode === null) {
+        const rows = output.split(/\r?\n/).map(line => line.trim().split(/\s+/).map(Number))
+          .filter(row => row.length === 3 && row.every(value => Number.isSafeInteger(value) && value >= 0));
+        const children = new Map<number, number[][]>();
+        for (const row of rows) {
+          const group = children.get(row[1]) || [];
+          group.push(row); children.set(row[1], group);
+        }
+        if (rows.some(row => row[0] === child.pid && row[2] === child.pid)) {
+          const descendants: number[][] = [];
+          const frontier = [child.pid];
+          const seen = new Set(frontier);
+          for (let i = 0; i < frontier.length; i++) for (const row of children.get(frontier[i]) || []) {
+            if (seen.has(row[0])) continue;
+            seen.add(row[0]); frontier.push(row[0]); descendants.push(row);
+          }
+          // Signal only proven descendants outside the owned group, before
+          // stopping their parents. Do not retain PIDs for later escalation.
+          for (const row of descendants.reverse()) if (row[2] !== child.pid) {
+            try { process.kill(row[0], 'SIGKILL'); } catch { /* already exited */ }
+          }
+        }
+      } else if (!ok) {
+        log.warn('CLI descendant discovery failed', { fallback: 'process_group_only' });
+      }
+      resolve();
+    };
+    const timer = setTimeout(() => { probe.kill('SIGKILL'); finish(false); }, 1000);
+    probe.stdout!.setEncoding('utf8');
+    probe.stdout!.on('data', (chunk: string) => {
+      if (settled) return;
+      output += chunk;
+      if (output.length > 1024 * 1024) { probe.kill('SIGKILL'); finish(false); }
+    });
+    probe.once('error', () => finish(false));
+    probe.once('close', code => finish(code === 0));
+  });
+  escapedToolCleanup.set(child, cleanup);
+  return cleanup;
+}
+
 function terminateCliTree(child: ChildProcessWithoutNullStreams, graceMs: number, onComplete?: () => void): void {
   let hardKill: NodeJS.Timeout | undefined;
-  let closed = false;
+  let closed = child.exitCode != null || child.signalCode != null;
   child.once?.('close', () => {
     closed = true;
     if (process.platform !== 'win32' && child.pid) killProcessTree(child, 'SIGKILL');
     if (hardKill) clearTimeout(hardKill);
   });
-  killProcessTree(child, 'SIGTERM', { onComplete });
-  if (!closed) {
-    hardKill = setTimeout(() => {
-      hardKill = undefined;
-      killProcessTree(child, 'SIGKILL');
-    }, Math.max(0, graceMs));
-    hardKill.unref?.();
-  }
+  const terminate = () => {
+    if (closed) { onComplete?.(); return; }
+    killProcessTree(child, 'SIGTERM', { onComplete });
+    // taskkill /f is already forceful and owns its bounded fallback. A second
+    // Windows taskkill can race the first and target an already-exited root.
+    if (!closed && (process.platform !== 'win32' || !child.pid)) {
+      hardKill = setTimeout(() => {
+        hardKill = undefined;
+        killProcessTree(child, 'SIGKILL');
+      }, Math.max(0, graceMs));
+      hardKill.unref?.();
+    }
+  };
+  if (process.platform !== 'win32' && spawnedCliRoots.has(child) && !closed) {
+    void stopEscapedToolGroups(child).then(terminate, terminate);
+  } else terminate();
 }
 
 /** A protocol terminal settles the turn without waiting on inherited pipes.
@@ -474,29 +539,39 @@ export function reapCliAfterProtocolTerminal(
  */
 export class LineSplitter {
   private buf = '';
-  /** Push a chunk; emit each complete line via `onLine`. */
+  private dropping = false;
+  // Protocol records keep their existing unbounded contract. Diagnostics opt
+  // into a finite limit; an oversized record is explicit, never a silent cut.
+  constructor(private readonly maxLineChars = Infinity) {}
+
+  /** Scan only incoming bytes, retaining at most the selected line budget. */
   push(chunk: string, onLine: (line: string) => void): void {
-    // Only the new chunk can hold the next newline: rescanning the whole
-    // buffered partial line per chunk made one long record (a base64 image
-    // inside a single stream-json line) cost O(len²) on the main thread
-    // (2026-08-28 review D-6).
-    let scanFrom = this.buf.length;
-    this.buf += chunk;
-    let idx: number;
-    while ((idx = this.buf.indexOf('\n', scanFrom)) >= 0) {
-      let line = this.buf.slice(0, idx);
-      this.buf = this.buf.slice(idx + 1);
-      scanFrom = 0;
-      if (line.endsWith('\r')) line = line.slice(0, -1);
-      onLine(line);
+    let start = 0;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf('\n', start);
+      const end = newline < 0 ? chunk.length : newline;
+      if (!this.dropping) {
+        if (this.buf.length + end - start > this.maxLineChars) {
+          this.buf = '';
+          this.dropping = true;
+          onLine('CLI diagnostic line exceeded the supported size.');
+        } else this.buf += chunk.slice(start, end);
+      }
+      if (newline < 0) break;
+      if (!this.dropping) {
+        const line = this.buf.endsWith('\r') ? this.buf.slice(0, -1) : this.buf;
+        this.buf = '';
+        onLine(line);
+      }
+      this.dropping = false;
+      start = newline + 1;
     }
   }
-  /** Flush any trailing line without a newline (e.g. CLI exited early). */
+  /** Flush a final record before the backend publishes its terminal event. */
   flush(onLine: (line: string) => void): void {
-    if (this.buf.length > 0) {
-      onLine(this.buf);
-      this.buf = '';
-    }
+    const line = this.buf;
+    this.buf = '';
+    if (line) onLine(line);
   }
 }
 
@@ -534,7 +609,7 @@ export function levelOrInfo(raw: unknown): 'debug' | 'info' | 'warn' | 'error' {
  */
 export function armKillWatchdog(
   child: ChildProcessWithoutNullStreams,
-  opts: { timeoutMs: number; deadlineAt?: number; idleKillMs?: number; lastEventAt?: () => number },
+  opts: { timeoutMs: number; deadlineAt?: number; idleKillMs?: number; lastEventAt?: () => number; terminate?: () => void },
 ): { fired: () => 'wall' | 'idle' | null; reason: () => string; disarm: () => void } {
   const startedAt = Date.now();
   const deadlineAt = Math.min(opts.deadlineAt ?? Infinity, startedAt + opts.timeoutMs);
@@ -545,6 +620,10 @@ export function armKillWatchdog(
   let firedIdleMs = 0;
 
   const kill = () => {
+    if (opts.terminate) {
+      try { opts.terminate(); return; }
+      catch { /* Native cancellation failed; retain forceful tree cleanup. */ }
+    }
     terminateCliTree(child, 10_000);
   };
 
@@ -576,7 +655,7 @@ export function armKillWatchdog(
     reason: () => (
       firedKind === 'idle'
         ? `timed out: no activity for ${firedIdleMs}ms (idle cap ${idleKillMs}ms)`
-        : `timed out: exceeded ${opts.timeoutMs}ms wall-clock cap`
+        : `timed out: exceeded ${Math.max(0, deadlineAt - startedAt)}ms wall-clock cap`
     ),
     disarm: () => clearInterval(ticker),
   };

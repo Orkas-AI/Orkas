@@ -4,11 +4,9 @@
  * tool schemas; only uncached, stale, or repair-needed rows connect during bootstrap. The first
  * real tool call reconnects a cached instance on demand.
  *
- * Process-quit hook calls `manager.shutdownAll()` so stdio subprocesses (MCP servers) exit
- * cleanly instead of becoming zombies — symmetrical to the cleanup that `local_agents/runner.ts`
- * runs for its own spawned CLIs.
+ * The shared app shutdown coordinator awaits `shutdown()` before installer
+ * handoff; an asynchronous before-quit listener cannot delay Electron exit.
  */
-import { app } from 'electron';
 import * as manager from './manager';
 import { createLogger } from '../../logger';
 
@@ -16,7 +14,6 @@ const log = createLogger('connectors');
 
 let _bootPromise: Promise<void> | null = null;
 let _bootUid: string | null = null;
-let _quitHookInstalled = false;
 
 async function _doBootstrap(uid: string): Promise<void> {
   try {
@@ -26,18 +23,19 @@ async function _doBootstrap(uid: string): Promise<void> {
   }
 }
 
-function _installQuitHook(): void {
-  if (_quitHookInstalled) return;
-  _quitHookInstalled = true;
-  app.on('before-quit', () => {
-    manager.shutdownAll().catch((err) => {
-      log.warn('connectors shutdownAll failed', { error: (err as Error).message });
-    });
-  });
+export async function shutdown(): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      manager.shutdownAll(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Connector shutdown timed out')), 5_000);
+      }),
+    ]);
+  } finally { if (timer) clearTimeout(timer); }
 }
 
 export function bootstrap(uid: string): Promise<void> {
-  _installQuitHook();
   if (!_bootPromise || _bootUid !== uid) {
     _bootUid = uid;
     _bootPromise = _doBootstrap(uid);

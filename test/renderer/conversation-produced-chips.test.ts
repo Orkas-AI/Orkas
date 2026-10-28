@@ -26,7 +26,6 @@ const utils = require('../../src/renderer/modules/utils.js');
 const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
 const styleSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
 const conversationInfoSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation-info.js'), 'utf8');
-const viewerSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/chat-file-viewer.js'), 'utf8');
 const utilsSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/utils.js'), 'utf8');
 
 function extractFunction(name: string): string {
@@ -328,17 +327,11 @@ describe('chat video layout', () => {
     expect(styleSource).not.toContain('.chat-msg-attach-video-shell');
   });
 
-  it('wires expanded markdown and floating-player surfaces to the shared playback toggle', () => {
+  it('wires expanded markdown surfaces to the shared playback toggle', () => {
     expect(source).not.toContain('data-chat-video-playback-surface="attachment_bubble"');
     expect(utilsSource).toContain('data-chat-video-playback-surface="markdown_bubble"');
-    // Both floating-player video wraps must carry the surface marker. The
-    // viewer builds them via DOM (`dataset.chatVideoPlaybackSurface`), which
-    // sets the same data attribute an innerHTML template would; accept either
-    // spelling so a template<->DOM refactor cannot fail this while the
-    // delegated toggle in utils.js keeps working.
-    expect((viewerSource.match(
-      /data-chat-video-playback-surface="floating_player"|chatVideoPlaybackSurface = 'floating_player'/g,
-    ) || [])).toHaveLength(2);
+    // Local and URL viewer entry points are exercised through their real DOM
+    // mount in video-viewer-lifecycle.test.ts.
     expect(utilsSource).toContain("target.closest('[data-chat-video-playback-surface]')");
     expect(utilsSource).toContain('_toggleChatVideoFromSurface(e, surface)');
   });

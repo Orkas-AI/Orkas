@@ -11,11 +11,16 @@ import {
   OAUTH_ALIAS_FOR,
   EXTRA_LABELS,
   isVisibleProvider,
+  isKnownModelProvider,
+  isUserAddableProvider,
   providerLabel,
   providerDocsUrl,
   providerSubscriptionNote,
   sortProviderIds,
   curatedModelsFor,
+  configuredOpenAICompatibleProviders,
+  getConfiguredOpenAICompatibleProvider,
+  isExternalApiProvider,
   modelInputFromConfiguredCapabilities,
   modelInputImageLimit,
   resolveConfiguredPiModel,
@@ -93,12 +98,12 @@ describe('provider_catalog › CURATED_MODELS', () => {
         id: 'orkas-llm-1.5',
         name: 'Orkas-1.5',
         recommended: true,
-        includedModels: ['DeepSeek V4', 'GPT-5.6 Luna', 'Claude-Sonnet-5', 'Gemini-3.6 Flash'],
+        includedModels: ['DeepSeek V4.1 Flash', 'GPT-6 Luna', 'Claude-Sonnet-5', 'Gemini-3.8 Flash'],
       }),
       expect.objectContaining({
         id: 'orkas-llm-1.5-pro',
         name: 'Orkas-1.5 Pro',
-        includedModels: ['GPT-5.6 Sol', 'Claude Opus 5', 'Kimi K3'],
+        includedModels: ['GPT-6.1 Sol', 'Claude Opus 5.5', 'Kimi K3'],
       }),
     ]);
   });
@@ -142,7 +147,7 @@ describe('provider_catalog › CURATED_MODELS', () => {
     for (const row of rows.filter(m => m.id !== 'k2p7')) {
       const resolved = resolveConfiguredPiModel({ getPiModel: getBuiltinModel as any }, 'kimi-coding', row.id);
       expect(resolved).toMatchObject({ templateModelId: row.id, isConfiguredFallback: false,
-        model: { id: row.id, api: 'anthropic-messages', compat: { forceAdaptiveThinking: true } } });
+        model: { id: row.id, api: 'openai-completions', baseUrl: 'https://api.kimi.com/coding/v1', compat: { requiresReasoningContentOnAssistantMessages: true } } });
     }
     expect(isSelectableModel('kimi-coding', 'k2p7')).toBe(true);
     expect(resolveModelUpgrade('kimi-coding', 'k2p7')).toMatchObject({ modelId: 'k2p7', upgraded: false });
@@ -162,13 +167,14 @@ describe('provider_catalog › CURATED_MODELS', () => {
       isConfiguredFallback: false,
       needsCustomModel: true,
       model: {
-        api: 'anthropic-messages',
+        api: 'openai-completions',
+        baseUrl: 'https://api.kimi.com/coding/v1',
         reasoning: true,
         contextWindow: 1_000_000,
         maxTokens: 131_072,
         compat: {
-          allowEmptySignature: true,
-          forceAdaptiveThinking: true,
+          requiresReasoningContentOnAssistantMessages: true,
+          supportsReasoningEffort: true,
         },
       },
     });
@@ -177,6 +183,7 @@ describe('provider_catalog › CURATED_MODELS', () => {
   it('minimax catalog exposes M3 before the M2.7 generation', () => {
     const directIds = (CURATED_MODELS['minimax-cn'] || []).map((m) => m.id);
     expect(directIds).toEqual([
+      'MiniMax-M3.1-Flash',
       'MiniMax-M3',
       'MiniMax-M2.7',
     ]);
@@ -186,6 +193,44 @@ describe('provider_catalog › CURATED_MODELS', () => {
 
     const portalIds = (CURATED_MODELS['minimax-portal-cn'] || []).map((m) => m.id);
     expect(portalIds).toEqual(directIds);
+    for (const provider of ['minimax-cn', 'minimax-portal', 'minimax-portal-cn']) {
+      expect(curatedModelsFor(provider).filter(m => !m.hiddenFromPicker).map(m => m.id))
+        .toEqual(['MiniMax-M3.1-Flash', 'MiniMax-M3']);
+      expect(resolveModelUpgrade(provider, 'MiniMax-M2.7').modelId).toBe('MiniMax-M2.7');
+      expect(isSelectableModel(provider, 'MiniMax-M2.7')).toBe(true);
+    }
+  });
+
+  it.each(['minimax-cn', 'minimax-portal', 'minimax-portal-cn'])('runs new Flash through %s with its own protocol metadata', async (providerId) => {
+    const catalog = { getPiModel: (provider: string, id: string) => id === 'MiniMax-M3.1-Flash' ? undefined : (getBuiltinModel as any)(provider, id) };
+    const original = structuredClone(catalog.getPiModel(providerId === 'minimax-portal' ? 'minimax' : 'minimax-cn', 'MiniMax-M3'));
+    const resolved = resolveConfiguredPiModel(catalog, providerId, 'MiniMax-M3.1-Flash');
+    expect(resolved).not.toBeNull();
+    expect(resolved!.model).toMatchObject({ id: 'MiniMax-M3.1-Flash', api: 'anthropic-messages',
+      baseUrl: providerId === 'minimax-portal' ? 'https://api.minimax.io/anthropic' : 'https://api.minimaxi.com/anthropic',
+      contextWindow: 1_000_000, maxTokens: 131072, reasoning: true, input: ['text', 'image'],
+      cost: { input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0 },
+    });
+    expect(resolved!.model.cost).not.toHaveProperty('tiers');
+    const { createPiProvider } = await import('#core-agent');
+    for (const reasoning of [undefined, 'off', 'low', 'high'] as const) {
+      let payload: any;
+      const provider = createPiProvider({ provider: providerId, apiKey: 'fixture-only', customModel: resolved!.model,
+        onPayload(value) { payload = value; throw new Error('captured-before-transport'); } });
+      await expect(provider.complete({ model: 'MiniMax-M3.1-Flash', reasoning, temperature: 0.25,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'Answer' }] }], onRequestFailure() {},
+      })).rejects.toThrow('captured-before-transport');
+      expect(payload.model).toBe('MiniMax-M3.1-Flash');
+      expect(payload.thinking?.type).not.toBe('disabled');
+      expect(payload).not.toHaveProperty('temperature');
+      expect(payload).not.toHaveProperty('service_tier');
+      if (reasoning && reasoning !== 'off') {
+        expect(payload.thinking).toMatchObject({ type: 'adaptive' });
+        expect(payload.thinking).not.toHaveProperty('budget_tokens');
+        expect(payload.output_config.effort).toBe(reasoning);
+      }
+    }
+    expect(catalog.getPiModel(providerId === 'minimax-portal' ? 'minimax' : 'minimax-cn', 'MiniMax-M3')).toEqual(original);
   });
 
   it('exposes GLM 5.3 and 5.2 as native runnable Z.AI models', () => {
@@ -761,3 +806,159 @@ describe('provider_catalog › pickLatestGenerations (fallback)', () => {
       }
     }
   });
+
+describe('configured provider trust boundary',()=>{it('accepts safe Server-configured providers and rejects unsafe or reserved definitions', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'configuredopenaiproviders';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              acme: [
+                { id: 'acme-vision', name: 'Acme Vision', supportsVision: true, maxInputImages: 12 },
+                { id: 'acme-default', name: 'Acme Default' },
+                { id: 'acme-text', name: 'Acme Text', supportsVision: false },
+              ],
+              unsafe: [{ id: 'unsafe-model', name: 'Unsafe Model' }],
+              conflict: [{ id: 'conflict-model', supportsVision: false, maxInputImages: 3 }],
+            },
+            openai_compatible_providers: {
+              acme: {
+                label: 'Acme AI',
+                baseUrl: 'https://api.acme.example/v1/',
+                docsUrl: 'https://docs.acme.example/keys',
+              },
+              unsafe: { label: 'Unsafe', baseUrl: 'http://127.0.0.1:9000/v1' },
+              conflict: { label: 'Conflict', baseUrl: 'https://api.conflict.example/v1' },
+              openai: { label: 'Imposter', baseUrl: 'https://evil.example/v1' },
+            },
+          },
+        },
+      },
+    });
+    try {
+      expect(configuredOpenAICompatibleProviders()).toEqual([{
+        id: 'acme',
+        label: 'Acme AI',
+        baseUrl: 'https://api.acme.example/v1',
+        docsUrl: 'https://docs.acme.example/keys',
+      }]);
+      expect(getConfiguredOpenAICompatibleProvider('acme')).toMatchObject({ label: 'Acme AI' });
+      expect(getConfiguredOpenAICompatibleProvider('unsafe')).toBeNull();
+      expect(getConfiguredOpenAICompatibleProvider('conflict')).toBeNull();
+      expect(getConfiguredOpenAICompatibleProvider('openai')).toBeNull();
+      expect(isVisibleProvider('acme')).toBe(true);
+      expect(isKnownModelProvider('acme')).toBe(true);
+      expect(isUserAddableProvider('acme')).toBe(true);
+      expect(isExternalApiProvider('acme')).toBe(true);
+      expect(providerLabel('acme')).toBe('Acme AI');
+      expect(providerDocsUrl('acme')).toBe('https://docs.acme.example/keys');
+      expect(isSelectableModel('acme', 'acme-vision')).toBe(true);
+      expect(isSelectableModel('acme', 'not-configured')).toBe(false);
+      expect(curatedModelsFor('acme')).toEqual([
+        { id: 'acme-vision', name: 'Acme Vision', supportsVision: true, maxInputImages: 12 },
+        { id: 'acme-default', name: 'Acme Default' },
+        { id: 'acme-text', name: 'Acme Text', supportsVision: false },
+      ]);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });});
+
+describe('current public model upgrade aliases', () => {
+  it.each([
+    ['openai', 'gpt-5.4', 'gpt-5.6-sol'],
+    ['openai-codex', 'gpt-5.4', 'gpt-5.6-sol'],
+    ['google', 'gemini-3.6-flash', 'gemini-3.8-flash'],
+    ['doubao', 'doubao-seed-2-1-pro-260628', 'doubao-seed-2-1-pro-260915'],
+    ['openrouter', 'qwen/qwen3.7-max', 'qwen/qwen3.8-max-0902'],
+  ])('upgrades %s %s only into an available public catalog row', (provider, oldId, expected) => {
+    expect(resolveModelUpgrade(provider, oldId)).toMatchObject({ modelId: expected, upgraded: true });
+  });
+});
+
+describe('configured provider capability declaration',()=>{
+it('accepts the complete capability-field matrix and rejects conflicts or invalid field types', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'configuredcapabilitymatrix';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    const cases: Array<{
+      id: string;
+      supportsVision?: unknown;
+      maxInputImages?: unknown;
+      accepted: boolean;
+    }> = [
+      { id: 'omitted-omitted', accepted: true },
+      { id: 'omitted-zero', maxInputImages: 0, accepted: true },
+      { id: 'omitted-positive', maxInputImages: 12, accepted: true },
+      { id: 'true-omitted', supportsVision: true, accepted: true },
+      { id: 'true-zero', supportsVision: true, maxInputImages: 0, accepted: false },
+      { id: 'true-positive', supportsVision: true, maxInputImages: 12, accepted: true },
+      { id: 'false-omitted', supportsVision: false, accepted: true },
+      { id: 'false-zero', supportsVision: false, maxInputImages: 0, accepted: true },
+      { id: 'false-positive', supportsVision: false, maxInputImages: 12, accepted: false },
+      { id: 'invalid-omitted', supportsVision: 'yes', accepted: false },
+      { id: 'invalid-zero', supportsVision: 'yes', maxInputImages: 0, accepted: false },
+      { id: 'invalid-positive', supportsVision: 'yes', maxInputImages: 12, accepted: false },
+      { id: 'invalid-invalid', supportsVision: 'yes', maxInputImages: '12', accepted: false },
+      { id: 'omitted-invalid', maxInputImages: '12', accepted: false },
+      { id: 'true-invalid', supportsVision: true, maxInputImages: '12', accepted: false },
+      { id: 'false-invalid', supportsVision: false, maxInputImages: '12', accepted: false },
+      { id: 'negative-limit', maxInputImages: -1, accepted: false },
+      { id: 'fractional-limit', maxInputImages: 1.5, accepted: false },
+      { id: 'boolean-limit', maxInputImages: true, accepted: false },
+      { id: 'null-limit', maxInputImages: null, accepted: false },
+      { id: 'object-limit', maxInputImages: { count: 12 }, accepted: false },
+    ];
+    const models = Object.fromEntries(cases.map((entry) => [entry.id, [{
+      id: `${entry.id}-model`,
+      ...(entry.supportsVision !== undefined ? { supportsVision: entry.supportsVision } : {}),
+      ...('maxInputImages' in entry ? { maxInputImages: entry.maxInputImages } : {}),
+    }]]));
+    const definitions = Object.fromEntries(cases.map((entry) => [entry.id, {
+      label: entry.id,
+      baseUrl: `https://api.${entry.id}.example/v1`,
+    }]));
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: models,
+            openai_compatible_providers: definitions,
+          },
+        },
+      },
+    });
+    try {
+      expect(configuredOpenAICompatibleProviders().map((provider) => provider.id)).toEqual(
+        cases.filter((entry) => entry.accepted).map((entry) => entry.id),
+      );
+      for (const entry of cases) {
+        const provider = getConfiguredOpenAICompatibleProvider(entry.id);
+        if (entry.accepted) {
+          expect(provider, entry.id).not.toBeNull();
+        } else {
+          expect(provider, entry.id).toBeNull();
+        }
+      }
+      expect(curatedModelsFor('false-zero')).toEqual([{
+        id: 'false-zero-model',
+        name: 'false-zero-model',
+        supportsVision: false,
+        maxInputImages: 0,
+      }]);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+});

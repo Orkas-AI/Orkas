@@ -177,6 +177,8 @@ export function flattenImageProviderOptions(
       model: model.id,
       label: provider.id === 'doubao'
         ? `DouBao · ${model.name}`
+        : provider.id === 'openai' ? `OpenAI · ${model.name}`
+        : provider.id === 'google' ? `Google · ${model.name}`
         : `${provider.label} · ${model.name}`,
     }));
   });
@@ -194,7 +196,8 @@ export async function testImageProfile(id: string): Promise<TestImageProfileResu
   const cap = findImageGenCapability(target.provider);
   if (!cap) return { ok: false, durationMs: 0, error: `provider ${target.provider} has no image-gen capability` };
   const model = target.model || cap.model;
-  if (!isImageProviderModelAllowed(target.provider, model)) {
+  if (!isImageProviderModelAllowed(target.provider, model)
+    && !(target.provider === 'doubao' && model === 'doubao-seedream-5-0-lite-260128')) {
     return { ok: false, durationMs: 0, error: `unsupported image model "${target.provider}/${model}"` };
   }
 
@@ -204,7 +207,7 @@ export async function testImageProfile(id: string): Promise<TestImageProfileResu
       apiKey: target.apiKey,
       model,
       prompt: 'a small red dot on white background',
-      size: '1024x1024',
+      size: cap.api === 'doubao' || cap.api === 'orkas' ? '2k' : '1024x1024',
     };
     if (cap.api === 'openai')      await callOpenAIImage(req);
     else if (cap.api === 'gemini') await callGeminiImage(req);

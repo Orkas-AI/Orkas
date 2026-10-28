@@ -63,6 +63,10 @@ function applyEvents(
     _taskBoardTasks: new Map(),
     _taskBoardBatchIds: new Map(),
     _taskBoardSendingNow: new Set(),
+    _taskBoardPlanning: new Map(),
+    _taskBoardPlanningEnded: new Map(),
+    _TASK_BOARD_PLANNING_ENDED_MAX: 50,
+    _taskBoardPlanningClock: 0,
     _TASK_BOARD_TERMINAL: new Set(['done', 'stopped', 'failed', 'cancelled']),
     currentCid: visibleCid,
     renders: [] as string[],
@@ -85,6 +89,8 @@ function applyEvents(
     extractFunction(boardSource, '_taskBoardMapFor'),
     extractFunction(boardSource, '_taskBoardLiveRows'),
     extractFunction(boardSource, '_taskBoardBatchAfterCreate'),
+    extractFunction(boardSource, '_taskBoardEndPlanning'),
+    extractFunction(boardSource, '_taskBoardApplyPlanning'),
     extractFunction(boardSource, '_taskBoardOnEvent'),
   ].join('\n');
   if (throughBus) {
@@ -166,7 +172,17 @@ describe('task board › events are settled above the cross-cid view guard', () 
     expect(ctx.renders).toEqual([]);
   });
 
-  it('routes exactly the two board event types past the guard', () => {
+  it('settles a background send\'s planning window without consulting view eligibility', () => {
+    const planning = (active: boolean) => ({ type: 'dispatch_planning', message_id: 'm1', active, preview: 'arrange' });
+    const ctx = applyEvents('visible-cid', [['bg-cid', planning(true)], ['bg-cid', planning(false)]], true);
+    expect(ctx.deliveries.map(([cid, event]) => [cid, (event as { active: boolean }).active]))
+      .toEqual([['bg-cid', true], ['bg-cid', false]]);
+    expect((ctx as any)._taskBoardPlanning.get('bg-cid').get('m1').active).toBe(false);
+    expect(ctx.visibilityChecks).toEqual([]);
+    expect(ctx.renders).toEqual([]);
+  });
+
+  it('routes exactly the board event types past the guard', () => {
     const predicate = extractFunction(conversationSource, '_taskBoardEventBypassesViewGuard');
     const decide = (ev: unknown) => vm.runInNewContext(
       `${predicate}; _taskBoardEventBypassesViewGuard(${JSON.stringify(ev)});`,
@@ -174,6 +190,7 @@ describe('task board › events are settled above the cross-cid view guard', () 
     );
     expect(decide({ type: 'task_created' })).toBe(true);
     expect(decide({ type: 'task_state' })).toBe(true);
+    expect(decide({ type: 'dispatch_planning' })).toBe(true);
     // Everything else must keep obeying the guard — these are the DOM-minting
     // events it was written for.
     expect(decide({ type: 'process' })).toBe(false);

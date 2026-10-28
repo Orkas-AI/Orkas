@@ -12,6 +12,46 @@ afterEach(() => {
 });
 
 describe('util/boot_init', () => {
+  it('admits fresh work after a failed quit without reviving the cancelled batch', async () => {
+    vi.useFakeTimers();
+    const boot = await loadBootInit();
+    const old = vi.fn();
+    let release!: () => void;
+    boot.registerImmediate('held', () => new Promise<void>(resolve => { release = resolve; }), 'serial');
+    boot.registerImmediate('old', old);
+    const run = boot.runBootPhases();
+    await Promise.resolve();
+    boot.stopBootWork();
+    boot.resumeBootAdmission();
+    release();
+    await run;
+    const fresh = vi.fn();
+    const work = boot.scheduleBootBackground('fresh', fresh);
+    await vi.advanceTimersByTimeAsync(1);
+    await work.promise;
+    expect(old).not.toHaveBeenCalled();
+    expect(fresh).toHaveBeenCalledOnce();
+  });
+  it('stops deferred and standalone work and cancels an active cooperative task on quit', async () => {
+    vi.useFakeTimers();
+    const boot = await loadBootInit();
+    const later = vi.fn();
+    let activeSignal: AbortSignal | undefined;
+    boot.registerImmediate('active', signal => {
+      activeSignal = signal;
+      return new Promise<void>(resolve => signal!.addEventListener('abort', () => resolve(), { once: true }));
+    });
+    boot.registerDeferred('later', later);
+    const scheduled = boot.scheduleBootBackground('standalone', later, 10_000);
+    const run = boot.runBootPhases();
+    await Promise.resolve();
+    boot.stopBootWork();
+    await run;
+    await scheduled.promise;
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(activeSignal?.aborted).toBe(true);
+    expect(later).not.toHaveBeenCalled();
+  });
   it('treats serial tasks as barriers after in-flight parallel work', async () => {
     const boot = await loadBootInit();
     const order: string[] = [];

@@ -65,7 +65,15 @@ class FakeElement {
     this.parentNode = null;
   }
 
-  addEventListener() {}
+  listeners = new Map<string, Array<(event: any) => void>>();
+  addEventListener(type: string, handler: (event: any) => void) {
+    const list = this.listeners.get(type) || [];
+    list.push(handler);
+    this.listeners.set(type, list);
+  }
+  click() {
+    for (const handler of this.listeners.get('click') || []) handler({ target: this, stopPropagation() {} });
+  }
 
   contains(target: FakeElement): boolean {
     if (target != null && !(target instanceof FakeElement)) {
@@ -389,5 +397,34 @@ describe('user workspace menu placement', () => {
     const items = menu?.querySelectorAll('.workspace-menu-item') || [];
     expect(items[0]?.childNodes[0]?.textContent).toBe('Default');
     expect(items[1]?.childNodes[0]?.textContent).toBe('logs');
+  });
+});
+
+describe('workspace picker failure diagnostics', () => {
+  beforeEach(() => {
+    delete require.cache[require.resolve('../../src/renderer/modules/user-workspace.js')];
+  });
+
+  it.each([null, { ok: false, error: 'synthetic-private-picker-marker' }])('keeps picker rejection visible and logs its fixed failure code (%j)', async response => {
+    const warn = vi.fn();
+    vi.stubGlobal('createLogger', () => ({ info: vi.fn(), warn, error: vi.fn() }));
+    const toast = vi.fn();
+    vi.stubGlobal('uiToast', toast);
+    const { _showWorkspaceDropdown } = loadUserWorkspace();
+    const invoke = vi.fn().mockResolvedValue(response);
+    (globalThis as any).window.orkas = { invoke };
+    const anchor = new FakeElement('button');
+    _showWorkspaceDropdown(anchor, 'new-chat');
+    const menu = (globalThis as any).document.body.querySelector('.workspace-menu') as FakeElement;
+    const chooseFolder = menu.querySelectorAll('.workspace-menu-item').find(item => item.textContent === 'workspace.pick_folder');
+    expect(chooseFolder).toBeDefined();
+    chooseFolder!.click();
+    await vi.waitFor(() => expect(toast).toHaveBeenCalledOnce());
+    expect(invoke.mock.calls).toEqual([['workspace.selectDirectory', {}]]);
+    expect(toast).toHaveBeenCalledWith('workspace.set_failed', { variant: 'warning', timeoutMs: 6000 });
+    expect(warn).toHaveBeenCalledExactlyOnceWith('workspace change failed', {
+      action: 'select', surface: 'new_chat', error_code: 'picker_failed',
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('synthetic-private-picker-marker');
   });
 });

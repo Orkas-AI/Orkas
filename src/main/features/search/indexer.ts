@@ -560,7 +560,7 @@ export function upsertContext(userId: string, relPath: string): void {
       entry.dirty = true;
     });
     _markDirty(idxPath);
-  })().catch((err) => log.warn(`upsertContext failed: ${err.message}`));
+  })().catch((err) => log.warn('upsertContext failed', { error: logErrorSummary(err) }));
 }
 
 export function dropContext(userId: string, relPath: string): void {
@@ -573,7 +573,7 @@ export function dropContext(userId: string, relPath: string): void {
       entry.dirty = true;
     });
     _markDirty(idxPath);
-  })().catch((err) => log.warn(`dropContext failed: ${err.message}`));
+  })().catch((err) => log.warn('dropContext failed', { error: logErrorSummary(err) }));
 }
 
 // ── Chat index (main conversations only) ────────────────────────────────

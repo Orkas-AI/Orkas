@@ -21,6 +21,10 @@ const testNamePattern = [
   'terminates the complete Windows FFmpeg process tree',
   'kills a real Windows ffprobe-style process tree',
   'P1 terminates a real Windows video subprocess tree',
+  'stops orphaned and late Windows descendants',
+  'releases a Windows MCP descendant file lock',
+  'stops only this installation',
+  'releases orphaned app/runtime executables',
 ].join('|');
 const suites = [
   'src/core-agent/test/process-session.test.ts',
@@ -29,6 +33,9 @@ const suites = [
   'test/main/features/packages.test.ts',
   'test/main/features/generation_reference_assets.test.ts',
   'test/main/util/media_probe.test.ts',
+  'test/main/util/windows-shutdown-processes.test.ts',
+  'test/main/util/windows-installer-processes.test.ts',
+  'test/main/features/connectors/mcp-client.test.ts',
   'test/main/features/video_studio_native_qa.test.ts',
 ];
 

@@ -1,9 +1,8 @@
 /**
  * Shared image preprocessing utilities for main/.
  *
- * Knowledge-base indexing uses the grayscale JPEG path because vision input
- * only needs text/shapes/layout. User feedback keeps color and only compresses
- * upload payloads when doing so is useful.
+ * Preserve color in model inputs while bounding image dimensions and JPEG
+ * quality. User feedback only compresses upload payloads when useful.
  */
 
 export interface ImageTransformOpts {
@@ -11,8 +10,6 @@ export interface ImageTransformOpts {
   maxDim?: number;
   /** JPEG quality 1-100. Default 70. */
   quality?: number;
-  /** Apply greyscale. Default true. */
-  grayscale?: boolean;
 }
 
 export interface ImageTransformResult {
@@ -27,7 +24,6 @@ export interface ImageTransformResult {
 export const LIBRARY_IMAGE_TRANSFORM_OPTIONS: Readonly<Required<ImageTransformOpts>> = Object.freeze({
   maxDim: 1024,
   quality: 70,
-  grayscale: true,
 });
 
 export interface FeedbackImageTransformOpts {
@@ -82,16 +78,15 @@ function flattenAlphaOnWhite(Jimp: any, img: any): { image: any; flattened: bool
   return { image: background, flattened: true };
 }
 
-export async function toCompressedGrayJpeg(
+export async function toCompressedJpeg(
   buf: Buffer,
   opts: ImageTransformOpts = {},
 ): Promise<ImageTransformResult> {
   if (!buf || !(buf instanceof Buffer) || buf.length === 0) {
-    throw new Error('toCompressedGrayJpeg: empty or invalid buffer');
+    throw new Error('toCompressedJpeg: empty or invalid buffer');
   }
   const maxDim = Math.max(64, opts.maxDim ?? 1024);
   const quality = Math.min(100, Math.max(1, opts.quality ?? 70));
-  const grayscale = opts.grayscale !== false;
 
   const Jimp: any = await loadJimp();
   let img: any = await Jimp.read(buf);
@@ -106,7 +101,6 @@ export async function toCompressedGrayJpeg(
   if (img.bitmap.width > maxDim || img.bitmap.height > maxDim) {
     img.scaleToFit({ w: maxDim, h: maxDim });
   }
-  if (grayscale) img.greyscale();
 
   const out: Buffer = await img.getBuffer('image/jpeg', { quality });
   return {

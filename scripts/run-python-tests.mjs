@@ -7,13 +7,11 @@ import { spawnSync } from 'node:child_process';
 import { withWindowsGitOnPath } from './test-runtime-env.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
-// The open-source app is a flat repository (unlike the private monorepo, which
-// nests the desktop app under PC/), so resolve both the test venv and pytest
-// working directory from this repository root.
-const appRoot = resolve(here, '..');
+// The open-source app and its test virtual environment share this flat root.
+const repoRoot = resolve(here, '..');
 const localPython = process.platform === 'win32'
-  ? resolve(appRoot, 'venv', 'Scripts', 'python.exe')
-  : resolve(appRoot, 'venv', 'bin', 'python');
+  ? resolve(repoRoot, 'venv', 'Scripts', 'python.exe')
+  : resolve(repoRoot, 'venv', 'bin', 'python');
 const testEnvironment = withWindowsGitOnPath(process.env);
 const candidates = [testEnvironment.ORKAS_TEST_PYTHON, localPython, 'python3', 'python']
   .filter((value, index, all) => value && all.indexOf(value) === index);
@@ -32,15 +30,27 @@ if (!python) {
 testEnvironment.ORKAS_TEST_PYTHON = python;
 
 const args = process.argv.slice(2);
+const cwdFlag = args.findIndex(arg => arg.startsWith('--cwd='));
+const cwd = cwdFlag < 0 ? repoRoot : resolve(args.splice(cwdFlag, 1)[0].slice(6));
 if (args.length === 0) args.push('resources/builtin');
-const result = spawnSync(python, ['-m', 'pytest', ...args], {
-  cwd: appRoot,
-  stdio: 'inherit',
-  env: testEnvironment,
-});
+if (args.some(arg => arg === '--resume' || arg.startsWith('--checkpoint-dir') || arg.startsWith('--batch-count'))) {
+  try {
+    const { runRunnerCheckpoint } = await import('./runner-checkpoint.mjs');
+    process.exitCode = await runRunnerCheckpoint('python', args, { cwd, env: testEnvironment, python });
+  } catch (error) {
+    console.error(`[run-python-tests] ${error.message}`);
+    process.exitCode = 1;
+  }
+} else {
+  const result = spawnSync(python, ['-m', 'pytest', ...args], {
+    cwd,
+    stdio: 'inherit',
+    env: testEnvironment,
+  });
 
-if (result.error) {
-  console.error(`[run-python-tests] failed to start pytest: ${result.error.message}`);
-  process.exit(1);
+  if (result.error) {
+    console.error(`[run-python-tests] failed to start pytest: ${result.error.message}`);
+    process.exit(1);
+  }
+  process.exit(result.status ?? 1);
 }
-process.exit(result.status ?? 1);

@@ -3,6 +3,39 @@ import path from 'node:path';
 import { test, expect } from './fixtures/orkas';
 
 test.describe('inline historical task cleanup', () => {
+  test('shows remaining history after cleanup and requires a new selection', async ({ orkas }, testInfo) => {
+    const cids: string[] = [];
+    for (const title of ['Selected history', 'History left for review']) {
+      cids.push((await orkas.invoke<any>('conversations.create', { title })).conversation.conversation_id);
+    }
+    const root = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats');
+    const rows = JSON.parse(readFileSync(path.join(root, '_index.json'), 'utf8'));
+    const old = '2020-01-01T00:00:00Z';
+    for (const row of rows) {
+      row.created_at = row.updated_at = old;
+      writeFileSync(path.join(root, row.conversation_id, 'meta.json'), JSON.stringify(row));
+      writeFileSync(path.join(root, `${row.conversation_id}.jsonl`), JSON.stringify({ id: 'request', from: 'user', content: row.title, ts: old }) + '\n');
+    }
+    writeFileSync(path.join(root, '_index.json'), JSON.stringify(rows));
+    const page = await orkas.relaunch();
+    await page.locator('#settings-btn').click();
+    await page.locator('[data-settings-tab="data"]').click();
+    const section = page.locator('#settings-task-cleanup');
+    await section.locator('[data-cleanup-action="view"]').click();
+    await section.locator(`[data-cleanup-cid="${cids[0]}"]`).check();
+    await section.locator('[data-cleanup-action="prepare"]').click();
+    await section.locator('[data-cleanup-action="confirm"]').click();
+    await expect(section).toContainText('Still matching: 1. Review and select again to continue.');
+    await expect(section.locator('[data-cleanup-action="prepare"]')).toBeDisabled();
+    expect(existsSync(path.join(root, `${cids[0]}.jsonl`))).toBe(false);
+    expect(existsSync(path.join(root, `${cids[1]}.jsonl`))).toBe(true);
+    for (const [lang, width, height] of [['en', 1280, 900], ['zh', 1000, 720], ['en', 620, 780]] as const) {
+      await page.setViewportSize({ width, height });
+      await page.evaluate(async lang => { await (window as any).setLang(lang); }, lang);
+      await section.screenshot({ path: testInfo.outputPath(`cleanup-remaining-${lang}-${width}.png`) });
+      expect(await section.locator('[role="status"]').evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    }
+  });
   test('uses sidebar timestamps and retains tasks renamed before preview or confirmation', async ({ orkas }, testInfo) => {
     const cids: string[] = [];
     for (const title of ['Old task metadata', 'Rename before preview', 'Rename before confirmation']) {
@@ -239,28 +272,146 @@ test.describe('inline historical task cleanup', () => {
     await section.locator('[data-cleanup-action="prepare"]').click();
     await expect(section).toContainText('Running tasks are stopped automatically before cleanup.');
     await section.screenshot({ path: testInfo.outputPath('cleanup-stop-confirm.png') });
-    await section.locator('[data-cleanup-action="confirm"]').click();
-    await expect(section).toContainText('Recycled 1');
-    expect(existsSync(path.join(root, `${cid}.jsonl`))).toBe(false);
-    // A polling request can overlap the tombstone commit. Absence is the
-    // required history result until the user explicitly restores this task.
-    const missing = await app.invoke<any>('conversations.history', { cid });
-    expect(missing).toMatchObject({ ok: false, error: 'conversation not found' });
-    await testInfo.attach('deleted-history-receipt', {
-      body: Buffer.from(JSON.stringify({ expectedAbsent: true, code: missing.code, deletedFileAbsent: true })),
-      contentType: 'application/json',
-    });
-    app.releaseControlledModelChunk(); app.finishControlledModelStream();
-    const { batches } = await app.invoke<any>('recycle.list');
-    const batch = batches.find((entry: any) => entry.items.some((item: any) => item.path === `cloud/chats/${cid}.jsonl`));
-    expect(batch).toBeTruthy();
-    expect((await app.invoke<any>('recycle.restore', { id: batch.id })).failed).toBe(0);
-    const history = readFileSync(path.join(root, `${cid}.jsonl`), 'utf8');
-    expect(history).toContain('Write a short task cleanup fixture.');
-    const restored = await app.invoke<any>('conversations.history', { cid });
-    expect(restored.ok).toBe(true);
-    expect(JSON.stringify(restored.history)).toContain('Write a short task cleanup fixture.');
-    expect((await app.invoke<any>('groupChat.runtimeStatus', { cid })).processing).toBe(false);
+    // Observe only the selected task's original IPC promises; never await a
+    // replacement result, inspect metadata, or publish private request data.
+    await app.electronApp!.evaluate(({ ipcMain }, selectedCid) => {
+      const handlers = (ipcMain as any)._invokeHandlers as Map<string, Function>;
+      const original = handlers.get('orkas.invoke')!;
+      if (typeof original !== 'function') throw new Error('Cleanup evidence requires the real IPC handler');
+      const state = { stage: 'cleanup', rows: [] as any[], overflow: 0, restored: false };
+      const missing = (value: any) => value?.ok === false && (
+        value.code === 'E_CONVERSATION_NOT_FOUND' || value.code === 'E_NOT_FOUND'
+        || value.error === 'conversation not found');
+      function observed(this: unknown, event: unknown, request: any) {
+        const selected = request?.payload?.cid === selectedCid
+          && ['conversations.history', 'groupChat.abort', 'videoStudio.reviewPanel'].includes(request?.channel);
+        const returned = original.call(this, event, request);
+        if (!selected) return returned;
+        if (state.rows.length >= 64) { state.overflow++; return returned; }
+        const row: any = { channel: request.channel, startStage: state.stage,
+          settled: false, ok: null, knownMissing: false, missingCode: null, rejected: false, reviewEmpty: null };
+        state.rows.push(row);
+        const observe = (value: any, rejected: boolean) => {
+          try {
+            Object.assign(row, { endStage: state.stage, settled: true,
+              ok: !rejected && value?.ok === true, knownMissing: !rejected && missing(value), rejected,
+              missingCode: !rejected && missing(value)
+                ? (['E_UNKNOWN', 'E_NOT_FOUND', 'E_CONVERSATION_NOT_FOUND'].includes(value.code) ? value.code : 'other') : null,
+              reviewEmpty: request.channel === 'videoStudio.reviewPanel'
+                ? Array.isArray(value?.panel?.compositions) && value.panel.compositions.length === 0 : null });
+          } catch { /* Observation cannot alter the real response. */ }
+        };
+        // This non-async wrapper returns the exact original Promise/object.
+        // Both side-observer callbacks are bounded and never rethrow.
+        if (returned && typeof returned.then === 'function') void returned.then(
+          (value: unknown) => observe(value, false), () => observe(null, true));
+        else observe(returned, false);
+        return returned;
+      }
+      ipcMain.removeHandler('orkas.invoke'); ipcMain.handle('orkas.invoke', observed as any);
+      (globalThis as any).__cleanupLifetimeEvidence = { state, restore() {
+        if (handlers.get('orkas.invoke') === observed) {
+          ipcMain.removeHandler('orkas.invoke'); ipcMain.handle('orkas.invoke', original as any);
+          state.restored = true;
+        }
+      } };
+    }, cid);
+    await page.evaluate(selectedCid => {
+      const root = window as any, apiFetch = root.apiFetch, video = root.VideoReviewPanel;
+      const rows: any[] = []; let overflow = 0;
+      const push = (channel: string) => {
+        if (rows.length >= 64) { overflow++; return; }
+        const stack = String(new Error().stack || '');
+        rows.push({ channel, historyLoader: stack.includes('loadConversationHistory'),
+          missingRecovery: stack.includes('_recoverMissingConversation'),
+          conversationModule: stack.includes('/modules/conversation.js') });
+      };
+      function observedFetch(this: unknown, url: unknown, ...args: any[]) {
+        if (typeof url === 'string') {
+          if (url.startsWith('/api/conversations/' + encodeURIComponent(selectedCid) + '/history?')) push('conversations.history');
+          else if (url === '/api/conversations/' + selectedCid + '/abort') push('groupChat.abort');
+        }
+        return apiFetch.call(this, url, ...args);
+      }
+      const originals = { probe: video?.probe, notifyTurnEnd: video?.notifyTurnEnd };
+      const wrappers: Record<string, Function> = {};
+      for (const method of ['probe', 'notifyTurnEnd'] as const) if (typeof originals[method] === 'function') {
+        wrappers[method] = function (this: unknown, owner: unknown, ...args: any[]) {
+          if (owner === selectedCid) push('VideoReviewPanel.' + method);
+          return originals[method].call(this, owner, ...args);
+        };
+        video[method] = wrappers[method];
+      }
+      root.apiFetch = observedFetch;
+      root.__cleanupLifetimeEvidence = { rows, get overflow() { return overflow; }, restore() {
+        if (root.apiFetch === observedFetch) root.apiFetch = apiFetch;
+        for (const method of ['probe', 'notifyTurnEnd']) if (video?.[method] === wrappers[method]) video[method] = originals[method as keyof typeof originals];
+      } };
+    }, cid);
+    const markStage = (stage: 'cleanup' | 'absence-check' | 'restore' | 'recovered') =>
+      app.electronApp!.evaluate((_electron, stage) => { (globalThis as any).__cleanupLifetimeEvidence.state.stage = stage; }, stage);
+    let evidence: any;
+    try {
+      await section.locator('[data-cleanup-action="confirm"]').click();
+      await expect(section).toContainText('Recycled 1');
+      await markStage('absence-check');
+      expect(existsSync(path.join(root, `${cid}.jsonl`))).toBe(false);
+      // A polling request can overlap the tombstone commit. Absence is the
+      // required history result until the user explicitly restores this task.
+      const missing = await app.invoke<any>('conversations.history', { cid });
+      expect(missing).toMatchObject({ ok: false, error: 'conversation not found' });
+      await testInfo.attach('deleted-history-receipt', {
+        body: Buffer.from(JSON.stringify({ expectedAbsent: true, code: missing.code, deletedFileAbsent: true })),
+        contentType: 'application/json',
+      });
+      app.releaseControlledModelChunk(); app.finishControlledModelStream();
+      const { batches } = await app.invoke<any>('recycle.list');
+      const batch = batches.find((entry: any) => entry.items.some((item: any) => item.path === `cloud/chats/${cid}.jsonl`));
+      expect(batch).toBeTruthy();
+      await markStage('restore');
+      // Independent existing file-absence oracle at the actual restore boundary.
+      // This one additional assertion read is separate from the zero-I/O observer.
+      expect(existsSync(path.join(root, `${cid}.jsonl`))).toBe(false);
+      expect((await app.invoke<any>('recycle.restore', { id: batch.id })).failed).toBe(0);
+      await markStage('recovered');
+      const history = readFileSync(path.join(root, `${cid}.jsonl`), 'utf8');
+      expect(history).toContain('Write a short task cleanup fixture.');
+      const restored = await app.invoke<any>('conversations.history', { cid });
+      expect(restored.ok).toBe(true);
+      expect(JSON.stringify(restored.history)).toContain('Write a short task cleanup fixture.');
+      expect((await app.invoke<any>('groupChat.runtimeStatus', { cid })).processing).toBe(false);
+      await expect.poll(() => app.electronApp!.evaluate(() =>
+        (globalThis as any).__cleanupLifetimeEvidence.state.rows.every((row: any) => row.settled),
+      )).toBe(true);
+    } finally {
+      const main = await app.electronApp!.evaluate(() => {
+        const owner = (globalThis as any).__cleanupLifetimeEvidence;
+        owner.restore();
+        return owner.state;
+      });
+      const renderer = await page.evaluate(() => {
+        const owner = (window as any).__cleanupLifetimeEvidence;
+        owner.restore();
+        return { rows: owner.rows, overflow: owner.overflow };
+      });
+      evidence = { main, renderer };
+      await testInfo.attach('cleanup-lifetime-requests', {
+        body: Buffer.from(JSON.stringify(evidence)), contentType: 'application/json',
+      });
+    }
+    expect(evidence.main.restored).toBe(true);
+    expect(evidence.main.overflow).toBe(0);
+    expect(evidence.renderer.overflow).toBe(0);
+    const reviewCalls = evidence.main.rows.filter((row: any) => row.channel === 'videoStudio.reviewPanel');
+    expect(reviewCalls.every((row: any) => row.settled && row.ok && row.reviewEmpty)).toBe(true);
+    const historyCalls = evidence.main.rows.filter((row: any) => row.channel === 'conversations.history');
+    const failures = historyCalls.filter((row: any) => row.settled && !row.ok);
+    expect(failures.every((row: any) => row.knownMissing && !row.rejected)).toBe(true);
+    expect(failures.every((row: any) => row.startStage !== 'recovered')).toBe(true);
+    const absenceCalls = historyCalls.filter((row: any) => row.startStage === 'absence-check');
+    expect(absenceCalls.length).toBeGreaterThan(0);
+    expect(absenceCalls.every((row: any) => row.settled && !row.ok && row.knownMissing)).toBe(true);
+    expect(historyCalls.some((row: any) => row.startStage === 'recovered' && row.settled && row.ok)).toBe(true);
   });
   for (const inProject of [false, true]) test(`previews, cancels, excludes, cleans and restores ${inProject ? 'project' : 'personal'} history using real IPC and storage`, async ({ orkas }, testInfo) => {
     const projectId = inProject ? (await orkas.invoke<any>('projects.create', { name: 'Cleanup project' })).project.project_id : '';

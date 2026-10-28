@@ -27,6 +27,7 @@ import {
 } from '../../../../src/main/features/local_agents/registry';
 import { configureBootAdmission, noteBootUserActivity, _resetForTests as resetBoot } from '../../../../src/main/util/boot_init';
 import { MIN_VERSIONS } from '../../../../src/main/features/local_agents/version';
+import * as versionProbe from '../../../../src/main/features/local_agents/version';
 
 const isWindows = process.platform === 'win32';
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
@@ -580,6 +581,16 @@ describe('local_agents/registry', () => {
     expect(r.path).toBe(fake);
   });
 
+  it('discovers the official OpenCode install without shell PATH and preserves an explicit missing pin', async () => {
+    process.env.PATH = '';
+    const bin = writeMockCli(path.join(process.env.HOME!, '.opencode', 'bin', 'opencode'), MIN_VERSIONS.opencode);
+    const detected = await detectOne('opencode');
+    expect(detected).toMatchObject({ available: true, version: MIN_VERSIONS.opencode });
+    expect(isWindows ? detected.path?.toLowerCase() : detected.path).toBe(isWindows ? bin.toLowerCase() : bin);
+    process.env.ORKAS_OPENCODE_PATH = path.join(tmpDir, 'missing-pinned-opencode');
+    expect(await detectOne('opencode')).toMatchObject({ available: false, path: null, error: 'not_found' });
+  });
+
   it('marks version_timeout when an installed CLI exceeds the probe deadline', async () => {
     const fake = writeCountingMockCli(
       path.join(tmpDir, 'slow-opencode'),
@@ -698,10 +709,18 @@ describe('local_agents/registry', () => {
   });
 
   it.each(['conversation', 'interaction', 'abort', 'idle'] as const)('respects %s activity during warmup and keeps on-demand dispatch available', async (activity) => {
-    const firstLog = path.join(tmpDir, 'first-probe.log');
-    const nextLog = path.join(tmpDir, 'next-probe.log');
-    const first = writeCountingMockCli(path.join(tmpDir, 'first-cli'), firstLog);
-    const next = writeCountingMockCli(path.join(tmpDir, 'next-cli'), nextLog);
+    const first = writeMockCli(path.join(tmpDir, 'first-cli'), '2.1.0');
+    const next = writeMockCli(path.join(tmpDir, 'next-cli'), '2.1.0');
+    // Admission is checked between probes. Hold the first result explicitly:
+    // process-start latency and a 120ms sleep cannot synchronize this contract.
+    let started!: () => void;
+    let release!: () => void;
+    const firstStarted = new Promise<void>(resolve => { started = resolve; });
+    const firstReleased = new Promise<void>(resolve => { release = resolve; });
+    const detector = vi.spyOn(versionProbe, 'detectVersionResult').mockImplementation(async bin => {
+      if (bin === first) { started(); await firstReleased; }
+      return { status: 'success', version: '2.1.0' };
+    });
     process.env.PATH = '';
     for (const type of LOCAL_CLI_TYPES) process.env[`ORKAS_${type.toUpperCase()}_PATH`] = path.join(tmpDir, `missing-${type}`);
     process.env.ORKAS_CLAUDE_PATH = first;
@@ -711,18 +730,20 @@ describe('local_agents/registry', () => {
     let warming: Promise<unknown> | undefined;
     try {
       warming = warmLocalClis(controller.signal);
-      await vi.waitFor(() => expect(fs.existsSync(firstLog)).toBe(true));
+      await firstStarted;
       if (activity === 'conversation') configureBootAdmission({ isRuntimeBusy: () => true });
       else if (activity === 'interaction') noteBootUserActivity();
       else if (activity === 'abort') controller.abort();
       else vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 3_000);
+      release();
       await warming;
-      expect(fs.existsSync(nextLog)).toBe(activity === 'idle');
+      expect(detector.mock.calls.filter(([bin]) => bin === next)).toHaveLength(activity === 'idle' ? 1 : 0);
       const dispatched = await resolveCliForDispatch('codex');
       expect(dispatched).toMatchObject({ available: true, version: '2.1.0' });
-      expect(fs.readFileSync(nextLog, 'utf8').trim().split(/\r?\n/)).toEqual(['--version']);
+      expect(detector.mock.calls.filter(([bin]) => bin === next)).toEqual([[next, VERSION_PROBE_TIMEOUT_MS, ['--version']]]);
     } finally {
       controller.abort();
+      release();
       await warming;
       resetBoot();
     }
@@ -787,6 +808,14 @@ describe('local_agents/registry', () => {
 });
 
 describe('local_agents/registry › Windows GUI search paths', () => {
+  it.each(['darwin', 'linux', 'win32'] as const)('includes the official OpenCode installation only for OpenCode on %s', platform => {
+    const pathApi = platform === 'win32' ? path.win32 : path.posix;
+    const userDir = platform === 'win32' ? 'C:\\Users\\fixture' : '/users/fixture';
+    const installDir = pathApi.join(userDir, '.opencode', 'bin');
+    expect(localCliSearchDirs('opencode', platform, {}, userDir)).toContain(installDir);
+    expect(localCliSearchDirs('claude', platform, {}, userDir)).not.toContain(installDir);
+  });
+
   it('covers npm, WindowsApps, pnpm, Volta, nvm, and the Codex app directory', () => {
     const dirs = localCliSearchDirs('codex', 'win32', {
       APPDATA: 'C:\\Users\\alice\\AppData\\Roaming',

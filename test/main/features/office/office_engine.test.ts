@@ -1,4 +1,4 @@
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   spawn: vi.fn(),
   spawnSync: vi.fn(),
   killProcessTree: vi.fn(),
+  warn: vi.fn(),
 }));
 
 vi.mock('node:child_process', () => ({
@@ -17,7 +18,7 @@ vi.mock('node:child_process', () => ({
 }));
 vi.mock('../../../../src/main/paths', () => ({ officeCliBinaryPath: () => mocks.bin || null }));
 vi.mock('../../../../src/main/logger', () => ({
-  createLogger: () => ({ warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() }),
+  createLogger: () => ({ warn: mocks.warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() }),
 }));
 vi.mock('../../../../src/core-agent/src/sandbox/executor', () => ({
   killProcessTree: mocks.killProcessTree,
@@ -28,6 +29,7 @@ import {
   OfficeCliError,
   _resetOfficeCliAvailableForTest,
   closeAllOfficeResidents,
+  closeOfficeFile,
   officeCliAvailable,
   runOfficeCli,
 } from '../../../../src/main/features/office/office_engine';
@@ -55,6 +57,7 @@ describe('OfficeCLI engine', () => {
     mocks.spawn.mockReset();
     mocks.spawnSync.mockReset();
     mocks.killProcessTree.mockReset();
+    mocks.warn.mockReset();
     _resetOfficeCliAvailableForTest();
   });
 
@@ -68,6 +71,8 @@ describe('OfficeCLI engine', () => {
   it('does not cache a missing binary but retains a positive availability result', () => {
     fs.rmSync(mocks.bin);
     expect(officeCliAvailable()).toBe(false);
+    expect(mocks.warn).toHaveBeenCalledOnce();
+    expect(JSON.stringify(mocks.warn.mock.calls)).not.toContain(tmpDir);
     fs.writeFileSync(mocks.bin, 'binary');
     expect(officeCliAvailable()).toBe(true);
     fs.rmSync(mocks.bin, { force: true });
@@ -201,17 +206,101 @@ describe('OfficeCLI engine', () => {
     expect(mocks.killProcessTree).toHaveBeenCalledWith(child, 'SIGKILL');
   });
 
-  it('uses a hidden absolute taskkill tree command for the Windows resident sweep', () => {
+  it.each(['close', 'sweep'] as const)('keeps %s failure diagnostics without leaking private file or error contents', async (operation) => {
+    const file = path.join(tmpDir, 'confidential-acquisition.docx');
+    const privateMessage = 'private document text and credentials from a failed native process';
+    const failure = new Error(privateMessage);
+    mocks.spawn.mockImplementation(() => { throw failure; });
+    mocks.spawnSync.mockImplementation(() => { throw failure; });
+
+    if (operation === 'close') await expect(closeOfficeFile(file, tmpDir)).resolves.toBeUndefined();
+    else expect(() => closeAllOfficeResidents()).not.toThrow();
+
+    expect(mocks.warn).toHaveBeenCalledOnce();
+    const diagnostic = mocks.warn.mock.calls[0][1];
+    expect(diagnostic).toMatchObject({
+      error: {
+        message_hash: expect.stringMatching(/^[a-f0-9]{12}$/),
+        message_chars: privateMessage.length,
+      },
+    });
+    const serialized = JSON.stringify(mocks.warn.mock.calls);
+    expect(serialized).not.toContain(privateMessage);
+    expect(serialized).not.toContain(tmpDir);
+    expect(serialized).not.toContain(path.basename(file));
+  });
+
+  it('bounds the Windows resident helper, uses an absolute system executable and passes paths as data', () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     vi.stubEnv('SystemRoot', 'D:\\Windows');
     mocks.bin = 'D:\\Orkas\\resources\\officecli\\officecli-win-x64.exe';
+    mocks.spawnSync.mockReturnValue({ status: 0 });
 
     closeAllOfficeResidents();
 
     expect(mocks.spawnSync).toHaveBeenCalledWith(
-      'D:\\Windows\\System32\\taskkill.exe',
-      ['/F', '/T', '/IM', 'officecli-win-x64.exe'],
-      { timeout: 5_000, stdio: 'ignore', windowsHide: true },
+      'D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', expect.any(String)],
+      { env: expect.objectContaining({ ORKAS_OFFICECLI_SWEEP_BINARY: mocks.bin }), timeout: 5_000, stdio: 'ignore', windowsHide: true },
     );
+    const source = Buffer.from(mocks.spawnSync.mock.calls[0][1].at(-1), 'base64').toString('utf16le');
+    expect(source).not.toContain(mocks.bin);
+    expect(mocks.warn).not.toHaveBeenCalled();
   });
+
+  it.each([{ status: 1 }, { status: null, error: new Error('timeout') }])('surfaces an unsuccessful Windows resident sweep without broadening its target: %j', result => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    mocks.spawnSync.mockReturnValue(result);
+    closeAllOfficeResidents();
+    expect(mocks.spawnSync).toHaveBeenCalledTimes(1);
+    expect(mocks.warn).toHaveBeenCalledOnce();
+    expect(JSON.stringify(mocks.warn.mock.calls)).not.toContain(tmpDir);
+  });
+
+  it.runIf(process.platform === 'win32')('stops only this installation\'s Windows residents, preserving same-name and active commands', async () => {
+    const native = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const binaryName = `orkas-office-fixture-${process.pid}-${Date.now()}.exe`;
+    const own = path.join(tmpDir, "Orkas Office 测试 '", binaryName);
+    const other = path.join(tmpDir, 'Orkas-other', binaryName);
+    for (const binary of [own, other]) {
+      fs.mkdirSync(path.dirname(binary), { recursive: true });
+      fs.copyFileSync(process.env.ORKAS_TEST_NODE!, binary);
+    }
+    for (const command of ['__resident-serve__', 'create']) {
+      fs.writeFileSync(path.join(tmpDir, command), "console.log('ready');setTimeout(() => {}, 30000);");
+    }
+    mocks.bin = own;
+    mocks.spawnSync.mockImplementation(native.spawnSync);
+    const children: import('node:child_process').ChildProcess[] = [];
+    const diagnostics: string[] = [];
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      for (const [binary, command] of [[own, '__resident-serve__'], [other, '__resident-serve__'], [own, 'create']]) {
+        // A resident-mode word later in a document command must not select it.
+        const child = native.spawn(binary, [command, '__resident-serve__'], {
+          cwd: tmpDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined },
+        });
+        children.push(child);
+        child.stderr!.on('data', bytes => diagnostics.push(String(bytes)));
+        await once(child.stdout!, 'data', { signal: AbortSignal.timeout(3000) });
+      }
+      closeAllOfficeResidents();
+      expect(alive(children[0].pid!)).toBe(false);
+      expect(alive(children[1].pid!), 'another installation with the same executable name must survive').toBe(true);
+      expect(alive(children[2].pid!), 'a live document command is not a stale resident').toBe(true);
+      closeAllOfficeResidents();
+      expect(alive(children[1].pid!)).toBe(true);
+      expect(alive(children[2].pid!)).toBe(true);
+      expect(mocks.warn).not.toHaveBeenCalled();
+    } finally {
+      await Promise.all(children.map(async child => {
+        if (child.exitCode !== null || child.signalCode !== null) return;
+        const closed = once(child, 'close', { signal: AbortSignal.timeout(3000) });
+        child.kill();
+        await closed;
+      }));
+    }
+    expect(diagnostics).toEqual([]);
+  }, 15000);
 });

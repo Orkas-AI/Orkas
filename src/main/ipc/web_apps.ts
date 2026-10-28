@@ -72,7 +72,7 @@ export const webAppInvokeHandlers = {
     } catch (err) { return failure(err); }
   },
   'webApps.canSubmitArtifact': async (payload: any, ctx: Context) => {
-    try { return { allowed: runtime.canSubmitArtifact(ctx.userId, ctx.sender.id, credential(payload)) }; }
+    try { return { allowed: await runtime.canSubmitArtifact(ctx.userId, ctx.sender.id, credential(payload)) }; }
     catch { return { allowed: false }; }
   },
   'webApps.close': async (payload: any, ctx: Context) => {

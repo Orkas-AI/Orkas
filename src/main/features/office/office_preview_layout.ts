@@ -21,6 +21,7 @@ import {
   type OfficePreviewResult,
 } from '../../util/office-preview';
 import { closeOfficeFile, officeCliAvailable, runOfficeCli } from './office_engine';
+import { hardenOfficeHtml } from './office_html_security';
 
 const log = createLogger('office-preview');
 const OFFICE_LAYOUT_PREVIEW_CACHE_MAX_BYTES = 32 * 1024 * 1024;
@@ -121,33 +122,10 @@ function stabilizeRenderedPresentationNavigation(source: string): string {
 }
 
 function hardenRenderedOfficeHtml(source: string, kind: OfficePreviewKind): string {
-  const csp = [
-    "default-src 'none'",
-    "img-src data: blob:",
-    "media-src data: blob:",
-    "font-src data:",
-    "style-src 'unsafe-inline' data:",
-    "script-src 'unsafe-inline'",
-    "connect-src 'none'",
-    "frame-src 'none'",
-    "object-src 'none'",
-    "base-uri 'none'",
-    "form-action 'none'",
-  ].join('; ');
-  const meta = `<meta http-equiv="Content-Security-Policy" content="${csp}">`;
   const presentationSafeSource = kind === 'presentation'
     ? stabilizeRenderedPresentationNavigation(source)
     : source;
-  const withoutBase = presentationSafeSource
-    .replace(/<base\b[^>]*>/gi, '')
-    .replace(
-      /\b(href|src)\s*=\s*(["'])\s*javascript:[\s\S]*?\2/gi,
-      (_match, attribute: string, quote: string) => `${attribute}=${quote}#${quote}`,
-    );
-  if (/<head\b[^>]*>/i.test(withoutBase)) {
-    return withoutBase.replace(/<head\b[^>]*>/i, (head) => `${head}\n${meta}`);
-  }
-  return `<!doctype html><html><head>${meta}</head><body>${withoutBase}</body></html>`;
+  return hardenOfficeHtml(presentationSafeSource);
 }
 
 function engineExtensionForKind(kind: OfficePreviewKind): '.docx' | '.xlsx' | '.pptx' {

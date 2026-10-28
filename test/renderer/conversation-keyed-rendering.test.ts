@@ -263,6 +263,45 @@ const CID = 'c1';
 const TURN = 'turn-1';
 
 describe('keyed rendering › durable terminal recovery', () => {
+  it.each([
+    ['same-message', 'upgrading'], ['same-message', 'up_to_date'], ['same-message', 'failure'],
+    ['other-message', 'upgrading'], ['other-actor', 'upgrading'],
+  ])(
+    'keeps CLI maintenance bound to its failed message during history rebuild: %s / %s', async (scope, state) => {
+      const h = loadRenderer(CID);
+      configureDisplayRecovery(h.context);
+      h.context.document.createDocumentFragment = () => new FakeContainer();
+      const append = h.container.appendChild.bind(h.container);
+      h.container.appendChild = (node: any) => {
+        if (node instanceof FakeContainer) {
+          for (const row of [...node.rows]) append(row);
+          return node;
+        }
+        return append(node);
+      };
+      const control = { dataset: { state, cli: 'codex' } };
+      const old = new FakeNode();
+      old.dataset = { msgId: 'failed-message', fromActor: 'codex-agent', failureCode: 'version_too_old' };
+      const query = old.querySelector.bind(old);
+      old.querySelector = (selector: string): any => selector === '.local-cli-upgrade-control' ? control : query(selector);
+      h.container.appendChild(old);
+      const retained: unknown[] = [];
+      const render = h.context.appendChatMessage;
+      h.context.appendChatMessage = (message: any, scroll: boolean, opts: any) => {
+        retained.push(opts.cliUpgradeControl);
+        return render(message, scroll, opts);
+      };
+      h.context.apiFetch = async () => ({ json: async () => ({ ok: true, history: [{
+        id: scope === 'other-message' ? 'another-message' : 'failed-message',
+        from: scope === 'other-actor' ? 'claude-agent' : 'codex-agent', to: ['user'],
+        text: 'CLI requires an update', ts: '2026-10-26T10:00:00Z',
+        failure_code: 'version_too_old', failure_kind: 'dependency',
+      }], conversation: { processing: false } }) });
+      await h.context.loadConversationHistory(CID, { preserveScroll: true });
+      expect(retained).toEqual([scope === 'same-message' ? control : undefined]);
+    },
+  );
+
   it('keeps a saved-task shortcut when an otherwise empty Commander reply hands off the work', () => {
     const h = loadRenderer(CID);
     const record = { from: 'commander', text: '', process: [{ type: 'event', event: {

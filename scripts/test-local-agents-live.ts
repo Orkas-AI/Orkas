@@ -9,12 +9,21 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  classifyCurrentHistoryReadMode,
+  localAgentLiveUsage,
+  createLiveDeliveryTrace,
+  observeLiveDeliveryEvent,
+  scoreLiveDelivery,
+  liveRuntimeOverrides,
+  createLiveToolTrace,
+  observeLiveToolEvent,
+  createLiveBridgeTrace,
+  observeLiveBridgeCall,
   ingestLocalAgentLogEvent,
   createLocalAgentLogCollector,
   LOCAL_AGENT_ENV_KEYS,
@@ -25,9 +34,8 @@ import {
   managedBinaryCandidates,
   parseLiveArgs,
   scoreLocalAgentBenchmarkScenario,
-  summarizeLiveFailure,
-  validateLiveProtocolTrace,
   validateLocalAgentBenchmarkInventory,
+  waitForLiveCliExit,
 } from './local-agent-live-support.mjs';
 import { resolveCliCommand } from '../src/main/features/local_agents/spawn-command.js';
 
@@ -36,22 +44,6 @@ const pcRoot = path.resolve(scriptDir, '..');
 const installRoot = process.env.ORKAS_LOCAL_AGENT_TEST_INSTALL_ROOT
   ? path.resolve(process.env.ORKAS_LOCAL_AGENT_TEST_INSTALL_ROOT)
   : path.join(pcRoot, 'node_modules', '.orkas-local-agent-live');
-
-function usage(): string {
-  return [
-    'Usage: npm run test:local-agents:live -- [options]',
-    '',
-    'Options:',
-    '  --agents claude,codex,...  Agents to verify; default: all five',
-    '  --no-install               Fail instead of installing a missing CLI',
-    '  --install-only             Install and version-check, skip model calls',
-    '  --benchmark                Run the objective model-quality suite',
-    '  --scenario id[,id...]     Select a focused benchmark cohort',
-    '  --k N                      Benchmark rollouts per scenario; default: 2',
-    '  --no-save                  Print benchmark scorecard without saving it',
-    '  -h, --help                 Show this help',
-  ].join('\n');
-}
 
 function printableCommand(command: string, args: string[]): string {
   return [command, ...args].map(part => /\s/.test(part) ? JSON.stringify(part) : part).join(' ');
@@ -189,6 +181,7 @@ type QualityRun = {
   checks: Array<{ name: string; pass: boolean; detail: string }>;
   outputSha256: string;
   cliLogAnalysis?: unknown;
+  bridgeEvidence?: unknown;
   failureKind: string | null;
 };
 
@@ -211,6 +204,15 @@ function listWorkspaceFiles(root: string, relativeDir = ''): string[] {
     else files.push(relativePath.split(path.sep).join('/'));
   }
   return files.sort();
+}
+
+async function readLivePersistence(uid: string, runId: string) {
+  const { localAgentRunDir } = await import('../src/main/paths.js');
+  try {
+    const directory = localAgentRunDir(uid, runId);
+    return { meta: JSON.parse(fs.readFileSync(path.join(directory, 'meta.json'), 'utf8')),
+      output: fs.readFileSync(path.join(directory, 'output.txt'), 'utf8') };
+  } catch { return { meta: null, output: null }; }
 }
 
 async function runQualityBenchmark(
@@ -297,9 +299,26 @@ async function runQualityBenchmark(
 
         const cliLogs = createLocalAgentLogCollector(`${entry.type}/${scenario.id}/${rollout}`);
         let terminalEvent: any = null;
-        const toolNames: string[] = [];
-        const historyReadModes: string[] = [];
+        const deliveryTrace = createLiveDeliveryTrace();
+        const toolTrace = createLiveToolTrace();
+        const bridgeTrace = createLiveBridgeTrace();
+        const toolNames: string[] = toolTrace.toolNames;
+        const historyReadModes: string[] = toolTrace.historyReadModes;
         const handoffWorkspaceSnapshots: Record<string, string | null>[] = [];
+        const observeTool = (event: any) => {
+          if (!event) return;
+          ingestLocalAgentLogEvent(cliLogs, event);
+          if (observeLiveToolEvent(toolTrace, event)
+            && scenario.id === 'local-agent-skill-source-and-install'
+            && /orkas_handoff_to_commander$/i.test(String(event.tool))) {
+            const snapshot: Record<string, string | null> = {};
+            for (const relPath of scenario.observedFiles) {
+              try { snapshot[relPath] = fs.readFileSync(path.join(cwd, relPath), 'utf8'); }
+              catch { snapshot[relPath] = null; }
+            }
+            handoffWorkspaceSnapshots.push(snapshot);
+          }
+        };
         const t0 = Date.now();
         const result = await run({
           uid,
@@ -311,27 +330,24 @@ async function runQualityBenchmark(
           ...(projectId ? { projectId } : {}),
           // These isolated fixtures test capability selection, not unattended approval UI.
           ...(projectId || (scenario as any).permissionPolicy === 'full_access' ? { permissionPolicy: 'full_access' } : {}),
-          ...(entry.type === 'codex' ? { modelOverride: process.env.EVAL_MODEL || 'gpt-5.5', customArgs: ['-c', 'model_provider="openai"'] } : {}),
-          prompt: scenario.prompt,
+          ...liveRuntimeOverrides(entry.type),
+          // Some native agents retain a configured workspace independent of
+          // process.cwd(). Supply the isolated fixture location as task data.
+          prompt: `${scenario.prompt}\n\nTask workspace: ${cwd}`,
           cwd,
           signal: new AbortController().signal,
+          // OpenClaw has no native tool event rail. Observe the same actual
+          // host calls without adding UI events or changing tool execution.
+          onBridgeCallObserved: (call: any) => {
+            const event = observeLiveBridgeCall(bridgeTrace, call);
+            // Other adapters retain their native event oracle, with host
+            // outcomes saved separately so one call cannot count twice.
+            if (entry.type === 'openclaw') observeTool(event);
+          },
           onEvent: (event: any) => {
-            ingestLocalAgentLogEvent(cliLogs, event);
+            observeLiveDeliveryEvent(deliveryTrace, event);
             if (event?.type === 'done') terminalEvent = event;
-            if (event?.type === 'tool-event' && event?.phase === 'use' && event?.tool) {
-              toolNames.push(String(event.tool));
-              if (scenario.id === 'local-agent-skill-source-and-install'
-                && /orkas_handoff_to_commander$/i.test(String(event.tool))) {
-                const snapshot: Record<string, string | null> = {};
-                for (const relPath of scenario.observedFiles) {
-                  try { snapshot[relPath] = fs.readFileSync(path.join(cwd, relPath), 'utf8'); }
-                  catch { snapshot[relPath] = null; }
-                }
-                handoffWorkspaceSnapshots.push(snapshot);
-              }
-              const historyReadMode = classifyCurrentHistoryReadMode(event.tool, event.input);
-              if (historyReadMode) historyReadModes.push(historyReadMode);
-            }
+            observeTool(event);
           },
         });
         const files: Record<string, string | null> = {};
@@ -356,7 +372,10 @@ async function runQualityBenchmark(
           handoffWorkspaceSnapshots,
           commanderHandoff: result.commanderHandoff || null,
         });
+        checks.push(...scoreLiveDelivery(entry.type, result, deliveryTrace, await readLivePersistence(uid, result.runId)));
         const cliLogAnalysis = cliLogs.finish();
+        checks.push({ name: 'tool-trace-bounded', pass: !toolTrace.overflow, detail: 'native tool trace retained within its bounded case budget' });
+        checks.push({ name: 'bridge-trace-bounded', pass: !bridgeTrace.overflow, detail: 'host tool outcomes retained within the bounded case budget' });
         checks.push({ name: 'cli-log-health', pass: cliLogAnalysis.passed, detail: `coverage=${cliLogAnalysis.analyzedLineCount}/${cliLogAnalysis.capturedLineCount}; warnings=${cliLogAnalysis.levelCounts.warn}; errors=${cliLogAnalysis.levelCounts.error}` });
         const passed = checks.every(check => check.pass);
         const failureKind = passed
@@ -375,6 +394,7 @@ async function runQualityBenchmark(
           checks,
           outputSha256: outputFingerprint(output),
           cliLogAnalysis,
+          bridgeEvidence: bridgeTrace,
           failureKind,
         });
         const failedChecks = checks.filter(check => !check.pass).map(check => check.name);
@@ -415,12 +435,13 @@ async function runQualityBenchmark(
   };
 
   if (!options.noSave) {
-    const resultsDir = path.join(pcRoot, 'eval', 'local-agents', 'results');
+    const resultsDir = path.join(pcRoot, 'test-results', 'local-agents');
     fs.mkdirSync(resultsDir, { recursive: true });
     const fileName = `local-agent-quality-${scorecardFileTimestamp(startedAt)}-${process.pid}.json`;
     const outputPath = path.join(resultsDir, fileName);
     fs.writeFileSync(outputPath, `${JSON.stringify(scorecard, null, 2)}\n`, 'utf8');
     process.stdout.write(`[local-agent-benchmark] scorecard: ${path.relative(pcRoot, outputPath)}\n`);
+    process.stdout.write(`report=${path.relative(pcRoot, outputPath)}\n`);
   } else {
     process.stdout.write('[local-agent-benchmark] scorecard not saved (--no-save)\n');
   }
@@ -433,17 +454,23 @@ async function runQualityBenchmark(
   }
 }
 
-async function main(): Promise<void> {
-  const args = parseLiveArgs(process.argv.slice(2));
+export async function main(argv = process.argv.slice(2)): Promise<number> {
+  const args = parseLiveArgs(argv);
   if (args.help) {
-    process.stdout.write(`${usage()}\n`);
-    return;
+    process.stdout.write(`${localAgentLiveUsage()}\n`);
+    return 0;
   }
+
+  if (!process.versions.electron) throw new Error('Local Agent live verification requires Electron. Use the npm local-agent entry.');
+  const { probeSqlite } = createRequire(import.meta.url)('./native-dependency-probe.cjs');
+  await probeSqlite(createRequire(import.meta.url));
+  process.stdout.write('[local-agent-live] native database and vector operations verified before model dispatch\n');
 
   const testDataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-local-agent-live-data-'));
   process.env.ORKAS_WORKSPACE_ROOT = testDataRoot;
   process.env.ORKAS_LOCAL_AGENT_TIMEOUT_MS ||= '180000';
   process.env.ORKAS_LOCAL_AGENT_IDLE_KILL_MS ||= '60000';
+  const dispatchedPids = new Set<number>();
 
   try {
     const registry = await import('../src/main/features/local_agents/registry.js');
@@ -460,72 +487,85 @@ async function main(): Promise<void> {
       applyManagedRuntimeEnv(entry);
       process.stdout.write(`  ✓ ${entry.type} ${entry.version || '(version unknown)'}\n`);
     }
-    if (args.installOnly) return;
+    if (args.installOnly) return 0;
 
-    const [{ activateUser }, { run }] = await Promise.all([
+    const [{ activateUser }, { run: runAgent }] = await Promise.all([
       import('../src/main/features/users.js'),
       import('../src/main/features/local_agents/runner.js'),
     ]);
+    const run: typeof runAgent = opts => runAgent({ ...opts, onEvent: event => {
+      if (event.type === 'process-info' && Number.isSafeInteger(event.pid) && Number(event.pid) > 0) dispatchedPids.add(Number(event.pid));
+      opts.onEvent(event);
+    } });
     const uid = 'u-local-agent-live';
     activateUser(uid);
+    if (args.lifecycle) {
+      const { runLiveLifecycleCanary } = await import('./local-agent-lifecycle.mjs');
+      const scorecard = await runLiveLifecycleCanary(entries, run, uid, testDataRoot, { fault: args.lifecycleFault || 'cancel' });
+      const resultsDir = path.join(pcRoot, 'test-results', 'local-agents');
+      if (!args.noSave) {
+        fs.mkdirSync(resultsDir, { recursive: true });
+        const fileName = `local-agent-lifecycle-${scorecardFileTimestamp(scorecard.startedAt)}-${process.pid}.json`;
+        fs.writeFileSync(path.join(resultsDir, fileName), `${JSON.stringify(scorecard, null, 2)}\n`);
+        process.stdout.write(`[local-agent-lifecycle] scorecard: test-results/local-agents/${fileName}\n`);
+        process.stdout.write(`report=test-results/local-agents/${fileName}\n`);
+      }
+      process.stdout.write(`${JSON.stringify(scorecard, null, 2)}\n`);
+      if (!scorecard.passed) throw new Error('real CLI lifecycle verification failed');
+      return 0;
+    }
     if (args.benchmark) {
       process.stdout.write(`\n[local-agent-benchmark] running pass@${args.k}...\n`);
       await runQualityBenchmark(entries, run, uid, testDataRoot, { k: args.k, noSave: args.noSave, scenarios: args.scenarios });
-      return;
+      return 0;
     }
-    const failures: string[] = [];
-
+    const startedAt = new Date().toISOString();
+    const smokeResults: any[] = [];
     for (const entry of entries) {
       const cwd = path.join(testDataRoot, `work-${entry.type}`);
       fs.mkdirSync(cwd, { recursive: true });
-      const eventCounts: Record<string, number> = {};
-      const eventTypes: string[] = [];
-      let terminalEvent: any = null;
+      const trace = createLiveDeliveryTrace();
+      const logs = createModelEvalLogCollector(`${entry.type}/smoke`);
+      let toolEvents = 0;
       process.stdout.write(`\n[local-agent-live] probing ${entry.type}...\n`);
       const result = await run({
-        uid,
-        cid: `c-live-${entry.type}`,
-        agentId: `a-live-${entry.type}`,
-        agentName: `Live ${entry.type} probe`,
-        currentMessageId: `trigger-live-${entry.type}`,
-        cli: entry.type,
+        uid, cid: `c-live-${entry.type}`, agentId: `a-live-${entry.type}`,
+        agentName: `Live ${entry.type} probe`, currentMessageId: `trigger-live-${entry.type}`,
+        cli: entry.type, ...liveRuntimeOverrides(entry.type),
         prompt: 'Do not call tools or access or modify files. Reply with exactly ORKAS_AGENT_OK and nothing else.',
-        cwd,
-        signal: new AbortController().signal,
+        cwd, signal: new AbortController().signal,
         onEvent: (event: any) => {
-          const type = String(event?.type || 'unknown');
-          eventCounts[type] = (eventCounts[type] || 0) + 1;
-          eventTypes.push(type);
-          if (type === 'done') terminalEvent = event;
+          observeLiveDeliveryEvent(trace, event);
+          ingestLocalAgentLogEvent(logs, event);
+          if (event.type === 'tool-event') toolEvents++;
         },
       });
-      const output = String(result.output || '').trim();
-      const protocolIssues = validateLiveProtocolTrace(entry.type, result, {
-        eventTypes,
-        terminalEvent,
-      });
-
-      if (result.status === 'completed' && output === 'ORKAS_AGENT_OK' && protocolIssues.length === 0) {
-        process.stdout.write(`  ✓ ${entry.type}: round-trip passed ${JSON.stringify(eventCounts)}\n`);
-      } else {
-        const failure = {
-          ...result,
-          stderrTail: typeof terminalEvent?.stderrTail === 'string' ? terminalEvent.stderrTail : '',
-        };
-        const kind = classifyLiveFailure(failure);
-        const baseDetail = summarizeLiveFailure(failure);
-        const detail = protocolIssues.length
-          ? `${baseDetail}; protocol=${protocolIssues.join(', ')}`
-          : baseDetail;
-        failures.push(`${entry.type} [${kind}]: ${detail}`);
-        process.stderr.write(`  ✗ ${entry.type} [${kind}]: ${detail}\n`);
-      }
+      const cliLogAnalysis = logs.finish();
+      const checks = [
+        ...scoreLiveDelivery(entry.type, result, trace, await readLivePersistence(uid, result.runId)),
+        { name: 'exact-round-trip', pass: result.status === 'completed' && String(result.output || '').trim() === 'ORKAS_AGENT_OK' },
+        { name: 'no-tools', pass: toolEvents === 0 },
+        { name: 'cli-log-health', pass: cliLogAnalysis.passed },
+      ];
+      const passed = checks.every(check => check.pass);
+      smokeResults.push({ agent: entry.type, version: entry.version, status: result.status, passed, checks, cliLogAnalysis });
+      process.stdout.write(`  ${passed ? '✓' : '✗'} ${entry.type}: round-trip ${passed ? 'passed' : 'failed'}${passed ? '' : ` checks=${checks.filter(check => !check.pass).map(check => check.name).join(',')}`}\n`);
     }
-
-    if (failures.length > 0) {
-      throw new Error(`local-agent live verification failed:\n${failures.map(item => `- ${item}`).join('\n')}`);
+    const scorecard = { kind: 'local-agent-smoke', startedAt, finishedAt: new Date().toISOString(),
+      passed: smokeResults.every(result => result.passed), results: smokeResults };
+    if (!args.noSave) {
+      const resultsDir = path.join(pcRoot, 'test-results', 'local-agents');
+      fs.mkdirSync(resultsDir, { recursive: true });
+      const name = `local-agent-smoke-${scorecardFileTimestamp(startedAt)}-${process.pid}.json`;
+      fs.writeFileSync(path.join(resultsDir, name), `${JSON.stringify(scorecard, null, 2)}\n`);
+      process.stdout.write(`[local-agent-live] scorecard: test-results/local-agents/${name}\n`);
+      process.stdout.write(`report=test-results/local-agents/${name}\n`);
     }
+    process.stdout.write(`${JSON.stringify(scorecard, null, 2)}\n`);
+    if (!scorecard.passed) throw new Error('local-agent live round-trip or delivery/log verification failed');
+    return 0;
   } finally {
+    await waitForLiveCliExit(dispatchedPids);
     // A just-exited CLI can keep its working directory briefly open on
     // Windows. Use Node's bounded rimraf retry instead of turning an otherwise
     // successful live benchmark into an EBUSY infrastructure failure.
@@ -538,7 +578,9 @@ async function main(): Promise<void> {
   }
 }
 
-void main().catch(error => {
-  process.stderr.write(`\n[local-agent-live] ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  void main().then(code => { process.exitCode = code; }).catch(error => {
+    process.stderr.write(`\n[local-agent-live] ${error instanceof Error ? error.message : 'verification failed'}\n`);
+    process.exitCode = 1;
+  });
+}

@@ -24,7 +24,7 @@ Do not include execution steps, tool names, implementation details, marketing cl
 
 When authoring or repairing a description, use the same compact routing index as SKILL.md frontmatter; aim for no more than 200 characters; exceed this target only when needed to preserve routing information, and keep it at or below 200 estimated tokens (the runtime’s local estimate). Use only the detail needed for complete routing; there is no minimum length and no need to pad. Runtime will preserve the complete description up to that token boundary and mark an omitted tail with `…`; when the roster exceeds its budget, lower-priority non-builtin entries are listed by name only and stay discoverable through `skill_search`. Do not depend on truncation. Preserve faithful imported descriptions unless the user asks for a rewrite.
 
-Use `<description>` for the current UI language. Emit `<description_zh>` and `<description_en>` only when the user explicitly asks for multilingual/bilingual descriptions; write each independently with equivalent routing signal.
+Description language: explicit description-language request, otherwise the current UI language; the chat's response language does not select it. Use `<description>` by default and `<description_zh>` / `<description_en>` for explicitly requested Chinese/English variants. When both are requested, keep their routing signal equivalent.
 
 ## Routing metadata tags
 

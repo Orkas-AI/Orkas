@@ -90,7 +90,11 @@ function createBridgeFetch(nativeFetch, bridgeUrl, bridgeToken) {
       throw new Error(`system fetch bridge failed: ${detail}`);
     }
     const responseMeta = decodeMeta(response.headers.get('x-orkas-fetch-meta'));
-    return new Response(response.body, {
+    // Lock the transport body into its own pipe before wrapping it. Undici's
+    // Response finalizer can cancel a shared, unlocked stream when the
+    // transport Response is collected before the caller reads this wrapper.
+    const body = response.body?.pipeThrough(new TransformStream()) ?? null;
+    return new Response(body, {
       status: responseMeta.status,
       statusText: responseMeta.statusText,
       headers: responseMeta.headers,

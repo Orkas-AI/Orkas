@@ -29,10 +29,9 @@ describe('atomic directory replacement', () => {
     return fs.readdirSync(root).filter((name) => name.startsWith('.installed-item.install-'));
   }
 
-  it('sweeps staging and backup leftovers of a dead replacement but never a live one', async () => {
-    // A crash between staging and activation leaves `.item.install-XXXX` and
-    // `.item.install-XXXX.previous` behind; they are dot-prefixed, so the
-    // install listings ignore them and their space was never reclaimed.
+  it('sweeps abandoned staging while preserving prior copies and live work', async () => {
+    // Directory presence cannot establish that a crashed replacement committed.
+    // Keep its prior copy even when an installed-looking target also exists.
     writeCurrent();
     for (const name of ['.installed-item.install-dead01', '.installed-item.install-dead01.previous', '.other.install-x9']) {
       fs.mkdirSync(path.join(root, name), { recursive: true });
@@ -58,10 +57,10 @@ describe('atomic directory replacement', () => {
     expect(errors).toEqual([]);
     expect(removed.map((item) => path.basename(item)).sort()).toEqual([
       '.installed-item.install-dead01',
-      '.installed-item.install-dead01.previous',
       '.other.install-x9',
     ]);
     expect(fs.existsSync(liveStaged)).toBe(true);
+    expect(fs.readFileSync(path.join(root, '.installed-item.install-dead01.previous', 'content.txt'), 'utf8')).toBe('stale');
     expect(fs.existsSync(path.join(root, '.hidden-but-not-ours'))).toBe(true);
     expect(fs.existsSync(path.join(root, '.installed-item.install-file'))).toBe(true);
     expect(fs.readFileSync(path.join(target, 'content.txt'), 'utf8')).toBe('working');
@@ -70,7 +69,7 @@ describe('atomic directory replacement', () => {
     await inFlight;
     expect(fs.readFileSync(path.join(target, 'content.txt'), 'utf8')).toBe('fresh');
     fs.rmSync(path.join(root, '.installed-item.install-file'));
-    expect(transactionArtifacts()).toEqual([]);
+    expect(transactionArtifacts()).toEqual(['.installed-item.install-dead01.previous']);
     // Missing parent: nothing to do, no throw.
     expect(await sweepStaleReplacementArtifacts(path.join(root, 'nope'))).toEqual([]);
   });
@@ -284,5 +283,65 @@ describe('atomic directory replacement', () => {
     expect(commit).not.toHaveBeenCalled();
     expect(fs.readFileSync(path.join(target, 'content.txt'), 'utf8')).toBe('working');
     expect(transactionArtifacts()).toEqual([]);
+  });
+
+  it('keeps the prior copy through maintenance when both rollback removal and quarantine fail', async () => {
+    writeCurrent('only durable draft');
+    const rm = nativeFs.promises.rm.bind(nativeFs.promises);
+    const rename = nativeFs.promises.rename.bind(nativeFs.promises);
+    let metadataRejected = false;
+    const denied = Object.assign(new Error('injected rollback denial'), { code: 'EACCES' });
+    const removeSpy = vi.spyOn(nativeFs.promises, 'rm').mockImplementation(async (file, options) => {
+      if (metadataRejected && String(file) === target) throw denied;
+      return rm(file, options);
+    });
+    const renameSpy = vi.spyOn(nativeFs.promises, 'rename').mockImplementation(async (from, to) => {
+      if (metadataRejected && String(from) === target) throw denied;
+      return rename(from, to);
+    });
+    syncBuiltinESMExports();
+    try {
+      await expect(replaceDirectoryAtomically(target, async staged => {
+        fs.writeFileSync(path.join(staged, 'uncommitted.txt'), 'rejected candidate');
+      }, async () => {
+        metadataRejected = true;
+        throw new Error('metadata rejected');
+      })).rejects.toThrow();
+    } finally {
+      removeSpy.mockRestore();renameSpy.mockRestore();syncBuiltinESMExports();
+    }
+    const backup = transactionArtifacts().find(name => name.endsWith('.previous'))!;
+    expect(fs.readFileSync(path.join(root, backup, 'content.txt'), 'utf8')).toBe('only durable draft');
+    expect(fs.existsSync(path.join(target, 'uncommitted.txt'))).toBe(true);
+    await sweepStaleReplacementArtifacts(root);
+    await sweepStaleReplacementArtifacts(root);
+    expect(fs.readFileSync(path.join(root, backup, 'content.txt'), 'utf8')).toBe('only durable draft');
+  });
+
+  it('distinguishes failed directory discovery from a missing parent', async () => {
+    const denied = Object.assign(new Error('injected directory read denial'), { code: 'EACCES' });
+    const spy = vi.spyOn(nativeFs.promises, 'readdir').mockRejectedValue(denied);
+    syncBuiltinESMExports();
+    try {
+      const onError = vi.fn();
+      expect(await sweepStaleReplacementArtifacts(root, onError)).toEqual([]);
+      expect(onError).toHaveBeenCalledWith(denied, root);
+      await expect(sweepStaleReplacementArtifacts(root)).rejects.toThrow(denied);
+    } finally {spy.mockRestore();syncBuiltinESMExports();}
+  });
+
+  it('reports an undeletable staging directory instead of silently swallowing its failure', async () => {
+    const artifact=path.join(root,'.installed-item.install-denied');
+    fs.mkdirSync(artifact);
+    const denied=Object.assign(new Error('injected staging cleanup denial'),{code:'EACCES'});
+    const spy=vi.spyOn(nativeFs.promises,'rm').mockRejectedValue(denied);
+    syncBuiltinESMExports();
+    try {
+      const onError=vi.fn();
+      expect(await sweepStaleReplacementArtifacts(root,onError)).toEqual([]);
+      expect(onError).toHaveBeenCalledWith(denied,artifact);
+      expect(fs.existsSync(artifact)).toBe(true);
+      await expect(sweepStaleReplacementArtifacts(root)).rejects.toThrow(denied);
+    } finally {spy.mockRestore();syncBuiltinESMExports();}
   });
 });

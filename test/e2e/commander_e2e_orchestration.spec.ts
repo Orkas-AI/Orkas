@@ -160,6 +160,65 @@ test.describe('Commander orchestration', () => {
   });
   }
 
+  test('sends a queued correction into the same handed-off Agent turn', async ({ modelOrkas }, testInfo) => {
+    const app = modelOrkas;
+    if (!app.page) throw new Error('Orkas renderer is unavailable');
+    const page = app.page;
+    const correction = 'Include the revised launch headline.';
+    app.setAgentHandoffScenario(CONTENT_WRITER_ID, 'Write the launch announcement.',
+      'E2E hand-off correction delivered.', { holdAgentReply: true });
+    await page.locator('#new-chat-btn').click();
+    await page.locator('#new-chat-input').fill('Hand the launch announcement to ContentWriter.');
+    await page.locator('#new-chat-send-btn').click();
+    await expect.poll(() => app.hasPendingAgentHandoffReply(), { timeout: 30_000 }).toBe(true);
+    await expect(page.locator('#chat-recipient-name')).toHaveText('ContentWriter');
+    const cid = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
+    expect(cid).toBeTruthy();
+    const tasks = async () => (await app.invoke<{ tasks: Array<{
+      task_id: string; status: string; assignee: string; created_by: string;
+      turn_id: string; result_msg_id?: string; absorbed_into_task_id?: string;
+    }> }>('groupChat.tasks.list', { cid })).tasks;
+    const original = (await tasks()).find(task => task.assignee === CONTENT_WRITER_ID && task.status === 'running')!;
+    expect(original).toBeTruthy();
+    await page.locator('#chat-input').fill(correction);
+    await page.locator('#chat-input').press('Enter');
+    const row = page.locator('#chat-task-board-list .chat-queue-item', { hasText: correction });
+    await expect(row).toBeVisible();
+    const sendNow = row.locator('[data-act="task-send-now"]');
+    await expect(sendNow).toBeVisible();
+    expect((await tasks()).some(task => task.status === 'queued' && task.created_by === 'user')).toBe(true);
+    await page.locator('#chat-task-board').screenshot({ path: testInfo.outputPath('handoff-send-now.png') });
+    await sendNow.click();
+    // Sending is a persisted chat action, not a model acknowledgement. Keep
+    // the provider held while checking the bubble and queue on both sides of
+    // a renderer reload; the existing inference boundary stays unchanged.
+    const bubble = page.locator('#chat-history .chat-message.user', { hasText: correction });
+    await expect(bubble).toHaveCount(1);
+    await expect(row).toHaveCount(0);
+    expect(app.hasPendingAgentHandoffReply()).toBe(true);
+    expect(app.modelRequests).toHaveLength(2);
+    await page.screenshot({ path: testInfo.outputPath('send-now-before-model-acceptance.png') });
+    await page.reload();
+    await expect(bubble).toHaveCount(1);
+    await expect(page.locator('#chat-task-board')).toBeHidden();
+    expect(app.hasPendingAgentHandoffReply()).toBe(true);
+    app.releaseAgentHandoffReply();
+    await expect.poll(() => app.modelRequests.length, { timeout: 20_000 }).toBe(3);
+    expect(JSON.stringify(app.modelRequests[2])).toContain(correction);
+    await expect.poll(() => app.hasPendingAgentHandoffReply()).toBe(true);
+    app.releaseAgentHandoffReply();
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
+    await expect(page.locator('#chat-history')).toContainText('E2E hand-off correction delivered.');
+    const settled = await tasks();
+    const primary = settled.find(task => task.task_id === original.task_id)!;
+    const update = settled.find(task => task.absorbed_into_task_id === original.task_id)!;
+    expect(primary).toMatchObject({ status: 'done', turn_id: original.turn_id });
+    expect(primary.result_msg_id).toBeTruthy();
+    expect(update).toMatchObject({ status: 'done', result_msg_id: primary.result_msg_id });
+    await expect(page.locator('#chat-task-board')).toBeHidden();
+    expect(app.modelRequests).toHaveLength(3);
+  });
+
   test('keeps a narration-free hand-off free of Commander placeholders while the Agent runs', async ({
     modelOrkas,
   }) => {

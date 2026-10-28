@@ -1,9 +1,12 @@
+import { normaliseSeedreamSize, normaliseGeminiImageSize, isSingleImageSeedream, UnsupportedImageSizeError } from './image_size';
+import { logErrorSummary, logPathRef } from '../util/log-redact';
+import { sanitizeLogTextForUpload } from '../util/log-sanitize';
 /**
  * Image generation — provider-agnostic dispatch on top of the existing
  * auth-profiles store.
  *
- * Two-step picker:
- *   1. `pickImageGenProfile()` walks the user's priority-ordered entry list,
+ * Ordered API-key candidates:
+ *   1. `listOpenImageGenCandidates()` walks the user's priority-ordered entry list,
  *      filters out OAuth (none of the OAuth surfaces we ship can reach image
  *      APIs — see auth.ts::listApiKeyEntries note), and returns the first
  *      entry whose provider is in `IMAGE_GEN_BY_PROVIDER`.
@@ -58,7 +61,8 @@ export function listOpenImageGenCandidates(): PickedImageGenProfile[] {
     const capability = findImageGenCapability(profile.provider);
     if (!capability) continue;
     const model = profile.model || capability.model;
-    if (!isImageProviderModelAllowed(profile.provider, model)) continue;
+    if (!isImageProviderModelAllowed(profile.provider, model)
+      && !(profile.provider === 'doubao' && model === 'doubao-seedream-5-0-lite-260128')) continue;
     const selectedCapability = { ...capability, model };
     out.push({
       entry: {
@@ -87,9 +91,7 @@ export function listOpenImageGenCandidates(): PickedImageGenProfile[] {
  *   1. The user's dedicated `imageProfiles` list (from the "Image
  *      Generation API Key" card in settings). First entry whose
  *      provider has a capability wins.
- *      Multiple entries on the same provider just shadow each other —
- *      first wins, no rotation (image gen calls are rare; rotation isn't
- *      worth the surprise factor).
+ *      Generation tries the usable dedicated rows in their saved order.
  *   2. Fallback: the chat `entries` list. If the user never set up a
  *      dedicated image key but happens to have an OpenAI/Google chat key,
  *      reuse it. Keeps existing setups working without forcing a re-config.
@@ -113,7 +115,7 @@ export interface GenerateImageInput {
   referenceImageUrls?: string[];
   referenceBindings?: ImageReferenceBinding[];
   negativePrompt?: string[];
-  /** Provider-side size hint. Default `1024x1024`. */
+  /** Provider size. Defaults: Seedream/Orkas 2k, Gemini auto, OpenAI 1024x1024. */
   size?: string;
   signal?: AbortSignal;
   onProgress?: ImageProgressReporter;
@@ -140,111 +142,136 @@ export type GenerateImageResult =
         | 'IO_ERROR'
         | 'BAD_INPUT';
       message: string;
+      /** False only when validation prevented every provider request. */
+      dispatched?: false;
     };
 
 export async function generateImage(input: GenerateImageInput): Promise<GenerateImageResult> {
-  throwIfAborted(input.signal);
+  try {
+    throwIfAborted(input.signal);
+  } catch (error) {
+    return { ok: false, errorCode: 'BAD_INPUT', message: errorMessage(error), dispatched: false };
+  }
   if (!input.prompt || !input.prompt.trim()) {
-    return { ok: false, errorCode: 'BAD_INPUT', message: 'prompt is required' };
+    return { ok: false, errorCode: 'BAD_INPUT', message: 'prompt is required', dispatched: false };
   }
   if (!input.outputAbsPath) {
-    return { ok: false, errorCode: 'BAD_INPUT', message: 'outputAbsPath is required' };
+    return { ok: false, errorCode: 'BAD_INPUT', message: 'outputAbsPath is required', dispatched: false };
   }
 
-  const picked = pickImageGenProfile();
-  if (!picked) {
+  const candidates = listOpenImageGenCandidates();
+  if (!candidates.length) {
     log.warn('image gen aborted: no api-key entry maps to an image-capable provider');
-    return { ok: false, errorCode: 'NO_CAPABLE_MODEL', message: t('image_gen.no_capable_model') };
+    return { ok: false, errorCode: 'NO_CAPABLE_MODEL', message: t('image_gen.no_capable_model'), dispatched: false };
   }
 
-  const { entry, capability } = picked;
   const refPaths = input.referenceImagePaths || [];
   const refUrls = input.referenceImageUrls || [];
+  const hasRefs = refPaths.length > 0 || refUrls.length > 0;
+  if (hasRefs) {
+    emitProgress(input.onProgress, 'prepare_references', 'Preparing image references', {
+      count: refPaths.length + refUrls.length,
+    });
+  }
 
-  if ((refPaths.length || refUrls.length) && !capability.supportsEdit) {
+  let adapterRes: AdapterResult | null = null;
+  let picked: PickedImageGenProfile | null = null;
+  let editUnsupported = '';
+  let lastProviderError = '';
+  let attempted = false;
+  for (const candidate of candidates) {
+    const { entry, capability } = candidate;
+    if (hasRefs && !capability.supportsEdit) {
+      editUnsupported = `Image model ${capability.model} does not support reference-image editing`;
+      continue;
+    }
+    let size = input.size || (capability.api === 'doubao' || capability.api === 'orkas' ? '2k'
+      : capability.api === 'gemini' ? 'auto' : '1024x1024');
+    try {
+      if (capability.api === 'doubao') size = normaliseSeedreamSize(size, capability.model);
+      if (capability.api === 'gemini') normaliseGeminiImageSize(size, capability.model);
+    } catch (error) {
+      if (!(error instanceof UnsupportedImageSizeError)) throw error;
+      // An incompatible fallback cannot overwrite the actual primary error.
+      if (attempted) continue;
+      return { ok: false, errorCode: 'BAD_INPUT', message: error.message, dispatched: false };
+    }
+    const adapterReq: AdapterRequest = {
+      apiKey: entry.apiKey,
+      model: capability.model,
+      prompt: input.prompt,
+      size,
+      signal: input.signal,
+      onProgress: input.onProgress,
+      usageContext: input.usageContext,
+      ...(refPaths.length ? { referenceImagePaths: refPaths } : {}),
+      ...(refUrls.length ? { referenceImageUrls: refUrls } : {}),
+    };
+    attempted = true;
+    try {
+      if (capability.api === 'openai') adapterRes = await callOpenAIImage(adapterReq);
+      else if (capability.api === 'gemini') adapterRes = await callGeminiImage(adapterReq);
+      else if (capability.api === 'doubao') adapterRes = await callDoubaoImage(adapterReq);
+      else if (capability.api === 'orkas') adapterRes = await callOrkasImage(adapterReq);
+      else return { ok: false, errorCode: 'BAD_INPUT', message: `Unknown image-gen api: ${capability.api}`, dispatched: false };
+      picked = candidate;
+      break;
+    } catch (err) {
+      if (err instanceof ImageGenerationDeliveryError) throw err;
+      const msg = (err as Error).message;
+      lastProviderError = msg;
+      throwIfAborted(input.signal);
+      // A public async request may have been accepted despite a lost response.
+      // Preserve its existing no-replay boundary rather than charging a fallback.
+      if (capability.api === 'orkas') return { ok: false, errorCode: 'PROVIDER_API_ERROR', message: sanitizeLogTextForUpload(msg) };
+      log.warn(`image gen API call failed (${entry.provider}/${capability.model}); trying next provider`, {
+        error: logErrorSummary(err),
+      });
+    }
+  }
+
+  if (!adapterRes || !picked) {
+    if (lastProviderError) {
+      return {
+        ok: false,
+        errorCode: 'PROVIDER_API_ERROR',
+        message: sanitizeLogTextForUpload(lastProviderError),
+      };
+    }
     return {
       ok: false,
       errorCode: 'EDIT_NOT_SUPPORTED',
-      message: `Image model ${capability.model} does not support reference-image editing`,
+      message: editUnsupported || 'No configured image model supports reference-image editing',
+      ...(attempted ? {} : { dispatched: false as const }),
     };
   }
 
-  let referenceBuffers: Buffer[] | undefined;
-  if (refPaths.length || refUrls.length) {
-    try {
-      referenceBuffers = await loadImageReferenceBuffersWithProgress(refUrls, refPaths, { signal: input.signal, onProgress: input.onProgress });
-    } catch (err) {
-      throwIfAborted(input.signal);
-      log.warn(`failed reading reference image: ${(err as Error).message}`);
-      return {
-        ok: false,
-        errorCode: 'IO_ERROR',
-        message: `Failed to read reference image: ${(err as Error).message}`,
-      };
-    }
-  }
-
-  const size = input.size || '1024x1024';
-  const adapterReq: AdapterRequest = {
-    apiKey: entry.apiKey,
-    model: capability.model,
-    prompt: input.prompt,
-    size,
-    onProgress: input.onProgress,
-    ...(input.signal ? { signal: input.signal } : {}),
-    ...(input.usageContext ? { usageContext: input.usageContext } : {}),
-    ...(referenceBuffers ? { referenceImages: referenceBuffers } : {}),
-  };
-
-  let adapterRes: AdapterResult;
-  try {
-    if (capability.api === 'openai') {
-      adapterRes = await callOpenAIImage(adapterReq);
-    } else if (capability.api === 'gemini') {
-      adapterRes = await callGeminiImage(adapterReq);
-    } else if (capability.api === 'doubao') {
-      adapterRes = await callDoubaoImage(adapterReq);
-    } else if (capability.api === 'orkas') {
-      adapterRes = await callOrkasImage(adapterReq);
-    } else {
-      return {
-        ok: false,
-        errorCode: 'BAD_INPUT',
-        message: `Unknown image-gen api: ${(capability as ImageGenCapability).api}`,
-      };
-    }
-  } catch (err) {
-    if (err instanceof ImageGenerationDeliveryError) throw err;
-    throwIfAborted(input.signal);
-    const msg = (err as Error).message;
-    log.error(`image gen API call failed (${entry.provider}/${capability.model}): ${msg}`);
-    return { ok: false, errorCode: 'PROVIDER_API_ERROR', message: msg };
-  }
-
-  throwIfAborted(input.signal);
-  adapterRes = validateImageAdapterResult(adapterRes);
-  emitProgress(input.onProgress, 'save_image', 'Saving generated image');
   let finalPath: string;
   try {
     finalPath = ensureExtension(input.outputAbsPath, adapterRes.mimeType);
+    emitProgress(input.onProgress, 'save_image', 'Saving generated image', { provider: picked.entry.provider });
+    throwIfAborted(input.signal);
     await fs.mkdir(path.dirname(finalPath), { recursive: true });
     throwIfAborted(input.signal);
     await fs.writeFile(finalPath, adapterRes.buffer);
-    registerGeneratedMediaUrl(finalPath, adapterRes.sourceUrl);
   } catch (err) {
     const msg = (err as Error).message;
-    log.error(`image write failed (${input.outputAbsPath}): ${msg}`);
+    log.error('image write failed', {
+      path: logPathRef(input.outputAbsPath),
+      error: logErrorSummary(err),
+    });
     return { ok: false, errorCode: 'IO_ERROR', message: `Failed to write image: ${msg}` };
   }
 
   log.info('image generated', {
-    provider: entry.provider,
-    model: capability.model,
-    path: finalPath,
+    provider: picked.entry.provider,
+    model: picked.capability.model,
+    path: logPathRef(finalPath),
     bytes: adapterRes.buffer.length,
     width: adapterRes.width,
     height: adapterRes.height,
   });
+  registerGeneratedMediaUrl(finalPath, adapterRes.sourceUrl);
 
   return {
     ok: true,
@@ -252,8 +279,8 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
     width: adapterRes.width,
     height: adapterRes.height,
     bytes: adapterRes.buffer.length,
-    provider: entry.provider,
-    model: capability.model,
+    provider: picked.entry.provider,
+    model: picked.capability.model,
     ...(adapterRes.sourceUrl ? { sourceUrl: adapterRes.sourceUrl } : {}),
   };
 }
@@ -266,6 +293,8 @@ export interface AdapterRequest {
   prompt: string;
   size: string;
   referenceImages?: Buffer[];
+  referenceImagePaths?: string[];
+  referenceImageUrls?: string[];
   signal?: AbortSignal;
   onProgress?: ImageProgressReporter;
   usageContext?: OrkasApiUsageContext;
@@ -286,12 +315,15 @@ export const IMAGE_MODELS_BY_PROVIDER: Readonly<Record<string, Array<{ id: strin
   ],
   openai: [
     { id: 'gpt-image-2', name: 'GPT Image 2' },
+    { id: 'gpt-image-2.5-flare', name: 'GPT Image 2.5 Flare' },
+    { id: 'gpt-image-2.5-sunburst', name: 'GPT Image 2.5 Sunburst' },
   ],
   google: [
+    { id: 'gemini-nano-banana-2.1', name: 'Nano Banana 2.1' },
     { id: 'gemini-3.1-flash-image-preview', name: 'Nano Banana 2' },
   ],
   doubao: [
-    { id: 'doubao-seedream-5-0-lite-260128', name: 'Seedream 5.0 Lite' },
+    { id: 'doubao-seedream-5-0-flash-260915', name: 'Seedream 5.0 Flash' },
     { id: 'doubao-seedream-5-0-pro-260628', name: 'Seedream 5.0 Pro' },
   ],
 };
@@ -377,6 +409,7 @@ function sleepWithSignal(ms: number, signal: AbortSignal): Promise<void> {
 
 export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult> {
   throwIfAborted(req.signal);
+  const referenceImages = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress }));
   const overall = composeAbortSignal(
     req.signal,
     ORKAS_IMAGE_TOTAL_TIMEOUT_MS,
@@ -397,8 +430,8 @@ export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult
           size: req.size === '1024x1024' ? '2k' : req.size,
           response_format: 'url',
           async: true,
-          ...(req.referenceImages?.length
-            ? { reference_images: req.referenceImages.map(orkasImageDataUrl) }
+          ...(referenceImages.length
+            ? { reference_images: referenceImages.map(orkasImageDataUrl) }
             : {}),
         }),
       },
@@ -454,7 +487,7 @@ export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult
 
 export async function callOpenAIImage(req: AdapterRequest): Promise<AdapterResult> {
   throwIfAborted(req.signal);
-  const referenceImages = (req.referenceImages || []);
+  const referenceImages = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress }));
   const hasRefs = referenceImages.length > 0;
   const url = hasRefs
     ? `${OPENAI_BASE}/v1/images/edits`
@@ -520,9 +553,11 @@ export async function callOpenAIImage(req: AdapterRequest): Promise<AdapterResul
 
 export async function callGeminiImage(req: AdapterRequest): Promise<AdapterResult> {
   throwIfAborted(req.signal);
-  const url = `${GEMINI_BASE}/v1beta/models/${encodeURIComponent(req.model)}:generateContent`;
+  const imageConfig = normaliseGeminiImageSize(req.size, req.model);
+  const upstreamModel = req.model === 'gemini-3.1-flash-image-preview' ? 'gemini-3.1-flash-image' : req.model;
+  const url = `${GEMINI_BASE}/v1beta/models/${encodeURIComponent(upstreamModel)}:generateContent`;
   const parts: unknown[] = [{ text: req.prompt }];
-  const referenceImages = (req.referenceImages || []);
+  const referenceImages = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress }));
   if (referenceImages.length) {
     for (const buf of referenceImages) {
       parts.push({
@@ -535,7 +570,7 @@ export async function callGeminiImage(req: AdapterRequest): Promise<AdapterResul
   }
   const body = JSON.stringify({
     contents: [{ parts }],
-    generationConfig: { responseModalities: ['IMAGE'] },
+    generationConfig: { responseModalities: ['IMAGE'], ...(imageConfig ? { imageConfig } : {}) },
   });
   emitProgress(req.onProgress, 'create_image', 'Calling Gemini image API', {
     provider: 'google',
@@ -599,48 +634,23 @@ export async function callGeminiImage(req: AdapterRequest): Promise<AdapterResul
 }
 
 /**
- * Volcengine Ark (Doubao) Seedream text-to-image + image-to-image (4.5+).
+ * Volcengine Ark (Doubao) Seedream 5.0 text-to-image + image-to-image.
  * Endpoint: POST /api/v3/images/generations, OpenAI-compatible request body.
- * Returns `{ data: [{ url: "..." }] }` by default (base64 also available
- * on request); we use the URL mode and re-fetch the bytes ourselves so
- * we don't bump into account-level base64 quotas.
+ * Returns `{ data: [{ b64_json: "..." }] }` when requested. Keep this
+ * adapter data-first so image generation behaves like OpenAI/Gemini.
  *
  * Image-to-image: add `image: string | string[]` to the body; each entry
- * is either a public HTTPS URL or a data URI
- * (`data:<mime>;base64,<b64>`). Local reference images are encoded as
- * data URIs uniformly.
+ * is either a public HTTPS URL or a data URI (`data:<mime>;base64,<b64>`).
+ * We normalise references to data URIs before sending.
  * Reference images + outputs total ≤ 15; the tool layer additionally
  * caps references to 4.
  *
- * Size note: Seedream 4.5's `size` does NOT accept arbitrary `WxH` like
- * OpenAI — the value must satisfy both:
- *   1. Pixels ≥ 3,686,400 (≈ 1920×1920).
- *   2. Form must be `WIDTHxHEIGHT` or one of the keywords
- *      `1k` / `2k` / `4k`.
- * Callers default to `1024x1024` (OpenAI-style), which is under
- * Seedream's lower bound, so we translate here: bump to `2k` when below
- * the pixel floor; pass through anything already large enough or
- * already a keyword. In image-to-image mode, when the caller hasn't
- * explicitly set a non-default size, we pass `adaptive` so the model
- * picks dimensions from the reference image, avoiding aspect-ratio
- * conflicts when forcing 2k.
+ * Ark size contracts differ by model: Lite uses 2K/3K/4K and
+ * [3,686,400, 16,777,216] pixels; Pro/Flash use 1K/1.5K/2K and
+ * [921,600, 4,624,220] pixels. All require aspect ratio [1/16,16].
+ * Preserve explicit supported sizes; Flash/Pro reject invalid sizes before I/O.
+ * Source: https://docs.volcengine.com/docs/ark/image-generation-api?lang=zh
  */
-const SEEDREAM_MIN_PIXELS = 3_686_400;
-const SEEDREAM_DEFAULT_SIZE = '1024x1024';
-
-function normaliseSeedreamSize(size: string): string {
-  const s = String(size || '').trim().toLowerCase();
-  if (!s) return '2k';
-  if (s === '1k' || s === '2k' || s === '4k' || s === 'adaptive') return s;
-  const m = s.match(/^(\d+)x(\d+)$/);
-  if (!m) return '2k';
-  const w = parseInt(m[1], 10);
-  const h = parseInt(m[2], 10);
-  if (!w || !h) return '2k';
-  if (w * h < SEEDREAM_MIN_PIXELS) return '2k';
-  return `${w}x${h}`;
-}
-
 function bufferToDataUri(buf: Buffer): string {
   const mime = detectMimeType(buf) || 'image/png';
   return `data:${mime};base64,${buf.toString('base64')}`;
@@ -648,9 +658,9 @@ function bufferToDataUri(buf: Buffer): string {
 
 export async function callDoubaoImage(req: AdapterRequest): Promise<AdapterResult> {
   throwIfAborted(req.signal);
-  const refs = (req.referenceImages || []);
+  const size = normaliseSeedreamSize(req.size, req.model);
+  const refs = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress }));
   const isEdit = refs.length > 0;
-  const size = isEdit && req.size === SEEDREAM_DEFAULT_SIZE ? 'adaptive' : normaliseSeedreamSize(req.size);
   const bodyObj: Record<string, unknown> = {
     model: req.model,
     prompt: req.prompt,
@@ -658,8 +668,8 @@ export async function callDoubaoImage(req: AdapterRequest): Promise<AdapterResul
     response_format: 'b64_json',
     output_format: 'jpeg',
     watermark: false,
-    sequential_image_generation: 'disabled',
   };
+  if (!isSingleImageSeedream(req.model)) bodyObj.sequential_image_generation = 'disabled';
   if (isEdit) {
     const dataUris = refs.map(bufferToDataUri);
     bodyObj.image = dataUris.length === 1 ? dataUris[0] : dataUris;

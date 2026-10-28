@@ -340,6 +340,40 @@ describe('Lark user journeys against the pinned official command contract', () =
 // installs software, opens real profiles, reads credentials, or calls business APIs.
 const nativeCli = process.env.ORKAS_TEST_LARK_CLI_BIN;
 describe.skipIf(!nativeCli)('installed official Lark CLI compatibility canary', () => {
+  it('passes download path validation outside configuration with the same native binary and parameters', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-lark-download-canary-'));
+    const config = path.join(root, 'config');
+    const work = path.join(config, 'work');
+    const staging = path.join(root, 'download');
+    fs.mkdirSync(work, { recursive: true });
+    fs.mkdirSync(staging);
+    fs.writeFileSync(path.join(config, 'config.json'), JSON.stringify({
+      currentApp: 'contract-profile', apps: [{ name: 'contract-profile', appId: 'cli_fixture', appSecret: 'fixture-only', brand: 'feishu' }],
+    }));
+    const env = { ...envFor(config), LARKSUITE_CLI_CONFIG_DIR: config };
+    const parameters = { message_id: 'om_0123456789abcdef0123456789abcdef', file_key: 'file_fixture', type: 'file' };
+    const args = ['im', '+messages-resources-download', '--message-id', parameters.message_id,
+      '--file-key', parameters.file_key, '--type', parameters.type, '--profile', 'contract-profile', '--format', 'json', '--dry-run'];
+    try {
+      // Negative control reproduces the upstream denylist, without credentials or network.
+      const blocked = spawnSync(nativeCli!, args, { cwd: work, env, encoding: 'utf8', timeout: 10_000 });
+      expect(blocked.status).toBe(2);
+      expect(JSON.parse(blocked.stderr || blocked.stdout).error).toMatchObject({ type: 'validation', subtype: 'invalid_argument', param: '--output' });
+      const runner = (_command: string, argv: string[], options: any) => {
+        const cliArgs = argv.slice(4);
+        return spawnSync(nativeCli!, cliArgs.includes('--help') ? cliArgs : [...cliArgs, '--dry-run'], {
+          cwd: options.cwd, env: options.env, encoding: 'utf8', timeout: 10_000,
+        });
+      };
+      const result = await adapter.callTool('execute_write', { action: 'im.+messages-resources-download', parameters }, {
+        runner, skipPackageIntegrityCheck: true, localFileOutputDirectory: staging,
+      }, env);
+      expect(result.result).toMatchObject({ ok: true, dry_run: true });
+      expect(fs.readdirSync(work)).toEqual([]);
+      expect(fs.readdirSync(staging)).toEqual([]);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('matches frozen discovery/help/schema contracts in an isolated configuration', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-lark-canary-'));
     try {

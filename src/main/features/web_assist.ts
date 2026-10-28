@@ -269,7 +269,10 @@ function directWebAssistAddress(value: string): string | null {
   const normalized = safeWebAssistUrl(`https://${value}`);
   if (!normalized) return null;
   const hostname = new URL(normalized).hostname.replace(/^\[|\]$/gu, '').toLowerCase();
-  if (hostname === 'localhost') return normalized;
+  if (hostname === 'localhost' || hostname === '::1' || /^127(?:\.\d{1,3}){3}$/u.test(hostname)) {
+    // Reparse the input so an explicit :443 survives HTTPS default-port normalization.
+    return safeWebAssistUrl(`http://${value}`);
+  }
   if (hostname.includes(':')) return normalized;
   if (/^\d{1,3}(?:\.\d{1,3}){3}$/u.test(hostname)) return normalized;
   return hostname.includes('.') ? normalized : null;

@@ -655,7 +655,7 @@ async function _startDcrOAuth(
     };
     _pending = pending;
     shell.openExternal(authUrl.toString()).catch(() => {
-      if (_pending === pending) _cancelPending('failed to open authorization browser');
+      if (_pending === pending) _cancelPending('failed to open authorization browser', 'browser_open_failed');
     });
   });
 }

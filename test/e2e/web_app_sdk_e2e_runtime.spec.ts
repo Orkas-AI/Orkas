@@ -709,9 +709,10 @@ test('new ordinary apps isolate browser data across objects and accounts while r
   const entry = orkas.createWorkspaceFile('browser-data/index.html', '<!doctype html><h1>Browser data</h1><script src="__orkas/bridge.js"></script>');
   const saved: any[] = [];
   for (const title of ['First', 'Second', 'Legacy']) {
-    const app: any = await orkas.invoke('savedApps.saveFromPath', { path: entry, title });
+    const app: any = await orkas.invoke('savedApps.saveFromPath', { path: entry, title, mode: 'new' });
     expect(app.ok).toBe(true); saved.push(app);
   }
+  expect(new Set(saved.map(app => app.id)).size).toBe(3);
   const oldMeta = path.join(orkas.workspaceRoot, 'account-e2e/cloud/saved_apps', saved[2].id, '__orkas-meta.json');
   const metadata = JSON.parse(readFileSync(oldMeta, 'utf8')); delete metadata.browserStorage;
   writeFileSync(oldMeta, JSON.stringify(metadata));
@@ -851,7 +852,7 @@ test('historical web artifacts cannot submit conversation tasks with a forged lo
   const cid = task.conversation.conversation_id, artifactId = 'web-submit-test';
   const dir = path.join(orkas.workspaceRoot, 'account-e2e/cloud/chat_artifacts', cid, artifactId);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, 'index.html'), '<h1>Never execute historical web output</h1>');
+  writeFileSync(path.join(dir, 'index.html'), '<h1>Historical browser app</h1>');
   writeFileSync(path.join(dir, '__orkas-meta.json'), JSON.stringify({ appType: 'web', title: 'Web output', entry: 'index.html' }));
   await orkas.page.evaluate(({ cid, artifactId }) => {
     const host = document.createElement('div'); host.id = 'web-submit-test'; document.body.append(host);
@@ -859,12 +860,15 @@ test('historical web artifacts cannot submit conversation tasks with a forged lo
     (window as any).sendInCurrentConversation = () => { (window as any).unexpectedSubmissions++; };
     (window as any).renderChatArtifact(host, { cid, artifactId, agentId: 'commander' });
   }, { cid, artifactId });
-  await expect(orkas.page.locator('#web-submit-test')).toContainText('commercial version');
   const iframe = orkas.page.locator('#web-submit-test iframe');
-  await expect(iframe).not.toHaveAttribute('src');
+  await expect(iframe.contentFrame().locator('body')).toContainText('Historical browser app');
+  await expect(iframe).toHaveAttribute('src', /^chat-app:/);
   await iframe.evaluate(node => { (node as HTMLElement).dataset.appType = 'local'; });
   expect(await iframe.evaluate(node => (window as any).OrkasWebAppHost.canSubmitArtifact(node))).toBe(false);
-  expect(await orkas.invoke('webApps.open', { source: { cid, artifactId } })).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED' });
+  const reopened: any = await orkas.invoke('webApps.open', { source: { cid, artifactId } });
+  expect(reopened).toMatchObject({ ok: true, token: expect.any(String) });
+  expect(await orkas.invoke('webApps.canSubmitArtifact', { token: reopened.token })).toMatchObject({ ok: true, allowed: false });
+  await orkas.invoke('webApps.close', { token: reopened.token });
   expect(await orkas.page.evaluate(() => (window as any).unexpectedSubmissions)).toBe(0);
   expect(orkas.modelRequests).toHaveLength(0);
 });

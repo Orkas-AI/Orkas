@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createRequire } from 'node:module';
 import * as path from 'node:path';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 
 const requireCjs = createRequire(import.meta.url);
 
@@ -56,6 +58,37 @@ function loadAdapter(): Adapter {
   const full = path.join(process.cwd(), 'bin', 'composio-mcp-server.cjs');
   delete requireCjs.cache[full];
   return requireCjs(full) as Adapter;
+}
+
+
+// Execute the actual entrypoint registration with only the MCP transport boundary replaced.
+// The handler, dispatcher, HTTP request and AbortSignal composition remain real adapter code.
+function loadMcpHandlers() {
+  type Handler = (request: any, extra: { signal: AbortSignal }) => Promise<Record<string, unknown>>;
+  const handlers = new Map<unknown, Handler>();
+  const schemas = requireCjs('@modelcontextprotocol/sdk/types.js');
+  class ServerBoundary {
+    setRequestHandler(schema: unknown, handler: Handler) { handlers.set(schema, handler); }
+    async connect() {}
+  }
+  const entryModule = { exports: {} };
+  const entryRequire = Object.assign((name: string) => {
+    if (name === './proxy-bootstrap.cjs') return {};
+    if (name === '@modelcontextprotocol/sdk/server/index.js') return { Server: ServerBoundary };
+    if (name === '@modelcontextprotocol/sdk/server/stdio.js') return { StdioServerTransport: class {} };
+    return requireCjs(name);
+  }, { main: entryModule });
+  runInNewContext(readFileSync(path.join(process.cwd(), 'bin/composio-mcp-server.cjs'), 'utf8'), {
+    require: entryRequire, module: entryModule,
+    process: { env: process.env, exit: vi.fn() }, console,
+    fetch: globalThis.fetch, AbortSignal,
+  });
+  expect(handlers.has(schemas.CallToolRequestSchema)).toBe(true);
+  expect(handlers.has(schemas.ListToolsRequestSchema)).toBe(true);
+  return {
+    call: handlers.get(schemas.CallToolRequestSchema)!,
+    list: handlers.get(schemas.ListToolsRequestSchema)!,
+  };
 }
 
 describe('Composio stdio proxy adapter', () => {
@@ -232,5 +265,78 @@ describe('Composio stdio proxy adapter', () => {
     expect(JSON.stringify(result)).toContain('connector_proxy_failed');
     expect(JSON.stringify(result)).not.toContain('alice@example.com');
     expect(JSON.stringify(result)).not.toContain('confidential provider failure');
+  });
+
+  it('forwards caller cancellation through the dispatcher to the one HTTP request', async () => {
+    configureAdapterEnv();
+    let observed!: AbortSignal;
+    const fetchMock = vi.fn((_url, options) => {
+      observed = options.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        observed.addEventListener('abort', () => reject(observed.reason), { once: true });
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+    const pending = loadAdapter().callComposioTool('GMAIL_SEND_EMAIL', {}, undefined, controller.signal);
+    void pending.catch(() => {});
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(observed.aborted).toBe(false);
+    controller.abort();
+    expect(observed.aborted).toBe(true);
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('propagates the actual registered MCP handler cancellation to fetch without replay', async () => {
+    configureAdapterEnv();
+    let observed!: AbortSignal;
+    const fetchMock = vi.fn((_url, options) => {
+      observed = options.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        observed.addEventListener('abort', () => reject(observed.reason), { once: true });
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+    const pending = loadMcpHandlers().call({ params: { name: 'SHOP_CREATE_REFUND', arguments: { amount: 12.5 } } }, { signal: controller.signal });
+    void pending.catch(() => {});
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(observed.aborted).toBe(false);
+    controller.abort();
+    expect(observed.aborted).toBe(true);
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      tool_slug: 'SHOP_CREATE_REFUND', arguments: { amount: 12.5 },
+    });
+  });
+
+  it.each([0, 1])('accepts whitespace keepalive plus terminal envelope code=%i using the long-call opt-in', async (code) => {
+    configureAdapterEnv();
+    const terminal = code ? {
+      code, error: { code: 'composio_upstream_timeout', message: 'Action timed out' },
+    } : { code, result: { ok: true } };
+    const fetchMock = vi.fn(async () => new Response(` \n \n${JSON.stringify(terminal)}`, { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await loadMcpHandlers().call({ params: { name: 'GMAIL_FETCH_EMAILS', arguments: { query: 'inbox' } } }, { signal: new AbortController().signal });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][1].headers).toMatchObject({
+      'Orkas-Composio-Long-Call': '1',
+      Authorization: 'Bearer orkas-user-key',
+      'X-Orkas-Connection-Token': 'a'.repeat(43),
+    });
+    if (code) expect(result).toEqual({ isError: true, content: [{ type: 'text', text: JSON.stringify({ error_code: 'composio_upstream_timeout', message: 'Action timed out' }) }] });
+    else expect(result).toEqual({ content: [{ type: 'text', text: JSON.stringify({ ok: true }, null, 2) }] });
+  });
+
+  it('keeps tools/list on the ordinary request path without the execution opt-in', async () => {
+    configureAdapterEnv();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ code: 0, tools: [] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(loadMcpHandlers().list({}, { signal: new AbortController().signal })).resolves.toEqual({ tools: [] });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][0]).toBe('https://orkas.example/api/connectors/composio/tools');
+    expect(fetchMock.mock.calls[0][1].headers).not.toHaveProperty('Orkas-Composio-Long-Call');
   });
 });

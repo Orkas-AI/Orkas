@@ -102,6 +102,45 @@ describe('installed dependency drift guard', () => {
     }
   });
 
+  it('detects stale nested dependencies even when the direct package matches', () => {
+    const root = fakeProject({
+      declared: { alpha: '^1.0.0' },
+      lock: { alpha: { version: '1.2.0' }, 'alpha/node_modules/beta': { version: '2.1.0' } },
+      installed: { alpha: '1.2.0', 'alpha/node_modules/beta': '2.0.0' },
+    });
+    try {
+      expect(installedDependencyDrift(root).drifted).toEqual([
+        { name: 'alpha/node_modules/beta', expected: '2.1.0', installed: '2.0.0' },
+      ]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('reports a missing required hoisted transitive package', () => {
+    const root = fakeProject({
+      declared: { alpha: '^1.0.0' },
+      lock: { alpha: { version: '1.2.0' }, beta: { version: '2.1.0' } },
+      installed: { alpha: '1.2.0' },
+    });
+    try {
+      expect(installedDependencyDrift(root).drifted).toEqual([
+        { name: 'beta', expected: '2.1.0', installed: null },
+      ]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('checks an installed optional dependency while allowing an absent platform optional', () => {
+    const root = fakeProject({
+      declared: { alpha: '^1.0.0' },
+      lock: { alpha: { version: '1.2.0' }, beta: { version: '2.1.0', optional: true }, gamma: { version: '3.0.0', optional: true } },
+      installed: { alpha: '1.2.0', beta: '2.0.0' },
+    });
+    try {
+      expect(installedDependencyDrift(root).drifted).toEqual([
+        { name: 'beta', expected: '2.1.0', installed: '2.0.0' },
+      ]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   // The runner calls this on every invocation, so the real tree must be clean —
   // otherwise every test run in this repository starts with a false alarm.
   it('finds no drift in the checked-in project itself', () => {

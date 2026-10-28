@@ -53,6 +53,7 @@ let storage: typeof import('../../../../src/main/storage');
 const cids: string[] = [];
 let onRequest: ((body: Record<string, any>) => void) | undefined;
 const unexpectedRequests: string[] = [];
+let nativeEsmHooks: { deregister(): void } | null = null;
 
 function completeCliDispatch(opts: any): void {
   // External CLI startup/network timing belongs to that executable. The host budget
@@ -79,6 +80,10 @@ function modelResponse(): Response {
 
 beforeAll(async () => {
   // Vitest's source transformation is harness startup, outside the loaded-app send budget.
+  const require = createRequire(import.meta.url);
+  // Match bootstrap.cjs: native SDK leaves use the production resolver, while
+  // TypeScript stays with the test loader. This does not preload an API.
+  nativeEsmHooks = require('../../../../src/main/util/native-esm-loader.js').registerNativeEsmLoader();
   const { installSdkTimeoutPatch } = await import('../../../../src/main/model/core-agent/sdk-timeout-patch');
   installSdkTimeoutPatch();
   // SDK 1.2 loads this transport lazily. Compile its module graph alongside
@@ -93,9 +98,13 @@ beforeAll(async () => {
   // separate ESM graph would otherwise recompile the bus on the first send.
   // No send is warmed up. Fixtures are written after module loading, so their
   // first reads and all request preparation remain inside the budget.
-  const require = createRequire(import.meta.url);
   require('../../../../src/main/features/packages');
   require('../../../../src/main/features/group_chat/bus');
+  // main/index.ts imports these features before the window is ready. Their
+  // cycle-breaking CJS reads must not compile a second graph inside the send
+  // timer. Keep provider APIs lazy: their real first-use cost stays measured.
+  require('../../../../src/main/features/skills');
+  require('../../../../src/main/features/auto_tasks');
   [chats, groupChat, bus, state, paths, storage] = await Promise.all([
     import('../../../../src/main/features/chats'),
     import('../../../../src/main/features/group_chat'),
@@ -137,6 +146,7 @@ afterEach(async () => {
 
 afterAll(async () => {
   await drainMainRuntimeForTest();
+  nativeEsmHooks?.deregister();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
 });

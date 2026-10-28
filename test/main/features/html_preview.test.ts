@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ARTIFACT_FRAME } from '../../../src/main/features/chat_artifacts';
 import { chatMediaLocalPathFromUrl, chatMediaLocalUrl } from '../../../src/main/util/chat-media-url';
@@ -54,6 +54,7 @@ function fakeRuntime(options: {
   downloadCandidate?: boolean;
   downloadObserved?: boolean;
   downloadBytes?: number;
+  downloadUrl?: string;
   keyboardFocusIndicator?: boolean;
   controlsExercised?: number;
   stateChangesObserved?: number;
@@ -75,7 +76,7 @@ function fakeRuntime(options: {
   deps: HtmlPreviewRuntimeDeps;
   evidenceScripts: string[];
   windows: Array<{ options: Record<string, any>; destroyed: boolean }>;
-  requestDecisions: Array<{ url: string; cancel: boolean }>;
+  requestDecisions: Array<{ url: string; cancel: boolean; redirectURL?: string }>;
   permissionDecisions: {
     check: boolean[];
     request: boolean[];
@@ -90,7 +91,7 @@ function fakeRuntime(options: {
   registeredProtocolHandlers: Array<(request: Request) => Response | Promise<Response>>;
 } {
   const windows: Array<{ options: Record<string, any>; destroyed: boolean }> = [];
-  const requestDecisions: Array<{ url: string; cancel: boolean }> = [];
+  const requestDecisions: Array<{ url: string; cancel: boolean; redirectURL?: string }> = [];
   const permissionDecisions = {
     check: [] as boolean[],
     request: [] as boolean[],
@@ -104,7 +105,7 @@ function fakeRuntime(options: {
   const evidenceScripts: string[] = [];
   const protocolHandlers = new Map<string, (request: Request) => Response | Promise<Response>>();
   const registeredProtocolHandlers: Array<(request: Request) => Response | Promise<Response>> = [];
-  let requestHandler: ((details: { url: string }, callback: (decision: { cancel: boolean }) => void) => void) | undefined;
+  let requestHandler: ((details: { url: string }, callback: (decision: { cancel: boolean; redirectURL?: string }) => void) => void) | undefined;
   const sessionListeners = new Map<string, Function>();
   let tabKeyDowns = 0;
 
@@ -142,7 +143,7 @@ function fakeRuntime(options: {
               sessionListeners.get('will-download')?.(
                 { preventDefault: () => undefined },
                 {
-                  getURL: () => 'blob:file-preview',
+                  getURL: () => options.downloadUrl ?? 'blob:file-preview',
                   getFilename: () => 'resume.txt',
                   getMimeType: () => 'text/plain',
                   getTotalBytes: () => options.downloadBytes ?? 128,
@@ -199,7 +200,7 @@ function fakeRuntime(options: {
       requestHandler?.({ url }, (decision) => requestDecisions.push({ url, cancel: decision.cancel }));
       if (options.loadFailure) throw new Error('synthetic preview load failure');
       for (const extra of options.extraRequests ?? []) {
-        requestHandler?.({ url: extra }, (decision) => requestDecisions.push({ url: extra, cancel: decision.cancel }));
+        requestHandler?.({ url: extra }, (decision) => requestDecisions.push({ url: extra, ...decision }));
       }
       if (options.externalRequest) {
         const external = 'https://example.invalid/tracker.png';
@@ -479,6 +480,28 @@ describe('responsive HTML preview renderer', () => {
       ]);
   });
 
+  it('serves only the host artifact bridge virtually while retaining local containment', async () => {
+    const bridgeUrl = pathToFileURL(path.join(fs.realpathSync(root), '__orkas', 'bridge.js')).href;
+    const outside = pathToFileURL(path.join(root, '..', 'private.html')).href;
+    const runtime = fakeRuntime({ extraRequests: [bridgeUrl, outside] });
+    await renderResponsiveHtmlPreview(path.join(root, 'index.html'), viewports, runtime.deps,
+      { bridgeJavaScript: 'window.orkasArtifact = { send() {} };' });
+    const bridge = runtime.requestDecisions.find(item => item.url === bridgeUrl)!;
+    expect(bridge.cancel).toBe(false);
+    const handler = runtime.registeredProtocolHandlers[0];
+    const response = await handler(new Request(bridgeUrl));
+    expect(response.headers.get('Content-Type')).toBe('text/javascript; charset=utf-8');
+    expect(await response.text()).toBe('window.orkasArtifact = { send() {} };');
+    expect((await handler(new Request(outside))).status).toBe(403);
+    const entry = await handler(new Request(pathToFileURL(path.join(root, 'index.html')).href));
+    expect(entry.headers.get('Content-Type')).toBe('text/html; charset=utf-8');
+    expect(await entry.text()).toContain('<main>Preview</main>');
+    expect(runtime.protocolHandlers.has('file')).toBe(false);
+    expect(runtime.requestDecisions.find(item => item.url === outside)).toMatchObject({ cancel: true });
+    expect(fs.existsSync(path.join(root, '__orkas'))).toBe(false);
+    expect(runtime.sessionCleanup).toEqual({ cache: true, storage: true });
+  });
+
   it('records observed download metadata and rejects a download control that produces nothing', async () => {
     const observed = fakeRuntime({ downloadCandidate: true, downloadObserved: true });
     const passed = await renderResponsiveHtmlPreview(
@@ -522,6 +545,37 @@ describe('responsive HTML preview renderer', () => {
     expect(emptyPayload.evidence.blockers).toContain(
       '1 observed download(s) lacked a filename, MIME type, or non-empty payload',
     );
+  });
+
+  it.each([
+    ['data:text/plain;charset=utf-8,%E7%AE%80%E5%8E%86%0AResume', 13],
+    ['data:application/octet-stream,%00%FF%01', 3],
+    ['data:text/plain;base64,UmVzdW1l', 6],
+    ['data:text/plain,', 0],
+    ['data:text/plain;base64,', 0],
+    ['data:text/plain;base64,%%%%', 0],
+  ])('measures inline download bytes when Electron has not reported a length: %s', async (downloadUrl, expectedBytes) => {
+    const runtime = fakeRuntime({ downloadCandidate: true, downloadObserved: true, downloadBytes: 0, downloadUrl });
+    const result = await renderResponsiveHtmlPreview(path.join(root, 'index.html'), viewports, runtime.deps);
+    expect(result.evidence.interactions.downloads[0]).toMatchObject({ totalBytes: expectedBytes, urlKind: 'data' });
+    expect(result.evidence.ok).toBe(expectedBytes > 0);
+  });
+
+  it('does not fetch remote downloads or decode oversized inline payloads to infer an unknown length', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    try {
+      for (const downloadUrl of [
+        'https://example.invalid/private-download',
+        'data:text/plain,' + 'x'.repeat(2 * 1024 * 1024),
+      ]) {
+        const runtime = fakeRuntime({ downloadCandidate: true, downloadObserved: true, downloadBytes: 0, downloadUrl });
+        const result = await renderResponsiveHtmlPreview(path.join(root, 'index.html'), viewports, runtime.deps);
+        expect(result.evidence.interactions.downloads[0].totalBytes).toBe(0);
+        expect(fetchSpy).not.toHaveBeenCalled();
+      }
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it('rejects keyboard traversal when focused controls have no visible indicator', async () => {

@@ -148,23 +148,27 @@ describe('todo_tasks tool', () => {
     expect(statusValues).toEqual(['todo', 'progress', 'review', 'done']);
   });
 
-  it('explains unconfirmed shared sync states in every project variant within the description budget', () => {
-    // Shared task views carry sync_state; without its meaning a model may retry a
-    // status change on a conflicted task or report an unsynced edit as shared.
+  it('names the global to-do list on the selector parameter and only there', () => {
+    // Outside a project the open-work block is absent when there are no open
+    // to-dos, so the schema is the only place a Commander can learn that the
+    // account's global list is addressed as "__global__".
+    const selector = createProjectTasksTool({
+      listProjects: async () => [],
+      resolveProject: async () => ({ ok: false, error: 'project_not_found' }),
+    } as any);
+    const projectField = (selector.inputSchema as any).properties.project;
+    expect(projectField.description).toContain('"__global__"');
+    expect(projectField.description).toMatch(/global to-do list/);
+    expect(projectField.description).toContain('list_projects');
+    // A bound project session cannot retarget scope, so it advertises no
+    // selector; the fixed global executor keeps only the legacy enum.
     const { handler } = stubHandler();
-    const variants = {
-      bound: createProjectTasksTool(handler),
-      readOnly: createProjectTasksTool(handler, { readOnly: true }),
-      selector: createProjectTasksTool({ listProjects: async () => [], resolveProject: async () => ({ ok: false, error: 'project_not_found' }) } as any),
-    };
-    for (const [name, tool] of Object.entries(variants)) {
-      for (const term of ['sync_state', 'pending/retry', 'conflict', 'status_conflict']) {
-        expect(tool.description, name).toContain(term);
-      }
-      expect(estimateTextTokens(tool.description.replace(/\s+/g, ' ').trim()), name)
-        .toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
-    }
+    expect((createProjectTasksTool(handler).inputSchema as any).properties).not.toHaveProperty('project');
+    const fixedGlobal = (createProjectTasksTool(handler, { globalScope: true }).inputSchema as any).properties.project;
+    expect(fixedGlobal).toEqual({ type: 'string', enum: ['__global__'] });
   });
+
+
 
   it('completes once with redundant done status but rejects a conflicting status', async () => {
     const { handler, calls } = stubHandler();

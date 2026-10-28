@@ -13,9 +13,8 @@ function loadProjectsRenderer(options: {
 }) {
   const setViewCalls: any[] = [];
   const refreshAutoProjectCalls: string[] = [];
-  const monitorClicks: any[] = [];
-  const monitorEvents: any[] = [];
-  const monitorErrors: any[] = [];
+  const invokeCalls: any[] = [];
+  const alerts: any[] = [];
   const context: any = {
     console,
     setTimeout,
@@ -26,15 +25,10 @@ function loadProjectsRenderer(options: {
     conversations: [],
     _projectDetailPid: '',
     createLogger: () => ({ warn() {}, info() {}, error() {}, debug() {} }),
-    Monitor: {
-      click: (name: string, payload: any) => monitorClicks.push({ name, payload }),
-      event: (name: string, payload: any) => monitorEvents.push({ name, payload }),
-      error: (name: string, payload: any) => monitorErrors.push({ name, payload }),
-    },
     escapeHtml: (value: unknown) => String(value ?? ''),
     t: (key: string) => key,
     uiConfirmDanger: async () => true,
-    uiAlert: async () => undefined,
+    uiAlert: async (message: any) => { alerts.push(message); },
     setView: (view: string, id?: string | null, opts?: any) => {
       setViewCalls.push({ view, id, opts });
       context.currentView = view;
@@ -57,11 +51,11 @@ function loadProjectsRenderer(options: {
     },
     window: {
       addEventListener() {},
-      Monitor: true,
       uiIconHtml: () => '',
       refreshAutoProjectOptions: (pid: string) => { refreshAutoProjectCalls.push(pid); },
       orkas: {
         invoke: async (channel: string) => {
+          invokeCalls.push({ channel });
           if (channel === 'autoTasks.list') return { tasks: [] };
           if (channel === 'projects.delete') return { ok: true };
           if (channel === 'projects.create') {
@@ -85,9 +79,8 @@ function loadProjectsRenderer(options: {
   };
   context.__setViewCalls = setViewCalls;
   context.__refreshAutoProjectCalls = refreshAutoProjectCalls;
-  context.__monitorClicks = monitorClicks;
-  context.__monitorEvents = monitorEvents;
-  context.__monitorErrors = monitorErrors;
+  context.__invokeCalls = invokeCalls;
+  context.__alerts = alerts;
   vm.createContext(context);
   const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/projects.js'), 'utf8');
   vm.runInContext(source, context);
@@ -245,7 +238,7 @@ describe('project delete navigation', () => {
     expect(context.__refreshAutoProjectCalls).toEqual(['p1']);
   });
 
-  it('keeps a successful delete authoritative when post-mutation refresh fails without PC telemetry', async () => {
+  it('keeps a successful delete authoritative when post-mutation refresh fails', async () => {
     const context = loadProjectsRenderer({
       afterProjects: [],
       afterConversations: [],
@@ -255,8 +248,8 @@ describe('project delete navigation', () => {
 
     await context._confirmDeleteProject('p-private', 'detail');
 
-    expect(context.__monitorEvents).toEqual([]);
-    expect(context.__monitorErrors).toEqual([]);
+    expect(context.__invokeCalls.filter((call: any) => call.channel === 'projects.delete')).toHaveLength(1);
+    expect(context.__alerts).toEqual([]);
   });
 });
 
@@ -391,8 +384,8 @@ describe('project create navigation', () => {
     expect(html).toContain('project-rename-input is-error');
     expect(html).toContain('project-inline-error');
     expect(html).toContain('project.name_dup_inline');
-    expect(context.__monitorEvents).toEqual([]);
-    expect(context.__monitorErrors).toEqual([]);
+    expect(context.__invokeCalls.filter((call: any) => call.channel === 'projects.create')).toHaveLength(1);
+    expect(context.__alerts).toEqual([]);
   });
 
   it('freezes an in-flight create and does not discard its result by starting a rename', async () => {

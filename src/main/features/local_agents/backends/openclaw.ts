@@ -20,16 +20,11 @@
  *       }
  *     }
  *
- * stdout is empty. So we collect stderr, scan for the trailing JSON
- * block, parse it, and surface `payloads[*].text` as the agent reply +
- * `meta.agentMeta.sessionId` as the resume key. Earlier stderr lines
- * (warnings, tool errors) are still forwarded as `stderr-line` events
- * for visibility in the debug rail.
- *
- * Streaming: openclaw doesn't push partial tokens. The user sees a
- * spinner / process rail until the run ends, then the full reply
- * lands at once. Token-streaming would require openclaw to support
- * NDJSON output mode; not available today.
+ * Older builds emit this envelope on stderr; newer builds can use stdout.
+ * Both channels are decoded as buffered native replies. Only diagnostics outside
+ * the consumed envelope reach the process rail. Total captured output is bounded
+ * to 8 MiB; an overrun fails the dispatch instead of retaining unlimited memory.
+ * OpenClaw reply delivery remains buffered rather than token streaming.
  */
 
 import * as crypto from 'node:crypto';
@@ -45,6 +40,8 @@ import {
   bindAbort,
   armKillWatchdog,
   stripAnsi,
+  LineSplitter,
+  reapCliAfterProtocolTerminal,
 } from './base.js';
 
 import { prepareOpenclawBridge } from './openclaw-bridge.js';
@@ -63,11 +60,21 @@ export const openclawBackend: LocalBackend = {
       const startedAt = Date.now();
 
       let exited = false;
-      // openclaw writes everything to stderr; we accumulate the FULL
-      // stderr (no cap — the trailing JSON blob we need to parse can
-      // run several KB) AND keep a separate StderrTail for the
-      // diagnostic snippet on failure.
-      let fullStderr = '';
+      let fullStdout = '';
+      let pendingStderr = '';
+      let replyPending = false;
+      let capturedBytes = 0;
+      let outputOverflow = false;
+      // Native replies are buffered envelopes, not token streams. Bound both
+      // channels together, including malformed/unterminated output.
+      const accept = (chunk: string) => {
+        if (outputOverflow) return false;
+        capturedBytes += Buffer.byteLength(chunk);
+        if (capturedBytes <= 8 * 1024 * 1024) return true;
+        outputOverflow = true;
+        reapCliAfterProtocolTerminal(child, 0);
+        return false;
+      };
 
       opts.onEvent({
         type: 'process-info',
@@ -87,23 +94,27 @@ export const openclawBackend: LocalBackend = {
       // openclaw doesn't read stdin; close so it doesn't wait.
       child.stdin.end();
 
-      // stdout is currently always empty for openclaw 2026.4.11 — keep a
-      // best-effort listener anyway in case future versions start using
-      // it (we'd surface the line as text-delta).
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', (chunk: string) => {
-        if (chunk) opts.onEvent({ type: 'text-delta', text: chunk });
+        if (accept(chunk)) fullStdout += chunk;
       });
-
+      const stderrLines = new LineSplitter();
+      const stderrLine = (raw: string) => {
+        const line = stripAnsi(raw);
+        if (!replyPending && line.trim().startsWith('{')) {
+          try {
+            const record = JSON.parse(line);
+            replyPending = Array.isArray(record?.payloads) || record?.ok === false || (typeof record?.error === 'string' && !record.level && !record._meta);
+          } catch { replyPending = true; }
+        }
+        if (replyPending) pendingStderr += line + '\n';
+        else if (line.trim()) opts.onEvent({ type: 'stderr-line', line });
+      };
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', (chunk: string) => {
-        fullStderr += chunk;
+        if (!accept(chunk)) return;
         tail.push(chunk);
-        // Forward each line for the process rail. Strip ANSI escapes
-        // so colored log prefixes don't leak into the UI.
-        for (const line of chunk.split(/\r?\n/)) {
-          if (line) opts.onEvent({ type: 'stderr-line', line: stripAnsi(line) });
-        }
+        stderrLines.push(chunk, stderrLine);
       });
 
       return await new Promise<void>(resolve => {
@@ -129,10 +140,17 @@ export const openclawBackend: LocalBackend = {
           });
         });
         child.on('close', code => {
+          stderrLines.flush(stderrLine);
           if (opts.signal.aborted) return finish('cancelled');
           if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, stderrTail: tail.toString() });
 
-          const parsed = parseOpenclawReply(fullStderr);
+          if (outputOverflow) return finish('failed', { error: 'OpenClaw output exceeded the supported size.' });
+          const stdoutReply = parseOpenclawReply(fullStdout);
+          const stderrReply = parseOpenclawReply(pendingStderr);
+          const parsed = stdoutReply || stderrReply;
+          for (const text of [stdoutReply?.diagnostics ?? fullStdout, stderrReply?.diagnostics ?? pendingStderr]) {
+            for (const line of text.split(/\r?\n/)) if (line.trim()) opts.onEvent({ type: 'stderr-line', line });
+          }
           const replyText = parsed?.text || '';
           const media = parsed?.media || [];
           const files = parsed?.files || [];
@@ -165,10 +183,10 @@ export const openclawBackend: LocalBackend = {
           }
 
           const usage = parsed?.usage;
-          if (code === 0 && (replyText || media.length || files.length)) {
+          if (code === 0 && !parsed?.error && (replyText || media.length || files.length)) {
             return finish('completed', { output: replyText, sessionId: sid, ...(usage ? { usage } : {}) });
           }
-          if (code === 0 && !replyText && !media.length && !files.length) {
+          if (code === 0 && !parsed?.error && !replyText && !media.length && !files.length) {
             // Exit clean but no parseable reply → treat as failed so
             // the user sees an error bubble instead of an empty turn.
             return finish('failed', {
@@ -219,35 +237,22 @@ function hasOpenclawTimeoutArg(args: string[] | undefined): boolean {
 }
 
 /**
- * Find the trailing pretty-printed JSON object in openclaw's stderr
- * and pull out the user-facing reply + session id. The JSON lands AT
- * THE END of the stream, but earlier output (warnings, tool errors,
- * partial JSON from interrupted tools) means we can't just take the
- * first `{`. Strategy: walk backward from the end of the buffer
- * looking for a `{` whose matching `}` (counting balanced braces)
- * runs through to (or near) the end of the stream — that's the final
- * envelope object. Validate by parsing.
+ * Decode a native top-level payload/error envelope from either output channel.
+ * Reverse balancing scans once, ignores nested look-alikes, and retains text
+ * outside the consumed envelope as diagnostics. This accepts diagnostic noise
+ * around the reply without treating arbitrary stdout as model-authored text.
  *
  * Exposed for unit testing.
  */
 export function parseOpenclawReply(stderrText: string):
   | null
-  | { text: string; media: string[]; files: string[]; sessionId?: string; error?: string; usage?: Record<string, number | string> } {
+  | { text: string; media: string[]; files: string[]; sessionId?: string; error?: string; usage?: Record<string, number | string>; diagnostics?: string } {
   if (!stderrText) return null;
   const clean = stripAnsi(stderrText);
 
-  // Walk backward through `{` candidates. The final `{` line in the
-  // stream is highly likely to be the start of the reply envelope.
-  // We try each candidate from latest to earliest until JSON.parse
-  // succeeds AND the result has the shape we expect.
-  const opens: number[] = [];
-  for (let i = 0; i < clean.length; i++) {
-    if (clean[i] === '{') opens.push(i);
-  }
-  for (let i = opens.length - 1; i >= 0; i--) {
-    const start = opens[i];
-    const end = findMatchingBrace(clean, start);
-    if (end < 0) continue;
+  // Reverse balancing visits each byte once and parses disjoint top-level
+  // objects only. Nested payload-like objects are not native reply envelopes.
+  for (const { start, end } of openclawEnvelopeCandidates(clean)) {
     const candidate = clean.slice(start, end + 1);
     let obj: any;
     try { obj = JSON.parse(candidate); } catch { continue; }
@@ -286,6 +291,8 @@ export function parseOpenclawReply(stderrText: string):
         obj.meta?.agentMeta?.model || obj.meta?.agentMeta?.provider,
       );
       return {
+        diagnostics: clean.slice(0, start) + clean.slice(end + 1),
+        ...(obj.ok === false ? { error: typeof obj.error === 'string' ? obj.error : typeof obj.error?.message === 'string' ? obj.error.message : 'OpenClaw reported a failed run.' } : {}),
         text,
         media: Array.from(new Set(media)),
         files: Array.from(new Set(files)),
@@ -293,8 +300,9 @@ export function parseOpenclawReply(stderrText: string):
         ...(usage ? { usage } : {}),
       };
     }
-    if (obj && typeof obj === 'object' && typeof obj.error === 'string') {
-      return { text: '', media: [], files: [], error: String(obj.error) };
+    if (obj && typeof obj === 'object' && ((typeof obj.error === 'string' && !obj.level && !obj._meta) || obj.ok === false)) {
+      return { text: '', media: [], files: [], diagnostics: clean.slice(0, start) + clean.slice(end + 1),
+        error: typeof obj.error === 'string' ? obj.error : typeof obj.error?.message === 'string' ? obj.error.message : 'OpenClaw reported a failed run.' };
     }
   }
   return null;
@@ -355,24 +363,28 @@ function _num(...vals: any[]): number | undefined {
   return undefined;
 }
 
-function findMatchingBrace(s: string, openIdx: number): number {
-  let depth = 0;
-  let inStr = false;
-  let escape = false;
-  for (let i = openIdx; i < s.length; i++) {
-    const ch = s[i];
-    if (escape) { escape = false; continue; }
-    if (inStr) {
-      if (ch === '\\') escape = true;
-      else if (ch === '"') inStr = false;
+function* openclawEnvelopeCandidates(text: string): Generator<{ start: number; end: number }> {
+  const stack: string[] = [];
+  let end = -1;
+  let inString = false;
+  for (let i = text.length - 1; i >= 0; i--) {
+    const char = text[i];
+    if (char === '"') {
+      if (!stack.length && !inString) continue;
+      let slashes = 0;
+      for (let j = i - 1; j >= 0 && text[j] === '\\'; j--) slashes++;
+      if (slashes % 2 === 0) inString = !inString;
       continue;
     }
-    if (ch === '"') { inStr = true; continue; }
-    if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) return i;
+    if (inString) continue;
+    if (char === '}' || char === ']') {
+      if (!stack.length) end = i;
+      stack.push(char);
+    } else if (char === '{' || char === '[') {
+      const expected = char === '{' ? '}' : ']';
+      if (stack.at(-1) !== expected) { stack.length = 0; end = -1; continue; }
+      stack.pop();
+      if (!stack.length && char === '{' && end >= i) yield { start: i, end };
     }
   }
-  return -1;
 }

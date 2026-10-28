@@ -311,4 +311,56 @@ describe('web_search override tool', () => {
     await tool.execute({ query: 'evicted' }, { state: {} } as any);
     expect(h.runSearchAdapter).toHaveBeenCalledTimes(130);
   });
+
+  it.each([['deepseek',128], ['orkas-api',128], ['tavily',400]] as const)('advertises and enforces the first provider Unicode bound (%s)', async(provider,limit)=>{
+    h.candidates=provider?[{provider,apiKey:'fixture'}]:[];
+    const tool=await createTool();
+    expect((tool.inputSchema as any).properties.query.maxLength).toBe(limit);
+    const result=await tool.execute({query:'🌏'.repeat(limit+1)},{} as any);
+    expect(result.isError).toBe(true);expect(result.content).toContain(String(limit));
+    expect(h.runSearchAdapter).not.toHaveBeenCalled();expect(h.runBuiltinWebSearch).not.toHaveBeenCalled();
+  });
+  it('lets a changed first provider tighten but never widen an existing run schema',async()=>{
+    h.candidates=[{provider:'tavily',apiKey:'fixture'}]; const wide=await createTool();
+    h.candidates=[{provider:'deepseek',apiKey:'fixture'}];
+    expect((await wide.execute({query:'🌏'.repeat(129)},{} as any)).isError).toBe(true);
+    const narrow=await createTool();h.candidates=[{provider:'tavily',apiKey:'fixture'}];
+    expect((await narrow.execute({query:'🌏'.repeat(129)},{} as any)).isError).toBe(true);
+    expect(h.runSearchAdapter).not.toHaveBeenCalled();expect(h.runBuiltinWebSearch).not.toHaveBeenCalled();
+  });
+  it.each(['deepseek','orkas-api'])('stops an incompatible fallback without dispatching it (%s)',async backup=>{
+    h.candidates=[{provider:'tavily',apiKey:'fixture'},...(backup?[{provider:backup,apiKey:'fixture'}]:[])];
+    h.runSearchAdapter.mockRejectedValueOnce(new Error('Tavily 503: request failed'));
+    const result=await(await createTool()).execute({query:'🌏'.repeat(200)},{} as any);
+    expect(result.isError).toBe(true);expect(result.content).toContain('128');
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(1);expect(h.runBuiltinWebSearch).not.toHaveBeenCalled();
+    expect(h.runSearchAdapter.mock.calls[0][1]).toBe('🌏'.repeat(200));
+  });
+  it('keeps the existing tool guidance and does not append paid-search reminders',async()=>{
+    h.candidates=[{provider:'tavily',apiKey:'fixture'}];
+    h.runSearchAdapter.mockResolvedValue({results:[{title:'Source',url:'https://example.org',snippet:'Evidence'}]});
+    const tool=await createTool();
+    expect(tool.description).toBe('Search the web for information. Returns a list of search results with titles, URLs, and snippets. Use this when you need to find current information, news, documentation, or any web content. After searching, use web_fetch to read the full content of relevant result URLs.');
+    for(let i=0;i<15;i++){
+      const result=await tool.execute({query:'public query'},{} as any);
+      expect(result.content).toContain('Evidence');expect(result.content).not.toMatch(/This turn:|paid web searches|Prioritize completing/);
+    }
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(15);
+  });
+
+  it('preserves the existing unbounded keyless query without advertising a configured-service limit',async()=>{
+    const tool=await createTool();const query='🌏'.repeat(1024);
+    expect((tool.inputSchema as any).properties.query).not.toHaveProperty('maxLength');
+    expect((await tool.execute({query},{} as any)).isError).not.toBe(true);
+    expect(h.runBuiltinWebSearch).toHaveBeenCalledExactlyOnceWith(query,8);expect(h.runSearchAdapter).not.toHaveBeenCalled();
+  });
+  it('preserves keyless recovery after a valid long Tavily query fails',async()=>{
+    h.candidates=[{provider:'tavily',apiKey:'fixture'}];
+    h.runSearchAdapter.mockRejectedValueOnce(new Error('Tavily 503: request failed'));
+    const query='🌏'.repeat(400);const result=await(await createTool()).execute({query},{} as any);
+    expect(result.isError).not.toBe(true);expect(result.content).toContain('free results');
+    expect(h.runBuiltinWebSearch).toHaveBeenCalledExactlyOnceWith(query,8);
+    expect(h.runSearchAdapter).toHaveBeenCalledTimes(1);
+  });
+
 });

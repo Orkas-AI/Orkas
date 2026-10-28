@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+const mutableFs = createRequire(import.meta.url)('node:fs') as typeof fs;
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -45,6 +47,80 @@ afterEach(() => {
 });
 
 describe('project_files › explicit versioned replacement', () => {
+  it.runIf(process.platform !== 'win32')('continues to reject editing a read-only project Library source', async () => {
+    const files = await import('../../../src/main/features/project_files');
+    expect(await files.uploadProjectFile('u1', 'p1', 'locked.md', Buffer.from('Protected procedure'))).toMatchObject({ ok: true });
+    const resolved = await files.resolveProjectFileAbsPath('u1', 'p1', 'locked.md');
+    if (!resolved.ok) throw new Error('saved source precondition failed');
+    fs.chmodSync(resolved.absPath, 0o444);
+    try {
+      expect(await files.updateProjectTextFile('u1', 'p1', 'locked.md', 'changed')).toMatchObject({ ok: false });
+      expect(await files.readProjectTextFile('u1', 'p1', 'locked.md')).toMatchObject({ content: 'Protected procedure' });
+      expect(enqueueCalls).toHaveLength(1);
+    } finally { fs.chmodSync(resolved.absPath, 0o644); }
+  });
+
+  it('does not publish an incomplete project upload after a short write and permits one complete retry', async () => {
+    const files = await import('../../../src/main/features/project_files');
+    expect(await files.uploadProjectFile('u1', 'p1', 'prior.md', Buffer.from('Prior complete source'))).toMatchObject({ ok: true });
+    const { projectFilesDir } = await import('../../../src/main/paths');
+    const root = projectFilesDir('u1', 'p1');
+    const target = path.join(root, 'procedure.md');
+    const originalWrite = fs.writeFileSync;
+    const write = vi.spyOn(mutableFs, 'writeFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, data: any, options: any) => {
+      if (String(file) === target || String(file).startsWith(target + '.')) {
+        originalWrite(file, Buffer.from(data).subarray(0, 7), options);
+        throw Object.assign(new Error('controlled short upload'), { code: 'ENOSPC' });
+      }
+      return originalWrite(file, data, options);
+    }) as typeof fs.writeFileSync);
+    syncBuiltinESMExports();
+    try {
+      expect(await files.uploadProjectFile('u1', 'p1', 'procedure.md', Buffer.from('New complete procedure'))).toMatchObject({ ok: false });
+    } finally { write.mockRestore(); syncBuiltinESMExports(); }
+    expect(await files.listProjectFiles('u1', 'p1')).toMatchObject([{ name: 'prior.md' }]);
+    expect(fs.readdirSync(root)).toEqual(['prior.md']);
+    expect(await files.readProjectTextFile('u1', 'p1', 'prior.md')).toMatchObject({ content: 'Prior complete source' });
+    expect(enqueueCalls).toHaveLength(1);
+    expect(await files.uploadProjectFile('u1', 'p1', 'procedure.md', Buffer.from('New complete procedure'))).toMatchObject({ ok: true, info: { relPath: 'procedure.md' } });
+    vi.resetModules();
+    expect(await (await import('../../../src/main/features/project_files')).readProjectTextFile('u1', 'p1', 'procedure.md')).toMatchObject({ content: 'New complete procedure' });
+    expect(enqueueCalls).toHaveLength(2);
+  });
+
+  it('preserves the saved project Library source after a partial edit failure and permits retry', async () => {
+    const files = await import('../../../src/main/features/project_files');
+    const uploaded = await files.uploadProjectFile('u1', 'p1', 'procedure.md', Buffer.from('Original complete procedure'));
+    expect(uploaded.ok).toBe(true);
+    expect(await files.updateProjectTextFile('u1', 'p1', 'procedure.md', 'Current complete procedure')).toMatchObject({ ok: true });
+    expect(await files.readProjectTextFile('u1', 'p1', 'procedure.md')).toMatchObject({ content: 'Current complete procedure' });
+    const resolved = await files.resolveProjectFileAbsPath('u1', 'p1', 'procedure.md');
+    if (!resolved.ok) throw new Error('saved source precondition failed');
+    const target = resolved.absPath;
+    if (process.platform !== 'win32') fs.chmodSync(target, 0o640);
+    const enqueueCount = enqueueCalls.length;
+    const originalWrite = fs.writeFileSync;
+    const write = vi.spyOn(mutableFs, 'writeFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, data: any, options: any) => {
+      if (String(file) === target || String(file).startsWith(target + '.')) {
+        originalWrite(file, String(data).slice(0, 7), options);
+        throw Object.assign(new Error('controlled short write'), { code: 'ENOSPC' });
+      }
+      return originalWrite(file, data, options);
+    }) as typeof fs.writeFileSync);
+    syncBuiltinESMExports();
+    try {
+      expect(await files.updateProjectTextFile('u1', 'p1', 'procedure.md', 'New complete procedure')).toMatchObject({ ok: false });
+    } finally { write.mockRestore(); syncBuiltinESMExports(); }
+    expect(fs.readFileSync(target, 'utf8')).toBe('Current complete procedure');
+    expect(await files.readProjectTextFile('u1', 'p1', 'procedure.md')).toMatchObject({ content: 'Current complete procedure' });
+    expect(fs.readdirSync(path.dirname(target)).filter(n => n.startsWith('procedure.md'))).toEqual(['procedure.md']);
+    expect(enqueueCalls).toHaveLength(enqueueCount);
+    expect(await files.updateProjectTextFile('u1', 'p1', 'procedure.md', 'New complete procedure')).toMatchObject({ ok: true });
+    if (process.platform !== 'win32') expect(fs.statSync(target).mode & 0o777).toBe(0o640);
+    vi.resetModules();
+    expect(await (await import('../../../src/main/features/project_files')).readProjectTextFile('u1', 'p1', 'procedure.md')).toMatchObject({ content: 'New complete procedure' });
+  });
+
   it('stores a large text upload while retaining the whole-text preview/edit limit', async () => {
     const files = await import('../../../src/main/features/project_files');
     const bytes = Buffer.alloc(6 * 1024 * 1024, 'a');

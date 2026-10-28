@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -69,6 +71,40 @@ afterEach(async () => {
 });
 
 describe('marketplace reconcile', () => {
+  it('keeps cleanup diagnostics private without suppressing the recoverable failure', async () => {
+    const logger = await import('../../../src/main/logger');
+    const createLogger = logger.createLogger;
+    const warnings: unknown[][] = [];
+    const capture = vi.spyOn(logger, 'createLogger').mockImplementation(name => {
+      const scoped = createLogger(name);
+      return name === 'marketplace_reconcile'
+        ? {...scoped, warn: (message: string, ...args: unknown[]) => {warnings.push([message,...args]);}}
+        : scoped;
+    });
+    const artifact = path.join(tmpDir, 'u1', 'local', 'marketplace', 'agents', '.private-draft.install-abandoned');
+    fs.mkdirSync(artifact, {recursive:true});
+    const rm = nativeFs.promises.rm.bind(nativeFs.promises);
+    const denied = Object.assign(new Error(`PRIVATE-CLEANUP-CONTENT ${artifact}`), {code:'EACCES'});
+    const remove = vi.spyOn(nativeFs.promises, 'rm').mockImplementation(async (file, options) => {
+      if(String(file)===artifact)throw denied;
+      return rm(file,options);
+    });
+    syncBuiltinESMExports();
+    try {
+      writeManifest({version:1,agents:[],skills:[]});
+      const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+      expect(await reconcile.reconcileInstalls('u1')).toMatchObject({failed:[]});
+      expect(fs.existsSync(artifact)).toBe(true);
+      expect(warnings).toHaveLength(1);
+      const payload=JSON.stringify(warnings);
+      for(const secret of [artifact,path.basename(artifact),'PRIVATE-CLEANUP-CONTENT'])expect(payload).not.toContain(secret);
+      expect(warnings[0][1]).toMatchObject({
+        artifact:{path_hash:expect.any(String)},
+        error:{code:'EACCES',message_hash:expect.any(String)},
+      });
+    } finally {remove.mockRestore();capture.mockRestore();syncBuiltinESMExports();}
+  });
+
   function writeLocalSkill(id: string, meta: Record<string, unknown>): string {
     const dir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', id);
     fs.mkdirSync(dir, { recursive: true });

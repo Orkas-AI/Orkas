@@ -30,32 +30,32 @@ const _localAgentsLog = createLogger('local-agents');
 const CLI_DEFAULTS = {
   claude: {
     name: 'ClaudeCode',
-    description_zh: '在本地项目中实现功能、修复缺陷、跨文件重构、编写测试和调试，通过文件编辑与命令执行交付代码改动及验证结果。',
-    description_en: 'Implements features, fixes bugs, refactors across files, writes tests and debugs in a local project, using file edits and commands to deliver code changes and verification results.',
+    description_zh: '理解和维护项目代码，解答代码问题、开发功能、修复缺陷和审查改动，提供代码修改或分析建议。',
+    description_en: 'Understands and maintains project code, answers code questions, develops features, fixes bugs, and reviews changes, providing code changes or analysis and recommendations.',
     isCoding: true,
   },
   codex: {
     name: 'Codex',
-    description_zh: '在本地项目中按需求或 issue 实现功能、修复缺陷和跨文件重构，通过文件编辑与命令执行交付代码补丁及验证结果。',
-    description_en: 'Implements requirements or issues, fixes bugs and refactors across files in a local project, using file edits and commands to deliver code patches and verification results.',
+    description_zh: '理解和维护项目代码，解答代码问题、开发功能、修复缺陷和审查改动，提供代码修改或分析建议。',
+    description_en: 'Understands and maintains project code, answers code questions, develops features, fixes bugs, and reviews changes, providing code changes or analysis and recommendations.',
     isCoding: true,
   },
   openclaw: {
     name: 'OpenClaw',
-    description_zh: '组合可用工具执行通用多步任务与轻量自动化流程，汇总各步骤结果，交付所需的任务成果。',
-    description_en: 'Carries out general multi-step tasks and lightweight automation by combining available tools, consolidating their results into the requested deliverable.',
+    description_zh: '协助处理日常事务，包括查找资料、撰写内容、整理文件和执行自动化任务，提供所需内容及处理结果。',
+    description_en: 'Helps with everyday tasks, including finding information, writing content, organizing files, and running automated tasks, providing the requested content and results.',
     isCoding: false,
   },
   opencode: {
     name: 'OpenCode',
-    description_zh: '在本地项目中实现功能和修复缺陷，通过文件编辑与终端命令执行交付代码改动及验证结果。',
-    description_en: 'Implements features and fixes bugs in a local project, editing files and running terminal commands to deliver code changes and verification results.',
+    description_zh: '理解和维护项目代码，解答代码问题、开发功能、修复缺陷和审查改动，提供代码修改或分析建议。',
+    description_en: 'Understands and maintains project code, answers code questions, develops features, fixes bugs, and reviews changes, providing code changes or analysis and recommendations.',
     isCoding: true,
   },
   hermes: {
     name: 'Hermes',
-    description_zh: '使用可用工具按既定流程推进通用多步任务，汇总各步骤结果，交付所需的任务成果。',
-    description_en: 'Carries out general multi-step tasks by following defined workflows with available tools, consolidating step results into the requested deliverable.',
+    description_zh: '完成资料研究、代码开发和需要多个步骤的任务，提供研究结论、代码修改或生成的文件。',
+    description_en: 'Carries out research, code development, and tasks that require multiple steps, providing research findings, code changes, or generated files.',
     isCoding: false,
   },
 };
@@ -232,6 +232,7 @@ async function loadLocalCliEntries(options = {}) {
 //
 let _extCliSelectApi = null;
 let _externalCliLastOnChange = null;
+let _cliUpgradeControlId = 0;
 
 function _setExternalCliDetectionBusy(
   busy,
@@ -488,11 +489,17 @@ window.getExternalCliSelectionWarning = getExternalCliSelectionWarning;
 window.setExternalCliValue = setExternalCliValue;
 
 /** Shared recovery action. Updates never replay a failed task or alter its model. */
-function createLocalCliUpgradeControl(target, { cli = target.type, chip = false } = {}) {
+function createLocalCliUpgradeControl(target, { cli = target.type, chip = false, named = chip, warningVersion } = {}) {
   const root = document.createElement('div');
   root.className = 'local-cli-upgrade-control' + (chip ? ' chat-app-nav-row' : '');
   root.dataset.cli = cli || '';
-  root.dataset.named = chip ? '1' : '';
+  root.dataset.named = named ? '1' : '';
+  if (warningVersion !== undefined) {
+    root.dataset.warningVersion = warningVersion || '?';
+    const warning = document.createElement('span');
+    warning.className = 'local-cli-upgrade-warning agent-cli-selection-warning';
+    root.appendChild(warning);
+  }
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'btn local-cli-upgrade-btn' + (chip ? ' chat-app-nav-btn' : '');
@@ -500,21 +507,47 @@ function createLocalCliUpgradeControl(target, { cli = target.type, chip = false 
   status.className = 'agents-detail-cli-note';
   status.setAttribute('role', 'status');
   status.setAttribute('aria-live', 'polite');
-  root.append(button, status);
+  const feedback = document.createElement('span');
+  feedback.className = 'local-cli-upgrade-feedback';
+  const details = document.createElement('button');
+  details.type = 'button';
+  details.className = 'settings-link-btn local-cli-upgrade-details';
+  details.setAttribute('aria-expanded', 'false');
+  const label = document.createElement('span');
+  label.className = 'local-cli-upgrade-error-label';
+  details.appendChild(label);
+  if (typeof window.uiIconHtml === 'function') details.insertAdjacentHTML('beforeend', window.uiIconHtml('chevron-right', 'sidebar-section-chevron'));
+  const error = document.createElement('div');
+  error.className = 'local-cli-upgrade-error';
+  error.id = 'local-cli-upgrade-error-' + (++_cliUpgradeControlId);
+  error.tabIndex = 0;
+  details.setAttribute('aria-controls', error.id);
+  feedback.append(status, details);
+  root.append(button, feedback, error);
+  details.addEventListener('click', () => {
+    if (details.hidden) return;
+    details.setAttribute('aria-expanded', String(details.getAttribute('aria-expanded') !== 'true'));
+    _renderCliUpgradeState(root);
+  });
   _renderCliUpgradeState(root);
   button.addEventListener('click', async () => {
     if (button.disabled) return;
     root.dataset.state = 'upgrading';
+    details.setAttribute('aria-expanded', 'false');
+    error.textContent = '';
     _renderCliUpgradeState(root);
     try {
       const result = await window.orkas.invoke('localAgents.upgrade', target);
       if (result?.ok && result.entry?.available) {
-        root.dataset.state = 'success';
+        root.dataset.state = result.outcome === 'up_to_date' ? 'up_to_date' : 'success';
         // Discovery refresh is separate from the updater's authoritative result.
         _localCliEntries = null;
         window.dispatchEvent(new CustomEvent('local-cli-upgraded', { detail: { type: result.type } }));
       } else {
         root.dataset.state = 'failure';
+        // Main owns redaction. Treat installer output strictly as bounded text,
+        // never Markdown/HTML, and never include it in the telemetry above.
+        error.textContent = typeof result?.error_detail === 'string' ? result.error_detail.slice(0, 8192) : '';
       }
     } catch (_) {
       root.dataset.state = 'failure';
@@ -523,7 +556,7 @@ function createLocalCliUpgradeControl(target, { cli = target.type, chip = false 
   return root;
 }
 function _renderCliUpgradeState(root) {
-  const button = root.querySelector('button');
+  const button = root.querySelector('.local-cli-upgrade-btn');
   const pending = root.dataset.state === 'upgrading';
   const cli = t('agent_modal.runtime_cli_' + root.dataset.cli);
   button.textContent = t(pending ? 'cli_upgrade.pending'
@@ -531,25 +564,38 @@ function _renderCliUpgradeState(root) {
   button.disabled = pending;
   button.classList.toggle('is-loading', pending);
   button.setAttribute('aria-busy', String(pending));
-  root.querySelector('[role="status"]').textContent = root.dataset.state === 'success'
-    ? t('cli_upgrade.success') : root.dataset.state === 'failure' ? t('cli_upgrade.failed') : '';
+  root.querySelector('[role="status"]').textContent = root.dataset.state === 'up_to_date'
+    ? t('cli_upgrade.up_to_date') : root.dataset.state === 'success'
+      ? t('cli_upgrade.success') : root.dataset.state === 'failure' ? t('cli_upgrade.failed') : '';
+  const warning = root.querySelector('.local-cli-upgrade-warning');
+  if (warning) {
+    warning.hidden = !root.dataset.warningVersion;
+    warning.textContent = root.dataset.warningVersion
+      ? cli + ': ' + getLocalCliUnavailableHint({ error: 'version_too_old', version: root.dataset.warningVersion }) : '';
+  }
+  const error = root.querySelector('.local-cli-upgrade-error');
+  const details = root.querySelector('.local-cli-upgrade-details');
+  details.hidden = root.dataset.state !== 'failure' || !error.textContent;
+  if (details.hidden) details.setAttribute('aria-expanded', 'false');
+  error.hidden = details.hidden || details.getAttribute('aria-expanded') !== 'true';
+  root.querySelector('.local-cli-upgrade-feedback').hidden = !root.querySelector('[role="status"]').textContent;
+  root.querySelector('.local-cli-upgrade-error-label').textContent = t('cli_upgrade.error_details');
 }
 function _renderExternalCliUpgrades(entries) {
   const slot = document.getElementById('agent-modal-ext-cli-upgrades');
   if (!slot) return;
   const oldEntries = entries.filter(entry => entry.error === 'version_too_old');
-  const warning = document.getElementById('agent-modal-ext-cli-upgrade-warning');
-  if (warning) {
-    warning.textContent = oldEntries.map(entry => t('agent_modal.runtime_cli_' + entry.type) + ': ' + getLocalCliUnavailableHint(entry)).join(' · ');
-    warning.hidden = oldEntries.length === 0;
-  }
   // Keep pending and terminal states mounted while discovery refreshes.
   for (const row of slot.querySelectorAll('[data-cli]')) {
-    if (!oldEntries.some(entry => entry.type === row.dataset.cli) && !row.dataset.state) row.remove();
+    const entry = oldEntries.find(entry => entry.type === row.dataset.cli);
+    if (!entry && !row.dataset.state) { row.remove(); continue; }
+    if (entry) row.dataset.warningVersion = entry.version || '?';
+    else delete row.dataset.warningVersion;
+    _renderCliUpgradeState(row);
   }
   for (const entry of oldEntries) {
     if (slot.querySelector('[data-cli="' + entry.type + '"]')) continue;
-    slot.appendChild(createLocalCliUpgradeControl({ type: entry.type }));
+    slot.appendChild(createLocalCliUpgradeControl({ type: entry.type }, { named: true, warningVersion: entry.version || '?' }));
   }
 }
 window.createLocalCliUpgradeControl = createLocalCliUpgradeControl;

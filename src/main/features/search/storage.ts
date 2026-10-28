@@ -90,11 +90,43 @@ export function emptyIndex(kind: IndexKind): Index {
   };
 }
 
+function isRecord(value: unknown): value is Record<string, any> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/** Parsed JSON can carry the current version while its nested shapes are
+ * damaged. Reject those snapshots before a matching file watermark prevents
+ * reconciliation from rebuilding them. Missing bags retain legacy backfill. */
+function usableIndexBags(idx: Index): boolean {
+  for (const bag of [idx.files, idx.docs, idx.postings]) {
+    if (bag != null && !isRecord(bag)) return false;
+  }
+  for (const meta of Object.values(idx.files || {})) {
+    if (!isRecord(meta) || !finiteNumber(meta.mtime) || !Number.isInteger(meta.size) || meta.size < 0
+        || (meta.next != null && (!Number.isInteger(meta.next) || meta.next < 0))) return false;
+  }
+  for (const doc of Object.values(idx.docs || {})) {
+    if (!isRecord(doc) || doc.kind !== idx.kind || typeof doc.fileKey !== 'string'
+        || !Number.isInteger(doc.len) || doc.len < 0
+        || (doc._tokens != null && (!Array.isArray(doc._tokens)
+          || !doc._tokens.every((token: unknown) => typeof token === 'string')))) return false;
+  }
+  for (const rows of Object.values(idx.postings || {})) {
+    if (!Array.isArray(rows) || !rows.every(row => Array.isArray(row) && row.length === 2
+      && typeof row[0] === 'string' && Number.isInteger(row[1]) && row[1] > 0)) return false;
+  }
+  return true;
+}
+
 export async function loadIndex(idxPath: string, kind: IndexKind): Promise<Index> {
   try {
     const raw = await fsp.readFile(idxPath, 'utf8');
     const idx = JSON.parse(raw);
-    if (idx && idx.version === SCHEMA_VERSION && idx.kind === kind) {
+    if (idx && idx.version === SCHEMA_VERSION && idx.kind === kind && usableIndexBags(idx)) {
       // JSON.parse does not preserve the null prototype used by emptyIndex.
       // Copy own keys into dictionaries so every filename/token remains data,
       // including __proto__, and absent terms never resolve through Object.

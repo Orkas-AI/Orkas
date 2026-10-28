@@ -141,8 +141,8 @@ describe('Web Assist security boundary', () => {
   it('opens address-bar URLs and domains directly, then searches ordinary text with Bing', () => {
     expect(normalizeWebAssistUserUrl('example.com/docs')).toBe('https://example.com/docs');
     expect(normalizeWebAssistUserUrl('http://localhost:4400')).toBe('http://localhost:4400/');
-    expect(normalizeWebAssistUserUrl('localhost:4400/docs')).toBe('https://localhost:4400/docs');
-    expect(normalizeWebAssistUserUrl('127.0.0.1:4400/docs')).toBe('https://127.0.0.1:4400/docs');
+    expect(normalizeWebAssistUserUrl('localhost:4400/docs')).toBe('http://localhost:4400/docs');
+    expect(normalizeWebAssistUserUrl('127.0.0.1:4400/docs')).toBe('http://127.0.0.1:4400/docs');
 
     for (const query of ['orkas', '上海 天气']) {
       const result = normalizeWebAssistUserUrl(query);
@@ -156,6 +156,33 @@ describe('Web Assist security boundary', () => {
     for (const value of ['file:///tmp/private', 'javascript:alert(1)', 'user:secret@example.com', '']) {
       expect(normalizeWebAssistUserUrl(value), value).toBeNull();
     }
+  });
+
+  it.each([
+    ['localhost', 'http://localhost/'],
+    ['localhost:4400/docs?item=one#board', 'http://localhost:4400/docs?item=one#board'],
+    ['LOCALHOST:443/one%20two?x=%2F&x=two#hash', 'http://localhost:443/one%20two?x=%2F&x=two#hash'],
+    ['127.0.0.1:443/ready', 'http://127.0.0.1:443/ready'],
+    ['127.0.0.2:8080/', 'http://127.0.0.2:8080/'],
+    ['127.1:4400/docs', 'http://127.0.0.1:4400/docs'],
+    ['[::1]:4400/docs', 'http://[::1]:4400/docs'],
+    ['[0:0:0:0:0:0:0:1]:443/ready', 'http://[::1]:443/ready'],
+  ])('opens a scheme-less loopback address over HTTP: %s', (input, expected) => {
+    expect(normalizeWebAssistUserUrl(input)).toBe(expected);
+  });
+
+  it.each([
+    ['localhost.example.test:4400/docs', 'https://localhost.example.test:4400/docs'],
+    ['127.0.0.1.example.test:4400/docs', 'https://127.0.0.1.example.test:4400/docs'],
+    ['192.168.1.1:4400/docs', 'https://192.168.1.1:4400/docs'],
+    ['[2001:db8::1]:4400/docs', 'https://[2001:db8::1]:4400/docs'],
+    ['example.com:80/docs', 'https://example.com:80/docs'],
+    ['http://localhost:443/docs', 'http://localhost:443/docs'],
+    ['https://localhost:4400/docs', 'https://localhost:4400/docs'],
+    ['http://[::1]:443/docs', 'http://[::1]:443/docs'],
+    ['https://127.0.0.1:4400/docs', 'https://127.0.0.1:4400/docs'],
+  ])('preserves explicit protocols and non-loopback address defaults: %s', (input, expected) => {
+    expect(normalizeWebAssistUserUrl(input)).toBe(expected);
   });
 
   it('clamps renderer geometry to the owner window and rejects unusable rectangles', () => {

@@ -19,7 +19,7 @@ import { projectHistoryMediaText } from '../../util/history-media';
  */
 
 import * as crypto from 'node:crypto';
-import { getLocaleMeta, type Lang } from '../../i18n.js';
+import { buildLanguageDirective, type Lang } from '../../i18n.js';
 import { localCliCapabilities } from './registry.js';
 
 export const CLI_HISTORY_MAX_TURNS = 5;
@@ -98,12 +98,13 @@ export function buildCliDurableInstructions(input: {
   const projectContext = String(input.projectContext || '').trim();
   if (projectContext) blocks.push(projectContext);
 
-  blocks.push(buildCompactCliLanguageInstruction(input.language));
+  blocks.push(buildLanguageDirective(input.language));
   return blocks.filter(Boolean).join('\n\n');
 }
 
 export function buildCliTurnPrompt(input: {
   task: string;
+  taskSource?: 'user' | 'agent';
   projectContext?: string;
   attachmentPaths?: string[];
   runtimeProtocol?: string;
@@ -121,8 +122,8 @@ export function buildCliTurnPrompt(input: {
   }
 
   const task = String(input.task || '').trim();
-  if (blocks.length === 0) return task;
-  if (task) blocks.push(`## Your task\n\n${task}`);
+  if (blocks.length === 0 && input.taskSource !== 'agent') return task;
+  if (task) blocks.push(`## ${input.taskSource === 'agent' ? 'Delegated task' : 'Your task'}\n\n${task}`);
   return blocks.join('\n\n');
 }
 
@@ -222,13 +223,6 @@ export function materializeCliContext(
       ? recoveryAndTurn
       : joinBlocks(plan.durableInstructions, recoveryAndTurn),
   };
-}
-
-function buildCompactCliLanguageInstruction(lang: Lang): string {
-  return [
-    '## Response language',
-    `Write human-readable responses and form labels in ${getLocaleMeta(lang).llmName} unless the user explicitly requests another language. Keep XML tags, JSON keys, ids, file paths, and code unchanged.`,
-  ].join('\n\n');
 }
 
 function uniqueNonEmpty(values: string[]): string[] {

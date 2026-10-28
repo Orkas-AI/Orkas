@@ -8,12 +8,12 @@ import * as path from 'node:path';
 import { makeMinimalPdf } from '../../fixtures/make-minimal-pdf';
 import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
 
-const loggerMocks = vi.hoisted(() => ({ info: vi.fn() }));
+const loggerMocks = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn() }));
 vi.mock('../../../src/main/logger', () => ({
   createLogger: () => ({
     debug: vi.fn(),
     info: loggerMocks.info,
-    warn: vi.fn(),
+    warn: loggerMocks.warn,
     error: vi.fn(),
   }),
 }));
@@ -443,6 +443,96 @@ describe('file_indexer › readImageAsJpeg', () => {
 });
 
 describe('file_indexer › invalidate + purge + prune', () => {
+  it.each([
+    { shape: 'missing path', absPath: undefined },
+    { shape: 'non-string path', absPath: 42 },
+    { shape: 'empty path', absPath: '' },
+  ])('removes current-version cache metadata with a $shape without aborting the sweep', async ({ absPath: invalidPath }) => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('keep-source.txt', 'The source must survive cache repair.');
+    await m.statFile(UID, abs);
+    const malformed = path.join(userFileCacheRoot(), fs.readdirSync(userFileCacheRoot())[0]);
+    const metadata = JSON.parse(fs.readFileSync(path.join(malformed, 'meta.json'), 'utf8'));
+    metadata.absPath = invalidPath;
+    fs.writeFileSync(path.join(malformed, 'meta.json'), JSON.stringify(metadata));
+    const orphan = path.join(userFileCacheRoot(), '0000000000000000');
+    fs.mkdirSync(orphan);
+    expect(await m.pruneOrphans(UID)).toEqual({ deleted: 2 });
+    expect(fs.existsSync(malformed)).toBe(false);
+    expect(fs.existsSync(orphan)).toBe(false);
+    expect(fs.readFileSync(abs, 'utf8')).toBe('The source must survive cache repair.');
+  });
+
+  it.each(['orphan', 'conversation'] as const)('retains a denied %s cache cleanup without counting it and permits a complete retry', async mode => {
+    const m = await loadMod();
+    const cid = 'private-cleanup-conversation';
+    const abs = attachmentFile(cid, 'private-cleanup.txt', 'Keep the source intact.');
+    await m.statFile(UID, abs);
+    const cacheDir = path.join(userFileCacheRoot(), fs.readdirSync(userFileCacheRoot())[0]);
+    if (mode === 'orphan') fs.unlinkSync(abs);
+    const cleanup = () => mode === 'orphan' ? m.pruneOrphans(UID) : m.purgeFileCacheByCid(UID, cid);
+    const remove = fsDefault.rmSync;
+    const denied = vi.spyOn(fsDefault, 'rmSync').mockImplementation((target, options) => {
+      if (String(target) === cacheDir) throw Object.assign(new Error('Fixture permission denial'), { code: 'EPERM' });
+      return remove(target, options);
+    });
+    syncBuiltinESMExports();
+    try {
+      expect(await cleanup()).toEqual({ deleted: 0 });
+      expect(fs.existsSync(cacheDir)).toBe(true);
+    } finally {
+      denied.mockRestore();
+      syncBuiltinESMExports();
+    }
+    expect(await cleanup()).toEqual({ deleted: 1 });
+    expect(fs.existsSync(cacheDir)).toBe(false);
+    if (mode === 'conversation') expect(fs.readFileSync(abs, 'utf8')).toBe('Keep the source intact.');
+  });
+
+  it('reports a denied invalidation without exposing its path or raw filesystem diagnostic', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('private-cleanup.txt', 'Keep the source intact.');
+    await m.statFile(UID, abs);
+    const cacheDir = path.join(userFileCacheRoot(), fs.readdirSync(userFileCacheRoot())[0]);
+    const remove = fsDefault.rmSync;
+    const denied = vi.spyOn(fsDefault, 'rmSync').mockImplementation((target, options) => {
+      if (String(target) === cacheDir) throw Object.assign(new Error(`PRIVATE_DIAGNOSTIC ${cacheDir}`), { code: 'EPERM' });
+      return remove(target, options);
+    });
+    syncBuiltinESMExports();
+    loggerMocks.warn.mockClear();
+    try {
+      expect(() => m.invalidateFileCache(UID, abs)).not.toThrow();
+      expect(fs.existsSync(cacheDir)).toBe(true);
+      expect(loggerMocks.warn).toHaveBeenCalledTimes(1);
+      const diagnostics = JSON.stringify(loggerMocks.warn.mock.calls);
+      expect(diagnostics).not.toContain(tmpDir);
+      expect(diagnostics).not.toContain('PRIVATE_DIAGNOSTIC');
+      expect(diagnostics).toContain('EPERM');
+    } finally {
+      denied.mockRestore();
+      syncBuiltinESMExports();
+    }
+    m.invalidateFileCache(UID, abs);
+    expect(fs.existsSync(cacheDir)).toBe(false);
+    expect(fs.readFileSync(abs, 'utf8')).toBe('Keep the source intact.');
+  });
+
+  it.each(['orphan', 'conversation'] as const)('reports completed %s cleanup without exposing account or conversation identifiers', async mode => {
+    const m = await loadMod();
+    const cid = 'private-cleanup-conversation';
+    const abs = attachmentFile(cid, 'private-cleanup.txt', 'Keep the source intact.');
+    await m.statFile(UID, abs);
+    if (mode === 'orphan') fs.unlinkSync(abs);
+    loggerMocks.info.mockClear();
+    expect(await (mode === 'orphan' ? m.pruneOrphans(UID) : m.purgeFileCacheByCid(UID, cid))).toEqual({ deleted: 1 });
+    expect(loggerMocks.info).toHaveBeenCalled();
+    const diagnostics = JSON.stringify(loggerMocks.info.mock.calls);
+    expect(diagnostics).not.toContain(UID);
+    expect(diagnostics).not.toContain(cid);
+    expect(diagnostics).not.toContain(tmpDir);
+  });
+
   it('invalidateFileCache drops the hash dir for one path', async () => {
     const m = await loadMod();
     const abs = writeWorkspaceFile('x.pdf', makeMinimalPdf(['X']));

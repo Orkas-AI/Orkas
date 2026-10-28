@@ -49,6 +49,8 @@ describe('ContentWriter builtin contract', () => {
     expect(spec.standards.join('\n')).toContain('internal values');
     expect(spec.standards.join('\n')).toContain('label that exact occurrence Hypothesis/Proposed');
     expect(spec.standards.join('\n')).toContain('skip manage_execution_plan');
+    expect(spec.standards.join('\n')).not.toContain('deliver the complete draft in the response');
+    expect(spec.standards.join('\n')).toMatch(/shared delivery rules/i);
     expect(spec.standards.join('\n')).toContain('completion summary is not an artifact');
     expect(spec.standards.join('\n')).not.toMatch(/20\s*[-–]\s*100|SaaS|remote collaboration/i);
     expect(spec.workflow).toContain('Never ask which publishing platform to use');

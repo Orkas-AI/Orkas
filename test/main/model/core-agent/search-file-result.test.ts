@@ -14,16 +14,18 @@ describe('search_files root-relative output', () => {
       ...hit(root, `${root}readings/${i}.jsonl`), name: `${i}.jsonl`,
       ...(i === 0 ? { totalChars: 0 } : {}),
     }));
-    const output = formatSearchFileResults(hits, path.posix);
+    const output = formatSearchFileResults(hits, path.posix, root);
     const result = parse(output);
     expect(result.roots).toEqual([root]);
     expect(output.split(root)).toHaveLength(2);
     expect(result.files).toEqual(hits.map((h, i) => ({
-      root: 0, path: `readings/${i}.jsonl`, name: h.name, size: h.size,
+      root: 0, path: `readings/${i}.jsonl`, read_path: `readings/${i}.jsonl`, name: h.name, size: h.size,
       mtime: new Date(h.mtime).toISOString(), source: h.source,
       ...(h.totalChars !== undefined ? { total_chars: h.totalChars } : {}),
     })));
     expect(result.files.map((f: any) => path.posix.join(result.roots[f.root], f.path)))
+      .toEqual(hits.map((h) => h.path));
+    expect(result.files.map((f: any) => path.posix.resolve(root, f.read_path)))
       .toEqual(hits.map((h) => h.path));
     const old = hits.map((h) => `- ${h.name}  (path=${h.path}, size=${h.size}, mtime=${new Date(h.mtime).toISOString()}, source=${h.source}${h.totalChars !== undefined ? `, total_chars=${h.totalChars}` : ''})`).join('\n');
     expect(output.length).toBeLessThan(old.length);
@@ -42,6 +44,7 @@ describe('search_files root-relative output', () => {
     expect(result.files.map((f: any) => f.root)).toEqual([0, 1, 0]);
     expect(result.files.map((f: any) => paths.join(result.roots[f.root], f.path)))
       .toEqual(hits.map((h) => h.path));
+    expect(result.files.map((f: any) => f.read_path)).toEqual(hits.map((h) => h.path));
     expect(result.files.map((f: any) => f.source)).toEqual(['workspace', 'attachment', 'workspace']);
   });
 
@@ -51,6 +54,7 @@ describe('search_files root-relative output', () => {
     const result = parse(formatSearchFileResults([{ ...hit(root, `${root}/${name}`), name }], path.posix));
     expect(result.roots).toEqual([root]);
     expect(result.files[0].path).toBe(name);
+    expect(result.files[0].read_path).toBe(`${root}/${name}`);
     expect(result.files[0].name).toBe(name);
   });
 
@@ -59,6 +63,31 @@ describe('search_files root-relative output', () => {
     const result = parse(formatSearchFileResults([hit(root, `${root}/facts.md`, 'extra')], path.win32));
     expect(result.roots).toEqual([root]);
     expect(result.files[0].path).toBe('facts.md');
+    expect(result.files[0].read_path).toBe('@skill/bundle/references/facts.md');
     expect(path.posix.join(result.roots[0], result.files[0].path)).toBe('@skill/bundle/references/facts.md');
+  });
+
+  it.each([
+    ['POSIX', path.posix, '/workspace/project', '/attachments/chat'],
+    ['Windows drives', path.win32, 'C:\\workspace\\project', 'D:\\attachments\\chat'],
+    ['Windows UNC', path.win32, '\\\\server\\share\\project', '\\\\server\\other\\chat'],
+  ] as const)('provides directly readable %s paths from a nested working directory', (_label, paths, root, attachments) => {
+    const cwd = paths.join(root, 'conversation');
+    const hits = [
+      hit(root, paths.join(cwd, 'accounts.csv')),
+      hit(root, paths.join(cwd, 'conversation', 'accounts.csv')),
+      hit(root, paths.join(root, 'conversation-other', 'accounts.csv')),
+      hit(attachments, paths.join(attachments, 'accounts.csv'), 'attachment'),
+    ];
+    const output = formatSearchFileResults(hits, paths, cwd);
+    const result = parse(output);
+    expect(result.files.map((f: any) => f.read_path)).toEqual([
+      'accounts.csv', paths.join('conversation', 'accounts.csv'), hits[2].path, hits[3].path,
+    ]);
+    expect(result.files.map((f: any) => paths.resolve(cwd, f.read_path)))
+      .toEqual(hits.map((h) => h.path));
+    expect(result.files.map((f: any) => paths.join(result.roots[f.root], f.path)))
+      .toEqual(hits.map((h) => h.path));
+    expect(output).toContain('Use files[].read_path directly for file tools.');
   });
 });

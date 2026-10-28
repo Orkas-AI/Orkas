@@ -80,6 +80,24 @@ async function createLibrary(projectId?: string) {
 }
 
 describe('kb-tools › library(search)', () => {
+  it('keeps an explicit directory filter within its literal Library subtree', async () => {
+    const kb = await import('../../../../src/main/features/kb_vector');
+    for (const relPath of ['annual_2026/selected.md', 'annualX2026/other.md']) {
+      const embedding = new Array(512).fill(0);
+      embedding[0] = 1;
+      await kb.upsertFile(TEST_UID, {
+        relPath, kind: 'text', bytes: 1, mtime: 1, sha1: relPath,
+        chunks: [{ title: 'Annual report', content: 'Annual report source', embedding }],
+      });
+    }
+    const library = await createLibrary();
+    const result = await library.execute({ action: 'search', query: 'annual report', dir: 'annual_2026' }, ctxFor());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('path="annual_2026/selected.md"');
+    expect(result.content).not.toContain('annualX2026');
+  });
+
   it('returns formatted hits with path/chunk/score/preview', async () => {
     await seedFiles();
     const library = await createLibrary();

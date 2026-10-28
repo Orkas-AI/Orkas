@@ -11,6 +11,7 @@ export const hermesBackend = makeAcpBackend({
   logName: 'local-agents:hermes',
   argv: ['acp'],
   clientName: 'orkas',
+  refreshMcpAfterModelSelection: true,
   extraEnv: opts => {
     if (opts.permissionPolicy === 'full_access') return { HERMES_YOLO_MODE: '1' };
     if (opts.permissionPolicy === 'ask') return { HERMES_YOLO_MODE: '0' };

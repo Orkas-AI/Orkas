@@ -32,39 +32,47 @@ function _kbPickerUiIconHtml(name, className) {
  * click.
  */
 async function pickKbLocation(opts = {}) {
-  if (_kbPickerResolve) {
-    // Only one picker at a time — reject older callers.
-    _kbPickerResolve(null);
-    _kbPickerResolve = null;
-  }
-  _kbPickerScope = _kbPickerNormalizeScope(opts.scope || opts.targetScope);
-  await _kbPickerLoadTree(_kbPickerScope);
+  // Own cancellation before loading: a newer open or close settles this caller
+  // even if its directory request has not returned yet.
+  closeKbPicker();
+  const scope = _kbPickerNormalizeScope(opts.scope || opts.targetScope);
+  _kbPickerScope = scope;
+  return new Promise((resolve, reject) => {
+    _kbPickerResolve = resolve;
+    void _kbPickerLoadTree(scope).then((tree) => {
+      if (_kbPickerResolve !== resolve) return;
+      _kbPickerTree = tree;
+      const defaultDir = opts.defaultDir != null
+        ? String(opts.defaultDir)
+        : _kbPickerReadLastDir(scope);
+      _kbPickerCurrentDir = _kbPickerDirExists(defaultDir) ? defaultDir : '';
 
-  const defaultDir = opts.defaultDir != null
-    ? String(opts.defaultDir)
-    : _kbPickerReadLastDir(_kbPickerScope);
-  _kbPickerCurrentDir = _kbPickerDirExists(defaultDir) ? defaultDir : '';
+      // Expand the path down to the default dir so the user sees the selection.
+      _kbPickerExpanded = new Set();
+      if (_kbPickerCurrentDir) {
+        const parts = _kbPickerCurrentDir.split('/');
+        for (let i = 1; i <= parts.length; i++) {
+          _kbPickerExpanded.add(parts.slice(0, i).join('/'));
+        }
+      }
 
-  // Expand the path down to the default dir so the user sees the selection.
-  _kbPickerExpanded = new Set();
-  if (_kbPickerCurrentDir) {
-    const parts = _kbPickerCurrentDir.split('/');
-    for (let i = 1; i <= parts.length; i++) {
-      _kbPickerExpanded.add(parts.slice(0, i).join('/'));
-    }
-  }
-
-  const modal = document.getElementById('kb-picker-modal');
-  document.getElementById('kb-picker-title').textContent =
-    opts.title || _kbPickerDefaultTitle(_kbPickerScope);
-  document.getElementById('kb-picker-name').value = opts.defaultName || '';
-  document.getElementById('kb-picker-msg').textContent = '';
-  _kbPickerRenderTree();
-  _kbPickerRenderTarget();
-  modal.classList.add('open');
-  setTimeout(() => document.getElementById('kb-picker-name')?.focus(), 40);
-
-  return new Promise((resolve) => { _kbPickerResolve = resolve; });
+      const modal = document.getElementById('kb-picker-modal');
+      document.getElementById('kb-picker-title').textContent =
+        opts.title || _kbPickerDefaultTitle(scope);
+      document.getElementById('kb-picker-name').value = opts.defaultName || '';
+      document.getElementById('kb-picker-msg').textContent = '';
+      _kbPickerRenderTree();
+      _kbPickerRenderTarget();
+      modal.classList.add('open');
+      setTimeout(() => {
+        if (_kbPickerResolve === resolve) document.getElementById('kb-picker-name')?.focus();
+      }, 40);
+    }).catch((error) => {
+      if (_kbPickerResolve !== resolve) return;
+      _kbPickerResolve = null;
+      reject(error);
+    });
+  });
 }
 window.pickKbLocation = pickKbLocation;
 
@@ -142,15 +150,14 @@ async function _kbPickerLoadTree(scope = { type: 'global' }) {
   try {
     if (scope && scope.type === 'project' && scope.projectId && window.orkas?.invoke) {
       const data = await window.orkas.invoke('projects.files.tree', { projectId: scope.projectId });
-      _kbPickerTree = data?.ok ? _kbPickerNormalizeTree(data.tree || []) : [];
-      return;
+      return data?.ok ? _kbPickerNormalizeTree(data.tree || []) : [];
     }
     const res = await apiFetch('/api/contexts/tree');
     const data = await res.json();
-    _kbPickerTree = data.ok ? _kbPickerNormalizeTree(data.tree || []) : [];
+    return data.ok ? _kbPickerNormalizeTree(data.tree || []) : [];
   } catch (e) {
     _kbPickerLog.warn('tree fetch failed', e);
-    _kbPickerTree = [];
+    return [];
   }
 }
 

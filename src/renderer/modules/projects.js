@@ -995,7 +995,33 @@ function _applyProjectRename(projectId, name) {
 
 // ── Init ────────────────────────────────────────────────────────────────
 
+function _applyProjectRename(projectId, name) {
+  const cached = Array.isArray(_projectsCache)
+    ? _projectsCache.find((project) => project?.project_id === projectId) : null;
+  if (cached) cached.name = name;
+  // Update only the title; reloading the detail would replace active editors.
+  if (typeof _projectDetailPid !== 'undefined' && _projectDetailPid === projectId
+      && typeof _projectDetailMeta !== 'undefined' && _projectDetailMeta?.project) {
+    _projectDetailMeta.project.name = name;
+    const title = document.getElementById('project-detail-title');
+    if (title) title.textContent = name;
+  }
+  renderProjectsSection();
+}
+
+async function _applyHostProjectRename(payload) {
+  if (!payload || typeof currentUserId === 'undefined' || payload.userId !== currentUserId
+      || typeof payload.projectId !== 'string' || !payload.projectId
+      || typeof payload.name !== 'string' || !payload.name) return;
+  _applyProjectRename(payload.projectId, payload.name);
+  // The normal loader fences older list requests and preserves sidebar edits.
+  await loadProjects(true);
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
+    window.orkas.onPushEvent('projects:renamed', _applyHostProjectRename);
+  }
   // `+` button on the section header.
   const addBtn = document.getElementById('projects-add-btn');
   if (addBtn) {

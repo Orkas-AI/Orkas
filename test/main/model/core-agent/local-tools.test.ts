@@ -14,12 +14,17 @@ const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 const UID = 'u-localtools-001';
 const CID = 'conv-edit';
 
-it('advertises edit freshness before the model attempts a cross-turn revision', async () => {
+it.each(['apply_patch', 'edit_file'])('advertises the accepted read/write baseline before a %s call', async name => {
   const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
-  const edit = createLocalTools({}).find(tool => tool.name === 'edit_file')!;
-  expect(edit.description).toContain('unchanged read/write baseline from this run');
-  expect(edit.description).toContain('or a matching expected_hash');
-  expect(edit.description).toContain('earlier turns alone do not establish a baseline');
+  const tool = createLocalTools({}).find(tool => tool.name === name)!;
+  expect(tool.description).toContain('unchanged baseline from this run');
+  expect(tool.description).toContain('read_files and successful file-tool writes establish');
+  expect(tool.description).toContain('bash reads/writes');
+  expect(tool.description).toContain('do not');
+  if (name === 'edit_file') {
+    expect(tool.description).toContain('or a matching expected_hash');
+    expect(tool.description).toContain('earlier turns alone do not');
+  }
 });
 
 let tmpDir: string;
@@ -703,13 +708,11 @@ async function buildBashTool() {
 }
 
 describe('local-tools › interactive CLI action contract', () => {
-  it('advertises a portable action schema and rejects cross-action fields before session lookup', async () => {
+  it('uses a portable schema and ignores send fields during close', async () => {
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
     const interactive = createLocalTools({ userId: UID, cid: CID })
       .find((tool) => tool.name === 'interactive_cli')!;
     const schema = interactive.inputSchema as any;
-    expect(schema.required).toEqual(['action']);
-    expect(schema).not.toHaveProperty('oneOf');
 
     const rejected = await interactive.execute({
       action: 'close',
@@ -2399,43 +2402,34 @@ describe('local-tools › apply_patch › transactional text changes', () => {
 
   it('keeps read and stale-write guards when context-only hunks locate an edit', async () => {
     await allFilesAuto();
-    const { applyPatch, wsDir } = await buildPatchTool();
+    const written: string[] = [];
+    const { applyPatch, wsDir } = await buildPatchTool({ onFileWritten: (p) => written.push(p) });
     const source = path.join(wsDir, 'source.ts');
-    fs.writeFileSync(source, 'const value = 1;\nconst label = "before";\n');
+    fs.writeFileSync(source, '// target\nconst value = 1;\n');
     const ctx = { workingDir: wsDir, state: { readFileState: new Map() } } as any;
+    const patch = [
+      '*** Begin Patch', `*** Update File: ${source}`,
+      '@@', ' // target', '@@', '-const value = 2;', '+const value = 3;',
+      '*** End Patch',
+    ].join('\n');
 
-    const blocked = await applyPatch.execute({
-      patch: [
-        '*** Begin Patch',
-        `*** Update File: ${source}`,
-        '@@',
-        '-const label = "before";',
-        '+const label = "after";',
-        '*** End Patch',
-      ].join('\n'),
-    }, ctx);
+    const unread = await applyPatch.execute({ patch }, ctx);
+    expect(unread.content).toContain('E_NOT_READ');
+    expect(fs.readFileSync(source, 'utf8')).toBe('// target\nconst value = 1;\n');
+    const tracker = await import('../../../../src/main/model/core-agent/read-tracker');
+    tracker.recordRead(ctx, source, undefined, hash('// target\nconst value = 1;\n'));
+    fs.writeFileSync(source, '// target\nconst value = 2;\n');
 
-    expect(blocked.isError).toBe(true);
-    expect(blocked.content).toContain('E_NOT_READ');
-    expect(blocked.content).toContain('<patch-recovery file_hash=');
-    expect(blocked.content).toContain('rebuild the patch against these bytes');
-    expect(blocked.content).not.toContain('expected_hash');
-    expect(fs.readFileSync(source, 'utf8')).toBe('const value = 1;\nconst label = "before";\n');
+    const stale = await applyPatch.execute({ patch }, ctx);
+    expect(stale.content).toContain('E_STALE');
+    expect(fs.readFileSync(source, 'utf8')).toBe('// target\nconst value = 2;\n');
+    expect(written).toEqual([]);
 
-    const retried = await applyPatch.execute({
-      patch: [
-        '*** Begin Patch',
-        `*** Update File: ${source}`,
-        '@@',
-        ' const value = 1;',
-        '-const label = "before";',
-        '+const label = "after";',
-        '*** End Patch',
-      ].join('\n'),
-    }, ctx);
-
-    expect(retried.isError).toBeFalsy();
-    expect(fs.readFileSync(source, 'utf8')).toBe('const value = 1;\nconst label = "after";\n');
+    // The existing stale response supplies current bytes and refreshes the baseline.
+    const recovered = await applyPatch.execute({ patch }, ctx);
+    expect(recovered.isError).toBeFalsy();
+    expect(fs.readFileSync(source, 'utf8')).toBe('// target\nconst value = 3;\n');
+    expect(written).toEqual([source]);
   });
 
   it('moves an updated file while preserving its mode and reporting the destination', async () => {
@@ -2570,6 +2564,26 @@ describe('local-tools › edit_file › file kind / existence', () => {
 });
 
 describe('local-tools › edit_file › matching semantics', () => {
+  it.each(['exact', 'whitespace_relaxed', 'replace_all'])('writes replacement tokens literally (%s)', async (mode) => {
+    await allFilesAuto();
+    const written: string[] = [];
+    const { edit, wsDir } = await buildEditTool({ onFileWritten: (p) => written.push(p) });
+    const p = path.join(wsDir, 'literal.ps1');
+    const needle = 'first\nsecond';
+    const source = mode === 'whitespace_relaxed' ? 'first  \nsecond' : needle;
+    const replacement = "if ($value -match '^ok$') { '$& $$ $` $1 $<name>' }";
+    const before = `prefix\r\n${source}\r\nsuffix` + (mode === 'replace_all' ? `\r\n${source}` : '');
+    const expected = `prefix\r\n${replacement}\r\nsuffix` + (mode === 'replace_all' ? `\r\n${replacement}` : '');
+    fs.writeFileSync(p, before);
+    const result = await run(edit, { path: p, old_string: needle, new_string: replacement, replace_all: mode === 'replace_all' });
+    expect(result.isError).toBeFalsy();
+    expect(fs.readFileSync(p, 'utf8')).toBe(expected);
+    expect(result.content).toContain(`edited="${mode === 'replace_all' ? 2 : 1}"`);
+    expect(result.content).toContain('revision=');
+    expect(written).toEqual([p]);
+    if (mode === 'whitespace_relaxed') expect(result.content).toContain('match="whitespace_relaxed"');
+  });
+
   it('returns bounded real contexts for long-line matches and supports an exact targeted retry', async () => {
     await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
@@ -2915,6 +2929,7 @@ async function buildCreateArtifactTool(opts: {
     warnings?: string[];
     controlsExercised?: number;
     observableEffects?: number;
+    sdkByViewport?: Array<{ viewport: string; calls: Array<{ method: string; code: string }> }>;
   }>;
 } = {}) {
   const localTools = await import('../../../../src/main/model/core-agent/local-tools');
@@ -2935,6 +2950,29 @@ async function buildCreateArtifactTool(opts: {
 
 const MIN_FILES = [{ path: 'index.html', content: '<!doctype html><h1>hi</h1>' }];
 
+it('repairs a preview issue through the same application identity and exposes the committed revision', async () => {
+  const events: Array<{ id: string; title: string; revision?: number }> = [];
+  const tool = await buildCreateArtifactTool({ agentId: 'builder', onArtifactCreated: a => events.push(a),
+    artifactInteractionSmoke: async () => ({ ok: events.length > 0, blockers: events.length ? [] : ['runtime fault'] }) });
+  const first = await run(tool, { title: 'Chat', files: MIN_FILES });
+  expect(first.content).toContain('preview reported issues');
+  expect(first.content).toContain('artifact_id');
+  const second = await run(tool, { artifact_id: events[0].id, files: [{ path: 'index.html', content: '<!doctype html><button>Corrected</button>' }] });
+  expect(second.isError).toBeFalsy();
+  expect(events).toEqual([{ id: events[0].id, title: 'Chat', revision: 1 }, { id: events[0].id, title: 'Chat', revision: 2 }]);
+  expect(second.content).toContain('updated');
+  expect(fs.readdirSync(path.join(tmpDir, UID, 'cloud/chat_artifacts', CID))).toEqual([events[0].id]);
+});
+
+it('reports a failed correction without publishing another app or deleting the previous version', async () => {
+  const events: Array<{ id: string }> = [];
+  const tool = await buildCreateArtifactTool({ agentId: 'builder', onArtifactCreated: a => events.push(a) });
+  await run(tool, { files: MIN_FILES });
+  const result = await run(tool, { artifact_id: events[0].id, files: [{ path: 'style.css', content: 'body{}' }] });
+  expect(result.isError).toBe(true); expect(events).toHaveLength(1);
+  expect(fs.readFileSync(path.join(tmpDir, UID, 'cloud/chat_artifacts', CID, events[0].id, 'index.html'), 'utf8')).toContain('<h1>hi</h1>');
+});
+
 describe('local-tools › create_artifact › availability', () => {
   it('is offered only when both cid and onArtifactCreated are present', async () => {
     expect(await buildCreateArtifactTool({ cid: CID, onArtifactCreated: () => {} })).toBeTruthy();
@@ -2953,7 +2991,8 @@ describe('local-tools › create_artifact › permission mode', () => {
     const r = await run(tool, { title: 'X', files: MIN_FILES });
     expect(r.isError).toBeFalsy();
     expect(r.content).toMatch(/do NOT paste/i);
-    expect(r.content).toMatch(/preview checks passed/i);
+    expect(r.content).toContain('preview completed');
+    expect(r.content).toContain('not a full functional verification');
   });
 
   it('publishes a valid bundle with honest diagnostics even when preview checks find issues', async () => {
@@ -2987,6 +3026,20 @@ describe('local-tools › create_artifact › permission mode', () => {
     expect(fs.existsSync(candidateDir)).toBe(true);
   });
 
+  it.each(['E_PERMISSION', 'E_UNAVAILABLE', 'E_CANCELLED'])('delivers an app with factual %s SDK observations without requiring repair', async code => {
+    const created: Array<{ id: string }> = [];
+    const tool = await buildCreateArtifactTool({ onArtifactCreated: a => created.push(a),
+      artifactInteractionSmoke: async () => ({ ok: true, blockers: [], controlsExercised: 1, observableEffects: 1,
+        sdkByViewport: [{ viewport: 'mobile', calls: [{ method: 'data.query', code }, { method: 'data.query', code }] }] }) });
+    const result = await run(tool, { title: 'Editable app', files: MIN_FILES });
+    expect(result.isError).toBeFalsy();
+    expect(created).toHaveLength(1);
+    expect(result.content).toContain(`mobile data.query: ${code}`);
+    expect(result.content.match(new RegExp(code, 'g'))).toHaveLength(1);
+    expect(result.content).not.toContain('checks passed');
+    expect(fs.existsSync(path.join(tmpDir, UID, 'cloud/chat_artifacts', CID, created[0].id, 'index.html'))).toBe(true);
+  });
+
   it('retains unavailable remote resource diagnostics without forcing an offline rewrite', async () => {
     await allFilesAuto();
     const tool = await buildCreateArtifactTool({
@@ -3010,17 +3063,17 @@ describe('local-tools › create_artifact › permission mode', () => {
 });
 
 describe('local-tools › create_artifact › success + callback', () => {
-  it.each(['web', 'cloud'])('refuses an explicit %s artifact without output or callback', async appType => {
+  it('declares and persists an explicit cloud type without granting desktop interfaces', async () => {
     await allFilesAuto();
-    const created: Array<{ id: string }> = [];
-    const smoke = vi.fn();
-    const tool = await buildCreateArtifactTool({ onArtifactCreated: a => created.push(a), artifactInteractionSmoke: smoke });
-    expect(tool.inputSchema.properties.appType.enum).toEqual(['local', 'web']);
-    const result = await run(tool, { appType, files: MIN_FILES });
-    expect(result.isError).toBe(true);
-    expect(JSON.parse(String(result.content))).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
-    expect(created).toEqual([]); expect(smoke).not.toHaveBeenCalled();
-    expect(fs.existsSync(path.join(tmpDir, UID, 'cloud/chat_artifacts', CID))).toBe(false);
+    const created: Array<{id:string}>=[];
+    const tool=await buildCreateArtifactTool({onArtifactCreated:a=>created.push(a)});
+    expect(tool.inputSchema.properties.appType.enum).toEqual(['local','web']);
+    const result=await run(tool,{appType:'web',files:MIN_FILES});
+    expect(result.isError).toBeFalsy();
+    const meta=JSON.parse(fs.readFileSync(path.join(tmpDir,UID,'cloud/chat_artifacts',CID,created[0].id,'__orkas-meta.json'),'utf8'));
+    expect(meta.appType).toBe('web');
+    expect(result.content).not.toContain('orkasArtifact.send');
+    expect(result.content).not.toContain('bridge.js');
   });
   it('preserves the application and reports unavailable preview without claiming verification', async () => {
     const created: unknown[]=[];
@@ -3254,35 +3307,6 @@ describe('local-tools › markdown_to_pdf › locked probe+render wiring', () =>
       expect(failed.isError).toBe(true);
       expect(String(failed.content)).toContain('Error generating PDF');
       expect(fs.existsSync(path.join(wsDir, 'broken.pdf'))).toBe(false);
-    } finally {
-      vi.doUnmock('../../../../src/main/util/md-to-pdf');
-      vi.resetModules();
-    }
-  });
-});
-
-describe('PDF output publication', () => {
-  it.each(['markdown', 'html'])('keeps a successfully rendered %s PDF successful when the publication callback fails', async (sourceType) => {
-    vi.resetModules();
-    const render = vi.fn(async (_content: string, outPath: string) => { fs.writeFileSync(outPath, '%PDF-fixture'); });
-    vi.doMock('../../../../src/main/util/md-to-pdf', () => ({ markdownToPdf: render, htmlToPdf: render }));
-    try {
-      const users = await import('../../../../src/main/features/users');
-      users.activateUser(UID);
-      await allFilesAuto();
-      const ws = await import('../../../../src/main/features/user_workspace');
-      const wsDir = path.join(tmpDir, 'ws');
-      fs.mkdirSync(wsDir, { recursive: true });
-      expect(ws.setWorkspacePath(UID, wsDir).ok).toBe(true);
-      const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
-      const onFileWritten = vi.fn(async () => { throw new Error('publication fixture failed'); });
-      const tool = createLocalTools({ userId: UID, cid: CID, onFileWritten }).find((item) => item.name === 'create_pdf')!;
-      const target = path.join(wsDir, 'report.pdf');
-      const result = await tool.execute({ source_type: sourceType, path: target, content: '<h1>Report</h1>' }, { workingDir: wsDir, state: {} } as any);
-      expect(result.isError).toBeFalsy();
-      expect(String(result.content)).toContain('PDF written:');
-      expect(fs.readFileSync(target, 'utf8')).toBe('%PDF-fixture');
-      expect(onFileWritten).toHaveBeenCalledWith(target);
     } finally {
       vi.doUnmock('../../../../src/main/util/md-to-pdf');
       vi.resetModules();

@@ -1,4 +1,5 @@
 import { getEventListeners } from 'node:events';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -147,6 +148,29 @@ describe('analyzeFrames — orchestration', () => {
     expect(diagnostic[0]).toBe(failure === 'frame' ? 'frame load failed' : 'frame analysis degraded');
     expect(diagnostic[1].error).toMatchObject({ message_hash: expect.stringMatching(/^[a-f0-9]{12}$/) });
     if (failure === 'frame') expect(diagnostic[1].frame).toMatchObject({ path_hash: expect.stringMatching(/^[a-f0-9]{12}$/) });
+  });
+
+  it('preserves color through the real frame loader into model input', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'orkas-frame-color-'));
+    try {
+      const { Jimp } = await import('jimp' as any);
+      const frame = new Jimp({ width: 80, height: 60, color: 0xDC1E1EFF });
+      const path = join(dir, 'frame.png');
+      await writeFile(path, await frame.getBuffer('image/png'));
+      const chat = vi.fn(async (_opts: { images?: LoadedImage[] }) => okRes('A red frame.'));
+      const result = await analyzeFrames({
+        userId: 'u1', framePaths: [path], question: 'describe', chat: chat as never,
+      });
+      expect(result).toMatchObject({ ok: true, framesUsed: 1 });
+      const options = chat.mock.calls[0][0];
+      const decoded = await Jimp.read(Buffer.from(options.images![0].data, 'base64'));
+      const px = decoded.getPixelColor(40, 30);
+      expect((px >>> 24) & 0xff).toBeGreaterThan(200);
+      expect((px >>> 16) & 0xff).toBeLessThan(45);
+      expect((px >>> 8) & 0xff).toBeLessThan(45);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('degrades to no-frames when no paths are supplied (no model call)', async () => {

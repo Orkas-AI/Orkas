@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
+import ts from 'typescript';
 
 import { describe, expect, it } from 'vitest';
 
@@ -175,6 +176,64 @@ describe('external CLI Agent detail layout', () => {
     expect(settings).toContain('_mergeAgentIntoCache(saved.agent)');
     expect(settings).not.toContain('_agentsCache = null');
   });
+  it.each([['success', false], ['success', true], ['up_to_date', false], ['up_to_date', true]] as const)('retains %s upgrade feedback across overlapping detail refreshes (older first: %s)', async (state, olderFirst) => {
+    const source = fs.readFileSync(path.join(rendererRoot, 'modules/agents.js'), 'utf8');
+    const ast = ts.createSourceFile('agents.js', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const entry = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === '_renderAgentDetailRuntime');
+    expect(entry).toBeDefined();
+    // A minimal DOM ownership double; the native CLI E2E separately verifies
+    // the real controls, locale text and installer invocation count.
+    class Element {
+      dataset: Record<string, string> = {};
+      style: Record<string, string> = {};
+      className = '';
+      parentElement: Element | null = null;
+      children: Element[] = [];
+      options: Array<{ value: string; label: string }> = [];
+      set innerHTML(_html: string) { for (const child of this.children) child.parentElement = null; this.children = []; }
+      appendChild(child: Element) {
+        if (child.parentElement) child.parentElement.children = child.parentElement.children.filter(node => node !== child);
+        child.parentElement = this; this.children.push(child); return child;
+      }
+      querySelector(selector: string): Element | null {
+        for (const child of this.children) {
+          if (child.className.split(' ').includes(selector.slice(1))) return child;
+          const nested = child.querySelector(selector); if (nested) return nested;
+        }
+        return null;
+      }
+      setAttribute() {}
+    }
+    const slot = new Element(), section = new Element(), feedback = new Element();
+    slot.dataset.runtimeKey = 'one::claude';
+    feedback.className = 'local-cli-upgrade-control'; feedback.dataset.state = state;
+    slot.appendChild(feedback);
+    const resolveDiscovery: Array<(entries: unknown[]) => void> = [];
+    const context = vm.createContext({
+      document: { getElementById: (id: string) => id.endsWith('-section') ? section : slot, createElement: () => new Element() },
+      _selectedAgent: { id: 'one' }, _agentsLog: { warn() {} }, t: (key: string) => key,
+      loadLocalCliEntries: () => new Promise(resolve => { resolveDiscovery.push(resolve); }),
+      window: { createLocalCliUpgradeControl: () => {
+        const empty = new Element(); empty.className = 'local-cli-upgrade-control'; return empty;
+      } },
+      _aiSelectMount: (mount: Element, { options }: { options: Element['options'] }) => {
+        mount.options = options; const trigger = new Element(); trigger.className = 'ai-select-trigger'; mount.appendChild(trigger);
+      },
+    });
+    vm.runInContext(entry!.getText(ast), context);
+    const agent = { agent_id: 'one', runtime: { kind: 'cli', cli: 'claude' } };
+    const runs = [context._renderAgentDetailRuntime(agent), context._renderAgentDetailRuntime(agent)];
+    expect.soft(slot.querySelector('.local-cli-upgrade-control')).toBe(feedback);
+    for (const index of olderFirst ? [0, 1] : [1, 0]) {
+      resolveDiscovery[index]([{ type: 'claude', available: true, version: index === 0 ? '2.1.112' : '2.1.113' }]);
+      await runs[index];
+    }
+    expect(slot.querySelector('.local-cli-upgrade-control')).toBe(feedback);
+    expect(slot.querySelector('.local-cli-upgrade-control')?.dataset.state).toBe(state);
+    expect(slot.querySelector('.agents-detail-runtime-select')?.options[0].label).toContain('2.1.113');
+  });
+
+
 });
 
 // The picker is what a user reads before pinning an Agent to a model, so the
@@ -182,7 +241,7 @@ describe('external CLI Agent detail layout', () => {
 // cannot be checked against a release note or a support thread. The option
 // loop is run here directly so the assertions are the visible strings.
 describe('external CLI Agent model picker labels', () => {
-  const source = fs.readFileSync(path.join(rendererRoot, 'modules/agents.js'), 'utf8');
+  const source = fs.readFileSync(path.join(rendererRoot, 'modules/agents.js'), 'utf8').replace(/\r\n/g, '\n');
 
   function buildModelOptions(input: {
     models: Array<Record<string, unknown>>;

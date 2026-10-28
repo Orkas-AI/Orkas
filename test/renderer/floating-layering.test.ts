@@ -7,12 +7,29 @@ function readRendererCss() {
 }
 
 function zIndexForSelector(css: string, selector: string) {
-  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const match = css.match(new RegExp(`${escaped}\\s*\\{[\\s\\S]*?z-index:\\s*(\\d+)`));
-  return match ? Number(match[1]) : null;
+  const rules = css.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/([^{}]+)\{([^{}]*)\}/g);
+  const rule = Array.from(rules).find(([, selectors]) =>
+    selectors.split(',').some(value => value.trim() === selector),
+  );
+  const declaration = rule?.[2].match(/(?:^|;)\s*z-index\s*:\s*(-?\d+)\s*(?:!important\s*)?(?:;|$)/i);
+  return declaration ? Number(declaration[1]) : null;
 }
 
 describe('floating layer ordering', () => {
+  it.each([
+    ['adjacent rule', '.skill-picker { position: fixed; } .other { z-index: 14000; }', null],
+    ['descendant selector', '.parent .skill-picker { z-index: 14000; }', null],
+    ['commented declaration', '.skill-picker { /* z-index: 14000; */ position: fixed; }', null],
+    ['custom property', '.skill-picker { --z-index: 14000; }', null],
+    ['different class', '.skill-picker-other { z-index: 14000; }', null],
+    ['missing selector', '.other { z-index: 14000; }', null],
+    ['signed value', '.skill-picker { z-index: -1; }', -1],
+    ['important declaration', '.skill-picker { z-index : 14000 !important; }', 14000],
+    ['shared selector list', '.other, .skill-picker { z-index: 14000; }', 14000],
+  ] as const)('reads only the owning declaration: %s', (_label, css, expected) => {
+    expect(zIndexForSelector(css, '.skill-picker')).toBe(expected);
+  });
+
   it('keeps body-level pickers above shared dialog overlays', () => {
     const css = readRendererCss();
     const dialogZ = zIndexForSelector(css, '.ui-dialog-overlay');

@@ -13,12 +13,8 @@ vi.mock('../../../src/main/features/auth', () => ({
     mocks.profiles = profiles.map((profile) => ({ ...profile }));
   },
 }));
-vi.mock('../../../src/main/model/core-agent/search-adapters', () => ({
-  searchAdaptersByProvider: {
-    tavily: vi.fn(),
-    serper: vi.fn(),
-    keenable: vi.fn(),
-  },
+vi.mock('../../../src/main/model/core-agent/search-adapters', async importOriginal => ({
+  ...await importOriginal(),
   runSearchAdapter: mocks.runSearchAdapter,
 }));
 vi.mock('../../../src/main/logger', () => ({
@@ -36,6 +32,15 @@ beforeEach(() => {
 });
 
 describe('search credential profiles', () => {
+  it('accepts and probes a user-owned DeepSeek key without a managed session',async()=>{
+    const auth=await import('../../../src/main/features/search_auth');
+    const added=auth.addSearchProfile({provider:'deepseek',apiKey:'fixture-key'});
+    expect(added.ok).toBe(true);if(!added.ok)throw new Error('profile rejected');
+    mocks.runSearchAdapter.mockResolvedValue({provider:'deepseek',results:[]});
+    expect(await auth.testSearchProfile(added.id)).toMatchObject({ok:true});
+    expect(auth.listSearchProfiles()).toHaveLength(1);
+    expect(mocks.runSearchAdapter).toHaveBeenCalledWith(expect.objectContaining({provider:'deepseek',apiKey:'fixture-key'}),'Orkas connectivity probe',1);
+  });
   it('does not create duplicate fallback rows for the same provider and key', async () => {
     const searchAuth = await import('../../../src/main/features/search_auth');
 

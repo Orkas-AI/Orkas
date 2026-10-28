@@ -4,24 +4,43 @@ import { checkLatencyBudget } from './latency-budget';
 afterEach(() => vi.restoreAllMocks());
 
 it.each([
-  { ms: 300, warnings: 0, fails: false },
-  { ms: 301, warnings: 1, fails: false },
-  { ms: 500, warnings: 1, fails: false },
-  { ms: 501, warnings: 1, fails: true },
-])('reports $ms ms without turning the 300 ms target into a hard failure', ({ ms, warnings, fails }) => {
+  { platform: 'win32', limit: 800, firstRequest: 700 },
+  { platform: 'darwin', limit: 500, firstRequest: 500 },
+  { platform: 'linux', limit: 500, firstRequest: 500 },
+])('uses the approved $limit ms response budget on $platform', async ({ platform, limit, firstRequest }) => {
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  let budget: typeof import('./latency-budget');
+  try {
+    Object.defineProperty(process, 'platform', { value: platform });
+    vi.resetModules();
+    budget = await import('./latency-budget');
+  } finally {
+    Object.defineProperty(process, 'platform', descriptor);
+  }
+  expect(budget.LATENCY_LIMIT_MS).toBe(limit);
+  expect(budget.FIRST_REQUEST_LATENCY_LIMIT_MS).toBe(firstRequest);
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-  const check = () => checkLatencyBudget('fixture request', {
-    elapsedMs: ms, phases: [{ phase: 'prepared', ms: 100 }],
-  });
-  if (fails) expect(check).toThrow('budget 500 ms');
-  else expect(check).not.toThrow();
-  expect(warn).toHaveBeenCalledTimes(warnings);
-  if (warnings) {
-    expect(warn.mock.calls[0][0]).toBe('[latency-warning]');
-    expect(JSON.parse(warn.mock.calls[0][1])).toEqual({
-      metric: 'fixture request', elapsed_ms: ms, target_ms: 300, limit_ms: 500,
-      phases: [{ phase: 'prepared', ms: 100 }],
+  for (const { ms, warnings, fails } of [
+    { ms: 300, warnings: 0, fails: false },
+    { ms: 301, warnings: 1, fails: false },
+    { ms: limit - 1, warnings: 1, fails: false },
+    { ms: limit, warnings: 1, fails: false },
+    { ms: limit + 1, warnings: 1, fails: true },
+  ]) {
+    warn.mockClear();
+    const check = () => budget.checkLatencyBudget('fixture request', {
+      elapsedMs: ms, phases: [{ phase: 'prepared', ms: 100 }],
     });
+    if (fails) expect(check).toThrow(`budget ${limit} ms`);
+    else expect(check).not.toThrow();
+    expect(warn).toHaveBeenCalledTimes(warnings);
+    if (warnings) {
+      expect(warn.mock.calls[0][0]).toBe('[latency-warning]');
+      expect(JSON.parse(warn.mock.calls[0][1])).toEqual({
+        metric: 'fixture request', elapsed_ms: ms, target_ms: 300, limit_ms: limit,
+        phases: [{ phase: 'prepared', ms: 100 }],
+      });
+    }
   }
 });
 

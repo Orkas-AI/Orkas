@@ -175,16 +175,19 @@ describe('i18n › t() lookup', () => {
   });
 
   it('ships privacy-safe task-intervention notification copy in every supported language', () => {
+    // The copy names what kind of work wants attention and how many, never
+    // the task's content or title.
     const expected = {
-      en: ['Task status updated', 'Open Orkas to view details.'],
-      zh: ['任务状态已更新', '打开 Orkas 查看详情。'],
-      ja: ['タスクのステータスが更新されました', 'Orkas を開いて詳細を確認してください。'],
-      pt: ['Status da tarefa atualizado', 'Abra o Orkas para ver os detalhes.'],
+      en: ['A task needs your reply', 'Open Orkas to view details.', '3 automation runs failed'],
+      zh: ['有任务等你回复', '打开 Orkas 查看详情。', '3 个自动化运行失败'],
+      ja: ['タスクが返信を待っています', 'Orkas を開いて詳細を確認してください。', '3 件の自動化の実行が失敗しました'],
+      pt: ['Uma tarefa aguarda sua resposta', 'Abra o Orkas para ver os detalhes.', '3 execuções de automação falharam'],
     } as const;
     for (const lang of ['en', 'zh', 'ja', 'pt'] as const) {
       expect([
         t('notification.task.waiting_input.title', undefined, lang),
         t('notification.task.waiting_input.body', undefined, lang),
+        t('notification.automation.failed.title_many', { count: 3 }, lang),
       ]).toEqual(expected[lang]);
     }
   });

@@ -42,7 +42,7 @@ function harness(...modules: string[]) {
     },
     _aiSelectMount(_host: any, config: any) {
       selections.push(config);
-      return { state: {}, setValue() {}, setAriaLabel() {}, setOptions(options: any) { selections.push({ options }); } };
+      return { state: {}, close() {}, setValue() {}, setAriaLabel() {}, setOptions(options: any) { selections.push({ options }); } };
     },
     orkas: { invoke: async (channel: string) => channel === 'projects.list' ? { projects } : { tree: [] } },
   };

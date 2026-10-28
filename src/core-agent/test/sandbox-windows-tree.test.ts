@@ -78,7 +78,7 @@ it.runIf(process.platform === "win32")("cleans up eight simultaneous deadlines w
   }
 }, 15_000);
 
-it.runIf(process.platform === "win32")("reaps a child born after the cleanup snapshot without killing an unrelated producer", async () => {
+it.runIf(process.platform === "win32").each([0, 3])("reaps a child born after the cleanup snapshot without killing an unrelated producer (extra launcher depth %s)", async (extraDepth) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-late-child-"));
   let root: ChildProcess | undefined;
   let sibling: ChildProcess | undefined;
@@ -90,7 +90,12 @@ it.runIf(process.platform === "win32")("reaps a child born after the cleanup sna
       + "console.log('ready');setTimeout(()=>process.exit(0),10000)";
     // Detached descendants model shells that do not automatically reap their
     // children, while retaining real parent identities and inherited pipes.
-    const rootScript = `require('child_process').spawn(process.execPath,['-e',${JSON.stringify(producerScript)}],`
+    let descendantScript = producerScript;
+    for (let depth = 0; depth < extraDepth; depth++) {
+      descendantScript = `require('child_process').spawn(process.execPath,['-e',${JSON.stringify(descendantScript)}],`
+        + "{windowsHide:true,detached:true,stdio:'inherit'});setInterval(()=>{},1000);setTimeout(()=>process.exit(0),10000)";
+    }
+    const rootScript = `require('child_process').spawn(process.execPath,['-e',${JSON.stringify(descendantScript)}],`
       + "{windowsHide:true,detached:true,stdio:'inherit'});setInterval(()=>{},1000);setTimeout(()=>process.exit(0),10000)";
     sibling = spawn(node, ["-e", "console.log('ready');setInterval(()=>{},1000);setTimeout(()=>process.exit(0),10000)"], { windowsHide: true });
     await new Promise<void>((resolve, reject) => {

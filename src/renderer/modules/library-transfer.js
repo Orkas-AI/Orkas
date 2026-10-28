@@ -9,6 +9,8 @@
     : { warn() {} };
 
   let confirmingDrafts = false;
+  let latestOpen = 0;
+  let activeDialog = null;
 
   async function confirmUnsaved({ paths, drafts, getActivePath, getController, openFile, isCurrent }) {
     if (confirmingDrafts || !isCurrent()) return false;
@@ -96,10 +98,10 @@
       'target_exists',
       'transfer_failed',
       'unsupported_destination',
+      'E_IPC_REQUEST', 'E_IPC_SENDER', 'E_NOT_LOGGED_IN', 'E_STORAGE_FULL',
+      'E_NETWORK_TIMEOUT', 'E_NETWORK_UNAVAILABLE', 'E_BAD_RESPONSE', 'E_SERVER_UNAVAILABLE',
     ]);
-    const errorCode = known.has(raw)
-      ? raw
-      : (/^E_[A-Z0-9_]{1,64}$/.test(raw) && raw !== 'E_UNKNOWN' ? raw : 'transfer_failed');
+    const errorCode = known.has(raw) ? raw : 'transfer_failed';
     const errorType = /invalid|unsupported/.test(errorCode)
       ? 'validation'
       : (/target_exists|account_changed/.test(errorCode) ? 'conflict' : 'operation');
@@ -161,14 +163,17 @@
   }
 
   async function openLibraryTransfer(opts) {
-    const source = opts?.source;
+    const source = opts?.source ? { ...opts.source } : null;
+    const onComplete = opts?.onComplete;
     const paths = Array.from(new Set((opts?.paths || []).map((item) => String(item || '')).filter(Boolean)));
     if (!source || !paths.length) return null;
-    document.getElementById('library-transfer-overlay')?.remove();
+    const opening = ++latestOpen;
+    activeDialog?.close();
 
     let projects;
     try { projects = await _loadProjects(); }
     catch (_) { projects = []; }
+    if (opening !== latestOpen) return null;
     const libraryOptions = [
       { value: 'global', label: t('contexts.transfer.global_library'), iconName: 'folder' },
       ...projects.map((project) => ({
@@ -225,13 +230,27 @@
     let currentRef = _parseLibraryValue(initialLibrary) || { scope: 'global' };
     let loadingFolders = false;
     let destinationReady = false;
+    let submitting = false;
+    let closed = false;
     const folderEl = overlay.querySelector('[data-transfer-folders]');
     const errorEl = overlay.querySelector('[data-transfer-error]');
     const confirmBtn = overlay.querySelector('[data-transfer-confirm]');
 
     const close = () => {
+      if (closed) return;
+      closed = true;
+      selector?.close();
       document.removeEventListener('keydown', onKey, true);
       overlay.remove();
+      if (activeDialog?.close === close) activeDialog = null;
+    };
+    const setSubmitting = (value) => {
+      submitting = value;
+      if (value) selector?.close();
+      overlay.querySelectorAll('[data-transfer-mode], [data-folder-path], .ai-select-trigger').forEach((control) => {
+        control.disabled = submitting || closed;
+      });
+      confirmBtn.disabled = closed || submitting || !_canSubmitTransfer({ loading: loadingFolders, destinationReady });
     };
     const showError = (message) => {
       errorEl.textContent = message || '';
@@ -254,6 +273,7 @@
       targetDir = '';
       folderEl.querySelectorAll('[data-folder-path]').forEach((row) => {
         row.addEventListener('click', () => {
+          if (submitting || closed) return;
           targetDir = row.dataset.folderPath || '';
           folderEl.querySelectorAll('.active').forEach((node) => node.classList.remove('active'));
           row.classList.add('active');
@@ -280,10 +300,11 @@
       },
       onFinish: () => {
         loadingFolders = false;
-        confirmBtn.disabled = !_canSubmitTransfer({ loading: loadingFolders, destinationReady });
+        setSubmitting(submitting);
       },
     });
     const refreshFolders = (value) => {
+      if (submitting || closed) return Promise.resolve(false);
       const ref = _parseLibraryValue(value);
       if (!ref) return Promise.resolve(false);
       return loadFolders(ref);
@@ -297,13 +318,14 @@
     selector?.setValue(initialLibrary);
     overlay.querySelectorAll('[data-transfer-mode]').forEach((input) => {
       input.addEventListener('change', () => {
-        if (!input.checked) return;
+        if (submitting || closed || !input.checked) return;
         mode = input.dataset.transferMode === 'copy' ? 'copy' : 'move';
         confirmBtn.textContent = t(mode === 'copy' ? 'contexts.transfer.copy' : 'contexts.transfer.move');
         showError('');
       });
     });
     const onKey = (event) => {
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key !== 'Escape') return;
       event.preventDefault();
       close();
@@ -311,30 +333,29 @@
     document.addEventListener('keydown', onKey, true);
     overlay.querySelector('[data-transfer-close]')?.addEventListener('click', close);
     overlay.querySelector('[data-transfer-cancel]')?.addEventListener('click', close);
+    activeDialog = { close };
     confirmBtn.addEventListener('click', async () => {
-      if (!_canSubmitTransfer({ loading: loadingFolders, destinationReady }) || confirmBtn.disabled) return;
-      confirmBtn.disabled = true;
+      if (closed || submitting || !_canSubmitTransfer({ loading: loadingFolders, destinationReady }) || confirmBtn.disabled) return;
+      const request = { mode, source: { ...source }, paths: [...paths], destination: { ...currentRef, dir: targetDir } };
+      setSubmitting(true);
       showError('');
       let result;
       try {
-        result = await root.orkas.invoke('library.transfer', {
-          mode,
-          source,
-          paths,
-          destination: { ...currentRef, dir: targetDir },
-        });
+        result = await root.orkas.invoke('library.transfer', request);
       } catch (err) {
         const failure = _transferFailureDetails(err);
-        transferLog.warn('library transfer failed', { mode, source_scope: source.scope, destination_scope: currentRef.scope, ...failure });
+
+        transferLog.warn('library transfer failed', { mode: request.mode, source_scope: request.source.scope, destination_scope: request.destination.scope, ...failure });
         showError(t('contexts.transfer.error_generic'));
-        confirmBtn.disabled = false;
+        setSubmitting(false);
         return;
       }
       if (!result?.ok) {
         const failure = _transferFailureDetails(result);
-        transferLog.warn('library transfer failed', { mode, source_scope: source.scope, destination_scope: currentRef.scope, ...failure });
+
+        transferLog.warn('library transfer failed', { mode: request.mode, source_scope: request.source.scope, destination_scope: request.destination.scope, ...failure });
         showError(_errorLabel(failure.error_code));
-        confirmBtn.disabled = false;
+        setSubmitting(false);
         return;
       }
       const succeededCount = Number(result.succeeded || 0);
@@ -344,23 +365,24 @@
         : (succeededCount > 0 ? 'partial' : 'failure');
       const firstError = result.results?.find((row) => !row.ok)?.error;
       const failure = resultValue === 'success' ? {} : _transferFailureDetails(firstError || 'transfer_failed');
+
       if (succeededCount === 0) {
-        transferLog.warn('library transfer failed', { mode, source_scope: source.scope, destination_scope: currentRef.scope, ...failure });
+        transferLog.warn('library transfer failed', { mode: request.mode, source_scope: request.source.scope, destination_scope: request.destination.scope, ...failure });
         showError(_errorLabel(firstError));
-        confirmBtn.disabled = false;
+        setSubmitting(false);
         return;
       }
       close();
-      if (typeof opts?.onComplete === 'function') {
+      if (typeof onComplete === 'function') {
         try {
-          await opts.onComplete({ ...result, mode, source, destination: { ...currentRef, dir: targetDir } });
-        } catch (err) {
-          transferLog.warn('refresh after library transfer failed', err);
+          await onComplete({ ...result, mode: request.mode, source: request.source, destination: request.destination });
+        } catch (_) {
+          transferLog.warn('refresh after library transfer failed', { error_code: 'refresh_failed', error_type: 'operation' });
         }
       }
       const key = result.failed
         ? 'contexts.transfer.partial_result'
-        : (mode === 'copy' ? 'contexts.transfer.copy_success' : 'contexts.transfer.move_success');
+        : (request.mode === 'copy' ? 'contexts.transfer.copy_success' : 'contexts.transfer.move_success');
       if (typeof uiToast === 'function') {
         uiToast(t(key, {
           count: succeededCount,

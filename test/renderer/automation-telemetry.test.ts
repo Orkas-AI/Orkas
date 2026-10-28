@@ -74,6 +74,61 @@ function createHarness(
 }
 
 describe('Automation create IPC contract', () => {
+  it('retains the first position after a repeated attachment finishes before its original upload', async () => {
+    const invoke = vi.fn(async () => ({ task: { id: 'at_order' } }));
+    const { context } = createHarness(invoke);
+    vm.runInContext(`
+      _autoCurrentTaskId = 'at_order';
+      _autoSetAttachmentItems([
+        { tempId: 'first', name: 'z-first.txt', status: 'uploading' },
+        { tempId: 'middle', name: 'a-middle.txt', status: 'ready' },
+        { tempId: 'last', name: 'duplicate.txt', status: 'uploading' },
+      ]);
+      _autoReplaceAttachmentByTempId('last', { name: 'z-first.txt', status: 'ready' });
+      _autoReplaceAttachmentByTempId('first', { name: 'z-first.txt', status: 'ready' });
+    `, context);
+    await context._autoSubmitForm();
+    expect(invoke).toHaveBeenCalledWith('autoTasks.create', expect.objectContaining({ attachments: ['z-first.txt', 'a-middle.txt'] }));
+  });
+
+  it('appends new selections after an existing automation attachment list', async () => {
+    const invoke = vi.fn(async (channel: string, input: any) => channel.endsWith('upload')
+      ? { name: input.name } : { task: { id: 'at_order' } });
+    const { context } = createHarness(invoke);
+    context._arrayBufferToBase64 = () => 'YQ==';
+    vm.runInContext(`
+      _autoCurrentTaskId = 'at_order';
+      _autoEditingTaskId = 'at_order';
+      _autoCurrentAttachments = ['z-old.txt', 'a-old.txt'].map(name => ({ name, status: 'ready' }));
+    `, context);
+    await context._autoUploadFiles([{ name: 'm-new.txt', size: 1, arrayBuffer: async () => new Uint8Array([2]).buffer }], 'paste');
+    await context._autoSubmitForm();
+    expect(invoke).toHaveBeenCalledWith('autoTasks.update', expect.objectContaining({
+      updates: expect.objectContaining({ attachments: ['z-old.txt', 'a-old.txt', 'm-new.txt'] }),
+    }));
+  });
+
+  it('saves consecutive additions in user order despite reversed file-read completion', async () => {
+    const invoke = vi.fn(async (channel: string, input: any) => channel.endsWith('upload')
+      ? { name: input.name } : { task: { id: 'at_order' } });
+    const { context } = createHarness(invoke);
+    context._arrayBufferToBase64 = () => 'YQ==';
+    vm.runInContext("_autoCurrentTaskId = 'at_order'", context);
+    let release!: () => void;
+    const first = { name: 'z-first.txt', size: 1, arrayBuffer: () => new Promise<ArrayBuffer>((resolve) => {
+      release = () => resolve(new Uint8Array([1]).buffer);
+    }) };
+    const pending = context._autoUploadFiles([first], 'paste');
+    await Promise.resolve();
+    await context._autoUploadFiles([{ name: 'a-second.txt', size: 1, arrayBuffer: async () => new Uint8Array([2]).buffer }], 'paste');
+    release();
+    await pending;
+    expect(vm.runInContext('_autoCurrentAttachments.map(item => item.name)', context)).toEqual(['z-first.txt', 'a-second.txt']);
+    await context._autoSubmitForm();
+    expect(invoke).toHaveBeenCalledWith('autoTasks.create', expect.objectContaining({ attachments: ['z-first.txt', 'a-second.txt'] }));
+  });
+
+
   it('submits hourly cadence and a scheduled-run cutoff through the canonical create IPC', async () => {
     const invoke = vi.fn(async () => ({ task: { id: 'at_hourly' } }));
     const harness = createHarness(invoke);

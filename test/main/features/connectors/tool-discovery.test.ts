@@ -175,21 +175,25 @@ describe('bounded connector discovery', () => {
   });
 
   it.each([
-    [{ query: '' }, 'query must be a non-empty string'],
-    [{ query: ' ' }, 'query must be a non-empty string'],
-    [{ query: 3 }, 'query must be a non-empty string'],
-    [{ query: 'x'.repeat(1025) }, 'query must be at most 1024 characters'],
-    [{ limit: '20' }, 'limit must be an integer from 1 to 50'],
-    [{ limit: 1.5 }, 'limit must be an integer from 1 to 50'],
-    [{ offset: -1 }, 'offset must be an integer from 0 to 9007199254740991'],
-    [{ offset: Infinity }, 'offset must be an integer from 0 to 9007199254740991'],
-    [{ offset: '1' }, 'offset must be an integer from 0 to 9007199254740991'],
-    [{ offset: Number.MAX_SAFE_INTEGER + 1 }, 'offset must be an integer from 0 to 9007199254740991'],
-    [{ tool_name: 'read' }, '`connector_id` is required'],
-    [{ connector_id: 'x', tool_name: 'read', query: 'read' }, 'tool_name cannot be combined'],
-    [{ unknown: 'private value' }, 'unsupported discovery field "unknown"; allowed fields: connector_id, tool_name, query, limit, offset'],
-  ] as const)('rejects malformed parameters with field constraints: %j', (raw, message) => {
-    expect(() => validateDiscoveryParams(raw)).toThrow(message);
+    [{ connector_id: 4 }, 'connector_id must be a non-empty string', 'invalid_connector_id'],
+    [{ tool_name: false }, 'tool_name must be a non-empty string', 'invalid_tool_name'],
+    [{ query: '' }, 'query must be a non-empty string', 'invalid_query'],
+    [{ query: ' ' }, 'query must be a non-empty string', 'invalid_query'],
+    [{ query: 3 }, 'query must be a non-empty string', 'invalid_query'],
+    [{ query: 'x'.repeat(1025) }, 'query must be at most 1024 characters', 'query_too_long'],
+    [{ limit: '20' }, 'limit must be an integer from 1 to 50', 'invalid_limit'],
+    [{ limit: 1.5 }, 'limit must be an integer from 1 to 50', 'invalid_limit'],
+    [{ offset: -1 }, 'offset must be an integer from 0 to 9007199254740991', 'invalid_offset'],
+    [{ offset: Infinity }, 'offset must be an integer from 0 to 9007199254740991', 'invalid_offset'],
+    [{ offset: '1' }, 'offset must be an integer from 0 to 9007199254740991', 'invalid_offset'],
+    [{ offset: Number.MAX_SAFE_INTEGER + 1 }, 'offset must be an integer from 0 to 9007199254740991', 'invalid_offset'],
+    [{ tool_name: 'read' }, '`connector_id` is required', 'connector_id_required'],
+    [{ connector_id: 'x', tool_name: 'read', query: 'read' }, 'tool_name cannot be combined', 'conflicting_fields'],
+    [{ unknown: 'private value' }, 'unsupported discovery field "unknown"; allowed fields: connector_id, tool_name, query, limit, offset', 'unknown_field'],
+  ] as const)('rejects malformed parameters with field constraints: %j', (raw, message, reason) => {
+    expect(() => validateDiscoveryParams(raw)).toThrowError(expect.objectContaining({
+      code: 'E_BAD_INPUT', message: expect.stringContaining(message), reason,
+    }));
   });
 
   it('bounds and escapes unsupported field names without echoing values', () => {

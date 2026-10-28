@@ -187,17 +187,21 @@ describe('renderer task board › Send now eligibility', () => {
     expect(list.innerHTML.match(/data-act="task-send-now"/g)).toHaveLength(1);
   });
 
-  it('keeps the row locked after acceptance, but restores it when promotion fails', async () => {
+  it('finishes sending on persistence without waiting for model acceptance, and restores failed sends', async () => {
     const sendNow = `async ${extractFunction('_taskBoardSendNow')}`;
     const run = async (result: any) => {
       const sending = new Set<string>();
       const renders: string[] = [];
       const alerts: string[] = [];
+      const task = { task_id: 'q1', status: 'queued' };
+      const messages: unknown[] = [];
       await vm.runInNewContext(
         `${sendNow}; _taskBoardSendNow('c1', 'q1');`,
         {
           _taskBoardSendingNow: sending,
           _taskBoardRender: (cid: string) => renders.push(cid),
+          _taskBoardOnEvent: (_cid: string, event: any) => Object.assign(task, event.task),
+          _renderOrClaimPersistedUserMessage: (_cid: string, message: any) => messages.push(message),
           apiFetch: async () => ({ status: 409, json: async () => result }),
           t: (_key: string, params: any) => `failed: ${params?.msg || ''}`,
           uiAlert: (message: string) => alerts.push(message),
@@ -207,16 +211,19 @@ describe('renderer task board › Send now eligibility', () => {
       const draggable = vm.runInNewContext(
         `${extractFunction('_taskBoardCanDrag')}; _taskBoardCanDrag('c1', 'q1');`,
         {
-          _taskBoardMapFor: () => new Map([['q1', { task_id: 'q1', status: 'queued' }]]),
+          _taskBoardMapFor: () => new Map([['q1', task]]),
           _taskBoardSendingNow: sending,
         },
       );
-      return { sending, renders, alerts, draggable };
+      return { sending, renders, alerts, draggable, messages };
     };
 
-    const accepted = await run({ ok: true, turn_id: 'live-turn' });
-    expect([...accepted.sending]).toEqual(['c1:q1']);
-    expect(accepted.renders).toEqual(['c1']);
+    const message = { id: 'm1', from: 'user', text: 'Correction' };
+    const accepted = await run({ ok: true, turn_id: 'live-turn', message,
+      task: { task_id: 'q1', status: 'queued', message_sent_at: '2026-10-21T12:00:00Z' } });
+    expect([...accepted.sending]).toEqual([]);
+    expect(accepted.renders).toEqual(['c1', 'c1']);
+    expect(accepted.messages).toEqual([message]);
     expect(accepted.alerts).toEqual([]);
     expect(accepted.draggable).toBe(false);
 
@@ -225,6 +232,24 @@ describe('renderer task board › Send now eligibility', () => {
     expect(rejected.renders).toEqual(['c1', 'c1']);
     expect(rejected.alerts).toEqual(['failed: turn_not_steerable']);
     expect(rejected.draggable).toBe(true);
+    expect(rejected.messages).toEqual([]);
+  });
+
+  it('hides sent queue rows across stale events and resync while retaining fallback execution', () => {
+    const { context, list, panel, board } = boardHarness();
+    const queued = { task_id: 'q1', assignee: 'agentA', created_by: 'user', status: 'queued', instruction: 'Correction' };
+    const sent = { ...queued, message_sent_at: '2026-10-21T12:00:00Z' };
+    board.onEvent('c1', { task: queued });
+    expect(list.innerHTML).toContain('Correction');
+    board.onEvent('c1', { task: sent });
+    expect(panel.style.display).toBe('none');
+    board.onEvent('c1', { task: queued });
+    expect(panel.style.display).toBe('none');
+    context.__sent = sent;
+    vm.runInContext("_taskBoardTasks.clear(); _taskBoardMergeSeedRows(_taskBoardMapFor('c1'), [__sent]); _taskBoardRender('c1');", context);
+    expect(panel.style.display).toBe('none');
+    // A FIFO fallback is still a real execution; sending never claims absorption.
+    expect(runLiveRows([{ ...sent, status: 'running' }])).toHaveLength(1);
   });
 });
 
@@ -848,5 +873,123 @@ describe('renderer task board › editing queued messages', () => {
     expect(context._taskBoardMapFor('c1').get('q').instruction).toBe('saved');
     context._taskBoardMergeSeedRows(context._taskBoardMapFor('c1'), [{ ...task, instruction: 'saved again', instruction_revision: 2 }]);
     expect(context._taskBoardMapFor('c1').get('q').instruction).toBe('saved again');
+  });
+});
+
+describe('renderer task board › arranging a planned send (D29)', () => {
+  // Planning a send to several actors takes seconds before any row exists.
+  // The board must show that the send is being arranged from the host's start
+  // signal, hand over to the real rows without blinking out, and never keep
+  // showing "arranging" after planning ended.
+  const PLANNING = 'chat.task_status_planning';
+  const start = (preview = 'Write a draft, then review it') => (
+    { type: 'dispatch_planning', cid: 'c1', message_id: 'm1', active: true, preview });
+  const end = { type: 'dispatch_planning', cid: 'c1', message_id: 'm1', active: false };
+  const row = (task_id: string, assignee: string, extra: Record<string, unknown> = {}) => ({ task: {
+    task_id, assignee, status: 'queued', admission_pending: true, created_by: 'user',
+    instruction: `${task_id} part`, source_msg_id: 'm1', created_at: `2026-10-19T00:00:0${task_id.length}Z`, ...extra,
+  } });
+
+  it('shows the send as being arranged as soon as planning starts', () => {
+    const { panel, list, board } = boardHarness();
+    board.onEvent('c1', start());
+    expect(panel.style.display).toBe('');
+    expect(list.innerHTML).toContain(PLANNING);
+    expect(list.innerHTML).toContain('Write a draft, then review it');
+    expect(list.innerHTML).not.toContain('data-task-id');
+  });
+
+  it('hands over to the planned rows without hiding the board in between', () => {
+    const { panel, list, board } = boardHarness();
+    board.onEvent('c1', start());
+    board.onEvent('c1', row('a', 'writer'));
+    board.onEvent('c1', row('bb', 'reviewer', { after: ['a'] }));
+    board.onEvent('c1', end);
+    // Planning is over but neither row has been admitted yet.
+    expect(panel.style.display).toBe('');
+    expect(list.innerHTML).not.toContain(PLANNING);
+    board.onEvent('c1', row('a', 'writer', { status: 'running', admission_pending: false }));
+    expect(panel.style.display).toBe('');
+    board.onEvent('c1', row('bb', 'reviewer', { after: ['a'], admission_pending: false }));
+    expect(panel.style.display).toBe('');
+    expect(list.innerHTML).toContain('data-task-id="a"');
+    expect(list.innerHTML).toContain('data-task-id="bb"');
+    expect(list.innerHTML).not.toContain(PLANNING);
+  });
+
+  it('retracts for a single planned task once it runs, as for any lone running task', () => {
+    const { panel, board } = boardHarness();
+    board.onEvent('c1', start());
+    board.onEvent('c1', row('a', 'writer'));
+    board.onEvent('c1', end);
+    board.onEvent('c1', row('a', 'writer', { status: 'running', admission_pending: false }));
+    expect(panel.style.display).toBe('none');
+  });
+
+  it('clears the arranging row when planning ends without any task', () => {
+    const { panel, list, board } = boardHarness();
+    board.onEvent('c1', start());
+    board.onEvent('c1', end);
+    expect(panel.style.display).toBe('none');
+    expect(list.innerHTML).toBe('');
+  });
+
+  it('does not revive a send whose planning ended when a second stream repeats the start', () => {
+    const { panel, board } = boardHarness();
+    board.onEvent('c1', start());
+    board.onEvent('c1', end);
+    board.onEvent('c1', start());
+    expect(panel.style.display).toBe('none');
+  });
+
+  it('keeps another conversation\'s planning off the visible board', () => {
+    const { context, panel, list, board } = boardHarness();
+    board.onEvent('c2', { ...start(), cid: 'c2' });
+    expect(list.innerHTML).toBe('');
+    context.currentCid = 'c2';
+    context._taskBoardRender('c2');
+    expect(panel.style.display).toBe('');
+    expect(list.innerHTML).toContain(PLANNING);
+  });
+
+  function stubTaskList(context: any) {
+    const answers: Array<(planning: unknown[]) => void> = [];
+    context.apiFetch = vi.fn(async (url: string) => {
+      if (!url.endsWith('/tasks')) return { json: async () => ({}) };
+      const planning = await new Promise<unknown[]>((resolve) => answers.push(resolve));
+      return { json: async () => ({ ok: true, tasks: [], planning }) };
+    });
+    return answers;
+  }
+
+  it('lets only a list read after the start retire an arranging send', async () => {
+    const { context, panel, board } = boardHarness();
+    const answers = stubTaskList(context);
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+    // Read sent before the start arrived: it may predate planning entirely.
+    board.resync('c1');
+    board.onEvent('c1', start());
+    await vi.waitFor(() => expect(answers).toHaveLength(1));
+    answers[0]([]);
+    await settle();
+    expect(context.apiFetch).toHaveBeenCalledTimes(3);
+    expect(panel.style.display).toBe('');
+    // A read sent after the start (Stop's resync) is authoritative.
+    board.resync('c1');
+    await vi.waitFor(() => expect(answers).toHaveLength(2));
+    answers[1]([]);
+    await vi.waitFor(() => expect(panel.style.display).toBe('none'));
+  });
+
+  it('restores an arranging send from the host list after the renderer reloads', async () => {
+    const { context, list, board } = boardHarness();
+    const answers = stubTaskList(context);
+    board.resync('c1');
+    await vi.waitFor(() => expect(answers).toHaveLength(1));
+    answers[0]([{ message_id: 'm1', preview: 'Write a draft, then review it' }]);
+    await vi.waitFor(() => expect(list.innerHTML).toContain(PLANNING));
+    // The end event that follows still retires it.
+    board.onEvent('c1', end);
+    expect(list.innerHTML).not.toContain(PLANNING);
   });
 });

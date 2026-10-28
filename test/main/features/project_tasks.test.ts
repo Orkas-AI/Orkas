@@ -72,238 +72,6 @@ function globalAttachDir(tid: string): string {
   return path.join(tmpDir, TEST_UID, 'cloud', 'task_attachments', tid);
 }
 
-describe('project_tasks › global scope', () => {
-
-  it.each(['project', 'global'])('copies a chat attachment through the todo tool into durable %s storage', async (scope) => {
-    const { pt, pid: projectId } = await setup();
-    const pid = scope === 'global' ? '' : projectId;
-    const { chatAttachmentDirForConversation } = await import('../../../src/main/util/project-layout');
-    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
-    const { createProjectTasksTool } = await import('../../../src/core-agent/src/tools/project-tasks-tool');
-    const sourceDir = chatAttachmentDirForConversation(TEST_UID, 'c-attachment');
-    fs.mkdirSync(sourceDir, { recursive: true });
-    const source = path.join(sourceDir, 'brief.txt');
-    fs.writeFileSync(source, 'The actual document, not just its name.');
-    const tool = createProjectTasksTool(createProjectTasksHandler(TEST_UID, pid, 'c-attachment', new Map()));
-    const receipt = JSON.parse((await tool.execute({ action: 'create', content: 'Review attached brief' }, { state: {} })).content);
-    const added = await tool.execute({ action: 'add_attachment', task_id: receipt.task.id, source_path: source }, { state: {} });
-    expect(added.isError).toBe(false);
-    expect(JSON.parse(added.content).task.attachments).toEqual(['brief.txt']);
-    const dir = pid ? path.join(path.dirname(taskFile(pid, receipt.task.id)), '..', 'task_attachments', receipt.task.id) : globalAttachDir(receipt.task.id);
-    expect(fs.readFileSync(path.join(dir, 'brief.txt'), 'utf8')).toBe('The actual document, not just its name.');
-    fs.writeFileSync(source, 'Must not replace the saved document');
-    const repeat = await tool.execute({ action: 'add_attachment', task_id: receipt.task.id, source_path: source }, { state: {} });
-    expect(repeat.isError).toBe(true);
-    expect(JSON.parse(repeat.content).error).toBe('attachment_already_exists');
-    fs.unlinkSync(source);
-    expect(fs.readFileSync(path.join(dir, 'brief.txt'), 'utf8')).toBe('The actual document, not just its name.');
-    expect(await pt.getTask(TEST_UID, pid, receipt.task.id)).toMatchObject({ attachments: ['brief.txt'], status: 'todo' });
-    expect(JSON.parse((await tool.execute({ action: 'get', task_id: receipt.task.id }, { state: {} })).content).task.attachments).toEqual(['brief.txt']);
-    const deleted = await tool.execute({ action: 'delete', task_id: receipt.task.id }, { state: {} });
-    expect(JSON.parse(deleted.content)).toEqual({ ok: true, task_id: receipt.task.id, deleted: true });
-    expect(await pt.getTask(TEST_UID, pid, receipt.task.id)).toBeNull();
-    expect(fs.existsSync(dir)).toBe(false);
-
-  });
-
-  it('rejects foreign files, symlink escapes, missing files, unsupported files and oversized inputs without changing a todo', async () => {
-    const { pt, pid } = await setup();
-    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
-    const workspace = path.join(tmpDir, 'allowed');
-    fs.mkdirSync(workspace);
-    const outside = path.join(tmpDir, 'foreign.txt');
-    fs.writeFileSync(outside, 'private');
-    fs.symlinkSync(outside, path.join(workspace, 'escape.txt'));
-    fs.writeFileSync(path.join(workspace, 'program.exe'), 'exe');
-    const oversized = path.join(workspace, 'big.txt');
-    fs.writeFileSync(oversized, '');
-    fs.truncateSync(oversized, pt.TASK_ATTACHMENT_MAX_BYTES + 1);
-    const created = await pt.createTask(TEST_UID, pid, { content: 'No attachment on failure' });
-    if (!created.ok) throw new Error('fixture failed');
-    const handler = createProjectTasksHandler(TEST_UID, pid, '', new Map(), {}, { workingDir: workspace });
-    for (const source of [outside, path.join(workspace, 'escape.txt'), path.join(workspace, 'missing.txt'),
-      path.join(workspace, 'program.exe'), oversized, 'relative.txt']) {
-      expect((await handler.addAttachment!(created.task.id, source)).ok).toBe(false);
-      expect(await pt.getTask(TEST_UID, pid, created.task.id)).toEqual(created.task);
-      expect(await pt.listTaskAttachments(TEST_UID, pid, created.task.id)).toEqual([]);
-    }
-    const valid = path.join(workspace, 'valid.txt'); fs.writeFileSync(valid, 'Valid');
-    expect((await handler.addAttachment!('t_000000000000', valid)).error).toBe('task_not_found');
-    const users = await import('../../../src/main/features/users');
-    users.activateUser('other');
-    expect((await handler.addAttachment!(created.task.id, valid)).error).toBe('account_changed');
-  });
-
-  it('preserves the first attachment when two additions race for the same name', async () => {
-    const { pt, pid } = await setup();
-    const task = await pt.createTask(TEST_UID, pid, { content: 'Race attachment' });
-    if (!task.ok) throw new Error('fixture failed');
-    const results = await Promise.all(['First', 'Second'].map(value =>
-      pt.uploadTaskAttachment(TEST_UID, pid, task.task.id, 'brief.txt', Buffer.from(value), { overwrite: false })));
-    expect(results.filter(r => r.ok)).toHaveLength(1);
-    expect(results.filter(r => !r.ok)).toEqual([{ ok: false, error: 'attachment_already_exists' }]);
-    expect(await pt.listTaskAttachments(TEST_UID, pid, task.task.id)).toEqual(['brief.txt']);
-  });
-
-  it('removes partial attachment bytes after a disk failure and permits a clean retry', async () => {
-    const { pt, pid } = await setup();
-    const created = await pt.createTask(TEST_UID, pid, { content: 'Recoverable attachment' });
-    if (!created.ok) throw new Error('fixture failed');
-    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
-    const source = path.join(tmpDir, 'brief.txt'); fs.writeFileSync(source, 'Complete bytes');
-    const handler = createProjectTasksHandler(TEST_UID, pid, '', new Map(), {}, { workingDir: tmpDir });
-    const original = nativeFs.promises.writeFile;
-    const spy = vi.spyOn(nativeFs.promises, 'writeFile').mockImplementation(async (target, body, options) => {
-      if (String(target).includes('.pending-')) {
-        await original(target, 'partial', options);
-        throw Object.assign(new Error('injected disk full'), { code: 'ENOSPC' });
-      }
-      return original(target, body, options);
-    });
-    syncBuiltinESMExports();
-    try {
-      expect(await handler.addAttachment!(created.task.id, source)).toEqual({ ok: false, error: 'write_failed' });
-      expect(await pt.listTaskAttachments(TEST_UID, pid, created.task.id)).toEqual([]);
-      expect(fs.readdirSync(path.join(path.dirname(taskFile(pid, created.task.id)), '..', 'task_attachments', created.task.id))).toEqual([]);
-      expect(await pt.getTask(TEST_UID, pid, created.task.id)).toEqual(created.task);
-      expect(taskLogs.some(args => args[0] === 'warn' && args[1] === 'attachment upload')).toBe(true);
-    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
-    expect((await handler.addAttachment!(created.task.id, source)).ok).toBe(true);
-  });
-
-  it('does not gain access to the destination project workspace when attaching from a different conversation scope', async () => {
-    const { pt, pid } = await setup();
-    const { setWorkspacePath } = await import('../../../src/main/features/user_workspace');
-    const current = path.join(tmpDir, 'current-workspace'), other = path.join(tmpDir, 'other-workspace');
-    fs.mkdirSync(current); fs.mkdirSync(other);
-    setWorkspacePath(TEST_UID, current); setWorkspacePath(TEST_UID, other, pid);
-    const source = path.join(current, 'brief.txt'), foreign = path.join(other, 'private.txt');
-    fs.writeFileSync(source, 'Current conversation document'); fs.writeFileSync(foreign, 'Unrelated document');
-    const created = await pt.createTask(TEST_UID, pid, { content: 'Receive the current document' });
-    if (!created.ok) throw new Error('fixture failed');
-    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
-    const handler = createProjectTasksHandler(TEST_UID, pid, '', new Map(), {}, { sourceProjectId: '' });
-    expect((await handler.addAttachment!(created.task.id, foreign)).ok).toBe(false);
-    expect((await handler.addAttachment!(created.task.id, source)).ok).toBe(true);
-    expect(await pt.listTaskAttachments(TEST_UID, pid, created.task.id)).toEqual(['brief.txt']);
-  });
-
-
-  it('records attachment success and disk failure without disclosing the local identity or filename', async () => {
-    const pt = await import('../../../src/main/features/project_tasks');
-    const tid = 't_aabbccddeeff';
-    const filename = 'private-client-brief.txt';
-    expect(await pt.uploadTaskAttachment(TEST_UID, '', tid, filename, Buffer.from('private content')))
-      .toEqual({ ok: true, name: filename });
-    fs.unlinkSync(path.join(globalAttachDir(tid), filename));
-    fs.mkdirSync(path.join(globalAttachDir(tid), filename));
-    expect(await pt.uploadTaskAttachment(TEST_UID, '', tid, filename, Buffer.from('private content')))
-      .toEqual({ ok: false, error: 'write_failed' });
-    expect(taskLogs).toEqual([
-      ['info', 'attachment uploaded', expect.objectContaining({
-        bytes: 15, attachment: expect.objectContaining({ path_hash: expect.stringMatching(/^[a-f0-9]{12}$/) }),
-      })],
-      ['warn', 'attachment upload', expect.objectContaining({
-        error: expect.objectContaining({ message_hash: expect.stringMatching(/^[a-f0-9]{12}$/), message_chars: expect.any(Number) }),
-      })],
-    ]);
-    const output = JSON.stringify(taskLogs);
-    for (const secret of [TEST_UID, tid, filename, tmpDir, 'private content']) expect(output).not.toContain(secret);
-  });
-
-  it('persists a registered global owner, rejects unavailable or cross-account owners, and clears assignment', async () => {
-    const { pt } = await setup();
-    const agents = await import('../../../src/main/features/agents');
-    const owner = await agents.createCustomAgent({ name: 'GlobalOwner' });
-    if (!owner) throw new Error('agent fixture failed');
-    const created = await pt.createTask(TEST_UID, '', { content: 'Assigned globally', owner_agent_id: owner.agent_id, owner_agent: 'Stale name' });
-    expect(created.ok).toBe(true);
-    if (!created.ok) return;
-    expect(await pt.getTask(TEST_UID, '', created.task.id)).toMatchObject({ owner_agent: 'GlobalOwner', owner_agent_id: owner.agent_id });
-    expect(await pt.updateTask(TEST_UID, '', created.task.id, { owner_agent_id: 'missing' }))
-      .toEqual({ ok: false, error: 'owner_not_bound' });
-    expect(await pt.createTask('other-account', '', { content: 'Wrong account', owner_agent_id: owner.agent_id }))
-      .toEqual({ ok: false, error: 'owner_not_bound' });
-    expect(await pt.listTasks('other-account', '')).toEqual([]);
-    expect((await pt.getTask(TEST_UID, '', created.task.id))?.owner_agent_id).toBe(owner.agent_id);
-    agents.setAgentEnabledForActiveUser(owner.agent_id, false);
-    expect(await pt.updateTask(TEST_UID, '', created.task.id, { owner_agent_id: owner.agent_id }))
-      .toEqual({ ok: false, error: 'owner_not_bound' });
-    expect((await pt.updateTask(TEST_UID, '', created.task.id, { owner_agent: '', owner_agent_id: '' })).ok).toBe(true);
-    expect(await pt.getTask(TEST_UID, '', created.task.id)).not.toHaveProperty('owner_agent_id');
-  });
-  it('isolates identical task ids and attachment names across accounts and scopes after reload', async () => {
-    const { pt, projects, pid } = await setup();
-    const other = await projects.createProject(TEST_UID, 'Other project');
-    if (!other.ok) throw new Error('project fixture failed');
-    const tid = 't_aabbccddeeff';
-    const scopes = [
-      { uid: TEST_UID, pid: '', content: 'Global reminder' },
-      { uid: TEST_UID, pid, content: 'Project reminder' },
-      { uid: TEST_UID, pid: other.project.project_id, content: 'Other project reminder' },
-      { uid: 'other-account', pid: '', content: 'Private reminder' },
-    ];
-    for (const scope of scopes) {
-      expect((await pt.uploadTaskAttachment(scope.uid, scope.pid, tid, 'brief.txt', Buffer.from(scope.content))).ok).toBe(true);
-      expect((await pt.createTask(scope.uid, scope.pid, { id: tid, content: scope.content })).ok).toBe(true);
-    }
-
-    vi.resetModules();
-    const reloaded = await import('../../../src/main/features/project_tasks');
-    const paths = await import('../../../src/main/paths');
-    expect((await reloaded.updateTask(TEST_UID, pid, tid, { status: 'done' })).ok).toBe(true);
-    expect((await reloaded.deleteTask(TEST_UID, '', tid)).ok).toBe(true);
-    expect(await reloaded.listTasks(TEST_UID, '')).toEqual([]);
-    expect(await reloaded.listTaskAttachments(TEST_UID, '', tid)).toEqual([]);
-    for (const scope of scopes.slice(1)) {
-      expect(await reloaded.listTasks(scope.uid, scope.pid)).toEqual([
-        expect.objectContaining({ id: tid, content: scope.content,
-          status: scope.pid === pid ? 'done' : 'todo', attachments: ['brief.txt'] }),
-      ]);
-      const dir = scope.pid
-        ? paths.projectTaskAttachmentsDir(scope.uid, scope.pid, tid)
-        : paths.userTaskAttachmentsDir(scope.uid, tid);
-      expect(fs.readFileSync(path.join(dir, 'brief.txt'), 'utf8')).toBe(scope.content);
-    }
-  });
-
-  it('persists, updates, attaches, and deletes a to-do without any project', async () => {
-    const pt = await import('../../../src/main/features/project_tasks');
-    const deletedPaths: string[] = [];
-    const events: Array<{ uid: string; pid: string }> = [];
-    pt._setSyncDeletedNotifierForTest((relPath) => deletedPaths.push(relPath));
-    pt.onTasksChanged((event) => events.push(event));
-
-    // The editor can stage files before the task JSON exists, even for users
-    // who have no projects at all.
-    const tid = 't_aaaaaaaaaaaa';
-    expect(await pt.uploadTaskAttachment(TEST_UID, '', tid, 'brief.txt', Buffer.from('global')))
-      .toMatchObject({ ok: true, name: 'brief.txt' });
-    const created = await pt.createTask(TEST_UID, '', { id: tid, content: 'Account-wide reminder' });
-    expect(created.ok).toBe(true);
-    if (!created.ok) return;
-    expect(created.task.attachments).toEqual(['brief.txt']);
-    expect(fs.existsSync(globalTaskFile(tid))).toBe(true);
-    expect(fs.readFileSync(path.join(globalAttachDir(tid), 'brief.txt'), 'utf-8')).toBe('global');
-    expect((await pt.listTasks(TEST_UID, '')).map((task) => task.id)).toEqual([tid]);
-
-    const updated = await pt.updateTask(TEST_UID, '', tid, { status: 'progress' });
-    expect(updated.ok && updated.task.status).toBe('progress');
-    expect(await pt.createTask(TEST_UID, '', { content: 'Cannot assign globally', owner_agent: 'Agent' }))
-      .toEqual({ ok: false, error: 'owner_not_bound' });
-
-    expect(await pt.deleteTask(TEST_UID, '', tid)).toEqual({ ok: true });
-    expect(fs.existsSync(globalTaskFile(tid))).toBe(false);
-    expect(fs.existsSync(globalAttachDir(tid))).toBe(false);
-    expect(deletedPaths).toEqual([`cloud/tasks/${tid}.json`]);
-    expect(events).toEqual([
-      { uid: TEST_UID, pid: '' },
-      { uid: TEST_UID, pid: '' },
-      { uid: TEST_UID, pid: '' },
-    ]);
-  });
-});
-
 describe('project_tasks › createTask', () => {
   it('persists a per-task file with a t_ id, default status todo', async () => {
     const { pt, pid } = await setup();
@@ -407,6 +175,45 @@ describe('project_tasks › createTask', () => {
     if (nameOnly.ok) expect(nameOnly.task.owner_agent_id).toBeUndefined();
   });
 
+  it('keeps a due day as a local calendar date, clears it on request, drops a malformed one on read, and lists dated work first', async () => {
+    const { pt, pid } = await setup();
+    const dated = await pt.createTask(TEST_UID, pid, { content: 'Send the launch email', due_at: '2026-10-25' });
+    expect(dated.ok).toBe(true);
+    if (!dated.ok) return;
+    expect(dated.task.due_at).toBe('2026-10-25');
+    expect(pt.taskView(dated.task).due_at).toBe('2026-10-25');
+    // A day that does not exist, a time, or a non-date is refused up front.
+    for (const bad of ['2026-02-30', '2026-10-25T09:00', 'next Friday', '25/10/2026']) {
+      expect(await pt.createTask(TEST_UID, pid, { content: `Bad ${bad}`, due_at: bad })).toEqual({ ok: false, error: 'due_invalid' });
+    }
+    expect((await pt.createTask(TEST_UID, pid, { content: 'No date', due_at: '' })).ok).toBe(true);
+    expect((await pt.getTask(TEST_UID, pid, (await pt.listTasks(TEST_UID, pid)).find((task) => task.content === 'No date')!.id))).not.toHaveProperty('due_at');
+
+    // Update moves the day, an empty string or null clears it, a bad one is refused without changing the task.
+    expect((await pt.updateTask(TEST_UID, pid, dated.task.id, { due_at: '2026-11-01' }) as { task: { due_at?: string } }).task.due_at).toBe('2026-11-01');
+    expect(await pt.updateTask(TEST_UID, pid, dated.task.id, { due_at: 'soon' })).toEqual({ ok: false, error: 'due_invalid' });
+    expect((await pt.getTask(TEST_UID, pid, dated.task.id))?.due_at).toBe('2026-11-01');
+    expect((await pt.updateTask(TEST_UID, pid, dated.task.id, { due_at: '' }) as { task: object }).task).not.toHaveProperty('due_at');
+    expect((await pt.updateTask(TEST_UID, pid, dated.task.id, { due_at: '2026-11-03' })).ok).toBe(true);
+    expect((await pt.updateTask(TEST_UID, pid, dated.task.id, { due_at: null }) as { task: object }).task).not.toHaveProperty('due_at');
+
+    // A hand-edited file with a malformed day still reads as a task without one.
+    const raw = JSON.parse(fs.readFileSync(taskFile(pid, dated.task.id), 'utf8'));
+    fs.writeFileSync(taskFile(pid, dated.task.id), JSON.stringify({ ...raw, due_at: '2026-13-40' }));
+    expect(await pt.getTask(TEST_UID, pid, dated.task.id)).not.toHaveProperty('due_at');
+
+    // The account-wide open list puts dated work first, soonest first, and
+    // keeps the most recently touched order for the rest.
+    const later = await pt.createTask(TEST_UID, '', { content: 'Later', due_at: '2026-12-01' });
+    const soon = await pt.createTask(TEST_UID, '', { content: 'Soon', due_at: '2026-10-22' });
+    const fresh = await pt.createTask(TEST_UID, '', { content: 'Fresh and undated' });
+    if (!later.ok || !soon.ok || !fresh.ok) throw new Error('fixture failed');
+    const open = (await pt.listOpenTasks(TEST_UID)).tasks.map((task) => task.content);
+    expect(open.slice(0, 2)).toEqual(['Soon', 'Later']);
+    expect(open.slice(2)).toEqual(expect.arrayContaining(['Fresh and undated', 'No date', 'Send the launch email']));
+    expect(open.slice(2)).not.toContain('Soon');
+  });
+
   it('validates content length and sanitizes dependency ids deterministically', async () => {
     const { pt, pid } = await setup();
     const tooLong = await pt.createTask(TEST_UID, pid, {
@@ -490,184 +297,6 @@ describe('project_tasks › list + progress', () => {
     expect(listed.map((task) => task.id)).toEqual([first.task.id, second.task.id].sort());
     expect(listed.every((task) => task.status === 'todo')).toBe(true);
     expect(listed.every((task) => task.depends_on?.length === 1)).toBe(true);
-  });
-});
-
-describe('project_tasks › update / complete / delete', () => {
-  it.each(['project', 'global'] as const)('keeps repeated %s updates read-only, then persists a real edit with the same status', async (scope) => {
-    const { pt, pid: projectId } = await setup();
-    const pid = scope === 'project' ? projectId : '';
-    const storage = await import('../../../src/main/storage');
-    const clock = vi.spyOn(storage, 'nowIso').mockReturnValue('2026-10-23T16:21:17');
-    try {
-      const created = await pt.createTask(TEST_UID, pid, { content: 'Paused prerequisite' });
-      if (!created.ok) throw new Error('task fixture failed');
-      const id = created.task.id;
-      const file = pid ? taskFile(pid, id) : globalTaskFile(id);
-      const before = await pt.getTask(TEST_UID, pid, id);
-      const bytes = fs.readFileSync(file, 'utf8');
-      const modified = fs.statSync(file).mtimeMs;
-      const events: unknown[] = [];
-      pt.onTasksChanged(event => events.push(event));
-      clock.mockReturnValue('2026-10-23T16:21:58');
-
-      // Historical pause trace: todo_tasks.update sent the existing status.
-      expect(await pt.updateTask(TEST_UID, pid, id, { status: 'todo' })).toEqual({ ok: true, task: before });
-      expect(await pt.updateTask(TEST_UID, pid, id, { content: '  Paused prerequisite  ' }))
-        .toEqual({ ok: true, task: before });
-      expect(fs.readFileSync(file, 'utf8')).toBe(bytes);
-      expect(fs.statSync(file).mtimeMs).toBe(modified);
-      expect(events).toEqual([]);
-
-      // Equal status must not conceal a changed requirement or bypass checks.
-      expect(await pt.updateTask(TEST_UID, pid, id, { status: 'todo', content: '' }))
-        .toEqual({ ok: false, error: 'content_empty' });
-      expect(await pt.updateTask(TEST_UID, pid, id, { status: 'todo', owner_agent_id: 'unbound' }))
-        .toEqual({ ok: false, error: 'owner_not_bound' });
-      expect(await pt.updateTask(TEST_UID, pid, id, { status: 'todo' }, { expectedStatus: 'progress' }))
-        .toEqual({ ok: false, error: 'status_conflict' });
-      expect(fs.readFileSync(file, 'utf8')).toBe(bytes);
-      expect(events).toEqual([]);
-      expect(await pt.updateTask(TEST_UID, pid, id, { status: 'todo', content: 'Authorized revised requirement' }))
-        .toMatchObject({ ok: true, task: { content: 'Authorized revised requirement', updated_at: '2026-10-23T16:21:58' } });
-      expect(events).toHaveLength(1);
-      vi.resetModules();
-      const reopened = await import('../../../src/main/features/project_tasks');
-      expect(await reopened.getTask(TEST_UID, pid, id)).toMatchObject({ content: 'Authorized revised requirement', status: 'todo' });
-    } finally { clock.mockRestore(); }
-  });
-
-  it.each(['progress', 'review', 'done'] as const)('does not refresh timestamps when reapplying %s', async status => {
-    const { pt, pid } = await setup();
-    const storage = await import('../../../src/main/storage');
-    const clock = vi.spyOn(storage, 'nowIso').mockReturnValue('2026-10-23T16:21:17');
-    try {
-      const created = await pt.createTask(TEST_UID, pid, { content: 'Existing work' });
-      if (!created.ok) throw new Error('task fixture failed');
-      const changed = await pt.updateTask(TEST_UID, pid, created.task.id, { status });
-      if (!changed.ok) throw new Error('status fixture failed');
-      const bytes = fs.readFileSync(taskFile(pid, created.task.id), 'utf8');
-      const events: unknown[] = [];
-      pt.onTasksChanged(event => events.push(event));
-      clock.mockReturnValue('2026-10-23T16:21:58');
-      const repeated = status === 'done' ? await pt.completeTask(TEST_UID, pid, created.task.id)
-        : await pt.updateTask(TEST_UID, pid, created.task.id, { status });
-      expect(repeated).toEqual(changed);
-      expect(fs.readFileSync(taskFile(pid, created.task.id), 'utf8')).toBe(bytes);
-      expect(events).toEqual([]);
-    } finally { clock.mockRestore(); }
-  });
-
-  it('rejects a stale status transition without changing the newer result or notifying a false update', async () => {
-    const { pt, pid } = await setup();
-    const created = await pt.createTask(TEST_UID, pid, { content: 'Already reviewed' });
-    if (!created.ok) throw new Error('task fixture failed');
-    const completed = await pt.completeTask(TEST_UID, pid, created.task.id);
-    if (!completed.ok) throw new Error('completion fixture failed');
-    const events: unknown[] = [];
-    pt.onTasksChanged((event) => events.push(event));
-    const rejected = await pt.updateTask(TEST_UID, pid, created.task.id,
-      { status: 'progress' }, { expectedStatus: 'todo' });
-    expect(rejected).toEqual({ ok: false, error: 'status_conflict' });
-    expect(await pt.getTask(TEST_UID, pid, created.task.id)).toEqual(completed.task);
-    expect(events).toEqual([]);
-    // A deliberate manual reopen still works; only the stale conditional
-    // operation is rejected, not the user's ordinary status control.
-    expect((await pt.updateTask(TEST_UID, pid, created.task.id, { status: 'todo' })).ok).toBe(true);
-    expect(await pt.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'todo' });
-    expect(events).toHaveLength(1);
-  });
-
-  it('status→done stamps done_at; back to todo clears it', async () => {
-    const { pt, pid } = await setup();
-    const c = await pt.createTask(TEST_UID, pid, { content: 't' });
-    if (!c.ok) return;
-    const done = await pt.completeTask(TEST_UID, pid, c.task.id);
-    expect(done.ok).toBe(true);
-    if (done.ok) {
-      expect(done.task.status).toBe('done');
-      expect(done.task.done_at).toBeTruthy();
-      expect(done.task).not.toHaveProperty('result_ref');
-    }
-    const reopened = await pt.updateTask(TEST_UID, pid, c.task.id, { status: 'todo' });
-    if (reopened.ok) expect(reopened.task.done_at).toBeUndefined();
-  });
-
-  it('update rejects an unbound owner; delete removes the file', async () => {
-    const { pt, pid } = await setup();
-    const deletedPaths: string[] = [];
-    pt._setSyncDeletedNotifierForTest((relPath) => deletedPaths.push(relPath));
-    const c = await pt.createTask(TEST_UID, pid, { content: 't' });
-    if (!c.ok) return;
-    const bad = await pt.updateTask(TEST_UID, pid, c.task.id, { owner_agent_id: 'nope' });
-    expect(bad.ok).toBe(false);
-    if (!bad.ok) expect(bad.error).toBe('owner_not_bound');
-    const del = await pt.deleteTask(TEST_UID, pid, c.task.id);
-    expect(del.ok).toBe(true);
-    expect(fs.existsSync(taskFile(pid, c.task.id))).toBe(false);
-    expect(deletedPaths).toEqual([`cloud/projects/${pid}/tasks/${c.task.id}.json`]);
-    expect((await pt.deleteTask(TEST_UID, pid, c.task.id)).ok).toBe(false); // gone
-  });
-
-  it('validates update boundaries and can clear optional fields and ownership', async () => {
-    const { pt, pid } = await setup();
-    const created = await pt.createTask(TEST_UID, pid, {
-      content: 'original\ndetail',
-      owner_agent: 'Researcher',
-      owner_agent_id: BOUND_AGENT,
-    });
-    if (!created.ok) throw new Error('create failed');
-
-    expect(await pt.updateTask(TEST_UID, pid, created.task.id, { content: ' ' }))
-      .toEqual({ ok: false, error: 'content_empty' });
-    expect(await pt.updateTask(TEST_UID, pid, created.task.id, {
-      content: 'x'.repeat(pt.TASK_CONTENT_MAX + 1),
-    })).toEqual({ ok: false, error: 'content_too_long' });
-    expect(await pt.updateTask(TEST_UID, pid, created.task.id, { status: 'invalid' as any }))
-      .toEqual({ ok: false, error: 'bad_status' });
-
-    const cleared = await pt.updateTask(TEST_UID, pid, created.task.id, {
-      content: 'Updated work',
-      owner_agent: '',
-      owner_agent_id: '',
-    });
-    expect(cleared.ok).toBe(true);
-    if (cleared.ok) {
-      expect(cleared.task.content).toBe('Updated work');
-      expect(cleared.task.owner_agent).toBeUndefined();
-      expect(cleared.task.owner_agent_id).toBeUndefined();
-      expect(cleared.task).not.toHaveProperty('result_ref');
-    }
-    expect(await pt.updateTask(TEST_UID, 'p_ffffffffffff', created.task.id, {}))
-      .toEqual({ ok: false, error: 'project_not_found' });
-    expect(await pt.updateTask(TEST_UID, pid, 't_ffffffffffff', {}))
-      .toEqual({ ok: false, error: 'task_not_found' });
-  });
-
-  it('serializes host execution links and persists the latest association', async () => {
-    const { pt, pid } = await setup();
-    const created = await pt.createTask(TEST_UID, pid, { content: 'Conversation-owned task' });
-    if (!created.ok) throw new Error('create failed');
-
-    const [first, later] = await Promise.all([
-      pt.updateTask(TEST_UID, pid, created.task.id, {
-        status: 'progress',
-        origin_cid: 'conv_first',
-      }),
-      pt.updateTask(TEST_UID, pid, created.task.id, {
-        status: 'review',
-        origin_cid: 'conv_later',
-      }),
-    ]);
-    expect(first.ok).toBe(true);
-    if (first.ok) expect(first.task.origin_cid).toBe('conv_first');
-    expect(later.ok).toBe(true);
-    if (later.ok) {
-      expect(later.task.status).toBe('review');
-      expect(later.task.origin_cid).toBe('conv_later');
-    }
-    expect(JSON.parse(fs.readFileSync(taskFile(pid, created.task.id), 'utf-8')).origin_cid)
-      .toBe('conv_later');
   });
 });
 
@@ -830,6 +459,25 @@ describe('project_tasks › attachments', () => {
     expect(fs.readFileSync(foreign, 'utf8')).toBe('Outside bytes');
   });
 
+  it.each(['global', 'project'])('preserves composer order through %s save, reopen, later uploads and removal', async (scope) => {
+    const { pt, pid: projectId } = await setup();
+    const pid = scope === 'global' ? '' : projectId;
+    const tid = 't_eeeeeeeeeeee';
+    const names = ['z-first.png', 'a-second.png', 'm-third.txt'];
+    for (const name of [...names].reverse()) {
+      expect(await pt.uploadTaskAttachment(TEST_UID, pid, tid, name, Buffer.from(name))).toMatchObject({ ok: true });
+    }
+    const created = await pt.createTask(TEST_UID, pid, { id: tid, content: 'Compare image 1 and image 2', attachment_order: names } as any);
+    expect(created).toMatchObject({ ok: true, task: { attachments: names } });
+    expect((await pt.getTask(TEST_UID, pid, tid))?.attachments).toEqual(names);
+    expect(await pt.listTaskAttachments(TEST_UID, pid, tid)).toEqual(names);
+    await pt.uploadTaskAttachment(TEST_UID, pid, tid, '0-later.txt', Buffer.from('later'));
+    expect((await pt.getTask(TEST_UID, pid, tid))?.attachments).toEqual([...names, '0-later.txt']);
+    await pt.updateTask(TEST_UID, pid, tid, { content: 'Edited', attachment_order: ['0-later.txt', ...names] } as any);
+    await pt.deleteTaskAttachment(TEST_UID, pid, tid, 'a-second.png');
+    expect((await pt.getTask(TEST_UID, pid, tid))?.attachments).toEqual(['0-later.txt', 'z-first.png', 'm-third.txt']);
+  });
+
   it('uploads a file, caches the name on the task, and lists it', async () => {
     const { pt, pid } = await setup();
     const created = await pt.createTask(TEST_UID, pid, { content: 'with files' });
@@ -978,7 +626,6 @@ describe('project_tasks › concurrent persistence paths', () => {
   });
 });
 
-
 describe('project_tasks › persistence failure recovery', () => {
   it('keeps the last link on a failed association write and can record the next execution after recovery', async () => {
     const { pt, pid } = await setup();
@@ -1049,7 +696,6 @@ describe('project_tasks › persistence failure recovery', () => {
     })]);
   });
 });
-
 
 describe('project_tasks › retired status compatibility', () => {
   it.each(['global', 'project'])('rejects retired status writes in %s and retains the current task on failure', async (scope) => {

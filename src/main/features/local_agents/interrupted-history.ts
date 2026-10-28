@@ -13,7 +13,8 @@ import { processTextChunks } from '../conversation-process-cache';
 import { CodexFileCitationStreamFilter } from './public-output';
 
 type Item = NonNullable<GroupMessage['process']>[number];
-type Candidate = { record: GroupMessage; users: Map<string, number>; settled: boolean; invalid: boolean };
+type Candidate = { record: GroupMessage; actorId: string; actorResolved: boolean;
+  users: Map<string, number>; settled: boolean; invalid: boolean };
 type Run = { directory: string; cid: string; agentId: string; cli: string;
   startedAt: string; endedAt?: string; durationMs?: number; currentMessageId?: string };
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
@@ -32,11 +33,12 @@ async function openRegular(file: string): Promise<fsp.FileHandle> {
 
 /** Ignore an incomplete crash tail, while keeping each complete line before
  * it. A damaged oversized line cannot make buffers grow with the whole run. */
-async function* archiveEvents(file: string): AsyncGenerator<Record<string, any>> {
+async function* archiveEvents(file: string, snapshot: (stat: fs.Stats) => void): AsyncGenerator<Record<string, any>> {
   const handle = await openRegular(file);
   const stream = handle.createReadStream({ autoClose: false, highWaterMark: 64 * 1024 });
   let chunks: Buffer[] = [], bytes = 0, oversized = false;
   try {
+    snapshot(await handle.stat());
     for await (const block of stream) {
       let start = 0;
       while (start < block.length) {
@@ -84,7 +86,31 @@ async function archiveRuns(userId: string, cid: string, actors: Set<string>): Pr
 
 function collectTrigger(record: GroupMessage, candidate: Candidate): void {
   if (candidate.settled) return;
-  if (record.from === candidate.record.from && (record.system_kind === 'reply_interrupted'
+  if (candidate.record.source_message_id) {
+    // New receipts retain the exact causal input, including an Agent dispatch.
+    // Other user messages and older replies cannot substitute for that input.
+    if (record.id === candidate.record.source_message_id) {
+      const ts = Date.parse(record.ts);
+      if (Number.isFinite(ts)) candidate.users.set(record.id, ts);
+      else candidate.invalid = true;
+      candidate.settled = true;
+    }
+    return;
+  }
+  if (!candidate.actorResolved) {
+    // Startup falls back to Commander when the running roster was lost. The
+    // nearest structured question or single user destination can identify the
+    // actual actor; do not infer it from prose or search older completed work.
+    candidate.actorResolved = true;
+    if (record.cli_question && record.turn_id && record.from !== 'user') candidate.actorId = record.from;
+    else if (record.from === 'user' && record.to?.length === 1 && record.to[0] !== 'user') {
+      candidate.actorId = record.to[0];
+    }
+    if (candidate.actorId === candidate.record.from) {
+      candidate.invalid = true; candidate.settled = true; return;
+    }
+  }
+  if (record.from === candidate.actorId && (record.system_kind === 'reply_interrupted'
       || record.source_message_id || record.process?.length || record.process_parts?.length)) {
     // Official replies/already-saved trails close the preceding attempt.
     // An async question with no terminal receipt does not end a CLI run.
@@ -96,8 +122,11 @@ function collectTrigger(record: GroupMessage, candidate: Candidate): void {
   }
 }
 
-async function recoverRun(run: Run, store: (items: Item[]) => HistoryProcessPart | undefined): Promise<HistoryProcessPart[]> {
+async function recoverRun(run: Run, store: (items: Item[]) => HistoryProcessPart | undefined, includeProcess = true): Promise<{
+  parts: HistoryProcessPart[]; durationMs?: number; lastWrittenAt?: number;
+}> {
   const parts: HistoryProcessPart[] = [];
+  let durationMs: number | undefined, lastWrittenAt: number | undefined, hasEvents = false;
   let batch: Item[] = [];
   const flush = () => {
     if (!batch.length) return;
@@ -121,7 +150,14 @@ async function recoverRun(run: Run, store: (items: Item[]) => HistoryProcessPart
     if (commentary) addText(commentary);
     commentary = '';
   };
-  for await (const event of archiveEvents(path.join(run.directory, 'events.jsonl'))) {
+  for await (const event of archiveEvents(path.join(run.directory, 'events.jsonl'), stat => {
+    lastWrittenAt = stat.mtimeMs;
+  })) {
+    hasEvents = true;
+    // A terminal from an earlier attempt cannot time work appended after it.
+    durationMs = event.type === 'done' && typeof event.durationMs === 'number'
+      && Number.isFinite(event.durationMs) && event.durationMs >= 0 ? event.durationMs : undefined;
+    if (!includeProcess) continue;
     if (event.type === 'text-delta') {
       if (event.phase === 'commentary' && typeof event.text === 'string') {
         commentary += filter ? filter.push(event.text) : event.text;
@@ -146,7 +182,43 @@ async function recoverRun(run: Run, store: (items: Item[]) => HistoryProcessPart
     if (batch.length >= 200) flush();
   }
   flushText(); flush();
-  return parts;
+  return { parts, durationMs, ...(hasEvents ? { lastWrittenAt } : {}) };
+}
+
+function runTiming(run: Run, noticeEnd: number, recovered?: Awaited<ReturnType<typeof recoverRun>>): {
+  duration: number; estimated: boolean;
+} | undefined {
+  const start = Date.parse(run.startedAt);
+  const span = Date.parse(run.endedAt || '') - start;
+  let duration = typeof run.durationMs === 'number' && Number.isFinite(run.durationMs) && run.durationMs >= 0
+    ? run.durationMs : span;
+  let estimated = false;
+  if (!Number.isFinite(duration) && !run.endedAt) {
+    if (recovered?.durationMs != null) duration = recovered.durationMs;
+    else if (recovered?.lastWrittenAt != null) {
+      duration = recovered.lastWrittenAt - start;
+      estimated = true;
+    }
+  }
+  return Number.isFinite(duration) && duration >= 0 && start + duration <= noticeEnd
+    ? { duration, estimated } : undefined;
+}
+
+function hasInterruptionClock(record: GroupMessage): boolean {
+  return !!record.process?.some(item => {
+    const event = item.event;
+    const data = event?.data as Record<string, unknown> | undefined;
+    return event?.stream === 'runtime' && data?.phase !== 'segment_end' && data?.phase !== 'retrying'
+      && typeof data?.duration_ms === 'number' && Number.isFinite(data.duration_ms) && data.duration_ms >= 0;
+  });
+}
+
+function noticeEndUpperBound(ts: string): number {
+  // nowIso/localIsoAt persist whole seconds, whereas CLI archives retain
+  // milliseconds. A receipt at :24 can follow a run ending at :24.602.
+  // Only widen that explicit timestamp shape; precise receipts stay precise.
+  const secondPrecision = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})?$/.test(ts);
+  return Date.parse(ts) + (secondPrecision ? 999 : 0);
 }
 
 /** `before` names the byte start of this selected page, so a notice whose
@@ -158,13 +230,20 @@ export async function restoreInterruptedCliHistory(
   const candidates: Candidate[] = [];
   for (let index = 0; index < records.length; index++) {
     const record = records[index];
-    if (record.system_kind !== 'reply_interrupted' || record.deleted_at
-        || record.process?.length || record.process_parts?.length) continue;
-    const candidate: Candidate = { record, users: new Map(), settled: false, invalid: false };
-    for (let n = index - 1; n >= 0 && !candidate.settled; n--) {
-      collectTrigger(records[n], candidate);
+    if (record.system_kind !== 'reply_interrupted' || record.deleted_at || hasInterruptionClock(record)) continue;
+    const attempts: Candidate[] = [{ record, actorId: record.from, actorResolved: true,
+      users: new Map(), settled: false, invalid: false }];
+    // Keep the original sender's recovery first. A delegated question must
+    // not replace that actor's own archive when both runs are evidenced.
+    if (record.from === 'commander' && !record.turn_id && !record.source_message_id
+        && !record.process?.length && !record.process_parts?.length) {
+      attempts.push({ record, actorId: record.from, actorResolved: false,
+        users: new Map(), settled: false, invalid: false });
     }
-    candidates.push(candidate);
+    for (const candidate of attempts) {
+      for (let n = index - 1; n >= 0 && !candidate.settled; n--) collectTrigger(records[n], candidate);
+      candidates.push(candidate);
+    }
   }
   if (!candidates.length) return records;
   let cursor = before;
@@ -179,16 +258,20 @@ export async function restoreInterruptedCliHistory(
     cursor = page.nextCursor;
   }
   if (!candidates.some(candidate => !candidate.invalid && candidate.users.size)) return records;
-  const runs = await archiveRuns(userId, path.basename(sourceFile, '.jsonl'), new Set(candidates.map(c => c.record.from)));
+  const runs = await archiveRuns(userId, path.basename(sourceFile, '.jsonl'), new Set(candidates.map(c => c.actorId)));
   const recovered = new Map<string, GroupMessage>();
-  for (const { record, users, invalid } of candidates) {
-    if (invalid || !users.size) continue;
-    const end = Date.parse(record.ts);
+  for (const { record, actorId, users, invalid } of candidates) {
+    if (invalid || !users.size || recovered.has(record.id)) continue;
+    const end = noticeEndUpperBound(record.ts);
     const earliestUser = Math.min(...users.values());
     const latestUser = Math.max(...users.values());
-    const matches = runs.filter(run => run.agentId === record.from
+    const matches = runs.filter(run => run.agentId === actorId
+      && (!record.source_message_id || run.currentMessageId === record.source_message_id)
+      // Cross-actor fallback requires the exact original trigger. Legacy time
+      // windows alone cannot prove which actor owned a generic startup notice.
+      && (actorId === record.from || !!run.currentMessageId)
       && Date.parse(run.startedAt) >= (run.currentMessageId ? users.get(run.currentMessageId) ?? Infinity : earliestUser)
-      && Date.parse(run.startedAt) < end
+      && Date.parse(run.startedAt) <= end
       && (!run.endedAt || (Date.parse(run.endedAt) >= latestUser && Date.parse(run.endedAt) <= end)));
     // A legacy archive has no trigger identity. Ambiguity must not show work
     // from another run as if it belonged to this interrupted reply.
@@ -196,23 +279,40 @@ export async function restoreInterruptedCliHistory(
       && (matches.some(run => !run.currentMessageId) || new Set(matches.map(run => run.currentMessageId)).size !== 1))) continue;
     try {
       const parts: HistoryProcessPart[] = [];
+      const savedProcess = !!(record.process?.length || record.process_parts?.length);
+      const intervals: { start: number; end: number }[] = [];
+      let estimated = false, allTimed = true;
       for (const run of matches.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt))) {
-        parts.push(...await recoverRun(run, store));
+        let timing = runTiming(run, end);
+        // A saved trail needs only its missing clock. Finalized metadata avoids
+        // rereading a potentially large archive or appending duplicate process.
+        if (!savedProcess || !timing) {
+          try {
+            const recoveredRun = await recoverRun(run, store, !savedProcess);
+            parts.push(...recoveredRun.parts);
+            timing = runTiming(run, end, recoveredRun);
+          } catch (error) { if (!timing) throw error; }
+        }
+        if (!timing) { allTimed = false; continue; }
+        estimated ||= timing.estimated;
+        const start = Date.parse(run.startedAt);
+        intervals.push({ start, end: start + timing.duration });
       }
-      // A single archived attempt has a defined elapsed time. Prefer its
-      // measured duration; use retained endpoints when both are known. Never
-      // count app downtime up to the later startup notice or invent a terminal
-      // success receipt merely to display the clock.
-      const run = matches.length === 1 ? matches[0] : undefined;
-      const span = run ? Date.parse(run.endedAt || '') - Date.parse(run.startedAt) : NaN;
-      const duration = typeof run?.durationMs === 'number' && Number.isFinite(run.durationMs) && run.durationMs >= 0
-        ? run.durationMs : span;
-      const runtime: Item[] = Number.isFinite(duration) && duration >= 0
-        ? [{ type: 'event', event: { stream: 'runtime', data: { phase: 'interrupted', duration_ms: Math.round(duration) } } }]
+      // Add evidenced execution intervals, excluding gaps between attempts and
+      // downtime before startup. Overlapping archives must not double the clock.
+      let duration = 0, coveredEnd = -Infinity;
+      for (const interval of intervals) {
+        duration += Math.max(0, interval.end - Math.max(interval.start, coveredEnd));
+        coveredEnd = Math.max(coveredEnd, interval.end);
+      }
+      const runtime: Item[] = allTimed && intervals.length
+        ? [{ type: 'event', event: { stream: 'runtime', data: {
+          phase: 'interrupted', duration_ms: Math.round(duration), ...(estimated ? { duration_estimated: true } : {}),
+        } } }]
         : [];
-      if (parts.length) recovered.set(record.id, { ...record,
+      if (parts.length || runtime.length) recovered.set(record.id, { ...record,
         ...(runtime.length ? { process: [...(record.process || []), ...runtime] } : {}),
-        process_parts: parts.map(part => 'ref' in part ? { ...part, message_id: record.id } : part) });
+        ...(parts.length ? { process_parts: parts.map(part => 'ref' in part ? { ...part, message_id: record.id } : part) } : {}) });
     } catch { /* Missing archive/cache must not hide the interruption notice. */ }
   }
   return records.map(record => recovered.get(record.id) || record);

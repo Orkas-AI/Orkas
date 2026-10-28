@@ -1,4 +1,4 @@
-export { bootstrap } from './bootstrap';
+export { bootstrap, shutdown } from './bootstrap';
 export {
   listInstances,
   getInstance,

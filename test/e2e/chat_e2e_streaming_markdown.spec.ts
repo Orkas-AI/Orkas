@@ -3,6 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, test, type Page } from '@playwright/test';
 import { classifyNativeCommentary } from '../../src/main/features/group_chat/message-display';
+import { loadRetainedFilePage } from './fixtures/retained-file-page';
 
 // Real renderer, DOMPurify, local MathJax and fonts. No account or model calls.
 test.use({ launchOptions: { executablePath: process.env.ORKAS_E2E_BROWSER_PATH } });
@@ -80,7 +81,7 @@ async function setup(page: Page) {
     ${scripts.map(name => `<script src="modules/${name}.js"></script>`).join('')}
     </head><body><textarea id="composer"></textarea>
     <div id="chat-history" class="chat-history" style="height:500px;width:850px;overflow:auto"></div></body></html>`);
-  await page.goto(pathToFileURL(fixture).href);
+  await loadRetainedFilePage(page, fixture);
   await page.evaluate(() => {
     const w = window as any;
     const history = document.querySelector('#chat-history') as any;

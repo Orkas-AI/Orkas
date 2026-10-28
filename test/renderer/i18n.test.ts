@@ -151,7 +151,7 @@ function literalTranslationKeys(file: string): string[] {
     if (
       ts.isCallExpression(node)
       && ts.isIdentifier(node.expression)
-      && node.expression.text === 't'
+      && ['t', '_t'].includes(node.expression.text)
       && node.arguments.length > 0
     ) {
       keys.push(...translationKeyChoices(node.arguments[0]));
@@ -171,6 +171,12 @@ function sourceFiles(root: string): string[] {
 }
 
 describe('renderer i18n runtime', () => {
+  it('collects translation keys used by fallback wrappers as well as ordinary lookups', () => {
+    const keys = literalTranslationKeys(path.join(rendererRoot, 'modules', 'saved-apps.js'));
+    expect(keys).toContain('apps.publish_action');
+    expect(keys).toContain('apps.publish_visit');
+  });
+
   it('rejects prototype names as saved or selected languages and keeps English usable', async () => {
     const setLanguage = vi.fn(async (language) => ({ ok: true, language }));
     const { sandbox, events } = loadI18n({
@@ -555,7 +561,7 @@ describe('locale resource contract', () => {
     expect(parameterizedBindings).toEqual([]);
   });
 
-  it('defines every literal Renderer translation key referenced by HTML or JS', () => {
+  it('defines every literal Renderer UI key while omitting the stripped publication prompt', () => {
     const rendererEnglish = localeTables('renderer').en;
     const html = fs.readFileSync(path.join(rendererRoot, 'index.html'), 'utf8');
     const keys = [
@@ -565,9 +571,13 @@ describe('locale resource contract', () => {
         .filter((name) => name.endsWith('.js'))
         .flatMap((name) => literalTranslationKeys(path.join(rendererRoot, 'modules', name))),
     ];
-    const missing = [...new Set(keys)].filter((key) => !Object.hasOwn(rendererEnglish, key));
+    // The commercial web-adaptation prompt has no public UI caller and its
+    // empty fallback is intentional. It must not be restored by a copy sync.
+    const missing = [...new Set(keys)].filter((key) => key !== 'apps.publish_adapt_seed'
+      && !Object.hasOwn(rendererEnglish, key));
 
     expect(missing).toEqual([]);
+    expect(rendererEnglish).not.toHaveProperty('apps.publish_adapt_seed');
   });
 
   it('defines every literal Main translation key referenced by TypeScript or JavaScript', () => {
@@ -593,5 +603,29 @@ describe('locale resource contract', () => {
           .toBe(rawKeys.length);
       }
     }
+  });
+});
+
+
+describe('shared 1.9.5 and API-key voice translations', () => {
+  const sharedKeys = ['chat.task_status_planning', 'contexts.kb.image_failed', 'contexts.kb.image_failed_hint',
+    'project.todo.delete_confirm', 'project.todo.due_label',
+    'project.todo.due_on', 'project.todo.due_overdue', 'project.todo.due_invalid'];
+  const voiceKeys = ['chat.mic_title', 'chat.mic_stop_title', 'chat.mic_error_permission',
+    'chat.mic_error_no_device', 'chat.mic_error_unavailable', 'chat.mic_insufficient_credits',
+    'chat.mic_limit_reached', 'settings.orkas_api.key_required'];
+  it.each(LANGS)('renders shared status, recovery and voice guidance using the selected %s table', lang => {
+    const tables = localeTables('renderer');
+    const { sandbox } = loadI18n({boot:{lang,tables}});
+    for (const key of [...sharedKeys,...voiceKeys]) {
+      expect(tables[lang][key], lang + ':' + key).toBeTypeOf('string');
+      expect(tables[lang][key].trim(), lang + ':' + key).not.toBe('');
+      const variables = Object.fromEntries(placeholders(tables.en[key]).map(name => [name, name === 'seconds' ? '120' : '2026-10-26']));
+      const expected = tables[lang][key].replace(/\{(\w+)\}/g, (_match: string,name: string) => variables[name]);
+      expect(sandbox.t(key,variables), lang + ':' + key).toBe(expected);
+      expect(sandbox.t(key,variables)).not.toMatch(/\{\w+\}/);
+    }
+    if(lang !== 'en') for(const key of voiceKeys)
+      expect(tables[lang][key], lang + ':' + key + ' translated voice recovery').not.toBe(tables.en[key]);
   });
 });

@@ -80,11 +80,12 @@ async function orkasRequest(path, body, timeoutMs, signal) {
   assertConfigured();
   const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
       ...clientHeaders(),
+      ...(path === '/connectors/composio/execute' ? { 'Orkas-Composio-Long-Call': '1' } : {}),
       Authorization: `Bearer ${API_KEY}`,
       'X-Orkas-Connection-Token': CONNECTION_TOKEN,
     },
@@ -120,7 +121,7 @@ async function callComposioTool(name, value, request = orkasRequest, signal) {
       tool_slug: name,
       arguments: args,
       ...creditContextBody,
-    }, EXECUTE_REQUEST_TIMEOUT_MS);
+    }, EXECUTE_REQUEST_TIMEOUT_MS, signal);
     return { content: [{ type: 'text', text: JSON.stringify(body.result ?? body, null, 2) }] };
   } catch (err) {
     if (!(err instanceof OrkasProxyResponseError)) throw err;
@@ -179,8 +180,8 @@ async function main() {
     const body = await orkasRequest('/connectors/composio/tools', {}, TOOLS_REQUEST_TIMEOUT_MS);
     return { tools: Array.isArray(body.tools) ? body.tools.map(normalizeTool).filter(Boolean) : [] };
   });
-  server.setRequestHandler(CallToolRequestSchema, async (req) => (
-    callComposioTool(req.params.name, req.params.arguments)
+  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => (
+    callComposioTool(req.params.name, req.params.arguments, orkasRequest, extra.signal)
   ));
   await server.connect(new StdioServerTransport());
 }

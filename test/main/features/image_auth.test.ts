@@ -24,24 +24,24 @@ vi.mock('../../../src/main/features/auth', () => ({
 vi.mock('../../../src/main/model/provider_catalog', () => ({
   findImageGenCapability: (provider: string) => ({
     openai: { model: 'gpt-image-2', api: 'openai', supportsEdit: true },
-    google: { model: 'gemini-3.1-flash-image-preview', api: 'gemini', supportsEdit: true },
-    doubao: { model: 'doubao-seedream-5-0-lite-260128', api: 'doubao', supportsEdit: true },
+    google: { model: 'gemini-nano-banana-2.1', api: 'gemini', supportsEdit: true },
+    doubao: { model: 'doubao-seedream-5-0-flash-260915', api: 'doubao', supportsEdit: true },
   })[provider] || null,
 }));
 
 vi.mock('../../../src/main/features/image_gen', () => ({
   IMAGE_MODELS_BY_PROVIDER: {
-    openai: [{ id: 'gpt-image-2', name: 'GPT Image 2' }],
-    google: [{ id: 'gemini-3.1-flash-image-preview', name: 'Nano Banana 2' }],
+    openai: [{ id: 'gpt-image-2', name: 'GPT Image 2' }, { id: 'gpt-image-2.5-flare', name: 'GPT Image 2.5 Flare' }, { id: 'gpt-image-2.5-sunburst', name: 'GPT Image 2.5 Sunburst' }],
+    google: [{ id: 'gemini-nano-banana-2.1', name: 'Nano Banana 2.1' }, { id: 'gemini-3.1-flash-image-preview', name: 'Nano Banana 2' }],
     doubao: [
-      { id: 'doubao-seedream-5-0-lite-260128', name: 'Seedream 5.0 Lite' },
+      { id: 'doubao-seedream-5-0-flash-260915', name: 'Seedream 5.0 Flash' },
       { id: 'doubao-seedream-5-0-pro-260628', name: 'Seedream 5.0 Pro' },
     ],
   },
   isImageProviderModelAllowed: (provider: string, model: string) => ({
-    openai: ['gpt-image-2'],
-    google: ['gemini-3.1-flash-image-preview'],
-    doubao: ['doubao-seedream-5-0-lite-260128', 'doubao-seedream-5-0-pro-260628'],
+    openai: ['gpt-image-2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst'],
+    google: ['gemini-nano-banana-2.1', 'gemini-3.1-flash-image-preview'],
+    doubao: ['doubao-seedream-5-0-flash-260915', 'doubao-seedream-5-0-pro-260628'],
   })[provider]?.includes(model) === true,
   callOpenAIImage: mocks.callOpenAIImage,
   callGeminiImage: mocks.callGeminiImage,
@@ -77,6 +77,10 @@ beforeEach(() => {
 describe('image auth profiles', () => {
   it.each([
     ['openai', 'gpt-image-2', 'callOpenAIImage'],
+    ['openai', 'gpt-image-2.5-flare', 'callOpenAIImage'],
+    ['openai', 'gpt-image-2.5-sunburst', 'callOpenAIImage'],
+    ['google', 'gemini-nano-banana-2.1', 'callGeminiImage'],
+    ['doubao', 'doubao-seedream-5-0-flash-260915', 'callDoubaoImage'],
     ['google', 'gemini-3.1-flash-image-preview', 'callGeminiImage'],
     ['doubao', 'doubao-seedream-5-0-pro-260628', 'callDoubaoImage'],
   ] as const)('dispatches a %s profile probe to its matching adapter', async (provider, model, callName) => {
@@ -176,14 +180,16 @@ describe('image auth profiles', () => {
       { id: 'doubao', label: 'DouBao' },
     ])).toEqual([
       expect.objectContaining({
-        id: 'openai',
+        id: 'openai:gpt-image-2',
         provider: 'openai',
         model: 'gpt-image-2',
       }),
+      expect.objectContaining({ id: 'openai:gpt-image-2.5-flare', model: 'gpt-image-2.5-flare' }),
+      expect.objectContaining({ id: 'openai:gpt-image-2.5-sunburst', model: 'gpt-image-2.5-sunburst' }),
       expect.objectContaining({
-        id: 'doubao:doubao-seedream-5-0-lite-260128',
+        id: 'doubao:doubao-seedream-5-0-flash-260915',
         provider: 'doubao',
-        model: 'doubao-seedream-5-0-lite-260128',
+        model: 'doubao-seedream-5-0-flash-260915',
       }),
       expect.objectContaining({
         id: 'doubao:doubao-seedream-5-0-pro-260628',

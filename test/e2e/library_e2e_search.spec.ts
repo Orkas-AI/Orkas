@@ -452,6 +452,11 @@ test.describe('library and global search', () => {
     const renameInput = page.locator('.ctx-tree-rename-input');
     await expect(renameInput).toBeFocused();
     await renameInput.fill(renamedName);
+    // Indexing can finish while a name is still being edited. Its status
+    // refresh must not blur the input or submit the draft on the user's behalf.
+    await page.evaluate(async () => (window as any)._refreshKbStatusSnapshot());
+    await expect(renameInput).toHaveValue(renamedName);
+    await expect(renameInput).toBeFocused();
     await renameInput.press('Enter');
     row = page.locator(`.ctx-tree-wrap[data-path="${renamedName}"]`);
     await expect(row).toBeVisible();

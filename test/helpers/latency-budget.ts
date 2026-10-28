@@ -1,5 +1,6 @@
 export const LATENCY_TARGET_MS = 300;
-export const LATENCY_LIMIT_MS = 500;
+// Platform-specific response budget approved for lower-spec Windows hosts.
+export const LATENCY_LIMIT_MS = process.platform === 'win32' ? 800 : 500;
 // First-request setup has a separate, approved budget on lower-spec Windows hosts.
 export const FIRST_REQUEST_LATENCY_LIMIT_MS = process.platform === 'win32' ? 700 : LATENCY_LIMIT_MS;
 

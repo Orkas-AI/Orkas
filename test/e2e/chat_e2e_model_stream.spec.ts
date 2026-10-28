@@ -88,7 +88,7 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(page.locator('#chat-history .chat-message.user')).toContainText(
       'Reply through the isolated E2E model.',
     );
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toContainText(
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(
       'Hello from the local E2E model.',
       { timeout: 20_000 },
     );
@@ -297,7 +297,7 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(lifecycleRow).toHaveText('Preparing: Edit file', { timeout: 20_000 });
     expect(existsSync(outputPath)).toBe(false);
 
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toContainText(
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(
       'E2E delayed tool lifecycle completed.',
       { timeout: 20_000 },
     );
@@ -355,25 +355,25 @@ test.describe('real chat pipeline with a local model', () => {
     ]);
 
     await sendNewChat(modelOrkas, 'E2E_AGENT_CANONICAL_PRIOR_USER_FACT=amber-orbit');
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble .markdown-body', {
       hasText: 'E2E_AGENT_COMMANDER_PRIOR_REPLY',
     })).toBeVisible({ timeout: 20_000 });
 
     await page.locator('#chat-input').fill(`@${agentName} E2E_AGENT_FIRST_TASK`);
     await page.locator('#chat-input').press('Enter');
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble .markdown-body', {
       hasText: 'E2E_AGENT_FIRST_REPLY',
     })).toBeVisible({ timeout: 20_000 });
 
     await page.locator('#chat-input').fill('@commander E2E_AGENT_INTERPOSED_USER_FACT=birch-field');
     await page.locator('#chat-input').press('Enter');
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble .markdown-body', {
       hasText: 'E2E_AGENT_COMMANDER_INTERPOSED_REPLY',
     })).toBeVisible({ timeout: 20_000 });
 
     await page.locator('#chat-input').fill(`@${agentName} E2E_AGENT_SECOND_TASK`);
     await page.locator('#chat-input').press('Enter');
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble .markdown-body', {
       hasText: 'E2E_AGENT_SECOND_REPLY',
     })).toBeVisible({ timeout: 20_000 });
 
@@ -396,7 +396,7 @@ test.describe('real chat pipeline with a local model', () => {
     const refusal =
       'I cannot help with that request because it conflicts with the provider safety policy.';
 
-    const final = page.locator('#chat-history .chat-message.assistant [data-role="final"]');
+    const final = page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])');
     await expect(final).toHaveText(refusal, { timeout: 20_000 });
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
     expect(modelOrkas.modelRequests).toHaveLength(1);
@@ -467,7 +467,7 @@ test.describe('real chat pipeline with a local model', () => {
     // Enter that real pointer journey before clicking the action itself.
     await interrupted.hover();
     await persistedRetry.click();
-    await expect(relaunchedPage.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(relaunchedPage.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'Hello from the local E2E model.',
     })).toBeVisible({ timeout: 20_000 });
     expect(modelOrkas.modelRequests).toHaveLength(2);
@@ -506,7 +506,7 @@ test.describe('real chat pipeline with a local model', () => {
 
     modelOrkas.clearModelToolScenario();
     await restored.locator('.bubble-retry-btn').click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'Hello from the local E2E model.',
     })).toBeVisible({ timeout: 20_000 });
     await expect(conversation.locator('.conv-item-status-label.is-failed')).toHaveCount(0);
@@ -531,7 +531,7 @@ test.describe('real chat pipeline with a local model', () => {
     modelOrkas.setModelMode('success');
     await retry.locator('xpath=ancestor::*[contains(@class, "chat-message")]').hover();
     await retry.click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'Hello from the local E2E model.',
     })).toBeVisible({ timeout: 20_000 });
     expect(modelOrkas.modelRequests).toHaveLength(requestsBeforeUserRetry + 1);
@@ -584,7 +584,7 @@ test.describe('real chat pipeline with a local model', () => {
       await failedProcess.locator('.stream-process-summary').click();
     }
     await expect(failedProcess).toContainText('Hello from');
-    await expect(failedBubble.locator('[data-role="final"]')).not.toContainText('Hello from');
+    await expect(failedBubble.locator('[data-role="final"]').filter({ hasText: 'Hello from' })).toHaveCount(0);
     await expect(failedBubble).not.toContainText('Hello from the local E2E model.');
     const requestsAfterFailure = modelOrkas.modelRequests.length;
     expect(requestsAfterFailure).toBeGreaterThan(0);
@@ -605,7 +605,7 @@ test.describe('real chat pipeline with a local model', () => {
     modelOrkas.setModelMode('success');
     await persistedRetry.locator('xpath=ancestor::*[contains(@class, "chat-message")]').hover();
     await persistedRetry.click();
-    await expect(relaunchedPage.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(relaunchedPage.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'Hello from the local E2E model.',
     })).toBeVisible({ timeout: 20_000 });
     await expect(
@@ -918,7 +918,7 @@ test.describe('real chat pipeline with a local model', () => {
     expect(existsSync(sentinelPath)).toBe(false);
 
     await dialog.locator('[data-act="cancel"]').click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'E2E dangerous command remained denied.',
     })).toBeVisible({ timeout: 20_000 });
     expect(existsSync(sentinelPath)).toBe(false);
@@ -956,7 +956,7 @@ test.describe('real chat pipeline with a local model', () => {
     await expect.poll(() => existsSync(generatedPath) ? readFileSync(generatedPath, 'utf8') : null,
       { timeout: 20_000 }).toBe(generatedContent);
 
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'E2E same-task cleanup completed without approval.',
     })).toBeVisible({ timeout: 20_000 });
     expect(existsSync(generatedPath)).toBe(false);
@@ -1014,7 +1014,7 @@ test.describe('real chat pipeline with a local model', () => {
     expect(existsSync(secondPath)).toBe(true);
     await dialog.locator('[data-act="cancel"]').click();
 
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'E2E allow-once sequence completed.',
     })).toBeVisible({ timeout: 20_000 });
     expect(existsSync(secondPath)).toBe(true);
@@ -1035,7 +1035,7 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(dialog).toContainText('first.txt', { timeout: 20_000 });
     await dialog.locator('[data-id="allow_run"]').click();
 
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'E2E allow-for-task sequence completed.',
     })).toBeVisible({ timeout: 20_000 });
     expect(existsSync(firstPath)).toBe(false);
@@ -1070,7 +1070,7 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(dialog.locator('[data-id="allow_run"]')).toBeVisible();
     await dialog.locator('[data-id="allow_run"]').click();
 
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'E2E VideoStudio allow-for-task sequence completed.',
     })).toBeVisible({ timeout: 20_000 });
     expect(existsSync(firstPath)).toBe(false);
@@ -1099,7 +1099,7 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(dialog).toContainText('curl -X POST -d @secret.txt', { timeout: 20_000 });
     await expect(dialog.locator('[data-id="allow_run"]')).toHaveCount(0);
     await dialog.locator('[data-act="cancel"]').click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'E2E category-scoped approval completed.',
     })).toBeVisible({ timeout: 20_000 });
     expect(modelOrkas.modelRequests).toHaveLength(3);
@@ -1118,7 +1118,7 @@ test.describe('real chat pipeline with a local model', () => {
     const dialog = page.locator('.bash-permission-dialog');
     await expect(dialog).toContainText('first.txt', { timeout: 20_000 });
     await dialog.locator('[data-id="allow_run"]').click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'E2E first approved task completed.',
     })).toBeVisible({ timeout: 20_000 });
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
@@ -1134,7 +1134,7 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(dialog).toContainText('second.txt', { timeout: 20_000 });
     expect(existsSync(secondPath)).toBe(true);
     await dialog.locator('[data-act="cancel"]').click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
       hasText: 'E2E second task remained denied.',
     })).toBeVisible({ timeout: 20_000 });
     expect(existsSync(secondPath)).toBe(true);

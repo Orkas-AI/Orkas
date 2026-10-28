@@ -78,9 +78,11 @@ const OPENAI_SEARCH_MODELS = new Set([
   'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.1', 'gpt-5.2', 'gpt-5.3-codex',
   'gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra',
 ]);
-// Tool combinations are supported only by documented Gemini 3 models.
+// Tool combinations are supported by documented Gemini 3 and 4 models.
+// Gemini 4 Argon checked 2026-10-19.
 // https://ai.google.dev/gemini-api/docs/generate-content/tool-combination
 const GOOGLE_SEARCH_MODELS = new Set([
+  'gemini-4-argon',
   'gemini-3-flash-preview', 'gemini-3.1-pro-preview',
   'gemini-3.1-flash-lite-preview', 'gemini-3.1-flash-lite',
   'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.7-flash', 'gemini-3.8-flash',

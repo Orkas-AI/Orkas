@@ -162,6 +162,21 @@ export class MiniElement extends MiniNode {
     this.childNodes.push(node);
     return node;
   }
+  cloneNode(deep = false): MiniElement {
+    const copy = new MiniElement(this.ownerDocument, this.localName);
+    for (const [name, value] of this.attributes) copy.setAttribute(name, value);
+    Object.assign(copy.style, this.style);
+    if (deep) for (const child of this.childNodes) copy.appendChild(child instanceof MiniElement
+      ? child.cloneNode(true) : new MiniText(this.ownerDocument, child.textContent));
+    return copy;
+  }
+  replaceChild<T extends MiniNode>(next: MiniNode, previous: T): T {
+    if (previous.parentNode !== this) throw new Error('Child not found');
+    next.remove();
+    const index = this.childNodes.indexOf(previous);
+    this.childNodes[index] = next; next.parentNode = this; previous.parentNode = null;
+    return previous;
+  }
   append(...nodes: Array<MiniNode | string>): void {
     for (const node of nodes) this.appendChild(typeof node === 'string' ? new MiniText(this.ownerDocument, node) : node);
   }

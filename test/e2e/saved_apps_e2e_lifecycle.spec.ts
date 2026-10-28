@@ -1,19 +1,8 @@
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { expectComposerText } from './fixtures/composer';
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
 declare const currentCid: string;
-
-function historicalArtifact(root: string, cid: string, appType?: string, title = 'Historic app') {
-  const artifactId = 'historical-' + (appType || 'untyped');
-  const dir = path.join(root, 'account-e2e/cloud/chat_artifacts', cid, artifactId);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, 'index.html'), '<!doctype html><h1>Retained historical app</h1>');
-  writeFileSync(path.join(dir, '__orkas-meta.json'), JSON.stringify({ title, appType, entry: 'index.html', agentId: 'commander' }));
-  return { ok: true, artifactId, title };
-}
-
-
 
 
 test('root-level Save as app explains the separate-folder requirement and saves only the recovered bundle', async ({ orkas }, testInfo) => {
@@ -142,7 +131,7 @@ test.describe('My Apps', () => {
       await expect(page.locator('#apps-create-btn')).toBeFocused();
       await page.locator('#apps-create-btn').click();
       await expect(panel.locator('textarea')).toHaveValue(draft);
-      await expect(panel.locator('[data-app-type="local"]')).toHaveAttribute('aria-pressed', 'true');
+      await expect(panel.locator('[data-app-type]')).toHaveCount(0);
       await expect(panel.locator('[data-create-submit]')).toBeEnabled();
     }
     await panel.screenshot({ path: testInfo.outputPath('retained-create-draft.png') });
@@ -155,79 +144,38 @@ test.describe('My Apps', () => {
     await expect(page.locator('[data-create-submit]')).toBeDisabled();
   });
 
-  test('keeps type buttons anchored when counts change or disappear', async ({ orkas }, testInfo) => {
+  test('shows local and legacy web apps in one creation flow across languages and widths', async ({ orkas }, testInfo) => {
     const page = orkas.page!;
-    const entry = orkas.createWorkspaceFile('stable-header/index.html', '<h1>Local app</h1>');
-    for (let i = 0; i < 10; i++) await orkas.invoke('savedApps.saveFromPath', { path: entry, title: `App ${i}` });
-    await openSidebarEntry(page, '#apps-btn');
-    await page.evaluate(() => (window as any).setLang('zh'));
-    const tabs = page.locator('#apps-type-tabs');
-    const count = page.locator('#apps-page-header-count');
-    for (const width of [1133, 560]) {
-      await page.setViewportSize({ width, height: 720 });
-      await tabs.locator('[data-app-filter="local"]').click();
-      await expect(count).toHaveText('10');
-      await page.evaluate(() => (window as any).loadSavedApps(true));
-      await expect(tabs.locator('[data-app-filter="local"]')).toBeFocused();
-      const local = await tabs.boundingBox();
-      await tabs.locator('[data-app-filter="web"]').click();
-      await expect(page.locator('.ui-dialog-overlay.open').last()).toBeVisible();
-      await page.locator('.ui-dialog-overlay.open').last().locator('[data-act="cancel"]').click();
-      await expect(count).toHaveText('10');
-      const cloud = await tabs.boundingBox();
-      expect(Math.abs(cloud!.x - local!.x)).toBeLessThan(1);
-      expect(Math.abs(cloud!.y - local!.y)).toBeLessThan(1);
-      await tabs.locator('[data-app-filter="local"]').click();
-      await expect(page.locator('.app-card')).toHaveCount(10);
-      await expect(page.locator('#apps-type-description')).toHaveText('在 Orkas 桌面端运行，可使用 AI、文件、知识库和连接器等能力，不支持发布为网页。');
-      const description = page.locator('#apps-type-description');
-      const tabBox = (await tabs.boundingBox())!;
-      const descriptionBox = (await description.boundingBox())!;
-      expect(tabBox.height).toBe(32);
-      const createHeight = (await page.locator('#apps-create-btn').boundingBox())!.height;
-      expect(createHeight).toBe(28);
-      for (const tab of await tabs.getByRole('tab').all()) {
-        expect((await tab.boundingBox())!.height).toBe(createHeight);
-      }
-      expect(descriptionBox.x).toBeGreaterThanOrEqual(tabBox.x + tabBox.width);
-      expect(Math.abs(descriptionBox.y + descriptionBox.height / 2 - tabBox.y - tabBox.height / 2)).toBeLessThan(1);
-      if (width === 1133) expect((await page.locator('.apps-page-header').boundingBox())!.height).toBeLessThanOrEqual(60);
-      await page.locator('.apps-page-header').screenshot({ path: testInfo.outputPath(`stable-header-${width}.png`) });
-    }
-  });
-
-  test('keeps local cards and the creation draft when web guidance is cancelled across languages and sizes', async ({ orkas }, testInfo) => {
-    const page = orkas.page!;
-    const entry = orkas.createWorkspaceFile('described-app/index.html', '<head><meta name="description" content="Track orders &amp; stock"></head><h1>Inventory</h1>');
+    const entry = orkas.createWorkspaceFile('unified/index.html', '<h1>Inventory</h1>');
     await orkas.invoke('savedApps.saveFromPath', { path: entry, title: 'Inventory' });
+    const creation = await orkas.invoke<any>('conversations.create', { title: 'Legacy web', assistance: { kind: 'app_creation', appType: 'web' } });
+    const web = orkas.createWorkspaceFile('legacy-web/index.html', '<h1>Notes</h1>');
+    await orkas.invoke('savedApps.saveFromPath', { path: web, title: 'Notes', cid: creation.conversation.conversation_id });
     await openSidebarEntry(page, '#apps-btn');
-    await expect(page.locator('.app-card')).toHaveCount(1);
+    await expect(page.locator('.app-card')).toHaveCount(2);
+    await expect(page.locator('[data-app-filter]')).toHaveCount(0);
     await expect(page.locator('.app-card-description')).toHaveCount(0);
-    for (const width of [1133, 560]) for (const language of ['en', 'zh']) {
-      await page.setViewportSize({ width, height: 720 });
+    for (const language of ['en', 'zh', 'de', 'ar']) {
       await page.evaluate(language => (window as any).setLang(language), language);
-      const tab = page.locator('[data-app-filter="web"]'); await tab.click();
-      const dialog = page.locator('.ui-dialog-overlay.open').last();
-      await expect(dialog).toBeVisible();
-      await expect(dialog).toContainText(language === 'zh' ? '商业版' : 'commercial version');
-      await dialog.locator('[data-act="cancel"]').click();
-      await expect(page.locator('[data-app-filter="local"]')).toHaveAttribute('aria-selected', 'true');
-      await expect(page.locator('.app-card')).toHaveCount(1);
-      await page.locator('#apps-create-btn').click();
-      const panel = page.locator('.apps-create-panel');
-      await panel.locator('textarea').fill('Keep my draft');
-      await panel.locator('[data-app-type="web"]').click();
-      const guidance = page.locator('.ui-dialog-overlay.open').last();
-      await expect(guidance).toContainText(language === 'zh' ? '商业版' : 'commercial version');
-      await guidance.screenshot({ path: testInfo.outputPath(`web-guidance-${language}-${width}.png`) });
-      await page.keyboard.press('Escape');
-      await expect(panel.locator('textarea')).toHaveValue('Keep my draft');
-      await expect(panel.locator('[data-app-type="local"]')).toHaveAttribute('aria-pressed', 'true');
-      await panel.locator('[data-create-cancel]').click();
-      expect((await orkas.invoke<any>('conversations.list')).conversations).toHaveLength(0);
+      for (const width of [1133, 560]) {
+        await page.setViewportSize({width, height:720});
+        await expect(page.locator('#apps-publication-quota')).toHaveCount(0);
+        expect(await page.locator('#panel-apps').evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+        await page.locator('#panel-apps').screenshot({path:testInfo.outputPath(`unified-${language}-${width}.png`)});
+      }
     }
-    const refused = await orkas.invoke<any>('conversations.create', { title: 'Denied', assistance: { kind: 'app_creation', appType: 'web' } });
-    expect(refused).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
+    await page.locator('#apps-create-btn').click();
+    const panel = page.locator('.apps-create-panel');
+    await expect(panel.locator('[data-app-type]')).toHaveCount(0);
+    await panel.locator('textarea').fill('Keep this draft');
+    await page.evaluate(() => (window as any).setLang('zh'));
+    await expect(panel.locator('textarea')).toHaveValue('Keep this draft');
+    await panel.screenshot({path:testInfo.outputPath('unified-create.png')});
+    await panel.locator('[data-create-cancel]').click();
+    await page.locator('#apps-create-btn').click();
+    await expect(panel.locator('textarea')).toHaveValue('Keep this draft');
+    await panel.locator('[data-create-cancel]').click();
+    expect(orkas.modelRequests).toHaveLength(0);
   });
 
   for (const existingTaskCount of [0, 2]) {
@@ -242,7 +190,8 @@ test.describe('My Apps', () => {
       await page.evaluate(() => (window as any).loadConversations());
       await expect(page.locator('#conversation-list .conv-item')).toHaveCount(existingTaskCount);
       await page.locator('.chat-rich-editor[data-rich-input-id="new-chat-input"]').fill('Unrelated home draft');
-      await page.locator('#apps-btn').click();
+      await openSidebarEntry(page, '#apps-btn');
+
       const opener = page.locator('#apps-create-btn');
       await opener.click();
       const panel = page.getByRole('dialog', { name: 'Create app', exact: true });
@@ -255,7 +204,7 @@ test.describe('My Apps', () => {
       await idea.fill('   ');
       await expect(submit).toBeDisabled();
       await page.keyboard.press('Shift+Tab');
-      await expect(panel.locator('[data-app-type=web]')).toBeFocused();
+      await expect(cancel).toBeFocused();
       await idea.focus();
       await idea.dispatchEvent('keydown', { key: 'Escape', isComposing: true });
       await expect(panel).toBeVisible();
@@ -275,7 +224,7 @@ test.describe('My Apps', () => {
       await cancel.click();
       await expect(opener).toBeFocused();
       await opener.click();
-      await expect(panel.locator('[data-app-type=local]')).toHaveAttribute('aria-pressed', 'true');
+      await expect(panel.locator('[data-app-type]')).toHaveCount(0);
       await expect(idea).toHaveValue(/snake game/i);
       await idea.fill('Create an app to plan family meals');
       await idea.press('Enter');
@@ -289,7 +238,7 @@ test.describe('My Apps', () => {
       await expect(page.locator('#chat-header .chat-app-type-tag')).toHaveCount(0);
       await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(1);
       await expect(page.locator('#chat-history .chat-message.user')).toContainText(prompt);
-      await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', { hasText: 'APP_CREATE_ACK' })).toBeVisible({ timeout: 20_000 });
+      await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', { hasText: 'APP_CREATE_ACK' })).toBeVisible({ timeout: 20_000 });
       expect(orkas.modelRequests).toHaveLength(1);
       expectAppCreationContext(orkas.modelRequests[0]);
       await expect(page.locator('#chat-history .chat-message.user')).not.toContainText('## App creation');
@@ -339,7 +288,7 @@ test.describe('My Apps', () => {
     expect(orkas.modelRequests).toHaveLength(0);
     expect((await orkas.invoke<{ conversations: unknown[] }>('conversations.list')).conversations).toHaveLength(1);
     await page.locator('#chat-send-btn').click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', { hasText: 'APP_RETRY_ACK' })).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', { hasText: 'APP_RETRY_ACK' })).toBeVisible({ timeout: 20_000 });
     expect((await orkas.invoke<{ conversations: unknown[] }>('conversations.list')).conversations).toHaveLength(1);
     expect(orkas.modelRequests).toHaveLength(1);
     expectAppCreationContext(orkas.modelRequests[0]);
@@ -355,7 +304,7 @@ test.describe('My Apps', () => {
     const page = orkas.page!;
     const entry = orkas.createWorkspaceFile('app-gallery/index.html', '<!doctype html><h1>My app</h1>');
     for (const title of ['Orkas · SDK 能力体验馆', '像素贪吃蛇', '霓虹贪吃蛇', '指挥官 · 智能体详情', '计算器应用', 'ROI 计算器', '长标题应用 <img src=x onerror=alert(1)> '.repeat(5)]) {
-      await orkas.invoke('savedApps.saveFromPath', { path: entry, title });
+      await orkas.invoke('savedApps.saveFromPath', { path: entry, title, mode: 'new' });
     }
     await openSidebarEntry(page, '#apps-btn');
     await expect(page.locator('.app-card')).toHaveCount(7);
@@ -423,20 +372,6 @@ test.describe('My Apps', () => {
     let card = page.locator(`.app-card[data-app-id="${saved.id}"]`);
     await expect(card).toContainText('E2E Saved App');
     await expect(page.locator('#apps-page-header-count')).toHaveText('1');
-
-    const moreButton = card.locator('[data-app-more]');
-    await expect(moreButton).toHaveCSS('position', 'absolute');
-    await expect(moreButton).toHaveCSS('top', '12px');
-    await expect(moreButton).toHaveCSS('right', '12px');
-    await expect(moreButton).toBeHidden();
-    await card.hover();
-    await expect(moreButton).toBeVisible();
-    await page.locator('.apps-page-header-title').hover();
-    await expect(moreButton).toBeHidden();
-    await card.focus();
-    await expect(moreButton).toBeVisible();
-    await page.locator('#apps-create-btn').focus();
-    await expect(moreButton).toBeHidden();
 
     const opened = orkas.electronApp!.waitForEvent('window');
     await card.click();
@@ -513,13 +448,13 @@ test.describe('My Apps', () => {
 });
 
 
-test('labels each application artifact inside its bubble across languages and reopening', async ({ orkas }, testInfo) => {
+test('shows unified application artifacts across languages and reopening', async ({ orkas }, testInfo) => {
   const page = orkas.page!;
   const created = await orkas.invoke<any>('conversations.create', { title: 'Application outputs' });
   const cid = created.conversation.conversation_id;
   const artifacts = [];
   for (const appType of ['local', 'web']) {
-    const result = appType === 'web' ? historicalArtifact(orkas.workspaceRoot, cid, 'web', `${appType} application `.repeat(8)) : await orkas.electronApp!.evaluate(async (_electron, args) =>
+    const result = await orkas.electronApp!.evaluate(async (_electron, args) =>
       (process as any).mainModule.require(args.module).createArtifact('account-e2e', args.cid, 'commander', {
         appType: args.appType, title: args.title,
         files: [{ path: 'index.html', content: '<!doctype html><h1>Application ready</h1>' }],
@@ -542,20 +477,19 @@ test('labels each application artifact inside its bubble across languages and re
   const cards = page.locator('#chat-history .chat-bubble .chat-artifact-card');
   const tags = cards.locator('.chat-app-type-tag');
   await expect(cards).toHaveCount(2);
-  await expect(tags).toHaveText(['Local app', 'Web app']);
+  await expect(cards.locator('.chat-app-type-tag:visible')).toHaveCount(0);
   await expect(page.locator('#chat-header .chat-app-type-tag')).toHaveCount(0);
   await page.evaluate(() => (window as any).setLang('zh'));
-  await expect(tags).toHaveText(['本地应用', '网页应用']);
+  await expect(cards.locator('.chat-app-type-tag:visible')).toHaveCount(0);
   for (const width of [1133, 560]) {
     await page.setViewportSize({ width, height: 720 });
     for (const card of await cards.all()) {
       expect(await card.evaluate(el => {
         const title = el.querySelector('.chat-artifact-title')!.getBoundingClientRect();
-        const tag = el.querySelector('.chat-app-type-tag')!.getBoundingClientRect();
         const menu = el.querySelector('.chat-artifact-more')!.getBoundingClientRect();
         const bounds = el.getBoundingClientRect();
         const bubble = el.closest('.chat-bubble')!.getBoundingClientRect();
-        return title.right <= tag.left && tag.right <= menu.left && el.scrollWidth <= el.clientWidth
+        return title.right <= menu.left && el.scrollWidth <= el.clientWidth
           && bounds.left >= bubble.left && bounds.right <= bubble.right;
       })).toBe(true);
     }
@@ -567,50 +501,21 @@ test('labels each application artifact inside its bubble across languages and re
   }
   await page.evaluate(() => (window as any).setLang('en'));
   await reopen();
-  await expect(tags).toHaveText(['Local app', 'Web app']);
-  await expect(cards.locator('iframe[src]')).toHaveCount(1);
-  await expect(cards.nth(1)).toContainText('commercial version');
+  await expect(cards.locator('.chat-app-type-tag:visible')).toHaveCount(0);
+  await expect(cards.locator('iframe')).toHaveCount(2);
 });
 
 
-test('denies historical web resource URLs before and after restart while retaining their bytes', async ({ orkas }) => {
-  const created = await orkas.invoke<any>('conversations.create', { title: 'Historical web resources' });
-  const cid = created.conversation.conversation_id;
-  const urls: string[] = [];
-  const originals = new Map<string, Buffer>();
-  for (const appType of ['web', 'cloud']) {
-    const artifact = historicalArtifact(orkas.workspaceRoot, cid, appType);
-    const savedId = 'historic-' + appType;
-    const savedDir = path.join(orkas.workspaceRoot, 'account-e2e/cloud/saved_apps', savedId);
-    mkdirSync(savedDir, { recursive: true });
-    writeFileSync(path.join(savedDir, 'index.html'), '<h1>Preserve saved app bytes</h1>');
-    writeFileSync(path.join(savedDir, '__orkas-meta.json'), JSON.stringify({ title: 'Historic saved app', appType, entry: 'index.html' }));
-    for (const dir of [savedDir, path.join(orkas.workspaceRoot, 'account-e2e/cloud/chat_artifacts', cid, artifact.artifactId)]) {
-      for (const file of readdirSync(dir)) originals.set(path.join(dir, file), readFileSync(path.join(dir, file)));
-    }
-    urls.push(`chat-app://saved/${savedId}/index.html`, `chat-app://cid/${cid}/${artifact.artifactId}/index.html`);
-  }
-  for (const restart of [false, true]) {
-    if (restart) await orkas.relaunch();
-    const receipts = await orkas.electronApp!.evaluate(async ({ net }, urls) => Promise.all(urls.map(async url => {
-      const response = await net.fetch(url);
-      return { status: response.status, body: await response.json() };
-    })), urls);
-    for (const receipt of receipts) expect(receipt).toMatchObject({ status: 403, body: { ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' } });
-    for (const [file, bytes] of originals) expect(readFileSync(file).equals(bytes)).toBe(true);
-    expect(orkas.electronApp!.windows()).toHaveLength(1);
-    expect(orkas.modelRequests).toHaveLength(0);
-  }
-});
-
-
-test('labels an untyped artifact from its task: web in a web creation task, local in an ordinary conversation', async ({ orkas }) => {
+test('keeps legacy untyped artifacts usable without type labels', async ({ orkas }) => {
   const page = orkas.page!;
   const tags: string[] = [];
   for (const assistance of [{ kind: 'app_creation', appType: 'web' }, undefined]) {
-    const created = await orkas.electronApp!.evaluate(async (_electron, args) => ({ conversation: await (process as any).mainModule.require(args.module).createConversation('account-e2e', { title: 'Untyped output', assistance: args.assistance }) }), { module: path.resolve(__dirname, '../../src/main/features/chats.ts'), assistance });
+    const created = await orkas.invoke<any>('conversations.create', { title: 'Untyped output', ...(assistance ? { assistance } : {}) });
     const cid = created.conversation.conversation_id;
-    const result = historicalArtifact(orkas.workspaceRoot, cid);
+    const result = await orkas.electronApp!.evaluate(async (_electron, args) =>
+      (process as any).mainModule.require(args.module).createArtifact('account-e2e', args.cid, 'commander', {
+        title: 'Untyped app', files: [{ path: 'index.html', content: '<!doctype html><h1>Untyped</h1>' }],
+      }), { module: path.resolve(__dirname, '../../src/main/features/chat_artifacts.ts'), cid });
     expect(result.ok).toBe(true);
     // Legacy/synced metadata without a type must not default to local in a web task.
     writeFileSync(path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chat_artifacts', cid, result.artifactId, '__orkas-meta.json'), JSON.stringify({ title: 'Untyped app' }));
@@ -625,22 +530,23 @@ test('labels an untyped artifact from its task: web in a web creation task, loca
     }, cid);
     await page.evaluate(() => (window as any).setLang('en'));
     const tag = page.locator('#chat-history .chat-artifact-card .chat-app-type-tag');
-    await expect(tag).toBeVisible();
-    tags.push(await tag.innerText());
+    await expect(tag).toBeHidden();
+    await expect(page.locator('#chat-history .chat-artifact-card iframe')).toHaveCount(1);
   }
-  expect(tags).toEqual(['Web app', 'Local app']);
 });
 
-test('keeps the local application icon while the web entry only offers commercial guidance', async ({ orkas }) => {
+test('uses unified app icons for local and legacy web apps', async ({ orkas }, testInfo) => {
   const page = orkas.page!;
   const local = orkas.createWorkspaceFile('icon-local/index.html', '<h1>Local</h1>');
   await orkas.invoke('savedApps.saveFromPath', { path: local, title: 'Local example' });
+  const creation = await orkas.invoke<any>('conversations.create', { title: 'Cloud example', assistance: { kind: 'app_creation', appType: 'web' } });
+  const cloud = orkas.createWorkspaceFile('icon-cloud/index.html', '<h1>Cloud</h1>');
+  await orkas.invoke('savedApps.saveFromPath', { path: cloud, title: 'Cloud example', cid: creation.conversation.conversation_id });
   await openSidebarEntry(page, '#apps-btn');
-  await expect(page.locator('.app-card-icon svg.is-layout-grid')).toHaveCount(1);
-  await page.locator('[data-app-filter="web"]').click();
-  await expect(page.locator('.ui-dialog-overlay.open').last()).toBeVisible();
-  await page.locator('.ui-dialog-overlay.open').last().locator('[data-act="cancel"]').click();
-  await expect(page.locator('.app-card-icon svg.is-layout-grid')).toHaveCount(1);
+  await expect(page.locator('.app-card')).toHaveCount(2);
+  await expect(page.locator('.app-card-icon svg.is-layout-grid')).toHaveCount(2);
+  await expect(page.locator('.app-card-published')).toHaveCount(0);
+  await page.locator('#apps-grid').screenshot({ path: testInfo.outputPath('cloud-icons.png') });
 });
 
 /** Mono 8-bit PCM WAV whose sample bytes vary, so a shifted or truncated byte
@@ -770,10 +676,26 @@ test('saving an artifact shows exactly one confirmation toast and no dialog', as
   await expect(page.locator('.app-card').filter({ hasText: 'Saved artifact' })).toHaveCount(1);
   await expect(page.locator('.ui-dialog-overlay:visible')).toHaveCount(0);
   expect(await page.evaluate(() => (window as any).__saveSurfaces())).toEqual({ toasts: 1, dialogs: 0 });
+  const original=(await orkas.invoke<any>('savedApps.list')).apps[0].id;
+  const preview=await orkas.openPreview(()=>page.evaluate(input=>(window as any).openChatArtifactViewer(input),{cid,artifactId:result.artifactId,title:result.title}));
+  await expect(preview.locator('.chat-artifact-viewer-save')).toHaveAttribute('title','Update original app');
+  await expect(preview.locator('.chat-artifact-viewer-save-new')).toBeVisible();
+  await preview.locator('.chat-artifact-viewer-save-new').click();
+  await expect.poll(async()=>(await orkas.invoke<any>('savedApps.list')).apps.length).toBe(2);
+  const copy=(await orkas.invoke<any>('savedApps.list')).apps.find((app:any)=>app.id!==original).id;
+  writeFileSync(path.join(orkas.workspaceRoot,'account-e2e/cloud/chat_artifacts',cid,result.artifactId,'index.html'),'<h1>Updated artifact copy</h1>');
+  await expect(preview.locator('.chat-artifact-viewer-save')).toBeEnabled();
+  await preview.locator('.chat-artifact-viewer-save').click();
+  await expect(preview.locator('.chat-artifact-viewer-save')).toBeEnabled();
+  expect((await orkas.invoke<any>('savedApps.list')).apps).toHaveLength(2);
+  const root=path.join(orkas.workspaceRoot,'account-e2e/cloud/saved_apps');
+  expect(readFileSync(path.join(root,original,'index.html'),'utf8')).toContain('Saved artifact');
+  expect(readFileSync(path.join(root,copy,'index.html'),'utf8')).toContain('Updated artifact copy');
+  await orkas.closePreview(preview);
 });
 
 // UI review captures (zh, default window unless named -390): saved time, local delete
-// confirmation without a publication, and the create dialog type choice.
+// confirmation without a publication, and the unified create dialog.
 test('reads saved time, local delete confirmation and the create dialog in Chinese at default and narrow widths', async ({ orkas }, testInfo) => {
   const page = orkas.page!;
   const review = (name: string) => testInfo.outputPath('ui-review', name);
@@ -816,14 +738,168 @@ test('reads saved time, local delete confirmation and the create dialog in Chine
   await page.locator('#apps-create-btn').click();
   const panel = page.locator('.apps-create-panel');
   await expect(panel.getByRole('heading', { name: '创建应用', exact: true })).toBeVisible();
-  await expect(panel.locator('[data-app-type]')).toHaveText(['本地应用', '网页应用']);
-  await expect(panel.locator('[data-app-type="local"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(panel.locator('[data-app-type]')).toHaveCount(0);
   await panel.screenshot({ path: review('12-create-dialog.png') });
   await page.setViewportSize({ width: 390, height: 720 });
   expect(await panel.evaluate(node => node.scrollWidth <= node.clientWidth + 1)).toBe(true);
   await page.screenshot({ path: review('12-create-dialog-390.png') });
-  await page.setViewportSize({ width: 1133, height: 800 });
+  // The narrow dialog scrolls; its actions must remain reachable there.
   await panel.locator('[data-create-cancel]').click(); await expect(panel).toHaveCount(0);
   expect((await orkas.invoke<{ apps: unknown[] }>('savedApps.list')).apps).toHaveLength(1);
+  expect(orkas.modelRequests).toHaveLength(0);
+});
+
+test('file preview saves once, updates that app, saves an independent copy and remembers the copy after reopening', async ({ orkas }, testInfo) => {
+  const page=orkas.page!;
+  const entry=orkas.createWorkspaceFile('save-target/index.html','<h1>First version</h1>');
+  const open=()=>orkas.openPreview(()=>page.evaluate(file=>(window as any).openChatFileViewer(file,'index.html'),entry));
+  let preview=await open();
+  const primary=()=>preview.locator('.chat-file-viewer-save-app');
+  await expect(primary()).toHaveAttribute('title','Save as app');
+  await expect(preview.locator('.chat-file-viewer-save-new-app')).toBeHidden();
+  await primary().click();
+  await expect(primary()).toHaveAttribute('title','Update original app');
+  let apps=(await orkas.invoke<any>('savedApps.list')).apps;
+  expect(apps).toHaveLength(1);const original=apps[0].id;
+  await primary().click();
+  await expect(primary()).toBeEnabled();
+  expect((await orkas.invoke<any>('savedApps.list')).apps.map((app:any)=>app.id)).toEqual([original]);
+  await preview.locator('.chat-file-viewer-save-new-app').click();
+  await expect(primary()).toBeEnabled();
+  apps=(await orkas.invoke<any>('savedApps.list')).apps;expect(apps).toHaveLength(2);
+  const copy=apps.find((app:any)=>app.id!==original).id;
+  await preview.screenshot({path:testInfo.outputPath('file-update-and-copy.png')});
+  await orkas.closePreview(preview);
+  writeFileSync(entry,'<h1>Second version</h1>');
+  preview=await open();
+  await expect(primary()).toHaveAttribute('title','Update original app');
+  await primary().click();await expect(primary()).toBeEnabled();
+  const root=path.join(orkas.workspaceRoot,'account-e2e/cloud/saved_apps');
+  expect(readFileSync(path.join(root,original,'index.html'),'utf8')).toContain('First version');
+  expect(readFileSync(path.join(root,copy,'index.html'),'utf8')).toContain('Second version');
+  expect((await orkas.invoke<any>('savedApps.list')).apps).toHaveLength(2);
+  await orkas.closePreview(preview);
+  // A deleted copy must not redirect the source back to the untouched original.
+  expect((await orkas.invoke<any>('savedApps.delete',{appId:copy})).ok).toBe(true);
+  preview=await open();
+  await expect(primary()).toHaveAttribute('title','Save as app');
+  await expect(preview.locator('.chat-file-viewer-save-new-app')).toBeHidden();
+  await primary().click();
+  await expect(primary()).toHaveAttribute('title','Update original app');
+  apps=(await orkas.invoke<any>('savedApps.list')).apps;
+  expect(apps).toHaveLength(2);
+  const recreated=apps.find((app:any)=>app.id!==original).id;
+  expect(recreated).not.toBe(copy);
+  expect(readFileSync(path.join(root,original,'index.html'),'utf8')).toContain('First version');
+  expect(readFileSync(path.join(root,recreated,'index.html'),'utf8')).toContain('Second version');
+  await orkas.closePreview(preview);
+  expect(orkas.modelRequests).toHaveLength(0);
+});
+
+test('file preview exports, cancels and confirms incompatible data recovery in English and Chinese',async({orkas},testInfo)=>{
+  const entry=orkas.createWorkspaceFile('file-recovery/index.html','<h1>Original notes</h1>');
+  const definition={version:1,tables:[{id:'notes',name:'notes',fields:[{id:'body',name:'body',type:'string'}],access:{read:['body'],insert:['body']}}]};
+  const manifest=orkas.createWorkspaceFile('file-recovery/orkas-app.json',JSON.stringify({sdkVersion:1,capabilities:['data'],data:definition}));
+  const app=await orkas.invoke<any>('savedApps.saveFromPath',{path:entry});expect(app.ok).toBe(true);
+  const exported=path.join(orkas.workspaceRoot,'file-recovery-export.sqlite');
+  const file=await orkas.electronApp!.evaluate(async({dialog},input)=>{
+    const main=(process as any).mainModule,{LocalAppData}=main.require(input.data),paths=main.require(input.paths),crypto=main.require('node:crypto');
+    const key=crypto.createHash('sha256').update(JSON.stringify(['saved',input.id])).digest('hex');
+    const file=paths.webAppSandboxRoot('account-e2e',key,'local')+'/data.sqlite';
+    const db=new LocalAppData(file,paths.userLocalRoot('account-e2e'),input.definition);
+    try{await db.call('data.insert',{table:'notes',values:{body:'KEEP'}});}finally{await db.close();}
+    (dialog as any).showSaveDialog=async()=>({canceled:false,filePath:input.exported});return file;
+  },{id:app.id,definition,exported,data:path.resolve('src/main/features/web_apps/data.ts'),paths:path.resolve('src/main/paths.ts')});
+  const inspect=(file:string,data:any,method='data.query')=>orkas.electronApp!.evaluate(async(_electron,input)=>{
+    const {LocalAppData}=(process as any).mainModule.require(input.module),db=new LocalAppData(input.file,input.boundary,input.data);
+    try{return await db.call(input.method,input.method==='data.query'?{table:'notes'}:{});}finally{await db.close();}
+  },{file,data,method,boundary:orkas.workspaceRoot,module:path.resolve('src/main/features/web_apps/data.ts')});
+  writeFileSync(entry,'<h1>Updated notes</h1>');const changed={version:1,tables:[]};
+  writeFileSync(manifest,JSON.stringify({sdkVersion:1,capabilities:['data'],data:changed}));
+  const preview=await orkas.openPreview(()=>orkas.page.evaluate(file=>(window as any).openChatFileViewer(file,'index.html'),entry));
+  const savedEntry=path.join(orkas.workspaceRoot,'account-e2e/cloud/saved_apps',app.id,'index.html');
+  for(const [language,width,height] of [['en',560,600],['zh',1080,720]] as const){
+    await preview.evaluate(language=>(window as any).setLang(language),language);await preview.setViewportSize({width,height});
+    await preview.locator('.chat-file-viewer-save-app').click();
+    const dialog=preview.locator('.ui-dialog-overlay:visible');
+    await expect(dialog).toContainText('notes: 1 (body)');
+    await dialog.locator(`[data-act="${language==='en'?'ok':'cancel'}"]`).click();
+    await expect(dialog).toContainText(language==='en'?'Clear all local records':'清空');
+    expect(await dialog.evaluate(el=>el.scrollWidth<=el.clientWidth)).toBe(true);
+    await preview.screenshot({path:testInfo.outputPath(`file-recovery-${language}.png`)});
+    await dialog.locator('[data-act="cancel"]').click();
+    expect(await inspect(file,definition)).toEqual({records:[{body:'KEEP'}]});
+    expect(readFileSync(savedEntry,'utf8')).toContain('Original notes');
+    await expect(preview.locator('.chat-file-viewer-save-app')).toBeVisible();
+  }
+  expect(await inspect(exported,definition)).toEqual({records:[{body:'KEEP'}]});
+  await preview.locator('.chat-file-viewer-save-app').click();
+  await preview.locator('.ui-dialog-overlay:visible [data-act="cancel"]').click();
+  await preview.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
+  await expect.poll(()=>readFileSync(savedEntry,'utf8')).toContain('Updated notes');
+  expect(await inspect(file,changed,'internal.inspect')).toMatchObject({records:0});
+  expect((await orkas.invoke<any>('savedApps.list')).apps.map((item:any)=>item.id)).toEqual([app.id]);
+  expect(orkas.modelRequests).toHaveLength(0);
+});
+
+for(const manifest of [false,true])test(`legacy local app opens and reopens without changing metadata (manifest: ${manifest})`,async({orkas},testInfo)=>{
+  const entry=orkas.createWorkspaceFile('legacy-open/index.html','<!doctype html><html><body><h1>Legacy link app</h1><a href="https://legacy-app.example.invalid/">Website</a><output></output><script>const count=Number(localStorage.getItem("opens")||0)+1;localStorage.setItem("opens",String(count));document.querySelector("output").textContent=String(count);</script></body></html>');
+  if(manifest)orkas.createWorkspaceFile('legacy-open/orkas-app.json',JSON.stringify({sdkVersion:1,capabilities:[]}));
+  const app=await orkas.invoke<any>('savedApps.saveFromPath',{path:entry,title:'Legacy link app'});expect(app.ok).toBe(true);
+  const metaFile=path.join(orkas.workspaceRoot,'account-e2e/cloud/saved_apps',app.id,'__orkas-meta.json');
+  const meta=JSON.parse(readFileSync(metaFile,'utf8'));delete meta.appType;delete meta.browserStorage;
+  const before=JSON.stringify(meta);writeFileSync(metaFile,before);
+  await openSidebarEntry(orkas.page,'#apps-btn');
+  const card=orkas.page.locator(`.app-card[data-app-id="${app.id}"]`);await expect(card).toBeVisible();
+  for(let count=1;count<=2;count++){
+    const preview=await orkas.openPreview(()=>card.click());
+    await expect(preview.locator('.ui-dialog-overlay:visible')).toHaveCount(0);
+    const frame=preview.frameLocator('.saved-app-viewer-frame');
+    await expect(frame.locator('h1')).toHaveText('Legacy link app');
+    // SDK instances have ephemeral origins; legacy browser-only pages keep theirs.
+    await expect(frame.locator('output')).toHaveText(String(manifest?1:count));
+    expect(await frame.locator('body').evaluate(()=>typeof (window as any).orkas)).toBe('undefined');
+    if(count===1)await preview.screenshot({path:testInfo.outputPath('legacy-local-open.png')});
+    await preview.route('https://legacy-app.example.invalid/',route=>route.fulfill({contentType:'text/html',body:'<h1>Website loaded</h1>'}));
+    await frame.getByRole('link',{name:'Website'}).click();
+    await expect(frame.locator('h1')).toHaveText('Website loaded');
+    expect(await frame.locator('body').evaluate(()=>typeof (window as any).orkas)).toBe('undefined');
+    if(count===1)await preview.screenshot({path:testInfo.outputPath('legacy-url-open.png')});
+    await orkas.closePreview(preview);
+  }
+  expect(readFileSync(metaFile,'utf8')).toBe(before);expect(orkas.modelRequests).toHaveLength(0);
+});
+
+test('publication guidance preserves the app and direct publication refuses without changes', async ({ orkas }, testInfo) => {
+  const entry = orkas.createWorkspaceFile('publication-boundary/index.html', '<h1>Keep locally available</h1>');
+  const saved = await orkas.invoke<any>('savedApps.saveFromPath', { path: entry, title: 'Long app title kept while publishing requires the commercial version' });
+  expect(saved.ok).toBe(true);
+  const metadata = path.join(orkas.workspaceRoot, 'account-e2e/cloud/saved_apps', saved.id, '__orkas-meta.json');
+  const before = readFileSync(metadata, 'utf8');
+  for (const channel of ['appPublishing.prepare', 'appPublishing.publish', 'appPublishing.recover', 'appPublishing.unpublish']) {
+    expect(await orkas.invoke(channel, { appId: saved.id, snapshot: 'synthetic' }))
+      .toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
+  }
+  const page = orkas.page!;
+  await openSidebarEntry(page, '#apps-btn');
+  for (const [language, width] of [['en', 1133], ['zh', 560]] as const) {
+    await page.evaluate(language => (window as any).setLang(language), language);
+    await page.setViewportSize({width,height:720});
+    const card = page.locator(`.app-card[data-app-id="${saved.id}"]`);
+    await card.hover();
+    await card.locator('[data-app-more]').click();
+    await expect(page.locator('.app-row-menu [data-action="publish"]'))
+      .toHaveText(language === 'zh' ? '发布' : 'Publish');
+    await page.locator('.app-row-menu').screenshot({path:testInfo.outputPath(`publication-menu-${language}.png`)});
+    await page.locator('.app-row-menu [data-action="publish"]').click();
+    const dialog = page.locator('.ui-dialog-overlay.open');
+    await expect(dialog).toContainText(language === 'zh' ? '发布' : 'publish', {ignoreCase:true});
+    expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    await dialog.screenshot({path:testInfo.outputPath(`publication-guidance-${language}-${width}.png`)});
+    await dialog.locator('[data-act="cancel"]').click();
+    await expect(card).toBeVisible();
+    await expect(card.locator('[data-app-more]')).toBeFocused();
+    expect(readFileSync(metadata, 'utf8')).toBe(before);
+  }
   expect(orkas.modelRequests).toHaveLength(0);
 });

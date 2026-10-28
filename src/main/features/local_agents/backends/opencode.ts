@@ -113,18 +113,22 @@ const opencodeRunBackend: LocalBackend = {
       });
     });
 
+    const stderrLines = new LineSplitter(64 * 1024);
+    const stderrLine = (line: string) => {
+      if (line) opts.onEvent({ type: 'stderr-line', line });
+    };
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
+      if (exited) return;
       tail.push(chunk);
-      for (const line of chunk.split(/\r?\n/)) {
-        if (line) opts.onEvent({ type: 'stderr-line', line });
-      }
+      stderrLines.push(chunk, stderrLine);
     });
 
     return new Promise<void>(resolve => {
       const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) => {
         if (exited) return;
         exited = true;
+        stderrLines.flush(stderrLine);
         watchdog.disarm();
         detachAbort();
         opts.onEvent({

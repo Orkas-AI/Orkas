@@ -69,9 +69,9 @@ it('admits submission only from a live local artifact owned by the active accoun
   expect(await check(local.token)).toEqual({ allowed: true });
   expect(await check(local.token, 'foreign')).toEqual({ allowed: false });
   expect(await check(local.token, 'user', 99)).toEqual({ allowed: false });
-  const saved = runtime.open('user', 1, { ...bundle, kind: 'saved' });
-  expect(await check(saved.token)).toEqual({ allowed: false });
-  expect(() => runtime.open('user', 1, { ...bundle, appType: 'web' })).toThrowError(expect.objectContaining({ code: 'E_COMMERCIAL_REQUIRED' }));
+  for (const app of [runtime.open('user', 1, { ...bundle, kind: 'saved' }),
+    runtime.open('user', 1, { ...bundle, appType: 'web' })])
+    expect(await check(app.token)).toEqual({ allowed: false });
   active = 'foreign'; expect(await check(local.token)).toEqual({ allowed: false });
   active = 'user'; expect(await check(local.token)).toEqual({ allowed: true });
   valid = false; expect(await check(local.token)).toEqual({ allowed: false });
@@ -154,4 +154,27 @@ it('scopes cancellation and duplicate IDs to the originating app instance', asyn
   expect(await collect(call(sibling.token, 'same-id'))).toEqual([{ type: 'result', ok: true, value: { text: 'Sibling result' } }]);
   expect(await collect(call(sibling.token, 'same-id'))).toEqual([{ type: 'result', ok: false, value: { code: 'E_DUPLICATE' } }]);
   expect(generate).toHaveBeenCalledOnce();
+});
+
+it.each(['cancel', 'close', 'account-switch'] as const)('does not dispatch after %s during asynchronous source validation', async action => {
+  let uid = 'user', release!: () => void, entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const generate = vi.fn(async () => ({ text: 'Must not run' }));
+  const { open, call, webAppCall, ctx } = await setup(generate, () => uid);
+  let first = true;
+  const app = runtime.open(uid, 1, { key: 'guarded', title: 'Guarded', entry: 'index.html',
+    manifest: { sdkVersion: 1, capabilities: ['ai'] }, resolve: () => null,
+    valid: async () => { if (first) { first = false; entered(); await gate; } return true; } });
+  const pending = collect(call(app.token, 'guarded'));
+  await started;
+  if (action === 'cancel') runtime.cancel('user', 1, app.token, 'guarded');
+  else if (action === 'close') runtime.close('user', 1, app.token);
+  else { uid = 'other'; runtime.closeUser('user'); }
+  release();
+  expect(await pending).toEqual([{ type: 'result', ok: false, value: { code: 'E_CANCELLED' } }]);
+  expect(generate).not.toHaveBeenCalled();
+  const recovered = action === 'cancel' ? app : open();
+  expect(await collect(webAppCall({ token: recovered.token, requestId: 'fresh', method: 'host.getContext', args: {} },
+    ctx(), new AbortController().signal))).toMatchObject([{ type: 'result', ok: true }]);
 });

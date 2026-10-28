@@ -35,15 +35,12 @@
  *
  * Pick algorithm (pickChatEntry / pickChatEntryGroup)
  *   1. Walk entries top-to-bottom.
- *   2. Group consecutive entries by (provider, model): the first group hit
- *      is the "primary" model; entries in that group round-robin by
- *      lastUsed (oldest picked first).
- *   3. For each candidate, check credential is usable:
- *        - api_key:  key is present, profile not in cooldown
- *        - oauth:    access token not expired, OR refresh succeeds
- *      If unusable, try the next candidate in the group, then the next
- *      group.
- *   4. Bump lastUsed on the chosen entry.
+ *   2. Preserve that priority even when adjacent entries share a model.
+ *   3. For each candidate, check that its credential is usable:
+ *        - api_key: key is present, profile not in cooldown
+ *        - oauth: access token not expired, OR one refresh succeeds
+ *      If unusable, try the next candidate in user order.
+ *   4. Picking is read-only; request completion owns usage updates.
  *
  * Cooldown (`model/core-agent/profile-cooldown.ts`)
  *   A profile that fails with a key-specific error (401 / 403 / 429 / 402;
@@ -59,20 +56,25 @@
 
 import { normalizeAnthropicBaseUrl } from '../model/custom-model-url';
 import * as fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import * as path from 'node:path';
 import { shell } from 'electron';
 
 import { userAuthProfilesFile, userLocalConfigDir } from '../paths';
 import * as localSecrets from '../util/local-secret-store';
+import { MIN_NATIVE_MODEL_CONTEXT_WINDOW, modelContextWindowBelowMinimum } from '../util/model-context-window';
 import { isBearerTokenHeaderSafe } from '../util/http-authorization';
 import { safeExternalUserActionUrl } from '../util/window-security';
-import { getActiveUserId } from './users';
+import { getActiveUserId, hasActiveUser } from './users';
 import {
   FEATURED_API_PROVIDERS,
   OAUTH_PROVIDERS,
   OAUTH_ALIAS_FOR,
   VISIBLE_PROVIDERS,
   EXTERNAL_API_PROVIDERS,
+  isExternalApiProvider,
+  configuredOpenAICompatibleProviders,
+  getConfiguredOpenAICompatibleProvider,
   isVisibleProvider,
   curatedModelsFor,
   isSelectableModel,
@@ -190,7 +192,7 @@ interface ApiKeyProfile {
   key: string;
   /** Present only for the custom provider. */
   baseUrl?: string;
-  protocol?: 'openai' | 'anthropic';
+  protocol?: 'openai' | 'responses' | 'anthropic';
   contextWindow?: number;
   maxTokens?: number;
   supportsReasoning?: boolean;
@@ -389,12 +391,12 @@ function decryptProfilesPayload(raw: string, localId: string): { json: string; n
   throw new Error('auth-profiles decrypt failed');
 }
 
-function loadProfiles(opts: { throwOnInvalidExisting?: boolean } = {}): ProfilesFile {
+function loadProfiles(opts: { throwOnInvalidExisting?: boolean; userId?: string } = {}): ProfilesFile {
+  const uid = opts.userId ?? getActiveUserId();
   try {
-    const raw = fs.readFileSync(profilesFile(), 'utf-8');
+    const raw = fs.readFileSync(userAuthProfilesFile(uid), 'utf-8');
     // Decrypt current Hosted/Open fallback payloads, or the previous crypto-vault whole-file
     // format. Plain JSON is also accepted as a one-shot migration input.
-    const uid = getActiveUserId();
     const { json, needsRewrite } = decryptProfilesPayload(raw, uid);
     let shouldRewrite = needsRewrite;
     const data = JSON.parse(json) as Partial<ProfilesFile>;
@@ -494,7 +496,7 @@ function loadProfiles(opts: { throwOnInvalidExisting?: boolean } = {}): Profiles
         ...(orkasApiCredential ? { orkasApiCredential } : {}),
       };
       if (shouldRewrite || Number((data as any).version) !== PROFILES_FILE_VERSION) {
-        try { saveProfiles(store); }
+        try { saveProfiles(store, uid); }
         catch (err) {
           // Migration is best-effort: a valid parsed store remains usable when disk writes fail.
           log.warn('auth profiles migration rewrite failed; using parsed store', { error: logErrorSummary(err) });
@@ -889,8 +891,8 @@ export function removeOrkasApiCredential(): { removed: boolean } {
   return { removed };
 }
 
-function saveProfiles(store: ProfilesFile): void {
-  const localId = getActiveUserId();
+function saveProfiles(store: ProfilesFile, userId?: string): void {
+  const localId = userId ?? getActiveUserId();
   const target = userAuthProfilesFile(localId);
   const targetDir = path.dirname(target);
   const tmp = `${target}.tmp`;
@@ -925,14 +927,15 @@ function isEntryAllowed(store: ProfilesFile, entry: Entry): boolean {
   return !!prof
     && isModelProviderAllowed(entry.provider, entry.model)
     && !isStoredProfileBlocked(prof)
-    && (!providerUsesCustomOpenAIConfig(entry.provider) || !!customRuntimeConfigFromProfile(prof))
+    && (!providerUsesCustomOpenAIConfig(entry.provider) || (!!customRuntimeConfigFromProfile(prof) && !entryHasSmallCustomWindow(store, entry)))
     && isSelectableModel(entry.provider, entry.model);
 }
 
-function modelNotAvailableError(): Error & { code: string } {
-  return Object.assign(new Error(t('errors.model_not_available')), {
-    code: 'MODEL_NOT_AVAILABLE',
-  });
+function modelNotAvailableError(contextTooSmall = false): Error & { code: string } {
+  const err = new Error(t(contextTooSmall ? 'errors.model_context_too_small' : 'errors.model_not_available',
+    { minimum: MIN_NATIVE_MODEL_CONTEXT_WINDOW })) as Error & { code: string };
+  err.code = 'MODEL_NOT_AVAILABLE';
+  return err;
 }
 
 /** A configured SDK-backed model is usable only when pi-ai knows the exact id
@@ -940,37 +943,49 @@ function modelNotAvailableError(): Error & { code: string } {
  * Direct adapters build their own Model objects and remain independently
  * resolvable. */
 function isRuntimeModelResolvable(
-  catalog: CoreAgentModule,
+  catalog: CoreAgentModule | null,
   providerId: string,
   modelId: string,
+  ignoreContextMinimum = false,
 ): boolean {
   if (!isSelectableModel(providerId, modelId)) return false;
-  if (EXTERNAL_API_PROVIDERS.includes(providerId)) return true;
-  return resolveConfiguredPiModel(catalog, providerId, modelId) !== null;
+  const external = isExternalApiProvider(providerId);
+  const resolved = !external && catalog ? resolveConfiguredPiModel(catalog, providerId, modelId) : null;
+  if (!external && !resolved) return false;
+  const window = external
+    ? curatedModelsFor(providerId).find(model => model.id === modelId)?.contextWindow
+    : resolved?.model.contextWindow;
+  return ignoreContextMinimum || !modelContextWindowBelowMinimum(window);
 }
 
 async function assertRuntimeSelectableModel(providerId: string, modelId: string): Promise<void> {
   if (!isSelectableModel(providerId, modelId)) throw modelNotAvailableError();
-  if (EXTERNAL_API_PROVIDERS.includes(providerId)) return;
-  if (isRuntimeModelResolvable(await ca(), providerId, modelId)) return;
-  throw modelNotAvailableError();
+  const catalog = isExternalApiProvider(providerId) ? null : await ca();
+  if (isRuntimeModelResolvable(catalog, providerId, modelId)) return;
+  throw modelNotAvailableError(isRuntimeModelResolvable(catalog, providerId, modelId, true));
 }
 
-type RuntimeModelResolver = (providerId: string, modelId: string) => boolean;
+type RuntimeModelResolver = (providerId: string, modelId: string, ignoreContextMinimum?: boolean) => boolean;
 
 async function buildRuntimeModelResolver(
   entries: readonly Pick<Entry, 'provider' | 'model'>[],
 ): Promise<RuntimeModelResolver> {
   const needsPiCatalog = entries.some((entry) => (
     isSelectableModel(entry.provider, entry.model)
-    && !EXTERNAL_API_PROVIDERS.includes(entry.provider)
+    && !isExternalApiProvider(entry.provider)
   ));
   const catalog = needsPiCatalog ? await ca() : null;
-  return (providerId, modelId) => (
-    isSelectableModel(providerId, modelId)
-    && (EXTERNAL_API_PROVIDERS.includes(providerId)
-      || (!!catalog && isRuntimeModelResolvable(catalog, providerId, modelId)))
-  );
+  const resolutions = new Map<string, { allowed: boolean; exists: boolean }>();
+  return (providerId, modelId, ignoreContextMinimum) => {
+    const key = JSON.stringify([providerId, modelId]);
+    let facts = resolutions.get(key);
+    if (!facts) {
+      const allowed = isRuntimeModelResolvable(catalog, providerId, modelId);
+      facts = { allowed, exists: allowed || isRuntimeModelResolvable(catalog, providerId, modelId, true) };
+      resolutions.set(key, facts);
+    }
+    return ignoreContextMinimum ? facts.exists : facts.allowed;
+  };
 }
 
 function makeProfileId(provider: string, label: string): string {
@@ -1010,7 +1025,7 @@ function customConfigError(code: string, message: string): Error & { code: strin
 
 export function normalizeCustomModelBaseUrl(
   raw: string,
-  protocol: 'openai' | 'anthropic' = 'openai',
+  protocol: 'openai' | 'responses' | 'anthropic' = 'openai',
   normalizeEndpoint = true,
 ): string {
   const value = String(raw || '').trim();
@@ -1036,6 +1051,10 @@ export function normalizeCustomModelBaseUrl(
     // can consume a gateway prefix that itself ends in /v1.
     return normalizeEndpoint ? normalizeAnthropicBaseUrl(url.toString()) : url.toString().replace(/\/+$/, '');
   }
+  if (protocol === 'responses') {
+    if (normalizeEndpoint) url.pathname = url.pathname.replace(/\/+$/, '').replace(/\/responses$/i, '') || '/';
+    return url.toString().replace(/\/+$/, '');
+  }
   const chatPathIndex = url.pathname.search(/\/chat(?:\/|$)/i);
   if (chatPathIndex >= 0) {
     url.pathname = url.pathname.slice(0, chatPathIndex).replace(/\/+$/, '') || '/';
@@ -1047,10 +1066,11 @@ function normalizeCustomTokenLimit(
   raw: number | string | null | undefined,
   fallback: number,
   field: 'contextWindow' | 'maxTokens',
+  contextMinimum = MIN_NATIVE_MODEL_CONTEXT_WINDOW,
 ): number {
   if (raw === undefined || raw === null || raw === '') return fallback;
-  const value = Number(raw);
-  const minimum = field === 'contextWindow' ? 1_024 : 1;
+  const value = typeof raw === 'number' || typeof raw === 'string' ? Number(raw) : NaN;
+  const minimum = field === 'contextWindow' ? contextMinimum : 1;
   if (!Number.isInteger(value) || value < minimum || value > MAX_CUSTOM_TOKEN_LIMIT) {
     throw customConfigError(
       'CUSTOM_TOKEN_LIMIT_INVALID',
@@ -1065,12 +1085,13 @@ function customRuntimeConfigFromProfile(
 ): CustomOpenAICompatibleRuntimeConfig | null {
   if (!profile || profile.type !== 'api_key' || profile.provider !== CUSTOM_MODEL_PROVIDER) return null;
   try {
-    const protocol = profile.protocol === 'anthropic' ? 'anthropic' : 'openai';
+    const protocol = profile.protocol === 'anthropic' ? 'anthropic' : profile.protocol === 'responses' ? 'responses' : 'openai';
     const baseUrl = normalizeCustomModelBaseUrl(profile.baseUrl || '', protocol, false);
     const contextWindow = normalizeCustomTokenLimit(
       profile.contextWindow,
       DEFAULT_CUSTOM_CONTEXT_WINDOW,
       'contextWindow',
+      1_024,
     );
     const maxTokens = normalizeCustomTokenLimit(
       profile.maxTokens,
@@ -1139,6 +1160,19 @@ export function getConfiguredModelCooldown(): {
   return best;
 }
 
+/** Read-only background gate; provider selection and cooldown policy stay unchanged. */
+export function allConfiguredModelsCooledDown(): boolean {
+  const store = loadProfiles();
+  let configured = 0;
+  for (const entry of store.entries) {
+    if (!isEntryAllowed(store, entry)) continue;
+    if (!store.profiles[entry.profileId]) continue;
+    configured += 1;
+    if (!getCooldown(entry.profileId)) return false;
+  }
+  return configured > 0;
+}
+
 export function getConfiguredModelOAuthExpiredMessage(): string | null {
   const store = loadProfiles();
   const now = Date.now();
@@ -1150,7 +1184,7 @@ export function getConfiguredModelOAuthExpiredMessage(): string | null {
       clearOAuthRefreshFailure(entry.profileId);
       continue;
     }
-    if (!oauthRefreshFailures.has(entry.profileId) && prof.refresh) continue;
+    if (!oauthRefreshFailures.has(oauthProfileKey(getActiveUserId(), entry.profileId)) && prof.refresh) continue;
     return t('errors.model_oauth_expired', { provider: providerLabel(prof.provider) });
   }
   return null;
@@ -1282,7 +1316,7 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
   }
 
   // Visible set: whitelist + providers with saved profiles.
-  const visible = new Set<string>(VISIBLE_PROVIDERS);
+  const visible = new Set<string>([...VISIBLE_PROVIDERS, ...configuredOpenAICompatibleProviders().map(p => p.id)]);
   for (const pid of byProvider.keys()) {
     if (isModelProviderAllowed(pid)) visible.add(pid);
   }
@@ -1314,7 +1348,7 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
     const directOAuth = oauthIds.has(id);
     const aliasOAuth  = OAUTH_ALIAS_FOR[id];
     const supportsOAuth = directOAuth || (!!aliasOAuth && oauthIds.has(aliasOAuth));
-    const supportsApiKey = apiCapable.has(id) && !oauthOnlyIds.has(id);
+    const supportsApiKey = (apiCapable.has(id) || isExternalApiProvider(id)) && !oauthOnlyIds.has(id);
     return {
       id,
       label: providerLabel(id),
@@ -1348,8 +1382,9 @@ export async function listModels(providerId: string): Promise<{ models: { id: st
   const allowed = (models: { id: string; name: string }[]) =>
     models.filter((m) => isModelProviderAllowed(id, m.id));
   const curated = curatedModelsFor(id);
-  const policyAllowed = allowed(curated);
-  if (EXTERNAL_API_PROVIDERS.includes(id) || policyAllowed.length === 0) {
+  const policyAllowed = allowed(curated.filter(model => model.hiddenFromPicker !== true && !modelContextWindowBelowMinimum(model.contextWindow)));
+
+  if (isExternalApiProvider(id) || policyAllowed.length === 0) {
     return { models: policyAllowed };
   }
   const catalog = await ca();
@@ -1370,6 +1405,9 @@ export async function addApiKey(
   if (!id) throw new Error('provider required');
   if (!key) throw new Error('api key required');
   assertModelProviderAllowed(id);
+  if (getConfiguredOpenAICompatibleProvider(id) && !isBearerTokenHeaderSafe(key)) {
+    throw customConfigError('API_KEY_INVALID', 'Invalid API key for HTTP Authorization headers');
+  }
   if (providerUsesCustomOpenAIConfig(id)) {
     throw customConfigError('CUSTOM_CONFIG_REQUIRED', 'Use the custom model configuration flow');
   }
@@ -1402,6 +1440,7 @@ export async function addApiKeyEntry(
   apiKey: string,
   label?: string,
 ): Promise<{ profileId: string; entryId: string }> {
+  const userId = getActiveUserId();
   const id = String(providerId || '').trim();
   const model = resolveModelUpgrade(id, String(modelId || '').trim()).modelId;
   const key = String(apiKey || '').trim();
@@ -1409,12 +1448,16 @@ export async function addApiKeyEntry(
   if (!model) throw new Error('model required');
   if (!key) throw new Error('api key required');
   assertModelProviderAllowed(id, model);
+  if (getConfiguredOpenAICompatibleProvider(id) && !isBearerTokenHeaderSafe(key)) {
+    throw customConfigError('API_KEY_INVALID', 'Invalid API key for HTTP Authorization headers');
+  }
   if (providerUsesCustomOpenAIConfig(id)) {
     throw customConfigError('CUSTOM_CONFIG_REQUIRED', 'Use the custom model configuration flow');
   }
   await assertRuntimeSelectableModel(id, model);
+  assertActiveAuthOwner(userId);
 
-  const store = loadProfiles({ throwOnInvalidExisting: true });
+  const store = loadProfiles({ throwOnInvalidExisting: true, userId });
   const chosenLabel = label ? sanitizeLabel(label) : autoLabel(store, id);
   const profileId = makeProfileId(id, chosenLabel);
   const now = Date.now();
@@ -1442,7 +1485,7 @@ export async function addApiKeyEntry(
       createdAt: now,
     });
   }
-  saveProfiles(store);
+  saveProfiles(store, userId);
   clearCooldown(profileId);
   invalidateCoreAgentRunner();
   return { profileId, entryId };
@@ -1450,7 +1493,7 @@ export async function addApiKeyEntry(
 
 export interface AddCustomModelEntryInput {
   label?: string;
-  protocol?: 'openai' | 'anthropic' | string;
+  protocol?: 'openai' | 'responses' | 'anthropic' | string;
   baseUrl: string;
   model: string;
   apiKey: string;
@@ -1467,7 +1510,7 @@ export async function addCustomModelEntry(
 ): Promise<{ profileId: string; entryId: string }> {
   const rawLabel = String(input?.label || '').trim();
   const model = String(input?.model || '').trim();
-  const protocol = input?.protocol === 'anthropic' ? 'anthropic' : 'openai';
+  const protocol = input?.protocol === 'anthropic' ? 'anthropic' : input?.protocol === 'responses' ? 'responses' : 'openai';
   const key = String(input?.apiKey || '').trim();
   if (!model) throw customConfigError('CUSTOM_MODEL_REQUIRED', 'Model ID required');
   if (!key) throw customConfigError('CUSTOM_API_KEY_REQUIRED', 'API key required');
@@ -1489,7 +1532,7 @@ export async function addCustomModelEntry(
   );
   const hasExplicitMaxTokens = input.maxTokens !== undefined
     && input.maxTokens !== null
-    && String(input.maxTokens).trim() !== '';
+    && !(typeof input.maxTokens === 'string' && input.maxTokens.trim() === '');
   const maxTokens = hasExplicitMaxTokens
     ? normalizeCustomTokenLimit(input.maxTokens, DEFAULT_CUSTOM_MAX_TOKENS, 'maxTokens')
     : undefined;
@@ -1502,7 +1545,7 @@ export async function addCustomModelEntry(
       'reasoningEffort must be low, medium, or high',
     );
   }
-  if (maxTokens !== undefined && maxTokens > contextWindow) {
+  if ((maxTokens ?? DEFAULT_CUSTOM_MAX_TOKENS) > contextWindow) {
     throw customConfigError(
       'CUSTOM_TOKEN_LIMIT_INVALID',
       'Maximum output tokens cannot exceed the context window',
@@ -1604,6 +1647,9 @@ export interface EntryView {
   modelEditable: boolean;
   modelAvailable: boolean;
   includedModels: string[];
+  selectable?: boolean;
+  availability?: 'available' | 'catalog_removed' | 'credential_missing' | 'context_too_small' | 'service_disabled';
+  availabilityReason?: string;
   official?: boolean;
   recommended?: boolean;
   profileId: string;
@@ -1621,10 +1667,18 @@ function entryToView(
   store: ProfilesFile,
   modelNameLookup: (p: string, m: string) => string,
   runtimeResolvable = true,
+  contextTooSmall = false,
 ): EntryView {
   const prof = store.profiles[e.profileId];
   const catalogModel = curatedModelsFor(e.provider).find((model) => model.id === e.model);
+  const availability = contextTooSmall || entryHasSmallCustomWindow(store, e) ? 'context_too_small'
+    : !isSelectableModel(e.provider, e.model) || !runtimeResolvable ? 'catalog_removed'
+      : !isModelProviderAllowed(e.provider, e.model) ? 'service_disabled'
+      : !prof || (providerUsesCustomOpenAIConfig(e.provider) && !customRuntimeConfigFromProfile(prof)) ? 'credential_missing' : 'available';
   const base = {
+    selectable: availability === 'available',
+    availability: availability as NonNullable<EntryView['availability']>,
+    ...(availability === 'context_too_small' ? { availabilityReason: t('errors.model_context_too_small', { minimum: MIN_NATIVE_MODEL_CONTEXT_WINDOW }) } : {}),
     entryId: e.entryId,
     provider: e.provider,
     providerLabel: providerLabel(e.provider),
@@ -1673,6 +1727,39 @@ async function buildModelNameLookup(): Promise<(p: string, m: string) => string>
   };
 }
 
+/** Read only the first eligible transport's metadata for idle code preparation.
+ * Never refresh OAuth, resolve credentials, construct a client, or send a request. */
+export async function getChatPreloadApi(): Promise<string | null> {
+  if (!hasActiveUser()) return null;
+  const uid = getActiveUserId();
+  const store = loadProfiles();
+  const allowed = store.entries.filter(entry => isEntryAllowed(store, entry) && !isCooledDown(entry.profileId));
+  if (!allowed.length) return null;
+  const resolvable = await buildRuntimeModelResolver(allowed);
+  if (!isActiveAuthOwner(uid)) return null;
+  const entry = allowed.find(entry => resolvable(entry.provider, entry.model));
+  if (!entry) return null;
+  if (isExternalApiProvider(entry.provider)) {
+    const models = await import('../model/core-agent/external-providers');
+    if (!isActiveAuthOwner(uid)) return null;
+    if (entry.provider === ORKAS_API_PROVIDER) return models.buildOrkasApiModel(entry.model).api;
+    if (entry.provider === 'moonshot') return models.buildMoonshotModel(entry.model).api;
+    if (entry.provider === 'deepseek') return models.buildDeepSeekModel(entry.model).api;
+    if (entry.provider === 'doubao') return models.buildDoubaoModel(entry.model).api;
+    const configured = models.buildConfiguredOpenAICompatibleModel(entry.provider, entry.model);
+    if (configured) return configured.api;
+    const config = customRuntimeConfigFromProfile(store.profiles[entry.profileId]);
+    if (!config) return null;
+    return (config.protocol === 'anthropic'
+      ? models.buildCustomAnthropicModel(entry.model, config)
+      : config.protocol === 'responses' ? models.buildCustomResponsesModel(entry.model, config)
+        : models.buildCustomOpenAICompatibleModel(entry.model, config)).api;
+  }
+  const catalog = await ca();
+  if (!isActiveAuthOwner(uid)) return null;
+  return resolveConfiguredPiModel(catalog, entry.provider, entry.model)?.model.api ?? null;
+}
+
 export async function listEntries(
   opts: { includeUnavailable?: boolean } = {},
 ): Promise<{ entries: EntryView[] }> {
@@ -1690,6 +1777,7 @@ export async function listEntries(
         store,
         lookup,
         runtimeResolvable(entry.provider, entry.model),
+        entryContextWindowTooSmall(store, entry, runtimeResolvable),
       )),
   };
 }
@@ -1706,13 +1794,15 @@ export async function addEntry({
   model,
   profileId,
 }: { provider: string; model: string; profileId: string }): Promise<{ entryId: string }> {
+  const userId = getActiveUserId();
   const p = String(provider || '').trim();
   const m = resolveModelUpgrade(p, String(model || '').trim()).modelId;
   const pid = String(profileId || '').trim();
   if (!p || !m || !pid) throw new Error('provider / model / profileId required');
   assertModelProviderAllowed(p, m);
   await assertRuntimeSelectableModel(p, m);
-  const store = loadProfiles({ throwOnInvalidExisting: true });
+  assertActiveAuthOwner(userId);
+  const store = loadProfiles({ throwOnInvalidExisting: true, userId });
   if (!store.profiles[pid]) throw new Error('profile not found');
   if (store.profiles[pid].provider !== p) throw new Error('profile does not belong to provider');
 
@@ -1732,16 +1822,18 @@ export async function addEntry({
     lastUsed: 0,
     createdAt: now,
   });
-  saveProfiles(store);
+  saveProfiles(store, userId);
   invalidateCoreAgentRunner();
   return { entryId };
 }
 
 export async function updateEntryModel(entryId: string, model: string): Promise<{ entryId: string; model: string }> {
+  const userId = getActiveUserId();
   const id = String(entryId || '').trim();
   const rawModel = String(model || '').trim();
   if (!id || !rawModel) throw new Error('entryId and model required');
-  const store = loadProfiles({ throwOnInvalidExisting: true });
+  const store = loadProfiles({ throwOnInvalidExisting: true, userId });
+  const snapshot = JSON.stringify(store);
   const target = store.entries.find((e) => e.entryId === id);
   if (!target) throw new Error('entry not found');
   const m = resolveModelUpgrade(target.provider, rawModel).modelId;
@@ -1750,6 +1842,7 @@ export async function updateEntryModel(entryId: string, model: string): Promise<
   }
   assertModelProviderAllowed(target.provider, m);
   await assertRuntimeSelectableModel(target.provider, m);
+  assertAuthStoreUnchanged(userId, snapshot);
   // Deduplicate: if another entry with the same (provider, model, profileId)
   // already exists, removing the target makes the priority list cleaner.
   const collision = store.entries.find(
@@ -1757,7 +1850,7 @@ export async function updateEntryModel(entryId: string, model: string): Promise<
   );
   if (collision) throw new Error('same (provider, model, profile) entry already exists');
   target.model = m;
-  saveProfiles(store);
+  saveProfiles(store, userId);
   invalidateCoreAgentRunner();
   return { entryId: id, model: m };
 }
@@ -1775,9 +1868,12 @@ export async function removeEntry(entryId: string): Promise<{ removed: boolean }
 }
 
 export async function reorderEntries(orderedIds: string[]): Promise<{ entries: EntryView[] }> {
+  const userId = getActiveUserId();
   if (!Array.isArray(orderedIds)) throw new Error('orderedIds must be an array');
-  const store = loadProfiles({ throwOnInvalidExisting: true });
+  const store = loadProfiles({ throwOnInvalidExisting: true, userId });
+  const snapshot = JSON.stringify(store);
   const runtimeResolvable = await buildRuntimeModelResolver(store.entries);
+  assertAuthStoreUnchanged(userId, snapshot);
   const byId = new Map(store.entries.map((e) => [e.entryId, e]));
   const reordered: Entry[] = [];
   for (const id of orderedIds) {
@@ -1789,7 +1885,7 @@ export async function reorderEntries(orderedIds: string[]): Promise<{ entries: E
     if (byId.has(e.entryId)) reordered.push(e);
   }
   store.entries = reordered;
-  saveProfiles(store);
+  saveProfiles(store, userId);
   invalidateCoreAgentRunner();
   const lookup = await buildModelNameLookup();
   return {
@@ -1807,9 +1903,11 @@ export async function selectEntry(
   entryId: string,
   requestedModel?: string,
 ): Promise<{ entries: EntryView[] }> {
+  const userId = getActiveUserId();
   const id = String(entryId || '').trim();
   if (!id) throw new Error('entryId required');
-  const store = loadProfiles({ throwOnInvalidExisting: true });
+  const store = loadProfiles({ throwOnInvalidExisting: true, userId });
+  const snapshot = JSON.stringify(store);
   const selected = store.entries.find((entry) => entry.entryId === id);
   if (!selected) throw modelNotAvailableError();
 
@@ -1831,10 +1929,11 @@ export async function selectEntry(
     selected.model = model;
   }
   const runtimeResolvable = await buildRuntimeModelResolver(store.entries);
+  assertAuthStoreUnchanged(userId, snapshot);
   if (
     !isEntryAllowed(store, selected)
     || !runtimeResolvable(selected.provider, selected.model)
-  ) throw modelNotAvailableError();
+  ) throw modelNotAvailableError(entryContextWindowTooSmall(store, selected, runtimeResolvable));
 
   const runnable = store.entries.filter((entry) => (
     isEntryAllowed(store, entry) && runtimeResolvable(entry.provider, entry.model)
@@ -1845,7 +1944,7 @@ export async function selectEntry(
   store.entries = store.entries.map((entry) => (
     runnableIds.has(entry.entryId) ? ordered[orderedIndex++] : entry
   ));
-  saveProfiles(store);
+  saveProfiles(store, userId);
   invalidateCoreAgentRunner();
 
   const lookup = await buildModelNameLookup();
@@ -1868,6 +1967,7 @@ type FlowStatus =
 
 interface Flow {
   flowId: string;
+  userId: string;
   provider: string;
   label: string;
   status: FlowStatus;
@@ -1882,6 +1982,31 @@ interface Flow {
 
 const flows = new Map<string, Flow>();
 let _flowCounter = 0;
+
+function isActiveAuthOwner(userId: string): boolean {
+  return hasActiveUser() && getActiveUserId() === userId;
+}
+
+function assertAuthStoreUnchanged(userId: string, snapshot: string): void {
+  assertActiveAuthOwner(userId);
+  const current = loadProfiles({ throwOnInvalidExisting: true, userId });
+  if (JSON.stringify(current) !== snapshot) throw modelNotAvailableError();
+}
+
+function assertActiveAuthOwner(userId: string): void {
+  if (!isActiveAuthOwner(userId)) throw modelNotAvailableError();
+}
+
+function isLiveOAuthFlow(flow: Flow): boolean {
+  return flows.get(flow.flowId) === flow
+    && !flow.abortController.signal.aborted
+    && isActiveAuthOwner(flow.userId);
+}
+
+function ownedOAuthFlow(flowId: string): Flow | undefined {
+  const flow = flows.get(flowId);
+  return flow && isActiveAuthOwner(flow.userId) ? flow : undefined;
+}
 
 function nextFlowId(): string {
   _flowCounter = (_flowCounter + 1) % 100000;
@@ -1951,10 +2076,12 @@ export async function startOAuth(
   providerId: string,
   label?: string,
 ): Promise<{ flowId: string; status: FlowStatus }> {
+  const userId = getActiveUserId();
   const id = String(providerId || '').trim();
   if (!id) throw new Error('provider required');
   const oauth = await piOauth();
   const provider = await oauth.getOAuthProvider(id);
+  assertActiveAuthOwner(userId);
   if (!provider) {
     const hint = _minimaxRegisterError && id.startsWith('minimax-portal')
       ? t('oauth.minimax.register_error_hint', { message: _minimaxRegisterError })
@@ -1969,6 +2096,7 @@ export async function startOAuth(
   const usesCallbackServer = provider.usesCallbackServer !== false;
   const flow: Flow = {
     flowId,
+    userId,
     provider: id,
     label: chosenLabel,
     status: { kind: 'starting' },
@@ -1980,6 +2108,7 @@ export async function startOAuth(
     .login({
       signal: flow.abortController.signal,
       onAuth: (info) => {
+        if (!isLiveOAuthFlow(flow)) return;
         flow.status = {
           kind: 'awaiting_auth',
           url: info.url,
@@ -1991,6 +2120,7 @@ export async function startOAuth(
         openExternalUrl(info.url);
       },
       onDeviceCode: (info) => {
+        if (!isLiveOAuthFlow(flow)) return;
         const details = [`Code: ${info.userCode}`];
         if (info.expiresInSeconds) details.push(`Expires in ${info.expiresInSeconds} seconds.`);
         flow.status = {
@@ -2002,6 +2132,7 @@ export async function startOAuth(
         openExternalUrl(info.verificationUri);
       },
       onPrompt: async (prompt) => {
+        if (!isLiveOAuthFlow(flow)) return '';
         flow.status = {
           kind: 'awaiting_input',
           prompt: {
@@ -2027,13 +2158,14 @@ export async function startOAuth(
       //      lets pi-ai drain out of `server.waitForCode()` and reach the
       //      `finally { server.close() }` block, so port 1455 gets freed
       //      instead of leaking.
-      onManualCodeInput: () => new Promise<string>((resolve) => {
+      onManualCodeInput: () => !isLiveOAuthFlow(flow) ? Promise.resolve('') : new Promise<string>((resolve) => {
         flow.manualInputResolver = (val) => {
           flow.manualInputResolver = undefined;
           resolve(val);
         };
       }),
       onSelect: async (prompt) => {
+        if (!isLiveOAuthFlow(flow)) return undefined;
         const selected = prompt.options[0];
         flow.status = {
           kind: 'progress',
@@ -2042,10 +2174,15 @@ export async function startOAuth(
         return selected?.id;
       },
       onProgress: (message) => {
+        if (!isLiveOAuthFlow(flow)) return;
         flow.status = { kind: 'progress', message };
       },
     })
     .then((credentials) => {
+      if (!isLiveOAuthFlow(flow)) {
+        if (!flow.abortController.signal.aborted) flow.status = { kind: 'error', error: 'cancelled' };
+        return;
+      }
       const store = loadProfiles({ throwOnInvalidExisting: true });
       // Prefer a human-identifiable label from the token if the caller
       // didn't supply one — email local-part, then accountId prefix —
@@ -2077,20 +2214,28 @@ export async function startOAuth(
       flow.status = { kind: 'done', profileId: pid };
     })
     .catch((err: unknown) => {
-      flow.status = { kind: 'error', error: (err as Error)?.message || String(err) };
+      if (flow.abortController.signal.aborted) return;
+      if (!isActiveAuthOwner(userId)) {
+        flow.status = { kind: 'error', error: 'cancelled' };
+        return;
+      }
+      // Upstream exceptions can contain token responses and redirect data.
+      // An empty detail selects the Renderer's existing localized failure copy.
+      log.warn('oauth authorization failed', { provider: id, error: logErrorSummary(err) });
+      flow.status = { kind: 'error', error: '' };
     });
 
   return { flowId, status: flow.status };
 }
 
 export function pollOAuthFlow(flowId: string): { status: FlowStatus } {
-  const flow = flows.get(flowId);
+  const flow = ownedOAuthFlow(flowId);
   if (!flow) return { status: { kind: 'error', error: 'unknown flow' } };
   return { status: flow.status };
 }
 
 export function submitOAuthInput(flowId: string, value: string): { ok: boolean } {
-  const flow = flows.get(flowId);
+  const flow = ownedOAuthFlow(flowId);
   if (!flow) return { ok: false };
   const val = String(value ?? '');
   // Prefer the late-stage `onPrompt` resolver if active (bind failed), else
@@ -2104,7 +2249,7 @@ export function submitOAuthInput(flowId: string, value: string): { ok: boolean }
 }
 
 export function cancelOAuthFlow(flowId: string): { ok: boolean } {
-  const flow = flows.get(flowId);
+  const flow = ownedOAuthFlow(flowId);
   if (!flow) return { ok: false };
   try { flow.abortController.abort(); } catch { /* noop */ }
   // Resolve both resolvers with empty string so pi-ai's flow drains out,
@@ -2131,39 +2276,15 @@ export interface ChatEntryChoice {
   model: string;
   apiKey: string;
   customConfig?: CustomOpenAICompatibleRuntimeConfig;
-}
-
-/**
- * Group consecutive entries by `(provider, model)`. Dropped into a helper
- * so `pickChatEntry` (single winner) and `pickChatEntryGroup` (whole
- * group of candidates for rotation) share exactly the same grouping
- * semantics — including the "first group wins" priority rule.
- */
-function groupEntries(entries: Entry[]): Entry[][] {
-  const groups: Entry[][] = [];
-  let current: Entry[] = [];
-  let currentKey = '';
-  for (const e of entries) {
-    const key = providerUsesCustomOpenAIConfig(e.provider)
-      ? `${e.provider}::${e.model}::${e.profileId}`
-      : `${e.provider}::${e.model}`;
-    if (key !== currentKey) {
-      if (current.length) groups.push(current);
-      current = [e];
-      currentKey = key;
-    } else {
-      current.push(e);
-    }
-  }
-  if (current.length) groups.push(current);
-  return groups;
+  refreshApiKey?: (rejectedApiKey: string) => Promise<string | undefined>;
 }
 
 /**
  * Resolve the usable `apiKey` for an entry (returns undefined if the
  * profile is gone, the OAuth token expired and refresh fails, etc.).
  */
-async function resolveEntryApiKey(store: ProfilesFile, entry: Entry): Promise<string | undefined> {
+async function resolveEntryApiKey(store: ProfilesFile, entry: Entry, userId: string): Promise<string | undefined> {
+  if (!isActiveAuthOwner(userId)) return undefined;
   const prof = store.profiles[entry.profileId];
   if (!prof || !isStoredProfileAllowed(prof)) return undefined;
   if (prof.type === 'api_key') return prof.key;
@@ -2172,11 +2293,13 @@ async function resolveEntryApiKey(store: ProfilesFile, entry: Entry): Promise<st
     return prof.access;
   }
   try {
-    const refreshed = await refreshOAuthProfile(entry.profileId);
-    if (!refreshed) rememberOAuthRefreshFailure(entry.profileId, prof);
+    const refreshed = await refreshOAuthProfile(entry.profileId, userId);
+    if (!isActiveAuthOwner(userId)) return undefined;
+    if (!refreshed) rememberOAuthRefreshFailure(entry.profileId, prof, userId);
     return refreshed;
   } catch (err) {
-    rememberOAuthRefreshFailure(entry.profileId, prof);
+    if (!isActiveAuthOwner(userId)) return undefined;
+    rememberOAuthRefreshFailure(entry.profileId, prof, userId);
     log.warn('OAuth refresh failed', { profileId: entry.profileId, error: logErrorSummary(err) });
     return undefined;
   }
@@ -2252,11 +2375,7 @@ export function bumpEntryLastUsed(entryId: string): void {
  * can fall back to a completely different provider+model if that's how
  * the user arranged their list.
  *
- * Within a run of consecutive entries sharing the same `(provider, model)`
- * (often: multiple API keys for the same model), we still pre-order by
- * oldest `lastUsed` first so load spreads fairly — but we flatten the
- * ordered sub-lists back into a single stream so the rotating provider
- * sees one simple sequence.
+ * Credentials retain user order even when they share provider and model.
  *
  * Skips:
  *   - entries whose profile was deleted
@@ -2269,20 +2388,17 @@ export function bumpEntryLastUsed(entryId: string): void {
  * bumps the winning candidate via `onSuccess`).
  */
 export async function pickChatEntryGroup(): Promise<ChatEntryChoice[]> {
-  const store = loadProfiles();
+  const userId = getActiveUserId();
+  const store = loadProfiles({ userId });
   if (store.entries.length === 0) return [];
   const runtimeResolvable = await buildRuntimeModelResolver(store.entries);
+  if (!isActiveAuthOwner(userId)) return [];
 
-  // Flatten: preserve entries[] order across groups, but within a
-  // consecutive same-(provider, model) run, sort oldest lastUsed first.
-  const groups = groupEntries(store.entries);
-  const ordered: Entry[] = [];
-  for (const group of groups) {
-    const sorted = [...group].sort((a, b) => (a.lastUsed || 0) - (b.lastUsed || 0));
-    for (const e of sorted) ordered.push(e);
-  }
+  // User priority applies to each credential, including identical models.
+  const ordered: Entry[] = [...store.entries];
 
   const choices: ChatEntryChoice[] = [];
+  const resolvedApiKeys = new Map<string, Promise<string | undefined>>();
   for (const entry of ordered) {
     if (!isEntryAllowed(store, entry)) {
       log.info(`skipping disabled provider/model ${entry.provider}/${entry.model}`);
@@ -2296,7 +2412,14 @@ export async function pickChatEntryGroup(): Promise<ChatEntryChoice[]> {
       log.info(`skipping cooled-down profile ${entry.profileId}`);
       continue;
     }
-    const apiKey = await resolveEntryApiKey(store, entry);
+    let pendingKey = resolvedApiKeys.get(entry.profileId);
+    if (!pendingKey) {
+      pendingKey = resolveEntryApiKey(store, entry, userId);
+      resolvedApiKeys.set(entry.profileId, pendingKey);
+    }
+    const apiKey = await pendingKey;
+    // Even an immediately available key crosses an await boundary here.
+    if (!isActiveAuthOwner(userId)) return [];
     if (!apiKey) continue;
     const customConfig = customRuntimeConfigFromProfile(store.profiles[entry.profileId]);
     choices.push({
@@ -2305,6 +2428,9 @@ export async function pickChatEntryGroup(): Promise<ChatEntryChoice[]> {
       provider: entry.provider,
       model: entry.model,
       apiKey,
+      ...(store.profiles[entry.profileId]?.type === 'oauth' ? {
+        refreshApiKey: (rejectedApiKey: string) => refreshOAuthProfileAfterAuthFailure(entry.profileId, rejectedApiKey, userId),
+      } : {}),
       ...(customConfig ? { customConfig } : {}),
     });
   }
@@ -2314,7 +2440,7 @@ export async function pickChatEntryGroup(): Promise<ChatEntryChoice[]> {
 /**
  * Pick the next chat entry respecting user priority. Thin wrapper over
  * `pickChatEntryGroup` that returns the top candidate (first group,
- * oldest-lastUsed first) and bumps `lastUsed` immediately. Callers that
+ * user order). Selection is read-only; completed requests own usage updates. Callers that
  * want rotation (runner.ts's chat path) use `pickChatEntryGroup` directly;
  * callers that only need one key (testConnection with provider-only mode)
  * keep using this.
@@ -2324,9 +2450,7 @@ export async function pickChatEntryGroup(): Promise<ChatEntryChoice[]> {
 export async function pickChatEntry(): Promise<ChatEntryChoice | null> {
   const group = await pickChatEntryGroup();
   if (group.length === 0) return null;
-  const chosen = group[0];
-  bumpEntryLastUsed(chosen.entryId);
-  return chosen;
+  return group[0];
 }
 
 /** Retained for one legacy caller (testConnection with a specific provider). */
@@ -2340,7 +2464,8 @@ export async function pickRotationKey(providerId: string): Promise<{
   const id = String(providerId || '').trim();
   if (!id) return null;
   if (!isModelProviderAllowed(id)) return null;
-  const store = loadProfiles({ throwOnInvalidExisting: true });
+  const userId = getActiveUserId();
+  const store = loadProfiles({ throwOnInvalidExisting: true, userId });
   const candidates = Object.entries(store.profiles)
     .filter(([, p]) => p.provider === id)
     .sort(([, a], [, b]) => (a.lastUsed || 0) - (b.lastUsed || 0));
@@ -2352,13 +2477,14 @@ export async function pickRotationKey(providerId: string): Promise<{
     let apiKey: string | undefined;
     if (prof.type === 'api_key') apiKey = prof.key;
     else if (Date.now() < prof.expires) apiKey = prof.access;
-    else apiKey = await refreshOAuthProfile(pid).catch(() => undefined);
+    else apiKey = await refreshOAuthProfile(pid, userId).catch(() => undefined);
+    if (!isActiveAuthOwner(userId)) return null;
     if (!apiKey) continue;
     const customConfig = customRuntimeConfigFromProfile(prof);
     if (providerUsesCustomOpenAIConfig(id) && !customConfig) continue;
-    const fresh = loadProfiles({ throwOnInvalidExisting: true });
+    const fresh = loadProfiles({ throwOnInvalidExisting: true, userId });
     const target = fresh.profiles[pid];
-    if (target) { target.lastUsed = Date.now(); saveProfiles(fresh); }
+    if (target) { target.lastUsed = Date.now(); saveProfiles(fresh, userId); }
     return {
       profileId: pid,
       provider: id,
@@ -2370,21 +2496,52 @@ export async function pickRotationKey(providerId: string): Promise<{
   return null;
 }
 
-async function refreshOAuthProfile(profileId: string): Promise<string | undefined> {
-  const store = loadProfiles();
-  const prof = store.profiles[profileId];
-  if (!prof || prof.type !== 'oauth') return undefined;
+// A rotating credential is shared by chat and connection probes. Keep one
+// exchange per exact owner/credential; reauthorization supersedes older grants.
+const oauthRefreshInFlight = new Map<string, Promise<string | undefined>>();
 
+function oauthCredentialFingerprint(prof: OAuthProfile): string {
+  return createHash('sha256').update(JSON.stringify([
+    prof.provider, prof.access, prof.refresh, prof.expires,
+  ])).digest('hex');
+}
+
+function isSameOAuthCredential(target: StoredProfile | undefined, expected: OAuthProfile): target is OAuthProfile {
+  return target?.type === 'oauth'
+    && oauthCredentialFingerprint(target) === oauthCredentialFingerprint(expected);
+}
+
+function refreshOAuthProfile(profileId: string, userId = getActiveUserId()): Promise<string | undefined> {
+  if (!isActiveAuthOwner(userId)) return Promise.resolve(undefined);
+  const prof = loadProfiles({ userId }).profiles[profileId];
+  if (!prof || prof.type !== 'oauth') return Promise.resolve(undefined);
+  const key = JSON.stringify([userId, profileId, oauthCredentialFingerprint(prof)]);
+  const existing = oauthRefreshInFlight.get(key);
+  if (existing) return existing;
+  const pending = performOAuthProfileRefresh(profileId, userId, prof);
+  oauthRefreshInFlight.set(key, pending);
+  const clearPending = () => {
+    if (oauthRefreshInFlight.get(key) === pending) oauthRefreshInFlight.delete(key);
+  };
+  pending.then(clearPending, clearPending);
+  return pending;
+}
+
+async function performOAuthProfileRefresh(
+  profileId: string,
+  userId: string,
+  prof: OAuthProfile,
+): Promise<string | undefined> {
   let oauth: PiOauthModule;
   try {
     oauth = await piOauth();
   } catch (err) {
-    rememberOAuthRefreshFailure(profileId, prof);
+    if (isActiveAuthOwner(userId)) rememberOAuthRefreshFailure(profileId, prof, userId);
     throw err;
   }
   const provider = await oauth.getOAuthProvider(prof.provider);
   if (!provider) {
-    rememberOAuthRefreshFailure(profileId, prof);
+    if (isActiveAuthOwner(userId)) rememberOAuthRefreshFailure(profileId, prof, userId);
     return undefined;
   }
 
@@ -2398,27 +2555,30 @@ async function refreshOAuthProfile(profileId: string): Promise<string | undefine
       ),
     ),
   };
+  if (!isActiveAuthOwner(userId)) return undefined;
+  if (!isSameOAuthCredential(loadProfiles({ userId }).profiles[profileId], prof)) return undefined;
   let newCreds: any;
   try {
-    newCreds = await provider.refreshToken(creds as any);
+    newCreds = await oauth.refreshOAuthProviderWithTimeout(provider, creds as any);
   } catch (err) {
-    rememberOAuthRefreshFailure(profileId, prof);
+    if (isActiveAuthOwner(userId)) rememberOAuthRefreshFailure(profileId, prof, userId);
     throw err;
   }
-  const fresh = loadProfiles({ throwOnInvalidExisting: true });
+  const fresh = loadProfiles({ throwOnInvalidExisting: true, userId });
   const target = fresh.profiles[profileId];
-  if (target && target.type === 'oauth') {
-    target.access = newCreds.access;
-    target.refresh = newCreds.refresh;
-    target.expires = newCreds.expires;
-    for (const [k, v] of Object.entries(newCreds)) {
-      if (!['access', 'refresh', 'expires'].includes(k)) {
-        (target as OAuthProfile)[k] = v;
-      }
+  // An admitted rotating grant still settles only to its original owner.
+  // Removal or reauthorization must not be undone by its delayed response.
+  if (!isSameOAuthCredential(target, prof)) return undefined;
+  target.access = newCreds.access;
+  target.refresh = newCreds.refresh;
+  target.expires = newCreds.expires;
+  for (const [k, v] of Object.entries(newCreds)) {
+    if (!['access', 'refresh', 'expires'].includes(k)) {
+      target[k] = v;
     }
-    saveProfiles(fresh);
   }
-  clearOAuthRefreshFailure(profileId);
+  saveProfiles(fresh, userId);
+  if (isActiveAuthOwner(userId)) clearOAuthRefreshFailure(profileId);
   return provider.getApiKey(newCreds);
 }
 
@@ -2461,11 +2621,13 @@ export async function testConnection(
   if (!selectedModel || !isSelectableModel(pid, selectedModel)) {
     return { ok: false, error: t('errors.model_not_available') };
   }
+  const userId = getActiveUserId();
   const mod = await ca();
-  const resolvedModel = EXTERNAL_API_PROVIDERS.includes(pid)
+  if (!isActiveAuthOwner(userId)) return { ok: false, error: t('errors.model_not_available') };
+  const resolvedModel = isExternalApiProvider(pid)
     ? null
     : resolveConfiguredPiModel(mod, pid, selectedModel);
-  if (!EXTERNAL_API_PROVIDERS.includes(pid) && !resolvedModel) {
+  if (!isExternalApiProvider(pid) && !resolvedModel) {
     return { ok: false, error: t('errors.model_not_available') };
   }
 
@@ -2474,12 +2636,12 @@ export async function testConnection(
   let customConfig: CustomOpenAICompatibleRuntimeConfig | undefined;
 
   if (chosenProfileId) {
-    const store = loadProfiles();
+    const store = loadProfiles({ userId });
     const prof = store.profiles[chosenProfileId];
     if (!prof || prof.provider !== pid) return { ok: false, error: 'profile not found' };
     if (prof.type === 'api_key') apiKey = prof.key;
     else if (Date.now() < prof.expires) apiKey = prof.access;
-    else apiKey = await refreshOAuthProfile(chosenProfileId).catch(() => undefined);
+    else apiKey = await refreshOAuthProfile(chosenProfileId, userId).catch(() => undefined);
     customConfig = customRuntimeConfigFromProfile(prof) || undefined;
   } else {
     const choice = await pickRotationKey(pid);
@@ -2490,6 +2652,7 @@ export async function testConnection(
     }
   }
 
+  if (!isActiveAuthOwner(userId)) return { ok: false, error: t('errors.model_not_available') };
   if (!apiKey) return { ok: false, error: 'no credential stored for this provider', profileId: chosenProfileId };
   if (providerUsesCustomOpenAIConfig(pid) && !customConfig) {
     return { ok: false, error: 'custom model configuration is incomplete', profileId: chosenProfileId };
@@ -2498,11 +2661,12 @@ export async function testConnection(
   // Orkas-side external providers bypass pi-ai's catalog — route directly
   // to their factory so we don't hit the "provider has no models registered"
   // guard below (which relies on pi-ai's listPiModels).
-  if (EXTERNAL_API_PROVIDERS.includes(pid)) {
+  if (isExternalApiProvider(pid)) {
     const modelForTest = selectedModel;
     const t0 = Date.now();
     try {
       const ext = await import('../model/core-agent/external-providers');
+      if (!isActiveAuthOwner(userId)) return { ok: false, error: t('errors.model_not_available') };
       let provider;
       let probeModel = modelForTest;
       if (pid === 'moonshot') {
@@ -2520,15 +2684,16 @@ export async function testConnection(
           ...customConfig,
         });
       } else {
-        throw new Error(`external provider "${pid}" has no test-connection factory yet`);
+        provider = await ext.createConfiguredOpenAICompatibleProvider({ providerId: pid, apiKey, modelId: probeModel });
       }
+      if (!isActiveAuthOwner(userId)) return { ok: false, error: t('errors.model_not_available') };
       const msg = await provider.complete({
         model: probeModel,
         systemPrompt: 'You are a connectivity probe; reply with a single word.',
         messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
         maxTokens: 1,
       });
-      if (chosenProfileId) clearCooldown(chosenProfileId);
+      if (chosenProfileId && isActiveAuthOwner(userId)) clearCooldown(chosenProfileId);
       return { ok: true, durationMs: Date.now() - t0, model: msg.model || probeModel, profileId: chosenProfileId };
     } catch (err) {
       const errMsg = sanitizeConnectionError(err, { apiKey, customConfig });
@@ -2577,7 +2742,7 @@ export async function testConnection(
       messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
       maxTokens: 1,
     });
-    if (chosenProfileId) clearCooldown(chosenProfileId);
+    if (chosenProfileId && isActiveAuthOwner(userId)) clearCooldown(chosenProfileId);
     return { ok: true, durationMs: Date.now() - t0, model: msg.model || '', profileId: chosenProfileId };
   } catch (err) {
     return {
@@ -2594,10 +2759,83 @@ export const saveApiKey = (providerId: string, apiKey: string, label?: string) =
   addApiKey(providerId, apiKey, label);
 
 const oauthRefreshFailures = new Set<string>();
-function rememberOAuthRefreshFailure(profileId: string, prof: OAuthProfile): void {
-  if (!profileId || Date.now() < prof.expires) return;
-  oauthRefreshFailures.add(profileId);
+function oauthProfileKey(userId: string, profileId: string): string {
+  return JSON.stringify([userId, profileId]);
 }
-function clearOAuthRefreshFailure(profileId: string): void {
-  if (profileId) oauthRefreshFailures.delete(profileId);
+function rememberOAuthRefreshFailure(profileId: string, prof: OAuthProfile, userId = getActiveUserId()): void {
+  if (!profileId || Date.now() < prof.expires) return;
+  // A superseded grant is not a failed attempt for its replacement credential.
+  if (!isSameOAuthCredential(loadProfiles({ userId }).profiles[profileId], prof)) return;
+  oauthRefreshFailures.add(oauthProfileKey(userId, profileId));
+}
+function clearOAuthRefreshFailure(profileId: string, userId = getActiveUserId()): void {
+  if (profileId) oauthRefreshFailures.delete(oauthProfileKey(userId, profileId));
+}
+
+/** Saved entries remain visible for credential/catalog remediation. */
+export async function listSettingsEntries(): Promise<{ entries: EntryView[] }> {
+  return listEntries({ includeUnavailable: true });
+}
+
+function entryHasSmallCustomWindow(store: ProfilesFile, entry: Entry): boolean {
+  if (!providerUsesCustomOpenAIConfig(entry.provider)) return false;
+  const profile = store.profiles[entry.profileId];
+  if (!profile || profile.type !== 'api_key') return false;
+  try {
+    const window = normalizeCustomTokenLimit(profile.contextWindow, DEFAULT_CUSTOM_CONTEXT_WINDOW, 'contextWindow', 1_024);
+    return modelContextWindowBelowMinimum(window);
+  } catch { return false; }
+}
+
+function entryContextWindowTooSmall(store: ProfilesFile, entry: Entry, resolver: RuntimeModelResolver): boolean {
+  return entryHasSmallCustomWindow(store, entry)
+    || (resolver(entry.provider, entry.model, true) && !resolver(entry.provider, entry.model));
+}
+
+export function getConfiguredModelContextWindowMessage(): string | null {
+  const store = loadProfiles();
+  const visible = store.entries.filter(entry => isModelProviderAllowed(entry.provider, entry.model) && !isStoredProfileBlocked(store.profiles[entry.profileId]));
+  return visible.length > 0 && visible.every(entry => entryHasSmallCustomWindow(store, entry))
+    ? t('errors.model_context_too_small', { minimum: MIN_NATIVE_MODEL_CONTEXT_WINDOW }) : null;
+}
+
+/** Only currently executable configured credentials are rotation candidates. */
+export async function listRotationEntries(): Promise<{ entries: EntryView[] }> { return listEntries(); }
+
+function oauthCredentialsFromProfile(prof: OAuthProfile): Record<string, unknown> {
+  return {
+    access: prof.access,
+    refresh: prof.refresh,
+    expires: prof.expires,
+    ...Object.fromEntries(
+      Object.entries(prof).filter(([k]) =>
+        !['type', 'provider', 'label', 'createdAt', 'lastUsed', 'email', 'access', 'refresh', 'expires'].includes(k),
+      ),
+    ),
+  };
+}
+
+async function refreshOAuthProfileAfterAuthFailure(
+  profileId: string,
+  rejectedApiKey: string,
+  userId: string,
+): Promise<string | undefined> {
+  if (!isActiveAuthOwner(userId)) return undefined;
+  const store = loadProfiles({ userId });
+  const prof = store.profiles[profileId];
+  if (!prof || prof.type !== 'oauth') return undefined;
+  try {
+    const oauth = await piOauth();
+    const provider = await oauth.getOAuthProvider(prof.provider);
+    if (!isActiveAuthOwner(userId)) return undefined;
+    if (!isSameOAuthCredential(loadProfiles({ userId }).profiles[profileId], prof)) return undefined;
+    const currentApiKey = provider?.getApiKey(oauthCredentialsFromProfile(prof) as any);
+    if (currentApiKey && currentApiKey !== rejectedApiKey) {
+      clearOAuthRefreshFailure(profileId, userId);
+      return currentApiKey;
+    }
+  } catch {
+    // The real refresh call below owns failure recording and propagation.
+  }
+  return refreshOAuthProfile(profileId, userId);
 }

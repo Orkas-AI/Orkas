@@ -146,14 +146,20 @@ describe('auto_tasks shared tool', () => {
     const scoped = createTool({ userId: uid, projectId: pid });
     const created = await run(scoped, { action: 'create', ...draft });
     expect(created.ok).toBe(true);
+    const byUser = await tasks.createTask(uid, draft as never);
+    expect(byUser.ok).toBe(true);
     const unscoped = createTool({ userId: uid });
     const globalCreate = await run(unscoped, { action: 'create', ...draft });
     expect(globalCreate.ok).toBe(true);
     const refused = await run(unscoped, { action: 'create', ...draft, project_id: 'p_missing' });
     expect(refused.isError).toBe(true);
-    // Reading, editing and deleting are not creations; neither is a rejected input.
+    // Reading and editing are not creations; neither is a rejected input.
     await run(scoped, { action: 'update', task_id: created.taskId, title: 'Renamed' });
     await run(scoped, { action: 'delete', task_id: created.taskId });
+    await run(unscoped, { action: 'delete', task_id: (byUser as { task: { id: string } }).task.id });
+    // A well-formed id with no record behind it reaches the delete; a malformed
+    // one is rejected by validation before it, like `missing` above.
+    await run(unscoped, { action: 'delete', task_id: tasks.allocateDraftTaskId() });
     await run(scoped, { action: 'create', content: draft.content });
 
     expect((await run(scoped, { action: 'get', task_id: created.taskId })).isError).toBe(true);

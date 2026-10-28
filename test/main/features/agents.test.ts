@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -191,6 +192,8 @@ function writeCustomAgent(agentId: string, fields: Partial<Record<string, any>> 
     created_at: '2026-04-18T10:00:00',
     updated_at: '2026-04-18T10:00:00',
   };
+  if ('description_zh' in fields) data.description_zh = fields.description_zh;
+  if ('description_en' in fields) data.description_en = fields.description_en;
   if ('skill_list' in fields) data.skill_list = fields.skill_list;
   if ('tool_list' in fields) data.tool_list = fields.tool_list;
   if ('runtime' in fields) data.runtime = fields.runtime;
@@ -2866,23 +2869,47 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     expect(seenOpts.agentToolDependencyAuthoring).toBe(true);
   });
 
-  it('does not advertise tool dependency authoring in a CLI Agent editor', async () => {
+  it.each([
+    { language: 'zh' as const, message: 'Shorten the description.', patch: '<description>审查代码并报告风险。</description>', zh: '审查代码并报告风险。', en: 'Original English' },
+    { language: 'en' as const, message: '把描述改短。', patch: '<description>Reviews code and reports risks.</description>', zh: '原有中文', en: 'Reviews code and reports risks.' },
+    { language: 'zh' as const, message: '请同时更新中英文描述。', patch: '<description_zh>审查代码。</description_zh><description_en>Reviews code.</description_en>', zh: '审查代码。', en: 'Reviews code.' },
+    { language: 'zh' as const, message: '只把英文简介改成更简短的版本。', patch: '<description_en>Reviews code.</description_en>', zh: '原有中文', en: 'Reviews code.' },
+  ].flatMap(scenario => (['cli', 'in_process'] as const).map(kind => ({ ...scenario, kind }))))(
+    'applies a $kind description edit with UI language $language: $message', async ({ kind, language, message, patch, zh, en }) => {
+    const { setLanguage } = await import('../../../src/main/features/config');
+    setLanguage(language);
     let seenOpts: any = null;
+    // Synthetic model output verifies prompt assembly and persistence, not model language quality.
     streamImpl.current = async function* (opts: any) {
       seenOpts = opts;
-      yield { type: 'final', text: 'done' };
+      yield { type: 'final', text: `<agent>${patch}</agent>` };
     };
-    writeCustomAgent('cli-agent', {
-      name: 'CliAgent',
-      runtime: { kind: 'cli', cli: 'codex' },
+    const runtime = kind === 'cli' ? { kind: 'cli', cli: 'codex' } : { kind: 'in_process' };
+    writeCustomAgent('edited-agent', {
+      name: 'Reviewer',
+      description_zh: '原有中文',
+      description_en: 'Original English',
+      runtime,
     });
 
     const a = await loadAgents();
-    for await (const _ev of a.streamSendToAgentEditChat('u1', 'cli-agent', '更新说明')) {
-      // drain
+    const events: any[] = [];
+    for await (const event of a.streamSendToAgentEditChat(TEST_UID, 'edited-agent', message)) {
+      events.push(event);
     }
 
-    expect(seenOpts.agentToolDependencyAuthoring).toBeUndefined();
+    expect(seenOpts.agentToolDependencyAuthoring).toBe(kind === 'cli' ? undefined : true);
+    expect(seenOpts.systemSkillList).toEqual(['agent-creator']);
+    expect(seenOpts.systemPrompt).not.toContain('bilingual `description`');
+    const { buildLanguageDirective } = await import('../../../src/main/i18n');
+    expect(seenOpts.systemPrompt).toContain(buildLanguageDirective(language));
+    expect(seenOpts.systemPrompt).toContain('**Description (Chinese)**: 原有中文');
+    expect(seenOpts.systemPrompt).toContain('**Description (English)**: Original English');
+    expect(events.some(event => event.type === 'error')).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'final', updated: expect.any(Object) }));
+    const stored = JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'edited-agent', 'agent.json'), 'utf8'));
+    expect(stored).toMatchObject({ name: 'Reviewer', description_zh: zh, description_en: en });
+    expect((await a.getAgent('edited-agent'))?.runtime?.kind ?? 'in_process').toBe(kind);
   });
 
   it('passes edit-chat attachments into the model prompt and history', async () => {
@@ -3051,6 +3078,28 @@ describe('agents › deleteCustomAgent', () => {
 });
 
 describe('agents › buildAgentEditSystemPrompt', () => {
+  it.each(['in_process', 'cli'] as const)('separates description language in the %s editor', async (kind) => {
+    const { setLanguage } = await import('../../../src/main/features/config');
+    setLanguage('zh');
+    const a = await loadAgents();
+    const sys = a.buildAgentEditSystemPrompt({
+      name: 'Reviewer',
+      description_en: 'Reviews code.',
+      runtime: kind === 'cli' ? { kind: 'cli', cli: 'codex' } : { kind: 'in_process' },
+    });
+    expect(sys).toContain('Fallback UI language: **Chinese (简体中文)**');
+    expect(sys).toContain('a current explicit request about reply language');
+    expect(sys).toContain('Agent and Skill descriptions instead follow the description-language rules in their owning creator Skill');
+    expect(sys.indexOf('## User language')).toBeGreaterThan(sys.indexOf('## Runtime injection'));
+    expect(sys).toContain('**Description (English)**: Reviews code.');
+    if (kind === 'cli') {
+      expect(sys).toContain('Apply a clear edit request directly');
+      expect(sys).toContain('Ask only when necessary information is missing');
+      expect(sys).toContain('neither `<operation>` nor `<agent_id>`');
+      expect(sys).not.toMatch(/Editable here|Clarify what coding task|Iterate gradually/i);
+    }
+  });
+
   it('substitutes agent fields and drops the removed skills_list placeholder', async () => {
     const a = await loadAgents();
     const sys = await a.buildAgentEditSystemPrompt({
@@ -3091,7 +3140,34 @@ describe('agents › buildAgentEditSystemPrompt', () => {
 });
 
 describe('agents › list cache invalidation', () => {
-  it('rebuilds a v2 OpenCode catalog snapshot with the host-owned project_dir schema', async () => {
+  it('retains the last complete disk snapshot on a failed refresh and reads the recovered source next time', async () => {
+    writeCustomAgent('recoverable', { name: 'Old name' });
+    const a = await loadAgents();
+    expect((await a.listAgents())[0].name).toBe('Old name');
+    const paths = await import('../../../src/main/paths');
+    const cache = paths.userAgentCatalogCacheFile(TEST_UID);
+    const snapshot = fs.readFileSync(cache, 'utf8');
+    const file = path.join(customAgentsDir(), 'recoverable', 'agent.json');
+    const body = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, JSON.stringify({ ...body, name: 'Fresh name' }));
+    const stamp = fs.statSync(customAgentsDir());
+    fs.utimesSync(customAgentsDir(), stamp.atime, new Date(stamp.mtimeMs + 2000));
+    const read = fs.promises.readFile.bind(fs.promises);
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((...args: any[]) => {
+      if (args[0] === file) return Promise.reject(Object.assign(new Error('private read failure'), { code: 'EIO' }));
+      return (read as any)(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      await expect(a.listAgents()).rejects.toThrow('Agent catalog unavailable');
+      await expect(a.listAgentSummaries()).rejects.toThrow('Agent catalog unavailable');
+      expect(fs.readFileSync(cache, 'utf8')).toBe(snapshot);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect((await a.listAgents())[0].name).toBe('Fresh name');
+    expect(JSON.parse(fs.readFileSync(cache, 'utf8')).data[0].name).toBe('Fresh name');
+  });
+
+  it.each([2, 3])('rebuilds a v%s catalog instead of trusting an obsolete or poisoned empty snapshot', async (version) => {
     writeCustomAgent('cached-opencode', {
       name: 'Cached OpenCode',
       runtime: { kind: 'cli', cli: 'opencode' },
@@ -3105,8 +3181,8 @@ describe('agents › list cache invalidation', () => {
     const paths = await import('../../../src/main/paths');
     const cacheFile = paths.userAgentCatalogCacheFile(TEST_UID);
     const stale = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-    stale.version = 2;
-    stale.data = stale.data.map((agent: any) => (
+    stale.version = version;
+    stale.data = version === 3 ? [] : stale.data.map((agent: any) => (
       agent.agent_id === 'cached-opencode' ? { ...agent, inputs: undefined } : agent
     ));
     fs.writeFileSync(cacheFile, JSON.stringify(stale));
@@ -3120,7 +3196,41 @@ describe('agents › list cache invalidation', () => {
     expect(repaired?.inputs?.find((input) => input.id === 'project_dir')).toMatchObject({
       type: 'directory', required: true, default: '',
     });
-    expect(JSON.parse(fs.readFileSync(cacheFile, 'utf8')).version).toBe(3);
+    expect(JSON.parse(fs.readFileSync(cacheFile, 'utf8')).version).toBe(4);
+  });
+
+  it.each(['EACCES', 'EIO', 'malformed'])('does not publish a partial catalog after %s and recovers without manual invalidation', async (fault) => {
+    writeCustomAgent('a-healthy', { name: 'Healthy' });
+    writeCustomAgent('z-recoverable', { name: 'Recoverable' });
+    const file = path.join(customAgentsDir(), 'z-recoverable', 'agent.json');
+    const source = fs.readFileSync(file, 'utf8');
+    const a = await loadAgents();
+    const paths = await import('../../../src/main/paths');
+    const cache = paths.userAgentCatalogCacheFile(TEST_UID);
+    const read = fs.promises.readFile.bind(fs.promises);
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((...args: any[]) => {
+      if (args[0] === file) return Promise.reject(Object.assign(new Error('private read failure'), { code: fault }));
+      return (read as any)(...args);
+    });
+    syncBuiltinESMExports();
+    if (fault === 'malformed') {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+      fs.writeFileSync(file, '{broken');
+    }
+    try {
+      await expect(a.listAgents()).rejects.toThrow('Agent catalog unavailable');
+      expect(fs.existsSync(cache)).toBe(false);
+      expect(fs.readFileSync(path.join(customAgentsDir(), 'a-healthy', 'agent.json'), 'utf8')).toContain('Healthy');
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+      fs.writeFileSync(file, source);
+    }
+    expect((await a.listAgents()).map(agent => agent.agent_id).sort()).toEqual(['a-healthy', 'z-recoverable']);
+    vi.resetModules();
+    (await import('../../../src/main/features/users')).activateUser(TEST_UID);
+    expect((await (await loadAgents()).listAgents()).map(agent => agent.agent_id).sort()).toEqual(['a-healthy', 'z-recoverable']);
   });
 
   it('reuses the persisted catalog after a module restart and honors force invalidation', async () => {
@@ -3142,7 +3252,9 @@ describe('agents › list cache invalidation', () => {
     expect((await restarted.listAgents())[0].name).toBe('Persisted Agent');
 
     restarted.clearAgentListCache();
-    expect(await restarted.listAgents()).toEqual([]);
+    await expect(restarted.listAgents()).rejects.toThrow('Agent catalog unavailable');
+    writeCustomAgent('persisted-agent', { name: 'Recovered Agent' });
+    expect((await restarted.listAgents())[0].name).toBe('Recovered Agent');
   });
 
   it('picks up newly created agents on next listAgents', async () => {

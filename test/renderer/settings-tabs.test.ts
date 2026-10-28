@@ -99,6 +99,18 @@ function loadSettingsTabsModule() {
 }
 
 describe('settings tabs module', () => {
+  it('refreshes local recycle data whenever the user returns to Data', () => {
+    const { window, tabs } = loadSettingsTabsModule();
+    window.initRecycleBin = vi.fn();
+    tabs[1].click();
+    expect(window.initRecycleBin).not.toHaveBeenCalled();
+    tabs[0].click();
+    expect(window.initRecycleBin).toHaveBeenCalledTimes(1);
+    tabs[2].click();
+    tabs[0].keydown('Home');
+    expect(window.initRecycleBin).toHaveBeenCalledTimes(2);
+  });
+
   it('initializes shared task cleanup on entering Data without requiring hosted data hooks', () => {
     const { window, tabs } = loadSettingsTabsModule();
     window.initTaskCleanup = vi.fn();

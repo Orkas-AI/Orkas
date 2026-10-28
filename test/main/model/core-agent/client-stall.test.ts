@@ -149,6 +149,43 @@ async function drain(opts: Record<string, unknown>): Promise<{ events: DrainedEv
 }
 
 describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
+  it.each(['wall', 'idle', 'cancel'] as const)('aborts a pending transport once on %s termination and settles the stream', async (termination) => {
+    await import('../../../../src/main/model/core-agent/client');
+    const transportAborted = vi.fn();
+    vi.useFakeTimers();
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    h.makeStream = async function* () {
+      const signal = h.lastRunStreamParams?.signal as AbortSignal;
+      started();
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => {
+        transportAborted(); resolve();
+      }, {once:true}));
+      expect(signal.aborted).toBe(true);
+      throw new Error('Controlled transport abort');
+    };
+    const controller = new AbortController();
+    try {
+      const result = drain({ idleTimeout: termination === 'idle' ? 0.1 : 10,
+        abortSignal: controller.signal,
+        ...(termination === 'wall' ? { executionDeadlineAt: Date.now() + 200 } : {}) });
+      await ready;
+      if (termination === 'cancel') controller.abort();
+      await vi.advanceTimersByTimeAsync(200);
+      const { events } = await result;
+      expect(events.filter(event => event.type === 'error')).toEqual([
+        expect.objectContaining(termination === 'cancel' ? { aborted: true }
+          : { failureCode: termination === 'wall' ? 'execution_wall_timeout' : 'idle_timeout' }),
+      ]);
+      expect(transportAborted).toHaveBeenCalledTimes(1);
+      expect((h.lastRunStreamParams?.signal as AbortSignal).aborted).toBe(true);
+      expect(h.runStreamCalls).toBe(1);
+      expect(events.at(-1)?.type).toBe('done');
+    } finally {
+      controller.abort();
+    }
+  });
+
 
   it('does not charge the provider usage again when the enclosing run finishes', async () => {
     const meter = await import('../../../../src/main/util/conversation-cost-meter');
@@ -163,6 +200,12 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
       expect(events.find(event => event.type === 'final')).toMatchObject({ text: 'done' });
       expect(meter.taskTokens(cid)).toBe(2);
     } finally { meter.resetTaskTokens(cid); }
+  });
+
+  it.each(['final', 'process'] as const)('preserves host delivery ownership through the client adapter: %s', async (outputDelivery) => {
+    h.makeStream = async function* () { yield completedEvent('done'); };
+    await drain({ outputDelivery });
+    expect(h.lastBuildRunnerParams?.outputDelivery).toBe(outputDelivery);
   });
 
   it('localizes a directly thrown task backstop without suggesting a model retry', async () => {

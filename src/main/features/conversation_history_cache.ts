@@ -14,7 +14,7 @@
 
 import * as fs from 'node:fs';
 import { isMainThread } from 'node:worker_threads';
-import { historyRequest } from './conversation-history-client';
+import { historyRequest, liveHistoryRequest, conversationHistoryLifetime } from './conversation-history-client';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -31,7 +31,7 @@ import { restoreInterruptedCliHistory } from './local_agents/interrupted-history
 import { DEFER_PROCESS_ITEMS, PROCESS_PAGE_REBUILD, PROCESS_PAGE_BYTES, processTextChunks, storeProcessPages, processSummary, readProcessPage, processPageReference } from './conversation-process-cache';
 
 const log = createLogger('conversation-history-cache');
-const CACHE_VERSION = 8;
+const CACHE_VERSION = 12;
 const MAX_INLINE_PROCESS_OUTPUT_BYTES = 1024;
 const MAX_FAILURE_OUTPUT_PREVIEW_CHARS = 600;
 const SOURCE_TAIL_FINGERPRINT_BYTES = 4 * 1024;
@@ -68,6 +68,9 @@ type CachePaths = {
 };
 
 const builds = new Map<string, Promise<LatestPageCache | null>>();
+const liveBuilds = new Map<string, Set<Promise<GroupMessage[]>>>();
+const purgeBarriers = new Map<string, Promise<void>>();
+const sourceKey = (userId: string, sourceFile: string) => JSON.stringify([userId, path.resolve(sourceFile)]);
 
 function snapshotIdentity(stat: fs.Stats): Omit<SourceSnapshot, 'tailHash'> {
   return {
@@ -122,7 +125,7 @@ function cachePaths(userId: string, sourceFile: string): CachePaths {
     entryDir,
     // Never parse an older, potentially hundreds-of-megabytes projection just
     // to discover its version. A new filename makes invalidation cheap.
-    latestPageFile: path.join(entryDir, 'latest-page-v8.json'),
+    latestPageFile: path.join(entryDir, `latest-page-v${CACHE_VERSION}.json`),
     toolResultsDir: path.join(entryDir, 'tool-results'),
   };
 }
@@ -629,6 +632,10 @@ async function buildLatestPage(
       await fsp.rm(path.join(files.entryDir, 'latest-page-v5.json'), { force: true });
       await fsp.rm(path.join(files.entryDir, 'latest-page-v6.json'), { force: true });
       await fsp.rm(path.join(files.entryDir, 'latest-page-v7.json'), { force: true });
+      await fsp.rm(path.join(files.entryDir, 'latest-page-v8.json'), { force: true });
+      await fsp.rm(path.join(files.entryDir, 'latest-page-v9.json'), { force: true });
+      await fsp.rm(path.join(files.entryDir, 'latest-page-v10.json'), { force: true });
+      await fsp.rm(path.join(files.entryDir, 'latest-page-v11.json'), { force: true });
       return next;
     }
     // A message landed while the page was being projected. Keep the valid
@@ -712,7 +719,21 @@ export async function purgeConversationHistoryCache(
   userId: string,
   sourceFile: string,
 ): Promise<void> {
-  if (isMainThread) return historyRequest({ kind: 'purge', userId, sourceFile });
+  if (isMainThread) {
+    const key = sourceKey(userId, sourceFile);
+    const generation = conversationHistoryLifetime();
+    const admitted = [...(liveBuilds.get(key) || [])];
+    const previous = purgeBarriers.get(key);
+    const pending = Promise.resolve(previous).catch(() => {}).then(async () => {
+      await Promise.allSettled(admitted);
+      if (generation !== conversationHistoryLifetime()) throw new Error('Conversation history worker stopped');
+      await historyRequest({ kind: 'purge', userId, sourceFile });
+    });
+    purgeBarriers.set(key, pending);
+    const cleanup = () => { if (purgeBarriers.get(key) === pending) purgeBarriers.delete(key); };
+    void pending.then(cleanup, cleanup);
+    return pending;
+  }
   const key = `${userId}\u0000${path.resolve(sourceFile)}`;
   await builds.get(key)?.catch(() => {});
   await fsp.rm(cachePaths(userId, sourceFile).entryDir, { recursive: true, force: true });
@@ -746,9 +767,26 @@ export async function readConversationHistoryWindowAtMessage(
 export async function projectLiveConversationHistoryRecords(
   userId: string, sourceFile: string, records: GroupMessage[],
 ): Promise<GroupMessage[]> {
-  const projected: GroupMessage[] = [];
-  for (const record of records) {
-    projected.push(...await historyRequest<GroupMessage[]>({ kind: 'project', userId, sourceFile, records: [record] }));
+  const key = sourceKey(userId, sourceFile);
+  const generation = conversationHistoryLifetime();
+  // A clear owns the same source across both worker lanes. Later reads may
+  // refill it, but an earlier projection must not recreate files after clear.
+  while (purgeBarriers.has(key)) await purgeBarriers.get(key)!.catch(() => {});
+  if (generation !== conversationHistoryLifetime()) throw new Error('Conversation history worker stopped');
+  const pending = (async () => {
+    const projected: GroupMessage[] = [];
+    for (const record of records) {
+      if (generation !== conversationHistoryLifetime()) throw new Error('Conversation history worker stopped');
+      projected.push(...await liveHistoryRequest<GroupMessage[]>({ kind: 'project', userId, sourceFile, records: [record] }));
+    }
+    return projected;
+  })();
+  const admitted = liveBuilds.get(key) || new Set<Promise<GroupMessage[]>>();
+  liveBuilds.set(key, admitted);
+  admitted.add(pending);
+  try { return await pending; }
+  finally {
+    admitted.delete(pending);
+    if (!admitted.size && liveBuilds.get(key) === admitted) liveBuilds.delete(key);
   }
-  return projected;
 }

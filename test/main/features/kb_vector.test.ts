@@ -305,6 +305,19 @@ describe('kb_vector › search', () => {
     expect(hits.length).toBe(2);
   });
 
+  it.each(['notes_2026', 'notes%2026', 'notes!2026'])('treats directory %s as a literal path rather than a SQL pattern', async dir => {
+    const kb = await loadKb();
+    const selected = [`${dir}/first.md`, `${dir}/nested/last.md`];
+    for (const relPath of [...selected, 'notesX2026/other.md', 'notes2026/other.md']) {
+      await kb.upsertFile(TEST_UID, {
+        relPath, kind: 'text', bytes: 1, mtime: 1, sha1: relPath,
+        chunks: [{ title: relPath, content: 'Directory-scoped source', embedding: fakeVec(1) }],
+      });
+    }
+    expect(kb.search(TEST_UID, fakeVec(1), { k: 10, dir }).map(hit => hit.rel_path).sort())
+      .toEqual(selected.sort());
+  });
+
   it('filters by exact path', async () => {
     const kb = await loadKb();
     await seed(kb);

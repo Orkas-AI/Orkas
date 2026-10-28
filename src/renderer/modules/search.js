@@ -100,6 +100,7 @@ function _bindGlobalSearch() {
   // in VS Code / Notion / etc.) — without this, the keystroke would re-call
   // openGlobalSearch() and reset query + tab state mid-typing.
   document.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
     if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
       e.preventDefault();
       const overlay = document.getElementById('search-overlay');

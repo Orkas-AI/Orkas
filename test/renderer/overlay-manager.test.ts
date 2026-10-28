@@ -83,6 +83,20 @@ describe('application floating layer presentation', () => {
     expect(f.invoke).toHaveBeenCalledExactlyOnceWith('webAssist.overlayState', expect.objectContaining({ blocked: false }));
   });
 
+  it('repaints a page that stops being a layer before native acknowledgement', async () => {
+    const f = fixture(); f.manager.setBrowserOpen(true); await f.drain();
+    f.invoke.mockImplementationOnce(() => new Promise(() => {}));
+    // A page panel briefly carries an overlay modifier (detail opened over
+    // another page) and drops it again when the detail fails to load.
+    const panel = f.add();
+    f.manager.refresh();
+    expect(panel.classList.contains('ui-overlay-waiting')).toBe(true);
+    panel.classList.toggle('fresh-surface', false); f.change(panel); await f.drain();
+    expect(f.manager.count()).toBe(0);
+    expect(panel.classList.contains('ui-overlay-waiting')).toBe(false);
+    expect(f.invoke).toHaveBeenLastCalledWith('webAssist.overlayState', expect.objectContaining({ blocked: false }));
+  });
+
   it('handles hidden ancestors, empty roots, visibility-only closing and browser close without a dangling blocker', async () => {
     const f = fixture(); const a = f.add(); a.parentHidden = true; await f.drain();
     f.manager.setBrowserOpen(true); await f.drain(); expect(f.manager.count()).toBe(0);

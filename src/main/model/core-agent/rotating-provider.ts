@@ -81,10 +81,13 @@ export const PROVIDER_EMPTY_UNKNOWN_CODE = 'PROVIDER_EMPTY_UNKNOWN';
 export const PROVIDER_CANDIDATES_UNAVAILABLE_CODE = 'PROVIDER_CANDIDATES_UNAVAILABLE';
 
 class ProviderCandidatesUnavailableError extends Error {
-  readonly code = PROVIDER_CANDIDATES_UNAVAILABLE_CODE;
+  readonly code: string;
 
-  constructor() {
-    super('No configured model candidate is currently available');
+  constructor(requireImageInput = false) {
+    super(requireImageInput
+      ? 'No available configured model can accept the required image input'
+      : 'No configured model candidate is currently available');
+    this.code = requireImageInput ? 'UNSUPPORTED_MODEL' : PROVIDER_CANDIDATES_UNAVAILABLE_CODE;
     this.name = 'ProviderCandidatesUnavailableError';
   }
 }
@@ -222,6 +225,8 @@ export interface CreateRotatingProviderConfig {
   /** Ordered list of candidates. First entry is the primary (matches
    *  `pickChatEntryGroup()[0]`). Further entries are fallbacks. */
   candidates: RotatingCandidate[];
+  /** Library image understanding cannot proceed after dropping its pixels. */
+  requireImageInput?: boolean;
   /** Called after the wrapper commits to a candidate (first content event
    *  yielded successfully). Used by callers to clear cooldown on the
    *  winning profile and bump `lastUsed`. */
@@ -293,8 +298,13 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
   const rateLimitIdFor = (candidate: RotatingCandidate): string => (
     JSON.stringify([candidate.profileId, candidate.providerId, candidate.modelId])
   );
+  const lacksRequiredImages = (candidate: RotatingCandidate): boolean => (
+    config.requireImageInput === true
+    && (candidate.maxInputImages === 0 || candidate.imageSupport?.unsupported === true)
+  );
   const isUnavailable = (candidate: RotatingCandidate): boolean => (
-    unavailableProfiles.has(cooldownIdFor(candidate))
+    lacksRequiredImages(candidate)
+    || unavailableProfiles.has(cooldownIdFor(candidate))
     || rateLimitedCandidates.has(rateLimitIdFor(candidate))
   );
   const markUnavailable = (candidate: RotatingCandidate, kind: KeyFailureKind, reason: string): void => {
@@ -356,6 +366,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
    *  `provider_default`, omit a call-specific cap, and keep that omission
    *  across fallback. */
   function paramsFor(cand: RotatingCandidate, params: CompletionParams): CompletionParams {
+    if (lacksRequiredImages(cand)) throw new ProviderCandidatesUnavailableError(config.requireImageInput);
     const next = { ...params, model: cand.modelId,
       ...(config.onRequestFailure ? { onRequestFailure: config.onRequestFailure } : {}),
     };
@@ -759,8 +770,11 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     name: providerId.charAt(0).toUpperCase() + providerId.slice(1),
 
     async complete(params: CompletionParams): Promise<CompletionResult> {
+      if (config.requireImageInput && !params.messages.some(message => messageImageCount(message) > 0)) {
+        throw new ProviderCandidatesUnavailableError(true);
+      }
       if (terminalRateLimit) throw terminalRateLimit;
-      let lastErr: unknown = new ProviderCandidatesUnavailableError();
+      let lastErr: unknown = new ProviderCandidatesUnavailableError(config.requireImageInput);
       let lastCand: RotatingCandidate | null = null;
       let lastFailure: PreCommitFailure | null = null;
       let exhaustedNetwork = false;
@@ -816,6 +830,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             }
             observeFailure(cand, params, err);
             lastErr = err;
+            if (lacksRequiredImages(cand)) break;
             const failure = err instanceof ProviderEmptyResponseError && err.kind === 'normal_end_empty'
               ? null : classifyPreCommitFailure(err);
             if (!failure) {
@@ -870,8 +885,11 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     },
 
     async *stream(params: CompletionParams): AsyncIterable<StreamEvent> {
+      if (config.requireImageInput && !params.messages.some(message => messageImageCount(message) > 0)) {
+        throw new ProviderCandidatesUnavailableError(true);
+      }
       if (terminalRateLimit) throw terminalRateLimit;
-      let lastErr: unknown = new ProviderCandidatesUnavailableError();
+      let lastErr: unknown = new ProviderCandidatesUnavailableError(config.requireImageInput);
       let lastCand: RotatingCandidate | null = null;
       let lastFailure: PreCommitFailure | null = null;
       let exhaustedNetwork = false;
@@ -903,6 +921,10 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
           attempt = await streamOne(cand, params);
 
           if (!('rotatable' in attempt)) break;
+          if (config.requireImageInput) {
+            observeFailure(cand, params, attempt.err);
+            if (lacksRequiredImages(cand)) break;
+          }
 
           if (attempt.empty) {
             yield {
@@ -982,6 +1004,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         if ('rotatable' in attempt) {
           observeFailure(cand, params, attempt.err);
           lastErr = attempt.err;
+          if (lacksRequiredImages(cand)) continue;
           if (!attempt.rotatable || (normalEmptyRecoveryActive && attempt.failure.kind !== 'rate_limit')) {
             // Non-rotatable failure before any content event → this
             // candidate is what the user sees in the surfaced error.

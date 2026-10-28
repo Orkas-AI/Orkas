@@ -59,7 +59,7 @@ vi.mock('../../src/main/features/file_indexer', () => ({
 }));
 
 vi.mock('../../src/main/util/image-transform', () => ({
-  toCompressedGrayJpeg: vi.fn(async () => Buffer.from('jpeg')),
+  toCompressedJpeg: vi.fn(async () => Buffer.from('jpeg')),
 }));
 
 beforeEach(async () => {

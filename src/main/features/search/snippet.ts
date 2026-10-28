@@ -1,4 +1,4 @@
-import { hasHistoryProcess, historyProcessTexts, historyRecordTextParts } from '../chat-history-records';
+import { hasHistoryProcess, historyProcessEntries, historyRecordTextParts } from '../chat-history-records';
 
 /** Preserve the first-token snippet without projecting the rest of a large
  * execution trail after its display window is already known. Parts have the
@@ -45,6 +45,7 @@ export interface ChatSnippet {
   msg_id?: string;
   has_process?: boolean;
   process_snippet?: string;
+  process_index?: number;
 }
 
 /** Only this small projection survives a source read. Large execution records
@@ -60,16 +61,19 @@ export function projectChatSnippet(message: any, tokens: readonly string[]): Cha
   const result: ChatSnippet = { snippet: makeSnippet(historyRecordTextParts(message, true), tokens), visible };
   if (hasHistoryProcess(message)) {
     result.has_process = true;
-    let best = '', coverage = 0;
+    let best = '', coverage = 0, bestIndex = -1;
     const terms = [...new Set(tokens)];
-    for (const text of historyProcessTexts(message, true)) {
+    for (const { index, text } of historyProcessEntries(message, true)) {
       const lower = text.toLowerCase();
       const matched = terms.reduce((count, term) => count + Number(lower.includes(term)), 0);
-      if (matched > coverage) { best = text; coverage = matched; }
+      if (matched > coverage) { best = text; coverage = matched; bestIndex = index; }
       // Later entries cannot improve full coverage; ties retain the first.
       if (coverage === terms.length) break;
     }
-    if (best) result.process_snippet = makeSnippet([best], tokens);
+    if (best) {
+      result.process_snippet = makeSnippet([best], tokens);
+      result.process_index = bestIndex;
+    }
   }
   if (typeof message.id === 'string' && message.id) result.msg_id = message.id;
   return result;

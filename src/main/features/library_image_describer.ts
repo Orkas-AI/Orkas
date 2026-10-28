@@ -1,15 +1,17 @@
 import * as crypto from 'node:crypto';
 
 import { createLogger } from '../logger';
-import { chatWithModel } from '../model/client';
 import { prompts } from '../prompts/loader';
-import { toCompressedGrayJpeg } from '../util/image-transform';
+import {
+  LIBRARY_IMAGE_TRANSFORM_OPTIONS,
+  toCompressedJpeg,
+} from '../util/image-transform';
 
 const log = createLogger('library_image_describer');
 
 // Per-image cap for KB / project-library vision summaries. The owning
 // indexers enforce a 5min extraction deadline that starts before image
-// preprocessing, so vision must settle earlier to leave time for fallback,
+// preprocessing, so vision must settle earlier to leave time for status updates,
 // chunking, embedding, and persistence.
 const DEFAULT_IMAGE_DESCRIBE_TIMEOUT_MS = 4 * 60 * 1000;
 const MAX_SOURCE_NAME_CHARS = 160;
@@ -29,12 +31,12 @@ export async function describeLibraryImage(
 ): Promise<string> {
   const sessionPrefix = opts.sessionPrefix || 'extract-img';
   const cleanName = cleanSourceName(sourceName);
-  let compressed: Awaited<ReturnType<typeof toCompressedGrayJpeg>>;
+  let compressed: Awaited<ReturnType<typeof toCompressedJpeg>>;
   try {
-    compressed = await toCompressedGrayJpeg(raw, { maxDim: 1024, quality: 70, grayscale: true });
+    compressed = await toCompressedJpeg(raw, LIBRARY_IMAGE_TRANSFORM_OPTIONS);
   } catch (err) {
-    logFallback('prepare', cleanName, 'image_prepare_failed');
-    return fallbackDescription(cleanName);
+    logFailure('prepare', cleanName, 'image_prepare_failed');
+    throw imageDescriptionError('image_prepare_failed');
   }
 
   const controller = new AbortController();
@@ -50,7 +52,9 @@ export async function describeLibraryImage(
     source_name_json: JSON.stringify(cleanName),
   });
 
-  const modelCall: Promise<VisionResult> = chatWithModel({
+  // Index/catalog startup must not load the model runtime before an image
+  // actually needs description. Include first-use loading in the deadline.
+  const modelCall: Promise<VisionResult> = import('../model/client').then(({ chatWithModel }) => chatWithModel({
     userId,
     sessionId,
     message,
@@ -58,9 +62,10 @@ export async function describeLibraryImage(
     skillList: [],
     // This one-shot vision operation must not receive the default tool set.
     toolList: [],
+    requireImageInput: true,
     idleTimeout: Math.ceil(timeoutMs / 1000),
     abortSignal: controller.signal,
-  }).catch((err) => ({
+  })).catch((err) => ({
     ok: false,
     text: '',
     error: (err as Error).message || String(err),
@@ -83,17 +88,17 @@ export async function describeLibraryImage(
   if (timer) clearTimeout(timer);
 
   if (!result.ok) {
-    logFallback(
+    logFailure(
       'describe',
       cleanName,
       result.aborted ? 'image_describe_timeout' : 'image_describe_failed',
     );
-    return fallbackDescription(cleanName);
+    throw imageDescriptionError(result.aborted ? 'image_describe_timeout' : 'image_describe_failed');
   }
   const text = (result.text || '').trim();
   if (!text) {
-    logFallback('describe', cleanName, 'image_describe_empty');
-    return fallbackDescription(cleanName);
+    logFailure('describe', cleanName, 'image_describe_empty');
+    throw imageDescriptionError('image_describe_empty');
   }
   return text;
 }
@@ -112,20 +117,16 @@ function imageDescribeTimeoutMs(): number {
   return Math.min(configured, DEFAULT_IMAGE_DESCRIBE_TIMEOUT_MS);
 }
 
-function logFallback(stage: 'prepare' | 'describe', sourceName: string, errorCode: string): void {
+function logFailure(stage: 'prepare' | 'describe', sourceName: string, errorCode: string): void {
   const sourceRef = crypto.createHash('sha256').update(sourceName).digest('hex').slice(0, 12);
-  log.warn('library image description fallback', {
+  log.warn('library image description failed', {
     stage,
     source_ref: sourceRef,
     error_code: errorCode,
   });
 }
 
-function fallbackDescription(sourceName: string): string {
-  return [
-    `# ${sourceName}`,
-    '',
-    'Image file; automatic visual description is unavailable.',
-    `Filename: ${sourceName}`,
-  ].join('\n');
+/** A failed description is status, never searchable image content. */
+function imageDescriptionError(code: string): Error {
+  return Object.assign(new Error(code), { code });
 }

@@ -36,6 +36,7 @@ function _taskBoardLiveRows(tasks) {
   return (Array.isArray(tasks) ? tasks : [])
     .filter((t) => t
       && !t.absorbed_into_turn_id
+      && !(t.status === 'queued' && t.message_sent_at)
       && Object.prototype.hasOwnProperty.call(rank, t.status))
     .sort((a, b) => (rank[a.status] - rank[b.status])
       || ((Number.isFinite(a.order) ? a.order : Infinity) - (Number.isFinite(b.order) ? b.order : Infinity))
@@ -101,8 +102,78 @@ function _taskBoardVisibility(liveRows) {
 const _taskBoardBatchIds = new Map();     // cid → Set(task_id)
 const _taskBoardCollapsedCids = new Set(); // cids the user collapsed
 const _taskBoardCollapsedAgents = new Map(); // cid → Set(assignee); groups start expanded
-const _taskBoardSendingNow = new Set();    // `${cid}:${task_id}` awaiting live-turn acknowledgement
+const _taskBoardSendingNow = new Set();    // `${cid}:${task_id}` awaiting message persistence
 const _taskBoardEditing = new Set();       // `${cid}:${task_id}` with an open editor
+
+// A send to several actors is split by the host planner (D29), which takes
+// seconds before any row exists. The host signals that window per message;
+// the board shows the send as being arranged until planning ends, then lets
+// its new rows hold the board up until their initial admission settles, so
+// the board never blinks out between the two.
+const _taskBoardPlanning = new Map();      // cid → Map(message_id → { preview, active, seenAt })
+const _taskBoardPlanningEnded = new Map(); // cid → Set(message_id), bounded
+const _TASK_BOARD_PLANNING_ENDED_MAX = 50;
+let _taskBoardPlanningClock = 0;
+
+function _taskBoardEndPlanning(cid, messageId) {
+  let ended = _taskBoardPlanningEnded.get(cid);
+  if (!ended) { ended = new Set(); _taskBoardPlanningEnded.set(cid, ended); }
+  ended.add(messageId);
+  if (ended.size > _TASK_BOARD_PLANNING_ENDED_MAX) ended.delete(ended.values().next().value);
+  const entry = _taskBoardPlanning.get(cid)?.get(messageId);
+  if (entry) entry.active = false;
+}
+
+function _taskBoardApplyPlanning(cid, evData) {
+  const messageId = evData && typeof evData.message_id === 'string' ? evData.message_id : '';
+  if (!cid || !messageId) return;
+  if (evData.active !== true) { _taskBoardEndPlanning(cid, messageId); return; }
+  // The send and observer streams both relay the window: a repeated start
+  // must not revive a send whose planning already ended.
+  if (_taskBoardPlanningEnded.get(cid)?.has(messageId)) return;
+  let entries = _taskBoardPlanning.get(cid);
+  if (!entries) { entries = new Map(); _taskBoardPlanning.set(cid, entries); }
+  if (!entries.has(messageId)) {
+    entries.set(messageId, { preview: String(evData.preview || ''), active: true, seenAt: ++_taskBoardPlanningClock });
+  }
+}
+
+// The host's planning list from a seed/resync. Only a list requested after
+// this renderer saw a send start may retire it: an earlier request can be
+// answered before that planning began.
+function _taskBoardMergePlanningSnapshot(cid, planning, requestedAt) {
+  const listed = new Map();
+  for (const item of planning) {
+    if (item && typeof item.message_id === 'string' && item.message_id) listed.set(item.message_id, item);
+  }
+  for (const [messageId, entry] of _taskBoardPlanning.get(cid) || []) {
+    if (entry.active && entry.seenAt < requestedAt && !listed.has(messageId)) _taskBoardEndPlanning(cid, messageId);
+  }
+  for (const [messageId, item] of listed) {
+    _taskBoardApplyPlanning(cid, { message_id: messageId, active: true, preview: item.preview });
+  }
+}
+
+// Which planning sends the board shows (pure — renderer tests extract it):
+// active ones render as "arranging" rows; an ended one only holds the board
+// while its own rows are still in initial admission, and is otherwise done.
+function _taskBoardPlanningView(entries, tasks) {
+  const rows = [];
+  const done = [];
+  let holding = false;
+  for (const [messageId, entry] of entries || []) {
+    if (entry.active) {
+      rows.push({ message_id: messageId, preview: entry.preview });
+      holding = true;
+    } else if ((Array.isArray(tasks) ? tasks : []).some((task) => task
+      && task.source_msg_id === messageId && task.status === 'queued' && task.admission_pending === true)) {
+      holding = true;
+    } else {
+      done.push(messageId);
+    }
+  }
+  return { rows, holding, done };
+}
 
 function _taskBoardBatchAfterCreate(batchIds, tasksById, createdId) {
   const ids = batchIds instanceof Set ? batchIds : new Set();
@@ -151,8 +222,9 @@ function _taskBoardMergeSeedRows(map, rows) {
     const admissionSettled = cached?.status === 'queued'
       && cached.admission_pending === true && task.admission_pending !== true;
     const edited = (task.instruction_revision || 0) > (cached?.instruction_revision || 0);
-    if (_TASK_BOARD_TERMINAL.has(task.status) || !cached || admissionSettled || edited) {
-      map.set(task.task_id, task);
+    const sent = cached?.status === 'queued' && task.status === 'queued' && task.message_sent_at;
+    if (_TASK_BOARD_TERMINAL.has(task.status) || !cached || admissionSettled || edited || sent) {
+      map.set(task.task_id, cached?.message_sent_at ? { ...task, message_sent_at: cached.message_sent_at } : task);
     }
   }
 }
@@ -170,6 +242,11 @@ function _taskBoardResync(cid) {
 }
 
 function _taskBoardOnEvent(cid, evData) {
+  if (evData && evData.type === 'dispatch_planning') {
+    _taskBoardApplyPlanning(cid, evData);
+    if (cid && typeof currentCid !== 'undefined' && cid === currentCid) _taskBoardRender(cid);
+    return;
+  }
   const task = evData && evData.task;
   if (!cid || !task || !task.task_id) return;
   const m = _taskBoardMapFor(cid);
@@ -192,8 +269,8 @@ function _taskBoardOnEvent(cid, evData) {
   if (!m.has(task.task_id)) {
     _taskBoardBatchIds.set(cid, _taskBoardBatchAfterCreate(_taskBoardBatchIds.get(cid), m, task.task_id));
   }
-  m.set(task.task_id, task);
-  if (task.status !== 'queued' || task.absorbed_into_turn_id) {
+  m.set(task.task_id, cached?.message_sent_at ? { ...task, message_sent_at: cached.message_sent_at } : task);
+  if (task.status !== 'queued' || task.absorbed_into_turn_id || task.message_sent_at || cached?.message_sent_at) {
     _taskBoardSendingNow.delete(`${cid}:${task.task_id}`);
   }
   if (typeof currentCid !== 'undefined' && cid === currentCid) _taskBoardRender(cid);
@@ -206,6 +283,7 @@ async function _taskBoardSync(cid) {
   if (!cid) { _taskBoardRender(cid); return; }
   if (!_taskBoardLoaded.has(cid) && !_taskBoardLoading.has(cid)) {
     _taskBoardLoading.add(cid);
+    const planningRequestedAt = ++_taskBoardPlanningClock;
     try {
       const [tasksRes, membersRes, agentsRes] = await Promise.all([
         apiFetch(`/api/conversations/${encodeURIComponent(cid)}/tasks`),
@@ -224,6 +302,9 @@ async function _taskBoardSync(cid) {
           if (t && t.task_id && !_TASK_BOARD_TERMINAL.has(t.status)) batch.add(t.task_id);
         }
         _taskBoardBatchIds.set(cid, batch);
+        if (Array.isArray(tasksData.planning)) {
+          _taskBoardMergePlanningSnapshot(cid, tasksData.planning, planningRequestedAt);
+        }
       }
       const membersData = await membersRes.json();
       if (membersData && Array.isArray(membersData.actors)) {
@@ -299,7 +380,7 @@ function _taskBoardJoinNames(names) {
 // contracts remain cancel-only; the user's queued update
 // can also guide a Commander-dispatched Agent's steerable live turn.
 function _taskBoardCanSendNow(cid, task) {
-  if (!cid || !task || task.status !== 'queued' || task.created_by !== 'user') return false;
+  if (!cid || !task || task.status !== 'queued' || task.created_by !== 'user' || task.message_sent_at) return false;
   if (_taskBoardDeps(task).length) return false; // dependent starts stay ordered (§4.8)
   if (typeof _latestActiveTurns === 'undefined') return false;
   const turns = _latestActiveTurns.get(cid);
@@ -352,7 +433,10 @@ function _taskBoardRender(cid) {
   const editing = typeof _queueComposerEditFor === 'function' ? _queueComposerEditFor(cid) : null;
   const rows = _taskBoardLiveRows(all);
   const decision = _taskBoardVisibility(rows);
-  if (!decision.visible) {
+  const planningEntries = cid ? _taskBoardPlanning.get(cid) : null;
+  const planning = _taskBoardPlanningView(planningEntries, all);
+  for (const messageId of planning.done) planningEntries.delete(messageId);
+  if (!decision.visible && !planning.holding) {
     panel.style.display = 'none';
     list.innerHTML = '';
     if (countEl) countEl.textContent = '0';
@@ -368,7 +452,7 @@ function _taskBoardRender(cid) {
   const chevron = document.getElementById('chat-task-board-chevron');
   if (chevron) chevron.style.transform = collapsed ? 'rotate(-90deg)' : '';
   const displayRows = cid ? _taskBoardDisplayRows(all, _taskBoardBatchIds.get(cid)) : [];
-  if (countEl) countEl.textContent = String(displayRows.length);
+  if (countEl) countEl.textContent = String(displayRows.length + planning.rows.length);
   if (hintEl) hintEl.textContent = t('chat.task_board_counts', { running, queued });
   if (collapsed) { list.innerHTML = ''; return; }
   const groups = _taskBoardAgentGroups(displayRows);
@@ -455,7 +539,11 @@ function _taskBoardRender(cid) {
       }).join('')}</div>
     </section>
   `;
-  }).join('');
+  }).join('') + planning.rows.map((entry) => `
+    <div class="chat-queue-item" data-planning-message-id="${escapeHtml(entry.message_id)}">
+      <div class="chat-queue-text"><span class="chat-queue-skill">${escapeHtml(t('chat.task_status_planning'))}</span>${escapeHtml(String(entry.preview || '').replace(/\s+/g, ' ').slice(0, 160))}</div>
+    </div>
+  `).join('');
   list.querySelectorAll('.chat-queue-agent-toggle').forEach((button) => {
     button.addEventListener('click', () => {
       const group = button.closest('.chat-queue-agent-group');
@@ -516,6 +604,7 @@ let _taskBoardDragging = null; // { cid, taskId }; never accepted from external 
 function _taskBoardCanDrag(cid, taskId) {
   const task = _taskBoardMapFor(cid).get(taskId);
   return !!task && task.status === 'queued' && !task.absorbed_into_turn_id
+    && !task.message_sent_at
     && !_taskBoardSendingNow.has(`${cid}:${taskId}`);
 }
 
@@ -658,17 +747,22 @@ async function _taskBoardSendNow(cid, taskId) {
     if (!data || data.ok !== true) {
       throw new Error((data && data.error) || `HTTP ${res.status}`);
     }
-    // Keep the row locked as "Sending" until the authoritative task_state
-    // says the live runtime accepted it (absorbed marker) or it starts as the
-    // ordinary FIFO fallback. Preparation/transport failure leaves it queued.
+    // The receipt carries the already-persisted bubble and sent snapshot.
+    // Reconcile by message id too, in case the stream is reconnecting; its
+    // later message event uses the same idempotent rendering path.
+    if (data.message && typeof _renderOrClaimPersistedUserMessage === 'function') {
+      _renderOrClaimPersistedUserMessage(cid, data.message);
+    }
+    if (data.task) _taskBoardOnEvent(cid, { task: data.task });
   } catch (err) {
-    _taskBoardSendingNow.delete(key);
-    _taskBoardRender(cid);
     try {
       uiAlert(t('chat.queue_send_now_failed', {
         msg: err && err.message ? err.message : String(err || ''),
       }));
     } catch (_) {}
+  } finally {
+    _taskBoardSendingNow.delete(key);
+    _taskBoardRender(cid);
   }
 }
 
@@ -716,20 +810,9 @@ async function _taskBoardEdit(cid, taskId) {
   }
 }
 
-// Queued rows currently known for a conversation; 0 for a conversation whose
-// board was never observed.
-function _taskBoardQueuedCount(cid) {
-  const m = cid ? _taskBoardTasks.get(cid) : null;
-  if (!m) return 0;
-  let n = 0;
-  for (const t of m.values()) { if (t && t.status === 'queued') n += 1; }
-  return n;
-}
-
 window.TaskBoard = {
   onEvent: _taskBoardOnEvent,
   sync: _taskBoardSync,
   resync: _taskBoardResync,
   render: _taskBoardRender,
-  queuedCount: _taskBoardQueuedCount,
 };

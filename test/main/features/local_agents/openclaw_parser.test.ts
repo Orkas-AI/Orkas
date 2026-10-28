@@ -106,6 +106,17 @@ describe('local_agents/backends/openclaw › parseOpenclawReply', () => {
     expect(r?.text).toBe('final reply');
   });
 
+  it('rejects a native-looking reply nested inside unrelated objects or arrays', () => {
+    const nested = { payloads: [{ text: 'not a top-level native envelope' }], meta: {} };
+    expect(parseOpenclawReply(JSON.stringify({ unrelated: nested }))).toBeNull();
+    expect(parseOpenclawReply(JSON.stringify([nested]))).toBeNull();
+  });
+
+  it('handles malformed trailing braces without repeatedly rescanning the entire suffix', () => {
+    const envelope = JSON.stringify({payloads:[{text:'bounded native reply'}],meta:{}});
+    expect(parseOpenclawReply(envelope + '\n' + '{'.repeat(20000))?.text).toBe('bounded native reply');
+  });
+
   it('returns null when no shape-matching JSON found', () => {
     expect(parseOpenclawReply('just some logs, no json')).toBeNull();
     expect(parseOpenclawReply('{"unrelated":42}')).toBeNull();

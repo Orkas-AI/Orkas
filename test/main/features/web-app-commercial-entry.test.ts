@@ -38,25 +38,68 @@ function snapshot(dir: string): unknown {
     return [name, fs.statSync(file).isDirectory() ? snapshot(file) : fs.readFileSync(file).toString('base64')];
   });
 }
-describe('commercial web application boundary', () => {
-  it('inherits a web task binding even when a caller claims local or stored type is absent', async () => {
-    const chats = await import('../../../src/main/features/chats');
-    const conversation = await chats.createConversation(uid, { assistance: { kind: 'app_creation', appType: 'web' } });
-    const cid = conversation.conversation_id;
-    const paths = await import('../../../src/main/paths');
-    const dir = path.join(paths.chatArtifactCidDir(uid, cid), 'historic');
-    seed(dir, undefined);
-    const before = snapshot(paths.userChatArtifactsDir(uid));
+describe('unified apps and the publication boundary', () => {
+  it.each(['local', 'web', 'cloud'])('creates, saves, reopens, previews and edits a %s app locally', async appType => {
     const artifacts = await import('../../../src/main/features/chat_artifacts');
-    expect(await artifacts.createArtifact(uid, cid, 'commander', { appType: 'local', files: [] })).toMatchObject(receipt);
     const saved = await import('../../../src/main/features/saved_apps');
-    expect(await saved.saveFromArtifact(uid, cid, 'historic')).toMatchObject(receipt);
-    expect(await saved.saveFromPath(uid, path.join(dir, 'index.html'))).toMatchObject(receipt);
+    const created = await artifacts.createArtifact(uid, 'new-task', 'commander', { appType, files: [
+      { path: 'index.html', content: '<h1>Locally available</h1>' },
+      { path: 'orkas-app.json', content: JSON.stringify({ sdkVersion: 1, capabilities: [] }) },
+    ] });
+    expect(created.ok).toBe(true); if (!created.ok) throw new Error(created.error);
+    const stored = await saved.saveFromArtifact(uid, 'new-task', created.artifactId);
+    expect(stored.ok).toBe(true); if (!stored.ok) throw new Error(stored.error);
+    expect(saved.listSavedApps(uid).map(app => app.id)).toContain(stored.id);
+    const host = await import('../../../src/main/features/web_apps/host');
+    const opened = await host.openApp(uid, 4, { appId: stored.id });
+    expect(opened.url).toMatch(/^chat-app:/);
     const { previewBundle } = await import('../../../src/main/features/web_apps/preview');
-    await expect(previewBundle(path.join(dir, 'index.html'))).rejects.toMatchObject(receipt);
-    expect(snapshot(paths.userChatArtifactsDir(uid))).toEqual(before);
+    const paths = await import('../../../src/main/paths');
+    const preview = await previewBundle(path.join(paths.savedAppDir(uid, stored.id), 'index.html'));
+    expect(preview?.resolve('index.html')).toMatchObject({ mime: 'text/html; charset=utf-8' });
+    expect(await saved.openForEditing(uid, stored.id)).toMatchObject({ ok: true });
+    host.runtime.closeUser(uid); await host.runtime.drainData();
   });
 
+  it.each(['web', 'cloud'])('retains existing %s source and capability identity while saving and editing', async appType => {
+    const paths = await import('../../../src/main/paths');
+    const savedDir = paths.savedAppDir(uid, 'historic-app');
+    const artifactDir = path.join(paths.chatArtifactCidDir(uid, 'historic'), 'historic');
+    seed(savedDir, appType); seed(artifactDir, appType);
+    const before = snapshot(savedDir);
+    const saved = await import('../../../src/main/features/saved_apps');
+    expect(saved.listSavedApps(uid).map(app => app.id)).toContain('historic-app');
+    expect(await saved.saveFromArtifact(uid, 'historic', 'historic')).toMatchObject({ ok: true });
+    expect(await saved.saveFromPath(uid, path.join(artifactDir, 'index.html'))).toMatchObject({ ok: true });
+    const edited = await saved.openForEditing(uid, 'historic-app');
+    expect(edited.ok).toBe(true);
+    expect(snapshot(savedDir)).toEqual(before);
+    expect(await saved.resolveSavedAppType(uid, 'historic-app')).toBe('web');
+  });
+
+  it('keeps legacy web SDK data available without granting host-only capabilities', async () => {
+    const { WebAppRuntime } = await import('../../../src/main/features/web_apps/runtime');
+    const called = vi.fn();
+    const runtime = new WebAppRuntime({ activeUser: () => uid, language: () => 'en', modelAvailable: () => true,
+      pick: called, save: called, generate: called, tools: called });
+    const bundle = { key: 'direct', appType: 'web', entry: 'index.html', title: 'Retained',
+      manifest: { sdkVersion: 1, capabilities: [] }, resolve: () => null } as any;
+    const opened = runtime.open(uid, 1, bundle);
+    expect(opened.url).toMatch(/^chat-app:/);
+    expect(await runtime.call(uid, 1, opened.token, 'context', 'host.getContext', {})).toMatchObject({ language: 'en', sdkVersion: 1 });
+    await expect(runtime.call(uid, 1, opened.token, 'host-file', 'files.pick', {})).rejects.toMatchObject({ code: 'E_UNAVAILABLE' });
+    expect(called).not.toHaveBeenCalled(); runtime.closeUser(uid); await runtime.drainData();
+  });
+
+  it('refuses publication before changing saved apps, artifacts, or edit drafts', async () => {
+    const paths = await import('../../../src/main/paths');
+    seed(paths.savedAppDir(uid, 'historic-app'), 'web');
+    seed(path.join(paths.chatArtifactCidDir(uid, 'historic'), 'historic'), 'web');
+    const before = snapshot(path.join(root, 'data'));
+    const { publishApp } = await import('../../../src/main/features/web_apps/commercial-entry');
+    expect(publishApp()).toMatchObject(receipt);
+    expect(snapshot(path.join(root, 'data'))).toEqual(before);
+  });
   it.each(['{ damaged', '[]', '{"assistance":{"kind":"app_creation","appType":"unexpected"}}'])
   ('does not turn an unreadable task binding into local permission (%s)', async content => {
     const chats = await import('../../../src/main/features/chats');
@@ -76,101 +119,20 @@ describe('commercial web application boundary', () => {
     } finally { vi.restoreAllMocks(); }
   });
 
-  it.each(['web', 'cloud'])('refuses direct %s SDK and preview acquisition', async appType => {
-    const { WebAppRuntime } = await import('../../../src/main/features/web_apps/runtime');
-    const called = vi.fn();
-    const runtime = new WebAppRuntime({ activeUser: () => uid, language: () => 'en', modelAvailable: () => true,
-      pick: called, save: called, generate: called, tools: called });
-    const bundle = { key: 'direct', appType, entry: 'index.html', title: 'Retained',
-      manifest: { sdkVersion: 1, capabilities: [] }, resolve: called } as any;
-    expect(() => runtime.open(uid, 1, bundle)).toThrowError(expect.objectContaining(receipt));
-    const { createPreviewSdk } = await import('../../../src/main/features/web_apps/preview');
-    await expect(createPreviewSdk({} as any, {} as any, bundle)).rejects.toMatchObject(receipt);
-    expect(called).not.toHaveBeenCalled();
-  });
-  it.each(['web', 'cloud'])('refuses explicit %s authoring before allocating artifact files', async appType => {
-    const artifacts = await import('../../../src/main/features/chat_artifacts');
-    const paths = await import('../../../src/main/paths');
-    const pool = paths.userChatArtifactsDir(uid), before = snapshot(pool);
-    for (const files of [[], [{ path: 'index.html', content: '<h1>Must not be created</h1>' }]]) {
-      expect(await artifacts.createArtifact(uid, 'new-task', 'commander', { appType, files })).toMatchObject(receipt);
-      expect(snapshot(pool)).toEqual(before);
-    }
-  });
+});
 
-  it.each(['web', 'cloud'])('keeps the specific %s tool failure and never finalizes, smoke-tests or announces an artifact', async appType => {
-    const { createLocalTools } = await import('../../../src/main/model/core-agent/local-tools');
-    const paths = await import('../../../src/main/paths');
-    const callback = vi.fn(), smoke = vi.fn();
-    const tool = createLocalTools({ userId: uid, cid: 'tool-task', onArtifactCreated: callback, artifactInteractionSmoke: smoke })
-      .find(tool => tool.name === 'create_artifact')!;
-    const before = snapshot(paths.userChatArtifactsDir(uid));
-    const result = await tool.execute({ appType, files: [{ path: 'index.html', content: '<h1>Refused</h1>' }] }, { workingDir: root, state: new Map() } as any);
-    expect(result.isError).toBe(true);
-    expect(JSON.parse(String(result.content))).toMatchObject(receipt);
-    expect(callback).not.toHaveBeenCalled(); expect(smoke).not.toHaveBeenCalled();
-    expect(snapshot(paths.userChatArtifactsDir(uid))).toEqual(before);
-  });
-
-  it('preserves web edit journals and snapshots during local listing and background cleanup', async () => {
-    const paths = await import('../../../src/main/paths');
-    const edit = path.join(paths.userAppEditsDir(uid), 'historic-edit');
-    seed(path.join(edit, 'snapshot'), 'web');
-    seed(paths.savedAppDir(uid, 'historic-app'), 'web');
-    seed(paths.savedAppDir(uid, 'historic-app.tmp-01234567'), 'web');
-    fs.writeFileSync(path.join(edit, 'context.json'), JSON.stringify({ version: 1, appId: 'historic-app',
-      appType: 'web', title: 'Retained app', fingerprint: '0'.repeat(64) }));
-    fs.writeFileSync(path.join(edit, 'save-journal.json'), JSON.stringify({ version: 1, appId: 'historic-app',
-      temporary: 'historic-app.tmp-01234567', before: '0'.repeat(64), after: '1'.repeat(64) }));
-    const beforeEdits = snapshot(paths.userAppEditsDir(uid));
-    const beforeApps = snapshot(paths.userSavedAppsDir(uid));
-    const saved = await import('../../../src/main/features/saved_apps');
-    saved.listSavedApps(uid);
-    await saved.cleanupEditSnapshots(uid);
-    expect(snapshot(paths.userAppEditsDir(uid))).toEqual(beforeEdits);
-    expect(snapshot(paths.userSavedAppsDir(uid))).toEqual(beforeApps);
-  });
-
-  it.each(['web', 'cloud'])('preserves existing %s bundles when save, edit, open and preview are refused', async appType => {
-    const paths = await import('../../../src/main/paths');
-    const savedDir = paths.savedAppDir(uid, 'historic-app');
-    const artifactDir = path.join(paths.chatArtifactCidDir(uid, 'historic'), 'historic');
-    seed(savedDir, appType); seed(artifactDir, appType);
-    const saved = await import('../../../src/main/features/saved_apps');
-    const beforeSaved = snapshot(paths.userSavedAppsDir(uid));
-    const beforeArtifact = snapshot(paths.userChatArtifactsDir(uid));
-    const beforeEdits = snapshot(paths.userAppEditsDir(uid));
-    expect(await saved.saveFromArtifact(uid, 'historic', 'historic')).toMatchObject(receipt);
-    expect(await saved.saveFromArtifact(uid, 'historic', 'historic', 'update')).toMatchObject(receipt);
-    expect(await saved.saveFromPath(uid, path.join(artifactDir, 'index.html'))).toMatchObject(receipt);
-    expect(await saved.openForEditing(uid, 'historic-app')).toMatchObject(receipt);
-    expect(await saved.appDataImpact(uid, 'historic', 'historic')).toMatchObject(receipt);
-    const destination = path.join(root, 'export-refused');
-    expect(await saved.exportAppData(uid, 'historic', 'historic', destination)).toMatchObject(receipt);
-    expect(fs.existsSync(destination)).toBe(false);
-    const { openApp } = await import('../../../src/main/features/web_apps/host');
-    await expect(openApp(uid, 4, { appId: 'historic-app' })).rejects.toMatchObject(receipt);
-    await expect(openApp(uid, 4, { cid: 'historic', artifactId: 'historic' })).rejects.toMatchObject(receipt);
-    const { previewBundle } = await import('../../../src/main/features/web_apps/preview');
-    await expect(previewBundle(path.join(artifactDir, 'index.html'))).rejects.toMatchObject(receipt);
-    fs.unlinkSync(path.join(artifactDir, 'orkas-app.json'));
-    await expect(previewBundle(path.join(artifactDir, 'index.html'))).rejects.toMatchObject(receipt);
-    fs.writeFileSync(path.join(artifactDir, 'orkas-app.json'), JSON.stringify({ sdkVersion: 1, capabilities: [] }));
-    expect(snapshot(paths.userSavedAppsDir(uid))).toEqual(beforeSaved);
-    expect(snapshot(paths.userChatArtifactsDir(uid))).toEqual(beforeArtifact);
-    expect(snapshot(paths.userAppEditsDir(uid))).toEqual(beforeEdits);
-  });
-
-  it('allows ordinary local authoring, saving and editing with the same SDK declaration', async () => {
-    const artifacts = await import('../../../src/main/features/chat_artifacts');
-    const saved = await import('../../../src/main/features/saved_apps');
-    const created = await artifacts.createArtifact(uid, 'local-task', 'commander', { appType: 'local', files: [
-      { path: 'index.html', content: '<h1>Local app</h1>' },
-      { path: 'orkas-app.json', content: JSON.stringify({ sdkVersion: 1, capabilities: ['storage'] }) },
-    ] });
-    expect(created.ok).toBe(true); if (!created.ok) throw new Error(created.error);
-    const stored = await saved.saveFromArtifact(uid, 'local-task', created.artifactId);
-    expect(stored.ok).toBe(true); if (!stored.ok) throw new Error(stored.error);
-    expect(await saved.openForEditing(uid, stored.id)).toMatchObject({ ok: true });
-  });
+it.each(['web','cloud'])('retains an unrecognized %s save journal and staging bytes for recovery', async appType => {
+  const paths = await import('../../../src/main/paths');
+  const editing = path.join(paths.userAppEditsDir(uid), 'interrupted-edit');
+  const temporary = paths.savedAppDir(uid, 'retained-app.tmp-01234567');
+  seed(paths.savedAppDir(uid, 'retained-app'), appType);
+  seed(temporary, appType);
+  fs.mkdirSync(editing, {recursive:true});
+  fs.writeFileSync(path.join(editing,'context.json'), JSON.stringify({version:1,appId:'retained-app',appType,title:'Retained',fingerprint:'0'.repeat(64)}));
+  fs.writeFileSync(path.join(editing,'save-journal.json'), JSON.stringify({version:1,appId:'retained-app',temporary:'retained-app.tmp-01234567',before:'0'.repeat(64),after:'1'.repeat(64)}));
+  const beforeApps = snapshot(paths.userSavedAppsDir(uid)), beforeEdits = snapshot(editing);
+  const saved = await import('../../../src/main/features/saved_apps');
+  saved.listSavedApps(uid); await saved.cleanupEditSnapshots(uid);
+  expect(snapshot(paths.userSavedAppsDir(uid))).toEqual(beforeApps);
+  expect(snapshot(editing)).toEqual(beforeEdits);
 });

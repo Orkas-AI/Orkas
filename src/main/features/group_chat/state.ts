@@ -106,6 +106,9 @@ export interface StateFile {
   last_active_at: string;
   /** Actor ids currently running their worker loop. */
   in_flight: string[];
+  /** Optional causal identity for startup recovery. Legacy actor-only rosters
+   * remain readable; settlement removes the corresponding entry atomically. */
+  in_flight_turns?: Record<string, { turn_id: string; source_message_id: string }>;
   /** Per-conversation workspace subdirectory basename (relative to the
    *  user's root workspace). Lazily filled by `conv_workspace.ts` on the
    *  first write_file in this conversation; **empty / missing → legacy
@@ -434,8 +437,24 @@ export async function renameAgentInMembers(
 
 // ── State IO ─────────────────────────────────────────────────────────────
 
-export async function readState(uid: string, cid: string, projectIdHint?: string | null): Promise<StateFile> {
-  const cloud = await readCloudState(uid, cid, projectIdHint);
+/** Shared decoding for the normal state reader and raw startup snapshots. */
+export function parseInFlightTurns(inFlight: unknown, value: unknown): StateFile['in_flight_turns'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const roster = new Set(Array.isArray(inFlight) ? inFlight : []);
+  const entries = Object.entries(value).filter(([actor, row]) => {
+    const turn = row as Record<string, unknown> | null;
+    return safeId(actor) && actor !== USER_ID && roster.has(actor)
+      && turn && typeof turn.turn_id === 'string' && safeId(turn.turn_id)
+      && typeof turn.source_message_id === 'string' && safeId(turn.source_message_id);
+  }).map(([actor, row]) => {
+    const turn = row as NonNullable<StateFile['in_flight_turns']>[string];
+    return [actor, { turn_id: turn.turn_id, source_message_id: turn.source_message_id }];
+  });
+  return entries.length ? Object.fromEntries(entries) : undefined;
+}
+
+export async function readState(uid: string, cid: string, projectIdHint?: string | null, opts?: { strict?: boolean }): Promise<StateFile> {
+  const cloud = await readCloudState(uid, cid, projectIdHint, opts);
   return { ...cloudConversationState(cloud),
     ...readCodingDirectoryFromStateFile(uid, cid, conversationLayout(uid, cid, projectIdHint).stateFile),
   };
@@ -445,15 +464,20 @@ async function readCloudState(
   uid: string,
   cid: string,
   projectIdHint?: string | null,
+  opts?: { strict?: boolean },
 ): Promise<StateFile> {
   const file = conversationLayout(uid, cid, projectIdHint).stateFile;
-  if (!fs.existsSync(file)) {
+  if (!opts?.strict && !fs.existsSync(file)) {
     return { version: 1, status: 'idle', last_active_at: nowIso(), in_flight: [], active_recipient_choice_revision: 0 };
   }
   try {
-    const data: any = await readJson(file);
+    const data: any = await readJson(file, opts);
+    if (opts?.strict && (!data || typeof data !== 'object' || Array.isArray(data))) {
+      throw new Error('Conversation state is invalid');
+    }
     if (data && typeof data === 'object') {
       const orchestrationLedger = _sanitizeOrchestrationLedger(data.orchestration_ledger);
+      const inFlightTurns = parseInFlightTurns(data.in_flight, data.in_flight_turns);
       const recipients = Array.isArray(data.active_recipients)
         ? [...new Set<string>(data.active_recipients.filter((id: unknown) => (
             typeof id === 'string' && safeId(id) && id !== USER_ID
@@ -469,6 +493,7 @@ async function readCloudState(
         status: (data.status as GroupStatus) || 'idle',
         last_active_at: typeof data.last_active_at === 'string' ? data.last_active_at : nowIso(),
         in_flight: Array.isArray(data.in_flight) ? data.in_flight.filter((s: unknown) => typeof s === 'string') : [],
+        ...(inFlightTurns ? { in_flight_turns: inFlightTurns } : {}),
         ...(typeof data.workspace_dir === 'string' && data.workspace_dir
           ? { workspace_dir: data.workspace_dir }
           : {}),
@@ -518,6 +543,10 @@ async function readCloudState(
       };
     }
   } catch (err) {
+    if (opts?.strict) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      return { version: 1, status: 'idle', last_active_at: nowIso(), in_flight: [], active_recipient_choice_revision: 0 };
+    }
     log.warn(`read state failed user=${uid} cid=${cid}: ${(err as Error).message}`);
   }
   return { version: 1, status: 'idle', last_active_at: nowIso(), in_flight: [], active_recipient_choice_revision: 0 };
@@ -651,7 +680,7 @@ export async function setStatus(uid: string, cid: string, status: GroupStatus): 
     const current = s.status;
     s.status = status;
     s.last_active_at = nowIso();
-    if (status !== 'running') s.in_flight = [];
+    if (status !== 'running') { s.in_flight = []; delete s.in_flight_turns; }
     await _writeStatusTransition(uid, cid, current, status, s);
     return s;
   });
@@ -672,6 +701,7 @@ export async function recoverOrphanRunningState(
     // Cancellation is sticky even if an orphan roster also needs clearing.
     s.status = current === 'aborted' ? 'aborted' : 'idle';
     s.in_flight = [];
+    delete s.in_flight_turns;
     s.last_active_at = nowIso();
     await _writeStatusTransition(uid, cid, current, s.status, s);
     return { recovered: true, state: s };
@@ -695,7 +725,7 @@ export async function transitionStatus(
     if (next === null || next === cur) return { changed: false, state: s };
     s.status = next;
     s.last_active_at = nowIso();
-    if (next !== 'running') s.in_flight = [];
+    if (next !== 'running') { s.in_flight = []; delete s.in_flight_turns; }
     await _writeStatusTransition(uid, cid, cur, next, s);
     return { changed: true, state: s };
   });
@@ -1124,12 +1154,22 @@ export async function takeOrchestrationLedgerForForm(
  *  Mutex-guarded against concurrent `setStatus` so the "read s, mutate
  *  in_flight, write s" cycle doesn't lose status changes that landed
  *  while we held a stale `s` snapshot. */
-export async function markInFlight(uid: string, cid: string, actorId: string, running: boolean): Promise<StateFile> {
+export async function markInFlight(
+  uid: string, cid: string, actorId: string, running: boolean,
+  turn?: NonNullable<StateFile['in_flight_turns']>[string],
+): Promise<StateFile> {
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
     const have = s.in_flight.includes(actorId);
     if (running && !have) s.in_flight.push(actorId);
     if (!running && have) s.in_flight = s.in_flight.filter((id) => id !== actorId);
+    if (running && turn) s.in_flight_turns = { ...s.in_flight_turns, [actorId]: {
+      turn_id: turn.turn_id, source_message_id: turn.source_message_id,
+    } };
+    if (!running && s.in_flight_turns) {
+      delete s.in_flight_turns[actorId];
+      if (!Object.keys(s.in_flight_turns).length) delete s.in_flight_turns;
+    }
     s.last_active_at = nowIso();
     await writeStateRaw(uid, cid, s);
     return s;

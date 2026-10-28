@@ -1,8 +1,11 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as vm from 'node:vm';
+import { webcrypto } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { previewBundle } from '../../../src/main/features/web_apps/preview';
+import { freezeFileMetadata } from '../../helpers/frozen-file-metadata';
 
 let root: string, entry: string;
 beforeEach(() => {
@@ -30,9 +33,9 @@ describe('preview source opt-in and revision isolation', () => {
     manifest(); const bundle = (await previewBundle(entry))!;
     expect(bundle.resolve('index.html')).toEqual({ absPath: entry, mime: 'text/html; charset=utf-8' });
     for (const rel of ['../private.txt', '/private.txt', 'dir/../../private.txt', '.env', 'dir\\file']) expect(bundle.resolve(rel)).toBeNull();
-    expect(bundle.valid!()).toBe(true);
+    expect(await bundle.valid!()).toBe(true);
     fs.writeFileSync(entry, '<h1>Changed</h1>');
-    expect(bundle.valid!()).toBe(false); expect(bundle.resolve('index.html')).toBeNull();
+    expect(await bundle.valid!()).toBe(false); expect(bundle.resolve('index.html')).toBeNull();
   });
   it('rejects linked manifests, sibling files and linked assets before launching', async () => {
     const outside = path.join(root, 'outside.json'); fs.writeFileSync(outside, '{"sdkVersion":1,"capabilities":[]}');
@@ -42,6 +45,23 @@ describe('preview source opt-in and revision isolation', () => {
     fs.symlinkSync(outside, path.join(path.dirname(entry), 'asset.json'));
     await expect(previewBundle(entry)).rejects.toThrow('E_BUNDLE');
   });
+});
+
+it('rejects changed preview content at the actual protocol boundary despite identical metadata', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { createPreviewSdk } = await import('../../../src/main/features/web_apps/preview');
+  manifest();
+  const restore = freezeFileMetadata([entry]);
+  const contents: any = Object.assign(new EventEmitter(), { id: 20, mainFrame: {}, isDestroyed: () => false });
+  let resource!: (request: Request) => Promise<Response>;
+  const session: any = { protocol: { handle: (_scheme: string, handler: typeof resource) => { resource = handler; }, unhandle() {} } };
+  let preview: Awaited<ReturnType<typeof createPreviewSdk>> | undefined;
+  try {
+    preview = await createPreviewSdk(session, contents, (await previewBundle(entry))!);
+    expect((await resource(new Request(preview.origin + '/index.html'))).status).toBe(200);
+    fs.writeFileSync(entry, '<h1>Changed</h1>');
+    expect((await resource(new Request(preview.origin + '/index.html'))).status).toBe(403);
+  } finally { try { await preview?.dispose(); } finally { restore(); } }
 });
 
 it('accepts only its own trusted frame, token and narrow operations, then revokes resources and deletes storage', async () => {
@@ -104,6 +124,76 @@ it('settles the current bundle document after local navigation and rejects forei
     expect(painted).toBe(1);
   } finally { await preview.dispose(); }
   await expect(preview.settle()).rejects.toThrow('E_BUNDLE');
+});
+
+it('waits for SDK requests and chained results still in transit before finishing authoring evidence', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { createPreviewSdk } = await import('../../../src/main/features/web_apps/preview');
+  manifest('{"sdkVersion":1,"capabilities":["files"]}');
+  const contents: any = new EventEmitter();
+  const outgoing: any[] = [], replies: any[] = [];
+  const events = new Map<string, (event?: any) => void>();
+  const paints: Array<() => void> = [];
+  const parent = { postMessage: (message: unknown) => outgoing.push(message) };
+  const window: any = { parent, addEventListener: (name: string, listener: (event?: any) => void) => events.set(name, listener) };
+  const context = vm.createContext({ window, parent, crypto: webcrypto, setTimeout, clearTimeout,
+    requestAnimationFrame: (callback: () => void) => paints.push(callback) });
+  const frame: any = { detached: false, frames: [], send: (_channel: string, value: any) => replies.push(value) };
+  let token = '', resource!: (request: Request) => Promise<Response>;
+  Object.assign(contents, { id: 32, mainFrame: frame, isDestroyed: () => false,
+    executeJavaScript: async (script: string) => {
+      const opened = JSON.parse(/attach\(frame, (\{.*?\})\);/s.exec(script)![1]);
+      token = opened.token;
+      frame.frames = [{ url: opened.url, executeJavaScript: (source: string) => vm.runInContext(source, context) }];
+    } });
+  const preview = await createPreviewSdk({ protocol: {
+    handle: (_scheme: string, handler: typeof resource) => { resource = handler; }, unhandle() {},
+  } } as any, contents, (await previewBundle(entry))!);
+  const paint = async () => {
+    for (const callback of paints.splice(0)) callback();
+    await new Promise(resolve => setImmediate(resolve));
+  };
+  try {
+    contents.getURL = () => preview.shellUrl;
+    await preview.attach();
+    vm.runInContext(await (await resource(new Request(preview.origin + '/__orkas/sdk.js'))).text(), context);
+    const journey = vm.runInContext(`(async () => {
+      const catalog = await window.orkasApp.call('capabilities.list');
+      try { await window.orkasApp.call('files.pick', {}); }
+      catch (error) { window.outcome = { available: catalog.methods.find(method => method.name === 'files.pick').available, code: error.code }; }
+    })()`, context);
+    let settled = false;
+    const settling = preview.settle().then(() => { settled = true; });
+    // The first request has left the document but has not reached main IPC.
+    await paint(); await paint();
+    const finishedBeforeRequestDelivery = settled;
+    let finishedBeforeReplyDelivery = false;
+    for (let sequence = 1; sequence <= 2; sequence++) {
+      await expect.poll(() => outgoing.length).toBe(1);
+      const request = outgoing.shift();
+      contents.emit('ipc-message', { senderFrame: frame }, 'orkas.web-app-preview', {
+        id: String(sequence), operation: 'webApps.call',
+        payload: { token, requestId: request.id, method: request.method, args: structuredClone(request.args) },
+      });
+      await expect.poll(() => replies.length).toBe(1);
+      // The runtime has finished, but the SDK promise and its continuation have not.
+      await paint(); await paint();
+      finishedBeforeReplyDelivery ||= settled;
+      const reply = replies.shift().event;
+      events.get('message')!({ source: parent, data: { __orkasApp: 1, id: request.id, ...reply } });
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    await journey;
+    for (let i = 0; i < 4 && !settled; i++) await paint();
+    expect(settled).toBe(true);
+    await settling;
+    expect(finishedBeforeRequestDelivery).toBe(false);
+    expect(finishedBeforeReplyDelivery).toBe(false);
+    expect(window.outcome).toEqual({ available: false, code: 'E_UNAVAILABLE' });
+    expect(preview.evidence.calls).toEqual([
+      { method: 'capabilities.list', code: 'OK' }, { method: 'files.pick', code: 'E_UNAVAILABLE' },
+    ]);
+  } finally { events.get('pagehide')?.(); await preview.dispose(); }
 });
 
 it('keeps preview data in disposable storage: writes are readable during the session and leave no files afterwards', async () => {

@@ -1,12 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+const mutableFs = createRequire(import.meta.url)('node:fs') as typeof fs;
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { makeMinimalPptx, makeMinimalXlsx } from '../../fixtures/make-minimal-office';
+import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
 import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
 
+const diagnostics = vi.hoisted(() => ({ warn: vi.fn() }));
 vi.mock('../../../src/main/logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: diagnostics.warn, error: vi.fn() }),
 }));
 
 // The layout-rendering behavior is covered with a deterministic OfficeCLI mock
@@ -84,6 +88,74 @@ function writeFile(rel: string, body: string | Buffer, userId = TEST_UID): void 
 }
 
 describe('contexts › path safety', () => {
+  it.each(['write', 'update', 'upload'] as const)('preserves the saved Library source after a partial %s failure and permits retry', async (operation) => {
+    const c = await loadContexts();
+    const name = 'procedure.md';
+    expect(c.writeContextFile(name, 'Original complete procedure')).toMatchObject({ ok: true });
+    expect(c.updateContextFile(name, 'Current complete procedure')).toMatchObject({ ok: true });
+    expect(c.readContextFile(name)).toMatchObject({ content: 'Current complete procedure' });
+    const target = fs.realpathSync(path.join(ctxRoot(), name));
+    if (process.platform !== 'win32') fs.chmodSync(target, 0o640);
+    const enqueueCount = kbEnqueueCalls.length;
+    const searchCount = searchCalls.length;
+    const originalWrite = fs.writeFileSync;
+    const write = vi.spyOn(mutableFs, 'writeFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, data: any, options: any) => {
+      const written = typeof file === 'string' ? path.join(fs.realpathSync(path.dirname(file)), path.basename(file)) : String(file);
+      if (written === target || written.startsWith(target + '.')) {
+        originalWrite(file, String(data).slice(0, 7), options);
+        throw Object.assign(new Error('controlled short write'), { code: 'ENOSPC' });
+      }
+      return originalWrite(file, data, options);
+    }) as typeof fs.writeFileSync);
+    syncBuiltinESMExports();
+    try {
+      const result = operation === 'upload' ? c.uploadContextFile(name, Buffer.from('New complete procedure')) : operation === 'write' ? c.writeContextFile(name, 'New complete procedure') : c.updateContextFile(name, 'New complete procedure');
+      expect(result).toMatchObject({ ok: false });
+    } finally { write.mockRestore(); syncBuiltinESMExports(); }
+    expect(fs.readFileSync(target, 'utf8')).toBe('Current complete procedure');
+    expect(c.readContextFile(name)).toMatchObject({ ok: true, content: 'Current complete procedure' });
+    expect(fs.readdirSync(ctxRoot()).filter(n => n.startsWith(name))).toEqual([name]);
+    expect(kbEnqueueCalls).toHaveLength(enqueueCount);
+    expect(searchCalls).toHaveLength(searchCount);
+    const retry = operation === 'upload' ? c.uploadContextFile(name, Buffer.from('New complete procedure')) : operation === 'write' ? c.writeContextFile(name, 'New complete procedure') : c.updateContextFile(name, 'New complete procedure');
+    expect(retry).toMatchObject({ ok: true });
+    if (process.platform !== 'win32') expect(fs.statSync(target).mode & 0o777).toBe(0o640);
+    vi.resetModules();
+    (await import('../../../src/main/features/users')).activateUser(TEST_UID);
+    expect((await loadContexts()).readContextFile(name)).toMatchObject({ ok: true, content: 'New complete procedure' });
+  });
+
+  it.runIf(process.platform !== 'win32')('keeps an internal file alias and its target mode when saving text', async () => {
+    writeFile('source.md', 'Original procedure');
+    const target = path.join(ctxRoot(), 'source.md');
+    const alias = path.join(ctxRoot(), 'alias.md');
+    fs.chmodSync(target, 0o640);
+    fs.symlinkSync(target, alias, 'file');
+    const c = await loadContexts();
+    for (const operation of ['write', 'update', 'upload']) {
+      const body = `${operation} complete procedure`;
+      const result = operation === 'upload' ? c.uploadContextFile('alias.md', Buffer.from(body)) : operation === 'write' ? c.writeContextFile('alias.md', body) : c.updateContextFile('alias.md', body);
+      expect(result).toMatchObject({ ok: true });
+      expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+      expect(fs.readFileSync(target, 'utf8')).toBe(body);
+      expect(fs.statSync(target).mode & 0o777).toBe(0o640);
+    }
+  });
+
+  it.runIf(process.platform !== 'win32')('continues to reject overwriting a read-only Library source', async () => {
+    writeFile('locked.md', 'Protected procedure');
+    const target = path.join(ctxRoot(), 'locked.md');
+    fs.chmodSync(target, 0o444);
+    try {
+      const c = await loadContexts();
+      expect(c.writeContextFile('locked.md', 'changed')).toMatchObject({ ok: false });
+      expect(c.updateContextFile('locked.md', 'changed')).toMatchObject({ ok: false });
+      expect(c.uploadContextFile('locked.md', Buffer.from('changed'))).toMatchObject({ ok: false });
+      expect(c.readContextFile('locked.md')).toMatchObject({ content: 'Protected procedure' });
+      expect(kbEnqueueCalls).toHaveLength(0);
+    } finally { fs.chmodSync(target, 0o644); }
+  });
+
   it('writeContextFile rejects path traversal', async () => {
     const c = await loadContexts();
     const r = c.writeContextFile('../evil.md', 'x');
@@ -589,13 +661,58 @@ describe('contexts › readContextFile', () => {
 });
 
 describe('contexts › listContextsTree', () => {
+  it('lists a populated Library without a synchronous directory walk on the UI process', async () => {
+    for (let i = 0; i < 200; i += 1) writeFile(`folder/f${i}.md`, `# Document ${i}`);
+    const contexts = await loadContexts();
+    const nodeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const readDirectory = nodeFs.readdirSync;
+    let synchronousWalks = 0;
+    const spy = vi.spyOn(nodeFs, 'readdirSync').mockImplementation(((directory: any, ...args: any[]) => {
+      if (String(directory).startsWith(ctxRoot())) synchronousWalks += 1;
+      return (readDirectory as any)(directory, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    let tree: Awaited<ReturnType<typeof contexts.listContextsTree>>;
+    try { tree = await contexts.listContextsTree(); }
+    finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(tree[0].children).toHaveLength(200);
+    expect(tree[0].children!.map(node => node.name)).toEqual(
+      Array.from({ length: 200 }, (_, n) => `f${n}.md`).sort((a, b) => a.localeCompare(b)),
+    );
+    expect(synchronousWalks).toBe(0);
+  });
+  it('coalesces a complete wide-folder read with bounded metadata I/O and observes later additions', async () => {
+    const names = Array.from({ length: 64 }, (_, n) => `f${String(n).padStart(3, '0')}.md`);
+    names.forEach(name => writeFile(name, 'Complete body'));
+    const c = await loadContexts();
+    const nodeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const stat = nodeFs.promises.stat;
+    let active = 0, peak = 0;
+    const spy = vi.spyOn(nodeFs.promises, 'stat').mockImplementation((async (...args: any[]) => {
+      active++; peak = Math.max(peak, active);
+      try { await new Promise(resolve => setTimeout(resolve, 2)); return await (stat as any)(...args); }
+      finally { active--; }
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      const first = c.listContextsTree();
+      expect(c.listContextsTree()).toBe(first);
+      expect((await first).map(node => node.name)).toEqual(names);
+      expect(peak).toBeGreaterThan(1);
+      expect(peak).toBeLessThanOrEqual(8);
+      writeFile('z-last.md', 'New complete body');
+      expect((await c.listContextsTree()).map(node => node.name)).toEqual([...names, 'z-last.md']);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  });
   it('lists text + binary files, hides dotfiles + _INDEX.md', async () => {
     writeFile('a.md', '# a');
     writeFile('sub/b.pdf', 'PDF');
     writeFile('.kb/vector.db', 'bin');
     writeFile('_INDEX.md', '# idx');
     const c = await loadContexts();
-    const tree = c.listContextsTree();
+    const tree = await c.listContextsTree();
     const top = tree.map((n) => n.name).sort();
     expect(top).toEqual(['sub', 'a.md'].sort());
     const sub = tree.find((n) => n.name === 'sub')!;
@@ -607,7 +724,7 @@ describe('contexts › listContextsTree', () => {
   it('stamps an mtime on folders as well as files', async () => {
     writeFile('sub/b.pdf', 'PDF');
     const c = await loadContexts();
-    const tree = c.listContextsTree();
+    const tree = await c.listContextsTree();
     const sub = tree.find((n) => n.name === 'sub')!;
     expect(sub.mtime).toBeGreaterThan(0);
   });
@@ -688,4 +805,254 @@ describe('contexts › resolveContextFileAbsPath (ask-commander attach uses this
     expect(() => c.resolveContextFileAbsPath('.kb/secret.md')).toThrow();  // hidden segment
     expect(() => c.resolveContextFileAbsPath('does-not-exist.md')).toThrow(); // mustExist
   });
+});
+
+
+describe('contexts › resolved Library boundary', () => {
+  it.each([
+    'read', 'preview', 'image', 'word', 'office', 'write', 'new-write',
+    'update', 'upload', 'mkdir', 'delete', 'rename-source', 'rename-target',
+    'copy-target', 'resolve-file', 'resolve-entry',
+  ])('refuses %s through an external directory link without touching external data or indexes', async operation => {
+    const outside = path.join(tmpDir, 'outside');
+    fs.mkdirSync(outside, { recursive: true });
+    const protectedFiles: Record<string, Buffer> = {
+      'note.md': Buffer.from('Protected external source'),
+      'data.csv': Buffer.from('id,value\n001,external\n'),
+      'image.png': Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+      'word.docx': makeMinimalDocx({ paragraphs: ['Protected external Word source'] }),
+      'sheet.xlsx': makeMinimalXlsx({ rows: [['Protected external spreadsheet']] }),
+    };
+    for (const [name, body] of Object.entries(protectedFiles)) fs.writeFileSync(path.join(outside, name), body);
+    writeFile('source.md', 'Owned Library source');
+    fs.symlinkSync(outside, path.join(ctxRoot(), 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+    const c = await loadContexts();
+    kbEnqueueCalls.length = 0; searchCalls.length = 0;
+    const invoke = async (): Promise<{ ok: boolean }> => {
+      switch (operation) {
+        case 'read': return c.readContextFile('linked/note.md');
+        case 'preview': return c.readContextFile('linked/data.csv', true);
+        case 'image': return c.readContextImage('linked/image.png');
+        case 'word': return c.readContextDocxHtml('linked/word.docx');
+        case 'office': return c.readContextOfficeHtml('linked/sheet.xlsx');
+        case 'write': return c.writeContextFile('linked/note.md', 'replacement');
+        case 'new-write': return c.writeContextFile('linked/new/note.md', 'replacement');
+        case 'update': return c.updateContextFile('linked/note.md', 'replacement');
+        case 'upload': return c.uploadContextFile('linked/note.md', Buffer.from('replacement'));
+        case 'mkdir': return c.createContextDir('linked/new/folder');
+        case 'delete': return c.deleteContextTarget('linked/note.md');
+        case 'rename-source': return c.renameContextEntry('linked/note.md', 'moved.md');
+        case 'rename-target': return c.renameContextEntry('source.md', 'linked/moved.md');
+        case 'copy-target': return c.copyContextEntryFromPath(path.join(ctxRoot(), 'source.md'), 'linked/copied.md');
+        case 'resolve-file':
+          expect(() => c.resolveContextFileAbsPath('linked/note.md')).toThrow(/path escapes contexts root/);
+          return { ok: false };
+        case 'resolve-entry':
+          expect(() => c.resolveContextEntryAbsPath('linked/note.md')).toThrow(/path escapes contexts root/);
+          return { ok: false };
+        default: throw new Error('Unknown boundary scenario');
+      }
+    };
+    const result = await invoke();
+    const externalBytesUnchanged = Object.entries(protectedFiles).every(([name, body]) =>
+      fs.existsSync(path.join(outside, name)) && fs.readFileSync(path.join(outside, name)).equals(body));
+    expect({
+      ok: result.ok,
+      externalBytesUnchanged,
+      externalNames: fs.readdirSync(outside).sort(),
+      source: fs.existsSync(path.join(ctxRoot(), 'source.md')) ? fs.readFileSync(path.join(ctxRoot(), 'source.md'), 'utf8') : null,
+      moved: fs.existsSync(path.join(ctxRoot(), 'moved.md')),
+      indexOperations: kbEnqueueCalls.length + searchCalls.length,
+    }).toEqual({
+      ok: false, externalBytesUnchanged: true,
+      externalNames: Object.keys(protectedFiles).sort(), source: 'Owned Library source', moved: false, indexOperations: 0,
+    });
+  });
+
+  it('keeps internal directory aliases and genuinely missing descendants usable', async () => {
+    writeFile('real/note.md', 'Owned existing source');
+    fs.symlinkSync(path.join(ctxRoot(), 'real'), path.join(ctxRoot(), 'alias'), process.platform === 'win32' ? 'junction' : 'dir');
+    const c = await loadContexts();
+    expect(c.readContextFile('alias/note.md')).toMatchObject({ ok: true, content: 'Owned existing source' });
+    expect(c.writeContextFile('alias/new/note.md', 'Owned new source')).toMatchObject({ ok: true });
+    expect(fs.readFileSync(path.join(ctxRoot(), 'real/new/note.md'), 'utf8')).toBe('Owned new source');
+    expect(c.writeContextFile('missing/child/note.md', 'New direct source')).toMatchObject({ ok: true });
+    expect(fs.readFileSync(path.join(ctxRoot(), 'missing/child/note.md'), 'utf8')).toBe('New direct source');
+  });
+
+  it.runIf(process.platform !== 'win32').each(['external', 'internal'])(
+    'publishes an owned generated index without overwriting its %s link target', async location => {
+      writeFile('note.md', '# Owned title');
+      const target = location === 'external' ? path.join(tmpDir, 'outside-index.md') : path.join(ctxRoot(), 'index-target.md');
+      fs.writeFileSync(target, 'Protected index target');
+      const index = path.join(ctxRoot(), '_INDEX.md');
+      fs.symlinkSync(target, index, 'file');
+      const c = await loadContexts();
+      const rebuilt = c.rebuildIndex();
+      expect(fs.readFileSync(target, 'utf8')).toBe('Protected index target');
+      expect(rebuilt.entries).toContainEqual({ path: 'note.md', title: 'Owned title' });
+      expect(fs.lstatSync(index).isSymbolicLink()).toBe(false);
+      expect(fs.readFileSync(index, 'utf8')).toContain('Owned title');
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')('keeps the derived overview safe on index-publication failure and recovers on retry', async () => {
+    writeFile('note.md', '# Owned title');
+    const outside = path.join(tmpDir, 'outside-index.md');
+    fs.writeFileSync(outside, 'Protected index target');
+    const index = path.join(ctxRoot(), '_INDEX.md');
+    fs.symlinkSync(outside, index, 'file');
+    const c = await loadContexts();
+    const nodeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const rename = nodeFs.renameSync, read = nodeFs.readFileSync;
+    const privateMessage = `EIO: ${outside} PRIVATE_INDEX_FAILURE`;
+    let indexReads = 0;
+    const renameSpy = vi.spyOn(nodeFs, 'renameSync').mockImplementation(((from: any, to: any) => {
+      if (String(to) === index) throw Object.assign(new Error(privateMessage), { code: 'EIO' });
+      return rename(from, to);
+    }) as any);
+    const readSpy = vi.spyOn(nodeFs, 'readFileSync').mockImplementation(((file: any, ...args: any[]) => {
+      if (String(file) === index) indexReads++;
+      return (read as any)(file, ...args);
+    }) as any);
+    diagnostics.warn.mockClear(); syncBuiltinESMExports();
+    let markdown: string;
+    try { markdown = c.rebuildIndex().rootMarkdown; }
+    finally { renameSpy.mockRestore(); readSpy.mockRestore(); syncBuiltinESMExports(); }
+    expect({ target: fs.readFileSync(outside, 'utf8'), indexReads, markdown: markdown!.includes('Owned title') }).toEqual({
+      target: 'Protected index target', indexReads: 0, markdown: true,
+    });
+    expect(diagnostics.warn).toHaveBeenCalledExactlyOnceWith('failed to write root Library index', {
+      message_hash: expect.stringMatching(/^[a-f0-9]{12}$/), message_chars: privateMessage.length,
+    });
+    expect(JSON.stringify(diagnostics.warn.mock.calls)).not.toMatch(/PRIVATE_INDEX_FAILURE|outside-index|EIO/);
+    expect(fs.readdirSync(ctxRoot()).sort()).toEqual(['_INDEX.md', 'note.md']);
+    expect(fs.lstatSync(index).isSymbolicLink()).toBe(true);
+    expect(c.rebuildIndex().rootMarkdown).toContain('Owned title');
+    expect(fs.lstatSync(index).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(outside, 'utf8')).toBe('Protected index target');
+  });
+});
+
+
+it.runIf(process.platform !== 'win32')('writes through a known missing internal Library file alias without widening its scope', async () => {
+  fs.mkdirSync(ctxRoot(), { recursive: true });
+  const target = path.join(ctxRoot(), 'future-source.md');
+  fs.symlinkSync(target, path.join(ctxRoot(), 'future-alias.md'), 'file');
+  const c = await loadContexts();
+  expect(c.writeContextFile('future-alias.md', 'Owned future source')).toMatchObject({ ok: true });
+  expect(fs.readFileSync(target, 'utf8')).toBe('Owned future source');
+  expect(c.readContextFile('future-alias.md')).toMatchObject({ ok: true, content: 'Owned future source' });
+});
+
+
+it.each(['', ' ', '/', '///'])('refuses deleting the Library root for an empty target spelling %j', async relative => {
+  writeFile('note.md', '# Preserved root source');
+  writeFile('nested/other.txt', 'Preserved nested source');
+  writeFile('_INDEX.md', 'Existing generated overview');
+  const c = await loadContexts();
+  const result = c.deleteContextTarget(relative);
+  const preserved = (name: string, expected: string) => fs.existsSync(path.join(ctxRoot(), name))
+    && fs.readFileSync(path.join(ctxRoot(), name), 'utf8') === expected;
+  expect({
+    ok: result.ok,
+    source: preserved('note.md', '# Preserved root source'),
+    nested: preserved('nested/other.txt', 'Preserved nested source'),
+    index: preserved('_INDEX.md', 'Existing generated overview'),
+    indexOperations: kbEnqueueCalls.length + searchCalls.length,
+  }).toEqual({ ok: false, source: true, nested: true, index: true, indexOperations: 0 });
+});
+
+
+describe('Library copy and move source ownership', () => {
+
+  it.each([
+    ['file', 'file'], ['file', 'directory'],
+    ['directory', 'file'], ['directory', 'directory'],
+  ] as const)('preserves a concurrent %s-copy destination claimed by a %s winner', async (sourceKind, winnerKind) => {
+    const root = ctxRoot(); fs.mkdirSync(root, { recursive: true });
+    const source = path.join(tmpDir, sourceKind === 'file' ? 'source.md' : 'source-folder');
+    const sourceFile = sourceKind === 'file' ? source : path.join(source, 'copied.md');
+    fs.mkdirSync(path.dirname(sourceFile), { recursive: true }); fs.writeFileSync(sourceFile, 'Original copied source');
+    const targetName = sourceKind === 'file' ? 'target.md' : 'target-folder';
+    const target = path.join(root, targetName);
+    const winnerFile = winnerKind === 'file' ? target : path.join(target, 'winner.md');
+    const c = await loadContexts();
+    const nodeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const exists = nodeFs.existsSync; let checks = 0; let injected = false;
+    const spy = vi.spyOn(nodeFs, 'existsSync').mockImplementation((filename: any) => {
+      const present = exists(filename);
+      if (String(filename) === target && ++checks === 1 && !present) {
+        if (winnerKind === 'directory') fs.mkdirSync(target);
+        fs.writeFileSync(winnerFile, 'Concurrent winner source'); injected = true;
+      }
+      return present;
+    });
+    syncBuiltinESMExports();
+    let result: any;
+    try { result = c.copyContextEntryFromPath(source, targetName); } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(injected).toBe(true);
+    expect({
+      ok: result.ok,
+      winner: fs.existsSync(winnerFile) ? fs.readFileSync(winnerFile, 'utf8') : null,
+      names: winnerKind === 'directory' && fs.existsSync(target) ? fs.readdirSync(target).sort() : [],
+      source: fs.readFileSync(sourceFile, 'utf8'), indexOperations: kbEnqueueCalls.length + searchCalls.length,
+    }).toEqual({ ok: false, winner: 'Concurrent winner source',
+      names: winnerKind === 'directory' ? ['winner.md'] : [], source: 'Original copied source', indexOperations: 0 });
+  });
+
+  it('rejects moving a folder into a new descendant before creating that descendant', async () => {
+    writeFile('source/note.md', 'Preserved source'); const c = await loadContexts();
+    const result = c.renameContextEntry('source', 'source/new-parent/moved');
+    expect({ ok: result.ok, names: fs.readdirSync(path.join(ctxRoot(), 'source')).sort(),
+      source: fs.readFileSync(path.join(ctxRoot(), 'source/note.md'), 'utf8'),
+      indexOperations: kbEnqueueCalls.length + searchCalls.length,
+    }).toEqual({ ok: false, names: ['note.md'], source: 'Preserved source', indexOperations: 0 });
+  });
+
+  it.each(['parent-create', 'source-stat'])('returns a recoverable failed move after %s fails without losing the source', async failure => {
+    writeFile('source.md', 'Preserved source'); const c = await loadContexts();
+    const nodeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const method = failure === 'parent-create' ? 'mkdirSync' : 'statSync';
+    const original = nodeFs[method];
+    const failedPath = path.join(ctxRoot(), failure === 'parent-create' ? 'new-parent' : 'source.md');
+    const spy = vi.spyOn(nodeFs, method).mockImplementation(((filename: any, ...args: any[]) => {
+      if (String(filename) === failedPath) throw Object.assign(new Error('Filesystem unavailable'), { code: 'EACCES' });
+      return (original as any)(filename, ...args);
+    }) as any); syncBuiltinESMExports();
+    let result: any;
+    try { result = c.renameContextEntry('source.md', 'new-parent/moved.md'); }
+    finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect({ ok: result.ok, source: fs.readFileSync(path.join(ctxRoot(), 'source.md'), 'utf8'),
+      targetParent: fs.existsSync(path.join(ctxRoot(), 'new-parent')),
+      indexOperations: kbEnqueueCalls.length + searchCalls.length,
+    }).toEqual({ ok: false, source: 'Preserved source', targetParent: false, indexOperations: 0 });
+  });
+
+});
+
+
+it.runIf(process.platform !== 'win32')('does not remove an existing internal dangling file alias when create-only copying fails', async () => {
+  writeFile('source.md', 'Original source');
+  const target = path.join(ctxRoot(), 'alias.md'), missing = path.join(ctxRoot(), 'future.md');
+  fs.symlinkSync(missing, target, 'file'); const c = await loadContexts();
+  const copied = c.copyContextEntryFromPath(path.join(ctxRoot(), 'source.md'), 'alias.md');
+  expect(copied.ok).toBe(false); expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+  expect(fs.readlinkSync(target)).toBe(missing); expect(fs.existsSync(missing)).toBe(false);
+  expect(fs.readFileSync(path.join(ctxRoot(), 'source.md'), 'utf8')).toBe('Original source');
+  expect(kbEnqueueCalls.length + searchCalls.length).toBe(0);
+});
+
+
+it.runIf(process.platform !== 'win32')('moves an internal directory alias as an entry without confusing it with its referenced directory', async () => {
+  writeFile('real/note.md', 'Referenced source');
+  const source = path.join(ctxRoot(), 'alias'), real = path.join(ctxRoot(), 'real');
+  fs.symlinkSync(real, source, 'dir'); const c = await loadContexts();
+  expect(c.renameContextEntry('alias', 'real/alias').ok).toBe(true);
+  expect(fs.existsSync(source)).toBe(false);
+  expect(fs.lstatSync(path.join(real, 'alias')).isSymbolicLink()).toBe(true);
+  expect(fs.readFileSync(path.join(real, 'note.md'), 'utf8')).toBe('Referenced source');
 });

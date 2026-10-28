@@ -7,8 +7,10 @@ import path from 'node:path';
 import { shell } from 'electron';
 
 import { describe, expect, it, vi } from 'vitest';
+import { findTestNpmCli } from '../../../helpers/npm-cli';
 
 const diagnostics = vi.hoisted(() => ({ warn: vi.fn() }));
+const bundledRuntime = vi.hoisted(() => ({ node: '/opt/orkas/runtime/node' }));
 vi.mock('../../../../src/main/logger', async importOriginal => {
   const actual = await importOriginal<typeof import('../../../../src/main/logger')>();
   return { ...actual, createLogger: (scope: string) => ({ ...actual.createLogger(scope), warn: diagnostics.warn }) };
@@ -36,7 +38,7 @@ vi.mock('node:child_process', () => ({
   }),
 }));
 vi.mock('../../../../src/main/util/bundled-runtime', () => ({
-  bundledNodeExecutable: () => '/opt/orkas/runtime/node',
+  bundledNodeExecutable: () => bundledRuntime.node,
   bundledNpxCli: () => '/opt/orkas/runtime/lib/node_modules/npm/bin/npx-cli.js',
 }));
 vi.mock('../../../../src/main/util/proxy-dispatcher', () => ({
@@ -758,6 +760,210 @@ describe('official local CLI connector runtime', () => {
     } finally {
       fs.rmSync(runtimeDir, { recursive: true, force: true });
     }
+  });
+
+  it.each(['missing', 'shadowed'])('uses bundled Node for real npm lifecycle and connector children with %s system Node', async mode => {
+    const realProcess = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const npmCli = findTestNpmCli(TEST_NODE);
+    expect(npmCli, 'An installed npm CLI must be available on PATH or beside the test Node').toBeTruthy();
+    const entry = findCatalogEntry('feishu')!;
+    const uid = `bundled-node-child-${mode}`;
+    const runtimeDir = localCliRuntimeDir(uid, entry.id);
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas CLI 路径-'));
+    const nodeDir = path.join(fixture, 'bundled Node 空格');
+    const hostPath = path.join(fixture, 'host-bin');
+    const home = path.join(fixture, 'home');
+    for (const directory of [hostPath, home]) fs.mkdirSync(directory);
+    // Junctions need no Windows symlink privilege; the selected runtime remains real Node.
+    fs.symlinkSync(path.dirname(TEST_NODE), nodeDir, 'junction');
+    if (mode === 'shadowed') fs.writeFileSync(path.join(hostPath, process.platform === 'win32' ? 'node.exe' : 'node'),
+      '#!/bin/sh\nexit 91\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(fixture, 'package.json'), JSON.stringify({
+      name: 'local-cli-lifecycle-fixture', version: '1.0.0',
+      scripts: { postinstall: 'node postinstall.cjs' },
+    }));
+    fs.writeFileSync(path.join(fixture, 'postinstall.cjs'), [
+      "require('node:fs').writeFileSync('attempt.json', JSON.stringify({ node: process.execPath, exit: Number(process.env.FIXTURE_EXIT) }));",
+      "if (process.env.FIXTURE_EXIT !== '0') process.exit(Number(process.env.FIXTURE_EXIT));",
+      "require('node:fs').writeFileSync('receipt.json', JSON.stringify({ node: process.execPath }));",
+    ].join('\n'));
+    const previousNode = bundledRuntime.node;
+    bundledRuntime.node = path.join(nodeDir, path.basename(TEST_NODE));
+    vi.stubEnv('PATH', hostPath);
+    vi.stubEnv('Path', hostPath);
+    const assertChildNode = (env: Record<string, string>) => {
+      // The selected runtime must win even when canonical/CI paths contain another Node.
+      expect(env.PATH.split(path.delimiter)[0]).toBe(nodeDir);
+      const result = realProcess.spawnSync('node', ['-p', 'process.execPath'], {
+        env, encoding: 'utf8', timeout: 10_000, windowsHide: true,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe('');
+      expect(fs.realpathSync(result.stdout.trim())).toBe(fs.realpathSync(TEST_NODE));
+    };
+    let fixtureExit = 17;
+    const runner = async (options: { env: Record<string, string> }) => {
+      assertChildNode(options.env);
+      const result = realProcess.spawnSync(bundledRuntime.node, [npmCli!, '--silent', 'run', 'postinstall'], {
+        cwd: fixture, encoding: 'utf8', timeout: 15_000, windowsHide: true,
+        env: {
+          ...options.env, HOME: home, USERPROFILE: home, FIXTURE_EXIT: String(fixtureExit),
+          NPM_CONFIG_USERCONFIG: path.join(home, '.npmrc'), NPM_CONFIG_GLOBALCONFIG: path.join(home, 'global.npmrc'),
+          NPM_CONFIG_CACHE: path.join(fixture, 'npm-cache'), NPM_CONFIG_OFFLINE: 'true', NPM_CONFIG_LOGS_MAX: '0',
+        },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(fixtureExit);
+      // Only the network/package extraction is a fixture. A real npm lifecycle
+      // must execute successfully before the managed-package postcheck can pass.
+      if (result.status === 0) {
+        const receipt = JSON.parse(fs.readFileSync(path.join(fixture, 'receipt.json'), 'utf8'));
+        expect(fs.realpathSync(receipt.node)).toBe(fs.realpathSync(TEST_NODE));
+        seedInstalled(uid, entry);
+      }
+      return { exitCode: result.status, stderr: result.stderr };
+    };
+    try {
+      await expect(installLocalCli(uid, entry, { runHelper: runner }))
+        .rejects.toMatchObject({ code: 'local_cli_install_failed' });
+      const attempt = JSON.parse(fs.readFileSync(path.join(fixture, 'attempt.json'), 'utf8'));
+      expect(attempt.exit).toBe(17);
+      expect(fs.realpathSync(attempt.node)).toBe(fs.realpathSync(TEST_NODE));
+      expect(localCliInstallStatus(uid, entry).installed).toBe(false);
+      expect(fs.existsSync(path.join(runtimeDir, '.orkas-cli-integrity.json'))).toBe(false);
+      expect(fs.existsSync(path.join(fixture, 'receipt.json'))).toBe(false);
+      await expect(authorizeLocalCli(uid, entry)).rejects.toMatchObject({ code: 'local_cli_install_required' });
+      fixtureExit = 0;
+      await expect(installLocalCli(uid, entry, { runHelper: runner })).resolves.toMatchObject({ installed: true });
+      const transport = localCliTransport(uid, entry);
+      expect(transport.kind).toBe('stdio');
+      if (transport.kind === 'stdio') assertChildNode(transport.env!);
+      await authorizeLocalCli(uid, entry);
+      assertChildNode(interactiveMocks.start.mock.calls.at(-1)![0].sandboxEnv);
+      await checkLocalCliPermissions(uid, entry, true, async options => {
+        assertChildNode(options.env);
+        return { exitCode: 0, stderr: '' };
+      });
+    } finally {
+      bundledRuntime.node = previousNode;
+      vi.unstubAllEnvs();
+      fs.rmSync(runtimeDir, { recursive: true, force: true });
+      // Remove the directory link itself before recursive Windows cleanup;
+      // the selected runtime belongs to the host, outside this fixture.
+      fs.unlinkSync(nodeDir);
+      fs.rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it('records one private-data-free install receipt for coalesced failures and permits a clean retry', async () => {
+    const entry = findCatalogEntry('wecom')!;
+    const uid = 'install-failure-receipt';
+    const runtimeDir = localCliRuntimeDir(uid, entry.id);
+    diagnostics.warn.mockClear();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const runner = vi.fn(async () => {
+      await pending;
+      return { exitCode: 127, stderr: 'private account token and /private/installer/path',
+        spawnCode: 'private-untrusted-code', signal: 'private-untrusted-signal' };
+    });
+    try {
+      const first = installLocalCli(uid, entry, { runHelper: runner });
+      const duplicate = installLocalCli(uid, entry, { runHelper: runner });
+      expect(duplicate).toBe(first);
+      release();
+      await expect(first).rejects.toMatchObject({ code: 'local_cli_install_failed' });
+      expect(runner).toHaveBeenCalledOnce();
+      expect(diagnostics.warn).toHaveBeenCalledExactlyOnceWith('Official CLI installation failed', {
+        provider: 'wecom', phase: 'execute', error_code: 'local_cli_install_failed', exit_code: 127,
+      });
+      expect(localCliInstallStatus(uid, entry).installed).toBe(false);
+      await expect(installLocalCli(uid, entry, { runHelper: async () => {
+        seedInstalled(uid, entry);
+        return { exitCode: 0, stderr: '' };
+      } })).resolves.toMatchObject({ installed: true });
+      expect(diagnostics.warn).toHaveBeenCalledOnce();
+    } finally { fs.rmSync(runtimeDir, { recursive: true, force: true }); }
+  });
+
+  it('distinguishes an installation postcheck failure from a successful helper exit', async () => {
+    const entry = findCatalogEntry('wecom')!;
+    const uid = 'install-postcheck-receipt';
+    diagnostics.warn.mockClear();
+    try {
+      await expect(installLocalCli(uid, entry, { runHelper: async () => ({ exitCode: 0, stderr: '' }) }))
+        .rejects.toMatchObject({ code: 'local_cli_install_failed' });
+      expect(diagnostics.warn).toHaveBeenCalledExactlyOnceWith('Official CLI installation failed', {
+        provider: 'wecom', phase: 'verify', error_code: 'local_cli_install_failed', exit_code: 0,
+      });
+      expect(localCliInstallStatus(uid, entry).installed).toBe(false);
+    } finally { fs.rmSync(localCliRuntimeDir(uid, entry.id), { recursive: true, force: true }); }
+  });
+
+  it.each(['ENOENT', 'private-untrusted-code'])('keeps only a known OS spawn code for %s', async code => {
+    const entry = findCatalogEntry('wecom')!;
+    const uid = 'install-spawn-receipt';
+    diagnostics.warn.mockClear();
+    vi.mocked(spawn).mockImplementationOnce(() => {
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('error', Object.assign(new Error('private spawn path'), { code })));
+      return child as ReturnType<typeof spawn>;
+    });
+    try {
+      await expect(installLocalCli(uid, entry)).rejects.toMatchObject({ code: 'local_cli_install_failed' });
+      expect(diagnostics.warn).toHaveBeenCalledExactlyOnceWith('Official CLI installation failed', {
+        provider: 'wecom', phase: 'execute', error_code: 'local_cli_install_failed', exit_code: null,
+        ...(code === 'ENOENT' ? { system_code: 'ENOENT' } : {}),
+      });
+      expect(localCliInstallStatus(uid, entry).installed).toBe(false);
+    } finally { fs.rmSync(localCliRuntimeDir(uid, entry.id), { recursive: true, force: true }); }
+  });
+
+  it.each(['SIGTERM', 'private-untrusted-signal'])('retains only a known termination signal for %s', async signal => {
+    const entry = findCatalogEntry('wecom')!;
+    const uid = 'install-signal-receipt';
+    diagnostics.warn.mockClear();
+    vi.mocked(spawn).mockImplementationOnce(() => {
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('close', null, signal));
+      return child as ReturnType<typeof spawn>;
+    });
+    try {
+      await expect(installLocalCli(uid, entry)).rejects.toMatchObject({ code: 'local_cli_install_failed' });
+      expect(diagnostics.warn).toHaveBeenCalledExactlyOnceWith('Official CLI installation failed', {
+        provider: 'wecom', phase: 'execute', error_code: 'local_cli_install_failed', exit_code: null,
+        ...(signal === 'SIGTERM' ? { signal } : {}),
+      });
+      expect(localCliInstallStatus(uid, entry).installed).toBe(false);
+    } finally { fs.rmSync(localCliRuntimeDir(uid, entry.id), { recursive: true, force: true }); }
+  });
+
+  it('records an invalid cache layout without starting an installer or deleting existing credentials', async () => {
+    const entry = findCatalogEntry('wecom')!;
+    const uid = 'install-cleanup-receipt';
+    const runtime = localCliRuntimeDir(uid, entry.id);
+    fs.mkdirSync(runtime, { recursive: true });
+    const credentials = path.join(runtime, 'credentials.json');
+    fs.writeFileSync(credentials, 'preserve-existing-credentials');
+    // An invalid marker directory cannot be removed by the file-only cleanup.
+    // Unlike ENOTDIR under force=true, this is stable across Node versions.
+    const marker = path.join(runtime, '.orkas-cli-integrity.json');
+    fs.mkdirSync(marker);
+    fs.writeFileSync(path.join(marker, 'preserve'), 'invalid-marker-layout');
+    const runner = vi.fn();
+    diagnostics.warn.mockClear();
+    try {
+      await expect(installLocalCli(uid, entry, { runHelper: runner }))
+        .rejects.toMatchObject({ code: 'local_cli_install_failed' });
+      expect(runner).not.toHaveBeenCalled();
+      expect(diagnostics.warn).toHaveBeenCalledExactlyOnceWith('Official CLI installation failed', {
+        provider: 'wecom', phase: 'cache_cleanup', error_code: 'local_cli_install_failed',
+      });
+      expect(fs.readFileSync(credentials, 'utf8')).toBe('preserve-existing-credentials');
+    } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
   });
 
   it('maps registry verification failures to a stable renderer-safe install code', async () => {

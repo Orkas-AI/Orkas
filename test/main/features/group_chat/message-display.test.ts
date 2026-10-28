@@ -2,6 +2,15 @@ import { describe, expect, it } from 'vitest';
 import { classifyNativeCommentary, normalizeNativeMessageDisplay, commanderMentionDisplayText, stripReservedRoutingMentions } from '../../../../src/main/features/group_chat/message-display';
 
 describe('native transcript classification', () => {
+  it.each([{ process: [] }, { process: [{ type: 'event' as const,
+    event: { stream: 'runtime', data: { phase: 'interrupted', duration_ms: 13374 } } }] }])(
+    'keeps a structured interruption notice in the reply body regardless of clock availability', ({ process }) => {
+      const record = { id: 'interrupted', ts: '2026-10-26T14:31:24', from: 'codex', to: ['user'],
+        turn_id: 't', source_message_id: 'u', seg: 0, system_kind: 'reply_interrupted' as const,
+        text: 'The previous reply was interrupted.', process };
+      expect(normalizeNativeMessageDisplay(record)).toBe(record);
+    });
+
   it('stores commentary once while preserving the original source and tool order', () => {
     const record = { id: 'm0', ts: '2026-10-14T00:00:00', from: 'claude', to: ['user'],
       turn_id: 't', source_message_id: 'u', seg: 0, text: '  ## Complete report\n原文\n',

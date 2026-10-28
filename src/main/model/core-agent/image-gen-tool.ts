@@ -39,6 +39,7 @@ import { versionedChatMediaLocalUrl } from '../../util/chat-media-url';
 import {
   beginVideoProductionGeneration,
   finishVideoProductionGeneration,
+  releaseVideoProductionGeneration,
   videoProductionControlStatePath,
   type VideoProductionGenerationTransaction,
 } from '../../features/video_production_control';
@@ -156,7 +157,7 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
         size: {
           type: 'string',
           description:
-            'Provider size hint. Seedream supports 2K (default after normalization), 3K, 4K, or a valid WIDTHxHEIGHT; other providers commonly use 1024x1024, 1536x1024, 1024x1536, or auto.',
+            'Flash/Pro: 1K/1.5K/2K(default) or WIDTHxHEIGHT (921600-4624220 pixels, aspect 1:16-16:1). Lite: 2K/3K/4K. Gemini: auto(default) or exact table size. OpenAI: supported size, default 1024x1024.',
         },
         production_plan_path: {
           type: 'string',
@@ -393,17 +394,29 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
       }
 
       if (result.ok === false) {
+        const notDispatched = result.dispatched === false;
         if (productionTransaction) {
           try {
-            await finishVideoProductionGeneration({
-              statePath: productionStatePath,
-              planPath: productionPlanAbs,
-              transactionId: productionTransaction.transaction_id,
-              segmentId: productionTransaction.segment_id,
-              kind: 'image',
-              ok: false,
-              errorCode: result.errorCode,
-            });
+            if (notDispatched) {
+              await releaseVideoProductionGeneration({
+                statePath: productionStatePath,
+                planPath: productionPlanAbs,
+                transactionId: productionTransaction.transaction_id,
+                segmentId: productionTransaction.segment_id,
+                kind: 'image',
+                errorCode: result.errorCode,
+              });
+            } else {
+              await finishVideoProductionGeneration({
+                statePath: productionStatePath,
+                planPath: productionPlanAbs,
+                transactionId: productionTransaction.transaction_id,
+                segmentId: productionTransaction.segment_id,
+                kind: 'image',
+                ok: false,
+                errorCode: result.errorCode,
+              });
+            }
           } catch (err) {
             return { content: `${(err as Error).message}; provider error=[${result.errorCode}] ${result.message}`, isError: true } as ToolResult;
           }
@@ -415,6 +428,7 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
               transactionId: imageTransaction.transaction_id,
               ok: false,
               errorCode: result.errorCode,
+              ...(notDispatched ? { countsTowardBudget: false } : {}),
             });
           } catch (err) {
             return { content: `${(err as Error).message}; provider error=[${result.errorCode}] ${result.message}`, isError: true } as ToolResult;

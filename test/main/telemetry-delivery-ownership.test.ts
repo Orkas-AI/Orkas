@@ -103,6 +103,9 @@ describe('Main task-terminal UI delivery', () => {
     const win = Object.assign(new EventEmitter(), { webContents });
     const context = vm.createContext({
       createRendererChannel,
+      // Preloading is scheduled independently of terminal delivery. Keep its
+      // callback deferred, as the real scheduler does until the app is ready.
+      scheduleChatApiPreload: () => {},
       users: { hasActiveUser: () => true, getActiveUserId: () => 'owner-a' },
       ipc: { broadcastToRenderer: (channel: string, payload: unknown) => { delivered.push({ channel, payload }); return true; } },
       win,
@@ -111,8 +114,11 @@ describe('Main task-terminal UI delivery', () => {
     const lifecycleEnd = mainSource.indexOf('\n  // Block HTML', lifecycleStart);
     expect(lifecycleStart).toBeGreaterThan(0);
     expect(lifecycleEnd).toBeGreaterThan(lifecycleStart);
+    const preloadState = mainSource.match(/^let modelApiPreloadScheduled = false;$/m)?.[0];
+    expect(preloadState).toBeDefined();
     const source = [
       'let mainRendererReady = false;',
+      preloadState!,
       mainSource.slice(mainSource.indexOf('const rendererChannels:'), mainSource.indexOf('function emitTaskTerminalToRenderer(')),
       mainSource.slice(lifecycleStart, lifecycleEnd),
     ].join('\n');

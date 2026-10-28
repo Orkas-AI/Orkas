@@ -32,3 +32,18 @@ it('handles fixtures that exit before creating a diagnostic directory', () => {
   roots.push(root);
   expect(collectLogFiles(root)).toBe('');
 });
+
+it.each(['ascii', 'cjk', 'astral', 'invalid'])('bounds the complete UTF-8 artifact for %s logs', kind => {
+  const root = mkdtempSync(path.join(tmpdir(), 'orkas-log-evidence-'));
+  roots.push(root);
+  const directory = path.join(root, 'workspace/logs');
+  mkdirSync(directory, { recursive: true });
+  const body = kind === 'invalid' ? Buffer.alloc(3 * 1024 * 1024, 0xff)
+    : (kind === 'cjk' ? '中' : kind === 'astral' ? '😀' : 'a').repeat(3 * 1024 * 1024);
+  writeFileSync(path.join(directory, 'current.log'), body);
+  const logs = collectLogFiles(root);
+  expect(logs).toContain('current.log');
+  expect(Buffer.byteLength(logs, 'utf8')).toBeLessThanOrEqual(2 * 1024 * 1024);
+  expect(Buffer.byteLength(logs, 'utf8')).toBeGreaterThan(1024 * 1024);
+  if (kind !== 'invalid') expect(logs).not.toContain('\ufffd');
+});

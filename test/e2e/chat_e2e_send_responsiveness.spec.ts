@@ -1,11 +1,11 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { expect, test } from './fixtures/orkas';
-import { checkLatencyBudget } from '../helpers/latency-budget';
+import { checkLatencyBudget, LATENCY_LIMIT_MS } from '../helpers/latency-budget';
 
 // Real renderer -> IPC -> main -> SDK, using the existing isolated local model.
 // The second case proves a main-process stall cannot hide behind a fast cached paint.
-for (const injectedStallMs of [0, 600]) {
+for (const injectedStallMs of [0, LATENCY_LIMIT_MS + 100]) {
   test(`switches from sending A to B with a responsive main process (injected stall ${injectedStallMs} ms)`, async ({ modelOrkas }) => {
     const page = modelOrkas.page!;
     const app = modelOrkas.electronApp!;
@@ -13,7 +13,7 @@ for (const injectedStallMs of [0, 600]) {
     await page.locator('#new-chat-input').fill(marker);
     await page.locator('#new-chat-send-btn').click();
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
-      // Cold-start setup is outside the 500 ms send/switch measurement below.
+      // Cold-start setup is outside the platform send/switch measurement below.
       .toContainText('Hello from the local E2E model.', { timeout: 30_000 });
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
     const cidB = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
@@ -125,7 +125,7 @@ for (const injectedStallMs of [0, 600]) {
     if (injectedStallMs) {
       expect(pulse.injected).toBe(true);
       expect(() => checkLatencyBudget('main loop response negative control', { elapsedMs: pulse.maxGapMs }))
-        .toThrow('budget 500 ms');
+        .toThrow(`budget ${LATENCY_LIMIT_MS} ms`);
     } else {
       checkLatencyBudget('send A then open B', { elapsedMs: switchMs, phases: [
         { phase: 'scheduled_click', ms: timing.clickDelayMs },

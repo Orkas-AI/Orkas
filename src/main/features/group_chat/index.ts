@@ -41,6 +41,7 @@ import {
   beginConversationTaskEdit as busBeginConversationTaskEdit,
   cancelConversationTaskEdit as busCancelConversationTaskEdit,
   listConversationTasks as busListConversationTasks,
+  listPlanningDispatches as busListPlanningDispatches,
   setConversationTaskAfter as busSetConversationTaskAfter,
   resumeBlockedTask as busResumeBlockedTask,
   reorderConversationTask as busReorderConversationTask,
@@ -54,8 +55,7 @@ import {
 export const busIsQuiescent = isQuiescent;
 
 /** Reuse history's lazy tool-output projection for an active public turn. */
-export async function displaySnapshot(userId: string, cid: string, projectIdHint?: string | null) {
-  const snapshot = liveDisplaySnapshot(userId, cid);
+async function buildDisplaySnapshot(userId: string, cid: string, snapshot: ReturnType<typeof liveDisplaySnapshot>, projectIdHint?: string | null) {
   const source = conversationMessageReadFile(userId, cid, projectIdHint);
   return {
     ...snapshot,
@@ -64,6 +64,25 @@ export async function displaySnapshot(userId: string, cid: string, projectIdHint
       records: await projectLiveConversationHistoryRecords(userId, source, turn.records),
     }))),
   };
+}
+
+const pendingDisplaySnapshots = new Map<string, { signature: unknown; pending: ReturnType<typeof buildDisplaySnapshot> }>();
+/** A process watermark covers the public event trail; compare all remaining
+ * display data too so changed prose or turn membership never reuses old work. */
+export function displaySnapshot(userId: string, cid: string, projectIdHint?: string | null) {
+  const snapshot = liveDisplaySnapshot(userId, cid);
+  const signature = { ...snapshot, turns: snapshot.turns.map(turn => ({ ...turn,
+    records: turn.records.map(({ process, ...record }) => ({ ...record, processCount: process?.length })),
+  })) };
+  const key = JSON.stringify([userId, cid, projectIdHint]);
+  const existing = pendingDisplaySnapshots.get(key);
+  if (existing && isDeepStrictEqual(existing.signature, signature)) return existing.pending;
+  const pending = buildDisplaySnapshot(userId, cid, snapshot, projectIdHint);
+  const entry = { signature, pending };
+  pendingDisplaySnapshots.set(key, entry);
+  const cleanup = () => { if (pendingDisplaySnapshots.get(key) === entry) pendingDisplaySnapshots.delete(key); };
+  void pending.then(cleanup, cleanup);
+  return pending;
 }
 
 export async function runtimeStatus(
@@ -75,7 +94,11 @@ export async function runtimeStatus(
   try {
     let state = await readState(userId, cid, projectIdHint);
     let runtime = runtimeSnapshot(userId, cid);
-    if ((state.status === 'running' || state.in_flight.some(Boolean)) && !runtime.processing) {
+    const orphan = (state.status === 'running' || state.in_flight.some(Boolean)) && !runtime.processing;
+    const recoveryPending = orphan && (await import('../chats'))
+      .isInterruptionRecoveryPending(userId, cid, state);
+    if (orphan) runtime = runtimeSnapshot(userId, cid);
+    if (orphan && !recoveryPending) {
       const result = await recoverOrphanRunningState(userId, cid, () => !runtimeSnapshot(userId, cid).processing);
       state = result.state;
       // Admission can also start during the asynchronous recovery write.
@@ -84,7 +107,7 @@ export async function runtimeStatus(
         log.warn('healed orphan running state', { user_id: maskId(userId), cid: maskId(cid) });
       }
     }
-    const diskInFlight = state.in_flight.filter(Boolean);
+    const diskInFlight = recoveryPending ? [] : state.in_flight.filter(Boolean);
     // The conversation floor — included so a renderer reload / recovery poll
     // restores the composer target (the agent the commander handed off to)
     // instead of dropping back to the commander until the next state_changed.
@@ -94,7 +117,7 @@ export async function runtimeStatus(
       ...diskInFlight,
       ...runtime.inFlight,
     ].filter(Boolean)));
-    const processing = state.status === 'running' || inFlight.length > 0 || runtime.processing;
+    const processing = (!recoveryPending && state.status === 'running') || inFlight.length > 0 || runtime.processing;
     return {
       processing,
       processing_since: processing ? (state.last_active_at || null) : null,
@@ -112,7 +135,8 @@ export async function runtimeStatus(
  *  starts emitting events on the same microtask cycle as send's return —
  *  if subscribe runs after send, those first events are lost. */
 export const subscribeBus = subscribe;
-export { submitCliAsyncInput } from './bus';
+export { submitCliAsyncInput, subscribeTaskTerminals } from './bus';
+export type { TaskTerminalEvent, TaskTerminalStatus } from './bus';
 
 import type { ChatUseSelection, ChatMessageReference, GroupMessage } from './visibility';
 import {
@@ -133,6 +157,10 @@ export interface SendInput {
   userId: string;
   cid: string;
   text: string;
+  /** Host feature bookkeeping after routing accepts the message and before
+   * recipient work becomes runnable. Never part of the persisted message. */
+  beforeDispatch?: () => Promise<void>;
+  notificationKind?: 'task' | 'automation';
   commander_mention_display?: CommanderMentionDisplay;
   /** Host-owned delivery decision for the explicit queue "Send now" action.
    * Analytics attribution must never imply this execution control. */
@@ -294,6 +322,8 @@ export async function send(
       uid: userId, cid,
       fromActorId: USER_ID,
       text,
+      ...(input.beforeDispatch ? { beforeDispatch: input.beforeDispatch } : {}),
+      ...(input.notificationKind ? { notificationKind: input.notificationKind } : {}),
       ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
         ? { commander_mention_display } : {}),
       ...(steerActiveTurn === true ? { steerActiveTurn: true } : {}),
@@ -792,9 +822,9 @@ export async function dropConv(userId: string, cid: string): Promise<void> {
 // ── Conversation task board (list + queued/running cancel) ───────────────
 
 export async function listTasks(userId: string, cid: string) {
-  if (!safeId(cid)) return { ok: false as const, error: 'invalid cid', tasks: [] };
+  if (!safeId(cid)) return { ok: false as const, error: 'invalid cid', tasks: [], planning: [] };
   const tasks = await busListConversationTasks(userId, cid);
-  return { ok: true as const, tasks };
+  return { ok: true as const, tasks, planning: busListPlanningDispatches(userId, cid) };
 }
 
 export async function cancelTask(userId: string, cid: string, taskId: string) {
@@ -1488,10 +1518,19 @@ export async function resolveMarketplaceInstallRequest(
 
 // ── Read messages (UI initial load) ──────────────────────────────────────
 
-export async function readMessages(userId: string, cid: string, limit = 500): Promise<GroupMessage[]> {
+export async function readMessages(userId: string, cid: string, limit = 500, opts?: { strict?: boolean }): Promise<GroupMessage[]> {
   if (!safeId(cid)) return [];
-  return (await readJsonl<GroupMessage>(conversationMessageReadFile(userId, cid), limit))
-    .filter((msg) => !msg.deleted_at);
+  let messages: GroupMessage[];
+  try {
+    messages = await readJsonl<GroupMessage>(conversationMessageReadFile(userId, cid), limit, opts);
+  } catch (error) {
+    if (opts?.strict && (error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  if (opts?.strict && messages.some(msg => !msg || typeof msg !== 'object' || Array.isArray(msg))) {
+    throw new Error('Conversation message is invalid');
+  }
+  return messages.filter((msg) => !msg.deleted_at);
 }
 
 function _deletedMessageRevision(message: GroupMessage, deletedAt: string): GroupMessage {

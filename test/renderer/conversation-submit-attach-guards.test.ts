@@ -54,7 +54,7 @@ function stubEl(extra: Record<string, any> = {}) {
   };
 }
 
-function loadConversation(overrides: Record<string, any> = {}) {
+function loadConversation(overrides: Record<string, any> = {}, surface = 'PC') {
   const revoked: string[] = [];
   const elements: Record<string, any> = {};
   const context: any = {
@@ -118,6 +118,57 @@ describe('empty addressed composer requests', () => {
     expect(modelChecks).toBe(0);
     expect(requests).toBe(0);
     expect(elements[inputId].value).toBe(text);
+  });
+});
+
+describe('attachment order continuity across input surfaces', () => {
+  it('retains the first selection position when duplicate uploads complete in reverse order', () => {
+    const { context } = loadConversation();
+    context._chatAttachSet('task-a', [
+      { tempId: 'first', name: 'z-first.txt', status: 'uploading' },
+      { tempId: 'middle', name: 'a-middle.txt', status: 'ready' },
+      { tempId: 'last', name: 'duplicate.txt', status: 'uploading' },
+    ]);
+    context._chatAttachReplaceByTempId('task-a', 'last', { name: 'z-first.txt', status: 'ready' });
+    context._chatAttachReplaceByTempId('task-a', 'first', { name: 'z-first.txt', status: 'ready' });
+    expect(context._chatAttachList('task-a').map((item: any) => item.name)).toEqual(['z-first.txt', 'a-middle.txt']);
+  });
+
+  it.each([
+    ['PC', 'main_chat'], ['PC', 'task-a'], ['PC', 'projchat-p'], ['PC', 'agent-edit-a'], ['PC', 'skill-edit-s'],
+  ])('%s %s keeps selection order after reopening and a renderer reload', async (surface, cid) => {
+    const saved = new Map<string, string>();
+    const names = ['z-first.png', 'a-second.png', 'm-third.txt'];
+    const infos = names.map((name) => ({ name, kind: 'text', bytes: 1, status: 'ready' }));
+    const overrides = { currentUserId: 'owner', localStorage: {
+      getItem: (key: string) => saved.get(key) || null,
+      setItem: (key: string, value: string) => saved.set(key, value),
+      removeItem: (key: string) => saved.delete(key),
+    }, apiFetch: async () => ({ json: async () => ({ ok: true, items: [...infos].reverse() }) }) };
+    const first = loadConversation(overrides, surface).context;
+    first._chatAttachSet(cid, infos);
+    await first._chatAttachRefreshFromServer(cid);
+    expect(first._chatAttachList(cid).map((item: any) => item.name)).toEqual(names);
+    const reopened = loadConversation(overrides, surface).context;
+    await reopened._chatAttachRefreshFromServer(cid);
+    expect(reopened._chatAttachList(cid).map((item: any) => item.name)).toEqual(names);
+    await reopened._chatAttachClear(cid);
+    expect(saved.size).toBe(0);
+  });
+
+  it.each(['Agent', 'Skill'])('%s editing sends the same attachment order after refreshing the composer', async (kind) => {
+    const cid = `${kind.toLowerCase()}-edit-abc`;
+    const names = ['z-first.png', 'a-second.png'];
+    const infos = names.map((name) => ({ name, kind: 'image', bytes: 1, status: 'ready' }));
+    const { context } = loadConversation({ apiFetch: async () => ({ json: async () => ({ ok: true, items: [...infos].reverse() }) }) });
+    const source = fs.readFileSync(path.join(rendererRoot, `modules/${kind.toLowerCase()}s.js`), 'utf8');
+    const start = source.indexOf(`async function _build${kind}EditChatExtraBody(`);
+    const end = source.indexOf(`\nfunction _ensure${kind}ChatController`, start);
+    context[`_${kind.toLowerCase()}EditAttachmentCid`] = () => cid;
+    vm.runInContext(source.slice(start, end), context);
+    context._chatAttachSet(cid, infos);
+    await context._chatAttachRefreshFromServer(cid);
+    expect(await context[`_build${kind}EditChatExtraBody`]('Compare', 'abc', {})).toEqual({ attachments: names, attachment_cid: cid });
   });
 });
 
@@ -322,6 +373,178 @@ describe('conversation send ownership across navigation', () => {
     expect(input.value).toBe(navigates ? 'Unsent B draft' : phase === 'new-draft' ? 'Updated A draft' : '');
     expect(clearedDrafts).toEqual(phase === 'new-draft' ? [] : ['task-a']);
     expect(vm.runInContext("_chatAttachmentSendLocks.has('task-a')", context)).toBe(false);
+  });
+});
+
+describe('composer attachment send lifecycle', () => {
+  function setup(entry: string) {
+    const sends: any[] = [];
+    const alerts: string[] = [];
+    const requests: string[] = [];
+    const { context, elements } = loadConversation({ currentCid: 'task-a' });
+    if (entry === 'project') {
+      vm.runInContext(fs.readFileSync(path.join(rendererRoot, 'modules/project-detail.js'), 'utf8'), context);
+      vm.runInContext("_projectDetailPid = 'p_send'", context);
+    }
+    Object.assign(context, {
+      currentView: entry,
+      ensureModelConfigured: () => true,
+      _isQueueItemEditing: () => false,
+      _getQuotes: () => [],
+      getChatUseSelections: () => [],
+      _recipientSnapshotForSend: () => ({ kind: 'commander' }),
+      _commanderMentionDisplayForSend: () => ({}),
+      transformWithChatUse: (text: string) => text,
+      transformChatUseTokens: (text: string) => text,
+      applyRecipientPrefix: (text: string) => text,
+      _applyRecipientPrefixWithSnapshot: (text: string) => text,
+      _titleSeedWithoutRoutingMentions: (text: string) => text,
+      _autoTitle: (text: string) => text,
+      unresolvedOssTemplatePlaceholder: () => false,
+      isConvPending: () => false,
+      _rememberSentComposerSnapshot() {},
+      renderConversationList() {}, loadProjects() {}, setView() {},
+      _renderRecipientChip() {}, _saveRecipientMap() {},
+      uiAlert: async (message: string) => { alerts.push(message); },
+      sendInConversation: async (...args: any[]) => { sends.push(args); },
+      apiFetch: async (url: string) => {
+        requests.push(url);
+        if (url.endsWith('/attachments') || url.endsWith('/adopt')) {
+          return { json: async () => ({ ok: true, items: [] }) };
+        }
+        if (url.endsWith('/create')) return { json: async () => ({ ok: true,
+          conversation: { conversation_id: 'created', created_at: '2026-10-20T00:00:00Z' },
+        }) };
+        throw new Error('Unexpected send request');
+      },
+    });
+    const inputId = entry === 'conversation' ? 'chat-input'
+      : entry === 'project' ? 'project-chat-input' : 'new-chat-input';
+    elements[inputId] = stubEl({ value: 'Send this text' });
+    elements[entry === 'project' ? 'project-chat-send-btn' : 'new-chat-send-btn'] = stubEl();
+    const cid = entry === 'conversation' ? 'task-a' : entry === 'project' ? 'projchat-p_send' : 'main_chat';
+    const submit = () => entry === 'conversation' ? context.handleChatSubmit()
+      : entry === 'project' ? context._submitProjectChat() : context.handleNewChatSubmit();
+    return { context, elements, inputId, cid, submit, sends, alerts, requests };
+  }
+
+  it.each(['new-chat', 'conversation', 'project'])('preserves authored attachment order through refresh and %s send', async (entry) => {
+    const { context, elements, cid, submit, sends, alerts } = setup(entry);
+    const names = ['image.png', 'image-20261021-122943.png', 'alpha.txt'];
+    const infos = names.map((name) => ({ name, kind: name.endsWith('.png') ? 'image' : 'text', bytes: 1 }));
+    const fetch = context.apiFetch;
+    context.apiFetch = async (url: string) => {
+      if (url.endsWith('/attachments')) return { json: async () => ({ ok: true, items: [...infos].reverse() }) };
+      if (url.endsWith('/adopt')) return { json: async () => ({ ok: true,
+        items: [...names].reverse().map((name) => ({ sourceName: name, targetName: `saved-${name}` })),
+      }) };
+      return fetch(url);
+    };
+    const host = entry === 'conversation' ? 'chat-attachments' : entry === 'project' ? 'project-chat-attachments' : 'new-chat-attachments';
+    elements[host] = stubEl();
+    context._chatAttachSet(cid, infos.map((info) => ({ ...info, status: 'ready' })));
+    await context._chatAttachRefreshFromServer(cid);
+    expect(context._chatAttachList(cid).map((item: any) => item.name)).toEqual(names);
+    expect([...elements[host].innerHTML.matchAll(/class="chat-attach-label">([^<]+)/g)].map((m: any) => m[1])).toEqual(names);
+    await submit();
+    expect(alerts).toEqual([]);
+    expect(sends).toHaveLength(1);
+    const expected = entry === 'conversation' ? names : names.map((name) => `saved-${name}`);
+    expect(sends[0][2].attachments).toEqual(expected);
+    const bubble = context._renderMessageAttachmentsHtml(sends[0][2].attachments, sends[0][0]);
+    expect([...bubble.matchAll(/data-attach-name="([^"]+)"/g)].map((m: any) => m[1])).toEqual(expected);
+  });
+
+  it('keeps reused and pending files interleaved on retry and queued-message edits', async () => {
+    const { context, cid } = setup('conversation');
+    const names = ['z-old.png', 'b-new.png', 'a-old.png', 'c-new.png'];
+    const infos = names.map((name, i) => ({ name, kind: 'image', bytes: 1, status: 'ready', reused: i % 2 === 0 }));
+    context._chatAttachSet(cid, infos);
+    let fail = true;
+    context.apiFetch = async () => ({ json: async () => fail ? { ok: false } : {
+      ok: true, items: [infos[3], infos[1], { name: 'recovered.txt', kind: 'text', bytes: 1 }],
+    } });
+    expect((await context._chatAttachSnapshotForSend(cid)).ok).toBe(false);
+    expect(context._chatAttachList(cid).map((item: any) => item.name)).toEqual(names);
+    fail = false;
+    expect((await context._chatAttachSnapshotForSend(cid, { onlySelected: true })).names).toEqual(names);
+    expect((await context._chatAttachSnapshotForSend(cid)).names).toEqual([...names, 'recovered.txt']);
+  });
+
+  it.each(['new-chat', 'conversation', 'project'])('ignores repeated %s submit during an empty attachment preflight', async (entry) => {
+    const fixture = setup(entry);
+    const { context, submit, sends, alerts, requests } = fixture;
+    const fetch = context.apiFetch;
+    let resume!: () => void;
+    const held = new Promise<void>((resolve) => { resume = resolve; });
+    context.apiFetch = async (url: string) => {
+      if (url.endsWith('/attachments')) await held;
+      return fetch(url);
+    };
+    const first = submit();
+    await submit();
+    resume();
+    await first;
+    expect(alerts).toEqual([]);
+    expect(sends).toHaveLength(1);
+    expect(requests.filter((url) => url.endsWith('/attachments'))).toHaveLength(1);
+    expect(sends[0][1]).toBe('Send this text');
+  });
+
+  it.each(['new-chat', 'conversation', 'project'])('allows a %s retry after preparation throws with no attachments', async (entry) => {
+    const { context, elements, inputId, cid, submit, sends, alerts, requests } = setup(entry);
+    const references = context._referenceSnapshotsForQuotes;
+    context._referenceSnapshotsForQuotes = () => { throw new Error('Preparation interrupted'); };
+    await expect(submit()).rejects.toThrow('Preparation interrupted');
+    expect(elements[inputId].value).toBe('Send this text');
+    expect(sends).toEqual([]);
+    expect(requests.some((url) => url.endsWith('/create'))).toBe(false);
+    expect(vm.runInContext(`_chatAttachmentSendLocks.has('${cid}')`, context)).toBe(false);
+    context._referenceSnapshotsForQuotes = references;
+    await submit();
+    expect(alerts).toEqual([]);
+    expect(sends).toHaveLength(1);
+  });
+
+  it.each(['new-chat', 'conversation', 'project'])('keeps the %s draft blocked until an actual attachment operation completes', async (entry) => {
+    const { context, elements, inputId, cid, submit, sends, alerts, requests } = setup(entry);
+    // File reads and native picking begin before there is an attachment chip.
+    const finish = context._chatAttachBeginOperation(cid);
+    await submit();
+    expect(alerts).toEqual(['chat.attach_still_uploading']);
+    expect(requests).toEqual([]);
+    expect(sends).toEqual([]);
+    expect(elements[inputId].value).toBe('Send this text');
+    finish();
+    await submit();
+    expect(sends).toHaveLength(1);
+    expect(alerts).toHaveLength(1);
+  });
+
+  it('does not submit a busy conversation twice while its send response is pending', async () => {
+    const { context, elements, inputId, submit, sends, alerts, requests } = setup('conversation');
+    context.isConvPending = () => true;
+    const fetch = context.apiFetch;
+    let resume!: () => void;
+    let reached!: () => void;
+    const waiting = new Promise<void>((resolve) => { reached = resolve; });
+    const held = new Promise<void>((resolve) => { resume = resolve; });
+    context.apiFetch = async (url: string) => {
+      if (!url.endsWith('/send')) return fetch(url);
+      requests.push(url);
+      reached();
+      await held;
+      return { json: async () => ({ ok: true }) };
+    };
+    const first = submit();
+    await waiting;
+    await submit();
+    resume();
+    await first;
+    expect(alerts).toEqual([]);
+    expect(requests.filter((url) => url.endsWith('/send'))).toHaveLength(1);
+    expect(sends).toEqual([]);
+    expect(elements[inputId].value).toBe('');
   });
 });
 

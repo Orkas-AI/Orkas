@@ -1,6 +1,6 @@
 import { defaultNumericRange } from '../../../../bin/tool-input-compat.cjs';
 import { readToolResultExcerpt } from './tool-result-tools';
-import { hasHistoryProcess, historyMessageIndex, historyMessages, historyRecordText, historyToolResultSource } from '../../features/chat-history-records';
+import { hasHistoryProcess, historyMessageIndex, historyMessages, historyProcessTextAt, historyRecordText, historyToolResultSource } from '../../features/chat-history-records';
 import { withRetrievalBudget, RETRIEVAL_OUTPUT_BUDGET_KEY, DEFAULT_INLINE_RESULT_TOKENS, boundedRetrievalText, estimateToolResultTokens } from '../../util/tool-result-cap';
 /**
  * Conversation-history tools injected into main-conversation runners.
@@ -516,6 +516,12 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
           ...(h.msg_id ? { record_id: h.msg_id } : { page: { mode: 'around', index: msgIndex, count: 0 } }),
           include_process: h.has_process === true,
         })}`);
+        if (h.msg_id && Number.isSafeInteger(h.process_index) && Number(h.process_index) >= 0) {
+          lines.push(`    process_read: ${JSON.stringify({ action: 'read', scope: readScope,
+            ...(readScope !== 'current' ? { cid } : {}), record_id: h.msg_id,
+            process_index: h.process_index,
+          })}`);
+        }
       }
       const budget = Number(ctx.state[RETRIEVAL_OUTPUT_BUDGET_KEY] ?? DEFAULT_INLINE_RESULT_TOKENS);
       return { content: boundedRetrievalText(lines.join('\n'), Math.max(0, budget - 30)) + (estimateToolResultTokens(lines.join('\n')) > budget - 30 ? '\n[More matches omitted; narrow the query or read a hit by record_id.]' : '') };
@@ -551,6 +557,7 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
         record_id: { type: 'string', description: 'Read only: exact message ID from search/read.' },
         turn_id: { type: 'string', description: 'Read only: user message ID or execution turn_id.' },
         tool_call_id: { type: 'string', description: 'Read only: select a stored tool call and its input/output.' },
+        process_index: { type: 'integer', minimum: 0, description: 'Read only: public segment index from search; requires record_id, excludes page/output_cursor. cursor pages this segment.' },
         output_cursor: { type: 'integer', minimum: 0, description: 'Full tool_call_id output: start at 0, continue returned cursor.' },
         include_process: { type: 'boolean', description: 'Execution records: default true with tool_call_id, else false.' },
         cursor: { type: 'integer', minimum: 0, description: 'Partial-read character cursor.' },
@@ -568,6 +575,13 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
       required: currentOnly ? ['scope'] : [],
     },
     async execute(input, ctx) {
+      const processIndex = input.process_index;
+      if (processIndex !== undefined && (!Number.isSafeInteger(processIndex) || Number(processIndex) < 0
+          || typeof input.record_id !== 'string' || !input.record_id.trim()
+          || input.page !== undefined || LEGACY_CHAT_READ_PAGE_KEYS.some(key => input[key] != null)
+          || input.output_cursor !== undefined)) {
+        return { content: 'chat_history(read): process_index requires a non-negative safe integer and exact record_id; it cannot be combined with page, legacy paging or output_cursor.', isError: true };
+      }
       const pageResult = parseChatReadPage(input);
       if (pageResult.error) {
         return { content: `chat_history(read): ${pageResult.error}`, isError: true };
@@ -673,9 +687,12 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
       const hi = selected[selected.length - 1].index;
       const hasOlderCurrentRows = scope === 'current'
         && available.some((row) => row.index < lo);
-      const budget = Math.min(Number(ctx.state[RETRIEVAL_OUTPUT_BUDGET_KEY] ?? DEFAULT_INLINE_RESULT_TOKENS),
-        boundedInt(defaultNumericRange(input.max_tokens, DEFAULT_INLINE_RESULT_TOKENS, 1, DEFAULT_INLINE_RESULT_TOKENS), DEFAULT_INLINE_RESULT_TOKENS, 1, DEFAULT_INLINE_RESULT_TOKENS));
-      const includeProcess = input.include_process === true || !!input.tool_call_id;
+      const pageTokens = boundedInt(defaultNumericRange(input.max_tokens, DEFAULT_INLINE_RESULT_TOKENS, 1, DEFAULT_INLINE_RESULT_TOKENS), DEFAULT_INLINE_RESULT_TOKENS, 1, DEFAULT_INLINE_RESULT_TOKENS);
+      const budget = Math.min(Number(ctx.state[RETRIEVAL_OUTPUT_BUDGET_KEY] ?? DEFAULT_INLINE_RESULT_TOKENS), pageTokens);
+      const includeProcess = input.include_process === true || !!input.tool_call_id || processIndex !== undefined;
+      const readIdentity = { action: 'read', scope, ...(scope !== 'current' ? { cid } : {}),
+        ...(input.max_tokens !== undefined ? { max_tokens: pageTokens } : {}),
+      };
       if (input.cursor !== undefined && (!Number.isSafeInteger(input.cursor) || Number(input.cursor) < 0)) {
         return { content: 'chat_history(read): cursor must be a non-negative safe integer.', isError: true };
       }
@@ -693,8 +710,10 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
         + `<!-- ${note} -->\n`
         + (hasOlderCurrentRows ? `<!-- Older records: {"page":{"mode":"before","index":${lo},"count":10}}. -->\n` : '<!-- This window reaches the start of readable history. -->\n');
       const locatorFor = (position: number, cursor: number) => JSON.stringify({
+        ...readIdentity,
         record_id: selected[position].message.id,
-        page: { mode: 'from', index: selected[position].index, count: selected.length - position },
+        ...(processIndex !== undefined ? { process_index: processIndex }
+          : { page: { mode: 'from', index: selected[position].index, count: selected.length - position } }),
         cursor, include_process: includeProcess,
         ...(input.turn_id ? { turn_id: input.turn_id } : {}),
         ...(input.tool_call_id ? { tool_call_id: input.tool_call_id } : {}),
@@ -703,10 +722,20 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
       let next = 'done';
       for (let i = 0; i < selected.length; i++) {
         const [msg] = await historyMessages(opts.userId, cid, [selected[i].index], historySource);
-        const body = historyRecordText(msg, includeProcess);
-        const processRead = !includeProcess && hasHistoryProcess(msg)
+        const body = processIndex !== undefined ? historyProcessTextAt(msg, Number(processIndex)) : historyRecordText(msg, includeProcess);
+        if (body === undefined) return { content: 'chat_history(read): public process segment unavailable in the selected record.', isError: true };
+        const item = processIndex !== undefined ? msg.process?.[Number(processIndex)] as any : undefined;
+        if (input.tool_call_id && processIndex !== undefined && item?.event?.data?.id !== input.tool_call_id) {
+          return { content: 'chat_history(read): process segment does not belong to tool_call_id.', isError: true };
+        }
+        let processRead = !includeProcess && hasHistoryProcess(msg)
           ? `\n<process_read>${attrOf(JSON.stringify({ action: 'read', scope,
             ...(scope !== 'current' ? { cid } : {}), record_id: msg.id, include_process: true }))}</process_read>` : '';
+        const callId = item?.event?.data?.id;
+        if (typeof callId === 'string' && item?.event?.data?.result_path
+            && await historyToolResultSource(opts.userId, cid, msg, callId)) {
+          processRead += `\n<output_read>${attrOf(JSON.stringify({ ...readIdentity, record_id: msg.id, tool_call_id: callId, output_cursor: 0 }))}</output_read>`;
+        }
         const cursor = i === 0 ? boundedInt(input.cursor, 0, 0, Number.MAX_SAFE_INTEGER) : 0;
         if (cursor > body.length) return { content: 'chat_history(read): cursor exceeds the selected record length.', isError: true };
         const envelope = (text: string, end: number) =>
@@ -753,7 +782,7 @@ const CHAT_HISTORY_ACTION_FIELDS: Readonly<Record<ChatHistoryAction, ReadonlySet
   // from an older conversation. The provider-visible schema advertises only
   // the tagged `page` contract.
   read: new Set([
-    'action', 'cid', 'page', 'scope', 'record_id', 'turn_id', 'tool_call_id', 'include_process', 'cursor', 'max_tokens', 'output_cursor',
+    'action', 'cid', 'page', 'scope', 'record_id', 'turn_id', 'tool_call_id', 'process_index', 'include_process', 'cursor', 'max_tokens', 'output_cursor',
     ...LEGACY_CHAT_READ_PAGE_KEYS,
   ]),
 };
@@ -764,7 +793,7 @@ function chatHistoryActionError(
 ): string | null {
   const unexpected = Object.keys(input).filter(
     (key) => !Object.values(CHAT_HISTORY_ACTION_FIELDS).some((fields) => fields.has(key))
-      || (action === 'search' && ['cid', 'record_id', 'turn_id', 'tool_call_id'].includes(key)
+      || (action === 'search' && ['cid', 'record_id', 'turn_id', 'tool_call_id', 'process_index'].includes(key)
         && input[key] !== undefined && input[key] !== null && input[key] !== ''),
   );
   if (!unexpected.length) return null;

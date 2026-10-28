@@ -9,6 +9,31 @@ function register(shape: z.ZodRawShape, handler: (...args: any[]) => any) {
 }
 
 describe('tolerant MCP argument receipts', () => {
+  it('advertises required fields, numeric bounds and nested maps without requiring defaulted inputs', () => {
+    const [config] = bridgeToolInput(z, 'Read fixture', {
+      id: z.string().min(1),
+      scope: z.enum(['local', 'cloud']).default('local'),
+      limit: z.preprocess(value => value, z.number().int().min(1).max(50).optional()),
+      args: z.record(z.string(), z.unknown()).optional(),
+      task_id: z.string().min(1).optional().catch(ctx => ctx.input),
+    }, async () => ({ content: [] }));
+    for (const direction of ['input', 'output']) {
+      const schema = config.inputSchema['~standard'].jsonSchema[direction]();
+      expect(schema).toMatchObject({ type: 'object', required: ['id'], properties: {
+        id: { type: 'string', minLength: 1 },
+        scope: { type: 'string', enum: ['local', 'cloud'], default: 'local' },
+        limit: { type: 'integer', minimum: 1, maximum: 50 },
+        args: { type: 'object', additionalProperties: {} },
+        task_id: { type: 'string', minLength: 1 },
+      } });
+    }
+    expect(config.inputSchema.parse({ id: 'item', args: { nested: { enabled: true } } }))
+      .toEqual({ id: 'item', scope: 'local', args: { nested: { enabled: true } } });
+    expect(() => config.inputSchema.parse({ id: 'item', limit: 51 })).toThrow();
+    // A malformed unused selector reaches its owning action guard unchanged.
+    expect(config.inputSchema.parse({ id: 'item', task_id: 4 }).task_id).toBe(4);
+  });
+
   it('ignores undeclared fields on writes and executes once with the declared content', async () => {
     const handler = vi.fn(async () => ({ content: [{ type: 'text', text: 'saved' }] }));
     const call = register({ content: z.string() }, handler);
@@ -23,7 +48,7 @@ describe('tolerant MCP argument receipts', () => {
     const result = { content: [{ type: 'text', text: '{"found":true}' },
       { type: 'image', data: 'fixture', mimeType: 'image/png' }], structuredContent: { found: true } };
     const handler = vi.fn(async () => result);
-    const call = register({ id: z.string(), args: z.record(z.unknown()) }, handler);
+    const call = register({ id: z.string(), args: z.record(z.string(), z.unknown()) }, handler);
     const reply = await call({ id: 'item', args: { provider_extension: 42 }, extra_note: { secret: 'PRIVATE_VALUE' } });
     expect(handler).toHaveBeenCalledExactlyOnceWith({ id: 'item', args: { provider_extension: 42 } }, {});
     expect(reply.content.slice(0, 2)).toEqual(result.content);

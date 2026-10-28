@@ -2,7 +2,7 @@
 // Drives `#panel-project`: shows the project composer, task panes, and a
 // right-side rail for project agents + files.
 //
-// Header carries the title and a menu with Rename and Delete.
+// Header carries the title and a menu with Invite members, Rename and Delete.
 // The sidebar provides back navigation.
 //
 // Add picker and project-file viewer are centered modals (`.modal-overlay`)
@@ -77,12 +77,15 @@ function _projectFileUploadPayload(fileList, source, targetDir) {
   };
 }
 
+let _projectLibraryScopeGeneration = 0;
 let _projectDetailPid = '';     // pid currently rendered in the panel
 let _projectDetailMeta = null;  // { project, agentDetails, files, libraryStatus? }
 let _projectKbStatusByName = {}; // {[name]: {status, chunks?, error?, kind?}}
 let _projectKbEventsHandle = null;
 let _projectKbEventsPid = '';
+let _projectKbEventsScope = null;
 let _projectLibraryActiveName = '';
+let _projectLibraryViewerSeq = 0;
 let _projectLibraryMveController = null;
 let _projectOfficeBlobUrl = null;
 const _projectLibraryExpanded = new Set();
@@ -121,7 +124,10 @@ async function loadProjectDetail(pid) {
   const isCurrent = () => loadSeq === _projectDetailLoadSeq && pid === _projectDetailPid
     && account === (typeof currentUserId === 'string' ? currentUserId : '');
   const prevPid = _projectDetailPid;
-  if (prevPid !== pid) _projectDetailResolvedPid = '';
+  if (prevPid !== pid) {
+    _projectDetailResolvedPid = '';
+    _projectLibraryScopeGeneration++;
+  }
   if (prevPid && prevPid !== pid) {
     _projectLibraryDrafts.clear();
     _projectLibraryExpanded.clear();
@@ -734,6 +740,19 @@ function _onProjectAdvance(payload) {
 // uploads) used to reload the full list N times (2026-08-28 review E1-7).
 const _PROJECT_TASKS_RELOAD_DEBOUNCE_MS = 150;
 let _projectTasksReloadTimer = null;
+/** A model wrote this project's rules during a conversation: reread them so
+ *  the rail shows what conversations now get. An open editor keeps its draft;
+ *  only the saved copy behind it moves. */
+function _onProjectInstructionsChanged(payload) {
+  const pid = payload && payload.projectId;
+  if (!pid || pid !== _projectDetailPid || currentView !== 'project' || !_projectDetailMeta) return;
+  window.orkas.invoke('projects.instructions.get', { projectId: pid }).then((res) => {
+    if (!res?.ok || pid !== _projectDetailPid || !_projectDetailMeta) return;
+    _projectDetailMeta.instructions = { content: String(res.content || ''), limit: Number(res.limit) || 4000 };
+    _renderProjectInstructions();
+  }).catch(() => { /* the next page load reads the saved rules */ });
+}
+
 function _onProjectTasksChanged(payload) {
   const pid = payload && payload.projectId;
   if (typeof _scheduleGlobalTodosRefresh === 'function') _scheduleGlobalTodosRefresh(pid);
@@ -851,7 +870,7 @@ async function _loadProjectMemory(pid) {
     nextMemory = loaded ? res.entries : [];
     nextFull = loaded && !!res.usage?.full;
   } catch (err) {
-    _projectDetailLog.warn('load project memory failed', err);
+    _projectDetailLog.warn('load project memory failed', _projectMemoryFailure(err, true));
     nextMemory = [];
   }
   if (loadSeq !== _projectMemoryLoadSeq || pid !== _projectDetailPid
@@ -1001,7 +1020,7 @@ async function _mutateProjectMemory(channel, payload) {
         ...(payload || {}),
       });
     } catch (err) {
-      _projectDetailLog.warn('project memory mutate failed', err);
+      _projectDetailLog.warn('project memory mutate failed', _projectMemoryFailure(err, true));
       if (typeof uiAlert === 'function') uiAlert(t('project.memory.failed'));
       return { ok: false, failure: _projectMemoryFailure(err, true) };
     }
@@ -1027,7 +1046,7 @@ async function _mutateProjectMemory(channel, payload) {
         await _loadProjectMemory(pid);
       }
     } catch (err) {
-      _projectDetailLog.warn('refresh project memory after mutation failed', err);
+      _projectDetailLog.warn('refresh project memory after mutation failed', _projectMemoryFailure(err));
     }
     return { ok: true, failure: null };
   } finally {
@@ -1128,6 +1147,8 @@ let _todoEditorGeneration = 0;
 let _todoEditorReturnFocus = null;
 let _todoEditorReleaseFocus = null;
 let _todoEditorInitial = null;
+let _todoEditorDuePicker = null;
+const _TODO_DUE_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 let _todoEditorProjectSelect = null;
 let _todoEditorStatusSelect = null;
 let _todoEditorAgentSelect = null;
@@ -1220,6 +1241,29 @@ function _todoBoardStatus(status) {
 
 function _projectTodoContext() {
   return { pid: _projectDetailPid, tasks: _projectTodos, agents: _projectDetailMeta?.agentDetails || [], project: _projectDetailMeta?.project };
+}
+
+/** Today as the same local `YYYY-MM-DD` a due date is stored in. */
+function _todoLocalToday() {
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+/** A due date for the eye: short month and day in the UI language, with the
+ *  year only when it is not this year. Falls back to the stored text. */
+function _todoDueLabel(dueAt) {
+  const match = _TODO_DUE_DATE_RE.test(dueAt) ? dueAt.split('-').map(Number) : null;
+  if (!match) return String(dueAt || '');
+  const date = new Date(match[0], match[1] - 1, match[2]);
+  try {
+    const locale = typeof getLocaleMeta === 'function' && typeof getLang === 'function'
+      ? getLocaleMeta(getLang()).intlLocale : undefined;
+    const sameYear = date.getFullYear() === new Date().getFullYear();
+    return new Intl.DateTimeFormat(locale, { month: 'short', day: 'numeric', ...(sameYear ? {} : { year: 'numeric' }) }).format(date);
+  } catch (_) {
+    return dueAt;
+  }
 }
 
 function _todoContextHasScope(context) {
@@ -1406,6 +1450,16 @@ function _renderTodoCard(task, context) {
     appendMeta(att);
   }
 
+  // Due date: plain text in the meta row, red once the day has passed on an
+  // open task.
+  if (typeof task.due_at === 'string' && _TODO_DUE_DATE_RE.test(task.due_at)) {
+    const overdue = status !== 'done' && task.due_at < _todoLocalToday();
+    const due = document.createElement('span');
+    due.className = 'project-todo-due' + (overdue ? ' is-overdue' : '');
+    due.textContent = t(overdue ? 'project.todo.due_overdue' : 'project.todo.due_on', { date: _todoDueLabel(task.due_at) });
+    appendMeta(due);
+  }
+
   // Open the latest successfully dispatched execution on every todo board.
   const conversationId = typeof task.origin_cid === 'string' ? task.origin_cid.trim() : '';
   if (conversationId) {
@@ -1521,6 +1575,12 @@ function _ensureTodoEditorSelects() {
     _todoEditorAgentSelect = _aiSelectMount(agent, {
       options: [], value: '', ariaLabel: t('project.todo.assign'),
       onChange: () => { _todoEditorOwnerChanged = true; },
+    });
+  }
+  const duePicker = document.getElementById('project-todo-due-picker');
+  if (duePicker && !_todoEditorDuePicker && typeof _autoDatePickerMount === 'function') {
+    _todoEditorDuePicker = _autoDatePickerMount(duePicker, {
+      labelKey: 'project.todo.due_label', portalRoot: duePicker.closest('.ui-dialog-overlay'),
     });
   }
 }
@@ -1730,7 +1790,7 @@ function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 
   _todoEditorReturnFocus = document.activeElement;
   _todoEditorTaskId = task && task.id ? task.id : null;
   _todoEditorInitial = task ? { status: task.status || 'todo', owner_agent: task.owner_agent,
-    owner_agent_id: task.owner_agent_id, } : null;
+    owner_agent_id: task.owner_agent_id, due_at: task.due_at || '' } : null;
   // Edit stages attachments onto the real task; create lazily allocates a draft
   // id on first attach (adopted by create on save, discarded on cancel).
   _todoEditorTid = _todoEditorTaskId;
@@ -1739,6 +1799,11 @@ function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 
   _todoEditorOwnerChanged = false;
   void _loadTodoEditorAgents(task);
   input.value = _todoEditorTaskId && task ? (task.content || '') : '';
+  const dueField = document.getElementById('project-todo-due-field');
+  if (dueField) dueField.hidden = false;
+  const dueInput = document.getElementById('project-todo-due');
+  if (dueInput) dueInput.value = _todoEditorTaskId && task ? (task.due_at || '') : '';
+  if (_todoEditorDuePicker?.setValue) _todoEditorDuePicker.setValue(dueInput?.value || '');
   const existing = (_todoEditorTaskId && task && Array.isArray(task.attachments)) ? task.attachments : [];
   _setTodoEditorAttachments(existing.map((name) => ({ name, displayName: name, kind: _todoAttachKind(name), status: 'ready' })));
   if (_todoEditorStatusSelect) {
@@ -1793,6 +1858,7 @@ function _closeProjectTodoEditor() {
   _todoEditorGeneration += 1;
   document.getElementById('todo-editor-modal')?.classList.remove('open');
   _todoEditorAgentSelect?.close?.();
+  _todoEditorDuePicker?.close?.();
   _todoEditorAgentLoading = false;
   document.getElementById('project-todo-composer')?.classList.remove('drag-over');
   _todoEditorReleaseFocus?.();
@@ -1867,6 +1933,16 @@ async function _saveProjectTodoEditor() {
       ? { agent_id: _todoEditorInitial.owner_agent_id, name: _todoEditorInitial.owner_agent } : null);
   const owner = (!taskId && agent) || (taskId && _todoEditorOwnerChanged)
     ? { owner_agent: agent?.name || '', owner_agent_id: agent?.agent_id || '' } : {};
+  // The due date is a local calendar day; a malformed one is corrected here
+  // rather than refused by the host after the content was already saved.
+  const dueValue = String(document.getElementById('project-todo-due')?.value || '').trim();
+  if (dueValue && !_autoLocalDateParts(dueValue)) {
+    if (typeof uiAlert === 'function') uiAlert(t('project.todo.due_invalid'));
+    return;
+  }
+  const due = taskId
+    ? (dueValue !== (_todoEditorInitial?.due_at || '') ? { due_at: dueValue } : {})
+    : (dueValue ? { due_at: dueValue } : {});
   const startedAt = Date.now();
   // Create passes the pre-allocated draft id when files were staged so the
   // persisted task adopts them. Edits update the existing task in place.
@@ -1876,14 +1952,18 @@ async function _saveProjectTodoEditor() {
         projectId: pid,
         taskId,
         content,
+        attachment_order: _todoEditorAttachments.filter((item) => item.status === 'ready').map((item) => item.name),
         ...(status !== _todoEditorInitial?.status ? { status } : {}),
         ...owner,
+        ...due,
       })
       : window.orkas.invoke('projects.tasks.create', {
         projectId: pid,
         content,
         status,
+        attachment_order: _todoEditorAttachments.filter((item) => item.status === 'ready').map((item) => item.name),
         ...owner,
+        ...due,
         ...(_todoEditorTid ? { taskId: _todoEditorTid } : {}),
       }));
     if (result?.ok === false) return result;
@@ -1948,8 +2028,9 @@ function _todoCommanderAgent() {
   return { agent_id: 'commander', name: t('chat.recipient_commander'), enabled: true, ...avatar };
 }
 
+// An unavailable binding cannot run; an existing owner keeps its stored name.
 function _todoAssignableAgents(list = []) {
-  return [_todoCommanderAgent(), ...list.filter((a) => a?.agent_id && a.agent_id !== 'commander')
+  return [_todoCommanderAgent(), ...list.filter((a) => a?.agent_id && a.agent_id !== 'commander' && !a.unavailable)
     .slice().sort((a, b) => String(a.name || a.agent_id).localeCompare(String(b.name || b.agent_id)))];
 }
 
@@ -2046,7 +2127,16 @@ async function _runTodoTask(tid, context = _projectTodoContext()) {
 }
 
 async function _deleteTodoTask(tid, context = _projectTodoContext()) {
-  await _todoMutate(() => window.orkas.invoke('projects.tasks.delete', {
+  const task = (context.tasks || []).find((item) => item.id === tid);
+  const account = currentUserId;
+  const confirmed = await uiConfirmDanger({
+    title: t('project.todo.delete_confirm'),
+    message: task?.content || '',
+    dangerLabel: t('project.todo.delete'),
+  });
+  if (!confirmed || account !== currentUserId) return;
+  const startedAt = Date.now();
+  const outcome = await _todoMutate(() => window.orkas.invoke('projects.tasks.delete', {
     projectId: context.pid,
     taskId: tid,
   }), context.pid);
@@ -2065,7 +2155,7 @@ function _openTodoRowMenu(evt, tid, context = _projectTodoContext()) {
     items.push({ label: t('project.todo.run'), onClick: () => _runTodoTask(tid, context) });
   }
   items.push({ label: t('project.todo.edit'), onClick: () => _openProjectTodoEditor(task, context) });
-  items.push({ label: t('project.todo.delete'), onClick: () => _deleteTodoTask(tid, context) });
+  items.push({ label: t('project.todo.delete'), danger: true, onClick: () => _deleteTodoTask(tid, context) });
   showContextMenu(evt, items);
 }
 
@@ -2401,18 +2491,21 @@ function _renderProjectAgentCards(items) {
   return sorted.map((a) => {
     const id = a.agent_id || a.id || '';
     const enabled = a.enabled !== false;
+    const unavailable = a.unavailable === true;
     const avatarHtml = (typeof renderAvatarHtml === 'function')
       ? renderAvatarHtml(a.icon, a.color, {
         size: 28, seed: id, extraClass: 'project-agent-row-avatar',
       })
       : '';
+    // Missing local definitions keep their binding until explicit removal.
+    const unavailableAttr = unavailable ? ' data-project-agent-unavailable="removable"' : '';
     return `
       <div class="project-agent-row${enabled ? '' : ' is-disabled'}" role="button" tabindex="0"
-           data-project-agent-id="${escapeHtml(id)}" data-project-agent-name="${escapeHtml(a.name || '')}" data-source="${escapeHtml(a.source || '')}">
+           data-project-agent-id="${escapeHtml(id)}" data-project-agent-name="${escapeHtml(a.name || '')}" data-source="${escapeHtml(a.source || '')}"${unavailableAttr}>
         ${avatarHtml}
-        <span class="project-agent-row-name">${escapeHtml(a.name || t('agents.unnamed'))}</span>
+        <span class="project-agent-row-name">${escapeHtml(unavailable ? t('project.bindings.unavailable') : (a.name || t('agents.unnamed')))}</span>
         <div class="project-agent-row-actions">
-          <button type="button" class="project-agent-row-run agent-card-use" data-project-agent-run title="${useTitle}" aria-label="${useTitle}">
+          <button type="button" class="project-agent-row-run agent-card-use" data-project-agent-run title="${useTitle}" aria-label="${useTitle}" ${unavailable ? 'disabled' : ''}>
             ${useLabel}
           </button>
           <button type="button" class="project-agent-row-remove" data-project-agent-remove title="${removeTitle}" aria-label="${removeTitle}">
@@ -2429,15 +2522,16 @@ function _bindProjectAgentCards() {
   if (!root) return;
   root.querySelectorAll('.project-agent-row[data-project-agent-id]').forEach((card) => {
     const id = card.dataset.projectAgentId || '';
+    const unavailable = card.dataset.projectAgentUnavailable || '';
     card.addEventListener('click', async () => {
-      await _openProjectAgentDetail(id);
+      await _openProjectAgentDetail(id, unavailable);
     });
     card.addEventListener('keydown', async (e) => {
       if (e.isComposing || e.keyCode === 229) return;
       if (e.target?.closest?.('button')) return;
       if (e.key !== 'Enter' && e.key !== ' ') return;
       e.preventDefault();
-      await _openProjectAgentDetail(id);
+      await _openProjectAgentDetail(id, unavailable);
     });
     card.querySelector('[data-project-agent-run]')?.addEventListener('click', async (e) => {
       e.stopPropagation();
@@ -2450,8 +2544,14 @@ function _bindProjectAgentCards() {
   });
 }
 
-async function _openProjectAgentDetail(agentId) {
+async function _openProjectAgentDetail(agentId, unavailable = '') {
   if (!agentId) return;
+  if (unavailable) {
+    if (typeof uiToast === 'function') {
+      uiToast(t('project.bindings.unavailable_remove_hint'));
+    }
+    return;
+  }
   try {
     if (typeof openAgentDetail === 'function') {
       await openAgentDetail(agentId);
@@ -2686,8 +2786,11 @@ function _hasActiveProjectKbStatuses() {
 
 async function _refreshProjectKbStatusSnapshot(pid) {
   if (!pid || pid !== _projectDetailPid) return;
+  const loadSeq = _projectDetailLoadSeq;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
   const res = await window.orkas.invoke('projects.files.status', { projectId: pid, skipReconcile: true });
-  if (!res?.ok || pid !== _projectDetailPid) return;
+  if (!res?.ok || pid !== _projectDetailPid || loadSeq !== _projectDetailLoadSeq
+      || account !== (typeof currentUserId === 'string' ? currentUserId : '')) return;
   const flatFiles = _flattenProjectLibraryFiles(_projectDetailMeta?.files || []);
   _projectKbStatusByName = _buildProjectKbStatusMap(flatFiles, res.files || []);
   for (const file of flatFiles) {
@@ -2710,11 +2813,15 @@ function _kickProjectKbReconcileIfNeeded() {
   const pid = _projectDetailPid;
   if (!pid) return;
   const loadSeq = _projectDetailLoadSeq;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  const isCurrent = () => pid === _projectDetailPid && loadSeq === _projectDetailLoadSeq
+    && account === (typeof currentUserId === 'string' ? currentUserId : '');
   _projectKbReconciledLoadSeq = loadSeq;
   _projectKbReconcileInFlight = true;
   window.orkas.invoke('projects.files.reconcile', { projectId: pid })
-    .then(() => _refreshProjectKbStatusSnapshot(pid))
+    .then(() => isCurrent() && _refreshProjectKbStatusSnapshot(pid))
     .catch((err) => {
+      if (!isCurrent()) return;
       // A later polling tick may retry a transient IPC/storage failure.
       if (_projectKbReconciledLoadSeq === loadSeq) _projectKbReconciledLoadSeq = -1;
       _projectDetailLog.warn('project kb reconcile failed', err);
@@ -2751,6 +2858,11 @@ function _projectKbStatusChipHtml(name) {
     return `<span class="ctx-kb-chip is-processing" title="${escapeHtml(label)}"><span class="ctx-kb-spinner"></span></span>`;
   }
   if (st.status === 'failed') {
+    if (st.kind === 'image') {
+      const label = t('contexts.kb.image_failed');
+      const hint = t('contexts.kb.image_failed_hint');
+      return `<button type="button" class="ctx-kb-chip is-failed is-image-failed" data-action="project-file-reprocess" title="${escapeHtml(hint)}" aria-label="${escapeHtml(label + ': ' + hint)}">${escapeHtml(label)}</button>`;
+    }
     if (st.errorCode === 'E_LIBRARY_FILE_TOO_LARGE' && st.error) {
       return `<span class="ctx-kb-chip is-failed" title="${escapeHtml(st.error)}">!</span>`;
     }
@@ -3167,8 +3279,7 @@ async function _openProjectFile(name, options = {}) {
   if (!_projectDetailPid || !name) return;
   const row = _findProjectFileRow(name);
   const kind = row?.dataset?.projectFileKind || '';
-  if (options.trackIntent !== false) {
-  }
+
   _projectLibraryActiveName = name;
   _markProjectLibraryActive();
   try {
@@ -3213,7 +3324,16 @@ function _markProjectLibraryActive() {
   });
 }
 
+function _captureProjectLibraryViewerScope() {
+  const seq = _projectLibraryViewerSeq;
+  const projectId = _projectDetailPid;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  return () => seq === _projectLibraryViewerSeq && projectId === _projectDetailPid
+    && account === (typeof currentUserId === 'string' ? currentUserId : '');
+}
+
 function _prepProjectLibraryViewer(name) {
+  _projectLibraryViewerSeq += 1;
   if (_projectOfficeBlobUrl) {
     try { URL.revokeObjectURL(_projectOfficeBlobUrl); } catch (_) { /* ignore */ }
     _projectOfficeBlobUrl = null;
@@ -3242,6 +3362,7 @@ function _prepProjectLibraryViewer(name) {
 }
 
 function _clearProjectLibraryViewer() {
+  _projectLibraryViewerSeq += 1;
   if (_projectLibraryMveController) {
     try { _projectLibraryMveController.destroy(); } catch (_) { /* ignore */ }
     _projectLibraryMveController = null;
@@ -3266,10 +3387,15 @@ function _clearProjectLibraryViewer() {
 async function _showProjectTextViewer(name) {
   const els = _prepProjectLibraryViewer(name);
   if (!els || !els.bodyEl || !els.actionsEl) return;
+  const isCurrent = _captureProjectLibraryViewerScope();
   const res = await window.orkas.invoke('projects.files.readText', {
     projectId: _projectDetailPid,
     name,
+  }).catch((err) => {
+    if (isCurrent()) throw err;
+    return null;
   });
+  if (!isCurrent()) return;
   if (!res?.ok) throw new Error(res?.error || 'read_failed');
   if (typeof mountMdViewEdit !== 'function') {
     els.bodyEl.innerHTML = `<pre class="ctx-viewer-pre">${escapeHtml(res.content || '')}</pre>`;
@@ -3301,10 +3427,15 @@ async function _showProjectTextViewer(name) {
 async function _showProjectImageViewer(name) {
   const els = _prepProjectLibraryViewer(name);
   if (!els || !els.bodyEl || !els.actionsEl) return;
+  const isCurrent = _captureProjectLibraryViewerScope();
   const res = await window.orkas.invoke('projects.files.image', {
     projectId: _projectDetailPid,
     name,
+  }).catch((err) => {
+    if (isCurrent()) throw err;
+    return null;
   });
+  if (!isCurrent()) return;
   if (!res?.ok) throw new Error(res?.error || 'read_failed');
   const src = `data:${res.mediaType};base64,${res.base64}`;
   const sizeKb = res.bytes ? ` · ${Math.round(res.bytes / 1024)}KB` : '';
@@ -3321,7 +3452,9 @@ async function _showProjectImageViewer(name) {
 async function _showProjectPdfViewer(name) {
   const els = _prepProjectLibraryViewer(name);
   if (!els || !els.bodyEl || !els.actionsEl) return;
+  const isCurrent = _captureProjectLibraryViewerScope();
   const absPath = await _resolveProjectFilePath(name);
+  if (!isCurrent()) return;
   if (!absPath) throw new Error('not_found');
   const src = _projectChatMediaLocalUrl(absPath);
   els.bodyEl.innerHTML = `<iframe class="ctx-viewer-pdf" src="${src}#toolbar=1&navpanes=0" title="${escapeHtml(name)}"></iframe>`;
@@ -3331,10 +3464,15 @@ async function _showProjectPdfViewer(name) {
 async function _showProjectDocxViewer(name) {
   const els = _prepProjectLibraryViewer(name);
   if (!els || !els.bodyEl || !els.actionsEl) return;
+  const isCurrent = _captureProjectLibraryViewerScope();
   const res = await window.orkas.invoke('projects.files.docxHtml', {
     projectId: _projectDetailPid,
     name,
+  }).catch((err) => {
+    if (isCurrent()) throw err;
+    return null;
   });
+  if (!isCurrent()) return;
   if (!res?.ok) throw new Error(res?.error || 'read_failed');
   els.bodyEl.innerHTML = `<div class="ctx-viewer-docx markdown-body">${res.html || `<p class="muted">${escapeHtml(t('contexts.viewer.docx_empty'))}</p>`}</div>`;
   _renderProjectLibraryViewerActions(els.actionsEl, name);
@@ -3351,6 +3489,7 @@ function _projectOfficePreviewLoadingHtml() {
 async function _showProjectOfficeViewer(name) {
   const els = _prepProjectLibraryViewer(name);
   if (!els || !els.bodyEl || !els.actionsEl) return;
+  const isCurrent = _captureProjectLibraryViewerScope();
   els.bodyEl.setAttribute('aria-busy', 'true');
   els.bodyEl.innerHTML = _projectOfficePreviewLoadingHtml();
   els.actionsEl.innerHTML = '';
@@ -3359,6 +3498,7 @@ async function _showProjectOfficeViewer(name) {
       projectId: _projectDetailPid,
       name,
     });
+    if (!isCurrent()) return;
     if (!res?.ok) throw new Error(res?.error || 'read_failed');
     if (_projectOfficeBlobUrl) {
       try { URL.revokeObjectURL(_projectOfficeBlobUrl); } catch (_) { /* ignore */ }
@@ -3370,10 +3510,11 @@ async function _showProjectOfficeViewer(name) {
     _renderProjectLibraryViewerActions(els.actionsEl, name);
     els.bodyEl.scrollTop = 0;
   } catch (err) {
+    if (!isCurrent()) return;
     els.bodyEl.innerHTML = `<div class="ctx-viewer-msg">${escapeHtml(t('contexts.read_failed'))}</div>`;
     throw err;
   } finally {
-    els.bodyEl.removeAttribute('aria-busy');
+    if (isCurrent()) els.bodyEl.removeAttribute('aria-busy');
   }
 }
 
@@ -3430,6 +3571,10 @@ async function _revealProjectFile(name) {
 async function _reprocessProjectFile(name) {
   if (!_projectDetailPid || !name) return;
   const projectId = _projectDetailPid;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  const isAccountCurrent = () => account === (typeof currentUserId === 'string' ? currentUserId : '');
+  const isCurrent = () => projectId === _projectDetailPid && isAccountCurrent();
+
   const startedAt = performance.now();
   try {
     _projectKbStatusByName[name] = {
@@ -3442,12 +3587,14 @@ async function _reprocessProjectFile(name) {
       projectId,
       name,
     });
+    if (!isAccountCurrent()) return;
     if (!res?.ok) throw res || new Error('reprocess_failed');
   } catch (err) {
+    if (!isAccountCurrent()) return;
     const failure = _projectDetailFailure(err, 'reprocess_failed');
     _projectLogFailure('project_file_reprocess', failure);
     _projectDetailLog.warn('reprocess project file failed', err);
-    if (typeof uiAlert === 'function') uiAlert(t('project.files.reprocess_failed'));
+    if (isCurrent() && typeof uiAlert === 'function') uiAlert(t('project.files.reprocess_failed'));
   }
 }
 
@@ -3455,8 +3602,8 @@ async function _deleteProjectFile(name) {
   if (!_projectDetailPid || !name) return;
   const projectId = _projectDetailPid;
   const account = typeof currentUserId === 'string' ? currentUserId : '';
-  const isCurrent = () => projectId === _projectDetailPid
-    && account === (typeof currentUserId === 'string' ? currentUserId : '');
+  const isAccountCurrent = () => account === (typeof currentUserId === 'string' ? currentUserId : '');
+  const isCurrent = () => projectId === _projectDetailPid && isAccountCurrent();
   const row = _findProjectFileRow(name);
   const isDir = !!_findProjectDirRow(name);
   const kind = isDir ? 'dir' : (row?.dataset?.projectFileKind || '');
@@ -3466,6 +3613,7 @@ async function _deleteProjectFile(name) {
     : t('contexts.file.del_confirm', { name: _projectBasename(name) });
   if (!(await uiConfirm(prompt))) return;
   if (!isCurrent()) return;
+
   const startedAt = performance.now();
   let res;
   try {
@@ -3475,12 +3623,15 @@ async function _deleteProjectFile(name) {
     });
     if (!res?.ok) throw res || new Error('delete_failed');
   } catch (err) {
+    if (!isAccountCurrent()) return;
     const failure = _projectDetailFailure(err, 'delete_failed');
     _projectLogFailure('project_file_delete', { file_kind: kind || 'other', ...failure });
     _projectDetailLog.warn('delete project file failed', err);
-    if (typeof uiAlert === 'function') uiAlert(t('project.files.delete_failed'));
+    if (isCurrent() && typeof uiAlert === 'function') uiAlert(t('project.files.delete_failed'));
     return;
   }
+
+  if (!isAccountCurrent()) return;
   try {
     if (!isCurrent()) return;
     // The local delete is committed. Update this rail immediately and reject
@@ -3766,7 +3917,10 @@ async function _runProjectLibraryRootAction(action) {
 async function _openProjectLibraryTransfer(paths, entryPoint) {
   if (!_projectDetailPid || !window.LibraryTransfer?.open || !paths?.length) return;
   const sourceProjectId = _projectDetailPid;
+  const generation = _projectLibraryScopeGeneration;
   const owner = typeof currentUserId === 'string' ? currentUserId : '';
+  const isCurrent = () => _projectDetailPid === sourceProjectId && _projectLibraryScopeGeneration === generation
+    && (typeof currentUserId === 'string' ? currentUserId : '') === owner;
   if (!await window.LibraryTransfer.confirmUnsaved({
     paths,
     drafts: _projectLibraryDrafts,
@@ -3776,14 +3930,14 @@ async function _openProjectLibraryTransfer(paths, entryPoint) {
       _projectLibraryActiveName = name;
       await _showProjectTextViewer(name);
     },
-    isCurrent: () => _projectDetailPid === sourceProjectId
-      && (typeof currentUserId === 'string' ? currentUserId : '') === owner,
-  })) return;
+    isCurrent,
+  }) || !isCurrent()) return;
   await window.LibraryTransfer.open({
     source: { scope: 'project', projectId: sourceProjectId },
     paths,
     entryPoint,
     onComplete: async (result) => {
+      if (!isCurrent()) return;
       const successful = (result.results || []).filter((row) => row.ok);
       if (result.mode === 'move') {
         const staysInProject = result.destination?.scope === 'project'
@@ -3833,7 +3987,7 @@ async function _createProjectTextFile(parentDir = '') {
     if (parentDir) _projectLibraryExpanded.add(parentDir);
     _projectLibraryActiveName = createdName;
     if (projectId === _projectDetailPid) await loadProjectDetail(projectId);
-    if (projectId === _projectDetailPid) await _openProjectFile(createdName, { trackIntent: false });
+    if (projectId === _projectDetailPid) await _openProjectFile(createdName);
     if (_projectLibraryMveController) _projectLibraryMveController.setMode('edit');
   } catch (err) {
     _projectDetailLog.warn('open created project text failed', err);
@@ -4059,32 +4213,42 @@ function _applyProjectKbEvent(ev) {
 
 function _ensureProjectKbEventSubscription(pid) {
   if (!pid || !window.orkas || typeof window.orkas.stream !== 'function') return;
-  if (_projectKbEventsHandle && _projectKbEventsPid === pid) return;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  if (_projectKbEventsHandle && _projectKbEventsPid === pid && _projectKbEventsScope?.account === account) return;
   _stopProjectKbEventSubscription();
+  const scope = { pid, account };
+  _projectKbEventsScope = scope;
   _projectKbEventsPid = pid;
   try {
     _projectKbEventsHandle = window.orkas.stream('project.kb.events', { projectId: pid }, (msg) => {
+      if (_projectKbEventsScope !== scope || pid !== _projectDetailPid
+          || account !== (typeof currentUserId === 'string' ? currentUserId : '')) return;
       if (msg?.type === 'event' && msg.event) _applyProjectKbEvent(msg.event);
     });
     _projectKbEventsHandle.promise.catch(() => {
       /* stream closes on navigation/cancel */
     }).finally(() => {
-      if (_projectKbEventsPid === pid) {
+      if (_projectKbEventsScope === scope) {
         _projectKbEventsHandle = null;
         _projectKbEventsPid = '';
+        _projectKbEventsScope = null;
       }
     });
   } catch (err) {
     _projectDetailLog.warn('subscribe project kb events failed', err);
     _projectKbEventsHandle = null;
     _projectKbEventsPid = '';
+    _projectKbEventsScope = null;
   }
 }
 
 function _stopProjectKbEventSubscription() {
-  try { _projectKbEventsHandle?.cancel?.(); } catch { /* ignore */ }
+  const handle = _projectKbEventsHandle;
+  // Invalidate callbacks before cancellation can synchronously deliver a final event.
+  _projectKbEventsScope = null;
   _projectKbEventsHandle = null;
   _projectKbEventsPid = '';
+  try { handle?.cancel?.(); } catch { /* ignore */ }
 }
 
 function _setProjectFilesStatus(text) {
@@ -4128,6 +4292,10 @@ async function _runProjectUploadPool(items, worker, concurrency = 3) {
 async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
   if (!_projectDetailPid || !fileList || !fileList.length) return;
   const uploadProjectId = _projectDetailPid;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  const isAccountCurrent = () => account === (typeof currentUserId === 'string' ? currentUserId : '');
+  const isCurrent = () => _projectDetailPid === uploadProjectId && isAccountCurrent();
+
   const files = Array.from(fileList).filter(Boolean);
   if (!files.length) return;
   if (targetDir) _projectLibraryExpanded.add(targetDir);
@@ -4144,6 +4312,7 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
   const failed = [];
   try {
     await _runProjectUploadPool(uploadable, async (file) => {
+      if (!isAccountCurrent()) return;
       try {
         const targetName = _projectJoinPath(targetDir, file.name || 'file');
         let res = null;
@@ -4152,6 +4321,7 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
             projectId: uploadProjectId,
             targetDir,
           });
+          if (!isAccountCurrent()) return;
           if (imported && imported.ok === false) res = imported;
           else if (Array.isArray(imported && imported.files) && imported.files.length) res = imported.files[0];
         }
@@ -4162,6 +4332,7 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
             res = { ok: false, error: 'local file path unavailable' };
           } else {
             const buf = await file.arrayBuffer();
+            if (!isAccountCurrent()) return;
             res = await window.orkas.invoke('projects.files.upload', {
               projectId: uploadProjectId,
               name: targetName,
@@ -4175,8 +4346,9 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
       }
     });
   } finally {
-    _setProjectFilesStatus('');
+    if (isCurrent()) _setProjectFilesStatus('');
   }
+  if (!isAccountCurrent()) return;
   const rejectedCount = hiddenRejected.length + extRejected.length;
   const unsuccessfulCount = rejectedCount + failed.length;
   const uploadFailure = unsuccessfulCount
@@ -4194,20 +4366,20 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
       ...uploadFailure,
     });
   }
-  if (extRejected.length && typeof uiAlert === 'function') {
+  if (isCurrent() && extRejected.length && typeof uiAlert === 'function') {
     await uiAlert(t('contexts.upload_rejected', {
       list: extRejected.map((row) => row.name).join('\n'),
     }));
   }
-  if (hiddenRejected.length && typeof uiAlert === 'function') {
+  if (isCurrent() && hiddenRejected.length && typeof uiAlert === 'function') {
     await uiAlert(t('contexts.upload_hidden_rejected', {
       list: hiddenRejected.map((row) => row.name).join('\n'),
     }));
   }
-  if (failed.length && typeof uiAlert === 'function') {
+  if (isCurrent() && failed.length && typeof uiAlert === 'function') {
     await uiAlert(_projectUploadFailureMessage(failed));
   }
-  if (uploadable.length && _projectDetailPid === uploadProjectId) {
+  if (uploadable.length && isCurrent()) {
     try {
       await loadProjectDetail(uploadProjectId);
     } catch (err) {
@@ -4219,6 +4391,10 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
 async function _uploadProjectFilesNative(targetDir = '') {
   if (!_projectDetailPid) return;
   const uploadProjectId = _projectDetailPid;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  const isAccountCurrent = () => account === (typeof currentUserId === 'string' ? currentUserId : '');
+  const isCurrent = () => _projectDetailPid === uploadProjectId && isAccountCurrent();
+
   if (targetDir) _projectLibraryExpanded.add(targetDir);
   const payload = { source: 'picker', has_target_dir: !!targetDir };
   const startedAt = performance.now();
@@ -4230,19 +4406,21 @@ async function _uploadProjectFilesNative(targetDir = '') {
       targetDir,
     });
   } catch (err) {
-    _setProjectFilesStatus('');
+    if (!isAccountCurrent()) return;
+    if (isCurrent()) _setProjectFilesStatus('');
     const failure = _projectDetailFailure(err, 'picker_failed');
     _projectLogFailure('project_file_upload', { source: 'picker', ...failure });
-    if (typeof uiAlert === 'function') {
+    if (isCurrent() && typeof uiAlert === 'function') {
       await uiAlert(t('contexts.upload_picker_failed'));
     }
     return;
   }
-  _setProjectFilesStatus('');
+  if (!isAccountCurrent()) return;
+  if (isCurrent()) _setProjectFilesStatus('');
   if (!data?.ok) {
     const failure = _projectDetailFailure(data, 'picker_failed');
     _projectLogFailure('project_file_upload', { source: 'picker', ...failure });
-    if (typeof uiAlert === 'function') await uiAlert(t('contexts.upload_picker_failed'));
+    if (isCurrent() && typeof uiAlert === 'function') await uiAlert(t('contexts.upload_picker_failed'));
     return;
   }
   if (data.cancelled) {
@@ -4258,10 +4436,10 @@ async function _uploadProjectFilesNative(targetDir = '') {
       ...pickerFailure,
     });
   }
-  if (failed.length && typeof uiAlert === 'function') {
+  if (isCurrent() && failed.length && typeof uiAlert === 'function') {
     await uiAlert(_projectUploadFailureMessage(failed));
   }
-  if (_projectDetailPid === uploadProjectId) {
+  if (isCurrent()) {
     try {
       await loadProjectDetail(uploadProjectId);
     } catch (err) {
@@ -4279,6 +4457,7 @@ async function _submitProjectChat() {
   const navigationEpoch = _composerNavigationEpoch;
   const raw = submittedDraft.text().trim();
   const draftCid = _projectChatDraftCid(projectId);
+  if (typeof _chatAttachIsSending === 'function' && _chatAttachIsSending(draftCid)) return;
   const quotes = (typeof _getQuotes === 'function') ? _getQuotes(draftCid).slice() : [];
   if (_composerSendIsEmpty(raw, 'project', quotes, _chatAttachList(draftCid))) return;
   const requestText = raw || t('chat.reference_default_prompt');
@@ -4305,175 +4484,187 @@ async function _submitProjectChat() {
     if (typeof uiAlert === 'function') await uiAlert(t('chat.attach_still_uploading'));
     return;
   }
-  const attachmentSnapshot = typeof _chatAttachSnapshotForSend === 'function'
-    ? await _chatAttachSnapshotForSend(draftCid, { requireServerMatch: true })
-    : { ok: true, items: draftItems };
-  if (!attachmentSnapshot.ok) {
-    releaseAttachmentSend();
-    if (typeof uiAlert === 'function') await uiAlert(t('chat.attach_sync_failed'));
-    return;
-  }
-  draftItems = attachmentSnapshot.items;
-  intendedAttachmentCount = draftItems.length;
-  const references = (typeof _referenceSnapshotsForQuotes === 'function')
-    ? _referenceSnapshotsForQuotes(quotes)
-    : [];
-  // Keep the resource chips intact until every draft attachment has entered
-  // the new conversation. A failed adoption must leave the full composer
-  // request available for retry.
-  const useSelections = pendingUseSelections;
-  const withUse = (typeof transformWithChatUse === 'function')
-    ? transformWithChatUse(requestText)
-    : requestText;
-  const titleSeed = (typeof _titleSeedWithoutRoutingMentions === 'function')
-    ? _titleSeedWithoutRoutingMentions(raw, 'project')
-    : raw;
-  const titleText = (typeof transformChatUseTokens === 'function')
-    ? transformChatUseTokens(titleSeed)
-    : titleSeed;
-  const content = (typeof applyRecipientPrefix === 'function')
-    ? applyRecipientPrefix(withUse, 'project', { recipientSnapshot: recipient })
-    : withUse;
-  const commanderDisplay = typeof _commanderMentionDisplayForSend === 'function'
-    ? _commanderMentionDisplayForSend(withUse, recipient, 'project') : {};
-  if (btn) btn.disabled = true;
-  let convId = '';
-  let createdConversation = null;
   try {
-    const res = await apiFetch('/api/conversations/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind: 'normal', projectId }),
-    });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
-    const conv = data.conversation;
-    convId = conv.conversation_id;
-    if (titleText) {
-      // Optimistic only: the persisted title comes from the backend
-      // `autoTitle`. Without the shared helper loaded there is no width table
-      // to cut against, so show the text as typed until the backend replies.
-      conv.title = (typeof _autoTitle === 'function') ? _autoTitle(titleText) : titleText;
-    }
-    createdConversation = conv;
-  } catch (err) {
-    if (typeof uiAlert === 'function') {
-      await uiAlert(t('chat.create_conv_failed_with_reason', { reason: err?.message || err }));
-    }
-    if (btn) btn.disabled = false;
-    releaseAttachmentSend();
-    return;
-  }
+    const attachmentSnapshot = typeof _chatAttachSnapshotForSend === 'function'
+      ? await _chatAttachSnapshotForSend(draftCid, { requireServerMatch: true })
+      : { ok: true, items: draftItems };
+    if (!attachmentSnapshot.ok) {
+      releaseAttachmentSend();
 
-  // Adopt the project composer's draft attachments (e.g. a KB file added via
-  // "ask the commander about this file") into the new conversation — mirrors the
-  // new-chat draft adopt. Always call it: renderer state can be empty while a
-  // completed main-process upload is already present in the draft directory.
-  const _draftNames = draftItems
-    .filter((item) => item && item.status !== 'error')
-    .map((item) => item.name)
-    .filter(Boolean);
-  let _adopted = [];
-  let adoptionError = '';
-  try {
-    const aRes = await apiFetch('/api/conversations/attachments/adopt', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from_cid: draftCid, to_cid: convId }),
-    });
-    const aData = await aRes.json();
-    if (!aData?.ok) {
-      adoptionError = String(aData?.error || 'attachment_adopt_failed');
-    } else {
-      const adoptedItems = (Array.isArray(aData.items) ? aData.items : [])
-        .filter((item) => item?.sourceName && item?.targetName);
-      const adoptedSources = new Set(adoptedItems.map((item) => String(item.sourceName)));
-      if (_draftNames.some((name) => !adoptedSources.has(String(name)))) {
-        adoptionError = 'attachment_adopt_incomplete';
-      } else {
-        _adopted = adoptedItems.map((item) => String(item.targetName));
-      }
+      if (typeof uiAlert === 'function') await uiAlert(t('chat.attach_sync_failed'));
+      return;
     }
-  } catch (err) {
-    adoptionError = String(err?.message || err || 'attachment_adopt_failed');
-  }
-  if (adoptionError) {
+    draftItems = attachmentSnapshot.items;
+    intendedAttachmentCount = draftItems.length;
+    const references = (typeof _referenceSnapshotsForQuotes === 'function')
+      ? _referenceSnapshotsForQuotes(quotes)
+      : [];
+    // Keep the resource chips intact until every draft attachment has entered
+    // the new conversation. A failed adoption must leave the full composer
+    // request available for retry.
+    const useSelections = pendingUseSelections;
+    const withUse = (typeof transformWithChatUse === 'function')
+      ? transformWithChatUse(requestText)
+      : requestText;
+    const titleSeed = (typeof _titleSeedWithoutRoutingMentions === 'function')
+      ? _titleSeedWithoutRoutingMentions(raw, 'project')
+      : raw;
+    const titleText = (typeof transformChatUseTokens === 'function')
+      ? transformChatUseTokens(titleSeed)
+      : titleSeed;
+    const content = (typeof applyRecipientPrefix === 'function')
+      ? applyRecipientPrefix(withUse, 'project', { recipientSnapshot: recipient })
+      : withUse;
+    const commanderDisplay = typeof _commanderMentionDisplayForSend === 'function'
+      ? _commanderMentionDisplayForSend(withUse, recipient, 'project') : {};
+    if (btn) btn.disabled = true;
+    let convId = '';
+    let createdConversation = null;
     try {
-      const cleanup = await window.orkas.invoke('conversations.discardEmpty', {
-        cid: convId,
-        project_id: projectId,
+      const res = await apiFetch('/api/conversations/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'normal', projectId }),
       });
-      if (!cleanup?.discarded) {
-        _projectDetailLog.warn('discard empty project conversation rejected', {
-          error_code: 'discard_empty_rejected',
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
+      const conv = data.conversation;
+      convId = conv.conversation_id;
+      if (titleText) {
+        // Optimistic only: the persisted title comes from the backend
+        // `autoTitle`. Without the shared helper loaded there is no width table
+        // to cut against, so show the text as typed until the backend replies.
+        conv.title = (typeof _autoTitle === 'function') ? _autoTitle(titleText) : titleText;
+      }
+      createdConversation = conv;
+    } catch (err) {
+
+      if (typeof uiAlert === 'function') {
+        await uiAlert(t('chat.create_conv_failed_with_reason', { reason: err?.message || err }));
+      }
+      if (btn) btn.disabled = false;
+      releaseAttachmentSend();
+      return;
+    }
+
+    // Adopt the project composer's draft attachments (e.g. a KB file added via
+    // "ask the commander about this file") into the new conversation — mirrors the
+    // new-chat draft adopt. Always call it: renderer state can be empty while a
+    // completed main-process upload is already present in the draft directory.
+    const _draftNames = draftItems
+      .filter((item) => item && item.status !== 'error')
+      .map((item) => item.name)
+      .filter(Boolean);
+    let _adopted = [];
+    let adoptionError = '';
+    try {
+      const aRes = await apiFetch('/api/conversations/attachments/adopt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from_cid: draftCid, to_cid: convId }),
+      });
+      const aData = await aRes.json();
+      if (!aData?.ok) {
+        adoptionError = String(aData?.error || 'attachment_adopt_failed');
+      } else {
+        const adoptedItems = (Array.isArray(aData.items) ? aData.items : [])
+          .filter((item) => item?.sourceName && item?.targetName);
+        const adoptedSources = new Set(adoptedItems.map((item) => String(item.sourceName)));
+        if (_draftNames.some((name) => !adoptedSources.has(String(name)))) {
+          adoptionError = 'attachment_adopt_incomplete';
+        } else {
+          _adopted = _chatAttachOrderItems(adoptedItems, _draftNames, 'sourceName')
+            .map((item) => String(item.targetName));
+        }
+      }
+    } catch (err) {
+      adoptionError = String(err?.message || err || 'attachment_adopt_failed');
+    }
+    if (adoptionError) {
+      try {
+        const cleanup = await window.orkas.invoke('conversations.discardEmpty', {
+          cid: convId,
+          project_id: projectId,
+        });
+        if (!cleanup?.discarded) {
+          _projectDetailLog.warn('discard empty project conversation rejected', {
+            error_code: 'discard_empty_rejected',
+          });
+        }
+      } catch (_) {
+        _projectDetailLog.warn('discard empty project conversation failed', {
+          error_code: 'discard_empty_failed',
         });
       }
-    } catch (_) {
-      _projectDetailLog.warn('discard empty project conversation failed', {
-        error_code: 'discard_empty_failed',
-      });
+
+      if (typeof uiAlert === 'function') {
+        await uiAlert(t('chat.attach_sync_failed'));
+      }
+      if (btn) btn.disabled = false;
+      releaseAttachmentSend();
+      return;
     }
-    if (typeof uiAlert === 'function') {
-      await uiAlert(t('chat.attach_sync_failed'));
+    if (typeof _chatAttachClear === 'function') {
+      _chatAttachClear(draftCid);
+    }
+    releaseAttachmentSend();
+    if (createdConversation) {
+      _cacheCreatedConversation(createdConversation, createdConversation.title);
+      renderConversationList();
+      if (typeof loadProjects === 'function') loadProjects(true);
+    }
+    if (typeof consumeChatUseSelections === 'function') consumeChatUseSelections('project');
+    _consumeSubmittedQuotes(draftCid, quotes);
+
+    const ownsDraft = submittedDraft.matches();
+    const openCreated = ownsDraft && navigationEpoch === _composerNavigationEpoch;
+    if (typeof composerDiscardStoredDraft === 'function') {
+      composerDiscardStoredDraft(input, projectId, submittedDraft);
+    }
+    if (ownsDraft) {
+      composerSetText(input, '');
+      if (typeof _draftHadRecipient !== 'undefined') _draftHadRecipient.delete('project');
+    }
+    if (recipient) {
+      _recipientByCid[convId] = recipient.defaultRecipient || recipient;
+      _saveRecipientMap();
+    }
+    if (openCreated) {
+      if (currentCid) _flushDraftSave(currentCid);
+      composerBindOwner('chat-input', convId);
+      composerSetText('chat-input', '');
+      setView('conversation', convId, { skipLoad: true });
+      if (recipient) setChatRecipient('conversation', recipient.defaultRecipient || recipient);
     }
     if (btn) btn.disabled = false;
-    releaseAttachmentSend();
-    return;
-  }
-  if (typeof _chatAttachClear === 'function') {
-    _chatAttachClear(draftCid);
-  }
-  releaseAttachmentSend();
-  if (createdConversation) {
-    _cacheCreatedConversation(createdConversation, createdConversation.title);
-    renderConversationList();
-    if (typeof loadProjects === 'function') loadProjects(true);
-  }
-  if (typeof consumeChatUseSelections === 'function') consumeChatUseSelections('project');
-  _consumeSubmittedQuotes(draftCid, quotes);
-
-  const ownsDraft = submittedDraft.matches();
-  const openCreated = ownsDraft && navigationEpoch === _composerNavigationEpoch;
-  if (typeof composerDiscardStoredDraft === 'function') {
-    composerDiscardStoredDraft(input, projectId, submittedDraft);
-  }
-  if (ownsDraft) {
-    composerSetText(input, '');
-    if (typeof _draftHadRecipient !== 'undefined') _draftHadRecipient.delete('project');
-  }
-  if (recipient) {
-    _recipientByCid[convId] = recipient.defaultRecipient || recipient;
-    _saveRecipientMap();
-  }
-  if (openCreated) {
-    if (currentCid) _flushDraftSave(currentCid);
-    composerBindOwner('chat-input', convId);
-    composerSetText('chat-input', '');
-    setView('conversation', convId, { skipLoad: true });
-    if (recipient) setChatRecipient('conversation', recipient.defaultRecipient || recipient);
-  }
-  if (btn) btn.disabled = false;
-  if (typeof sendInConversation === 'function') {
-    const extra = {
-      title_text: titleText,
-      ...commanderDisplay,
-      ...(_adopted.length ? { attachments: _adopted } : {}),
-      ...(useSelections.length ? { use_selections: useSelections } : {}),
-      ...(references.length ? { references } : {}),
-    };
-    if (typeof _rememberSentComposerSnapshot === 'function') {
-      _rememberSentComposerSnapshot(convId, {
-        text: requestText,
-        recipient,
-        references: quotes,
-        attachments: _adopted.map((name) => ({ name })),
+    if (typeof sendInConversation === 'function') {
+      const extra = {
+        title_text: titleText,
+        ...commanderDisplay,
+        ...(_adopted.length ? { attachments: _adopted } : {}),
+        ...(useSelections.length ? { use_selections: useSelections } : {}),
+        ...(references.length ? { references } : {}),
+      };
+      // Stopping this first turn hands the composer state back in the new
+      // conversation, so the user can adjust the request instead of retyping it.
+      if (typeof _rememberSentComposerSnapshot === 'function') {
+        _rememberSentComposerSnapshot(convId, {
+          text: requestText,
+          recipient,
+          references: quotes,
+          attachments: _adopted.map((name) => ({ name })),
+        });
+      }
+      // Finish composer preparation in finally before waiting for the model reply.
+      return sendInConversation(convId, content, Object.keys(extra).length ? extra : undefined, {
+        restoreComposerOnFailure: true,
+        source_view: 'project',
+        content_length: requestText.length,
       });
     }
-    await sendInConversation(convId, content, Object.keys(extra).length ? extra : undefined, {
-      restoreComposerOnFailure: true,
-      source_view: 'project',
-      content_length: requestText.length,
-    });
+  } finally {
+    releaseAttachmentSend();
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -4667,11 +4858,12 @@ async function _openAddPicker() {
   setTimeout(() => searchEl.focus(), 0);
 }
 
-// ── Header actions: "⋯" menu with Rename / Delete ──────────────────────
+// ── Header actions: "⋯" menu with Invite members / Rename / Delete ─────
 
 function _projectHeaderMenuItems() {
   if (!_projectDetailPid || !_projectDetailMeta?.project) return [];
   return [
+    { label: t('project.menu.invite_members'), onClick: () => _showProjectMemberInviteGate() },
     { label: t('project.action.rename'), onClick: () => _onRenameAction() },
     { label: t('project.action.delete'), onClick: () => _onDeleteAction() },
   ];
@@ -4698,6 +4890,9 @@ function _onRenameAction() {
 async function _commitRename(newName) {
   if (!_projectDetailPid || !_projectDetailMeta || _projectRenameCommitInFlight) return;
   const projectId = _projectDetailPid;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  const isAccountCurrent = () => account === (typeof currentUserId === 'string' ? currentUserId : '');
+  const isCurrent = () => projectId === _projectDetailPid && isAccountCurrent();
   const old = _projectDetailMeta.project?.name || '';
   let trimmed = String(newName || '').trim();
   if (typeof window.limitNameDisplayText === 'function') trimmed = window.limitNameDisplayText(trimmed);
@@ -4711,43 +4906,67 @@ async function _commitRename(newName) {
   const startedAt = performance.now();
   _projectRenameCommitInFlight = true;
   try {
-    const res = await window.orkas.invoke('projects.rename', {
-      projectId, name: trimmed,
-    });
-    if (!res || !res.ok) {
-      code = (res && res.error) || 'generic';
-      failure = _projectDetailFailure(res, 'rename_failed');
-    } else {
+    let res;
+    try {
+      res = await window.orkas.invoke('projects.rename', {
+        projectId, name: trimmed,
+      });
+      if (!res || !res.ok) {
+        code = (res && res.error) || 'generic';
+        failure = _projectDetailFailure(res, 'rename_failed');
+      }
+    } catch (err) {
+      code = (err && err.message) || 'generic';
+      failure = _projectDetailFailure(err, 'rename_exception');
+    }
+    if (!isAccountCurrent()) return;
+    if (res?.ok) {
+
+      if (!isCurrent()) return;
       _projectDetailMeta.project = res.project;
-      if (typeof loadProjects === 'function') loadProjects(true);
-      _exitRenameMode();
-      _projectRenameCommitInFlight = false;
-      _renderProjectDetail();
+      // Refresh failures cannot change the already committed rename outcome.
+      try {
+        if (typeof loadProjects === 'function') {
+          Promise.resolve(loadProjects(true)).catch(() => {
+            _projectDetailLog.warn('refresh project list after rename failed');
+          });
+        }
+      } catch (_) {
+        _projectDetailLog.warn('refresh project list after rename failed');
+      }
+      try {
+        _exitRenameMode();
+        _projectRenameCommitInFlight = false;
+        _renderProjectDetail();
+      } catch (_) {
+        _projectDetailLog.warn('refresh project detail after rename failed');
+      }
       return;
     }
-  } catch (err) {
-    code = (err && err.message) || 'generic';
-    failure = _projectDetailFailure(err, 'rename_exception');
-  }
-  _projectLogFailure('project_rename', {
-    source: 'detail',
-    ...(failure || _projectDetailFailure(null, 'rename_failed')),
-  });
-  try {
-    if (code === 'name_dup') {
-      await uiAlert(t('project.name_dup_inline'));
-    } else if (code === 'name_empty') {
-      await uiAlert(t('project.name_empty'));
-    } else if (code) {
-      await uiAlert(t('project.error.generic'));
+
+    _projectLogFailure('project_rename', {
+      source: 'detail',
+      ...(failure || _projectDetailFailure(null, 'rename_failed')),
+    });
+    if (!isCurrent()) return;
+    try {
+      if (code === 'name_dup') {
+        await uiAlert(t('project.name_dup_inline'));
+      } else if (code === 'name_empty') {
+        await uiAlert(t('project.name_empty'));
+      } else if (code) {
+        await uiAlert(t('project.error.generic'));
+      }
+    } finally {
+      if (isCurrent()) {
+        // Restore before hiding the focused input so blur cannot resubmit a
+        // failed rename. A later project/account owns its own input instead.
+        const inputEl = document.getElementById('project-detail-title-input');
+        if (inputEl) inputEl.value = old;
+        _exitRenameMode();
+      }
     }
   } finally {
-    // Restoring the saved value before hiding the focused input prevents the
-    // browser's subsequent blur event from submitting the same failed rename a
-    // second time.
-    const inputEl = document.getElementById('project-detail-title-input');
-    if (inputEl) inputEl.value = old;
-    _exitRenameMode();
     _projectRenameCommitInFlight = false;
   }
 }
@@ -4810,8 +5029,10 @@ function _initProjectDetailBindings() {
   if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
     window.orkas.onPushEvent('projects:advance', _onProjectAdvance);
     window.orkas.onPushEvent('projects:tasks-changed', _onProjectTasksChanged);
+    window.orkas.onPushEvent('projects:instructions-changed', _onProjectInstructionsChanged);
   }
   window.addEventListener('i18n-change', () => {
+    _todoEditorDuePicker?.repaint?.();
   });
   document.getElementById('project-add-agent-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -4876,6 +5097,17 @@ function _initProjectDetailBindings() {
     inputEl.addEventListener('blur', () => _commitRename(inputEl.value));
   }
   window.addEventListener('i18n-change', () => {
+    if (_todoEditorPid !== null && _todoEditorStatusSelect) {
+      _todoEditorStatusSelect.setAriaLabel(t('todo.status'));
+      _todoEditorStatusSelect.setOptions(_todoEditorStatusSelect.state.options.map((option) =>
+        ({ ...option, label: t('project.todo.status_' + option.value) })));
+    }
+    if (_todoEditorPid !== null && _todoEditorProjectSelect) {
+      _todoEditorProjectSelect.setAriaLabel(t('todo.project'));
+      _todoEditorProjectSelect.setOptions(_todoEditorProjectSelect.state.options.map((option) =>
+        option.value ? option : { ...option, label: t('todo.global') }));
+    }
+
     if (currentView === 'project' && _projectDetailMeta) _renderProjectDetail();
     if (_todoEditorPid !== null && _todoEditorAgentSelect) {
       _todoEditorAgentSelect.setAriaLabel(t('project.todo.assign'));

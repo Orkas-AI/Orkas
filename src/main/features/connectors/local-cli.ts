@@ -7,6 +7,7 @@
 import { spawn } from 'node:child_process';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { app, shell } from 'electron';
 
@@ -52,6 +53,12 @@ interface LocalCliInstallRunResult {
   exitCode: number | null;
   stderr: string;
   timedOut?: boolean;
+  spawnCode?: string;
+  signal?: string;
+}
+
+function knownSystemCode(value: unknown): string | undefined {
+  return typeof value === 'string' && Object.hasOwn(os.constants.errno, value) ? value : undefined;
 }
 
 interface LocalCliInstallRunOptions {
@@ -221,6 +228,9 @@ function localCliEnv(uid: string, entry: CatalogEntry): Record<string, string> {
   fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(workDir, { recursive: true, mode: 0o700 });
   return withBackgroundNodeEnv({
+    // npm lifecycle scripts and Windows command shims invoke bare `node`.
+    // Keep their runtime aligned with the explicitly selected helper runtime.
+    PATH: [path.dirname(runtime.executable), buildSandboxEnv(undefined).PATH].join(path.delimiter),
     ORKAS_LOCAL_CLI_PROVIDER: config.provider,
     ORKAS_LOCAL_CLI_BRAND: config.brand || '',
     ORKAS_LOCAL_CLI_PACKAGE: `${config.package_name}@${config.package_version}`,
@@ -322,6 +332,12 @@ function runLocalCliProcess(options: LocalCliInstallRunOptions): Promise<LocalCl
     let stderr = '';
     let settled = false;
     let timedOut = false;
+    let terminating = false;
+    let cleanupPending = false;
+    let closed = false;
+    let closeCode: number | null = null;
+    let spawnCode: string | undefined;
+    let closeSignal: string | undefined;
     let timer: NodeJS.Timeout | undefined;
     const child = spawn(options.command, options.args, {
       cwd: options.cwd,
@@ -331,26 +347,43 @@ function runLocalCliProcess(options: LocalCliInstallRunOptions): Promise<LocalCl
       detached: process.platform !== 'win32',
     });
     const finish = (exitCode: number | null) => {
-      if (settled) return;
+      if (settled || cleanupPending) return;
       settled = true;
       clearTimeout(timer);
       options.signal?.removeEventListener('abort', abort);
-      resolve({ exitCode, stderr, timedOut });
+      resolve({ exitCode, stderr, timedOut, ...(spawnCode ? { spawnCode } : {}),
+        ...(closeSignal ? { signal: closeSignal } : {}) });
     };
     child.stderr?.on('data', (chunk) => {
       if (stderr.length < 64 * 1024) stderr += String(chunk).slice(0, 64 * 1024 - stderr.length);
     });
     child.once('error', (error) => {
+      spawnCode = knownSystemCode((error as NodeJS.ErrnoException)?.code);
       stderr = String(error && error.message ? error.message : error).slice(0, 64 * 1024);
       finish(null);
     });
-    child.once('close', (code) => finish(code));
+    child.once('close', (code, signal) => {
+      closed = true;
+      closeCode = code;
+      if (signal && Object.hasOwn(os.constants.signals, signal)) closeSignal = signal;
+      finish(code);
+    });
     const abort = () => {
+      if (settled || terminating) return;
+      terminating = true;
+      cleanupPending = true;
       clearTimeout(timer);
-      try { killProcessTree(child, 'SIGKILL'); } catch { /* child already exited */ }
-      // Prefer close so Windows releases package/config file handles before cleanup.
-      timer = setTimeout(() => finish(null), 3000);
+      // The root can close before the Windows helper finishes its descendant
+      // sweep. Keep ownership until that receipt and the child's close event.
+      // The helper has a five-second deadline; retain a bounded settlement tail.
+      timer = setTimeout(() => { cleanupPending = false; finish(null); }, 6000);
       timer.unref?.();
+      const cleanupComplete = () => {
+        cleanupPending = false;
+        if (closed) finish(closeCode);
+      };
+      try { killProcessTree(child, 'SIGKILL', { onComplete: cleanupComplete }); }
+      catch { cleanupComplete(); }
     };
     options.signal?.addEventListener('abort', abort, { once: true });
     timer = setTimeout(() => { timedOut = true; abort(); }, options.timeoutMs);
@@ -382,32 +415,41 @@ export function installLocalCli(
   const key = `${uid}\0${entry.id}`;
   const active = localCliInstallLocks.get(key);
   if (active) return active;
+  // One bounded local receipt per failed install, including coalesced callers.
+  // Never retain installer output, paths, account identity or untrusted codes.
+  let phase = 'preflight';
+  let processResult: LocalCliInstallRunResult | undefined;
   const task = (async () => {
     const before = localCliInstallStatus(uid, entry);
     if (before.installed) return before;
     if (!before.runtime_ready) throw localCliError('local_cli_runtime_missing');
 
     const runtime = resolveBackgroundNodeRuntime();
+    phase = 'proxy';
     const proxyEnv = await buildChildProxyEnvironment();
+    phase = 'cache_cleanup';
     const cwd = localCliRuntimeDir(uid, entry.id);
     // A prior interrupted or tampered npx extraction must not poison every retry. These paths are
     // fully connector-owned; credentials/config elsewhere in runtimeDir are deliberately kept.
-    try { fs.rmSync(path.join(cwd, 'npm-cache', '_npx'), { recursive: true, force: true }); }
-    catch { throw localCliError('local_cli_install_failed'); }
-    try { fs.rmSync(path.join(cwd, '.orkas-cli-integrity.json'), { force: true }); }
-    catch { throw localCliError('local_cli_install_failed'); }
+    fs.rmSync(path.join(cwd, 'npm-cache', '_npx'), { recursive: true, force: true });
+    fs.rmSync(path.join(cwd, '.orkas-cli-integrity.json'), { force: true });
+    phase = 'environment';
+    const env = buildSandboxEnv({
+      ...localCliEnv(uid, entry),
+      ...proxyEnv,
+      ORKAS_LOCAL_CLI_INSTALL_ONLY: '1',
+    });
+    phase = 'execute';
     const result = await (options.runHelper || runLocalCliProcess)({
       command: runtime.executable,
       args: [path.join(pcDirForChild(), 'bin/local-cli-auth.cjs')],
       cwd,
-      env: buildSandboxEnv({
-        ...localCliEnv(uid, entry),
-        ...proxyEnv,
-        ORKAS_LOCAL_CLI_INSTALL_ONLY: '1',
-      }),
+      env,
       timeoutMs: LOCAL_CLI_INSTALL_TIMEOUT_MS,
     });
+    processResult = result;
     if (result.timedOut || result.exitCode !== 0) throw localCliError(classifyLocalCliInstallError(result));
+    phase = 'verify';
     const after = localCliInstallStatus(uid, entry);
     if (!after.installed) throw localCliError('local_cli_install_failed');
     return after;
@@ -415,7 +457,16 @@ export function installLocalCli(
     const code = error && typeof error === 'object' && 'code' in error
       ? String((error as { code?: unknown }).code || '')
       : '';
-    throw LOCAL_CLI_INSTALL_ERROR_CODES.has(code) ? error : localCliError('local_cli_install_failed');
+    const errorCode = LOCAL_CLI_INSTALL_ERROR_CODES.has(code) ? code : 'local_cli_install_failed';
+    const systemCode = knownSystemCode(code) || knownSystemCode(processResult?.spawnCode);
+    const signal = processResult?.signal;
+    log.warn('Official CLI installation failed', {
+      provider: config.provider, phase, error_code: errorCode,
+      ...(processResult ? { exit_code: Number.isSafeInteger(processResult.exitCode) ? processResult.exitCode : null } : {}),
+      ...(systemCode ? { system_code: systemCode } : {}),
+      ...(signal && Object.hasOwn(os.constants.signals, signal) ? { signal } : {}),
+    });
+    throw LOCAL_CLI_INSTALL_ERROR_CODES.has(code) ? error : localCliError(errorCode);
   }).finally(() => {
     localCliInstallLocks.delete(key);
   });

@@ -100,10 +100,7 @@ export function loadAppsRenderer(options: { invoke: Invoke; lang?: 'zh' | 'en'; 
       item.click();
       await flush();
     },
-    async showTab(type: 'local' | 'web') {
-      document.querySelector(`[data-app-filter="${type}"]`)!.click();
-      await flush();
-    },
+
     openDialogs: () => document.querySelectorAll('.ui-dialog-overlay.open'),
     dialogText: (overlay: MiniElement) => visibleText(overlay.querySelector('.ui-dialog-message')!),
     press: (key: string) => document.press(key),

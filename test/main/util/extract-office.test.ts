@@ -66,6 +66,16 @@ describe('extract-office › xlsxBufferToMarkdown', () => {
 });
 
 describe('extract-office › xlsxBufferToHtml', () => {
+  it('renders every row of a large worksheet without exceeding the argument limit', () => {
+    const count = 150000;
+    const source = makeMinimalXlsx({ rows: Array.from({ length: count }, (_, i) => [`record-${i + 1}`]) });
+    const html = xlsxBufferToHtml(source);
+
+    expect(html.match(/<tr>/g)).toHaveLength(count);
+    expect(html).toContain('<td>record-1</td>');
+    expect(html).toContain('<td>record-150000</td>');
+  }, 15000);
+
   it('renders worksheet rows as escaped table HTML', () => {
     const html = xlsxBufferToHtml(makeMinimalXlsx({
       sheetName: 'Scores & Totals',

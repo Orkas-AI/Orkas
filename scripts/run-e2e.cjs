@@ -20,4 +20,11 @@ if (process.env.NO_COLOR !== undefined) {
   delete process.env.NO_COLOR;
 }
 
-require('playwright/lib/program').program.parse(process.argv);
+if (args.some(arg => arg === '--resume' || arg.startsWith('--checkpoint-dir') || arg.startsWith('--batch-count'))) {
+  import('./runner-checkpoint.mjs').then(({ runRunnerCheckpoint }) =>
+    runRunnerCheckpoint('e2e', args, { cwd: process.cwd(), env: process.env }))
+    .then(code => { process.exitCode = code; })
+    .catch(error => { console.error(`[run-e2e] ${error.message}`); process.exitCode = 1; });
+} else {
+  require('playwright/lib/program').program.parse(process.argv);
+}

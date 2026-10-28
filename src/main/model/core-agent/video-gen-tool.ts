@@ -17,6 +17,7 @@ import { versionedChatMediaLocalUrl } from '../../util/chat-media-url';
 import {
   beginVideoProductionGeneration,
   finishVideoProductionGeneration,
+  releaseVideoProductionGeneration,
   videoProductionControlStatePath,
   type VideoProductionGenerationTransaction,
 } from '../../features/video_production_control';
@@ -306,16 +307,27 @@ export function createVideoGenTool(opts: VideoGenToolOpts): AgentTool {
       if (result.ok === false) {
         if (productionTransaction) {
           try {
-            await finishVideoProductionGeneration({
-              statePath: productionStatePath,
-              planPath: productionPlanAbs,
-              transactionId: productionTransaction.transaction_id,
-              segmentId: productionTransaction.segment_id,
-              kind: 'video',
-              ok: false,
-              errorCode: result.errorCode,
-              ...(result.taskId ? { providerTaskId: result.taskId } : {}),
-            });
+            if (result.dispatched === false) {
+              await releaseVideoProductionGeneration({
+                statePath: productionStatePath,
+                planPath: productionPlanAbs,
+                transactionId: productionTransaction.transaction_id,
+                segmentId: productionTransaction.segment_id,
+                kind: 'video',
+                errorCode: result.errorCode,
+              });
+            } else {
+              await finishVideoProductionGeneration({
+                statePath: productionStatePath,
+                planPath: productionPlanAbs,
+                transactionId: productionTransaction.transaction_id,
+                segmentId: productionTransaction.segment_id,
+                kind: 'video',
+                ok: false,
+                errorCode: result.errorCode,
+                ...(result.taskId ? { providerTaskId: result.taskId } : {}),
+              });
+            }
           } catch (err) {
             return {
               content: `${sanitizeLogTextForUpload((err as Error).message)}; provider error=[${result.errorCode}] ${sanitizeLogTextForUpload(result.message)}`,

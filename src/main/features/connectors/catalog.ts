@@ -527,6 +527,11 @@ export function connectorCatalog(): CatalogEntry[] {
   return structuredClone(Array.from(catalogIndex().values()));
 }
 
+/** Membership checks must not clone catalog transport, policy or icon data. */
+export function isCatalogConnectorId(id: string): boolean {
+  return catalogIndex().has(id);
+}
+
 export function findCatalogEntry(id: string): CatalogEntry | null {
   const entry = catalogIndex().get(id);
   // Callers may prepare transport/policy data locally without changing future lookups.

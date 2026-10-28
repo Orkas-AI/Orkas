@@ -33,7 +33,7 @@ it.runIf(!!process.env.ORKAS_CLAUDE_MCP_CANARY_PATH)(
         if (!req.url?.startsWith('/v1/messages')) {
           res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{}'); return;
         }
-        if (++requests > 12) { fatal = 'API fixture request budget exceeded'; res.writeHead(429); res.end('{}'); return; }
+        if (++requests > 14) { fatal = 'API fixture request budget exceeded'; res.writeHead(429); res.end('{}'); return; }
         let payload: any;
         try { payload = JSON.parse(body); }
         catch { fatal = 'Malformed request to API fixture'; res.writeHead(400); res.end('{}'); return; }
@@ -60,11 +60,15 @@ it.runIf(!!process.env.ORKAS_CLAUDE_MCP_CANARY_PATH)(
         if (!issued) {
           const suffix = phase === 'list' ? 'orkas_list_skills' : 'orkas_read_skill';
           const tool = (payload.tools || []).find((t: any) => phase === 'denied'
-            ? t.name === 'Write' : t.name?.endsWith('__' + suffix));
+            ? t.name === 'Write' : phase === 'cancel-tool' ? t.name === 'Bash' : t.name?.endsWith('__' + suffix));
           if (!tool) { fatal = 'Expected tool missing from actual CLI request'; res.writeHead(400); res.end('{}'); return; }
           issued = true;
           block = { type: 'tool_use', id: toolId, name: tool.name, input: phase === 'denied'
             ? { file_path: path.join(root, 'must-not-exist.txt'), content: 'Unapproved write' }
+            : phase === 'cancel-tool' ? {
+              command: `${JSON.stringify(process.env.ORKAS_TEST_NODE || process.execPath)} ${JSON.stringify(path.join(root, 'cancel-tool.cjs'))}`,
+              timeout: 10000,
+            }
             : phase === 'list' ? {} : { id: 'compat-probe-skill' } };
           stop = 'tool_use';
         } else {
@@ -229,8 +233,32 @@ it.runIf(!!process.env.ORKAS_CLAUDE_MCP_CANARY_PATH)(
           await running;
         }
       }
+      phase = 'cancel-tool'; scenario = phase; toolId = 'call_cancel'; issued = false;
+      fs.writeFileSync(path.join(root, 'cancel-tool.cjs'), [
+        "const fs = require('node:fs'); const path = require('node:path');",
+        "fs.writeFileSync(path.join(__dirname, 'tool-started'), 'ready');",
+        "setTimeout(() => fs.writeFileSync(path.join(__dirname, 'late-effect'), 'survived'), 2000);",
+      ].join('\n'));
+      const cancelledEvents: any[] = [];
+      const cancellation = new AbortController();
+      const pending = runner.run({ uid: 'compat-user', cid: 'cancel-native-tool', agentId: 'compat-agent',
+        currentMessageId: 'trigger-cancel-native-tool', cli: 'claude', cwd: path.join(root, 'default'),
+        permissionPolicy: 'full_access', prompt: 'Run the requested foreground fixture command.',
+        customArgs: ['--setting-sources', ''], signal: cancellation.signal, onEvent: event => cancelledEvents.push(event) });
+      try {
+        await vi.waitFor(() => expect(fs.existsSync(path.join(root, 'tool-started'))).toBe(true), { timeout: 10000, interval: 20 });
+        cancellation.abort();
+        const result = await pending;
+        expect(result.status).toBe('cancelled');
+        await new Promise(resolve => setTimeout(resolve, 2200));
+        expect(fs.existsSync(path.join(root, 'late-effect'))).toBe(false);
+        expect(cancelledEvents.filter(event => event.type === 'done')).toHaveLength(1);
+        expect(cancelledEvents.at(-1)).toMatchObject({ type: 'done', status: 'cancelled' });
+      } finally { cancellation.abort(); await pending; }
+      expect(fatal).toBeUndefined();
       expect(logs.filter(l => l.level === 'warn' || l.level === 'error')).toEqual([]);
-      console.log(JSON.stringify({ version: denied.cliVersion, verifiedScenarios: observations, streamingScenarios, paidModelCalls: 0, apiFixtureRequests: requests }));
+      console.log(JSON.stringify({ version: denied.cliVersion, verifiedScenarios: observations, streamingScenarios,
+        cancellationVerified: true, paidModelCalls: 0, apiFixtureRequests: requests }));
     } finally {
       server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
       try { (await import('../../../../src/main/features/local_agents/cli_permissions'))._resetForTest(); } catch {}

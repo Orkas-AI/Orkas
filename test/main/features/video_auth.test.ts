@@ -97,16 +97,46 @@ describe('video auth profiles', () => {
       model: 'orkas-video',
       label: 'Orkas · Video',
     });
-    expect(options).toHaveLength(1);
-    expect(listVideoProviderOptions().map((option) => option.id)).toEqual(['orkas-api']);
+    expect(options).toHaveLength(4);
+    expect(listVideoProviderOptions().map((option) => option.id)).toEqual(['orkas-api', 'doubao', 'minimax', 'vidu', 'kling', 'google', 'runway']);
   });
 });
 
  it('retains legacy credentials for removal but refuses new unsupported video profiles', () => {
-    mocks.profiles = [{ id: 'legacy', provider: 'doubao', model: 'doubao-seedance-2-0-260128', apiKey: 'legacy-key', label: 'Legacy', createdAt: 1 }];
-    expect(addVideoProfile({ provider: 'doubao', model: 'doubao-seedance-2-0-260128', apiKey: 'new-key' })).toMatchObject({ ok: false });
+    mocks.profiles = [{ id: 'legacy', provider: 'legacy-provider', model: 'retired-model', apiKey: 'legacy-key', label: 'Legacy', createdAt: 1 }];
+    expect(addVideoProfile({ provider: 'legacy-provider', model: 'retired-model', apiKey: 'new-key' })).toMatchObject({ ok: false });
     expect(listVideoProfiles()).toEqual(mocks.profiles);
     expect(listVideoProfiles()).toHaveLength(1);
     expect(removeVideoProfile('legacy')).toEqual({ ok: true });
     expect(listVideoProfiles()).toEqual([]);
  });
+
+
+describe('public BYO video capability parity', () => {
+  const supported = [
+    ['doubao','doubao-seedance-2-0-260128'], ['doubao','doubao-seedance-2-0-fast-260128'],
+    ['doubao','doubao-seedance-2-0-mini'], ['minimax','MiniMax-Hailuo-2.3'],
+    ['vidu','viduq3-pro'], ['kling','kling-v3-0-turbo'],
+    ['google','veo-3.1-generate-preview'], ['runway','gen4.5'],
+  ];
+  it.each(supported)('saves a selected %s model and returns its saved identity', (provider, model) => {
+    const result = addVideoProfile({provider,model,apiKey:'fixture-user-key',label:'My video service'});
+    expect(result.ok).toBe(true);
+    expect(listVideoProfiles()).toEqual([expect.objectContaining({provider,model,label:'My video service'})]);
+  });
+  it('returns every concrete BYO choice while preserving the public API entry', () => {
+    const choices = flattenVideoProviderOptions(listVideoProviderOptions());
+    expect(choices.map(p=>[p.provider,p.model])).toEqual([
+      ['orkas-api','orkas-video'], ...supported,
+    ]);
+    expect(choices.filter(p=>p.provider==='doubao').map(p=>p.id)).toEqual([
+      'doubao:doubao-seedance-2-0-260128','doubao:doubao-seedance-2-0-fast-260128','doubao:doubao-seedance-2-0-mini',
+    ]);
+    expect(choices.some(p=>p.provider==='orkas-video')).toBe(false);
+  });
+  it('rejects a foreign provider/model pairing and missing user key before saving', () => {
+    expect(addVideoProfile({provider:'google',model:'gen4.5',apiKey:'fixture'}).ok).toBe(false);
+    expect(addVideoProfile({provider:'google',model:'veo-3.1-generate-preview',apiKey:''})).toEqual({ok:false,error:'apiKey required'});
+    expect(mocks.profiles).toEqual([]);
+  });
+});

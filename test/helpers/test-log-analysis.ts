@@ -22,6 +22,7 @@ import { afterAll, afterEach, beforeEach } from 'vitest';
 import { createModelEvalLogCollector } from '../../scripts/model-eval-log-policy.mjs';
 import { sanitizeLogTextForUpload } from '../../src/main/util/log-sanitize';
 import { TEST_LOG_META_KEY } from '../log-analysis-reporter';
+import { createStderrReceipt } from '../../scripts/test-stderr-receipt.mjs';
 
 export type TestLogLevel = 'warn' | 'error';
 export type TestLogPhase = 'case' | 'setup' | 'cleanup';
@@ -90,6 +91,7 @@ interface TapState {
   fileExpectations: { spec: ExpectedTestLog; hits: number }[];
   setup: Scope;
   cleanup?: Scope;
+  stderrReceipt?: ReturnType<typeof createStderrReceipt>;
 }
 
 const STATE_KEY = Symbol.for('orkas.test.log-analysis');
@@ -106,7 +108,7 @@ function newScope(phase: TestLogPhase, expectations: Scope['expectations']): Sco
       const message = String(line ?? '').replace(RUNTIME_PREFIX_RE, '');
       const level: TestLogLevel = finding.severity === 'error' ? 'error' : 'warn';
       const match = scope.expectations.find(({ spec }) => spec.level === level
-        && (spec.source === undefined || spec.source === source) && spec.message.test(message));
+        && (spec.source === undefined || spec.source === source) && matchesExpectedMessage(spec.message, message));
       if (match) { match.hits += 1; scope.expectedCount += 1; }
       else if (finding.severity === 'error') scope.unexpectedErrorCount += 1;
       const signature = testLogSignature(line);
@@ -121,6 +123,12 @@ function newScope(phase: TestLogPhase, expectations: Scope['expectations']): Sco
     },
   });
   return scope;
+}
+
+function matchesExpectedMessage(pattern: RegExp, message: string): boolean {
+  // Stateful declarations still match each record independently.
+  if (pattern.global || pattern.sticky) pattern.lastIndex = 0;
+  return pattern.test(message);
 }
 
 function summarize(scope: Scope): TestLogScopeSummary {
@@ -169,7 +177,11 @@ function tapState(): TapState | undefined {
 export function expectTestLog(spec: ExpectedTestLog): void {
   const state = tapState();
   if (!state) throw new Error('test log analysis is not installed');
-  const entry = { spec, hits: 0 };
+  // Own mutable match state without changing (or writing into a frozen)
+  // caller-owned RegExp. Ordinary stateless declarations retain their path.
+  const owned = spec.message.global || spec.message.sticky
+    ? { ...spec, message: new RegExp(spec.message.source, spec.message.flags) } : spec;
+  const entry = { spec: owned, hits: 0 };
   if (state.current.phase === 'case') state.current.expectations.push(entry);
   else state.fileExpectations.push(entry);
 }
@@ -212,6 +224,9 @@ function installStreamTaps(state: TapState): void {
     const original = target.write;
     target.write = function tappedWrite(this: typeof target, chunk: unknown, ...rest: unknown[]) {
       ingest(stream, chunk, rest[0]);
+      if (stream === 'stderr' && state.stderrReceipt) {
+        state.stderrReceipt.ingest(chunk, typeof rest[0] === 'string' ? rest[0] : undefined);
+      }
       return (original as (...args: unknown[]) => boolean).call(this, chunk, ...rest);
     } as typeof target.write;
   }
@@ -241,6 +256,7 @@ export function installTestLogAnalysis(): void {
     installStreamTaps(state);
   }
   const fileState = state;
+  fileState.stderrReceipt = process.env.ORKAS_TEST_BATCH_REPORT ? createStderrReceipt() : undefined;
 
   beforeEach(() => {
     fileState.current = newScope('case', []);
@@ -265,6 +281,7 @@ export function installTestLogAnalysis(): void {
     for (const phase of phases) phase.unmetExpectations = 0;
     phases[phases.length - 1].unmetExpectations = unmet;
     (suite.meta as Record<string, unknown>)[TEST_LOG_META_KEY] = phases;
+    if (fileState.stderrReceipt) (suite.meta as Record<string, unknown>).orkasStderrReceipt = fileState.stderrReceipt.finish();
     // Output after the last hook (worker teardown) has no reporting channel.
     fileState.setup = newScope('setup', []);
     fileState.cleanup = undefined;

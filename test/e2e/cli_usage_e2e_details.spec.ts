@@ -7,6 +7,20 @@ test('shows compact remaining allowance for both CLIs without starting a task', 
   const app = cliOrkas; const page = app.page!;
   const requests = path.join(app.root, 'quota-requests');
   writeFileSync(requests, '');
+  const ordinary = await app.invoke<any>('agents.create', {
+    name: 'Quota_ordinary', description: 'Ordinary agent without a CLI account',
+  });
+  expect(ordinary.ok).toBe(true);
+  const section = page.locator('#agents-detail-cli-usage-section');
+  const openOrdinary = async (label: string, language: string) => {
+    await page.evaluate(async ({ id, language }) => {
+      await (window as any).setLang(language);
+      await (window as any).openAgentDetail(id);
+    }, { id: ordinary.agent.agent_id, language });
+    await page.screenshot({ path: testInfo.outputPath(`quota-ordinary-${label}.png`) });
+    await expect(section).toBeHidden();
+  };
+  await openOrdinary('initial', 'zh');
   for (const cli of ['codex', 'claude'] as const) {
     const script = path.join(app.root, `quota-${cli}.cjs`);
     const source = `const fs = require('node:fs');
@@ -41,7 +55,6 @@ else require('node:readline').createInterface({ input: process.stdin }).on('line
     await page.evaluate(async id => {
       await (window as any).setLang('zh'); await (window as any).openAgentDetail(id);
     }, created.agent.agent_id);
-    const section = page.locator('#agents-detail-cli-usage-section');
     await expect(section).toBeVisible();
     await expect(section).toContainText(cli === 'codex' ? '83%' : '75%');
     await expect(section).toContainText('重置时间');
@@ -50,7 +63,18 @@ else require('node:readline').createInterface({ input: process.stdin }).on('line
     await expect(section).not.toContainText('同一 CLI');
     await expect(section).not.toContainText('更新于');
     await page.screenshot({ path: testInfo.outputPath(`quota-${cli}.png`) });
+    await openOrdinary(`after-${cli}`, cli === 'codex' ? 'en' : 'zh');
   }
+  await page.setViewportSize({ width: 900, height: 650 });
+  for (const cli of ['opencode', 'hermes'] as const) {
+    const created = await app.invoke<any>('agents.create', {
+      name: `Quota_${cli}`, description: 'CLI without account allowance support', runtime: { kind: 'cli', cli },
+    });
+    expect(created.ok).toBe(true);
+    await page.evaluate(async id => { await (window as any).openAgentDetail(id); }, created.agent.agent_id);
+    await expect(section).toBeHidden();
+  }
+  await openOrdinary('narrow', 'en');
   const observed = readFileSync(requests, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   expect(observed.some(r => r.method === 'account/rateLimits/read')).toBe(true);
   expect(observed.some(r => r.request?.subtype === 'get_usage')).toBe(true);

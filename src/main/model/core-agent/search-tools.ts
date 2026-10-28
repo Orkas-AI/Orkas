@@ -30,6 +30,7 @@ import { listSearchProfiles } from '../../features/search_auth';
 import { runSearchAdapter, SEARCH_PROVIDER_LABEL, SearchAccountError } from './search-adapters';
 import { createLogger } from '../../logger';
 import { logErrorSummary } from '../../util/log-redact';
+import { getSearchQueryMaxChars, validateSearchQuery } from '../../util/search-contract';
 
 // core-agent is ESM; main is CJS. Static import would yank pi-ai into the
 // CJS load graph and crash with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Same
@@ -97,6 +98,9 @@ function formatPaidResults(query: string, providerLabel: string, results: { titl
 
 export async function createWebSearchOverrideTool(context?: SearchExecutionContext): Promise<AgentTool> {
   const mod = await ca();
+  const firstProfile = listSearchProfiles()[0];
+  // Keyless search retains its existing unrestricted query contract.
+  const maxQueryChars = firstProfile ? getSearchQueryMaxChars(firstProfile.provider) : undefined;
   const runKeylessFallback = async (
     query: string,
     count: number,
@@ -140,7 +144,7 @@ export async function createWebSearchOverrideTool(context?: SearchExecutionConte
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'The search query.' },
+        query: { type: 'string', ...(maxQueryChars !== undefined ? { maxLength: maxQueryChars } : {}), description: 'The search query; length is measured in Unicode characters.' },
         count: { type: 'number', description: `Number of results to return (default: ${DEFAULT_COUNT}, max: ${MAX_COUNT}).` },
       },
       required: ['query'],
@@ -152,6 +156,13 @@ export async function createWebSearchOverrideTool(context?: SearchExecutionConte
       if (!query) return { content: 'Error: query is required', isError: true };
 
       const profiles = listSearchProfiles();
+      // A changed setting can tighten this run's advertised bound. A wider
+      // schema takes effect when the next runner constructs its tools.
+      const currentMax = profiles[0] ? getSearchQueryMaxChars(profiles[0].provider) : undefined;
+      const applicableMax = Math.min(maxQueryChars ?? Infinity, currentMax ?? Infinity);
+      try { if (Number.isFinite(applicableMax)) validateSearchQuery(query, applicableMax); } catch (error) {
+        return { content: (error as Error).message, isError: true };
+      }
       if (profiles.length) {
         const userId = getActiveUserId();
         const candidates = profiles.map(profile => ({ profile, key: searchCooldownKey(userId, profile) }));
@@ -165,6 +176,10 @@ export async function createWebSearchOverrideTool(context?: SearchExecutionConte
             continue;
           }
           paidSearchCooldowns.delete(key);
+          // Input incompatibility must not advance the fallback chain or dispatch a request.
+          try { validateSearchQuery(query, getSearchQueryMaxChars(profile.provider)); } catch (error) {
+            return { content: (error as Error).message, isError: true };
+          }
           log.info('web_search via paid API', { provider: profile.provider, query_len: query.length, count });
           try {
             const res = await runSearchAdapter(profile, query, count, context);

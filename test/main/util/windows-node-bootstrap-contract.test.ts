@@ -1,11 +1,31 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 
 import { describe, expect, it } from 'vitest';
 
 const pcRoot = process.cwd();
 
 describe('Windows no-Node startup bootstrap contract', () => {
+  it('isolates the official CLI canary from CI Node, mixed-case PATH keys and credentials', async () => {
+    const { sanitizedEnvironment, MANIFESTS } = await import('../../windows/windows-local-cli.integration.mjs');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-cli-canary-env-'));
+    const hostEnv = { SystemRoot: 'C:\\Windows', Path: 'C:\\CI\\node', PATH: 'D:\\GlobalNode',
+      path: 'E:\\OtherNode', TEST_TOKEN: 'must-not-reach-child' };
+    const original = { ...hostEnv };
+    try {
+      const env = sanitizedEnvironment(root, 'lark', MANIFESTS.lark, 'C:\\Orkas\\npm\\npx-cli.js', {
+        hostEnv, nodeExecutable: 'C:\\Orkas 空格\\node.exe',
+      });
+      expect(env.PATH.split(';')).toEqual(['C:\\Orkas 空格', 'C:\\Windows\\System32',
+        'C:\\Windows\\System32\\WindowsPowerShell\\v1.0', 'C:\\Windows']);
+      expect(Object.keys(env).filter(key => key.toUpperCase() === 'PATH')).toEqual(['PATH']);
+      expect(env.ORKAS_NODE).toBe('C:\\Orkas 空格\\node.exe');
+      expect(env.TEST_TOKEN).toBeUndefined();
+      expect(hostEnv).toEqual(original);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('routes run.cmd through the pinned bootstrap before dependency preparation', () => {
     const runCmd = fs.readFileSync(path.join(pcRoot, 'run.cmd'), 'utf8');
     const bootstrapIndex = runCmd.indexOf(

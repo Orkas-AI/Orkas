@@ -34,6 +34,7 @@ import {
 import { conversationMessageReadFile } from '../../util/project-layout';
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
+import { logErrorSummary, logPathRef, maskId } from '../../util/log-redact';
 import { t } from '../../i18n';
 
 const log = createLogger('search');
@@ -390,7 +391,9 @@ export async function searchProjectContexts(
     scored.sort((a, b) => b.score - a.score || String(a.path || '').localeCompare(String(b.path || '')));
     return scored.slice(0, _boundedSearchLimit(limit));
   } catch (err) {
-    log.warn(`project contexts search failed user=${userId} pid=${pid}: ${(err as Error).message}`);
+    log.warn('project contexts search failed', {
+      user_id: maskId(userId), project_id: maskId(pid), error: logErrorSummary(err),
+    });
     return [];
   }
 }
@@ -835,7 +838,9 @@ async function _reconcileUser(
     try { await operation(); }
     catch { failed += 1; }
   }
-  if (failed) log.warn(`reconcile user=${uid} failed=${failed}/${operations.length}`);
+  if (failed) log.warn('reconcile user failed', {
+    user_id: maskId(uid), failed, tasks: operations.length,
+  });
   return { tasks: operations.length, reused, cancelled };
 }
 
@@ -847,7 +852,10 @@ export async function reconcileActive(signal?: AbortSignal): Promise<void> {
   const t0 = Date.now();
   const uid = getActiveUserId();
   const result = await _reconcileUser(uid, true, signal);
-  log.info(`reconcileActive done in ${Date.now() - t0}ms (user=${uid}, tasks=${result.tasks}, reused=${result.reused}, cancelled=${result.cancelled})`);
+  log.info('reconcileActive done', {
+    user_id: maskId(uid), duration_ms: Date.now() - t0,
+    tasks: result.tasks, reused: result.reused, cancelled: result.cancelled,
+  });
 }
 
 /** Full all-user repair hook. Startup uses `reconcileActive`; this broader
@@ -878,7 +886,9 @@ async function _unlinkLegacyIndexes(uid: string): Promise<void> {
     try { await fsp.unlink(p); }
     catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'ENOENT') log.warn(`legacy idx unlink ${p}: ${(err as Error).message}`);
+      if (code !== 'ENOENT') log.warn('legacy idx unlink failed', {
+        path: logPathRef(p), error: logErrorSummary(err),
+      });
     }
   }
 }

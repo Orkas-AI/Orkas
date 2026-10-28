@@ -12,6 +12,7 @@ import {
   fetchGitHubRepositorySnapshot,
   identifyGitHubRepositoryResource,
   renderGitHubSnapshotView,
+  type GitHubRepositorySnapshot,
 } from "./github-repository-fetch.js";
 import {
   DEFAULT_WEB_FETCH_TIMEOUT_MS,
@@ -56,6 +57,7 @@ export function configureWebFetchRenderer(renderer: WebFetchRenderer | null): vo
 type WebFetchCacheEntry = {
   epoch: number;
   result: Promise<ToolResult>;
+  githubSnapshot?: Promise<GitHubRepositorySnapshot>;
   /** End of the furthest character range already returned for this URL. After
    * context compaction, only windows at or beyond it are served again. */
   servedThrough?: number;
@@ -842,6 +844,7 @@ export const webFetchTool: AgentTool = defineTool({
     }
     const offset = parseOffset(input.offset);
     if (typeof offset === "string") return { content: offset, isError: true };
+    if (ctx.signal?.aborted) return { content: `Fetch of ${url} was cancelled`, isError: true };
 
     const fetchCache = fetchCacheForState(ctx.state);
     const failurePolicy = failurePolicyForState(ctx.state);
@@ -875,18 +878,21 @@ export const webFetchTool: AgentTool = defineTool({
       return compactReplay ? compactCacheReplay(result, servedThrough) : serveView(cached, result);
     }
 
-    const priorGitHubSnapshot = githubResource
-      ? fetchCache.get(`github:${githubResource.key}`)
+    const priorGitHubSnapshot = githubResource?.snapshotComponent
+      ? fetchCache.get(`github:${githubResource.key}`)?.githubSnapshot
       : undefined;
-    if (githubResource && githubResource.kind !== "repository" && priorGitHubSnapshot) {
-      // A pending or failed root fetch is not successful source evidence.
-      const result = await priorGitHubSnapshot.result;
-      if (result.isError) return applyExplicitCharacterLimit(result, maxChars);
+    if (githubResource?.snapshotComponent && priorGitHubSnapshot) {
+      // Raw URLs and ref/path variants have independent identities. An exact
+      // default API alias may reuse only its own acquired component or failure.
+      const snapshot = await priorGitHubSnapshot;
+      if (ctx.signal?.aborted) return { content: `Fetch of ${url} was cancelled`, isError: true };
+      const component = snapshot.components[githubResource.snapshotComponent];
+      if (component.ok === false) return applyExplicitCharacterLimit({ content: component.error, isError: true }, maxChars);
       log.info("github repository alias cache hit; skipped network request", {
         repository: githubResource.key,
         requestedKind: githubResource.kind,
       });
-      return compactGitHubSnapshotReplay(githubResource);
+      return applyExplicitCharacterLimit(compactGitHubSnapshotReplay(githubResource), maxChars);
     }
 
     if (failurePolicy.blockedAuthOrigins.has(origin)) {
@@ -899,10 +905,13 @@ export const webFetchTool: AgentTool = defineTool({
       };
     }
 
-    const request = githubResource?.kind === "repository"
+    const snapshotRequest = githubResource?.kind === "repository"
       ? fetchGitHubRepositorySnapshot(githubResource, ctx.signal)
+      : undefined;
+    const request = snapshotRequest
+      ? snapshotRequest.then(snapshot => snapshot.result)
       : fetchGeneralUrl(url, ctx.signal);
-    const cacheEntry: WebFetchCacheEntry = { epoch, result: request };
+    const cacheEntry: WebFetchCacheEntry = { epoch, result: request, githubSnapshot: snapshotRequest };
     fetchCache.set(requestKey, cacheEntry);
     let result = await request;
     const disposition = fetchFailureDisposition(result);

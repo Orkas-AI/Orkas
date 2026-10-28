@@ -152,6 +152,7 @@ function startPolling(cid) {
     // polling request that an earlier tick already started; the cid may also
     // be stopped and re-started while that request is in flight.
     if (pollTimers.get(cid) !== timer || pollInFlight.has(cid)) return;
+    const pendingOwner = pendingConvs.get(cid);
     const requestToken = {};
     pollInFlight.set(cid, requestToken);
     try {
@@ -164,7 +165,7 @@ function startPolling(cid) {
       // flight. Never let that stale poll fall through to _onPolledResponse:
       // it would reload the whole transcript after the final bubble was
       // already painted, causing a visible "Loading…" flash on every reply.
-      if (pollTimers.get(cid) !== timer) return;
+      if (pollTimers.get(cid) !== timer || pendingConvs.get(cid) !== pendingOwner) return;
       if (!runtimeRes.ok || !runtimeData || runtimeData.ok === false) return;
       const hasServerRuntime = Object.prototype.hasOwnProperty.call(runtimeData, 'processing');
       const runtimeBusy = hasServerRuntime
@@ -182,7 +183,7 @@ function startPolling(cid) {
         : `/api/conversations/${encodeURIComponent(cid)}/history?limit=10`;
       const historyRes = await apiFetch(historyUrl);
       const data = await historyRes.json();
-      if (pollTimers.get(cid) !== timer) return;
+      if (pollTimers.get(cid) !== timer || pendingConvs.get(cid) !== pendingOwner) return;
       if (!historyRes.ok || !data || data.ok === false || !data.history) return;
       // Same visibility filter as loadConversationHistory (drops `dispatch`
       // records AND redundant routing-only commander tails) so the polled
@@ -220,8 +221,12 @@ function startPolling(cid) {
         return;
       }
 
-      // If server is no longer processing but last message is still user → request was lost
+      // A send can be admitted after the runtime read but before this history
+      // read. Its primary stream still owns the reply; an idle snapshot must
+      // not replace that live bubble with an interruption notice. Reconnected
+      // observers have no isBusy method and still use the lost-stream fallback.
       if (_isPolledUserMsg(last) && !runtimeBusy) {
+        if (pendingOwner?.controller?.isBusy?.()) return;
         stopPolling(cid);
         await _onPolledResponse(cid, t('chat.reply_interrupted'), true);
         return;
@@ -299,8 +304,8 @@ async function _onPolledResponse(cid, contentOrMessage, isError = false) {
             // Polling can finish after the user has already started reading
             // upward. Reconcile the richer persisted message without treating
             // this background refresh like a fresh conversation entry. Await
-            // the rebuild so the next queued turn cannot race its DOM reset.
-            await loadConversationHistory(cid, { preserveScroll: true });
+            // reconciliation so loaded pages remain available to the reader.
+            await loadConversationHistory(cid, { preserveScroll: true, refreshDisplay: true });
             _updateConvSendUI(cid);
           }
           return;
@@ -326,7 +331,7 @@ async function _onPolledResponse(cid, contentOrMessage, isError = false) {
       // Preserve the user's reading position across the terminal polling
       // reconcile. Users who stayed near the bottom still follow the final
       // message; users who scrolled up are no longer pulled back down.
-      await loadConversationHistory(cid, { preserveScroll: true });
+      await loadConversationHistory(cid, { preserveScroll: true, refreshDisplay: true });
       _updateConvSendUI(cid);
     }
   }

@@ -59,8 +59,7 @@ On create or when the current icon is missing, choose the closest candidate. Oth
 
 This is the Commander's dispatch signal; workflow, inputs, and Skills are not visible at dispatch time.
 
-- Default: one current-language description only. Use `<description_zh>` / `<description_en>` only when the user explicitly asks for multilingual/bilingual descriptions.
-- Follow the root Skill's routing-description contract; this field is a selection aid, not an execution manual.
+Follow the root Skill's description-language and routing-description contracts; this field is a selection aid, not an execution manual.
 
 ## `<workflow>`
 

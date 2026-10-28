@@ -53,7 +53,7 @@ for (const scope of ['global', 'project'] as const) {
     await expect(page.locator('#todo-editor-modal')).not.toHaveClass(/\bopen\b/);
     const saved = await orkas.invoke<any>('projects.tasks.list', { projectId });
     const task = saved.tasks.find((item: any) => item.content === 'Review the attached files');
-    expect(task.attachments.slice().sort()).toEqual(['dropped.txt', 'pasted.txt', 'second.md']);
+    expect(task.attachments).toEqual(['pasted.txt', 'second.md', 'dropped.txt']);
     for (const [name, body] of [
       ['pasted.txt', 'Pasted document bytes'], ['second.md', 'Second pasted document'], ['dropped.txt', 'Dropped document bytes'],
     ]) {

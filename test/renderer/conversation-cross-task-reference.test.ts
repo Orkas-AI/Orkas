@@ -265,3 +265,45 @@ describe('select all across conversation history pages', () => {
     expect(context.uiToast).not.toHaveBeenCalled();
   });
 });
+
+describe('selection toolbar actual controls', () => {
+  it('selects every history page and deselects through the rendered Select all button', async () => {
+    const context = selectionHarness();
+    const buttons = new Map<string, EventTarget>();
+    let toolbar: any = null;
+    const pane = { classList: { toggle: vi.fn() }, querySelector: () => ({
+      insertBefore: (bar: any) => { toolbar = bar; }, querySelector: () => null,
+    }) };
+    context.escapeHtml = (value: string) => value;
+    context._exitMessageSelection = vi.fn();
+    context.document = {
+      querySelector: () => pane,
+      querySelectorAll: () => [],
+      getElementById: () => toolbar,
+      createElement: () => ({
+        set innerHTML(html: string) {
+          for (const match of html.matchAll(/<button\b[^>]*\b(data-selection-[a-z]+)\b/g)) buttons.set(match[1], new EventTarget());
+        },
+        querySelector: (selector: string) => buttons.get(selector.slice(1, -1)),
+      }),
+    };
+    let resolveRead!: (response: any) => void;
+    const firstRead = new Promise(resolve => { resolveRead = resolve; });
+    context.apiFetch = vi.fn((cursor: number | null) => cursor === null ? firstRead : Promise.resolve(selectionPage(['oldest'])));
+    vm.runInContext(conversationSource.slice(
+      conversationSource.indexOf('function _syncMessageSelectionUi('),
+      conversationSource.indexOf('function _enterMessageSelection('),
+    ), context);
+    context._syncMessageSelectionUi();
+    const selectAll = buttons.get('data-selection-all');
+    expect(selectAll).toBeDefined();
+    selectAll!.dispatchEvent(new Event('click'));
+    expect(context.apiFetch).toHaveBeenCalledExactlyOnceWith(null);
+    resolveRead(selectionPage(['latest'], 10));
+    await vi.waitFor(() => expect(Array.from(context._messageSelectionState.selected)).toEqual(['oldest', 'latest']));
+    expect(context.apiFetch).toHaveBeenCalledTimes(2);
+    selectAll!.dispatchEvent(new Event('click'));
+    expect(context._messageSelectionState.selected.size).toBe(0);
+    expect(context.apiFetch).toHaveBeenCalledTimes(2);
+  });
+});

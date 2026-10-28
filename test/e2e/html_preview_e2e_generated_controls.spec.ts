@@ -4,6 +4,66 @@ import { test } from './fixtures/web-app-eval';
 import { expect } from './fixtures/orkas';
 import type { HtmlPreviewDesignEvidence } from '../../src/main/features/html_preview';
 
+test('exercises SVG diagram controls and downloads without losing native controls or disabled exclusions', async ({ sdkOrkas: orkas }, info) => {
+  const entry = orkas.createWorkspaceFile('svg-controls/index.html', `<!doctype html>
+    <style>button:focus-visible,[tabindex]:focus-visible{outline:2px solid blue}</style>
+    <button onclick="document.getElementById('detail').textContent='Native selected'">Native control</button>
+    <svg viewBox="0 0 420 180" width="420" style="max-width:100%;height:auto" aria-label="Architecture">
+      <g role="button" tabindex="0" aria-label="Diagram detail" onclick="document.getElementById('detail').textContent='Diagram selected'">
+        <rect width="120" height="40" fill="blue"/><text y="20" fill="white">Diagram</text>
+      </g>
+      <g role="tab" tabindex="0" aria-label="Unwired detail" transform="translate(140 0)">
+        <rect width="120" height="40" fill="gray"/>
+      </g>
+      <g role="button" tabindex="0" aria-label="Download diagram" transform="translate(0 60)"
+        onclick="const a=document.createElement('a');a.download='diagram.txt';a.href='data:text/plain,Diagram';a.click()">
+        <rect width="120" height="40" fill="green"/>
+      </g>
+      <g role="button" aria-disabled="true" aria-label="Disabled detail" transform="translate(140 60)"
+        onclick="console.error('Disabled control was activated')"><rect width="120" height="40"/></g>
+      <g role="button" aria-label="Hidden detail" style="display:none"
+        onclick="console.error('Hidden control was activated')"><rect width="120" height="40"/></g>
+    </svg><p id="detail">Choose a component</p>`);
+  for (const artifact of [false, true]) {
+    const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+      const preview = (process as any).mainModule.require(args.modulePath);
+      return (await (args.artifact ? preview.renderInteractiveHtmlSmoke(args.entry)
+        : preview.renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }]))).evidence;
+    }, { entry, artifact, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+    writeFileSync(info.outputPath(`svg-controls-${artifact}.json`), JSON.stringify({ ...evidence, entryPath: undefined }, null, 2));
+    expect(evidence.ok).toBe(true);
+    expect(evidence.blockers).toEqual([]);
+    expect(evidence.viewports.every(view => view.consoleErrors.length === 0)).toBe(true);
+    expect(evidence.interactions).toMatchObject({ controlsExercised: 4, stateControlsExercised: 3,
+      stateTransitionsObserved: 2, failures: [], warnings: ['enabled control produced no observable outcome: Unwired detail'] });
+    expect(evidence.interactions.downloads).toEqual([{
+      filename: 'diagram.txt', mimeType: 'text/plain', totalBytes: 7, urlKind: 'data',
+    }]);
+  }
+});
+
+for (const empty of [false, true]) {
+  test(`measures an inline resume download (${empty ? 'empty' : 'nonempty'})`, async ({ sdkOrkas: orkas }, info) => {
+    const content = empty ? '' : '简历\nProduct designer\nExperience and contact details.';
+    const entry = orkas.createWorkspaceFile('inline-resume/index.html', `<!doctype html>
+      <style>a:focus-visible{outline:2px solid blue}</style>
+      <a download="resume.txt" href="data:text/plain;charset=utf-8,${encodeURIComponent(content)}">Download resume</a>`);
+    for (const artifact of [false, true]) {
+      const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+        const preview = (process as any).mainModule.require(args.modulePath);
+        return (await (args.artifact ? preview.renderInteractiveHtmlSmoke(args.entry)
+          : preview.renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }], {},
+            { fileViewer: true }))).evidence;
+      }, { entry, artifact, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+      writeFileSync(info.outputPath(`inline-resume-${artifact}.json`), JSON.stringify({ ...evidence, entryPath: undefined }, null, 2));
+      expect(evidence.interactions.downloads).toEqual([{
+        filename: 'resume.txt', mimeType: 'text/plain', totalBytes: Buffer.byteLength(content), urlKind: 'data',
+      }]);
+      expect(evidence.ok).toBe(!empty);
+    }
+  });
+}
+
 for (const broken of [false, true]) {
   test(`fills an editor before download and retains empty-payload rejection (${broken ? 'broken' : 'working'})`, async ({ sdkOrkas: orkas }, info) => {
     const entry = orkas.createWorkspaceFile('editor/index.html', `<!doctype html>

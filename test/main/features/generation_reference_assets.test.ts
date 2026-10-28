@@ -38,6 +38,7 @@ afterEach(async () => {
   proxy._resetProxyRoutingForTests();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   await fs.rm(tmpDir, { recursive: true, force: true });
 });
 

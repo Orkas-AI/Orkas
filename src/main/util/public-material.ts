@@ -2,6 +2,40 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { createPublicKey, X509Certificate } from 'node:crypto';
 
+/** Check the complete BER/DER envelope, independently of native crypto's
+ * semantic validation (which may accept a prefix). Reads stay bounded by the
+ * existing 64 KiB file limit; indefinite constructed values have a depth cap. */
+function publicObjectEnd(bytes: Buffer, offset = 0, depth = 0): number {
+  if (depth > 64 || offset + 2 > bytes.length) return -1;
+  const tag = bytes[offset++];
+  if ((tag & 0x1f) === 0x1f) {
+    do { if (offset >= bytes.length) return -1; } while (bytes[offset++] & 0x80);
+  }
+  if (offset >= bytes.length) return -1;
+  const first = bytes[offset++];
+  if (first === 0x80) {
+    if (!(tag & 0x20)) return -1;
+    while (offset + 2 <= bytes.length) {
+      if (bytes[offset] === 0 && bytes[offset + 1] === 0) return offset + 2;
+      const end = publicObjectEnd(bytes, offset, depth + 1);
+      if (end <= offset) return -1;
+      offset = end;
+    }
+    return -1;
+  }
+  let size = first;
+  if (first & 0x80) {
+    const count = first & 0x7f;
+    if (offset + count > bytes.length) return -1;
+    size = 0;
+    for (let i = 0; i < count; i++) {
+      size = size * 256 + bytes[offset++];
+      if (size > bytes.length) return -1;
+    }
+  }
+  return offset + size <= bytes.length ? offset + size : -1;
+}
+
 /** Content proof for the shipped credential-path policy, never a general path
  * grant. Bounded reads, no cache (a template may acquire secrets after a write).
  * Comments and trailing data are deliberately not accepted as public proof. */
@@ -28,6 +62,8 @@ export function isVerifiedPublicMaterial(file: string): boolean {
     }
     const pem = /^-----BEGIN (CERTIFICATE|PUBLIC KEY|RSA PUBLIC KEY)-----\r?\n[A-Za-z0-9+/=\r\n]+\r?\n-----END \1-----$/.exec(text);
     if (pem) {
+      const bytes = Buffer.from(text.split(/\r?\n/).slice(1, -1).join(''), 'base64');
+      if (bytes[0] !== 0x30 || publicObjectEnd(bytes) !== bytes.length) return false;
       if (pem[1] === 'CERTIFICATE') new X509Certificate(text);
       else createPublicKey(text);
       return true;

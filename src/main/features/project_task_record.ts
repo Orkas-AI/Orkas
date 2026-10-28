@@ -7,6 +7,17 @@ import type { ProjectTask, TaskStatus } from './project_tasks';
 export const TASK_STATUSES: readonly TaskStatus[] = ['todo', 'progress', 'review', 'done'];
 const TASK_ID_RE = /^t_[a-f0-9]{12}$/;
 
+/** Reorder only validated members; an order hint cannot add or remove a file. */
+export function orderTaskAttachments(available: string[], preferred?: string[]): string[] {
+  const remaining = new Set(available);
+  const ordered: string[] = [];
+  for (const name of Array.isArray(preferred) ? preferred : []) {
+    if (!remaining.delete(name)) continue;
+    ordered.push(name);
+  }
+  return ordered.concat([...remaining]);
+}
+
 /** Commander is a reserved actor, including legacy name-only task records.
  * A stable id takes precedence over the display name. */
 export function isCommanderTaskOwner(owner: { owner_agent_id?: string; owner_agent?: string }): boolean {
@@ -23,6 +34,18 @@ export function clampStr(v: unknown, max: number): string | undefined {
 
 /** Coerce a persisted (possibly hand-edited / synced / older-shape) record into
  *  a valid ProjectTask, or null if unusable. Never throws on bad input. */
+/** A due date is a local calendar day, `YYYY-MM-DD`, never a time: the user
+ *  asks for "by Friday", and every device reads the same day. */
+const DUE_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+export function isDueDate(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = DUE_DATE_RE.exec(value);
+  if (!match) return false;
+  const [year, month, day] = match.slice(1).map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
 export function normaliseTask(raw: any): ProjectTask | null {
   if (!raw || typeof raw !== 'object') return null;
   const id = typeof raw.id === 'string' ? raw.id : '';
@@ -61,6 +84,7 @@ export function normaliseTask(raw: any): ProjectTask | null {
     if (names.length) t.attachments = names;
   }
   if (status === 'done' && typeof raw.done_at === 'string' && raw.done_at) t.done_at = raw.done_at;
+  if (isDueDate(raw.due_at)) t.due_at = raw.due_at;
   return t;
 }
 

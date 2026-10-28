@@ -110,7 +110,8 @@ describe('local project binding continuity', () => {
       await reached;
       expect(fs.existsSync(target)).toBe(false);
       expect(await invoke('projects.bindings.list', { projectId: pid })).toMatchObject({
-        ok: true, bindings: { agents: [aid] }, agentDetails: [],
+        ok: true, bindings: { agents: [aid] },
+        agentDetails: [{ agent_id: aid, name: '', enabled: false, unavailable: true }],
       });
       expect(fs.readFileSync(bindingsFile, 'utf8')).toBe(before);
     } finally {
@@ -179,7 +180,8 @@ describe('local project binding continuity', () => {
     fs.unlinkSync(definition);
     agents.clearAgentListCache();
     expect(await invoke('projects.bindings.list', { projectId: pid })).toMatchObject({
-      ok: true, bindings: { agents: [aid] }, agentDetails: [],
+      ok: true, bindings: { agents: [aid] },
+        agentDetails: [{ agent_id: aid, name: '', enabled: false, unavailable: true }],
     });
     expect(await invoke('projects.bindings.remove', { projectId: pid, kind: 'agent', id: aid }))
       .toMatchObject({ ok: true, bindings: { agents: [] } });
@@ -190,5 +192,24 @@ describe('local project binding continuity', () => {
       .toMatchObject({ ok: true, bindings: { agents: [] }, agentDetails: [] });
     expect((await projects.getBindings('member', pid)).agents).toEqual([]);
   });
-});
 
+  it('marks a deleted custom Agent unavailable until the user removes it', async () => {
+    const { agents, projects, pid, aid } = await fixture();
+    const created = await agents.createCustomAgent({ name: 'Deleted-later', description: 'desc' });
+    if (!created) throw new Error('fixture Agent creation failed');
+    const id = created.agent_id;
+    expect((await projects.addAgentBinding('member', pid, id)).ok).toBe(true);
+    expect(await agents.deleteCustomAgent(id)).toBe(true);
+    const listed = await invoke('projects.bindings.list', { projectId: pid });
+    expect(listed.ok).toBe(true);
+    expect(listed.bindings.agents.sort()).toEqual([aid, id].sort());
+    // An ordinary project carries no sharing metadata on the placeholder.
+    expect(listed.agentDetails.find((agent: any) => agent.agent_id === id))
+      .toEqual({ agent_id: id, name: '', enabled: false, unavailable: true });
+    expect(listed.agentDetails.find((agent: any) => agent.agent_id === aid)).toMatchObject({ name: 'Bound' });
+    expect(await invoke('projects.bindings.remove', { projectId: pid, kind: 'agent', id }))
+      .toMatchObject({ ok: true, bindings: { agents: [aid] } });
+    expect((await invoke('projects.bindings.list', { projectId: pid })).agentDetails
+      .map((agent: any) => agent.agent_id)).toEqual([aid]);
+  });
+});

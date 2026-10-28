@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -79,6 +79,81 @@ function runPkg(...args: string[]) {
   return runPkgWithEnv({}, ...args);
 }
 
+/** Pause a real CLI at a filesystem boundary; only the schedule is injected. */
+function scheduledPkg(hook: string, ...args: string[]) {
+  const id = fs.mkdtempSync(path.join(tmpDir, 'schedule-'));
+  const ready = path.join(id, 'ready');
+  const gate = path.join(id, 'gate');
+  const preload = path.join(id, 'preload.cjs');
+  fs.writeFileSync(preload, `
+    const fs = require('node:fs');
+    const lockPath = ${JSON.stringify(path.join(pkgsDir(), '_registry.lock'))};
+    const pause = () => {
+      fs.writeFileSync(${JSON.stringify(ready)}, 'ready');
+      const until = Date.now() + 10000;
+      const signal = new Int32Array(new SharedArrayBuffer(4));
+      while (!fs.existsSync(${JSON.stringify(gate)})) {
+        if (Date.now() > until) throw new Error('test schedule timed out');
+        Atomics.wait(signal, 0, 0, 5);
+      }
+    };
+    ${hook}
+  `);
+  const child = spawn(TEST_NODE, ['--require', preload, path.join(process.cwd(), 'bin', 'orkas-pkg.cjs'), ...args], {
+    cwd: process.cwd(), windowsHide: true,
+    env: { ...process.env, ORKAS_WORKSPACE_ROOT: wsRoot, ORKAS_UID: TEST_UID },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '', stderr = '';
+  child.stdout.on('data', data => { stdout += data; });
+  child.stderr.on('data', data => { stderr += data; });
+  const done = new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', status => resolve({ status, stdout, stderr }));
+  }).then(result => {
+    // Account for the non-result stream as well as the JSON asserted below.
+    if (result.status === 0) expect(result.stderr).toBe('');
+    else expect(result.stdout).toBe('');
+    if (result.status === null) expect(result.stderr).toBe('');
+    return result;
+  });
+  return { child, done, release: () => fs.writeFileSync(gate, 'go'),
+    async pausedOrExited() {
+      const until = Date.now() + 5000;
+      while (!fs.existsSync(ready) && child.exitCode === null) {
+        if (Date.now() > until) throw new Error('CLI did not reach scheduled boundary');
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      return fs.existsSync(ready);
+    },
+  };
+}
+
+const PAUSE_AFTER_OWNER_READ = `
+  const read = fs.readFileSync;
+  let armed = true;
+  fs.readFileSync = function(file, ...args) {
+    const value = read.call(this, file, ...args);
+    if (armed && String(file) === lockPath) { armed = false; pause(); }
+    return value;
+  };
+`;
+
+const PAUSE_AFTER_OWNER_WRITE = `
+  const open = fs.openSync, write = fs.writeSync;
+  let lockFd, armed = true;
+  fs.openSync = function(file, ...args) {
+    const fd = open.call(this, file, ...args);
+    if (String(file) === lockPath) lockFd = fd;
+    return fd;
+  };
+  fs.writeSync = function(fd, ...args) {
+    const count = write.call(this, fd, ...args);
+    if (armed && fd === lockFd) { armed = false; pause(); }
+    return count;
+  };
+`;
+
 function runPkgInput(input: string, ...args: string[]) {
   const pcRoot = process.cwd();
   const r = spawnSync(TEST_NODE, [path.join(pcRoot, 'bin', 'orkas-pkg.cjs'), ...args], {
@@ -135,6 +210,152 @@ describe('orkas-pkg.cjs source invariants', () => {
 });
 
 describe('orkas-pkg.cjs registry lock recovery', () => {
+  it('backs off before creating a shared lock when both contenders have announced', async () => {
+    const hook = `
+      const readdir = fs.readdirSync;
+      let armed = true;
+      fs.readdirSync = function(dir, ...args) {
+        if (armed && String(dir).endsWith('.registry-lock-claims')) { armed = false; pause(); }
+        return readdir.call(this, dir, ...args);
+      };
+    `;
+    const first = scheduledPkg(hook, 'remove', 'missing');
+    let second: ReturnType<typeof scheduledPkg> | undefined;
+    try {
+      expect(await first.pausedOrExited()).toBe(true);
+      second = scheduledPkg(hook, 'remove', 'missing');
+      expect(await second.pausedOrExited()).toBe(true);
+      first.release();
+      const rejected = await first.done;
+      expect(rejected.status).toBe(75);
+      expect(JSON.parse(rejected.stderr).error).toMatch(/operation is in progress/);
+      expect(fs.existsSync(path.join(pkgsDir(), '_registry.lock'))).toBe(false);
+      second.release();
+      const accepted = await second.done;
+      expect(accepted.status).toBe(66);
+      expect(JSON.parse(accepted.stderr).error).toMatch(/is not installed/);
+      expect(fs.readdirSync(path.join(pkgsDir(), '.registry-lock-claims'))).toEqual([]);
+    } finally { first.release(); second?.release(); await first.done; if (second) await second.done; }
+  });
+
+  it('does not let two reclaimers enter package mutations together', async () => {
+    fs.mkdirSync(pkgsDir(), { recursive: true });
+    const exited = spawnSync(TEST_NODE, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+    expect(exited.status).toBe(0);
+    fs.writeFileSync(path.join(pkgsDir(), '_registry.lock'), exited.stdout);
+    for (const name of ['first', 'second']) fs.mkdirSync(path.join(pkgsDir(), name));
+    fs.writeFileSync(path.join(pkgsDir(), '_registry.json'), JSON.stringify({ version: 1,
+      packages: ['first', 'second'].map(name => ({ name, kind: 'skill', skill_roots: [], bin_entries: [] })),
+    }));
+    const first = scheduledPkg(PAUSE_AFTER_OWNER_READ, 'remove', 'first');
+    let second: ReturnType<typeof scheduledPkg> | undefined;
+    try {
+      expect(await first.pausedOrExited()).toBe(true);
+      second = scheduledPkg(PAUSE_AFTER_OWNER_WRITE, 'remove', 'second');
+      const secondOwnsLock = await second.pausedOrExited();
+      first.release();
+      const a = await first.done;
+      // Either contender may win, but the other cannot mutate while it owns the lock.
+      if (secondOwnsLock) {
+        expect(a.status).toBe(75);
+        expect(fs.readFileSync(path.join(pkgsDir(), '_registry.lock'), 'utf8')).toBe(String(second.child.pid));
+      }
+      second.release();
+      const b = await second.done;
+      expect([a.status, b.status].sort()).toEqual([0, 75]);
+      const winner = a.status === 0 ? 'first' : 'second';
+      const loser = a.status === 0 ? 'second' : 'first';
+      expect(JSON.parse((a.status === 0 ? a : b).stdout)).toMatchObject({ ok: true, action: 'remove', name: winner });
+      expect(JSON.parse((a.status === 75 ? a : b).stderr)).toMatchObject({ ok: false, error: expect.stringMatching(/operation is in progress/) });
+      expect(readRegistry().packages.map((p: { name: string }) => p.name)).toEqual([loser]);
+      expect(fs.existsSync(path.join(pkgsDir(), loser))).toBe(true);
+      expect(fs.existsSync(path.join(pkgsDir(), winner))).toBe(false);
+      expect(fs.existsSync(path.join(pkgsDir(), '_registry.lock'))).toBe(false);
+      expect(fs.readdirSync(path.join(pkgsDir(), '.registry-lock-claims'))).toEqual([]);
+    } finally {
+      first.release(); second?.release();
+      await first.done; if (second) await second.done;
+    }
+  });
+
+  it.each(['replace', 'overwrite'] as const)('leaves a foreign lock intact on process.exit (%s)', async mode => {
+    fs.mkdirSync(pkgsDir(), { recursive: true });
+    const lockPath = path.join(pkgsDir(), '_registry.lock');
+    const operation = scheduledPkg(`
+      const exit = process.exit;
+      process.exit = function(code) {
+        ${mode === 'replace' ? 'fs.unlinkSync(lockPath);' : ''}
+        fs.writeFileSync(lockPath, ${JSON.stringify(String(process.pid))});
+        return exit.call(this, code);
+      };
+    `, 'remove', 'missing');
+    const result = await operation.done;
+    expect(result.status).toBe(66);
+    expect(JSON.parse(result.stderr).error).toMatch(/is not installed/);
+    expect(fs.readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+    expect(fs.readdirSync(path.join(pkgsDir(), '.registry-lock-claims'))).toEqual([]);
+  });
+
+  it('recovers after a holder is killed without leaving another permanent recovery lock', async () => {
+    const holder = scheduledPkg(PAUSE_AFTER_OWNER_WRITE, 'remove', 'missing');
+    try {
+      expect(await holder.pausedOrExited()).toBe(true);
+      expect(runPkg('remove', 'missing').status).toBe(75);
+      // The same machine can operate another account without sharing its lock.
+      const otherUser = spawnSync(TEST_NODE, [path.join(process.cwd(), 'bin', 'orkas-pkg.cjs'), 'remove', 'missing'], {
+        encoding: 'utf8', timeout: 5000, windowsHide: true,
+        env: { ...process.env, ORKAS_WORKSPACE_ROOT: wsRoot, ORKAS_UID: 'u2' },
+      });
+      expect(otherUser.status).toBe(66);
+      expect(JSON.parse(otherUser.stderr).error).toMatch(/is not installed/);
+      expect(fs.readFileSync(path.join(pkgsDir(), '_registry.lock'), 'utf8')).toBe(String(holder.child.pid));
+      holder.child.kill('SIGKILL');
+      await holder.done;
+      const recovered = runPkg('remove', 'missing');
+      expect(recovered.status).toBe(66);
+      expect(recovered.json.error).toMatch(/is not installed/);
+      expect(fs.existsSync(path.join(pkgsDir(), '_registry.lock'))).toBe(false);
+      expect(fs.readdirSync(path.join(pkgsDir(), '.registry-lock-claims'))).toEqual([]);
+    } finally { holder.release(); if (holder.child.exitCode === null) holder.child.kill(); await holder.done; }
+  });
+
+  it('cleans its intent after an acquisition exception so a subsequent operation can proceed', async () => {
+    const operation = scheduledPkg(`
+      const readdir = fs.readdirSync;
+      fs.readdirSync = function(dir, ...args) {
+        if (String(dir).endsWith('.registry-lock-claims')) throw Object.assign(new Error('fixture access denied'), { code: 'EACCES' });
+        return readdir.call(this, dir, ...args);
+      };
+    `, 'remove', 'missing');
+    const failed = await operation.done;
+    expect(failed.status).toBe(1);
+    expect(JSON.parse(failed.stderr)).toMatchObject({ ok: false, error: 'fixture access denied' });
+    expect(fs.existsSync(path.join(pkgsDir(), '_registry.lock'))).toBe(false);
+    expect(fs.readdirSync(path.join(pkgsDir(), '.registry-lock-claims'))).toEqual([]);
+    const recovered = runPkg('remove', 'missing');
+    expect(recovered.status).toBe(66);
+    expect(recovered.json.error).toMatch(/is not installed/);
+  });
+
+  it('preserves an intent whose process liveness cannot be queried', async () => {
+    const claimsDir = path.join(pkgsDir(), '.registry-lock-claims');
+    fs.mkdirSync(claimsDir, { recursive: true });
+    const foreignClaim = `${process.pid}-${'a'.repeat(32)}`;
+    fs.writeFileSync(path.join(claimsDir, foreignClaim), '');
+    const operation = scheduledPkg(`
+      const kill = process.kill;
+      process.kill = function(pid, signal) {
+        if (pid === ${process.pid}) throw Object.assign(new Error('fixture permission denied'), { code: 'EPERM' });
+        return kill.call(this, pid, signal);
+      };
+    `, 'remove', 'missing');
+    const rejected = await operation.done;
+    expect(rejected.status).toBe(75);
+    expect(JSON.parse(rejected.stderr).error).toMatch(/operation is in progress/);
+    expect(fs.readdirSync(claimsDir)).toEqual([foreignClaim]);
+    expect(fs.existsSync(path.join(pkgsDir(), '_registry.lock'))).toBe(false);
+  });
+
   it('reclaims a recent lock left by an abruptly terminated package process', () => {
     const exited = spawnSync(TEST_NODE, ['-e', 'process.stdout.write(String(process.pid))'], {
       encoding: 'utf8',

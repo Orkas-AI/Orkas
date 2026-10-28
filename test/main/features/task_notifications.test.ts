@@ -2,8 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../../src/main/i18n', () => ({
   // Default to a stale English process locale. Production must pass the
-  // event user's current persisted locale explicitly.
-  t: (key: string, _vars?: Record<string, string | number>, lang = 'en') => `${lang}:${key}`,
+  // event user's current persisted locale explicitly. A count rides the key
+  // so counted copy is distinguishable from the single form.
+  t: (key: string, vars?: Record<string, string | number>, lang = 'en') =>
+    `${lang}:${key}${vars?.count !== undefined ? `:${vars.count}` : ''}`,
 }));
 
 vi.mock('../../../src/main/logger', () => ({
@@ -30,7 +32,7 @@ function terminal(status: TaskTerminalEvent['status']): TaskTerminalEvent {
     run_id: 'run-1',
     user_id: 'u1',
     conversation_id: 'c1',
-    entry_point: 'conversation',
+    kind: 'task',
     status,
     started_at_ms: 10,
     finished_at_ms: 20,
@@ -122,6 +124,66 @@ describe('task completion notifications', () => {
     clickListener!();
     expect(setBadgeCount).toHaveBeenLastCalledWith(0);
     expect(openConversation).toHaveBeenCalledWith('c1', status, 'u1');
+  });
+
+  it('names an automation run by kind so it is not mistaken for a chat task', () => {
+    listener({ ...terminal('failed'), kind: 'automation' });
+
+    expect(createNotification).toHaveBeenCalledWith({
+      title: 'zh:notification.automation.failed.title',
+      body: 'zh:notification.task.failed.body',
+    });
+    clickListener!();
+    expect(openConversation).toHaveBeenCalledWith('c1', 'failed', 'u1');
+  });
+
+  it('collapses unread events of one kind and status into one counted notification that opens the latest', () => {
+    const handles: Array<{ close: ReturnType<typeof vi.fn>; onClose: ((reason?: string) => void) | null; onClick: (() => void) | null }> = [];
+    createNotification.mockImplementation(() => {
+      const handle = { close: vi.fn(), onClose: null as ((reason?: string) => void) | null, onClick: null as (() => void) | null };
+      handles.push(handle);
+      return {
+        onClick: (next: () => void) => { handle.onClick = next; },
+        onClose: (next: (reason?: string) => void) => { handle.onClose = next; },
+        onFailed: () => {},
+        show: showNotification,
+        close: handle.close,
+      };
+    });
+
+    listener({ ...terminal('failed'), kind: 'automation', conversation_id: 'c-first' });
+    listener({ ...terminal('failed'), kind: 'automation', conversation_id: 'c-second', run_id: 'run-2' });
+    // A different status of the same kind stays its own notification.
+    listener({ ...terminal('completed'), kind: 'automation', conversation_id: 'c-third', run_id: 'run-3' });
+
+    expect(createNotification.mock.calls.map(([options]) => options.title)).toEqual([
+      'zh:notification.automation.failed.title',
+      'zh:notification.automation.failed.title_many:2',
+      'zh:notification.automation.completed.title',
+    ]);
+    // The counted notification replaced the one it absorbed; every event still
+    // counts toward the badge.
+    expect(handles[0].close).toHaveBeenCalledOnce();
+    expect(handles[1].close).not.toHaveBeenCalled();
+    expect(setBadgeCount).toHaveBeenLastCalledWith(3);
+    handles[1].onClick!();
+    expect(openConversation).toHaveBeenCalledWith('c-second', 'failed', 'u1');
+    // Reading clears every group: the next failure is a single one again.
+    expect(setBadgeCount).toHaveBeenLastCalledWith(0);
+    listener({ ...terminal('failed'), kind: 'automation', conversation_id: 'c-fourth', run_id: 'run-4' });
+    expect(createNotification.mock.calls.at(-1)![0].title).toBe('zh:notification.automation.failed.title');
+
+    // A toast the user dismissed starts a fresh count; one that merely timed
+    // out of the screen keeps counting, since it was never acted on.
+    handles.at(-1)!.onClose!();
+    listener({ ...terminal('failed'), kind: 'automation', conversation_id: 'c-fifth', run_id: 'run-5' });
+    expect(createNotification.mock.calls.at(-1)![0].title).toBe('zh:notification.automation.failed.title');
+    handles.at(-1)!.onClose!('timedOut');
+    listener({ ...terminal('failed'), kind: 'automation', conversation_id: 'c-sixth', run_id: 'run-6' });
+    expect(createNotification.mock.calls.at(-1)![0].title).toBe('zh:notification.automation.failed.title_many:2');
+    // Chat tasks and automation runs never share a count.
+    listener({ ...terminal('failed'), conversation_id: 'c-chat', run_id: 'run-7' });
+    expect(createNotification.mock.calls.at(-1)![0].title).toBe('zh:notification.task.failed.title');
   });
 
   it.each(['sensitive_operation', 'interactive_cli_input'] as const)('uses background notification and waiting-input navigation for %s', kind => {

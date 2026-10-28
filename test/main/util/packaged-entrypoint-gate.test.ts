@@ -113,6 +113,10 @@ describe('packaged-entrypoint-gate', () => {
     expect(gate.BUILD_ONLY_BIN_FILES).toContain('packaged-entrypoint-gate.cjs');
     expect(gate.BUILD_ONLY_BIN_FILES).toContain('packaged-dependency-gate.cjs');
     expect(gate.PACKAGED_BIN_HELPERS).toContain('auto-tasks-contract.cjs');
+    expect(gate.PACKAGED_BIN_HELPERS).toContain('project-instructions-contract.cjs');
+    expect(gate.PACKAGED_BIN_ENTRYPOINTS).not.toContain('project-instructions-contract.cjs');
+    expect(gate.BUILD_ONLY_BIN_FILES).toContain('project-instructions-contract.d.cts');
+    expect(gate.PACKAGED_BIN_HELPERS).not.toContain('project-instructions-contract.d.cts');
     expect(gate.PACKAGED_BIN_HELPERS).toContain('bridge-skill-runner.cjs');
     expect(gate.PACKAGED_BIN_HELPERS).toContain('local-cli-lark.cjs');
     expect(gate.PACKAGED_BIN_HELPERS).toContain('proxy-bootstrap.cjs');
@@ -120,11 +124,11 @@ describe('packaged-entrypoint-gate', () => {
     expect(gate.PACKAGED_BIN_ENTRYPOINTS).not.toContain('shopify-setup-requirements.cjs');
   });
 
-  it('loads the bridge SDK closure outside the source tree and rejects a missing nested validator', () => {
+  it('loads the bridge SDK closure outside the source tree and rejects a missing shared validator', () => {
     const root = packagedRuntimeFixture();
     fs.copyFileSync(path.join(process.cwd(), 'package-lock.json'), path.join(root, 'package-lock.json'));
     expect(() => gate.verifyBridgeSdkRuntime(root)).not.toThrow();
-    fs.rmSync(path.join(root, 'node_modules', '@modelcontextprotocol', 'server', 'node_modules', 'zod'), { recursive: true });
+    fs.rmSync(path.join(root, 'node_modules', 'zod'), { recursive: true });
     const child = spawnSync(process.env.ORKAS_TEST_NODE || process.execPath, ['-e',
       `require(${JSON.stringify(path.join(process.cwd(), 'bin', 'packaged-entrypoint-gate.cjs'))}).verifyBridgeSdkRuntime(${JSON.stringify(root)})`,
     ], { encoding: 'utf8', timeout: 10000 });
@@ -145,14 +149,16 @@ describe('packaged-entrypoint-gate', () => {
       .toThrow(/invalid runtime helper.*browser-tool-contract\.cjs/);
   });
 
-  it('rejects a build-only helper that is not excluded from the app', () => {
-    const packageJson = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
-    packageJson.build.files = packageJson.build.files.filter(
-      (entry: string) => entry !== '!bin/runtime-gate.cjs',
-    );
+  it.each(['runtime-gate.cjs', 'project-instructions-contract.d.cts'])(
+    'rejects build-only %s that is not excluded from the app', (name) => {
+      const packageJson = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
+      packageJson.build.files = packageJson.build.files.filter(
+        (entry: string) => entry !== `!bin/${name}`,
+      );
 
-    expect(() => gate.verifyBuildFilesConfig(packageJson.build)).toThrow(/runtime-gate\.cjs/);
-  });
+      expect(() => gate.verifyBuildFilesConfig(packageJson.build)).toThrow(name);
+    },
+  );
 
   it.each(['files', 'asarUnpack'] as const)(
     'rejects every MCP runtime glob omitted from build.%s',
@@ -234,7 +240,7 @@ describe('packaged-entrypoint-gate', () => {
       .toThrow(/missing esbuild loader lib\/main\.js/);
   });
 
-  it.each(['skill-esm-loader.cjs', 'browser-tool-contract.cjs', 'connector-discovery-contract.cjs', 'ebay-signature.cjs', 'temu-api-contracts.cjs', 'shein-api-contracts.cjs', 'lazada-api-contracts.cjs', 'amazon-business-api.cjs', 'amazon-api-contracts.cjs', 'square-business-api.cjs', 'square-api-contracts.cjs', 'ebay-business-api.cjs', 'ebay-api-contracts.cjs', 'etsy-business-api.cjs', 'etsy-api-contracts.cjs', 'bigcommerce-business-api.cjs', 'bigcommerce-api-contracts.cjs', 'woocommerce-business-api.cjs', 'woocommerce-api-contracts.cjs', 'commercelayer-business-api.cjs', 'commercelayer-api-contracts.cjs', 'constant-contact-business-api.cjs', 'constant-contact-api-contracts.cjs', 'shopify-business-api.cjs', 'shopify-api-contracts.cjs', 'shopline-business-api.cjs', 'shopline-api-contracts.cjs', 'shoplazza-business-api.cjs', 'shoplazza-api-contracts.cjs', 'reloadly-business-api.cjs', 'reloadly-api-contracts.cjs', 'lightspeed-business-api.cjs', 'lightspeed-api-contracts.cjs', 'shopline-graphql-api.cjs', 'shopline-graphql-contracts.cjs', 'base-shop-business-api.cjs', 'base-shop-api-contracts.cjs', 'walmart-business-api.cjs', 'walmart-api-contracts.cjs', 'qoo10-business-api.cjs', 'qoo10-api-contracts.cjs', 'futureshop-business-api.cjs', 'futureshop-api-contracts.cjs', 'shopee-business-api.cjs', 'shopee-api-contracts.cjs', 'tiktok-shop-business-api.cjs', 'tiktok-shop-api-contracts.cjs', 'yahoo-shopping-business-api.cjs', 'yahoo-shopping-api-contracts.cjs', 'douyin-business-api.cjs', 'douyin-api-contracts.cjs', 'aliexpress-business-api.cjs', 'aliexpress-api-contracts.cjs', 'mercado-libre-business-api.cjs', 'mercado-libre-api-contracts.cjs', 'kuaishou-business-api.cjs', 'kuaishou-api-contracts.cjs', 'alibaba-1688-business-api.cjs', 'alibaba-1688-api-contracts.cjs', 'youzan-business-api.cjs', 'youzan-api-contracts.cjs', 'icbu-business-api.cjs', 'icbu-api-contracts.cjs', 'weimob-business-api.cjs', 'weimob-api-contracts.cjs', 'taobao-business-api.cjs', 'taobao-api-contracts.cjs', 'jd-business-api.cjs', 'jd-api-contracts.cjs'])(
+  it.each(['project-instructions-contract.cjs', 'skill-esm-loader.cjs', 'browser-tool-contract.cjs', 'connector-discovery-contract.cjs', 'ebay-signature.cjs', 'temu-api-contracts.cjs', 'shein-api-contracts.cjs', 'lazada-api-contracts.cjs', 'amazon-business-api.cjs', 'amazon-api-contracts.cjs', 'square-business-api.cjs', 'square-api-contracts.cjs', 'ebay-business-api.cjs', 'ebay-api-contracts.cjs', 'etsy-business-api.cjs', 'etsy-api-contracts.cjs', 'bigcommerce-business-api.cjs', 'bigcommerce-api-contracts.cjs', 'woocommerce-business-api.cjs', 'woocommerce-api-contracts.cjs', 'commercelayer-business-api.cjs', 'commercelayer-api-contracts.cjs', 'constant-contact-business-api.cjs', 'constant-contact-api-contracts.cjs', 'shopify-business-api.cjs', 'shopify-api-contracts.cjs', 'shopline-business-api.cjs', 'shopline-api-contracts.cjs', 'shoplazza-business-api.cjs', 'shoplazza-api-contracts.cjs', 'reloadly-business-api.cjs', 'reloadly-api-contracts.cjs', 'lightspeed-business-api.cjs', 'lightspeed-api-contracts.cjs', 'shopline-graphql-api.cjs', 'shopline-graphql-contracts.cjs', 'base-shop-business-api.cjs', 'base-shop-api-contracts.cjs', 'walmart-business-api.cjs', 'walmart-api-contracts.cjs', 'qoo10-business-api.cjs', 'qoo10-api-contracts.cjs', 'futureshop-business-api.cjs', 'futureshop-api-contracts.cjs', 'shopee-business-api.cjs', 'shopee-api-contracts.cjs', 'tiktok-shop-business-api.cjs', 'tiktok-shop-api-contracts.cjs', 'yahoo-shopping-business-api.cjs', 'yahoo-shopping-api-contracts.cjs', 'douyin-business-api.cjs', 'douyin-api-contracts.cjs', 'aliexpress-business-api.cjs', 'aliexpress-api-contracts.cjs', 'mercado-libre-business-api.cjs', 'mercado-libre-api-contracts.cjs', 'kuaishou-business-api.cjs', 'kuaishou-api-contracts.cjs', 'alibaba-1688-business-api.cjs', 'alibaba-1688-api-contracts.cjs', 'youzan-business-api.cjs', 'youzan-api-contracts.cjs', 'icbu-business-api.cjs', 'icbu-api-contracts.cjs', 'weimob-business-api.cjs', 'weimob-api-contracts.cjs', 'taobao-business-api.cjs', 'taobao-api-contracts.cjs', 'jd-business-api.cjs', 'jd-api-contracts.cjs'])(
     'blocks a package missing the runtime helper %s', (name) => {
       const pcRoot = packagedFixture();
       fs.rmSync(path.join(pcRoot, 'bin', name));

@@ -84,7 +84,7 @@ export const CompositionManifestSchema = z.object({
   source_alignment: z.object({
     merge_reason: z.string().trim().min(1).optional(),
   }).strict().optional(),
-  art_direction: z.record(z.unknown()).optional(),
+  art_direction: z.record(z.string(), z.unknown()).optional(),
 }).strict().superRefine((manifest, ctx) => {
   const hasNarration = manifest.scenes.some((scene) => !!scene.narration_text?.trim());
   if (manifest.schema_version === 2

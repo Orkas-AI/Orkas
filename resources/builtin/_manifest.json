@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "0e78e96e8b9b5abf21a7977610c05c909e5582414d43da4710e36303fa6111b5",
+  "content_tree_sha256": "d610f162459f927b56f1508b70fcf6b1850de0ee5f805471c4b986b703be6da1",
   "files": [
     {
       "path": "marketplace/agents/1040b336306f/agent.json",
@@ -69,8 +69,8 @@
     },
     {
       "path": "marketplace/agents/173d4235a431/agent.json",
-      "bytes": 3041,
-      "sha256": "b69bd9cd250fec1322559a4f62d94f0e92a4ab130b7f63ce6de57d48e1c584eb"
+      "bytes": 3089,
+      "sha256": "b38fb7432f3455711bbff43629c77f9b7a806c4fec076f52417f2a54286f18ff"
     },
     {
       "path": "marketplace/agents/5a1d43c2f28a/agent.json",
@@ -120,7 +120,7 @@
     {
       "path": "marketplace/agents/79df9cc89f5f/agent.json",
       "bytes": 6733,
-      "sha256": "03b03d9bce89683fba366a80e1286413ade43123e381f58eb6bbe4722e20a66a"
+      "sha256": "52daa1c90118278771cd59e231a08e6771698fbd4ac21ebbeb0fd98dc0d82195"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/bundled-runtime.ts",
@@ -1475,7 +1475,7 @@
     {
       "path": "marketplace/skills/fc125b9df078/_meta.json",
       "bytes": 865,
-      "sha256": "c56cfdcbf3c4c5375a1d919e9a130d15344dc1f5a5768a3400c21952459ff83a"
+      "sha256": "ee708c418169b963fd0ee290640b3630461761e87c3456dcaecd8915f48f604e"
     },
     {
       "path": "marketplace/skills/fc125b9df078/references/design-style-index.md",
@@ -1759,18 +1759,18 @@
     },
     {
       "path": "marketplace/skills/fc125b9df078/references/ui-implementation.md",
-      "bytes": 4956,
-      "sha256": "c1480e1cccc0b9b9b3b6361baf05a19488a2d613fc9add45a406f3b2a352e16d"
+      "bytes": 5395,
+      "sha256": "3d3b9983b56e688470ad52a6862b45c5f9fb255c43c1a47c1daa5419d2fdc0ca"
     },
     {
       "path": "marketplace/skills/fc125b9df078/SKILL.md",
-      "bytes": 7187,
-      "sha256": "91ffb9f6bb2ef998b1135c7db0f8d015c29ffb412bba555a6a09f8431ff1a09e"
+      "bytes": 4122,
+      "sha256": "dc0423d3fa1a415b59a0beb29a5709dc557ec918b757b56e84f1410f4b9be24b"
     },
     {
       "path": "system/skills/_system.json",
       "bytes": 273,
-      "sha256": "dfa3d511c76ef69f6c376b3d8e6d74f95ae39d1ed8151e6b9e261cd76a57e359"
+      "sha256": "1e58abde8b8a97d5190106d818f5cf7394f311474977bbc504e0e59a094d71d2"
     },
     {
       "path": "system/skills/agent-creator/references/cli-and-prose.md",
@@ -1779,8 +1779,8 @@
     },
     {
       "path": "system/skills/agent-creator/references/llm-agent-fields.md",
-      "bytes": 10105,
-      "sha256": "d919419c3dbf59f733b9394e18ca182b02b690a1604741e5114d9e6ddd05bce1"
+      "bytes": 9959,
+      "sha256": "048d9dc231afe20764a38f78f4f492a59647818639a3279b2d5221e4070c547c"
     },
     {
       "path": "system/skills/agent-creator/references/source-and-editing.md",
@@ -1789,8 +1789,8 @@
     },
     {
       "path": "system/skills/agent-creator/SKILL.md",
-      "bytes": 6726,
-      "sha256": "2aaad51cc8f0c99f6dbeebc68cc0ce29fe8d15051654386641e51aa45de1ef57"
+      "bytes": 6911,
+      "sha256": "3437900a477456f0a5dd121e862da701ed6af62ddb1587ab2f3df8a865ccf655"
     },
     {
       "path": "system/skills/package-installer/SKILL.md",
@@ -1814,13 +1814,13 @@
     },
     {
       "path": "system/skills/skill-creator/references/metadata.md",
-      "bytes": 4416,
-      "sha256": "838b4b93c7a0ce836e6ca74dabfa478842c53e817554b675e018b794c169de32"
+      "bytes": 4521,
+      "sha256": "09da4b36e410a9d15c0702451983cd1233a8dea31cb7010dacabcd78bb78102c"
     },
     {
       "path": "system/skills/skill-creator/SKILL.md",
-      "bytes": 7615,
-      "sha256": "6bc6ce7ba58505d181f03dd69b66d5b7c1639099166569ca119f7fa72f3eaf91"
+      "bytes": 7588,
+      "sha256": "d83ace7fa8cdf0f19eb314ff317c59632b3ece084239aca6c8acb2d214be30df"
     },
     {
       "path": "system/skills/web-app-sdk/assets/starter/index.html",
@@ -1844,13 +1844,13 @@
     },
     {
       "path": "system/skills/web-app-sdk/references/api.json",
-      "bytes": 46594,
-      "sha256": "f892bf39debafc38ca2acaa731089ea2f02e67edab0d71836df7dd3e9af9aaea"
+      "bytes": 46783,
+      "sha256": "4b6736b3dd165da50ac384451142d5ec4bd80d91c07c72a8bad473a2ea6e820f"
     },
     {
       "path": "system/skills/web-app-sdk/references/common.md",
-      "bytes": 2140,
-      "sha256": "4fd4d66a7bd339eb8912b2d7529c64f34464bcc8830e30cf68623b192c62f5bd"
+      "bytes": 2717,
+      "sha256": "7fe0e60af76c4d5659cc33e13a2f3630d9e6a406ed9223ddcfbda4fffdca6f3e"
     },
     {
       "path": "system/skills/web-app-sdk/references/local.md",
@@ -1859,8 +1859,8 @@
     },
     {
       "path": "system/skills/web-app-sdk/references/web-api.json",
-      "bytes": 28742,
-      "sha256": "7c944c4ab1186beb091b3df4ae1917a3c551be8a19536cc85fd860b3329983a8"
+      "bytes": 28896,
+      "sha256": "5f78daa4847364f7b0f251cf4e83a21c06d39862997458019992aca77eb86d9f"
     },
     {
       "path": "system/skills/web-app-sdk/references/web.md",
@@ -1877,7 +1877,7 @@
     "system_skills": [
       {
         "id": "agent-creator",
-        "update_at": 1790685144182
+        "update_at": 1792401858760
       },
       {
         "id": "package-installer",
@@ -1885,11 +1885,11 @@
       },
       {
         "id": "skill-creator",
-        "update_at": 1792221336825
+        "update_at": 1792401858760
       },
       {
         "id": "web-app-sdk",
-        "update_at": 1792073047732
+        "update_at": 1792801744171
       }
     ],
     "marketplace_agents": [
@@ -1920,10 +1920,10 @@
       {
         "id": "173d4235a431",
         "name": "ContentWriter",
-        "version": "1.0.37",
+        "version": "1.0.38",
         "icon": "document",
         "color": "lavender",
-        "updated_at": "2026-09-15T08:24:17.847Z",
+        "updated_at": "2026-10-20T07:26:23.313Z",
         "skill_list": [
           "9dfbd4e00c0d"
         ],
@@ -1976,10 +1976,10 @@
       {
         "id": "79df9cc89f5f",
         "name": "VideoStudio",
-        "version": "1.6.81",
+        "version": "1.6.82",
         "icon": "film",
         "color": "violet",
-        "updated_at": "2026-10-14T02:51:38Z",
+        "updated_at": "2026-10-20T03:51:20Z",
         "skill_list": [
           "composition-design-review",
           "design-system-importer",
@@ -2346,8 +2346,8 @@
       {
         "id": "fc125b9df078",
         "name": "product-ui",
-        "version": "1.0.10",
-        "updated_at": "2026-09-15T09:12:53.592Z"
+        "version": "1.0.11",
+        "updated_at": "2026-10-20T07:26:23.314Z"
       }
     ]
   }

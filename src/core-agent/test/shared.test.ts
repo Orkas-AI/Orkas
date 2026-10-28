@@ -16,6 +16,7 @@ import {
   getRetryErrorPolicy,
   isRetryableError,
   isStorageFullError,
+  isTerminalRecoveryError,
   isTransientNetworkError,
   errorCodeForLog,
   formatError,
@@ -199,6 +200,24 @@ describe("Errors", () => {
         cause: Object.assign(new Error("Unauthorized"), { status: 401 }),
       });
       expect(isRetryableError(wrappedAuth)).toBe(false);
+    });
+
+    it("keeps HTTP 451 terminal through wrappers even when runtime policy clears every blacklist", () => {
+      const policy = { permanent_statuses: [], permanent_message_patterns: [], permanent_code_patterns: [] };
+      for (const error of [
+        new ProviderError("opaque", "test", 451),
+        { status: 451 }, { httpStatus: 451 }, { http_status: 451 },
+        { statusCode: 503, cause: { status: 451, code: "rate_limit_error" } },
+        { cause: { error: { status: 451, code: "insufficient_quota" } } },
+      ]) {
+        expect(classifyRetryableError(error)).toBeNull();
+        expect(classifyRetryableErrorWithPolicy(error, policy)).toBeNull();
+        expect(isTerminalRecoveryError(error)).toBe(true);
+      }
+      // A number in diagnostic prose is not an authoritative HTTP rejection.
+      const lookalike = Object.assign(new Error("451 status code (no body)"), { status: 503 });
+      expect(classifyRetryableError(lookalike)).toBe("service_unavailable");
+      expect(isTerminalRecoveryError(lookalike)).toBe(false);
     });
 
     it("never retries structured provider safety errors even when runtime policy removes every blacklist", () => {

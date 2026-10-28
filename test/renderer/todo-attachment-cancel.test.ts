@@ -116,6 +116,7 @@ describe('todo attachment removal is committed by Save', () => {
         arrayBuffer: async () => new Uint8Array([110, 101, 119]).buffer }]);
       await f.context._saveProjectTodoEditor();
       expect(f.bytes('a.txt')).toBe('new');
+      expect(f.invoke).toHaveBeenCalledWith('projects.tasks.update', expect.objectContaining({ attachment_order: ['b.txt', 'a.txt'] }));
       expect(f.names()).toEqual(['a.txt', 'b.txt']);
     } finally { f.dispose(); }
   });

@@ -486,8 +486,8 @@ export function openVecStore(dbDir: string): VecStore {
     `;
     if (opts.dir) {
       const dir = opts.dir.replace(/\/+$/, '');
-      sql += ` AND (f.rel_path = ? OR f.rel_path LIKE ?)`;
-      params.push(dir, dir + '/%');
+      sql += ` AND (f.rel_path = ? OR f.rel_path LIKE ? ESCAPE '!')`;
+      params.push(dir, dir.replace(/[!%_]/g, '!$&') + '/%');
     }
     if (opts.path) {
       sql += ` AND f.rel_path = ?`;

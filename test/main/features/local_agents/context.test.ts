@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { estimateBudgetTokens } from '../../../../src/main/util/token-estimate';
-import { LOCALES } from '../../../../src/main/i18n';
+import { buildLanguageDirective, LOCALES } from '../../../../src/main/i18n';
 
 import {
   CLI_HISTORY_MAX_TURNS,
@@ -19,6 +19,18 @@ const XML_PROTOCOL = [
   '{"agent_id":"agent-1","fields":[{"id":"project_dir","type":"directory"}]}',
   '</agent-input-form>',
 ].join('\n');
+
+it('preserves nonalphabetic attachment order in fresh and resumed Codex turn input', () => {
+  const prompt = buildCliTurnPrompt({ task: 'Compare image 1 with image 2',
+    attachmentPaths: ['/tmp/z-first.png', '/tmp/a-second.png', '/tmp/m-third.png'] });
+  expect(prompt.match(/^- .*$/gm)).toEqual(['- /tmp/z-first.png', '- /tmp/a-second.png', '- /tmp/m-third.png']);
+  const contextPlan = createCliContextPlan({ durableInstructions: '', turnPrompt: prompt, recoveryContext: '', incrementalContext: '' });
+  for (const resumed of [false, true]) {
+    const materialized = materializeCliContext(contextPlan, { cli: 'codex', resumed });
+    expect(materialized.prompt.indexOf('z-first.png')).toBeLessThan(materialized.prompt.indexOf('a-second.png'));
+    expect(materialized.prompt.indexOf('a-second.png')).toBeLessThan(materialized.prompt.indexOf('m-third.png'));
+  }
+});
 
 const INTENT_RULES = [
   '## User intent and clarification',
@@ -45,11 +57,19 @@ function plan() {
 }
 
 describe('local_agents/context › semantic CLI context', () => {
-  it.each(LOCALES)('uses the selected $code software language instead of an English fallback', ({ code, llmName }) => {
+  it.each(LOCALES)('shares user-first reply precedence with ordinary chat and uses $code only as fallback', ({ code, llmName }) => {
     const instructions = buildCliDurableInstructions({ agentName: 'Locale agent', language: code });
-    expect(instructions).toContain(`responses and form labels in ${llmName} unless the user explicitly requests another language`);
-    expect(instructions).toContain('Keep XML tags, JSON keys, ids, file paths, and code unchanged');
-    if (code !== 'en') expect(instructions).not.toContain('responses and form labels in English');
+    expect(instructions).toContain(buildLanguageDirective(code));
+    expect(instructions).toContain(`Fallback UI language: **${llmName}**`);
+    const explicit = instructions.indexOf('a current explicit request about reply language');
+    const prose = instructions.indexOf("the clear language of the user's latest substantive prose");
+    const fallback = instructions.indexOf('(3) otherwise, the fallback UI language');
+    expect(explicit).toBeGreaterThan(-1);
+    expect(prose).toBeGreaterThan(explicit);
+    expect(fallback).toBeGreaterThan(prose);
+    expect(instructions).toContain('Keep protocol tokens unchanged');
+    expect(instructions).toContain('Agent and Skill descriptions instead follow the description-language rules');
+    expect(instructions.match(/## User language/g)).toHaveLength(1);
   });
 
   it.each(['recovery', 'incremental'] as const)('marks %s dialogue as a partial execution view without inventing archived facts', (mode) => {
@@ -97,7 +117,7 @@ describe('local_agents/context › semantic CLI context', () => {
         expect(fresh.systemPrompt).toContain('## Workflow');
         expect(fresh.systemPrompt).toContain(XML_PROTOCOL);
         expect(fresh.systemPrompt).toContain('## Project instructions (user-authored)');
-        expect(fresh.systemPrompt).toContain('## Response language');
+        expect(fresh.systemPrompt).toContain('## User language');
         expect(fresh.prompt).not.toContain('You are "Orkas Codex".');
         expect(resumed.systemPrompt).toBe(fresh.systemPrompt);
       } else {
@@ -146,12 +166,12 @@ describe('local_agents/context › semantic CLI context', () => {
       '## Workflow',
       'CODING_PROTOCOL_MARKER',
       'PROJECT_CONTEXT_MARKER',
-      '## Response language',
+      '## User language',
     ];
     const positions = markers.map((marker) => durable.indexOf(marker));
     expect(positions.every((position) => position >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((left, right) => left - right));
-    expect(durable).not.toContain('multiselect');
+    expect(durable).not.toContain('## Input choice and confirmation');
     expect(durable).not.toContain(':::dashboard');
   });
 
@@ -191,7 +211,7 @@ describe('local_agents/context › semantic CLI context', () => {
         'STATIC_CODING_PROTOCOL',
         'STATIC_PROJECT_POLICY',
         'STATIC_PROJECT_INSTRUCTIONS',
-        '## Response language',
+        '## User language',
       ];
       expectInOrder(durableSurface, staticMarkers);
 

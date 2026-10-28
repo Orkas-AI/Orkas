@@ -120,6 +120,36 @@ export async function copyLocalFileAtomic(
   }
 }
 
+
+/** Copy a validated entry into a create-only destination. Namespace and source
+ * validation belong to the feature caller. Only a directory root claimed by
+ * this operation may be rolled back; native exclusive file copies own theirs. */
+export function copyLocalEntryExclusiveSync(source: string, target: string, directory: boolean): void {
+  if (!directory) {
+    fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
+    return;
+  }
+  const sourceMode = fs.statSync(source).mode;
+  fs.mkdirSync(target);
+  let owned: fs.BigIntStats | undefined;
+  try {
+    owned = fs.lstatSync(target, { bigint: true });
+    fs.cpSync(source, target, {
+      recursive: true, errorOnExist: true, force: false,
+      dereference: false, mode: fs.constants.COPYFILE_EXCL,
+    });
+    fs.chmodSync(target, sourceMode);
+  } catch (error) {
+    try {
+      const current = fs.lstatSync(target, { bigint: true });
+      if (owned && current.dev === owned.dev && current.ino === owned.ino && !current.isSymbolicLink()) {
+        fs.rmSync(target, { recursive: true, force: true });
+      }
+    } catch { /* best-effort rollback of an owned partial copy */ }
+    throw error;
+  }
+}
+
 export async function isUtf8File(absPath: string): Promise<boolean> {
   const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
   const stream = fs.createReadStream(absPath);

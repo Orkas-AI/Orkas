@@ -68,8 +68,6 @@ function loadHome(options: {
     'home-groups': element(),
     'home-explore-context': element(),
   };
-  const clicks: Array<[string, any]> = [];
-  const events: Array<[string, any]> = [];
   const views: any[][] = [];
   const invokes: Array<[string, any]> = [];
   const forgotten: string[] = [];
@@ -96,16 +94,11 @@ function loadHome(options: {
     loadRendererFeature: vi.fn(async () => {}),
     focusTodo: vi.fn(),
     showContextMenu: (_anchor: any, items: any[]) => { menus.push(items); },
-    Monitor: {
-      click: (action: string, data: any) => { clicks.push([action, data]); },
-      event: (action: string, data: any) => { events.push([action, data]); },
-    },
     document: { getElementById: (id: string) => els[id] || null },
   };
   context.window = {
     uiIconHtml,
     innerHeight: 720,
-    Monitor: true,
     addEventListener() {},
     TaskUnread: { list: () => options.unread || [] },
     loadConnectorNavTarget: async (id: string) => ({ name: { feishu: '飞书', dingtalk: '钉钉', gmail: 'Gmail', 'm365-mail': 'Microsoft 365 邮箱' }[id] || id }),
@@ -131,7 +124,7 @@ function loadHome(options: {
     for (let i = 0; i < 4; i += 1) await new Promise((resolve) => setImmediate(resolve));
   };
   return {
-    context, els, clicks, events, views, invokes, forgotten, menus, timers, settle,
+    context, els, views, invokes, forgotten, menus, timers, settle,
     state: () => els['panel-new-chat'].dataset.homeState,
     html: () => els['home-groups'].innerHTML as string,
     data: () => JSON.parse(vm.runInContext('JSON.stringify(_homeData)', context)),
@@ -157,6 +150,32 @@ describe('Commander home states', () => {
     expect(h.els['home-explore-context'].innerHTML).toBe(
       '添加资料或<button type="button" class="home-connect-link" data-home-connect="1">连接邮箱/店铺/办公软件等</button>，让 Orkas 更了解你。从你愿意分享的内容开始。',
     );
+  });
+
+  it('shows a dated to-do\'s day on its row and flags one past its day while it is open', async () => {
+    const pad = (value: number) => String(value).padStart(2, '0');
+    const day = (offset: number) => {
+      const date = new Date();
+      date.setDate(date.getDate() + offset);
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+    };
+    const h = loadHome({
+      todos: {
+        total: 3,
+        tasks: [
+          { id: 't_due', project_id: '', project_name: '', status: 'todo', content: '发上线邮件', due_at: day(2) },
+          { id: 't_late', project_id: '', project_name: '', status: 'todo', content: '交周报', due_at: day(-2) },
+          { id: 't_plain', project_id: '', project_name: '', status: 'todo', content: '整理访谈' },
+        ],
+      },
+    });
+    h.context.homeOnEnter();
+    await h.settle();
+    const html = h.html();
+    const metaOf = (title: string) => new RegExp(`${title}</span><span class="home-row-meta"><span class="home-row-source">[^<]*</span>([^<]*)`).exec(html)?.[1] || '';
+    expect(metaOf('发上线邮件')).toMatch(/^[^·]+ · .+ 到期$/);
+    expect(metaOf('交周报')).toMatch(/^[^·]+ · 已逾期（.+）$/);
+    expect(metaOf('整理访谈')).not.toMatch(/到期|逾期/);
   });
 
   it('groups open to-dos, automation runs and other finished tasks in that order', async () => {
@@ -351,7 +370,7 @@ describe('Commander home states', () => {
     expect(h.views.slice(1)).toEqual([['auto', null, { entryPoint: 'home' }], ['todos', null, { entryPoint: 'home' }]]);
   });
 
-  it('returns to the conversation a to-do belongs to, and falls back to the To-dos page when it is gone', async () => {
+  it('opens linked global and project to-dos on their cards even when the conversation exists or is gone', async () => {
     const h = loadHome({
       todos: { total: 2, tasks: [
         { id: 't-saved', project_id: '', status: 'todo', content: 'Write chapter 3', origin_cid: 'conv-origin' },
@@ -362,23 +381,28 @@ describe('Commander home states', () => {
     });
     h.context.homeOnEnter();
     await h.settle();
-    expect(h.html()).toContain('data-home-origin-cid="conv-origin"');
+    const readsBeforeOpen = h.invokes.length;
+    for (const [index, task] of h.data().todos.entries()) {
+      h.els['home-groups'].fire('click', click({
+        '.home-row': { dataset: { homeTodo: task.id, homePid: task.project_id, homeStatus: task.status,
+          homePosition: String(index + 1), homeOriginCid: task.origin_cid } },
+      }));
+      await h.settle();
+      expect(h.context.focusTodo).toHaveBeenNthCalledWith(index + 1, task.project_id, task.id, { entryPoint: 'home' });
+    }
+    expect(h.views).toEqual([]);
+    // Opening a to-do must not depend on reading its execution conversation.
+    expect(h.invokes.slice(readsBeforeOpen)).toEqual([]);
+  });
 
-    h.els['home-groups'].fire('click', click({
-      '.home-row': { dataset: { homeTodo: 't-saved', homePid: '', homeStatus: 'todo', homePosition: '1', homeOriginCid: 'conv-origin' } },
-    }));
-    await h.settle();
-    // Back to the original conversation, with nothing prefilled.
-    expect(h.views).toEqual([['conversation', 'conv-origin', { entryPoint: 'home' }]]);
-    expect(h.context.focusTodo).not.toHaveBeenCalled();
-
-    h.els['home-groups'].fire('click', click({
-      '.home-row': { dataset: { homeTodo: 't-gone', homePid: 'p1', homeStatus: 'progress', homePosition: '2', homeOriginCid: 'conv-deleted' } },
-    }));
-    await h.settle();
-    expect(h.context.focusTodo).toHaveBeenCalledWith('p1', 't-gone', { entryPoint: 'home' });
-    expect(h.invokes.some(([channel, payload]) => channel === 'conversations.getMany'
-      && JSON.stringify(payload.cids) === JSON.stringify(['conv-deleted']))).toBe(true);
+  it.each(['unavailable', 'failed'])('opens the To-dos page when its card locator is %s', async state => {
+    const h = loadHome();
+    h.context.focusTodo = undefined;
+    if (state === 'failed') h.context.loadRendererFeature.mockRejectedValueOnce(new Error('controlled feature load failure'));
+    else h.context.loadRendererFeature = undefined;
+    await h.context._homeOpenTodo({ dataset: { homeTodo: 't_saved', homePid: 'p1', homeOriginCid: 'linked-chat' } });
+    expect(h.views).toEqual([['todos', null, { entryPoint: 'home' }]]);
+    expect(h.invokes).toEqual([]);
   });
 
   it('hides only the group whose lookup failed', async () => {
@@ -431,6 +455,46 @@ describe('Commander home states', () => {
   });
 });
 
+describe('Commander home keyboard continuity during refresh', () => {
+  it.each(['homeToggle', 'homeAction', 'homeTodo', 'homeCid'])('keeps the focused %s control usable when new work arrives', async (key) => {
+    const h = loadHome();
+    const document = h.context.document;
+    const oldButton = element({ dataset: { [key]: 'selected', homePid: 'p1' } });
+    const replacement = element({ dataset: { [key]: 'selected', homePid: 'p1' },
+      focus: vi.fn(() => { document.activeElement = replacement; }) });
+    const unrelated = element({ dataset: { [key]: 'other', homePid: 'p1' } });
+    const otherProject = element({ dataset: { [key]: 'selected', homePid: 'p2' } });
+    const host = h.els['home-groups'];
+    host.contains = (node: unknown) => node === oldButton;
+    host.querySelectorAll = () => [unrelated, otherProject, replacement];
+    document.activeElement = oldButton;
+    Object.defineProperty(host, 'innerHTML', { set() { document.activeElement = null; } });
+
+    h.context.homeRefresh();
+    h.timers.find((timer) => timer.ms === 500)!.fn();
+    await h.settle();
+
+    expect(document.activeElement).toBe(replacement);
+    expect(replacement.focus).toHaveBeenCalledWith({ preventScroll: true });
+    expect(unrelated.focusCount).toBe(0);
+    expect(otherProject.focusCount).toBe(0);
+  });
+
+  it.each(['outside', 'removed'])('does not move focus to another control when the focused control is %s', async (location) => {
+    const h = loadHome();
+    const original = element({ dataset: { homeToggle: 'todos' } });
+    const other = element({ dataset: { homeToggle: 'tasks' } });
+    h.context.document.activeElement = original;
+    h.els['home-groups'].contains = () => location !== 'outside';
+    h.els['home-groups'].querySelectorAll = () => [other];
+    h.context.homeRefresh();
+    h.timers.find((timer) => timer.ms === 500)!.fn();
+    await h.settle();
+    expect(other.focusCount).toBe(0);
+    expect(original.focusCount).toBe(0);
+  });
+});
+
 describe('Commander home Connectors link', () => {
   it('opens Connectors directly without a chooser or starting setup', async () => {
     const h = loadHome();
@@ -440,7 +504,6 @@ describe('Commander home Connectors link', () => {
 
     h.els['home-explore-context'].fire('click', click({}));
     expect(h.views).toEqual([]);
-    expect(h.clicks).toEqual([]);
     h.els['home-explore-context'].fire('click', click({ '[data-home-connect]': element() }));
     expect(h.views).toEqual([['connectors', null, { entryPoint: 'home' }]]);
     await h.settle();

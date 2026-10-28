@@ -63,6 +63,10 @@ jobs:
           test/main/util/ensure-dev-dependencies.test.ts
           test/main/util/linux-source-dependencies.test.ts
           test/main/features/search/chat_store.test.ts
+          test/renderer/agents-detail-layout.test.ts
+          test/renderer/cli-account-usage.test.ts
+          test/renderer/local-agents-status.test.ts
+          test/renderer/agent-detail-return-navigation.test.ts
       - name: Verify workbook formulas and interrupted directory recovery
         run: >-
           npm run test:js -- --maxWorkers=1

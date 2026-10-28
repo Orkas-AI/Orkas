@@ -101,7 +101,7 @@ describe('Web app capability journeys', () => {
     const definition = { version: 1, tables: [{ id: 'notes', name: 'notes',
       fields: [{ id: 'body', name: 'body', type: 'string' }],
       access: { read: ['body'], insert: ['body'], count: true } }] };
-    const b = { ...bundle('stalled-query', ['data']), appType: 'local' as const, manifest: { sdkVersion: 1, capabilities: ['data'], data: definition } };
+    const b = { ...bundle('stalled-query', ['data']), appType: 'web' as const, manifest: { sdkVersion: 1, capabilities: ['data'], data: definition } };
     const workers = new Set<unknown>();
     let stall = false;
     const post = Worker.prototype.postMessage;
@@ -124,10 +124,10 @@ describe('Web app capability journeys', () => {
     } finally { spy.mockRestore(); }
   });
 
-  it('lets a local app describe the method shown in its supplied discovery example', async () => {
+  it('lets a web app describe the method shown in its supplied discovery example', async () => {
     const { appResource } = await import('../../../src/main/features/web_apps/resources');
-    const app = runtime.open(uid, 1, { ...bundle('cloud-discovery-example', []), appType: 'local' });
-    const supplied = appResource(new Request(new URL('/__orkas/capabilities.json', app.url)), runtime);
+    const app = runtime.open(uid, 1, { ...bundle('cloud-discovery-example', []), appType: 'web' });
+    const supplied = await appResource(new Request(new URL('/__orkas/capabilities.json', app.url)), runtime);
     const document = JSON.parse(supplied!.body!);
     const example = document.methods.find((method: any) => method.name === 'capabilities.describe').example;
     expect(await call(app.token, 'capabilities.describe', example)).toMatchObject({ name: example.method });
@@ -135,26 +135,26 @@ describe('Web app capability journeys', () => {
     expect(host.tools).not.toHaveBeenCalled();
   });
 
-  it.each(['local'] as const)('serves the matching %s authoring contract and invalidates it on closure', async appType => {
+  it.each(['local', 'web'] as const)('serves the matching %s authoring contract and invalidates it on closure', async appType => {
     const { appResource } = await import('../../../src/main/features/web_apps/resources');
     const b = { ...bundle('catalog-' + appType, []), appType };
     const app = runtime.open(uid, 1, b);
     const request = new Request(new URL('/__orkas/capabilities.json', app.url));
-    const result = appResource(request, runtime);
+    const result = await appResource(request, runtime);
     expect(result?.status).toBe(200);
     const document = JSON.parse(result!.body!);
     expect(document.manifest.starter.manifest).toBe(`@skill/web-app-sdk/assets/${appType === 'web' ? 'web' : 'starter'}/orkas-app.json`);
     expect(document.methods.some((method: any) => method.name === 'ai.generate')).toBe(appType === 'local');
     runtime.closeOwner(1);
-    expect(appResource(request, runtime)?.status).toBe(403);
+    expect((await appResource(request, runtime))?.status).toBe(403);
   });
   it('preserves ordinary SQLite data without requiring a personal sync adapter',async()=>{
-    const definition:any={version:1,tables:[{id:'notes',name:'notes',fields:[{id:'body',name:'body',type:'string'}],access:{read:['body'],insert:['body']}}]};const b=bundle('offline-data',['data']);b.appType='local';b.manifest={sdkVersion:1,capabilities:['data'],data:definition};const app=runtime.open(uid,1,b);await call(app.token,'data.insert',{table:'notes',values:{body:'local only'}});runtime.closeOwner(1);await runtime.drainData();
+    const definition:any={version:1,tables:[{id:'notes',name:'notes',fields:[{id:'body',name:'body',type:'string'}],access:{read:['body'],insert:['body']}}]};const b=bundle('offline-data',['data']);b.appType='web';b.manifest={sdkVersion:1,capabilities:['data'],data:definition};const app=runtime.open(uid,1,b);await call(app.token,'data.insert',{table:'notes',values:{body:'local only'}});runtime.closeOwner(1);await runtime.drainData();
     const {webAppSandboxRoot}=await import('../../../src/main/paths');expect(nativeFs.existsSync(path.join(webAppSandboxRoot(uid,b.key,'local'),'data.sqlite'))).toBe(true);expect(nativeFs.existsSync(path.join(webAppSandboxRoot(uid,b.key,'cloud'),'database.snapshot'))).toBe(false);const reopened=runtime.open(uid,1,b);expect(await call(reopened.token,'data.query',{table:'notes'})).toEqual({records:[{body:'local only'}]});
   });
   it('runs real common SQLite calls with the same visitor rules and preserves formal records across reopen',async()=>{
     const definition={version:1,tables:[{id:'messages',name:'messages',fields:[{id:'body',name:'body',type:'string'}],access:{read:['body'],insert:['body'],count:true}}]};
-    const b={...bundle('common',['data']),appType:'local' as const,manifest:{sdkVersion:1,capabilities:['data'],data:definition}};
+    const b={...bundle('common',['data']),appType:'web' as const,manifest:{sdkVersion:1,capabilities:['data'],data:definition}};
     const first=runtime.open(uid,1,b);
     await call(first.token,'data.insert',{table:'messages',values:{body:'KEEP'}});
     expect(await call(first.token,'data.query',{table:'messages',fields:['body']})).toEqual({records:[{body:'KEEP'}]});
@@ -173,15 +173,16 @@ describe('Web app capability journeys', () => {
     preview.closeOwner(2);await preview.drainData();
     expect(await call(reopened.token,'data.count',{table:'messages'})).toEqual({count:1});
   });
-  it('refuses a known web bundle before granting a runtime instance, including after manifest mutation', () => {
-    const b = { ...bundle('cloud', []), appType: 'web' as const };
-    for (const capabilities of [[], ['ai', 'storage']]) {
-      (b.manifest as any).capabilities = capabilities;
-      expect(() => runtime.open(uid, 1, b)).toThrowError(expect.objectContaining({ code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' }));
-    }
-    expect(host.generate).not.toHaveBeenCalled(); expect(host.tools).not.toHaveBeenCalled();
+  it('denies cloud host calls using trusted bundle type even after the page changes its manifest',async()=>{
+    const b={...bundle('cloud',[]),appType:'web' as const};
+    const opened=runtime.open(uid,1,b);
+    (b.manifest as any).capabilities.push('ai','storage');
+    for(const [method,args] of [['ai.generate',{prompt:'No spend'}],['storage.set',{key:'private',value:1}],['tools.list',{}]] as const)
+      await expect(call(opened.token,method,args)).rejects.toMatchObject({code:'E_UNAVAILABLE'});
+    expect(host.generate).not.toHaveBeenCalled();expect(host.tools).not.toHaveBeenCalled();
+    const catalog=await call(opened.token,'capabilities.list');
+    expect(catalog.methods.some((m:any)=>m.name.startsWith('storage.')||m.name.startsWith('ai.')||m.name.startsWith('tools.'))).toBe(false);
   });
-
   it('reads complete picked and sandbox files when the filesystem returns short chunks', async () => {
     const source = path.join(root, 'chunked.txt');
     const text = '完整内容 αβ — complete payload';
@@ -266,12 +267,12 @@ describe('Web app capability journeys', () => {
     expect(await call(b.token,'storage.get',{key:'private'})).toEqual({value:null});
     await expect(runtime.call(uid,2,a.token,'foreign','storage.keys',{})).rejects.toMatchObject({code:'E_CLOSED'});
     const hostname=new URL(a.url).host;
-    expect(runtime.resource(hostname,'index.html','chat-app://foreign')).toBeNull();
-    expect(runtime.resource(hostname,'../private',null)).toBeNull();
+    expect(await runtime.resource(hostname,'index.html','chat-app://foreign')).toBeNull();
+    expect(await runtime.resource(hostname,'../private',null)).toBeNull();
     runtime.closeUser(uid); uid='account-b';
     await expect(call(a.token,'storage.keys')).rejects.toMatchObject({code:'E_CLOSED'});
     expect(await call(open().token,'storage.get',{key:'private'})).toEqual({value:null});
-    expect(runtime.resource(hostname,'index.html',null)).toBeNull();
+    expect(await runtime.resource(hostname,'index.html',null)).toBeNull();
   });
   it('reads only selected snapshots and exports real bytes without overwriting existing files', async () => {
     const source=path.join(root,'source.txt'), output=path.join(root,'export.txt'); await fs.writeFile(source,'Original α');
@@ -460,7 +461,7 @@ describe('Web app resource lifetime and contention', () => {
       expect(await call(a.token, 'storage.get', { key: 'draft' })).toEqual({ value: 'Still working' });
       await call(a.token, 'permissions.revoke');
       await expect(call(a.token, 'storage.keys')).rejects.toMatchObject({ code: 'E_CLOSED' });
-      expect(runtime.resource(new URL(a.url).host, 'index.html', null)).toBeNull();
+      expect(await runtime.resource(new URL(a.url).host, 'index.html', null)).toBeNull();
     } finally { time.mockRestore(); }
   });
 });
@@ -1009,9 +1010,17 @@ it('shares initial host discovery across concurrent requests and cancels all wor
   } finally { vi.useRealTimers(); }
 });
 
+it('cannot obtain hosted publication authority from a standalone browser',async()=>{
+  const {runInNewContext}=await import('node:vm');const {sdkScript}=await import('../../../src/main/features/web_apps/resources');
+  const fetch=vi.fn(),window:any={addEventListener:vi.fn()};window.parent=window;
+  runInNewContext(sdkScript('web'),{window,location:{protocol:'https:',hostname:'example.invalid'},document:{currentScript:null,documentElement:{lang:'en'}},navigator:{language:'en'},crypto:(await import('node:crypto')).webcrypto,fetch,AbortController,setTimeout,clearTimeout});
+  await expect(window.orkasApp.data.insert({table:'messages',values:{body:'Keep private'}})).rejects.toMatchObject({code:'E_HOST_UNAVAILABLE'});
+  expect(fetch).not.toHaveBeenCalled();
+});
+
 it('matches the shared independent data contract fixtures through the real browser runtime',async()=>{
   const fixture=JSON.parse(await fs.readFile(path.resolve(__dirname,'../../fixtures/app-data-v1.json'),'utf8'));
-  const b=bundle('conformance',['data']);b.appType='local';b.manifest={sdkVersion:1,capabilities:['data'],data:fixture.definition};const app=runtime.open(uid,1,b);
+  const b=bundle('conformance',['data']);b.appType='web';b.manifest={sdkVersion:1,capabilities:['data'],data:fixture.definition};const app=runtime.open(uid,1,b);
   for(const values of fixture.inserts)await call(app.token,'data.insert',{table:'items',values});
   for(const [method,key] of [['data.query','queries'],['data.aggregate','aggregates']])for(const test of fixture[key])expect(await call(app.token,method,test.args)).toEqual(test.expected);
   for(const test of fixture.rejections){const result=call(app.token,test.method,test.args);if(test.code)await expect(result).rejects.toMatchObject({code:test.code});else await expect(result).rejects.toBeInstanceOf(Error);}
@@ -1021,7 +1030,7 @@ it('matches the shared independent data contract fixtures through the real brows
 
 it('fails grouped analytics explicitly when more than one hundred groups match',async()=>{
   const definition={version:1,tables:[{id:'items',name:'items',fields:[{id:'category',name:'category',type:'string'},{id:'n',name:'n',type:'integer'}],access:{read:['category','n'],insert:['category','n'],aggregate:['n']}}]};
-  const b=bundle('group-boundary',['data']);b.appType='local';b.manifest={sdkVersion:1,capabilities:['data'],data:definition};const app=runtime.open(uid,1,b);
+  const b=bundle('group-boundary',['data']);b.appType='web';b.manifest={sdkVersion:1,capabilities:['data'],data:definition};const app=runtime.open(uid,1,b);
   for(let n=0;n<101;n++)await call(app.token,'data.insert',{table:'items',values:{category:String(n),n}});
   await expect(call(app.token,'data.aggregate',{table:'items',field:'n',op:'sum',groupBy:'category'})).rejects.toMatchObject({code:'E_LIMIT'});
 });
@@ -1029,14 +1038,43 @@ it('fails grouped analytics explicitly when more than one hundred groups match',
 // Web type contract. The expected common surface is the published v1 product
 // contract (Common/docs/plans/app-publishing.md), not a copy of commonMethod().
 const WEB_COMMON_V1 = ['capabilities.describe', 'capabilities.list', 'data.aggregate', 'data.count', 'data.insert', 'data.insertIf', 'data.query', 'host.getContext'];
-const webBundle = (name: string, data?: any): Bundle => ({ ...bundle(name, data ? ['data'] : []), appType: 'local',
+const webBundle = (name: string, data?: any): Bundle => ({ ...bundle(name, data ? ['data'] : []), appType: 'web',
   manifest: data ? { sdkVersion: 1, capabilities: ['data'], data } : { sdkVersion: 1, capabilities: [] } });
 const notesDefinition = { version: 1, tables: [{ id: 'notes', name: 'notes', fields: [{ id: 'body', name: 'body', type: 'string' }], access: { read: ['body'], insert: ['body'], count: true } }] };
 
-it('refuses web SDK resource acquisition before exposing any runtime URL or token', () => {
-  const b = { ...webBundle('web-resources'), appType: 'web' as const };
-  expect(() => runtime.open(uid, 1, b)).toThrowError(expect.objectContaining({ code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' }));
+it('denies every registered host method to a web app before any host adapter or sandbox write runs', async () => {
+  const { METHODS } = await import('../../../src/main/features/web_apps/catalog');
+  const { webAppSandboxRoot } = await import('../../../src/main/paths');
+  const hostOnly = Object.keys(METHODS).filter(name => !WEB_COMMON_V1.includes(name));
+  // Guard the derived list: new registry entries are covered automatically,
+  // and an empty or truncated list cannot make this case pass vacuously.
+  expect(hostOnly).toEqual(expect.arrayContaining(['storage.set', 'appFiles.writeText', 'files.pick', 'files.saveAs', 'ai.generate', 'tools.list', 'tools.call', 'permissions.revoke']));
+  const b = webBundle('web-registry'); const app = runtime.open(uid, 1, b);
+  for (const name of hostOnly) {
+    await expect(call(app.token, name, (METHODS as any)[name].example), name).rejects.toMatchObject({ code: 'E_UNAVAILABLE' });
+  }
   for (const adapter of [host.pick, host.save, host.generate, host.tools]) expect(adapter).not.toHaveBeenCalled();
+  for (const scope of ['local', 'cloud'] as const) expect(nativeFs.existsSync(webAppSandboxRoot(uid, b.key, scope))).toBe(false);
+  // permissions.revoke was denied, so the instance is still open and usable.
+  expect(await call(app.token, 'host.getContext')).toMatchObject({ sdkVersion: 1 });
+});
+
+it('serves a web app only the common SDK surface inside Orkas: no bridge script, no host stubs, no host schemas', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const { appResource } = await import('../../../src/main/features/web_apps/resources');
+  const { METHODS } = await import('../../../src/main/features/web_apps/catalog');
+  const app = runtime.open(uid, 1, webBundle('web-resources'));
+  const at = (rel: string) => appResource(new Request(new URL('/' + rel, app.url)), runtime);
+  expect(await at('__orkas/bridge.js')).toEqual({ status: 403 });
+  const sdk = await at('__orkas/sdk.js'); expect(sdk?.status).toBe(200);
+  const parent = { postMessage: vi.fn() }, window: any = { addEventListener: vi.fn(), parent };
+  runInNewContext(sdk!.body!, { window, parent, location: { protocol: 'chat-app:', hostname: new URL(app.url).host }, crypto: (await import('node:crypto')).webcrypto, setTimeout, clearTimeout });
+  const exposed = Object.entries(window.orkasApp).flatMap(([group, value]) => value && typeof value === 'object' ? Object.keys(value as object).map(method => `${group}.${method}`) : []);
+  expect(exposed.sort()).toEqual(WEB_COMMON_V1);
+  for (const name of Object.keys(METHODS).filter(name => !WEB_COMMON_V1.includes(name))) {
+    await expect(call(app.token, 'capabilities.describe', { method: name }), name).rejects.toMatchObject({ code: 'E_METHOD' });
+  }
+  expect(await call(app.token, 'capabilities.describe', { method: 'data.insertIf' })).toMatchObject({ name: 'data.insertIf', appTypes: ['local', 'web'] });
 });
 
 it('matches the shared stateful data scenarios: retries, relations, read filters, capacity and stable pages', async () => {
@@ -1090,7 +1128,7 @@ it('isolates formal data by application and account and closes the previous acco
   expect(await call(back.token, 'data.query', { table: 'notes' })).toEqual({ records: [{ body: 'A private' }] });
 });
 
-it.each(['local'] as const)('rejects record update and delete from a %s app without changing records', async appType => {
+it.each(['local', 'web'] as const)('rejects record update and delete from a %s app without changing records', async appType => {
   const b = { ...webBundle('no-mutation-' + appType, notesDefinition), appType };
   const app = runtime.open(uid, 1, b);
   const { id } = await call(app.token, 'data.insert', { table: 'notes', values: { body: 'KEEP' } });

@@ -7,7 +7,6 @@ import { createLogger } from '../logger';
 import { hardenedWebPreferences, installExternalNavigationGuard, installHtmlPreviewNavigationGuard } from '../util/window-security';
 import { registerUserSwitchHook } from './user-switch-hooks';
 import { subscribeBus } from './group_chat';
-import { commercialWebAppFailure, isCommercialWebAppFailure, requireLocalAppType, storedAppType } from './web_apps/commercial-entry';
 
 // Host-only window chrome. Generated applications retain the existing iframe
 // sandbox and acquire their SDK instance from their own trusted renderer.
@@ -36,7 +35,9 @@ const sourceSchema = z.discriminatedUnion('kind', [
 ]);
 export type PreviewSource = z.infer<typeof sourceSchema>;
 type Record = { win: BrowserWindow; owner: WebContents; uid: string; source: PreviewSource; dirty: boolean;
-  ready: boolean; next?: PreviewSource; dispose?: () => void };
+  ready: boolean; next?: PreviewSource; dispose?: () => void;
+  revealPending?: boolean;
+  artifactRevision?: number };
 const records = new Map<number, Record>();
 const owners = new Map<WebContents, { windows: Set<BrowserWindow>; dispose: () => void }>();
 const log = createLogger('preview-windows');
@@ -48,6 +49,10 @@ function sourceKey(source: PreviewSource): string {
   return JSON.stringify([source.kind, source.options.cid, source.options.projectId, source.kind === 'file' ? source.path : source.src]);
 }
 
+function canReplaceContent(current: PreviewSource, next: PreviewSource): boolean {
+  return ['image', 'file', 'video'].includes(current.kind) && ['image', 'file', 'video'].includes(next.kind);
+}
+
 function owned(uid: string, sender: WebContents): Record {
   const record = records.get(sender.id);
   if (!record || record.uid !== uid || record.win.isDestroyed()) throw new Error('Preview is unavailable.');
@@ -55,6 +60,12 @@ function owned(uid: string, sender: WebContents): Record {
 }
 
 export function isPreviewContents(sender: WebContents): boolean { return records.has(sender.id); }
+
+function showPreview(record: Record) {
+  if (record.win.isDestroyed() || !record.win.isFocusable()) return;
+  if (record.win.isMinimized()) record.win.restore();
+  record.win.show(); record.win.focus();
+}
 
 function cancelOwnerRequests(record: Record) {
   for (const [key, request] of pending) if (request.preview === record.win.id) {
@@ -66,53 +77,70 @@ export function readyPreview(uid: string, sender: WebContents) {
   const record = owned(uid, sender);
   record.ready = true;
   if (record.next) sender.send('preview-windows:replace-request', {});
+  else if (record.revealPending) {
+    record.revealPending = false;
+    showPreview(record);
+  }
 }
 
 export async function replacePreview(uid: string, sender: WebContents, accepted: unknown) {
   const record = owned(uid, sender);
+  if (!record.ready) return;
   const source = record.next;
   record.next = undefined;
-  if (accepted !== true || !source || !record.ready) return;
+  if (accepted !== true || !source) {
+    if (record.revealPending) { record.revealPending = false; showPreview(record); }
+    return;
+  }
+  // A dirty editor stays visible for its discard dialog; once accepted it
+  // can release its content through the same path as a clean preview.
+  const inPlace = canReplaceContent(record.source, source);
+  if (record.revealPending && !inPlace) record.win.hide();
   record.ready = false;
   record.dispose?.(); record.dispose = undefined;
   cancelOwnerRequests(record);
+  if (sourceKey(record.source) !== sourceKey(source)) record.artifactRevision = undefined;
   record.source = source;
   record.dirty = false;
+  // The existing renderer releases its old media and acknowledges the new
+  // source through readyPreview before the window is raised. No navigation.
+  if (inPlace) {
+    initializePreview(uid, sender);
+    return { source };
+  }
   // Recreate only the document: preserve native window position, size and
   // maximized state, and release the old document's media/SDK resources.
-  await record.win.loadFile(path.join(SRC_ROOT, 'renderer', 'preview.html'));
+  try {
+    await record.win.loadFile(path.join(SRC_ROOT, 'renderer', 'preview.html'));
+  } catch (error) {
+    // A failed document cannot signal readiness. Release the hidden window so
+    // the next click can create a working preview, as on an initial load failure.
+    if (!record.win.isDestroyed()) record.win.destroy();
+    throw error;
+  }
 }
 
 export async function openPreview(uid: string, owner: WebContents, payload: unknown) {
   if ((JSON.stringify(payload)?.length || 0) > 8 * 1024 * 1024) throw new Error('Preview is too large.');
   const source = sourceSchema.parse(payload);
-  try {
-    const saved = await import('./saved_apps');
-    if (source.kind === 'app') requireLocalAppType(await saved.resolveSavedAppType(uid, source.appId));
-    else if (source.kind === 'artifact') requireLocalAppType(await saved.resolveArtifactAppType(uid, source.cid, source.artifactId));
-    else if (source.kind === 'file') {
-      if (source.options.cid) requireLocalAppType(await saved.boundAppType(uid, source.options.cid));
-      const file = source.options.absPath || source.path;
-      if (path.isAbsolute(file)) {
-        requireLocalAppType(await saved.managedPathAppType(uid, file));
-        requireLocalAppType(storedAppType(path.dirname(file)));
-      }
-    }
-  } catch (error) { if (isCommercialWebAppFailure(error)) return commercialWebAppFailure(); throw error; }
   if (records.has(owner.id)) throw new Error('Open previews from the main window.');
   const existing = [...records.values()].find(r => r.uid === uid && r.owner === owner
     && (source.kind === 'app' ? sourceKey(r.source) === sourceKey(source) : r.source.kind !== 'app'));
   if (existing) {
-    if (existing.win.isFocusable()) {
-      if (existing.win.isMinimized()) existing.win.restore();
-      existing.win.show(); existing.win.focus();
-    }
     if (source.kind !== 'app') {
       const unchanged = source.kind !== 'image' && sourceKey(existing.source) === sourceKey(source);
       existing.next = unchanged ? undefined : source;
+      if (existing.next) {
+        // Raise the window only after replacement. File and media swaps keep the shell
+        // visible in place; other kinds hide the document being navigated away.
+        existing.revealPending = true;
+        if (!existing.dirty && !canReplaceContent(existing.source, source)) existing.win.hide();
+      } else if (existing.ready) existing.revealPending = false;
       if (existing.next && existing.ready) existing.win.webContents.send('preview-windows:replace-request', {});
     }
-    return { windowId: existing.win.id };
+    if (!existing.revealPending || existing.dirty) showPreview(existing);
+    // Only an app window's opener needs to know its open was a refocus.
+    return { windowId: existing.win.id, ...(source.kind === 'app' ? { reused: true } : {}) };
   }
   const parent = BrowserWindow.fromWebContents(owner);
   if (!parent || parent.isDestroyed()) throw new Error('Preview is unavailable.');
@@ -163,7 +191,7 @@ export async function openPreview(uid: string, owner: WebContents, payload: unkn
   });
   try {
     await win.loadFile(path.join(SRC_ROOT, 'renderer', 'preview.html'));
-    if (!win.isDestroyed() && win.isFocusable()) { win.show(); win.focus(); }
+    if (!record.revealPending) showPreview(record);
     return { windowId: win.id };
   } catch (error) { destroy(); throw error; }
 }
@@ -176,6 +204,17 @@ export function initializePreview(uid: string, sender: WebContents) {
     // cross into preview renderers or trigger repeated history scans.
     record.dispose = subscribeBus(uid, source.gallery.cid, event => {
       if (event.type === 'message' && !sender.isDestroyed()) sender.send('preview-windows:gallery-refresh', {});
+    });
+  }
+  if (source.kind === 'artifact' && !record.dispose) {
+    record.dispose = subscribeBus(uid, source.cid, event => {
+      if (event.type !== 'artifact_created' || event.artifact.id !== source.artifactId
+        || !Number.isSafeInteger(event.artifact.revision)
+        || event.artifact.revision! <= (record.artifactRevision ?? 0) || sender.isDestroyed()) return;
+      record.artifactRevision = event.artifact.revision;
+      if (record.next && sourceKey(record.next) !== sourceKey(source)) return;
+      record.next = { ...source, title: event.artifact.title };
+      if (record.ready) sender.send('preview-windows:replace-request', {});
     });
   }
   return { source };

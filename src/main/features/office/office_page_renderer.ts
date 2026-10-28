@@ -9,18 +9,14 @@ import type { BrowserWindow as ElectronBrowserWindow, Session } from 'electron';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { hardenedWebPreferences } from '../../util/window-security';
 import { runOfficeCli } from './office_engine';
+import { hardenOfficeHtml, OFFICE_RENDER_ASSET_HOSTS } from './office_html_security';
 import { PPTX_TEXT_COLLISION_SCRIPT, unassessedTextCollision, type TextCollisionAudit } from './pptx_text_collision';
 
 const OFFICE_RENDER_TIMEOUT_MS = 60_000;
 const DEFAULT_SCREENSHOT_WIDTH = 1600;
 const DEFAULT_SCREENSHOT_HEIGHT = 1200;
 const MAX_SCREENSHOT_DIMENSION = 1920;
-const TRUSTED_RENDER_HOSTS = new Set([
-  'd.officecli.ai',
-  'cdn.jsdelivr.net',
-  'fonts.googleapis.com',
-  'fonts.gstatic.com',
-]);
+const TRUSTED_RENDER_HOSTS = new Set(OFFICE_RENDER_ASSET_HOSTS);
 
 type ElectronRuntime = {
   BrowserWindow?: new (options: Record<string, unknown>) => ElectronBrowserWindow;
@@ -45,11 +41,26 @@ const READY_SCRIPT = `(async () => {
   return true;
 })()`;
 
+// The pinned Word preview skips pagination only for a page-1 screenshot.
+// Use its normal paginator after fonts settle so page 1 and later pages share
+// the same content partition. The hook schedules one synchronous pagination
+// pass; the following timer waits for that pass before measuring/capturing.
+const WORD_FIRST_PAGE_SCRIPT = `(async () => {
+  const pages = window._requestedPages;
+  if (typeof window._wordPaginate !== 'function'
+    || !Array.isArray(pages) || pages.length !== 1 || pages[0] !== 1) return;
+  window._wordPaginate();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+})()`;
+
 const CONTENT_SIZE_SCRIPT = `(() => {
   const visible = (element) => element && element.offsetParent !== null;
   const slide = Array.from(document.querySelectorAll('.slide')).find(visible);
   const page = Array.from(document.querySelectorAll('.page')).find(visible);
   const target = slide || page;
+  if (!target && !Array.from(document.querySelectorAll('.sheet-content')).some(visible)) {
+    return { missingPage: true };
+  }
   if (!target) return { width: 1600, height: 1200 };
   return {
     width: Math.max(1, Math.ceil(target.offsetWidth || 0)),
@@ -153,6 +164,12 @@ export async function renderOfficePageToPng(
     }
     assertNotAborted(signal);
 
+    // file: responses cannot carry a CSP header. Install the policy before
+    // Chromium parses any generated script, preserving Office layout assets.
+    const html = await fs.promises.readFile(htmlPath, 'utf8');
+    await fs.promises.writeFile(htmlPath, hardenOfficeHtml(html, true));
+    assertNotAborted(signal);
+
     const electron = await (deps.loadElectron?.() ?? import('electron') as Promise<ElectronRuntime>);
     const BrowserWindow = electron.BrowserWindow;
     if (!BrowserWindow || !electron.session) {
@@ -189,7 +206,17 @@ export async function renderOfficePageToPng(
     );
     assertNotAborted(signal);
 
-    const size = normalizeContentSize(await win.webContents.executeJavaScript(CONTENT_SIZE_SCRIPT, true));
+    await withTimeout(
+      win.webContents.executeJavaScript(WORD_FIRST_PAGE_SCRIPT, true),
+      'E_OFFICE_RENDER_PAGINATION_TIMEOUT: preview pagination did not settle',
+    );
+    assertNotAborted(signal);
+
+    const layout = await win.webContents.executeJavaScript(CONTENT_SIZE_SCRIPT, true);
+    if (layout?.missingPage) {
+      throw new Error(`E_OFFICE_RENDER_PAGE_UNAVAILABLE: page ${page} has no visible Office page or worksheet.`);
+    }
+    const size = normalizeContentSize(layout);
     win.setContentSize(size.width, size.height, false);
     await withTimeout(
       win.webContents.executeJavaScript(READY_SCRIPT, true),

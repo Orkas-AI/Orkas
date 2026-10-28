@@ -243,3 +243,48 @@ describe('conversations.attachments.pickAndUpload', () => {
     });
   });
 });
+
+
+it.each([{}, { path: '' }])('refuses an empty Library deletion through the actual IPC router: %j', async payload => {
+  const root = contextsRoot(); fs.mkdirSync(root, { recursive: true });
+  const source = path.join(root, 'protected.md'); fs.writeFileSync(source, '# Protected Library source');
+  const logger = await import('../../../src/main/logger');
+  const createLogger = logger.createLogger;
+  const warnings = vi.fn();
+  const spy = vi.spyOn(logger, 'createLogger').mockImplementation(name => {
+    const original = createLogger(name);
+    return name === 'ipc' ? { ...original, warn: warnings } : original;
+  });
+  let result: any;
+  try { result = await invoke('contexts.delete', payload); }
+  finally { spy.mockRestore(); }
+  expect({
+    ok: result.ok,
+    source: fs.existsSync(source) ? fs.readFileSync(source, 'utf8') : null,
+  }).toEqual({ ok: false, source: '# Protected Library source' });
+  expect(warnings).toHaveBeenCalledExactlyOnceWith('invoke returned failure', {
+    channel: 'contexts.delete', code: 'operation_rejected', error: 'path required',
+  });
+  const kb = await import('../../../src/main/features/kb_indexer');
+  expect(kb.enqueue).not.toHaveBeenCalled();
+  const recycle = await import('../../../src/main/features/recycle_bin');
+  expect(await recycle.listRecycleBatches(TEST_UID)).toEqual([]);
+});
+
+it('deletes only the selected Library file through IPC and preserves its recovery bytes', async () => {
+  const root = contextsRoot(); fs.mkdirSync(root, { recursive: true });
+  const selected = path.join(root, 'selected.md');
+  const kept = path.join(root, 'kept.md');
+  fs.writeFileSync(selected, '# Selected source'); fs.writeFileSync(kept, '# Kept source');
+  const result = await invoke('contexts.delete', { path: 'selected.md' });
+  expect(result.ok).toBe(true);
+  expect(fs.existsSync(selected)).toBe(false);
+  expect(fs.readFileSync(kept, 'utf8')).toBe('# Kept source');
+  const recycle = await import('../../../src/main/features/recycle_bin');
+  const batches = await recycle.listRecycleBatches(TEST_UID);
+  expect(batches).toHaveLength(1);
+  expect(batches[0].items).toEqual([{ path: 'cloud/contexts/selected.md', size: Buffer.byteLength('# Selected source') }]);
+  const paths = await import('../../../src/main/paths');
+  expect(fs.readFileSync(path.join(paths.userRecycleDir(TEST_UID), batches[0].id, 'files', 'contexts', 'selected.md'), 'utf8'))
+    .toBe('# Selected source');
+});

@@ -4,6 +4,7 @@ import type { ProjectTasksToolHandler } from '../../core-agent/src/tools/project
 import { backlogExecutionSnapshot, type BacklogRunIdentity } from './group_chat/task_board';
 import { taskSummaryPage } from './task_query';
 import { getActiveUserId } from './users';
+import { isCommanderTaskOwner } from './project_task_record';
 
 export function createProjectTasksHandler(
   uid: string, pid: string, cid: string, agentDisplayNameById: ReadonlyMap<string, string>,
@@ -12,7 +13,13 @@ export function createProjectTasksHandler(
   onSaved?: (taskId: string, projectId: string, content: string) => void,
   // A successful delete withdraws any offer staged for that task this turn.
   onDeleted?: (taskId: string, projectId: string) => void,
+  // Aborts once the caller stopped waiting; a later write would contradict the
+  // failure it already reported and invite a duplicate retry.
+  signal?: AbortSignal,
 ): ProjectTasksToolHandler {
+  const beforeWrite = () => {
+    if (signal?.aborted) throw new Error('E_BRIDGE_CALL_CANCELLED: the caller stopped waiting for this task operation');
+  };
   const toView = (task: projectTasks.ProjectTask) => ({
     ...projectTasks.taskView(task),
     ...(backlogExecutionSnapshot(uid, pid, cid, execution).get(task.id)
@@ -30,6 +37,13 @@ export function createProjectTasksHandler(
   const resolveTaskOwner = async (
     ownerRaw: string,
   ): Promise<{ fields?: { owner_agent: string; owner_agent_id: string }; error?: string }> => {
+    // Commander is a reserved actor, not a roster entry. Use the store's
+    // identity rule while retaining the active-account boundary.
+    if (isCommanderTaskOwner({ owner_agent: ownerRaw })) {
+      return getActiveUserId() === uid
+        ? { fields: { owner_agent: 'Commander', owner_agent_id: 'commander' } }
+        : { error: 'account_changed' };
+    }
     if (!pid) {
       // Global owners come from this account's enabled registry, just as in
       // the backlog store. Project handlers keep their bound-agent scope.
@@ -77,6 +91,7 @@ export function createProjectTasksHandler(
   return {
     delete: async (taskId) => {
       if (getActiveUserId() !== uid) return { ok: false, error: 'account_changed' };
+      beforeWrite();
       const result = await projectTasks.deleteTask(uid, pid, taskId);
       if (!result.ok) return result;
       try { onDeleted?.(taskId, pid); } catch { /* withdrawing an offer never fails the delete */ }
@@ -84,6 +99,7 @@ export function createProjectTasksHandler(
     },
     addAttachment: async (taskId, sourcePath) => {
       const { addTaskAttachmentFromPath } = await import('./project_task_attachment_tool');
+      beforeWrite();
       const result = await addTaskAttachmentFromPath(uid, pid, cid, taskId, sourcePath, files);
       return result.ok ? { ok: true, task: savedView(result.task) } : result;
     },
@@ -104,19 +120,21 @@ export function createProjectTasksHandler(
       const task = await projectTasks.getTask(uid, pid, taskId);
       return task ? { ok: true, task: toView(task) } : { ok: false, error: 'task_not_found' };
     },
-    create: async (input: projectTasks.TaskContentInput & { owner?: string; status?: projectTasks.TaskStatus }) => {
+    create: async (input: projectTasks.TaskContentInput & { owner?: string; status?: projectTasks.TaskStatus; due_at?: string }) => {
       let ownerFields: { owner_agent?: string; owner_agent_id?: string } = {};
       if (input.owner && input.owner.trim()) {
         const resolved = await resolveTaskOwner(input.owner.trim());
         if (resolved.error) return { ok: false, error: resolved.error };
         ownerFields = resolved.fields;
       }
+      beforeWrite();
       const r = await projectTasks.createTask(uid, pid, {
         ...(input.content !== undefined ? { content: input.content } : {}),
         ...(input.title !== undefined ? { title: input.title } : {}),
         ...(input.detail !== undefined ? { detail: input.detail } : {}),
         ...(input.status !== undefined ? { status: input.status } : {}),
         ...ownerFields,
+        ...(input.due_at !== undefined ? { due_at: input.due_at } : {}),
         created_by: 'agent',
       });
       if (!r.ok) return { ok: false, error: (r as { error: string }).error };
@@ -128,7 +146,7 @@ export function createProjectTasksHandler(
       }
       return { ok: true, task: savedView(task), alreadyExists: r.alreadyExists };
     },
-    update: async (taskId: string, patch: projectTasks.TaskContentInput & { status?: projectTasks.TaskStatus; owner?: string }) => {
+    update: async (taskId: string, patch: projectTasks.TaskContentInput & { status?: projectTasks.TaskStatus; owner?: string; due_at?: string }) => {
       let ownerPatch: { owner_agent?: string; owner_agent_id?: string } = {};
       if (patch.owner !== undefined) {
         if (patch.owner.trim()) {
@@ -140,12 +158,15 @@ export function createProjectTasksHandler(
           ownerPatch = { owner_agent: '' };
         }
       }
+      beforeWrite();
       const r = await projectTasks.updateTask(uid, pid, taskId, {
         ...(patch.content !== undefined ? { content: patch.content } : {}),
         ...(patch.title !== undefined ? { title: patch.title } : {}),
         ...(patch.detail !== undefined ? { detail: patch.detail } : {}),
         ...(patch.status !== undefined ? { status: patch.status } : {}),
         ...ownerPatch,
+        // An empty string clears, like `owner`.
+        ...(patch.due_at !== undefined ? { due_at: patch.due_at === '' ? null : patch.due_at } : {}),
       });
       return r.ok === true ? { ok: true, task: savedView(r.task) } : {
         ok: false,
@@ -155,6 +176,7 @@ export function createProjectTasksHandler(
       };
     },
     complete: async (taskId: string) => {
+      beforeWrite();
       const r = await projectTasks.updateTask(uid, pid, taskId, {
         status: 'done',
       });

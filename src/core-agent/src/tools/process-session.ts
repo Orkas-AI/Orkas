@@ -46,6 +46,7 @@ interface ProcessSession {
   lifetimeTimer: NodeJS.Timeout;
   cleanupTimer?: NodeJS.Timeout;
   killTimer?: NodeJS.Timeout;
+  termination?: Promise<void>;
 }
 
 const PROCESS_OUTPUT_BUFFER_CHARS = 1_000_000;
@@ -141,13 +142,21 @@ function finishSession(
   scheduleCleanup(session);
 }
 
-function killSession(session: ProcessSession, signal: NodeJS.Signals = "SIGTERM"): void {
-  try { killProcessTree(session.child, signal); } catch { /* best effort */ }
+function killSession(session: ProcessSession, signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+  if (session.termination) return session.termination;
+  session.termination = new Promise<void>((resolve) => {
+    try { killProcessTree(session.child, signal, { onComplete: resolve }); }
+    catch { resolve(); }
+  });
+  // Windows performs its bounded forceful sweep in the existing helper.
+  // POSIX still escalates the process group even if its shell exited first.
+  if (process.platform === "win32") return session.termination;
   if (session.killTimer) clearTimeout(session.killTimer);
   session.killTimer = setTimeout(() => {
     try { killProcessTree(session.child, "SIGKILL"); } catch { /* best effort */ }
   }, 5_000);
   if (typeof session.killTimer.unref === "function") session.killTimer.unref();
+  return session.termination;
 }
 
 function ownedSession(ctx: ToolContext, sessionId: unknown): ProcessSession | ToolResult {
@@ -546,8 +555,11 @@ export const processStopTool: AgentTool = defineTool({
     if (session.status === "running") {
       killSession(session);
       finishSession(session, "stopped", { signal: "agent" });
-      await waitForProcessClose(session);
     }
+    // A shell closing is not proof that its descendants have been reaped.
+    // Repeated/concurrent stops share the original ownership receipt.
+    await session.termination;
+    await waitForProcessClose(session);
     return terminalResultJson(session, session.outputEnd, PROCESS_READ_DEFAULT_CHARS);
   },
 });
@@ -672,7 +684,10 @@ export async function _resetProcessSessionsForTest(): Promise<void> {
       try { killProcessTree(session.child, "SIGKILL"); } catch { /* best effort */ }
     }
   }
-  await Promise.all(active.map((session) => waitForProcessClose(session, 2_000)));
+  await Promise.all(active.map(async (session) => {
+    await session.termination;
+    await waitForProcessClose(session, 2_000);
+  }));
   for (const session of active) {
     clearTimers(session);
   }

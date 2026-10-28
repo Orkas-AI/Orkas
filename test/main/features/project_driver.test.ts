@@ -29,6 +29,24 @@ describe('project_driver › nextActionableTask', () => {
     expect(driver.nextActionableTask(tasks)?.id).toBe('t_b');
   });
 
+  it('advances the actionable todo due soonest before undated ones, keeping backlog order among equals', () => {
+    const dated = (id: string, due_at: string, depends_on?: string[]) => ({ ...mkTask(id, 'todo', depends_on), due_at });
+    const tasks = [
+      mkTask('t_first', 'todo'),
+      dated('t_later', '2026-11-02'),
+      dated('t_soon', '2026-10-25'),
+      dated('t_blocked_sooner', '2026-10-20', ['t_open']),
+      mkTask('t_open', 'progress'),
+    ];
+    // The soonest due date wins over backlog position; a dated task whose
+    // dependency is still open does not count.
+    expect(driver.nextActionableTask(tasks)?.id).toBe('t_soon');
+    // Without dates the first actionable task in backlog order is chosen.
+    expect(driver.nextActionableTask([mkTask('t_a', 'todo'), mkTask('t_b', 'todo')])?.id).toBe('t_a');
+    // Equal dates fall back to backlog order too.
+    expect(driver.nextActionableTask([dated('t_x', '2026-10-25'), dated('t_y', '2026-10-25')])?.id).toBe('t_x');
+  });
+
   it('skips non-todo statuses (progress / review / done)', () => {
     for (const s of ['progress', 'review', 'done'] as TaskStatus[]) {
       expect(driver.nextActionableTask([mkTask('t_x', s)])).toBeNull();

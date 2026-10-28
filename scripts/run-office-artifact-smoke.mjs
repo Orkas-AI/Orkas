@@ -12,8 +12,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import AdmZip from 'adm-zip';
+import foreignDocxFixture from '../test/fixtures/office/foreign-docx.cjs';
 import officeCliPin from './fetch-officecli.cjs';
 import officeCliPolicy from '../bin/officecli-policy-gate.cjs';
+
+const { foreignDocxBytes } = foreignDocxFixture;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pcRoot = path.resolve(here, '..');
@@ -142,6 +145,46 @@ function validateAndInspect(binary, file, expectedText, renderedHtml, renderArgs
   closeFile(binary, file);
 }
 
+
+async function assertReadOnlyDocx(binary, officeReview, officeRead, root) {
+  for (const spacedBreaks of [false, true]) {
+    const original = foreignDocxBytes(spacedBreaks);
+    for (const surface of ['check', 'read', 'preview']) {
+      const label = `foreign-${spacedBreaks ? 'spaced-breaks' : 'compressed'}-${surface}`;
+      const file = path.join(root, `${label}.docx`);
+      fs.writeFileSync(file, original);
+      const initialHash = `sha256:${sha256(file)}`;
+      const initialMtime = fs.statSync(file, { bigint: true }).mtimeNs;
+      try {
+        if (surface === 'check') {
+          // A second check must keep reviewing the same source revision too.
+          for (let round = 0; round < 2; round++) {
+            const result = await officeReview.execute({ action: 'check', path: file }, { workingDir: root });
+            assert(!result.isError, `${label}: structural check failed: ${result.content}`);
+            const receipt = JSON.parse(result.content);
+            assert(receipt.valid === true, `${label}: fixture is not valid OpenXML`);
+            assert(fs.readFileSync(file).equals(original), `${label}: check changed source bytes`);
+            assert(receipt.artifact_sha256 === initialHash, `${label}: receipt identifies a different source revision`);
+            assert(receipt.artifact_sha256 === `sha256:${sha256(file)}`, `${label}: receipt differs from final file`);
+          }
+        } else if (surface === 'read') {
+          const result = await officeRead.execute({ mode: 'text', path: file }, { workingDir: root });
+          assert(!result.isError, `${label}: read failed: ${result.content}`);
+          assertContains(result.content, 'Readonly review fixture', label);
+        } else {
+          const html = path.join(root, `${label}.html`);
+          run(binary, ['view', file, 'html', '--page', '1', '--render', 'html', '-o', html]);
+          assertRenderedHtml(html, file);
+        }
+      } finally {
+        closeFile(binary, file);
+      }
+      assert(fs.readFileSync(file).equals(original), `${label}: read-only lifecycle changed source bytes`);
+      assert(fs.statSync(file, { bigint: true }).mtimeNs === initialMtime, `${label}: read-only lifecycle changed source mtime`);
+    }
+  }
+}
+
 const platformKey = `${process.platform}-${process.arch}`;
 const assetName = assetNames[platformKey];
 if (!assetName) {
@@ -177,8 +220,14 @@ try {
   await batch(binary, sourceDocx, [
     { command: 'add', parent: '/body', type: 'p', props: { text: '季度报告', style: 'Heading1' } },
     { command: 'add', parent: '/body', type: 'p', props: { text: '中文内容：进展正常。' } },
+    { command: 'add', parent: '/body', type: 'p', props: { text: '第一行\n第二行' } },
   ]);
   closeFile(binary, sourceDocx);
+  // The upgraded engine versions dump/newline semantics, but our unversioned
+  // batch contract must retain the existing single-paragraph soft line break.
+  const sourceXml = new AdmZip(sourceDocx).readAsText('word/document.xml');
+  assert((sourceXml.match(/<w:p[\s>]/g) || []).length === 3, 'DOCX batch newline unexpectedly split a paragraph');
+  assert((sourceXml.match(/<w:br[\s/>]/g) || []).length === 1, 'DOCX batch newline did not retain its soft line break');
   const sourceHash = sha256(sourceDocx);
   const produced = new Set();
   const officeTools = createOfficeTools({
@@ -190,9 +239,12 @@ try {
   const editOffice = officeTools.find((tool) => tool.name === 'edit_office');
   const createXlsx = officeTools.find((tool) => tool.name === 'create_xlsx');
   const officeRead = officeTools.find((tool) => tool.name === 'office_read');
+  const officeReview = officeTools.find((tool) => tool.name === 'office_review');
   assert(editOffice, 'edit_office tool is missing');
   assert(createXlsx, 'create_xlsx tool is missing');
   assert(officeRead, 'office_read tool is missing');
+  assert(officeReview, 'office_review tool is missing');
+  await assertReadOnlyDocx(binary, officeReview, officeRead, tempDir);
   const editResult = await editOffice.execute({
     path: sourceDocx,
     operations: [
@@ -388,7 +440,7 @@ try {
     );
   }
 
-  console.log(`[office-artifact-smoke] PASS ${platformKey} OfficeCLI=${version} artifacts=3 production-fixtures=${fixtureScenarios.length} native-xlsx-chart=true xlsx-cross-sheet-layout=true xlsx-edit-readback=true tool-copy=true source-preserved=true atomic-rollback=true guarded-html-renders=3`);
+  console.log(`[office-artifact-smoke] PASS ${platformKey} OfficeCLI=${version} artifacts=3 production-fixtures=${fixtureScenarios.length} foreign-docx-readonly=true check-receipt-matches-source=true native-xlsx-chart=true xlsx-cross-sheet-layout=true xlsx-edit-readback=true tool-copy=true source-preserved=true atomic-rollback=true guarded-html-renders=3`);
 } catch (error) {
   failed = true;
   console.error(`[office-artifact-smoke] FAIL: ${error instanceof Error ? error.message : String(error)}`);

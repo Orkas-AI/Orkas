@@ -1554,7 +1554,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
         const header = total > hits.length
           ? `${total} match(es), showing ${maxResults}; backend=${[...backends].join('+') || 'walk'}:`
           : `${total} match(es); backend=${[...backends].join('+') || 'walk'}:`;
-        return { content: `${header}\n${completion}\n${formatSearchFileResults(hits)}` };
+        return { content: `${header}\n${completion}\n${formatSearchFileResults(hits, path, ctx.workingDir)}` };
       } finally { budget.dispose(); }
     },
   };
@@ -1974,7 +1974,7 @@ function createListFilesTool(opts: FileToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Directory relative to the working directory, a visible absolute directory, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
+        path: { type: 'string', minLength: 1, description: 'Directory relative to the working directory (use "." for that directory), a visible absolute directory, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
       },
       required: ['path'],
     },

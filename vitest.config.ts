@@ -1,6 +1,9 @@
 import { defineConfig } from 'vitest/config';
 import { cpus } from 'node:os';
+import { createRequire } from 'node:module';
 import { TestLogAnalysisReporter } from './test/log-analysis-reporter';
+
+createRequire(import.meta.url)('./test/helpers/source-map-literals.cjs').install();
 
 const logicalCpus = cpus().length || 1;
 // Test files exercise real Electron workers, shell helpers, Git, SQLite,

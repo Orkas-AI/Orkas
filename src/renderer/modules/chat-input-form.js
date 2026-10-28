@@ -16,6 +16,7 @@
   // Cleared on successful submit, on reset, and whenever the form re-renders
   // as already-submitted (server-side values are authoritative then).
   const _formDrafts = new Map();
+  const _attachmentOrder = Symbol('attachmentOrder');
   function _draftKey(cid, formId) {
     return `${cid || ''}::${formId || ''}`;
   }
@@ -319,10 +320,14 @@
         ? opts.presetValue.filter((x) => typeof x === 'string' && x)
         : (typeof opts.presetValue === 'string' && opts.presetValue ? [opts.presetValue] : []);
       for (const name of names) {
-        entries.push({
+        const savedIndex = ctx.attachmentOrder.indexOf(name);
+        const ent = {
           tempId: 'fp-preset-' + Math.random().toString(36).slice(2, 8),
           name, localName: name, status: 'ready',
-        });
+          selectionBatch: savedIndex >= 0 ? savedIndex : ctx.nextSelection++, selectionIndex: 0,
+        };
+        entries.push(ent);
+        ctx.attachmentEntries.push(ent);
       }
     }
 
@@ -354,6 +359,8 @@
           x.addEventListener('click', () => {
             const i = entries.indexOf(ent);
             if (i >= 0) entries.splice(i, 1);
+            const selectedIndex = ctx.attachmentEntries.indexOf(ent);
+            if (selectedIndex >= 0) ctx.attachmentEntries.splice(selectedIndex, 1);
             _renderChips();
             if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
           });
@@ -433,6 +440,7 @@
 
     picker.addEventListener('click', async () => {
       if (disabled) return;
+      const selectionBatch = ctx.nextSelection++;
       let picked = [];
       try {
         const res = await window.orkas.invoke('common.pickFiles', {
@@ -446,14 +454,19 @@
       }
       if (!picked.length) return;
       // single-file mode: replace any prior selection
-      if (!multiple) entries.length = 0;
+      if (!multiple) {
+        ctx.attachmentEntries = ctx.attachmentEntries.filter((entry) => !entries.includes(entry));
+        entries.length = 0;
+      }
       for (const file of picked) {
         const ent = {
+          selectionBatch, selectionIndex: picked.indexOf(file),
           tempId: 'fp-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
           localName: file.name,
           status: 'uploading',
         };
         entries.push(ent);
+        ctx.attachmentEntries.push(ent);
         _uploadFile(ent, file);
       }
       _renderChips();
@@ -592,6 +605,12 @@
     const fields = [];
     const fieldCtx = {
       cid: opts.cid,
+      attachmentEntries: [],
+      attachmentOrder: draftValues?.[_attachmentOrder] || [],
+      nextSelection: (draftValues?.[_attachmentOrder] || []).length,
+      attachmentNames: () => fieldCtx.attachmentEntries.filter((entry) => entry.status === 'ready')
+        .slice().sort((a, b) => a.selectionBatch - b.selectionBatch || a.selectionIndex - b.selectionIndex)
+        .map((entry) => entry.name),
       onChange: () => {
         _refreshSubmitState();
         if (submitted) return;
@@ -599,6 +618,7 @@
         for (const f of fields) {
           try { snap[f.field.id] = f.read(); } catch (_) { /* skip */ }
         }
+        snap[_attachmentOrder] = fieldCtx.attachmentNames();
         _formDrafts.set(draftKey, snap);
       },
     };
@@ -713,7 +733,8 @@
       const encoded = encodeChatFormSubmission(form, values);
       // De-dupe attachment names (a file dropped into both the form and the
       // composer would otherwise appear twice on the user message).
-      const dedupAttachments = Array.from(new Set(attachmentNames));
+      const selected = new Set(attachmentNames);
+      const dedupAttachments = Array.from(new Set(fieldCtx.attachmentNames().filter((name) => selected.has(name))));
       try {
         if (opts.onSubmit) await opts.onSubmit(encoded, values, dedupAttachments);
         // Submission left our hands; once the bubble re-renders as

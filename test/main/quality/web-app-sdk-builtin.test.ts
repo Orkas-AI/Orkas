@@ -95,6 +95,24 @@ describe('Web app authoring package', () => {
     for(const reference of ['common.md','local.md','web.md'])
       expect(fs.readFileSync(path.join(skill,'references',reference),'utf8').replace(/\s+/g,' ')).not.toMatch(/in orkas-app\.json when using data|orkas-app\.json[^.]*same call/);
   });
+  it('the documented timestamp query uses declared read authority and returned fields', async () => {
+    const text = fs.readFileSync(path.join(skill, 'references/common.md'), 'utf8');
+    const example = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(text)![1]);
+    const { LocalAppData } = await import('../../../src/main/features/web_apps/data');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-sdk-query-example-'));
+    const definition = { version: 1, tables: [{ id: 'messages', name: 'messages',
+      fields: [{ id: 'body', name: 'body', type: 'string' }], access: example.access }] };
+    const db = new LocalAppData(path.join(dir, 'data.sqlite'), dir, definition as any);
+    try {
+      await db.call('data.insert', { table: 'messages', values: { body: 'Retained' } });
+      const response: any = await db.call('data.query', example.query);
+      expect(response.records).toHaveLength(1);
+      expect(response.records[0].body).toBe('Retained');
+      expect(Number.isFinite(Date.parse(response.records[0].createdAt))).toBe(true);
+      expect(response.records[0]).not.toHaveProperty('id');
+      await expect(db.call('data.query', { ...example.query, fields: ['id'] })).rejects.toMatchObject({ code: 'E_PERMISSION' });
+    } finally { await db.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
   it('cloud guidance and generated contract contain only actually common interfaces',()=>{
     const cloud=JSON.parse(fs.readFileSync(path.join(skill,'references/web-api.json'),'utf8'));
     expect(cloud.methods.map((method:any)=>method.name)).toContain('data.insert');

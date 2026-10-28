@@ -36,8 +36,14 @@ export interface TaskNotificationRuntime {
 
 type TaskTerminalSubscribe = (listener: TaskTerminalListener) => () => void;
 type TaskInterventionSubscribe = (listener: TaskInterventionListener) => () => void;
+type TaskNotificationStatus = Exclude<TaskTerminalStatus, 'cancelled'>;
+/** What produced the run: a scheduled automation, or any other task. The
+ *  copy names the kind and, when several of one kind and status pile up
+ *  while the app is in the background, their count; never task content. */
+type TaskNotificationKind = 'task' | 'automation';
 type TaskNotificationEvent = Pick<TaskTerminalEvent, 'user_id' | 'conversation_id'> & {
-  status: Exclude<TaskTerminalStatus, 'cancelled'>;
+  status: TaskNotificationStatus;
+  kind: TaskNotificationKind;
 };
 const INTERVENTION_TERMINAL_COALESCE_MS = 2 * 60_000;
 
@@ -45,12 +51,27 @@ function eventKey(event: Pick<TaskTerminalEvent, 'user_id' | 'conversation_id'>)
   return `${event.user_id}\0${event.conversation_id}`;
 }
 
+/** Unread notifications of one kind and status for one account collapse into
+ *  a single counted one, so three overnight automation failures read as
+ *  "3 automation runs failed" instead of three identical alerts. */
+function groupKey(event: TaskNotificationEvent): string {
+  return `${event.user_id}\0${event.kind}\0${event.status}`;
+}
+
+function kindFor(event: Pick<TaskTerminalEvent, 'kind'>): TaskNotificationKind {
+  return event.kind === 'automation' ? 'automation' : 'task';
+}
+
 function copyFor(
-  status: Exclude<TaskTerminalStatus, 'cancelled'>,
+  kind: TaskNotificationKind,
+  status: TaskNotificationStatus,
+  count: number,
   lang: Lang,
 ): { title: string; body: string } {
   return {
-    title: t(`notification.task.${status}.title`, undefined, lang),
+    title: count > 1
+      ? t(`notification.${kind}.${status}.title_many`, { count }, lang)
+      : t(`notification.${kind}.${status}.title`, undefined, lang),
     body: t(`notification.task.${status}.body`, undefined, lang),
   };
 }
@@ -67,6 +88,9 @@ export function startTaskNotifications(
   let unreadCount = 0;
   const activeNotifications = new Set<TaskNotificationHandle>();
   const recentInterventions = new Map<string, number>();
+  /** The one visible notification per account, kind and status, with how
+   *  many events it stands for and the conversation its click opens. */
+  const groups = new Map<string, { count: number; handle: TaskNotificationHandle; conversationId: string }>();
 
   const updateBadge = (nextCount: number): void => {
     unreadCount = Math.max(0, Math.trunc(nextCount));
@@ -78,18 +102,20 @@ export function startTaskNotifications(
       log.warn('task notification badge update failed', { error: (err as Error)?.message || String(err) });
     }
   };
+  const closeNotification = (notification: TaskNotificationHandle): void => {
+    try {
+      notification.close();
+    } catch (err) {
+      log.warn('native task notification close failed', {
+        error: (err as Error)?.message || String(err),
+      });
+    }
+  };
   const closeActiveNotifications = (): void => {
     const notifications = [...activeNotifications];
     activeNotifications.clear();
-    for (const notification of notifications) {
-      try {
-        notification.close();
-      } catch (err) {
-        log.warn('native task notification close failed', {
-          error: (err as Error)?.message || String(err),
-        });
-      }
-    }
+    groups.clear();
+    for (const notification of notifications) closeNotification(notification);
   };
   const markNotificationsRead = (): void => {
     if (unreadCount > 0) updateBadge(0);
@@ -102,6 +128,7 @@ export function startTaskNotifications(
   const stopFocusListener = runtime.onDidFocus(markNotificationsRead);
   const deliver = (event: TaskNotificationEvent, intervention = false): void => {
     const key = eventKey(event);
+    const group = groupKey(event);
     let badgeOwned = false;
     let interventionShownAt = 0;
     let notification: TaskNotificationHandle | null = null;
@@ -117,19 +144,35 @@ export function startTaskNotifications(
       const lang = runtime.resolveLanguageForUser(event.user_id);
       updateBadge(unreadCount + 1);
       badgeOwned = true;
-      const createdNotification = runtime.createNotification(copyFor(event.status, lang));
+      const previous = groups.get(group);
+      const count = (previous?.count || 0) + 1;
+      const createdNotification = runtime.createNotification(copyFor(event.kind, event.status, count, lang));
       notification = createdNotification;
       activeNotifications.add(createdNotification);
+      // The counted notification replaces the one it absorbs. Register the
+      // new owner before closing the old handle so its close callback cannot
+      // drop the group it no longer owns.
+      groups.set(group, { count, handle: createdNotification, conversationId: event.conversation_id });
+      if (previous) {
+        activeNotifications.delete(previous.handle);
+        closeNotification(previous.handle);
+      }
+      const releaseGroup = (): void => {
+        if (groups.get(group)?.handle === createdNotification) groups.delete(group);
+      };
       createdNotification.onClose((reason) => {
         // A timed-out Windows toast can remain in Action Center. Keep the
-        // handle alive so its message and click route remain available there.
+        // handle alive so its message and click route remain available there,
+        // and keep counting into it until the user acts on it.
         if (reason === 'timedOut') return;
         activeNotifications.delete(createdNotification);
+        releaseGroup();
       });
       createdNotification.onFailed(() => {
         // Native delivery failures are asynchronous on macOS and Windows.
         // Roll back only while this notification still owns an unread badge.
         if (!activeNotifications.delete(createdNotification)) return;
+        releaseGroup();
         if (
           interventionShownAt > 0
           && recentInterventions.get(key) === interventionShownAt
@@ -145,13 +188,19 @@ export function startTaskNotifications(
           // local conversation namespace after an account switch.
           if (runtime.getActiveUserId() !== event.user_id) {
             if (activeNotifications.delete(createdNotification)) {
+              releaseGroup();
               badgeOwned = false;
               updateBadge(unreadCount - 1);
             }
             return;
           }
+          // A counted notification opens the conversation of its latest event;
+          // the sidebar shows the rest.
+          const target = groups.get(group)?.handle === createdNotification
+            ? groups.get(group)!.conversationId
+            : event.conversation_id;
           markNotificationsRead();
-          runtime.openConversation(event.conversation_id, event.status, event.user_id);
+          runtime.openConversation(target, event.status, event.user_id);
         } catch (err) {
           log.warn('task notification click failed', { error: (err as Error)?.message || String(err) });
         }
@@ -166,6 +215,7 @@ export function startTaskNotifications(
       // affect persistence, task completion, the worker scheduler, or leave a
       // badge for a notification the operating system never accepted.
       if (notification && activeNotifications.delete(notification)) {
+        if (groups.get(group)?.handle === notification) groups.delete(group);
         try {
           notification.close();
         } catch {
@@ -194,13 +244,16 @@ export function startTaskNotifications(
       user_id: event.user_id,
       conversation_id: event.conversation_id,
       status: event.status,
+      kind: kindFor(event),
     });
   });
   const unsubscribeInterventions = subscribeInterventions((event: TaskInterventionEvent) => {
+    // An intervention carries no entry point; it reads as a task needing a reply.
     deliver({
       user_id: event.user_id,
       conversation_id: event.conversation_id,
       status: 'waiting_input',
+      kind: 'task',
     }, true);
   });
 

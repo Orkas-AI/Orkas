@@ -36,35 +36,38 @@ export interface DiscoveryResult {
   tools?: DiscoveredTool[];
   connectors?: { id: string; name: string; tool_count: number }[];
 }
+export type DiscoveryValidationReason = 'unknown_field' | 'invalid_connector_id' | 'invalid_tool_name'
+  | 'invalid_query' | 'query_too_long' | 'invalid_limit' | 'invalid_offset'
+  | 'connector_id_required' | 'conflicting_fields';
 export class ConnectorDiscoveryError extends Error {
-  constructor(public readonly code: string, message: string) { super(message); }
+  constructor(public readonly code: string, message: string, public readonly reason?: DiscoveryValidationReason) { super(message); }
 }
 
 export function validateDiscoveryParams(raw: Record<string, unknown>): Params {
-  const bad = (message: string): never => { throw new ConnectorDiscoveryError('E_BAD_INPUT', message); };
+  const bad = (reason: DiscoveryValidationReason, message: string): never => { throw new ConnectorDiscoveryError('E_BAD_INPUT', message, reason); };
   const fields = ['connector_id', 'tool_name', 'query', 'limit', 'offset'];
   const unknown = Object.keys(raw).find(key => !fields.includes(key));
   if (unknown !== undefined) {
     const field = unknown.length > 80 ? `${unknown.slice(0, 80)}…` : unknown;
-    bad(`unsupported discovery field ${JSON.stringify(field)}; allowed fields: ${fields.join(', ')}`);
+    bad('unknown_field', `unsupported discovery field ${JSON.stringify(field)}; allowed fields: ${fields.join(', ')}`);
   }
   const params: Params = {};
   for (const key of ['connector_id', 'tool_name', 'query'] as const) {
     if (raw[key] === undefined) continue;
-    if (typeof raw[key] !== 'string' || !raw[key].trim()) bad(`${key} must be a non-empty string`);
+    if (typeof raw[key] !== 'string' || !raw[key].trim()) bad(`invalid_${key}`, `${key} must be a non-empty string`);
     params[key] = (raw[key] as string).trim();
   }
-  if (params.query && params.query.length > 1024) bad('query must be at most 1024 characters');
+  if (params.query && params.query.length > 1024) bad('query_too_long', 'query must be at most 1024 characters');
   for (const key of ['limit', 'offset'] as const) {
     if (raw[key] === undefined) continue;
     const value = key === 'limit' ? defaultNumericRange(raw[key], params.query ? 8 : 20, 1, 50) : raw[key];
     if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < (key === 'limit' ? 1 : 0) || (key === 'limit' && value > 50)) {
-      bad(key === 'limit' ? 'limit must be an integer from 1 to 50' : `offset must be an integer from 0 to ${Number.MAX_SAFE_INTEGER}`);
+      bad(`invalid_${key}`, key === 'limit' ? 'limit must be an integer from 1 to 50' : `offset must be an integer from 0 to ${Number.MAX_SAFE_INTEGER}`);
     }
     params[key] = value as number;
   }
-  if (params.tool_name && !params.connector_id) bad('`connector_id` is required when `tool_name` is provided');
-  if (params.tool_name && (params.query !== undefined || Object.hasOwn(raw, 'limit') || params.offset !== undefined)) bad('tool_name cannot be combined with query, limit or offset');
+  if (params.tool_name && !params.connector_id) bad('connector_id_required', '`connector_id` is required when `tool_name` is provided');
+  if (params.tool_name && (params.query !== undefined || Object.hasOwn(raw, 'limit') || params.offset !== undefined)) bad('conflicting_fields', 'tool_name cannot be combined with query, limit or offset');
   return params;
 }
 

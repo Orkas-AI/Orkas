@@ -9,8 +9,11 @@ const _convLog = createLogger('preview-host');
   'use strict';
   let closing = false;
   let replacing = false;
+  let replaceAgain = false;
   let refreshTimer = null;
   let projectScoped = false;
+  let sourceGeneration = 0;
+  let disposeVideoToolbar = null;
   async function close() {
     if (closing) return;
     closing = true;
@@ -39,8 +42,9 @@ const _convLog = createLogger('preview-host');
     _updateLightboxNavigation();
   }
   async function loadGalleryPage(gallery, before) {
+    const generation = sourceGeneration;
     const response = await window.orkas.invoke('previewWindows.requestOwner', { kind: 'gallery', before });
-    if (!response?.ok || !Array.isArray(response.items)) return;
+    if (closing || generation !== sourceGeneration || !response?.ok || !Array.isArray(response.items)) return;
     merge(gallery, response.items, before != null);
     if (before != null) gallery.nextCursor = response.nextCursor;
   }
@@ -49,11 +53,30 @@ const _convLog = createLogger('preview-host');
     filesChanged: () => window.orkas.invoke('previewWindows.filesChanged', {}).catch(() => {}) };
   window.orkas.onPushEvent('preview-windows:close-request', requestClose);
   window.orkas.onPushEvent('preview-windows:replace-request', async () => {
-    if (replacing || closing) return;
+    if (closing) return;
+    if (replacing) { replaceAgain = true; return; }
     replacing = true;
     try {
-      const accepted = await _confirmDiscardViewerEdits();
-      await window.orkas.invoke('previewWindows.replace', { accepted });
+      do {
+        replaceAgain = false;
+        const accepted = await _confirmDiscardViewerEdits();
+        const result = await window.orkas.invoke('previewWindows.replace', { accepted });
+        if (result?.source && !closing) {
+          sourceGeneration += 1;
+          clearTimeout(refreshTimer);
+          refreshTimer = null;
+          disposeVideoToolbar?.();
+          disposeVideoToolbar = null;
+          // Release the old content before any stat/read request for the next
+          // file. Keep each lazily-created shell and its fixed listeners.
+          closeChatImageLightbox({ force: true });
+          await closeChatFileViewer({ force: true, keepShell: result.source.kind === 'video' });
+          document.getElementById('preview-loading').hidden = false;
+          await renderSource(result.source);
+        }
+      } while (replaceAgain && !closing);
+    } catch (_) {
+      await showFailure();
     } finally { replacing = false; }
   });
   window.orkas.onPushEvent('preview-windows:gallery-refresh', () => {
@@ -69,6 +92,8 @@ const _convLog = createLogger('preview-host');
     if (!result?.ok) await uiAlert(t('artifact.open_failed'));
   };
   function setupVideoToolbar() {
+    disposeVideoToolbar?.();
+    disposeVideoToolbar = null;
     const viewer = document.querySelector('.chat-file-viewer');
     const video = viewer?.querySelector('video');
     if (!video) return;
@@ -82,18 +107,28 @@ const _convLog = createLogger('preview-host');
     };
     for (const event of ['pointermove', 'pointerdown', 'focusin', 'focusout']) viewer.addEventListener(event, wake);
     for (const event of ['play', 'pause', 'ended', 'error']) video.addEventListener(event, wake);
-    window.addEventListener('pagehide', () => clearTimeout(idleTimer), { once: true });
+    disposeVideoToolbar = () => {
+      clearTimeout(idleTimer);
+      for (const event of ['pointermove', 'pointerdown', 'focusin', 'focusout']) viewer.removeEventListener(event, wake);
+      for (const event of ['play', 'pause', 'ended', 'error']) video.removeEventListener(event, wake);
+      viewer.classList.remove('is-video-idle');
+    };
     wake();
+  }
+  window.addEventListener('pagehide', () => { disposeVideoToolbar?.(); }, { once: true });
+  function applySourceContext(s) {
+    currentCid = s.options?.cid || s.cid || null;
+    projectScoped = !!s.options?.projectScoped;
+    document.title = s.title || 'Orkas';
   }
   async function initialize() {
     await initI18n();
     const result = await window.orkas.invoke('previewWindows.initialize');
     if (!result?.ok || !result.source) throw new Error('preview_unavailable');
-    const s = result.source;
-    currentCid = s.options?.cid || s.cid || null;
-    projectScoped = !!s.options?.projectScoped;
-    document.title = s.title || 'Orkas';
-    document.getElementById('preview-loading').hidden = true;
+    await renderSource(result.source, result);
+  }
+  async function renderSource(s, result = {}) {
+    applySourceContext(s);
     if (s.kind === 'image') {
       const gallery = s.gallery ? { ...s.gallery, selectedKey: s.gallery.items[s.gallery.index]?.key, src: s.src, busy: false } : null;
       openChatImageLightbox(s.src, s.title, { ...s.options, gallery });
@@ -108,12 +143,17 @@ const _convLog = createLogger('preview-host');
       if (!info?.ok || !info.url) throw new Error('application_unavailable');
       window.openSavedAppPreview(info, s.title);
     } else if (s.kind === 'artifact') window.openChatArtifactViewer(s);
+    document.getElementById('preview-loading').hidden = true;
     setupVideoToolbar();
     await window.orkas.invoke('previewWindows.ready');
   }
-  initialize().catch(async () => {
+  async function showFailure() {
     document.getElementById('preview-loading').hidden = true;
+    // A replacement window is hidden until this document can be presented,
+    // including its failure dialog when initialization could not finish.
+    await window.orkas.invoke('previewWindows.ready');
     await uiAlert(t('chat.preview_window_failed'));
     await close();
-  });
+  }
+  initialize().catch(showFailure);
 })();

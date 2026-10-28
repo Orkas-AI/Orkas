@@ -2,6 +2,7 @@
 (function () {
   'use strict';
   const pending = new Map();
+  /* PREVIEW_PENDING */
   let hostConnected = false;
   let hostDiscovery = null;
   const documentId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');

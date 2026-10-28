@@ -44,7 +44,10 @@ test('app approval uses Orkas UI, lasts for this use, isolates windows and honor
     };</script></body></html>`);
   orkas.createWorkspaceFile('usage-app/orkas-app.json', JSON.stringify({sdkVersion:1,capabilities:['connectors']}));
   const first: any = await orkas.invoke('savedApps.saveFromPath', {path:entry,title:'Usage one'});
-  const second: any = await orkas.invoke('savedApps.saveFromPath', {path:entry,title:'Usage two'});
+  const second: any = await orkas.invoke('savedApps.saveFromPath', {path:entry,title:'Usage two',mode:'new'});
+  expect(first.ok).toBe(true);
+  expect(second.ok).toBe(true);
+  expect(second.id).not.toBe(first.id);
   await openSidebarEntry(orkas.page, '#apps-btn');
   const open = (id: string) => orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${id}"]`).click());
   let preview = await open(first.id);

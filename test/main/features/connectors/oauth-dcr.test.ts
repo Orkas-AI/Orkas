@@ -129,6 +129,30 @@ afterEach(() => {
 });
 
 describe('features/connectors/oauth-dcr', () => {
+  it.each(['catalog', 'custom'] as const)('preserves the browser launch failure cause for %s OAuth without exchanging or storing a grant', async kind => {
+    const fetchMock = vi.fn(async (raw: string) => {
+      if (raw.includes('oauth-protected-resource')) return jsonResponse({
+        authorization_servers: ['https://auth.notion.example'], resource: 'https://mcp.notion.example/mcp',
+      });
+      if (raw.includes('oauth-authorization-server')) return jsonResponse({
+        issuer: 'https://auth.notion.example', authorization_endpoint: 'https://auth.notion.example/authorize',
+        token_endpoint: 'https://auth.notion.example/token', registration_endpoint: 'https://auth.notion.example/register',
+      });
+      if (raw.endsWith('/register')) return jsonResponse({ client_id: 'fixture-client' });
+      throw new Error('Token exchange or grant storage must not follow a browser launch failure');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    electronMock.openExternal.mockRejectedValueOnce(new Error('PRIVATE_BROWSER_FAILURE'));
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const flow = kind === 'catalog' ? oauth.startMcpDcrOAuth('uid-1', notionEntry())
+      : oauth.startCustomMcpOAuth('fixture-custom', 'https://mcp.notion.example/mcp');
+    await expect(flow).rejects.toMatchObject({ code: 'browser_open_failed' });
+    expect(electronMock.openExternal).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/register'))).toHaveLength(1);
+    expect(fetchMock.mock.calls.some(([url]) => /\/(?:token|dcr-store|dcr-exchange)$/.test(url))).toBe(false);
+    expect(oauth.cancelDcrOAuth()).toBe(false);
+  });
+
   it('continues discovery after a candidate sends headers but stalls its metadata body', async () => {
     vi.useFakeTimers();
     let release!: () => void;

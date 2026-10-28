@@ -34,6 +34,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 
 const STAMP_FILENAME = '.migrated-from-source';
 
@@ -107,7 +108,7 @@ function safeRm(dir) {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch (err) {
     process.stderr.write(
-      `[migrate-source-data-root] failed to remove ${dir}: ${err.message}\n`,
+      '[migrate-source-data-root] source cleanup failed\n',
     );
   }
 }
@@ -142,7 +143,7 @@ function unionUsersJson(srcFile, dstFile) {
   if (!srcDoc) return; // Nothing to merge (no src users.json).
   if (!dstDoc) {
     // Target had no users.json → just write src's verbatim.
-    fs.writeFileSync(dstFile, JSON.stringify(srcDoc, null, 2), 'utf8');
+    writeUsersJsonAtomic(dstFile, srcDoc);
     return;
   }
 
@@ -173,7 +174,20 @@ function unionUsersJson(srcFile, dstFile) {
       String(a.created_at).localeCompare(String(b.created_at)),
     ),
   };
-  fs.writeFileSync(dstFile, JSON.stringify(merged, null, 2), 'utf8');
+  writeUsersJsonAtomic(dstFile, merged);
+}
+
+// Bootstrap runs before the TypeScript loader and storage.ts. Publish the
+// registry through a sibling so a failed write never truncates the old users.
+function writeUsersJsonAtomic(file, body) {
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(body, null, 2), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    try { fs.rmSync(temporary, { force: true }); } catch { /* preserve the write error */ }
+    throw error;
+  }
 }
 
 function readUsersJsonOrNull(file) {

@@ -9,12 +9,29 @@ const renderer = path.resolve(__dirname, '../../src/renderer');
 const svg = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><rect width="640" height="360" fill="steelblue"/></svg>');
 const picture = (id: string) => `<img id="${id}" class="chat-md-img" src="${svg}#${id}" alt="${id}">`;
 
+const capturedLogs = new WeakMap<Page, Array<{ level: string; message: string }>>();
+test.afterEach(async ({ page }, testInfo) => {
+  const captured = capturedLogs.get(page) || [];
+  await testInfo.attach('browser-log-audit.json', {
+    body: JSON.stringify({ total: captured.length,
+      unexpected: captured.map(log => ({ ...log, message: log.message.replace(/file:\/\/\/\S+/g, '[local-file]') })) }),
+    contentType: 'application/json',
+  });
+  expect(captured).toEqual([]);
+});
+
 // Real renderer scripts and browser events; only IPC/history data is controlled.
 // This suite owns gallery UI integration, not backend history or file permissions.
 async function setup(page: Page, content: string) {
   const errors: string[] = [];
-  page.on('pageerror', (error) => errors.push(error.message));
+  const captured: Array<{ level: string; message: string }> = [];
+  capturedLogs.set(page, captured);
+  page.on('pageerror', (error) => {
+    errors.push(error.message);
+    captured.push({ level: 'error', message: error.message });
+  });
   page.on('console', (message) => {
+    captured.push({ level: message.type(), message: message.text() });
     if (message.type() === 'error' || message.type() === 'warning') errors.push(message.text());
   });
   await page.setContent(`<textarea id="composer"></textarea><div id="chat-history" class="chat-history">${content}</div><div class="chat-history">${picture('other-task')}</div>`);

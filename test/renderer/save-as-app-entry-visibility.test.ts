@@ -1,5 +1,5 @@
 // "Save as app" is offered from the file preview button and the conversation
-// file menu. Oracle: docs/test/my-apps-regression.md 保存入口 2/3 — only
+// file menu. Oracle: docs/test/my-apps-regression.md save entries 2/3 — only
 // HTML/HTM, CSS and JS/MJS application sources and directories containing an
 // HTML entry offer it; images, JSON, audio/video, manifests, fonts, WASM,
 // models, PDF, ZIP and plain directories never do, even beside an HTML entry.
@@ -78,10 +78,15 @@ function fileViewer(invoke: (channel: string, payload: any) => Promise<any>) {
   const context: any = { window: { orkas: { invoke } }, warnings };
   vm.createContext(context);
   vm.runInContext(`
-    var _viewerSaveAppBtn = { hidden: true, disabled: true };
+    function button() { return { hidden: true, disabled: true, dataset: {}, attributes: {},
+      setAttribute(name, value) { this.attributes[name] = value; } }; }
+    var _viewerSaveAppBtn = button(), _viewerSaveNewAppBtn = button();
     var _viewerCurrentPath = null, _viewerCurrentCid = 'conversation-1', _viewerCurrentProjectId = null;
+    var _viewerRenderSeq = 0;
     var _viewerLog = { warn: (...args) => warnings.push(args) };
     function _isViewerOpen() { return true; }
+    ${extractFunction(viewerSource, '_viewerLabel')}
+    ${extractFunction(viewerSource, '_setViewerButtonLabel')}
     ${extractFunction(viewerSource, '_viewerFileActionPayload')}
     ${extractFunction(viewerSource, '_setSaveAppVisible')}
     ${extractFunction(viewerSource, '_refreshSaveAppButton')}
@@ -90,7 +95,10 @@ function fileViewer(invoke: (channel: string, payload: any) => Promise<any>) {
       await _refreshSaveAppButton(target);
       return !_viewerSaveAppBtn.hidden && !_viewerSaveAppBtn.disabled;
     }`, context, { filename: 'chat-file-viewer.js' });
-  return { visible: (target: string) => context.previewSaveAppVisible(target) as Promise<boolean>, warnings };
+  return {
+    visible: (target: string) => context.previewSaveAppVisible(target) as Promise<boolean>, warnings,
+    copyVisible: () => !context._viewerSaveNewAppBtn.hidden && !context._viewerSaveNewAppBtn.disabled,
+  };
 }
 
 class MenuNode {
@@ -147,6 +155,7 @@ describe('Save as app entry visibility by file type', () => {
   it.each(table)('file preview offers Save as app for %s: %s', async (rel, expected) => {
     const viewer = fileViewer(inspectionIpc);
     expect(await viewer.visible(path.join(workspace, rel))).toBe(expected);
+    expect(viewer.copyVisible()).toBe(false);
     expect(viewer.warnings).toEqual([]);
   });
 
@@ -159,6 +168,16 @@ describe('Save as app entry visibility by file type', () => {
     const invoke=async()=>({ok:true,canSave:false,reason:'app_bundle_root'});
     expect(await fileViewer(invoke).visible(path.join(workspace,'index.html'))).toBe(true);
     expect(await conversationFileMenu(invoke)(path.join(workspace,'index.html'))).toBe(true);
+  });
+
+  it('offers a copy only for an eligible source with a saved destination and clears it for the next file', async () => {
+    const viewer = fileViewer(async (channel, payload) => ({
+      ...await inspectionIpc(channel, payload), target: { appId: 'existing-app' },
+    }));
+    expect(await viewer.visible(path.join(workspace, 'app', 'index.html'))).toBe(true);
+    expect(viewer.copyVisible()).toBe(true);
+    expect(await viewer.visible(path.join(workspace, 'app', 'logo.png'))).toBe(false);
+    expect(viewer.copyVisible()).toBe(false);
   });
 
   it('keeps both entries hidden when inspection fails or reports a refusal', async () => {

@@ -95,7 +95,7 @@ describe('open-source composer model picker', () => {
       official: true,
       recommended: true,
       modelEditable: false,
-      includedModels: ['DeepSeek V4', 'GPT-5.6 Luna', 'Claude-Sonnet-5', 'Gemini-3.6 Flash'],
+      includedModels: ['DeepSeek V4.1 Flash', 'GPT-6 Luna', 'Claude-Sonnet-5', 'Gemini-3.8 Flash'],
     };
     const pro = {
       entryId: 'official-pro',
@@ -104,7 +104,7 @@ describe('open-source composer model picker', () => {
       modelName: 'Orkas-1.5 Pro',
       official: true,
       modelEditable: false,
-      includedModels: ['GPT-5.6 Sol', 'Claude Opus 5', 'Kimi K3'],
+      includedModels: ['GPT-6.1 Sol', 'Claude Opus 5.5', 'Kimi K3'],
     };
     const custom = {
       entryId: 'custom-model', provider: 'anthropic', model: 'claude-opus-4-8',
@@ -124,13 +124,15 @@ describe('open-source composer model picker', () => {
     const title = item.children[0].children[0].children[0];
     expect(title.children[0].textContent).toBe('Orkas-1.5');
     expect(title.children[1].className).toBe('composer-model-menu-recommended');
-    expect(title.children[1].textContent).toBe('推荐');
+    expect(title.children[1].textContent).toBe('推荐 · 较厂商 API 最高省 50%');
     expect(item.children[0].children[0].children[1].textContent).toBe(
-      '适合问答、写作、办公等日常任务。包含：DeepSeek V4 · GPT-5.6 Luna · Claude-Sonnet-5 · Gemini-3.6 Flash',
+      '适合问答、写作、办公等日常任务。包含：DeepSeek V4.1 Flash · GPT-6 Luna · Claude-Sonnet-5 · Gemini-3.8 Flash',
     );
     expect(context._composerModelOfficialDescription(pro)).toBe(
-      '适合研究、视频、研发等复杂任务。包含：GPT-5.6 Sol · Claude Opus 5 · Kimi K3',
+      '适合研究、视频、研发等复杂任务。包含：GPT-6.1 Sol · Claude Opus 5.5 · Kimi K3',
     );
+    const proItem = context._buildComposerModelMenuItem(pro, '', {});
+    expect(proItem.children[0].children[0].children[0].children).toHaveLength(1);
     expect(style).toMatch(/\.composer-model-menu-group \+ \.composer-model-menu-group\s*\{[^}]*border-top:\s*1px solid var\(--border\)/s);
   });
 });

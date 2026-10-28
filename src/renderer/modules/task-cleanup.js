@@ -56,6 +56,8 @@
   const aliases = { retry: 'chat.retry_btn', stop: 'chat.task_stop', loading: 'common.loading', refresh: 'common.refresh', view: 'settings.recycle.view', collapse: 'settings.recycle.collapse', cancel: 'common.cancel', confirm_title: 'settings.cleanup.title' };
   const tr = (key, values) => key === 'all' ? `${t('chat.message_select_all')} (${values.n})`
     : key === 'page' ? `${values.from}–${values.to} / ${values.n}` : t(aliases[key] || `settings.cleanup.${key}`, values);
+  const resultText = () => tr('result', result) + (Number.isSafeInteger(result?.remaining)
+    ? ' · ' + tr('remaining', { n: result.remaining }) : '');
   const esc = value => escapeHtml(String(value));
   const button = (action, label, disabled = false, danger = false, projectId = '') =>
     `<button type="button" class="btn btn-sm${danger ? ' btn-danger' : ''}" data-cleanup-action="${action}" data-cleanup-owner="${esc(projectId)}"${disabled ? ' disabled' : ''}>${esc(label)}</button>`;
@@ -134,10 +136,10 @@
     let html = '';
     if (busy) html += `<div class="settings-row" role="status"><span class="settings-row-desc">${esc(tr('progress', { done: result.done, total: result.total }))}</span>${button('stop', tr('stop'), stopped)}</div>`;
     else if (loading) html += `<div class="settings-row" role="status">${esc(tr('loading'))}</div>`;
-    else if (error) html += `<div class="settings-row" role="alert"><span class="settings-row-desc">${esc(tr('error'))}${result ? ' ' + esc(tr('result', result)) : ''}</span><div class="settings-cleanup-actions">${failed.length ? button('retry', tr('retry')) : ''}${button('refresh', tr('refresh'))}</div></div>`;
+    else if (error) html += `<div class="settings-row" role="alert"><span class="settings-row-desc">${esc(tr('error'))}${result ? ' ' + esc(resultText()) : ''}</span><div class="settings-cleanup-actions">${failed.length ? button('retry', tr('retry')) : ''}${button('refresh', tr('refresh'))}</div></div>`;
     else {
       if (confirming) html += `<div class="settings-row" role="group" aria-label="${esc(tr('confirm_title'))}"><span class="settings-row-desc">${esc(tr('confirm', { n: selected }))}</span><div class="settings-cleanup-actions">${button('cancel', tr('cancel'))}${button('confirm', tr('move', { n: selected }), !selected, true)}</div></div>`;
-      else html += `<div class="settings-row"><div class="settings-cleanup-copy">${total ? `<label class="settings-cleanup-select-all">${checkbox('data-cleanup-all', selected, selectableTotal, false, tr('all', { n: total }))}<span>${esc(tr('all', { n: total }))}</span></label>` : ''}${result || !total ? `<span class="settings-row-desc" role="status">${esc(result ? tr('result', result) : tr('empty'))}</span>` : ''}</div><div class="settings-cleanup-actions">${failed.length ? button('retry', tr('retry')) : ''}${total ? button('view', tr(expanded ? 'collapse' : 'view')) : ''}${button('prepare', `${tr('clean')} (${selected})`, !selected, true)}</div></div>`;
+      else html += `<div class="settings-row"><div class="settings-cleanup-copy">${total ? `<label class="settings-cleanup-select-all">${checkbox('data-cleanup-all', selected, selectableTotal, false, tr('all', { n: total }))}<span>${esc(tr('all', { n: total }))}</span></label>` : ''}${result || !total ? `<span class="settings-row-desc" role="status">${esc(result ? resultText() : tr('empty'))}</span>` : ''}</div><div class="settings-cleanup-actions">${failed.length ? button('retry', tr('retry')) : ''}${total ? button('view', tr(expanded ? 'collapse' : 'view')) : ''}${button('prepare', `${tr('clean')} (${selected})`, !selected, true)}</div></div>`;
       if (expanded && total) {
         const drafts = new Set(draftIds());
         html += '<div class="settings-cleanup-list">';
@@ -171,6 +173,7 @@
     try {
       const p = await invoke('preview', { days, draftIds: draftIds() });
       if (!Array.isArray(p.entries) || !Number.isSafeInteger(p.total) || !Number.isSafeInteger(p.selectableTotal) || typeof p.token !== 'string') throw new Error('invalid_preview');
+      if (keepResult && result) result.remaining = p.total;
       token = p.token; total = p.total; selectableTotal = p.selectableTotal; entries = p.entries; offset = 0;
       nextOffset = p.treeNextOffset; treeTotal = p.treeTotal;
       projects.clear(); knownRows.clear(); projectViews.clear(); removed.clear(); removedByProject.clear(); resetSelection(); remember(entries);
@@ -190,7 +193,7 @@
   async function run(retry = false) {
     if (busy || loading || owner !== user() || (!retry && !confirming)) return;
     busy = true; confirming = false; stopped = false; error = false;
-    const operationOwner = owner, retryIds = failed.slice(); failed = [];
+    const operationOwner = owner, startedAt = Date.now(), retryIds = failed.slice(); failed = [];
     result = { deleted: 0, skipped: 0, failed: 0, done: 0, total: retry ? retryIds.length : selectedCount() }; render();
     try {
       let next = 0;
@@ -219,6 +222,11 @@
     } catch (_) { error = true; }
     finally {
       busy = false;
+      if (typeof _logConversationManageResult === 'function') {
+        const failedOperation = error || result.failed;
+        _logConversationManageResult('delete', startedAt, failedOperation ? 'failure' : 'success',
+          failedOperation ? 'delete_failed' : '');
+      }
       if (operationOwner === user()) {
         window.initRecycleBin?.();
         if (typeof loadConversations === 'function') try { await loadConversations({ fresh: true }); } catch (_) { log.warn('cleanup navigation refresh failed'); }

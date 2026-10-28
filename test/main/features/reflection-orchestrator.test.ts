@@ -622,6 +622,32 @@ describe('reflection-orchestrator › runOneCycle', () => {
     expect(mod.readReflectionState(TEST_UID)).toEqual({ lastReflectedAt: {} });
   });
 
+  it('uses configured API-key cooldowns by default without consuming reflection windows', async () => {
+    const auth = await import('../../../src/main/features/auth');
+    const cooldown = await import('../../../src/main/model/core-agent/profile-cooldown');
+    const first = await auth.addApiKeyEntry('anthropic', 'claude-opus-4-8', 'fixture-first-key-xxxxxxxx', 'first');
+    const second = await auth.addApiKeyEntry('openai', 'gpt-5.5', 'fixture-second-key-xxxxxxxx', 'second');
+    cooldown.markCooldown(first.profileId, 'rate_limit', 'fixture 429');
+    cooldown.markCooldown(second.profileId, 'auth', 'fixture 401');
+    const mod = await loadModule();
+    const reflect = vi.fn(async () => 'nothing_to_save' as const);
+    const isDirty = vi.fn(async () => true);
+    const stateFile = path.join(tmpDir, TEST_UID, 'local', 'config', 'reflection-state.json');
+    expect(fs.existsSync(stateFile)).toBe(false);
+    expect(await mod.runOneCycle(TEST_UID, { now: () => NOW, reflect, isDirty })).toBe(0);
+    expect(isDirty).not.toHaveBeenCalled();
+    expect(reflect).not.toHaveBeenCalled();
+    expect(fs.existsSync(stateFile)).toBe(false);
+    expect(mod.readReflectionState(TEST_UID)).toEqual({ lastReflectedAt: {} });
+
+    // A usable credential opens the same production default gate again.
+    cooldown.clearCooldown(second.profileId);
+    await mod.runOneCycle(TEST_UID, { now: () => NOW, reflect, isDirty });
+    expect(isDirty).toHaveBeenCalled();
+    expect(reflect).toHaveBeenCalledOnce();
+    expect(fs.existsSync(stateFile)).toBe(true);
+  });
+
   it('passes model-safe capacity into transcript selection', async () => {
     const observeBudget = vi.fn();
     const mod = await loadModuleWithRunner({ writes: 0, inputBudget: 43210, observeBudget });

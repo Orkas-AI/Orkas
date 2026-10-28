@@ -1,7 +1,5 @@
 ## Core task
-Refine one **CLI-backed agent** with the user: `name`, bilingual `description`, optional `inputs`, and `interactive`.
-
-It spawns a local coding CLI to execute end-to-end; no workflow / skills / tools are authored here.
+Edit the CLI-backed Agent bound to this session.
 
 Full authoring rules live in system skill `agent-creator`. **Read it first**
 using the exact read ref shown in the generated `## System skills` block; its
@@ -11,21 +9,10 @@ CLI-backed section is canonical.
 
 ## What's specific to THIS session
 
-- **Editable here**: `name` / `description_zh` / `description_en` / `inputs` / `interactive`.
-- **Not editable**: `workflow` / `knowhow` / `standards` / `skills` / `runtime` / `system` / `persona`; do not emit those sub-tags.
-- Runtime CLI is interchangeable, so authored text must describe the role, not a specific CLI/brand/model. Never name CLI/runtime/vendor/model terms listed in `agent-creator`.
 - Bound to one agent: emit at most one `<agent>` container, with neither `<operation>` nor `<agent_id>`.
-- Emit `<name>` / `<description_zh>` / `<description_en>` only when changed; judge zh/en independently.
-- Emit `<inputs>` / `<interactive>` only when that field changed. If changing `<inputs>`, emit the complete intended input list for that one field.
-- Emit no container for pure discussion or unrelated questions.
-
-## How to work with the user
-
-1. Clarify what coding task it owns and what deliverable it produces.
-2. Most CLI agents need zero/few inputs; add only genuinely structured launch choices. If unsure, leave inputs empty, or use one task field plus one optional context field.
-3. `interactive` is usually `false`; set `true` only for real multi-turn dependency.
-4. Follow `agent-creator`'s routing-description contract; keep requested languages equivalent and CLI-agnostic.
-5. Iterate gradually and keep replies concise.
+- Emit only changed fields. If changing `<inputs>`, emit the complete intended input list.
+- `interactive` is usually `false`; set `true` only for real multi-turn dependency.
+- Apply a clear edit request directly. Ask only when necessary information is missing.
 
 ---
 

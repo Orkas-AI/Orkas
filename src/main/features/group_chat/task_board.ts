@@ -125,6 +125,9 @@ export interface ConversationTask {
    * log, so a user reply that continues this row gets this copy instead. */
   assignment_context?: string;
   source_msg_id?: string;
+  /** Send now has persisted the user bubble. Independent of runtime
+   * acceptance: the queued item may still await the next steer boundary. */
+  message_sent_at?: string;
   result_msg_id?: string;
   turn_id?: string;
   /** A queued user task explicitly folded into an already-running turn.
@@ -269,6 +272,7 @@ function normalizeTask(raw: any, cid: string): ConversationTask | null {
     t.assignment_context = raw.assignment_context;
   }
   if (typeof raw.source_msg_id === 'string' && raw.source_msg_id) t.source_msg_id = raw.source_msg_id;
+  if (typeof raw.message_sent_at === 'string' && raw.message_sent_at) t.message_sent_at = raw.message_sent_at;
   if (typeof raw.result_msg_id === 'string' && raw.result_msg_id) t.result_msg_id = raw.result_msg_id;
   if (typeof raw.turn_id === 'string' && raw.turn_id) t.turn_id = raw.turn_id;
   if (typeof raw.absorbed_into_turn_id === 'string' && raw.absorbed_into_turn_id) {
@@ -404,9 +408,11 @@ function scheduleFlush(b: BoardState): void {
   });
 }
 
-/** Wait until every board's pending snapshot is on disk. */
-export async function flushBoards(): Promise<void> {
-  await Promise.all([..._boards.values()].map((b) => {
+/** Settle pending snapshots for one conversation, or every board at teardown. */
+export async function flushBoards(scope?: { uid: string; cid: string }): Promise<void> {
+  const selected = scope ? _boards.get(boardKey(scope.uid, scope.cid)) : undefined;
+  const boards = scope ? (selected ? [selected] : []) : [..._boards.values()];
+  await Promise.all(boards.map((b) => {
     const run = b.chain.then(() => flushLocked(b));
     b.chain = run.catch(() => {});
     return run;
@@ -538,6 +544,18 @@ export function confirmQueued(
       changed.push({ ...t });
     }
     return changed;
+  });
+}
+
+/** Publish message delivery without claiming execution or absorption. */
+export function markMessageSent(
+  uid: string, cid: string, taskId: string, sentAt: string,
+): Promise<ConversationTask | null> {
+  return withBoard(uid, cid, (b) => {
+    const task = b.tasks.find((row) => row.task_id === taskId);
+    if (!task || task.created_by !== 'user') return null;
+    task.message_sent_at ||= sentAt;
+    return { ...task };
   });
 }
 

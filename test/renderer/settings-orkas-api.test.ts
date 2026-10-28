@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
+import { LOCALES } from '../../src/main/i18n';
 
 class FakeElement {
   value = '';
@@ -115,6 +116,24 @@ function loadQuickSetupHarness(language = 'en') {
 }
 
 describe('Orkas public API quick setup', () => {
+  it('uses the approved maximum saving in every locale and the initial settings paint', () => {
+    const html = readFileSync(resolve(__dirname, '../../src/renderer/index.html'), 'utf8');
+    for (const { code } of LOCALES) {
+      const catalog = JSON.parse(readFileSync(
+        resolve(__dirname, `../../src/renderer/locales/${code}.json`), 'utf8',
+      ));
+      for (const key of ['price_comparison.maximum', 'new_chat.model_picker.recommended_with_savings']) {
+        expect(catalog[key], `${code}: ${key}`).toContain('50');
+        expect(catalog[key], `${code}: ${key}`).not.toContain('60');
+      }
+      if (code === 'en') {
+        expect(html).toContain(`data-i18n="price_comparison.maximum">${catalog['price_comparison.maximum']}</span>`);
+        expect(catalog['price_comparison.maximum']).toBe('Model costs up to 50% less than provider API pricing');
+      }
+      if (code === 'zh') expect(catalog['price_comparison.maximum']).toBe('模型费用较厂商 API 最高省 50%');
+    }
+  });
+
   it('uses concise configure copy in every supported locale', () => {
     const html = readFileSync(resolve(__dirname, '../../src/renderer/index.html'), 'utf8');
     expect(html).toContain('data-i18n="settings.orkas_api.configure">Configure</button>');
@@ -160,7 +179,10 @@ describe('Orkas public API quick setup', () => {
     vm.runInContext(`
       _settingsAttachReorderDnd = () => {};
       _settingsState.searchProfiles = [{ id: 's1', provider: 'orkas-api', label: 'Orkas', apiKeyMasked: 'sk-…1' }];
-      _settingsState.imageProfiles = [{ id: 'i1', provider: 'orkas-api', model: 'orkas-image', label: 'Orkas', apiKeyMasked: 'sk-…1' }];
+      _settingsState.imageProfiles = [
+        { id: 'i1', provider: 'orkas-api', model: 'orkas-image', label: 'Orkas', apiKeyMasked: 'sk-…1' },
+        { id: 'i2', provider: 'openai', model: 'gpt-image-2', label: 'Personal', apiKeyMasked: 'sk-…2' }
+      ];
       _settingsState.videoProfiles = [{ id: 'v1', provider: 'orkas-api', model: 'orkas-video', label: 'Orkas', apiKeyMasked: 'sk-…1' }];
       _settingsState.ttsProfiles = [{ id: 't1', provider: 'orkas-api', model: 'orkas-tts-1', label: 'Orkas', apiKeyMasked: 'sk-…1' }];
       _settingsRenderSearchEntries();
@@ -175,15 +197,22 @@ describe('Orkas public API quick setup', () => {
     expect(configuredLabel('settings-image-entries')).toContain('>Orkas · Image</span>');
     expect(configuredLabel('settings-video-entries')).toContain('>Orkas · Video</span>');
     expect(configuredLabel('settings-tts-entries')).toContain('>Orkas · Voice</span>');
+    const mediaDetails = (id: string, index = 0) => elements.get(id)!.children[index]!.children[1]!.children
+      .filter(child => child.className.includes('entry-media-model')).map(child => child.textContent);
+    expect(mediaDetails('settings-image-entries')).toEqual(['Seedream 5.0 Flash']);
+    expect(mediaDetails('settings-video-entries')).toEqual(['Seedance 2.0/2.5']);
+    expect(mediaDetails('settings-image-entries', 1)).toEqual([]);
+    expect(mediaDetails('settings-search-entries')).toEqual([]);
+    expect(mediaDetails('settings-tts-entries')).toEqual([]);
     expect(source).toContain('settings.orkas_api.recommended');
     expect(source).toContain('settings.orkas_api.includes');
   });
 
   it('renders both configured official model rows in Settings', () => {
     const { context, elements } = loadQuickSetupHarness();
-    context.t = (key: string, values?: { models?: string }) => (
-      values?.models ? `${key}: ${values.models}` : key
-    );
+    const zh = JSON.parse(readFileSync(resolve(__dirname, '../../src/renderer/locales/zh.json'), 'utf8'));
+    context.t = (key: string, values?: { models?: string }) => String(zh[key] || key)
+      .replace('{models}', values?.models || '');
     vm.runInContext(`
       _settingsAttachReorderDnd = () => {};
       _settingsState.entries = [
@@ -191,14 +220,14 @@ describe('Orkas public API quick setup', () => {
           entryId: 'orkas-standard', provider: 'orkas-api', providerLabel: 'Orkas',
           model: 'orkas-llm-1.5', modelName: 'Orkas-1.5', modelEditable: false,
           modelAvailable: true, official: true, recommended: true,
-          includedModels: ['DeepSeek V4', 'GPT-5.6 Luna', 'Claude-Sonnet-5', 'Gemini-3.6 Flash'],
+          includedModels: ['DeepSeek V4.1 Flash', 'GPT-6 Luna', 'Claude-Sonnet-5', 'Gemini-3.8 Flash'],
           profileType: 'api_key', profileAvailable: true, profileLabel: 'Orkas'
         },
         {
           entryId: 'orkas-pro', provider: 'orkas-api', providerLabel: 'Orkas',
           model: 'orkas-llm-1.5-pro', modelName: 'Orkas-1.5 Pro', modelEditable: false,
           modelAvailable: true, official: true,
-          includedModels: ['GPT-5.6 Sol', 'Claude Opus 5', 'Kimi K3'],
+          includedModels: ['GPT-6.1 Sol', 'Claude Opus 5.5', 'Kimi K3'],
           profileType: 'api_key', profileAvailable: true, profileLabel: 'Orkas'
         }
       ];
@@ -208,11 +237,13 @@ describe('Orkas public API quick setup', () => {
     const rows = elements.get('settings-entries')!.children;
     expect(rows).toHaveLength(2);
     expect(rows[0]!.children[1]!.children[0]!.innerHTML).toContain('Orkas-1.5');
+    expect(rows[0]!.children[1]!.children[0]!.innerHTML).toContain('推荐 · 较厂商 API 最高省 50%');
     expect(rows[1]!.children[1]!.children[0]!.innerHTML).toContain('Orkas-1.5 Pro');
+    expect(rows[1]!.children[1]!.children[0]!.innerHTML).not.toContain('50%');
     expect(rows[0]!.children[1]!.children[1]!.children[1]!.textContent)
-      .toContain('DeepSeek V4 · GPT-5.6 Luna · Claude-Sonnet-5 · Gemini-3.6 Flash');
+      .toContain('DeepSeek V4.1 Flash · GPT-6 Luna · Claude-Sonnet-5 · Gemini-3.8 Flash');
     expect(rows[1]!.children[1]!.children[1]!.children[1]!.textContent)
-      .toContain('GPT-5.6 Sol · Claude Opus 5 · Kimi K3');
+      .toContain('GPT-6.1 Sol · Claude Opus 5.5 · Kimi K3');
   });
 
   it('saves the shared credential without a success label from the real card click binding', async () => {

@@ -41,9 +41,7 @@ import {
   type LocalCliPermissionDecision,
   StderrTail,
   spawnCli,
-  killProcessTree,
   reapCliAfterProtocolTerminal,
-  bindAbort,
   armKillWatchdog,
   LineSplitter,
   stripAnsi,
@@ -340,11 +338,13 @@ export const codexBackend: LocalBackend = {
     // `-c mcp_servers.orkas.env.*` (buildCodexBridgeOverrides); Codex itself,
     // and every shell it runs, must not inherit those handles.
     const child = spawnCli(opts.binPath, args, opts.cwd);
-    const detachAbort = bindAbort(child, opts.signal);
+    const detachAbort = () => opts.signal.removeEventListener('abort', cancelAndReap);
     const tail = new StderrTail();
     const startedAt = Date.now();
 
     let exited = false;
+    let cancellationRequested = false;
+    let interruptCleanup: ReturnType<typeof setTimeout> | undefined;
     let bootstrapTimer: NodeJS.Timeout | null = null;
     let resolveOuter!: () => void;
     const outerPromise = new Promise<void>(resolve => { resolveOuter = resolve; });
@@ -362,6 +362,7 @@ export const codexBackend: LocalBackend = {
       deadlineAt: opts.deadlineAt,
       idleKillMs: opts.idleKillMs,
       lastEventAt: opts.lastEventAt,
+      terminate: () => cancelAndReap(),
     });
 
     // ─── JSON-RPC client state ────────────────────────────────────────
@@ -411,6 +412,32 @@ export const codexBackend: LocalBackend = {
         pending.set(id, { method, resolve, reject });
         sendLine({ jsonrpc: '2.0', id, method, params });
       });
+
+    function reapAfterInterrupt() {
+      if (interruptCleanup) clearTimeout(interruptCleanup);
+      interruptCleanup = undefined;
+      reapCliAfterProtocolTerminal(child);
+    }
+
+    function cancelAndReap() {
+      if (cancellationRequested) return;
+      cancellationRequested = true;
+      // turn/interrupt is part of the verified v2 floor (0.145.0), with
+      // threadId + turnId. Let the native tool host close before discovering
+      // and forcing leftover descendants; otherwise Code Mode reports an
+      // unexpected stdout closure while Orkas is cancelling normally.
+      if (!exited && threadId && activeTurnId) {
+        interruptCleanup = setTimeout(reapAfterInterrupt, 500);
+        interruptCleanup.unref?.();
+        void rpc('turn/interrupt', { threadId, turnId: activeTurnId }).catch(() => {
+          if (!exited) log.warn('codex native interruption failed; forcing process cleanup');
+        });
+      } else reapAfterInterrupt();
+    }
+    child.once('close', () => {
+      if (interruptCleanup) clearTimeout(interruptCleanup);
+      interruptCleanup = undefined;
+    });
 
     const notify = (method: string, params?: Record<string, unknown>) => {
       sendLine({ jsonrpc: '2.0', method, ...(params ? { params } : {}) });
@@ -733,14 +760,16 @@ export const codexBackend: LocalBackend = {
       });
     });
 
+    const stderrLines = new LineSplitter(64 * 1024);
+    const stderrLine = (raw: string) => {
+      const line = stripAnsi(raw);
+      if (line) opts.onEvent({ type: 'stderr-line', line });
+    };
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
       if (exited) return;
-      const clean = stripAnsi(chunk);
-      tail.push(clean);
-      for (const line of clean.split(/\r?\n/)) {
-        if (line) opts.onEvent({ type: 'stderr-line', line });
-      }
+      tail.push(stripAnsi(chunk));
+      stderrLines.push(chunk, stderrLine);
     });
 
     function emitTextDelta(chunk: { text: string; itemId?: string; phase?: LocalTextPhase } | null) {
@@ -1186,7 +1215,9 @@ export const codexBackend: LocalBackend = {
       publishActiveIngress(null);
       if (aborted) turnAborted = true;
       const output = agentMessages.output();
-      if (turnAborted) {
+      if (watchdog.fired() && !opts.signal.aborted) {
+        finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output, stderrTail: tail.toString() });
+      } else if (turnAborted || opts.signal.aborted) {
         finish('cancelled', { output });
       } else if (turnFailed) {
         finish('failed', {
@@ -1200,7 +1231,7 @@ export const codexBackend: LocalBackend = {
       // Resolve the run from the authoritative protocol terminal event.
       // Process reaping is deliberately asynchronous so an inherited pipe or
       // background terminal cannot leave the conversation spinner running.
-      reapCliAfterProtocolTerminal(child);
+      reapAfterInterrupt();
     }
 
     function clearSystemErrorFallback() {
@@ -1230,6 +1261,7 @@ export const codexBackend: LocalBackend = {
       if (exited) return;
       publishActiveIngress(null);
       exited = true;
+      stderrLines.flush(stderrLine);
       if (bootstrapTimer) clearTimeout(bootstrapTimer);
       clearSystemErrorFallback();
       clearInterval(activityTimer);
@@ -1250,13 +1282,10 @@ export const codexBackend: LocalBackend = {
       // A JSON-RPC setup failure resolves before the normal close-driven
       // lifecycle. Explicitly terminate the detached process group so a CLI
       // that keeps its event loop alive cannot outlive the failed dispatch.
-      // A short hard-kill fallback also bounds teardown of an uncooperative
-      // process. Submission, not a missing acknowledgement, decides replay safety.
-      const hardKill = setTimeout(() => killProcessTree(child, 'SIGKILL'), 250);
-      if (typeof hardKill.unref === 'function') hardKill.unref();
-      child.once('close', () => clearTimeout(hardKill));
-      try { child.stdin.end(); } catch { /* already closed */ }
-      killProcessTree(child, 'SIGTERM');
+      // Use the existing terminal cleanup owner: on Windows EOF must wait
+      // until taskkill has traversed the live parent. POSIX retains the short
+      // escalation. Submission, not a missing acknowledgement, decides replay safety.
+      reapCliAfterProtocolTerminal(child, 250);
       finish('failed', {
         error,
         stderrTail: tail.toString(),
@@ -1298,6 +1327,9 @@ if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), 
         ...(!turnStarted ? { failureKind: 'cli_spawn', retrySafe: !turnStartSent } : {}),
       });
     });
+
+    if (opts.signal.aborted) cancelAndReap();
+    else opts.signal.addEventListener('abort', cancelAndReap, { once: true });
 
     // ─── Drive the protocol ──────────────────────────────────────────
     // initialize → thread → turn/start is a control-plane exchange. A binary

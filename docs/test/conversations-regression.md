@@ -353,6 +353,24 @@ Orkas 不在 Commander、内置 in-process Agent 或 CLI Agent 的 prompt 中追
 3. 自动恢复验证成功后返回 `cascade_failed` 并清理内部快照；验证不完整时返回
    `cascade_recovery_incomplete` 并保留快照供重试。
 
+### Local history cleanup, repair and restoration
+
+- Cleanup operates on the confirmed preview only. After a successful run, show
+  the refreshed remaining count and clear selection. Tasks added afterwards
+  require a new selection; changing the age filter does not install a retention policy.
+- A repair paused during discovery must not overwrite a subsequent delete,
+  pin, create or explicit restore, or remove the restored metadata.
+- An explicitly deleted task must remain hidden if its old payload reappears
+  with a newer modification time. Missing or unreadable transcripts alone must
+  not be treated as permission to delete a task.
+- Repeat local repair after restarting. Deleted metadata must not reappear;
+  an explicit recycle-bin restoration must remain visible, including a task
+  whose archive contains metadata and drafts without a transcript.
+
+Automated owners: `test/main/features/chats.test.ts`,
+`test/main/features/recycle_bin.test.ts`, `test/renderer/task-cleanup.test.ts`
+and `test/e2e/task_cleanup_e2e_history.spec.ts`.
+
 ## 任务失败只来自明确执行错误（2026-08-20）
 
 1. 模型正文不再携带成功/失败结果标记，宿主不得从模型自述推导任务状态。

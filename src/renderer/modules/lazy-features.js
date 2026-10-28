@@ -22,10 +22,12 @@ const _rendererFeatureManifest = Object.freeze({
   ],
   project: [
     { src: './modules/library-transfer.js' },
+    { src: './modules/date-picker.js' },
     { src: './modules/project-detail.js' },
     { src: './modules/todos.js' },
   ],
   auto: [
+    { src: './modules/date-picker.js' },
     { src: './modules/auto.js' },
   ],
   contexts: [

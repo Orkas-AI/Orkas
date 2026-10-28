@@ -342,6 +342,17 @@ export function providerHttpStatusOf(err: unknown): number | undefined {
   return undefined;
 }
 
+/** A structured HTTP 451 rejection is terminal, independently of retry policy.
+ * A transient wrapper must not reopen retries or route around that rejection. */
+export function isProviderLegalRestrictionError(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; current && depth < 8; depth++) {
+    if (errorStatusOf(current) === 451) return true;
+    current = errorCauseOf(current);
+  }
+  return false;
+}
+
 const PROVIDER_SAFETY_CODE_RE =
   /^(?:PROVIDER_EMPTY_SAFETY|CONTENT[_\s-]?(?:FILTER|POLICY(?:[_\s-]?VIOLATION)?)|SAFETY(?:[_\s-]?VIOLATION)?|RESPONSIBLE[_\s-]?AI[_\s-]?POLICY[_\s-]?VIOLATION|RESPONSIBLEAIPOLICYVIOLATION|PROHIBITED[_\s-]?CONTENT|PROMPT[_\s-]?(?:FILTER|BLOCKED)|MODERATION[_\s-]?(?:BLOCKED|REJECTED)|BLOCKED[_\s-]?BY[_\s-]?POLICY|BLOCKLIST|IMAGE[_\s-]?SAFETY)$/i;
 
@@ -418,7 +429,7 @@ const TERMINAL_RECOVERY_CODE_RE = /^(?:CONTEXT_OVERFLOW|context_length_exceeded|
 /** Hard runtime barriers also apply when an adapter proves a remote rejection.
  * Authentication itself is recovered by the credential owner, before Runner. */
 export function isTerminalRecoveryError(err: unknown): boolean {
-  return isProviderSafetyError(err) || isStorageFullError(err, false)
+  return isProviderLegalRestrictionError(err) || isProviderSafetyError(err) || isStorageFullError(err, false)
     || providerErrorFacts(err, false).codes.some(code => TERMINAL_RECOVERY_CODE_RE.test(code));
 }
 
@@ -481,7 +492,7 @@ export function classifyRetryableErrorWithPolicy(
   config?: Partial<RetryErrorPolicyConfig> | null,
 ): RetryableErrorKind | null {
   const policy = config ? compileRetryErrorPolicy(config) : activeRetryErrorPolicy;
-  if (err == null || isProviderRateLimitError(err)) return null;
+  if (err == null || isProviderLegalRestrictionError(err) || isProviderRateLimitError(err)) return null;
   if (err instanceof AuthError || err instanceof ContextOverflowError || err instanceof OutputLimitError || err instanceof StorageFullError) return null;
 
   // Retry budget already spent below us (for example after provider rotation).

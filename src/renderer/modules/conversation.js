@@ -1966,7 +1966,6 @@ function _transferNewChatRecipientTo(cid) {
   }
 }
 
-
 // Quoted-line and code spans (start/end offsets) in composer text. `@` tokens
 // inside them are context the user pulled in with quote-reply, not dispatch —
 // the bus router strips those lines before parsing mentions, so every composer
@@ -2813,6 +2812,14 @@ function _initEmptyStateScenarios() {
   _bindEmptyStateScenarioButtons(row);
   _refreshQuickStartConfig(row);
 }
+window.addEventListener('i18n-change', () => {
+  const row = document.getElementById('new-chat-scenarios');
+  if (!row) return;
+  _renderEmptyStateHeading();
+  _renderQuickStartScenarios();
+  _bindEmptyStateScenarioButtons(row);
+});
+
 function onEnterConversationView() {
   if (_messageSelectionState && _messageSelectionState.cid !== currentCid) _exitMessageSelection();
   _renderRecipientChip('conversation');
@@ -2883,6 +2890,10 @@ function onEnterConversationView() {
 // don't accumulate dead entries in localStorage forever.
 function _forgetCidRecipient(cid) {
   if (!cid) return;
+  _forgetConversationRuntime(cid);
+  const taskSurfaceOwner = _taskSurfaceAbortRefreshOwners.get(cid);
+  if (taskSurfaceOwner && taskSurfaceOwner.timer != null) clearTimeout(taskSurfaceOwner.timer);
+  _taskSurfaceAbortRefreshOwners.delete(cid);
   if (_recipientByCid[cid]) {
     delete _recipientByCid[cid];
     _saveRecipientMap();
@@ -3132,9 +3143,11 @@ function _isPrimaryOwnedLiveEvent(evData) {
 // task board is the whole set: its rows live in a cid-keyed Map that only
 // repaints for the visible cid, and its states are absorbing — a terminal
 // missed while the user is elsewhere is not re-read until the next stream
-// (re)connect, so the row stays painted "running" indefinitely.
+// (re)connect, so the row stays painted "running" indefinitely. A planned
+// send's arranging window (`dispatch_planning`) is board state of the same kind.
 function _taskBoardEventBypassesViewGuard(evData) {
-  return !!evData && (evData.type === 'task_created' || evData.type === 'task_state');
+  return !!evData && (evData.type === 'task_created' || evData.type === 'task_state'
+    || evData.type === 'dispatch_planning');
 }
 
 function _stopRuntimeActorRecovery(cid) {
@@ -3159,7 +3172,11 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
   // source; letting this path finish it can manufacture empty loading bubbles
   // or clear pending in the middle of a plan handoff.
   const allowController = !!opts.allowController;
-  const hasLiveController = !!state.controller && _convChatCtrls.has(cid);
+  // A standalone recovery observer also occupies the controller map. It is
+  // not a primary send stream that can deliver replies after we cancel it.
+  const activeController = _convChatCtrls.get(cid);
+  const hasLiveController = !!state.controller && !!activeController
+    && activeController !== _groupObserverReservations.get(cid);
   if (hasLiveController && !allowController) return false;
   const loadingEl = state.loadingEl;
   let data = null;
@@ -3170,7 +3187,7 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
     return false;
   }
   if (!data || data.ok === false) return false;
-  if (!isConvPending(cid) || pendingConvs.get(cid)?.aborted) return false;
+  if (!isConvPending(cid) || pendingConvs.get(cid) !== state || state.aborted) return false;
   const inFlight = Array.isArray(data.in_flight)
     ? data.in_flight.filter(Boolean).map(String)
     : [];
@@ -3181,6 +3198,13 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
     try { window.ConversationInfo.refreshFiles(cid, { silent: true }); } catch (_) {}
   }
   if (!processing) {
+    // Runtime can be idle while a recovery stream still buffers the terminal
+    // reply. Read canonical history before cancelling that stream; otherwise
+    // an empty placeholder makes cleanup discard the only delivery path.
+    if (!hasLiveController && cid === currentCid) {
+      await _recoverObservedConversationHistory(cid);
+      if (pendingConvs.get(cid) !== state || state.aborted) return false;
+    }
     _stopGroupEventObserver(cid);
     if (hasLiveController) {
       _latestInFlight.set(cid, []);
@@ -3241,7 +3265,7 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
   // Names/avatars are local data; warm members before revealing so the
   // placeholder does not flash as an unknown agent.
   try { await _refreshGroupMembers(cid); } catch (_) { /* best effort */ }
-  if (!isConvPending(cid) || pendingConvs.get(cid)?.aborted) return false;
+  if (!isConvPending(cid) || pendingConvs.get(cid) !== state || state.aborted) return false;
   if (cid !== currentCid) return true;
   if (hasActiveTurnsField) {
     const activeCommander = activeTurns.some((t) => t.actor === 'commander');
@@ -4068,6 +4092,7 @@ function _findRenderedGroupMessage(container, message, exclude = null) {
 // real attachment-pool filename; `displayName` is the stable composer label.
 
 const _chatAttachments = new Map();   // cid → Array<{name, displayName?, kind, bytes, dataUrl?, sha256?, reused?}>
+let _chatAttachmentSelectionSequence = 0;
 // Attachment bytes live in the main process while composer chips live in this
 // renderer. Track mutations from their earliest async boundary so Send cannot
 // snapshot an empty chip list while file hashing, native picking, importing, or
@@ -4130,31 +4155,6 @@ function _chatAttachTargetOf(cid) {
   return 'conversation';
 }
 
-function _chatAttachPayload(cid, files, source) {
-  const list = Array.from(files || []);
-  const kinds = {};
-  let totalBytes = 0;
-  for (const file of list) {
-    const name = file && (file.name || file.path || '');
-    const kind = _chatAttachKindFromExt(_chatAttachExtOf(name));
-    kinds[kind] = (kinds[kind] || 0) + 1;
-    totalBytes += Number((file && (file.size || file.bytes)) || 0);
-  }
-  return {
-    source,
-    target: _chatAttachTargetOf(cid),
-    file_count: list.length,
-    total_bytes: totalBytes,
-    image_count: kinds.image || 0,
-    video_count: kinds.video || 0,
-    audio_count: kinds.audio || 0,
-    document_count:
-      (kinds.pdf || 0) + (kinds.docx || 0) + (kinds.spreadsheet || 0)
-      + (kinds.presentation || 0),
-    text_count: kinds.text || 0,
-  };
-}
-
 function _chatAttachBaseName(p) {
   const parts = String(p || '').split(/[\\/]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : String(p || '');
@@ -4173,6 +4173,9 @@ async function _chatAttachSha256(buf) {
   return _chatAttachHex(digest);
 }
 
+// Only closed, content-free diagnostics enter the aggregate terminal. Never
+// derive codes from translated errors, filenames, paths or exception messages.
+
 async function _chatAttachPrepareUploadFiles(cid, fileList) {
   const files = Array.from(fileList || []);
   const rejected = [];
@@ -4187,6 +4190,7 @@ async function _chatAttachPrepareUploadFiles(cid, fileList) {
     const ext = _chatAttachExtOf(file.name);
     if (!CHAT_ATTACH_ACCEPT.includes(ext)) {
       rejected.push(t('chat.attach_unsupported', { name: file.name }));
+
       continue;
     }
 
@@ -4196,6 +4200,7 @@ async function _chatAttachPrepareUploadFiles(cid, fileList) {
       buf = await file.arrayBuffer();
     } catch (err) {
       rejected.push(t('chat.attach_upload_fail', { name: file.name, reason: err.message || t('chat.attach_upload_generic_fail') }));
+
       continue;
     }
     try { sha256 = await _chatAttachSha256(buf); }
@@ -4252,6 +4257,10 @@ function _chatAttachHasPendingWork(cid) {
   ));
 }
 
+function _chatAttachIsSending(cid) {
+  return _chatAttachmentSendLocks.has(cid);
+}
+
 function _chatAttachTryBeginSend(cid) {
   if (!cid || _chatAttachmentSendLocks.has(cid) || _chatAttachHasPendingWork(cid)) return null;
   _chatAttachmentSendLocks.add(cid);
@@ -4272,7 +4281,7 @@ function _chatAttachItemsFromServer(cid, infos) {
       .filter((item) => item && item.name)
       .map((item) => [String(item.name), item]),
   );
-  return (Array.isArray(infos) ? infos : [])
+  return _chatAttachOrderItems(Array.isArray(infos) ? infos : [], _chatAttachPreferredNames(cid))
     .filter((info) => info && info.name)
     .map((info) => {
       const previous = existing.get(String(info.name)) || {};
@@ -4291,6 +4300,34 @@ function _chatAttachItemsFromServer(cid, infos) {
         status: 'ready',
       };
     });
+}
+
+// Membership comes from storage; relative order belongs to the user's selection.
+// Unknown recovered files follow known chips without displacing their ordinals.
+function _chatAttachOrderItems(items, names, key = 'name') {
+  const remaining = new Map(items.filter((item) => item && item[key]).map((item) => [String(item[key]), item]));
+  const ordered = [];
+  for (const name of names) {
+    if (!remaining.has(String(name))) continue;
+    ordered.push(remaining.get(String(name)));
+    remaining.delete(String(name));
+  }
+  return ordered.concat(Array.from(remaining.values()));
+}
+
+function _chatAttachOrderKey(cid) {
+  const uid = typeof currentUserId === 'string' ? currentUserId : '';
+  return uid && cid ? `attachment_order:${JSON.stringify([uid, cid])}` : '';
+}
+
+function _chatAttachPreferredNames(cid) {
+  const local = _chatAttachList(cid);
+  if (local.length) return local.map((item) => item.name);
+  try {
+    const key = _chatAttachOrderKey(cid);
+    const saved = key ? JSON.parse(localStorage.getItem(key) || '[]') : [];
+    return Array.isArray(saved) ? saved.filter((name) => typeof name === 'string').slice(0, 20) : [];
+  } catch (_) { return []; }
 }
 
 async function _chatAttachSnapshotForSend(cid, opts = {}) {
@@ -4331,7 +4368,7 @@ async function _chatAttachSnapshotForSend(cid, opts = {}) {
     const reusable = opts.requireServerMatch
       ? []
       : localReady.filter((item) => item.reused && !serverNames.has(String(item.name)));
-    const items = serverItems.concat(reusable);
+    const items = _chatAttachOrderItems(serverItems.concat(reusable), _chatAttachPreferredNames(cid));
     const localNames = new Set(_chatAttachList(cid).filter((item) => item && item.name).map((item) => String(item.name)));
     _convLog.info('attachment send snapshot ready', {
       local_count: localNames.size,
@@ -4350,7 +4387,19 @@ async function _chatAttachSnapshotForSend(cid, opts = {}) {
 }
 
 function _chatAttachSet(cid, items) {
+  // Reserve a batch before any file reads/picker/import await; completion time
+  // must never determine where its chips appear relative to later additions.
+  items = items.map((item) => Number.isFinite(item.selectionBatch) ? item : {
+    ...item, selectionBatch: ++_chatAttachmentSelectionSequence, selectionIndex: 0,
+  }).sort((a, b) => a.selectionBatch - b.selectionBatch || (a.selectionIndex || 0) - (b.selectionIndex || 0));
   _chatAttachments.set(cid, items);
+  try {
+    const key = _chatAttachOrderKey(cid);
+    if (key) {
+      if (items.length) localStorage.setItem(key, JSON.stringify(items.map((item) => item.name).slice(0, 20)));
+      else localStorage.removeItem(key);
+    }
+  } catch (_) { /* Storage may be unavailable; in-memory order still applies. */ }
   if (typeof _persistQueueComposerEditState === 'function') _persistQueueComposerEditState(cid);
   _chatAttachMarkMutation(cid);
   _chatAttachRenderChips(cid);
@@ -4395,6 +4444,10 @@ async function _chatAttachClear(cid, opts = {}) {
     if (deleteFiles) await _chatAttachDeleteItemFile(cid, item);
   }
   _chatAttachments.delete(cid);
+  try {
+    const key = _chatAttachOrderKey(cid);
+    if (key) localStorage.removeItem(key);
+  } catch (_) {}
   _chatAttachMarkMutation(cid);
   _chatAttachRenderChips(cid);
   if (cid && cid === currentCid && window.ConversationInfo) {
@@ -4546,10 +4599,12 @@ function _chatAttachReplaceByTempId(cid, tempId, patch) {
       ? items.findIndex((it, i) => i !== idx && it.name === next.name && it.status !== 'uploading')
       : -1;
     if (dupIdx >= 0) {
-      if (items[idx].dataUrl && items[idx].dataUrl.startsWith('blob:')) {
-        try { URL.revokeObjectURL(items[idx].dataUrl); } catch (_) { /* ignore */ }
+      const removeIdx = Math.max(idx, dupIdx);
+      if (items[removeIdx].dataUrl && items[removeIdx].dataUrl.startsWith('blob:')) {
+        try { URL.revokeObjectURL(items[removeIdx].dataUrl); } catch (_) { /* ignore */ }
       }
-      items.splice(idx, 1);
+      if (idx < dupIdx) items[idx] = next;
+      items.splice(removeIdx, 1);
     } else {
       items[idx] = next;
     }
@@ -4577,28 +4632,30 @@ async function _chatAttachUpload(cid, fileList, source = 'drop') {
 // byte upload. Both routes paint the same placeholder chip, are bounded by the
 // same main-side per-kind caps and hash dedupe.
 async function _chatAttachUploadCore(cid, fileList, source) {
-  const clickPayload = _chatAttachPayload(cid, fileList, source);
+  const selectionBatch = ++_chatAttachmentSelectionSequence;
+
   const rejected = [];
+
   const accepted = [];
   for (const file of Array.from(fileList || [])) {
     if (!CHAT_ATTACH_ACCEPT.includes(_chatAttachExtOf(file.name))) {
       rejected.push(t('chat.attach_unsupported', { name: file.name }));
+
       continue;
     }
     accepted.push(file);
   }
-  const local = _chatAttachStartLocalImport(cid, accepted);
+  const selection = new Map(accepted.map((file, selectionIndex) => [file, { selectionBatch, selectionIndex }]));
+  const local = _chatAttachStartLocalImport(cid, accepted, selection);
   const byteFiles = accepted.filter((_file, index) => !local.resolved.has(index));
   const [localOutcome, byteOutcome] = await Promise.all([
     _chatAttachSettleLocalImport(cid, local, rejected),
-    _chatAttachUploadBytes(cid, byteFiles, rejected),
+    _chatAttachUploadBytes(cid, byteFiles, rejected, selection),
   ]);
   if (!localOutcome.attempted && !byteOutcome.attempted) {
     if (rejected.length) uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
     return;
   }
-  const uploadedCount = localOutcome.uploaded + byteOutcome.uploaded;
-  const failedCount = rejected.length;
 
   if (rejected.length) {
     uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
@@ -4612,7 +4669,7 @@ function _chatAttachNewTempId() {
 // Path route. Preload reports which Files resolved to a path synchronously
 // (before main copies anything) so their chips appear at once; main returns
 // one result per resolved index. `resolved` maps index → placeholder.
-function _chatAttachStartLocalImport(cid, files) {
+function _chatAttachStartLocalImport(cid, files, selection) {
   const resolved = new Map();
   if (!files.length || !window.orkas || typeof window.orkas.importLocalFiles !== 'function') {
     return { resolved, promise: null };
@@ -4633,6 +4690,7 @@ function _chatAttachStartLocalImport(cid, files) {
             try { localPreview = URL.createObjectURL(file); } catch (_) { /* ignore */ }
           }
           current.push({
+            ...selection.get(file),
             tempId, name: file.name, displayName: file.name, kind, bytes: file.size || 0,
             dataUrl: localPreview, sha256: '', status: 'uploading',
           });
@@ -4659,6 +4717,7 @@ async function _chatAttachSettleLocalImport(cid, local, rejected) {
       name: ph.file.name,
       reason: reason || t('chat.attach_upload_generic_fail'),
     }));
+
   };
   let data;
   try {
@@ -4700,7 +4759,7 @@ async function _chatAttachSettleLocalImport(cid, local, rejected) {
 // Byte route (path-less Files only). Unchanged contract: hash before painting
 // so one paste of several identical blobs never flashes duplicate chips, then
 // upload every placeholder in parallel.
-async function _chatAttachUploadBytes(cid, files, rejected) {
+async function _chatAttachUploadBytes(cid, files, rejected, selection) {
   const outcome = { attempted: 0, uploaded: 0 };
   if (!files.length) return outcome;
   const prepared = await _chatAttachPrepareUploadFiles(cid, files);
@@ -4721,6 +4780,7 @@ async function _chatAttachUploadBytes(cid, files, rejected) {
       try { localPreview = URL.createObjectURL(file); } catch (_) { /* ignore */ }
     }
     const entry = {
+      ...selection.get(file),
       tempId, name: file.name, displayName: file.name, kind, bytes: file.size || 0,
       dataUrl: localPreview, sha256, status: 'uploading',
     };
@@ -4747,6 +4807,7 @@ async function _chatAttachUploadBytes(cid, files, rejected) {
         _chatAttachReplaceByTempId(cid, ph.tempId, null);
         uploadFailed += 1;
         rejected.push(t('chat.attach_upload_fail', { name: ph.file.name, reason: data.error || t('chat.attach_upload_generic_fail') }));
+
         return;
       }
       const info = data.info;
@@ -4768,6 +4829,7 @@ async function _chatAttachUploadBytes(cid, files, rejected) {
       _chatAttachReplaceByTempId(cid, ph.tempId, { status: 'error' });
       uploadFailed += 1;
       rejected.push(t('chat.attach_upload_fail', { name: ph.file.name, reason: err.message || t('chat.attach_upload_generic_fail') }));
+
     }
   }));
   outcome.uploaded = Math.max(0, placeholders.length - uploadFailed);
@@ -4789,7 +4851,7 @@ async function _chatAttachPickAndUpload(cid, source = 'picker') {
 }
 
 async function _chatAttachPickAndUploadCore(cid, source) {
-  const basePayload = { source, target: _chatAttachTargetOf(cid) };
+  const selectionBatch = ++_chatAttachmentSelectionSequence;
   let data;
   try {
     data = await window.orkas.invoke('conversations.attachments.pickAndUpload', { cid });
@@ -4797,7 +4859,11 @@ async function _chatAttachPickAndUploadCore(cid, source) {
     _convLog.warn('native attachment picker failed', {
       error_type: err && typeof err === 'object' ? 'Error' : typeof err,
     });
-    await uiAlert(t('chat.attach_upload_fail', { name: '', reason: err.message || t('chat.attach_upload_generic_fail') }));
+    data = { ok: false, code: err && err.code };
+  }
+  if (!data || data.ok === false) {
+
+    await uiAlert(t('chat.attach_upload_generic_fail'));
     return;
   }
   if (data && data.cancelled) {
@@ -4810,8 +4876,16 @@ async function _chatAttachPickAndUploadCore(cid, source) {
     for (const item of picked) {
       const info = item && item.info;
       if (!info || !info.name) continue;
-      if (current.some((it) => it.name === info.name && it.status !== 'uploading')) continue;
+      const existing = current.find((it) => it.name === info.name && it.status !== 'uploading');
+      if (existing) {
+        if (selectionBatch < existing.selectionBatch) {
+          existing.selectionBatch = selectionBatch;
+          existing.selectionIndex = picked.indexOf(item);
+        }
+        continue;
+      }
       current.push({
+        selectionBatch, selectionIndex: picked.indexOf(item),
         tempId: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: info.name,
         displayName: item.displayName || info.name,
@@ -4877,7 +4951,7 @@ async function _chatAttachImportPaths(cid, entries, source = 'internal_drop') {
 }
 
 async function _chatAttachImportPathsCore(cid, files, source) {
-  const clickPayload = _chatAttachPayload(cid, files, source);
+  const selectionBatch = ++_chatAttachmentSelectionSequence;
 
   const placeholders = [];
   const current = _chatAttachList(cid).slice();
@@ -4887,6 +4961,7 @@ async function _chatAttachImportPathsCore(cid, files, source) {
     const kind = _chatAttachKindFromExt(ext);
     const tempId = `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     current.push({
+      selectionBatch, selectionIndex: placeholders.length,
       tempId,
       name: displayName,
       displayName,
@@ -4900,6 +4975,7 @@ async function _chatAttachImportPathsCore(cid, files, source) {
   _chatAttachSet(cid, current);
 
   const rejected = [];
+
   let uploadFailed = 0;
   await Promise.all(placeholders.map(async (ph) => {
     try {
@@ -4913,6 +4989,7 @@ async function _chatAttachImportPathsCore(cid, files, source) {
         _chatAttachReplaceByTempId(cid, ph.tempId, null);
         uploadFailed += 1;
         rejected.push(t('chat.attach_upload_fail', { name: ph.name, reason: data.error || t('chat.attach_upload_generic_fail') }));
+
         return;
       }
       const info = data.info;
@@ -4929,9 +5006,9 @@ async function _chatAttachImportPathsCore(cid, files, source) {
       _chatAttachReplaceByTempId(cid, ph.tempId, null);
       uploadFailed += 1;
       rejected.push(t('chat.attach_upload_fail', { name: ph.name, reason: err.message || t('chat.attach_upload_generic_fail') }));
+
     }
   }));
-  const uploadedCount = Math.max(0, placeholders.length - uploadFailed);
 
   if (rejected.length) {
     uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
@@ -4945,13 +5022,22 @@ window.addChatAttachmentsFromPaths = async function addChatAttachmentsFromPaths(
 // Add an already-imported attachment (from a KB "ask the commander about this
 // file" action) to a draft pool's chips. The file is imported server-side into
 // the draft cid's pool; here we just surface it as a ready chip.
-function _addReadyDraftAttachment(cid, info) {
+function _addReadyDraftAttachment(cid, info, selectionBatch) {
   if (!info || !info.name) return;
   const items = _chatAttachList(cid).slice();
   // The storage owner can reuse the same pending file across Library imports.
   // Match upload completion: one stored attachment owns one removable chip.
-  if (items.some((item) => item.name === info.name && item.status !== 'uploading')) return;
+  const existing = items.find((item) => item.name === info.name && item.status !== 'uploading');
+  if (existing) {
+    if (selectionBatch < existing.selectionBatch) {
+      existing.selectionBatch = selectionBatch;
+      existing.selectionIndex = 0;
+      _chatAttachSet(cid, items);
+    }
+    return;
+  }
   items.push({
+    selectionBatch, selectionIndex: 0,
     name: info.name,
     displayName: info.displayName || info.name,
     kind: info.kind,
@@ -4970,6 +5056,39 @@ function _addReadyDraftAttachment(cid, info) {
 // draft chip. No conversation is created — the user's first message creates it
 // and adopts the draft attachments.
 window.COMMANDER_DRAFT_CID = DRAFT_CID;
+window.attachKbFileToDraft = async function attachKbFileToDraft(channel, payload, draftCid, afterNavigate) {
+  const selectionBatch = ++_chatAttachmentSelectionSequence;
+  const finishOperation = _chatAttachBeginOperation(draftCid);
+  let stage = 'draft_lock';
+  try {
+    if (!finishOperation) throw new Error(t('chat.attach_send_in_progress'));
+    stage = 'ipc_request';
+    const data = await window.orkas.invoke(channel, { ...(payload || {}), cid: draftCid });
+    if (!data || !data.ok) {
+      const error = new Error((data && data.error) || 'failed');
+      error.failure_stage = data && data.failure_stage;
+      error.failure_kind = data && data.failure_kind;
+      throw error;
+    }
+    stage = 'navigation';
+    if (typeof afterNavigate === 'function') afterNavigate();
+    stage = 'draft_render';
+    _addReadyDraftAttachment(draftCid, data.info, selectionBatch);
+  } catch (error) {
+    const safeStage = error && error.failure_stage;
+    const safeKind = error && error.failure_kind;
+    const failure_stage = ['input_validation', 'source_resolve', 'attachment_import'].includes(safeStage) ? safeStage : stage;
+    const failure_kind = ['not_found', 'permission_denied', 'disk_full'].includes(safeKind) ? safeKind : 'operation_failed';
+    // Keep the UI's original message; diagnostics receive only the enums.
+    const wrapped = new Error((error && error.message) || String(error));
+    wrapped.failure_stage = failure_stage;
+    wrapped.failure_kind = failure_kind;
+    _convLog.warn('library attachment failed', { failure_stage, failure_kind });
+    throw wrapped;
+  } finally {
+    if (finishOperation) finishOperation();
+  }
+};
 
 async function _chatAttachRefreshFromServer(cid) {
   // Navigation restores this selection from the edit marker. Pending files
@@ -5164,8 +5283,6 @@ function _mountMessageRunFactsFooter(msgDiv, facts) {
   if (factsNode) bubble.appendChild(factsNode);
 }
 
-
-
 // Resolve only attachment references that could overlap a produced file. The
 // basename filter avoids unrelated IPC; only the resolved full path establishes
 // identity. Never infer attachment storage layout in the renderer.
@@ -5318,7 +5435,10 @@ function _mountSavedTaskChips(msg, tasks) {
       button.disabled = true;
       try {
         if (task.kind === 'automation') {
-          await _APP_NAV_SURFACES.auto.open({ action: 'configure', target_id: task.task_id });
+          await _appNavOpenFeatureView('auto', 'auto', () => {
+            if (typeof window.focusAutoTaskById !== 'function') return false;
+            return window.focusAutoTaskById(task.task_id);
+          });
         } else {
           await _appNavLoadFeature('project', () => {
             if (typeof focusTodo !== 'function') return false;
@@ -7609,6 +7729,16 @@ async function loadConversationHistory(cid, opts = {}) {
     } else if (!history.length) {
       container.innerHTML = `<div class="empty">${escapeHtml(t('chat.empty'))}</div>`;
     } else {
+      // A background rebuild must keep the action node that owns an in-flight
+      // updater and its result. Scope reuse to the exact message and actor;
+      // leaving this transcript still discards these transient controls.
+      const cliUpgradeControls = new Map();
+      for (const row of container.querySelectorAll('.chat-message[data-msg-id]')) {
+        const control = row.querySelector('.local-cli-upgrade-control');
+        if (control?.dataset.state) {
+          cliUpgradeControls.set(JSON.stringify([row.dataset.msgId, row.dataset.fromActor]), control);
+        }
+      }
       container.innerHTML = '';
       // The history array is already time-sorted above. Stage it off-DOM and
       // bypass the live-event dedupe/sorted-insertion work: doing either for
@@ -7625,6 +7755,7 @@ async function loadConversationHistory(cid, opts = {}) {
           msgIndex: Number.isSafeInteger(msg?._history_index) ? msg._history_index : undefined,
           container: historyFragment,
           historyHydration: true,
+          cliUpgradeControl: cliUpgradeControls.get(JSON.stringify([msg._msg_id, msg._from])),
         });
         // Retain terminal identity across the DOM rebuild so a stale live
         // display snapshot or deferred process event cannot reopen this turn.
@@ -7781,7 +7912,6 @@ async function loadConversationHistory(cid, opts = {}) {
       _replayOffViewGroupProcessEvents(cid, activePendingState.loadingEl, { archive: true });
     }
 
-
     // Re-add the inline "create agent" entry BEFORE scrolling so it's part of
     // scrollHeight when we jump to the bottom — otherwise the MutationObserver
     // adds it post-scroll and it ends up below the visible area.
@@ -7820,7 +7950,11 @@ function _messageRecordHasMountedSidecars(gm, el, opts = {}) {
   if (Array.isArray(gm.saved_tasks) && gm.saved_tasks.some((task) => !el.querySelector(
     `[data-saved-task-key="${CSS.escape(JSON.stringify([task.kind, task.project_id || '', task.task_id]))}"]`,
   ))) return false;
-  if (Array.isArray(gm.artifacts) && gm.artifacts.length && !el.querySelector('.chat-artifact-host')) return false;
+  if (Array.isArray(gm.artifacts) && gm.artifacts.length && !el.querySelector('.chat-artifact-host')) {
+    const frames = Array.from(document.querySelectorAll('iframe.chat-artifact-frame'));
+    if (gm.artifacts.some(app => !frames.some(frame => frame.dataset.artifactCid === opts.cid
+      && frame.dataset.artifactId === String(app.id)))) return false;
+  }
   if (Array.isArray(gm.marketplace_requests) && gm.marketplace_requests.length && !el.querySelector('.chat-marketplace-request')) return false;
   if (_processItemsHaveRenderableLine(gm.process) && !el.querySelector('.stream-process')) return false;
   if (_isInterruptedAssistantMessage(gm) && !el.querySelector('.bubble-retry-btn')) return false;
@@ -7881,7 +8015,7 @@ async function _recoverPolledVisibleMessages(cid, rawMessages) {
         }
       }
       _syncRenderedGroupMessageIdentity(existing, gm);
-      if (!_messageRecordHasMountedSidecars(gm, existing, { checkMutableState: false })) {
+      if (!_messageRecordHasMountedSidecars(gm, existing, { cid, checkMutableState: false })) {
         loadConversationHistory(cid, { preserveScroll: true });
         return true;
       }
@@ -8988,6 +9122,9 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   // raw-markdown replies; sanitized HTML status stubs are not archivable.
   if (role === 'assistant' && failedAssistant) {
     _mountEmptyResponseNotice(msgDiv, message);
+    if (message.failure_code === 'version_too_old' && opts.cliUpgradeControl) {
+      msgDiv.querySelector('.chat-bubble')?.appendChild(opts.cliUpgradeControl);
+    }
     _attachFailedAssistantActions(msgDiv, () => _messageTextForActions(msgDiv, rawContent));
     // Live group-bus messages can arrive without a matching streaming
     // placeholder (fast preflight failures and reconnect races). History
@@ -10536,7 +10673,10 @@ async function _openReferenceTargetPicker(payloads) {
     if (target) _stageReferencesForNewTask(payloads, target.dataset.createProjectId);
   });
   overlay.querySelector('.chat-reference-target-close')?.addEventListener('click', _closeReferenceTargetPicker);
-  overlay.addEventListener('keydown', (event) => { if (event.key === 'Escape') _closeReferenceTargetPicker(); });
+  overlay.addEventListener('keydown', (event) => {
+    if (event.isComposing || event.keyCode === 229) return;
+    if (event.key === 'Escape') _closeReferenceTargetPicker();
+  });
   search.addEventListener('input', () => {
     picker.limit = _REFERENCE_TARGET_PAGE_SIZE;
     render();
@@ -10672,6 +10812,7 @@ function _syncMessageSelectionUi() {
     const wrapper = pane.querySelector('.chat-input-wrapper');
     wrapper.insertBefore(bar, wrapper.querySelector('.chat-input-area'));
     bar.querySelector('[data-selection-cancel]').addEventListener('click', _exitMessageSelection);
+    bar.querySelector('[data-selection-all]').addEventListener('click', _toggleAllMessageSelection);
     bar.querySelector('[data-selection-reference]').addEventListener('click', async () => {
       const payloads = await _prepareSelectedMessagePayloads();
       if (payloads) _openReferenceTargetPicker(payloads.map(payload => payload.reference).filter(Boolean));
@@ -10972,12 +11113,12 @@ async function _retryFailedAssistantMessage(msgDiv) {
 // succeeds (so a failure keeps the user's text for retry). Without this flag, a
 // held Enter (key auto-repeat) or a fast double-press during the create round
 // trip re-runs the whole submit with the same text: two conversations, two paid
-// model runs. Existing conversations use the per-cid attachment send lock to
-// guard asynchronous preparation and acceptance of the submitted draft.
+// model runs. The attachment send lock also covers the earlier asynchronous
+// snapshot, while this flag preserves the conversation-create gate.
 let _newChatSubmitting = false;
 
 async function handleNewChatSubmit() {
-  if (_newChatSubmitting) return;
+  if (_newChatSubmitting || _chatAttachIsSending(DRAFT_CID)) return;
   const input = document.getElementById('new-chat-input');
   const submittedDraft = composerSnapshot(input);
   const navigationEpoch = _composerNavigationEpoch;
@@ -11006,183 +11147,196 @@ async function handleNewChatSubmit() {
     await uiAlert(t('chat.attach_still_uploading'));
     return;
   }
-  const attachmentSnapshot = await _chatAttachSnapshotForSend(DRAFT_CID, { requireServerMatch: true });
-  if (!attachmentSnapshot.ok) {
-    releaseAttachmentSend();
-    await uiAlert(t('chat.attach_sync_failed'));
-    return;
-  }
-  draftItems = attachmentSnapshot.items;
-  const references = _referenceSnapshotsForQuotes(quotes);
-  // Keep resource selections in the composer until attachment adoption has
-  // completed. A failed preflight must leave the whole request retryable.
-  const useSelections = pendingUseSelections;
-  // Snapshot the new-chat recipient *now* so a stray view-change between
-  // here and conv-create doesn't reset it before we can transfer.
-  _pendingNewChatRecipient = _normaliseRecipientSnapshot(recipientSnapshot) || { ..._COMMANDER };
-  // Keep the title seed separate from transport content. The body carries
-  // routing mentions (panel-inserted or typed) and `content` may gain an
-  // injected leading `@Agent`, while task titles describe only the user's
-  // request.
-  const titleSeed = _titleSeedWithoutRoutingMentions(raw, 'new-chat');
-  const titleText = (typeof transformChatUseTokens === 'function')
-    ? transformChatUseTokens(titleSeed)
-    : titleSeed;
-  const content = applyRecipientPrefix(transformWithChatUse(requestText), 'new-chat', {
-    recipientSnapshot,
-  });
-  const commanderDisplay = _commanderMentionDisplayForSend(transformWithChatUse(requestText), recipientSnapshot, 'new-chat');
-  const draftNames = draftItems.filter((a) => a.status !== 'error').map((a) => a.name);
-  _convLog.info('new chat submit', {
-    content_length: content.length,
-    use: useSelections.map((sel) => sel.kind),
-    attachments: draftNames.length,
-
-  });
-  const newBtn = document.getElementById('new-chat-send-btn');
-  if (newBtn) newBtn.disabled = true;
-  // Hold the re-entrancy gate while conversation creation is in flight. The
-  // input is intentionally preserved until creation succeeds, so button state
-  // alone does not protect Enter-key auto-repeat.
-  _newChatSubmitting = true;
-  let convId;
-  let createdConversation = null;
   try {
-    const res = await apiFetch('/api/conversations/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind: 'normal' }),
-    });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
-    const conv = data.conversation;
-    convId = conv.conversation_id;
-    // Optimistic title from the user-visible text (without recipient routing).
-    // Use the shared `_autoTitle` so this matches backend `autoTitle` —
-    // otherwise the optimistic + backend-refreshed titles disagree and
-    // the sidebar entry flips on the next loadConversations.
-    if (titleText) conv.title = _autoTitle(titleText);
-    // Backend `createConversation` returns `created_at`/`updated_at` but
-    // NOT the derived `last_active_at` (that lives only in `listConversations`'
-    // output). Set it explicitly so `timeBucket` puts the brand-new row in
-    // the 'today' bucket instead of falling through to 'older'.
-    conv.last_active_at = new Date().toISOString();
-    createdConversation = conv;
-  } catch (e) {
-    _convLog.warn('new chat conversation creation failed', {
+    const attachmentSnapshot = await _chatAttachSnapshotForSend(DRAFT_CID, { requireServerMatch: true });
+    if (!attachmentSnapshot.ok) {
+      releaseAttachmentSend();
 
-      error: e && e.message ? e.message : String(e || ''),
-    });
-    await uiAlert(t('chat.create_conv_failed_with_reason', { reason: e.message || e }));
-    if (newBtn) newBtn.disabled = false;
-    _newChatSubmitting = false; // text kept in the input — allow a retry submit
-    releaseAttachmentSend();
-    return;
-  }
-
-  // Adopt local `main_chat/` draft files into `<convId>/` on disk.
-  // Preprocessing caches (`.<name>.extracted.NNN.md`) move with their source
-  // when present — nothing to re-run.
-  let attachments = [];
-  let adoptionError = '';
-  try {
-    // Always adopt. An empty renderer snapshot must not skip files that were
-    // committed by the main process but lost from the renderer state.
-    const res = await apiFetch('/api/conversations/attachments/adopt', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from_cid: DRAFT_CID, to_cid: convId }),
-    });
-    const data = await res.json();
-    if (!data.ok) {
-      adoptionError = String(data.error || 'attachment_adopt_failed');
-    } else {
-      const adoptedItems = (Array.isArray(data.items) ? data.items : [])
-        .filter((item) => item && item.sourceName && item.targetName);
-      const adoptedSources = new Set(adoptedItems.map((item) => String(item.sourceName)));
-      if (draftNames.some((name) => !adoptedSources.has(String(name)))) {
-        adoptionError = 'attachment_adopt_incomplete';
-      } else {
-        // The adoption result is authoritative. Include any file that appeared
-        // between the preflight list and the atomic directory move as well.
-        attachments = adoptedItems.map((item) => String(item.targetName));
-      }
+      await uiAlert(t('chat.attach_sync_failed'));
+      return;
     }
-  } catch (err) {
-    adoptionError = String(err && err.message ? err.message : err || 'attachment_adopt_failed');
-  }
-  if (adoptionError) {
+    draftItems = attachmentSnapshot.items;
+
+    const references = _referenceSnapshotsForQuotes(quotes);
+    // Keep resource selections in the composer until attachment adoption has
+    // completed. A failed preflight must leave the whole request retryable.
+    const useSelections = pendingUseSelections;
+    // Snapshot the new-chat recipient *now* so a stray view-change between
+    // here and conv-create doesn't reset it before we can transfer.
+    _pendingNewChatRecipient = _normaliseRecipientSnapshot(recipientSnapshot) || { ..._COMMANDER };
+    // Keep the title seed separate from transport content. The body carries
+    // routing mentions (panel-inserted or typed) and `content` may gain an
+    // injected leading `@Agent`, while task titles describe only the user's
+    // request.
+    const titleSeed = _titleSeedWithoutRoutingMentions(raw, 'new-chat');
+    const titleText = (typeof transformChatUseTokens === 'function')
+      ? transformChatUseTokens(titleSeed)
+      : titleSeed;
+    const content = applyRecipientPrefix(transformWithChatUse(requestText), 'new-chat', {
+      recipientSnapshot,
+    });
+    const commanderDisplay = _commanderMentionDisplayForSend(transformWithChatUse(requestText), recipientSnapshot, 'new-chat');
+    const draftNames = draftItems.filter((a) => a.status !== 'error').map((a) => a.name);
+    _convLog.info('new chat submit', {
+      content_length: content.length,
+      use: useSelections.map((sel) => sel.kind),
+      attachments: draftNames.length,
+    });
+    const newBtn = document.getElementById('new-chat-send-btn');
+    if (newBtn) newBtn.disabled = true;
+    // Hold the re-entrancy gate while conversation creation is in flight. The
+    // input is intentionally preserved until creation succeeds, so button state
+    // alone does not protect Enter-key auto-repeat.
+    _newChatSubmitting = true;
+    let convId;
+    let createdConversation = null;
     try {
-      const cleanup = await window.orkas.invoke('conversations.discardEmpty', { cid: convId });
-      if (!cleanup || !cleanup.discarded) {
-        _convLog.warn('discard empty conversation rejected', {
-          error_code: 'discard_empty_rejected',
+      const res = await apiFetch('/api/conversations/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'normal' }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
+      const conv = data.conversation;
+      convId = conv.conversation_id;
+      // Optimistic title from the user-visible text (without recipient routing).
+      // Use the shared `_autoTitle` so this matches backend `autoTitle` —
+      // otherwise the optimistic + backend-refreshed titles disagree and
+      // the sidebar entry flips on the next loadConversations.
+      if (titleText) conv.title = _autoTitle(titleText);
+      // Backend `createConversation` returns `created_at`/`updated_at` but
+      // NOT the derived `last_active_at` (that lives only in `listConversations`'
+      // output). Set it explicitly so `timeBucket` puts the brand-new row in
+      // the 'today' bucket instead of falling through to 'older'.
+      conv.last_active_at = new Date().toISOString();
+      createdConversation = conv;
+    } catch (e) {
+      _convLog.warn('new chat conversation creation failed', {
+        error: e && e.message ? e.message : String(e || ''),
+      });
+
+      await uiAlert(t('chat.create_conv_failed_with_reason', { reason: e.message || e }));
+      if (newBtn) newBtn.disabled = false;
+      _newChatSubmitting = false; // text kept in the input — allow a retry submit
+      releaseAttachmentSend();
+      return;
+    }
+
+    // Adopt local `main_chat/` draft files into `<convId>/` on disk.
+    // Preprocessing caches (`.<name>.extracted.NNN.md`) move with their source
+    // when present — nothing to re-run.
+    let attachments = [];
+    let adoptionError = '';
+    try {
+      // Always adopt. An empty renderer snapshot must not skip files that were
+      // committed by the main process but lost from the renderer state.
+      const res = await apiFetch('/api/conversations/attachments/adopt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from_cid: DRAFT_CID, to_cid: convId }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        adoptionError = String(data.error || 'attachment_adopt_failed');
+      } else {
+        const adoptedItems = (Array.isArray(data.items) ? data.items : [])
+          .filter((item) => item && item.sourceName && item.targetName);
+        const adoptedSources = new Set(adoptedItems.map((item) => String(item.sourceName)));
+        if (draftNames.some((name) => !adoptedSources.has(String(name)))) {
+          adoptionError = 'attachment_adopt_incomplete';
+        } else {
+          // The adoption result is authoritative. Include any file that appeared
+          // between the preflight list and the atomic directory move as well.
+          attachments = _chatAttachOrderItems(adoptedItems, draftNames, 'sourceName')
+            .map((item) => String(item.targetName));
+        }
+      }
+    } catch (err) {
+      adoptionError = String(err && err.message ? err.message : err || 'attachment_adopt_failed');
+    }
+    if (adoptionError) {
+      try {
+        const cleanup = await window.orkas.invoke('conversations.discardEmpty', { cid: convId });
+        if (!cleanup || !cleanup.discarded) {
+          _convLog.warn('discard empty conversation rejected', {
+            error_code: 'discard_empty_rejected',
+          });
+        }
+      } catch (_) {
+        _convLog.warn('discard empty conversation failed', {
+          error_code: 'discard_empty_failed',
         });
       }
-    } catch (_) {
-      _convLog.warn('discard empty conversation failed', {
-        error_code: 'discard_empty_failed',
+
+      await uiAlert(t('chat.attach_sync_failed'));
+      if (newBtn) newBtn.disabled = false;
+      _newChatSubmitting = false;
+      releaseAttachmentSend();
+      return;
+    }
+    if (createdConversation) {
+      _cacheCreatedConversation(createdConversation, createdConversation.title);
+      renderConversationList();
+    }
+    if (typeof consumeChatUseSelections === 'function') consumeChatUseSelections('new-chat');
+    // Adoption succeeded, so the draft chip pool can now be consumed.
+    _chatAttachClear(DRAFT_CID);
+    _chatAttachClear(convId);
+    releaseAttachmentSend();
+    _consumeSubmittedQuotes(DRAFT_CID, quotes);
+
+    const ownsDraft = submittedDraft.matches();
+    const openCreated = ownsDraft && navigationEpoch === _composerNavigationEpoch;
+    if (ownsDraft) {
+      composerSetText(input, '');
+      _draftHadRecipient.delete('new-chat');
+    }
+    _newChatSubmitting = false;
+    _transferNewChatRecipientTo(convId);
+    if (openCreated) {
+      // Save the previous task before reusing its visible editor.
+      if (currentCid) _flushDraftSave(currentCid);
+      composerBindOwner('chat-input', convId);
+      composerSetText('chat-input', '');
+      setView('conversation', convId, { skipLoad: true });
+      _renderRecipientChip('conversation');
+    }
+    if (newBtn) newBtn.disabled = false;
+    const extra = {
+      title_text: titleText,
+      ...commanderDisplay,
+      ...(attachments.length ? { attachments } : {}),
+      ...(useSelections.length ? { use_selections: useSelections } : {}),
+      ...(references.length ? { references } : {}),
+    };
+    // Attachments were adopted into the new conversation, so the snapshot carries
+    // the adopted names — the draft-cid originals no longer exist.
+    if (typeof _rememberSentComposerSnapshot === 'function') {
+      _rememberSentComposerSnapshot(convId, {
+        text: requestText,
+        recipient: recipientSnapshot,
+        references: quotes,
+        attachments: attachments.map((name) => ({ name })),
       });
     }
-    await uiAlert(t('chat.attach_sync_failed'));
-    if (newBtn) newBtn.disabled = false;
-    _newChatSubmitting = false;
-    releaseAttachmentSend();
-    return;
-  }
-  if (createdConversation) {
-    _cacheCreatedConversation(createdConversation, createdConversation.title);
-    renderConversationList();
-  }
-  if (typeof consumeChatUseSelections === 'function') consumeChatUseSelections('new-chat');
-  // Adoption succeeded, so the draft chip pool can now be consumed.
-  _chatAttachClear(DRAFT_CID);
-  _chatAttachClear(convId);
-  releaseAttachmentSend();
-  _consumeSubmittedQuotes(DRAFT_CID, quotes);
-
-  const ownsDraft = submittedDraft.matches();
-  const openCreated = ownsDraft && navigationEpoch === _composerNavigationEpoch;
-  if (ownsDraft) {
-    _clearQuickStartDraft(input);
-    composerSetText(input, '');
-    _draftHadRecipient.delete('new-chat');
-  }
-  _newChatSubmitting = false;
-  _transferNewChatRecipientTo(convId);
-  if (openCreated) {
-    // Save the previous task before reusing its visible editor.
-    if (currentCid) _flushDraftSave(currentCid);
-    composerBindOwner('chat-input', convId);
-    composerSetText('chat-input', '');
-    setView('conversation', convId, { skipLoad: true });
-    _renderRecipientChip('conversation');
-  }
-  if (newBtn) newBtn.disabled = false;
-  const extra = {
-    title_text: titleText,
-    ...commanderDisplay,
-    ...(attachments.length ? { attachments } : {}),
-    ...(useSelections.length ? { use_selections: useSelections } : {}),
-    ...(references.length ? { references } : {}),
-  };
-  // The initial turn uses the same abort-recovery contract as a follow-up:
-  // stopping must restore the user's authored text and adopted attachments.
-  if (typeof _rememberSentComposerSnapshot === 'function') {
-    _rememberSentComposerSnapshot(convId, {
-      text: requestText,
-      recipient: recipientSnapshot,
-      references: quotes,
-      attachments: attachments.map((name) => ({ name })),
+    // Finish composer preparation in finally before waiting for the model reply.
+    return sendInConversation(convId, content, Object.keys(extra).length ? extra : undefined, {
+      restoreComposerOnFailure: true,
+      source_view: 'new_chat',
+      content_length: requestText.length,
     });
+  } finally {
+    releaseAttachmentSend();
+    _newChatSubmitting = false;
+    const btn = document.getElementById('new-chat-send-btn');
+    if (btn) btn.disabled = false;
   }
-  await sendInConversation(convId, content, Object.keys(extra).length ? extra : undefined, {
-    restoreComposerOnFailure: true,
-
-  });
 }
 
 async function handleChatSubmit() {
+  // A repeated submit shares the in-flight send, not an attachment upload.
+  if (_chatAttachIsSending(currentCid)) return;
   if (typeof _isQueueItemEditing === 'function' && _isQueueItemEditing(currentCid)) {
     await _finishQueueItemEdit(currentCid);
     return;
@@ -11216,144 +11370,151 @@ async function handleChatSubmit() {
     await uiAlert(t('chat.attach_still_uploading'));
     return;
   }
-  // Freeze all composer-owned dispatch inputs before the first async boundary.
-  const recipientSnapshot = _recipientSnapshotForSend('conversation');
-  const commanderDisplay = _commanderMentionDisplayForSend(requestText, recipientSnapshot);
-  const content = transformWithChatUse(_applyRecipientPrefixWithSnapshot(requestText, recipientSnapshot));
-  const pendingFloorSync = _floorSyncByCid.get(cid);
-  const clearSubmittedComposer = () => {
-    const ownsVisibleDraft = currentCid === cid && submittedDraft.matches();
-    if (ownsVisibleDraft) {
-      _clearQuickStartDraft(input);
-      composerSetText(input, '');
-      _draftHadRecipient.delete('conversation');
-      autoGrow(input, 200);
-    }
-    // Navigation saves the old draft under cid; never clear a newer draft
-    // authored in this same composer while the send was waiting.
-    if (ownsVisibleDraft) _clearDraft(cid);
-    else if (typeof _discardSubmittedDraft === 'function') _discardSubmittedDraft(cid, submittedDraft);
-  };
-  const attachmentSnapshot = await _chatAttachSnapshotForSend(cid);
-  if (!attachmentSnapshot.ok) {
-    releaseAttachmentSend();
-    await uiAlert(t('chat.attach_sync_failed'));
-    return;
-  }
-  attachList = attachmentSnapshot.items;
-  attachments = attachmentSnapshot.names;
-  if (recipientSnapshot.resetFloor) _pendingFloorResetByCid.delete(cid);
-  const references = _referenceSnapshotsForQuotes(quotes);
-  _convLog.info('chat submit', { cid, length: raw.length, use: useSelections.map((sel) => sel.kind), attachments: attachments.length });
+  try {
+    // The shared composer can change tasks during either preflight await.
+    // Resolve its routing context while it still belongs to this submission.
+    const recipientSnapshot = _recipientSnapshotForSend('conversation');
+    const commanderDisplay = _commanderMentionDisplayForSend(requestText, recipientSnapshot);
+    const content = transformWithChatUse(_applyRecipientPrefixWithSnapshot(requestText, recipientSnapshot));
+    const runRecipient = recipientSnapshot.defaultRecipient || recipientSnapshot;
+    const agentRunOptions = runRecipient.kind === 'agent' && runRecipient.id
+      ? { agent_id: runRecipient.id } : {};
 
-  // Queue absorption (task-board plan P2 UI half): a busy conversation no
-  // longer parks new messages in the renderer-local queue — they go straight
-  // to the backend, where the scheduler queues them as visible, cancellable
-  // board tasks. The LOCAL queue survives only to drain legacy rows already
-  // stored (order preserved: while any remain, new sends line up behind
-  // them). A newly queued task can still be folded into the active turn with
-  // its task-board row's explicit "Send now" action.
-  if (pendingFloorSync) {
-    await Promise.race([pendingFloorSync, new Promise((r) => setTimeout(r, 1500))]);
-  }
-  if (isConvPending(cid)) {
-    // Lightweight direct send while busy (same transport the queue rows'
-    // "Send now" used): plain /send, no local controller — the already-open
-    // event stream renders the bubble and the board row. Composer sends
-    // always queue; only an existing task-board row offers "Send now".
-    try {
-      const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/send`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          content,
-          ...commanderDisplay,
-          ...(attachments.length ? { attachments } : {}),
-          ...(useSelections.length ? { use_selections: useSelections } : {}),
-          ...(references.length ? { references } : {}),
-        }),
-      });
-      const data = await res.json();
-      if (!data || data.ok === false) {
-        _convLog.warn('busy direct send failed', { failure_stage: 'response' });
-        await uiAlert(t('chat.send_failed', { msg: String((data && data.error) || 'unknown') }));
-        releaseAttachmentSend();
-        return; // keep the composer content for retry
+    const clearSubmittedComposer = () => {
+      const ownsVisibleDraft = currentCid === cid && submittedDraft.matches();
+      if (ownsVisibleDraft) {
+        composerSetText(input, '');
+        _draftHadRecipient.delete('conversation');
+        autoGrow(input, 200);
       }
-      // A busy-path send can race the previous turn's settlement: the backend
-      // may have gone idle and closed the event streams a beat before the
-      // POST landed, leaving this send's events (bubble, board row, reply)
-      // with no subscriber — nothing visible happens and the user resends
-      // (on-device 2026-08-27). Repair at the boundary: paint the user
-      // message from the response when it already entered history (admitted
-      // immediately), re-arm the observer for a live turn, refresh the board
-      // rows from disk, and let recovery+polling reconcile a stale busy
-      // flag. Best-effort — a repair failure must never fail the accepted
-      // send itself.
+      // Navigation saves the old draft under cid; never clear a newer draft
+      // authored in this same composer while the send was waiting.
+      if (ownsVisibleDraft) _clearDraft(cid);
+      else if (typeof _discardSubmittedDraft === 'function') _discardSubmittedDraft(cid, submittedDraft);
+    };
+    const attachmentSnapshot = await _chatAttachSnapshotForSend(cid);
+    if (!attachmentSnapshot.ok) {
+      releaseAttachmentSend();
+
+      await uiAlert(t('chat.attach_sync_failed'));
+      return;
+    }
+    attachList = attachmentSnapshot.items;
+    attachments = attachmentSnapshot.names;
+
+    const references = _referenceSnapshotsForQuotes(quotes);
+    _convLog.info('chat submit', { cid, length: raw.length, use: useSelections.map((sel) => sel.kind), attachments: attachments.length });
+
+    // Queue absorption (task-board plan P2 UI half): a busy conversation no
+    // longer parks new messages in the renderer-local queue — they go straight
+    // to the backend, where the scheduler queues them as visible, cancellable
+    // board tasks. The LOCAL queue survives only to drain legacy rows already
+    // stored (order preserved: while any remain, new sends line up behind
+    // them). A newly queued task can still be folded into the active turn with
+    // its task-board row's explicit "Send now" action.
+    _takeRecipientSnapshotForSend('conversation', recipientSnapshot, cid);
+    const pendingFloorSync = _floorSyncByCid.get(cid);
+    if (pendingFloorSync) {
+      await Promise.race([pendingFloorSync, new Promise((r) => setTimeout(r, 1500))]);
+    }
+    if (isConvPending(cid)) {
+      // Lightweight direct send while busy (same transport the queue rows'
+      // "Send now" used): plain /send, no local controller — the already-open
+      // event stream renders the bubble and the board row. Composer sends
+      // always queue; only an existing task-board row offers "Send now".
       try {
-        if (data.msg && data.msg.persisted !== false
-            && cid === currentCid
-            && typeof _renderOrClaimPersistedUserMessage === 'function') {
-          _renderOrClaimPersistedUserMessage(cid, data.msg);
+        const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/send`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content,
+            ...commanderDisplay,
+            ...(attachments.length ? { attachments } : {}),
+            ...(useSelections.length ? { use_selections: useSelections } : {}),
+            ...(references.length ? { references } : {}),
+          }),
+        });
+        const data = await res.json();
+        if (!data || data.ok === false) {
+          _convLog.warn('busy direct send failed', { failure_stage: 'response' });
+          await uiAlert(t('chat.send_failed', { msg: String((data && data.error) || 'unknown') }));
+          releaseAttachmentSend();
+          return; // keep the composer content for retry
         }
-        if (typeof _observeConversationRunFromPlanAction === 'function') {
-          _observeConversationRunFromPlanAction(cid, { attachExisting: true, allowWithController: true });
+        // A busy-path send can race the previous turn's settlement: the backend
+        // may have gone idle and closed the event streams a beat before the
+        // POST landed, leaving this send's events (bubble, board row, reply)
+        // with no subscriber — nothing visible happens and the user resends
+        // (on-device 2026-08-27). Repair at the boundary: paint the user
+        // message from the response when it already entered history (admitted
+        // immediately), re-arm the observer for a live turn, refresh the board
+        // rows from disk, and let recovery+polling reconcile a stale busy
+        // flag. Best-effort — a repair failure must never fail the accepted
+        // send itself.
+        try {
+          if (data.msg && data.msg.persisted !== false
+              && cid === currentCid
+              && typeof _renderOrClaimPersistedUserMessage === 'function') {
+            _renderOrClaimPersistedUserMessage(cid, data.msg);
+          }
+          if (typeof _observeConversationRunFromPlanAction === 'function') {
+            _observeConversationRunFromPlanAction(cid, { attachExisting: true, allowWithController: true });
+          }
+          if (window.TaskBoard && typeof window.TaskBoard.resync === 'function') window.TaskBoard.resync(cid);
+          if (typeof _startRuntimeActorRecovery === 'function') _startRuntimeActorRecovery(cid);
+          if (typeof startPolling === 'function') startPolling(cid);
+        } catch (_) {
+          _convLog.warn('post-send visibility repair failed', { failure_stage: 'visibility_repair' });
         }
-        if (window.TaskBoard && typeof window.TaskBoard.resync === 'function') window.TaskBoard.resync(cid);
-        if (typeof _startRuntimeActorRecovery === 'function') _startRuntimeActorRecovery(cid);
-        if (typeof startPolling === 'function') startPolling(cid);
-      } catch (_) {
-        _convLog.warn('post-send visibility repair failed', { failure_stage: 'visibility_repair' });
+      } catch (err) {
+        _convLog.warn('busy direct send failed', { failure_stage: 'request' });
+        await uiAlert(t('chat.send_failed', { msg: String((err && err.message) || err) }));
+        releaseAttachmentSend();
+        return;
       }
-    } catch (err) {
-      _convLog.warn('busy direct send failed', { failure_stage: 'request' });
-      await uiAlert(t('chat.send_failed', { msg: String((err && err.message) || err) }));
+      clearSubmittedComposer();
+      _consumeSubmittedQuotes(cid, quotes);
+      if (attachments.length) _chatAttachClear(cid);
       releaseAttachmentSend();
       return;
     }
+
+    // Keep the authored composer state (raw text with inline use tokens, chips)
+    // so stopping this turn can hand the message back for a quick edit.
+    if (typeof _rememberSentComposerSnapshot === 'function') {
+      _rememberSentComposerSnapshot(cid, {
+        text: requestText,
+        recipient: recipientSnapshot,
+        references: quotes,
+        attachments: attachList.filter((attachment) => attachment.status !== 'error'),
+      });
+    }
     clearSubmittedComposer();
+    // Persist remaining references after clearing the accepted text, so a quote
+    // added during preflight also survives reload.
     _consumeSubmittedQuotes(cid, quotes);
+    // Clear chip area immediately — the server will return with the final
+    // attachment state tied to the user message record. If the send fails or
+    // is aborted, the files remain on disk but the user can re-attach via the
+    // "+" button (listAttachments shows what's still there).
     if (attachments.length) _chatAttachClear(cid);
     releaseAttachmentSend();
-    return;
-  }
-
-  // D9 UI half: no hidden recipient-prefix synthesis on the direct send —
-  // inline mentions the user typed ARE the dispatch; a mention-less message
-  // routes by the floor the chip already set via IPC. Await any in-flight
-  // chip floor write (bounded) so a click-then-send burst cannot race it.
-  // Keep the authored composer state (raw text with inline use tokens, chips)
-  // so stopping this turn can hand the message back for a quick edit.
-  if (typeof _rememberSentComposerSnapshot === 'function') {
-    _rememberSentComposerSnapshot(cid, {
-      text: requestText,
-      recipient: recipientSnapshot,
-      references: quotes,
-      attachments: attachList.filter((attachment) => attachment.status !== 'error'),
+    const extra = {
+      ...(attachments.length ? { attachments } : {}),
+      ...(useSelections.length ? { use_selections: useSelections } : {}),
+      ...(references.length ? { references } : {}),
+      ...commanderDisplay,
+    };
+    return sendInConversation(cid, content, Object.keys(extra).length ? extra : undefined, {
+      restoreComposerOnFailure: true,
+      source_view: 'conversation',
+      background: cid !== currentCid,
+      ...agentRunOptions,
+      content_length: requestText.length,
     });
+  } finally {
+    releaseAttachmentSend();
   }
-  clearSubmittedComposer();
-  // Persist remaining references after clearing the accepted text, so a quote
-  // added during preflight also survives reload.
-  _consumeSubmittedQuotes(cid, quotes);
-  // Clear chip area immediately — the server will return with the final
-  // attachment state tied to the user message record. If the send fails or
-  // is aborted, the files remain on disk but the user can re-attach via the
-  // "+" button (listAttachments shows what's still there).
-  if (attachments.length) _chatAttachClear(cid);
-  releaseAttachmentSend();
-  const extra = {
-    ...(attachments.length ? { attachments } : {}),
-    ...(useSelections.length ? { use_selections: useSelections } : {}),
-    ...(references.length ? { references } : {}),
-    ...commanderDisplay,
-  };
-  await sendInConversation(cid, content, Object.keys(extra).length ? extra : undefined, {
-    restoreComposerOnFailure: true,
-    ...(recipientSnapshot && recipientSnapshot.kind === 'agent' && recipientSnapshot.id
-      ? { agent_id: recipientSnapshot.id }
-      : {}),
-  });
 }
 
 // One transient controller per conversation send. Multi-cid support comes
@@ -11643,8 +11804,8 @@ async function sendInConversation(cid, content, extra, options = {}) {
     // snapshot intact.
     if (!started && typeof _clearSentComposerSnapshot === 'function') {
       _clearSentComposerSnapshot(cid);
-      _convChatCtrls.delete(cid);
     }
+    if (!started && _convChatCtrls.get(cid) === ctrl) _convChatCtrls.delete(cid);
     return { ...terminal, started, aborted, errored, result };
   } catch (err) {
     if (agentId) {
@@ -11970,6 +12131,7 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
     } finally {
       settled = true;
       clearTimeout(noActivityTimer);
+      if (_forgottenTaskSurfaceObservers.has(ctrl)) return;
       // Whether this observer is still the conversation's current one. A newer
       // send registers its own observer, and once that happens every global
       // teardown below belongs to that newer run, not to this finishing one.
@@ -12564,7 +12726,7 @@ function _refreshProcessCompactGroup(group) {
   const groupBody = _processCompactGroupBody(group);
   const summary = _processCompactGroupSummary(group);
   if (!key || !groupBody || !summary) return;
-  const count = Array.from(groupBody.children || []).filter((node) => (
+  const count = group._processOperationCount ?? Array.from(groupBody.children || []).filter((node) => (
     node?.dataset?.processOperation === '1'
   )).length;
   summary.innerHTML = `
@@ -12584,6 +12746,7 @@ function _createProcessCompactGroup(key) {
   groupBody.className = 'stream-process-compact-body';
   group._processCompactSummary = summary;
   group._processCompactBody = groupBody;
+  group._processOperationCount = 0;
   group.appendChild(summary);
   group.appendChild(groupBody);
   _refreshProcessCompactGroup(group);
@@ -12593,10 +12756,28 @@ function _createProcessCompactGroup(key) {
 // Collapse maximal adjacent operation runs. Creating a fresh wrapper preserves
 // exact child order when a live row joins an existing group. An open group stays
 // open as more items arrive; otherwise every group starts closed.
-function _compactAdjacentProcessRows(body) {
+function _compactAdjacentProcessRows(body, appended = null) {
   if (!body
       || typeof body.insertBefore !== 'function'
       || _hasProcessClass(body, 'stream-process-compact-body')) return;
+  // An append cannot change earlier adjacency. Narration-heavy turns must
+  // not rescan their whole rail each time another isolated operation lands.
+  if (appended && _processCompactNodeKey(appended)) {
+    const previous = appended.previousElementSibling || body.children?.[body.children.length - 2];
+    if (_hasProcessClass(previous, 'stream-process-compact-group')
+        && _processCompactNodeKey(previous) === _processCompactNodeKey(appended)) {
+      _processCompactGroupBody(previous).appendChild(appended);
+      previous._processOperationCount += appended.dataset?.processOperation === '1' ? 1 : 0;
+      _refreshProcessCompactGroup(previous);
+    } else {
+      const group = _createProcessCompactGroup(_processCompactNodeKey(appended));
+      body.insertBefore(group, appended);
+      _processCompactGroupBody(group).appendChild(appended);
+      group._processOperationCount = appended.dataset?.processOperation === '1' ? 1 : 0;
+      _refreshProcessCompactGroup(group);
+    }
+    return;
+  }
   // Live-append fast path: the newest row continues the trailing group, so
   // move just that row. The general rebuild below re-created the group and
   // reparented every earlier row on each appended operation — O(rows²) DOM
@@ -12612,6 +12793,7 @@ function _compactAdjacentProcessRows(body) {
     const groupBody = _processCompactGroupBody(trailingGroup);
     if (groupBody && typeof groupBody.appendChild === 'function') {
       groupBody.appendChild(newest);
+      trailingGroup._processOperationCount += newest.dataset?.processOperation === '1' ? 1 : 0;
       _refreshProcessCompactGroup(trailingGroup);
       return;
     }
@@ -12646,10 +12828,14 @@ function _compactAdjacentProcessRows(body) {
     for (const node of run) {
       if (_hasProcessClass(node, 'stream-process-compact-group')) {
         const nestedBody = _processCompactGroupBody(node);
-        for (const child of Array.from(nestedBody?.children || [])) groupBody.appendChild(child);
+        for (const child of Array.from(nestedBody?.children || [])) {
+          groupBody.appendChild(child);
+          group._processOperationCount += child.dataset?.processOperation === '1' ? 1 : 0;
+        }
         node.remove?.();
       } else {
         groupBody.appendChild(node);
+        group._processOperationCount += node.dataset?.processOperation === '1' ? 1 : 0;
       }
     }
     group.open = keepOpen;
@@ -12661,13 +12847,22 @@ function _compactAdjacentProcessRows(body) {
 
 function _processLifecycleRow(body, lifecycleKey) {
   if (!body || !lifecycleKey) return null;
-  for (const line of Array.from(body.children || [])) {
-    if (line?.dataset?.processCallId === lifecycleKey) return line;
-    if (!_hasProcessClass(line, 'stream-process-compact-group')) continue;
-    const nested = _processLifecycleRow(_processCompactGroupBody(line), lifecycleKey);
-    if (nested) return nested;
+  if (!body._processLifecycleRows || body.children?.length === 0) {
+    body._processLifecycleRows = new Map();
+    const visit = (container) => {
+      for (const line of Array.from(container?.children || [])) {
+        if (line?.dataset?.processCallId) body._processLifecycleRows.set(line.dataset.processCallId, line);
+        if (_hasProcessClass(line, 'stream-process-compact-group')) visit(_processCompactGroupBody(line));
+      }
+    };
+    visit(body);
   }
-  return null;
+  const line = body._processLifecycleRows.get(lifecycleKey);
+  if (line && body.contains?.(line) === false) {
+    body._processLifecycleRows.delete(lifecycleKey);
+    return null;
+  }
+  return line || null;
 }
 
 function _setProcessRowPresentation(
@@ -12762,7 +12957,6 @@ function _appendProcessTextLines(
         false,
         lifecycleTerminal,
       );
-      _compactAdjacentProcessRows(body);
       return 1;
     }
   }
@@ -12785,8 +12979,12 @@ function _appendProcessTextLines(
     const compactGroup = _processCompactGroupKey();
     if (compactGroup) line.dataset.processCompactGroup = compactGroup;
     body.appendChild(line);
+    if (lifecycleKey && index === 0) {
+      if (!body._processLifecycleRows) body._processLifecycleRows = new Map();
+      body._processLifecycleRows.set(lifecycleKey, line);
+    }
+    _compactAdjacentProcessRows(body, line);
   }
-  _compactAdjacentProcessRows(body);
   return lines.length;
 }
 
@@ -12816,7 +13014,7 @@ function _runtimeDurationMsFromEvent(evt) {
 
 function _runtimeDurationFromEvent(evt) {
   const durationMs = _runtimeDurationMsFromEvent(evt);
-  return durationMs == null ? '' : _formatProcessDuration(durationMs);
+  return durationMs == null ? '' : (evt.data?.duration_estimated === true ? '≈ ' : '') + _formatProcessDuration(durationMs);
 }
 
 function _runtimeDurationFromProcessItem(item) {
@@ -12942,7 +13140,7 @@ function _updateStreamingRuntimeSummary(msg, evt, elapsedMs) {
   } else {
     delete container.dataset.runtimeTerminal;
   }
-  _setProcessSummaryRuntime(msg, _formatProcessDuration(durationMs));
+  _setProcessSummaryRuntime(msg, hasRuntimeEvent ? _runtimeDurationFromEvent(evt) : _formatProcessDuration(durationMs));
   return container;
 }
 
@@ -14922,6 +15120,10 @@ function _anchorPlaceholderToTurnStart(ph, startedAtMs) {
     startMs,
     Number.isFinite(activitySortAfter) ? activitySortAfter : 0,
   ));
+  // Recovery creates the DOM now, but this header describes the running turn,
+  // not when the user reopened the page. Keep it aligned with the row anchor.
+  const timeEl = ph.querySelector?.('.chat-msg-time');
+  if (timeEl) timeEl.textContent = formatTime(new Date(Number(ph.dataset.ts)).toISOString());
   const container = ph.parentElement;
   if (!container) return;
   if (!_isTimestampPositionCorrect(container, ph)) _insertByTimestamp(container, ph);
@@ -16302,7 +16504,7 @@ function _formatEventLine(evt, displayContext) {
     // Keep the process summary compact: expose only total wall time. Provider,
     // aggregate tool, compaction, and retry breakdowns remain internal
     // diagnostics; individual completed tool rows show their persisted E2E time.
-    return t('chat.stream.runtime_total', { duration: _formatProcessDuration(runtimeDurationMs) });
+    return t('chat.stream.runtime_total', { duration: _runtimeDurationFromEvent(evt) });
   }
 
   if (stream === 'tool') {
@@ -16661,8 +16863,11 @@ function _appendProjectedProcessRowToBody(body, projection) {
   else if (line.dataset) delete line.dataset.toolResultRef;
   line._fullOutput = projection.fullOutput || '';
   line.title = t('chat.tool_result_expand_hint');
-  if (!existing) body.appendChild(line);
-  _compactAdjacentProcessRows(body);
+  if (!existing) {
+    body.appendChild(line);
+    if (projection.lifecycleKey) body._processLifecycleRows.set(projection.lifecycleKey, line);
+    _compactAdjacentProcessRows(body, line);
+  }
 
   // One delegated handler per process body. Persisted messages use the same
   // handler as the live bubble once the outer process disclosure is opened.
@@ -16742,7 +16947,7 @@ function _materializeReasoningSummary(msg, evt) {
 // text deltas update the single "live" line; everything else becomes a new
 // process-pane line (via _formatEventLine).
 function _renderAgentEvent(msg, evt) {
-  window.OrkasCommercialEntry?.observeToolResult(msg, evt);
+
   if (!evt || typeof evt !== 'object') return;
   evt = _materializeReasoningSummary(msg, evt);
   const { stream, data } = evt;
@@ -17034,22 +17239,70 @@ function _renderConvDisabledBanner(cid) {
   if (cid === currentCid) _updateConvSendUI(cid);
 }
 
-function _refreshTaskSurfacesAfterAbort(cid) {
-  if (!cid) return;
+const _taskSurfaceAbortRefreshOwners = new Map();
+const _forgottenTaskSurfaceObservers = new WeakSet();
+
+function _forgetConversationRuntime(cid) {
+  const state = pendingConvs.get(cid);
+  if (state) state.aborted = true;
+  const sources = new Set([
+    _convChatCtrls.get(cid), _groupObserverReservations.get(cid),
+    _groupObserverCtrls.get(cid), state?.controller,
+  ].filter(Boolean));
+  // Remove the cached identities before abort callbacks can settle. Restoring
+  // this cid must create fresh controllers through the normal entry points.
+  _convChatCtrls.delete(cid);
+  _groupObserverReservations.delete(cid);
+  _groupObserverCtrls.delete(cid);
+  pendingConvs.delete(cid);
+  _stopRuntimeActorRecovery(cid);
+  stopPolling(cid);
+  for (const source of sources) {
+    if (typeof source === 'object' || typeof source === 'function') _forgottenTaskSurfaceObservers.add(source);
+    try { source.abort?.(); } catch (_) {}
+  }
+}
+
+function _beginTaskSurfaceAbortRefresh(cid) {
+  const previous = _taskSurfaceAbortRefreshOwners.get(cid);
+  if (previous && previous.timer != null) clearTimeout(previous.timer);
+  const owner = { timer: null, settled: false };
+  _taskSurfaceAbortRefreshOwners.set(cid, owner);
+  return owner;
+}
+
+function _refreshTaskSurfacesAfterAbort(cid, owner) {
+  if (!owner) {
+    // This entry is the bus-owned abort, independent of a local Stop request.
+    // Its active transport was already checked by the original reader loop.
+    // Confirmed forget removes and aborts all three cid source identities.
+    if (!cid || !(_convChatCtrls.has(cid) || _groupObserverReservations.has(cid) || _groupObserverCtrls.has(cid))) return;
+    owner = _taskSurfaceAbortRefreshOwners.get(cid);
+    if (!owner) {
+      owner = _beginTaskSurfaceAbortRefresh(cid);
+      owner.settled = true;
+    }
+  }
+  // A confirmed forget invalidates both queued timers and abort responses that
+  // are still in flight. A restored conversation gets a fresh owner identity.
+  if (!cid || _taskSurfaceAbortRefreshOwners.get(cid) !== owner) return;
   try {
     if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid, { silent: true });
   } catch (_) {}
-  // The Stop click tears the event streams down BEFORE the bus settles the
-  // aborted turn's task, so the terminal `task_state` has no subscriber —
-  // re-seed the board once now and once after the settlement window. Without
-  // this the cancelled task stayed painted "running" until the next send
-  // reopened a stream (observed on-device 2026-08-23).
+  // Stop detaches streams before task settlement. Keep the immediate refresh
+  // and one refresh after the latest settlement window, owned by this abort.
   try {
     if (window.TaskBoard && typeof window.TaskBoard.resync === 'function') {
       window.TaskBoard.resync(cid);
-      setTimeout(() => { try { window.TaskBoard.resync(cid); } catch (_) {} }, 1500);
     }
   } catch (_) {}
+  if (owner.timer != null) clearTimeout(owner.timer);
+  owner.timer = setTimeout(() => {
+    owner.timer = null;
+    if (_taskSurfaceAbortRefreshOwners.get(cid) !== owner) return;
+    try { window.TaskBoard?.resync?.(cid); } catch (_) {}
+    if (owner.settled) _taskSurfaceAbortRefreshOwners.delete(cid);
+  }, 1500);
 }
 
 // A restored/reconnected run is owned by the group-events observer rather than
@@ -17072,6 +17325,7 @@ function _settleConversationPlaceholdersOnAbort(cid, state) {
 }
 
 function abortConvStream(cid, options = {}) {
+  const taskSurfaceOwner = _beginTaskSurfaceAbortRefresh(cid);
   const state = pendingConvs.get(cid);
   if (options && options.userInitiated) {
     // A user stop is normally followed by an edit and resend. Restore the
@@ -17081,6 +17335,11 @@ function abortConvStream(cid, options = {}) {
   _stopRuntimeActorRecovery(cid);
   _stopGroupEventObserver(cid);
   setGroupConversationBusy(cid, false);
+  // The detached streams cannot deliver the cancelled turns' final state.
+  // Expire their question cards locally without answering or forgetting drafts;
+  // a later authoritative update can still describe a replacement turn.
+  _latestActiveTurns.set(cid, []);
+  window.CliAsyncInput?.setActiveTurns(cid, []);
   // Group chat: also tell the bus to abort all in-flight worker turns + clear
   // queues. Cancelling just the IPC stream would leave agents running in the
   // background. Fire-and-forget — no need to block the UI on the response.
@@ -17088,12 +17347,16 @@ function abortConvStream(cid, options = {}) {
     apiFetch(`/api/conversations/${cid}/abort`, { method: 'POST' })
       .catch(() => {})
       .finally(() => {
-        _refreshTaskSurfacesAfterAbort(cid);
-        });
-  } catch (_) {}
+        taskSurfaceOwner.settled = true;
+        _refreshTaskSurfacesAfterAbort(cid, taskSurfaceOwner);
+      });
+  } catch (_) {
+    taskSurfaceOwner.settled = true;
+    _refreshTaskSurfacesAfterAbort(cid, taskSurfaceOwner);
+  }
   if (!state) {
     _updateConvSidebarBadge(cid, false);
-    _refreshTaskSurfacesAfterAbort(cid);
+    _refreshTaskSurfacesAfterAbort(cid, taskSurfaceOwner);
     if (cid === currentCid) _updateConvSendUI(cid);
     return;
   }
@@ -17112,7 +17375,7 @@ function abortConvStream(cid, options = {}) {
     stopPolling(cid);
     if (state.loadingEl && state.loadingEl.isConnected) state.loadingEl.remove();
     _updateConvSidebarBadge(cid, false);
-    _refreshTaskSurfacesAfterAbort(cid);
+    _refreshTaskSurfacesAfterAbort(cid, taskSurfaceOwner);
     if (cid === currentCid) _updateConvSendUI(cid);
     return;
   }
@@ -18031,42 +18294,6 @@ function _selectedMessageElements() {
   return Array.from(document.querySelectorAll('#chat-history .chat-message[data-msg-id]'))
     .filter((msg) => _messageSelectionState.selected.has(msg.dataset.msgId || ''));
 }
-
-
-window.attachKbFileToDraft = async function attachKbFileToDraft(channel, payload, draftCid, afterNavigate) {
-  const finishOperation = _chatAttachBeginOperation(draftCid);
-  let stage = 'draft_lock';
-  try {
-    if (!finishOperation) throw new Error(t('chat.attach_send_in_progress'));
-    stage = 'ipc_request';
-    const data = await window.orkas.invoke(channel, { ...(payload || {}), cid: draftCid });
-    if (!data || !data.ok) {
-      const error = new Error((data && data.error) || 'failed');
-      error.failure_stage = data && data.failure_stage;
-      error.failure_kind = data && data.failure_kind;
-      throw error;
-    }
-    stage = 'navigation';
-    if (typeof afterNavigate === 'function') afterNavigate();
-    stage = 'draft_render';
-    _addReadyDraftAttachment(draftCid, data.info);
-  } catch (error) {
-    const safeStage = error && error.failure_stage;
-    const safeKind = error && error.failure_kind;
-    const failure_stage = ['input_validation', 'source_resolve', 'attachment_import'].includes(safeStage) ? safeStage : stage;
-    const failure_kind = ['not_found', 'permission_denied', 'disk_full'].includes(safeKind) ? safeKind : 'operation_failed';
-    // Keep the UI's original message; diagnostics receive only the enums.
-    const wrapped = new Error((error && error.message) || String(error));
-    wrapped.failure_stage = failure_stage;
-    wrapped.failure_kind = failure_kind;
-    _convLog.warn('library attachment failed', { failure_stage, failure_kind });
-    throw wrapped;
-  } finally {
-    if (finishOperation) finishOperation();
-  }
-};
-
-
 
 try {
   if (window.orkas && typeof window.orkas.onPushEvent === 'function') {

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import {
   flattenTransparentImageToJpeg,
   prepareFeedbackUploadImage,
-  toCompressedGrayJpeg,
+  toCompressedJpeg,
 } from '../../../src/main/util/image-transform';
 
 let sourcePng: Buffer;
@@ -11,7 +11,7 @@ beforeAll(async () => {
   // Build a 2000x1500 colorful PNG via jimp (test-only dep on the same lib).
   const { Jimp } = await import('jimp' as any);
   const img: any = new Jimp({ width: 2000, height: 1500, color: 0x336699FF });
-  // Stamp a few colored bands so greyscale conversion has something to verify.
+  // Include red and blue regions to detect lost color after compression.
   img.scan(0, 0, 2000, 100, function (this: any, _x: number, _y: number, idx: number) {
     this.bitmap.data[idx + 0] = 220;
     this.bitmap.data[idx + 1] = 30;
@@ -20,9 +20,9 @@ beforeAll(async () => {
   sourcePng = await img.getBuffer('image/png');
 });
 
-describe('image-transform › toCompressedGrayJpeg', () => {
+describe('image-transform › toCompressedJpeg', () => {
   it('downscales long edge to maxDim and emits JPEG', async () => {
-    const r = await toCompressedGrayJpeg(sourcePng, { maxDim: 800, quality: 60 });
+    const r = await toCompressedJpeg(sourcePng, { maxDim: 800, quality: 60 });
     expect(r.mimeType).toBe('image/jpeg');
     expect(Math.max(r.width, r.height)).toBeLessThanOrEqual(800);
     // JPEG magic
@@ -31,24 +31,25 @@ describe('image-transform › toCompressedGrayJpeg', () => {
     expect(r.buf.length).toBeGreaterThan(100);
   });
 
-  it('produces grayscale pixels (R≈G≈B for sampled pixel)', async () => {
-    const r = await toCompressedGrayJpeg(sourcePng, { maxDim: 200 });
+  it('preserves red and blue pixels with the default transform', async () => {
+    const r = await toCompressedJpeg(sourcePng);
     const { Jimp } = await import('jimp' as any);
     const out: any = await Jimp.read(r.buf);
-    // Sample a band that started red — after greyscale, R/G/B should be near-equal.
-    const px = out.getPixelColor(50, 50); // 0xRRGGBBAA
-    const r8 = (px >>> 24) & 0xff;
-    const g8 = (px >>> 16) & 0xff;
-    const b8 = (px >>> 8)  & 0xff;
-    expect(Math.abs(r8 - g8)).toBeLessThanOrEqual(8);
-    expect(Math.abs(g8 - b8)).toBeLessThanOrEqual(8);
+    for (const [x, y, expected] of [
+      [50, 20, [220, 30, 30]],
+      [50, 100, [51, 102, 153]],
+    ] as const) {
+      const px = out.getPixelColor(x, y);
+      const actual = [(px >>> 24) & 0xff, (px >>> 16) & 0xff, (px >>> 8) & 0xff];
+      actual.forEach((channel, i) => expect(Math.abs(channel - expected[i])).toBeLessThan(15));
+    }
   });
 
   it('does not upscale when source is smaller than maxDim', async () => {
     const { Jimp } = await import('jimp' as any);
     const small: any = new Jimp({ width: 100, height: 80, color: 0xFFFFFFFF });
     const smallPng: Buffer = await small.getBuffer('image/png');
-    const r = await toCompressedGrayJpeg(smallPng, { maxDim: 1024 });
+    const r = await toCompressedJpeg(smallPng, { maxDim: 1024 });
     expect(r.width).toBe(100);
     expect(r.height).toBe(80);
   });
@@ -64,7 +65,7 @@ describe('image-transform › toCompressedGrayJpeg', () => {
     });
     const input: Buffer = await transparent.getBuffer('image/png');
 
-    const result = await toCompressedGrayJpeg(input, { maxDim: 100, quality: 90 });
+    const result = await toCompressedJpeg(input, { maxDim: 100, quality: 90 });
     const output: any = await Jimp.read(result.buf);
     const background = output.getPixelColor(5, 5);
     const foreground = output.getPixelColor(40, 30);
@@ -84,7 +85,7 @@ describe('image-transform › toCompressedGrayJpeg', () => {
   });
 
   it('rejects empty buffer', async () => {
-    await expect(toCompressedGrayJpeg(Buffer.alloc(0))).rejects.toThrow(/empty|invalid/i);
+    await expect(toCompressedJpeg(Buffer.alloc(0))).rejects.toThrow(/empty|invalid/i);
   });
 });
 

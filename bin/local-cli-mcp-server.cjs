@@ -833,6 +833,20 @@ async function executeAction(expectedRisk, args, options = {}, env = process.env
   let prepared;
   try {
     prepared = await prepareLocalInputs(parameters, inspection, env, signal);
+    if (inspection.provider === 'lark' && inspection.action === 'im.+messages-resources-download') {
+      const directory = options.localFileOutputDirectory;
+      if (typeof directory !== 'string' || !path.isAbsolute(directory)) {
+        throw new Error('A current conversation is required to receive this download.');
+      }
+      const real = fs.realpathSync(directory);
+      // This directory comes from MCP request metadata owned by the Host,
+      // never provider arguments. Host and child may have different temp roots.
+      if (!fs.statSync(real).isDirectory()
+          || isWithin(fs.realpathSync(env.ORKAS_LOCAL_CLI_RUNTIME_DIR), real)) {
+        throw new Error('The download staging directory is not allowed.');
+      }
+      prepared.cwd = real;
+    }
     throwIfCancelled(signal);
     const invocation = providerInvocation(validateAction(inspection.action, env), prepared.parameters, effectiveRisk, env, inspection);
     return {
@@ -915,7 +929,10 @@ async function main() {
       const onProgress = progressToken == null ? undefined : () => extra.sendNotification({
         method: 'notifications/progress', params: { progressToken, progress: ++progress },
       }).catch(() => {});
-      const result = await runInOrder(() => callTool(request.params.name, request.params.arguments || {}, { signal, onProgress }));
+      const result = await runInOrder(() => callTool(request.params.name, request.params.arguments || {}, {
+        signal, onProgress,
+        localFileOutputDirectory: request.params._meta?.['orkas/local-file-output-directory'],
+      }));
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     } catch (error) {
       return {

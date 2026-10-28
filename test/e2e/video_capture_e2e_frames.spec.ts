@@ -1,4 +1,4 @@
-import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
 import { expect, OrkasTestApp, test as base } from './fixtures/orkas';
@@ -70,7 +70,9 @@ function writeComposition(dir: string) {
 async function expectColor(file: string, color: string, encoded = false) {
   // Away from text/grid strokes. Encoding may convert the display color
   // profile; assert chapter identity by dominant channel, not exact RGB.
-  const pixel = await sharp(file).extract({ left: 350, top: 350, width: 1, height: 1 }).raw().toBuffer();
+  // Node supports retained checkpoint paths beyond Windows MAX_PATH; the
+  // native image decoder's filename API may report those existing files missing.
+  const pixel = await sharp(readFileSync(file)).extract({ left: 350, top: 350, width: 1, height: 1 }).raw().toBuffer();
   const expected = Buffer.from(color.slice(1), 'hex');
   if (encoded) {
     const channel = colors.indexOf(color);

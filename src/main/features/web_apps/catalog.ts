@@ -3,7 +3,7 @@ import { DATA_INPUTS, dataDefinitionSchema, commonMethod, type AppType } from '.
 import { isAtomicWriteTempPath } from '../../storage';
 import { z } from 'zod';
 import { MAX_TEXT_FILE_BYTES } from '../../util/file-size-limits';
-import { zodToJsonSchema } from 'zod-to-json-schema';
+const { schemaToJson } = require('../../../../bin/schema-to-json.cjs');
 
 export const SDK_VERSION = 1;
 export const MANIFEST_FILE = 'orkas-app.json';
@@ -47,7 +47,7 @@ export const METHODS = {
   'files.release': define('files', 'Release a file handle before closing the app.', z.object({ handle }).strict(), '{released:true}', { handle: '0123456789abcdef0123456789abcdef' }),
   'ai.generate': define('ai', 'Generate text with the configured model without tools, skills or conversation history. Optional progress receives text deltas. Uses the configured model without an extra application permission dialog.', z.object({ prompt: z.string().min(1), maxTokens: z.number().int().positive().safe().optional() }).strict(), '{text,usage,stopReason}; token-limited output has stopReason=max_tokens. Cancel with AbortSignal.', { prompt: 'Write a short greeting.', maxTokens: 128 }),
   'tools.list': define(null, 'Discover eligible existing Orkas tools and their original schemas. Connector discovery supports BM25 query, bounded pages and full schemas for small catalogs through list_connector_tools. Does not grant execution.', empty, '{tools:[{name,capability,description,inputSchema}]}', {}),
-  'tools.call': define(null, 'Execute an eligible existing tool under its original operation permissions. Sensitive actions use host approval; Trusted mode skips confirmation. Unknown tools fail closed.', z.object({ name: key, arguments: z.record(z.unknown()) }).strict(), '{content,isError?}; inspect isError. Oversized results fail without replay.', { name: 'library', arguments: { action: 'list', scope: 'global', limit: 10 } }),
+  'tools.call': define(null, 'Execute an eligible existing tool under its original operation permissions. Sensitive actions use host approval; Trusted mode skips confirmation. Unknown tools fail closed.', z.object({ name: key, arguments: z.record(z.string(), z.unknown()) }).strict(), '{content,isError?}; inspect isError. Oversized results fail without replay.', { name: 'library', arguments: { action: 'list', scope: 'global', limit: 10 } }),
 } as const;
 export type Method = keyof typeof METHODS;
 export const CAPABILITIES = ['storage', 'appFiles', 'files', 'ai', 'library', 'connectors', 'data'] as const;
@@ -70,7 +70,7 @@ export function describeMethod(method: string) {
   const def = METHODS[method as Method];
   return { name: method, capability: def.capability, description: def.description,
     appTypes:commonMethod(method)?['local','web']:['local'],environments:commonMethod(method)?['desktop','preview','online']:['desktop','preview'],status:'supported',
-    inputSchema: zodToJsonSchema(def.input, { $refStrategy: 'none' }), result: def.result, example: def.example };
+    inputSchema: schemaToJson(def.input), result: def.result, example: def.example };
 }
 export function catalogDocument(appType:AppType='local') {
   const starter = appType === 'web' ? 'web' : 'starter';
@@ -81,11 +81,11 @@ export function catalogDocument(appType:AppType='local') {
     : manifestSchema;
   return { sdkVersion: SDK_VERSION,
     manifest: { file: MANIFEST_FILE, schema: {
-        ...zodToJsonSchema(schema, { $refStrategy: 'none' }),
+        ...schemaToJson(schema),
         // Both creators and runtimes require a definition for declared data.
         allOf: [{ if: { properties: { capabilities: { contains: { const: 'data' } } }, required: ['capabilities'] }, then: { required: ['data'] } }],
       },
       starter: { entry: `@skill/web-app-sdk/assets/${starter}/index.html`,
         manifest: `@skill/web-app-sdk/assets/${starter}/${MANIFEST_FILE}` } },
-    dataDefinition:zodToJsonSchema(dataDefinitionSchema,{$refStrategy:'none'}), methods: Object.keys(METHODS).filter(name=>appType==='local'||commonMethod(name)).map(name => describeMethod(name)), unsupported: UNSUPPORTED };
+    dataDefinition:schemaToJson(dataDefinitionSchema), methods: Object.keys(METHODS).filter(name=>appType==='local'||commonMethod(name)).map(name => describeMethod(name)), unsupported: UNSUPPORTED };
 }

@@ -2028,6 +2028,8 @@ function _openAddCustomDialog() {
       });
       if (res && res.ok && res.instance) {
         if (res.started && typeof res.attempt_id === 'string') {
+          const launch = _startOAuthLaunchFeedback(res.instance.id);
+          launch.attemptId = res.attempt_id;
           _pendingConnectAttempts.set(res.attempt_id, { uiCatalogId: res.instance.id });
         }
         added = true;

@@ -295,8 +295,8 @@ function writeEmbeddingModel(): void {
   for (const name of fs.readdirSync(source)) {
     const from = path.join(source, name);
     const to = path.join(dest, name);
-    try { fs.linkSync(from, to); }
-    catch { fs.copyFileSync(from, to); }
+    // Keep fixture lifecycle changes off the source inode used by checkpoint fingerprints.
+    fs.copyFileSync(from, to, fs.constants.COPYFILE_FICLONE);
   }
 }
 
@@ -328,7 +328,6 @@ describe('codesign-adhoc runtime gate', () => {
     writeVcRuntime(key, vc);
     writeEmbeddingModel();
     const entrypointRoot = writeEntrypointPayload();
-
     await afterPack({
       electronPlatformName: 'win32',
       arch: 1,

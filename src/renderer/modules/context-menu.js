@@ -1,6 +1,6 @@
 // ─── Generic right-click context menu ───
 // Small floating menu anchored at the cursor; items are { label, onClick,
-// disabled?, icon? }. There's exactly one menu instance at a time — opening a new
+// disabled?, danger?, icon? }. There's exactly one menu instance at a time — opening a new
 // menu closes the previous one. A row may provide a leading `icon`, a
 // structured Agent `avatar`, and/or a `trailingIcon` for selection state.
 // Dismissers: outside click, Escape, scroll,
@@ -43,7 +43,7 @@ function showContextMenu(event, items) {
   _ctxMenuItems.forEach((it, idx) => {
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = `context-menu-item${it.disabled ? ' is-disabled' : ''}`;
+    btn.className = `context-menu-item${it.danger ? ' is-danger' : ''}${it.disabled ? ' is-disabled' : ''}`;
     btn.dataset.contextMenuIdx = String(idx);
     btn.setAttribute('role', 'menuitem');
     btn.setAttribute('tabindex', '-1');

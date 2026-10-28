@@ -11,12 +11,11 @@ import { serveFileRange } from '../../util/http-range';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { mimeFor } from '../chat_artifacts';
 import { bundleRevision } from './bundle-revision';
-import { MANIFEST_FILE, manifestSchema } from './catalog';
+import { MANIFEST_FILE, SDK_PATH, manifestSchema } from './catalog';
 import { AppError, WebAppRuntime, type Bundle } from './runtime';
 import { normalizeAppType } from './data-contract';
 import { appResource } from './resources';
-import { storedAppType, requireLocalAppType } from './commercial-entry';
-import { getActiveUserId, hasActiveUser } from '../users';
+import { storedAppType } from './commercial-entry';
 
 export const previewPreload = path.join(SRC_ROOT, 'main/features/web_apps/preview-preload.js');
 export interface PreviewSdkEvidence {
@@ -29,22 +28,21 @@ export interface PreviewSdkEvidence {
 /** Absence preserves legacy HTML; an invalid opt-in must never downgrade. */
 export async function previewBundle(entry: string): Promise<Bundle | null> {
   const root = path.dirname(entry);
-  if (hasActiveUser()) requireLocalAppType(await (await import('../saved_apps')).managedPathAppType(getActiveUserId(), entry));
   const appType = storedAppType(root) ?? 'local';
-  requireLocalAppType(appType);
   const manifestPath = path.join(root, MANIFEST_FILE);
   let stat: fs.Stats;
   try { stat = fs.lstatSync(manifestPath); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   if (!stat.isFile() || stat.size > 64 * 1024) throw new AppError('E_MANIFEST');
   let manifest: unknown;
-  try { manifest = manifestSchema.parse(JSON.parse(fs.readFileSync(manifestPath, 'utf8'))); }
+  let manifestBytes: Buffer;
+  try { manifestBytes = fs.readFileSync(manifestPath); manifest = manifestSchema.parse(JSON.parse(manifestBytes.toString('utf8'))); }
   catch { throw new AppError('E_MANIFEST'); }
   let revision: Awaited<ReturnType<typeof bundleRevision>>;
-  try { revision = await bundleRevision(root, [entry, manifestPath]); }
+  try { revision = await bundleRevision(root, [entry, manifestPath], new Map([[manifestPath, manifestBytes]])); }
   catch { throw new AppError('E_BUNDLE'); }
   return { appType, key: 'preview', title: 'HTML preview', entry: path.basename(entry), manifest,
-    valid: () => revision.valid(),
+    current: () => revision.current(), valid: signal => revision.valid(signal),
     resolve(rel) {
       if (!rel || rel.includes('\\') || rel.split('/').some(p => !p || p === '.' || p === '..' || p.startsWith('.'))) return null;
       const file = path.resolve(root, rel);
@@ -58,7 +56,6 @@ export async function previewBundle(entry: string): Promise<Bundle | null> {
 }
 
 export async function createPreviewSdk(ses: Session, contents: WebContents, bundle: Bundle) {
-  requireLocalAppType(bundle.appType);
   const storageRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'orkas-preview-storage-'));
   // This identity belongs only to this in-memory runtime; no account is created/read.
   const uid = 'preview';
@@ -134,10 +131,19 @@ export async function createPreviewSdk(ses: Session, contents: WebContents, bund
       if (event.url !== open.url) event.preventDefault();
     });
     ses.protocol.handle('chat-app', async request => {
-      const resource = appResource(request, runtime);
+      const resource = await appResource(request, runtime);
       if (!resource || resource.status !== 200) return new Response(null, { status: resource?.status ?? 403 });
       try {
-        if ('body' in resource) return new Response(resource.body, { headers: { ...resource.headers, 'Content-Type': resource.mime } });
+        if ('body' in resource) {
+          // Only isolated authoring previews expose this read-only count. It
+          // includes requests/replies in transit, without exposing their data
+          // or adding an application capability or privileged handle.
+          const body = decodeURIComponent(new URL(request.url).pathname) === '/' + SDK_PATH
+            ? resource.body.replace('/* PREVIEW_PENDING */',
+              'Object.defineProperty(window, "__orkasPreviewPending", { configurable: true, get: () => pending.size });')
+            : resource.body;
+          return new Response(body, { headers: { ...resource.headers, 'Content-Type': resource.mime } });
+        }
         const stat = await fsp.stat(resource.file);
         const response = serveFileRange(request, resource.file, resource.mime, stat.size, stat.mtimeMs);
         const headers = new Headers(response.headers);
@@ -154,8 +160,8 @@ export async function createPreviewSdk(ses: Session, contents: WebContents, bund
         for (;;) {
           const frame = contents.mainFrame.frames.find(frame => runtime.canNavigate(contents.id, open.url, frame.url));
           if (!frame) throw new AppError('E_BUNDLE');
-          await frame.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
-          if (!pending.size) return;
+          const documentPending = await frame.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(window.__orkasPreviewPending || 0))))');
+          if (!documentPending && !pending.size) return;
           await Promise.allSettled([...pending]);
         }
       },

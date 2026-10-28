@@ -31,15 +31,17 @@ function configuredPolicy(field: 'entitlements' | 'entitlementsInherit'): Record
 }
 
 describe('macOS signing entitlements', () => {
-  it('supports main-process JIT without granting child-only runtime exceptions', () => {
+  it('allows microphone recording and main-process JIT without child-only runtime exceptions', () => {
     expect(configuredPolicy('entitlements')).toEqual({
       'com.apple.security.cs.allow-jit': true,
+      'com.apple.security.device.audio-input': true,
     });
   });
 
   it('preserves inherited Intel Node executable memory without disabling library validation', () => {
     expect(configuredPolicy('entitlementsInherit')).toEqual({
       'com.apple.security.cs.allow-jit': true,
+      'com.apple.security.device.audio-input': true,
       'com.apple.security.cs.allow-unsigned-executable-memory': true,
     });
   });

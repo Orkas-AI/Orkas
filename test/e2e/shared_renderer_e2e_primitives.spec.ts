@@ -1,3 +1,4 @@
+import type { Request } from '@playwright/test';
 import { expect, test } from './fixtures/orkas';
 
 test.describe('shared Renderer primitives', () => {
@@ -145,79 +146,111 @@ test.describe('shared Renderer primitives', () => {
     expect(math).toEqual({ rendered: true, runtimes: 1 });
   });
 
-  test('rejects an XSS attack matrix after prototype pollution', async ({ appPage }) => {
-    const result = await appPage.evaluate(async () => {
-      const root = window as any;
-      const prototype = Object.prototype as Record<string, unknown>;
-      const pollution: Record<string, unknown> = {
-        CUSTOM_ELEMENT_HANDLING: {
-          tagNameCheck: /.*/,
-          attributeNameCheck: /.*/,
-          allowCustomizedBuiltInElements: true,
-        },
-        ALLOWED_TAGS: ['x-unsafe', 'script', 'img', 'svg', 'a', 'button'],
-        ALLOWED_ATTR: ['onfocus', 'onerror', 'onload', 'href', 'is'],
-        ADD_TAGS: ['x-unsafe', 'script'],
-        ADD_ATTR: ['onfocus', 'onerror', 'onload', 'is'],
-        FORBID_TAGS: [],
-      };
-      const previous = new Map(
-        Object.keys(pollution).map((key) => [
-          key,
-          Object.getOwnPropertyDescriptor(prototype, key),
-        ]),
-      );
-      try {
-        for (const [key, value] of Object.entries(pollution)) {
-          Object.defineProperty(prototype, key, {
-            value,
-            configurable: true,
-            writable: true,
-          });
-        }
-        const safe = [
-          '<x-unsafe tabindex="0" onfocus="window.__domPurifyBypass=1">focus me</x-unsafe>',
-          '<button is="x-unsafe" tabindex="0" onfocus="window.__domPurifyBypass=2">button</button>',
-          '<img src="x-invalid" onerror="window.__domPurifyBypass=3">',
-          '<svg onload="window.__domPurifyBypass=4"><script>window.__domPurifyBypass=5</script></svg>',
-          '<a href="javascript:window.__domPurifyBypass=6">link</a>',
-        ].map((payload) => root.sanitizeHtml(payload));
-        const host = document.createElement('div');
-        host.innerHTML = safe.join('\n');
-        document.body.appendChild(host);
-        host.querySelectorAll<HTMLElement>('[tabindex]').forEach((node) => node.focus());
-        host.querySelectorAll('img').forEach((node) => node.dispatchEvent(new Event('error')));
-        host.querySelectorAll('svg').forEach((node) => node.dispatchEvent(new Event('load')));
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        const state = {
-          safe,
-          customElements: host.querySelectorAll('x-unsafe').length,
-          scripts: host.querySelectorAll('script').length,
-          eventAttributes: host.querySelectorAll('[onfocus], [onerror], [onload]').length,
-          dangerousUrls: Array.from(host.querySelectorAll('[href]')).filter((node) => (
-            /^\s*javascript:/i.test(node.getAttribute('href') || '')
-          )).length,
-          executed: !!root.__domPurifyBypass,
+  test('rejects an XSS attack matrix after prototype pollution', async ({ appPage }, testInfo) => {
+    const expectedMissingImageUrl = new URL('x-invalid', appPage.url()).href;
+    const resourceFailures: Array<{
+      matchesInjectedImage: boolean;
+      resourceKind: string;
+      errorCode: 'net::ERR_FILE_NOT_FOUND' | 'unexpected';
+    }> = [];
+    const onRequestFailed = (request: Request) => {
+      const errorText = request.failure()?.errorText;
+      resourceFailures.push({
+        matchesInjectedImage: request.url() === expectedMissingImageUrl,
+        resourceKind: request.resourceType(),
+        errorCode: errorText === 'net::ERR_FILE_NOT_FOUND' ? errorText : 'unexpected',
+      });
+    };
+    appPage.on('requestfailed', onRequestFailed);
+    try {
+      const result = await appPage.evaluate(async () => {
+        const root = window as any;
+        const prototype = Object.prototype as Record<string, unknown>;
+        const pollution: Record<string, unknown> = {
+          CUSTOM_ELEMENT_HANDLING: {
+            tagNameCheck: /.*/,
+            attributeNameCheck: /.*/,
+            allowCustomizedBuiltInElements: true,
+          },
+          ALLOWED_TAGS: ['x-unsafe', 'script', 'img', 'svg', 'a', 'button'],
+          ALLOWED_ATTR: ['onfocus', 'onerror', 'onload', 'href', 'is'],
+          ADD_TAGS: ['x-unsafe', 'script'],
+          ADD_ATTR: ['onfocus', 'onerror', 'onload', 'is'],
+          FORBID_TAGS: [],
         };
-        host.remove();
-        delete root.__domPurifyBypass;
-        return state;
-      } finally {
-        for (const [key, descriptor] of previous) {
-          if (descriptor) Object.defineProperty(prototype, key, descriptor);
-          else delete prototype[key];
+        const previous = new Map(
+          Object.keys(pollution).map((key) => [
+            key,
+            Object.getOwnPropertyDescriptor(prototype, key),
+          ]),
+        );
+        try {
+          for (const [key, value] of Object.entries(pollution)) {
+            Object.defineProperty(prototype, key, {
+              value,
+              configurable: true,
+              writable: true,
+            });
+          }
+          const safe = [
+            '<x-unsafe tabindex="0" onfocus="window.__domPurifyBypass=1">focus me</x-unsafe>',
+            '<button is="x-unsafe" tabindex="0" onfocus="window.__domPurifyBypass=2">button</button>',
+            '<img src="x-invalid" onerror="window.__domPurifyBypass=3">',
+            '<svg onload="window.__domPurifyBypass=4"><script>window.__domPurifyBypass=5</script></svg>',
+            '<a href="javascript:window.__domPurifyBypass=6">link</a>',
+          ].map((payload) => root.sanitizeHtml(payload));
+          const host = document.createElement('div');
+          host.innerHTML = safe.join('\n');
+          document.body.appendChild(host);
+          host.querySelectorAll<HTMLElement>('[tabindex]').forEach((node) => node.focus());
+          host.querySelectorAll('img').forEach((node) => node.dispatchEvent(new Event('error')));
+          host.querySelectorAll('svg').forEach((node) => node.dispatchEvent(new Event('load')));
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          const state = {
+            safe,
+            customElements: host.querySelectorAll('x-unsafe').length,
+            scripts: host.querySelectorAll('script').length,
+            eventAttributes: host.querySelectorAll('[onfocus], [onerror], [onload]').length,
+            dangerousUrls: Array.from(host.querySelectorAll('[href]')).filter((node) => (
+              /^\s*javascript:/i.test(node.getAttribute('href') || '')
+            )).length,
+            executed: !!root.__domPurifyBypass,
+          };
+          host.remove();
+          delete root.__domPurifyBypass;
+          return state;
+        } finally {
+          for (const [key, descriptor] of previous) {
+            if (descriptor) Object.defineProperty(prototype, key, descriptor);
+            else delete prototype[key];
+          }
         }
-      }
-    });
+      });
 
-    expect(result).toMatchObject({
-      customElements: 0,
-      scripts: 0,
-      eventAttributes: 0,
-      dangerousUrls: 0,
-      executed: false,
-    });
-    expect(result.safe.join('')).not.toMatch(/onfocus|onerror|onload|javascript:/i);
+      expect(result).toMatchObject({
+        customElements: 0,
+        scripts: 0,
+        eventAttributes: 0,
+        dangerousUrls: 0,
+        executed: false,
+      });
+      expect(result.safe.join('')).not.toMatch(/onfocus|onerror|onload|javascript:/i);
+      await expect.poll(() => resourceFailures.length).toBe(1);
+      expect(resourceFailures).toEqual([{
+        matchesInjectedImage: true,
+        resourceKind: 'image',
+        errorCode: 'net::ERR_FILE_NOT_FOUND',
+      }]);
+      await appPage.evaluate((evidence) => {
+        console.info('[e2e:xss-resource-failure] ' + JSON.stringify(evidence));
+      }, resourceFailures);
+    } finally {
+      appPage.off('requestfailed', onRequestFailed);
+      await testInfo.attach('xss-resource-failure', {
+        body: Buffer.from(JSON.stringify(resourceFailures)),
+        contentType: 'application/json',
+      });
+    }
   });
 
   test('exposes the shared dropdown state and supports keyboard-only selection', async ({ appPage }) => {

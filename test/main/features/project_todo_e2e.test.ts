@@ -110,6 +110,22 @@ async function seedProject(projects: any, name = 'Iterate'): Promise<string> {
 }
 
 describe('project to-do › end-to-end', () => {
+  it('saves the due day a model gives a to-do, clears it on an empty string, and refuses a malformed one', async () => {
+    await load();
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const handler = createProjectTasksHandler(UID, '', 'c_due', new Map());
+    const created = await handler.create({ content: 'Send the launch email', due_at: '2026-10-25' });
+    expect(created).toMatchObject({ ok: true, task: { due_at: '2026-10-25' } });
+    const tid = (created as { task: { id: string } }).task.id;
+    expect(await handler.update(tid, { due_at: '2026-11-01' })).toMatchObject({ ok: true, task: { due_at: '2026-11-01' } });
+    expect(await handler.update(tid, { due_at: 'Friday' })).toMatchObject({ ok: false, error: 'due_invalid' });
+    expect((await handler.get(tid) as { task: { due_at?: string } }).task.due_at).toBe('2026-11-01');
+    expect(await handler.update(tid, { due_at: '' })).toMatchObject({ ok: true });
+    expect((await handler.get(tid) as { task: object }).task).not.toHaveProperty('due_at');
+    expect(await handler.create({ content: 'Bad day', due_at: '2026-02-30' })).toMatchObject({ ok: false, error: 'due_invalid' });
+  });
+
+
   it.each(['project', 'global'])('executes a synced %s backlog only on its bound installation, then hands it over after disable/re-enable', async scope => {
     const a = await load();
     const pid = scope === 'project' ? await seedProject(a.projects) : '';
@@ -474,10 +490,12 @@ describe('project to-do › end-to-end', () => {
     const t1 = await pt.createTask(UID, pid, { content: 'Brief', owner_agent: 'Owner', owner_agent_id: AGENT });
     if (!t1.ok) throw new Error('seed');
     await pt.uploadTaskAttachment(UID, pid, t1.task.id, 'brief.txt', Buffer.from('do X'));
+    await pt.uploadTaskAttachment(UID, pid, t1.task.id, 'z-first.txt', Buffer.from('first'));
+    await pt.updateTask(UID, pid, t1.task.id, { attachment_order: ['z-first.txt', 'brief.txt'] });
     const res = await runner.runTaskNow(UID, pid, t1.task.id);
     expect(res.ok).toBe(true);
     const runSend = vi.mocked(groupChat.send).mock.calls.at(-1)?.[0] as { attachments?: string[] };
-    expect(runSend.attachments).toEqual(['brief.txt']);
+    expect(runSend.attachments).toEqual(['z-first.txt', 'brief.txt']);
     // Resolve from the fresh module (paths pin the workspace root at load, so a
     // top-level import would use a stale root from before beforeEach ran).
     const { chatAttachmentDirForConversation } = await import('../../../src/main/util/project-layout');
@@ -488,10 +506,12 @@ describe('project to-do › end-to-end', () => {
     const t2 = await pt.createTask(UID, pid, { content: 'Spec', owner_agent_id: AGENT });
     if (!t2.ok) throw new Error('seed');
     await pt.uploadTaskAttachment(UID, pid, t2.task.id, 'spec.md', Buffer.from('# spec'));
+    await pt.uploadTaskAttachment(UID, pid, t2.task.id, 'z-first.txt', Buffer.from('first'));
+    await pt.updateTask(UID, pid, t2.task.id, { attachment_order: ['z-first.txt', 'spec.md'] });
     const fresh = await pt.getTask(UID, pid, t2.task.id);
     const adv = await startAutomaticTask(runner, pid, fresh!);
     expect(adv.ok).toBe(true);
     const advSend = vi.mocked(groupChat.send).mock.calls.at(-1)?.[0] as { attachments?: string[] };
-    expect(advSend.attachments).toEqual(['spec.md']);
+    expect(advSend.attachments).toEqual(['z-first.txt', 'spec.md']);
   });
 });

@@ -1,5 +1,5 @@
 import { composerAccessorSource } from './composer-test-source';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -233,13 +233,16 @@ describe('composer restore after a user stop', () => {
 });
 
 describe('stop and settlement wiring', () => {
-  function runAbort(options: Record<string, unknown>) {
+  function runAbort(options: Record<string, unknown>, tracked = true) {
     const restore = vi.fn();
     const context: any = {
       Map,
       Set,
       Promise,
-      pendingConvs: new Map([['conv-a', { controller: { abort: vi.fn() }, aborted: false }]]),
+      pendingConvs: new Map(tracked ? [['conv-a', { controller: { abort: vi.fn() }, aborted: false }]] : []),
+      _latestActiveTurns: new Map([['conv-a', [{ actor: 'cli-a', turn_id: 'old-turn', steerable: true }]],
+        ['conv-other', [{ actor: 'cli-b', turn_id: 'other-turn', steerable: true }]]]),
+      window: { CliAsyncInput: { setActiveTurns: vi.fn() } },
       _groupPlaceholders: new Map(),
       currentCid: 'conv-a',
       _trackTaskStopClick: vi.fn(),
@@ -249,6 +252,7 @@ describe('stop and settlement wiring', () => {
       setGroupConversationBusy: vi.fn(),
       apiFetch: vi.fn(() => ({ catch: () => ({ finally: () => {} }) })),
       _refreshTaskSurfacesAfterAbort: vi.fn(),
+      _beginTaskSurfaceAbortRefresh: vi.fn(() => ({ settled: false })),
       _updateConvSidebarBadge: vi.fn(),
       _updateConvSendUI: vi.fn(),
       _streamingMarkAborted: vi.fn(),
@@ -262,14 +266,25 @@ describe('stop and settlement wiring', () => {
       ${extractFunction('abortConvStream')}
     `, context, { filename: 'abort.js' });
     context.abortConvStream('conv-a', options);
-    return restore;
+    return { restore, context };
   }
 
   it('restores only when the user pressed stop', () => {
-    expect(runAbort({ userInitiated: true })).toHaveBeenCalledWith('conv-a');
+    expect(runAbort({ userInitiated: true }).restore).toHaveBeenCalledWith('conv-a');
     // Conversation delete and missing-conversation recovery also abort; neither
     // is an edit intent, so the composer must be left alone.
-    expect(runAbort({})).not.toHaveBeenCalled();
+    expect(runAbort({}).restore).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('expires questions only for the stopped conversation after streams detach (tracked=%s)', tracked => {
+    const { context } = runAbort({ userInitiated: true }, tracked);
+    expect(context._latestActiveTurns.get('conv-a')).toEqual([]);
+    expect(context._latestActiveTurns.get('conv-other')).toEqual([
+      { actor: 'cli-b', turn_id: 'other-turn', steerable: true },
+    ]);
+    expect(context.window.CliAsyncInput.setActiveTurns).toHaveBeenCalledExactlyOnceWith('conv-a', []);
+    // Invalidating the view must not submit or cancel an answer on the user's behalf.
+    expect(context.apiFetch).toHaveBeenCalledExactlyOnceWith('/api/conversations/conv-a/abort', { method: 'POST' });
   });
 
   it('drops the snapshot when the turn settles', () => {
@@ -305,5 +320,249 @@ describe('stop and settlement wiring', () => {
     // Composer state is retired, but a background transcript must still fetch
     // its saved terminal reply when the user returns to it.
     expect([...offViewDirty]).toEqual(['conv-a', 'conv-other']);
+  });
+});
+
+
+function loadAbortTaskSurfaceLifecycle() {
+  const abortReplies: Array<() => void> = [];
+  const owners = new Map();
+  const resync = vi.fn();
+  const streams: Array<{ read: ReturnType<typeof vi.fn>; event: (event: unknown) => void; finish: () => void }> = [];
+  const primaryHooks: any[] = [];
+  const context: any = {
+    Map, Set, Promise, setTimeout, clearTimeout,
+    _taskSurfaceAbortRefreshOwners: owners,
+    _forgottenTaskSurfaceObservers: new WeakSet(),
+    _convChatCtrls: new Map(), _groupObserverReservations: new Map(), _groupObserverCtrls: new Map(),
+    AbortController, TextDecoder,
+    _startRuntimeActorRecovery: vi.fn(),
+    isConvPending: () => false, isGroupConversationBusy: () => false,
+    _conversationHistoryLoad: null, _lastGroupWorkEventAt: new Map(),
+    _isConversationDisplayVisible: () => true, _syncTaskBoardForRuntimeState: vi.fn(),
+    _createStreamingAssistantMessage: () => null, startPolling: vi.fn(),
+    _finishStreamingMsg: vi.fn(),
+    createChatController: vi.fn((config: any) => {
+      primaryHooks.push(config.hooks);
+      return { abort: vi.fn(), send: vi.fn() };
+    }),
+    pendingConvs: new Map(), currentCid: '',
+    window: {
+      TaskBoard: { resync },
+      ConversationInfo: { refreshFiles: vi.fn() },
+      CliAsyncInput: { setActiveTurns: vi.fn(), forget: vi.fn() },
+    },
+    _groupPlaceholders: new Map(), _recipientByCid: {},
+    _saveRecipientMap: vi.fn(), setGroupConversationBusy: vi.fn(),
+    _stopRuntimeActorRecovery: vi.fn(), _stopGroupEventObserver: vi.fn(),
+    _restoreSentComposerSnapshot: vi.fn(), _updateConvSidebarBadge: vi.fn(),
+    _updateConvSendUI: vi.fn(), stopPolling: vi.fn(),
+    document: { getElementById: () => null },
+    uiConfirm: vi.fn(async () => true), uiAlert: vi.fn(async () => {}),
+    t: (key: string) => key, _projectIdForConversation: () => 'project-owner',
+    _removeConversationFromSidebar: vi.fn(), _logConversationManageResult: vi.fn(),
+    _convLog: { warn: vi.fn() }, setView: vi.fn(),
+    deletionSucceeds: true,
+  };
+  for (const key of [
+    '_autoRecipientByCid', '_serverFloorByCid', '_serverFloorRevisionByCid',
+    '_pendingFloorResetByCid', '_latestInFlight', '_latestActiveTurns',
+    '_liveDisplayWatermarks', '_conversationInfoFileRefreshTimers',
+    '_quotesByCid', '_groupMembersCache', '_settledConvTurns',
+    '_chatAttachmentRevisions', 'pollMsgCounts',
+  ]) context[key] = new Map();
+  context._offViewLiveDisplayDirty = new Set();
+  context._failedConvs = new Set();
+  context.apiFetch = vi.fn((url: string, options: { signal?: AbortSignal } = {}) => {
+    if (url.endsWith('/events/stream')) {
+      // Real response/reader protocol: even after AbortSignal changes, an
+      // already queued IPC read can resolve later. The test owns that boundary.
+      let resolveRead: ((reply: { done: boolean; value?: Uint8Array }) => void) | undefined;
+      const read = vi.fn(() => new Promise(resolve => { resolveRead = resolve; }));
+      streams.push({
+        read,
+        event: event => {
+          if (!resolveRead) throw new Error('observer has not started reading');
+          const resolve = resolveRead;
+          resolveRead = undefined;
+          resolve({ done: false, value: new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`) });
+        },
+        finish: () => {
+          if (!resolveRead) throw new Error('observer has no pending read');
+          const resolve = resolveRead;
+          resolveRead = undefined;
+          resolve({ done: true });
+        },
+      });
+      return Promise.resolve({ ok: true, body: { getReader: () => ({ read }) } });
+    }
+    if (url.endsWith('/abort')) return new Promise(resolve => {
+      abortReplies.push(() => resolve({ ok: true }));
+    });
+    return Promise.resolve({
+      ok: context.deletionSucceeds,
+      status: context.deletionSucceeds ? 200 : 500,
+      json: async () => ({ ok: context.deletionSucceeds }),
+    });
+  });
+  vm.createContext(context);
+  vm.runInContext([
+    extractFunction('_forgetConversationRuntime'),
+    extractFunction('_beginTaskSurfaceAbortRefresh'),
+    extractFunction('_refreshTaskSurfacesAfterAbort'),
+    extractFunction('_forgetCidRecipient'),
+    extractFunction('_settleConversationPlaceholdersOnAbort'),
+    extractFunction('_taskBoardEventBypassesViewGuard'),
+    conversationSource.slice(conversationSource.indexOf('function _handleGroupBusEvent('), conversationSource.indexOf('\nfunction ', conversationSource.indexOf('function _handleGroupBusEvent(') + 1)),
+    extractFunction('_handleStreamEvent'),
+    extractFunction('_makeConvChatController'),
+    extractFunction('_observerShouldDeferCleanup'),
+    extractFunction('_isPrimaryOwnedLiveEvent'),
+    extractFunction('_nowForStreamYield'),
+    extractFunction('_makeStreamPaintYield'),
+    extractFunction('_observeConversationRunFromPlanAction'),
+    extractFunction('abortConvStream'),
+    'async ' + extractFunction('_deleteConversationWithConfirm'),
+  ].join('\n'), context);
+  context._forgetConvLocal = vi.fn((cid: string) => context._forgetCidRecipient(cid));
+  return { context, owners, resync, abortReplies, streams, primaryHooks };
+}
+
+describe('abort task-surface refresh lifetime', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('refreshes an incoming bus abort without a local Stop and stops it after confirmed forget', async () => {
+    const { context, owners, resync } = loadAbortTaskSurfaceLifecycle();
+    const cid = 'project-task';
+    context.currentCid = cid;
+    context._convChatCtrls.set(cid, context._makeConvChatController(cid));
+    context._handleStreamEvent(cid, null, { type: 'event', event: { stream: 'group', data: { type: 'aborted' } } });
+    expect(resync).toHaveBeenCalledExactlyOnceWith(cid);
+    context._forgetCidRecipient(cid);
+    await vi.advanceTimersByTimeAsync(5000);
+    context._handleStreamEvent(cid, null, { type: 'event', event: { stream: 'group', data: { type: 'aborted' } } });
+    expect(resync).toHaveBeenCalledTimes(1);
+    expect(owners.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('restores a live run while an activated old observer and primary onDone unwind', async () => {
+    const { context, streams, primaryHooks } = loadAbortTaskSurfaceLifecycle();
+    const cid = 'project-task';
+    context.currentCid = cid;
+    const oldDone = vi.fn();
+    const oldPrimary = context._makeConvChatController(cid, { onDone: oldDone });
+    context._convChatCtrls.set(cid, oldPrimary);
+    // Drive the actual primary factory hook. It creates pending state and
+    // attaches the actual paired observer, just as a started send does.
+    primaryHooks[0].onAssistantStart(null, cid);
+    await vi.advanceTimersByTimeAsync(0);
+    const oldObserver = context._groupObserverReservations.get(cid);
+    expect(context.pendingConvs.get(cid).controller).toBe(oldPrimary);
+    expect(context.setGroupConversationBusy).toHaveBeenCalledWith(cid, true);
+    expect(streams[0].read).toHaveBeenCalledTimes(1);
+    // At least one valid event traverses the real decoder and observer loop.
+    // A paired process event stays owned by its primary and is not duplicated.
+    const ownsLiveEvent = vi.spyOn(context, '_isPrimaryOwnedLiveEvent');
+    streams[0].event({ type: 'process', actor_id: 'commander', event: { type: 'text_delta', text: 'working' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ownsLiveEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'process' }));
+    expect(streams[0].read).toHaveBeenCalledTimes(2);
+    const other = { abort: vi.fn() };
+    context._convChatCtrls.set('other-task', other);
+    context._forgetCidRecipient(cid);
+    expect(oldPrimary.abort).toHaveBeenCalledTimes(1);
+    expect(context._convChatCtrls.has(cid)).toBe(false);
+    expect(context._groupObserverReservations.has(cid)).toBe(false);
+    expect(context._groupObserverCtrls.has(cid)).toBe(false);
+    const restoredPrimary = context._makeConvChatController(cid);
+    context._convChatCtrls.set(cid, restoredPrimary);
+    primaryHooks[1].onAssistantStart(null, cid);
+    await vi.advanceTimersByTimeAsync(0);
+    const restoredObserver = context._groupObserverReservations.get(cid);
+    expect(restoredPrimary).not.toBe(oldPrimary);
+    expect(restoredObserver).toBeTruthy();
+    expect(restoredObserver).not.toBe(oldObserver);
+    expect(streams[1].read).toHaveBeenCalledTimes(1);
+    const refreshFiles = context.window.ConversationInfo.refreshFiles;
+    refreshFiles.mockClear();
+    // The old stream finally is deliberately released only AFTER the restored
+    // primary and shared subscription exist. No obsolete file/history lookup
+    // or settlement may run against that restored conversation.
+    streams[0].finish();
+    await vi.advanceTimersByTimeAsync(0);
+    primaryHooks[0].onDone(null, cid, { aborted: true });
+    expect(oldDone).toHaveBeenCalledExactlyOnceWith({ aborted: true });
+    expect(refreshFiles).not.toHaveBeenCalled();
+    expect(context._convChatCtrls.get(cid)).toBe(restoredPrimary);
+    expect(context.pendingConvs.get(cid).controller).toBe(restoredPrimary);
+    expect(context._groupObserverReservations.get(cid)).toBe(restoredObserver);
+    expect(context._finishStreamingMsg).not.toHaveBeenCalled();
+    expect(other.abort).not.toHaveBeenCalled();
+    expect(context._convChatCtrls.get('other-task')).toBe(other);
+    expect(context._convLog.warn).not.toHaveBeenCalled();
+    context._forgetCidRecipient(cid);
+    streams[1].finish();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('keeps immediate and settled refreshes for a project conversation outside the sidebar cache', async () => {
+    const { context, resync, owners, abortReplies } = loadAbortTaskSurfaceLifecycle();
+    context.abortConvStream('project-task', { userInitiated: true });
+    expect(resync).toHaveBeenCalledExactlyOnceWith('project-task');
+    abortReplies[0]();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resync).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1499);
+    expect(resync).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(resync).toHaveBeenCalledTimes(3);
+    expect(owners.size).toBe(0);
+    expect(context._restoreSentComposerSnapshot).toHaveBeenCalledExactlyOnceWith('project-task');
+  });
+
+  it('preserves failed-delete recovery and cancels delayed work only after successful retry', async () => {
+    const { context, owners, resync, abortReplies } = loadAbortTaskSurfaceLifecycle();
+    context.deletionSucceeds = false;
+    expect(await context._deleteConversationWithConfirm('project-task')).toBe(false);
+    expect(context._forgetConvLocal).not.toHaveBeenCalled();
+    expect(context.uiAlert).toHaveBeenCalled();
+    abortReplies[0]();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(resync).toHaveBeenLastCalledWith('project-task');
+    expect(resync).toHaveBeenCalledTimes(3);
+    context.deletionSucceeds = true;
+    expect(await context._deleteConversationWithConfirm('project-task')).toBe(true);
+    expect(context._forgetConvLocal).toHaveBeenCalledExactlyOnceWith('project-task');
+    const afterDelete = resync.mock.calls.length;
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(5000);
+    abortReplies[1]();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(resync).toHaveBeenCalledTimes(afterDelete);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(owners.size).toBe(0);
+  });
+
+  it('keeps other conversations alive and rejects a late old abort after the same cid is restored', async () => {
+    const { context, owners, resync, abortReplies } = loadAbortTaskSurfaceLifecycle();
+    context.abortConvStream('project-task');
+    context.abortConvStream('other-task');
+    context._forgetCidRecipient('project-task');
+    context.abortConvStream('project-task');
+    const restoredOwner = owners.get('project-task');
+    const beforeOldReply = resync.mock.calls.length;
+    abortReplies[0]();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resync).toHaveBeenCalledTimes(beforeOldReply);
+    expect(owners.get('project-task')).toBe(restoredOwner);
+    abortReplies[1]();
+    abortReplies[2]();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(resync.mock.calls.filter(([cid]) => cid === 'other-task')).toHaveLength(3);
+    expect(resync.mock.calls.filter(([cid]) => cid === 'project-task')).toHaveLength(4);
+    expect(owners.size).toBe(0);
   });
 });

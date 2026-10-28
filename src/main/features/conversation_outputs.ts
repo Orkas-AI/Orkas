@@ -213,7 +213,7 @@ export async function listConversationOutputs(
   cid: string,
 ): Promise<ConversationOutputList> {
   const root = await conversationScanRoot(userId, cid);
-  const workspace = listWorkspaceFiles(root);
+  const workspace = await listWorkspaceFiles(root);
 
   let artifacts: ArtifactSummary[] = [];
   try { artifacts = chatArtifacts.listArtifacts(userId, cid); }

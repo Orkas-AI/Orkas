@@ -44,3 +44,30 @@ it('does not save partial rejected audio or repeat a potentially charged request
   expect(JSON.stringify(result)).not.toContain('private upstream detail');
   expect(fetch).toHaveBeenCalledOnce(); expect(fs.existsSync(path.join(root, 'voice.wav'))).toBe(false);
 });
+
+it('returns an unknown-charge failure for non-event JSON without writing or replaying', async () => {
+  const fetch = vi.fn(async () => new Response('null\n{"code":20000000}'));
+  vi.stubGlobal('fetch', fetch);
+  await expect(request(1)).resolves.toMatchObject({
+    ok: false, errorCode: 'E_TTS_API_ERROR', requestDisposition: 'sent', chargeStatus: 'unknown',
+  });
+  expect(fetch).toHaveBeenCalledOnce();
+  expect(fs.existsSync(path.join(root, 'voice.wav'))).toBe(false);
+});
+
+it.each([false, true])('rejects clean EOF without completion and preserves the output (existing file: %s)', async existing => {
+  const output = path.join(root, 'voice.wav');
+  const priorAudio = Buffer.from('prior complete narration');
+  if (existing) fs.writeFileSync(output, priorAudio);
+  const fetch = vi.fn(async () => new Response(JSON.stringify({ code: 0, data: pcm.toString('base64') })));
+  vi.stubGlobal('fetch', fetch);
+  const result = await request(1);
+  expect(result).toMatchObject({
+    ok: false, errorCode: 'E_TTS_API_ERROR', requestDisposition: 'sent',
+    chargeStatus: 'unknown', retryPolicy: 'unknown',
+  });
+  expect(result).not.toHaveProperty('path');
+  expect(fetch).toHaveBeenCalledOnce();
+  if (existing) expect(fs.readFileSync(output)).toEqual(priorAudio);
+  else expect(fs.existsSync(output)).toBe(false);
+});

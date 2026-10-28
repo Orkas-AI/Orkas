@@ -31,7 +31,7 @@ Do not read unrelated references. A category-only edit needs only `metadata.md`;
 - **No protocol files.** Do not dump `<skill>`, `<skill-meta>`, or file blocks into the workspace. The host parses them inline.
 - **One container per Skill.** Multiple containers are legal only when the request or source contains multiple distinct Skills. Never merge multiple source `SKILL.md` files into one Skill.
 - **Skills are independent.** Do not name, invoke, or read another Skill from this Skill's body, references, scripts, or examples. Orchestration belongs to the caller.
-- **Use the user's UI language** for newly authored human-readable instructions and user-visible prose. Keep frontmatter keys, identifiers, paths, commands, and code unchanged. Imported prose remains faithful by default.
+- **Use the user's UI language** for newly authored Skill body instructions. Keep frontmatter keys, identifiers, paths, commands, and code unchanged. Imported prose remains faithful by default.
 - **The host owns completion.** A valid `<skill>` container or file block only requests a mutation. Only a successful host result proves it was applied; before that, or after a failed or omitted mutation, never say the Skill is created, updated, saved, ready, or available. Describe pending mutations as “将创建” or “已提交，等待应用”.
 
 ## Decide create versus edit

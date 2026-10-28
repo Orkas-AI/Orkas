@@ -193,9 +193,11 @@ test.describe('agents and skills', () => {
     )).toContain("This is the Agent's default capability boundary");
   });
 
-  test('creates an agent, persists its enabled state, and deletes it', async ({ orkas }) => {
+  test('creates an agent, persists its enabled state, and deletes it', async ({ modelOrkas: orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;
+    const completedReply = 'E2E agent edit chat completed without changes.';
+    orkas.setModelTextReplies([completedReply]);
     await openSidebarEntry(page, '#agents-btn');
     await expect(page.locator('#panel-agents')).toHaveClass(/\bactive\b/);
     await page.locator('#create-agent-btn').click();
@@ -208,11 +210,28 @@ test.describe('agents and skills', () => {
 
     await expect(page.locator('#agents-detail-name')).toHaveText('E2EAgent');
     await expect(page.locator('#agent-edit-btn')).toHaveText('Done');
+    // Finish the automatic edit turn before leaving the editor. This CRUD
+    // scenario controls its model dependency and does not test cancellation.
+    const final = page.locator('#agents-chat-messages .chat-message.assistant [data-role="final"]').last();
+    await expect(final).toHaveText(completedReply, { timeout: 20_000 });
+    await expect(page.locator('#agents-chat-send-btn')).not.toHaveClass(/\b(streaming|aborting)\b/);
+    expect(orkas.modelRequests).toHaveLength(1);
     await page.locator('#agent-edit-btn').click();
     await expect(page.locator('#agent-enabled-btn')).toBeVisible();
     const created = await orkas.invoke<{ agents: AgentSummary[] }>('agents.list');
     const agent = created.agents.find((item) => item.name === 'E2EAgent');
     expect(agent).toBeTruthy();
+    expect(created.agents.filter((item) => item.name === 'E2EAgent')).toHaveLength(1);
+    const fetched = await orkas.invoke<{ agent: AgentDetail }>('agents.get', {
+      agent_id: agent?.agent_id,
+    });
+    expect(fetched.agent.description_zh || fetched.agent.description_en)
+      .toBe('Checks deterministic desktop user flows.');
+    const history = await orkas.invoke<{ messages: Array<{ role?: string; content?: string }> }>('agents.chat.history', {
+      agent_id: agent?.agent_id,
+    });
+    expect(history.messages.filter((message) => message.role === 'assistant')
+      .map((message) => message.content)).toEqual([completedReply]);
 
     await page.locator('#agent-enabled-btn').click();
     await expect.poll(async () => {
@@ -241,11 +260,14 @@ test.describe('agents and skills', () => {
         }),
       ]),
     }));
+    expect(orkas.modelRequests).toHaveLength(1);
   });
 
-  test('creates a skill, persists its enabled state, and deletes it', async ({ orkas }) => {
+  test('creates a skill, persists its enabled state, and deletes it', async ({ modelOrkas: orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;
+    const completedReply = 'E2E skill edit chat completed without changes.';
+    orkas.setModelTextReplies([completedReply]);
     await openSidebarEntry(page, '#skills-btn');
     await expect(page.locator('#panel-skills')).toHaveClass(/\bactive\b/);
     await page.locator('#create-skill-btn').click();
@@ -258,11 +280,28 @@ test.describe('agents and skills', () => {
 
     await expect(page.locator('#skills-detail-name')).toHaveText('e2e-desktop-check');
     await expect(page.locator('#skill-edit-btn')).toHaveText('Done');
+    // Finish the automatic edit turn before leaving the editor. This CRUD
+    // scenario controls its model dependency and does not test cancellation.
+    const final = page.locator('#skills-chat-messages .chat-message.assistant [data-role="final"]').last();
+    await expect(final).toHaveText(completedReply, { timeout: 20_000 });
+    await expect(page.locator('#skills-chat-send-btn')).not.toHaveClass(/\b(streaming|aborting)\b/);
+    expect(orkas.modelRequests).toHaveLength(1);
     await page.locator('#skill-edit-btn').click();
     await expect(page.locator('#skill-enabled-btn')).toBeVisible();
     const created = await orkas.invoke<{ skills: SkillSummary[] }>('skills.list');
     const skill = created.skills.find((item) => item.name === 'e2e-desktop-check');
     expect(skill).toBeTruthy();
+    expect(created.skills.filter((item) => item.name === 'e2e-desktop-check')).toHaveLength(1);
+    const fetched = await orkas.invoke<{ skill: { name: string; description_zh?: string; description_en?: string } }>('skills.get', {
+      id: skill?.id,
+    });
+    expect(fetched.skill.description_zh || fetched.skill.description_en)
+      .toBe('Verifies deterministic desktop UI behavior.');
+    const history = await orkas.invoke<{ messages: Array<{ role?: string; content?: string }> }>('skills.chat.history', {
+      id: skill?.id,
+    });
+    expect(history.messages.filter((message) => message.role === 'assistant')
+      .map((message) => message.content)).toEqual([completedReply]);
 
     await page.locator('#skill-enabled-btn').click();
     await expect.poll(async () => {
@@ -291,5 +330,6 @@ test.describe('agents and skills', () => {
         }),
       ]),
     }));
+    expect(orkas.modelRequests).toHaveLength(1);
   });
 });

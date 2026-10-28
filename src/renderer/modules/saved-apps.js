@@ -14,9 +14,8 @@
   if (!artifactSecurity) throw new Error('artifact-security.js must load before saved-apps.js');
   const _appsLog = (typeof createLogger === 'function') ? createLogger('saved-apps') : { warn: () => {}, error: () => {} };
   let _appsCache = null; // last fetched list (for the i18n-change re-render)
+  let _appsLocalCache = null;
   let _appsLoadGeneration = 0;
-  let _appsFilter = 'local';
-  const _appsFilters = [['local', 'apps.type_local'], ['web', 'apps.type_web']];
   let _appViewerEl = null;
   let _appViewerFrame = null;
   let _appViewerTitle = null;
@@ -154,7 +153,8 @@
     root.setAttribute('aria-hidden', 'false');
     if (!_appViewerKeyHandler) {
       _appViewerKeyHandler = (e) => {
-        if (e.key === 'Escape' && !document.querySelector('.chat-share-overlay') && _appViewerEl && _appViewerEl.classList.contains('is-open')) _closeAppViewer();
+        if (e.isComposing || e.keyCode === 229) return;
+        if (e.key === 'Escape' && _appViewerEl && _appViewerEl.classList.contains('is-open')) _closeAppViewer();
       };
       document.addEventListener('keydown', _appViewerKeyHandler);
     }
@@ -310,14 +310,11 @@
   window.AppActionMenu = { toggle: _toggleActionMenu, close: () => { if (_rowMenuCustom) _closeRowMenu(); } };
 
   // ── actions ─────────────────────────────────────────────────────────────
-  async function _openApp(appId) {
+  async function _openApp(appId, online = false) {
     const selected = (_appsCache || []).find(row => row.id === appId);
-    if (selected && _appType(selected) === 'web') return window.OrkasCommercialEntry.show();
-
     if (window.OrkasPreviewWindows) {
       const app = (_appsCache || []).find(item => item.id === appId);
       const result = await window.OrkasPreviewWindows.open({ kind: 'app', appId, title: app?.title || _t('artifact.title', 'Interactive app') });
-      if (window.OrkasCommercialEntry.isFailure(result)) return window.OrkasCommercialEntry.show();
       if (!result?.ok) _appsLogFailure('saved_app_open', { error_type: 'presentation', error_code: 'saved_app_viewer_failed' });
       return;
     }
@@ -330,8 +327,7 @@
       return;
     }
     if (!r || r.ok === false || !r.url) {
-      if (window.OrkasCommercialEntry.isFailure(r)) return window.OrkasCommercialEntry.show();
-      const failure = _savedAppFailure(r, r && r.ok === false ? 'saved_app_open_failed' : 'invalid_response');
+        const failure = _savedAppFailure(r, r && r.ok === false ? 'saved_app_open_failed' : 'invalid_response');
       _appsLogFailure('saved_app_open', failure);
       _fail(_t('apps.open_failed', 'Could not open the app'), { message: (r && r.error) || 'open failed' });
       return;
@@ -352,10 +348,7 @@
   // auto-send — the user completes the request and hits Send).
   window.openSavedAppPreview = _openAppViewer;
 
-  async function _editApp(appId) {
-    const selected = (_appsCache || []).find(row => row.id === appId);
-    if (selected && _appType(selected) === 'web') return window.OrkasCommercialEntry.show();
-
+  async function _editApp(appId, capabilities) {
     let r;
     try {
       r = await window.orkas.invoke('savedApps.openForEditing', { appId: String(appId) });
@@ -365,8 +358,7 @@
       return;
     }
     if (!r || r.ok === false) {
-      if (window.OrkasCommercialEntry.isFailure(r)) return window.OrkasCommercialEntry.show();
-      _appsLogFailure('saved_app_manage', { action: 'edit', ..._savedAppFailure(r, 'saved_app_edit_failed') });
+        _appsLogFailure('saved_app_manage', { action: 'edit', ..._savedAppFailure(r, 'saved_app_edit_failed') });
       _fail(_t('apps.edit_failed', 'Could not open an edit conversation'), { message: (r && r.error) || 'open-for-editing failed' });
       return;
     }
@@ -396,9 +388,10 @@
       const name = r.title || _t('artifact.title', 'Interactive app');
       const input = document.getElementById('chat-input');
       if (input) {
-        const seed = _t('apps.edit_seed',
+        let seed = _t('apps.edit_seed',
           'Modify the interactive app "{name}". Source: attached "{file}":',
           { name, file });
+        if (capabilities?.length) seed += '\n' + _t('apps.publish_adapt_seed', '', { capabilities: capabilities.map(c => _t('apps.capability_' + c, c)).join(', ') });
         composerSetText(input, String(seed || '').trimEnd());
         if (typeof autoGrow === 'function') autoGrow(input, 200);
         if (typeof _saveDraft === 'function') _saveDraft(conv.conversation_id);
@@ -412,6 +405,8 @@
       });
     }
   }
+
+  window.editSavedAppForWeb = _editApp;
 
   async function _renameApp(appId) {
     const cur = (_appsCache || []).find((a) => a.id === appId);
@@ -533,7 +528,6 @@
 
 
   async function _createAppTask(prompt, onReady, appType) {
-    if (appType === 'web' || appType === 'cloud') { await window.OrkasCommercialEntry.show(); return false; }
     let stage = 'preflight';
     let started = false;
     try {
@@ -570,8 +564,7 @@
     }
   }
 
-  function _openCreatePanel(draft = '', selectedTemplate = 'custom', selectedType = 'local') {
-    if (selectedType === 'web' || selectedType === 'cloud') { void window.OrkasCommercialEntry.show(); return; }
+  function _openCreatePanel(draft = '', selectedTemplate = 'custom') {
     if (_createPanel) return;
     _closeRowMenu();
     const previousFocus = document.activeElement;
@@ -584,9 +577,6 @@
           <div class="modal-title">
             <h2 id="apps-create-title">${label('apps.create_title')}</h2>
           </div>
-        </div>
-        <div class="header-actions apps-create-types" role="group">
-          ${['local','web'].map(type=>`<button type="button" class="btn btn-sm ${selectedType===type?'btn-primary':''}" data-app-type="${type}" aria-pressed="${selectedType===type}">${label('apps.type_'+type)}</button>`).join('')}
         </div>
         <div class="form-row apps-create-idea">
           <label for="apps-create-idea">${label('apps.idea_label')}</label>
@@ -625,7 +615,7 @@
     const releaseFocusGuard = _uiKeepDialogFocus(overlay, idea);
     const close = (retainDraft = true) => {
       if (!overlay.isConnected) return;
-      _createDraft = retainDraft ? { idea: idea.value, template: selectedTemplate, type: selectedType } : null;
+      _createDraft = retainDraft ? { idea: idea.value, template: selectedTemplate } : null;
       releaseFocusGuard();
       document.removeEventListener('keydown', onKey, true);
       overlay.remove();
@@ -643,11 +633,6 @@
     document.addEventListener('keydown', onKey, true);
     overlay.addEventListener('click', async (event) => {
       if (submitting) return;
-      const typeButton=event.target.closest('[data-app-type]');
-      if(typeButton){
-        if (typeButton.dataset.appType === 'web') { await window.OrkasCommercialEntry.show(); return; }
-        selectedType=typeButton.dataset.appType;overlay.querySelectorAll('[data-app-type]').forEach(button=>(button.setAttribute('aria-pressed',String(button===typeButton)),button.classList.toggle('btn-primary',button===typeButton)));return;
-      }
       if (event.target === overlay || event.target.closest('[data-create-cancel]')) {
          close(); return;
       }
@@ -667,16 +652,16 @@
       cancelButton.disabled = true;
       idea.disabled = true;
       createButton.setAttribute('aria-busy', 'true');
-      overlay.querySelectorAll('[data-app-template],[data-app-type]').forEach(button => { button.disabled = true; });
-      await _createAppTask(idea.value, () => close(false), selectedType);
+      overlay.querySelectorAll('[data-app-template]').forEach(button => { button.disabled = true; });
+      await _createAppTask(idea.value, () => close(false), 'local');
       submitting = false;
       updateSubmit();
       cancelButton.disabled = false;
       idea.disabled = false;
       createButton.removeAttribute('aria-busy');
-      overlay.querySelectorAll('[data-app-template],[data-app-type]').forEach(button => { button.disabled = false; });
+      overlay.querySelectorAll('[data-app-template]').forEach(button => { button.disabled = false; });
     });
-    _createPanel = { close, getDraft: () => idea.value, getTemplate: () => selectedTemplate, getType:()=>selectedType, isSubmitting: () => submitting };
+    _createPanel = { close, getDraft: () => idea.value, getTemplate: () => selectedTemplate, isSubmitting: () => submitting };
     idea.focus();
   }
 
@@ -696,7 +681,7 @@
     grid.innerHTML = '';
     const list = (Array.isArray(apps) ? apps : []).filter(app => {
       if (!app || !app.id) return false;
-      return _appType(app) === _appsFilter;
+      return true;
     });
     if (empty) empty.style.display = list.length ? 'none' : '';
     if (countEl) countEl.textContent = list.length ? String(list.length) : '';
@@ -723,7 +708,7 @@
       const icon = document.createElement('span');
       icon.className = `app-card-icon is-${tones[hash % tones.length]}`;
       icon.setAttribute('aria-hidden', 'true');
-      icon.innerHTML = uiIconHtml(_appType(a) === 'web' ? 'cloud' : 'layout-grid');
+      icon.innerHTML = uiIconHtml('layout-grid');
       const header = document.createElement('div');
       header.className = 'app-card-header';
       header.appendChild(icon);
@@ -802,52 +787,11 @@
     }
   }
 
-  function _appType(app) {
-    if (app.appType === 'local') return 'local';
-    return app.appType === 'web' || app.appType === 'cloud' ? 'web' : 'local';
-  }
 
-  function _renderFilters() {
-    const tools = document.getElementById('apps-type-tabs');
-    if (!tools) return;
-    const focusedType = tools.contains(document.activeElement) ? document.activeElement?.dataset?.appFilter : '';
-    const description = document.getElementById('apps-type-description');
-    if (description) {
-      description.textContent = _t('apps.type_' + _appsFilter + '_description', '');
-      description.title = description.textContent;
-    }
-    document.getElementById('apps-content')?.setAttribute('aria-labelledby', 'apps-tab-' + _appsFilter);
-    tools.replaceChildren();
-    for (const [value, key] of _appsFilters) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.id = 'apps-tab-' + value;
-      button.dataset.appFilter = value;
-      button.className = 'btn btn-sm';
-      button.textContent = _t(key, key);
-      button.setAttribute('role', 'tab');
-      button.setAttribute('aria-selected', String(_appsFilter === value));
-      if (_appsFilter === value) button.setAttribute('aria-describedby', 'apps-type-description');
-      button.setAttribute('aria-controls', 'apps-content');
-      button.tabIndex = _appsFilter === value ? 0 : -1;
-      button.onclick = () => {
-        if (value === 'web') { void window.OrkasCommercialEntry.show(); return; }
-        _closeRowMenu();
-        _appsFilter = value;
-        _renderFilters();
-        _renderApps(_appsCache);
-        tools.querySelector(`[data-app-filter="${value}"]`)?.focus();
-      };
-      button.onkeydown = (event) => {
-        if (event.isComposing || event.keyCode === 229) return;
-        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
-        event.preventDefault();
-        const next = event.key === 'Home' ? 'local' : event.key === 'End' ? 'web' : value === 'local' ? 'web' : 'local';
-        tools.querySelector(`[data-app-filter="${next}"]`)?.click();
-      };
-      tools.appendChild(button);
-    }
-    if (focusedType) tools.querySelector(`[data-app-filter="${focusedType}"]`)?.focus();
+  function repaintSavedApps() {
+    if (!_appsLocalCache) return;
+    _appsCache = _appsLocalCache;
+    _renderApps(_appsCache);
   }
 
   async function loadSavedApps(_force, options) {
@@ -856,15 +800,14 @@
       _createPanel?.close(false);
       _createDraft = null;
       _appsCache = null;
+      _appsLocalCache = null;
       _closeRowMenu();
       _renderApps([]);
     }
-    _renderFilters();
     const createButton = document.getElementById('apps-create-btn');
     if (createButton) createButton.onclick = () => {
       if (_createPanel) return;
-
-      _openCreatePanel(_createDraft?.idea ?? '', _createDraft?.template ?? 'custom', _createDraft?.type ?? _appsFilter);
+      _openCreatePanel(_createDraft?.idea ?? '', _createDraft?.template ?? 'custom');
     };
     // List from disk before online revalidation. Legacy type recovery can need
     // the service; it must not hold every app card behind a network request.
@@ -873,6 +816,7 @@
       if(request!==_appsLoadGeneration)return;
       if (!r || r.ok === false || !Array.isArray(r.apps)) throw new Error('saved_app_list_failed');
       _appsCache = r.apps;
+      _appsLocalCache = r.apps;
     } catch (_) {
       if(request!==_appsLoadGeneration)return;
       _appsLog.warn('savedApps.list failed', { error_code: 'saved_app_list_failed' });
@@ -884,14 +828,14 @@
   window.addEventListener('i18n-change', () => {
     _closeRowMenu();
     if (_appsCache) _renderApps(_appsCache);
-    _renderFilters();
     if (_createPanel && !_createPanel.isSubmitting()) {
       const selectedTemplate = _createPanel.getTemplate();
-      const draft = _createPanel.getDraft(),selectedType=_createPanel.getType();
+      const draft = _createPanel.getDraft();
       _createPanel.close();
-      _openCreatePanel(draft, selectedTemplate,selectedType);
+      _openCreatePanel(draft, selectedTemplate);
     }
   });
 
   window.loadSavedApps = loadSavedApps;
+  window.repaintSavedApps = repaintSavedApps;
 })();

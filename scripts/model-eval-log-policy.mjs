@@ -10,6 +10,10 @@ const ELECTRON_MACOS_SPELLCHECKER_WARNING_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\
 /** The one runtime warning whose message can span several lines: AgentRunner
  *  splices a slice of the failed tool's result, newlines included. */
 const TOOL_ERROR_PAYLOAD_RE = /\bTool\s+\S+\s+returned error:/i;
+// Node-only toolFailureForLog records contain bounded correlation and parser
+// facts. Admit their known shapes; arbitrary indented stderr still fails.
+const NODE_TOOL_DIAGNOSTIC_SCALAR_RE = /^  (?:tool: '[A-Za-z0-9_-]+'|runner_ref: '[a-f0-9]{24}'|batch_sequence: \d+|execution_mode: '(?:single|parallel|programmatic)'|(?:session_hash|call_hash|command_hash|output_ref_hash): '[a-f0-9]{12}'|input_digest: 'sha256:[a-f0-9]{64}'|result: \{ text_hash: '[a-f0-9]{12}', text_chars: \d+ \}|output_storage: '(?:inline|persisted)'),?$/;
+const NODE_TOOL_INPUT_DIAGNOSTIC_RE = /^    (?:stream_json: '(?:strict|non_strict|unobserved|limit)'|tolerant_parse: '(?:used|not_used|unknown)'|parsed_input_matches: (?:true|false)),?$/;
 
 const STDERR_CONTEXT_CONTINUATION_RE = /^(?:\s+|\[\d+\]\s|[}\]]|\(Use\s|<\/?[a-z][\w:.-]*(?:\s[^>]*)?>?\s*$)/i;
 
@@ -72,17 +76,21 @@ function findingDetail(code) {
   }
 }
 
+function findingKey(finding) {
+  return [
+    finding.severity,
+    finding.code,
+    finding.phase,
+    finding.source || "",
+    finding.caseKey || "",
+    finding.attribution || "",
+  ].join("\0");
+}
+
 function aggregateFindings(findings) {
   const aggregated = new Map();
   for (const finding of findings) {
-    const key = [
-      finding.severity,
-      finding.code,
-      finding.phase,
-      finding.source || "",
-      finding.caseKey || "",
-      finding.attribution || "",
-    ].join("\0");
+    const key = findingKey(finding);
     const current = aggregated.get(key);
     if (current) {
       current.count += finding.count;
@@ -120,7 +128,7 @@ export function createModelEvalLogCollector(phase, { maxLineChars = MAX_PARTIAL_
     streamLineCounts: { stdout: 0, stderr: 0 },
     sourceCounts: {},
     activeCases: new Set(),
-    findings: [],
+    findings: new Map(),
     reportPaths: [],
   };
   const contexts = new Map();
@@ -138,7 +146,10 @@ export function createModelEvalLogCollector(phase, { maxLineChars = MAX_PARTIAL_
       ...attribution,
       detail: findingDetail(code),
     };
-    state.findings.push(finding);
+    const key = findingKey(finding);
+    const existing = state.findings.get(key);
+    if (existing) existing.count += 1;
+    else state.findings.set(key, { ...finding });
     onFinding?.(finding, currentLine);
   };
 
@@ -193,7 +204,9 @@ export function createModelEvalLogCollector(phase, { maxLineChars = MAX_PARTIAL_
       // application errors that merely mention deprecation.
       const nodeDeprecation = level === "error" && source === "console"
         && /^\(node:\d+\) \[DEP\d{4}\] DeprecationWarning: /.test(message);
-      if (nodeDeprecation) level = "warn";
+      const nodeListenerWarning = level === "error" && source === "console"
+        && /^\(node:\d+\) MaxListenersExceededWarning: /.test(message);
+      if (nodeDeprecation || nodeListenerWarning) level = "warn";
       state.classificationCounts.runtime += 1;
       state.levelCounts[level] += 1;
       state.sourceCounts[source] = (state.sourceCounts[source] || 0) + 1;
@@ -203,6 +216,7 @@ export function createModelEvalLogCollector(phase, { maxLineChars = MAX_PARTIAL_
         addFinding(
           "warning",
           nodeDeprecation ? "node-deprecation-warning"
+            : nodeListenerWarning ? "node-runtime-warning"
             : /tool definition description exceeds soft budget/i.test(message)
             ? "tool-definition-soft-budget"
             : "runtime-warning",
@@ -230,17 +244,27 @@ export function createModelEvalLogCollector(phase, { maxLineChars = MAX_PARTIAL_
         state.levelCounts.warn += 1;
         context.stderrContext = undefined;
         context.stderrPayload = false;
-        context.nodeToolDiagnostic = true;
+        context.nodeToolDiagnostic = 'root';
         addFinding('warning', 'tool-execution-failed', 'agent-runner');
         return;
       }
       if (context.nodeToolDiagnostic) {
-        if (line === '}') {
+        if (context.nodeToolDiagnostic === 'root' && line === '}') {
           context.nodeToolDiagnostic = false;
           state.classificationCounts.other += 1;
           return;
         }
-        if (/^\s+(?:tool: '[A-Za-z0-9_-]+',?|result: \{ text_hash: '[a-f0-9]{12}', text_chars: \d+ \},?)$/.test(line)) {
+        if (context.nodeToolDiagnostic === 'root' && line === '  input_parse: {') {
+          context.nodeToolDiagnostic = 'input';
+          state.classificationCounts.other += 1;
+          return;
+        }
+        if (context.nodeToolDiagnostic === 'input' && /^  \},?$/.test(line)) {
+          context.nodeToolDiagnostic = 'root';
+          state.classificationCounts.other += 1;
+          return;
+        }
+        if ((context.nodeToolDiagnostic === 'root' ? NODE_TOOL_DIAGNOSTIC_SCALAR_RE : NODE_TOOL_INPUT_DIAGNOSTIC_RE).test(line)) {
           state.classificationCounts.other += 1;
           return;
         }
@@ -394,7 +418,7 @@ export function createModelEvalLogCollector(phase, { maxLineChars = MAX_PARTIAL_
     }
     const coveragePassed = state.capturedLineCount === state.analyzedLineCount;
     const findings = aggregateFindings([
-      ...state.findings,
+      ...state.findings.values(),
       ...(coveragePassed ? [] : [{
         severity: "error",
         code: "log-coverage-gap",

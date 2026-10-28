@@ -87,6 +87,8 @@ const _standaloneTimers = new Set<NodeJS.Timeout>();
 const _resourceTails = new Map<BootResourceClass, Promise<void>>();
 let _lastUserActivityAt = Date.now();
 let _isRuntimeBusy: () => boolean = () => false;
+let _lifetime = new AbortController();
+const _standaloneCancels = new Set<() => void>();
 
 export function configureBootAdmission(options: { isRuntimeBusy?: () => boolean } = {}): void {
   _isRuntimeBusy = typeof options.isRuntimeBusy === 'function'
@@ -134,8 +136,21 @@ export function scheduleBootBackground(
   const finish = (): void => {
     if (settled) return;
     settled = true;
+    _standaloneCancels.delete(cancel);
     resolvePromise();
   };
+  const cancel = (): void => {
+    if (cancelled || settled) return;
+    cancelled = true;
+    controller.abort(new Error(`background task cancelled: ${name}`));
+    if (timer) {
+      clearTimeout(timer);
+      _standaloneTimers.delete(timer);
+      timer = null;
+    }
+    finish();
+  };
+  _standaloneCancels.add(cancel);
   timer = setTimeout(() => {
     if (timer) _standaloneTimers.delete(timer);
     timer = null;
@@ -146,17 +161,7 @@ export function scheduleBootBackground(
   timer.unref?.();
   _standaloneTimers.add(timer);
   return {
-    cancel() {
-      if (cancelled || settled) return;
-      cancelled = true;
-      controller.abort(new Error(`background task cancelled: ${name}`));
-      if (timer) {
-        clearTimeout(timer);
-        _standaloneTimers.delete(timer);
-        timer = null;
-      }
-      finish();
-    },
+    cancel,
     promise,
   };
 }
@@ -216,7 +221,7 @@ export async function runBootPhases(deferMs: number = DEFAULT_DEFER_MS): Promise
   _immediateRan = true;
   log.info(`boot immediate phase: tasks=${_immediate.length}`);
   await _runBatch(_immediate, 'immediate');
-  if (!_deferredScheduled) {
+  if (!_deferredScheduled && !_lifetime.signal.aborted) {
     _deferredScheduled = true;
     _deferredBaseTimer = setTimeout(() => {
       _deferredBaseTimer = null;
@@ -253,7 +258,9 @@ async function _runDeferredBatches(): Promise<void> {
 
 async function _runBatch(tasks: Task[], phase: string): Promise<void> {
   const inFlight: Promise<unknown>[] = [];
-  for (const t of tasks) {
+  const lifetime = _lifetime.signal;
+  for (const task of tasks) {
+    const t = { ...task, signal: AbortSignal.any([lifetime, ...(task.signal ? [task.signal] : [])]) };
     if (t.mode === 'serial') {
       // Barrier: settle any pending parallel work before running this
       // task, then await it.
@@ -270,6 +277,7 @@ async function _runBatch(tasks: Task[], phase: string): Promise<void> {
 }
 
 async function _runOne(t: Task, phase: string): Promise<void> {
+  t = { ...t, signal: AbortSignal.any([_lifetime.signal, ...(t.signal ? [t.signal] : [])]) };
   const resource = t.options.resourceClass;
   if (resource) {
     const previous = _resourceTails.get(resource) || Promise.resolve();
@@ -343,14 +351,27 @@ async function _waitForAdmission(t: Task, phase: string): Promise<boolean> {
   }
 }
 
-/** Test-only — reset internal state so the suite can register & re-run. */
-export function _resetForTests(): void {
+/** No startup work may begin or recreate dependencies during application exit. */
+export function stopBootWork(): void {
+  _lifetime.abort(new Error('application is closing'));
+  for (const cancel of [..._standaloneCancels]) cancel();
   if (_deferredBaseTimer) clearTimeout(_deferredBaseTimer);
   _deferredBaseTimer = null;
   for (const timer of _deferredOffsetTimers) clearTimeout(timer);
   _deferredOffsetTimers.clear();
   for (const timer of _standaloneTimers) clearTimeout(timer);
   _standaloneTimers.clear();
+}
+
+/** A failed exit may accept new work, but never replay cancelled boot tasks. */
+export function resumeBootAdmission(): void {
+  if (_lifetime.signal.aborted) _lifetime = new AbortController();
+}
+
+/** Test-only — reset internal state so the suite can register & re-run. */
+export function _resetForTests(): void {
+  stopBootWork();
+  _lifetime = new AbortController();
   _immediate.length = 0;
   _deferred.length = 0;
   _immediateRan = false;

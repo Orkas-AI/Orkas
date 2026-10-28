@@ -4,7 +4,8 @@ The generated API reference includes the exact version-1 data definition schema.
 Use stable table/field IDs. Renaming a display name preserves data; removal,
 constraint/type changes and incompatible references fail migration.
 
-Records have a platform-generated id and UTC createdAt. Values are finite safe
+Records have a platform-generated id and UTC createdAt; do not redeclare these
+names in table fields. Values are finite safe
 numbers, booleans, UTF-8 strings, JSON objects/arrays or null on nullable fields.
 Timestamp fields use UTC ISO strings, normalized to millisecond precision.
 Omitted fields use explicit defaults or remain absent. Query comparisons use
@@ -13,6 +14,21 @@ UTF-8 record bytes meter the online 20 MiB limit, including id/createdAt. JSON
 null and absent fields both match a null filter. User-provided SQL is rejected.
 
 Queries, counts and aggregates apply the declared read fields and readFilters.
+A query's selected fields, filters and non-id ordering require access.read;
+createdAt ordering requires it too. Explicit query fields determine the returned
+projection: granting read access alone does not add a field to that projection.
+For example, reading message text and creation time in newest-first order:
+
+```json
+{
+  "access": { "read": ["body", "createdAt"], "insert": ["body"] },
+  "query": {
+    "table": "messages", "fields": ["body", "createdAt"],
+    "order": { "field": "createdAt", "direction": "desc" }
+  }
+}
+```
+
 Declared references target stable table IDs; include performs one-hop reads under
 the target's read permissions. References must identify an existing record;
 author deletion refuses references instead of silently cascading.

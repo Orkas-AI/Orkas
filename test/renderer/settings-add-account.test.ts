@@ -41,6 +41,12 @@ class FakeElement {
     this.listeners.set(type, handlers);
   }
 
+  keyDown(key: string) {
+    for (const handler of this.listeners.get('keydown') || []) {
+      handler({ key, keyCode: key === 'Enter' ? 13 : 0, isComposing: false, preventDefault: vi.fn() });
+    }
+  }
+
   async click() {
     if (this.onclick) await this.onclick({ currentTarget: this, target: this });
     for (const handler of this.listeners.get('click') || []) {
@@ -110,6 +116,10 @@ function loadSettingsClickHarness(
     'settings-image-add-btn',
     'settings-image-status',
     'settings-image-entries',
+    'settings-video-provider',
+    'settings-video-key-input',
+    'settings-video-add-btn',
+    'settings-video-status',
     'settings-video-entries',
     'settings-tts-entries',
   ]) {
@@ -204,28 +214,65 @@ function loadSettingsClickHarness(
   return { context, elements, indexHtml, settingsSource: source, invoke, monitor, selects };
 }
 
-it('submits the shared protocol picker selection without losing a gateway prefix', async () => {
+it.each(['anthropic', 'responses'])('submits the %s protocol picker selection without losing a gateway prefix', async protocol => {
   const { context, elements, invoke, selects } = loadSettingsClickHarness();
   const body = elements.get('add-account-body')!;
   for (const [selector, value] of Object.entries({
     '.custom-label-input': 'Gateway', '.custom-protocol-input': 'anthropic',
-    '.custom-base-url-input': 'https://gateway.example.test/proxy/v1/messages',
+    '.custom-base-url-input': protocol === 'responses' ? 'https://gateway.example.test/proxy/v1/responses' : 'https://gateway.example.test/proxy/v1/messages',
     '.custom-model-input': 'claude-gateway-alias', '.custom-max-tokens-input': '8192',
     '.custom-key-input': 'synthetic-form-key', '.form-msg': '',
   })) { const field = new FakeElement(); field.value = value; body.setQueryResult(selector, field); }
   context._settingsShowCustomModelForm({ id: 'custom', label: 'Custom' });
   const protocolPicker = selects.get(body.querySelector('.custom-protocol-input')!);
   expect(protocolPicker.getValue()).toBe('openai');
-  protocolPicker.emitChange('anthropic');
-  expect(body.querySelector('.custom-base-url-input')!.placeholder).toBe('https://api.example.com');
+  expect(protocolPicker.getOptions().map((option: {value: string}) => option.value)).toContain(protocol);
+  protocolPicker.emitChange(protocol);
+  expect(body.querySelector('.custom-base-url-input')!.placeholder).toBe(protocol === 'anthropic' ? 'https://api.example.com' : 'https://api.example.com/v1');
   await elements.get('add-account-actions')!.children.at(-1)!.click();
   expect(invoke).toHaveBeenCalledWith('auth.addCustomModelEntry', {
-    label: 'Gateway', protocol: 'anthropic', baseUrl: 'https://gateway.example.test/proxy/v1/messages',
+    label: 'Gateway', protocol, baseUrl: protocol === 'responses' ? 'https://gateway.example.test/proxy/v1/responses' : 'https://gateway.example.test/proxy/v1/messages',
     model: 'claude-gateway-alias', maxTokens: '8192', apiKey: 'synthetic-form-key',
   });
 });
 
 describe('settings model authorization add account', () => {
+  it.each(['doubao-seedance-2-0-fast-260128', 'doubao-seedance-2-0-mini'])('preserves a flattened video model choice through the real add button: %s', async (model) => {
+    const option = { id: `doubao:${model}`, provider: 'doubao', model, label: `DouBao · ${model}` };
+    const { context, elements, invoke } = loadSettingsClickHarness(async (channel) => (
+      channel === 'videoAuth.list' ? { ok: true, profiles: [], providers: [option] } : { ok: true }
+    ));
+    elements.get('settings-video-key-input')!.value = 'fixture-video-key';
+    await context._settingsRefreshVideoProfiles();
+    context._settingsRenderVideoPicker();
+    context.__selected = option.id;
+    vm.runInContext('_settingsState.videoProviderSel.setValue(__selected)', context);
+    await elements.get('settings-video-add-btn')!.click();
+    expect(invoke).toHaveBeenCalledWith('videoAuth.add', { provider: 'doubao', model, apiKey: 'fixture-video-key', label: 'default' });
+    expect(elements.get('settings-video-key-input')!.value).toBe('');
+  });
+
+  it('does not submit an unknown video option or lose its entered key', async () => {
+    const { context, elements, invoke } = loadSettingsClickHarness();
+    elements.get('settings-video-key-input')!.value = 'fixture-video-key';
+    context._settingsRenderVideoPicker();
+    vm.runInContext("_settingsState.videoProviderSel.setValue('doubao:unknown-model')", context);
+    await elements.get('settings-video-add-btn')!.click();
+    expect(invoke.mock.calls.some(([channel]) => channel === 'videoAuth.add')).toBe(false);
+    expect(elements.get('settings-video-key-input')!.value).toBe('fixture-video-key');
+  });
+
+  it('labels saved video models by their provider/model pair', async () => {
+    const { context } = loadSettingsClickHarness(async (channel) => (
+      channel === 'videoAuth.list' ? { ok: true, profiles: [], providers: [
+        { id: 'doubao:standard', provider: 'doubao', model: 'standard', label: 'DouBao · Standard' },
+        { id: 'doubao:fast', provider: 'doubao', model: 'fast', label: 'DouBao · Fast' },
+      ] } : { ok: true }
+    ));
+    await context._settingsRefreshVideoProfiles();
+    expect(context._videoProviderLabel('doubao', 'fast')).toBe('DouBao · Fast');
+  });
+
   it('uses the model options returned by imageAuth and preserves the selected model on save', async () => {
     const model = 'doubao-seedream-5-0-pro-260628';
     const option = { id: `doubao:${model}`, provider: 'doubao', model, label: 'DouBao · Seedream 5.0 Pro' };
@@ -708,7 +755,8 @@ describe('settings model authorization add account', () => {
         oauthProviderId: 'openai-codex',
         modelId: 'gpt-5.6-sol'
       };
-      _oauthFlowTelemetry = { startedAt: Date.now(), done: false };
+      _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
+      _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
       _oauthFlowRender(
         { id: 'openai-codex' },
         { kind: 'done', profileId: 'openai-codex:new-account' },
@@ -744,7 +792,8 @@ describe('settings model authorization add account', () => {
         oauthProviderId: 'openai-codex',
         modelId: 'gpt-5.6-sol'
       };
-      _oauthFlowTelemetry = { startedAt: Date.now(), done: false };
+      _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
+      _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
       _oauthFlowRender(
         { id: 'openai-codex' },
         { kind: 'done', profileId: 'openai-codex:new-account' },
@@ -771,7 +820,8 @@ describe('settings model authorization add account', () => {
         oauthProviderId: 'openai-codex',
         modelId: 'gpt-5.6-sol'
       };
-      _oauthFlowTelemetry = { startedAt: Date.now(), done: false };
+      _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
+      _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
       _oauthFlowRender(
         { id: 'openai-codex' },
         { kind: 'done' },
@@ -800,4 +850,320 @@ it('shows legacy unsupported video profiles as unavailable instead of active', a
   expect(row.children.find((child) => child.className === 'entry-rank')?.textContent).toBe('new_chat.model_picker.unavailable');
   const main = row.children.find((child) => child.className === 'entry-main');
   expect(main?.children.find((child) => child.className === 'form-hint')?.textContent).toBe('settings.video.provider_unavailable');
+});
+
+
+describe('credential form repeated keyboard submission', () => {
+  it.each([
+    ['api_key', 'success'], ['api_key', 'rejected'], ['api_key', 'thrown'],
+    ['custom', 'success'], ['custom', 'rejected'], ['custom', 'thrown'],
+  ])('submits the %s form once while pending and preserves %s recovery', async (method, outcome) => {
+    const channel = method === 'custom' ? 'auth.addCustomModelEntry' : 'auth.addApiKeyEntry';
+    let release!: (result: Record<string, unknown>) => void;
+    let reject!: (error: Error) => void;
+    const gate = new Promise<Record<string, unknown>>((resolve, fail) => { release = resolve; reject = fail; });
+    let attempts = 0;
+    const { context, elements, invoke, monitor } = loadSettingsClickHarness(async current => {
+      if (current !== channel) return { ok: true };
+      attempts += 1;
+      return attempts === 1 ? gate : { ok: true };
+    });
+    vm.runInContext('_settingsReload = async () => {};', context);
+    const body = elements.get('add-account-body')!;
+    const values = method === 'custom' ? {
+      '.custom-label-input': '', '.custom-protocol-input': '',
+      '.custom-base-url-input': 'https://gateway.example.test/v1',
+      '.custom-model-input': 'fixture-model', '.custom-max-tokens-input': '',
+      '.custom-key-input': 'synthetic-form-key', '.form-msg': '',
+    } : {
+      '.api-label-input': '', '.api-key-input': 'synthetic-form-key', '.form-msg': '',
+    };
+    for (const [selector, value] of Object.entries(values)) {
+      const field = new FakeElement(); field.value = value; body.setQueryResult(selector, field);
+    }
+    if (method === 'custom') context._settingsShowCustomModelForm({ id: 'custom', label: 'Custom' });
+    else context._settingsShowApiKeyForm({ id: 'openai', label: 'OpenAI' }, 'gpt-5.6-sol');
+    const input = body.querySelector(method === 'custom' ? '.custom-key-input' : '.api-key-input')!;
+    const save = elements.get('add-account-actions')!.children.at(-1)!;
+    try {
+      input.keyDown('Enter');
+      expect(save.disabled).toBe(true);
+      input.keyDown('Enter'); input.keyDown('Enter');
+      expect(invoke.mock.calls.filter(call => call[0] === channel)).toHaveLength(1);
+      if (outcome === 'thrown') reject(new Error('synthetic write failure'));
+      else release(outcome === 'rejected' ? { ok: false, code: 'WRITE_FAILED' } : { ok: true });
+      await vi.waitFor(() => expect(outcome === 'success'
+        ? elements.get('add-account-modal')!.classList.contains('open') : save.disabled).toBe(false));
+      if (outcome === 'success') {
+        expect(elements.get('add-account-modal')!.classList.contains('open')).toBe(false);
+      } else {
+        expect(elements.get('add-account-modal')!.classList.contains('open')).toBe(true);
+        expect(save.disabled).toBe(false);
+        input.keyDown('Enter');
+        await vi.waitFor(() => expect(elements.get('add-account-modal')!.classList.contains('open')).toBe(false));
+        expect(invoke.mock.calls.filter(call => call[0] === channel)).toHaveLength(2);
+      }
+    } finally {
+      release({ ok: true });
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  });
+});
+
+
+describe('credential dialog response ownership', () => {
+  function openCredential(context: any, elements: Map<string, FakeElement>, method: string) {
+    const body = elements.get('add-account-body')!;
+    const values = method === 'custom' ? {
+      '.custom-label-input': '', '.custom-protocol-input': '',
+      '.custom-base-url-input': 'https://gateway.example.test/v1',
+      '.custom-model-input': 'fixture-model', '.custom-max-tokens-input': '',
+      '.custom-key-input': 'synthetic-dialog-key', '.form-msg': '',
+    } : { '.api-label-input': '', '.api-key-input': 'synthetic-dialog-key', '.form-msg': '' };
+    for (const [selector, value] of Object.entries(values)) {
+      const field = new FakeElement(); field.value = value; body.setQueryResult(selector, field);
+    }
+    if (method === 'custom') context._settingsShowCustomModelForm({ id: 'custom', label: 'Custom' });
+    else context._settingsShowApiKeyForm({ id: 'openai', label: 'OpenAI' }, 'gpt-5.6-sol');
+  }
+
+  it.each(['api_key', 'custom'].flatMap(method => [
+    [method, 'closed', 'success'], [method, 'reopened', 'success'], [method, 'reopened', 'rejected'],
+  ]))('does not close or repaint a newer dialog after %s finishes %s with %s', async (method, destination, outcome) => {
+    let release!: (result: Record<string, unknown>) => void;
+    const gate = new Promise<Record<string, unknown>>(resolve => { release = resolve; });
+    const channel = method === 'custom' ? 'auth.addCustomModelEntry' : 'auth.addApiKeyEntry';
+    const { context, elements, invoke, monitor } = loadSettingsClickHarness(async current => current === channel ? gate : { ok: true });
+    vm.runInContext('_settingsReload = async () => {};', context);
+    openCredential(context, elements, method);
+    const actions = elements.get('add-account-actions')!;
+    const pending = actions.children.at(-1)!.click();
+    try {
+      await actions.children.at(-2)!.click();
+      if (destination === 'reopened') openCredential(context, elements, method === 'custom' ? 'api_key' : 'custom');
+      const body = elements.get('add-account-body')!.innerHTML;
+      const title = elements.get('add-account-title')!.textContent;
+      release(outcome === 'success' ? { ok: true } : { ok: false, code: 'WRITE_FAILED' });
+      await pending;
+      expect(elements.get('add-account-modal')!.classList.contains('open')).toBe(destination === 'reopened');
+      expect(elements.get('add-account-body')!.innerHTML).toBe(body);
+      expect(elements.get('add-account-title')!.textContent).toBe(title);
+      expect(invoke.mock.calls.filter(call => call[0] === channel)).toHaveLength(1);
+    } finally {
+      release({ ok: true }); await pending;
+      context._settingsCloseModal(elements.get('add-account-modal'));
+    }
+  });
+});
+
+describe('OAuth dialog asynchronous ownership', () => {
+  function controlIntervals(context: any) {
+    const active = new Map<number, () => Promise<void>>();
+    let next = 0;
+    context.setInterval = (callback: () => Promise<void>) => { active.set(++next, callback); return next; };
+    context.clearInterval = (id: number) => { active.delete(id); };
+    return active;
+  }
+  const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+
+  it.each(['closed', 'reopened'])('cancels a late startup response after its modal was %s', async destination => {
+    let release!: (result: Record<string, unknown>) => void;
+    const gate = new Promise<Record<string, unknown>>(resolve => { release = resolve; });
+    let starts = 0;
+    const { context, elements, invoke } = loadSettingsClickHarness(async channel => {
+      if (channel === 'auth.startOAuth') return ++starts === 1 ? gate : { ok: true, flowId: 'new-flow' };
+      return { ok: true, status: { kind: 'starting' } };
+    });
+    const active = controlIntervals(context);
+    const pending = context._settingsStartOAuthFlow({ id: 'old-provider' }, 'old-model');
+    try {
+      await elements.get('oauth-flow-close-btn')!.click();
+      if (destination === 'reopened') await context._settingsStartOAuthFlow({ id: 'new-provider' }, 'new-model');
+      const body = elements.get('oauth-flow-body')!.innerHTML;
+      release({ ok: true, flowId: 'old-flow' }); await pending;
+      expect(invoke).toHaveBeenCalledWith('auth.cancelOAuthFlow', { flowId: 'old-flow' });
+      expect(active.size).toBe(destination === 'reopened' ? 1 : 0);
+      for (const callback of active.values()) await callback();
+      const polls = invoke.mock.calls.filter(call => call[0] === 'auth.pollOAuthFlow');
+      expect(polls.map(call => call[1])).toEqual(destination === 'reopened' ? [{ flowId: 'new-flow' }] : []);
+      expect(elements.get('oauth-flow-modal')!.classList.contains('open')).toBe(destination === 'reopened');
+      if (destination === 'closed') expect(elements.get('oauth-flow-body')!.innerHTML).toBe(body);
+    } finally {
+      release({ ok: true, flowId: 'old-flow' }); await pending;
+      await elements.get('oauth-flow-close-btn')!.click(); active.clear();
+    }
+  });
+
+  it.each(['starting', 'done', 'error'].flatMap(kind => ['closed', 'reopened'].map(destination => [kind, destination])))('discards an obsolete %s poll after the dialog was %s', async (kind, destination) => {
+    let release!: (result: Record<string, unknown>) => void;
+    const gate = new Promise<Record<string, unknown>>(resolve => { release = resolve; });
+    let starts = 0;
+    const { context, elements, invoke, monitor } = loadSettingsClickHarness(async channel => {
+      if (channel === 'auth.startOAuth') return { ok: true, flowId: ++starts === 1 ? 'old-flow' : 'new-flow' };
+      if (channel === 'auth.pollOAuthFlow') return gate;
+      return { ok: true };
+    });
+    vm.runInContext('_settingsReload = async () => {};', context);
+    const active = controlIntervals(context);
+    await context._settingsStartOAuthFlow({ id: 'old-provider' }, 'old-model');
+    const pending = [...active.values()][0]();
+    try {
+      await elements.get('oauth-flow-close-btn')!.click();
+      if (destination === 'reopened') await context._settingsStartOAuthFlow({ id: 'new-provider' }, 'new-model');
+      const body = elements.get('oauth-flow-body')!.innerHTML;
+      release({ ok: true, status: { kind, profileId: 'old-provider:old-profile', message: 'old progress', error: 'old error' } });
+      await pending; await settle();
+      expect(invoke.mock.calls.filter(call => ['auth.addEntry', 'auth.removeCredential'].includes(call[0]))).toHaveLength(0);
+      expect(elements.get('oauth-flow-body')!.innerHTML).toBe(body);
+      expect(elements.get('oauth-flow-modal')!.classList.contains('open')).toBe(destination === 'reopened');
+      expect(active.size).toBe(destination === 'reopened' ? 1 : 0);
+    } finally {
+      release({ ok: true, status: { kind: 'starting' } }); await pending; await settle();
+      await elements.get('oauth-flow-close-btn')!.click(); active.clear();
+    }
+  });
+
+  it('commits one model entry when two in-flight polls return the same completed flow', async () => {
+    let releasePoll!: (value: Record<string, unknown>) => void;
+    let releaseWrite!: (value: Record<string, unknown>) => void;
+    const poll = new Promise<Record<string, unknown>>(resolve => { releasePoll = resolve; });
+    const write = new Promise<Record<string, unknown>>(resolve => { releaseWrite = resolve; });
+    const { context, elements, invoke, monitor } = loadSettingsClickHarness(async channel => {
+      if (channel === 'auth.startOAuth') return { ok: true, flowId: 'single-flow' };
+      if (channel === 'auth.pollOAuthFlow') return poll;
+      if (channel === 'auth.addEntry') return write;
+      return { ok: true };
+    });
+    vm.runInContext('_settingsReload = async () => {};', context);
+    const active = controlIntervals(context);
+    await context._settingsStartOAuthFlow({ id: 'openai-codex' }, 'gpt-5.6-sol');
+    const callback = [...active.values()][0];
+    const pending = [callback(), callback()];
+    try {
+      releasePoll({ ok: true, status: { kind: 'done', profileId: 'openai-codex:single' } });
+      await Promise.all(pending); await settle();
+      expect(invoke.mock.calls.filter(call => call[0] === 'auth.addEntry')).toHaveLength(1);
+      releaseWrite({ ok: true }); await settle();
+      expect(elements.get('oauth-flow-modal')!.classList.contains('open')).toBe(false);
+    } finally {
+      releasePoll({ ok: true, status: { kind: 'starting' } }); releaseWrite({ ok: true });
+      await Promise.all(pending); await settle();
+      await elements.get('oauth-flow-close-btn')!.click(); active.clear();
+    }
+  });
+});
+
+
+describe('OAuth admitted write compatibility across dialog changes', () => {
+  it.each(['models', 'entry-success', 'entry-failure', 'cleanup'])('finishes its already-admitted %s operation without changing the newer dialog', async stage => {
+    let release!: (result: Record<string, unknown>) => void;
+    const gate = new Promise<Record<string, unknown>>(resolve => { release = resolve; });
+    let entered = false;
+    let starts = 0;
+    const { context, elements, invoke, monitor } = loadSettingsClickHarness(async channel => {
+      if (channel === 'auth.startOAuth') return { ok: true, flowId: ++starts === 1 ? 'old-flow' : 'new-flow' };
+      if (channel === 'auth.pollOAuthFlow') return { ok: true, status: { kind: 'done', profileId: 'backend:completed' } };
+      if (channel === 'auth.listModels') {
+        if (stage === 'models') { entered = true; return gate; }
+        return { ok: true, models: [{ id: 'chosen-model' }] };
+      }
+      if (channel === 'auth.addEntry') {
+        if (stage.startsWith('entry-')) { entered = true; return gate; }
+        return stage === 'cleanup' ? { ok: false, code: 'WRITE_FAILED' } : { ok: true };
+      }
+      if (channel === 'auth.removeCredential' && stage === 'cleanup') { entered = true; return gate; }
+      return { ok: true };
+    });
+    const active = new Map<number, () => Promise<void>>(); let next = 0;
+    context.setInterval = (callback: () => Promise<void>) => { active.set(++next, callback); return next; };
+    context.clearInterval = (id: number) => { active.delete(id); };
+    context.__reload = vi.fn(async () => {});
+    vm.runInContext('_settingsReload = __reload;', context);
+    await context._settingsStartOAuthFlow({ id: stage === 'models' ? 'visible-provider' : 'backend', oauthProvider: 'backend' }, 'chosen-model');
+    const pending = [...active.values()][0]();
+    try {
+      await vi.waitFor(() => expect(entered).toBe(true));
+      await elements.get('oauth-flow-close-btn')!.click();
+      await context._settingsStartOAuthFlow({ id: 'new-provider' }, 'new-model');
+      const body = elements.get('oauth-flow-body')!.innerHTML;
+      release(stage === 'models' ? { ok: true, models: [{ id: 'chosen-model' }] }
+        : stage === 'entry-failure' ? { ok: false, code: 'WRITE_FAILED' } : { ok: true });
+      await pending;
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(invoke.mock.calls.filter(call => call[0] === 'auth.addEntry')).toEqual([[
+        'auth.addEntry', { provider: 'backend', model: 'chosen-model', profileId: 'backend:completed' },
+      ]]);
+      expect(invoke.mock.calls.filter(call => call[0] === 'auth.removeCredential')).toEqual(
+        ['entry-failure', 'cleanup'].includes(stage) ? [['auth.removeCredential', { profileId: 'backend:completed' }]] : [],
+      );
+      expect(context.__reload).toHaveBeenCalledTimes(['models', 'entry-success'].includes(stage) ? 1 : 0);
+      expect(elements.get('oauth-flow-modal')!.classList.contains('open')).toBe(true);
+      expect(elements.get('oauth-flow-body')!.innerHTML).toBe(body);
+      expect(active.size).toBe(1);
+    } finally {
+      release({ ok: true, models: [{ id: 'chosen-model' }] }); await pending;
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await elements.get('oauth-flow-close-btn')!.click(); active.clear();
+    }
+  });
+});
+
+
+it('does not undo the first completed OAuth entry when a duplicate completion would fail', async () => {
+  let releasePoll!: (value: Record<string, unknown>) => void;
+  let releaseWrite!: (value: Record<string, unknown>) => void;
+  const poll = new Promise<Record<string, unknown>>(resolve => { releasePoll = resolve; });
+  const write = new Promise<Record<string, unknown>>(resolve => { releaseWrite = resolve; });
+  let writes = 0;
+  const { context, elements, invoke, monitor } = loadSettingsClickHarness(async channel => {
+    if (channel === 'auth.startOAuth') return { ok: true, flowId: 'single-flow' };
+    if (channel === 'auth.pollOAuthFlow') return poll;
+    if (channel === 'auth.addEntry') {
+      if (++writes === 1) return write;
+      await write;
+      // The first response reaches its success handler before this later
+      // failure. Its committed credential must not enter duplicate cleanup.
+      return new Promise(resolve => setTimeout(() => resolve({ ok: false, code: 'WRITE_FAILED' }), 0));
+    }
+    return { ok: true };
+  });
+  const active = new Map<number, () => Promise<void>>(); let next = 0;
+  context.setInterval = (callback: () => Promise<void>) => { active.set(++next, callback); return next; };
+  context.clearInterval = (id: number) => { active.delete(id); };
+  vm.runInContext('_settingsReload = async () => {};', context);
+  await context._settingsStartOAuthFlow({ id: 'openai-codex' }, 'gpt-5.6-sol');
+  const callback = [...active.values()][0]; const pending = [callback(), callback()];
+  try {
+    releasePoll({ ok: true, status: { kind: 'done', profileId: 'openai-codex:committed' } });
+    await Promise.all(pending);
+    releaseWrite({ ok: true });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(invoke.mock.calls.filter(call => call[0] === 'auth.removeCredential')).toHaveLength(0);
+    expect(invoke.mock.calls.filter(call => call[0] === 'auth.addEntry')).toHaveLength(1);
+  } finally {
+    releasePoll({ ok: true, status: { kind: 'starting' } }); releaseWrite({ ok: true });
+    await Promise.all(pending); await new Promise(resolve => setTimeout(resolve, 0));
+    await elements.get('oauth-flow-close-btn')!.click(); active.clear();
+  }
+});
+
+
+describe('legacy context capacity remediation', () => {
+  it('keeps a too-small saved model visible and removable without ranking or reordering it', () => {
+    const { context } = loadSettingsClickHarness();
+    const row = context._settingsRenderEntryRow({
+      entryId: 'legacy-small', provider: 'custom', model: 'old-small',
+      profileId: 'profile-small', modelEditable: false,
+      availability: 'context_too_small', availabilityReason: 'Choose a model with at least 32000 tokens.',
+    }, null);
+    expect(row.draggable).toBe(false);
+    expect(row.children.some((child: FakeElement) => child.className === 'entry-sort')).toBe(false);
+    expect(row.children.find((child: FakeElement) => child.className === 'entry-rank')?.textContent).toBe('');
+    const main = row.children.find((child: FakeElement) => child.className === 'entry-main');
+    expect(main?.children.some((child: FakeElement) => child.textContent === 'Choose a model with at least 32000 tokens.')).toBe(true);
+    const actions = row.children.find((child: FakeElement) => child.className === 'entry-actions');
+    expect(actions?.children.some((child: FakeElement) => child.className === 'icon-btn danger')).toBe(true);
+  });
 });

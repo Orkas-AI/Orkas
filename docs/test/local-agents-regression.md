@@ -2,7 +2,12 @@
 
 ## 评测口径
 
-本模块遵循 `Common/docs/test-case-design.md`。新增、修改或保留 case 必须同时说明：
+本模块遵循 `Common/docs/test-case-design.md`。本轮以产品逻辑为验收主体：发现与选择、
+协议通信、正文和工具结果交付、权限及作用域、终止、持久化和恢复。模型能否规划任务、
+理解复杂指令或选出正确工具属于辅助模型评测，不能代替这些链路的验收，也不能仅凭
+模型选择不佳判定产品逻辑有缺陷。真实 CLI canary 保留小规模、明确边界的调用。
+
+新增、修改或保留 case 必须同时说明：
 
 1. **现状回归价值**：对应 CLI 发现/版本、命令构造、协议解析、权限、进程树、事件流、
    session 续接、失败分类、公开输出过滤或 Renderer 接线中的具体路径。
@@ -81,7 +86,11 @@
   还覆盖新建和历史 OpenCode 的空默认 schema、workspace 回退与设备本地自定义目录。
 - Electron E2E：`test/e2e/chat_e2e_cli_recovery.spec.ts` 使用确定性真实子进程，覆盖
   工具副作用后的失败、完整重启后续接、过期 session 重开、Hermes 可见历史桥接，
-  以及模型/思考覆盖持久化、切换模型清除不兼容思考级别、恢复 CLI 默认后下一轮不再
+  Hermes 版本不可识别和初始化请求收到后退出码 1 两类启动失败：必须展示并持久化
+  失败原因/错误码，重开后保留；修复检测结果后手动重试只建一个 session、提交一次
+  prompt、交付一次回复且不增加 Agent。故障前不得建立 session 或提交模型任务；
+  以及 composer 停止时过期问题卡、子进程退出、取消状态落盘、刷新后不复活和下一轮恢复；
+  模型/思考覆盖持久化、切换模型清除不兼容思考级别、恢复 CLI 默认后下一轮不再
   传入覆盖参数，并要求设置前后的相邻回复继续使用同一个 Agent 头像；Claude Code case
   还验证别名传参、具体模型回传、重启后展示，以及切换别名后不显示旧的具体版本；
   OpenCode case 从详情页所示自定义目录贯通到真实 fake child，要求唯一 `--dir`、OS cwd
@@ -92,11 +101,169 @@
 - Live smoke：`test:local-agents:live` 通过生产 registry/runner 请求精确
   `ORKAS_AGENT_OK`，只证明安装、认证、协议和基本往返，不能证明模型任务质量。
 - 动态模型 benchmark：`benchmark:local-agents` 通过同一生产 runner 运行事实读取、
-  最小范围编辑、缺少权威依据时停止、当前对话检索、开放 Skill 读取和 Commander 专属
-  变更转交六类场景。发布验收使用默认 `k=2`；`k=1` 仅作开发探测。fake CLI、静态合同
-  和 live smoke 都不能替代真实模型结果。
+  最小范围编辑、缺少权威依据时停止、当前对话检索、开放 Skill 读取和转交等辅助场景。
+  它评价模型参与的任务结果，不作为产品逻辑主验收，也不要求为协议、数量、注册或
+  确定性状态合同扩展模型批次。主动运行模型质量比较时默认 `k=2`；`k=1` 仅作开发探测。
+  确定性子进程、真实 CLI canary 和模型任务评测各自保留证据边界。
 
 以下 case 只保留真实 CLI/ACP 二进制、系统 PATH、长任务、进程中断和真实终端行为。
+
+### Non-Claude CLI acceptance portfolio
+
+| User journey | Independent acceptance | Execution evidence |
+| --- | --- | --- |
+| Discover and select a usable CLI | Missing/non-executable/old candidates fail; replacement and reinstall invalidate identity caches; model eligibility stays separate from version support. | Registry, which/version/compatibility/runtime-option cases plus real binary detection. |
+| Access current history and Skills after changing model | Actual Orkas Bridge calls retrieve facts absent from workspace/current input; no cross-conversation search or unnecessary handoff. | ACP model-switch cases restore MCP with advertised `session/load` before the first prompt; rejection/missing capability cannot submit model work. Real Hermes runs cover this repaired path. |
+| Deliver and reopen a reply | One terminal, no later events, public text event, matching metadata/status/session; archive equals the actual text stream or final-only fallback. | Shared live acceptance helpers with missing/duplicate/corrupt evidence controls, wired into smoke and quality runs. |
+| Decode native OpenClaw output | One Unicode reply from stdout or stderr; protocol envelope is absent from text/diagnostics; structured failure remains failure even with zero exit status. | Real-child cases split UTF-8 one byte at a time; native stderr diagnostics stay visible. |
+| Reject malformed or runaway native output | Nested look-alikes are not replies; malformed suffixes are scanned linearly; combined stdout/stderr above 8 MiB fails without partial JSON delivery. | Parser negative controls and a real child producing 10 MiB. |
+| Stop and recover | A running tool exits, its delayed write never occurs, cancellation or wall timeout is persisted once; native or fresh recovery follows the adapter capability. | Real lifecycle modes `cancel` / `wall` plus deterministic idle timeout, permission-denial, startup-abort and no-replay cases. The wall mode also requires authoritative `timeoutKind=wall`. Cancellation at ACP session readiness must not submit a prompt. |
+
+Native diagnostic cases also cover split UTF-8 and CRLF records, an unterminated
+last record before a protocol terminal, bounded overflow with recovery at the
+next newline, and capped JSON warning/error records. Known native severity,
+source and timestamp survive public redaction as optional `nativeLog` metadata;
+raw messages, credentials and paths do not gain another persistence channel.
+Unknown or oversized records still fail diagnostic acceptance. Existing event
+readers ignore the optional field and old events remain readable. Absolute
+timeout diagnostics must describe the effective inherited budget rather than
+claiming a fresh full allowance.
+
+Real CLI acceptance runs through Electron and verifies native dependencies before dispatch. Deterministic cases cover native warnings, errors, bounded host RPC evidence, and incomplete log coverage. A live run requires separate authorization and does not establish permission-dialog or other-platform behavior.
+
+Composer Stop also expires the stopped conversation's cached active turns as
+its event observers detach. Existing question-card logic then hides unanswered
+asynchronous questions without sending an answer; accepted answers awaiting a
+history-save retry retain their existing recovery path. Another conversation's
+turns and drafts remain untouched. The E2E case uses a deterministic Codex child
+and separately checks actual process exit, persisted cancellation, reload and a
+single later successful dispatch; this is UI/product wiring, not a real-binary
+or model-capability result.
+
+Native warnings remain a separate review result. Real permission UI, other-platform execution and provider/account outages require their owning environment checks. Do not infer those outcomes from a successful local deterministic run.
+
+### 主动问题发现记录
+
+- 失败恢复不能只测“重试成功”：Electron E2E 同时检查工具执行计数、resume session id
+  和持久化 terminal status，防止重启后重复有副作用的工具。
+- Hermes uses fresh ACP sessions with visible-history recovery. Test that recovery
+  independently from verbatim answer streaming/persistence and native thought-event
+  redaction; Markdown headings are not an output protocol.
+- CLI 上下文不能再用单个大模板逐轮重放。`context.test.ts` 与相关 Group Chat case
+  分别验证稳定指令、当前任务和恢复上下文三层：Claude/Codex 的 XML 项目目录协议走
+  原生 instruction channel，正常续接的 user turn 只含当前任务；只有新 session 或
+  resume 失败才携带最多 16 KiB 的该 CLI Agent 私有可见历史；私有历史为空时不得
+  回退到 Commander/canonical 对话。完整 User intent 模块、Agent
+  description 中的 For/Triggers、空 Runtime injection、当前日期和旧附件不得进入
+  普通 CLI turn。
+- 五种 CLI 的续接、指令通道、稳定指令生命周期、项目目录协议和 Orkas bridge 支持
+  必须在同一 capability registry 中声明。上下文编译器、Group Chat session 绑定、
+  coding CLI 判定和 bridge 注入都读取该声明，新增 CLI 缺少上下文语义时必须由
+  registry/context matrix 测试失败，不能回退到按名称散落判断。后端参数 case 必须
+  证明 Claude resume 仍携带 invocation-scoped append；Group Chat case 必须同时证明
+  user-message session 在 hash 命中时只发当前任务、稳定指令变化时 fresh bootstrap。
+- Registry discovery case 必须显式隔离受控搜索目录；不能让开发机已安装的
+  Codex/ChatGPT bundled CLI 与夹具竞争，否则“选择最新版本”的正确生产行为会让测试
+  随主机版本漂移。
+- 发现性能不能只断言实现文本。版本调度 case 使用可控 pending Promise 证明兼容探针
+  同时启动、优先探针先成功时不等待 fallback、优先探针失败/抛错时才接受 fallback；
+  `detectAll` 并发 case 使用真实临时 CLI 记录版本子进程次数，两个强制请求只能产生
+  四个单探针和一组 Hermes 双探针；路径优先 case 使用会记录调用的真实临时 CLI，
+  证明 `findAllInstalled` 能返回候选但不会启动任何版本子进程。
+- Renderer loading case 必须在 IPC Promise 未完成时分别断言：无缓存时标题无 loading、
+  菜单显示“识别中”且禁用；路径阶段返回后菜单立即显示并选中候选、标题显示“更新中”、
+  版本阶段仍未完成；有缓存时标题显示“更新中”、菜单立即选中缓存首项且可用，同一路径
+  的 CLI 在复核期间必须保留缓存版本号。失败反例断言旧结果不会被空数组覆盖，冷失败
+  不会成为缓存；版本不兼容反例必须从暂显列表移除。立即 resolve 两个阶段后再检查 DOM
+  无法证明用户等待期间的状态。
+- 公开事件边界不能只删除 thinking。反证 fixture 必须同时向 `process-info`、
+  `stderr-line`、`raw-line`、`log`、`done.error/stderrTail` 注入绝对路径、邮箱和
+  token，并对转发事件及 `events.jsonl` 两个出口做禁止断言。由此发现并修复了 cwd、
+  argv、完整命令及失败诊断会进入会话过程栏和持久化记录的问题；进程信息现在只公开
+  可执行文件 basename 与参数数量，诊断文本经过路径/凭据清理及长度限制。工具输入中的
+  cwd 内路径以相对路径参与产物归属；cwd 外绝对路径和任意深度的 `..` traversal 只保留
+  display-only 叶子名，既不能误认项目内同名文件，也不能越界进入 produced。分隔式
+  `--token value` / `--session-id value`、等号式凭据及 curl 的紧连 `-u...` / `-H...`
+  都必须在持久化前清理。超大 CLI 工具
+  结果仅同步 content-addressed opaque ref，绝对 Result Store 路径留在本机并由当前用户 IPC
+  解析，刷新或跨设备恢复不得把机器路径放进会话 JSONL/DOM。Codex 的
+  `summaryTextDelta`/`summaryPartAdded` 属于可展示的进度摘要：流式分片只更新活动状态，
+  每个 reasoning item 完成后只持久化一条有界、脱敏摘要；原始 `textDelta` 和 `item.text`
+  仍不得进入 Renderer、会话历史或运行归档。
+- CLI process copy is a Renderer-only projection over the existing persisted
+  events. Regression cases pair `use/result` by call id in an ephemeral display
+  context, distinguish Skill, Agent, and ordinary file resources, preserve
+  dynamic display names verbatim across all four locales, resolve both Bridge
+  ids and run-scoped `@skill/<read-ref>` entry/reference reads to the Skill
+  display name without persisting physical paths, preserve that target when a
+  historical completion only has its call id, and ensure unknown or malformed
+  refs never borrow another Skill's display name. Cases also reject raw paths,
+  JSON, stderr, unrelated model metadata, and tool output from process rows. A
+  structured model-reroute milestone may show bounded from/to model names. The
+  stored event shape, expandable full result, live expansion, and terminal auto-collapse
+  contracts remain unchanged. Codex pathless `patch_apply` rows stay hidden;
+  the existing `file-change.paths` event renders one completed “Edit file” row
+  with deduplicated file names. `append_file` is classified with the other file
+  edits instead of falling through to a raw tool-name action. In-process
+  `apply_patch` rows derive the same target from patch headers without persisting
+  additional display metadata.
+  Directory inspection uses a directory-specific action. The core event mapper
+  marks `list_files` only when its requested path resolves to the active run
+  root, allowing live and restored process rows to say “Current task workspace”
+  without exposing a generated `chat-YYYY-MM-DD-N` slug; real subdirectories
+  retain their own bounded names.
+  The coverage matrix also carries the original business target through
+  start/progress/result events, accepts snake/camel-case path and failure
+  fields, and covers common Claude/OpenCode/ACP aliases for notebooks, plans,
+  Agents, web fetches, commands, generated media, Office/PDF files, and MCP
+  connectors. Commands enter the concise row only as a bounded safe summary:
+  secret assignments/flags, credentials, absolute paths, and multiline bodies
+  are removed while useful executable names and workspace-relative targets stay
+  visible. Failed tool rows may add one bounded summary after applying the same
+  redaction. Raw background diagnostics remain hidden; localized actions,
+  dynamic names, bounded filenames, and terminal success/failure are displayed.
+  Connector actions include the bounded operation name; retry, background-task,
+  lifecycle-error, and general-error rows retain one sanitized summary; completed
+  tools retain their per-call duration (an exact supplied duration takes priority,
+  otherwise the latest elapsed milestone is preserved); conversation organization
+  retains before/after token counts. The same sanitizer continues
+  to redact credentials, absolute paths, and multiline bodies from these details.
+  Web reads retain the full sanitized URL rather than collapsing every page to
+  a hostname. File searches retain both the query and relative scope; Skill
+  runs retain the script name; connector calls retain service, operation, and
+  one safe URL/query/path target. Start/progress/result events with the same call
+  id update one row in both live and restored history views, and a late replayed
+  progress event cannot regress a terminal row. Live Group Chat completions also
+  treat an unchanged row count as a successful keyed update: parallel tools may
+  finish out of start order, but each keeps exactly one target-bearing row with
+  its own terminal status and duration, without a targetless fallback duplicate.
+  Live, direct-stream, and restored-history entry points consume one row
+  projection for text, kind, call identity, terminal state, duration, and result
+  metadata. At-least-once terminal replay retains the completed presentation
+  instead of erasing its target or timing, and a post-append UI failure is logged
+  without an unkeyed second append.
+- OpenCode 真实 `--format json` 输出可能只给 completed tool snapshot，不先给 pending/use。
+  对这种 result-only 事件，adapter 必须保留白名单化的命令或文件目标和耗时，不得保留
+  写入内容；Group Chat 仍要识别写入产物，Renderer 的实时与恢复视图都要显示脱敏后的
+  命令摘要或叶子文件名，并能展开有界结果。连续重复的无目标 `step_start` 只能保留一个
+  活动态，不能把真正的工具动作淹没。命令中的凭据、多行正文和绝对路径仍不得公开。
+- OpenCode 不能只依赖子进程的 OS cwd。真实 1.18.x CLI 会优先读取继承的 `PWD`；若它
+  与 spawn cwd 不一致，任务会静默写入旧目录。命令构造必须过滤 custom args 中拆分或
+  等号形式的旧 `--dir`，只传一个宿主选择的绝对目录；spawn 环境同步 `PWD`，并由测试
+  分别固定参数唯一性、环境值及 result-only 协议形状。
+- ACP 不能只测解析函数：真实 NDJSON 子进程在 initialize acknowledgement 后只给
+  100 ms 接收 `session/new`，由此发现固定 250 ms fallback 会让快速服务端先行退出。
+  后端现在收到初始化确认即发送且保持 one-shot，timer 只用于兼容不回确认的旧实现。
+- Codex 不能只测事件 fixture：真实 JSON-RPC 子进程分别覆盖过期 resume 降级、稳定
+  指令恢复、有界上下文、最终答案/usage，以及 initialize 拒绝后仍保持 event loop 的
+  对抗场景。后者发现任务虽已报失败但后台 Codex 进程未退出；协议失败现在终止整个
+  子进程组。
+- CLI 状态/模型命令可能夹带 banner、插件日志或账号配置文本。运行选项解析反例同时
+  注入 banner、伪 Authorization 行和无关状态，要求 IPC 结果只包含受限长度的模型 ID、
+  标签、默认标记与思考枚举；不得把原始 stdout/stderr、路径、凭据或 provider 错误传给
+  Renderer。fake CLI 还必须覆盖重复探测只命中一次缓存，以及超过输出上限时终止探测、
+  返回可操作的 partial 结果且不泄露超量内容。未设置覆盖值时，参数和 E2E case 必须证明
+  下一轮调用不再携带覆盖参数、继续使用 CLI 默认值。
 
 ### 模型 benchmark 场景
 
@@ -133,12 +300,9 @@ npm run benchmark:local-agents -- --agents codex --k 1 --no-save
 
 - `npm run test:local-agents:prepare -- --agents codex,claude`：准备并检查指定 CLI，不发起模型请求。
 - `npm run test:local-agents:live -- --agents codex,claude --no-install`：使用生产注册表和 runner 各执行一次固定输出请求，但不安装缺失 CLI。
-- `npm run benchmark:local-agents -- --agents codex,claude --no-save`：使用已安装 CLI
-  运行默认 `pass@2` 模型质量场景；该命令固定包含 `--no-install`。
-- 两个命令默认都会准备全部五种 CLI，并自动安装缺失项；npm-backed CLI 使用 `@latest`，Hermes 会下载并执行官方在线安装脚本。该流程需要联网，可能执行第三方安装生命周期脚本，只能在明确接受供应链和磁盘占用影响的测试环境运行。
+- `npm run test:local-agents:lifecycle -- --agents claude,codex,opencode,hermes,openclaw`: runs installed CLIs through the production registry/runner in isolated workspaces. All modes observe and cancel a live foreground tool, check process exit and absence of delayed writes, then verify usable, persisted recovery. Claude/Codex/OpenCode reuse the native session and recover a removed-file key without tools; Hermes must use a new session and actually read a new recovery file; OpenClaw establishes a known session before cancellation and reuses its ID, with buffered output labeled explicitly. Each CLI uses two host dispatches, or three for OpenClaw, under the live runner's 180-second per-dispatch deadline. `EVAL_MODEL` optionally pins a native model ID for the selected CLI. This checks the runner boundary, not Renderer Stop-button wiring, approval UI, timeout recovery or application shutdown. Native diagnostics and redacted checks are saved under `test-results/local-agents/`.
+- 未指定 `--agents` 时会准备全部五种 CLI，并安装缺失项；npm-backed CLI 使用 `@latest`，Hermes 会下载并执行官方在线安装脚本。该流程需要联网，可能执行第三方安装生命周期脚本，只能在明确接受供应链和磁盘占用影响的测试环境运行。
 - live 模式会使用测试机器上已有的 CLI 认证和默认模型，可能消耗 API 配额或产生费用。脚本不会写入凭证，但运行前仍需确认测试账号、权限和费用边界；不得将终端中的令牌、完整路径或模型输出粘贴进测试夹具和提交记录。
-- benchmark 同样使用既有认证和额度；scorecard 仅含场景、客观检查、耗时、状态与输出
-  SHA-256，不持久化原始提示、回复、文件内容或绝对路径。
 - 仅验证已安装 CLI 时始终传入 `--no-install`。测试管理的安装位于 `node_modules/.orkas-local-agent-live`，临时工作区会在进程结束时清理。
 - `node test/manual/probe-cli-background-runs.cjs`：对已安装的 claude CLI 实测后台任务协议的六条事实（result 后驻留、任务完成自动触发后续 turn、后续 turn 独立 usage、驻留期注入开新 turn、interrupt 控制记录被接受、stdin 关闭即退出且清理仍在运行的后台任务）。第六项由独立 cleanup probe 等待超过后台命令的 sleep 时间并断言 proof 文件未出现，不以退出延迟代替副作用证据。CLI 升级后跑一次即可确认协议未漂移；不通过时按 `docs/plans/cli-background-runs.md` §9 走能力降级。默认约 90 秒，共启动两个 CLI 进程、产生四个真实 Claude turn，按所选 provider/model 的当前价格计费；基线记录在该文档 §2.1。
 
@@ -155,12 +319,19 @@ npm run benchmark:local-agents -- --agents codex --k 1 --no-save
 3. 修改 PATH 或 CLI 配置后刷新，本地 Agent 列表应同步更新，不需要重启应用。
 4. macOS 同时安装旧版 standalone Codex 与较新版 ChatGPT/Codex 内置 CLI 时，自动发现必须选择语义版本最高者；设置 `ORKAS_CODEX_PATH` 后则必须严格使用显式路径。
 5. 准备一个同时挂起 `version` 与 `--version` 的 Hermes 路径：两个兼容探针必须并发且
-   整轮发现约 3 秒结束，不能串行累计到 6–10 秒；创建页和详情页同时请求时只允许一轮
+   使用生产 15 秒探针期限，整轮发现不能串行累计到约 30 秒；创建页和详情页同时请求时只允许一轮
    主进程发现。
 6. 取消共享创建弹窗时，普通“创建”页签不得产生外接 CLI 取消埋点；切换至“外接”页签
    后点击取消必须立即上报三态字段 `has_local_cli`：没有缓存且识别未完成为 `detecting`，
    缓存结果无可用 CLI 为 `none`，存在可用 CLI 为 `available`。后台更新期间沿用缓存状态，
    不能把“尚未识别”误报成 `none`，也不能等待识别完成才上报。
+7. Hermes 启动候选故障按两类分别归因：先记录系统、Orkas/Hermes 版本、安装方式、
+   `version`/`--version` 输出与耗时、多个安装及 `ORKAS_HERMES_PATH`；再用真实
+   `hermes acp` 发送当前 `initialize` 请求，必须收到匹配 id 的成功响应才算基础握手通过。
+   UI 需另验“AI 团队 → 连接智能体”的识别、直接 @Hermes 的无工具 OK 回复、失败可见、
+   重开保留和修复后的单次重试。仅终端握手或合成故障通过不能关闭历史真实 CLI 样本；
+   原环境先测，升级/配置变化后的结果单独记录。真实模型调用使用隔离原生配置和已授权
+   Codex 登录，避免复制可轮换刷新凭据或改写日常 CLI 状态。
 
 ## 真实运行
 
@@ -274,12 +445,7 @@ parser 或 fake E2E 描述成真实模型验证。
    隐藏 dispatch、过程信息、内部 `model_text` 和之后并发写入的消息均不可返回。
    自包含任务不查询；“继续/上面/之前/刚才/你处理下”等未解析指代应在追问用户前优先
    查询当前对话。返回内容始终按可能过期的引用数据处理，不构成新指令或授权。
-8. 可选真实模型质量回归 `local-agent-current-history-reference` 仅适用于支持 Orkas
-   Bridge 的 Claude/Codex。Case 在 canonical 当前对话中预置发布代号和日期，再追加
-   32 条无关记录；触发消息本身不包含可搜索关键词或答案。验收必须看到先读取当前
-   默认 10 条的末页、再用 `page.mode=before` 以每页 10 条向前翻页（共 2–4 次
-   `chat_history` read action）、零次 search action 和两项精确事实；单纯猜中输出、重复读取末页、低信号关键词搜索或
-   要求用户重述均失败。
+8. The optional `local-agent-current-history-reference` real-model regression covers all five CLI adapters with Orkas Bridge. It seeds two facts followed by 32 unrelated canonical records; the triggering message and workspace contain neither answers nor useful search keywords. Acceptance requires the latest page followed by older current-history pages, 2–4 successful reads, zero searches and both exact facts. Page sizes use the supported 1–30 range. OpenCode completed-only events may prove paging through the host's structured envelope and decreasing ranges when native public inputs omit selectors. Duplicate events count once; nested quoted envelopes, repeated latest pages, guessed answers and requests to repeat retrievable context fail. Native tool failures remain visible separately from recovered outcomes.
 
 ## Windows 专项
 

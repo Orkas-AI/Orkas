@@ -2325,6 +2325,13 @@ describe('skills › buildSkillEditSystemPrompt', () => {
     expect(sys).toContain('a demo');
     expect(sys).toContain('alpha');     // shows up in skill_dir (dir name == id)
     expect(sys).toContain('SKILL.md');  // file listing includes SKILL.md
+    expect(sys).toContain('This session is bound to the skill in Runtime injection');
+    expect(sys).toContain('<skill-reply>...</skill-reply>');
+    expect(sys).toContain('<skill-as-package name="<installed-name>"/>');
+    expect(sys).not.toMatch(/\bModes? [ABC]|How to work with the user|Dependency installs/i);
+    expect(sys).toContain('a current explicit request about reply language');
+    expect(sys).toContain('Agent and Skill descriptions instead follow the description-language rules in their owning creator Skill');
+    expect(sys.indexOf('## User language')).toBeGreaterThan(sys.indexOf('## Runtime injection'));
     // Template no longer carries the user-input footer.
     expect(sys).not.toMatch(/##\s*用户的初始请求/);
     // All placeholders resolved.

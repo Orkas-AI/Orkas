@@ -14,7 +14,7 @@ const SHARED_PROMPT = path.join(
 );
 
 // Output-format selection remains in the role-specific presentation hint;
-// this resident surface owns only the baseline and the dashboard grammar.
+// these fragments own the baseline and the conditionally loaded rich grammar.
 // The margin permits small clarity fixes without restoring the removed full
 // dashboard example or a second format-selection decision tree.
 const OUTPUT_PRESENTATION_CEILING = 1_900;
@@ -23,7 +23,7 @@ function outputPresentationSurface(): string {
   const body = fs.readFileSync(SHARED_PROMPT, 'utf8');
   const start = body.indexOf('## Output formats');
   expect(start, 'shared output-format heading must remain present').toBeGreaterThanOrEqual(0);
-  return body.slice(start);
+  return body.slice(start) + fs.readFileSync(path.join(path.dirname(SHARED_PROMPT), 'chat_rich_output_rules.md'), 'utf8');
 }
 
 describe('shared output-presentation prompt surface', () => {

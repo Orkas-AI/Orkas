@@ -10,6 +10,8 @@ function mount({ cached = true, collapsed = false, previous = '' } = {}) {
   const nodes = new Map<string, any>();
   const deferred: Array<() => void> = [];
   const featureLoads: Array<() => void> = [];
+  const ready: Array<() => void> = [];
+  const pushes = new Map<string, (payload: any) => Promise<void>>();
   const projects = ['alpha', 'beta'].map(project_id => ({ project_id, name: project_id }));
   const node = () => ({
     innerHTML: '', textContent: '', hidden: false, dataset: {} as Record<string, string>,
@@ -40,18 +42,18 @@ function mount({ cached = true, collapsed = false, previous = '' } = {}) {
   };
   const loadProjectDetail = vi.fn();
   const context: any = {
-    currentView: 'settings', currentCid: null, conversations: [], _projectDetailPid: previous,
+    currentView: 'settings', currentCid: null, conversations: [], _projectDetailPid: previous, currentUserId: 'rename-user',
     _composerNavigationEpoch: 0, composerBindOwner() {}, _saveLastView() {},
     _bootLog: { info() {}, warn() {} }, createLogger: () => ({ info() {}, warn() {} }),
     _clearLazyFeatureError() {}, _showLazyFeatureError() {},
     setTimeout: () => 0, clearTimeout() {}, performance, t: String, escapeHtml: String,
     localStorage: { getItem: () => null, setItem() {} },
     document: {
-      addEventListener() {}, getElementById: (id: string) => nodes.get(id) || null,
+      addEventListener(name: string, run: () => void) { if (name === 'DOMContentLoaded') ready.push(run); }, getElementById: (id: string) => nodes.get(id) || null,
       querySelector: () => null, querySelectorAll: () => [],
     },
     addEventListener() {},
-    orkas: { invoke: vi.fn(async () => ({ ok: true, projects })) },
+    orkas: { invoke: vi.fn(async () => ({ ok: true, projects })), onPushEvent: (name: string, run: any) => pushes.set(name, run) },
     _deferSidebarNavWork: (_key: string, run: () => void) => deferred.push(run),
     loadRendererFeature: () => new Promise<void>(resolve => featureLoads.push(resolve)),
     loadProjectDetail,
@@ -65,7 +67,8 @@ function mount({ cached = true, collapsed = false, previous = '' } = {}) {
   if (cached) vm.runInContext(`_projectsCache = ${JSON.stringify(projects)}`, context);
   const selected = () => [...list.innerHTML.matchAll(/class="project-row active" data-pid="([^"]+)"/g)]
     .map(match => match[1]);
-  return { context, nodes, projects, list, toggle, scrolled, selected, deferred, featureLoads, loadProjectDetail };
+  ready[0]();
+  return { context, pushes, nodes, projects, list, toggle, scrolled, selected, deferred, featureLoads, loadProjectDetail };
 }
 
 describe('project navigation follows the destination in the sidebar', () => {
@@ -137,6 +140,26 @@ describe('project navigation follows the destination in the sidebar', () => {
   });
 
 
+  it('reflects a host rename in the sidebar and open title without replacing drafts or accepting another account event', async () => {
+    const h = mount({ previous: 'alpha' });
+    h.context._projectDetailMeta = { project: { project_id: 'alpha', name: 'alpha' }, draft: 'Keep editing' };
+    const draft = { value: 'Unsubmitted title', selectionStart: 3 };
+    h.nodes.set('project-detail-title-input', draft);
+    h.nodes.get('project-detail-content').innerHTML = 'Unsaved workspace';
+    h.projects[0].name = 'Release readiness';
+    expect(h.pushes.has('projects:renamed')).toBe(true);
+    await h.pushes.get('projects:renamed')!({ userId: 'rename-user', projectId: 'alpha', name: 'Release readiness' });
+    expect(h.list.innerHTML).toContain('Release readiness');
+    expect(h.nodes.get('project-detail-title').textContent).toBe('Release readiness');
+    expect(h.context._projectDetailMeta.project.name).toBe('Release readiness');
+    expect(h.context._projectDetailMeta.draft).toBe('Keep editing');
+    expect(h.nodes.get('project-detail-content').innerHTML).toBe('Unsaved workspace');
+    expect(draft).toEqual({ value: 'Unsubmitted title', selectionStart: 3 });
+    h.context.orkas.invoke.mockClear();
+    await h.pushes.get('projects:renamed')!({ userId: 'other-user', projectId: 'alpha', name: 'Foreign name' });
+    expect(h.context.orkas.invoke).not.toHaveBeenCalled();
+    expect(h.nodes.get('project-detail-title').textContent).toBe('Release readiness');
+  });
   it.each(['', 'alpha'])('selects and reveals the target before detail loading, with previous detail %j', previous => {
     const h = mount({ previous, collapsed: true });
     h.context.setView('project', 'beta');

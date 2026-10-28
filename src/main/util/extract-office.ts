@@ -301,7 +301,7 @@ export function xlsxBufferToMarkdown(buf: Buffer): string {
 export function xlsxBufferToHtml(buf: Buffer): string {
   const sheets = parseSpreadsheetSheets(buf);
   return sheets.map((sheet) => {
-    const maxCols = Math.max(0, ...sheet.rows.map((row) => row.length));
+    const maxCols = sheet.rows.reduce((max, row) => Math.max(max, row.length), 0);
     const rows = sheet.rows.map((row) => (
       `<tr>${Array.from({ length: maxCols }, (_unused, i) => `<td>${escapeHtml(row[i] || '')}</td>`).join('')}</tr>`
     )).join('');

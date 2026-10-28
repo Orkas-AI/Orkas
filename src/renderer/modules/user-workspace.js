@@ -156,6 +156,12 @@ async function _selectAndSetWorkspace(target, dirPath) {
     if (!selectedPath) {
       const dirResult = await window.orkas.invoke('workspace.selectDirectory', {});
       if (!dirResult || dirResult.ok === false) {
+        _wsLog.warn('workspace change failed', {
+          action: 'select',
+          surface: target === 'new-chat' ? 'new_chat'
+            : (target === 'conversation' || target === 'project' ? target : 'unknown'),
+          error_code: 'picker_failed',
+        });
         _showWorkspaceSetFailure(t('workspace.set_failed'));
         return;
       }

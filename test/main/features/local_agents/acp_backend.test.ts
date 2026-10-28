@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 import { makeAcpBackend } from '../../../../src/main/features/local_agents/backends/_acp';
 import { killProcessTree } from '../../../../src/main/features/local_agents/backends/base';
@@ -11,6 +14,107 @@ function isAlive(pid: number): boolean {
 }
 
 describe('local_agents/backends/_acp process lifecycle', () => {
+  it.skipIf(process.platform === 'win32').each(['abort', 'timeout'] as const)(
+    'sends native ACP cancellation before reaping a detached foreground tool on %s', async mode => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-acp-native-cancel-'));
+      const controller = new AbortController();
+      // This case expires an executing foreground tool, not CLI startup. Keep
+      // the original 500ms wall cap, advancing only after the real tool event.
+      let wallNow = Date.now();
+      const wallClock = mode === 'timeout' ? vi.spyOn(Date, 'now').mockImplementation(() => wallNow) : undefined;
+      let foregroundStarted = false;
+      const fixture = String.raw`
+        const fs = require('node:fs');
+        const { spawn } = require('node:child_process');
+        const send = m => process.stdout.write(JSON.stringify(m) + '\n');
+        let child, promptId;
+        require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+          const m = JSON.parse(line);
+          if (m.method === 'initialize') send({ id: m.id, result: { protocolVersion: 1 } });
+          if (m.method === 'session/new') setTimeout(() => send({ id: m.id, result: { sessionId: 'fixture-session' } }), ${mode === 'timeout' ? 700 : 0});
+          if (m.method === 'session/prompt') {
+            promptId = m.id;
+            child = spawn(process.execPath, ['-e', "setTimeout(() => require('node:fs').writeFileSync('late-effect', 'survived'), 1500)"], { detached: true, stdio: 'ignore' });
+            fs.writeFileSync('child-pid', String(child.pid));
+            send({ method: 'session/update', params: { update: { sessionUpdate: 'tool_call', title: 'terminal', toolCallId: 'foreground', rawInput: {} } } });
+          }
+          if (m.method === 'session/cancel') {
+            fs.appendFileSync('native-cancel', JSON.stringify(m) + '\n');
+            try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+            send({ id: promptId, result: { stopReason: 'cancelled' } });
+          }
+        });
+      `;
+      const events: any[] = [];
+      let pid = 0;
+      try {
+        await makeAcpBackend({ logName: 'local-agents:test-acp', argv: ['-e', fixture], clientName: 'orkas-test' }).run({
+          binPath: TEST_NODE, cwd: root, prompt: 'Run the foreground command', signal: controller.signal,
+          timeoutMs: mode === 'timeout' ? 500 : 5000,
+          onEvent: event => {
+            events.push(event);
+            if (event.type === 'process-info') pid = Number(event.pid);
+            if (event.type === 'tool-event') {
+              foregroundStarted = fs.existsSync(path.join(root, 'child-pid'));
+              if (mode === 'abort') controller.abort();
+              else if (foregroundStarted) wallNow += 500;
+            }
+          },
+        });
+        await new Promise(resolve => setTimeout(resolve, 1700));
+        const cancellations = fs.existsSync(path.join(root, 'native-cancel'))
+          ? fs.readFileSync(path.join(root, 'native-cancel'), 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
+        expect(foregroundStarted, 'the native foreground tool must start before expiry').toBe(true);
+        expect(cancellations).toEqual([{ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: 'fixture-session' } }]);
+        expect(fs.existsSync(path.join(root, 'late-effect'))).toBe(false);
+        expect(events.filter(e => e.type === 'done')).toHaveLength(1);
+        expect(events.at(-1)).toMatchObject({ status: mode === 'abort' ? 'cancelled' : 'timeout' });
+      } finally {
+        wallClock?.mockRestore();
+        const child = Number(fs.existsSync(path.join(root, 'child-pid')) && fs.readFileSync(path.join(root, 'child-pid'), 'utf8'));
+        if (child && isAlive(child)) { try { process.kill(-child, 'SIGKILL'); } catch {} }
+        if (pid && isAlive(pid)) killProcessTree({ pid, kill: signal => process.kill(pid, signal) }, 'SIGKILL');
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === 'win32')('reaps a session-start timeout without a session or a native cancellation', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-acp-before-session-'));
+    let wallNow = Date.now();
+    const wallClock = vi.spyOn(Date, 'now').mockImplementation(() => wallNow);
+    const events: any[] = [];
+    let pid = 0;
+    const fixture = String.raw`
+      const fs = require('node:fs');
+      const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+      require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+        const message = JSON.parse(line);
+        if (message.method === 'initialize') send({ id: message.id, result: { protocolVersion: 1 } });
+        if (message.method === 'session/new') fs.writeFileSync('session-requested', 'ready');
+        if (message.method === 'session/prompt' || message.method === 'session/cancel') fs.writeFileSync('unexpected-session-call', 'called');
+      });
+    `;
+    try {
+      const running = makeAcpBackend({ logName: 'local-agents:test-acp', argv: ['-e', fixture], clientName: 'orkas-test' }).run({
+        binPath: TEST_NODE, cwd: root, prompt: 'Wait for session readiness', signal: new AbortController().signal,
+        timeoutMs: 500,
+        onEvent: event => { events.push(event); if (event.type === 'process-info') pid = Number(event.pid); },
+      });
+      await vi.waitFor(() => expect(fs.existsSync(path.join(root, 'session-requested'))).toBe(true));
+      wallNow += 500;
+      await running;
+      expect(events.some(event => event.type === 'tool-event')).toBe(false);
+      expect(fs.existsSync(path.join(root, 'unexpected-session-call'))).toBe(false);
+      expect(events.filter(event => event.type === 'done')).toEqual([expect.objectContaining({ status: 'timeout', timeoutKind: 'wall', sessionId: undefined })]);
+      expect(isAlive(pid)).toBe(false);
+    } finally {
+      wallClock.mockRestore();
+      if (pid && isAlive(pid)) killProcessTree({ pid, kill: signal => process.kill(pid, signal) }, 'SIGKILL');
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     { mode: 'success', status: 'completed', output: 'ACP result' },
     { mode: 'empty', status: 'completed', output: '' },
@@ -74,16 +178,20 @@ describe('local_agents/backends/_acp process lifecycle', () => {
     const requestPermission = vi.fn(() => mode === 'approval-stall'
       ? new Promise<'deny'>(() => {}) : Promise.resolve('deny' as const));
     let lastActivity = Date.now();
+    let executionStarted = false;
     let pid = 0;
     let descendantPid = 0;
     try {
       await makeAcpBackend({ logName: 'local-agents:test-acp', argv: ['-e', fixture], clientName: 'orkas-test' }).run({
         binPath: TEST_NODE, cwd: process.cwd(), prompt: 'Return a result',
         signal: controller.signal, requestPermission, permissionPolicy: 'ask',
-        timeoutMs: 5_000, idleKillMs: 500, lastEventAt: () => lastActivity,
+        // These cases exercise silence after prompt execution, not host CPU
+        // scheduling during cold child startup. The wall clock bounds setup.
+        timeoutMs: 5_000, idleKillMs: 500, lastEventAt: () => executionStarted ? lastActivity : Date.now(),
         onEvent: event => {
           events.push(event);
           lastActivity = Date.now();
+          if (event.type === 'text-delta' || event.type === 'tool-event') executionStarted = true;
           if (event.type === 'process-info') pid = Number(event.pid);
           if (event.type === 'raw-line') descendantPid = Number(String(event.line).split(':')[1]);
           if (mode === 'cancel' && event.type === 'text-delta') controller.abort();
@@ -715,6 +823,50 @@ describe('local_agents/backends/_acp process lifecycle', () => {
       status: 'completed',
       output: 'API call failed after 3 retries: HTTP 404: 404 Not found. Check the docs for available routes.',
     });
+  });
+});
+
+describe('ACP model selection preserves the fresh-session tool surface', () => {
+  it.each(['supported', 'missing-capability', 'rejected-reload'])('preserves MCP tools or fails before model execution: %s', async mode => {
+    const fixture = String.raw`
+const send = value => process.stdout.write(JSON.stringify(value)+'\n');let attached=false,selected=false;const mode=process.argv[1];
+require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
+ const m=JSON.parse(line);
+ if(m.method==='initialize')send({id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:mode!=='missing-capability'}}});
+ if(m.method==='session/new'){attached=m.params.mcpServers.length===1;send({id:m.id,result:{sessionId:'model-tools'}});}
+ if(m.method==='session/set_model'){selected=true;attached=false;send({id:m.id,result:{}});}
+ if(m.method==='session/load'){attached=m.params.sessionId==='model-tools'&&m.params.mcpServers[0]?.name==='orkas';send(mode==='rejected-reload'?{id:m.id,error:{code:-32000,message:'Reload unavailable'}}:{id:m.id,result:{}});}
+ if(m.method==='session/prompt'){process.stderr.write('PROMPT_SUBMITTED\n');send({id:m.id,...(selected&&attached?{result:{stopReason:'end_turn'}}:{error:{code:-32000,message:'Native model switch lost the MCP surface'}})});}
+});`;
+    const events:any[]=[];
+    await makeAcpBackend({logName:'local-agents:test-model-tools',argv:['-e',fixture,mode],clientName:'fixture',refreshMcpAfterModelSelection:true}).run({
+      binPath:TEST_NODE,cwd:process.cwd(),prompt:'Use the configured tools',modelOverride:'selected-model',
+      bridge:{mcpConfigPath:'unused',server:{command:TEST_NODE,args:[],env:{}}},signal:new AbortController().signal,
+      timeoutMs:5000,onEvent:event=>events.push(event),
+    });
+    expect(events.at(-1)).toMatchObject({type:'done',status:mode==='supported'?'completed':'failed'});
+    expect(events.filter(event=>event.type==='stderr-line'&&event.line==='PROMPT_SUBMITTED')).toHaveLength(mode==='supported'?1:0);
+    expect(events.filter(event=>event.type==='done')).toHaveLength(1);
+  });
+
+  it('does not submit a model prompt after cancellation at session readiness', async () => {
+    const root=fs.mkdtempSync(path.join(os.tmpdir(),'orkas-acp-preprompt-cancel-'));
+    const controller=new AbortController();const events:any[]=[];
+    const fixture=String.raw`
+const fs=require('node:fs');const send=m=>process.stdout.write(JSON.stringify(m)+'\n');
+require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+ if(m.method==='initialize')send({id:m.id,result:{protocolVersion:1}});
+ if(m.method==='session/new')send({id:m.id,result:{sessionId:'cancel-before-model'}});
+ if(m.method==='session/prompt')fs.writeFileSync('unexpected-model-request','submitted');
+});`;
+    try{
+      await makeAcpBackend({logName:'local-agents:test-preprompt',argv:['-e',fixture],clientName:'fixture'}).run({
+        binPath:TEST_NODE,cwd:root,prompt:'Do not start after cancellation',signal:controller.signal,timeoutMs:5000,
+        onEvent:event=>{events.push(event);if(event.type==='status'&&event.status==='session_ready')controller.abort();},
+      });
+      expect(fs.existsSync(path.join(root,'unexpected-model-request'))).toBe(false);
+      expect(events.at(-1)).toMatchObject({type:'done',status:'cancelled'});
+    }finally{fs.rmSync(root,{recursive:true,force:true});}
   });
 });
 

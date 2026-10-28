@@ -465,6 +465,34 @@ describe('core-agent client skill sandbox env', () => {
     });
   });
 
+  it('keeps user-cancelled tools out of returned-error and recovery diagnostics', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const stats = client.createModelRunLogDiagnostics(1000);
+
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start', id: 'cancelled-read', name: 'read_file', input: { path: 'one.txt' },
+    }, 1010);
+    // The real core runner marks its abort receipt as an error for the tool
+    // protocol and separately supplies this authoritative lifecycle fact.
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'cancelled-read', name: 'read_file', isError: true,
+      executionCancelled: true, result: 'Tool execution aborted: Run aborted',
+    }, 1020);
+    expect(client.summarizeModelRunForLog(stats, 1021)).toMatchObject({
+      toolResultErrors: 0, toolResultErrorsRecovered: 0, toolResultErrorsUnresolved: 0,
+    });
+
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start', id: 'later-read', name: 'read_file', input: { path: 'two.txt' },
+    }, 1030);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'later-read', name: 'read_file', isError: false, result: 'file contents',
+    }, 1040);
+    expect(client.summarizeModelRunForLog(stats, 1050)).toMatchObject({
+      toolResultErrors: 0, toolResultErrorsRecovered: 0, toolResultErrorsUnresolved: 0,
+    });
+  });
+
   it('recovers an invalid selector-less call only from a later retry with the same argument shape', async () => {
     const client = await import('../../../../src/main/model/core-agent/client');
     const stats = client.createModelRunLogDiagnostics(1000);

@@ -68,6 +68,34 @@ describe('search/storage › loadIndex', () => {
     expect(idx.docs).toEqual({});
   });
 
+  it.each([
+    ['files', []], ['files', 'invalid'], ['files', 42],
+    ['docs', []], ['docs', 'invalid'], ['docs', 42],
+    ['postings', []], ['postings', 'invalid'], ['postings', 42],
+    ['files', { 'needle.md': null }],
+    ['files', { 'needle.md': { mtime: 'invalid', size: 1 } }],
+    ['docs', { needle: null }],
+    ['docs', { needle: { kind: 'context', fileKey: 'needle.md', len: 'invalid' } }],
+    ['postings', { needle: 'invalid' }],
+    ['postings', { needle: [[null, 1]] }],
+    ['postings', { needle: [['needle', null]] }],
+    ['postings', { needle: [['needle', -1]] }],
+  ])('rebuilds a same-version snapshot with malformed %s data (%j)', async (field, malformed) => {
+    const file = path.join(tmpDir, 'malformed-shape.json');
+    const stored = {
+      version: SCHEMA_VERSION, kind: 'context',
+      files: { 'needle.md': { mtime: 1, size: 1 } },
+      docs: { needle: { kind: 'context', fileKey: 'needle.md', len: 1 } },
+      postings: { needle: [['needle', 1]] },
+      [String(field)]: malformed,
+    };
+    const bytes = JSON.stringify(stored);
+    fs.writeFileSync(file, bytes);
+    expect(await loadIndex(file, 'context')).toEqual(emptyIndex('context'));
+    // Validation itself does not delete or rewrite the failed snapshot.
+    expect(fs.readFileSync(file, 'utf8')).toBe(bytes);
+  });
+
   it('loads valid index intact and back-fills missing sub-bags', async () => {
     const p = path.join(tmpDir, 'good.json');
     const stored = {

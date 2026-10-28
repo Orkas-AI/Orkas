@@ -22,6 +22,8 @@ function harness(invoke: ReturnType<typeof vi.fn>) {
     document: { getElementById: () => host },
     currentCid: 'main_chat',
     _chatAttachments: new Map(),
+    _chatAttachmentSelectionSequence: 0,
+    _chatAttachOrderKey: () => '',
     _chatAttachmentOperations: new Map(),
     _chatAttachmentSendLocks: new Set(),
     _chatAttachmentRevisions: new Map(),
@@ -72,6 +74,18 @@ function harness(invoke: ReturnType<typeof vi.fn>) {
 const imported = { ok: true, info: { name: 'note.md', kind: 'text', bytes: 4, mtime: 1 } };
 
 describe('Library attachment draft lifecycle', () => {
+  it('keeps consecutive Library selections in user order when the first import finishes last', async () => {
+    let release!: (value: typeof imported) => void;
+    const invoke = vi.fn().mockImplementationOnce(() => new Promise(resolve => { release = resolve; }))
+      .mockResolvedValueOnce({ ...imported, info: { ...imported.info, name: 'a-second.md' } });
+    const fixture = harness(invoke);
+    const first = fixture.attach();
+    await fixture.attach();
+    release({ ...imported, info: { ...imported.info, name: 'z-first.md' } });
+    await first;
+    expect(fixture.names()).toEqual(['z-first.md', 'a-second.md']);
+  });
+
   it.each(['sequential', 'concurrent'])(
     'renders one removable attachment when repeated Library selections are %s',
     async (mode) => {

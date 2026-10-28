@@ -8,8 +8,10 @@
  * signatures, repository-relative test files and test names.
  */
 import { relative } from 'node:path';
+import { writeFileSync } from 'node:fs';
 import type { Reporter, TestModule } from 'vitest/node';
 import type { TestLogScopeSummary, TestLogSignature } from './helpers/test-log-analysis';
+import { combineStderrReceipts } from '../scripts/test-stderr-receipt.mjs';
 
 /** Task-meta key shared with the worker tap; this module must not load Vitest's runtime. */
 export const TEST_LOG_META_KEY = 'orkasLogAnalysis';
@@ -117,14 +119,45 @@ export function formatTestLogSummary(summary: TestLogRunSummary): string {
 
 export class TestLogAnalysisReporter implements Reporter {
   private root = process.cwd();
+  private inventory: string[] = [];
 
   onInit(vitest: { config: { root: string } }): void {
     this.root = vitest.config.root;
   }
 
-  onTestRunEnd(modules: readonly TestModule[]): void {
+  onTestRunStart(): void {
+    this.inventory = [];
+  }
+
+  onTestModuleQueued(module: TestModule): void {
+    // onTestRunStart receives the pre-shard inventory in Vitest 4. Queue events
+    // identify the selected shard, including files that fail during collection.
+    this.inventory.push(relative(this.root, module.moduleId).replace(/\\/g, '/'));
+  }
+
+  onTestRunEnd(modules: readonly TestModule[], errors: readonly unknown[] = [], reason = 'passed'): void {
     const summary = summarizeTestLogs(modules, this.root);
     process.stdout.write(formatTestLogSummary(summary));
     if (summary.status === 'FAIL') process.exitCode = 1;
+    if (process.env.ORKAS_TEST_BATCH_REPORT) {
+      const files = modules.map(module => {
+        const counts = { passed: 0, failed: 0, skipped: 0 };
+        for (const test of module.children.allTests()) {
+          const state = test.result().state;
+          if (state in counts) counts[state as keyof typeof counts] += 1;
+        }
+        const diagnostic = module.diagnostic();
+        return { file: relative(this.root, module.moduleId).replace(/\\/g, '/'), state: module.state(), ...counts,
+          durationMs: diagnostic.duration, collectMs: diagnostic.collectDuration, setupMs: diagnostic.setupDuration,
+          prepareMs: diagnostic.prepareDuration, environmentMs: diagnostic.environmentSetupDuration };
+      });
+      // No raw logs, environment values or test payloads in structured reports.
+      // The launcher retains stdout/stderr separately with restricted permissions.
+      writeFileSync(process.env.ORKAS_TEST_BATCH_REPORT, JSON.stringify({ schema: 1, reason,
+        unhandledErrors: errors.length, inventory: this.inventory, files, logs: summary,
+        stderr: combineStderrReceipts(modules.filter(module => module.state() !== 'skipped')
+          .map(module => (module.meta() as Record<string, unknown>).orkasStderrReceipt)),
+      }), { mode: 0o600 });
+    }
   }
 }

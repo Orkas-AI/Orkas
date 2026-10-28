@@ -20,7 +20,7 @@ Do not use this skill to write a PRD, create product test scenarios, split backe
 
 | Situation | Read |
 |---|---|
-| Need to build or improve UI in an app | [UI implementation](references/ui-implementation.md) |
+| Build or improve UI, including standalone artifacts | [UI implementation](references/ui-implementation.md) |
 | User asks for a known brand/style, DESIGN.md, or "make it look like X" | [Design style index](references/design-style-index.md), then one matching file under `references/design-styles/` |
 | Need a design brief before coding, or the user asks for JSON/Markdown handoff | [UI brief template](references/ui-brief-template.md) |
 
@@ -33,17 +33,9 @@ Read only the relevant style reference. Do not load all design style files at on
 3. Choose a UI direction: existing product style first; external style reference only when requested or useful.
 4. Define the screen structure, states, interactions, requested viewport behavior, and accessibility requirements. Add responsive behavior only when the user asks for multi-device or narrow-screen support.
 5. Implement using the app's existing framework and component patterns.
-6. When multiple inspectable source screens define the requested scope, inventory all of them and keep one source-to-target row per screen with must-preserve anchors plus `inspected`, `implemented`, and post-implementation `compared` status. Do not claim all screens complete from shared tokens, a successful build, working routes/links, no overflow, or spot checks. A partial result names every remaining screen; a user fidelity contradiction reopens the full ledger before asking for an example already available in the sources.
-7. For runnable local HTML, call `html_preview` on the actual entry before completion. `screenshots` defaults to false for audit-only results; set `screenshots:true` only for the final visual review. Pass `target:"responsive"` only when the user explicitly requests responsive, multi-device, or narrow-screen behavior; otherwise omit target for desktop or use mobile for an explicitly mobile artifact. Source inspection, media-query checks, a local server, PID, or HTTP response do not replace rendered evidence.
-8. Summarize what changed, what visual behavior was verified, and any remaining design questions.
+6. Follow the implementation reference's verification and handoff procedure before delivery; it owns screen coverage, rendered checks, interaction checks, recovery, and evidence freshness.
 
 For a standalone greenfield UI with a clear audience, deliverable, and required sections, the absence of an existing app is not a blocker. Choose the smallest self-contained implementation, use clearly labeled editable sample content when authorized, and produce the complete artifact. Do not replace implementation with a handoff plan merely because no repository, brand system, personal assets, or deployment target was supplied.
-
-For that standalone artifact, finish the whole delivery contract: include every requested section and reachable action, the requested viewport behavior, visible keyboard focus, adequate contrast, accessible labels or alt text, and `prefers-reduced-motion` handling. Add mobile or multi-device reflow only when the user requests it. Requested actions must work with included or inline sample content; do not point a download, image, form, or navigation action at a missing placeholder file. End with copy-paste deployment steps for a suitable static host and an honest checklist covering browser, requested viewport, link, form, and download checks; distinguish checks actually run from checks the recipient must still run. Make the checklist executable by naming every requested viewport (desktop by default), overflow and text-fit inspection, keyboard tab order/focus, link targets, form behavior, and generated download content and filename.
-
-If `html_preview` reports a blocker, inspect its diagnostics; failed checks never return screenshots. Make the smallest runtime/resource/layout repair and rerun the same entry until every requested target succeeds. Do not hide overflow globally, shrink the entire page, or downgrade the result to a source-only check. On the final passing call use `screenshots:true`, inspect the returned screenshot(s), and name each captured target and size. Report Tab-key focus traversal and visible-focus counts, hash/mail links, filled/submitted forms, and observed download filenames, MIME types, and byte sizes. If the built-in tool is environmentally unavailable, keep rendered behavior unverified; do not search for or install Playwright, Puppeteer, Chromium, or another browser runtime.
-
-Rendered evidence belongs to the exact UI revision it captured. After any change that may affect layout or behavior, discard affected pre-change evidence; after the final relevant edit, rerun `html_preview` with `screenshots:true`, inspect the new screenshots and interaction evidence, and report only that post-change evidence. If this rerun is unavailable, keep the affected behavior unverified.
 
 ## UI Rules
 

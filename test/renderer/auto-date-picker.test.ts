@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const auto = require('../../src/renderer/modules/auto.js') as {
+const auto = require('../../src/renderer/modules/date-picker.js') as {
   _autoLocalDateParts: (value: string) => {
     year: number;
     month: number;

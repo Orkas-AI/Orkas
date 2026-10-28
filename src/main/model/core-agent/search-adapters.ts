@@ -12,9 +12,11 @@
  * `features/search_auth.ts::addSearchProfile`.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { SearchProfile } from '../../features/auth';
 import { createLogger } from '../../logger';
-import { fetchAndReadWithTimeout } from '../../util/abort';
+import { composeAbortSignal, fetchAndReadWithTimeout } from '../../util/abort';
+import { getSearchQueryMaxChars, validateSearchQuery } from '../../util/search-contract';
 import {
   ORKAS_API_BASE_URL,
   ORKAS_API_KEYS_URL,
@@ -36,15 +38,30 @@ export interface SearchAdapterResult {
   results: NormalisedSearchResult[];
 }
 
-/** Account-level search failure that should not be retried immediately. */
-export class SearchAccountError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'SearchAccountError';
+const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_RESPONSE_BYTES = 2_000_000;
+class SearchBodyTooLargeError extends Error {}
+
+async function readSearchBody(response: Response): Promise<string> {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let size = 0;
+  let text = '';
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_RESPONSE_BYTES) throw new SearchBodyTooLargeError('Search response is too large');
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
 }
-
-const REQUEST_TIMEOUT_MS = 30_000;
 
 async function fetchTextWithTimeout(
   url: string,
@@ -57,7 +74,7 @@ async function fetchTextWithTimeout(
     timeoutMs,
     null,
     `Search request timed out after ${timeoutMs}ms`,
-    (resp) => resp.text(),
+    readSearchBody,
   );
   return { response, text: body };
 }
@@ -68,6 +85,41 @@ function parseJson<T>(text: string): T {
 
 function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
+}
+
+function normaliseResults(text: string, provider: 'deepseek' | 'tavily', count: number): NormalisedSearchResult[] {
+  let data: any;
+  try { data = JSON.parse(text); } catch { throw new Error(`${SEARCH_PROVIDER_LABEL[provider]} search returned an invalid response`); }
+  if (!data || !Array.isArray(data.results) || data.results.length > 100) {
+    throw new Error(`${SEARCH_PROVIDER_LABEL[provider]} search returned an invalid response`);
+  }
+  const results: NormalisedSearchResult[] = [];
+  for (const item of data.results) {
+    if (!item || typeof item.url !== 'string' || item.url.length > 4096) continue;
+    const url = item.url.trim();
+    try {
+      const parsed = new URL(url);
+      if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password) continue;
+    } catch { continue; }
+    const snippet = provider === 'deepseek' ? item.summary || item.snippet || ''
+      : item.content || '';
+    if (typeof snippet !== 'string' || (item.title != null && typeof item.title !== 'string')) continue;
+    results.push({ title: (item.title || '').slice(0, 512), url, snippet: snippet.slice(0, 10000) });
+    if (results.length >= count) break;
+  }
+  return results;
+}
+
+/**
+ * Account-level search failure (credits exhausted / auth), not "no results".
+ * Keep the HTTP status so callers can distinguish a balance that payment can
+ * restore from rejected credentials. Both fall back without an inline retry.
+ */
+export class SearchAccountError extends Error {
+  constructor(message: string, readonly statusCode?: number) {
+    super(message);
+    this.name = 'SearchAccountError';
+  }
 }
 
 // ── Orkas public search API ─────────────────────────────────────────────
@@ -107,28 +159,95 @@ async function orkasApiSearch(
 
 async function tavilySearch(profile: SearchProfile, query: string, count: number): Promise<SearchAdapterResult> {
   const body = JSON.stringify({
-    api_key: profile.apiKey,
     query,
     max_results: clamp(count, 1, 20),
     search_depth: 'basic',
   });
   const { response: resp, text } = await fetchTextWithTimeout('https://api.tavily.com/search', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${profile.apiKey}` },
     body,
   });
   if (!resp.ok) {
-    throw new Error(`Tavily ${resp.status}: ${text.slice(0, 300)}`);
+    // Never expose provider error bodies: they may echo the key or query.
+    const message = `Tavily search ${resp.status}: request failed`;
+    if ([401, 402, 403].includes(resp.status)) throw new SearchAccountError(message, resp.status);
+    throw new Error(message);
   }
-  const data = parseJson(text) as { results?: Array<{ title?: string; url?: string; content?: string }> };
-  return {
-    provider: 'tavily',
-    results: (data.results || []).map((r) => ({
-      title: String(r.title || ''),
-      url: String(r.url || ''),
-      snippet: String(r.content || ''),
-    })).filter((r) => r.url),
+  return { provider: 'tavily', results: normaliseResults(text, 'tavily', count) };
+}
+
+// ── DeepSeek ────────────────────────────────────────────────────────────
+
+function searchTransportReason(error: unknown): string {
+  // Node/Undici preserve structured causes. Never infer a cause from prose.
+  let cause: any = error;
+  const known: Record<string, string> = {
+    ENOTFOUND: 'dns_error', EAI_AGAIN: 'dns_error', ECONNREFUSED: 'connect_error',
+    ECONNRESET: 'connection_reset', ETIMEDOUT: 'transport_timeout',
+    UND_ERR_CONNECT_TIMEOUT: 'connect_timeout', UND_ERR_HEADERS_TIMEOUT: 'headers_timeout',
+    UND_ERR_BODY_TIMEOUT: 'read_timeout', CERT_HAS_EXPIRED: 'tls_error',
+    ERR_TLS_CERT_ALTNAME_INVALID: 'tls_error', UNABLE_TO_VERIFY_LEAF_SIGNATURE: 'tls_error',
+    SELF_SIGNED_CERT_IN_CHAIN: 'tls_error',
   };
+  try {
+    for (let i = 0; cause && i < 4; i++) {
+      if (typeof cause.code === 'string' && Object.hasOwn(known, cause.code)) return known[cause.code];
+      cause = cause.cause;
+    }
+  } catch { /* A nonstandard error accessor must not replace the failure. */ }
+  return 'transport_error';
+}
+
+async function deepseekSearch(profile: SearchProfile, query: string, count: number): Promise<SearchAdapterResult> {
+  const started = performance.now();
+  const searchRef = randomUUID();
+  const timeoutMessage = 'Search request timed out after 60000ms';
+  const composed = composeAbortSignal(null, 60_000, timeoutMessage);
+  let phase = 'before_response';
+  let status = 0;
+  let result = 'failure';
+  let reason = 'transport_error';
+  try {
+    const resp = await fetch('https://api.deepseek.com/v1/tools/search', {
+      method: 'POST', signal: composed.signal,
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${profile.apiKey}` },
+      body: JSON.stringify({ query, count: clamp(Math.trunc(count) || 1, 1, 20), need_content: false }),
+    });
+    status = resp.status;
+    phase = 'after_response';
+    const text = await readSearchBody(resp);
+    if (!resp.ok) {
+      reason = 'http_error';
+      const message = `DeepSeek search ${resp.status}: request failed`;
+      if ([401, 402, 403].includes(resp.status)) throw new SearchAccountError(message, resp.status);
+      throw new Error(message);
+    }
+    phase = 'response_validation';
+    reason = 'invalid_response';
+    const results = normaliseResults(text, 'deepseek', count);
+    result = results.length ? 'success' : 'empty';
+    reason = results.length ? 'none' : 'empty_results';
+    return { provider: 'deepseek', results };
+  } catch (error) {
+    if (composed.signal.aborted) {
+      reason = 'deadline_timeout';
+      throw new Error(timeoutMessage);
+    }
+    if (error instanceof SearchBodyTooLargeError) reason = 'response_too_large';
+    else if (phase !== 'response_validation' && reason !== 'http_error') reason = searchTransportReason(error);
+    throw error;
+  } finally {
+    composed.cleanup();
+    // One constant-size local observation, including the actual header status
+    // on body failures. No account/profile id, query, URL or exception text.
+    try {
+      const data = { provider: 'deepseek', search_ref: searchRef, result, reason, phase,
+        status_code: status, duration_ms: Math.min(1_000_000, Math.max(0, Math.round(performance.now() - started))) };
+      if (result === 'failure') log.warn('search provider result', data);
+      else log.debug('search provider result', data);
+    } catch { /* Diagnostics cannot trigger fallback or change the result. */ }
+  }
 }
 
 // ── Serper ──────────────────────────────────────────────────────────────
@@ -146,9 +265,9 @@ async function serperSearch(profile: SearchProfile, query: string, count: number
   if (!resp.ok) {
     throw new Error(`Serper ${resp.status}: ${text.slice(0, 300)}`);
   }
-  const data = parseJson(text) as {
+  const data = parseJson<{
     organic?: Array<{ title?: string; link?: string; snippet?: string }>;
-  };
+  }>(text);
   return {
     provider: 'serper',
     results: (data.organic || []).map((r) => ({
@@ -176,9 +295,9 @@ async function braveApiSearch(profile: SearchProfile, query: string, count: numb
   if (!resp.ok) {
     throw new Error(`Brave Search ${resp.status}: ${text.slice(0, 300)}`);
   }
-  const data = parseJson(text) as {
+  const data = parseJson<{
     web?: { results?: Array<{ title?: string; url?: string; description?: string }> };
-  };
+  }>(text);
   return {
     provider: 'brave-search',
     results: (data.web?.results || []).map((r) => ({
@@ -218,9 +337,9 @@ async function baiduAiSearch(profile: SearchProfile, query: string, count: numbe
   if (!resp.ok) {
     throw new Error(`Baidu AI Search ${resp.status}: ${text.slice(0, 300)}`);
   }
-  const data = parseJson(text) as {
+  const data = parseJson<{
     references?: Array<{ title?: string; url?: string; web_anchor?: string; snippet?: string; content?: string }>;
-  };
+  }>(text);
   return {
     provider: 'baidu-ai-search',
     results: (data.references || []).map((r) => ({
@@ -235,11 +354,11 @@ async function baiduAiSearch(profile: SearchProfile, query: string, count: numbe
 
 /**
  * Metaso AI Search:
- * Endpoint: POST https://api.metaso.cn/search
+ * Endpoint: POST https://metaso.cn/api/v1/search
  * Auth: Authorization: Bearer <api-key>
- * Docs / console: https://metaso.cn/
+ * Docs / console: https://metaso.cn/search-api/playground
  *
- * Request body core fields (verified 2026-04):
+ * Request body core fields (official playground + MCP catalog):
  *   - q (string, required)
  *   - scope: 'webpage' | 'document' | 'scholar' | 'podcast' | 'video' | 'image'
  *            (default 'webpage')
@@ -258,7 +377,7 @@ async function metasoSearch(profile: SearchProfile, query: string, count: number
     size: clamp(count, 1, 20),
     includeSummary: false,
   });
-  const { response: resp, text } = await fetchTextWithTimeout('https://api.metaso.cn/search', {
+  const { response: resp, text } = await fetchTextWithTimeout('https://metaso.cn/api/v1/search', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -269,7 +388,7 @@ async function metasoSearch(profile: SearchProfile, query: string, count: number
   if (!resp.ok) {
     throw new Error(`Metaso ${resp.status}: ${text.slice(0, 300)}`);
   }
-  const data = parseJson(text) as Record<string, unknown>;
+  const data = parseJson<Record<string, unknown>>(text);
   const list: any[] = Array.isArray((data as any).references) ? (data as any).references
                     : Array.isArray((data as any).results)    ? (data as any).results
                     : Array.isArray((data as any).data)       ? (data as any).data
@@ -350,6 +469,7 @@ export type SearchAdapter = (
 export const searchAdaptersByProvider: Record<string, SearchAdapter> = {
   [ORKAS_API_PROVIDER]: orkasApiSearch,
   tavily:            tavilySearch,
+  deepseek:          deepseekSearch,
   serper:            serperSearch,
   'brave-search':    braveApiSearch,
   'baidu-ai-search': baiduAiSearch,
@@ -362,6 +482,7 @@ export const searchAdaptersByProvider: Record<string, SearchAdapter> = {
 export const SEARCH_PROVIDER_LABEL: Record<string, string> = {
   [ORKAS_API_PROVIDER]: 'Orkas · Search',
   tavily:            'Tavily',
+  deepseek:          'DeepSeek',
   serper:            'Serper',
   'brave-search':    'Brave',
   'baidu-ai-search': 'Baidu',
@@ -373,6 +494,7 @@ export const SEARCH_PROVIDER_LABEL: Record<string, string> = {
 export const SEARCH_PROVIDER_DOCS: Record<string, string> = {
   [ORKAS_API_PROVIDER]: ORKAS_API_KEYS_URL,
   tavily:            'https://tavily.com/',
+  deepseek:          'https://api-docs.deepseek.com/guides/search/',
   serper:            'https://serper.dev/',
   'brave-search':    'https://brave.com/search/api/',
   'baidu-ai-search': 'https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk',
@@ -386,6 +508,9 @@ export async function runSearchAdapter(
   count: number,
   context?: OrkasApiUsageContext,
 ): Promise<SearchAdapterResult> {
+  query = query.trim();
+  validateSearchQuery(query, getSearchQueryMaxChars(profile.provider));
+  count = clamp(Math.trunc(count) || 1, 1, 20);
   const adapter = searchAdaptersByProvider[profile.provider];
   if (!adapter) throw new Error(`no search adapter registered for provider "${profile.provider}"`);
   log.debug('runSearchAdapter', { provider: profile.provider, count });

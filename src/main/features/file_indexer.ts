@@ -43,13 +43,12 @@ import { finished } from 'node:stream/promises';
 import { userChatAttachmentsDir, userFileCacheDir, projectChatAttachmentsDir } from '../paths';
 import { listProjectIds } from '../util/project-layout';
 import { createLogger } from '../logger';
-import { logPathRef, maskId } from '../util/log-redact';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { macosTccSensitivePath } from '../util/macos-tcc';
 import { pdfBufferToPages, EXTRACT_CACHE_VERSION } from '../util/extract-pdf';
 import { docxBufferToMarkdown } from '../util/extract-docx';
-import { xlsxBufferToMarkdown, pptxBufferToMarkdown } from '../util/extract-office';
-import { isZipSpreadsheet, xlsBufferToMarkdown } from '../util/extract-xls';
-import { toCompressedGrayJpeg } from '../util/image-transform';
+import { extractOffice } from '../util/office-extract';
+import { toCompressedJpeg } from '../util/image-transform';
 
 const log = createLogger('file_indexer');
 
@@ -242,9 +241,14 @@ function touchMeta(dir: string, patch?: Partial<OnDiskMeta>): void {
   try { writeMeta(dir, meta); } catch { /* best-effort */ }
 }
 
-function removeDir(dir: string): void {
-  try { fs.rmSync(dir, { recursive: true, force: true }); }
-  catch (err) { log.warn(`rmdir ${dir}: ${(err as Error).message}`); }
+function removeDir(dir: string): boolean {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return true;
+  } catch (err) {
+    log.warn('file cache cleanup deferred', { path: logPathRef(dir), error: logErrorSummary(err) });
+    return false;
+  }
 }
 
 function metaToPublic(meta: OnDiskMeta): FileMeta {
@@ -559,14 +563,12 @@ async function materialise(
     fs.writeFileSync(path.join(dir, 'text.md'), md, 'utf8');
     base.totalChars = md.length;
   } else if (kind === 'spreadsheet') {
-    const buf = await fs.promises.readFile(absPath);
-    const md = isZipSpreadsheet(buf) ? xlsxBufferToMarkdown(buf) : await xlsBufferToMarkdown(buf);
-    fs.writeFileSync(path.join(dir, 'text.md'), md, 'utf8');
+    const md = await extractOffice('spreadsheet-markdown', signal => fs.promises.readFile(absPath, { signal }));
+    await fs.promises.writeFile(path.join(dir, 'text.md'), md, 'utf8');
     base.totalChars = md.length;
   } else if (kind === 'presentation') {
-    const buf = await fs.promises.readFile(absPath);
-    const md = pptxBufferToMarkdown(buf);
-    fs.writeFileSync(path.join(dir, 'text.md'), md, 'utf8');
+    const md = await extractOffice('pptx-markdown', signal => fs.promises.readFile(absPath, { signal }));
+    await fs.promises.writeFile(path.join(dir, 'text.md'), md, 'utf8');
     base.totalChars = md.length;
   } else if (kind === 'legacy_office') {
     throw new UnsupportedFileKindError(absPath, kind);
@@ -779,7 +781,7 @@ export async function readImageAsJpeg(
   const kind = kindOf(absPath);
   if (kind !== 'image') throw new Error(`readImageAsJpeg: not an image: ${absPath}`);
   const buf = await fs.promises.readFile(absPath);
-  const out = await toCompressedGrayJpeg(buf, { maxDim: 1024, quality: 70, grayscale: false });
+  const out = await toCompressedJpeg(buf, { maxDim: 1024, quality: 70 });
   return {
     base64: out.buf.toString('base64'),
     mediaType: 'image/jpeg',
@@ -841,19 +843,18 @@ export async function pruneOrphans(
     const dir = path.join(root, e.name);
     const meta = readMeta(dir);
     const reason =
-      !meta ? 'no-meta' :
+      !meta || typeof meta.absPath !== 'string' || !path.isAbsolute(meta.absPath) ? 'no-meta' :
       meta.cacheVersion !== EXTRACT_CACHE_VERSION ? 'version' :
       macosTccSensitivePath(path.resolve(meta.absPath), { recursive: false }) ? 'tcc-protected-source' :
       !safeExistsSync(meta.absPath) ? 'orphan' :
       (wsRoot && meta.source === 'workspace' && !_isUnder(meta.absPath, wsRoot)) ? 'out-of-workspace' :
       null;
-    if (reason) {
-      removeDir(dir);
+    if (reason && removeDir(dir)) {
       deleted++;
-      log.debug(`pruneOrphans: drop ${e.name} (${reason})`);
+      log.debug('file cache entry pruned', { path: logPathRef(dir), reason });
     }
   }
-  if (deleted) log.info(`pruneOrphans user=${userId} deleted=${deleted}`);
+  if (deleted) log.info('orphan file cache pruned', { user_id: maskId(userId), deleted });
   return { deleted };
 }
 
@@ -880,12 +881,11 @@ export async function purgeFileCacheByCid(
     if (!e.isDirectory()) continue;
     const dir = path.join(root, e.name);
     const meta = readMeta(dir);
-    if (meta && meta.source === 'attachment' && meta.cid === cid) {
-      removeDir(dir);
+    if (meta && meta.source === 'attachment' && meta.cid === cid && removeDir(dir)) {
       deleted++;
     }
   }
-  if (deleted) log.info(`purgeFileCacheByCid user=${userId} cid=${cid} deleted=${deleted}`);
+  if (deleted) log.info('conversation file cache purged', { user_id: maskId(userId), cid: maskId(cid), deleted });
   return { deleted };
 }
 

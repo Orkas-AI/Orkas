@@ -23,8 +23,12 @@
  */
 
 import { readTextPreview } from '../util/text-preview';
+import { isPathAllowed, resolveSandboxRoot } from '../util/path-sandbox';
+import { writeBytesAtomicSync, writeTextAtomicSync } from '../storage';
 import { fileFailureKind } from '../util/app-error';
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import { Semaphore } from 'async-mutex';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { shell } from 'electron';
@@ -44,12 +48,18 @@ import { officeFileToPreviewHtml } from './office/office_preview_layout';
 import {
   assertLocalImportTarget,
   copyLocalFileAtomic,
+  copyLocalEntryExclusiveSync,
   inspectLocalImportSource,
   withLocalImportLock,
 } from '../util/file-import';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 
 const log = createLogger('contexts');
+
+function warnContextFailure(message: string, error: unknown): void {
+  const { message_hash, message_chars } = logErrorSummary(error);
+  log.warn(message, { message_hash, message_chars });
+}
 
 function contextsRoot(userId: string = getActiveUserId()): string {
   return userContextsDir(userId);
@@ -198,6 +208,9 @@ function resolvePath(
   const target = path.resolve(root, s);
   const rel = path.relative(root, target);
   if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error('path escapes contexts root');
+  if (!isPathAllowed(target, [root])) {
+    throw Object.assign(new Error('path escapes contexts root'), { code: 'E_LIBRARY_PATH_SCOPE' });
+  }
   if (mustExist && !fs.existsSync(target)) {
     const err = new Error(`not found: ${s}`) as NodeJS.ErrnoException;
     err.code = 'ENOENT';
@@ -245,21 +258,25 @@ export function isSupportedContextFileName(name: string): boolean {
 
 // ── Listing / Reading ────────────────────────────────────────────────────
 
-export function listContextsTree(): ContextNode[] {
-  fs.mkdirSync(contextsRoot(), { recursive: true });
+const contextTreeIo = new Semaphore(8);
+const contextTreeReads = new Map<string, Promise<ContextNode[]>>();
 
-  function walk(d: string, rel = ''): ContextNode[] {
+export function listContextsTree(): Promise<ContextNode[]> {
+  const root = contextsRoot();
+  const existing = contextTreeReads.get(root);
+  if (existing) return existing;
+
+  async function walk(d: string, rel = ''): Promise<ContextNode[]> {
     let items;
     try {
-      items = fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => {
+      items = (await contextTreeIo.runExclusive(() => fsp.readdir(d, { withFileTypes: true }))).sort((a, b) => {
         if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
         return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
       });
     } catch { return []; }
 
-    const out: ContextNode[] = [];
-    for (const e of items) {
-      if (CONTEXTS_IGNORE.has(e.name) || e.name.startsWith('.')) continue;
+    const readItem = async (e: fs.Dirent): Promise<ContextNode | null> => {
+      if (CONTEXTS_IGNORE.has(e.name) || e.name.startsWith('.')) return null;
       const relPath = rel ? `${rel}/${e.name}` : e.name;
       const full = path.join(d, e.name);
       if (e.isDirectory()) {
@@ -267,21 +284,36 @@ export function listContextsTree(): ContextNode[] {
         // alongside files. A directory's mtime moves when entries are added or
         // removed directly inside it — close enough for "recently touched".
         let dirMtime = 0;
-        try { dirMtime = fs.statSync(full).mtimeMs / 1000; } catch { /* ignore */ }
-        out.push({ name: e.name, path: relPath, type: 'dir', mtime: dirMtime, children: walk(full, relPath) });
+        try { dirMtime = (await contextTreeIo.runExclusive(() => fsp.stat(full))).mtimeMs / 1000; } catch { /* ignore */ }
+        return { name: e.name, path: relPath, type: 'dir', mtime: dirMtime, children: await walk(full, relPath) };
       } else if (e.isFile()) {
         // Show every supported KB file kind in the tree — text + binary both
         // get vectorized, both deserve to be visible.
-        if (!isAllowedName(e.name)) continue;
+        if (!isAllowedName(e.name)) return null;
         let size = 0; let mtime = 0;
-        try { const st = fs.statSync(full); size = st.size; mtime = st.mtimeMs / 1000; }
+        try { const st = await contextTreeIo.runExclusive(() => fsp.stat(full)); size = st.size; mtime = st.mtimeMs / 1000; }
         catch { /* ignore */ }
-        out.push({ name: e.name, path: relPath, type: 'file', bytes: size, mtime });
+        return { name: e.name, path: relPath, type: 'file', bytes: size, mtime };
       }
-    }
-    return out;
+      return null;
+    };
+    const out: Array<ContextNode | null> = new Array(items.length).fill(null);
+    let next = 0;
+    // Bound producers too: a wide folder must not allocate one pending
+    // promise/semaphore waiter for every file before the first stat finishes.
+    await Promise.all(Array.from({ length: Math.min(8, items.length) }, async () => {
+      while (next < items.length) {
+        const index = next++;
+        out[index] = await readItem(items[index]);
+      }
+    }));
+    return out.filter((node): node is ContextNode => node !== null);
   }
-  return walk(contextsRoot());
+  const pending = fsp.mkdir(root, { recursive: true }).then(() => walk(root)).finally(() => {
+    if (contextTreeReads.get(root) === pending) contextTreeReads.delete(root);
+  });
+  contextTreeReads.set(root, pending);
+  return pending;
 }
 
 export function readContextFile(relpath: string, preview = false): Result<{ content: string; path: string; truncated?: boolean }> {
@@ -318,7 +350,7 @@ export async function readContextDocxHtml(relpath: string): Promise<Result<{ htm
     const html = await docxBufferToHtml(buf);
     return { ok: true, html };
   } catch (err) {
-    log.warn(`docx→html ${relpath}: ${(err as Error).message}`);
+    warnContextFailure('context Word preview failed', err);
     return { ok: false, error: (err as Error).message };
   }
 }
@@ -340,7 +372,10 @@ export async function readContextOfficeHtml(
     const preview = await officeFileToPreviewHtml(kind, path.basename(p), p, buf);
     return { ok: true, ...preview };
   } catch (err) {
-    log.warn(`office→html ${relpath}: ${(err as Error).message}`);
+    log.warn('context Office preview failed', {
+      path: logPathRef(relpath),
+      error: logErrorSummary(err),
+    });
     return { ok: false, error: (err as Error).message };
   }
 }
@@ -374,7 +409,7 @@ export async function showContextFileInSystem(relpath: string): Promise<Result> 
     shell.showItemInFolder(p);
     return { ok: true };
   } catch (err) {
-    log.warn(`showItemInFolder ${relpath}: ${(err as Error).message}`);
+    warnContextFailure('context file reveal failed', err);
     return { ok: false, error: (err as Error).message };
   }
 }
@@ -410,7 +445,7 @@ function checkDuplicateContent(sha1: string): Result<null> | null {
   try {
     existing = kbVector.findBySha1(getActiveUserId(), sha1);
   } catch (err) {
-    log.warn(`duplicate content check skipped: ${(err as Error).message}`);
+    warnContextFailure('duplicate content check skipped', err);
     return null;
   }
   if (!existing) return null;
@@ -433,20 +468,17 @@ function kbKindForContextName(name: string): kbVector.KbKind {
   return 'text';
 }
 
-function notifyDeletedContext(relPath: string): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDeleted?: (relPath: string) => Promise<void> | void };
-    void sync?.markDeleted?.(`cloud/contexts/${relPath}`);
-  } catch { /* features/sync stripped */ }
-}
-
-function notifyDirtyContext(relPath: string): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('contexts', `cloud/contexts/${relPath}`);
-  } catch { /* features/sync stripped */ }
+function writeContextSourceAtomic(target: string, data: string | Uint8Array): void {
+  // Authorization already checked the resolved target. Preserve supported
+  // internal file aliases, including aliases whose target is still missing.
+  const resolved = resolveSandboxRoot(target);
+  let mode: number | undefined;
+  if (fs.existsSync(resolved)) {
+    fs.accessSync(resolved, fs.constants.W_OK);
+    mode = fs.statSync(resolved).mode & 0o777;
+  }
+  if (typeof data === 'string') writeTextAtomicSync(resolved, data, 'utf8', { mode });
+  else writeBytesAtomicSync(resolved, data, { mode });
 }
 
 export function writeContextFile(relpath: string, content: string): Result<{ path: string }> {
@@ -474,14 +506,13 @@ export function writeContextFile(relpath: string, content: string): Result<{ pat
     const dup = checkDuplicateContent(sha1);
     if (dup) return dup;
   }
-  try { fs.writeFileSync(p, body, 'utf8'); }
+  try { writeContextSourceAtomic(p, body); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   invalidateIndex();
   if (path.basename(p) !== CONTEXTS_INDEX_FILENAME) {
     const uid = getActiveUserId();
     search.upsertContext(uid, relpath);
     kbIndexer.enqueue(uid, relpath, 'upsert');
-    notifyDirtyContext(relpath);
   }
   return { ok: true, path: relpath };
 }
@@ -507,13 +538,12 @@ export function updateContextFile(relpath: string, content: string): Result<{ pa
   if (bytes > MAX_FILE_BYTES) {
     return { ok: false, error: `file exceeds ${Math.round(MAX_FILE_BYTES / 1024 / 1024)}MB limit` };
   }
-  try { fs.writeFileSync(p, body, 'utf8'); }
+  try { writeContextSourceAtomic(p, body); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   invalidateIndex();
   const uid = getActiveUserId();
   search.upsertContext(uid, relpath);
   kbIndexer.enqueue(uid, relpath, 'upsert');
-  notifyDirtyContext(relpath);
   return { ok: true, path: relpath };
 }
 
@@ -550,13 +580,12 @@ export function uploadContextFile(relpath: string, raw: Buffer | Uint8Array | nu
     if (dup) return dup;
   }
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  try { fs.writeFileSync(p, buf); }
+  try { writeContextSourceAtomic(p, buf); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   invalidateIndex();
   const uid = getActiveUserId();
   search.upsertContext(uid, relpath);
   kbIndexer.enqueue(uid, relpath, 'upsert');
-  notifyDirtyContext(relpath);
   return { ok: true, path: relpath, bytes: buf.length };
 }
 
@@ -574,7 +603,21 @@ export async function importContextFileFromPath(
   const uid = getActiveUserId();
   let target: string;
   try { target = resolvePath(relpath); }
-  catch (err) { return { ok: false, error: (err as Error).message, code: 'E_IMPORT_TARGET' }; }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'E_LIBRARY_PATH_SCOPE') {
+      try {
+        // Preserve the import validator's established symlink/access codes
+        // when the shared real-path boundary rejects the target earlier.
+        const root = contextsRoot(uid);
+        await assertLocalImportTarget(root, path.resolve(root, relpath));
+      } catch (targetError) {
+        const code = (targetError as NodeJS.ErrnoException).code;
+        return { ok: false, error: (targetError as Error).message,
+          code: typeof code === 'string' ? code : 'E_IMPORT_TARGET' };
+      }
+    }
+    return { ok: false, error: (err as Error).message, code: 'E_IMPORT_TARGET' };
+  }
   if (!isAllowedName(path.basename(target))) {
     return { ok: false, error: t('errors.contexts.formats_only', { allowed: [...ALLOWED_EXTS].sort().join(', ') }), code: 'E_IMPORT_EXT' };
   }
@@ -613,7 +656,6 @@ export async function importContextFileFromPath(
       invalidateIndex();
       search.upsertContext(uid, relpath);
       kbIndexer.enqueue(uid, relpath, 'upsert');
-      notifyDirtyContext(relpath);
       return { ok: true as const, path: relpath, bytes: source.bytes };
     });
     if (!result.ok) return result;
@@ -646,6 +688,7 @@ export function deleteContextTarget(relpath: string, userId: string = getActiveU
   let p: string;
   try { p = resolvePath(relpath, { mustExist: true, userId }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
+  if (p === path.resolve(contextsRoot(userId))) return { ok: false, error: 'path required' };
   if (path.basename(p) === CONTEXTS_INDEX_FILENAME) {
     return { ok: false, error: t('errors.cant_delete_index') };
   }
@@ -659,7 +702,6 @@ export function deleteContextTarget(relpath: string, userId: string = getActiveU
   for (const r of droppedRels) {
     search.dropContext(userId, r);
     kbIndexer.enqueue(userId, r, 'delete');
-    if (isActiveUser(userId)) notifyDeletedContext(r);
   }
   return { ok: true };
 }
@@ -764,22 +806,17 @@ export function copyContextEntryFromPath(
   const checked = validateContextCopySource(sourceAbs);
   if (checked.ok === false) return { ok: false, error: checked.error };
   try {
-    fs.cpSync(sourceAbs, targetAbs, {
-      recursive: sourceStat.isDirectory(),
-      errorOnExist: true,
-      force: false,
-      dereference: false,
-    });
+    copyLocalEntryExclusiveSync(sourceAbs, targetAbs, sourceStat.isDirectory());
   } catch (err) {
-    try { fs.rmSync(targetAbs, { recursive: true, force: true }); } catch { /* best-effort rollback */ }
-    return { ok: false, error: (err as Error).message };
+    const code = (err as NodeJS.ErrnoException).code;
+    return { ok: false, error: code === 'EEXIST' || code === 'ERR_FS_CP_EEXIST'
+      ? 'target_exists' : (err as Error).message };
   }
 
   invalidateIndex(userId);
   for (const rel of _collectRelsUnder(targetAbs, targetRel)) {
     search.upsertContext(userId, rel);
     kbIndexer.enqueue(userId, rel, 'upsert');
-    if (isActiveUser(userId)) notifyDirtyContext(rel);
   }
   return { ok: true, path: targetRel, fileCount: checked.fileCount, bytes: checked.bytes };
 }
@@ -796,24 +833,31 @@ export function renameContextEntry(
   }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (fs.existsSync(dst)) return { ok: false, error: 'destination already exists' };
-  const srcIsFile = fs.statSync(src).isFile();
+  let srcStat: fs.Stats;
+  try {
+    srcStat = fs.statSync(src);
+    if (srcStat.isDirectory() && fs.lstatSync(src).isDirectory() && isPathAllowed(dst, [src])) {
+      return { ok: false, error: 'cannot move a directory into itself' };
+    }
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+  const srcIsFile = srcStat.isFile();
   if (srcIsFile && !isAllowedName(path.basename(dst))) {
     return { ok: false, error: 'destination has unsupported extension' };
   }
   const oldRels = _collectRelsUnder(src, srcRel);
-  fs.mkdirSync(path.dirname(dst), { recursive: true });
-  try { fs.renameSync(src, dst); }
+  try {
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.renameSync(src, dst);
+  }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   invalidateIndex(userId);
   for (const r of oldRels) {
     search.dropContext(userId, r);
     kbIndexer.enqueue(userId, r, 'delete');
-    if (isActiveUser(userId)) notifyDeletedContext(r);
   }
   for (const r of _collectRelsUnder(dst, dstRel)) {
     search.upsertContext(userId, r);
     kbIndexer.enqueue(userId, r, 'upsert');
-    if (isActiveUser(userId)) notifyDirtyContext(r);
   }
   return { ok: true, src: srcRel, dst: dstRel };
 }
@@ -850,9 +894,10 @@ const indexCache: IndexCache = {
 };
 
 export function invalidateIndex(userId: string = getActiveUserId()): void {
+  contextTreeReads.delete(contextsRoot(userId));
   if (indexCache.userId === userId) indexCache.mtime = 0;
   try { rebuildIndex(userId); }
-  catch (err) { log.warn(`index rebuild failed: ${(err as Error).message}`); }
+  catch (err) { warnContextFailure('context index rebuild failed', err); }
 }
 
 interface WalkNode { name: string; rel: string; full: string }
@@ -929,18 +974,16 @@ export function rebuildIndex(userId: string = getActiveUserId()): IndexCache {
       lines.push('');
     }
   }
+  const rootMd = lines.join('\n').trimEnd() + '\n';
   try {
-    fs.writeFileSync(
-      path.join(root, CONTEXTS_INDEX_FILENAME),
-      lines.join('\n').trimEnd() + '\n',
-      'utf8',
-    );
-  } catch (err) { log.warn(`failed to write root _INDEX.md: ${(err as Error).message}`); }
+    // Publish the generated directory entry, never follow an old index link.
+    writeTextAtomicSync(path.join(root, CONTEXTS_INDEX_FILENAME), rootMd);
+  } catch (err) {
+    warnContextFailure('failed to write root Library index', err);
+  }
 
-  // Full root markdown — re-read what we just wrote, for getContextIndexMarkdown.
-  let rootMd = '';
-  try { rootMd = fs.readFileSync(path.join(root, CONTEXTS_INDEX_FILENAME), 'utf8'); }
-  catch { rootMd = t('contexts.index.empty_kb'); }
+  // The overview is derived from owned files. A failed cache publication must
+  // not read an old destination that may be a link to unrelated content.
 
   const flatLines = allEntries.length
     ? allEntries.map((e) => `- \`${e.path}\`${e.title ? ` — ${e.title}` : ''}`).join('\n')

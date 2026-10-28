@@ -14,20 +14,25 @@ import {createLogger} from '../../logger';
 import { logErrorSummary } from '../../util/log-redact';
 import { commonMethod, type AppType, type DataDefinition } from './data-contract';
 import { RequestHistory } from './request-history';
-import { requireLocalAppType } from './commercial-entry';
 
 export class AppError extends Error {
   constructor(readonly code: string) { super(code); }
 }
+class SourceRevisionError extends AppError {
+  constructor() { super('E_CLOSED'); }
+}
 export interface Bundle {
   browserOnly?: boolean;
   kind?: 'saved' | 'artifact';
-  appType?: AppType;
+  /** Unresolved is runtime-only; it allows rendering/common data, never host authority. */
+  appType?: AppType | 'unresolved';
   key: string;
   title: string;
   entry: string;
   manifest: unknown;
-  valid?(): boolean;
+  /** Cheap rejection only; content validation remains authoritative. */
+  current?(): boolean;
+  valid?(signal?: AbortSignal): boolean | Promise<boolean>;
   resolve(rel: string): { absPath: string; mime: string } | null;
 }
 export interface AppTool {
@@ -243,7 +248,6 @@ export class WebAppRuntime {
     const owner=this.host.dataOwner(uid,key,file,definition);try{await owner.open();}finally{await owner.close();}return true;
   }
   open(uid: string, owner: number, bundle: Bundle) {
-    requireLocalAppType(bundle.appType);
     if (uid !== this.host.activeUser()) return error('E_CLOSED');
     if(heldAppData.has(JSON.stringify([uid,bundle.key])))return error('E_BUSY');
     const parsed = manifestSchema.safeParse(bundle.manifest);
@@ -262,16 +266,16 @@ export class WebAppRuntime {
   private current(uid: string, owner: number, token: string): Instance {
     const s = this.instances.get(token);
     if (!s || s.uid !== uid || s.owner !== owner || uid !== this.host.activeUser() || s.controller.signal.aborted) return error('E_CLOSED');
-    requireLocalAppType(s.bundle.appType);
-    if (s.bundle.valid?.() === false) {
-      this.close(uid, owner, token); return error('E_CLOSED');
+    if (s.bundle.current?.() === false) {
+      this.close(uid, owner, token); throw new SourceRevisionError();
     }
     return s;
   }
   /** The existing artifact bridge is available only in its local task context. */
-  canSubmitArtifact(uid: string, owner: number, token: string): boolean {
+  async canSubmitArtifact(uid: string, owner: number, token: string): Promise<boolean> {
     try {
       const s = this.current(uid, owner, token);
+      await this.check(s, s.controller.signal);
       return !this.preview && s.bundle.kind === 'artifact' && s.bundle.appType === 'local';
     } catch { return false; }
   }
@@ -298,7 +302,9 @@ export class WebAppRuntime {
       const instance = [...this.instances.values()].find(s => s.owner === owner && s.host === from.host);
       if (!instance) return false;
       const rel = to.pathname.slice(1).split('/').map(decodeURIComponent).join('/');
-      return this.resource(to.host, rel, `chat-app://${from.host}`)?.resolved?.mime.startsWith('text/html') === true;
+      // This synchronous Electron navigation decision grants no resource or
+      // SDK access. The protocol waits for content validation before serving.
+      return this.resourceCandidate(to.host, rel, `chat-app://${from.host}`)?.resolved?.mime.startsWith('text/html') === true;
     } catch { return false; }
   }
   cancelOriginRequests(owner: number, url: string): void {
@@ -325,13 +331,20 @@ export class WebAppRuntime {
     if (!s.seen.add(requestId)) return error('E_LIMIT');
     s.requests.get(requestId)?.abort();
   }
-  resource(host: string, rel: string, origin: string | null) {
+  private resourceCandidate(host: string, rel: string, origin: string | null) {
     const s = [...this.instances.values()].find(item => item.host === host);
     if (!s || s.uid !== this.host.activeUser() || s.controller.signal.aborted) return null;
     try { this.current(s.uid, s.owner, s.token); } catch { return null; }
     if (origin && origin !== `chat-app://${host}`) return null;
     if (!rel || rel.includes('\\') || rel.split('/').some(p => !p || p === '.' || p === '..' || p.startsWith('.'))) return null;
-    return { bundle: s.bundle, resolved: s.bundle.resolve(rel) };
+    return { instance: s, bundle: s.bundle, resolved: s.bundle.resolve(rel) };
+  }
+  async resource(host: string, rel: string, origin: string | null) {
+    const candidate = this.resourceCandidate(host, rel, origin);
+    if (!candidate) return null;
+    try { await this.check(candidate.instance, candidate.instance.controller.signal); }
+    catch { return null; }
+    return { bundle: candidate.bundle, resolved: candidate.resolved };
   }
   private requireCapability(s: Instance, capability: string): void {
     if (!s.manifest.capabilities.includes(capability as any)) return error('E_NOT_DECLARED');
@@ -354,7 +367,7 @@ export class WebAppRuntime {
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(requestId)) return error('E_INPUT');
     if (s.seen.has(requestId)) return error('E_DUPLICATE');
     if (!Object.hasOwn(METHODS, method)) return error('E_METHOD');
-    if(s.bundle.appType==='web'&&!commonMethod(method))return error('E_UNAVAILABLE');
+    if(s.bundle.appType!=='local'&&!commonMethod(method))return error('E_UNAVAILABLE');
     boundedJson(raw,method.startsWith('data.')?1024*1024:MAX_PAYLOAD_BYTES);
     const def = METHODS[method as Method];
     const parsed = def.input.safeParse(raw);
@@ -366,23 +379,30 @@ export class WebAppRuntime {
     const signal = controller.signal;
     try {
       if (def.capability) this.requireCapability(s, def.capability);
-      this.check(s, signal);
+      await this.check(s, signal);
       const value = await this.execute(s, method as Method, parsed.data, signal, event => {
-        this.check(s, signal); boundedJson(event, 64 * 1024); progress(event);
+        this.checkCurrent(s, signal); boundedJson(event, 64 * 1024); progress(event);
       });
-      if (method !== 'permissions.revoke') this.check(s, signal);
+      if (method !== 'permissions.revoke') await this.check(s, signal);
       boundedJson(value,method.startsWith('data.')?2*1024*1024:MAX_PAYLOAD_BYTES);
       return value;
     } catch (cause) {
       // Owning services may reject with Error/AbortError rather than AppError.
       // The request signal, not provider wording, determines SDK cancellation.
+      if (cause instanceof SourceRevisionError) throw cause;
       if (signal.aborted) return error('E_CANCELLED');
       throw cause;
     } finally { s.requests.delete(requestId); }
   }
-  private check(s: Instance, signal: AbortSignal) {
+  private checkCurrent(s: Instance, signal: AbortSignal) {
     if (signal.aborted) return error('E_CANCELLED');
     this.current(s.uid, s.owner, s.token);
+  }
+  private async check(s: Instance, signal: AbortSignal) {
+    this.checkCurrent(s, signal);
+    const valid = await s.bundle.valid?.(signal);
+    this.checkCurrent(s, signal);
+    if (valid === false) { this.close(s.uid, s.owner, s.token); throw new SourceRevisionError(); }
   }
   private async store(s: Instance, action: string, input: any, signal: AbortSignal) {
     const file = this.preview ? path.join(this.preview.storageRoot, input.scope === 'cloud' ? 'cloud-storage.json' : 'storage.json') : webAppDataFile(s.uid, s.bundle.key, input.scope);
@@ -390,7 +410,7 @@ export class WebAppRuntime {
     if (!lock) { lock = { mutex: new Mutex(), users: 0 }; this.stores.set(file, lock); }
     lock.users++;
     try { return await lock.mutex.runExclusive(async () => {
-      this.check(s, signal);
+      await this.check(s, signal);
       if (!isPathAllowed(file, [this.preview?.storageRoot ?? (input.scope === 'cloud' ? userCloudRoot(s.uid) : userLocalRoot(s.uid))])) return error('E_FILE');
       // App-local paths may not alias another application's private store.
       for (const segment of [path.dirname(path.dirname(file)), path.dirname(file), file]) {
@@ -420,7 +440,7 @@ export class WebAppRuntime {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
         this.dropStore(file);
       }
-      this.check(s, signal);
+      await this.check(s, signal);
       if (action === 'storage.get') return { value: Object.hasOwn(entries, input.key) ? entries[input.key] : null };
       if (action === 'storage.keys') return { keys: Object.keys(entries).sort() };
       const next: Record<string, unknown> = Object.assign(Object.create(null), entries);
@@ -432,8 +452,8 @@ export class WebAppRuntime {
       try { json = JSON.stringify({ version: 1, entries: next }, null, 2); } catch { return error('E_INPUT'); }
       const bytes = Buffer.from(json);
       if (bytes.length > STORE_BYTES || !jsonDepthWithin(json, 32)) return error('E_LIMIT');
-      await writeBytesAtomic(file, bytes, { shouldCommit: () => { this.check(s, signal); return true; } });
-      this.check(s, signal);
+      await writeBytesAtomic(file, bytes, { shouldCommit: () => { this.checkCurrent(s, signal); return true; } });
+      await this.check(s, signal);
       // Only sync also writes cloud files, and it could land between this
       // write and a stat; those are re-read on their next call instead.
       const written = this.preview || input.scope !== 'cloud' ? await fs.stat(file).catch(() => null) : null;
@@ -455,7 +475,7 @@ export class WebAppRuntime {
     if (!lock) { lock = { mutex: new Mutex(), users: 0 }; this.stores.set(root, lock); }
     lock.users++;
     const guard = (target: string) => {
-      this.check(s, signal);
+      this.checkCurrent(s, signal);
       const boundary = this.preview?.storageRoot ?? (input.scope === 'cloud' ? userCloudRoot(s.uid) : userLocalRoot(s.uid));
       if (!isPathAllowed(target, [boundary])) return error('E_FILE');
       let current = target;
@@ -466,6 +486,7 @@ export class WebAppRuntime {
       }
     };
     try { return await lock.mutex.runExclusive(async () => {
+      await this.check(s, signal);
       guard(file);
       if (action === 'appFiles.readText' || action === 'appFiles.readBase64') {
         let handle;
@@ -525,8 +546,8 @@ export class WebAppRuntime {
     if (method.startsWith('storage.')) return this.store(s, method, a, signal);
     switch (method) {
       case 'host.getContext': return { language: this.host.language(), sdkVersion: SDK_VERSION, ...(this.preview ? { mode: 'preview' } : {}) };
-      case 'capabilities.describe': return (s.bundle.appType!=='web'||commonMethod(a.method)) && describeMethod(a.method) || error('E_METHOD');
-      case 'capabilities.list': return { sdkVersion: SDK_VERSION, methods: Object.keys(METHODS).filter(name=>s.bundle.appType!=='web'||commonMethod(name)).map(name => {
+      case 'capabilities.describe': return (s.bundle.appType==='local'||commonMethod(a.method)) && describeMethod(a.method) || error('E_METHOD');
+      case 'capabilities.list': return { sdkVersion: SDK_VERSION, methods: Object.keys(METHODS).filter(name=>s.bundle.appType==='local'||commonMethod(name)).map(name => {
         const def = METHODS[name as Method];
         return { name, capability: def.capability, supported: true,
           available: this.available(def.capability) && !(this.preview && name === 'tools.call'),
@@ -536,7 +557,7 @@ export class WebAppRuntime {
       }), unsupported: UNSUPPORTED };
       case 'permissions.revoke': this.close(s.uid, s.owner, s.token); return { revoked: true };
       case 'files.pick': {
-        const selected = await this.host.pick(); this.check(s, signal);
+        const selected = await this.host.pick(); await this.check(s, signal);
         if (!selected) return null;
         const real = await fs.realpath(selected);
         if (isPathAllowed(real, [WS_ROOT])) return error('E_FILE');
@@ -544,8 +565,8 @@ export class WebAppRuntime {
         try {
           const stat = await file.stat();
           if (!stat.isFile() || stat.size > MAX_FILE_BYTES) return error('E_LIMIT');
-          const bytes = await readFileBytes(file, () => this.check(s, signal));
-          this.check(s, signal);
+          const bytes = await readFileBytes(file, () => this.checkCurrent(s, signal));
+          await this.check(s, signal);
           const handle = id(); const name = path.basename(real);
           s.handles.set(handle, { name, bytes });
           return { handle, name, size: bytes.length };
@@ -560,7 +581,7 @@ export class WebAppRuntime {
       case 'files.release': s.handles.delete(a.handle); return { released: true };
       case 'files.saveAs': {
         if (Buffer.byteLength(a.text, 'utf8') > MAX_FILE_BYTES) return error('E_LIMIT');
-        const selected = await this.host.save(a.name); this.check(s, signal);
+        const selected = await this.host.save(a.name); await this.check(s, signal);
         if (!selected) return null;
         const parent = await fs.realpath(path.dirname(selected));
         const target = path.join(parent, path.basename(selected));
@@ -571,7 +592,7 @@ export class WebAppRuntime {
           const file = await fs.open(temp, 'wx', 0o600);
           try { await file.writeFile(a.text, 'utf8'); await file.sync(); }
           finally { await file.close(); }
-          this.check(s, signal);
+          await this.check(s, signal);
           // Atomic create-only publication, including on Windows; never replace.
           await fs.link(temp, target);
         } finally { await fs.unlink(temp).catch(() => {}); }
@@ -583,15 +604,15 @@ export class WebAppRuntime {
       }
       case 'tools.list': {
         if (this.preview) return { tools: [] };
-        const tools = await this.host.tools(s.uid, { id: s.token, owner: s.owner }); this.check(s, signal);
+        const tools = await this.host.tools(s.uid, { id: s.token, owner: s.owner }); await this.check(s, signal);
         return { tools: tools.filter(tool => s.manifest.capabilities.includes(tool.capability)).map(({ execute: _execute, ...info }) => info) };
       }
       case 'tools.call': {
-        const tools = await this.host.tools(s.uid, { id: s.token, owner: s.owner }); this.check(s, signal);
+        const tools = await this.host.tools(s.uid, { id: s.token, owner: s.owner }); await this.check(s, signal);
         const tool = tools.find(tool => tool.name === a.name);
         if (!tool) return error('E_TOOL');
-        this.requireCapability(s, tool.capability); this.check(s, signal);
-        const result = await tool.execute(a.arguments, signal); this.check(s, signal);
+        this.requireCapability(s, tool.capability); await this.check(s, signal);
+        const result = await tool.execute(a.arguments, signal); await this.check(s, signal);
         // Never replay a tool because its result cannot fit the app boundary.
         try { boundedJson(result); } catch { return error('E_RESULT_LIMIT'); }
         return result;

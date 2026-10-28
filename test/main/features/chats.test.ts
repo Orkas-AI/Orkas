@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
@@ -1556,6 +1557,55 @@ describe('chats › index repair', () => {
 });
 
 describe('chats › deleteConversation', () => {
+  it.each(['delete', 'edit', 'create', 'restore', 'module-delete'] as const)('does not publish an old repair snapshot across a concurrent %s', async action => {
+    const chats = await loadChats();
+    const task = await chats.createConversation(TEST_UID, { title: 'Before repair' });
+    const dir = path.join(tmpDir, TEST_UID, 'cloud', 'chats');
+    fs.mkdirSync(path.join(dir, 'unindexed'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'unindexed', 'meta.json'), JSON.stringify({
+      ...task, conversation_id: 'unindexed', title: 'Recovered metadata', _sync_rev: undefined,
+    }));
+    if (action === 'restore') await chats.deleteConversation(TEST_UID, task.conversation_id);
+    let release!: () => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const original = fs.promises.readdir;
+    let held = false;
+    const spy = vi.spyOn(fs.promises, 'readdir').mockImplementation(async (...args: any[]) => {
+      if (!held && String(args[0]) === dir) {
+        held = true; entered();
+        await new Promise<void>(resolve => { release = resolve; });
+      }
+      return (original as any)(...args);
+    });
+    syncBuiltinESMExports();
+    const repair = chats.repairConversationIndex(TEST_UID);
+    await waiting;
+    let created: any;
+    if (action === 'module-delete') {
+      vi.resetModules();
+      await (await loadChats()).deleteConversation(TEST_UID, task.conversation_id);
+    }
+    if (action === 'delete') await chats.deleteConversation(TEST_UID, task.conversation_id);
+    if (action === 'edit') await chats.setConversationPinned(TEST_UID, task.conversation_id, true);
+    if (action === 'restore') await chats.createConversation(TEST_UID, { conversationId: task.conversation_id, title: 'Restored task' });
+    if (action === 'create') created = await chats.createConversation(TEST_UID, { title: 'New task' });
+    release(); await repair; spy.mockRestore(); syncBuiltinESMExports();
+    const rows = JSON.parse(fs.readFileSync(path.join(dir, '_index.json'), 'utf8'));
+    const current = rows.find((r: any) => r.conversation_id === task.conversation_id);
+    if (action === 'delete' || action === 'module-delete') {
+      expect(current.deleted_at).toBeTruthy();
+      expect(fs.existsSync(path.join(dir, task.conversation_id, 'meta.json'))).toBe(false);
+    }
+    if (action === 'restore') {
+      expect(current.deleted_at).toBeUndefined();
+      expect(current.title).toBe('Restored task');
+      expect(fs.existsSync(path.join(dir, task.conversation_id, 'meta.json'))).toBe(true);
+    }
+    if (action === 'edit') expect(current.pinned_at).toBeTruthy();
+    if (action === 'create') expect(rows.some((r: any) => r.conversation_id === created.conversation_id)).toBe(true);
+  });
+
   it('keeps history and the live index when the maintenance guard rejects current metadata', async () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID, { title: 'Protected during preview' });
@@ -1884,6 +1934,238 @@ describe('chats › autoTitle on first send', () => {
 
 describe('chats › sweepStaleProcessing', () => {
   const staleActiveAt = () => new Date(Date.now() - 60_000).toISOString();
+
+  it.each(['both', 'one-finished', 'prior-notice', 'old-turn', 'segment', 'paged', 'write-failure', 'concurrent-sweeps', 'missing-timestamp'])(
+    'recovers each unfinished parallel actor independently and idempotently: %s', async scenario => {
+      const chats = await loadChats();
+      const paths = await import('../../../src/main/paths');
+      const storage = await import('../../../src/main/storage');
+      const conversation = await chats.createConversation(TEST_UID);
+      const cid = conversation.conversation_id;
+      const actors = ['agent-a', 'agent-b'];
+      const file = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+      const stateFile = paths.groupChatStateFile(TEST_UID, cid);
+      const snapshot = { version: 1, status: 'running', ...(scenario === 'missing-timestamp' ? {} : { last_active_at: staleActiveAt() }), in_flight: actors,
+        in_flight_turns: Object.fromEntries(actors.map(id => [id, { turn_id: `turn-${id}`, source_message_id: 'user-1' }])) };
+      fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+      fs.writeFileSync(stateFile, JSON.stringify(snapshot));
+      fs.writeFileSync(paths.groupChatMembersFile(TEST_UID, cid), JSON.stringify({ version: 1,
+        actors: actors.map(id => ({ id, kind: 'agent', joined_at: staleActiveAt() })) }));
+      const user = { id: 'user-1', from: 'user', to: actors, ts: staleActiveAt(), text: 'Review in parallel.' };
+      const terminal = { id: 'terminal-a', from: 'agent-a', to: ['user'], ts: staleActiveAt(), text: 'Finished',
+        source_message_id: 'user-1', turn_id: scenario === 'old-turn' ? 'older-turn' : 'turn-agent-a',
+        ...(scenario === 'prior-notice' ? { system_kind: 'reply_interrupted' } : {}),
+        process: [{ type: 'event', event: { stream: 'runtime', data: {
+          phase: scenario === 'segment' ? 'segment_end' : 'end', duration_ms: 1000,
+        } } }] };
+      const rows = [user, ...(['both', 'write-failure', 'concurrent-sweeps', 'missing-timestamp'].includes(scenario) ? [] : [terminal]),
+        ...(scenario === 'paged' ? Array.from({ length: 24 }, (_, i) => ({ id: `side-${i}`, from: 'commander', to: ['user'],
+          ts: staleActiveAt(), text: 'Public progress', turn_id: 'other-turn' })) : [])];
+      fs.writeFileSync(file, rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+      const journal = paths.userRunningConversationsFile(TEST_UID);
+      fs.mkdirSync(path.dirname(journal), { recursive: true });
+      fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [{ conversation_id: cid }] }));
+      const readRows = () => fs.readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      if (scenario === 'write-failure') {
+        const original = storage.appendJsonlAtomic;
+        const append = vi.spyOn(storage, 'appendJsonlAtomic').mockImplementation(async (...args) => {
+          if (args[0] === file && (args[1] as any).from === 'agent-b') throw Object.assign(new Error('Injected archive failure'), { code: 'EIO' });
+          return original(...args);
+        });
+        try {
+          await chats.sweepStaleProcessing(TEST_UID);
+          const facade = await import('../../../src/main/features/group_chat');
+          expect((await facade.runtimeStatus(TEST_UID, cid)).processing, 'a recovery write failure is not a live model run').toBe(false);
+          expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).status).toBe('running');
+          expect(JSON.parse(fs.readFileSync(journal, 'utf8')).items).toHaveLength(1);
+          expect(readRows().filter(row => row.system_kind === 'reply_interrupted').map(row => row.from)).toEqual(['agent-a']);
+          expect(loggerMocks.warn).toHaveBeenCalledWith('stale sweep recovery remains pending', expect.any(Object));
+        } finally { append.mockRestore(); }
+      }
+      if (scenario === 'missing-timestamp') {
+        const later = Date.now() + 5000;
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(later);
+        try { await chats.sweepStaleProcessing(TEST_UID); }
+        finally { vi.useRealTimers(); }
+      } else if (scenario === 'concurrent-sweeps') await Promise.all([chats.sweepStaleProcessing(TEST_UID), chats.sweepStaleProcessing()]);
+      else await chats.sweepStaleProcessing(TEST_UID);
+      const recovered = readRows();
+      const expected = ['one-finished', 'paged'].includes(scenario) ? ['agent-b'] : ['agent-a', 'agent-b'];
+      expect(recovered.filter(row => row.system_kind === 'reply_interrupted').map(row => row.from)).toEqual(expected);
+      expect(recovered.slice(0, rows.length)).toEqual(rows);
+      expect(recovered.filter(row => row.system_kind === 'reply_interrupted' && row.id !== terminal.id))
+        .toEqual(expect.arrayContaining(expected.filter(id => scenario !== 'prior-notice' || id !== 'agent-a').map(id =>
+          expect.objectContaining({ from: id, turn_id: `turn-${id}`, source_message_id: 'user-1' }))));
+      expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).status).toBe('idle');
+      // Recreated stale journal/state simulates a second crash or sync replay
+      // after notices became durable, before state cleanup reached disk.
+      fs.writeFileSync(stateFile, JSON.stringify(snapshot));
+      fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [{ conversation_id: cid }] }));
+      await chats.sweepStaleProcessing(TEST_UID);
+      expect(readRows()).toEqual(recovered);
+    });
+
+  it.each(['in-flight', 'failed'])('keeps %s startup receipts protected when another sweep queues before status polling', async firstState => {
+    const chats = await loadChats();
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const state = await import('../../../src/main/features/group_chat/state');
+    const facade = await import('../../../src/main/features/group_chat');
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID);
+    const stateFile = paths.groupChatStateFile(TEST_UID, cid);
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(stateFile, JSON.stringify({ version: 1, status: 'running', last_active_at: staleActiveAt(),
+      in_flight: ['agent-a'], in_flight_turns: { 'agent-a': { turn_id: 'old-turn', source_message_id: 'old-source' } } }));
+    const file = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    fs.writeFileSync(file, JSON.stringify({ id: 'old-source', from: 'user', to: ['agent-a'],
+      ts: staleActiveAt(), text: 'Recover this turn' }) + '\n');
+    const journal = paths.userRunningConversationsFile(TEST_UID);
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [{ conversation_id: cid }] }));
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const original = storage.appendJsonlAtomic;
+    const append = vi.spyOn(storage, 'appendJsonlAtomic').mockImplementation(async (...args) => {
+      if (args[0] === file) {
+        if (firstState === 'in-flight') { entered(); await gate; }
+        throw Object.assign(new Error('Injected archive failure'), { code: 'EIO' });
+      }
+      return original(...args);
+    });
+    const recoveries = [chats.sweepStaleProcessing(TEST_UID)];
+    let registry: ReturnType<typeof vi.spyOn> | undefined;
+    let readSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      if (firstState === 'in-flight') await ready;
+      else {
+        // The active-user pre-window sweep failed. The deferred maintenance
+        // retry must retain its protection while reloading the same state.
+        await recoveries[0];
+        const read = fs.promises.readFile;
+        let blocked = false;
+        readSpy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (...args: any[]) => {
+          if (String(args[0]) === stateFile && !blocked) { blocked = true; entered(); await gate; }
+          return (read as any)(...args);
+        });
+        syncBuiltinESMExports();
+      }
+      // A resolved registry read makes the second sweep enqueue on the next
+      // microtask. The event-loop barrier drains that continuation while the
+      // first sweep remains blocked on the explicit append gate.
+      const tracked = await state.readRunningConversationRegistry(TEST_UID);
+      registry = vi.spyOn(state, 'readRunningConversationRegistry').mockResolvedValue(tracked);
+      recoveries.push(chats.sweepStaleProcessing(TEST_UID));
+      if (firstState === 'failed') await ready;
+      else await new Promise<void>(resolve => setImmediate(resolve));
+      expect(registry).toHaveBeenCalledOnce();
+      expect((await facade.runtimeStatus(TEST_UID, cid)).processing).toBe(false);
+      expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).status).toBe('running');
+      expect(JSON.parse(fs.readFileSync(journal, 'utf8')).items).toHaveLength(1);
+    } finally {
+      release(); await Promise.all(recoveries); append.mockRestore(); registry?.mockRestore();
+      readSpy?.mockRestore(); syncBuiltinESMExports();
+    }
+    expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).status).toBe('running');
+    await chats.sweepStaleProcessing(TEST_UID);
+    const readRows = () => fs.readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(readRows().filter(row => row.system_kind === 'reply_interrupted'))
+      .toEqual([expect.objectContaining({ from: 'agent-a', turn_id: 'old-turn', source_message_id: 'old-source' })]);
+    expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).status).toBe('idle');
+    expect(JSON.parse(fs.readFileSync(journal, 'utf8')).items).toHaveLength(0);
+    await chats.sweepStaleProcessing(TEST_UID);
+    expect(readRows().filter(row => row.system_kind === 'reply_interrupted')).toHaveLength(1);
+  });
+
+  it('recovers all legacy in-flight actors when only one has a durable terminal reply', async () => {
+    const chats = await loadChats();
+    const paths = await import('../../../src/main/paths');
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID);
+    const stateFile = paths.groupChatStateFile(TEST_UID, cid);
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(stateFile, JSON.stringify({ version: 1, status: 'running', last_active_at: staleActiveAt(), in_flight: ['agent-a', 'agent-b'] }));
+    const file = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    fs.writeFileSync(file, [
+      { id: 'user-1', from: 'user', to: ['agent-a', 'agent-b'], ts: staleActiveAt(), text: 'Review' },
+      { id: 'reply-a', from: 'agent-a', to: ['user'], ts: staleActiveAt(), text: 'Done', source_message_id: 'user-1' },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const journal = paths.userRunningConversationsFile(TEST_UID);
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [{ conversation_id: cid }] }));
+    await chats.sweepStaleProcessing(TEST_UID);
+    const rows = fs.readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(rows.filter(row => row.system_kind === 'reply_interrupted').map(row => row.from)).toEqual(['agent-b']);
+  });
+
+  it('keeps a legacy private worker out of user-visible interruption notices', async () => {
+    const chats = await loadChats();
+    const paths = await import('../../../src/main/paths');
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID);
+    const stateFile = paths.groupChatStateFile(TEST_UID, cid);
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(stateFile, JSON.stringify({ version: 1, status: 'running', last_active_at: staleActiveAt(),
+      in_flight: ['commander', 'private-worker'] }));
+    fs.writeFileSync(paths.groupChatMembersFile(TEST_UID, cid), JSON.stringify({ version: 1,
+      actors: [{ id: 'commander', kind: 'commander', joined_at: staleActiveAt() }] }));
+    const file = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    fs.writeFileSync(file, JSON.stringify({ id: 'user-1', from: 'user', to: ['commander'], ts: staleActiveAt(), text: 'Review' }) + '\n');
+    const journal = paths.userRunningConversationsFile(TEST_UID);
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [{ conversation_id: cid }] }));
+    await chats.sweepStaleProcessing(TEST_UID);
+    const rows = fs.readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(rows.filter(row => row.system_kind === 'reply_interrupted').map(row => row.from)).toEqual(['commander']);
+  });
+
+  it.each([false, true])('keeps newly admitted execution state when startup history inspection is delayed (old turn settled: %s)', async settled => {
+    const chats = await loadChats();
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const state = await import('../../../src/main/features/group_chat/state');
+    const bus = require('../../../src/main/features/group_chat/bus') as typeof import('../../../src/main/features/group_chat/bus');
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID);
+    const stateFile = paths.groupChatStateFile(TEST_UID, cid);
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(stateFile, JSON.stringify({ version: 1, status: 'running', last_active_at: staleActiveAt(), in_flight: ['agent-a'],
+      in_flight_turns: { 'agent-a': { turn_id: 'old-turn', source_message_id: 'old-source' } } }));
+    const file = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    fs.writeFileSync(file, [
+      { id: 'old-source', from: 'user', to: ['agent-a'], ts: staleActiveAt(), text: 'Old task' },
+      ...(settled ? [{ id: 'old-reply', from: 'agent-a', to: ['user'], ts: staleActiveAt(), text: 'Finished',
+        turn_id: 'old-turn', source_message_id: 'old-source' }] : []),
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const journal = paths.userRunningConversationsFile(TEST_UID);
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [{ conversation_id: cid }] }));
+    const original = storage.readJsonlPageWithOffsets;
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const page = vi.spyOn(storage, 'readJsonlPageWithOffsets').mockImplementation(async (...args) => {
+      const result = await original(...args);
+      if (args[0] === file) { entered(); await gate; }
+      return result;
+    });
+    const unsubscribe = bus.subscribe(TEST_UID, cid, () => {});
+    const live = bus._cidStateForTest(TEST_UID, cid)!;
+    const recovery = chats.sweepStaleProcessing(TEST_UID);
+    try {
+      await ready;
+      // Hold the scheduler's actual admission latch while disk inspection is
+      // delayed. No model request is needed to establish admitted work.
+      live.admittedInFlight += 1;
+      await state.setStatus(TEST_UID, cid, 'running');
+      await state.markInFlight(TEST_UID, cid, 'commander', true, { turn_id: 'new-turn', source_message_id: 'new-source' });
+      const current = fs.readFileSync(stateFile, 'utf8');
+      release(); await recovery;
+      expect(fs.readFileSync(stateFile, 'utf8')).toBe(current);
+      expect(JSON.parse(fs.readFileSync(journal, 'utf8')).items).toHaveLength(1);
+    } finally {
+      release(); await recovery; page.mockRestore();
+      live.admittedInFlight = 0; unsubscribe(); await bus.dropConv(TEST_UID, cid);
+    }
+  });
 
   it('does not load the Group Chat runtime when the compact journal is empty', async () => {
     const paths = await import('../../../src/main/paths');

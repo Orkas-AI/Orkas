@@ -37,6 +37,22 @@ function options(signal = new AbortController().signal) {
 }
 
 describe('OpenClaw per-run bridge configuration', () => {
+  it('resolves the final native config path after ANSI doctor diagnostics without modifying the source', async () => {
+    const before = fs.readFileSync(source, 'utf8');
+    const output = '\u001b[33m│ Configuration notices │\u001b[0m\n│ Existing profile retained │\n' + source + '\n';
+    fs.writeFileSync(path.join(root, 'config'), `process.stdout.write(${JSON.stringify(output)});`);
+    const prepared = await prepareOpenclawBridge(options());
+    try {
+      expect(path.dirname(prepared.env.OPENCLAW_CONFIG_PATH!)).toBe(root);
+      expect(fs.readFileSync(source, 'utf8')).toBe(before);
+    } finally { prepared.cleanup(); }
+  });
+
+  it('rejects diagnostic text after the path instead of selecting an earlier path-looking line', async () => {
+    fs.writeFileSync(path.join(root, 'config'), `process.stdout.write(${JSON.stringify(source + '\nInvalid trailing output\n')});`);
+    await expect(prepareOpenclawBridge(options())).rejects.toThrow(/OpenClaw/);
+    expect(fs.readdirSync(root).filter(name => name.startsWith('.orkas-run-'))).toEqual([]);
+  });
   it('keeps concurrent overlays distinct, preserves original settings and removes only its own files', async () => {
     const original = fs.readFileSync(source, 'utf8');
     const one = await prepareOpenclawBridge(options());

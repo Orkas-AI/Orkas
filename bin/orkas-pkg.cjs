@@ -156,13 +156,17 @@ function registryLockOwner(lockPath) {
   if (!/^[1-9]\d*$/.test(raw)) return { state: 'unknown', pid: null };
   const pid = Number(raw);
   if (!Number.isSafeInteger(pid)) return { state: 'unknown', pid: null };
+  return { state: processOwnerState(pid), pid };
+}
+
+function processOwnerState(pid) {
   try {
     process.kill(pid, 0);
-    return { state: 'alive', pid };
+    return 'alive';
   } catch (e) {
     // EPERM means the process exists but this user cannot signal it. Reclaim
     // only on ESRCH so an unexpected platform error stays conservative.
-    return { state: e && e.code === 'ESRCH' ? 'dead' : 'alive', pid };
+    return e && e.code === 'ESRCH' ? 'dead' : 'alive';
   }
 }
 
@@ -187,20 +191,58 @@ function cleanupAbandonedStaging(uid, deadPid) {
 async function withRegistryLock(uid, fn) {
   fs.mkdirSync(packagesDir(uid), { recursive: true });
   const lockPath = path.join(packagesDir(uid), '_registry.lock');
+  const claimsDir = path.join(packagesDir(uid), '.registry-lock-claims');
+  const claimName = `${process.pid}-${crypto.randomBytes(16).toString('hex')}`;
+  const claimPath = path.join(claimsDir, claimName);
   let fd = null;
   let ownsLock = false;
+  let ownsClaim = false;
   let abandonedOwnerPid = null;
   // `die()` calls process.exit, which skips `finally`, so normal CLI exits use
   // this hook. A host timeout can terminate the process without running either
   // cleanup path; the next operation recovers that abandoned PID lock below.
   const releaseLock = () => {
-    if (!ownsLock) return;
-    if (fd !== null) { try { fs.closeSync(fd); } catch { /* already closed */ } fd = null; }
-    ownsLock = false;
-    try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
+    if (ownsLock) {
+      let identity;
+      try { identity = fs.fstatSync(fd, { bigint: true }); } catch { /* no owned file */ }
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* already closed */ } fd = null; }
+      ownsLock = false;
+      try {
+        const current = fs.lstatSync(lockPath, { bigint: true });
+        if (identity && current.isFile() && current.dev === identity.dev && current.ino === identity.ino
+          && fs.readFileSync(lockPath, 'utf8').trim() === String(process.pid)) fs.unlinkSync(lockPath);
+      } catch { /* missing or replaced locks are not ours to remove */ }
+    }
+    if (ownsClaim) {
+      ownsClaim = false;
+      try { fs.unlinkSync(claimPath); } catch { /* unique to this operation */ }
+    }
   };
   process.on('exit', releaseLock);
   try {
+    // Publish a unique intent BEFORE inspecting other intents. If two callers
+    // overlap, at least one sees the other's live intent and backs off; both
+    // may back off. Never elect a lower-id newcomer over an active owner.
+    // Unique paths are never reused, so dead intents can be removed without
+    // racing a replacement owner. This also serializes legacy-lock recovery
+    // without introducing another shared stale lock that needs recovery.
+    fs.mkdirSync(claimsDir, { recursive: true });
+    const claimFd = fs.openSync(claimPath, 'wx');
+    ownsClaim = true;
+    fs.closeSync(claimFd);
+    for (const name of fs.readdirSync(claimsDir)) {
+      if (name === claimName) continue;
+      const match = /^([1-9]\d*)-[a-f0-9]{32}$/.exec(name);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      if (Number.isSafeInteger(pid) && processOwnerState(pid) === 'dead') {
+        try { fs.unlinkSync(path.join(claimsDir, name)); } catch (error) {
+          if (!error || error.code !== 'ENOENT') throw error;
+        }
+      } else {
+        die(75, 'another orkas-pkg operation is in progress; retry shortly', { lock: lockPath });
+      }
+    }
     try {
       fd = fs.openSync(lockPath, 'wx');
       ownsLock = true;
@@ -213,7 +255,6 @@ async function withRegistryLock(uid, fn) {
           try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch { stale = true; }
         }
         if (!stale) {
-          process.removeListener('exit', releaseLock); // not our lock — leave it
           die(75, 'another orkas-pkg operation is in progress; retry shortly', { lock: lockPath });
         }
         try { fs.unlinkSync(lockPath); } catch { /* raced */ }
@@ -222,7 +263,6 @@ async function withRegistryLock(uid, fn) {
           ownsLock = true;
         } catch (retryError) {
           if (retryError && retryError.code === 'EEXIST') {
-            process.removeListener('exit', releaseLock);
             die(75, 'another orkas-pkg operation is in progress; retry shortly', { lock: lockPath });
           }
           throw retryError;

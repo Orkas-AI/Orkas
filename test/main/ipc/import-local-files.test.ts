@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { expectTestLog } from '../../helpers/test-log-analysis';
 import * as fs from 'node:fs';
+import mutableFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -9,6 +11,23 @@ import { makeMinimalPdf } from '../../fixtures/make-minimal-pdf';
 import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
 import { makeMinimalXlsx, makeMinimalPptx } from '../../fixtures/make-minimal-office';
 import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
+
+const { ipcDiagnostics } = vi.hoisted(() => ({ ipcDiagnostics: vi.fn() }));
+function captureIpcDiagnostics() {
+  // Recreate after resetModules: retaining importOriginal's old logger would
+  // retain a delivery worker already closed by the preceding case.
+  vi.doMock('../../../src/main/logger', async importOriginal => {
+    const actual = await importOriginal<typeof import('../../../src/main/logger')>();
+    return { ...actual, createLogger: (scope: string) => {
+      const logger = actual.createLogger(scope);
+      if (scope !== 'ipc') return logger;
+      return { ...logger,
+        warn: (...args: Parameters<typeof logger.warn>) => { ipcDiagnostics('warn', ...args); logger.warn(...args); },
+        error: (...args: Parameters<typeof logger.error>) => { ipcDiagnostics('error', ...args); logger.error(...args); },
+      };
+    } };
+  });
+}
 
 // `orkas.importLocalFiles` is the private preload → main channel that carries
 // paths resolved from genuine user-selected File objects. The conversation
@@ -56,6 +75,7 @@ beforeEach(async () => {
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
   closeLogWorkers = await captureMainLogWorkers();
+  captureIpcDiagnostics();
   vi.clearAllMocks();
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -63,7 +83,9 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await closeLogWorkers();
+  vi.doUnmock('../../../src/main/logger');
   vi.restoreAllMocks();
+  syncBuiltinESMExports();
   if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(sourceDir, { recursive: true, force: true });
@@ -100,6 +122,78 @@ async function invoke(channel: string, payload: unknown, sender: unknown = trust
 }
 
 describe('add a user-selected local file to conversation attachments', () => {
+  it.each(['bytes', 'internal', 'picker', 'drop'])('retains destination errno on the %s route and keeps diagnostics private', async route => {
+    const abs = sourceFile('PRIVATE_SELECTED.txt', 'selected bytes');
+    const electron = await import('electron') as any;
+    const mkdir = mutableFs.mkdirSync;
+    const fault = vi.spyOn(mutableFs, 'mkdirSync').mockImplementation(((target: any, ...args: any[]) => {
+      if (String(target) === attachmentDir()) throw Object.assign(new Error('PRIVATE_DESTINATION'), { code: 'ENOSPC' });
+      return (mkdir as any)(target, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    const add = () => {
+      if (route === 'picker') electron.dialog.showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [abs] });
+      return route === 'drop'
+      ? importLocalFiles({ scope: 'conversation', cid: CID, entries: [{ index: 0, path: abs, name: path.basename(abs) }] })
+      : invoke(route === 'bytes' ? 'conversations.attachments.upload' : route === 'picker' ? 'conversations.attachments.pickAndUpload' : 'conversations.attachments.import',
+        route === 'bytes' ? { cid: CID, name: path.basename(abs), data: Buffer.from('selected bytes').toString('base64') } : { cid: CID, path: abs });
+    };
+    if (route === 'bytes' || route === 'internal') expectTestLog({ level: 'error', source: 'ipc', message: /^invoke conversations\.attachments\.(?:upload|import) failed/ });
+    const result = await add();
+    const failure = route === 'drop' ? result.files[0] : route === 'picker' ? result.failed[0] : result;
+    expect(failure).toMatchObject({ failure_kind: 'disk_full' });
+    if (route !== 'picker') expect(failure.ok).toBe(false);
+    expect(fs.existsSync(attachmentDir())).toBe(false);
+    const records = ipcDiagnostics.mock.calls;
+    expect(records).toHaveLength(1);
+    expect(records[0][2]).toMatchObject({ failure_kind: 'disk_full' });
+    expect(JSON.stringify(records)).not.toMatch(/PRIVATE_SELECTED|PRIVATE_DESTINATION|\.txt|ENOSPC:/);
+    fault.mockRestore(); syncBuiltinESMExports();
+    const recovered = await add();
+    expect(route === 'drop' ? recovered.files[0].ok : route === 'picker' ? recovered.failed.length === 0 : recovered.ok).toBe(true);
+    expect(fs.readFileSync(path.join(attachmentDir(), 'PRIVATE_SELECTED.txt'), 'utf8')).toBe('selected bytes');
+  });
+
+  it.each(['picker', 'drop'])('logs one bounded private-safe diagnostic for a mixed %s batch, with dedupe', async route => {
+    const good = sourceFile('PRIVATE_GOOD.txt', 'complete');
+    const missing = path.join(sourceDir, 'PRIVATE_MISSING.txt');
+    const unsupported = sourceFile('PRIVATE_UNSUPPORTED.exe', 'unsupported');
+    const add = async () => {
+      if (route === 'drop') return importLocalFiles({ scope: 'conversation', cid: CID, entries: [good, missing, unsupported].map((p, index) => ({ index, path: p, name: path.basename(p) })) });
+      const electron = await import('electron') as any;
+      electron.dialog.showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [good, missing, unsupported] });
+      return invoke('conversations.attachments.pickAndUpload', { cid: CID });
+    };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await add();
+      if (route === 'drop') expect(result.files.map((r: any) => r.ok)).toEqual([true, false, false]);
+      else { expect(result.items).toHaveLength(1); expect(result.failed).toHaveLength(2); }
+    }
+    expect(ipcDiagnostics.mock.calls).toEqual([['warn', 'invoke returned failure', {
+      channel: route === 'drop' ? 'orkas.importLocalFiles' : 'conversations.attachments.pickAndUpload',
+      code: 'mixed', failure_kind: 'mixed', failed_count: 2,
+    }]]);
+    expect(JSON.stringify(ipcDiagnostics.mock.calls)).not.toContain('PRIVATE_');
+    expect(fs.readFileSync(path.join(attachmentDir(), 'PRIVATE_GOOD.txt'), 'utf8')).toBe('complete');
+  });
+
+  it('retains a copy-specific code and does not suppress a different errno category', async () => {
+    const abs = sourceFile('PRIVATE_COPY.txt', 'complete source');
+    const copy = vi.spyOn(fs.promises, 'copyFile');
+    const add = () => invoke('conversations.attachments.import', { cid: CID, path: abs });
+    for (const code of ['EACCES', 'EACCES', 'ENOSPC']) {
+      copy.mockRejectedValueOnce(Object.assign(new Error('PRIVATE_COPY_ERROR'), { code }));
+      expect(await add()).toMatchObject({ ok: false, error_code: 'copy_failed', failure_kind: code === 'ENOSPC' ? 'disk_full' : 'permission_denied' });
+    }
+    expect(ipcDiagnostics.mock.calls).toEqual(['permission_denied', 'disk_full'].map(failure_kind => ['warn', 'invoke returned failure', {
+      channel: 'conversations.attachments.import', code: 'copy_failed', failure_kind,
+    }]));
+    expect(JSON.stringify(ipcDiagnostics.mock.calls)).not.toContain('PRIVATE_');
+    copy.mockRestore();
+    expect(await add()).toMatchObject({ ok: true });
+    expect(fs.readFileSync(path.join(attachmentDir(), 'PRIVATE_COPY.txt'), 'utf8')).toBe('complete source');
+  });
+
   it.each([
     ['mp3', 'audio'], ['wav', 'audio'], ['png', 'image'],
     ['txt', 'text'], ['pdf', 'pdf'], ['docx', 'docx'], ['xlsx', 'spreadsheet'],
@@ -369,15 +463,16 @@ describe('orkas.importLocalFiles › conversation scope', () => {
     });
 
     expect(viaBytes.ok).toBe(false);
+    expect(viaBytes).toMatchObject({ error_code: 'file_too_large' });
     expect(viaPath.files).toEqual([expect.objectContaining({
-      index: 0, ok: false, error: (viaBytes as { error: string }).error,
+      index: 0, ok: false, error: (viaBytes as { error: string }).error, error_code: 'file_too_large',
     })]);
     const viaMenu = await invoke('conversations.attachments.import', { cid: CID, path: abs });
-    expect(viaMenu).toMatchObject({ ok: false, error: (viaBytes as { error: string }).error });
+    expect(viaMenu).toMatchObject({ ok: false, error: (viaBytes as { error: string }).error, error_code: 'file_too_large' });
     const { dialog } = await import('electron');
     vi.mocked(dialog.showOpenDialog).mockResolvedValueOnce({ canceled: false, filePaths: [abs] });
     await expect(invoke('conversations.attachments.pickAndUpload', { cid: CID }))
-      .resolves.toMatchObject({ items: [], failed: [{ name: 'skills.zip', error: (viaBytes as { error: string }).error }] });
+      .resolves.toMatchObject({ items: [], failed: [{ name: 'skills.zip', error: (viaBytes as { error: string }).error, error_code: 'file_too_large' }] });
     expect(fs.existsSync(path.join(attachmentDir(), 'skills.zip'))).toBe(false);
     // The exact supported limit succeeds; this catches an off-by-one rejection.
     fs.truncateSync(abs, 8 * 1024 * 1024);

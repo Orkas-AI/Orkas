@@ -289,7 +289,7 @@ function _renderMarkdownFullInner(md, blockCache) {
     const placeholder = _protectedDashboardPlaceholder(body, protectedBlocks);
     if (placeholder) return placeholder;
     const spec = _parseDashboardSpec(body);
-    if (spec !== undefined) return protect(renderDashboard(spec));
+    if (spec !== undefined) return protect(_renderDashboardOrSource(spec, body));
     return protect(`<pre class="code-view dashboard-parse-error"><code>${escapeHtml(body.trim())}</code></pre>`);
   });
 
@@ -707,7 +707,7 @@ function _renderDashboardFromJsonBlock(lang, code) {
   if (body == null) return '';
   const spec = _parseDashboardSpec(body);
   if (!_looksLikeDashboardSpec(spec)) return '';
-  return renderDashboard(spec);
+  return _renderDashboardOrSource(spec, body);
 }
 
 function _protectedDashboardPlaceholder(body, protectedBlocks) {
@@ -765,7 +765,7 @@ function _replaceStandaloneDashboardJsonBlocks(md, protect) {
       startRe.lastIndex = start + 1;
       continue;
     }
-    out += text.slice(cursor, start) + protect(renderDashboard(spec));
+    out += text.slice(cursor, start) + protect(_renderDashboardOrSource(spec, candidate));
     cursor = end;
     startRe.lastIndex = end;
   }
@@ -1009,6 +1009,17 @@ function renderDashboard(spec) {
   const themeStyle = _dbEnum({ minimal: 'minimal', card: 'card' }, theme.style, 'minimal');
   const inner = _renderDbNode(spec.root);
   return `<div class="dashboard" data-theme-color="${themeColor}" data-theme-style="${themeStyle}">${inner}</div>`;
+}
+
+function _renderDashboardOrSource(spec, source) {
+  try {
+    return renderDashboard(spec);
+  } catch (error) {
+    if (!(error instanceof RangeError || error instanceof TypeError)) throw error;
+    // Deep trees and uncoercible JSON props can fail during rendering. Retain
+    // their complete source, as with parse failures, without losing the reply.
+    return `<pre class="code-view dashboard-render-error"><code>${escapeHtml(source.trim())}</code></pre>`;
+  }
 }
 
 function _renderDbNode(node) {

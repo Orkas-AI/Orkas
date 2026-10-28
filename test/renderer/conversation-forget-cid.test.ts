@@ -23,6 +23,8 @@ describe('conversation › _forgetCidRecipient', () => {
     // boundary; entries of other conversations must survive.
     const globals = {
       window: { CliAsyncInput: { forget: vi.fn() } },
+      _taskSurfaceAbortRefreshOwners: new Map(),
+      _forgetConversationRuntime: vi.fn(),
       _recipientByCid: { c1: 'agent-a' },
       _saveRecipientMap: vi.fn(),
       _autoRecipientByCid: new Map([['c1', 1]]),

@@ -215,6 +215,11 @@ contextBridge.exposeInMainWorld('orkas', {
   getLanguage: () => invoke('config.getLanguage'),
   setLanguage: (language) => invoke('config.setLanguage', { language }),
   getLocales: () => invoke('config.getLocales'),
+  voiceInput: {
+    status: () => invoke('voiceInput.status'),
+    createSession: () => invoke('voiceInput.createSession'),
+    ensureMicrophoneAccess: () => invoke('voiceInput.ensureMicrophoneAccess'),
+  },
   recycleBin,
   quality,
   invoke,

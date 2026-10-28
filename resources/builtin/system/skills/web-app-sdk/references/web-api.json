@@ -3,6 +3,7 @@
   "manifest": {
     "file": "orkas-app.json",
     "schema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
       "type": "object",
       "properties": {
         "sdkVersion": {
@@ -14,14 +15,14 @@
           "const": "1.9.0"
         },
         "capabilities": {
+          "maxItems": 7,
           "type": "array",
           "items": {
             "type": "string",
             "enum": [
               "data"
             ]
-          },
-          "maxItems": 7
+          }
         },
         "data": {
           "type": "object",
@@ -31,6 +32,7 @@
               "const": 1
             },
             "tables": {
+              "maxItems": 32,
               "type": "array",
               "items": {
                 "type": "object",
@@ -44,6 +46,7 @@
                     "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
                   },
                   "fields": {
+                    "maxItems": 128,
                     "type": "array",
                     "items": {
                       "type": "object",
@@ -97,27 +100,26 @@
                         "type"
                       ],
                       "additionalProperties": false
-                    },
-                    "maxItems": 128
+                    }
                   },
                   "access": {
                     "type": "object",
                     "properties": {
                       "read": {
+                        "default": [],
                         "type": "array",
                         "items": {
                           "type": "string",
                           "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
-                        },
-                        "default": []
+                        }
                       },
                       "insert": {
+                        "default": [],
                         "type": "array",
                         "items": {
                           "type": "string",
                           "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
-                        },
-                        "default": []
+                        }
                       },
                       "count": {
                         "type": "boolean"
@@ -135,6 +137,7 @@
                         }
                       },
                       "readFilters": {
+                        "maxItems": 16,
                         "type": "array",
                         "items": {
                           "type": "object",
@@ -179,24 +182,23 @@
                             "value"
                           ],
                           "additionalProperties": false
-                        },
-                        "maxItems": 16
+                        }
                       }
                     },
                     "additionalProperties": false
                   },
                   "indexes": {
+                    "maxItems": 16,
                     "type": "array",
                     "items": {
+                      "minItems": 1,
+                      "maxItems": 4,
                       "type": "array",
                       "items": {
                         "type": "string",
                         "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
-                      },
-                      "minItems": 1,
-                      "maxItems": 4
-                    },
-                    "maxItems": 16
+                      }
+                    }
                   }
                 },
                 "required": [
@@ -206,8 +208,7 @@
                   "access"
                 ],
                 "additionalProperties": false
-              },
-              "maxItems": 32
+              }
             }
           },
           "required": [
@@ -222,7 +223,6 @@
         "capabilities"
       ],
       "additionalProperties": false,
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "allOf": [
         {
           "if": {
@@ -251,6 +251,7 @@
     }
   },
   "dataDefinition": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
     "properties": {
       "version": {
@@ -258,6 +259,7 @@
         "const": 1
       },
       "tables": {
+        "maxItems": 32,
         "type": "array",
         "items": {
           "type": "object",
@@ -271,6 +273,7 @@
               "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
             },
             "fields": {
+              "maxItems": 128,
               "type": "array",
               "items": {
                 "type": "object",
@@ -324,27 +327,26 @@
                   "type"
                 ],
                 "additionalProperties": false
-              },
-              "maxItems": 128
+              }
             },
             "access": {
               "type": "object",
               "properties": {
                 "read": {
+                  "default": [],
                   "type": "array",
                   "items": {
                     "type": "string",
                     "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
-                  },
-                  "default": []
+                  }
                 },
                 "insert": {
+                  "default": [],
                   "type": "array",
                   "items": {
                     "type": "string",
                     "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
-                  },
-                  "default": []
+                  }
                 },
                 "count": {
                   "type": "boolean"
@@ -362,6 +364,7 @@
                   }
                 },
                 "readFilters": {
+                  "maxItems": 16,
                   "type": "array",
                   "items": {
                     "type": "object",
@@ -406,24 +409,23 @@
                       "value"
                     ],
                     "additionalProperties": false
-                  },
-                  "maxItems": 16
+                  }
                 }
               },
               "additionalProperties": false
             },
             "indexes": {
+              "maxItems": 16,
               "type": "array",
               "items": {
+                "minItems": 1,
+                "maxItems": 4,
                 "type": "array",
                 "items": {
                   "type": "string",
                   "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
-                },
-                "minItems": 1,
-                "maxItems": 4
-              },
-              "maxItems": 16
+                }
+              }
             }
           },
           "required": [
@@ -433,16 +435,14 @@
             "access"
           ],
           "additionalProperties": false
-        },
-        "maxItems": 32
+        }
       }
     },
     "required": [
       "version",
       "tables"
     ],
-    "additionalProperties": false,
-    "$schema": "http://json-schema.org/draft-07/schema#"
+    "additionalProperties": false
   },
   "methods": [
     {
@@ -460,6 +460,7 @@
       ],
       "status": "supported",
       "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
           "table": {
@@ -467,22 +468,23 @@
             "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
           },
           "fields": {
+            "maxItems": 130,
             "type": "array",
             "items": {
               "type": "string",
               "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
-            },
-            "maxItems": 130
+            }
           },
           "include": {
+            "maxItems": 4,
             "type": "array",
             "items": {
               "type": "string",
               "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
-            },
-            "maxItems": 4
+            }
           },
           "filters": {
+            "maxItems": 16,
             "type": "array",
             "items": {
               "type": "object",
@@ -527,8 +529,7 @@
                 "value"
               ],
               "additionalProperties": false
-            },
-            "maxItems": 16
+            }
           },
           "limit": {
             "type": "integer",
@@ -565,8 +566,7 @@
         "required": [
           "table"
         ],
-        "additionalProperties": false,
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "additionalProperties": false
       },
       "result": "{records:object[]}; include adds relations keyed by reference field.",
       "example": {
@@ -592,6 +592,7 @@
       ],
       "status": "supported",
       "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
           "table": {
@@ -599,6 +600,7 @@
             "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
           },
           "filters": {
+            "maxItems": 16,
             "type": "array",
             "items": {
               "type": "object",
@@ -643,15 +645,13 @@
                 "value"
               ],
               "additionalProperties": false
-            },
-            "maxItems": 16
+            }
           }
         },
         "required": [
           "table"
         ],
-        "additionalProperties": false,
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "additionalProperties": false
       },
       "result": "{count:number}",
       "example": {
@@ -673,6 +673,7 @@
       ],
       "status": "supported",
       "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
           "table": {
@@ -681,6 +682,9 @@
           },
           "values": {
             "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
             "additionalProperties": {}
           },
           "requestId": {
@@ -692,8 +696,7 @@
           "table",
           "values"
         ],
-        "additionalProperties": false,
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "additionalProperties": false
       },
       "result": "{id:string}; generated record ID, never the private row.",
       "example": {
@@ -719,6 +722,7 @@
       ],
       "status": "supported",
       "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
           "table": {
@@ -727,6 +731,9 @@
           },
           "values": {
             "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
             "additionalProperties": {}
           },
           "requestId": {
@@ -744,8 +751,7 @@
           "values",
           "maxCount"
         ],
-        "additionalProperties": false,
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "additionalProperties": false
       },
       "result": "{id:string}; no partial insertion on failure.",
       "example": {
@@ -772,6 +778,7 @@
       ],
       "status": "supported",
       "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
           "table": {
@@ -797,6 +804,7 @@
             "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
           },
           "filters": {
+            "maxItems": 16,
             "type": "array",
             "items": {
               "type": "object",
@@ -841,8 +849,7 @@
                 "value"
               ],
               "additionalProperties": false
-            },
-            "maxItems": 16
+            }
           }
         },
         "required": [
@@ -850,8 +857,7 @@
           "field",
           "op"
         ],
-        "additionalProperties": false,
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "additionalProperties": false
       },
       "result": "{value:number|string|null} or {groups:[{key,value}]} when groupBy is supplied.",
       "example": {
@@ -875,10 +881,10 @@
       ],
       "status": "supported",
       "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {},
-        "additionalProperties": false,
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "additionalProperties": false
       },
       "result": "{sdkVersion, methods, unsupported}",
       "example": {}
@@ -898,6 +904,7 @@
       ],
       "status": "supported",
       "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
           "method": {
@@ -908,8 +915,7 @@
         "required": [
           "method"
         ],
-        "additionalProperties": false,
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "additionalProperties": false
       },
       "result": "Method documentation.",
       "example": {
@@ -931,10 +937,10 @@
       ],
       "status": "supported",
       "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {},
-        "additionalProperties": false,
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "additionalProperties": false
       },
       "result": "{language, sdkVersion}",
       "example": {}

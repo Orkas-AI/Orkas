@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { createServer as createTcpServer } from "node:net";
+import { get as httpGet } from "node:http";
 import { SandboxExecutor } from "../src/sandbox/executor.js";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -97,6 +99,46 @@ afterEach(async () => {
 });
 
 describe("persistent process sessions", () => {
+  it.each(["legacy", "managed"])("keeps a local server alive through startup, readiness checks and explicit shutdown: %s", async mode => {
+    const reservation = createTcpServer();
+    await new Promise<void>(resolve => reservation.listen(0, "127.0.0.1", resolve));
+    const port = (reservation.address() as { port: number }).port;
+    await new Promise<void>(resolve => reservation.close(() => resolve()));
+    const fixture = path.join(workingDir, "startup-server.cjs");
+    await fs.writeFile(fixture, `console.log('BOOTING');
+process.stdin.once('data', () => {
+  require('node:http').createServer((_req,res) => res.end('local-service-ready'))
+    .listen(${port}, '127.0.0.1', () => console.log('LISTENING'));
+});
+process.stdin.resume();`);
+    const owner = `local-server-${mode}`;
+    const ctx = { ...context(owner), state: { processSessionOwner: owner, commandSessionEnabled: mode === "managed" } };
+    const command = shellInvoke(TEST_NODE, [fixture]);
+    const started = mode === "managed"
+      ? await bashTool.execute({ command, yield_time_ms: 0 }, ctx)
+      : await tool("process_session").execute({ action: "start", command }, ctx);
+    const sessionId = json(started.content).session_id;
+    const read = await waitForProcessRead(owner, sessionId, 0, value => value.output.includes("BOOTING"));
+    expect(read.payload.status).toBe("running");
+    const request = () => new Promise<Record<string, unknown>>(resolve => {
+      const req = httpGet({ hostname: "127.0.0.1", port, path: "/", timeout: 1000 }, res => {
+        let body = "";
+        res.setEncoding("utf8"); res.on("data", data => { body += data; });
+        res.on("end", () => resolve({ status: res.statusCode, body }));
+      });
+      req.on("timeout", () => req.destroy(Object.assign(new Error("timeout"), { code: "ETIMEDOUT" })));
+      req.on("error", error => resolve({ error: (error as NodeJS.ErrnoException).code }));
+    });
+    expect(await request()).toEqual({ error: "ECONNREFUSED" });
+    await tool("process_session").execute({ action: "write", session_id: sessionId, chars: "listen\n" }, ctx);
+    await waitForProcessRead(owner, sessionId, 0, value => value.output.includes("LISTENING"));
+    expect(await request()).toEqual({ status: 200, body: "local-service-ready" });
+    const stops = await Promise.all([0, 1].map(() =>
+      tool("process_session").execute({ action: "stop", session_id: sessionId }, ctx)));
+    expect(stops.every(result => !result.isError)).toBe(true);
+    expect(await request()).toEqual({ error: "ECONNREFUSED" });
+  });
+
   it.each(["legacy", "foreground", "managed", "detached"])("honors the configured Windows shell at actual startup: %s", async mode => {
     const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
     vi.stubEnv("ORKAS_WINDOWS_SHELL", "cmd.exe");

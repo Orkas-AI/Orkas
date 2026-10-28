@@ -124,8 +124,8 @@ export function buildOutputFormatHint(format: string | undefined): string {
     case 'dashboard':
       return [
         '### Presentation preference',
-        'dashboard output: use a valid fenced `:::dashboard` JSON block for read-only structured snapshots.',
-        'Follow the `Output formats` schema exactly. Do NOT call `create_artifact`.',
+        '',
+        'Prefer the `:::dashboard` format defined in `Output formats` for structured data.',
       ].join('\n');
     case 'artifact':
     case 'allow_artifacts':
@@ -169,7 +169,7 @@ export function buildInputChannelProtocol(channel: AgentInputChannel): string {
     '<agent-input-form>',
     '{',
     '  "fields": [',
-    '    {"id": "<snake_case_id>", "label": "<label in user UI language>", "type": "text", "required": true}',
+    '    {"id": "<snake_case_id>", "label": "<label in the chosen response language>", "type": "text", "required": true}',
     '  ]',
     '}',
     '</agent-input-form>',
@@ -191,9 +191,8 @@ export function buildPlanInteractionHint(interactive: boolean): string {
   return [
     '### Plan interaction',
     '',
-    'In an interactive plan step, an insufficient-input reply contains only a brief blocker sentence, the required internal result marker, the channel-specific input request above, then `<plan-interaction status="open" />`.',
-    'Keep the marker open on follow-up turns until inputs are sufficient. When the step is complete, include `<plan-interaction status="closed" />`.',
-    'Do not add a recommendation, diagnosis, plan, report, or separate "needed information" section to an open reply.',
+    'When waiting for user input during an interactive plan step, include `<plan-interaction status="open" />` in each reply that still requires input.',
+    'When the step is complete, include `<plan-interaction status="closed" />`.',
   ].join('\n');
 }
 
@@ -204,11 +203,11 @@ export function buildLanguageDirectiveText(languageName: string): string {
     '',
     `Fallback UI language: **${languageName}**.`,
     '',
-    "Choose the response language in this order: (1) a current explicit user language request; (2) otherwise, the clear language of the user's latest substantive prose; (3) otherwise, the fallback UI language above.",
+    "Choose the response language in this order: (1) a current explicit request about reply language; (2) otherwise, the clear language of the user's latest substantive prose; (3) otherwise, the fallback UI language above.",
     '',
-    'Quoted text, code, file contents, proper nouns, and earlier assistant messages do not switch the response language.',
+    'Quoted text, code, file contents, proper nouns, earlier assistant messages, and internal delegation or continuation instructions do not switch the response language.',
     '',
-    'Write all human-readable prose in the chosen language, including replies, status text, form labels, plan titles/inputs, and natural-language text inside XML/JSON fields.',
+    'Write all human-readable prose in the chosen language, including replies, status text, form labels, plan titles/inputs, and natural-language text inside XML/JSON fields. Agent and Skill descriptions instead follow the description-language rules in their owning creator Skill.',
     '',
     'Keep protocol tokens unchanged: XML tag names, JSON keys, tool/skill ids or names, file paths, code, and `select` / `multiselect` `value` strings.',
     '',

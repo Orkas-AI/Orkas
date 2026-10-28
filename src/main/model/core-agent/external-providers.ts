@@ -41,6 +41,7 @@ import type { Model } from '@earendil-works/pi-ai';
 import { isBearerTokenHeaderSafe } from '../../util/http-authorization';
 import {
   curatedModelsFor,
+  getConfiguredOpenAICompatibleProvider,
   modelInputFromConfiguredCapabilities,
   type CustomOpenAICompatibleRuntimeConfig,
 } from '../provider_catalog';
@@ -204,7 +205,7 @@ const MOONSHOT_BASE_URL = 'https://api.moonshot.cn/v1';
  * if a stale credential references them.
  */
 const MOONSHOT_CONTEXT_WINDOW: Record<string, number> = {
-  'kimi-k3': 1048576,
+  'kimi-k3': 1_000_000,
   'kimi-k2.7-code': 262144,
   'kimi-k2.7-code-highspeed': 262144,
   'kimi-k2.6': 262144,
@@ -311,9 +312,7 @@ export function buildMoonshotModel(
     // affect the actual request. Filling 0 means "not accounted for here";
     // users check the actual price on their Moonshot bill.
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: modelId === 'kimi-k3'
-      ? moonshotContextWindow(modelId)
-      : configuredPositiveInteger(curated?.contextWindow, moonshotContextWindow(modelId)),
+    contextWindow: configuredPositiveInteger(curated?.contextWindow, moonshotContextWindow(modelId)),
     maxTokens: configuredPositiveInteger(curated?.maxTokens, moonshotMaxOutputTokens(modelId)),
     ...(nativeModel?.headers ? { headers: { ...nativeModel.headers } } : {}),
     ...(protocol?.compat ? { compat: { ...protocol.compat } } : {}),
@@ -368,10 +367,10 @@ const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/v1';
 // Compressed Sparse Attention. Fallback 131072 for unknown ids (safe lower
 // bound; older deprecated v3 snapshots top out there).
 const DEEPSEEK_CONTEXT_WINDOW: Record<string, number> = {
-  'deepseek-flash':              1_048_576,
-  'deepseek-v4-pro':              1_048_576,
-  'deepseek-v4-flash-vision-exp': 1_048_576,
-  'deepseek-v4-flash':            1_048_576,
+  'deepseek-flash':              1_000_000,
+  'deepseek-v4-pro':              1_000_000,
+  'deepseek-v4-flash-vision-exp': 1_000_000,
+  'deepseek-v4-flash':            1_000_000,
 };
 
 function deepseekContextWindow(modelId: string): number {
@@ -383,10 +382,10 @@ function deepseekContextWindow(modelId: string): number {
 // so preserving the provider's real cap avoids silently truncating long
 // reasoning + answers. Unknown/legacy ids retain a conservative 8192 fallback.
 const DEEPSEEK_MAX_OUTPUT_TOKENS: Record<string, number> = {
-  'deepseek-flash':              384_000,
-  'deepseek-v4-pro':              384_000,
-  'deepseek-v4-flash-vision-exp': 384_000,
-  'deepseek-v4-flash':            384_000,
+  'deepseek-flash':              128_000,
+  'deepseek-v4-pro':              128_000,
+  'deepseek-v4-flash-vision-exp': 128_000,
+  'deepseek-v4-flash':            128_000,
 };
 
 function deepseekMaxOutputTokens(modelId: string): number {
@@ -413,12 +412,9 @@ export function buildDeepSeekModel(modelId: string): Model<'openai-completions'>
       ? ['text', 'image']
       : ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: Object.prototype.hasOwnProperty.call(DEEPSEEK_CONTEXT_WINDOW, modelId)
-      ? deepseekContextWindow(modelId)
-      : configuredPositiveInteger(curated?.contextWindow, deepseekContextWindow(modelId)),
-    maxTokens: Object.prototype.hasOwnProperty.call(DEEPSEEK_MAX_OUTPUT_TOKENS, modelId)
-      ? deepseekMaxOutputTokens(modelId)
-      : configuredPositiveInteger(curated?.maxTokens, deepseekMaxOutputTokens(modelId)),
+    contextWindow: configuredPositiveInteger(curated?.contextWindow, deepseekContextWindow(modelId)),
+    maxTokens: configuredPositiveInteger(curated?.maxTokens, deepseekMaxOutputTokens(modelId)),
+    // DeepSeek manages context caching itself and rejects OpenAI cache keys.
     compat: { supportsLongCacheRetention: false },
   };
 }
@@ -437,8 +433,10 @@ export async function createDeepSeekProvider(config: CreateDeepSeekProviderConfi
     provider: 'deepseek',
     apiKey: config.apiKey,
     customModel: model,
-    // Replay compatibility is projected by the core adapter.
-    onPayload: repairDeepSeekPayload,
+    // The core adapter fills missing tool-turn reasoning after SDK conversion.
+    // Preserve the caller's thinking/effort; this hook owns output limits and
+    // existing tool-receipt ordering only.
+    onPayload: repairDeepSeekRequest,
   });
 }
 
@@ -451,6 +449,7 @@ const DOUBAO_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3';
 // endpoint id (ep-xxxx) or a model id; the context window is keyed by model
 // id, with a 131072 safe lower-bound fallback for unknown ids.
 const DOUBAO_CONTEXT_WINDOW: Record<string, number> = {
+  'doubao-seed-2-1-pro-260915': 1_000_000,
   'doubao-seed-2-0-pro-260215':  262144,
   'doubao-seed-2-0-lite-260215': 262144,
   'doubao-seed-2-0-lite-260428': 262144,
@@ -464,6 +463,7 @@ function doubaoContextWindow(modelId: string): number {
 // 用户填的可能是 endpoint id（ep-xxxx）也可能是模型 id；endpoint id 形式
 // 走 fallback 8192 兜底，不会撞到上游 400。
 const DOUBAO_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  'doubao-seed-2-1-pro-260915': 32768,
   'doubao-seed-2-0-pro-260215':  16384,
   'doubao-seed-2-0-lite-260215': 16384,
   'doubao-seed-2-0-lite-260428': 32768,
@@ -535,17 +535,22 @@ export function buildCustomOpenAICompatibleModel(
     provider: 'custom' as any,
     baseUrl: config.baseUrl,
     reasoning: config.supportsReasoning ?? !!config.reasoningEffort,
-    input: openAICompatibleModelSupportsImages(modelId, config.supportsVision, true)
-      ? ['text', 'image']
-      : ['text'],
+    // Custom gateways own model aliases and image handling. Preserve their
+    // declaration instead of inferring capability from an official model name.
+    input: config.supportsVision === false ? ['text'] : ['text', 'image'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: config.contextWindow,
     maxTokens: config.maxTokens,
+    // The custom contract deliberately targets the broadly supported Chat
+    // Completions subset. Provider-specific roles, storage flags, strict tool
+    // schemas, and reasoning controls require a curated adapter instead.
     compat: {
       supportsDeveloperRole: false,
       supportsStore: false,
       supportsReasoningEffort: !!config.reasoningEffort,
       supportsStrictMode: false,
+      // The SDK otherwise assumes unknown endpoints support OpenAI's 24h
+      // cache extension, which strict Chat-compatible gateways reject.
       supportsLongCacheRetention: false,
     },
   };
@@ -585,18 +590,115 @@ export async function createCustomOpenAICompatibleProvider(
   if (!config.baseUrl) throw new Error('custom: baseUrl required');
   const mod = await ca();
   const isAnthropic = config.protocol === 'anthropic';
-  const compatibility = isAnthropic ? null : createCustomOutputLimitCompatibility(config);
+  const isResponses = config.protocol === 'responses';
+  const compatibility = isAnthropic || isResponses ? null : createCustomOutputLimitCompatibility(config);
   return mod.createPiProvider({
     provider: 'custom',
     apiKey: config.apiKey,
     customModel: isAnthropic
       ? buildCustomAnthropicModel(config.modelId, config)
-      : buildCustomOpenAICompatibleModel(config.modelId, config),
-    normalizeLiteralLeadingThinkText: !isAnthropic,
+      : isResponses ? buildCustomResponsesModel(config.modelId, config)
+        : buildCustomOpenAICompatibleModel(config.modelId, config),
+    normalizeLiteralLeadingThinkText: !isAnthropic && !isResponses,
     ...(compatibility ? {
       onPayload: (payload: unknown) => compatibility.onPayload(repairOpenAICompatiblePayload(payload)),
       wrapFetch: compatibility.wrapFetch,
     } : {}),
     ...(config.reasoningEffort ? { defaultReasoning: config.reasoningEffort } : {}),
   });
+}
+
+export function buildCustomResponsesModel(
+  modelId: string,
+  config: CustomOpenAICompatibleRuntimeConfig,
+): Model<'openai-responses'> {
+  return {
+    id: modelId, name: modelId, api: 'openai-responses', provider: 'custom' as any,
+    baseUrl: config.baseUrl,
+    reasoning: config.supportsReasoning ?? !!config.reasoningEffort,
+    input: config.supportsVision === false ? ['text'] : ['text', 'image'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: config.contextWindow, maxTokens: config.maxTokens,
+    // Responses otherwise normalizes omitted strictness. Keep ordinary tools
+    // explicitly non-strict so optional fields retain their executor contract.
+    compat: { supportsStrictMode: true, supportsLongCacheRetention: false },
+  };
+}
+
+const CONFIGURED_OPENAI_CONTEXT_WINDOW = 131_072;
+
+const CONFIGURED_OPENAI_MAX_TOKENS = 32_768;
+
+export function buildConfiguredOpenAICompatibleModel(
+  providerId: string,
+  modelId: string,
+): Model<'openai-completions'> | null {
+  const provider = getConfiguredOpenAICompatibleProvider(providerId);
+  const model = curatedModelsFor(providerId).find((entry) => entry.id === modelId);
+  if (!provider || !model) return null;
+  return {
+    id: modelId,
+    name: model.name || modelId,
+    api: 'openai-completions',
+    provider: providerId as any,
+    baseUrl: provider.baseUrl,
+    reasoning: false,
+    input: openAICompatibleModelSupportsImages(
+      modelId,
+      configuredModelVisionDeclaration(model),
+      true,
+    )
+      ? ['text', 'image']
+      : ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: configuredPositiveInteger(model.contextWindow, CONFIGURED_OPENAI_CONTEXT_WINDOW),
+    maxTokens: configuredPositiveInteger(model.maxTokens, CONFIGURED_OPENAI_MAX_TOKENS),
+    compat: {
+      supportsDeveloperRole: false,
+      supportsStore: false,
+      supportsReasoningEffort: false,
+      supportsStrictMode: false,
+      maxTokensField: 'max_tokens',
+    },
+  };
+}
+
+export interface CreateConfiguredOpenAICompatibleProviderConfig {
+  providerId: string;
+  apiKey: string;
+  modelId: string;
+}
+
+export async function createConfiguredOpenAICompatibleProvider(
+  config: CreateConfiguredOpenAICompatibleProviderConfig,
+): Promise<LLMProvider> {
+  if (!config.providerId) throw new Error('configured provider: providerId required');
+  if (!config.apiKey) throw new Error(`${config.providerId}: apiKey required`);
+  if (!isBearerTokenHeaderSafe(config.apiKey)) {
+    throw Object.assign(
+      new Error('Configured provider has an invalid API key for HTTP Authorization headers.'),
+      { code: 'API_KEY_INVALID' },
+    );
+  }
+  if (!config.modelId) throw new Error(`${config.providerId}: modelId required`);
+  const model = buildConfiguredOpenAICompatibleModel(config.providerId, config.modelId);
+  if (!model) throw new Error(`${config.providerId}: model is not configured`);
+  const mod = await ca();
+  return mod.createPiProvider({
+    provider: config.providerId,
+    apiKey: config.apiKey,
+    customModel: model,
+    onPayload: repairOpenAICompatiblePayload,
+  });
+}
+
+export function repairDeepSeekRequest(
+  params: unknown,
+  model: { maxTokens?: number } | undefined,
+  requestMetadata?: unknown,
+): unknown {
+  const metadata = requestMetadata && typeof requestMetadata === 'object' && !Array.isArray(requestMetadata)
+    ? requestMetadata as Record<string, unknown>
+    : {};
+  return repairDeepSeekPayload(omitReservedOutputLimit(params, model?.maxTokens, metadata.outputLimitSource));
 }

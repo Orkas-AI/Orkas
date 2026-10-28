@@ -1,4 +1,4 @@
-import { randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import {
   appendFileSync,
@@ -14,6 +14,8 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
+import type { ChildProcess } from 'node:child_process';
+import type { Duplex } from 'node:stream';
 import AdmZip from 'adm-zip';
 import { estimateTextTokens } from '../../../src/core-agent/src/agent/session';
 import { BackgroundServices } from './background-services';
@@ -60,7 +62,7 @@ type OrkasOptions = {
   modelStub?: boolean;
   marketplaceStub?: boolean;
   cliStub?: boolean;
-  updateStub?: boolean;
+  voiceStub?: boolean;
   metacognitionEnabled?: boolean;
   enableSystemProxy?: boolean;
   /** Language persisted before launch. `null` deliberately leaves the
@@ -94,9 +96,15 @@ export type CliStubState = {
   modelListResponses: number;
   codexResumeHangs?: number;
   codexThreadRequests?: Array<{ method: string; pid: number }>;
+  hermesFault?: 'version_unknown' | 'initialize_exit';
+  hermesInitializations?: number;
 };
 
 type ModelStubMode = 'success' | 'refusal' | 'http-error' | 'auth-error' | 'model-not-open' | 'slow' | 'very-slow' | 'controlled-slow' | 'truncated';
+type VoiceStubMode = 'success' | 'blocked-open';
+const VOICE_API_KEY = 'orkas-e2e-voice-api-key-xxxxxxxx';
+const VOICE_TICKET = 'E'.repeat(43);
+
 type SystemIdleState = 'active' | 'idle' | 'locked' | 'unknown';
 type AgentFanoutTarget = {
   agentId: string;
@@ -111,7 +119,7 @@ type ModelToolScenario =
   }
   | { kind: 'connector'; connectorId: string }
   | { kind: 'agent-authoring'; finalText: string }
-  | { kind: 'saved-tasks'; next: number; projectId: string; finalText: string }
+  | { kind: 'saved-tasks'; next: number; finalText: string }
   | {
     kind: 'create-pdf';
     sourceType: 'markdown' | 'html';
@@ -254,7 +262,7 @@ function writeJson(filePath: string, value: unknown): void {
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
-function writeNodeExecutable(directory: string, name: string, source: string): string {
+function writeNodeExecutable(directory: string, name: string, source: string, versionInScript = false): string {
   mkdirSync(directory, { recursive: true });
   const scriptName = `${name}.js`;
   writeFileSync(path.join(directory, scriptName), source, 'utf8');
@@ -279,9 +287,11 @@ function writeNodeExecutable(directory: string, name: string, source: string): s
   const safeNode = TEST_NODE.replace(/'/g, `'\\''`);
   writeFileSync(launcher, [
     '#!/bin/sh',
-    'case "$1" in',
-    "  --version|version) printf '%s\\n' '99.0.0'; exit 0 ;;",
-    'esac',
+    ...(!versionInScript ? [
+      'case "$1" in',
+      "  --version|version) printf '%s\\n' '99.0.0'; exit 0 ;;",
+      'esac',
+    ] : []),
     `exec '${safeNode}' "$(dirname "$0")/${scriptName}" "$@"`,
     '',
   ].join('\n'), 'utf8');
@@ -418,16 +428,21 @@ function fakeHermesSource(): string {
 const fs = require('node:fs');
 const readline = require('node:readline');
 const args = process.argv.slice(2);
-if (args.includes('--version') || args[0] === 'version') {
-  process.stdout.write('Hermes Agent v99.0.0\n');
-  process.exit(0);
-}
-
 const statePath = process.env.ORKAS_E2E_CLI_STATE;
 const blank = () => ({ nextSession: 0, attempts: {}, toolExecutions: 0, invocations: [] });
 const readState = () => {
   try { return { ...blank(), ...JSON.parse(fs.readFileSync(statePath, 'utf8')) }; }
   catch { return blank(); }
+};
+if (args.includes('--version') || args[0] === 'version') {
+  process.stdout.write(readState().hermesFault === 'version_unknown'
+    ? 'Hermes Agent (version unavailable)\n' : 'Hermes Agent v99.0.0\n');
+  process.exit(0);
+}
+const writeState = state => {
+  const tmp = statePath + '.' + String(process.pid) + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, statePath);
 };
 const send = value => process.stdout.write(JSON.stringify(value) + '\n');
 let sessionId = '';
@@ -436,13 +451,17 @@ input.on('line', line => {
   let message;
   try { message = JSON.parse(line); } catch { return; }
   if (message.id === 1) {
+    const state = readState();
+    state.hermesInitializations = (state.hermesInitializations || 0) + 1;
+    writeState(state);
+    if (state.hermesFault === 'initialize_exit') process.exit(1);
     send({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } });
     return;
   }
   if (message.id === 2) {
     const state = readState();
     sessionId = 'hermes-e2e-' + String(++state.nextSession);
-    fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    writeState(state);
     send({ jsonrpc: '2.0', id: 2, result: { sessionId } });
     return;
   }
@@ -452,7 +471,7 @@ input.on('line', line => {
     state.invocations.push({
       cli: 'hermes', args, prompt, resumeSessionId: null, sessionId,
     });
-    fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    writeState(state);
     let text = 'E2E_HERMES_FIRST_OK';
     if (prompt.includes('E2E_HERMES_CONTINUE') && prompt.includes('E2E_HERMES_PRIOR_FACT')) {
       text = 'E2E_HERMES_HISTORY_BRIDGED';
@@ -493,7 +512,11 @@ const readState = () => {
   try { return { ...blank(), ...JSON.parse(fs.readFileSync(statePath, 'utf8')) }; }
   catch { return blank(); }
 };
-const writeState = state => fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+const writeState = state => {
+  const tmp = statePath + '.' + String(process.pid) + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, statePath);
+};
 const send = value => process.stdout.write(JSON.stringify(value) + '\n');
 const argValue = name => {
   const index = args.indexOf(name);
@@ -626,7 +649,11 @@ const readState = () => {
   try { return { ...blank(), ...JSON.parse(fs.readFileSync(statePath, 'utf8')) }; }
   catch { return blank(); }
 };
-const writeState = state => fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+const writeState = state => {
+  const tmp = statePath + '.' + String(process.pid) + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, statePath);
+};
 const send = value => process.stdout.write(JSON.stringify(value) + '\n');
 let threadId = '';
 let turnId = '';
@@ -750,6 +777,13 @@ input.on('line', line => {
     send({ method: 'turn/started', params: {
       threadId, turn: { id: turnId, status: 'inProgress' },
     } });
+    // A cancelled turn can appear in canonical recovery history. Only the
+    // current synthetic task selects the post-Stop response; old hang/question
+    // markers must not make this fresh request hang again.
+    if (prompt.trimEnd().endsWith('E2E_CODEX_AFTER_STOP')) {
+      finish('E2E_CODEX_DEFAULT_OK');
+      return;
+    }
     if (prompt.includes('E2E_CLI_NATIVE_QUESTION')) {
       send({ id: 'native-question', method: 'item/tool/requestUserInput', params: {
         threadId, turnId, itemId: 'native-question', isBlocking: true,
@@ -762,6 +796,14 @@ input.on('line', line => {
         id: 'async-question', type: 'agentMessage', delivery: 'async', text: 'Which scope?',
         questions: [{ title: 'Which scope?', options: ['Current', 'All'] }],
       } } });
+    }
+    if (prompt.includes('E2E_CODEX_CRASH_PROCESS')) {
+      const item = { id: 'crash-tool', type: 'commandExecution', command: 'fixture-check' };
+      send({ method: 'item/started', params: { threadId, turnId, item } });
+      send({ method: 'item/completed', params: { threadId, turnId, item: {
+        ...item, status: 'completed', aggregatedOutput: 'DURABLE_CRASH_RECEIPT', exitCode: 0, durationMs: 25,
+      } } });
+      return;
     }
     if (!prompt.includes('E2E_CODEX_SEND_NOW_ACTIVE')) finish('E2E_CODEX_DEFAULT_OK');
     return;
@@ -857,7 +899,7 @@ export class OrkasTestApp {
   readonly modelStub: boolean;
   readonly marketplaceStub: boolean;
   readonly cliStub: boolean;
-  readonly updateStub: boolean;
+  readonly voiceStub: boolean;
   readonly metacognitionEnabled: boolean;
   readonly enableSystemProxy: boolean;
   readonly appLocale: string;
@@ -911,10 +953,9 @@ export class OrkasTestApp {
   private disposeApiServer: (() => Promise<void>) | null = null;
   private apiBaseUrl = 'http://127.0.0.1:9/api';
   private modelStubMode: ModelStubMode = 'success';
-  private clientConfigGeneration = 0;
-  private clientConfigImmediate: Record<string, unknown> = {
-    'feature.e2e_published': 'generation-a',
-  };
+  private voiceStubMode: VoiceStubMode = 'success';
+  private readonly voiceSockets = new Set<Duplex>();
+  readonly voiceSessionRequests: Array<{ method: string; path: string; authorized: boolean; body: string }> = [];
   private readonly modelTimers = new Set<ReturnType<typeof setTimeout>>();
   private controlledModelStream: {
     chunkReady: Promise<void>;
@@ -931,6 +972,7 @@ export class OrkasTestApp {
   private traceNumber = 0;
   private readonly appClosePromises = new WeakMap<ElectronApplication, Promise<void>>();
   private readonly appTraceStops = new WeakMap<ElectronApplication, Promise<void>>();
+  private readonly nativeShutdownProcesses = new WeakMap<ElectronApplication, ChildProcess>();
   private activeUserId: string;
   private readonly configuredModelSeededUsers = new Set<string>();
   private modelToolScenario: ModelToolScenario | null = null;
@@ -956,7 +998,7 @@ export class OrkasTestApp {
     this.modelStub = options.modelStub === true;
     this.marketplaceStub = options.marketplaceStub === true;
     this.cliStub = options.cliStub === true;
-    this.updateStub = options.updateStub === true;
+    this.voiceStub = options.voiceStub === true;
     this.metacognitionEnabled = options.metacognitionEnabled === true;
     this.enableSystemProxy = options.enableSystemProxy === true;
     this.appLocale = options.appLocale || '';
@@ -975,7 +1017,7 @@ export class OrkasTestApp {
       ? writeNodeExecutable(cliBinRoot, 'opencode-e2e', fakeOpenCodeSource())
       : null;
     this.fakeHermesPath = this.cliStub
-      ? writeNodeExecutable(cliBinRoot, 'hermes-e2e', fakeHermesSource())
+      ? writeNodeExecutable(cliBinRoot, 'hermes-e2e', fakeHermesSource(), true)
       : null;
     this.fakeCodexPath = this.cliStub
       ? writeNodeExecutable(cliBinRoot, 'codex-e2e', fakeCodexSource())
@@ -994,22 +1036,6 @@ export class OrkasTestApp {
       } satisfies CliStubState);
     }
     seedWorkspace(this.workspaceRoot, options.seedLanguage);
-    if (this.updateStub) {
-      writeJson(
-        path.join(this.workspaceRoot, this.activeUserId, 'local', 'config', 'remote-config.json'),
-        {
-          version: 1,
-          etag: `"sha256:e2e-client-config-generation"`,
-          config_hash: 'sha256:e2e-client-config-generation',
-          last_request_at_ms: Date.now(),
-          active: {
-            immediate: { 'feature.e2e_published': 'generation-a' },
-            restart: {},
-          },
-          fetched_at_ms: Date.now(),
-        },
-      );
-    }
     mkdirSync(this.userDataRoot, { recursive: true });
     mkdirSync(this.authRoot, { recursive: true });
     mkdirSync(this.userWorkspaceRoot, { recursive: true });
@@ -1018,7 +1044,7 @@ export class OrkasTestApp {
   async launch(): Promise<void> {
     if (this.electronApp) throw new Error('Orkas Electron app is already running');
     this.lastLaunchReadyMs = null;
-    if (this.modelStub || this.marketplaceStub || this.updateStub) await this.ensureStubServer();
+    if (this.modelStub || this.marketplaceStub || this.voiceStub) await this.ensureStubServer();
     const launchStartedAt = Date.now();
 
     const environment: NodeJS.ProcessEnv = {
@@ -1181,6 +1207,51 @@ export class OrkasTestApp {
     return this.page;
   }
 
+  /** Reopen only after a prepared native exit; never turn this into a quit. */
+  async launchAfterNativeExit(expectedApp: ElectronApplication): Promise<Page> {
+    if (this.electronApp !== expectedApp) throw new Error('Native exit application is no longer owned');
+    const child = this.nativeShutdownProcesses.get(expectedApp);
+    const traceStopped = this.appTraceStops.get(expectedApp);
+    if (!child || !traceStopped) throw new Error('Native shutdown was not prepared');
+    if (child.exitCode !== 0 || child.signalCode !== null) {
+      throw new Error('Native application has not exited cleanly');
+    }
+    if (this.appClosePromises.has(expectedApp)) throw new Error('Application cleanup already started');
+    await traceStopped;
+    // A teardown/replacement may have won while the export was settling.
+    if (this.electronApp !== expectedApp || this.appClosePromises.has(expectedApp)) {
+      throw new Error('Native exit ownership changed during trace export');
+    }
+    this.appClosePromises.set(expectedApp, Promise.resolve());
+    this.electronApp = null;
+    this.page = null;
+    await this.launch();
+    if (!this.page) throw new Error('Orkas renderer did not open after native exit');
+    return this.page;
+  }
+
+  /** A controlled crash is separate from the clean native-exit contract. */
+  async launchAfterCrash(expectedApp: ElectronApplication): Promise<Page> {
+    if (this.electronApp !== expectedApp) throw new Error('Crash application is no longer owned');
+    const child = this.nativeShutdownProcesses.get(expectedApp);
+    const traceStopped = this.appTraceStops.get(expectedApp);
+    if (!child || !traceStopped) throw new Error('Native crash was not prepared');
+    if (child.exitCode !== null || child.signalCode !== 'SIGKILL') {
+      throw new Error('Native application has not exited with SIGKILL');
+    }
+    if (this.appClosePromises.has(expectedApp)) throw new Error('Application cleanup already started');
+    await traceStopped;
+    if (this.electronApp !== expectedApp || this.appClosePromises.has(expectedApp)) {
+      throw new Error('Crash ownership changed during trace export');
+    }
+    this.appClosePromises.set(expectedApp, Promise.resolve());
+    this.electronApp = null;
+    this.page = null;
+    await this.launch();
+    if (!this.page) throw new Error('Orkas renderer did not open after native crash');
+    return this.page;
+  }
+
   async switchLocalUser(
     userId: string,
     _profile: { nickname: string; email: string },
@@ -1301,14 +1372,85 @@ export class OrkasTestApp {
     this.controlledModelStream.releaseFinish();
   }
 
-  setClientConfigImmediate(immediate: Record<string, unknown>): string {
-    if (!this.updateStub && !this.modelStub) throw new Error('The local client-config stub is not enabled for this fixture');
-    this.clientConfigGeneration += 1;
-    this.clientConfigImmediate = {
-      'feature.e2e_published': 'generation-a',
-      ...immediate,
-    };
-    return `sha256:e2e-client-config-generation-${this.clientConfigGeneration}`;
+  setVoiceMode(mode: VoiceStubMode): void {
+    if (!this.voiceStub) throw new Error('The local voice stub is not enabled for this fixture');
+    this.voiceStubMode = mode;
+  }
+
+  async installVoiceCaptureStub(): Promise<void> {
+    if (!this.voiceStub || !this.electronApp || !this.page) {
+      throw new Error('The local voice fixture is unavailable');
+    }
+    await this.electronApp.evaluate(({ systemPreferences }) => {
+      const preferences = systemPreferences as any;
+      preferences.getMediaAccessStatus = () => 'granted';
+      preferences.askForMediaAccess = async () => true;
+    });
+    await this.invoke('orkasApi.save', { apiKey: VOICE_API_KEY });
+    await this.electronApp.evaluate((_electron, input) => {
+      const originalFetch = globalThis.fetch;
+      const state = globalThis as typeof globalThis & { __e2eVoiceSessionUrls?: string[] };
+      state.__e2eVoiceSessionUrls = [];
+      globalThis.fetch = ((request: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof request === 'string' ? request : request instanceof URL ? request.href : request.url;
+        if (url !== 'https://orkas.ai/v1/audio/transcription_sessions') return originalFetch(request, init);
+        state.__e2eVoiceSessionUrls!.push(url);
+        return originalFetch(input.localOrigin + '/v1/audio/transcription_sessions', init);
+      }) as typeof fetch;
+    }, { localOrigin: this.apiBaseUrl.replace(/\/api$/, '') });
+    await this.page.evaluate((input) => {
+      const NativeWebSocket = window.WebSocket;
+      (window as any).__e2eVoiceSocketUrls = [];
+      class FixtureWebSocket extends NativeWebSocket {
+        constructor(url: string | URL, protocols?: string | string[]) {
+          const intended = new URL(String(url));
+          if (intended.origin !== 'wss://orkas.ai' || intended.pathname !== '/api/voice/asr_ws'
+              || intended.searchParams.get('ticket') !== input.ticket) {
+            throw new Error('Unexpected public voice socket URL');
+          }
+          (window as any).__e2eVoiceSocketUrls.push(intended.toString());
+          super(input.localSocketOrigin + intended.pathname + intended.search, protocols);
+        }
+      }
+      Object.defineProperty(window, 'WebSocket', { configurable: true, value: FixtureWebSocket });
+      const noopNode = () => ({
+        connect() {},
+        disconnect() {},
+        onaudioprocess: null,
+      });
+      class FakeAudioContext {
+        state = 'running';
+        sampleRate = 16_000;
+        destination = {};
+        createMediaStreamSource() { return noopNode(); }
+        createScriptProcessor() { return noopNode(); }
+        createGain() {
+          return {
+            ...noopNode(),
+            gain: { value: 1 },
+          };
+        }
+        async resume() {}
+        async close() {}
+      }
+      Object.defineProperty(window, 'AudioContext', {
+        configurable: true,
+        value: FakeAudioContext,
+      });
+      Object.defineProperty(navigator, 'mediaDevices', {
+        configurable: true,
+        value: {
+          getUserMedia: async () => ({
+            getTracks: () => [{
+              stop() {
+                (window as any).__e2eVoiceTrackStops =
+                  Number((window as any).__e2eVoiceTrackStops || 0) + 1;
+              },
+            }],
+          }),
+        },
+      });
+    }, { ticket: VOICE_TICKET, localSocketOrigin: this.apiBaseUrl.replace(/^http/, 'ws').replace(/\/api$/, '') });
   }
 
   setModelTextReplies(replies: string[]): void {
@@ -1371,10 +1513,10 @@ export class OrkasTestApp {
     this.modelToolScenario = null;
   }
 
-  setSavedTasksScenario(projectId: string, finalText: string): void {
+  setSavedTasksScenario(finalText: string): void {
     if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
     this.modelToolScenarioRequestStart = this.modelRequests.length;
-    this.modelToolScenario = { kind: 'saved-tasks', next: 0, projectId, finalText };
+    this.modelToolScenario = { kind: 'saved-tasks', next: 0, finalText };
   }
 
   setBashDenyScenario(command: string): void {
@@ -1835,6 +1977,10 @@ export class OrkasTestApp {
     for (const record of await this.rendererErrorEvidence()) {
       if (record.windowId !== null && windows.has(record.windowId)) this.recoveredRendererErrors.add(record.diagnosticIndex);
     }
+    return this.recoveredDiagnosticRanges();
+  }
+
+  private recoveredDiagnosticRanges() {
     let line = 1;
     const ranges: Array<{ start: number; end: number; diagnosticIndex: number }> = [];
     this.diagnostics.forEach((entry, diagnosticIndex) => {
@@ -1867,6 +2013,17 @@ export class OrkasTestApp {
       failed = true;
     }
 
+    // Export receipts after releasing native/stub ownership. Evidence IO must
+    // fail certification without interrupting resource cleanup.
+    if (process.env.ORKAS_TEST_BATCH_REPORT) {
+      try {
+        await this.testInfo.attach('electron-log-required', { body: Buffer.from(JSON.stringify(this.recoveredDiagnosticRanges())), contentType: 'application/json' });
+      } catch (error) {
+        cleanupError = cleanupError ? new AggregateError([cleanupError, error], 'Fixture cleanup failed') : error;
+        failed = true;
+      }
+    }
+
     const unexpectedApiFailures = this.apiResponses.filter(item => {
       if (item.status < 400) return false;
       const index = this.expectedApiFailures.findIndex(expected => expected.method === item.method
@@ -1876,7 +2033,7 @@ export class OrkasTestApp {
       return false;
     });
     failed ||= unexpectedApiFailures.length > 0 || this.expectedApiFailures.length > 0;
-    if (failed || process.env.ORKAS_E2E_KEEP_LOGS === '1') {
+    if (failed || process.env.ORKAS_E2E_KEEP_LOGS === '1' || process.env.ORKAS_TEST_BATCH_REPORT) {
       mkdirSync(this.testInfo.outputDir, { recursive: true });
       writeFileSync(this.testInfo.outputPath('stub-responses.json'), JSON.stringify(this.apiResponses, null, 2));
     }
@@ -1901,7 +2058,8 @@ export class OrkasTestApp {
         // reporters truncate an inline attachment to a couple of lines, which is
         // exactly the main-process history a failed run needs. `attach({ path })`
         // keeps the full file in the artifacts tree.
-        const logPath = path.join(this.testInfo.outputDir, 'electron-main.log');
+        const logPath = path.join(this.testInfo.outputDir, process.env.ORKAS_TEST_BATCH_REPORT
+          ? `checkpoint-electron-${randomUUID()}.log` : 'electron-main.log');
         try {
           mkdirSync(this.testInfo.outputDir, { recursive: true });
           writeFileSync(logPath, diagnosticText, 'utf8');
@@ -1921,15 +2079,24 @@ export class OrkasTestApp {
       // ORKAS_E2E_KEEP_LOGS=1 preserves the same captured stdout/stderr,
       // renderer diagnostics and app logs as a failed run. File logs alone
       // omit direct console output, including renderer warnings.
-      if (process.env.ORKAS_E2E_KEEP_LOGS === '1') {
+      if (process.env.ORKAS_E2E_KEEP_LOGS === '1' || process.env.ORKAS_TEST_BATCH_REPORT) {
         const appLogs = collectLogFiles(this.root);
         const diagnosticText = [this.diagnostics.join('\n'), appLogs].filter(Boolean).join('\n');
         if (diagnosticText) {
           try {
             mkdirSync(this.testInfo.outputDir, { recursive: true });
             writeFileSync(path.join(this.testInfo.outputDir, 'electron-main.log'), diagnosticText, 'utf8');
-          } catch {
-            // Diagnostics only — never fail a passing test over log capture.
+            if (process.env.ORKAS_TEST_BATCH_REPORT) {
+              const snapshot = this.testInfo.outputPath(`checkpoint-electron-${randomUUID()}.log`);
+              writeFileSync(snapshot, diagnosticText, 'utf8');
+              await this.testInfo.attach('electron-logs', { path: snapshot, contentType: 'text/plain' });
+            }
+          } catch (error) {
+            // Fail reuse after releasing the temporary root and trace files.
+            if (process.env.ORKAS_TEST_BATCH_REPORT) {
+              cleanupError = new Error('Checkpoint Electron log capture failed', { cause: error });
+            }
+            // Ordinary runs preserve their existing diagnostic behavior.
           }
         }
       }
@@ -1999,8 +2166,16 @@ export class OrkasTestApp {
 
   /** Export while the browser context exists, before a case confirms native exit. */
   async prepareForNativeShutdown(): Promise<void> {
-    if (!this.electronApp) throw new Error('Electron is unavailable');
-    await this.stopAppTrace(this.electronApp);
+    const app = this.electronApp;
+    if (!app) throw new Error('Electron is unavailable');
+    // Capture while the Playwright application is live. Its disposed channel
+    // must not be queried to reconstruct process ownership after native exit.
+    if (!this.nativeShutdownProcesses.has(app)) {
+      const child = app.process();
+      if (!child) throw new Error('Native Electron process is unavailable');
+      this.nativeShutdownProcesses.set(app, child);
+    }
+    await this.stopAppTrace(app);
   }
 
   private stopAppTrace(app: ElectronApplication): Promise<void> {
@@ -2059,7 +2234,7 @@ export class OrkasTestApp {
       });
       const isChat = requestUrl.pathname === '/api/v1/chat/completions';
       const isResponses = requestUrl.pathname === '/api/v1/responses';
-      const isClientConfig = requestUrl.pathname === '/api/config/client';
+
       const isImageCreate = requestUrl.pathname === '/api/e2e-image/generations';
       const isImageTask = requestUrl.pathname === '/api/e2e-image/generations/e2e-image-task';
       const isImageOutput = requestUrl.pathname === '/generated/e2e-managed-image.png';
@@ -2085,29 +2260,16 @@ export class OrkasTestApp {
       const marketplacePath = requestUrl.pathname.startsWith('/api/marketplace/')
         ? requestUrl.pathname.slice('/api'.length)
         : '';
-      if (request.method === 'GET' && isClientConfig) {
-        const configHash = this.clientConfigGeneration === 0
-          ? 'sha256:e2e-client-config-generation'
-          : `sha256:e2e-client-config-generation-${this.clientConfigGeneration}`;
-        const etag = `"${configHash}"`;
-        const ifNoneMatch = String(request.headers['if-none-match'] || '');
-        if (ifNoneMatch.split(',').map((item) => item.trim()).includes(etag)) {
-          response.writeHead(304, { ETag: etag });
-          response.end();
-          return;
-        }
-        response.writeHead(200, {
-          'Content-Type': 'application/json',
-          ETag: etag,
-          'Cache-Control': 'no-cache',
+      if (this.voiceStub && request.method === 'POST' && requestUrl.pathname === '/v1/audio/transcription_sessions') {
+        const chunks: Buffer[] = [];
+        request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+        request.on('end', () => {
+          const authorized = request.headers.authorization === `Bearer ${VOICE_API_KEY}`;
+          this.voiceSessionRequests.push({ method: request.method!, path: requestUrl.pathname,
+            authorized, body: Buffer.concat(chunks).toString('utf8') });
+          response.writeHead(authorized ? 200 : 401, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify(authorized ? { ticket: VOICE_TICKET } : { error: 'invalid_api_key' }));
         });
-        response.end(JSON.stringify({
-          code: 0,
-          schema: 1,
-          immediate: this.clientConfigImmediate,
-          restart: {},
-          config_hash: configHash,
-        }));
         return;
       }
       if (request.method === 'GET' && requestUrl.pathname === '/marketplace-e2e-skill.zip' && this.marketplaceStub) {
@@ -2783,8 +2945,8 @@ export class OrkasTestApp {
 
         if (scenario?.kind === 'saved-tasks') {
           const calls = [
-            { name: 'auto_tasks', args: { action: 'create', project_id: scenario.projectId, title: 'Nightly review', content: 'Review changes', enabled: false, schedule: { type: 'daily', hour: 0, minute: 0 } } },
-            { name: 'todo_tasks', args: { action: 'create', project: scenario.projectId, content: 'Review release notes' } },
+            { name: 'auto_tasks', args: { action: 'create', title: 'Nightly review', content: 'Review changes', enabled: false, schedule: { type: 'daily', hour: 0, minute: 0 } } },
+            { name: 'todo_tasks', args: { action: 'create', content: 'Review release notes' } },
             { name: 'auto_tasks', args: { action: 'create', title: 'Rejected automation', content: '' } },
           ];
           const next = calls[scenario.next];
@@ -3442,6 +3604,104 @@ export class OrkasTestApp {
         finishImmediately(events);
       });
     });
+    if (this.voiceStub) {
+      server.on('upgrade', (request, socket) => {
+        const requestUrl = new URL(request.url || '/', 'http://127.0.0.1');
+        if (requestUrl.pathname !== '/api/voice/asr_ws' || requestUrl.searchParams.get('ticket') !== VOICE_TICKET) {
+          socket.destroy();
+          return;
+        }
+        const key = String(request.headers['sec-websocket-key'] || '');
+        if (!key) {
+          socket.destroy();
+          return;
+        }
+        this.voiceSockets.add(socket);
+        socket.once('close', () => this.voiceSockets.delete(socket));
+
+        const accept = createHash('sha1')
+          .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+          .digest('base64');
+        const openSocket = () => {
+          if (socket.destroyed) return;
+          socket.write([
+            'HTTP/1.1 101 Switching Protocols',
+            'Upgrade: websocket',
+            'Connection: Upgrade',
+            `Sec-WebSocket-Accept: ${accept}`,
+            '',
+            '',
+          ].join('\r\n'));
+          const ready = Buffer.from('{"event":"ready"}');
+          socket.write(Buffer.concat([Buffer.from([0x81, ready.length]), ready]));
+        };
+        // Keep the HTTP upgrade pending until the client cancels. This makes
+        // the negotiation-cancellation contract deterministic under load;
+        // a fixed delay can expire before Playwright gets its second click in.
+        if (this.voiceStubMode !== 'blocked-open') {
+          openSocket();
+        }
+
+        let buffered = Buffer.alloc(0);
+        socket.on('data', (chunk) => {
+          buffered = Buffer.concat([buffered, Buffer.from(chunk)]);
+          while (buffered.length >= 2) {
+            const opcode = buffered[0] & 0x0f;
+            const masked = (buffered[1] & 0x80) !== 0;
+            let payloadLength = buffered[1] & 0x7f;
+            let offset = 2;
+            if (payloadLength === 126) {
+              if (buffered.length < 4) return;
+              payloadLength = buffered.readUInt16BE(2);
+              offset = 4;
+            } else if (payloadLength === 127) {
+              if (buffered.length < 10) return;
+              const longLength = buffered.readBigUInt64BE(2);
+              if (longLength > BigInt(Number.MAX_SAFE_INTEGER)) {
+                socket.destroy();
+                return;
+              }
+              payloadLength = Number(longLength);
+              offset = 10;
+            }
+            const maskBytes = masked ? 4 : 0;
+            if (buffered.length < offset + maskBytes + payloadLength) return;
+            const mask = masked ? buffered.subarray(offset, offset + 4) : null;
+            offset += maskBytes;
+            const payload = Buffer.from(buffered.subarray(offset, offset + payloadLength));
+            buffered = buffered.subarray(offset + payloadLength);
+            if (mask) {
+              for (let index = 0; index < payload.length; index += 1) {
+                payload[index] ^= mask[index % 4];
+              }
+            }
+            if (opcode === 0x8) {
+              socket.end(Buffer.from([0x88, 0x00]));
+              return;
+            }
+            if (opcode !== 0x1 || payload.toString('utf8') !== '__END__') continue;
+
+            const result = Buffer.from(JSON.stringify({
+              is_last_package: true,
+              payload_msg: {
+                result: {
+                  text: 'E2E dictated launch note',
+                  last: true,
+                },
+              },
+            }), 'utf8');
+            const header = result.length < 126
+              ? Buffer.from([0x81, result.length])
+              : Buffer.from([0x81, 126, (result.length >> 8) & 0xff, result.length & 0xff]);
+            const timer = setTimeout(() => {
+              this.modelTimers.delete(timer);
+              if (!socket.destroyed) socket.write(Buffer.concat([header, result]));
+            }, 20);
+            this.modelTimers.add(timer);
+          }
+        });
+      });
+    }
     // Chromium rejects several legacy ports before a request reaches the
     // local server. On Windows, listen(0) can still select from the legacy
     // ephemeral range, so choose from the modern high-port range explicitly.
@@ -3490,6 +3750,8 @@ export class OrkasTestApp {
     this.pendingCommentaryReply = null;
     for (const timer of this.modelTimers) clearTimeout(timer);
     this.modelTimers.clear();
+    for (const socket of this.voiceSockets) socket.destroy();
+    this.voiceSockets.clear();
     if ('closeAllConnections' in server && typeof server.closeAllConnections === 'function') {
       server.closeAllConnections();
     }
@@ -3514,7 +3776,7 @@ type OrkasFixtures = {
   cliOrkas: OrkasTestApp;
   connectorOrkas: OrkasTestApp;
   cliModelOrkas: OrkasTestApp;
-  updateOrkas: OrkasTestApp;
+  voiceOrkas: OrkasTestApp;
   metacognitionOrkas: OrkasTestApp;
 };
 
@@ -3576,8 +3838,8 @@ export const test = base.extend<OrkasFixtures>({
       await app.dispose();
     }
   },
-  updateOrkas: async ({}, use, testInfo) => {
-    const app = new OrkasTestApp(testInfo, { updateStub: true });
+  voiceOrkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { voiceStub: true });
     try {
       await app.launch();
       await use(app);

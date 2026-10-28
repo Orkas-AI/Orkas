@@ -153,11 +153,20 @@ export interface CommanderHandoffRequest {
   context?: string;
 }
 
+/** Host-only observation; never a model receipt, permission grant or public event. */
+export interface BridgeCallObservation {
+  method: string;
+  params: Readonly<Record<string, unknown>>;
+  ok: boolean;
+}
+
 export interface StartBridgeOpts {
   uid: string;
   cid: string;
   agentId: string;
   agentName: string;
+  /** Optional in-process audit sink. No raw results or failure messages. */
+  onCallObserved?: (observation: BridgeCallObservation) => void;
   conversationTitle?: string;
   cli: LocalCliType;
   permissionPolicy: LocalCliPermissionPolicy;
@@ -513,7 +522,7 @@ function _buildMethods(
         }
 
         const raw = await connectors.callTool(opts.uid, connectorId, toolName, args, {
-          signal: call.signal,
+          signal: call.signal, conversationId: opts.cid,
         });
         if (!call.signal.aborted) observeTaskDraftResult(draftScope, toolName, args, raw);
         const text = connectors.stringifyMcpResult(raw);
@@ -569,7 +578,7 @@ function _buildMethods(
   });
 
   if (capabilities.has('tasks.read')) Object.assign(methods, {
-    todo_tasks: async (params) => {
+    todo_tasks: async (params, call) => {
       if (opts.projectId && !(await projectExists(opts.uid, opts.projectId))) throw new Error('project_not_found');
       const readOnly = !capabilities.has('tasks.write');
       const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
@@ -586,7 +595,7 @@ function _buildMethods(
       // Reads and writes share native validation, paging, scope and execution facts.
       const tool = createProjectTasksTool(createProjectTasksHandler(opts.uid, opts.projectId || '', opts.cid, names, {
         actorId: opts.agentId,
-      }, { workingDir: opts.workingDir }, opts.onTodoTaskSaved, opts.onTodoTaskDeleted), { readOnly, globalScope: !opts.projectId });
+      }, { workingDir: opts.workingDir }, opts.onTodoTaskSaved, opts.onTodoTaskDeleted, call.signal), { readOnly, globalScope: !opts.projectId });
       const result = await tool.execute(params, { state: {} });
       const receipt = JSON.parse(result.content);
       if (result.isError) throw new Error(receipt.error || 'task operation failed');
@@ -789,6 +798,12 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
     socket.on('error', () => { /* client died mid-run; harmless */ });
   });
 
+  const observeCall = (method: string, params: Record<string, unknown>, ok: boolean) => {
+    if (!opts.onCallObserved) return;
+    try { opts.onCallObserved({ method, params, ok }); }
+    catch { log.warn('Bridge call observer failed'); }
+  };
+
   async function handleLine(line: string, socket: net.Socket): Promise<void> {
     let req: { id?: unknown; token?: unknown; method?: unknown; params?: unknown };
     try { req = JSON.parse(line); }
@@ -829,8 +844,10 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
       try {
         const result = await handler(params, { signal: controller.signal });
         payload = JSON.stringify({ id, ok: true, result });
+        observeCall(method, params, true);
       } catch (err) {
         payload = JSON.stringify({ id, ok: false, error: (err as Error).message || String(err) });
+        observeCall(method, params, false);
       } finally {
         if (id !== null && calls.get(id) === controller) calls.delete(id);
       }

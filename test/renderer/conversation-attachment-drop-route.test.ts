@@ -9,7 +9,7 @@ import { webcrypto, createHash } from 'node:crypto';
 // copied by main; only path-less Files (clipboard image data) keep the base64
 // upload. The user-visible contract of the old byte route is preserved on the
 // path route: the chip appears immediately, hash dedupe still applies, the
-// same failure copy is shown, and one click/result telemetry pair is emitted.
+// same failure copy is shown.
 
 const source = fs.readFileSync(
   path.join(__dirname, '../../src/renderer/modules/conversation.js'),
@@ -76,6 +76,7 @@ function loadHarness(opts: {
   importReject?: Error;
   preloadSupportsPaths?: boolean;
   uploadResult?: (name: string) => unknown;
+  pickerResult?: unknown;
 } = {}) {
   const chips = new Map<string, any[]>();
   const clicks: any[] = [];
@@ -135,7 +136,10 @@ function loadHarness(opts: {
     encodeURIComponent,
     setTimeout,
     window: {
-      orkas: opts.preloadSupportsPaths === false ? {} : { importLocalFiles },
+      orkas: {
+        ...(opts.preloadSupportsPaths === false ? {} : { importLocalFiles }),
+        invoke: vi.fn(async () => opts.pickerResult),
+      },
     },
     URL: {
       createObjectURL: (file: FakeFile) => `blob:${file.name}`,
@@ -144,17 +148,19 @@ function loadHarness(opts: {
     t: (key: string, vars?: Record<string, unknown>) =>
       vars ? `${key}:${JSON.stringify(vars)}` : key,
     uiAlert: vi.fn(async (text: string) => { alerts.push(text); }),
-    _convTrackClick: vi.fn((name: string, payload: unknown) => { clicks.push({ name, payload }); }),
-    _convTrackEvent: vi.fn((name: string, payload: unknown) => { events.push({ name, payload }); }),
-    _chatAttachPayload: (cid: string, files: ArrayLike<FakeFile>, sourceName: string) => ({
-      source: sourceName,
-      target: 'conversation',
-      file_count: Array.from(files).length,
-    }),
+    _convLog: { warn: vi.fn() },
+    _chatAttachTargetOf: () => 'conversation',
+    _chatMediaUrl: () => 'chat-media://fixture',
     _chatAttachList: (cid: string) => chips.get(cid) || [],
-    _chatAttachSet: (cid: string, items: any[]) => { chips.set(cid, items); },
+    _chatAttachments: chips,
+    _chatAttachOrderKey: () => '',
+    _chatAttachMarkMutation() {},
+    _chatAttachRenderChips() {},
+    currentCid: '',
     apiFetch: vi.fn(async (url: string, options: any) => {
-      const name = decodeURIComponent(String(options.headers['X-Filename']));
+      const name = url.endsWith('/import')
+        ? JSON.parse(options.body).name
+        : decodeURIComponent(String(options.headers['X-Filename']));
       uploads.push({ url, name, body: options.body });
       const bytes = new Uint8Array(options.body);
       const data = opts.uploadResult
@@ -164,6 +170,8 @@ function loadHarness(opts: {
     }),
   };
   const code = [
+    'let _chatAttachmentSelectionSequence = 0;',
+    extractFunction('_chatAttachSet'),
     extractConst('CHAT_ATTACH_ACCEPT'),
     extractConst('CHAT_IMAGE_EXTS'),
     extractConst('CHAT_VIDEO_EXTS'),
@@ -179,6 +187,9 @@ function loadHarness(opts: {
     extractFunction('_chatAttachSettleLocalImport'),
     extractFunction('_chatAttachUploadBytes'),
     extractFunction('_chatAttachUploadCore'),
+    extractFunction('_chatAttachBaseName'),
+    extractFunction('_chatAttachPickAndUploadCore'),
+    extractFunction('_chatAttachImportPathsCore'),
   ].join('\n');
   vm.createContext(context);
   vm.runInContext(code, context, { filename: 'conversation-attach.js' });
@@ -283,9 +294,23 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
     expect(h.uploads.map((u) => u.name)).toEqual(['pasted.png']);
     expect(osFile.arrayBufferReads).toBe(0);
     expect(h.chips.get(CID)!.map((c) => [c.name, c.status])).toEqual([
-      ['notes.md', 'ready'],
       ['pasted.png', 'ready'],
+      ['notes.md', 'ready'],
     ]);
+  });
+
+  it('keeps separate additions in user order when the first file read finishes last', async () => {
+    const h = loadHarness();
+    const first = fakeFile('z-first.png');
+    const second = fakeFile('a-second.png');
+    let release!: () => void;
+    const bytes = first.arrayBuffer;
+    first.arrayBuffer = async () => { await new Promise<void>((resolve) => { release = resolve; }); return bytes(); };
+    const pending = h.upload(CID, [first], 'paste');
+    await h.upload(CID, [second], 'paste');
+    release();
+    await pending;
+    expect(h.chips.get(CID)!.map((item) => item.name)).toEqual(['z-first.png', 'a-second.png']);
   });
 
   it('shows the same rejection outcome whether main refuses the file on the path route or the byte route', async () => {
@@ -399,4 +424,31 @@ describe('composer attachment routing: OS files by path, clipboard data by bytes
     expect(h.chips.get(CID)).toBeUndefined();
     expect(h.alerts[0]).toContain('chat.attach_unsupported');
   });
+
+  it('reports a rejected picker request as failure rather than zero-file success', async () => {
+    const h = loadHarness({ pickerResult: { ok: false, code: 'E_UNKNOWN', error: '/private/Private.txt' } });
+    await h.context._chatAttachPickAndUploadCore(CID, 'picker');
+
+    expect(h.alerts).toEqual(['chat.attach_upload_generic_fail']);
+
+  });
+
+  it.each([
+    ['cancelled', { cancelled: true, items: [], failed: [] }],
+    ['success', { cancelled: false, items: [{ info: { name: 'kept.txt', kind: 'text', bytes: 1 } }], failed: [] }],
+  ])('keeps a %s picker result free of failure diagnostics', async (result, pickerResult) => {
+    const h = loadHarness({ pickerResult });
+    await h.context._chatAttachPickAndUploadCore(CID, 'picker');
+
+    for (const key of ['error_code', 'failure_kind', 'failure_phase'])
+    expect(h.alerts).toEqual([]);
+  });
+
+  it('retains a byte-upload error chip when the reply is unavailable and records no raw exception', async () => {
+    const h = loadHarness({ uploadResult: () => { throw new Error('/private/Private.txt'); } });
+    await h.upload(CID, [fakeFile('Private.txt')], 'paste');
+    expect(h.chips.get(CID)).toEqual([expect.objectContaining({ name: 'Private.txt', status: 'error' })]);
+
+  });
+
 });

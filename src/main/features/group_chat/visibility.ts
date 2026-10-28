@@ -164,7 +164,7 @@ export interface GroupMessage {
    * (`'commander'` or an agent id) — the renderer routes a user→artifact
    * interaction result back to it. Rendered as a sandboxed `<iframe>`
    * (`chat-app://`) at the bottom of the bubble. */
-  artifacts?: Array<{ id: string; title: string; agent_id: string }>;
+  artifacts?: Array<{ id: string; title: string; agent_id: string; revision?: number }>;
   /** Commander-requested marketplace installs. The model can search the
    * official marketplace and request a user decision, but the install only
    * happens after the human clicks the rendered card. */

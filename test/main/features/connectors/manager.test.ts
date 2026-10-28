@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { captureMainLogWorkers } from '../../../helpers/capture-main-log-workers';
+import { makeMinimalDocx } from '../../../fixtures/make-minimal-docx';
 
 const TEST_UID = 'u-connectors-manager';
 
@@ -1897,6 +1898,21 @@ describe('features/connectors/manager authorization recovery', () => {
     });
   });
 
+  it('reports a DCR browser launch rejection without provisioning a connector', async () => {
+    mocks.dcr.startMcpDcrOAuth = vi.fn(async () => {
+      throw Object.assign(new Error('failed to open authorization browser'), { code: 'browser_open_failed' });
+    });
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    manager.beginOAuthConnect(TEST_UID, 'notion');
+    await vi.waitFor(() => expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledOnce());
+    expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      catalog_id: 'notion', result: 'failure', code: 'browser_open_failed',
+    }));
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+    expect(registry.load(TEST_UID).connections.notion).toBeUndefined();
+  });
+
   it('does not count an authorized but degraded MCP connection as a successful installation', async () => {
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');
@@ -2359,6 +2375,159 @@ describe('OAuth refresh ownership', () => {
     expect(options.signal).toBe(controller.signal);
     // Local CLI uses the same fixed deadline as all other MCP calls.
     expect(options).toEqual({ signal: controller.signal });
+  });
+
+  it('imports downloaded message files into only the calling conversation and keeps their document bytes readable', async () => {
+    mocks.mcp.listTools = vi.fn(async () => [{ name: 'execute_write', description: 'Download.', input_schema: {} }]);
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const attachments = await import('../../../../src/main/features/chat_attachments');
+    const { docxBufferToMarkdown } = await import('../../../../src/main/util/extract-docx');
+    await manager.connectViaOAuth(TEST_UID, 'feishu');
+    const body = makeMinimalDocx({ paragraphs: ['Cache reuse investigation fixture.'] });
+    const directories: string[] = [];
+    mocks.mcp.callTool = vi.fn(async (_name, _args, options) => {
+      expect(typeof options?.localFileOutputDirectory).toBe('string');
+      const directory = options.localFileOutputDirectory;
+      directories.push(directory);
+      const saved = path.join(directory, 'cache-report.docx');
+      fs.writeFileSync(saved, body);
+      return { content: [{ type: 'text', text: JSON.stringify({ action: 'im.+messages-resources-download', risk: 'W',
+        result: { ok: true, data: { saved_path: saved, size_bytes: body.length } } }) }] };
+    });
+    const returned: string[] = [];
+    for (const conversationId of ['download-a', 'download-a', 'download-b']) {
+      const raw: any = await manager.callTool(TEST_UID, 'feishu', 'execute_write', {
+        action: 'im.+messages-resources-download', parameters: { message_id: 'om_fixture', file_key: 'file_fixture', type: 'file' },
+      }, { conversationId });
+      const saved = JSON.parse(raw.content[0].text).result.data.saved_path;
+      returned.push(saved);
+      const resolved = attachments.resolveAttachmentAbsPath(TEST_UID, conversationId, path.basename(saved));
+      expect(resolved).toMatchObject({ ok: true, absPath: saved });
+      expect(fs.readFileSync(saved)).toEqual(body);
+      expect(await docxBufferToMarkdown(fs.readFileSync(saved))).toContain('Cache reuse investigation fixture');
+      expect(attachments.listPendingAttachments(TEST_UID, conversationId)).toEqual([]);
+    }
+    expect(new Set(returned).size).toBe(3);
+    expect(new Set(directories).size).toBe(3);
+    expect(directories.every(directory => !fs.existsSync(directory))).toBe(true);
+  });
+
+  it.each(['success', 'provider-error', 'throw'])('preserves the download outcome when staging cleanup fails (%s)', async mode => {
+    mocks.mcp.listTools = vi.fn(async () => [{ name: 'execute_write', description: 'Download.', input_schema: {} }]);
+    const denied = { isError: true, content: [{ type: 'text', text: '{"error_code":"connector_permission_denied"}' }] };
+    const original = new Error('MCP tool call timed out');
+    let directory = '';
+    const realRm = fs.promises.rm;
+    const remove = vi.fn(async (target: any, options: any) => {
+      if (directory && String(target) === directory) throw new Error('private staging path: ' + directory);
+      return realRm(target, options);
+    });
+    vi.doMock('node:fs/promises', async importOriginal => ({
+      ...await importOriginal<typeof import('node:fs/promises')>(), rm: remove,
+    }));
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const attachments = await import('../../../../src/main/features/chat_attachments');
+    await manager.connectViaOAuth(TEST_UID, 'feishu');
+    const { default: electronLog } = await import('electron-log/main');
+    const records: unknown[][] = [];
+    const hook = (message: any) => {
+      if (message.scope === 'connectors:local-cli-downloads' && message.level === 'warn') records.push(message.data);
+      return message;
+    };
+    electronLog.hooks.push(hook);
+    mocks.mcp.callTool = vi.fn(async (_name, _args, options) => {
+      directory = options.localFileOutputDirectory;
+      if (mode === 'provider-error') return denied;
+      if (mode === 'throw') throw original;
+      const saved = path.join(directory, 'download.txt');
+      fs.writeFileSync(saved, 'download fixture');
+      return { content: [{ type: 'text', text: JSON.stringify({ result: { ok: true,
+        data: { saved_path: saved, size_bytes: 16 } } }) }] };
+    });
+    try {
+      const pending = manager.callTool(TEST_UID, 'feishu', 'execute_write', {
+        action: 'im.+messages-resources-download',
+      }, { conversationId: 'download-cleanup' });
+      if (mode === 'throw') await expect(pending).rejects.toBe(original);
+      else if (mode === 'provider-error') expect(await pending).toEqual(denied);
+      else {
+        const raw: any = await pending;
+        const saved = JSON.parse(raw.content[0].text).result.data.saved_path;
+        expect(fs.readFileSync(saved, 'utf8')).toBe('download fixture');
+        expect(attachments.listAttachments(TEST_UID, 'download-cleanup')).toHaveLength(1);
+        expect(attachments.listPendingAttachments(TEST_UID, 'download-cleanup')).toEqual([]);
+      }
+      expect(records).toEqual([['temporary download cleanup failed', { error: {
+        message_hash: expect.stringMatching(/^[a-f0-9]{12}$/),
+        message_chars: ('private staging path: ' + directory).length,
+      } }]]);
+      expect(JSON.stringify(records)).not.toContain(directory);
+      expect(mocks.mcp.callTool).toHaveBeenCalledOnce();
+      expect(remove).toHaveBeenCalledWith(directory, expect.objectContaining({ recursive: true, force: true }));
+      if (mode !== 'success') expect(attachments.listAttachments(TEST_UID, 'download-cleanup')).toEqual([]);
+    } finally {
+      const hookIndex = electronLog.hooks.indexOf(hook);
+      if (hookIndex >= 0) electronLog.hooks.splice(hookIndex, 1);
+      vi.doUnmock('node:fs/promises');
+      if (directory) await realRm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['outside', 'symlink', 'hardlink', 'directory', 'missing', 'no-receipt', 'wrong-size', 'unsupported', 'cancel', 'timeout', 'provider-error'])(
+    'does not publish an unsafe or incomplete download (%s), cleans staging and never replays', async mode => {
+      mocks.mcp.listTools = vi.fn(async () => [{ name: 'execute_write', description: 'Download.', input_schema: {} }]);
+      const manager = await import('../../../../src/main/features/connectors/manager');
+      const attachments = await import('../../../../src/main/features/chat_attachments');
+      await manager.connectViaOAuth(TEST_UID, 'feishu');
+      const outside = path.join(tmpDir, 'private.txt');
+      fs.writeFileSync(outside, 'private');
+      const controller = new AbortController();
+      let directory = '';
+      const denied = { isError: true, content: [{ type: 'text', text: '{"error_code":"connector_permission_denied"}' }] };
+      mocks.mcp.callTool = vi.fn(async (_name, _args, options) => {
+        expect(typeof options?.localFileOutputDirectory).toBe('string');
+        directory = options.localFileOutputDirectory;
+        let saved = path.join(directory, mode === 'unsupported' ? 'payload.exe' : 'download.txt');
+        if (mode === 'outside') saved = outside;
+        else if (mode === 'symlink') fs.symlinkSync(outside, saved);
+        else if (mode === 'hardlink') fs.linkSync(outside, saved);
+        else if (mode === 'directory') fs.mkdirSync(saved);
+        else if (mode === 'missing') { /* A success receipt without file bytes must fail. */ }
+        else fs.writeFileSync(saved, 'private');
+        if (mode === 'timeout') throw new Error('MCP tool call timed out');
+        if (mode === 'cancel') controller.abort();
+        if (mode === 'provider-error') return denied;
+        if (mode === 'no-receipt') return { content: [{ type: 'text', text: 'done' }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ result: { ok: true,
+          data: { saved_path: saved, size_bytes: mode === 'wrong-size' ? 1 : 7 } } }) }] };
+      });
+      const pending = manager.callTool(TEST_UID, 'feishu', 'execute_write', {
+        action: 'im.+messages-resources-download', parameters: { message_id: 'om_fixture', file_key: 'file_fixture', type: 'file' },
+      }, { conversationId: 'download-failure', signal: controller.signal });
+      if (mode === 'provider-error') expect(await pending).toEqual(denied);
+      else {
+        const error = await pending.catch(error => error);
+        expect(error).toBeInstanceOf(Error);
+        expect(error.message).toMatch(/download|cancelled|timed out/);
+        expect(error.message).not.toContain(directory);
+        expect(error.message).not.toContain(outside);
+        if (mode === 'cancel') expect(error.code).toBe('E_TOOL_CALL_CANCELLED');
+      }
+      expect(mocks.mcp.callTool).toHaveBeenCalledOnce();
+      expect(directory).not.toBe('');
+      expect(fs.existsSync(directory)).toBe(false);
+      expect(attachments.listAttachments(TEST_UID, 'download-failure')).toEqual([]);
+      expect(fs.readFileSync(outside, 'utf8')).toBe('private');
+    },
+  );
+
+  it('requires host conversation context before requesting a message download', async () => {
+    mocks.mcp.listTools = vi.fn(async () => [{ name: 'execute_write', description: 'Download.', input_schema: {} }]);
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await manager.connectViaOAuth(TEST_UID, 'feishu');
+    await expect(manager.callTool(TEST_UID, 'feishu', 'execute_write', { action: 'im.+messages-resources-download' }))
+      .rejects.toThrow('conversation');
+    expect(mocks.mcp.callTool).not.toHaveBeenCalled();
   });
 
   it('keeps legacy standalone Lark installs mutually exclusive with the unified Feishu entry', async () => {

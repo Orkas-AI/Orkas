@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as path from 'node:path';
 
-const runtime = vi.hoisted(() => ({ windows: [] as any[], hook: null as any, nextId: 0, appType: 'local', unsubscribe: vi.fn() }));
+const runtime = vi.hoisted(() => ({ windows: [] as any[], hook: null as any, nextId: 0, unsubscribe: vi.fn(), bus: null as any }));
 vi.mock('electron', async () => {
   const { EventEmitter } = await import('node:events');
   class Contents extends EventEmitter {
@@ -14,7 +14,10 @@ vi.mock('electron', async () => {
     id = ++runtime.nextId;
     webContents = new Contents();
     dead = false;
-    show = vi.fn(); focus = vi.fn(); restore = vi.fn();
+    visible = false;
+    show = vi.fn(() => { this.visible = true; });
+    hide = vi.fn(() => { this.visible = false; });
+    focus = vi.fn(); restore = vi.fn();
     isMinimized = () => false;
     isFocusable = () => this.options.focusable !== false;
     isDestroyed = () => this.dead;
@@ -26,14 +29,8 @@ vi.mock('electron', async () => {
   }
   return { BrowserWindow: Window, shell: { openExternal: vi.fn() }, screen: { getDisplayMatching: () => ({ workArea: { x: 0, y: 0, width: 1440, height: 900 } }) } };
 });
-vi.mock('../../../src/main/features/saved_apps', () => ({
-  resolveSavedAppType: async () => runtime.appType,
-  resolveArtifactAppType: async () => runtime.appType,
-  boundAppType: async () => undefined,
-  managedPathAppType: async () => undefined,
-}));
 vi.mock('../../../src/main/features/user-switch-hooks', () => ({ registerUserSwitchHook: (_name: string, fn: any) => { runtime.hook = fn; } }));
-vi.mock('../../../src/main/features/group_chat', () => ({ subscribeBus: () => runtime.unsubscribe }));
+vi.mock('../../../src/main/features/group_chat', () => ({ subscribeBus: (_uid: string, _cid: string, callback: any) => { runtime.bus = callback; return runtime.unsubscribe; } }));
 vi.mock('../../../src/main/logger', () => ({ createLogger: () => ({ warn: vi.fn() }) }));
 
 import { BrowserWindow } from 'electron';
@@ -42,24 +39,136 @@ import { openPreview, initializePreview, closePreview, setPreviewDirty, requestP
 beforeEach(() => {
   for (const win of runtime.windows) win.destroy();
   runtime.windows.length = 0;
-  runtime.appType = 'local';
   runtime.unsubscribe.mockClear();
 });
 
 describe('independent preview ownership and lifecycle', () => {
-  it.each(['web', 'cloud'])('refuses a %s preview before allocating, focusing or reusing a window', async appType => {
+  it('keeps the video window visible without reloading or raising stale content, including rapid selections', async () => {
     const main = new BrowserWindow({});
-    const local = { kind: 'app', appId: 'a', title: 'App' };
-    await openPreview('user-a', main.webContents, local);
-    const previous = runtime.windows[1]; previous.focus.mockClear(); previous.show.mockClear();
-    runtime.appType = appType;
-    for (const source of [local, { kind: 'artifact', cid: 'task', artifactId: 'result', title: 'Result' }]) {
-      expect(await openPreview('user-a', main.webContents, source)).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
-      expect(runtime.windows).toHaveLength(2);
-      expect(previous.focus).not.toHaveBeenCalled(); expect(previous.show).not.toHaveBeenCalled();
-    }
+    const video = (name: string) => ({ kind: 'video', src: `chat-media://local/${name}.mp4`, title: name, options: {} });
+    await openPreview('user-a', main.webContents, video('first'));
+    const child = runtime.windows.at(-1);
+    readyPreview('user-a', child.webContents);
+    child.show.mockClear(); child.focus.mockClear();
+    await openPreview('user-a', main.webContents, video('second'));
+    expect(child.visible).toBe(true);
+    expect(child.show).not.toHaveBeenCalled();
+    expect(child.focus).not.toHaveBeenCalled();
+    expect(await replacePreview('user-a', child.webContents, true)).toEqual({ source: video('second') });
+    await openPreview('user-a', main.webContents, video('last'));
+    readyPreview('user-a', child.webContents);
+    expect(child.visible).toBe(true);
+    expect(child.show).not.toHaveBeenCalled();
+    expect(await replacePreview('user-a', child.webContents, true)).toEqual({ source: video('last') });
+    expect(initializePreview('user-a', child.webContents).source).toEqual(video('last'));
+    expect(child.loadFile).toHaveBeenCalledTimes(1);
+    expect(child.hide).not.toHaveBeenCalled();
+    readyPreview('user-a', child.webContents);
+    expect(child.visible).toBe(true);
+    expect(child.focus).toHaveBeenCalledOnce();
+    expect(runtime.windows).toHaveLength(2);
   });
 
+  it('switches files and images in place, releases the previous gallery, and preserves a selection received while loading', async () => {
+    const main = new BrowserWindow({});
+    const image = (cid: string) => ({ kind: 'image', src: `chat-media://local/${cid}.png`, title: cid, options: { cid },
+      gallery: { cid, index: 0, nextCursor: null, items: [{ key: cid, src: cid, alt: cid }] } });
+    await openPreview('user-a', main.webContents, image('first'));
+    const child = runtime.windows.at(-1);
+    initializePreview('user-a', child.webContents); readyPreview('user-a', child.webContents);
+    const pending = requestPreviewOwner('user-a', child.webContents, { kind: 'gallery' });
+    const file = { kind: 'file', path: '/fixture/note.txt', title: 'Note', options: {} };
+    await openPreview('user-a', main.webContents, file);
+    expect(await replacePreview('user-a', child.webContents, true)).toEqual({ source: file });
+    expect(await pending).toEqual({ ok: false });
+    expect(runtime.unsubscribe).toHaveBeenCalledOnce();
+    await openPreview('user-a', main.webContents, image('latest'));
+    // A duplicate acknowledgement must not consume the pending selection.
+    await replacePreview('user-a', child.webContents, true);
+    readyPreview('user-a', child.webContents);
+    expect(await replacePreview('user-a', child.webContents, true)).toEqual({ source: image('latest') });
+    child.webContents.send.mockClear();
+    runtime.bus({ type: 'message' });
+    expect(child.webContents.send).toHaveBeenCalledWith('preview-windows:gallery-refresh', {});
+    readyPreview('user-a', child.webContents);
+    expect(child.loadFile).toHaveBeenCalledTimes(1);
+    expect(child.hide).not.toHaveBeenCalled();
+  });
+
+  it('restores the current preview if a pending selection is superseded by the current source', async () => {
+    const main = new BrowserWindow({});
+    const first = { kind: 'video', src: 'chat-media://local/first.mp4', title: 'First', options: {} };
+    await openPreview('user-a', main.webContents, first);
+    const child = runtime.windows.at(-1);
+    readyPreview('user-a', child.webContents);
+    await openPreview('user-a', main.webContents, { ...first, src: 'chat-media://local/second.mp4' });
+    expect(child.visible).toBe(true);
+    await openPreview('user-a', main.webContents, first);
+    await replacePreview('user-a', child.webContents, true);
+    expect(child.visible).toBe(true);
+    expect(initializePreview('user-a', child.webContents).source).toEqual(first);
+    expect(child.loadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows reopening after a replacement document fails to load instead of leaving a hidden window stuck', async () => {
+    const main = new BrowserWindow({});
+    const first = { kind: 'video', src: 'chat-media://local/first.mp4', title: 'First', options: {} };
+    const next = { kind: 'artifact', cid: 'task', artifactId: 'result', title: 'App' };
+    await openPreview('user-a', main.webContents, first);
+    const child = runtime.windows.at(-1);
+    readyPreview('user-a', child.webContents);
+    await openPreview('user-a', main.webContents, next);
+    child.loadFile.mockRejectedValueOnce(new Error('Fixture document load failure'));
+    await expect(replacePreview('user-a', child.webContents, true)).rejects.toThrow('Fixture document load failure');
+    expect(child.dead).toBe(true);
+    await openPreview('user-a', main.webContents, next);
+    const reopened = runtime.windows.at(-1);
+    expect(reopened).not.toBe(child);
+    expect(reopened.visible).toBe(true);
+    expect(initializePreview('user-a', reopened.webContents).source).toEqual(next);
+  });
+
+  it('keeps unsaved edits and their confirmation visible until replacement is accepted', async () => {
+    const main = new BrowserWindow({});
+    const file = { kind: 'file', path: '/fixture/note.md', title: 'Note', options: {} };
+    const video = { kind: 'video', src: 'chat-media://local/next.mp4', title: 'Next', options: {} };
+    await openPreview('user-a', main.webContents, file);
+    const child = runtime.windows.at(-1);
+    readyPreview('user-a', child.webContents);
+    setPreviewDirty('user-a', child.webContents, true);
+    await openPreview('user-a', main.webContents, video);
+    expect(child.visible).toBe(true);
+    await replacePreview('user-a', child.webContents, false);
+    expect(child.visible).toBe(true);
+    expect(initializePreview('user-a', child.webContents).source).toEqual(file);
+    await openPreview('user-a', main.webContents, video);
+    await replacePreview('user-a', child.webContents, true);
+    expect(child.visible).toBe(true);
+    expect(child.loadFile).toHaveBeenCalledTimes(1);
+    readyPreview('user-a', child.webContents);
+    expect(child.visible).toBe(true);
+  });
+
+  it('refreshes an open artifact in the same native window only for a newer revision of that app', async () => {
+    const main = new BrowserWindow({});
+    const source = { kind: 'artifact', cid: 'task', artifactId: 'one', title: 'Draft' };
+    await openPreview('user-a', main.webContents, source);
+    const child = runtime.windows.at(-1);
+    initializePreview('user-a', child.webContents); readyPreview('user-a', child.webContents);
+    expect(runtime.bus).toBeTypeOf('function');
+    runtime.bus({ type: 'artifact_created', artifact: { id: 'other', revision: 2 } });
+    expect(child.webContents.send).not.toHaveBeenCalled();
+    runtime.bus({ type: 'artifact_created', artifact: { id: 'one', title: 'Corrected', revision: 2 } });
+    expect(child.webContents.send).toHaveBeenCalledWith('preview-windows:replace-request', {});
+    await replacePreview('user-a', child.webContents, true);
+    expect(runtime.windows).toHaveLength(2);
+    expect(initializePreview('user-a', child.webContents).source).toEqual({ ...source, title: 'Corrected' });
+    readyPreview('user-a', child.webContents);
+    child.webContents.send.mockClear();
+    runtime.bus({ type: 'artifact_created', artifact: { id: 'one', title: 'Old', revision: 1 } });
+    runtime.bus({ type: 'artifact_created', artifact: { id: 'one', title: 'Corrected', revision: 2 } });
+    expect(child.webContents.send).not.toHaveBeenCalled();
+  });
   it.each([false, true])('inherits owner focusability across every preview kind, including reopening minimized windows: %s', async (focusable) => {
     const sources = [
       { kind: 'app', appId: 'a', title: 'App' },
@@ -78,8 +187,14 @@ describe('independent preview ownership and lifecycle', () => {
       expect(child.show).toHaveBeenCalledTimes(focusable ? 1 : 0);
       expect(child.focus).toHaveBeenCalledTimes(focusable ? 1 : 0);
       if (!focusable) expect(child.options.webPreferences.backgroundThrottling).toBe(false);
+      readyPreview('user-a', child.webContents);
       child.isMinimized = () => true;
-      expect(await openPreview('user-a', main.webContents, source)).toEqual(result);
+      expect(await openPreview('user-a', main.webContents, source)).toEqual({ ...result, ...(source.kind === 'app' ? { reused: true } : {}) });
+      // Images refresh their gallery even when reopening the same selection.
+      if (source.kind === 'image') {
+        await replacePreview('user-a', child.webContents, true);
+        readyPreview('user-a', child.webContents);
+      }
       expect(child.restore).toHaveBeenCalledTimes(focusable ? 1 : 0);
       expect(child.show).toHaveBeenCalledTimes(focusable ? 2 : 0);
       expect(child.focus).toHaveBeenCalledTimes(focusable ? 2 : 0);
@@ -160,7 +275,7 @@ describe('independent preview ownership and lifecycle', () => {
       expect(initializePreview('user-a', child.webContents).source).toEqual(sources[index]);
       expect(child.dead).toBe(false);
     }
-    expect(await openPreview('user-a', main.webContents, sources[0])).toEqual(opened[0]);
+    expect(await openPreview('user-a', main.webContents, sources[0])).toEqual({...opened[0], reused: true});
     runtime.hook('user-a', 'user-b');
     expect(runtime.windows.slice(1).every(child => child.dead && !isPreviewContents(child.webContents))).toBe(true);
     expect(main.webContents.listenerCount('destroyed')).toBe(0);

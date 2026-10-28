@@ -32,6 +32,27 @@ afterEach(() => {
 });
 
 describe('TTS runtime capabilities', () => {
+  it.each(['configured-voice', 'zh_configured-voice'])('rejects a non-language prototype name before dispatch with %s', async voice => {
+    process.env.ORKAS_TTS_BASE_URL = 'https://example.invalid/v1';
+    process.env.ORKAS_TTS_API_KEY = 'fixture-key';
+    process.env.ORKAS_TTS_MODEL = 'fixture-model';
+    process.env.ORKAS_TTS_VOICE = voice;
+    const fetch = vi.fn(async () => new Response('', { status: 503 }));
+    vi.stubGlobal('fetch', fetch);
+
+    await expect(generateSpeech({
+      text: 'This request must not reach a provider.',
+      outputAbsPath: '/tmp/invalid-language-must-not-exist.mp3',
+      language: 'constructor',
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'E_TTS_LANGUAGE_INVALID',
+      requestDisposition: 'rejected_preflight',
+      chargeStatus: 'not_charged',
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('normalizes language tags and keeps candidate non-native locales out of production', () => {
     const candidate = {
       nativeLocale: 'zh-CN',

@@ -120,10 +120,12 @@ function delayedModelPicker() {
       listeners.get(name)!.add(listener);
     },
     removeEventListener(name: string, listener: unknown) { listeners.get(name)?.delete(listener); },
+    dispatchEvent(event: { type: string }) { [...(listeners.get(event.type) || [])].forEach((fn: any) => fn(event)); return true; },
   };
   const pending: Array<() => void> = [];
   const timers: Array<() => void> = [];
   const context = vm.createContext({
+    CustomEvent: class { constructor(public type: string, public detail: unknown) { this.detail = (detail as any)?.detail; } },
     document: {
       ...eventTarget, body,
       createElement: () => new Element(),
@@ -147,6 +149,8 @@ function delayedModelPicker() {
   const api = vm.runInContext('({ open: _toggleComposerModelMenu, close: _closeComposerModelMenu, peer: _closeOtherComposerPopovers })', context);
   return {
     ...api,
+    context,
+    emit: (name: string, event: unknown = {}) => [...(listeners.get(name) || [])].forEach((fn: any) => fn(event)),
     anchor: () => new Element(),
     release: () => pending.splice(0).forEach((resolve) => resolve()),
     flushTimers: () => timers.splice(0).forEach((fn) => fn()),
@@ -279,5 +283,59 @@ describe('composer popover coordination', () => {
     expect(modelOpen).toContain("_closeOtherComposerPopovers('model')");
     expect(agentOpen).toContain("_closeOtherComposerPopovers('recipient')");
     expect(workspaceOpen).toContain("_closeOtherComposerPopovers('workspace')");
+  });
+});
+
+
+describe('composer model snapshot ordering', () => {
+  const oldEntries = [{ entryId: 'entry-a', provider: 'custom', model: 'old', modelName: 'Old' }];
+  const newEntries = [{ entryId: 'entry-b', provider: 'custom', model: 'new', modelName: 'New' }];
+  it.each(['read', 'event', 'selection', 'version'])('does not replace newer %s state with an older list response', async cause => {
+    const picker = delayedModelPicker();
+    const context = picker.context;
+    let release!: (value: unknown) => void;
+    const gate = new Promise(resolve => { release = resolve; });
+    let reads = 0;
+    context.window.orkas.invoke = async (channel: string) => {
+      if (channel === 'auth.listComposerEntries') return ++reads === 1 ? gate : { ok: true, entries: newEntries };
+      return { ok: true, entries: newEntries };
+    };
+    if (cause !== 'read') {
+      picker.emit('DOMContentLoaded'); // Starts the actual boot read and installs the real event listener.
+    }
+    const pending = cause === 'read' ? vm.runInContext('_refreshComposerModelEntries()', context) : undefined;
+    try {
+      if (cause === 'read') await vm.runInContext('_refreshComposerModelEntries()', context);
+      else if (cause === 'event') picker.emit('orkas:model-entries-changed', { detail: { entries: newEntries } });
+      else {
+        context.__entries = oldEntries.map(entry => ({ ...entry }));
+        vm.runInContext('_composerModelEntries = __entries;', context);
+        if (cause === 'selection') {
+          context.__selected = newEntries[0];
+          await vm.runInContext('_selectComposerModel(__selected, "new-chat")', context);
+        } else {
+          await vm.runInContext('_updateComposerModelVersion(__entries[0], "new-chat", {id:"new",name:"New"}, null, null)', context);
+        }
+      }
+      const expected = vm.runInContext('JSON.stringify(_composerModelEntries)', context);
+      release({ ok: true, entries: oldEntries }); await pending;
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(vm.runInContext('JSON.stringify(_composerModelEntries)', context)).toBe(expected);
+      expect(JSON.parse(expected)[0].model).toBe('new');
+    } finally { release({ ok: true, entries: [] }); await pending; picker.close(); }
+  });
+
+  it.each(['rejected', 'malformed'])('retains the published entries when the latest read is %s', async outcome => {
+    const picker = delayedModelPicker();
+    const context = picker.context;
+    context.window.orkas.invoke = async () => ({ ok: true, entries: newEntries });
+    await vm.runInContext('_refreshComposerModelEntries()', context);
+    context.window.orkas.invoke = async () => {
+      if (outcome === 'rejected') throw new Error('controlled transport failure');
+      return { ok: true, entries: null };
+    };
+    await vm.runInContext('_refreshComposerModelEntries()', context);
+    expect(vm.runInContext('JSON.stringify(_composerModelEntries)', context)).toBe(JSON.stringify(newEntries));
+    picker.close();
   });
 });

@@ -10,9 +10,11 @@ const params = (providerTurnContext?: object): CompletionParams => ({
   model: "gpt-5.5", sessionId: "fixture-session", providerTurnContext,
   messages: [{ role: "user", content: [{ type: "text", text: "Process the next batch" }] }],
 });
-const provider = (account = "account-a", onPayload?: (value: unknown) => void) => createPiProvider({
-  provider: "openai-codex", model: "gpt-5.5", apiKey: token(account), onPayload,
-});
+const provider = (account = "account-a", onPayload?: (value: unknown) => void) => {
+  const config = { provider: "openai-codex", model: "gpt-5.5", apiKey: token(account), onPayload,
+    userCacheKey: 'opaque-user-a' };
+  return createPiProvider(config);
+};
 function response(state?: string, status = 200): Response {
   const headers: Record<string, string> = { "content-type": "text/event-stream" };
   if (state !== undefined) headers[routingHeader] = state;
@@ -30,6 +32,19 @@ async function stream(p: ReturnType<typeof provider>, request: CompletionParams)
 afterEach(() => vi.unstubAllGlobals());
 
 describe("Codex user-turn routing continuity", () => {
+  it('never replays routing state to another user sharing credentials and a turn handle', async () => {
+    const requests: Headers[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+      requests.push(new Headers(init.headers)); return response(`state-${requests.length}`);
+    }));
+    const request = params({});
+    for (const userCacheKey of ['user-a', 'user-a', 'user-b', 'user-b']) {
+      const config = { provider: 'openai-codex', model: 'gpt-5.5', apiKey: token('shared'), userCacheKey };
+      await stream(createPiProvider(config), request);
+    }
+    expect(requests.map(h => h.get(routingHeader))).toEqual([null, 'state-1', null, 'state-3']);
+  });
+
   it.each([undefined, "low"] as const)("replays the first state across rebuilt providers and complete/stream (reasoning=%s)", async (reasoning) => {
     const requests: Headers[] = [];
     const bodies: string[] = [];
@@ -46,7 +61,9 @@ describe("Codex user-turn routing continuity", () => {
     expect(requests.map(h => h.get(routingHeader))).toEqual([null, "private-routing-first", "private-routing-first"]);
     expect(bodies.join(" ")).not.toContain("private-routing");
     expect(JSON.stringify(request)).not.toContain("private-routing");
-    expect(requests.map(h => h.get("session-id"))).toEqual(Array(3).fill("fixture-session"));
+    expect(requests[0].get("session-id")).not.toBe("fixture-session");
+    expect(requests.map(h => h.get("session-id"))).toEqual(Array(3).fill(requests[0].get("session-id")));
+    expect(requests.map(h => h.get("x-client-request-id"))).toEqual(Array(3).fill("fixture-session"));
   });
 
   it("isolates interleaved tasks and starts a new user turn without the previous state", async () => {
@@ -75,7 +92,7 @@ describe("Codex user-turn routing continuity", () => {
     expect(requests.map(h => h.get(routingHeader))).toEqual([null, "state-1", null, null, "state-4"]);
   });
 
-  it("does not let a delayed response from an old owner overwrite the new owner's state", async () => {
+  it.each(['credential', 'user'] as const)("does not let a delayed response overwrite the new %s owner's state", async boundary => {
     let release!: (value: Response) => void;
     const requests: Headers[] = [];
     vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
@@ -84,12 +101,14 @@ describe("Codex user-turn routing continuity", () => {
       return response("new-owner-state");
     }));
     const request = params({});
-    const old = stream(provider("old"), request);
+    const build = (owner: string) => boundary === 'credential' ? provider(owner)
+      : createPiProvider({ provider: 'openai-codex', model: 'gpt-5.5', apiKey: token('shared'), userCacheKey: owner });
+    const old = stream(build("old"), request);
     await vi.waitFor(() => expect(release).toBeTypeOf("function"));
-    await stream(provider("new"), request);
+    await stream(build("new"), request);
     release(response("old-owner-state"));
     await old;
-    await stream(provider("new"), request);
+    await stream(build("new"), request);
     expect(requests[2].get(routingHeader)).toBe("new-owner-state");
   });
 

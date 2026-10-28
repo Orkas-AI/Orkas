@@ -57,7 +57,9 @@ describe('memory page full notice', () => {
 });
 
 describe('project memory full notice', () => {
-  function projectContext() {
+  function projectContext(realLogger = false) {
+    const records: any[] = [];
+    const timers: Array<() => void> = [];
     const nodes: Record<string, any> = {
       'project-memory-list': { innerHTML: '', style: {}, appendChild() {} },
       'project-memory-empty': { style: {} },
@@ -81,8 +83,18 @@ describe('project memory full notice', () => {
       t: (key: string) => key,
       setTimeout, clearTimeout,
     });
+    if (realLogger) {
+      delete context.createLogger;
+      context.console = { log() {}, info() {}, warn() {}, error() {}, debug() {} };
+      context.window.orkas.log = (record: any) => records.push(record);
+      context.setTimeout = (callback: () => void) => { timers.push(callback); return timers.length; };
+      vm.runInContext(fs.readFileSync(path.join(rendererRoot, 'modules/logger.js'), 'utf8'), context, { filename: 'logger.js' });
+    }
     vm.runInContext(projectSource, context, { filename: 'project-detail.js' });
-    return { context, nodes, alerts };
+    return { context, nodes, alerts, records, flushLogs() {
+      for (let index = 0; timers.length && index < 32; index++) timers.shift()!();
+      expect(timers).toHaveLength(0);
+    } };
   }
 
   it('toggles the notice from the store usage', () => {
@@ -93,6 +105,32 @@ describe('project memory full notice', () => {
     expect(nodes['project-memory-full'].hidden).toBe(true);
   });
 
+  it.each([
+    ['read', 'load project memory failed', 'ipc', 'memory_ipc_invoke_failed'],
+    ['mutate', 'project memory mutate failed', 'ipc', 'memory_ipc_invoke_failed'],
+    ['refresh', 'refresh project memory after mutation failed', 'runtime', 'memory_operation_failed'],
+  ])('keeps the %s failure private through the real logger bridge', async (phase, message, type, code) => {
+    const { context, records, alerts, flushLogs } = projectContext(true);
+    const marker = 'PRIVATE_MEMORY_DIAGNOSTIC_MARKER';
+    context.currentUserId = 'account-fixture';
+    vm.runInContext("_projectDetailPid = 'project-fixture'", context);
+    if (phase === 'refresh') {
+      vm.runInContext(`window.orkas.invoke = async () => ({ ok:true, entries:['fixture'], usage:{full:false} });
+        _renderProjectMemoryList = () => { throw new Error(${JSON.stringify(marker)}); }`, context);
+    } else {
+      vm.runInContext(`window.orkas.invoke = async () => { throw new Error(${JSON.stringify(marker)}); }`, context);
+    }
+    const outcome = await vm.runInContext(phase === 'read' ? "_loadProjectMemory('project-fixture')"
+      : "_mutateProjectMemory('memory.add', { content:'fixture' })", context);
+    flushLogs();
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ level: 'warn', message });
+    expect(JSON.stringify(records)).not.toContain(marker);
+    expect(records[0].data).toEqual([{ error_type: type, error_code: code }]);
+    if (phase === 'mutate') { expect(outcome.ok).toBe(false); expect(alerts).toEqual(['project.memory.failed']); }
+    if (phase === 'refresh') { expect(outcome).toEqual({ ok:true, failure:null }); expect(alerts).toHaveLength(0); }
+  });
+
   it('classifies a refused add as full', () => {
     const { context } = projectContext();
     expect(vm.runInContext("_projectMemoryFailure({ error: 'memory full: the project store would hold 17/16 entries' }).error_code", context))
@@ -100,7 +138,11 @@ describe('project memory full notice', () => {
   });
 
   it('places a localized status notice in the project memory panel', () => {
-    expect(html).toMatch(/id="project-memory-full"[^>]*role="status"[^>]*hidden[^>]*data-i18n="memory\.full_notice"|id="project-memory-full"[^>]*data-i18n="memory\.full_notice"/);
+    const notice = html.match(/<p\b[^>]*\bid="project-memory-full"[^>]*>/)?.[0];
+    expect(notice).toBeDefined();
+    expect(notice).toMatch(/\srole="status"(?:\s|>)/);
+    expect(notice).toMatch(/\shidden(?:\s|>)/);
+    expect(notice).toMatch(/\sdata-i18n="memory\.full_notice"(?:\s|>)/);
   });
 });
 
@@ -112,7 +154,7 @@ describe('agent memory full message', () => {
     const text = vm.runInNewContext(`(${match?.[0]})`, { t: (key: string) => key }) as (res: any, fallback: string) => string;
     const refused = { ok: false, error: 'memory full: the agent store would hold 17/16 entries. Consolidate it first: merge related entries with replace or remove outdated ones, then retry.' };
     expect(text(refused, 'fallback')).toBe('memory.error_full');
-    expect(text({ ok: false, error: 'old_text not found' }, 'fallback')).toBe('old_text not found');
+    expect(text({ ok: false, error: 'old_text not found' }, 'fallback')).toBe('fallback');
     expect(text(null, 'fallback')).toBe('fallback');
     // Every agent-memory add/edit failure goes through the helper.
     expect(source).not.toMatch(/uiAlert\(\(res && res\.error\) \|\| _agentLabel\('agents\.memory_update_failed'/);

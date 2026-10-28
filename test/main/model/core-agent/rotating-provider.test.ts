@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-import { classifyTransientNetworkError } from '../../../../src/core-agent/src/shared/errors';
+import { classifyRetryableError, classifyTransientNetworkError } from '../../../../src/core-agent/src/shared/errors';
 import {
   boundMessagesForImageLimit,
   createRotatingProvider,
@@ -10,7 +10,7 @@ import {
   type RotatingCandidate,
 } from '../../../../src/main/model/core-agent/rotating-provider';
 import type { LLMProvider, StreamEvent, CompletionParams, CompletionResult } from '#core-agent';
-import { createPiProvider, AgentRunner, createConfig, defineTool, ProviderError, ProviderRegistry } from '#core-agent';
+import { createPiProvider, AgentRunner, createConfig, defineTool, ContextOverflowError, ProviderError, ProviderRegistry } from '#core-agent';
 import { _clearAll, getCooldown } from '../../../../src/main/model/core-agent/profile-cooldown';
 
 import { normalizeElectronNetFetchError } from '../../../../src/main/util/proxy-dispatcher';
@@ -70,6 +70,82 @@ const PARAMS: CompletionParams = {
   model: 'test-model',
   messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
 };
+
+describe('recovery of actual upstream rejections', () => {
+  it.each(['complete', 'stream'] as const)('leaves local context overflow to Runner without rotating or cooling down (%s)', async method => {
+    _clearAll();
+    const fetchStub = vi.fn(async () => new Response(JSON.stringify({ error: {
+      code: 400, type: 'exceed_context_size_error', message: 'Request rejected',
+      n_prompt_tokens: 16764, n_ctx: 8192,
+    } }), { status: 400, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchStub);
+    const fallbackBuild = vi.fn(async () => fakeProvider('fallback', {}));
+    const onCandidateChosen = vi.fn();
+    try {
+      const provider = createRotatingProvider({ providerId: 'custom', networkRetryDelayMs: () => 0, onCandidateChosen,
+        candidates: [{ profileId: 'primary', providerId: 'custom', modelId: 'fixture',
+          build: async () => createPiProvider({ provider: 'custom', apiKey: 'fixture', customModel: {
+            id: 'fixture', name: 'fixture', api: 'openai-completions', provider: 'custom',
+            baseUrl: 'https://primary.invalid/v1', reasoning: false, input: ['text'],
+            contextWindow: 131072, maxTokens: 32768,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          } }),
+        }, { profileId: 'fallback', providerId: 'custom', modelId: 'fixture', build: fallbackBuild }],
+      });
+      if (method === 'complete') await expect(provider.complete(PARAMS)).rejects.toBeInstanceOf(ContextOverflowError);
+      else await expect(collect(provider.stream(PARAMS))).rejects.toBeInstanceOf(ContextOverflowError);
+      expect(fetchStub).toHaveBeenCalledTimes(1);
+      expect(fallbackBuild).not.toHaveBeenCalled();
+      expect(onCandidateChosen).toHaveBeenCalledExactlyOnceWith({
+        profileId: 'primary', providerId: 'custom', modelId: 'fixture',
+      });
+      expect(getCooldown('primary')).toBeUndefined();
+    } finally { vi.unstubAllGlobals(); _clearAll(); }
+  });
+});
+
+describe('HTTP 451 terminal handling', () => {
+  it.each([
+    ['complete', 'openai-completions'], ['stream', 'openai-completions'],
+    ['complete', 'openai-responses'], ['stream', 'openai-responses'],
+  ] as const)('stops %s via %s without retry, rotation or cooldown and allows a fresh request', async (method, api) => {
+    _clearAll();
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const requests: string[] = [];
+    const recoveryEvents: StreamEvent[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      requests.push(String(input).includes('primary.invalid') ? 'primary' : 'fallback');
+      return new Response(null, { status: 451 });
+    }));
+    const create = () => createRotatingProvider({ providerId: 'custom', networkRetryDelayMs: () => 0,
+      candidates: ['primary', 'fallback'].map(name => ({ profileId: name, providerId: 'custom', modelId: 'fixture',
+        build: async () => createPiProvider({ provider: 'custom', apiKey: 'fixture', customModel: {
+          id: 'fixture', name: 'fixture', api, provider: 'custom', baseUrl: `https://${name}.invalid/v1`,
+          reasoning: false, input: ['text'], contextWindow: 128000, maxTokens: 4096,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        } }),
+      })),
+    });
+    const invoke = async () => {
+      const provider = create();
+      if (method === 'complete') return provider.complete(PARAMS);
+      for await (const event of provider.stream(PARAMS)) {
+        if (event.type === 'retry' || event.type === 'provider_fallback') recoveryEvents.push(event);
+      }
+    };
+    try {
+      await expect(invoke()).rejects.toMatchObject({ statusCode: 451 });
+      expect(requests).toEqual(['primary']);
+      expect(recoveryEvents).toEqual([]);
+      expect(getCooldown('primary')).toBeUndefined();
+      expect(getCooldown('fallback')).toBeUndefined();
+      await expect(invoke()).rejects.toMatchObject({ statusCode: 451 });
+      expect(requests).toEqual(['primary', 'primary']);
+      expect(warning.mock.calls).toHaveLength(2);
+      expect(warning.mock.calls.every(([, , facts]) => facts?.httpStatus === 451)).toBe(true);
+    } finally { vi.unstubAllGlobals(); warning.mockRestore(); _clearAll(); }
+  });
+});
 
 describe('rotating-provider › successful streams', () => {
   beforeEach(() => _clearAll());
@@ -1438,6 +1514,84 @@ describe('rotating-provider › exhausted stream candidates', () => {
 
 describe('rotating-provider › cross-provider fallback', () => {
   beforeEach(() => _clearAll());
+
+  it.each(['complete', 'stream'] as const)('requires image input in %s without calling text-only candidates', async method => {
+    const textBuild = vi.fn(async () => fakeProvider('text', {
+      completeResult: { content: [{ type: 'text', text: 'blind answer' }] }, streamEvents: [{ type: 'text_delta', text: 'blind answer' } as any],
+    }));
+    const received: CompletionParams[] = [];
+    const vision: LLMProvider = {
+      id: 'vision', name: 'vision', validateAuth: async () => true,
+      complete: async params => { received.push(params); return { content: [{ type: 'text', text: 'red chart' }] } as any; },
+      async *stream(params) { received.push(params); yield { type: 'text_delta', text: 'red chart' } as any; },
+    };
+    const provider = createRotatingProvider({
+      providerId: 'test', requireImageInput: true,
+      candidates: [
+        { ...candidate('text', {}), maxInputImages: 0, build: textBuild },
+        { ...candidate('vision', {}), maxInputImages: 1, build: async () => vision },
+        { ...candidate('unused', {}), maxInputImages: 1, build: textBuild },
+      ],
+    });
+    const params: CompletionParams = { ...PARAMS, messages: [{ role: 'user', content: [
+      { type: 'image', data: 'red-pixels', mediaType: 'image/png' },
+    ] }] };
+    if (method === 'complete') expect((await provider.complete(params)).content).toEqual([{ type: 'text', text: 'red chart' }]);
+    else expect(await collect(provider.stream(params))).toContainEqual({ type: 'text_delta', text: 'red chart' });
+    expect(textBuild).not.toHaveBeenCalled();
+    expect(received).toHaveLength(1);
+    expect(received[0].messages).toEqual(params.messages);
+    expect(getCooldown('text')).toBeUndefined();
+  });
+
+  it.each(['complete', 'stream'] as const)('fails %s without requests when every configured candidate lacks vision', async method => {
+    const build = vi.fn(async () => fakeProvider('blind', {}));
+    const provider = createRotatingProvider({
+      providerId: 'test', requireImageInput: true,
+      candidates: [
+        { ...candidate('text', {}), maxInputImages: 0, build },
+        { ...candidate('observed', {}), imageSupport: { unsupported: true, observeRejection() {} }, build },
+      ],
+    });
+    const params: CompletionParams = { ...PARAMS, messages: [{ role: 'user', content: [
+      { type: 'image', data: 'red-pixels', mediaType: 'image/png' },
+    ] }] };
+    const error = await (method === 'complete' ? provider.complete(params) : collect(provider.stream(params)))
+      .catch(error => error);
+    expect(error).toMatchObject({ code: 'UNSUPPORTED_MODEL' });
+    expect(classifyRetryableError(error)).toBeNull();
+    expect(build).not.toHaveBeenCalled();
+  });
+
+  it.each(['complete', 'stream'] as const)('keeps pixels when an unknown custom model rejects images during %s', async method => {
+    const { customModelImageSupport } = await import('../../../../src/main/model/core-agent/custom-model-image-support');
+    const imageSupport = customModelImageSupport({ userId: 'vision-test', profileId: method,
+      modelId: 'unknown', apiKey: 'test-only', config: {} });
+    const rejection = Object.assign(new Error('This model does not support image inputs.'), { status: 400 });
+    const primary = vi.fn(async () => fakeProvider('unknown', { throwBefore: rejection, completeError: rejection }));
+    const received: CompletionParams[] = [];
+    const provider = createRotatingProvider({
+      providerId: 'custom', requireImageInput: true,
+      candidates: [
+        { ...candidate('unknown', {}, 'custom'), imageSupport, build: primary },
+        { ...candidate('vision', {}), maxInputImages: 1, build: async () => ({
+          id: 'vision', name: 'vision', validateAuth: async () => true,
+          async complete(params) { received.push(params); return { content: [{ type: 'text', text: 'red' }] } as any; },
+          async *stream(params) { received.push(params); yield { type: 'text_delta', text: 'red' } as any; },
+        }) },
+      ],
+    });
+    const params: CompletionParams = { ...PARAMS, messages: [{ role: 'user', content: [
+      { type: 'image', data: 'red-pixels', mediaType: 'image/png' },
+    ] }] };
+    if (method === 'complete') await provider.complete(params);
+    else await collect(provider.stream(params));
+    expect(primary).toHaveBeenCalledTimes(1);
+    expect(received).toHaveLength(1);
+    expect(received[0].messages).toEqual(params.messages);
+    expect(imageSupport.unsupported).toBe(true);
+    expect(getCooldown('unknown')).toBeUndefined();
+  });
 
   it('applies each fallback candidate image limit without mutating caller history', async () => {
     const authErr = Object.assign(new Error('401 primary rejected'), { status: 401 });
