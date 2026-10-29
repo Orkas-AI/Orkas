@@ -1480,6 +1480,7 @@
   "settings.search.sub": "搜索时会依次使用：已配置的搜索服务、模型自带搜索、本地免费搜索。",
   "settings.search.provider": "服务商",
   "settings.search.api_key": "API Key",
+  "settings.search.api_key_optional": "可选：留空即可不用 API Key 搜索",
   "settings.search.add": "+ 添加搜索 Key",
   "settings.search.pick_provider": "— 选择搜索服务 —",
   "settings.search.error_provider_needed": "请先选择搜索服务商",

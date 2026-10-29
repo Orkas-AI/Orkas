@@ -1480,6 +1480,7 @@
   "settings.search.sub": "Die Suche verwendet der Reihe nach: konfigurierte Suchdienste, die integrierte Modellsuche und kostenlose lokale Suche.",
   "settings.search.provider": "Anbieter",
   "settings.search.api_key": "API-Schlüssel",
+  "settings.search.api_key_optional": "Optional: leer lassen, um ohne API-Schlüssel zu suchen",
   "settings.search.add": "+ Suchschlüssel hinzufügen",
   "settings.search.pick_provider": "— Suchanbieter wählen —",
   "settings.search.error_provider_needed": "Wählen Sie zuerst einen Suchanbieter",

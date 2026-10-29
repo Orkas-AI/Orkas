@@ -1480,6 +1480,7 @@
   "settings.search.sub": "Search uses these in order: configured search services, the model's built-in search, then free local search.",
   "settings.search.provider": "Provider",
   "settings.search.api_key": "API Key",
+  "settings.search.api_key_optional": "Optional: leave empty to search without an API key",
   "settings.search.add": "+ Add search key",
   "settings.search.pick_provider": "— Pick search provider —",
   "settings.search.error_provider_needed": "Pick a search provider first",

@@ -404,6 +404,59 @@ async function metasoSearch(profile: SearchProfile, query: string, count: number
   };
 }
 
+// ── Keenable ────────────────────────────────────────────────────────────
+
+/**
+ * Keenable Search API:
+ * Endpoint: POST https://api.keenable.ai/v1/search/public (no key) or
+ *           POST https://api.keenable.ai/v1/search (with key)
+ * Auth: optional X-API-Key; the key only raises the rate limit. Every call
+ *       names the calling app in X-Keenable-Title.
+ * Docs: https://docs.keenable.ai/
+ *
+ * `snippet` holds page text (often thousands of characters with line
+ * breaks), so it is flattened and capped to keep one short line per result.
+ */
+const KEENABLE_API_BASE_URL = 'https://api.keenable.ai/v1';
+const KEENABLE_SNIPPET_MAX_CHARS = 500;
+
+function clipKeenableSnippet(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > KEENABLE_SNIPPET_MAX_CHARS
+    ? `${flat.slice(0, KEENABLE_SNIPPET_MAX_CHARS).trimEnd()}…`
+    : flat;
+}
+
+async function keenableSearch(profile: SearchProfile, query: string, count: number): Promise<SearchAdapterResult> {
+  const apiKey = String(profile.apiKey || '').trim();
+  const { response: resp, text } = await fetchTextWithTimeout(
+    `${KEENABLE_API_BASE_URL}/${apiKey ? 'search' : 'search/public'}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Keenable-Title': 'Orkas',
+        ...(apiKey ? { 'X-API-Key': apiKey } : {}),
+      },
+      body: JSON.stringify({ query, max_results: clamp(count, 1, 20) }),
+    },
+  );
+  if (!resp.ok) {
+    throw new Error(`Keenable ${resp.status}: ${text.slice(0, 300)}`);
+  }
+  const data = parseJson(text) as {
+    results?: Array<{ title?: string; url?: string; snippet?: string; description?: string }>;
+  };
+  return {
+    provider: 'keenable',
+    results: (data.results || []).map((r) => ({
+      title: String(r.title || ''),
+      url: String(r.url || ''),
+      snippet: clipKeenableSnippet(String(r.snippet || r.description || '')),
+    })).filter((r) => r.url),
+  };
+}
+
 // ── Registry ────────────────────────────────────────────────────────────
 
 export type SearchAdapter = (
@@ -421,6 +474,7 @@ export const searchAdaptersByProvider: Record<string, SearchAdapter> = {
   'brave-search':    braveApiSearch,
   'baidu-ai-search': baiduAiSearch,
   metaso:            metasoSearch,
+  keenable:          keenableSearch,
 };
 
 /** Display labels for provider ids — used by both the settings UI and the
@@ -433,6 +487,7 @@ export const SEARCH_PROVIDER_LABEL: Record<string, string> = {
   'brave-search':    'Brave',
   'baidu-ai-search': 'Baidu',
   metaso:            'Metaso',
+  keenable:          'Keenable',
 };
 
 /** Documentation URL shown next to the API-key input in the settings UI. */
@@ -444,6 +499,7 @@ export const SEARCH_PROVIDER_DOCS: Record<string, string> = {
   'brave-search':    'https://brave.com/search/api/',
   'baidu-ai-search': 'https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk',
   metaso:            'https://metaso.cn/',
+  keenable:          'https://docs.keenable.ai/',
 };
 
 export async function runSearchAdapter(

@@ -1480,6 +1480,7 @@
   "settings.search.sub": "खोज इस क्रम में उपयोग करती है: कॉन्फ़िगर की गई खोज सेवाएँ, मॉडल की अंतर्निहित खोज, फिर मुफ़्त स्थानीय खोज।",
   "settings.search.provider": "प्रदाता",
   "settings.search.api_key": "API कुंजी",
+  "settings.search.api_key_optional": "वैकल्पिक: बिना API कुंजी के खोजने के लिए खाली छोड़ें",
   "settings.search.add": "+ खोज कुंजी जोड़ें",
   "settings.search.pick_provider": "— खोज प्रदाता चुनें —",
   "settings.search.error_provider_needed": "पहले खोज प्रदाता चुनें",

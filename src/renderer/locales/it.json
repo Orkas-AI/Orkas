@@ -1480,6 +1480,7 @@
   "settings.search.sub": "La ricerca usa, nell'ordine: i servizi configurati, la ricerca integrata del modello e infine la ricerca locale gratuita.",
   "settings.search.provider": "Fornitore",
   "settings.search.api_key": "Chiave API",
+  "settings.search.api_key_optional": "Facoltativo: lascia vuoto per cercare senza chiave API",
   "settings.search.add": "+ Aggiungi chiave di ricerca",
   "settings.search.pick_provider": "— Scegli fornitore di ricerca —",
   "settings.search.error_provider_needed": "Scegli prima un fornitore di ricerca",

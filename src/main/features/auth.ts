@@ -234,12 +234,16 @@ interface Entry {
 export interface SearchProfile {
   id: string;
   provider: string;          // tavily / serper / brave-search / baidu-ai-search / ...
-  apiKey: string;
+  apiKey: string;            // '' only for KEYLESS_SEARCH_PROVIDERS
   label: string;
   createdAt: number;
   /** Provider-specific extras (e.g. baidu requires app id alongside key). */
   extras?: Record<string, string>;
 }
+
+/** Search providers that also answer without an API key (a key only raises
+ *  their rate limit), so their rows may be stored with an empty `apiKey`. */
+export const KEYLESS_SEARCH_PROVIDERS: ReadonlySet<string> = new Set(['keenable']);
 
 /**
  * Image-generation API key. Same shape as SearchProfile but lives in its
@@ -534,11 +538,12 @@ function parseSearchProfilesArray(arr: unknown): SearchProfile[] {
   const out: SearchProfile[] = [];
   for (const raw of arr) {
     const p = raw as any;
-    if (!p || typeof p !== 'object' || !p.id || !p.provider || !p.apiKey) continue;
+    if (!p || typeof p !== 'object' || !p.id || !p.provider) continue;
+    if (!p.apiKey && !KEYLESS_SEARCH_PROVIDERS.has(String(p.provider))) continue;
     out.push({
       id: String(p.id),
       provider: String(p.provider),
-      apiKey: String(p.apiKey),
+      apiKey: String(p.apiKey || ''),
       label: String(p.label || 'default'),
       createdAt: typeof p.createdAt === 'number' ? p.createdAt : Date.now(),
       extras: p.extras && typeof p.extras === 'object'

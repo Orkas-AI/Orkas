@@ -1480,6 +1480,7 @@
   "settings.search.sub": "Arama sırasıyla yapılandırılmış arama hizmetlerini, modelin yerleşik aramasını ve ücretsiz yerel aramayı kullanır.",
   "settings.search.provider": "Sağlayıcı",
   "settings.search.api_key": "API anahtarı",
+  "settings.search.api_key_optional": "İsteğe bağlı: API anahtarı olmadan aramak için boş bırakın",
   "settings.search.add": "+ Arama anahtarı ekle",
   "settings.search.pick_provider": "— Arama sağlayıcısı seçin —",
   "settings.search.error_provider_needed": "Önce bir arama sağlayıcısı seçin",
