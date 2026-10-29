@@ -681,6 +681,9 @@
               </div>
             </header>
             <div class="todos-workarea">
+              <input type="search" class="form-input todo-search-input" id="todos-search" autocomplete="off"
+                     data-i18n-placeholder="sidebar.search" placeholder="Search"
+                     data-i18n-aria-label="sidebar.search" aria-label="Search" />
               <div class="todo-load-error" id="todos-error" role="status" hidden><span data-i18n="todo.load_failed">Could not load tasks. Try again.</span><button class="btn btn-sm" id="todos-retry" data-i18n="chat.retry_btn">Retry</button></div>
               <div class="todos-scroll" id="todos-content" aria-live="polite"></div>
             </div>

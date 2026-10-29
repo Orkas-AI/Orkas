@@ -4,6 +4,8 @@
 let _globalTodoGroups = [];
 let _globalTodoProjects = [];
 let _globalTodoMode = 'project';
+let _globalTodoSearchQuery = '';
+let _globalTodoSearchLimit = 100;
 // Presentation-only: the by-project view paints one scope at a time ('' is the
 // global scope). Never persisted, and never narrows what a load fetches.
 let _globalTodoActiveScope = null;
@@ -350,6 +352,58 @@ function _mountTodoScrollTrack(track, snapshot) {
   _todoScrollTrackResizeObserver.observe(track);
 }
 
+function _setGlobalTodoSearch(value) {
+  const query = String(value || '').trim();
+  if (query === _globalTodoSearchQuery) return;
+  _globalTodoSearchQuery = query;
+  _globalTodoSearchLimit = 100;
+  const host = document.getElementById('todos-content');
+  if (host) host.scrollTop = 0;
+  _renderGlobalTodos();
+}
+
+function _renderGlobalTodoSearch(host) {
+  // Search cached content only. A result retains its full original context,
+  // including project identity, so duplicate task ids cannot redirect actions.
+  const query = _globalTodoSearchQuery.toLowerCase();
+  const list = document.createElement('div');
+  list.className = 'todo-board todo-search-results';
+  list.dataset.todoScrollKey = JSON.stringify([
+    typeof currentUserId === 'string' ? currentUserId : '', 'search', query,
+  ]);
+  let count = 0;
+  let hasMore = false;
+  scan: for (const group of _globalTodoGroups) {
+    for (const task of group.tasks) {
+      if (!task?.id || !String(task.content || '').toLowerCase().includes(query)) continue;
+      if (count === _globalTodoSearchLimit) { hasMore = true; break scan; }
+      list.appendChild(_renderTodoCard(task, _globalTodoContext(group.project.project_id, true)));
+      count++;
+    }
+  }
+  if (!count) {
+    // A pending/failed initial load cannot establish that there are no matches.
+    if (_globalTodoNeedsFullLoad && !_globalTodoGroups.length) return;
+    const empty = document.createElement('div');
+    empty.className = 'empty muted';
+    empty.textContent = t('search.no_results', { query: _globalTodoSearchQuery });
+    host.appendChild(empty);
+    return;
+  }
+  host.appendChild(list);
+  if (hasMore) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'btn btn-sm';
+    more.textContent = t('search.show_more');
+    more.addEventListener('click', () => {
+      _globalTodoSearchLimit += 100;
+      _renderGlobalTodos();
+    });
+    host.appendChild(more);
+  }
+}
+
 function _renderGlobalTodos() {
   const host = document.getElementById('todos-content');
   if (!host) return;
@@ -359,6 +413,12 @@ function _renderGlobalTodos() {
   host.innerHTML = '';
   for (const button of document.querySelectorAll('[data-todo-group]')) {
     button.setAttribute('aria-pressed', String(button.dataset.todoGroup === _globalTodoMode));
+    button.disabled = !!_globalTodoSearchQuery;
+  }
+  if (_globalTodoSearchQuery) {
+    _renderGlobalTodoSearch(host);
+    _restoreTodoScroll(host, scroll);
+    return;
   }
   const groups = _globalTodoGroups;
   if (!groups.length) {
@@ -414,6 +474,9 @@ function _renderGlobalTodos() {
  *  scope and the row is highlighted once loaded. If it is gone by then (done or
  *  deleted meanwhile), the page simply opens. */
 function focusTodo(scope, taskId, opts = {}) {
+  _globalTodoSearchQuery = '';
+  const search = document.getElementById('todos-search');
+  if (search) search.value = '';
   const pid = String(scope || '');
   const id = String(taskId || '');
   _globalTodoPendingFocus = id ? { pid, id } : null;
@@ -480,6 +543,17 @@ function _scheduleGlobalTodosRefresh(pid) {
 
 function _initGlobalTodos() {
   _bindTodoListActions(document.getElementById('todos-content'), _globalTodoContext);
+  const search = document.getElementById('todos-search');
+  search?.addEventListener('input', (event) => {
+    if (!event.isComposing) _setGlobalTodoSearch(search.value);
+  });
+  search?.addEventListener('compositionend', () => _setGlobalTodoSearch(search.value));
+  search?.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || event.isComposing || !search.value) return;
+    event.preventDefault();
+    search.value = '';
+    _setGlobalTodoSearch('');
+  });
   document.getElementById('todos-retry')?.addEventListener('click', loadGlobalTodos);
   for (const button of document.querySelectorAll('[data-todo-group]')) {
     button.addEventListener('click', () => {
