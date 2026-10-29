@@ -1927,6 +1927,9 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
 .todo-editor-select .ai-select-trigger:disabled { cursor: default; color: var(--muted); background: var(--surface-2); }
 #project-todo-agent.is-readonly .ai-select-trigger:disabled { color: var(--text); background: var(--surface); opacity: 1; }
 .todos-scroll { flex: 1; min-height: 0; overflow: auto; }
+.todo-search-input { flex: 0 0 auto; width: 100%; box-sizing: border-box; }
+.todo-board.todo-search-results { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.todo-board.todo-search-results .project-todo-status-select { opacity: 1; }
 /* Both entry points keep lanes on the page ground and use the same card surface. */
 .todo-board { display: grid; grid-template-columns: repeat(4, minmax(190px, 1fr)); gap: 16px; align-items: stretch; overflow-x: auto; border: 0; border-radius: 0; background: transparent; }
 .todo-board[hidden], .todo-column-body[hidden], .todo-load-error[hidden] { display: none; }
