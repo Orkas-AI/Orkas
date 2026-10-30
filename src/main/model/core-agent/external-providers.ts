@@ -516,6 +516,59 @@ export async function createDoubaoProvider(config: CreateDoubaoProviderConfig): 
   });
 }
 
+// ── SiliconFlow (user-owned API key, CN endpoint) ──────────────────────
+
+export function buildSiliconFlowModel(modelId: string): Model<'openai-completions'> {
+  const model = curatedModelsFor('siliconflow').find(entry => entry.id === modelId);
+  if (!model) throw new Error('siliconflow: model is not configured');
+  const deepseek = modelId === 'deepseek-ai/DeepSeek-V4-Flash';
+  return {
+    id: modelId,
+    name: model.name,
+    api: 'openai-completions',
+    provider: 'siliconflow' as any,
+    baseUrl: 'https://api.siliconflow.cn/v1',
+    reasoning: true,
+    input: modelInputFromConfiguredCapabilities(['text'], model),
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: configuredPositiveInteger(model.contextWindow, deepseek ? 1_000_000 : 256000),
+    maxTokens: configuredPositiveInteger(model.maxTokens, 32768),
+    ...(deepseek ? { thinkingLevelMap: { minimal: 'high', low: 'high', medium: 'high', high: 'max' } } : {}),
+    // SiliconFlow uses enable_thinking for both model families, rather than
+    // the direct DeepSeek API's thinking object. Omitted effort retains the
+    // service default; only the DeepSeek model accepts reasoning_effort.
+    // https://docs.siliconflow.cn/docs/api/chat-completions-post
+    compat: {
+      thinkingFormat: 'qwen',
+      supportsReasoningEffort: deepseek,
+      requiresReasoningContentOnAssistantMessages: true,
+      supportsDeveloperRole: false,
+      supportsStore: false,
+      supportsStrictMode: false,
+      supportsLongCacheRetention: false,
+      maxTokensField: 'max_tokens',
+    },
+  };
+}
+
+export async function createSiliconFlowProvider(config: {
+  apiKey: string;
+  modelId: string;
+}): Promise<LLMProvider> {
+  if (!config.apiKey) throw new Error('siliconflow: apiKey required');
+  if (!isBearerTokenHeaderSafe(config.apiKey)) {
+    throw Object.assign(new Error('siliconflow: invalid API key for HTTP Authorization headers'), { code: 'API_KEY_INVALID' });
+  }
+  const model = buildSiliconFlowModel(config.modelId);
+  const mod = await ca();
+  return mod.createPiProvider({
+    provider: 'siliconflow',
+    apiKey: config.apiKey,
+    customModel: model,
+    onPayload: repairOpenAICompatiblePayload,
+  });
+}
+
 // ── User-configured endpoint ──────────────────────────
 
 export interface CreateCustomOpenAICompatibleProviderConfig
