@@ -148,10 +148,7 @@ describe('auth › external navigation', () => {
 describe('auth › FEATURED_PROVIDERS', () => {
   it('lists the curated API-key providers in CATALOG order', async () => {
     const a = await import('../../../src/main/features/auth');
-    // DeepSeek 直连先（pi-ai 不带，自建适配）→ 全球前沿 OpenAI / Google /
-    // Anthropic（去掉 oauthOnly 的 OpenAI Codex）→ CN 主流（Zhipu / Moonshot
-    // / Kimi-Coding / MiniMax / Doubao；去掉 oauthOnly 的 minimax-portal*）
-    // → 聚合器 OpenRouter。必须严格跟 CATALOG 对齐（减 oauthOnly 项）。
+    // API-key documentation follows the catalog while excluding OAuth-only entries.
     expect(a.FEATURED_PROVIDERS).toEqual([
       'orkas-api',
       'deepseek',
@@ -163,6 +160,7 @@ describe('auth › FEATURED_PROVIDERS', () => {
       'kimi-coding',
       'minimax-cn',
       'doubao',
+      'siliconflow',
       'openrouter',
     ]);
     // openai-codex / minimax-portal / minimax-portal-cn are oauthOnly and
