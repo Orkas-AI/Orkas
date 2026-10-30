@@ -16,6 +16,7 @@ describe('public model catalog', () => {
       'openai',
       'openai-codex',
       'openrouter',
+      'siliconflow',
       'zai',
     ]);
     for (const models of Object.values(PUBLIC_PROVIDER_MODELS)) {
