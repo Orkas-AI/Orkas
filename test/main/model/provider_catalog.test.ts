@@ -33,9 +33,7 @@ describe('provider_catalog › CATALOG', () => {
   it('holds unique provider ids in display order', () => {
     const ids = CATALOG.map((p) => p.id);
     expect(new Set(ids).size).toBe(ids.length);
-    // DeepSeek 直连先（pi-ai 不带，自建适配），然后全球前沿（OpenAI Codex /
-    // OpenAI / Google / Anthropic），CN 主流（Zhipu / Moonshot / Kimi-Coding /
-    // MiniMax × 3 / Doubao），最后聚合器（OpenRouter）。
+    // Keep the shipped order, adding SiliconFlow beside the other aggregator.
     expect(ids).toEqual([
       'orkas-api',
       'deepseek',
@@ -50,6 +48,7 @@ describe('provider_catalog › CATALOG', () => {
       'minimax-portal-cn',
       'minimax-cn',
       'doubao',
+      'siliconflow',
       'openrouter',
       'custom',
     ]);
@@ -79,6 +78,7 @@ describe('provider_catalog › CATALOG', () => {
       'minimax-portal-cn',
       'minimax-cn',
       'doubao',
+      'siliconflow',
     ]);
   });
 
@@ -670,17 +670,14 @@ describe('provider_catalog › labels and docs', () => {
 });
 
 describe('provider_catalog › EXTERNAL_API_PROVIDERS', () => {
-  it('列出所有走 Orkas 自建适配层的 provider（pi-ai 不认识）', () => {
-    // EXTERNAL_API_PROVIDERS 是 `listProviders` / `runner.ts::buildRunner` /
-    // `auth.ts::testConnection` 的分发依据——名单必须和 CATALOG 里真实
-    // 标记为"外部"的 provider 严格一致，否则会出现"能选但调用报
-    // No model found for provider"。
-    // 当前外部适配层还包含公开 Orkas API（OpenAI-compatible chat）。
+  it('routes every app-owned provider through the external adapter', () => {
+    // Selection, task execution and connection tests must agree on routing.
     expect([...EXTERNAL_API_PROVIDERS]).toEqual([
       'orkas-api',
       'moonshot',
       'deepseek',
       'doubao',
+      'siliconflow',
       'custom',
     ]);
   });

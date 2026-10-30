@@ -52,6 +52,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -83,6 +84,71 @@ function entryProviders(res: Record<string, unknown>): string[] {
 }
 
 describe('ipc › model config auth lists', () => {
+
+  it('offers SiliconFlow and preserves a user key and both selected models across reopening', async () => {
+    const providers = await call('auth.listProviders');
+    expect((providers.providers as any[]).find(provider => provider.id === 'siliconflow'))
+      .toMatchObject({ label: 'SiliconFlow', supportsApiKey: true, supportsOAuth: false });
+    const models = await call('auth.listModels', { provider: 'siliconflow' });
+    expect((models.models as any[]).map(model => model.id)).toEqual([
+      'deepseek-ai/DeepSeek-V4-Flash', 'Qwen/Qwen3.8-27B',
+    ]);
+    const added = await call('auth.addApiKeyEntry', {
+      provider: 'siliconflow', model: 'deepseek-ai/DeepSeek-V4-Flash',
+      apiKey: 'synthetic-siliconflow-key', label: 'personal',
+    });
+    expect(added.ok).toBe(true);
+    expect((await call('auth.addEntry', {
+      provider: 'siliconflow', model: 'Qwen/Qwen3.8-27B', profileId: added.profileId,
+    })).ok).toBe(true);
+    vi.resetModules();
+    (await import('../../../src/main/features/users')).activateUser(TEST_UID);
+    const auth = await import('../../../src/main/features/auth');
+    const choices = await auth.pickChatEntryGroup();
+    expect(choices.map(choice => choice.model)).toEqual([
+      'Qwen/Qwen3.8-27B', 'deepseek-ai/DeepSeek-V4-Flash',
+    ]);
+    expect(choices.every(choice => choice.apiKey === 'synthetic-siliconflow-key')).toBe(true);
+    expect(await auth.getChatPreloadApi()).toBe('openai-completions');
+    (await import('../../../src/main/features/users')).activateUser('another-siliconflow-account');
+    expect(await auth.pickChatEntryGroup()).toEqual([]);
+    (await import('../../../src/main/features/users')).activateUser(TEST_UID);
+    await auth.removeCredential(String(added.profileId));
+    expect(await auth.pickChatEntryGroup()).toEqual([]);
+  });
+
+  it('rejects an unlisted SiliconFlow model and unsafe key without partial profile saves', async () => {
+    for (const values of [
+      { model: 'unlisted-model', apiKey: 'synthetic' },
+      { model: 'deepseek-ai/DeepSeek-V4-Flash', apiKey: 'unsafe-щ-key' },
+    ]) {
+      expect((await call('auth.addApiKeyEntry', { provider: 'siliconflow', ...values })).ok).toBe(false);
+    }
+    expect(entryProviders(await call('auth.listEntries'))).toEqual([]);
+    const providers = await call('auth.listProviders');
+    expect((providers.providers as any[]).find(provider => provider.id === 'siliconflow')?.profiles).toEqual([]);
+  });
+
+  it('tests the selected SiliconFlow model through the same SDK transport as task execution', async () => {
+    const model = 'deepseek-ai/DeepSeek-V4-Flash';
+    const added = await call('auth.addApiKeyEntry', {
+      provider: 'siliconflow', model, apiKey: 'synthetic-siliconflow-key',
+    });
+    const requests: any[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, init) => {
+      expect(String(input)).toBe('https://api.siliconflow.cn/v1/chat/completions');
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response('data: ' + JSON.stringify({
+        id: 'fixture', object: 'chat.completion.chunk', model,
+        choices: [{ index: 0, delta: { content: 'Ready' }, finish_reason: 'stop' }],
+      }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+    }));
+    expect(await call('auth.testConnection', { provider: 'siliconflow', model, profileId: added.profileId }))
+      .toMatchObject({ ok: true, model });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ model, max_tokens: 1 });
+    expect(requests[0]).not.toHaveProperty('enable_thinking');
+  });
 
   it('persists the selected Anthropic protocol and gateway prefix through settings IPC', async () => {
     const added = await call('auth.addCustomModelEntry', {
@@ -236,10 +302,10 @@ describe('ipc › model config auth lists', () => {
     expect(initial.modelsByProvider).toBeUndefined();
     expect(initial.providers).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        id: 'doubao:doubao-seedream-5-0-lite-260128',
+        id: 'doubao:doubao-seedream-5-0-flash-260915',
         provider: 'doubao',
-        model: 'doubao-seedream-5-0-lite-260128',
-        label: 'DouBao · Seedream 5.0 Lite',
+        model: 'doubao-seedream-5-0-flash-260915',
+        label: 'DouBao · Seedream 5.0 Flash',
       }),
       expect.objectContaining({
         id: 'doubao:doubao-seedream-5-0-pro-260628',

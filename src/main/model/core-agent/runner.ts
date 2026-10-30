@@ -112,6 +112,8 @@ import {
   buildMoonshotModel,
   buildDeepSeekModel,
   buildDoubaoModel,
+  buildSiliconFlowModel,
+  createSiliconFlowProvider,
   buildConfiguredOpenAICompatibleModel,
   createConfiguredOpenAICompatibleProvider,
   createMoonshotProvider,
@@ -180,6 +182,8 @@ function buildExternalProviderModel(
       return buildDeepSeekModel(modelId);
     case 'doubao':
       return buildDoubaoModel(modelId);
+    case 'siliconflow':
+      return buildSiliconFlowModel(modelId);
     case 'custom':
       return customConfig
         ? (customConfig.protocol === 'anthropic'
@@ -1776,6 +1780,8 @@ async function buildExternalProvider(
       return await createDeepSeekProvider({ apiKey, modelId });
     case 'doubao':
       return await createDoubaoProvider({ apiKey, modelId });
+    case 'siliconflow':
+      return await createSiliconFlowProvider({ apiKey, modelId });
     case 'custom':
       if (!choice.customConfig) throw new Error('custom model configuration is incomplete');
       return await createCustomOpenAICompatibleProvider({
