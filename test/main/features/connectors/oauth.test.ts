@@ -55,6 +55,54 @@ afterEach(() => {
 });
 
 describe('features/connectors/oauth', () => {
+  it.each([
+    ['connector_oauth', 'success'], ['connector_oauth', 'failure'],
+    ['google_picker', 'success'], ['google_picker', 'failure'],
+    ['composio', 'success'], ['composio', 'failure'],
+  ] as const)('keeps a replacement %s flow active when its old exchange returns %s', async (kind, outcome) => {
+    let finishOld!: (response: Response) => void;
+    let exchanges = 0;
+    const grant = (access: string) => ({ code: 0, access_token: access,
+      scope: 'webmaster.read https://www.googleapis.com/auth/drive.file', picked_file_ids: 'sheet-1',
+      connection_id: access, connection_token: 'a'.repeat(43), toolkit: 'gmail', auth_config_id: 'ac_public' });
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      if (String(url).endsWith('/composio/start')) return Promise.resolve(new Response(JSON.stringify({
+        code: 0, redirect_url: 'https://provider.example/connect',
+      })));
+      if (++exchanges === 1) return new Promise<Response>(resolve => { finishOld = resolve; });
+      return Promise.resolve(new Response(JSON.stringify(grant('current-access'))));
+    }));
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const { shell } = await import('electron');
+    const start = () => kind === 'composio'
+      ? oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any)
+      : kind === 'google_picker' ? oauth.startGoogleSheetsPicker(['sheet-1'])
+        : oauth.startOAuth('u1', catalog.findCatalogEntry('bing-webmaster')!);
+    const old = start().then(value => ({ value }), error => ({ error }));
+    await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalledTimes(1));
+    const oldCallback = oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=old');
+    await vi.waitFor(() => expect(finishOld).toBeTypeOf('function'));
+    const settled = vi.fn();
+    let currentResult: unknown;
+    void start().then(value => { settled('success'); currentResult = { value }; },
+      error => { settled('failure'); currentResult = { error }; });
+    await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalledTimes(2));
+    await expect(old).resolves.toMatchObject({ error: { code: 'superseded' } });
+    finishOld(new Response(JSON.stringify(outcome === 'success' ? grant('stale-access') : { code: 1, msg: 'old exchange rejected' })));
+    await oldCallback;
+    const settledByOld = settled.mock.calls.length;
+    await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=current');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    // Clean up even a broken implementation that loses the replacement handle.
+    oauth.cancelInFlightOAuth();
+    expect(settledByOld).toBe(0);
+    expect(currentResult).toMatchObject({ value: kind === 'composio'
+      ? { connection_id: 'current-access', connection_token: 'a'.repeat(43) }
+      : kind === 'google_picker' ? { grant: { access_token: 'current-access' }, pickedFileIds: ['sheet-1'] }
+        : { access_token: 'current-access' } });
+  });
+
   it.each(['connector_oauth', 'google_picker', 'composio'] as const)(
     'redeems a %s callback only once and ignores duplicate terminal callbacks during exchange', async (kind) => {
       const finishes: Array<(response: Response) => void> = [];

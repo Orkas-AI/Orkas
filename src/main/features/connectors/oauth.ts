@@ -455,6 +455,8 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
       account_label?: string;
       picked_file_ids?: string;
     };
+    // A cancelled or superseded exchange must not settle the replacement flow.
+    if (_pending !== pending) return;
     if (body.code !== 0 || !body.access_token) {
       throw _flowError(body.msg || 'invalid exchange response', 'invalid_exchange_response');
     }
@@ -499,7 +501,7 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
       pending.resolve(grant);
     }
   } catch (err) {
-    if (pending.kind === 'composio' && _pending !== pending) return;
+    if (_pending !== pending) return;
     log.warn('connector OAuth exchange failed', { error: logErrorSummary(err) });
     const code = (err as { code?: unknown }).code;
     // A thrown network/timeout error carries no code of its own — still tag the stage so these do
