@@ -55,6 +55,42 @@ afterEach(() => {
 });
 
 describe('features/connectors/oauth', () => {
+  it.each(['connector_oauth', 'google_picker', 'composio'] as const)(
+    'redeems a %s callback only once and ignores duplicate terminal callbacks during exchange', async (kind) => {
+      const finishes: Array<(response: Response) => void> = [];
+      const fetchMock = vi.fn((url: string) => String(url).endsWith('/composio/start')
+        ? Promise.resolve(new Response(JSON.stringify({ code: 0, redirect_url: 'https://provider.example/connect' })))
+        : new Promise<Response>(resolve => { finishes.push(resolve); }));
+      vi.stubGlobal('fetch', fetchMock);
+      const oauth = await import('../../../../src/main/features/connectors/oauth');
+      const catalog = await import('../../../../src/main/features/connectors/catalog');
+      const { shell } = await import('electron');
+      const pending = kind === 'composio'
+        ? oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any, { attemptId: 'one-attempt' })
+        : kind === 'google_picker' ? oauth.startGoogleSheetsPicker(['sheet-1'])
+          : oauth.startOAuth('u1', catalog.findCatalogEntry('bing-webmaster')!, { attemptId: 'one-attempt' });
+      const result = pending.then(value => ({ value }), error => ({ error }));
+      await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalledTimes(1));
+      const callback = 'orkas://connectors/oauth/callback?exchange_code=one-time-code';
+      const first = oauth.handleCallbackUrl(callback);
+      await vi.waitFor(() => expect(finishes).toHaveLength(1));
+      const duplicate = oauth.handleCallbackUrl(callback);
+      await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?status=cancelled');
+      const exchangeCount = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/exchange')).length;
+      for (const finish of finishes) finish(new Response(JSON.stringify({ code: 0, access_token: 'access-1',
+        scope: 'webmaster.read https://www.googleapis.com/auth/drive.file', picked_file_ids: 'sheet-1',
+        connection_id: 'conn-1', connection_token: 'a'.repeat(43), toolkit: 'gmail', auth_config_id: 'ac_public' })));
+      await Promise.all([first, duplicate]);
+      const outcome = await result;
+      expect(exchangeCount).toBe(1);
+      expect(outcome).toMatchObject({ value: kind === 'composio'
+        ? { connection_id: 'conn-1', connection_token: 'a'.repeat(43) }
+        : kind === 'google_picker' ? { grant: { access_token: 'access-1' }, pickedFileIds: ['sheet-1'] }
+          : { access_token: 'access-1' } });
+      expect(oauthProgress).toHaveBeenCalledTimes(kind === 'google_picker' ? 0 : 1);
+      expect(oauth.cancelInFlightOAuth()).toBe(false);
+    });
+
   it('never logs callback URL components even when a stale deep link is malformed', async () => {
     const oauth = await import('../../../../src/main/features/connectors/oauth');
     await oauth.handleCallbackUrl('orkas://connectors/oauth/callback/private_callback_canary#private_fragment_canary');

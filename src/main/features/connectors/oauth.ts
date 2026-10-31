@@ -357,6 +357,9 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
     return;
   }
   const pending = _pending;
+  // The landing page and its return link can deliver the same callback twice.
+  // Once exchange starts, only that exchange may settle this flow.
+  if (pending.callbackStarted) return;
   let url: URL;
   try { url = new URL(rawUrl); }
   catch (err) {
@@ -375,6 +378,7 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
   }
   const exchangeCode = url.searchParams.get('exchange_code');
   if (!exchangeCode) { _cancelPending('missing exchange_code', 'missing_exchange_code'); return; }
+  pending.callbackStarted = true;
   if (pending.attemptId) {
     broadcastOAuthConnectProgress({
       attempt_id: pending.attemptId,
@@ -384,8 +388,6 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
 
   try {
     if (pending.kind === 'composio') {
-      if (pending.callbackStarted) return;
-      pending.callbackStarted = true;
       const res = await postConnectorBridgeJson(
         'Composio connector exchange',
         `${accountApiBase()}/connectors/composio/exchange`,
