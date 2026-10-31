@@ -5,9 +5,11 @@
  * Source resolution and every destination write stay behind the global and
  * project Library path validators. Cross-Library moves are copy-then-delete:
  * the source is removed only after the destination copy and index refresh
- * succeed; a failed source delete rolls the destination back best-effort.
+ * succeed and the source is unchanged since the copy began; a failed or
+ * skipped source delete rolls the destination back best-effort.
  */
 
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import * as contexts from './contexts';
@@ -111,6 +113,30 @@ async function resolveSourceAbs(userId: string, ref: LibraryRef, rel: string): P
   const resolved = await projectFiles.resolveProjectEntryAbsPath(userId, ref.projectId!, rel);
   if (resolved.ok === false) return { ok: false, error: resolved.error };
   return { ok: true, absPath: resolved.absPath };
+}
+
+/**
+ * Fingerprint of a file or folder tree (path, size and mtime of every entry),
+ * or null when it cannot be read. Two fingerprints differ when the source was
+ * edited, added to or removed from between them.
+ */
+function fingerprintEntry(absPath: string): string | null {
+  const rows: string[] = [];
+  const walk = (abs: string, rel: string): void => {
+    const stat = fs.statSync(abs);
+    if (stat.isDirectory()) {
+      rows.push(`${rel}/`);
+      for (const name of fs.readdirSync(abs).sort()) walk(path.join(abs, name), `${rel}/${name}`);
+      return;
+    }
+    rows.push(`${rel}:${stat.size}:${stat.mtimeMs}`);
+  };
+  try {
+    walk(absPath, '');
+  } catch {
+    return null;
+  }
+  return rows.join('\n');
 }
 
 async function copyInto(
@@ -218,6 +244,7 @@ export async function transferLibraryEntries(
       results.push({ ...resultBase, ok: false, error: 'account_changed' });
       continue;
     }
+    const sourceBefore = mode === 'move' ? fingerprintEntry(resolved.absPath) : null;
     const copied = await copyInto(userId, destination, resolved.absPath, targetRel);
     if (copied.ok === false) {
       results.push({ ...resultBase, ok: false, error: normalizeError(copied.error) });
@@ -239,10 +266,15 @@ export async function transferLibraryEntries(
         continue;
       }
       let removed: { ok: boolean; error?: string };
-      try {
-        removed = await deleteFrom(userId, source, sourceRel);
-      } catch {
-        removed = { ok: false, error: 'source_delete_failed' };
+      if (fingerprintEntry(resolved.absPath) !== sourceBefore) {
+        // Edited while it was being copied: deleting now would lose those edits.
+        removed = { ok: false, error: 'source_changed' };
+      } else {
+        try {
+          removed = await deleteFrom(userId, source, sourceRel);
+        } catch {
+          removed = { ok: false, error: 'source_delete_failed' };
+        }
       }
       if (!removed.ok) {
         let rollback: { ok: boolean; error?: string };
