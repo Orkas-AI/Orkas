@@ -559,7 +559,9 @@ export async function deleteProjectFile(userId: string, projectId: string, name:
   return { ok: true };
 }
 
-export async function deleteProjectEntry(userId: string, projectId: string, name: string): Promise<Result> {
+export async function deleteProjectEntry(
+  userId: string, projectId: string, name: string, beforeDelete?: () => boolean,
+): Promise<Result> {
   let safeName: string;
   let pid: string;
   try {
@@ -579,6 +581,7 @@ export async function deleteProjectEntry(userId: string, projectId: string, name
 
   const files = await filesUnderEntry(abs, root);
   try {
+    if (beforeDelete && !beforeDelete()) return { ok: false, error: 'source_changed' };
     if (st.isDirectory()) fs.rmSync(abs, { recursive: true, force: false });
     else fs.unlinkSync(abs);
   } catch (err) { return { ok: false, error: (err as Error).message }; }

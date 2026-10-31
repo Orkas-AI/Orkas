@@ -2,8 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
 
 import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
+
+const hooks = vi.hoisted(() => ({ beforeProjectAccess: null as null | (() => void) }));
 
 vi.mock('../../../src/main/logger', () => ({
   createLogger: () => ({
@@ -15,7 +18,7 @@ vi.mock('../../../src/main/logger', () => ({
 }));
 
 vi.mock('../../../src/main/features/projects', () => ({
-  projectExists: async () => true,
+  projectExists: async () => { hooks.beforeProjectAccess?.(); return true; },
   getProject: async () => ({ project_id: 'p1' }),
 }));
 
@@ -50,6 +53,7 @@ function seed(target: string, content: string): void {
 }
 
 beforeEach(async () => {
+  hooks.beforeProjectAccess = null;
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-library-transfer-'));
   previousWorkspace = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = root;
@@ -59,10 +63,167 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
   await drainMainRuntimeForTest();
   if (previousWorkspace === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = previousWorkspace;
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+it.each(['file', 'folder'] as const)('preserves a %s edited during awaited project source deletion', async (kind) => {
+  const entry = kind === 'file' ? 'latest.md' : 'folder';
+  const relative = kind === 'file' ? entry : `${entry}/latest.md`;
+  seed(projectPath(relative), 'Copied revision');
+  const transfer = await import('../../../src/main/features/library_transfer');
+  let edited = false;
+  hooks.beforeProjectAccess = () => {
+    if (!edited && fs.existsSync(globalPath(entry))) {
+      edited = true;
+      seed(projectPath(relative), 'Saved during deletion preparation');
+    }
+  };
+
+  const result = await transfer.transferLibraryEntries('u1', {
+    mode: 'move', source: { scope: 'project', projectId: 'p1' }, paths: [entry], destination: { scope: 'global' },
+  });
+
+  expect(edited).toBe(true);
+  expect(fs.existsSync(projectPath(relative))).toBe(true);
+  expect(fs.readFileSync(projectPath(relative), 'utf8')).toBe('Saved during deletion preparation');
+  expect(fs.existsSync(globalPath(entry))).toBe(false);
+  expect(result).toMatchObject({ ok: true, succeeded: 0, failed: 1, results: [{ error: 'source_delete_failed' }] });
+});
+
+it('fails closed when source metadata cannot establish a revision', async () => {
+  const source = globalPath('unreadable.md');
+  seed(source, 'Source must survive');
+  const transfer = await import('../../../src/main/features/library_transfer');
+  const nodeFs = (await import('node:fs')).default;
+  const promises = (await import('node:fs/promises')).default;
+  const stat = nodeFs.statSync;
+  const lstat = promises.lstat;
+  let syncFailures = 0;
+  vi.spyOn(nodeFs, 'statSync').mockImplementation(((filename: any, ...args: any[]) => {
+    if (String(filename) === source && syncFailures++ < 2) {
+      throw Object.assign(new Error('Injected metadata read failure'), { code: 'EIO' });
+    }
+    return (stat as any)(filename, ...args);
+  }) as any);
+  vi.spyOn(promises, 'lstat').mockImplementation(((filename: any, ...args: any[]) => {
+    if (String(filename) === source) {
+      return Promise.reject(Object.assign(new Error('Injected revision read failure'), { code: 'EIO' }));
+    }
+    return (lstat as any)(filename, ...args);
+  }) as any);
+  syncBuiltinESMExports();
+
+  const result = await transfer.transferLibraryEntries('u1', {
+    mode: 'move', source: { scope: 'global' }, paths: ['unreadable.md'], destination: { scope: 'project', projectId: 'p1' },
+  });
+
+  expect(fs.existsSync(source)).toBe(true);
+  expect(fs.readFileSync(source, 'utf8')).toBe('Source must survive');
+  expect(fs.existsSync(projectPath('unreadable.md'))).toBe(false);
+  expect(result).toMatchObject({ ok: true, succeeded: 0, failed: 1 });
+});
+
+it('rejects a nested symlink without scanning the directory it points to', async () => {
+  const outside = path.join(root, 'outside');
+  seed(path.join(outside, 'unrelated.md'), 'Outside document');
+  fs.mkdirSync(projectPath('folder'), { recursive: true });
+  const linked = projectPath('folder/linked');
+  fs.symlinkSync(outside, linked, process.platform === 'win32' ? 'junction' : 'dir');
+  const transfer = await import('../../../src/main/features/library_transfer');
+  const nodeFs = (await import('node:fs')).default;
+  const promises = (await import('node:fs/promises')).default;
+  const readdir = nodeFs.readdirSync;
+  const opendir = promises.opendir;
+  let traversedLink = false;
+  const observe = (filename: unknown) => {
+    const value = String(filename);
+    if (value === linked || value.startsWith(`${linked}${path.sep}`)) traversedLink = true;
+  };
+  vi.spyOn(nodeFs, 'readdirSync').mockImplementation(((filename: any, ...args: any[]) => {
+    observe(filename); return (readdir as any)(filename, ...args);
+  }) as any);
+  vi.spyOn(promises, 'opendir').mockImplementation(((filename: any, ...args: any[]) => {
+    observe(filename); return (opendir as any)(filename, ...args);
+  }) as any);
+  syncBuiltinESMExports();
+
+  const result = await transfer.transferLibraryEntries('u1', {
+    mode: 'move', source: { scope: 'project', projectId: 'p1' }, paths: ['folder'], destination: { scope: 'global' },
+  });
+
+  expect(traversedLink).toBe(false);
+  expect(result).toMatchObject({ ok: true, succeeded: 0, failed: 1 });
+  expect(fs.existsSync(projectPath('folder'))).toBe(true);
+  expect(fs.readFileSync(path.join(outside, 'unrelated.md'), 'utf8')).toBe('Outside document');
+  expect(fs.existsSync(globalPath('folder'))).toBe(false);
+});
+
+it('preserves a replacement source even when its size and mtime match the copied file', async () => {
+  const source = globalPath('same.md');
+  seed(source, 'old');
+  const timestamp = new Date('2026-01-01T00:00:00Z');
+  fs.utimesSync(source, timestamp, timestamp);
+  const transfer = await import('../../../src/main/features/library_transfer');
+  const nodeFs = (await import('node:fs')).default;
+  const copy = nodeFs.copyFileSync;
+  let edited = false;
+  vi.spyOn(nodeFs, 'copyFileSync').mockImplementation(((from: any, to: any, mode: any) => {
+    copy(from, to, mode);
+    if (String(from) === source && !edited) {
+      edited = true;
+      fs.writeFileSync(`${source}.replacement`, 'new');
+      fs.renameSync(`${source}.replacement`, source);
+      fs.utimesSync(source, timestamp, timestamp);
+    }
+  }) as any);
+  syncBuiltinESMExports();
+
+  const result = await transfer.transferLibraryEntries('u1', {
+    mode: 'move', source: { scope: 'global' }, paths: ['same.md'], destination: { scope: 'project', projectId: 'p1' },
+  });
+
+  expect(edited).toBe(true);
+  expect(fs.existsSync(source)).toBe(true);
+  expect(fs.readFileSync(source, 'utf8')).toBe('new');
+  expect(fs.existsSync(projectPath('same.md'))).toBe(false);
+  expect(result).toMatchObject({ ok: true, succeeded: 0, failed: 1 });
+});
+
+it.each(['global', 'project'] as const)('retains the complete copy after a %s source is partially deleted', async (scope) => {
+  const source = scope === 'global' ? globalPath : projectPath;
+  const destination = scope === 'global' ? projectPath : globalPath;
+  seed(source('folder/first.md'), 'First original');
+  seed(source('folder/second.md'), 'Second original');
+  const transfer = await import('../../../src/main/features/library_transfer');
+  const nodeFs = (await import('node:fs')).default;
+  const remove = nodeFs.rmSync;
+  let interrupted = false;
+  vi.spyOn(nodeFs, 'rmSync').mockImplementation(((target: any, ...args: any[]) => {
+    if (String(target) === source('folder') && !interrupted) {
+      interrupted = true;
+      fs.unlinkSync(source('folder/first.md'));
+      throw Object.assign(new Error('Injected partial deletion'), { code: 'EACCES' });
+    }
+    return (remove as any)(target, ...args);
+  }) as any);
+  syncBuiltinESMExports();
+
+  const result = await transfer.transferLibraryEntries('u1', {
+    mode: 'move', paths: ['folder'],
+    source: scope === 'global' ? { scope: 'global' } : { scope: 'project', projectId: 'p1' },
+    destination: scope === 'global' ? { scope: 'project', projectId: 'p1' } : { scope: 'global' },
+  });
+
+  expect(interrupted).toBe(true);
+  expect(fs.existsSync(destination('folder/first.md'))).toBe(true);
+  expect(fs.readFileSync(destination('folder/first.md'), 'utf8')).toBe('First original');
+  expect(fs.readFileSync(destination('folder/second.md'), 'utf8')).toBe('Second original');
+  expect(result).toMatchObject({ ok: true, succeeded: 0, failed: 1, results: [{ error: 'rollback_failed' }] });
 });
 
 describe('library_transfer filesystem lifecycle', () => {

@@ -1,6 +1,10 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({
+  root: '',
   calls: [] as Array<{ op: string; args: unknown[] }>,
   failDelete: '' as string,
   throwDelete: '' as string,
@@ -18,7 +22,7 @@ vi.mock('../../../src/main/features/users', () => ({
 }));
 
 vi.mock('../../../src/main/features/contexts', () => ({
-  resolveContextEntryAbsPath: (rel: string, userId = state.activeUserId) => `/${userId}/global/${rel}`,
+  resolveContextEntryAbsPath: (rel: string, userId = state.activeUserId) => `${state.root}/${userId}/global/${rel}`,
   copyContextEntryFromPath: (source: string, target: string, userId = state.activeUserId) => {
     state.calls.push({ op: 'copy-global', args: [userId, source, target] });
     if (target.includes('conflict')) return { ok: false, error: 'target_exists' };
@@ -43,7 +47,7 @@ vi.mock('../../../src/main/features/project_files', () => ({
     }
     return {
       ok: true,
-      absPath: `/projects/${pid}/${rel}`,
+      absPath: `${state.root}/projects/${pid}/${rel}`,
       type: rel.includes('.') ? 'file' : 'dir',
     };
   },
@@ -68,6 +72,12 @@ vi.mock('../../../src/main/features/project_files', () => ({
 }));
 
 beforeEach(() => {
+  state.root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-transfer-unit-'));
+  for (const relative of ['u1/global/note.md', 'projects/p1/note.md', 'projects/p1/folder/child.md']) {
+    const absolute = path.join(state.root, relative);
+    fs.mkdirSync(path.dirname(absolute), { recursive: true });
+    fs.writeFileSync(absolute, 'Source fixture');
+  }
   state.calls.length = 0;
   state.failDelete = '';
   state.throwDelete = '';
@@ -79,6 +89,10 @@ beforeEach(() => {
   state.projectCopyStarted = null;
   state.releaseProjectCopy = null;
   vi.resetModules();
+});
+
+afterEach(() => {
+  fs.rmSync(state.root, { recursive: true, force: true });
 });
 
 async function transfer(request: any) {
@@ -98,7 +112,7 @@ describe('library_transfer', () => {
     expect(result).toMatchObject({ ok: true, succeeded: 1, failed: 0 });
     expect(state.calls).toContainEqual({
       op: 'copy-global',
-      args: ['u1', '/projects/p1/notes/report.md', 'imports/report.md'],
+      args: ['u1', `${state.root}/projects/p1/notes/report.md`, 'imports/report.md'],
     });
   });
 
@@ -135,7 +149,7 @@ describe('library_transfer', () => {
     });
 
     expect(result).toMatchObject({ ok: true, succeeded: 1, failed: 0 });
-    expect(state.calls).toEqual([{ op: 'copy-global', args: ['u1', '/u1/global/note.md', 'archive/note.md'] }]);
+    expect(state.calls).toEqual([{ op: 'copy-global', args: ['u1', `${state.root}/u1/global/note.md`, 'archive/note.md'] }]);
   });
 
   it('reports unsupported destinations per item while allowing the rest of a batch', async () => {
@@ -166,7 +180,7 @@ describe('library_transfer', () => {
       failed: 1,
       results: [{ source: 'conflict.md', ok: false, error: 'target_exists' }],
     });
-    expect(state.calls).toEqual([{ op: 'copy-global', args: ['u1', '/projects/p1/conflict.md', 'conflict.md'] }]);
+    expect(state.calls).toEqual([{ op: 'copy-global', args: ['u1', `${state.root}/projects/p1/conflict.md`, 'conflict.md'] }]);
   });
 
   it('deduplicates children when their selected parent is transferred', async () => {

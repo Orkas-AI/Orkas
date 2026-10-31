@@ -9,8 +9,8 @@
  * skipped source delete rolls the destination back best-effort.
  */
 
-import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { captureLocalEntryRevision, localEntryRevisionMatches } from '../util/file-import';
 
 import * as contexts from './contexts';
 import * as projectFiles from './project_files';
@@ -115,30 +115,6 @@ async function resolveSourceAbs(userId: string, ref: LibraryRef, rel: string): P
   return { ok: true, absPath: resolved.absPath };
 }
 
-/**
- * Fingerprint of a file or folder tree (path, size and mtime of every entry),
- * or null when it cannot be read. Two fingerprints differ when the source was
- * edited, added to or removed from between them.
- */
-function fingerprintEntry(absPath: string): string | null {
-  const rows: string[] = [];
-  const walk = (abs: string, rel: string): void => {
-    const stat = fs.statSync(abs);
-    if (stat.isDirectory()) {
-      rows.push(`${rel}/`);
-      for (const name of fs.readdirSync(abs).sort()) walk(path.join(abs, name), `${rel}/${name}`);
-      return;
-    }
-    rows.push(`${rel}:${stat.size}:${stat.mtimeMs}`);
-  };
-  try {
-    walk(absPath, '');
-  } catch {
-    return null;
-  }
-  return rows.join('\n');
-}
-
 async function copyInto(
   userId: string,
   destination: LibraryRef,
@@ -160,9 +136,11 @@ async function copyInto(
   return { ok: true, fileCount: copied.fileCount, bytes: copied.bytes };
 }
 
-async function deleteFrom(userId: string, ref: LibraryRef, rel: string): Promise<{ ok: boolean; error?: string }> {
-  if (ref.scope === 'global') return contexts.deleteContextTarget(rel, userId);
-  return projectFiles.deleteProjectEntry(userId, ref.projectId!, rel);
+async function deleteFrom(
+  userId: string, ref: LibraryRef, rel: string, beforeDelete?: () => boolean,
+): Promise<{ ok: boolean; error?: string }> {
+  if (ref.scope === 'global') return contexts.deleteContextTarget(rel, userId, beforeDelete);
+  return projectFiles.deleteProjectEntry(userId, ref.projectId!, rel, beforeDelete);
 }
 
 async function moveWithin(
@@ -244,7 +222,15 @@ export async function transferLibraryEntries(
       results.push({ ...resultBase, ok: false, error: 'account_changed' });
       continue;
     }
-    const sourceBefore = mode === 'move' ? fingerprintEntry(resolved.absPath) : null;
+    const sourceBefore = mode === 'move' ? await captureLocalEntryRevision(resolved.absPath) : undefined;
+    if (mode === 'move' && !sourceBefore) {
+      results.push({ ...resultBase, ok: false, error: 'transfer_failed' });
+      continue;
+    }
+    if (!isActiveAccount(userId)) {
+      results.push({ ...resultBase, ok: false, error: 'account_changed' });
+      continue;
+    }
     const copied = await copyInto(userId, destination, resolved.absPath, targetRel);
     if (copied.ok === false) {
       results.push({ ...resultBase, ok: false, error: normalizeError(copied.error) });
@@ -266,17 +252,18 @@ export async function transferLibraryEntries(
         continue;
       }
       let removed: { ok: boolean; error?: string };
-      if (fingerprintEntry(resolved.absPath) !== sourceBefore) {
-        // Edited while it was being copied: deleting now would lose those edits.
-        removed = { ok: false, error: 'source_changed' };
-      } else {
-        try {
-          removed = await deleteFrom(userId, source, sourceRel);
-        } catch {
-          removed = { ok: false, error: 'source_delete_failed' };
-        }
+      try {
+        removed = await deleteFrom(userId, source, sourceRel, () => localEntryRevisionMatches(sourceBefore));
+      } catch {
+        removed = { ok: false, error: 'source_delete_failed' };
       }
       if (!removed.ok) {
+        // A native directory removal may fail after deleting some children.
+        // Keep the completed copy when the original revision is no longer intact.
+        if (removed.error !== 'source_changed' && !localEntryRevisionMatches(sourceBefore)) {
+          results.push({ ...resultBase, ok: false, error: 'rollback_failed' });
+          continue;
+        }
         let rollback: { ok: boolean; error?: string };
         try {
           rollback = await deleteFrom(userId, destination, targetRel);

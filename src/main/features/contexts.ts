@@ -684,7 +684,9 @@ export async function importContextFileFromPath(
 }
 
 /** User-facing delete — files or dirs (recursive), refuses to touch the root index. */
-export function deleteContextTarget(relpath: string, userId: string = getActiveUserId()): Result {
+export function deleteContextTarget(
+  relpath: string, userId: string = getActiveUserId(), beforeDelete?: () => boolean,
+): Result {
   let p: string;
   try { p = resolvePath(relpath, { mustExist: true, userId }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
@@ -695,6 +697,7 @@ export function deleteContextTarget(relpath: string, userId: string = getActiveU
   const droppedRels = _collectRelsUnder(p, relpath);
   try {
     const st = fs.statSync(p);
+    if (beforeDelete && !beforeDelete()) return { ok: false, error: 'source_changed' };
     if (st.isDirectory()) fs.rmSync(p, { recursive: true, force: true });
     else fs.unlinkSync(p);
   } catch (err) { return { ok: false, error: (err as Error).message }; }

@@ -150,6 +150,55 @@ export function copyLocalEntryExclusiveSync(source: string, target: string, dire
   }
 }
 
+export interface LocalEntryRevision {
+  root: string;
+  entries: Array<{ relative: string; stamp: string }>;
+}
+
+const MAX_REVISION_ENTRIES = 10_000;
+const MAX_REVISION_PATH_BYTES = 1024 * 1024;
+
+function revisionStamp(stat: fs.BigIntStats): string | undefined {
+  if (!stat.isFile() && !stat.isDirectory()) return undefined;
+  return [stat.isDirectory() ? 'dir' : 'file', stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+}
+
+/** Capture bounded metadata without following symlinks or blocking Main for a
+ * full directory scan. An unavailable revision must never authorize deletion. */
+export async function captureLocalEntryRevision(root: string): Promise<LocalEntryRevision | undefined> {
+  const entries: LocalEntryRevision['entries'] = [];
+  const deadline = performance.now() + 5000;
+  let pathBytes = 0;
+  async function visit(absolute: string, relative: string, depth: number): Promise<void> {
+    pathBytes += Buffer.byteLength(relative);
+    if (depth > 64 || entries.length >= MAX_REVISION_ENTRIES
+      || pathBytes > MAX_REVISION_PATH_BYTES || performance.now() > deadline) throw new Error('revision budget exceeded');
+    const stat = await fsp.lstat(absolute, { bigint: true });
+    const stamp = revisionStamp(stat);
+    if (!stamp) throw new Error('unsupported revision source');
+    entries.push({ relative, stamp });
+    if (stat.isDirectory()) {
+      const directory = await fsp.opendir(absolute);
+      for await (const child of directory) {
+        await visit(path.join(absolute, child.name), relative ? path.join(relative, child.name) : child.name, depth + 1);
+      }
+    }
+  }
+  try { await visit(root, '', 0); return { root, entries }; }
+  catch { return undefined; }
+}
+
+/** Run immediately before the synchronous removal, after all awaited work.
+ * Directory stamps detect added/removed children without another tree walk. */
+export function localEntryRevisionMatches(revision: LocalEntryRevision | undefined): boolean {
+  if (!revision?.entries.length || revision.entries.length > MAX_REVISION_ENTRIES) return false;
+  const deadline = performance.now() + 100;
+  try {
+    return revision.entries.every(({ relative, stamp }) => performance.now() <= deadline
+      && revisionStamp(fs.lstatSync(path.join(revision.root, relative), { bigint: true })) === stamp);
+  } catch { return false; }
+}
+
 export async function isUtf8File(absPath: string): Promise<boolean> {
   const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
   const stream = fs.createReadStream(absPath);

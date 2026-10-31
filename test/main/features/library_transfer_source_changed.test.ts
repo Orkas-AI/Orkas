@@ -20,7 +20,8 @@ vi.mock('../../../src/main/features/contexts', () => ({
     state.calls.push({ op: 'copy-global', args: [source, target] });
     return { ok: true, path: target, fileCount: 1, bytes: 10 };
   },
-  deleteContextTarget: (rel: string) => {
+  deleteContextTarget: (rel: string, _uid: string, beforeDelete?: () => boolean) => {
+    if (beforeDelete && !beforeDelete()) return { ok: false, error: 'source_changed' };
     state.calls.push({ op: 'delete-global', args: [rel] });
     return { ok: true };
   },
@@ -34,7 +35,8 @@ vi.mock('../../../src/main/features/project_files', () => ({
     state.duringCopy?.();
     return { ok: true, name: target, fileCount: 1, bytes: 10 };
   },
-  deleteProjectEntry: async (_uid: string, pid: string, rel: string) => {
+  deleteProjectEntry: async (_uid: string, pid: string, rel: string, beforeDelete?: () => boolean) => {
+    if (beforeDelete && !beforeDelete()) return { ok: false, error: 'source_changed' };
     state.calls.push({ op: 'delete-project', args: [pid, rel] });
     return { ok: true };
   },
