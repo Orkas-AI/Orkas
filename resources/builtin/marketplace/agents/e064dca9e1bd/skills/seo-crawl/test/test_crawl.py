@@ -761,3 +761,49 @@ class FirstSentenceUnitTest(unittest.TestCase):
 
     def test_empty_in_empty_out(self):
         self.assertEqual(crawl._first_sentence("   "), "")
+
+class RobotsDirectiveRegressionTest(unittest.TestCase):
+    def page(self, directives='', status=200):
+        return extract_fields(directives, 'https://example.com/', status=status)
+
+    def test_none_meta_blocks_indexing(self):
+        page = self.page('<meta name="ROBOTS" content="NONE">')
+        self.assertTrue(page['noindex'])
+        self.assertFalse(page['is_indexable'])
+
+    def test_all_generic_meta_tags_are_combined_restrictively(self):
+        page = self.page('<meta name="robots" content="index,follow">'
+                         '<meta name="robots" content="noindex">')
+        self.assertTrue(page['noindex'])
+        self.assertFalse(page['is_indexable'])
+
+    def test_only_exact_directives_block(self):
+        for value in ('x-noindex', 'noindexing', 'noimageindex', 'max-image-preview:none', 'max-image-preview: none',
+                      'max-snippet:0', 'index, follow'):
+            with self.subTest(value=value):
+                self.assertFalse(self.page('<meta name="robots" content="' + value + '">')['noindex'])
+
+    def test_missing_response_status_stays_unknown(self):
+        page = self.page('<meta name="robots" content="none">', status=None)
+        self.assertTrue(page['noindex'])
+        self.assertIsNone(page['is_indexable'])
+
+    def test_agent_specific_meta_is_not_global(self):
+        self.assertFalse(self.page('<meta name="googlebot" content="noindex">')['noindex'])
+
+    def test_meta_robots_display_remains_first_value(self):
+        page = self.page('<meta name="robots" content="index,follow">'
+                         '<meta name="robots" content="noindex">')
+        self.assertEqual(page['meta_robots'], 'index,follow')
+        self.assertTrue(page['noindex'])
+
+    def test_noindex_with_mixed_case_and_whitespace(self):
+        page = self.page('<meta name="RoBoTs" content="  NoInDeX , FOLLOW  ">')
+        self.assertTrue(page['noindex'])
+        self.assertFalse(page['is_indexable'])
+
+    def test_later_index_does_not_override_earlier_noindex(self):
+        page = self.page('<meta name="robots" content="noindex">'
+                         '<meta name="robots" content="index,follow">')
+        self.assertTrue(page['noindex'])
+        self.assertFalse(page['is_indexable'])
