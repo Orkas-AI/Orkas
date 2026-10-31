@@ -52,7 +52,7 @@ const OAUTH_RETRY_BASE_DELAY_MS = 400;
 
 interface PendingFlow {
   kind: 'connector_oauth' | 'google_picker' | 'composio';
-  callbackStarted?: boolean;
+  phase: 'starting' | 'authorizing' | 'exchanging';
   catalogId: string;
   attemptId?: string;
   requiredScopes: string[];
@@ -225,29 +225,15 @@ export async function startComposioConnect(
 ): Promise<ComposioGrant> {
   if (entry.auth_mode !== 'composio') throw new Error(`catalog entry ${entry.id} is not Composio-backed`);
   _cancelPending('superseded by a new OAuth start', 'superseded');
-  const headers = connectorApiKeyHeaders();
-  const res = await postConnectorBridgeJson(
-    'Composio connector start',
-    `${accountApiBase()}/connectors/composio/start`,
-    {
-      catalog_id: entry.id,
-      device_id: tokenStore.getDeviceId(),
-      lang: getLanguage(),
-    },
-    headers,
-  );
-  const raw = await res.text();
-  const body = _parseJsonObject(raw);
-  if (!res.ok || Number(body.code || 0) !== 0 || typeof body.redirect_url !== 'string') {
-    throw _friendlyComposioStartError(body, `Composio start HTTP ${res.status}`);
-  }
-  const redirectUrl = safeExternalHttpUrl(body.redirect_url);
-  if (!redirectUrl) throw _flowError('invalid Composio redirect URL', 'invalid_redirect_url');
   return new Promise<ComposioGrant>((resolve, reject) => {
-    const timer = setTimeout(() => _cancelPending('OAuth flow timed out', 'flow_timeout'), FLOW_TIMEOUT_MS);
+    const expire = () => {
+      if (_pending === pending) _cancelPending('OAuth flow timed out', 'flow_timeout');
+    };
+    const timer = setTimeout(expire, FLOW_TIMEOUT_MS);
     timer.unref?.();
-    _pending = {
+    const pending: PendingFlow = {
       kind: 'composio',
+      phase: 'starting',
       catalogId: entry.id,
       ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
       requiredScopes: [],
@@ -255,8 +241,35 @@ export async function startComposioConnect(
       reject,
       timer,
     };
-    shell.openExternal(redirectUrl).catch((err) => {
-      _cancelPending(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
+    _pending = pending;
+    void (async () => {
+      const res = await postConnectorBridgeJson(
+        'Composio connector start',
+        `${accountApiBase()}/connectors/composio/start`,
+        { catalog_id: entry.id, device_id: tokenStore.getDeviceId(), lang: getLanguage() },
+        connectorApiKeyHeaders(),
+      );
+      if (_pending !== pending) return;
+      const body = _parseJsonObject(await res.text());
+      if (_pending !== pending) return;
+      if (!res.ok || Number(body.code || 0) !== 0 || typeof body.redirect_url !== 'string') {
+        throw _friendlyComposioStartError(body, `Composio start HTTP ${res.status}`);
+      }
+      const redirectUrl = safeExternalHttpUrl(body.redirect_url);
+      if (!redirectUrl) throw _flowError('invalid Composio redirect URL', 'invalid_redirect_url');
+      // Preserve the full consent budget after the bounded start request.
+      clearTimeout(pending.timer);
+      pending.timer = setTimeout(expire, FLOW_TIMEOUT_MS);
+      pending.timer.unref?.();
+      pending.phase = 'authorizing';
+      await shell.openExternal(redirectUrl).catch((err) => {
+        throw _flowError(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
+      });
+    })().catch((err) => {
+      if (_pending !== pending) return;
+      _pending = null;
+      clearTimeout(pending.timer);
+      pending.reject(err);
     });
   });
 }
@@ -297,11 +310,12 @@ export async function startOAuth(
   });
   return new Promise<OAuthGrant>((resolve, reject) => {
     const timer = setTimeout(() => {
-      _cancelPending('OAuth flow timed out', 'flow_timeout');
+      if (_pending === pending) _cancelPending('OAuth flow timed out', 'flow_timeout');
     }, FLOW_TIMEOUT_MS);
     timer.unref?.();
-    _pending = {
+    const pending: PendingFlow = {
       kind: 'connector_oauth',
+      phase: 'authorizing',
       catalogId: entry.id,
       ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
       requiredScopes: Array.isArray(entry.required_oauth_scopes) ? entry.required_oauth_scopes.slice() : [],
@@ -309,8 +323,9 @@ export async function startOAuth(
       reject,
       timer,
     };
+    _pending = pending;
     shell.openExternal(startUrl.toString()).catch((err) => {
-      _cancelPending(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
+      if (_pending === pending) _cancelPending(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
     });
   });
 }
@@ -332,19 +347,21 @@ export async function startGoogleSheetsPicker(fileIds?: string[]): Promise<Googl
   log.info('opening Google Sheets picker url', { file_id_count: cleanFileIds.length });
   return new Promise<GooglePickerResult>((resolve, reject) => {
     const timer = setTimeout(() => {
-      _cancelPending('OAuth flow timed out', 'flow_timeout');
+      if (_pending === pending) _cancelPending('OAuth flow timed out', 'flow_timeout');
     }, FLOW_TIMEOUT_MS);
     timer.unref?.();
-    _pending = {
+    const pending: PendingFlow = {
       kind: 'google_picker',
+      phase: 'authorizing',
       catalogId: 'gsheets',
       requiredScopes: ['https://www.googleapis.com/auth/drive.file'],
       resolve: resolve as PendingFlow['resolve'],
       reject,
       timer,
     };
+    _pending = pending;
     shell.openExternal(startUrl.toString()).catch((err) => {
-      _cancelPending(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
+      if (_pending === pending) _cancelPending(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
     });
   });
 }
@@ -359,7 +376,7 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
   const pending = _pending;
   // The landing page and its return link can deliver the same callback twice.
   // Once exchange starts, only that exchange may settle this flow.
-  if (pending.callbackStarted) return;
+  if (pending.phase !== 'authorizing') return;
   let url: URL;
   try { url = new URL(rawUrl); }
   catch (err) {
@@ -378,7 +395,7 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
   }
   const exchangeCode = url.searchParams.get('exchange_code');
   if (!exchangeCode) { _cancelPending('missing exchange_code', 'missing_exchange_code'); return; }
-  pending.callbackStarted = true;
+  pending.phase = 'exchanging';
   if (pending.attemptId) {
     broadcastOAuthConnectProgress({
       attempt_id: pending.attemptId,
