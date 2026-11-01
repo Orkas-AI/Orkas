@@ -1731,6 +1731,18 @@ describe('agents › createAgentFromBlocks', () => {
 });
 
 describe('agents › listAgents', () => {
+  it.each(['custom', 'marketplace'])('loads a BOM-prefixed Agent from %s without changing its definition', async (source) => {
+    const dir = path.join(tmpDir, TEST_UID, source === 'custom' ? 'cloud' : 'local/marketplace', 'agents', 'bom-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'agent.json');
+    const bytes = Buffer.from('\uFEFF' + JSON.stringify({ agent_id: 'bom-agent', name: 'Fixture', workflow: 'Preserve this workflow' }));
+    fs.writeFileSync(file, bytes);
+    const a = await loadAgents();
+    expect(await a.listAgentSummaries()).toMatchObject([{ agent_id: 'bom-agent', name: 'Fixture', source }]);
+    expect(await a.listAgents()).toMatchObject([{ agent_id: 'bom-agent', workflow: 'Preserve this workflow', source }]);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+  });
+
   it('returns empty when both dirs are missing', async () => {
     const a = await loadAgents();
     expect(await a.listAgents()).toEqual([]);
@@ -3203,7 +3215,10 @@ describe('agents › list cache invalidation', () => {
     writeCustomAgent('a-healthy', { name: 'Healthy' });
     writeCustomAgent('z-recoverable', { name: 'Recoverable' });
     const file = path.join(customAgentsDir(), 'z-recoverable', 'agent.json');
-    const source = fs.readFileSync(file, 'utf8');
+    // Compatibility with an encoding marker must not turn a failed scan into
+    // a partial success; restoring these exact bytes must be enough to recover.
+    const source = '\uFEFF' + fs.readFileSync(file, 'utf8');
+    fs.writeFileSync(file, source);
     const a = await loadAgents();
     const paths = await import('../../../src/main/paths');
     const cache = paths.userAgentCatalogCacheFile(TEST_UID);
@@ -3228,9 +3243,11 @@ describe('agents › list cache invalidation', () => {
       fs.writeFileSync(file, source);
     }
     expect((await a.listAgents()).map(agent => agent.agent_id).sort()).toEqual(['a-healthy', 'z-recoverable']);
+    expect(fs.readFileSync(file, 'utf8')).toBe(source);
     vi.resetModules();
     (await import('../../../src/main/features/users')).activateUser(TEST_UID);
     expect((await (await loadAgents()).listAgents()).map(agent => agent.agent_id).sort()).toEqual(['a-healthy', 'z-recoverable']);
+    expect(fs.readFileSync(file, 'utf8')).toBe(source);
   });
 
   it('reuses the persisted catalog after a module restart and honors force invalidation', async () => {

@@ -115,6 +115,28 @@ describe('storage › exclusive file publication', () => {
 });
 
 describe('storage › JSON IO', () => {
+  it.each(['\n', '\r\n'])('reads one leading UTF-8 BOM without changing JSON values or source bytes (%j)', async (newline) => {
+    const file = path.join(tmpDir, 'bom.json');
+    const data = { name: 'Fixture', text: 'inside\uFEFFvalue', nested: [false, 3] };
+    const bytes = Buffer.from('\uFEFF' + JSON.stringify(data, null, 2).replace(/\n/g, newline));
+    fs.writeFileSync(file, bytes);
+    expect(await readJson(file, { strict: true })).toEqual(data);
+    expect(await readJson(file)).toEqual(data);
+    expect(readJsonSync(file)).toEqual(data);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+  });
+
+  it('does not repair malformed JSON or consume repeated BOMs', async () => {
+    const file = path.join(tmpDir, 'invalid-bom.json');
+    for (const text of ['\uFEFF{broken', '\uFEFF\uFEFF{"name":"Fixture"}']) {
+      fs.writeFileSync(file, text);
+      await expect(readJson(file, { strict: true })).rejects.toBeInstanceOf(SyntaxError);
+      expect(await readJson(file)).toEqual({});
+      expect(readJsonSync(file)).toEqual({});
+      expect(fs.readFileSync(file, 'utf8')).toBe(text);
+    }
+  });
+
   it('strict reads preserve read failures and parse failures while tolerant callers retain compatibility', async () => {
     const missing = path.join(tmpDir, 'missing-strict.json');
     await expect(readJson(missing, { strict: true })).rejects.toMatchObject({ code: 'ENOENT' });
@@ -125,6 +147,26 @@ describe('storage › JSON IO', () => {
     expect(await readJson(file)).toEqual({});
     fs.writeFileSync(file, JSON.stringify({ agents: ['kept'] }));
     expect(await readJson(file, { strict: true })).toEqual({ agents: ['kept'] });
+  });
+
+  it.each(['EACCES', 'EIO'])('preserves %s on BOM files and reads them after the fault clears', async (code) => {
+    const file = path.join(tmpDir, 'denied-bom.json');
+    const bytes = Buffer.from('\uFEFF{"name":"Preserved fixture"}');
+    fs.writeFileSync(file, bytes);
+    const error = Object.assign(new Error('Controlled read failure'), { code });
+    const asyncRead = vi.spyOn(nativeFs.promises, 'readFile').mockRejectedValue(error);
+    const syncRead = vi.spyOn(nativeFs, 'readFileSync').mockImplementation(() => { throw error; });
+    syncBuiltinESMExports();
+    try {
+      await expect(readJson(file, { strict: true })).rejects.toMatchObject({ code });
+      expect(await readJson(file)).toEqual({});
+      expect(readJsonSync(file)).toEqual({});
+    } finally {
+      asyncRead.mockRestore(); syncRead.mockRestore(); syncBuiltinESMExports();
+    }
+    expect(fs.readFileSync(file)).toEqual(bytes);
+    expect(await readJson(file, { strict: true })).toEqual({ name: 'Preserved fixture' });
+    expect(readJsonSync(file)).toEqual({ name: 'Preserved fixture' });
   });
 
   it('writeJson + readJson roundtrip preserves UTF-8 and structure', async () => {

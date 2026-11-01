@@ -62,7 +62,8 @@ export async function readJson<T = Record<string, any>>(
 ): Promise<T> {
   try {
     const text = await fsp.readFile(filePath, 'utf8');
-    return JSON.parse(text) as T;
+    // A single leading UTF-8 BOM is an encoding marker, not JSON content.
+    return JSON.parse(text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text) as T;
   } catch (error) {
     if (opts?.strict) throw error;
     return {} as T;
@@ -72,7 +73,8 @@ export async function readJson<T = Record<string, any>>(
 /** Synchronous variant — used in startup paths before the event loop is hot. */
 export function readJsonSync<T = Record<string, any>>(filePath: string): T {
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
+    const text = fs.readFileSync(filePath, 'utf8');
+    return JSON.parse(text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text) as T;
   } catch {
     return {} as T;
   }
