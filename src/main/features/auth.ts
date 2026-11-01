@@ -1400,7 +1400,7 @@ export async function addApiKey(
   if (!id) throw new Error('provider required');
   if (!key) throw new Error('api key required');
   assertModelProviderAllowed(id);
-  if (getConfiguredOpenAICompatibleProvider(id) && !isBearerTokenHeaderSafe(key)) {
+  if ((id === 'siliconflow' || getConfiguredOpenAICompatibleProvider(id)) && !isBearerTokenHeaderSafe(key)) {
     throw customConfigError('API_KEY_INVALID', 'Invalid API key for HTTP Authorization headers');
   }
   if (providerUsesCustomOpenAIConfig(id)) {
@@ -1443,7 +1443,7 @@ export async function addApiKeyEntry(
   if (!model) throw new Error('model required');
   if (!key) throw new Error('api key required');
   assertModelProviderAllowed(id, model);
-  if (getConfiguredOpenAICompatibleProvider(id) && !isBearerTokenHeaderSafe(key)) {
+  if ((id === 'siliconflow' || getConfiguredOpenAICompatibleProvider(id)) && !isBearerTokenHeaderSafe(key)) {
     throw customConfigError('API_KEY_INVALID', 'Invalid API key for HTTP Authorization headers');
   }
   if (providerUsesCustomOpenAIConfig(id)) {
@@ -1741,6 +1741,7 @@ export async function getChatPreloadApi(): Promise<string | null> {
     if (entry.provider === 'moonshot') return models.buildMoonshotModel(entry.model).api;
     if (entry.provider === 'deepseek') return models.buildDeepSeekModel(entry.model).api;
     if (entry.provider === 'doubao') return models.buildDoubaoModel(entry.model).api;
+    if (entry.provider === 'siliconflow') return models.buildSiliconFlowModel(entry.model).api;
     const configured = models.buildConfiguredOpenAICompatibleModel(entry.provider, entry.model);
     if (configured) return configured.api;
     const config = customRuntimeConfigFromProfile(store.profiles[entry.profileId]);
@@ -2672,6 +2673,8 @@ export async function testConnection(
         provider = await ext.createDeepSeekProvider({ apiKey, modelId: probeModel });
       } else if (pid === 'doubao') {
         provider = await ext.createDoubaoProvider({ apiKey, modelId: probeModel });
+      } else if (pid === 'siliconflow') {
+        provider = await ext.createSiliconFlowProvider({ apiKey, modelId: probeModel });
       } else if (pid === CUSTOM_MODEL_PROVIDER && customConfig) {
         provider = await ext.createCustomOpenAICompatibleProvider({
           apiKey,

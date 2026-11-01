@@ -128,6 +128,13 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'doubao-seed-2-0-pro-260215', name: 'Doubao Seed 2.0 Pro' },
     { id: 'doubao-seed-2-0-lite-260428', name: 'Doubao Seed 2.0 Lite' },
   ],
+  siliconflow: [
+    // SiliconFlow model ids and capabilities are independent of direct-vendor aliases.
+    // https://docs.siliconflow.cn/docs/api/chat-completions-post
+    // https://docs.siliconflow.cn/docs/usercases/use-siliconcloud-in-yan
+    { id: 'deepseek-ai/DeepSeek-V4-Flash', name: 'DeepSeek V4 Flash', contextWindow: 1_000_000, maxTokens: 32768, supportsVision: false },
+    { id: 'Qwen/Qwen3.8-27B', name: 'Qwen3.8 27B', contextWindow: 256000, maxTokens: 32768, supportsVision: true },
+  ],
   openrouter: [
     // OpenRouter exposes hundreds of models. Prefer recent generations but
     // retain capability-driven exceptions such as Gemini 3.1 Pro. Settings

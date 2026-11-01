@@ -83,7 +83,7 @@ export interface CatalogEntry {
 // default via provider_policy.ts; dev builds keep it for local testing.
 // Group 1: global frontier labs (Anthropic, OpenAI, Google)
 // Group 2: China mainstream (Zhipu GLM, Moonshot Kimi, MiniMax)
-// Group 3: aggregators (OpenRouter)
+// Group 3: aggregators (SiliconFlow, OpenRouter)
 
 export const CATALOG: readonly CatalogEntry[] = [
   {
@@ -125,6 +125,7 @@ export const CATALOG: readonly CatalogEntry[] = [
   { id: 'doubao',             label: 'Doubao',  docsUrl: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey', region: 'cn',
     subscriptionNote: '' },
 
+  { id: 'siliconflow',        label: 'SiliconFlow',   docsUrl: 'https://cloud.siliconflow.cn/account/ak', region: 'cn' },
   { id: 'openrouter',         label: 'OpenRouter',    docsUrl: 'https://openrouter.ai/keys' },
   {
     id: 'custom',
@@ -758,7 +759,7 @@ export interface CustomOpenAICompatibleRuntimeConfig {
  * provider registry. `listProviders()` treats these as API-key-capable
  * even though `listPiProviders()` doesn't list them.
  */
-export const EXTERNAL_API_PROVIDERS: readonly string[] = [ORKAS_API_PROVIDER, 'moonshot', 'deepseek', 'doubao', 'custom'];
+export const EXTERNAL_API_PROVIDERS: readonly string[] = [ORKAS_API_PROVIDER, 'moonshot', 'deepseek', 'doubao', 'siliconflow', 'custom'];
 
 // ── Image-generation capability map ─────────────────────────────────────
 //

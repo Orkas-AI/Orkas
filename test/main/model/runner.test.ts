@@ -68,6 +68,30 @@ async function loadRunner() {
 }
 
 describe('runner › buildRunner auth gate', () => {
+  it('uses the saved SiliconFlow choice for task execution and context budgeting', async () => {
+    const createPiProvider = vi.fn(({ customModel }: any) => ({
+      id: 'siliconflow', name: 'SiliconFlow fixture',
+      async *stream() { yield { type: 'text_delta', text: 'Ready' }; yield { type: 'message_end', model: customModel.id, stopReason: 'end_turn' }; },
+      complete: vi.fn(), validateAuth: vi.fn(),
+    }));
+    vi.doMock('#core-agent', async () => ({ ...(await vi.importActual<any>('#core-agent')), createPiProvider }));
+    const auth = await import('../../../src/main/features/auth');
+    await auth.addApiKeyEntry('siliconflow', 'Qwen/Qwen3.8-27B', 'synthetic-siliconflow-key');
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({ sessionId: 'gconv-siliconflow', userId: RUNNER_TEST_UID });
+    expect((built.runner as any).config.models.catalog['Qwen/Qwen3.8-27B'])
+      .toMatchObject({ contextWindow: 256000, maxOutputTokens: 32768 });
+    const provider = (built.runner as any).providers.get('siliconflow');
+    const events = [];
+    for await (const event of provider.stream({ model: built.modelId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }] })) events.push(event);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'text_delta', text: 'Ready' }));
+    expect(createPiProvider).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'siliconflow', apiKey: 'synthetic-siliconflow-key',
+      customModel: expect.objectContaining({ id: 'Qwen/Qwen3.8-27B', baseUrl: 'https://api.siliconflow.cn/v1' }),
+    }));
+  });
+
   it('propagates custom Anthropic metadata to the runner provider without catalog lookup', async () => {
     const createPiProvider = vi.fn(({ customModel }: any) => ({
       id: 'custom', name: 'Protocol fixture',
