@@ -5,6 +5,46 @@ import { openSidebarEntry, expect, test } from './fixtures/orkas';
 declare const currentCid: string;
 
 
+test('retains saved app cards when the local inventory is unreadable and recovers the same app', async ({orkas}, info) => {
+  const page=orkas.page!;
+  const source=orkas.createWorkspaceFile('inventory-recovery/index.html','<!doctype html><h1>Charging planner</h1>');
+  const saved=await orkas.invoke<any>('savedApps.saveFromPath',{path:source,title:'Charging planner'});
+  expect(saved.ok).toBe(true);
+  await openSidebarEntry(page,'#apps-btn');
+  const card=page.locator(`.app-card[data-app-id="${saved.id}"]`);
+  await expect(card).toBeVisible();
+  const root=path.join(orkas.workspaceRoot,'account-e2e/cloud/saved_apps');
+  await orkas.electronApp!.evaluate((_electron,root)=>{
+    const main=(process as any).mainModule,fs=main.require('node:fs'),modules=main.require('node:module');
+    const original=fs.readdirSync;
+    (globalThis as any).__restoreSavedInventory=()=>{fs.readdirSync=original;modules.syncBuiltinESMExports();};
+    fs.readdirSync=(target:any,...args:any[])=>{
+      if(String(target)===root)throw Object.assign(new Error('PRIVATE inventory unavailable'),{code:'EIO'});
+      return original(target,...args);
+    };
+    modules.syncBuiltinESMExports();
+  },root);
+  try {
+    await page.evaluate(()=>(window as any).loadSavedApps(true));
+    await expect(card).toBeVisible();
+    await expect(page.locator('#apps-empty')).toBeHidden();
+    await expect(page.locator('#apps-page-header-count')).toHaveText('1');
+  } finally {
+    await orkas.electronApp!.evaluate(()=>{
+      (globalThis as any).__restoreSavedInventory();delete (globalThis as any).__restoreSavedInventory;
+    });
+  }
+  await page.evaluate(()=>(window as any).loadSavedApps(true));
+  await expect(card).toBeVisible();
+  expect((await orkas.invoke<any>('savedApps.list')).apps.map((a:any)=>a.id)).toEqual([saved.id]);
+  expect(readFileSync(source,'utf8')).toContain('Charging planner');
+  const preview=await orkas.openPreview(()=>card.click());
+  await expect(preview.frameLocator('.saved-app-viewer-frame').locator('h1')).toHaveText('Charging planner');
+  await preview.screenshot({path:info.outputPath('recovered-planner.png')});
+  await orkas.closePreview(preview);
+  expect(orkas.modelRequests).toHaveLength(0);
+});
+
 test('root-level Save as app explains the separate-folder requirement and saves only the recovered bundle', async ({ orkas }, testInfo) => {
   const page=orkas.page!;
   const source=orkas.createWorkspaceFile('小工具.html','<!doctype html><html lang="zh"><meta charset="utf-8"><title>小工具</title><body><h1>小工具</h1><p>一个待保存的应用</p></body></html>');

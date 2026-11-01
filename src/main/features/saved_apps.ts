@@ -154,11 +154,12 @@ function failureCode(err: unknown, fallback: string): string {
   return typeof message === 'string' && /^app_[a-z_]+$/.test(message) ? message : fallback;
 }
 
-function isRealSavedAppDirectory(dir: string): boolean {
+function isRealSavedAppDirectory(dir: string, unavailable?: 'app_list_failed' | 'app_save_binding_unavailable'): boolean {
   try {
     const st = fs.lstatSync(dir);
     return st.isDirectory() && !st.isSymbolicLink();
-  } catch {
+  } catch (error) {
+    if (unavailable && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(unavailable);
     return false;
   }
 }
@@ -541,17 +542,18 @@ export async function getSaveTarget(uid: string, cid: string, source: {artifactI
   // A deleted explicit destination must not fall back to an unrelated original.
   if (id) {
     const dir = savedAppDir(uid, safeAppId(id));
-    if (!isRealSavedAppDirectory(dir)) return null;
+    if (!isRealSavedAppDirectory(dir, 'app_save_binding_unavailable')) return null;
     const meta = readMeta(dir);
     return { appId: id, title: sanitiseTitle(meta.title), appType: metadataAppType(meta.appType) ?? await resolveSavedAppType(uid, id) };
   }
   const edit = cid ? await getEditTarget(uid, cid) : null;
-  if (edit) return isRealSavedAppDirectory(savedAppDir(uid, edit.appId)) ? edit : null;
+  if (edit) return isRealSavedAppDirectory(savedAppDir(uid, edit.appId), 'app_save_binding_unavailable') ? edit : null;
   // Recover only unique historical provenance; duplicate copies are not a choice.
   const sourceKeys=source.rootDir?[pathSourceKey(source.rootDir),legacyPathSourceKey(source.legacyRoot??source.rootDir)]:[];
   const candidates = listSavedApps(uid).filter(app => {
     let meta: Partial<SavedAppMeta>;
-    try { meta = readMeta(savedAppDir(uid, app.id)); } catch { return false; }
+    try { meta = readMeta(savedAppDir(uid, app.id)); }
+    catch { throw new Error('app_save_binding_unavailable'); }
     return source.artifactId ? meta.sourceCid === cid && meta.sourceArtifactId === source.artifactId
       : sourceKeys.includes(meta.sourcePathKey!);
   });
@@ -800,7 +802,10 @@ export function listSavedApps(userId: string): SavedAppListItem[] {
   const root = userSavedAppsDir(userId);
   let names: string[];
   try { names = fs.readdirSync(root); }
-  catch { return []; } // pool dir not created yet
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new Error('app_list_failed');
+  }
   sweepStagingDirs(root, names, retained);
   const items: SavedAppListItem[] = [];
   for (const name of names) {
@@ -808,7 +813,7 @@ export function listSavedApps(userId: string): SavedAppListItem[] {
     let appId: string;
     try { appId = safeAppId(name); } catch { continue; }
     const dir = savedAppDir(userId, appId);
-    if (!isRealSavedAppDirectory(dir)) continue;
+    if (!isRealSavedAppDirectory(dir, 'app_list_failed')) continue;
     let meta: Partial<SavedAppMeta> = {};
     try { meta = readMeta(dir); }
     catch (err) {

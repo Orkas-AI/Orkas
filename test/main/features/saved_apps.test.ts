@@ -67,6 +67,34 @@ async function makeArtifact(title: string, extra: Array<{ path: string; content:
 }
 
 describe('saved_apps › saveFromArtifact', () => {
+  it.each(['artifact','workspace'] as const)('does not turn an unreadable %s save destination into a new app',async source=>{
+    const {savedApps}=await mods();
+    const artifactId=source==='artifact'?await makeArtifact('Original planner'):'';
+    const root=path.join(tmpDir,'workspace','planner');fs.mkdirSync(root,{recursive:true});
+    const sourceFile=path.join(root,'index.html');fs.writeFileSync(sourceFile,'<h1>Original planner</h1>');
+    const save=()=>source==='artifact'?savedApps.saveFromArtifact(UID,CID,artifactId,'auto')
+      :savedApps.saveFromPath(UID,sourceFile,{mode:'auto',fenceRoots:[tmpDir]});
+    const saved=await save();if(!saved.ok)throw new Error(saved.error);
+    const dir=path.join(APPS_ROOT(),saved.id),before=fs.readFileSync(path.join(dir,'index.html'));
+    const target=()=>savedApps.getSaveTarget(UID,CID,source==='artifact'?{artifactId}:{rootDir:root});
+    expect(await target()).toMatchObject({appId:saved.id});
+    const nodeFs=(await import('node:fs')).default,{syncBuiltinESMExports}=await import('node:module');
+    const lstat=nodeFs.lstatSync;
+    const fault=vi.spyOn(nodeFs,'lstatSync').mockImplementation(((file:any,...args:any[])=>{
+      if(String(file)===dir)throw Object.assign(new Error('PRIVATE target unavailable'),{code:'EIO'});
+      return (lstat as any)(file,...args);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      await expect.soft(target()).rejects.toThrow('app_save_binding_unavailable');
+      expect.soft(await save()).toMatchObject({ok:false,error:'app_edit_target_missing'});
+    } finally {fault.mockRestore();syncBuiltinESMExports();}
+    expect.soft(fs.readdirSync(APPS_ROOT())).toEqual([saved.id]);
+    expect(fs.readFileSync(path.join(dir,'index.html'))).toEqual(before);
+    expect.soft(await target()).toMatchObject({appId:saved.id});
+    expect.soft(await save()).toMatchObject({ok:true,id:saved.id});
+  });
+
   it('preserves the editing destination after a short context refresh write and recovers the next update', async () => {
     const { savedApps, chatArtifacts } = await mods();
     const saved = await savedApps.saveFromArtifact(UID, CID, await makeArtifact('Original'));
@@ -1246,6 +1274,82 @@ describe('saved_apps › rename / delete', () => {
 });
 
 describe('saved_apps › listSavedApps', () => {
+  it.each(['unreadable','missing','malformed'] as const)('refuses unknown historical provenance when saved metadata is %s',async failure=>{
+    const {savedApps,chatArtifacts}=await mods(),artifactId=await makeArtifact('Legacy planner');
+    const saved=await savedApps.saveFromArtifact(UID,CID,artifactId);if(!saved.ok)throw new Error(saved.error);
+    const artifact=chatArtifacts.resolveArtifactDir(UID,CID,artifactId);if(!artifact.ok)throw new Error(artifact.error);
+    const sourceMeta=path.join(artifact.dirPath,'__orkas-meta.json'),meta=JSON.parse(fs.readFileSync(sourceMeta,'utf8'));
+    delete meta.savedAppId;fs.writeFileSync(sourceMeta,JSON.stringify(meta));
+    const savedMeta=path.join(APPS_ROOT(),saved.id,'__orkas-meta.json'),before=fs.readFileSync(savedMeta);
+    expect(await savedApps.getSaveTarget(UID,CID,{artifactId})).toMatchObject({appId:saved.id});
+    const nodeFs=(await import('node:fs')).default,{syncBuiltinESMExports}=await import('node:module'),read=nodeFs.readFileSync;
+    const fault=vi.spyOn(nodeFs,'readFileSync').mockImplementation(((file:any,...args:any[])=>{
+      if(String(file)===savedMeta){
+        if(failure==='malformed')return 'PRIVATE malformed metadata';
+        throw Object.assign(new Error('PRIVATE metadata read unavailable'),{code:failure==='missing'?'ENOENT':'EIO'});
+      }
+      return (read as any)(file,...args);
+    }) as any);syncBuiltinESMExports();
+    try {
+      await expect.soft(savedApps.getSaveTarget(UID,CID,{artifactId})).rejects.toThrow('app_save_binding_unavailable');
+      expect.soft(await savedApps.saveFromArtifact(UID,CID,artifactId,'auto')).toMatchObject({ok:false,error:'app_edit_target_missing'});
+    }finally{fault.mockRestore();syncBuiltinESMExports();}
+    expect.soft(fs.readdirSync(APPS_ROOT())).toEqual([saved.id]);
+    expect(fs.readFileSync(savedMeta)).toEqual(before);
+    expect.soft(await savedApps.getSaveTarget(UID,CID,{artifactId})).toMatchObject({appId:saved.id});
+  });
+
+  it('rejects an unreadable app entry instead of returning an incomplete successful list', async () => {
+    const {savedApps}=await mods();
+    const saved=await savedApps.saveFromArtifact(UID,CID,await makeArtifact('Kept planner'));
+    if(!saved.ok)throw new Error(saved.error);
+    const before=savedApps.listSavedApps(UID),dir=path.join(APPS_ROOT(),saved.id);
+    const nodeFs=(await import('node:fs')).default,{syncBuiltinESMExports}=await import('node:module');
+    const lstat=nodeFs.lstatSync;
+    const fault=vi.spyOn(nodeFs,'lstatSync').mockImplementation(((target:any,...args:any[])=>{
+      if(String(target)===dir)throw Object.assign(new Error('PRIVATE entry unavailable'),{code:'EACCES'});
+      return (lstat as any)(target,...args);
+    }) as any);
+    syncBuiltinESMExports();
+    try {expect(()=>savedApps.listSavedApps(UID)).toThrow('app_list_failed');}
+    finally {fault.mockRestore();syncBuiltinESMExports();}
+    expect(savedApps.listSavedApps(UID)).toEqual(before);
+    expect(fs.readFileSync(path.join(dir,'index.html'),'utf8')).toContain('Kept planner');
+  });
+
+  it.each(['EACCES', 'EIO', 'ENOTDIR'])('rejects an unavailable %s inventory without erasing apps or historical save destinations', async code => {
+    const { savedApps, chatArtifacts } = await mods();
+    const artifactId = await makeArtifact('Retained planner');
+    const saved = await savedApps.saveFromArtifact(UID, CID, artifactId);
+    if (!saved.ok) throw new Error(saved.error);
+    // Legacy provenance has no explicit binding, so enumeration is necessary.
+    const artifactDir = chatArtifacts.resolveArtifactDir(UID, CID, artifactId);
+    if (!artifactDir.ok) throw new Error(artifactDir.error);
+    const artifactMeta = path.join(artifactDir.dirPath, '__orkas-meta.json');
+    const meta = JSON.parse(fs.readFileSync(artifactMeta, 'utf8')); delete meta.savedAppId;
+    fs.writeFileSync(artifactMeta, JSON.stringify(meta));
+    const before = savedApps.listSavedApps(UID);
+    expect(await savedApps.getSaveTarget(UID, CID, {artifactId})).toMatchObject({appId:saved.id});
+    const entry = path.join(APPS_ROOT(), saved.id, 'index.html');
+    const bytes = fs.readFileSync(entry);
+    const nodeFs = (await import('node:fs')).default;
+    const {syncBuiltinESMExports} = await import('node:module');
+    const readdir = nodeFs.readdirSync;
+    const fault = vi.spyOn(nodeFs, 'readdirSync').mockImplementation(((target:any, ...args:any[]) => {
+      if (String(target) === APPS_ROOT()) throw Object.assign(new Error('PRIVATE inventory path'), {code});
+      return (readdir as any)(target, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      expect.soft(() => savedApps.listSavedApps(UID)).toThrow('app_list_failed');
+      await expect.soft(savedApps.listResolvedSavedApps(UID)).rejects.toThrow('app_list_failed');
+      await expect.soft(savedApps.getSaveTarget(UID, CID, {artifactId})).rejects.toThrow('app_list_failed');
+      expect(fs.readFileSync(entry)).toEqual(bytes);
+    } finally {fault.mockRestore();syncBuiltinESMExports();}
+    expect(savedApps.listSavedApps(UID)).toEqual(before);
+    expect(await savedApps.getSaveTarget(UID, CID, {artifactId})).toMatchObject({appId:saved.id});
+  });
+
   it('keeps private malformed metadata excerpts out of diagnostics and retains the recoverable app', async () => {
     const logging = await import('../../../src/main/logger');
     const createLogger = logging.createLogger;
