@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "425219b0adce79102b6ee5c13e9381f1d488b9f6c218fd08f3bdb52089c52aff",
+  "content_tree_sha256": "db38b8ec2589638315c65db2cb0533d3547e06af82a873ceb48bb78e367bf15c",
   "files": [
     {
       "path": "marketplace/agents/1040b336306f/agent.json",
@@ -744,8 +744,8 @@
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-tech-audit/scripts/audit.py",
-      "bytes": 13718,
-      "sha256": "36924443e903928d7586fb5bd8df1bdb771111e30b35bbd4b3ed9e0064836573"
+      "bytes": 14098,
+      "sha256": "a42ad40ea726aa0721fa2574782e39c0669a94e94936bb4ada3acc5361c729b7"
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-tech-audit/SKILL.md",
@@ -754,8 +754,8 @@
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-tech-audit/test/test_audit.py",
-      "bytes": 10113,
-      "sha256": "e87478d14d8b78be5aac4c34dd63300befda341f0ae8e0c7de8e24d1b253cf0c"
+      "bytes": 13036,
+      "sha256": "1c873117a986bc2b301e9be6d9c6a746c3fa2f4f1be646d720d9496c4f3d39ce"
     },
     {
       "path": "marketplace/agents/e0f3a98c624b/agent.json",
