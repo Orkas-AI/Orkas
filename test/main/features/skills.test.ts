@@ -98,6 +98,25 @@ function markImportDraft(id: string, source: 'url' | 'dir' = 'dir'): void {
 }
 
 describe('skills › parseSkillFrontmatter', () => {
+  it.each(['\n', '\r\n'])('preserves identity and private ownership with a leading UTF-8 BOM (%j)', async (newline) => {
+    const s = await loadSkills();
+    const text = ['---', 'name: Fixture', 'description: Synthetic fixture', 'ownerAgent: fixture-owner', '---', 'Body'].join(newline);
+    expect(s.parseSkillFrontmatter('\uFEFF' + text)).toMatchObject({
+      name: 'Fixture', description: 'Synthetic fixture', ownerAgent: 'fixture-owner',
+    });
+  });
+
+  it('does not expose a BOM-prefixed private Skill in the public listing', async () => {
+    writeCustomSkill('private-bom', 'name: Fixture\ndescription: Synthetic fixture\nownerAgent: fixture-owner');
+    const file = path.join(customSkillsDir(), 'private-bom', 'SKILL.md');
+    const bytes = Buffer.from('\uFEFF' + fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, bytes);
+    const s = await loadSkills();
+    expect(await s.listSkills()).toEqual([]);
+    expect(await s.listAgentPrivateSkills()).toMatchObject([{ id: 'private-bom', ownerAgent: 'fixture-owner' }]);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+  });
+
   it('extracts unquoted scalars', async () => {
     const s = await loadSkills();
     const meta = s.parseSkillFrontmatter('---\nname: agent-browser\ndescription: A tool\n---\nbody');
@@ -148,6 +167,14 @@ describe('skills › parseSkillFrontmatter', () => {
 });
 
 describe('skills › splitSkillMd', () => {
+  it('recognizes a leading encoding marker without moving frontmatter into the body', async () => {
+    const s = await loadSkills();
+    const body = '  Body with an interior \uFEFF character\n';
+    const result = s.splitSkillMd('\uFEFF---\nname: Fixture\n---\n\n' + body);
+    expect(result.meta).toMatchObject({ name: 'Fixture' });
+    expect(result.body).toBe(body);
+  });
+
   it('separates meta + body for well-formed file', async () => {
     const s = await loadSkills();
     const r = s.splitSkillMd('---\nname: n\ndescription: d\n---\n\nbody text');
@@ -841,6 +868,37 @@ describe('skills › applySkillContainerFromCommander › edit', () => {
 // `<uid>/local/marketplace/skills/<id>/` per machine — see features/marketplace_*.ts.
 
 describe('skills › listSkills', () => {
+  it.each(['custom', 'marketplace'])('rebuilds pre-BOM catalog metadata after restart without exposing private %s Skills', async (source) => {
+    const id = 'aabbccddeeff';
+    const root = source === 'custom' ? customSkillsDir() : builtinSkillsDir();
+    const file = path.join(root, id, 'SKILL.md');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const bytes = Buffer.from('\uFEFF---\nname: Owned fixture\ndescription: Private fixture\nownerAgent: fixture-owner\n---\nBody');
+    fs.writeFileSync(file, bytes);
+    const first = await loadSkills();
+    expect(await first.listSkills()).toEqual([]);
+    first.setSkillEnabledForActiveUser(id, false);
+    const paths = await import('../../../src/main/paths');
+    const cacheFile = paths.userSkillCatalogCacheFile(TEST_UID);
+    const snapshot = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    // Old readers persisted the directory id and blank metadata for BOM files.
+    // Keep real inventory stamps so only rejecting the obsolete projection can
+    // restore the original identity/ownership on the first post-upgrade read.
+    fs.writeFileSync(cacheFile, JSON.stringify({
+      ...snapshot, version: 2,
+      data: [{ id, name: id, source, description_zh: '', description_en: '', category: '', enabled: true }],
+    }));
+    vi.resetModules();
+    (await import('../../../src/main/features/users')).activateUser(TEST_UID);
+    const restarted = await loadSkills();
+    expect(await restarted.listSkills()).toEqual([]);
+    expect(await restarted.listAgentPrivateSkills()).toMatchObject([{
+      id, source, name: 'Owned fixture', description_en: 'Private fixture', ownerAgent: 'fixture-owner', enabled: false,
+    }]);
+    expect(JSON.parse(fs.readFileSync(cacheFile, 'utf8')).version).toBe(3);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+  });
+
   it('reuses the persisted catalog after a module restart and honors force invalidation', async () => {
     writeCustomSkill('persisted-skill', 'name: "Old Skill"\ndescription: "cached"');
     const first = await loadSkills();

@@ -331,6 +331,7 @@ export interface SkillOrkasMeta {
  *   - single-quoted with '' escape: `description: 'it''s fine'`
  */
 export function parseSkillFrontmatter(text: string): SkillFrontmatter {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   const meta: SkillFrontmatter = {};
   if (!text.startsWith('---')) return meta;
   const end = text.indexOf('---', 3);
@@ -523,7 +524,9 @@ function removeSkillSidecarDescriptionsSync(dir: string): void {
 }
 
 // Module-level cache for `listSkills`.
-const SKILL_CATALOG_CACHE_VERSION = 2;
+// Older projections may have lost ownership metadata on BOM-prefixed files.
+// Rebuild derived rows once; the original Skill files stay untouched.
+const SKILL_CATALOG_CACHE_VERSION = 3;
 const SKILL_PERSISTED_TRUST_MS = 2_000;
 
 interface SkillListCache {
@@ -1046,6 +1049,7 @@ function platformSkillMdContent(
 }
 
 export function splitSkillMd(text: string): { meta: SkillFrontmatter; body: string } {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   if (!text.startsWith('---')) return { meta: {}, body: text };
   const end = text.indexOf('---', 3);
   if (end === -1) return { meta: {}, body: text };
