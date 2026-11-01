@@ -16,7 +16,7 @@ Orkas 为持续推进的项目而设计，而不只是回答一次提问。**项
 [![X: @leochenpm](https://img.shields.io/badge/X-%40leochenpm-black?logo=x)](https://x.com/leochenpm)
 [![官网：orkas.ai](https://img.shields.io/badge/Website-orkas.ai-5b57d6)](https://orkas.ai/?source=gh-orkas)
 
-[English](./README.md) · [简体中文](./README.zh-CN.md)
+[English](./README.md) · [简体中文](./README.zh-CN.md) · [日本語](./README.ja.md)
 
 ---
 
