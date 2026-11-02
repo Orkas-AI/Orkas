@@ -587,12 +587,12 @@ function _normaliseDraft(d: TaskDraft): { ok: true; fields: NormalisedFields } |
     recipient = d.recipient;
   }
   let skill: TaskSkillRef | undefined;
-  if (d.skill !== undefined) {
+  if (d.skill !== undefined && d.skill !== null) {
     if (!_isValidRef(d.skill)) return { ok: false, error: 'invalid_skill' };
     skill = { id: d.skill.id, name: d.skill.name };
   }
   let connector: TaskConnectorRef | undefined;
-  if (d.connector !== undefined) {
+  if (d.connector !== undefined && d.connector !== null) {
     if (!_isValidRef(d.connector)) return { ok: false, error: 'invalid_connector' };
     connector = { id: d.connector.id, name: d.connector.name };
   }
