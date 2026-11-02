@@ -502,6 +502,36 @@ describe('client_config', () => {
 
 
 describe('client config response ownership and deadline', () => {
+  it('allows a fresh refresh after the attempt timestamp could not be persisted', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'clientconfigattemptrecovery';
+    users.activateUser(uid);
+    const manager = new ClientConfigManager();
+    manager.applyServerPayload({ immediate: { 'feature.recovery': 'cached' }, restart: {} }, 'cached-etag');
+    const failure = Object.assign(new Error('synthetic config write unavailable'), { code: 'EACCES' });
+    const write = vi.spyOn(storage, 'writeJsonSync').mockImplementationOnce(() => { throw failure; });
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      code: 0, immediate: { 'feature.recovery': 'fresh' }, restart: {}, config_hash: 'recovered-hash',
+    }), { headers: { etag: 'recovered-etag' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      await expect(refresh('manual', { force: true })).rejects.toBe(failure);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(manager.get('feature.recovery')).toBe('cached');
+      write.mockRestore();
+      await expect(refresh('manual', { force: true })).resolves.toEqual({ updated: true });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(manager.get('feature.recovery')).toBe('fresh');
+      expect(manager.readCache().etag).toBe('recovered-etag');
+    } finally {
+      write.mockRestore();
+      fs.rmSync(path.dirname(paths.userRemoteConfigFile(uid)), { recursive: true, force: true });
+    }
+  });
+
+
   afterEach(() => {
     stop();
     vi.unstubAllGlobals();
