@@ -99,7 +99,7 @@ import {
   findAutoTaskLocation,
   globalAutoTaskLocation,
 } from '../util/project-layout';
-import { logErrorRef, logPathRef, maskId } from '../util/log-redact';
+import { logErrorRef, logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { chatMediaLocalPathFromUrl } from '../util/chat-media-url';
 import { captureDeliveredTaskIntervention } from '../util/task-intervention-events';
 import { macosTccSensitivePath } from '../util/macos-tcc';
@@ -186,7 +186,7 @@ function logInvokeResultFailure(channel: string, result: Record<string, unknown>
       ...(Number.isInteger(result.failed_count) ? { failed_count: result.failed_count } : {}),
     } : channel === 'contexts.attachToDraft' || channel === 'projects.files.attachToDraft'
       ? { failure_stage: result.failure_stage, failure_kind: result.failure_kind }
-      : { error: typeof result.error === 'string' ? result.error : 'operation rejected' }),
+      : { error: logErrorSummary(typeof result.error === 'string' ? result.error : 'operation rejected') }),
     ...(suppressed > 0 ? { suppressed_count: suppressed } : {}),
   });
 }
@@ -4259,7 +4259,7 @@ export function register(): void {
           ? Number(rawCode.trim())
           : (typeof rawCode === 'string' && rawCode ? rawCode : normalized.code));
       const attachment = attachmentAddChannels.has(channel) ? attachmentFailureDiagnostic({ code, failure_kind: fileFailureKind(err) }) : null;
-      log.error(`invoke ${channel} failed`, attachment || { error: normalized.error, code });
+      log.error(`invoke ${channel} failed`, attachment || { error: logErrorSummary(err), code });
       const out: {
         ok: false;
         error: string;
@@ -4317,7 +4317,7 @@ export function register(): void {
       const normalized = normalizeAppError(err);
       log.warn('local file import request failed', {
         code: normalized.code,
-        error: normalized.error,
+        error: logErrorSummary(err),
       });
       return { ok: false, error: normalized.error, code: normalized.code };
     }
@@ -4358,7 +4358,7 @@ export function register(): void {
         out(ev);
       }
     } catch (err) {
-      log.error(`stream ${channel} failed`, { error: (err as Error)?.message || String(err) });
+      log.error(`stream ${channel} failed`, { error: logErrorSummary(err) });
       out({ type: 'error', text: (err as Error).message || String(err) });
     } finally {
       activeStreams.delete(requestId);

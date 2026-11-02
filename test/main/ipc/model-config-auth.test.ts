@@ -236,10 +236,10 @@ describe('ipc › model config auth lists', () => {
     expect(initial.modelsByProvider).toBeUndefined();
     expect(initial.providers).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        id: 'doubao:doubao-seedream-5-0-lite-260128',
+        id: 'doubao:doubao-seedream-5-0-flash-260915',
         provider: 'doubao',
-        model: 'doubao-seedream-5-0-lite-260128',
-        label: 'DouBao · Seedream 5.0 Lite',
+        model: 'doubao-seedream-5-0-flash-260915',
+        label: 'DouBao · Seedream 5.0 Flash',
       }),
       expect.objectContaining({
         id: 'doubao:doubao-seedream-5-0-pro-260628',
