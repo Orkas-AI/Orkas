@@ -262,9 +262,13 @@ it.each([{}, { path: '' }])('refuses an empty Library deletion through the actua
     ok: result.ok,
     source: fs.existsSync(source) ? fs.readFileSync(source, 'utf8') : null,
   }).toEqual({ ok: false, source: '# Protected Library source' });
+  expect(result.error).toBe('path required');
   expect(warnings).toHaveBeenCalledExactlyOnceWith('invoke returned failure', {
-    channel: 'contexts.delete', code: 'operation_rejected', error: 'path required',
+    channel: 'contexts.delete', code: 'operation_rejected', error: expect.objectContaining({
+      message_chars: 13, message_hash: 'd7c056fdbfce',
+    }),
   });
+  expect(JSON.stringify(warnings.mock.calls)).not.toContain('path required');
   const kb = await import('../../../src/main/features/kb_indexer');
   expect(kb.enqueue).not.toHaveBeenCalled();
   const recycle = await import('../../../src/main/features/recycle_bin');
