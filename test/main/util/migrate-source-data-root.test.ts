@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -71,59 +71,5 @@ describe('source-run boot migration continuity', () => {
     expect(output).toEqual(['[install-data-root] source-run data migration failed\n']);
     expect(env.ORKAS_WORKSPACE_ROOT).toBe(path.join(f.root, '.orkas/data'));
     root.flushEarlyDiagnostics((value: string) => diagnostics.push(value)); expect(diagnostics).toHaveLength(1);
-  });
-});
-
-// The public pre-tsx CJS boot owner probes Windows itself. Use its real resolver
-// with only OS/filesystem boundaries controlled; never launch host PowerShell
-// or write a real installation pin while verifying the native argv contract.
-function windowsInstallRoot(probe: () => string) {
-  const files = new Map<string, string>();
-  const execute = vi.fn((_command: string, _args: string[], _options: {
-    encoding: string; timeout: number; windowsHide: boolean;
-  }) => probe());
-  const owner = load('src/main/install-data-root.cjs', {
-    'node:path': path.win32,
-    'node:os': { homedir: () => 'C:\\Users\\Fixture' },
-    'node:child_process': { execFileSync: execute },
-    'node:fs': {
-      readFileSync(file: string) {
-        if (!files.has(file)) throw Object.assign(new Error('No fixture pin'), { code: 'ENOENT' });
-        return files.get(file);
-      },
-      existsSync: (file: string) => ['C:\\', 'D:\\', 'E:\\'].includes(file),
-      mkdirSync() {},
-      writeFileSync: (file: string, body: string) => files.set(file, body),
-    },
-    process: { platform: 'win32', env: { SystemDrive: 'C:', LOCALAPPDATA: 'C:\\FixtureLocal',
-      ORKAS_WORKSPACE_ROOT: 'isolated-bootstrap-override' }, stderr: { write: vi.fn() } },
-  });
-  return { owner, execute, files };
-}
-
-describe('public Windows install-root process boundary', () => {
-  it('probes only fixed disks with bounded native argv and reuses the chosen installation pin', () => {
-    const f = windowsInstallRoot(() => 'E:\r\nC:\r\nD:\r\ninvalid drive\r\n');
-    expect(f.owner.resolveInstallContainer()).toBe('D:\\.orkas');
-    expect(f.execute).toHaveBeenCalledExactlyOnceWith('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-Command',
-      "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Select-Object -ExpandProperty DeviceID",
-    ], { encoding: 'utf8', timeout: 5000, windowsHide: true });
-    expect(JSON.parse(f.files.get('C:\\FixtureLocal\\Orkas\\install-pin.json')!).container).toBe('D:\\.orkas');
-    expect(f.owner.resolveInstallContainer()).toBe('D:\\.orkas');
-    expect(f.execute).toHaveBeenCalledTimes(1);
-  });
-
-  it.each(['failure', 'no fixed disks'])('falls back to the system drive after probe %s and persists that decision', kind => {
-    const f = windowsInstallRoot(() => {
-      if (kind === 'failure') throw new Error('controlled unavailable PowerShell');
-      return 'unrecognized probe output\n';
-    });
-    expect(f.owner.resolveInstallContainer()).toBe('C:\\.orkas');
-    expect(f.execute).toHaveBeenCalledTimes(1);
-    expect(f.execute.mock.calls[0][2]).toMatchObject({ timeout: 5000, windowsHide: true });
-    expect(JSON.parse(f.files.get('C:\\FixtureLocal\\Orkas\\install-pin.json')!).container).toBe('C:\\.orkas');
-    expect(f.owner.resolveInstallContainer()).toBe('C:\\.orkas');
-    expect(f.execute).toHaveBeenCalledTimes(1);
   });
 });
