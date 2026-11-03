@@ -28,6 +28,8 @@ const CREATE_TIMEOUT_MS = 60_000;
 const POLL_TIMEOUT_MS = 20_000;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
 const MAX_CONSECUTIVE_POLL_TIMEOUTS = 5;
+// Expired Ark-style tasks are terminal and cannot deliver a video.
+const VIDEO_TASK_FAILED_STATUSES = ['failed', 'cancelled', 'canceled', 'expired'];
 
 const DOUBAO_BASE = 'https://ark.cn-beijing.volces.com';
 const MINIMAX_BASE = 'https://api.minimax.io';
@@ -465,7 +467,7 @@ async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResu
   while (Date.now() - started < req.timeoutMs) {
     throwIfAborted(req.signal);
     const status = String(data?.status || 'processing').toLowerCase();
-    if (['failed', 'cancelled', 'canceled'].includes(status)) {
+    if (VIDEO_TASK_FAILED_STATUSES.includes(status)) {
       throw new Error(`Orkas API video task ${taskId} ${status}: ${truncate(JSON.stringify(data?.error || data), 500)}`);
     }
     const url = String(data?.url || '').trim();
@@ -836,7 +838,7 @@ export async function callDoubaoVideo(req: AdapterVideoRequest): Promise<Adapter
       });
       continue;
     }
-    if (['failed', 'cancelled', 'canceled'].includes(status)) {
+    if (VIDEO_TASK_FAILED_STATUSES.includes(status)) {
       throw new Error(`DouBao video task ${taskId} ${status}: ${truncate(JSON.stringify((last as any)?.error || last), 500)}`);
     }
     if (['succeeded', 'success', 'completed', 'done'].includes(status)) {
