@@ -17,6 +17,7 @@
  *   - one_time: { at: ISO datetime }       fires once; after fire enabled=false
  *   - hourly:   { interval_hours }         every x hours from create / last run
  *   - daily:    { hour, minute }
+ *   - weekdays: { hour, minute }           daily, Monday–Friday only
  *   - weekly:   { weekday, hour, minute }
  *   - monthly:  { day, hour, minute }      day=31 → last day of shorter months
  *
@@ -98,8 +99,9 @@ export type ScheduleOneTime = { type: 'one_time'; at: string };
 export type ScheduleHourly  = { type: 'hourly'; interval_hours: number };
 export type ScheduleDaily   = { type: 'daily';   hour: number; minute: number };
 export type ScheduleWeekly  = { type: 'weekly';  weekday: number; hour: number; minute: number };
+export type ScheduleWeekdays = { type: 'weekdays'; hour: number; minute: number };
 export type ScheduleMonthly = { type: 'monthly'; day: number; hour: number; minute: number };
-export type Schedule = ScheduleOneTime | ScheduleHourly | ScheduleDaily | ScheduleWeekly | ScheduleMonthly;
+export type Schedule = ScheduleOneTime | ScheduleHourly | ScheduleDaily | ScheduleWeekdays | ScheduleWeekly | ScheduleMonthly;
 
 export type TaskEndCondition =
   | { type: 'date'; date: string }
@@ -220,6 +222,7 @@ function _isValidSchedule(s: any): s is Schedule {
       && s.interval_hours <= MAX_INTERVAL_HOURS;
   }
   if (s.type === 'daily') return _isHM(s.hour, s.minute);
+  if (s.type === 'weekdays') return _isHM(s.hour, s.minute);
   if (s.type === 'weekly') {
     return _isHM(s.hour, s.minute)
       && Number.isInteger(s.weekday) && s.weekday >= 0 && s.weekday <= 6;
@@ -238,6 +241,9 @@ function _schedulesEqual(a: Schedule, b: Schedule): boolean {
   }
   if (a.type === 'daily') {
     return b.type === 'daily' && a.hour === b.hour && a.minute === b.minute;
+  }
+  if (a.type === 'weekdays') {
+    return b.type === 'weekdays' && a.hour === b.hour && a.minute === b.minute;
   }
   if (a.type === 'hourly') {
     return b.type === 'hourly' && a.interval_hours === b.interval_hours;
@@ -1249,6 +1255,10 @@ function _dueBoundary(task: AutoTask, now: Date, lastRun: Date | null): Date | n
   if (sched.type === 'daily') {
     return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
   }
+  if (sched.type === 'weekdays') {
+    if (now.getDay() === 0 || now.getDay() === 6) return null;
+    return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
+  }
   if (sched.type === 'weekly') {
     if (now.getDay() !== sched.weekday) return null;
     return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
@@ -1294,14 +1304,17 @@ function _latestOccurrenceAtOrBefore(task: AutoTask, now: Date): Date | null {
     const boundary = new Date(baseline.getTime() + Math.floor(elapsed / intervalMs) * intervalMs);
     return Number.isNaN(boundary.getTime()) ? null : boundary;
   }
-  if (sched.type === 'daily' || sched.type === 'weekly') {
-    const stepDays = sched.type === 'daily' ? 1 : 7;
+  if (sched.type === 'daily' || sched.type === 'weekly' || sched.type === 'weekdays') {
+    const stepDays = sched.type === 'weekly' ? 7 : 1;
     const boundary = new Date(now);
     if (sched.type === 'weekly') boundary.setDate(boundary.getDate() - ((now.getDay() - sched.weekday + 7) % 7));
     boundary.setHours(sched.hour, sched.minute, 0, 0);
-    if (boundary.getTime() > now.getTime()) {
-      boundary.setDate(boundary.getDate() - stepDays);
-      boundary.setHours(sched.hour, sched.minute, 0, 0);
+    if (boundary.getTime() > now.getTime()
+        || (sched.type === 'weekdays' && (boundary.getDay() === 0 || boundary.getDay() === 6))) {
+      do {
+        boundary.setDate(boundary.getDate() - stepDays);
+        boundary.setHours(sched.hour, sched.minute, 0, 0);
+      } while (sched.type === 'weekdays' && (boundary.getDay() === 0 || boundary.getDay() === 6));
     }
     return boundary;
   }
@@ -1340,6 +1353,10 @@ function _catchUpBoundary(task: AutoTask, now: Date): Date | null {
 
 export function catchUpBoundaryForTest(task: AutoTask, now: Date): Date | null {
   return _catchUpBoundary(task, now);
+}
+
+export function latestOccurrenceForTest(task: AutoTask, now: Date): Date | null {
+  return _latestOccurrenceAtOrBefore(task, now);
 }
 
 function _claimFile(uid: string, taskId: string, boundary: Date): string {
@@ -1853,6 +1870,7 @@ function _nextDueAt(task: AutoTask, now: Date, lastRun: Date | null): Date | nul
   }
   if (sched.type === 'hourly') candidate = _nextHourlyAt(now, lastRun, sched.interval_hours);
   if (sched.type === 'daily') candidate = _nextDailyAt(now, lastRun, sched.hour, sched.minute);
+  if (sched.type === 'weekdays') candidate = _nextWeekdaysAt(now, lastRun, sched.hour, sched.minute);
   if (sched.type === 'weekly') candidate = _nextWeeklyAt(now, lastRun, sched.weekday, sched.hour, sched.minute);
   if (sched.type === 'monthly') candidate = _nextMonthlyAt(now, lastRun, sched.day, sched.hour, sched.minute);
   return candidate && _endAllowsAt(task, candidate) ? candidate : null;
@@ -1875,6 +1893,24 @@ function _nextDailyAt(now: Date, lastRun: Date | null, h: number, m: number): Da
     return tomorrow;
   }
   return today;
+}
+
+function _nextWeekdaysAt(now: Date, lastRun: Date | null, h: number, m: number): Date {
+  const today = new Date(now);
+  today.setHours(h, m, 0, 0);
+  const isWeekday = now.getDay() >= 1 && now.getDay() <= 5;
+  if (isWeekday && now.getTime() >= today.getTime()) {
+    if (!lastRun || lastRun.getTime() < today.getTime()) return now; // already due
+  } else if (isWeekday) {
+    return today;
+  }
+  // Today is a weekend, or today's boundary already ran; step forward to the
+  // next Monday–Friday.
+  const result = new Date(today);
+  do {
+    result.setDate(result.getDate() + 1);
+  } while (result.getDay() === 0 || result.getDay() === 6);
+  return result;
 }
 
 function _nextWeeklyAt(now: Date, lastRun: Date | null, weekday: number, h: number, m: number): Date {
@@ -1944,7 +1980,9 @@ function _scheduleStateKey(task: AutoTask): string {
       ? `hourly:${task.schedule.interval_hours}`
       : task.schedule.type === 'daily'
         ? `daily:${task.schedule.hour}:${task.schedule.minute}`
-        : task.schedule.type === 'weekly'
+        : task.schedule.type === 'weekdays'
+          ? `weekdays:${task.schedule.hour}:${task.schedule.minute}`
+          : task.schedule.type === 'weekly'
           ? `weekly:${task.schedule.weekday}:${task.schedule.hour}:${task.schedule.minute}`
           : `monthly:${task.schedule.day}:${task.schedule.hour}:${task.schedule.minute}`;
   const endCondition = !task.end_condition

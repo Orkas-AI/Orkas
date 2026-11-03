@@ -257,6 +257,7 @@ function _autoFormatSummary(task) {
   if (s.type === 'hourly') summary = t('auto.summary_hourly', { hours: s.interval_hours });
   const time = _autoPadHM(s.hour) + ':' + _autoPadHM(s.minute);
   if (s.type === 'daily') summary = t('auto.summary_daily', { time });
+  if (s.type === 'weekdays') summary = t('auto.summary_weekdays', { time });
   if (s.type === 'weekly') {
     summary = t('auto.summary_weekly', { day: t('auto.weekday.' + s.weekday), time });
   }
@@ -1051,6 +1052,7 @@ function _autoFreqOptions() {
     { value: 'one_time', label: t('auto.freq_one_time') },
     { value: 'hourly',   label: t('auto.freq_hourly') },
     { value: 'daily',    label: t('auto.freq_daily') },
+    { value: 'weekdays', label: t('auto.freq_weekdays') },
     { value: 'weekly',   label: t('auto.freq_weekly') },
     { value: 'monthly',  label: t('auto.freq_monthly') },
   ];
@@ -2146,6 +2148,8 @@ async function _autoSubmitForm() {
     schedule = { type: 'hourly', interval_hours: intervalHours };
   } else if (type === 'daily') {
     schedule = { type: 'daily', hour, minute };
+  } else if (type === 'weekdays') {
+    schedule = { type: 'weekdays', hour, minute };
   } else if (type === 'weekly') {
     const wd = _autoWeekdaySel ? parseInt(_autoWeekdaySel.getValue() || '1', 10) : 1;
     schedule = { type: 'weekly', weekday: Number.isInteger(wd) ? wd : 1, hour, minute };
