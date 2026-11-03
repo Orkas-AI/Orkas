@@ -6813,3 +6813,124 @@ describe('P3c R2 scene segment assembly', () => {
     expect(profileReasons(noIsolation)?.[0]).toContain('isolation record is missing');
   });
 });
+
+
+describe.skipIf(process.platform === 'win32')('speech.transcribe result preservation', () => {
+    const roots: string[] = [];
+    afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+    function fakeTranscriber(label: string, whisperBody: string[]) {
+      const p = tmpProject(label);
+      roots.push(p.root);
+      const input = path.join(p.root, 'raw.mp4');
+      fs.writeFileSync(input, 'fake media');
+      const ffprobe = path.join(p.root, 'ffprobe');
+      writeExecutable(ffprobe, [
+        '#!/usr/bin/env node',
+        'process.stdout.write(JSON.stringify({ format: { duration: "5" }, streams: [{ codec_type: "audio", codec_name: "aac" }] }));',
+        '',
+      ].join('\n'));
+      const ffmpeg = path.join(p.root, 'ffmpeg');
+      writeExecutable(ffmpeg, [
+        '#!/usr/bin/env node',
+        "require('node:fs').writeFileSync(process.argv[process.argv.length - 1], 'wav');",
+        '',
+      ].join('\n'));
+      const runtimeRoot = path.join(p.root, 'runtime');
+      writeExecutable(path.join(runtimeRoot, 'whisper', 'current', 'bin', 'whisper-cli'), ['#!/usr/bin/env node', ...whisperBody, '']
+        .join('\n'));
+      const model = path.join(runtimeRoot, 'whisper', 'current', 'models', 'ggml-base.bin');
+      fs.mkdirSync(path.dirname(model), { recursive: true });
+      fs.writeFileSync(model, 'model');
+      process.env.ORKAS_BUNDLED_FFMPEG = ffmpeg;
+      process.env.ORKAS_BUNDLED_FFPROBE = ffprobe;
+      process.env.ORKAS_RUNTIME_DIR = runtimeRoot;
+      delete process.env.ORKAS_WHISPER_CPP;
+      delete process.env.ORKAS_WHISPER_CLI;
+      delete process.env.ORKAS_WHISPER_MODEL;
+      return { root: p.root, input };
+    }
+
+    it.each([
+      '{"transcription":[', 'null', '[]', '{}', '{"transcription":{}}',
+      '{"transcription":[null]}',
+      '{"transcription":[{"text":"Lost words","offsets":{"from":0,"to":null}}]}',
+    ])(
+      'rejects invalid speech.transcribe output %s without replacing an existing transcript', async raw => {
+        if (process.platform === 'win32') return;
+        const { root, input } = fakeTranscriber('transcribe-invalid-output', [
+          "const fs = require('node:fs'), args = process.argv.slice(2);",
+          `fs.writeFileSync(args[args.indexOf('-of') + 1] + '.json', ${JSON.stringify(raw)});`,
+        ]);
+        const transcript = path.join(root, 'existing.json');
+        const previous = '{"text":"Existing usable transcript"}\n';
+        fs.writeFileSync(transcript, previous);
+        const source = fs.readFileSync(input);
+
+        const rejected = await transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript });
+        expect(rejected).toMatchObject({ ok: false, errorCode: 'E_TRANSCRIBE_INVALID_OUTPUT' });
+        expect(String(rejected.message)).toContain('Try transcribing');
+        expect(String(rejected.message)).not.toContain(root);
+        expect(fs.readFileSync(transcript, 'utf8')).toBe(previous);
+        expect(fs.readFileSync(input)).toEqual(source);
+
+        // An explicit healthy retry can replace the preserved old result.
+        writeExecutable(path.join(root, 'runtime', 'whisper', 'current', 'bin', 'whisper-cli'), [
+          '#!/usr/bin/env node',
+          "const fs = require('node:fs'), args = process.argv.slice(2);",
+          "fs.writeFileSync(args[args.indexOf('-of') + 1] + '.json', JSON.stringify({ result: { language: 'en' }, transcription: [{ offsets: { from: 0, to: 1200 }, text: ' Pickup at the east entrance.' }] }));",
+          '',
+        ].join('\n'));
+        const recovered = await transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript });
+        expect(recovered).toMatchObject({ ok: true });
+        expect(JSON.parse(fs.readFileSync(transcript, 'utf8')).text).toBe('Pickup at the east entrance.');
+        expect(fs.readFileSync(input)).toEqual(source);
+      },
+    );
+
+    it('accepts a valid empty speech.transcribe result for silent audio', async () => {
+      if (process.platform === 'win32') return;
+      const { root, input } = fakeTranscriber('transcribe-silence', [
+        "const fs = require('node:fs'), args = process.argv.slice(2);",
+        "fs.writeFileSync(args[args.indexOf('-of') + 1] + '.json', JSON.stringify({ result: { language: 'en' }, transcription: [] }));",
+      ]);
+      const transcript = path.join(root, 'silence.json');
+      expect(await transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript })).toMatchObject({ ok: true });
+      expect(JSON.parse(fs.readFileSync(transcript, 'utf8'))).toMatchObject({ text: '', segments: [] });
+    });
+
+    it('preserves the prior speech.transcribe result after a partial write and supports an explicit retry', async () => {
+      if (process.platform === 'win32') return;
+      const { root, input } = fakeTranscriber('transcribe-write-failure', [
+        "const fs = require('node:fs'), args = process.argv.slice(2);",
+        "fs.writeFileSync(args[args.indexOf('-of') + 1] + '.json', JSON.stringify({ transcription: [{ offsets: { from: 0, to: 1200 }, text: ' New accurate result' }] }));",
+      ]);
+      const transcript = path.join(root, 'existing.json');
+      const previous = '{"text":"Previous usable result"}\n';
+      fs.writeFileSync(transcript, previous);
+      const source = fs.readFileSync(input);
+      const nativeFs = (await import('node:fs/promises')).default;
+      const writeFile = nativeFs.writeFile;
+      let injected = false;
+      const fault = vi.spyOn(nativeFs, 'writeFile').mockImplementation((async (file: any, data: any, ...args: any[]) => {
+        if (String(file) === transcript || String(file).startsWith(transcript + '.')) {
+          injected = true;
+          await (writeFile as any)(file, Buffer.from(data).subarray(0, 8), ...args);
+          throw Object.assign(new Error('Controlled write interruption'), { code: 'EIO' });
+        }
+        return (writeFile as any)(file, data, ...args);
+      }) as any);
+      syncBuiltinESMExports();
+      try {
+        await expect(transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript })).rejects.toMatchObject({ code: 'EIO' });
+      } finally {
+        fault.mockRestore();
+        syncBuiltinESMExports();
+      }
+      expect(injected).toBe(true);
+      expect(fs.readFileSync(transcript, 'utf8')).toBe(previous);
+      expect(fs.readFileSync(input)).toEqual(source);
+      expect(fs.readdirSync(root).filter(name => name.startsWith('existing.json.'))).toEqual([]);
+      expect(await transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript })).toMatchObject({ ok: true });
+      expect(JSON.parse(fs.readFileSync(transcript, 'utf8')).text).toBe('New accurate result');
+    });
+});

@@ -5758,11 +5758,26 @@ export async function transcribeSpeech(p: SpeechTranscribeOptions): Promise<Vide
     }
     let parsed: unknown;
     try { parsed = JSON.parse(raw); }
-    catch { parsed = { raw }; }
+    catch { /* Invalid backend output is rejected before replacing a transcript. */ }
+    const transcription = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as WhisperJsonObject).transcription : undefined;
+    if (!Array.isArray(transcription) || transcription.some(segment => {
+      if (!segment || typeof segment !== 'object' || Array.isArray(segment)) return true;
+      const item = segment as WhisperJsonObject;
+      const timing = offsetsMs(item.offsets);
+      return typeof item.text !== 'string' || !timing || timing.from < 0 || timing.to < timing.from
+        || (item.text.trim().length > 0 && timing.to === timing.from);
+    })) {
+      return {
+        ok: false,
+        op: 'speech.transcribe',
+        errorCode: 'E_TRANSCRIBE_INVALID_OUTPUT',
+        message: 'The transcription result could not be read. Try transcribing the recording again.',
+      };
+    }
     const normalized = normalizeWhisperTranscript(parsed, timestampDetail);
     if (p.transcriptAbsPath) {
-      await fs.mkdir(path.dirname(p.transcriptAbsPath), { recursive: true });
-      await fs.writeFile(p.transcriptAbsPath, JSON.stringify(normalized, null, 2), 'utf8');
+      await writeJson(p.transcriptAbsPath, normalized);
     }
     return {
       ok: true,
