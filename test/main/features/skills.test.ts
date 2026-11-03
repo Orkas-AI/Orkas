@@ -188,6 +188,27 @@ describe('skills › splitSkillMd', () => {
     expect(r.body).toBe('just body');
     expect(r.meta).toEqual({});
   });
+
+  it('ends the frontmatter at a line of its own, not at a --- inside a value', async () => {
+    const s = await loadSkills();
+    const text = [
+      '---',
+      'name: md2pdf',
+      'description: Convert Markdown --- tables included --- to PDF',
+      'category: "docs"',
+      '---',
+      '',
+      'body text',
+    ].join('\n');
+    const r = s.splitSkillMd(text);
+    expect(r.meta).toMatchObject({
+      name: 'md2pdf',
+      description: 'Convert Markdown --- tables included --- to PDF',
+      category: 'docs',
+    });
+    expect(r.body).toBe('body text');
+    expect(s.parseSkillFrontmatter(text).category).toBe('docs');
+  });
 });
 
 describe('skills › skillMdContent', () => {
