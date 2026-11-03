@@ -195,6 +195,66 @@ describe('Electron system-proxy transport failures', () => {
   });
 });
 
+describe('Electron system-proxy request headers', () => {
+  // Fixture of the behavior the real-Chromium case in
+  // proxy_e2e_routing.spec.ts proves: rejected before anything is sent.
+  const chromiumFetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+    if (new Headers(init?.headers).has('content-length')) throw new Error('net::ERR_INVALID_ARGUMENT');
+    return new Response('sent');
+  });
+  const signed = {
+    'Content-Type': 'image/png', 'Content-Length': '4', 'Content-MD5': 'bWQ1',
+    'Content-Disposition': 'attachment; filename="r.png"', 'x-cos-acl': 'private',
+  };
+  const body = new Uint8Array([1, 2, 3, 4]);
+
+  beforeEach(() => {
+    chromiumFetch.mockClear();
+    vi.doMock('electron', () => ({net: {fetch: chromiumFetch}, session: {defaultSession: {}}}));
+  });
+  afterEach(() => vi.doUnmock('electron'));
+
+  it.each([
+    ['a plain object', signed],
+    ['a lowercase name', {...signed, 'Content-Length': undefined, 'content-length': '4'}],
+    ['a Headers instance', new Headers(signed)],
+    ['header pairs', Object.entries(signed)],
+  ] as Array<[string, HeadersInit]>)('sends a signed upload given as %s without Content-Length', async (_label, source) => {
+    const headers = Array.isArray(source) || source instanceof Headers
+      ? source : Object.fromEntries(Object.entries(source).filter(([, value]) => value !== undefined));
+    await installSystemProxyDispatcher(undefined, async () => 'PROXY 127.0.0.1:7890');
+    const response = await globalThis.fetch('https://cos.example/object', {method: 'PUT', headers, body, redirect: 'error'});
+    expect(await response.text()).toBe('sent');
+    const sent = chromiumFetch.mock.calls[0][1] as RequestInit;
+    const received = new Headers(sent.headers);
+    expect(received.has('content-length')).toBe(false);
+    for (const name of ['content-type', 'content-md5', 'content-disposition', 'x-cos-acl']) {
+      expect(received.get(name)).toBe(new Headers(signed).get(name));
+    }
+    expect(sent.body).toBe(body);
+    expect(sent.method).toBe('PUT');
+    expect(sent.redirect).toBe('error');
+  });
+
+  it('leaves the caller\'s request unchanged', async () => {
+    await installSystemProxyDispatcher(undefined, async () => 'PROXY 127.0.0.1:7890');
+    const headers = {...signed};
+    const init = {method: 'PUT', headers, body};
+    await globalThis.fetch('https://cos.example/object', init);
+    expect(init.headers).toBe(headers);
+    expect(headers['Content-Length']).toBe('4');
+  });
+
+  it('keeps Content-Length on the direct Node route, which accepts it', async () => {
+    const direct = vi.fn(async () => new Response('direct')) as unknown as typeof fetch;
+    globalThis.fetch = direct;
+    await installSystemProxyDispatcher(undefined, async () => 'DIRECT');
+    await globalThis.fetch('https://cos.example/object', {method: 'PUT', headers: signed, body});
+    expect(chromiumFetch).not.toHaveBeenCalled();
+    expect(new Headers((direct as any).mock.calls[0][1].headers).get('content-length')).toBe('4');
+  });
+});
+
 describe('util/proxy-dispatcher environment configuration', () => {
   it('returns no proxy when the environment is empty', () => {
     expect(envProxyConfig({})).toMatchObject({ httpProxy: undefined, httpsProxy: undefined });

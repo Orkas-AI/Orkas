@@ -330,6 +330,17 @@ export function normalizeElectronNetFetchError(error: unknown): unknown {
   return Object.assign(new Error(error.message, { cause: error }), { code: 'ENETUNREACH' });
 }
 
+/** Chromium owns Content-Length: an explicit one fails with
+ * net::ERR_INVALID_ARGUMENT before sending, where the Node route accepts it.
+ * Chromium sends the same length from the body, preserving a signed upload. */
+function withoutContentLength(init?: Parameters<FetchLike>[1]): Parameters<FetchLike>[1] {
+  if (!init?.headers) return init;
+  const headers = new Headers(init.headers);
+  if (!headers.has('content-length')) return init;
+  headers.delete('content-length');
+  return { ...init, headers };
+}
+
 async function electronSystemFetch(): Promise<FetchLike> {
   const { net } = await import('electron');
   return (async (input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
@@ -337,7 +348,7 @@ async function electronSystemFetch(): Promise<FetchLike> {
     try {
       return await net.fetch(
         normalized as Parameters<typeof net.fetch>[0],
-        init as Parameters<typeof net.fetch>[1],
+        withoutContentLength(init) as Parameters<typeof net.fetch>[1],
       ) as Response;
     } catch (error) {
       throw normalizeElectronNetFetchError(error);
