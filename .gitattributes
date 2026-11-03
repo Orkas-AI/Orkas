@@ -4,3 +4,6 @@
 # Bundled resources carry reviewed byte/hash pins; Git must preserve them on
 # Windows as well as POSIX, including text workers, licenses and Skill files.
 resources/** -text
+
+# Vendored runtimes and licenses also carry byte-exact integrity pins.
+vendor/** -text
