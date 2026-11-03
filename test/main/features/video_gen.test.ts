@@ -181,3 +181,42 @@ describe('video request body lifetime', () => {
     } finally { vi.useRealTimers(); }
   });
 });
+
+
+describe('video_gen expired provider tasks', () => {
+  const adapterRequest = {
+    model: 'doubao-seedance-2-0-260128', prompt: 'x', referenceImageUrls: [], referenceVideoUrls: [],
+    operation: 'generate', ratio: '16:9', duration: 5, resolution: '720p', generateAudio: false,
+    watermark: false, pollIntervalMs: 1, timeoutMs: 600_000,
+  } as any;
+  it('stops the user-key Doubao tracker on the first expired status', async () => {
+    let polls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return new Response(JSON.stringify({ id: 'expired-task', status: 'queued' }));
+      polls += 1;
+      return new Response(JSON.stringify({ status: polls < 3 ? 'expired' : 'failed' }));
+    }));
+    const { callDoubaoVideo } = await import('../../../src/main/features/video_gen');
+    await expect(callDoubaoVideo({ ...adapterRequest, apiKey: 'sk-user' })).rejects.toThrow(/expired-task expired/);
+    expect(polls).toBe(1);
+  });
+  it.each(['created', 'polled'])('stops an expired public API task at the %s response without downloading or creating again', async stage => {
+    let polls = 0;
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return new Response(JSON.stringify({ id: 'expired-public-task', status: stage === 'created' ? 'expired' : 'queued' }));
+      polls += 1;
+      return new Response(JSON.stringify({ id: 'expired-public-task', status: polls < 3 ? 'expired' : 'failed', url: 'https://cdn.example.test/must-not-download.mp4' }));
+    });
+    vi.stubGlobal('fetch', fetch);
+    const output = path.join(tmpDir, 'preserved.mp4');
+    fs.writeFileSync(output, 'previous usable video');
+    const result = await generateVideo({ prompt: 'A quiet landscape', outputAbsPath: output, pollIntervalMs: 1 });
+    expect(result).toMatchObject({ ok: false, errorCode: 'PROVIDER_API_ERROR' });
+    expect(result.message).toContain('expired-public-task expired');
+    expect(polls).toBe(stage === 'created' ? 0 : 1);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    expect(mocks.downloadBinaryWithProxyPolicy).not.toHaveBeenCalled();
+    expect(mocks.registerGeneratedMediaUrl).not.toHaveBeenCalled();
+    expect(fs.readFileSync(output, 'utf8')).toBe('previous usable video');
+  });
+});
