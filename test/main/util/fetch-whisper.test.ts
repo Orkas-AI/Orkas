@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -22,6 +23,16 @@ const fetchWhisper = require('../../../scripts/fetch-whisper.cjs') as {
 const { WHISPER_RUNTIME_CONTRACT } = require('../../../bin/runtime-gate.cjs') as {
   WHISPER_RUNTIME_CONTRACT: any;
 };
+const pinnedLicenses = [
+  ...Object.entries(WHISPER_RUNTIME_CONTRACT.licenses).map(([name, spec]) => ({
+    source: `vendor/whisper/v${WHISPER_RUNTIME_CONTRACT.version}/${name}`,
+    spec: spec as { bytes: number; sha256: string },
+  })),
+  ...Object.values(WHISPER_RUNTIME_CONTRACT.targets['win32-x64'].licenses).map((spec: any) => ({
+    source: `vendor/whisper/${spec.vendorPath}`,
+    spec: spec as { bytes: number; sha256: string },
+  })),
+];
 
 const tempDirs: string[] = [];
 afterEach(() => {
@@ -44,6 +55,28 @@ describe('fetch-whisper', () => {
     for (const [name, spec] of Object.entries(WHISPER_RUNTIME_CONTRACT.licenses)) {
       expect(fetchWhisper.matchesFile(path.join(vendor, name), spec as any)).toBe(true);
     }
+  });
+
+  it.each(pinnedLicenses)('preserves $source through Windows Git checkout filters and rejects tampering', ({ source, spec }) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-whisper-checkout-'));
+    tempDirs.push(root);
+    const original = execFileSync('git', ['show', `HEAD:${source}`], {
+      cwd: process.cwd(), timeout: 10_000,
+    });
+    const checkedOut = execFileSync('git', [
+      '-c', 'core.autocrlf=true', 'cat-file', '--filters', `--path=${source}`, `HEAD:${source}`,
+    ], { cwd: process.cwd(), timeout: 10_000 });
+    expect(checkedOut.length).toBe(original.length);
+    expect(checkedOut).toEqual(original);
+    const file = path.join(root, path.basename(source));
+    fs.writeFileSync(file, checkedOut);
+    expect(fetchWhisper.matchesFile(file, spec)).toBe(true);
+
+    // Keep the size unchanged so the hash must detect the altered payload.
+    const tampered = Buffer.from(checkedOut);
+    tampered[0] ^= 1;
+    fs.writeFileSync(file, tampered);
+    expect(fetchWhisper.matchesFile(file, spec)).toBe(false);
   });
 
   it('recognizes signed and unsigned Windows illegal-instruction exit codes', () => {
