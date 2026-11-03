@@ -20,6 +20,7 @@ if (!['win32', 'darwin', 'linux'].includes(process.platform)) {
 // runs after dependency provisioning in the platform-specific Windows and
 // Linux lanes because it requires downloaded FFmpeg, model, and native payloads.
 const commonSuites = [
+  'test/main/windows-install-data-root.test.ts',
   'test/main/util/ensure-dev-dependencies.test.ts',
   'test/main/util/verify-native-dependencies.test.ts',
   'test/main/util/ensure-sqlite-electron-abi.test.ts',

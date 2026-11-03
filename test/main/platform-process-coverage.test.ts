@@ -121,8 +121,8 @@ const PROCESS_OWNER_SUITE: Record<string, ProcessOwner> = {
   },
   'src/main/install-data-root.cjs': {
     platforms: ['win32'],
-    suite: 'test/main/util/migrate-source-data-root.test.ts',
-    evidence: 'Get-CimInstance Win32_LogicalDisk',
+    suite: 'test/main/windows-install-data-root.test.ts',
+    evidence: 'install-data-root.',
   },
   'src/main/features/video_studio.ts': {
     suite: 'test/main/features/video_studio_native_qa.test.ts',
