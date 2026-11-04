@@ -76,9 +76,11 @@ import {
   getCurrentDevice,
   getTask,
   handoffNotePath,
+  hasEnabledLocalAutomations,
   isDue,
   listAttachments,
   listTasks,
+  listTaskSearchRows,
   recordRunTerminal,
   nextDueAfterRestoreForTest,
   nextDueAtForTest,
@@ -494,6 +496,7 @@ describe('task CRUD normalization', () => {
       name: 'Test workstation',
     });
 
+    expect(await hasEnabledLocalAutomations(TEST_UID)).toBe(true);
     await rescheduleAllForTest(TEST_UID);
 
     expect(await getTask(TEST_UID, taskId)).toMatchObject({
@@ -2730,5 +2733,207 @@ describe('automation › recovery discovery sequences', () => {
     expect(fs.readFileSync(path.join(attachments,'draft.txt'),'utf8')).toBe('only draft');
     expect(fs.readFileSync(path.join(attachments,'source.txt'),'utf8')).toBe('source attachment');
     expect(fs.existsSync(source)).toBe(false);expect(autoRuntime.send).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('exit protection reads the automation owner before scheduler startup', () => {
+  it('uses enabled/device configuration even for distant dates and rejects malformed configs as unknown', async () => {
+    const created = await createTask(TEST_UID, { id: 'at_deadbeef', content: 'future check', enabled: true, schedule: { type: 'one_time', at: '2099-12-01T09:00:00.000Z' } });
+    expect(created.ok).toBe(true);
+    expect(await hasEnabledLocalAutomations(TEST_UID)).toBe(true);
+    await setTaskEnabled(TEST_UID, 'at_deadbeef', false);
+    expect(await hasEnabledLocalAutomations(TEST_UID)).toBe(false);
+    const file = autoTaskConfigFile(TEST_UID, 'at_deadbeef');
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, JSON.stringify({ ...stored, enabled: true, device_id: 'another-device' }));
+    expect(await hasEnabledLocalAutomations(TEST_UID)).toBe(false);
+    fs.writeFileSync(file, '{bad');
+    await expect(hasEnabledLocalAutomations(TEST_UID)).rejects.toThrow();
+  });
+});
+
+describe('calendar multi-selection journeys', () => {
+  it('persists non-contiguous weekly/monthly choices and legacy single selections without conversion', async () => {
+    for (const schedule of [
+      { type: 'weekly', weekdays: [1, 3], hour: 9, minute: 0 },
+      { type: 'weekly', weekday: 'workdays', hour: 9, minute: 0 },
+      { type: 'monthly', days: [1, 8, 19], hour: 9, minute: 0 },
+      { type: 'monthly', days: [15], hour: 9, minute: 0 },
+      { type: 'weekly', weekday: 2, hour: 9, minute: 0 },
+    ]) {
+      const created = await createTask(TEST_UID, { content: 'Calendar selection', schedule: schedule as Schedule });
+      expect(created.ok).toBe(true);
+      if (!created.ok) throw new Error('Calendar fixture rejected');
+      expect((await getTask(TEST_UID, created.task.id))?.schedule).toEqual(schedule);
+      await updateTask(TEST_UID, created.task.id, { title: 'Edited title' });
+      expect((await getTask(TEST_UID, created.task.id))?.schedule).toEqual(schedule);
+    }
+  });
+
+  it.each([
+    { type: 'weekly', weekdays: [] }, { type: 'weekly', weekdays: [1, 7] },
+    { type: 'weekly', weekdays: [1, 1] }, { type: 'weekly', weekday: 1, weekdays: [3] },
+    { type: 'monthly', days: [] }, { type: 'monthly', days: [0, 8] },
+    { type: 'monthly', days: [1, 32] }, { type: 'monthly', days: ['8'] },
+    { type: 'monthly', day: 1, days: [8] },
+  ])('rejects ambiguous or invalid selection %j before writing', async selection => {
+    expect(await createTask(TEST_UID, { content: 'Must not save', schedule: { ...selection, hour: 9, minute: 0 } as Schedule }))
+      .toEqual({ ok: false, error: 'invalid_schedule' });
+    expect(await listTasks(TEST_UID)).toEqual([]);
+  });
+
+  it('runs Monday/Wednesday only and advances through a week rollover', () => {
+    const task = makeTask({ type: 'weekly', weekdays: [3, 1], hour: 9, minute: 0 } as Schedule);
+    const monday = new Date(2026, 10, 2, 9);
+    expect(isDue(task, monday, null)).toBe(true);
+    expect(isDue(task, new Date(2026, 10, 3, 9), monday)).toBe(false);
+    task.last_run_at = monday.toISOString();
+    expect(nextDueAtForTest(task, monday)?.getTime()).toBe(new Date(2026, 10, 4, 9).getTime());
+    task.last_run_at = new Date(2026, 10, 4, 9).toISOString();
+    expect(nextDueAtForTest(task, new Date(2026, 10, 5, 10))?.getTime()).toBe(new Date(2026, 10, 9, 9).getTime());
+  });
+
+  it('treats workdays as Monday through Friday and skips the weekend', () => {
+    const task = makeTask({ type: 'weekly', weekday: 'workdays', hour: 9, minute: 0 } as Schedule);
+    expect(isDue(task, new Date(2026, 10, 6, 9), null)).toBe(true);
+    expect(isDue(task, new Date(2026, 10, 7, 9), null)).toBe(false);
+    expect(isDue(task, new Date(2026, 10, 8, 9), null)).toBe(false);
+    task.last_run_at = new Date(2026, 10, 6, 9).toISOString();
+    expect(nextDueAtForTest(task, new Date(2026, 10, 6, 10))?.getTime()).toBe(new Date(2026, 10, 9, 9).getTime());
+  });
+
+  it('preserves non-contiguous monthly days, clamps short months once and finds the latest missed date', () => {
+    const task = makeTask({ type: 'monthly', days: [1, 8, 19], hour: 9, minute: 0 } as Schedule);
+    const first = new Date(2026, 10, 1, 9);
+    task.last_run_at = first.toISOString();
+    expect(nextDueAtForTest(task, first)?.getTime()).toBe(new Date(2026, 10, 8, 9).getTime());
+    expect(isDue(task, new Date(2026, 10, 9, 9), first)).toBe(false);
+    expect(catchUpBoundaryForTest(task, new Date(2026, 10, 19, 10))?.getTime()).toBe(new Date(2026, 10, 19, 9).getTime());
+    const clamped = makeTask({ type: 'monthly', days: [29, 30, 31], hour: 9, minute: 0 } as Schedule);
+    const febEnd = new Date(2027, 1, 28, 9);
+    expect(isDue(clamped, febEnd, null)).toBe(true);
+    expect(isDue(clamped, new Date(2027, 1, 28, 10), febEnd)).toBe(false);
+    clamped.last_run_at = febEnd.toISOString();
+    expect(nextDueAtForTest(clamped, febEnd)?.getTime()).toBe(new Date(2027, 2, 29, 9).getTime());
+    const leap = new Date(2028, 1, 29, 9);
+    expect(isDue(clamped, leap, febEnd)).toBe(true);
+  });
+
+  it('dispatches coincident month-end selections once and consumes one scheduled run', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2027, 1, 28, 8, 59));
+    const created = await createTask(TEST_UID, { content: 'Month-end report',
+      schedule: { type: 'monthly', days: [29, 30, 31], hour: 9, minute: 0 } as Schedule,
+      end_condition: { type: 'count', max_runs: 2 },
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error('Month-end fixture rejected');
+    stopScheduler();
+    vi.setSystemTime(new Date(2027, 1, 28, 9));
+    await _onTimerFireForTest(TEST_UID, created.task.id);
+    await _onTimerFireForTest(TEST_UID, created.task.id);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect((await getTask(TEST_UID, created.task.id))?.scheduled_run_count).toBe(1);
+    expect(armedDueAtForTest(created.task.id)).toBe(new Date(2027, 2, 29, 9).getTime());
+  });
+
+  it('recomputes an armed calendar boundary after the device timezone changes while awake', async () => {
+    const previous = process.env.TZ;
+    try {
+      process.env.TZ = 'Asia/Shanghai';
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(2026, 10, 4, 8));
+      activateUser(TEST_UID);
+      const created = await createTask(TEST_UID, { content: 'Local morning report', schedule: { type: 'daily', hour: 9, minute: 0 } });
+      if (!created.ok) throw new Error('Clock fixture rejected');
+      startScheduler();
+      await waitForSchedulerOutcome(() => armedDueAtForTest(created.task.id) === new Date(2026, 10, 4, 9).getTime(), 'initial local boundary');
+      process.env.TZ = 'Asia/Bangkok';
+      await vi.advanceTimersByTimeAsync(31_000);
+      const target = new Date(2026, 10, 4, 9).getTime();
+      await waitForSchedulerOutcome(() => armedDueAtForTest(created.task.id) === target, 'new device timezone boundary');
+      expect(autoRuntime.send).not.toHaveBeenCalled();
+    } finally {
+      stopScheduler();
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
+    }
+  });
+});
+
+describe('multi-selection recovery and clock changes', () => {
+  it('preserves an armed occurrence through reordered selections and live sync, then advances once', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 10, 2, 8));
+    const created = await createTask(TEST_UID, { content: 'Two weekly dates',
+      schedule: { type: 'weekly', weekdays: [1, 3], hour: 9, minute: 0 },
+    });
+    if (!created.ok) throw new Error('Weekly fixture rejected');
+    const due = new Date(2026, 10, 2, 9);
+    vi.setSystemTime(due);
+    await updateTask(TEST_UID, created.task.id, { schedule: { type: 'weekly', weekdays: [3, 1], hour: 9, minute: 0 } });
+    await rescheduleAllAfterSyncForTest(TEST_UID);
+    expect(armedDueAtForTest(created.task.id)).toBe(due.getTime());
+    await _onTimerFireForTest(TEST_UID, created.task.id);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect(armedDueAtForTest(created.task.id)).toBe(new Date(2026, 10, 4, 9).getTime());
+  });
+
+  it('keeps date/count cutoffs and restore no-backfill for multi-selection schedules', () => {
+    const task = makeTask({ type: 'weekly', weekdays: [1, 3], hour: 9, minute: 0 }, {
+      last_run_at: new Date(2026, 10, 2, 9).toISOString(), end_condition: { type: 'date', date: '2026-11-03' },
+    });
+    expect(nextDueAtForTest(task, new Date(2026, 10, 2, 10))).toBeNull();
+    task.end_condition = { type: 'count', max_runs: 1 };task.scheduled_run_count = 1;
+    expect(isDue(task, new Date(2026, 10, 4, 9), new Date(task.last_run_at!))).toBe(false);
+    delete task.end_condition;
+    expect(nextDueAfterRestoreForTest(task, new Date(2026, 10, 4, 10))?.getTime()).toBe(new Date(2026, 10, 9, 9).getTime());
+  });
+
+  it('catches up only the latest selected day after waking and keeps the remaining schedule', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date(2026, 10, 1, 8));activateUser(TEST_UID);
+    const created = await createTask(TEST_UID, { content: 'Selected monthly days',
+      schedule: { type: 'monthly', days: [1, 8, 19], hour: 9, minute: 0 },
+    });
+    if (!created.ok) throw new Error('Monthly fixture rejected');
+    suspendSchedulerForTest();vi.setSystemTime(new Date(2026, 10, 19, 10));
+    await resumeSchedulerForTest(TEST_UID);
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
+    await waitForSchedulerOutcome(() => autoRuntime.send.mock.calls.length === 1, 'one latest selected-day catch-up');
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    await waitForSchedulerOutcome(() => armedDueAtForTest(created.task.id) === new Date(2026, 11, 1, 9).getTime(), 'next selected month');
+  });
+
+  it('detects a forward wall-clock correction, catches up once and stops monitoring on shutdown', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date(2026, 10, 2, 8));activateUser(TEST_UID);
+    const created = await createTask(TEST_UID, { content: 'Clock correction', schedule: { type: 'daily', hour: 9, minute: 0 } });
+    if (!created.ok) throw new Error('Clock fixture rejected');
+    startScheduler();
+    await rescheduleAllForTest(TEST_UID);
+    vi.setSystemTime(new Date(2026, 10, 2, 10));
+    await vi.advanceTimersByTimeAsync(30_000);
+    await waitForSchedulerOutcome(() => armedDueAtForTest(created.task.id) === Date.now() + AUTO_TASK_CATCH_UP_DELAY_MS, 'clock-change catch-up timer');
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
+    await waitForSchedulerOutcome(() => autoRuntime.send.mock.calls.length === 1, 'clock-change run');
+    stopScheduler();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(armedDueAtForTest(created.task.id)).toBeNull();
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('automation search projection freshness', () => {
+  it('returns current scoped content after edits and drops a deleted automation', async () => {
+    const created = await createTask(TEST_UID, { title: 'Original', content: 'Read-only search content', enabled: false,
+      schedule: { type: 'daily', hour: 9, minute: 0 } });
+    if (!created.ok) throw new Error('Projection fixture rejected');
+    expect(await listTaskSearchRows(TEST_UID)).toEqual([{ id: created.task.id, title: 'Original',
+      content: 'Read-only search content', enabled: false, project_id: undefined }]);
+    await updateTask(TEST_UID, created.task.id, { title: 'Revised' });
+    expect((await listTaskSearchRows(TEST_UID))[0].title).toBe('Revised');
+    await deleteTask(TEST_UID, created.task.id);
+    expect(await listTaskSearchRows(TEST_UID)).toEqual([]);
   });
 });

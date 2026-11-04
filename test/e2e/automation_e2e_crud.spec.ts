@@ -418,22 +418,23 @@ test.describe('automation', () => {
     await expect(more).toHaveCSS('opacity', '0');
     await row.hover();
     await expect(more).toHaveCSS('opacity', '1');
-    const side = row.locator('.auto-row-side');
-    const [rowBox, moreBox, sideBox] = await Promise.all([
+    const [rowBox, moreBox] = await Promise.all([
       row.boundingBox(),
       more.boundingBox(),
-      side.boundingBox(),
     ]);
     expect(rowBox).not.toBeNull();
     expect(moreBox).not.toBeNull();
-    expect(sideBox).not.toBeNull();
     expect(moreBox!.width).toBeLessThanOrEqual(22);
-    expect(moreBox!.y - rowBox!.y).toBeLessThan(12);
-    expect((rowBox!.x + rowBox!.width) - (moreBox!.x + moreBox!.width)).toBeLessThan(12);
-    // Schedule metadata uses only the card's normal inset. The hover-only menu
-    // overlays the corner instead of reserving a permanent blank column.
-    expect((rowBox!.x + rowBox!.width) - (sideBox!.x + sideBox!.width)).toBeLessThanOrEqual(18);
-    await expect(row.locator('.auto-row-head')).toHaveCSS('grid-template-columns', /^\S+\s+\S+$/);
+    expect(moreBox!.y - rowBox!.y).toBeLessThanOrEqual(18);
+    expect((rowBox!.x + rowBox!.width) - (moreBox!.x + moreBox!.width)).toBeLessThanOrEqual(18);
+    // Schedule information follows the preview and uses the whole card width.
+    const scheduleBox = await row.locator('.auto-row-schedule').boundingBox();
+    const contentBox = await row.locator('.auto-row-content').boundingBox();
+    expect(scheduleBox!.y).toBeGreaterThanOrEqual(contentBox!.y + contentBox!.height + 8);
+    expect(scheduleBox!.width).toBeGreaterThanOrEqual(rowBox!.width - 36);
+    const titleBox = await row.locator('.auto-row-title').boundingBox();
+    expect(titleBox!.y - rowBox!.y).toBeLessThanOrEqual(18);
+    await expect(row.locator('.auto-row-lastrun')).toHaveCount(0);
     await more.click();
     const runItem = page.locator('.auto-row-menu .auto-row-menu-item[data-action="run-now"]');
     await expect(runItem).toHaveText('Run now');
@@ -645,7 +646,7 @@ test.describe('automation', () => {
     expect(cliState.invocations[0].prompt).not.toContain('## Return control to commander');
   });
 
-  test('supports project-bound hourly, weekly, monthly, and one-time schedules with optional ends', async ({ orkas }) => {
+  test('supports project-bound hourly, weekly, monthly, and one-time schedules with optional ends', async ({ orkas }, testInfo) => {
     // This journey validates four schedules and persists project/global changes across several relaunches.
     // Budget the whole journey separately; individual UI and operation deadlines stay unchanged.
     test.setTimeout(120_000);
@@ -682,6 +683,13 @@ test.describe('automation', () => {
     let row = page.locator('#project-auto-list .auto-row', { hasText: 'Run the project release review' });
     await expect(row).toBeVisible();
     await expect(page.locator('#project-auto-tab-count')).toHaveText('1');
+    await expect(row.locator('.auto-row-lastrun')).toHaveCount(0);
+    const projectLayout = await row.evaluate(el => ({
+      messageBottom: el.querySelector('.auto-row-content')!.getBoundingClientRect().bottom,
+      scheduleTop: el.querySelector('.auto-row-schedule')!.getBoundingClientRect().top,
+    }));
+    expect(projectLayout.scheduleTop).toBeGreaterThanOrEqual(projectLayout.messageBottom + 8);
+    await page.locator('#project-auto-list').screenshot({ path: testInfo.outputPath('project-automation-card.png') });
     let listed = await orkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list', { projectId });
     expect(listed.tasks[0]).toMatchObject({
       project_id: projectId,

@@ -830,6 +830,22 @@ export function listTasks(uid: string, cid: string): Promise<ConversationTask[]>
   return withBoard(uid, cid, (b) => b.tasks.map((t) => ({ ...t })), { readonly: true });
 }
 
+/** Live user tasks own their attachments before the deferred message reaches
+ * history. Read this conversation's board only; a cold process has no queued
+ * execution to reserve files for and retains ordinary unsent-file recovery. */
+export function activeUserAttachmentNames(uid: string, cid: string): Set<string> {
+  const names = new Set<string>();
+  const b = _boards.get(boardKey(uid, cid));
+  if (!b) return names;
+  // Sync can invalidate the snapshot while preserving local task identities.
+  loadBoardSync(b);
+  for (const task of b.tasks) {
+    if (task.created_by !== 'user' || TERMINAL_STATUSES.has(task.status)) continue;
+    for (const name of task.attachments || []) names.add(name);
+  }
+  return names;
+}
+
 export interface BacklogRunIdentity {
   turnId?: string;
   sourceMessageId?: string;
