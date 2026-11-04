@@ -918,6 +918,95 @@ describe('chat_attachments › listAttachments', () => {
 });
 
 describe('chat_attachments › listPendingAttachments', () => {
+  it('keeps queued and blocked message files out of drafts across edits and sync, without losing independent drafts or cancellation recovery', async () => {
+    const m = await loadMod();
+    const tb = await import('../../../src/main/features/group_chat/task_board');
+    tb._resetForTest();
+    try {
+      for (const name of ['draft.txt', 'queued.txt', 'added.txt']) {
+        expect(await m.uploadAttachment(UID, CID, name, Buffer.from(name))).toMatchObject({ ok: true });
+      }
+      const queued = await tb.createTask(UID, CID, {
+        assignee: 'commander', instruction: 'original', createdBy: 'user', attachments: ['queued.txt'],
+      });
+      const pending = () => m.listPendingAttachments(UID, CID).map(item => item.name).sort();
+      expect.soft(pending()).toEqual(['added.txt', 'draft.txt']);
+      expect(await tb.editQueued(UID, CID, queued.task_id, 'with new attachment', 'original',
+        () => ({ attachments: ['queued.txt', 'added.txt'] }))).toHaveProperty('task');
+      expect.soft(pending()).toEqual(['draft.txt']);
+
+      // Sync invalidates the board cache, but these local tasks still own
+      // their files. Attachment refresh may be the first reader afterwards.
+      await tb.flushBoards();
+      tb.dropBoard(UID, CID, { persistPending: false });
+      expect.soft(pending()).toEqual(['draft.txt']);
+      const sibling = await tb.createTask(UID, CID, {
+        assignee: 'agent', instruction: 'shared attachment', createdBy: 'user', attachments: ['queued.txt'],
+      });
+      await tb.editQueued(UID, CID, queued.task_id, 'only added attachment', 'with new attachment',
+        () => ({ attachments: ['added.txt'] }));
+      expect.soft(pending()).toEqual(['draft.txt']);
+      await tb.cancelPending(UID, CID, sibling.task_id);
+      expect.soft(pending()).toEqual(['draft.txt', 'queued.txt']);
+      await tb.markBlocked(UID, CID, queued.task_id);
+      expect.soft(pending()).toEqual(['draft.txt', 'queued.txt']);
+      await tb.requeueBlocked(UID, CID, queued.task_id);
+      await tb.claimTask(UID, CID, queued.task_id);
+      expect.soft(pending()).toEqual(['draft.txt', 'queued.txt']);
+
+      // Once execution has a history record, ownership must survive runtime
+      // teardown rather than depending on a retained in-memory board.
+      const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+      fs.mkdirSync(chatsDir, { recursive: true });
+      fs.writeFileSync(path.join(chatsDir, `${CID}.jsonl`), JSON.stringify({ attachments: ['added.txt'] }) + '\n');
+      await tb.finishTask(UID, CID, queued.task_id, 'done');
+      await tb.flushBoards();
+      tb._resetForTest();
+      expect(pending()).toEqual(['draft.txt', 'queued.txt']);
+      expect(m.listAttachments(UID, CID)).toHaveLength(3);
+    } finally { await tb.flushBoards(); tb._resetForTest(); }
+  });
+
+  it.each(['upload', 'path'])('admits a fresh %s selection after a full message was queued, with its own recoverable file', async (route) => {
+    const m = await loadMod();
+    const tb = await import('../../../src/main/features/group_chat/task_board');
+    tb._resetForTest();
+    try {
+      const names: string[] = [];
+      for (let index = 0; index < m.MAX_PENDING_ATTACHMENTS_PER_MESSAGE; index += 1) {
+        const name = `queued-${index}.txt`;
+        expect(await m.uploadAttachment(UID, CID, name, Buffer.from(`queued bytes ${index}`))).toMatchObject({ ok: true });
+        names.push(name);
+      }
+      await tb.createTask(UID, CID, { assignee: 'commander', instruction: 'full queued message', createdBy: 'user', attachments: names });
+      const select = async (name: string, content: string) => {
+        if (route === 'upload') return m.uploadAttachment(UID, CID, name, Buffer.from(content));
+        const source = path.join(tmpDir, name);
+        fs.writeFileSync(source, content);
+        return m.importAttachmentFromPath(UID, CID, source);
+      };
+      // A queued message must not consume the next composer's attachment cap.
+      const fresh = await select('fresh.txt', 'independent draft');
+      expect.soft(fresh).toMatchObject({ ok: true });
+      const selected = await select(names[0], 'queued bytes 0');
+      expect(selected.ok).toBe(true);
+      if (!selected.ok) return;
+      expect.soft(selected.info.name).not.toBe(names[0]);
+      expect.soft(m.listPendingAttachments(UID, CID).map(item => item.name).sort())
+        .toEqual(['fresh.txt', selected.info.name].sort());
+      // Same cid on another account and the same filename on another task
+      // remain independent; a process restart cancels the volatile queue and
+      // preserves its files for the existing unsent recovery path.
+      expect(await m.uploadAttachment('another-user', CID, names[0], Buffer.from('other account'))).toMatchObject({ ok: true });
+      expect(m.listPendingAttachments('another-user', CID).map(item => item.name)).toEqual([names[0]]);
+      expect(await m.uploadAttachment(UID, 'another-conv', names[0], Buffer.from('other task'))).toMatchObject({ ok: true });
+      expect(m.listPendingAttachments(UID, 'another-conv').map(item => item.name)).toEqual([names[0]]);
+      await tb.flushBoards();
+      tb._resetForTest();
+      expect(m.listPendingAttachments(UID, CID)).toHaveLength(names.length + 2);
+    } finally { await tb.flushBoards(); tb._resetForTest(); }
+  });
+
   it('never restores generated media as composer uploads before the assistant finishes or after restart', async () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, CID, 'my-notes.txt', Buffer.from('user draft'));

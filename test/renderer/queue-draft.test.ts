@@ -307,15 +307,17 @@ describe('queued message composer editing', () => {
   });
 
   it('keeps failed edits across task switches and reload, and retries only once while a save is pending', async () => {
-    const { context, input, stored } = loadQueueDraft();
+    const { context, input, stored, attachmentsByCid } = loadQueueDraft();
     context.window = { TaskBoard: { resync: vi.fn() } };
     context.currentCid = 'c1';
     input.value = 'original draft';
+    attachmentsByCid.set('c1', [{ name: 'draft.txt', status: 'ready' }]);
     context._chatAttachTryBeginSend = () => () => {};
-    context._chatAttachSnapshotForSend = async () => ({ ok: true, names: [] });
+    context._chatAttachSnapshotForSend = async () => ({ ok: true, names: context._chatAttachList('c1').map((item: any) => item.name) });
     context.transformWithChatUse = (text: string) => text;
-    context.apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true, message: { text: 'queued' } }) }));
+    context.apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true, message: { text: 'queued', attachments: ['queued.txt'] } }) }));
     await context._startQueueItemEdit('c1', 'q1');
+    context._chatAttachSet('c1', [...context._chatAttachList('c1'), { name: 'new.txt', status: 'ready' }]);
     input.value = 'my changes';
     context._saveDraft('c1');
     context._flushDraftSave('c1'); // setView flushes before reusing the shared composer
@@ -324,10 +326,12 @@ describe('queued message composer editing', () => {
     reloaded.context.currentCid = 'c1';
     reloaded.context._restoreDraft('c1');
     expect(reloaded.input.value).toBe('my changes');
+    expect(reloaded.attachmentsByCid.get('c1')?.map(item => item.name)).toEqual(['queued.txt', 'new.txt']);
     context.currentCid = 'c1'; context._restoreDraft('c1');
     context.apiFetch.mockRejectedValueOnce(new Error('offline'));
     expect(await context._finishQueueItemEdit('c1')).toBe(false);
     expect(input.value).toBe('my changes');
+    expect(attachmentsByCid.get('c1')?.map(item => item.name)).toEqual(['queued.txt', 'new.txt']);
     expect(context.uiAlert).toHaveBeenCalledWith('chat.queue_edit_failed');
     let release: (value: unknown) => void = () => {};
     context.apiFetch.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
@@ -338,6 +342,7 @@ describe('queued message composer editing', () => {
     release({ json: async () => ({ ok: true }) });
     expect(await saving).toBe(true);
     expect(input.value).toBe('original draft');
+    expect(attachmentsByCid.get('c1')?.map(item => item.name)).toEqual(['draft.txt']);
     expect(context.apiFetch).toHaveBeenCalledTimes(3);
   });
 });
