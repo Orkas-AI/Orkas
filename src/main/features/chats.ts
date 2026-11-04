@@ -2843,7 +2843,9 @@ async function _unsettledStaleActors(uid: string, cid: string, state: StateFile)
   const file = conversationMessageReadFile(uid, cid);
   const actors = [...new Set(state.in_flight.filter(actor => safeId(actor) && actor !== 'user'))];
   const readPage = async (cursor: number | null) => {
-    try { return await readJsonlPageWithOffsets<GroupMessage>(file, 8, cursor, { strict: true }); }
+    // A partial row is the residue this recovery exists for, so it is skipped
+    // and never settles an actor. Only an unreadable source stays retryable.
+    try { return await readJsonlPageWithOffsets<GroupMessage>(file, 8, cursor, { strict: true, skipInvalidRecords: true }); }
     catch (error) {
       // A locally journaled run can outlive its missing canonical file. Its
       // interruption notice recreates that file; other I/O failures retry.

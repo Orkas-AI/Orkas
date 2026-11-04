@@ -505,14 +505,17 @@ export async function readJsonlPage<T = Record<string, any>>(
   };
 }
 
-/** Offset-preserving variant used by sparse derived page caches. */
+/** Offset-preserving variant used by sparse derived page caches.
+ * `skipInvalidRecords` keeps `strict` for I/O only, for readers that must tell an
+ * unavailable source from an empty one yet still get past a partial crash-time row. */
 export async function readJsonlPageWithOffsets<T = Record<string, any>>(
   filePath: string,
   limit = 200,
   before?: number | null,
-  opts?: { strict?: boolean },
+  opts?: { strict?: boolean; skipInvalidRecords?: boolean },
 ): Promise<JsonlPageWithOffsets<T>> {
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  const strictRecords = !!opts?.strict && !opts?.skipInvalidRecords;
   let handle: fs.promises.FileHandle;
   try {
     handle = await fsp.open(filePath, 'r');
@@ -549,7 +552,7 @@ export async function readJsonlPageWithOffsets<T = Record<string, any>>(
         const line = suffixSegments.length
           ? _concatJsonlSegments([current, ...suffixSegments.reverse()])
           : current;
-        const record = _parseJsonlRecord<T>(line.toString('utf8'), opts?.strict);
+        const record = _parseJsonlRecord<T>(line.toString('utf8'), strictRecords);
         if (record !== undefined) {
           const start = position + i + 1;
           newestFirst.push({ record, start });
@@ -568,7 +571,7 @@ export async function readJsonlPageWithOffsets<T = Record<string, any>>(
     if (newestFirst.length < wanted && suffixSegments.length) {
       const record = _parseJsonlRecord<T>(
         _concatJsonlSegments(suffixSegments.reverse()).toString('utf8'),
-        opts?.strict,
+        strictRecords,
       );
       if (record !== undefined) {
         newestFirst.push({ record, start: 0 });
