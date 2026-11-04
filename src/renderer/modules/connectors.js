@@ -408,7 +408,21 @@ function _persistConnectorsRenderCache() {
   } catch (_) { /* localStorage unavailable / quota — skip */ }
 }
 
+let _connectorsLatestLoad = null;
 async function loadConnectors() {
+  let loading = _refreshConnectors();
+  _connectorsLatestLoad = loading;
+  // A tab-entry refresh can supersede an explicit navigation load. Its caller
+  // still needs the final grid before focusing a card, rather than the stale
+  // request's early return. Follow newer loads without issuing another fetch.
+  for (;;) {
+    await loading;
+    if (loading === _connectorsLatestLoad) return;
+    loading = _connectorsLatestLoad;
+  }
+}
+
+async function _refreshConnectors() {
   const seq = ++_connectorsLoadSeq;
   _purgeLegacyConnectorsRenderCaches();
   _hydrateConnectorsRenderCache();

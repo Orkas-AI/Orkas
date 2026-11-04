@@ -110,7 +110,7 @@ CLI processes left running. This canary is not covered by mocked MCP success.
 3. 点击依赖 CLI 的连接器时，先检测当前账号、设备和 catalog id 对应的 Orkas 隔离目录；不得把系统 PATH 中任意同名 CLI 当作已安装。缺失时必须在下载前询问用户，确认后按钮显示“安装中”，失败时卡片保留本地化原因并提供“重试安装”，且不能继续打开账号授权。
 4. 安装只允许写入该连接器自己的 npm cache，并校验固定包名、版本、官方 registry integrity、package.json 和 executable 文件。安装完成后，账号授权、schema 发现、业务执行和 logout 一律使用 npm offline 模式；任何隐式重新下载或全局安装都应失败测试。
 5. 首次授权以直接 argv 启动已经安装的固定版本官方 npm 包，退出后必须重新检查官方 auth status；取消、失败或未登录不能保存为已连接。缺少精确受管安装时，主进程也必须拒绝授权，不能只依赖 Renderer 检查。
-6. Feishu/Lark authorization opens only structurally validated HTTPS URLs on exact official hosts and authorization routes; provider prose never decides completion. Explicit Connect/Reauthorize requests the complete reviewed domains/scopes, including sending, even if an old or newly initialized identity verifies. Compare actual grants with the pinned full permission contract after consent and on Connectors-page entry/manual refresh, preserving API alternatives and exact shortcut requirements. CLI cards do not display missing-permission notices or an inline Reauthorize button. The three-dot menu always offers Reauthorize for connected or degraded CLI instances, including those without recorded deficiencies and disabled instances; Use remains available for enabled connected instances. Clicking directly enters the official flow, without an Orkas administrator pre-prompt or a cached enterprise block. A verified partial identity remains usable; cancellation cannot masquerade as completion from an old token. DingTalk uses its supported full-domain PAT batch route and a read-only full-domain plan, preserves exact acknowledged PAT grants, and cannot clear independent OAuth gaps from identity/PAT success. WeCom keeps native robot binding and remote identity verification; no user OAuth scope or complete business-grant list is invented. Resource/recipient-only or unclassified business-access failures stay with the task and do not create card completeness warnings. Unavailable reports retain known evidence, newer denials remain recoverable, selected tools and other usable capabilities stay available, and no failed business action is replayed. Repeated page checks coalesce for one minute; authorization/manual refresh recheck, disconnect/account switch cancel, and no startup/timer scan is added.
+6. Feishu/Lark authorization opens only structurally validated HTTPS URLs on exact official hosts and authorization routes; provider prose never decides completion. Explicit Connect/Reauthorize requests the complete reviewed domains/scopes, including sending, even if an old or newly initialized identity verifies. Compare actual grants with the pinned full permission contract after consent and on Connectors-page entry/manual refresh, preserving API alternatives and exact shortcut requirements. CLI cards do not display missing-permission notices or an inline Reauthorize button. The three-dot menu always offers Reauthorize for connected or degraded CLI instances, including those without recorded deficiencies and disabled instances; Use remains available for enabled connected instances. Clicking directly enters the official flow, without an Orkas administrator pre-prompt or a cached enterprise block. A verified partial identity remains usable; cancellation cannot masquerade as completion from an old token. DingTalk requests the reviewed full-domain PAT batch once with JSON output, forwarding the same execution for consent and receipt capture. The pinned CLI API error PAT_BATCH_PRODUCT_NOT_FOUND may retain a freshly reverified partial identity on first connection, with plan_missing preserved; no test-organization domain subset or full grant is inferred. Cancellation, network/unknown failures, look-alike output and unresolved explicit scope/identity recovery still fail authorization. Available operations remain usable across a denied operation and adapter restart without login or replay. Only an authoritative remote plan can clear PAT gaps; local dry-run previews remain unavailable evidence, and identity/PAT success cannot clear independent OAuth gaps. WeCom keeps native robot binding and remote identity verification; no user OAuth scope or complete business-grant list is invented. Resource/recipient-only or unclassified business-access failures stay with the task and do not create card completeness warnings. Unavailable reports retain known evidence, newer denials remain recoverable, selected tools and other usable capabilities stay available, and no failed business action is replayed. Repeated page checks coalesce for one minute; authorization/manual refresh recheck, disconnect/account switch cancel, and no startup/timer scan is added.
 7. Isolate the account, device and catalog id. New Feishu/Lark connections use the unified profile; the hidden legacy `lark` id remains compatible. Disconnect waits asynchronously for provider logout, removes only the owned runtime directory and device connection record, and leaves other devices unchanged. Installation/logout timeouts terminate the full managed process tree. Unknown account-scoped connector ids remain preserved by older readers; local CLI records never enter the synced registry.
 8. stdio 适配层只暴露 `list_capabilities`、`describe_action`、`execute_read`、`execute_write`、`execute_high_impact` 和 `execute_destructive`。能力发现必须从受审业务根逐级读取官方 schema，执行前再次读取 exact leaf schema。
 9. auth/config/profile/schema/plugin/extension、原始 API、应用开发/发布和任意命令执行入口永久拒绝；固定域清单、包名、版本和 integrity 任一漂移都应在进程调用前失败。
@@ -151,6 +151,42 @@ grants, cancellation/partial-consent recovery, and a successful explicit operati
 retry. The pinned DWS 1.0.61 identity login does not implement that request; its separate full-domain PAT batch route is now used for initial business grants and reauthorization. Local identity
 fixtures and PAT grant tests do not satisfy this gate. WeCom business-permission
 verification likewise needs provider evidence beyond `identity whoami`.
+
+The 2026-10-29 pinned-DWS live check verified identity and an MCP
+`contact.user.get-self` read, but initial full-domain PAT authorization remains
+an **open acceptance gap**: the test organization rejects `hrbrain`, `recruit`
+and `whiteboard` with `PAT_BATCH_PRODUCT_NOT_FOUND`. Its other 18 domains pass
+the remote plan stage; no grant was issued by those diagnostic plan calls.
+Do not extrapolate that organization-specific domain set to other accounts.
+The pinned CLI's `pat chmod --dry-run --format json` emits a local
+`dry_run/request` preview, not a remote `allGranted` receipt. Preserve existing
+permission evidence when a check returns that preview, including a preview with
+success-shaped extra fields (`local-cli-files.test.ts`). Connecting available
+capabilities while retaining unsupported-domain gaps was confirmed by the requester
+on 2026-11-02 and implemented by `5b353084be` / `3c94665478`.
+
+The 2026-11-02 live canary on source `0e8e24e238` exercised the current
+authorization driver with the pinned native CLI and the dedicated test account.
+The full 21-domain request returned the exact structured PAT/API
+`PAT_BATCH_PRODUCT_NOT_FOUND` error; the driver exited 0 after identity
+revalidation and persisted `plan_missing`. A fresh native `auth status` reported
+authenticated. Two separate production `McpConnection`/stdio-adapter sessions
+each discovered six tools, classified `contact.user.get-self` as read-only and
+completed that read with provider success and one result. Both sessions closed;
+the permission gap survived reconnection and successful reads. A separate
+check-only invocation rejected the local preview (expected exit 1) without
+clearing that gap. Repeat this sequence in an isolated workspace when changing
+the initial partial-connection contract; never use a local preview as its grant
+oracle or replay a business operation to recover authorization.
+
+This is live macOS source-driver/adapter evidence, not installed-GUI connection
+creation, Windows, full-domain grants, incremental OAuth consent, cancellation
+or production-release acceptance. The supplier log retained two reviewed
+warnings: the asserted PAT template error and an audit-actor lookup of an absent
+legacy data file. Main emitted four INFO records and no warnings/errors.
+Provider stderr is drained by `McpConnection`, and earlier npm debug files
+rotated; complete internal-stream archival is therefore not established.
+Neither a successful identity nor a local preview closes full-grant acceptance.
 
 本轮问题挖掘发现并固定了这些缺陷：
 

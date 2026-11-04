@@ -157,7 +157,8 @@ function run(node, npxCli, packageSpec, args, env, allowExisting = false, offlin
       process.removeListener('SIGINT', forward);
       if (code === 0 || allowExisting) resolve(captureStdout && !overflow ? stdout : undefined);
       else reject(Object.assign(new Error(`official CLI exited with ${code ?? signal ?? 'unknown'}`), {
-        outputForwarded, ...(captureStdout && !overflow ? { stdout, stderr } : {}),
+        outputForwarded, exitCode: code, signal,
+        ...(captureStdout && !overflow ? { stdout, stderr } : {}),
       }));
     });
   });
@@ -344,7 +345,7 @@ function dingtalkPermissionPlan(output) {
   try {
     const receipt = JSON.parse(output);
     const data = receipt?.data || receipt?.result;
-    if (receipt?.success !== true || typeof data?.allGranted !== 'boolean') return null;
+    if (receipt?.dry_run === true || receipt?.success !== true || typeof data?.allGranted !== 'boolean') return null;
     const pending = data.pendingScopes === undefined ? [] : data.pendingScopes;
     const skipped = data.skippedScopes === undefined ? [] : data.skippedScopes;
     if (![pending, skipped].every(scopes => Array.isArray(scopes) && scopes.every(permissions.isScopeName))) return null;
@@ -369,8 +370,23 @@ function checkDingtalkPermissions(node, npxCli, manifest, env, runner = spawnSyn
   return true;
 }
 
+function dingtalkBatchProductUnavailable(error) {
+  // DWS 1.0.61 prints API failures through errors.PrintJSON on stderr.
+  // Only this exact PAT planning code is a capability gap. Process cancellation,
+  // network errors, prose and nested business data cannot establish that fact.
+  if (error?.exitCode !== 1 || error.signal || typeof error.stderr !== 'string'
+    || error.stderr.length > 64 * 1024) return false;
+  try {
+    const receipt = JSON.parse(error.stderr);
+    const body = receipt?.error;
+    return receipt?.success !== true && receipt?.ok !== true
+      && body?.code === 1 && body.category === 'api' && body.server_key === 'pat'
+      && body.server_error_code === 'PAT_BATCH_PRODUCT_NOT_FOUND';
+  } catch { return false; }
+}
+
 // Identity and PAT grants are separate. Use the pinned domain batch route for
-// complete initial access; never treat repeating OAuth login as a PAT receipt.
+// initial consent; never treat repeating OAuth login as a full PAT receipt.
 async function authorizeDingtalk(node, npxCli, manifest, env, dependencies = {}) {
   const execute = dependencies.execute
     || ((args, capture = false) => run(node, npxCli, manifest.package, args, env, false, true, capture));
@@ -386,9 +402,22 @@ async function authorizeDingtalk(node, npxCli, manifest, env, dependencies = {})
   let grantError;
   let output;
   try {
-    await execute([...grantArgs, '--format', 'table'], 'tee');
-    output = await execute([...grantArgs, '--format', 'json'], true);
+    // One consent execution supplies both interactive output and a structured
+    // receipt; do not repeat the grant merely to change its presentation.
+    output = await execute([...grantArgs, '--format', 'json'], 'tee');
   } catch (error) { grantError = error; }
+  if (dingtalkBatchProductUnavailable(grantError)) {
+    const current = permissions.readPermissionRequest(env);
+    permissions.recordDingtalkPermissionCheck(env, current,
+      { complete: false, missing: [] }, manifest.domains);
+    if (!ready()) throw new Error('official CLI authorization did not produce a verified identity');
+    const outstanding = permissions.readPermissionRequest(env);
+    // Initial connection may retain a verified partial identity. An explicit
+    // outstanding scope/identity recovery still has not been satisfied.
+    if (!outstanding?.plan_missing || outstanding.scopes.length || outstanding.pat_scopes?.length || outstanding.connector_level
+      || outstanding?.identity_denied || outstanding?.unresolved_access) throw grantError;
+    return;
+  }
   let receipt;
   try { receipt = JSON.parse(output); } catch { /* no verified receipt */ }
   const denial = permissions.structuredPermissionFailure({ status: 1,

@@ -209,7 +209,7 @@ describe('MCP stdio diagnostic boundary', () => {
       ...(mode.startsWith('app-') || mode === 'shared-runtime' ? [
         `  const { captureWindowsShutdownProcesses } = require(${JSON.stringify(path.resolve('src/main/util/windows-shutdown-processes.ts'))});`,
         `  const { createShutdownCoordinator } = require(${JSON.stringify(path.resolve('src/main/util/shutdown.ts'))});`,
-        '  const shutdown = createShutdownCoordinator({ captureProcesses: () => processSnapshot || captureWindowsShutdownProcesses(), localTasks: [{ name: "connectors", run: close }], sync: async () => {}, onFailure: name => { throw new Error(name); } });',
+        '  const shutdown = createShutdownCoordinator({ captureProcesses: () => processSnapshot || captureWindowsShutdownProcesses(), localTasks: [{ name: "connectors", run: close }], onFailure: name => { throw new Error(name); } });',
         '  await shutdown.prepare();',
       ] : ['  await close();']),
       `  const pid = Number(require('node:fs').readFileSync(${JSON.stringify(pidPath)}, 'utf8'));`,

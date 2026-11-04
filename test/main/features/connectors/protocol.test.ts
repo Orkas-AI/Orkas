@@ -84,6 +84,21 @@ describe('connector callback protocol', () => {
     expect(electronMock.window.focus).not.toHaveBeenCalled();
   });
 
+  it('keeps duplicate OS startup silent while manual launches and connector callbacks restore the window', async () => {
+    const protocol = await import('../../../../src/main/features/connectors/protocol');
+    protocol.registerConnectorProtocol();
+    const secondInstance = electronMock.listeners.get('second-instance')!;
+    secondInstance({}, ['--orkas-startup']);
+    expect(electronMock.window.show).not.toHaveBeenCalled();
+    expect(connectorMock.handleCallbackUrl).not.toHaveBeenCalled();
+    secondInstance({}, []);
+    expect(electronMock.window.show).toHaveBeenCalledOnce();
+    electronMock.window.show.mockClear();
+    secondInstance({}, ['--orkas-startup', 'orkas://connectors/oauth/callback?exchange_code=startup']);
+    await vi.waitFor(() => expect(connectorMock.handleCallbackUrl).toHaveBeenCalledOnce());
+    expect(electronMock.window.show).toHaveBeenCalledOnce();
+  });
+
   it('does not intercept stripped account-login links', async () => {
     const protocol = await import('../../../../src/main/features/connectors/protocol');
     protocol.registerConnectorProtocol();

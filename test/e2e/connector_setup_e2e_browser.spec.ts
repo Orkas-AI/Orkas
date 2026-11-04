@@ -79,7 +79,7 @@ async function prepare(orkas: OrkasTestApp, url: string) {
   };
   const setup = (input: Record<string, unknown>) => call('setup', { connector_id: connectorId, ...input });
   const browser = (input: Record<string, unknown>) => call('browser', input);
-  expect(await setup({ operation: 'start' })).toMatchObject({ ok: true, web_assist: { opened: true } });
+  expect(await setup({ operation: 'show' })).toMatchObject({ ok: true, web_assist: { opened: true } });
   expect(await setup({ operation: 'page_wait' })).toMatchObject({ ok: true });
   const initial = await setup({ operation: 'page_observe' });
   expect(initial.ok).toBe(true);
@@ -126,7 +126,7 @@ test('connector setup continues through browser readback, visual navigation and 
     expect(await browser({ operation: 'read_value', tab_id: tabId, page_id: initial.page_id, element_ref: field.ref }))
       .toMatchObject({ ok: true, value: 'Pending application' });
     expect(await setup({ operation: 'page_observe' })).toMatchObject({ ok: true, tab_id: tabId });
-    expect(await setup({ operation: 'start' })).toMatchObject({ web_assist: { opened: true } });
+    expect(await setup({ operation: 'show' })).toMatchObject({ web_assist: { opened: true } });
     expect((await browser({ operation: 'tabs' })).tabs.map((tab: any) => tab.tab_id)).toEqual([tabId]);
 
     const observation = await browser({ operation: 'observe', tab_id: tabId });
@@ -165,7 +165,7 @@ test('connector setup continues through browser readback, visual navigation and 
       (globalThis as any).__connectorBrowserTools.browser = req(args.root + '/src/main/features/group_chat/browser_tool.ts')
         .buildConversationBrowserTool('account-e2e', args.cid);
     }, { root, cid });
-    expect(await setup({ operation: 'start' })).toMatchObject({ web_assist: { opened: true } });
+    expect(await setup({ operation: 'show' })).toMatchObject({ web_assist: { opened: true } });
     expect((await browser({ operation: 'tabs' })).tabs.map((tab: any) => tab.tab_id)).toEqual([tabId]);
     expect(saved).toEqual(['Exact callback draft']);
   } finally {
@@ -244,7 +244,7 @@ test('setup restart preserves the native draft when another debugger makes page 
       (globalThis as any).__connectorObservationFault = contents;
     }, { root, url });
     expect(await setup({ operation: 'page_observe' })).toMatchObject({ ok: false, code: 'observation_failed' });
-    expect(await setup({ operation: 'start' })).toMatchObject({ ok: true, web_assist: { opened: true },
+    expect(await setup({ operation: 'show' })).toMatchObject({ ok: true, web_assist: { opened: true },
       connector: { connection: { configured: false, status: 'not_configured' } } });
     expect((await browser({ operation: 'tabs' })).tabs.map((tab: any) => tab.tab_id)).toEqual([tabId]);
     const retained = await orkas.electronApp!.evaluate(async (_electron, args) => {
@@ -392,7 +392,7 @@ test('connector setup resumes after native login and OTP handback without losing
     // The human returns to the conversation after login. Keep the page's full
     // idle lease; only native focus changes, as when typing an acknowledgement.
     await orkas.electronApp!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.focus());
-    expect(await setup({ operation: 'start' })).toMatchObject({ web_assist: { opened: true } });
+    expect(await setup({ operation: 'show' })).toMatchObject({ web_assist: { opened: true } });
     expect((await browser({ operation: 'tabs' })).tabs.map((tab: any) => tab.tab_id)).toEqual([tabId]);
     const loginReady = await setup({ operation: 'page_wait' });
     expect(loginReady, `Login continuation: ${loginReady.code || 'ready'}; timeout=${loginReady.timeout_ms || 0}`)
@@ -425,7 +425,7 @@ test('connector setup resumes after native login and OTP handback without losing
     expect(verifications).toEqual([]);
     await human('#verification button');
     await expect.poll(() => verifications).toEqual([{ trusted: true, draft: 'Retained merchant application' }]);
-    expect(await setup({ operation: 'start' })).toMatchObject({ web_assist: { opened: true } });
+    expect(await setup({ operation: 'show' })).toMatchObject({ web_assist: { opened: true } });
     // Recovery must also work with this task hidden, without another chrome click.
     await orkas.page!.evaluate(() => (window as any).setView('connectors'));
     expect(await setup({ operation: 'page_wait', wait_condition: 'text', text: 'Verification complete' })).toMatchObject({ ok: true });

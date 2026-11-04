@@ -403,6 +403,7 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
     });
   }
 
+  let exchangeResponse: { kind: PendingFlow['kind']; api_result: 'success' | 'rejected' | 'invalid'; required_fields_present: boolean } | undefined;
   try {
     if (pending.kind === 'composio') {
       const res = await postConnectorBridgeJson(
@@ -416,6 +417,10 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
       if (_pending !== pending) return;
       const body = _parseJsonObject(raw);
       if (!res.ok || Number(body.code || 0) !== 0) {
+        exchangeResponse = { kind: pending.kind,
+          api_result: body.code === 0 ? 'success' : typeof body.code === 'number' ? 'rejected' : 'invalid',
+          required_fields_present: !!(body.connection_id && body.toolkit && body.auth_config_id),
+        };
         throw _flowError(
           String(body.msg || `Composio exchange HTTP ${res.status}`),
           _exchangeHttpCode(res.status),
@@ -426,6 +431,10 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
       const toolkit = String(body.toolkit || '');
       const authConfigId = String(body.auth_config_id || '');
       if (!connectionId || !toolkit || !authConfigId) {
+        exchangeResponse = { kind: pending.kind,
+          api_result: body.code === 0 ? 'success' : typeof body.code === 'number' ? 'rejected' : 'invalid',
+          required_fields_present: false,
+        };
         throw _flowError('invalid Composio exchange response', 'invalid_exchange_response');
       }
       if (!/^[A-Za-z0-9_-]{43}$/.test(connectionToken)) {
@@ -475,6 +484,10 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
     // A cancelled or superseded exchange must not settle the replacement flow.
     if (_pending !== pending) return;
     if (body.code !== 0 || !body.access_token) {
+      exchangeResponse = { kind: pending.kind,
+        api_result: body.code === 0 ? 'success' : typeof body.code === 'number' ? 'rejected' : 'invalid',
+        required_fields_present: !!body.access_token,
+      };
       throw _flowError(body.msg || 'invalid exchange response', 'invalid_exchange_response');
     }
     const expires_at = typeof body.expires_in === 'number' ? Date.now() + body.expires_in * 1000 : null;
@@ -519,7 +532,10 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
     }
   } catch (err) {
     if (_pending !== pending) return;
-    log.warn('connector OAuth exchange failed', { error: logErrorSummary(err) });
+    log.warn('connector OAuth exchange failed', {
+      error: logErrorSummary(err),
+      ...(exchangeResponse ? { exchange_response: exchangeResponse } : {}),
+    });
     const code = (err as { code?: unknown }).code;
     // A thrown network/timeout error carries no code of its own — still tag the stage so these do
     // not fall into the untyped bucket. The renderer's error_type derives network/timeout from the

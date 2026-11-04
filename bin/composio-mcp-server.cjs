@@ -3,7 +3,12 @@ require('./proxy-bootstrap.cjs');
 
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
-const { ListToolsRequestSchema, CallToolRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
+const {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+  McpError,
+  ErrorCode,
+} = require('@modelcontextprotocol/sdk/types.js');
 
 const API_BASE = (process.env.ORKAS_API_BASE || '').replace(/\/+$/, '');
 const API_KEY = process.env.ORKAS_API_KEY || '';
@@ -15,12 +20,57 @@ const TOOLS_REQUEST_TIMEOUT_MS = 25000;
 const EXECUTE_REQUEST_TIMEOUT_MS = 590000;
 const CREDIT_CONTEXT_ARG = '__orkas_credit_context';
 
+function withinErrorBudget(value) {
+  let nodes = 0;
+  let chars = 0;
+  function visit(item, depth) {
+    if (++nodes > 640 || depth > 16) return false;
+    if (typeof item === 'string') chars += item.length;
+    if (chars > 40000) return false;
+    if (Array.isArray(item)) {
+      if (item.length > 640) return false;
+      for (const child of item) if (!visit(child, depth + 1)) return false;
+    } else if (item && typeof item === 'object') {
+      for (const key in item) {
+        if (!Object.hasOwn(item, key)) continue;
+        chars += key.length;
+        if (chars > 40000 || !visit(item[key], depth + 1)) return false;
+      }
+    }
+    return true;
+  }
+  return visit(value, 0);
+}
+
+// Server owns sensitive-data filtering. Treat its original response as opaque;
+// never translate unfamiliar codes, reasons or nested provider fields.
+function publicFailureDetails(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+      || !Object.hasOwn(value, 'response') || typeof value.redacted !== 'boolean'
+      || typeof value.truncated !== 'boolean') return undefined;
+  const details = { response: value.response, redacted: value.redacted, truncated: value.truncated,
+    ...(Number.isInteger(value.http_status) && value.http_status >= 100 && value.http_status <= 599
+      ? { http_status: value.http_status } : {}),
+    ...(typeof value.retry_after === 'string' ? { retry_after: value.retry_after } : {}),
+    ...(value.invalid_json === true ? { invalid_json: true } : {}),
+    ...(value.private_context_limited === true ? { private_context_limited: true } : {}),
+  };
+  // Normal Server projections are <=32K text. Keep protocol serialization
+  // bounded before serialization, with an explicit marker when incomplete.
+  if (!withinErrorBudget(details)) {
+    return { response: '[truncated]', redacted: value.redacted, truncated: true,
+      ...(details.http_status ? { http_status: details.http_status } : {}) };
+  }
+  return details;
+}
+
 class OrkasProxyResponseError extends Error {
-  constructor(message, status, code) {
+  constructor(message, status, code, details) {
     super(message);
     this.name = 'OrkasProxyResponseError';
     this.status = Number(status) || 0;
     this.code = String(code || 'connector_proxy_failed');
+    this.details = publicFailureDetails(details);
   }
 }
 
@@ -105,11 +155,9 @@ async function orkasRequest(path, body, timeoutMs, signal) {
   } catch { payload = {}; }
   if (!res.ok || payload.code !== 0) {
     const err = payload.error && typeof payload.error === 'object' ? payload.error : {};
-    throw new OrkasProxyResponseError(
-      boundedMessage(parsedJson ? (payload.msg || err.message) : '', 'Connector action failed'),
-      res.status,
-      boundedErrorCode(parsedJson ? (err.code || err.type) : ''),
-    );
+    const code = boundedErrorCode(parsedJson ? (err.code || err.type) : '');
+    const detail = boundedMessage(parsedJson ? (payload.msg || err.message) : '', 'Connector action failed');
+    throw new OrkasProxyResponseError(detail, res.status, code, err.details);
   }
   return payload;
 }
@@ -127,8 +175,23 @@ async function callComposioTool(name, value, request = orkasRequest, signal) {
     if (!(err instanceof OrkasProxyResponseError)) throw err;
     return {
       isError: true,
-      content: [{ type: 'text', text: JSON.stringify({ error_code: err.code, message: err.message }) }],
+      content: [{
+        type: 'text',
+        text: JSON.stringify(err.details || { error_code: err.code, message: err.message }),
+      }],
     };
+  }
+}
+
+async function listComposioTools(request = orkasRequest) {
+  try {
+    const body = await request('/connectors/composio/tools', {}, TOOLS_REQUEST_TIMEOUT_MS);
+    return { tools: Array.isArray(body.tools) ? body.tools.map(normalizeTool).filter(Boolean) : [] };
+  } catch (err) {
+    // tools/list has no operation-level isError envelope. Preserve the same
+    // public cause in the SDK's established JSON-RPC diagnostic field instead.
+    if (!(err instanceof OrkasProxyResponseError) || !err.details) throw err;
+    throw new McpError(ErrorCode.InternalError, JSON.stringify(err.details), err.details);
   }
 }
 
@@ -176,13 +239,13 @@ async function main() {
     { name: `orkas-composio-${CONNECTOR_ID || 'connector'}`, version: '1.0.0' },
     { capabilities: { tools: {} } },
   );
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const body = await orkasRequest('/connectors/composio/tools', {}, TOOLS_REQUEST_TIMEOUT_MS);
-    return { tools: Array.isArray(body.tools) ? body.tools.map(normalizeTool).filter(Boolean) : [] };
+
+  server.setRequestHandler(ListToolsRequestSchema, () => listComposioTools());
+
+  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
+    return callComposioTool(req.params.name, req.params.arguments, orkasRequest, extra.signal);
   });
-  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => (
-    callComposioTool(req.params.name, req.params.arguments, orkasRequest, extra.signal)
-  ));
+
   await server.connect(new StdioServerTransport());
 }
 
@@ -200,5 +263,6 @@ module.exports = {
   OrkasProxyResponseError,
   splitComposioToolArguments,
   callComposioTool,
+  listComposioTools,
   normalizeTool,
 };

@@ -247,3 +247,28 @@ describe('connectors renderer cache', () => {
     expect(context.window.connectorNavTarget('gcal')).toEqual({ name: 'Google Calendar', iconSvg: '' });
   });
 });
+
+
+it('waits for a superseding connector refresh before a navigation caller can focus its final card', async () => {
+  const { context } = loadConnectorsRenderer();
+  const pending: Array<{ channel: string; resolve: (value: unknown) => void }> = [];
+  context.window.orkas.invoke = (channel: string) => new Promise(resolve => pending.push({ channel, resolve }));
+  let settled = false;
+  const navigation = context.loadConnectors().then(() => { settled = true; });
+  const refresh = context.loadConnectors();
+  expect(pending.map(row => row.channel)).toEqual([
+    'connectors.catalog', 'connectors.list', 'connectors.catalog', 'connectors.list',
+  ]);
+  try {
+    pending[0].resolve({ ok: true, catalog: [{ id: 'obsolete' }] });
+    pending[1].resolve({ ok: true, instances: [] });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(settled).toBe(false);
+  } finally {
+    pending[2].resolve({ ok: true, catalog: [{ id: 'current' }] });
+    pending[3].resolve({ ok: true, instances: [] });
+    await Promise.all([navigation, refresh]);
+  }
+  expect(vm.runInContext('_connectorsState.catalog.map(row => row.id)', context)).toEqual(['current']);
+  expect(pending).toHaveLength(4);
+});
