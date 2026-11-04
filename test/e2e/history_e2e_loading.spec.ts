@@ -1,3 +1,4 @@
+import { INTERACTIVE_MAIN_GAP_LIMIT_MS } from '../helpers/latency-budget';
 import { finished } from 'node:stream/promises';
 import { expectComposerText } from './fixtures/composer';
 import path from 'node:path';
@@ -5,6 +6,7 @@ import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node
 import { createPackageWithOptions } from '@electron/asar';
 import { expect, test, OrkasTestApp } from './fixtures/orkas';
 import { analyzeWebAppLogs } from './fixtures/web-app-log-analysis';
+import { formatProcessLogSummary } from '../../scripts/model-eval-log-policy.mjs';
 import { installEmptyLibrarySearch } from './fixtures/empty-library-search';
 
 const pcRoot = path.resolve(__dirname, '../..');
@@ -34,7 +36,7 @@ test.afterEach(async ({}, info) => {
   const analysis = { ...analyzeWebAppLogs(classified), phase: 'history-loading', debuggerDisconnects };
   writeFileSync(info.outputPath('log-analysis.json'), JSON.stringify(analysis, null, 2));
   expect(analysis.passed, 'Review log-analysis.json for errors or incomplete coverage').toBe(true);
-  if (analysis.requiresReview) console.warn('History E2E log warnings:', JSON.stringify(analysis.findings));
+  if (analysis.requiresReview) console.info(formatProcessLogSummary(analysis));
 });
 
 test('updates settled message actions in place when the user changes language', async ({}, info) => {
@@ -448,6 +450,7 @@ test('scrolls forward from a search hit and keeps a sent reply reachable when a 
     const openSearchHit = async () => {
       await page.locator('#sidebar-search-btn').click();
       await page.locator('#search-input').fill('middlepageanchor');
+      await page.locator('#search-input').press('Enter');
       const hit = page.locator('#search-body .search-result').filter({ hasText: 'middlepageanchor' });
       await expect(hit).toHaveCount(1);
       await hit.click();
@@ -681,7 +684,7 @@ test('opens large history through IPC, preserves formulas and expands complete t
     }, { root: pcRoot, cid });
     writeFileSync(testInfo.outputPath('history-performance.json'), JSON.stringify(evidence));
     await testInfo.attach('history-performance.json', { body: JSON.stringify(evidence), contentType: 'application/json' });
-    expect(evidence.gap).toBeLessThan(150);
+    expect(evidence.gap).toBeLessThan(INTERACTIVE_MAIN_GAP_LIMIT_MS);
     expect(evidence.lazyComplete).toBe(true);
     expect(evidence.ids).toEqual(Array.from({ length: 10 }, (_, i) => `history-${i + 20}`));
     const result = await app.invoke<any>('conversations.history', { cid, limit: '10', live: '1' });
@@ -842,7 +845,7 @@ test('builds cold turn navigation without flashing formulas, accepts input and j
       const probe = (globalThis as any).turnProbe; clearInterval(probe.timer); return { gap: probe.gap, ticks: probe.ticks };
     });
     expect(timing.ticks).toBeGreaterThan(0);
-    expect(timing.gap).toBeLessThan(150);
+    expect(timing.gap).toBeLessThan(INTERACTIVE_MAIN_GAP_LIMIT_MS);
     writeFileSync(testInfo.outputPath('turn-navigation-performance.json'), JSON.stringify({ ...timing, ...visual }));
     // This turn is outside the mounted latest ten messages. Clicking its real
     // rail marker must load an anchored window and render its exact formula.

@@ -27,32 +27,25 @@ function timeBucket(iso, now) {
   return 'older';
 }
 
-// Rows whose sidebar activity falls in today's or yesterday's local bucket, in
-// input order. Feeds the sidebar "Recent Tasks" section with the same
-// `last_active_at` reading as the bucketed lists, so a row is never under
-// "Today"/"Yesterday" in one list and missing from the aggregate. Using the
-// calendar buckets (not a rolling 48h) keeps the section stable within a day:
-// it only changes when a conversation gets a new message or when the local date
-// rolls over, which is when the list already re-renders.
-const _RECENT_BUCKETS = new Set(['today', 'yesterday']);
+// Unpinned Recent Tasks use elapsed time, independent of calendar-day headings.
+// Pinned tasks remain members regardless of their activity timestamp.
+// Membership is checked on normal list refreshes, reopening and foregrounding.
+const _RECENT_TASK_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 function selectRecentConversations(rows, now) {
+  const sinceMs = recentConversationsSince(now).getTime();
   const out = [];
   for (const c of Array.isArray(rows) ? rows : []) {
     if (!c || !c.conversation_id) continue;
     const iso = c.last_active_at || c.updated_at || c.created_at || '';
-    if (_RECENT_BUCKETS.has(timeBucket(iso, now))) out.push(c);
+    if (c.pinned_at || (iso && new Date(iso).getTime() >= sinceMs)) out.push(c);
   }
   return out;
 }
 
-// Local start of yesterday: the lower bound the startup slice must load so
-// rows under collapsed projects reach the Recent Tasks section.
+// Use the same lower bound when loading rows under collapsed projects.
 function recentConversationsSince(now) {
-  const d = new Date(now || new Date());
-  d.setHours(0, 0, 0, 0);
-  d.setDate(d.getDate() - 1);
-  return d;
+  return new Date(new Date(now || new Date()).getTime() - _RECENT_TASK_WINDOW_MS);
 }
 
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {

@@ -14,7 +14,8 @@
  * inside a turn creates the project here and leaves the move to the host at
  * the next quiescent boundary.
  *
- * Filing creates a fresh local project; existing projects are never retargeted.
+ * Existing-project moves only admit the current local user's projects and leave
+ * bindings and other resources unchanged.
  */
 
 import { createLogger } from '../logger';
@@ -197,13 +198,61 @@ export async function unfileConversation(
   opts: { moveNow?: boolean } = {},
 ): Promise<chats.ConversationMoveResult> {
   if (opts.moveNow !== false) return chats.moveConversationOutOfProject(userId, cid);
+  const key = _pendingKey(userId, cid);
+  const pending = _pendingFilings.get(key);
+  if (_filingsInProgress.has(key) || (pending && pending.kind !== 'unfile')) {
+    return { ok: false, error: 'move_failed' };
+  }
   // Undoing has the same constraint as filing: the relocation refuses while the
   // turn holds the session files open, so it waits for the same boundary.
-  const conversation = await chats.getConversationMetadata(userId, cid);
-  if (!conversation) return { ok: false, error: 'not_found' };
-  if (!conversation.project_id) return { ok: false, error: 'not_in_project' };
-  _pendingFilings.set(_pendingKey(userId, cid), { kind: 'unfile' });
-  return { ok: true, conversation };
+  _filingsInProgress.add(key);
+  try {
+    const conversation = await chats.getConversationMetadata(userId, cid);
+    if (!conversation) return { ok: false, error: 'not_found' };
+    if (!conversation.project_id) return { ok: false, error: 'not_in_project' };
+    _pendingFilings.set(key, { kind: 'unfile' });
+    return { ok: true, conversation };
+  } finally { _filingsInProgress.delete(key); }
+}
+
+type ExistingProjectMoveError = 'not_found' | 'project_not_found' | 'project_ambiguous'
+  | 'forbidden' | 'already_in_project' | 'relocation_pending';
+
+function privateMoveTargetError(userId: string, project: projects.Project | null): ExistingProjectMoveError | undefined {
+  if (!project) return 'project_not_found';
+  if (project.owner_uid !== userId) return 'forbidden';
+}
+
+/** Queue only the current conversation; the selector can never create a project
+ * or retarget an already-reserved relocation. Repeated same-target calls are idempotent. */
+export async function moveConversationToExistingProject(
+  userId: string, cid: string, target: string,
+): Promise<{ ok: true; project: projects.Project; applies: 'now' | 'when_this_turn_ends' }
+  | { ok: false; error: ExistingProjectMoveError }> {
+  const key = _pendingKey(userId, cid);
+  if (_filingsInProgress.has(key)) return { ok: false, error: 'relocation_pending' };
+  _filingsInProgress.add(key);
+  try {
+    // Reuse cached metadata-only rows; do not scan conversation counts or task stores.
+    const rows = await projects.listProjectNameRows(userId);
+    const matches = rows.filter(row => row.project_id === target || row.name === target);
+    if (!matches.length) return { ok: false, error: 'project_not_found' };
+    if (matches.length !== 1) return { ok: false, error: 'project_ambiguous' };
+    const project = await projects.getProject(userId, matches[0].project_id);
+    const error = privateMoveTargetError(userId, project);
+    if (error) return { ok: false, error };
+    const conversation = await chats.getConversationMetadata(userId, cid);
+    if (!conversation) return { ok: false, error: 'not_found' };
+    const pending = _pendingFilings.get(key);
+    if (pending && (pending.kind !== 'move' || pending.projectId !== project!.project_id)) {
+      return { ok: false, error: 'relocation_pending' };
+    }
+    if (conversation.project_id) return conversation.project_id === project!.project_id
+      ? { ok: true, project: project!, applies: 'now' }
+      : { ok: false, error: 'already_in_project' };
+    _pendingFilings.set(key, { kind: 'move', projectId: project!.project_id });
+    return { ok: true, project: project!, applies: 'when_this_turn_ends' };
+  } finally { _filingsInProgress.delete(key); }
 }
 
 // ── Deferred filing ──────────────────────────────────────────────────────
@@ -219,6 +268,7 @@ export async function unfileConversation(
 
 type PendingRelocation =
   | { kind: 'file'; projectId: string; projectName: string; todosCreated: number }
+  | { kind: 'move'; projectId: string }
   | { kind: 'unfile' };
 
 const _pendingFilings = new Map<string, PendingRelocation>();
@@ -284,7 +334,8 @@ export function onConversationFiled(cb: FiledListener): void {
 
 type FilingFailedListener = (event: {
   userId: string; cid: string; projectId: string; projectName: string; todosCreated: number;
-} | { userId: string; cid: string; kind: 'unfile' }) => void;
+} | { userId: string; cid: string; kind: 'unfile' }
+  | { userId: string; cid: string; kind: 'move'; projectId: string }) => void;
 const _filingFailedListeners: FilingFailedListener[] = [];
 
 /** Notify the owner once; retry uses the existing picker and project. */
@@ -312,7 +363,12 @@ export async function drainConversationFiling(
   }
   let moved: chats.ConversationMoveResult;
   try {
-    moved = pending.kind === 'file'
+    if (pending.kind === 'move') {
+      // Revalidate the destination while the reply streams.
+      const error = privateMoveTargetError(userId, await projects.getProject(userId, pending.projectId));
+      moved = error ? { ok: false, error: 'move_failed' }
+        : await chats.moveConversationToProject(userId, cid, pending.projectId);
+    } else moved = pending.kind === 'file'
       ? await chats.moveConversationToProject(userId, cid, pending.projectId)
       : await chats.moveConversationOutOfProject(userId, cid);
   } catch (error) {
@@ -324,7 +380,7 @@ export async function drainConversationFiling(
       + ` reason=${(moved as { error: string }).error}`);
     for (const cb of _filingFailedListeners) {
       try {
-        cb(pending.kind === 'file'
+        cb(pending.kind === 'move' ? { userId, cid, kind: 'move', projectId: pending.projectId } : pending.kind === 'file'
           ? { userId, cid, projectId: pending.projectId, projectName: pending.projectName, todosCreated: pending.todosCreated }
           : { userId, cid, kind: 'unfile' });
       } catch { /* a listener must never break terminal cleanup */ }

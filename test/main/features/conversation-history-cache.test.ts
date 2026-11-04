@@ -564,7 +564,12 @@ describe('conversation history projection cache', () => {
     const { storeProcessPages, processPageReference, readProcessPage, processCacheDirectory } = await import('../../../src/main/features/conversation-process-cache');
     const items: any[] = Array.from({ length: 201 }, (_, n) => ({ type: 'progress', text: `${n}` }));
     items[0] = { type: 'progress', text: 'x'.repeat(16 * 1024 - 1) + '🌟界\n\t"\\' + String.fromCharCode(0xd800),
-      nested: [undefined, NaN, Infinity, -0, { omit: undefined, escaped: '\b', boxed: new Number(7) }] };
+      nested: [undefined, NaN, Infinity, -0, { omit: undefined, escaped: '\b', boxed: new Number(7) }],
+      // Native JSON is the independent oracle at the short-string and old
+      // chunk boundaries, including bytes that expand during escaping.
+      boundaries: [2047, 2048, 2049, 16383, 16384, 16385].flatMap(length =>
+        ['x', '界', '\n', String.fromCharCode(0xd800)].map(unit => unit.repeat(length))),
+    };
     items[200] = { toJSON(key: string) { return { type: 'progress', text: `JSON key ${key}` }; } };
     const expected = createHash('sha256');
     for (let n = 0; n < items.length; n += 200) expected.update(JSON.stringify(items.slice(n, n + 200)) + '\n');

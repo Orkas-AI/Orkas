@@ -99,8 +99,8 @@ for (const surface of ['hidden-window', 'other-panel', 'other-task'] as const) {
       } else {
         await page.evaluate(cid => (window as any).setView('conversation', cid), cid);
       }
-      // Recovery can reserve a hidden, actor-less observer placeholder. Only
-      // visible replies represent duplicate output to the user.
+      // Recovery may reserve an actor-neutral, display:none row until the
+      // terminal bus event drains. Only the delivered row is user-visible.
       const replies = page.locator('#chat-history .chat-message.assistant:visible');
       await expect(replies).toHaveCount(1);
       await expect(replies).toContainText('Hello from the local E2E model.');
@@ -110,6 +110,7 @@ for (const surface of ['hidden-window', 'other-panel', 'other-task'] as const) {
         modelOrkas.finishControlledModelStream();
       }
       await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+      await expect(page.locator('#chat-history .chat-message.assistant')).toHaveCount(1);
       expect(persisted().filter(row => row.from === 'commander')).toHaveLength(1);
       expect(modelOrkas.modelRequests).toHaveLength(1);
     });

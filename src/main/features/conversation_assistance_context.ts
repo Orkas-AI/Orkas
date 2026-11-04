@@ -322,15 +322,21 @@ export async function resolveConversationAssistanceForTurn(
     ? await automationRunGuidance(userId, cid, conversation.origin_auto_task_id)
     : { guidance: '' };
   const automationRun = automation.guidance;
-  const followUp = finalDelivery ? prompts.load('followup_offer_guidance').trim() : '';
+  // A conversation an automation created already recurs and has no one to
+  // accept an offer, so it gets neither offer block.
+  const followUp = finalDelivery && !conversation.origin_auto_task_id
+    ? prompts.load('followup_offer_guidance').trim()
+    : '';
   // Project membership gates only the new-project offer. Recurring work and
-  // its consent rules also apply inside a project or during relocation.
-  const projectOffer = finalDelivery && !conversation.project_id
-    && !hasPendingConversationFiling(userId, cid)
+  // its consent rules also apply inside a project or during relocation. Only
+  // the Commander holds the project executor, so only it is told to offer one.
+  const projectOffer = commander && finalDelivery && !conversation.origin_auto_task_id
+    && !conversation.project_id && !hasPendingConversationFiling(userId, cid)
     ? prompts.load('project_offer_guidance').trim()
     : '';
-  // Scope must be known before tool selection, including a direct navigation
-  // reply with no task tool loaded and no global task snapshot to inject.
+  // A brand-new account's finished one-off task gives no reason to return, so
+  // every final deliverer, the welcome conversation included, may suggest one
+  // next use. An automation's own conversation has no one to read it.
   const todoScope = finalDelivery && !conversation.project_id
     ? prompts.load('global_todo_scope').trim()
     : '';

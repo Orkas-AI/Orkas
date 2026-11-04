@@ -109,7 +109,42 @@ export type VersionProbeResult =
  * intentionally grouped as `failed`; callers only need a distinct timeout
  * state for accurate user-facing recovery copy.
  */
+let activeProbes = 0;
+const probeWaiters: Array<() => void> = [];
+async function acquireProbe(waitMs: number): Promise<(() => void) | null> {
+  if (activeProbes < 2) activeProbes += 1;
+  else {
+    const admitted = await new Promise<boolean>(resolve => {
+      const next = () => { clearTimeout(timer); resolve(true); };
+      const timer = setTimeout(() => {
+        const index = probeWaiters.indexOf(next);
+        if (index >= 0) probeWaiters.splice(index, 1);
+        resolve(false);
+      }, waitMs);
+      timer.unref?.();
+      probeWaiters.push(next);
+    });
+    if (!admitted) return null;
+  }
+  return () => {
+    const next = probeWaiters.shift();
+    if (next) next();
+    else activeProbes -= 1;
+  };
+}
+
 export async function detectVersionResult(
+  binPath: string,
+  timeoutMs = 5000,
+  versionArgs: readonly string[] = ['--version'],
+): Promise<VersionProbeResult> {
+  const release = await acquireProbe(timeoutMs);
+  if (!release) return { status: 'timeout', version: null };
+  try { return await probeVersion(binPath, timeoutMs, versionArgs); }
+  finally { release(); }
+}
+
+async function probeVersion(
   binPath: string,
   timeoutMs = 5000,
   versionArgs: readonly string[] = ['--version'],

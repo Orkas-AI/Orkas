@@ -12,6 +12,62 @@ const index = fs.readFileSync(path.join(renderer, 'index.html'), 'utf8');
 const mathConfig = index.slice(index.indexOf('window.MathJax = {'), index.indexOf('</script>', index.indexOf('window.MathJax = {')));
 const capturedLogs = new WeakMap<Page, Array<{ level: string; message: string }>>();
 
+test('resolves scoped task previews after delayed final math and preserves complete visible characters', async ({ page }) => {
+  await setup(page);
+  await page.evaluate(() => {
+    const w = window as any;
+    w.currentUserId = 'fixture-user';
+    w.taskReferenceReads = [];
+    w.orkas.invoke = async (_channel: string, payload: any) => {
+      w.taskReferenceReads.push(payload.references);
+      return { ok: true, references: [{ kind: 'todo', task_id: 't_123456789abc', project_id: 'p_source',
+        title: '👨‍👩‍👧‍👦一二三四五六七八九十甲乙丙丁戊' }] };
+    };
+    w.typesetMathHtml = async (html: string) => {
+      await new Promise<void>(resolve => { w.releaseFinalTaskMath = resolve; });
+      return html;
+    };
+    w._streamingSetFinal(w.msg, 'Saved `t_123456789abc`. Formula \\(x^2\\).');
+    w._mountSavedTaskChips(w.msg, [{ kind: 'todo', task_id: 't_123456789abc', project_id: 'p_source', title: 'Receipt' }]);
+    w._appNavLoadFeature = async (_feature: string, run: Function) => run();
+    w.focusTodo = (pid: string, id: string) => { w.openedTask = [pid, id]; };
+  });
+  await expect.poll(() => page.evaluate(() => typeof (window as any).releaseFinalTaskMath)).toBe('function');
+  await page.evaluate(() => (window as any).releaseFinalTaskMath());
+  const preview = page.locator('[data-role="final"] button.chat-task-reference');
+  await expect(preview).toHaveText('👨‍👩‍👧‍👦一二三四五六七八九十甲乙丙丁…');
+  await expect(preview).toHaveAttribute('title', '👨‍👩‍👧‍👦一二三四五六七八九十甲乙丙丁戊');
+  expect(await page.evaluate(() => (window as any).taskReferenceReads)).toEqual([
+    [{ kind: 'todo', task_id: 't_123456789abc', project_id: 'p_source', fallback_global: false }],
+  ]);
+  await preview.focus();
+  await page.keyboard.press('Enter');
+  expect(await page.evaluate(() => (window as any).openedTask)).toEqual(['p_source', 't_123456789abc']);
+});
+
+test('keeps unresolved task IDs literal and resolves fresh content when the reply reopens', async ({ page }) => {
+  await setup(page);
+  await page.evaluate(() => {
+    const w = window as any;
+    w.currentUserId = 'fixture-user';
+    w.orkas.invoke = async () => ({ ok: false });
+    w._streamingSetFinal(w.msg, 'Saved `t_123456789abc`.');
+    w._mountSavedTaskChips(w.msg, []);
+  });
+  await page.evaluate('_chatTaskReferenceReads');
+  await expect(page.locator('[data-role="final"] button.chat-task-reference')).toHaveCount(0);
+  await expect(page.locator('[data-role="final"] code')).toHaveText('t_123456789abc');
+  await page.evaluate(() => {
+    const w = window as any;
+    w.orkas.invoke = async () => ({ ok: true, references: [{ kind: 'todo', task_id: 't_123456789abc',
+      project_id: '', title: '123456789012345' }] });
+    w._setStreamingFinalHtml(w.msg.querySelector('[data-role="final"]'),
+      `<div class="markdown-body">${w._renderMessageMarkdown('Saved `t_123456789abc`.')}</div>`);
+    w._mountSavedTaskChips(w.msg, []);
+  });
+  await expect(page.locator('[data-role="final"] button.chat-task-reference')).toHaveText('123456789012345');
+});
+
 test('renders process commentary formulas and retains completed formulas as the prose grows', async ({ page }) => {
   await setup(page);
   await page.evaluate(() => {

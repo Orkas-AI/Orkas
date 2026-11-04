@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
 
 const UID = 'u-artifact-001';
 const CID = 'conv-art-1';
@@ -528,7 +529,7 @@ describe('chat_artifacts › application type input', () => {
     const result = await m.createArtifact(UID, CID, AGENT, { appType, files: MIN_FILES });
     expect(result).toEqual({ ok: false, error: 'app type must match the task or editing source' });
     expect(fs.existsSync(cidDir()) ? fs.readdirSync(cidDir()) : []).toEqual([]);
-    expect(m.listArtifacts(UID, CID)).toEqual([]);
+    expect(await m.listArtifacts(UID, CID)).toEqual([]);
   });
 
   it('gives a web artifact without a declaration the empty data-only declaration and leaves its entry bytes unchanged', async () => {
@@ -544,5 +545,76 @@ describe('chat_artifacts › application type input', () => {
     expect(local.ok).toBe(true); if (!local.ok) return;
     expect(fs.readFileSync(path.join(cidDir(), local.artifactId, 'index.html'), 'utf8')).toContain(m.BRIDGE_RELPATH);
     expect(fs.existsSync(path.join(cidDir(), local.artifactId, 'orkas-app.json'))).toBe(false);
+  });
+});
+
+describe('chat_artifacts › bundle summaries', () => {
+  it.each(['local', 'web'] as const)('includes nested resources and orders %s apps by their latest file update without changing served content', async appType => {
+    const m = await loadMod();
+    const first = await m.createArtifact(UID, CID, AGENT, { appType, files: [
+      ...MIN_FILES,
+      { path: 'assets/deep/labels.txt', content: '标签' },
+      { path: 'assets/image.png', content: 'AAEC/w==', encoding: 'base64' },
+    ] });
+    const second = await m.createArtifact(UID, CID, AGENT, { appType, files: MIN_FILES });
+    if (!first.ok) throw new Error(first.error);
+    if (!second.ok) throw new Error(second.error);
+    const firstDir = path.join(cidDir(), first.artifactId);
+    let rootBytes = 0;
+    for (const [id, seconds] of [[first.artifactId, 1000], [second.artifactId, 2000]] as const) {
+      const dir = path.join(cidDir(), id);
+      const rootFiles = appType === 'web'
+        ? ['index.html', 'orkas-app.json', '__orkas-meta.json']
+        : ['index.html', '__orkas-meta.json'];
+      for (const name of rootFiles) {
+        fs.utimesSync(path.join(dir, name), seconds, seconds);
+        if (id === first.artifactId) rootBytes += fs.statSync(path.join(dir, name)).size;
+      }
+    }
+    fs.utimesSync(path.join(firstDir, 'assets/image.png'), 1000, 1000);
+    fs.utimesSync(path.join(firstDir, 'assets/deep/labels.txt'), 3000, 3000);
+    const listed = await m.listArtifacts(UID, CID);
+    expect(listed.map(row => row.artifactId)).toEqual([first.artifactId, second.artifactId]);
+    expect(listed[0]).toMatchObject({ bytes: rootBytes + Buffer.byteLength('标签') + 4, mtime: 3000000 });
+    const { listConversationOutputs } = await import('../../../src/main/features/conversation_outputs');
+    const outputs = await listConversationOutputs(UID, CID);
+    const apps = outputs.items.filter(row => row.origin === 'artifact');
+    expect(apps.map(row => row.artifactId)).toEqual([first.artifactId, second.artifactId]);
+    expect(apps[0]).toMatchObject({ bytes: rootBytes + 10, mtime: 3000000 });
+    for (const [relPath, expected] of [
+      ['assets/deep/labels.txt', Buffer.from('标签')],
+      ['assets/image.png', Buffer.from([0, 1, 2, 255])],
+    ] as const) {
+      const served = m.resolveArtifactFilePath(UID, CID, first.artifactId, relPath);
+      expect(served.ok).toBe(true);
+      if (!served.ok) throw new Error(served.error);
+      expect(fs.readFileSync(served.absPath)).toEqual(expected);
+    }
+  });
+
+  it('skips links and a disappearing nested directory while retaining readable siblings', async () => {
+    const m = await loadMod();
+    const dir = path.join(cidDir(), 'nested_fixture');
+    fs.mkdirSync(path.join(dir, 'assets/gone'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'index.html'), 'entry');
+    fs.writeFileSync(path.join(dir, 'assets/keep.txt'), 'keep');
+    fs.writeFileSync(path.join(dir, 'assets/gone/lost.txt'), 'lost');
+    const outside = path.join(tmpDir, 'outside');
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, 'large.txt'), 'x'.repeat(10000));
+    fs.symlinkSync(outside, path.join(dir, 'assets/external'), 'junction');
+    fs.symlinkSync(dir, path.join(dir, 'assets/loop'), 'junction');
+    // A junction needs no Windows symlink privilege; file-link coverage runs on POSIX.
+    if (process.platform !== 'win32') fs.symlinkSync(path.join(outside, 'large.txt'), path.join(dir, 'external.txt'));
+    const realRead = fs.promises.readdir.bind(fs.promises);
+    const spy = vi.spyOn(fs.promises, 'readdir').mockImplementation((async (target: any, options: any) => {
+      if (String(target) === path.join(dir, 'assets/gone')) throw Object.assign(new Error('fixture removed directory'), { code: 'ENOENT' });
+      return realRead(target, options);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      expect(await m.listArtifacts(UID, CID)).toMatchObject([{ artifactId: 'nested_fixture', bytes: 9 }]);
+      expect(spy.mock.calls.some(([target]) => String(target) === path.join(dir, 'assets/gone'))).toBe(true);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
   });
 });

@@ -26,7 +26,7 @@ afterEach(async () => {
 });
 
 describe('conversation entry assistance', () => {
-  it('gives the final Agent the same offer rules without Commander entry instructions or intermediate offers', async () => {
+  it('gives the final Agent the recurring-work rules but not the project offer, without Commander entry instructions or intermediate offers', async () => {
     const chats = await import('../../../src/main/features/chats');
     const context = await import('../../../src/main/features/conversation_assistance_context');
     const state = await import('../../../src/main/features/group_chat/state');
@@ -38,8 +38,12 @@ describe('conversation entry assistance', () => {
     const final = await context.resolveConversationAssistanceForTurn('u1', cid, agent);
     expect(final).toMatchObject({ kind: undefined });
     expect(final.guidance).toContain('## Keeping work going');
-    expect(final.guidance).toContain('## Giving work a project');
     expect(final.guidance).toContain('## Global to-do scope');
+    // Only the Commander holds the project executor, so only it is told to
+    // offer one; a named Agent that offered could not create it on "yes".
+    expect(final.guidance).not.toContain('## Giving work a project');
+    expect((await context.resolveConversationAssistanceForTurn('u1', cid)).guidance)
+      .toContain('## Giving work a project');
     expect(final.guidance).not.toMatch(/New-account welcome|App creation|connector_setup/);
     expect((await context.resolveConversationAssistanceForTurn('u1', cid, {
       ...agent, outputDelivery: 'process',
@@ -166,6 +170,8 @@ describe('conversation entry assistance', () => {
     expect(guidance).toContain('## Global open work');
     expect(guidance).not.toContain('## Open to-dos from this conversation');
     expect(guidance).toContain('Host facts: 2 open global to-do(s).');
+    expect(guidance).toContain('after loading `management.todos`');
+    expect(guidance).not.toContain('after loading `management.projects`');
     expect(accountScan).not.toHaveBeenCalled();
     expect(guidance).not.toContain('店铺上新');
     expect(guidance).not.toContain(review);
@@ -398,6 +404,47 @@ describe('conversation entry assistance', () => {
     expect((await context.resolveConversationAssistanceForTurn('u2', third.conversation_id)).guidance).toBe('');
   });
 
+  it('keeps save, schedule and project offers out of conversations an automation created', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const autoTasks = await import('../../../src/main/features/auto_tasks');
+    const context = await import('../../../src/main/features/conversation_assistance_context');
+    const created = await autoTasks.createTask('u1', {
+      content: 'Check the FRED series and report changes', schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    if (!created.ok) throw new Error((created as { error: string }).error);
+    const earlier = await chats.createConversation('u1', { title: 'Daily check', originAutoTaskId: created.task.id });
+    await autoTasks.recordRunStart('u1', created.task.id, earlier.conversation_id, '2026-10-27T09:00:00.000Z');
+    await autoTasks.recordRunTerminal('u1', created.task.id, earlier.conversation_id, 'completed', '2026-10-27T09:05:00.000Z');
+    const run = await chats.createConversation('u1', { title: 'Daily check', originAutoTaskId: created.task.id });
+    await autoTasks.recordRunStart('u1', created.task.id, run.conversation_id, '2026-10-28T09:00:00.000Z');
+    const ordinary = await chats.createConversation('u1', { title: 'Daily check by hand' });
+    const offers = /## Keeping work going|## Giving work a project|schedule it in this reply|sentence offering a project/;
+
+    // The run already recurs and no one is there to accept an offer: neither
+    // the Commander nor a named Agent delivering the run is told to make one,
+    // and the run block itself says not to.
+    const commanderRun = (await context.resolveConversationAssistanceForTurn('u1', run.conversation_id)).guidance;
+    expect(commanderRun).toContain('## This automation run');
+    expect(commanderRun).toContain('Do not offer to save a to-do, schedule, or project during this run; no one is here to accept it.');
+    expect(commanderRun).not.toMatch(offers);
+    const agentRun = (await context.resolveConversationAssistanceForTurn('u1', run.conversation_id, {
+      agentId: 'writer', outputDelivery: 'final',
+    })).guidance;
+    expect(agentRun).toContain('## This automation run');
+    expect(agentRun).not.toMatch(offers);
+    // An earlier run's conversation reopened later is still the automation's
+    // own output: no run block, and still no offer to schedule it again.
+    const reopened = (await context.resolveConversationAssistanceForTurn('u1', earlier.conversation_id)).guidance;
+    expect(reopened).not.toContain('## This automation run');
+    expect(reopened).not.toMatch(offers);
+    // Scope stays explained there, and an ordinary conversation keeps both offers.
+    expect(reopened).toContain('## Global to-do scope');
+    const plain = (await context.resolveConversationAssistanceForTurn('u1', ordinary.conversation_id)).guidance;
+    expect(plain).toContain('## Keeping work going');
+    expect(plain).toContain('## Giving work a project');
+    expect(plain).not.toContain('## This automation run');
+  });
+
   it('keeps a final named Agent and an automation run on the plain facts for this conversation', async () => {
     const chats = await import('../../../src/main/features/chats');
     const projectTasks = await import('../../../src/main/features/project_tasks');
@@ -516,7 +563,7 @@ describe('conversation entry assistance', () => {
     expect(guidance).toContain('schedule it in this reply');
     expect(guidance).toContain('Create one only when the user asks for it, or after they accept your offer');
     expect(guidance).toContain('Make at most one offer per reply');
-    expect(guidance).toContain('If the user declines, do not raise it again');
+    expect(guidance).toContain('If the user does not take it up, whether by declining or by replying about something else, do not raise it again');
     expect(guidance).not.toContain('sentence offering a project for it');
     expect(guidance).not.toContain('this conversation belongs to no project');
     await filing.drainConversationFiling('u1', cid);

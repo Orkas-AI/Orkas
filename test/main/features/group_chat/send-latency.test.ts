@@ -332,9 +332,9 @@ describe('initial model request latency', () => {
     });
     const result = await sendUntilRequest(cid);
     expect(injected).toBe(true);
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const warn = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     expect(() => checkLatencyBudget('send to first model request', result, BUDGET_MS)).toThrow(`budget ${BUDGET_MS} ms`);
     expect(warn).toHaveBeenCalledOnce();
-    expect(JSON.parse(warn.mock.calls[0][1]).phases).not.toHaveLength(0);
+    expect(JSON.parse(String(warn.mock.calls[0][0]).split('latency target exceeded ')[1]).phases).not.toHaveLength(0);
   });
 });

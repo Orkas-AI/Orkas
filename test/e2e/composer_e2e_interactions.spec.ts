@@ -351,9 +351,9 @@ test.describe('new chat composer', () => {
     expect(await versionList.evaluate((element) => element.parentElement === document.body)).toBe(true);
     const parentHeightAfter = await parentMenu.evaluate((element) => element.getBoundingClientRect().height);
     expect(Math.abs(parentHeightAfter - parentHeightBefore)).toBeLessThan(1);
-    await expect(versionList.locator('.composer-model-menu-version-item')).toHaveCount(7);
+    await expect(versionList.locator('.composer-model-menu-version-item')).toHaveCount(8);
     await expect(versionList.locator('.composer-model-menu-version-label'))
-      .toHaveText(['GPT-6 Astra', 'GPT-6.1 Sol', 'GPT-6 Sol', 'GPT-6 Luna', 'GPT-5.6 Sol', 'GPT-5.6 Terra', 'GPT-5.6 Luna']);
+      .toHaveText(['GPT-6 Astra', 'GPT-6.1 Sol', 'GPT-6.1 Terra', 'GPT-6 Sol', 'GPT-6 Luna', 'GPT-5.6 Sol', 'GPT-5.6 Terra', 'GPT-5.6 Luna']);
     await expect(versionList.locator('.composer-model-menu-version-current-dot')).toHaveCount(1);
     await expect(versionList.locator('.composer-model-menu-version-check')).toHaveCount(0);
     await versionList.locator(

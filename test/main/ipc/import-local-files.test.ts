@@ -200,8 +200,8 @@ describe('add a user-selected local file to conversation attachments', () => {
     ['pptx', 'presentation'], ['zip', 'archive'], ['mp4', 'video'],
   ])('copies an unrecorded external %s file and reuses its pending attachment on repeat', async (ext, kind) => {
     // The two rejected reads/deletes of the original path are asserted below.
-    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke produced\.readText failed \{ error: 'path is outside the user workspace'/ });
-    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke workspace\.deletePath failed \{ error: 'path/ });
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke produced\.readText failed \{$/ });
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke workspace\.deletePath failed \{$/ });
     const fixtures: Record<string, Buffer> = {
       pdf: makeMinimalPdf(['Selected document']), docx: makeMinimalDocx({ paragraphs: ['Selected document'] }),
       xlsx: makeMinimalXlsx(), pptx: makeMinimalPptx(),
@@ -216,8 +216,10 @@ describe('add a user-selected local file to conversation attachments', () => {
     await expect(invoke('conversations.attachments.import', { cid: CID, path: abs }))
       .resolves.toMatchObject({ ok: true, reused: true, info: { name: result.info.name } });
     // Import copies bytes; it does not grant access to the original directory.
-    await expect(invoke('produced.readText', { cid: CID, path: abs })).resolves.toMatchObject({ ok: false });
-    await expect(invoke('workspace.deletePath', { cid: CID, path: abs })).resolves.toMatchObject({ ok: false });
+    await expect(invoke('produced.readText', { cid: CID, path: abs }))
+      .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
+    await expect(invoke('workspace.deletePath', { cid: CID, path: abs }))
+      .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
     expect(fs.readFileSync(abs)).toEqual(content);
   });
 
@@ -375,9 +377,8 @@ describe('manual attachment import boundaries', () => {
   });
 
   it('reports missing and unsupported scheduled-task selections and allows a corrected retry', async () => {
-    // Both rejections are asserted with their error before the corrected retry.
-    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke autoTasks\.attachments\.import failed \{ error: 'file not found'/ });
-    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke autoTasks\.attachments\.import failed \{ error: 'unsupported/ });
+    // The tap matches the content-free header; each error reply is asserted below.
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke autoTasks\.attachments\.import failed \{$/ });
     const taskId = 'at_12345678';
     const abs = sourceFile('brief.txt', 'restored source', 'downloads');
     const unsupported = sourceFile('program.exe', 'unsupported');

@@ -125,6 +125,7 @@ test('task details remembers open and closed panels and each selected tab across
 
 test('surfaces produced files, outside files, and artifacts for one conversation', async ({ orkas }, testInfo) => {
   const page = orkas.page!;
+  const diagnostics = orkas.rendererDiagnosticCheckpoint();
   const uid = 'account-e2e';
   const chatFile = (cid: string) => path.join(
     orkas.workspaceRoot, uid, 'cloud', 'chats', `${cid}.jsonl`,
@@ -286,6 +287,8 @@ test('surfaces produced files, outside files, and artifacts for one conversation
   const staleNarrationUrl = `chat-media://local/${
     staleNarrationPath.replace(/^\//, '').split('/').map(encodeURIComponent).join('/')
   }`;
+  const staleNarrationDiagnostics = orkas.rendererDiagnosticCheckpoint();
+  const staleNarrationResponse = page.waitForResponse(response => response.url() === staleNarrationUrl);
   appendFileSync(chatFile(cid), `${JSON.stringify({
     id: 'm_outputs_reply_stale_narration',
     ts: new Date().toISOString(),
@@ -300,6 +303,9 @@ test('surfaces produced files, outside files, and artifacts for one conversation
   await expect(narration.locator('.chat-md-audio-card')).toHaveCount(1);
   await expect(narration.locator('.chat-msg-produced-media .chat-md-audio')).toHaveJSProperty('duration', 0.1);
   await expect(narration.locator('.chat-msg-produced-item')).toContainText('narration.wav');
+  expect((await staleNarrationResponse).status()).toBe(404);
+  await orkas.acknowledgeRendererFailure({ surface: page, after: staleNarrationDiagnostics, count: 1,
+    detail: 'Failed to load resource: the server responded with a status of 404 (Not Found)' });
 
   // Revisit existing files in the body while the footer contains only this
   // reply's new output. The outside file needs the current conversation scope;
@@ -402,6 +408,7 @@ test('surfaces produced files, outside files, and artifacts for one conversation
   await expect(viewer.locator('.chat-file-viewer-title')).toHaveText('summary.md');
   await expect(viewer.locator('.chat-file-viewer-body')).toContainText('Fresh contents after recovery.');
   await expect(referenceOnly.locator('.chat-msg-produced')).toHaveCount(0);
+  await orkas.acknowledgeInvokeFailures('workspace.revealPath', 1, diagnostics);
 });
 
 test('opens code references from the project task selected directory', async ({ orkas }, testInfo) => {
@@ -453,6 +460,7 @@ test('opens code references from the project task selected directory', async ({ 
     await orkas.closePreview(preview);
   }
 
+  const deniedReferenceDiagnostics = orkas.rendererDiagnosticCheckpoint();
   await reply.getByRole('button', { name: 'Unselected file', exact: true }).click();
   const dialog = page.locator('.ui-dialog-overlay:visible');
   await expect(dialog).toContainText('Could not read');
@@ -462,4 +470,5 @@ test('opens code references from the project task selected directory', async ({ 
   preview = await orkas.openPreview(() => reply.getByRole('button', { name: 'Agent 组装逻辑', exact: true }).click());
   viewer = preview.locator('.chat-file-viewer');
   await expect(viewer.locator('.chat-file-viewer-body')).toContainText('agent ready');
+  await orkas.acknowledgeInvokeFailures('workspace.statPath', 1, deniedReferenceDiagnostics);
 });

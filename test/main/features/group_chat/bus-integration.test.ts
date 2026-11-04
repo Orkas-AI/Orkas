@@ -7,7 +7,7 @@ import AdmZip from 'adm-zip';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 import { currentTurnSnapshots, quotedSnapshots } from '../../../helpers/reference-context';
 import { estimateTextTokens } from '../../../../src/core-agent/src/shared/token-estimate';
-import { SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS } from '../../../../src/core-agent/src/tools/base';
+import { SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS, TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS } from '../../../../src/core-agent/src/tools/base';
 
 const retryInfoLog = vi.hoisted(() => vi.fn());
 const warningLog = vi.hoisted(() => vi.fn());
@@ -792,6 +792,115 @@ describe('group_chat bus integration › conversation search freshness', () => {
   });
 });
 
+describe('group_chat bus integration › failed application exit', () => {
+  async function failExit(code: 'E_SHUTDOWN_PROCESSES_FAILED' | 'E_SHUTDOWN_ARCHIVE_FAILED') {
+    const { createShutdownCoordinator } = await import('../../../../src/main/util/shutdown');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const shutdown = createShutdownCoordinator({
+      captureProcesses: async () => ({
+        // Same shape as the Windows helper failing after producers were quiesced.
+        terminate: async () => { throw new Error('controlled process cleanup timeout'); },
+        dispose() {},
+      }),
+      quiesce: async () => {
+        await bus.prepareForShutdown();
+        if (code === 'E_SHUTDOWN_ARCHIVE_FAILED') throw new Error('controlled archive failure');
+      },
+      localTasks: [],
+      onFailure: vi.fn(),
+      onIncomplete: () => bus.resumeAfterFailedShutdown(),
+    });
+    await expect(shutdown.prepare()).rejects.toMatchObject({ code });
+    return shutdown;
+  }
+
+  it.each(['E_SHUTDOWN_PROCESSES_FAILED', 'E_SHUTDOWN_ARCHIVE_FAILED'] as const)(
+    'lets the user keep sending in existing and new tasks after %s', async code => {
+      const chats = await import('../../../../src/main/features/chats');
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const groupChat = await import('../../../../src/main/features/group_chat');
+      const { conversation_id: existing } = await chats.createConversation(TEST_UID, { kind: 'normal' });
+      _setScript(state.buildGconvSessionId(existing), [{ type: 'final', text: 'Before quitting.' }]);
+      await bus.enqueue({ uid: TEST_UID, cid: existing, fromActorId: 'user', text: 'First request.' });
+      await waitForQuiescent(TEST_UID, existing);
+
+      await failExit(code);
+
+      const { conversation_id: fresh } = await chats.createConversation(TEST_UID, { kind: 'normal' });
+      for (const cid of [existing, fresh]) {
+        _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: `After the failed quit ${cid}.` }]);
+        await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Still here.' });
+        await waitForQuiescent(TEST_UID, cid, 4000);
+        expect((await groupChat.readMessages(TEST_UID, cid)).at(-1)).toMatchObject({
+          from: 'commander', text: `After the failed quit ${cid}.`,
+        });
+      }
+    },
+  );
+
+  it('lets a scheduler restarted after the failed exit run an automation', async () => {
+    const autoTasks = await import('../../../../src/main/features/auto_tasks');
+    const created = await autoTasks.createTask(TEST_UID, {
+      content: 'Run after the failed quit.', schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    if (!created.ok) throw new Error(created.error);
+    await failExit('E_SHUTDOWN_PROCESSES_FAILED');
+    const fired = await autoTasks.runTaskNow(TEST_UID, created.task.id);
+    expect(fired).toMatchObject({ ok: true });
+    if (!fired.ok) throw new Error(fired.error);
+    await waitForQuiescent(TEST_UID, fired.cid, 4000);
+    await vi.waitFor(async () => {
+      expect((await autoTasks.getTask(TEST_UID, created.task.id))?.run_count).toBe(1);
+    });
+  });
+
+  it('closes admission again and completes when the user retries the exit', async () => {
+    const chats = await import('../../../../src/main/features/chats');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    await failExit('E_SHUTDOWN_PROCESSES_FAILED');
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID, { kind: 'normal' });
+    cidsToDrop.add(cid);
+    _setScript(state.buildGconvSessionId(cid), [{ type: 'delta', text: 'Work in progress.' }, { type: '__wait_for_abort__' }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Long request.' });
+    await expect.poll(() => JSON.stringify(bus.liveDisplaySnapshot(TEST_UID, cid)).includes('Work in progress')).toBe(true);
+    const retry = bus.prepareForShutdown();
+    await expect(bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Too late.' })).rejects.toMatchObject({ code: 'E_APP_SHUTTING_DOWN' });
+    await retry;
+    expect(bus.isQuiescent(TEST_UID, cid)).toBe(true);
+    const rows = await groupChat.readMessages(TEST_UID, cid);
+    expect(rows.filter(row => row.system_kind === 'reply_interrupted')).toHaveLength(1);
+    expect(rows.map(row => row.text)).not.toContain('Too late.');
+  });
+
+  it('keeps one interruption record when a turn settles only after the failed exit', async () => {
+    const chats = await import('../../../../src/main/features/chats');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID, { kind: 'normal' });
+    cidsToDrop.add(cid);
+    _holdStream('late-settlement');
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'delta', text: 'Public partial answer.' },
+      { type: '__wait_for_gate__', name: 'late-settlement' },
+    ]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Unresponsive provider.' });
+    await expect.poll(() => JSON.stringify(bus.liveDisplaySnapshot(TEST_UID, cid)).includes('Public partial answer')).toBe(true);
+
+    await failExit('E_SHUTDOWN_PROCESSES_FAILED');
+    expect((await groupChat.readMessages(TEST_UID, cid)).filter(row => row.system_kind === 'reply_interrupted')).toHaveLength(1);
+
+    _releaseStream('late-settlement');
+    await waitForQuiescent(TEST_UID, cid, 4000);
+    const assistantRows = (await groupChat.readMessages(TEST_UID, cid)).filter(row => row.from !== 'user');
+    expect(assistantRows.map(row => row.system_kind)).toEqual(['reply_interrupted']);
+    expect(hostErrorLog).not.toHaveBeenCalled();
+  }, 12_000);
+});
+
 describe('group_chat bus integration › failed-turn write receipt continuity', () => {
   it.each([false, true])('archives concurrent turns on application shutdown without replay (unresponsive=%s)', async (unresponsive) => {
     const chats = await import('../../../../src/main/features/chats');
@@ -927,11 +1036,11 @@ describe('group_chat bus integration › failed-turn write receipt continuity', 
       const boundary = rows.find(row => row.from === 'user' && row.text === 'Check prior writes before creating any more.')!;
       const { createChatHistoryTool } = await import('../../../../src/main/model/core-agent/chat-history-tools');
       const history = createChatHistoryTool({ userId: TEST_UID, currentCid: cid, currentMessageId: boundary.id, allowedScopes: ['current'] });
-      const read = await history.execute({ action: 'read', scope: 'current', page: { mode: 'latest', count: 30 }, include_process: true, max_tokens: 10000 }, { state: {} } as any);
+      const read = await history.execute({ action: 'read', scope: 'current', read: { page: { mode: 'latest', count: 30 }, include_process: true }, max_tokens: 10000 }, { state: {} } as any);
       expect(read.isError, read.content).toBeFalsy();
       expect.soft(expectedIds.filter(id => !read.content.includes(id)), 'next-turn retrieval must retain each successful write').toEqual([]);
       if (split === 'before-writes' && ending === 'error') {
-        const found = await history.execute({ action: 'search', scope: 'current', query: 'lessonregistrationreceipt' }, { state: {} } as any);
+        const found = await history.execute({ action: 'search', scope: 'current', search: { query: 'lessonregistrationreceipt' } }, { state: {} } as any);
         expect(found.isError, found.content).toBeFalsy();
         const locator = JSON.parse(/^    process_read: (.+)$/m.exec(found.content)?.[1] || 'null');
         expect(locator, 'search must offer a usable process locator for the saved write').toBeTruthy();
@@ -2016,6 +2125,10 @@ describe('group_chat bus integration › direct agent handback', () => {
     expect(commanderCalls[0].message).toContain('Treat the concrete capability report as authoritative');
     expect(commanderCalls[0].message).toContain('do not search for or run shell/process conversion');
     expect(commanderCalls[0].message).toContain('publish an empty or placeholder output');
+    // The no-conversion stop is for proprietary formats only; a missing helper
+    // that a bundled runtime can do must not end with "use another app".
+    expect(commanderCalls[0].message).toContain('If it says a proprietary file format is unsupported');
+    expect(commanderCalls[0].message).toContain('do not send the user to another application');
     expect(commanderCalls[0].message).toContain('brief.txt');
     expect(commanderCalls[0].message).toContain('Use the quoted school launch requirements.');
 
@@ -2393,7 +2506,7 @@ describe('group_chat bus integration › Commander utility tools', () => {
         surface_id: 'agents', action: 'configure', target_id: 'agent-123',
       } },
       { type: '__call_tool__', name: 'connector_setup', input: {
-        operation: 'start', connector_id: 'xiaohongshu-seller',
+        operation: 'show', connector_id: 'xiaohongshu-seller',
       } },
       { type: '__call_tool__', name: 'open_app_view', input: {
         surface_id: 'agents', action: 'configure', target_id: 'agent-123',
@@ -2405,6 +2518,7 @@ describe('group_chat bus integration › Commander utility tools', () => {
         surface_id: 'agents', action: 'configure',
       } },
       { type: '__call_tool__', name: 'open_app_view', input: { surface_id: 'not-a-surface' } },
+      { type: '__call_tool__', name: 'open_app_view', input: { surface_id: 'settings.data' } },
       { type: '__call_tool__', name: 'app_health', input: { domain: 'credentials' } },
       { type: '__call_tool__', name: 'app_health', input: { domain: 'kb' } },
       { type: '__call_tool__', name: 'app_health', input: {} },
@@ -2425,6 +2539,12 @@ describe('group_chat bus integration › Commander utility tools', () => {
     const contracts = _recordedCalls.find((call) => call.sid === sid)?.extraToolContracts ?? [];
     const navContract = contracts.find((tool) => tool.name === 'open_app_view');
     expect(navContract?.description).toContain('Use connector_setup');
+    // Recovery has one shared destination regardless of the deleted resource.
+    // It must be discoverable from the offered tool, before any guide read.
+    expect(navContract?.description).toMatch(/Recycle Bin[^.]*settings\.data[^.]*Settings > Data/i);
+    expect(navContract?.description).toMatch(/users restore deleted items/i);
+    expect(navContract?.description).toMatch(/Delete\/Empty permanently removes recycle-bin batches/i);
+    expect(estimateTextTokens(navContract?.description ?? '')).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
     expect(navContract?.inputSchema).toMatchObject({
       type: 'object',
       required: ['surface_id'],
@@ -2438,7 +2558,18 @@ describe('group_chat bus integration › Commander utility tools', () => {
         target_id: { type: 'string', maxLength: 160 },
       },
     });
-    expect(contracts.find((tool) => tool.name === 'app_health')?.inputSchema).toMatchObject({
+    const destinationDescription = (navContract?.inputSchema as any).properties.surface_id.description;
+    const actionDescription = (navContract?.inputSchema as any).properties.action.description;
+    expect(actionDescription).toMatch(/add_custom[^;]*manual[^;]*form/i);
+    expect(estimateTextTokens(actionDescription)).toBeLessThanOrEqual(SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS);
+    expect(estimateTextTokens(destinationDescription)).toBeLessThanOrEqual(SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS);
+    const healthContract = contracts.find((tool) => tool.name === 'app_health');
+    expect((healthContract?.inputSchema as any).properties.domain.description).toContain('tasks checks running conversations');
+    expect(healthContract?.description).toContain('diagnostic_status');
+    expect(healthContract?.description).toMatch(/failed.*unknown/i);
+    expect(healthContract?.description).toMatch(/succeeded.*healthy/i);
+    expect(estimateTextTokens(healthContract?.description ?? '')).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
+    expect(healthContract?.inputSchema).toMatchObject({
       type: 'object',
       additionalProperties: false,
       properties: {
@@ -2451,7 +2582,7 @@ describe('group_chat bus integration › Commander utility tools', () => {
       additionalProperties: false,
       properties: {
         operation: { enum: [
-          'search', 'inspect', 'start', 'status', 'page_observe', 'page_act', 'page_wait',
+          'search', 'inspect', 'show', 'status', 'page_observe', 'page_act', 'page_wait',
         ] },
         query: { type: 'string', maxLength: 160 },
         connector_id: { type: 'string', maxLength: 160 },
@@ -2479,13 +2610,14 @@ describe('group_chat bus integration › Commander utility tools', () => {
     expect(navResults[4]).toMatchObject({ ok: false, error: expect.stringContaining('not supported') });
     expect(navResults[5]).toMatchObject({ ok: false, error: expect.stringContaining('target_id is required') });
     expect(navResults[6]).toMatchObject({ ok: false, error: expect.stringContaining('unknown surface_id') });
+    expect(navResults[7]).toMatchObject({ ok: true, surface_id: 'settings.data', action: 'open' });
 
     const connectorSetupResults = _recordedToolResults
       .filter((result) => result.name === 'connector_setup')
       .map((result) => JSON.parse(result.content));
     expect(connectorSetupResults).toEqual([expect.objectContaining({
       ok: true,
-      operation: 'start',
+      operation: 'show',
       connector_id: 'xiaohongshu-seller',
       status: 'setup_card_staged',
     })]);
@@ -2513,12 +2645,13 @@ describe('group_chat bus integration › Commander utility tools', () => {
     });
     // Domain filter returns exactly that probe.
     expect(Object.keys(healthResults[1]).sort()).toEqual(['kb', 'ok']);
-    expect(healthResults[1].kb).toMatchObject({ total: expect.any(Number), ready: expect.any(Number) });
+    expect(healthResults[1].kb).toMatchObject({ diagnostic_status: 'succeeded', total: expect.any(Number), ready: expect.any(Number) });
     // Full snapshot covers every domain and stays sanitized: no credential or
     // secret-shaped keys may appear anywhere in the payload.
     const full = healthResults[2];
     expect(Object.keys(full).sort()).toEqual(['connectors', 'kb', 'model', 'ok', 'tasks']);
     expect(full.tasks).toMatchObject({
+      diagnostic_status: 'succeeded',
       active_work: expect.any(Boolean),
       active_conversation_count: expect.any(Number),
       other_active_conversation_count: expect.any(Number),
@@ -2547,8 +2680,48 @@ describe('group_chat bus integration › Commander utility tools', () => {
         target_id: 'xiaohongshu-seller',
         requested_at: expect.any(String),
       },
+      { surface_id: 'settings.data', action: 'open', requested_at: expect.any(String) },
     ]);
   }, 12_000);
+
+  it('returns an app_health probe failure as unknown and preserves independent results and later recovery', async () => {
+    const cid = newCid();
+    const chats = await import('../../../../src/main/features/chats');
+    await chats.createConversation(TEST_UID, { conversationId: cid });
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const kbVector = await import('../../../../src/main/features/kb_vector');
+    const probe = vi.spyOn(kbVector, 'statusSummary').mockImplementationOnce(() => {
+      throw new Error('private Library path and user content must not escape');
+    });
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [
+      { type: '__call_tool__', name: 'app_health', input: {} },
+      { type: '__call_tool__', name: 'app_health', input: { domain: 'kb' } },
+      { type: 'final', text: 'The first Library check failed; the later check returned its current status.' },
+    ]);
+    try {
+      bus.subscribe(TEST_UID, cid, () => {});
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: '@commander check app status' });
+      await waitForQuiescent(TEST_UID, cid, 6000);
+      const results = _recordedToolResults.filter(result => result.name === 'app_health');
+      expect(results).toHaveLength(2);
+      expect(results.every(result => !result.isError)).toBe(true);
+      const [partial, recovered] = results.map(result => JSON.parse(result.content));
+      expect(partial).toMatchObject({
+        ok: true,
+        kb: { diagnostic_status: 'failed', state: 'unknown', error_code: 'diagnostic_probe_failed' },
+        tasks: { diagnostic_status: 'succeeded', active_conversation_count: expect.any(Number) },
+      });
+      expect(partial.kb).not.toHaveProperty('total');
+      expect(JSON.stringify(partial)).not.toContain('private Library');
+      expect(recovered).toMatchObject({ ok: true, kb: { diagnostic_status: 'succeeded', total: expect.any(Number) } });
+      expect(recovered.kb).not.toHaveProperty('state', 'unknown');
+    } finally {
+      probe.mockRestore();
+    }
+  }, 12_000);
+
 
 });
 
@@ -10141,34 +10314,42 @@ describe('group_chat bus integration › D29 planned dispatch', () => {
     const sidA = state.buildGmemberSessionId(cid, AGENT_ID);
     _setScript(sidA, [{ type: 'final', text: 'draft written' }]);
     _setScript(sidA, [{ type: 'final', text: 'ending added' }]);
-    let planning = false;
+    let notifyPlanning!: () => void;
+    const planningReady = new Promise<void>((resolve) => { notifyPlanning = resolve; });
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     await installPlanner(async () => {
-      planning = true;
+      notifyPlanning();
       await held;
       return planFor([{ assignee: 'a1', part: 'WRITE_THE_DRAFT' }], { references: ['a2'] })();
     });
     const first = bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user',
       text: `先 @${AGENT_NAME} 写初稿，参考 @${SECOND_AGENT_NAME} 的意见` });
-    expect(await waitUntil(() => planning)).toBe(true);
-    const second = bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'KEEP_GOING_WITH_THE_ENDING' });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(await tb.listTasks(TEST_UID, cid)).toEqual([]);
-    release();
-    await Promise.all([first, second]);
-    await waitForQuiescent(TEST_UID, cid, 6000);
+    try {
+      // This is an ordering gate, not a first-request latency measurement. Cold
+      // Windows admission can exceed the helper's 2s polling window. Wait for the
+      // controlled planner, retaining this case's existing overall watchdog.
+      await Promise.race([planningReady, first.then(() => {
+        throw new Error('Send completed without entering the controlled planner');
+      })]);
+      const second = bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'KEEP_GOING_WITH_THE_ENDING' });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(await tb.listTasks(TEST_UID, cid)).toEqual([]);
+      release();
+      await Promise.all([first, second]);
+      await waitForQuiescent(TEST_UID, cid, 6000);
 
-    const rows = await tb.listTasks(TEST_UID, cid);
-    expect(rows).toHaveLength(2);
-    expect(rows[0]).toMatchObject({ assignee: AGENT_ID, instruction: 'WRITE_THE_DRAFT' });
-    expect(rows[1].assignee).toBe(AGENT_ID);
-    expect(rows[1].instruction).toContain('KEEP_GOING_WITH_THE_ENDING');
-    const calls = _recordedCalls.filter((c) => c.sid === sidA).map((c) => c.message);
-    expect(calls).toHaveLength(2);
-    expect(calls[0]).toContain('WRITE_THE_DRAFT');
-    expect(calls[1]).toContain('KEEP_GOING_WITH_THE_ENDING');
-    expect(_recordedCalls.some((c) => c.sid === state.buildGconvSessionId(cid))).toBe(false);
+      const rows = await tb.listTasks(TEST_UID, cid);
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toMatchObject({ assignee: AGENT_ID, instruction: 'WRITE_THE_DRAFT' });
+      expect(rows[1].assignee).toBe(AGENT_ID);
+      expect(rows[1].instruction).toContain('KEEP_GOING_WITH_THE_ENDING');
+      const calls = _recordedCalls.filter((c) => c.sid === sidA).map((c) => c.message);
+      expect(calls).toHaveLength(2);
+      expect(calls[0]).toContain('WRITE_THE_DRAFT');
+      expect(calls[1]).toContain('KEEP_GOING_WITH_THE_ENDING');
+      expect(_recordedCalls.some((c) => c.sid === state.buildGconvSessionId(cid))).toBe(false);
+    } finally { release(); await first; }
   }, 15_000);
 
   // Planning takes seconds before any board row exists. The send must read as
@@ -11092,8 +11273,11 @@ describe('group_chat bus integration › deferred conversation filing', () => {
   // conversation: the relocation refuses while the turn holds the session files
   // open. The host finishes it at the quiescent boundary, and a cancelled run
   // drops it — the reply that announced the project never reached the user.
-  it.each(['completed', 'cancelled'] as const)(
-    'a %s turn settles the pending filing at the quiescent boundary', async (outcome) => {
+  it.each([
+    ['completed', 'new'], ['cancelled', 'new'],
+    ['completed', 'existing'], ['cancelled', 'existing'],
+  ] as const)(
+    'a %s turn settles the pending %s-project filing at the quiescent boundary', async (outcome, destination) => {
       const stateMod = await import('../../../../src/main/features/group_chat/state');
       const bus = await import('../../../../src/main/features/group_chat/bus');
       const chats = await import('../../../../src/main/features/chats');
@@ -11102,11 +11286,23 @@ describe('group_chat bus integration › deferred conversation filing', () => {
       const conv = await chats.createConversation(TEST_UID, { title: 'weekly competitor report' });
       const cid = conv.conversation_id;
       cidsToDrop.add(cid);
-      const filed = await filing.fileConversationUnderNewProject(
-        TEST_UID, cid, `Competitor tracking ${outcome}`, { moveNow: false },
-      );
-      expect(filed.ok).toBe(true);
-      const pid = (filed as { result: any }).result.project.project_id;
+      let pid: string;
+      if (destination === 'existing') {
+        const projects = await import('../../../../src/main/features/projects');
+        const created = await projects.createProject(TEST_UID, `Existing ${outcome}`);
+        if (!created.ok) throw new Error('project fixture failed');
+        pid = created.project.project_id;
+        const { createProjectSetupTool } = await import('../../../../src/main/features/project_setup_tool');
+        const tool = createProjectSetupTool({ userId: TEST_UID, cid });
+        const receipt = await tool.execute({ action: 'move_conversation', target_project: pid }, {} as never);
+        expect(JSON.parse(receipt.content as string)).toMatchObject({ ok: true, applies: 'when_this_turn_ends' });
+      } else {
+        const filed = await filing.fileConversationUnderNewProject(
+          TEST_UID, cid, `Competitor tracking ${outcome}`, { moveNow: false },
+        );
+        expect(filed.ok).toBe(true);
+        pid = (filed as { result: any }).result.project.project_id;
+      }
       // Deferred means deferred: nothing moved while the turn had not started.
       expect((await chats.getConversationMetadata(TEST_UID, cid))?.project_id).toBeFalsy();
 

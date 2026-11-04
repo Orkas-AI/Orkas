@@ -223,3 +223,39 @@ it('loads a 20 MiB single-record older page without truncating its expandable Un
   expect(await digest(tool.result_path)).toBe(createHash('sha256').update(output).digest('hex'));
   expect(await digest(file)).toBe(canonicalHash);
 });
+
+// PF-02: parent-page size must not hide nested work or another conversation's wait.
+it.each([1000, 30000, 100000])('PF-02 preserves %i nested events across cold/warm reads and queued small conversations', async count => {
+  const cache = await import('../../../src/main/features/conversation_history_cache');
+  const file = path.join(root, 'nested.jsonl'), small = path.join(root, 'small.jsonl');
+  const events = Array.from({ length: count }, (_, n) => ({ type: 'progress', text: `event-${n}-界` }));
+  const records = Array.from({ length: 10 }, (_, n) => ({ ...row(`parent-${n}`), process: n === 0 ? events : [] }));
+  const canonical = records.map(record => JSON.stringify(record)).join('\n') + '\n';
+  fs.writeFileSync(file, canonical); fs.writeFileSync(small, JSON.stringify(row('small')) + '\n');
+  await cache.readConversationHistoryPage('user', small, 10); // worker startup excluded
+  const start = performance.now();
+  const heavy = cache.readConversationHistoryPage('user', file, 10);
+  const smallWaits: number[] = [];
+  const queued = Array.from({ length: 8 }, () => cache.readConversationHistoryPage('user', small, 10).then(page => {
+    smallWaits.push(performance.now() - start); expect(page.records.map(record => record.id)).toEqual(['small']);
+  }));
+  const cold = await heavy; const coldMs = performance.now() - start; await Promise.all(queued);
+  const warmStart = performance.now(); const warm = await cache.readConversationHistoryPage('user', file, 10);
+  const warmMs = performance.now() - warmStart;
+  expect(warm).toEqual(cold); expect(cold.records.map(record => record.id)).toEqual(records.map(record => record.id));
+  const projected = cold.records[0]; const complete: unknown[] = [];
+  for (const part of projected.process_parts || []) {
+    if (!('ref' in part)) throw new Error('Expected expandable process');
+    let cursor: number | null = 0;
+    do {
+      const page = await cache.readConversationProcessPage('user', file, part.ref, cursor, projected.id);
+      complete.push(...page.items); cursor = page.nextCursor;
+    } while (cursor !== null);
+  }
+  if (!projected.process_parts?.length) complete.push(...projected.process || []);
+  expect(complete).toEqual(events);
+  expect(fs.readFileSync(file, 'utf8')).toBe(canonical);
+  console.log('[PF-02 nested history]', JSON.stringify({ parents: 10, events: count, sourceBytes: Buffer.byteLength(canonical),
+    coldMs, warmMs, queuedSmallMs: smallWaits, expandedEvents: complete.length,
+    scope: 'actual shared history worker; warm OS cache; queue wait includes heavy cold read; no UI/p95 claim' }));
+}, 30000);

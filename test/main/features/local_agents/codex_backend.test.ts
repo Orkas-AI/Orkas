@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import * as childProcess from 'node:child_process';
+import { once } from 'node:events';
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
@@ -10,7 +12,120 @@ import {
 } from '../../../../src/main/features/local_agents/backends/codex';
 import * as userInput from '../../../../src/main/features/local_agents/cli_user_input';
 
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+
 const describePosix = process.platform === 'win32' ? describe.skip : describe;
+
+it.runIf(process.platform === 'win32').each(['cmd', 'npm'] as const)(
+  'reaps Windows bootstrap descendants before recovery without stopping unrelated work via %s', async launch => {
+  // A hung CLI may exit on stdin EOF while a tool keeps running. Recovery must
+  // clean up the whole owned tree, not merely settle the failed parent turn.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-codex-tree-'));
+  const node = process.env.ORKAS_TEST_NODE || process.execPath;
+  const trace = path.join(directory, 'trace.json');
+  const script = path.join(directory, 'fake.cjs');
+  const shim = path.join(directory, 'fake.cmd');
+  const delayedKill = path.join(directory, 'delayed-kill.cjs');
+  fs.writeFileSync(delayedKill, `
+setTimeout(() => {
+  const child = require('node:child_process').spawn(process.argv[2], process.argv.slice(3), {
+    stdio: 'ignore', windowsHide: true,
+  });
+  child.once('error', () => process.exit(1));
+  child.once('exit', code => process.exit(code ?? 1));
+}, 200);
+`);
+  // Exercise slow OS command startup deterministically. The real taskkill still
+  // owns traversal; the test never substitutes the expected process outcome.
+  const { spawn: originalSpawn } = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+  let delayedCommands = 0;
+  const spawnSpy = vi.mocked(childProcess.spawn).mockImplementation(((command: string, args: string[], options: any) => {
+    if (/[\\/]taskkill\.exe$/i.test(command)) {
+      delayedCommands++;
+      return originalSpawn(node, [delayedKill, command, ...args], options);
+    }
+    return originalSpawn(command, args, options);
+  }) as typeof childProcess.spawn);
+  const childSource = 'process.send("ready"); setTimeout(() => process.exit(0), 20000);';
+  fs.writeFileSync(script, `
+const fs = require('node:fs');
+const { spawn } = require('node:child_process');
+const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(childSource)}], {
+  stdio: ['ignore', 'ignore', 'ignore', 'ipc'], windowsHide: true, detached: true,
+});
+const trace = ${JSON.stringify(trace)};
+const state = { parent: process.pid, descendant: descendant.pid, ready: false, requests: [] };
+const save = () => fs.writeFileSync(trace, JSON.stringify(state));
+descendant.once('message', () => { state.ready = true; save(); });
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => {
+  input += chunk;
+  let end;
+  while ((end = input.indexOf('\\n')) >= 0) {
+    const line = input.slice(0, end); input = input.slice(end + 1);
+    if (line.trim()) state.requests.push(JSON.parse(line).method);
+  }
+  save(); // Deliberately never acknowledge bootstrap.
+});
+process.stdin.on('end', () => process.exit(0));
+setTimeout(() => process.exit(0), 20000);
+`);
+  fs.writeFileSync(shim, `@echo off\r\n"${node}" "${script}" %*\r\n`);
+  if (launch === 'npm') fs.writeFileSync(path.join(directory, 'fake.ps1'), '& "$basedir/node.exe" "$basedir/fake.cjs" $args\n');
+  const unrelated = childProcess.spawn(node, ['-e', 'process.stdout.write("ready"); setTimeout(() => process.exit(0), 20000);'], {
+    stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+  });
+  const previous = process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS;
+  const events: any[] = [];
+  const alive = (pid: number) => {
+    try { process.kill(pid, 0); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+  };
+  let owned: number[] = [];
+  try {
+    await once(unrelated.stdout!, 'data', { signal: AbortSignal.timeout(5000) });
+    process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS = '1500';
+    const run = codexBackend.run({ binPath: shim, prompt: 'Do not submit while bootstrap is unavailable',
+      cwd: directory, signal: new AbortController().signal, timeoutMs: 10000,
+      onEvent: event => { events.push(event); if (event.type === 'process-info') owned.push(Number(event.pid)); },
+    });
+    await vi.waitFor(() => expect(JSON.parse(fs.readFileSync(trace, 'utf8')).ready).toBe(true), { timeout: 1000 });
+    const observation = JSON.parse(fs.readFileSync(trace, 'utf8'));
+    owned.push(observation.parent, observation.descendant);
+    expect(owned.map(alive)).toEqual([true, true, true]);
+    await run;
+    const completed = JSON.parse(fs.readFileSync(trace, 'utf8'));
+    expect(completed.ready).toBe(true);
+    expect(completed.requests).toContain('initialize');
+    expect(completed.requests).not.toContain('turn/start');
+    expect(events.filter(event => event.type === 'done')).toEqual([
+      expect.objectContaining({ status: 'failed', failureKind: 'cli_protocol', bootstrapTimeout: true, retrySafe: true }),
+    ]);
+    await vi.waitFor(() => expect(owned.map(alive)).toEqual([false, false, false]), { timeout: 5000 });
+    expect(alive(unrelated.pid!)).toBe(true);
+    expect(delayedCommands).toBeGreaterThan(0);
+  } finally {
+    if (previous === undefined) delete process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS;
+    else process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS = previous;
+    if (fs.existsSync(trace)) {
+      const observation = JSON.parse(fs.readFileSync(trace, 'utf8'));
+      owned.push(observation.parent, observation.descendant);
+    }
+    for (const pid of [...new Set(owned)].reverse()) if (Number.isSafeInteger(pid) && pid > 0 && alive(pid)) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* owned fixture already exited */ }
+    }
+    const stopped = once(unrelated, 'close', { signal: AbortSignal.timeout(5000) });
+    unrelated.kill('SIGKILL');
+    await stopped;
+    await vi.waitFor(() => expect(owned.filter(pid => pid > 0).some(alive)).toBe(false), { timeout: 5000 });
+    spawnSpy.mockRestore();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}, 15000);
 
 describePosix('local_agents/backends/codex process lifecycle', () => {
   let tempDir = '';

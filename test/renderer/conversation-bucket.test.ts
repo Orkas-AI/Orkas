@@ -93,24 +93,39 @@ describe('timeBucket — older + degenerate inputs', () => {
   });
 });
 
-// The sidebar "Recent Tasks" aggregate must agree with the "Today" and
-// "Yesterday" bucket headers of every list it mirrors: same activity field
-// precedence, same local midnight boundaries, projected and unprojected rows
-// alike.
+// Recent Tasks uses a rolling 24h window, independently of calendar-day
+// headings, with the same activity-field precedence for all projects.
 describe('selectRecentConversations — Recent Tasks membership', () => {
-  it('keeps today and yesterday rows from any project and drops older rows at the exact boundary', () => {
+  it('keeps pinned tasks regardless of activity age and applies the cutoff again after unpinning', () => {
+    const rows = [
+      { conversation_id: 'old-pin', pinned_at: NOW.toISOString(), last_active_at: offsetFromTodayStart(-30 * DAY) },
+      { conversation_id: 'project-pin', project_id: 'p1', pinned_at: NOW.toISOString() },
+      { conversation_id: 'invalid-time-pin', pinned_at: NOW.toISOString(), last_active_at: 'not-a-date' },
+      { conversation_id: 'old-unpinned', last_active_at: offsetFromTodayStart(-30 * DAY) },
+      { pinned_at: NOW.toISOString() },
+    ];
+    expect(selectRecentConversations(rows, NOW).map(c => c.conversation_id))
+      .toEqual(['old-pin', 'project-pin', 'invalid-time-pin']);
+    expect(selectRecentConversations(rows.map(c => ({ ...c, pinned_at: undefined })), NOW)).toEqual([]);
+  });
+
+  it('keeps tasks from any project within 24h, including the exact cutoff, and rejects older or invalid rows', () => {
     const rows = [
       { conversation_id: 'unprojected-today', last_active_at: offsetFromTodayStart(10 * 60 * 60 * 1000) },
       { conversation_id: 'projected-today', project_id: 'p1', last_active_at: offsetFromTodayStart(0) },
       { conversation_id: 'yesterday-late', project_id: 'p2', last_active_at: offsetFromTodayStart(-1) },
+      { conversation_id: 'cutoff-inside', last_active_at: new Date(NOW.getTime() - DAY + 1).toISOString() },
+      { conversation_id: 'cutoff-exact', last_active_at: new Date(NOW.getTime() - DAY).toISOString() },
+      { conversation_id: 'cutoff-outside', last_active_at: new Date(NOW.getTime() - DAY - 1).toISOString() },
       { conversation_id: 'yesterday-start', last_active_at: offsetFromTodayStart(-DAY) },
       { conversation_id: 'day-before-late', project_id: 'p3', last_active_at: offsetFromTodayStart(-DAY - 1) },
       { conversation_id: 'no-timestamps' },
+      { conversation_id: 'invalid', last_active_at: 'not-a-date' },
       { title: 'no id', last_active_at: NOW.toISOString() },
       null,
     ];
     expect(selectRecentConversations(rows, NOW).map((c) => c.conversation_id))
-      .toEqual(['unprojected-today', 'projected-today', 'yesterday-late', 'yesterday-start']);
+      .toEqual(['unprojected-today', 'projected-today', 'yesterday-late', 'cutoff-inside', 'cutoff-exact']);
   });
 
   it('reads last_active_at before updated_at and created_at, exactly like the bucket headers', () => {
@@ -125,11 +140,10 @@ describe('selectRecentConversations — Recent Tasks membership', () => {
       .toEqual(['bumped', 'created']);
   });
 
-  it('drops yesterday rows once the local date rolls over', () => {
-    const rows = [{ conversation_id: 'yesterday', last_active_at: offsetFromTodayStart(-60_000) }];
+  it('expires a task within the same calendar day when checked again', () => {
+    const rows = [{ conversation_id: 'yesterday', last_active_at: new Date(NOW.getTime() - DAY).toISOString() }];
     expect(selectRecentConversations(rows, NOW).map((c) => c.conversation_id)).toEqual(['yesterday']);
-    const tomorrow = new Date(NOW.getTime() + DAY);
-    expect(selectRecentConversations(rows, tomorrow)).toEqual([]);
+    expect(selectRecentConversations(rows, new Date(NOW.getTime() + 1))).toEqual([]);
   });
 
   it('tolerates a missing or non-array cache', () => {
@@ -137,10 +151,21 @@ describe('selectRecentConversations — Recent Tasks membership', () => {
     expect(selectRecentConversations({} as unknown, NOW)).toEqual([]);
   });
 
-  it('loads the startup slice from the local start of yesterday', () => {
+  it('loads the startup slice from exactly 24h ago', () => {
     const since = recentConversationsSince(NOW);
-    expect(since.getTime()).toBe(new Date(offsetFromTodayStart(-DAY)).getTime());
-    expect(since.getHours()).toBe(0);
-    expect(since.getMinutes()).toBe(0);
+    expect(since.getTime()).toBe(NOW.getTime() - DAY);
+    expect(NOW.getHours()).toBe(14);
+  });
+
+  it.each([
+    ['spring forward', '2026-03-09T00:30:00-04:00', '2026-03-08T04:30:00.000Z'],
+    ['fall back', '2026-11-02T00:30:00-05:00', '2026-11-01T05:30:00.000Z'],
+  ])('uses elapsed hours across %s instead of calendar boundaries', (_name, now, cutoff) => {
+    const clock = new Date(now);
+    expect(recentConversationsSince(clock).toISOString()).toBe(cutoff);
+    expect(selectRecentConversations([
+      { conversation_id: 'inside', last_active_at: cutoff },
+      { conversation_id: 'outside', last_active_at: new Date(Date.parse(cutoff) - 1).toISOString() },
+    ], clock).map(c => c.conversation_id)).toEqual(['inside']);
   });
 });
