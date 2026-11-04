@@ -2557,3 +2557,50 @@ it('continues a real SDK tool round on a configured fallback without foreign cip
     });
     expect(getCooldown('p1')).toBeUndefined();
   });
+
+
+describe('committed stream resource ownership', () => {
+  it.each(['notice', 'buffered content', 'stream tail', 'terminal receipt'] as const)('releases upstream when the consumer exits at %s', async boundary => {
+    let signal: AbortSignal | undefined;
+    let closed = 0;
+    let tailReads = 0;
+    let builds = 0;
+    const cand: RotatingCandidate = { profileId: 'owned', providerId: 'openai', modelId: 'test-model',
+      ...(boundary === 'notice' ? { imageSupport: { unsupported: true, observeRejection() {} } } : {}),
+      build: async () => { builds += 1; return { ...fakeProvider('owned', {}),
+        async *stream(params: CompletionParams): AsyncIterable<StreamEvent> {
+          signal = params.signal;
+          try {
+            yield { type: 'text_delta', text: 'first' };
+            tailReads += 1;
+            yield { type: 'text_delta', text: 'tail' };
+            yield { type: 'message_end', content: [{ type: 'text', text: 'firsttail' }] };
+          } finally { closed += 1; }
+        },
+      }; },
+    };
+    const provider = createRotatingProvider({ providerId: 'openai', networkRetryAttempts: 0, candidates: [cand] });
+    const params: CompletionParams = boundary === 'notice' ? { ...PARAMS, messages: [{ role: 'user', content: [
+      { type: 'text', text: 'ping' }, { type: 'image', mediaType: 'image/png', data: 'fixture' },
+    ] }] } : PARAMS;
+    const stream = provider.stream(params)[Symbol.asyncIterator]();
+    if (boundary === 'notice') expect((await stream.next()).value).toMatchObject({ type: 'images_omitted', count: 1 });
+    else {
+      expect((await stream.next()).value).toMatchObject({ text: 'first' });
+      if (boundary !== 'buffered content') expect((await stream.next()).value).toMatchObject({ text: 'tail' });
+      if (boundary === 'terminal receipt') expect((await stream.next()).value).toMatchObject({ type: 'message_end' });
+    }
+    await stream.return?.();
+    expect(signal?.aborted).toBe(true);
+    expect(closed).toBe(1);
+    expect(tailReads).toBe(boundary === 'stream tail' || boundary === 'terminal receipt' ? 1 : 0);
+    expect(builds).toBe(1);
+    expect(await collect(provider.stream(PARAMS))).toEqual([
+      { type: 'text_delta', text: 'first' }, { type: 'text_delta', text: 'tail' },
+      { type: 'message_end', content: [{ type: 'text', text: 'firsttail' }] },
+    ]);
+    expect(signal?.aborted).toBe(false);
+    expect(closed).toBe(2);
+    expect(builds).toBe(2);
+  });
+});
