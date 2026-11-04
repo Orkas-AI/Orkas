@@ -1,3 +1,4 @@
+import { frontmatterCloseIndex } from '../util/skill-frontmatter';
 import { bumpRecordSyncVersion } from '../util/record_sync_fields';
 /**
  * Global local recycle bin.
@@ -615,7 +616,7 @@ async function readDisplayJson(uid: string, batchId: string | undefined, relPath
 
 function parseSkillName(text: string | null, fallback: string): string {
   if (!text || !text.startsWith('---')) return fallback;
-  const end = text.indexOf('---', 3);
+  const end = frontmatterCloseIndex(text);
   if (end === -1) return fallback;
   for (const line of text.slice(3, end).split('\n')) {
     const m = /^name\s*:\s*(.+)$/.exec(line.trim());

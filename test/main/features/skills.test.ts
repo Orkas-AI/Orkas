@@ -1731,6 +1731,36 @@ describe('skills › createFromDir', () => {
     }
   });
 
+  it.each(['\n', '\r\n'])('preserves inline dashes through reading, validation, import and write-back (%j)', async (eol) => {
+    const src = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-package-dashes-'));
+    const description = 'Convert Markdown --- tables included --- to PDF';
+    const body = '# Instructions\nProcess a document.';
+    const content = [
+      '---', `description: "${description}"`, 'name: md2pdf', '---', '',
+      ...body.split('\n'),
+    ].join(eol);
+    try {
+      fs.writeFileSync(path.join(src, 'SKILL.md'), content);
+      const s = await loadSkills();
+      const quality = await import('../../../src/main/quality');
+      expect(s.parseSkillFrontmatter(content)).toMatchObject({ name: 'md2pdf', description });
+      expect(s.splitSkillMd(content).body.trim().replace(/\r\n/g, '\n')).toBe(body);
+      // Marketplace validates original staged bytes before normalization.
+      expect(quality.validateSkillDir(src, { source: 'custom' }).ok).toBe(true);
+      const imported = await s.importSkillPackageFromPath(src);
+      expect(imported.ok).toBe(true);
+      expect(imported.skills?.map((skill: any) => skill.id)).toEqual(['md2pdf']);
+      expect(await s.writeCustomSkillFileChecked('md2pdf', 'SKILL.md', content)).toMatchObject({ ok: true });
+      const persisted = fs.readFileSync(path.join(customSkillsDir(), 'md2pdf', 'SKILL.md'), 'utf8');
+      expect(s.parseSkillFrontmatter(persisted)).toMatchObject({ name: 'md2pdf', description });
+      expect(s.splitSkillMd(persisted).body.trim().replace(/\r\n/g, '\n')).toBe(body);
+      expect(quality.validateSkillDir(path.join(customSkillsDir(), 'md2pdf')).ok).toBe(true);
+      expect(fs.readFileSync(path.join(src, 'SKILL.md'), 'utf8')).toBe(content);
+    } finally {
+      fs.rmSync(src, { recursive: true, force: true });
+    }
+  });
+
   it('retains native import compatibility with legacy sidecar descriptions', async () => {
     const src = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-package-legacy-'));
     try {
