@@ -9,6 +9,8 @@ import {
   assertLocalImportTarget,
   copyLocalFileAtomic,
   copyLocalEntryExclusiveSync,
+  captureLocalEntryRevision,
+  localEntryRevisionMatches,
   inspectLocalImportSource,
   withLocalImportLock,
 } from '../../../src/main/util/file-import';
@@ -17,6 +19,67 @@ let root = '';
 
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-file-import-'));
+});
+
+describe('Library move revisions', () => {
+  it('accepts unchanged descendants and rejects added and removed children', async () => {
+    fs.writeFileSync(path.join(root, 'first.md'), 'First document');
+    const before = await captureLocalEntryRevision(root);
+    expect(localEntryRevisionMatches(before)).toBe(true);
+
+    fs.writeFileSync(path.join(root, 'second.md'), 'Second document');
+    expect(localEntryRevisionMatches(before)).toBe(false);
+    const afterAddition = await captureLocalEntryRevision(root);
+    fs.unlinkSync(path.join(root, 'second.md'));
+    expect(localEntryRevisionMatches(afterAddition)).toBe(false);
+  });
+
+  it('rejects missing and unreadable revision evidence', async () => {
+    const file = path.join(root, 'source.md');
+    fs.writeFileSync(file, 'Source document');
+    const revision = await captureLocalEntryRevision(file);
+    const nodeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const lstat = nodeFs.lstatSync;
+    const spy = vi.spyOn(nodeFs, 'lstatSync').mockImplementation(((filename: any, ...args: any[]) => {
+      if (String(filename) === file) throw Object.assign(new Error('Injected metadata read failure'), { code: 'EIO' });
+      return (lstat as any)(filename, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    try { expect(localEntryRevisionMatches(revision)).toBe(false); }
+    finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(localEntryRevisionMatches(undefined)).toBe(false);
+    expect(await captureLocalEntryRevision(path.join(root, 'missing.md'))).toBeUndefined();
+  });
+
+  it('accepts depth 64 and refuses a deeper source', async () => {
+    let directory = root;
+    for (let depth = 1; depth <= 64; depth++) {
+      directory = path.join(directory, 'd'); fs.mkdirSync(directory);
+    }
+    const revision = await captureLocalEntryRevision(root);
+    expect(revision).toBeDefined();
+    fs.mkdirSync(path.join(directory, 'too-deep'));
+    expect(await captureLocalEntryRevision(root)).toBeUndefined();
+  });
+
+  it('refuses deletion when the synchronous verification budget expires', async () => {
+    fs.writeFileSync(path.join(root, 'source.md'), 'Source document');
+    const revision = await captureLocalEntryRevision(root);
+    const clock = vi.spyOn(performance, 'now').mockReturnValueOnce(0).mockReturnValue(101);
+    let matches: boolean;
+    try { matches = localEntryRevisionMatches(revision); }
+    finally { clock.mockRestore(); }
+    expect(matches).toBe(false);
+  });
+
+  it('refuses a snapshot after the collection budget expires', async () => {
+    const clock = vi.spyOn(performance, 'now').mockReturnValueOnce(0).mockReturnValue(5001);
+    let revision: Awaited<ReturnType<typeof captureLocalEntryRevision>>;
+    try { revision = await captureLocalEntryRevision(root); }
+    finally { clock.mockRestore(); }
+    expect(revision).toBeUndefined();
+  });
 });
 
 afterEach(() => {

@@ -23,6 +23,7 @@ describe('operator policy packaged runtime', () => {
       copy('src/main/quality');
       copy('src/main/util/token-estimate.ts');
       copy('src/main/util/skill-description-policy.ts');
+      copy('src/main/util/skill-frontmatter.ts');
       const build = require('../../../package.json').build;
       for (const dep of ['tsx', 'get-tsconfig', 'resolve-pkg-maps', 'esbuild', '@esbuild']) {
         expect(build.asarUnpack).toContain(`node_modules/${dep}/**/*`);

@@ -61,6 +61,7 @@ jobs:
           test/main/util/ensure-sqlite-electron-abi.test.ts
           test/main/util/ensure-deps.test.ts
           test/main/util/ensure-dev-dependencies.test.ts
+          test/main/util/fetch-whisper.test.ts
           test/main/util/linux-source-dependencies.test.ts
           test/main/features/search/chat_store.test.ts
           test/renderer/agents-detail-layout.test.ts
