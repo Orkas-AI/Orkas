@@ -1935,7 +1935,7 @@ describe('chats › autoTitle on first send', () => {
 describe('chats › sweepStaleProcessing', () => {
   const staleActiveAt = () => new Date(Date.now() - 60_000).toISOString();
 
-  it.each(['both', 'one-finished', 'prior-notice', 'old-turn', 'segment', 'paged', 'write-failure', 'concurrent-sweeps', 'missing-timestamp'])(
+  it.each(['both', 'one-finished', 'prior-notice', 'old-turn', 'segment', 'paged', 'write-failure', 'concurrent-sweeps', 'missing-timestamp', 'torn-tail'])(
     'recovers each unfinished parallel actor independently and idempotently: %s', async scenario => {
       const chats = await loadChats();
       const paths = await import('../../../src/main/paths');
@@ -1958,14 +1958,17 @@ describe('chats › sweepStaleProcessing', () => {
         process: [{ type: 'event', event: { stream: 'runtime', data: {
           phase: scenario === 'segment' ? 'segment_end' : 'end', duration_ms: 1000,
         } } }] };
-      const rows = [user, ...(['both', 'write-failure', 'concurrent-sweeps', 'missing-timestamp'].includes(scenario) ? [] : [terminal]),
+      const rows = [user, ...(['both', 'write-failure', 'concurrent-sweeps', 'missing-timestamp', 'torn-tail'].includes(scenario) ? [] : [terminal]),
         ...(scenario === 'paged' ? Array.from({ length: 24 }, (_, i) => ({ id: `side-${i}`, from: 'commander', to: ['user'],
           ts: staleActiveAt(), text: 'Public progress', turn_id: 'other-turn' })) : [])];
-      fs.writeFileSync(file, rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+      // A crash, power loss or ENOSPC during a reply leaves this partial last line.
+      const tornTail = scenario === 'torn-tail' ? '{"id":"torn","from":"agent-a","text":"Half a re' : '';
+      fs.writeFileSync(file, rows.map(row => JSON.stringify(row)).join('\n') + '\n' + tornTail);
       const journal = paths.userRunningConversationsFile(TEST_UID);
       fs.mkdirSync(path.dirname(journal), { recursive: true });
       fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [{ conversation_id: cid }] }));
-      const readRows = () => fs.readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const readRows = () => fs.readFileSync(file, 'utf8').trim().split('\n')
+        .filter(line => !tornTail || line !== tornTail).map(line => JSON.parse(line));
       if (scenario === 'write-failure') {
         const original = storage.appendJsonlAtomic;
         const append = vi.spyOn(storage, 'appendJsonlAtomic').mockImplementation(async (...args) => {
@@ -1998,6 +2001,15 @@ describe('chats › sweepStaleProcessing', () => {
         .toEqual(expect.arrayContaining(expected.filter(id => scenario !== 'prior-notice' || id !== 'agent-a').map(id =>
           expect.objectContaining({ from: id, turn_id: `turn-${id}`, source_message_id: 'user-1' }))));
       expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).status).toBe('idle');
+      expect(JSON.parse(fs.readFileSync(journal, 'utf8')).items).toEqual([]);
+      if (scenario === 'torn-tail') {
+        // The notices must reach the conversation the user reopens, not just the file.
+        const groupChat = await import('../../../src/main/features/group_chat');
+        const visible = await groupChat.readMessages(TEST_UID, cid);
+        expect(visible.filter(row => row.system_kind === 'reply_interrupted').map(row => row.from)).toEqual(expected);
+        expect(visible.map(row => row.id)).not.toContain('torn');
+        expect(loggerMocks.warn).not.toHaveBeenCalledWith('stale sweep recovery remains pending', expect.any(Object));
+      }
       // Recreated stale journal/state simulates a second crash or sync replay
       // after notices became durable, before state cleanup reached disk.
       fs.writeFileSync(stateFile, JSON.stringify(snapshot));

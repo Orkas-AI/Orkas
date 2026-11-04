@@ -62,6 +62,7 @@ import { linkWithRetry, renameWithRetry, writeJsonSync } from '../storage';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { t } from '../i18n';
 import { toCompressedJpeg } from '../util/image-transform';
+import { activeUserAttachmentNames } from './group_chat/task_board';
 import {
   invalidateFileCache,
   purgeFileCacheByCid,
@@ -870,8 +871,8 @@ export function listAttachments(userId: string, cid: string): AttachmentInfo[] {
 }
 
 /**
- * Same as listAttachments, minus files that are already referenced by any
- * user message in the conversation's jsonl. Used by the chip area
+ * Same as listAttachments, minus files owned by live user tasks, generated
+ * outputs, or persisted messages. Used by the chip area
  * (`/api/conversations/:cid/attachments`) to restore only the "uploaded but
  * not yet sent" pool on app restart — without also re-chiping files that
  * already belong to prior messages.
@@ -881,7 +882,8 @@ export function listPendingAttachments(userId: string, cid: string): AttachmentI
   try { safeConvId = safeCid(cid); }
   catch { return []; }
   const generated = generatedAttachmentNames(userId, safeConvId);
-  const all = listAttachments(userId, safeConvId).filter(item => !generated.has(item.name));
+  const active = activeUserAttachmentNames(userId, safeConvId);
+  const all = listAttachments(userId, safeConvId).filter(item => !generated.has(item.name) && !active.has(item.name));
   if (!all.length) return all;
 
   const jsonlPath = conversationMessageReadFile(userId, safeConvId);

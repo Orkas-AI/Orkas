@@ -8,7 +8,7 @@ import {
   nowIso, genUserId, genId12, safeId,
   readJson, readJsonSync, writeJson, writeJsonSync, linkWithRetry,
   writeTextAtomicSync, writeTextAtomicGuardedSync, appendJsonl, appendJsonlAtomic,
-  invalidateLineCount, readJsonl, readJsonlPage, readJsonlPageWithOffsets,
+  invalidateLineCount, rewriteJsonlLine, readJsonl, readJsonlPage, readJsonlPageWithOffsets,
   readJsonlWindow, readJsonlWindowAtMatch, readJsonlAppendRecord, __storageTestHooks,
 } from '../../src/main/storage';
 
@@ -639,6 +639,106 @@ describe('storage › appendJsonlAtomic', () => {
     );
     const indices = results.map((r) => r.msgIndex).sort((a, b) => a - b);
     expect(indices).toEqual(Array.from({ length: N }, (_, i) => i));
+  });
+
+  it('starts on a clean line after a crash left a partial row, keeping valid-record numbering', async () => {
+    const p = path.join(tmpDir, 'torn.jsonl');
+    fs.writeFileSync(p, '{"i":0}\n{"i":1,"text":"half a re');
+    invalidateLineCount(p);
+    const appended = await appendJsonlAtomic(p, { i: 2 }, true);
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 2 }]);
+    // The next read of this index must land on the same record it just wrote.
+    expect(appended.msgIndex).toBe(1);
+    expect((await readJsonlWindow(p, appended.msgIndex, 1)).records).toEqual([{ i: 2 }]);
+    const bytes = fs.readFileSync(p);
+    const source = appended.source!;
+    expect(JSON.parse(bytes.subarray(source.offset, source.offset + source.bytes).toString('utf8'))).toEqual({ i: 2 });
+    expect((await appendJsonlAtomic(p, { i: 3 })).msgIndex).toBe(2);
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 2 }, { i: 3 }]);
+  });
+
+  it('keeps recovered message indexes stable after a cold reopen', async () => {
+    const p = path.join(tmpDir, 'reopened-torn.jsonl');
+    fs.writeFileSync(p, '{"i":0}\n{"i":1,"text":"partial');
+    expect((await appendJsonlAtomic(p, { i: 2 })).msgIndex).toBe(1);
+    // Restart and sync invalidate this cache; the preserved damaged row must
+    // never become a message slot on the next cold append.
+    for (const i of [3, 4]) {
+      invalidateLineCount(p);
+      const appended = await appendJsonlAtomic(p, { i }, true);
+      expect(appended.msgIndex).toBe(i - 1);
+      expect((await readJsonlWindow(p, appended.msgIndex, 1)).records).toEqual([{ i }]);
+    }
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 2 }, { i: 3 }, { i: 4 }]);
+  });
+
+  it('edits a recovered message by the same index used to read it', async () => {
+    const p = path.join(tmpDir, 'edit-recovered.jsonl');
+    const prefix = '{"i":0}\n{"i":1,"text":"partial';
+    fs.writeFileSync(p, prefix);
+    const appended = await appendJsonlAtomic(p, { i: 2 });
+    expect(await rewriteJsonlLine<{ i: number; edited?: boolean }>(p, appended.msgIndex,
+      record => record.i === 2 ? { ...record, edited: true } : null))
+      .toEqual({ ok: true, record: { i: 2, edited: true } });
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 2, edited: true }]);
+    expect(fs.readFileSync(p, 'utf8').startsWith(prefix + '\n')).toBe(true);
+  });
+
+  it('counts only readable records across already terminated corruption and blank lines', async () => {
+    const p = path.join(tmpDir, 'existing-corruption.jsonl');
+    fs.writeFileSync(p, '\n{"i":0}\ninvalid\n  \n{"i":1}\n');
+    const appended = await appendJsonlAtomic(p, { i: 2 });
+    expect(appended.msgIndex).toBe(2);
+    expect((await readJsonlWindow(p, appended.msgIndex, 1)).records).toEqual([{ i: 2 }]);
+    expect(await rewriteJsonlLine(p, 3, record => record)).toMatchObject({ ok: false });
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 1 }, { i: 2 }]);
+  });
+
+  it('keeps a complete record that only lost its newline', async () => {
+    const p = path.join(tmpDir, 'unterminated.jsonl');
+    fs.writeFileSync(p, '{"i":0}\n{"i":1}');
+    invalidateLineCount(p);
+    expect((await appendJsonlAtomic(p, { i: 2 })).msgIndex).toBe(2);
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 1 }, { i: 2 }]);
+    const blankTail = path.join(tmpDir, 'blank-tail.jsonl');
+    fs.writeFileSync(blankTail, '{"i":0}\n   ');
+    invalidateLineCount(blankTail);
+    expect((await appendJsonlAtomic(blankTail, { i: 1 })).msgIndex).toBe(1);
+    expect(await readJsonl(blankTail, 0)).toEqual([{ i: 0 }, { i: 1 }]);
+  });
+
+  it('does not touch a file that already ends cleanly or holds nothing', async () => {
+    const clean = path.join(tmpDir, 'clean.jsonl');
+    fs.writeFileSync(clean, '{"i":0}\n');
+    invalidateLineCount(clean);
+    await appendJsonlAtomic(clean, { i: 1 });
+    expect(fs.readFileSync(clean, 'utf8')).toBe('{"i":0}\n{"i":1}\n');
+    const empty = path.join(tmpDir, 'empty.jsonl');
+    fs.writeFileSync(empty, '');
+    invalidateLineCount(empty);
+    await appendJsonlAtomic(empty, { i: 0 });
+    expect(fs.readFileSync(empty, 'utf8')).toBe('{"i":0}\n');
+  });
+
+  it.each([false, true])('recovers the next append after a write failed part way (withSource=%s)', async withSource => {
+    const p = path.join(tmpDir, `enospc-${withSource}.jsonl`);
+    invalidateLineCount(p);
+    expect((await appendJsonlAtomic(p, { i: 0 }, withSource)).msgIndex).toBe(0);
+    const enospc = Object.assign(new Error('controlled disk full'), { code: 'ENOSPC' });
+    const fail = async () => { fs.appendFileSync(p, '{"i":1,"text":"half'); throw enospc; };
+    const open = fs.promises.open.bind(fs.promises);
+    const spy = withSource
+      ? vi.spyOn(fs.promises, 'open').mockImplementationOnce((async (...args: any[]) => {
+        const handle = await (open as any)(...args);
+        handle.writeFile = fail;
+        return handle;
+      }) as any)
+      : vi.spyOn(fs.promises, 'appendFile').mockImplementationOnce(fail as any);
+    syncBuiltinESMExports();
+    try { await expect(appendJsonlAtomic(p, { i: 1 }, withSource)).rejects.toMatchObject({ code: 'ENOSPC' }); }
+    finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect((await appendJsonlAtomic(p, { i: 2 }, withSource)).msgIndex).toBe(1);
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 2 }]);
   });
 
   it('invalidateLineCount forces recount from disk', async () => {

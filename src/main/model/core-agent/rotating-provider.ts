@@ -573,6 +573,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     iterator: AsyncIterator<StreamEvent>;
     buffered: StreamEvent[];
     cleanup: () => void;
+    dispose: () => void;
   } | { rotatable: true; err: unknown; failure: PreCommitFailure; empty?: EmptyObservation }
     | { rotatable: false; err: unknown; empty?: EmptyObservation }> {
     const parentSignal = (params as { signal?: AbortSignal }).signal;
@@ -633,7 +634,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       clearFirstEventTimer();
       parentSignal?.removeEventListener('abort', onParentAbort);
     };
-    const stopUncommittedStream = () => {
+    const disposeStream = () => {
       cleanup();
       if (!providerController.signal.aborted) providerController.abort();
       try {
@@ -648,7 +649,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       const iter = provider.stream(paramsFor(cand, { ...params, signal: providerController.signal }));
       iterator = (iter as AsyncIterable<StreamEvent>)[Symbol.asyncIterator]();
     } catch (err) {
-      stopUncommittedStream();
+      disposeStream();
       if (parentSignal?.aborted) {
         return { rotatable: false, err: abortError(parentSignal) };
       }
@@ -671,7 +672,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         if (parentAbortError) throw parentAbortError;
       } catch (err) {
         const surfacedError = timedOutError || parentAbortError || err;
-        stopUncommittedStream();
+        disposeStream();
         if (parentAbortError || parentSignal?.aborted) return { rotatable: false, err: surfacedError };
         const failure = classifyPreCommitFailure(surfacedError);
         if (failure) return { rotatable: true, err: surfacedError, failure };
@@ -681,7 +682,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         // No terminal event means the transport ended early. This is distinct
         // from a provider explicitly ending with an empty assistant message
         // and can use the ordinary transport retry/fallback path.
-        stopUncommittedStream();
+        disposeStream();
         const err = new ProviderEmptyResponseError(cand.providerId, 'transport_empty');
         const failure = classifyPreCommitFailure(err);
         if (failure) {
@@ -704,7 +705,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       // In-band error event — classify like a thrown error.
       if (type === 'error') {
         const err = (ev as any).error ?? new Error(String((ev as any).text ?? 'unknown stream error'));
-        stopUncommittedStream();
+        disposeStream();
         const failure = classifyPreCommitFailure(err);
         if (failure) return { rotatable: true, err, failure };
         return { rotatable: false, err };
@@ -739,7 +740,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
           return item.type === 'tool_use';
         });
         if (!hasUsableContent) {
-          stopUncommittedStream();
+          disposeStream();
           const category = (ev as Extract<StreamEvent, { type: 'message_end' }>)
             .providerTermination?.category;
           const kind = emptyKindForTermination(category);
@@ -761,7 +762,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       // First real content event — commit.
       buffered.push(ev);
       clearFirstEventTimer();
-      return { iterator, buffered, cleanup };
+      return { iterator, buffered, cleanup, dispose: disposeStream };
     }
   }
 
@@ -1055,36 +1056,40 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         // Drained past preamble without hitting an error → commit to
         // this candidate. From here on, failures propagate to caller
         // unchanged (rotation would mean corrupting visible stream).
-        const { iterator, buffered, cleanup } = attempt;
-        config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
-        config.onSuccess?.(cand.profileId, cand);
-        // This candidate works, so the network failures collected above were
-        // candidate-specific: keep those candidates out of the remaining
-        // model rounds of this run. Deliberately no markCooldown — the next
-        // run starts from the full candidate list again.
-        for (const id of networkFailedThisCall) unavailableProfiles.add(id);
-
-        // W4-2: the committed candidate is text-only, so paramsFor stripped
-        // every attached image. Say so — the visible alternative is the model
-        // "admitting" it cannot see, which sampled users debugged as their
-        // own mistake.
-        if ((cand.imageSupport?.unsupported || cand.maxInputImages === 0) && !imagesOmittedAnnounced) {
-          const omitted = params.messages.reduce(
-            (sum, message) => sum + messageImageCount(message),
-            0,
-          );
-          if (omitted > 0) {
-            imagesOmittedAnnounced = true;
-            yield { type: 'images_omitted', count: omitted, providerId: cand.providerId } as StreamEvent;
-          }
-        }
-
-        for (const ev of buffered) yield ev;
-
+        const { iterator, buffered, cleanup, dispose } = attempt;
+        let streamFinished = false;
         try {
+          config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+          config.onSuccess?.(cand.profileId, cand);
+          // This candidate works, so the network failures collected above were
+          // candidate-specific: keep those candidates out of the remaining
+          // model rounds of this run. Deliberately no markCooldown — the next
+          // run starts from the full candidate list again.
+          for (const id of networkFailedThisCall) unavailableProfiles.add(id);
+
+          // W4-2: the committed candidate is text-only, so paramsFor stripped
+          // every attached image. Say so — the visible alternative is the model
+          // "admitting" it cannot see, which sampled users debugged as their
+          // own mistake.
+          if ((cand.imageSupport?.unsupported || cand.maxInputImages === 0) && !imagesOmittedAnnounced) {
+            const omitted = params.messages.reduce(
+              (sum, message) => sum + messageImageCount(message),
+              0,
+            );
+            if (omitted > 0) {
+              imagesOmittedAnnounced = true;
+              yield { type: 'images_omitted', count: omitted, providerId: cand.providerId } as StreamEvent;
+            }
+          }
+
+          for (const ev of buffered) yield ev;
+
           while (true) {
             const { value, done } = await iterator.next();
-            if (done) return;
+            if (done) {
+              streamFinished = true;
+              return;
+            }
             if (value?.type === 'error') observeFailure(cand, params, value.error, true);
             if (value) yield value;
           }
@@ -1093,7 +1098,10 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
           observeFailure(cand, params, err, true);
           throw err;
         } finally {
-          cleanup();
+          // Consumer exit must release this upstream request; natural
+          // exhaustion retains its original completion disposition.
+          if (streamFinished) cleanup();
+          else dispose();
         }
       }
 

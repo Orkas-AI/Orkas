@@ -358,8 +358,10 @@ function globToRegExpSource(glob: string): string {
     const ch = glob[i];
     if (ch === '*') {
       if (glob[i + 1] === '*') {
-        // `**` spans directory separators; `*` stops at one.
+        // `**` spans directory separators; `*` stops at one. A trailing `**`
+        // (`logs/**`) matches everything inside, at any depth, as in git.
         i += 1;
+        if (i === glob.length - 1) { out += '.*'; continue; }
         if (glob[i + 1] === '/') i += 1;
         out += '(?:.*/)?';
       } else {

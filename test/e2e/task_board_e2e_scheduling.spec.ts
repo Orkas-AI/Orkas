@@ -611,6 +611,82 @@ test.describe('task board scheduling (D29 planned dependencies)', () => {
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
   });
 
+  for (const separateDraft of [false, true]) {
+    test(`keeps queued edit attachments out of the ${separateDraft ? 'independent' : 'empty'} draft after navigation and reload`, async ({ modelOrkas, boardPage }, testInfo) => {
+      const app = modelOrkas;
+      const page = boardPage;
+      const input = page.locator('#chat-input');
+      const chips = page.locator('#chat-attachments .chat-attach-label');
+      const before = app.modelRequests.length;
+      await page.evaluate(async (lang) => { await (window as any).setLang(lang); }, separateDraft ? 'zh' : 'en');
+      if (separateDraft) await page.setViewportSize({ width: 1000, height: 720 });
+      const attach = async (name: string) => {
+        const source = app.createFixtureFile(name, `Source content for ${name}`);
+        await app.selectFilesOnNextDialog([source]);
+        await page.locator('#chat-attach-btn').click();
+        await expect(chips).toContainText([name]);
+        await expect(page.locator('#chat-attachments .is-uploading')).toHaveCount(0);
+      };
+      app.setModelMode('controlled-slow');
+      await input.fill('@ContentWriter keep the preceding reply running.');
+      await input.press('Enter');
+      await expect.poll(() => app.modelRequests.length).toBe(before + 1);
+      await attach('queued.txt');
+      await input.fill('@ContentWriter original attached queued message.');
+      await input.press('Enter');
+      const row = page.locator('#chat-task-board-list .chat-queue-item', { hasText: 'original attached queued message.' });
+      await expect(row).toBeVisible();
+      await expect(chips).toHaveCount(0);
+      const cid = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
+      expect(cid).toBeTruthy();
+      const refreshAttachments = async () => {
+        // Await the real navigation refresh boundary; an empty-DOM assertion
+        // before this async response could miss attachments returning later.
+        await page.evaluate(async (conversationId) => {
+          await (window as any)._chatAttachRefreshFromServer(conversationId);
+        }, cid);
+      };
+      await page.locator('#new-chat-btn').click();
+      await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+      await refreshAttachments();
+      await expect(chips).toHaveCount(0);
+      if (separateDraft) {
+        await attach('draft.txt');
+        await input.fill('Keep my independent draft');
+      }
+      await row.locator('[data-act="task-edit"]').click();
+      await expect(chips).toHaveText(['queued.txt']);
+      await input.press('Escape');
+      await expectComposerText(input, separateDraft ? 'Keep my independent draft' : '');
+      await refreshAttachments();
+      await expect(chips).toHaveText(separateDraft ? ['draft.txt'] : []);
+      await row.locator('[data-act="task-edit"]').click();
+      await expect(chips).toHaveText(['queued.txt']);
+      await attach('edit-added.txt');
+      await input.fill('Edited attached queued message.');
+      await page.locator('#chat-send-btn').click();
+      await expect(page.locator('#chat-send-btn')).not.toHaveClass(/queue-editing/);
+      await expectComposerText(input, separateDraft ? 'Keep my independent draft' : '');
+      await refreshAttachments();
+      await expect(chips).toHaveText(separateDraft ? ['draft.txt'] : []);
+      expect(app.modelRequests).toHaveLength(before + 1);
+      await page.locator('#panel-conversation .chat-input-wrapper').screenshot({ path: testInfo.outputPath('restored-attachment-draft.png') });
+      await page.reload();
+      await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+      await refreshAttachments();
+      await expectComposerText(input, separateDraft ? 'Keep my independent draft' : '');
+      await expect(chips).toHaveText(separateDraft ? ['draft.txt'] : []);
+      app.setModelMode('success');
+      app.releaseControlledModelChunk();
+      app.finishControlledModelStream();
+      const bubble = page.locator('#chat-history .chat-message.user', { hasText: 'Edited attached queued message.' });
+      await expect(bubble.locator('.chat-msg-attach .chat-attach-label')).toHaveText(['queued.txt', 'edit-added.txt']);
+      await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
+      await refreshAttachments();
+      await expect(chips).toHaveText(separateDraft ? ['draft.txt'] : []);
+    });
+  }
+
   test('cancels the editing message from the queue after the preceding reply finishes', async ({ modelOrkas, boardPage }) => {
     const app = modelOrkas;
     const page = boardPage;
