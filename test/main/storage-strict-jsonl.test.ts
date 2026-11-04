@@ -19,6 +19,22 @@ describe('strict JSONL reads for durable projections',() => {
     await expect(readJsonl(file,limit,strict)).rejects.toThrow('JSONL record is invalid');
     expect(await readJsonl(file,limit)).toEqual([{id:'first'},{id:'last'}]);
   });
+  it('can stay strict about I/O while skipping a partial crash-time row',async () => {
+    const lenient={strict:true,skipInvalidRecords:true};
+    await expect(readJsonlPageWithOffsets(file,8,undefined,lenient)).rejects.toMatchObject({code:'ENOENT'});
+    fs.writeFileSync(file,'{"id":"first"}\nOLDER_CORRUPTION\n{"id":"last"}\n{"id":"torn","te');
+    expect((await readJsonlPageWithOffsets(file,8,undefined,lenient)).entries.map(entry => entry.record)).toEqual([{id:'first'},{id:'last'}]);
+    await expect(readJsonlPageWithOffsets(file,8,undefined,strict)).rejects.toThrow('JSONL record is invalid');
+    const open=fs.promises.open.bind(fs.promises);
+    vi.spyOn(fs.promises,'open').mockImplementation(async (...args:any[]) => {
+      const handle=await (open as any)(...args);if(String(args[0]) !== file) return handle;
+      const stat=handle.stat.bind(handle);
+      handle.stat=async () => { const result=await stat();fs.truncateSync(file,0);return result; };
+      return handle;
+    });
+    syncBuiltinESMExports();
+    await expect(readJsonlPageWithOffsets(file,8,undefined,lenient)).rejects.toThrow('JSONL read is incomplete');
+  });
   it('accepts valid generic JSON values and blank lines without applying a conversation-specific schema',async () => {
     fs.writeFileSync(file,' \r\nnull\n0\nfalse\n{"ok":true}\n');
     expect(await readJsonl(file,0,strict)).toEqual([null,0,false,{ok:true}]);
