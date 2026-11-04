@@ -13,6 +13,7 @@ import {
   videoProductionControlSummary,
   beginVideoProductionGeneration,
   finishVideoProductionGeneration,
+  reserveVideoProductionGenerationOutput,
   releaseVideoProductionGeneration,
   readVideoProductionControlState,
   readVideoProductionPlanIdentity,
@@ -409,6 +410,87 @@ describe('VideoStudio project production control', () => {
       candidateOutputPaths: [existingImageVariant],
       request: request(),
     })).rejects.toThrow(/E_VIDEO_PRODUCTION_OUTPUT_COLLISION/);
+  });
+
+  async function startStoppedVideo() {
+    await approveVideoProductionPlan({ statePath, planPath, turnId: 'turn-b' });
+    await approveVideoProductionGeneration({ statePath, planPath, turnId: 'turn-c' });
+    const args = { statePath, planPath, segmentId: 'shot-1', kind: 'video' as const,
+      outputPath: path.join(root, 'shot-1.mp4'), request: request() };
+    const begun = await beginVideoProductionGeneration(args);
+    return { args, transactionId: begun.transaction.transaction_id };
+  }
+
+  it('reserves a collision-safe stopped output before writing and reuses it under the original request', async () => {
+    const { args, transactionId } = await startStoppedVideo();
+    fs.writeFileSync(args.outputPath, 'foreign-file');
+    const renamed = path.join(root, 'shot-1-2.mp4');
+    await reserveVideoProductionGenerationOutput({ ...args, transactionId, outputPath: renamed });
+    expect(fs.existsSync(renamed)).toBe(false);
+    const reserved = await readVideoProductionControlState(statePath, planPath);
+    expect(reserved.transactions['video:shot-1']).toMatchObject({
+      status: 'pending', output_path: args.outputPath, reserved_output_paths: [args.outputPath, renamed],
+    });
+    // Repeated reservation does not alter the approval or duplicate the claim.
+    await reserveVideoProductionGenerationOutput({ ...args, transactionId, outputPath: renamed });
+    expect(await readVideoProductionControlState(statePath, planPath)).toEqual(reserved);
+    fs.writeFileSync(renamed, 'generated-video');
+    await finishVideoProductionGeneration({ ...args, transactionId, outputPath: renamed, ok: true, providerTaskId: 'paid-task' });
+    const reused = await beginVideoProductionGeneration(args);
+    expect(reused.status).toBe('reused');
+    expect(reused.transaction).toMatchObject({ output_path: renamed, provider_task_id: 'paid-task', status: 'completed' });
+    expect(fs.readFileSync(args.outputPath, 'utf8')).toBe('foreign-file');
+    expect(fs.readFileSync(renamed, 'utf8')).toBe('generated-video');
+  });
+
+  it.each(['other.mp4', 'shot-1-02.mp4', 'shot-1-1.mp4', 'nested/shot-1-2.mp4', '../shot-1-2.mp4', 'shot-1-2.mov'])(
+    'rejects an unrelated stopped-output path without changing the transaction: %s', async candidate => {
+      const { args, transactionId } = await startStoppedVideo();
+      const before = fs.readFileSync(statePath, 'utf8');
+      await expect(reserveVideoProductionGenerationOutput({ ...args, transactionId, outputPath: path.resolve(root, candidate) }))
+        .rejects.toThrow(/E_VIDEO_PRODUCTION_GENERATION_OUTPUT_UNEXPECTED/);
+      expect(fs.readFileSync(statePath, 'utf8')).toBe(before);
+    },
+  );
+
+  it.each(['wrong transaction', 'completed transaction'])('rejects a stopped-output claim for a %s', async owner => {
+    const { args, transactionId } = await startStoppedVideo();
+    if (owner === 'completed transaction') {
+      fs.writeFileSync(args.outputPath, 'completed-video');
+      await finishVideoProductionGeneration({ ...args, transactionId, ok: true });
+    }
+    const before = fs.readFileSync(statePath, 'utf8');
+    await expect(reserveVideoProductionGenerationOutput({ ...args,
+      transactionId: owner === 'wrong transaction' ? 'stale-transaction' : transactionId,
+      outputPath: path.join(root, 'shot-1-2.mp4'),
+    })).rejects.toThrow(/E_VIDEO_PRODUCTION_GENERATION_TRANSACTION_STALE/);
+    expect(fs.readFileSync(statePath, 'utf8')).toBe(before);
+  });
+
+  it('does not claim another segment reservation even before that segment writes its file', async () => {
+    const initial = plan();
+    const first = (initial.segments as Array<Record<string, unknown>>)[0];
+    writePlan({ ...initial, total_target_sec: 10, segments: [first, { ...first, id: 'shot-2', order: 2 }],
+      cost_estimate: { billable_generations: 2 } });
+    const { args, transactionId } = await startStoppedVideo();
+    const claimed = path.join(root, 'shot-1-2.mp4');
+    await beginVideoProductionGeneration({ ...args, segmentId: 'shot-2', outputPath: claimed });
+    const before = fs.readFileSync(statePath, 'utf8');
+    await expect(reserveVideoProductionGenerationOutput({ ...args, transactionId, outputPath: claimed }))
+      .rejects.toThrow(/E_VIDEO_PRODUCTION_OUTPUT_RESERVED/);
+    expect(fs.existsSync(claimed)).toBe(false);
+    expect(fs.readFileSync(statePath, 'utf8')).toBe(before);
+  });
+
+  it('does not claim an existing collision-safe filename', async () => {
+    const { args, transactionId } = await startStoppedVideo();
+    const occupied = path.join(root, 'shot-1-2.mp4');
+    fs.writeFileSync(occupied, 'foreign-file');
+    const before = fs.readFileSync(statePath, 'utf8');
+    await expect(reserveVideoProductionGenerationOutput({ ...args, transactionId, outputPath: occupied }))
+      .rejects.toThrow(/E_VIDEO_PRODUCTION_OUTPUT_COLLISION/);
+    expect(fs.readFileSync(statePath, 'utf8')).toBe(before);
+    expect(fs.readFileSync(occupied, 'utf8')).toBe('foreign-file');
   });
 
   it('does not mark provider success completed before the artifact exists', async () => {

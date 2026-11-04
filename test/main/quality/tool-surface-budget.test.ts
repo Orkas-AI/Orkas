@@ -55,29 +55,25 @@ const COMMANDER_COMMON_INITIAL_BUDGET_TOKENS = 6_500;
 // task-turn retention. Keep its cost separate so the existing corpus cannot grow.
 const BROWSER_DEFINITION_BUDGET_TOKENS = 1_000;
 
-const BUILTIN_AGENT_INITIAL_SURFACE_BUDGETS: Readonly<Record<
-  string,
-  { tools: number; tokens: number }
->> = Object.freeze({
-  ContentWriter: { tools: 22, tokens: 7_300 },
-  DeepResearcher: { tools: 24, tokens: 7_300 },
-  VideoStudio: { tools: 25, tokens: 9_500 },
-  VoiceStudio: { tools: 23, tokens: 7_900 },
-  PptMaker: { tools: 16, tokens: 8_100 },
-  ImageStudio: { tools: 20, tokens: 8_400 },
-  OfficeWorker: { tools: 21, tokens: 12_000 },
-  ProductDeveloper: { tools: 25, tokens: 8_800 },
-  UIDesigner: { tools: 25, tokens: 8_800 },
-  SeoGeoAgent: { tools: 24, tokens: 8_500 },
-  StockAnalyser: { tools: 22, tokens: 7_300 },
-  // September 21 packaging migration: preserve fixed capabilities, adding
-  // coverage for the five newly bundled Agents. Measured tokens are
-  // 6,471/4,344/6,471/5,189/4,365; caps allow at most about 10% wording growth.
-  ECommerceResearcher: { tools: 18, tokens: 7_100 },
-  ECommerceReviewer: { tools: 11, tokens: 4_700 },
-  ECommerceWriter: { tools: 18, tokens: 7_100 },
-  ECommerceAnalyzer: { tools: 15, tokens: 5_700 },
-  ECommerceOperator: { tools: 13, tokens: 4_800 },
+// Capability inventory remains bounded independently of initial token overhead.
+// agent-initial-overhead.test.ts owns the uniform, fully assembled request budget.
+const BUILTIN_AGENT_INITIAL_TOOL_COUNTS: Readonly<Record<string, number>> = Object.freeze({
+  ContentWriter: 22,
+  DeepResearcher: 24,
+  VideoStudio: 25,
+  VoiceStudio: 23,
+  PptMaker: 16,
+  ImageStudio: 20,
+  OfficeWorker: 21,
+  ProductDeveloper: 25,
+  UIDesigner: 25,
+  SeoGeoAgent: 24,
+  StockAnalyser: 22,
+  ECommerceResearcher: 18,
+  ECommerceReviewer: 11,
+  ECommerceWriter: 18,
+  ECommerceAnalyzer: 15,
+  ECommerceOperator: 13,
 });
 
 describe('injected tool surface budget', () => {
@@ -235,7 +231,7 @@ describe('injected tool surface budget', () => {
     }
   });
 
-  it('keeps each built-in Agent initial schema surface within budget', () => {
+  it('retains reviewed built-in Agent initial schema inventories', () => {
     const previousMode = process.env.ORKAS_TOOL_LOADING_MODE;
     process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
     const measurements: string[] = [];
@@ -258,17 +254,13 @@ describe('injected tool surface budget', () => {
           createToolLoadTool(surface),
         ];
         const tokens = initialTools.reduce((sum, tool) => sum + definitionTokens(tool), 0);
-        const budget = BUILTIN_AGENT_INITIAL_SURFACE_BUDGETS[scenario.name];
+        const count = BUILTIN_AGENT_INITIAL_TOOL_COUNTS[scenario.name];
 
-        if (!budget) throw new Error(`${scenario.name} is missing an initial schema budget`);
+        if (count === undefined) throw new Error(`${scenario.name} is missing an initial schema inventory`);
         expect(
           initialTools.length,
-          `${scenario.name} sends ${initialTools.length} common-corpus schemas; budget ${budget.tools}`,
-        ).toBeLessThanOrEqual(budget.tools);
-        expect(
-          tokens,
-          `${scenario.name} sends ${tokens} common-corpus schema tokens; budget ${budget.tokens}`,
-        ).toBeLessThanOrEqual(budget.tokens);
+          `${scenario.name} sends ${initialTools.length} common-corpus schemas; reviewed count ${count}`,
+        ).toBeLessThanOrEqual(count);
         measurements.push(`${scenario.name}=${initialTools.length}/${tokens}`);
       }
     } finally {
@@ -300,7 +292,7 @@ describe('injected tool surface budget', () => {
       });
       const regressedCount = availableTools.filter((tool) => regressed.isActive(tool.name)).length;
 
-      expect(regressedCount).toBeGreaterThan(BUILTIN_AGENT_INITIAL_SURFACE_BUDGETS.ContentWriter.tools);
+      expect(regressedCount).toBeGreaterThan(BUILTIN_AGENT_INITIAL_TOOL_COUNTS.ContentWriter);
     } finally {
       if (previousMode === undefined) delete process.env.ORKAS_TOOL_LOADING_MODE;
       else process.env.ORKAS_TOOL_LOADING_MODE = previousMode;

@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { withWindowsGitOnPath } from './test-runtime-env.mjs';
+import { withWindowsGitOnPath, withWindowsPowerShellModules } from './test-runtime-env.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 // The open-source app and its test virtual environment share this flat root.
@@ -12,7 +12,7 @@ const repoRoot = resolve(here, '..');
 const localPython = process.platform === 'win32'
   ? resolve(repoRoot, 'venv', 'Scripts', 'python.exe')
   : resolve(repoRoot, 'venv', 'bin', 'python');
-const testEnvironment = withWindowsGitOnPath(process.env);
+const testEnvironment = withWindowsPowerShellModules(withWindowsGitOnPath(process.env));
 const candidates = [testEnvironment.ORKAS_TEST_PYTHON, localPython, 'python3', 'python']
   .filter((value, index, all) => value && all.indexOf(value) === index);
 const python = candidates.find((candidate) => {

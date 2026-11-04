@@ -1596,4 +1596,16 @@ describe('stringifyMcpResult (via call_connector_tool)', () => {
     const r = await runTool(call, { connector_id: 'notion', tool_name: 'search', args: { query: 'x' } });
     expect(r.content).toContain('"type":"image"');
   });
+  it('delivers the sanitized original connector error intact to the native model without leaking it into telemetry', async () => {
+    fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
+    const original = 'HTTP 403: Request had insufficient authentication scopes.';
+    const content = JSON.stringify({ response: { error: original, data: { status_code: 403, code: 'NEW_VENDOR_SCOPE_741' } },
+      http_status: 200, redacted: true, truncated: false });
+    fixtures.callTool = async () => ({ isError: true, content: [{ type: 'text', text: content }] });
+    const { createConnectorMetaTools } = await loadModule();
+    const [, call] = await createConnectorMetaTools({ userId: UID });
+    expect(await runTool(call, { connector_id: 'notion', tool_name: 'search', args: {} }))
+      .toEqual({ content, isError: true });
+  });
+
 });

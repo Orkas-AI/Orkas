@@ -1,8 +1,8 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: gate-control
-description_zh: VideoStudio 的统一审核授权与状态转换规则；把用户决策、产物范围、原生 QA 状态映射为唯一下一动作，防止重复确认和错误恢复。
-description_en: VideoStudio's canonical gate-authorization and transition policy. Maps user decisions, artifact scope, and native QA state to one next action without duplicate confirmations or false recovery gates.
+description_zh: 确认、审批与恢复的唯一规则：把用户决定和 QA 状态映射为唯一的下一步。
+description_en: The single policy for confirmations, approvals and recovery: maps user decisions and QA state to the one next action.
 ---
 
 # gate-control
@@ -50,8 +50,7 @@ Keep the first two stops mechanically distinct:
 
 Before ending a turn on a user decision, all must be true:
 
-- it is direction, production plan, paid generation, keyframe preview, or final
-  video;
+- it is one of the review stops in the Delivery standards;
 - that decision is not already pending;
 - the exact complete review artifact exists now;
 - every native prerequisite succeeded for that exact candidate;
@@ -131,7 +130,7 @@ segments and surface at the production review; never create a segment gate.
 
 Before presenting or consuming any of the five stopping decisions, or handling
 a COMPOSE narration retry, read
-[confirmation-artifacts.md](references/confirmation-artifacts.md). It owns exact
+[confirmation-artifacts.md](references/confirmation-artifacts.md) once per turn. It owns exact
 post-direction artifact content, locator rules, gate table, video-language default, the once-per-
 visual-identity preview, and narration retry presentation. Do not load it for a
 pure technical recovery that will not reach a user stop.
@@ -183,9 +182,6 @@ After any gate submission, post-gate revision, or visual-revision error:
 4. Run the bundled resolver and obey `next_action`, `allowed_ops`, and
    `prohibited_ops`. Pass only the current submission's decision field.
 
-Even in a planning-only benchmark, name `composition.status`/`production.status`
-and `gate-control resolve-transition` as separate ordered steps.
-
 Pass `--origin` on signed-payload revisions. A current user-named change uses
 `origin=user`: apply it without a new confirmation and quote it in
 `decision_evidence`. A model-authored change or mixed user instruction plus model
@@ -199,6 +195,9 @@ Invoke the resolver only through the standard Skill Runner:
 
 Line values are `compose`, `auto`, `generate`, `edit`; artifact values are
 `composition`, `production`. AUTO passes `--artifact composition` for a child.
+Gate values are `gate_a` (direction), `gate_b` (plan), `gate_c` (paid generation),
+`gate_d` (final video) or `none`. A keyframe-preview reply is not a gate
+submission: continue with `composition.draft` without the resolver.
 Use exact enum values and `unknown` for missing evidence. When a current decision
 is present, omit old `--artifact-state` and `--approval-status`.
 

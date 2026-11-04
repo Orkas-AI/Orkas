@@ -363,8 +363,6 @@ const BASH_OUTPUT_MANIFEST_MAX_BYTES = 256 * 1024;
 const BASH_OUTPUT_MANIFEST_MAX_FILES = 500;
 const BASH_SNAPSHOT_FILE_MAX_BYTES = 512 * 1024;
 const BASH_SNAPSHOT_TOTAL_MAX_BYTES = 8 * 1024 * 1024;
-const PROCESS_WORKSPACE_SNAPSHOT_MAX = 64;
-const PROCESS_WORKSPACE_SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 type BashFileSnapshotEntry = {
   mtimeMs: number;
@@ -376,14 +374,6 @@ type BashFileSnapshotEntry = {
 type BashFileSnapshot = Map<string, BashFileSnapshotEntry>;
 const creationSnapshots = new WeakMap<BashFileSnapshot, CreationSnapshot>();
 const taskFileOwnership = new WeakMap<LocalToolsOpts, TaskFileOwnership>();
-type ProcessWorkspaceSnapshot = {
-  root: string;
-  command: string;
-  before: BashFileSnapshot;
-  createdAt: number;
-};
-
-const processWorkspaceSnapshots = new Map<string, ProcessWorkspaceSnapshot>();
 
 function shouldSkipBashProducedDir(name: string): boolean {
   return BASH_PRODUCED_SKIP_DIRS.has(name);
@@ -3353,6 +3343,29 @@ function mergeRiskReasons(target: LocalAccessRiskCategory[], source: readonly Lo
 
 const EXTERNAL_MUTATION_SCRIPT_MAX_BYTES = 512 * 1024;
 
+async function dataImportShadowed(root: string, modules: readonly string[]): Promise<boolean> {
+  // Native and sourceless modules can shadow the data libraries too. Bound the
+  // directory work for the stronger proof; uncertainty retains approval.
+  let entries = 1024;
+  for (const folder of [root, ...modules.map(name => path.join(root, name))]) {
+    try {
+      const directory = await fs.promises.opendir(folder);
+      for await (const entry of directory) {
+        if (--entries < 0) return true;
+        const names = folder === root ? modules : ['__init__'];
+        const candidate = entry.name.toLowerCase();
+        if (names.some(name => candidate.startsWith(name + '.')
+          && ['.so', '.pyd', '.pyc'].some(extension => candidate.endsWith(extension)))) return true;
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // A file in sys.path can be a zip importer. Its contents are unresolved.
+      if (code !== 'ENOENT' && !(code === 'ENOTDIR' && folder !== root)) return true;
+    }
+  }
+  return false;
+}
+
 async function classifyBashRiskIncludingScripts(command: string, workingDir: string, opts: LocalToolsOpts, ctx?: ToolContext) {
   const heredocs = analyzeBashHeredocs(command);
   const base = classifyBashCommand(heredocs.shellSurface);
@@ -3438,10 +3451,27 @@ async function classifyBashRiskIncludingScripts(command: string, workingDir: str
     ...scriptRefs.map(ref => path.dirname(path.resolve(workingDir, ref))),
     ...segments.flatMap(s => (s.env.PYTHONPATH || '').split(path.delimiter).filter(Boolean).map(p => path.resolve(s.workingDir || workingDir, p))),
   ])];
-  const shadowedImport = externalMutations.some(f => f.resource) && (importRoots.length > 32 || importRoots.some(root =>
-    ['sqlite3.py', 'sqlite3/__init__.py', 'pathlib.py', 'pathlib/__init__.py'].some(name =>
+  const importCandidates = [...new Set(externalMutations.flatMap(f => f.resource?.imports ?? ['sqlite3', 'pathlib']))]
+    .flatMap(name => [name + '.py', name + '/__init__.py']);
+  let shadowedImport = externalMutations.some(f => f.resource) && (importRoots.length > 32 || importRoots.some(root =>
+    importCandidates.some(name =>
       fs.existsSync(path.join(root, name)) || filePayloads.some(payload =>
         directories.some(dir => dir !== null && path.resolve(dir, payload.fileTarget!) === path.join(root, name))))));
+  const dataModules = [...new Set(externalMutations.flatMap(f => f.resource?.imports ?? []))];
+  if (!shadowedImport && dataModules.length) {
+    const nativeOrBytecode = (file: string, root: string) => dataModules.some(name => {
+      const relative = path.relative(root, file).split(path.sep).join('/').toLowerCase();
+      return !relative || [name + '.', name + '/__init__.'].some(prefix => relative.startsWith(prefix)
+        && !relative.slice(prefix.length).includes('/') && ['.so', '.pyd', '.pyc'].some(ext => relative.endsWith(ext)));
+    });
+    for (const root of importRoots) {
+      if (await dataImportShadowed(root, dataModules) || filePayloads.some(payload =>
+        directories.some(dir => dir !== null && nativeOrBytecode(path.resolve(dir, payload.fileTarget!), root)))) {
+        shadowedImport = true;
+        break;
+      }
+    }
+  }
   const localResources = new Map<string, boolean>();
   const isLocal = (database: string): boolean => {
     if (shadowedImport || uncertainDirectory || !directories.length || directories.some(dir => dir === null)) return false;
@@ -4928,119 +4958,16 @@ function processSessionContext(opts: LocalToolsOpts, ctx: ToolContext): ToolCont
   };
 }
 
-function parseProcessToolPayload(result: ToolResult): Record<string, unknown> | null {
-  try {
-    const parsed = JSON.parse(String(result.content || '')) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function pruneProcessWorkspaceSnapshots(now = Date.now()): void {
-  for (const [sessionId, snapshot] of processWorkspaceSnapshots) {
-    if (now - snapshot.createdAt > PROCESS_WORKSPACE_SNAPSHOT_MAX_AGE_MS) {
-      processWorkspaceSnapshots.delete(sessionId);
-    }
-  }
-  while (processWorkspaceSnapshots.size >= PROCESS_WORKSPACE_SNAPSHOT_MAX) {
-    const oldest = processWorkspaceSnapshots.keys().next().value as string | undefined;
-    if (!oldest) break;
-    processWorkspaceSnapshots.delete(oldest);
-  }
-}
-
-function processPayloadIsTerminal(payload: Record<string, unknown> | null): boolean {
-  const status = String(payload?.status ?? '');
-  return status === 'exited' || status === 'error' || status === 'stopped';
-}
-
-async function finalizeProcessWorkspaceSnapshot(
-  opts: LocalToolsOpts,
-  result: ToolResult,
-  snapshot: ProcessWorkspaceSnapshot,
-): Promise<ToolResult> {
-  const fileChanges = await emitBashProducedFiles(
-    opts,
-    snapshot.before,
-    snapshot.root,
-    snapshot.command,
-  );
-  if (!fileChanges.length) return result;
-  return {
-    ...result,
-    observations: {
-      ...(result.observations ?? {}),
-      fileChanges: [
-        ...(result.observations?.fileChanges ?? []),
-        ...fileChanges,
-      ],
-    },
-  };
-}
-
-/** Permission-gated PC adapters for core-agent's persistent process sessions.
- * The core owns process lifecycle/cursors; PC owns command approval and
- * conversation isolation. */
+/** PC binds continuation calls to the current conversation. Command startup,
+ * approval and produced-file tracking belong to bash's managed command path. */
 function createHostProcessTools(opts: LocalToolsOpts): AgentTool[] {
   return getProcessSessionTools().map((coreTool) => ({
     ...coreTool,
     inspectReadContinuation(input, ctx) {
-      return coreTool.inspectReadContinuation?.(input, {
-        ...ctx,
-        state: { ...ctx.state, processSessionOwner: `${opts.userId ?? ''}:${opts.cid ?? ''}` },
-      });
+      return coreTool.inspectReadContinuation?.(input, processSessionContext(opts, ctx));
     },
     async execute(input, ctx) {
-      const action = String(input.action ?? '');
-      if (action === 'start') {
-        const command = String(input.command ?? '').trim();
-        if (!command) return { content: errText('E_BAD_INPUT', '`command` is required'), isError: true };
-        const workingDir = path.resolve(ctx.workingDir ?? '.');
-        const mode = getLocalExecMode();
-        const filesystemGate = await guardBashFilesystemTargets(
-          opts,
-          input,
-          ctx,
-          workingDir,
-          !localAccessRequiresSensitiveApproval(mode),
-        );
-        if (filesystemGate.result) return filesystemGate.result;
-        const gate = await gateInteractiveCliStart(opts, command, {
-          workingDir,
-          approvedReasons: filesystemGate.approvedReasons,
-          unresolvedPaths: filesystemGate.unresolvedPaths,
-          keyFacts: filesystemGate.keyFacts,
-        }, ctx);
-        if (gate) return gate;
-        pruneProcessWorkspaceSnapshots();
-        const snapshot: ProcessWorkspaceSnapshot = {
-          root: workingDir,
-          command,
-          before: collectBashFileSnapshot(workingDir, taskFileOwnership.get(opts)?.token),
-          createdAt: Date.now(),
-        };
-        const result = await coreTool.execute(input, processSessionContext(opts, ctx));
-        const payload = parseProcessToolPayload(result);
-        const sessionId = String(payload?.session_id ?? '').trim();
-        if (!sessionId) return result;
-        if (processPayloadIsTerminal(payload)) {
-          return finalizeProcessWorkspaceSnapshot(opts, result, snapshot);
-        }
-        processWorkspaceSnapshots.set(sessionId, snapshot);
-        return result;
-      }
-      const result = await coreTool.execute(input, processSessionContext(opts, ctx));
-      if (action !== 'read' && action !== 'stop') return result;
-      const payload = parseProcessToolPayload(result);
-      if (!processPayloadIsTerminal(payload)) return result;
-      const sessionId = String(payload?.session_id ?? input.session_id ?? '').trim();
-      const snapshot = processWorkspaceSnapshots.get(sessionId);
-      if (!snapshot) return result;
-      processWorkspaceSnapshots.delete(sessionId);
-      return finalizeProcessWorkspaceSnapshot(opts, result, snapshot);
+      return coreTool.execute(input, processSessionContext(opts, ctx));
     },
   }));
 }
@@ -5127,8 +5054,10 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
   };
 }
 
-function fileBufferHash(body: Buffer): string {
-  return `sha256:${crypto.createHash('sha256').update(body).digest('hex')}`;
+function fileBufferHash(body: Buffer, suffix?: Buffer): string {
+  const hash = crypto.createHash('sha256').update(body);
+  if (suffix) hash.update(suffix);
+  return `sha256:${hash.digest('hex')}`;
 }
 
 function appendFileReceipt(
@@ -5146,6 +5075,7 @@ function appendFileReceipt(
 function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'append_file',
+    compatibilityInputFields: ['expected_size'],
     description:
       'Append one complete UTF-8 chunk to an existing text file with optimistic concurrency and replay-safe behavior. Use edit_file or apply_patch for targeted changes.',
     inputSchema: {
@@ -5161,32 +5091,26 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
         },
         base_revision: {
           type: 'string',
-          description: 'Opaque revision from the preceding file-tool result. Required unless legacy expected_size is provided; stale revisions fail without writing and exact replay is idempotent.',
+          description: 'Opaque revision from the preceding file-tool result. Stale revisions fail without writing; exact replay is idempotent.',
           pattern: '^file_rev_[A-Za-z0-9_-]{16}$',
         },
-        expected_size: {
-          type: 'number',
-          description: 'Legacy expected current byte size. Omit when base_revision is available.',
-          minimum: 0,
-        },
       },
-      required: ['path', 'content'],
+      required: ['path', 'content', 'base_revision'],
     },
     async execute(input, ctx) {
       const rawPath = String(input.path ?? '');
       const content = typeof input.content === 'string' ? input.content : null;
       const baseRevision = typeof input.base_revision === 'string' ? input.base_revision.trim() : '';
-      const hasExpectedSize = input.expected_size !== undefined && input.expected_size !== null;
-      const expectedSize = Number(input.expected_size);
+      if (input.expected_size !== undefined) return { content: errText('E_BAD_INPUT', 'expected_size is unsupported; use base_revision'), isError: true };
       if (!rawPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       if (content === null || content.length === 0) {
         return { content: errText('E_BAD_INPUT', '`content` must be a non-empty string'), isError: true };
       }
-      if (!baseRevision && (!hasExpectedSize || !Number.isSafeInteger(expectedSize) || expectedSize < 0)) {
+      if (!baseRevision) {
         return {
-          content: errText('E_BAD_INPUT', 'copy `base_revision` from the preceding file result; legacy `expected_size` must be a non-negative safe integer byte size'),
+          content: errText('E_BAD_INPUT', 'base_revision from the preceding file result is required'),
           isError: true,
-          observations: fileFailure('E_BAD_INPUT', 'append_precondition', { stage: 'input', revision_provided: !!baseRevision, size_provided: hasExpectedSize, size_valid: hasExpectedSize && Number.isSafeInteger(expectedSize) && expectedSize >= 0 }),
+          observations: fileFailure('E_BAD_INPUT', 'append_precondition', { stage: 'input', revision_provided: false }),
         };
       }
 
@@ -5228,62 +5152,30 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
         const currentHash = fileBufferHash(before);
         const currentRevision = issueFileRevision(ctx, abs, before.length, currentHash);
         const chunkHash = fileBufferHash(chunk);
-        const revisionRecord = baseRevision ? resolveFileRevision(ctx, baseRevision) : null;
+        const revisionRecord = resolveFileRevision(ctx, baseRevision);
 
-        if (baseRevision) {
-          const replay = findAppendReplay(ctx, baseRevision, chunkHash);
-          if (revisionRecord?.path !== canonicalFileRevisionPath(abs)) {
-            return {
-              content: `${errText(
-                revisionRecord ? 'E_REVISION_PATH_MISMATCH' : 'E_REVISION_UNKNOWN',
-                revisionRecord
-                  ? `${abs}: base_revision belongs to a different file; no bytes were written`
-                  : `${abs}: base_revision is not available in this run; use the returned current revision`,
-              )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
-              isError: true,
-              observations: fileFailure(revisionRecord ? 'E_REVISION_PATH_MISMATCH' : 'E_REVISION_UNKNOWN', revisionRecord ? 'revision_path' : 'revision_unknown', { stage: 'freshness', revision_provided: true, revision_found: !!revisionRecord }),
-            };
-          }
-          if (revisionRecord.hash !== currentHash || revisionRecord.size !== before.length) {
-            const replayEnd = replay?.baseSize != null
-              ? replay.baseSize + replay.appendedBytes
-              : revisionRecord.size + chunk.length;
-            const replayed = !!replay
-              && replay.baseSize === revisionRecord.size
-              && replay.appendedBytes === chunk.length
-              && replayEnd <= before.length
-              && before.subarray(replay.baseSize, replayEnd).equals(chunk);
-            if (replayed) {
-              recordRead(ctx, abs, st, currentHash);
-              return {
-                content: appendFileReceipt(
-                  abs,
-                  chunk.length,
-                  before.length,
-                  currentHash,
-                  currentRevision,
-                  true,
-                ),
-              };
-            }
-            return {
-              content: `${errText(
-                'E_STALE',
-                `${abs}: base_revision no longer matches the current file; no bytes were written`,
-              )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
-              isError: true,
-              observations: fileFailure('E_STALE', 'revision_changed', { stage: 'freshness', revision_provided: true, revision_found: true, revision_matches: false }),
-            };
-          }
+        const replay = findAppendReplay(ctx, baseRevision, chunkHash);
+        if (revisionRecord?.path !== canonicalFileRevisionPath(abs)) {
+          return {
+            content: `${errText(
+              revisionRecord ? 'E_REVISION_PATH_MISMATCH' : 'E_REVISION_UNKNOWN',
+              revisionRecord
+                ? `${abs}: base_revision belongs to a different file; no bytes were written`
+                : `${abs}: base_revision is not available in this run; use the returned current revision`,
+            )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
+            isError: true,
+            observations: fileFailure(revisionRecord ? 'E_REVISION_PATH_MISMATCH' : 'E_REVISION_UNKNOWN', revisionRecord ? 'revision_path' : 'revision_unknown', { stage: 'freshness', revision_provided: true, revision_found: !!revisionRecord }),
+          };
         }
-
-        // A provider/host retry may replay a tool call after its write already
-        // committed. Detect the exact bytes at the declared offset and return
-        // the current receipt instead of appending them twice.
-        if (!baseRevision && before.length !== expectedSize) {
-          const replayEnd = expectedSize + chunk.length;
-          const replayed = replayEnd <= before.length
-            && before.subarray(expectedSize, replayEnd).equals(chunk);
+        if (revisionRecord.hash !== currentHash || revisionRecord.size !== before.length) {
+          const replayEnd = replay?.baseSize != null
+            ? replay.baseSize + replay.appendedBytes
+            : revisionRecord.size + chunk.length;
+          const replayed = !!replay
+            && replay.baseSize === revisionRecord.size
+            && replay.appendedBytes === chunk.length
+            && replayEnd <= before.length
+            && before.subarray(replay.baseSize, replayEnd).equals(chunk);
           if (replayed) {
             recordRead(ctx, abs, st, currentHash);
             return {
@@ -5300,10 +5192,10 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
           return {
             content: `${errText(
               'E_STALE',
-              `${abs}: expected ${expectedSize} bytes before append, current size is ${before.length}; use the returned revision and regenerate only the missing chunk`,
+              `${abs}: base_revision no longer matches the current file; no bytes were written`,
             )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
             isError: true,
-            observations: fileFailure('E_STALE', 'size_changed', { stage: 'freshness', revision_provided: false, size_provided: true, size_valid: true }),
+            observations: fileFailure('E_STALE', 'revision_changed', { stage: 'freshness', revision_provided: true, revision_found: true, revision_matches: false }),
           };
         }
 
@@ -5318,28 +5210,28 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
           return { content: errText('E_APPEND_FAILED', `${abs}: write failed: ${(err as Error).message}`), isError: true };
         }
 
-        const after = Buffer.concat([before, chunk]);
-        const beforeHash = fileBufferHash(before);
-        const afterHash = fileBufferHash(after);
+        // The freshness check already hashed this immutable snapshot. Hash the
+        // exact concatenated bytes without allocating another full-file buffer.
+        const beforeHash = currentHash;
+        const afterBytes = before.length + chunk.length;
+        const afterHash = fileBufferHash(before, chunk);
         const nextStat = fs.statSync(abs);
         recordRead(ctx, abs, nextStat, afterHash);
-        const nextRevision = issueFileRevision(ctx, abs, after.length, afterHash);
-        if (baseRevision) {
-          recordAppendReplay(ctx, {
-            baseRevision,
-            contentHash: chunkHash,
-            baseSize: before.length,
-            appendedBytes: chunk.length,
-            resultRevision: nextRevision,
-            resultHash: afterHash,
-          });
-        }
+        const nextRevision = issueFileRevision(ctx, abs, afterBytes, afterHash);
+        recordAppendReplay(ctx, {
+          baseRevision,
+          contentHash: chunkHash,
+          baseSize: before.length,
+          appendedBytes: chunk.length,
+          resultRevision: nextRevision,
+          resultHash: afterHash,
+        });
         // append_file refuses a path it cannot read, so the target always
         // pre-existed.
         try { await opts.onFileWritten?.(abs, { preExisting: true }); }
         catch (err) { log.warn('onFileWritten callback failed', { error: logErrorRef(err) }); }
         return {
-          content: appendFileReceipt(abs, chunk.length, after.length, afterHash, nextRevision, false),
+          content: appendFileReceipt(abs, chunk.length, afterBytes, afterHash, nextRevision, false),
           observations: {
             fileChanges: [{
               operation: 'update',
@@ -5349,7 +5241,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
               beforeHash,
               afterHash,
               beforeBytes: before.length,
-              afterBytes: after.length,
+              afterBytes,
               coverage: 'exact',
             }],
           },
@@ -5501,11 +5393,8 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
       if (oldStr === null || newStr === null) {
         return { content: errText('E_BAD_INPUT', '`old_string` and `new_string` are both required strings'), isError: true };
       }
-      if (oldStr.length === 0) {
+      if (oldStr.length === 0 && oldStr !== newStr) {
         return { content: errText('E_BAD_INPUT', '`old_string` must be non-empty'), isError: true };
-      }
-      if (oldStr === newStr) {
-        return { content: errText('E_BAD_INPUT', '`old_string` and `new_string` are identical — no-op rejected'), isError: true };
       }
       const replaceAll = input.replace_all === true;
       const expectedHash = typeof input.expected_hash === 'string' ? input.expected_hash.trim() : '';
@@ -5575,6 +5464,13 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
             isError: true,
             observations: fileFailure(block.code, block.code === 'E_NOT_READ' ? 'not_read' : expectedHash ? 'expected_hash_changed' : 'file_changed', { stage: 'freshness', ...baseline, expected_hash_provided: !!expectedHash }),
           };
+        }
+
+        if (oldStr === newStr) {
+          // No replacement is needed; retain the verified version without a write.
+          recordRead(ctx, abs, st, currentHash);
+          const revision = issueFileRevision(ctx, abs, Buffer.byteLength(body, 'utf8'), currentHash);
+          return { content: `<file path="${abs}" edited="0" kind="${kind}" file_hash="${currentHash}" revision="${revision}"/>` };
         }
 
         let count = countOccurrences(body, oldStr);

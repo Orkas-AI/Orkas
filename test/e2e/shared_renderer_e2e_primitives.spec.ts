@@ -103,7 +103,7 @@ test.describe('shared Renderer primitives', () => {
   });
 
   test('hydrates the icon catalog, contains sanitizer loss, and loads offline math on demand', async ({
-    appPage,
+    appPage, orkas,
   }) => {
     const iconState = await appPage.locator('[data-ui-icon]').evaluateAll((nodes) => ({
       count: nodes.length,
@@ -113,6 +113,7 @@ test.describe('shared Renderer primitives', () => {
     expect(iconState.count).toBeGreaterThan(30);
     expect(iconState).toMatchObject({ missing: 0, exposed: 0 });
 
+    const fallbackCheckpoint = orkas.rendererDiagnosticCheckpoint();
     const fallback = await appPage.evaluate(() => {
       const root = window as any;
       const purifier = root.DOMPurify;
@@ -144,9 +145,12 @@ test.describe('shared Renderer primitives', () => {
       };
     });
     expect(math).toEqual({ rendered: true, runtimes: 1 });
+    await orkas.acknowledgeRendererFailure({ surface: appPage, after: fallbackCheckpoint, count: 1,
+      detail: '[security] DOMPurify unavailable — rendering HTML as text' });
   });
 
-  test('rejects an XSS attack matrix after prototype pollution', async ({ appPage }, testInfo) => {
+  test('rejects an XSS attack matrix after prototype pollution', async ({ appPage, orkas }, testInfo) => {
+    const missingImageCheckpoint = orkas.rendererDiagnosticCheckpoint();
     const expectedMissingImageUrl = new URL('x-invalid', appPage.url()).href;
     const resourceFailures: Array<{
       matchesInjectedImage: boolean;
@@ -241,6 +245,8 @@ test.describe('shared Renderer primitives', () => {
         resourceKind: 'image',
         errorCode: 'net::ERR_FILE_NOT_FOUND',
       }]);
+      await orkas.acknowledgeRendererFailure({ surface: appPage, after: missingImageCheckpoint, count: 1,
+        detail: 'Failed to load resource: net::ERR_FILE_NOT_FOUND' });
       await appPage.evaluate((evidence) => {
         console.info('[e2e:xss-resource-failure] ' + JSON.stringify(evidence));
       }, resourceFailures);

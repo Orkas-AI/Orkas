@@ -1,7 +1,6 @@
 ---
 name: skill-creator
-description_zh: "创建、编辑或忠实导入用户明确要求的自定义 Skill；不用于普通任务执行或单纯安装外部包。"
-description_en: "Create, edit or faithfully import explicitly requested custom Skills; not ordinary task execution or plain external-package installation."
+description: "Create, edit or faithfully import explicitly requested custom Skills; not ordinary task execution or plain external-package installation."
 ---
 
 # skill-creator

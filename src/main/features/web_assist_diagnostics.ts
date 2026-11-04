@@ -14,11 +14,21 @@ const FAILURES = {
 } as const;
 type Failure = keyof typeof FAILURES;
 
+interface RendererExitDetails {
+  reason: unknown;
+  exitCode: unknown;
+}
+const RENDERER_EXIT_REASONS = new Set([
+  'clean-exit', 'abnormal-exit', 'killed', 'crashed', 'oom',
+  'launch-failed', 'integrity-failure', 'memory-eviction',
+]);
+
 export function createWebAssistDiagnostics() {
   const last = new Map<Failure, number>();
   const suppressed = new Map<Failure, number>();
   let emitted: number[] = [];
-  return (sender: Pick<WebContents, 'isDestroyed'>, failure: Failure, netCode?: unknown): void => {
+  return (sender: Pick<WebContents, 'isDestroyed'>, failure: Failure, netCode?: unknown,
+    _context?: unknown, exitDetails?: RendererExitDetails): void => {
     if (!Object.hasOwn(FAILURES, failure) || sender.isDestroyed()) return;
     const now = Date.now();
     emitted = emitted.filter(time => now - time < WINDOW_MS);
@@ -37,8 +47,20 @@ export function createWebAssistDiagnostics() {
         ? { net_error_code: netCode } : {}),
     };
     suppressed.delete(failure);
-    // Best effort only: local diagnostics must never change navigation or recovery.
-    try { log.warn('browser failure', payload); } catch { /* no recursive logging */ }
+    // Native exit facts stay in the sampled local warning. No page, URL or exception data is retained.
+    let localExitDiagnostic = {};
+    if (failure === 'renderer_gone') {
+      let reason = 'unknown';
+      let code: number | 'unknown' = 'unknown';
+      try {
+        if (typeof exitDetails?.reason === 'string' && RENDERER_EXIT_REASONS.has(exitDetails.reason)) reason = exitDetails.reason;
+        if (typeof exitDetails?.exitCode === 'number' && Number.isSafeInteger(exitDetails.exitCode)) code = exitDetails.exitCode;
+      } catch { /* unavailable details do not affect the incident */ }
+      localExitDiagnostic = { renderer_exit_reason: reason, renderer_exit_code: code };
+    }
+    // Best effort only: diagnostics must never change navigation or recovery.
+    try { log.warn('browser failure', { ...payload, ...localExitDiagnostic }); } catch { /* no recursive logging */ }
+
   };
 }
 

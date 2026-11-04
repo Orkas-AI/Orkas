@@ -21,6 +21,7 @@ function loadStatusHint() {
       return key;
     },
   });
+  vm.runInContext(fs.readFileSync(path.join(rendererRoot, 'shared/local-cli-defaults.js'), 'utf8'), context);
   vm.runInContext(source, context, { filename: 'local-agents.js' });
   return {
     hint: windowObject.getLocalCliUnavailableHint as (entry: Record<string, unknown> | undefined) => string,
@@ -119,6 +120,7 @@ function loadExternalSelectorHarness() {
       return selectApi;
     },
   });
+  vm.runInContext(fs.readFileSync(path.join(rendererRoot, 'shared/local-cli-defaults.js'), 'utf8'), context);
   vm.runInContext(source, context, { filename: 'local-agents.js' });
   const takePendingInvoke = (predicate?: (pending: {
     channel: string;

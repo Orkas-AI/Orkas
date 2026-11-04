@@ -19,6 +19,7 @@
   const HAS_GZIP =
     typeof CompressionStream === 'function' && typeof DecompressionStream === 'function';
   const VOICE_MAX_DURATION_MS = 120 * 1000;
+  const ASR_CLOSE_CODES = [1000, 1001, 1002, 1003, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015];
   const voiceLog = (() => {
     try { return typeof createLogger === 'function' ? createLogger('voice-input') : null; } catch { return null; }
   })();
@@ -48,10 +49,11 @@
     const timings = attempt.timings;
     const finalWait = timings.stop_ms !== undefined && timings.final_text_ms !== undefined
       ? Math.max(0, timings.final_text_ms - timings.stop_ms) : undefined;
-    // One local summary per attempt, numeric milestones only. Never retain audio,
+    // One local summary per attempt, bounded timing and close state. Never retain audio,
     // transcript text, credentials, or the session-bearing WebSocket URL.
     try { voiceLog?.info('voice timing', { ...timings, final_wait_ms: finalWait,
-      phase: attempt.phase, terminal: timings.final_text_ms !== undefined }); } catch {}
+      phase: attempt.phase, terminal: timings.final_text_ms !== undefined,
+      ...(attempt.client ? { asr_close_context: attempt.client.diagnosticContext() } : {}) }); } catch {}
   }
 
   async function gzipBytes(u8) {
@@ -95,6 +97,33 @@
       this._captureFlush = null;
       this._finishTimer = null;
       this._connectTimer = null;
+      this._resetDiagnostics();
+    }
+
+    _resetDiagnostics() {
+      this._closeSource = 'none';
+      this._closeCode = 'unknown';
+      this._closeClean = 'unknown';
+      this._endSent = false;
+      this._terminalReceived = false;
+      this._pendingAtClose = false;
+      this._incoming = null;
+    }
+
+    _recordClose(source, event) {
+      if (this._closeSource !== 'none') return;
+      this._closeSource = source;
+      this._closeCode = ASR_CLOSE_CODES.includes(event?.code) ? String(event.code) : 'unknown';
+      this._closeClean = typeof event?.wasClean === 'boolean' ? (event.wasClean ? 'clean' : 'unclean') : 'unknown';
+      this._pendingAtClose = !!this._incoming?.pending;
+    }
+
+    diagnosticContext() {
+      // One closed, content-free tuple binds all facts on the existing result.
+      // The first close trigger wins; terminal delivery can finish after close.
+      return ['v1', this._closeSource, this._closeCode, this._closeClean,
+        this._endSent ? 'end' : 'no_end', this._terminalReceived ? 'terminal' : 'no_terminal',
+        this._pendingAtClose ? 'pending' : 'drained'].join('|');
     }
 
     _emit(name, ...args) {
@@ -116,6 +145,7 @@
 
     async start() {
       if (this._ws && (this._ws.readyState === WebSocket.OPEN || this._ws.readyState === WebSocket.CONNECTING)) return;
+      this._resetDiagnostics();
       const epoch = ++this._captureEpoch;
       this._closeEmitted = false;
       // Acquire the mic FIRST so a permission denial fails before we open the
@@ -157,11 +187,13 @@
       this._ws = ws;
       this._connectTimer = setTimeout(() => {
         if (this._ws !== ws) return;
+        this._recordClose('connect_timeout');
         this._emit('onError', Object.assign(new Error(), { code: 'network' }));
         if (this._ws === ws) this.close();
       }, 60_000);
       this._lastText = '';
       const incoming = { tail: Promise.resolve(), pending: 0 };
+      this._incoming = incoming;
       this._sendTail = Promise.resolve();
       this._inputEnded = false;
       this._closeEmitted = false;
@@ -186,13 +218,15 @@
       };
       ws.onmessage = (ev) => {
         if (this._ws !== ws) return;
-        if (typeof ev.data === 'string') { this._handleJSON(ev.data); return; }
+        if (typeof ev.data === 'string' && !incoming.pending) { this._handleJSON(ev.data); return; }
         // Binary gzip decoding is async; browser event dispatch does not
-        // wait for it. Keep transcript delivery in this socket's wire order.
+        // wait for it. Queue later JSON controls too: an error/timeout must
+        // not close the client before an admitted transcript is delivered.
         incoming.pending++;
         incoming.tail = incoming.tail.then(() => {
           if (this._ws !== ws) return;
-          return this._handleBinary(ev.data, ws);
+          return typeof ev.data === 'string'
+            ? this._handleJSON(ev.data) : this._handleBinary(ev.data, ws);
         }).catch(() => {}).finally(() => { incoming.pending--; });
       };
       ws.onerror = (e) => {
@@ -212,7 +246,8 @@
       };
       ws.onclose = (ev) => {
         if (this._ws !== ws) return;
-        try { if (voiceLog) voiceLog.info('ASR websocket close', { code: ev && ev.code, wasClean: ev && ev.wasClean }); } catch {}
+        this._recordClose('socket', ev);
+        try { voiceLog?.info('ASR websocket close', { asr_close_context: this.diagnosticContext() }); } catch {}
         this._captureEpoch++;
         this._inputEnded = true;
         this._running = false;
@@ -262,6 +297,7 @@
       const text = String(result.text || result.punctuated_text || '');
       this._lastText = text || this._lastText;
       const isLast = !!((obj && obj.is_last_package) || result.last);
+      if (isLast) this._terminalReceived = true;
       this._emit('onResult', { text: this._lastText, last: isLast });
       if (isLast) {
         this._running = false;
@@ -319,6 +355,7 @@
             ws.send(payload);
             if (last) {
               ws.send('__END__');
+              this._endSent = true;
               this._running = false;
             }
           } catch {
@@ -565,6 +602,7 @@ registerProcessor('orkas-asr-capture', C);`;
       try {
         this._finishTimer = setTimeout(() => {
           if (!this._pendingClose || this._ws !== ws) return;
+          this._recordClose('final_timeout');
           if (this._captureFlush) this._emit('onError', new Error('incomplete_capture'));
           if (this._ws === ws) this.close();
         }, 10_000);
@@ -572,6 +610,7 @@ registerProcessor('orkas-asr-capture', C);`;
     }
 
     close() {
+      this._recordClose('client');
       clearTimeout(this._connectTimer);
       clearTimeout(this._finishTimer);
       this._captureEpoch++;

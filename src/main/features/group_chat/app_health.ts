@@ -5,8 +5,8 @@
  * and already-localized user-facing messages only — never credentials, base
  * URLs, file paths, or free-form provider error text. The `tasks` probe is
  * injected by the bus (its running-state maps live there) to avoid an import
- * cycle. A probe failure degrades to an `unavailable` marker instead of
- * failing the whole snapshot.
+ * cycle. Every domain distinguishes a completed check from a failed check
+ * whose actual state is unknown, without failing the whole snapshot.
  */
 
 import * as auth from '../auth';
@@ -18,6 +18,7 @@ import {
   readEnabledMap,
 } from '../component_enabled';
 import * as kbVector from '../kb_vector';
+import { appHealthProbeFailed, appHealthProbeSucceeded } from './app_health_contract';
 
 export type AppHealthDomain = 'model' | 'connectors' | 'kb' | 'tasks';
 export const APP_HEALTH_DOMAINS: readonly AppHealthDomain[] = ['model', 'connectors', 'kb', 'tasks'];
@@ -90,12 +91,12 @@ export async function collectAppHealth(
   const out: Record<string, unknown> = {};
   for (const domain of domains) {
     try {
-      if (domain === 'model') out.model = await modelProbe();
-      else if (domain === 'connectors') out.connectors = await connectorsProbe(uid);
-      else if (domain === 'kb') out.kb = kbVector.statusSummary(uid);
-      else if (domain === 'tasks') out.tasks = tasksProbe();
+      if (domain === 'model') out.model = appHealthProbeSucceeded(await modelProbe());
+      else if (domain === 'connectors') out.connectors = appHealthProbeSucceeded(await connectorsProbe(uid));
+      else if (domain === 'kb') out.kb = appHealthProbeSucceeded(kbVector.statusSummary(uid));
+      else if (domain === 'tasks') out.tasks = appHealthProbeSucceeded(tasksProbe());
     } catch {
-      out[domain] = { unavailable: true };
+      out[domain] = appHealthProbeFailed();
     }
   }
   return out;

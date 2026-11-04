@@ -39,6 +39,7 @@ afterEach(() => {
   vi.doUnmock('node:fs');
   vi.doUnmock('@earendil-works/pi-ai/oauth');
   vi.doUnmock('#core-agent');
+  vi.doUnmock('../../../src/main/model/core-agent/external-providers');
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -1317,6 +1318,7 @@ describe('auth › listModels', () => {
     expect((await a.listModels('openai-codex')).models.map((model) => model.id)).toEqual([
       'gpt-6-astra',
       'gpt-6.1-sol',
+      'gpt-6.1-terra',
       'gpt-6-sol',
       'gpt-6-luna',
       'gpt-5.6-sol',
@@ -2885,4 +2887,35 @@ describe('public availability remediation', () => {
     await auth.removeEntry(saved.entryId);
     expect((await auth.listSettingsEntries()).entries).toEqual([]);
   });
+  it.each(['context', 'legacy'] as const)(
+    'refuses misplaced %s credentials under the selected local owner', async (format) => {
+      const foreignUid = 'different-account';
+      const paths = await import('../../../src/main/paths');
+      const secrets = await import('../../../src/main/util/local-secret-store');
+      const vault = await import('../../../src/main/util/crypto-vault');
+      const users = await import('../../../src/main/features/users');
+      const json = JSON.stringify({ version: 6, profiles: {
+        'openai:foreign': { provider: 'openai', type: 'api_key', label: 'foreign',
+          key: 'sk-foreign-must-stay-private-xxxxxxxx', createdAt: 1, lastUsed: 0 },
+      }, entries: [] });
+      const raw = vault.encrypt(format === 'context' ? `auth.profiles\0${foreignUid}\0auth-profiles.json` : foreignUid, json);
+      const file = paths.userAuthProfilesFile(TEST_UID);
+      const foreignFile = paths.userAuthProfilesFile(foreignUid);
+      fs.mkdirSync(path.dirname(foreignFile), { recursive: true });
+      fs.writeFileSync(file, raw, 'utf8');
+      fs.writeFileSync(foreignFile, raw, 'utf8');
+      const a = await import('../../../src/main/features/auth');
+
+      expect((await a.listProviders()).providers.flatMap(p => p.profiles)).toEqual([]);
+      await expect(a.addApiKey('openai', 'sk-do-not-replace-xxxxxxxx')).rejects.toThrow();
+      expect(fs.readFileSync(file, 'utf8')).toBe(raw);
+      expect(fs.readFileSync(foreignFile, 'utf8')).toBe(raw);
+      expect(JSON.stringify(loggerMocks.warn.mock.calls)).not.toContain('sk-foreign-must-stay-private');
+
+      users.activateUser(foreignUid);
+      expect((await a.listProviders()).providers.find(p => p.id === 'openai')?.profiles[0]?.masked).toBe('sk-f…xxxx');
+      users.activateUser(TEST_UID);
+      expect(fs.readFileSync(file, 'utf8')).toBe(raw);
+    },
+  );
 });

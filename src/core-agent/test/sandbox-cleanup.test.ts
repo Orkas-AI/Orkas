@@ -69,12 +69,12 @@ describe("Windows shell cleanup", () => {
     const onComplete = vi.fn();
     const onRootTerminated = vi.fn();
     killProcessTree(child as any, "SIGTERM", { platform: "win32", onComplete, onRootTerminated });
-    killer.stdout.emit("data", Buffer.from("ready\n"));
+    killer.stdout.emit("data", Buffer.from("accepting\nready:0\n"));
     child.exitCode = 4294967295;
     killer.emit("exit", 0);
     // A helper's exit can precede its final pipe data. Do not finish early.
     expect(onComplete).not.toHaveBeenCalled();
-    killer.stdout.emit("data", Buffer.from("root-terminated\n"));
+    killer.stdout.emit("data", Buffer.from("done:0:1\n"));
     killer.emit("close", 0);
     expect(onRootTerminated).toHaveBeenCalledTimes(1);
     expect(onComplete).toHaveBeenCalledTimes(1);
@@ -90,17 +90,18 @@ describe("Windows shell cleanup", () => {
       const onRootTerminated = vi.fn();
       killProcessTree(child as any, "SIGTERM", { platform: "win32", onRootTerminated });
       if (outcome === "unauthorized") child.exitCode = 7;
-      killer.stdout.emit("data", Buffer.from("ready\n"));
+      killer.stdout.emit("data", Buffer.from("accepting\nready:0\n"));
       child.exitCode = 7;
+      if (outcome === "natural-exit") killer.stdout.emit("data", Buffer.from("done:0:0\n"));
       if (outcome !== "natural-exit") killer.stdout.emit("data", Buffer.from(
-        "root-terminated\n" + (outcome === "malformed" ? "unexpected\n" : ""),
+        "done:0:1\n" + (outcome === "malformed" ? "unexpected\n" : ""),
       ));
       const code = outcome === "failed-cleanup" ? 1 : 0;
       killer.emit("exit", code);
       killer.emit("close", code);
       expect(onRootTerminated).not.toHaveBeenCalled();
       expect(child.kill).not.toHaveBeenCalled();
-      expect(warning).toHaveBeenCalledTimes(outcome === "failed-cleanup" ? 1 : 0);
+      expect(warning).toHaveBeenCalledTimes(outcome === "failed-cleanup" || outcome === "malformed" ? 1 : 0);
     },
   );
 
@@ -114,13 +115,13 @@ describe("Windows shell cleanup", () => {
       .execute("fixture", { onStart: (next) => { control = next; }, onOutput: () => {} })
       .then((result) => { done(); return result; });
     control.stop();
-    killer.stdout.emit("data", Buffer.from("ready\n"));
+    killer.stdout.emit("data", Buffer.from("accepting\nready:0\n"));
     child.exitCode = 4294967295;
     child.emit("close", child.exitCode);
     killer.emit("exit", 0);
     await Promise.resolve();
     expect(done).not.toHaveBeenCalled();
-    killer.stdout.emit("data", Buffer.from("root-terminated\n"));
+    killer.stdout.emit("data", Buffer.from("done:0:1\n"));
     killer.emit("close", 0);
     await expect(execution).resolves.toMatchObject({ aborted: true, exitCode: 4294967295,
       rootTerminationConfirmed: true, timedOut: false, outputLimitExceeded: false });
@@ -145,14 +146,17 @@ describe("Windows shell cleanup", () => {
     const child = childFixture();
     const killer = childFixture();
     vi.mocked(spawn).mockReturnValue(killer as any);
-    const input = vi.spyOn(killer.stdin, "end");
+    const input = vi.spyOn(killer.stdin, "write");
     killProcessTree(child as any, "SIGKILL", { platform: "win32" });
     if (exited) child.exitCode = 0;
+    killer.stdout.emit("data", Buffer.from("accepting\n"));
+    input.mockClear();
     killer.stdout.emit("data", Buffer.from("rea"));
     expect(input).not.toHaveBeenCalled();
-    killer.stdout.emit("data", Buffer.from("dy\r\n"));
-    expect(input).toHaveBeenCalledExactlyOnceWith(exited ? "cancel\n" : "go\n");
-    killer.stdout.emit("data", Buffer.from("ready\n"));
+    killer.stdout.emit("data", Buffer.from("dy:0\r\n"));
+    expect(input).toHaveBeenCalledExactlyOnceWith(exited ? "cancel:0\n" : "go:0\n");
+    killer.stdout.emit("data", Buffer.from(exited ? "done:0:0\n" : "done:0:1\n"));
+    killer.emit("close", 0);
     expect(input).toHaveBeenCalledTimes(1);
   });
 
@@ -182,7 +186,7 @@ describe("Windows shell cleanup", () => {
     });
     expect(JSON.stringify(warning.mock.calls)).not.toContain("private path");
     expect(spawn).toHaveBeenCalledWith(expect.any(String), expect.any(Array),
-      expect.objectContaining({ timeout: 5_000, windowsHide: true }));
+      expect.objectContaining({ windowsHide: true }));
   });
 
   it.runIf(process.platform === "win32")("waits for tree cleanup after shell close before returning the timeout result", async () => {

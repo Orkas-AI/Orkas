@@ -163,8 +163,9 @@ function revisionStamp(stat: fs.BigIntStats): string | undefined {
   return [stat.isDirectory() ? 'dir' : 'file', stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
 }
 
-/** Capture bounded metadata without following symlinks or blocking Main for a
- * full directory scan. An unavailable revision must never authorize deletion. */
+/** Metadata only: native saves replace the inode or change its timestamps.
+ * Include every directory so additions/removals are detected too. Refuse an
+ * unavailable or oversized snapshot before a move can remove any source. */
 export async function captureLocalEntryRevision(root: string): Promise<LocalEntryRevision | undefined> {
   const entries: LocalEntryRevision['entries'] = [];
   const deadline = performance.now() + 5000;
@@ -188,11 +189,39 @@ export async function captureLocalEntryRevision(root: string): Promise<LocalEntr
   catch { return undefined; }
 }
 
-/** Run immediately before the synchronous removal, after all awaited work.
- * Directory stamps detect added/removed children without another tree walk. */
-export function localEntryRevisionMatches(revision: LocalEntryRevision | undefined): boolean {
-  if (!revision?.entries.length || revision.entries.length > MAX_REVISION_ENTRIES) return false;
+/** Capture the owned copy before indexing can yield to another edit. */
+export function captureLocalEntryRevisionSync(root: string): LocalEntryRevision | undefined {
+  const entries: LocalEntryRevision['entries'] = [];
   const deadline = performance.now() + 100;
+  let pathBytes = 0;
+  function visit(absolute: string, relative: string, depth: number): void {
+    pathBytes += Buffer.byteLength(relative);
+    if (depth > 64 || entries.length >= MAX_REVISION_ENTRIES
+      || pathBytes > MAX_REVISION_PATH_BYTES || performance.now() > deadline) throw new Error('revision budget exceeded');
+    const stat = fs.lstatSync(absolute, { bigint: true });
+    const stamp = revisionStamp(stat);
+    if (!stamp) throw new Error('unsupported revision source');
+    entries.push({ relative, stamp });
+    if (stat.isDirectory()) {
+      const directory = fs.opendirSync(absolute);
+      try {
+        let child: fs.Dirent | null;
+        while ((child = directory.readSync())) {
+          visit(path.join(absolute, child.name), relative ? path.join(relative, child.name) : child.name, depth + 1);
+        }
+      } finally { directory.closeSync(); }
+    }
+  }
+  try { visit(root, '', 0); return { root, entries }; }
+  catch { return undefined; }
+}
+
+/** Called at the actual synchronous removal boundary, after async validation.
+ * Bound main-thread work; uncertain state must retain both recoverable copies. */
+export function localEntryRevisionMatches(
+  revision: LocalEntryRevision | undefined, deadline = performance.now() + 100,
+): boolean {
+  if (!revision?.entries.length || revision.entries.length > MAX_REVISION_ENTRIES) return false;
   try {
     return revision.entries.every(({ relative, stamp }) => performance.now() <= deadline
       && revisionStamp(fs.lstatSync(path.join(revision.root, relative), { bigint: true })) === stamp);

@@ -1,18 +1,14 @@
-/** Cancellation-only Windows helper. Open handles pin identities even after
- * exit; the host must acknowledge readiness while its original child is live.
- * This avoids both taskkill's snapshot/child-creation race and PID reuse.
- * No helper runs on the normal command path, and no native payload is shipped.
+/** Cancellation-only helper. Handles and creation times pin each tree
+ * independently; cold PowerShell startup and WMI snapshots are shared.
+ * No helper runs on the healthy path and no native payload is shipped.
  */
-export function windowsTreeCleanupCommand(pid: number): string {
-  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Invalid process identity");
-  return Buffer.from(`$targetProcessId = ${pid}\n` + SCRIPT, "utf16le").toString("base64");
+export function windowsTreeCleanupCommand(): string {
+  return Buffer.from(SCRIPT, "utf16le").toString("base64");
 }
 
 const SCRIPT = String.raw`
 function Read-ProcessSnapshot {
-  # Older processes cannot descend from the pinned root. Filter at the WMI
-  # boundary so concurrent cancellations do not materialize every host process.
-  $since = [System.Management.ManagementDateTimeConverter]::ToDmtfDateTime($owned[$targetProcessId].Started)
+  $since = [System.Management.ManagementDateTimeConverter]::ToDmtfDateTime($earliest)
   $query = [System.Management.ManagementObjectSearcher]::new("SELECT ProcessId,ParentProcessId,CreationDate FROM Win32_Process WHERE CreationDate >= '$since'")
   $rows = $null
   try {
@@ -31,98 +27,134 @@ function Read-ProcessSnapshot {
     $query.Dispose()
   }
 }
+function Check-Deadline($tree) {
+  if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $tree.Deadline) { throw 'cleanup_deadline' }
+}
+function Stop-Entry($entry, $tree) {
+  Check-Deadline $tree
+  try {
+    if (-not $entry.Process.HasExited) { $entry.Process.Kill() }
+  } catch { if (-not $entry.Process.HasExited) { throw } }
+}
 $ErrorActionPreference = 'Stop'
-$owned = @{}
-$ordered = [Collections.Generic.List[object]]::new()
-$result = 1
-$rootTerminated = $false
+$trees = [Collections.Generic.List[object]]::new()
+$earliest = [DateTime]::MaxValue
 try {
-  $root = [Diagnostics.Process]::GetProcessById($targetProcessId)
-  $null = $root.Handle
-  $owned[$targetProcessId] = @{ Process = $root; Started = $root.StartTime.ToUniversalTime() }
-  $ordered.Add($owned[$targetProcessId])
-  [Console]::Out.WriteLine('ready')
+  [Console]::Out.WriteLine('accepting')
   [Console]::Out.Flush()
-  if ([Console]::In.ReadLine() -cne 'go') { $result = 0; return }
-
-  # Stop the root immediately, before WMI startup can delay cancellation.
-  # Its held handle keeps the parent identity valid for orphan discovery.
-  if (-not $root.HasExited) {
+  $manifest = [Console]::In.ReadLine()
+  foreach ($spec in $manifest.Split(';')) {
+    $parts = $spec.Split(',')
+    $targetProcessId = [int]$parts[1]
+    $tree = @{ Id = [int]$parts[0]; Deadline = [long]$parts[2]; Owned = @{};
+      Ordered = [Collections.Generic.List[object]]::new(); Result = 1; Terminated = $false; Active = $false }
+    $trees.Add($tree)
+    $root = $null
     try {
-      $root.Kill()
-      $rootTerminated = $true
+      Check-Deadline $tree
+      $root = [Diagnostics.Process]::GetProcessById($targetProcessId)
+      $null = $root.Handle
+      $entry = @{ Process = $root; Started = $root.StartTime.ToUniversalTime() }
+      $tree.Owned[$targetProcessId] = $entry
+      $tree.Ordered.Add($entry)
+      [Console]::Out.WriteLine('ready:' + $tree.Id)
+      [Console]::Out.Flush()
+      if ([Console]::In.ReadLine() -cne ('go:' + $tree.Id)) { $tree.Result = 0; continue }
+      Check-Deadline $tree
+      # Stop the root immediately, before WMI startup can delay cancellation.
+      if (-not $root.HasExited) {
+        try { $root.Kill(); $tree.Terminated = $true }
+        catch { if (-not $root.HasExited) { throw } }
+      }
+      $tree.Active = $true
+      if ($entry.Started -lt $earliest) { $earliest = $entry.Started }
     } catch {
-      # A natural exit between HasExited and Kill is not our termination.
-      if (-not $root.HasExited) { throw }
+      if ($null -ne $root -and $tree.Owned.Count -eq 0) { $root.Dispose() }
     }
   }
-  if (-not $root.WaitForExit(500)) { throw 'termination_incomplete' }
-  $rows = @(Read-ProcessSnapshot)
-  for ($pass = 0; $pass -lt 4; $pass++) {
-    # Hold every discoverable identity before killing parents. Old or reused
-    # parent ids are rejected by birth time; WMI truncates it to microseconds.
-    do {
-      $added = 0
-      foreach ($row in $rows) {
-        $id = [int]$row.ProcessId
-        $parent = $owned[[int]$row.ParentProcessId]
-        if ($null -eq $parent -or $owned.ContainsKey($id)) { continue }
-        if ($row.CreationDate.ToUniversalTime() -lt $parent.Started) { continue }
-        $candidate = $null
+  # Issue all root kills before waiting. Sequential Kill/Wait pairs multiply
+  # shell exit latency across the batch and can consume the cleanup deadline.
+  foreach ($tree in $trees) {
+    if (-not $tree.Active) { continue }
+    try {
+      Check-Deadline $tree
+      if (-not $tree.Ordered[0].Process.WaitForExit(500)) { throw 'termination_incomplete' }
+    } catch { $tree.Active = $false }
+  }
+  if ($earliest -ne [DateTime]::MaxValue) {
+    $rows = @(Read-ProcessSnapshot)
+    for ($pass = 0; $pass -lt 4; $pass++) {
+      foreach ($tree in $trees) {
+        if (-not $tree.Active) { continue }
         try {
-          $candidate = [Diagnostics.Process]::GetProcessById($id)
-          $null = $candidate.Handle
-          $started = $candidate.StartTime.ToUniversalTime()
-          $ticks = $started.Ticks - ($started.Ticks % 10)
-          if ($ticks -ne $row.CreationDate.ToUniversalTime().Ticks) { continue }
-          $owned[$id] = @{ Process = $candidate; Started = $started }
-          $ordered.Add($owned[$id])
-          $candidate = $null
-          $added++
-        } catch [ArgumentException] {
-          # The snapshot member exited before its handle could be acquired.
-        } finally {
-          if ($null -ne $candidate) { $candidate.Dispose() }
-        }
+          Check-Deadline $tree
+          $owned = $tree.Owned
+          do {
+            $added = 0
+            foreach ($row in $rows) {
+              $id = [int]$row.ProcessId
+              $parent = $owned[[int]$row.ParentProcessId]
+              if ($null -eq $parent -or $owned.ContainsKey($id)) { continue }
+              if ($row.CreationDate -lt $parent.Started) { continue }
+              Check-Deadline $tree
+              $candidate = $null
+              try {
+                $candidate = [Diagnostics.Process]::GetProcessById($id)
+                $null = $candidate.Handle
+                $started = $candidate.StartTime.ToUniversalTime()
+                $ticks = $started.Ticks - ($started.Ticks % 10)
+                if ($ticks -ne $row.CreationDate.Ticks) { continue }
+                $owned[$id] = @{ Process = $candidate; Started = $started }
+                $tree.Ordered.Add($owned[$id])
+                $candidate = $null
+                $added++
+              } catch [ArgumentException] {
+                # Snapshot member exited before its handle could be acquired.
+              } finally { if ($null -ne $candidate) { $candidate.Dispose() } }
+            }
+          } while ($added -gt 0)
+          if ($tree.Ordered.Count -eq 1) { $tree.Result = 0; $tree.Active = $false; continue }
+          # Parent-first order stops producers; held handles retain lineage for
+          # children born after this snapshot, without accepting recycled PIDs.
+          foreach ($entry in $tree.Ordered) { Stop-Entry $entry $tree }
+        } catch { $tree.Active = $false }
       }
-    } while ($added -gt 0)
-
-    # The pinned root has already exited. If the first snapshot contains no
-    # live descendants, no owned producer can create another child. Avoid a
-    # redundant WMI query in this common shell-startup cancellation path.
-    if ($ordered.Count -eq 1) { $result = 0; break }
-
-    # Stop producers first, retaining their handles for the next snapshot.
-    # A child created during this sweep remains linked to a pinned parent.
-    # Discovery only adds a child after its parent, so this order already
-    # stops producers first without a sort or PowerShell module auto-loading.
-    foreach ($entry in $ordered) {
-      try {
-        if (-not $entry.Process.HasExited) { $entry.Process.Kill() }
-        if (-not $entry.Process.WaitForExit(500)) { throw 'termination_incomplete' }
-      } catch {
-        if (-not $entry.Process.HasExited) { throw }
+      # All known producers have received termination before waiting for any
+      # one's exit. Keep every identity pinned until the verification snapshot.
+      foreach ($tree in $trees) {
+        if (-not $tree.Active) { continue }
+        try {
+          foreach ($entry in $tree.Ordered) {
+            Check-Deadline $tree
+            if (-not $entry.Process.WaitForExit(500)) { throw 'termination_incomplete' }
+          }
+        } catch { $tree.Active = $false }
+      }
+      $active = @($trees | Where-Object { $_.Active })
+      if ($active.Count -eq 0) { break }
+      $rows = @(Read-ProcessSnapshot)
+      foreach ($tree in $active) {
+        $remaining = $false
+        foreach ($row in $rows) {
+          $parent = $tree.Owned[[int]$row.ParentProcessId]
+          if ($null -ne $parent -and -not $tree.Owned.ContainsKey([int]$row.ProcessId) -and $row.CreationDate -ge $parent.Started) {
+            $remaining = $true; break
+          }
+        }
+        if (-not $remaining) { $tree.Result = 0; $tree.Active = $false }
       }
     }
-    $rows = @(Read-ProcessSnapshot)
-    $remaining = @($rows | Where-Object {
-      $parent = $owned[[int]$_.ParentProcessId]
-      $null -ne $parent -and -not $owned.ContainsKey([int]$_.ProcessId) -and
-        $_.CreationDate.ToUniversalTime() -ge $parent.Started
-    })
-    if ($remaining.Count -eq 0) { $result = 0; break }
   }
 } catch {
-  # Only the classified exit code crosses the boundary, never raw WMI errors.
-  $result = 1
+  # Incomplete trees keep failure; never emit raw WMI errors or private paths.
 } finally {
-  foreach ($entry in $owned.Values) { $entry.Process.Dispose() }
-}
-if ($result -eq 0 -and $rootTerminated) {
-  # Private helper evidence, never command output. Publish only after the
-  # pinned root's Kill/WaitForExit and the complete descendant sweep succeed.
-  [Console]::Out.WriteLine('root-terminated')
+  foreach ($tree in $trees) {
+    foreach ($entry in $tree.Owned.Values) { $entry.Process.Dispose() }
+    if ($tree.Result -eq 0) {
+      [Console]::Out.WriteLine('done:' + $tree.Id + ':' + [int]$tree.Terminated)
+    } else { [Console]::Out.WriteLine('failed:' + $tree.Id) }
+  }
   [Console]::Out.Flush()
 }
-exit $result
+exit 0
 `;

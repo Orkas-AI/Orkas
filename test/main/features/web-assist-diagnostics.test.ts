@@ -6,6 +6,31 @@ import { createWebAssistDiagnostics } from '../../../src/main/features/web_assis
 afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); });
 
 describe('local browser diagnostics', () => {
+  it.each([
+    ['crashed', 1, 'crashed', 1],
+    ['oom', -1, 'oom', -1],
+    ['killed', Number.MIN_SAFE_INTEGER, 'killed', Number.MIN_SAFE_INTEGER],
+    ['abnormal-exit', Number.MAX_SAFE_INTEGER, 'abnormal-exit', Number.MAX_SAFE_INTEGER],
+    ['crashed', 3221225477, 'crashed', 3221225477],
+    ['PRIVATE_REASON', 'PRIVATE_CODE', 'unknown', 'unknown'],
+    ['killed', Number.MAX_SAFE_INTEGER + 1, 'killed', 'unknown'],
+    ['oom', NaN, 'oom', 'unknown'],
+  ])('retains native exit %s/%s in local diagnostics without expanding telemetry', (reason, exitCode, safeReason, safeCode) => {
+    const sender = { isDestroyed: () => false, send: vi.fn() };
+    const report = createWebAssistDiagnostics();
+    report(sender, 'renderer_gone', undefined, undefined, { reason, exitCode });
+    expect(warn).toHaveBeenCalledExactlyOnceWith('browser failure', expect.objectContaining({
+      renderer_exit_reason: safeReason, renderer_exit_code: safeCode,
+    }));
+    expect(sender.send).not.toHaveBeenCalled();
+    for (let i = 0; i < 100; i++) report(sender, 'renderer_gone', undefined, undefined, { reason, exitCode });
+    expect(warn).toHaveBeenCalledOnce();
+    expect(sender.send).not.toHaveBeenCalled();
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('PRIVATE');
+    expect(JSON.stringify(sender.send.mock.calls)).not.toContain('PRIVATE');
+  });
+
+
   it('merges repeated failures across tabs and admits later failures without URL or exception data', () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);

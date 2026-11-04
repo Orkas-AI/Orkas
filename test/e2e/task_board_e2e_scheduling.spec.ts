@@ -684,6 +684,7 @@ test.describe('task board scheduling (D29 planned dependencies)', () => {
       await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
       await refreshAttachments();
       await expect(chips).toHaveText(separateDraft ? ['draft.txt'] : []);
+      await page.screenshot({ path: testInfo.outputPath('recovered-queued-user-and-draft.png') });
     });
   }
 

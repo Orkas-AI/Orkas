@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as vm from 'node:vm';
 
 const rendererSource = fs.readFileSync(
   path.join(__dirname, '../../src/renderer/modules/conversation.js'),
@@ -108,5 +109,69 @@ describe('conversation detail first-paint boundary', () => {
       turnNavSource.indexOf('renderMarkers();', turnNavSource.indexOf('state.indexReady = true')),
     );
     expect(bootSource).toContain('_scheduleConversationTurnNavigation(cid)');
+  });
+});
+
+// Every streaming paint decorates every Markdown block, so a block may only pay
+// for a DOM parse when it can hold a canonical task ID. Code-style replies are
+// full of snake_case text that must stay on the cheap path.
+describe('inline task reference paint boundary', () => {
+  const decorator = () => {
+    const createElement = vi.fn(() => ({ innerHTML: '' }));
+    const markReferences = vi.fn();
+    const context = vm.createContext({
+      document: { createElement },
+      _htmlMayContainKnownSkillIdForDisplay: () => false,
+      _replaceKnownSkillIdsIn: vi.fn(),
+      _decorateTaskReferencesIn: markReferences,
+      _highlightMentionsIn: vi.fn(),
+    });
+    vm.runInContext(rendererSource.slice(
+      rendererSource.indexOf('function _decorateMessageMarkdown('),
+      rendererSource.indexOf('// Mark canonical typed IDs'),
+    ), context);
+    return { decorate: context._decorateMessageMarkdown, createElement, markReferences };
+  };
+
+  it.each([
+    '<p>t_123456789abc</p>',
+    '<p>at_12345678</p>',
+    '<p>Saved <code>t_123456789abc</code>.</p>',
+    '<p>Saved t_123456789abc.</p>',
+    '<p>(at_12345678), then more</p>',
+    '<p>a &amp;t_123456789abc</p>',
+    't_123456789abc',
+  ])('parses %s so its canonical ID can become a reference', html => {
+    const { decorate, createElement, markReferences } = decorator();
+    decorate(html, []);
+    expect(createElement).toHaveBeenCalledOnce();
+    expect(markReferences).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    '<p>input_tokens</p>',
+    '<p>t_12345</p>',
+    '<pre><code>agent_id = get_value(print_result)</code></pre>',
+    '<p>at_1234567</p>',
+    '<p>at_123456789</p>',
+    '<p>t_123456789abg</p>',
+    '<p>t_123456789abcd</p>',
+    '<p>T_123456789ABC</p>',
+    '<p>x_t_123456789abc</p>',
+    '<p>dir/t_123456789abc</p>',
+    '<p>t_123456789abc/file</p>',
+    '<p>t_123456789abc.txt</p>',
+  ])('returns %s unchanged without a DOM parse', html => {
+    const { decorate, createElement, markReferences } = decorator();
+    expect(decorate(html, [])).toBe(html);
+    expect(createElement).not.toHaveBeenCalled();
+    expect(markReferences).not.toHaveBeenCalled();
+  });
+
+  it('keeps mention highlighting independent of the task ID check', () => {
+    const { decorate, createElement, markReferences } = decorator();
+    decorate('<p>@Agent input_tokens</p>', []);
+    expect(createElement).toHaveBeenCalledOnce();
+    expect(markReferences).not.toHaveBeenCalled();
   });
 });

@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { profileSyncCosts } from "../../../test/helpers/sync-cost.cjs";
 import { PersistentSession } from "../src/agent/persistent-session.js";
 import { contextBudget } from "../src/agent/session.js";
 import type { Message, MessageContent } from "../src/shared/types.js";
@@ -1579,6 +1581,74 @@ describe("session save recovery", () => {
   beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "session-recovery-")); vi.useFakeTimers(); });
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); fs.rmSync(dir, { recursive: true, force: true }); });
 
+  it.each(["complete", "corrupt", "blank"])("separates a %s unterminated tail before appending and reopening", (tail) => {
+    const file = path.join(dir, "session.jsonl");
+    const first = JSON.stringify({ role: "user", content: [{ type: "text", text: "first 界🙂" }] });
+    const second = JSON.stringify({ role: "assistant", content: [{ type: "text", text: "second" }] });
+    const prefix = first + "\r\n" + (tail === "complete" ? second : tail === "corrupt" ? '{"role":' : " ");
+    fs.writeFileSync(file, prefix);
+    const session = new PersistentSession({ sessionFile: file });
+    // Loading remains read-only; preserve even malformed source bytes.
+    expect(fs.readFileSync(file, "utf8")).toBe(prefix);
+    session.addUserMessage("third");
+    session.addAssistantMessage([{ type: "text", text: "fourth" }]);
+    const expected = ["first 界🙂", ...(tail === "complete" ? ["second"] : []), "third", "fourth"];
+    expect(new PersistentSession({ sessionFile: file }).getMessages().map(m => (m.content[0] as { text: string }).text)).toEqual(expected);
+    expect(fs.readFileSync(file, "utf8").startsWith(prefix + "\n")).toBe(true);
+    expect(session.hasPendingPersistence()).toBe(false);
+  });
+
+  it("keeps append offsets valid after replacing an unterminated canonical tail", () => {
+    const file = path.join(dir, "session.jsonl");
+    const initial = new PersistentSession({ sessionFile: file });
+    initial.replaceConversationHistory([
+      { role: "user", turnId: 1, content: [{ type: "text", text: "old request" }] },
+      { role: "assistant", turnId: 1, content: [{ type: "text", text: "old reply 界🙂" }] },
+      { role: "user", turnId: 2, content: [{ type: "text", text: "replace request" }] },
+      { role: "assistant", turnId: 2, content: [{ type: "text", text: "replace reply" }] },
+    ], "canonical");
+    fs.truncateSync(file, fs.statSync(file).size - 1);
+    const prefix = fs.readFileSync(file, "utf8").split("\n").slice(0, 2).join("\n") + "\n";
+    const session = new PersistentSession({ sessionFile: file });
+    expect(session.replaceConversationHistory([
+      { role: "user", turnId: 2, content: [{ type: "text", text: "corrected" }] },
+    ], "canonical", { replaceFromTurnId: 2 })).toBe(2);
+    session.addUserMessage("next");
+    expect(fs.readFileSync(file, "utf8").startsWith(prefix)).toBe(true);
+    expect(fs.readFileSync(file, "utf8")).not.toContain("\n\n");
+    expect(new PersistentSession({ sessionFile: file }).getMessages().map(m => (m.content[0] as { text: string }).text))
+      .toEqual(["old request", "old reply 界🙂", "corrected", "next"]);
+  });
+
+  it.each([1, 17])("retries a separated append after %i bytes without losing the old tail or later rows", async bytes => {
+    const file = path.join(dir, "session.jsonl");
+    const prefix = JSON.stringify({ role: "user", content: [{ type: "text", text: "old 界🙂" }] });
+    fs.writeFileSync(file, prefix);
+    const session = new PersistentSession({ sessionFile: file });
+    const append = fs.appendFileSync;
+    vi.spyOn(fs, "appendFileSync").mockImplementationOnce((target, data, options) => {
+      append(target, Buffer.from(String(data)).subarray(0, bytes), options);
+      throw Object.assign(new Error("injected partial append"), { code: "ENOSPC" });
+    });
+    session.addUserMessage("new");
+    session.addAssistantMessage([{ type: "text", text: "answer" }]);
+    const flush = session.flushPending();
+    await vi.advanceTimersByTimeAsync(200);
+    await flush;
+    expect(fs.readFileSync(file, "utf8").startsWith(prefix + "\n")).toBe(true);
+    expect(new PersistentSession({ sessionFile: file }).getMessages().map(m => (m.content[0] as { text: string }).text)).toEqual(["old 界🙂", "new", "answer"]);
+    // Offsets must include the separator: a canonical tail edit must retain the old row.
+    session.replaceConversationHistory([
+      session.getMessages()[0],
+      { role: "user", content: [{ type: "text", text: "replacement" }] },
+    ], "canonical");
+    expect(new PersistentSession({ sessionFile: file }).getMessages().map(m => (m.content[0] as { text: string }).text)).toEqual(["old 界🙂", "replacement"]);
+    session.clear();
+    session.addUserMessage("after reset");
+    expect(fs.readFileSync(file, "utf8").startsWith("{" )).toBe(true);
+    expect(new PersistentSession({ sessionFile: file }).getMessages()).toEqual(session.getMessages());
+  });
+
   it("repairs a partially written row and retains every later message in order", async () => {
     const file = path.join(dir, "session.jsonl");
     const session = new PersistentSession({ sessionFile: file });
@@ -1674,4 +1744,244 @@ describe("session save recovery", () => {
     await recovered;
     expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(11);
   });
+});
+
+// PF-01/PF-18: independent durable receipts, not a synthetic provider's elapsed time.
+it.each([1, 4, 8])('PF-01 reopens every completed operation from %i interleaved task sessions', async tasks => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-task-load-'));
+  try {
+    const files = Array.from({ length: tasks }, (_, n) => path.join(root, `task-${n}.jsonl`));
+    const sessions = files.map(sessionFile => new PersistentSession({ sessionFile }));
+    const costs = process.env.ORKAS_PERFORMANCE_ATTRIBUTION === '1'
+      ? profileSyncCosts(file => typeof file === 'string' && file.startsWith(root + path.sep)) : null;
+    const payload = '界x'.repeat(1024), start = performance.now(), cpu = process.cpuUsage();
+    try {
+      for (let task = 0; task < tasks; task++) sessions[task].beginUserTurn([{ type: 'text', text: `task-${task}` }]);
+      for (let operation = 0; operation < 40; operation++) {
+        for (let task = 0; task < tasks; task++) {
+          const id = `task-${task}-operation-${operation}`;
+          sessions[task].addAssistantMessage([{ type: 'tool_use', id, name: 'fixture', input: {} }]);
+          sessions[task].addToolResult(id, `${id} ${payload}`);
+        }
+        if (operation % 10 === 9) await new Promise(resolve => setImmediate(resolve));
+      }
+      await Promise.all(sessions.map(session => session.flushPending()));
+    } finally { costs?.stop(); }
+    const durableMs = performance.now() - start, used = process.cpuUsage(cpu);
+    const reopenStart = performance.now();
+    for (let task = 0; task < tasks; task++) {
+      const restored = new PersistentSession({ sessionFile: files[task] });
+      const results = restored.getMessages().flatMap(message => Array.isArray(message.content)
+        ? message.content.filter(block => block.type === 'tool_result') : []);
+      expect(results).toEqual(Array.from({ length: 40 }, (_, operation) => ({ type: 'tool_result',
+        toolUseId: `task-${task}-operation-${operation}`, content: `task-${task}-operation-${operation} ${payload}`, images: [] })));
+      expect(restored.getMessages()).toEqual(sessions[task].getMessages());
+    }
+    console.log('[PF-01 durable task load]', JSON.stringify({ tasks, operations: tasks * 40, durableMs, ...(costs ? { callerCosts: costs.report } : {}),
+      reopenMs: performance.now() - reopenStart, cpuUserMs: used.user / 1000, cpuSystemMs: used.system / 1000,
+      transcriptBytes: files.reduce((total, file) => total + fs.statSync(file).size, 0),
+      scope: 'real persistence; interleaved sessions, not concurrent JS threads or whole Runner/model/UI' }));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+it('PF-18 retains each acknowledged resource before abrupt process exit without waiting for callback completion', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-durable-exit-'));
+  try {
+    const file = path.join(root, 'task.jsonl');
+    const source = path.resolve(__dirname, '../src/agent/persistent-session.ts');
+    const script = `require('tsx/cjs');
+      const {PersistentSession} = require(${JSON.stringify(source)});
+      const session = new PersistentSession({sessionFile:${JSON.stringify(file)}});
+      const turn = session.beginUserTurn([{type:'text',text:'synthetic task'}]);
+      for (let n=0;n<3;n++) session.addHistoryResource({kind:'attachment',path:'/fixture-'+n,name:'input-'+n,sourceTurnId:turn});
+      process.exit(0);`;
+    // Same Electron ABI, explicit Node mode; child deliberately bypasses normal cleanup.
+    const child = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', cwd: path.resolve(__dirname, '../../..'),
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, timeout: 10000 });
+    expect(child.status).toBe(0); expect(child.error).toBeUndefined();
+    expect(child.stdout).toBe(''); expect(child.stderr).toBe('');
+    const saved = JSON.parse(fs.readFileSync(file + '.context.json', 'utf8'));
+    expect(saved.resources.map((resource: { path: string }) => resource.path)).toEqual(['/fixture-0', '/fixture-1', '/fixture-2']);
+    const rows = fs.readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(rows).toHaveLength(1); expect(JSON.stringify(rows)).toContain('synthetic task');
+    expect(new PersistentSession({ sessionFile: file }).getSerializedContextState()!.resources!.map(resource => resource.path))
+      .toEqual(['/fixture-0', '/fixture-1', '/fixture-2']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// PF-01: exercise real Runner bookkeeping, not only direct Session appends.
+// Provider/tool are deterministic fixtures; filesystem and reload are real.
+it.each([
+  { mode: 'sequential', tasks: 8, operations: 40, snapshotBytes: 0 },
+  { mode: 'parallel', tasks: 8, operations: 40, snapshotBytes: 0 },
+  { mode: 'sequential', tasks: 1, operations: 16, snapshotBytes: 65536 },
+] as const)('PF-01 retains every receipt and ledger through $mode tasks with $snapshotBytes-byte file observations', async ({ mode, tasks, operations, snapshotBytes }) => {
+  const { AgentRunner } = await import('../src/agent/runner.js');
+  const { ProviderRegistry } = await import('../src/providers/registry.js');
+  const { createConfig } = await import('../src/config/loader.js');
+  const { defineTool } = await import('../src/tools/base.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-runner-persistence-'));
+  const { createHash } = await import('node:crypto');
+  const payload = '界x'.repeat(256), workspace = path.join(root, 'workspace');
+  fs.mkdirSync(workspace);
+  const sourceText = (step: number) => `${String(step).padStart(4, '0')}\n` + 'x'.repeat(Math.max(0, snapshotBytes - 5));
+  if (snapshotBytes) for (let task = 0; task < tasks; task++) fs.writeFileSync(path.join(workspace, `source-${task}.txt`), sourceText(-1));
+  const attribution = process.env.ORKAS_PERFORMANCE_ATTRIBUTION === '1';
+  const previousBodies = new Map<string, string>();
+  const context = { writes: 0, first: 0, identical: 0, changed: 0, unclassified: 0 };
+  const sessions = Array.from({ length: tasks }, (_, n) => new PersistentSession({ sessionFile: path.join(root, `task-${n}.jsonl`) }));
+  const callCounts = Array(tasks).fill(0);
+  const runners = sessions.map((session, task) => {
+    let next = 0;
+    const providers = new ProviderRegistry();
+    providers.registerFactory('mock', () => ({
+      id: 'mock', name: 'Synthetic provider',
+      async complete() { throw new Error('This fixture must not compact'); },
+      async *stream() {
+        yield { type: 'message_start' as const };
+        if (next === operations) {
+          yield { type: 'message_end' as const, stopReason: 'end_turn' as const,
+            content: [{ type: 'text' as const, text: `DONE-${task}` }], model: 'mock-model' };
+          return;
+        }
+        const end = Math.min(operations, next + (mode === 'parallel' ? 8 : 1));
+        const content = Array.from({ length: end - next }, (_, offset) => ({ type: 'tool_use' as const,
+          id: `task-${task}-step-${next + offset}`, name: 'fixture_result', input: { step: next + offset } }));
+        next = end;
+        yield { type: 'message_end' as const, stopReason: 'tool_use' as const, content, model: 'mock-model' };
+      },
+      async validateAuth() { return true; },
+    }));
+    return new AgentRunner({ session, providers,
+      config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'mock-model' },
+        models: { catalog: { 'mock-model': { provider: 'mock', model: 'mock-model', contextWindow: 272000, maxOutputTokens: 32000 } } } }),
+      evolution: { enabled: false },
+      tools: [defineTool({ name: 'fixture_result', description: 'Synthetic result fixture',
+        inputSchema: { type: 'object', properties: { step: { type: 'number' } }, required: ['step'] },
+        ...(mode === 'parallel' ? { executionMode: 'parallel' as const } : {}),
+        async execute(input) {
+          callCounts[task]++;
+          await new Promise(resolve => setImmediate(resolve));
+          const content = `task-${task}-step-${input.step} ${payload}`;
+          if (!snapshotBytes) return { content };
+          const target = path.join(workspace, `source-${task}.txt`);
+          const before = fs.readFileSync(target), after = Buffer.from(sourceText(Number(input.step)));
+          fs.writeFileSync(target, after);
+          return { content, observations: { fileChanges: [{ operation: 'update' as const, sourcePath: target,
+            beforeExists: true, afterExists: true, beforeBytes: before.length, afterBytes: after.length,
+            beforeHash: `sha256:${createHash('sha256').update(before).digest('hex')}`,
+            afterHash: `sha256:${createHash('sha256').update(after).digest('hex')}`,
+            beforeContent: before.toString('utf8'), afterContent: after.toString('utf8'), coverage: 'exact' as const }] } };
+        },
+      })],
+    });
+  });
+  const costs = attribution ? profileSyncCosts(file => typeof file === 'string' && file.startsWith(root + path.sep) && !file.startsWith(workspace + path.sep)) : null;
+  const originalWrite = fs.writeFileSync;
+  const spy = attribution ? vi.spyOn(fs, 'writeFileSync').mockImplementation(((target: fs.PathOrFileDescriptor, body: unknown, ...args: unknown[]) => {
+    const result = (originalWrite as Function)(target, body, ...args);
+    if (typeof target === 'string' && target.startsWith(root + path.sep) && target.endsWith('.context.json.tmp')) {
+      context.writes++;
+      // Diagnostic storage is bounded to the fixture paths and4M UTF-16
+      // units each, including the declared16x64KiB before/after snapshots.
+      // Saturation is unknown, never an assumed cache hit.
+      if (typeof body !== 'string' || body.length > 4194304 || (!previousBodies.has(target) && previousBodies.size >= tasks)) {
+        context.unclassified++; previousBodies.delete(target);
+      } else {
+        if (!previousBodies.has(target)) context.first++;
+        else if (previousBodies.get(target) === body) context.identical++;
+        else context.changed++;
+        previousBodies.set(target, body);
+      }
+    }
+    return result;
+  }) as typeof fs.writeFileSync) : null;
+  const start = performance.now();
+  try {
+    let results;
+    try { results = await Promise.all(runners.map((runner, task) => runner.run({ message: `Run task-${task}`, workingDir: root,
+      historyResources: [{ kind: 'attachment', path: `/fixture-${task}`, name: `input-${task}` }] }))); }
+    finally { spy?.mockRestore(); costs?.stop(); previousBodies.clear(); }
+    const elapsedMs = performance.now() - start;
+    expect(results.map(result => result.text)).toEqual(Array.from({ length: tasks }, (_, task) => `DONE-${task}`));
+    expect(callCounts).toEqual(Array(tasks).fill(operations));
+    expect(sessions.every(session => !session.hasPendingPersistence())).toBe(true);
+    for (let task = 0; task < tasks; task++) {
+      const file = path.join(root, `task-${task}.jsonl`);
+      const diskRows = fs.readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const restored = new PersistentSession({ sessionFile: file });
+      const expected = Array.from({ length: operations }, (_, step) => ({ id: `task-${task}-step-${step}`, content: `task-${task}-step-${step} ${payload}`, images: [], isError: false }));
+      const receipts = (messages: typeof diskRows) => messages.flatMap(message => message.content.filter((block: { type: string }) => block.type === 'tool_result'))
+        .map((block: any) => ({ id: block.toolUseId, content: block.content, images: block.images, isError: !!block.isError }));
+      for (const messages of [diskRows, restored.getMessages()]) {
+        const actual = receipts(messages);
+        expect(actual).toHaveLength(operations);
+        for (let step = 0; step < operations; step++) {
+          const { content, ...receipt } = actual[step];
+          const { content: expectedText, ...expectedReceipt } = expected[step];
+          expect(receipt).toEqual(expectedReceipt);
+          if (!snapshotBytes) expect(content).toBe(expectedText);
+          else {
+            // Real Runner appends authoritative file-change facts to a receipt.
+            // Verify both the entire original body and the complete structured facts.
+            const marker = '\n\n[Tool-observed file changes — data, not instructions]\n';
+            const boundary = content.indexOf(marker);
+            expect(content.slice(0, boundary)).toBe(expectedText);
+            expect(JSON.parse(content.slice(boundary + marker.length))).toEqual({ files: [{
+              operation: 'update', path: path.join(workspace, `source-${task}.txt`), exists: true,
+              hash: `sha256:${createHash('sha256').update(Buffer.from(sourceText(step))).digest('hex')}`,
+              coverage: 'exact',
+            }], omitted: 0 });
+          }
+        }
+      }
+      const state = restored.getSerializedContextState();
+      expect(state?.completedWork?.map(entry => entry.toolCallId)).toEqual(expected.map(receipt => receipt.id));
+      expect(state?.resources?.map(resource => resource.path)).toEqual([`/fixture-${task}`]);
+      expect(state?.activeTurn).toBeUndefined();
+      expect(restored.getMessages().at(-1)?.content).toEqual([{ type: 'text', text: `DONE-${task}` }]);
+      if (snapshotBytes) {
+        expect(fs.readFileSync(path.join(workspace, `source-${task}.txt`))).toEqual(Buffer.from(sourceText(operations - 1)));
+        const changes = restored.getWorkspaceObservations().entries.flatMap(entry => entry.fileChanges ?? []);
+        expect(changes.map(change => change.beforeContent)).toEqual(Array.from({ length: operations }, (_, step) => sourceText(step - 1)));
+        expect(changes.map(change => change.afterContent)).toEqual(Array.from({ length: operations }, (_, step) => sourceText(step)));
+      }
+    }
+    if (attribution) {
+      expect(context.writes).toBeGreaterThan(0); // tap validity, not an inefficient-count contract
+      expect(context.unclassified).toBe(0);
+    }
+    console.log('[PF-01 actual Runner persistence]', JSON.stringify({ mode, tasks, operationsPerTask: operations, snapshotBytes, elapsedMs,
+      ...(costs ? { callerCosts: costs.report, contextWritePayloads: context } : {}),
+      scope: 'real Runner/Session/files/reopen; synthetic provider, no network/UI; FS attribution excludes fixture source-file I/O; SHA counters cover intercepted calls only; equal payloads compare successful submissions, not an external-change-safe write cache' }));
+  } finally { spy?.mockRestore(); costs?.stop(); fs.rmSync(root, { recursive: true, force: true }); }
+}, 30000);
+
+// A remembered last payload is not proof that the backing file still has it.
+it.each(['deleted', 'replaced'] as const)('PF-01 restores unchanged in-memory context after its backing sidecar is %s', change => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-context-integrity-'));
+  try {
+    const file = path.join(root, 'task.jsonl'), sidecar = file + '.context.json';
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: 'text', text: 'Keep the resource through interruption' }]);
+    session.addHistoryResource({ kind: 'attachment', path: '/kept', name: 'source' });
+    const saved = fs.readFileSync(sidecar, 'utf8');
+    if (change === 'deleted') fs.unlinkSync(sidecar);
+    else {
+      const changed = saved.replace('/kept', '/evil');
+      expect(Buffer.byteLength(changed)).toBe(Buffer.byteLength(saved));
+      expect(changed).not.toBe(saved);
+      fs.writeFileSync(sidecar, changed);
+    }
+    // Ordinary assistant text leaves serialized turn context unchanged.
+    session.addAssistantMessage([{ type: 'text', text: 'Progress committed' }]);
+    expect(session.hasPendingPersistence()).toBe(false);
+    expect(fs.readFileSync(sidecar, 'utf8')).toBe(saved);
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getSerializedContextState()?.resources?.map(resource => resource.path)).toEqual(['/kept']);
+    expect(restored.getMessages().map(message => message.content)).toEqual([
+      [{ type: 'text', text: 'Keep the resource through interruption' }],
+      [{ type: 'text', text: 'Progress committed' }],
+    ]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

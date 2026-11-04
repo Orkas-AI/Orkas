@@ -30,6 +30,11 @@ test.describe('desktop shell', () => {
           windows: [{ visible: false, focused: false, focusable: false }], dockVisible: false,
         };
         expect(state).toEqual({ initial: background, reactivated: background });
+        // DOM emulation must not draw a native child outside the real content
+        // area. The default fixture promises one 1280x800 coordinate system.
+        const nativeSize = await orkas.electronApp!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getContentSize());
+        expect(nativeSize).toEqual([1280, 800]);
+        expect(await orkas.page!.evaluate(() => [innerWidth, innerHeight])).toEqual(nativeSize);
         await orkas.page!.locator('#new-chat-btn').click();
         const editor = orkas.page!.locator('.chat-rich-editor[data-rich-input-id="new-chat-input"]');
         await editor.fill('Background');

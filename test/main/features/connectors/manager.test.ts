@@ -2332,6 +2332,40 @@ describe('OAuth refresh ownership', () => {
     },
   );
 
+  it('persists the first DingTalk connection after a verified partial authorization and keeps it readable', async () => {
+    const { createRequire } = await import('node:module');
+    const require = createRequire(import.meta.url);
+    const auth = require('../../../../bin/local-cli-auth.cjs');
+    const permissions = require('../../../../bin/local-cli-permissions.cjs');
+    const fixture = require('./fixtures/dingtalk-cli-1.0.61.json').batch_product_not_found;
+    const localCli = await import('../../../../src/main/features/connectors/local-cli');
+    const env = { ORKAS_LOCAL_CLI_RUNTIME_DIR: localCli.localCliRuntimeDir(TEST_UID, 'dingtalk'),
+      ORKAS_LOCAL_CLI_PROFILE: localCli.localCliProfileName(TEST_UID, 'dingtalk') };
+    fs.mkdirSync(env.ORKAS_LOCAL_CLI_RUNTIME_DIR, { recursive: true });
+    mocks.localCli.authorize.mockImplementationOnce(async () => auth.authorizeDingtalk('', '', auth.MANIFESTS.dingtalk, env, {
+      execute: async (args: string[]) => {
+        if (args[0] === 'pat') throw Object.assign(new Error('synthetic unsupported product'), {
+          exitCode: 1, stderr: JSON.stringify(fixture),
+        });
+      },
+      authorizationReady: () => true,
+    }));
+    mocks.mcp.listTools = vi.fn(async () => [
+      { name: 'execute_read', description: 'Read.', input_schema: {} },
+    ]);
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    expect(registry.load(TEST_UID).connections.dingtalk).toBeUndefined();
+    await manager.connectViaOAuth(TEST_UID, 'dingtalk');
+    expect(registry.load(TEST_UID).connections.dingtalk).toMatchObject({ status: { kind: 'connected' } });
+    expect(permissions.readPermissionRequest(env)).toMatchObject({ plan_missing: true, scopes: [], pat_scopes: [] });
+    const readable = { content: [{ type: 'text', text: 'read fixture' }] };
+    mocks.mcp.callTool.mockResolvedValueOnce(readable);
+    expect(await manager.callTool(TEST_UID, 'dingtalk', 'execute_read', { action: 'contact.get' })).toEqual(readable);
+    expect(mocks.mcp.callTool).toHaveBeenCalledOnce();
+    expect(manager.getInstance(TEST_UID, 'dingtalk')?.status.kind).toBe('connected');
+  });
+
   it.each(['feishu', 'dingtalk', 'wecom'])(
     'keeps %s connected and readable after one business operation is denied', async id => {
       mocks.mcp.listTools = vi.fn(async () => [

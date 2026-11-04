@@ -158,6 +158,9 @@ export interface EdlSegment {
 
 export interface NarrationLine {
   text: string;
+  /** The segment this line plays over; validation requires start_sec inside
+   *  that segment's window on the finished video. */
+  segment_id?: string;
   start_sec?: number;
   target_sec?: number;
   /** Where this line's synthesized audio landed (set after generate_speech). A
@@ -188,6 +191,8 @@ export interface MusicTrack {
  *  the assembler re-burns just the .srt — see the language-driven refactor. */
 export interface CaptionLine {
   text: string;
+  /** Same binding as NarrationLine.segment_id. */
+  segment_id?: string;
   start_sec?: number;
   /** On-screen duration in seconds (end = start_sec + target_sec). */
   target_sec?: number;
@@ -280,6 +285,33 @@ function isSourceBackedPrimary(
     && reference.required === true
     && Array.isArray(reference.target_segment_ids)
     && reference.target_segment_ids.includes(segment.id)));
+}
+
+type SegmentWindow = { start: number; end: number; primaryId: string };
+
+/** Each segment's window on the finished video: primaries play back to back in
+ * `order` (overlay time never extends the timeline), and an overlay/bg segment
+ * shares the window of the primary it sits `over`. Null when the primary order
+ * is ambiguous or a duration is invalid; those plans carry their own issues. */
+function finishedVideoWindows(segments: Array<Record<string, unknown>>): Map<string, SegmentWindow> | null {
+  const primaries = segments.filter((s) => s.layer === 'primary');
+  if (primaries.some((s) => !isStr(s.id) || !isNum(s.order) || !isNum(s.target_sec) || s.target_sec <= 0)
+    || new Set(primaries.map((s) => s.order)).size !== primaries.length) {
+    return null;
+  }
+  const windows = new Map<string, SegmentWindow>();
+  let at = 0;
+  for (const s of [...primaries].sort((a, b) => (a.order as number) - (b.order as number))) {
+    const id = s.id as string;
+    windows.set(id, { start: at, end: at + (s.target_sec as number), primaryId: id });
+    at += s.target_sec as number;
+  }
+  for (const s of segments) {
+    if (s.layer === 'primary' || !isStr(s.id) || !isStr(s.over)) continue;
+    const under = windows.get(s.over);
+    if (under?.primaryId === s.over) windows.set(s.id, under);
+  }
+  return windows;
 }
 
 /**
@@ -599,6 +631,30 @@ export function validateEdl(obj: unknown): EdlValidation {
     if (!isObject(tracks)) {
       err('tracks', 'E_TRACKS_NOT_OBJECT', 'tracks must be an object');
     } else {
+      // A line bound to its segment must start inside that segment on the
+      // finished video. The 2026-10-30 benchmark plans timed every line after
+      // a composed opener by stacking the clips' lengths, so each played 4-5 s
+      // ahead of its footage, and nothing downstream compares the two.
+      const segmentIds = new Set(segments.map((s) => s.id).filter(isStr));
+      const windows = finishedVideoWindows(segments);
+      const checkLineSegment = (at: string, line: Record<string, unknown>) => {
+        if (line.segment_id === undefined) return;
+        if (!isStr(line.segment_id) || !segmentIds.has(line.segment_id)) {
+          err(`${at}.segment_id`, 'E_TRACK_LINE_SEGMENT_UNKNOWN', `segment_id "${String(line.segment_id)}" names no segment in this plan`);
+          return;
+        }
+        const window = windows?.get(line.segment_id);
+        if (!window || !isNum(line.start_sec)) return;
+        if (line.start_sec < window.start - 0.05 || line.start_sec >= window.end) {
+          const over = window.primaryId === line.segment_id ? '' : ` (over "${window.primaryId}")`;
+          err(
+            `${at}.start_sec`,
+            'E_TRACK_LINE_OUTSIDE_SEGMENT',
+            `starts at ${round1(line.start_sec)}s, but segment "${line.segment_id}"${over} plays ${round1(window.start)}–${round1(window.end)}s in the finished video; start_sec counts every earlier primary segment's target_sec, composed cards included`,
+          );
+        }
+      };
+
       const nar = tracks.narration;
       if (nar !== undefined && nar !== null && !isObject(nar)) {
         err('tracks.narration', 'E_NARRATION_NOT_OBJECT', 'narration must be an object, null, or omitted');
@@ -633,9 +689,12 @@ export function validateEdl(obj: unknown): EdlValidation {
           nar.segments.forEach((ln, i) => {
             if (!isObject(ln) || !isStr(ln.text)) {
               err(`tracks.narration.segments[${i}].text`, 'E_NARRATION_LINE_TEXT', 'each narration line needs non-empty text');
-            } else if (ln.produced_path !== undefined && !isStr(ln.produced_path)) {
+              return;
+            }
+            if (ln.produced_path !== undefined && !isStr(ln.produced_path)) {
               warn(`tracks.narration.segments[${i}].produced_path`, 'W_NARRATION_PRODUCED', 'produced_path should be a string path when present');
             }
+            checkLineSegment(`tracks.narration.segments[${i}]`, ln);
           });
           // Overlapping line windows produce two voices at once at mix time.
           // The 2026-08-06 run wrote `target_sec` as each line's END time
@@ -696,6 +755,7 @@ export function validateEdl(obj: unknown): EdlValidation {
               if (ln.target_sec !== undefined && !isNum(ln.target_sec)) {
                 warn(`tracks.captions.lines[${i}].target_sec`, 'W_CAPTION_TIMING', 'target_sec (on-screen seconds) should be a number');
               }
+              checkLineSegment(`tracks.captions.lines[${i}]`, ln);
             }
           });
         } else if (!isStr(caps.from)) {

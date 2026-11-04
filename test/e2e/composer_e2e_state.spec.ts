@@ -1,6 +1,8 @@
+import { COMPOSER_EDIT_LIMIT_MS } from '../helpers/latency-budget';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { expect, test, OrkasTestApp } from './fixtures/orkas';
 import { analyzeWebAppLogs } from './fixtures/web-app-log-analysis';
+import { formatProcessLogSummary } from '../../scripts/model-eval-log-policy.mjs';
 
 const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
 
@@ -102,7 +104,7 @@ test.afterEach(async ({}, info) => {
   const analysis = { ...analyzeWebAppLogs(classified), phase: 'composer-state', debuggerDisconnects };
   writeFileSync(info.outputPath('log-analysis.json'), JSON.stringify(analysis, null, 2));
   expect(analysis.passed, 'Review log-analysis.json for errors or incomplete coverage').toBe(true);
-  if (analysis.requiresReview) console.warn('Composer E2E log warnings:', JSON.stringify(analysis.findings));
+  if (analysis.requiresReview) console.info(formatProcessLogSummary(analysis));
 });
 
 
@@ -301,7 +303,7 @@ for (const shape of ['5000-lines', 'long-paragraph'] as const) test(`${shape} re
     expect(sample.paragraphs).toBe(shape === '5000-lines' ? 5000 : 1);
     // A generous ceiling detects a full synchronous DOM rebuild without making
     // this a microbenchmark of the CI host. Actual timings remain in evidence.
-    expect(Math.max(...sample.durations)).toBeLessThan(shape === '5000-lines' ? 150 : 300);
+    expect(Math.max(...sample.durations)).toBeLessThan(shape === '5000-lines' ? COMPOSER_EDIT_LIMIT_MS.multiline : COMPOSER_EDIT_LIMIT_MS.paragraph);
   } finally { await app.dispose(); }
 });
 

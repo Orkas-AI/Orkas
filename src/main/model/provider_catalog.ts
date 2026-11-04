@@ -388,26 +388,37 @@ function cloneModelWithId(
     input: [...template.input],
     cost: { ...template.cost },
     ...(template.headers ? { headers: { ...template.headers } } : {}),
-    ...(template.thinkingLevelMap ? { thinkingLevelMap: { ...template.thinkingLevelMap } } : {}),
+    ...(template.thinkingLevelMap ? { thinkingLevelMap: { ...template.thinkingLevelMap as object } } : {}),
   };
   return applyConfiguredModelOverrides(cloned, overrides);
 }
 
-/** Temporary metadata for the official Flash id until pi-ai includes it.
- * M3 supplies the regional transport and input limits, not Flash's pricing or
- * thinking controls. Exact future SDK entries bypass this fallback.
+/** Keep the shipped Flash request controls when SDK discovery replaces the
+ * compatibility template. Minimal maps to the lowest supported effort and
+ * temperature remains provider-owned; native pricing and input limits survive.
  * https://platform.minimax.io/docs/api-reference/text-anthropic-api
  */
-function applyMinimaxFlashFallback(model: Model<Api>, providerId: string): Model<Api> {
+function applyMinimaxFlashControls(model: Model<Api>, providerId: string): Model<Api> {
   if (!['minimax-cn', 'minimax-portal', 'minimax-portal-cn'].includes(providerId)
     || model.id !== 'MiniMax-M3.1-Flash' || model.api !== 'anthropic-messages') return model;
   return {
     ...model,
+    thinkingLevelMap: { ...model.thinkingLevelMap as object, off: null, minimal: 'low' },
+    compat: { ...model.compat, supportsTemperature: false },
+  };
+}
+
+/** Older runtimes still use M3 as the regional transport template. */
+function applyMinimaxFlashFallback(model: Model<Api>, providerId: string): Model<Api> {
+  if (!['minimax-cn', 'minimax-portal', 'minimax-portal-cn'].includes(providerId)
+    || model.id !== 'MiniMax-M3.1-Flash' || model.api !== 'anthropic-messages') return model;
+  return applyMinimaxFlashControls({
+    ...model,
     reasoning: true,
     cost: { input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: 'low', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
-    compat: { ...model.compat, forceAdaptiveThinking: true, supportsTemperature: false },
-  };
+    compat: { ...model.compat, forceAdaptiveThinking: true },
+  }, providerId);
 }
 
 function hasConfiguredModelOverrides(configured: ProviderModelEntry | undefined): boolean {
@@ -498,7 +509,7 @@ export function resolveConfiguredPiModel(
   const exact = safeGetPiModel(catalog, catalogProviderId, requestedModelId);
   if (exact) {
     return {
-      model: applyConfiguredModelOverrides(exact, configured),
+      model: applyMinimaxFlashControls(applyConfiguredModelOverrides(exact, configured), requestedProviderId),
       requestedProviderId,
       requestedModelId,
       catalogProviderId,

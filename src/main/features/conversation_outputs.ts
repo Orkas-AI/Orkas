@@ -216,7 +216,7 @@ export async function listConversationOutputs(
   const workspace = await listWorkspaceFiles(root);
 
   let artifacts: ArtifactSummary[] = [];
-  try { artifacts = chatArtifacts.listArtifacts(userId, cid); }
+  try { artifacts = await chatArtifacts.listArtifacts(userId, cid); }
   catch (err) {
     // An unreadable artifact pool must not blank the file list.
     log.warn('artifact listing failed', { error: (err as Error).message });

@@ -1,6 +1,8 @@
 import type { Page } from '@playwright/test';
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
+const settingsTest = test;
+
 async function openDataSettings(page: Page): Promise<void> {
   await page.locator('#settings-btn').click();
   const dataTab = page.locator('.settings-tab[data-settings-tab="data"]');
@@ -17,7 +19,7 @@ async function openPersonalMemory(page: Page): Promise<void> {
 }
 
 test.describe('secondary user surfaces', () => {
-  test('imports reviewed memory into separate user and shared scopes', async ({ orkas }) => {
+  settingsTest('imports reviewed memory into separate user and shared scopes', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;
     await openPersonalMemory(page);
@@ -59,7 +61,7 @@ test.describe('secondary user surfaces', () => {
     expect(sharedMemory.entries).toContain('The E2E release checklist is the durable source of truth.');
   });
 
-  test('creates, edits, persists, exports, and deletes personal memory', async ({ orkas }) => {
+  settingsTest('creates, edits, persists, exports, and deletes personal memory', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     let page = orkas.page;
     await openPersonalMemory(page);

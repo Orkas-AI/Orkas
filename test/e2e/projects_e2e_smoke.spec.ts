@@ -792,6 +792,7 @@ test.describe('projects', () => {
     await expect.poll(async () => (
       await projectNames.allTextContents()
     ).filter((name) => name === projectName).length).toBe(1);
+    await orkas.acknowledgeInvokeFailures('projects.create', 1);
   });
 
   test('keeps an unsaved project draft focused without creating it during a background refresh', async ({
@@ -1277,6 +1278,7 @@ test.describe('projects', () => {
     expect(list.conversations.find((item) => item.conversation_id === conversation.conversation_id)?.project_id).toBe(project.project_id);
     const bindings = await orkas.invoke<{ bindings: { agents: string[] } }>('projects.bindings.list', { projectId: project.project_id });
     expect(bindings.bindings.agents).not.toContain(agent.agent_id);
+    await orkas.acknowledgeInvokeFailures('projects.bindings.add', 1);
   });
 
 });

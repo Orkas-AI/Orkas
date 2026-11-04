@@ -25,9 +25,10 @@ export type ToolDefinition = {
 
 /** Parameters for an LLM completion request. */
 export type CompletionParams = {
-  /** Request-local measurement from core preparation. Input references identify
-   * the unchanged request view; transformed inputs and foreign candidates must
-   * estimate afresh. Cloneable bookkeeping, never sent to an API or persisted. */
+  /** Request-local measurement from core preparation. `model` is the configured
+   * model preparation priced for; input references identify the unchanged
+   * request view. Transformed inputs and other candidates must estimate afresh.
+   * Cloneable bookkeeping, never sent to an API or persisted. */
   requestTokenEstimate?: {
     model: string;
     messages: Message[];
@@ -116,6 +117,12 @@ export interface LLMProvider {
 
   /** Test whether this provider's credentials are valid. */
   validateAuth(): Promise<boolean>;
+
+  /** Optional, read-only: the configured model the next request will be
+   * offered to first. Preparation prices its context budget against this
+   * model's catalog window and labels its measurement with it. Absent means
+   * the last model the provider reported serving. */
+  contextBudgetModel?(): string | undefined;
 }
 
 /** Provider factory function. */

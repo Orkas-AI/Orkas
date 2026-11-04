@@ -39,6 +39,7 @@ test('a scheme-less loopback address recovers after its local service becomes re
     });
     const address = page.locator('.web-assist-address-input');
     const input = `127.0.0.1:${port}/ready?item=one#board`;
+    const failedNavigationCheckpoint = orkas.rendererDiagnosticCheckpoint();
     await address.fill(input); await address.press('Enter');
     await expect.poll(async () => (await orkas.invoke<any>('webAssist.state')).state.error_code).toBe('page_load_failed');
     expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__loopbackNetErrors)).toContain(-102);
@@ -66,6 +67,7 @@ test('a scheme-less loopback address recovers after its local service becomes re
     expect(await wait()).toMatchObject({ ok: true, isError: false });
     expect(await orkas.electronApp!.evaluate(async ({ webContents }, id) => webContents.fromId(id)!.executeJavaScript('document.querySelector("h1")?.textContent'), nativeId)).toBe('Local service ready');
     expect(pageRequests).toBe(1);
+    await orkas.acknowledgeNavigationFailure(`http://${input}`, 'ERR_CONNECTION_REFUSED', failedNavigationCheckpoint);
     await orkas.electronApp!.evaluate((_electron, args) => {
       const require = (process as any).mainModule.require;
       require(args.root + '/src/main/features/web_assist_lifecycle.ts').finishBrowserTaskRun('account-e2e', args.cid, 'loopback-startup');

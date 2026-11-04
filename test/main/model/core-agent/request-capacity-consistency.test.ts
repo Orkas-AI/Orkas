@@ -126,27 +126,20 @@ describe('request capacity consistency', () => {
     expect(sentBudget.estimate_source).toBe('anchored');
   });
 
-  it('includes retained thinking in preparation and forwards it intact when nothing can be dropped', async () => {
+  it('includes retained thinking in preparation when no measured usage is available', async () => {
     const session = new Session();
     session.beginUserTurn([{ type: 'text', text: 'a'.repeat(248000) }]);
     session.addAssistantMessage([{ type: 'thinking', thinking: 'b'.repeat(84000) }]);
     const calls: CompletionParams[] = [];
     const { runner, prepared, failures } = harness(session, backend(calls));
     const result = await runner.run({ message: 'Resume', resumeActiveTurn: true });
-    // Public candidate rotation preserves its existing forwarding policy.
-    // Core preparation still prices the full retained thinking and reports
-    // that no allowed context can be dropped; it must not silently lose it.
-    expect(result.meta.error).toBeUndefined();
-    expect(result.text).toBe('Finished');
-    expect(calls).toHaveLength(1);
-    expect(failures).toEqual([]);
-    expect(calls[0].messages.some(message => message.content.some(block =>
-      block.type === 'thinking' && block.thinking === 'b'.repeat(84000)))).toBe(true);
+    expect(result.meta.error?.code).toBe('CONTEXT_CAPACITY_INSUFFICIENT');
+    expect(calls).toHaveLength(0);
+    expect(failures).toHaveLength(1);
     const preparation = prepared[0].requestMetadata!.contextBudgetDiagnostics as any;
     expect(preparation.estimated_input_tokens).toBeGreaterThan(ceiling);
     expect(preparation.emergency_result).toBe('nothing_to_drop');
-    expect((calls[0].requestMetadata!.contextBudgetDiagnostics as any).estimated_input_tokens)
-      .toBe(preparation.estimated_input_tokens);
+    expect(failures[0].contextBudget.estimated_input_tokens).toBe(preparation.estimated_input_tokens);
   });
 
   it('prices the tools-off boundary control before deciding whether to reduce context', async () => {
@@ -218,7 +211,28 @@ describe('request capacity consistency', () => {
     expect(unchangedCalls).toHaveLength(1);
     expect((unchangedCalls[0].requestMetadata!.contextBudgetDiagnostics as any).estimated_input_tokens)
       .toBe((request.requestMetadata!.contextBudgetDiagnostics as any).estimated_input_tokens);
-    // Changed-candidate capacity admission is a release provider policy;
-    // this public wrapper has not enabled that local rejection strategy.
+    for (const change of ['model', 'provider', 'output', 'messages', 'system', 'tools', 'image_projection']) {
+      const downstream: CompletionParams[] = [];
+      // The first available candidate is the one preparation priced, whatever
+      // its provider; a foreign provider behind it still estimates afresh.
+      const priced = change === 'provider' ? [{ profileId: 'priced', providerId: 'fixture', modelId: 'smaller',
+        contextWindow: 32000, maxTokens: 8192, build: async () => backend(downstream) }] : [];
+      const provider = createRotatingProvider({ providerId: 'fixture', candidates: [...priced, {
+        profileId: 'other', providerId: change === 'provider' ? 'foreign' : 'fixture',
+        modelId: change === 'model' ? 'smaller' : 'fixture',
+        contextWindow: change === 'model' ? 32000 : window,
+        maxTokens: change === 'output' ? 110000 : change === 'model' ? 8192 : output,
+        ...(change === 'image_projection' ? { maxInputImages: 0 } : {}),
+        build: async () => backend(downstream),
+      }] });
+      const changed = { ...request };
+      if (change === 'messages') changed.messages = [...request.messages, { role: 'user', content: [{ type: 'text', text: 'x'.repeat(200000) }] }];
+      if (change === 'system') changed.systemPrompt = (request.systemPrompt || '') + 'x'.repeat(200000);
+      if (change === 'tools') changed.tools = [{ name: 'large', description: 'x'.repeat(200000), inputSchema: {} }];
+      if (change === 'image_projection') changed.messages = [...request.messages, { role: 'user', content: [{ type: 'image', data: 'synthetic', mediaType: 'image/png' }] }];
+      const invoke = () => mode === 'stream' ? drain(provider.stream(changed)) : provider.complete(changed);
+      await expect(invoke()).rejects.toMatchObject({ code: 'CONTEXT_OVERFLOW' });
+      expect(downstream).toEqual([]);
+    }
   });
 });

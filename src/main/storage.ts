@@ -1,4 +1,4 @@
-import { prepareIndexedJsonlAppend } from './util/indexed-jsonl';
+import { indexedJsonlStampFromStat, prepareIndexedJsonlAppend } from './util/indexed-jsonl';
 /**
  * Timestamps, ID generation, and JSON/JSONL IO helpers.
  *
@@ -89,7 +89,7 @@ export function isAtomicWriteTempPath(filePath: string): boolean {
   return ATOMIC_TMP_PATH_RE.test(path.basename(filePath));
 }
 
-function atomicTmpPath(filePath: string): string {
+export function atomicTmpPath(filePath: string): string {
   return `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
 }
 
@@ -313,6 +313,8 @@ export interface JsonlAppendSource {
   dev: number;
   ino: number;
   beforeMtime: number;
+  beforeStamp?: string;
+  stamp?: string;
   mtime: number;
   size: number;
 }
@@ -345,11 +347,13 @@ export async function appendJsonlAtomic<T>(filePath: string, record: T, withSour
           const after = await handle.stat();
           source = { kind: 'jsonl-append', file: filePath, offset: before.size,
             bytes: Buffer.byteLength(line), dev: after.dev, ino: after.ino,
-            beforeMtime: before.mtimeMs, mtime: after.mtimeMs, size: after.size };
+            beforeMtime: before.mtimeMs, mtime: after.mtimeMs, size: after.size,
+            beforeStamp: indexedJsonlStampFromStat(before), stamp: indexedJsonlStampFromStat(after) };
         } finally { await handle.close(); }
       } else await fsp.appendFile(filePath, line, 'utf8');
     } catch (error) {
-      // Recount after a failed write may have left a partial row.
+      // A failed write may have left part of this line. Recount on the next
+      // append so that it starts on a clean line.
       _lineCounts.delete(filePath);
       throw error;
     }

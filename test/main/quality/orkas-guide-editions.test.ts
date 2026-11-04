@@ -48,3 +48,37 @@ describe('shared Orkas guide editions', () => {
     ]) expect(read(`references/${file}`)).toMatch(new RegExp(`## ${section}[^\\n]*commercial edition only`, 'i'));
   });
 });
+
+it('routes feature selection to the overview and distinguishes work tracking from scheduled execution', () => {
+    const skill = read('SKILL.md');
+    const overviewRoute = skill.split('\n').find((line) => line.startsWith('|') && line.includes('(references/getting-started.md)'));
+    expect(overviewRoute).toMatch(/choose features for ongoing work/i);
+    const overview = read('references/getting-started.md');
+    for (const feature of ['Task / conversation', 'Project', 'Goals & rules', 'To-do', 'Auto', 'Agent', 'Skill', 'Connector', 'Library', 'Memory', 'App', 'Model', 'Workspace']) {
+      expect(overview.includes(`| **${feature}** |`), feature).toBe(true);
+    }
+    const projectGuide = read('references/projects-and-automation.md');
+    expect(projectGuide.includes('does not calculate business-metric progress')).toBe(true);
+    expect(projectGuide.includes('Completing to-dos measures work progress')).toBe(true);
+    expect(projectGuide.includes('auto-advance is separate from scheduled Automation')).toBe(true);
+    expect(projectGuide.includes('does not start work merely because it exists')).toBe(true);
+    expect(projectGuide).toContain('**Auto** on **To-do**');
+    expect(projectGuide).toContain('off by default');
+    expect(projectGuide).toContain('due date is a deadline');
+    const resources = read('references/agents-skills-and-connectors.md');
+    expect(resources.includes("caller's available connections and permissions")).toBe(true);
+  });
+it('retains explicit-request and accepted-offer authority without requiring a second confirmation', () => {
+ const projectGuide=read('references/projects-and-automation.md');
+ expect(projectGuide).toContain('when the user asks for one or accepts its offer');
+ expect(projectGuide).toContain('does not require a second confirmation');
+ expect(projectGuide).not.toContain('without asking first');
+ const guidance=fs.readFileSync(path.resolve(process.cwd(),'src/main/prompts/followup_offer_guidance.md'),'utf8');
+ expect(guidance).toContain('Create one only when the');
+ const root=read('SKILL.md');
+ expect(root.match(/^---\n([\s\S]*?)\n---/)?.[1].split('\n').map(l=>l.match(/^([a-z_]+):/)?.[1]).filter(Boolean)).toEqual(['name','description']);
+ expect(root).toMatch(/\*\*Execute:\*\* supply the relevant product facts, prerequisites, visible results, and recovery/);
+ const removal=fs.readFileSync(path.join(skillRoot,'skill-creator/references/file-deletion.md'),'utf8').replace(/\s+/g,' ');
+ expect(removal.split('## Files inside a Skill')[0]).toContain('has no protocol here. The user does it:');
+ expect(removal).toContain('Do not call the tool again in that turn');
+});

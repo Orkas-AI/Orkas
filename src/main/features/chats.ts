@@ -1,4 +1,4 @@
-import { taskForPath, type TaskOwnership } from './conversation_deletions';
+import { taskForPath, conversationFileInventory, invalidateTaskDeletions, type TaskOwnership } from './conversation_deletions';
 /**
  * Conversations (per-user) — CRUD + message reads.
  *
@@ -25,7 +25,7 @@ import { turnIndexRequest } from './conversation-history-client';
 
 import {
   userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile, userProjectsDir,
-  WS_ROOT,
+  WS_ROOT, userCloudRoot, projectMetaFile,
   localCliDirectoryFile,
 } from '../paths';
 import {
@@ -54,6 +54,7 @@ import {
 } from '../storage';
 import { removeCodingDirectory } from './local_agents/project-directory';
 import { createLogger } from '../logger';
+import { resolveCloudRelPath } from '../util/cloud-path';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { t } from '../i18n';
 import {
@@ -727,6 +728,7 @@ export async function retainedConversationIdsForEditCleanup(uid: string): Promis
 }
 
 export interface ConversationDisplayRow {
+  deleted: boolean;
   conversation_id: string;
   title: string;
   project_id: string;
@@ -738,13 +740,22 @@ export async function listCleanupConversationRows(userId: string): Promise<Conve
   return items.filter(row => !isDeletedConversation(row));
 }
 
+/** Deletion discovers durable metadata, including legacy and already deleted
+ * children, without history/runtime enrichment or silently losing recoverable rows. */
+export async function listConversationDeletionRows(userId: string, projectId: string): Promise<Conversation[]> {
+  return (await _readRawConversations(userId)).filter(row => row.project_id === projectId);
+}
+
 /** Compact search/display catalog. Reuses the central parsed index snapshot
  * and deliberately excludes runtime, participants, history, and metadata. */
-export async function listConversationDisplayRows(userId: string): Promise<ConversationDisplayRow[]> {
+export async function listConversationDisplayRows(
+  userId: string, options: { includeDeleted?: boolean } = {},
+): Promise<ConversationDisplayRow[]> {
   const { items } = _mergeNormalizedConversationRows(await _readIndexConversations(userId));
   return items
-    .filter((row) => !isDeletedConversation(row))
+    .filter((row) => options.includeDeleted || !isDeletedConversation(row))
     .map((row) => ({
+      deleted: isDeletedConversation(row),
       conversation_id: row.conversation_id,
       title: row.title || '',
       project_id: typeof row.project_id === 'string' ? row.project_id : '',
@@ -956,9 +967,9 @@ async function _saveConversationMetas(
   });
 }
 
-async function _removeConversationMeta(userId: string, cid: string): Promise<void> {
+async function _removeConversationMeta(cid: string, roots: ReadonlyArray<{ dir: string }>): Promise<void> {
   if (!safeId(cid)) return;
-  for (const root of conversationRoots(userId)) {
+  for (const root of roots) {
     try { await fsp.unlink(path.join(root.dir, cid, conversationMetaName())); } catch { /* ignore */ }
   }
 }
@@ -1063,6 +1074,57 @@ async function _withConversationWrite<T>(userId: string, fn: () => Promise<T>): 
   }
 }
 
+/** Tombstones cleaned per lifecycle-lock hold. */
+const TOMBSTONE_CLEANUP_BATCH = 32;
+
+/**
+ * Remove the files a published repair left behind, in short lifecycle-lock holds
+ * so that a new task never queues behind the whole list. Each hold rechecks the
+ * index, because a restore between holds must keep the metadata it just wrote.
+ *
+ * `pruned` rows just left the index: nothing would clean them later and discovery
+ * would revive whatever stays on disk. They go first and ignore cancellation, while
+ * the others wait for the next repair. Returns false when cancelled.
+ */
+async function _removeTombstoneFiles(
+  userId: string,
+  tombstones: readonly Conversation[],
+  pruned: ReadonlySet<string>,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!tombstones.length) return true;
+  const isPruned = (c: Conversation) => pruned.has(c.conversation_id);
+  const ordered = [...tombstones.filter(isPruned), ...tombstones.filter(c => !isPruned(c))];
+  const roots = conversationRoots(userId);
+  let checkedGeneration = -1;
+  let live = new Set<string>();
+  for (let start = 0; start < ordered.length; start += TOMBSTONE_CLEANUP_BATCH) {
+    const batch = ordered.slice(start, start + TOMBSTONE_CLEANUP_BATCH);
+    if (signal?.aborted && !isPruned(batch[0])) return false;
+    await _withConversationWrite(userId, async () => {
+      const generation = _conversationListGeneration.get(userId) || 0;
+      if (generation !== checkedGeneration) {
+        checkedGeneration = generation;
+        // The index cache is per module instance; the generation spans them.
+        _invalidateConversationIndexCache(userId);
+        live = new Set((await _readIndexConversations(userId))
+          .filter(row => !isDeletedConversation(row)).map(row => row.conversation_id));
+      }
+      for (const c of batch) {
+        if (live.has(c.conversation_id)) continue;
+        await _removeConversationMeta(c.conversation_id, roots);
+        if (isExpiredIsoTombstone(c.deleted_at)) {
+          const file = conversationMessageReadFile(userId, c.conversation_id, c.project_id ?? null);
+          try { await fsp.unlink(file); } catch { /* missing is fine */ }
+          invalidateLineCount(file);
+        }
+      }
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  return true;
+}
+
 async function _repairConversationIndexFromDiskUnlocked(
   userId: string,
   items: Conversation[],
@@ -1076,14 +1138,17 @@ async function _repairConversationIndexFromDiskUnlocked(
   const tombstones = items.filter(c => isDeletedConversation(c) && safeId(c.conversation_id));
   const compacted = pruneExpiredDeletedRecords(items) as Conversation[];
   const expiredTombstoneCount = items.length - compacted.length;
+  const keptCids = new Set(compacted.map(c => c.conversation_id));
+  const prunedCids = new Set(tombstones.map(c => c.conversation_id).filter(cid => !keptCids.has(cid)));
   items = compacted;
 
   const finish = async (cancelled: boolean, includeRecovered: boolean): Promise<ConversationRepairRun> => {
     const acceptedRecovered = includeRecovered ? recovered : [];
     const snapshot = [...items, ...acceptedRecovered];
+    let published = false;
     // Do not hold the lifecycle lock during discovery. Validate the snapshot
     // inside that lock before any index, metadata, or transcript mutation.
-    return _withConversationWrite(userId, async () => {
+    const run = await _withConversationWrite<ConversationRepairRun>(userId, async () => {
       if ((_conversationListGeneration.get(userId) || 0) !== generation) {
         _invalidateConversationIndexCache(userId);
         return { items: await _readIndexConversations(userId), cancelled: true };
@@ -1093,14 +1158,7 @@ async function _repairConversationIndexFromDiskUnlocked(
       try {
         // Persist deletion intent before removing any remaining metadata.
         if (changed) await _saveConversationsUnlocked(userId, repaired);
-        for (const c of tombstones) {
-          await _removeConversationMeta(userId, c.conversation_id);
-          if (isExpiredIsoTombstone(c.deleted_at)) {
-            const file = conversationMessageReadFile(userId, c.conversation_id, c.project_id ?? null);
-            try { await fsp.unlink(file); } catch { /* missing is fine */ }
-            invalidateLineCount(file);
-          }
-        }
+        published = true;
         if (changed) {
           try {
             createLogger('chats').info(
@@ -1110,9 +1168,13 @@ async function _repairConversationIndexFromDiskUnlocked(
         }
         return { items: repaired, cancelled };
       } finally {
-        if (changed || tombstones.length) _invalidateConversationListCache(userId);
+        if (changed) _invalidateConversationListCache(userId);
       }
     });
+    // A rejected snapshot lost to a newer write and removes nothing.
+    if (!published) return run;
+    const cleaned = await _removeTombstoneFiles(userId, tombstones, prunedCids, signal);
+    return cleaned ? run : { ...run, cancelled: true };
   };
 
   if (signal?.aborted) return finish(true, false);
@@ -1235,6 +1297,7 @@ function _cloneConversationList(items: Conversation[]): Conversation[] {
 }
 
 function _invalidateConversationListCache(userId: string): void {
+  invalidateTaskDeletions(userId);
   _invalidateConversationIndexCache(userId);
   _conversationListCache.delete(userId);
   _conversationListInFlight.delete(userId);
@@ -1460,9 +1523,8 @@ export interface ConversationPage extends ConversationPageInfo {
 }
 
 export const CONVERSATION_LIST_PAGE_SIZE = 10;
-// The renderer includes today and yesterday, so the previous local midnight
-// can be 49 hours behind across a DST fallback. Keep one extra hour of
-// tolerance while bounding the startup slice to the recent calendar window.
+// Retain compatibility with older renderers' two-calendar-day windows (up to
+// 49h across a DST fallback). Current renderers request a rolling 24h window.
 const STARTUP_ACTIVE_SINCE_MAX_LOOKBACK_MS = 50 * 60 * 60 * 1000;
 
 function _conversationActivityMs(c: Conversation): number {
@@ -1516,8 +1578,8 @@ async function _enrichConversationPage(
  * per-conversation state/member/history enrichment is limited to rows that can
  * actually appear on first paint. Project and unprojected task lists each use
  * one chronological 10-row page; time buckets are only a renderer grouping.
- * Rows active at or after `activeSinceMs` (the renderer's previous local day start) are
- * always included, whatever their project, so the sidebar's recent-task aggregate can
+ * Pinned rows and rows active at or after `activeSinceMs` (the recent-task cutoff)
+ * are always included, whatever their project, so the sidebar's recent-task aggregate can
  * show tasks under collapsed projects; page totals and cursors are unchanged. */
 export async function listStartupConversations(
   userId: string,
@@ -1574,6 +1636,7 @@ export async function listStartupConversations(
     if (active?.project_id) selectedProjectCids.add(active.conversation_id);
     else if (active) selectedUnprojectedCids.add(active.conversation_id);
     return all.filter((c) => {
+      if (c.pinned_at) return true;
       if (activeSinceMs !== null && _conversationActivityMs(c) >= activeSinceMs) return true;
       if (c.project_id) return selectedProjectCids.has(c.conversation_id);
       return selectedUnprojectedCids.has(c.conversation_id);
@@ -1733,6 +1796,10 @@ class ConversationIndexStore {
     if (projectIdHint === null || (typeof projectIdHint === 'string' && safeId(projectIdHint))) {
       const hinted = await this.targetInRoot(_conversationRootKey(projectIdHint), cid);
       if (hinted) return hinted;
+      if (projectIdHint) {
+        const legacy = await this.targetInRoot('', cid);
+        if (legacy?.conversation.project_id === projectIdHint) return legacy;
+      }
       if (!fallbackAcrossRoots) return null;
     }
 
@@ -1749,12 +1816,21 @@ class ConversationIndexStore {
     const winner = _mergeNormalizedConversationRows(candidates).items[0];
     if (!winner) return null;
     const winnerRoot = _conversationRootKey(winner.project_id);
-    return this.targetInRoot(winnerRoot, cid);
+    const canonical = await this.targetInRoot(winnerRoot, cid);
+    if (canonical) return canonical;
+    // Pre-v4 project rows can still be physically in the global index. Their
+    // declared membership, not an assumed index location, owns the mutation.
+    const legacy = winnerRoot ? await this.targetInRoot('', cid) : null;
+    return legacy?.conversation.project_id === winner.project_id ? legacy : null;
   }
 
   async persistTarget(target: ConversationIndexTarget, next: Conversation): Promise<void> {
     const oldRoot = target.rootKey;
-    const newRoot = _conversationRootKey(next.project_id);
+    // Project deletion retains its child tombstones in the existing global
+    // catalog. Acknowledging them must not recreate a removed project tree.
+    const newRoot = isDeletedConversation(next) && !oldRoot
+      && next.project_id && !fs.existsSync(projectMetaFile(this.userId, next.project_id))
+      ? '' : _conversationRootKey(next.project_id);
     const changedRoots = new Set<string>([oldRoot, newRoot]);
     const oldRows = await this.readRoot(oldRoot);
     // A project move spans two atomic files. Keep their rows until both writes
@@ -1766,6 +1842,11 @@ class ConversationIndexStore {
     if (oldRoot === newRoot) {
       if (oldIndex >= 0) oldRows[oldIndex] = next;
       else oldRows.unshift(next);
+      if (newRoot && isDeletedConversation(next)) {
+        const legacy = await this.readRoot('');
+        const at = legacy.findIndex(row => row.conversation_id === next.conversation_id && row.project_id === next.project_id);
+        if (at >= 0) { legacy.splice(at, 1); changedRoots.add(''); }
+      }
     } else {
       for (let i = oldRows.length - 1; i >= 0; i -= 1) {
         if (oldRows[i].conversation_id === next.conversation_id) oldRows.splice(i, 1);
@@ -1812,6 +1893,19 @@ class ConversationIndexStore {
       _conversationMetaFileForRoot(this.userId, conversation.conversation_id, key),
       _cleanConversationMeta(conversation),
     );
+  }
+
+  async retainProjectDeletes(projectId: string): Promise<void> {
+    const rows = await this.readRoot(projectId);
+    const global = await this.readRoot('');
+    for (const row of rows) {
+      if (!isDeletedConversation(row)) throw new Error('project deletion incomplete');
+      const at = global.findIndex(item => item.conversation_id === row.conversation_id);
+      if (at >= 0 && global[at].project_id !== projectId) throw new Error('conversation ownership conflict');
+      if (at >= 0) global[at] = row;
+      else global.push(row);
+    }
+    if (rows.length) await this.commitRoots(new Set(['']));
   }
 
   private async commitRoots(rootKeys: ReadonlySet<string>): Promise<void> {
@@ -2355,7 +2449,7 @@ function purgeSession(userId: string, sessionId: string): void {
   deleteSessionFileForUser(userId, sessionId);
 }
 
-async function _purgeDeletedConversationFiles(userId: string, cid: string, ownership: TaskOwnership, removed?: Conversation): Promise<void> {
+async function _purgeDeletedConversationFiles(userId: string, cid: string, ownership: TaskOwnership, physicalRoots: string[], removed?: Conversation): Promise<void> {
   // A completed turn may still be materializing remote image/video output in
   // the background. Abort it before removing the message file; attachment
   // purge also holds the writer lock so a response already past abort cannot
@@ -2437,6 +2531,15 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, owner
     }
   } catch (err) { log.warn(`purge cli sessions user=${userId} cid=${cid}: ${(err as Error).message}`); }
 
+  // Feature purgers clear caches/locks but older implementations were best
+  // effort and resolved only the current write location. Verify the physical
+  // inventory strictly before claiming durable deletion, including old copies.
+  try {
+    for (const rel of physicalRoots) await fsp.rm(resolveCloudRelPath(userCloudRoot(userId), rel), { recursive: true, force: true });
+  } catch (error) {
+    log.warn('conversation physical deletion incomplete', { ...logErrorSummary(error) });
+    throw new Error('delete_failed');
+  }
   removeCodingDirectory(userId, cid);
   log.info(`deleted user=${userId} cid=${cid}`);
 }
@@ -2449,6 +2552,7 @@ export async function deleteConversation(
 ): Promise<boolean> {
   let removed: Conversation | null = null;
   let ownership: TaskOwnership = new Map();
+  let physicalRoots: string[] = [];
   const found = await _withConversationIndexStore(userId, async (store) => {
     const target = await store.findTarget(cid, projectIdHint);
     if (!target) return false;
@@ -2458,8 +2562,10 @@ export async function deleteConversation(
     // index twice per task just to disambiguate member-session prefixes.
     ownership = new Map((await store.readRoot(target.rootKey)).map(row => [
       `${target.rootKey}/${row.conversation_id}`,
-      { cid: row.conversation_id, projectId: target.rootKey || null },
+      { cid: row.conversation_id, projectId: target.rootKey || null, deletedAt: row.deleted_at || '' },
     ]));
+    const inventory = await conversationFileInventory(userId, cid, target.conversation.project_id || null, ownership);
+    physicalRoots = inventory.roots;
     if (!isDeletedConversation(target.conversation)) {
       const deletedAt = nowIso();
       const tombstone = _stampConversationSync(userId, {
@@ -2478,7 +2584,7 @@ export async function deleteConversation(
     return true;
   });
   if (!found || !removed) return false;
-  await _purgeDeletedConversationFiles(userId, cid, ownership, removed);
+  await _purgeDeletedConversationFiles(userId, cid, ownership, physicalRoots, removed);
   await (await import('./saved_apps')).cleanupEditSnapshots(userId, false, cid);
   return true;
 }
@@ -3045,6 +3151,11 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
   });
   if (swept) log.info(`cleared ${swept} stale running conversations`);
   return { swept };
+}
+
+/** Preserve deletion generations before their parent directory is removed. */
+export async function retainProjectConversationDeletes(userId: string, projectId: string): Promise<void> {
+  await _withConversationIndexStore(userId, store => store.retainProjectDeletes(projectId));
 }
 
 /** Serialize explicit recycle restoration with ordinary task lifecycle writes. */

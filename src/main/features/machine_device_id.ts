@@ -10,7 +10,7 @@
 
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
-import * as path from 'node:path';
+import { updateDeviceRecord } from '../util/device-record';
 
 import { DEVICE_FILE } from '../paths';
 import { createLogger } from '../logger';
@@ -53,24 +53,10 @@ function readStoredDeviceId(): string {
 }
 
 function writeStoredDeviceId(deviceId: string): void {
-  const dir = path.dirname(DEVICE_FILE);
-  fs.mkdirSync(dir, { recursive: true });
-  const tmp = `${DEVICE_FILE}.${process.pid}.${Date.now()}.tmp`;
-  try {
-    const body = JSON.stringify({
-      version: 1,
-      device_id: deviceId,
-      created_at: Date.now(),
-    }, null, 2);
-    fs.writeFileSync(tmp, body, { encoding: 'utf8', mode: 0o600 });
-    fs.renameSync(tmp, DEVICE_FILE);
-  } finally {
-    // A failed rename (read-only path, directory collision, full disk) must
-    // not accumulate machine-global identity temp files on every launch.
-    try {
-      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
-    } catch { /* best-effort cleanup; the original persistence error wins */ }
-  }
+  updateDeviceRecord(record => ({
+    ...record, version: 1, device_id: deviceId,
+    created_at: record.created_at ?? Date.now(),
+  }), true);
 }
 
 export function getDeviceId(legacySeed?: unknown): string {

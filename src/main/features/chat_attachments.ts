@@ -43,7 +43,6 @@
 
 import { fileFailureKind, type FileFailureKind } from '../util/app-error';
 import * as fs from 'node:fs';
-import { isUtf8File } from '../util/file-import';
 import { MAX_TEXT_FILE_BYTES } from '../util/file-size-limits';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -123,6 +122,7 @@ const MAX_BYTES_ARCHIVE = 8 * 1024 * 1024;
 const MAX_FILENAME_LEN = 200;
 const MAX_CONVERSATION_ATTACHMENT_INDEX_FILES = 40;
 const GENERATED_ATTACHMENTS_FILE = '.generated-attachments.json';
+const SELECTED_ATTACHMENTS_FILE = '.selected-attachments.json';
 /** Composer boundary: one unsent message may reference at most this many
  * distinct attachments. Enforced in the storage layer so IPC, drag/drop and
  * any future callers cannot bypass the UI. */
@@ -149,7 +149,7 @@ export interface AttachmentInfo {
   mtime: number;      // epoch seconds
 }
 
-type AttachmentErrorCode = 'invalid_attachment' | 'file_too_large' | 'invalid_utf8'
+type AttachmentErrorCode = 'invalid_attachment' | 'file_too_large'
   | 'too_many_attachments' | 'source_unavailable' | 'not_file' | 'read_failed' | 'write_failed' | 'copy_failed';
 export type Result<T = {}> = ({ ok: true } & T) | {
   ok: false; error: string; failure_kind?: FileFailureKind; error_code?: AttachmentErrorCode;
@@ -241,13 +241,29 @@ function migrateLegacyDraftCloudDir(userId: string, cid: string): void {
       fs.renameSync(legacy, local);
     } else {
       fs.mkdirSync(local, { recursive: true });
+      const selectionFile = path.join(local, SELECTED_ATTACHMENTS_FILE);
+      let selected: Set<string> | undefined;
+      if (fs.existsSync(selectionFile)) {
+        const value: unknown = JSON.parse(fs.readFileSync(selectionFile, 'utf8'));
+        if (!Array.isArray(value)) throw new Error('invalid selected attachment ledger');
+        selected = new Set(value.filter((name): name is string => typeof name === 'string'));
+      }
       for (const name of fs.readdirSync(legacy)) {
+        if (name === SELECTED_ATTACHMENTS_FILE) continue;
         const from = path.join(legacy, name);
         let st: fs.Stats;
         try { st = fs.statSync(from); } catch { continue; }
         if (!st.isFile()) continue;
-        _moveFileBestEffort(from, uniqueTarget(local, name));
+        const target = uniqueTarget(local, name);
+        if (selected && !name.startsWith('.')) {
+          // These are legacy composer inputs. Record their collision-resolved
+          // names before moving so a failed metadata write cannot hide bytes.
+          selected.add(path.basename(target));
+          writeJsonSync(selectionFile, [...selected]);
+        }
+        _moveFileBestEffort(from, target);
       }
+      try { fs.unlinkSync(path.join(legacy, SELECTED_ATTACHMENTS_FILE)); } catch { /* optional legacy metadata */ }
       try { fs.rmdirSync(legacy); } catch { /* best-effort */ }
     }
   } catch (err) {
@@ -303,6 +319,46 @@ function saveGeneratedAttachmentNames(userId: string, cid: string, names: Set<st
 function clearGeneratedAttachment(userId: string, cid: string, name: string): void {
   const generated = generatedAttachmentNames(userId, cid);
   if (generated.delete(name)) saveGeneratedAttachmentNames(userId, cid, generated);
+}
+
+/** Only user selection creates composer ownership. A mixed conversation pool
+ * is not evidence of selection, including legacy pools without a receipt. */
+function selectedAttachmentNames(userId: string, cid: string): Set<string> {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(
+      path.join(attachmentDirForCid(userId, cid), SELECTED_ATTACHMENTS_FILE), 'utf8',
+    ));
+    if (!Array.isArray(value)) throw new Error('invalid selected attachment ledger');
+    return new Set(value.filter((name): name is string => typeof name === 'string'
+      && path.basename(name) === name && !name.includes('\\') && !name.startsWith('.')));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('selected attachment ownership read failed', { error: logErrorSummary(error) });
+      return new Set();
+    }
+    // These local-only directories have always belonged exclusively to the
+    // composer. Preserve their legacy drafts, never infer inputs in a cid pool.
+    return isDraftAttachmentCid(cid) ? new Set(listAttachments(userId, cid).map(item => item.name)) : new Set();
+  }
+}
+
+function saveSelectedAttachmentNames(userId: string, cid: string, names: Set<string>): void {
+  const file = path.join(attachmentDirForCid(userId, cid), SELECTED_ATTACHMENTS_FILE);
+  if (names.size) {
+    writeJsonSync(file, [...names]);
+  } else if (fs.existsSync(file)) {
+    fs.unlinkSync(file);
+  }
+}
+
+function rollbackSelectedAttachment(target: string | undefined): void {
+  if (!target) return;
+  try { fs.rmSync(target, { force: true }); }
+  catch (error) {
+    // The original publication failure remains authoritative. A leftover
+    // file has no selection receipt and therefore cannot become user input.
+    log.warn('selected attachment rollback cleanup failed', { error: logErrorSummary(error) });
+  }
 }
 
 /** Record only actual files directly in this conversation's attachment pool.
@@ -398,7 +454,7 @@ async function publishSelectedAttachment(dir: string, name: string, stage: (temp
 }
 
 class StagedAttachmentAdmissionError extends Error {
-  constructor(readonly errorCode: 'file_too_large' | 'invalid_utf8', message: string) { super(message); }
+  constructor(readonly errorCode: 'file_too_large', message: string) { super(message); }
 }
 
 function attachmentInfoForPath(absPath: string, name = path.basename(absPath)): AttachmentInfo | null {
@@ -653,12 +709,6 @@ export async function uploadAttachment(
   if (buf.length > cap) {
     return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }), error_code: 'file_too_large' };
   }
-  if (TEXT_EXTS.has(ext)) {
-    const s = buf.toString('utf8');
-    if (!Buffer.from(s, 'utf8').equals(buf)) {
-      return { ok: false, error: t('errors.not_utf8'), error_code: 'invalid_utf8' };
-    }
-  }
 
   const dir = ensureDir(userId, safeConvId);
   const incomingHash = hashBuffer(buf);
@@ -684,11 +734,18 @@ export async function uploadAttachment(
       };
     }
 
-    let target: string;
+    let target: string | undefined;
     // Only publish complete bytes. A failed direct write could leave a short
     // file that pending-attachment recovery would treat as a successful add.
-    try { target = await publishSelectedAttachment(dir, safeName, temp => fs.promises.writeFile(temp, buf, { flag: 'wx' })); }
+    try {
+      // Materialize legacy composer ownership before publishing the new file.
+      const selected = selectedAttachmentNames(userId, safeConvId);
+      target = await publishSelectedAttachment(dir, safeName, temp => fs.promises.writeFile(temp, buf, { flag: 'wx' }));
+      selected.add(path.basename(target));
+      saveSelectedAttachmentNames(userId, safeConvId, selected);
+    }
     catch (err) {
+      rollbackSelectedAttachment(target);
       // Roll back the mkdir from `ensureDir` if the directory ended up empty
       // (i.e., this was the first attachment for the cid and the write failed
       // before producing anything). Best-effort: a non-empty dir means a
@@ -750,14 +807,6 @@ export async function importAttachmentFromPath(
   if (sourceStat.size > cap) {
     return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }), error_code: 'file_too_large' };
   }
-  if (TEXT_EXTS.has(ext)) {
-    let validUtf8: boolean;
-    try { validUtf8 = await isUtf8File(absSource); }
-    catch (err) { return { ok: false, error: (err as Error).message, error_code: 'read_failed', failure_kind: fileFailureKind(err) }; }
-    if (!validUtf8) {
-      return { ok: false, error: t('errors.not_utf8'), error_code: 'invalid_utf8' };
-    }
-  }
 
   return withAttachmentWriteLock(userId, safeConvId, async () => {
     const dir = ensureDir(userId, safeConvId);
@@ -785,8 +834,9 @@ export async function importAttachmentFromPath(
       };
     }
 
-    let target: string;
+    let target: string | undefined;
     try {
+      const selected = selectedAttachmentNames(userId, safeConvId);
       // Keep in-flight and failed copies out of the public attachment pool.
       target = await publishSelectedAttachment(dir, safeName, async temp => {
         await fs.promises.copyFile(absSource, temp, fs.constants.COPYFILE_EXCL);
@@ -797,11 +847,6 @@ export async function importAttachmentFromPath(
         }
         // The source may have changed after initial validation/hash. Bind
         // admission and the dedupe receipt to the private completed snapshot.
-        // It can also change between UTF-8 preflight and the initial hash,
-        // so matching hashes cannot substitute for validating this snapshot.
-        if (TEXT_EXTS.has(ext) && !await isUtf8File(temp)) {
-          throw new StagedAttachmentAdmissionError('invalid_utf8', t('errors.not_utf8'));
-        }
         const copiedHash = await hashFile(temp);
         if (copiedHash !== incomingHash) {
           incomingHash = copiedHash;
@@ -809,8 +854,13 @@ export async function importAttachmentFromPath(
           if (duplicate) return path.join(dir, duplicate.name);
         }
       });
+      if (!duplicate) {
+        selected.add(path.basename(target));
+        saveSelectedAttachmentNames(userId, safeConvId, selected);
+      }
     }
     catch (err) {
+      if (!duplicate) rollbackSelectedAttachment(target);
       try {
         if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
       } catch { /* best-effort */ }
@@ -871,8 +921,9 @@ export function listAttachments(userId: string, cid: string): AttachmentInfo[] {
 }
 
 /**
- * Same as listAttachments, minus files owned by live user tasks, generated
- * outputs, or persisted messages. Used by the chip area
+ * Explicit selections, minus files owned by live user tasks, generated
+ * outputs, or persisted messages. Unknown pool files are never user inputs.
+ * Used by the chip area
  * (`/api/conversations/:cid/attachments`) to restore only the "uploaded but
  * not yet sent" pool on app restart — without also re-chiping files that
  * already belong to prior messages.
@@ -882,8 +933,10 @@ export function listPendingAttachments(userId: string, cid: string): AttachmentI
   try { safeConvId = safeCid(cid); }
   catch { return []; }
   const generated = generatedAttachmentNames(userId, safeConvId);
+  const selected = selectedAttachmentNames(userId, safeConvId);
   const active = activeUserAttachmentNames(userId, safeConvId);
-  const all = listAttachments(userId, safeConvId).filter(item => !generated.has(item.name) && !active.has(item.name));
+  const all = listAttachments(userId, safeConvId).filter(item => selected.has(item.name)
+    && !generated.has(item.name) && !active.has(item.name));
   if (!all.length) return all;
 
   const jsonlPath = conversationMessageReadFile(userId, safeConvId);
@@ -986,6 +1039,8 @@ export function deleteAttachment(userId: string, cid: string, name: string): Res
   try { fs.unlinkSync(p); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   clearGeneratedAttachment(userId, safeConvId, safeName);
+  const selected = selectedAttachmentNames(userId, safeConvId);
+  if (selected.delete(safeName)) saveSelectedAttachmentNames(userId, safeConvId, selected);
   // Drop the lazy file_cache entry for this source (if any was materialised).
   try { invalidateFileCache(userId, p); }
   catch (err) { log.warn('attachment cache invalidation failed', { file: logPathRef(p), error: logErrorSummary(err) }); }
@@ -1463,20 +1518,26 @@ export async function adoptDraftAttachments(
     if (!fs.existsSync(src)) return { ok: true, count: 0, items: [] };
     const dst = chatAttachmentDirForConversation(userId, dstSafe);
     const sourceGenerated = generatedAttachmentNames(userId, srcSafe);
+    const sourceSelected = selectedAttachmentNames(userId, srcSafe);
+    const destinationSelected = selectedAttachmentNames(userId, dstSafe);
+    const destinationGenerated = generatedAttachmentNames(userId, dstSafe);
     let sourceNames: string[] = [];
     try { sourceNames = fs.readdirSync(src).filter((n) => !n.startsWith('.')); }
     catch { /* ignore */ }
     let movedNames: Array<{ source: string; target: string }> = [];
     const movedPaths: Array<{ from: string; target: string }> = [];
+    let generatedOwnershipChanged = false;
 
     try {
+      // Convert legacy dedicated drafts before a whole-directory rename.
+      if (sourceSelected.size) saveSelectedAttachmentNames(userId, srcSafe, sourceSelected);
       if (!fs.existsSync(dst)) {
         fs.mkdirSync(path.dirname(dst), { recursive: true });
         await renameWithRetry(src, dst);
         movedNames = sourceNames.map((name) => ({ source: name, target: name }));
       } else {
         for (const name of fs.readdirSync(src)) {
-          if (name === GENERATED_ATTACHMENTS_FILE) continue;
+          if (name === GENERATED_ATTACHMENTS_FILE || name === SELECTED_ATTACHMENTS_FILE) continue;
           const from = path.join(src, name);
           const target = uniqueTarget(dst, name);
           await moveDraftEntry(from, target);
@@ -1486,14 +1547,20 @@ export async function adoptDraftAttachments(
           }
         }
         if (sourceGenerated.size) {
-          const generated = generatedAttachmentNames(userId, dstSafe);
+          const generated = new Set(destinationGenerated);
           for (const item of movedNames) {
             if (sourceGenerated.has(item.source)) generated.add(item.target);
           }
           saveGeneratedAttachmentNames(userId, dstSafe, generated);
-          fs.unlinkSync(path.join(src, GENERATED_ATTACHMENTS_FILE));
+          generatedOwnershipChanged = true;
         }
-        try { fs.rmdirSync(src); } catch { /* best-effort */ }
+        if (sourceSelected.size) {
+          const selected = new Set(destinationSelected);
+          for (const item of movedNames) {
+            if (sourceSelected.has(item.source)) selected.add(item.target);
+          }
+          saveSelectedAttachmentNames(userId, dstSafe, selected);
+        }
       }
     } catch (err) {
       // The freshly-created conversation must never receive only part of the
@@ -1510,8 +1577,20 @@ export async function adoptDraftAttachments(
           });
         }
       }
+      if (generatedOwnershipChanged) {
+        try {
+          saveGeneratedAttachmentNames(userId, dstSafe, destinationGenerated);
+        } catch (rollbackErr) {
+          log.warn('draft attachment ownership rollback failed', { error: logErrorSummary(rollbackErr) });
+        }
+      }
       return { ok: false, error: (err as Error).message };
     }
+
+    for (const name of [GENERATED_ATTACHMENTS_FILE, SELECTED_ATTACHMENTS_FILE]) {
+      try { fs.unlinkSync(path.join(src, name)); } catch { /* best-effort cleanup after publication */ }
+    }
+    try { fs.rmdirSync(src); } catch { /* best-effort */ }
 
     const count = movedNames.length;
     log.info('draft attachments adopted', {

@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   writeFileSync,
 } from 'node:fs';
@@ -490,8 +491,11 @@ test.describe('CLI failed-turn recovery', () => {
       const cid = await sendNewChat(page, `@${name} Only reply OK. Do not call tools.`);
       const failureText = fault === 'version_unknown'
         ? 'could not be identified' : 'stopped before completing the task';
+      const cliReason = 'Error: no inference provider configured. Run hermes setup, then try again.';
       const failedBubble = page.locator('#chat-history .chat-message.assistant');
       await expect(failedBubble).toContainText(failureText, { timeout: 30_000 });
+      await expect(failedBubble).not.toContainText(cliReason);
+      await expect(failedBubble.locator('[data-private-diagnostic]')).toHaveCount(0);
       await expect(failedBubble.locator('.bubble-retry-btn')).toBeVisible();
       await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
       const before = cliOrkas.readCliState();
@@ -503,13 +507,28 @@ test.describe('CLI failed-turn recovery', () => {
       expect(failures).toHaveLength(1);
       expect(failures[0]).toMatchObject({
         failure_kind: fault === 'version_unknown' ? 'dependency' : 'runtime',
-        failure_code: fault === 'version_unknown' ? 'version_unknown' : 'cli_failed',
+        // Hermes exits during initialize, before any reply reaches the user.
+        failure_code: fault === 'version_unknown' ? 'version_unknown' : 'cli_failed_before_output',
       });
       expect(failures[0].text).toContain(failureText);
+      expect(failures[0].text).not.toContain(cliReason);
+      if (fault === 'initialize_exit') {
+        const runsDir = path.join(cliOrkas.workspaceRoot, 'account-e2e', 'local', 'file_cache', 'local-agent-runs');
+        const runDirs = readdirSync(runsDir).map(id => path.join(runsDir, id));
+        const runDir = runDirs.find(dir => {
+          const meta = JSON.parse(readFileSync(path.join(dir, 'meta.json'), 'utf8'));
+          return meta.cid === cid && meta.agentId === agentId;
+        });
+        expect(runDir).toBeTruthy();
+        const events = readFileSync(path.join(runDir!, 'events.jsonl'), 'utf8')
+          .trim().split('\n').map(line => JSON.parse(line));
+        expect(events.some(event => event.type === 'done' && event.stderrTail?.includes(cliReason))).toBe(true);
+      }
 
       const reopened = await cliOrkas.relaunch();
       await reopened.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
       await expect(reopened.locator('#chat-history .chat-message.assistant')).toContainText(failureText);
+      await expect(reopened.locator('#chat-history .chat-message.assistant')).not.toContainText(cliReason);
       expect(cliOrkas.readCliState().hermesInitializations || 0).toBe(before.hermesInitializations || 0);
       await reopened.screenshot({ path: testInfo.outputPath(`hermes-${fault}-reopened.png`) });
       writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), hermesFault: undefined }));
@@ -602,11 +621,16 @@ test.describe('CLI failed-turn recovery', () => {
     expect(restarted.invocations).toHaveLength(3);
     expect(restarted.invocations[2].resumeSessionId).toBeNull();
     expect(restarted.invocations[2].sessionId).not.toBe(restarted.invocations[0].sessionId);
-    const bindingAfter = JSON.parse(readFileSync(cliSessionFile(cliOrkas, conversationId), 'utf8')) as Record<
-      string,
-      { sessionId: string; terminalStatus?: string }
-    >;
-    expect(Object.values(bindingAfter)[0]).toMatchObject({
+    // Visible CLI text can precede process exit and the durable terminal binding.
+    await expect.poll(() => {
+      const file = cliSessionFile(cliOrkas, conversationId);
+      if (!existsSync(file)) return null;
+      const bindingAfter = JSON.parse(readFileSync(file, 'utf8')) as Record<
+        string,
+        { sessionId: string; terminalStatus?: string }
+      >;
+      return Object.values(bindingAfter)[0];
+    }).toMatchObject({
       sessionId: restarted.invocations[2].sessionId,
       terminalStatus: 'completed',
     });

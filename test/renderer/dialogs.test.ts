@@ -154,6 +154,7 @@ class FakeElement {
   }
 
   querySelectorAll(selector: string): FakeElement[] {
+    if (selector === 'button') return this.descendants().filter(element => element.tagName === 'button');
     if (selector === '[data-act="choice"]') {
       return this.descendants().filter((element) => element.dataset.act === 'choice');
     }
@@ -569,6 +570,24 @@ describe('shared renderer dialogs', () => {
     const choices = overlay.querySelectorAll('[data-act="choice"]');
     choices.find((choice) => choice.dataset.id === 'purge')!.click();
     await expect(choiceResult).resolves.toBe('purge');
+  });
+
+  it('keeps choices open with visible failure feedback and prevents duplicate saves until retry succeeds', async () => {
+    const ctx = loadDialogs();
+    let complete!: (value: string | null) => void;
+    const save = vi.fn().mockImplementationOnce(() => new Promise(resolve => { complete = resolve; })).mockResolvedValueOnce(null);
+    const result = ctx.uiChoice({ choices: [{ id: 'background', label: 'Run in background' }], onChoice: save });
+    const overlay = overlays(ctx)[0];
+    const choice = overlay.querySelectorAll('[data-act="choice"]')[0];
+    choice.click(); choice.click();
+    ctx._document.dispatchKey({ key: 'Escape' });
+    expect(save).toHaveBeenCalledOnce(); expect(ctx._document.contains(overlay)).toBe(true);
+    complete('Could not save settings. Please try again.');
+    await vi.waitFor(() => expect(overlay.querySelector('.ui-dialog-error')!.hidden).toBe(false));
+    expect(overlay.querySelector('.ui-dialog-error')!.textContent).toContain('Could not save');
+    expect(ctx._document.contains(overlay)).toBe(true);
+    choice.click(); await expect(result).resolves.toBe('background');
+    expect(save).toHaveBeenCalledTimes(2);
   });
 
   it('renders bounded, dismissible, non-HTML toasts and ignores empty messages', () => {

@@ -2244,12 +2244,12 @@ describe('conversation filing agent choices', () => {
     expect(JSON.parse(toasts[0]).key).toBe('chat.conv_moved_out');
   });
 
-  it('updates the sidebar from a host unfile receipt and reports an unfile refusal without retrying', async () => {
+  it.each(['unfile', 'move'])('updates the sidebar from host movement and reports a %s refusal without claiming creation or retrying', async kind => {
     const listeners = new Map<string, Function>();
     const { ctx, toasts } = setup(null, [], false, (channel: string, handler: Function) => listeners.set(channel, handler));
     ctx.conversations = [{ conversation_id: 'c1', title: 'Filed', project_id: 'p1' }];
     ctx.startConversationFiledSubscription();
-    listeners.get('conversations:filing-failed')!({ cid: 'c1', kind: 'unfile' });
+    listeners.get('conversations:filing-failed')!({ cid: 'c1', kind });
     expect(JSON.parse(toasts[0]).key).toBe('chat.conv_move_failed');
     expect(ctx.conversations[0].project_id).toBe('p1');
     expect(ctx.window.orkas.invoke).not.toHaveBeenCalled();
@@ -11147,5 +11147,69 @@ describe('preflight send controller ownership', () => {
     expect(newer.abort).not.toHaveBeenCalled();
     newerResult.resolve({ started: true, aborted: false, errored: false, accepted: true });
     expect((await active).result).toBe('success');
+  });
+});
+
+describe('conversation observer admission-gap recovery', () => {
+  function setup() {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+    const rows: any[] = [];
+    const container = {
+      querySelector(selector: string) {
+        return rows.find(row => selector.includes(`data-msg-id="${row.dataset.msgId}"`)) || null;
+      },
+      querySelectorAll: () => [],
+    };
+    context.document.getElementById = () => container;
+    context._groupMsgToLegacy = (message: any) => message;
+    context.appendChatMessage = (message: any, autoScroll: boolean) => {
+      const row = { dataset: {}, message, autoScroll };
+      rows.push(row);
+      return row;
+    };
+    context._moveUserBeforeOrphanLivePlaceholder = () => {};
+    context._markEarlierLiveMessagesForUser = () => {};
+    context._syncRenderedGroupMessageIdentity = () => {};
+    context._recoverPolledVisibleMessages = vi.fn(async () => true);
+    return { context, rows };
+  }
+
+  it('restores an admitted user and its attachments missed before subscription exactly once', async () => {
+    const { context, rows } = setup();
+    const user = { id: 'queued-user', from: 'user', text: 'Edited attached queued message.',
+      attachments: [{ name: 'queued.txt' }, { name: 'edit-added.txt' }] };
+    const reply = { id: 'reply', from: 'writer', text: 'Saved response' };
+    context.apiFetch = async () => ({ ok: true, json: async () => ({ ok: true, history: [user, reply] }) });
+    await context._recoverObservedConversationHistory('c1', new AbortController().signal);
+    await context._recoverObservedConversationHistory('c1', new AbortController().signal);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ dataset: { msgId: 'queued-user', fromActor: 'user' },
+      message: user, autoScroll: false });
+    expect(context._recoverPolledVisibleMessages).toHaveBeenLastCalledWith('c1', [user, reply]);
+  });
+
+  it('does not recover deleted, routing-only or unpersisted user records', async () => {
+    const { context, rows } = setup();
+    const history = [{ id: 'deleted', from: 'user', deleted_at: '2026-11-02T00:00:00Z' },
+      { id: 'dispatch', from: 'user', dispatch: true }, { from: 'user', text: 'not admitted' }];
+    context.apiFetch = async () => ({ ok: true, json: async () => ({ ok: true, history }) });
+    await context._recoverObservedConversationHistory('c1', new AbortController().signal);
+    expect(rows).toEqual([]);
+  });
+
+  it.each(['aborted', 'navigated', 'failed-response'])('ignores a stale %s reconciliation', async (outcome) => {
+    const { context, rows } = setup();
+    let finish!: (response: any) => void;
+    context.apiFetch = () => new Promise(resolve => { finish = resolve; });
+    const controller = new AbortController();
+    const recovering = context._recoverObservedConversationHistory('c1', controller.signal);
+    if (outcome === 'aborted') controller.abort();
+    if (outcome === 'navigated') context.currentCid = 'c2';
+    finish({ ok: outcome !== 'failed-response', json: async () => ({ ok: true,
+      history: [{ id: 'queued-user', from: 'user', text: 'Saved input' }] }) });
+    expect(await recovering).toBe(false);
+    expect(rows).toEqual([]);
+    expect(context._recoverPolledVisibleMessages).not.toHaveBeenCalled();
   });
 });

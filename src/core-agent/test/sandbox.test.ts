@@ -401,7 +401,7 @@ describe("SandboxExecutor", () => {
 });
 
 describe("killProcessTree", () => {
-  it("uses bounded native Windows tree cleanup and reports fallback failure", () => {
+  it("keeps the Windows cleanup helper referenced until close and reports fallback failure", () => {
     const callbacks = new Map<string, (...args: any[]) => void>();
     const killer = {
       once: vi.fn((event: string, cb: (...args: any[]) => void) => {
@@ -412,28 +412,42 @@ describe("killProcessTree", () => {
     };
     const spawnFn = vi.fn(() => killer);
     const child = { pid: 1234, kill: vi.fn() };
+    const onComplete = vi.fn();
+    const onRootTerminated = vi.fn();
 
     killProcessTree(child as any, "SIGTERM", {
       platform: "win32",
       spawnFn: spawnFn as any,
+      onComplete,
+      onRootTerminated,
     });
 
     expect(String(spawnFn.mock.calls[0][0]).toLowerCase()).toMatch(/powershell\.exe$/);
     expect(spawnFn).toHaveBeenCalledWith(expect.any(String), expect.arrayContaining(["-NoProfile", "-EncodedCommand"]), {
       stdio: ["pipe", "pipe", "ignore"],
       windowsHide: true,
-      timeout: 5_000,
     });
-    expect(killer.unref).toHaveBeenCalled();
+    // The bounded helper owns the close receipt, even after its pipes reach EOF.
+    expect(killer.unref).not.toHaveBeenCalled();
     expect(child.kill).not.toHaveBeenCalled();
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(onRootTerminated).not.toHaveBeenCalled();
 
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       callbacks.get("close")?.(1);
+      expect(onComplete).toHaveBeenCalledOnce();
       expect(child.kill).toHaveBeenCalledWith("SIGTERM");
       expect(warning).toHaveBeenCalledWith("[sandbox]", "Shell process tree termination failed", {
         platform: "win32", fallback: "direct_child_only",
       });
+      expect(onComplete).toHaveBeenCalledTimes(1);
+      expect(onRootTerminated).not.toHaveBeenCalled();
+      callbacks.get("close")?.(0);
+      expect(onComplete).toHaveBeenCalledTimes(1);
+      expect(child.kill).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(onRootTerminated).not.toHaveBeenCalled();
     } finally { warning.mockRestore(); }
   });
 

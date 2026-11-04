@@ -61,8 +61,14 @@ import { classifyKeyFailure, formatKeyFailure, type KeyFailureKind } from './aut
 import { markCooldown } from './profile-cooldown';
 import { createLogger } from '../../logger';
 import { getRetryErrorPolicyConfig } from '../../features/client_config';
-import { isProviderRateLimitError, classifyTransientNetworkError, classifyRetryableErrorWithPolicy, type RetryableErrorKind } from '../../../core-agent/src/shared/errors';
+import { isProviderRateLimitError, isTerminalRecoveryError, classifyTransientNetworkError, classifyRetryableErrorWithPolicy, type RetryableErrorKind } from '../../../core-agent/src/shared/errors';
+import { providerErrorFacts, providerRequestWasRejected } from '../../../core-agent/src/shared/provider-error-facts';
 import { maskId } from '../../util/log-redact';
+
+import { MIN_NATIVE_MODEL_CONTEXT_WINDOW, modelContextWindowBelowMinimum } from '../../util/model-context-window';
+import { t } from '../../i18n';
+import { ALL_CONFIGURED_RATE_LIMITED_MESSAGE } from './rate-limit-messages';
+export { ALL_CONFIGURED_RATE_LIMITED_MESSAGE } from './rate-limit-messages';
 
 const log = createLogger('rotating-provider');
 
@@ -144,6 +150,7 @@ export interface RotatingCandidate {
    *  (AgentRunner) doesn't need to know which candidate is active. */
   providerId: string;
   modelId: string;
+  contextWindow?: number;
   /** Model-default output cap for this exact candidate. AgentRunner enters
    *  the wrapper with the primary model's generated default in params; when
    *  rotation crosses models/providers, replace that generated value with
@@ -307,6 +314,12 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     || unavailableProfiles.has(cooldownIdFor(candidate))
     || rateLimitedCandidates.has(rateLimitIdFor(candidate))
   );
+  const budgetCandidate = (): RotatingCandidate | undefined => {
+    const first = candidates.find(candidate => !isUnavailable(candidate));
+    return typeof first?.contextWindow === 'number' ? first : undefined;
+  };
+  const allConfiguredRateLimited = (): boolean => candidates.length > 0 && candidates.every(isUnavailable)
+    && candidates.every(candidate => rateLimitedCandidates.has(rateLimitIdFor(candidate)));
   const markUnavailable = (candidate: RotatingCandidate, kind: KeyFailureKind, reason: string): void => {
     if (kind === 'rate_limit') {
       rateLimitedCandidates.add(rateLimitIdFor(candidate));
@@ -365,7 +378,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
    *  generated default follows the candidate. Auxiliary semantic calls mark
    *  `provider_default`, omit a call-specific cap, and keep that omission
    *  across fallback. */
-  function paramsFor(cand: RotatingCandidate, params: CompletionParams): CompletionParams {
+  function paramsFor(cand: RotatingCandidate, params: CompletionParams, observeImages = true): CompletionParams {
     if (lacksRequiredImages(cand)) throw new ProviderCandidatesUnavailableError(config.requireImageInput);
     const next = { ...params, model: cand.modelId,
       ...(config.onRequestFailure ? { onRequestFailure: config.onRequestFailure } : {}),
@@ -378,7 +391,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       // — sampled users debugged that as their own mistake. Log the drop so
       // diagnosis has a recorded fact; the user-facing notice needs the
       // provider_fallback-style event plumbing (recorded in the plan doc).
-      if (imageLimit === 0) {
+      if (imageLimit === 0 && observeImages) {
         const dropped = params.messages.reduce(
           (sum, message) => sum + messageImageCount(message),
           0,
@@ -404,6 +417,101 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         : undefined;
     }
     return next;
+  }
+
+  /** Read-only, request-local admission. Never compact, cool down a profile,
+   * or issue a provider call to discover whether a candidate can fit. */
+  async function admitCandidates(params: CompletionParams): Promise<{
+    admitted: Map<RotatingCandidate, CompletionParams>;
+    skipped: Set<RotatingCandidate>;
+  }> {
+    if (config.requireImageInput && !params.messages.some(message => messageImageCount(message) > 0)) {
+      throw new ProviderCandidatesUnavailableError(config.requireImageInput);
+    }
+    const admitted = new Map<RotatingCandidate, CompletionParams>();
+    const skipped = new Set<RotatingCandidate>();
+    const inputEstimates = new Map<Message[], number>();
+    let capacityError: Error | undefined;
+    const oldBudget = params.requestMetadata?.contextBudgetDiagnostics as Record<string, unknown> | undefined;
+    const mod = candidates.some(c => typeof c.contextWindow === 'number') ? await import('#core-agent') : undefined;
+    const priced = budgetCandidate();
+    throwIfAborted(params.signal);
+    for (let index = 0; index < candidates.length; index++) {
+      const cand = candidates[index];
+      if (lacksRequiredImages(cand)) { skipped.add(cand); continue; }
+      if (isUnavailable(cand)) continue;
+      const next = paramsFor(cand, params, false);
+      const window = cand.contextWindow;
+      if (!mod || window === undefined) {
+        admitted.set(cand, next);
+        continue;
+      }
+      const output = next.maxTokens ?? cand.maxTokens ?? 8_192;
+      const usable = Math.max(0, window - output);
+      const ceiling = Math.floor(usable * mod.CONTEXT_COMPACTION_TRIGGER_RATIO);
+      // Core preparation owns the measured estimate for this exact request,
+      // priced for the budget candidate. Diagnostics are not an authority for
+      // lowering admission. Other providers/models and projected inputs use
+      // the ordinary raw estimate.
+      const measured = params.requestTokenEstimate;
+      const validMeasurement = measured && (cand.providerId === providerId || cand === priced)
+        && measured.model === next.model && measured.messages === next.messages
+        && measured.systemPrompt === next.systemPrompt && measured.tools === next.tools
+        && Number.isSafeInteger(measured.tokens) && measured.tokens >= 0
+        && (measured.source === 'anchored' || measured.source === 'estimated');
+      let input = validMeasurement ? measured.tokens : inputEstimates.get(next.messages);
+      if (input === undefined) {
+        input = mod.estimateCompletionRequestInputTokens(next);
+        inputEstimates.set(next.messages, input);
+      }
+      const anchored = !validMeasurement && next.messages === params.messages && oldBudget?.estimate_source === 'anchored'
+        && typeof oldBudget.estimated_input_tokens === 'number' && Number.isSafeInteger(oldBudget.estimated_input_tokens)
+        && oldBudget.estimated_input_tokens > input;
+      if (anchored) input = oldBudget!.estimated_input_tokens as number;
+      const budget: Record<string, number | string> = {
+        version: 1, candidate_index: index + 1, budget_context_window: window,
+        output_reservation: output, usable_input_tokens: usable, input_ceiling_tokens: ceiling,
+        estimated_input_tokens: input,
+        estimate_source: validMeasurement ? measured.source : anchored ? 'anchored' : 'estimated', window_source: 'catalog',
+      };
+      // Keep preparation evidence, explicitly labeling its possibly different
+      // window; candidate admission must not erase earlier compaction facts.
+      const preparationWindow = oldBudget?.budget_context_window;
+      if (typeof preparationWindow === 'number' && Number.isSafeInteger(preparationWindow) && preparationWindow > 0) {
+        budget.preparation_context_window = preparationWindow;
+      }
+      for (const key of ['compaction_attempts', 'compaction_failures', 'compaction_before_tokens',
+        'compaction_after_tokens', 'emergency_before_tokens', 'emergency_after_tokens']) {
+        const value = oldBudget?.[key];
+        if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) budget[key] = value;
+      }
+      const emergencyResult = oldBudget?.emergency_result;
+      if (typeof emergencyResult === 'string' && ['not_needed', 'applied', 'nothing_to_drop'].includes(emergencyResult)) {
+        budget.emergency_result = emergencyResult;
+      }
+      next.requestMetadata = { ...next.requestMetadata, contextBudgetDiagnostics: budget };
+      if (Number.isSafeInteger(window) && window >= MIN_NATIVE_MODEL_CONTEXT_WINDOW && Number.isSafeInteger(output) && output > 0 && output < window && input <= ceiling) {
+        admitted.set(cand, next);
+        continue;
+      }
+      skipped.add(cand);
+      capacityError = new mod.ContextOverflowError(modelContextWindowBelowMinimum(window)
+        ? t('errors.model_context_too_small', { minimum: MIN_NATIVE_MODEL_CONTEXT_WINDOW })
+        : 'The configured models cannot fit this request. Choose a model with a larger context window or reduce the input.', undefined, true);
+      const observer = config.onRequestFailure ?? params.onRequestFailure;
+      try { observer?.({ phase: 'before_request', source: 'payload', code: 'context_capacity_insufficient',
+        elapsedMs: 0, aborted: false, lastEvent: 'none', contextWindow: window,
+        outputLimit: output, budgetObserved: false, contextBudget: budget }); } catch { /* Best-effort diagnostics. */ }
+      throwIfAborted(params.signal);
+    }
+    if (capacityError && admitted.size === 0) throw capacityError;
+    return { admitted, skipped };
+  }
+
+  /** A shorter deadline set by this call itself (context summaries), if any. */
+  function perCallFirstEventTimeoutMs(params: CompletionParams): number | undefined {
+    const raw = params.firstEventTimeoutMs;
+    return Number.isFinite(raw) && Number(raw) > 0 ? Math.max(1, Math.trunc(Number(raw))) : undefined;
   }
 
   function abortError(signal: AbortSignal): Error {
@@ -458,7 +566,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
   }
 
   function exhaustedCredentialError(lastErr: unknown, failure: PreCommitFailure): Error {
-    const codeByKind: Partial<Record<KeyFailureKind | RetryableErrorKind, string>> = {
+    const codeByKind: Partial<Record<PreCommitFailure['kind'], string>> = {
       auth: 'PROVIDER_AUTH_EXHAUSTED',
       permission: 'PROVIDER_PERMISSION_EXHAUSTED',
       rate_limit: 'PROVIDER_RATE_LIMIT_EXHAUSTED',
@@ -466,12 +574,14 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     };
     const code = codeByKind[failure.kind];
     if (!code) return lastErr instanceof Error ? lastErr : new Error(String(lastErr));
-    const message = lastErr instanceof Error ? lastErr.message : (formatKeyFailure(lastErr) || String(lastErr));
+    const message = failure.kind === 'rate_limit' && allConfiguredRateLimited()
+      ? ALL_CONFIGURED_RATE_LIMITED_MESSAGE
+      : lastErr instanceof Error ? lastErr.message : (formatKeyFailure(lastErr) || String(lastErr));
     return Object.assign(new Error(message), { code, cause: lastErr });
   }
 
   type PreCommitFailure = {
-    kind: KeyFailureKind | RetryableErrorKind;
+    kind: KeyFailureKind | RetryableErrorKind | 'request_rejected';
     cooldownKind: KeyFailureKind | null;
     retryCurrent?: boolean;
   };
@@ -480,12 +590,24 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     if (isProviderNoFirstEventTimeout(err)) {
       return { kind: 'timeout', cooldownKind: null, retryCurrent: false };
     }
+    if (isTerminalRecoveryError(err)) return null;
     const keyKind = classifyKeyFailure(err);
     if (keyKind) return { kind: keyKind, cooldownKind: keyKind };
     if (isProviderRateLimitError(err)) return { kind: 'rate_limit', cooldownKind: 'rate_limit' };
 
     const retryableKind = classifyRetryableErrorLocal(err);
     if (retryableKind) return { kind: retryableKind, cooldownKind: null };
+
+    if (providerRequestWasRejected(err)) {
+      // An unchanged rejected payload gains nothing from repeated requests.
+      // Another configured model/adapter can accept it. Explicit temporary
+      // machine codes still use the ordinary bounded same-candidate retries,
+      // including gateways that incorrectly return them with HTTP 400.
+      const transient = providerErrorFacts(err, false).codes.some(code =>
+        ['server_error', 'internal_server_error', 'upstream_error', 'overloaded_error',
+          'service_unavailable', 'timeout'].includes(code.toLowerCase()));
+      return { kind: transient ? 'server_error' : 'request_rejected', cooldownKind: null, retryCurrent: transient };
+    }
 
     return null;
   }
@@ -612,11 +734,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       providerController.abort(parentAbortError);
     };
     parentSignal?.addEventListener('abort', onParentAbort, { once: true });
-    const rawRequestFirstEventTimeoutMs = params.firstEventTimeoutMs;
-    const requestFirstEventTimeoutMs = Number.isFinite(rawRequestFirstEventTimeoutMs)
-      && Number(rawRequestFirstEventTimeoutMs) > 0
-      ? Math.max(1, Math.trunc(Number(rawRequestFirstEventTimeoutMs)))
-      : firstEventTimeoutMs;
+    const requestFirstEventTimeoutMs = perCallFirstEventTimeoutMs(params) ?? firstEventTimeoutMs;
     let firstEventTimer: NodeJS.Timeout | null = setTimeout(() => {
       timedOutError = new ProviderNoFirstEventTimeoutError(cand.providerId, requestFirstEventTimeoutMs);
       rejectGate(timedOutError);
@@ -770,6 +888,8 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     id: providerId,
     name: providerId.charAt(0).toUpperCase() + providerId.slice(1),
 
+    contextBudgetModel: () => budgetCandidate()?.modelId,
+
     async complete(params: CompletionParams): Promise<CompletionResult> {
       if (config.requireImageInput && !params.messages.some(message => messageImageCount(message) > 0)) {
         throw new ProviderCandidatesUnavailableError(true);
@@ -791,9 +911,10 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       reportCandidates();
       throwIfAborted(params.signal);
       if (exhaustedRateLimitError) throw exhaustedRateLimitError;
+      const { admitted } = await admitCandidates(params);
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
-        if (isUnavailable(cand)) continue;
+        if (isUnavailable(cand) || !admitted.has(cand)) continue;
         lastCand = cand;
 
         let networkRetry = 0;
@@ -805,7 +926,8 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             throwIfAborted((params as { signal?: AbortSignal }).signal);
             const provider = await cand.build();
             throwIfAborted((params as { signal?: AbortSignal }).signal);
-            const result = await provider.complete(paramsFor(cand, params));
+            const result = await provider.complete(paramsFor(cand, { ...params,
+              requestMetadata: admitted.get(cand)!.requestMetadata }));
             throwIfAborted((params as { signal?: AbortSignal }).signal);
             if (isNormalEmptyCompletion(result)) {
               if (normalEmptyRetry < allowedNormalEmptyRetries) {
@@ -908,10 +1030,11 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       reportCandidates();
       throwIfAborted(params.signal);
       if (exhaustedRateLimitError) throw exhaustedRateLimitError;
+      const { admitted } = await admitCandidates(params);
 
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
-        if (isUnavailable(cand)) continue;
+        if (isUnavailable(cand) || !admitted.has(cand)) continue;
         lastCand = cand;
         let attempt: Awaited<ReturnType<typeof streamOne>> | null = null;
         let networkRetry = 0;
@@ -919,7 +1042,8 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         let normalEmptyRecoveryActive = false;
 
         while (true) {
-          attempt = await streamOne(cand, params);
+          attempt = await streamOne(cand, { ...params,
+            requestMetadata: admitted.get(cand)!.requestMetadata });
 
           if (!('rotatable' in attempt)) break;
           if (config.requireImageInput) {
@@ -1016,7 +1140,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
           const reason = formatKeyFailure(attempt.err);
           const fallbackCandidate = candidates
             .slice(i + 1)
-            .find((candidate) => !isUnavailable(candidate));
+            .find((candidate) => admitted.has(candidate) && !isUnavailable(candidate));
           const hasFallback = !!fallbackCandidate;
           if (failure.cooldownKind && failure.cooldownKind !== 'network') {
             markUnavailable(cand, failure.cooldownKind, reason);
@@ -1030,7 +1154,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
               };
             }
           } else if (isProviderNoFirstEventTimeout(attempt.err) && hasFallback) {
-            unavailableProfiles.add(cooldownIdFor(cand));
+            if (perCallFirstEventTimeoutMs(params) === undefined) unavailableProfiles.add(cooldownIdFor(cand));
             yield {
               type: 'provider_fallback',
               reason: 'no_first_event_timeout',
@@ -1039,7 +1163,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
               candidateCount: candidates.length,
             };
           } else if (isProviderNoFirstEventTimeout(attempt.err)) {
-            unavailableProfiles.add(cooldownIdFor(cand));
+            if (perCallFirstEventTimeoutMs(params) === undefined) unavailableProfiles.add(cooldownIdFor(cand));
           } else if (failure.kind === 'network') {
             networkFailedThisCall.add(cooldownIdFor(cand));
           }

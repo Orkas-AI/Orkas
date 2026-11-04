@@ -415,6 +415,36 @@ describe('local_agents/registry', () => {
     expect(fs.existsSync(probeLog)).toBe(false);
   });
 
+  it('keeps presence-only scans of a 30-directory local PATH within the 500ms onboarding target', async () => {
+    const dirs = Array.from({ length: 30 }, (_, index) => path.join(tmpDir, 'path-' + index));
+    dirs.forEach(dir => fs.mkdirSync(dir));
+    const probeLog = path.join(tmpDir, 'unexpected-presence-process.log');
+    const installed = LOCAL_CLI_TYPES.map(type => writeCountingMockCli(path.join(dirs[29], type), probeLog, '999.0.0'));
+    process.env.PATH = dirs.join(path.delimiter);
+    const samples: number[] = [];
+    for (let round = 0; round < 10; round += 1) {
+      const start = performance.now();
+      const found = await findAllInstalled();
+      samples.push(performance.now() - start);
+      // Windows PATHEXT may spell the same file with an uppercase extension.
+      // Compare filesystem identity after timing, preserving the cold scan.
+      expect(found.map(entry => entry.path ? fs.realpathSync.native(entry.path) : null))
+        .toEqual(installed.map(file => fs.realpathSync.native(file)));
+      expect(found.every(entry => entry.available && entry.validation === 'pending' && entry.version === null)).toBe(true);
+    }
+    expect(fs.existsSync(probeLog)).toBe(false);
+    const ordered = samples.slice().sort((a, b) => a - b);
+    const measurement = {
+      path_dirs: 30, samples: samples.length, cli_processes: 0,
+      first_ms: samples[0], p50_ms: ordered[4], p95_ms: ordered[9], max_ms: ordered[9],
+    };
+    const artifactDir = path.resolve(process.cwd(), 'test-results/local-cli-onboarding-performance');
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, 'presence-scan.json'), JSON.stringify(measurement, null, 2));
+    // This is the documented local-filesystem target, not a network-disk guarantee.
+    expect(Math.max(...samples)).toBeLessThan(500);
+  });
+
   it('marks not_found when binary missing on PATH', async () => {
     process.env.PATH = tmpDir;
     const r = await detectOne('opencode');

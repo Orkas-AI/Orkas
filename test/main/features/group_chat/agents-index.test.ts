@@ -24,6 +24,7 @@
 // user-visible bubbles.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { expectTestLog } from '../../../helpers/test-log-analysis';
 import * as fs from 'node:fs';
 import nativeFs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -87,6 +88,7 @@ async function buildBlock(uid: string): Promise<string> {
 
 describe('agents_index block — header + per-entry shape', () => {
   it('rejects an inaccessible catalog stamp rather than treating the root as absent', async () => {
+    expectTestLog({ level: 'warn', source: 'console', message: /^\[agents\] agent catalog read failed \{ source: 'custom', stage: 'stamp', error_code: 'EACCES' \}$/ });
     writeAgent(customAgentsDir(), 'kept', { name: 'Kept' });
     const stat = nativeFs.statSync.bind(nativeFs);
     const spy = vi.spyOn(nativeFs, 'statSync').mockImplementation(((...args: any[]) => {
@@ -109,6 +111,7 @@ describe('agents_index block — header + per-entry shape', () => {
   });
 
   it('rejects a catalog directory failure instead of advertising no agents, then recovers', async () => {
+    expectTestLog({ level: 'warn', source: 'console', message: /^\[agents\] agent catalog read failed \{ source: 'custom', stage: 'enumerate', error_code: 'EACCES' \}$/ });
     writeAgent(customAgentsDir(), 'healthy', { name: 'Healthy' });
     writeAgent(builtinAgentsDir(), 'other', { name: 'Other' });
     const read = fs.promises.readdir.bind(fs.promises);

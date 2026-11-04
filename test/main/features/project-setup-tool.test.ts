@@ -141,6 +141,12 @@ describe('project_setup › create', () => {
     expect(inProject.map((task) => task.content).sort())
       .toEqual(['Agree the weekly check scope', 'List the competitors worth watching']);
     expect(await projectTasks.listTasks(UID, '')).toEqual([]);
+    // The first to-do is this conversation's next step, so opening or running
+    // it returns here; the rest of the backlog links on its first run.
+    expect(inProject.find((task) => task.content === 'List the competitors worth watching'))
+      .toMatchObject({ origin_cid: cid });
+    expect(inProject.find((task) => task.content === 'Agree the weekly check scope'))
+      .not.toHaveProperty('origin_cid');
   });
 
   it('reports the name the project actually got after a duplicate was suffixed', async () => {
@@ -215,7 +221,7 @@ describe('project_setup › create', () => {
     expect(refused.body).toMatchObject({ ok: false, error: 'already_in_project' });
     // Validation errors and undoing are not creations.
     await call(conv.conversation_id, { action: 'create' });
-    await call(conv.conversation_id, { action: 'unfile' });
+    await call(conv.conversation_id, { action: 'remove_conversation' });
 
     expect(await projects.listProjects(UID)).toHaveLength(2);
   });
@@ -268,7 +274,7 @@ describe('project_setup › create', () => {
   });
 });
 
-describe('project_setup › unfile', () => {
+describe('project_setup › remove_conversation', () => {
   it('queues the undo for the end of the turn', async () => {
     const chats = await import('../../../src/main/features/chats');
     const projects = await import('../../../src/main/features/projects');
@@ -279,9 +285,9 @@ describe('project_setup › unfile', () => {
     const cid = conv.conversation_id;
     expect((await chats.moveConversationToProject(UID, cid, pid)).ok).toBe(true);
 
-    const { body } = await call(cid, { action: 'unfile' }, pid);
+    const { body } = await call(cid, { action: 'remove_conversation' }, pid);
 
-    expect(body).toMatchObject({ ok: true, action: 'unfile', left_project_id: pid, applies: 'when_this_turn_ends' });
+    expect(body).toMatchObject({ ok: true, action: 'remove_conversation', left_project_id: pid, applies: 'when_this_turn_ends' });
     // Undoing moves the same bytes, so it cannot happen inside this turn either.
     expect((await chats.getConversationMetadata(UID, cid))?.project_id).toBe(pid);
     expect(filing.hasPendingConversationFiling(UID, cid)).toBe(true);
@@ -292,7 +298,7 @@ describe('project_setup › unfile', () => {
     const filing = await import('../../../src/main/features/conversation_filing');
     const conv = await chats.createConversation(UID, { title: 'never filed' });
 
-    const { raw, body } = await call(conv.conversation_id, { action: 'unfile' });
+    const { raw, body } = await call(conv.conversation_id, { action: 'remove_conversation' });
 
     expect({ isError: raw.isError, error: body.error }).toEqual({ isError: true, error: 'not_in_project' });
     expect(filing.hasPendingConversationFiling(UID, conv.conversation_id)).toBe(false);
@@ -306,10 +312,148 @@ describe('project_setup › unfile', () => {
     const conv = await chats.createConversation(UID, { title: 'undo with extras' });
     expect((await chats.moveConversationToProject(UID, conv.conversation_id, pid)).ok).toBe(true);
 
-    const { body } = await call(conv.conversation_id, { action: 'unfile', name: 'ignored' }, pid);
+    const { body } = await call(conv.conversation_id, { action: 'remove_conversation', name: 'ignored' }, pid);
 
     expect(body.ok).toBe(true);
     expect(body.ignored_fields).toEqual(['name']);
+  });
+});
+
+describe('project_setup › move_conversation', () => {
+  async function fixture() {
+    const projects = await import('../../../src/main/features/projects');
+    const chats = await import('../../../src/main/features/chats');
+    const filing = await import('../../../src/main/features/conversation_filing');
+    const created = await projects.createProject(UID, 'Aurora 发布计划');
+    if (!created.ok) throw new Error('project setup failed');
+    const conv = await chats.createConversation(UID, { title: 'Existing project target' });
+    return { projects, chats, filing, pid: created.project.project_id, cid: conv.conversation_id };
+  }
+
+  it.each(['name', 'id'])('moves the same conversation and bytes into an existing project by %s without modifying its resources', async selector => {
+    const { projects, chats, filing, pid, cid } = await fixture();
+    const tasks = await import('../../../src/main/features/project_tasks');
+    await projects.writeProjectInstructions(UID, pid, 'Keep the standing goal');
+    await tasks.createTask(UID, pid, { content: 'Keep the original backlog' });
+    const projectBefore = await projects.getProject(UID, pid);
+    const tasksBefore = await tasks.listTasks(UID, pid);
+    const bindingsBefore = await projects.resolveProjectScope(UID, pid);
+    const source = path.join(tmpDir, UID, 'cloud', 'chats', `${cid}.jsonl`);
+    fs.writeFileSync(source, '{"from":"user","text":"keep this history"}\n');
+    const input = { action: 'move_conversation', target_project: selector === 'name' ? 'Aurora 发布计划' : pid };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect((await call(cid, input)).body).toMatchObject({ ok: true, action: 'move_conversation', project_id: pid, applies: 'when_this_turn_ends' });
+    }
+    expect((await chats.getConversationMetadata(UID, cid))?.project_id).toBeFalsy();
+    // A conflicting operation cannot replace the reserved destination.
+    expect((await call(cid, { action: 'remove_conversation' })).raw.isError).toBe(true);
+    expect((await call(cid, { action: 'create', name: 'Unrequested project' })).raw.isError).toBe(true);
+    await filing.drainConversationFiling(UID, cid);
+    expect((await chats.getConversationMetadata(UID, cid))?.project_id).toBe(pid);
+    expect(fs.readFileSync(path.join(tmpDir, UID, 'cloud', 'projects', pid, 'chats', `${cid}.jsonl`), 'utf8'))
+      .toBe('{"from":"user","text":"keep this history"}\n');
+    expect(await projects.listProjectIds(UID)).toEqual([pid]);
+    expect(await projects.getProject(UID, pid)).toEqual(projectBefore);
+    expect(await tasks.listTasks(UID, pid)).toEqual(tasksBefore);
+    expect(await projects.resolveProjectScope(UID, pid)).toEqual(bindingsBefore);
+    expect((await projects.readProjectInstructions(UID, pid) as any).content).toBe('Keep the standing goal');
+    expect((await call(cid, input, pid)).body).toMatchObject({ ok: true, applies: 'now', project_id: pid });
+  });
+
+  it('advertises current movement/removal and rejects the retired unfile action', async () => {
+    const { cid, pid, chats, filing } = await fixture();
+    const schema = (await tool(cid)).inputSchema as any;
+    expect(schema.properties.action.enum).toEqual(['create', 'rename', 'move_conversation', 'remove_conversation']);
+    expect(schema.properties.target_project.description).toMatch(/exact.*name|name.*exact/i);
+    expect((await call(cid, { action: 'move_conversation' })).raw.isError).toBe(true);
+    expect((await call(cid, { action: 'unfile' }, pid)).raw.isError).toBe(true);
+    await chats.moveConversationToProject(UID, cid, pid);
+    expect((await call(cid, { action: 'remove_conversation' }, pid)).body)
+      .toMatchObject({ ok: true, action: 'remove_conversation', applies: 'when_this_turn_ends' });
+    await filing.drainConversationFiling(UID, cid);
+    expect((await chats.getConversationMetadata(UID, cid))?.project_id).toBeFalsy();
+    expect(await (await import('../../../src/main/features/projects')).listProjectIds(UID)).toEqual([pid]);
+  });
+
+  it('reserves removal before metadata reads so concurrent moves cannot replace its destination', async () => {
+    const { cid, pid, chats, filing } = await fixture();
+    await chats.moveConversationToProject(UID, cid, pid);
+    const original = chats.getConversationMetadata;
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const reading = new Promise<void>(resolve => { entered = resolve; });
+    vi.spyOn(chats, 'getConversationMetadata').mockImplementationOnce(async (...args) => {
+      entered();
+      await gate;
+      return original(...args);
+    });
+    const removal = call(cid, { action: 'remove_conversation' }, pid);
+    await reading;
+    const competing = await call(cid, { action: 'move_conversation', target_project: pid });
+    release();
+    expect((await removal).body.ok).toBe(true);
+    expect(competing.body).toMatchObject({ ok: false, error: 'relocation_pending' });
+    await filing.drainConversationFiling(UID, cid);
+    expect((await chats.getConversationMetadata(UID, cid))?.project_id).toBeFalsy();
+  });
+
+  it.each(['create', 'rename', 'remove_conversation'])('rejects a destination on %s without silently performing a different mutation', async action => {
+    const { cid, pid, projects, filing, chats } = await fixture();
+    expect((await call(cid, { action, target_project: pid, name: 'Unexpected project' })).raw.isError).toBe(true);
+    expect(await projects.listProjectIds(UID)).toEqual([pid]);
+    expect((await projects.getProject(UID, pid))?.name).toBe('Aurora 发布计划');
+    expect((await chats.getConversationMetadata(UID, cid))?.project_id).toBeFalsy();
+    expect(filing.hasPendingConversationFiling(UID, cid)).toBe(false);
+  });
+
+  it.each(['missing', 'foreign', 'ambiguous', 'other-project'])('rejects %s without creating or moving anything', async failure => {
+    const { projects, chats, filing, pid, cid } = await fixture();
+    const paths = await import('../../../src/main/paths');
+    let target = 'Aurora 发布计划';
+    if (failure === 'missing') target = 'No such project';
+    if (failure === 'foreign') {
+      const foreign = await projects.createProject('other-account', 'Foreign target');
+      if (!foreign.ok) throw new Error('foreign setup failed');
+      target = foreign.project.project_id;
+    }
+    if (failure === 'ambiguous') vi.spyOn(projects, 'listProjectNameRows').mockResolvedValue([
+      { project_id: pid, name: target }, { project_id: 'p_another', name: target },
+    ]);
+    if (failure === 'other-project') {
+      const other = await projects.createProject(UID, 'Already filed');
+      if (!other.ok) throw new Error('project setup failed');
+      await chats.moveConversationToProject(UID, cid, other.project.project_id);
+    }
+    const before = await chats.getConversationMetadata(UID, cid);
+    const ids = await projects.listProjectIds(UID);
+    const result = await call(cid, { action: 'move_conversation', target_project: target });
+    expect(result.raw.isError).toBe(true);
+    expect(result.body.error).toBe({ missing: 'project_not_found', foreign: 'project_not_found', ambiguous: 'project_ambiguous', 'other-project': 'already_in_project' }[failure]);
+    expect(await chats.getConversationMetadata(UID, cid)).toEqual(before);
+    expect(await projects.listProjectIds(UID)).toEqual(ids);
+    expect(filing.hasPendingConversationFiling(UID, cid)).toBe(false);
+  });
+
+  it.each(['cancel', 'deleted', 'collision'])('preserves the conversation when pending movement encounters %s', async failure => {
+    const { projects, chats, filing, pid, cid } = await fixture();
+    const failed = vi.fn(); filing.onConversationFilingFailed(failed);
+    const source = path.join(tmpDir, UID, 'cloud', 'chats', `${cid}.jsonl`);
+    fs.writeFileSync(source, 'source bytes\n');
+    expect((await call(cid, { action: 'move_conversation', target_project: pid })).body.ok).toBe(true);
+    const paths = await import('../../../src/main/paths');
+    if (failure === 'deleted') fs.rmSync(path.dirname(paths.projectMetaFile(UID, pid)), { recursive: true, force: true });
+    if (failure === 'collision') {
+      const dest = path.join(tmpDir, UID, 'cloud', 'projects', pid, 'chats', `${cid}.jsonl`);
+      fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.writeFileSync(dest, 'keep destination\n');
+    }
+    await filing.drainConversationFiling(UID, cid, failure === 'cancel');
+    await filing.drainConversationFiling(UID, cid);
+    expect((await chats.getConversationMetadata(UID, cid))?.project_id).toBeFalsy();
+    expect(fs.readFileSync(source, 'utf8')).toBe('source bytes\n');
+    expect(filing.hasPendingConversationFiling(UID, cid)).toBe(false);
+    if (failure === 'cancel') expect(failed).not.toHaveBeenCalled();
+    else expect(failed).toHaveBeenCalledExactlyOnceWith({ userId: UID, cid, kind: 'move', projectId: pid });
   });
 });
 

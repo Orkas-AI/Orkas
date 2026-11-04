@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import mutableFs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import AdmZip from 'adm-zip';
+import { expectTestLog } from '../../helpers/test-log-analysis';
 
 // Each case resets modules and deletes its workspace. Keep diagnostics visible
 // without starting file-log workers that can recreate that workspace at teardown.
@@ -188,7 +189,6 @@ describe('skills › splitSkillMd', () => {
     expect(r.body).toBe('just body');
     expect(r.meta).toEqual({});
   });
-
   it('ends the frontmatter at a line of its own, not at a --- inside a value', async () => {
     const s = await loadSkills();
     const text = [
@@ -889,6 +889,85 @@ describe('skills › applySkillContainerFromCommander › edit', () => {
 // `<uid>/local/marketplace/skills/<id>/` per machine — see features/marketplace_*.ts.
 
 describe('skills › listSkills', () => {
+  it.each([
+    ['custom', 'definition', 'EACCES'], ['marketplace', 'definition', 'EACCES'],
+    ['custom', 'definition', 'EIO'], ['marketplace', 'definition', 'EIO'],
+    ['custom', 'stamp', 'EPERM'], ['marketplace', 'stamp', 'EIO'],
+    ['custom', 'enumerate', 'EACCES'], ['marketplace', 'enumerate', 'EBUSY'],
+  ] as const)('does not publish or cache unknown private ownership after %s/%s %s and recovers', async (source, stage, code) => {
+    const root = source === 'custom' ? customSkillsDir() : builtinSkillsDir();
+    const file = path.join(root, 'z-private-canary', 'SKILL.md');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const bytes = Buffer.from('---\nname: Private canary\ndescription: Private description\nownerAgent: owner-canary\n---\nPrivate body\n');
+    fs.writeFileSync(file, bytes);
+    writeCustomSkill('a-healthy');
+    const enabled = await import('../../../src/main/features/component_enabled');
+    enabled.setSkillEnabled(TEST_UID, 'z-private-canary', false);
+    const s = await loadSkills();
+    const paths = await import('../../../src/main/paths');
+    const cache = paths.userSkillCatalogCacheFile(TEST_UID);
+    const nativeFs = createRequire(import.meta.url)('node:fs');
+    const method = stage === 'definition' ? 'readFileSync' : stage === 'stamp' ? 'statSync' : 'readdirSync';
+    const original = nativeFs[method].bind(nativeFs);
+    const fault = Object.assign(new Error('private-error-canary'), { code, path: file });
+    const spy = vi.spyOn(nativeFs, method).mockImplementation((...args: any[]) => {
+      if (args[0] === (stage === 'definition' ? file : root)) throw fault;
+      return original(...args);
+    });
+    syncBuiltinESMExports();
+    const warn = vi.spyOn(console, 'warn');
+    expectTestLog({ level: 'warn', message: /skill catalog read failed/ });
+    try {
+      await expect(s.listSkills()).rejects.toThrow('Skill catalog unavailable');
+      await expect(s.listAgentPrivateSkills()).rejects.toThrow('Skill catalog unavailable');
+      expect(fs.existsSync(cache)).toBe(false);
+      const receipts = warn.mock.calls.filter((call) => call[1] === 'skill catalog read failed');
+      expect(receipts).toHaveLength(1);
+      // Enumeration is first encountered while checking catalog freshness.
+      expect(receipts[0][2]).toEqual({ source, stage: stage === 'enumerate' ? 'stamp' : stage, error_code: code });
+      expect(JSON.stringify(receipts)).not.toMatch(/canary|Private|SKILL\.md/);
+    } finally {
+      warn.mockRestore();
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+    // No manual invalidation or file rewrite is needed after access recovers.
+    expect((await s.listSkills()).map((row) => row.id)).toEqual(['a-healthy']);
+    expect(await s.listAgentPrivateSkills()).toMatchObject([{
+      id: 'z-private-canary', source, ownerAgent: 'owner-canary', enabled: false,
+    }]);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+    vi.resetModules();
+    (await import('../../../src/main/features/users')).activateUser(TEST_UID);
+    expect((await (await loadSkills()).listSkills()).map((row) => row.id)).toEqual(['a-healthy']);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+  });
+
+  it.each(['custom', 'marketplace'])('rebuilds legacy fallback projections before publishing %s private entries', async (source) => {
+    const root = source === 'custom' ? customSkillsDir() : builtinSkillsDir();
+    const file = path.join(root, 'private-canary', 'SKILL.md');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const bytes = Buffer.from('---\nname: Private canary\nownerAgent: owner-canary\n---\nBody\n');
+    fs.writeFileSync(file, bytes);
+    const s = await loadSkills();
+    expect(await s.listSkills()).toEqual([]);
+    const paths = await import('../../../src/main/paths');
+    const cache = paths.userSkillCatalogCacheFile(TEST_UID);
+    const snapshot = JSON.parse(fs.readFileSync(cache, 'utf8'));
+    // A previous failed read persisted defaults with no ownership, despite
+    // matching directory stamps. The original definition is authoritative.
+    fs.writeFileSync(cache, JSON.stringify({ ...snapshot, version: 3, data: [{
+      id: 'private-canary', name: 'private-canary', source,
+      description_zh: '', description_en: '', category: '', enabled: true,
+    }] }));
+    vi.resetModules();
+    (await import('../../../src/main/features/users')).activateUser(TEST_UID);
+    const restarted = await loadSkills();
+    expect(await restarted.listSkills()).toEqual([]);
+    expect(await restarted.listAgentPrivateSkills()).toMatchObject([{ ownerAgent: 'owner-canary' }]);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+  });
+
   it.each(['custom', 'marketplace'])('rebuilds pre-BOM catalog metadata after restart without exposing private %s Skills', async (source) => {
     const id = 'aabbccddeeff';
     const root = source === 'custom' ? customSkillsDir() : builtinSkillsDir();
@@ -916,7 +995,7 @@ describe('skills › listSkills', () => {
     expect(await restarted.listAgentPrivateSkills()).toMatchObject([{
       id, source, name: 'Owned fixture', description_en: 'Private fixture', ownerAgent: 'fixture-owner', enabled: false,
     }]);
-    expect(JSON.parse(fs.readFileSync(cacheFile, 'utf8')).version).toBe(3);
+    expect(JSON.parse(fs.readFileSync(cacheFile, 'utf8')).version).toBe(4);
     expect(fs.readFileSync(file)).toEqual(bytes);
   });
 

@@ -17,6 +17,29 @@ export const PROCESS_PAGE_REBUILD = 'E_PROCESS_PAGE_REBUILD';
 type Index = { offsets: number[]; bytes: number; count: number; version?: 2; legacyPages?: number[] };
 type ProcessItems = NonNullable<GroupMessage['process']>;
 
+/** Amortize tiny hash updates without retaining a whole record. The byte
+ * budget covers pending UTF-8 payload, not JS heap; long existing chunks pass
+ * through directly. Also cap fragment overhead for punctuation-heavy data. */
+function processHash() {
+  const hash = createHash('sha256');
+  let chunks: string[] = [];
+  let bytes = 0;
+  const flush = () => {
+    if (chunks.length) hash.update(chunks.join(''));
+    chunks = []; bytes = 0;
+  };
+  return {
+    update(chunk: string): void {
+      const size = Buffer.byteLength(chunk);
+      if (!size) return;
+      if (size > 16 * 1024) { flush(); hash.update(chunk); return; }
+      if (bytes + size > 16 * 1024 || chunks.length >= 256) flush();
+      chunks.push(chunk); bytes += size;
+    },
+    digest(): string { flush(); return hash.digest('hex'); },
+  };
+}
+
 /** Slice text without bisecting a surrogate pair; each UTF-8 buffer is small. */
 export function* processTextChunks(text: string): Generator<string> {
   for (let start = 0; start < text.length;) {
@@ -34,6 +57,8 @@ function* jsonChunks(value: any, key = '', seen = new Set<object>(), prepared = 
   if (!prepared && value && typeof value.toJSON === 'function') value = value.toJSON(key);
   if (value instanceof Number || value instanceof String || value instanceof Boolean) value = value.valueOf();
   if (typeof value === 'string') {
+    // At most 12290 UTF-8 bytes even if every code unit needs JSON escaping.
+    if (value.length <= 2048) { yield JSON.stringify(value); return; }
     yield '"';
     for (const chunk of processTextChunks(value)) yield JSON.stringify(chunk).slice(1, -1);
     yield '"'; return;
@@ -110,13 +135,13 @@ export function processCacheDirectory(entryDir: string): string {
 /** Allows a compact transcript to survive unavailable cache storage. Once
  * storage recovers, the same content address can be rebuilt on disclosure. */
 export function processPageReference(items: NonNullable<GroupMessage['process']>): string {
-  const hash = createHash('sha256');
+  const hash = processHash();
   for (let n = 0; n < items.length; n++) {
     hash.update(n % PROCESS_PAGE_ITEMS === 0 ? '[' : ',');
     for (const chunk of jsonChunks(items[n], String(n % PROCESS_PAGE_ITEMS))) hash.update(chunk);
     if ((n + 1) % PROCESS_PAGE_ITEMS === 0 || n + 1 === items.length) hash.update(']\n');
   }
-  return hash.digest('hex');
+  return hash.digest();
 }
 
 /** One pass, bounded serialization buffers and sparse page offsets. Raw
@@ -127,7 +152,7 @@ export function storeProcessPages(entryDir: string, items: ProcessItems,
   fs.mkdirSync(directory, { recursive: true });
   const temporary = path.join(directory, randomUUID() + '.tmp');
   const fd = fs.openSync(temporary, 'wx', 0o600);
-  const hash = createHash('sha256');
+  const hash = processHash();
   const offsets: number[] = [];
   const legacyPages: number[] = [];
   let bytes = 0;
@@ -178,7 +203,7 @@ export function storeProcessPages(entryDir: string, items: ProcessItems,
     throw error;
   }
   fs.closeSync(fd);
-  const ref = hash.digest('hex');
+  const ref = hash.digest();
   const destination = path.join(directory, ref + '.v2.jsonl');
   try {
     if (!fs.existsSync(destination)) fs.renameSync(temporary, destination);

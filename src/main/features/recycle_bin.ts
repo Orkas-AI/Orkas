@@ -1,4 +1,5 @@
 import { frontmatterCloseIndex } from '../util/skill-frontmatter';
+import { conversationFileInventory } from './conversation_deletions';
 import { bumpRecordSyncVersion } from '../util/record_sync_fields';
 /**
  * Global local recycle bin.
@@ -23,6 +24,7 @@ import { projectMetaFile, userCloudRoot, userRecycleDir, userSyncRecycleDir } fr
 import {
   cloudRelForAbs,
   conversationMessageReadFile,
+  findProjectIdForConversation,
   findAutoTaskLocation,
   globalAutoTaskLocation,
   listAutoTaskLocations,
@@ -388,40 +390,6 @@ async function collectCloudFilesUnder(uid: string, relDir: string): Promise<stri
   return out;
 }
 
-async function collectCloudFilesMatching(uid: string, relDir: string, predicate: (name: string) => boolean): Promise<string[]> {
-  const safeRelDir = relDir.replace(/\/+$/, '');
-  if (!isSafeCloudRelPath(`${safeRelDir}/__probe__`)) return [];
-  let entries: fs.Dirent[] = [];
-  try {
-    const abs = await resolveCloudRelPath(userCloudRoot(uid), safeRelDir);
-    entries = await fsp.readdir(abs, { withFileTypes: true });
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-    return [];
-  }
-  return entries
-    .filter((entry) => entry.isFile() && predicate(entry.name))
-    .map((entry) => `${safeRelDir}/${entry.name}`)
-    .filter(isSafeCloudRelPath);
-}
-
-async function collectCloudFilesUnderMatchingDirs(uid: string, relDir: string, predicate: (name: string) => boolean): Promise<string[]> {
-  const safeRelDir = relDir.replace(/\/+$/, '');
-  if (!isSafeCloudRelPath(`${safeRelDir}/__probe__`)) return [];
-  let entries: fs.Dirent[] = [];
-  try {
-    const abs = await resolveCloudRelPath(userCloudRoot(uid), safeRelDir);
-    entries = await fsp.readdir(abs, { withFileTypes: true });
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-    return [];
-  }
-  const batches = await Promise.all(entries
-    .filter((entry) => entry.isDirectory() && predicate(entry.name))
-    .map((entry) => collectCloudFilesUnder(uid, `${safeRelDir}/${entry.name}`)));
-  return batches.flat();
-}
-
 export async function collectCloudEntryFiles(uid: string, relPath: string): Promise<string[]> {
   if (!isSafeCloudRelPath(relPath)) return [];
   try {
@@ -457,49 +425,9 @@ async function expandRecycleRelPaths(uid: string, relPaths: string[]): Promise<s
   }
 
   for (const cid of cids) {
-    const projectPid = projectChatRoots.get(cid);
-    for (const relDir of [
-      `cloud/chats/${cid}`,
-      `cloud/chat_attachments/${cid}`,
-      `cloud/chat_artifacts/${cid}`,
-      ...(projectPid ? [
-        `cloud/projects/${projectPid}/chats/${cid}`,
-        `cloud/projects/${projectPid}/chat_attachments/${cid}`,
-        `cloud/projects/${projectPid}/chat_artifacts/${cid}`,
-      ] : []),
-    ]) {
-      for (const relPath of await collectCloudFilesUnder(uid, relDir)) out.add(relPath);
-    }
-    const commanderSession = `cloud/sessions/gconv-${cid}.jsonl`;
-    if ((await collectCloudEntryFiles(uid, commanderSession)).length) out.add(commanderSession);
-    for (const relPath of await collectCloudFilesUnder(uid, `cloud/sessions/gconv-${cid}.tool-results`)) out.add(relPath);
-    if (projectPid) {
-      const projectCommanderSession = `cloud/projects/${projectPid}/sessions/gconv-${cid}.jsonl`;
-      if ((await collectCloudEntryFiles(uid, projectCommanderSession)).length) out.add(projectCommanderSession);
-      for (const relPath of await collectCloudFilesUnder(uid, `cloud/projects/${projectPid}/sessions/gconv-${cid}.tool-results`)) out.add(relPath);
-    }
-    for (const relPath of await collectCloudFilesMatching(
-      uid,
-      'cloud/sessions',
-      (name) => name.startsWith(`gmember-${cid}-`) && name.endsWith('.jsonl'),
-    )) out.add(relPath);
-    for (const relPath of await collectCloudFilesUnderMatchingDirs(
-      uid,
-      'cloud/sessions',
-      (name) => name.startsWith(`gmember-${cid}-`) && name.endsWith('.tool-results'),
-    )) out.add(relPath);
-    if (projectPid) {
-      for (const relPath of await collectCloudFilesMatching(
-        uid,
-        `cloud/projects/${projectPid}/sessions`,
-        (name) => name.startsWith(`gmember-${cid}-`) && name.endsWith('.jsonl'),
-      )) out.add(relPath);
-      for (const relPath of await collectCloudFilesUnderMatchingDirs(
-        uid,
-        `cloud/projects/${projectPid}/sessions`,
-        (name) => name.startsWith(`gmember-${cid}-`) && name.endsWith('.tool-results'),
-      )) out.add(relPath);
-    }
+    const pid = projectChatRoots.get(cid) || findProjectIdForConversation(uid, cid);
+    const inventory = await conversationFileInventory(uid, cid, pid || null);
+    for (const rel of inventory.files) if (!isAtomicWriteTempPath(rel)) out.add(rel);
   }
   for (const pid of projectIds) {
     for (const relPath of await collectCloudFilesUnder(uid, `cloud/projects/${pid}`)) out.add(relPath);
@@ -1460,7 +1388,12 @@ async function reactivateChatIndexRows(
   const cidToRelPath = new Map<string, string>();
   for (const relPath of relPaths) {
     const transcriptCid = chatJsonlCid(relPath);
-    if (transcriptCid) cidToRelPath.set(transcriptCid, relPath);
+    if (transcriptCid) {
+      const previous = cidToRelPath.get(transcriptCid);
+      // Both layouts can be archived for one task. Prefer its canonical
+      // transcript; archive iteration order must not choose a different index.
+      if (!previous || projectIdFromRelPath(relPath) === metadataRows.get(transcriptCid)?.project_id) cidToRelPath.set(transcriptCid, relPath);
+    }
     else if (relPath.endsWith('/meta.json')) {
       const cid = chatCidFromRelPath(relPath);
       const pid = projectIdFromRelPath(relPath);
@@ -1481,8 +1414,7 @@ async function reactivateChatIndexRows(
   const reactivated = new Set<string>();
   const restoredIso = restoredAt.toISOString();
   const buckets = new Map<string, { rows: any[]; rowsByCid: Map<string, any>; changed: boolean }>();
-  const bucketFor = async (relPath: string) => {
-    const pid = projectIdFromRelPath(relPath);
+  const bucketFor = async (relPath: string, pid = projectIdFromRelPath(relPath)) => {
     const indexFile = pid
       ? await resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${pid}/chats/_index.json`)
       : await resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
@@ -1507,10 +1439,30 @@ async function reactivateChatIndexRows(
   };
 
   for (const [cid, relPath] of cidToRelPath) {
-    const pid = projectIdFromRelPath(relPath);
-    const bucket = await bucketFor(relPath);
-    const row = bucket.rowsByCid.get(cid);
     const metadataRow = metadataRows.get(cid);
+    let pid = projectIdFromRelPath(relPath);
+    let bucket = await bucketFor(relPath);
+    // A legacy-only backup keeps its original index unless deletion has since
+    // established the task in the canonical project index. Clear that durable
+    // tombstone too, rather than creating a lower-revision live duplicate.
+    if (!pid && safeId(metadataRow?.project_id)) {
+      const canonical = await bucketFor(relPath, metadataRow!.project_id);
+      if (canonical.rowsByCid.has(cid)) { bucket = canonical; pid = metadataRow!.project_id; }
+    }
+    const row = bucket.rowsByCid.get(cid);
+    if (pid && row) {
+      const global = await bucketFor(relPath, '');
+      const retained = global.rowsByCid.get(cid);
+      if (retained?.project_id === pid && retained.deleted_at) {
+        // Restoring the project is a new generation after its deletion, even
+        // when its archived index itself contains only an older live row.
+        row._sync_rev = Math.max(Number(row._sync_rev) || 0, Number(retained._sync_rev) || 0);
+        row.deleted_at = retained.deleted_at;
+        global.rows.splice(global.rows.indexOf(retained), 1);
+        global.rowsByCid.delete(cid);
+        global.changed = true;
+      }
+    }
     if (!row && !metadataRow) {
       const restoredRow = await deriveChatIndexRowFromArchive(uid, batch.id, cid, relPath, restoredIso);
       if (!restoredRow) continue;
@@ -1877,26 +1829,8 @@ export async function createAppRecycleBatchForAutoTask(
 }
 
 async function conversationIdsForProject(uid: string, projectId: string): Promise<string[]> {
-  try {
-    const indexFile = await resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${projectId}/chats/_index.json`);
-    const rows = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
-    if (!Array.isArray(rows)) return [];
-    return rows
-      .filter((row: any) => row && safeId(row.conversation_id) && !row.deleted_at)
-      .map((row: any) => row.conversation_id);
-  } catch {
-    // Fallback for legacy layouts that still kept project rows in the global index.
-    try {
-      const indexFile = await resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
-      const rows = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
-      if (!Array.isArray(rows)) return [];
-      return rows
-        .filter((row: any) => row && row.project_id === projectId && safeId(row.conversation_id) && !row.deleted_at)
-        .map((row: any) => row.conversation_id);
-    } catch {
-      return [];
-    }
-  }
+  const chats = await import('./chats');
+  return (await chats.listConversationDeletionRows(uid, projectId)).map(row => row.conversation_id);
 }
 
 async function autoTaskIdsForProject(uid: string, projectId: string): Promise<string[]> {
@@ -1921,7 +1855,18 @@ export async function createAppRecycleBatchForProject(
   const rels = new Set<string>([`cloud/projects/${projectId}`]);
   const conversationIds = await conversationIdsForProject(uid, projectId);
   const autoTaskIds = await autoTaskIdsForProject(uid, projectId);
-  for (const cid of conversationIds) rels.add(`cloud/projects/${projectId}/chats/${cid}.jsonl`);
+  for (const cid of conversationIds) {
+    const file = conversationMessageReadFile(uid, cid, projectId);
+    try {
+      await fsp.lstat(file);
+      rels.add(cloudRelForAbs(uid, file));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      // Imported drafts and already-tombstoned children may have no transcript.
+      // Archive their existing owned roots without inventing a missing primary.
+      for (const rel of (await conversationFileInventory(uid, cid, projectId)).roots) rels.add(rel);
+    }
+  }
   for (const taskId of autoTaskIds) {
     const loc = findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId);
     rels.add(loc.configRelPath);

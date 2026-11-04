@@ -233,6 +233,13 @@
         <button type="button" class="btn btn-ghost btn-sm" data-act="handback" hidden></button>
         <div class="web-assist-status" role="status" aria-live="polite"></div>
       </div>
+      <section id="web-assist-activity" class="web-assist-activity-popover" hidden aria-labelledby="web-assist-activity-title">
+        <div class="web-assist-activity-header">
+          <strong id="web-assist-activity-title"></strong>
+          <button type="button" class="web-assist-icon-btn" data-act="close-activity">${icon('x')}</button>
+        </div>
+        <ol class="web-assist-trail-list"></ol>
+      </section>
       <div class="web-assist-page">
       <section class="web-assist-permission-prompt" hidden role="dialog" aria-modal="false" aria-labelledby="web-assist-permission-title">
         <strong id="web-assist-permission-title"></strong>
@@ -242,13 +249,6 @@
           <button type="button" class="btn btn-ghost btn-sm" data-act="deny-permission"></button>
           <button type="button" class="btn btn-primary btn-sm" data-act="allow-permission"></button>
         </div>
-      </section>
-      <section id="web-assist-activity" class="web-assist-activity-popover" hidden aria-labelledby="web-assist-activity-title">
-        <div class="web-assist-activity-header">
-          <strong id="web-assist-activity-title"></strong>
-          <button type="button" class="web-assist-icon-btn" data-act="close-activity">${icon('x')}</button>
-        </div>
-        <ol class="web-assist-trail-list"></ol>
       </section>
       <div class="web-assist-empty">
         <span class="web-assist-empty-icon">${icon('globe')}</span>
@@ -355,14 +355,16 @@
       activateTab(tab.dataset.tabId);
     });
     window.addEventListener('resize', scheduleLayout);
+    window.addEventListener('resize', scheduleActivityMeasurement);
     window.addEventListener('i18n-change', refreshCopy);
     if (typeof ResizeObserver === 'function') {
       resizeObserver = new ResizeObserver(() => {
         scheduleLayout();
-        if (activityListEl.clientWidth !== activityMeasuredWidth) scheduleActivityMeasurement();
+        scheduleActivityMeasurement();
       });
       resizeObserver.observe(panel);
       resizeObserver.observe(host);
+      resizeObserver.observe(activityBtn);
       resizeObserver.observe(activityListEl);
     }
     overlaySubscription?.();
@@ -456,6 +458,7 @@
     activityEl.hidden = !open;
     activityBtn.setAttribute('aria-expanded', String(open));
     if (open) {
+      positionActivity();
       renderActivity();
       activityEl.querySelector('[data-act="close-activity"]').focus();
     } else {
@@ -466,11 +469,26 @@
     syncVisibility();
   }
 
+  function positionActivity() {
+    if (!activityEl || activityEl.hidden) return;
+    // Anchor in browser-chrome coordinates, including when the drawer moves
+    // or fills the window. The page has a different origin below the toolbar.
+    const bounds = shell.getBoundingClientRect();
+    const anchor = activityBtn.getBoundingClientRect();
+    const top = anchor.bottom - bounds.top + 4;
+    const right = Math.max(8, Math.min(bounds.right - anchor.right,
+      shell.clientWidth - activityEl.offsetWidth - 8));
+    activityEl.style.top = `${top}px`;
+    activityEl.style.right = `${right}px`;
+    activityEl.style.maxHeight = `${Math.max(0, shell.clientHeight - top - 8)}px`;
+  }
+
   function scheduleActivityMeasurement() {
     if (!activityEl || activityEl.hidden || activityMeasureFrame) return;
     activityMeasureFrame = window.requestAnimationFrame(() => {
       activityMeasureFrame = 0;
-      measureActivityGroups();
+      positionActivity();
+      if (activityListEl.clientWidth !== activityMeasuredWidth) measureActivityGroups();
     });
   }
 

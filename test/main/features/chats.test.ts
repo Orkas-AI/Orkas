@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
@@ -1010,6 +1010,43 @@ describe('chats › index repair', () => {
     expect(startup.unprojected_pagination).toEqual({ total: 2, next_offset: null });
   });
 
+  it.each([false, true])('loads all old pinned tasks including collapsed projects and later pages (recent cutoff: %s)', async (withCutoff) => {
+    const chats = await loadChats();
+    const projects = await import('../../../src/main/features/projects');
+    const project = await projects.createProject(TEST_UID, 'Collapsed pinned tasks');
+    if (!project.ok) throw new Error('project setup failed');
+    const pid = project.project.project_id;
+    const old = '2020-01-01T00:00:00.000Z';
+    const row = (cid: string, projectId?: string, pinned = true) => ({
+      conversation_id: cid, title: cid, kind: 'normal',
+      ...(projectId ? { project_id: projectId } : {}),
+      ...(pinned ? { pinned_at: old } : {}),
+      created_at: old, updated_at: old, participant_summary_updated_at: old,
+      agent_ids: [], commander_in_chat: false, _sync_rev: 1, _sync_device_id: 'test',
+    });
+    const globalPins = Array.from({ length: 12 }, (_, i) => row((i + 1).toString(16).padStart(12, '0')));
+    const projectPins = Array.from({ length: 12 }, (_, i) => row((i + 100).toString(16).padStart(12, '0'), pid));
+    for (const [projectId, pins, oldCid] of [[undefined, globalPins, '000000000200'], [pid, projectPins, '000000000201']] as const) {
+      const file = projectId
+        ? path.join(tmpDir, TEST_UID, 'cloud', 'projects', projectId, 'chats', '_index.json')
+        : path.join(tmpDir, TEST_UID, 'cloud', 'chats', '_index.json');
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify([...pins, row(oldCid, projectId, false)]));
+    }
+    chats.invalidateConversationCaches(TEST_UID);
+    const startup = await chats.listStartupConversations(TEST_UID, {
+      expandedProjectIds: [],
+      ...(withCutoff ? { activeSinceMs: Date.now() - 24 * 60 * 60 * 1000 } : {}),
+    });
+    expect(new Set(startup.conversations.map(c => c.conversation_id)))
+      .toEqual(new Set([...globalPins, ...projectPins].map(c => c.conversation_id)));
+    expect(startup.loaded_project_ids).toEqual([]);
+    expect(startup.project_pagination).toEqual({});
+    expect(startup.unprojected_pagination).toEqual({ total: 13, next_offset: 10 });
+    expect((await chats.listProjectConversationPage(TEST_UID, pid)).conversations).toHaveLength(10);
+    expect((await chats.listUnprojectedConversationPage(TEST_UID)).conversations).toHaveLength(10);
+  });
+
   it('rejects renderer active-since values outside a plausible recent calendar window', async () => {
     const chats = await loadChats();
     const projects = await import('../../../src/main/features/projects');
@@ -1556,6 +1593,142 @@ describe('chats › index repair', () => {
   });
 });
 
+// Deleted tasks keep a tombstone for 30 days after a bulk cleanup, and the repair
+// runs at every startup. New tasks must not queue behind its file cleanup, and that
+// cleanup must never take back a restore or leave a pruned task able to reappear.
+describe('chats › index repair tombstone cleanup', () => {
+  const mutableFs: typeof fs = createRequire(import.meta.url)('node:fs');
+  const cidOf = (i: number) => `c${i.toString(16).padStart(11, '0')}`;
+  const chatsDir = () => path.join(tmpDir, TEST_UID, 'cloud', 'chats');
+  const projectRoot = (p: number) => path.join(tmpDir, TEST_UID, 'cloud', 'projects', `p${p}`);
+  const strayMeta = (cid: string) => path.join(projectRoot(0), 'chats', cid, 'meta.json');
+  const readIndex = () => JSON.parse(fs.readFileSync(path.join(chatsDir(), '_index.json'), 'utf8')) as any[];
+
+  /** Retained tombstones remain in the index; expired ones are pruned by this repair.
+   * Each leaves a copy of its metadata under another root, as a moved task does. */
+  function seed({ retained = 0, expired = 0, projects = 3 }: { retained?: number; expired?: number; projects?: number }) {
+    const recent = new Date().toISOString();
+    const old = new Date(Date.now() - 40 * 86_400_000).toISOString();
+    const row = (cid: string, deletedAt: string) => ({ conversation_id: cid, title: 'Deleted', kind: 'normal',
+      created_at: old, updated_at: old, deleted_at: deletedAt, _sync_rev: 2, _sync_device_id: 'device' });
+    const retainedIds = Array.from({ length: retained }, (_, i) => cidOf(i));
+    const expiredIds = Array.from({ length: expired }, (_, i) => cidOf(retained + i));
+    fs.mkdirSync(chatsDir(), { recursive: true });
+    fs.writeFileSync(path.join(chatsDir(), '_index.json'), JSON.stringify([
+      ...expiredIds.map(cid => row(cid, old)),
+      ...retainedIds.map(cid => row(cid, recent)),
+    ]));
+    for (let p = 0; p < projects; p++) {
+      fs.mkdirSync(path.join(projectRoot(p), 'chats'), { recursive: true });
+      fs.writeFileSync(path.join(projectRoot(p), 'project.json'), JSON.stringify({ project_id: `p${p}`, name: `p${p}`, created_at: recent, updated_at: recent }));
+    }
+    for (const cid of [...retainedIds, ...expiredIds]) {
+      fs.mkdirSync(path.dirname(strayMeta(cid)), { recursive: true });
+      fs.writeFileSync(strayMeta(cid), JSON.stringify({ conversation_id: cid, title: 'Deleted', deleted_at: recent }));
+    }
+    for (const cid of expiredIds) fs.writeFileSync(path.join(chatsDir(), `${cid}.jsonl`), '{"id":"m1","from":"user","text":"old"}\n');
+    return { retainedIds, expiredIds };
+  }
+
+  /** Pause cleanup at its first unlink so a concurrent action can run during it. */
+  function holdFirstUnlink(onHold?: () => void) {
+    const original = fs.promises.unlink.bind(fs.promises);
+    let release!: () => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let calls = 0;
+    const spy = vi.spyOn(fs.promises, 'unlink').mockImplementation((async (...args: any[]) => {
+      if (++calls === 1) { onHold?.(); entered(); await gate; }
+      return (original as any)(...args);
+    }) as any);
+    syncBuiltinESMExports();
+    return { waiting, release, calls: () => calls, restore: () => { spy.mockRestore(); syncBuiltinESMExports(); } };
+  }
+
+  it('does not rescan the projects once per tombstone', async () => {
+    const chats = await loadChats();
+    const readdirCalls = async (retained: number) => {
+      seed({ retained, projects: 5 });
+      const spy = vi.spyOn(mutableFs, 'readdirSync');
+      syncBuiltinESMExports();
+      try {
+        await chats.repairConversationIndex(TEST_UID);
+        return spy.mock.calls.length;
+      } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    };
+    const few = await readdirCalls(1);
+    const many = await readdirCalls(200);
+    expect(many - few).toBeLessThanOrEqual(3);
+  });
+
+  it('lets a new task through before the whole cleanup finishes and still removes every copy', async () => {
+    const chats = await loadChats();
+    const { retainedIds } = seed({ retained: 200 });
+    const hold = holdFirstUnlink();
+    try {
+      const repair = chats.repairConversationIndex(TEST_UID);
+      await hold.waiting;
+      let callsWhenCreated = -1;
+      const creating = chats.createConversation(TEST_UID, { title: 'New task' }).then(task => {
+        callsWhenCreated = hold.calls();
+        return task;
+      });
+      hold.release();
+      const task = await creating;
+      await repair;
+      expect(callsWhenCreated).toBeLessThan(hold.calls());
+      expect(readIndex().find(row => row.conversation_id === task.conversation_id)?.title).toBe('New task');
+      expect(retainedIds.filter(cid => fs.existsSync(strayMeta(cid)))).toEqual([]);
+      expect(readIndex().filter(row => row.deleted_at)).toHaveLength(200);
+    } finally { hold.release(); hold.restore(); }
+  });
+
+  it.each(['restore', 'restore-other-module'] as const)('keeps the metadata of a task restored while cleanup is running: %s', async action => {
+    const chats = await loadChats();
+    const { retainedIds } = seed({ retained: 200 });
+    const target = retainedIds.at(-1)!;
+    const hold = holdFirstUnlink();
+    try {
+      const repair = chats.repairConversationIndex(TEST_UID);
+      await hold.waiting;
+      if (action === 'restore-other-module') vi.resetModules();
+      const restorer = action === 'restore' ? chats : await loadChats();
+      const restoring = restorer.createConversation(TEST_UID, { conversationId: target, title: 'Restored task' });
+      hold.release();
+      await Promise.all([restoring, repair]);
+      const row = readIndex().find(item => item.conversation_id === target);
+      expect(row?.deleted_at).toBeUndefined();
+      expect(row?.title).toBe('Restored task');
+      expect(JSON.parse(fs.readFileSync(path.join(chatsDir(), target, 'meta.json'), 'utf8')).title).toBe('Restored task');
+      expect(retainedIds.slice(0, -1).filter(cid => fs.existsSync(strayMeta(cid)))).toEqual([]);
+    } finally { hold.release(); hold.restore(); }
+  });
+
+  it('stops at cancellation, yet never leaves a pruned task able to reappear', async () => {
+    const chats = await loadChats();
+    const { retainedIds, expiredIds } = seed({ retained: 100, expired: 40 });
+    const controller = new AbortController();
+    const hold = holdFirstUnlink(() => controller.abort());
+    hold.release();
+    try {
+      const result = await chats.repairConversationIndex(TEST_UID, controller.signal);
+      expect(result.cancelled).toBe(true);
+      // These rows just left the index, so nothing would ever clean them later and
+      // discovery would turn a leftover transcript or metadata back into a live task.
+      expect(expiredIds.filter(cid => fs.existsSync(strayMeta(cid)))).toEqual([]);
+      expect(expiredIds.filter(cid => fs.existsSync(path.join(chatsDir(), `${cid}.jsonl`)))).toEqual([]);
+      expect(readIndex().map(row => row.conversation_id).sort()).toEqual([...retainedIds].sort());
+      const remaining = retainedIds.filter(cid => fs.existsSync(strayMeta(cid)));
+      expect(remaining.length).toBeGreaterThan(0);
+
+      await chats.repairConversationIndex(TEST_UID);
+      expect(retainedIds.filter(cid => fs.existsSync(strayMeta(cid)))).toEqual([]);
+      expect(await chats.listConversations(TEST_UID)).toEqual([]);
+    } finally { hold.restore(); }
+  });
+});
+
 describe('chats › deleteConversation', () => {
   it.each(['delete', 'edit', 'create', 'restore', 'module-delete'] as const)('does not publish an old repair snapshot across a concurrent %s', async action => {
     const chats = await loadChats();
@@ -1623,6 +1796,30 @@ describe('chats › deleteConversation', () => {
     expect(fs.existsSync(history)).toBe(false);
     expect(await chats.listCleanupConversationRows(TEST_UID)).toEqual([]);
   });
+  it('reports an incomplete physical deletion and lets an idempotent retry finish it', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID);
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', conv.conversation_id + '.jsonl');
+    fs.writeFileSync(file, 'retained until retry');
+    const unlink = fs.promises.unlink, rm = fs.promises.rm;
+    const failure = Object.assign(new Error('injected permission failure'), { code: 'EACCES' });
+    const unlinkSpy = vi.spyOn(fs.promises, 'unlink').mockImplementation(async target => {
+      if (String(target) === file) throw failure;
+      return unlink(target);
+    });
+    const rmSpy = vi.spyOn(fs.promises, 'rm').mockImplementation(async (target, options) => {
+      if (String(target) === file) throw failure;
+      return rm(target, options);
+    });
+    syncBuiltinESMExports();
+    try {
+      await expect(chats.deleteConversation(TEST_UID, conv.conversation_id)).rejects.toThrow();
+      expect(fs.readFileSync(file, 'utf8')).toBe('retained until retry');
+    } finally { unlinkSpy.mockRestore(); rmSpy.mockRestore(); syncBuiltinESMExports(); }
+    expect(await chats.deleteConversation(TEST_UID, conv.conversation_id)).toBe(true);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
   it('purges retained member outputs after a model-state reset removed the session JSONL', async () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID);

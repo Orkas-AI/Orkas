@@ -199,8 +199,8 @@ function recordPatScopeGrant(env, expected, granted) {
   }
 }
 
-// The full-domain dry-run is an authoritative PAT check, never a grant or a
-// business action. It does not establish unrelated user OAuth/resource access.
+// Only a verified remote PAT plan is grant evidence. Local dry-run request
+// previews are unavailable checks, and never establish OAuth/resource access.
 function recordDingtalkPermissionCheck(env, expected, plan, domains) {
   if (JSON.stringify(readPermissionRequest(env)) !== JSON.stringify(expected)) return;
   const value = { ...expected, profile: env.ORKAS_LOCAL_CLI_PROFILE, reauthorize: true,

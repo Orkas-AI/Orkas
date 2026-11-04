@@ -3,8 +3,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const OPS = new Set(['probe', 'trim', 'concat', 'burnsubs', 'overlay', 'extract_frame', 'loudness', 'normalize_loudness', 'mix', 'trim_silence', 'remove_fillers']);
-const OUTPUT_OPS = new Set(['trim', 'concat', 'burnsubs', 'overlay', 'extract_frame', 'normalize_loudness', 'mix', 'trim_silence', 'remove_fillers']);
+const OPS = new Set(['probe', 'trim', 'concat', 'burnsubs', 'overlay', 'extract_frame', 'loudness', 'normalize_loudness', 'mix', 'trim_silence', 'remove_fillers', 'reframe']);
+const OUTPUT_OPS = new Set(['trim', 'concat', 'burnsubs', 'overlay', 'extract_frame', 'normalize_loudness', 'mix', 'trim_silence', 'remove_fillers', 'reframe']);
+const REFRAME_MODES = ['pad', 'crop', 'blur'];
 
 function fail(code, message, extra = {}) {
   process.stderr.write(JSON.stringify({ ok: false, code, message, ...extra }) + '\n');
@@ -125,6 +126,20 @@ function parseArgs(args) {
     else if (a.startsWith('--min-keep-sec=')) out.minKeepSec = parseNumber(a.slice('--min-keep-sec='.length), '--min-keep-sec');
     else if (a === '--fillers') { out.fillers.push(...parseList(nextValue(args, i, a), a)); i += 1; }
     else if (a.startsWith('--fillers=')) out.fillers.push(...parseList(a.slice('--fillers='.length), '--fillers'));
+    else if (a === '--aspect') { out.aspect = nextValue(args, i, a); i += 1; }
+    else if (a.startsWith('--aspect=')) out.aspect = a.slice('--aspect='.length);
+    else if (a === '--width') { out.width = parseNumber(nextValue(args, i, a), a); i += 1; }
+    else if (a.startsWith('--width=')) out.width = parseNumber(a.slice('--width='.length), '--width');
+    else if (a === '--height') { out.height = parseNumber(nextValue(args, i, a), a); i += 1; }
+    else if (a.startsWith('--height=')) out.height = parseNumber(a.slice('--height='.length), '--height');
+    else if (a === '--mode') { out.mode = nextValue(args, i, a); i += 1; }
+    else if (a.startsWith('--mode=')) out.mode = a.slice('--mode='.length);
+    else if (a === '--focus-x') { out.focusX = parseNumber(nextValue(args, i, a), a); i += 1; }
+    else if (a.startsWith('--focus-x=')) out.focusX = parseNumber(a.slice('--focus-x='.length), '--focus-x');
+    else if (a === '--focus-y') { out.focusY = parseNumber(nextValue(args, i, a), a); i += 1; }
+    else if (a.startsWith('--focus-y=')) out.focusY = parseNumber(a.slice('--focus-y='.length), '--focus-y');
+    else if (a === '--pad-color') { out.padColor = nextValue(args, i, a); i += 1; }
+    else if (a.startsWith('--pad-color=')) out.padColor = a.slice('--pad-color='.length);
     else if (!out.op) out.op = a;
     else if (!out.inputPath) out.inputPath = a;
     else fail('E_ARGS', `unexpected argument: ${a}; accepted options are ${acceptedOptions().join(' ')}`);
@@ -227,6 +242,17 @@ module.exports = async function editVideoScript({ args }) {
     }
     if (['reject', 'mix', 'replace'].includes(opts.onExistingAudio)) params.onExistingAudio = opts.onExistingAudio;
   }
+  if (opts.op === 'reframe') {
+    const hasSize = typeof opts.width === 'number' && typeof opts.height === 'number';
+    if (!opts.aspect && !hasSize) fail('E_ARGS', 'reframe requires --aspect (9:16, 1:1, 4:5, 16:9 or W:H) or both --width and --height');
+    if (opts.mode !== undefined && !REFRAME_MODES.includes(opts.mode)) fail('E_ARGS', `reframe --mode must be one of: ${REFRAME_MODES.join(', ')}`);
+    for (const [key, label] of [['focusX', '--focus-x'], ['focusY', '--focus-y']]) {
+      if (typeof opts[key] === 'number' && (opts[key] < 0 || opts[key] > 1)) fail('E_ARGS', `${label} must be between 0 and 1`);
+    }
+    if (opts.aspect) params.aspect = opts.aspect;
+    if (opts.mode) params.mode = opts.mode;
+    if (opts.padColor) params.padColor = opts.padColor;
+  }
 
   if (OUTPUT_OPS.has(opts.op)) {
     const out = await outputFile(opts.outputPath);
@@ -244,6 +270,10 @@ module.exports = async function editVideoScript({ args }) {
     ['minSilenceSec', 'minSilenceSec'],
     ['padSec', 'padSec'],
     ['minKeepSec', 'minKeepSec'],
+    ['width', 'width'],
+    ['height', 'height'],
+    ['focusX', 'focusX'],
+    ['focusY', 'focusY'],
   ]) {
     if (typeof opts[from] === 'number') params[to] = opts[from];
   }
@@ -263,7 +293,8 @@ module.exports = async function editVideoScript({ args }) {
   }
   else if (result.path) {
     payload.media = `chat-media://local/${result.path}`;
-    payload.text = `${opts.op} wrote ${result.path}${outputRenamed ? ` (renamed from ${requestedOutputAbsPath})` : ''}.`;
+    const reframed = result.reframe ? ` at ${result.reframe.canvas} (${result.reframe.mode})` : '';
+    payload.text = `${opts.op} wrote ${result.path}${reframed}${outputRenamed ? ` (renamed from ${requestedOutputAbsPath})` : ''}.`;
   }
   return payload;
 };

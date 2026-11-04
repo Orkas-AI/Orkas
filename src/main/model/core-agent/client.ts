@@ -54,6 +54,7 @@ import {
 } from './session-store';
 import { getSession as _getCachedSession } from './session-store';
 import { app } from 'electron';
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as paths from '../../paths';
@@ -174,6 +175,10 @@ function buildSkillSandboxEnvStatic(): Record<string, string> {
  *   - `ORKAS_GLOBAL_SKILL_ROOTS_ENABLED` = current account preference, so the
  *     standalone Skill runner enforces the same global-root boundary as the
  *     registry instead of independently scanning hidden roots.
+ *   - `ORKAS_RUN_TOKEN` = a fresh random value per call (one model run or CLI
+ *     dispatch), so Skill scripts can scope per-run bookkeeping such as
+ *     VideoStudio's plan-check repair budget. It carries no id and grants
+ *     nothing.
  *   - `ORKAS_PATH_PREPEND` = bundled runtime bins plus enabled external
  *     package CLI dirs (`.bin`, package-local bin fallbacks) when present.
  *     Composed into PATH by the sandbox executor (see core-agent
@@ -188,6 +193,7 @@ function safeAgentEnvId(agentId?: string): string {
 
 export function buildSkillSandboxEnv(userId?: string, agentId?: string): Record<string, string> {
   const env = { ...buildSkillSandboxEnvStatic(), ...bundledRuntimeEnv() };
+  env.ORKAS_RUN_TOKEN = randomUUID();
   env.ORKAS_UI_LANG = getCurrentLang();
   env.ORKAS_VENV_ROOT = paths.VENV_ROOT;
   env.ORKAS_PYTHON_VENV_ROOT = paths.PYTHON_VENV_ROOT;
@@ -503,7 +509,134 @@ type RunTimelineLogEntry = {
   detail?: string;
 };
 
+/** Fixed-size attempt evidence; no event or array per retry. */
+interface ProviderFailureDiagnostics {
+  /** Present only when every non-abort observation in this run was classified.
+   * Legacy totals cannot be decomposed from their last failure. */
+  provider_failure_breakdown_version?: 1;
+  provider_capacity_skip_count?: number;
+  provider_pre_request_failure_count?: number;
+  provider_attempt_failure_count?: number;
+  provider_failure_unknown_count?: number;
+  provider_request_failure_count?: number;
+  provider_request_abort_count?: number;
+  provider_request_failure_ms?: number;
+  provider_last_failure_code?: string;
+  provider_last_failure_phase?: string;
+  provider_last_failure_http_status?: number;
+  provider_last_failure_source?: string;
+  provider_last_failure_event?: string;
+  provider_last_failure_request_sequence?: number;
+}
+
+// Mirror the adapter's closed-world codes at the local diagnostic boundary.
+const PROVIDER_FAILURE_CODES = new Set([
+  'reference_error', 'eperm', 'eacces',
+  'econnreset', 'econnrefused', 'etimedout', 'enotfound', 'eai_again',
+  'epipe', 'enetunreach', 'ehostunreach', 'und_err_connect_timeout',
+  'und_err_headers_timeout', 'und_err_body_timeout', 'und_err_socket',
+  'cert_has_expired', 'depth_zero_self_signed_cert',
+  'unable_to_verify_leaf_signature', 'err_tls_cert_altname_invalid', 'unknown',
+  'invalid_request_error', 'invalid_function_parameters', 'invalid_json_schema',
+  'unsupported_parameter', 'unsupported_value', 'missing_required_parameter',
+  'context_length_exceeded', 'context_capacity_insufficient', 'model_not_found', 'authentication_error',
+  'permission_error', 'insufficient_quota', 'rate_limit_error', 'server_error',
+  'internal_server_error', 'service_unavailable', 'overloaded_error',
+  'content_filter', 'content_policy_violation', 'invalid_encrypted_content',
+  'invalid_value', 'upstream_error',
+]);
+const PROVIDER_FAILURE_PHASES = new Set(['unknown', 'before_request', 'before_response', 'after_response']);
+
+const PROVIDER_FAILURE_SOURCES = new Set(['unknown', 'payload', 'transport', 'http', 'sdk_error', 'exception']);
+const PROVIDER_FAILURE_EVENTS = new Set(['none', 'unknown', 'start', 'text_start', 'text_delta', 'text_end',
+  'thinking_start', 'thinking_delta', 'thinking_end', 'toolcall_start', 'toolcall_delta', 'toolcall_end', 'done']);
+
+function sanitizeProviderFailureDiagnostics(t: ProviderFailureDiagnostics): ProviderFailureDiagnostics {
+  const count = boundedCount(t.provider_request_failure_count);
+  const abortCount = boundedCount(t.provider_request_abort_count);
+  const httpStatus = t.provider_last_failure_http_status;
+  return {
+    ...(t.provider_failure_breakdown_version === 1 ? {
+      provider_failure_breakdown_version: 1 as const,
+      provider_capacity_skip_count: boundedCount(t.provider_capacity_skip_count),
+      provider_pre_request_failure_count: boundedCount(t.provider_pre_request_failure_count),
+      provider_attempt_failure_count: boundedCount(t.provider_attempt_failure_count),
+      provider_failure_unknown_count: boundedCount(t.provider_failure_unknown_count),
+    } : {}),
+    ...(abortCount ? { provider_request_abort_count: abortCount } : {}),
+    ...(count ? {
+      provider_request_failure_count: count,
+      provider_request_failure_ms: boundedCount(t.provider_request_failure_ms),
+      provider_last_failure_code: closedValue(t.provider_last_failure_code, PROVIDER_FAILURE_CODES, 'unknown'),
+      provider_last_failure_phase: closedValue(t.provider_last_failure_phase, PROVIDER_FAILURE_PHASES, 'unknown'),
+      provider_last_failure_source: closedValue(t.provider_last_failure_source, PROVIDER_FAILURE_SOURCES, 'unknown'),
+      provider_last_failure_event: closedValue(t.provider_last_failure_event, PROVIDER_FAILURE_EVENTS, 'unknown'),
+      provider_last_failure_request_sequence: boundedCount(t.provider_last_failure_request_sequence),
+      ...(Number.isInteger(httpStatus) && Number(httpStatus) >= 100 && Number(httpStatus) <= 599
+        ? { provider_last_failure_http_status: httpStatus } : {}),
+    } : {}),
+  };
+}
+
+/** The caller keeps one aggregate per run, including auxiliary model calls.
+ * A completed run may still contain recovered failures. Abort observations
+ * stay separate and never overwrite the last genuine failure. */
+function recordProviderRequestFailure(stats: ProviderFailureDiagnostics, failure: {
+  code: string; phase: string; elapsedMs: number; httpStatus?: number; aborted: boolean;
+  source?: string; lastEvent?: string; requestSequence?: number;
+}): void {
+  if (failure.aborted) {
+    stats.provider_request_abort_count = boundedCount((stats.provider_request_abort_count || 0) + 1);
+    return;
+  }
+  const breakdown: ProviderFailureDiagnostics = {};
+  if (stats.provider_failure_breakdown_version === 1 || !stats.provider_request_failure_count) {
+    breakdown.provider_failure_breakdown_version = 1;
+    const phase = closedValue(failure.phase, PROVIDER_FAILURE_PHASES, 'unknown');
+    const code = closedValue(failure.code, PROVIDER_FAILURE_CODES, 'unknown');
+    const source = closedValue(failure.source, PROVIDER_FAILURE_SOURCES, 'unknown');
+    const field = phase === 'before_request'
+      ? code === 'context_capacity_insufficient' && source === 'payload'
+        ? 'provider_capacity_skip_count' : 'provider_pre_request_failure_count'
+      : phase === 'before_response' || phase === 'after_response'
+        ? 'provider_attempt_failure_count' : 'provider_failure_unknown_count';
+    breakdown[field] = boundedCount((stats[field] || 0) + 1);
+  }
+  const next = sanitizeProviderFailureDiagnostics({
+    ...stats,
+    ...breakdown,
+    provider_request_failure_count: boundedCount((stats.provider_request_failure_count || 0) + 1),
+    provider_request_failure_ms: boundedCount((stats.provider_request_failure_ms || 0) + boundedCount(failure.elapsedMs)),
+    provider_last_failure_code: failure.code,
+    provider_last_failure_phase: failure.phase,
+    provider_last_failure_source: failure.source,
+    provider_last_failure_event: failure.lastEvent,
+    provider_last_failure_request_sequence: failure.requestSequence,
+    provider_last_failure_http_status: failure.httpStatus,
+  });
+  Object.assign(stats, next);
+  // A later failure without a valid HTTP status must not inherit one.
+  if (next.provider_last_failure_http_status === undefined) delete stats.provider_last_failure_http_status;
+}
+
+function compactString(value: unknown, max = 128): string {
+  return String(value ?? '').trim().slice(0, max);
+}
+
+function boundedCount(value: unknown): number {
+  const count = Math.round(Number(value));
+  if (!Number.isFinite(count) || count < 0) return 0;
+  return Math.min(count, 1_000_000_000);
+}
+
+function closedValue(value: unknown, allowed: Set<string>, fallback: string): string {
+  const normalized = compactString(value, 64).toLowerCase();
+  return allowed.has(normalized) ? normalized : fallback;
+}
+
+
 export interface ModelRunLogDiagnostics {
+  providerRequestFailures: ProviderFailureDiagnostics;
   terminalOutput?: TerminalOutput;
   startedAtMs: number;
   rawEventCount: number;
@@ -748,6 +881,7 @@ export function createModelRunLogDiagnostics(nowMs = Date.now()): ModelRunLogDia
     serverFallbackCount: 0,
     providerCandidateCount: 0,
     providerAvailableCandidateCount: 0,
+    providerRequestFailures: {},
     providerEmptyCount: 0,
     providerEmptyTransportCount: 0,
     providerEmptyNormalCount: 0,
@@ -1308,6 +1442,15 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     stats.toolResultErrors - stats.toolResultErrorsRecovered,
   );
   return {
+    // The shared logger bounds object keys/nodes. Preserve the last-response
+    // evidence before optional activity counters consume that budget.
+    terminal_output: terminalOutputSnapshot(stats.terminalOutput),
+    stopReason: stats.stopReason,
+    errorKind: stats.errorKind,
+    doneRawEventMs: stats.doneRawEventMs,
+    resultTextChars: stats.resultTextChars,
+    resultContentBlocks: stats.resultContentBlocks,
+    providerRequestFailures: sanitizeProviderFailureDiagnostics(stats.providerRequestFailures),
     durationMs: Math.max(0, nowMs - stats.startedAtMs),
     rawEventCount: stats.rawEventCount,
     streamEventCount: stats.streamEventCount,
@@ -1360,16 +1503,10 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     firstClientEventMs: stats.firstClientEventMs,
     firstTextDeltaMs: stats.firstTextDeltaMs,
     firstToolMs: stats.firstToolMs,
-    doneRawEventMs: stats.doneRawEventMs,
     providerDurationMs: stats.providerDurationMs,
     provider: stats.provider,
     model: stats.model,
-    stopReason: stats.stopReason,
-    errorKind: stats.errorKind,
     usage: stats.usage,
-    terminal_output: terminalOutputSnapshot(stats.terminalOutput),
-    resultTextChars: stats.resultTextChars,
-    resultContentBlocks: stats.resultContentBlocks,
     toolLoops: stats.toolLoops,
     skillsLoadedCount: stats.skillsLoadedCount,
     transientToolErrors: stats.transientToolErrors,
@@ -1932,6 +2069,16 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       onCandidateChosen: (info) => {
         recorder.setActiveCandidate(info);
       },
+      onRequestFailure: (failure) => {
+        recordProviderRequestFailure(diagnostics.providerRequestFailures, failure);
+        const safeFailure: ProviderFailureDiagnostics = {};
+        recordProviderRequestFailure(safeFailure, { ...failure, aborted: false });
+        log.warn('provider request failed', {
+          session_id: turnLogContext.session_id, turn_id: turnLogContext.turn_id,
+          cid: turnLogContext.cid, session_kind: turnLogContext.session_kind,
+          ...sanitizeProviderFailureDiagnostics(safeFailure), aborted: failure.aborted,
+        });
+      },
       onCandidatesObserved: (info) => {
         diagnostics.providerCandidateCount = Math.max(
           diagnostics.providerCandidateCount,
@@ -2192,11 +2339,17 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       yield outgoing;
     }
     log.info('model turn stream drained', {
-      ...turnLogContext,
+      session_id: turnLogContext.session_id,
+      turn_id: turnLogContext.turn_id,
+      cid: turnLogContext.cid,
+      session_kind: turnLogContext.session_kind,
+      provider: turnLogContext.provider,
+      model: turnLogContext.model,
       mapped_events: eventCount,
       final_chars: finalText.length,
       has_error: !!errText,
       diagnostics: summarizeModelRunForLog(diagnostics),
+      context: turnLogContext,
     });
 
     // Metacognitive reflection is no longer triggered per-turn — it now
@@ -2369,16 +2522,23 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       agentRunResult?.meta.timings || snapshotLiveRunTimings(liveRunTimings),
     );
     log.info('model turn finish', {
-      ...turnLogContext,
+      session_id: turnLogContext.session_id,
+      turn_id: turnLogContext.turn_id,
+      cid: turnLogContext.cid,
+      session_kind: turnLogContext.session_kind,
+      provider: turnLogContext.provider,
+      model: turnLogContext.model,
       status: terminalStatus,
       aborted: abortedFlag,
       idle_hit: idleHit,
       idle_window_sec: idleHit ? idleHitWindow : undefined,
       final_chars: finalText.length,
       has_error: !!errText,
+      failure_code: terminalFailureCode || undefined,
       error: errText ? logErrorRef(new Error(errText)) : undefined,
       timings: timingSummary,
       diagnostics: summarizeModelRunForLog(diagnostics),
+      context: turnLogContext,
     });
     try { recorder.finish({ text: finalText, aborted: abortedFlag, error: errText }); }
     catch (err) { log.warn('archive finish failed', { error: logErrorRef(err) }); }

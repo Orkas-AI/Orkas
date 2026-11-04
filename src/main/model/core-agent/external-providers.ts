@@ -301,7 +301,7 @@ export function buildMoonshotModel(
     baseUrl: MOONSHOT_BASE_URL,
     reasoning: protocol?.reasoning ?? false,
     ...(protocol?.thinkingLevelMap
-      ? { thinkingLevelMap: { ...protocol.thinkingLevelMap } }
+      ? { thinkingLevelMap: { ...protocol.thinkingLevelMap as object } }
       : {}),
     input: modelInputFromConfiguredCapabilities(
       protocol ? [...protocol.input] : ['text', 'image'],

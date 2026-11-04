@@ -24,6 +24,7 @@ import {
   draftComposition,
   inspectComposition,
   inspectVideoReference,
+  checkCompositionScenes,
   lintComposition,
   prepareComposition,
   snapshotComposition,
@@ -35,6 +36,11 @@ import {
   type VideoStudioOp,
   type VideoStudioResult,
 } from '../../features/video_studio';
+import {
+  captureProductSource,
+  normalizeProductCaptureClips,
+  normalizeProductCaptureSelectors,
+} from '../../features/video_studio_product_capture';
 import {
   buildCompositionNarrationMap,
   buildCompositionScaffold,
@@ -579,6 +585,11 @@ function draftRenderedThisTurnStop(): Record<string, unknown> {
  * explicitly on a detected mismatch. Read/QA/render ops keep working — the
  * degraded mode is "produce and show, but no gate decisions".
  */
+/** Operations the handler still accepts from older rollouts but no longer
+ * offers to the model. The P3 design review is advisory: nothing blocks on it
+ * and no skill asks for it, so its op and parameters only cost context. */
+const MODEL_HIDDEN_OPS = new Set<string>(['composition.submit_design_review']);
+
 const CONTRACT_SENSITIVE_OPS = new Set<string>([
   'production.edit',
   'composition.approve_plan',
@@ -820,6 +831,7 @@ export interface VideoStudioToolOpts {
 
 const OPS = new Set<VideoStudioOp>([
   'reference.inspect',
+  'product.capture',
   'production.edit',
   'production.status',
   'production.approve_plan',
@@ -837,6 +849,7 @@ const OPS = new Set<VideoStudioOp>([
   'composition.draft',
   'composition.export',
   'composition.snapshot',
+  'composition.scene_check',
   'composition.submit_design_review',
   'composition.approve_draft',
   'speech.capabilities',
@@ -895,6 +908,24 @@ function resolvePath(ctx: ToolContext, opts: VideoStudioToolOpts, raw: string, r
     if (isPathAllowed(candidate, roots)) return candidate;
   }
   return path.resolve(defaultRoot(opts, ctx), value);
+}
+
+/** Where speech.transcribe saves a transcript nobody named: the project's
+ * transcripts folder, keyed by the source path so re-transcribing a file
+ * replaces its own transcript and same-named sources do not collide. A Luna
+ * drive on 2026-10-31 omitted transcript_path, the transcript lived only in
+ * that turn's result, and each later turn reported the ingest records missing.
+ * Undefined outside the allowed roots: the transcript is then only returned. */
+function defaultTranscriptAbsPath(
+  ctx: ToolContext,
+  opts: VideoStudioToolOpts,
+  inputAbsPath: string,
+  roots: string[],
+): string | undefined {
+  const stem = path.parse(inputAbsPath).name.replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+  const id = crypto.createHash('sha256').update(path.resolve(inputAbsPath)).digest('hex').slice(0, 8);
+  const candidate = resolvePath(ctx, opts, path.join('project', 'transcripts', `${stem || 'media'}-${id}.json`), roots);
+  return isPathAllowed(candidate, roots) ? candidate : undefined;
 }
 
 function withExtension(absPath: string, ext: string): string {
@@ -1375,6 +1406,62 @@ function artifactsShowAuthoredVisuals(
     return baseline.scaffold_html_sha256 !== current.html_sha256;
   }
   return !!currentHtml && !currentHtml.includes('ORKAS-GENERATED-SCAFFOLD');
+}
+
+/** Read-only recovery facts. Saved approval state and observed files remain
+ * separate: missing cache fields are not missing files, and an old ready
+ * entry is not proof that its inputs are still current. */
+async function currentDraftStatus(
+  compositionDirAbs: string,
+  state: VideoProductionStateV1,
+  artifacts: VideoProductionArtifactState,
+  roots: string[],
+): Promise<Record<string, unknown> | undefined> {
+  const draft = state.draft;
+  if (!draft) return undefined;
+  const mediaPath = draft.path && isPathAllowed(draft.path, roots) ? draft.path : undefined;
+  const reportPath = draft.report_path && isPathAllowed(draft.report_path, roots) ? draft.report_path : undefined;
+  const [mediaStat, reportStat, signature] = await Promise.all([
+    mediaPath ? fs.stat(mediaPath).catch(() => null) : null,
+    reportPath ? fs.stat(reportPath).catch(() => null) : null,
+    draft.validation_version >= 5
+      ? artifacts.composition_signature
+      : videoStudioGateSignature(compositionDirAbs, draft),
+  ]);
+  let qaSummary: Record<string, unknown> | undefined;
+  // Reports can contain large per-frame evidence. Bound both the read and
+  // projection; the full report remains available at the scoped locator.
+  if (reportPath && reportStat?.isFile() && reportStat.size <= 256 * 1024) {
+    const handle = await fs.open(reportPath, 'r').catch(() => null);
+    if (handle) {
+      try {
+        const buffer = Buffer.alloc(256 * 1024 + 1);
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+        if (bytesRead <= 256 * 1024) {
+          const report = JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
+          if (report && typeof report === 'object' && !Array.isArray(report)) {
+            qaSummary = {
+              ...(typeof report.ok === 'boolean' ? { ok: report.ok } : {}),
+              ...(typeof report.video_qa?.ok === 'boolean'
+                ? { video_qa_ok: report.video_qa.ok } : {}),
+              ...(typeof report.steps?.media_qa?.ok === 'boolean'
+                ? { media_qa_ok: report.steps.media_qa.ok } : {}),
+            };
+          }
+        }
+      } catch { /* Missing or malformed evidence is not a passing QA claim. */ }
+      finally { await handle.close(); }
+    }
+  }
+  return {
+    status: draft.status,
+    ...(mediaPath ? { path: mediaPath } : {}),
+    ...(reportPath ? { report_path: reportPath } : {}),
+    input_signature_current: draft.signature === signature,
+    media_exists: !!mediaStat?.isFile(),
+    report_exists: !!reportStat?.isFile(),
+    ...(qaSummary && Object.keys(qaSummary).length ? { qa_summary: qaSummary } : {}),
+  };
 }
 
 function videoStudioRuntimeFingerprint(): string {
@@ -2967,6 +3054,65 @@ export function edlNarrationBudgetIssues(plan: Record<string, unknown>): Array<{
   return issues;
 }
 
+/** Every narration or caption line whose `segment_id` names a segment it does
+ * not start inside on the finished video: primaries play back to back in
+ * `order`, and an overlay shares the window of the primary it sits `over`.
+ * Host twin of the stage-plan validator's E_TRACK_LINE_OUTSIDE_SEGMENT, run at
+ * Gate B because that validator runs only when the model calls it. On
+ * 2026-10-30 lines timed by stacking the source clips' lengths played 4-5 s
+ * ahead of their footage. Lines without `segment_id`, ids the validator
+ * reports as unknown, and plans with an ambiguous primary order are skipped. */
+export function edlTrackLineSegmentIssues(plan: Record<string, unknown>): Array<{
+  track: 'narration' | 'captions';
+  index: number;
+  segment_id: string;
+  start_sec: number;
+  window_start_sec: number;
+  window_end_sec: number;
+}> {
+  const isNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+  const isText = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+  const segments = (Array.isArray(plan.segments) ? plan.segments : []).filter(isIntentRecord);
+  const primaries = segments.filter((segment) => segment.layer === 'primary');
+  if (primaries.some((segment) => !isText(segment.id) || !isNumber(segment.order)
+    || !isNumber(segment.target_sec) || segment.target_sec <= 0)
+    || new Set(primaries.map((segment) => segment.order)).size !== primaries.length) {
+    return [];
+  }
+  const windows = new Map<string, { start: number; end: number }>();
+  let at = 0;
+  for (const segment of [...primaries].sort((a, b) => (a.order as number) - (b.order as number))) {
+    windows.set(segment.id as string, { start: at, end: at + (segment.target_sec as number) });
+    at += segment.target_sec as number;
+  }
+  const primaryIds = new Set(windows.keys());
+  for (const segment of segments) {
+    if (segment.layer === 'primary' || !isText(segment.id) || !isText(segment.over)) continue;
+    if (primaryIds.has(segment.over)) windows.set(segment.id, windows.get(segment.over)!);
+  }
+  const round1 = (value: number) => Math.round(value * 10) / 10;
+  const issues: ReturnType<typeof edlTrackLineSegmentIssues> = [];
+  const check = (track: 'narration' | 'captions', line: unknown, index: number) => {
+    if (!isIntentRecord(line) || !isText(line.text) || !isText(line.segment_id) || !isNumber(line.start_sec)) return;
+    const window = windows.get(line.segment_id);
+    if (!window || (line.start_sec >= window.start - 0.05 && line.start_sec < window.end)) return;
+    issues.push({
+      track,
+      index,
+      segment_id: line.segment_id,
+      start_sec: line.start_sec,
+      window_start_sec: round1(window.start),
+      window_end_sec: round1(window.end),
+    });
+  };
+  const tracks = isIntentRecord(plan.tracks) ? plan.tracks : {};
+  const narration = isIntentRecord(tracks.narration) ? tracks.narration : {};
+  (Array.isArray(narration.segments) ? narration.segments : []).forEach((line, index) => check('narration', line, index));
+  const captions = isIntentRecord(tracks.captions) ? tracks.captions : {};
+  (Array.isArray(captions.lines) ? captions.lines : []).forEach((line, index) => check('captions', line, index));
+  return issues;
+}
+
 /** Every segment reports produced bytes, so a final artifact is expected to
  * exist and the delivery check has something to check. */
 function videoProductionLooksAssembled(plan: Record<string, unknown>): boolean {
@@ -3478,9 +3624,20 @@ async function runProductionSegmentQa(input: {
       reason: String(record.fact.reason),
     }));
   const mediaUnresolvedIds = new Set(mediaUnresolved.map((item) => item.segment_id));
+  // A cut or generated segment that is not produced yet gets the step that
+  // produces it, neither the broken-path repair nor the composition binding.
+  const unproducedIds = scope.filter((id) => {
+    const record = byId.get(id);
+    return !!record && !record.compositionDir && !record.mediaPath && record.fact.reason === 'not_produced';
+  });
+  const pathInSpecIds = scope.filter((id) => {
+    const record = byId.get(id);
+    return !!record && !record.compositionDir && !record.mediaPath && record.fact.reason === 'produced_path_in_spec';
+  });
   const unknownIds = scope.filter((id) => {
     const record = byId.get(id);
-    return !record?.compositionDir && !record?.mediaPath && !mediaUnresolvedIds.has(id);
+    return !record?.compositionDir && !record?.mediaPath && !mediaUnresolvedIds.has(id)
+      && !unproducedIds.includes(id) && !pathInSpecIds.includes(id);
   });
 
   if (!runnable.length) {
@@ -3497,7 +3654,22 @@ async function runProductionSegmentQa(input: {
       segment_id: segmentId,
       composition_dir: path.posix.join(planDirPosix, 'compositions', segmentId),
     }));
-    const readySheet = input.phase === 'snapshot' && !unknownIds.length && !review.uncaptured_segment_ids.length
+    // Everything captured is a stop only while the user has not answered this
+    // preview. Answered, or captured before their latest message, it is not
+    // shown again: 2026-10-31 runs presented the same preview twice and spent
+    // a user reply on it.
+    const productionReady = !unknownIds.length && !review.uncaptured_segment_ids.length;
+    const previewAnswer = productionReady
+      ? await productionPreviewAnswer(input.opts, input.planPathAbs, records, review.segments)
+      : 'unseen';
+    const answeredMessage = previewAnswer === 'granted'
+      ? 'The user already gave the go-ahead for this whole-video preview. Draft the composition segments and assemble the video; do not show the preview again.'
+      : previewAnswer === 'reply_pending'
+        ? "These frames were captured before the user's latest message, so that message is their answer to this preview: if it names no change, "
+          + 'call composition.draft for each composition segment and assemble; if it names a change, apply only that change. '
+          + 'Do not show the same preview again.'
+        : '';
+    const readySheet = input.phase === 'snapshot' && productionReady && !answeredMessage
       ? await composeProductionContactSheet(input.opts, input.planPathAbs, records)
       : '';
     const mediaUnresolvedMessage = mediaUnresolved.length
@@ -3505,15 +3677,27 @@ async function runProductionSegmentQa(input: {
         + `(${mediaUnresolved.map((item) => `${item.segment_id}: ${item.reason}`).join('; ')}). Fix that segment's produced_path in the plan `
         + '— a relative path resolves from the video directory — or place the file where it points. Do NOT author a composition for a media segment. '
       : '';
+    const unproducedMessage = unproducedIds.length
+      ? `Segment(s) ${unproducedIds.join(', ')} are not produced yet: cut or generate each one, then write its file path `
+        + "to the segment's own produced_path, beside id and source, not inside spec (an execution fact; the approval stays). "
+        + (mediaUnresolvedMessage ? '' : 'Do NOT author a composition for a media segment. ')
+      : '';
+    const pathInSpecMessage = pathInSpecIds.length
+      ? `Segment(s) ${pathInSpecIds.join(', ')} have produced_path inside spec; the host reads it only on the segment itself, `
+        + 'beside id and source. Move each value out of spec onto its segment; the approval is unaffected. '
+      : '';
+    const mediaPending = mediaUnresolved.length > 0 || unproducedIds.length > 0 || pathInSpecIds.length > 0;
     return {
-      ok: unknownIds.length === 0 && mediaUnresolved.length === 0,
+      ok: unknownIds.length === 0 && !mediaPending,
       op: 'production.segment_qa',
       phase: input.phase,
-      nothing_to_check: unknownIds.length === 0 && mediaUnresolved.length === 0,
+      nothing_to_check: unknownIds.length === 0 && !mediaPending,
       ...(readySheet ? { production_contact_sheet: readySheet } : {}),
       checked_segment_ids: [],
       ...(unknownIds.length ? { unknown_segment_ids: unknownIds, unbound_segments: unbound } : {}),
       ...(mediaUnresolved.length ? { media_unresolved_segments: mediaUnresolved } : {}),
+      ...(unproducedIds.length ? { unproduced_segment_ids: unproducedIds } : {}),
+      ...(pathInSpecIds.length ? { produced_path_in_spec_segment_ids: pathInSpecIds } : {}),
       ...(mediaBackedIds.length ? { media_backed_segment_ids: mediaBackedIds } : {}),
       segments: [],
       production_review: {
@@ -3523,20 +3707,28 @@ async function runProductionSegmentQa(input: {
           .filter((segment) => !segment.captured)
           .map(({ segment_id, reason }) => ({ segment_id, ...(reason ? { reason } : {}) })),
       },
-      message: mediaUnresolvedMessage + (unknownIds.length
+      message: mediaUnresolvedMessage + pathInSpecMessage + unproducedMessage + (unknownIds.length
         ? `No composition is bound to segment(s) ${unknownIds.join(', ')}. For each, call composition.approve_plan with `
           + `plan_path=${path.posix.basename(planDirPosix)}/plan.json, its segment_id, and the composition_dir listed in `
           + 'unbound_segments: that inherits the parent Gate B, creates the directory, and derives '
-          + 'composition-manifest.json from the signed parent. Do not create the directory or author the manifest by hand; '
-          + 'author only index.html afterwards.'
-        : mediaUnresolved.length
+          + 'composition-manifest.json from the signed parent. Do not create the directory or rewrite the derived scenes by hand; '
+          + "afterwards add the manifest's art_direction design contract, then author index.html."
+        : mediaPending
           ? ''
-          : mediaBackedIds.length
-            ? `Segment(s) ${mediaBackedIds.join(', ')} are produced media, not compositions: their file is the review evidence and needs no QA phase. Nothing else in scope needs re-checking.`
-            : 'Every segment is already approved for its current bytes; there is nothing to re-check. Take the production review to the user instead of re-running QA.'),
+          : answeredMessage
+            ? (mediaBackedIds.length
+              ? `Segment(s) ${mediaBackedIds.join(', ')} are produced media, not compositions: their file is the review evidence and needs no QA phase. `
+              : '') + answeredMessage
+            : mediaBackedIds.length
+              ? `Segment(s) ${mediaBackedIds.join(', ')} are produced media, not compositions: their file is the review evidence and needs no QA phase. Nothing else in scope needs re-checking.`
+              : 'Every segment is already approved for its current bytes; there is nothing to re-check. Take the production review to the user instead of re-running QA.'),
       next_action: unknownIds.length
         ? 'author_missing_segments'
-        : mediaUnresolved.length ? 'fix_media_segment_paths' : 'open_production_preview_review',
+        : mediaUnresolved.length ? 'fix_media_segment_paths'
+          : pathInSpecIds.length ? 'move_produced_path_out_of_spec'
+            : unproducedIds.length ? 'produce_listed_segments'
+              : previewAnswer === 'granted' ? 'draft_segments_and_assemble'
+                : previewAnswer === 'reply_pending' ? 'act_on_preview_reply' : 'open_production_preview_review',
     };
   }
 
@@ -3787,6 +3979,8 @@ async function runProductionSegmentQa(input: {
     checked_segment_ids: runnable,
     ...(productionContactSheet ? { production_contact_sheet: productionContactSheet } : {}),
     ...(unknownIds.length ? { unknown_segment_ids: unknownIds } : {}),
+    ...(unproducedIds.length ? { unproduced_segment_ids: unproducedIds } : {}),
+    ...(pathInSpecIds.length ? { produced_path_in_spec_segment_ids: pathInSpecIds } : {}),
     ...(mediaBackedIds.length ? { media_backed_segment_ids: mediaBackedIds } : {}),
     failed_segment_ids: failed,
     segments,
@@ -4590,13 +4784,24 @@ async function videoProductionSegmentReviewRecords(input: {
     if (!mediaPath) {
       // A media-typed segment whose file does not resolve is NOT a missing
       // composition — prescribing "author one" for it wedged the 2026-08-23
-      // run against E_PARENT_SEGMENT_NOT_A_COMPOSITION.
+      // run against E_PARENT_SEGMENT_NOT_A_COMPOSITION. A cut or generated
+      // segment with no produced_path is not produced yet rather than a broken
+      // path; user-provided footage is referenced at approval, so its gap is.
+      const notProduced = mediaTyped && !producedPath && planSegment?.source !== 'provided';
+      // A path written into spec is read nowhere; saying "not produced" there
+      // sent a 2026-10-31 run back to rewrite spec.produced_path for six turns.
+      const segmentSpec = planSegment?.spec && typeof planSegment.spec === 'object' && !Array.isArray(planSegment.spec)
+        ? planSegment.spec as Record<string, unknown>
+        : {};
+      const specProducedPath = typeof segmentSpec.produced_path === 'string' ? segmentSpec.produced_path.trim() : '';
       return {
         fact: {
           segment_id: segmentId,
           visual_signature: '',
           captured: false,
-          reason: mediaTyped ? 'media_path_unresolved' as const : 'no_composition' as const,
+          reason: !mediaTyped ? 'no_composition' as const
+            : notProduced ? (specProducedPath ? 'produced_path_in_spec' as const : 'not_produced' as const)
+              : 'media_path_unresolved' as const,
         },
         ...(producedPath ? { producedPath } : {}),
       };
@@ -6085,6 +6290,26 @@ export async function recordVideoStudioGate(
   const artifacts = await videoProductionArtifacts(compositionDirAbs);
   const signature = artifacts.composition_signature;
   const visualSignature = artifacts.visual_signature;
+  const previous = kind === 'preview'
+    ? await readVideoProductionState(statePath, compositionDirAbs)
+    : undefined;
+  const draft = previous?.draft;
+  const canPreserveDraft = !!draft && (draft.validation_version === 5
+    ? draft.signature === signature
+    : (await checkVideoStudioGateSignature(compositionDirAbs, draft)).matches);
+  if (canPreserveDraft) {
+    const files = await Promise.all([draft!.path, draft!.report_path].map(async (file) => {
+      if (!file) return false;
+      try { return (await fs.stat(file)).isFile(); }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw err;
+      }
+    }));
+    if (files.some((exists) => !exists)) {
+      throw new Error('E_DRAFT_ARTIFACT_UNAVAILABLE: The recorded draft media or report is missing. Preview capture did not replace the saved draft state.');
+    }
+  }
   const framePaths = Array.isArray(result.frame_paths)
     ? result.frame_paths
       .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
@@ -6129,8 +6354,12 @@ export async function recordVideoStudioGate(
       } : {}),
     };
     if (kind === 'preview') {
-      delete state.draft;
-      state.stage = 'preview_ready';
+      // Recapturing unchanged inputs adds preview evidence, not a new draft
+      // revision. Preserve the existing review/approval/export frontier.
+      if (!canPreserveDraft) {
+        delete state.draft;
+        state.stage = 'preview_ready';
+      }
     } else {
       state.stage = 'draft_ready';
     }
@@ -6158,7 +6387,7 @@ export async function recordVideoStudioGate(
       stage: state.stage,
       artifacts,
     });
-  });
+  }, previous ? { expectedRevision: previous.revision } : {});
   return true;
 }
 
@@ -6451,9 +6680,13 @@ async function grantVisualQaCycleOnUserTurn(input: {
 async function currentProductionPreviewReview(
   opts: VideoStudioToolOpts,
   planPath: string,
-): Promise<{ signature: string; uncaptured: Array<{ segment_id: string; reason?: string }> }> {
+): Promise<{
+  signature: string;
+  uncaptured: Array<{ segment_id: string; reason?: string }>;
+  records: SegmentReviewRecord[];
+}> {
   const identity = await readVideoProductionPlanIdentity(planPath).catch(() => null);
-  if (!identity) return { signature: '', uncaptured: [] };
+  if (!identity) return { signature: '', uncaptured: [], records: [] };
   const records = await videoProductionSegmentReviewRecords({
     opts,
     planPathAbs: planPath,
@@ -6470,24 +6703,74 @@ async function currentProductionPreviewReview(
       uncaptured: review.segments
         .filter((segment) => !segment.captured)
         .map(({ segment_id, reason }) => ({ segment_id, ...(reason ? { reason } : {}) })),
+      records,
     };
   }
   return {
-    signature: crypto.createHash('sha256').update(stableJson(review.segments.map((segment) => ({
-      segment_id: segment.segment_id,
-      visual_signature: segment.visual_signature,
-    })))).digest('hex'),
+    signature: productionVisualSignature(review.segments),
     uncaptured: [],
+    records,
   };
+}
+
+/** The production's whole-video visual identity: segment order plus each
+ *  segment's current visual bytes. */
+function productionVisualSignature(segments: Array<{ segment_id: string; visual_signature: string }>): string {
+  return crypto.createHash('sha256').update(stableJson(segments.map((segment) => ({
+    segment_id: segment.segment_id,
+    visual_signature: segment.visual_signature,
+  })))).digest('hex');
+}
+
+/** Whether the user has answered the production's current whole-video
+ *  preview: its go-ahead is recorded, or every composition was captured
+ *  before the user's latest message (the reply composition.draft would
+ *  record as that go-ahead), or neither. */
+async function productionPreviewAnswer(
+  opts: VideoStudioToolOpts,
+  planPathAbs: string,
+  records: SegmentReviewRecord[],
+  segments: Array<{ segment_id: string; visual_signature: string }>,
+): Promise<'granted' | 'reply_pending' | 'unseen'> {
+  const control = await readVideoProductionControlState(
+    videoProductionControlStatePath({ userId: opts.userId, planPath: planPathAbs }),
+    planPathAbs,
+  ).catch(() => null);
+  const planSignature = String(control?.plan_approval?.signature || control?.plan_signature || '');
+  const goAhead = control?.preview_go_ahead;
+  if (goAhead && planSignature && goAhead.plan_signature === planSignature
+    && goAhead.visual_signature === productionVisualSignature(segments)) {
+    return 'granted';
+  }
+  const currentTurn = String(opts.turnId || '');
+  if (!currentTurn || !currentUserTurnAvailable(opts.userMessage)) return 'unseen';
+  const compositions = records.filter((record) => record.statePath && record.compositionDir);
+  if (!compositions.length) return 'unseen';
+  const captureTurns = await Promise.all(compositions.map(async (record) => {
+    const state = await readVideoProductionState(record.statePath!, record.compositionDir!).catch(() => null);
+    return String(state?.preview?.turn_id || '');
+  }));
+  return captureTurns.every((turn) => !!turn && turn !== currentTurn) ? 'reply_pending' : 'unseen';
+}
+
+/** "id (reason), ..." for the production segments a preview cannot count yet. */
+function productionUncapturedText(uncaptured: Array<{ segment_id: string; reason?: string }>): string {
+  return uncaptured.map((item) => `${item.segment_id} (${item.reason || 'unknown'})`).join(', ');
 }
 
 /** Has this segment's production already had its current visual preview stop answered? */
 async function productionPreviewGoAheadGranted(
   opts: VideoStudioToolOpts,
   state: VideoProductionStateV1,
-): Promise<{ granted: boolean; uncaptured: Array<{ segment_id: string; reason?: string }> }> {
+): Promise<{
+  granted: boolean;
+  uncaptured: Array<{ segment_id: string; reason?: string }>;
+  /** The parent plan and its segment records, for composing the whole-video sheet. */
+  planPath: string;
+  records: SegmentReviewRecord[];
+}> {
   const link = parentEdlLinkOf(state);
-  if (!link.segmentId || !link.planPath) return { granted: false, uncaptured: [] };
+  if (!link.segmentId || !link.planPath) return { granted: false, uncaptured: [], planPath: '', records: [] };
   const control = await readVideoProductionControlState(
     videoProductionControlStatePath({ userId: opts.userId, planPath: link.planPath }),
     link.planPath,
@@ -6495,13 +6778,30 @@ async function productionPreviewGoAheadGranted(
   const goAhead = control?.preview_go_ahead;
   const signature = String(control?.plan_approval?.signature || control?.plan_signature || '');
   const review = await currentProductionPreviewReview(opts, link.planPath);
-  if (!goAhead) return { granted: false, uncaptured: review.uncaptured };
+  if (!goAhead) return { granted: false, uncaptured: review.uncaptured, planPath: link.planPath, records: review.records };
   return {
     granted: !!signature
       && !!review.signature
       && goAhead.plan_signature === signature
       && goAhead.visual_signature === review.signature,
     uncaptured: review.uncaptured,
+    planPath: link.planPath,
+    records: review.records,
+  };
+}
+
+/** The production's one preview stop, led by its whole-video sheet instead of
+ *  the drafting segment's own frames. Same stop and next action; only the
+ *  artifact changes, because a 2026-10-31 run showed a title-card-only
+ *  preview here and the whole video one turn later. */
+function productionWidePreviewStop(stop: Record<string, unknown>, sheet: string): Record<string, unknown> {
+  const { frame_paths: _childFrames, frame_paths_omitted: _omitted, ...rest } = stop;
+  return {
+    ...rest,
+    message: 'The whole video is captured and the user has not answered its preview yet. Do not retry this call — it cannot succeed until they reply. '
+      + 'Write the keyframe preview message now: lead with the whole-video contact_sheet below, list each segment\'s locator in playback order, '
+      + 'invite changes in one line, end the turn with the interaction marker, and render on their next reply.',
+    contact_sheet: sheet,
   };
 }
 
@@ -6544,19 +6844,42 @@ function keyframePreviewStopBlock(input: {
     if (userRepliedSinceCapture) {
       const uncaptured = input.productionUncaptured || [];
       const detail = uncaptured.length
-        ? `segment(s) without a reviewable capture: ${uncaptured.map((item) => `${item.segment_id} (${item.reason || 'unknown'})`).join(', ')}`
+        ? `segment(s) without a reviewable capture: ${productionUncapturedText(uncaptured)}`
         : 'the recorded review no longer matches the current plan/visual signatures';
       return {
         ok: false,
         op: 'composition.draft',
         errorCode: 'E_PRODUCTION_REVIEW_INCOMPLETE',
         message: `The user already replied, but the production preview go-ahead cannot bind — ${detail}. `
-          + "Repair that in this turn (media_path_unresolved: fix the plan's produced_path or place the file where it points; "
+          + 'Repair that in this turn (not_produced: cut or generate it and write its produced_path; '
+          + 'produced_path_in_spec: move spec.produced_path onto the segment itself; '
+          + "media_path_unresolved: fix the plan's produced_path or place the file where it points; "
           + 'no_snapshot/snapshot_stale: re-run production.segment_qa phase=snapshot; no_composition: bind it via '
           + 'composition.approve_plan), then retry composition.draft in this same turn — the recorded reply grants the '
           + 'go-ahead automatically. Do not ask the user to confirm again.',
         ...(uncaptured.length ? { uncaptured_segments: uncaptured } : {}),
         next_action: 'repair_listed_segments_then_retry_composition.draft',
+      };
+    }
+    // Nothing has been shown yet. While other segments have no frames there is
+    // no whole-video preview to stop on, and this segment's own frames are not
+    // one: the 2026-10-31 runs stopped on a title-card-only preview and spent a
+    // user reply on it.
+    const pending = input.productionUncaptured || [];
+    if (pending.length) {
+      return {
+        ok: false,
+        op: 'composition.draft',
+        errorCode: 'E_PRODUCTION_PREVIEW_NOT_READY',
+        message: `This segment renders after the whole-video preview, and that preview is not ready: ${productionUncapturedText(pending)}. `
+          + 'Produce those segments, then run production.segment_qa phase=snapshot and present its production_contact_sheet as the one preview stop. '
+          + "Do not stop on this segment's frames.",
+        uncaptured_segments: pending,
+        requires_user_decision: false,
+        next_step_owner: 'agent',
+        same_turn_continuation_required: true,
+        billable_request_sent: false,
+        next_action: 'produce_remaining_segments_then_present_production_preview',
       };
     }
   } else {
@@ -6776,7 +7099,10 @@ async function videoStudioReferenceReviewRequirement(compositionDirAbs: string):
  *  replaced carried no error code, no next action, and no argument name — the
  *  same string answered a missing `plan_path` and a `speech.transcribe`
  *  `input_path`, so the model could not tell which of its arguments was wrong
- *  or whether the file was absent or merely a directory (2026-08-09 run). */
+ *  or whether the file was absent or merely a directory (2026-08-09 run).
+ *  A missing `plan_path` is the normal state before planning, so it names the
+ *  step that writes the plan: "retry with the path that holds the file" read
+ *  as a lost plan, and the 2026-10-31 runs reported one and ended the turn. */
 async function ensureInputFile(
   absPath: string,
   argument: 'plan_path' | 'input_path' | 'delivered_video_path',
@@ -6784,13 +7110,16 @@ async function ensureInputFile(
   const st = await fs.stat(absPath).catch(() => null);
   if (st?.isFile()) return null;
   const missing = !st;
+  const unwrittenPlan = missing && argument === 'plan_path';
   return resultContent({
     ok: false,
     errorCode: missing ? 'E_INPUT_FILE_NOT_FOUND' : 'E_INPUT_NOT_A_FILE',
-    message: missing
-      ? `${argument} does not exist here yet: ${absPath}`
-      : `${argument} names a directory, not a file: ${absPath}`,
-    next_action: 'retry_with_the_path_that_holds_the_file',
+    message: unwrittenPlan
+      ? `No production plan exists at ${absPath} yet. Write it with stage-plan (ingest the sources, write the plan, run validate and promise_check), then call this operation again; if the plan is at another path, pass that path as plan_path.`
+      : missing
+        ? `${argument} does not exist here yet: ${absPath}`
+        : `${argument} names a directory, not a file: ${absPath}`,
+    next_action: unwrittenPlan ? 'author_plan_with_stage_plan_then_retry' : 'retry_with_the_path_that_holds_the_file',
   });
 }
 
@@ -9304,22 +9633,22 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
   const inner: AgentTool = {
     name: 'video_studio',
     description:
-      'Inspect reference video frames, manage durable EDL approvals, billable generation authorization, signed HTML video production, speech capabilities, and transcription.',
+      'Inspect reference videos, capture product pages, run EDL approvals and billable generation, produce signed HTML video, and handle speech and transcription.',
     inputSchema: {
       type: 'object',
       properties: {
         op: {
           type: 'string',
-          enum: [...OPS],
-          description: 'Keyframe preview must end the current turn; draft resumes after a later real user reply. No preview-approval op. Retry exhaustion allows one fresh turn to approve one narration materialize call; never reuse an old turn.',
+          enum: [...OPS].filter(op => !MODEL_HIDDEN_OPS.has(op)),
+          description: 'Keyframe preview must end the current turn; draft resumes after a later real user reply. No preview-approval op. Retry exhaustion allows one fresh turn to approve one narration materialize call; never reuse an old turn. production.edit only re-captions one completed generated clip.',
         },
-        plan_path: { type: 'string', description: 'Canonical project/plan.json for production.* operations. composition.* operations take it only with segment_id, to inherit that approved parent plan\'s compose segment; omit both for a standalone composition.' },
-        delivered_video_path: { type: 'string', description: 'Final video for production.status. Direct model output receives a readable-video check and advisory spec differences; locally assembled output also checks timing, canvas, narration, loudness, and captions.' },
-        segment_id: { type: 'string', description: 'Parent EDL compose segment id for AUTO child-composition inheritance; requires plan_path.' },
-        composition_dir: { type: 'string', description: 'Directory containing composition-manifest.json and generated index.html; prepare may run before index.html exists.' },
+        plan_path: { type: 'string', description: 'project/plan.json for production.*; on composition.* only with segment_id (AUTO child). Omit both for a standalone composition.' },
+        delivered_video_path: { type: 'string', description: 'production.status: the final video to check (readability; local assemblies also timing, canvas, narration, loudness, captions).' },
+        segment_id: { type: 'string', description: 'AUTO parent compose segment id; requires plan_path.' },
+        composition_dir: { type: 'string', description: 'Folder with composition-manifest.json and index.html (prepare may run before index.html exists).' },
         decision_evidence: {
           type: 'object',
-          description: 'Natural-language replies only: native object with a decision and verbatim current-turn excerpt; never a bare reply or quoted JSON. Omit for forms. The host validates provenance and gate before approval or billing.',
+          description: 'An object, not a string: the decision and a verbatim quote from the current user reply. Omit for form submissions; the host checks it before approval or billing.',
           properties: {
             source: { type: 'string', enum: ['user_message'] },
             gate: { type: 'string', enum: ['plan', 'generation', 'narration_retry', 'preview', 'draft', 'qa_waiver'] },
@@ -9328,47 +9657,38 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           },
           required: ['source', 'gate', 'decision', 'quote'],
         },
-        task_title: { type: 'string', description: 'For composition.approve_plan, optional one-line user-language deliverable title shown instead of the directory path. Display-only; not part of approval identity and does not reopen a gate.' },
-        expected_plan_change: { type: 'boolean', description: 'True only when composition.approve_plan consumes an approved production-plan amendment; fails unless the signed manifest signature changed.' },
-        output_path: { type: 'string', description: 'For draft/export: required path outside composition_dir, preferably project/render. For snapshot: optional, defaults to preview/first-frame.png, and paths inside composition_dir are relocated under preview/.' },
-        report_path: { type: 'string', description: 'Optional JSON QA report path for composition.draft/export. It must be outside composition_dir; use project/render.' },
-        findings_path: { type: 'string', description: 'Optional JSON path for inspect/snapshot/draft findings. Paths inside composition_dir are relocated under qa/ so runtime evidence does not invalidate the signature.' },
-        quality: { type: 'string', enum: ['draft', 'standard', 'high'], description: 'Render quality; draft uses lower fps/CRF. composition.export defaults to high; pass a lower value only when the user explicitly accepted a faster lower-quality final delivery.' },
+        task_title: { type: 'string', description: 'composition.approve_plan: optional one-line title in the user\'s language, display only.' },
+        expected_plan_change: { type: 'boolean', description: 'True only when approve_plan applies an approved plan amendment; fails if the signed manifest did not change.' },
+        output_path: { type: 'string', description: 'draft/export: required, outside composition_dir (use project/render). snapshot: optional, defaults to preview/first-frame.png.' },
+        report_path: { type: 'string', description: 'Optional QA report JSON for draft/export, outside composition_dir (project/render).' },
+        findings_path: { type: 'string', description: 'Optional findings JSON for inspect/snapshot/draft; paths inside composition_dir move to qa/.' },
+        quality: { type: 'string', enum: ['draft', 'standard', 'high'], description: 'Render quality. export defaults to high; go lower only if the user accepted a faster lower-quality final.' },
         fps: { type: 'number', description: 'Frames per second, capped at 60.' },
-        strict_render_settings: { type: 'boolean', description: 'Set true only when the user explicitly requires exact fps/render settings. Default false lets final export choose the highest safe fps without another confirmation.' },
-        format: { type: 'string', enum: ['mp4', 'webm'], description: 'Output video format. Default mp4.' },
+        strict_render_settings: { type: 'boolean', description: 'True only when the user requires exact fps/render settings; otherwise export picks the best safe fps.' },
+        format: { type: 'string', enum: ['mp4', 'webm'], description: 'Default mp4.' },
         variables: { type: 'object', description: 'Optional composition variables exposed as window.__ORKAS_VIDEO_VARIABLES__.' },
-        visual_baseline_path: { type: 'string', description: 'Optional visual baseline JSON path for advisory preview/draft regression checks.' },
-        update_visual_baseline: { type: 'boolean', description: 'Explicitly promote current sampled preview/draft frames to the visual baseline. Never enabled automatically.' },
-        waive_qa_findings: { type: 'array', items: { type: 'string' }, description: 'QA codes to waive for inspect/snapshot/draft or production.segment_qa. Requires current-turn decision_evidence with gate=qa_waiver. Waivers persist as informational; evidence-integrity findings cannot be waived.' },
-        voice: { type: 'string', description: 'Legacy schema_version 1 compatibility only. New manifests must use the production-plan-confirmed audio.narration_intent from speech.capabilities.' },
-        speed: { type: 'number', description: 'Legacy schema_version 1 compatibility only. New manifests read speed from the production-plan-confirmed audio.narration_intent.' },
-        review_verdict: { type: 'string', enum: ['passed', 'repair', 'blocked'], description: 'Structured design-review verdict for composition.submit_design_review. passed requires review_findings to be omitted or []; repair and blocked require one or more concrete unresolved findings.' },
-        review_scope: { type: 'string', description: 'What the design review inspected (contact sheet, sampled frames, hierarchy, typography, rhythm).' },
-        review_findings: { type: 'array', items: { type: 'string' }, description: 'Unresolved visual defects. For review_verdict=passed, omit this field or send []; do not put positive observations or a pass summary here. For repair or blocked, send one or more concrete findings.' },
-        quality_scores: {
-          type: 'object',
-          description: 'Evidence-based 0-100 design scores. cover_communication is always required; reference_fidelity is additionally required for concrete visual references.',
-          properties: {
-            content_alignment: { type: 'number' },
-            cover_communication: { type: 'number' },
-            hierarchy: { type: 'number' },
-            text_legibility: { type: 'number' },
-            motion_readiness: { type: 'number' },
-            specificity: { type: 'number' },
-            reference_fidelity: { type: 'number' },
-          },
-          required: ['content_alignment', 'cover_communication', 'hierarchy', 'text_legibility', 'motion_readiness', 'specificity'],
-        },
-        reviewed_frame_paths: { type: 'array', items: { type: 'string' }, description: 'Every returned snapshot frame path actually inspected during a preview design review. Required to cover the complete current preview frame set before the preview can be shown.' },
+        visual_baseline_path: { type: 'string', description: 'Optional baseline JSON for advisory preview/draft regression checks.' },
+        update_visual_baseline: { type: 'boolean', description: 'Promote the current sampled frames to the visual baseline; never automatic.' },
+        waive_qa_findings: { type: 'array', items: { type: 'string' }, description: 'QA codes to waive; needs current-turn decision_evidence with gate=qa_waiver. Evidence-integrity findings cannot be waived.' },
+        voice: { type: 'string', description: 'Legacy schema v1 only; new manifests use audio.narration_intent.' },
+        speed: { type: 'number', description: 'Legacy schema v1 only; new manifests use audio.narration_intent.' },
         phase: { type: 'string', enum: ['lint', 'inspect', 'snapshot'], description: 'QA phase for production.segment_qa.' },
-        segment_ids: { type: 'array', items: { type: 'string' }, description: 'Segments for production.segment_qa. Omit to check every segment the ledger reports as stale or uncaptured.' },
-        input_path: { type: 'string', description: 'Input for speech.transcribe or reference.inspect. Reference inspection reads scoped videos up to 256 MiB, freezes a composition-local copy, and attaches colored source frames before any plan is needed.' },
-        sample_times: { type: 'array', items: { type: 'number', minimum: 0 }, minItems: 1, maxItems: 6, description: 'reference.inspect: distinct source seconds below duration; omit for six distributed samples. Use nearby times to inspect relevant changes.' },
-        transcript_path: { type: 'string', description: 'Optional transcript JSON output path for speech.transcribe.' },
+        segment_ids: { type: 'array', items: { type: 'string' }, description: 'production.segment_qa targets; omit for every stale or uncaptured segment.' },
+        input_path: { type: 'string', description: 'speech.transcribe or reference.inspect input; videos up to 256 MiB, frames are attached.' },
+        url: { type: 'string', description: 'product.capture: the http(s) page to capture into assets/product/.' },
+        clips: {
+          type: 'array',
+          maxItems: 12,
+          description: 'product.capture: page rects (CSS px, 1440 wide) to save at 2x.',
+          items: { type: 'object', properties: { id: { type: 'string' }, x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } }, required: ['x', 'y', 'width', 'height'] },
+        },
+        scene_ids: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 4, description: 'composition.scene_check: start, middle and end frames of these scenes; no QA state.' },
+        selectors: { type: 'array', items: { type: 'string' }, maxItems: 12, description: 'product.capture: CSS selectors (selector_hint) to save at 2x.' },
+        sample_times: { type: 'array', items: { type: 'number', minimum: 0 }, minItems: 1, maxItems: 32, description: 'reference.inspect: source seconds; omit first to get per-shot stills, cuts and BPM.' },
+        transcript_path: { type: 'string', description: 'Transcript JSON output path for speech.transcribe. When omitted, the transcript is saved under project/transcripts/ and its path is returned.' },
         model: { type: 'string', description: 'ASR model id/path. Backend-specific.' },
-        language: { type: 'string', description: 'ASR language code for speech.transcribe, or auto. For speech.capabilities, the deliverable narration language: the listing then carries only the voices verified for it.' },
-        all_voices: { type: 'boolean', description: 'List every eligible voice for speech.capabilities instead of a use-case-diverse sample. Use when the user named a particular voice; the default sample is what a narration choice needs.' },
+        language: { type: 'string', description: 'speech.transcribe: ASR language or auto. speech.capabilities: narration language to list voices for.' },
+        all_voices: { type: 'boolean', description: 'speech.capabilities: list every eligible voice, e.g. when the user named one.' },
         timestamps: { type: 'string', enum: ['segment', 'word'], description: 'ASR timestamp detail.' },
         allow_model_download: { type: 'boolean', description: 'Whether native ASR may download a missing model. Backend-specific.' },
       },
@@ -9376,10 +9696,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
     },
     async execute(input, ctx) {
       const rawOp = String(input.op || '').trim();
-      // Compatibility for an observed model mistake. Keep the schema canonical
-      // so new calls learn the namespaced operation, but do not burn a turn when
-      // an older/resumed rollout sends the unambiguous legacy alias.
-      let op = (rawOp === 'doctor' ? 'composition.doctor' : rawOp) as VideoStudioOp;
+      let op = rawOp as VideoStudioOp;
       if (!OPS.has(op)) {
         return { content: `op must be one of: ${[...OPS].join(', ')}`, isError: true } as ToolResult;
       }
@@ -9409,6 +9726,37 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         const visual = await prepareVideoStudioModelVisual(String(result.contact_sheet));
         if (!visual) return { content: resultContent({ ok: false, op, errorCode: 'E_REFERENCE_IMAGE', message: 'Reference frames could not be attached for inspection.' }), isError: true };
         return { content: resultContent({ ...result, visual_evidence: { attached: true, role: 'reference_source_frames' } }), images: [visual], imageRetention: 'active_turn' };
+      }
+
+      if (op === 'product.capture') {
+        const clips = normalizeProductCaptureClips(input.clips);
+        if ('error' in clips) return { content: resultContent({ ok: false, op, errorCode: 'E_PRODUCT_CAPTURE_INPUT', message: clips.error }), isError: true };
+        const selectors = normalizeProductCaptureSelectors(input.selectors);
+        if ('error' in selectors) return { content: resultContent({ ok: false, op, errorCode: 'E_PRODUCT_CAPTURE_INPUT', message: selectors.error }), isError: true };
+        const writeRoots = [defaultRoot(opts, ctx)].filter(root => isPathAllowed(root, [getWorkspacePath(opts.userId, opts.projectId)]));
+        const compositionDirAbs = resolvePath(ctx, opts, String(input.composition_dir || 'project/composition'), roots);
+        const result = await captureProductSource({ url: String(input.url || ''), compositionDirAbs, writeRoots,
+          clips: clips.clips, selectors: selectors.selectors, signal: ctx.signal });
+        if (!result.ok) return { content: resultContent(result), isError: true };
+        const { overview_abs_path: overviewAbsPath, ...report } = result;
+        const visual = overviewAbsPath ? await prepareVideoStudioModelVisual(String(overviewAbsPath)) : null;
+        if (!visual) return { content: resultContent({ ...report, visual_evidence: { attached: false } }) };
+        return { content: resultContent({ ...report, visual_evidence: { attached: true, role: 'product_capture_overview' } }), images: [visual], imageRetention: 'active_turn' };
+      }
+
+      if (op === 'composition.scene_check') {
+        const writeRoots = [defaultRoot(opts, ctx)].filter(root => isPathAllowed(root, [getWorkspacePath(opts.userId, opts.projectId)]));
+        const compositionDirAbs = resolvePath(ctx, opts, String(input.composition_dir || 'project/composition'), roots);
+        if (!isPathAllowed(compositionDirAbs, writeRoots)) {
+          return { content: resultContent({ ok: false, op, errorCode: 'E_PATH_OUT_OF_SCOPE', message: 'Scene checks must run on a composition inside the writable workspace.' }), isError: true };
+        }
+        const result = await checkCompositionScenes({ compositionDirAbs, sceneIds: input.scene_ids, signal: ctx.signal });
+        if (!result.ok) return { content: resultContent(result), isError: true };
+        const visual = await prepareVideoStudioModelVisual(String(result.contact_sheet));
+        return {
+          content: resultContent({ ...result, visual_evidence: { attached: !!visual, role: 'scene_check_frames' } }),
+          ...(visual ? { images: [visual], imageRetention: 'active_turn' as const } : {}),
+        };
       }
 
       if (op === 'speech.capabilities') {
@@ -9611,7 +9959,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                   renderable: review.renderable,
                   uncaptured_segment_ids: review.uncaptured_segment_ids,
                   segments: review.segments,
-                  invariant: 'Segment frames are shown to the user, never put to them for approval: publish the current frames and keep working. Only the production plan, paid generation, and the final video wait for the user. A segment listed in uncaptured_segment_ids has no current frames and needs its QA phase re-run; everything else is ready to assemble.',
+                  invariant: 'A segment in uncaptured_segment_ids lacks current capture evidence; other segments retain their current capture evidence. renderable reports capture readiness, not user go-ahead for assembly.',
                 } } : {}),
               }),
               isError: false,
@@ -9782,6 +10130,29 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                       + 'turn. No approval was recorded.',
                     media_segment_issues: mediaIssues,
                     next_action: 'fix_media_segment_paths_then_retry_production.approve_plan',
+                    billable_request_sent: false,
+                  }),
+                  isError: true,
+                } as ToolResult;
+              }
+              // A line bound to a segment must start on that segment's
+              // footage. Every misplaced line is named at once; the retime is
+              // repaired under this turn's approval, and the same failure a
+              // third time ends the turn through the repeated-failure breaker.
+              const trackLineIssues = edlTrackLineSegmentIssues(identityNow.plan);
+              if (trackLineIssues.length) {
+                return {
+                  content: resultContent({
+                    ok: false,
+                    op,
+                    errorCode: 'E_VIDEO_PRODUCTION_TRACK_LINE_OUTSIDE_SEGMENT',
+                    message: `${trackLineIssues.length} narration/caption line(s) start outside the segment they name: `
+                      + trackLineIssues.map((issue) => `${issue.track === 'narration' ? 'tracks.narration.segments' : 'tracks.captions.lines'}`
+                        + `[${issue.index}] starts at ${Math.round(issue.start_sec * 10) / 10}s, but "${issue.segment_id}" plays `
+                        + `${issue.window_start_sec}–${issue.window_end_sec}s in the finished video`).join('; ')
+                      + '. Move each start into its segment and call this operation again in this turn. No approval was recorded.',
+                    track_line_issues: trackLineIssues,
+                    next_action: 'retime_listed_lines_then_retry_production.approve_plan',
                     billable_request_sent: false,
                   }),
                   isError: true,
@@ -10337,6 +10708,21 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             ? undefined
             : await compositionPlanSummaryFor(compositionDirAbs);
           const freshMissingComposition = !dirCheck.exists && stateBefore.revision === 0;
+          const currentDraft = await currentDraftStatus(compositionDirAbs, stateBefore, currentArtifacts, roots);
+          const productionState = summarizeVideoProductionState({
+            ...stateBefore,
+            artifacts: {
+              ...currentArtifacts,
+              scaffold_html_sha256: stateBefore.artifacts.scaffold_html_sha256,
+              scaffold_visual_signature: stateBefore.artifacts.scaffold_visual_signature,
+            },
+          }, policyFactsBefore);
+          const readiness = productionState.artifact_readiness as Record<string, unknown>;
+          readiness.complete_delivery_ready = readiness.complete_delivery_ready === true
+            && currentDraft?.input_signature_current === true
+            && currentDraft?.media_exists === true
+            && currentDraft?.report_exists === true
+            && planApprovalCurrent;
           return {
             content: resultContent({
               ok: true,
@@ -10376,7 +10762,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               visual_qa_cycle_stale: !!legacyVisualQaCycle(stateBefore.visual_qa)
                 && !currentVisualQaCycle(stateBefore.visual_qa),
               repair_state: repairState,
-              production_state: summarizeVideoProductionState(stateBefore, policyFactsBefore),
+              ...(currentDraft ? { current_draft: currentDraft } : {}),
+              production_state: productionState,
             }),
             isError: false,
           } as ToolResult;
@@ -11921,15 +12308,22 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             state: stateBefore,
             opts,
           });
-          const previewStop = keyframePreviewStopBlock({
+          const production = await productionPreviewGoAheadGranted(opts, stateBefore);
+          let previewStop = keyframePreviewStopBlock({
             state: stateBefore,
             entry: gate.entry,
             opts,
-            ...(await productionPreviewGoAheadGranted(opts, stateBefore).then((granted) => ({
-              productionPreviewGoAhead: granted.granted,
-              productionUncaptured: granted.uncaptured,
-            }))),
+            productionPreviewGoAhead: production.granted,
+            productionUncaptured: production.uncaptured,
           });
+          // A fully captured production of several segments stops on its
+          // whole-video sheet; this segment's frames are only part of it. A
+          // sheet that cannot be composed leaves the stop as it was.
+          if (previewStop?.errorCode === 'E_PREVIEW_GO_AHEAD_REQUIRED' && production.planPath
+            && !production.uncaptured.length && production.records.length > 1) {
+            const sheet = await composeProductionContactSheet(opts, production.planPath, production.records);
+            if (sheet) previewStop = productionWidePreviewStop(previewStop, sheet);
+          }
           if (previewStop) {
             // Deliberately NOT terminal. Ending the turn here guarantees the
             // stop but leaves the host unable to write the message that goes
@@ -12445,6 +12839,29 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               : []),
         } as typeof result;
 
+        // An AUTO child's preview_ready describes this segment alone. While the
+        // whole-video preview still lacks segments, say that these frames are
+        // not the stop: 2026-10-31 runs presented a title card as the keyframe
+        // preview and ended the turn.
+        if (op === 'composition.snapshot' && result.ok && parentEdlLinkOf(productionState).segmentId) {
+          const production = await productionPreviewGoAheadGranted(opts, productionState);
+          if (!production.granted && production.uncaptured.length) {
+            const notice = 'This segment is captured, but it is one part of the production, so its frames are not a stop. '
+              + `The whole-video preview is not ready: ${productionUncapturedText(production.uncaptured)}. `
+              + 'Produce those segments, then run production.segment_qa phase=snapshot and present its production_contact_sheet as the one preview stop.';
+            const previous = typeof (result as Record<string, unknown>).message === 'string'
+              ? `${String((result as Record<string, unknown>).message)} `
+              : '';
+            result = {
+              ...result,
+              production_preview_ready: false,
+              production_uncaptured_segments: production.uncaptured,
+              message: `${previous}${notice}`,
+              next_action: 'produce_remaining_segments_then_present_production_preview',
+            } as typeof result;
+          }
+        }
+
         if (result.ok === false) {
           const reviewPackage = await deliverReviewPackage({
             opts,
@@ -12506,12 +12923,13 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
       const fileErr = await ensureInputFile(inputAbsPath, 'input_path');
       if (fileErr) return { content: fileErr, isError: true } as ToolResult;
 
-      const transcriptAbsPath = typeof input.transcript_path === 'string' && input.transcript_path.trim()
+      const requestedTranscript = typeof input.transcript_path === 'string' && input.transcript_path.trim()
         ? resolvePath(ctx, opts, input.transcript_path, roots)
         : undefined;
-      if (transcriptAbsPath && !isPathAllowed(transcriptAbsPath, roots)) {
-        return { content: `E_PATH_OUT_OF_SCOPE: transcript_path is outside scope: ${transcriptAbsPath}`, isError: true } as ToolResult;
+      if (requestedTranscript && !isPathAllowed(requestedTranscript, roots)) {
+        return { content: `E_PATH_OUT_OF_SCOPE: transcript_path is outside scope: ${requestedTranscript}`, isError: true } as ToolResult;
       }
+      const transcriptAbsPath = requestedTranscript ?? defaultTranscriptAbsPath(ctx, opts, inputAbsPath, roots);
       const result = await transcribeSpeech({
         inputAbsPath,
         ...(transcriptAbsPath ? { transcriptAbsPath } : {}),

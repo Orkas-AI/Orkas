@@ -96,6 +96,47 @@ async function run(
 }
 
 describe('connector_setup', () => {
+  it.each(['oauth', 'extra_configuration'] as const)('advertises show and refuses retired start without effects for %s', async kind => {
+    const candidate = kind === 'oauth' ? CONNECTOR_CATALOG.find(item => item.id === 'github')! : entry();
+    const instances: ConnectorInstance[] = [];
+    const receipts: Record<string, any>[] = [];
+    for (const operation of ['show']) {
+      const stageConfigure = vi.fn(() => ({ ok: true as const }));
+      const bindAssistance = vi.fn(async () => {});
+      const openGuide = vi.fn(async () => ({ ok: true }));
+      const options = { uid: 'u1', language: 'en' as const, stageConfigure, bindAssistance, openGuide,
+        dependencies: { catalog: () => [candidate], instances: () => instances,
+          enabledSnapshot: () => ({ connectors: {} }) } };
+      const tool = buildConnectorSetupTool(options);
+      const advertised = (tool.inputSchema as any).properties.operation;
+      expect(advertised.enum).toContain('show');
+      expect(advertised.enum).not.toContain('start');
+      expect(advertised.description).toContain('does not connect or authorize');
+      const shown = await run(tool, { operation, connector_id: candidate.id });
+      expect(shown.isError).toBeUndefined();
+      expect(shown.result).toMatchObject({ ok: true, operation, status: 'setup_card_staged' });
+      expect(stageConfigure).toHaveBeenCalledExactlyOnceWith(candidate.id);
+      expect(bindAssistance).toHaveBeenCalledTimes(kind === 'oauth' ? 0 : 1);
+      expect(openGuide).toHaveBeenCalledTimes(kind === 'oauth' ? 0 : 1);
+      const { operation: _operation, ...receipt } = shown.result;
+      receipts.push(receipt);
+      expect((await run(tool, { operation: 'status', connector_id: candidate.id })).result.connection)
+        .toMatchObject({ configured: false, status: 'not_configured' });
+      expect(instances).toEqual([]);
+      stageConfigure.mockClear();
+      const unavailable = buildConnectorSetupTool({ ...options, dependencies: {
+        ...options.dependencies, catalog: () => [{ ...candidate, availability: 'visible_disabled' as const }],
+      } });
+      expect((await run(unavailable, { operation, connector_id: candidate.id })).isError).toBe(true);
+      expect(stageConfigure).not.toHaveBeenCalled();
+    }
+    const stageConfigure = vi.fn(() => ({ ok: true as const }));
+    const tool = buildConnectorSetupTool({ uid: 'u1', language: 'en', stageConfigure,
+      dependencies: { catalog: () => [candidate], instances: () => instances, enabledSnapshot: () => ({ connectors: {} }) } });
+    expect((await run(tool, { operation: 'start', connector_id: candidate.id })).isError).toBe(true);
+    expect(stageConfigure).not.toHaveBeenCalled();
+  });
+
   it('finds unconfigured Taobao in the built-in catalog without granting callable access', async () => {
     const stageConfigure = vi.fn(() => ({ ok: true as const }));
     const tool = buildConnectorSetupTool({
@@ -270,7 +311,7 @@ describe('connector_setup', () => {
       } else {
         expect(inspected.result.connector.protected_fields.every(field => field.help)).toBe(true);
       }
-      const started = await run(tool, { operation: 'start', connector_id: id });
+      const started = await run(tool, { operation: 'show', connector_id: id });
       expect(started.result).toMatchObject({ status: 'setup_card_staged', web_assist: { opened: true }, connector: {
         connection: { configured: false, status: 'not_configured' },
       } });
@@ -295,7 +336,7 @@ describe('connector_setup', () => {
             status: state === 'connected' ? { kind: state, since: 1 } : { kind: state } })],
           enabledSnapshot: () => ({ connectors: {} }) },
       });
-      for (const operation of ['inspect', 'start']) {
+      for (const operation of ['inspect', 'show']) {
         const output = await run(tool, { operation, connector_id: candidate.id });
         expect(output.result).toMatchObject({ ok: true, connector: {
           connector_id: candidate.id, setup_type: 'one_click_oauth', requires_extra_configuration: false,
@@ -321,7 +362,7 @@ describe('connector_setup', () => {
     const openGuide = vi.fn(async () => ({ ok: true }));
     const tool = buildConnectorSetupTool({ uid: 'u1', language: 'en', bindAssistance, stageConfigure, openGuide,
       dependencies: { catalog: () => [candidate], instances: () => [], enabledSnapshot: () => ({ connectors: {} }) } });
-    const output = await run(tool, { operation: 'start', connector_id: candidate.id });
+    const output = await run(tool, { operation: 'show', connector_id: candidate.id });
     expect(output).toMatchObject({ isError: true, result: { ok: false, error: expect.any(String) } });
     expect(output.result).not.toHaveProperty('status');
     expect(stageConfigure).toHaveBeenCalledTimes(failure === 'disabled' ? 0 : 1);
@@ -430,7 +471,7 @@ describe('connector_setup', () => {
     expect((tool.inputSchema as any).properties.connector_id.description)
       .toMatch(/exact catalog ID.*never start/i);
 
-    const fuzzyStart = await run(tool, { operation: 'start', connector_id: '小红书' });
+    const fuzzyStart = await run(tool, { operation: 'show', connector_id: '小红书' });
     expect(fuzzyStart).toMatchObject({
       isError: true,
       result: { ok: false, error: expect.stringContaining('exact catalog ID') },
@@ -510,7 +551,7 @@ describe('connector_setup', () => {
     const inspected = await run(tool, { operation: 'inspect', connector_id: candidate.id });
     expect(openGuide).not.toHaveBeenCalled();
     expect(stageConfigure).not.toHaveBeenCalled();
-    const started = await run(tool, { operation: 'start', connector_id: candidate.id });
+    const started = await run(tool, { operation: 'show', connector_id: candidate.id });
     expect(started.result).toMatchObject({ ok: true, status: 'setup_card_staged', web_assist: { opened: true } });
     expect(started.result.connector.connection).toMatchObject({ configured: false, status: 'not_configured' });
     expect(started.result.connector.connection).not.toHaveProperty('verified');
@@ -541,11 +582,11 @@ describe('connector_setup', () => {
     });
 
     const started = await run(tool, {
-      operation: 'start', connector_id: 'xiaohongshu-seller',
+      operation: 'show', connector_id: 'xiaohongshu-seller',
     });
     expect(started.result).toMatchObject({
       ok: true,
-      operation: 'start',
+      operation: 'show',
       connector_id: 'xiaohongshu-seller',
       status: 'setup_card_staged',
       web_assist: { opened: true },
@@ -566,7 +607,7 @@ describe('connector_setup', () => {
     // follow-up guidance lives on the operation description instead.
     expect(started.result).not.toHaveProperty('instruction');
     expect((tool.inputSchema as any).properties.operation.description)
-      .toMatch(/start stages a protected setup card/);
+      .toMatch(/show stages a protected connection card/);
   });
 
   it.each(['not_authored', 'missing_resource', 'incompatible', 'no_entry'] as const)(
@@ -584,7 +625,7 @@ describe('connector_setup', () => {
         uid: 'u1', language: 'en', openGuide, stageConfigure: () => ({ ok: true }),
         dependencies: { catalog: () => [candidate], instances: () => [], enabledSnapshot: () => ({ connectors: {} }) },
       });
-      const result = await run(tool, { operation: 'start', connector_id: candidate.id });
+      const result = await run(tool, { operation: 'show', connector_id: candidate.id });
       expect(openGuide).toHaveBeenCalledWith(expect.objectContaining({ url: candidate.connection_setup!.guide_url }));
       expect(result.result.connector.connection).toMatchObject({ configured: false });
       expect(result.result.connector.setup_guide).not.toHaveProperty('entry_url');
@@ -604,7 +645,7 @@ describe('connector_setup', () => {
     await run(tool, { operation: 'status', connector_id: candidate.id });
     expect(openGuide).not.toHaveBeenCalled();
     expect(stageConfigure).not.toHaveBeenCalled();
-    await run(tool, { operation: 'start', connector_id: candidate.id });
+    await run(tool, { operation: 'show', connector_id: candidate.id });
     expect(openGuide).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://ark.xiaohongshu.com/' }));
   });
 
@@ -619,16 +660,16 @@ describe('connector_setup', () => {
     });
     await run(tool, { operation: 'inspect', connector_id: entry().id });
     await run(tool, { operation: 'status', connector_id: entry().id });
-    await run(tool, { operation: 'start', connector_id: 'missing' });
+    await run(tool, { operation: 'show', connector_id: 'missing' });
     expect(bindAssistance).not.toHaveBeenCalled();
     expect(stageConfigure).not.toHaveBeenCalled();
-    const result = await run(tool, { operation: 'start', connector_id: entry().id });
+    const result = await run(tool, { operation: 'show', connector_id: entry().id });
     expect(bindAssistance).toHaveBeenCalledWith(entry().id);
     expect(result.result.web_assist).toEqual({ opened: true });
     expect(openGuide).not.toHaveBeenCalled();
     bindAssistance.mockRejectedValueOnce(new Error('missing conversation'));
     stageConfigure.mockClear();
-    const failed = await run(tool, { operation: 'start', connector_id: entry().id });
+    const failed = await run(tool, { operation: 'show', connector_id: entry().id });
     expect(failed.isError).toBe(true);
     expect(stageConfigure).not.toHaveBeenCalled();
     expect(openGuide).not.toHaveBeenCalled();
@@ -645,7 +686,7 @@ describe('connector_setup', () => {
       stageConfigure: () => ({ ok: true }),
       dependencies: { catalog: () => [entry()], instances: () => [], enabledSnapshot: () => ({ connectors: {} }) },
     });
-    const result = await run(tool, { operation: 'start', connector_id: entry().id });
+    const result = await run(tool, { operation: 'show', connector_id: entry().id });
     expect(observePage).toHaveBeenCalledWith(entry().id);
     expect(openGuide).toHaveBeenCalledTimes(opens);
     expect(result.result).toMatchObject({
@@ -676,7 +717,7 @@ describe('connector_setup', () => {
         },
         dependencies: { catalog: () => [candidate], instances: () => [], enabledSnapshot: () => ({ connectors: {} }) },
       });
-      const result = await run(tool, { operation: 'start', connector_id: candidate.id });
+      const result = await run(tool, { operation: 'show', connector_id: candidate.id });
       expect(result.isError).toBeUndefined();
       expect(bindAssistance).toHaveBeenCalledWith(candidate.id);
       expect(stageConfigure).toHaveBeenCalledWith(candidate.id);
@@ -702,7 +743,7 @@ describe('connector_setup', () => {
         uid: 'u1', language: 'en', bindAssistance, stageConfigure, openGuide,
         dependencies: { catalog: () => [candidate], instances: () => [], enabledSnapshot: () => ({ connectors: {} }) },
       });
-      const result = await run(tool, { operation: 'start', connector_id: candidate.id });
+      const result = await run(tool, { operation: 'show', connector_id: candidate.id });
       expect(result.isError).toBe(true);
       expect(result.result.ok).toBe(false);
       expect(result.result).not.toHaveProperty('status');

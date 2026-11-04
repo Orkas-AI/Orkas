@@ -58,7 +58,9 @@ it.runIf(process.platform === "win32")("cleans up eight simultaneous deadlines w
   const warnings = vi.spyOn(console, "warn");
   const dirs = Array.from({ length: 8 }, (_, index) => path.join(root, String(index)));
   try {
-    await Promise.all(dirs.map(async dir => {
+    // Keep every branch alive through its liveness oracle before fixture
+    // teardown; a first failure must not kill another branch's producer.
+    const outcomes = await Promise.allSettled(dirs.map(async dir => {
       await fs.mkdir(dir);
       const script = "require('fs').writeFileSync('producer.pid',String(process.pid));setInterval(()=>{},1000);setTimeout(()=>process.exit(0),10000)";
       const result = await new SandboxExecutor({ workingDir: dir, timeoutMs: 250 })
@@ -67,6 +69,7 @@ it.runIf(process.platform === "win32")("cleans up eight simultaneous deadlines w
       const pid = await fs.readFile(path.join(dir, "producer.pid"), "utf8").catch(() => "");
       if (pid) expect(() => process.kill(Number(pid), 0)).toThrow();
     }));
+    expect(outcomes.filter(outcome => outcome.status === "rejected")).toEqual([]);
     expect(warnings.mock.calls).toEqual([]);
   } finally {
     warnings.mockRestore();

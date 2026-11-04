@@ -258,10 +258,21 @@ function _autoFormatSummary(task) {
   const time = _autoPadHM(s.hour) + ':' + _autoPadHM(s.minute);
   if (s.type === 'daily') summary = t('auto.summary_daily', { time });
   if (s.type === 'weekly') {
-    summary = t('auto.summary_weekly', { day: t('auto.weekday.' + s.weekday), time });
+    const days = s.weekdays || [s.weekday];
+    if (days.length === 1 && days[0] === 'workdays') {
+      summary = t('auto.summary_weekly', { day: t('auto.workdays'), time });
+    } else {
+      const day = days.map(value => t('auto.summary_weekday.' + value)).join(t('ai_select.separator'));
+      summary = t('auto.summary_weekly_days', { day, time });
+    }
   }
   if (s.type === 'monthly') {
-    const day = (s.day === 31) ? t('auto.day_last') : t('auto.day_value', { day: s.day });
+    const days = s.days || [s.day];
+    const separator = t('ai_select.separator');
+    const dates = days.filter(value => value !== 31);
+    const parts = dates.length ? [t('auto.summary_monthdays', { days: dates.join(separator) })] : [];
+    if (days.includes(31)) parts.push(t('auto.day_last'));
+    const day = parts.join(separator);
     summary = t('auto.summary_monthly', { day, time });
   }
   const end = _autoFormatEndSummary(task);
@@ -277,17 +288,6 @@ function _autoFormatEndSummary(task) {
     return t('auto.summary_end_count', { current, max: condition.max_runs });
   }
   return '';
-}
-
-function _autoFormatLastRun(iso) {
-  if (!iso) return t('auto.never_run');
-  let when;
-  if (typeof formatIsoForList === 'function') when = formatIsoForList(iso);
-  else {
-    try { when = new Date(iso).toLocaleString(); }
-    catch { when = String(iso).slice(0, 16).replace('T', ' '); }
-  }
-  return t('auto.last_run', { when });
 }
 
 function _autoDisplayDeviceName(name) {
@@ -407,8 +407,7 @@ function _autoRenderRow(task, opts) {
   row.className = 'auto-row' + (task.enabled ? '' : ' is-disabled');
   row.dataset.taskId = task.id;
 
-  // ── Main column (left) ────────────────────────────────────────────────
-  // Name and message preview lead; enabled state sits with device metadata.
+  // Name and message preview lead; the full schedule and metadata follow.
   // Inline skill/connector resources retain the shared message rendering.
   const contentText = String(task.content || '');
   const contentHtml = contentText
@@ -451,10 +450,9 @@ function _autoRenderRow(task, opts) {
   }
   const chipsHtml = chips.length ? `<div class="auto-row-chips">${chips.join('')}</div>` : '';
 
-  // ── Right column (schedule + last run + ⋯) ───────────────────────────
   const summary = escapeHtml(_autoFormatSummary(task));
-  const lastRun = escapeHtml(_autoFormatLastRun(task.last_run_at));
   const moreTitle = escapeHtml(t('auto.more_menu'));
+  const moreHtml = `<button type="button" class="auto-row-more" data-act="more" title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
 
   // Conversation count labels the row's optional execution-history disclosure.
   // The row itself is the disclosure surface, with no extra chevron.
@@ -463,15 +461,17 @@ function _autoRenderRow(task, opts) {
   row.innerHTML = `
     <div class="auto-row-head">
       <div class="auto-row-main">
-        ${titleHtml}
-        ${contentHtml}
+        <div class="auto-row-heading">
+          ${titleHtml || contentHtml}
+          ${moreHtml}
+        </div>
+        ${titleHtml ? contentHtml : ''}
+        <div class="auto-row-schedule">
+          ${_autoUiIcon('calendar', 'auto-row-schedule-icon')}
+          <span class="auto-row-schedule-text">${summary}</span>
+        </div>
         ${chipsHtml}
       </div>
-      <div class="auto-row-side">
-        <div class="auto-row-schedule">${summary}</div>
-        <div class="auto-row-lastrun">${lastRun}</div>
-      </div>
-      <button type="button" class="auto-row-more" data-act="more" title="${moreTitle}" aria-label="${moreTitle}">⋯</button>
     </div>
     <div class="auto-row-convs" hidden>
       <div class="auto-row-convs-head muted">${escapeHtml(t('auto.task_convs', { n: convCount }))}</div>
@@ -1065,7 +1065,8 @@ function _autoEndOptions() {
 }
 
 function _autoWeekdayOptions() {
-  return [0, 1, 2, 3, 4, 5, 6].map((d) => ({ value: String(d), label: t('auto.weekday.' + d) }));
+  return [{ value: 'workdays', label: t('auto.workdays'), singleOnly: true, multipleValues: ['1', '2', '3', '4', '5'] },
+    ...[0, 1, 2, 3, 4, 5, 6].map((d) => ({ value: String(d), label: t('auto.weekday.' + d) }))];
 }
 
 function _autoMonthlyDayOptions() {
@@ -1291,10 +1292,14 @@ function _mountAutoForm() {
     _autoWeekdaySel = _aiSelectMount(weekdayMount, {
       options: _autoWeekdayOptions(),
       value: '1',
+      allowMultiple: true,
+      onChange: _autoSyncCalendarSelection,
     });
     _autoMonthlyDaySel = _aiSelectMount(monthlyDayMount, {
       options: _autoMonthlyDayOptions(),
       value: '1',
+      allowMultiple: true,
+      onChange: _autoSyncCalendarSelection,
     });
     _autoHourSel = _aiSelectMount(hourMount, {
       options: _autoHourOptions(),
@@ -1795,7 +1800,17 @@ function _renderAutoAttachmentChips() {
   }
 }
 
+function _autoSyncCalendarSelection() {
+  const type = _autoFreqSel?.getValue();
+  const picker = type === 'weekly' ? _autoWeekdaySel : type === 'monthly' ? _autoMonthlyDaySel : null;
+  const button = document.getElementById('auto-submit-btn');
+  if (button) button.disabled = !!picker && !picker.getValues().length;
+}
+
 function _autoSyncFreqRows(type) {
+  if (type !== 'weekly') _autoWeekdaySel?.close();
+  if (type !== 'monthly') _autoMonthlyDaySel?.close();
+  _autoSyncCalendarSelection();
   const hourlyIntervalRow = document.getElementById('auto-row-hourly-interval');
   const dateRow = document.getElementById('auto-row-date');
   const weekdayRow = document.getElementById('auto-row-weekday');
@@ -1915,8 +1930,8 @@ function _autoResetForm() {
   if (endCountInput) endCountInput.value = '10';
   if (_autoFreqSel) _autoFreqSel.setValue('daily');
   if (_autoEndSel) _autoEndSel.setValue('none');
-  if (_autoWeekdaySel) _autoWeekdaySel.setValue('1');
-  if (_autoMonthlyDaySel) _autoMonthlyDaySel.setValue('1');
+  if (_autoWeekdaySel) _autoWeekdaySel.setSelection(['1'], false);
+  if (_autoMonthlyDaySel) _autoMonthlyDaySel.setSelection(['1'], false);
   if (_autoHourSel) _autoHourSel.setValue('9');
   if (_autoMinuteSel) _autoMinuteSel.setValue('0');
   _autoSyncFreqRows('daily');
@@ -2065,8 +2080,9 @@ function _autoFillForm(task) {
   }
   if (_autoHourSel) _autoHourSel.setValue(String(hour));
   if (_autoMinuteSel) _autoMinuteSel.setValue(String(minute));
-  if (sched.type === 'weekly' && _autoWeekdaySel) _autoWeekdaySel.setValue(String(sched.weekday));
-  if (sched.type === 'monthly' && _autoMonthlyDaySel) _autoMonthlyDaySel.setValue(String(sched.day));
+  if (sched.type === 'weekly' && _autoWeekdaySel) _autoWeekdaySel.setSelection((sched.weekdays || [sched.weekday]).map(String), Array.isArray(sched.weekdays));
+  if (sched.type === 'monthly' && _autoMonthlyDaySel) _autoMonthlyDaySel.setSelection((sched.days || [sched.day]).map(String), Array.isArray(sched.days));
+  _autoSyncCalendarSelection();
   _repaintAutoRecipientChip();
   _renderAutoAttachmentChips();
 }
@@ -2147,11 +2163,17 @@ async function _autoSubmitForm() {
   } else if (type === 'daily') {
     schedule = { type: 'daily', hour, minute };
   } else if (type === 'weekly') {
-    const wd = _autoWeekdaySel ? parseInt(_autoWeekdaySel.getValue() || '1', 10) : 1;
-    schedule = { type: 'weekly', weekday: Number.isInteger(wd) ? wd : 1, hour, minute };
+    const values = _autoWeekdaySel ? _autoWeekdaySel.getValues() : [];
+    if (!values.length) { await blockSave('invalid_schedule', 'auto.invalid_schedule'); return; }
+    schedule = _autoWeekdaySel.isMultiple()
+      ? { type: 'weekly', weekdays: values.map(Number).sort((a, b) => a - b), hour, minute }
+      : { type: 'weekly', weekday: values[0] === 'workdays' ? 'workdays' : Number(values[0]), hour, minute };
   } else if (type === 'monthly') {
-    const day = _autoMonthlyDaySel ? parseInt(_autoMonthlyDaySel.getValue() || '1', 10) : 1;
-    schedule = { type: 'monthly', day: Number.isInteger(day) && day >= 1 ? day : 1, hour, minute };
+    const values = _autoMonthlyDaySel ? _autoMonthlyDaySel.getValues() : [];
+    if (!values.length) { await blockSave('invalid_schedule', 'auto.invalid_schedule'); return; }
+    schedule = _autoMonthlyDaySel.isMultiple()
+      ? { type: 'monthly', days: values.map(Number).sort((a, b) => a - b), hour, minute }
+      : { type: 'monthly', day: Number(values[0]), hour, minute };
   } else {
     await blockSave('invalid_schedule', 'auto.invalid_schedule');
     return;

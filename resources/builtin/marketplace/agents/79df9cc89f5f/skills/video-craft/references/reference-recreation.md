@@ -10,8 +10,37 @@ text, probe metadata, and rejected extraction commands are not visual evidence.
 If inspection fails, keep source-dependent design decisions unknown, recover
 access through supported tools, and continue only independent product work;
 report a remaining access blocker instead of inventing a reference analysis.
-The initial sparse samples establish only what is visible at those times;
-request relevant neighboring times before making motion or transition claims.
+If the frames are omitted because the current model cannot receive images, the
+reference's look is unknown: say so in the direction confirmation and recommend
+switching to a vision-capable model. Only after the user agrees to continue,
+work from the measured rhythm (cuts, BPM, moving shots) and the product page's
+words, and do not describe the reference's look.
+The first pass returns one still per detected shot, a `shot end` still for each
+shot in `shots.moving`, the cut times and the soundtrack tempo (`audio.bpm`).
+Use those as the edit-rhythm evidence. Request neighboring times only when a
+motion or transition stays unclear.
+
+## Signature elements
+
+Before the direction confirmation, list what a viewer would name as the
+reference's look: hero image or subject, display typeface style, recurring
+layout devices (masthead, numbered roster, page furniture), palette and grounds,
+edit rhythm, and the animation of each moving shot named from its first and end
+stills (build-up, typing, camera pull-back, zoom wipe). Record each in `ingest.json` `reference.signature`
+as `{element, treatment, how}`:
+
+- `reuse`: the reference is the target brand's own material (its name, logo or
+  product is the subject) or the user supplied it as theirs; extract stills from
+  the frozen copy. Reuse needs no separate license check: name it in the
+  direction confirmation so the user can object.
+- `recreate`: rebuild type and layout devices in HTML/CSS with an installed font
+  of the same style, vendored into `assets/`; for an image you cannot reuse,
+  offer an original generated replacement with its cost, or a graphic stand-in.
+- `drop`: only what the user excluded or what contradicts the request.
+
+"Reference the style" means these elements, not only the layout grid, so a guide
+reference keeps them too. Name the elements and their treatment in one line of
+the direction confirmation; say why for any `drop`.
 
 Understand the dimensions that actually constrain this job:
 
@@ -19,15 +48,17 @@ Understand the dimensions that actually constrain this job:
   proof, information order, payoff and CTA. Separate observed facts from inferred
   creative intent; a reference's offer, testimonial, demonstrated capability or UI
   is not evidence about the target product. Borrow visual organization without
-  asserting those features: use supplied target facts, and label any conceptual
-  interface as illustrative rather than presenting it as a verified product screen.
+  asserting those features: take target facts and screens from the target's own
+  page or supplied material ([product-source.md](product-source.md)); label only
+  an interface drawn without such a source as illustrative.
 - **Visual design:** framing, hierarchy, composition, typography, palette,
   product placement, backgrounds and text-safe areas.
 - **Movement and timing:** shot boundaries, subject/camera movement, transitions,
   beat lengths, reading time and emphasis. Sample around meaningful changes;
   inspect neighboring frames to locate boundaries instead of inventing timestamps.
-- **Audio and text:** speech, captions, music and their relation to visible action.
-  Transcribe when wording or speech timing drives the local edit. A silent
+- **Audio and text:** take the audio's style, not its detail: music or none, its
+  genre, energy and rough tempo; voice-over or none; captions and on-screen words
+  as observed. Transcribe when wording or speech timing drives the local edit. A silent
   reference has no transcript to recover.
 
 Persist concise observations in `project/ingest.json` with input identity,

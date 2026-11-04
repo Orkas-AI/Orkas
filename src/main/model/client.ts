@@ -38,6 +38,8 @@ export interface StreamEvent {
   failureCode?: string;
   /** This terminal failure explicitly exhausted the inner retry policy. */
   retryExhausted?: boolean;
+  /** Sanitized provider rejection detail displayed only to the user. */
+  detail?: string;
   /** Runtime phase where the terminal failure occurred. */
   failurePhase?: 'preflight' | 'provider_wait' | 'model_text' | 'tool_input' | 'tool' | 'compaction';
   /** Bounded provider code retained only for local failure classification. */

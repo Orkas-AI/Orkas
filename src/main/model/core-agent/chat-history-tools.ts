@@ -16,6 +16,9 @@ import { safeId } from '../../storage';
 import { conversationMessageReadFile } from '../../util/project-layout';
 import * as chats from '../../features/chats';
 import * as search from '../../features/search';
+import { z } from 'zod';
+
+const historyContract = require('../../../../bin/chat-history-contract.cjs');
 
 export interface ChatHistoryToolsOpts {
   userId: string;
@@ -41,7 +44,6 @@ const MAX_LATEST_MESSAGES = 30;
 const DEFAULT_LATEST_MESSAGES = 10;
 const MAX_CURRENT_SEARCH_CANDIDATES = 200;
 const SCORE_EPSILON = 0.1;
-const LEGACY_CHAT_READ_PAGE_KEYS = ['msg_index', 'window', 'limit', 'before_msg_index'] as const;
 
 type ChatReadPage = {
   msgIndex?: number;
@@ -55,41 +57,10 @@ type ChatReadPageResult =
   | { page: ChatReadPage; error?: never }
   | { page?: never; error: string };
 
-function chatReadPageSchema(): Record<string, unknown> {
-  return {
-    type: 'object',
-    additionalProperties: false,
-    description: 'Read only: mode, optional index/count.',
-    properties: {
-      mode: {
-        type: 'string',
-        enum: ['latest', 'around', 'before', 'from'],
-        description: 'latest: tail; around: centered on index; before: backward; from: continue at index/record_id.',
-      },
-      index: {
-        type: 'integer',
-        minimum: 0,
-        description: 'Raw index for around/before/from; ignored for latest.',
-      },
-      count: {
-        type: 'integer',
-        minimum: 0,
-        description: 'Around radius 0-10; latest/before count 1-30; from remaining count. Defaults to 3 or 10.',
-      },
-    },
-    required: ['mode'],
-  };
-}
-
-/** Parse the provider-visible tagged page while retaining legacy flat fields
- * for resumed conversations. A tagged page and old paging fields cannot be
- * combined because that would restore the ambiguous provider contract. */
+/** Parse the selected current message-page shape. */
 function parseChatReadPage(input: Record<string, unknown>): ChatReadPageResult {
   const rawPage = input.page;
   if (rawPage !== undefined) {
-    if (LEGACY_CHAT_READ_PAGE_KEYS.some((key) => input[key] != null)) {
-      return { error: '`page` cannot be combined with legacy flat paging fields' };
-    }
     if (!rawPage || typeof rawPage !== 'object' || Array.isArray(rawPage)) {
       return { error: '`page` must be an object with mode, and index when required' };
     }
@@ -115,17 +86,7 @@ function parseChatReadPage(input: Record<string, unknown>): ChatReadPageResult {
       : { page: { beforeMsgIndex: index, ...(count !== undefined ? { limit: count } : {}) } };
   }
 
-  if (input.msg_index != null && input.before_msg_index != null) {
-    return { error: '`msg_index` and `before_msg_index` cannot be combined' };
-  }
-  return {
-    page: {
-      ...(input.msg_index != null ? { msgIndex: Number(input.msg_index) } : {}),
-      ...(input.window != null ? { window: Number(input.window) } : {}),
-      ...(input.limit != null ? { limit: Number(input.limit) } : {}),
-      ...(input.before_msg_index != null ? { beforeMsgIndex: Number(input.before_msg_index) } : {}),
-    },
-  };
+  return { page: {} };
 }
 
 function previewOf(text: unknown): string {
@@ -383,48 +344,12 @@ function unavailableHistory(action: 'read' | 'search', reason: 'source_unavailab
 }
 
 function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
-  const scopeEnum = [...allowedScopes(opts)];
-  const hasCrossConversationScope = scopeEnum.some((scope) => scope !== 'current');
-  const hasProjectScope = scopeEnum.includes('project');
-  const currentOnly = scopeEnum.length === 1 && scopeEnum[0] === 'current';
   return {
     name: 'chat_history',
     executionMode: 'parallel',
     // Internal executor: only the consolidated factory's description is exposed.
     description: '',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: {
-          type: 'string',
-          description: 'Search only: natural language or keywords with a discriminative name, phrase, id, or fact.',
-        },
-        k: {
-          type: 'number',
-          description: 'Search only: default 6, max 15; up to two hits/conversation.',
-        },
-        scope: {
-          type: 'string',
-          enum: scopeEnum,
-          description: hasProjectScope
-            ? 'Search scope. current is host-bound to this conversation. Project includes only this project; use all only for explicit cross-project or non-project recall.'
-            : (hasCrossConversationScope
-              ? 'Search scope. current is host-bound to this conversation; use all only for explicit cross-conversation recall.'
-              : 'Search scope. current is host-bound to this conversation.'),
-        },
-        ...(hasCrossConversationScope
-          ? {
-              include_current: {
-                type: 'boolean',
-                description: hasProjectScope
-                  ? 'Search: include this conversation; default false.'
-                  : 'Search: include this conversation; default true.',
-              },
-            }
-          : {}),
-      },
-      required: currentOnly ? ['query', 'scope'] : ['query'],
-    },
+    inputSchema: { type: 'object', properties: {} },
     async execute(input, ctx) {
       const query = String(input.query ?? '').trim();
       if (!query) return { content: 'chat_history(search): `query` is required', isError: true };
@@ -476,7 +401,7 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
       if (!hits.length) return { content: complete
         ? `${status}\nNo conversation-history results for "${query}".`
         : `${status}\nNo matches in the indexed portion. This does not establish that the records are absent.`
-          + (scope === 'current' ? '\nRead recent records: {"action":"read","scope":"current","page":{"mode":"latest"},"include_process":true}' : '') };
+          + (scope === 'current' ? '\nRead recent records: {"action":"read","scope":"current","read":{"page":{"mode":"latest"},"include_process":true}}' : '') };
 
       const scopeLabel = scope === 'current'
         ? 'current-conversation '
@@ -511,16 +436,16 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
         lines.push(`    ${previewOf(h.snippet)}`);
         if (h.process_snippet) lines.push(`    process_match: ${previewOf(h.process_snippet)}`);
         const readScope = scope;
-        lines.push(`    read: ${JSON.stringify({ action: 'read', scope: readScope,
+        lines.push(`    read: ${JSON.stringify(historyContract.locator({ action: 'read', scope: readScope,
           ...(readScope !== 'current' ? { cid } : {}),
           ...(h.msg_id ? { record_id: h.msg_id } : { page: { mode: 'around', index: msgIndex, count: 0 } }),
           include_process: h.has_process === true,
-        })}`);
+        }))}`);
         if (h.msg_id && Number.isSafeInteger(h.process_index) && Number(h.process_index) >= 0) {
-          lines.push(`    process_read: ${JSON.stringify({ action: 'read', scope: readScope,
+          lines.push(`    process_read: ${JSON.stringify(historyContract.locator({ action: 'read', scope: readScope,
             ...(readScope !== 'current' ? { cid } : {}), record_id: h.msg_id,
             process_index: h.process_index,
-          })}`);
+          }))}`);
         }
       }
       const budget = Number(ctx.state[RETRIEVAL_OUTPUT_BUDGET_KEY] ?? DEFAULT_INLINE_RESULT_TOKENS);
@@ -530,57 +455,19 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
 }
 
 function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
-  const scopeEnum = [...allowedScopes(opts)];
-  const hasCrossConversationScope = scopeEnum.some((scope) => scope !== 'current');
-  const hasProjectScope = scopeEnum.includes('project');
-  const currentOnly = scopeEnum.length === 1 && scopeEnum[0] === 'current';
   return {
     name: 'chat_history',
     executionMode: 'parallel',
     // Internal executor: only the consolidated factory's description is exposed.
     description: '',
-    inputSchema: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        ...(!currentOnly
-          ? {
-              cid: {
-                type: 'string',
-                description: hasProjectScope
-                  ? 'Read only: conversation ID from search. Required when reading project/all; ignored for host-bound current.'
-                  : 'Read only: conversation ID from search. Required when reading all; ignored for host-bound current.',
-              },
-            }
-          : {}),
-        page: chatReadPageSchema(),
-        record_id: { type: 'string', description: 'Read only: exact message ID from search/read.' },
-        turn_id: { type: 'string', description: 'Read only: user message ID or execution turn_id.' },
-        tool_call_id: { type: 'string', description: 'Read only: select a stored tool call and its input/output.' },
-        process_index: { type: 'integer', minimum: 0, description: 'Read only: public segment index from search; requires record_id, excludes page/output_cursor. cursor pages this segment.' },
-        output_cursor: { type: 'integer', minimum: 0, description: 'Full tool_call_id output: start at 0, continue returned cursor.' },
-        include_process: { type: 'boolean', description: 'Execution records: default true with tool_call_id, else false.' },
-        cursor: { type: 'integer', minimum: 0, description: 'Partial-read character cursor.' },
-        max_tokens: { type: 'integer', minimum: 1, maximum: DEFAULT_INLINE_RESULT_TOKENS, description: 'Page token budget; default 10K.' },
-        scope: {
-          type: 'string',
-          enum: scopeEnum,
-          description: hasProjectScope
-            ? 'Read scope. current is host-bound to this conversation. Project includes only this project; other projects and non-project tasks require all.'
-            : (hasCrossConversationScope
-              ? 'Read scope. current is host-bound to this conversation; all is for explicit cross-conversation recall.'
-              : 'Read scope. current is host-bound to this conversation.'),
-        },
-      },
-      required: currentOnly ? ['scope'] : [],
-    },
+    inputSchema: { type: 'object', properties: {} },
     async execute(input, ctx) {
       const processIndex = input.process_index;
       if (processIndex !== undefined && (!Number.isSafeInteger(processIndex) || Number(processIndex) < 0
           || typeof input.record_id !== 'string' || !input.record_id.trim()
-          || input.page !== undefined || LEGACY_CHAT_READ_PAGE_KEYS.some(key => input[key] != null)
+          || input.page !== undefined
           || input.output_cursor !== undefined)) {
-        return { content: 'chat_history(read): process_index requires a non-negative safe integer and exact record_id; it cannot be combined with page, legacy paging or output_cursor.', isError: true };
+        return { content: 'chat_history(read): process_index requires a non-negative safe integer and exact record_id; it cannot be combined with page or output_cursor.', isError: true };
       }
       const pageResult = parseChatReadPage(input);
       if (pageResult.error) {
@@ -702,14 +589,25 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
         }
         const [record] = await historyMessages(opts.userId, cid, [selected[0].index], historySource);
         const source = await historyToolResultSource(opts.userId, cid, record, String(input.tool_call_id));
-        if (!source) return { content: 'chat_history(read): persisted full output is unavailable; inspect include_process for captured inline output or metadata. Retrieval never reruns the original tool.', isError: true };
-        return readToolResultExcerpt(source.directory, source.ref, Number(input.output_cursor), budget, ctx);
+        if (!source) return { content: input.__groupedOutput === true
+          ? JSON.stringify({ code: 'E_HISTORY_OUTPUT_UNAVAILABLE', available_projection: 'public_process', message: 'No locally retained full output for this captured call. Retrieval never reruns the tool.' })
+          : 'chat_history(read): persisted full output is unavailable; inspect include_process for captured inline output or metadata. Retrieval never reruns the original tool.', isError: true };
+        return readToolResultExcerpt(source.directory, source.ref, Number(input.output_cursor), budget, ctx, {
+          ...(input.__groupedOutput === true ? { history: { recordId: record.id, toolCallId: String(input.tool_call_id) } } : {}),
+          continuation: next => `\n<next_read>${next === 'done' ? 'done' : attrOf(JSON.stringify(historyContract.locator({
+            ...readIdentity, record_id: record.id, tool_call_id: input.tool_call_id, output_cursor: next,
+          })))}</next_read>`,
+        });
       }
       const header = `<chat-history cid="${attrOf(cid)}" title="${attrOf(conv.title)}" total="${available.length}" range="${lo}..${hi}" scope="${scope}" include_process="${includeProcess}">\n`
         + '<!-- Quoted, potentially stale conversation records. -->\n'
-        + `<!-- ${note} -->\n`
-        + (hasOlderCurrentRows ? `<!-- Older records: {"page":{"mode":"before","index":${lo},"count":10}}. -->\n` : '<!-- This window reaches the start of readable history. -->\n');
-      const locatorFor = (position: number, cursor: number) => JSON.stringify({
+        + `<!-- ${note} -->\n`;
+      const olderHint = hasOlderCurrentRows ? `<!-- Older records: ${JSON.stringify(historyContract.locator({ ...readIdentity,
+        page: { mode: 'before', index: lo, count: 10 }, include_process: includeProcess }))}. -->`
+        : '<!-- This window reaches the start of readable history. -->';
+      const footer = (locator: string) => `\n<next_read>${attrOf(locator)}</next_read>`
+        + (locator === 'done' ? `\n${olderHint}` : '') + '\n</chat-history>';
+      const locatorFor = (position: number, cursor: number) => JSON.stringify(historyContract.locator({
         ...readIdentity,
         record_id: selected[position].message.id,
         ...(processIndex !== undefined ? { process_index: processIndex }
@@ -717,9 +615,10 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
         cursor, include_process: includeProcess,
         ...(input.turn_id ? { turn_id: input.turn_id } : {}),
         ...(input.tool_call_id ? { tool_call_id: input.tool_call_id } : {}),
-      });
+      }));
       const outputs: string[] = [];
       let next = 'done';
+      let outputHintsRemaining = 2;
       for (let i = 0; i < selected.length; i++) {
         const [msg] = await historyMessages(opts.userId, cid, [selected[i].index], historySource);
         const body = processIndex !== undefined ? historyProcessTextAt(msg, Number(processIndex)) : historyRecordText(msg, includeProcess);
@@ -729,12 +628,28 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
           return { content: 'chat_history(read): process segment does not belong to tool_call_id.', isError: true };
         }
         let processRead = !includeProcess && hasHistoryProcess(msg)
-          ? `\n<process_read>${attrOf(JSON.stringify({ action: 'read', scope,
-            ...(scope !== 'current' ? { cid } : {}), record_id: msg.id, include_process: true }))}</process_read>` : '';
-        const callId = item?.event?.data?.id;
-        if (typeof callId === 'string' && item?.event?.data?.result_path
-            && await historyToolResultSource(opts.userId, cid, msg, callId)) {
-          processRead += `\n<output_read>${attrOf(JSON.stringify({ ...readIdentity, record_id: msg.id, tool_call_id: callId, output_cursor: 0 }))}</output_read>`;
+          ? `\n<process_read>${attrOf(JSON.stringify(historyContract.locator({ action: 'read', scope,
+            ...(scope !== 'current' ? { cid } : {}), record_id: msg.id, include_process: true })))}</process_read>` : '';
+        // A start event and its captured end share one call identity. Whole
+        // records also expose retained outputs, without requiring a second
+        // process lookup. Bound filesystem checks across the entire page.
+        const callIds: string[] = [];
+        if (item?.event?.stream === 'tool' && typeof item.event.data?.id === 'string') {
+          callIds.push(item.event.data.id);
+        } else if (processIndex === undefined && includeProcess) {
+          for (const entry of msg.process ?? []) {
+            const event = (entry as any)?.event;
+            if (event?.stream === 'tool' && event.data?.phase === 'end' && typeof event.data?.result_path === 'string'
+              && typeof event.data?.id === 'string' && !callIds.includes(event.data.id)) callIds.push(event.data.id);
+            if (callIds.length >= outputHintsRemaining) break;
+          }
+        }
+        for (const callId of callIds) {
+          if (outputHintsRemaining <= 0) break;
+          outputHintsRemaining--;
+          if (await historyToolResultSource(opts.userId, cid, msg, callId)) {
+            processRead += `\n<output_read>${attrOf(JSON.stringify(historyContract.locator({ ...readIdentity, record_id: msg.id, tool_call_id: callId, output_cursor: 0 })))}</output_read>`;
+          }
         }
         const cursor = i === 0 ? boundedInt(input.cursor, 0, 0, Number.MAX_SAFE_INTEGER) : 0;
         if (cursor > body.length) return { content: 'chat_history(read): cursor exceeds the selected record length.', isError: true };
@@ -742,7 +657,7 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
           `<msg index="${selected[i].index}" id="${attrOf(msg.id)}" from="${attrOf(messageActor(msg))}" time="${attrOf(messageTime(msg))}" covered="${cursor}-${end}" next_cursor="${end < body.length ? end : 'done'}">\n${attrOf(text)}${processRead}\n</msg>`;
         const nextLocator = (end: number) => locatorFor(i, end);
         const render = (item: string, locator: string) => header + [...outputs, item].filter(Boolean).join('\n')
-          + `\n<next_read>${attrOf(locator)}</next_read>\n</chat-history>`;
+          + footer(locator);
         const whole = envelope(body.slice(cursor), body.length);
         const afterWhole = i + 1 < selected.length ? locatorFor(i + 1, 0) : 'done';
         if (estimateToolResultTokens(render(whole, afterWhole)) <= budget) {
@@ -761,7 +676,7 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
         next = nextLocator(low);
         break;
       }
-      const content = header + outputs.join('\n') + `\n<next_read>${attrOf(next)}</next_read>\n</chat-history>`;
+      const content = header + outputs.join('\n') + footer(next);
       const fits = estimateToolResultTokens(content) <= budget;
       return { content: fits ? content
         : boundedRetrievalText('No history data delivered: insufficient tool-result budget. Retry the same record/cursor.', budget),
@@ -774,86 +689,32 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
 type ChatHistoryAction = 'search' | 'read';
 
 const CHAT_HISTORY_ACTION_FIELDS: Readonly<Record<ChatHistoryAction, ReadonlySet<string>>> = {
-  // `page` was part of the old provider-visible union schema. Retain runtime
-  // compatibility for resumed calls, but the action-discriminated schema no
-  // longer advertises it for search.
-  search: new Set(['action', 'query', 'k', 'scope', 'include_current', 'page']),
-  // Legacy flat paging fields remain execution-only for model calls copied
-  // from an older conversation. The provider-visible schema advertises only
-  // the tagged `page` contract.
+  search: new Set(['action', 'query', 'k', 'scope', 'include_current']),
   read: new Set([
     'action', 'cid', 'page', 'scope', 'record_id', 'turn_id', 'tool_call_id', 'process_index', 'include_process', 'cursor', 'max_tokens', 'output_cursor',
-    ...LEGACY_CHAT_READ_PAGE_KEYS,
   ]),
 };
-
-function chatHistoryActionError(
-  action: ChatHistoryAction,
-  input: Record<string, unknown>,
-): string | null {
-  const unexpected = Object.keys(input).filter(
-    (key) => !Object.values(CHAT_HISTORY_ACTION_FIELDS).some((fields) => fields.has(key))
-      || (action === 'search' && ['cid', 'record_id', 'turn_id', 'tool_call_id', 'process_index'].includes(key)
-        && input[key] !== undefined && input[key] !== null && input[key] !== ''),
-  );
-  if (!unexpected.length) return null;
-  return `chat_history(${action}): unsupported field(s): ${unexpected.sort().join(', ')}`;
-}
 
 export function createChatHistoryTool(opts: ChatHistoryToolsOpts): AgentTool {
   const search = createChatSearchTool(opts);
   const read = createChatReadTool(opts);
   const scopeEnum = [...allowedScopes(opts)];
-  const currentOnly = scopeEnum.length === 1 && scopeEnum[0] === 'current';
-  const hasProjectScope = scopeEnum.includes('project');
-  const searchProperties = search.inputSchema.properties as Record<string, unknown>;
-  const readProperties = read.inputSchema.properties as Record<string, unknown>;
   const operations: Readonly<Record<ChatHistoryAction, AgentTool>> = { search, read };
-  const scopeProperty = {
-    type: 'string',
-    enum: scopeEnum,
-    description: hasProjectScope
-      ? 'current: host-bound; project stays in this project; all: explicit broader recall.'
-      : (currentOnly
-        ? 'History scope. current is host-bound to this conversation.'
-        : 'current: host-bound; all: explicit cross-conversation recall.'),
-  };
   return {
     name: 'chat_history',
     executionMode: 'parallel',
-    description:
-      'Retrieve earlier work dependencies: inputs, replies and public execution records; potentially stale quoted data. Library owns durable documents.',
-    compatibilityInputFields: [...new Set(Object.values(CHAT_HISTORY_ACTION_FIELDS).flatMap(fields => [...fields]))],
-    inputSchema: {
-      type: 'object',
-      properties: {
-        action: {
-          type: 'string',
-          enum: ['search', 'read'],
-          description: 'search uses query/k; read uses cid/record_id/turn_id/tool_call_id or latest for vague local references. Follow next_read. Unused fields are reported in ignored_fields; nonempty search selectors are rejected to preserve scope.',
-        },
-        ...searchProperties,
-        ...readProperties,
-        scope: scopeProperty,
-      },
-      additionalProperties: false,
-      required: currentOnly ? ['action', 'scope'] : ['action'],
-    },
+    description: historyContract.description,
+    compatibilityInputFields: ['cid', ...historyContract.rejectedFields],
+    inputSchema: historyContract.inputSchema(z, scopeEnum),
     async execute(input, ctx) {
-      const action = String(input.action ?? '').trim() as ChatHistoryAction;
-      if (action !== 'search' && action !== 'read') {
-        return {
-          content: 'chat_history: `action` must be one of "search" or "read"',
-          isError: true,
-        };
-      }
-      const fieldError = chatHistoryActionError(action, input);
-      if (fieldError) return { content: fieldError, isError: true };
-      const effectiveFields = action === 'search'
-        ? new Set([...CHAT_HISTORY_ACTION_FIELDS.search].filter((key) => key !== 'page'))
-        : CHAT_HISTORY_ACTION_FIELDS.read;
-      const ignoredFields = Object.keys(input).filter((key) => !effectiveFields.has(key)).sort();
-      const effectiveInput = Object.fromEntries(Object.entries(input).filter(([key]) => effectiveFields.has(key)));
+      const projected = historyContract.project(z, input, scopeEnum);
+      if (projected.error) return { content: JSON.stringify({ tool: 'chat_history', ...projected.error }), isError: true };
+      const effective = projected.input as Record<string, unknown>;
+      const action = effective.action as ChatHistoryAction;
+      const effectiveFields = CHAT_HISTORY_ACTION_FIELDS[action];
+      const ignoredFields = projected.ignored;
+      const effectiveInput = Object.fromEntries(Object.entries(effective).filter(([key]) => effectiveFields.has(key)));
+      if (input.action === 'read_output') effectiveInput.__groupedOutput = true;
       const notice = ignoredFields.length ? `ignored_fields: ${JSON.stringify(ignoredFields)}\n` : '';
       const execute = async (ctx: ToolContext) => {
         const budget = Number(ctx.state[RETRIEVAL_OUTPUT_BUDGET_KEY]);

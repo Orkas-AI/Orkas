@@ -1,4 +1,5 @@
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
+import commanderProfile from '../../src/main/data/commander.json';
 
 type AgentSummary = { agent_id: string; name: string; enabled?: boolean };
 type AgentDetail = AgentSummary & {
@@ -60,11 +61,30 @@ test.describe('agents and skills', () => {
     await openSidebarEntry(page, '#agents-btn');
     const card = page.locator('.agent-card[data-id="commander"]');
     await expect(card.locator('.agent-card-name')).toHaveText('Commander');
-    await expect(card.locator('.agent-card-desc')).toContainText('camada de orquestração');
+    await expect(card.locator('.agent-card-desc')).toContainText('seu assistente de IA');
 
     await card.click();
     await expect(page.locator('#agents-detail-name')).toHaveText('Commander');
-    await expect(page.locator('#agents-detail-desc')).toContainText('camada de orquestração');
+    await expect(page.locator('#agents-detail-desc')).toContainText('seu assistente de IA');
+
+    // A locale must render its own catalog entry, including regional variants,
+    // rather than silently passing through the Chinese/English fallback.
+    const supportedLangs = await orkas.electronApp!.evaluate(() => (
+      (process as any).mainModule.require('./src/main/i18n.ts').SUPPORTED_LANGS
+    )) as Array<keyof typeof commanderProfile.name>;
+    for (const lang of supportedLangs) {
+      await page.evaluate(language => (window as any).setLang(language), lang);
+      await expect(card.locator('.agent-card-name')).toHaveText(commanderProfile.name[lang]);
+      await expect(card.locator('.agent-card-desc')).toHaveText(commanderProfile.description[lang]);
+      await expect(page.locator('#agents-detail-name')).toHaveText(commanderProfile.name[lang]);
+      await expect(page.locator('#agents-detail-desc')).toHaveText(commanderProfile.description[lang]);
+      await expect(page.locator('#agents-detail-knowhow .agents-detail-list-text')).toHaveText(commanderProfile.knowhow[lang]);
+      await expect(page.locator('#agents-detail-output-standards .agents-detail-list-text')).toHaveText(commanderProfile.standards[lang]);
+      await expect(page.locator('#agents-detail-workflow')).toHaveText(
+        commanderProfile.workflow[lang].replace(/^#### /gm, ''),
+      );
+    }
+    await page.evaluate(() => (window as any).setLang('pt'));
 
     await page.locator('#agents-detail-avatar .avatar-circle').click();
     const picker = page.locator('#avatar-picker');

@@ -38,15 +38,22 @@ afterEach(async () => {
   // Account activation starts a real log worker. Drain and close it before
   // removing its directory so late file creation cannot race the teardown.
   try {
-    for (const delivery of logDeliveries) await vi.waitFor(() => expect(delivery.stats().pending).toBe(0));
-  } finally { await Promise.all(logDeliveries.map(delivery => delivery.close())); }
-  if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
-  else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  if (prevDisableDelivery === undefined) delete process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
-  else process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = prevDisableDelivery;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-  vi.restoreAllMocks();
-  vi.resetModules();
+    for (const delivery of logDeliveries) {
+      await vi.waitFor(() => expect(delivery.stats().pending).toBe(0), { timeout: 5_000 });
+      expect(delivery.stats()).toMatchObject({ dropped: 0, failed: false });
+    }
+  } finally {
+    try { await Promise.all(logDeliveries.map(delivery => delivery.close())); }
+    finally {
+      if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
+      else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+      if (prevDisableDelivery === undefined) delete process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
+      else process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = prevDisableDelivery;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      vi.restoreAllMocks();
+      vi.resetModules();
+    }
+  }
 });
 
 function packagedSystemSkill(id: string): string {
@@ -452,7 +459,10 @@ describe('system skills reconciliation', () => {
 });
 
 describe('system skill contracts', () => {
-  it('keeps every platform-managed system Skill bilingual without a generic description', () => {
+  it('loads every hidden system Skill from one English routing description', async () => {
+    const { SkillLoader } = await import('#core-agent');
+    const root = path.resolve(process.cwd(), 'resources/builtin/system/skills');
+    const specs = new SkillLoader({ dirs: [root] }).list();
     const ids = [
       'agent-creator',
       'orkas-guide',
@@ -463,9 +473,14 @@ describe('system skill contracts', () => {
     for (const id of ids) {
       const fm = frontmatterOf(packagedSystemSkill(id));
       expect(fm).toMatch(/^name:\s*/m);
-      expect(fm).toMatch(/^description_zh:\s*\S/m);
-      expect(fm).toMatch(/^description_en:\s*\S/m);
-      expect(fm).not.toMatch(/^description:/m);
+      expect(fm).toMatch(/^description:\s*\S/m);
+      expect(fm).not.toMatch(/^description_(?:zh|en):/m);
+      const description = JSON.parse(fm.match(/^description:\s*(.+)$/m)![1]);
+      expect(description).not.toMatch(/[\u4e00-\u9fff]/);
+      expect(specs.find((spec) => spec.id === id)).toMatchObject({
+        description_zh: '',
+        description_en: description,
+      });
     }
   });
 

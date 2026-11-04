@@ -896,7 +896,7 @@ describe('util/proxy-dispatcher startup ordering', () => {
     expect(source).toContain('setFetchImplementation((input, init) => net.fetch');
     expect(source).not.toContain('const accountBoot = account.bootstrap();');
     expect(source.indexOf('await installSystemProxyDispatcher();')).toBeGreaterThan(0);
-    expect(source.indexOf('await installSystemProxyDispatcher();')).toBeLessThan(source.lastIndexOf('    createWindow();'));
+    expect(source.indexOf('await installSystemProxyDispatcher();')).toBeLessThan(source.lastIndexOf('    createWindow(startupHidden);'));
     expect(source).not.toContain("registerImmediate('net:system-proxy'");
   });
 });

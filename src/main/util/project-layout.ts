@@ -91,15 +91,22 @@ function readJsonArray(file: string): any[] {
   return Array.isArray(data) ? data : (data && Array.isArray(data.items) ? data.items : []);
 }
 
-export function listProjectIds(uid: string): string[] {
+/** Strict lifecycle discovery distinguishes missing paths from inaccessible state. */
+function existsForDiscovery(file: string, strict: boolean): boolean {
+  if (!strict) return fs.existsSync(file);
+  try { fs.statSync(file); return true; }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+}
+
+export function listProjectIds(uid: string, strict = false): string[] {
   const root = userProjectsDir(uid);
   let entries: fs.Dirent[] = [];
   try { entries = fs.readdirSync(root, { withFileTypes: true }); }
-  catch { return []; }
+  catch (error) { if (strict && error.code !== 'ENOENT') throw error; return []; }
   const out: string[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || !safeId(entry.name)) continue;
-    if (!fs.existsSync(projectMetaFile(uid, entry.name))) continue;
+    if (!existsForDiscovery(projectMetaFile(uid, entry.name), strict)) continue;
     out.push(entry.name);
   }
   out.sort();
@@ -385,24 +392,24 @@ function projectAutoTaskLocation(uid: string, pid: string, taskId: string): Auto
   };
 }
 
-export function listAutoTaskLocations(uid: string): AutoTaskLocation[] {
+export function listAutoTaskLocations(uid: string, strict = false): AutoTaskLocation[] {
   const out: AutoTaskLocation[] = [];
   const seen = new Set<string>();
   const scanRoot = (root: string, make: (taskId: string) => AutoTaskLocation) => {
     let entries: fs.Dirent[] = [];
     try { entries = fs.readdirSync(root, { withFileTypes: true }); }
-    catch { return; }
+    catch (error) { if (strict && error.code !== 'ENOENT') throw error; return; }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const loc = make(entry.name);
-      if (!fs.existsSync(loc.configFile)) continue;
+      if (!existsForDiscovery(loc.configFile, strict)) continue;
       const key = entry.name;
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(loc);
     }
   };
-  for (const pid of listProjectIds(uid)) {
+  for (const pid of listProjectIds(uid, strict)) {
     scanRoot(projectAutoTasksDir(uid, pid), (taskId) => projectAutoTaskLocation(uid, pid, taskId));
   }
   scanRoot(userAutoTasksDir(uid), (taskId) => globalAutoTaskLocation(uid, taskId));

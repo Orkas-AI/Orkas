@@ -86,7 +86,7 @@ export async function installConnectorAutonomy(input: {
       if (!groupsLoaded) { name = 'tool_load'; args = { groups: ['connectors', 'web'] }; groupsLoaded = true; }
       else if (input.handback) {
         name = 'connector_setup';
-        if (step === 0) args = { operation: 'start', connector_id: 'fixture-shop' };
+        if (step === 0) args = { operation: 'show', connector_id: 'fixture-shop' };
         else if (input.silentHandback && step === 1) args = { operation: 'page_observe', connector_id: 'fixture-shop' };
         else if (step === (input.silentHandback ? 2 : 1)) args = { operation: 'page_wait', connector_id: 'fixture-shop',
           wait_condition: 'text', text: 'Verification complete', ...(input.silentHandback ? { timeout_ms: 15000 } : {}) };
@@ -105,7 +105,7 @@ export async function installConnectorAutonomy(input: {
           args = { operation: 'page_observe', connector_id: 'fixture-shop' };
         }
       }
-      else if (step === 0) { name = 'connector_setup'; args = { operation: 'start', connector_id: 'fixture-shop' }; }
+      else if (step === 0) { name = 'connector_setup'; args = { operation: 'show', connector_id: 'fixture-shop' }; }
       else if (step === 1) args = { operation: 'wait' };
       else if (step === 2) args = { operation: 'screenshot' };
       else if (step === 3) args = { operation: 'act', page_id: last.page_id, page_action: 'click', point: [140, 100] };

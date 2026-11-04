@@ -1,21 +1,14 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-compose
-description_zh: Orkas HTML 视频合成的编写知识——如何写一个 composition（index.html）、用时间线驱动动画、声明画幅与时长，再渲染成 mp4；解说/动画/动态图形/字幕叠加的核心技能。
-description_en: Authoring knowledge for Orkas HTML video compositions — how to write an index.html composition, drive animation from a timeline, declare canvas + duration, then render to mp4; core skill for explainer/animation/motion-graphics/caption work.
+description_zh: 编写并渲染 HTML 视频合成（方案、时间线动画、预览、草稿、导出）；动态图形和讲解视频的核心。
+description_en: Write and render HTML video compositions (manifest, timeline animation, preview, draft, export); the core of motion graphics and explainers.
 ---
 
 # stage-compose
 
 Author an Orkas HTML composition and turn it into video. In Orkas, lint,
 inspect, snapshot, draft, and export run through built-in `video_studio`.
-
-Apply `frontend-design` before writing `manifest.art_direction`. When the user
-provides a reference image/video, DESIGN.md, brand guide, screenshot, design
-notes, or named style, apply `design-system-importer` to create intent-bound
-media constraints and compact tokens. After snapshot, apply
-`composition-design-review` yourself as an advisory frame checklist; it never
-replaces native QA or creates a gate.
 
 All COMPOSE stops and authorization transitions belong to `gate-control`. This
 Skill supplies the manifest, contact sheet, draft, QA evidence, and readiness;
@@ -81,23 +74,25 @@ is `visual_only`. Signed delivery, approved copy, narration, timing, language,
 source mappings, roles, or narration intent is `gate_b_payload`.
 
 After a draft/final `visual_only` edit, recapture and show the changed complete
-frame set, wait for go-ahead, then draft the complete composition as one mp4.
+frame set, wait for go-ahead; `composition.draft` then re-encodes the complete composition as one mp4.
 Approved export re-encodes the same whole composition at delivery quality. The
 new draft reopens final-video confirmation; do not imply only one scene can be
 encoded or skip whole-composition QA.
 
-In other words, `composition.draft` re-encodes the complete composition as one mp4;
-export is not a scene-only shortcut.
-
 ## Fast COMPOSE runbook
+
+This sequence covers new production and unfinished authoring. On resume, use
+`composition.status` to locate the current artifact and remaining work. An
+unchanged ready draft with existing media/report is already at final review;
+use its `current_draft` evidence with `gate-control`. Changed inputs or missing
+files need the corresponding repair, rather than restarting the whole sequence.
 
 1. For a new runtime production, finish
    [video-router's direction confirmation](../video-router/SKILL.md#direction-confirmation)
    before design preparation. On resume, reuse the chosen direction; do not ask again.
-2. Read this installed root once per conversation; re-read only when runtime
-   reports an updated installation. Read an existing canonical manifest. Apply
-   `frontend-design`; apply `design-system-importer` only for a concrete style
-   source; apply `composition-design-review` only after snapshot.
+2. Read an existing canonical manifest. Apply
+   `frontend-design` for visual authoring; apply `design-system-importer` only for a concrete style
+   source; apply `composition-design-review` only after snapshot, as an advisory checklist that never replaces native QA or creates a gate.
 3. The plan is only
    `project/composition/composition-manifest.json`: duration, language, audio
    ownership, scenes, approved copy, narration, and art direction. No shotlist,
@@ -110,12 +105,12 @@ export is not a scene-only shortcut.
    locale-compatible `route_ref` + `voice_ref`, write exact intent, then run the
    free `composition.check_narration_fit`. Open the plan stop only when
    `gate_b_ready:true`.
-5. On every new/resumed production turn, call `composition.status`. Reconcile
+5. Read `composition.status` for the current production state. Reconcile
    file/state disagreement through `gate-control`. Plan identity is normalized
    approved intent, not raw manifest hash; implementation-only art direction,
    formatting, HTML/CSS/SVG/motion makes a new candidate without reopening plan.
-   Once current, call `composition.doctor` once that turn, fix missing required
-   capabilities, then call `composition.prepare`.
+   For new production, use `composition.doctor` to resolve required capabilities
+   and `composition.prepare` to create the native scaffold.
 6. For standalone speech after prepare, read
    [narration.md](references/narration.md) before
    `composition.materialize_narration`. AUTO child composition stays silent
@@ -139,8 +134,8 @@ export is not a scene-only shortcut.
     work with dense text, complex SVG/GSAP, many supplied assets, narration
     complexity, or prior draft failure. Skip only genuinely short/simple work.
 11. Before snapshot/draft/export, read
-    [render-and-preview.md](references/render-and-preview.md). Run inspect +
-    snapshot, use contact sheet as the complete index, open full scale only the
+    [render-and-preview.md](references/render-and-preview.md). When a new visual
+    preview is needed, run inspect + snapshot. Use its contact sheet as the complete index, open full scale only the
     cover, QA-named frames, or risky cells, then batch repairs. Pass readiness or
     errors and later user decisions to `gate-control`.
 12. Run `composition.draft`. Structural failures repair the highest source—
@@ -154,7 +149,29 @@ one plan confirmation -> doctor -> native scaffold -> planned narration when app
 VisualDirectionV1/resolved-frame authoring -> inspect/snapshot -> preview ->
 draft -> final confirmation -> export. `VideoProductionStateV1` is durable state;
 call status/reconcile rather than inventing or skipping a stage. Never write or
-compile `spec.json` or use fixed visual templates.
+compile `spec.json`. A frontend-design preset is a starting system to remap and
+adapt, not a fixed template.
+
+## Scene-by-scene authoring
+
+For a composition with four or more scenes:
+
+1. Before HTML, write every scene's task sheet in `manifest.art_direction.scenes[]`
+   in one pass: `source` (the reference shot range, product capture or supplied
+   asset it shows), `layout` (regions and sizes) and `beats`, the time-coded
+   actions inside the scene (for example `0.0 type the goal into the input`,
+   `0.8 task rows expand`, `2.4 hold`), cutting on a beat when a tempo is known.
+2. After `composition.prepare`, write one scene at a time (its section, CSS and
+   timeline entries) from its own sheet. Do not generate all scenes in one script.
+3. After every two or three scenes, run `video_studio`
+   `op:"composition.scene_check"` with those `scene_ids`. Compare each scene's
+   start, middle and end frames with its sheet and reference shot, and fix only
+   the scenes that miss before writing the next ones.
+4. When every scene has been checked, run inspect and snapshot once for the
+   preview. After a later revision, re-check only the changed scenes; the draft
+   render reuses unchanged ones.
+
+`composition.scene_check` changes no QA, preview, approval or render state.
 
 ## Render-contract quality invariants
 

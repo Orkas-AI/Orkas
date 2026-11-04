@@ -351,6 +351,17 @@ vi.mock('../../../../src/main/model/client', () => ({
       yield { type: 'done' };
       return;
     }
+    if (message.includes('REJECTED_WITH_DETAIL_TEST')) {
+      yield {
+        type: 'error',
+        text: 'The model service rejected this request (HTTP 400).',
+        detail: 'Provider said: image input is not supported',
+        failureKind: 'model',
+        failureCode: 'provider_http_400',
+      };
+      yield { type: 'done' };
+      return;
+    }
     if (message.includes('NON_CLI_DRAFT_TEST')) {
       yield { type: 'delta', text: 'Inspect sources.', phase: 'pending' };
       yield { type: 'commentary-finalized', text: 'Inspect sources.' };
@@ -792,6 +803,19 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     }
     expect(events.filter(e => e.type === 'process' && e.data?.type === 'delta').map(e => e.data.text))
       .toEqual(ending === 'success' ? ['Inspect sources.', 'Verify results.', 'Delivered.'] : ['Inspect sources.', 'Verify results.']);
+  });
+
+  it('shows the sanitized provider explanation beside the failure', async () => {
+    const cid = 'cid-native-rejected-detail';
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'REJECTED_WITH_DETAIL_TEST' });
+    await waitForQuiescent(TEST_UID, cid);
+    const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
+      .trim().split('\n').map(line => JSON.parse(line));
+    const reply = rows.find(row => row.from === 'commander');
+    expect(reply.failure_code).toBe('provider_http_400');
+    expect(reply.text).toMatch(/rejected this request \(HTTP 400\)\.<\/span> <span>Provider said: image input is not supported<\/span>$/);
   });
 
   it.each(['codex', 'claude'])('recovers the complete active %s display without retaining another event log', async cli => {
@@ -4681,6 +4705,116 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(failure?.text).not.toContain('/Users/alice');
   });
 
+  describe('external CLI failure feedback', () => {
+    const useCli = async (cli: string) => {
+      const paths = await import('../../../../src/main/paths');
+      const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+      const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+      spec.runtime = { kind: 'cli', cli };
+      fs.writeFileSync(agentFile, JSON.stringify(spec));
+      const i18n = await import('../../../../src/main/i18n');
+      i18n.setCurrentLang('en');
+      return paths;
+    };
+    const exitedAtStart = {
+      runId: 'exited-at-start',
+      status: 'failed',
+      error: 'opencode exited with code 1',
+      stderrExcerpt: 'Error: no provider credentials. Run `opencode auth login` at /Users/test/project',
+      failureCategory: 'cli_failed_before_output',
+    };
+    const agentRows = async (cid: string) => {
+      const paths = await import('../../../../src/main/paths');
+      const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+      return fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+        .filter((row: any) => row.from === AGENT_ID);
+    };
+    const ask = async (cid: string, fromActorId = 'user') => {
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      // Commander delegates through an explicit recipient, as dispatch_to does.
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId, text: `@${AGENT_NAME} run the task`,
+        ...(fromActorId === 'commander' ? { forceTo: [AGENT_ID] } : {}) });
+      await waitForQuiescent(TEST_UID, cid);
+    };
+
+    it.each([
+      { language: 'en', error: 'opencode exited with code 1' },
+      { language: 'zh', error: 'account/read: workspace routing discovery timed out (code=-32603)' },
+    ])('shows only the primary CLI failure in $language and records the failure stage', async ({ language, error }) => {
+      await useCli('opencode');
+      const i18n = await import('../../../../src/main/i18n');
+      i18n.setCurrentLang(language as 'en' | 'zh');
+      // A legacy runner payload must not reintroduce stderr into the bubble.
+      cliRunMock.nextResult = { ...exitedAtStart, error };
+      const cid = 'cid-cli-stderr-shown';
+      await ask(cid);
+
+      const [failure] = await agentRows(cid);
+      expect(failure.failure_kind).toBe('runtime');
+      expect(failure.failure_code).toBe('cli_failed_before_output');
+      expect(failure.text).toContain(error);
+      expect(failure.text).toMatch(/^<span style="color:var\(--danger\)">[^<]+<\/span>$/);
+      expect(failure.text).not.toContain('no provider credentials');
+      expect(failure.text).not.toContain('data-private-diagnostic');
+      expect(failure.text).not.toContain('/Users/alice');
+      // One failure is not a pattern: no suggestion to switch yet.
+      expect(failure.text).not.toContain('Commander');
+    });
+
+    it('suggests Commander when the same agent fails again in this conversation', async () => {
+      await useCli('opencode');
+      const cid = 'cid-cli-repeated-failure';
+      cliRunMock.nextResult = exitedAtStart;
+      await ask(cid);
+      cliRunMock.nextResult = { ...exitedAtStart, runId: 'exited-again' };
+      await ask(cid);
+
+      const failures = (await agentRows(cid)).filter((row: any) => row.failure_kind);
+      expect(failures).toHaveLength(2);
+      expect(failures[0].text).not.toContain('@Commander');
+      expect(failures[1].text).toContain('@Commander');
+      expect(failures[1].failure_code).toBe('cli_failed_before_output');
+    });
+
+    it('does not count failures separated by a completed reply as consecutive', async () => {
+      await useCli('opencode');
+      const cid = 'cid-cli-failure-recovered';
+      cliRunMock.nextResult = exitedAtStart;
+      await ask(cid);
+      cliRunMock.nextResult = { runId: 'recovered', status: 'completed', output: 'Finished this one.' };
+      await ask(cid);
+      cliRunMock.nextResult = { ...exitedAtStart, runId: 'failed-after-recovery' };
+      await ask(cid);
+
+      const rows = await agentRows(cid);
+      expect(rows.filter((row: any) => row.failure_kind)).toHaveLength(2);
+      expect(rows.some((row: any) => String(row.text).includes('@Commander'))).toBe(false);
+    });
+
+    it('does not suggest Commander for work Commander delegated', async () => {
+      await useCli('opencode');
+      const cid = 'cid-cli-delegated-failure';
+      cliRunMock.nextResult = exitedAtStart;
+      await ask(cid, 'commander');
+      cliRunMock.nextResult = { ...exitedAtStart, runId: 'delegated-again' };
+      await ask(cid, 'commander');
+
+      const failures = (await agentRows(cid)).filter((row: any) => row.failure_kind);
+      expect(failures).toHaveLength(2);
+      expect(failures.some((row: any) => String(row.text).includes('@Commander'))).toBe(false);
+    });
+
+    it('keeps the generic code when the runner gives no stage or stderr', async () => {
+      await useCli('opencode');
+      cliRunMock.nextResult = { runId: 'no-stage', status: 'failed', error: 'opencode exited with code 1' };
+      const cid = 'cid-cli-no-stage';
+      await ask(cid);
+      const [failure] = await agentRows(cid);
+      expect(failure.failure_code).toBe('cli_failed');
+      expect(failure.text).not.toContain('CLI output');
+    });
+  });
+
   it('states that no specific error information was provided when the CLI omits it', async () => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
@@ -6210,12 +6344,9 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
       const edited = 'Revised first line\nSecond line with <literal> markup';
       const reference = { source_cid: 'quoted-task', source_msg_id: 'quoted-message', from_actor: 'user',
         source_title: 'Reference', source_ts: '2026-09-11T00:00:00', text: 'Keep this reference context' };
-      const layout = await import('../../../../src/main/util/project-layout');
-      const attachmentDir = layout.chatAttachmentDirForConversation(TEST_UID, cid);
       const attachments = await import('../../../../src/main/features/chat_attachments');
-      fs.mkdirSync(attachmentDir, { recursive: true });
-      fs.writeFileSync(path.join(attachmentDir, 'notes.txt'), 'Attached notes');
-      fs.writeFileSync(path.join(attachmentDir, 'draft.txt'), 'Independent unsent attachment');
+      expect(await attachments.uploadAttachment(TEST_UID, cid, 'notes.txt', Buffer.from('Attached notes'))).toMatchObject({ ok: true });
+      expect(await attachments.uploadAttachment(TEST_UID, cid, 'draft.txt', Buffer.from('Independent unsent attachment'))).toMatchObject({ ok: true });
       try {
         await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'DEFERRED_SLOW_TURN_TEST active' });
         await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'obsolete queued instruction',

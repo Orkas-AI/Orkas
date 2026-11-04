@@ -1,13 +1,13 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: design-system-importer
-description_zh: VideoStudio 的参考媒体与设计系统输入层——统一处理参考图片、参考视频、品牌规范、网站截图和设计说明，按复刻/编辑/借鉴意图写入可执行的画面与时序约束。
-description_en: Reference-media and design-system input layer for VideoStudio. Treat reference images, reference videos, screenshots, brand guides, and design notes uniformly, compiling reproduce/edit/guide intent into executable spatial and temporal constraints.
+description_zh: 把参考图、参考视频、截图和品牌规范转成可执行的画面与时序约束（复刻/编辑/借鉴）。
+description_en: Turns reference images, videos, screenshots and brand guides into concrete visual and timing constraints (reproduce, edit or guide).
 ---
 
 # design-system-importer
 
-Use this when COMPOSE or an AUTO compose segment has any external reference media or style source: a reference image, reference video, `DESIGN.md`, brand guide, screenshot, existing website, design notes, or an explicit named visual direction.
+Use this when COMPOSE or an AUTO compose segment has any external reference media or style source: a reference image, reference video, `DESIGN.md`, brand guide, screenshot, a website the user asks to match, design notes, or an explicit named visual direction.
 
 Do not use it for ordinary editing, TTS, shot generation, or clip selection. Do not introduce a new user Gate. The output is an internal style extraction that feeds `project/composition/composition-manifest.json::art_direction` and the model-authored `project/composition/index.html`.
 
@@ -88,18 +88,18 @@ For every concrete image or video, write `art_direction.references`; then write 
     "preserve": ["composition", "identity", "motion"],
     "may_change": ["copy", "aspect-safe reflow"],
     "layout_anchors": [{ "id": "hero", "role": "hero", "bounds": { "x": 0.08, "y": 0.12, "width": 0.5, "height": 0.7 } }],
-    "verification": { "minimum_score": 85, "compare_frames": ["first-frame", "scene-1-mid"] }
+    "verification": { "compare_frames": ["first-frame", "scene-1-mid"] }
   }
 }
 ```
 
 Choose the mode from user intent, not convenience:
 
-- `exact`: the user asks to reproduce/continue the supplied design. Preserve at least three named axes; minimum score must be at least 85.
+- `exact`: the user asks to reproduce/continue the supplied design. Preserve at least three named axes.
 - `close`: keep its recognizable system and spatial grammar while adapting content/aspect/motion.
 - `adapt`: borrow selected tokens or a visual principle; do not claim pixel fidelity.
 
-Map image composition/structure into normalized layout anchors, not only adjectives. For a video used to reproduce, edit, control motion, or control timing, map source time ranges to target scenes with temporal anchors. The model must be able to answer what stays, what changes, where it appears, and when each preserved beat happens.
+`preserve` names the kept signature elements from [reference-recreation.md](../video-craft/references/reference-recreation.md), not only abstract layout traits. Map image composition/structure into normalized layout anchors, not only adjectives. For a video used to reproduce, edit, control motion, or control timing, map source time ranges to target scenes with temporal anchors. The model must be able to answer what stays, what changes, where it appears, and when each preserved beat happens.
 
 ## Map To Video
 
@@ -120,4 +120,4 @@ After extraction, `manifest.art_direction` must state:
 - Which tokens were deliberately simplified.
 - Which elements the user explicitly excludes.
 - Which observed visual signature is retained under `preserve` and adapted under `may_change`.
-- Which image/video reference intent and roles, preserve/may-change rules, target scenes, layout/temporal anchors, and scored verification floor apply.
+- Which image/video reference intent and roles, preserve/may-change rules, target scenes and layout/temporal anchors apply.

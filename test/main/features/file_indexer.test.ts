@@ -365,6 +365,483 @@ describe('file_indexer › readRange on text', () => {
   });
 });
 
+describe('file_indexer › source changes during a text read', () => {
+  it.each([false, true])('invalidates same-size timestamp-preserving saves (legacy cache: %s)', async (legacy) => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('preserved-date.csv', 'A,100\n');
+    const stamp = new Date('2026-01-01T00:00:00Z');
+    fs.utimesSync(abs, stamp, stamp);
+    await m.readRange(UID, abs);
+    if (legacy) {
+      const metaFile = path.join(userFileCacheRoot(), fs.readdirSync(userFileCacheRoot())[0], 'meta.json');
+      const old = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+      delete old.ctime;
+      fs.writeFileSync(metaFile, JSON.stringify(old));
+    }
+    const before = fs.statSync(abs);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const expected = '中,2\n';
+    fs.writeFileSync(abs, expected);
+    fs.utimesSync(abs, stamp, stamp);
+    const after = fs.statSync(abs);
+    expect(after.size).toBe(before.size);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect(after.ctimeMs).not.toBe(before.ctimeMs);
+    const result = await m.readRange(UID, abs);
+    expect(result.content).toBe(expected);
+    expect(result.meta.totalChars).toBe(expected.length);
+    expect(result.sourceHash).toBe(`sha256:${crypto.createHash('sha256').update(expected).digest('hex')}`);
+    expect(fs.readFileSync(abs, 'utf8')).toBe(expected);
+  });
+
+  it('revalidates a same-size timestamp-preserving save during the first analysis', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('first-preserved-date.csv', 'A,100\n');
+    const stamp = new Date('2026-01-01T00:00:00Z');
+    fs.utimesSync(abs, stamp, stamp);
+    const expected = '中,2\n';
+    const originalRead = fs.promises.readFile;
+    let changed = false;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      const body = await originalRead(file, options);
+      if (String(file) === abs && !changed) {
+        changed = true;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        fs.writeFileSync(abs, expected);
+        fs.utimesSync(abs, stamp, stamp);
+      }
+      return body;
+    });
+    try {
+      const result = await m.readRange(UID, abs);
+      expect(changed).toBe(true);
+      expect(result.content).toBe(expected);
+      expect(result.meta.totalChars).toBe(expected.length);
+      expect(result.sourceHash).toBe(`sha256:${crypto.createHash('sha256').update(expected).digest('hex')}`);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('rebuilds an existing false-empty cache when a populated source is retried', async () => {
+    const m = await loadMod();
+    const text = 'id,value\nA,100\nB,200\n';
+    const abs = writeWorkspaceFile('prior-failure.csv', text);
+    await m.statFile(UID, abs);
+    const metaFile = path.join(userFileCacheRoot(), fs.readdirSync(userFileCacheRoot())[0], 'meta.json');
+    const poisoned = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+    poisoned.totalChars = 0;
+    delete poisoned.sourceHash;
+    delete poisoned.utf8Valid;
+    fs.writeFileSync(metaFile, JSON.stringify(poisoned));
+    expect((await m.statFile(UID, abs)).totalChars).toBe(text.length);
+    expect(fs.readFileSync(abs, 'utf8')).toBe(text);
+  });
+
+  it.each(['EIO', 'EACCES'])('does not cache a failed %s analysis as an empty source', async (code) => {
+    const m = await loadMod();
+    const text = 'id,value\nA,100\nB,200\n';
+    const abs = writeWorkspaceFile('unreadable.csv', text);
+    const originalRead = fs.promises.readFile;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      if (String(file) === abs) throw Object.assign(new Error('Controlled analysis failure'), { code });
+      return originalRead(file, options);
+    });
+    try {
+      await expect(m.statFile(UID, abs)).rejects.toMatchObject({ code });
+      expect(m.getCachedMeta(UID, abs)).toBeNull();
+    } finally { spy.mockRestore(); }
+    expect((await m.statFile(UID, abs)).totalChars).toBe(text.length);
+    expect(fs.readFileSync(abs, 'utf8')).toBe(text);
+    expect((await m.statFile(UID, writeWorkspaceFile('empty.csv', ''))).totalChars).toBe(0);
+  });
+
+  it.each(['readRange', 'statFile'] as const)(
+    'revalidates the first %s analysis after an editor save, including a concurrent cache rebuild',
+    async (entry) => {
+      const m = await loadMod();
+      const abs = writeWorkspaceFile('first-read.csv', 'id,value\nA,1\n');
+      const expected = 'id,value\nA,100\nB,200\nC,300\n';
+      const originalRead = fs.promises.readFile;
+      let changed = false;
+      const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+        const body = await originalRead(file, options);
+        if (String(file) === abs && !changed) {
+          changed = true;
+          fs.writeFileSync(abs, expected);
+          const at = new Date(Date.now() + 10_000);
+          fs.utimesSync(abs, at, at);
+          // A second reader has already prepared the current revision before
+          // the first reader's old analysis is allowed to finish.
+          await m.readRange(UID, abs);
+        }
+        return body;
+      });
+      try {
+        const result = await m[entry](UID, abs);
+        expect(changed).toBe(true);
+        expect('meta' in result ? result.meta.totalChars : result.totalChars).toBe(expected.length);
+        const current = await m.readRange(UID, abs);
+        const expectedHash = `sha256:${crypto.createHash('sha256').update(expected).digest('hex')}`;
+        if ('content' in result) {
+          expect(result.content).toBe(expected);
+          expect(result.sourceHash).toBe(expectedHash);
+        }
+        expect(current.content).toBe(expected);
+        expect(current.sourceHash).toBe(expectedHash);
+        expect(fs.readFileSync(abs, 'utf8')).toBe(expected);
+      } finally { spy.mockRestore(); }
+    },
+  );
+
+  it.each([undefined, 'gb18030'])(
+    'rejects a mixed-version page after cached metadata was prepared (encoding: %s)',
+    async (encoding) => {
+      const m = await loadMod();
+      const abs = writeWorkspaceFile('saved-page.csv', 'id,value\nA,1\n');
+      await m.readRange(UID, abs);
+      const expected = 'id,value\nA,100\nB,200\nC,300\n';
+      const originalRead = fs.promises.readFile;
+      let changed = false;
+      const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+        // Replace immediately before the page read. In the decoded path this
+        // is its full validity/length scan; both must bind to one source.
+        if (String(file) === abs && !changed) {
+          changed = true;
+          fs.writeFileSync(abs, expected);
+          const at = new Date(Date.now() + 10_000);
+          fs.utimesSync(abs, at, at);
+        }
+        return originalRead(file, options);
+      });
+      try {
+        await expect(m.readRange(UID, abs, { encoding })).rejects.toThrow('file changed while preparing text metadata');
+        expect(changed).toBe(true);
+      } finally { spy.mockRestore(); }
+      const recovered = await m.readRange(UID, abs, { encoding });
+      expect(recovered.content).toBe(expected);
+      expect(recovered.meta.totalChars).toBe(expected.length);
+      expect(fs.readFileSync(abs, 'utf8')).toBe(expected);
+    },
+  );
+
+  it('bounds first-use recovery while an editor keeps saving and recovers after saves stop', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('changing.csv', 'id,value\nA,1\n');
+    const originalRead = fs.promises.readFile;
+    let saves = 0;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      const body = await originalRead(file, options);
+      if (String(file) === abs) {
+        saves++;
+        fs.writeFileSync(abs, `id,value\nA,${saves}\n${'B,2\n'.repeat(saves)}`);
+        const at = new Date(Date.now() + saves * 10_000);
+        fs.utimesSync(abs, at, at);
+      }
+      return body;
+    });
+    try {
+      await expect(m.readRange(UID, abs)).rejects.toThrow('file changed while preparing text metadata');
+      expect(saves).toBe(3);
+    } finally { spy.mockRestore(); }
+    const expected = fs.readFileSync(abs, 'utf8');
+    const recovered = await m.readRange(UID, abs);
+    expect(recovered.content).toBe(expected);
+    expect(recovered.sourceHash).toBe(`sha256:${crypto.createHash('sha256').update(expected).digest('hex')}`);
+  });
+});
+
+describe('file_indexer › non-UTF-8 text', () => {
+  // Bytes are written out by hand from the published code tables, so the oracle
+  // does not depend on the decoder under test.
+  it.each([
+    ['gb18030', [0xD6, 0xD0, 0xCE, 0xC4], '中文'],
+    ['gb18030', [0x95, 0x32, 0x82, 0x36], '\u{20000}'],
+    ['big5', [0xA4, 0xA4, 0xA4, 0xE5], '中文'],
+    ['shift_jis', [0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA], '日本語'],
+    ['euc-kr', [0xC7, 0xD1, 0xB1, 0xDB], '한글'],
+    ['utf-16le', [0x2D, 0x4E, 0x87, 0x65], '中文'],
+    ['utf-16le', [0xFF, 0xFE, 0x2D, 0x4E, 0x87, 0x65], '中文'],
+    ['utf-16be', [0x4E, 0x2D, 0x65, 0x87], '中文'],
+    ['windows-1252', [0x45, 0xE9, 0x80], 'Eé€'],
+  ])('decodes %s bytes %j as the authored text and leaves the source alone', async (encoding, bytes, text) => {
+    const m = await loadMod();
+    const source = Buffer.from(bytes);
+    const abs = writeWorkspaceFile('legacy.csv', source);
+    const result = await m.readRange(UID, abs, { encoding });
+    expect(result.content).toBe(text);
+    expect(result.encoding).toBe(encoding);
+    expect(result.meta.totalChars).toBe(text.length);
+    expect(result.range).toEqual({ charStart: 0, charEnd: text.length });
+    // A decoded view is not editable source: no hash may stand in for its bytes.
+    expect(result.sourceHash).toBeUndefined();
+    expect(result.notUtf8).toBeUndefined();
+    expect(fs.readFileSync(abs)).toEqual(source);
+  });
+
+  it('keeps no decoded copy on disk', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('legacy.csv', Buffer.from([0xD6, 0xD0, 0xCE, 0xC4]));
+    await m.readRange(UID, abs, { encoding: 'gb18030' });
+    const cached = fs.readdirSync(userFileCacheRoot(), { recursive: true, withFileTypes: true })
+      .filter(entry => entry.isFile()).map(entry => entry.name);
+    expect(cached).toEqual(['meta.json']);
+    expect(fs.readdirSync(tmpDir).filter(name => name.includes('legacy'))).toEqual(['legacy.csv']);
+  });
+
+  it('pages a large file by character and line across a stream-chunk boundary', async () => {
+    // One ASCII byte shifts every two-byte GBK character so one straddles the
+    // default 64 KiB stream chunk; the source is large enough to select streaming.
+    const row = Buffer.from([0xD6, 0xD0, 0xCE, 0xC4, 0x0A]);
+    const rowCount = Math.ceil((4 * 1024 * 1024) / row.length) + 10;
+    const source = Buffer.concat([Buffer.from('a'), Buffer.alloc(rowCount * row.length, row)]);
+    const expected = `a${'中文\n'.repeat(rowCount)}`;
+    const abs = writeWorkspaceFile('large-gbk.csv', source);
+    const streamSpy = vi.spyOn(fsDefault, 'createReadStream');
+    const readSpy = vi.spyOn(fs.promises, 'readFile');
+    syncBuiltinESMExports();
+    try {
+      const m = await loadMod();
+      await m.statFile(UID, abs);
+      streamSpy.mockClear();
+      const charStart = 40_000;
+      const chars = await m.readRange(UID, abs, { encoding: 'gb18030', charStart, charEnd: charStart + 90_000, maxContentChars: 100_000 });
+      expect(chars.content).toBe(expected.slice(charStart, charStart + 90_000));
+      expect(chars.meta.totalChars).toBe(expected.length);
+      expect(chars.startLine).toBe(expected.slice(0, charStart).split('\n').length);
+      expect(chars.content).not.toContain('�');
+      // Bounded pages stream the source rather than holding it in memory, and
+      // every stream is released once the page is delivered.
+      expect(readSpy.mock.calls.filter(([file]) => file === abs)).toHaveLength(0);
+      const streams = streamSpy.mock.results.map(result => result.value as fs.ReadStream);
+      expect(streams.length).toBeGreaterThan(0);
+      for (const stream of streams) expect(stream.closed).toBe(true);
+
+      const lines = await m.readRange(UID, abs, { encoding: 'gb18030', lineStart: 30_000, lineEnd: 30_001, maxContentChars: 100_000 });
+      expect(lines.content).toBe('中文\n中文');
+      expect(lines.startLine).toBe(30_000);
+    } finally {
+      streamSpy.mockRestore();
+      readSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+
+  it('refuses a whole file when any later byte is invalid, even for an earlier page', async () => {
+    const m = await loadMod();
+    const source = Buffer.alloc(5 * 1024 * 1024, 0x61);
+    source[source.length - 1] = 0xFF;
+    const abs = writeWorkspaceFile('late-invalid.csv', source);
+    const streamSpy = vi.spyOn(fsDefault, 'createReadStream');
+    syncBuiltinESMExports();
+    try {
+      const mod = await loadMod();
+      const read = mod.readRange(UID, abs, { encoding: 'gb18030', charStart: 0, charEnd: 10, maxContentChars: 100 });
+      await expect(read).rejects.toBeInstanceOf(m.TextEncodingMismatchError);
+      await expect(read).rejects.toMatchObject({ encoding: 'gb18030' });
+      for (const result of streamSpy.mock.results) expect((result.value as fs.ReadStream).closed).toBe(true);
+    } finally {
+      streamSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+
+  it('refuses an incomplete final character when the stream ends', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('odd-utf16.txt', Buffer.from([0x2D, 0x4E, 0x87]));
+    await expect(m.readRange(UID, abs, { encoding: 'utf-16le' })).rejects.toBeInstanceOf(m.TextEncodingMismatchError);
+  });
+
+  it.each([
+    ['plain UTF-8', Buffer.from('中文 and text\n'), false],
+    ['UTF-8 with a byte-order mark', Buffer.from('﻿中文'), false],
+    ['an authored replacement character', Buffer.from('a�b'), false],
+    ['an empty file', Buffer.alloc(0), false],
+    ['GBK bytes', Buffer.from([0xD6, 0xD0, 0xCE, 0xC4]), true],
+    ['UTF-16 with a byte-order mark', Buffer.from([0xFF, 0xFE, 0x2D, 0x4E]), true],
+    ['a truncated final character', Buffer.from([0x61, 0xE4, 0xB8]), true],
+    ['an overlong sequence', Buffer.from([0xC0, 0x80]), true],
+    ['an encoded surrogate', Buffer.from([0xED, 0xA0, 0x80]), true],
+    ['an authored replacement character beside a bad byte', Buffer.concat([Buffer.from('�'), Buffer.from([0xFF])]), true],
+  ])('flags whether a plain read of %s is valid UTF-8', async (_label, source, invalid) => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('checked.txt', source);
+    const result = await m.readRange(UID, abs);
+    expect(!!result.notUtf8).toBe(invalid);
+    expect(result.encoding).toBeUndefined();
+  });
+
+  it.each([
+    ['a late bad byte', () => { const b = Buffer.alloc(5 * 1024 * 1024, 0x61); b[b.length - 1] = 0xFF; return b; }, true],
+    ['an authored replacement character', () => Buffer.concat([Buffer.alloc(5 * 1024 * 1024, 0x61), Buffer.from('�')]), false],
+  ])('flags a streamed source with %s correctly', async (_label, build, invalid) => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('streamed.log', build());
+    const result = await m.readRange(UID, abs, { charStart: 0, charEnd: 5, maxContentChars: 10 });
+    expect(result.content).toBe('aaaaa');
+    expect(!!result.notUtf8).toBe(invalid);
+  });
+
+  it('drops the flag once the file is rewritten as UTF-8, and the reverse', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('edited.csv', Buffer.from([0xD6, 0xD0, 0xCE, 0xC4]));
+    expect((await m.readRange(UID, abs)).notUtf8).toBe(true);
+    fs.writeFileSync(abs, Buffer.from('中文 fixed'));
+    expect((await m.readRange(UID, abs)).notUtf8).toBeUndefined();
+    fs.writeFileSync(abs, Buffer.from([0xD6, 0xD0, 0xCE, 0xC4, 0xD6, 0xD0]));
+    expect((await m.readRange(UID, abs)).notUtf8).toBe(true);
+  });
+
+  it('upgrades a cache written before the flag existed, once, without losing its hash', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('old-cache.csv', Buffer.from([0xD6, 0xD0, 0xCE, 0xC4]));
+    const first = await m.readRange(UID, abs);
+    const metaFile = fs.readdirSync(userFileCacheRoot(), { recursive: true, withFileTypes: true })
+      .filter(entry => entry.isFile() && entry.name === 'meta.json')
+      .map(entry => path.join(entry.parentPath, entry.name))[0];
+    const legacy = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+    delete legacy.utf8Valid;
+    fs.writeFileSync(metaFile, JSON.stringify(legacy));
+    const upgraded = await m.readRange(UID, abs);
+    expect(upgraded.notUtf8).toBe(true);
+    expect(upgraded.sourceHash).toBe(first.sourceHash);
+    expect(JSON.parse(fs.readFileSync(metaFile, 'utf8')).utf8Valid).toBe(false);
+  });
+
+  it.each([
+    {
+      change: 'size and encoding',
+      bytes: Buffer.from([0xD6, 0xD0, 0xCE, 0xC4, 0x0A, 0x31, 0x30, 0x30, 0x30, 0x30]),
+      text: '\uFFFD\uFFFD\uFFFD\uFFFD\n10000', invalid: true,
+    },
+    { change: 'same-size content and mtime', bytes: Buffer.from('new text'), text: 'new text', invalid: false },
+  ].flatMap(fixture => [false, true].map(rebuild => ({ ...fixture, rebuild }))))(
+    'discards a legacy upgrade after $change changes (concurrent rebuild: $rebuild)',
+    async ({ bytes, text, invalid, rebuild }) => {
+      const m = await loadMod();
+      const abs = writeWorkspaceFile('upgrading.csv', 'old text');
+      await m.readRange(UID, abs);
+      const metaFile = path.join(userFileCacheRoot(), fs.readdirSync(userFileCacheRoot())[0], 'meta.json');
+      const legacy = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+      delete legacy.utf8Valid;
+      fs.writeFileSync(metaFile, JSON.stringify(legacy));
+
+      let analysisStarted!: () => void;
+      let resumeAnalysis!: () => void;
+      const started = new Promise<void>(resolve => { analysisStarted = resolve; });
+      const resume = new Promise<void>(resolve => { resumeAnalysis = resolve; });
+      const readFile = fs.promises.readFile;
+      let pause = true;
+      const readSpy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+        const body = await readFile(file, options);
+        if (String(file) === abs && pause) {
+          pause = false;
+          analysisStarted();
+          await resume;
+        }
+        return body;
+      });
+      const upgrade = m.readRange(UID, abs);
+      try {
+        // Hold the old bytes after the real read, then let an editor and an
+        // optional second reader publish the new version before it completes.
+        await started;
+        fs.writeFileSync(abs, bytes);
+        const changedTime = new Date((Math.floor(legacy.mtime / 1000) + 10) * 1000);
+        fs.utimesSync(abs, changedTime, changedTime);
+        if (rebuild) await m.readRange(UID, abs);
+        resumeAnalysis();
+
+        const expectedHash = `sha256:${crypto.createHash('sha256').update(text, 'utf8').digest('hex')}`;
+        for (const result of [await upgrade, await m.readRange(UID, abs)]) {
+          expect(result.content).toBe(text);
+          expect(result.meta.totalChars).toBe(text.length);
+          expect(result.range).toEqual({ charStart: 0, charEnd: text.length });
+          expect(result.sourceHash).toBe(expectedHash);
+          expect(!!result.notUtf8).toBe(invalid);
+        }
+        expect(JSON.parse(fs.readFileSync(metaFile, 'utf8'))).toMatchObject({
+          size: bytes.length, mtime: changedTime.getTime(), totalChars: text.length,
+          sourceHash: expectedHash, utf8Valid: !invalid,
+        });
+        expect(fs.readFileSync(abs)).toEqual(bytes);
+      } finally {
+        resumeAnalysis();
+        await upgrade.catch(() => {});
+        readSpy.mockRestore();
+      }
+    },
+  );
+
+  it('bounds retries for continually replaced legacy caches and recovers once writes stop', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('changing.csv', 'initial');
+    await m.readRange(UID, abs);
+    const metaFile = path.join(userFileCacheRoot(), fs.readdirSync(userFileCacheRoot())[0], 'meta.json');
+    const legacy = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+    delete legacy.utf8Valid;
+    fs.writeFileSync(metaFile, JSON.stringify(legacy));
+    const readFile = fs.promises.readFile;
+    let changes = 0;
+    let latestText = '';
+    const readSpy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      const body = await readFile(file, options);
+      if (String(file) === abs) {
+        if (++changes > 5) throw new Error('fixture read budget exceeded');
+        // Emulate a writer with the legacy cache format publishing after each
+        // analysis read, so no attempt can safely commit its older analysis.
+        latestText = `version ${changes}`;
+        fs.writeFileSync(abs, latestText);
+        const mtime = (Math.floor(legacy.mtime / 1000) + changes) * 1000;
+        fs.utimesSync(abs, mtime / 1000, mtime / 1000);
+        fs.writeFileSync(metaFile, JSON.stringify({
+          ...legacy, mtime, size: latestText.length, totalChars: latestText.length,
+          sourceHash: `sha256:${crypto.createHash('sha256').update(latestText).digest('hex')}`,
+        }));
+      }
+      return body;
+    });
+    try {
+      await expect(m.readRange(UID, abs)).rejects.toThrow('file changed while preparing text metadata');
+      expect(changes).toBeLessThanOrEqual(3);
+      expect(JSON.parse(fs.readFileSync(metaFile, 'utf8')).utf8Valid).toBeUndefined();
+    } finally {
+      readSpy.mockRestore();
+    }
+    const recovered = await m.readRange(UID, abs);
+    expect(recovered.content).toBe(latestText);
+    expect(recovered.sourceHash).toBe(`sha256:${crypto.createHash('sha256').update(latestText).digest('hex')}`);
+    expect(JSON.parse(fs.readFileSync(metaFile, 'utf8')).utf8Valid).toBe(true);
+  });
+
+  it('treats an explicit utf-8 label as the ordinary read on valid bytes and refuses invalid ones', async () => {
+    const m = await loadMod();
+    const valid = writeWorkspaceFile('valid.txt', Buffer.from('中文'));
+    const plain = await m.readRange(UID, valid);
+    const labelled = await m.readRange(UID, valid, { encoding: 'utf-8' });
+    expect(labelled).toEqual(plain);
+    const invalid = writeWorkspaceFile('invalid.txt', Buffer.from([0xD6, 0xD0]));
+    await expect(m.readRange(UID, invalid, { encoding: 'utf-8' })).rejects.toBeInstanceOf(m.TextEncodingMismatchError);
+  });
+
+  it.each([
+    ['gb18030', 'gb18030'],
+    ['  GBK ', 'gbk'],
+    ['GB2312', 'gbk'],
+    ['Big5', 'big5'],
+    ['sjis', 'shift_jis'],
+    ['utf-16', 'utf-16le'],
+    ['latin1', 'windows-1252'],
+    ['utf8', 'utf-8'],
+    ['cp936', null],
+    ['utf-8-sig', null],
+    ['', null],
+    [42, null],
+    [undefined, null],
+  ])('resolves encoding label %j to %j', async (label, expected) => {
+    const m = await loadMod();
+    expect(m.resolveTextEncoding(label)).toBe(expected);
+  });
+});
+
 describe('file_indexer › readRange on pdf/docx', () => {
   it('throws NeedStatError when pdf cache is missing', async () => {
     const m = await loadMod();

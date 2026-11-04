@@ -15,6 +15,7 @@ import type {
 import {
   AuthError,
   ContextOverflowError,
+  ProviderCandidateChangedError,
   classifyRetryableError,
   isProviderRateLimitError,
   isRetryableError,
@@ -1008,7 +1009,7 @@ function outputLimitToolRetryControl(maxChunkChars: number): string {
   return [
     "The preceding response reached the output-token limit before completing a valid tool call. No tool call from that response was executed or saved.",
     "Retry the intended action now as one complete, concise tool call; do not repeat explanatory prose before it.",
-    `For a long new text file, keep this file-content chunk at or below ${maxChunkChars} characters, use write_file only for the first chunk, and copy its returned revision into append_file.base_revision for later chunks (expected_size is legacy fallback only).`,
+    `For a long new text file, keep this file-content chunk at or below ${maxChunkChars} characters, use write_file only for the first chunk, and copy its returned revision into append_file.base_revision for later chunks.`,
     "For an existing file, prefer a targeted edit_file or apply_patch call instead of rewriting the whole file.",
   ].join("\n");
 }
@@ -1702,6 +1703,9 @@ export class AgentRunner {
     // blocks. Total recoveries stay bounded by the tool-loop budget (each
     // re-arm requires a completed call, and those are capped).
     let overflowRecoveryAttempted = false;
+    // One re-preparation when the provider's first candidate changes after
+    // preparation; re-armed by a completed call like overflow recovery.
+    let candidateRepreparationAttempted = false;
     const toolNamesSet = new Set<string>();
     const skillsLoadedSet = new Set<string>();
     let transientToolErrors = 0;
@@ -1887,7 +1891,11 @@ export class AgentRunner {
           });
         }
 
-        const historyModel = this.modelCatalogEntry(modelId, servedModelId);
+        // A provider that knows its next candidate names it, so a run that had
+        // to use a larger fallback once compacts back onto the earlier model
+        // instead of staying on the fallback for every later round.
+        const callBudgetModel = provider.contextBudgetModel?.() ?? servedModelId;
+        const historyModel = this.modelCatalogEntry(modelId, callBudgetModel);
         if (historyModel?.contextWindow && Number.isFinite(historyModel.contextWindow)) {
           const usable = historyModel.contextWindow - (historyModel.maxOutputTokens ?? 8_192);
           this.session.configureHistoryBudget(usable, Math.floor(usable * CONTEXT_COMPACTION_TRIGGER_RATIO),
@@ -1903,9 +1911,9 @@ export class AgentRunner {
           systemPrompt,
           toolDefs,
           budgetEphemeral || undefined,
-          servedModelId,
+          callBudgetModel,
         );
-        const callUsableInputTokens = this.resolveUsableInputTokens(modelId, servedModelId);
+        const callUsableInputTokens = this.resolveUsableInputTokens(modelId, callBudgetModel);
         // In-memory scalar evidence only; the provider emits it on failure.
         const contextBudgetDiagnostics: Record<string, number | string> = {
           version: 1,
@@ -2028,7 +2036,7 @@ export class AgentRunner {
           this.session.contentEpoch(),
           this.session.getEstimatorCalibration(),
         );
-        const measuredModel = servedModelId || modelId;
+        const measuredModel = callBudgetModel || modelId;
         Object.assign(contextBudgetDiagnostics, {
           estimated_input_tokens: preparedTokens.tokens, estimate_source: preparedTokens.source,
         });
@@ -2210,6 +2218,7 @@ export class AgentRunner {
         // growth with fresh foldable content: re-arm the one-shot recovery
         // (see the declaration comment for the bound).
         overflowRecoveryAttempted = false;
+        candidateRepreparationAttempted = false;
 
         // Fall back to a text-only content block if the provider didn't
         // include `content` in message_end (older providers / custom stream
@@ -3275,6 +3284,23 @@ export class AgentRunner {
           return;
         }
 
+        // Nothing reached the stream, so preparing again is safe: compaction
+        // now targets the candidate the provider will offer next. It does not
+        // consume a provider retry slot; a repeat surfaces the original cause.
+        if (err instanceof ProviderCandidateChangedError) {
+          if (!candidateRepreparationAttempted) {
+            candidateRepreparationAttempted = true;
+            log.warn("provider candidate changed after preparation; preparing again", {
+              sessionId: this.session.getSessionId(),
+              model: modelId,
+              cause: logErrorRef(err.cause ?? err),
+            });
+            attempt--;
+            continue;
+          }
+          err = err.cause ?? err;
+        }
+
         if (err instanceof AuthError) {
           const e = this.errorResult(startTime, modelId, provider.id, {
             kind: "auth",
@@ -3285,14 +3311,14 @@ export class AgentRunner {
           return;
         }
 
-                if (err instanceof ContextOverflowError
+        if (err instanceof ContextOverflowError
           || (err instanceof Error && err.name === "ContextOverflowError")) {
           // Candidate admission already checked the unchanged request against
           // every available window. This is not an upstream estimation miss:
           // folding Session or retrying would defeat the read-only skip contract.
           if ((err as ContextOverflowError).admissionChecked) {
             const e = this.errorResult(startTime, modelId, provider.id, {
-              kind: "context_overflow", message: err.message, code: (err as ContextOverflowError).code,
+              kind: "context_overflow", message: err.message, code: "CONTEXT_CAPACITY_INSUFFICIENT",
             }, lastUsage, toolLoops, compactionCount, false, [...toolNamesSet], [...skillsLoadedSet], transientToolErrors, permanentToolErrors, finalizedRunTimings(startTime, timings), convergenceSignals());
             yield { type: "done", result: e };
             return;

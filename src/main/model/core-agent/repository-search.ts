@@ -98,6 +98,8 @@ export async function visitRepositoryFiles(
   const args = [
     '--files',
     '--hidden',
+    // Plain workspaces must honor .gitignore just like Git checkouts and the fallback walker.
+    '--no-require-git',
     '--null',
     '--glob',
     '!.git/**',
@@ -141,6 +143,8 @@ export async function grepRepository(
   const args = [
     '--json',
     '--hidden',
+    // Plain workspaces must honor .gitignore just like Git checkouts and the fallback walker.
+    '--no-require-git',
     '--line-number',
     '--column',
     '--color',

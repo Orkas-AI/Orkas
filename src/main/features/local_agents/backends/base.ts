@@ -368,6 +368,14 @@ function windowsSystem32Tool(name: string): string {
   return path.win32.join(root, 'System32', name);
 }
 
+function treeCommandErrorCode(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  // Closed OS outcomes only: child-process errors can also carry paths or
+  // command arguments, neither of which belongs in this recovery warning.
+  return typeof code === 'string' && ['ENOENT', 'EACCES', 'EPERM', 'EBUSY', 'ETIMEDOUT', 'ENOBUFS', 'EINVAL'].includes(code)
+    ? code : 'unknown';
+}
+
 /** Send `signal` to the child's whole process group on POSIX (the child
  *  is spawned detached, so its pgid == pid and `-pid` addresses the
  *  group). This reaps grandchildren that inherited the stdio pipes;
@@ -390,7 +398,10 @@ export function killProcessTree(
         { stdio: 'ignore', windowsHide: true, timeout: 10_000 },
       );
       let settled = false;
-      const complete = (failed: boolean) => {
+      const complete = (failed: boolean, outcome: {
+        completion: 'error' | 'exit'; error_code?: string;
+        exit_code?: number | null; termination_signal?: string | null;
+      }) => {
         if (settled) return;
         settled = true;
         if (failed) {
@@ -398,18 +409,23 @@ export function killProcessTree(
           // Omit PIDs, commands, paths and raw stderr from this bounded warning.
           log.warn('CLI process tree termination failed', {
             platform: 'win32', failure: 'tree_command_failed', fallback: 'direct_child_only',
+            ...outcome,
           });
           try { child.kill(signal); } catch { /* already gone */ }
         }
         opts.onComplete?.();
       };
-      killer.once('error', () => complete(true));
-      killer.once('exit', (code) => complete(code !== 0));
+      killer.once('error', error => complete(true, { completion: 'error', error_code: treeCommandErrorCode(error) }));
+      killer.once('exit', (code, signal) => complete(code !== 0, {
+        completion: 'exit', exit_code: Number.isSafeInteger(code) ? code : null,
+        termination_signal: !signal ? null : signal === 'SIGTERM' || signal === 'SIGKILL' ? signal : 'other',
+      }));
       if (typeof killer.unref === 'function') killer.unref();
       return;
-    } catch {
+    } catch (error) {
       log.warn('CLI process tree termination failed', {
         platform: 'win32', failure: 'tree_command_unavailable', fallback: 'direct_child_only',
+        completion: 'spawn_throw', error_code: treeCommandErrorCode(error),
       });
       // Fall through to a best-effort direct child kill.
     }

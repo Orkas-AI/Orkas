@@ -341,7 +341,7 @@ export const autoTaskAttachmentsDir = (uid: string, taskId: string) => path.join
 // (local-secret encrypted with the active Orkas account's OAuth user_id as owner — see
 // `features/connectors/registry.ts`). Cloud-synced as of 2026-05-15 so a user authorizing on
 // one device sees the same connectors on another. **Secret owner:** OAuth user_id (not local uid)
-// so any device logged into the same Orkas account can decrypt; the open build / not-logged-in
+// so any device logged into the same Orkas account can decrypt; OrkasOpen / not-logged-in
 // users fall back to local uid (the file then sits in cloud/config/ but doesn't actually
 // sync — sync engine is inactive without an account).
 export const userConnectorsConfigFile = (uid: string) => path.join(userCloudConfigDir(uid), 'connectors.json');
@@ -500,7 +500,7 @@ export const localCliSessionsFile = (uid: string, cid: string) =>
 // `features/packages.ts`. Marketplace reconcile must never touch this tree.
 // `.bin/` holds generated shims for CLI-shaped packages; it is injected into
 // the bash tool PATH (see `model/core-agent/client.ts`).
-// See docs/plans/open-ecosystem-architecture.md §A.
+// See docs/architecture/skill-engineering-contract.md.
 export const userPackagesDir          = (uid: string) => path.join(userLocalRoot(uid), 'packages');
 export const userPackageDir           = (uid: string, name: string) => path.join(userPackagesDir(uid), name);
 export const userPackagesRegistryFile = (uid: string) => path.join(userPackagesDir(uid), '_registry.json');

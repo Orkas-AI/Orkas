@@ -358,7 +358,7 @@ function _startConversationFilingFailureSubscription() {
   if (_convFilingFailedWatchStarted || !window.orkas || typeof window.orkas.onPushEvent !== 'function') return;
   try {
     window.orkas.onPushEvent('conversations:filing-failed', (payload) => {
-      if (payload && payload.kind === 'unfile' && typeof payload.cid === 'string' && payload.cid) {
+      if (payload && (payload.kind === 'unfile' || payload.kind === 'move') && typeof payload.cid === 'string' && payload.cid) {
         uiToast(t('chat.conv_move_failed'), { variant: 'warning', timeoutMs: 10000 });
         return;
       }

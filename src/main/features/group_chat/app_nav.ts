@@ -13,8 +13,10 @@ export type AppNavAction = 'open' | 'create' | 'add_custom' | 'configure';
 
 export interface AppNavSurface {
   id: string;
-  /** Review-facing one-liner; the model schema receives the compact matrix. */
+  /** Canonical purpose; selected summaries accompany the model's action matrix. */
   summary: string;
+  /** Include the purpose when the destination id alone leaves ambiguity. */
+  describePurpose?: boolean;
   /** Closed actions supported by this surface. `open` is the default. */
   actions: readonly AppNavAction[];
   /** Actions that require a stable business id resolved by the renderer. */
@@ -59,6 +61,9 @@ export const APP_NAV_ACTIONS: readonly AppNavAction[] = Array.from(new Set(
   APP_NAV_SURFACES.flatMap((surface) => surface.actions),
 ));
 
+export const APP_NAV_ACTION_DESCRIPTION =
+  'Defaults to open for a list or landing page. Use create for a new resource, add_custom to open the manual MCP configuration form, and configure with target_id to focus one existing resource.';
+
 export function findAppNavSurface(id: string): AppNavSurface | null {
   return APP_NAV_SURFACES.find((s) => s.id === id) ?? null;
 }
@@ -72,9 +77,13 @@ export function appNavSurfaceDescription(): string {
     ids.push(surface.id);
     idsByActionSet.set(actionSet, ids);
   }
-  return `All support open. Other actions: ${[...idsByActionSet.entries()]
-    .map(([actions, ids]) => `${ids.join(',')}=${actions}`)
-    .join(';')}.`;
+  return [
+    ...APP_NAV_SURFACES.filter(surface => surface.describePurpose)
+      .map(surface => `${surface.id}: ${surface.summary}`),
+    `All support open. Other actions: ${[...idsByActionSet.entries()]
+      .map(([actions, ids]) => `${ids.join(',')}=${actions}`)
+      .join(';')}.`,
+  ].join(' ');
 }
 
 export function validateAppNavRequest(input: {

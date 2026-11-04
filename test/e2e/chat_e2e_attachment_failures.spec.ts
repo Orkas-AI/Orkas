@@ -54,4 +54,5 @@ test('reports a native picker failure, keeps cancellation neutral, and lets the 
     await page.locator('#new-chat-attachments .chat-attach-remove').click();
     await expect(page.locator('#new-chat-attachments .chat-attach-chip')).toHaveCount(0);
   }
+  await orkas.acknowledgeInvokeFailures('conversations.attachments.pickAndUpload', 2);
 });

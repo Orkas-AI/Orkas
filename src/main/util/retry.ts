@@ -12,6 +12,8 @@ interface RetryOptions {
   delaysMs?: number[];
   /** Cancels both the next attempt and any pending retry backoff. */
   signal?: AbortSignal;
+  /** Zero-based dispatched attempt; observation must not affect the operation. */
+  onAttempt?: (attempt: number) => void;
 }
 
 export interface FetchRetryOptions extends RetryOptions {
@@ -86,6 +88,7 @@ export async function retryAsync<T>(
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (opts.signal?.aborted) throw abortReason(opts.signal);
+    try { opts.onAttempt?.(attempt); } catch { /* Diagnostics cannot change retry behavior. */ }
     try {
       return await fn();
     } catch (err) {
@@ -184,5 +187,6 @@ export async function fetchAndReadWithRetry<T>(
     retries: opts.retries,
     delaysMs: opts.delaysMs,
     isRetriable: opts.isRetriable,
+    onAttempt: opts.onAttempt,
   });
 }

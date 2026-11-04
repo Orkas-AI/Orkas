@@ -132,12 +132,14 @@ import * as marketplaceFeat from '../marketplace';
 import { readInstalls } from '../marketplace_installs';
 import {
   APP_NAV_ACTIONS,
+  APP_NAV_ACTION_DESCRIPTION,
   APP_NAV_SURFACES,
   appNavSurfaceDescription,
   validateAppNavRequest,
   type AppNavRequest,
 } from './app_nav';
 import { APP_HEALTH_DOMAINS, collectAppHealth, isAppHealthDomain } from './app_health';
+import { APP_HEALTH_TOOL_DESCRIPTION } from './app_health_contract';
 import { buildConversationBrowserTool } from './browser_tool';
 import { beginBrowserTaskRun, browserTaskRunId, finishBrowserTaskRun } from '../web_assist_lifecycle';
 import { buildConnectorSetupTool } from './connector_setup_tool';
@@ -2071,6 +2073,16 @@ async function _readCliCanonicalTail(
 
 export const _readCliCanonicalTailForTest = _readCliCanonicalTail;
 
+/** Whether this actor's latest visible reply in the history snapshot failed. */
+function _lastReplyFailed(rows: readonly GroupMessage[], actorId: string): boolean {
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (row.from !== actorId || row.deleted_at) continue;
+    return !!row.failure_kind;
+  }
+  return false;
+}
+
 function recentReferencesFromRows(
   seed: readonly ChatMessageReference[],
   rows: readonly GroupMessage[],
@@ -3840,7 +3852,7 @@ function _buildDirectAgentHandbackModelText(params: {
     snapshot,
     '</agent-handback>',
     '',
-    'Continue the original user task as commander. The directly addressed agent returned it because the primary outcome crossed its capability boundary. Treat the concrete capability report as authoritative. If it says the requested format or tool is unsupported and no already-available, authorized alternative is identified, do not search for or run shell/process conversion, install a workaround, publish an empty or placeholder output, or retry the same unsupported operation through another actor. Preserve the source, ask only for the smallest required converted copy or target-application action, and stop. Otherwise decide the next owner or commander action; do not merely restate the agent response. Do not send the unchanged goal back to the same agent unless required input or available capability has materially changed.',
+    'Continue the original user task as commander. The directly addressed agent returned it because the primary outcome crossed its capability boundary. Treat the concrete capability report as authoritative. If it says a proprietary file format is unsupported and no already-available, authorized alternative is identified, do not search for or run shell/process conversion, install a workaround, publish an empty or placeholder output, or retry the same unsupported operation through another actor. Preserve the source, ask only for the smallest required converted copy or target-application action, and stop. If only a helper operation is missing and a bundled runtime (ffmpeg, node, python) can perform it, do not send the user to another application: complete it yourself or route it to a shell-capable actor with that runtime named. Otherwise decide the next owner or commander action; do not merely restate the agent response. Do not send the unchanged goal back to the same agent unless required input or available capability has materially changed.',
   ].join('\n');
 }
 
@@ -4348,7 +4360,7 @@ async function _planAndQueueUserSend(state: CidState, input: {
     let description = '';
     try {
       const agent = await agentsFeat.getAgent(id);
-      if (agent) description = pickAgentRuntimeDescription(agent, language);
+      if (agent) description = pickAgentDispatchDescription(agent);
     } catch { /* the name alone still identifies the actor */ }
     candidates.push({
       id, name: actor.name || id, description: _clipForOrchestration(description, 240),
@@ -6294,6 +6306,8 @@ async function runActorTurnWithDisplay(
     ]);
   }
   let errText: string | null = null;
+  // Shown beside errText to the user only; see TurnFinishedEvent.errDetail.
+  let errDetail: string | undefined;
   let aborted = false;
   let turnFailureKind: GroupMessageFailureKind | undefined;
   let turnFailureCode = '';
@@ -6685,11 +6699,18 @@ async function runActorTurnWithDisplay(
         : null;
       if (cliOut.error) {
         errText = cliOut.error;
-        markTurnFailure(cliOut.failureKind || 'runtime', cliOut.failureCode || 'cli_failed');
+        // A user retrying the same failing CLI keeps getting the same error;
+        // after the second one in a row, point them at Commander. Delegated
+        // work is already in Commander's hands.
+        if (item.fromActorId === USER_ID && _lastReplyFailed(canonicalRows, actor.id)) {
+          errText = `${errText} ${t('cli_agent.repeated_failure_hint', { name: cliAgent.name || actor.id })}`;
+        }
+        markTurnFailure(cliOut.failureKind || 'runtime', cliOut.failureCode || 'cli_failed', cliOut.failurePhase);
       }
       if (cliOut.aborted) aborted = true;
     } catch (err) {
       errText = (err as Error).message || String(err);
+      errDetail = undefined;
       aborted = !!w.abortController?.signal.aborted;
       if (!aborted) markTurnFailure('runtime', 'cli_exception');
       log.warn('cli stream threw', {
@@ -6864,6 +6885,7 @@ async function runActorTurnWithDisplay(
         // Capture so onTurnFinished can decide between surfacing a ⚠️
         // failure bubble vs treating 'empty response' as a tool-only turn.
         errText = ev.text || 'unknown error';
+        errDetail = ev.detail;
         aborted = !!(ev as { aborted?: boolean }).aborted;
         if (!aborted) {
           markTurnFailure(
@@ -6916,6 +6938,7 @@ async function runActorTurnWithDisplay(
     }
   } catch (err) {
     errText = (err as Error).message || String(err);
+    errDetail = undefined;
     aborted = !!w.abortController?.signal.aborted;
     if (!aborted) markTurnFailure('model', 'model_stream_exception');
     log.warn('stream threw', { cid, actor: actor.id, error: logErrorRef(err) });
@@ -6991,6 +7014,7 @@ async function runActorTurnWithDisplay(
         }, processItems);
       }
       errText = null;
+      errDetail = undefined;
       turnFailureKind = undefined;
       turnFailureCode = '';
       turnFailurePhase = undefined;
@@ -7004,7 +7028,8 @@ async function runActorTurnWithDisplay(
 
   // Exit never parses partial prose into new side effects or starts another
   // turn. Preserve the same public trail the user could inspect while live.
-  if (state.shuttingDown && actor.kind !== 'worker') {
+  // A turn that settles only after a failed exit reuses its archived receipt.
+  if ((state.shuttingDown || state.shutdownArchives?.has(item.turnId)) && actor.kind !== 'worker') {
     const persistedMsg = await archiveInterruptedTurn(state, item.turnId);
     return { kind: 'completed', text: persistedMsg?.text || '', produced: [],
       outcome: { kind: 'silent' }, persistedMsg, aborted: true, terminalStatus: 'cancelled' };
@@ -7672,6 +7697,7 @@ async function runActorTurnWithDisplay(
       actor: { id: actor.id, kind: actor.kind === 'commander' ? 'commander' : 'agent' },
       finalText: workingText,
       errText,
+      ...(errText && errDetail ? { errDetail } : {}),
       aborted,
       ...(turnFailureKind ? { failureKind: turnFailureKind } : {}),
       ...(turnFailureCode ? { failureCode: turnFailureCode } : {}),
@@ -8148,7 +8174,8 @@ async function runActorTurnWithDisplay(
     produced: turnFinalCandidates,
     outcome,
     persistedMsg,
-    errText: errText || undefined,
+    // Commander's handback keeps the user-only detail: it names the fix.
+    errText: errText ? [errText, errDetail].filter(Boolean).join(' ') : undefined,
     aborted,
     terminalStatus,
     ...(failure ? { failure } : {}),
@@ -8228,6 +8255,8 @@ export async function _buildCommanderSystemPromptForTest(
 ): Promise<string> {
   return buildCommanderSystemPrompt(uid, cid, undefined, projectId, language);
 }
+
+export const _buildCommanderExtraToolsForTest = buildCommanderExtraTools;
 
 // Render the agents-index block injected into commander's system prompt.
 //
@@ -8331,7 +8360,6 @@ async function buildAgentInGroupSystemPrompt(
   const main = prompts.load('chat_agent_in_group', {
     name: agent.name || '',
     agent_id: agent.agent_id,
-    description: pickAgentRuntimeDescription(agent, language),
     workflow: (agent.workflow || '').trim() || '(not provided)',
     agent_runtime_guidance: runtimeGuidance,
     inputs_schema: inputsSchemaJson || '(none)',
@@ -8387,9 +8415,8 @@ export function _resolveAgentInputsForRuntimeForTest(
   return resolveAgentInputsForRuntime(inputs, uiLanguage);
 }
 
-function pickAgentRuntimeDescription(
+function pickAgentDispatchDescription(
   agent: { description?: string; description_zh?: string; description_en?: string },
-  _language: Lang,
 ): string {
   const legacy = typeof agent.description === 'string' ? agent.description.trim() : '';
   const zh = typeof agent.description_zh === 'string' ? agent.description_zh.trim() : '';
@@ -8452,13 +8479,6 @@ export function buildAgentRuntimeGuidance(profile: unknown): string {
 // contract without dispatching a full group-chat turn.
 export function _buildAgentRuntimeGuidanceForTest(profile: unknown): string {
   return buildAgentRuntimeGuidance(profile);
-}
-
-// Test-only export: the description line the worker prompt sends every turn.
-export function _pickAgentRuntimeDescriptionForTest(
-  agent: { description?: string; description_zh?: string; description_en?: string },
-): string {
-  return pickAgentRuntimeDescription(agent, 'en');
 }
 
 /** Which asking protocol the model is taught. `form` is the platform default;
@@ -10074,7 +10094,8 @@ async function buildCommanderExtraTools(
   tools.push({
     name: 'open_app_view',
     description:
-      'Stage a click-to-open card for a supported Orkas destination. Use connector_setup for built-in connector setup or reconnect guidance; the renderer navigates only after the user clicks.',
+      'Stage a click-to-open card for a supported Orkas destination. Use connector_setup for built-in connector setup or reconnect guidance; the renderer navigates only after the user clicks. '
+      + 'Recycle Bin is under settings.data (Settings > Data): users restore deleted items there; Delete/Empty permanently removes recycle-bin batches.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -10086,7 +10107,7 @@ async function buildCommanderExtraTools(
         action: {
           type: 'string',
           enum: APP_NAV_ACTIONS,
-          description: 'Defaults to open for a list or landing page. Use create for a new resource, add_custom for a custom MCP server, and configure with target_id to focus one existing resource.',
+          description: APP_NAV_ACTION_DESCRIPTION,
         },
         target_id: {
           type: 'string',
@@ -10118,15 +10139,14 @@ async function buildCommanderExtraTools(
 
   tools.push({
     name: 'app_health',
-    description:
-      'Return a sanitized read-only snapshot of supported Orkas app-health domains. It never returns credentials, paths, provider error text, or user content.',
+    description: APP_HEALTH_TOOL_DESCRIPTION,
     inputSchema: {
       type: 'object',
       properties: {
         domain: {
           type: 'string',
           enum: [...APP_HEALTH_DOMAINS],
-          description: 'Optional single domain; omit for the full snapshot.',
+          description: 'Optional single domain; tasks checks running conversations; omit for all domains.',
         },
       },
       additionalProperties: false,
@@ -10214,6 +10234,18 @@ export function prepareForShutdown(): Promise<void> {
     ]));
   }).catch(error => { _shutdown.pending = undefined; throw error; });
   return _shutdown.pending;
+}
+
+/** A failed exit leaves the application open. Reopen what `prepareForShutdown`
+ * closed, once its settlement pass has ended so its archival cannot race new work. */
+export async function resumeAfterFailedShutdown(): Promise<void> {
+  await _shutdown.pending?.catch(() => undefined);
+  _shutdown.started = false;
+  _shutdown.pending = undefined;
+  for (const state of _cids.values()) {
+    state.shuttingDown = false;
+    _scheduleAdmissions(state);
+  }
 }
 
 // ── Abort ────────────────────────────────────────────────────────────────
@@ -10926,6 +10958,7 @@ async function _runCliAgentTurn(opts: {
   commanderHandoff?: import('../local_agents/bridge').CommanderHandoffRequest;
   failureKind?: GroupMessageFailureKind;
   failureCode?: string;
+  failurePhase?: TaskFailurePhase;
   historySyncEligible?: boolean;
 }> {
   const runtime = opts.agent.runtime as Extract<NonNullable<import('../agents').AgentRuntime>, { kind: 'cli' }>;
@@ -11465,6 +11498,7 @@ async function _runCliAgentTurn(opts: {
       produced: Array.from(produced),
       failureKind: 'dependency',
       failureCode: result.cliError || 'missing_cli',
+      failurePhase: 'preflight',
     };
   }
   const unsuccessfulRun = result.status === 'cancelled'
@@ -11496,30 +11530,29 @@ async function _runCliAgentTurn(opts: {
   }
   if (result.cliError === 'model_unsupported' || result.cliError === 'parameter_unsupported') {
     return { text: '', error: result.error, produced: Array.from(produced),
-      failureKind: 'dependency', failureCode: result.cliError };
+      failureKind: 'dependency', failureCode: result.cliError, failurePhase: 'preflight' };
   }
   if (result.status === 'failed' || result.status === 'timeout') {
     const vars = { name: opts.agent.name || runtime.cli, cli: runtime.cli };
     const cliError = runner.sanitizePublicCliError(result.error);
+    const message = cliError || t('cli_agent.error_detail_missing');
     const detail = resumeRejected
       ? t('cli_agent.session_expired_detail', vars)
       : result.status === 'timeout'
         ? t(result.timeoutKind === 'wall' || (!result.timeoutKind && result.timeoutPhase === 'background')
           ? 'agent.execution_wall_timeout'
           : 'agent.execution_idle_timeout', undefined, opts.language)
-        : t('cli_agent.run_failed_detail', {
-            ...vars,
-            message: cliError || t('cli_agent.error_detail_missing'),
-          });
+        : t('cli_agent.run_failed_detail', { ...vars, message });
     return {
       text: publicText,
       error: detail,
       produced: Array.from(produced),
       published: publishedOutputs,
       failureKind: 'runtime',
+      failurePhase: 'tool',
       failureCode: result.status === 'timeout'
         ? (result.timeoutKind === 'wall' ? 'cli_wall_timeout' : result.timeoutKind === 'idle' ? 'cli_idle_timeout' : 'cli_timeout')
-        : 'cli_failed',
+        : result.failureCategory || 'cli_failed',
     };
   }
   const finalText = publicText;

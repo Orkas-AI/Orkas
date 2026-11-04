@@ -19,7 +19,8 @@ const MAX_PROJECT_NAME_CHARS = 80;
 const MAX_GOAL_CHARS = 400;
 
 const schema = z.object({
-  action: z.enum(['create', 'unfile', 'rename']),
+  action: z.enum(['create', 'rename', 'move_conversation', 'remove_conversation']),
+  target_project: z.string().trim().min(1).max(128).optional(),
   name: z.string().min(1).max(MAX_PROJECT_NAME_CHARS).optional(),
   todos: z.array(z.string().min(1).max(MAX_TODO_CHARS)).max(MAX_INITIAL_TODOS).optional(),
   goal: z.string().min(1).max(MAX_GOAL_CHARS).optional(),
@@ -33,18 +34,21 @@ export function createProjectSetupTool(opts: {
 }): AgentTool {
   return {
     name: 'project_setup',
-    description: 'Create or rename the project for this conversation, or undo its filing. '
-      + '`create` makes the project, opens it with the to-dos you pass, saves the goal you pass as its instructions, '
-      + 'and files this conversation under it when the turn ends; `unfile` returns the conversation to the unprojected list. '
-      + '`rename` saves a new name for its existing or just-created project immediately. '
-      + 'Use `todo_tasks` for a backlog that already has a project.',
+    description: 'Create or rename this conversation\'s project, move this conversation into an existing project, or remove it from its project without deleting either. '
+      + 'Conversation moves apply when this turn ends; creation and rename save immediately. '
+      + 'Use `todo_tasks` for backlog changes.',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['create', 'unfile', 'rename'],
-          description: 'create: a new project. unfile: undo filing. rename: rename this conversation\'s project.',
+          enum: ['create', 'rename', 'move_conversation', 'remove_conversation'],
+          description: 'create: new project, then file this conversation. rename: current or just-created project. '
+            + 'move_conversation: existing private project; no creation or resource edits. remove_conversation: move to the conversation list outside projects.',
+        },
+        target_project: {
+          type: 'string', minLength: 1, maxLength: 128,
+          description: 'Required only for move_conversation: an existing project ID or exact name in this account. Missing or ambiguous targets fail.',
         },
         name: {
           type: 'string',
@@ -79,11 +83,25 @@ export function createProjectSetupTool(opts: {
       if (!parsed.success) {
         return fail(parsed.error.issues.map((issue) => `${issue.path.join('.') || 'input'}: ${issue.message}`).join('; '));
       }
-      const { action } = parsed.data;
+      const action = parsed.data.action;
+      // Never silently discard an explicit destination and execute a different mutation.
+      if (action !== 'move_conversation' && parsed.data.target_project !== undefined) {
+        return fail('target_project is only valid for move_conversation');
+      }
       const ignored = action === 'create'
         ? []
         : (action === 'rename' ? ['todos', 'goal'] : ['name', 'todos', 'goal'])
           .filter((field) => (parsed.data as Record<string, unknown>)[field] !== undefined);
+
+      if (action === 'move_conversation') {
+        if (!parsed.data.target_project) return fail('target_project is required for move_conversation');
+        const result = await filing.moveConversationToExistingProject(opts.userId, opts.cid, parsed.data.target_project);
+        if (!result.ok) return fail((result as { error: string }).error);
+        return { content: JSON.stringify({
+          ok: true, action, project_id: result.project.project_id, project_name: result.project.name,
+          applies: result.applies, ...(ignored.length ? { ignored_fields: ignored } : {}),
+        }) };
+      }
 
       if (action === 'rename') {
         if (!parsed.data.name) return fail('name is required to rename a project');
@@ -98,7 +116,7 @@ export function createProjectSetupTool(opts: {
         };
       }
 
-      if (action === 'unfile') {
+      if (action === 'remove_conversation') {
         // Undoing moves the same bytes, so it waits for the same boundary the
         // filing does.
         const result = await filing.unfileConversation(opts.userId, opts.cid, { moveNow: false });
@@ -107,7 +125,7 @@ export function createProjectSetupTool(opts: {
             ...(ignored.length ? { ignored_fields: ignored } : {}),
           });
         }
-        log.info(`project unfile queued uid=${maskId(opts.userId)} cid=${maskId(opts.cid)}`);
+        log.info(`conversation removal queued uid=${maskId(opts.userId)} cid=${maskId(opts.cid)}`);
         return {
           content: JSON.stringify({
             ok: true,
@@ -159,6 +177,12 @@ export function createProjectSetupTool(opts: {
         }
       }
 
+      // The first to-do is this conversation's next step: opening or running
+      // it returns here once the conversation is in the project. The rest of
+      // the backlog links on its first run.
+      if (created.length) {
+        await projectTasks.recordTaskExecution(opts.userId, project.project_id, created[0], opts.cid);
+      }
       filing.setPendingConversationFilingTodoCount(opts.userId, opts.cid, project.project_id, created.length);
 
       log.info(`project set up uid=${maskId(opts.userId)} cid=${maskId(opts.cid)} pid=${maskId(project.project_id)}`

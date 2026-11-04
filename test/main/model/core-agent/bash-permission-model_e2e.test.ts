@@ -43,6 +43,9 @@ function state(): string {
 function context() {
   return { workingDir: workspace, state: { sandboxEnv } } as any;
 }
+function managedContext() {
+  return { workingDir: workspace, state: { sandboxEnv, commandSessionEnabled: true } } as any;
+}
 
 beforeEach(async () => {
   vi.resetModules();
@@ -117,6 +120,117 @@ function assertOutput(name = 'report.txt') {
 }
 
 describe('bash permission journey — deterministic native execution', () => {
+  it.each(['orders.py', 'reconcile.py'].flatMap(name => [
+    ...(process.platform === 'win32' ? ['file'] : ['file', 'heredoc', 'inline']).map(entry => [name, entry, 'small']),
+    [name, process.platform === 'win32' ? 'file' : 'heredoc', 'original'],
+  ]))('completes recorded local computation %s through %s on %s inputs without approval', async (name, entry, dataset) => {
+    const inputs: Record<string, string> = name === 'orders.py' ? {
+      'orders.ndjson': [
+        { status: 'completed', region: 'north', discount_cents: 5, items: [{ sku: 'alpha', qty: 2, unit_cents: 100 }] },
+        { status: 'completed', region: 'south', discount_cents: 0, items: [{ sku: 'beta', qty: 1, unit_cents: 50 }] },
+        { status: 'cancelled', region: 'south', discount_cents: 0, items: [{ sku: 'beta', qty: 100, unit_cents: 50 }] },
+      ].map(row => JSON.stringify(row)).join('\n') + '\n',
+    } : {
+      'orders.csv': 'order_id,customer_id,status\n1,A,completed\n2,B,completed\n3,A,cancelled\n',
+      'items.csv': 'order_id,qty,unit_cents\n1,2,100\n2,1,50\n3,100,50\n',
+      'refunds.csv': 'refund_id,order_id,amount_cents\nR1,1,20\nR1,1,20\nR2,3,100\n',
+      'customers.csv': 'customer_id,region\nA,north\n',
+    };
+    if (dataset === 'original') {
+      const fixture = name === 'orders.py' ? 'data-analysis-local' : 'data-analysis-joins';
+      for (const file of Object.keys(inputs)) inputs[file] = fs.readFileSync(path.resolve('test/fixtures/sqlite-local-analysis/data', fixture, file), 'utf8');
+    }
+    for (const [file, text] of Object.entries(inputs)) fs.writeFileSync(path.join(workspace, file), text);
+    const source = fs.readFileSync(path.resolve('test/fixtures/sqlite-local-analysis', name));
+    fs.writeFileSync(path.join(workspace, 'analysis.py'), source);
+    pendingDecision = 'deny';
+    const command = entry === 'file' ? 'python analysis.py'
+      : entry === 'heredoc' ? `python - <<'PY'\n${source.toString('utf8')}PY`
+        : `python -c '${source.toString('utf8').replace(/'/g, `'"'"'`)}'`;
+    const result = await bash.execute({ command }, context());
+    expect(result.isError, result.content).toBeFalsy();
+    expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+    expect(result.observations?.execution?.stderr.bytes).toBe(0);
+    expect(requests).toHaveLength(0);
+    const output = name === 'orders.py' ? 'analysis.json' : 'reconciliation.json';
+    const expected = dataset === 'original' ? (name === 'orders.py' ? {
+      completed_orders: 180, net_revenue_cents: 540000,
+      revenue_by_region: { north: 174000, south: 216000, west: 150000 }, top_sku_by_units: { sku: 'beta', units: 210 },
+    } : {
+      completed_orders: 4, gross_cents: 11200, refund_cents: 1800, net_cents: 9400,
+      revenue_by_region: { north: 3300, south: 4000, unknown: 2100 }, unmatched_customers: 1, duplicate_refunds: 1,
+    }) : name === 'orders.py' ? {
+      completed_orders: 2, net_revenue_cents: 245, revenue_by_region: { north: 195, south: 50 },
+      top_sku_by_units: { sku: 'alpha', units: 2 },
+    } : {
+      completed_orders: 2, gross_cents: 250, refund_cents: 20, net_cents: 230,
+      revenue_by_region: { north: 180, unknown: 50 }, unmatched_customers: 1, duplicate_refunds: 1,
+    };
+    expect(JSON.parse(fs.readFileSync(path.join(workspace, output), 'utf8'))).toEqual(expected);
+    for (const [file, text] of Object.entries(inputs)) expect(fs.readFileSync(path.join(workspace, file), 'utf8')).toBe(text);
+    expect(fs.readFileSync(path.join(workspace, 'analysis.py'))).toEqual(source);
+  });
+
+  it.each(['json.py', 'json/__init__.py', 'hashlib.py', 'json.pyc', 'json.native.so', 'json/__init__.native.pyd', 'JSON.PYD'])
+  ('requires approval for the data-analysis import shadow candidate %s', async module => {
+    fs.copyFileSync(path.resolve('test/fixtures/sqlite-local-analysis/orders.py'), path.join(workspace, 'analysis.py'));
+    const shadow = path.join(workspace, module);
+    fs.mkdirSync(path.dirname(shadow), { recursive: true });
+    fs.writeFileSync(shadow, 'raise RuntimeError("must not execute")');
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command: 'python analysis.py' }, context());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('external_mutation');
+    expect(requests[0].external_mutations?.every(f => !('resource' in f))).toBe(true);
+    expect(fs.existsSync(path.join(workspace, 'analysis.json'))).toBe(false);
+    expect(fs.existsSync(path.join(workspace, '__pycache__'))).toBe(false);
+  });
+
+  it('retains approval when the data-import scope exceeds the bounded inspection', async () => {
+    fs.copyFileSync(path.resolve('test/fixtures/sqlite-local-analysis/orders.py'), path.join(workspace, 'analysis.py'));
+    for (let i = 0; i < 1025; i++) fs.writeFileSync(path.join(workspace, `entry-${i}.txt`), 'unchanged');
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command: 'python analysis.py' }, context());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('external_mutation');
+    expect(fs.existsSync(path.join(workspace, 'analysis.json'))).toBe(false);
+    expect(fs.readFileSync(path.join(workspace, 'entry-0.txt'), 'utf8')).toBe('unchanged');
+  });
+
+  it('retains approval for a file-based PYTHONPATH importer without executing it', async () => {
+    fs.copyFileSync(path.resolve('test/fixtures/sqlite-local-analysis/orders.py'), path.join(workspace, 'analysis.py'));
+    const archive = path.join(workspace, 'modules.zip');
+    fs.writeFileSync(archive, Buffer.alloc(22));
+    pendingDecision = 'deny';
+    const ctx = context();
+    ctx.state.sandboxEnv = { ...sandboxEnv, PYTHONPATH: archive };
+    const result = await bash.execute({ command: 'python analysis.py' }, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('external_mutation');
+    expect(fs.readFileSync(archive)).toEqual(Buffer.alloc(22));
+    expect(fs.existsSync(path.join(workspace, 'analysis.json'))).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32').each(['json.py', 'json.native.so', 'json.pyc'])
+  ('retains approval before a combined command creates the import shadow %s', async module => {
+    fs.copyFileSync(path.resolve('test/fixtures/sqlite-local-analysis/orders.py'), path.join(workspace, 'analysis.py'));
+    pendingDecision = 'deny';
+    const command = `cat > ${module} <<'MODULE'\nraise RuntimeError('must not execute')\nMODULE\npython analysis.py`;
+    const result = await bash.execute({ command }, context());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('external_mutation');
+    expect(fs.existsSync(path.join(workspace, module))).toBe(false);
+    expect(fs.existsSync(path.join(workspace, 'analysis.json'))).toBe(false);
+  });
+
   it.each(['workspace_approval', 'all_files_auto'] as const)(
     'cleans a task-created build tree without a dialog and preserves a later user file in %s', async mode => {
       const permissions = await import('../../../../src/main/features/permissions');
@@ -160,15 +274,18 @@ describe('bash permission journey — deterministic native execution', () => {
     },
   );
 
+  // Current command-start paths: one-shot bash, managed bash continued through
+  // process_session, and the live-input interactive_cli session.
   it.runIf(process.platform !== 'win32').each([
     ['bash', 'workspace_approval'], ['bash', 'all_files_approval'],
-    ['process_session', 'workspace_approval'], ['process_session', 'all_files_approval'],
+    ['managed bash', 'workspace_approval'], ['managed bash', 'all_files_approval'],
+    ['interactive_cli', 'workspace_approval'], ['interactive_cli', 'all_files_approval'],
   ] as const)('cleans ordinary entries with redirection through %s in %s', async (name, mode) => {
     const permissions = await import('../../../../src/main/features/permissions');
     permissions.setLocalExecMode(mode);
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
-    const tool = createLocalTools({ userId: UID, cid: 'permission-journey', agentId: 'model-eval' })
-      .find(candidate => candidate.name === name)!;
+    const tools = createLocalTools({ userId: UID, cid: 'permission-journey', agentId: 'model-eval' });
+    const toolNamed = (toolName: string) => tools.find(candidate => candidate.name === toolName)!;
     pendingDecision = 'deny';
     for (const command of [
       'rmdir empty 2>/dev/null || true; printf verified',
@@ -178,24 +295,51 @@ describe('bash permission journey — deterministic native execution', () => {
     ]) {
       fs.mkdirSync(path.join(workspace, 'empty'));
       fs.writeFileSync(path.join(workspace, 'disposable.txt'), 'temporary');
-      let result = await tool.execute({ action: 'start', command }, context());
-      expect(result.isError, result.content).toBeFalsy();
-      if (name === 'process_session') {
+      if (name === 'interactive_cli') {
+        // Interactive sessions report the terminal state in their payload and
+        // carry no execution observation.
+        const interactive = toolNamed('interactive_cli');
+        const started = await interactive.execute({ action: 'start', command }, context());
+        expect(started.isError, started.content).toBeFalsy();
+        let payload = JSON.parse(started.content);
+        try {
+          await vi.waitFor(async () => {
+            if (payload.status === 'running') {
+              payload = JSON.parse((await interactive.execute({ action: 'read', session_id: payload.session_id }, context())).content);
+            }
+            expect(payload.status).toBe('exited');
+          }, { timeout: 5_000, interval: 50 });
+          expect(payload.exit_code).toBe(0);
+        } finally {
+          await interactive.execute({ action: 'close', session_id: payload.session_id }, context());
+        }
+      } else if (name === 'managed bash') {
+        // A zero initial wait returns the running session; the terminal
+        // execution observation arrives through process_session continuation.
+        const started = await toolNamed('bash').execute({ command, yield_time_ms: 0 }, managedContext());
+        expect(started.isError, started.content).toBeFalsy();
+        let result = started;
         let payload = JSON.parse(result.content);
+        expect(payload.status).toBe('running');
+        const continuation = toolNamed('process_session');
         const sessionId = payload.session_id;
         try {
           await vi.waitFor(async () => {
             if (payload.status === 'running') {
-              result = await tool.execute({ action: 'read', session_id: sessionId, cursor: payload.next_cursor }, context());
+              result = await continuation.execute({ action: 'read', session_id: sessionId, cursor: payload.next_cursor, yield_time_ms: 0 }, managedContext());
               payload = JSON.parse(result.content);
             }
             expect(payload.status).toBe('exited');
           }, { timeout: 5_000, interval: 50 });
         } finally {
-          if (payload.status === 'running') await tool.execute({ action: 'stop', session_id: sessionId }, context());
+          if (payload.status === 'running') await continuation.execute({ action: 'stop', session_id: sessionId }, managedContext());
         }
+        expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+      } else {
+        const result = await toolNamed('bash').execute({ command }, context());
+        expect(result.isError, result.content).toBeFalsy();
+        expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
       }
-      expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
       expect(requests).toHaveLength(0);
       expect(fs.existsSync(path.join(workspace, 'empty'))).toBe(false);
       expect(fs.readFileSync(path.join(workspace, 'input-a.txt'), 'utf8')).toBe('alpha\n');
@@ -208,12 +352,10 @@ describe('bash permission journey — deterministic native execution', () => {
     }
   });
 
-  it.runIf(process.platform !== 'win32').each(['bash', 'process_session'])(
+  it.runIf(process.platform !== 'win32').each(['bash', 'managed bash'] as const)(
     'checks redirection independently before any cleanup through %s', async name => {
-      expectedMainWarnings.push('bash filesystem mutation scope reject', 'bash filesystem read scope reject', 'interactive_cli_start risk denied');
-      const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
-      const tool = createLocalTools({ userId: UID, cid: 'permission-journey', agentId: 'model-eval' })
-        .find(candidate => candidate.name === name)!;
+      expectedMainWarnings.push('bash filesystem mutation scope reject', 'bash filesystem read scope reject');
+      const ctx = name === 'managed bash' ? managedContext() : context();
       const outside = path.join(root, 'outside.txt');
       fs.writeFileSync(outside, 'outside stays intact');
       fs.mkdirSync(path.join(workspace, 'empty'));
@@ -227,7 +369,7 @@ describe('bash permission journey — deterministic native execution', () => {
         ['rmdir empty > "$UNKNOWN_REDIRECT"', 'E_BASH_RISK_DENIED'],
         ['rm -r empty 2>/dev/null', 'E_BASH_RISK_DENIED'],
       ]) {
-        const result = await tool.execute({ action: 'start', command }, context());
+        const result = await bash.execute({ command }, ctx);
         expect(result.isError, command).toBe(true);
         expect(result.content).toContain(error);
         expect(fs.statSync(path.join(workspace, 'empty')).isDirectory()).toBe(true);
@@ -238,6 +380,34 @@ describe('bash permission journey — deterministic native execution', () => {
       expect(requests[1].reasons).toContain('destructive');
     },
   );
+
+  // interactive_cli deliberately skips the read/write path-scope guard for login
+  // flows (policy: only a removal target gates interactive_cli.start), so the
+  // redirection rows above do not apply. Removal targets stay behind the gate.
+  it.runIf(process.platform !== 'win32')('gates removal targets before any cleanup through interactive_cli', async () => {
+    expectedMainWarnings.push('bash filesystem mutation scope reject', 'interactive_cli_start risk denied');
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const interactive = createLocalTools({ userId: UID, cid: 'permission-journey', agentId: 'model-eval' })
+      .find(candidate => candidate.name === 'interactive_cli')!;
+    const outsideDir = path.join(root, 'outside-empty');
+    fs.mkdirSync(outsideDir);
+    fs.mkdirSync(path.join(workspace, 'empty'));
+    pendingDecision = 'deny';
+    for (const [command, error] of [
+      [`rmdir '${outsideDir}' 2>/dev/null`, 'E_BASH_PATH_OUT_OF_SCOPE'],
+      ['rmdir "$UNKNOWN_CLEANUP_DIR" 2>/dev/null; rmdir empty', 'E_BASH_RISK_DENIED'],
+      ['rm -r empty 2>/dev/null', 'E_BASH_RISK_DENIED'],
+    ]) {
+      const result = await interactive.execute({ action: 'start', command }, context());
+      expect(result.isError, command).toBe(true);
+      expect(result.content).toContain(error);
+      expect(fs.statSync(outsideDir).isDirectory()).toBe(true);
+      expect(fs.statSync(path.join(workspace, 'empty')).isDirectory()).toBe(true);
+    }
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+    expect(requests[1].reasons).toContain('destructive');
+  });
 
   it('never exempts raw-device writes just because ordinary cleanup is also present', async () => {
     const { bashDestructiveRiskIsOnlyProducedFileDeletion } = await import('../../../../src/main/model/core-agent/local-tools');
@@ -750,15 +920,16 @@ describe('bash permission journey — deterministic native execution', () => {
     expect(fs.existsSync(path.join(workspace, '.env'))).toBe(false);
   });
 
-  it('denies an outside SQLite write, then executes it once after explicit approval', async () => {
+  it.each(['execute', 'executescript'])('denies an outside SQLite write through %s, then executes it once after explicit approval', async api => {
     const permissions = await import('../../../../src/main/features/permissions');
     permissions.setLocalExecMode('all_files_approval');
     const database = path.join(root, 'outside.db');
     fs.writeFileSync(path.join(workspace, 'outside.py'), [
       'import sqlite3',
       `db = sqlite3.connect(${JSON.stringify(database)})`,
-      'db.execute("CREATE TABLE dogs (id integer)")',
-      'db.execute("INSERT INTO dogs VALUES (42)")',
+      `db.${api}("CREATE TABLE dogs (id integer)")`,
+      'for value in [42]:',
+      api === 'execute' ? ' db.execute("INSERT INTO dogs VALUES (?)", (value,))' : ' db.executescript("INSERT INTO dogs VALUES (42)")',
       'db.commit()',
       'print(db.execute("SELECT id FROM dogs").fetchall())',
     ].join('\n'));

@@ -56,6 +56,13 @@ import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 
 const log = createLogger('contexts');
 
+/** Source bytes are authoritative; failed derived admission is recoverable by
+ * ordinary reconciliation and must never turn a committed save into failure. */
+function enqueueCommittedContextSource(uid: string, relPath: string, op: 'upsert' | 'delete'): void {
+  try { kbIndexer.enqueue(uid, relPath, op); }
+  catch (error) { log.warn('library indexing deferred after local source change', { error: logErrorSummary(error) }); }
+}
+
 function warnContextFailure(message: string, error: unknown): void {
   const { message_hash, message_chars } = logErrorSummary(error);
   log.warn(message, { message_hash, message_chars });
@@ -512,7 +519,7 @@ export function writeContextFile(relpath: string, content: string): Result<{ pat
   if (path.basename(p) !== CONTEXTS_INDEX_FILENAME) {
     const uid = getActiveUserId();
     search.upsertContext(uid, relpath);
-    kbIndexer.enqueue(uid, relpath, 'upsert');
+    enqueueCommittedContextSource(uid, relpath, 'upsert');
   }
   return { ok: true, path: relpath };
 }
@@ -543,7 +550,7 @@ export function updateContextFile(relpath: string, content: string): Result<{ pa
   invalidateIndex();
   const uid = getActiveUserId();
   search.upsertContext(uid, relpath);
-  kbIndexer.enqueue(uid, relpath, 'upsert');
+  enqueueCommittedContextSource(uid, relpath, 'upsert');
   return { ok: true, path: relpath };
 }
 
@@ -585,7 +592,7 @@ export function uploadContextFile(relpath: string, raw: Buffer | Uint8Array | nu
   invalidateIndex();
   const uid = getActiveUserId();
   search.upsertContext(uid, relpath);
-  kbIndexer.enqueue(uid, relpath, 'upsert');
+  enqueueCommittedContextSource(uid, relpath, 'upsert');
   return { ok: true, path: relpath, bytes: buf.length };
 }
 
@@ -655,7 +662,7 @@ export async function importContextFileFromPath(
       }
       invalidateIndex();
       search.upsertContext(uid, relpath);
-      kbIndexer.enqueue(uid, relpath, 'upsert');
+      enqueueCommittedContextSource(uid, relpath, 'upsert');
       return { ok: true as const, path: relpath, bytes: source.bytes };
     });
     if (!result.ok) return result;
@@ -704,7 +711,7 @@ export function deleteContextTarget(
   invalidateIndex(userId);
   for (const r of droppedRels) {
     search.dropContext(userId, r);
-    kbIndexer.enqueue(userId, r, 'delete');
+    enqueueCommittedContextSource(userId, r, 'delete');
   }
   return { ok: true };
 }
@@ -787,6 +794,7 @@ export function copyContextEntryFromPath(
   sourceAbs: string,
   targetRel: string,
   userId: string = getActiveUserId(),
+  onCopied?: (absolutePath: string) => void,
 ): Result<{ path: string; fileCount: number; bytes: number }> {
   let targetAbs: string;
   try { targetAbs = resolvePath(targetRel, { userId }); }
@@ -810,6 +818,7 @@ export function copyContextEntryFromPath(
   if (checked.ok === false) return { ok: false, error: checked.error };
   try {
     copyLocalEntryExclusiveSync(sourceAbs, targetAbs, sourceStat.isDirectory());
+    onCopied?.(targetAbs);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     return { ok: false, error: code === 'EEXIST' || code === 'ERR_FS_CP_EEXIST'
@@ -819,7 +828,7 @@ export function copyContextEntryFromPath(
   invalidateIndex(userId);
   for (const rel of _collectRelsUnder(targetAbs, targetRel)) {
     search.upsertContext(userId, rel);
-    kbIndexer.enqueue(userId, rel, 'upsert');
+    enqueueCommittedContextSource(userId, rel, 'upsert');
   }
   return { ok: true, path: targetRel, fileCount: checked.fileCount, bytes: checked.bytes };
 }
@@ -856,11 +865,11 @@ export function renameContextEntry(
   invalidateIndex(userId);
   for (const r of oldRels) {
     search.dropContext(userId, r);
-    kbIndexer.enqueue(userId, r, 'delete');
+    enqueueCommittedContextSource(userId, r, 'delete');
   }
   for (const r of _collectRelsUnder(dst, dstRel)) {
     search.upsertContext(userId, r);
-    kbIndexer.enqueue(userId, r, 'upsert');
+    enqueueCommittedContextSource(userId, r, 'upsert');
   }
   return { ok: true, src: srcRel, dst: dstRel };
 }

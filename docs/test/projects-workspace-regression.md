@@ -76,3 +76,45 @@
 ## 邀请成员入口
 
 项目菜单保留“邀请成员”。点击只打开商业版说明，取消保持项目、工作区、草稿和焦点；只有明确点击下载才打开带当前有效语言的官方下载页。不得联系成员服务、发邀请或改写项目身份。所有界面语言以及窄窗口均应保持可操作。待办卡片和编辑器不显示真人责任人；可选 Agent 指派和“未指定”继续可用。
+
+## Shared instruction limit ownership
+
+The Projects owner includes `bin/project-instructions-contract.cjs`. Native
+project tools, the MCP bridge and both host writers share its 4,000 UTF-16
+code-unit limit. The host rejects oversized content without clipping or
+changing saved instructions; conditional replacement also preserves concurrent
+edits. `projects.test.ts` covers ASCII, CJK and supplementary Unicode at and
+above the boundary, unchanged state on rejection and corrected replacement.
+`project-state-tools-integration.test.ts` and local-agent `bridge.test.ts`
+cover scoped execution and conflict recovery. Inventory ownership does not
+change tool descriptions, limits, permissions or prompt assembly.
+
+The matching `.d.cts` file belongs to this contract but is build-only. Source
+packaging preflight must accept it, while the packaged entrypoint gate rejects
+a missing package exclusion. The executable `.cjs` helper remains shipped.
+
+## Local saves and derived background work
+
+Ordinary edits complete at durable local storage, including local validation,
+locks, attachment metadata and revision checks. Library extraction/vectorization
+does not extend that completion boundary or convert a committed mutation into a
+failed save. Explicit install and download operations retain their own remote
+completion and error contracts.
+
+- Hold the fixture embedder while saving global Library text, importing a path
+  and uploading a project source. Read exact stored bytes before embedding
+  completes; release and verify eventual ready state. Close the derived corpus
+  before saving, then resume/reconcile and verify indexing recovers without
+  resaving or duplicating the source. A throwing pending-status consumer cannot
+  strand an admitted job. Use controlled inference, never an actual model call.
+- Move between Libraries with failed post-removal index admission. A completed
+  local move succeeds and retains the destination; source/destination revision
+  and rollback guards still protect genuine copy/delete failures.
+- Confirm project instructions, names, Agent bindings, task attachments and
+  metadata are durable locally. Conditional revision conflicts still reject
+  without changing the source. No shared-project publication is implemented in
+  this build.
+
+Owners: `projects.test.ts`, `project_files.test.ts`, `project_tasks.test.ts`,
+`library-corpus-lifecycle.test.ts`, and `library_transfer_integration.test.ts`.
+These local fixture results do not establish Windows or Linux native acceptance.

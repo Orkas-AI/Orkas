@@ -148,3 +148,16 @@ automation cannot fully judge:
 2. Named Agent 以各自 `tool_list` 作为初始工具面，并只把 `tool_load` 用作低优先级、当前用户轮次的 Agent-dependency 兜底；匿名 Worker 固定使用 `workspace`、`web`、`library` 且不提供 `tool_load`。两者都不能发现 Commander 的 dispatch、marketplace 或 connector-install 能力。
 3. Commander 加载的分类不得传播给 Agent/Worker；Named Agent 自己加载的分类也不得跨用户轮次或传播给其他 Actor，每轮均按当前配置重建。
 4. `dispatch_to`、`hand_off_to`、`run_worker` 仍作为三个不同编排语义存在，不因分类加载而合并或改变终止边界。
+
+## Queued admission during Renderer reload
+
+Keep the preceding synthetic reply held while editing an attached queued message.
+Preserve an independent composer draft, reload, and let queue admission occur
+between the first history snapshot and the future-only event subscription.
+The subscription reconciliation must restore the canonical user bubble with both
+attachments exactly once alongside its reply, without forcing the reading position.
+Deleted, routing-only and unpersisted records remain absent; an aborted or
+superseded conversation read must not paint into another conversation. This is
+Renderer presentation recovery only and does not replay execution or alter model
+history. Deterministic sidebar cases cover the missed-record window and exact
+identity; the task-board E2E retains real reload, attachment and draft assertions.

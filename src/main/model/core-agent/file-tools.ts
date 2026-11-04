@@ -42,6 +42,8 @@ import {
   getCachedMeta,
   kindOf,
   NoTextError,
+  resolveTextEncoding,
+  TextEncodingMismatchError,
   UnsupportedFileKindError,
 } from '../../features/file_indexer';
 import { userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
@@ -548,18 +550,16 @@ function taggedReadRangeSchema(): Record<string, unknown> {
   };
 }
 
-/** Parse the provider-visible tagged range while retaining old flat fields for
- * already-running conversations and non-model callers. New and legacy forms
- * cannot be combined because their precedence would otherwise be ambiguous. */
+/** Parse the one provider-visible range shape before any file read. */
 function parseReadAddress(input: Record<string, unknown>): ReadAddressResult {
   const invalid = (error: string, reason: FileFailureDiagnostic['reason'], facts: Omit<FileFailureDiagnostic, 'code' | 'reason'> = {}): ReadAddressResult => ({
     error, diagnostic: { code: 'E_BAD_INPUT', reason, stage: 'input', ...facts },
   });
   const rawRange = input.range;
+  if (LEGACY_READ_RANGE_KEYS.some((key) => input[key] !== undefined)) {
+    return invalid('flat range fields are unsupported; use range.unit/start/end', 'range_conflict');
+  }
   if (rawRange !== undefined) {
-    if (LEGACY_READ_RANGE_KEYS.some((key) => input[key] !== undefined)) {
-      return invalid('`range` cannot be combined with legacy flat range fields', 'range_conflict');
-    }
     if (!rawRange || typeof rawRange !== 'object' || Array.isArray(rawRange)) {
       return invalid('`range` must be an object with unit, start, and end', 'range_shape');
     }
@@ -594,22 +594,32 @@ function parseReadAddress(input: Record<string, unknown>): ReadAddressResult {
       : { address: { charStart: numericStart, charEnd: numericEnd } };
   }
 
-  const hasCharRange = typeof input.charStart === 'number' || typeof input.charEnd === 'number';
-  const hasLineRange = typeof input.lineStart === 'number' || typeof input.lineEnd === 'number';
-  if (hasCharRange && hasLineRange) {
-    return invalid('use either charStart/charEnd or lineStart/lineEnd, not both', 'range_conflict');
-  }
-  return {
-    address: {
-      ...(typeof input.charStart === 'number' ? { charStart: input.charStart } : {}),
-      ...(typeof input.charEnd === 'number' ? { charEnd: input.charEnd } : {}),
-      ...(typeof input.lineStart === 'number' ? { lineStart: input.lineStart } : {}),
-      ...(typeof input.lineEnd === 'number' ? { lineEnd: input.lineEnd } : {}),
-    },
-  };
+  return { address: {} };
 }
 
 // ── read_files item executor ──────────────────────────────────────────────
+
+const READ_NOT_UTF8_RECOVERY = '<text-encoding-recovery>\n'
+  + 'This file is not valid UTF-8, so the text below may be garbled. Do not infer meaning from garbled text. '
+  + 'Read it again with `encoding` set to a likely encoding such as gb18030, big5, shift_jis or utf-16le, and check that the result reads correctly. '
+  + 'If none works and most of the text below reads correctly, work from it and tell the user which parts are unreadable. '
+  + 'Otherwise tell the user the file could not be decoded.\n'
+  + '</text-encoding-recovery>';
+const RAW_NOT_UTF8_RECOVERY = '<text-encoding-recovery>\n'
+  + 'This file is not valid UTF-8. '
+  + 'Read it again with `encoding` set to a likely encoding such as gb18030, big5, shift_jis or utf-16le, and check that the result reads correctly. '
+  + 'If none works, read it without raw_text to see whether most of it is readable; if not, tell the user the file could not be decoded.\n'
+  + '</text-encoding-recovery>';
+
+function textEncodingMismatch(displayPath: string, encoding: string): ToolResult {
+  return {
+    content: errText(
+      'E_TEXT_ENCODING',
+      `${displayPath}: the bytes are not valid ${encoding}. Try another likely encoding, or read it without encoding to see whether most of it is readable.`,
+    ),
+    isError: true,
+  };
+}
 
 /** Internal preparation only; page callbacks never escape read_files. */
 type PreparedFileRead = ToolResult & {
@@ -764,13 +774,28 @@ function createReadFileTool(
           }
           const bytes = await fs.promises.readFile(abs);
           let content: string;
+          // Decoded text is not the file's bytes, so it carries no hash or edit evidence.
+          if (input.encoding && input.encoding !== 'utf-8') {
+            const encoding = String(input.encoding);
+            try {
+              content = new TextDecoder(encoding, { fatal: true }).decode(bytes);
+            } catch {
+              return textEncodingMismatch(displayPath, encoding);
+            }
+            return {
+              content: JSON.stringify({ path: displayPath, encoding, content, total_chars: content.length }),
+              observations: {
+                fileReads: [{ path: abs, charRange: [0, content.length], lineRange: [1, content.split('\n').length] }],
+              },
+            };
+          }
           try {
             content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
           } catch {
             return {
               content: errText(
                 'E_RAW_TEXT_ENCODING',
-                `${displayPath}: raw_text requires valid UTF-8.`,
+                `${displayPath}: raw_text requires valid UTF-8.\n\n${RAW_NOT_UTF8_RECOVERY}`,
               ),
               isError: true,
             };
@@ -801,10 +826,11 @@ function createReadFileTool(
             : kind === 'text'
               ? await statFile(opts.userId, abs)
               : await withReadFilesExtractionSlot(() => statFile(opts.userId, abs));
+          const sourceBytes = meta?.bytes ?? sourceStat.size;
           const attrs = [
             `path="${displayPath}"`,
             `kind="${kind}"`,
-            `bytes="${sourceStat.size}"`,
+            `bytes="${sourceBytes}"`,
             ...(meta?.totalChars !== undefined ? [`total_chars="${meta.totalChars}"`] : []),
             ...(meta?.extractionEmpty ? ['extraction="empty_pages"'] : []),
           ];
@@ -812,7 +838,7 @@ function createReadFileTool(
             user_id: maskId(opts.userId),
             path: logPathRef(abs),
             kind,
-            bytes: sourceStat.size,
+            bytes: sourceBytes,
             total_chars: meta?.totalChars,
             extraction_empty: !!meta?.extractionEmpty,
           });
@@ -849,6 +875,7 @@ function createReadFileTool(
           // The shared estimator charges at least one token per four UTF-16
           // units. No larger body can fit, even before headers and preludes.
           maxContentChars: readFilesInlineTokenBudget(ctx, portableSkillDocument) * 4,
+          ...(input.encoding ? { encoding: String(input.encoding) } : {}),
           ...(hasLineRange
             ? {
               ...(address.lineStart !== undefined ? { lineStart: address.lineStart } : {}),
@@ -871,7 +898,7 @@ function createReadFileTool(
         const total = result.meta.totalChars ?? 0;
         const cs = result.range.charStart;
         const revision = kind === 'text' && result.sourceHash
-          ? issueFileRevision(ctx, abs, sourceStat.size, result.sourceHash)
+          ? issueFileRevision(ctx, abs, result.meta.bytes, result.sourceHash)
           : '';
         const runtimeBinding = resolvedPath.skillRef
           ? opts.skillRuntimeBindings?.get(resolvedPath.skillRef)
@@ -897,6 +924,7 @@ function createReadFileTool(
           entryReadPrelude,
           runtimeRequirementsPrelude,
           executionReadPrelude,
+          result.notUtf8 ? READ_NOT_UTF8_RECOVERY : '',
         ].filter(Boolean).join('\n\n');
         const renderPage = (body: string, includePrelude = true) => {
           const ce = cs + body.length;
@@ -923,6 +951,7 @@ function createReadFileTool(
             ] : ['has_more="false"']),
             ...(result.sourceHash ? [`file_hash="${result.sourceHash}"`] : []),
             ...(revision ? [`revision="${revision}"`] : []),
+            ...(result.encoding ? [`encoding="${result.encoding}"`] : []),
             ...(result.meta.extractionEmpty ? ['extraction="empty_pages"'] : []),
           ];
           const header = `<file ${attrs.join(' ')}>`;
@@ -954,6 +983,8 @@ function createReadFileTool(
             total_chars: total,
             start_line: result.startLine,
             end_line: lastLine,
+            ...(result.encoding ? { encoding: result.encoding } : {}),
+            ...(result.notUtf8 ? { not_utf8: true } : {}),
           });
           // skill_invoked attribution: when the LLM reads a SKILL.md body through
           // read_files, the body is the progressive-disclosure "use this skill"
@@ -978,8 +1009,9 @@ function createReadFileTool(
           }
           // Stamp the read-state baseline so a later edit_file accepts an edit
           // built on these bytes (read-before-edit) and rejects it if the file
-          // changed since (OCC). See read-tracker.ts.
-          recordRead(ctx, abs, undefined, result.sourceHash);
+          // changed since (OCC). See read-tracker.ts. A decoded page is not the
+          // file's bytes: an edit built on it would rewrite the source as UTF-8.
+          if (!result.encoding) recordRead(ctx, abs, undefined, result.sourceHash);
           return {
             content: page.content,
             // Skill pages retain the shared policy's wider inline ceiling.
@@ -1027,6 +1059,10 @@ function createReadFileTool(
           },
         };
       } catch (err) {
+        if (err instanceof TextEncodingMismatchError) {
+          log.info('read_files encoding rejected', { user_id: maskId(opts.userId), path: logPathRef(abs), encoding: err.encoding });
+          return textEncodingMismatch(displayPath, err.encoding);
+        }
         if (err instanceof NoTextError) {
           log.warn('read_files no text', { user_id: maskId(opts.userId), path: logPathRef(abs) });
           return { content: errText('E_NO_TEXT', `${displayPath}: ${err.kind} has no text representation`), isError: true };
@@ -1110,6 +1146,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
             properties: {
               path: { type: 'string', minLength: 1, description: 'Path relative to the working directory, a visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
               range: taggedReadRangeSchema(),
+              encoding: { type: 'string', minLength: 1, description: 'Decode a non-UTF-8 text file with this encoding label, such as gb18030, big5, shift_jis or utf-16le. Fails if the bytes are invalid for it.' },
             },
             required: ['path'],
           },
@@ -1120,7 +1157,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
         },
         raw_text: {
           type: 'boolean',
-          description: 'Return complete UTF-8 text as JSON {files:[{requested_path,ok,path,content,total_chars,file_hash}|{requested_path,ok:false,error}]}. Cannot combine with ranges/metadata_only. Large direct results may be persisted.',
+          description: 'Return complete text as JSON {files:[{requested_path,ok,path,content,total_chars,...}|{requested_path,ok:false,error}]}. UTF-8 results include file_hash; decoded results include encoding instead. Cannot combine with ranges/metadata_only. Large direct results may be persisted.',
         },
       },
       required: ['paths'],
@@ -1174,6 +1211,11 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
         const parsed = parseReadAddress(request);
         if (parsed.error) return invalid(parsed.error, parsed.diagnostic);
         const address = parsed.address!;
+        const encoding = request.encoding === undefined ? undefined : resolveTextEncoding(request.encoding);
+        if (encoding === null) {
+          return invalid(`unknown encoding ${JSON.stringify(request.encoding)?.slice(0, 80)}. Use a label such as gb18030, big5, shift_jis or utf-16le.`);
+        }
+        const item = { path: request.path, ...(encoding ? { encoding } : {}) };
         const hasLineRange = address.lineStart !== undefined || address.lineEnd !== undefined;
         if (hasLineRange) {
           const lineStart = address.lineStart !== undefined && Number.isFinite(address.lineStart)
@@ -1182,10 +1224,10 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           const lineEnd = address.lineEnd !== undefined && Number.isFinite(address.lineEnd)
             ? Math.max(lineStart, Math.trunc(address.lineEnd))
             : lineStart + 399;
-          return { path: request.path, lineStart, lineEnd };
+          return { ...item, range: { unit: 'line', start: lineStart, end: lineEnd } };
         }
         const hasCharacterRange = address.charStart !== undefined || address.charEnd !== undefined;
-        if (!hasCharacterRange) return { path: request.path };
+        if (!hasCharacterRange) return item;
         const start = address.charStart !== undefined && Number.isFinite(address.charStart)
           ? Math.max(0, Math.trunc(address.charStart))
           : 0;
@@ -1193,9 +1235,8 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           ? Math.max(start, Math.trunc(address.charEnd))
           : undefined;
         return {
-          path: request.path,
-          charStart: start,
-          charEnd: explicitEnd ?? start + READ_FILES_DEFAULT_SLICE_CHARS,
+          ...item,
+          range: { unit: 'char', start, end: explicitEnd ?? start + READ_FILES_DEFAULT_SLICE_CHARS },
         };
       });
       const inputFailure = itemErrors.find((result) => result?.observations?.fileFailure)?.observations?.fileFailure;

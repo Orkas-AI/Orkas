@@ -1152,6 +1152,39 @@ function addDesignContractAdvisories(
     });
   }
 
+  // Filled is not directed. On 2026-10-29 seven scenes carried word-for-word
+  // the same motion verbs and opening/resolved states; every presence check
+  // passed and every scene got the same generic slide-in. Advisory only.
+  if (scenes.length >= 3) {
+    const repeated: string[] = [];
+    const readers: Array<[string, (scene: Record<string, unknown>) => unknown]> = [
+      ['motion_verbs', (scene) => scene.motion_verbs ?? scene.motion_choreography ?? scene.motion],
+      ['opening_state', (scene) => scene.opening_state],
+      ['resolved_state', (scene) => scene.resolved_state],
+      ['beats', (scene) => scene.beats],
+    ];
+    for (const [field, read] of readers) {
+      const groups = new Map<string, number>();
+      for (const scene of scenes) {
+        const key = textFrom(read(scene)).replace(/\s+/g, ' ').trim().toLowerCase();
+        if (key) groups.set(key, (groups.get(key) || 0) + 1);
+      }
+      const largest = Math.max(0, ...groups.values());
+      if (largest >= 3 && largest * 2 > scenes.length) repeated.push(`${field} (${largest} of ${scenes.length} scenes)`);
+    }
+    if (repeated.length) {
+      const code = 'SCENE_DIRECTION_REPEATED';
+      issues.push({
+        code,
+        severity: designSeverity(code),
+        selector: `${sourceSelector}.scenes`,
+        message: `Scene art direction repeats the same wording across scenes: ${repeated.join(', ')}.`,
+        fixHint: 'Write each scene\'s own motion and states from what that scene shows and the reference shot it maps to (for example typing into the input, a camera pull-back to the card wall, half-second roster cuts), then make the HTML timeline follow them.',
+        source: 'orkas-native-design-contract',
+      });
+    }
+  }
+
   let repeatedLayoutRun = 1;
   let previousLayout = '';
   for (const scene of scenes) {
@@ -1295,10 +1328,9 @@ async function addReferenceFidelityIssues(
   if (!references.length) missing.push('references');
   if (!preserve.length) missing.push('preserve');
   if (!Array.isArray(fidelity.may_change)) missing.push('may_change');
+  // A review threshold is optional: the fidelity review falls back to its own
+  // floor (85 for exact, 70 otherwise), so its absence is not incomplete.
   const minimumScore = Number(verification.minimum_score);
-  if (!Number.isFinite(minimumScore) || minimumScore < DESIGN_QUALITY_DIMENSION_FLOOR || minimumScore > 100) {
-    missing.push('verification.minimum_score');
-  }
   if (missing.length) {
     // Advisory, not blocking. These four fields describe how faithfully the
     // design intends to follow its references; they change nothing that
@@ -1314,7 +1346,7 @@ async function addReferenceFidelityIssues(
       severity: 'warning',
       selector,
       message: `Concrete visual references have no executable fidelity contract: ${missing.join(', ')} missing or invalid. Nothing is blocked — this sets the bar the fidelity review scores against, so without it that review falls back to the default floor.`,
-      fixHint: 'Declare image/video references, exact/close/adapt fidelity, preserve/may-change rules, any layout or temporal anchors, and a scored review threshold.',
+      fixHint: 'Declare image/video references, exact/close/adapt fidelity, preserve/may-change rules, and any layout or temporal anchors.',
       source: 'orkas-native-design-contract',
     });
   }
@@ -2985,10 +3017,12 @@ export async function writeFrameContactSheet(
      *  and "@ 0s" on every cell would be false. */
     labelOnly?: boolean;
     columns?: number;
+    /** 16:9 cell width; reference sheets use larger cells than QA sheets. */
+    thumbWidth?: number;
   } = {},
 ): Promise<string> {
-  const thumbW = 320;
-  const thumbH = 180;
+  const thumbW = opts.thumbWidth || 320;
+  const thumbH = Math.round(thumbW * 9 / 16);
   const gap = 16;
   const cols = Math.min(opts.columns || 3, Math.max(1, samples.length));
   const rows = Math.max(1, Math.ceil(samples.length / cols));

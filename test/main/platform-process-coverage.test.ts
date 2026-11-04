@@ -79,6 +79,10 @@ const PROCESS_OWNER_SUITE: Record<string, ProcessOwner> = {
     suite: 'src/core-agent/test/sandbox.test.ts',
     evidence: 'SandboxExecutor',
   },
+  'src/core-agent/src/sandbox/windows-cleanup-batch.ts': {
+    suite: 'src/core-agent/test/windows-cleanup-batch.test.ts',
+    evidence: 'killProcessTree',
+  },
   'src/core-agent/src/tools/process-session.ts': {
     suite: 'src/core-agent/test/process-session.test.ts',
     evidence: 'getProcessSessionTools',
@@ -188,6 +192,11 @@ describe('platform process test ownership', () => {
       'test/main/features/connectors/mcp-client.test.ts',
       'test/main/util/shutdown.test.ts',
       'test/main/util/migrate-source-data-root.test.ts',
+      'test/main/features/desktop_background.test.ts',
+      'test/main/features/desktop_shutdown.test.ts',
+      'test/main/features/login_startup_boot.test.ts',
+      'test/main/features/login_startup.test.ts',
+      'test/main/util/app-tray.test.ts',
     ]) expect(selected).toContain(suite);
     for (const suite of selected.filter(arg => arg.endsWith('.test.ts'))) {
       expect(fs.existsSync(path.resolve(suite)), `native selection has a missing suite: ${suite}`).toBe(true);

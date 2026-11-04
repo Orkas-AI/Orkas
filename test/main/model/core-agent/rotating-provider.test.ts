@@ -1,7 +1,10 @@
+import { mapCoreAgentEvents } from '../../../../src/main/model/core-agent/event-mapper';
+import { t } from '../../../../src/main/i18n';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import { classifyRetryableError, classifyTransientNetworkError } from '../../../../src/core-agent/src/shared/errors';
 import {
+  ALL_CONFIGURED_RATE_LIMITED_MESSAGE,
   boundMessagesForImageLimit,
   createRotatingProvider,
   PROVIDER_EMPTY_NORMAL_CODE,
@@ -1820,6 +1823,43 @@ describe('rotating-provider › cross-provider fallback', () => {
 });
 
 describe('rotating-provider › complete calls and per-call stream policy', () => {
+  it('keeps a model that missed only a per-call first-content deadline for the next main request', async () => {
+    const silentThenWorking = (name: string) => ({
+      id: name, name,
+      async *stream(params: CompletionParams): AsyncIterable<StreamEvent> {
+        if (params.firstEventTimeoutMs === undefined) {
+          yield { type: 'text_delta', text: `${name} answered` } as any;
+          return;
+        }
+        yield { type: 'message_start' } as any;
+        await new Promise<void>((_resolve, reject) => {
+          params.signal?.addEventListener('abort', () => reject(params.signal?.reason), { once: true });
+        });
+      },
+      async complete() { throw new Error('unused'); },
+      async validateAuth() { return true; },
+    });
+    const only = createRotatingProvider({ providerId: 'test', candidates: [{
+      profileId: 'slow', providerId: 'slow-provider', modelId: 'slow-model', build: async () => silentThenWorking('slow') }] });
+    await expect(collect(only.stream({ ...PARAMS, firstEventTimeoutMs: 20 }))).rejects.toMatchObject({ code: 'PROVIDER_NO_FIRST_EVENT_TIMEOUT' });
+    // A repeat of the short call may wait again; the deadline bounds each one.
+    await expect(collect(only.stream({ ...PARAMS, firstEventTimeoutMs: 20 }))).rejects.toMatchObject({ code: 'PROVIDER_NO_FIRST_EVENT_TIMEOUT' });
+    expect((await collect(only.stream(PARAMS))).at(-1)).toMatchObject({ type: 'text_delta', text: 'slow answered' });
+
+    const fallbackUsed: string[] = [];
+    const chain = createRotatingProvider({ providerId: 'test', candidates: [
+      { profileId: 'slow', providerId: 'slow-provider', modelId: 'slow-model', build: async () => silentThenWorking('slow') },
+      { profileId: 'fallback', providerId: 'fallback-provider', modelId: 'fallback-model', build: async () => {
+        fallbackUsed.push('fallback');
+        return fakeProvider('fallback', { streamEvents: [{ type: 'text_delta', text: 'bounded summary' } as any] });
+      } },
+    ] });
+    expect((await collect(chain.stream({ ...PARAMS, firstEventTimeoutMs: 20 }))).at(-1)).toMatchObject({ text: 'bounded summary' });
+    expect((await collect(chain.stream(PARAMS))).at(-1)).toMatchObject({ text: 'slow answered' });
+    expect(fallbackUsed).toEqual(['fallback']);
+    expect(getCooldown('slow')).toBeUndefined();
+  });
+
   beforeEach(() => _clearAll());
 
   it('falls back when the first completion credential returns 401', async () => {
@@ -2113,6 +2153,7 @@ describe('rotating-provider › complete calls and per-call stream policy', () =
     });
 
     const completing = p.complete({ ...PARAMS, signal: controller.signal });
+    await vi.waitFor(() => expect(primaryBuilds).toBe(1));
     controller.abort(new Error('user stopped compaction'));
 
     await expect(completing).rejects.toThrow(/user stopped compaction/);
@@ -2603,4 +2644,129 @@ describe('committed stream resource ownership', () => {
     expect(closed).toBe(2);
     expect(builds).toBe(2);
   });
+});
+
+// A request the provider refused is repeated unchanged when the user presses
+// Continue. Rotation wraps it for the exhausted chain, and that wrapper must not
+// hide the status: the user needs the provider's reason and, from the second
+// refusal, to hear that retrying as is will not help.
+describe('rejected requests after the candidate chain ends', () => {
+  const REASON = 'Unknown parameter: stream_options';
+  async function refusedRun(names: string[], failureTrackingScope: object) {
+    const requests: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      requests.push(new URL(String(input)).hostname.split('.')[0]);
+      return new Response(JSON.stringify({ error: { type: 'invalid_request_error', message: REASON } }),
+        { status: 400, headers: { 'content-type': 'application/json' } });
+    }));
+    const rotating = createRotatingProvider({ providerId: 'custom', networkRetryDelayMs: () => 0,
+      candidates: names.map(name => ({ profileId: name, providerId: 'custom', modelId: 'fixture',
+        build: async () => createPiProvider({ provider: 'custom', apiKey: 'fixture', customModel: {
+          id: 'fixture', name: 'fixture', api: 'openai-completions', provider: 'custom',
+          baseUrl: `https://${name}.invalid/v1`, reasoning: false, input: ['text'],
+          contextWindow: 128000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        } }),
+      })),
+    });
+    const registry = new ProviderRegistry();
+    registry.registerFactory('custom', () => rotating);
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: 'custom', defaultModel: 'fixture' }, evolution: { enabled: false } }),
+      providers: registry, tools: [],
+    });
+    const events: any[] = [];
+    for await (const event of mapCoreAgentEvents(runner.runStream({ message: 'Continue' }), { failureTrackingScope })) events.push(event);
+    return { requests, error: events.find(event => event.type === 'error') };
+  }
+
+  it.each([
+    ['the only configured model', ['primary'], ['primary']],
+    ['every configured model', ['primary', 'fallback'], ['primary', 'fallback']],
+  ])('keeps the rejection facts when %s refuses the request', async (_label, names, expectedRequests) => {
+    _clearAll();
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const scope = {};
+      const first = await refusedRun(names, scope);
+      // Unchanged requests are not retried, so this was a refusal, not retries.
+      expect(first.requests).toEqual(expectedRequests);
+      expect(first.error).toMatchObject({ failureCode: 'provider_http_400', retryExhausted: true,
+        text: t('errors.model_request_rejected'),
+        detail: t('errors.provider_reply_detail', { detail: REASON }) });
+      expect(first.error.text).not.toContain(t('errors.model_request_rejected_repeated'));
+
+      const second = await refusedRun(names, scope);
+      expect(second.error.text).toContain(t('errors.model_request_rejected_repeated'));
+      expect(second.error.detail).toBe(t('errors.provider_reply_detail', { detail: REASON }));
+      for (const id of names) expect(getCooldown(id)).toBeUndefined();
+    } finally { vi.unstubAllGlobals(); warning.mockRestore(); _clearAll(); }
+  });
+});
+
+
+describe('rotating-provider request failure observation', () => {
+  it.each(['complete', 'stream'] as const)('retains SDK failure evidence after successful %s recovery', async method => {
+    _clearAll();
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
+    const fetchStub = vi.fn(async () => { throw new TypeError('fetch failed', {
+      cause: Object.assign(new Error('private-canary'), { code: 'ENOTFOUND' }),
+    }); });
+    vi.stubGlobal('fetch', fetchStub);
+    const observations: any[] = [];
+    let builds = 0;
+    const provider = createRotatingProvider({
+      providerId: 'openai-codex', networkRetryAttempts: 1, networkRetryDelayMs: () => 0,
+      onRequestFailure: failure => observations.push(failure),
+      candidates: [{ profileId: 'diagnostic-fixture', providerId: 'openai-codex', modelId: 'diagnostic-model',
+        build: async () => ++builds === 1
+          // Pin the transport contract, not a model in the changing SDK catalog.
+          ? createPiProvider({ provider: 'openai-codex', apiKey: `fixture.${token}.fixture`, customModel: {
+              id: 'diagnostic-model', name: 'Diagnostic fixture', api: 'openai-codex-responses',
+              provider: 'openai-codex', baseUrl: 'https://diagnostic.invalid/backend-api',
+              reasoning: false, input: ['text'], contextWindow: 200_000, maxTokens: 4_096,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, type: 'chat',
+            } })
+          : fakeProvider('recovered', { streamEvents: [{ type: 'text_delta', text: 'recovered' }], completeResult: {
+              content: [{ type: 'text', text: 'recovered' }], stopReason: 'end_turn', model: 'diagnostic-model',
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            } }),
+      }],
+    });
+    try {
+      if (method === 'complete') expect((await provider.complete(PARAMS)).content).toEqual([{ type: 'text', text: 'recovered' }]);
+      else {
+        const events = await collect(provider.stream(PARAMS));
+        expect(events.filter(event => event.type === 'error')).toEqual([]);
+        expect(events.filter(event => event.type === 'text_delta')).toEqual([{ type: 'text_delta', text: 'recovered' }]);
+        expect(events.filter(event => event.type === 'retry')).toHaveLength(1);
+      }
+      expect(observations).toMatchObject([{ phase: 'before_response', code: 'ENOTFOUND', aborted: false, elapsedMs: expect.any(Number) }]);
+      expect(fetchStub).toHaveBeenCalledTimes(1);
+      expect(builds).toBe(2);
+      expect(JSON.stringify(warning.mock.calls)).not.toContain('private-canary');
+    } finally { vi.unstubAllGlobals(); warning.mockRestore(); }
+  });
+});
+
+
+it('does not dispatch another model under a credential invalidated earlier in the same prepared request', async () => {
+  _clearAll();
+  const builds: string[] = [];
+  const failed: RotatingCandidate = { profileId: 'same-key', providerId: 'custom', modelId: 'first', build: async () => {
+    builds.push('first'); return fakeProvider('first', { throwBefore: Object.assign(new Error('invalid credential'), { status: 401 }) });
+  } };
+  const duplicate: RotatingCandidate = { profileId: 'same-key', providerId: 'custom', modelId: 'second', build: async () => {
+    builds.push('second'); return fakeProvider('second', { streamEvents: [{ type: 'text_delta', text: 'must not send' }] });
+  } };
+  const fallback: RotatingCandidate = { profileId: 'usable-key', providerId: 'custom', modelId: 'third', build: async () => {
+    builds.push('third'); return fakeProvider('third', { streamEvents: [{ type: 'text_delta', text: 'recovered' }] });
+  } };
+  try {
+    const provider = createRotatingProvider({ providerId: 'custom', candidates: [failed, duplicate, fallback] });
+    const result = await collect(provider.stream(PARAMS));
+    expect(builds).toEqual(['first', 'third']);
+    expect(result.filter(item => item.type === 'text_delta')).toEqual([{ type: 'text_delta', text: 'recovered' }]);
+    expect(getCooldown('same-key')?.kind).toBe('auth');
+  } finally { _clearAll(); }
 });

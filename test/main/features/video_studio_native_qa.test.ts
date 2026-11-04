@@ -1293,6 +1293,12 @@ describe('native VideoStudio draft QA parity', () => {
     expect(String(missingIssues[0].message)).toContain('visual_direction{visual_tradition');
     expect(String(missingIssues[0].message)).toContain('cover{scene_id');
     expect(String(missingIssues[0].fixHint)).toContain('COMPLETE in one pass');
+    // Nested under design_contract alone it was skipped: in the 2026-10-31
+    // retests every child that wrote the contract before its HTML passed the
+    // first check (8 of 8), and every one that wrote only HTML was blocked
+    // (7 of 7). The step is named at the top of the result too.
+    expect(missing).toMatchObject({ status: 'passed', next_action: 'write_art_direction_then_index_html' });
+    expect(String(missing.message)).toMatch(/no complete art_direction design contract yet[\s\S]*before writing index\.html/);
 
     // An empty contract shell teaches the WHOLE shape in one round: on
     // 2026-08-08 bare section names took two structurally guaranteed rounds
@@ -1326,6 +1332,7 @@ describe('native VideoStudio draft QA parity', () => {
     const partial = await prepareComposition({ compositionDirAbs: p.compositionDir });
     expect(partial.ok).toBe(true);
     expect(partial.design_contract).toMatchObject({ status: 'incomplete' });
+    expect(partial.next_action).toBe('write_art_direction_then_index_html');
     const codes = (partial.design_contract as { issues: Array<{ code: string }> }).issues.map((issue) => issue.code);
     expect(codes).toContain('DESIGN_CONTRACT_BUDGET_INCOMPLETE');
     expect(codes).toContain('AESTHETIC_THESIS_INCOMPLETE');
@@ -1333,6 +1340,19 @@ describe('native VideoStudio draft QA parity', () => {
     // context, and demanding a poster from a mid-film segment is the exact
     // misdirection the opening-only rule prevents.
     expect(codes.every((code) => !code.startsWith('COVER_'))).toBe(true);
+
+    // A complete contract adds nothing at the top of the result.
+    const complete = tmpProject('design-ready');
+    writeManifest(complete.compositionDir, {
+      composition: { id: 'main', width: 1920, height: 1080, duration: 10, fps: 30, language: 'en' },
+      scenes: [
+        { id: 'hook', start: 0, duration: 10, approved_copy: ['Start'], narration_refs: [], source_shots: [], roles: ['title', 'visual'] },
+      ],
+    });
+    const ready = await prepareComposition({ compositionDirAbs: complete.compositionDir });
+    expect(ready.design_contract).toMatchObject({ status: 'ready' });
+    expect(ready.next_action).toBeUndefined();
+    expect(ready.message).toBeUndefined();
   });
 
   it('reports imperative media, seek-unsafe callbacks, and silent narration in one preflight', async () => {
@@ -3385,6 +3405,41 @@ describe('native VideoStudio draft QA parity', () => {
     ]));
   });
 
+  it('warns when scene direction repeats word for word (the 2026-10-29 generic slide-in run)', async () => {
+    const p = tmpProject('scene-direction-repeated');
+    const ids = ['hook', 'goal', 'team', 'delivery'];
+    fs.writeFileSync(path.join(p.compositionDir, 'index.html'), [
+      '<!doctype html><html><body>',
+      '<main data-composition-id="main" data-width="1920" data-height="1080" data-duration="8">',
+      ...ids.map((id, i) => `<section class="clip" data-scene-id="${id}" data-start="${i * 2}" data-duration="2"><h1 data-role="title">${id}</h1></section>`),
+      '</main></body></html>',
+    ].join('\n'), 'utf8');
+    const meta: CompositionMeta = {
+      htmlPath: path.join(p.compositionDir, 'index.html'),
+      html: fs.readFileSync(path.join(p.compositionDir, 'index.html'), 'utf8'),
+      rootAttrs: {}, id: 'main', width: 1920, height: 1080, durationSec: 8, audioTracks: [],
+    };
+    const run = async () => (await runContractHtmlQa(meta, [], await loadDesignContract(p.compositionDir),
+      { path: path.join(p.compositionDir, 'scene-map.json'), exists: false, value: null }, p.compositionDir)).issues;
+    const boilerplate = { depth_layers: ['brand ground', 'product', 'accent'], motion_verbs: ['展开', '落位', '停留'],
+      opening_state: '标题与主体清晰可见', resolved_state: '完整呈现本场信息，至少停留两秒' };
+    writeContract(p.compositionDir, { scenes: Object.fromEntries(ids.map((id) => [id, { ...boilerplate }])) });
+    const repeated = (await run()).find((issue) => issue.code === 'SCENE_DIRECTION_REPEATED');
+    expect(repeated).toMatchObject({ severity: 'warning' });
+    expect(repeated?.message).toContain('motion_verbs (4 of 4 scenes)');
+    expect(repeated?.message).toContain('resolved_state (4 of 4 scenes)');
+
+    // Shared depth layers are a consistent brand system, not boilerplate; a
+    // minority of matching scenes is not either.
+    writeContract(p.compositionDir, { scenes: {
+      hook: { ...boilerplate, motion_verbs: ['slow push on the photo', 'masthead masks in'], opening_state: 'orca alone', resolved_state: 'masthead and promise locked' },
+      goal: { ...boilerplate, motion_verbs: ['type the goal', 'task rows expand'], opening_state: 'empty input', resolved_state: 'three tasks listed' },
+      team: { ...boilerplate, motion_verbs: ['half-second roster cuts'], opening_state: 'THE CAST', resolved_state: 'full roster' },
+      delivery: { ...boilerplate },
+    } });
+    expect((await run()).map((issue) => issue.code)).not.toContain('SCENE_DIRECTION_REPEATED');
+  });
+
   it('accepts depth and motion by meaning, not by one key spelling (the 2026-08-06 six-segment stall)', async () => {
     // Six compose segments carried {background, midground, foreground,
     // motion, hero_visual} per scene — the exact shape the old fixHint
@@ -5217,6 +5272,176 @@ describe('native VideoStudio draft QA parity', () => {
     })).toEqual(expect.arrayContaining(['-oj', '-l', 'zh']));
   });
 
+  it('passes whisper.cpp the base language of a locale tag', () => {
+    // whisper.cpp rejects region and script tags: `-l zh-CN` prints its usage
+    // and exits 0 with no transcript. speech.capabilities takes exactly such a
+    // tag in the same `language` field, and a 2026-10-31 Luna run reused it.
+    const languageArg = (language: string | undefined) => {
+      const args = buildSpeechTranscribeArgs('ggml-base-q5_1.bin', 'audio.wav', 'out', { language, timestamps: 'segment' });
+      return args[args.indexOf('-l') + 1];
+    };
+    const cases: Array<[string | undefined, string]> = [
+      ['zh-CN', 'zh'], ['zh_CN', 'zh'], ['ZH-cn', 'zh'], ['zh-Hans-CN', 'zh'], ['en-US', 'en'], ['yue-HK', 'yue'],
+      ['zh', 'zh'], ['Chinese', 'chinese'], ['AUTO', 'auto'], ['  ', 'auto'], [undefined, 'auto'],
+    ];
+    for (const [given, passed] of cases) expect(languageArg(given), String(given)).toBe(passed);
+  });
+
+  describe('speech.transcribe language outcomes', () => {
+    function fakeTranscriber(label: string, whisperBody: string[]) {
+      const p = tmpProject(label);
+      const input = path.join(p.root, 'raw.mp4');
+      fs.writeFileSync(input, 'fake media');
+      const ffprobe = path.join(p.root, 'ffprobe');
+      writeExecutable(ffprobe, [
+        '#!/usr/bin/env node',
+        'process.stdout.write(JSON.stringify({ format: { duration: "5" }, streams: [{ codec_type: "audio", codec_name: "aac" }] }));',
+        '',
+      ].join('\n'));
+      const ffmpeg = path.join(p.root, 'ffmpeg');
+      writeExecutable(ffmpeg, [
+        '#!/usr/bin/env node',
+        "require('node:fs').writeFileSync(process.argv[process.argv.length - 1], 'wav');",
+        '',
+      ].join('\n'));
+      const runtimeRoot = path.join(p.root, 'runtime');
+      writeExecutable(path.join(runtimeRoot, 'whisper', 'current', 'bin', 'whisper-cli'), ['#!/usr/bin/env node', ...whisperBody, '']
+        .join('\n'));
+      const model = path.join(runtimeRoot, 'whisper', 'current', 'models', 'ggml-base.bin');
+      fs.mkdirSync(path.dirname(model), { recursive: true });
+      fs.writeFileSync(model, 'model');
+      process.env.ORKAS_BUNDLED_FFMPEG = ffmpeg;
+      process.env.ORKAS_BUNDLED_FFPROBE = ffprobe;
+      process.env.ORKAS_RUNTIME_DIR = runtimeRoot;
+      delete process.env.ORKAS_WHISPER_CPP;
+      delete process.env.ORKAS_WHISPER_CLI;
+      delete process.env.ORKAS_WHISPER_MODEL;
+      return { root: p.root, input };
+    }
+
+    it('transcribes a locale-tagged request with the base language', async () => {
+      if (process.platform === 'win32') return;
+      const { root, input } = fakeTranscriber('transcribe-locale', [
+        "const fs = require('node:fs');",
+        "const args = process.argv.slice(2);",
+        "fs.writeFileSync(require('node:path').join(__dirname, 'argv.json'), JSON.stringify(args));",
+        "const base = args[args.indexOf('-of') + 1];",
+        "fs.writeFileSync(base + '.json', JSON.stringify({ result: { language: 'zh' }, transcription: [{ offsets: { from: 0, to: 1200 }, text: ' 你好' }] }));",
+      ]);
+      const transcript = path.join(root, 'project', 'transcripts', 'raw.json');
+      const res = await transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript, language: 'zh-CN', timestamps: 'segment' });
+      expect(res, JSON.stringify(res)).toMatchObject({ ok: true, transcript_path: transcript });
+      const argv = JSON.parse(fs.readFileSync(path.join(root, 'runtime', 'whisper', 'current', 'bin', 'argv.json'), 'utf8'));
+      expect(argv[argv.indexOf('-l') + 1]).toBe('zh');
+      expect(JSON.parse(fs.readFileSync(transcript, 'utf8')).text).toBe('你好');
+    });
+
+    it('names an unsupported language instead of reporting a missing transcript', async () => {
+      if (process.platform === 'win32') return;
+      const { input } = fakeTranscriber('transcribe-unknown-language', [
+        "console.error(\"whisper_lang_id: unknown language 'xx'\");",
+        "console.error(\"error: unknown language 'xx'\");",
+        "console.error('usage: whisper-cli [options] file0 file1 ...');",
+        'process.exit(0);',
+      ]);
+      const res = await transcribeSpeech({ inputAbsPath: input, language: 'xx-YY' });
+      expect(res).toMatchObject({ ok: false, op: 'speech.transcribe', errorCode: 'E_TRANSCRIBE_LANGUAGE_UNSUPPORTED' });
+      expect(res.message).toBe('Speech transcription does not support the language "xx-YY". '
+        + 'Use a two-letter language code such as zh or en, or auto.');
+    });
+
+    it('still reports a missing transcript when the language was accepted', async () => {
+      if (process.platform === 'win32') return;
+      const { input } = fakeTranscriber('transcribe-no-output', ["console.error('whisper_init: loaded');", 'process.exit(0);']);
+      const res = await transcribeSpeech({ inputAbsPath: input, language: 'zh' });
+      expect(res).toMatchObject({ ok: false, errorCode: 'E_TRANSCRIBE_NO_OUTPUT' });
+    });
+
+    it.each([
+      '{"transcription":[', 'null', '[]', '{}', '{"transcription":{}}',
+      '{"transcription":[null]}',
+      '{"transcription":[{"text":"Lost words","offsets":{"from":0,"to":null}}]}',
+    ])(
+      'rejects invalid speech.transcribe output %s without replacing an existing transcript', async raw => {
+        if (process.platform === 'win32') return;
+        const { root, input } = fakeTranscriber('transcribe-invalid-output', [
+          "const fs = require('node:fs'), args = process.argv.slice(2);",
+          `fs.writeFileSync(args[args.indexOf('-of') + 1] + '.json', ${JSON.stringify(raw)});`,
+        ]);
+        const transcript = path.join(root, 'existing.json');
+        const previous = '{"text":"Existing usable transcript"}\n';
+        fs.writeFileSync(transcript, previous);
+        const source = fs.readFileSync(input);
+
+        const rejected = await transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript });
+        expect(rejected).toMatchObject({ ok: false, errorCode: 'E_TRANSCRIBE_INVALID_OUTPUT' });
+        expect(String(rejected.message)).toContain('Try transcribing');
+        expect(String(rejected.message)).not.toContain(root);
+        expect(fs.readFileSync(transcript, 'utf8')).toBe(previous);
+        expect(fs.readFileSync(input)).toEqual(source);
+
+        // An explicit healthy retry can replace the preserved old result.
+        writeExecutable(path.join(root, 'runtime', 'whisper', 'current', 'bin', 'whisper-cli'), [
+          '#!/usr/bin/env node',
+          "const fs = require('node:fs'), args = process.argv.slice(2);",
+          "fs.writeFileSync(args[args.indexOf('-of') + 1] + '.json', JSON.stringify({ result: { language: 'en' }, transcription: [{ offsets: { from: 0, to: 1200 }, text: ' Pickup at the east entrance.' }] }));",
+          '',
+        ].join('\n'));
+        const recovered = await transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript });
+        expect(recovered).toMatchObject({ ok: true });
+        expect(JSON.parse(fs.readFileSync(transcript, 'utf8')).text).toBe('Pickup at the east entrance.');
+        expect(fs.readFileSync(input)).toEqual(source);
+      },
+    );
+
+    it('accepts a valid empty speech.transcribe result for silent audio', async () => {
+      if (process.platform === 'win32') return;
+      const { root, input } = fakeTranscriber('transcribe-silence', [
+        "const fs = require('node:fs'), args = process.argv.slice(2);",
+        "fs.writeFileSync(args[args.indexOf('-of') + 1] + '.json', JSON.stringify({ result: { language: 'en' }, transcription: [] }));",
+      ]);
+      const transcript = path.join(root, 'silence.json');
+      expect(await transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript })).toMatchObject({ ok: true });
+      expect(JSON.parse(fs.readFileSync(transcript, 'utf8'))).toMatchObject({ text: '', segments: [] });
+    });
+
+    it('preserves the prior speech.transcribe result after a partial write and supports an explicit retry', async () => {
+      if (process.platform === 'win32') return;
+      const { root, input } = fakeTranscriber('transcribe-write-failure', [
+        "const fs = require('node:fs'), args = process.argv.slice(2);",
+        "fs.writeFileSync(args[args.indexOf('-of') + 1] + '.json', JSON.stringify({ transcription: [{ offsets: { from: 0, to: 1200 }, text: ' New accurate result' }] }));",
+      ]);
+      const transcript = path.join(root, 'existing.json');
+      const previous = '{"text":"Previous usable result"}\n';
+      fs.writeFileSync(transcript, previous);
+      const source = fs.readFileSync(input);
+      const nativeFs = (await import('node:fs/promises')).default;
+      const writeFile = nativeFs.writeFile;
+      let injected = false;
+      const fault = vi.spyOn(nativeFs, 'writeFile').mockImplementation((async (file: any, data: any, ...args: any[]) => {
+        if (String(file) === transcript || String(file).startsWith(transcript + '.')) {
+          injected = true;
+          await (writeFile as any)(file, Buffer.from(data).subarray(0, 8), ...args);
+          throw Object.assign(new Error('Controlled write interruption'), { code: 'EIO' });
+        }
+        return (writeFile as any)(file, data, ...args);
+      }) as any);
+      syncBuiltinESMExports();
+      try {
+        await expect(transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript })).rejects.toMatchObject({ code: 'EIO' });
+      } finally {
+        fault.mockRestore();
+        syncBuiltinESMExports();
+      }
+      expect(injected).toBe(true);
+      expect(fs.readFileSync(transcript, 'utf8')).toBe(previous);
+      expect(fs.readFileSync(input)).toEqual(source);
+      expect(fs.readdirSync(root).filter(name => name.startsWith('existing.json.'))).toEqual([]);
+      expect(await transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript })).toMatchObject({ ok: true });
+      expect(JSON.parse(fs.readFileSync(transcript, 'utf8')).text).toBe('New accurate result');
+    });
+  });
+
   it('normalizes whisper.cpp full JSON into stable segment and word timestamps', () => {
     const normalized = normalizeWhisperTranscript({
       result: { language: 'zh' },
@@ -6527,6 +6752,26 @@ describe('P3c R2 scene segment assembly', () => {
     }
   });
 
+  it('does not evict an in-flight assembly workspace as a completed cache entry', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-segment-cache-active-'));
+    const workspace = path.join(root, '.segment-assembly-active');
+    const cached = path.join(root, 'completed');
+    for (const dir of [workspace, cached]) {
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, 'segment.mp4');
+      fs.writeFileSync(file, '');
+      fs.truncateSync(file, 2 * 1024 ** 3);
+    }
+    const removed: string[] = [];
+    try {
+      await pruneSegmentCache(root, async (dir) => { removed.push(dir); });
+      expect(removed).toEqual([]);
+      expect(fs.existsSync(workspace)).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   const ffmpegBins2 = bundledFfmpegPaths();
   it.skipIf(!ffmpegBins2.ffmpeg || !ffmpegBins2.ffprobe)(
     'assembles fully cached segments without a window and re-renders only changed scenes',
@@ -6646,6 +6891,9 @@ describe('P3c R2 scene segment assembly', () => {
         }), 'utf8');
       }
 
+      const nativeFs = (await import('node:fs/promises')).default;
+      const mkdirSpy = vi.spyOn(nativeFs, 'mkdir');
+      syncBuiltinESMExports();
       const assembled = await renderComposition({
         compositionDirAbs: p.compositionDir,
         outputAbsPath: p.outputPath,
@@ -6653,6 +6901,15 @@ describe('P3c R2 scene segment assembly', () => {
         segmentCacheDirAbs: cacheDir,
         visualSignature: visualSignatureV1,
       });
+      const workspaces = mkdirSpy.mock.calls.map(([dir]) => String(dir))
+        .filter((dir) => path.basename(dir).startsWith('.segment-assembly-'));
+      mkdirSpy.mockRestore();
+      syncBuiltinESMExports();
+      // Cache publication uses rename, which must stay on one filesystem even
+      // when the requested output directory is on an external drive.
+      expect(workspaces).toHaveLength(1);
+      expect(path.dirname(workspaces[0])).toBe(cacheDir);
+      expect(fs.existsSync(workspaces[0])).toBe(false);
       expect(assembled.ok, JSON.stringify(assembled)).toBe(true);
       expect((assembled as { render_profile?: { frame_pipeline?: string } }).render_profile?.frame_pipeline)
         .toBe('scene_segment_assembly');

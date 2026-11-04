@@ -212,14 +212,19 @@ describe('project to-do › end-to-end', () => {
     const created = await creator.create({ content: 'Execute only when requested' });
     expect(created.ok).toBe(true);
     const tid = created.task.id;
-    // A global to-do saved from a conversation points back there; a project
-    // backlog item links on its first run instead.
-    if (scope === 'global') expect(created.task).toMatchObject({ origin_cid: 'c_creator' });
-    else expect(created.task).not.toHaveProperty('origin_cid');
+    // A to-do saved from a conversation points back there. In a project only
+    // the conversation's first open to-do does, so a backlog split into several
+    // items is not funnelled back into one conversation: the rest link on
+    // their first run.
+    expect(created.task).toMatchObject({ origin_cid: 'c_creator' });
+    const sibling = await creator.create({ content: 'Split-out follow-up' });
+    expect(sibling.ok).toBe(true);
+    if (scope === 'global') expect(sibling.task).toMatchObject({ origin_cid: 'c_creator' });
+    else expect(sibling.task).not.toHaveProperty('origin_cid');
+    expect((await creator.delete(sibling.task.id)).ok).toBe(true);
     expect((await creator.update(tid, { status: 'progress' })).ok).toBe(true);
     expect((await creator.complete(tid)).ok).toBe(true);
-    if (scope === 'global') expect(await pt.getTask(UID, pid, tid)).toMatchObject({ origin_cid: 'c_creator' });
-    else expect(await pt.getTask(UID, pid, tid)).not.toHaveProperty('origin_cid');
+    expect(await pt.getTask(UID, pid, tid)).toMatchObject({ origin_cid: 'c_creator' });
     await creator.update(tid, { status: 'todo' });
 
     // The saved-from conversation does not exist in this fixture, so the run
@@ -243,6 +248,31 @@ describe('project to-do › end-to-end', () => {
     expect(await reloaded.listTasks(UID, pid)).toEqual([expect.objectContaining({
       id: tid, content: 'Final requirements', status: 'done', origin_cid: second.cid,
     })]);
+  });
+
+  it('links the next project to-do saved from a conversation once its earlier one is finished, without touching other conversations', async () => {
+    const { projects } = await load();
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const pid = await seedProject(projects);
+    const creator = createProjectTasksHandler(UID, pid, 'c_creator', new Map());
+    const first = await creator.create({ content: 'Draft the outline' });
+    expect(first).toMatchObject({ ok: true, task: { origin_cid: 'c_creator' } });
+    // Another conversation's next step is its own, whatever this one holds.
+    const elsewhere = await createProjectTasksHandler(UID, pid, 'c_other', new Map()).create({ content: 'Price the print run' });
+    expect(elsewhere).toMatchObject({ ok: true, task: { origin_cid: 'c_other' } });
+    expect((await creator.complete(first.task.id)).ok).toBe(true);
+    const next = await creator.create({ content: 'Write chapter one' });
+    expect(next).toMatchObject({ ok: true, task: { origin_cid: 'c_creator' } });
+  });
+
+  it('still saves a project to-do, unlinked, when its backlog cannot be read to decide the link', async () => {
+    const { pt, projects } = await load();
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const pid = await seedProject(projects);
+    vi.spyOn(pt, 'listTasks').mockRejectedValueOnce(new Error('backlog unreadable'));
+    const created = await createProjectTasksHandler(UID, pid, 'c_creator', new Map()).create({ content: 'Draft the outline' });
+    expect(created).toMatchObject({ ok: true, task: { content: 'Draft the outline' } });
+    expect(await pt.getTask(UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
   });
 
   it.each([

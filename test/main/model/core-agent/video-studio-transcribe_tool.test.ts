@@ -5,7 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('electron', () => ({}));
 
-// Exercise the public transcription tool with an explicit destination.
+// 2026-10-31 Luna drive: transcripts were never written into the project when
+// the model omitted transcript_path, so every later turn reported the ingest
+// records missing and redid the work. Omitting the path now saves the
+// transcript under project/transcripts/ and returns where.
 const UID = 'transcribe-tool';
 const ENV_KEYS = [
   'ORKAS_WORKSPACE_ROOT',
@@ -80,7 +83,7 @@ async function tool() {
 const body = (result: any) => JSON.parse(String(result.content).split('\n\n<file-renamed>')[0]);
 const transcriptsDir = () => path.join(workspace, 'project', 'transcripts');
 
-describe.skipIf(process.platform === 'win32')('video_studio speech.transcribe result safety', () => {
+describe.skipIf(process.platform === 'win32')('video_studio speech.transcribe transcript location', () => {
   it('returns an error and preserves the prior file when speech.transcribe produces corrupt JSON', async () => {
     const source = path.join(workspace, 'project', 'raw', 'clip.mp4');
     fs.writeFileSync(source, 'fake media');
@@ -99,6 +102,33 @@ describe.skipIf(process.platform === 'win32')('video_studio speech.transcribe re
     expect(body(result)).toMatchObject({ ok: false, errorCode: 'E_TRANSCRIBE_INVALID_OUTPUT' });
     expect(fs.readFileSync(transcript, 'utf8')).toBe('{"text":"Prior usable result"}\n');
     expect(fs.readFileSync(source, 'utf8')).toBe('fake media');
+  });
+
+  it('saves an unrequested transcript in the project, once per source file', async () => {
+    const source = path.join(workspace, 'project', 'raw', 'source.mp4');
+    const sameName = path.join(workspace, 'uploads', 'source.mp4');
+    fs.writeFileSync(source, 'fake media');
+    fs.mkdirSync(path.dirname(sameName), { recursive: true });
+    fs.writeFileSync(sameName, 'other media');
+    const t = await tool();
+    const ctx = { workingDir: workspace, state: {} } as any;
+
+    const first = body(await t.execute({ op: 'speech.transcribe', input_path: 'project/raw/source.mp4' }, ctx));
+    expect(first).toMatchObject({ ok: true, op: 'speech.transcribe' });
+    expect(path.dirname(first.transcript_path)).toBe(transcriptsDir());
+    expect(path.basename(first.transcript_path)).toMatch(/^source-[0-9a-f]{8}\.json$/);
+    expect(JSON.parse(fs.readFileSync(first.transcript_path, 'utf8')).text).toBe('Grow without hiring.');
+
+    // Re-transcribing the same file replaces its own transcript; another file
+    // with the same name gets its own.
+    const again = body(await t.execute({ op: 'speech.transcribe', input_path: source }, ctx));
+    expect(again.transcript_path).toBe(first.transcript_path);
+    const other = body(await t.execute({ op: 'speech.transcribe', input_path: 'uploads/source.mp4' }, ctx));
+    expect(path.dirname(other.transcript_path)).toBe(transcriptsDir());
+    expect(other.transcript_path).not.toBe(first.transcript_path);
+    expect(fs.readdirSync(transcriptsDir()).sort()).toEqual(
+      [path.basename(first.transcript_path), path.basename(other.transcript_path)].sort(),
+    );
   });
 
   it('keeps an explicit transcript_path and still refuses one outside the workspace', async () => {
@@ -124,4 +154,19 @@ describe.skipIf(process.platform === 'win32')('video_studio speech.transcribe re
     }
   });
 
+  it('returns the transcript without saving it when the default location is outside the workspace', async () => {
+    const source = path.join(workspace, 'project', 'raw', 'clip.mp4');
+    fs.writeFileSync(source, 'fake media');
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-transcribe-elsewhere-'));
+    try {
+      const t = await tool();
+      const result = body(await t.execute({ op: 'speech.transcribe', input_path: source }, { workingDir: elsewhere, state: {} } as any));
+      expect(result).toMatchObject({ ok: true, transcript_path: '' });
+      expect(result.summary.text).toBe('Grow without hiring.');
+      expect(fs.readdirSync(elsewhere)).toEqual([]);
+      expect(fs.existsSync(transcriptsDir())).toBe(false);
+    } finally {
+      fs.rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
 });

@@ -335,7 +335,7 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
       },
     },
     required: ['ref'],
-    description: 'Use only fields for the selected action. materialize takes ref only. Ignored legacy read/query fields are listed by request in ignored_fields; other incompatible fields are errors.',
+    description: 'Use only fields for the selected action. materialize takes ref only. Unused read/query fields are listed by request in ignored_fields; other incompatible fields are errors.',
   };
   const actionProperty = {
     type: 'string',
@@ -345,7 +345,7 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
   return {
     name: 'tool_result',
     description:
-      'Inspect oversized results using the literal opaque tool.hash ref from a prior <persisted-output ref="..."> marker, not read_files. Make at most one tool_result call per model step and batch up to eight currently needed same-action requests. Use only the selected action; never use a tool-call ID such as call_....',
+      'Inspect oversized tool results retained in the current agent session using the literal opaque tool.hash ref from a prior <persisted-output ref="..."> marker, not read_files. Make at most one tool_result call per model step and batch up to eight currently needed same-action requests. Use only the selected action; never use a tool-call ID such as call_....',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -409,7 +409,7 @@ async function materializeToolResults(
   opts: ToolResultToolsOpts,
   requests: unknown,
 ): Promise<RetrievalItemResult> {
-  const batch = batchItems({ requests }, 'requests', ['ref']);
+  const batch = batchItems({ requests }, 'requests');
   if (batch.error) return batch.error;
 
   const sources: Array<{ ref: string; path: string; bytes: number }> = [];
@@ -501,7 +501,7 @@ function createQueryTool(opts: ToolResultToolsOpts): AgentTool {
     },
     async execute(input, ctx) {
       const ledger = readLedger(ctx, opts);
-      const batch = batchItems(input, 'queries', ['ref', 'operation']);
+      const batch = batchItems(input, 'queries');
       if (batch.error) return batch.error;
       const worker = opts.queryExecutor ? null : new PersistedToolResultQueryWorker();
       const queryExecutor = opts.queryExecutor ?? worker!.query.bind(worker);
@@ -551,7 +551,7 @@ function createSearchTool(opts: ToolResultToolsOpts): AgentTool {
     },
     async execute(input, ctx) {
       const ledger = readLedger(ctx, opts);
-      const batch = batchItems(input, 'queries', ['ref', 'query']);
+      const batch = batchItems(input, 'queries');
       if (batch.error) return batch.error;
       return executeBatch(batch.items, ledger, (item, maxOutputTokens) =>
         executeSearchItem(opts, item, ledger, maxOutputTokens), String(input.notice ?? ''));
@@ -592,7 +592,7 @@ function createReadChunkTool(opts: ToolResultToolsOpts): AgentTool {
     },
     async execute(input, ctx) {
       const ledger = readLedger(ctx, opts);
-      const batch = batchItems(input, 'chunks', ['ref', 'cursor']);
+      const batch = batchItems(input, 'chunks');
       if (batch.error) return batch.error;
       return executeBatch(batch.items, ledger, (item, maxOutputTokens) =>
         executeReadChunkItem(opts, item, ledger, maxOutputTokens), String(input.notice ?? ''));
@@ -605,34 +605,13 @@ type RetrievalItemResult = Pick<ToolResult, 'content' | 'isError' | 'observation
 function batchItems(
   input: Record<string, unknown>,
   batchKey: 'queries' | 'chunks' | 'requests',
-  legacyRequired: string[],
 ): { items: Record<string, unknown>[]; error?: never } | { items?: never; error: RetrievalItemResult } {
   const rawBatch = input[batchKey];
-  if (rawBatch !== undefined) {
-    if (!Array.isArray(rawBatch) || rawBatch.length < 1 || rawBatch.length > TOOL_RESULT_BATCH_MAX_ITEMS) {
-      return {
-        error: error(
-          'E_BAD_INPUT',
-          `\`${batchKey}\` must contain 1-${TOOL_RESULT_BATCH_MAX_ITEMS} requests.`,
-        ),
-      };
-    }
-    return {
-      items: rawBatch.map((item) =>
-        item && typeof item === 'object' && !Array.isArray(item)
-          ? item as Record<string, unknown>
-          : {}),
-    };
+  if (!Array.isArray(rawBatch) || rawBatch.length < 1 || rawBatch.length > TOOL_RESULT_BATCH_MAX_ITEMS) {
+    return { error: error('E_BAD_INPUT', `\`${batchKey}\` must contain 1-${TOOL_RESULT_BATCH_MAX_ITEMS} requests.`) };
   }
-  if (!legacyRequired.every((key) => input[key] !== undefined)) {
-    return {
-      error: error(
-        'E_BAD_INPUT',
-        `Provide either \`${batchKey}\` or the legacy ${legacyRequired.map((key) => `\`${key}\``).join(' + ')} fields.`,
-      ),
-    };
-  }
-  return { items: [input] };
+  return { items: rawBatch.map((item) => item && typeof item === 'object' && !Array.isArray(item)
+    ? item as Record<string, unknown> : {}) };
 }
 
 async function executeBatch(
@@ -836,9 +815,14 @@ function executeSearchItem(
 
 /** Shared exact reader for authorized historical execution records. The
  * caller owns admission; this returns a source range, never another spill. */
-export function readToolResultExcerpt(toolResultsDir: string, ref: string, cursor: number, budget: number, ctx: ToolContext): ToolResult {
+type ReadChunkPresentation = {
+  continuation?: (cursor: number | 'done') => string;
+  history?: { recordId: string; toolCallId: string };
+};
+
+export function readToolResultExcerpt(toolResultsDir: string, ref: string, cursor: number, budget: number, ctx: ToolContext, presentation?: ReadChunkPresentation): ToolResult {
   const opts = { toolResultsDir, materializeDir: toolResultsDir, isProgrammaticToolCallContext: () => false };
-  return executeReadChunkItem(opts, { ref, cursor, maxTokens: budget }, readLedger(ctx, opts), budget);
+  return executeReadChunkItem(opts, { ref, cursor, maxTokens: budget }, readLedger(ctx, opts), budget, presentation);
 }
 
 function executeReadChunkItem(
@@ -846,6 +830,7 @@ function executeReadChunkItem(
   input: Record<string, unknown>,
   ledger: ToolResultReadLedger | null,
   maxOutputTokens: number,
+  presentation?: ReadChunkPresentation,
 ): RetrievalItemResult {
   const ref = String(input.ref || '').trim();
   const cursor = Number(input.cursor);
@@ -871,9 +856,14 @@ function executeReadChunkItem(
   if (cursor > totalChars) {
     return error('E_RESULT_CURSOR_RANGE', `cursor ${cursor} exceeds total_chars ${totalChars}.`);
   }
+  const { continuation, history } = presentation ?? {};
+  const tag = history ? 'history-tool-output' : 'tool-result-chunk';
+  const identity = history
+    ? `record_id="${escapeAttr(history.recordId)}" tool_call_id="${escapeAttr(history.toolCallId)}"`
+    : `ref="${escapeAttr(ref)}"`;
   const emptyEnvelope =
-    `<tool-result-chunk ref="${escapeAttr(ref)}" total_chars="${totalChars}" covered="${cursor}-${cursor}" next_cursor="done">\n\n` +
-    `</tool-result-chunk>`;
+    `<${tag} ${identity} total_chars="${totalChars}" covered="${cursor}-${cursor}" next_cursor="done">\n\n` +
+    `</${tag}>` + (continuation?.('done') ?? '');
   const payloadBudget = budget - estimateToolResultTokens(emptyEnvelope);
   if (payloadBudget < 64) return budgetError();
   // The cursor/end attributes grow with the selected payload, so reserving
@@ -886,9 +876,9 @@ function executeReadChunkItem(
     const end = cursor + text.length;
     const next = end < totalChars ? String(end) : 'done';
     return (
-      `<tool-result-chunk ref="${escapeAttr(ref)}" total_chars="${totalChars}" covered="${cursor}-${end}" next_cursor="${next}">\n` +
+      `<${tag} ${identity} total_chars="${totalChars}" covered="${cursor}-${end}" next_cursor="${next}">\n` +
       `${text}\n` +
-      `</tool-result-chunk>`
+      `</${tag}>` + (continuation?.(end < totalChars ? end : 'done') ?? '')
     );
   };
   let lo = 0;

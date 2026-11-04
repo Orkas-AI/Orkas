@@ -35,6 +35,7 @@
     "test:local-agents:prepare": "node scripts/run-local-agents-live.mjs --install-only",
     "test:runtime-path": "node scripts/run-tests.mjs run test/main/platform-process-coverage.test.ts test/main/features/connectors/local-cli.test.ts test/main/features/local_agents/bridge_skill_runner.test.ts test/main/features/generation_reference_assets.test.ts test/main/util/bundled-runtime.test.ts",
     "test:platform-native": "node scripts/run-platform-native-tests.mjs",
+    "test:startup-native": "node test/gui/run-startup-native.mjs",
     "test:video-studio-inspect-canary": "node test/gui/run-inspect-canary.mjs",
     "test:windows-native": "node scripts/run-windows-native-tests.mjs",
     "test:windows-stability": "node scripts/run-windows-stability-tests.mjs",
@@ -59,7 +60,11 @@
     "test:web-assist-input-canary": "node test/gui/run-web-assist-input-canary.mjs",
     "test:apps:e2e": "node scripts/run-e2e.cjs test --config playwright.apps.config.ts",
     "test:local-agents:lifecycle": "node scripts/run-local-agents-live.mjs --lifecycle --no-install",
-    "benchmark:local-agents": "node scripts/run-local-agents-live.mjs --benchmark --no-install"
+    "benchmark:local-agents": "node scripts/run-local-agents-live.mjs --benchmark --no-install",
+    "test:performance:portfolio": "node scripts/run-tests.mjs run test/main/features/search/resource-cost.test.ts test/main/features/search/search-progress.test.ts test/main/features/search/chat-snippets.test.ts test/main/features/search/chat-snippet-failure.test.ts test/main/features/kb_indexer.test.ts test/main/features/project_library_indexer.test.ts test/main/features/file_indexer.test.ts test/main/model/core-agent/file-tools.test.ts test/main/model/core-agent/office-tools.test.ts test/main/model/core-agent/office-batch.test.ts test/main/features/office/office_engine.test.ts test/main/features/library_transfer_integration.test.ts test/main/features/saved_apps.test.ts test/main/features/local_agents/runner.test.ts test/main/features/connectors/mcp-client.test.ts test/main/logger-delivery.test.ts src/core-agent/test/process-session.test.ts src/core-agent/test/run-program-worker-pool.test.ts src/core-agent/test/agent-runner.test.ts test/main/util/tool-result-save-retry.test.ts test/main/model/core-agent/local-tools.test.ts test/main/model/local-tools.test.ts test/main/model/core-agent/file-edit-handoff.test.ts test/main/model/core-agent/repository-search.test.ts test/main/util/office-extract.test.ts test/main/features/conversation-history-worker.test.ts src/core-agent/test/persistent-session.test.ts src/core-agent/test/apply-patch.test.ts test/main/model/core-agent/file-performance.test.ts test/main/features/office/office-readonly_e2e.test.ts",
+    "test:performance:ui": "node scripts/run-e2e.cjs test --config playwright.config.ts test/e2e/chat_e2e_send_responsiveness.spec.ts test/e2e/conversation_e2e_process_responsiveness.spec.ts test/e2e/search_e2e_rebuild.spec.ts",
+    "test:video-studio-product-capture-canary": "node test/gui/run-product-capture-canary.mjs",
+    "test:orkas-guide": "node scripts/run-tests.mjs run test/main/quality/orkas-guide-editions.test.ts test/main/quality/web-app-sdk-builtin.test.ts test/main/features/system_skills.test.ts test/main/model/skill-registry.test.ts test/main/util/builtin-resource-gate.test.ts"
   },
   "devDependencies": {
     "@electron/asar": "3.4.1",
@@ -75,10 +80,11 @@
     "semver": "7.8.5",
     "tar": "7.5.21",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.12"
+    "vitest": "^4.1.12",
+    "typebox": "1.4.3"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^1.3.0",
+    "@earendil-works/pi-ai": "^1.5.0",
     "@modelcontextprotocol/sdk": "^1.32.0",
     "@modelcontextprotocol/server": "2.3.1",
     "adm-zip": "^0.6.1",
@@ -97,12 +103,12 @@
     "tsx": "^4.21.0",
     "undici": "^7.30.1",
     "zod": "4.6.7",
-    "fast-xml-parser": "5.7.3",
-    "zod-to-json-schema": "3.25.2"
+    "zod-to-json-schema": "3.25.2",
+    "fast-xml-parser": "5.7.3"
   },
   "overrides": {
     "@anush008/tokenizers": "0.6.0",
-    "@hono/node-server": "2.0.11",
+    "@hono/node-server": "2.1.3",
     "esbuild": "0.28.1",
     "tar": "7.5.21",
     "zod": "4.6.7"

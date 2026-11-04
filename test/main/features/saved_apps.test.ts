@@ -1778,14 +1778,16 @@ describe('saved_apps › failure consistency and redacted errors', () => {
     const key = crypto.createHash('sha256').update(JSON.stringify(['saved', saved.id])).digest('hex');
     const local = path.join(tmpDir, UID, 'local/web_apps', key);
     fs.mkdirSync(local, { recursive: true }); fs.writeFileSync(path.join(local, 'data.sqlite'), 'records');
-    const fsp = await import('node:fs/promises');
-    const { rm } = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-    const spy = vi.spyOn(fsp, 'rm').mockImplementation(async (target, options) => {
-      if (String(target) === local) throw fault('EBUSY');
-      return rm(target, options);
+    const nodeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const rename = nodeFs.renameSync;
+    const spy = vi.spyOn(nodeFs, 'renameSync').mockImplementation((from, to) => {
+      if (String(from) === local) throw fault('EIO');
+      return rename(from,to);
     });
+    syncBuiltinESMExports();
     let failed: any;
-    try { failed = await savedApps.deleteSavedApp(UID, saved.id); } finally { spy.mockRestore(); }
+    try { failed = await savedApps.deleteSavedApp(UID, saved.id); } finally { spy.mockRestore(); syncBuiltinESMExports(); }
     expect(failed).toEqual({ ok: false, error: 'app_delete_failed' });
     expect(savedApps.listSavedApps(UID).map(app => app.id)).toEqual([saved.id]);
     expect(fs.readFileSync(path.join(APPS_ROOT(), saved.id, 'index.html'), 'utf8')).toContain('Delete later');
@@ -1926,6 +1928,46 @@ describe('saved_apps › delete interrupted by a process stop', () => {
 
   });
 
+  it.each(['EIO', 'EACCES'])('retains saved records when the app directory lookup fails with %s, then deletes on explicit retry', async code => {
+      const { savedApps } = await mods();
+      const saved = await savedApps.saveFromArtifact(UID, CID, await makeArtifact('Receiving log'));
+      const kept = await savedApps.saveFromArtifact(UID, CID, await makeArtifact('Unrelated log'));
+      if (!saved.ok || !kept.ok) throw new Error('save failed');
+      const data = seed(dataKey(saved.id)), other = seed(dataKey(kept.id));
+      const app = path.join(APPS_ROOT(), saved.id), entry = path.join(app, 'index.html');
+      const before = fs.readFileSync(entry);
+      expect(savedApps.listSavedApps(UID).map(a => a.id).sort()).toEqual([saved.id, kept.id].sort());
+      const nodeFs = (await import('node:fs')).default;
+      const { syncBuiltinESMExports } = await import('node:module');
+      const lstat = nodeFs.lstatSync;
+      const fault = vi.spyOn(nodeFs, 'lstatSync').mockImplementation(((target: any, ...args: any[]) => {
+        if (String(target) === app) throw Object.assign(new Error('PRIVATE app lookup unavailable'), { code });
+        return (lstat as any)(target, ...args);
+      }) as any);
+      syncBuiltinESMExports();
+      try {
+        expect.soft(await savedApps.deleteSavedApp(UID, saved.id)).toEqual({ ok: false, error: 'app_delete_failed' });
+      } finally { fault.mockRestore(); syncBuiltinESMExports(); }
+      expect.soft(fs.readFileSync(entry)).toEqual(before);
+      for (const roots of [data, other]) {
+        expect.soft(fs.existsSync(path.join(roots.local, 'data.sqlite'))).toBe(true);
+        expect.soft(fs.existsSync(path.join(roots.cloud, 'files/note.txt'))).toBe(true);
+      }
+      if (fs.existsSync(path.join(data.local, 'data.sqlite'))) expect(fs.readFileSync(path.join(data.local, 'data.sqlite'), 'utf8')).toBe('records');
+      if (fs.existsSync(path.join(data.cloud, 'files/note.txt'))) expect(fs.readFileSync(path.join(data.cloud, 'files/note.txt'), 'utf8')).toBe('note');
+      const intents = (await import('../../../src/main/paths')).userAppDeletesDir(UID);
+      expect(fs.existsSync(intents) ? fs.readdirSync(intents) : []).toEqual([]);
+      expect(savedApps.listSavedApps(UID).map(a => a.id).sort()).toEqual([saved.id, kept.id].sort());
+      expect(await savedApps.deleteSavedApp(UID, saved.id)).toEqual({ ok: true });
+      expect(await savedApps.deleteSavedApp(UID, saved.id)).toEqual({ ok: true });
+      expect(fs.existsSync(app)).toBe(false);
+      expect(fs.existsSync(data.local)).toBe(false);
+      expect(fs.existsSync(data.cloud)).toBe(false);
+      expect(savedApps.listSavedApps(UID).map(a => a.id)).toEqual([kept.id]);
+      expect(fs.readFileSync(path.join(other.local, 'data.sqlite'), 'utf8')).toBe('records');
+      expect(fs.readFileSync(path.join(other.cloud, 'files/note.txt'), 'utf8')).toBe('note');
+  });
+
   it.each(['app', 'cloud'] as const)('retains the app and private data when the %s deletion inventory cannot be read', async source => {
 
       const { savedApps } = await mods();
@@ -1956,7 +1998,7 @@ describe('saved_apps › delete interrupted by a process stop', () => {
 
   });
 
-  it.each(['after moving the app folder aside', 'after removing part of its data'] as const)(
+  it.each(['after detaching both data roots', 'after removing the first staged domain'] as const)(
     'completes a delete that stopped %s on the next listing, keeping unrelated data', async stage => {
 
         const { savedApps } = await mods();
@@ -1968,28 +2010,68 @@ describe('saved_apps › delete interrupted by a process stop', () => {
         const orphanKey = dataKey('ArrivingFromSync'), orphan = seed(orphanKey);
         const fsp = await import('node:fs/promises');
         const { rm } = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-        const stopAt = stage === 'after moving the app folder aside' ? doomed.local : doomed.cloud;
+        const stopAt = stage === 'after detaching both data roots' ? doomed.local : doomed.cloud;
         let stopped!: () => void; const reached = new Promise<void>(resolve => { stopped = resolve; });
         const halt = vi.spyOn(fsp, 'rm').mockImplementation(async (target, options) => {
-          if (String(target) === stopAt) { stopped(); return new Promise<void>(() => {}); } // the process stops here
+          if (String(target).startsWith(stopAt+'.') && String(target).endsWith('.tmp')) { stopped(); return new Promise<void>(() => {}); } // the process stops here
           return rm(target, options);
         });
         void savedApps.deleteSavedApp(UID, saved.id);
         await reached; halt.mockRestore();
         expect(fs.existsSync(path.join(APPS_ROOT(), saved.id))).toBe(false);
-        expect(fs.existsSync(doomed.cloud)).toBe(true);
+        expect(fs.existsSync(doomed.cloud)).toBe(false);
+        const pending = JSON.parse(fs.readFileSync(path.join((await import('../../../src/main/paths')).userAppDeletesDir(UID), saved.id+'.json'),'utf8'));
+        expect(fs.existsSync(path.join(path.dirname(doomed.cloud),pending.dataStaging.cloud))).toBe(true);
 
         const next = await restart();
         expect(next.listSavedApps(UID).map(app => app.id)).toEqual([kept.id]);
         await vi.waitFor(() => { expect(fs.existsSync(doomed.local)).toBe(false); expect(fs.existsSync(doomed.cloud)).toBe(false); });
         for (const root of [keptData.local, keptData.cloud, orphan.local, orphan.cloud]) expect(fs.readdirSync(root).length).toBeGreaterThan(0);
-        expect(fs.readdirSync(APPS_ROOT()).sort()).toEqual([kept.id]);
+        await vi.waitFor(() => expect(fs.readdirSync(APPS_ROOT()).sort()).toEqual([kept.id]));
         const later = await restart();
         expect(later.listSavedApps(UID).map(app => app.id)).toEqual([kept.id]);
         await new Promise(resolve => setTimeout(resolve, 50));
         for (const root of [keptData.local, keptData.cloud, orphan.local, orphan.cloud]) expect(fs.existsSync(root)).toBe(true);
 
     });
+
+  it('defers interrupted deletion while the original app is unreadable, then voids its uncommitted intent', async () => {
+      const { savedApps } = await mods();
+      const saved = await savedApps.saveFromArtifact(UID, CID, await makeArtifact('Retain receiving records'));
+      if (!saved.ok) throw new Error(saved.error);
+      const data = seed(dataKey(saved.id)), app = path.join(APPS_ROOT(), saved.id);
+      const intents = (await import('../../../src/main/paths')).userAppDeletesDir(UID);
+      fs.mkdirSync(intents, { recursive: true });
+      const intent = path.join(intents, saved.id + '.json');
+      // Durable state after the intent is flushed but before the app folder moves.
+      const journal = JSON.stringify({ version: 1, appId: saved.id, files: ['index.html', '__orkas-meta.json'], cloudFiles: ['state.json', 'files/note.txt'] });
+      fs.writeFileSync(intent, journal);
+      const next = await restart();
+      const nodeFs = (await import('node:fs')).default;
+      const { syncBuiltinESMExports } = await import('node:module');
+      const lstat = nodeFs.lstatSync, exists = nodeFs.existsSync;
+      const faults = [
+        vi.spyOn(nodeFs, 'existsSync').mockImplementation(target => String(target) === app ? false : exists(target)),
+        vi.spyOn(nodeFs, 'lstatSync').mockImplementation(((target: any, ...args: any[]) => {
+          if (String(target) === app) throw Object.assign(new Error('PRIVATE recovery lookup unavailable'), { code: 'EACCES' });
+          return (lstat as any)(target, ...args);
+        }) as any),
+      ];
+      syncBuiltinESMExports();
+      try {
+        expect(() => next.listSavedApps(UID)).toThrow('app_list_failed');
+        // This public entry waits for the pending recovery before handling an absent ID.
+        expect(await next.deleteSavedApp(UID, 'MissingControl')).toEqual({ ok: true });
+      } finally { for (const fault of faults) fault.mockRestore(); syncBuiltinESMExports(); }
+      expect.soft(fs.existsSync(intent)).toBe(true);
+      expect.soft(fs.existsSync(path.join(data.local, 'data.sqlite'))).toBe(true);
+      expect.soft(fs.existsSync(path.join(data.cloud, 'files/note.txt'))).toBe(true);
+      if (fs.existsSync(intent)) expect(fs.readFileSync(intent, 'utf8')).toBe(journal);
+      expect(next.listSavedApps(UID).map(a => a.id)).toEqual([saved.id]);
+      expect(fs.existsSync(intent)).toBe(false);
+      expect(fs.readFileSync(path.join(app, 'index.html'), 'utf8')).toContain('Retain receiving records');
+      if (fs.existsSync(path.join(data.local, 'data.sqlite'))) expect(fs.readFileSync(path.join(data.local, 'data.sqlite'), 'utf8')).toBe('records');
+  });
 
   it('leaves no delete intent after a completed or a failed delete', async () => {
 
@@ -1999,19 +2081,22 @@ describe('saved_apps › delete interrupted by a process stop', () => {
       if (!done.ok || !failed.ok) throw new Error('save failed');
       seed(dataKey(done.id)); const failedData = seed(dataKey(failed.id));
       expect(await savedApps.deleteSavedApp(UID, done.id)).toEqual({ ok: true });
-      const fsp = await import('node:fs/promises');
-      const { rm } = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-      const spy = vi.spyOn(fsp, 'rm').mockImplementation(async (target, options) => {
-        if (String(target) === failedData.cloud) throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' });
-        return rm(target, options);
+      const nodeFs = (await import('node:fs')).default;
+      const { syncBuiltinESMExports } = await import('node:module');
+      const rename = nodeFs.renameSync;
+      const spy = vi.spyOn(nodeFs, 'renameSync').mockImplementation((from,to) => {
+        if (String(from) === failedData.cloud) throw Object.assign(new Error('fixture cloud detachment failure'), { code:'EIO' });
+        return rename(from,to);
       });
+      syncBuiltinESMExports();
       try { expect(await savedApps.deleteSavedApp(UID, failed.id)).toEqual({ ok: false, error: 'app_delete_failed' }); }
-      finally { spy.mockRestore(); }
+      finally { spy.mockRestore(); syncBuiltinESMExports(); }
       // A later start neither re-deletes the completed app nor finishes the refused one.
       const next = await restart();
       expect(next.listSavedApps(UID).map(app => app.id)).toEqual([failed.id]);
       await new Promise(resolve => setTimeout(resolve, 50));
       expect(fs.readFileSync(path.join(failedData.cloud, 'state.json'), 'utf8')).toBe('{}');
+      expect(fs.readFileSync(path.join(failedData.local, 'data.sqlite'), 'utf8')).toBe('records');
       expect(fs.readFileSync(path.join(APPS_ROOT(), failed.id, 'index.html'), 'utf8')).toContain('Delete fails');
 
   });

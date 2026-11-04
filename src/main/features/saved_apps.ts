@@ -34,7 +34,7 @@ import { t } from '../i18n';
 import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { isPathAllowed } from '../util/path-sandbox';
-import { renameWithRetrySync, writeTextAtomicSync } from '../storage';
+import { atomicTmpPath, isAtomicWriteTempPath, renameWithRetrySync, writeTextAtomicSync } from '../storage';
 
 const log = createLogger('saved_apps');
 
@@ -569,10 +569,17 @@ function bindSave(uid: string, cid: string, artifactId: string, appId: string, s
 
 export async function saveFromArtifact(userId: string, cid: string, artifactId: string, mode: SaveMode = 'new', recovery?:SaveRecovery, source?: PathSource): Promise<Result<{ id: string; title: string; entry?:string }>> {
   const key = JSON.stringify([userId, cid]);
-  activeEditSaves.set(key, (activeEditSaves.get(key) || 0) + 1);
   // Keep each conversation's recovery journal exclusive, and share the source
   // queue when different conversations save the same workspace bundle.
-  const queueKeys = source ? [key, JSON.stringify([userId, 'source', pathSourceKey(source.rootDir)])] : [key];
+  let queueKeys: string[];
+  try { queueKeys = source ? [key, JSON.stringify([userId, 'source', pathSourceKey(source.rootDir)])] : [key]; }
+  catch (error) {
+    log.warn('saveFromArtifact source unavailable', { error: logErrorSummary(error) });
+    return { ok: false, error: 'app_save_failed' };
+  }
+  // Source identity can fail before admission; acquire activity only after it
+  // resolves so every acquired save reaches the matching finally below.
+  activeEditSaves.set(key, (activeEditSaves.get(key) || 0) + 1);
   const previous = queueKeys.map(queueKey => saveQueues.get(queueKey)?.catch(() => {}));
   const saving = Promise.all(previous).then(() => saveArtifact(userId, cid, artifactId, mode, recovery, source));
   for (const queueKey of queueKeys) saveQueues.set(queueKey, saving);
@@ -770,28 +777,33 @@ export async function saveFromPath(
   targetPath: string,
   opts: BundleInspectOptions & { title?: unknown; sourceCid?: unknown; mode?: SaveMode; recovery?:SaveRecovery } = {},
 ): Promise<Result<{ id: string; title: string; rootDir: string; entry: string; fileCount: number; totalBytes: number }>> {
-  const inspected = await inspectBundle(targetPath, opts);
-  if (!inspected.ok) return { ok: false, error: (inspected as { ok: false; error: string }).error };
-  if (!inspected.canSave) return { ok: false, error: (inspected as { ok: true; canSave: false; reason: string }).reason };
-  try { storedAppType(inspected.rootDir); }
-  catch { return { ok: false, error: 'app_edit_target_missing' }; }
-
-  const title = sanitiseTitle(opts.title || inspected.title);
-  const sourceCid=typeof opts.sourceCid==='string'?opts.sourceCid:'';
-  const assistance=sourceCid?(await chats.getConversationMetadata(userId,sourceCid))?.assistance:undefined;
-  let editType:AppType|undefined;
-  try{editType=sourceCid?(await getEditTarget(userId,sourceCid))?.appType:undefined;}
-  catch(err){log.warn('saveFromPath edit binding unavailable',{error:logErrorSummary(err)});return {ok:false,error:'app_edit_target_missing'};}
-  const appType:AppType=editType??(assistance?.kind==='app_creation'?assistance.appType??'local':storedAppType(inspected.rootDir)??'local');
-  const realRoot=inspected.realRoot!;
-  const operationCid = sourceCid || `file-${pathSourceKey(realRoot)}`;
-  const result = await saveFromArtifact(userId,operationCid,'',opts.mode ?? 'new',opts.recovery,{
-    rootDir:realRoot,bindingRoot:inspected.rootDir,entry:inspected.entry,
-    explicitEntry:/\.html?$/i.test(targetPath)&&fs.statSync(targetPath).isFile(),
-    explicitTitle:!!opts.title,title,files:inspected.files!.map(file=>path.join(realRoot,path.relative(inspected.rootDir,file))),appType,sourceCid,
-  });
-  if (result.ok === false) return result;
-  return {...result,rootDir:inspected.rootDir,entry:result.entry!,fileCount:inspected.fileCount,totalBytes:inspected.totalBytes};
+  try {
+    const inspected = await inspectBundle(targetPath, opts);
+    if (!inspected.ok) return { ok: false, error: (inspected as { ok: false; error: string }).error };
+    if (!inspected.canSave) return { ok: false, error: (inspected as { ok: true; canSave: false; reason: string }).reason };
+    try { storedAppType(inspected.rootDir); }
+    catch { return { ok: false, error: 'app_edit_target_missing' }; }
+  
+    const title = sanitiseTitle(opts.title || inspected.title);
+    const sourceCid=typeof opts.sourceCid==='string'?opts.sourceCid:'';
+    const assistance=sourceCid?(await chats.getConversationMetadata(userId,sourceCid))?.assistance:undefined;
+    let editType:AppType|undefined;
+    try{editType=sourceCid?(await getEditTarget(userId,sourceCid))?.appType:undefined;}
+    catch(err){log.warn('saveFromPath edit binding unavailable',{error:logErrorSummary(err)});return {ok:false,error:'app_edit_target_missing'};}
+    const appType:AppType=editType??(assistance?.kind==='app_creation'?assistance.appType??'local':storedAppType(inspected.rootDir)??'local');
+    const realRoot=inspected.realRoot!;
+    const operationCid = sourceCid || `file-${pathSourceKey(realRoot)}`;
+    const result = await saveFromArtifact(userId,operationCid,'',opts.mode ?? 'new',opts.recovery,{
+      rootDir:realRoot,bindingRoot:inspected.rootDir,entry:inspected.entry,
+      explicitEntry:/\.html?$/i.test(targetPath)&&fs.statSync(targetPath).isFile(),
+      explicitTitle:!!opts.title,title,files:inspected.files!.map(file=>path.join(realRoot,path.relative(inspected.rootDir,file))),appType,sourceCid,
+    });
+    if (result.ok === false) return result;
+    return {...result,rootDir:inspected.rootDir,entry:result.entry!,fileCount:inspected.fileCount,totalBytes:inspected.totalBytes};
+  } catch (error) {
+    log.warn('saveFromPath failed', { error: logErrorSummary(error) });
+    return { ok: false, error: failureCode(error, 'app_save_failed') };
+  }
 }
 
 /** List the user's saved apps, newest save first. */
@@ -967,7 +979,8 @@ export function renameSavedApp(userId: string, appId: string, title: unknown): R
 }
 
 /** Delete a saved app (`rm -rf saved_apps/<appId>/`). */
-export async function deleteSavedApp(userId: string, appId: string): Promise<Result> {
+type DeleteResult = Result & { recoveryPending?: true };
+export async function deleteSavedApp(userId: string, appId: string): Promise<DeleteResult> {
   recoverEditedSaves(userId);
   let safeId: string;
   try { safeId = safeAppId(appId); }
@@ -976,14 +989,39 @@ export async function deleteSavedApp(userId: string, appId: string): Promise<Res
   return deleteLocalSavedApp(userId, safeId);
 }
 
-async function deleteLocalSavedApp(userId: string, safeId: string): Promise<Result> {
+async function deleteLocalSavedApp(userId: string, safeId: string): Promise<DeleteResult> {
+  const intent = deleteIntentPath(userId, safeId);
+  const pending: DeleteResult = {ok:false,error:'app_delete_failed',recoveryPending:true};
+  // An unfinished delete owns its journal even after its request has returned.
+  if (activeDeleteIntents.has(intent)) return pending;
+  try {
+    if (deletePathExists(intent)) {
+      await recoverInterruptedDeletes(userId,safeId);
+      if (deletePathExists(intent)) {
+        const outstanding = readDeleteIntent(intent,safeId);
+        const roots = [savedAppDir(userId,safeId), ...appDataDeleteRoots(userId,outstanding)
+          .flatMap(entry => entry.staged ? [entry.root,entry.staged] : [entry.root])];
+        // Local deletion remains idempotent while sync acknowledgement waits.
+        // Preserve its original tombstones rather than replacing the journal.
+        return roots.some(deletePathExists) ? pending : {ok:true};
+      }
+    }
+  } catch (error) {
+    log.warn('deleteSavedApp recovery admission deferred', { error: logErrorSummary(error) });
+    return pending;
+  }
   const dir = savedAppDir(userId, safeId);
   let exists = false;
   try {
     const st = fs.lstatSync(dir);
     exists = true;
     if (!st.isDirectory() || st.isSymbolicLink()) return { ok: false, error: 'app not found' };
-  } catch { /* idempotent missing delete */ }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('deleteSavedApp inventory unavailable', { user_id: maskId(userId), app_id: maskId(safeId), error: logErrorSummary(error) });
+      return { ok: false, error: 'app_delete_failed' };
+    }
+  }
   let deleted: string[];
   try { deleted = exists ? listAppFilesRel(dir) : []; }
   catch (err) {
@@ -993,28 +1031,46 @@ async function deleteLocalSavedApp(userId: string, safeId: string): Promise<Resu
   // The app folder moves aside atomically first and returns if its data cannot
   // be removed, so a failed delete leaves the app listed and sync untouched.
   // A durable intent recorded before anything moves lets a stopped delete finish.
-  const staged = exists ? stagingDir(dir) : '', intent = deleteIntentPath(userId, safeId);
+  const staged = exists ? stagingDir(dir) : '';
+  const key = appDataKey(safeId);
+  const transaction: DeleteIntent = {version:1,appId:safeId,files:deleted,cloudFiles:[],dataStaging:{
+    local:path.basename(atomicTmpPath(webAppSandboxRoot(userId,key,'local'))),
+    cloud:path.basename(atomicTmpPath(webAppSandboxRoot(userId,key,'cloud'))),
+  }};
   activeDeleteIntents.add(intent);
   try {
-    let release:(()=>void)|undefined,key='',cloudFiles:string[]=[];
+    let release:(()=>void)|undefined;
     try {
-      key=appDataKey(safeId);
       const runtime=await import('./web_apps/runtime');release=runtime.holdAppData(userId,key);
       await runtime.closeAppData(userId,key);
-      cloudFiles=listAppDataCloudFiles(userId,key);
-      writeDeleteIntent(userId,{version:1,appId:safeId,files:deleted,cloudFiles});
+      transaction.cloudFiles=listAppDataCloudFiles(userId,key);
+      writeDeleteIntent(userId,transaction);
       if (exists) renameWithRetrySync(dir, staged);
-      try { await removeAppData(userId,key); }
-      catch (err) { if (exists) renameWithRetrySync(staged, dir); throw err; }
+      try { stageAppDataDelete(userId,transaction); }
+      catch (err) {
+        // Restore the app only after all detached data returned. If the
+        // filesystem also refuses rollback, retain the intent for recovery.
+        if (exists && !hasStagedAppData(userId,transaction)) renameWithRetrySync(staged, dir);
+        throw err;
+      }
     } catch (err) {
       log.warn('deleteSavedApp failed', { user_id: maskId(userId), app_id: maskId(safeId), error: logErrorSummary(err) });
       // A restored (or never moved) app voids the intent; a missing one keeps it for recovery.
-      if (!exists || isRealSavedAppDirectory(dir)) clearDeleteIntent(intent);
+      let recoveryPending = true;
+      try {
+        if ((!exists || isRealSavedAppDirectory(dir)) && !hasStagedAppData(userId,transaction)) {
+          clearDeleteIntent(intent);
+          recoveryPending = false;
+        }
+      } catch (error) { log.warn('saved app delete rollback check deferred', { error: logErrorSummary(error) }); }
       activeStagingDirs.delete(staged);
       release?.();
-      return { ok: false, error: 'app_delete_failed' };
+      return { ok: false, error: 'app_delete_failed', ...(recoveryPending ? {recoveryPending:true as const} : {}) };
     }
     release?.();
+    let dataCleaned = false;
+    try { await removeAppData(userId,transaction,true); dataCleaned = true; }
+    catch (error) { log.warn('saved app deleted data cleanup deferred', { error: logErrorSummary(error) }); }
     // Committed: the app and its data are gone. Cleanup or sync notification
     // failures cannot turn this into a failed delete; leftovers are swept later.
     if (staged) {
@@ -1023,7 +1079,7 @@ async function deleteLocalSavedApp(userId: string, safeId: string): Promise<Resu
       finally { activeStagingDirs.delete(staged); }
     }
     log.info('deleteSavedApp completed', { user_id: maskId(userId), app_id: maskId(safeId) });
-    clearDeleteIntent(intent);
+    if (dataCleaned) clearDeleteIntent(intent);
     return { ok: true };
   } finally { activeDeleteIntents.delete(intent); }
 }
@@ -1034,16 +1090,57 @@ function listAppDataCloudFiles(uid: string, key: string): string[] {
   for(const root of [local,cloud])if(fs.existsSync(root)&&fs.lstatSync(root).isSymbolicLink())throw new Error('app data unavailable');
   return fs.existsSync(cloud)?listAppFilesRel(cloud):[];
 }
-async function removeAppData(uid: string, key: string): Promise<void> {
-  await fsp.rm(webAppSandboxRoot(uid,key,'local'),{recursive:true,force:true});
-  await fsp.rm(webAppSandboxRoot(uid,key,'cloud'),{recursive:true,force:true});
+function appDataDeleteRoots(uid: string, intent: DeleteIntent) {
+  const key = appDataKey(intent.appId);
+  return (['local','cloud'] as const).map(scope => {
+    const root = webAppSandboxRoot(uid,key,scope);
+    const name = intent.dataStaging?.[scope];
+    return {root,staged:name ? path.join(path.dirname(root),name) : undefined};
+  });
+}
+function hasStagedAppData(uid: string, intent: DeleteIntent): boolean {
+  return appDataDeleteRoots(uid,intent).some(({staged}) => {
+    if (!staged) return false;
+    try { fs.lstatSync(staged); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
+  });
+}
+/** Detach both data domains before removing any bytes. Renames stay beside
+ * each original root, including when cloud and local live on different disks.
+ * No await separates app detachment, data detachment or rollback. */
+function stageAppDataDelete(uid: string, intent: DeleteIntent): void {
+  const moved: Array<{root:string;staged:string}> = [];
+  try {
+    if (hasStagedAppData(uid,intent)) throw new Error('app data deletion pending');
+    for (const entry of appDataDeleteRoots(uid,intent)) {
+      if (!entry.staged) throw new Error('app data deletion staging required');
+      let stat: fs.Stats;
+      try { stat = fs.lstatSync(entry.root); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('app data unavailable');
+      fs.renameSync(entry.root,entry.staged);
+      moved.push({root:entry.root,staged:entry.staged});
+    }
+  } catch (error) {
+    for (const entry of moved.reverse()) {
+      try { fs.renameSync(entry.staged,entry.root); }
+      catch (rollback) { log.warn('saved app data rollback deferred', { error: logErrorSummary(rollback) }); }
+    }
+    throw error;
+  }
+}
+async function removeAppData(uid: string, intent: DeleteIntent, stagedOnly = false): Promise<void> {
+  for (const entry of appDataDeleteRoots(uid,intent)) {
+    if (!stagedOnly) await fsp.rm(entry.root,{recursive:true,force:true});
+    if (entry.staged) await fsp.rm(entry.staged,{recursive:true,force:true});
+  }
 }
 
 // ── Interrupted delete recovery ──────────────────────────────────────────
 // Only a recorded intent proves the user deleted an app. Data without a local
 // app folder may belong to an app still arriving through personal sync, so it
 // is never removed on its own. Intents live in the machine-private domain.
-interface DeleteIntent { version: 1; appId: string; files: string[]; cloudFiles: string[] }
+interface DeleteIntent { version: 1; appId: string; files: string[]; cloudFiles: string[]; dataStaging?: {local:string;cloud:string} }
 const activeDeleteIntents = new Set<string>();
 const deleteRecoveries = new Map<string, Promise<void>>();
 const DELETE_INTENT_RE = /^([A-Za-z0-9_-]{1,64})\.json$/;
@@ -1060,6 +1157,10 @@ function clearDeleteIntent(file: string): void {
   try { fs.rmSync(file, { force: true }); }
   catch (err) { log.warn('saved app delete intent cleanup deferred', { error: logErrorSummary(err) }); }
 }
+function deletePathExists(file: string): boolean {
+  try { fs.lstatSync(file); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
+}
 function isIntentRel(rel: unknown): rel is string {
   return typeof rel === 'string' && rel.length > 0 && rel.length <= 1024 && !/[\\\0]/.test(rel)
     && rel.split('/').every(seg => !!seg && seg !== '.' && seg !== '..');
@@ -1069,13 +1170,22 @@ function readDeleteIntent(file: string, appId: string): DeleteIntent {
   const intent = JSON.parse(fs.readFileSync(file, 'utf8'));
   if (intent?.version !== 1 || intent.appId !== appId || !Array.isArray(intent.files) || !Array.isArray(intent.cloudFiles)
     || !intent.files.every(isIntentRel) || !intent.cloudFiles.every(isIntentRel)) throw new Error('invalid delete intent');
+  if (intent.dataStaging !== undefined) {
+    const key = appDataKey(appId), names = intent.dataStaging;
+    if (!names || typeof names !== 'object' || Array.isArray(names)
+      || Object.keys(names).some(scope => scope !== 'local' && scope !== 'cloud')
+      || !['local','cloud'].every(scope => typeof names[scope] === 'string'
+        && !/[\\/]/.test(names[scope]) && names[scope].startsWith(key+'.') && isAtomicWriteTempPath(names[scope]))) {
+      throw new Error('invalid delete data staging');
+    }
+  }
   return intent;
 }
-function recoverInterruptedDeletes(uid: string): Promise<void> {
+function recoverInterruptedDeletes(uid: string, onlyAppId?: string): Promise<void> {
   const running = deleteRecoveries.get(uid);
   if (running) return running;
   let appIds: string[];
-  try { appIds = fs.readdirSync(userAppDeletesDir(uid)).map(name => DELETE_INTENT_RE.exec(name)?.[1]).filter((id): id is string => !!id); }
+  try { appIds = onlyAppId ? [onlyAppId] : fs.readdirSync(userAppDeletesDir(uid)).map(name => DELETE_INTENT_RE.exec(name)?.[1]).filter((id): id is string => !!id); }
   catch { return Promise.resolve(); } // no intents recorded
   if (!appIds.length) return Promise.resolve();
   const work = (async () => { for (const appId of appIds) await recoverDelete(uid, appId); })()
@@ -1088,7 +1198,16 @@ async function recoverDelete(uid: string, appId: string): Promise<void> {
   if (activeDeleteIntents.has(file)) return;
   try {
     // A present app folder means the delete never committed or was rolled back.
-    if (fs.existsSync(savedAppDir(uid, appId)) || isSymlink(savedAppDir(uid, appId))) {
+    let present = false;
+    try { fs.lstatSync(savedAppDir(uid, appId)); present = true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (present) {
+      let intent: DeleteIntent | undefined;
+      try { intent = readDeleteIntent(file, appId); }
+      catch { /* A present app also voids a torn or invalid uncommitted intent. */ }
+      // A restored app owns fresh canonical data. Finish only the old detached
+      // cleanup, retaining its journal if that cleanup is still unavailable.
+      if (intent?.dataStaging) await removeAppData(uid,intent,true);
       clearDeleteIntent(file);
       log.info('saved app delete intent voided', { app_id: maskId(appId) });
       return;
@@ -1098,14 +1217,11 @@ async function recoverDelete(uid: string, appId: string): Promise<void> {
     if (users.getActiveUserId() !== uid) return;
     const intent = readDeleteIntent(file, appId), key = appDataKey(appId);
     const runtime = await import('./web_apps/runtime'), release = runtime.holdAppData(uid, key);
-    try { await runtime.closeAppData(uid, key); listAppDataCloudFiles(uid, key); await removeAppData(uid, key); }
+    try { await runtime.closeAppData(uid, key); listAppDataCloudFiles(uid, key); await removeAppData(uid,intent); }
     finally { release(); }
     clearDeleteIntent(file);
     log.info('saved app delete recovery completed', { app_id: maskId(appId), files: intent.files.length, data_files: intent.cloudFiles.length });
   } catch (error) { log.warn('saved app delete recovery deferred', { app_id: maskId(appId), error: logErrorSummary(error) }); }
-}
-function isSymlink(target: string): boolean {
-  try { return fs.lstatSync(target).isSymbolicLink(); } catch { return false; }
 }
 
 // ── "Edit in a new conversation" ─────────────────────────────────────────

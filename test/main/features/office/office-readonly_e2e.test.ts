@@ -11,7 +11,8 @@ type Row = {
   id: string; error?: string;
   logs: Array<{ scope: string; level: string; args: unknown[] }>;
   browserLogs: Array<{ level: string; message: string }>;
-  commands: Array<{ verb: string; code: number; stderr: string; stdoutChars: number }>;
+  commands: Array<{ verb: string; code: number; stderr: string; stdoutChars: number; elapsedMs: number }>;
+  measurement?: Record<string, unknown>;
   renderErrors: Array<{ page: string; message: string }>;
 };
 // OfficeCLI is bundled for desktop macOS/Windows, not Linux hosts.
@@ -34,7 +35,7 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform))('real Office re
     rows = JSON.parse(fs.readFileSync(output, 'utf8'));
     expect(rows.map(row => row.id)).toEqual([
       'combined-review', 'partial-page-retry', 'cancel-after-check', 'invalid-document', 'edit-then-review',
-      'xlsx-render', 'pptx-render',
+      'xlsx-render', 'pptx-render', 'edit-10-paragraphs', 'edit-1000-paragraphs',
     ]);
   }, 160_000);
 
@@ -48,6 +49,8 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform))('real Office re
     ['edit-then-review', 'saves an intentional edit, preserves the original and reviews the new revision'],
     ['xlsx-render', 'renders a real workbook with no browser warnings or source mutation'],
     ['pptx-render', 'renders a real presentation with no browser warnings or source mutation'],
+    ['edit-10-paragraphs', 'PF-09 preserves every paragraph through a small real edit and cleanup'],
+    ['edit-1000-paragraphs', 'PF-09 preserves every paragraph through a large real edit and cleanup'],
   ])('%s: %s', (id) => {
     const row = rows.find(item => item.id === id)!;
     expect(row.error, JSON.stringify({ commands: row.commands, renderErrors: row.renderErrors, logs: row.logs })).toBeUndefined();
@@ -63,6 +66,8 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform))('real Office re
       expect(log).toMatchObject({ scope: 'office-tools', level: 'warn' });
       expect(log.args[0]).toBe('render error');
     }
+    if (row.measurement) console.log('[PF-09 native edit]', JSON.stringify({ ...row.measurement,
+      commands: row.commands.map(command => ({ verb: command.verb, elapsedMs: command.elapsedMs })) }));
     const failures = row.commands.filter(command => command.code !== 0);
     if (id === 'invalid-document') {
       expect(failures).toHaveLength(1);

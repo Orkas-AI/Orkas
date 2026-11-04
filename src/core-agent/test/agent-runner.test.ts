@@ -1475,6 +1475,8 @@ describe("AgentRunner", () => {
       "B".repeat(12_001),
       "C".repeat(12_000),
     ];
+    const firstRevision = "file_rev_1111111111111111";
+    const secondRevision = "file_rev_2222222222222222";
     const firstSize = Buffer.byteLength(chunks[0], "utf8");
     const secondSize = firstSize + Buffer.byteLength(chunks[1], "utf8");
     const mockProvider = createMockProvider([
@@ -1494,7 +1496,7 @@ describe("AgentRunner", () => {
           type: "tool_use",
           id: "large-append-2",
           name: "append_file",
-          input: { path: "large.txt", content: chunks[1], expected_size: firstSize },
+          input: { path: "large.txt", content: chunks[1], base_revision: firstRevision },
         }],
         stopReason: "tool_use",
         usage: { inputTokens: 30, outputTokens: 3_100, totalTokens: 3_130 },
@@ -1505,7 +1507,7 @@ describe("AgentRunner", () => {
           type: "tool_use",
           id: "partial-large-append",
           name: "append_file",
-          input: { path: "large.txt", expected_size: secondSize },
+          input: { path: "large.txt", base_revision: secondRevision },
         }],
         stopReason: "max_tokens",
         usage: { inputTokens: 40, outputTokens: 32_768, totalTokens: 32_808 },
@@ -1516,7 +1518,7 @@ describe("AgentRunner", () => {
           type: "tool_use",
           id: "large-append-3",
           name: "append_file",
-          input: { path: "large.txt", content: chunks[2], expected_size: secondSize },
+          input: { path: "large.txt", content: chunks[2], base_revision: secondRevision },
         }],
         stopReason: "tool_use",
         usage: { inputTokens: 45, outputTokens: 3_100, totalTokens: 3_145 },
@@ -1531,7 +1533,8 @@ describe("AgentRunner", () => {
     ], (params) => requests.push(params));
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => mockProvider);
-    const operations: Array<{ name: string; expectedSize?: number }> = [];
+    const operations: Array<{ name: string; baseRevision?: string }> = [];
+    let currentRevision = firstRevision;
     let fileBody = "";
     const writeFile = defineTool({
       name: "write_file",
@@ -1540,19 +1543,20 @@ describe("AgentRunner", () => {
       async execute(input) {
         fileBody = String(input.content ?? "");
         operations.push({ name: "write_file" });
-        return { content: `<file path="large.txt" total_bytes="${Buffer.byteLength(fileBody, "utf8")}"/>` };
+        return { content: `<file path="large.txt" total_bytes="${Buffer.byteLength(fileBody, "utf8")}" revision="${currentRevision}"/>` };
       },
     });
     const appendFile = defineTool({
       name: "append_file",
       description: "Append the next complete file chunk",
-      inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" }, expected_size: { type: "number" } } },
+      inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" }, base_revision: { type: "string" } } },
       async execute(input) {
-        const expectedSize = Number(input.expected_size);
-        if (expectedSize !== Buffer.byteLength(fileBody, "utf8")) throw new Error("stale append offset");
-        operations.push({ name: "append_file", expectedSize });
+        const baseRevision = String(input.base_revision);
+        if (baseRevision !== currentRevision) throw new Error("stale append revision");
+        operations.push({ name: "append_file", baseRevision });
         fileBody += String(input.content ?? "");
-        return { content: `<file path="large.txt" total_bytes="${Buffer.byteLength(fileBody, "utf8")}"/>` };
+        currentRevision = baseRevision === firstRevision ? secondRevision : "file_rev_3333333333333333";
+        return { content: `<file path="large.txt" total_bytes="${Buffer.byteLength(fileBody, "utf8")}" revision="${currentRevision}"/>` };
       },
     });
     const session = new Session();
@@ -1578,10 +1582,12 @@ describe("AgentRunner", () => {
     expect(requests).toHaveLength(5);
     expect(JSON.stringify(requests[3].messages)).toContain("at or below 12000 characters");
     expect(JSON.stringify(requests[3].messages)).toContain(`total_bytes=\\"${secondSize}\\"`);
+    expect(JSON.stringify(requests[3].messages)).toContain(secondRevision);
+    expect(JSON.stringify(requests[3].messages)).not.toContain("expected_size");
     expect(operations).toEqual([
       { name: "write_file" },
-      { name: "append_file", expectedSize: firstSize },
-      { name: "append_file", expectedSize: secondSize },
+      { name: "append_file", baseRevision: firstRevision },
+      { name: "append_file", baseRevision: secondRevision },
     ]);
     expect(fileBody).toBe(chunks.join(""));
     expect(fileBody.length).toBeGreaterThan(32_768);
@@ -2111,7 +2117,7 @@ describe("AgentRunner", () => {
       .toBe(false);
   });
 
-  it("accepts common execution-plan aliases without spending a retry round", async () => {
+  it("accepts the current execution-plan snapshot without spending a retry round", async () => {
     const mockProvider = createMockProvider([
       {
         content: [{
@@ -2119,12 +2125,11 @@ describe("AgentRunner", () => {
           id: "call-plan-aliases",
           name: "manage_execution_plan",
           input: {
-            action: "replace",
             plan: [
-              { step: "Inspect", status: "done" },
-              { step: "Implement", status: "in-progress" },
-              { step: "Verify", status: "not_started" },
-              { step: "Publish", status: "unknown" },
+              { step: "Inspect", status: "completed" },
+              { step: "Implement", status: "in_progress" },
+              { step: "Verify", status: "pending" },
+              { step: "Publish", status: "pending" },
             ],
           },
         }],
@@ -2670,7 +2675,7 @@ describe("AgentRunner", () => {
     if (outcome === "nonterminal") expect(result.text).toBe("The Agent was not started.");
   });
 
-  it("treats a legacy Plan finish as an ordinary tool call before the final no-tool reply", async () => {
+  it("treats a completed Plan snapshot as an ordinary tool call before the final no-tool reply", async () => {
     const requests: CompletionParams[] = [];
     const provider = createMockProvider([
       {
@@ -2680,7 +2685,6 @@ describe("AgentRunner", () => {
             id: "plan-create",
             name: "manage_execution_plan",
             input: {
-              action: "update",
               plan: [{ step: "Produce and verify the artifact", status: "in_progress" }],
             },
           },
@@ -2698,10 +2702,7 @@ describe("AgentRunner", () => {
             id: "plan-finish",
             name: "manage_execution_plan",
             input: {
-              action: "set_status",
-              step_id: 1,
-              status: "completed",
-              finish: "completed",
+              plan: [{ step: "Produce and verify the artifact", status: "completed" }],
             },
           },
         ],
@@ -2749,7 +2750,7 @@ describe("AgentRunner", () => {
       .toEqual(["completed"]);
   });
 
-  it("keeps the normal active tool surface after a legacy Plan finish without reply text", async () => {
+  it("rejects legacy Plan finish without mutating progress or ending the turn", async () => {
     const requests: CompletionParams[] = [];
     const provider = createMockProvider([
       {
@@ -2759,7 +2760,6 @@ describe("AgentRunner", () => {
             id: "plan-create",
             name: "manage_execution_plan",
             input: {
-              action: "update",
               plan: [{ step: "Finish the verified work", status: "in_progress" }],
             },
           },
@@ -2813,6 +2813,8 @@ describe("AgentRunner", () => {
 
     const result = await runner.run({ message: "Track progress while finishing the verified work" });
 
+    expect(runner.getSession().getExecutionPlan()?.steps.map(step => step.status)).toEqual(["in_progress"]);
+    expect(JSON.stringify(requests[2].messages)).toContain("PLAN_INPUT_UNSUPPORTED_FIELDS");
     expect(result.text).toBe("Verified work is complete.");
     expect(result.text).not.toContain("must not be reached");
     expect(requests).toHaveLength(3);
@@ -2890,7 +2892,6 @@ describe("AgentRunner", () => {
           id: "plan-boundary",
           name: "manage_execution_plan",
           input: {
-            action: "update",
             plan: [
               { step: "Show the preview", status: "completed" },
               { step: "Render after the user's reply", status: "pending" },
@@ -7870,7 +7871,6 @@ describe("AgentRunner", () => {
           id: "plan-work",
           name: "manage_execution_plan",
           input: {
-            action: "update",
             plan: [{ step: "Process the files", status: "in_progress" }],
           },
         }],
@@ -7921,15 +7921,14 @@ describe("AgentRunner", () => {
     });
     const provider = createMockProvider([
       planCall("plan-create", {
-        action: "update",
         plan: [
           { step: "Implement the change", status: "in_progress" },
           { step: "Verify the change", status: "in_progress" },
         ],
       }),
-      planCall("plan-implement-done", { action: "set_status", step_id: 1, status: "completed" }),
-      planCall("plan-verify-start", { action: "set_status", step_id: 2, status: "in_progress" }),
-      planCall("plan-verify-done", { action: "set_status", step_id: 2, status: "completed" }),
+      planCall("plan-implement-done", { plan: [{ step: "Implement the change", status: "completed" }, { step: "Verify the change", status: "pending" }] }),
+      planCall("plan-verify-start", { plan: [{ step: "Implement the change", status: "completed" }, { step: "Verify the change", status: "in_progress" }] }),
+      planCall("plan-verify-done", { plan: [{ step: "Implement the change", status: "completed" }, { step: "Verify the change", status: "completed" }] }),
       {
         content: [{ type: "text", text: '{"plan":"complete"}' }],
         stopReason: "end_turn",
@@ -7969,7 +7968,6 @@ describe("AgentRunner", () => {
     });
     const provider = createMockProvider([
       planCall("plan-churn-create", {
-        action: "update",
         plan: [
           { step: "Implement the change", status: "in_progress" },
           { step: "Verify the change", status: "pending" },

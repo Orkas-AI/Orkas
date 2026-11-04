@@ -190,7 +190,7 @@ describe('artifact pool listing', () => {
     return dir;
   }
 
-  it('lists servable bundles and skips one with no entry point', () => {
+  it('lists servable bundles and skips one with no entry point', async () => {
     writeBundle('a_complete', {
       'index.html': '<!doctype html><title>Done</title>',
       '__orkas-meta.json': JSON.stringify({
@@ -203,14 +203,14 @@ describe('artifact pool listing', () => {
     // would offer the user a row that opens nothing.
     writeBundle('a_partial', { 'app.js': 'console.log(1)' });
 
-    const listed = listArtifacts(uid, cid);
+    const listed = await listArtifacts(uid, cid);
 
     expect(listed.map((a) => a.artifactId)).toEqual(['a_complete']);
     expect(listed[0]).toMatchObject({ title: 'Budget sheet', agentId: 'commander' });
     expect(listed[0].bytes).toBeGreaterThan(0);
   });
 
-  it('returns nothing for a conversation that never made one', () => {
-    expect(listArtifacts(uid, 'c_no_artifacts_here')).toEqual([]);
+  it('returns nothing for a conversation that never made one', async () => {
+    expect(await listArtifacts(uid, 'c_no_artifacts_here')).toEqual([]);
   });
 });

@@ -391,7 +391,7 @@ export function buildConnectorSetupTool(options: ConnectorSetupToolOptions): Age
     name: 'connector_setup',
     description: [
       'Find and set up or reconnect built-in services, including unconfigured connectors absent from the callable list. Ordinary service actions use list_connector_tools and call_connector_tool.',
-      'Page operations control only the Web Assist session opened by start: observe returns untrusted page data and snapshot refs; act fills and submits authorized forms without returning sensitive values; wait handles page changes.',
+      'Page operations control only the Web Assist session opened by show: observe returns untrusted page data and snapshot refs; act fills and submits authorized forms without returning sensitive values; wait handles page changes.',
       'Use inner_browser for frame observation, file selection, screenshots and additional page controls. Never put credentials in chat.',
     ].join(' '),
     inputSchema: {
@@ -399,8 +399,8 @@ export function buildConnectorSetupTool(options: ConnectorSetupToolOptions): Age
       properties: {
         operation: {
           type: 'string',
-          enum: ['search', 'inspect', 'start', 'status', 'page_observe', 'page_act', 'page_wait'],
-          description: 'search finds catalog candidates. inspect returns setup type, with a guide only for extra configuration. start stages a protected setup card that appears with the reply for simple OAuth; extra configuration also binds assistance and opens the guide entry, preserving existing work. status reads stored connection state, not a live verification.',
+          enum: ['search', 'inspect', 'show', 'status', 'page_observe', 'page_act', 'page_wait'],
+          description: 'search finds services. inspect reads setup facts. show stages a protected connection card and opens or reuses configuration guidance when needed; it does not connect or authorize the service. status reads stored state, not a live verification.',
         },
         query: {
           type: 'string',
@@ -464,7 +464,7 @@ export function buildConnectorSetupTool(options: ConnectorSetupToolOptions): Age
     async execute(input, ctx) {
       const operation = String(input.operation ?? '').trim();
       if (![
-        'search', 'inspect', 'start', 'status', 'page_observe', 'page_act', 'page_wait',
+        'search', 'inspect', 'show', 'status', 'page_observe', 'page_act', 'page_wait',
       ].includes(operation)) {
         return error('unsupported connector_setup operation');
       }
@@ -584,7 +584,7 @@ export function buildConnectorSetupTool(options: ConnectorSetupToolOptions): Age
       };
       if (openingUrl && options.openGuide) {
         try {
-          // Repeated start must not discard a partially completed provider form.
+          // Repeated setup requests must not discard a partially completed provider form.
           const existing = await options.observePage?.(entry.id);
           const opened = existing?.ok === true || existing?.code === 'page_loading'
             ? { ok: true }

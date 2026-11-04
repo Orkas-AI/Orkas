@@ -8,7 +8,7 @@ type OwnedApplication = {
   context(): { tracing: { stop(options: { path: string }): Promise<void> } };
 };
 
-/** Run quit on the normal event loop, outside the inspector evaluation stack.
+/** Detach the owned Node inspector before one normal quit outside evaluation.
  * Keep Electron's before-quit flushes and wait for the actual application close. */
 export async function requestElectronQuit(app: ElectronApplication): Promise<void> {
   // Closing the final window already starts normal shutdown on Windows/Linux.
@@ -30,18 +30,26 @@ export async function requestElectronQuit(app: ElectronApplication): Promise<voi
   app.once('close', onClose);
   try {
     try {
-      await app.evaluate(({ app }) => { setImmediate(() => app.quit()); });
+      await app.evaluate(({ app }) => {
+        const inspector = (process as any).mainModule.require('node:inspector') as { close(): void };
+        setImmediate(() => {
+          inspector.close();
+          app.quit();
+        });
+      });
     } catch (error) {
       // A fast successful exit may dispose the inspector before it replies.
       // Playwright can report this before delivering the application close event.
       // Still require that event below; the fixture's close deadline stays active.
-      const inspectorDisposed = error instanceof Error && error.message ===
-        'electronApplication.evaluate: Execution context was destroyed, most likely because of a navigation.';
+      const inspectorDisposed = error instanceof Error && [
+        'electronApplication.evaluate: Execution context was destroyed, most likely because of a navigation.',
+        'electronApplication.evaluate: Target page, context or browser has been closed',
+      ].includes(error.message);
       if (!closed && !inspectorDisposed) throw error;
     }
-    // Complete the public Playwright close path after requesting deferred quit:
-    // it detaches the inspector and still waits for the actual process close.
-    await app.close();
+    // Playwright.close() evaluates app.quit() again before detaching. That
+    // second evaluation races Node teardown after the deferred quit above.
+    // The application's browser/process close remains the completion signal.
     await completion;
   } finally {
     app.off('close', onClose);

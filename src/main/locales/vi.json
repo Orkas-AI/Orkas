@@ -135,7 +135,7 @@
   "errors.model_currently_unavailable": "Mô hình này hiện không khả dụng",
   "errors.model_config_unavailable": "Đã cấu hình mô hình nhưng thông tin xác thực hiện không dùng được. Hãy kiểm tra khóa API, trạng thái đăng nhập hoặc mô hình dự phòng trong Cài đặt.",
   "errors.model_oauth_expired": "Quyền truy cập {provider} đã hết hạn. Hãy cấp quyền lại cho tài khoản này trong Cài đặt hoặc chuyển sang mô hình dự phòng.",
-  "errors.model_credits_insufficient": "Không đủ tín dụng. Hãy nạp tín dụng hoặc chuyển sang mô hình khả dụng trong Cài đặt.",
+  "errors.model_credits_insufficient": "Không đủ tín dụng nên tác vụ đã dừng. Sau khi nạp tín dụng, hãy quay lại tác vụ này và nhập “Tiếp tục” để làm tiếp từ chỗ đã dừng. Bạn cũng có thể chuyển sang mô hình khả dụng trong Cài đặt.",
   "errors.custom_endpoint_suspect": "Điểm cuối mô hình tùy chỉnh của bạn bị lỗi nhiều yêu cầu liên tiếp (HTTP {status}) — có thể đã ngừng hoạt động hoặc chuyển địa chỉ. Hãy kiểm tra URL và khóa API trong Cài đặt → Mô hình hoặc đổi mô hình để tiếp tục.",
   "errors.model_output_cap_repeated": "Mô hình này đã đạt giới hạn đầu ra mỗi phản hồi nhiều lần liên tiếp — giới hạn có thể quá nhỏ cho tác vụ này. Hãy chọn mô hình có giới hạn đầu ra lớn hơn trong Cài đặt hoặc chia nhỏ tác vụ.",
   "errors.model_provider_balance_insufficient": "Tài khoản nhà cung cấp mô hình đã cấu hình của bạn đã hết số dư (không phải tín dụng Orkas). Hãy nạp tiền tại nhà cung cấp đó hoặc đổi mô hình trong Cài đặt.",
@@ -361,5 +361,11 @@
   "notification.automation.failed.title": "Lần chạy tự động hóa thất bại",
   "notification.automation.failed.title_many": "{count} lần chạy tự động hóa thất bại",
   "notification.automation.waiting_input.title": "Một lần chạy tự động hóa đang chờ bạn trả lời",
-  "notification.automation.waiting_input.title_many": "{count} lần chạy tự động hóa đang chờ bạn trả lời"
+  "notification.automation.waiting_input.title_many": "{count} lần chạy tự động hóa đang chờ bạn trả lời",
+  "errors.model_rate_limited_all_configured": "Tất cả mô hình bạn cấu hình đều đang bị giới hạn tốc độ. Thường giới hạn sẽ hết sau một hai phút; khi đó hãy thử lại.",
+  "errors.model_request_rejected_repeated": "Yêu cầu này đã bị từ chối nhiều lần liên tiếp, nên thử lại y nguyên sẽ không cho kết quả khác. Hãy chuyển sang mô hình khác trong Cài đặt rồi thử lại, hoặc bỏ hình ảnh hay tệp đính kèm rồi gửi lại.",
+  "errors.provider_reply_detail": "Phản hồi của nhà cung cấp: {detail}",
+  "cli_agent.repeated_failure_hint": "“{name}” lại thất bại. Bạn có thể nhờ @Commander đảm nhận tác vụ này.",
+  "desktop.open": "Mở",
+  "desktop.exit": "Thoát"
 }

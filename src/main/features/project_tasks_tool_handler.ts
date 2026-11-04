@@ -138,9 +138,22 @@ export function createProjectTasksHandler(
         created_by: 'agent',
       });
       if (!r.ok) return { ok: false, error: (r as { error: string }).error };
-      // Reused global to-dos retain their original conversation association.
+      // Link only the first open to-do saved in this conversation.
       let task = r.task;
-      if (!task.origin_cid && cid && !pid) {
+
+      // The to-do is already saved, so an unreadable backlog leaves it
+      // unlinked rather than failing the creation.
+      const linksHere = async (): Promise<boolean> => {
+        if (!pid) return true;
+        try {
+          return !(await projectTasks.listTasks(uid, pid)).some((other) => (
+            other.id !== task.id && other.origin_cid === cid && other.status !== 'done'
+          ));
+        } catch {
+          return false;
+        }
+      };
+      if (!task.origin_cid && cid && await linksHere()) {
         await projectTasks.recordTaskExecution(uid, pid, task.id, cid);
         task = (await projectTasks.getTask(uid, pid, task.id)) || task;
       }

@@ -570,11 +570,13 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     execute.mockClear();
     await auth.authorizeDingtalk('', '', auth.MANIFESTS.dingtalk, env, deps);
     const grants = execute.mock.calls.filter(([args]) => args[0] === 'pat' && !args.includes('--dry-run'));
-    expect(grants).toHaveLength(2);
-    for (const [args] of grants) {
+    expect(grants).toHaveLength(1);
+    for (const [args, capture] of grants) {
       expect(args).toContain('calendar.event:get');
       expect(args).not.toContain('chat.message:send');
       expect(args.slice(0, 2)).toEqual(['pat', 'chmod']);
+      expect(args.slice(-2)).toEqual(['--format', 'json']);
+      expect(capture).toBe('tee');
     }
     expect(permissions.readPermissionRequest(env)).toBeNull();
   });
@@ -623,7 +625,7 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     await auth.authorizeDingtalk('', '', auth.MANIFESTS.dingtalk, env, { execute, authorizationReady: () => true });
     expect(execute.mock.calls[0][0]).toEqual(['auth', 'login', '--device', '--no-browser']);
     const grants = execute.mock.calls.filter(([args]) => args[0] === 'pat' && !args.includes('--dry-run'));
-    expect(grants).toHaveLength(2);
+    expect(grants).toHaveLength(1);
     for (const [args] of grants) expect(args).toEqual(expect.arrayContaining(['chat.message:send', '--domains', auth.MANIFESTS.dingtalk.domains.join(','), '--yes']));
     expect(permissions.readPermissionRequest(env)).toBeNull();
   });
@@ -1017,13 +1019,21 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     expect(permissions.readPermissionRequest(env)?.pat_scopes).toContain('chat.message:send');
   });
 
-  it.each(['timeout', 'malformed', 'missing-status', 'invalid-scopes', 'null-scopes'])(
+  it.each(['timeout', 'malformed', 'missing-status', 'invalid-scopes', 'null-scopes', 'request-preview', 'preview-with-status'])(
     'preserves DingTalk permission evidence when the full-domain plan is %s', mode => {
       const env = envFor('dingtalk');
       dwsDenied(env, 'PAT_NO_PERMISSION', { scope: 'chat.message:send' });
       const original = permissions.readPermissionRequest(env);
+      // Pinned DWS 1.0.61 emits a local request preview for --dry-run. Even
+      // success-shaped extra fields cannot turn a preview into grant evidence.
+      const preview = { dry_run: true, note: 'execution skipped by --dry-run',
+        request: { jsonrpc: '2.0', method: 'tools/call', params: {
+          name: 'pat.batch_plan', arguments: { productCodes: ['calendar'], dryRun: true },
+        } } };
       const result = mode === 'timeout' ? { error: new Error('timeout') }
         : mode === 'malformed' ? { status: 0, stdout: '{' }
+          : mode === 'request-preview' ? ok(preview)
+            : mode === 'preview-with-status' ? ok({ ...preview, success: true, data: { allGranted: true } })
           : ok({ success: true, data: { ...(mode === 'invalid-scopes' ? { allGranted: true, pendingScopes: ['--invalid'] } : mode === 'null-scopes' ? { allGranted: true, pendingScopes: null } : {}) } });
       expect(auth.checkDingtalkPermissions('', '', auth.MANIFESTS.dingtalk, env, () => result)).toBe(false);
       expect(permissions.readPermissionRequest(env)).toEqual(original);

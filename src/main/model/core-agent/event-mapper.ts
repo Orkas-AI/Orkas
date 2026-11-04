@@ -37,6 +37,7 @@
 
 import { createLogger } from '../../logger';
 import { t } from '../../i18n';
+import { ALL_CONFIGURED_RATE_LIMITED_MESSAGE } from './rate-limit-messages';
 import type { StreamEvent } from '../client';
 import { parseSkillPath } from '../../features/expert_signals/skill_path';
 import { userAgentsDir, userMarketplaceAgentsDir, userSystemSkillsDir } from '../../paths';
@@ -218,7 +219,12 @@ function modelFailureDetails(
   if (isStorageFullError(error)) failureCode = 'storage_full';
   else if (code === 'OUTPUT_LIMIT') failureCode = 'provider_max_tokens';
   else if (code === 'PROVIDER_CANDIDATES_UNAVAILABLE') failureCode = 'provider_unavailable';
-  else if (code === 'PROVIDER_RETRIES_EXHAUSTED') failureCode = 'provider_retries_exhausted';
+  // Rotation uses this wrapper for any unclassified failure that ended the
+  // candidate chain, including an unchanged request it never retried. A 4xx
+  // below it remains an endpoint rejection for advice and dashboards.
+  else if (code === 'PROVIDER_RETRIES_EXHAUSTED') {
+    failureCode = statusCode >= 400 && statusCode < 500 ? `provider_http_${statusCode}` : 'provider_retries_exhausted';
+  }
   else if (code === 'PROVIDER_NO_FIRST_EVENT_TIMEOUT') failureCode = 'provider_no_first_event';
   else if (code === 'PROVIDER_EMPTY_NORMAL') failureCode = 'empty_response_normal';
   else if (code === 'PROVIDER_EMPTY_SAFETY') failureCode = 'empty_response_safety';
@@ -331,6 +337,7 @@ function localizeKnownRunnerText(text: string, code?: string): string {
   if (/^PROVIDER_EMPTY_(?:RESPONSE|NORMAL|SAFETY|UNKNOWN|TRANSPORT)$/.test(String(code || '').trim().toUpperCase())) {
     return t('model.empty_response');
   }
+  if (trimmed === ALL_CONFIGURED_RATE_LIMITED_MESSAGE) return t('errors.model_rate_limited_all_configured');
   if (trimmed === '(Tool loop limit reached)') return t('model.tool_loop_limit_reached');
   if (trimmed === 'Run aborted') return t('model.run_aborted');
   if (trimmed === 'Max retries exceeded') return t('model.max_retries_exceeded');
@@ -348,6 +355,7 @@ function localizeKnownRunnerText(text: string, code?: string): string {
 type ModelFailureTrackingState = {
   customEndpointConsecutiveFailures: number;
   consecutiveMaxTokensFailures: number;
+  consecutiveRequestRejections: number;
 };
 
 /** Session-local terminal-failure guidance. The cached PersistentSession
@@ -360,7 +368,11 @@ let modelFailureTrackingBySession = new WeakMap<object, ModelFailureTrackingStat
 function modelFailureTrackingState(scope: object): ModelFailureTrackingState {
   const existing = modelFailureTrackingBySession.get(scope);
   if (existing) return existing;
-  const created = { customEndpointConsecutiveFailures: 0, consecutiveMaxTokensFailures: 0 };
+  const created = {
+    customEndpointConsecutiveFailures: 0,
+    consecutiveMaxTokensFailures: 0,
+    consecutiveRequestRejections: 0,
+  };
   modelFailureTrackingBySession.set(scope, created);
   return created;
 }
@@ -418,6 +430,58 @@ function maxTokensAdvice(
   tracking.consecutiveMaxTokensFailures += 1;
   if (tracking.consecutiveMaxTokensFailures < 2) return null;
   return t('errors.model_output_cap_repeated');
+}
+
+/** Failure codes for a request the provider refused as malformed or
+ * unsupported. Retrying resumes the identical request, so it is refused again:
+ * one sampled conversation ended in 400 fourteen times in a row while the
+ * user pressed "Continue" thirteen times. From the second rejection in a
+ * row the visible error says that retrying as is will not help. */
+const REQUEST_REJECTION_FAILURE_CODES = new Set(['provider_http_400', 'provider_http_422', 'provider_request']);
+
+function requestRejectionAdvice(
+  tracking: ModelFailureTrackingState,
+  failureCode: string,
+): string | null {
+  if (!REQUEST_REJECTION_FAILURE_CODES.has(failureCode)) {
+    tracking.consecutiveRequestRejections = 0;
+    return null;
+  }
+  tracking.consecutiveRequestRejections += 1;
+  if (tracking.consecutiveRequestRejections < 2) return null;
+  return t('errors.model_request_rejected_repeated');
+}
+
+const MAX_PROVIDER_DETAIL_CHARS = 240;
+const LEADING_HTTP_STATUS_RE = /^(?:Error:\s*)?(?:HTTP\s*)?4\d\d\b[:\s-]*/i;
+
+/** The provider's own explanation of a rejected request, for a provider the
+ * user configured. The generic "rejected (HTTP 400)" copy cannot say which
+ * part was refused; the provider's text usually does (unsupported image
+ * input, unknown parameter, model name). It is shown to the user only: the
+ * caller displays it separately from the localized status. */
+function providerRejectionDetail(error: AgentErrorMeta): string | undefined {
+  let text = String(error.message || '').trim().replace(LEADING_HTTP_STATUS_RE, '');
+  if (!text || /^status code\s*\(\s*no body\s*\)$/i.test(text)) return undefined;
+  if (/^[{[]/.test(text)) {
+    try {
+      const body = JSON.parse(text) as { error?: unknown; message?: unknown; detail?: unknown } | null;
+      const nested = body?.error;
+      const picked = [
+        nested && typeof nested === 'object' ? (nested as { message?: unknown }).message : nested,
+        body?.message,
+        body?.detail,
+      ].find((value): value is string => typeof value === 'string' && !!value.trim());
+      if (picked) text = picked;
+    } catch {
+      // Not JSON after all: show the bounded raw body.
+    }
+  }
+  const clean = sanitizePublicReasoningSummary(text);
+  if (!clean) return undefined;
+  return clean.length > MAX_PROVIDER_DETAIL_CHARS
+    ? `${clean.slice(0, MAX_PROVIDER_DETAIL_CHARS).trimEnd()}…`
+    : clean;
 }
 
 function customEndpointDiagnostic(
@@ -708,6 +772,7 @@ export async function* mapCoreAgentEvents(
   let finalText = '';
   let error: string | null = null;
   let failureDetails: ReturnType<typeof modelFailureDetails> | null = null;
+  let errorDetail: string | undefined;
   const skillReadByToolId = new Map<string, SkillReadEventMetadata>();
   const agentReadByToolId = new Map<string, AgentReadEventMetadata>();
   const delegationByToolId = new Map<string, { agent_id: string; agent_name: string }>();
@@ -1285,6 +1350,18 @@ export async function* mapCoreAgentEvents(
           if (endpointDiagnostic) error = endpointDiagnostic;
           const capAdvice = maxTokensAdvice(failureTracking, failureDetails.failureCode || '');
           if (capAdvice) error = `${error} ${capAdvice}`;
+          const rejectionAdvice = requestRejectionAdvice(failureTracking, failureDetails.failureCode || '');
+          if (rejectionAdvice) error = `${error} ${rejectionAdvice}`;
+          if (
+            errorProviderId
+            && REQUEST_REJECTION_FAILURE_CODES.has(failureDetails.failureCode || '')
+          ) {
+            const providerDetail = providerRejectionDetail(result.meta.error);
+            // An unmapped status already shows the provider's text verbatim.
+            if (providerDetail && !error.includes(providerDetail)) {
+              errorDetail = t('errors.provider_reply_detail', { detail: providerDetail });
+            }
+          }
           // meta.error is `{kind, message}` — cause/stack live on the
           // ProviderError that runner.ts already logged via `log.warn(...)`
           // on the retry path. Keep this line focused on what survives.
@@ -1303,6 +1380,7 @@ export async function* mapCoreAgentEvents(
             failureTracking.customEndpointConsecutiveFailures = 0;
           }
           failureTracking.consecutiveMaxTokensFailures = 0;
+          failureTracking.consecutiveRequestRejections = 0;
           // The runner's terminal-round text is authoritative, including an
           // empty value. Keeping deltas accumulated from an earlier tool round
           // can otherwise turn a preamble into a successful final answer when
@@ -1347,7 +1425,7 @@ export async function* mapCoreAgentEvents(
   for (const event of flushPendingText('commentary')) yield event;
 
   if (error) {
-    yield { type: 'error', text: error, ...failureDetails };
+    yield { type: 'error', text: error, ...(errorDetail ? { detail: errorDetail } : {}), ...failureDetails };
   } else if (finalText) {
     yield { type: 'final', text: finalText };
   } else if (!allowsEmptyFinal) {

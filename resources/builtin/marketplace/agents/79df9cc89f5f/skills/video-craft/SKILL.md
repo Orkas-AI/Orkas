@@ -1,13 +1,13 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: video-craft
-description_zh: 做出「优秀视频」的创作 know-how——钩子/叙事节奏/视觉层级/字体安全区/动效缓动/字幕/音频配比/平台规范/镜头语言/生成 prompt 写作 + 出片前自检。每条产线动手前都先过这套标准,把「能渲染」拉到「真的好」。
-description_en: The craft know-how that makes a video GOOD (not just rendered) — hooks, story pacing, visual hierarchy, type & safe zones, motion/easing, captions, audio mix, platform conventions, shot language, generation-prompt writing, and a pre-publish checklist. Apply it before producing on every line.
+description_zh: 让视频真正好看的创作标准：钩子、节奏、层级、字体、动效、字幕、音频、平台规范与出片自检。
+description_en: What makes a video good: hooks, pacing, hierarchy, type, motion, captions, audio, platform norms and a pre-publish check.
 ---
 
 # video-craft
 
-Apply these craft principles while scripting, composing, prompting and editing; the numbers are starting points to adapt to the brief. They guide authoring, not mandatory local postprocessing of model output. Before any pre-publish self-check, apply [production-method.md](../video-router/references/production-method.md): direct generation skips the review below, and mixed work reviews only local integration.
+Apply these craft principles while scripting, composing, prompting and editing; the numbers are starting points to adapt to the brief. They guide authoring, not mandatory local postprocessing of model output. Outside COMPOSE, before any pre-publish self-check, apply [production-method.md](../video-router/references/production-method.md): direct generation skips the review below, and mixed work reviews only local integration.
 
 ## 1. The opening (hook)
 
@@ -36,15 +36,15 @@ Apply these craft principles while scripting, composing, prompting and editing; 
 
 - Composition: rule-of-thirds for key elements; center for stable establishing frames. One clear focal point per frame.
 - Palette: **≤ 3–5 colors on screen** at once. Background is the least-saturated; foreground (largest, most saturated, central) reads first.
-- Typography: **1–2 font families** total. At 1080p, titles ~60–90 px, body ~40–60 px, **never below ~40 px**; title at least ~50% larger than body. Max ~2 lines, ~32–42 chars/line.
+- Typography: **1–2 font families** total. Follow the active design system's type scale (at 1080p roughly titles 72–140 px, body 28–48 px; native QA blocks text under 18 px); title at least ~50% larger than body. Max ~2 lines, ~32–42 chars/line.
 - **Safe zones**: keep text inside ~80% of the frame (~192 px margin at 1080p). For vertical, keep essential content out of the bottom ~300 px (platform UI sits there) and away from the very top.
-- Contrast ≥ **4.5:1** for any text (white-on-dark is safest). Use brightness/saturation, not red-green, to distinguish elements.
+- Contrast ≥ **4.5:1** for any text. Use brightness/saturation, not red-green, to distinguish elements.
 - Consistency is a feeling of quality: one color grade/LUT, one type system, 2–3 transition types — for the whole video.
 
 ## 5. Motion & animation
 
 - **Never linear easing** — it reads robotic. Default ease-in-out for moves, ease-out for entrances (settle in), ease-in for exits (accelerate away). Vary easing; don't repeat one three times.
-- Restraint: **one main element moves at a time**; stagger multi-element reveals by ~100–200 ms. A "static" shot means truly zero motion/zoom — if it moves, name the move.
+- Restraint: **one focal entrance at a time**; stagger multi-element reveals by ~100–200 ms; a slow ambient push or drift may continue underneath. A "static" shot means truly zero motion/zoom — if it moves, name the move.
 - *Weak → strong:* ✗ four cards fly in together, linear, all 0.3 s → ✓ stagger them ~120 ms, ease-out, each settling before the next starts (one focal point at a time).
 - Entrances ~0.3–0.5 s then hold for readable dwell; exits ~0.5–1 s. Optional small overshoot (~10–15%, settle in a few frames) adds life for playful pieces.
 - Kinetic type: reveal text to a readable dwell (~3 s per ~60 chars); word-by-word reveal synced to narration boosts attention.
@@ -52,7 +52,7 @@ Apply these craft principles while scripting, composing, prompting and editing; 
 
 ## 6. Captions / on-screen text
 
-- Most social viewing is **muted** — captions are mandatory and are part of the pacing, not an afterthought.
+- Most social viewing is **muted** — when there is speech, caption it; captions are part of the pacing, not an afterthought.
 - Bold sans-serif, **≥ ~42 px**, ≤ ~2 lines, ≤ ~32–42 chars/line, with a dark stroke or semi-opaque backing for legibility on any footage.
 - Don't scroll text off before it can be read (~3 s per ~60 chars). Word-by-word highlighting in sync with the voice reads best.
 - Lower-thirds: speaker name bold + role lighter; enter ~1–2 s, hold a few seconds, exit fast; never cover eyes/mouth.
@@ -68,20 +68,9 @@ Apply these craft principles while scripting, composing, prompting and editing; 
 ## 8. Platform & format
 
 - Aspect: **9:16** (TikTok/Reels/Shorts), **16:9** (YouTube/web), **1:1** when speaker+context both matter, cinematic letterbox only when the look serves it. Don't center-crop a wide shot and call it vertical — reframe properly or downgrade to 1:1 honestly.
-- Get past the **3-second** threshold: hook in frame 1, change something every 1–3 s in short-form, captions always.
+- Get past the **3-second** threshold: hook in frame 1, change something every 1–3 s in short-form.
 - The **first frame is the thumbnail/promise** — design it deliberately as a cover, not as an accidental pre-animation state. It needs a readable promise plus concrete signals of the actual subject/result; make it match what you're delivering, and pay it off quickly.
 - Match length to platform norms; the algorithm rewards watch-time/completion, not raw length.
-
-## 9. Per-line craft — see the matching stage skill
-
-The cross-cutting craft above (§1–§8, §10–§11) applies to every line. The **line-specific director judgment** lives with each line's mechanics in its stage skill — read the one for the line you locked:
-
-- **Explainer / animation** → **stage-compose** (compose line).
-- **Talking-head, cinematic** → **stage-generate** (generation line).
-- **Social clip, podcast-repurpose, screen-demo, localization, documentary-montage** → **stage-edit** (editing line).
-- **A finished video woven from the user's material + framing / voice / motion (more than one line)** → **stage-plan** + **stage-assemble** (AUTO end-to-end line) — the cross-source editorial judgment: deciding the spine source-agnostic, assigning each beat the right source, and engineering continuity across the seams.
-
-If a piece layers lines (e.g. compose captions over generated footage), read both and apply the primary (locked) line's judgment first.
 
 ## 10. Shot & camera language (generation / cinematic)
 
@@ -111,13 +100,13 @@ The most common failure of generated/composed video is that it quietly degrades 
 
 - **Dead motion** — shots sit still: no camera move, build, or designed motion where the format wants it.
 - **Repetition** — same shot size / scene type / transition ≥ 3 in a row.
-- **Decoration** — motion or effects that carry no meaning (movement for its own sake).
+- **Decoration** — effects unrelated to the subject (particles, glows, blobs). A slow push or drift that keeps a frame alive is not decoration.
 - **Promise drift** — a motion/cinematic brief silently delivered as static cards (see the routing lock).
 - **Text crutch** — walls of on-screen text doing the job the visuals should be doing.
 
 ### Then confirm (each line = where a finding hides)
 
-- **Readable** — text ≥ the legibility floor (~40 px at 1080p, scaled to the canvas) and ≥ 4.5:1 contrast; captions synced; nothing covers the face/critical content; readable at phone size.
+- **Readable** — text within the design system's type scale (native QA blocks under 18 px) and ≥ 4.5:1 contrast; captions synced; nothing covers the face/critical content; readable at phone size.
 - **Timed** — hook lands in the first seconds; first payoff early; pattern interrupt on cadence; each scene held long enough to read; narration wpm fits the format.
 - **On message** — the core point is actually stated; visuals reinforce (not fight) the narration; no padding/dead time; exact text correct (no hallucinated stats).
 - **Consistent** — one grade, one type system, a small transition set; subject identity preserved across cuts.
@@ -128,6 +117,10 @@ The most common failure of generated/composed video is that it quietly degrades 
 
 For this route, read [ecommerce.md](references/ecommerce.md) when selected by the router.
 
+## Product source
+
+For a video that promotes, launches, demos or explains a product, app, service or site with a reachable page or supplied screenshots, read [product-source.md](references/product-source.md) before the direction confirmation, including reference-led work.
+
 ## Reference-led reconstruction
 
-For `is_generation:false` reference-led creative work, read [reference-recreation.md](references/reference-recreation.md) after production-method selection.
+For `is_generation:false` reference-led creative work (COMPOSE always is), read [reference-recreation.md](references/reference-recreation.md).

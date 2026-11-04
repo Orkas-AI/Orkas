@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import type { Reporter, FullConfig, Suite, TestCase, TestResult, FullResult } from '@playwright/test/reporter';
+import type { Reporter, FullConfig, Suite, TestCase, TestResult, FullResult, TestError } from '@playwright/test/reporter';
 import { analyzeWebAppLogs } from '../test/e2e/fixtures/web-app-log-analysis';
+import { sanitizeLogTextForUpload } from '../src/main/util/log-sanitize';
 
 /** Structured outcomes, not console text, determine completion. */
 export default class CheckpointReporter implements Reporter {
@@ -12,6 +13,8 @@ export default class CheckpointReporter implements Reporter {
   private files: Array<{ file: string; state: string; passed: number; failed: number; skipped: number; durationMs: number }> = [];
   private testFiles: string[] = [];
   private errors = 0;
+  private runnerErrors: string[] = [];
+  private omittedRunnerErrors = 0;
   private appAnalyses: Array<ReturnType<typeof analyzeWebAppLogs> & { case: string }> = [];
   private artifacts: string[] = [];
   private outputDir = '';
@@ -27,7 +30,13 @@ export default class CheckpointReporter implements Reporter {
   private event(stream: string, chunk: string | Buffer, test?: TestCase) {
     fs.appendFileSync(this.events, JSON.stringify({ case: test?.id || 'setup', phase: 'worker', stream, text: chunk.toString() }) + '\n');
   }
-  onError() { this.errors++; }
+  onError(error: TestError) {
+    this.errors++;
+    if (this.runnerErrors.length < 20) this.runnerErrors.push(sanitizeLogTextForUpload(
+      (error.message || error.value || 'Unhandled Playwright error').slice(0, 4000),
+    ).slice(0, 2000));
+    else this.omittedRunnerErrors++;
+  }
   onTestEnd(test: TestCase, result: TestResult) {
     const failed = result.status !== test.expectedStatus && result.status !== 'skipped';
     // A retry is preserved as a finding and never certified for reuse.
@@ -63,7 +72,9 @@ export default class CheckpointReporter implements Reporter {
   }
   onEnd(result: FullResult) {
     fs.writeFileSync(this.report, JSON.stringify({ schema: 1, reason: result.status === 'passed' ? 'passed' : 'failed',
-      batchUnits: this.testFiles.length, testFiles: this.testFiles, unhandledErrors: this.errors, inventory: this.inventory, files: this.files, appAnalyses: this.appAnalyses,
+      batchUnits: this.testFiles.length, testFiles: this.testFiles, unhandledErrors: this.errors,
+      runnerErrors: this.runnerErrors, omittedRunnerErrors: this.omittedRunnerErrors,
+      inventory: this.inventory, files: this.files, appAnalyses: this.appAnalyses,
       artifactPaths: this.artifacts, outputDir: this.outputDir }), { mode: 0o600 });
   }
 }

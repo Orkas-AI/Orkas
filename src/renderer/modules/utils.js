@@ -328,6 +328,14 @@ function _renderMarkdownFullInner(md, blockCache) {
     return protect(`<code>${escapeHtml(content)}</code>`);
   });
 
+  // Visualization content references are a standalone structured protocol.
+  // Parse after shielding code examples, then protect the generated mount
+  // from Markdown transforms just like the existing dashboard blocks.
+  md = md.replace(/^[ \t]*\uE200visualize\uE202([^\uE200\uE201\uE202\r\n]*)\uE201[ \t]*\r?$/gm, (source, body) => {
+    const html = _markdownVisualizationHtml(body);
+    return html ? protect(html) : source;
+  });
+
   // ── Phase 2: line-by-line parsing ──
   // Collected after phase 1 so a fenced or inline-code `![](…)` sample — now a
   // placeholder — is not mistaken for an embed this message actually shows.
@@ -1097,11 +1105,11 @@ function _dbAlert(props, children = []) {
   const bodyText = String(bodyRaw == null ? '' : bodyRaw);
   // Fallback: some models put the alert copy in child nodes (e.g. a nested
   // Markdown) instead of a text prop. Render those as the body so the alert
-  // is not silently dropped to an empty string.
-  const childHtml = (!titleText && !bodyText && children.length) ? _dbChildren(children) : '';
+  // body is retained even when a title is supplied. Explicit body text wins.
+  const childHtml = (!bodyText && children.length) ? _dbChildren(children) : '';
   if (!titleText && !bodyText && !childHtml) return '';
   const content = childHtml
-    ? `<div class="db-alert-body">${childHtml}</div>`
+    ? `${titleText ? `<div class="db-alert-title">${escapeHtml(titleText)}</div>` : ''}<div class="db-alert-body">${childHtml}</div>`
     : `<div class="db-alert-title">${escapeHtml(titleText || bodyText)}</div>${
         titleText && bodyText ? `<div class="db-alert-body">${escapeHtml(bodyText)}</div>` : ''}`;
   return `<div class="db-alert" data-level="${level}" role="status">
@@ -1512,6 +1520,28 @@ function _markdownHtmlPreviewLabel() {
     }
   } catch (_) { /* fall through */ }
   return 'Preview';
+}
+
+function _markdownVisualizationHtml(body) {
+  // Bound JSON work; paths are literal executor-side filenames, never URLs.
+  // Unknown shapes remain visible source rather than being guessed/repaired.
+  if (body.length > 16_384) return '';
+  try {
+    const spec = JSON.parse(body);
+    if (!spec || Array.isArray(spec) || typeof spec !== 'object'
+        || !Object.hasOwn(spec, 'path')
+        || Object.keys(spec).some(key => key !== 'path' && key !== 'mode')
+        || (Object.hasOwn(spec, 'mode') && spec.mode !== 'wide')
+        || typeof spec.path !== 'string'
+        || !/^(?:\/(?!\/)|[A-Za-z]:[\\/])/.test(spec.path)
+        || /[\u0000-\u001f\u007f]/.test(spec.path)
+        || !_HTML_EXT_RE.test(spec.path)) return '';
+    // Both default and wide references fit the existing chat preview surface.
+    // Hydration and main's normal HTML resolver retain the sandbox boundary.
+    return _markdownHtmlEmbedHtml(_normalizeLocalMediaSrc(spec.path), '');
+  } catch (_) {
+    return '';
+  }
 }
 
 // Markdown image syntax occasionally carries an HTML deliverable when an
@@ -2421,6 +2451,9 @@ function _aiSelectMount(el, config) {
   const state = {
     options: [],        // [{value, label, hint?, iconName?, avatar?, disabled?}]
     value: '',
+    allowMultiple: false,
+    multiple: false,
+    values: [],
     placeholder: (t('ai_select.placeholder')),
     onChange: () => {},
     open: false,
@@ -2433,6 +2466,12 @@ function _aiSelectMount(el, config) {
   if (state.value && !state.options.some(
     option => option.value === state.value && !option.disabled,
   )) state.value = '';
+
+  state.multiple = state.allowMultiple && state.multiple === true;
+  const disabled = option => option.disabled || (state.multiple && option.singleOnly);
+  const normalizeValues = values => state.options
+    .filter(option => !disabled(option) && values.includes(option.value)).map(option => option.value);
+  state.values = state.multiple ? normalizeValues(state.values) : (state.value ? [state.value] : []);
 
   const caretIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
     ? window.uiIconHtml('chevron-down', 'ai-select-caret')
@@ -2482,7 +2521,10 @@ function _aiSelectMount(el, config) {
 
   const renderTrigger = () => {
     trigger.setAttribute('aria-label', accessibleName());
-    const opt = state.options.find(o => o.value === state.value);
+    const selected = state.multiple ? state.options.filter(o => state.values.includes(o.value)) : [];
+    const opt = state.multiple
+      ? (selected.length ? { label: selected.map(o => o.label).join(t('ai_select.separator')) } : null)
+      : state.options.find(o => o.value === state.value);
     if (opt) {
       renderOptionLabel(labelEl, opt);
       labelEl.classList.remove('placeholder');
@@ -2491,10 +2533,34 @@ function _aiSelectMount(el, config) {
       labelEl.classList.add('placeholder');
     }
     el.dataset.value = state.value || '';
+    if (state.allowMultiple) {
+      el.dataset.values = JSON.stringify(state.values);
+      trigger.title = opt ? opt.label : '';
+      trigger.setAttribute('aria-label', opt ? accessibleName() + ': ' + opt.label : accessibleName());
+    }
   };
 
   const renderPopover = () => {
+    const scrollTop = popover.scrollTop;
     popover.innerHTML = '';
+    popover.setAttribute('aria-multiselectable', String(state.multiple));
+    if (state.allowMultiple) {
+      const header = document.createElement('label');
+      header.className = 'ai-select-multiple-row';
+      header.textContent = t('ai_select.multiple');
+      const toggle = document.createElement('input');
+      toggle.type = 'checkbox';
+      toggle.className = 'ai-select-multiple-toggle';
+      toggle.setAttribute('role', 'switch');
+      toggle.checked = state.multiple;
+      toggle.addEventListener('change', () => {
+        api.setMultiple(toggle.checked);
+        state.onChange(state.multiple ? [...state.values] : state.value);
+        popover.querySelector('.ai-select-multiple-toggle')?.focus();
+      });
+      header.appendChild(toggle);
+      popover.appendChild(header);
+    }
     if (state.options.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'ai-select-empty';
@@ -2508,16 +2574,23 @@ function _aiSelectMount(el, config) {
       item.id = `${listboxId}-option-${idx}`;
       item.dataset.value = opt.value;
       item.setAttribute('role', 'option');
-      const selected = opt.value === state.value;
+      const selected = state.multiple ? state.values.includes(opt.value) : opt.value === state.value;
       item.setAttribute('aria-selected', selected ? 'true' : 'false');
-      item.setAttribute('aria-disabled', opt.disabled ? 'true' : 'false');
+      item.setAttribute('aria-disabled', disabled(opt) ? 'true' : 'false');
       if (selected) item.classList.add('active');
-      if (opt.disabled) item.classList.add('disabled');
+      if (disabled(opt)) item.classList.add('disabled');
       if (idx === state.activeIdx) item.classList.add('hover');
       const main = document.createElement('div');
       main.className = 'ai-select-item-label';
       renderOptionLabel(main, opt);
       item.appendChild(main);
+      if (state.multiple && selected) {
+        const check = document.createElement('span');
+        check.className = 'ai-select-check';
+        check.setAttribute('aria-hidden', 'true');
+        check.innerHTML = typeof window.uiIconHtml === 'function' ? window.uiIconHtml('check', 'ui-icon') : '\u2713';
+        main.appendChild(check);
+      }
       if (opt.hint) {
         const hint = document.createElement('div');
         hint.className = 'ai-select-item-hint';
@@ -2526,16 +2599,17 @@ function _aiSelectMount(el, config) {
       }
       item.addEventListener('mousedown', (e) => {
         e.preventDefault();
-        if (opt.disabled) return;
+        if (disabled(opt)) return;
         _aiSelectPick(api, opt.value);
       });
       item.addEventListener('mouseenter', () => {
-        if (opt.disabled) return;
+        if (disabled(opt)) return;
         state.activeIdx = idx;
         popover.querySelectorAll('.ai-select-item').forEach((n, i) => n.classList.toggle('hover', i === idx));
       });
       popover.appendChild(item);
     });
+    if (state.allowMultiple) popover.scrollTop = scrollTop;
     const active = state.activeIdx >= 0
       ? popover.querySelectorAll('.ai-select-item')[state.activeIdx]
       : null;
@@ -2579,10 +2653,10 @@ function _aiSelectMount(el, config) {
     portalParent = popover.parentNode;
     portalNextSibling = popover.nextSibling;
     document.body.appendChild(popover);
-    const selectedIdx = state.options.findIndex(o => o.value === state.value && !o.disabled);
+    const selectedIdx = state.options.findIndex(o => (state.multiple ? state.values.includes(o.value) : o.value === state.value) && !disabled(o));
     state.activeIdx = selectedIdx >= 0
       ? selectedIdx
-      : state.options.findIndex(option => !option.disabled);
+      : state.options.findIndex(option => !disabled(option));
     renderPopover();
     reposition();
     setTimeout(() => document.addEventListener('mousedown', onDocDown, true), 0);
@@ -2629,7 +2703,7 @@ function _aiSelectMount(el, config) {
   };
   const nextEnabledIndex = (start, step) => {
     for (let idx = start; idx >= 0 && idx < state.options.length; idx += step) {
-      if (!state.options[idx].disabled) return idx;
+      if (!disabled(state.options[idx])) return idx;
     }
     return state.activeIdx;
   };
@@ -2639,7 +2713,9 @@ function _aiSelectMount(el, config) {
     // adjacent input would otherwise commit its Enter into "pick the
     // active option" of this select.
     if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Escape') { close(); e.preventDefault(); }
+    if (e.key === 'Escape') { close(); if (state.allowMultiple) trigger.focus(); e.preventDefault(); }
+    else if (state.allowMultiple && e.key === 'Tab') { close(); if (e.target !== trigger) trigger.focus(); }
+    else if (e.target.classList?.contains('ai-select-multiple-toggle')) return;
     else if (e.key === 'ArrowDown') {
       state.activeIdx = nextEnabledIndex(state.activeIdx + 1, 1);
       renderPopover();
@@ -2651,11 +2727,11 @@ function _aiSelectMount(el, config) {
       );
       renderPopover();
       e.preventDefault();
-    } else if (e.key === 'Enter') {
+    } else if (e.key === 'Enter' || (state.multiple && e.key === ' ')) {
       if (
         state.activeIdx >= 0
         && state.activeIdx < state.options.length
-        && !state.options[state.activeIdx].disabled
+        && !disabled(state.options[state.activeIdx])
       ) {
         _aiSelectPick(api, state.options[state.activeIdx].value);
         e.preventDefault();
@@ -2680,8 +2756,10 @@ function _aiSelectMount(el, config) {
         state.activeIdx >= state.options.length
         || state.options[state.activeIdx]?.disabled
       ) {
-        state.activeIdx = state.options.findIndex(option => !option.disabled);
+        state.activeIdx = state.options.findIndex(option => !disabled(option));
       }
+      if (state.multiple) state.values = normalizeValues(state.values);
+      else state.values = state.value ? [state.value] : [];
       renderTrigger();
       if (state.open) renderPopover();
     },
@@ -2692,6 +2770,31 @@ function _aiSelectMount(el, config) {
         ? value
         : '';
       renderTrigger();
+    },
+    setSelection(values, multiple) {
+      state.multiple = state.allowMultiple && multiple === true;
+      state.values = normalizeValues(Array.isArray(values) ? values : []);
+      state.value = state.multiple ? '' : (state.values.length === 1 ? state.values[0] : '');
+      if (!state.multiple) state.values = state.value ? [state.value] : [];
+      renderTrigger();
+      if (state.open) { renderPopover(); reposition(); }
+    },
+    setMultiple(multiple) {
+      const values = state.multiple ? state.values : (state.value ? [state.value] : []);
+      const expanded = values.flatMap(value => {
+        const option = state.options.find(opt => opt.value === value);
+        return multiple && option?.singleOnly ? (option.multipleValues || []) : [value];
+      });
+      api.setSelection(expanded, multiple);
+    },
+    isMultiple() { return state.multiple; },
+    getValues() { return state.multiple ? [...state.values] : (state.value ? [state.value] : []); },
+    toggleValue(value) {
+      const next = state.options.find(option => option.value === value);
+      if (!next || disabled(next)) return;
+      const values = state.values.includes(value) ? state.values.filter(v => v !== value) : [...state.values, value];
+      api.setSelection(values, true);
+      state.onChange([...state.values]);
     },
     setAriaLabel(value) {
       state.ariaLabel = value === null || value === undefined ? '' : String(value);
@@ -2708,7 +2811,8 @@ function _aiSelectMount(el, config) {
 
 function _aiSelectPick(api, value) {
   const next = api.state.options.find(option => option.value === value);
-  if (!next || next.disabled) return;
+  if (!next || next.disabled || (api.state.multiple && next.singleOnly)) return;
+  if (api.state.multiple) { api.toggleValue(value); return; }
   const prev = api.state.value;
   api.state.value = value || '';
   api.el.dataset.value = api.state.value;

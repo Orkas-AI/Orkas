@@ -67,6 +67,8 @@ export interface ChatDocInput {
   time: string;
   /** Already extracted by the caller (`readMsgText`); tokenized here. */
   text: string;
+  /** Compressed, source-derived public display text; old callers may omit it. */
+  projection?: Buffer;
 }
 
 export interface ChatDocRow {
@@ -234,9 +236,44 @@ function handleFor(uid: string): Handle {
     try { db.close(); } catch { /* preserve the original failure */ }
     throw err;
   }
+  // Additive derived cache: preserve every existing v2 posting during upgrade.
+  // Old applications can ignore these tables; source stamps prevent stale reuse.
+  try { db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_projection_files (cid TEXT PRIMARY KEY, stamp TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS chat_projections (
+      cid TEXT NOT NULL, msg_index INTEGER NOT NULL, payload BLOB NOT NULL,
+      PRIMARY KEY (cid, msg_index)
+    ) WITHOUT ROWID;
+  `); } catch (error) { db.close(); throw error; }
   const handle: Handle = { db, dbPath, stats: null, dataVersion: -1 };
   _stores.set(uid, handle);
   return handle;
+}
+
+/** Source identity includes inode and ctime, not only size/mtime. */
+export function readProjectionStamp(uid: string, cid: string): string | undefined {
+  return (handleFor(uid).db.prepare('SELECT stamp FROM chat_projection_files WHERE cid = ?')
+    .get(cid) as { stamp: string } | undefined)?.stamp;
+}
+
+function setProjectionStamp(uid: string, cid: string, stamp?: string): void {
+  const db = handleFor(uid).db;
+  if (stamp !== undefined) db.prepare('INSERT OR REPLACE INTO chat_projection_files (cid, stamp) VALUES (?, ?)').run(cid, stamp);
+  else db.prepare('DELETE FROM chat_projection_files WHERE cid = ?').run(cid);
+}
+
+function writeProjection(db: Database.Database, doc: ChatDocInput): void {
+  if (doc.projection) db.prepare('INSERT OR REPLACE INTO chat_projections (cid, msg_index, payload) VALUES (?, ?, ?)')
+    .run(doc.cid, doc.msgIndex, doc.projection);
+  else db.prepare('DELETE FROM chat_projections WHERE cid = ? AND msg_index = ?').run(doc.cid, doc.msgIndex);
+}
+
+/** Read one bounded payload at a time on a snippet worker. A missing/stale cache
+ * falls back to the exact source; it never removes a ranked candidate. */
+export function readChatProjection(uid: string, cid: string, index: number, stamp: string): Buffer | undefined {
+  return (handleFor(uid).db.prepare(`SELECT p.payload FROM chat_projections p
+    JOIN chat_projection_files f ON f.cid = p.cid
+    WHERE p.cid = ? AND p.msg_index = ? AND f.stamp = ?`).get(cid, index, stamp) as { payload: Buffer } | undefined)?.payload;
 }
 
 // ── Writes ───────────────────────────────────────────────────────────────
@@ -271,6 +308,7 @@ export function upsertDoc(uid: string, doc: ChatDocInput): void {
     const insert = db.prepare('INSERT INTO chat_postings (term_id, doc, tf) VALUES (?, ?, ?)');
     const intern = _internStatements(db);
     for (const [term, tf] of terms) insert.run(intern(term), id, tf);
+    writeProjection(db, doc);
   });
   run();
   handle.stats = null;
@@ -279,13 +317,22 @@ export function upsertDoc(uid: string, doc: ChatDocInput): void {
 /** A crash must never certify a message whose postings did not commit. */
 export function writeLiveMessage(uid: string, cid: string, msgIndex: number,
   doc: ChatDocInput | undefined, mark: ChatFileWatermark | undefined,
-  previous?: { size: number; mtime: number }): boolean {
+  previous?: { size: number; mtime: number },
+  projectionSource?: { beforeStamp?: string; stamp: string }): boolean {
   const { db } = handleFor(uid);
   return db.transaction(() => {
     const known = readFileWatermark(uid, cid);
+    const previousProjection = readProjectionStamp(uid, cid);
     const contiguous = (known?.next ?? 0) === msgIndex
-      && (!previous || (known ? known.size === previous.size && known.mtime === previous.mtime : previous.size === 0));
+      && (!previous || (known ? known.size === previous.size && known.mtime === previous.mtime : previous.size === 0))
+      && (!projectionSource?.beforeStamp || !previousProjection || previousProjection === projectionSource.beforeStamp);
     if (doc) upsertDoc(uid, doc);
+    const retainProjection = contiguous && projectionSource
+      && ((msgIndex === 0 && (!previous || previous.size === 0))
+        || (!!projectionSource.beforeStamp && readProjectionStamp(uid, cid) === projectionSource.beforeStamp));
+    // Compatibility callers have no byte receipt. Keep their established
+    // incremental index contract but do not certify earlier cached text.
+    setProjectionStamp(uid, cid, retainProjection ? projectionSource.stamp : previousProjection !== undefined ? '' : undefined);
     if (contiguous && mark) setFileWatermark(uid, cid, mark);
     else {
       dropFileWatermark(uid, cid);
@@ -303,13 +350,15 @@ export function deleteConversation(uid: string, cid: string): void {
     db.prepare('DELETE FROM chat_postings WHERE doc IN (SELECT id FROM chat_docs WHERE cid = ?)').run(cid);
     db.prepare('DELETE FROM chat_docs WHERE cid = ?').run(cid);
     db.prepare('DELETE FROM chat_files WHERE cid = ?').run(cid);
+    db.prepare('DELETE FROM chat_projection_files WHERE cid = ?').run(cid);
+    db.prepare('DELETE FROM chat_projections WHERE cid = ?').run(cid);
     db.prepare('DELETE FROM chat_meta WHERE key = ?').run(`rebuild:${cid}`);
   })();
   handle.stats = null;
 }
 
 /** A restartable source-file cursor, separate from a completed file watermark. */
-export function readRebuildCursor(uid: string, cid: string): ChatFileWatermark | undefined {
+export function readRebuildCursor(uid: string, cid: string): (ChatFileWatermark & { projectionStamp?: string; projectionOnly?: boolean }) | undefined {
   const row = handleFor(uid).db.prepare('SELECT value FROM chat_meta WHERE key = ?')
     .get(`rebuild:${cid}`) as { value: string } | undefined;
   return row ? JSON.parse(row.value) : undefined;
@@ -319,30 +368,37 @@ export function readRebuildCursor(uid: string, cid: string): ChatFileWatermark |
  * documents may be searched, but only the final batch certifies the file. */
 export function writeRebuildBatch(
   uid: string, cid: string, docs: ChatDocInput[], mark: ChatFileWatermark,
-  reset: boolean, complete: boolean,
+  reset: boolean, complete: boolean, projectionStamp?: string, projectionOnly = false,
 ): void {
   const handle = handleFor(uid);
   const { db } = handle;
   db.transaction(() => {
-    if (reset) deleteConversation(uid, cid);
-    db.prepare('DELETE FROM chat_files WHERE cid = ?').run(cid);
+    if (reset) {
+      if (projectionOnly) db.prepare('DELETE FROM chat_projections WHERE cid = ?').run(cid);
+      else deleteConversation(uid, cid);
+    }
+    setProjectionStamp(uid, cid);
+    if (!projectionOnly) db.prepare('DELETE FROM chat_files WHERE cid = ?').run(cid);
     const insertDoc = db.prepare(`INSERT INTO chat_docs (doc_id, cid, msg_index, role, time, len)
       VALUES (?, ?, ?, ?, ?, ?)`);
     const insertPosting = db.prepare('INSERT INTO chat_postings (term_id, doc, tf) VALUES (?, ?, ?)');
     const intern = _internStatements(db);
     for (const doc of docs) {
+      if (projectionOnly) { writeProjection(db, doc); continue; }
       const id = Number(insertDoc.run(chatDocId(cid, doc.msgIndex), cid, doc.msgIndex,
         doc.role || '', doc.time || '', doc.text.length).lastInsertRowid);
       const terms = new Map<string, number>();
       for (const term of tokenize(doc.text)) terms.set(term, (terms.get(term) || 0) + 1);
       for (const [term, tf] of terms) insertPosting.run(intern(term), id, tf);
+      writeProjection(db, doc);
     }
     if (complete) {
       setFileWatermark(uid, cid, mark);
+      setProjectionStamp(uid, cid, projectionStamp);
       db.prepare('DELETE FROM chat_meta WHERE key = ?').run(`rebuild:${cid}`);
     } else {
       db.prepare('INSERT OR REPLACE INTO chat_meta (key, value) VALUES (?, ?)')
-        .run(`rebuild:${cid}`, JSON.stringify(mark));
+        .run(`rebuild:${cid}`, JSON.stringify({ ...mark, ...(projectionStamp ? { projectionStamp } : {}), ...(projectionOnly ? { projectionOnly } : {}) }));
     }
   })();
   handle.stats = null;
@@ -374,6 +430,8 @@ export function replaceConversation(
   const handle = handleFor(uid);
   const { db } = handle;
   db.transaction(() => {
+    setProjectionStamp(uid, cid);
+    db.prepare('DELETE FROM chat_projections WHERE cid = ?').run(cid);
     db.prepare('DELETE FROM chat_postings WHERE doc IN (SELECT id FROM chat_docs WHERE cid = ?)').run(cid);
     db.prepare('DELETE FROM chat_docs WHERE cid = ?').run(cid);
     const insertDoc = db.prepare(`
@@ -391,6 +449,7 @@ export function replaceConversation(
       const terms = new Map<string, number>();
       for (const term of tokenize(doc.text)) terms.set(term, (terms.get(term) || 0) + 1);
       for (const [term, tf] of terms) insertPosting.run(intern(term), id, tf);
+      writeProjection(db, doc);
     }
     db.prepare(`
       INSERT INTO chat_files (cid, mtime, size, next) VALUES (?, ?, ?, ?)

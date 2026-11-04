@@ -1,7 +1,6 @@
 ---
 name: agent-creator
-description_zh: "创建或修改用户明确要求的自定义 Agent，支持把对话沉淀为 Agent、调整工作流或路由描述；不用于执行普通 Agent 任务。"
-description_en: "Create or revise explicitly requested custom Agents, including conversation crystallization, workflows and routing descriptions; not ordinary Agent task execution."
+description: "Create or revise explicitly requested custom Agents, including conversation crystallization, workflows and routing descriptions; not ordinary Agent task execution."
 ---
 
 # agent-creator

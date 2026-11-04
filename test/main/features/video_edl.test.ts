@@ -773,6 +773,133 @@ describe('validateEdl — editable caption/narration data (language-driven separ
   });
 });
 
+/** The AUTO plan gpt-6-luna wrote in the 2026-10-30 benchmark (vid-plan-auto):
+ *  a 4 s title card, clip1, three cuts of clip2 and a closing card, with
+ *  captions mirroring the narration. `segment_id` is added the way stage-plan
+ *  now asks for it; `lineStarts` places the six lines. */
+function openerPlan(lineStarts: number[]): VideoEdl {
+  const card = (id: string, order: number, role: 'hook' | 'cta', kind: string, copy: string, target: number) => ({
+    id, order, role, layer: 'primary' as const, source: 'compose' as const, target_sec: target,
+    spec: { kind, composition_plan: { scenes: [{ id, approved_copy: [copy], narration_text: '', roles: ['title'] }] } },
+  });
+  const cut = (id: string, order: number, role: 'body' | 'proof' | 'cta', input: string, from: number, to: number) => ({
+    id, order, role, layer: 'primary' as const, source: 'edit' as const, target_sec: to - from,
+    spec: { input_id: input, in_sec: from, out_sec: to },
+  });
+  const lines = [
+    { text: '先从产品外观开始，看看它的操作体验。', segment_id: 's1_open', target_sec: 4 },
+    { text: '产品外观清晰呈现；上电后，主界面随即显示。', segment_id: 's2_product', target_sec: 8 },
+    { text: '跟随画面，看看产品的核心操作。', segment_id: 's3_operation', target_sec: 5 },
+    { text: '画面展示了操作前后的效果对比。', segment_id: 's4_comparison', target_sec: 4 },
+    { text: '最后，镜头落在品牌特写。', segment_id: 's5_brand', target_sec: 3 },
+    { text: '从产品外观、上电界面到核心操作与效果对比，完整了解这次产品体验。', segment_id: 's6_close', target_sec: 6 },
+  ].map((line, index) => ({ ...line, start_sec: lineStarts[index] }));
+  return {
+    aspect: '16:9',
+    total_target_sec: 40,
+    language: 'zh',
+    delivery_promise: { type: 'hybrid', source_required: true, motion_min_ratio: 0.7 },
+    segments: [
+      card('s1_open', 1, 'hook', 'title-card', '产品体验，从这里开始', 4),
+      cut('s2_product', 2, 'proof', 'clip1', 0, 12),
+      cut('s3_operation', 3, 'body', 'clip2', 0, 8),
+      cut('s4_comparison', 4, 'proof', 'clip2', 8, 14),
+      cut('s5_brand', 5, 'cta', 'clip2', 14, 18),
+      card('s6_close', 6, 'cta', 'closing-card', '看见每一步，体验更清晰', 6),
+    ],
+    tracks: {
+      narration: {
+        synthesis: { route_ref: 'speech-route-zh-current', voice_ref: 'zh-cn-narrator-1', display_name: '温和中文旁白', language: 'zh-CN', speed: 1 },
+        segments: lines,
+      },
+      captions: { style: 'bold-bottom', lines: lines.map((line) => ({ ...line })) },
+    },
+    cost_estimate: { billable_generations: 0 },
+  };
+}
+
+describe('validateEdl — track lines bound to the segment they play over', () => {
+  // As written in the run: from "核心操作" on, each line sits where its footage
+  // would be without the 4 s card. Then the same lines on their footage.
+  const asWritten = [0, 4, 12, 20, 26, 34];
+  const onFootage = [0, 4, 16, 24, 30, 34];
+  const outside = (plan: unknown) => validateEdl(plan).errors.filter((e) => e.code === 'E_TRACK_LINE_OUTSIDE_SEGMENT');
+
+  it('rejects lines timed on the clips instead of the finished video', () => {
+    const errors = outside(openerPlan(asWritten));
+    expect(errors.map((e) => e.path)).toEqual([
+      'tracks.narration.segments[2].start_sec',
+      'tracks.narration.segments[3].start_sec',
+      'tracks.narration.segments[4].start_sec',
+      'tracks.captions.lines[2].start_sec',
+      'tracks.captions.lines[3].start_sec',
+      'tracks.captions.lines[4].start_sec',
+    ]);
+    // The message names the window the line has to move into.
+    expect(errors[0].message).toContain('"s3_operation" plays 16–24s in the finished video');
+  });
+
+  it('accepts the same lines placed on their footage', () => {
+    const r = validateEdl(openerPlan(onFootage));
+    expect(r.ok).toBe(true);
+    expect(r.errors).toEqual([]);
+  });
+
+  it('checks where a line starts, so one sentence may run across a cut', () => {
+    const p = openerPlan(onFootage);
+    p.tracks!.narration!.segments = [
+      { text: '镜头先展示产品外观，随后呈现上电与主界面。', segment_id: 's2_product', start_sec: 9, target_sec: 10 },
+    ];
+    p.tracks!.captions = null;
+    expect(validateEdl(p).errors).toEqual([]);
+  });
+
+  it('accepts a line at its segment start and rejects one at its segment end', () => {
+    const p = openerPlan(onFootage);
+    p.tracks!.captions = { lines: [
+      { text: '产品外观', segment_id: 's2_product', start_sec: 4, target_sec: 3 },
+      { text: '核心操作', segment_id: 's2_product', start_sec: 16, target_sec: 3 },
+    ] };
+    expect(outside(p).map((e) => e.path)).toEqual(['tracks.captions.lines[1].start_sec']);
+  });
+
+  it('follows segment order rather than array position and gives an overlay its primary window', () => {
+    const p = openerPlan(onFootage);
+    p.segments.reverse();
+    p.segments.push({
+      id: 'logo', order: 7, role: 'body', layer: 'overlay', over: 's3_operation', source: 'compose', target_sec: 3,
+      spec: { kind: 'corner-logo', composition_plan: { scenes: [{ id: 'logo', approved_copy: ['Logo'], narration_text: '', roles: ['logo'] }] } },
+    });
+    p.tracks!.captions = { lines: [
+      { text: '角标', segment_id: 'logo', start_sec: 17, target_sec: 2 },
+      { text: '角标提前', segment_id: 'logo', start_sec: 12, target_sec: 2 },
+    ] };
+    const errors = outside(p);
+    expect(errors.map((e) => e.path)).toEqual(['tracks.captions.lines[1].start_sec']);
+    expect(errors[0].message).toContain('"logo" (over "s3_operation") plays 16–24s');
+  });
+
+  it('rejects a segment_id that names no segment', () => {
+    const p = openerPlan(onFootage);
+    p.tracks!.narration!.segments[2].segment_id = 's3_operations';
+    expect(codes(p).errors).toEqual(['E_TRACK_LINE_SEGMENT_UNKNOWN']);
+  });
+
+  it('leaves lines without segment_id to the existing checks', () => {
+    const p = openerPlan(asWritten);
+    for (const line of [...p.tracks!.narration!.segments, ...p.tracks!.captions!.lines!]) delete line.segment_id;
+    expect(validateEdl(p).ok).toBe(true);
+  });
+
+  it('skips the check when the primary order is ambiguous', () => {
+    const p = openerPlan(asWritten);
+    p.segments[2].order = 2;
+    const r = codes(p);
+    expect(r.warnings).toContain('W_ORDER_DUP');
+    expect(r.errors).not.toContain('E_TRACK_LINE_OUTSIDE_SEGMENT');
+  });
+});
+
 describe('summarizeEdl', () => {
   it('renders a timeline with promise, ordered primaries, nested overlays, tracks, and cost', () => {
     const out = summarizeEdl(validPlan());

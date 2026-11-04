@@ -3,7 +3,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
 import { createExecutionPlanTool, defineTool, toToolDefinition, getBuiltinTools } from "../src/tools/index.js";
-import { Session } from "../src/agent/session.js";
+import { Session, EXECUTION_PLAN_MAX_STEPS, EXECUTION_PLAN_MAX_STEP_CHARS } from "../src/agent/session.js";
 import { DEFAULT_BASH_TIMEOUT_MS, normalizeBashTimeoutMs } from "../src/tools/builtin.js";
 import { compactGitHubReadme } from "../src/tools/github-repository-fetch.js";
 import { MAX_WEB_FETCH_RESPONSE_BYTES } from "../src/tools/web-fetch.js";
@@ -106,699 +106,81 @@ describe("Tools", () => {
       expect(properties).not.toHaveProperty("status");
     });
 
-    it("creates a plan directly from the first complete snapshot", async () => {
+    function fixture() {
       const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the task" }]);
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
+      session.beginUserTurn([{ type: 'text', text: 'Inspect and deliver the requested work' }]);
+      const tool = createExecutionPlanTool({ get: () => session.getExecutionPlan(),
+        update: update => session.updateExecutionPlan(update), clear: () => session.clearExecutionPlan() });
+      return { session, call: (plan: unknown, extra = {}) => tool.execute({ plan, ...extra }, { state: {} }) };
+    }
 
-      const inferred = await tool.execute({
-        plan: [{ step: "Complete the work", status: "working" }],
-      }, context);
-
-      expect(inferred.isError).toBeUndefined();
-      expect(JSON.parse(inferred.content)).toMatchObject({
-        action: "update",
-        action_inferred: true,
-        revision: 1,
-        updated_step_ids: [1],
-      });
-      expect(session.getExecutionPlan()?.steps[0].status).toBe("in_progress");
+    it('creates and advances a complete plan snapshot, preserves IDs and makes replay a no-op', async () => {
+      const { session, call } = fixture();
+      expect((await call([{ step: 'Inspect', status: 'in_progress' }, { step: 'Deliver', status: 'pending' }])).isError).toBeUndefined();
+      const first = session.getExecutionPlan()!;
+      const next = [{ step: 'Inspect', status: 'completed' }, { step: 'Deliver', status: 'in_progress' }, { step: 'Verify', status: 'pending' }];
+      expect((await call(next)).isError).toBeUndefined();
+      const advanced = session.getExecutionPlan()!;
+      expect(advanced.steps.slice(0, 2).map(step => step.id)).toEqual(first.steps.map(step => step.id));
+      expect(advanced.steps.map(step => step.status)).toEqual(['completed', 'in_progress', 'pending']);
+      expect(JSON.parse((await call(next)).content)).toMatchObject({ unchanged: true, revision: advanced.revision });
     });
 
-    it("repairs a complete guarded plan mislabeled as set_status", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
-      session.updateExecutionPlan({
-        steps: [
-          { step: "Inspect the project", status: "completed" },
-          { step: "Summarize the structure", status: "in_progress" },
-        ],
-      });
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
-
-      const repaired = await tool.execute({
-        action: "set_status",
-        plan: [
-          { step: "Inspect the project", status: "completed" },
-          { step: "Summarize the structure", status: "completed" },
-        ],
-      }, context);
-
-      expect(repaired.isError).toBeUndefined();
-      expect(JSON.parse(repaired.content)).toMatchObject({
-        action: "update",
-        action_inferred: true,
-      });
-      expect(session.getExecutionPlan()?.steps.map((step) => step.status))
-        .toEqual(["completed", "completed"]);
-    });
-
-    it("does not repair ambiguous set_status payloads with one narrow field present", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
-      session.updateExecutionPlan({
-        steps: [{ step: "Complete the work", status: "in_progress" }],
-      });
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
-      const plan = [{ step: "Complete the work", status: "completed" }];
-
-      const missingStatus = await tool.execute({
-        action: "set_status",
-        step_id: 1,
-        plan,
-      }, context);
-      const missingStepId = await tool.execute({
-        action: "set_status",
-        status: "completed",
-        plan,
-      }, context);
-
-      expect(missingStatus).toMatchObject({ isError: true });
-      expect(JSON.parse(missingStatus.content)).toMatchObject({
-        ok: false,
-        error_code: "PLAN_STATUS_INVALID",
-        message: "manage_execution_plan set_status requires a valid status",
-        current_revision: 1,
-        current_steps: [{ id: 1, step: "Complete the work", status: "in_progress" }],
-      });
-      expect(missingStepId).toMatchObject({ isError: true });
-      expect(JSON.parse(missingStepId.content)).toMatchObject({
-        ok: false,
-        error_code: "PLAN_STEP_ID_INVALID",
-        message: "manage_execution_plan set_status requires a positive integer step_id",
-        current_revision: 1,
-      });
-      expect(session.getExecutionPlan()?.steps[0].status).toBe("in_progress");
-    });
-
-    it("accepts replace as a legacy alias without bypassing plan guards", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the task" }]);
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
-
-      const result = await tool.execute({
-        action: "replace",
-        plan: [{ step: "Complete the work", status: "in_progress" }],
-      }, context);
-
-      expect(result.isError).toBeUndefined();
-      expect(JSON.parse(result.content)).toMatchObject({ action: "update", action_inferred: false });
-      expect(session.getExecutionPlan()?.steps[0].step).toBe("Complete the work");
-    });
-
-    it("downgrades a redundant replace_objective replay to a guarded status update", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the original task" }]);
-      session.updateExecutionPlan({
-        steps: [{ step: "Complete the work", status: "in_progress" }],
-      });
-      session.addMessage("user", [{ type: "text", text: "Also include the revised requirement" }]);
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
-      const revisedPlan = [
-        { step: "Complete the work", status: "completed" },
-        { step: "Include the revised requirement", status: "in_progress" },
-      ];
-
-      const first = await tool.execute({
-        action: "update",
-        replace_objective: true,
-        plan: revisedPlan,
-      }, context);
-      const replay = await tool.execute({
-        action: "update",
-        replace_objective: true,
-        plan: revisedPlan,
-      }, context);
-
-      expect(first.isError).toBeUndefined();
-      expect(JSON.parse(first.content)).toMatchObject({ replace_objective_applied: true });
-      expect(replay.isError).toBeUndefined();
-      expect(JSON.parse(replay.content)).toMatchObject({ replace_objective_applied: false });
-      expect(session.getExecutionPlan()?.objective).toBe("Also include the revised requirement");
-
-      const unsafeReplay = await tool.execute({
-        action: "update",
-        replace_objective: true,
-        plan: [{ step: "Do less work", status: "completed" }],
-      }, context);
-      expect(unsafeReplay.isError).toBe(true);
-      expect(unsafeReplay.content).toContain("cannot remove or rename existing milestones");
-    });
-
-    it("advances statuses, appends work, and ignores a replay through complete snapshots", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
-
-      const initial = await tool.execute({
-        explanation: "Create the durable milestones",
-        plan: [
-          { step: "Inspect the inputs", status: "in_progress" },
-          { step: "Verify the result", status: "pending" },
-        ],
-      }, context);
-      expect(JSON.parse(initial.content)).toMatchObject({
-        revision: 1,
-        step_ids: [1, 2],
-        updated_step_ids: [1, 2],
-      });
-      expect(initial.observations?.coordination).toEqual({ changed: true });
-      expect(JSON.parse(initial.content)).not.toHaveProperty("steps");
-
-      const nextSnapshot = [
-        { step: "Inspect the inputs", status: "completed" },
-        { step: "Verify the result", status: "in_progress" },
-        { step: "Publish the result", status: "pending" },
-      ] as const;
-      const advanced = await tool.execute({
-        explanation: "Inspection finished and publishing was discovered",
-        plan: nextSnapshot,
-      }, context);
-      expect(advanced.isError).toBeUndefined();
-      expect(JSON.parse(advanced.content)).toMatchObject({
-        action: "update",
-        action_inferred: true,
-        revision: 2,
-        step_count: 3,
-        step_ids: [1, 2, 3],
-        updated_step_ids: [1, 2, 3],
-      });
-      expect(session.getExecutionPlan()?.steps.map((item) => item.id)).toEqual([1, 2, 3]);
-      expect(session.getExecutionPlan()?.steps.map((item) => item.status))
-        .toEqual(["completed", "in_progress", "pending"]);
-
-      const replay = await tool.execute({
-        explanation: "A different explanation cannot manufacture progress",
-        plan: nextSnapshot,
-      }, context);
-      expect(replay.isError).toBeUndefined();
-      const replayReceipt = JSON.parse(replay.content);
-      expect(replayReceipt).toMatchObject({
-        revision: 2,
-        updated_step_ids: [],
-        unchanged: true,
-      });
-      expect(replay.observations?.coordination).toEqual({ changed: false });
-      expect(replayReceipt).not.toHaveProperty("do_not_retry");
-      expect(replayReceipt).not.toHaveProperty("next_action");
-      expect(session.getExecutionPlanAudit()).toHaveLength(2);
-    });
-
-    it("atomically updates several known statuses while preserving stable step ids", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
-      session.updateExecutionPlan({
-        steps: [
-          { step: "Inspect the inputs", status: "in_progress" },
-          { step: "Verify the evidence", status: "pending" },
-          { step: "Publish the result", status: "pending" },
-        ],
-      });
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
-
-      const result = await tool.execute({
-        action: "set_statuses",
-        updates: [
-          { step_id: 1, status: "completed" },
-          { step_id: "step_2", status: "in_progress" },
-          { step_id: 3, status: "completed" },
-        ],
-      }, context);
-
-      expect(result.isError).toBeUndefined();
-      expect(JSON.parse(result.content)).toMatchObject({
-        action: "set_statuses",
-        revision: 2,
-        requested_step_ids: [1, 2, 3],
-        updated_step_ids: [1, 2, 3],
-        unchanged_step_ids: [],
-      });
-      expect(session.getExecutionPlan()?.steps).toEqual([
-        { id: 1, step: "Inspect the inputs", status: "completed" },
-        { id: 2, step: "Verify the evidence", status: "in_progress" },
-        { id: 3, step: "Publish the result", status: "completed" },
-      ]);
-    });
-
-    it("accepts a legacy completed finish marker without turning Plan into a terminal tool", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete and verify the staged task" }]);
-      session.updateExecutionPlan({
-        steps: [
-          { step: "Complete the work", status: "completed" },
-          { step: "Verify the result", status: "in_progress" },
-        ],
-      });
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-
-      const result = await tool.execute({
-        action: "set_status",
-        step_id: 2,
-        status: "completed",
-        finish: "completed",
-      }, { state: {} });
-
-      expect(result.endTurn).toBeUndefined();
-      expect(result.synthesizeIfNoText).toBeUndefined();
-      expect(JSON.parse(result.content)).toMatchObject({
-        ok: true,
-        finish: "completed",
-        updated_step_ids: [2],
-        step_ids: [1, 2],
-      });
-      expect(JSON.parse(result.content)).not.toHaveProperty("terminal");
-      expect(JSON.parse(result.content)).not.toHaveProperty("steps");
-      expect(session.getExecutionPlan()?.steps.map((step) => step.status))
-        .toEqual(["completed", "completed"]);
-    });
-
-    it("rejects an invalid terminal state before changing any plan status", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
-      session.updateExecutionPlan({
-        steps: [
-          { step: "Complete the work", status: "in_progress" },
-          { step: "Verify the result", status: "pending" },
-        ],
-      });
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-
-      const result = await tool.execute({
-        action: "set_status",
-        step_id: 1,
-        status: "completed",
-        finish: "completed",
-      }, { state: {} });
-
-      expect(result).toMatchObject({ isError: true });
-      expect(JSON.parse(result.content)).toMatchObject({
-        error_code: "PLAN_FINISH_REJECTED",
-      });
-      expect(session.getExecutionPlan()?.steps.map((step) => step.status))
-        .toEqual(["in_progress", "pending"]);
-    });
-
-    it("accepts a legacy blocked finish marker only when no milestone remains in progress", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Run until an external approval is required" }]);
-      session.updateExecutionPlan({
-        steps: [
-          { step: "Prepare the request", status: "completed" },
-          { step: "Receive external approval", status: "in_progress" },
-        ],
-      });
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-
-      const result = await tool.execute({
-        action: "set_status",
-        step_id: 2,
-        status: "blocked",
-        finish: "blocked",
-      }, { state: {} });
-
-      expect(result.endTurn).toBeUndefined();
-      expect(result.synthesizeIfNoText).toBeUndefined();
-      expect(JSON.parse(result.content)).toMatchObject({ finish: "blocked" });
-      expect(JSON.parse(result.content)).not.toHaveProperty("terminal");
-      expect(session.getExecutionPlan()?.steps.map((step) => step.status))
-        .toEqual(["completed", "blocked"]);
-    });
-
-    it("infers unambiguous narrow actions without weakening payload validation", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
-      session.updateExecutionPlan({
-        steps: [
-          { step: "Inspect the inputs", status: "in_progress" },
-          { step: "Verify the result", status: "pending" },
-        ],
-      });
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
-
-      const batch = await tool.execute({
-        updates: [
-          { step_id: 1, status: "completed" },
-          { step_id: 2, status: "in_progress" },
-        ],
-      }, context);
-      expect(batch.isError).toBeUndefined();
-      expect(JSON.parse(batch.content)).toMatchObject({
-        action: "set_statuses",
-        updated_step_ids: [1, 2],
-      });
-
-      const status = await tool.execute({ step_id: 2, status: "completed" }, context);
-      expect(status.isError).toBeUndefined();
-      expect(JSON.parse(status.content)).toMatchObject({
-        action: "set_status",
-        step_id: 2,
-      });
-
-      const appended = await tool.execute({ step: "Publish the result" }, context);
-      expect(appended.isError).toBeUndefined();
-      expect(JSON.parse(appended.content)).toMatchObject({
-        action: "append_step",
-        appended_step_id: 3,
-      });
-
-      const ambiguous = await tool.execute({
-        updates: [{ step_id: 1, status: "blocked" }],
-        step_id: 1,
-        status: "blocked",
-      }, context);
-      expect(ambiguous.isError).toBe(true);
-      expect(JSON.parse(ambiguous.content)).toMatchObject({
-        error_code: "PLAN_ACTION_INVALID",
-      });
-      expect(session.getExecutionPlan()?.steps[0].status).toBe("completed");
-    });
-
-    it("rejects an invalid status batch without partially changing the plan", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
-      session.updateExecutionPlan({
-        steps: [
-          { step: "Inspect the inputs", status: "in_progress" },
-          { step: "Verify the evidence", status: "pending" },
-          { step: "Publish the result", status: "pending" },
-        ],
-      });
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
-      const original = session.getExecutionPlan();
-      const invalidBatches = [
-        {
-          updates: [
-            { step_id: 1, status: "completed" },
-            { step_id: "step_1", status: "blocked" },
-          ],
-          errorCode: "PLAN_STEP_ID_DUPLICATE",
-        },
-        {
-          updates: [
-            { step_id: 2, status: "in_progress" },
-            { step_id: 3, status: "in_progress" },
-          ],
-          errorCode: "PLAN_MULTIPLE_IN_PROGRESS",
-        },
-        {
-          updates: [
-            { step_id: 1, status: "completed" },
-            { step_id: 99, status: "blocked" },
-          ],
-          errorCode: "PLAN_STEP_NOT_FOUND",
-        },
-        {
-          updates: [
-            { step_id: 1, status: "completed" },
-            { step_id: 2, status: "later" },
-          ],
-          errorCode: "PLAN_STATUS_INVALID",
-        },
-      ];
-
-      for (const invalid of invalidBatches) {
-        const result = await tool.execute({
-          action: "set_statuses",
-          updates: invalid.updates,
-        }, context);
-        expect(result).toMatchObject({ isError: true });
-        expect(JSON.parse(result.content)).toMatchObject({
-          ok: false,
-          error_code: invalid.errorCode,
-          current_revision: original?.revision,
-        });
-        expect(session.getExecutionPlan()).toEqual(original);
-      }
-    });
-
-    it("acknowledges capacity without failing or rewriting the durable plan", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the long staged task" }]);
-      const initialSteps = Array.from({ length: 12 }, (_, index) => ({
-        step: `Milestone ${index + 1}`,
-        status: index === 11 ? "in_progress" as const : "completed" as const,
-      }));
-      session.updateExecutionPlan({ steps: initialSteps });
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
-
-      const appended = await tool.execute({
-        action: "append_step",
-        step: "Thirteenth bookkeeping milestone",
-        status: "pending",
-      }, context);
-
-      expect(appended.isError).toBeUndefined();
-      const appendReceipt = JSON.parse(appended.content);
-      expect(appendReceipt).toMatchObject({
-        ok: true,
-        action: "append_step",
-        step_count: 12,
-        appended: false,
-        capacity_reached: true,
-        max_steps: 12,
-      });
-      expect(appendReceipt).not.toHaveProperty("do_not_retry");
-      expect(appendReceipt).not.toHaveProperty("next_action");
-      expect(session.getExecutionPlan()?.steps.map((item) => item.step))
-        .toEqual(initialSteps.map((item) => item.step));
-
-      const replayedFullPlan = await tool.execute({
-        action: "update",
-        plan: [
-          ...initialSteps,
-          { step: "Thirteenth bookkeeping milestone", status: "pending" },
-        ],
-      }, context);
-
-      expect(replayedFullPlan.isError).toBeUndefined();
-      const replayedFullPlanReceipt = JSON.parse(replayedFullPlan.content);
-      expect(replayedFullPlanReceipt).toMatchObject({
-        ok: true,
-        action: "update",
-        step_count: 12,
-        updated: false,
-        capacity_reached: true,
-        requested_step_count: 13,
-      });
-      expect(replayedFullPlanReceipt).not.toHaveProperty("do_not_retry");
-      expect(replayedFullPlanReceipt).not.toHaveProperty("next_action");
-      expect(session.getExecutionPlan()?.steps.map((item) => item.step))
-        .toEqual(initialSteps.map((item) => item.step));
-
-      session.addMessage("user", [{ type: "text", text: "Replace this with a new objective" }]);
-      const oversizedNewObjective = await tool.execute({
-        action: "update",
-        replace_objective: true,
-        plan: [
-          ...initialSteps,
-          { step: "Thirteenth bookkeeping milestone", status: "pending" },
-        ],
-      }, context);
-
-      expect(oversizedNewObjective.isError).toBe(true);
-      expect(JSON.parse(oversizedNewObjective.content)).toMatchObject({
-        ok: false,
-        error_code: "PLAN_UPDATE_REJECTED",
-      });
-      expect(oversizedNewObjective.content).toContain("accepts at most 12 steps");
-      expect(session.getExecutionPlan()?.steps.map((item) => item.step))
-        .toEqual(initialSteps.map((item) => item.step));
-    });
-
-    it("normalizes multiple in-progress milestones without spending a retry round", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
-
-      const result = await tool.execute({
-        action: "update",
-        plan: [
-          { step: "Inspect the inputs", status: "in_progress" },
-          { step: "Verify the result", status: "in_progress" },
-        ],
-      }, context);
-
-      expect(result.isError).toBeUndefined();
-      expect(JSON.parse(result.content)).toMatchObject({
-        normalized_statuses: [{ step_id: 2, from: "in_progress", to: "pending" }],
-      });
-      expect(session.getExecutionPlan()?.steps.map((step) => step.status))
-        .toEqual(["in_progress", "pending"]);
-
-      const switched = await tool.execute({
-        action: "set_status",
-        step_id: 2,
-        status: "in_progress",
-      }, context);
-
-      expect(switched.isError).toBeUndefined();
-      expect(JSON.parse(switched.content)).toMatchObject({
-        normalized_statuses: [{ step_id: 1, from: "in_progress", to: "pending" }],
-      });
-      expect(session.getExecutionPlan()?.steps.map((step) => step.status))
-        .toEqual(["pending", "in_progress"]);
-    });
-
-    it("rejects malformed milestone entries without changing the current plan", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
-      session.updateExecutionPlan({
-        steps: [
-          { step: "Inspect the inputs", status: "completed" },
-          { step: "Verify the result", status: "in_progress" },
-        ],
-      });
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
+    it.each(['clear', 'replace', 'update', 'set_status', 'set_statuses', 'append_step'])('rejects retired action %s without changing the plan', async action => {
+      const { session, call } = fixture();
+      const plan = [{ step: 'Inspect', status: 'in_progress' }];
+      await call(plan);
       const before = session.getExecutionPlan();
-
-      const result = await tool.execute({
-        action: "update",
-        plan: ["Inspect the inputs", { step: "Verify the result", status: "completed" }],
-      }, { state: {} });
-
-      expect(result).toMatchObject({ isError: true });
-      expect(JSON.parse(result.content)).toMatchObject({
-        ok: false,
-        error_code: "PLAN_UPDATE_REJECTED",
-        current_revision: before?.revision,
-        current_steps: before?.steps,
-      });
-      expect(result.content).toMatch(/step.*object/i);
+      expect((await call(plan, { action })).isError).toBe(true);
       expect(session.getExecutionPlan()).toEqual(before);
     });
 
-    it("accepts detailed milestone labels beyond the model-facing anchor budget", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the detailed task" }]);
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
-      const longStep = `Inspect the production evidence and preserve every accepted constraint ${"detail ".repeat(60)}`.trim();
-      expect(longStep.length).toBeGreaterThan(180);
-
-      const result = await tool.execute({
-        action: "update",
-        plan: [{ step: longStep, status: "in_progress" }],
-      }, context);
-
-      expect(result.isError).toBeUndefined();
-      expect(session.getExecutionPlan()?.steps[0].step).toBe(longStep);
-      session.applyActiveCheckpointSummary("Detailed milestone recorded.", session.length - 1);
-      const modelView = JSON.stringify(session.getMessagesForModel());
-      expect(modelView).toContain("chars omitted");
-      expect(modelView.length).toBeLessThan(longStep.length + 2_000);
+    it.each(['finish', 'replace_objective', 'step_id', 'step', 'updates', 'status'])('rejects retired field %s even alongside a valid snapshot', async field => {
+      const { session, call } = fixture();
+      expect((await call([{ step: 'Inspect', status: 'in_progress' }], { [field]: 'old' })).isError).toBe(true);
+      expect(session.getExecutionPlan()).toBeUndefined();
     });
 
-    it("accepts canonical step_<id> aliases without accepting lookalike labels", async () => {
-      const session = new Session();
-      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
-      session.updateExecutionPlan({
-        steps: [{ step: "Complete the work", status: "in_progress" }],
-      });
-      const tool = createExecutionPlanTool({
-        get: () => session.getExecutionPlan(),
-        update: (update) => session.updateExecutionPlan(update),
-        clear: () => session.clearExecutionPlan(),
-      });
-      const context: ToolContext = { state: {} };
+    it.each(['working', 'todo', 'not_started', 'unknown', 'done', 'complete', 'in-progress'])('rejects the noncanonical status %s without mutation', async status => {
+      const { session, call } = fixture();
+      expect((await call([{ step: 'Inspect', status }])).isError).toBe(true);
+      expect(session.getExecutionPlan()).toBeUndefined();
+    });
 
-      const accepted = await tool.execute({
-        action: "set_status",
-        step_id: "step_1",
-        status: "completed",
-      }, context);
-
-      expect(accepted.isError).toBeUndefined();
-      expect(JSON.parse(accepted.content)).toMatchObject({
-        action: "set_status",
-        step_id: 1,
-      });
-      expect(session.getExecutionPlan()?.steps[0].status).toBe("completed");
-
-      for (const stepId of ["step_0", "step_1_extra", "phase_1"]) {
-        const rejected = await tool.execute({
-          action: "set_status",
-          step_id: stepId,
-          status: "in_progress",
-        }, context);
-        expect(rejected).toMatchObject({ isError: true });
-        expect(rejected.content).toContain("requires a positive integer step_id");
+    it('preserves milestones and completed work when rejecting a destructive snapshot', async () => {
+      const { session, call } = fixture();
+      await call([{ step: 'Inspect', status: 'completed' }, { step: 'Deliver', status: 'in_progress' }]);
+      const before = session.getExecutionPlan();
+      for (const plan of [[{ step: 'Renamed', status: 'completed' }], [{ step: 'Inspect', status: 'pending' }, { step: 'Deliver', status: 'in_progress' }]]) {
+        expect((await call(plan)).isError).toBe(true);
+        expect(session.getExecutionPlan()).toEqual(before);
       }
-      expect(session.getExecutionPlan()?.steps[0].status).toBe("completed");
+    });
+
+    it('retains blocked state and normalizes concurrent active steps through the owning session', async () => {
+      const { session, call } = fixture();
+      expect((await call([{ step: 'Inspect', status: 'in_progress' }, { step: 'Deliver', status: 'in_progress' }])).isError).toBeUndefined();
+      expect(session.getExecutionPlan()!.steps.map(step => step.status)).toEqual(['in_progress', 'pending']);
+      expect((await call([{ step: 'Inspect', status: 'blocked' }, { step: 'Deliver', status: 'pending' }])).isError).toBeUndefined();
+      expect(session.getExecutionPlan()!.steps[0].status).toBe('blocked');
+    });
+
+    it('preserves the full plan at capacity and rejects oversized milestone labels without mutation', async () => {
+      const { session, call } = fixture();
+      const invalid = await call([{ step: 'x'.repeat(EXECUTION_PLAN_MAX_STEP_CHARS + 1), status: 'pending' }]);
+      expect(invalid.isError).toBe(true);
+      expect(session.getExecutionPlan()).toBeUndefined();
+      const full = Array.from({ length: EXECUTION_PLAN_MAX_STEPS }, (_, i) => ({ step: 'Milestone ' + i, status: 'pending' }));
+      expect((await call(full)).isError).toBeUndefined();
+      const before = session.getExecutionPlan();
+      expect(JSON.parse((await call([...full, { step: 'Overflow', status: 'pending' }])).content)).toMatchObject({ capacity_reached: true, updated: false });
+      expect(session.getExecutionPlan()).toEqual(before);
+    });
+
+    it('rejects missing, empty and malformed snapshots without creating state', async () => {
+      const { session, call } = fixture();
+      for (const plan of [undefined, [], [null], [{ step: 'Inspect', status: 'completed', step_id: 1 }]]) expect((await call(plan)).isError).toBe(true);
+      expect(session.getExecutionPlan()).toBeUndefined();
     });
   });
 
@@ -1828,13 +1210,11 @@ describe("Tools", () => {
   });
 
   describe("bash tool", () => {
-    it("uses the long default only for missing or legacy-synthetic timeout values", () => {
+    it("uses the long default for invalid values and preserves explicit timeouts", () => {
       expect(normalizeBashTimeoutMs(undefined)).toBe(DEFAULT_BASH_TIMEOUT_MS);
       expect(normalizeBashTimeoutMs(-1)).toBe(DEFAULT_BASH_TIMEOUT_MS);
       expect(normalizeBashTimeoutMs(30_000)).toBe(30_000);
       expect(normalizeBashTimeoutMs(300_000)).toBe(300_000);
-      expect(normalizeBashTimeoutMs(30_000, { legacyDefault: true })).toBe(DEFAULT_BASH_TIMEOUT_MS);
-      expect(normalizeBashTimeoutMs(300_000, { legacyDefault: true })).toBe(DEFAULT_BASH_TIMEOUT_MS);
       expect(normalizeBashTimeoutMs(5_000)).toBe(5_000);
     });
 

@@ -232,3 +232,29 @@ describe('repository-search › ignore rules', () => {
     expect(isIgnoredByScopes(at('secret'), false, rules)).toBe(false);
   });
 });
+
+// A plain project has the same search contract as a Git checkout. Otherwise
+// generated trees can dominate scans solely because the .git directory is absent.
+describe.runIf(RG_AVAILABLE)('project ignore parity', () => {
+  it.each(['plain', 'git'])('keeps list/grep exclusions and explicit overrides aligned in a %s project', async kind => {
+    const root = tempRepository();
+    if (kind === 'git') fs.mkdirSync(path.join(root, '.git'));
+    fs.mkdirSync(path.join(root, 'generated')); fs.mkdirSync(path.join(root, 'nested'));
+    fs.writeFileSync(path.join(root, '.gitignore'), 'generated/\n');
+    fs.writeFileSync(path.join(root, 'nested', '.gitignore'), 'hidden.txt\n');
+    const visible = ['visible.txt', path.join('nested', 'visible.txt')];
+    const excluded = [...Array.from({ length: 20 }, (_, n) => path.join('generated', `output-${n}.txt`)), path.join('nested', 'hidden.txt')];
+    for (const file of [...visible, ...excluded]) fs.writeFileSync(path.join(root, file), 'needle\n');
+    for (const includeIgnored of [false, true]) {
+      const expected = (includeIgnored ? [...visible, ...excluded] : visible).sort();
+      const listing = await listRepositoryFiles(root, 200, { includeIgnored });
+      expect(listing.error).toBeUndefined(); expect(listing.capped).toBe(false);
+      expect(listing.files.filter(file => file.endsWith('.txt')).map(file => path.relative(root, file)).sort()).toEqual(expected);
+      const content = await grepRepository(root, { pattern: 'needle', regex: false, caseSensitive: true,
+        contextLines: 0, maxResults: 200, includeGlobs: [], excludeGlobs: [], includeIgnored });
+      expect(content.error).toBeUndefined(); expect(content.capped).toBe(false);
+      expect(content.hits.map(hit => path.relative(root, hit.path)).sort()).toEqual(expected);
+      expect(content.hits.every(hit => hit.line === 1 && hit.text === 'needle')).toBe(true);
+    }
+  });
+});

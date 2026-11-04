@@ -27,7 +27,9 @@ const DEFAULT_TIMEOUT_MS = 60 * 60_000;
 const CREATE_TIMEOUT_MS = 60_000;
 const POLL_TIMEOUT_MS = 20_000;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
+// The public Orkas API keeps its existing timeout-only budget.
 const MAX_CONSECUTIVE_POLL_TIMEOUTS = 5;
+const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 // Expired Ark-style tasks are terminal and cannot deliver a video.
 const VIDEO_TASK_FAILED_STATUSES = ['failed', 'cancelled', 'canceled', 'expired'];
 
@@ -171,6 +173,22 @@ interface OrkasVideoResult {
   resolution?: string;
 }
 
+class VideoControlHttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = 'VideoControlHttpError';
+  }
+}
+
+const TRANSIENT_VIDEO_ERROR_RE =
+  /系统繁忙|请稍?后(?:重|再)?试|\b(?:429|50[0-4])\b|timed?\s*out|timeout|service unavailable|temporarily unavailable|too many requests|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|fetch failed|socket hang up|\bnet::ERR_[A-Z0-9_]+/i;
+export function classifyVideoGenError(message: string): 'TIMEOUT' | 'PROVIDER_API_ERROR' | 'BAD_INPUT' {
+  const msg = String(message || '');
+  if (!TRANSIENT_VIDEO_ERROR_RE.test(msg)) return 'BAD_INPUT';
+  return /timed?[\s_]*out|timeout/i.test(msg) ? 'TIMEOUT' : 'PROVIDER_API_ERROR';
+}
+
+
 export async function generateVideo(input: GenerateVideoInput): Promise<GenerateVideoResult> {
   try {
     throwIfAborted(input.signal);
@@ -220,7 +238,7 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
     const message = (err as Error).message || String(err);
     const safeMessage = sanitizeLogTextForUpload(message);
     // No generation request has left yet, so nothing billable happened.
-    return { ok: false, errorCode: 'BAD_INPUT', message: safeMessage, dispatched: false };
+    return { ok: false, errorCode: classifyVideoGenError(message), message: safeMessage, dispatched: false };
   }
 
   let lastProviderError = '';
@@ -654,7 +672,7 @@ async function fetchVideoControl<T>(
 
 async function readNativeVideoResponse(response: Response, label: string): Promise<any> {
   const text = await response.text();
-  if (!response.ok) throw new Error(`${label} API ${response.status}`);
+  if (!response.ok) throw new VideoControlHttpError(`${label} API ${response.status}`, response.status);
   try { return text ? JSON.parse(text) : {}; }
   catch { return {}; } // Invalid successful bodies remain missing receipts.
 }
@@ -776,7 +794,7 @@ export async function callDoubaoVideo(req: AdapterVideoRequest): Promise<Adapter
   const started = Date.now();
   let last: unknown = created;
   let pollAttempt = 0;
-  let consecutivePollTimeouts = 0;
+  let pollFailures = NO_POLL_FAILURES;
   while (Date.now() - started < req.timeoutMs) {
     throwIfAborted(req.signal);
     const now = Date.now();
@@ -813,7 +831,7 @@ export async function callDoubaoVideo(req: AdapterVideoRequest): Promise<Adapter
         response => readNativeVideoResponse(response, 'DouBao video query'),
       );
       status = String((last as any)?.status || '').toLowerCase();
-      consecutivePollTimeouts = 0;
+      pollFailures = NO_POLL_FAILURES;
       emitProgress(req.onProgress, 'poll_result', `Video task poll ${pollAttempt}: ${formatVideoStatus(status)} after ${Math.round((Date.now() - started) / 1000)}s`, {
         provider: 'doubao',
         taskId,
@@ -822,19 +840,15 @@ export async function callDoubaoVideo(req: AdapterVideoRequest): Promise<Adapter
         elapsedMs: Date.now() - started,
       });
     } catch (err) {
-      if (req.signal?.aborted || !isVideoPollTimeoutError(err)) throw err;
-      consecutivePollTimeouts += 1;
-      if (consecutivePollTimeouts >= MAX_CONSECUTIVE_POLL_TIMEOUTS) {
-        throw new Error(`DouBao video status polling stopped: the connection timed out ${consecutivePollTimeouts} times in a row (task ${taskId}). The network looks persistently interrupted — stopped instead of retrying silently until the overall timeout.`);
+      pollFailures = countVideoPollFailure(pollFailures, err, req.signal);
+      if (pollFailures.count >= MAX_CONSECUTIVE_POLL_FAILURES) {
+        throw new Error(videoPollStoppedMessage('DouBao video', taskId, pollFailures));
       }
-      emitProgress(req.onProgress, 'poll_timeout', `Video status poll timed out; retrying (${consecutivePollTimeouts}/${MAX_CONSECUTIVE_POLL_TIMEOUTS})`, {
+      emitVideoPollRetry(req.onProgress, err, pollFailures.count, {
         provider: 'doubao',
         taskId,
         attempt: pollAttempt,
-        retry: consecutivePollTimeouts,
-        maxRetry: MAX_CONSECUTIVE_POLL_TIMEOUTS,
         elapsedMs: Date.now() - started,
-        error: errorMessage(err),
       });
       continue;
     }
@@ -996,18 +1010,21 @@ export async function callKlingVideo(req: AdapterVideoRequest): Promise<AdapterV
   if (!taskId) throw new Error('Kling video create returned no native task id.');
   emitProgress(req.onProgress, 'task_created', `Kling video task created: ${taskId}`, { provider: 'kling', taskId });
   const started = Date.now();
-  let consecutivePollTimeouts = 0;
+  let pollFailures = NO_POLL_FAILURES;
   try {
     while (Date.now() - started < req.timeoutMs) {
       await sleep(req.pollIntervalMs, req.signal);
       let queried: any;
       try {
         queried = await requestKlingJson(`${KLING_BASE}/tasks?${new URLSearchParams({ task_ids: taskId })}`, { method: 'GET', headers }, req, 'Kling video query');
-        consecutivePollTimeouts = 0;
+        pollFailures = NO_POLL_FAILURES;
       } catch (err) {
-        if (req.signal?.aborted || !isVideoPollTimeoutError(err)) throw err;
-        if (++consecutivePollTimeouts >= MAX_CONSECUTIVE_POLL_TIMEOUTS) throw err;
-        emitProgress(req.onProgress, 'poll_timeout', 'Kling task status request timed out; retrying the same task query', { provider: 'kling', taskId, retry: consecutivePollTimeouts });
+        pollFailures = countVideoPollFailure(pollFailures, err, req.signal);
+        if (pollFailures.count >= MAX_CONSECUTIVE_POLL_FAILURES) throw err;
+        const timedOut = isVideoPollTimeoutError(err);
+        emitProgress(req.onProgress, timedOut ? 'poll_timeout' : 'poll_retry',
+          `Kling task status request ${timedOut ? 'timed out' : 'failed'}; retrying the same task query`,
+          { provider: 'kling', taskId, retry: pollFailures.count });
         continue;
       }
       const task = Array.isArray(queried.data) ? queried.data.find((item: any) => String(item?.id || '') === taskId) : null;
@@ -1289,5 +1306,51 @@ function errorMessage(err: unknown): string {
 }
 
 function isVideoPollTimeoutError(err: unknown): boolean {
-  return /\b(timed out|timeout)\b/i.test(errorMessage(err));
+  return !(err instanceof VideoControlHttpError) && /\b(timed out|timeout)\b/i.test(errorMessage(err));
 }
+
+/** Whether a failed status read leaves the accepted task worth querying again.
+ *  An HTTP status is authoritative, so a rejection whose body merely mentions
+ *  "503" or 系统繁忙 stays terminal; other failures are judged by transport text. */
+function isTransientVideoPollError(err: unknown): boolean {
+  const status = err instanceof VideoControlHttpError ? err.status : 0;
+  if (status >= 400) return status === 408 || status === 429 || status >= 500;
+  return TRANSIENT_VIDEO_ERROR_RE.test(errorMessage(err));
+}
+
+interface VideoPollFailures { count: number; allTimedOut: boolean }
+const NO_POLL_FAILURES: VideoPollFailures = { count: 0, allTimedOut: true };
+
+/** Counts one retryable status-read failure; anything else ends tracking now. */
+function countVideoPollFailure(previous: VideoPollFailures, err: unknown, signal?: AbortSignal | null): VideoPollFailures {
+  if (signal?.aborted || !isTransientVideoPollError(err)) throw err;
+  return { count: previous.count + 1, allTimedOut: previous.allTimedOut && isVideoPollTimeoutError(err) };
+}
+
+/** generateVideoObserved reads "timed out" here as the TIMEOUT error code, so the
+ *  phrase appears only when every failure in the streak really was a timeout. */
+function videoPollStoppedMessage(label: string, taskId: string, failures: VideoPollFailures): string {
+  const cause = failures.allTimedOut
+    ? `the connection timed out ${failures.count} times in a row`
+    : `${failures.count} status checks in a row hit a temporary error`;
+  const subject = failures.allTimedOut ? 'network' : 'service or network';
+  return `${label} status polling stopped: ${cause} (task ${taskId}). The ${subject} looks persistently interrupted — stopped instead of retrying silently until the overall timeout.`;
+}
+
+function emitVideoPollRetry(
+  onProgress: VideoProgressReporter | undefined,
+  err: unknown,
+  retry: number,
+  data: Record<string, unknown>,
+): void {
+  const timedOut = isVideoPollTimeoutError(err);
+  emitProgress(onProgress, timedOut ? 'poll_timeout' : 'poll_retry',
+    `Video status poll ${timedOut ? 'timed out' : 'failed'}; retrying (${retry}/${MAX_CONSECUTIVE_POLL_FAILURES})`, {
+      ...data,
+      retry,
+      maxRetry: MAX_CONSECUTIVE_POLL_FAILURES,
+      // Other failures can quote an upstream body, which stays out of the UI stream.
+      ...(timedOut ? { error: errorMessage(err) } : {}),
+    });
+}
+

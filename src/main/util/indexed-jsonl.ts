@@ -27,17 +27,19 @@ function remember(file: string, value: Cache): void {
   cache.set(file, value);
   cachedEntries += value.entries.length;
 }
-function stampOf(stat: Stats): string {
+export function indexedJsonlStampFromStat(stat: Stats): string {
   return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
 }
 export async function indexedJsonlStamp(file: string): Promise<string> {
-  try { return stampOf(await fs.stat(file)); }
+  try { return indexedJsonlStampFromStat(await fs.stat(file)); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ''; throw error; }
 }
 export async function getIndexedJsonl<T>(file: string, project: (record: any) => T, options: {
   throughIndex?: number;
   visit?: (record: any, index: number) => void;
+  signal?: { readonly aborted: boolean };
 } = {}): Promise<IndexedJsonl<T>> {
+  if (options.signal?.aborted) throw new Error('History read cancelled');
   const through = options.throughIndex ?? Infinity;
   const stamp = await indexedJsonlStamp(file);
   const hit = cache.get(file);
@@ -66,9 +68,11 @@ export async function getIndexedJsonl<T>(file: string, project: (record: any) =>
       const closed = new Promise<void>(resolve => stream.once('close', resolve));
       try {
         scan: for await (const raw of stream) {
+          if (options.signal?.aborted) throw new Error('History read cancelled');
           const chunk = raw as Buffer;
           let start = 0;
           for (let end = chunk.indexOf(10); end >= 0; end = chunk.indexOf(10, start)) {
+            if (options.signal?.aborted) throw new Error('History read cancelled');
             const fragment = chunk.subarray(start, end);
             const lineBytes = pendingBytes + fragment.length;
             // Join a long JSONL record once, not once per incoming chunk.
@@ -117,21 +121,23 @@ export async function prepareIndexedJsonlAppend(file: string): Promise<(record: 
       const entry = { index: prior.entries.length, offset: prior.size, bytes: bytes - 1, metadata: prior.project(record) };
       forget(file);
       prior.entries.push(entry);
-      remember(file, { ...prior, size: stat.size, stamp: stampOf(stat) });
+      remember(file, { ...prior, size: stat.size, stamp: indexedJsonlStampFromStat(stat) });
     } catch { forget(file); } // Cache failure must never turn a committed append into a retry.
   };
 }
 
-export async function readIndexedJsonlRecords<T>(file: string, index: IndexedJsonl<unknown>, entries: readonly IndexedJsonlEntry<unknown>[], project: (record: any, index: number) => T = record => record): Promise<T[]> {
+export async function readIndexedJsonlRecords<T>(file: string, index: IndexedJsonl<unknown>, entries: readonly IndexedJsonlEntry<unknown>[], project: (record: any, index: number) => T = record => record, signal?: { readonly aborted: boolean }): Promise<T[]> {
   if (!entries.length) return [];
   if (await indexedJsonlStamp(file) !== index.stamp) throw new Error('Conversation changed; retry the history lookup.');
   const handle = await fs.open(file, 'r');
   try {
     const records: T[] = [];
     for (const entry of entries) {
+      if (signal?.aborted) throw new Error('History read cancelled');
       const bytes = Buffer.allocUnsafe(entry.bytes);
       let read = 0;
       while (read < bytes.length) {
+        if (signal?.aborted) throw new Error('History read cancelled');
         const result = await handle.read(bytes, read, bytes.length - read, entry.offset + read);
         if (!result.bytesRead) throw new Error('Conversation record is incomplete; retry the history lookup.');
         read += result.bytesRead;
@@ -148,15 +154,16 @@ const offsetOnly = () => undefined;
 /** Project selected records during a cold prefix scan, or seek them directly
  * from cached offsets. Never parse the requested rows a second time on cold
  * search, nor retain their large source bodies after projection. */
-export async function mapIndexedJsonlRecords<T>(file: string, indexes: ReadonlySet<number>, project: (record: any, index: number) => T): Promise<Map<number, T>> {
+export async function mapIndexedJsonlRecords<T>(file: string, indexes: ReadonlySet<number>, project: (record: any, index: number) => T, signal?: { readonly aborted: boolean }): Promise<Map<number, T>> {
   const wanted = [...indexes].filter(index => Number.isInteger(index) && index >= 0);
   const out = new Map<number, T>();
   if (!wanted.length) return out;
   const index = await getIndexedJsonl(file, offsetOnly, {
+    signal,
     throughIndex: Math.max(...wanted),
     visit: (record, position) => { if (indexes.has(position)) out.set(position, project(record, position)); },
   });
   const remaining = wanted.filter(position => !out.has(position)).map(position => index.entries[position]).filter(Boolean);
-  await readIndexedJsonlRecords(file, index, remaining, (record, position) => { out.set(position, project(record, position)); });
+  await readIndexedJsonlRecords(file, index, remaining, (record, position) => { out.set(position, project(record, position)); }, signal);
   return out;
 }

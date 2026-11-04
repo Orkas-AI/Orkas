@@ -78,7 +78,7 @@ The user can also ask Commander to create or change a clearly specified automati
 
 1. Open **Auto** in the sidebar and choose **+ Create**.
 2. Write the instruction as if handing the job to Orkas at run time, including where the result should go.
-3. Choose a one-time, every-x-hours, daily, weekly, or monthly schedule. For a repeating task, optionally stop it on a local date or after a set number of scheduled runs.
+3. Choose a one-time, every-x-hours, daily, weekly, or monthly schedule. For a repeating task, optionally stop it on a local date or after a set number of scheduled runs. Weekly/monthly dropdowns default to one day; enable **Multiple selection** to choose separate days, marked with right-side checks only in that mode. **Workdays** means Monday–Friday and is single-mode only. Short months use the last day without duplicate runs. Update the assigned device before using these new schedules; older versions cannot read them.
 4. Create it on the device that should run it.
 5. Keep **Enabled** checked and choose **Create**.
 6. Review the first result in its **Runs** list before relying on it.

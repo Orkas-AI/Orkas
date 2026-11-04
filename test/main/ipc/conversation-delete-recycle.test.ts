@@ -58,6 +58,96 @@ async function invoke(channel: string, payload: Record<string, unknown>): Promis
 }
 
 describe('conversations.delete recycle transaction', () => {
+  it.each(['conversation', 'cleanup', 'project'] as const)('deletes and backs up both physical layouts through %s deletion', async action => {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const created = await projects.createProject(TEST_UID, 'Legacy project');
+    if (!created.ok) throw new Error('project setup failed');
+    const pid = created.project.project_id;
+    const conv = await chats.createConversation(TEST_UID, { title: 'Legacy task', projectId: pid });
+    const cid = conv.conversation_id;
+    const old = '2020-01-01T00:00:00Z';
+    const row = { ...conv, created_at: old, updated_at: old };
+    const cloud = path.join(tmpDir, TEST_UID, 'cloud');
+    const expected = new Map<string, string>();
+    for (const prefix of ['', `projects/${pid}/`]) {
+      const files = {
+        [`${prefix}chats/${cid}.jsonl`]: JSON.stringify({ role: 'user', content: `recoverable ${prefix || 'legacy'}`, ts: old }) + '\n',
+        [`${prefix}chats/${cid}/meta.json`]: JSON.stringify(row),
+        [`${prefix}chats/${cid}/state.json`]: JSON.stringify({ status: 'idle', in_flight: [] }),
+        [`${prefix}chat_attachments/${cid}/draft.txt`]: 'attachment ' + prefix,
+        [`${prefix}chat_artifacts/${cid}/artifact/index.html`]: 'artifact ' + prefix,
+        [`${prefix}sessions/gconv-${cid}.jsonl`]: 'commander ' + prefix,
+        [`${prefix}sessions/gconv-${cid}.jsonl.context.json`]: '{}',
+        [`${prefix}sessions/gmember-${cid}-agent.jsonl.context.json`]: '{}',
+        [`${prefix}sessions/gmember-${cid}-agent.tool-results/tail.txt`]: 'retained ' + prefix,
+      };
+      for (const [rel, body] of Object.entries(files)) {
+        const file = path.join(cloud, rel);
+        fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, body);
+        expected.set(rel, body);
+      }
+    }
+    fs.writeFileSync(path.join(cloud, 'projects', pid, 'chats', '_index.json'), JSON.stringify([row]));
+    fs.writeFileSync(path.join(cloud, 'chats', '_index.json'), JSON.stringify([row]));
+    chats.invalidateConversationCaches(TEST_UID);
+    const control = path.join(cloud, 'chats', 'other-task.jsonl');
+    fs.writeFileSync(control, 'unrelated history');
+    let result: any;
+    if (action === 'cleanup') {
+      const preview = await invoke('conversations.cleanup.preview', { expectedUserId: TEST_UID, days: 90 });
+      result = await invoke('conversations.cleanup.remove', { expectedUserId: TEST_UID, token: preview.token, cid });
+      expect(result).toMatchObject({ ok: true, status: 'deleted' });
+    } else {
+      result = await invoke(action === 'project' ? 'projects.delete' : 'conversations.delete', action === 'project' ? { projectId: pid } : { cid });
+      expect(result).toMatchObject({ ok: true });
+    }
+    expect([...expected.keys()].filter(rel => fs.existsSync(path.join(cloud, rel))), 'Deleted files must not remain').toEqual([]);
+    const globalRows = JSON.parse(fs.readFileSync(path.join(cloud, 'chats', '_index.json'), 'utf8'));
+    expect(globalRows.filter((item: any) => item.conversation_id === cid && !item.deleted_at), 'Legacy live catalog copies must not survive').toEqual([]);
+    expect(fs.readFileSync(control, 'utf8')).toBe('unrelated history');
+    const { batches } = await invoke('recycle.list', {});
+    expect(batches).toHaveLength(1);
+    const archived = new Set(batches[0].items.map((item: any) => item.path));
+    expect([...expected.keys()].filter(rel => !archived.has('cloud/' + rel)), 'Backup must cover every removed file').toEqual([]);
+    expect(await invoke('recycle.restore', { id: batches[0].id })).toMatchObject({ ok: true, failed: 0, skipped: 0 });
+    for (const [rel, body] of expected) {
+      // Restored metadata advances its revision/clock; the content files retain their bytes.
+      if (!rel.endsWith('/meta.json')) expect(fs.readFileSync(path.join(cloud, rel), 'utf8')).toBe(body);
+    }
+    expect(await chats.getConversationMetadata(TEST_UID, cid, pid)).toMatchObject({ title: 'Legacy task', project_id: pid });
+  });
+
+  it.each(['conversation', 'project'] as const)('deletes a pre-v4 task indexed only in the global catalog through %s', async action => {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const p = await projects.createProject(TEST_UID, 'Legacy-only project');
+    if (!p.ok) throw new Error('project setup failed');
+    const pid = p.project.project_id;
+    const conv = await chats.createConversation(TEST_UID, { title: 'Pre-v4 task', projectId: pid });
+    const cid = conv.conversation_id;
+    const cloud = path.join(tmpDir, TEST_UID, 'cloud');
+    const projectChats = path.join(cloud, 'projects', pid, 'chats');
+    const legacyFile = path.join(cloud, 'chats', `${cid}.jsonl`);
+    fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+    fs.writeFileSync(legacyFile, JSON.stringify({ role: 'user', content: 'recoverable legacy-only history' }) + '\n');
+    fs.mkdirSync(path.join(cloud, 'chats', cid), { recursive: true });
+    fs.writeFileSync(path.join(cloud, 'chats', cid, 'meta.json'), JSON.stringify(conv));
+    fs.writeFileSync(path.join(cloud, 'chats', '_index.json'), JSON.stringify([conv]));
+    fs.rmSync(projectChats, { recursive: true, force: true });
+    chats.invalidateConversationCaches(TEST_UID);
+    (await import('../../../src/main/features/conversation_deletions')).invalidateTaskDeletions(TEST_UID);
+    const result = await invoke(action === 'project' ? 'projects.delete' : 'conversations.delete', action === 'project' ? { projectId: pid } : { cid });
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+    expect(fs.existsSync(legacyFile)).toBe(false);
+    expect(fs.existsSync(path.join(cloud, 'chats', cid))).toBe(false);
+    const { batches } = await invoke('recycle.list', {});
+    expect(batches).toHaveLength(1);
+    expect(await invoke('recycle.restore', { id: batches[0].id })).toMatchObject({ ok: true, failed: 0 });
+    expect((await invoke('conversations.get', { cid, projectId: pid })).conversation).toMatchObject({ title: 'Pre-v4 task', project_id: pid });
+    expect((await invoke('conversations.history', { cid, projectId: pid })).history[0].content).toBe('recoverable legacy-only history');
+  });
+
   it('deletes and restores a task while an unpublished status write is present', async () => {
     const chats = await import('../../../src/main/features/chats');
     const paths = await import('../../../src/main/paths');

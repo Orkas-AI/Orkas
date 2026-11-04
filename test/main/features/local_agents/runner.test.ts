@@ -1633,6 +1633,128 @@ describe('local_agents/runner', () => {
     }
   });
 
+  // A CLI that exits on its own explains why on stderr (sign-in, config,
+  // provider). The user needs that text to act; analytics only needs the stage.
+  it.each([
+    {
+      label: 'before any output',
+      events: [] as any[],
+      done: { type: 'done', status: 'failed', error: 'claude exited with code 1' },
+      category: 'cli_failed_before_output',
+    },
+    {
+      label: 'after output started',
+      events: [{ type: 'text-delta', text: 'Starting the task.' }],
+      done: { type: 'done', status: 'failed', error: 'claude exited with code 1' },
+      category: 'cli_failed_after_output',
+    },
+    {
+      label: 'when the process cannot start',
+      events: [] as any[],
+      done: { type: 'done', status: 'failed', error: 'spawn EACCES', failureKind: 'cli_spawn', retrySafe: true },
+      category: 'cli_spawn_failed',
+    },
+  ])('returns the redacted stderr excerpt and failure stage $label', async ({ events, done, category }) => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockCliFallback.mockReturnValue(null);
+    const privateToken = 'sk-proj-local-agent-secret-123456789';
+    mockBackendImpl = async ({ onEvent }) => {
+      for (const event of events) onEvent(event);
+      onEvent({
+        ...done,
+        // Only the last three lines are kept; the first is older context.
+        stderrTail: [
+          'older context line',
+          '\u001b[31mError: no provider credentials\u001b[0m',
+          `config /Users/test/.claude/settings.json api_key=${privateToken}`,
+          'Run `claude /login` and try again.',
+          '',
+        ].join('\n'),
+      });
+    };
+
+    const runner = await loadRunner();
+    const result = await runner.run({
+      uid: TEST_UID, cid: `c-stderr-${category}`, agentId: 'agent-x',
+      cli: 'claude', prompt: 'run', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+
+    expect(result.status).toBe('failed');
+    expect(result.failureCategory).toBe(category);
+    expect(result.stderrExcerpt).toContain('Error: no provider credentials');
+    expect(result.stderrExcerpt).toContain('Run `claude /login` and try again.');
+    expect(result.stderrExcerpt).not.toContain('older context line');
+    expect(result.stderrExcerpt).not.toContain('\u001b[');
+    expect(result.stderrExcerpt).not.toContain('/Users/alice');
+    expect(result.stderrExcerpt).not.toContain(privateToken);
+  });
+
+  it('bounds the stderr excerpt to its end, keeps a lone reason, and omits empty stderr', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    // A long tail is bounded to its end, where the reason is; its first
+    // retained line is partial and must not appear.
+    const privateToken = 'sk-proj-local-agent-secret-123456789';
+    let tail = `api_key=${privateToken} ${'w'.repeat(8_000)}\n${'x'.repeat(2_000)}\nfinal reason`;
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'done', status: 'failed', error: 'claude exited with code 1', stderrTail: tail });
+    };
+    const runner = await loadRunner();
+    const run = () => runner.run({
+      uid: TEST_UID, cid: 'c-stderr-bounds', agentId: 'agent-x',
+      cli: 'claude', prompt: 'run', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+    const long = await run();
+    expect(long.stderrExcerpt!.length).toBeLessThanOrEqual(401);
+    expect(long.stderrExcerpt!.startsWith('…')).toBe(true);
+    expect(long.stderrExcerpt!.endsWith('final reason')).toBe(true);
+    expect(long.stderrExcerpt).not.toContain('w');
+    expect(long.stderrExcerpt).not.toContain(privateToken);
+
+    // A CLI that prints one short reason and exits (the common startup case).
+    tail = 'Error: no inference provider configured. Run setup, then try again.\n';
+    const lone = await run();
+    expect(lone.stderrExcerpt).toBe('Error: no inference provider configured. Run setup, then try again.');
+
+    tail = ' \n\n ';
+    const empty = await run();
+    expect(empty).not.toHaveProperty('stderrExcerpt');
+    expect(empty.failureCategory).toBe('cli_failed_before_output');
+  });
+
+  it('classifies a failure after a completed tool as after-output work', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'tool-event', tool: 'read_files', phase: 'use', callId: 'read-completed', input: {} });
+      onEvent({ type: 'tool-event', tool: 'read_files', phase: 'result', callId: 'read-completed', text: 'Done.' });
+      onEvent({ type: 'done', status: 'failed', error: 'test interruption' });
+    };
+    const runner = await loadRunner();
+    const result = await runner.run({ uid: TEST_UID, cid: 'c-completed-tool-failure', agentId: 'agent-x',
+      cli: 'claude', prompt: 'run', cwd: tmpDir, signal: new AbortController().signal, onEvent: () => {} });
+    expect(result.failureCategory).toBe('cli_failed_after_output');
+  });
+
+  it('reports no failure stage or stderr for a completed run', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'done', status: 'completed', output: 'done', stderrTail: 'warning: slow network' });
+    };
+    const runner = await loadRunner();
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c-stderr-completed', agentId: 'agent-x',
+      cli: 'claude', prompt: 'run', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+    expect(result.status).toBe('completed');
+    expect(result).not.toHaveProperty('failureCategory');
+    expect(result).not.toHaveProperty('stderrExcerpt');
+  });
+
   it('keeps useful tool metadata while stripping private command, path, and body data before forwarding and persistence', async () => {
     const privateToken = 'sk-proj-local-agent-secret-123456789';
     const opaqueToken = 'opaque-secret-value';

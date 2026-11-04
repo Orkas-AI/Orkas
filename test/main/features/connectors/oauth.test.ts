@@ -55,6 +55,40 @@ afterEach(() => {
 });
 
 describe('features/connectors/oauth', () => {
+  it.each([
+    ['connector_oauth', 1, false, 'rejected'],
+    ['connector_oauth', 0, false, 'success'],
+    ['connector_oauth', 'private-code-canary', true, 'invalid'],
+    ['composio', 1, false, 'rejected'],
+    ['composio', 0, false, 'success'],
+  ] as const)('diagnoses %s exchange API result %s with safe field presence only', async (kind, code, present, apiResult) => {
+    const fetchMock = vi.fn(async (url: string) => new Response(JSON.stringify(
+      String(url).endsWith('/composio/start')
+        ? { code: 0, redirect_url: 'https://connect.test/oauth' }
+        : { code, msg: 'private-message-canary',
+          ...(present ? { access_token: 'private-access-canary' } : {}),
+          refresh_token: 'private-refresh-canary' },
+    )));
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const pending = kind === 'composio'
+      ? oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any)
+      : oauth.startOAuth('u1', catalog.findCatalogEntry('bing-webmaster')!);
+    // Composio must finish its start request before the deep link arrives.
+    const { shell } = await import('electron');
+    await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalled());
+    const rejected = expect(pending).rejects.toMatchObject({ code: kind === 'composio' && code !== 0 ? 'exchange_http_4xx' : 'invalid_exchange_response' });
+    await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=private-exchange-canary');
+    await rejected;
+    expect(logWarn).toHaveBeenCalledWith('connector OAuth exchange failed', expect.objectContaining({
+      exchange_response: { kind, api_result: apiResult, required_fields_present: present },
+    }));
+    expect(JSON.stringify(logWarn.mock.calls)).not.toMatch(/private-/);
+    expect(fetchMock).toHaveBeenCalledTimes(kind === 'composio' ? 2 : 1);
+  });
+
+
   it.each(['missing_key', 'interrupted_body'] as const)('releases the pending start after %s and allows a fresh flow', async (failure) => {
     if (failure === 'missing_key') {
       vi.doMock('../../../../src/main/features/connectors/api-key', () => ({

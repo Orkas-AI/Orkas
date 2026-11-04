@@ -17,8 +17,8 @@
  *   - one_time: { at: ISO datetime }       fires once; after fire enabled=false
  *   - hourly:   { interval_hours }         every x hours from create / last run
  *   - daily:    { hour, minute }
- *   - weekly:   { weekday, hour, minute }
- *   - monthly:  { day, hour, minute }      day=31 → last day of shorter months
+ *   - weekly:   { weekday | weekdays[], hour, minute }; workdays = Monday–Friday
+ *   - monthly:  { day | days[], hour, minute }      day=31 → last day of shorter months
  *
  * Scheduler: per-task timers started by `startScheduler()` after
  * `activateUser()`. After system wake or startup, the most recent boundary
@@ -52,6 +52,7 @@ import {
   listAutoTaskLocations,
 } from '../util/project-layout';
 import { readJson, writeJson, nowIso, safeId } from '../storage';
+import { FileSnapshotCache, mapFileSnapshots } from '../util/file-snapshot';
 import { createLogger } from '../logger';
 import { logErrorSummary, maskId } from '../util/log-redact';
 import { replaceDirectoryAtomically } from '../util/atomic-directory-replace';
@@ -97,8 +98,14 @@ export function getCurrentDevice(): DeviceFingerprint {
 export type ScheduleOneTime = { type: 'one_time'; at: string };
 export type ScheduleHourly  = { type: 'hourly'; interval_hours: number };
 export type ScheduleDaily   = { type: 'daily';   hour: number; minute: number };
-export type ScheduleWeekly  = { type: 'weekly';  weekday: number; hour: number; minute: number };
-export type ScheduleMonthly = { type: 'monthly'; day: number; hour: number; minute: number };
+export type ScheduleWeekly = { type: 'weekly'; hour: number; minute: number } & (
+  | { weekday: number | 'workdays'; weekdays?: never }
+  | { weekdays: number[]; weekday?: never }
+);
+export type ScheduleMonthly = { type: 'monthly'; hour: number; minute: number } & (
+  | { day: number; days?: never }
+  | { days: number[]; day?: never }
+);
 export type Schedule = ScheduleOneTime | ScheduleHourly | ScheduleDaily | ScheduleWeekly | ScheduleMonthly;
 
 export type TaskEndCondition =
@@ -220,15 +227,31 @@ function _isValidSchedule(s: any): s is Schedule {
       && s.interval_hours <= MAX_INTERVAL_HOURS;
   }
   if (s.type === 'daily') return _isHM(s.hour, s.minute);
-  if (s.type === 'weekly') {
-    return _isHM(s.hour, s.minute)
-      && Number.isInteger(s.weekday) && s.weekday >= 0 && s.weekday <= 6;
-  }
-  if (s.type === 'monthly') {
-    return _isHM(s.hour, s.minute)
-      && Number.isInteger(s.day) && s.day >= 1 && s.day <= 31;
+  if (s.type === 'weekly' || s.type === 'monthly') {
+    const weekly = s.type === 'weekly';
+    const scalar = weekly ? s.weekday : s.day;
+    const values = weekly ? s.weekdays : s.days;
+    const min = weekly ? 0 : 1;
+    const max = weekly ? 6 : 31;
+    if (!_isHM(s.hour, s.minute)) return false;
+    if (values !== undefined) {
+      return scalar === undefined && Array.isArray(values) && values.length > 0
+        && values.length <= (weekly ? 7 : 31)
+        && new Set(values).size === values.length
+        && values.every(value => Number.isInteger(value) && value >= min && value <= max);
+    }
+    return (weekly && scalar === 'workdays')
+      || (Number.isInteger(scalar) && scalar >= min && scalar <= max);
   }
   return false;
+}
+
+/** Expand saved selectors without changing their single/multiple editor mode. */
+function _calendarSelection(s: ScheduleWeekly | ScheduleMonthly): number[] {
+  const values = s.type === 'weekly'
+    ? (s.weekdays || (s.weekday === 'workdays' ? [1, 2, 3, 4, 5] : [s.weekday]))
+    : (s.days || [s.day]);
+  return [...values].sort((a, b) => a - b);
 }
 
 function _schedulesEqual(a: Schedule, b: Schedule): boolean {
@@ -242,16 +265,10 @@ function _schedulesEqual(a: Schedule, b: Schedule): boolean {
   if (a.type === 'hourly') {
     return b.type === 'hourly' && a.interval_hours === b.interval_hours;
   }
-  if (a.type === 'weekly') {
-    return b.type === 'weekly'
-      && a.weekday === b.weekday
-      && a.hour === b.hour
-      && a.minute === b.minute;
-  }
-  return b.type === 'monthly'
-    && a.day === b.day
-    && a.hour === b.hour
-    && a.minute === b.minute;
+  return a.type === b.type
+    && a.hour === (b as ScheduleWeekly | ScheduleMonthly).hour
+    && a.minute === (b as ScheduleWeekly | ScheduleMonthly).minute
+    && JSON.stringify(_calendarSelection(a)) === JSON.stringify(_calendarSelection(b as ScheduleWeekly | ScheduleMonthly));
 }
 
 function _endConditionsEqual(
@@ -354,17 +371,21 @@ function _runExclusive<T>(uid: string, fn: () => Promise<T>): Promise<T> {
 async function _readOne(
   uid: string, taskId: string,
   loc = findAutoTaskLocation(uid, taskId),
+  strict = false,
 ): Promise<AutoTask | null> {
   const cfg = loc?.configFile || globalAutoTaskLocation(uid, taskId).configFile;
-  if (!fs.existsSync(cfg)) return null;
+  if (!strict && !fs.existsSync(cfg)) return null;
   try {
-    const raw: any = await readJson(cfg);
+    const raw: any = await readJson(cfg, { strict });
+    if (strict && !_isValidTaskShape(raw)) throw new Error('Invalid automation configuration');
     if (!raw || typeof raw !== 'object') return null;
     if (!_isValidTaskShape(raw)) return null;
     _dropMalformedRunFacts(raw as unknown as Record<string, unknown>);
     if (loc?.projectId && !raw.project_id) raw.project_id = loc.projectId;
     return raw;
   } catch (err) {
+    if (strict && (err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    if (strict) return null;
     log.warn(`read failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
     return null;
   }
@@ -494,13 +515,13 @@ async function _migrateLegacyDeviceBindingsIfOwned(
   return out;
 }
 
-async function _readAll(uid: string): Promise<AutoTask[]> {
+async function _readAll(uid: string, strict = false): Promise<AutoTask[]> {
   const out: AutoTask[] = [];
-  for (const loc of listAutoTaskLocations(uid)) {
+  for (const loc of listAutoTaskLocations(uid, strict)) {
     if (!_isValidTaskId(loc.taskId)) continue;
     // Discovery already resolved scope and duplicate precedence. Re-scanning
     // all directories per item makes a list quadratic in filesystem work.
-    const task = await _readOne(uid, loc.taskId, loc);
+    const task = await _readOne(uid, loc.taskId, loc, strict);
     if (task) out.push(task);
   }
   // Newest-first by created_at — a brand-new task lands at the top so the
@@ -509,6 +530,15 @@ async function _readAll(uid: string): Promise<AutoTask[]> {
   // would scramble the list every fire).
   out.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
   return out;
+}
+
+/** Lifecycle read uses the scheduler's device migration/ownership contract, not armed timers. */
+export async function hasEnabledLocalAutomations(uid: string): Promise<boolean> {
+  return _runExclusive(uid, async () => {
+    const all = await _migrateLegacyDeviceBindingsIfOwned(uid, await _readAll(uid, true));
+    const device = getCurrentDevice().id;
+    return all.some(task => task.enabled && (!task.device_id || task.device_id === device));
+  });
 }
 
 // ── Public CRUD ───────────────────────────────────────────────────────────
@@ -649,6 +679,26 @@ export async function listTasks(uid: string, opts?: { projectId?: string | null 
       return all.filter((t) => t.project_id === pid);
     }
     return all;
+  });
+}
+
+type TaskSearchRow = Pick<AutoTask, 'id' | 'title' | 'content' | 'enabled' | 'project_id'>;
+const _searchSnapshots = new FileSnapshotCache<TaskSearchRow>(
+  row => 256 + 2 * ((row.title?.length || 0) + row.content.length),
+);
+
+/** Read-only search projections do not need scheduler device migration or
+ * run/attachment metadata. Validate sources on every query, with bounded I/O. */
+export async function listTaskSearchRows(uid: string): Promise<TaskSearchRow[]> {
+  return _runExclusive(uid, async () => {
+    const rows = await mapFileSnapshots(listAutoTaskLocations(uid).filter(loc => _isValidTaskId(loc.taskId)), loc => (
+      _searchSnapshots.read(loc.configFile, async () => {
+        const task = await _readOne(uid, loc.taskId, loc);
+        return task ? { id: task.id, title: task.title, content: task.content,
+          enabled: task.enabled, project_id: task.project_id } : null;
+      })
+    ));
+    return rows.filter((row): row is TaskSearchRow => row !== null);
   });
 }
 
@@ -1250,14 +1300,13 @@ function _dueBoundary(task: AutoTask, now: Date, lastRun: Date | null): Date | n
     return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
   }
   if (sched.type === 'weekly') {
-    if (now.getDay() !== sched.weekday) return null;
+    if (!_calendarSelection(sched).includes(now.getDay())) return null;
     return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
   }
   if (sched.type === 'monthly') {
     const todayDom = now.getDate();
     const lastDom = _lastDayOfMonth(now);
-    const targetDom = Math.min(sched.day, lastDom); // day=31 → last day of month
-    if (todayDom !== targetDom) return null;
+    if (!_calendarSelection(sched).some(day => Math.min(day, lastDom) === todayDom)) return null;
     return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
   }
   return null;
@@ -1294,27 +1343,35 @@ function _latestOccurrenceAtOrBefore(task: AutoTask, now: Date): Date | null {
     const boundary = new Date(baseline.getTime() + Math.floor(elapsed / intervalMs) * intervalMs);
     return Number.isNaN(boundary.getTime()) ? null : boundary;
   }
-  if (sched.type === 'daily' || sched.type === 'weekly') {
-    const stepDays = sched.type === 'daily' ? 1 : 7;
+  if (sched.type === 'daily') {
     const boundary = new Date(now);
-    if (sched.type === 'weekly') boundary.setDate(boundary.getDate() - ((now.getDay() - sched.weekday + 7) % 7));
     boundary.setHours(sched.hour, sched.minute, 0, 0);
     if (boundary.getTime() > now.getTime()) {
-      boundary.setDate(boundary.getDate() - stepDays);
+      boundary.setDate(boundary.getDate() - 1);
       boundary.setHours(sched.hour, sched.minute, 0, 0);
     }
     return boundary;
   }
-  if (sched.type === 'monthly') {
-    const inMonth = (year: number, month: number): Date => {
-      const first = new Date(year, month, 1);
-      const day = Math.min(sched.day, _lastDayOfMonth(first));
-      return new Date(first.getFullYear(), first.getMonth(), day, sched.hour, sched.minute, 0, 0);
-    };
-    const boundary = inMonth(now.getFullYear(), now.getMonth());
-    return boundary.getTime() <= now.getTime()
-      ? boundary
-      : inMonth(now.getFullYear(), now.getMonth() - 1);
+  if (sched.type === 'weekly' || sched.type === 'monthly') {
+    const candidates = _calendarSelection(sched).map(day => {
+      if (sched.type === 'weekly') {
+        const boundary = new Date(now);
+        boundary.setDate(boundary.getDate() - ((now.getDay() - day + 7) % 7));
+        boundary.setHours(sched.hour, sched.minute, 0, 0);
+        if (boundary.getTime() > now.getTime()) {
+          boundary.setDate(boundary.getDate() - 7);
+          boundary.setHours(sched.hour, sched.minute, 0, 0);
+        }
+        return boundary;
+      }
+      const inMonth = (month: number): Date => {
+        const first = new Date(now.getFullYear(), month, 1);
+        return new Date(first.getFullYear(), first.getMonth(), Math.min(day, _lastDayOfMonth(first)), sched.hour, sched.minute, 0, 0);
+      };
+      const boundary = inMonth(now.getMonth());
+      return boundary.getTime() <= now.getTime() ? boundary : inMonth(now.getMonth() - 1);
+    });
+    return new Date(Math.max(...candidates.map(date => date.getTime())));
   }
   return null;
 }
@@ -1810,6 +1867,35 @@ let _schedulerSuspended = false;
 let _schedulerPowerMonitor: SchedulerPowerMonitor | null = null;
 let _schedulerEpoch = 0;
 
+// One bounded clock sample for the scheduler, not one poll or disk scan per task.
+// Date/Intl follow the device timezone; monotonic elapsed time exposes manual
+// clock corrections that ordinary setTimeout deadlines would otherwise miss.
+let _clockMonitor: ReturnType<typeof setInterval> | null = null;
+let _clockSample: { wall: number; monotonic: number; zone: string; offset: number } | null = null;
+function _sampleDeviceClock() {
+  return { wall: Date.now(), monotonic: performance.now(),
+    zone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    offset: new Date().getTimezoneOffset() };
+}
+function _startClockMonitor(): void {
+  if (_clockMonitor) return;
+  _clockSample = _sampleDeviceClock();
+  _clockMonitor = setInterval(() => {
+    const next = _sampleDeviceClock();
+    const previous = _clockSample;
+    _clockSample = next;
+    if (!previous || !_started || _schedulerSuspended || !_timers.size || !hasActiveUser()) return;
+    const changed = previous.zone !== next.zone || previous.offset !== next.offset
+      || Math.abs((next.wall - previous.wall) - (next.monotonic - previous.monotonic)) > 2000;
+    if (!changed) return;
+    const epoch = ++_schedulerEpoch;
+    _cancelAllTimers();
+    void _rescheduleAll(getActiveUserId(), 'restore', epoch, true)
+      .catch(err => log.warn('device clock reschedule failed', logErrorSummary(err)));
+  }, 30_000);
+  _clockMonitor.unref?.();
+}
+
 function schedulerEpochIsCurrent(schedulerEpoch?: number): boolean {
   if (schedulerEpoch === undefined) return true;
   return schedulerEpoch === _schedulerEpoch;
@@ -1853,8 +1939,12 @@ function _nextDueAt(task: AutoTask, now: Date, lastRun: Date | null): Date | nul
   }
   if (sched.type === 'hourly') candidate = _nextHourlyAt(now, lastRun, sched.interval_hours);
   if (sched.type === 'daily') candidate = _nextDailyAt(now, lastRun, sched.hour, sched.minute);
-  if (sched.type === 'weekly') candidate = _nextWeeklyAt(now, lastRun, sched.weekday, sched.hour, sched.minute);
-  if (sched.type === 'monthly') candidate = _nextMonthlyAt(now, lastRun, sched.day, sched.hour, sched.minute);
+  if (sched.type === 'weekly' || sched.type === 'monthly') {
+    const candidates = _calendarSelection(sched).map(day => sched.type === 'weekly'
+      ? _nextWeeklyAt(now, lastRun, day, sched.hour, sched.minute)
+      : _nextMonthlyAt(now, lastRun, day, sched.hour, sched.minute));
+    candidate = new Date(Math.min(...candidates.map(date => date.getTime())));
+  }
   return candidate && _endAllowsAt(task, candidate) ? candidate : null;
 }
 
@@ -1945,8 +2035,8 @@ function _scheduleStateKey(task: AutoTask): string {
       : task.schedule.type === 'daily'
         ? `daily:${task.schedule.hour}:${task.schedule.minute}`
         : task.schedule.type === 'weekly'
-          ? `weekly:${task.schedule.weekday}:${task.schedule.hour}:${task.schedule.minute}`
-          : `monthly:${task.schedule.day}:${task.schedule.hour}:${task.schedule.minute}`;
+          ? `weekly:${_calendarSelection(task.schedule).join(',')}:${task.schedule.hour}:${task.schedule.minute}`
+          : `monthly:${_calendarSelection(task.schedule).join(',')}:${task.schedule.hour}:${task.schedule.minute}`;
   const endCondition = !task.end_condition
     ? ''
     : task.end_condition.type === 'date'
@@ -2272,6 +2362,7 @@ export function startScheduler(): void {
   if (_started) return;
   _started = true;
   _schedulerSuspended = false;
+  _startClockMonitor();
   void _attachSchedulerPowerMonitor();
   if (!hasActiveUser()) return;
   const uid = getActiveUserId();
@@ -2292,6 +2383,9 @@ export async function rescheduleAllForActiveUser(): Promise<void> {
 }
 
 export function stopScheduler(): void {
+  if (_clockMonitor) clearInterval(_clockMonitor);
+  _clockMonitor = null;
+  _clockSample = null;
   _schedulerEpoch += 1;
   _cancelAllTimers();
   _detachSchedulerPowerMonitor();

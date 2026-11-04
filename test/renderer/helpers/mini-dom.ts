@@ -110,9 +110,10 @@ export class MiniElement extends MiniNode {
     this.localName = tag.toLowerCase();
     const attr = (key: string) => 'data-' + key.replace(/[A-Z]/g, c => '-' + c.toLowerCase());
     this.dataset = new Proxy({} as Record<string, string>, {
-      get: (_t, key: string) => this.attributes.get(attr(key)),
+      // Assertion libraries probe objects with symbols while diffing them.
+      get: (_t, key) => (typeof key === 'string' ? this.attributes.get(attr(key)) : undefined),
       set: (_t, key: string, value) => { this.setAttribute(attr(key), String(value)); return true; },
-      has: (_t, key: string) => this.attributes.has(attr(key)),
+      has: (_t, key) => typeof key === 'string' && this.attributes.has(attr(key)),
     });
   }
   get tagName(): string { return this.localName.toUpperCase(); }
@@ -188,6 +189,14 @@ export class MiniElement extends MiniNode {
     for (let current = node; current; current = current.parentNode) if (current === this) return true;
     return false;
   }
+  insertAdjacentHTML(position: 'afterbegin' | 'beforeend', html: string): void {
+    const holder = new MiniElement(this.ownerDocument, this.localName);
+    parseInto(holder, String(html));
+    const nodes = [...holder.childNodes];
+    for (const node of nodes) { node.remove(); node.parentNode = this; }
+    if (position === 'afterbegin') this.childNodes.unshift(...nodes);
+    else this.childNodes.push(...nodes);
+  }
   descendants(): MiniElement[] { return this.children.flatMap(child => [child, ...child.descendants()]); }
   matches(selector: string): boolean { return splitList(selector).some(item => matchComplex(this, item)); }
   closest(selector: string): MiniElement | null {
@@ -200,6 +209,7 @@ export class MiniElement extends MiniNode {
   blur(): void { if (this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = this.ownerDocument.body; }
   click(): void { if (!this.disabled) this.dispatchEvent(new MiniEvent('click', { bubbles: true })); }
   getBoundingClientRect() { return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
+  scrollIntoView(): void { /* layout is out of scope */ }
 }
 
 export class MiniDocument {

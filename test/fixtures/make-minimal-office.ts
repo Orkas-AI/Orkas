@@ -172,7 +172,13 @@ export function makeReorderedSheetsXlsx(): Buffer {
   return zip.toBuffer();
 }
 
-export function makeMinimalPptx(opts: { slides?: string[][] } = {}): Buffer {
+const PLACED_SHAPE_TREE_HEADER = '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>';
+const PLACED_SHAPE_HEADER = '<p:nvSpPr><p:cNvPr id="2" name="Text"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>'
+  + '<p:spPr><a:xfrm><a:off x="457200" y="457200"/><a:ext cx="8229600" cy="1371600"/></a:xfrm></p:spPr>';
+
+// `placed` emits a positioned shape so a real renderer has text to paint. Text
+// extraction does not need geometry, and OfficeCLI's HTML omits a shape without it.
+export function makeMinimalPptx(opts: { slides?: string[][]; placed?: boolean } = {}): Buffer {
   const slides = opts.slides ?? [
     ['Quarterly Review', 'Revenue grew 12%'],
   ];
@@ -202,7 +208,7 @@ export function makeMinimalPptx(opts: { slides?: string[][] } = {}): Buffer {
       .join('');
     addText(zip, `ppt/slides/slide${i + 1}.xml`, `<?xml version="1.0" encoding="UTF-8"?>
 <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
-  <p:cSld><p:spTree><p:sp><p:txBody>${runs}</p:txBody></p:sp></p:spTree></p:cSld>
+  <p:cSld><p:spTree>${opts.placed ? PLACED_SHAPE_TREE_HEADER : ''}<p:sp>${opts.placed ? PLACED_SHAPE_HEADER : ''}<p:txBody>${opts.placed ? '<a:bodyPr/><a:lstStyle/>' : ''}${runs}</p:txBody></p:sp></p:spTree></p:cSld>
 </p:sld>`);
   });
   return zip.toBuffer();

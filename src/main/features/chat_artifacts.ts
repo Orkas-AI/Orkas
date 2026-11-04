@@ -712,14 +712,14 @@ export interface ArtifactSummary {
  * Best-effort: an unreadable or malformed entry is skipped rather than failing
  * the whole listing.
  */
-export function listArtifacts(userId: string, cid: string): ArtifactSummary[] {
+export async function listArtifacts(userId: string, cid: string): Promise<ArtifactSummary[]> {
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
   catch { return []; }
 
   const root = chatArtifactCidDirForConversation(userId, safeConvId);
   let entries: fs.Dirent[];
-  try { entries = fs.readdirSync(root, { withFileTypes: true }); }
+  try { entries = await fsp.readdir(root, { withFileTypes: true }); }
   catch { return []; }
 
   const out: ArtifactSummary[] = [];
@@ -732,18 +732,32 @@ export function listArtifacts(userId: string, cid: string): ArtifactSummary[] {
     let bytes = 0;
     let mtime = 0;
     let files: fs.Dirent[];
-    try { files = fs.readdirSync(dir, { withFileTypes: true }); }
+    try { files = await fsp.readdir(dir, { withFileTypes: true }); }
     catch { continue; }
     // An artifact with no entry point is a half-written or discarded bundle;
     // the `chat-app://` handler could not serve it either.
     if (!files.some((file) => file.isFile() && file.name === 'index.html')) continue;
-    for (const file of files) {
-      if (!file.isFile()) continue;
-      try {
-        const st = fs.statSync(path.join(dir, file.name));
-        bytes += st.size;
-        mtime = Math.max(mtime, Math.floor(st.mtimeMs));
-      } catch { /* skip an unreadable sibling, keep the bundle */ }
+    // Summarize the full bundle, including nested resources. Keep traversal
+    // iterative and I/O serial/async so large apps do not block the host or
+    // create one pending operation per file. Links are not bundle resources.
+    const directories = [dir];
+    while (directories.length) {
+      const current = directories.pop()!;
+      let children: fs.Dirent[];
+      try { children = current === dir ? files : await fsp.readdir(current, { withFileTypes: true }); }
+      catch { continue; }
+      for (const file of children) {
+        if (!file.isFile() && !file.isDirectory()) continue;
+        const target = path.join(current, file.name);
+        try {
+          const st = await fsp.lstat(target);
+          if (st.isDirectory()) directories.push(target);
+          else if (st.isFile()) {
+            bytes += st.size;
+            mtime = Math.max(mtime, Math.floor(st.mtimeMs));
+          }
+        } catch { /* skip an unreadable sibling, keep the bundle */ }
+      }
     }
     const meta = readArtifactMeta(userId, safeConvId, artifactId);
     out.push({

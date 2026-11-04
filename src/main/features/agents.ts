@@ -1467,12 +1467,36 @@ export function setAgentEnabledForActiveUser(agentId: string, enabled: boolean):
   setAgentEnabled(getActiveUserId(), agentId, enabled);
 }
 
+// Six fixed source/stage buckets cap failure storms without retaining account,
+// Agent or path identifiers. Never forward an OS/JSON error's private text.
+const _catalogFailureWarnedAt = new Map<string, number>();
+const CATALOG_READ_ERROR_CODES = new Set([
+  'EACCES', 'EPERM', 'EIO', 'EBUSY', 'ENOTDIR', 'EISDIR',
+  'EMFILE', 'ENFILE', 'ENOSPC', 'EINVAL', 'ENAMETOOLONG', 'ELOOP',
+]);
+
+function _catalogReadFailure(source: 'custom' | 'marketplace', stage: 'stamp' | 'enumerate' | 'definition', error: unknown): Error {
+  const key = `${source}:${stage}`;
+  const now = Date.now();
+  const previous = _catalogFailureWarnedAt.get(key);
+  if (previous === undefined || now < previous || now - previous >= 60_000) {
+    _catalogFailureWarnedAt.set(key, now);
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    log.warn('agent catalog read failed', {
+      source, stage,
+      error_code: error instanceof SyntaxError ? 'syntax_error'
+        : typeof code === 'string' && CATALOG_READ_ERROR_CODES.has(code) ? code : 'unknown',
+    });
+  }
+  return new Error('Agent catalog unavailable');
+}
+
 function _agentDirStamp(): string {
   let stamp = '';
-  for (const d of [CUSTOM_AGENTS_DIR(), userMarketplaceAgentsDir(getActiveUserId())]) {
+  for (const [source, d] of [['custom', CUSTOM_AGENTS_DIR()], ['marketplace', userMarketplaceAgentsDir(getActiveUserId())]] as const) {
     try { stamp += `${d}:${fs.statSync(d).mtimeMs};`; }
     catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw new Error('Agent catalog unavailable');
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw _catalogReadFailure(source, 'stamp', error);
       stamp += `${d}:0;`;
     }
   }
@@ -1539,11 +1563,11 @@ async function _listAgentSpecs(): Promise<Agent[]> {
     } else {
       specs = [];
       const seen = new Set<string>();
-      const sources: Array<[AgentSource, string]> = [['marketplace', userMarketplaceAgentsDir(getActiveUserId())], ['custom', CUSTOM_AGENTS_DIR()]];
+      const sources = [['marketplace', userMarketplaceAgentsDir(getActiveUserId())], ['custom', CUSTOM_AGENTS_DIR()]] as const;
       for (const [source, dir] of sources) {
         const entries = (await fsp.readdir(dir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
           if (error?.code === 'ENOENT') return [];
-          throw new Error('Agent catalog unavailable');
+          throw _catalogReadFailure(source, 'enumerate', error);
         }))
           .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
           .sort((a, b) => a.name.localeCompare(b.name));
@@ -1555,7 +1579,7 @@ async function _listAgentSpecs(): Promise<Agent[]> {
             // A staging directory may not contain a definition yet. Existing
             // but unreadable/malformed definitions make the scan incomplete.
             if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
-            throw new Error('Agent catalog unavailable');
+            throw _catalogReadFailure(source, 'definition', error);
           }
           const norm = normalizeAgent(data, source);
           if (!norm) continue;
@@ -1837,10 +1861,30 @@ function bumpAgentSpecRevision(data: AgentRaw): void {
  * the quality gate requires a usable name plus at least one description variant
  * before the spec is written.
  */
-export async function createCustomAgent(
+const agentCreationLocks = new Map<string, Promise<void>>();
+
+async function withAgentCreationLock<T>(userId: string, run: () => Promise<T>): Promise<T> {
+  const previous = agentCreationLocks.get(userId) || Promise.resolve();
+  let release: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  agentCreationLocks.set(userId, gate);
+  await previous;
+  try { return await run(); }
+  finally {
+    release!();
+    if (agentCreationLocks.get(userId) === gate) agentCreationLocks.delete(userId);
+  }
+}
+
+export async function createCustomAgent(options: CreateAgentOptions = {}): Promise<Agent | null> {
+  const userId = getActiveUserId();
+  return withAgentCreationLock(userId, () => _createCustomAgentForUser(userId, options));
+}
+
+async function _createCustomAgentForUser(
+  userId: string,
   { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, profile, knowhow, standards, tool_list, skill_list, runtime, category, output_format }: CreateAgentOptions = {},
 ): Promise<Agent | null> {
-  const userId = getActiveUserId();
   assertAgentNameAllowed(name);
   await assertAgentNameUnique(String(name || '').trim(), undefined, userId);
   _assertAgentGuidanceMutationValid({ profile, knowhow, standards });

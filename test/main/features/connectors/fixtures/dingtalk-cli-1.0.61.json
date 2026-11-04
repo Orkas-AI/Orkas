@@ -1,0 +1,21 @@
+{
+  "package": "dingtalk-workspace-cli@1.0.61",
+  "integrity": "sha512-lYLLqE3jDRqzf3ekjaOnBqD222fsbRkEiO4GsR6k8aMiybEUTQDr7BC9/4Wtm2KeL+PiukBqfZ9EFULS22jdBA==",
+  "provenance": "Synthetic envelope derived from pinned v1.0.61 source; server code independently observed in the isolated test organization on 2026-10-29. No account output is copied.",
+  "sources": [
+    "https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli/blob/v1.0.61/internal/app/server_failure_classifier.go",
+    "https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli/blob/v1.0.61/internal/errors/errors.go",
+    "https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli/blob/v1.0.61/internal/pat/chmod.go"
+  ],
+  "batch_product_not_found": {
+    "error": {
+      "code": 1,
+      "category": "api",
+      "message": "synthetic unsupported batch product",
+      "reason": "mcp_tool_error",
+      "operation": "tools/call",
+      "server_key": "pat",
+      "server_error_code": "PAT_BATCH_PRODUCT_NOT_FOUND"
+    }
+  }
+}

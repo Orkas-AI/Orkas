@@ -21,6 +21,23 @@ each `narration_text` and pre-production audio as `owner:"none"`, `tracks:[]`,
 plus selected `narration_intent`; a no-narration plan states that choice at plan
 review.
 
+When the brief asks for music or background sound and this composition is the
+finished video, choose the track while writing the plan, not after the draft
+(an AUTO segment stays silent; its music goes in the AUTO plan's `tracks.music`): download a recorded track from a music
+library whose license allows commercial video use (CC0, or CC BY credited in
+the publishing notes, not on screen) into `assets/music/`, and name its title, author, license and any
+attribution duty at plan review (a paid track needs the user's approval first).
+Music synthesized in code sounds like test tones; it is not a substitute. If no
+track can be obtained this turn (the download is refused or fails), plan without
+music, say so at plan review and keep producing; add the track when one arrives,
+since an audio-only change keeps the approved preview. A
+no-narration plan declares it now as `owner:"composition"` with one track
+`{"id":"music","kind":"music","src":"assets/music/<file>","start":0,"duration":<video seconds>,"volume":1}`;
+a narrated plan adds it after materialization ([narration.md](narration.md)).
+Keep license pages and the rights ledger outside `composition/` (for example
+`project/rights/`): any non-audio file inside it changes the visual identity
+and reopens the preview.
+
 ```json
 {
   "schema_version": 2,

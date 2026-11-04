@@ -412,6 +412,28 @@ describe('local_agents/bridge › auth + skills', () => {
     } finally { await bridge.close(); }
   });
 
+  it.each([false, true])('preserves connector failure status through inline and retained reads (large=%s)', async large => {
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+      instance: { id: 'service', display_name: 'Service' }, tools: [{ name: 'list', input_schema: {} }],
+    }] as any);
+    const text = large ? 'Operation rejected. '.repeat(12_000) : 'Permission denied for this operation.';
+    bridgeConnectorMock.callTool.mockResolvedValue({ isError: true, content: [{ type: 'text', text }] });
+    const bridge = await startTestBridge();
+    const call = async (params: Record<string, unknown>) => (await rpcOnce(bridge.socketPath, {
+      id: 1, token: bridge.token, method: 'connectors.call', params,
+    })).reply as any;
+    try {
+      const result = (await call({ connector_id: 'service', tool_name: 'list' })).result;
+      expect(result.isError).toBe(true);
+      if (large) {
+        expect(result.output_ref).toBeTruthy();
+        const page = (await call({ action: 'read', output_ref: result.output_ref, offset: result.next_offset })).result;
+        expect(page.isError).toBe(true);
+      } else expect(result.text).toBe(text);
+      expect(bridgeConnectorMock.callTool).toHaveBeenCalledOnce();
+    } finally { await bridge.close(); }
+  });
+
   it('reads and retries pages of an approved sensitive action without repeating approval or its side effect', async () => {
     bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
       instance: { id: 'gmail', display_name: 'Gmail' }, tools: [{ name: 'GMAIL_SEND_EMAIL', input_schema: {} }],
@@ -463,7 +485,8 @@ describe('local_agents/bridge › auth + skills', () => {
       expect((await call({ action: 'list', target: 'user' })).result.entries).toEqual(['Original preference']);
       if (change === 'account-switch') users.activateUser('other-account');
       else controller.abort();
-      for (const params of [{ action: 'list', target: 'user' }, { action: 'list', target: 'shared' }, { action: 'add', target: 'agent', content: 'late write' }]) {
+      for (const params of [{ action: 'list', target: 'user' }, { action: 'list', target: 'shared' }, { action: 'add', target: 'agent', content: 'late write' },
+        { action: 'batch', operations: [{ action: 'remove', old_text: 'Original lesson' }], expected_revision: memory.listAgentEntries(TEST_UID, 'a1').revision }]) {
         const reply = await call(params);
         expect(reply.ok).toBe(false);
         expect(JSON.stringify(reply)).not.toContain('preference');
@@ -524,7 +547,9 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(creation.ok).toBe(true);
       const created = creation.result;
       expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ content: 'first\nfull detail' });
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
+      // The conversation's first open project to-do links back to it; later
+      // edits and completion keep that link.
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ origin_cid: 'c1' });
       const duplicate = await read({ action: 'create', content: 'first\nfull detail' });
       expect(duplicate.result).toMatchObject({ alreadyExists: true, task: { id: created.task.id, content: 'first\nfull detail' } });
       if (!created.ok) throw new Error('task fixture failed');
@@ -581,10 +606,10 @@ describe('local_agents/bridge › auth + skills', () => {
       expect((await tasks.getTask('other-account', foreignAccount.project.project_id, privateTask.task.id))?.status).toBe('todo');
       expect((await read({ action: 'complete', task_id: created.task.id })).ok).toBe(true);
       expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'done' });
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ origin_cid: 'c1' });
       expect((await read({ action: 'update', task_id: created.task.id, content: 'Edited in CLI\nUpdated detail', owner: '' })).ok).toBe(true);
       expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ content: 'Edited in CLI\nUpdated detail', status: 'done' });
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ origin_cid: 'c1' });
       expect(await tasks.listTasks(TEST_UID, '')).toEqual([]);
       await projects.deleteProject(TEST_UID, pid);
       expect((await read({ action: 'list' })).ok).toBe(false);
@@ -665,7 +690,7 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(created.ok).toBe(true);
       const tid = created.result.task.id;
       expect(await tasks.getTask(TEST_UID, pid, tid)).toMatchObject({ owner_agent: 'Backend Dev', owner_agent_id: 'aaa111bbb222' });
-      expect(await tasks.getTask(TEST_UID, pid, tid)).not.toHaveProperty('origin_cid');
+      expect(await tasks.getTask(TEST_UID, pid, tid)).toMatchObject({ origin_cid: 'c1' });
       expect((await call({ action: 'update', task_id: tid, owner: 'Reviewer', content: 'Must not apply' })).ok).toBe(false);
       expect((await tasks.getTask(TEST_UID, pid, tid))?.content).toBe('Assigned work');
       expect((await call({ action: 'update', task_id: tid, owner: '' })).ok).toBe(true);
@@ -890,6 +915,14 @@ describe('local_agents/bridge › auth + skills', () => {
       expect((await call('memory.agent', { action: 'add', target: 'project', content: 'Stable decision.' })).result.ok).toBe(true);
       expect((await call('memory.agent', { action: 'replace', target: 'project', old_text: 'Stable decision.', content: 'Corrected decision.' })).result.ok).toBe(true);
       expect(memory.listEntries(TEST_UID, { project: pid }).entries).toEqual(['Corrected decision.']);
+      const snapshot = memory.listEntries(TEST_UID, { project: pid });
+      const batch = await call('memory.agent', { action: 'batch', target: 'project', expected_revision: snapshot.revision,
+        operations: [{ action: 'replace', old_text: 'Corrected decision.', content: 'Updated decision.' }, { action: 'add', content: 'Second decision.' }] });
+      expect(batch.result).toMatchObject({ ok: true, changed: true });
+      expect(memory.listEntries(TEST_UID, { project: pid }).entries).toEqual(['Updated decision.', 'Second decision.']);
+      const staleBatch = await call('memory.agent', { action: 'batch', target: 'project', expected_revision: snapshot.revision,
+        operations: [{ action: 'remove', old_text: 'Updated decision.' }] });
+      expect(staleBatch.result).toMatchObject({ ok: false, error: expect.stringContaining('conflict') });
       expect(memory.listAgentEntries(TEST_UID, 'a1').entries).toEqual([]);
       for (const target of ['user', 'shared']) expect((await call('memory.agent', { action: 'add', target, content: 'Wrong scope' })).ok).toBe(false);
       expect((await call('memory.agent', { action: 'add', target: 'project', projectId: 'other', content: 'Wrong scope' })).ok).toBe(false);
@@ -930,9 +963,10 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(createdTask.ok).toBe(true);
       const tasks = await import('../../../../src/main/features/project_tasks');
       expect(await tasks.getTask(TEST_UID, pid, createdTask.result.task.id)).toMatchObject({ content: 'Current project work' });
-      expect(await tasks.getTask(TEST_UID, pid, createdTask.result.task.id)).not.toHaveProperty('origin_cid');
+      expect(await tasks.getTask(TEST_UID, pid, createdTask.result.task.id)).toMatchObject({ origin_cid: 'c1' });
       expect((await call('todo_tasks', { action: 'create', content: 'Wrong scope', project: 'other' })).ok).toBe(false);
-      expect((await call('memory.agent', { action: 'remove', target: 'project', old_text: 'Corrected decision.' })).result.ok).toBe(true);
+      expect((await call('memory.agent', { action: 'remove', target: 'project', old_text: 'Updated decision.' })).result.ok).toBe(true);
+      expect((await call('memory.agent', { action: 'remove', target: 'project', old_text: 'Second decision.' })).result.ok).toBe(true);
       expect(memory.listEntries(TEST_UID, { project: pid }).entries).toEqual([]);
     } finally { await bridge.close(); }
   });
@@ -1773,7 +1807,7 @@ describe('local_agents/bridge › current conversation history', () => {
         id: 40,
         token: bridge.token,
         method: 'chat_history',
-        params: { action: 'read', scope: 'current', page: { mode: 'latest', count: 20 } },
+        params: { action: 'read', scope: 'current', read: { page: { mode: 'latest', count: 20 } } },
       });
       expect((read.reply as any).ok).toBe(true);
       const text = (read.reply as any).result.text;
@@ -1788,19 +1822,21 @@ describe('local_agents/bridge › current conversation history', () => {
         id: 41,
         token: bridge.token,
         method: 'chat_history',
-        params: { action: 'read', scope: 'current', page: { mode: 'before', index: 1, count: 20 } },
+        params: { action: 'read', scope: 'current', read: { page: { mode: 'before', index: 1, count: 20 } } },
       });
       expect((paged.reply as any).ok).toBe(true);
       expect((paged.reply as any).result.text).toContain('PUBLIC_PRIOR_CONTEXT');
 
-      const denied = await rpcOnce(bridge.socketPath, {
-        id: 42,
-        token: bridge.token,
-        method: 'chat_history',
-        params: { action: 'read', scope: 'all', cid: 'c1' },
-      });
-      expect((denied.reply as any).ok).toBe(false);
-      expect((denied.reply as any).error).toContain('not allowed for this agent');
+      // Host-bound to this chat: a wider scope or a chosen cid reads nothing.
+      for (const [id, params, expected] of [
+        [42, { action: 'read', scope: 'all', read: { page: { mode: 'latest', count: 20 } } }, { code: 'invalid_arguments', invalid_fields: ['scope'] }],
+        [43, { action: 'read', scope: 'all', cid: 'c1' }, { code: 'unsupported_fields' }],
+      ] as const) {
+        const denied = await rpcOnce(bridge.socketPath, { id, token: bridge.token, method: 'chat_history', params });
+        expect((denied.reply as any).ok).toBe(false);
+        expect(JSON.parse((denied.reply as any).error)).toMatchObject(expected);
+        expect((denied.reply as any).error).not.toContain('PUBLIC_PRIOR_CONTEXT');
+      }
     } finally {
       await bridge.close();
     }

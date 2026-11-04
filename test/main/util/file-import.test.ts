@@ -281,3 +281,111 @@ it('preserves a replacement destination root when partial-directory cleanup obse
   expect(fs.readFileSync(path.join(target, 'winner.md'), 'utf8')).toBe('Replacement root winner');
   expect(fs.readFileSync(path.join(source, 'note.md'), 'utf8')).toBe('Original source');
 });
+
+// Move safety needs a revision of every descendant, not just the root folder.
+describe('Library move source revision', () => {
+  it.each(['async', 'sync'] as const)('%s capture recognizes an unchanged entry and rejects saved child changes and new children', async (mode) => {
+    const { captureLocalEntryRevision, captureLocalEntryRevisionSync, localEntryRevisionMatches } = await import('../../../src/main/util/file-import');
+    const capture = mode === 'sync' ? captureLocalEntryRevisionSync : captureLocalEntryRevision;
+    const source = path.join(root, 'folder');
+    fs.mkdirSync(path.join(source, 'nested'), { recursive: true });
+    fs.writeFileSync(path.join(source, 'nested', 'notes.md'), 'Original');
+    const snapshot = await capture(source);
+    expect(snapshot).toBeDefined();
+    expect(localEntryRevisionMatches(snapshot)).toBe(true);
+    expect(localEntryRevisionMatches(snapshot, performance.now() - 1)).toBe(false);
+    fs.writeFileSync(path.join(source, 'nested', 'notes.md'), 'Modified');
+    expect(localEntryRevisionMatches(snapshot)).toBe(false);
+    const next = await capture(source);
+    fs.writeFileSync(path.join(source, 'nested', 'added.md'), 'New child');
+    expect(localEntryRevisionMatches(next)).toBe(false);
+  });
+
+  it.each(['async', 'sync'] as const)('%s capture rejects replaced, missing, symbolic-link and unavailable evidence', async (mode) => {
+    const { captureLocalEntryRevision, captureLocalEntryRevisionSync, localEntryRevisionMatches } = await import('../../../src/main/util/file-import');
+    const capture = mode === 'sync' ? captureLocalEntryRevisionSync : captureLocalEntryRevision;
+    const source = path.join(root, 'source.md');
+    fs.writeFileSync(source, 'Same length');
+    const before = await capture(source);
+    fs.writeFileSync(path.join(root, 'replacement.md'), 'Same length');
+    fs.renameSync(path.join(root, 'replacement.md'), source);
+    expect(localEntryRevisionMatches(before)).toBe(false);
+    const next = await capture(source);
+    fs.unlinkSync(source);
+    expect(localEntryRevisionMatches(next)).toBe(false);
+    expect(localEntryRevisionMatches(undefined)).toBe(false);
+    expect(await capture(source)).toBeUndefined();
+    const directory = path.join(root, 'linked-directory');
+    fs.mkdirSync(directory);
+    fs.symlinkSync(directory, path.join(root, 'link'), process.platform === 'win32' ? 'junction' : 'dir');
+    expect(await capture(path.join(root, 'link'))).toBeUndefined();
+  });
+
+  it.each([
+    { children: 9998, capturedEntries: 9999 },
+    { children: 9999, capturedEntries: 10000 },
+    { children: 10000, capturedEntries: undefined },
+  ])('bounds revision evidence at 10000 entries with $children children without removing sources', async ({ children, capturedEntries }) => {
+    const { captureLocalEntryRevision, captureLocalEntryRevisionSync } = await import('../../../src/main/util/file-import');
+    const nodeFs = (await import('node:fs')).default;
+    const nodeFsp = (await import('node:fs/promises')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const source = path.join(root, 'many');
+    fs.mkdirSync(source);
+    const retained = path.join(source, 'retained.md');
+    fs.writeFileSync(retained, 'Retained');
+    const directoryStat = fs.lstatSync(source, { bigint: true });
+    const fileStat = fs.lstatSync(retained, { bigint: true });
+    // Model the metadata population, not thousands of native files whose
+    // Windows deletion can exceed the hook deadline. Adjacent cases retain
+    // real filesystem revision/replacement evidence. Freeze only this clock
+    // so a time-budget refusal cannot impersonate the entry-budget oracle.
+    const names = Array.from({ length: children }, (_, index) => index === 0 ? 'retained.md' : `${index}.md`);
+    let reads = 0;
+    const metadata = (file: fs.PathLike) => {
+      reads++;
+      if (String(file) !== source && path.dirname(String(file)) !== source) throw new Error('Unexpected revision fixture path');
+      return String(file) === source ? directoryStat : fileStat;
+    };
+    let asyncClosed = 0;
+    let syncClosed = 0;
+    const spies = [
+      vi.spyOn(nodeFs, 'lstatSync').mockImplementation(metadata as typeof nodeFs.lstatSync),
+      vi.spyOn(nodeFsp, 'lstat').mockImplementation(async file => metadata(file)),
+      vi.spyOn(nodeFsp, 'opendir').mockImplementation(async () => ({
+        async *[Symbol.asyncIterator]() {
+          try { for (const name of names) yield { name }; }
+          finally { asyncClosed++; }
+        },
+      }) as unknown as fs.Dir),
+      vi.spyOn(nodeFs, 'opendirSync').mockImplementation(() => {
+        let index = 0;
+        return {
+          readSync: () => index < names.length ? { name: names[index++] } : null,
+          closeSync: () => { syncClosed++; },
+        } as unknown as fs.Dir;
+      }),
+      vi.spyOn(performance, 'now').mockReturnValue(0),
+    ];
+    syncBuiltinESMExports();
+    try {
+      for (const capture of [captureLocalEntryRevision, captureLocalEntryRevisionSync]) {
+        reads = 0;
+        const revision = await capture(source);
+        if (capturedEntries === undefined) expect(revision).toBeUndefined();
+        else {
+          expect(revision?.entries).toHaveLength(capturedEntries);
+          expect(new Set(revision?.entries.map(entry => entry.relative)).size).toBe(capturedEntries);
+        }
+        expect(reads).toBe(capturedEntries ?? 10000);
+      }
+      expect(asyncClosed).toBe(1);
+      expect(syncClosed).toBe(1);
+    } finally {
+      for (const spy of spies.reverse()) spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+    expect(fs.readdirSync(source)).toEqual(['retained.md']);
+    expect(fs.readFileSync(retained, 'utf8')).toBe('Retained');
+  }, 15000);
+});

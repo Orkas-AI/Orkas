@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 
 import * as paths from '../../../src/main/paths';
@@ -115,5 +117,24 @@ describe('listCloudSessionToolResultsDirs', () => {
 
   it('returns empty for a user with no cloud layout', () => {
     expect(listCloudSessionToolResultsDirs('layout-tool-results-none')).toEqual([]);
+  });
+});
+
+describe('exit protection discovery', () => {
+  it('distinguishes unavailable automation roots from a genuinely empty installation', async () => {
+    const layout = await import('../../../src/main/util/project-layout');
+    const uid = 'layout-exit-protection'; createdUsers.push(uid);
+    expect(layout.listAutoTaskLocations(uid, true)).toEqual([]);
+    const root = paths.userAutoTasksDir(uid);
+    const original = fs.readdirSync;
+    const blocked = vi.spyOn(nativeFs, 'readdirSync').mockImplementation(((file: any, ...args: any[]) => {
+      if (String(file) === root) throw Object.assign(new Error('controlled denial'), { code: 'EACCES' });
+      return (original as any)(file, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      expect(() => layout.listAutoTaskLocations(uid, true)).toThrow('controlled denial');
+      expect(layout.listAutoTaskLocations(uid)).toEqual([]);
+    } finally { blocked.mockRestore(); syncBuiltinESMExports(); }
   });
 });

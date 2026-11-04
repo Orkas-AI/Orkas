@@ -135,7 +135,7 @@
   "errors.model_currently_unavailable": "Dieses Modell ist derzeit nicht verfügbar",
   "errors.model_config_unavailable": "Ein Modell ist konfiguriert, aber seine Zugangsdaten sind derzeit nicht verwendbar. Prüfen Sie API-Schlüssel, Anmeldestatus oder Ausweichmodell in den Einstellungen.",
   "errors.model_oauth_expired": "Die Autorisierung für {provider} ist abgelaufen. Autorisieren Sie dieses Konto erneut in den Einstellungen oder wechseln Sie zu einem Ausweichmodell.",
-  "errors.model_credits_insufficient": "Nicht genügend Credits. Fügen Sie Credits hinzu oder wechseln Sie in den Einstellungen zu einem verfügbaren Modell.",
+  "errors.model_credits_insufficient": "Nicht genügend Credits, daher wurde die Aufgabe angehalten. Fügen Sie Credits hinzu, kehren Sie dann zu dieser Aufgabe zurück und schreiben Sie „Fortfahren“, um dort weiterzumachen. Sie können auch in den Einstellungen zu einem verfügbaren Modell wechseln.",
   "errors.custom_endpoint_suspect": "Ihr benutzerdefinierter Modellendpunkt ist bei mehreren Anfragen in Folge fehlgeschlagen (HTTP {status}); er ist möglicherweise nicht mehr verfügbar oder wurde verschoben. Prüfen Sie API-URL und Schlüssel unter Einstellungen → Modelle oder wechseln Sie zu einem anderen Modell, um fortzufahren.",
   "errors.model_output_cap_repeated": "Dieses Modell hat mehrfach in Folge sein Ausgabelimit pro Antwort erreicht; es ist möglicherweise zu niedrig für diese Aufgabe. Wählen Sie in den Einstellungen ein Modell mit höherem Ausgabelimit oder teilen Sie die Aufgabe auf.",
   "errors.model_provider_balance_insufficient": "Das Guthaben Ihres konfigurierten Modellanbieterkontos ist aufgebraucht (dies betrifft keine Orkas-Credits). Laden Sie beim Anbieter Guthaben auf oder wechseln Sie das Modell in den Einstellungen.",
@@ -361,5 +361,11 @@
   "notification.automation.failed.title": "Automatisierungslauf fehlgeschlagen",
   "notification.automation.failed.title_many": "{count} Automatisierungsläufe fehlgeschlagen",
   "notification.automation.waiting_input.title": "Ein Automatisierungslauf wartet auf Ihre Antwort",
-  "notification.automation.waiting_input.title_many": "{count} Automatisierungsläufe warten auf Ihre Antwort"
+  "notification.automation.waiting_input.title_many": "{count} Automatisierungsläufe warten auf Ihre Antwort",
+  "errors.model_rate_limited_all_configured": "Alle konfigurierten Modelle sind gerade ratenbegrenzt. Die Begrenzung endet meist nach ein bis zwei Minuten; versuchen Sie es dann erneut.",
+  "errors.model_request_rejected_repeated": "Diese Anfrage wurde wiederholt abgelehnt; ein unveränderter erneuter Versuch ändert nichts am Ergebnis. Wechseln Sie in den Einstellungen zu einem anderen Modell und versuchen Sie es erneut, oder entfernen Sie Bilder bzw. Anhänge und senden Sie erneut.",
+  "errors.provider_reply_detail": "Antwort des Anbieters: {detail}",
+  "cli_agent.repeated_failure_hint": "„{name}“ ist erneut fehlgeschlagen. Sie können stattdessen @Commander bitten, diese Aufgabe zu übernehmen.",
+  "desktop.open": "Öffnen",
+  "desktop.exit": "Beenden"
 }

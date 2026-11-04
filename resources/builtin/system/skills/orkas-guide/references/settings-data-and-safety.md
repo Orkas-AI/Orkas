@@ -17,7 +17,7 @@ Credits can be used directly by eligible official Orkas services, including task
 
 Balances, included amounts, reset timing, prices, and available actions can change by account and over time. Treat the current Account card and the message shown at the blocked feature as the source of truth.
 ## Membership (commercial edition only)
-Membership can affect whether an account may use some hosted features. Give the user a path to their own current status instead of listing plans or promising a particular entitlement.
+Membership can affect whether an account may use some hosted features. Give the user a path to their own current status instead of listing plans or promising a particular entitlement. After returning from a purchase, **Account settings > Account** shows its confirmation. If unconfirmed or paid benefits are still updating, choose **Refresh status** to check the same purchase without another payment. Unconfirmed alone does not mean payment failed.
 
 1. Open the sidebar account menu and choose **Plan** for the Account area or **Upgrade** for the Web subscription area. **Account settings** also shows unresolved renewal notices.
 2. Review the displayed status or notice, then use the action shown there to manage, resume, renew, or start membership.

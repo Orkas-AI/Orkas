@@ -1,3 +1,4 @@
+import { INTERACTIVE_MAIN_GAP_LIMIT_MS } from '../../../helpers/latency-budget';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -83,7 +84,8 @@ it('immediately searches the full tool-output tail while live indexing leaves th
   const cpu = process.cpuUsage(cpuStart);
   const maxGap = Math.max(...gaps);
   expect(gaps.length).toBeGreaterThan(5);
-  expect(maxGap).toBeLessThan(150);
+  expect(maxGap).toBeLessThan(INTERACTIVE_MAIN_GAP_LIMIT_MS);
+  expect(controlGap, 'the synchronous control must exceed the platform ceiling').toBeGreaterThanOrEqual(INTERACTIVE_MAIN_GAP_LIMIT_MS);
   expect(maxGap).toBeLessThan(controlGap / 2);
   expect(store.postingsFor(uid, 'word099999')).toHaveLength(1);
   expect(store.postingsFor(uid, 'privatethoughtmarker')).toHaveLength(0);
@@ -110,6 +112,138 @@ it('accepts a queued append prefix, advances over empty rows, and isolates accou
   expect((await ix.reconcileChatsIndex(uid)).updated, 'contiguous live writes need no history rebuild').toBe(0);
   expect((await search.searchChatsWithStatus(uid, 'lastmarker')).results).toHaveLength(1);
   expect((await search.searchChatsWithStatus('other-account', 'lastmarker')).results).toHaveLength(0);
+});
+
+it('keeps available preview matches usable during a held live write and completes fresh history for ordinary readers', async () => {
+  const warm = await append('preview', { text: 'availablemarker' });
+  await ix.indexChatMessage(uid, 'preview', warm.msgIndex, warm.source!);
+  // The desktop has already loaded chat/catalog modules before the user can
+  // type. Keep cold test-module compilation outside the held-write oracle.
+  await search.searchChatsWithStatus(uid, 'availablemarker');
+  const { ChatRebuildWorker } = await import('../../../../src/main/features/search/chat-rebuild');
+  const original = ChatRebuildWorker.prototype.indexMessage;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const writer = vi.spyOn(ChatRebuildWorker.prototype, 'indexMessage').mockImplementation(async function(command) {
+    await gate;
+    return original.call(this, command);
+  });
+  const added = await append('preview', { text: 'freshmarker' });
+  const write = ix.indexChatMessage(uid, 'preview', added.msgIndex, added.source!);
+  let finished = false;
+  const preview = search.searchChatsWithStatus(uid, 'availablemarker', { includeSnippets: false })
+    .then(page => { finished = true; return page; });
+  try {
+    await vi.waitFor(() => expect(writer).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(finished, 'Preview cannot wait behind a live indexing transaction').toBe(true));
+    expect(await preview).toMatchObject({ indexComplete: false, snippetsPending: true,
+      results: [expect.objectContaining({ cid: 'preview', msg_index: 0 })] });
+    expect(await search.searchChatsWithStatus(uid, 'freshmarker', { includeSnippets: false }))
+      .toMatchObject({ indexComplete: false, snippetsPending: true, results: [] });
+  } finally { release(); await write; await preview; }
+  expect(await search.searchChatsWithStatus(uid, 'freshmarker'))
+    .toMatchObject({ indexComplete: true, results: [expect.objectContaining({ cid: 'preview', msg_index: 1, snippet: 'freshmarker' })] });
+});
+
+// The desktop's first page stays quiet behind a live write. A message the user
+// just sent must not settle as "no results" and stay that way until they resubmit.
+it('keeps chats pending behind a held live write and publishes the fresh match once it settles', async () => {
+  const warm = await append('streamed', { text: 'availablemarker' });
+  await ix.indexChatMessage(uid, 'streamed', warm.msgIndex, warm.source!);
+  await search.searchChatsWithStatus(uid, 'availablemarker');
+  search.__searchTestHooks.setLibraryContentSearchProvider({ hasSources: async () => false,
+    embedQuery: async () => [1], searchGlobal: () => [], listProjects: async () => [], searchProject: () => [] });
+  const { ChatRebuildWorker } = await import('../../../../src/main/features/search/chat-rebuild');
+  const original = ChatRebuildWorker.prototype.indexMessage;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const writer = vi.spyOn(ChatRebuildWorker.prototype, 'indexMessage').mockImplementation(async function(command) {
+    await gate;
+    return original.call(this, command);
+  });
+  const added = await append('streamed', { text: 'freshmarker availablemarker' });
+  const write = ix.indexChatMessage(uid, 'streamed', added.msgIndex, added.source!);
+  const scoring = vi.spyOn(store, 'postingsWithLen');
+  const pages: any[] = [];
+  const read = (async () => {
+    for await (const page of search.streamSearch(uid, 'freshmarker', { limit: 200, chatSnippetRefs: [] })) pages.push(page);
+  })();
+  try {
+    await vi.waitFor(() => expect(writer).toHaveBeenCalledOnce());
+    // Other modules settle behind the same write; only chat may still be open.
+    await vi.waitFor(() => expect(pages.at(-1)?.pending_kinds).toEqual(['chat']), { timeout: 5_000 });
+    expect(pages.at(-1)).toMatchObject({ results: [], failed_kinds: [], chat_index_complete: false });
+  } finally { release(); await write; await read; }
+  expect(pages.at(-1)).toMatchObject({ pending_kinds: [], failed_kinds: [], chat_index_complete: true,
+    results: [expect.objectContaining({ kind: 'chat', cid: 'streamed', msg_index: 1 })] });
+  // One preview before the write settled and one after: never a retry loop.
+  expect(scoring).toHaveBeenCalledTimes(2);
+});
+
+it('re-reads at most once for each submit when another live write queues behind the first', async () => {
+  const warm = await append('bounded', { text: 'warmmarker' });
+  await ix.indexChatMessage(uid, 'bounded', warm.msgIndex, warm.source!);
+  await search.searchChatsWithStatus(uid, 'warmmarker');
+  const { ChatRebuildWorker } = await import('../../../../src/main/features/search/chat-rebuild');
+  const original = ChatRebuildWorker.prototype.indexMessage;
+  const gates: Array<() => void> = [];
+  const writer = vi.spyOn(ChatRebuildWorker.prototype, 'indexMessage').mockImplementation(async function(command) {
+    await new Promise<void>(resolve => { gates.push(resolve); });
+    return original.call(this, command);
+  });
+  const first = await append('bounded', { text: 'firstqueuedmarker' });
+  const firstWrite = ix.indexChatMessage(uid, 'bounded', first.msgIndex, first.source!);
+  const scoring = vi.spyOn(store, 'postingsWithLen');
+  const pages: any[] = [];
+  const read = (async () => {
+    for await (const page of search.streamSearch(uid, 'firstqueuedmarker', { scope: 'chat', limit: 200, chatSnippetRefs: [] })) pages.push(page);
+  })();
+  let secondWrite: Promise<void> | undefined;
+  try {
+    await vi.waitFor(() => expect(writer).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(pages.at(-1)?.pending_kinds).toEqual(['chat']), { timeout: 5_000 });
+    const second = await append('bounded', { text: 'secondqueuedmarker' });
+    secondWrite = ix.indexChatMessage(uid, 'bounded', second.msgIndex, second.source!);
+    gates[0]();
+    await firstWrite;
+    await read;
+    expect(pages.at(-1)).toMatchObject({ pending_kinds: [], chat_index_complete: false,
+      results: [expect.objectContaining({ cid: 'bounded', msg_index: 1 })] });
+    expect(scoring).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(writer).toHaveBeenCalledTimes(2));
+  } finally {
+    // A failed oracle must not strand the writer behind afterEach's flush.
+    const releaseAll = setInterval(() => { for (const open of gates.splice(0)) open(); }, 5);
+    await Promise.all([firstWrite, secondWrite, read]);
+    clearInterval(releaseAll);
+  }
+});
+
+it('stops waiting on a held live write when the submit is cancelled', async () => {
+  const warm = await append('cancelled', { text: 'warmmarker' });
+  await ix.indexChatMessage(uid, 'cancelled', warm.msgIndex, warm.source!);
+  await search.searchChatsWithStatus(uid, 'warmmarker');
+  const { ChatRebuildWorker } = await import('../../../../src/main/features/search/chat-rebuild');
+  const original = ChatRebuildWorker.prototype.indexMessage;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  vi.spyOn(ChatRebuildWorker.prototype, 'indexMessage').mockImplementation(async function(command) {
+    await gate;
+    return original.call(this, command);
+  });
+  const added = await append('cancelled', { text: 'latermarker' });
+  const write = ix.indexChatMessage(uid, 'cancelled', added.msgIndex, added.source!);
+  const scoring = vi.spyOn(store, 'postingsWithLen');
+  const controller = new AbortController();
+  const iterator = search.streamSearch(uid, 'latermarker', { scope: 'chat', limit: 200, chatSnippetRefs: [] }, controller.signal);
+  try {
+    expect((await iterator.next()).value).toMatchObject({ pending_kinds: ['chat'], results: [] });
+    controller.abort();
+    expect((await iterator.next()).done, 'A cancelled stream does not wait behind the writer').toBe(true);
+  } finally { release(); await write; await iterator.return(undefined); }
+  // Let the module observe the settled write: cancelled work must not rank again.
+  await new Promise(resolve => setImmediate(resolve));
+  expect(scoring).toHaveBeenCalledTimes(1);
 });
 
 it.each(['replace', 'delete'] as const)('rejects a stale byte receipt after source %s and recovers from disk', async action => {
@@ -313,7 +447,7 @@ it.each(['terminate', 'invalidate-and-delete'] as const)('recovers from %s durin
       await run;
       await deletion;
     } finally { clearInterval(timer); }
-    expect(Math.max(0, ...gaps)).toBeLessThan(150);
+    expect(Math.max(0, ...gaps)).toBeLessThan(INTERACTIVE_MAIN_GAP_LIMIT_MS);
     expect(store.readFileWatermark(uid, 'active')).toBeUndefined();
     expect(store.readSourceStamp(uid)).toBeUndefined();
     expect(ix.isChatsIndexTrusted(uid)).toBe(false);

@@ -145,6 +145,7 @@ test('failed browser opening offers one retry link and cancellation without term
   await expect(card.locator('[data-icl-links] button')).toHaveCount(0);
   const result = await orkas.invoke<{ session: { status: string } }>('interactiveCli.read', { session_id: sessionId });
   expect(result.session.status).toBe('closed');
+  await orkas.acknowledgeInvokeFailures('connectors.open_local_cli_auth_url', 1);
 });
 
 test('authorization failure removes an existing browser retry panel', async ({ connectorOrkas: orkas }) => {
@@ -160,6 +161,7 @@ test('authorization failure removes an existing browser retry panel', async ({ c
   }).toBe('error');
   // A stale failure card used to disappear after seven seconds; that is still a visible bug.
   await expect(card).toHaveCount(0, { timeout: 1500 });
+  await orkas.acknowledgeInvokeFailures('connectors.open_local_cli_auth_url', 1);
 });
 
 for (const scenario of [

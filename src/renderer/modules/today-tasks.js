@@ -1,21 +1,18 @@
 /* Orkas Frontend — sidebar "Recent Tasks" (formerly "Today's Tasks")
  *
- * Aggregates every conversation with activity today or yesterday (local
- * calendar), whether it lives under a
- * Project or in the catch-all Tasks list, so running work and finished work
+ * Aggregates pinned conversations and those active in the last 24 hours,
+ * whether they live under a Project or in the catch-all Tasks list, so running work and finished work
  * that still needs a look sit in one place. The section is a mirror only:
  * rows reuse the shared conversation row renderer, click/menu handlers,
  * unread dots, and live-run badges, and the `conversations` cache remains the
  * single source of truth. Only the visible row limit belongs to this list;
  * opening a task from either copy clears both copies' attention cue.
  *
- * Day boundary: `selectRecentConversations` (conv-bucket.js) reads the same
- * activity timestamp and local-midnight rule as the "Today"/"Yesterday" bucket
- * headers, so a row is never "today" or "yesterday" in one list and absent
- * here. The date rollover re-render (conversation.js
- * `_refreshConversationBucketsForDateChange`) is the once-a-day check that drops
- * rows older than yesterday. Rows for collapsed projects reach the cache through
- * the startup slice's `active_since` filter (start of yesterday).
+ * `selectRecentConversations` (conv-bucket.js) uses the shared activity
+ * timestamp and a rolling cutoff for unpinned tasks. Normal refreshes,
+ * reopening this section, and the debounced foreground check update membership; there is no expiry
+ * timer. Rows for collapsed projects reach the cache through the startup
+ * slice's matching `active_since` filter and unconditional pin inclusion.
  *
  * DOM ids, the i18n keys and the section's collapse key keep their historical
  * `today` names; only the window and the label changed.
@@ -27,6 +24,15 @@
 
 const _RECENT_TASK_PAGE_SIZE = 10;
 let _recentTaskVisibleCount = _RECENT_TASK_PAGE_SIZE;
+let _recentTaskOldestActivityMs = Infinity;
+
+function refreshTodayTasksSectionForTimeChange(now) {
+  // Ordinary foreground returns need only one timestamp comparison. There is
+  // no timer or scan until a previously included row falls outside the window.
+  if (recentConversationsSince(now).getTime() <= _recentTaskOldestActivityMs) return;
+  renderTodayTasksSection();
+  _refreshAllConvBadges();
+}
 
 function _todayTaskRows(now) {
   const rows = typeof conversations !== 'undefined' && Array.isArray(conversations)
@@ -52,6 +58,8 @@ function renderTodayTasksSection() {
     return;
   }
   const rows = _todayTaskRows(new Date());
+  _recentTaskOldestActivityMs = rows.reduce((oldest, c) => c.pinned_at ? oldest : Math.min(oldest,
+    new Date(c.last_active_at || c.updated_at || c.created_at).getTime()), Infinity);
   if (!rows.length) {
     container.innerHTML = `<div class="conv-empty" data-i18n="sidebar.today_empty">${escapeHtml(t('sidebar.today_empty'))}</div>`;
     return;

@@ -6,7 +6,7 @@
  * `video_studio` tool.
  *
  * Multi-op (per the design decision that edit_video is one multi-sub-op tool):
- *   probe | trim | concat | burnsubs | overlay | extract_frame
+ *   probe | trim | concat | burnsubs | overlay | extract_frame | reframe | …
  * The tool layer owns path-sandbox validation; this backend trusts the
  * absolute paths it receives.
  *
@@ -84,7 +84,22 @@ const MIN_TRIM_OUTPUT_SEC = 0.1;
 const RUN_PROGRESS_HEARTBEAT_MS = 15_000;
 const RUN_PROGRESS_MIN_EMIT_MS = 2_000;
 
-export type EditOp = 'probe' | 'trim' | 'concat' | 'burnsubs' | 'overlay' | 'extract_frame' | 'loudness' | 'normalize_loudness' | 'mix' | 'trim_silence' | 'remove_fillers';
+export type EditOp = 'probe' | 'trim' | 'concat' | 'burnsubs' | 'overlay' | 'extract_frame' | 'loudness' | 'normalize_loudness' | 'mix' | 'trim_silence' | 'remove_fillers' | 'reframe';
+
+/** How `reframe` fits a source onto a canvas of another aspect ratio:
+ *  `pad` keeps every pixel on solid bars, `blur` fills the bars with a blurred
+ *  copy of the frame, `crop` fills the canvas and cuts the overflowing edges. */
+export type ReframeMode = 'pad' | 'crop' | 'blur';
+
+/** What a reframe changed, so the caller can report it and check the frame. */
+export interface ReframeReport {
+  mode: ReframeMode;
+  canvas: string;
+  from: string | null;
+  focus?: { x: number; y: number };
+  pad_color?: string;
+  note?: string;
+}
 
 /** ebur128 loudness measurement (video-craft §7 targets: ~-14 LUFS integrated,
  *  true-peak ≤ ~-1 dBTP). A field is null when the source is silent (ffmpeg
@@ -178,12 +193,127 @@ export interface EditParams {
    *  filler tokens to drop (default um/uh/...). */
   transcriptAbsPath?: string;
   fillers?: string[];
+  /** reframe: target aspect (`9:16`, `1:1`, `4:5`, `16:9`, any `W:H`) or an
+   *  explicit canvas (both width and height, which win over aspect); how to
+   *  fit (default pad); crop focus 0..1 per axis (default centre); bar colour. */
+  aspect?: string;
+  width?: number;
+  height?: number;
+  mode?: ReframeMode;
+  focusX?: number;
+  focusY?: number;
+  padColor?: string;
   signal?: AbortSignal;
 }
 
 export type EditResult =
-  | { ok: true; op: EditOp; path?: string; bytes?: number; probe?: unknown; loudness?: LoudnessResult; coverage?: CoverageReport; decision?: DecisionEvidence }
+  | { ok: true; op: EditOp; path?: string; bytes?: number; probe?: unknown; loudness?: LoudnessResult; coverage?: CoverageReport; decision?: DecisionEvidence; reframe?: ReframeReport }
   | { ok: false; errorCode: string; message: string };
+
+/** Platform-standard canvases for the aspect ratios people post at. A known
+ *  ratio always lands on the same size, so a batch of reframes matches: the
+ *  2026-10-26 live runs that hand-wrote the command picked 1152x2048 and
+ *  1440x2560 for the same 9:16 request. Any other ratio keeps a 1920 long side. */
+const REFRAME_STANDARD_CANVASES: ReadonlyArray<{ width: number; height: number }> = [
+  { width: 1080, height: 1920 }, // 9:16
+  { width: 1920, height: 1080 }, // 16:9
+  { width: 1080, height: 1080 }, // 1:1
+  { width: 1080, height: 1350 }, // 4:5
+  { width: 1080, height: 1440 }, // 3:4
+  { width: 1440, height: 1080 }, // 4:3
+];
+const REFRAME_LONG_SIDE = 1920;
+const REFRAME_MIN_SIDE = 16;
+const REFRAME_MAX_SIDE = 7680;
+
+function evenFloor(n: number): number {
+  return Math.floor(n / 2) * 2;
+}
+
+/** Resolve the reframe canvas from an explicit size or an aspect ratio.
+ *  Sides are rounded down to even numbers (yuv420p H.264 needs them).
+ *  Pure → unit-tested. */
+export function reframeCanvas(opts: { aspect?: string; width?: number; height?: number }):
+  { ok: true; width: number; height: number } | { ok: false; message: string } {
+  const w = finiteNum(opts.width);
+  const h = finiteNum(opts.height);
+  const inRange = (width: number, height: number) => (
+    width >= REFRAME_MIN_SIDE && height >= REFRAME_MIN_SIDE && width <= REFRAME_MAX_SIDE && height <= REFRAME_MAX_SIDE
+  );
+  if (w !== undefined || h !== undefined) {
+    if (w === undefined || h === undefined) {
+      return { ok: false, message: 'reframe needs both width and height, or an aspect such as 9:16.' };
+    }
+    const width = evenFloor(w);
+    const height = evenFloor(h);
+    if (!inRange(width, height)) {
+      return { ok: false, message: `reframe canvas must be ${REFRAME_MIN_SIDE}-${REFRAME_MAX_SIDE}px per side; got ${w}x${h}.` };
+    }
+    return { ok: true, width, height };
+  }
+  const raw = String(opts.aspect ?? '').trim();
+  const m = raw.match(/^(\d+(?:\.\d+)?)\s*[:x×/]\s*(\d+(?:\.\d+)?)$/i);
+  const aw = m ? Number(m[1]) : NaN;
+  const ah = m ? Number(m[2]) : NaN;
+  if (!(aw > 0) || !(ah > 0)) {
+    return { ok: false, message: `reframe needs an aspect such as 9:16, 1:1, 4:5 or 16:9, or both width and height; got ${raw || 'none'}.` };
+  }
+  const ratio = aw / ah;
+  const standard = REFRAME_STANDARD_CANVASES.find((c) => Math.abs(c.width / c.height - ratio) < 1e-6);
+  if (standard) return { ok: true, width: standard.width, height: standard.height };
+  const width = ratio >= 1 ? REFRAME_LONG_SIDE : evenFloor(REFRAME_LONG_SIDE * ratio);
+  const height = ratio >= 1 ? evenFloor(REFRAME_LONG_SIDE / ratio) : REFRAME_LONG_SIDE;
+  if (!inRange(width, height)) {
+    return { ok: false, message: `aspect ${raw} is too extreme for a ${REFRAME_LONG_SIDE}px long side.` };
+  }
+  return { ok: true, width, height };
+}
+
+/** Normalise a bar colour to an ffmpeg colour token, or null when it is not a
+ *  plain name or 6-digit hex (the value goes into a filter graph). */
+export function reframePadColor(raw: string | undefined): string | null {
+  const value = String(raw ?? 'black').trim();
+  const hex = value.match(/^(?:#|0x)?([0-9a-f]{6})$/i);
+  if (hex) return `0x${hex[1].toLowerCase()}`;
+  return /^[a-z]{3,20}$/i.test(value) ? value.toLowerCase() : null;
+}
+
+/** The ffmpeg filter for a reframe. Every chain first squares the pixels
+ *  (anamorphic sources would otherwise come out stretched) and ends on
+ *  square-pixel yuv420p so the result plays on every platform. `blur` needs a
+ *  filter_complex whose output is `[rfv]`. Pure → unit-tested. */
+export function buildReframeFilter(opts: {
+  mode: ReframeMode;
+  width: number;
+  height: number;
+  focusX?: number;
+  focusY?: number;
+  padColor?: string;
+}): { filter: string; complex: boolean } {
+  const W = opts.width;
+  const H = opts.height;
+  const squarePixels = 'scale=trunc(iw*sar/2)*2:ih,setsar=1';
+  const tail = 'setsar=1,format=yuv420p';
+  const fit = `scale=${W}:${H}:force_original_aspect_ratio=decrease:force_divisible_by=2`;
+  const fill = `scale=${W}:${H}:force_original_aspect_ratio=increase`;
+  if (opts.mode === 'crop') {
+    const fx = clamp(finiteNum(opts.focusX) ?? 0.5, 0, 1);
+    const fy = clamp(finiteNum(opts.focusY) ?? 0.5, 0, 1);
+    return { complex: false, filter: `${squarePixels},${fill},crop=${W}:${H}:(iw-ow)*${fx}:(ih-oh)*${fy},${tail}` };
+  }
+  if (opts.mode === 'blur') {
+    const radius = Math.max(2, Math.floor(Math.min(W, H) / 24));
+    return {
+      complex: true,
+      filter: `[0:v]${squarePixels},split=2[rfbg][rffg];`
+        + `[rfbg]${fill},crop=${W}:${H},boxblur=${radius}:2[rfback];`
+        + `[rffg]${fit}[rffront];`
+        + `[rfback][rffront]overlay=(W-w)/2:(H-h)/2,${tail}[rfv]`,
+    };
+  }
+  const color = reframePadColor(opts.padColor) ?? 'black';
+  return { complex: false, filter: `${squarePixels},${fit},pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=${color},${tail}` };
+}
 
 /** Parse the `[Parsed_ebur128_…] Summary:` block ffmpeg prints to stderr.
  *  `-inf` (silent source) maps to null. Returns null when no summary block is
@@ -814,6 +944,50 @@ async function conformConcatInput(
   ], signal);
 }
 
+export type ConcatAudioConformReport = {
+  applied: true;
+  padded_inputs: string[];
+  note: string;
+};
+
+type ConcatAudioSpec = { sampleRate: number; channels: number };
+
+/** Sample rate and channel count of an input's first audio stream, or null
+ *  when it has none. */
+async function probeConcatAudioSpec(
+  ffprobe: string,
+  input: string,
+  signal?: AbortSignal,
+): Promise<ConcatAudioSpec | null> {
+  const r = await run(ffprobe, [
+    '-v', 'error', '-select_streams', 'a:0',
+    '-show_entries', 'stream=sample_rate,channels', '-of', 'json', input,
+  ], signal);
+  try {
+    const a = ((JSON.parse(r.stdout) as { streams?: Array<{ sample_rate?: string; channels?: number }> }).streams ?? [])[0];
+    const sampleRate = Number(a?.sample_rate);
+    const channels = Number(a?.channels);
+    if (!a || !Number.isFinite(sampleRate) || sampleRate <= 0) return null;
+    return { sampleRate, channels: Number.isFinite(channels) && channels > 0 ? channels : 2 };
+  } catch { return null; }
+}
+
+/** Give a silent input a silent track in the other inputs' format, leaving
+ *  its video untouched, so the join keeps their sound. */
+async function addConcatSilence(
+  bins: { ffmpeg: string },
+  input: string,
+  audio: ConcatAudioSpec,
+  outPath: string,
+  signal?: AbortSignal,
+): Promise<{ code: number; stderr: string }> {
+  const layout = audio.channels === 1 ? 'mono' : 'stereo';
+  return run(bins.ffmpeg, [
+    '-y', '-i', input, '-f', 'lavfi', '-i', `anullsrc=channel_layout=${layout}:sample_rate=${audio.sampleRate}`,
+    '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-shortest', '-movflags', '+faststart', outPath,
+  ], signal);
+}
+
 async function probeVideoStream(
   ffprobe: string,
   input: string,
@@ -829,6 +1003,35 @@ async function probeVideoStream(
     if (!v || !Number.isFinite(v.width) || !Number.isFinite(v.height)) return null;
     const pixFmt = String(v.pix_fmt || '');
     return { width: Number(v.width), height: Number(v.height), pixFmt, hasAlpha: ALPHA_PIX_FMT_RE.test(pixFmt) };
+  } catch { return null; }
+}
+
+/** The size the first video stream is shown at. A phone clip stores a
+ *  portrait shot as landscape pixels plus a 90° rotation that ffmpeg applies
+ *  while decoding, so the raw width/height alone would report it backwards. */
+async function probeDisplaySize(
+  ffprobe: string,
+  input: string,
+  signal?: AbortSignal,
+): Promise<{ width: number; height: number } | null> {
+  const r = await run(ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-show_streams', '-of', 'json', input], signal);
+  try {
+    const j = JSON.parse(r.stdout) as {
+      streams?: Array<{
+        width?: number;
+        height?: number;
+        tags?: { rotate?: string };
+        side_data_list?: Array<{ rotation?: number }>;
+      }>;
+    };
+    const v = (j.streams ?? [])[0];
+    if (!v || !Number.isFinite(v.width) || !Number.isFinite(v.height)) return null;
+    const sideRotation = (v.side_data_list ?? []).map((s) => Number(s.rotation)).find((n) => Number.isFinite(n));
+    const rotation = sideRotation ?? (Number(v.tags?.rotate) || 0);
+    const quarterTurn = Math.abs(Math.round(rotation / 90)) % 2 === 1;
+    return quarterTurn
+      ? { width: Number(v.height), height: Number(v.width) }
+      : { width: Number(v.width), height: Number(v.height) };
   } catch { return null; }
 }
 
@@ -1120,6 +1323,33 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
         };
       }
 
+      // The demuxer takes its streams from the first input too. A silent title
+      // card first joined to narrated cuts dropped the whole video's sound, and
+      // one in the middle ended it early (2026-10-31 runs). Give each silent
+      // input silence in the others' format; an all-silent join stays silent.
+      const audioSpecs = await mapWithConcurrencyLimit(joinInputs, MIX_COVERAGE_CONCURRENCY, (input) =>
+        probeConcatAudioSpec(bins.ffprobe, input, p.signal));
+      const audioReference = audioSpecs.find((spec): spec is ConcatAudioSpec => !!spec);
+      let audioConform: ConcatAudioConformReport | undefined;
+      if (audioReference && audioSpecs.some((spec) => !spec)) {
+        joinInputs = [...joinInputs];
+        const padded_inputs: string[] = [];
+        for (let i = 0; i < joinInputs.length; i += 1) {
+          if (audioSpecs[i]) continue;
+          const paddedPath = path.join(os.tmpdir(), `orkas-silence-${randomUUID()}.mp4`);
+          scratch.push(paddedPath);
+          const ar = await addConcatSilence(bins, joinInputs[i], audioReference, paddedPath, p.signal);
+          if (ar.code !== 0) return ffmpegFailure('concat', ar, p.outputAbsPath);
+          padded_inputs.push(inputs[i]);
+          joinInputs[i] = paddedPath;
+        }
+        audioConform = {
+          applied: true,
+          padded_inputs,
+          note: 'Inputs without an audio track were given silence so the joined video keeps the sound of the others.',
+        };
+      }
+
       const listBody = joinInputs.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n');
       await fs.writeFile(listPath, listBody, 'utf8');
       const r = await run(bins.ffmpeg, withFfmpegProgress([
@@ -1150,6 +1380,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
         path: p.outputAbsPath,
         bytes: await statSize(p.outputAbsPath),
         ...(conform ? { conform } : {}),
+        ...(audioConform ? { audio_conform: audioConform } : {}),
       };
     } finally {
       await fs.rm(listPath, { force: true }).catch(() => {});
@@ -1205,6 +1436,75 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     ]), p.signal, { op: 'overlay', phase: 'edit', durationSec });
     if (r.code !== 0) return ffmpegFailure('overlay', r, p.outputAbsPath);
     return { ok: true, op: 'overlay', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath) };
+  }
+
+  if (p.op === 'reframe') {
+    if (!p.inputAbsPath) return fail('E_EDIT_ARG', 'reframe requires input_path');
+    // A reframe is a new deliverable. Encoding over the source would destroy
+    // the user's only copy the moment ffmpeg truncates it.
+    if (path.resolve(p.outputAbsPath) === path.resolve(p.inputAbsPath)) {
+      return fail('E_EDIT_ARG', 'reframe must write a new output file, not over its input.');
+    }
+    const canvas = reframeCanvas({ aspect: p.aspect, width: p.width, height: p.height });
+    if (canvas.ok === false) return fail('E_EDIT_ARG', canvas.message);
+    const mode: ReframeMode = p.mode ?? 'pad';
+    if (mode !== 'pad' && mode !== 'crop' && mode !== 'blur') {
+      return fail('E_EDIT_ARG', `reframe mode must be pad, crop or blur; got ${String(mode)}`);
+    }
+    const padColor = mode === 'pad' ? reframePadColor(p.padColor) : null;
+    if (mode === 'pad' && !padColor) {
+      return fail('E_EDIT_ARG', `reframe pad color must be a colour name or 6-digit hex; got ${String(p.padColor)}`);
+    }
+    const source = await probeDisplaySize(bins.ffprobe, p.inputAbsPath, p.signal);
+    if (!source) return fail('E_EDIT_NO_VIDEO', 'reframe needs an input with a readable video stream.');
+    const { width, height } = canvas;
+    const built = buildReframeFilter({
+      mode, width, height, focusX: p.focusX, focusY: p.focusY, ...(padColor ? { padColor } : {}),
+    });
+    const durationSec = await probeDurationSec(bins.ffprobe, p.inputAbsPath, p.signal);
+    const r = await run(bins.ffmpeg, withFfmpegProgress([
+      '-y', '-i', p.inputAbsPath,
+      ...(built.complex ? ['-filter_complex', built.filter, '-map', '[rfv]'] : ['-map', '0:v:0', '-vf', built.filter]),
+      '-map', '0:a:0?',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18',
+      '-c:a', 'aac', '-movflags', '+faststart', p.outputAbsPath,
+    ]), p.signal, { op: 'reframe', phase: 'edit', durationSec });
+    if (r.code !== 0) return ffmpegFailure('reframe', r, p.outputAbsPath);
+    // The canvas is the point of the op, and a timeline that gained or lost
+    // time against its source is corrupt however it happened — check the file
+    // that was written, not the command that was run (same rule as concat).
+    const written = await probeVideoStream(bins.ffprobe, p.outputAbsPath, p.signal);
+    if (!written || written.width !== width || written.height !== height) {
+      try { fsSync.unlinkSync(p.outputAbsPath); } catch { /* best effort */ }
+      return fail(
+        'E_EDIT_REFRAME_CANVAS',
+        `reframe wrote ${written ? `${written.width}x${written.height}` : 'no readable video'} instead of ${width}x${height}.`,
+      );
+    }
+    const writtenDurationSec = await probeDurationSec(bins.ffprobe, p.outputAbsPath, p.signal);
+    if (durationSec > 0 && writtenDurationSec > 0) {
+      const driftSec = Math.abs(writtenDurationSec - durationSec);
+      if (driftSec > Math.max(0.5, durationSec * 0.02)) {
+        try { fsSync.unlinkSync(p.outputAbsPath); } catch { /* best effort */ }
+        return fail(
+          'E_EDIT_REFRAME_DURATION_DRIFT',
+          `The reframed video is ${writtenDurationSec.toFixed(2)}s but its source is ${durationSec.toFixed(2)}s; the output was removed.`,
+        );
+      }
+    }
+    const reframe: ReframeReport = {
+      mode,
+      canvas: `${width}x${height}`,
+      from: `${source.width}x${source.height}`,
+      ...(padColor ? { pad_color: padColor } : {}),
+      ...(mode === 'crop'
+        ? {
+            focus: { x: clamp(finiteNum(p.focusX) ?? 0.5, 0, 1), y: clamp(finiteNum(p.focusY) ?? 0.5, 0, 1) },
+            note: 'crop cut the source edges outside the canvas; extract a frame and confirm no text, captions or faces were lost.',
+          }
+        : {}),
+    };
+    return { ok: true, op: 'reframe', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath), reframe };
   }
 
   if (p.op === 'extract_frame') {

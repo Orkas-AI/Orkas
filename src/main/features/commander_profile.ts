@@ -10,20 +10,11 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import type { Lang } from '../i18n';
 
-export interface CommanderLocalizedText {
-  zh?: string;
-  en?: string;
-  ja?: string;
-  pt?: string;
-}
+export type CommanderLocalizedText = Record<Lang, string>;
 
-export interface CommanderLocalizedList {
-  zh?: string[];
-  en?: string[];
-  ja?: string[];
-  pt?: string[];
-}
+export type CommanderLocalizedList = Record<Lang, string[]>;
 
 export interface CommanderProfile {
   id: 'commander';

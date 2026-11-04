@@ -30,6 +30,8 @@ export interface TurnFinishedEvent {
   actor: { id: string; kind: 'commander' | 'agent' };
   finalText: string;
   errText: string | null;
+  /** Sanitized provider or CLI detail displayed beside the localized error. */
+  errDetail?: string;
   aborted: boolean;
   /** Structured source supplied by the model/CLI/host mutation path. */
   failureKind?: GroupMessageFailureKind;
@@ -119,7 +121,7 @@ function outcomeForDirectTurn(evt: TurnFinishedEvent): TurnOutcome {
     // already landed, append the error pill instead of dropping the partial.
     const partial = evt.finalText || '';
     const body = evt.errText
-      ? (partial ? `${partial}\n\n${errorBubble(evt.errText, evt.failureKind, evt.failureCode)}` : errorBubble(evt.errText, evt.failureKind, evt.failureCode))
+      ? (partial ? `${partial}\n\n${errorBubble(evt.errText, evt.failureKind, evt.failureCode, evt.errDetail)}` : errorBubble(evt.errText, evt.failureKind, evt.failureCode, evt.errDetail))
       : partial;
     return {
       kind: 'persist',
@@ -139,10 +141,10 @@ function outcomeForDirectTurn(evt: TurnFinishedEvent): TurnOutcome {
       return { kind: 'persist', text: '', ...failureFields(evt) };
     }
     // Real failure (zero-activity empty, or other err).
-    return { kind: 'persist', text: errorBubble(evt.errText, evt.failureKind, evt.failureCode), ...failureFields(evt, true) };
+    return { kind: 'persist', text: errorBubble(evt.errText, evt.failureKind, evt.failureCode, evt.errDetail), ...failureFields(evt, true) };
   }
   // agent empty + no side effects.
-  if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText, evt.failureKind, evt.failureCode), ...failureFields(evt, true) };
+  if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText, evt.failureKind, evt.failureCode, evt.errDetail), ...failureFields(evt, true) };
   return {
     kind: 'persist',
     text: errorBubble(t('model.empty_response'), 'model', 'empty_response'),
@@ -181,7 +183,12 @@ function failureFields(
   return { failureKind, ...(failureCode ? { failureCode } : {}) };
 }
 
-function errorBubble(msg: string, failureKind?: GroupMessageFailureKind, failureCode?: string): string {
+function errorBubble(
+  msg: string,
+  failureKind?: GroupMessageFailureKind,
+  failureCode?: string,
+  detail?: string,
+): string {
   let visible: string;
   if (isStorageFullError({ message: msg, code: failureCode })) {
     visible = t('errors.storage_full');
@@ -192,7 +199,11 @@ function errorBubble(msg: string, failureKind?: GroupMessageFailureKind, failure
   } else {
     visible = t('model.call_failed', { message: normalizeRunError(msg) });
   }
-  return `<span style="color:var(--danger)">${escapeHtmlForBubble(visible)}</span>`;
+  const status = `<span style="color:var(--danger)">${escapeHtmlForBubble(visible)}</span>`;
+  const userDetail = String(detail || '').replace(/\s+/g, ' ').trim();
+  return userDetail
+    ? `${status} <span>${escapeHtmlForBubble(userDetail)}</span>`
+    : status;
 }
 
 function normalizeRunError(msg: string): string {

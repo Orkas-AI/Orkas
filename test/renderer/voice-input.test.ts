@@ -312,7 +312,7 @@ function loadWorkletCapture(sourcePath: string, options: {
   };
 }
 
-function loadDelayedTranscript(sourcePath: string) {
+function loadDelayedTranscript(sourcePath: string, closeOnError = false) {
   let releaseFirst: () => void = () => {};
   const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
   let decodes = 0;
@@ -379,7 +379,10 @@ function loadDelayedTranscript(sourcePath: string) {
   const client = context.window.VoiceInput.createClient('wss://example.test/asr', {
     onResult: ({ text, last }: { text: string; last: boolean }) => timeline.push(['result', text, last]),
     onClose: () => timeline.push(['close']),
-    onError: (error: Error) => timeline.push(['error', error.message]),
+    onError: (error: Error) => {
+      timeline.push(['error', error.message]);
+      if (closeOnError) client.close();
+    },
   });
   return { client, sockets, timeline, releaseFirst, tracksStopped: () => tracksStopped };
 }
@@ -1289,3 +1292,55 @@ describe('merged remote voice admission and editor lifetime', () => {
   });
 
 });
+
+describe('ASR transcript retention before control failures', () => {
+  it.each(['error', 'timeout'] as const)('preserves admitted text before a later %s closes the composer client', async (event) => {
+    const fixture = loadDelayedTranscript(path.join(__dirname, '../../src/renderer/modules/voice-input.js'), true);
+    await fixture.client.start();
+    const socket = fixture.sockets[0];
+    socket.open();
+    socket.receive('Retained partial transcript');
+    socket.onmessage?.({ data: JSON.stringify(event === 'timeout'
+      ? { event, max_seconds: 120 }
+      : { event, reason: 'upstream_closed_without_terminal' }) });
+    socket.close();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const whilePending = [...fixture.timeline];
+    fixture.releaseFirst();
+    await vi.waitFor(() => expect(fixture.timeline).toContainEqual(['close']));
+    expect(whilePending).toEqual([]);
+    expect(fixture.timeline).toEqual([
+      ['result', 'Retained partial transcript', false],
+      ['error', event === 'timeout' ? 'asr_timeout' : 'asr_upstream_closed_without_terminal'],
+      ['close'],
+    ]);
+    expect(fixture.tracksStopped()).toBe(1);
+    await fixture.client.start();
+    fixture.sockets[1].open();
+    fixture.sockets[1].receive('Replacement transcript', true);
+    await vi.waitFor(() => expect(fixture.timeline).toContainEqual(['result', 'Replacement transcript', true]));
+    fixture.client.close();
+  });
+});
+
+it('binds natural close to queued decoding, then resets the receipt for a replacement attempt', async () => {
+    const fixture = loadDelayedTranscript(path.join(__dirname, '../../src/renderer/modules/voice-input.js'));
+    await fixture.client.start(); fixture.sockets[0].open();
+    fixture.sockets[0].receive('terminal', true); fixture.sockets[0].close();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(fixture.client.diagnosticContext()).toBe('v1|socket|1000|clean|no_end|no_terminal|pending');
+    fixture.releaseFirst();
+    await vi.waitFor(() => expect(fixture.timeline).toEqual([['result', 'terminal', true], ['close']]));
+    expect(fixture.client.diagnosticContext()).toBe('v1|socket|1000|clean|no_end|terminal|pending');
+    await fixture.client.start();
+    expect(fixture.client.diagnosticContext()).toBe('v1|none|unknown|unknown|no_end|no_terminal|drained');
+    fixture.client.close();
+  });
+
+it.each([4999, -1, 'private-code'])('keeps nonstandard close codes out of the closed diagnostic vocabulary: %s', async code => {
+    const fixture = loadDelayedTranscript(path.join(__dirname, '../../src/renderer/modules/voice-input.js'));
+    await fixture.client.start(); fixture.sockets[0].open();
+    fixture.sockets[0].onclose({ code, wasClean: false, reason: 'private-close-body' });
+    expect(fixture.client.diagnosticContext()).toBe('v1|socket|unknown|unclean|no_end|no_terminal|drained');
+    fixture.releaseFirst(); fixture.client.close();
+  });

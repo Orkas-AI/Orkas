@@ -202,4 +202,31 @@ describe('group_chat plan executor terminal delivery', () => {
     expect(text).toContain('文档排版已完成，文件见下方。');
     expect(text).toContain('color:var(--danger)');
   });
+
+  // The provider explanation remains a sibling of the status so failure-text
+  // extraction reads the localized status alone.
+  it.each([
+    { label: 'an empty reply', finalText: '' },
+    { label: 'partial prose', finalText: 'Reading the document.' },
+  ])('renders the sanitized detail beside the error after $label', async ({ finalText }) => {
+    const prevLang = getCurrentLang();
+    setCurrentLang('en');
+    try {
+      const status = 'The model service rejected this request (HTTP 400). This request has been rejected repeatedly, so retrying as is will not change the result.';
+      const outcome = await onTurnFinished('u1', 'c1', commanderEvent({
+        finalText,
+        errText: status,
+        errDetail: 'Provider said: unknown variant <image_url>',
+        activityEvents: 3,
+        failureKind: 'model',
+        failureCode: 'provider_http_400',
+      }));
+
+      const text = outcome.kind === 'persist' ? outcome.text : '';
+      expect(text).toContain(`<span style="color:var(--danger)">⚠️ Model call failed: ${status}</span>`
+        + ' <span>Provider said: unknown variant &lt;image_url&gt;</span>');
+    } finally {
+      setCurrentLang(prevLang);
+    }
+  });
 });

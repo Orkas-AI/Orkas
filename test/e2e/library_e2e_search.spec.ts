@@ -96,6 +96,7 @@ test.describe('library and global search', () => {
     const searchInput = page.locator('#search-input');
     await expect(searchOverlay).toBeVisible();
     await searchInput.fill('orca navy white blue markings');
+    await searchInput.press('Enter');
     const imageSearchResult = page.locator('#search-body .search-result', {
       hasText: fileName,
     }).first();
@@ -164,6 +165,7 @@ test.describe('library and global search', () => {
       (element) => element.getBoundingClientRect().height,
     );
     await input.fill(query);
+    await input.press('Enter');
     await expect(page.locator('.search-result-kind.is-chat')).toHaveCount(0);
     await input.press('Escape');
     await expect(overlay).toBeHidden();
@@ -182,15 +184,21 @@ test.describe('library and global search', () => {
     );
     expect(historySearchHeight).toBeCloseTo(emptySearchHeight, 1);
     await input.fill(query);
+    await input.press('Enter');
     await expect(page.locator('.search-result-kind.is-chat').first()).toBeVisible();
     await expect(page.locator('.search-result-kind.is-agent').first()).toBeVisible();
     await expect(page.locator('.search-result-kind.is-skill').first()).toBeVisible();
     await expect(page.locator('.search-result-kind.is-context').first()).toBeVisible();
     const visibleResults = page.locator('#search-body .search-result');
+    await expect(page.locator('#search-body .search-loading-spinner')).toHaveCount(0);
+    // Independent modules retain the first available selection as later rows
+    // arrive. Keyboard movement is relative to that selection, not arrival order.
+    const selected = Number(await page.locator('#search-body .search-result.active').getAttribute('data-idx'));
+    const next = (selected + 1) % await visibleResults.count();
     await input.press('ArrowDown');
-    await expect(visibleResults.nth(1)).toHaveClass(/\bactive\b/);
+    await expect(visibleResults.nth(next)).toHaveClass(/\bactive\b/);
     await input.press('ArrowUp');
-    await expect(visibleResults.nth(0)).toHaveClass(/\bactive\b/);
+    await expect(visibleResults.nth(selected)).toHaveClass(/\bactive\b/);
 
     const tabs = [
       ['chat', 'is-chat'],
@@ -205,13 +213,14 @@ test.describe('library and global search', () => {
     }
 
     await page.locator('.search-tab[data-tab="chat"]').click();
-    await input.press('Enter');
+    await page.locator('#search-body .search-result.active').click();
     await expect(overlay).toBeHidden();
     await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
     await expect(page.locator('#chat-history .chat-message.user')).toContainText(query);
 
     ({ overlay, input } = await openSearch());
     await input.fill('zzqxvbnm741963');
+    await input.press('Enter');
     await expect(page.locator('#search-body .search-empty')).toBeVisible();
     await expect(page.locator('#search-body .search-result')).toHaveCount(0);
     await input.press('Escape');
@@ -291,6 +300,7 @@ test.describe('library and global search', () => {
     await expect(overlay).toBeVisible();
     await expect(input).toBeFocused();
     await input.fill(marker);
+    await input.press('Enter');
 
     const allResults = page.locator('#search-body .search-result', { hasText: marker });
     await expect(allResults).toHaveCount(3, { timeout: 20_000 });
@@ -312,6 +322,7 @@ test.describe('library and global search', () => {
     await expect(input).toBeFocused();
     await input.fill('');
     await input.fill(marker);
+    await input.press('Enter');
 
     const scopedResults = page.locator('#search-body .search-result', { hasText: marker });
     await expect(scopedResults).toHaveCount(2, { timeout: 20_000 });
@@ -559,6 +570,7 @@ test.describe('library and global search', () => {
     const input = page.locator('#search-input');
     await expect(input).toBeFocused();
     await input.fill(name);
+    await input.press('Enter');
 
     const result = page.locator('.search-result', { hasText: name });
     await expect(result).toBeVisible();

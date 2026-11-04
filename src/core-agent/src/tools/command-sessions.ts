@@ -7,7 +7,10 @@ import { isProgrammaticToolCallContext } from "./run-program.js";
 
 const OUTPUT_CHARS = 1_000_000;
 const RETENTION_MS = 60 * 60_000;
-const sessions = new Map<string, CommandSession>();
+// Main reaches this leaf module through both tsx/cjs and the ESM hook, which gives
+// separate module instances. Every instance must see the same running commands.
+const SESSIONS_KEY = Symbol.for("orkas.core_agent.command_sessions");
+const sessions: Map<string, CommandSession> = ((globalThis as any)[SESSIONS_KEY] ??= new Map<string, CommandSession>());
 
 type CommandSession = {
   id: string;
@@ -16,7 +19,7 @@ type CommandSession = {
   start: number;
   end: number;
   waiters: Set<() => void>;
-  control?: { write(chars: string): void; stop(): void };
+  control?: { pid?: number; write(chars: string): void; stop(): void; kill(): void };
   stopRequested: boolean;
   stoppedByRequest: boolean;
   result?: ToolResult;
@@ -175,7 +178,10 @@ export async function startCommandSession(
   const callSignal = ctx.signal;
   const runSignal = ctx.state.commandSessionSignal instanceof AbortSignal ? ctx.state.commandSessionSignal : undefined;
   session.completion = sandbox.execute(command, {
-    onStart: (control) => { session.control = control; },
+    onStart: (control) => {
+      session.control = control;
+      if (session.stopRequested) control.stop();
+    },
     onOutput: (bytes, stream, env) => append(session, process.platform === "win32"
       ? decodeProcessOutput(bytes, process.platform, env) : decoders[stream].write(bytes)),
   }).then(async (raw) => {
@@ -243,6 +249,27 @@ export async function continueCommandSession(input: Record<string, unknown>, ctx
     }
   }
   return receipt(session, input);
+}
+
+export interface HostExitCommand {
+  pid(): number | undefined;
+  settled: Promise<unknown>;
+  kill(): void;
+}
+
+/** Host exit only: request a stop for every running command and hand back what the
+ * caller needs to confirm or escalate it. Finished records keep their results. */
+export function stopCommandSessionsForHostExit(): HostExitCommand[] {
+  const running = [...sessions.values()].filter((session) => !session.result);
+  for (const session of running) {
+    session.stopRequested = true;
+    session.control?.stop();
+  }
+  return running.map((session) => ({
+    pid: () => session.control?.pid,
+    settled: session.completion,
+    kill: () => session.control?.kill(),
+  }));
 }
 
 export async function resetCommandSessionsForTest(): Promise<void> {

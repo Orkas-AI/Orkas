@@ -55,11 +55,13 @@ describe('native search through the production payload hook and real SDK', () =>
     const insertionType = supportsAdditionalTools ? 'additional_tools' : 'tool_search_output';
     policy.enabled = true; policy.configured = false;
     const initial = await capture(start, definitions.slice(0, 1));
-    expect(initial.tools.some((tool: any) => tool.type === 'web_search')).toBe(false);
+    // The SDK may place all initial functions in additional_tools and omit
+    // the top-level tools field. Absence still proves native search is inactive.
+    expect((initial.tools ?? []).some((tool: any) => tool.type === 'web_search')).toBe(false);
     expect(injected).not.toHaveBeenCalled();
     const activated = await capture(loaded, definitions);
     expect(activated.tools.filter((tool: any) => tool.type === 'web_search')).toHaveLength(1);
-    expect(activated.input.find((item: any) => item.type === insertionType).tools.map((tool: any) => tool.name)).toEqual(['web_fetch']);
+    expect(activated.input.findLast((item: any) => item.type === insertionType).tools.map((tool: any) => tool.name)).toEqual(['web_fetch']);
     expect(activated.input.slice(0, initial.input.length)).toEqual(initial.input);
     expect(injected).toHaveBeenLastCalledWith(expect.objectContaining({ model: 'gpt-5.5', tool: 'web_search' }));
     expect(await capture(loaded, definitions)).toEqual(activated);
@@ -74,17 +76,22 @@ describe('native search through the production payload hook and real SDK', () =>
       injected.mockClear();
       const fallback = await capture(loaded, definitions, state.model);
       expect(fallback).toEqual(raw);
-      expect(fallback.input.find((item: any) => item.type === insertionType).tools.map((tool: any) => tool.name)).toEqual(['web_search', 'web_fetch']);
+      expect(fallback.input.findLast((item: any) => item.type === insertionType).tools.map((tool: any) => tool.name)).toEqual(['web_search', 'web_fetch']);
       expect(injected).not.toHaveBeenCalled();
     }
     policy.enabled = true; policy.configured = false;
     // Compaction removes the insertion; active search still works in the prefix.
     const compacted = await capture(start, definitions);
-    expect(compacted.tools.map((tool: any) => tool.name || tool.type)).toEqual(['tool_load', 'web_fetch', 'web_search']);
+    const compactedTools = [...(compacted.tools ?? []), ...compacted.input
+      .filter((item: any) => item.type === insertionType).flatMap((item: any) => item.tools)];
+    expect(compactedTools.map((tool: any) => tool.name || tool.type).sort()).toEqual(['tool_load', 'web_fetch', 'web_search']);
     // A later user turn without the activation must not inherit native search.
     const inactive = await capture(loaded, definitions.slice(0, 1));
-    expect(inactive.tools.some((tool: any) => tool.type === 'web_search')).toBe(false);
-    expect(inactive.input.some((item: any) => item.type === insertionType)).toBe(false);
+    expect((inactive.tools ?? []).some((tool: any) => tool.type === 'web_search')).toBe(false);
+    // additional_tools also carries the initial tool_load definition. Retain
+    // that prefix while proving the previous search activation is absent.
+    const receipts = (payload: any) => payload.input.filter((item: any) => item.type === insertionType);
+    expect(receipts(inactive)).toEqual(receipts(initial));
   });
 });
 

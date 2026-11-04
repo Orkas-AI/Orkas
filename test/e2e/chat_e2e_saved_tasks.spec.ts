@@ -1,6 +1,178 @@
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
 
+test('keeps file and related resource glyphs readable within their shared icon box', async ({ orkas: app }, testInfo) => {
+  const page = app.page!;
+  const files = ['report.md', 'report.pdf', 'report.docx', 'report.xlsx', 'report.pptx',
+    'photo.png', 'movie.mp4', 'sound.mp3', 'config.json', 'bundle.zip', 'worker.ts', 'other.bin'];
+  const paths = files.map(name => app.createWorkspaceFile(name, 'Icon geometry fixture'));
+  const glyphs = await page.evaluate(({ files, paths }) => {
+    const runtime = window as any;
+    const host = document.createElement('div');
+    host.id = 'resource-icon-audit';
+    host.className = 'chat-message assistant';
+    host.style.cssText = 'position:fixed;inset:80px 40px auto 300px';
+    const bubble = document.createElement('div');
+    bubble.className = 'chat-bubble markdown-body';
+    bubble.style.cssText = 'display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:20px';
+    host.appendChild(bubble);
+    files.forEach((name, index) => {
+      const row = document.createElement('div');
+      row.dataset.iconName = name;
+      row.innerHTML = runtime._markdownFileLinkHtml(paths[index], name);
+      bubble.appendChild(row);
+    });
+    for (const name of ['file', 'file-text', 'document-pencil', 'clipboard-list', 'clock']) {
+      const row = document.createElement('div');
+      row.dataset.iconName = name;
+      row.innerHTML = `<span class="chat-task-reference"><span class="chat-task-reference-icon">${runtime.uiIconHtml(name)}</span><span>${name}</span></span>`;
+      bubble.appendChild(row);
+    }
+    document.body.appendChild(host);
+    return Array.from(host.querySelectorAll<SVGSVGElement>('svg')).map(svg => {
+      const bounds = svg.getBBox();
+      const box = svg.getBoundingClientRect();
+      const view = svg.viewBox.baseVal;
+      const stroke = Number(svg.getAttribute('stroke-width')) / 2;
+      return { name: svg.closest<HTMLElement>('[data-icon-name]')!.dataset.iconName,
+        box: [box.width, box.height], width: bounds.width,
+        unclipped: bounds.x - stroke >= view.x && bounds.y - stroke >= view.y
+          && bounds.x + bounds.width + stroke <= view.x + view.width
+          && bounds.y + bounds.height + stroke <= view.y + view.height };
+    });
+  }, { files, paths });
+  await testInfo.attach('resource-icon-geometry.json', { body: JSON.stringify(glyphs), contentType: 'application/json' });
+  await page.locator('#resource-icon-audit').screenshot({ path: testInfo.outputPath('resource-icons.png') });
+  expect(glyphs).toHaveLength(17);
+  for (const glyph of glyphs) {
+    expect(glyph.box, glyph.name).toEqual([16, 16]);
+    expect(glyph.width, glyph.name).toBeGreaterThanOrEqual(14);
+    expect(glyph.unclipped, glyph.name).toBe(true);
+  }
+});
+
+test('shows clickable task content previews without changing code examples, links, or message copy', async ({ orkas: app }, testInfo) => {
+  const page = app.page!;
+  const todo = 't_e4fe5478466d';
+  const automation = 'at_1234abcd';
+  const todoContent = '整理本周客户反馈并汇总需要优先修复的问题';
+  const autoTitle = '每天早上汇总最新行业资讯并发送到项目中';
+  const report = app.createWorkspaceFile('report.md', 'Task reference alignment');
+  await app.invoke('projects.tasks.create', { taskId: todo, content: todoContent });
+  await app.invoke('autoTasks.create', { id: automation, title: autoTitle, content: 'Collect industry news',
+    enabled: false, schedule: { type: 'daily', hour: 9, minute: 0 } });
+  const content = [
+    `Saved ${todo} and \`${automation}\`. 待办${todo}已保存。[查看报告](${report})`,
+    '',
+    '| Kind | Reference |', '| --- | --- |', `| To-do | \`${todo}\` |`,
+    '',
+    `Keep \`tasks/${todo}/task.json\`, \`task_id = "${todo}"\`, and [${todo}](https://example.com/${todo}) literal.`,
+    '',
+    `Invalid: t_e4fe5478466dx at_1234abc t_e4fe5478466d.txt prefix_${todo}. Missing: t_000000000000.`,
+    '',
+    '```json', `{"task_id":"${todo}","automation":"${automation}"}`, '```',
+  ].join('\n');
+  const { conversation } = await app.invoke<{ conversation: { conversation_id: string } }>(
+    'conversations.create', { title: 'Task reference display' },
+  );
+  await page.evaluate(async ({ cid, content }) => {
+    const runtime = window as any;
+    runtime.setView('conversation', cid);
+    await runtime.loadConversationHistory(cid);
+    runtime.appendChatMessage({ role: 'assistant', content, time: 1000 }, false);
+  }, { cid: conversation.conversation_id, content });
+  const message = page.locator('#chat-history .chat-message.assistant').filter({ hasText: 'Invalid:' });
+  const chips = message.locator('button.chat-task-reference');
+  const expectInlineAlignment = async () => {
+    const geometry = await chips.evaluateAll(elements => elements.map(element => {
+      // Zero-size inline boxes expose the actual text baselines without
+      // depending on the platform font's ascenders or a screenshot snapshot.
+      const marker = () => {
+        const span = document.createElement('span');
+        span.style.cssText = 'display:inline-block;width:0;height:0;padding:0;margin:0;border:0;vertical-align:baseline';
+        return span;
+      };
+      const surrounding = marker();
+      const inside = marker();
+      const label = element.querySelector('.chat-use-inline-name')!;
+      const reference = element.closest('.markdown-body')!.querySelector('.chat-attach-chip.is-inline')!;
+      const properties = ['fontSize', 'lineHeight', 'verticalAlign', 'padding', 'borderRadius',
+        'borderColor', 'backgroundColor', 'marginInlineStart', 'marginInlineEnd'] as const;
+      const style = getComputedStyle(element);
+      const fileStyle = getComputedStyle(reference);
+      const matchesFileStyle = properties.every(property => style[property] === fileStyle[property]);
+      element.after(surrounding);
+      label.prepend(inside);
+      const baselineOffset = inside.getBoundingClientRect().top - surrounding.getBoundingClientRect().top;
+      const icon = element.querySelector('svg')!.getBoundingClientRect();
+      const fileIcon = reference.querySelector('svg')!.getBoundingClientRect();
+      const bounds = element.getBoundingClientRect();
+      inside.remove();
+      surrounding.remove();
+      return { baselineOffset, matchesFileStyle, iconSize: [icon.width, icon.height],
+        labelColor: getComputedStyle(label).color,
+        fileLabelColor: getComputedStyle(reference.querySelector('.chat-attach-label')!).color,
+        iconColor: getComputedStyle(element.querySelector('svg')!).color,
+        fileIconColor: getComputedStyle(reference.querySelector('svg')!).color,
+        fileIconSize: [fileIcon.width, fileIcon.height],
+        iconCenterOffset: Math.abs((icon.top + icon.bottom - bounds.top - bounds.bottom) / 2),
+        iconContained: icon.top >= bounds.top && icon.bottom <= bounds.bottom };
+    }));
+    expect(geometry).toHaveLength(4);
+    for (const item of geometry) {
+      expect(Math.abs(item.baselineOffset)).toBeLessThanOrEqual(0.5);
+      expect(item.matchesFileStyle).toBe(true);
+      expect(item.labelColor).toBe(item.fileLabelColor);
+      expect(item.iconColor).toBe(item.fileIconColor);
+      expect(item.iconSize).toEqual(item.fileIconSize);
+      expect(item.iconSize).toEqual([16, 16]);
+      expect(item.iconCenterOffset).toBeLessThanOrEqual(0.5);
+      expect(item.iconContained).toBe(true);
+    }
+  };
+  await expect(chips).toHaveCount(4);
+  await expect(chips.first()).toHaveText('整理本周客户反馈并汇总需要优先…');
+  await expect(chips.nth(1)).toHaveText('每天早上汇总最新行业资讯并发送…');
+  await expect(chips.locator('svg')).toHaveCount(4);
+  await expect(chips.first()).toHaveAttribute('title', todoContent);
+  await expect(chips.nth(1)).toHaveAttribute('title', autoTitle);
+  await expect(chips).not.toContainText([todo, automation, todo, todo]);
+  await expect(message).toContainText('Missing: t_000000000000.');
+  await expect(message.locator('pre code')).toHaveText(`{"task_id":"${todo}","automation":"${automation}"}`);
+  await expect(message.locator('a')).toHaveText(todo);
+  await expect(message.locator('.chat-attach-chip.is-inline')).toHaveText('查看报告');
+  await expect(message.locator('code').filter({ hasText: 'tasks/' })).toHaveText(`tasks/${todo}/task.json`);
+  await expect(message.locator('code').filter({ hasText: 'task_id =' })).toHaveText(`task_id = "${todo}"`);
+  // The original Markdown remains the copy/retry source, including both IDs.
+  expect(await message.evaluate((element, original) =>
+    (window as any)._messageTextForActions(element, original), content)).toBe(content);
+  expect(await page.evaluate(content => {
+    const runtime = window as any;
+    const cache = {};
+    return runtime._renderMessageMarkdown(content, cache).join('') === runtime._renderMessageMarkdown(content);
+  }, content)).toBe(true);
+  await expectInlineAlignment();
+  await page.screenshot({ path: testInfo.outputPath('task-references-en-wide.png') });
+  await page.setViewportSize({ width: 1024, height: 600 });
+  await page.evaluate(() => (window as any).setLang('zh'));
+  await expect(chips.first()).toHaveText('整理本周客户反馈并汇总需要优先…');
+  await expect(chips.nth(1)).toHaveText('每天早上汇总最新行业资讯并发送…');
+  expect(await chips.evaluateAll(elements => elements.every(element => element.scrollWidth <= element.clientWidth))).toBe(true);
+  await expectInlineAlignment();
+  await page.screenshot({ path: testInfo.outputPath('task-references-zh-narrow.png') });
+  await message.locator('.markdown-body > p').first().screenshot({ path: testInfo.outputPath('task-reference-preview.png') });
+  await chips.first().click();
+  await expect(page.locator(`#todos-content [data-tid="${todo}"]`)).toHaveClass(/\bis-highlighted\b/);
+  await page.evaluate(async ({ cid, content }) => {
+    const runtime = window as any;
+    runtime.setView('conversation', cid);
+    await runtime.loadConversationHistory(cid);
+    runtime.appendChatMessage({ role: 'assistant', content, time: 1000 }, false);
+  }, { cid: conversation.conversation_id, content });
+  await message.locator('button.chat-task-reference').nth(1).click();
+  await expect(page.locator(`#auto-list [data-task-id="${automation}"]`)).toHaveClass(/\bis-highlighted\b/);
+});
+
 test('recovers the completed reply without leaving the page when terminal delivery is lost', async ({ modelOrkas: app }) => {
   test.setTimeout(120_000);
   const page = app.page!;

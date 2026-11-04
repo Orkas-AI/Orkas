@@ -390,6 +390,7 @@ async function initUser() {
 // ─── View routing ───
 
 function setView(view, cid, opts = {}) {
+  if (view !== 'agents' && typeof clearAgentCardHighlights === 'function') clearAgentCardHighlights();
   const restoreTaskCleanup = window.TaskCleanupNavigation?.beforeNavigate(view, cid, opts) === true;
   // A resource detail opened from another page is only a transient overlay.
   // Any explicit sidebar/programmatic navigation dismisses it first, so a
@@ -590,6 +591,7 @@ function setView(view, cid, opts = {}) {
     });
   } else if (view === 'auto') {
     currentCid = null;
+    window.DesktopStartup?.visitAutomation();
     // Force-refresh on every tab visit: a scheduled fire or remote sync pull
     // may have updated the list while the user was elsewhere.
     _deferSidebarNavWork('auto-tab-load', () => {

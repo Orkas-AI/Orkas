@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { commandSessionWait, continueCommandSession, inspectCommandRead, resetCommandSessionsForTest, runningCommandSessions } from "./command-sessions.js";
+import { commandSessionWait, continueCommandSession, inspectCommandRead, resetCommandSessionsForTest, runningCommandSessions, stopCommandSessionsForHostExit } from "./command-sessions.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -61,7 +61,11 @@ const PROCESS_EXITED_RETENTION_MS = 60 * 60 * 1000;
 const PROCESS_MAX_RUNNING_PER_OWNER = 8;
 const PROCESS_INITIAL_ACTIVITY_WAIT_MS = process.platform === "win32" ? 1_500 : 300;
 
-const sessions = new Map<string, ProcessSession>();
+const PROCESS_HOST_EXIT_BUDGET_MS = 5_000;
+
+// Shared across module instances like the managed command registry.
+const SESSIONS_KEY = Symbol.for("orkas.core_agent.process_sessions");
+const sessions: Map<string, ProcessSession> = ((globalThis as any)[SESSIONS_KEY] ??= new Map<string, ProcessSession>());
 
 function processOwner(ctx: ToolContext): string {
   const owner = ctx.state?.processSessionOwner;
@@ -564,10 +568,9 @@ export const processStopTool: AgentTool = defineTool({
   },
 });
 
-type ProcessSessionAction = "start" | "read" | "write" | "stop";
+type ProcessSessionAction = "read" | "write" | "stop";
 
 const PROCESS_SESSION_ACTION_FIELDS: Readonly<Record<ProcessSessionAction, ReadonlySet<string>>> = {
-  start: new Set(["action", "command", "max_lifetime_ms"]),
   read: new Set(["action", "session_id", "cursor", "max_chars", "yield_time_ms"]),
   write: new Set(["action", "session_id", "chars", "add_newline"]),
   stop: new Set(["action", "session_id"]),
@@ -578,8 +581,7 @@ function processSessionActionError(
   input: Record<string, unknown>,
 ): string | null {
   const unexpected = Object.keys(input)
-    .filter((key) => !Object.values(PROCESS_SESSION_ACTION_FIELDS).some((fields) => fields.has(key))
-      || (action === "start" && key === "session_id"))
+    .filter((key) => !Object.values(PROCESS_SESSION_ACTION_FIELDS).some((fields) => fields.has(key)))
     .sort();
   return unexpected.length
     ? `E_BAD_INPUT: process_session(${action}) does not accept: ${unexpected.join(", ")}`
@@ -610,7 +612,7 @@ function inspectProcessRead(input: Record<string, unknown>, ctx: ToolContext, in
  * non-model callers, but only this tool is advertised by the builtin registry. */
 export const processSessionTool: AgentTool = defineTool({
   name: "process_session",
-  compatibilityInputFields: [...PROCESS_SESSION_ACTION_FIELDS.start],
+  compatibilityInputFields: ["command", "max_lifetime_ms"],
   description:
     "Read, send input to, or stop a running shell session. Start commands with bash; use interactive_cli for user-entered secrets or OAuth.",
   inputSchema: {
@@ -635,7 +637,7 @@ export const processSessionTool: AgentTool = defineTool({
   inspectReadContinuation: inspectProcessRead,
   async execute(input, ctx) {
     const action = String(input.action ?? "") as ProcessSessionAction;
-    if (!(["start", "read", "write", "stop"] as const).includes(action)) {
+    if (!(["read", "write", "stop"] as const).includes(action)) {
       return {
         content: "E_BAD_INPUT: `action` must be read, write, or stop",
         isError: true,
@@ -656,14 +658,11 @@ export const processSessionTool: AgentTool = defineTool({
       } catch { /* Preserve non-JSON errors with a text receipt. */ }
       return { ...result, content: `${notice}${result.content}` };
     };
-    if (action !== "start") {
-      if (action === "read" && commandSessionWait(input.yield_time_ms) === null) {
-        return { content: "E_BAD_INPUT: yield_time_ms must be an integer from 0 to 30000", isError: true };
-      }
-      const managed = await continueCommandSession(input, ctx);
-      if (managed) return withNotice(managed);
+    if (action === "read" && commandSessionWait(input.yield_time_ms) === null) {
+      return { content: "E_BAD_INPUT: yield_time_ms must be an integer from 0 to 30000", isError: true };
     }
-    if (action === "start") return withNotice(await processStartTool.execute(input, ctx));
+    const managed = await continueCommandSession(input, ctx);
+    if (managed) return withNotice(managed);
     if (action === "read") return withNotice(await processReadTool.execute({ ...input, yield_time_ms: input.yield_time_ms ?? 10_000 }, ctx));
     if (action === "write") return withNotice(await processWriteTool.execute(input, ctx));
     if (action === "stop") return withNotice(await processStopTool.execute(input, ctx));
@@ -673,6 +672,50 @@ export const processSessionTool: AgentTool = defineTool({
 
 export function getProcessSessionTools(): AgentTool[] {
   return [processSessionTool];
+}
+
+/** A shell closing is not proof of exit: a descendant can release its pipes and
+ * stay in the process group. Windows has no group; its helper already sweeps the tree. */
+function processGroupAlive(pid: number | undefined): boolean {
+  if (process.platform === "win32" || !pid) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Host exit: stop every command this process still owns, across both registries,
+ * so that none outlives the app with no owner and no timeout. `run_in_background`
+ * is an explicit detach and is never registered here. Resolves within `budgetMs`,
+ * giving TERM most of it and promptly once the commands are gone.
+ */
+export async function stopAllProcessSessions(budgetMs = PROCESS_HOST_EXIT_BUDGET_MS): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  const termDeadline = deadline - Math.floor(budgetMs * 0.4);
+  const targets = stopCommandSessionsForHostExit();
+  for (const session of sessions.values()) {
+    if (session.status !== "running") continue;
+    killSession(session);
+    finishSession(session, "stopped", { signal: "agent" });
+    targets.push({
+      pid: () => session.child.pid,
+      settled: Promise.all([session.termination, waitForProcessClose(session, budgetMs)]),
+      kill: () => killProcessTree(session.child, "SIGKILL"),
+    });
+  }
+  if (!targets.length) return;
+  let settled = false;
+  void Promise.all(targets.map((target) => target.settled)).then(() => { settled = true; });
+  const stopped = () => settled && !targets.some((target) => processGroupAlive(target.pid()));
+  const waitUntil = async (time: number) => {
+    while (!stopped() && Date.now() < time) await new Promise((resolve) => setTimeout(resolve, 25));
+  };
+  await waitUntil(termDeadline);
+  if (!stopped() && process.platform !== "win32") for (const target of targets) target.kill();
+  await waitUntil(deadline);
 }
 
 /** Test-only cleanup; production sessions are retained by their lifecycle. */

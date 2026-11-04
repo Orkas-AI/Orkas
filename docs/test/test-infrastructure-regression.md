@@ -96,3 +96,17 @@ lock; after a forced kill, confirm no associated run remains before removing
 `run.lock`. Old attempt directories are deliberately retained for diagnosis;
 remove the whole checkpoint directory when that evidence is no longer needed.
 
+Case-owned IPC failures can have identical messages and timestamps within one
+millisecond. Each receipt must identify a distinct console line; the reviewed
+log keeps the exact number of matching console/file pairs. Reusing a receipt
+for one line, accepting an unacknowledged occurrence, missing either copy, or
+adding an extra copy still fails. `test/eval/preview-recovery.test.ts` exercises
+these positive and negative controls without changing the raw error severity.
+
+Native E2E can opt into `ORKAS_E2E_GPU_DIAGNOSTICS=1` to capture GPU/renderer
+process-exit reasons, exit codes, memory and feature status in the existing
+logs. It changes no GPU flag, rendering path, timeout or acceptance rule and
+records no URLs, profiles or environment values. Use the raw native failure and
+resource samples to diagnose a recurrence; a successful retry does not establish
+its cause.
+

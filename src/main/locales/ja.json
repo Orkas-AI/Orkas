@@ -135,7 +135,7 @@
   "errors.model_currently_unavailable": "このモデルは現在利用できません",
   "errors.model_config_unavailable": "モデルは設定されていますが、現在その認証情報を使用できません。設定で API キー、サインイン状態、または代替モデルを確認してください。",
   "errors.model_oauth_expired": "{provider} の認証が期限切れです。設定でこのアカウントを再認証するか、代替モデルに切り替えてください。",
-  "errors.model_credits_insufficient": "クレジットが不足しています。クレジットを追加するか、設定で利用可能なモデルへ切り替えてください。",
+  "errors.model_credits_insufficient": "クレジットが不足したため、タスクを停止しました。クレジットを追加したら、このタスクに戻って「続ける」と送ると、続きから再開できます。設定で利用可能なモデルへ切り替えることもできます。",
   "errors.custom_endpoint_suspect": "カスタムモデルサービスへのリクエストが連続して失敗しました（HTTP {status}）。エンドポイントが無効になっている可能性があります。「設定 → モデル」で API アドレスとキーを確認するか、別のモデルに切り替えてください。",
   "errors.model_output_cap_repeated": "このモデルは 1 回あたりの出力上限に連続して達しています。このタスク量には小さすぎる可能性があります。設定で出力上限の大きいモデルに切り替えるか、タスクを分割してください。",
   "errors.model_provider_balance_insufficient": "設定したモデルプロバイダーのアカウント残高が不足しています（Orkas クレジットではありません）。プロバイダー側でチャージするか、設定でモデルを切り替えてください。",
@@ -361,5 +361,11 @@
   "notification.automation.failed.title": "自動化の実行が失敗しました",
   "notification.automation.failed.title_many": "{count} 件の自動化の実行が失敗しました",
   "notification.automation.waiting_input.title": "自動化の実行が返信を待っています",
-  "notification.automation.waiting_input.title_many": "{count} 件の自動化の実行が返信を待っています"
+  "notification.automation.waiting_input.title_many": "{count} 件の自動化の実行が返信を待っています",
+  "errors.model_rate_limited_all_configured": "設定したモデルはすべてレート制限中です。通常は1〜2分で解除されるので、その後に再試行してください。",
+  "errors.model_request_rejected_repeated": "このリクエストは続けて拒否されています。このまま再試行しても結果は変わりません。設定で別のモデルに切り替えて再試行するか、画像や添付ファイルを外して送り直してください。",
+  "errors.provider_reply_detail": "プロバイダーの応答：{detail}",
+  "cli_agent.repeated_failure_hint": "「{name}」は再び失敗しました。代わりに @Commander にこのタスクを任せることができます。",
+  "desktop.open": "開く",
+  "desktop.exit": "終了"
 }

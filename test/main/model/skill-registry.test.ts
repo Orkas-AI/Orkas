@@ -127,8 +127,9 @@ describe('Agent authoring Skill candidates', () => {
     const block = `${system}\n\n${shared}`;
     expect(new Set([...bindings.values()].map(binding => binding.entry)).size).toBe(specs.length);
     for (const spec of specs) {
+      expect(spec.description_en).not.toBe('');
       expect(block.split(spec.description_en)).toHaveLength(2);
-      expect(block).not.toContain(spec.description_zh);
+      if (spec.description_zh) expect(block).not.toContain(spec.description_zh);
       expect(block).toContain(`**${spec.name}**`);
       const body = fs.readFileSync(spec.skillFile, 'utf8').replace(/^---\n[\s\S]*?\n---\n/, '').trim();
       expect(body).not.toBe('');

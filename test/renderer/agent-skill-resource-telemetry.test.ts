@@ -316,6 +316,7 @@ describe('public agent creation and resource workflows', () => {
     ['en', 'zh', 'ja', 'pt'].map(lang => ({ cli, lang }))
   )))('fills and saves the real $cli default in a $lang UI after an empty description', async ({ cli, lang }) => {
     const { context, element } = loadAgentRenderer();
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/shared/local-cli-defaults.js'), 'utf8'), context);
     for (const module of ['utils.js', 'local-agents.js']) {
       vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules', module), 'utf8'), context);
     }
@@ -356,6 +357,7 @@ describe('public agent creation and resource workflows', () => {
 
   it.each(['en', 'zh'])('refreshes untouched CLI defaults but preserves user text in a %s UI', (lang) => {
     const { context, element } = loadAgentRenderer();
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/shared/local-cli-defaults.js'), 'utf8'), context);
     for (const module of ['utils.js', 'local-agents.js']) {
       vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules', module), 'utf8'), context);
     }

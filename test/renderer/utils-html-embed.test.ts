@@ -3,6 +3,77 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { describe, expect, it } from 'vitest';
 
+const { renderMarkdown } = require('../../src/renderer/modules/utils.js');
+
+const visualize = (spec: unknown) => `\uE200visualize\uE202${JSON.stringify(spec)}\uE201`;
+
+describe('visualization content references in replies', () => {
+  it.each([
+    ['/workspace/automation-time-picker.html', 'chat-media://local/workspace/automation-time-picker.html', undefined],
+    ['C:\\Users\\user\\time picker.HTM', 'chat-media://local/C:/Users/user/time%20picker.HTM', 'wide'],
+    ['/workspace/时间 #1?.html', 'chat-media://local/workspace/%E6%97%B6%E9%97%B4%20%231%3F.html', undefined],
+  ])('shows the HTML preview for %s and preserves the surrounding answer', (file, src, mode) => {
+    const marker = visualize({ path: file, ...(mode ? { mode } : {}) });
+    const html = renderMarkdown(`UI 已完成。\n\n${marker}\n\n检查结果：\n- 通过`);
+    expect(html).toContain(`data-html-src="${src}"`);
+    expect(html.match(/data-chat-md-html-embed="1"/g)).toHaveLength(1);
+    expect(html).toContain('<p>UI 已完成。</p>');
+    expect(html).toContain('<p>检查结果：</p>');
+    expect(html).toContain('<li>通过');
+    expect(html).not.toContain('\uE200');
+    expect(html).not.toContain('<iframe');
+  });
+
+  it('keeps reference examples literal inside code and prose', () => {
+    const marker = visualize({ path: '/workspace/preview.html' });
+    for (const source of [`\`${marker}\``, `\`\`\`text\n${marker}\n\`\`\``, `Example: ${marker}`, `> ${marker}`]) {
+      const html = renderMarkdown(source);
+      expect(html).toContain('\uE200visualize\uE202');
+      expect(html).not.toContain('data-chat-md-html-embed');
+    }
+  });
+
+  it.each([
+    null, [], {}, { path: 42 }, { path: '' },
+    { path: 'relative.html' }, { path: '//server/share/preview.html' },
+    { path: 'https://example.test/preview.html' }, { path: 'javascript:alert(1).html' },
+    { path: 'file:///workspace/preview.html' }, { path: '/workspace/preview.html.png' },
+    { path: '/workspace/preview.html?download=1' },
+    { path: '/workspace/preview\u0000.html' },
+    { path: '/workspace/preview\ud800.html' },
+    { path: `/workspace/${'a'.repeat(16_384)}.html` },
+    { path: '/workspace/preview.html', mode: 'unknown' },
+    { path: '/workspace/preview.html', script: '<script>alert(1)</script>' },
+  ].map(spec => [spec]))('does not activate an invalid or lookalike reference (case %#)', spec => {
+    const html = renderMarkdown(`Before\n${visualize(spec)}\nAfter`);
+    expect(html).not.toContain('data-chat-md-html-embed');
+    expect(html).not.toContain('<iframe');
+    expect(html).toContain('<p>Before</p>');
+    expect(html).toContain('<p>After</p>');
+  });
+
+  it('does not repair malformed JSON or other protocol names', () => {
+    for (const marker of ['\uE200visualize\uE202{"path":\uE201', '\uE200other\uE202{"path":"/workspace/a.html"}\uE201']) {
+      const html = renderMarkdown(marker);
+      expect(html).toContain(marker);
+      expect(html).not.toContain('data-chat-md-html-embed');
+    }
+  });
+
+  it('activates only a complete streamed reference and keeps cached rendering equivalent', () => {
+    const marker = visualize({ path: '/workspace/preview.html' });
+    const cache: any = {};
+    for (let end = 1; end <= marker.length; end++) {
+      const source = `Before\n\n${marker.slice(0, end)}`;
+      const html = renderMarkdown(source, cache);
+      expect(html).toBe(renderMarkdown(source));
+      expect(html.includes('data-chat-md-html-embed')).toBe(end === marker.length);
+      expect(cache.blocks.join('')).toBe(html);
+    }
+    expect(renderMarkdown('Replacement', cache)).not.toContain('data-chat-md-html-embed');
+  });
+});
+
 const utilsSource = fs.readFileSync(
   path.join(__dirname, '../../src/renderer/modules/utils.js'),
   'utf8',

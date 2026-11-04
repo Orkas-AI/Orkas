@@ -52,7 +52,7 @@ export async function addTaskAttachmentFromPath(
   if (getActiveUserId() !== uid) return fail('account_changed');
   if (!await getTask(uid, pid, taskId)) return fail('task_not_found');
   try {
-    const saved = await uploadTaskAttachment(uid, pid, taskId, name, body, { overwrite: false });
+    const saved = await uploadTaskAttachment(uid, pid, taskId, name, body, { overwrite: false, requireTask: true });
     if (saved.ok === false) return saved;
     const updated = await getTask(uid, pid, taskId);
     return updated ? { ok: true, task: updated } : fail('task_not_found');

@@ -5,9 +5,10 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { addEntry, removeEntry, replaceEntry, type MemoryOpResult, type MemoryScope } from './memory';
-import { userLocalConfigDir } from '../paths';
+import { addEntry, removeEntry, replaceEntry, applyMemoryBatch, type MemoryOpResult, type MemoryScope } from './memory';
+import { projectMemoryFile, userLocalConfigDir } from '../paths';
 import { getActiveUserId } from './users';
+import { fileEditLock } from '../util/locks';
 
 interface WriteOptions { signal?: AbortSignal }
 
@@ -19,6 +20,14 @@ function cancelledWrite(): MemoryOpResult {
 
 function write(uid: string, target: MemoryScope, opts: WriteOptions, op: () => MemoryOpResult): Promise<MemoryOpResult> {
   if (opts.signal?.aborted || getActiveUserId() !== uid) return Promise.resolve(cancelledWrite());
+  if (typeof target === 'object' && 'project' in target) {
+    // A shared reader must close its Windows handle before synchronous atomic
+    // replacement. Wait asynchronously; never hold the lock during publication.
+    return fileEditLock(projectMemoryFile(uid, target.project)).runExclusive(() => {
+      if (opts.signal?.aborted || getActiveUserId() !== uid) return cancelledWrite();
+      return op();
+    });
+  }
   return Promise.resolve(op());
 }
 
@@ -34,6 +43,21 @@ export function replaceMemoryEntry(
 
 export function removeMemoryEntry(uid: string, target: MemoryScope, oldText: string, opts: WriteOptions = {}): Promise<MemoryOpResult> {
   return write(uid, target, opts, () => removeEntry(uid, target, oldText));
+}
+
+export async function batchMemoryEntries(
+  uid: string, target: MemoryScope, expectedRevision: unknown, operations: unknown, opts: WriteOptions = {},
+): Promise<MemoryOpResult> {
+  const active = () => !opts.signal?.aborted && getActiveUserId() === uid;
+  if (!active()) return cancelledWrite();
+  const commit = () => active() ? applyMemoryBatch(uid, target, expectedRevision, operations, active) : cancelledWrite();
+  const saved = typeof target === 'object' && 'project' in target
+    ? await fileEditLock(projectMemoryFile(uid, target.project)).runExclusive(commit)
+    : commit();
+  if (getActiveUserId() !== uid) return cancelledWrite();
+  // A no-op batch has nothing to publish. Existing single saves retain their
+  // explicit offline-publication retry behavior.
+  return saved;
 }
 
 /** Delete the local state of the retired automatic maintenance: its schedule

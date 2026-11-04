@@ -144,13 +144,20 @@ describe('chats › moveConversationToProject', () => {
     expect((await chats.moveConversationToProject(UID, cid, PID)).ok).toBe(true);
     await reopen();
     observe();
-    // Known-bad calibration: intact output bytes alone cannot prove ownership.
-    // Losing the ledger would silently select the generated file on next send.
+    // Missing output ownership must not turn pool bytes into user inputs.
     const ledger = path.join(layout.chatAttachmentDirForConversation(UID, cid), '.generated-attachments.json');
     const ownership = fs.readFileSync(ledger);
     fs.unlinkSync(ledger);
-    expect(attachments.listPendingAttachments(UID, cid).map(item => item.name).sort()).toEqual(inventory);
+    expect(attachments.listPendingAttachments(UID, cid).map(item => item.name).sort()).toEqual(pending);
     fs.writeFileSync(ledger, ownership);
+    // Losing explicit selection metadata is a recovery gap, never authority
+    // to attach every file. Preserve bytes and restore the receipt to recover.
+    const selectedLedger = path.join(layout.chatAttachmentDirForConversation(UID, cid), '.selected-attachments.json');
+    const selection = fs.readFileSync(selectedLedger);
+    fs.unlinkSync(selectedLedger);
+    expect(attachments.listPendingAttachments(UID, cid)).toEqual([]);
+    expect(attachments.listAttachments(UID, cid).map(item => item.name).sort()).toEqual(inventory);
+    fs.writeFileSync(selectedLedger, selection);
     observe();
     expect((await chats.moveConversationOutOfProject(UID, cid)).ok).toBe(true);
     await reopen();

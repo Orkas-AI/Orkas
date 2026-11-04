@@ -1,8 +1,8 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: video-router
-description_zh: 视频制作的产线路由与运行时锁定知识——按创意简报选「生成/合成/剪辑」能力轴并锁定主路径，开工前定调，避免中途无声切换。
-description_en: Routing + runtime-lock knowledge for video production — pick the generate/compose/edit capability axis from the brief and lock the main path before work starts.
+description_zh: 按需求选定产线（生成/合成/剪辑），开工前锁定。
+description_en: Pick the production line (generate, compose or edit) from the brief and lock it before work starts.
 ---
 
 # video-router
@@ -43,7 +43,7 @@ A finished video is built from one or more of three orthogonal axes. Decide whic
 - **Compose (B)** — deterministic HTML composition: explainers, kinetic typography, motion graphics, captions / lower-thirds / overlays, data viz, title cards, transitions. Use when the visuals are designed rather than filmed. This is the default for explainer/animation work.
 - **Edit (C)** — intelligent editing of supplied footage: evidence-based selection/cleanup, deterministic cut/join/reframe/captions/audio work, and semantic AI video editing when the user requests a pixel-level change that timeline operations cannot make.
 
-Before selecting a method, read [production-method.md](references/production-method.md). It owns the current-video `is_generation` decision, reference-analysis depth and delivery-check boundary.
+Before selecting a method, read [production-method.md](references/production-method.md). It owns the current-video `is_generation` decision, reference-analysis depth and delivery-check boundary. A locked COMPOSE line skips it: COMPOSE is always `is_generation:false`, and reference-led COMPOSE reads [reference-recreation.md](../video-craft/references/reference-recreation.md) directly.
 
 ## Decision rules
 
@@ -98,8 +98,9 @@ and explicit audio/asset preferences; label any defaults as proposed.
   video, show one concept.
 - Summarize the production line, aspect, duration, video language, intended audio
   mode and supplied-asset usage. With no supplied assets, say so.
-- Include a short assets-and-cost line: proposed visual and music sources,
-  known costs or costs still to be established in the plan, and which later
+- Include a short assets-and-cost line: proposed visual and music sources
+  (for a product video, its captured real visuals; read
+  `../video-craft/references/product-source.md` before capturing), known costs or costs still to be established in the plan, and which later
   operations need authorization under `gate-control`. Make that boundary visible
   to the user; choosing a direction only authorizes planning. Distinguish intended
   sources from verified rights and estimated costs from actual quotes; do not

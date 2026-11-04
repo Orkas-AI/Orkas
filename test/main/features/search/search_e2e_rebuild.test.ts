@@ -1,3 +1,4 @@
+import { BULK_MAIN_GAP_LIMIT_MS } from '../../../helpers/latency-budget';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -86,7 +87,8 @@ it('keeps real searches and the main timer responsive while indexing a full mult
   const maxGap = Math.max(...gaps);
   const sorted = partial.map(query => query.ms).sort((a, b) => a - b);
   const p95 = sorted[Math.floor((sorted.length - 1) * .95)];
-  expect(maxGap, 'main timer remains interactive during the native worker transaction').toBeLessThan(300);
+  expect(maxGap, 'main timer remains interactive during the native worker transaction').toBeLessThan(BULK_MAIN_GAP_LIMIT_MS);
+  expect(controlGap, 'the synchronous control must exceed the platform ceiling').toBeGreaterThanOrEqual(BULK_MAIN_GAP_LIMIT_MS);
   expect(maxGap, 'negative control must detect main-thread tokenization/writes').toBeLessThan(controlGap / 2);
   expect(p95).toBeLessThan(200);
   expect(store.docCount(uid), 'reader statistics observe external worker commits').toBe(2);
@@ -166,4 +168,55 @@ it('does not block main invalidation or deletion behind an active worker write t
     expect(store.postingsFor(uid, 'freshmarker')).toHaveLength(1);
     expect(store.docCount(uid)).toBe(2);
   } finally { await run.catch(() => undefined); db.close(); }
+});
+
+it('backfills legacy public projections without changing existing postings, then skips unchanged files after restart', async () => {
+  const ix = await import('../../../../src/main/features/search/indexer');
+  const store = await import('../../../../src/main/features/search/chat_store');
+  const file = write('legacy', [{ text: 'legacyneedle 电商领域' }]);
+  const stat = fs.statSync(file);
+  store.writeRebuildBatch(uid, 'legacy', [{ cid: 'legacy', msgIndex: 0, text: 'legacyneedle 电商领域' }],
+    { mtime: stat.mtimeMs, size: stat.size, next: 1 }, true, true);
+  store.markRebuildComplete(uid, 'legacy-source');
+  const postings = store.postingsFor(uid, 'legacyneedle');
+  const db = new Database(store.chatStorePath(uid));
+  try {
+    // Reproduce the previous schema rather than preparing the new cache API.
+    db.exec('DROP TABLE chat_projections; DROP TABLE chat_projection_files');
+    store.closeAllChatStores();
+    expect(store.postingsFor(uid, 'legacyneedle')).toEqual(postings);
+    db.exec("CREATE TRIGGER preserve_postings BEFORE DELETE ON chat_postings BEGIN SELECT RAISE(ABORT, 'valid legacy postings must survive'); END");
+    expect(await ix.reconcileChatsIndex(uid)).toMatchObject({ complete: true, updated: 1 });
+    expect(store.postingsFor(uid, 'legacyneedle')).toEqual(postings);
+    expect(store.readProjectionStamp(uid, 'legacy')).toBeTruthy();
+    await ix.flushAll();
+    expect(await ix.reconcileChatsIndex(uid)).toMatchObject({ complete: true, updated: 0 });
+    const search = await import('../../../../src/main/features/search');
+    expect((await search.searchChats(uid, 'legacyneedle'))[0]?.snippet).toBe('legacyneedle 电商领域');
+  } finally { db.close(); }
+});
+
+it('restarts a partial projection after same-size source replacement instead of certifying old prefix snippets', async () => {
+  const { ChatRebuildWorker } = await import('../../../../src/main/features/search/chat-rebuild');
+  const store = await import('../../../../src/main/features/search/chat_store');
+  const { indexedJsonlStamp } = await import('../../../../src/main/util/indexed-jsonl');
+  const { projectEncodedChatSnippet } = await import('../../../../src/main/features/search/chat-projection');
+  const file = write('partial', Array.from({ length: 40 }, (_, i) => ({ text: `oldmarker ${i}` })));
+  fs.utimesSync(file, 100, 100);
+  const stat = fs.statSync(file);
+  const input = { file, fileKey: 'partial', mtime: stat.mtimeMs, size: stat.size };
+  let worker = new ChatRebuildWorker(uid);
+  try {
+    expect(await worker.rebuildBatch(input)).toMatchObject({ valid: true, complete: false, next: 16 });
+    expect(store.readProjectionStamp(uid, 'partial')).toBeUndefined();
+    await worker.close();
+    fs.writeFileSync(file + '.new', fs.readFileSync(file, 'utf8').replaceAll('oldmarker', 'newmarker'));
+    fs.utimesSync(file + '.new', 100, 100); fs.renameSync(file + '.new', file);
+    worker = new ChatRebuildWorker(uid);
+    while (!(await worker.rebuildBatch(input)).complete) { /* bounded worker batches */ }
+    const payload = store.readChatProjection(uid, 'partial', 0, await indexedJsonlStamp(file));
+    expect(projectEncodedChatSnippet(payload!, ['newmarker'])?.snippet).toBe('newmarker 0');
+    expect(store.postingsFor(uid, 'oldmarker')).toHaveLength(0);
+    expect(store.postingsFor(uid, 'newmarker')).toHaveLength(40);
+  } finally { await worker.close(); }
 });

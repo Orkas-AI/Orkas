@@ -549,6 +549,39 @@ describe('project_driver_runner › runTaskNow in the to-do\'s own conversation'
     expect(await projectTasks.getTask(UID, PID, task.id)).toMatchObject({ status: 'todo', origin_cid: 'c_origin' });
   });
 
+  it.each([
+    { scope: 'project', originProject: '' },
+    { scope: 'project', originProject: 'p_aabbccddeeff' },
+    { scope: 'global', originProject: PID },
+  ])('starts a new $scope conversation when the original one is outside the to-do\'s scope (origin project "$originProject")', async ({ scope, originProject }) => {
+    // A conversation whose project filing failed, was undone, or that moved
+    // into a project afterwards cannot reach this to-do with todo_tasks.
+    const pid = scope === 'project' ? PID : '';
+    vi.mocked(chats.getConversation).mockResolvedValue({
+      conversation_id: 'c_origin', title: 'Novel', ...(originProject ? { project_id: originProject } : {}),
+    } as never);
+    const created = await projectTasks.createTask(UID, pid, { title: 'Ship the thing', created_by: 'user', origin_cid: 'c_origin' });
+    if (!created.ok) throw new Error('seed failed');
+    const res = await runner.runTaskNow(UID, pid, created.task.id);
+
+    expect(res).toMatchObject({ ok: true, cid: 'c_run', reused: false });
+    expect(vi.mocked(chats.createConversation).mock.calls[0][1]?.projectId || '').toBe(pid);
+    expect((vi.mocked(groupChat.send).mock.calls[0][0] as { cid: string }).cid).toBe('c_run');
+    expect(chats.deleteConversation).not.toHaveBeenCalled();
+    expect(await projectTasks.getTask(UID, pid, created.task.id)).toMatchObject({ status: 'progress', origin_cid: 'c_run' });
+  });
+
+  it('runs a global to-do in its original conversation outside any project', async () => {
+    vi.mocked(chats.getConversation).mockResolvedValue({ conversation_id: 'c_origin', title: 'Novel' } as never);
+    const created = await projectTasks.createTask(UID, '', { title: 'Ship the thing', created_by: 'user', origin_cid: 'c_origin' });
+    if (!created.ok) throw new Error('seed failed');
+    const res = await runner.runTaskNow(UID, '', created.task.id);
+
+    expect(res).toMatchObject({ ok: true, cid: 'c_origin', reused: true });
+    expect(chats.createConversation).not.toHaveBeenCalled();
+    expect(await projectTasks.getTask(UID, '', created.task.id)).toMatchObject({ status: 'progress', origin_cid: 'c_origin' });
+  });
+
   it('reports a busy original conversation instead of starting a second run', async () => {
     vi.mocked(chats.getConversation).mockResolvedValue({ conversation_id: 'c_origin', project_id: PID } as never);
     vi.mocked(groupChat.busIsQuiescent).mockImplementation((_uid: string, cid: string) => cid !== 'c_origin');

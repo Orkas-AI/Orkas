@@ -333,6 +333,11 @@ export async function runTaskNow(
       log.warn(`runTaskNow origin lookup failed uid=${maskId(uid)} pid=${maskId(pid)} tid=${maskId(tid)}`, { error: logErrorSummary(err) });
     }
   }
+  // Only a conversation in the to-do's own scope can update it with
+  // todo_tasks. One whose filing into the project failed or was undone, or
+  // that moved into a project after a global to-do was saved from it, gets a
+  // fresh conversation instead.
+  if (origin && ((origin as chats.Conversation).project_id || '') !== pid) origin = null;
   if (origin && !busIsQuiescent(uid, originCid)) {
     return { ok: false, error: 'conversation_busy', cid: originCid, conversation: origin, reused: true };
   }
@@ -539,4 +544,10 @@ export function startDriverScheduler(): void {
   }, DRIVER_TICK_MS);
   if (typeof _timer.unref === 'function') _timer.unref();
   log.info('driver scheduler started');
+}
+
+/** Stop admitting periodic advances after a confirmed application quit. */
+export function stopDriverScheduler(): void {
+  if (_timer) clearInterval(_timer);
+  _timer = null;
 }

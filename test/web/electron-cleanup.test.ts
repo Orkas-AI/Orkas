@@ -1,68 +1,135 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, unlinkSync, rmSync, existsSync } from 'node:fs';
+
+import { tmpdir } from 'node:os';
+
+import { randomUUID } from 'node:crypto';
+
 import path from 'node:path';
+
 import ts from 'typescript';
+
 import { spawn } from 'node:child_process';
+
 import { EventEmitter } from 'node:events';
+
 import { expect, it, vi } from 'vitest';
+
 import { closeElectronFixture, requestElectronQuit } from '../e2e/fixtures/electron-cleanup';
+
+import { analyzeWebAppLogs } from '../e2e/fixtures/web-app-log-analysis';
+
+
+function evaluateQuit(callback: (electron: any) => void, electron: any,
+  inspector: { close(): void } | (() => never) = { close: vi.fn() }): void {
+  // Playwright serializes the callback into the application's Node context.
+  // Keep its inspector isolated from the Vitest process in this control.
+  new Function('process', 'setImmediate', 'electron', `return (${callback.toString()})(electron);`)(
+    { mainModule: { require: (name: string) => {
+      expect(name).toBe('node:inspector');
+      return typeof inspector === 'function' ? inspector() : inspector;
+    } } }, setImmediate, electron,
+  );
+}
+
+
+it.each([false, true])('isolates Chromium stub traffic while preserving explicit proxy coverage (proxy: %s)', async systemProxyRouting => {
+  const source = ts.createSourceFile('orkas.ts', readFileSync(
+    path.join(__dirname, '../e2e/fixtures/orkas.ts'), 'utf8'), ts.ScriptTarget.Latest, true);
+  const owner = source.statements.find((node): node is ts.ClassDeclaration =>
+    ts.isClassDeclaration(node) && node.name?.text === 'OrkasTestApp');
+  const launch = owner?.members.find(member => member.name?.getText(source) === 'launch');
+  if (!launch) throw new Error('Missing fixture launch owner');
+  const code = ts.transpileModule(`class LaunchOwner { ${launch.getText(source)} }`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const reachedLaunch = new Error('launch boundary reached');
+  const launchApplication = vi.fn(async (_options: { args: string[]; env: Record<string, string> }) => { throw reachedLaunch; });
+  const Owner = new Function('electron', 'PC_ROOT', 'path', '__dirname', 'process', `${code}; return LaunchOwner;`)(
+    { launch: launchApplication }, '/fixture/pc', path, '/fixture', { platform: process.platform, env: {} });
+  const fixture = Object.assign(new Owner(), {
+    root: '/fixture', options: {}, enableSystemProxy: systemProxyRouting, apiBaseUrl: 'http://127.0.0.1:12345/api',
+    workspaceRoot: '/fixture/workspace', userDataRoot: '/fixture/user-data', authRoot: '/fixture/auth',
+    ensureStubServer: async () => {},
+  });
+  await expect(fixture.launch()).rejects.toBe(reachedLaunch);
+  const invocation = launchApplication.mock.calls[0][0] as { args: string[]; env: Record<string, string> };
+  expect(invocation.args.includes('--no-proxy-server')).toBe(!systemProxyRouting);
+  expect(invocation.env.ORKAS_NO_AUTO_PROXY).toBe(systemProxyRouting ? '0' : '1');
+});
+
 
 it('defers graceful quit outside evaluation and waits for the real close event', async () => {
   const app = new EventEmitter() as any;
-  app.windows = () => [{}];
+  app.windows = () => [{ isClosed: () => false, evaluate: vi.fn(async () => {}) }];
   app.close = vi.fn(async () => {});
   let evaluating = false;
   let requested = false;
   let finished = false;
   app.evaluate = async (callback: any) => {
     evaluating = true;
-    callback({ app: { quit: () => { expect(evaluating).toBe(false); requested = true; } } });
+    evaluateQuit(callback, { app: { quit: () => { expect(evaluating).toBe(false); requested = true; } } });
     expect(requested).toBe(false);
     evaluating = false;
   };
   const completion = requestElectronQuit(app).then(() => { finished = true; });
-  await new Promise(resolve => setImmediate(resolve));
-  expect(requested).toBe(true);
+  await vi.waitFor(() => expect(requested).toBe(true));
   expect(finished).toBe(false);
   app.emit('close');
   await completion;
   expect(app.listenerCount('close')).toBe(0);
 });
 
+
 it('preserves quit request errors and removes the close observer', async () => {
   const app = new EventEmitter() as any;
-  app.windows = () => [{}];
+  app.windows = () => [{ isClosed: () => false, evaluate: vi.fn(async () => {}) }];
   app.evaluate = async () => { throw new Error('inspector unavailable'); };
   await expect(requestElectronQuit(app)).rejects.toThrow('inspector unavailable');
   expect(app.listenerCount('close')).toBe(0);
 });
 
-it('releases the inspector after deferred quit so the real application can exit', async () => {
+
+it('detaches the inspector before one deferred quit without asking Playwright to quit again', async () => {
   const app = new EventEmitter() as any;
-  app.windows = () => [{}];
+  app.windows = () => [{ isClosed: () => false, evaluate: vi.fn(async () => {}) }];
   let quit!: () => void;
   const quitting = new Promise<void>(resolve => { quit = resolve; });
-  app.evaluate = async (callback: any) => { callback({ app: { quit } }); };
+  const steps: string[] = [];
+  const inspector = { close: vi.fn(() => { steps.push('detach'); }) };
+  app.evaluate = async (callback: any) => {
+    evaluateQuit(callback, { app: { quit: () => { steps.push('quit'); quit(); app.emit('close'); } } }, inspector);
+  };
   app.close = vi.fn(async () => { await quitting; app.emit('close'); });
   await requestElectronQuit(app);
-  expect(app.close).toHaveBeenCalledTimes(1);
+  expect(steps).toEqual(['detach', 'quit']);
+  expect(inspector.close).toHaveBeenCalledTimes(1);
+  expect(app.close).not.toHaveBeenCalled();
   expect(app.listenerCount('close')).toBe(0);
 });
 
-it('preserves inspector detach failures instead of reporting graceful shutdown', async () => {
+
+it('preserves inspector setup failures instead of reporting graceful shutdown', async () => {
   const app = new EventEmitter() as any;
   const failure = new Error('inspector detach failed');
-  app.windows = () => [{}];
-  app.evaluate = async (callback: any) => { callback({ app: { quit: () => {} } }); };
-  app.close = async () => { throw failure; };
+  app.windows = () => [{ isClosed: () => false, evaluate: vi.fn(async () => {}) }];
+  const quit = vi.fn();
+  app.evaluate = async (callback: any) => evaluateQuit(callback, { app: { quit } }, () => { throw failure; });
+  app.close = vi.fn();
   await expect(requestElectronQuit(app)).rejects.toBe(failure);
+  expect(quit).not.toHaveBeenCalled();
+  expect(app.close).not.toHaveBeenCalled();
   expect(app.listenerCount('close')).toBe(0);
 });
 
-it('waits for real close when quitting destroys the inspector before the close event', async () => {
+
+it.each([
+  'electronApplication.evaluate: Execution context was destroyed, most likely because of a navigation.',
+  'electronApplication.evaluate: Target page, context or browser has been closed',
+])('waits for real process close after an inspector-disposal race: %s', async message => {
   const app = new EventEmitter() as any;
-  app.windows = () => [{}];
+  app.windows = () => [{ isClosed: () => false, evaluate: vi.fn(async () => {}) }];
   app.close = vi.fn(async () => {});
-  app.evaluate = async () => { throw new Error('electronApplication.evaluate: Execution context was destroyed, most likely because of a navigation.'); };
+  app.evaluate = async () => { throw new Error(message); };
   let finished = false;
   const completion = requestElectronQuit(app).then(() => { finished = true; });
   // Observe rejection immediately as well, so the negative control is bounded.
@@ -74,6 +141,7 @@ it('waits for real close when quitting destroys the inspector before the close e
   expect(finished).toBe(true);
   expect(app.listenerCount('close')).toBe(0);
 });
+
 
 it.skipIf(process.platform === 'darwin')('waits for natural shutdown after the final window closes', async () => {
   const app = new EventEmitter() as any;
@@ -93,6 +161,7 @@ it.skipIf(process.platform === 'darwin')('waits for natural shutdown after the f
   expect(child.listenerCount('exit')).toBe(0);
 });
 
+
 it('captures ownership before a successful close disposes the application object', async () => {
   let closed = false;
   const child = { exitCode: 0, signalCode: null } as any;
@@ -103,6 +172,7 @@ it('captures ownership before a successful close disposes the application object
   }, 'unused-trace.zip')).resolves.toBeUndefined();
   expect(closed).toBe(true);
 });
+
 
 it('bounds stuck tracing and shutdown, stops only the owned process and preserves the failure', async () => {
   const node = process.env.ORKAS_TEST_NODE || process.execPath;
@@ -132,6 +202,7 @@ it('bounds stuck tracing and shutdown, stops only the owned process and preserve
   }
 });
 
+
 it('retains the original application-close error as the cleanup failure cause', async () => {
   const original = new Error('injected inspector close failure');
   const result = closeElectronFixture({
@@ -144,6 +215,7 @@ it('retains the original application-close error as the cleanup failure cause', 
   });
 });
 
+
 // Exercise the actual owner method without loading Playwright's fixture runner.
 // A timeout may overlap relaunch with teardown; neither may duplicate trace/quit
 // or clear an application that has since replaced the captured instance.
@@ -154,7 +226,7 @@ function createCleanupOwner(app: any) {
     ts.isClassDeclaration(node) && node.name?.text === 'OrkasTestApp');
   if (!owner) throw new Error('Missing fixture owner');
   const members = owner.members.filter(member =>
-    member.name && ['closeCurrentApp', 'appClosePromises', 'appTraceStops', 'nativeShutdownProcesses', 'stopAppTrace', 'prepareForNativeShutdown', 'launchAfterNativeExit', 'launchAfterCrash'].includes(member.name.getText(file)));
+    member.name && ['closeCurrentApp', 'appClosePromises', 'appTraceStops', 'appProcesses', 'nativeShutdownProcesses', 'stopAppTrace', 'prepareForNativeShutdown', 'launchAfterNativeExit', 'launchAfterCrash'].includes(member.name.getText(file)));
   const code = ts.transpileModule(`class CleanupOwner { ${members.map(m => m.getText(file)).join('\n')} }`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
@@ -166,21 +238,25 @@ function createCleanupOwner(app: any) {
   });
 }
 
+
 function controlledCleanupApp(closeError?: Error) {
   let release!: () => void;
   const tracingGate = new Promise<void>(resolve => { release = resolve; });
   const app = new EventEmitter() as any;
-  app.windows = () => [{}];
-  app.close = vi.fn(async () => {});
-  app.process = () => ({ exitCode: 0, signalCode: null });
+  const child = Object.assign(new EventEmitter(), { exitCode: null as number | null, signalCode: null as string | null,
+    kill: (signal: string) => { child.signalCode = signal; child.emit('exit', null, signal); return true; } });
+  app.windows = () => [{ isClosed: () => false, evaluate: vi.fn(async () => {}) }];
+  app.close = vi.fn(async () => { child.exitCode = 0; });
+  app.process = () => child;
   const stop = vi.fn(() => tracingGate);
   app.context = () => ({ tracing: { stop } });
   app.evaluate = vi.fn(async (callback: any) => {
     if (closeError) throw closeError;
-    callback({ app: { quit: () => app.emit('close') } });
+    evaluateQuit(callback, { app: { quit: () => { child.exitCode = 0; child.emit('exit', 0); app.emit('close'); } } });
   });
   return { app, stop, release };
 }
+
 
 it('shares one trace and graceful shutdown when relaunch and teardown overlap', async () => {
   const { app, stop, release } = controlledCleanupApp();
@@ -196,6 +272,7 @@ it('shares one trace and graceful shutdown when relaunch and teardown overlap', 
   expect(owner.page).toBeNull();
 });
 
+
 it('exports tracing before native shutdown and reuses that export during teardown', async () => {
   const { app, stop, release } = controlledCleanupApp();
   const owner = createCleanupOwner(app);
@@ -208,6 +285,22 @@ it('exports tracing before native shutdown and reuses that export during teardow
   expect(owner.tracePaths).toEqual(['trace-1.zip']);
   expect(app.evaluate).toHaveBeenCalledTimes(1);
 });
+
+
+it('uses launch-time process ownership after a user exit disposes the Playwright application', async () => {
+  const { app, release } = controlledCleanupApp();
+  const owner = createCleanupOwner(app);
+  const child = { exitCode: 0, signalCode: null } as any;
+  owner.appProcesses = new WeakMap([[app, child]]);
+  release(); await owner.prepareForNativeShutdown();
+  app.process = () => { throw new Error('Application object already disposed'); };
+  app.context = () => { throw new Error('Browser context already disposed'); };
+  await expect(owner.closeCurrentApp()).resolves.toBeUndefined();
+  expect(app.evaluate).not.toHaveBeenCalled();
+  expect(app.close).not.toHaveBeenCalled();
+  expect(owner.electronApp).toBeNull();
+});
+
 
 it('delivers the same cleanup failure and original cause to both overlapping callers', async () => {
   const cause = new Error('injected owner close failure');
@@ -223,6 +316,7 @@ it('delivers the same cleanup failure and original cause to both overlapping cal
   expect(first.reason).toMatchObject({ message: 'Electron fixture cleanup failed: application-close', cause });
   expect(owner.electronApp).toBeNull();
 });
+
 
 it('leaves a replacement application and page owned after the old close finishes', async () => {
   const { app, release } = controlledCleanupApp();
@@ -241,10 +335,64 @@ it('leaves a replacement application and page owned after the old close finishes
 });
 
 
+it.each(['success', 'application-error', 'cleanup-error'] as const)(
+  'retains the canonical complete log for downstream analyzers after %s in checkpoint mode', async scenario => {
+    const file = ts.createSourceFile('orkas.ts', readFileSync(
+      path.join(__dirname, '../e2e/fixtures/orkas.ts'), 'utf8'), ts.ScriptTarget.Latest, true);
+    const owner = file.statements.find((node): node is ts.ClassDeclaration =>
+      ts.isClassDeclaration(node) && node.name?.text === 'OrkasTestApp');
+    const dispose = owner?.members.find(member => member.name?.getText(file) === 'dispose');
+    if (!dispose) throw new Error('Missing fixture disposal owner');
+    const code = ts.transpileModule(`class DisposalOwner { ${dispose.getText(file)} }`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const dependencies = { mkdirSync, writeFileSync, unlinkSync, rmSync, randomUUID, path, Buffer,
+      analyzeWebAppLogs, collectLogFiles: () => '[fixture-cleanup] complete\n', expect };
+    const Owner = new Function(...Object.keys(dependencies), `${code}; return DisposalOwner;`)(...Object.values(dependencies));
+    const root = mkdtempSync(path.join(tmpdir(), 'electron-log-retention-'));
+    const fixtureRoot = path.join(root, 'fixture');
+    const outputDir = path.join(root, 'output');
+    mkdirSync(fixtureRoot);
+    const raw = scenario === 'application-error'
+      ? '[main:stderr] [12:00:00.000] [error] [(fixture)] controlled failure'
+      : '[main:stdout] complete application evidence';
+    const failure = new Error('controlled cleanup failure');
+    const testInfo = { status: 'passed', expectedStatus: 'passed', outputDir,
+      outputPath: (name: string) => path.join(outputDir, name), attach: vi.fn(async () => {}) };
+    const app = Object.assign(new Owner(), { testInfo, root: fixtureRoot, page: null,
+      resourceDenials: new Map(), browserDenials: new Map(), rendererPageErrors: [],
+      recoveredRendererErrors: new Set(), diagnostics: [raw], tracePaths: [],
+      expectedInvokeFailures: [], expectedRendererFailures: new Map(), expectedApiFailures: [], apiResponses: [],
+      recoveredDiagnosticRanges: () => [],
+      closeCurrentApp: async () => { if (scenario === 'cleanup-error') throw failure; },
+      closeStubServer: async () => {},
+    });
+    vi.stubEnv('ORKAS_TEST_BATCH_REPORT', 'controlled-checkpoint.json');
+    try {
+      if (scenario === 'application-error') await expect(app.dispose()).rejects.toThrow('Unexpected Electron diagnostics');
+      else if (scenario === 'cleanup-error') await expect(app.dispose()).rejects.toBe(failure);
+      else await app.dispose();
+      const canonical = testInfo.outputPath('electron-main.log');
+      expect(existsSync(canonical), 'A failure must retain the same canonical path as success').toBe(true);
+      expect(readFileSync(canonical, 'utf8')).toBe(`${raw}\n[fixture-cleanup] complete\n`);
+      expect(existsSync(fixtureRoot), 'Owned resources are cleaned even when evidence fails').toBe(false);
+      const analysis = JSON.parse(readFileSync(testInfo.outputPath('electron-log-analysis.json'), 'utf8'));
+      expect(analysis.passed).toBe(scenario !== 'application-error');
+      expect(analysis.coveragePassed).toBe(true);
+      expect(testInfo.attach).toHaveBeenCalledWith('electron-logs', expect.objectContaining({ path: expect.any(String) }));
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+
+
 it('reopens through fixture ownership after prepared clean native exit without a fallback quit', async () => {
   const { app, stop, release } = controlledCleanupApp();
   const owner = createCleanupOwner(app);
   const child = app.process();
+  child.exitCode = 0;
   app.process = vi.fn(() => child);
   release();
   await owner.prepareForNativeShutdown();
@@ -269,6 +417,7 @@ it('reopens through fixture ownership after prepared clean native exit without a
   expect(owner.page).toBe(replacementPage);
 });
 
+
 it.each([
   { exitCode: null, signalCode: null },
   { exitCode: 2, signalCode: null },
@@ -289,8 +438,10 @@ it.each([
   expect(app.close).not.toHaveBeenCalled();
 });
 
+
 it('requires native trace preparation and preserves its export failure', async () => {
   const { app } = controlledCleanupApp();
+  app.process().exitCode = 0;
   const owner = createCleanupOwner(app);
   const page = owner.page;
   owner.launch = vi.fn();
@@ -306,8 +457,10 @@ it('requires native trace preparation and preserves its export failure', async (
   expect(app.close).not.toHaveBeenCalled();
 });
 
+
 it('preserves a replacement owner when native trace export settles late', async () => {
   const { app, release } = controlledCleanupApp();
+  app.process().exitCode = 0;
   const owner = createCleanupOwner(app);
   owner.launch = vi.fn();
   const exporting = owner.prepareForNativeShutdown();
@@ -327,8 +480,10 @@ it('preserves a replacement owner when native trace export settles late', async 
   expect(app.close).not.toHaveBeenCalled();
 });
 
+
 it('does not bypass cleanup already owned by teardown after native exit', async () => {
   const { app, release } = controlledCleanupApp();
+  app.process().exitCode = 0;
   const owner = createCleanupOwner(app);
   owner.launch = vi.fn();
   release();
@@ -338,6 +493,7 @@ it('does not bypass cleanup already owned by teardown after native exit', async 
   expect(owner.electronApp).toBe(app);
   expect(owner.launch).not.toHaveBeenCalled();
 });
+
 
 it('reopens only the prepared SIGKILL owner without querying its disposed channels or issuing quit', async () => {
   const { app, stop, release } = controlledCleanupApp();
@@ -364,6 +520,7 @@ it('reopens only the prepared SIGKILL owner without querying its disposed channe
   for (const operation of [app.process, app.context, app.evaluate, app.close]) expect(operation).not.toHaveBeenCalled();
 });
 
+
 it.each([
   { exitCode: null, signalCode: null },
   { exitCode: 0, signalCode: null },
@@ -386,6 +543,7 @@ it.each([
   expect(app.close).not.toHaveBeenCalled();
 });
 
+
 it('requires captured crash ownership and retains trace export failures without clearing the app', async () => {
   const { app } = controlledCleanupApp();
   app.process = () => ({ exitCode: null, signalCode: 'SIGKILL' });
@@ -404,6 +562,7 @@ it('requires captured crash ownership and retains trace export failures without 
   expect(app.evaluate).not.toHaveBeenCalled();
   expect(app.close).not.toHaveBeenCalled();
 });
+
 
 it('preserves a replacement owner while the crashed app trace export settles', async () => {
   const { app, release } = controlledCleanupApp();
@@ -426,6 +585,7 @@ it('preserves a replacement owner while the crashed app trace export settles', a
   expect(app.close).not.toHaveBeenCalled();
 });
 
+
 it.each(['before', 'during'])('preserves teardown ownership acquired %s crash trace completion', async when => {
   const { app, release } = controlledCleanupApp();
   app.process = () => ({ exitCode: null, signalCode: 'SIGKILL' });
@@ -444,6 +604,7 @@ it.each(['before', 'during'])('preserves teardown ownership acquired %s crash tr
   expect(app.evaluate).not.toHaveBeenCalled();
   expect(app.close).not.toHaveBeenCalled();
 });
+
 
 it('allows at most one concurrent crash reopen after the same trace export', async () => {
   const { app, release } = controlledCleanupApp();

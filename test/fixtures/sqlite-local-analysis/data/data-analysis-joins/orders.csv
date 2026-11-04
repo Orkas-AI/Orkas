@@ -1,0 +1,6 @@
+order_id,customer_id,status
+o1,c1,completed
+o2,c2,completed
+o3,c3,cancelled
+o4,c9,completed
+o5,c1,completed

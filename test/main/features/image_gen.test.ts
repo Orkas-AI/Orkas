@@ -1294,3 +1294,57 @@ describe('mixed references across public adapters', () => {
   );
 
 });
+
+// Public request/result contracts, extracted from the final source diagnostics cases.
+describe('image generation public request boundaries', () => {
+  it.each(['blank', 'no-model', 'cancelled'] as const)('rejects %s before any provider request', async (scenario) => {
+    writeProfilesFile({}, []);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const abort = new AbortController();
+    if (scenario === 'cancelled') abort.abort();
+    const m = await import('../../../src/main/features/image_gen');
+    const result = await m.generateImage({ prompt: scenario === 'blank' ? '' : 'private prompt',
+      outputAbsPath: path.join(tmpDir, 'private.png'), signal: abort.signal });
+    expect(result).toMatchObject({ ok: false, dispatched: false });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['http', 'transport', 'reference'] as const)('returns %s failure without replaying the generation', async (failure) => {
+    writeProfilesFile({}, [], [{ id: 'image-openai', provider: 'openai', model: 'gpt-image-2',
+      apiKey: 'sk-private', label: 'private label', createdAt: 1 }]);
+    const fetchMock = vi.fn(async () => {
+      if (failure === 'http') return new Response('private provider body sk-private', { status: 403 });
+      throw new Error('private transport https://private.test/token');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const m = await import('../../../src/main/features/image_gen');
+    expect(await m.generateImage({ prompt: 'private prompt', outputAbsPath: path.join(tmpDir, 'private.png'),
+      ...(failure === 'reference' ? { referenceImagePaths: [path.join(tmpDir, 'missing-private.png')] } : {})
+    })).toMatchObject({ ok: false, errorCode: 'PROVIDER_API_ERROR' });
+    expect(fetchMock).toHaveBeenCalledTimes(failure === 'reference' ? 0 : 1);
+  });
+});
+
+
+describe('image call isolation', () => {
+  const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+  it('keeps overlapping calls independent when a late transport failure follows a saved image', async () => {
+    writeProfilesFile({}, [], [{ id: 'image-openai', provider: 'openai', model: 'gpt-image-2',
+      apiKey: 'fixture-key', label: 'fixture', createdAt: 1 }]);
+    let rejectFirst!: (error: Error) => void;
+    let calls = 0;
+    vi.stubGlobal('fetch', async () => {
+      if (++calls === 1) return await new Promise<Response>((_resolve, reject) => { rejectFirst = reject; });
+      return new Response(JSON.stringify({ data: [{ b64_json: PNG_B64 }] }));
+    });
+    const m = await import('../../../src/main/features/image_gen');
+    const first = m.generateImage({ prompt: 'first', outputAbsPath: path.join(tmpDir, 'first.png') });
+    await vi.waitFor(() => expect(calls).toBe(1));
+    expect(await m.generateImage({ prompt: 'second', outputAbsPath: path.join(tmpDir, 'second.png') })).toMatchObject({ ok: true });
+    rejectFirst(new Error('private transport failure'));
+    expect(await first).toMatchObject({ ok: false });
+    expect(fs.existsSync(path.join(tmpDir, 'first.png'))).toBe(false);
+    expect(fs.readFileSync(path.join(tmpDir, 'second.png'))).toEqual(Buffer.from(PNG_B64, 'base64'));
+  });
+});

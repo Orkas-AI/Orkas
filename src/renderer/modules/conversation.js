@@ -24,7 +24,13 @@ function _conversationLocalDateKey(now) {
 
 function _refreshConversationBucketsForDateChange(now) {
   const nextKey = _conversationLocalDateKey(now);
-  if (!nextKey || nextKey === _conversationBucketDateKey) return false;
+  if (!nextKey) return false;
+  if (nextKey === _conversationBucketDateKey) {
+    // Foreground return may expire recent rows within the same calendar day.
+    // Reuse the existing debounced event path without reloading other lists.
+    if (typeof refreshTodayTasksSectionForTimeChange === 'function') refreshTodayTasksSectionForTimeChange(now);
+    return false;
+  }
   _conversationBucketDateKey = nextKey;
   if (typeof renderConversationList === 'function') renderConversationList();
   return true;
@@ -1560,14 +1566,110 @@ function _renderMessageMarkdown(text, blockCache) {
 
 function _decorateMessageMarkdown(html, skills) {
   const needsSkillRewrite = _htmlMayContainKnownSkillIdForDisplay(html, skills);
+  // Same ID shape as _decorateTaskReferencesIn: snake_case text must not pay for a DOM parse on every paint.
+  const needsTaskLabels = html && /(?<![A-Za-z0-9_./\\-])(?:t_[a-f0-9]{12}|at_[a-f0-9]{8})(?![A-Za-z0-9_/\\-]|\.[A-Za-z0-9])/.test(html);
   // Mention highlighting requires DOM walking — do it on a detached
   // container, then return its innerHTML for the bubble to embed.
-  if (!html || (html.indexOf('@') < 0 && !needsSkillRewrite)) return html;
+  if (!html || (html.indexOf('@') < 0 && !needsSkillRewrite && !needsTaskLabels)) return html;
   const tmp = document.createElement('div');
   tmp.innerHTML = html;
   if (needsSkillRewrite) _replaceKnownSkillIdsIn(tmp, skills);
+  if (needsTaskLabels) _decorateTaskReferencesIn(tmp);
   _highlightMentionsIn(tmp);
   return tmp.innerHTML;
+}
+
+// Mark canonical typed IDs for authoritative resolution after the bubble mounts.
+// Code samples, resource paths and links retain their literal representation.
+function _decorateTaskReferencesIn(rootEl) {
+  const ids = /(?<![A-Za-z0-9_./\\-])(?:t_[a-f0-9]{12}|at_[a-f0-9]{8})(?![A-Za-z0-9_/\\-]|\.[A-Za-z0-9])/g;
+  const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const code = node.parentElement?.closest('code');
+      if (node.parentElement?.closest('pre, a, script, style, textarea, [data-chat-task-id]')) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      const text = node.nodeValue || '';
+      ids.lastIndex = 0;
+      const match = ids.exec(text);
+      if (!match || (code && (code.textContent !== match[0] || text !== match[0]))) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const targets = [];
+  let node;
+  while ((node = walker.nextNode())) targets.push(node);
+  for (const node of targets) {
+    const text = node.nodeValue || '';
+    const fragment = document.createDocumentFragment();
+    let last = 0;
+    ids.lastIndex = 0;
+    let match;
+    while ((match = ids.exec(text))) {
+      fragment.appendChild(document.createTextNode(text.slice(last, match.index)));
+      const chip = document.createElement('span');
+      chip.dataset.chatTaskId = match[0];
+      chip.dataset.chatTaskKind = match[0].startsWith('at_') ? 'automation' : 'todo';
+      chip.textContent = match[0];
+      fragment.appendChild(chip);
+      last = ids.lastIndex;
+    }
+    fragment.appendChild(document.createTextNode(text.slice(last)));
+    node.replaceWith(fragment);
+  }
+}
+
+// One local read batch at a time across history bubbles. No account-global
+// title cache: re-opening a conversation resolves current task content again.
+let _chatTaskReferenceReads = Promise.resolve();
+
+function _hydrateInlineTaskReferences(msg, savedTasks) {
+  if (!msg || typeof msg.querySelectorAll !== 'function') return;
+  const nodes = Array.from(msg.querySelectorAll('[data-chat-task-id]:not([data-task-reference-read])')).slice(0, 50);
+  if (!nodes.length) return;
+  const uid = currentUserId;
+  const cid = msg.dataset.billingCid || currentCid;
+  const pid = _projectIdForConversation(cid);
+  const sources = Array.isArray(savedTasks) ? savedTasks : [];
+  const refs = new Map();
+  for (const node of nodes) {
+    node.dataset.taskReferenceRead = '1';
+    const kind = node.dataset.chatTaskKind;
+    const id = node.dataset.chatTaskId;
+    const source = sources.find(task => task?.kind === kind && task.task_id === id);
+    refs.set(id, { kind, task_id: id, project_id: source?.project_id || (source ? '' : pid),
+      fallback_global: !source });
+  }
+  _chatTaskReferenceReads = _chatTaskReferenceReads.then(async () => {
+    if (msg.isConnected === false || currentUserId !== uid) return;
+    const result = await window.orkas.invoke('chatTaskReferences.resolve', { references: [...refs.values()] });
+    if (!result?.ok || !Array.isArray(result.references) || msg.isConnected === false || currentUserId !== uid) return;
+    const resolved = new Map(result.references.map(task => [task.task_id, task]));
+    const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    for (const node of nodes) {
+      const task = resolved.get(node.dataset.chatTaskId);
+      if (!node.isConnected || !task || task.kind !== node.dataset.chatTaskKind || !task.title?.trim()) continue;
+      const title = String(task.title).replace(/\s+/g, ' ').trim();
+      const characters = [];
+      for (const part of segmenter.segment(title)) {
+        characters.push(part.segment);
+        if (characters.length > 15) break;
+      }
+      const preview = characters.slice(0, 15).join('') + (characters.length > 15 ? '…' : '');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'chat-use-inline-chip chat-task-reference';
+      button.title = task.title;
+      button.innerHTML = `<span class="chat-task-reference-icon" aria-hidden="true">${_uiIconHtml(task.kind === 'automation' ? 'clock' : 'clipboard-list', 'ui-icon')}</span>`
+        + `<span class="chat-use-inline-name">${escapeHtml(preview)}</span>`;
+      _bindSavedTaskChipNavigation(button, task);
+      const target = node.parentElement?.tagName === 'CODE' ? node.parentElement : node;
+      target.replaceWith(button);
+    }
+  }).catch(() => { /* Keep literal IDs when the task cannot be resolved. */ })
+    .then(() => _hydrateInlineTaskReferences(msg, savedTasks));
 }
 
 function getChatRichComposerEditor(inputOrId) { return _composerApi(inputOrId)?.editor || null; }
@@ -4344,17 +4446,16 @@ async function _chatAttachSnapshotForSend(cid, opts = {}) {
       return { ok: false, reason: 'busy' };
     }
 
-    // Queued edits temporarily displace another draft in the same conversation.
-    // Its pending files must stay with that draft, outside the edited message.
+    // Preflight validates the displayed selection. Server recovery belongs to
+    // composer refresh; it must never silently expand the message being sent.
     const selectedNames = new Set(_chatAttachList(cid).map((item) => item?.name).filter(Boolean));
-    const serverItems = _chatAttachItemsFromServer(cid, opts.onlySelected
-      ? data.items.filter((item) => selectedNames.has(item?.name)) : data.items);
+    const serverItems = _chatAttachItemsFromServer(cid, data.items.filter((item) => selectedNames.has(item?.name)));
     const serverNames = new Set(serverItems.map((item) => String(item.name)));
     const localReady = _chatAttachList(cid).filter((item) => item && item.status === 'ready' && item.name);
     const missing = localReady.filter((item) => (
       !serverNames.has(String(item.name)) && (opts.requireServerMatch || !item.reused)
     ));
-    if ((opts.requireServerMatch || opts.onlySelected) && missing.length) {
+    if (missing.length) {
       _convLog.warn('attachment send snapshot mismatch', {
         missing_count: missing.length,
       });
@@ -5407,6 +5508,8 @@ window.addEventListener('i18n-change', () => {
 
 function _mountSavedTaskChips(msg, tasks) {
   const bubble = msg?.querySelector('.chat-bubble');
+  if (msg) msg._inlineSavedTasks = tasks;
+  if (bubble) _hydrateInlineTaskReferences(msg, tasks);
   if (!bubble || !Array.isArray(tasks)) return;
   for (const task of tasks.slice(0, 100)) {
     if (!task || !['automation', 'todo'].includes(task.kind)
@@ -5430,28 +5533,34 @@ function _mountSavedTaskChips(msg, tasks) {
     button.dataset.savedTaskTitle = name;
     button.innerHTML = `<span class="chat-app-nav-btn-page-icon" aria-hidden="true">${_uiIconHtml(task.kind === 'automation' ? 'clock' : 'clipboard-list', 'ui-icon chat-app-nav-btn-page-icon-svg')}</span><span class="chat-msg-created-agent-label"></span>`;
     _refreshSavedTaskChipLabel(button);
-    button.addEventListener('click', async () => {
-      if (button.disabled) return;
-      button.disabled = true;
-      try {
-        if (task.kind === 'automation') {
-          await _appNavOpenFeatureView('auto', 'auto', () => {
-            if (typeof window.focusAutoTaskById !== 'function') return false;
-            return window.focusAutoTaskById(task.task_id);
-          });
-        } else {
-          await _appNavLoadFeature('project', () => {
-            if (typeof focusTodo !== 'function') return false;
-            focusTodo(pid, task.task_id);
-            return true;
-          });
-        }
-      } catch (error) {
-        _appNavReportFailure(task.kind === 'automation' ? 'auto' : 'todos', 'open', error);
-      } finally { button.disabled = false; }
-    });
+    _bindSavedTaskChipNavigation(button, task);
     row.appendChild(button);
   }
+}
+
+function _bindSavedTaskChipNavigation(button, task) {
+  button.addEventListener('click', async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (button.disabled) return;
+    button.disabled = true;
+    try {
+      if (task.kind === 'automation') {
+        await _appNavOpenFeatureView('auto', 'auto', () => {
+          if (typeof window.focusAutoTaskById !== 'function') return false;
+          return window.focusAutoTaskById(task.task_id);
+        });
+      } else {
+        await _appNavLoadFeature('project', () => {
+          if (typeof focusTodo !== 'function') return false;
+          focusTodo(task.project_id || '', task.task_id);
+          return true;
+        });
+      }
+    } catch (error) {
+      _appNavReportFailure(task.kind === 'automation' ? 'auto' : 'todos', 'open', error);
+    } finally { button.disabled = false; }
+  });
 }
 
 // Skill mirror of the agent chip. Commander writes only custom skills,
@@ -5704,13 +5813,12 @@ function _startupConversationParams() {
   const params = new URLSearchParams({ mode: 'startup' });
   if (activeCid) params.set('active_cid', activeCid);
   if (expanded.length) params.set('expanded_projects', expanded.join(','));
-  // Local start of yesterday: the Recent Tasks section aggregates every task
-  // active today or yesterday, including rows under collapsed projects that the
-  // page slices would omit.
+  // Startup always includes pins, plus the same rolling 24h window used by
+  // Recent Tasks, including rows under collapsed projects omitted by page slices.
   const shared = typeof recentConversationsSince === 'function' ? recentConversationsSince(new Date()) : null;
   const since = shared && typeof shared.toISOString === 'function'
     ? shared
-    : (() => { const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - 1); return d; })();
+    : new Date(Date.now() - 24 * 60 * 60 * 1000);
   params.set('active_since', since.toISOString());
   return params.toString();
 }
@@ -5860,8 +5968,10 @@ async function loadConversationProject(projectId, options = {}) {
     const data = await res.json();
     if (removalRevision !== _conversationRemovalRevision) return;
     if (!data.ok) throw new Error(data.error || 'project conversation list failed');
+    // Pins also feed Recent Tasks; keep those outside this scope's first page.
+    // Returned rows overwrite cached pins, and startup refresh reconciles removals.
     if (append) _appendConversationSlice(data.conversations);
-    else _replaceConversationSlice(data.conversations, (c) => c && c.project_id === pid);
+    else _replaceConversationSlice(data.conversations, (c) => c && c.project_id === pid && !c.pinned_at);
     const next = data.next_offset === null ? null : Number(data.next_offset);
     const nextOffset = Number.isSafeInteger(next) && next >= 0 ? next : null;
     _conversationProjectPages.set(pid, {
@@ -5897,7 +6007,7 @@ async function loadUnprojectedConversations(options = {}) {
     if (removalRevision !== _conversationRemovalRevision) return;
     if (!data.ok) throw new Error(data.error || 'unprojected conversation list failed');
     if (append) _appendConversationSlice(data.conversations);
-    else _replaceConversationSlice(data.conversations, (c) => c && !c.project_id);
+    else _replaceConversationSlice(data.conversations, (c) => c && !c.project_id && !c.pinned_at);
     const next = data.next_offset === null ? null : Number(data.next_offset);
     _unprojectedConversationPage.initialized = true;
     _unprojectedConversationPage.total = Number(data.total) || 0;
@@ -8197,10 +8307,9 @@ function _captureHistoryReloadScroll(container) {
   return {
     top,
     bottom: Math.max(0, maxTop - top),
-    // Geometry alone is not enough: a small upward wheel gesture can remain
-    // within the near-bottom threshold while still expressing clear reading
-    // intent. Carry that explicit pause through the history rebuild.
-    nearBottom: !container._stickyUserPaused && _isNearFollowTarget(container),
+    // The send spacer can put a top-pinned message at the scroll limit.
+    // Preserve its position when recovery paints the reply below it.
+    nearBottom: !container._scrollPinActive && !container._stickyUserPaused && _isNearFollowTarget(container),
   };
 }
 
@@ -8216,6 +8325,10 @@ function _historyReloadTopForSnapshot(container, snapshot) {
 function _restoreHistoryReloadScroll(container, snapshot) {
   if (!container || !snapshot) return;
   const syncStickyState = () => {
+    if (container._scrollPinActive) {
+      container._scrollPinTargetTop = container.scrollTop;
+      return;
+    }
     container._stickyEnabled = snapshot.nearBottom === true && _isNearFollowTarget(container);
     container._stickyUserPaused = !container._stickyEnabled;
   };
@@ -8848,6 +8961,7 @@ async function _flushStreamingMathPaint(msg) {
     } else {
       _setStreamingFinalHtml(job.finalEl, rendered);
     }
+    if (job.finalEl._streamMarkdownComplete) _hydrateInlineTaskReferences(msg, msg._inlineSavedTasks);
     msg.dataset.streamPaintedDisplay = job.display;
     msg._streamMathLatestPaint = null;
     if (job.stickBottom) _stickBottomFromMsg(msg);
@@ -11974,6 +12088,16 @@ async function _recoverObservedConversationHistory(cid, signal) {
     const data = await res.json();
     if (!res.ok || !data || data.ok === false || !Array.isArray(data.history)) return false;
     if (signal?.aborted || cid !== currentCid) return false;
+    // A queued user message can be admitted after the initial history snapshot
+    // and before this future-only observer subscribes. Recover its canonical
+    // row as well as the reply; polling recovery below only renders assistants.
+    // Reuse persisted identity claiming so later events cannot duplicate it.
+    for (const message of data.history) {
+      if (message?.id && message.from === 'user' && !message.deleted_at
+          && _isVisibleGroupHistoryRecord(message)) {
+        _renderOrClaimPersistedUserMessage(cid, message, { autoScroll: false });
+      }
+    }
     return await _recoverPolledVisibleMessages(cid, data.history);
   } catch (err) {
     if (err?.name !== 'AbortError' && !signal?.aborted) {

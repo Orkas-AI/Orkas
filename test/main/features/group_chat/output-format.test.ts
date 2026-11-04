@@ -23,7 +23,7 @@ describe('group-chat response language', () => {
     expect(prompt).not.toContain('label in user UI language');
   });
 
-  it('keeps prompt-internal descriptions in English while user language outranks the Chinese UI fallback', async () => {
+  it('omits display descriptions while user language outranks the Chinese UI fallback', async () => {
     const prompt = await _buildAgentInGroupSystemPromptForTest({
       agent_id: 'language-contract-agent',
       name: 'LanguageContractAgent',
@@ -32,7 +32,7 @@ describe('group-chat response language', () => {
       workflow: 'This workflow is intentionally authored in English.',
     }, '/tmp/language-contract-agent', 'zh');
 
-    expect(prompt).toContain('ENGLISH_DESCRIPTION_SHOULD_NOT_RENDER');
+    expect(prompt).not.toContain('ENGLISH_DESCRIPTION_SHOULD_NOT_RENDER');
     expect(prompt).not.toContain('仅中文运行说明');
     expect(prompt).toContain('Fallback UI language: **Chinese (简体中文)**');
     expect(prompt).toContain('a current explicit request about reply language');
@@ -42,6 +42,39 @@ describe('group-chat response language', () => {
       .toBeGreaterThan(prompt.lastIndexOf('## Runtime injection'));
     expect(prompt.lastIndexOf('## User language'))
       .toBeGreaterThan(prompt.lastIndexOf('This workflow is intentionally authored in English.'));
+  });
+});
+
+describe('named Agent execution profile', () => {
+  it.each([
+    { description_en: 'ENGLISH_DISPLAY_ONLY' },
+    { description_zh: '中文展示简介' },
+    { description: 'LEGACY_DISPLAY_ONLY' },
+    { description_en: 'ENGLISH_DISPLAY_ONLY', description_zh: '中文展示简介', description: 'LEGACY_DISPLAY_ONLY' },
+    {},
+  ])('omits its own descriptions without losing execution guidance: %j', async (descriptions) => {
+    const prompt = await _buildAgentInGroupSystemPromptForTest({
+      agent_id: 'execution-profile-agent',
+      name: 'ExecutionProfileAgent',
+      ...descriptions,
+      workflow: 'WORKFLOW_REQUIRED: inspect the supplied file and deliver the requested report.',
+      profile: {
+        role: 'ROLE_REQUIRED: analyze the assigned business records.',
+        dispatch: 'BOUNDARY_REQUIRED: handle analysis within the assigned scope.',
+        standards: ['STANDARD_REQUIRED: support conclusions with evidence.'],
+        knowhow: ['CAPABILITY_DISPLAY_ONLY'],
+      },
+    }, '/tmp/execution-profile-agent', 'en');
+
+    for (const displayOnly of ['ENGLISH_DISPLAY_ONLY', '中文展示简介', 'LEGACY_DISPLAY_ONLY', 'CAPABILITY_DISPLAY_ONLY']) {
+      expect(prompt).not.toContain(displayOnly);
+    }
+    expect(prompt).not.toContain('$description');
+    expect(prompt).not.toMatch(/^- Description:/m);
+    expect(prompt).toContain('- Name: ExecutionProfileAgent');
+    for (const retained of ['WORKFLOW_REQUIRED', 'ROLE_REQUIRED', 'BOUNDARY_REQUIRED', 'STANDARD_REQUIRED']) {
+      expect(prompt.split(retained)).toHaveLength(2);
+    }
   });
 });
 

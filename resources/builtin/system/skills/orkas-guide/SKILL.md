@@ -1,7 +1,6 @@
 ---
 name: orkas-guide
-description_zh: "为问答或执行请求确认 Orkas 的支持范围、使用条件、积分与费用、配置、操作与恢复方式，包括任务中隐含的产品能力假设。不用于无关的普通内容工作；只提供产品事实，不接管任务或授予操作权限。"
-description_en: "Resolve Orkas support, usage conditions, credits and costs, configuration, operation and recovery facts for questions or actions, including implicit product assumptions. Not for Orkas-independent content; supplies facts, not task ownership or operation authority."
+description: "Resolve Orkas support, usage conditions, credits and costs, configuration, operation and recovery facts for questions or actions, including implicit product assumptions. Not for Orkas-independent content; supplies facts, not task ownership or operation authority."
 ---
 
 # Orkas Guide
@@ -39,7 +38,7 @@ For a broad “what can Orkas do?” question, start with `getting-started.md`, 
 - **Explain:** answer a factual “what/how/where” question with the shortest visible path.
 - **Navigate:** when an exact supported destination is available, pair the path with the app's click-to-open affordance. Do not invent a destination or claim that the screen opened before the user clicks.
 - **Diagnose:** for a reported blocked, failed, disconnected, or stuck state, inspect the smallest available sanitized app-status domain before choosing recovery. Never ask for or expose credentials, local paths, provider error text, or user content.
-- **Execute:** use the matching dedicated workflow for the requested operation, retaining this guide's product facts when deciding what can be done. If no dedicated operation exists, give a documented visible path when one exists; otherwise explain the limitation or unresolved availability.
+- **Execute:** supply the relevant product facts, prerequisites, visible results, and recovery for the requested operation.
 - **Verify:** describe an operation as complete only after its owning workflow returns success evidence; navigation and diagnostic results are not mutation evidence.
 
 ## Shape the answer

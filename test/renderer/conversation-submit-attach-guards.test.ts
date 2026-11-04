@@ -468,7 +468,35 @@ describe('composer attachment send lifecycle', () => {
     expect(context._chatAttachList(cid).map((item: any) => item.name)).toEqual(names);
     fail = false;
     expect((await context._chatAttachSnapshotForSend(cid, { onlySelected: true })).names).toEqual(names);
-    expect((await context._chatAttachSnapshotForSend(cid)).names).toEqual([...names, 'recovered.txt']);
+    expect((await context._chatAttachSnapshotForSend(cid)).names).toEqual(names);
+  });
+
+  it.each(['new-chat', 'conversation', 'project'])('never adds undisplayed server files during %s send', async entry => {
+    const { context, cid, submit, sends, alerts } = setup(entry);
+    context.apiFetch = async (url: string) => {
+      if (url.endsWith('/attachments')) return { json: async () => ({ ok: true,
+        items: [{ name: 'download.csv', kind: 'text', bytes: 12 }],
+      }) };
+      if (url.endsWith('/create')) return { json: async () => ({ ok: true,
+        conversation: { conversation_id: 'created', created_at: '2026-10-20T00:00:00Z' },
+      }) };
+      if (url.endsWith('/adopt')) return { json: async () => ({ ok: true, items: [] }) };
+      throw new Error('Unexpected send request');
+    };
+    expect(context._chatAttachList(cid)).toEqual([]);
+    await submit();
+    expect(alerts).toEqual([]);
+    expect(sends).toHaveLength(1);
+    expect(sends[0][2]?.attachments || []).toEqual([]);
+  });
+
+  it('keeps a selected message retryable when its file disappears during send preflight', async () => {
+    const { context, cid, submit, sends, alerts } = setup('conversation');
+    context._chatAttachSet(cid, [{ name: 'chosen.txt', kind: 'text', bytes: 1, status: 'ready' }]);
+    await submit();
+    expect(sends).toEqual([]);
+    expect(alerts).toEqual(['chat.attach_sync_failed']);
+    expect(context._chatAttachList(cid).map((item: any) => item.name)).toEqual(['chosen.txt']);
   });
 
   it.each(['new-chat', 'conversation', 'project'])('ignores repeated %s submit during an empty attachment preflight', async (entry) => {

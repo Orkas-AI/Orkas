@@ -115,7 +115,16 @@ describe('local_agents/backends/base', () => {
     vi.useRealTimers();
   });
 
-  it('uses taskkill tree mode on Windows and falls back when taskkill fails', () => {
+  it.each([
+    { event: 'error', value: Object.assign(new Error('private diagnostic'), { code: 'EPERM' }), signal: null,
+      outcome: { completion: 'error', error_code: 'EPERM' } },
+    { event: 'error', value: Object.assign(new Error('private diagnostic'), { code: 'private-code' }), signal: null,
+      outcome: { completion: 'error', error_code: 'unknown' } },
+    { event: 'exit', value: 128, signal: null,
+      outcome: { completion: 'exit', exit_code: 128, termination_signal: null } },
+    { event: 'exit', value: null, signal: 'SIGTERM',
+      outcome: { completion: 'exit', exit_code: null, termination_signal: 'SIGTERM' } },
+  ])('retains the Windows tree failure outcome $outcome without duplicating fallback', ({ event, value, signal, outcome }) => {
     const callbacks = new Map<string, (...args: any[]) => void>();
     const killer = {
       once: vi.fn((event: string, cb: (...args: any[]) => void) => {
@@ -126,10 +135,12 @@ describe('local_agents/backends/base', () => {
     };
     const spawnFn = vi.fn(() => killer);
     const child = { pid: 2468, kill: vi.fn() };
+    const complete = vi.fn();
 
     killProcessTree(child as any, 'SIGTERM', {
       platform: 'win32',
       spawnFn: spawnFn as any,
+      onComplete: complete,
     });
 
     expect(spawnFn).toHaveBeenCalledWith(
@@ -141,12 +152,16 @@ describe('local_agents/backends/base', () => {
     expect(child.kill).not.toHaveBeenCalled();
 
     cleanupWarning.mockClear();
-    callbacks.get('error')?.(new Error('private diagnostic'));
+    callbacks.get(event)?.(value, signal);
     callbacks.get('exit')?.(1);
     expect(child.kill).toHaveBeenCalledExactlyOnceWith('SIGTERM');
+    expect(complete).toHaveBeenCalledOnce();
     expect(cleanupWarning).toHaveBeenCalledExactlyOnceWith('CLI process tree termination failed', {
       platform: 'win32', failure: 'tree_command_failed', fallback: 'direct_child_only',
+      ...outcome,
     });
+    expect(JSON.stringify(cleanupWarning.mock.calls)).not.toContain('private');
+    expect(JSON.stringify(cleanupWarning.mock.calls)).not.toContain('2468');
   });
 
   it('does not signal a closed child again after cancellation grace expires', () => {
@@ -180,7 +195,7 @@ describe('local_agents/backends/base', () => {
 
   it('falls back to the direct Windows child when taskkill cannot start', () => {
     const child = { pid: 1357, kill: vi.fn() };
-    const spawnFn = vi.fn(() => { throw new Error('spawn failed'); });
+    const spawnFn = vi.fn(() => { throw Object.assign(new Error('private spawn failure'), { code: 'ENOENT' }); });
 
     cleanupWarning.mockClear();
     killProcessTree(child as any, 'SIGKILL', {
@@ -191,6 +206,7 @@ describe('local_agents/backends/base', () => {
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
     expect(cleanupWarning).toHaveBeenCalledExactlyOnceWith('CLI process tree termination failed', {
       platform: 'win32', failure: 'tree_command_unavailable', fallback: 'direct_child_only',
+      completion: 'spawn_throw', error_code: 'ENOENT',
     });
   });
 

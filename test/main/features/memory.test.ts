@@ -120,7 +120,11 @@ describe('memory › capacity', () => {
     expect(res.ok).toBe(false);
     expect(res.error).toMatch(/^memory full/);
     expect(res.error).toContain(`${limit + 1}/${limit} entries`);
-    expect(res.error).toMatch(/replace.*remov/);
+    expect(res.error).toContain('Use batch with this revision');
+    expect(res.error).toContain('obsolete or non-durable');
+    expect(res.error).toContain('preserve valid durable facts');
+    expect(res.error).toContain('skip the new fact');
+    expect(res.error).not.toContain('keeping every fact');
     expect(res.entries).toEqual(before);
     expect(res.usage.full).toBe(true);
     expect(res).not.toHaveProperty('evicted');

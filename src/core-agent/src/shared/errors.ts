@@ -36,6 +36,16 @@ export class ContextOverflowError extends CoreAgentError {
   }
 }
 
+/** The provider's first candidate changed after this request was prepared, and
+ * the new one was skipped only for capacity. Core prepares the same request
+ * once more for it; `cause` is the failure to surface if that cannot help. */
+export class ProviderCandidateChangedError extends CoreAgentError {
+  constructor(message: string, cause?: Error) {
+    super(message, "PROVIDER_CANDIDATE_CHANGED", cause);
+    this.name = "ProviderCandidateChangedError";
+  }
+}
+
 export class OutputLimitError extends CoreAgentError {
   constructor(message: string, cause?: Error) {
     super(message, "OUTPUT_LIMIT", cause);

@@ -18,6 +18,9 @@ const roots: string[] = [];
 const fakeToken = `test.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url')}.test`;
 const tool = createApplyPatchTool();
 const start: Message[] = [{ role: 'user', content: [{ type: 'text', text: 'Create the text file.' }] }];
+function declaredTools(payload: any): any[] {
+  return [...(payload.tools ?? []), ...payload.input.filter((row: any) => row.type === 'additional_tools').flatMap((row: any) => row.tools)];
+}
 function directory() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-patch-provider-'));
   roots.push(root);
@@ -49,10 +52,10 @@ describe('native patch input through the real provider SDK', () => {
   ] as const)('executes intact input and replays durable calls/results on %s / %s', async (providerId, method) => {
     const requests: any[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
-      return response(true, patch, requests.at(-1)?.tools?.[0]?.type === 'custom');
+      return response(true, patch, declaredTools(requests.at(-1))[0]?.type === 'custom');
     }));
-    const provider = createPiProvider({ provider: providerId, model: 'gpt-5.5', apiKey: fakeToken, onPayload: payload => { requests.push(structuredClone(payload)); } });
-    const params = { model: 'gpt-5.5', messages: start, tools: [toToolDefinition(tool)] };
+    const provider = createPiProvider({ provider: providerId, model: 'gpt-5.6-sol', apiKey: fakeToken, onPayload: payload => { requests.push(structuredClone(payload)); } });
+    const params = { model: 'gpt-5.6-sol', messages: start, tools: [toToolDefinition(tool)] };
     let content: Message['content'];
     if (method === 'complete') content = (await provider.complete(params)).content;
     else {
@@ -65,7 +68,9 @@ describe('native patch input through the real provider SDK', () => {
       expect(JSON.parse(deltas.join(''))).toEqual({ patch });
       expect(events.filter(event => event.type === 'tool_use_end')).toHaveLength(1);
     }
-    expect(requests[0].tools).toEqual([expect.objectContaining({ type: 'custom', name: 'apply_patch', format: expect.objectContaining({ type: 'grammar' }) })]);
+    expect(requests[0].tools ?? []).toEqual([]);
+    expect(requests[0].input[0]).toMatchObject({ type: 'additional_tools' });
+    expect(declaredTools(requests[0])).toEqual([expect.objectContaining({ type: 'custom', name: 'apply_patch', format: expect.objectContaining({ type: 'grammar' }) })]);
     expect(content).toHaveLength(1);
     expect(content).toMatchObject([{ type: 'tool_use', id: 'call_patch|ctc_patch', name: 'apply_patch', input: { patch } }]);
     const root = directory();
@@ -90,14 +95,14 @@ describe('native patch input through the real provider SDK', () => {
 
     // Model rotation must turn both halves back into ordinary function items.
     const fallback = createPiProvider({ provider: providerId, apiKey: fakeToken,
-      customModel: { ...getBuiltinModel(providerId, 'gpt-5.5'), compat: { supportsOpenAIGrammarTools: false } },
+      customModel: { ...getBuiltinModel(providerId, 'gpt-5.6-sol'), compat: { supportsOpenAIGrammarTools: false } },
       onPayload: payload => { requests.push(structuredClone(payload)); } });
     await fallback.complete({ ...params, messages: history });
-    expect(requests[2].tools[0].type).toBe('function');
+    expect(declaredTools(requests[2])[0].type).toBe('function');
     expect(requests[2].input.find((row: any) => row.type === 'function_call').arguments).toBe(JSON.stringify({ patch }));
     expect(requests[2].input.find((row: any) => row.type === 'function_call_output').call_id).toBe('call_patch');
     const otherConnection = createPiProvider({ provider: providerId, apiKey: fakeToken,
-      customModel: { ...getBuiltinModel(providerId, 'gpt-5.5'), baseUrl: 'https://other.invalid/v1' },
+      customModel: { ...getBuiltinModel(providerId, 'gpt-5.6-sol'), baseUrl: 'https://other.invalid/v1' },
       onPayload: payload => { requests.push(structuredClone(payload)); } });
     await otherConnection.complete({ ...params, messages: history });
     const foreignCall = requests[3].input.find((row: any) => row.type === 'custom_tool_call');
@@ -111,26 +116,30 @@ describe('native patch input through the real provider SDK', () => {
     const requests: any[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_url, init) => { requests.push(JSON.parse(typeof init.body === 'string' ? init.body : new TextDecoder().decode(init.body))); return response(); }));
     const provider = createPiProvider({ provider: 'openai', apiKey: fakeToken,
-      customModel: { ...getBuiltinModel('openai', 'gpt-5.5'), compat: { supportsOpenAIGrammarTools: true, supportsToolSearch: true, supportsAdditionalTools, supportsMidConvoSystemMessages: true, supportsMidConvoToolAdditions: true } } });
+      customModel: { ...getBuiltinModel('openai', 'gpt-5.6-sol'), compat: { supportsOpenAIGrammarTools: true, supportsToolSearch: true, supportsAdditionalTools, supportsMidConvoSystemMessages: true, supportsMidConvoToolAdditions: true } } });
     const tools = [{ name: 'tool_load', description: 'Load tools.', inputSchema: { type: 'object' } }, toToolDefinition(tool)];
     const messages: Message[] = [...start,
       { role: 'assistant', content: [{ type: 'tool_use', id: 'call_load', name: 'tool_load', input: {} }] },
       { role: 'user', content: [{ type: 'tool_result', toolUseId: 'call_load', content: 'Loaded.', addedToolNames: ['apply_patch'] }] },
     ];
-    await provider.complete({ model: 'gpt-5.5', messages, tools });
-    const receipt = requests[0].input.find((row: any) => row.type === (supportsAdditionalTools ? 'additional_tools' : 'tool_search_output'));
+    await provider.complete({ model: 'gpt-5.6-sol', messages, tools });
+    const receipt = requests[0].input.find((row: any) => row.type === (supportsAdditionalTools ? 'additional_tools' : 'tool_search_output')
+      && row.tools.some((tool: any) => tool.name === 'apply_patch'));
     expect(receipt.tools).toEqual([expect.objectContaining({ type: 'custom', name: 'apply_patch' })]);
-    expect(requests[0].tools.some((row: any) => row.name === 'apply_patch')).toBe(false);
-    await provider.complete({ model: 'gpt-5.5', messages, tools: tools.slice(0, 1) });
+    expect((requests[0].tools ?? []).some((row: any) => row.name === 'apply_patch')).toBe(false);
+    expect(requests[0].input.indexOf(receipt)).toBeGreaterThan(requests[0].input.findIndex((row: any) => row.type === 'function_call_output'));
+    await provider.complete({ model: 'gpt-5.6-sol', messages, tools: tools.slice(0, 1) });
+    // The host rebuilds additions from the active tool definitions, so a
+    // removed tool is absent from both the prefix and deferred declarations.
     expect(JSON.stringify(requests[1])).not.toContain('"type":"custom"');
   });
 
   it('does not deliver executable completed content from an interrupted native input', async () => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.stubGlobal('fetch', vi.fn(async () => response(false)));
-    const provider = createPiProvider({ provider: 'openai', model: 'gpt-5.5', apiKey: fakeToken });
+    const provider = createPiProvider({ provider: 'openai', model: 'gpt-5.6-sol', apiKey: fakeToken });
     const events: StreamEvent[] = [];
-    for await (const event of provider.stream({ model: 'gpt-5.5', messages: start, tools: [toToolDefinition(tool)] })) events.push(event);
+    for await (const event of provider.stream({ model: 'gpt-5.6-sol', messages: start, tools: [toToolDefinition(tool)] })) events.push(event);
     expect(events.some(event => event.type === 'message_end')).toBe(false);
     expect(events.some(event => event.type === 'error')).toBe(true);
     expect(warning).toHaveBeenCalled();
@@ -153,12 +162,12 @@ describe('native patch input through the real provider SDK', () => {
         { type: 'response.completed', response: { id: 'resp_final', status: 'completed', output: [final] } },
       ].map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
     }));
-    const provider = createPiProvider({ provider: 'openai', model: 'gpt-5.5', apiKey: fakeToken });
+    const provider = createPiProvider({ provider: 'openai', model: 'gpt-5.6-sol', apiKey: fakeToken });
     const registry = new ProviderRegistry();
     registry.registerFactory('patch-fixture', () => provider);
     const execute = vi.spyOn(tool, 'execute');
     const runner = new AgentRunner({
-      config: createConfig({ agent: { defaultProvider: 'patch-fixture', defaultModel: 'gpt-5.5', maxRetries: 0 } }),
+      config: createConfig({ agent: { defaultProvider: 'patch-fixture', defaultModel: 'gpt-5.6-sol', maxRetries: 0 } }),
       providers: registry, tools: [tool], evolution: { enabled: false },
     });
     const result = await runner.run({ message: 'Create the text file.', workingDir: root, signal: abort.signal });
@@ -181,12 +190,12 @@ describe('native patch input through the real provider SDK', () => {
   it('retains the JSON tool on non-Responses routes', () => {
     const definition = toToolDefinition(tool);
     for (const api of ['openai-completions', 'anthropic-messages', 'google-generative-ai'] as const) {
-      const context = buildPiContextForTest(start, undefined, [definition], { ...getBuiltinModel('openai', 'gpt-5.5'), api } as any);
+      const context = buildPiContextForTest(start, undefined, [definition], { ...getBuiltinModel('openai', 'gpt-5.6-sol'), api } as any);
       expect(context.tools?.[0].constrainedSampling).toBeUndefined();
       expect(context.tools?.[0].parameters).toMatchObject({ required: ['patch'], properties: { patch: { type: 'string' } } });
     }
     const undeclared = buildPiContextForTest(start, undefined, [definition], {
-      api: 'openai-responses', provider: 'custom', id: 'gpt-5.5',
+      api: 'openai-responses', provider: 'custom', id: 'gpt-5.6-sol',
     });
     expect(undeclared.tools?.[0].constrainedSampling).toBeUndefined();
   });
