@@ -20,6 +20,17 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
     expect(out).toBe('{"authorization":"***"}');
   });
 
+  it('masks Basic credentials from a raw Authorization header', () => {
+    // base64("alice:s3cret")
+    const out = sanitizeLogTextForUpload('Authorization: Basic YWxpY2U6czNjcmV0');
+    expect(out).toBe('Authorization: Basic ***');
+  });
+
+  it('masks Basic credentials with a lowercase scheme name (RFC 7617)', () => {
+    const out = sanitizeLogTextForUpload('proxy header basic dXNlcjpwYXNz rejected');
+    expect(out).toBe('proxy header Basic *** rejected');
+  });
+
   it('is case-insensitive on the Bearer scheme name (RFC 6750)', () => {
     const out = sanitizeLogTextForUpload('Cookie: bearer x.y.z');
     expect(out).toBe('Cookie: Bearer ***');
@@ -114,6 +125,13 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
 });
 
 describe('sanitizeLogTextForUpload › set B (must be preserved)', () => {
+  it('leaves the word "basic" in prose untouched', () => {
+    // Basic credentials are base64 of "user:password"; a plain word after
+    // "basic" is not one and must stay readable in the log.
+    expect(sanitizeLogTextForUpload('falling back to basic retrieval')).toBe('falling back to basic retrieval');
+    expect(sanitizeLogTextForUpload('Basic auth failed for proxy')).toBe('Basic auth failed for proxy');
+  });
+
   it('leaves "BearerWord" (no whitespace after Bearer) untouched', () => {
     // word-boundary follower required — "Bearer" without trailing whitespace
     // is just a word in prose, not an auth header.

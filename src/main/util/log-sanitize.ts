@@ -81,7 +81,11 @@ export function sanitizeLogTextForUpload(text: string): string {
     // and JSON-stringified "\"authorization\":\"Bearer X\"". Case-insensitive
     // because RFC 6750 declares the scheme name case-insensitive.
     .replace(/Bearer\s+[A-Za-z0-9._\-~+/=]+/gi, 'Bearer ***')
-    .replace(/Basic\s+[A-Za-z0-9+/=]+/gi, 'Basic ***')
+    // Basic credentials are base64 of "user-id:password" (RFC 7617), so only a
+    // token that decodes to something with a colon is masked. A plain word
+    // after "basic" in prose ("falling back to basic retrieval") is kept.
+    .replace(/Basic\s+([A-Za-z0-9+/=]+)/gi, (m, token: string) =>
+      (Buffer.from(token, 'base64').toString('latin1').includes(':') ? 'Basic ***' : m))
     // JWT — three base64url segments, first two starting "eyJ" (base64 of "{").
     .replace(/\beyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b/g, '***JWT***')
     // JSON-ish secret fields, preserving the original quote style.
