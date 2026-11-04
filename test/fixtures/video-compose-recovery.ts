@@ -3,6 +3,13 @@ import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
+import { vi } from 'vitest';
+
+// Recovery cases mock the tool runtime. Media setup must use the real bundled
+// executable rather than that mock or an unrelated FFmpeg on the host PATH.
+const { bundledFfmpegPaths } = await vi.importActual<typeof import('../../src/main/util/bundled-runtime')>(
+  '../../src/main/util/bundled-runtime',
+);
 
 // Public completed-draft recovery fixture extracted from the frozen production owner.
 // Contains no evaluation harness, account, hosted provider or collection code.
@@ -257,7 +264,9 @@ export function seedVideoComposeRecoveryFixture(
 }
 
 function runFixtureMediaCommand(args: string[], outputPath: string): void {
-  const result = spawnSync("ffmpeg", args, {
+  const ffmpeg = bundledFfmpegPaths().ffmpeg;
+  if (!ffmpeg) throw new Error('Video recovery fixture requires the prepared FFmpeg runtime.');
+  const result = spawnSync(ffmpeg, args, {
     encoding: "utf8",
     windowsHide: true,
     timeout: 30_000,
@@ -265,7 +274,7 @@ function runFixtureMediaCommand(args: string[], outputPath: string): void {
   });
   if (result.status !== 0 || !fs.existsSync(outputPath) || fs.statSync(outputPath).size < 1_000) {
     throw new Error(
-      `real media fixture generation failed for ${path.basename(outputPath)}: ${result.stderr || result.stdout}`,
+      `real media fixture generation failed for ${path.basename(outputPath)}: ${result.error?.code || result.signal || result.stderr || result.stdout}`,
     );
   }
 }
