@@ -52,6 +52,7 @@ describe('application shutdown durability and latency', () => {
       './util/boot_init': { stopBootWork: mark('boot-work') },
       './features/library_corpus': { closeAllLibraryCorpora: mark('library-owners') },
       './features/local_agents/runner.js': { stopBackgroundRuns: mark('background-cli') },
+      '../core-agent/src/tools/process-session': { stopAllProcessSessions: mark('process-sessions') },
       './features/kb_vector': { closeAllKb: mark('kb-database') },
       './features/kb_embed': { closeEmbedder: mark('embed-worker') },
       './util/sharp-runtime': { closeImageRuntime: mark('image-worker') },
@@ -73,7 +74,10 @@ describe('application shutdown durability and latency', () => {
         events.push('capture');
         return { terminate: () => { events.push('terminate'); return exited.promise; }, dispose: mark('dispose') };
       },
+      autoTasks: { stopScheduler: mark('auto-scheduler') },
+      projectDriverRunner: { stopDriverScheduler: mark('driver-scheduler') },
       prepareForShutdown: () => { events.push('archive'); return archived.promise; },
+      resumeAfterFailedShutdown: vi.fn(),
       connectorsFeature: { shutdown: mark('connectors') },
       searchFeature: { flushAll: mark('search-workers') },
       openLifecycleTracking: { flushQuit: () => { events.push('open-lifecycle'); return lifecycleSaved.promise; } },
@@ -83,8 +87,8 @@ describe('application shutdown durability and latency', () => {
     const shutdown = mod.exports;
     const pending = shutdown.prepare(mode);
     expect(shutdown.prepare(mode)).toBe(pending);
-    await vi.waitFor(() => expect(events).toContain('background-cli'));
-    expect(events).toEqual(mode === 'quit' ? ['capture', 'archive', 'background-cli'] : ['archive', 'background-cli']);
+    await vi.waitFor(() => expect(events).toContain('process-sessions'));
+    expect(events).toEqual(mode === 'quit' ? ['capture', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions'] : ['auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions']);
     archived.release();
     await vi.waitFor(() => expect(events).toContain('browser-save'));
     expect(events.indexOf('library-owners')).toBeLessThan(events.indexOf('kb-database'));
@@ -110,9 +114,70 @@ describe('application shutdown durability and latency', () => {
       exited.release();
     }
     await pending;
-    const owners = ['archive', 'background-cli', 'boot-work', 'library-owners', 'connectors', 'search-workers', 'kb-database', 'embed-worker', 'image-worker', 'office-extract', 'office', 'browser-save', 'open-lifecycle', 'app-close', 'app-databases'];
+    const owners = ['auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions', 'boot-work', 'library-owners', 'connectors', 'search-workers', 'kb-database', 'embed-worker', 'image-worker', 'office-extract', 'office', 'browser-save', 'open-lifecycle', 'app-close', 'app-databases'];
     expect([...events].sort()).toEqual([...owners, ...(mode === 'quit' ? ['capture', 'terminate', 'dispose'] : [])].sort());
     expect(shutdown.complete).toBe(true);
+  });
+
+  function realComposition(events: string[], overrides: {
+    terminate?: () => Promise<void>;
+    stopAllProcessSessions?: () => Promise<void>;
+  } = {}) {
+    const source = fs.readFileSync(path.resolve('src/main/index.ts'), 'utf8');
+    const parsed = ts.createSourceFile('index.ts', source, ts.ScriptTarget.Latest, true);
+    let composition = '';
+    const visit = (node: ts.Node) => {
+      if (ts.isCallExpression(node) && node.expression.getText(parsed) === 'createShutdownCoordinator') composition = node.getText(parsed);
+      ts.forEachChild(node, visit);
+    };
+    visit(parsed);
+    const mark = (name: string) => () => { events.push(name); };
+    const dependencies: Record<string, unknown> = {
+      './util/boot_init': { stopBootWork: vi.fn(), resumeBootAdmission: mark('boot') },
+      './features/library_corpus': { closeAllLibraryCorpora: vi.fn(), resumeLibraryAdmission: async () => { events.push('library'); } },
+      './features/local_agents/runner.js': { stopBackgroundRuns: vi.fn() },
+      '../core-agent/src/tools/process-session': { stopAllProcessSessions: overrides.stopAllProcessSessions || vi.fn() },
+      './features/kb_vector': { closeAllKb: vi.fn() },
+      './features/kb_embed': { closeEmbedder: vi.fn() },
+      './util/sharp-runtime': { closeImageRuntime: vi.fn() },
+      './util/office-extract': { closeOfficeExtraction: vi.fn() },
+      './features/office/office_engine': { closeAllOfficeResidents: vi.fn() },
+      './features/web_assist_session': { flushWebAssistSessions: vi.fn() },
+      './features/web_apps/host': { runtime: { closeUser: vi.fn(), drainData: vi.fn() } },
+    };
+    const mod = { exports: {} as ReturnType<typeof createShutdownCoordinator> };
+    vm.runInNewContext(ts.transpileModule(`module.exports = ${composition};`, {
+      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+    }).outputText, {
+      module: mod, createShutdownCoordinator,
+      require: (name: string) => { if (!(name in dependencies)) throw new Error(`Uncontrolled shutdown dependency: ${name}`); return dependencies[name]; },
+      captureWindowsShutdownProcesses: async () => ({ terminate: overrides.terminate || vi.fn(), dispose: vi.fn() }),
+      autoTasks: { stopScheduler: vi.fn(), startScheduler: mark('auto-scheduler') },
+      projectDriverRunner: { stopDriverScheduler: vi.fn(), startDriverScheduler: mark('driver-scheduler') },
+      prepareForShutdown: async () => {},
+      resumeAfterFailedShutdown: async () => { events.push('task-admission'); },
+      connectorsFeature: { shutdown: vi.fn() },
+      searchFeature: { flushAll: vi.fn() },
+      openLifecycleTracking: null,
+      users: { getActiveUserId: () => 'isolated-owner' },
+      createLogger: () => ({ warn: mark('process-sessions-warned') }),
+    });
+    return mod.exports;
+  }
+
+  it('reopens task admission before every other owner when the real wiring fails to exit', async () => {
+    const events: string[] = [];
+    const shutdown = realComposition(events, { terminate: async () => { throw new Error('controlled timeout'); } });
+    await expect(shutdown.prepare()).rejects.toMatchObject({ code: 'E_SHUTDOWN_PROCESSES_FAILED' });
+    expect(events).toEqual(['task-admission', 'library', 'boot', 'auto-scheduler', 'driver-scheduler']);
+  });
+
+  it('still exits when stopping retained commands fails, because no user data depends on it', async () => {
+    const events: string[] = [];
+    const shutdown = realComposition(events, { stopAllProcessSessions: async () => { throw new Error('controlled failure'); } });
+    await shutdown.prepare();
+    expect(shutdown.complete).toBe(true);
+    expect(events).toEqual(['process-sessions-warned']);
   });
 
   it('pins owned processes before stopping producers and confirms their exit before installer handoff', async () => {

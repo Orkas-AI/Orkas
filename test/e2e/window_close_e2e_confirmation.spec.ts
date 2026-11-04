@@ -1,4 +1,5 @@
 import { expect, test } from './fixtures/orkas';
+test.skip(process.platform !== 'linux', 'Linux retains native close confirmation because no supported tray is available.');
 
 
 

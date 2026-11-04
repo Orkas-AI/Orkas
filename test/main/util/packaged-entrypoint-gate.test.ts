@@ -124,6 +124,18 @@ describe('packaged-entrypoint-gate', () => {
     expect(gate.PACKAGED_BIN_ENTRYPOINTS).not.toContain('shopify-setup-requirements.cjs');
   });
 
+  // A duplicate survives the classification check because both sides repeat it,
+  // so a later edit to one copy would leave the other silently in force.
+  it('registers each bin file and package exclusion exactly once', () => {
+    const repeated = (entries: readonly string[]) => entries.filter((entry, index) => entries.indexOf(entry) !== index);
+    expect(repeated([
+      ...gate.PACKAGED_BIN_ENTRYPOINTS, ...gate.PACKAGED_BIN_HELPERS,
+      ...gate.BUILD_ONLY_BIN_FILES, ...gate.DORMANT_BIN_FILES,
+    ])).toEqual([]);
+    const manifest = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
+    expect(repeated(manifest.build.files)).toEqual([]);
+  });
+
   it('loads the bridge SDK closure outside the source tree and rejects a missing shared validator', () => {
     const root = packagedRuntimeFixture();
     fs.copyFileSync(path.join(process.cwd(), 'package-lock.json'), path.join(root, 'package-lock.json'));

@@ -82,7 +82,7 @@ function fixture(options: {
     rmSync(p: string) { p = norm(p); operations.push(['rm', p]); files.delete(p); },
   };
   function boot() {
-    const env: Record<string, string> = { LOCALAPPDATA: 'C:\\Profile', SystemDrive: 'C:', SystemRoot: 'C:\\Windows', ORKAS_RUNTIME_DEV: '0' };
+    const env: Record<string, string> = { LOCALAPPDATA: 'C:\\Profile', SystemDrive: 'C:', SystemRoot: 'C:\\Windows' };
     const module = { exports: {} };
     const requireMock = (id: string): any => {
       if (id === 'node:fs') return fsMock;

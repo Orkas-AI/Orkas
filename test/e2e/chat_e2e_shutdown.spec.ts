@@ -200,7 +200,7 @@ for (const [boundary, continuation] of [
             .createChatHistoryTool({ userId: users.getActiveUserId(), currentCid: data.cid, currentMessageId: data.boundaryId,
               allowedScopes: ['current'] });
           return history.execute({ action: 'read', scope: 'current',
-            page: { mode: 'latest', count: 30 }, include_process: true, max_tokens: 10000 }, { state: {} });
+            read: { page: { mode: 'latest', count: 30 }, include_process: true }, max_tokens: 10000 }, { state: {} });
         }, { root: path.resolve(__dirname, '../..'), cid,
           boundaryId: records().filter(row => row.from === 'user').at(-1).id });
         expect(retrieved.isError, retrieved.content).toBeFalsy();
