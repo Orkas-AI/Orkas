@@ -323,6 +323,17 @@ export interface SkillOrkasMeta {
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
+ * Index of the `---` that closes a SKILL.md frontmatter opened at index 0, or
+ * -1. The closing fence is a line of its own, as the renderer's
+ * `_parseSkillFrontmatterPairs` reads it: a `---` inside a value
+ * (`description: before --- after`) does not end the frontmatter.
+ */
+function frontmatterCloseIndex(text: string): number {
+  const m = /\n---[ \t]*\r?(?=\n|$)/.exec(text.slice(3));
+  return m ? m.index + 3 + 1 : -1;
+}
+
+/**
  * Minimal YAML-subset parser for SKILL.md frontmatter. Only extracts
  * top-level scalar keys (name/description/allowed-tools/…); list blocks and
  * nested maps are skipped. Handles:
@@ -334,7 +345,7 @@ export function parseSkillFrontmatter(text: string): SkillFrontmatter {
   if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   const meta: SkillFrontmatter = {};
   if (!text.startsWith('---')) return meta;
-  const end = text.indexOf('---', 3);
+  const end = frontmatterCloseIndex(text);
   if (end === -1) return meta;
   const lines = text.slice(3, end).split('\n');
   for (let i = 0; i < lines.length; i++) {
@@ -1051,7 +1062,7 @@ function platformSkillMdContent(
 export function splitSkillMd(text: string): { meta: SkillFrontmatter; body: string } {
   if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   if (!text.startsWith('---')) return { meta: {}, body: text };
-  const end = text.indexOf('---', 3);
+  const end = frontmatterCloseIndex(text);
   if (end === -1) return { meta: {}, body: text };
   return {
     meta: parseSkillFrontmatter(text),
@@ -1061,7 +1072,7 @@ export function splitSkillMd(text: string): { meta: SkillFrontmatter; body: stri
 
 function ensureSkillMdCategoryForWrite(content: string): string {
   if (!content.startsWith('---')) return content;
-  const end = content.indexOf('---', 3);
+  const end = frontmatterCloseIndex(content);
   if (end === -1) return content;
   const meta = parseSkillFrontmatter(content);
   const current = String(meta.category || '').trim();
