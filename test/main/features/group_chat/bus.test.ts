@@ -6212,19 +6212,25 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
         source_title: 'Reference', source_ts: '2026-09-11T00:00:00', text: 'Keep this reference context' };
       const layout = await import('../../../../src/main/util/project-layout');
       const attachmentDir = layout.chatAttachmentDirForConversation(TEST_UID, cid);
+      const attachments = await import('../../../../src/main/features/chat_attachments');
       fs.mkdirSync(attachmentDir, { recursive: true });
       fs.writeFileSync(path.join(attachmentDir, 'notes.txt'), 'Attached notes');
+      fs.writeFileSync(path.join(attachmentDir, 'draft.txt'), 'Independent unsent attachment');
       try {
         await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'DEFERRED_SLOW_TURN_TEST active' });
         await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'obsolete queued instruction',
           model_text: 'OBSOLETE MODEL TEXT', attachments: ['notes.txt'], references: [reference] });
         const queued = (await tb.listTasks(TEST_UID, cid)).find((row) => row.status === 'queued')!;
+        expect.soft(attachments.listPendingAttachments(TEST_UID, cid).map(item => item.name)).toEqual(['draft.txt']);
+        expect(bus.beginConversationTaskEdit(TEST_UID, cid, queued.task_id))
+          .toMatchObject({ ok: true, message: { attachments: ['notes.txt'] } });
         const result = await bus.editConversationTask(TEST_UID, cid, queued.task_id, edited, queued.instruction);
         expect(result).toMatchObject({ ok: true, task: {
           task_id: queued.task_id, assignee: queued.assignee, instruction: edited,
           source_msg_id: queued.source_msg_id, attachments: ['notes.txt'], status: 'queued',
         } });
         expect(await userRows(cid)).toEqual(['DEFERRED_SLOW_TURN_TEST active']);
+        expect.soft(attachments.listPendingAttachments(TEST_UID, cid).map(item => item.name)).toEqual(['draft.txt']);
         expect(await bus.editConversationTask(TEST_UID, cid, queued.task_id, 'stale overwrite', queued.instruction))
           .toMatchObject({ ok: false, error: 'edit_conflict' });
         if (action === 'send-now') {
@@ -6239,6 +6245,9 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
       await waitForQuiescent(TEST_UID, cid, 5000);
       expect(await userRows(cid)).toEqual(action === 'cancel'
         ? ['DEFERRED_SLOW_TURN_TEST active'] : ['DEFERRED_SLOW_TURN_TEST active', edited]);
+      expect(attachments.listPendingAttachments(TEST_UID, cid).map(item => item.name))
+        .toEqual(action === 'cancel' ? ['draft.txt', 'notes.txt'] : ['draft.txt']);
+      expect(attachments.listAttachments(TEST_UID, cid).map(item => item.name)).toEqual(['draft.txt', 'notes.txt']);
       if (action === 'admission') {
         expect(streamProbe.messages.some((message) => message.includes(edited))).toBe(true);
         expect(streamProbe.messages.some((message) => message.includes('OBSOLETE MODEL TEXT'))).toBe(false);
