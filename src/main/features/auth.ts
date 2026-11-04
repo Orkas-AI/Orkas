@@ -60,7 +60,7 @@ import { createHash } from 'node:crypto';
 import * as path from 'node:path';
 import { shell } from 'electron';
 
-import { userAuthProfilesFile, userLocalConfigDir } from '../paths';
+import { userAuthProfilesFile } from '../paths';
 import * as localSecrets from '../util/local-secret-store';
 import { MIN_NATIVE_MODEL_CONTEXT_WINDOW, modelContextWindowBelowMinimum } from '../util/model-context-window';
 import { isBearerTokenHeaderSafe } from '../util/http-authorization';
@@ -341,50 +341,22 @@ function authSecretContext(uid: string): localSecrets.LocalSecretContext {
   };
 }
 
-function authSecretOwner(localId: string): string {
-  try {
-    const obj = JSON.parse(fs.readFileSync(path.join(userLocalConfigDir(localId), 'account.json'), 'utf8'));
-    if (obj && typeof obj === 'object' && typeof obj.user_id === 'string' && obj.user_id) {
-      return obj.user_id;
-    }
-  } catch { /* logged out / open-source build / unreadable account file */ }
-  return localId;
-}
-
-function uniqueOwners(values: Array<string | null | undefined>): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const v of values) {
-    if (!v || seen.has(v)) continue;
-    seen.add(v);
-    out.push(v);
-  }
-  return out;
-}
-
 function decryptProfilesPayload(raw: string, localId: string): { json: string; needsRewrite: boolean } {
-  const primaryOwner = authSecretOwner(localId);
   if (!localSecrets.isEncryptedSecret(raw)) {
     return { json: raw, needsRewrite: true };
   }
 
-  for (const ownerId of uniqueOwners([primaryOwner, localId])) {
-    try {
-      const dec = localSecrets.decryptLocalSecretWithMeta(
-        authSecretContext(ownerId),
-        raw,
-        { legacySeeds: [ownerId] },
-      );
-      return {
-        json: dec.plaintext,
-        needsRewrite: ownerId !== primaryOwner || localSecrets.shouldRewriteLocalSecret(dec.kind),
-      };
-    } catch {
-      /* try next owner */
-    }
+  try {
+    // The selected directory owns ordinary IO. Account metadata is not an
+    // alternate-owner grant: it may be stale or misplaced. Legacy directory
+    // ownership changes belong to users' explicit move/rekey transaction.
+    const dec = localSecrets.decryptLocalSecretWithMeta(
+      authSecretContext(localId), raw, { legacySeeds: [localId] },
+    );
+    return { json: dec.plaintext, needsRewrite: localSecrets.shouldRewriteLocalSecret(dec.kind) };
+  } catch {
+    throw new Error('auth-profiles decrypt failed');
   }
-
-  throw new Error('auth-profiles decrypt failed');
 }
 
 function loadProfiles(opts: { throwOnInvalidExisting?: boolean; userId?: string } = {}): ProfilesFile {
@@ -396,7 +368,7 @@ function loadProfiles(opts: { throwOnInvalidExisting?: boolean; userId?: string 
     const { json, needsRewrite } = decryptProfilesPayload(raw, uid);
     let shouldRewrite = needsRewrite;
     const data = JSON.parse(json) as Partial<ProfilesFile>;
-    if (data && typeof data === 'object' && data.profiles && typeof data.profiles === 'object') {
+    if (data && typeof data === 'object' && !Array.isArray(data) && data.profiles && typeof data.profiles === 'object' && !Array.isArray(data.profiles)) {
       const profiles: Record<string, StoredProfile> = {};
       for (const [id, p] of Object.entries(data.profiles)) {
         const prof = p as any;
@@ -891,9 +863,8 @@ function saveProfiles(store: ProfilesFile, userId?: string): void {
   const target = userAuthProfilesFile(localId);
   const targetDir = path.dirname(target);
   const tmp = `${target}.tmp`;
-  const ownerId = authSecretOwner(localId);
   const json = JSON.stringify(store, null, 2);
-  const out = ownerId ? localSecrets.encryptLocalSecret(authSecretContext(ownerId), json) : json;
+  const out = localSecrets.encryptLocalSecret(authSecretContext(localId), json);
   // Capture one account and atomically publish its complete encrypted store.
   // Retry a disappearing directory/temp path once; preserve the original on failure.
   for (let attempt = 0; attempt < 2; attempt += 1) {

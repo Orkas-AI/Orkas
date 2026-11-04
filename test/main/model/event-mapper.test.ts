@@ -14,6 +14,9 @@ import {
   userSystemSkillsDir,
 } from '../../../src/main/paths';
 import { setCurrentLang } from '../../../src/main/i18n';
+import {
+  ALL_CONFIGURED_RATE_LIMITED_MESSAGE,
+} from '../../../src/main/model/core-agent/rotating-provider';
 
 type AgentRunEvent =
   | { type: 'text_delta'; text: string; phase?: 'commentary' | 'final_answer' }
@@ -1805,6 +1808,28 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     })]);
   });
 
+  // The wrapper only says the candidate chain ended. A 4xx below it is still an
+  // endpoint rejection, and dashboards must not read that as spent retries.
+  it.each([
+    [400, 'provider_http_400'],
+    [410, 'provider_http_410'],
+    [422, 'provider_http_422'],
+    [499, 'provider_http_499'],
+    [399, 'provider_retries_exhausted'],
+    [500, 'provider_retries_exhausted'],
+    [undefined, 'provider_retries_exhausted'],
+  ])('keeps an HTTP %s visible through an exhausted candidate chain', async (statusCode, failureCode) => {
+    const out = await collect([{
+      type: 'done',
+      result: { text: '', meta: { error: {
+        kind: 'provider_error', message: 'Rejected', code: 'PROVIDER_RETRIES_EXHAUSTED', statusCode,
+      } } },
+    }]);
+    expect(out).toEqual([expect.objectContaining({
+      type: 'error', failureKind: 'model', failureCode, retryExhausted: true, failurePhase: 'provider_wait',
+    })]);
+  });
+
   it.each([
     ['PROVIDER_NETWORK_EXHAUSTED', true],
     ['RETRY_EXHAUSTED', true],
@@ -2430,5 +2455,86 @@ describe('live reasoning preview sanitizing cost', () => {
     // Adjacent paths redact into a few characters, so the window widens to the whole text.
     const pathHeavy = 'Reasoning about /Users/test/Projects/plan step by step. '.repeat(5_000);
     expect(boundedLiveReasoningSummary(pathHeavy)).toBe(await reference(pathHeavy));
+  });
+});
+
+// Every model the user configured was throttled: tell them to wait a minute or
+// two before retrying.
+describe('all configured models rate limited', () => {
+  const failed = (message: string, provider = 'custom') => collect([{ type: 'done', result: { text: '', meta: {
+    provider, error: { kind: 'provider_error', message, code: 'PROVIDER_RATE_LIMIT_EXHAUSTED' },
+  } } } as any]);
+
+  it.each([
+    [ALL_CONFIGURED_RATE_LIMITED_MESSAGE, '你配置的模型都被限流了，通常一两分钟后恢复，到时再点重试。'],
+  ])('tells the user to wait before retrying: %s', async (message, visible) => {
+    setCurrentLang('zh');
+    try {
+      const out = await failed(message);
+      expect(out).toEqual([expect.objectContaining({ type: 'error', failureCode: 'provider_rate_limit', text: visible })]);
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
+  it('keeps the existing rate-limit copy for any other throttled ending', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await failed('Too Many Requests');
+      expect(out).toEqual([expect.objectContaining({ type: 'error', failureCode: 'provider_rate_limit',
+        text: '当前模型请求过于频繁，请稍后再试，或在「设置」中切换可用模型。' })]);
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+});
+
+// A rejected request (HTTP 400) repeats until something changes. Show a
+// user-configured provider's own explanation so the user can act on it, and
+// after a second rejection in a row tell them that retrying as is will not help.
+describe('rejected requests', () => {
+  const rejected = (message: string, provider = 'custom', failureTrackingScope: object = {}) => collect([{
+    type: 'done', result: { text: '', meta: { provider, error: {
+      kind: 'provider_error', message, code: 'PROVIDER_ERROR', statusCode: 400,
+    } } },
+  } as any], { failureTrackingScope });
+
+  it.each([
+    ['400 The model does not support image input.', 'The model does not support image input.'],
+    ['400 {"error":{"message":"unknown variant `image_url`, expected `text`","type":"invalid_request_error"}}',
+      'unknown variant `image_url`, expected `text`'],
+  ])('shows the provider explanation for %s', async (message, detail) => {
+    setCurrentLang('en');
+    const [out] = await rejected(message);
+    expect(out).toMatchObject({ type: 'error', failureCode: 'provider_http_400',
+      text: 'The model service rejected this request (HTTP 400).', detail: `Provider said: ${detail}` });
+  });
+
+  it('adds nothing when the provider gave no explanation or the route is the official model', async () => {
+    setCurrentLang('en');
+    expect((await rejected('400 status code (no body)'))[0]).not.toHaveProperty('detail');
+  });
+
+  it('redacts paths and secrets from the explanation and bounds it', async () => {
+    setCurrentLang('en');
+    const [out] = await rejected(`400 cannot read /Users/test/private/plan.md with api_key=sk-proj-local-agent-secret-123456789 ${'x'.repeat(600)}`);
+    expect(out.detail).not.toContain('/Users/alice');
+    expect(out.detail).not.toContain('sk-proj-local-agent-secret-123456789');
+    expect(out.detail.length).toBeLessThanOrEqual('Provider said: '.length + 241);
+  });
+
+  it('says retrying as is will not help from the second rejection in a row', async () => {
+    setCurrentLang('en');
+    const advice = 'This request has been rejected repeatedly';
+    const scope = {};
+    const first = (await rejected('400 bad request', 'custom', scope))[0];
+    const second = (await rejected('400 bad request', 'custom', scope))[0];
+    expect(first.text).not.toContain(advice);
+    expect(second.text).toContain(advice);
+    expect(second.detail).toBe('Provider said: bad request');
+
+    // A completed run starts the count over.
+    await collect([{ type: 'done', result: { text: 'ok', meta: { provider: 'custom' } } } as any], { failureTrackingScope: scope });
+    expect((await rejected('400 bad request', 'custom', scope))[0].text).not.toContain(advice);
   });
 });

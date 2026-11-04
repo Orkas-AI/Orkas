@@ -87,6 +87,7 @@ describe('client_config', () => {
     expect(DEFAULT_PROVIDER_MODELS['openai-codex']).toEqual([
       { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128000, maxInputImages: 20 },
       { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', maxTokens: 64000, maxInputImages: 20 },
+      { id: 'gpt-6.1-terra', name: 'GPT-6.1 Terra', maxTokens: 64000, maxInputImages: 20 },
       { id: 'gpt-6-sol', name: 'GPT-6 Sol', maxTokens: 64000, maxInputImages: 20 },
       { id: 'gpt-6-luna', name: 'GPT-6 Luna', maxTokens: 64000, maxInputImages: 20 },
       { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
@@ -502,10 +503,69 @@ describe('client_config', () => {
 
 
 describe('client config response ownership and deadline', () => {
+  it('allows a fresh refresh after the attempt timestamp could not be persisted', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'clientconfigattemptrecovery';
+    users.activateUser(uid);
+    const manager = new ClientConfigManager();
+    manager.applyServerPayload({ immediate: { 'feature.recovery': 'cached' }, restart: {} }, 'cached-etag');
+    const failure = Object.assign(new Error('synthetic config write unavailable'), { code: 'EACCES' });
+    const write = vi.spyOn(storage, 'writeJsonSync').mockImplementationOnce(() => { throw failure; });
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      code: 0, immediate: { 'feature.recovery': 'fresh' }, restart: {}, config_hash: 'recovered-hash',
+    }), { headers: { etag: 'recovered-etag' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      await expect(refresh('manual', { force: true })).rejects.toBe(failure);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(manager.get('feature.recovery')).toBe('cached');
+      write.mockRestore();
+      await expect(refresh('manual', { force: true })).resolves.toEqual({ updated: true });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(manager.get('feature.recovery')).toBe('fresh');
+      expect(manager.readCache().etag).toBe('recovered-etag');
+    } finally {
+      write.mockRestore();
+      fs.rmSync(path.dirname(paths.userRemoteConfigFile(uid)), { recursive: true, force: true });
+    }
+  });
+
+
   afterEach(() => {
     stop();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it('allows a fresh refresh after the attempt timestamp could not be persisted', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'clientconfigattemptrecovery';
+    users.activateUser(uid);
+    const manager = new ClientConfigManager();
+    manager.applyServerPayload({ immediate: { 'feature.recovery': 'cached' }, restart: {} }, 'cached-etag');
+    const failure = Object.assign(new Error('synthetic config write unavailable'), { code: 'EACCES' });
+    const write = vi.spyOn(storage, 'writeJsonSync').mockImplementationOnce(() => { throw failure; });
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      code: 0, immediate: { 'feature.recovery': 'fresh' }, restart: {}, config_hash: 'recovered-hash',
+    }), { headers: { etag: 'recovered-etag' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      await expect(refresh('manual', { force: true })).rejects.toBe(failure);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(manager.get('feature.recovery')).toBe('cached');
+      write.mockRestore();
+      await expect(refresh('manual', { force: true })).resolves.toEqual({ updated: true });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(manager.get('feature.recovery')).toBe('fresh');
+      expect(manager.readCache().etag).toBe('recovered-etag');
+    } finally {
+      write.mockRestore();
+      fs.rmSync(path.dirname(paths.userRemoteConfigFile(uid)), { recursive: true, force: true });
+    }
   });
 
   it.each(['local-profile', 'legacy-anonymous'] as const)('discards a body completed after switching to %s and permits a fresh owner request', async destination => {

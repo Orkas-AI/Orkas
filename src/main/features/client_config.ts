@@ -501,11 +501,16 @@ export async function refresh(
       const error = (err as Error)?.message || String(err);
       log.warn('client config refresh failed', { reason, error });
       return { updated: false, error };
-    } finally {
-      inFlight = null;
     }
   })();
-  return inFlight;
+  // Publish the promise before cleanup can run, including synchronous setup
+  // failures before the request's first await.
+  const pending = inFlight;
+  try {
+    return await pending;
+  } finally {
+    if (inFlight === pending) inFlight = null;
+  }
 }
 
 function onReturnToApp(): void {

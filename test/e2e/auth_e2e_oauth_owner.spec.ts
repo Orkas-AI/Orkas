@@ -1,6 +1,60 @@
 import { expect, test } from './fixtures/orkas';
 
 
+test('refuses a foreign encrypted store through IPC and recovers only the selected owner', async ({ orkas: app }) => {
+  await app.electronApp!.evaluate(async ({ app }) => {
+    const require = (process as any).mainModule.require;
+    await require(`${app.getAppPath()}/test/e2e/fixtures/oauth-owner-main.cjs`)(app.getAppPath());
+  });
+  try {
+    await app.electronApp!.evaluate(({ app }) => {
+      const require = (process as any).mainModule.require;
+      const paths = require(`${app.getAppPath()}/src/main/paths`);
+      const path = require('node:path');
+      const c = (globalThis as any).__oauthOwnerControl;
+      c.accountFile = path.join(paths.userLocalConfigDir(c.owner), 'account.json');
+      c.accountBefore = c.fs.existsSync(c.accountFile) ? c.fs.readFileSync(c.accountFile) : null;
+      // Fault injection is limited to this fixture's disposable owner root.
+      c.fs.writeFileSync(c.accountFile, JSON.stringify({ user_id: c.other }));
+      c.fs.writeFileSync(c.files[0], c.before[1]);
+    });
+    const refused = await app.invoke<any>('auth.listProviders');
+    expect(refused.providers.flatMap((provider: any) => provider.profiles)).toEqual([]);
+    expect(await app.electronApp!.evaluate(() => {
+      const c = (globalThis as any).__oauthOwnerControl;
+      return {
+        unchanged: c.files.every((file: string) => c.fs.readFileSync(file).equals(c.before[1])),
+        metadataStillConflicting: JSON.parse(c.fs.readFileSync(c.accountFile, 'utf8')).user_id === c.other,
+      };
+    })).toEqual({ unchanged: true, metadataStillConflicting: true });
+
+    await app.electronApp!.evaluate(() => {
+      const c = (globalThis as any).__oauthOwnerControl;
+      if (c.accountBefore) c.fs.writeFileSync(c.accountFile, c.accountBefore);
+      else c.fs.rmSync(c.accountFile, { force: true });
+      c.fs.writeFileSync(c.files[0], c.before[0]);
+    });
+    const recovered = await app.invoke<any>('auth.listProviders');
+    expect(recovered.providers.find((provider: any) => provider.id === 'openai')?.profiles)
+      .toHaveLength(1);
+    expect(await app.electronApp!.evaluate(() => {
+      const c = (globalThis as any).__oauthOwnerControl;
+      return c.files.map((file: string, index: number) => c.fs.readFileSync(file).equals(c.before[index]));
+    })).toEqual([true, true]);
+  } finally {
+    await app.electronApp!.evaluate(() => {
+      const c = (globalThis as any).__oauthOwnerControl;
+      if (c.accountBefore) c.fs.writeFileSync(c.accountFile, c.accountBefore);
+      else c.fs.rmSync(c.accountFile, { force: true });
+      c.fs.writeFileSync(c.files[0], c.before[0]);
+      c.users.activateUser(c.owner);
+      c.oauth.unregisterOAuthProvider('e2e-auth-owner');
+      c.release();
+      delete (globalThis as any).__oauthOwnerControl;
+    });
+  }
+});
+
 for (const scenario of ['cancelled', 'account-switch'] as const) {
   test(`discards a late OAuth credential after ${scenario} through actual IPC and encrypted stores`, async ({ orkas: app }) => {
     // The provider alone is controlled. Actual discovery, login orchestration,

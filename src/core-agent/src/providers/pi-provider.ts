@@ -11,7 +11,6 @@ import {
   stream as piStream,
   completeSimple as piCompleteSimple,
   streamSimple as piStreamSimple,
-  Type,
   getEnvApiKey,
 } from "@earendil-works/pi-ai/compat";
 import {
@@ -202,7 +201,7 @@ type RuntimePiContext = PiContext & { hostMessageIndexes: number[]; foreignRespo
  * ordering in `transform-messages`, one image trailer per contiguous tool-result
  * batch in `openai-completions`). Bump only after re-checking those rules against
  * the new release; `providers.test.ts` pins the installed package to this value. */
-export const MIRRORED_PI_AI_SERIALIZER_VERSION = "1.3.0";
+export const MIRRORED_PI_AI_SERIALIZER_VERSION = "1.5.0";
 
 /** pi-ai's portable history has no developer role. Responses has one, so
  * restore explicitly typed host messages at the native serialization boundary.
@@ -292,8 +291,7 @@ function buildPiContext(
   const piTools: PiTool[] | undefined = tools?.map((t) => ({
     name: t.name,
     description: t.description,
-    // Preserve the full JSON Schema while adding pi-ai's TypeBox marker.
-    parameters: Type.Unsafe(t.inputSchema),
+    parameters: t.inputSchema,
     // Only explicitly capable Responses routes receive native grammar input.
     ...((model?.api === "openai-responses" || model?.api === "openai-codex-responses")
       && model.compat && "supportsOpenAIGrammarTools" in model.compat
@@ -805,6 +803,8 @@ function restoreOfficialReasoningDefaults(
   }
 
   const next: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+  // pi-schema's optional-map Static type becomes unknown without strictNullChecks.
+  const mappedOff = (model.thinkingLevelMap as { off?: string | null })?.off;
   const compat = model.compat as (Record<string, unknown> & {
     thinkingFormat?: string;
     chatTemplateKwargs?: Record<string, unknown>;
@@ -847,7 +847,7 @@ function restoreOfficialReasoningDefaults(
       removeSynthesizedReasoningFields("none", false);
     }
   } else if (thinkingFormat === "string-thinking") {
-    const offValue = model.thinkingLevelMap?.off;
+    const offValue = mappedOff;
     if (next.thinking === "none" || (typeof offValue === "string" && next.thinking === offValue)) {
       delete next.thinking;
     }
@@ -856,7 +856,6 @@ function restoreOfficialReasoningDefaults(
   // OpenAI Responses and generic OpenAI-compatible reasoners use these
   // shapes rather than a named thinkingFormat.
   const reasoning = next.reasoning as { effort?: unknown } | undefined;
-  const mappedOff = model.thinkingLevelMap?.off;
   if (reasoning?.effort === "none" || (typeof mappedOff === "string" && reasoning?.effort === mappedOff)) {
     removeSynthesizedReasoningFields(reasoning.effort);
   }
@@ -1052,7 +1051,7 @@ export function createPiProvider(config: {
       const terminalReasoning = createResponsesTerminalReasoning(model.api, params.signal);
       const useOfficialReasoningDefaults = model.reasoning === true
         && ((params.reasoning === undefined && config.defaultReasoning === undefined)
-          || (params.reasoning === "off" && model.thinkingLevelMap?.off === null));
+          || (params.reasoning === "off" && (model.thinkingLevelMap as { off?: string | null })?.off === null));
       const useProviderOutputDefault = params.requestMetadata?.outputLimitSource === "provider_default";
       const cacheKey = sessionId && params.cacheRetention !== 'none' ? userCacheKey : undefined;
       const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders, userCacheKey);
@@ -1203,7 +1202,7 @@ export function createPiProvider(config: {
       const terminalReasoning = createResponsesTerminalReasoning(model.api, params.signal);
       const useOfficialReasoningDefaults = model.reasoning === true
         && ((params.reasoning === undefined && config.defaultReasoning === undefined)
-          || (params.reasoning === "off" && model.thinkingLevelMap?.off === null));
+          || (params.reasoning === "off" && (model.thinkingLevelMap as { off?: string | null })?.off === null));
       const cacheKey = sessionId && params.cacheRetention !== 'none' ? userCacheKey : undefined;
       const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders, userCacheKey);
       const headers = turnRouting?.headers ?? suppliedHeaders;

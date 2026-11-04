@@ -35,7 +35,10 @@ function registerNativeEsmLoader() {
             return { url: nativeResolutions.get(url.href), format: 'module', shortCircuit: true };
           }
           if (ordinaryDependency(url, context) && fs.statSync(url).isFile()) {
-            const physical = pathToFileURL(fs.realpathSync(fileURLToPath(url)));
+            // Node's JavaScript realpath walks every ancestor for each new
+            // SDK leaf. The native implementation resolves the same identity
+            // in one native call; Electron also adapts it for ASAR.
+            const physical = pathToFileURL(fs.realpathSync.native(fileURLToPath(url)));
             if (physical.pathname.endsWith('.mjs')) {
               nativeModules.add(physical.href);
               nativeResolutions.set(url.href, physical.href);

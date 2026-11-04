@@ -1,7 +1,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all';
+import { PUBLIC_PROVIDER_MODELS } from '../../../src/main/model/public_model_catalog';
 import {
   CATALOG,
   CURATED_MODELS,
@@ -27,6 +28,8 @@ import {
   isSelectableModel,
   resolveModelUpgrade,
   pickLatestGenerations,
+  modelCatalogEntryFromModel,
+  findImageGenCapability,
 } from '../../../src/main/model/provider_catalog';
 
 describe('provider_catalog › CATALOG', () => {
@@ -106,6 +109,126 @@ describe('provider_catalog › CURATED_MODELS', () => {
         includedModels: ['GPT-6.1 Sol', 'Claude Opus 5.5', 'Kimi K3'],
       }),
     ]);
+  });
+
+  it.each([
+    ['openai-codex', 'gpt-6.1-terra', 'openai-codex-responses', 500_000, 64_000],
+    ['openai', 'gpt-6.1-terra', 'openai-responses', 272_000, 64_000],
+    ['openrouter', 'openai/gpt-6.1-terra', 'openai-completions', 1_050_000, 128_000],
+  ] as const)('selects native %s Terra with its own identity, pricing and capabilities', (providerId, modelId, api, contextWindow, maxTokens) => {
+    const native = (getBuiltinModel as any)(providerId, modelId);
+    expect(native).toBeDefined();
+    const original = structuredClone(native);
+    const catalog = { getPiModel: getBuiltinModel as any };
+    expect(curatedModelsFor(providerId).map(model => model.id)).toContain(modelId);
+    expect(isSelectableModel(providerId, modelId)).toBe(true);
+    expect(resolveModelUpgrade(providerId, modelId)).toMatchObject({
+      modelId, upgraded: false,
+    });
+    const resolved = resolveConfiguredPiModel(catalog, providerId, modelId);
+    expect(resolved).toMatchObject({
+      isConfiguredFallback: false, needsCustomModel: true, templateModelId: modelId,
+      model: { id: modelId, api, provider: providerId,
+        contextWindow, maxTokens, input: ['text', 'image'],
+        cost: { input: 1, output: 5, cacheRead: 0.05, cacheWrite: 1.25 },
+        thinkingLevelMap: { off: 'none', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
+      },
+    });
+    expect(modelInputImageLimit(providerId, modelId, resolved!.model)).toBe(20);
+    expect(resolved!.model.compat).toEqual(native.compat);
+    if (providerId === 'openai-codex') {
+      expect(resolved!.model.compat).toMatchObject({ supportsOpenAIGrammarTools: true, supportsToolSearch: true, supportsAdditionalTools: true });
+    }
+    expect(native).toEqual(original);
+  });
+
+  it.each(['off', 'low', 'high'] as const)('sends the real Terra id, tools and vision through the existing Codex SDK at %s', async reasoning => {
+    const resolved = resolveConfiguredPiModel({ getPiModel: getBuiltinModel as any }, 'openai-codex', 'gpt-6.1-terra');
+    expect(resolved).not.toBeNull();
+    const { createPiProvider } = await import('#core-agent');
+    const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
+    let payload: any;
+    const provider = createPiProvider({ provider: 'openai-codex', customModel: resolved!.model,
+      apiKey: `fixture.${token}.fixture`,
+      onPayload(value) { payload = value; throw new Error('captured-before-transport'); },
+    });
+    await expect(provider.complete({ model: 'gpt-6.1-terra', reasoning,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Inspect the image.' },
+        { type: 'image', data: 'AQID', mediaType: 'image/png' }] }],
+      tools: [{ name: 'read_file', description: 'Read a file', inputSchema: {
+        type: 'object', properties: { path: { type: 'string' } }, required: ['path'],
+      } }], onRequestFailure() {},
+    })).rejects.toThrow('captured-before-transport');
+    expect(payload).toMatchObject({ model: 'gpt-6.1-terra', stream: true,
+      reasoning: { effort: reasoning === 'off' ? 'none' : reasoning } });
+    expect(JSON.stringify(payload.input)).toContain('input_image');
+    expect(JSON.stringify(payload.input)).toContain('data:image/png;base64,AQID');
+    expect(JSON.stringify(payload.input)).toContain('read_file');
+  });
+
+  it.each([
+    ['openai', 'gpt-6.1-terra', 'off'], ['openai', 'gpt-6.1-terra', 'low'], ['openai', 'gpt-6.1-terra', 'high'],
+    ['openrouter', 'openai/gpt-6.1-terra', 'off'], ['openrouter', 'openai/gpt-6.1-terra', 'low'], ['openrouter', 'openai/gpt-6.1-terra', 'high'],
+  ] as const)('preserves %s / %s / %s tool and image requests without transport', async (providerId, modelId, reasoning) => {
+    const resolved = resolveConfiguredPiModel({ getPiModel: getBuiltinModel as any }, providerId, modelId);
+    expect(resolved).not.toBeNull();
+    const { createPiProvider } = await import('#core-agent');
+    const transport = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('transport-must-not-run'));
+    try {
+      for (const method of ['complete', 'stream'] as const) {
+        let payload: any;
+        const provider = createPiProvider({ provider: providerId, customModel: resolved!.model, apiKey: 'sk-fixture-only',
+          onPayload(value) { payload = value; throw new Error('captured-before-transport'); },
+        });
+        const params = { model: modelId, reasoning, maxTokens: 512,
+          messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'Inspect the image.' },
+            { type: 'image' as const, data: 'AQID', mediaType: 'image/png' }] }],
+          tools: [{ name: 'read_file', description: 'Read a file', inputSchema: {
+            type: 'object' as const, properties: { path: { type: 'string' } }, required: ['path'],
+          } }], onRequestFailure() {},
+        };
+        if (method === 'complete') {
+          await expect(provider.complete(params)).rejects.toThrow('captured-before-transport');
+        } else {
+          const events = [];
+          for await (const event of provider.stream(params)) events.push(event);
+          expect(events.filter(event => event.type === 'error')).toHaveLength(1);
+          expect(events.find(event => event.type === 'error')?.error.message).toContain('captured-before-transport');
+          expect(events.some(event => event.type === 'message_end')).toBe(false);
+        }
+        expect(payload).toMatchObject({ model: modelId, stream: true,
+          reasoning: { effort: reasoning === 'off' ? 'none' : providerId === 'openai' ? 'medium' : reasoning } });
+        expect(payload.max_output_tokens ?? payload.max_tokens ?? payload.max_completion_tokens).toBe(512);
+        if (providerId === 'openai') {
+          // API-key Responses pins the prefix effort and sends the selected
+          // effort in a later configuration update. A non-sk fixture would
+          // exercise the SDK's ChatGPT sign-in branch instead.
+          if (reasoning !== 'off') {
+            expect(payload.input.findLast((item: any) => item.type === 'configuration_update' && item.reasoning))
+              .toMatchObject({ reasoning: { effort: reasoning } });
+          }
+          expect(payload.input).toContainEqual(expect.objectContaining({ type: 'additional_tools', tools: expect.arrayContaining([
+            expect.objectContaining({ type: 'function', name: 'read_file', parameters: expect.objectContaining({ required: ['path'] }) }),
+          ]) }));
+          expect(JSON.stringify(payload.input)).toContain('input_image');
+          expect(JSON.stringify(payload.input)).toContain('data:image/png;base64,AQID');
+        } else {
+          expect(payload.tools).toContainEqual(expect.objectContaining({ type: 'function', function: expect.objectContaining({ name: 'read_file' }) }));
+          expect(payload.messages[0].content).toContainEqual({ type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } });
+        }
+      }
+      expect(transport).not.toHaveBeenCalled();
+    } finally {
+      transport.mockRestore();
+    }
+  });
+
+  it('uses the confirmed Seedream 5.0 Flash default for direct Doubao images', () => {
+    expect(findImageGenCapability('doubao')).toMatchObject({
+      model: 'doubao-seedream-5-0-flash-260915',
+      api: 'doubao',
+      supportsEdit: true,
+    });
   });
 
   it('curates every visible non-oauth-only provider', () => {
@@ -201,8 +324,9 @@ describe('provider_catalog › CURATED_MODELS', () => {
     }
   });
 
-  it.each(['minimax-cn', 'minimax-portal', 'minimax-portal-cn'])('runs new Flash through %s with its own protocol metadata', async (providerId) => {
-    const catalog = { getPiModel: (provider: string, id: string) => id === 'MiniMax-M3.1-Flash' ? undefined : (getBuiltinModel as any)(provider, id) };
+  it.each(['minimax-cn', 'minimax-portal', 'minimax-portal-cn'])('retains Flash fallback controls on older SDK catalogs through %s', async (providerId) => {
+    const catalog = { getPiModel: (provider: string, id: string) => id === 'MiniMax-M3.1-Flash'
+      ? undefined : (getBuiltinModel as any)(provider, id) };
     const original = structuredClone(catalog.getPiModel(providerId === 'minimax-portal' ? 'minimax' : 'minimax-cn', 'MiniMax-M3'));
     const resolved = resolveConfiguredPiModel(catalog, providerId, 'MiniMax-M3.1-Flash');
     expect(resolved).not.toBeNull();
@@ -231,6 +355,83 @@ describe('provider_catalog › CURATED_MODELS', () => {
       }
     }
     expect(catalog.getPiModel(providerId === 'minimax-portal' ? 'minimax' : 'minimax-cn', 'MiniMax-M3')).toEqual(original);
+  });
+
+  it.each(['minimax-cn', 'minimax-portal', 'minimax-portal-cn'])('keeps Flash request controls when %s gains native SDK metadata', async (providerId) => {
+    const sdkProvider = providerId === 'minimax-portal' ? 'minimax' : 'minimax-cn';
+    const native = (getBuiltinModel as any)(sdkProvider, 'MiniMax-M3.1-Flash');
+    expect(native).toBeDefined();
+    const original = structuredClone(native);
+    const resolved = resolveConfiguredPiModel({ getPiModel: (provider, id) =>
+      provider === sdkProvider && id === native.id ? native : undefined }, providerId, native.id)!;
+    expect(resolved).toMatchObject({ isConfiguredFallback: false, needsCustomModel: true,
+      model: { contextWindow: 1_000_000, maxTokens: 131072, cost: native.cost } });
+    const { createPiProvider } = await import('#core-agent');
+    for (const reasoning of ['off', 'minimal', 'low', 'high'] as const) {
+      let payload: any;
+      const provider = createPiProvider({ provider: providerId, apiKey: 'fixture-only', customModel: resolved.model,
+        onPayload(value) { payload = value; throw new Error('captured-before-transport'); } });
+      await expect(provider.complete({ model: native.id, reasoning, temperature: 0.25,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'Answer' }] }], onRequestFailure() {},
+      })).rejects.toThrow('captured-before-transport');
+      expect(payload).not.toHaveProperty('temperature');
+      expect(payload.thinking?.type).not.toBe('disabled');
+      if (reasoning !== 'off') expect(payload.output_config.effort).toBe(reasoning === 'minimal' ? 'low' : reasoning);
+    }
+    expect(native).toEqual(original);
+  });
+
+  // A reservation is subtracted from the window before the input budget is worked
+  // out, so an SDK ceiling near the window leaves a long conversation almost no
+  // input: minimax-m3's 512K of 524K capped input at 10,076 tokens, below the
+  // overhead of an ordinary first request. Reservations come from the table's own
+  // rows: 131072 for wide windows (MiMo, Kimi K3, M3.1 Flash, direct GLM-5.2),
+  // 32768 for 256K ones (Doubao Turbo, direct Kimi K2.7 Code).
+  describe('output reservation against the context window', () => {
+    // Known rows above the limit but well short of the window, left to a separate
+    // decision. Each must still exceed it, so the list cannot go stale.
+    const ABOVE_HALF_WINDOW = new Set([
+      'minimax-cn/MiniMax-M3', 'minimax-portal/MiniMax-M3', 'minimax-portal-cn/MiniMax-M3',
+      'minimax-cn/MiniMax-M2.7', 'minimax-portal/MiniMax-M2.7', 'minimax-portal-cn/MiniMax-M2.7',
+      'openrouter/minimax/minimax-m2.7', 'openrouter/z-ai/glm-5.1',
+    ]);
+    const catalog = { getPiModel: (provider: string, id: string) => (getBuiltinModel as any)(provider, id) };
+    const rows = Object.entries(PUBLIC_PROVIDER_MODELS).flatMap(([provider, models]) => models.map((entry) => {
+      const resolved = resolveConfiguredPiModel(catalog, provider, entry.id)?.model;
+      return { row: `${provider}/${entry.id}`, window: resolved?.contextWindow ?? entry.contextWindow, output: resolved?.maxTokens ?? entry.maxTokens };
+    })).filter((row): row is { row: string; window: number; output: number } => !!row.window && !!row.output);
+
+    it('leaves at least half of every catalog window for input', () => {
+      // Guard against the check going vacuous if resolution stops finding rows.
+      expect(rows.length).toBeGreaterThan(50);
+      const overHalf = rows.filter(({ window, output }) => output / window > 0.5).map(({ row }) => row);
+      expect(overHalf.filter((row) => !ABOVE_HALF_WINDOW.has(row))).toEqual([]);
+    });
+
+    it('keeps the exception list limited to rows that still need it', () => {
+      const overHalf = new Set(rows.filter(({ window, output }) => output / window > 0.5).map(({ row }) => row));
+      expect([...ABOVE_HALF_WINDOW].filter((row) => !overHalf.has(row))).toEqual([]);
+    });
+  });
+
+  it.each([
+    ['google/gemini-4-argon', 65536],
+    ['xiaomi/mimo-v2.5', 65536],
+    ['xiaomi/mimo-v2.5-pro', 131072],
+    ['minimax/minimax-m3', 131072],
+    ['z-ai/glm-5.2', 131072],
+    ['x-ai/grok-4.5', 131072],
+    ['x-ai/grok-4.20', 131072],
+    ['moonshotai/kimi-k2.7-code', 32768],
+    ['qwen/qwen3-coder-next', 32768],
+  ] as const)('preserves input capacity for %s when the SDK raises its output ceiling', (id, reservation) => {
+    const native = { ...(getBuiltinModel as any)('openrouter', id), contextWindow: 1_050_000, maxTokens: 945_000 };
+    const resolved = resolveConfiguredPiModel({ getPiModel: () => native }, 'openrouter', id)!;
+    expect(resolved.model.contextWindow).toBe(1_050_000);
+    expect(resolved.model.maxTokens).toBe(reservation);
+    expect(resolved.needsCustomModel).toBe(true);
+    expect(modelCatalogEntryFromModel(resolved.model)).toEqual({ contextWindow: 1_050_000, maxOutputTokens: reservation });
+    expect(native.maxTokens).toBe(945_000);
   });
 
   it('exposes GLM 5.3 and 5.2 as native runnable Z.AI models', () => {
@@ -311,11 +512,81 @@ describe('provider_catalog › CURATED_MODELS', () => {
   });
 
   it('natively resolves GPT-6 tiers and every retained GPT-5.6 tier', () => {
-    const expected = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
-    expect((CURATED_MODELS.openai || []).map((m) => m.id)).toEqual(expected);
-    expect((CURATED_MODELS['openai-codex'] || []).map((m) => m.id)).toEqual(expected);
+    const expected = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+    expect((CURATED_MODELS.openai || []).map((m) => m.id)).toEqual([
+      ...expected,
+    ]);
+    expect((CURATED_MODELS['openai-codex'] || []).map((m) => m.id)).toEqual([
+      ...expected,
+    ]);
+
+    for (const provider of ['openai', 'openai-codex'] as const) {
+      for (const modelId of expected) {
+        expect(getBuiltinModel(provider, modelId)).toBeDefined();
+      }
+    }
+
+    expect(getBuiltinModel('openai', 'gpt-6-astra')).toMatchObject({
+      id: 'gpt-6-astra',
+      provider: 'openai',
+      api: 'openai-responses',
+      reasoning: true,
+      input: ['text', 'image'],
+      maxTokens: 128_000,
+      thinkingLevelMap: { off: null, minimal: null, low: 'low', max: 'max' },
+      compat: { supportsExplicitPromptCacheMode: true },
+    });
+    expect(getBuiltinModel('openai-codex', 'gpt-6-astra')).toMatchObject({
+      id: 'gpt-6-astra',
+      provider: 'openai-codex',
+      api: 'openai-codex-responses',
+      reasoning: true,
+      input: ['text', 'image'],
+      maxTokens: 128_000,
+    });
+    for (const id of ['gpt-6-sol', 'gpt-6-luna']) {
+      expect(getBuiltinModel('openai', id)).toMatchObject({
+        id, api: 'openai-responses', contextWindow: 272_000, maxTokens: 128_000,
+      });
+      expect(getBuiltinModel('openai-codex', id)).toMatchObject({
+        id, api: 'openai-codex-responses', contextWindow: 272_000, maxTokens: 128_000,
+      });
+    }
   });
 
+  it('inherits each GPT provider window from pi-ai while retaining output reservations', () => {
+    const catalog = { getPiModel: getBuiltinModel as any };
+    const ids = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+    for (const provider of ['openai', 'openai-codex', 'openrouter']) {
+      for (const id of ids) {
+        const modelId = provider === 'openrouter' ? `openai/${id}` : id;
+        const sdk = (getBuiltinModel as any)(provider, modelId);
+        const resolved = resolveConfiguredPiModel(catalog, provider, modelId);
+        expect(resolved?.model.contextWindow, `${provider}/${id}`).toBe(sdk.contextWindow);
+        expect(resolved?.model.maxTokens).toBe(
+          provider === 'openrouter' ? sdk.maxTokens : id === 'gpt-6-astra' ? 128_000 : 64_000,
+        );
+        expect(resolved?.needsCustomModel).toBe(true);
+      }
+    }
+  });
+
+  it('inherits the SDK template window when a GPT id is newer than the SDK', () => {
+    for (const provider of ['openai', 'openai-codex', 'openrouter']) {
+      const id = provider === 'openrouter' ? 'openai/gpt-5.6-sol' : 'gpt-5.6-sol';
+      const templateId = provider === 'openrouter' ? 'openai/gpt-5.5' : 'gpt-5.5';
+      // Model an older catalog independently of which retired templates the
+      // current SDK still ships (Codex removed GPT-5.5 in pi-ai 1.4).
+      const sourceId = provider === 'openrouter' ? 'openai/gpt-5.6-sol' : 'gpt-5.6-sol';
+      const template = { ...(getBuiltinModel as any)(provider, sourceId), id: templateId, contextWindow: 456_789 };
+      const catalog = { getPiModel: (_provider: string, modelId: string) => modelId === templateId ? template : undefined };
+      expect(resolveConfiguredPiModel(catalog, provider, id)).toMatchObject({
+        templateModelId: templateId,
+        isConfiguredFallback: true,
+        model: { id, contextWindow: 456_789 },
+      });
+    }
+  });
 
   it('openrouter catalog includes DeepSeek / Qwen / GLM / Kimi / MiniMax', () => {
     const ids = (CURATED_MODELS.openrouter || []).map((m) => m.id);
@@ -347,7 +618,7 @@ describe('provider_catalog › CURATED_MODELS', () => {
     const ids = (CURATED_MODELS.openrouter || [])
       .map((m) => m.id)
       .filter((id) => id.startsWith('openai/gpt-'));
-    expect(ids).toEqual([
+    const nativeIds = [
       'openai/gpt-6-astra',
       'openai/gpt-6.1-sol',
       'openai/gpt-6-sol',
@@ -355,7 +626,141 @@ describe('provider_catalog › CURATED_MODELS', () => {
       'openai/gpt-5.6-sol',
       'openai/gpt-5.6-terra',
       'openai/gpt-5.6-luna',
-    ]);
+    ];
+    expect(ids).toEqual([...nativeIds.slice(0, 2), 'openai/gpt-6.1-terra', ...nativeIds.slice(2)]);
+
+    for (const modelId of nativeIds) {
+      expect(getBuiltinModel('openrouter', modelId)).toBeDefined();
+    }
+    expect(getBuiltinModel('openrouter', 'openai/gpt-6-astra')).toMatchObject({
+      id: 'openai/gpt-6-astra',
+      provider: 'openrouter',
+      api: 'openai-completions',
+      reasoning: true,
+      input: ['text', 'image'],
+      contextWindow: 1_050_000,
+      maxTokens: 128_000,
+    });
+  });
+
+  it('maps retired ids while preserving listed generation variants', () => {
+    expect(resolveModelUpgrade('kimi-coding', 'k2p6')).toMatchObject({
+      modelId: 'k2p7',
+      previousModelId: 'k2p6',
+      upgraded: true,
+    });
+    expect(resolveModelUpgrade('moonshot', 'kimi-k2.5').modelId).toBe('kimi-k2.7-code');
+    expect(resolveModelUpgrade('google', 'gemini-3-pro-preview').modelId).toBe('gemini-3.8-flash');
+    expect(resolveModelUpgrade('google', 'gemini-3.1-pro-preview').modelId).toBe('gemini-3.1-pro-preview');
+    expect(resolveModelUpgrade('google', 'gemini-3.5-flash').modelId).toBe('gemini-3.8-flash');
+    expect(resolveModelUpgrade('google', 'gemini-3.6-flash').modelId).toBe('gemini-3.8-flash');
+    expect(resolveModelUpgrade('google', 'gemini-3.7-flash').upgraded).toBe(false);
+    expect(resolveModelUpgrade('google', 'gemini-3.1-flash-lite').modelId).toBe('gemini-3.5-flash-lite');
+    expect(resolveModelUpgrade('doubao', 'doubao-seed-2-0-lite-260215').modelId).toBe('doubao-seed-2-0-lite-260428');
+    expect(resolveModelUpgrade('zai', 'glm-5.1')).toMatchObject({
+      modelId: 'glm-5.2',
+      previousModelId: 'glm-5.1',
+      upgraded: true,
+    });
+    expect(resolveModelUpgrade('openrouter', 'qwen/qwen3-max').modelId).toBe('qwen/qwen3.8-max-0902');
+    expect(resolveModelUpgrade('openrouter', 'qwen/qwen3-coder').modelId).toBe('qwen/qwen3.8-max-0902');
+    expect(resolveModelUpgrade('openrouter', 'qwen/qwen3.7-max').modelId).toBe('qwen/qwen3.8-max-0902');
+    expect(resolveModelUpgrade('openrouter', 'qwen/qwen3.7-flash').modelId).toBe('qwen/qwen3.8-flash');
+    expect(resolveModelUpgrade('openrouter', 'moonshotai/kimi-k2.6').modelId).toBe('moonshotai/kimi-k3');
+    expect(resolveModelUpgrade('openrouter', 'anthropic/claude-opus-4.8').modelId).toBe('anthropic/claude-opus-5');
+    expect(resolveModelUpgrade('openrouter', 'anthropic/claude-sonnet-5').modelId).toBe('anthropic/claude-sonnet-5');
+    expect(resolveModelUpgrade('openrouter', 'anthropic/claude-fable-5').upgraded).toBe(false);
+    expect(resolveModelUpgrade('openrouter', 'google/gemini-3.6-flash').modelId).toBe('google/gemini-3.8-flash');
+    expect(resolveModelUpgrade('openrouter', 'google/gemini-3.7-flash').upgraded).toBe(false);
+    expect(resolveModelUpgrade('openrouter', 'openai/gpt-5.5').modelId).toBe('openai/gpt-5.6-sol');
+    expect(resolveModelUpgrade('openrouter', 'openai/gpt-5.4').modelId).toBe('openai/gpt-5.6-sol');
+    expect(resolveModelUpgrade('openrouter', 'openai/gpt-6-astra').upgraded).toBe(false);
+    expect(resolveModelUpgrade('openrouter', 'openai/gpt-5.6-luna').modelId).toBe('openai/gpt-5.6-luna');
+    expect(resolveModelUpgrade('openrouter', 'google/gemini-3.1-pro-preview').modelId).toBe('google/gemini-3.1-pro-preview');
+    expect(resolveModelUpgrade('openrouter', 'deepseek/deepseek-v4-flash').modelId).toBe('deepseek/deepseek-v4-flash-0731');
+    expect(resolveModelUpgrade('openrouter', 'qwen/qwen3-coder-next').modelId).toBe('qwen/qwen3-coder-next');
+    expect(resolveModelUpgrade('anthropic', 'claude-opus-4-7')).toMatchObject({
+      modelId: 'claude-opus-5',
+      upgraded: true,
+    });
+    expect(resolveModelUpgrade('anthropic', 'claude-sonnet-5').modelId).toBe('claude-sonnet-5');
+    expect(resolveModelUpgrade('anthropic', 'claude-fable-5').upgraded).toBe(false);
+    expect(resolveModelUpgrade('openai', 'gpt-5.5').modelId).toBe('gpt-5.6-sol');
+    expect(resolveModelUpgrade('openai', 'gpt-5.4').modelId).toBe('gpt-5.6-sol');
+    expect(resolveModelUpgrade('openai-codex', 'gpt-5.5').modelId).toBe('gpt-5.6-sol');
+    expect(resolveModelUpgrade('openai-codex', 'gpt-5.4').modelId).toBe('gpt-5.6-sol');
+    expect(resolveModelUpgrade('openai', 'gpt-6-astra').upgraded).toBe(false);
+    expect(resolveModelUpgrade('openai-codex', 'gpt-6-astra').upgraded).toBe(false);
+    expect(resolveModelUpgrade('openai-codex', 'gpt-5.6-luna').modelId).toBe('gpt-5.6-luna');
+  });
+
+  it('keeps strict provider whitelists while accepting validated OpenRouter ids', () => {
+    expect(isSelectableModel('openai', 'gpt-5.5')).toBe(true);
+    expect(isSelectableModel('openai', 'gpt-not-listed')).toBe(false);
+    expect(isSelectableModel('huggingface', 'some-runtime-model')).toBe(false);
+    expect(isSelectableModel('custom', 'acme/reasoner-v2')).toBe(true);
+    expect(isSelectableModel('custom', 'bad\u0000model')).toBe(false);
+    expect(isSelectableModel('openrouter', 'x-ai/grok-4.5')).toBe(true);
+    expect(isSelectableModel('openrouter', 'future-lab/frontier-1:free')).toBe(true);
+    expect(isSelectableModel('openrouter', '~openai/gpt-latest')).toBe(true);
+    expect(isSelectableModel('openrouter', 'bad model')).toBe(false);
+    expect(isSelectableModel('openrouter', 'bad\u0000model')).toBe(false);
+    // Explicit retired-id aliases remain valid because they resolve to a
+    // current catalog entry before the whitelist check.
+    expect(isSelectableModel('kimi-coding', 'k2p6')).toBe(true);
+  });
+
+  it('enforces the OpenRouter custom model ID length and whitespace boundaries', () => {
+    const maxLengthId = `vendor/${'m'.repeat(193)}`;
+    expect(maxLengthId).toHaveLength(200);
+    expect(isSelectableModel('openrouter', maxLengthId)).toBe(true);
+    expect(isSelectableModel('openrouter', `${maxLengthId}x`)).toBe(false);
+    expect(isSelectableModel('openrouter', 'vendor/model\tlatest')).toBe(false);
+    expect(isSelectableModel('openrouter', 'vendor/model\nlatest')).toBe(false);
+    expect(isSelectableModel('openrouter', '  vendor/model:free  ')).toBe(true);
+  });
+
+  it('resolves new user-entered OpenRouter ids through the relay protocol', () => {
+    const catalog = {
+      getPiModel(provider: string, modelId: string) {
+        return (getBuiltinModel as (p: string, m: string) => any)(provider, modelId);
+      },
+    };
+    const resolved = resolveConfiguredPiModel(catalog, 'openrouter', 'future-lab/frontier-1');
+    expect(resolved).toMatchObject({
+      requestedModelId: 'future-lab/frontier-1',
+      templateModelId: 'openrouter/auto',
+      isConfiguredFallback: true,
+      needsCustomModel: true,
+      model: {
+        id: 'future-lab/frontier-1',
+        api: 'openai-completions',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        input: ['text'],
+      },
+    });
+  });
+
+  it('uses declared metadata when the bundled SDK catalog lacks an advertised shortcut', () => {
+    const catalog = {
+      getPiModel(provider: string, modelId: string) {
+        if (provider === 'openrouter' && modelId === 'deepseek/deepseek-v4-flash-0731') {
+          return undefined;
+        }
+        return (getBuiltinModel as (p: string, m: string) => any)(provider, modelId);
+      },
+    };
+    const resolved = resolveConfiguredPiModel(catalog, 'openrouter', 'deepseek/deepseek-v4-flash-0731');
+    expect(resolved).toMatchObject({
+      templateModelId: 'deepseek/deepseek-v4-flash',
+      isConfiguredFallback: true,
+      needsCustomModel: true,
+      model: {
+        id: 'deepseek/deepseek-v4-flash-0731',
+        contextWindow: 1_000_000,
+        maxTokens: 128_000,
+      },
+    });
   });
 
   it('resolves the OpenRouter V4.1 Flash shortcut with vision before the SDK catalogs it', () => {
@@ -750,62 +1155,6 @@ describe('provider_catalog › pickLatestGenerations (fallback)', () => {
     expect(pickLatestGenerations(null as any, 2)).toEqual([]);
   });
 });
-
-  it('natively resolves GPT-6 tiers and every retained GPT-5.6 tier', () => {
-    const expected = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
-    expect((CURATED_MODELS.openai || []).map((m) => m.id)).toEqual(expected);
-    expect((CURATED_MODELS['openai-codex'] || []).map((m) => m.id)).toEqual(expected);
-
-    for (const provider of ['openai', 'openai-codex'] as const) {
-      for (const modelId of expected) {
-        expect(getBuiltinModel(provider, modelId)).toBeDefined();
-      }
-    }
-
-    expect(getBuiltinModel('openai', 'gpt-6-astra')).toMatchObject({
-      id: 'gpt-6-astra',
-      provider: 'openai',
-      api: 'openai-responses',
-      reasoning: true,
-      input: ['text', 'image'],
-      maxTokens: 128_000,
-      thinkingLevelMap: { off: null, minimal: null, low: 'low', max: 'max' },
-      compat: { supportsExplicitPromptCacheMode: true },
-    });
-    expect(getBuiltinModel('openai-codex', 'gpt-6-astra')).toMatchObject({
-      id: 'gpt-6-astra',
-      provider: 'openai-codex',
-      api: 'openai-codex-responses',
-      reasoning: true,
-      input: ['text', 'image'],
-      maxTokens: 128_000,
-    });
-    for (const id of ['gpt-6-sol', 'gpt-6-luna']) {
-      expect(getBuiltinModel('openai', id)).toMatchObject({
-        id, api: 'openai-responses', contextWindow: 272_000, maxTokens: 128_000,
-      });
-      expect(getBuiltinModel('openai-codex', id)).toMatchObject({
-        id, api: 'openai-codex-responses', contextWindow: 272_000, maxTokens: 128_000,
-      });
-    }
-  });
-
-  it('inherits each GPT provider window from pi-ai while retaining output reservations', () => {
-    const catalog = { getPiModel: getBuiltinModel as any };
-    const ids = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
-    for (const provider of ['openai', 'openai-codex', 'openrouter']) {
-      for (const id of ids) {
-        const modelId = provider === 'openrouter' ? `openai/${id}` : id;
-        const sdk = (getBuiltinModel as any)(provider, modelId);
-        const resolved = resolveConfiguredPiModel(catalog, provider, modelId);
-        expect(resolved?.model.contextWindow, `${provider}/${id}`).toBe(sdk.contextWindow);
-        expect(resolved?.model.maxTokens).toBe(
-          provider === 'openrouter' ? sdk.maxTokens : id === 'gpt-6-astra' ? 128_000 : 64_000,
-        );
-        expect(resolved?.needsCustomModel).toBe(true);
-      }
-    }
-  });
 
 describe('configured provider trust boundary',()=>{it('accepts safe Server-configured providers and rejects unsafe or reserved definitions', async () => {
     const users = await import('../../../src/main/features/users');

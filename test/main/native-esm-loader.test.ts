@@ -103,10 +103,12 @@ describe('native ESM dependency loading', () => {
     expect(await run(`
       const original = fs.realpathSync;
       let probes = 0;
-      fs.realpathSync = function(value, ...args) {
+      const count = original => function(value, ...args) {
         if (String(value).endsWith('shared.mjs')) probes++;
         return original.call(this, value, ...args);
       };
+      fs.realpathSync = count(original);
+      fs.realpathSync.native = count(original.native);
       const value = await import('fixture');
       return { shared: value.left === value.right, probes };
     `)).toEqual({ value: { shared: true, probes: 1 } });

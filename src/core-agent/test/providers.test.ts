@@ -146,7 +146,7 @@ describe("Providers (pi-ai backed)", () => {
   it('isolates concurrent request failures and cannot lose the original error to a broken observer', async () => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => { throw new Error('broken logger'); });
     const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
-    const provider = createPiProvider({ provider: 'openai-codex', model: 'gpt-5.5', apiKey: `fixture.${token}.fixture` });
+    const provider = createPiProvider({ provider: 'openai-codex', model: 'gpt-5.6-sol', apiKey: `fixture.${token}.fixture` });
     let release!: () => void;
     let entered!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
@@ -160,7 +160,7 @@ describe("Providers (pi-ai backed)", () => {
       return new Response('private', { status: 503 });
     }));
     const first: any[] = [], second: any[] = [];
-    const params: CompletionParams = { model: 'gpt-5.5', messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }] };
+    const params: CompletionParams = { model: 'gpt-5.6-sol', messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }] };
     try {
       const firstCall = provider.complete({ ...params, requestMetadata: { orkasRequestId: 'a'.repeat(32) }, onRequestFailure: failure => {
         first.push(failure); throw new Error('broken observer');
@@ -182,7 +182,7 @@ describe("Providers (pi-ai backed)", () => {
   it.each(['aborted', 'body_failure'] as const)('records %s without guessing a flattened cause or retrying', async mode => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
-    const provider = createPiProvider({ provider: 'openai-codex', model: 'gpt-5.5', apiKey: `fixture.${token}.fixture` });
+    const provider = createPiProvider({ provider: 'openai-codex', model: 'gpt-5.6-sol', apiKey: `fixture.${token}.fixture` });
     const controller = new AbortController();
     const fetchStub = vi.fn(async () => {
       if (mode === 'aborted') {
@@ -196,7 +196,7 @@ describe("Providers (pi-ai backed)", () => {
     const failures: any[] = [];
     try {
       const events: StreamEvent[] = [];
-      for await (const event of provider.stream({ model: 'gpt-5.5', messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }],
+      for await (const event of provider.stream({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }],
         signal: controller.signal, onRequestFailure: failure => failures.push(failure) })) events.push(event);
       expect(events.filter(event => event.type === 'error')).toHaveLength(1);
       if (mode === 'aborted') {
@@ -216,13 +216,13 @@ describe("Providers (pi-ai backed)", () => {
   it('rejects complete() when the SDK stops with aborted instead of returning partial content', async () => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
-    const provider = createPiProvider({ provider: 'openai-codex', model: 'gpt-5.5', apiKey: `fixture.${token}.fixture` });
+    const provider = createPiProvider({ provider: 'openai-codex', model: 'gpt-5.6-sol', apiKey: `fixture.${token}.fixture` });
     const controller = new AbortController();
     vi.stubGlobal('fetch', vi.fn(async () => { controller.abort(); throw new DOMException('private-canary', 'AbortError'); }));
     const failures: any[] = [];
     try {
       const error = await provider.complete({
-        model: 'gpt-5.5', messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }],
+        model: 'gpt-5.6-sol', messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }],
         signal: controller.signal, onRequestFailure: failure => failures.push(failure),
       }).then(() => null, err => err);
       expect(error).toBeInstanceOf(Error);
@@ -235,14 +235,14 @@ describe("Providers (pi-ai backed)", () => {
   it.each(['complete', 'stream'] as const)('keeps distinct pre-response causes through the real SDK in %s diagnostics', async (method) => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
-    const provider = createPiProvider({ provider: 'openai-codex', model: 'gpt-5.5', apiKey: `fixture.${token}.fixture` });
+    const provider = createPiProvider({ provider: 'openai-codex', model: 'gpt-5.6-sol', apiKey: `fixture.${token}.fixture` });
     const failures: any[] = [];
     try {
       for (const code of ['ECONNRESET', 'ENOTFOUND', 'CERT_HAS_EXPIRED', 'private-canary']) {
         const cause = Object.assign(new Error('private-canary'), { code });
         const fetchStub = vi.fn(async () => { throw new TypeError('fetch failed', { cause }); });
         vi.stubGlobal('fetch', fetchStub);
-        const params = { model: 'gpt-5.5', messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }],
+        const params = { model: 'gpt-5.6-sol', messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }],
           onRequestFailure: (failure: any) => { failures.push(failure); } } as CompletionParams;
         let error: unknown;
         if (method === 'complete') {
@@ -340,7 +340,7 @@ describe("Providers (pi-ai backed)", () => {
       "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" },
     })).toString("base64");
     const provider = createPiProvider({
-      provider: "openai-codex", model: "gpt-5.5", apiKey: `fixture.${tokenPayload}.fixture`,
+      provider: "openai-codex", model: "gpt-5.6-sol", apiKey: `fixture.${tokenPayload}.fixture`,
     });
     const privateBody = "request-body-private-canary";
     try {
@@ -393,12 +393,12 @@ describe("Providers (pi-ai backed)", () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const provider = createPiProvider({
-        provider: "openai", model: "gpt-5.5", apiKey: "test",
+        provider: "openai", model: "gpt-5.6-sol", apiKey: "test",
         onPayload() { throw new Error(privateMessage); },
       });
       const events: StreamEvent[] = [];
       for await (const event of provider.stream({
-        model: "gpt-5.5", messages: [{ role: "user", content: [{ type: "text", text: "probe" }] }],
+        model: "gpt-5.6-sol", messages: [{ role: "user", content: [{ type: "text", text: "probe" }] }],
       })) events.push(event);
       const errors = events.filter((event) => event.type === "error");
       expect(errors).toHaveLength(1);
@@ -481,7 +481,7 @@ describe("Providers (pi-ai backed)", () => {
     const payloads: any[] = [];
     const provider = createPiProvider({
       provider: "openai", apiKey: "test",
-      customModel: { api: "openai-responses", provider: "openai", id: "gpt-5.5", name: "GPT-5.5",
+      customModel: { api: "openai-responses", provider: "openai", id: "gpt-5.6-sol", name: "GPT-5.5",
         baseUrl: "https://example.test/v1", reasoning: true, input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 4096 },
       onPayload(payload) { payloads.push(payload); throw new Error("host-role payload captured before network"); },
@@ -490,8 +490,8 @@ describe("Providers (pi-ai backed)", () => {
     const messages: Message[] = [
       { role: "user", content: [{ type: "text", text: "[Internal execution control] quoted by a real user" }] },
       { role: "assistant", content: [
-        { type: "thinking", thinking: "", thinkingSignature: JSON.stringify(reasoning), replayOrigin: replayOrigin({ api: "openai-responses", provider: "openai", id: "gpt-5.5", baseUrl: "https://example.test/v1" }, "test") },
-        { type: "text", text: "Checking", textSignature: JSON.stringify({ v: 1, id: "msg_original", phase: "commentary" }), replayOrigin: replayOrigin({ api: "openai-responses", provider: "openai", id: "gpt-5.5", baseUrl: "https://example.test/v1" }, "test") },
+        { type: "thinking", thinking: "", thinkingSignature: JSON.stringify(reasoning), replayOrigin: replayOrigin({ api: "openai-responses", provider: "openai", id: "gpt-5.6-sol", baseUrl: "https://example.test/v1" }, "test") },
+        { type: "text", text: "Checking", textSignature: JSON.stringify({ v: 1, id: "msg_original", phase: "commentary" }), replayOrigin: replayOrigin({ api: "openai-responses", provider: "openai", id: "gpt-5.6-sol", baseUrl: "https://example.test/v1" }, "test") },
         { type: "tool_use", id: "call_image", name: "read_files", input: {} },
       ] },
       { role: "user", content: [{ type: "tool_result", toolUseId: "call_image", content: "image loaded",
@@ -499,7 +499,7 @@ describe("Providers (pi-ai backed)", () => {
       { role: "developer", content: [{ type: "text", text: "Continue the existing task." }] },
       { role: "user", content: [{ type: "text", text: "A real correction" }] },
     ];
-    const params = { model: "gpt-5.5", messages, systemPrompt: "Stable system", sessionId: "host-role-test" };
+    const params = { model: "gpt-5.6-sol", messages, systemPrompt: "Stable system", sessionId: "host-role-test" };
     await expect(provider.complete(params)).rejects.toThrow("host-role payload captured before network");
     const events: StreamEvent[] = [];
     for await (const event of provider.stream(params)) events.push(event);
@@ -1065,8 +1065,10 @@ describe("Providers (pi-ai backed)", () => {
         prompt_cache_key: "gpt6-payload-contract",
         prompt_cache_options: { ttl: "30m" },
         reasoning: { effort: "medium", summary: "auto" },
-        tools: [{ type: "function", name: "read_file" }],
       });
+      expect(payloads[0].tools ?? []).toEqual([]);
+      expect(payloads[0].input[0]).toMatchObject({ type: 'additional_tools',
+        tools: [{ type: 'function', name: 'read_file' }] });
       // pi-ai keeps the prefix stable; the native update carries the requested effort.
       expect(payloads[0].input.at(-1)).toMatchObject({ type: "configuration_update", reasoning: { effort: "low" } });
       expect(payloads[0].prompt_cache_retention).toBeUndefined();
@@ -1115,8 +1117,10 @@ describe("Providers (pi-ai backed)", () => {
       expect(capturedPayload).toMatchObject({
         model: modelId,
         reasoning: { effort: "low" },
-        tools: [expect.objectContaining({ type: "function", name: "read_file" })],
       });
+      expect(capturedPayload?.tools ?? []).toEqual([]);
+      expect(capturedPayload?.input[0]).toMatchObject({ type: 'additional_tools',
+        tools: [expect.objectContaining({ type: 'function', name: 'read_file' })] });
       expect(JSON.stringify(capturedPayload?.input)).toContain("input_image");
     });
 
@@ -1640,14 +1644,15 @@ describe("Providers (pi-ai backed)", () => {
       const steady = await capture(steadyMessages);
       expect(steady.tools).toEqual(initial.tools);
       expect(steady.input.slice(0, loaded.input.length)).toEqual(loaded.input);
-      expect(steady.input.filter((item: any) => item.type === insertionType)).toHaveLength(1);
+      expect(steady.input.filter((item: any) => item.type === insertionType)).toHaveLength(supportsAdditionalTools ? 2 : 1);
       expect(steady.input.find((item: any) => item.type === "function_call" && item.name === "web_search"))
         .toMatchObject({ call_id: "search-1", namespace: "web_search", arguments: "{}" });
       expect(steady.input.find((item: any) => item.type === "function_call" && item.name === "tool_load"))
         .not.toHaveProperty("namespace");
       expect(await capture(steadyMessages)).toEqual(steady);
 
-      const searchOutput = loaded.input.find((item: any) => item.type === insertionType);
+      const searchOutput = loaded.input.find((item: any) => item.type === insertionType
+        && item.tools.some((tool: any) => tool.name === 'web_search'));
       expect(searchOutput).toMatchObject({
         ...(supportsAdditionalTools ? { role: "developer" } : { execution: "client", status: "completed" }),
         tools: [expect.objectContaining({
@@ -1673,8 +1678,15 @@ describe("Providers (pi-ai backed)", () => {
       const compactedMessages = session.getMessagesForModel();
       expect(JSON.stringify(compactedMessages)).not.toContain("addedToolNames");
       const compacted = await capture(compactedMessages);
-      expect(compacted.tools.map((tool: any) => tool.name)).toEqual(["tool_load", "web_search"]);
-      expect(compacted.input.some((item: any) => item.type === insertionType)).toBe(false);
+      if (supportsAdditionalTools) {
+        expect(compacted.tools ?? []).toEqual([]);
+        expect(compacted.input.filter((item: any) => item.type === insertionType)).toHaveLength(1);
+        expect(compacted.input[0]).toMatchObject({ type: insertionType,
+          tools: [expect.objectContaining({ name: 'tool_load' }), expect.objectContaining({ name: 'web_search' })] });
+      } else {
+        expect(compacted.tools.map((tool: any) => tool.name)).toEqual(["tool_load", "web_search"]);
+        expect(compacted.input.some((item: any) => item.type === insertionType)).toBe(false);
+      }
 
       // Providers without native deferred schemas advertise the expanded list
       // up front. Do not claim their load round preserves the same prefix.
@@ -1965,7 +1977,7 @@ describe("Providers (pi-ai backed)", () => {
         messages,
         undefined,
         undefined,
-        { api: "openai-responses", provider: "openai", id: "gpt-5.5" },
+        { api: "openai-responses", provider: "openai", id: "gpt-5.6-sol" },
       );
       const assistant = context.messages.find((message) => message.role === "assistant") as
         | { role: "assistant"; content: Array<{ type: string; thinking?: string; thinkingSignature?: string }> }
@@ -1983,7 +1995,7 @@ describe("Providers (pi-ai backed)", () => {
           type: "thinking",
           thinking: "compatible reasoning",
           thinkingSignature: signature,
-          replayOrigin: replayOrigin({ api: "openai-responses", provider: "openai", id: "gpt-5.5" }),
+          replayOrigin: replayOrigin({ api: "openai-responses", provider: "openai", id: "gpt-5.6-sol" }),
         }],
       }];
 
@@ -1991,7 +2003,7 @@ describe("Providers (pi-ai backed)", () => {
         messages,
         undefined,
         undefined,
-        { api: "openai-responses", provider: "openai", id: "gpt-5.5" },
+        { api: "openai-responses", provider: "openai", id: "gpt-5.6-sol" },
       );
       const assistant = context.messages.find((message) => message.role === "assistant") as
         | { role: "assistant"; content: Array<{ type: string; thinkingSignature?: string }> }
@@ -2233,7 +2245,7 @@ describe("pi-provider wrapError", () => {
     const fetchStub = vi.fn(async () => { throw new Error('must not access network'); });
     vi.stubGlobal('fetch', fetchStub);
     const original = Object.assign(new Error('opaque diagnostic'), { code: 'TASK_TOKEN_LIMIT_REACHED' });
-    const provider = createPiProvider({ provider: 'openai', model: 'gpt-5.5', apiKey: 'fixture',
+    const provider = createPiProvider({ provider: 'openai', model: 'gpt-5.6-sol', apiKey: 'fixture',
       onPayload() { throw original; } });
     try {
       const params: CompletionParams = { messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }] };
@@ -2257,10 +2269,10 @@ describe("pi-provider wrapError", () => {
     let intercepted = 0;
     try {
       const provider = createPiProvider({
-        provider: "openai", model: "gpt-5.5", apiKey: "test",
+        provider: "openai", model: "gpt-5.6-sol", apiKey: "test",
         onPayload() { intercepted++; throw Object.assign(new Error(diagnostic), { code: "context_length_exceeded" }); },
       });
-      const params = { model: "gpt-5.5", messages: [
+      const params = { model: "gpt-5.6-sol", messages: [
         { role: "user" as const, content: [{ type: "text" as const, text: "probe" }] },
       ] };
       if (mode === "complete") {

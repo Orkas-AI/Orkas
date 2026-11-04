@@ -75,6 +75,35 @@ describe('core-agent client skill sandbox env', () => {
     expect(client.buildSkillSandboxEnv('u1', '../agent-a')).not.toHaveProperty('ORKAS_AGENT_ID');
   });
 
+  it('gives every model run its own random run token for per-turn skill bookkeeping', async () => {
+    // VideoStudio's plan checks scope their repair budget to a run; a token
+    // shared between runs would carry an exhausted budget into the user's
+    // next turn, and an id-derived one would expose host identity.
+    const client = await import('../../../../src/main/model/core-agent/client');
+
+    const first = client.buildSkillSandboxEnv('u1', 'agent-a');
+    const second = client.buildSkillSandboxEnv('u1', 'agent-a');
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    expect(first.ORKAS_RUN_TOKEN).toMatch(uuid);
+    expect(second.ORKAS_RUN_TOKEN).toMatch(uuid);
+    expect(second.ORKAS_RUN_TOKEN).not.toBe(first.ORKAS_RUN_TOKEN);
+    expect(client.buildSkillSandboxEnv().ORKAS_RUN_TOKEN).toMatch(uuid);
+  });
+
+  it('passes the account global-Skill preference to the standalone runner', async () => {
+    const preferences = path.join(tmpDir, 'u1', 'cloud', 'config', 'preferences.json');
+    fs.mkdirSync(path.dirname(preferences), { recursive: true });
+    fs.writeFileSync(preferences, JSON.stringify({ global_skill_roots_enabled: false }));
+    const client = await import('../../../../src/main/model/core-agent/client');
+
+    expect(client.buildSkillSandboxEnv('u1')).toMatchObject({
+      ORKAS_GLOBAL_SKILL_ROOTS_ENABLED: '0',
+    });
+    expect(client.buildSkillSandboxEnv('u2')).toMatchObject({
+      ORKAS_GLOBAL_SKILL_ROOTS_ENABLED: '1',
+    });
+  });
+
   it('stops waiting for a wedged event stream when the abort signal fires', async () => {
     const client = await import('../../../../src/main/model/core-agent/client');
     const controller = new AbortController();

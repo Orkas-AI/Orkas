@@ -7,6 +7,15 @@ afterEach(() => {
 });
 
 describe('retryAsync', () => {
+  it('reports only dispatched attempts without letting diagnostics alter retries', async () => {
+    const attempts: number[] = [];
+    const operation = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('done');
+    await expect(retryAsync('bounded-observer', operation, { delaysMs: [0],
+      onAttempt: (attempt: number) => { attempts.push(attempt); throw new Error('observer unavailable'); },
+    } as any)).resolves.toBe('done');
+    expect(attempts).toEqual([0, 1]);
+    expect(operation).toHaveBeenCalledTimes(2);
+  });
   it('retries a transient failure three times before succeeding', async () => {
     const fn = vi.fn()
       .mockRejectedValueOnce(new Error('temporary 1'))
