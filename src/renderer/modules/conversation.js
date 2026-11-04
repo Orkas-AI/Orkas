@@ -7985,6 +7985,13 @@ async function _recoverPolledVisibleMessages(cid, rawMessages) {
   let changed = _removeSupersededInterruptionBubbles(container) > 0;
   try { await _refreshGroupMembers(cid); } catch (_) { /* best effort */ }
   if (cid !== currentCid || document.getElementById('chat-history') !== container) return false;
+  // A queued send may reach history while its live event is interrupted by
+  // reload. Reconcile its durable user row before retiring the observer too.
+  for (const gm of rawMessages) {
+    if (!gm?.id || gm.from !== 'user' || !_isVisibleGroupHistoryRecord(gm)) continue;
+    if (_findRenderedGroupMessage(container, gm)) continue;
+    if (_renderOrClaimPersistedUserMessage(cid, gm, { autoScroll: false })) changed = true;
+  }
   const visible = _collapseSupersededInterruptionRecords(
     _mergeNativeSegmentRecords(
       rawMessages.filter((gm) => _isVisibleGroupHistoryRecord(gm) && gm.from !== 'user'),
