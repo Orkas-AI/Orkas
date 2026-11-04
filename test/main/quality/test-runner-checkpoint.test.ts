@@ -4,12 +4,42 @@ import path from 'node:path';
 import ts from 'typescript';
 import { spawn, spawnSync } from 'node:child_process';
 import { afterEach, expect, it } from 'vitest';
+import { analyzeWebAppLogs } from '../../e2e/fixtures/web-app-log-analysis';
 
 const pcRoot = path.resolve(__dirname, '../../..');
 const node = process.env.ORKAS_TEST_NODE || process.execPath;
 const python = process.env.ORKAS_TEST_PYTHON!;
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach(root => fs.rmSync(root, { recursive: true, force: true })));
+
+it('retains bounded Playwright collection errors even before onBegin', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-collection-errors-'));
+  roots.push(root);
+  const report = path.join(root, 'report.json');
+  const previous = process.env.ORKAS_TEST_BATCH_REPORT;
+  process.env.ORKAS_TEST_BATCH_REPORT = report;
+  try {
+    const { default: Reporter } = await import('../../../scripts/checkpoint-reporter');
+    const reporter = new Reporter();
+    reporter.onError({ message: 'Collection failed: fixture dependency unavailable' });
+    reporter.onError({ message: 'Cannot load /Users/me/private/customer.txt; token=controlled-secret https://example.invalid/?access_token=controlled-query' });
+    for (let index = 0; index < 24; index++) reporter.onError({ message: 'x'.repeat(3000) });
+    reporter.onBegin({ projects: [{ outputDir: root }] } as any, { allTests: () => [] } as any);
+    reporter.onEnd({ status: 'failed' } as any);
+    const result = JSON.parse(fs.readFileSync(report, 'utf8'));
+    expect(result.unhandledErrors).toBe(26);
+    expect(result.runnerErrors).toHaveLength(20);
+    expect(result.runnerErrors[0]).toBe('Collection failed: fixture dependency unavailable');
+    expect(result.runnerErrors[1]).toContain('Cannot load');
+    expect(result.runnerErrors[1]).not.toMatch(/customer\.txt|controlled-secret|controlled-query|\/Users\/me/);
+    expect(result.runnerErrors[2]).toHaveLength(2000);
+    expect(result.omittedRunnerErrors).toBe(6);
+    expect(result.reason).toBe('failed');
+  } finally {
+    if (previous === undefined) delete process.env.ORKAS_TEST_BATCH_REPORT;
+    else process.env.ORKAS_TEST_BATCH_REPORT = previous;
+  }
+});
 
 function fixture(kind: 'python' | 'e2e') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-runner-resume-'));
@@ -28,6 +58,7 @@ function fixture(kind: 'python' | 'e2e') {
     }
   }
   write('test/e2e/fixtures/web-app-log-analysis.ts', fs.readFileSync(path.join(pcRoot, 'test/e2e/fixtures/web-app-log-analysis.ts'), 'utf8'));
+  write('src/main/util/log-sanitize.ts', fs.readFileSync(path.join(pcRoot, 'src/main/util/log-sanitize.ts'), 'utf8'));
   write('node_modules/playwright/package.json', '{}');
   write('node_modules/playwright/cli.js', `require(${JSON.stringify(path.join(path.dirname(require.resolve('playwright/package.json')), 'cli.js'))});`);
   write('node_modules/playwright/lib/program.js', `module.exports = require(${JSON.stringify(require.resolve('playwright/lib/program'))});`);
@@ -229,9 +260,9 @@ it.each(['electron-log-required', 'electron-logs'])(
       compilerOptions: { target: ts.ScriptTarget.ES2022 },
     }).outputText;
     const Owner = new Function('process', 'expect', 'path', 'mkdirSync', 'writeFileSync', 'rmSync',
-      'unlinkSync', 'collectLogFiles', 'randomUUID', code + '; return DisposeOwner;')(
+      'unlinkSync', 'collectLogFiles', 'randomUUID', 'analyzeWebAppLogs', code + '; return DisposeOwner;')(
       { env: { ORKAS_TEST_BATCH_REPORT: 'fixture-report' } }, expect, path, fs.mkdirSync, fs.writeFileSync,
-      fs.rmSync, fs.unlinkSync, () => '', () => 'snapshot');
+      fs.rmSync, fs.unlinkSync, () => '', () => 'snapshot', analyzeWebAppLogs);
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-checkpoint-dispose-'));
     roots.push(root);
     const appRoot = path.join(root, 'app');
@@ -241,7 +272,8 @@ it.each(['electron-log-required', 'electron-logs'])(
     const failure = new Error('injected checkpoint attachment failure');
     const fixture = Object.assign(new Owner(), {
       root: appRoot, page: null, apiResponses: [], expectedApiFailures: [], cliStub: false,
-      rendererPageErrors: [], recoveredRendererErrors: new Set(), diagnostics: ['[fixture-cleanup] completed'], tracePaths: [],
+      rendererPageErrors: [], recoveredRendererErrors: new Set(), resourceDenials: new Map(), browserDenials: new Map(),
+      expectedRendererFailures: new Map(), expectedInvokeFailures: [], diagnostics: ['[fixture-cleanup] completed'], tracePaths: [],
       closeCurrentApp: async () => { released.push('app'); },
       closeStubServer: async () => { released.push('stub'); },
       testInfo: {

@@ -10,7 +10,7 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withTestPython, withWindowsGitOnPath } from './test-runtime-env.mjs';
+import { withTestPython, withWindowsGitOnPath, withWindowsPowerShellModules } from './test-runtime-env.mjs';
 import { formatDriftReport, installedDependencyDrift } from './check-installed-dependencies.mjs';
 
 // A merge that advanced the lockfile leaves stale packages installed, and the
@@ -25,7 +25,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const require_ = createRequire(import.meta.url);
 const electronBin = require_('electron');
 const vitestBin = resolve(here, '..', 'node_modules', 'vitest', 'vitest.mjs');
-const testEnvironment = withTestPython(withWindowsGitOnPath(process.env));
+const testEnvironment = withTestPython(withWindowsPowerShellModules(withWindowsGitOnPath(process.env)));
 // Nested launcher calls must not overwrite their parent's checkpoint report.
 delete testEnvironment.ORKAS_TEST_BATCH_REPORT;
 

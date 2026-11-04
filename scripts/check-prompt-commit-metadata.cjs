@@ -105,7 +105,15 @@ function resolveBase(repoRoot) {
 }
 
 function selectGovernanceBase(requestedBase, introductions, isAncestor) {
-  return introductions.find((commit) => isAncestor(requestedBase, commit)) || requestedBase;
+  const nodes = [...new Set(introductions)];
+  // Reintroducing the checker must not reset an already adopted policy, nor
+  // let Git log order hide governed commits between the two introductions.
+  if (nodes.some(node => node === requestedBase || isAncestor(node, requestedBase))) return requestedBase;
+  const eligible = nodes.filter(node => isAncestor(requestedBase, node));
+  if (!eligible.length) return requestedBase;
+  const first = eligible.filter(node => eligible.every(other => node === other || isAncestor(node, other)));
+  if (first.length !== 1) throw new Error('ambiguous governance adoption nodes; reconcile the commit baseline');
+  return first[0];
 }
 
 /** Do not apply a newly introduced commit policy retroactively to commits that
@@ -113,7 +121,7 @@ function selectGovernanceBase(requestedBase, introductions, isAncestor) {
  * that narrower base remains authoritative. */
 function resolveEffectiveBase(repoRoot, requestedBase) {
   const output = runGit([
-    'log', '--format=%H', '--diff-filter=A', 'HEAD', '--', CHECKER_PATH,
+    'log', '--full-history', '--format=%H', '--diff-filter=A', 'HEAD', '--', CHECKER_PATH,
   ], repoRoot);
   const introductions = output ? output.split('\n').filter(Boolean) : [];
   return selectGovernanceBase(requestedBase, introductions, (ancestor, descendant) => {

@@ -33,6 +33,7 @@ const AVATAR_COLORS = new Set(
 const REQUIRED_BUILTIN_INVENTORY = Object.freeze({
   system_skills: Object.freeze([
     'agent-creator',
+    'orkas-guide',
     'package-installer',
     'skill-creator',
     'web-app-sdk',

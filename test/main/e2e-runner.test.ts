@@ -5,13 +5,13 @@ import { describe, expect, it } from 'vitest';
 
 const source = readFileSync(path.resolve(process.cwd(), 'scripts/run-e2e.cjs'), 'utf8');
 
-function launch(args: string[], inherited: Record<string, string> = {}) {
+function launch(args: string[], inherited: Record<string, string> = {}, platform = 'darwin') {
   const env = { ...inherited };
   const argv = ['node', 'scripts/run-e2e.cjs', ...args];
   let loadedEnv: Record<string, string> | undefined;
   let parsedArgv: string[] | undefined;
   runInNewContext(source, {
-    process: { env, argv },
+    process: { env, argv, platform },
     require(name: string) {
       if (name !== 'playwright/lib/program') throw new Error(`Unexpected runner import: ${name}`);
       loadedEnv = { ...env };
@@ -23,6 +23,21 @@ function launch(args: string[], inherited: Record<string, string> = {}) {
 }
 
 describe('E2E runner desktop isolation', () => {
+  it.each<Record<string, string>>([{}, { GOMAXPROCS: '', GOMEMLIMIT: '' }])('bounds Windows source compilation before Playwright loads with %j', inherited => {
+    const result = launch(['test'], inherited, 'win32');
+    expect(result).toMatchObject({ GOMAXPROCS: '1', GOMEMLIMIT: '128MiB', ORKAS_E2E_HIDE_WINDOW: '1' });
+  });
+
+  it('preserves explicit Windows compiler resource budgets', () => {
+    const result = launch(['test'], { GOMAXPROCS: '2', GOMEMLIMIT: '256MiB' }, 'win32');
+    expect(result).toMatchObject({ GOMAXPROCS: '2', GOMEMLIMIT: '256MiB' });
+  });
+
+  it.each(['darwin', 'linux'])('leaves compiler budgets unchanged on %s', platform => {
+    const result = launch(['test'], {}, platform);
+    expect(result.GOMAXPROCS).toBeUndefined(); expect(result.GOMEMLIMIT).toBeUndefined();
+  });
+
   it.each<{ name: string; env: Record<string, string> }>([
     { name: 'clean shell', env: {} },
     { name: 'inherited visible mode', env: { ORKAS_E2E_SHOW_WINDOW: '1' } },
