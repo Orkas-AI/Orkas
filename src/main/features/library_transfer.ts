@@ -5,10 +5,15 @@
  * Source resolution and every destination write stay behind the global and
  * project Library path validators. Cross-Library moves are copy-then-delete:
  * the source is removed only after the destination copy and index refresh
- * succeed; a failed source delete rolls the destination back best-effort.
+ * succeed. Rollback requires an unchanged source; retain the completed
+ * destination when source deletion was partial or its revision is uncertain.
  */
 
 import * as path from 'node:path';
+import {
+  captureLocalEntryRevision, captureLocalEntryRevisionSync, localEntryRevisionMatches,
+  type LocalEntryRevision,
+} from '../util/file-import';
 
 import * as contexts from './contexts';
 import * as projectFiles from './project_files';
@@ -118,9 +123,10 @@ async function copyInto(
   destination: LibraryRef,
   sourceAbs: string,
   targetRel: string,
+  onCopied?: (absolutePath: string) => void,
 ): Promise<{ ok: true; fileCount: number; bytes: number } | { ok: false; error: string }> {
   if (destination.scope === 'global') {
-    const copied = contexts.copyContextEntryFromPath(sourceAbs, targetRel, userId);
+    const copied = contexts.copyContextEntryFromPath(sourceAbs, targetRel, userId, onCopied);
     if (copied.ok === false) return { ok: false, error: copied.error };
     return { ok: true, fileCount: copied.fileCount, bytes: copied.bytes };
   }
@@ -129,14 +135,17 @@ async function copyInto(
     destination.projectId!,
     sourceAbs,
     targetRel,
+    onCopied,
   );
   if (copied.ok === false) return { ok: false, error: copied.error };
   return { ok: true, fileCount: copied.fileCount, bytes: copied.bytes };
 }
 
-async function deleteFrom(userId: string, ref: LibraryRef, rel: string): Promise<{ ok: boolean; error?: string }> {
-  if (ref.scope === 'global') return contexts.deleteContextTarget(rel, userId);
-  return projectFiles.deleteProjectEntry(userId, ref.projectId!, rel);
+async function deleteFrom(
+  userId: string, ref: LibraryRef, rel: string, beforeDelete?: () => boolean,
+): Promise<{ ok: boolean; error?: string }> {
+  if (ref.scope === 'global') return contexts.deleteContextTarget(rel, userId, beforeDelete);
+  return projectFiles.deleteProjectEntry(userId, ref.projectId!, rel, beforeDelete);
 }
 
 async function moveWithin(
@@ -218,16 +227,38 @@ export async function transferLibraryEntries(
       results.push({ ...resultBase, ok: false, error: 'account_changed' });
       continue;
     }
-    const copied = await copyInto(userId, destination, resolved.absPath, targetRel);
+    const revision = mode === 'move' ? await captureLocalEntryRevision(resolved.absPath) : undefined;
+    if (mode === 'move' && !revision) {
+      results.push({ ...resultBase, ok: false, error: 'transfer_failed' });
+      continue;
+    }
+    if (!isActiveAccount(userId)) {
+      results.push({ ...resultBase, ok: false, error: 'account_changed' });
+      continue;
+    }
+    let destinationRevision: LocalEntryRevision | undefined;
+    const copied = await copyInto(userId, destination, resolved.absPath, targetRel,
+      mode === 'move' ? absolute => { destinationRevision = captureLocalEntryRevisionSync(absolute); } : undefined);
     if (copied.ok === false) {
       results.push({ ...resultBase, ok: false, error: normalizeError(copied.error) });
       continue;
     }
     if (mode === 'move') {
+      // Both sides must still be the revisions this operation owns. Share one
+      // verification budget and repeat at the synchronous removal boundary.
+      const revisionsMatch = () => {
+        const deadline = performance.now() + 100;
+        return localEntryRevisionMatches(revision, deadline)
+          && localEntryRevisionMatches(destinationRevision, deadline);
+      };
       if (!isActiveAccount(userId)) {
+        if (!revisionsMatch()) {
+          results.push({ ...resultBase, ok: false, error: 'rollback_failed' });
+          continue;
+        }
         let rollback: { ok: boolean; error?: string };
         try {
-          rollback = await deleteFrom(userId, destination, targetRel);
+          rollback = await deleteFrom(userId, destination, targetRel, revisionsMatch);
         } catch {
           rollback = { ok: false, error: 'rollback_failed' };
         }
@@ -240,14 +271,18 @@ export async function transferLibraryEntries(
       }
       let removed: { ok: boolean; error?: string };
       try {
-        removed = await deleteFrom(userId, source, sourceRel);
+        removed = await deleteFrom(userId, source, sourceRel, revisionsMatch);
       } catch {
         removed = { ok: false, error: 'source_delete_failed' };
       }
       if (!removed.ok) {
+        if (!revisionsMatch()) {
+          results.push({ ...resultBase, ok: false, error: 'rollback_failed' });
+          continue;
+        }
         let rollback: { ok: boolean; error?: string };
         try {
-          rollback = await deleteFrom(userId, destination, targetRel);
+          rollback = await deleteFrom(userId, destination, targetRel, revisionsMatch);
         } catch {
           rollback = { ok: false, error: 'rollback_failed' };
         }

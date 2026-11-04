@@ -1,4 +1,4 @@
-import { prepareIndexedJsonlAppend } from './util/indexed-jsonl';
+import { indexedJsonlStampFromStat, prepareIndexedJsonlAppend } from './util/indexed-jsonl';
 /**
  * Timestamps, ID generation, and JSON/JSONL IO helpers.
  *
@@ -89,7 +89,7 @@ export function isAtomicWriteTempPath(filePath: string): boolean {
   return ATOMIC_TMP_PATH_RE.test(path.basename(filePath));
 }
 
-function atomicTmpPath(filePath: string): string {
+export function atomicTmpPath(filePath: string): string {
   return `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
 }
 
@@ -284,13 +284,18 @@ function _getLineLock(filePath: string): MutexInterface {
   return m;
 }
 
+/** Count existing rows and leave the file ready for the next append. A crash,
+ * power loss or ENOSPC can leave a partial last line, and writing straight after
+ * it would fuse the new record into one unreadable row. The partial row is not a
+ * record, so it takes no slot in the valid-record numbering readers use. */
 async function _loadLineCount(filePath: string): Promise<number> {
-  try {
-    const text = await fsp.readFile(filePath, 'utf8');
-    let n = 0;
-    for (const line of text.split('\n')) if (line.trim()) n++;
-    return n;
-  } catch { return 0; }
+  let text: string;
+  try { text = await fsp.readFile(filePath, 'utf8'); } catch { return 0; }
+  let n = 0;
+  for (const line of text.split('\n')) if (_parseJsonlRecord(line) !== undefined) n++;
+  if (text.endsWith('\n') || !text.trim()) return n;
+  await fsp.appendFile(filePath, '\n', 'utf8');
+  return n;
 }
 
 export interface AtomicAppendResult<T = unknown> {
@@ -308,6 +313,8 @@ export interface JsonlAppendSource {
   dev: number;
   ino: number;
   beforeMtime: number;
+  beforeStamp?: string;
+  stamp?: string;
   mtime: number;
   size: number;
 }
@@ -331,17 +338,25 @@ export async function appendJsonlAtomic<T>(filePath: string, record: T, withSour
     const finishIndex = await prepareIndexedJsonlAppend(filePath);
     const line = JSON.stringify(record) + '\n';
     let source: JsonlAppendSource | undefined;
-    if (withSource) {
-      const handle = await fsp.open(filePath, 'a');
-      try {
-        const before = await handle.stat();
-        await handle.writeFile(line, 'utf8');
-        const after = await handle.stat();
-        source = { kind: 'jsonl-append', file: filePath, offset: before.size,
-          bytes: Buffer.byteLength(line), dev: after.dev, ino: after.ino,
-          beforeMtime: before.mtimeMs, mtime: after.mtimeMs, size: after.size };
-      } finally { await handle.close(); }
-    } else await fsp.appendFile(filePath, line, 'utf8');
+    try {
+      if (withSource) {
+        const handle = await fsp.open(filePath, 'a');
+        try {
+          const before = await handle.stat();
+          await handle.writeFile(line, 'utf8');
+          const after = await handle.stat();
+          source = { kind: 'jsonl-append', file: filePath, offset: before.size,
+            bytes: Buffer.byteLength(line), dev: after.dev, ino: after.ino,
+            beforeMtime: before.mtimeMs, mtime: after.mtimeMs, size: after.size,
+            beforeStamp: indexedJsonlStampFromStat(before), stamp: indexedJsonlStampFromStat(after) };
+        } finally { await handle.close(); }
+      } else await fsp.appendFile(filePath, line, 'utf8');
+    } catch (error) {
+      // A failed write may have left part of this line. Recount on the next
+      // append so that it starts on a clean line.
+      _lineCounts.delete(filePath);
+      throw error;
+    }
     await finishIndex(record, Buffer.byteLength(line));
     _lineCounts.set(filePath, count + 1);
     return { record, msgIndex: count, ...(source ? { source } : {}) };
@@ -389,18 +404,28 @@ export async function rewriteJsonlLine<T extends object>(
     const hasTrailing = lines.length > 0 && lines[lines.length - 1] === '';
     const body = hasTrailing ? lines.slice(0, -1) : lines;
 
-    if (msgIndex < 0 || msgIndex >= body.length) {
-      return { ok: false, error: `index out of range (${msgIndex}/${body.length})` };
+    // Callers obtain msgIndex from the tolerant readers or atomic append.
+    // Keep their valid-record positions even when crash residue is preserved.
+    let validIndex = 0;
+    let lineIndex = -1;
+    let current!: T;
+    for (let i = 0; i < body.length; i++) {
+      const record = _parseJsonlRecord<T>(body[i]);
+      if (record === undefined) continue;
+      if (validIndex++ === msgIndex) {
+        lineIndex = i;
+        current = record;
+        break;
+      }
     }
-
-    let current: T;
-    try { current = JSON.parse(body[msgIndex]) as T; }
-    catch (err) { return { ok: false, error: `line ${msgIndex} not JSON: ${(err as Error).message}` }; }
+    if (lineIndex < 0) {
+      return { ok: false, error: `index out of range (${msgIndex}/${validIndex})` };
+    }
 
     const next = mutate(current);
     if (next === null) return { ok: false, error: 'mutate aborted' };
 
-    body[msgIndex] = JSON.stringify(next);
+    body[lineIndex] = JSON.stringify(next);
     const out = body.join('\n') + '\n';
     // Write to tmp + rename — rewrite is a "full file" op; we can't use
     // append here. Line count stays the same.
@@ -484,14 +509,17 @@ export async function readJsonlPage<T = Record<string, any>>(
   };
 }
 
-/** Offset-preserving variant used by sparse derived page caches. */
+/** Offset-preserving variant used by sparse derived page caches.
+ * `skipInvalidRecords` keeps `strict` for I/O only, for readers that must tell an
+ * unavailable source from an empty one yet still get past a partial crash-time row. */
 export async function readJsonlPageWithOffsets<T = Record<string, any>>(
   filePath: string,
   limit = 200,
   before?: number | null,
-  opts?: { strict?: boolean },
+  opts?: { strict?: boolean; skipInvalidRecords?: boolean },
 ): Promise<JsonlPageWithOffsets<T>> {
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  const strictRecords = !!opts?.strict && !opts?.skipInvalidRecords;
   let handle: fs.promises.FileHandle;
   try {
     handle = await fsp.open(filePath, 'r');
@@ -528,7 +556,7 @@ export async function readJsonlPageWithOffsets<T = Record<string, any>>(
         const line = suffixSegments.length
           ? _concatJsonlSegments([current, ...suffixSegments.reverse()])
           : current;
-        const record = _parseJsonlRecord<T>(line.toString('utf8'), opts?.strict);
+        const record = _parseJsonlRecord<T>(line.toString('utf8'), strictRecords);
         if (record !== undefined) {
           const start = position + i + 1;
           newestFirst.push({ record, start });
@@ -547,7 +575,7 @@ export async function readJsonlPageWithOffsets<T = Record<string, any>>(
     if (newestFirst.length < wanted && suffixSegments.length) {
       const record = _parseJsonlRecord<T>(
         _concatJsonlSegments(suffixSegments.reverse()).toString('utf8'),
-        opts?.strict,
+        strictRecords,
       );
       if (record !== undefined) {
         newestFirst.push({ record, start: 0 });

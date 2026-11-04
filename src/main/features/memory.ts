@@ -14,8 +14,9 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import { userMemoryFile, userProfileFile, agentMemoryFile, userAgentMemoryFile, projectMemoryFile } from '../paths';
-import { writeTextAtomicSync } from '../storage';
+import { writeTextAtomicSync, writeTextAtomicGuardedSync } from '../storage';
 import { createLogger } from '../logger';
 
 const log = createLogger('memory');
@@ -66,6 +67,8 @@ export interface MemoryOpResult {
   ok: boolean;
   /** Present on successful add/replace/remove: whether the stored bytes changed. */
   changed?: boolean;
+  /** Opaque account/scope-bound snapshot token for atomic batches. */
+  revision?: string;
   error?: string;
   entries: string[];
   /** `full`: the store cannot take another suggested-size entry. Writes never
@@ -203,6 +206,16 @@ function readTexts(userId: string, target: MemoryScope): string[] {
 
 function buildResult(userId: string, target: MemoryScope, ok: boolean, error?: string, changed?: boolean): MemoryOpResult {
   const entries = readTexts(userId, target);
+  return resultForEntries(userId, target, entries, ok, error, changed);
+}
+
+function revisionFor(userId: string, target: MemoryScope, entries: readonly string[]): string {
+  const scope = typeof target === 'string' ? [target]
+    : isProjectScope(target) ? ['project', target.project] : ['agent', target.agent];
+  return createHash('sha256').update(JSON.stringify([userId, scope, entries])).digest('hex');
+}
+
+function resultForEntries(userId: string, target: MemoryScope, entries: string[], ok: boolean, error?: string, changed?: boolean): MemoryOpResult {
   const current = entries.join(ENTRY_SEPARATOR).length;
   const limit = limitForTarget(target);
   const entriesLimit = entryLimitForTarget(target);
@@ -212,6 +225,7 @@ function buildResult(userId: string, target: MemoryScope, ok: boolean, error?: s
     ...(error ? { error } : {}),
     ...(changed === undefined ? {} : { changed }),
     entries,
+    revision: revisionFor(userId, target, entries),
     usage: {
       current, limit, entries_current: entries.length, entries_limit: entriesLimit,
       full: entries.length >= entriesLimit || current + room > limit,
@@ -230,7 +244,7 @@ function capacityError(target: MemoryScope, before: readonly string[], after: re
   const charsOver = afterChars > charLimit && afterChars > beforeChars;
   if (!entriesOver && !charsOver) return null;
   return `memory full: the ${storeName(target)} store would hold ${after.length}/${entryLimit} entries and `
-    + `${afterChars}/${charLimit} characters. Consolidate it first, keeping every fact: shorten or merge entries with replace, removing an entry you merged before you lengthen another, then retry.`;
+    + `${afterChars}/${charLimit} characters. Remove obsolete or non-durable entries; preserve valid durable facts. Use batch with this revision to merge/remove/add together; only the final state must fit. If it still cannot fit, skip the new fact and report it unsaved.`;
 }
 
 function newestUnique(texts: readonly string[]): string[] {
@@ -356,6 +370,87 @@ export function resolveMemoryEntryMatch(entries: readonly string[], oldText: str
 }
 
 // ── Public API ───────────────────────────────────────────────────────────
+
+/** Batch edits reference complete entries in the original snapshot. The host
+ * binds the store; operation order never selects an intermediate entry. */
+export function applyMemoryBatch(
+  userId: string, target: MemoryScope, expectedRevision: unknown, operations: unknown,
+  shouldCommit: () => boolean = () => true,
+): MemoryOpResult {
+  const file = fileForTarget(userId, target);
+  const readStrict = (): string[] => {
+    let raw: string;
+    try { raw = fs.readFileSync(file, 'utf8'); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw err;
+    }
+    return raw.split(/\n?§\n?/).map(text => text.trim()).filter(Boolean);
+  };
+  // Never use the legacy tolerant reader as the authoritative write snapshot.
+  let before: string[];
+  try { before = readStrict(); }
+  catch { return { ok: false, error: 'memory could not be read; no changes saved', entries: [], usage: { current: 0, limit: limitForTarget(target) } }; }
+  const fail = (error: string) => resultForEntries(userId, target, before, false, error);
+  if (typeof expectedRevision !== 'string' || !/^[a-f0-9]{64}$/.test(expectedRevision)) {
+    return fail('expected_revision is required for batch; use the revision from list or a prior receipt');
+  }
+  if (revisionFor(userId, target, before) !== expectedRevision) return fail('memory revision conflict; list current entries before editing');
+  if (!Array.isArray(operations) || operations.length < 1 || operations.length > 32) return fail('batch requires 1 to 32 operations');
+  const edits = new Map<number, string | null>();
+  const additions: string[] = [];
+  for (const operation of operations) {
+    if (!operation || typeof operation !== 'object' || Array.isArray(operation)) return fail('invalid batch operation');
+    const op = operation as Record<string, unknown>;
+    const allowed = op.action === 'add' ? ['action', 'content']
+      : op.action === 'replace' ? ['action', 'old_text', 'content']
+      : op.action === 'remove' ? ['action', 'old_text'] : null;
+    if (!allowed || Object.keys(op).some(key => !allowed.includes(key))) return fail('invalid batch operation fields');
+    let text = '';
+    if (op.action !== 'remove') {
+      if (typeof op.content !== 'string') return fail('batch content is required');
+      text = op.content.trim();
+      if (text.length > limitForTarget(target)) return fail('batch entry exceeds the store character limit');
+      const invalid = contentError(text);
+      if (invalid) return fail(invalid);
+    }
+    if (op.action === 'add') { additions.push(text); continue; }
+    if (typeof op.old_text !== 'string' || !op.old_text.trim()) return fail('batch old_text is required');
+    const matches = before.flatMap((entry, index) => entry === op.old_text ? [index] : []);
+    if (matches.length !== 1) return fail('batch old_text must equal one complete unique original entry');
+    const index = matches[0];
+    if (edits.has(index)) return fail('batch cannot edit the same original entry twice');
+    edits.set(index, op.action === 'remove' ? null : text);
+  }
+  const after = newestUnique([
+    ...before.flatMap((text, index) => edits.has(index) ? edits.get(index) === null ? [] : [edits.get(index)!] : [text]),
+    ...additions,
+  ]);
+  if (after.length > entryLimitForTarget(target) || after.join(ENTRY_SEPARATOR).length > limitForTarget(target)) {
+    // Unlike legacy single edits, a batch must finish within both caps.
+    return fail(capacityError(target, [], after)!);
+  }
+  let refusal = 'memory write cancelled';
+  const guard = () => {
+    if (!shouldCommit()) { refusal = 'memory write cancelled'; return false; }
+    const current = readStrict();
+    if (revisionFor(userId, target, current) !== expectedRevision) {
+      before = current;
+      refusal = 'memory revision conflict; list current entries before editing';
+      return false;
+    }
+    return true;
+  };
+  try {
+    if (!guard()) return fail(refusal);
+    if (after.length === before.length && after.every((text, index) => text === before[index])) {
+      return resultForEntries(userId, target, before, true, undefined, false);
+    }
+    if (!writeTextAtomicGuardedSync(file, after.join(ENTRY_SEPARATOR), guard)) return fail(refusal);
+  } catch { return fail('memory could not be saved; no batch changes saved'); }
+  notifyMemoryDirty(target);
+  return resultForEntries(userId, target, after, true, undefined, true);
+}
 
 export function addEntry(userId: string, target: MemoryScope, content: string): MemoryOpResult {
   const trimmed = String(content || '').trim();

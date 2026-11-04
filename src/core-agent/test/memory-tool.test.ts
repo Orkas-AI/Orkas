@@ -5,6 +5,7 @@ import { createCrossSessionMemoryTool, type MemoryToolHandler } from '../src/too
 
 function mockHandler(): MemoryToolHandler {
   return {
+    batch: vi.fn().mockReturnValue({ ok: true, entries: [], usage: { current: 0, limit: 2200 } }),
     add: vi.fn().mockReturnValue({
       ok: true, entries: ['existing', 'new entry'], usage: { current: 100, limit: 2200 },
     }),
@@ -22,18 +23,18 @@ function mockHandler(): MemoryToolHandler {
 
 const dummyCtx = { state: {}, signal: new AbortController().signal };
 
-/** One admission rule owns what memory may hold on every variant; removed
- *  per-case exclusions must not reappear beside it. */
+/** The shared contract must select lasting decision context without turning
+ * incident notes or existing reference material into resident instructions. */
 function expectAdmissionRule(description: string): void {
   expect(description).toContain('Entries load into every later conversation in scope');
-  expect(description).toContain('Before replying, even unasked');
-  expect(description).toContain('save only compact facts');
-  expect(description).toContain('leave specs, plans and progress in their files, tasks or library, at most as a pointer');
-  expect(description).toContain('Update or remove stale entries');
-  expect(description).toContain('Decide by meaning, not trigger words');
-  for (const retired of ['Do not store current-task progress', 'Use todo_tasks for task progress', 'exclude task progress and temporary state']) {
-    expect(description).not.toContain(retired);
-  }
+  expect(description).toContain('Auto-save stable facts that change future decisions');
+  expect(description).toContain('task state, incidents');
+  expect(description).toContain('content kept in files, tools or Skills');
+  expect(description).toContain('pointers only when hard to rediscover');
+  expect(description).toContain('Do not generalize one-off corrections');
+  expect(description).toContain('Update facts instead of duplicating');
+  expect(description).toContain('remove obsolete or non-durable entries');
+  expect(description).not.toContain('Before replying, even unasked');
 }
 
 describe('createCrossSessionMemoryTool', () => {
@@ -267,7 +268,7 @@ describe('cross_session_memory › project tier', () => {
     expect(estimateTextTokens(withProject.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
     expect((withProject.inputSchema as any).properties.target.enum).toEqual(['agent', 'project', 'shared', 'user']);
     expect((withProject.inputSchema as any).properties.target.description)
-      .toContain('project: project-specific facts and decisions');
+      .toContain('project: stable project facts and decisions');
 
     const without = createCrossSessionMemoryTool(mockHandler());
     expect((without.inputSchema as any).properties.target.enum).not.toContain('project');
@@ -286,7 +287,7 @@ describe('cross_session_memory › project tier', () => {
     const handler = mockHandler();
     const tool = createCrossSessionMemoryTool(handler, { includeProjectTier: true, projectTierReadOnly: true });
 
-    expect(tool.description).toContain('Project memory is read-only in this session; Commander can change it.');
+    expect(tool.description).toContain('Project memory is read-only; Commander writes.');
     expectAdmissionRule(tool.description);
     expect(estimateTextTokens(tool.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
 

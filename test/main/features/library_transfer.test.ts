@@ -3,6 +3,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => ({
   calls: [] as Array<{ op: string; args: unknown[] }>,
   failDelete: '' as string,
+  sourceKind: 'file',
+  revisionUnavailable: false,
+  pauseRevision: false,
+  revisionStarted: null as null | (() => void),
+  releaseRevision: null as null | (() => void),
+  sourceMissingAfterDelete: false,
   throwDelete: '' as string,
   activeUserId: 'u1',
   pauseProjectResolve: false,
@@ -13,18 +19,33 @@ const state = vi.hoisted(() => ({
   releaseProjectCopy: null as null | (() => void),
 }));
 
+vi.mock('../../../src/main/util/file-import', () => ({
+  captureLocalEntryRevisionSync: (root: string) => ({ root, entries: [{ relative: '', stamp: 'copied' }] }),
+  captureLocalEntryRevision: async () => {
+    if (state.pauseRevision) {
+      state.revisionStarted?.();
+      await new Promise<void>(resolve => { state.releaseRevision = resolve; });
+    }
+    return state.revisionUnavailable ? undefined : { root: 'synthetic-source', entries: [{ relative: '', stamp: 'original' }] };
+  },
+  localEntryRevisionMatches: () => !(state.calls.some(row => row.op.startsWith('delete-'))
+    && (state.sourceKind === 'directory' || state.sourceMissingAfterDelete)),
+}));
+
 vi.mock('../../../src/main/features/users', () => ({
   getActiveUserId: () => state.activeUserId,
 }));
 
 vi.mock('../../../src/main/features/contexts', () => ({
   resolveContextEntryAbsPath: (rel: string, userId = state.activeUserId) => `/${userId}/global/${rel}`,
-  copyContextEntryFromPath: (source: string, target: string, userId = state.activeUserId) => {
+  copyContextEntryFromPath: (source: string, target: string, userId = state.activeUserId, onCopied?: (absolute: string) => void) => {
     state.calls.push({ op: 'copy-global', args: [userId, source, target] });
     if (target.includes('conflict')) return { ok: false, error: 'target_exists' };
+    onCopied?.(`/${userId}/global/${target}`);
     return { ok: true, path: target, fileCount: 1, bytes: 10 };
   },
-  deleteContextTarget: (rel: string, userId = state.activeUserId) => {
+  deleteContextTarget: (rel: string, userId = state.activeUserId, beforeDelete?: () => boolean) => {
+    if (beforeDelete && !beforeDelete()) return { ok: false, error: 'source_changed' };
     state.calls.push({ op: 'delete-global', args: [userId, rel] });
     if (state.throwDelete === `global:${rel}`) throw new Error('private global path');
     return state.failDelete === `global:${rel}` ? { ok: false, error: 'delete_failed' } : { ok: true };
@@ -47,8 +68,9 @@ vi.mock('../../../src/main/features/project_files', () => ({
       type: rel.includes('.') ? 'file' : 'dir',
     };
   },
-  copyProjectEntryFromPath: async (_uid: string, pid: string, source: string, target: string) => {
+  copyProjectEntryFromPath: async (_uid: string, pid: string, source: string, target: string, onCopied?: (absolute: string) => void) => {
     state.calls.push({ op: 'copy-project', args: [pid, source, target] });
+    if (!target.includes('unsupported')) onCopied?.(`/projects/${pid}/${target}`);
     if (state.pauseProjectCopy) {
       state.projectCopyStarted?.();
       await new Promise<void>((resolve) => { state.releaseProjectCopy = resolve; });
@@ -56,7 +78,8 @@ vi.mock('../../../src/main/features/project_files', () => ({
     if (target.includes('unsupported')) return { ok: false, error: 'unsupported_destination' };
     return { ok: true, name: target, fileCount: 1, bytes: 10 };
   },
-  deleteProjectEntry: async (_uid: string, pid: string, rel: string) => {
+  deleteProjectEntry: async (_uid: string, pid: string, rel: string, beforeDelete?: () => boolean) => {
+    if (beforeDelete && !beforeDelete()) return { ok: false, error: 'source_changed' };
     state.calls.push({ op: 'delete-project', args: [pid, rel] });
     if (state.throwDelete === `project:${pid}:${rel}`) throw new Error('private project path');
     return state.failDelete === `project:${pid}:${rel}` ? { ok: false, error: 'delete_failed' } : { ok: true };
@@ -70,6 +93,12 @@ vi.mock('../../../src/main/features/project_files', () => ({
 beforeEach(() => {
   state.calls.length = 0;
   state.failDelete = '';
+  state.sourceKind = 'file';
+  state.revisionUnavailable = false;
+  state.pauseRevision = false;
+  state.revisionStarted = null;
+  state.releaseRevision = null;
+  state.sourceMissingAfterDelete = false;
   state.throwDelete = '';
   state.activeUserId = 'u1';
   state.pauseProjectResolve = false;
@@ -341,4 +370,32 @@ describe('library_transfer', () => {
     expect(result).toMatchObject({ ok: true, succeeded: 0, failed: 1, results: [{ error: 'invalid_target' }] });
     expect(state.calls).toEqual([]);
   });
+});
+
+it.each(['directory', 'missing-file'])('retains the completed destination when a failed source deletion leaves an unsafe %s rollback', async (kind) => {
+  state.failDelete = 'global:note.md';
+  state.sourceKind = kind === 'directory' ? 'directory' : 'file';
+  state.sourceMissingAfterDelete = kind === 'missing-file';
+  const result = await transfer({ mode: 'move', source: { scope: 'global' }, paths: ['note.md'],
+    destination: { scope: 'project', projectId: 'p1', dir: '' } });
+  expect(result).toMatchObject({ ok: true, succeeded: 0, failed: 1, results: [{ error: 'rollback_failed' }] });
+  expect(state.calls.map(row => row.op)).toEqual(['copy-project', 'delete-global']);
+});
+
+it('keeps both Libraries unchanged when source revision observation is unavailable', async () => {
+  state.revisionUnavailable = true;
+  const result = await transfer({mode:'move', source:{scope:'global'}, paths:['note.md'],
+    destination:{scope:'project',projectId:'p1'}});
+  expect(result).toMatchObject({ok:true,succeeded:0,failed:1,results:[{error:'transfer_failed'}]});
+  expect(state.calls).toEqual([]);
+});
+
+it('does not copy after the account changes during source revision collection', async () => {
+  state.pauseRevision = true;
+  const started = new Promise<void>(resolve => { state.revisionStarted = resolve; });
+  const pending = transfer({mode:'move', source:{scope:'global'}, paths:['note.md'],
+    destination:{scope:'project',projectId:'p1'}});
+  await started; state.activeUserId = 'u2'; state.releaseRevision?.();
+  expect(await pending).toMatchObject({ok:true,succeeded:0,failed:1,results:[{error:'account_changed'}]});
+  expect(state.calls).toEqual([]);
 });

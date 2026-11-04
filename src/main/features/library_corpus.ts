@@ -319,10 +319,11 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
       attempt: Math.max(1, Math.round(opts.attempt || 1)),
     });
     queue.queuedKeys.add(queuedKey);
+    // A failed status consumer cannot strand an admitted source in the queue.
+    scheduleRun();
     if (op === 'upsert') {
       spec.emit({ relPath: safe, status: 'pending', ...(libraryKindFor(safe) ? { kind: libraryKindFor(safe)! } : {}) });
     }
-    scheduleRun();
   }
 
   function scheduleRun(): void {

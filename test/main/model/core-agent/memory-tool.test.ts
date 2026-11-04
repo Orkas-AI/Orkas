@@ -8,6 +8,7 @@ function stubHandler(): MemoryToolHandler & { calls: Array<{ op: string; tier: M
   const res = { ok: true, entries: [], usage: { current: 0, limit: 100 } };
   return {
     calls,
+    batch: vi.fn((tier: MemoryTier) => { calls.push({ op: 'batch', tier }); return res; }),
     add: vi.fn((tier: MemoryTier) => { calls.push({ op: 'add', tier }); return res; }),
     replace: vi.fn((tier: MemoryTier) => { calls.push({ op: 'replace', tier }); return res; }),
     remove: vi.fn((tier: MemoryTier) => { calls.push({ op: 'remove', tier }); return res; }),
@@ -19,6 +20,24 @@ const enumOf = (tool: ReturnType<typeof createCrossSessionMemoryTool>): string[]
   ((tool.inputSchema as any).properties.target.enum as string[]);
 
 describe('cross_session_memory tool › project tier exposure', () => {
+  it('forwards a versioned batch once and applies existing scope permissions to it', async () => {
+    const h = stubHandler();
+    const batch = vi.fn(() => ({ ok: true, changed: true, entries: ['merged'], revision: 'b'.repeat(64), usage: { current: 6, limit: 100 } }));
+    Object.assign(h, { batch });
+    const tool = createCrossSessionMemoryTool(h, { includeProjectTier: true, globalTiersReadOnly: true });
+    const operations = [{ action: 'add', content: 'merged' }];
+    const signal = new AbortController().signal;
+    const result = await tool.execute({ action: 'batch', target: 'project', expected_revision: 'a'.repeat(64), operations }, { state: {}, signal });
+    expect(result.isError).toBe(false);
+    expect(batch).toHaveBeenCalledExactlyOnceWith('project', 'a'.repeat(64), operations, signal);
+    expect(result.observations?.stateMutation).toMatchObject({ scope: 'project', changed: true });
+    for (const target of ['user', 'shared']) {
+      expect((await tool.execute({ action: 'batch', target, expected_revision: 'a'.repeat(64), operations }, {} as any)).isError).toBe(true);
+    }
+    const readOnly = createCrossSessionMemoryTool(h, { includeProjectTier: true, projectTierReadOnly: true });
+    expect((await readOnly.execute({ action: 'batch', target: 'project', expected_revision: 'a'.repeat(64), operations }, {} as any)).isError).toBe(true);
+    expect(batch).toHaveBeenCalledTimes(1);
+  });
   it.each([
     { includeProjectTier: false, projectTierReadOnly: false },
     { includeProjectTier: true, projectTierReadOnly: false },
@@ -27,12 +46,12 @@ describe('cross_session_memory tool › project tier exposure', () => {
     const h = stubHandler();
     const tool = createCrossSessionMemoryTool(h, { ...options, globalTiersReadOnly: true });
     expect(tool.description).toContain('intended scope, not write access');
-    expect(tool.description).toContain('Before replying, even unasked, save only compact facts');
-    expect(tool.description).toContain('leave specs, plans and progress in their files, tasks or library');
-    expect(tool.description).toContain('Update or remove stale entries');
+    expect(tool.description).toContain('Auto-save stable facts that change future decisions');
+    expect(tool.description).toContain('Skip task state, incidents and content kept in files, tools or Skills');
+    expect(tool.description).toContain('remove obsolete or non-durable entries');
     expect(tool.description).toContain('User/shared writes belong to Commander');
     expect(tool.description).toContain('hand back those changes without substituting or duplicating them in another store');
-    expect((tool.inputSchema as any).properties.target.description).toContain('Agent-only reusable lessons');
+    expect((tool.inputSchema as any).properties.target.description).toContain('stable Agent-specific facts and agreements');
     expect(tool.description).not.toContain('exclude task progress and temporary state');
     expect(tool.description).not.toContain('<handback');
     expect(estimateTextTokens(tool.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
@@ -75,8 +94,8 @@ describe('cross_session_memory tool › project tier exposure', () => {
     const action = (tool.inputSchema as any).properties.action;
     expect(enumOf(tool)).toEqual(['agent', 'shared', 'user']);
     expect(tool.description).toContain('Manage durable agent, shared, or user memory');
-    expect(tool.description).toContain('Before replying, even unasked');
-    expect(tool.description).toContain('Decide by meaning, not trigger words');
+    expect(tool.description).toContain('Auto-save stable facts');
+    expect(tool.description).toContain('Do not generalize one-off corrections');
     expect(tool.description).not.toContain('Do not store current-task progress');
     expect(action.description).toContain('entries are already injected');
     expect(target.description).toContain('Defaults to agent');
@@ -88,10 +107,10 @@ describe('cross_session_memory tool › project tier exposure', () => {
     const tool = createCrossSessionMemoryTool(stubHandler(), { includeProjectTier: true });
     const target = (tool.inputSchema as any).properties.target;
     expect(enumOf(tool)).toEqual(['agent', 'project', 'shared', 'user']);
-    expect(tool.description).toContain('leave specs, plans and progress in their files, tasks or library');
+    expect(tool.description).toContain('Skip task state, incidents and content kept in files, tools or Skills');
     expect(tool.description).not.toContain('Use todo_tasks for task progress');
-    expect(target.description).toContain('project-specific facts and decisions');
-    expect(target.description).toContain('this agent\'s reusable lessons');
+    expect(target.description).toContain('stable project facts and decisions');
+    expect(target.description).toContain('stable Agent-specific facts and agreements');
     expect((tool.inputSchema as any).properties.old_text.description).toContain('must match exactly one entry');
   });
 
@@ -148,13 +167,13 @@ describe('cross_session_memory tool › project tier exposure', () => {
 
 
 describe('cross_session_memory async persistence', () => {
-  it.each([true, false])('awaits shared deletion before reporting its outcome (success=%s)', async (ok) => {
+  it.each([true, false])('awaits durable local deletion before reporting its outcome (success=%s)', async (ok) => {
     const h = stubHandler();
     let finish!: (value: any) => void;
     h.remove = vi.fn(() => new Promise(resolve => { finish = resolve; }));
     const tool = createCrossSessionMemoryTool(h, { includeProjectTier: true });
     const pending = tool.execute({ action: 'remove', target: 'project', old_text: 'obsolete fact' }, {} as any);
-    const receipt = { ok, ...(!ok ? { error: 'shared_sync_failed' } : {}), entries: [], usage: { current: 0, limit: 2500 } };
+    const receipt = { ok, ...(!ok ? { error: 'memory could not be saved' } : {}), entries: [], usage: { current: 0, limit: 2500 } };
     finish(receipt);
     const result = await pending;
     expect(result.isError).toBe(!ok);
