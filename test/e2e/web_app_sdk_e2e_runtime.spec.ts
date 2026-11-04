@@ -6,6 +6,62 @@ import type { AddressInfo } from 'node:net';
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
 
+test('closing a saved app during a committed write preserves the entry in its local durable database', async ({ orkas }, info) => {
+  const entry = orkas.createWorkspaceFile('closing-data/index.html', '<!doctype html><script src="__orkas/sdk.js"></script><label>Note<input id="note"></label><button id="save">Save</button><output id="status"></output><script>document.querySelector("#save").onclick=async()=>{try{await orkasApp.data.insert({table:"notes",values:{body:document.querySelector("#note").value}});document.querySelector("#status").textContent="Saved";}catch{document.querySelector("#status").textContent="Unavailable";}};</script>');
+  const definition = { version: 1, tables: [{ id: 'notes', name: 'notes', fields: [{ id: 'body', name: 'body', type: 'string' }], access: { read: ['body'], insert: ['body'], count: true } }] };
+  orkas.createWorkspaceFile('closing-data/orkas-app.json', JSON.stringify({ sdkVersion: 1, capabilities: ['data'], data: definition }));
+  const app: any = await orkas.invoke('savedApps.saveFromPath', { path: entry, title: 'Closing data' });
+  expect(app.ok).toBe(true);
+  await openSidebarEntry(orkas.page!, '#apps-btn');
+  const card = orkas.page!.locator(`.app-card[data-app-id="${app.id}"]`);
+  const preview = await orkas.openPreview(() => card.click());
+  const frame = preview.locator('.saved-app-viewer-frame').contentFrame();
+  await frame.getByRole('textbox', { name: 'Note' }).fill('BASE');
+  await frame.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(frame.locator('#status')).toHaveText('Saved');
+  const inputs = { data: path.resolve(__dirname, '../../src/main/features/web_apps/data.ts'), runtime: path.resolve(__dirname, '../../src/main/features/web_apps/runtime.ts'), paths: path.resolve(__dirname, '../../src/main/paths.ts'), users: path.resolve(__dirname, '../../src/main/features/users.ts'), id: app.id, definition };
+  await orkas.electronApp!.evaluate(async (_electron, input) => {
+    const main = (process as any).mainModule, uid = main.require(input.users).getActiveUserId();
+    const { LocalAppData } = main.require(input.data), original = LocalAppData.prototype.call;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const probe = { committed: false, release, restore: () => { LocalAppData.prototype.call = original; } };
+    LocalAppData.prototype.call = async function (method: string, args: any) {
+      const result = await original.call(this, method, args);
+      if (method === 'data.insert' && args.values?.body === 'NEW') { probe.committed = true; await gate; }
+      return result;
+    };
+    (globalThis as any).__closingDataProbe = probe;
+  }, inputs);
+  try {
+    await frame.getByRole('textbox', { name: 'Note' }).fill('NEW');
+    await frame.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect.poll(() => orkas.electronApp!.evaluate(() => (globalThis as any).__closingDataProbe.committed)).toBe(true);
+    await orkas.closePreview(preview);
+    const received = await orkas.electronApp!.evaluate(async (_electron, input) => {
+      const main = (process as any).mainModule, uid = main.require(input.users).getActiveUserId();
+      const probe = (globalThis as any).__closingDataProbe;
+      probe.release(); probe.restore();
+      const key = main.require('node:crypto').createHash('sha256').update(JSON.stringify(['saved', input.id])).digest('hex');
+      await main.require(input.runtime).closeAppData(uid, key);
+      const paths = main.require(input.paths);
+      const { LocalAppData } = main.require(input.data);
+      const reader = new LocalAppData(main.require('node:path').join(paths.webAppSandboxRoot(uid, key, 'local'), 'data.sqlite'), paths.userLocalRoot(uid), input.definition);
+      try { return await reader.call('data.query', { table: 'notes' }); }
+      finally { await reader.close(); }
+    }, inputs);
+    writeFileSync(info.outputPath('closing-local-durable.json'), JSON.stringify(received));
+    expect(received.records.map((r: any) => r.body).sort()).toEqual(['BASE', 'NEW']);
+    const reopened = await orkas.openPreview(() => card.click());
+    const actual = await reopened.locator('.saved-app-viewer-frame').contentFrame().locator('body')
+      .evaluate(async () => (window as any).orkasApp.data.query({ table: 'notes' }));
+    expect(actual.records.map((r: any) => r.body).sort()).toEqual(['BASE', 'NEW']);
+    expect(orkas.modelRequests).toHaveLength(0);
+  } finally {
+    await orkas.electronApp!.evaluate(() => { const probe = (globalThis as any).__closingDataProbe; probe?.release(); probe?.restore(); });
+  }
+});
+
 test('ordinary artifact messages lose trust after the same iframe navigates to an external origin', async ({ modelOrkas: orkas }) => {
   const external=createServer((_request,response)=>{response.setHeader('Content-Type','text/html');response.end('<script>parent.postMessage({__orkasArtifact:true,type:"probe"},"*")</script>');});
   await new Promise<void>(resolve=>external.listen(0,'127.0.0.1',resolve));
@@ -250,6 +306,8 @@ test('a denied cross-origin write has no remote effect and an explicit retry kee
         document.querySelector('#retry').onclick=()=>send('/allowed');
       </script></body>`));
     const frame = await mount(orkas, app.id);
+    const denialAfter = orkas.rendererDiagnosticCheckpoint();
+    const deniedOrigin = await frame.locator('body').evaluate(() => location.origin);
     await frame.getByRole('button', { name: 'Send', exact: true }).click();
     await expect(frame.getByRole('status')).toHaveText('Request blocked; retry available');
     expect(requests).toEqual(['OPTIONS /denied']);
@@ -264,6 +322,9 @@ test('a denied cross-origin write has no remote effect and an explicit retry kee
     expect(await reopened.locator('body').evaluate(() => (window as any).orkasApp.storage.get({ key: 'result' }))).toEqual({ value: 'Saved remotely' });
     expect(writes).toHaveLength(1);
     expect(orkas.modelRequests).toHaveLength(0);
+    orkas.acknowledgeBrowserDenial(frame.owner().page(), {
+      kind: 'cors-preflight', url: base + '/denied', origin: deniedOrigin, after: denialAfter,
+    });
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
 
@@ -500,6 +561,7 @@ test('isolated origin denies forged messages, foreign data and revoked SDK calls
   expect(await frame.locator('body').evaluate(async()=>{try{await (window as any).orkasApp.call('auth.getConfig',{});return 'wrong';}catch(e){return (e as any).code;}})).toBe('E_METHOD');
   const other:any=await seed(orkas,'sdk-foreign');
   const remote:any=await orkas.invoke('savedApps.openInApp',{appId:other.id});
+  const denialAfter = orkas.rendererDiagnosticCheckpoint();
   expect(await frame.locator('body').evaluate(async(_node,url)=>{try{return await (await fetch(url)).text();}catch{return 'blocked';}},remote.url)).toBe('blocked');
   await frame.owner().page().evaluate(()=>{
     const frame=document.querySelector('.saved-app-viewer-frame') as HTMLIFrameElement;
@@ -509,6 +571,7 @@ test('isolated origin denies forged messages, foreign data and revoked SDK calls
   expect(await frame.locator('body').evaluate(()=>(window as any).orkasApp.permissions.revoke())).toEqual({revoked:true});
   expect(await frame.locator('body').evaluate(async()=>{try{await (window as any).orkasApp.storage.keys();return 'wrong';}catch(e){return (e as any).code;}})).toBe('E_CLOSED');
   expect(orkas.modelRequests.length).toBe(before);
+  orkas.acknowledgeBrowserDenial(frame.owner().page(), { kind: 'csp-connect', url: remote.url, after: denialAfter });
 });
 
 test('local SDK chat artifacts submit results but external destinations cannot submit or call the SDK', async ({ modelOrkas: orkas }) => {
@@ -757,6 +820,9 @@ test('new ordinary apps isolate browser data across objects and accounts while r
   const second = await open({ appId: saved[1].id }, 'browser-second');
   expect(second.url).not.toBe(first.url);
   expect(await data(second.body)).toEqual({ local: null, indexed: null });
+  const denialAfter = orkas.rendererDiagnosticCheckpoint();
+  const denialSurface = orkas.page;
+  const deniedOrigin = await second.body.evaluate(() => location.origin);
   expect(await second.body.evaluate(async (_node, url) => { try { await fetch(url); return true; } catch { return false; } }, first.url)).toBe(false);
   // Ordinary bridge messages remain trusted, but no SDK adapter is installed.
   await orkas.page.evaluate(() => {
@@ -807,6 +873,9 @@ test('new ordinary apps isolate browser data across objects and accounts while r
   expect(await data(restarted.body)).toEqual({ local: 'First private draft', indexed: 'First private draft' });
   expect(await data((await open({ appId: saved[2].id }, 'browser-legacy')).body)).toEqual({ local: 'Legacy retained', indexed: 'Legacy retained' });
   expect(orkas.modelRequests).toHaveLength(0);
+  orkas.acknowledgeBrowserDenial(denialSurface, {
+    kind: 'cors-scheme', url: first.url, origin: deniedOrigin, after: denialAfter,
+  });
 });
 
 

@@ -768,6 +768,23 @@ const INTERACTION_SCRIPT = `(async () => {
     || element.tagName
     || 'control'
   ).replace(/\\s+/g, ' ').trim().slice(0, 120);
+  const temporalSamples = {
+    date: '2000-01-01', time: '12:00', month: '2000-01', week: '2000-W01',
+    'datetime-local': '2000-01-01T12:00'
+  };
+  const fillTemporalField = (field) => {
+    const sample = temporalSamples[field.type];
+    if (!sample) return false;
+    const original = field.value;
+    for (const candidate of [field.min, field.max, original, sample]) {
+      if (!candidate) continue;
+      field.value = candidate;
+      if (field.value && field.validity.valid) return true;
+    }
+    // Inconsistent constraints must still fail the form's validity check.
+    field.value = original;
+    return true;
+  };
   // SVG role controls have no HTMLElement.click(), but receive DOM click
   // events. Keep native activation for HTML controls (forms and downloads).
   const activateControl = (control) => {
@@ -883,6 +900,7 @@ const INTERACTION_SCRIPT = `(async () => {
           const type = String(field.type || '').toLowerCase();
           if (type === 'checkbox') field.checked = !field.checked;
           else if (type === 'radio') field.checked = true;
+          else if (fillTemporalField(field)) { /* Preserve native formats and bounds. */ }
           else if (type === 'number' || type === 'range') {
             const current = Number(field.value || 0);
             const step = Math.max(1, Number(field.step || 1) || 1);
@@ -983,12 +1001,18 @@ const INTERACTION_SCRIPT = `(async () => {
             field instanceof HTMLInputElement
             || field instanceof HTMLTextAreaElement
           ) {
-            if (type === 'email') field.value = 'preview-check@example.invalid';
+            if (field instanceof HTMLInputElement && fillTemporalField(field)) { /* Native temporal sample. */ }
+            else if (type === 'email') field.value = 'preview-check@example.invalid';
             else if (type === 'url') field.value = 'https://example.invalid/';
             else if (type === 'number') field.value = field.min || '1';
             else if (type === 'password') field.value = 'Preview-Check-9!';
             else if (!['button', 'submit', 'reset', 'file', 'hidden'].includes(type)) {
-              field.value = 'Preview interaction check';
+              const original = field.value;
+              for (const sample of [original, 'Preview interaction check', '1', '0']) {
+                if (!sample) continue;
+                field.value = sample;
+                if (field.validity.valid) break;
+              }
             }
             field.dispatchEvent(new Event('input', { bubbles: true }));
             field.dispatchEvent(new Event('change', { bubbles: true }));

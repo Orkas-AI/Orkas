@@ -29,11 +29,12 @@ const USER = 'canary-user';
 const TASK = 'canary-background-task';
 
 const PAGE = `<!doctype html><title>Report</title><h1>Report</h1>
+<label>Draft<input id="draft"></label>
 <button id="continue" type="button">Continue</button><p id="state">idle</p>
 <script>
   document.querySelector('#continue').addEventListener('click', event => {
     document.querySelector('#state').textContent = event.isTrusted ? 'trusted' : 'synthetic';
-    fetch(location.pathname + '/clicked', { method: 'POST' });
+    fetch(location.pathname + '/clicked', { method: 'POST', body: JSON.stringify({ draft: document.querySelector('#draft').value }) });
   });
 </script>`;
 
@@ -59,11 +60,18 @@ function pageState(contents: WebContents): Promise<{ rendering: boolean; state: 
 
 export async function main(): Promise<number> {
   const web = await import('../../src/main/features/web_assist') as unknown as WebAssist;
+  const { createDesktopWindowController } = await import('../../src/main/features/desktop_windows');
+  const hiddenOnly = process.env.ORKAS_WEB_ASSIST_CANARY_HIDDEN_ONLY === '1';
   const clicks: string[] = [];
+  const drafts: string[] = [];
   const server = http.createServer((req, res) => {
     if (req.method === 'POST') {
-      clicks.push(String(req.url));
-      res.end('ok');
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        clicks.push(String(req.url)); drafts.push(JSON.parse(body).draft);
+        res.end('ok');
+      });
       return;
     }
     res.setHeader('Content-Type', 'text/html');
@@ -72,7 +80,11 @@ export async function main(): Promise<number> {
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   // The app window: on screen, with the user in another task.
-  const owner = new BrowserWindow({ width: 900, height: 700, show: false });
+  const owner = new BrowserWindow({ width: 900, height: 700, show: false, ...(hiddenOnly ? { focusable: false } : {}) });
+  const desktop = createDesktopWindowController({ canHide: () => true, isShutdownComplete: () => false });
+  desktop.install(owner);
+  let nativeShows = 0;
+  owner.on('show', () => { nativeShows++; });
   let tabId = '';
   let failed = 0;
   const view = () => owner.contentView.children.find(child => child instanceof WebContentsView) as WebContentsView | undefined;
@@ -85,12 +97,12 @@ export async function main(): Promise<number> {
     return navigated.ok === true ? settle() : [`navigate failed: ${String(navigated.code)}`];
   };
   /** One model click on a page that loaded while hidden, checked at the page and server. */
-  const clickHiddenPage = async (path: string, neverRendered = true): Promise<string[]> => {
+  const clickHiddenPage = async (path: string, neverRendered: boolean | null = true): Promise<string[]> => {
     const contents = view()?.webContents;
     if (!contents) return ['the task page has no native view'];
     const failures: string[] = [];
     // Without a never-rendered page this case would pass without testing anything.
-    if ((await pageState(contents)).rendering === neverRendered) {
+    if (neverRendered !== null && (await pageState(contents)).rendering === neverRendered) {
       failures.push(neverRendered
         ? 'setup: the page rendered before the click; the defect is no longer reproduced'
         : 'the previously woken page stopped rendering');
@@ -129,6 +141,59 @@ export async function main(): Promise<number> {
     // for stealing the user's focus; document focus is not that boundary.
     return failures;
   };
+  const closedCases: Array<{ name: string; run: () => Promise<string[]> }> = [
+    {
+      name: 'a closed main window stays alive while its cold task page receives a native click',
+      run: async () => {
+        owner.close();
+        if (owner.isDestroyed() || !desktop.owns(owner.webContents)) return ['close destroyed the main window'];
+        const opened = await web.openModelWebAssist(USER, TASK, { url: origin + '/closed-first' }) as Result;
+        if (!opened.ok) return [`open failed: ${String(opened.code)}`];
+        tabId = String(opened.active_tab_id);
+        const loading = await settle();
+        return loading.length ? loading : clickHiddenPage('/closed-first');
+      },
+    },
+    {
+      name: 'a closed task page fills Unicode input and submits it once without waking its owner',
+      run: async () => {
+        const observed = await web.observeModelWebAssist(USER, TASK, tabId) as Result;
+        const ref = observed.elements?.find((element: any) => element.label === 'Draft')?.ref;
+        if (!ref) return ['draft input was not observed'];
+        const draft = '后台报告 / background report';
+        const filled = await web.actOnModelWebAssist(USER, TASK, {
+          tabId, pageId: observed.page_id, elementRef: ref, action: 'fill', text: draft,
+        }) as Result;
+        if (!filled.ok) return [`fill failed: ${String(filled.code)}`];
+        if (await view()?.webContents.executeJavaScript("document.querySelector('#draft').value") !== draft) return ['page did not retain the complete draft'];
+        // A completed fill can release its frame-painting session on Windows.
+        // Rendering continuity is not the input outcome; cold-click cases above
+        // and below independently require an unrendered page before their input.
+        const failures = await clickHiddenPage('/closed-first', null);
+        if (drafts.at(-1) !== draft) failures.push('website did not receive the exact draft');
+        return failures;
+      },
+    },
+    {
+      name: 'navigation while closed rejects a stale click and permits one fresh cold-page click',
+      run: async () => {
+        const observed = await web.observeModelWebAssist(USER, TASK, tabId) as Result;
+        const ref = observed.elements?.find((element: any) => element.label === 'Continue')?.ref;
+        if (!ref) return ['continue button was not observed'];
+        const loading = await navigate('/closed-second');
+        if (loading.length) return loading;
+        const before = clicks.length;
+        const stale = await web.actOnModelWebAssist(USER, TASK, {
+          tabId, pageId: observed.page_id, elementRef: ref, action: 'click',
+        }) as Result;
+        if (stale.ok !== false || clicks.length !== before) return ['stale click was not rejected without a website write'];
+        const failures = await clickHiddenPage('/closed-second');
+        owner.close();
+        if (owner.isDestroyed() || owner.isVisible() || owner.isFocused() || nativeShows) failures.push('closed-window work revealed, focused or destroyed the owner');
+        return failures;
+      },
+    },
+  ];
   const cases: Array<{ name: string; run: () => Promise<string[]> }> = [
     {
       name: 'a page opened by a background task takes one native click without being shown',
@@ -172,14 +237,9 @@ export async function main(): Promise<number> {
   ];
   try {
     await owner.loadURL('data:text/html,<title>Orkas</title>');
-    owner.showInactive();
-    if (!await until(() => owner.isVisible(), Boolean, 3000)) {
-      process.stderr.write('[web-assist-input-canary] no usable window on this host; run it on a desktop session\n');
-      return CANARY_EXIT_NO_WINDOW;
-    }
     web.bindWebAssistConversation(USER, TASK, owner.webContents);
     web.setActiveWebAssistConversation(owner.webContents, 'canary-foreground-task');
-    for (const testCase of cases) {
+    const runCase = async (testCase: typeof cases[number]) => {
       let failures: string[];
       try {
         failures = await testCase.run();
@@ -193,6 +253,16 @@ export async function main(): Promise<number> {
       } else {
         process.stdout.write(`ok   ${testCase.name}\n`);
       }
+    };
+    for (const testCase of closedCases) await runCase(testCase);
+    if (tabId) await web.closeModelWebAssistTab(USER, TASK, tabId);
+    if (!hiddenOnly) {
+      owner.showInactive();
+      if (!await until(() => owner.isVisible(), Boolean, 3000)) {
+        process.stderr.write('[web-assist-input-canary] no usable window on this host; run it on a desktop session\n');
+        return CANARY_EXIT_NO_WINDOW;
+      }
+      for (const testCase of cases) await runCase(testCase);
     }
     process.stdout.write(`[web-assist-input-canary] ${failed ? `${failed} failed` : 'all cases passed'}\n`);
     return failed ? CANARY_EXIT_FAILED : CANARY_EXIT_PASS;

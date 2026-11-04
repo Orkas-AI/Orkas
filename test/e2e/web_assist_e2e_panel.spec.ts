@@ -339,9 +339,14 @@ test('task browser routes pages, resources and popup login through its launch pr
     expect(proxied).not.toContain('/bypass');
     proxy.closeAllConnections();
     await new Promise<void>(resolve => proxy.close(() => resolve()));
+    const proxyFailureDiagnostics = orkas.rendererDiagnosticCheckpoint();
     await orkas.invoke('webAssist.navigateTo', { tabId: opened.state.active_tab_id, url: 'http://browser-proxy.invalid/unavailable' });
     await expect.poll(async () => (await orkas.invoke<{ state: { tabs: Array<{ tab_id: string; error_code?: string }> } }>('webAssist.state', {})).state.tabs.find(tab => tab.tab_id === opened.state.active_tab_id)?.error_code).toBe('page_load_failed');
     expect(proxied).not.toContain('/unavailable');
+    await orkas.invoke('webAssist.navigateTo', { tabId: opened.state.active_tab_id, url: directUrl });
+    await expect.poll(title).toBe('Local service ready');
+    expect(leakedAuthorization).toBe(false);
+    await orkas.acknowledgeNavigationFailure('http://browser-proxy.invalid/unavailable', 'ERR_PROXY_CONNECTION_FAILED', proxyFailureDiagnostics);
   } finally {
     await orkas.invoke('webAssist.close', {});
     await orkas.electronApp!.evaluate(() => {
@@ -356,6 +361,7 @@ test('task browser routes pages, resources and popup login through its launch pr
 });
 
 test('task browser blocks requests when proxy setup fails instead of using a reachable direct route', async ({ orkas }) => {
+  const proxyFailureDiagnostics = orkas.rendererDiagnosticCheckpoint();
   let received = 0;
   const server = createServer((_req, res) => { received++; res.end('<title>Unexpected direct request</title>'); });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -385,6 +391,7 @@ test('task browser blocks requests when proxy setup fails instead of using a rea
     expect(opened.ok).toBe(true);
     await expect.poll(async () => (await orkas.invoke<{ state: { error_code?: string } }>('webAssist.state', {})).state.error_code).toBe('page_load_failed');
     expect(received).toBe(0);
+    await orkas.acknowledgeNavigationFailure(url, 'ERR_BLOCKED_BY_CLIENT', proxyFailureDiagnostics);
   } finally {
     await orkas.invoke('webAssist.close', {});
     await orkas.electronApp!.evaluate(() => { delete process.env.HTTP_PROXY; });
@@ -1186,7 +1193,8 @@ test('background browser work is revealed on return and activity overlays preser
         delete (globalThis as any).__activityReveal;
       });
     }
-    await page.locator('.web-assist-address-input').click();
+    // The anchored surface covers the address bar; dismiss via outside chrome.
+    await page.locator('.conversation-info-title').click();
     await expect(activity).toBeHidden();
     await button.click();
     await page.evaluate(id => (window as any).setView('conversation', id), front.conversation.conversation_id);

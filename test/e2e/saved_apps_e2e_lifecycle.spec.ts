@@ -38,6 +38,7 @@ test('retains saved app cards when the local inventory is unreadable and recover
   await expect(card).toBeVisible();
   expect((await orkas.invoke<any>('savedApps.list')).apps.map((a:any)=>a.id)).toEqual([saved.id]);
   expect(readFileSync(source,'utf8')).toContain('Charging planner');
+  await orkas.acknowledgeInvokeFailures('savedApps.list',1);
   const preview=await orkas.openPreview(()=>card.click());
   await expect(preview.frameLocator('.saved-app-viewer-frame').locator('h1')).toHaveText('Charging planner');
   await preview.screenshot({path:info.outputPath('recovered-planner.png')});

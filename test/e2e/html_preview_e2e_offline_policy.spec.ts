@@ -138,6 +138,7 @@ test.describe('local HTML preview', () => {
     expect(cleanEvidence.blockedResourceCount).toBe(0);
     expect(cleanEvidence.ok).toBe(true);
 
+    const storageCheckpoint = orkas.rendererDiagnosticCheckpoint();
     const storageEvidence = await check(storage, true);
     expect(storageEvidence.ok).toBe(false);
     expect(storageEvidence.viewports[0].consoleErrors.join(' ')).toMatch(/draft storage unavailable: .*sandboxed/);
@@ -146,6 +147,8 @@ test.describe('local HTML preview', () => {
     // check keeps the default loading and may use storage.
     const artifactEvidence = await check(storage, false);
     expect(artifactEvidence.viewports[0].consoleErrors).toEqual([]);
+    await orkas.acknowledgeRendererFailure({ after: storageCheckpoint, count: 1,
+      detail: "draft storage unavailable: Failed to read the 'localStorage' property from 'Window': The document is sandboxed and lacks the 'allow-same-origin' flag." });
   });
 
   test('audits filter panels after a dense graphic and retains missing effects as inconclusive', async ({ orkas }) => {
@@ -354,4 +357,34 @@ test.describe('local HTML preview', () => {
       expect(requests).toEqual(expect.arrayContaining(['/app.js','/app.css','/api','/page']));
     }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
   });
+  test('loads all valid blocking resource tags while keeping long HTML inference responsive', async ({
+    appPage,
+    orkas,
+  }) => {
+    const blockers = Array.from({ length: 16 }, (_, index) => (
+      `<script src="./blocking-${index}.js"></script><link rel="stylesheet" href="./blocking-${index}.css">`
+    )).join('');
+    for (let index = 0; index < 16; index++) {
+      orkas.createWorkspaceFile(`blocking-${index}.js`, 'window.__loadedBlockingScripts = (window.__loadedBlockingScripts || 0) + 1;');
+      orkas.createWorkspaceFile(`blocking-${index}.css`, 'main { display: block; }');
+    }
+    const htmlPath = orkas.createWorkspaceFile('blocking-resource-preview.html', `<!doctype html>
+<html><head>${blockers}<style>main { color: rgb(12, 34, 56); }</style></head>
+<body><main id="ready">${'preview-ready '.repeat(8_000)}</main></body></html>`);
+
+    const startedAt = Date.now();
+    const preview = await orkas.openPreview(() => appPage.evaluate((pathValue) => {
+      void (window as any).openChatFileViewer(pathValue, 'blocking-resource-preview.html');
+    }, htmlPath));
+
+    const body = preview.locator('.chat-file-viewer-body');
+    await expect(body).not.toHaveAttribute('aria-busy', 'true', { timeout: 5_000 });
+    const elapsedMs = Date.now() - startedAt;
+    expect(elapsedMs).toBeLessThan(5_000);
+    const frame = preview.locator('.chat-file-viewer-html');
+    expect(await frame.getAttribute('src')).toMatch(/^chat-media:\/\/local\//);
+    await expect(frame.contentFrame().locator('#ready')).toContainText('preview-ready');
+    expect(await frame.contentFrame().locator('body').evaluate(() => (window as any).__loadedBlockingScripts)).toBe(16);
+  });
+
 });

@@ -7,6 +7,14 @@ import * as permissions from '../../../src/main/features/web_assist_permissions'
 import * as passkeys from '../../../src/main/features/web_assist_passkey';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { logWebAssistFailure } from '../../../src/main/features/web_assist_diagnostics';
+import { recordGeneratedAttachment, deleteAttachment } from '../../../src/main/features/chat_attachments';
+
+// The native lifecycle suite controls publication faults. Real attachment
+// ownership, restart recovery and sending are exercised by download E2E.
+vi.mock('../../../src/main/features/chat_attachments', () => ({
+  recordGeneratedAttachment: vi.fn(),
+  deleteAttachment: vi.fn(() => ({ ok: false })),
+}));
 
 vi.mock('../../../src/main/features/web_assist_diagnostics', () => ({ logWebAssistFailure: vi.fn() }));
 
@@ -1241,7 +1249,8 @@ describe('Web Assist controlled connector lifecycle', () => {
       page.emit('render-process-gone', {}, { reason: 'clean-exit' });
       expect(logWebAssistFailure).toHaveBeenCalledTimes(2);
       page.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 1 });
-      expect(logWebAssistFailure).toHaveBeenLastCalledWith(electronMock.renderer, 'renderer_gone');
+      expect(logWebAssistFailure).toHaveBeenLastCalledWith(electronMock.renderer, 'renderer_gone',
+        undefined, undefined, { reason: 'crashed', exitCode: 1 });
     });
   });
 
@@ -3228,6 +3237,24 @@ describe('host-started task browser binding', () => {
       expect(listModelWebAssistTabs('u2', cid)).toMatchObject({ ok: false });
     });
 
+    it('registers download ownership before Chromium can write, and rejects a failed registration without a partial file', () => {
+      vi.mocked(recordGeneratedAttachment).mockImplementationOnce((_uid, _cid, file) => {
+        expect(fs.existsSync(file)).toBe(true);
+        throw Object.assign(new Error('Controlled download ownership failure'), { code: 'ENOSPC' });
+      });
+      const rejected = attempt('https://files.example.com/report.csv', 'report.csv');
+      expect(rejected.prevented.value).toBe(true);
+      expect(rejected.item.savePath).toBe('');
+      expect(fs.existsSync(path.join(DOWNLOAD_ROOT, 'u1', cid, 'report.csv'))).toBe(false);
+      expect(webAssistDownloads('u1', cid).downloads.at(-1)).toMatchObject({ state: 'failed' });
+      expect((listModelWebAssistTabs('u1', cid).downloads as unknown[]).at(-1)).not.toHaveProperty('path');
+      const retry = attempt('https://files.example.com/report.csv', 'report.csv');
+      expect(retry.prevented.value).toBe(false);
+      expect(recordGeneratedAttachment).toHaveBeenLastCalledWith('u1', cid, retry.item.savePath);
+      retry.item.handlers.done({}, 'completed');
+      expect(webAssistDownloads('u1', cid).downloads.at(-1)).toMatchObject({ state: 'saved' });
+    });
+
     it.each(['blob:https://export.example.net/fixture', 'data:text/csv,name%2Cvalue'])('saves page-generated %s without browser consent', url => {
       const transfer = attempt(url, 'site-export.csv');
       expect(transfer.prevented.value).toBe(false);
@@ -3301,6 +3328,7 @@ describe('host-started task browser binding', () => {
       tried.item.received = 7;
       tried.item.handlers.done({}, 'cancelled');
       expect(fs.existsSync(tried.item.savePath)).toBe(false);
+      expect(deleteAttachment).toHaveBeenLastCalledWith('u1', cid, 'half.csv');
       expect(webAssistDownloads('u1', cid).downloads.at(-1)).toMatchObject({ state: 'failed' });
       expect((listModelWebAssistTabs('u1', cid).downloads as unknown[]).at(-1)).not.toHaveProperty('path');
     });

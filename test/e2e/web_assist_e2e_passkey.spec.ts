@@ -71,6 +71,7 @@ test('Google phone passkey returns a browser-shaped assertion and cancels cleanl
 
 test('phone tunnel obeys the owning Session proxy and fails closed without bypassing it', async ({ modelOrkas: orkas }) => {
   test.skip(process.platform !== 'darwin', 'Mac hybrid transport coverage.');
+  const proxyFailureDiagnostics = orkas.rendererDiagnosticCheckpoint();
   const destinations: string[] = [];
   const proxy = createServer();
   proxy.on('connect', (request, socket) => { destinations.push(request.url!); socket.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'); });
@@ -93,6 +94,10 @@ test('phone tunnel obeys the owning Session proxy and fails closed without bypas
       });
     }, (proxy.address() as { port: number }).port);
     expect(result).toBe('proxy-rejected'); expect(destinations).toEqual(['cable.auth.com:443']);
+    expect(await orkas.electronApp!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()
+      .filter(win => win.webContents.getURL().endsWith('/browser-passkey/transport.html')).length)).toBe(0);
+    await orkas.acknowledgeRendererFailure({ after: proxyFailureDiagnostics, count: 1,
+      detail: "WebSocket connection to 'wss://cable.auth.com/cable/connect/010203/00000000000000000000000000000000' failed: " });
   } finally {
     proxy.closeAllConnections(); await new Promise<void>(resolve => proxy.close(() => resolve()));
   }

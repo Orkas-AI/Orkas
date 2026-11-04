@@ -16,11 +16,6 @@ test('every declared floating family hides native pixels while model input and s
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
     const page = orkas.page!;
-    // The fixture's CDP viewport is 1280x800. Align the native content area;
-    // otherwise OS titlebar height clips a correctly restored native rectangle.
-    await orkas.electronApp!.evaluate(({ BrowserWindow }) => {
-      BrowserWindow.getAllWindows().find(win => win.webContents.getURL().includes('/renderer/index.html'))!.setContentSize(1280, 800);
-    });
     const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
     const created = await orkas.invoke<any>('conversations.create', { title: 'Floating UI and background browser' });
     const cid = created.conversation.conversation_id;

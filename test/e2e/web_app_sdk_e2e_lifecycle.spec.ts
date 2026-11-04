@@ -1,8 +1,72 @@
 import path from 'node:path';
-import { writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { lstatSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
+
+test('native saved-app consumer retains the submitted check-in count after app-list reopening', async ({ orkas }, info) => {
+  const definition = { version: 1, tables: [{ id: 'counts', name: 'counts', fields: [
+    { id: 'value', name: 'value', type: 'number' },
+  ], access: { read: ['value'], insert: ['value'] } }] };
+  const reference = '<!doctype html><html><meta charset="utf-8"><script src="/__orkas/sdk.js"></script><h1>Check-in</h1><label for="count">Count</label><input id="count" type="number"><button id="save">Save</button><output id="value"></output><script>const refresh=async()=>{const r=await orkasApp.data.query({table:"counts"});document.getElementById("value").textContent=String(r.records.reduce((n,r)=>n+r.value,0));};document.getElementById("save").onclick=async()=>{await orkasApp.data.insert({table:"counts",values:{value:Number(document.getElementById("count").value)}});await refresh();};refresh();</script></html>';
+  const source = process.env.ORKAS_EVAL_NATIVE_APP_BUNDLE;
+  const files = new Map<string, Buffer>();
+  if (source) {
+    if (!path.isAbsolute(source)) throw new Error('Native app consumer needs an absolute bundle directory');
+    let bytes = 0, directories = 0;
+    const visit = (relative: string) => {
+      if (++directories > 100 || relative.split(path.sep).length > 10) throw new Error('Native app consumer directory limit');
+      const dir = path.join(source, relative), stat = lstatSync(dir);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Native app consumer rejects linked bundles');
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const rel = path.join(relative, entry.name), file = path.join(source, rel), st = lstatSync(file);
+        if (st.isSymbolicLink() || entry.name.startsWith('.')) throw new Error('Native app consumer rejects hidden or linked files');
+        if (st.isDirectory()) visit(rel);
+        else {
+          if (!st.isFile() || !/\.(?:html?|js|mjs|css|json|svg|png|jpe?g|webp|woff2?)$/i.test(rel)
+            || files.size >= 100 || (bytes += st.size) > 4 * 1024 * 1024) throw new Error('Native app consumer bundle limit');
+          files.set(rel, readFileSync(file));
+        }
+      }
+    };
+    visit('');
+  } else {
+    files.set('index.html', Buffer.from(reference));
+    files.set('orkas-app.json', Buffer.from(JSON.stringify({ sdkVersion: 1, capabilities: ['data'], data: definition })));
+  }
+  expect(files.has('index.html')).toBe(true);
+  const hashes = [...files].map(([name, bytes]) => ({ name, sha256: createHash('sha256').update(bytes).digest('hex') }));
+  for (const [name, bytes] of files) orkas.createWorkspaceFile(path.join('checkin', name), bytes);
+  const entry = path.join(orkas.userWorkspaceRoot, 'checkin/index.html');
+  const page = orkas.page!;
+  const saved = await orkas.invoke<any>('savedApps.saveFromPath', { path: entry, title: 'Check-in', mode: 'auto' });
+  expect(saved.ok).toBe(true);
+  const apps = (await orkas.invoke<any>('savedApps.list')).apps;
+  expect(apps).toHaveLength(1);
+  const id = apps[0].id;
+  const savedRoot = path.join(orkas.workspaceRoot, 'account-e2e/cloud/saved_apps', id);
+  for (const [name, bytes] of files) if (name !== 'orkas-app.json') expect(readFileSync(path.join(savedRoot, name))).toEqual(bytes);
+  await openSidebarEntry(page, '#apps-btn');
+  const card = page.locator(`.app-card[data-app-id="${id}"]`);
+  await expect(card).toBeVisible();
+  let preview = await orkas.openPreview(() => card.click());
+  let frame = preview.locator('.saved-app-viewer-frame').contentFrame();
+  await expect(frame.locator('#value')).toHaveText('0');
+  await frame.locator('#count').fill('7');
+  await frame.locator('#save').click();
+  await expect(frame.locator('#value')).toHaveText('7');
+  await orkas.closePreview(preview);
+  expect((await orkas.invoke<any>('savedApps.list')).apps.map((a: any) => a.id)).toEqual([id]);
+  preview = await orkas.openPreview(() => card.click());
+  frame = preview.locator('.saved-app-viewer-frame').contentFrame();
+  await expect(frame.locator('#value')).toHaveText('7');
+  await preview.screenshot({ path: info.outputPath('native-count-reopened.png') });
+  await orkas.closePreview(preview);
+  expect(orkas.modelRequests).toHaveLength(0);
+  writeFileSync(info.outputPath('native-app-consumer.json'), JSON.stringify({ owner: 'production-evaluation-runner',
+    sourceFiles: hashes, savedAppCount: 1, savedAppId: id, enteredCount: 7, reopenedCount: 7,
+    saveEntry: 'savedApps.saveFromPath IPC', reopenEntry: 'native-app-list-card', modelRequests: 0 }));
+});
 
 test('web app common data survives closing and reopening while host inference remains unavailable',async({orkas},testInfo)=>{
   const definition={version:1,tables:[{id:'notes',name:'notes',fields:[{id:'body',name:'body',type:'string'}],access:{read:['body'],insert:['body'],count:true}}]};
@@ -279,13 +343,19 @@ test('a same-length source edit revokes the live SDK and protocol while reopenin
     try { await (window as any).orkasApp.storage.set({ key: 'value', value: 'WRONG' }); return 'unexpected-success'; }
     catch (error: any) { return error.code; }
   })).toBe('E_CLOSED');
-  expect(await frame.locator('body').evaluate(async () => (await fetch(location.href)).status)).toBe(403);
+  const denialStart = orkas.rendererDiagnosticCheckpoint();
+  const deniedUrl = await frame.locator('body').evaluate((_body, nonce) => {
+    const url = new URL(location.href); url.searchParams.set('denial-probe', nonce); return url.href;
+  }, randomUUID());
+  const deniedStatus = await frame.locator('body').evaluate(async (_body, url) => (await fetch(url)).status, deniedUrl);
+  expect(deniedStatus).toBe(403);
   await preview.close();
   const reopened = await open();
   const fresh = reopened.locator('.saved-app-viewer-frame').contentFrame();
   await expect(fresh.getByRole('heading')).toHaveText('Revision after!');
   expect(await fresh.locator('body').evaluate(() => (window as any).orkasApp.storage.get({ key: 'value' }))).toEqual({ value: 'KEEP' });
   expect(orkas.modelRequests).toHaveLength(0);
+  orkas.acknowledgeResourceDenial(preview, { url: deniedUrl, after: denialStart, status: deniedStatus });
 });
 
 test('unavailable conversation apps show independent inline retries without modal stacks', async ({ orkas }, testInfo) => {

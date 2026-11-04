@@ -95,13 +95,26 @@ test('replacing an in-flight navigation does not show failure, while real failur
     await expect.poll(async () => (await evidence()).rejected).toContain(-3);
     await ready();
 
+    const failureDiagnostics = orkas.rendererDiagnosticCheckpoint();
     await navigate('/failure');
     await expect.poll(async () => (await evidence()).failures).toContain(-324); // ERR_EMPTY_RESPONSE
     await expect.poll(async () => (await state()).error_code).toBe('page_load_failed');
     await expect.poll(async () => (await state()).loading).toBe(false);
     await expect(status).not.toHaveText('');
+    for (const result of [await wait('loaded'), await wait('text')]) {
+      expect(result).toMatchObject({ ok: false, code: 'page_load_failed', isError: true });
+    }
     await navigate('/ready');
     await ready();
+    expect(await wait('loaded')).toMatchObject({ ok: true, isError: false });
+    expect(await wait('text')).toMatchObject({ ok: true, isError: false });
+    await orkas.electronApp!.evaluate(async (_electron, args) => {
+      const require = (process as any).mainModule.require;
+      require(args.root + '/src/main/features/web_assist_lifecycle.ts')
+        .finishBrowserTaskRun('account-e2e', args.cid, 'navigation-wait');
+      delete (globalThis as any).__navigationWaitTool;
+    }, { root: browserRoot, cid });
+    await orkas.acknowledgeNavigationFailure(origin + '/failure', 'ERR_EMPTY_RESPONSE', failureDiagnostics);
   } finally {
     await orkas.invoke('webAssist.close', {});
     server.closeAllConnections();

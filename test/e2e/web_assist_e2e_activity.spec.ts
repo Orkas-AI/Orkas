@@ -147,3 +147,72 @@ test('large activity refresh retains scrolling and task switches invalidate its 
   await stale!.evaluate((button: HTMLButtonElement) => button.click());
   expect(await page.evaluate(() => (window as any).calls.filter(([name]: any[]) => name === 'attachments.absPath'))).toEqual([]);
 });
+
+for (const locale of ['en', 'zh']) {
+  test(`activity follows its button through drawer resize and full screen (${locale})`, async ({ page }, info) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await setup(page);
+    const copy = JSON.parse(fs.readFileSync(path.join(renderer, `locales/${locale}.json`), 'utf8'));
+    await page.evaluate(translations => {
+      const w = window as any;
+      w.t = (key: string) => translations[key] || key;
+      window.dispatchEvent(new Event('i18n-change'));
+      const panel = document.getElementById('conversation-info-panel')!;
+      panel.classList.add('task-side-panel');
+      panel.style.cssText = 'width:600px;height:100%;min-width:0;flex:1 1 auto';
+      const frame = document.createElement('div');
+      frame.style.cssText = 'position:fixed;right:24px;top:80px;width:600px;height:500px;display:flex';
+      panel.before(frame);
+      frame.append(panel);
+    }, copy);
+    const popover = page.locator('.web-assist-activity-popover');
+    const button = page.locator('[data-act="activity"]');
+    const checkPosition = async () => {
+      await settle(page);
+      const anchor = (await button.boundingBox())!;
+      const popup = (await popover.boundingBox())!;
+      const shell = (await page.locator('.web-assist-shell').boundingBox())!;
+      // The trigger owns placement; the browser edges constrain the surface.
+      expect(popup.y - (anchor.y + anchor.height)).toBeCloseTo(4, 0);
+      expect(popup.x).toBeGreaterThanOrEqual(shell.x + 7);
+      expect(popup.x + popup.width).toBeLessThanOrEqual(shell.x + shell.width - 7);
+      expect(popup.y + popup.height).toBeLessThanOrEqual(shell.y + shell.height - 7);
+      if (anchor.x + anchor.width - shell.x >= popup.width + 8) {
+        expect(popup.x + popup.width).toBeCloseTo(anchor.x + anchor.width, 0);
+      }
+      await expect(popover.locator('[data-act="close-activity"]')).toBeInViewport();
+    };
+    await checkPosition();
+    await page.screenshot({ path: info.outputPath(`activity-${locale}-drawer.png`) });
+    // Resize the host while the menu stays open; no window resize event fires.
+    await page.locator('#conversation-info-panel').evaluate(panel => {
+      panel.parentElement!.style.width = '340px';
+      panel.parentElement!.style.height = '260px';
+      panel.style.width = '340px';
+    });
+    await checkPosition();
+    await page.setViewportSize({ width: 640, height: 420 });
+    await checkPosition();
+    await page.screenshot({ path: info.outputPath(`activity-${locale}-narrow.png`) });
+    // Keyboard expansion keeps the menu open; Escape dismisses it first.
+    await page.locator('[data-act="expand"]').focus();
+    await page.keyboard.press('Enter');
+    await checkPosition();
+    await page.screenshot({ path: info.outputPath(`activity-${locale}-expanded.png`) });
+    await page.keyboard.press('Escape');
+    await expect(popover).toBeHidden();
+    await expect(button).toBeFocused();
+    await page.keyboard.press('Escape');
+    await button.click();
+    await checkPosition();
+    await popover.locator('[data-act="close-activity"]').click();
+    await expect(button).toBeFocused();
+    await page.evaluate(() => { (window as any).visits = []; (window as any).downloads = []; });
+    await button.click();
+    await expect(popover.locator('.web-assist-trail-row')).toHaveCount(0);
+    await checkPosition();
+    await page.screenshot({ path: info.outputPath(`activity-${locale}-empty.png`) });
+    await page.mouse.click(10, 10);
+    await expect(popover).toBeHidden();
+  });
+}

@@ -27,6 +27,7 @@ import {
 
 import { userWebAssistProfileDir } from '../paths';
 import { chatAttachmentDirForConversation } from '../util/project-layout';
+import { recordGeneratedAttachment, deleteAttachment } from './chat_attachments';
 import { genId12, safeId } from '../storage';
 import { createLogger } from '../logger';
 import { logErrorRef } from '../util/log-redact';
@@ -637,6 +638,17 @@ function configureSession(userId: string, ses: Session): ReturnType<typeof prepa
     // Without a page origin the file has no site to be attributed to.
     if (!origin) return fail();
     let target = '';
+    const discard = (): void => {
+      if (!target) return;
+      try {
+        // Supported attachments also release durable ownership. Other browser
+        // file types retain the existing download contract and raw cleanup.
+        if (deleteAttachment(userId, conversationId, path.basename(target)).ok) return;
+      } catch (error) {
+        log.warn('download ownership cleanup failed', { error: logErrorRef(error) });
+      }
+      try { fs.unlinkSync(target); } catch { /* own reservation only */ }
+    };
     try {
       const dir = chatAttachmentDirForConversation(userId, conversationId);
       fs.mkdirSync(dir, { recursive: true });
@@ -656,9 +668,12 @@ function configureSession(userId: string, ses: Session): ReturnType<typeof prepa
         }
       }
       if (!target) return fail();
+      // Persist browser output ownership before Chromium can write bytes or
+      // any composer refresh can observe this reserved filename.
+      recordGeneratedAttachment(userId, conversationId, target);
       item.setSavePath(target);
     } catch (error) {
-      if (target) { try { fs.unlinkSync(target); } catch { /* own reservation only */ } }
+      discard();
       log.warn('download destination unavailable', { error: logErrorRef(error) });
       return fail();
     }
@@ -672,7 +687,7 @@ function configureSession(userId: string, ses: Session): ReturnType<typeof prepa
       entry.bytes = received();
       if (state !== 'completed') {
         entry.state = 'failed';
-        try { fs.unlinkSync(target); } catch { /* best effort */ }
+        discard();
         tab.errorCode = 'download_blocked';
       } else {
         entry.state = 'saved';
@@ -1817,7 +1832,9 @@ function mountTab(
     tab.loading = false;
     tab.pendingAddressUrl = undefined;
     tab.errorCode = 'page_load_failed';
-    if (details?.reason !== 'clean-exit') logWebAssistFailure(record.owner.webContents, 'renderer_gone');
+    if (details?.reason !== 'clean-exit') {
+      logWebAssistFailure(record.owner.webContents, 'renderer_gone', undefined, undefined, details);
+    }
     emit(record);
   });
   contents.once('destroyed', () => {
