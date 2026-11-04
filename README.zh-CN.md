@@ -145,6 +145,8 @@ Orkas 将你已安装的 CLI 智能体作为本地会话运行，与内置专业
 | --- | --- | --- |
 | **Claude Code** | Anthropic 的编程智能体，可在终端、IDE、桌面和网页中使用，基于 Claude 模型。 | 两者不是二选一：Orkas 把 Claude Code 作为团队中的一个智能体来运行；在此之上，Orkas 提供不绑定模型的智能体团队，处理代码之外的工作（研究、内容、视频等），并用项目、待办和自动化让工作持续推进。[Orkas 与 Claude Code 对比 →](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) |
 | **Codex** | OpenAI 的编程智能体，可在终端、编辑器和云端使用。 | 两者不是二选一：Orkas 把 Codex 作为其中一个智能体来运行，与 Claude Code、OpenCode 并列。指挥官可以把编码交给 Codex、把审查交给另一个智能体，再完成发布中代码之外的部分（文档、发布帖和视频）。[Orkas 与 Codex 对比 →](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) |
+| **Claude Cowork** | Anthropic 面向日常工作的智能体，现已并入 Claude，可在桌面、网页和手机上使用，需要付费 Claude 套餐。默认在 Anthropic 云端运行，基于 Claude 模型。 | Claude Cowork 的开源（MIT）替代方案，可免费开始，赠送 500 积分。智能体在你的电脑上运行，数据默认保存在本地，模型可以用内置 Orkas 模型、自己的服务商 Key 或本地端点。指挥官还能调动 Claude Code、Codex 等 CLI 智能体。代价是 Orkas 需要电脑保持唤醒，而 Cowork 的云端任务可以不依赖你的电脑继续运行。[Claude Cowork 替代方案 →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
+| **Manus** | 默认在 Manus 云端规划并执行任务的 AI 智能体。桌面应用 Manus Studio（macOS 和 Windows）也可以在你选择的文件夹中工作，但任务仍在云端规划。 | Manus 的开源（MIT）替代方案。智能体在你的电脑上运行，数据默认保存在本地，模型可以用内置 Orkas 模型、自己的服务商 Key 或本地端点，并用项目、待办和自动化让工作持续推进。代价是 Orkas 需要电脑保持唤醒，而 Manus 的云端任务可以不依赖你的电脑继续运行。[开源 Manus 替代方案 →](https://orkas.ai/open-source-manus-alternative/?source=gh-orkas) |
 | **LangChain** | 面向开发者的 LLM 应用与智能体框架，通过代码嵌入 Python/JS 应用。 | Orkas 是通过对话指挥的桌面应用，数据默认保存在本地。 |
 | **CrewAI** | 通过 Python 代码定义团队与角色、编排自治智能体的框架。 | Orkas 将多智能体编排做成桌面应用，内置项目、待办、自动化与各智能体的经验积累。 |
 | **OpenClaw** | 提供消息渠道集成、多智能体路由和子智能体能力的个人智能体平台。 | Orkas 提供面向成品交付的桌面工作区，内置专业智能体，并协调 Claude Code、Codex、OpenCode 等 CLI 智能体；OpenClaw 也可作为其中一员接入。 |
