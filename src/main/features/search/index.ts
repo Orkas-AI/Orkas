@@ -30,6 +30,7 @@ import {
   WS_ROOT,
   userContextsIndexPath, userChatsIndexPath,
   userSearchDir,
+  userKbVectorDbPath, projectLibraryVectorDbPath,
 } from '../../paths';
 import { conversationMessageReadFile } from '../../util/project-layout';
 import { getActiveUserId } from '../users';
@@ -46,6 +47,7 @@ import * as indexer from './indexer';
 import * as chatStore from './chat_store';
 import type { ChatSnippet } from './snippet';
 import { readChatSnippets } from './chat-snippets';
+import { chatEligibility } from './chat-eligibility';
 import {
   isRelevantLibraryContentHit,
   libraryContentDisplayScore,
@@ -65,6 +67,8 @@ const DEFAULT_PER_KIND = 30;
 const MAX_PER_KIND = 200;
 const SNIPPET_RADIUS = 60;
 const LIBRARY_EMBED_CACHE_MAX = 32;
+let _slowSearchLoggedAt = Number.NEGATIVE_INFINITY;
+const _progressWarnings = new Map<SearchResult['kind'], number>();
 const RESERVED_RECONCILE_DIRS = new Set([
   // Current machine-global data roots.
   'logs', 'venv',
@@ -73,6 +77,8 @@ const RESERVED_RECONCILE_DIRS = new Set([
 ]);
 
 interface ChatDisplayCatalog {
+  excluded: Set<string>;
+  ownershipComplete: boolean;
   titles: Map<string, string>;
   cidToPid: Map<string, string>;
   pidToName: Map<string, string>;
@@ -103,15 +109,19 @@ async function _getChatDisplayCatalog(userId: string): Promise<ChatDisplayCatalo
       import('../projects'),
     ]);
     const [conversationRows, projectRows] = await Promise.all([
-      chats.listConversationDisplayRows(userId),
+      chats.listConversationDisplayRows(userId, { includeDeleted: true }),
       projects.listProjectNameRows(userId),
     ]);
+    const eligibility = await chatEligibility(userId, conversationRows);
     const catalog: ChatDisplayCatalog = {
+      excluded: eligibility.excluded,
+      ownershipComplete: eligibility.complete,
       titles: new Map(),
       cidToPid: new Map(),
       pidToName: new Map(projectRows.map((row) => [row.project_id, row.name])),
     };
     for (const row of conversationRows) {
+      if (catalog.excluded.has(row.conversation_id)) continue;
       catalog.titles.set(row.conversation_id, row.title);
       if (row.project_id) catalog.cidToPid.set(row.conversation_id, row.project_id);
     }
@@ -121,7 +131,12 @@ async function _getChatDisplayCatalog(userId: string): Promise<ChatDisplayCatalo
     return catalog;
   })();
   _chatDisplayCatalogInFlight.set(userId, run);
-  try { return await run; }
+  try {
+    const catalog = await run;
+    // A delete/restore may finish while this snapshot is being read.
+    return (_chatDisplayCatalogGeneration.get(userId) || 0) === generation
+      ? catalog : _getChatDisplayCatalog(userId);
+  }
   finally {
     if (_chatDisplayCatalogInFlight.get(userId) === run) {
       _chatDisplayCatalogInFlight.delete(userId);
@@ -136,7 +151,7 @@ interface RuntimeIndex extends Index {
 }
 
 export interface SearchResult {
-  kind: 'context' | 'chat' | 'agent' | 'skill';
+  kind: 'context' | 'chat' | 'agent' | 'skill' | 'automation' | 'todo' | 'connector';
   score: number;
   snippet: string;
   [extra: string]: unknown;
@@ -151,6 +166,7 @@ interface LibraryVectorHit {
 }
 
 interface LibraryContentSearchProvider {
+  hasSources?(userId: string, projectId?: string): Promise<boolean>;
   embedQuery(query: string): Promise<number[]>;
   searchGlobal(userId: string, queryVec: number[], limit: number): LibraryVectorHit[];
   listProjects(userId: string): Promise<Array<{ project_id: string; name: string }>>;
@@ -167,6 +183,8 @@ interface SearchLibraryContentsOptions {
   projectId?: string;
   limit?: number;
   onDegraded?: (code: SearchDegradationCode) => void;
+  /** A cancelled caller discards the results, so stop reading indexes for it. */
+  signal?: AbortSignal;
 }
 
 let _libraryContentSearchProviderForTests: LibraryContentSearchProvider | null = null;
@@ -186,10 +204,18 @@ async function _libraryContentSearchProvider(): Promise<LibraryContentSearchProv
     import('../project_library_indexer'),
     import('../projects'),
   ]);
+  let projectRows: ReturnType<typeof projects.listProjectNameRows> | undefined;
+  const listProjects = (userId: string) => projectRows ||= projects.listProjectNameRows(userId);
   return {
+    hasSources: async (userId, projectId) => {
+      if (fs.existsSync(userKbVectorDbPath(userId))) return true;
+      if (projectId) return fs.existsSync(projectLibraryVectorDbPath(userId, projectId));
+      try { return (await listProjects(userId)).some(row => fs.existsSync(projectLibraryVectorDbPath(userId, row.project_id))); }
+      catch { return true; } // Preserve the existing catalog-failure degradation path.
+    },
     embedQuery: (query) => kbEmbed.embedQuery(query),
     searchGlobal: (userId, queryVec, limit) => kbVector.search(userId, queryVec, { k: limit }),
-    listProjects: (userId) => projects.listProjectNameRows(userId),
+    listProjects,
     searchProject: (userId, projectId, queryVec, limit) => (
       projectLibrary.search(userId, projectId, queryVec, { k: limit })
     ),
@@ -352,6 +378,7 @@ export async function searchProjectContexts(
   projectId: string,
   query: string,
   limit = DEFAULT_PER_KIND,
+  projectName?: string,
 ): Promise<SearchResult[]> {
   const q = (query || '').trim();
   const pid = (projectId || '').trim();
@@ -365,7 +392,7 @@ export async function searchProjectContexts(
     ]);
     const [files, project] = await Promise.all([
       projectFiles.listProjectFiles(userId, pid),
-      projects.getProject(userId, pid).catch(() => null),
+      projectName === undefined ? projects.getProject(userId, pid).catch(() => null) : Promise.resolve({ name: projectName }),
     ]);
     const scored: SearchResult[] = [];
     for (const f of files) {
@@ -407,7 +434,7 @@ async function _searchAllProjectContextPaths(
     const { listProjectNameRows } = await import('../projects');
     const projects = await listProjectNameRows(userId);
     const rows = await Promise.all(projects.map((project) => (
-      searchProjectContexts(userId, project.project_id, query, limit)
+      searchProjectContexts(userId, project.project_id, query, limit, project.name)
     )));
     return rows.flat().sort((a, b) => b.score - a.score).slice(0, limit);
   } catch {
@@ -461,12 +488,15 @@ export async function searchLibraryContents(
   let queryVec: number[];
   try {
     provider = await _libraryContentSearchProvider();
+    if (provider.hasSources && !await provider.hasSources(userId, options.projectId)) return [];
+    if (options.signal?.aborted) return [];
     queryVec = await _queryEmbedding(q, provider);
   } catch {
     log.warn('library content query embedding unavailable', { query_chars: q.length });
     options.onDegraded?.('library_content_embedding_unavailable');
     return [];
   }
+  if (options.signal?.aborted) return [];
 
   const byFile = new Map<string, SearchResult>();
   const keepBest = (result: SearchResult | null): void => {
@@ -503,7 +533,11 @@ export async function searchLibraryContents(
   if (options.projectId && !selectedProjects.length) {
     selectedProjects.push({ project_id: options.projectId, name: '' });
   }
-  for (const project of selectedProjects) {
+  for (const [position, project] of selectedProjects.entries()) {
+    // Each vector query is synchronous. Across many projects, yield so IPC,
+    // stream events and a cancellation can run between them.
+    if (position > 0) await new Promise<void>(resolve => setImmediate(resolve));
+    if (options.signal?.aborted) return [];
     try {
       for (const hit of provider.searchProject(userId, project.project_id, queryVec, limit)) {
         keepBest(_libraryContentResult(hit, q, project));
@@ -520,6 +554,10 @@ export async function searchLibraryContents(
 }
 
 export interface SearchChatsOptions {
+  /** Desktop hydration selects only references already present in this query's candidates. */
+  snippetRefs?: Array<{ cid: string; msg_index: number }>;
+  onProgress?: (results: SearchResult[]) => void;
+  signal?: AbortSignal;
   /** Restrict candidates to this project only. Ignored unless scope=project. */
   projectId?: string;
   /** Project scope is opt-in at this feature layer; model tools choose it by default in projects. */
@@ -534,6 +572,8 @@ export interface SearchChatsOptions {
   excludeCid?: string;
   /** Maximum candidate rows returned to the caller. */
   limit?: number;
+  /** Desktop preview only; ordinary/history callers retain source snippets. */
+  includeSnippets?: boolean;
 }
 
 export async function searchChats(
@@ -567,12 +607,15 @@ export async function searchChatsWithStatus(
   userId: string,
   query: string,
   options: SearchChatsOptions = {},
-): Promise<{ results: SearchResult[]; indexComplete: boolean; indexBuilding: boolean }> {
+): Promise<{ results: SearchResult[]; indexComplete: boolean; indexBuilding: boolean; snippetsPending?: boolean }> {
+  if (options.signal?.aborted) return { results: [], indexComplete: false, indexBuilding: false };
   const q = (query || '').trim();
   if (!q) return { results: [], indexComplete: true, indexBuilding: false };
-  // Appends hand their upsert to a deferred chain so a send is not held up by
-  // the index; a reader pays that cost instead, and only when it searches.
-  await indexer.drainDeferredChatWrites(userId);
+  // Ordinary readers settle live writes to include the latest message. The
+  // desktop preview uses already committed matches and explicitly reports
+  // pending enrichment rather than waiting behind a large live transaction.
+  const metadataPreview = options.includeSnippets === false && !options.userVisibleOnly;
+  if (!metadataPreview) await indexer.drainDeferredChatWrites(userId);
 
   // Cold and partial indexes use the same background path (the status check
   // schedules it). Searching must never inherit a history-wide rebuild,
@@ -588,30 +631,55 @@ export async function searchChatsWithStatus(
     chatStore.postingsWithLen(userId, term)
       .map((row) => ({ key: row.doc, tf: row.tf, len: row.len }))
   ));
-  // Resolve every surviving candidate in one statement. Reading metadata from
-  // inside the ranking callback would be one query per scored document.
-  const docsById = chatStore.docsByIds(userId, [...scores.keys()]);
-
   const displayCatalog = await _getChatDisplayCatalog(userId);
+  indexComplete = indexComplete && displayCatalog.ownershipComplete;
 
   interface ChatCandidate extends SearchResult {
     sourceFile: string;
     sourceIndex: number;
   }
-  const candidates = _topN<ChatCandidate, number>(
-    scores,
-    _boundedSearchLimit(options.limit),
-    (docKey, scored) => {
+  // Rank lightweight scores first; a frequent term can match the entire
+  // history. Hydrate bounded windows until enough eligible rows survive,
+  // preserving scoped/legacy filters and the existing stable coverage order.
+  const limit = _boundedSearchLimit(options.limit);
+  const ranked = [...scores].sort(([, a], [, b]) => b.coverage - a.coverage || b.score - a.score);
+  const batchSize = Math.max(64, limit);
+  const candidates: ChatCandidate[] = [];
+  const filesByCid = new Map<string, string>();
+  const availableCids = new Set<string>();
+  for (let offset = 0; offset < ranked.length && candidates.length < limit; offset += batchSize) {
+    const batch = ranked.slice(offset, offset + batchSize);
+    const docsById = chatStore.docsByIds(userId, batch.map(([id]) => id));
+    const eligible = batch.flatMap(([docKey, scored]) => {
       const doc = docsById.get(docKey);
-      if (!doc) return null;
+      if (!doc) return [];
       const cid = doc.cid;
       const msgIndex = doc.msgIndex;
-      if (!cid || !Number.isInteger(msgIndex) || msgIndex < 0) return null;
+      if (!cid || !Number.isInteger(msgIndex) || msgIndex < 0 || displayCatalog.excluded.has(cid)) return [];
       const pid = displayCatalog.cidToPid.get(cid) || '';
-      if (options.conversationId && cid !== options.conversationId) return null;
-      if (Number.isInteger(options.beforeMsgIndex) && msgIndex >= Number(options.beforeMsgIndex)) return null;
-      if (options.excludeCid && cid === options.excludeCid) return null;
-      if (options.scope === 'project' && (!options.projectId || pid !== options.projectId)) return null;
+      if (options.conversationId && cid !== options.conversationId) return [];
+      if (Number.isInteger(options.beforeMsgIndex) && msgIndex >= Number(options.beforeMsgIndex)) return [];
+      if (options.excludeCid && cid === options.excludeCid) return [];
+      if (options.scope === 'project' && (!options.projectId || pid !== options.projectId)) return [];
+      return [{ doc, scored, cid, msgIndex, pid }];
+    });
+    const unresolved = [...new Set(eligible.map(row => row.cid))].filter(cid => !filesByCid.has(cid));
+    // Check only ranked, eligible sources, once per conversation. Metadata
+    // preview still reads no history bodies and never scans the whole corpus.
+    // Bounded async stats also avoid blocking main on missing network files.
+    for (let start = 0; start < unresolved.length; start += 32) {
+      await Promise.all(unresolved.slice(start, start + 32).map(async cid => {
+        const pid = displayCatalog.cidToPid.get(cid);
+        const file = conversationMessageReadFile(userId, cid, pid || (displayCatalog.titles.has(cid) ? null : undefined));
+        filesByCid.set(cid, file);
+        try {
+          if ((await fsp.stat(file)).isFile()) availableCids.add(cid);
+          else indexComplete = false;
+        } catch { indexComplete = false; }
+      }));
+    }
+    for (const { doc, scored, cid, msgIndex, pid } of eligible) {
+      if (!availableCids.has(cid)) continue;
       const result: ChatCandidate = {
         kind: 'chat',
         cid: doc.cid,
@@ -625,7 +693,7 @@ export async function searchChatsWithStatus(
         // ranking full-query matches first; the row list they cut down to is
         // otherwise re-sorted by raw score and loses the tier.
         term_coverage: scored.coverage,
-        sourceFile: '',
+        sourceFile: filesByCid.get(cid)!,
         sourceIndex: msgIndex,
       };
       if (pid) {
@@ -633,39 +701,74 @@ export async function searchChatsWithStatus(
         const name = displayCatalog.pidToName.get(pid);
         if (name) (result as any).project_name = name;
       }
-      return result;
-    },
-    true,
-  );
+      candidates.push(result);
+      if (candidates.length >= limit) break;
+    }
+  }
+
+  // A cold query can otherwise parse hundreds of megabytes across up to 200
+  // histories before any category is displayed. Ranked metadata already has
+  // the exact message position needed for navigation; enrich it afterwards.
+  // Visibility-filtered history tools must still inspect their source rows.
+  if (metadataPreview) {
+    const pendingWrites = indexer.hasDeferredChatWrites(userId);
+    const currentCatalog = await _getChatDisplayCatalog(userId);
+    return {
+      results: candidates.filter(row => !currentCatalog.excluded.has(String(row.cid))).map(({ sourceFile, sourceIndex, ...result }) => result),
+      indexComplete: indexComplete && currentCatalog.ownershipComplete && !pendingWrites,
+      indexBuilding: status.chat_index_building,
+      snippetsPending: candidates.length > 0 || pendingWrites,
+    };
+  }
 
   const byFile = new Map<string, Set<number>>();
-  const filesByCid = new Map<string, string>();
+  const sourceCids = new Map<string, string>();
+  const requested = options.snippetRefs && new Set(options.snippetRefs.slice(0, 32).map(ref => `${ref.cid}:${ref.msg_index}`));
   for (const candidate of candidates) {
-    const cid = String(candidate.cid);
-    let file = filesByCid.get(cid);
-    if (!file) {
-      // Resolve only selected conversations, not every scored document. An
-      // explicit global hint avoids rediscovering catalog ownership on disk.
-      const pid = displayCatalog.cidToPid.get(cid);
-      file = conversationMessageReadFile(userId, cid, pid || (displayCatalog.titles.has(cid) ? null : undefined));
-      filesByCid.set(cid, file);
-    }
-    candidate.sourceFile = file;
+    if (requested && !requested.has(`${candidate.cid}:${candidate.msg_index}`)) continue;
     const indexes = byFile.get(candidate.sourceFile) || new Set<number>();
     indexes.add(candidate.sourceIndex);
     byFile.set(candidate.sourceFile, indexes);
+    sourceCids.set(candidate.sourceFile, String(candidate.cid));
   }
   const sourceRows = new Map<string, Map<number, ChatSnippet | undefined>>();
+  let lastPublication = -Infinity, publications = 0;
   await Promise.all(Array.from(byFile, async ([file, indexes]) => {
-    try { sourceRows.set(file, await readChatSnippets(file, indexes, tokens)); }
+    try { sourceRows.set(file, await readChatSnippets(file, indexes, tokens, options.signal, { userId, cid: sourceCids.get(file)! })); }
     catch { sourceRows.set(file, new Map()); } // Source changes/missing files are repaired by reconciliation.
+    if (options.onProgress && !options.signal?.aborted && publications < 10 && Date.now() - lastPublication >= 50) {
+      lastPublication = Date.now(); publications++;
+      options.onProgress(candidates.map(({ sourceFile, sourceIndex, ...row }) => {
+        const { visible: _visible, ...snippet } = sourceRows.get(sourceFile)?.get(sourceIndex) || { visible: false };
+        return { ...row, ...snippet, ...(requested && sourceRows.has(sourceFile) && requested.has(`${row.cid}:${row.msg_index}`) ? { snippet_loaded: true } : {}) };
+      }));
+    }
   }));
+  if (options.signal?.aborted) return { results: [], indexComplete: false, indexBuilding: false };
+  // Missing projections can also mean a temporarily unavailable snippet worker.
+  // Keep usable metadata for existing sources; never turn an unlinked history
+  // into an empty-snippet ghost. Recheck only affected files, once per source.
+  const unresolvedFiles = [...byFile.keys()].filter(file => {
+    const rows = sourceRows.get(file);
+    return [...byFile.get(file)!].some(index => !rows?.get(index));
+  });
+  const missingFiles = new Set<string>();
+  for (let start = 0; start < unresolvedFiles.length; start += 32) {
+    await Promise.all(unresolvedFiles.slice(start, start + 32).map(async file => {
+      try { if (!(await fsp.stat(file)).isFile()) missingFiles.add(file); }
+      catch { missingFiles.add(file); }
+    }));
+  }
+  const currentCatalog = await _getChatDisplayCatalog(userId);
+  indexComplete = indexComplete && currentCatalog.ownershipComplete;
   const results = candidates.flatMap(({ sourceFile, sourceIndex, ...result }) => {
+    if (currentCatalog.excluded.has(String(result.cid))) return [];
+    if (requested && !requested.has(`${result.cid}:${result.msg_index}`)) return [result];
     const projected = sourceRows.get(sourceFile)?.get(sourceIndex);
     if (!projected) indexComplete = false;
-    if (options.userVisibleOnly && !projected?.visible) return [];
+    if (missingFiles.has(sourceFile) || (options.userVisibleOnly && !projected?.visible)) return [];
     const { visible: _visible, ...snippet } = projected || { visible: false, snippet: '' };
-    return [{ ...result, ...snippet }];
+    return [{ ...result, ...snippet, ...(requested ? { snippet_loaded: true } : {}) }];
   });
   return { results, indexComplete, indexBuilding: status.chat_index_building };
 }
@@ -784,6 +887,67 @@ export async function searchSkills(
   return scored.slice(0, _boundedSearchLimit(limit));
 }
 
+/** Return one hit per visible catalog card, plus this account's custom names.
+ * Transport, grants, account labels and tool schemas never enter search text or results. */
+export async function searchConnectors(userId: string, query: string, limit = DEFAULT_PER_KIND): Promise<SearchResult[]> {
+  const qLower = query.trim().toLowerCase();
+  if (!qLower) return [];
+  const [{ connectorCatalog }, { listCustomSearchNames }, { catalogWithAvailability }, config, i18n] = await Promise.all([
+    import('../connectors/catalog'), import('../connectors/search-listings'),
+    import('../connectors/availability'), import('../config'), import('../../i18n'),
+  ]);
+  const lang = config.resolveLanguageForUser(userId);
+  const table = i18n.getRendererTable(lang);
+  const catalog = catalogWithAvailability(connectorCatalog());
+  const byId = new Map(catalog.map(entry => [entry.id, entry]));
+  const children = new Map<string, typeof catalog>();
+  const bundled = new Set<string>();
+  for (const entry of catalog) {
+    if (entry.catalog_parent_id) {
+      const rows = children.get(entry.catalog_parent_id) || [];
+      rows.push(entry);
+      children.set(entry.catalog_parent_id, rows);
+    }
+    for (const id of entry.bundle_member_ids || []) bundled.add(id);
+  }
+  const nameFor = (entry: (typeof catalog)[number]): string => lang.startsWith('zh')
+    ? entry.display_name_zh || entry.display_name || entry.id
+    : entry.display_name_en || entry.display_name || entry.id;
+  const descriptionFor = (entry: (typeof catalog)[number]): string =>
+    table[`connectors.catalog.${entry.id}.description`]
+    || entry[`description_${lang}`] || entry.description_en || entry.description_zh || '';
+  const results: SearchResult[] = [];
+  for (const entry of catalog) {
+    if (entry.catalog_parent_id || bundled.has(entry.id)) continue;
+    const name = nameFor(entry);
+    const description = descriptionFor(entry);
+    const variants = [
+      entry, ...(children.get(entry.id) || []),
+      ...(entry.bundle_member_ids || []).flatMap(id => byId.get(id) || []),
+      ...(entry.connection_variants || []).flatMap(variant => byId.get(variant.catalog_id) || []),
+    ];
+    let score = 0;
+    let snippet = '';
+    for (const variant of variants) {
+      const desc = descriptionFor(variant);
+      const match = Math.max(_matchScore(nameFor(variant), desc, qLower), _matchScore(variant.id, '', qLower));
+      if (match <= score) continue;
+      score = match;
+      snippet = _descSnippet(desc, qLower);
+    }
+    if (score) results.push({ kind: 'connector', id: entry.id, name, description, snippet, source: 'builtin', score });
+  }
+  for (const instance of await listCustomSearchNames(userId)) {
+    const score = _matchScore(instance.display_name, '', qLower);
+    if (score) results.push({
+      kind: 'connector', id: instance.id, name: instance.display_name,
+      description: '', snippet: '', source: 'custom', score,
+    });
+  }
+  return results.sort((a, b) => b.score - a.score || String(a.name).localeCompare(String(b.name)))
+    .slice(0, _boundedSearchLimit(limit));
+}
+
 async function _hasPersistedIndex(file: string): Promise<boolean> {
   try {
     const st = await fsp.stat(file);
@@ -893,7 +1057,83 @@ async function _unlinkLegacyIndexes(uid: string): Promise<void> {
   }
 }
 
-export interface SearchAllOptions { limit?: number; scope?: 'all' | 'context' | 'chat' | 'agent' | 'skill'; projectId?: string }
+export interface SearchAllOptions {
+  chatSnippetRefs?: Array<{ cid: string; msg_index: number }>;
+  signal?: AbortSignal;
+  limit?: number;
+  scope?: 'all' | SearchResult['kind'];
+  projectId?: string;
+  includeLibraryContent?: boolean;
+  includeChatSnippets?: boolean;
+}
+
+/** Read the same account-local snapshots as the Automation and To-do pages,
+ * including inactive/completed work. */
+async function _searchTaskResources(
+  userId: string, query: string, limit: number, scope: SearchAllOptions['scope'], signal?: AbortSignal,
+): Promise<SearchResult[]> {
+  const { listProjectNameRows } = await import('../projects');
+  const projects = await listProjectNameRows(userId);
+  if (signal?.aborted) return [];
+  const projectNames = new Map(projects.map(project => [project.project_id, project.name]));
+  const qLower = query.toLowerCase();
+  const results: SearchResult[][] = [];
+  const operations: Promise<void>[] = [];
+  const keep = (rows: SearchResult[], position: number): void => {
+    rows.sort((a, b) => b.score - a.score || String(a.name).localeCompare(String(b.name)));
+    results[position] = rows.slice(0, limit);
+  };
+  if (scope === 'all' || scope === 'automation') {
+    operations.push((async () => {
+      const { listTaskSearchRows } = await import('../auto_tasks');
+      const rows: SearchResult[] = [];
+      for (const task of await listTaskSearchRows(userId)) {
+        const name = task.title || task.content.slice(0, SNIPPET_RADIUS * 2);
+        const score = _matchScore(name, task.content, qLower);
+        if (!score) continue;
+        rows.push({
+          kind: 'automation', id: task.id, name, score,
+          snippet: _descSnippet(task.content, qLower), enabled: task.enabled,
+          project_id: task.project_id || '', project_name: projectNames.get(task.project_id || '') || '',
+        });
+      }
+      keep(rows, 0);
+    })());
+  }
+  if (scope === 'all' || scope === 'todo') {
+    operations.push((async () => {
+      const { listTaskSearchRows } = await import('../project_tasks');
+      const rows: SearchResult[] = [];
+      // Independent snapshots overlap, with four scopes at most. Retain the
+      // canonical shared-project resolver and deterministic scope ordering.
+      const scopes = [{ project_id: '', name: '' }, ...projects];
+      const snapshots: Awaited<ReturnType<typeof listTaskSearchRows>>[] = [];
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(4, scopes.length) }, async () => {
+        while (next < scopes.length && !signal?.aborted) {
+          const index = next++;
+          const project = scopes[index];
+          snapshots[index] = await listTaskSearchRows(userId, project.project_id, project);
+        }
+      }));
+      for (const [index, project] of scopes.entries()) {
+        for (const task of snapshots[index] || []) {
+          const name = task.content.slice(0, SNIPPET_RADIUS * 2);
+          const score = _matchScore(name, task.content, qLower);
+          if (!score) continue;
+          rows.push({
+            kind: 'todo', id: task.id, name, score,
+            snippet: _descSnippet(task.content, qLower), status: task.status,
+            project_id: project.project_id, project_name: project.name,
+          });
+        }
+      }
+      keep(rows, 1);
+    })());
+  }
+  await Promise.all(operations);
+  return results.flat();
+}
 
 function _dedupeSearchResults(results: SearchResult[]): SearchResult[] {
   const out: SearchResult[] = [];
@@ -937,8 +1177,8 @@ function _limitSearchResults(
   // A single large Library or chat bucket must not erase every other result
   // kind before the renderer can build its tabs. Reserve an equal first pass,
   // then fill unused capacity by relevance from all remaining rows.
-  const kinds: SearchResult['kind'][] = ['chat', 'agent', 'skill', 'context'];
-  const quota = Math.floor(limit / kinds.length);
+  const kinds: SearchResult['kind'][] = ['chat', 'agent', 'skill', 'context', 'automation', 'todo', 'connector'];
+  const quota = Math.max(1, Math.floor(limit / kinds.length));
   const selected = new Set<SearchResult>();
   const out: SearchResult[] = [];
   if (quota > 0) {
@@ -950,6 +1190,7 @@ function _limitSearchResults(
         ? results.filter((row) => row.kind === 'chat').sort(_byChatRank)
         : ranked.filter((row) => row.kind === kind);
       for (const result of contenders.slice(0, quota)) {
+        if (out.length >= limit) break;
         selected.add(result);
         out.push(result);
       }
@@ -965,50 +1206,96 @@ function _limitSearchResults(
 }
 
 export async function searchAll(
-  userId: string, query: string, { limit = 30, scope = 'all', projectId }: SearchAllOptions = {},
+  userId: string, query: string, {
+    limit = 30, scope = 'all', projectId, includeLibraryContent = true, includeChatSnippets = true, signal,
+  }: SearchAllOptions = {},
 ): Promise<{
   results: SearchResult[];
   total?: number;
   degradation_code?: SearchDegradationCode | 'multiple';
   chat_index_complete?: boolean;
   chat_index_building?: boolean;
+  library_content_pending?: boolean;
+  chat_snippets_pending?: boolean;
 }> {
   const q = (query || '').trim();
   if (!q) return { results: [] };
+  const startedAt = Date.now();
+  const phaseMs: Record<string, number> = {};
+  const timed = async <T>(phase: string, operation: () => Promise<T>): Promise<T> => {
+    const start = Date.now();
+    try { return await operation(); }
+    finally { phaseMs[phase] = Math.max(0, Date.now() - start); }
+  };
   const requestedLimit = _boundedSearchLimit(limit);
   const buckets: SearchResult[] = [];
   const degradations = new Set<SearchDegradationCode>();
   let chatIndexComplete: boolean | undefined;
   let chatIndexBuilding: boolean | undefined;
+  let libraryContentPending = false;
+  let chatSnippetsPending = false;
   const tasks: Array<Promise<void>> = [];
   if (scope === 'all' || scope === 'context') {
-    tasks.push(searchContexts(q, userId, requestedLimit).then((r) => { buckets.push(...r); }));
-    tasks.push((
+    tasks.push(timed('library_paths_ms', () => searchContexts(q, userId, requestedLimit)).then((r) => { buckets.push(...r); }));
+    tasks.push(timed('project_paths_ms', () => (
       projectId
         ? searchProjectContexts(userId, projectId, q, requestedLimit)
         : _searchAllProjectContextPaths(userId, q, requestedLimit)
-    ).then((r) => { buckets.push(...r); }));
-    tasks.push(searchLibraryContents(userId, q, {
+    )).then((r) => { buckets.push(...r); }));
+    if (includeLibraryContent) tasks.push(timed('library_body_ms', () => searchLibraryContents(userId, q, {
       ...(projectId ? { projectId } : {}),
       limit: requestedLimit,
       onDegraded: (code) => degradations.add(code),
-    }).then((r) => { buckets.push(...r); }));
+      signal,
+    })).then((r) => { buckets.push(...r); }));
+    else tasks.push(timed('library_preflight_ms', () => _libraryContentSearchProvider().then(async provider => {
+      libraryContentPending = provider.hasSources ? await provider.hasSources(userId, projectId) : true;
+    }).catch(() => {
+      // An optional preflight must not erase healthy local results. The
+      // complete query owns the established semantic degradation contract.
+      libraryContentPending = true;
+    })));
   }
   if (scope === 'all' || scope === 'chat') {
-    tasks.push(searchChatsWithStatus(userId, q, { limit: requestedLimit }).then((page) => {
+    tasks.push(timed('chat_ms', () => searchChatsWithStatus(userId, q, {
+      limit: requestedLimit, includeSnippets: includeChatSnippets, signal,
+    })).then((page) => {
       buckets.push(...page.results);
       chatIndexComplete = page.indexComplete;
       chatIndexBuilding = page.indexBuilding;
+      chatSnippetsPending = page.snippetsPending === true;
     }));
   }
   if (scope === 'all' || scope === 'agent') {
-    tasks.push(searchAgents(userId, q, requestedLimit).then((r) => { buckets.push(...r); }));
+    tasks.push(timed('agents_ms', () => searchAgents(userId, q, requestedLimit)).then((r) => { buckets.push(...r); }));
   }
   if (scope === 'all' || scope === 'skill') {
-    tasks.push(searchSkills(userId, q, requestedLimit).then((r) => { buckets.push(...r); }));
+    tasks.push(timed('skills_ms', () => searchSkills(userId, q, requestedLimit)).then((r) => { buckets.push(...r); }));
+  }
+  if (scope === 'all' || scope === 'automation' || scope === 'todo') {
+    tasks.push(timed('tasks_ms', () => _searchTaskResources(userId, q, requestedLimit, scope, signal)).then((r) => { buckets.push(...r); }));
+  }
+  if (scope === 'all' || scope === 'connector') {
+    tasks.push(timed('connectors_ms', () => searchConnectors(userId, q, requestedLimit)).then((r) => { buckets.push(...r); }));
   }
   await Promise.all(tasks);
-  const merged = _dedupeSearchResults(buckets);
+  // Other categories (especially semantic Library retrieval) may finish long
+  // after chat search. A deletion in that interval must also win at the final
+  // merge boundary, before quotas and counts are calculated.
+  const chatCatalog = buckets.some(row => row.kind === 'chat') ? await _getChatDisplayCatalog(userId) : undefined;
+  if (chatCatalog && !chatCatalog.ownershipComplete) chatIndexComplete = false;
+  const merged = _dedupeSearchResults(buckets.filter(row => row.kind !== 'chat' || !chatCatalog?.excluded.has(String(row.cid))));
+  const finishedAt = Date.now();
+  // Local diagnostics only: one record per minute, fixed phase names and no
+  // query, account, path or resource identity. Phase wall times overlap.
+  if (finishedAt - startedAt >= 500 && finishedAt - _slowSearchLoggedAt >= 60_000) {
+    _slowSearchLoggedAt = finishedAt;
+    log.info('slow global search', {
+      mode: includeChatSnippets && includeLibraryContent ? 'complete' : 'preview',
+      scope: ['all', 'chat', 'context', 'agent', 'skill', 'automation', 'todo', 'connector'].includes(scope) ? scope : 'unknown',
+      duration_ms: finishedAt - startedAt, result_count: merged.length, ...phaseMs,
+    });
+  }
   const degradationCode = degradations.size > 1
     ? 'multiple'
     : degradations.values().next().value;
@@ -1018,5 +1305,140 @@ export async function searchAll(
     ...(chatIndexComplete !== undefined ? { chat_index_complete: chatIndexComplete } : {}),
     ...(chatIndexBuilding !== undefined ? { chat_index_building: chatIndexBuilding } : {}),
     ...(degradationCode ? { degradation_code: degradationCode } : {}),
+    ...(!includeLibraryContent ? { library_content_pending: libraryContentPending } : {}),
+    ...(!includeChatSnippets ? { chat_snippets_pending: chatSnippetsPending } : {}),
   };
+}
+
+export interface SearchProgress {
+  results: SearchResult[];
+  pending_kinds: SearchResult['kind'][];
+  failed_kinds: SearchResult['kind'][];
+  chat_index_building?: boolean;
+  chat_index_complete?: boolean;
+}
+
+/** Desktop-only progressive retrieval. Each module publishes independently;
+ * complete invoke/history callers retain searchAll's existing settlement contract.
+ * Metadata and enrichment publish bounded snapshots; chat files can publish up
+ * to ten intermediate completions while slower sources remain pending. */
+export async function* streamSearch(
+  userId: string, query: string, options: SearchAllOptions = {}, signal?: AbortSignal,
+): AsyncGenerator<SearchProgress> {
+  const kinds: SearchResult['kind'][] = ['chat', 'todo', 'automation', 'agent', 'skill', 'connector', 'context'];
+  const selected = options.scope && options.scope !== 'all' ? kinds.filter(kind => kind === options.scope) : kinds;
+  const controller = new AbortController();
+  const abort = () => { controller.abort(); wake?.(); };
+  let wake: (() => void) | undefined;
+  if (signal?.aborted) controller.abort(); else signal?.addEventListener('abort', abort, { once: true });
+  const pending = new Set(selected), failed = new Set<SearchResult['kind']>();
+  const buckets = new Map<SearchResult['kind'], SearchResult[]>();
+  const startedAt = Date.now(), phaseMs: Record<string, number> = {};
+  let chatIndexComplete: boolean | undefined, chatIndexBuilding: boolean | undefined;
+  let dirty = 0, published = 0;
+  const changed = () => { dirty++; wake?.(); wake = undefined; };
+  const detailsAt = Date.now() + (options.chatSnippetRefs ? 0 : 200);
+  const quiet = async () => {
+    const { setTimeout } = await import('node:timers/promises');
+    await setTimeout(Math.max(0, detailsAt - Date.now()), undefined, { signal: controller.signal });
+  };
+  const readChatDetails = async () => {
+    const detailStarted = Date.now();
+    const full = await searchChatsWithStatus(userId, query, { limit: options.limit, signal: controller.signal,
+      snippetRefs: options.chatSnippetRefs,
+      onProgress: results => { buckets.set('chat', results); changed(); },
+    });
+    phaseMs.chat_snippets_ms = Date.now() - detailStarted;
+    if (controller.signal.aborted) return;
+    buckets.set('chat', full.results); chatIndexComplete = full.indexComplete; chatIndexBuilding = full.indexBuilding;
+  };
+  for (const kind of selected) void (async () => {
+    const moduleStarted = Date.now();
+    try {
+      if (controller.signal.aborted) return;
+      // A summary batch fills rows the renderer already shows. A metadata
+      // preview here would only rank the corpus again on the main thread.
+      if (kind === 'chat' && options.chatSnippetRefs?.length) { await readChatDetails(); return; }
+      const preview = async () => {
+        const page = await searchAll(userId, query, { ...options, scope: kind,
+          includeLibraryContent: false, includeChatSnippets: false, signal: controller.signal });
+        if (controller.signal.aborted) return page;
+        buckets.set(kind, page.results);
+        if (kind === 'chat') { chatIndexComplete = page.chat_index_complete; chatIndexBuilding = page.chat_index_building; }
+        return page;
+      };
+      // Sampled before ranking: a message queued ahead of this submit may match
+      // but be invisible to the preview, and the first page has no follow-up
+      // query to correct a false "no results". Later writes are not waited for.
+      const settleWrites = kind === 'chat' && options.chatSnippetRefs?.length === 0 && indexer.hasDeferredChatWrites(userId);
+      const page = await preview();
+      phaseMs[`${kind}_preview_ms`] = Date.now() - moduleStarted;
+      if (controller.signal.aborted) return;
+      if (settleWrites) {
+        changed();
+        await indexer.drainDeferredChatWrites(userId);
+        if (!controller.signal.aborted) await preview();
+        return;
+      }
+      const enrich = (page.chat_snippets_pending && !options.chatSnippetRefs) || page.library_content_pending;
+      if (enrich) {
+        changed();
+        await quiet();
+        if (controller.signal.aborted) return;
+        if (kind === 'chat') await readChatDetails();
+        else {
+          const detailStarted = Date.now();
+          const bodies = await searchLibraryContents(userId, query, { limit: options.limit, projectId: options.projectId,
+            onDegraded: () => failed.add(kind), signal: controller.signal });
+          phaseMs.library_body_ms = Date.now() - detailStarted;
+          if (controller.signal.aborted) return;
+          buckets.set(kind, _dedupeSearchResults([...page.results, ...bodies]));
+        }
+      }
+    } catch {
+      if (!controller.signal.aborted) {
+        failed.add(kind);
+        const now = Date.now(), previous = _progressWarnings.get(kind);
+        if (previous === undefined || now < previous || now - previous >= 60_000) {
+          _progressWarnings.set(kind, now);
+          log.warn('progressive search module unavailable', { kind });
+        }
+      }
+    } finally { phaseMs[`${kind}_ms`] = Date.now() - moduleStarted; pending.delete(kind); changed(); }
+  })();
+  try {
+    while (!controller.signal.aborted) {
+      if (dirty !== published) {
+        published = dirty;
+        let results = [...buckets.values()].flat();
+        // A task can be deleted while a different module is still running.
+        // Revalidate every publication, including already computed snippets.
+        if (results.some(row => row.kind === 'chat')) {
+          const catalog = await _getChatDisplayCatalog(userId);
+          results = results.filter(row => row.kind !== 'chat' || !catalog.excluded.has(String(row.cid)));
+          if (!catalog.ownershipComplete) chatIndexComplete = false;
+        }
+        if (controller.signal.aborted) break;
+        if (dirty !== published) continue;
+        const finishedAt = Date.now();
+        if (!pending.size && finishedAt - startedAt >= 500 && finishedAt - _slowSearchLoggedAt >= 60_000) {
+          _slowSearchLoggedAt = finishedAt;
+          log.info('slow global search', { mode: 'progressive', scope: options.scope || 'all',
+            duration_ms: finishedAt - startedAt, result_count: results.length, ...phaseMs });
+        }
+        yield { results: _limitSearchResults(_dedupeSearchResults(results), _boundedSearchLimit(options.limit), options.scope || 'all'),
+          pending_kinds: selected.filter(kind => pending.has(kind)), failed_kinds: selected.filter(kind => failed.has(kind)),
+          chat_index_complete: chatIndexComplete, chat_index_building: chatIndexBuilding };
+      }
+      if (dirty !== published) continue;
+      // An abort delivered while the consumer held this generator at its yield
+      // has no pending wake; a module behind a live write may not finish soon.
+      if (controller.signal.aborted || !pending.size) break;
+      await new Promise<void>(resolve => { wake = resolve; });
+    }
+  } finally {
+    controller.abort();
+    buckets.clear();
+    signal?.removeEventListener('abort', abort);
+  }
 }

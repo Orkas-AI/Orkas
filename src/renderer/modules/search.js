@@ -1,5 +1,5 @@
 // ─── Global search (Cmd+K) ───────────────────────────────────────────────
-// Live-search the Library + chat history (per-user). Results are
+// Search submitted account queries, including automations and to-dos. Results are
 // grouped by kind; clicking one navigates to the source. Search history is
 // persisted in localStorage per user.
 
@@ -11,9 +11,17 @@ const _SEARCH_HISTORY_KEY = 'search_history';
 const _SEARCH_HISTORY_MAX = 12;
 const _SEARCH_FETCH_LIMIT = 200;   // backend cap; we filter/slice locally per tab
 const _SEARCH_ALL_PER_SECTION = 10; // "all" tab shows up to N per section, overflow → "view more"
+const _SEARCH_PRESS_HOLD_MAX_MS = 2000; // a lost mouse release must not freeze result paints
 let _searchTimer = null;
 let _searchSeq = 0;
-let _searchTab = 'all';             // 'all' | 'chat' | 'agent' | 'skill' | 'context'
+let _searchStreamHandle = null;
+let _searchSnippetHandle = null;
+let _searchSnippetTimer = null;
+let _searchSnippetCache = new Map();
+let _searchSnippetAttempted = new Set();
+let _searchPendingKinds = [];
+let _searchFailedKinds = [];
+let _searchTab = 'all';
 let _searchResults = [];
 let _searchActiveIdx = -1;
 let _searchLastQuery = '';
@@ -21,24 +29,16 @@ let _searchLastQuery = '';
 // (an unverified index waiting for its idle repair) stays quiet.
 let _searchChatIndexBuilding = false;
 let _searchLoading = false;
+let _searchChatSnippetsFailed = false;
 const _SEARCH_FAILURE_DEDUPE_MS = 60 * 1000;
 const _SEARCH_FAILURE_MAX_KEYS = 16;
 const _SEARCH_FAILURE_STAGES = new Set(['request', 'response', 'partial']);
 const _searchFailureState = new Map();
 const _SEARCH_RESULT_STAGES = new Set(['request', 'response', 'partial', 'complete', 'superseded']);
-const _SEARCH_DEGRADATION_CODES = new Set([
-  'library_content_embedding_unavailable',
-  'library_global_content_unavailable',
-  'library_project_catalog_unavailable',
-  'library_project_content_unavailable',
-  'multiple',
-]);
 const _SEARCH_FAILURE_CODES = new Set([
   'search_failed',
   'search_request_failed',
-  'search_rejected',
   'search_degraded',
-  ..._SEARCH_DEGRADATION_CODES,
 ]);
 
 function _searchFailureCode(value, fallback) {
@@ -46,11 +46,6 @@ function _searchFailureCode(value, fallback) {
   if (_SEARCH_FAILURE_CODES.has(raw)) return raw;
   const safeFallback = String(fallback || '').trim().toLowerCase();
   return _SEARCH_FAILURE_CODES.has(safeFallback) ? safeFallback : 'search_failed';
-}
-
-function _searchDegradationErrorCode(value) {
-  const code = String(value || '').trim();
-  return _SEARCH_DEGRADATION_CODES.has(code) ? code : 'search_degraded';
 }
 
 function _reportGlobalSearchFailure(stage, error, fallbackCode) {
@@ -83,6 +78,12 @@ function _bindGlobalSearch() {
   // (Step 7 in the main-screen redesign — confirmed by user).
   document.getElementById('contexts-page-header-search')?.addEventListener('click', () => openGlobalSearch('library_header'));
   document.getElementById('search-close-btn')?.addEventListener('click', closeGlobalSearch);
+  const body = document.getElementById('search-body');
+  if (body && !body.dataset.snippetsBound) {
+    body.dataset.snippetsBound = '1';
+    body.addEventListener('scroll', _scheduleVisibleChatSnippets, { passive: true });
+    body.addEventListener('mousedown', _holdSearchPaintsForPress);
+  }
   const input = document.getElementById('search-input');
   if (input && !input.dataset.bound) {
     input.dataset.bound = '1';
@@ -115,12 +116,14 @@ function _bindGlobalSearch() {
   });
 }
 
-const _SEARCH_VALID_TABS = new Set(['all', 'chat', 'agent', 'skill', 'context']);
+const _SEARCH_VALID_TABS = new Set(['all', 'chat', 'agent', 'skill', 'context', 'automation', 'todo', 'connector']);
 function _setSearchTab(tab) {
   if (!tab || !_SEARCH_VALID_TABS.has(tab)) return;
   _searchTab = tab;
   document.querySelectorAll('.search-tab').forEach((b) => {
     b.classList.toggle('is-active', b.dataset.tab === tab);
+    b.setAttribute('aria-selected', b.dataset.tab === tab ? 'true' : 'false');
+    if (b.dataset.tab === tab) b.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   });
   _renderSearchResults(_searchLastQuery);
 }
@@ -134,6 +137,9 @@ function openGlobalSearch(entryPoint = 'unknown') {
   if (input) {
     input.value = '';
     _searchLoading = false;
+    _searchPendingKinds = [];
+    _searchFailedKinds = [];
+    _searchChatSnippetsFailed = false;
     _searchResults = [];
     _searchActiveIdx = -1;
     _searchLastQuery = '';
@@ -164,7 +170,11 @@ function closeGlobalSearch() {
   // flight so it cannot repaint hidden state or report a failure the user no
   // longer encountered.
   _searchSeq++;
+  _cancelSearchStream();
   _searchLoading = false;
+  _searchPendingKinds = [];
+  _searchFailedKinds = [];
+  _searchChatSnippetsFailed = false;
   overlay.style.display = 'none';
   if (_searchTimer) { clearTimeout(_searchTimer); _searchTimer = null; }
 }
@@ -172,14 +182,18 @@ function closeGlobalSearch() {
 function _scheduleSearch(query) {
   if (_searchTimer) clearTimeout(_searchTimer);
   _searchTimer = null;
-  // Invalidate at input time, including the debounce window.
+  const wasLoading = _searchLoading || _searchPendingKinds.length > 0 || !!_searchSnippetHandle;
+  // Invalidate immediately when editing a submitted query.
   _searchSeq++;
+  _cancelSearchStream();
   if (!query.trim()) { void _runSearchNow(''); return; }
-  _showSearchLoading(query.trim());
-  // Library body search embeds the settled query once. A slightly longer
-  // debounce avoids running native inference for every intermediate IME or
-  // fast-typing state while keeping filename/chat feedback responsive.
-  _searchTimer = setTimeout(() => _runSearchNow(query), 300);
+  // Editing a draft cancels obsolete work; only Enter submits the new query.
+  _searchLoading = false;
+  _searchPendingKinds = [];
+  // A keystroke changes no result, so only cancelled progress needs painting.
+  if (!wasLoading) { _scheduleVisibleChatSnippets(); return; }
+  if (_searchLastQuery) _renderSearchResults(_searchLastQuery);
+  else _renderSearchEmptyState();
 }
 
 function _activeProjectIdForSearch() {
@@ -219,6 +233,7 @@ async function _refreshSearchIndexStatus(seq, query, pending) {
 
 function _showSearchLoading(query) {
   _searchLoading = true;
+  _searchChatSnippetsFailed = false;
   _searchResults = [];
   _searchVisibleResults = [];
   _searchActiveIdx = -1;
@@ -228,11 +243,15 @@ function _showSearchLoading(query) {
 }
 
 async function _runSearchNow(queryArg) {
+  _cancelSearchStream();
+  _searchPendingKinds = [];
+  _searchFailedKinds = [];
   if (_searchTimer) { clearTimeout(_searchTimer); _searchTimer = null; }
   const input = document.getElementById('search-input');
   const query = (queryArg !== undefined ? queryArg : (input?.value || '')).trim();
   if (!query) {
     _searchLoading = false;
+    _searchChatSnippetsFailed = false;
     _searchSeq++;
     _searchResults = [];
     _searchVisibleResults = [];
@@ -250,51 +269,153 @@ async function _runSearchNow(queryArg) {
   _showSearchLoading(query);
   const pending = { active: true };
   void _refreshSearchIndexStatus(seq, query, pending);
-  try {
-    const res = await apiFetch('/api/search/global', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        query,
-        scope: 'all',
-        limit: _SEARCH_FETCH_LIMIT,
-        ...(projectId ? { projectId } : {}),
-      }),
-    });
-    const data = await res.json();
-    if (seq !== _searchSeq) {
-      return;     // a newer query arrived; drop this
-    }
-    _searchLoading = false;
-    if (!data.ok) {
-      const failure = _reportGlobalSearchFailure('response', data, 'search_rejected');
-      _renderSearchError(data.error);
-      return;
-    }
-    let degradation = null;
-    if (data.degradation_code) {
-      degradation = _reportGlobalSearchFailure('partial', {
-        code: _searchDegradationErrorCode(data.degradation_code),
-      }, 'search_degraded');
-    }
-    _searchChatIndexBuilding = data.chat_index_building === true;
-    _searchResults = data.results || [];
-    _searchLastQuery = query;
-    _setSearchTabsVisible(true);
+  await _runProgressiveSearch(query, seq, startedAt, projectId, pending);
+}
+
+function _cancelSearchStream() {
+  const handle = _searchStreamHandle;
+  _searchStreamHandle = null;
+  if (handle) handle.cancel();
+  if (_searchSnippetTimer) { clearTimeout(_searchSnippetTimer); _searchSnippetTimer = null; }
+  const snippets = _searchSnippetHandle;
+  _searchSnippetHandle = null;
+  if (snippets) snippets.cancel();
+}
+
+function _scheduleVisibleChatSnippets() {
+  if (_searchSnippetHandle || !_searchLastQuery) return;
+  const input = document.getElementById('search-input');
+  if (input && input.value.trim() !== _searchLastQuery) return;
+  if (_searchSnippetTimer) clearTimeout(_searchSnippetTimer);
+  _searchSnippetTimer = setTimeout(() => { _searchSnippetTimer = null; void _loadVisibleChatSnippets(); }, 40);
+}
+
+async function _loadVisibleChatSnippets() {
+  if (_searchSnippetHandle) return;
+  const body = document.getElementById('search-body');
+  if (!body?.getBoundingClientRect) return;
+  const bounds = body.getBoundingClientRect();
+  const refs = [];
+  for (const element of body.querySelectorAll('.search-result')) {
+    const row = _searchVisibleResults[Number(element.dataset.idx)];
+    if (row?.kind !== 'chat') continue;
+    const key = `${row.cid}:${row.msg_index}`;
+    if (_searchSnippetAttempted.has(key)) continue;
+    const rect = element.getBoundingClientRect();
+    if (rect.bottom < bounds.top - 120 || rect.top > bounds.bottom + 120) continue;
+    refs.push({ cid: row.cid, msg_index: row.msg_index });
+    if (refs.length === 20) break;
+  }
+  if (!refs.length) return;
+  const seq = _searchSeq, query = _searchLastQuery;
+  refs.forEach(ref => _searchSnippetAttempted.add(`${ref.cid}:${ref.msg_index}`));
+  let handle, failed = false, complete = false;
+  const repaint = () => {
+    const top = body.scrollTop;
+    const anchor = body.querySelector('.search-result.active');
+    const rect = anchor?.getBoundingClientRect();
+    const bounds = body.getBoundingClientRect();
+    const visible = rect && rect.bottom > bounds.top && rect.top < bounds.bottom;
     _renderSearchResults(query);
-  } catch (e) {
-    if (seq !== _searchSeq) {
-      return;
+    body.scrollTop = top;
+    const retained = visible && body.querySelector('.search-result.active');
+    if (retained) body.scrollTop += retained.getBoundingClientRect().top - rect.top;
+  };
+  try {
+    handle = window.orkas.stream('search.global', { query, scope: 'chat', limit: _SEARCH_FETCH_LIMIT, chatSnippetRefs: refs }, message => {
+      if (seq !== _searchSeq) return;
+      if (message.type === 'error') { failed = true; return; }
+      const page = message.event;
+      if (message.type !== 'event' || !Array.isArray(page?.results)) return;
+      failed ||= !!page.failed_kinds?.length;
+      complete = !page.pending_kinds?.length;
+      if (page.failed_kinds?.includes('chat')) return;
+      const eligible = new Set(page.results.map(row => `${row.cid}:${row.msg_index}`));
+      for (const row of page.results) if (row.snippet_loaded) _searchSnippetCache.set(`${row.cid}:${row.msg_index}`, row);
+      _searchResults = _searchResults.filter(row => row.kind !== 'chat' || eligible.has(`${row.cid}:${row.msg_index}`))
+        .map(row => row.kind === 'chat' ? { ...row, ..._searchSnippetCache.get(`${row.cid}:${row.msg_index}`) } : row);
+      repaint();
+    });
+    _searchSnippetHandle = handle;
+    repaint();
+    await handle.promise;
+    if (failed || !complete) throw new Error('Search summaries unavailable');
+  } catch (error) {
+    if (seq === _searchSeq) {
+      if (!_searchChatSnippetsFailed) _reportGlobalSearchFailure('partial', error, 'search_degraded');
+      _searchChatSnippetsFailed = true;
     }
-    _searchLoading = false;
-    const failure = _reportGlobalSearchFailure('request', e, 'search_request_failed');
-    _renderSearchError(e.message || String(e));
   } finally {
-    pending.active = false;
+    if (_searchSnippetHandle === handle) _searchSnippetHandle = null;
+    if (seq === _searchSeq) { repaint(); _scheduleVisibleChatSnippets(); }
   }
 }
 
-// Split results into 4 buckets per the tab-grouping spec:
+async function _runProgressiveSearch(query, seq, startedAt, projectId, pending) {
+  _searchSnippetCache = new Map();
+  _searchSnippetAttempted = new Set();
+  let received = false, complete = false, transportError = false;
+  let handle;
+  const repaint = () => {
+    const body = document.getElementById('search-body');
+    const top = body?.scrollTop || 0;
+    const anchor = body?.querySelector('.search-result.active');
+    const rect = anchor?.getBoundingClientRect();
+    const bounds = anchor ? body.getBoundingClientRect() : null;
+    const visible = rect && rect.bottom > bounds.top && rect.top < bounds.bottom;
+    _renderSearchResults(query);
+    if (body) {
+      body.scrollTop = top;
+      const retained = visible && body.querySelector('.search-result.active');
+      if (retained) body.scrollTop += retained.getBoundingClientRect().top - rect.top;
+    }
+  };
+  try {
+    handle = window.orkas.stream('search.global', { query, scope: 'all', limit: _SEARCH_FETCH_LIMIT, chatSnippetRefs: [],
+      ...(projectId ? { projectId } : {}) }, message => {
+      if (seq !== _searchSeq) return;
+      if (message.type === 'error') { transportError = true; return; }
+      const page = message.event;
+      if (message.type !== 'event' || !page || !Array.isArray(page.results)) return;
+      received = true;
+      _searchLoading = false;
+      _searchPendingKinds = page.pending_kinds || [];
+      _searchFailedKinds = page.failed_kinds || [];
+      complete = !_searchPendingKinds.length;
+      _searchChatSnippetsFailed ||= _searchFailedKinds.includes('chat');
+      if (typeof page.chat_index_building === 'boolean') _searchChatIndexBuilding = page.chat_index_building;
+      _searchResults = page.results.map(row => row.kind === 'chat'
+        ? { ...row, ..._searchSnippetCache.get(`${row.cid}:${row.msg_index}`) } : row);
+      _searchLastQuery = query;
+      _setSearchTabsVisible(true);
+      repaint();
+    });
+    _searchStreamHandle = handle;
+    await handle.promise;
+    if (seq !== _searchSeq) {
+      
+      return;
+    }
+    if (transportError || !received || !complete) throw new Error('Search incomplete');
+    
+  } catch (error) {
+    if (seq !== _searchSeq) {
+      
+      return;
+    }
+    _searchLoading = false;
+    _searchFailedKinds = [...new Set([..._searchFailedKinds, ..._searchPendingKinds])];
+    _searchPendingKinds = [];
+    const failure = _reportGlobalSearchFailure('request', error, 'search_request_failed');
+    
+    if (received) repaint(); else _renderSearchError(t('memory.error_generic'));
+  } finally {
+    pending.active = false;
+    if (_searchStreamHandle === handle) _searchStreamHandle = null;
+  }
+}
+
+// Split results into resource buckets per the tab-grouping spec:
 //   - chats:    main-conversation messages, sorted by relevance
 //               (query coverage, then score) — see _sectionRows for why the
 //               displayed rows are then re-ordered by recency
@@ -331,12 +452,16 @@ function _partitionSearchResults(results) {
       if (da !== db) return da - db;
       return pa.localeCompare(pb);
     });
-  return { chats, agents, skills, contexts };
+  const byName = (kind) => results.filter((r) => r.kind === kind)
+    .sort((a, b) => (b.score || 0) - (a.score || 0)
+      || String(a.name || '').localeCompare(String(b.name || '')));
+  return { chats, agents, skills, contexts, automations: byName('automation'), todos: byName('todo'), connectors: byName('connector') };
 }
 
 function _renderSearchEmptyState() {
   const body = document.getElementById('search-body');
   if (!body) return;
+  body._searchPaintWaiting = false;
   body.classList.add('is-start-state');
   const history = _loadSearchHistory();
   const historyHtml = history.length
@@ -369,6 +494,7 @@ function _renderSearchEmptyState() {
 function _renderSearchError(msg) {
   const body = document.getElementById('search-body');
   if (!body) return;
+  body._searchPaintWaiting = false;
   body.classList.remove('is-start-state');
   body.innerHTML = `<div class="search-empty" style="color:var(--danger)">${escapeHtml(t('search.failed', { msg: msg || '' }))}</div>`;
 }
@@ -386,6 +512,9 @@ const _SEARCH_KIND_META = {
   chat:    { labelKey: 'search.scope.chat',    cls: 'is-chat' },
   agent:   { labelKey: 'search.scope.agent',   cls: 'is-agent' },
   skill:   { labelKey: 'search.scope.skill',   cls: 'is-skill' },
+  automation: { labelKey: 'new_chat.home.source.automation', cls: 'is-automation' },
+  todo: { labelKey: 'project.todo.title', cls: 'is-todo' },
+  connector: { labelKey: 'connectors.title', cls: 'is-connector' },
 };
 
 const _SEARCH_SOURCE_LABEL = {
@@ -418,27 +547,38 @@ function _renderSearchRow(r, dataIdx, query) {
     if (r.project_name) {
       projectChip = `<span class="search-result-project" title="${escapeHtml(r.project_name)}">${escapeHtml(r.project_name)}</span>`;
     }
-  } else if (r.kind === 'agent' || r.kind === 'skill') {
+  } else if (r.kind === 'agent' || r.kind === 'skill' || r.kind === 'connector') {
     title = r.name || r.id;
     const source = (typeof normalizeCatalogSource === 'function') ? normalizeCatalogSource(r.source) : r.source;
     const srcKey = _SEARCH_SOURCE_LABEL[source] || _SEARCH_SOURCE_LABEL[r.source] || '';
     sub = srcKey ? t(srcKey) : '';
+  } else if (r.kind === 'automation' || r.kind === 'todo') {
+    title = r.name || r.id;
+    sub = r.kind === 'automation'
+      ? t(r.enabled ? 'auto.status_enabled' : 'auto.status_disabled')
+      : t('project.todo.status_' + r.status);
+    const scopeName = r.project_id ? (r.project_name || t('todo.project')) : t('todo.global');
+    projectChip = `<span class="search-result-project" title="${escapeHtml(scopeName)}">${escapeHtml(scopeName)}</span>`;
   }
   const active = dataIdx === _searchActiveIdx ? ' active' : '';
   return `
     <div class="search-result${active}" data-idx="${dataIdx}">
       <div class="search-result-head">
         <span class="search-result-kind ${metaCfg.cls}">${escapeHtml(label)}</span>
-        <span class="search-result-title">${escapeHtml(title)}</span>
+        <span class="search-result-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
         ${projectChip}
-        <span class="search-result-meta">${escapeHtml(sub)}</span>
+        <span class="search-result-meta" title="${escapeHtml(sub)}">${escapeHtml(sub)}</span>
       </div>
-      <div class="search-result-snippet">${_highlightSnippet(r.snippet, query)}</div>
+      ${r.snippet ? _renderSearchSnippet(r.snippet, query) : ''}
     </div>`;
 }
 
+function _renderSearchSnippet(snippet, query) {
+  return `<div class="search-result-snippet">${_highlightSnippet(snippet, query)}</div>`;
+}
+
 // Currently rendered (post-filter, post-slice) results in flat order so the
-// dataIdx → result lookup for click/arrow/Enter is O(1). Rebuilt on every
+// dataIdx → result lookup for click/arrow is O(1). Rebuilt on every
 // render. Think of `_searchResults` as "raw server output" and
 // `_searchVisibleResults` as "what the user sees".
 let _searchVisibleResults = [];
@@ -464,82 +604,162 @@ function _sectionRows(section, tab) {
 function _renderSearchResults(query) {
   const body = document.getElementById('search-body');
   if (!body) return;
+  if (body._searchPressTimer) { body._searchPaintWaiting = true; return; }
   body.classList.remove('is-start-state');
   const indexing = _searchChatIndexBuilding && (_searchTab === 'all' || _searchTab === 'chat');
-  const notice = indexing
+  const contentPending = (typeof _searchSnippetHandle !== 'undefined' && _searchSnippetHandle && (_searchTab === 'all' || _searchTab === 'chat'))
+    || (typeof _searchPendingKinds !== 'undefined' && _searchPendingKinds.some(kind => _searchTab === 'all' || _searchTab === kind));
+  const contentFailed = (typeof _searchFailedKinds !== 'undefined' && _searchFailedKinds.some(kind => _searchTab === 'all' || _searchTab === kind))
+    || (typeof _searchChatSnippetsFailed !== 'undefined' && _searchChatSnippetsFailed
+      && (_searchTab === 'all' || _searchTab === 'chat'));
+  const notice = (indexing
     ? `<div class="search-section-label is-status" role="status">${escapeHtml(t('search.history_indexing'))}</div>`
-    : '';
+    : '') + (contentPending
+      ? `<div class="search-section-label is-status" role="status"><span class="search-loading-spinner" aria-hidden="true"></span> ${escapeHtml(t('common.loading'))}</div>`
+      : contentFailed ? `<div class="search-section-label is-status" role="status">${escapeHtml(t('search.failed', { msg: t('memory.error_generic') }))}</div>` : '');
   if (_searchLoading) {
     body.innerHTML = notice + `<div class="search-empty search-loading" role="status"><span class="search-loading-spinner" aria-hidden="true"></span><span>${escapeHtml(t('common.loading'))}</span></div>`;
     return;
   }
   if (!_searchResults.length) {
     _searchVisibleResults = [];
-    body.innerHTML = indexing
+    body.innerHTML = contentPending || contentFailed ? notice : indexing
       ? `<div class="search-empty" role="status">${escapeHtml(t('search.history_indexing'))}</div>`
       : `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
     return;
   }
-  const { chats, agents, skills, contexts } = _partitionSearchResults(_searchResults);
+  const { chats, agents, skills, contexts, automations, todos, connectors } = _partitionSearchResults(_searchResults);
+  const identity = row => [row.kind, row.id || row.cid || row.path, row.project_id || '',
+    Number.isInteger(row.msg_index) ? row.msg_index : (row.msg_id || '')].join('\0');
+  // Everything a rendered row shows except its summary and selection.
+  const rowLayout = row => [identity(row), row.conv_title, row.title, row.path, row.name, row.role, row.time,
+    row.source, row.enabled, row.status, row.project_name, row.library_scope].join('\0');
   const parts = [notice];
+  const layout = [query];
   const visible = [];
 
-  // "All" tab order: chats → agents → skills → Library; each
+  // Match the sidebar and search tabs: chats → to-dos → automations → agents → skills → connectors → Library. Each
   // section caps at _SEARCH_ALL_PER_SECTION rows, with overflow
   // surfacing a "view more" button that jumps to the matching tab.
   // Other tabs render their own section only (no cap, so the user can
   // scroll through everything).
   const sections = [
     { tab: 'chat',    bucket: chats,    labelKey: 'search.section.chat' },
+    { tab: 'todo', bucket: todos, labelKey: 'project.todo.title' },
+    { tab: 'automation', bucket: automations, labelKey: 'new_chat.home.source.automation' },
     { tab: 'agent',   bucket: agents,   labelKey: 'search.section.agent' },
     { tab: 'skill',   bucket: skills,   labelKey: 'search.section.skill' },
+    { tab: 'connector', bucket: connectors, labelKey: 'connectors.title' },
     { tab: 'context', bucket: contexts, labelKey: 'search.section.context' },
   ];
   for (const s of sections) {
     if (_searchTab !== 'all' && _searchTab !== s.tab) continue;
     const slice = _sectionRows(s, _searchTab);
     if (!slice.length) continue;
-    parts.push(`<div class="search-section-label">${escapeHtml(t(s.labelKey))}</div>`);
-    for (const r of slice) { parts.push(_renderSearchRow(r, visible.length, query)); visible.push(r); }
+    const label = `<div class="search-section-label">${escapeHtml(t(s.labelKey))}</div>`;
+    parts.push(label);
+    layout.push(label);
+    for (const r of slice) {
+      const rowIndex = visible.length;
+      parts.push(() => _renderSearchRow(r, rowIndex, query));
+      layout.push(rowLayout(r));
+      visible.push(r);
+    }
     if (_searchTab === 'all' && s.bucket.length > slice.length) {
-      parts.push(`<button class="search-show-more" data-goto="${s.tab}">${escapeHtml(t('search.show_more'))} (${s.bucket.length})</button>`);
+      const more = `<button class="search-show-more" data-goto="${s.tab}">${escapeHtml(t('search.show_more'))} (${s.bucket.length})</button>`;
+      parts.push(more);
+      layout.push(more);
     }
   }
 
+  const previous = _searchVisibleResults[_searchActiveIdx];
+  const retainedIndex = previous ? visible.findIndex(row => identity(row) === identity(previous)) : -1;
   _searchVisibleResults = visible;
   if (!visible.length) {
-    body.innerHTML = indexing
+    body.innerHTML = contentPending || contentFailed ? notice : indexing
       ? `<div class="search-empty" role="status">${escapeHtml(t('search.history_indexing'))}</div>`
       : `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
     _searchActiveIdx = -1;
     return;
   }
   // Clamp active idx into range of the new visible list.
-  _searchActiveIdx = Math.min(Math.max(_searchActiveIdx, 0), visible.length - 1);
-  body.innerHTML = parts.join('');
-
-  body.querySelectorAll('.search-result').forEach((row) => {
-    row.addEventListener('click', () => {
-      const idx = parseInt(row.dataset.idx, 10);
-      _searchActiveIdx = idx;
-      _gotoSearchResult(_searchVisibleResults[idx]);
+  _searchActiveIdx = retainedIndex >= 0 ? retainedIndex : Math.min(Math.max(_searchActiveIdx, 0), visible.length - 1);
+  const signature = layout.join('\0');
+  const painted = body.querySelectorAll('.search-result');
+  if (body._searchLayout === signature && painted.length === visible.length) {
+    _patchSearchRows(body, painted, visible, notice, query);
+  } else {
+    body._searchLayout = signature;
+    body._searchNotice = notice;
+    body.innerHTML = parts.map(part => (typeof part === 'function' ? part() : part)).join('');
+    body.querySelectorAll('.search-result').forEach((row, index) => {
+      row._searchSnippet = visible[index].snippet || '';
+      row.classList.toggle('active', index === _searchActiveIdx);
+      row.addEventListener('click', () => {
+        const idx = parseInt(row.dataset.idx, 10);
+        _searchActiveIdx = idx;
+        _gotoSearchResult(_searchVisibleResults[idx], 'mouse');
+      });
     });
-  });
-  body.querySelectorAll('.search-show-more').forEach((btn) => {
-    btn.addEventListener('click', () => _setSearchTab(btn.dataset.goto));
+    body.querySelectorAll('.search-show-more').forEach((btn) => {
+      btn.addEventListener('click', () => _setSearchTab(btn.dataset.goto));
+    });
+  }
+  if (typeof _scheduleVisibleChatSnippets === 'function') _scheduleVisibleChatSnippets();
+}
+
+// The browser clicks the common ancestor of the pressed and released nodes, so
+// a row that moves or is replaced under the pointer loses the click and event
+// delegation cannot recover it. Status and summaries move rows by more than
+// their height, so nothing paints between press and release.
+function _holdSearchPaintsForPress(event) {
+  if (event.button !== 0 || !event.target?.closest?.('.search-result')) return;
+  const body = event.currentTarget;
+  if (body._searchPressTimer) return;
+  const release = () => {
+    clearTimeout(body._searchPressTimer);
+    body._searchPressTimer = null;
+    window.removeEventListener('mouseup', afterRelease, true);
+    window.removeEventListener('blur', afterRelease);
+    const waiting = body._searchPaintWaiting;
+    body._searchPaintWaiting = false;
+    const overlay = document.getElementById('search-overlay');
+    if (!waiting || !_searchLastQuery || overlay?.style.display === 'none') return;
+    const top = body.scrollTop;
+    _renderSearchResults(_searchLastQuery);
+    body.scrollTop = top;
+  };
+  // The click is dispatched right after mouseup in the same task; paint after it.
+  const afterRelease = () => { setTimeout(release, 0); };
+  body._searchPressTimer = setTimeout(release, _SEARCH_PRESS_HOLD_MAX_MS);
+  window.addEventListener('mouseup', afterRelease, true);
+  window.addEventListener('blur', afterRelease);
+}
+
+// A page that only fills summaries or status keeps the row nodes, their click
+// listeners and any text selection.
+function _patchSearchRows(body, rows, visible, notice, query) {
+  if (body._searchNotice !== notice) {
+    body._searchNotice = notice;
+    body.querySelectorAll('.search-section-label.is-status').forEach(element => element.remove());
+    body.insertAdjacentHTML('afterbegin', notice);
+  }
+  rows.forEach((row, index) => {
+    row.classList.toggle('active', index === _searchActiveIdx);
+    const snippet = visible[index].snippet || '';
+    if (row._searchSnippet === snippet) return;
+    row._searchSnippet = snippet;
+    const current = row.querySelector('.search-result-snippet');
+    if (current && snippet) current.innerHTML = _highlightSnippet(snippet, query);
+    else {
+      current?.remove();
+      if (snippet) row.insertAdjacentHTML('beforeend', _renderSearchSnippet(snippet, query));
+    }
   });
 }
 
 function _onSearchKey(e) {
-  // Skip every shortcut while an IME composition is active (pinyin / kana /
-  // hangul input). Without this guard, pressing Enter to commit an English
-  // candidate from the IME panel — common when the primary suggestion is
-  // already an English word — is interpreted as "submit the active result"
-  // and navigates away mid-typing. Arrow keys are also IME-owned during
-  // composition (they move the candidate cursor), so the same guard
-  // prevents them from moving our selection. Mirrors `conversation.js` /
-  // `state.js` chat input handlers (`!e.isComposing` + keyCode 229 belt-
-  // and-suspenders for older Electron / Safari).
+  // IME candidate confirmation and arrow navigation belong to the composer.
   if (e.isComposing || e.keyCode === 229) return;
   if (e.key === 'ArrowDown') {
     e.preventDefault();
@@ -549,9 +769,7 @@ function _onSearchKey(e) {
     _moveSearchSelection(-1);
   } else if (e.key === 'Enter') {
     e.preventDefault();
-    if (_searchActiveIdx >= 0 && _searchVisibleResults[_searchActiveIdx]) {
-      _gotoSearchResult(_searchVisibleResults[_searchActiveIdx]);
-    }
+    void _runSearchNow();
   }
 }
 
@@ -602,6 +820,19 @@ async function _gotoSearchResult(r) {
         role: r.role || '',
       },
     });
+  } else if (r.kind === 'connector') {
+    setView('connectors');
+    if (typeof loadConnectors === 'function') await loadConnectors();
+    if (typeof window.focusConnectorById === 'function') await window.focusConnectorById(r.id);
+  } else if (r.kind === 'automation' || r.kind === 'todo') {
+    const loader = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
+    if (typeof loader === 'function') await loader(r.kind === 'automation' ? 'auto' : 'project');
+    if (r.kind === 'automation') {
+      setView('auto');
+      if (typeof window.focusAutoTaskById === 'function') await window.focusAutoTaskById(r.id);
+    } else if (typeof focusTodo === 'function') {
+      focusTodo(r.project_id || '', r.id, { reportMissing: true });
+    }
   } else if (r.kind === 'agent') {
     // Open the agent detail view in read mode. Edit mode is intentionally
     // NOT auto-toggled — the user is looking up "this agent", not editing.
@@ -671,6 +902,8 @@ function _saveSearchHistoryEntry(query) {
 document.addEventListener('i18n-change', () => {
   const overlay = document.getElementById('search-overlay');
   if (overlay && overlay.style.display !== 'none') {
+    const body = document.getElementById('search-body');
+    if (body) body._searchLayout = '';
     if (_searchLastQuery) _renderSearchResults(_searchLastQuery);
     else _renderSearchEmptyState();
   }

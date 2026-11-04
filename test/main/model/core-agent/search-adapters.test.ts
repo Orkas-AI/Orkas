@@ -399,3 +399,23 @@ describe('configured public search through the real adapter and tool',()=>{
     expect(JSON.parse((fetch.mock.calls[0] as any)[1].body).query).toBe(query);
   });
 });
+
+describe('configured Tavily complete request deadline', () => {
+  afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
+  it('caps the complete request including its body at 30000ms without replay', async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn(async (_url, init) => new Response(new ReadableStream({ start(controller) {
+      init.signal.addEventListener('abort', () => controller.error(init.signal.reason));
+    } })));
+    vi.stubGlobal('fetch', fetch);
+    const { runSearchAdapter } = await import('../../../../src/main/model/core-agent/search-adapters');
+    let completed = false;
+    const operation = runSearchAdapter({ provider: 'tavily', apiKey: 'fixture' } as any, 'research', 8)
+      .catch(error => { completed = true; return error; });
+    await vi.advanceTimersByTimeAsync(29999);
+    expect(completed).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await operation).toMatchObject({ message: 'Search request timed out after 30000ms' });
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+});

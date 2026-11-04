@@ -12,6 +12,7 @@ export interface ChatLiveMessage {
 }
 
 export interface ChatRebuildFile {
+  projectionOnly?: boolean;
   fileKey: string;
   file: string;
   mtime: number;

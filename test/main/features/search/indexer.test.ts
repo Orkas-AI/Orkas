@@ -207,6 +207,56 @@ describe('search/indexer › reconcileChatsIndex', () => {
     expect((await loadChatStore()).postingsFor('u1', 'foobar')).toHaveLength(2);  // two docs
   });
 
+  it('does not reindex tombstoned root or project files after a restart', async () => {
+    const projectDir = path.join(tmpDir, TEST_UID, 'cloud', 'projects', 'p1');
+    fs.mkdirSync(path.join(projectDir, 'chats'), { recursive: true });
+    fs.writeFileSync(path.join(projectDir, 'project.json'), JSON.stringify({ project_id: 'p1', name: 'Project' }));
+    for (const [root, cid] of [[path.join(tmpDir, TEST_UID, 'cloud', 'chats'), 'removed-root'],
+      [path.join(projectDir, 'chats'), 'removed-project']] as const) {
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(path.join(root, `${cid}.jsonl`), JSON.stringify({ role: 'user', content: 'deletedpayload', time: 't' }) + '\n');
+      fs.writeFileSync(path.join(root, '_index.json'), JSON.stringify([
+        { conversation_id: cid, title: 'Removed', deleted_at: '2026-10-29T00:00:00Z' },
+      ]));
+    }
+    writeChat(TEST_UID, 'legacy', [{ role: 'user', content: 'retainedpayload', time: 't' }]);
+    const ix = await loadIndexer();
+    await ix.reconcileChatsIndex(TEST_UID);
+    expect(await chatDocIds()).toEqual(['chat:legacy:0']);
+    expect(await chatTermIsIndexed(TEST_UID, 'deletedpayload')).toBe(false);
+    expect(await chatTermIsIndexed(TEST_UID, 'retainedpayload')).toBe(true);
+  });
+
+  it('does not migrate legacy global transcripts whose owning project is unavailable', async () => {
+    const dir = path.join(tmpDir, TEST_UID, 'cloud', 'projects', 'old-project', 'chats');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, '_index.json'), JSON.stringify([
+      { conversation_id: 'orphan', project_id: 'old-project', title: 'Old project history' },
+    ]));
+    writeChat(TEST_UID, 'orphan', [{ role: 'user', content: 'orphanprojectpayload', time: 't' }]);
+    writeChat(TEST_UID, 'legacy', [{ role: 'user', content: 'retainedpayload', time: 't' }]);
+    await (await loadIndexer()).reconcileChatsIndex(TEST_UID);
+    expect(await chatDocIds()).toEqual(['chat:legacy:0']);
+    expect(await chatTermIsIndexed(TEST_UID, 'orphanprojectpayload')).toBe(false);
+  });
+
+  it('revalidates a persisted source stamp from before lifecycle eligibility was enforced', async () => {
+    writeChat(TEST_UID, 'legacy', [{ role: 'user', content: 'retainedpayload', time: 't' }]);
+    let ix = await loadIndexer();
+    await ix.reconcileChatsIndex(TEST_UID);
+    await ix.flushAll();
+    const store = await loadChatStore();
+    const current = store.readSourceStamp(TEST_UID)!;
+    store.writeSourceStamp(TEST_UID, current.replace(/^v\d+\|/, 'v1|'));
+    store.closeAllChatStores();
+    vi.resetModules();
+    ix = await loadIndexer();
+    expect(await ix.isChatsIndexCurrent(TEST_UID)).toBe(false);
+    await ix.reconcileChatsIndex(TEST_UID);
+    expect(await ix.isChatsIndexCurrent(TEST_UID)).toBe(true);
+    expect(await chatDocIds()).toEqual(['chat:legacy:0']);
+  });
+
   it('uses the compact conversation catalog to validate a reconciled snapshot', async () => {
     writeChat('u1', 'c1', [{ role: 'user', content: 'catalog marker', time: 't' }]);
     const ix = await loadIndexer();
@@ -400,12 +450,14 @@ describe('search/indexer › indexChatMessageDeferred', () => {
     // otherwise the write would land first and the case could not fail.
     statHook.holdNextChatStat = true;
     statHook.holdMs = 400;
+    appendChat('u1', 'c1', { role: 'assistant', content: 'quokka reply', time: 't2' });
     ix.indexChatMessageDeferred('u1', 'c1', 1, { role: 'assistant', content: 'quokka reply', time: 't2' });
     const search = await import('../../../../src/main/features/search/index');
     const results = await search.searchChats('u1', 'quokka');
     statHook.holdMs = 40;
     expect(statHook.holdNextChatStat, 'the upsert must have been parked').toBe(false);
     expect(results.length, 'the reader must drain pending index writes').toBeGreaterThan(0);
+    expect(results[0].snippet).toContain('quokka');
   });
 
   it('drains to completion even when an upsert fails', async () => {
@@ -729,6 +781,31 @@ function privateReadFailure(): Error {
 
 
 describe('context mutation diagnostic privacy', () => {
+  it('shares one cold snapshot between concurrent readers so a late load cannot replace a writer entry', async () => {
+    writeContext('private.md', 'source body');
+    const indexer = await loadIndexer();
+    const storage = await import('../../../../src/main/features/search/storage');
+    const paths = await import('../../../../src/main/paths');
+    const original = storage.loadIndex;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const load = vi.spyOn(storage, 'loadIndex').mockImplementation(async (...args) => {
+      const snapshot = await original(...args); await gate; return snapshot;
+    });
+    const first = indexer.getEntry(paths.userContextsIndexPath(TEST_UID), 'context');
+    const second = indexer.getEntry(paths.userContextsIndexPath(TEST_UID), 'context');
+    try {
+      await vi.waitFor(() => expect(load).toHaveBeenCalled());
+      expect(load).toHaveBeenCalledTimes(1);
+    } finally { release(); load.mockRestore(); }
+    const [a, b] = await Promise.all([first, second]);
+    expect(a).toBe(b);
+    indexer.upsertContext(TEST_UID, 'private.md');
+    await vi.waitFor(() => expect(a.idx.docs['private.md']).toBeDefined());
+    await indexer.flushAll();
+    expect((await original(paths.userContextsIndexPath(TEST_UID), 'context')).docs['private.md']).toBeDefined();
+  });
+
   it.each(['upsert', 'drop'] as const)('keeps an unexpected %s storage failure private and permits a later retry', async operation => {
     writeContext('private.md', 'unchanged source body');
     const indexer = await loadIndexer(); const storage = await import('../../../../src/main/features/search/storage');

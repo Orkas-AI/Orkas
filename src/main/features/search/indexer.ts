@@ -1,4 +1,5 @@
 import { historyRecordText } from '../chat-history-records';
+import { indexedJsonlStampFromStat } from '../../util/indexed-jsonl';
 /**
  * Context snapshot and restartable SQLite chat index manager.
  *
@@ -20,6 +21,7 @@ import * as path from 'node:path';
 import { Mutex } from 'async-mutex';
 
 import * as chatStore from './chat_store';
+import { chatEligibility } from './chat-eligibility';
 import { ChatRebuildWorker } from './chat-rebuild';
 import type { JsonlAppendSource } from '../../storage';
 
@@ -60,6 +62,7 @@ interface CacheEntry {
 }
 
 interface ChatFileInfo {
+  projectionStamp?: string;
   fileKey: string;
   file: string;
   mtime: number;
@@ -93,6 +96,7 @@ interface ChatMessage {
 // ── In-memory state ──────────────────────────────────────────────────────
 
 const _cache = new Map<string, CacheEntry>();
+const _entryLoads = new Map<string, Promise<CacheEntry>>();
 const _flushTimers = new Map<string, NodeJS.Timeout>();
 const _locks = new Map<string, Mutex>();
 const _currentContextIndexes = new Set<string>();
@@ -221,13 +225,19 @@ function _getLock(idxPath: string): Mutex {
 }
 
 async function _getEntry(idxPath: string, kind: IndexKind): Promise<CacheEntry> {
-  let entry = _cache.get(idxPath);
-  if (!entry) {
+  const cached = _cache.get(idxPath);
+  if (cached) return cached;
+  const pending = _entryLoads.get(idxPath);
+  if (pending) return pending;
+  const run = (async () => {
     const idx = await loadIndex(idxPath, kind);
-    entry = { idx: idx as RuntimeIndex, dirty: false, kind };
+    const entry = { idx: idx as RuntimeIndex, dirty: false, kind };
     _cache.set(idxPath, entry);
-  }
-  return entry;
+    return entry;
+  })();
+  _entryLoads.set(idxPath, run);
+  try { return await run; }
+  finally { if (_entryLoads.get(idxPath) === run) _entryLoads.delete(idxPath); }
 }
 
 function _markDirty(idxPath: string): void {
@@ -352,6 +362,11 @@ export function indexChatMessageDeferred(
   msg: ChatMessage | JsonlAppendSource,
 ): void {
   void indexChatMessage(userId, cid, msgIndex, msg);
+}
+
+/** Pending durable appends may add matches after a metadata preview. */
+export function hasDeferredChatWrites(userId: string): boolean {
+  return _deferredChatWrites.has(_chatIdxPath(userId));
 }
 
 /** Readers settle their account's existing live writes; shutdown drains all.
@@ -610,9 +625,16 @@ async function _listUserChats(
   statFile: (file: string) => Promise<Pick<fs.Stats, 'mtimeMs' | 'size'>> = fsp.stat,
   signal?: AbortSignal,
 ): Promise<{ files: ChatFileInfo[]; complete: boolean }> {
-  const roots = [userChatsDir(userId), ...listProjectIds(userId).map((pid) => projectChatsDir(userId, pid))];
+  // Source files can arrive after their deletion marker during sync. Only the
+  // canonical merged conversation catalog can distinguish these from valid
+  // uncatalogued legacy history; a rebuild must not revive deleted payloads.
+  const { listConversationDisplayRows } = await import('../chats');
+  const projectIds = listProjectIds(userId);
+  const eligibility = await chatEligibility(userId,
+    await listConversationDisplayRows(userId, { includeDeleted: true }), new Set(projectIds));
+  const roots = [userChatsDir(userId), ...projectIds.map((pid) => projectChatsDir(userId, pid))];
   const candidates: Array<{ fileKey: string; file: string }> = [];
-  let reliable = true;
+  let reliable = eligibility.complete;
   for (const root of roots) {
     if (signal?.aborted) return { files: [], complete: false };
     let items;
@@ -625,6 +647,7 @@ async function _listUserChats(
       if (!e.isFile() || !e.name.endsWith('.jsonl')) continue;
       const file = path.join(root, e.name);
       const fileKey = e.name.replace(/\.jsonl$/i, '');
+      if (eligibility.excluded.has(fileKey)) continue;
       candidates.push({ fileKey, file });
     }
   }
@@ -632,7 +655,8 @@ async function _listUserChats(
     try {
       const st = await statFile(file);
       return {
-        info: { fileKey, file, mtime: st.mtimeMs, size: st.size } satisfies ChatFileInfo,
+        info: { fileKey, file, mtime: st.mtimeMs, size: st.size,
+          projectionStamp: 'ctimeMs' in st ? indexedJsonlStampFromStat(st as fs.Stats) : undefined } satisfies ChatFileInfo,
         reliable: true,
       };
     } catch (err) {
@@ -674,7 +698,9 @@ async function _chatSourceStamp(userId: string): Promise<string> {
     ...projectIds.flatMap((pid) => [projectChatsDir(userId, pid), projectChatIndexFile(userId, pid)]),
   ];
   const stats = await Promise.all(paths.map(_statStamp));
-  return `v1|projects=${projectIds.join(',')}|${stats.join('|')}`;
+  // Schedule one additive projection backfill for existing indexes. Valid
+  // postings remain searchable while the idle worker fills missing text blocks.
+  return `v3|projects=${projectIds.join(',')}|${stats.join('|')}`;
 }
 
 export const __searchIndexerTestHooks = {
@@ -698,7 +724,7 @@ function _docId(kind: IndexKind, fileKey: string, msgIndex: number): string {
 }
 
 async function _reindexChatFile(
-  userId: string, f: ChatFileInfo, shouldStop: () => boolean, worker: ChatRebuildWorker,
+  userId: string, f: ChatFileInfo & { projectionOnly?: boolean }, shouldStop: () => boolean, worker: ChatRebuildWorker,
 ): Promise<boolean> {
   const revision = _chatRevisions.get(userId) || 0;
   while (true) {
@@ -767,10 +793,14 @@ async function _reconcileChatsPass(
     for (const f of scan.files) {
       if (shouldStop() || revision !== (_chatRevisions.get(userId) || 0)) { cancelled = true; break; }
       const known = chatStore.readFileWatermark(userId, f.fileKey);
+      const projectionStamp = chatStore.readProjectionStamp(userId, f.fileKey);
       if (!_dirtyChats.get(userId)?.has(f.fileKey)
-          && known && known.mtime === f.mtime && known.size === f.size) continue;
+          && known && known.mtime === f.mtime && known.size === f.size
+          && (!f.projectionStamp || projectionStamp === '' || projectionStamp === f.projectionStamp)) continue;
       worker ??= _chatWorker(userId);
-      if (!await _reindexChatFile(userId, f, shouldStop, worker)) { cancelled = true; break; }
+      const projectionOnly = !_dirtyChats.get(userId)?.has(f.fileKey)
+        && !!known && known.mtime === f.mtime && known.size === f.size && !projectionStamp;
+      if (!await _reindexChatFile(userId, { ...f, projectionOnly }, shouldStop, worker)) { cancelled = true; break; }
       updated++;
     }
     if (!cancelled && !shouldStop() && revision === (_chatRevisions.get(userId) || 0)) {

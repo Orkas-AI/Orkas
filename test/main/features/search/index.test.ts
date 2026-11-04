@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
+import type { ConnectorInstance } from '../../../../src/main/features/connectors/types';
 
 const searchDiagnosticLog = vi.hoisted(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
 vi.mock('../../../../src/main/logger', () => ({ createLogger: () => searchDiagnosticLog }));
@@ -76,7 +77,196 @@ function writeChat(uid: string, cid: string, messages: unknown[]): void {
   fs.writeFileSync(path.join(dir, `${cid}.jsonl`), messages.map((m) => JSON.stringify(m)).join('\n') + '\n');
 }
 
+function customConnector(id: string, name: string, extra: Partial<ConnectorInstance> = {}): ConnectorInstance {
+  return {
+    id, origin: 'custom', display_name: name,
+    transport: { kind: 'streamable-http', url: 'https://example.test/mcp' },
+    enabled_subtools: null, tools_cache: [], tools_cached_at: 0,
+    status: { kind: 'disconnected' },
+    created_at: '2026-10-29T00:00:00Z', updated_at: '2026-10-29T00:00:00Z',
+    ...extra,
+  };
+}
+
 describe('search › searchAll', () => {
+  it('searches only custom display names, keeps accounts isolated, and returns no credentials or tool schemas', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const excluded = ['transport-only-514ac', 'header-only-514ac', 'access-only-514ac',
+      'refresh-only-514ac', 'account-only-514ac', 'tool-only-514ac', 'schema-only-514ac'];
+    const custom = customConnector('custom-search-probe', 'Private search connector', {
+      transport: { kind: 'streamable-http', url: `https://example.test/${excluded[0]}`, headers: { Authorization: excluded[1] } },
+      oauth_grant: { access_token: excluded[2], refresh_token: excluded[3], account_label: excluded[4], expires_at: Date.now() + 60000, token_type: 'Bearer' },
+      tools_cache: [{ name: excluded[5], description: excluded[5], input_schema: { description: excluded[6] } }],
+    });
+    await registry.upsert(TEST_UID, custom);
+    // A populated second account rejects active-account fallback, rather than
+    // relying on an empty account that could also pass if all search broke.
+    await registry.upsert('other-account', customConnector('custom-other', 'Private search second account'));
+    const before = registry.load(TEST_UID);
+    const provider = libraryProvider();
+    const search = await loadSearch(provider);
+    const config = await import('../../../../src/main/features/config');
+    config.setLanguage('en');
+    const found = (await search.searchAll(TEST_UID, 'private search', { scope: 'connector' })).results;
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ kind: 'connector', id: custom.id, name: custom.display_name, source: 'custom' });
+    expect(Object.keys(found[0]).sort()).toEqual(['description', 'id', 'kind', 'name', 'score', 'snippet', 'source']);
+    for (const text of excluded) {
+      expect(JSON.stringify(found)).not.toContain(text);
+      expect((await search.searchAll(TEST_UID, text, { scope: 'connector' })).results).toEqual([]);
+    }
+    expect((await search.searchAll(TEST_UID, custom.id, { scope: 'connector' })).results).toEqual([]);
+    expect((await search.searchAll('other-account', 'private search', { scope: 'connector' })).results.map(row => row.id))
+      .toEqual(['custom-other']);
+    expect(registry.load(TEST_UID)).toEqual(before);
+    expect(provider.embedQuery).not.toHaveBeenCalled();
+    expect(provider.listProjects).not.toHaveBeenCalled();
+  });
+
+  it('finds localized catalog descriptions and resolves hidden aliases to one visible card', async () => {
+    const search = await loadSearch();
+    const config = await import('../../../../src/main/features/config');
+    config.setLanguage('en');
+    const github = (await search.searchAll(TEST_UID, 'GitHub', { scope: 'connector' })).results;
+    expect(github.filter(row => row.id === 'github')).toHaveLength(1);
+    const descriptionHit = (await search.searchAll(TEST_UID, 'repositories, issues, PRs', { scope: 'connector' })).results;
+    expect(descriptionHit.find(row => row.id === 'github')?.snippet).toContain('repositories, issues, PRs');
+    const lark = (await search.searchAll(TEST_UID, 'Lark', { scope: 'connector' })).results;
+    expect(lark.filter(row => row.id === 'feishu')).toHaveLength(1);
+    expect(lark.some(row => row.id === 'lark')).toBe(false);
+    const i18n = await import('../../../../src/main/i18n');
+    config.setLanguage('de');
+    expect((await search.searchAll(TEST_UID, 'GitHub', { scope: 'connector' })).results.find(row => row.id === 'github')?.description)
+      .toBe(i18n.getRendererTable('de')['connectors.catalog.github.description']);
+    // Query the translated text itself: displaying a translated description
+    // after an English name hit alone would not prove it was searchable.
+    const germanDescription = i18n.getRendererTable('de')['connectors.catalog.github.description'];
+    expect((await search.searchAll(TEST_UID, germanDescription, { scope: 'connector' })).results.map(row => row.id))
+      .toContain('github');
+  });
+
+  it('resolves the requested account locale without changing the active account language', async () => {
+    const users = await import('../../../../src/main/features/users');
+    const config = await import('../../../../src/main/features/config');
+    const i18n = await import('../../../../src/main/i18n');
+    users.activateUser('other-account');
+    config.setLanguage('de');
+    users.activateUser(TEST_UID);
+    config.setLanguage('zh');
+    const search = await loadSearch();
+    const german = i18n.getRendererTable('de')['connectors.catalog.github.description'];
+    const found = (await search.searchAll('other-account', german, { scope: 'connector' })).results;
+    expect(found.find(row => row.id === 'github')?.description).toBe(german);
+    expect(users.getActiveUserId()).toBe(TEST_UID);
+    expect(i18n.getCurrentLang()).toBe('zh');
+  });
+
+  it('reflects custom connector renames and deletion without stale cached hits', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const custom = customConnector('custom-search-probe', 'Private search connector');
+    await registry.upsert(TEST_UID, custom);
+    const search = await loadSearch();
+    expect((await search.searchAll(TEST_UID, 'private search', { scope: 'connector' })).results).toHaveLength(1);
+    await registry.update(TEST_UID, custom.id, inst => ({ ...inst, display_name: 'Renamed private connector' }));
+    expect((await search.searchAll(TEST_UID, 'private search', { scope: 'connector' })).results).toEqual([]);
+    expect((await search.searchAll(TEST_UID, 'Renamed private', { scope: 'connector' })).results).toHaveLength(1);
+    await registry.remove(TEST_UID, custom.id);
+    expect((await search.searchAll(TEST_UID, 'Renamed private', { scope: 'connector' })).results).toEqual([]);
+  });
+
+  it.each(['automation', 'todo', 'connector'] as const)('honors %s result limits beyond 30 and keeps name queries literal', async kind => {
+    const search = await loadSearch();
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const autos = await import('../../../../src/main/features/auto_tasks');
+    const todos = await import('../../../../src/main/features/project_tasks');
+    const count = kind === 'connector' ? 201 : 31;
+    const marker = '月末.[审计] "Q4"';
+    for (let index = 0; index < count; index++) {
+      const name = `${marker} ${String(index).padStart(3, '0')}`;
+      if (kind === 'connector') await registry.upsert(TEST_UID, customConnector(`custom-boundary-${index}`, name));
+      else if (kind === 'todo') expect((await todos.createTask(TEST_UID, '', { content: name, created_by: 'user' })).ok).toBe(true);
+      else expect((await autos.createTask(TEST_UID, {
+        title: name, content: 'Read-only search fixture', enabled: false,
+        schedule: { type: 'daily', hour: 9, minute: 0 },
+      })).ok).toBe(true);
+    }
+    for (const limit of [1, 30, 31]) {
+      const { results } = await search.searchAll(TEST_UID, `  ${marker.toLowerCase()}  `, { scope: kind, limit });
+      expect(results).toHaveLength(limit);
+      expect(new Set(results.map(row => row.id)).size).toBe(limit);
+      expect(results.every(row => row.kind === kind && String(row.name).startsWith(marker))).toBe(true);
+    }
+    // Regex look-alikes must not broaden a literal user query.
+    expect((await search.searchAll(TEST_UID, '月末.*审计', { scope: kind })).results).toEqual([]);
+    if (kind === 'connector') {
+      for (const limit of [200, 201]) {
+        expect((await search.searchAll(TEST_UID, marker, { scope: kind, limit })).results).toHaveLength(200);
+      }
+    }
+  });
+
+  it('finds personal and project automations and to-dos by title/body, including inactive work, without crossing accounts', async () => {
+    const projects = await import('../../../../src/main/features/projects');
+    const todos = await import('../../../../src/main/features/project_tasks');
+    const autos = await import('../../../../src/main/features/auto_tasks');
+    const project = await projects.createProject(TEST_UID, 'Launch project');
+    if (!project.ok) throw new Error('Project fixture failed');
+    const pid = project.project.project_id;
+    const globalTodo = await todos.createTask(TEST_UID, '', { content: 'Needle personal checklist', created_by: 'user' });
+    const projectTodo = await todos.createTask(TEST_UID, pid, { content: 'Completed needle checklist', created_by: 'user' });
+    if (!globalTodo.ok || !projectTodo.ok) throw new Error('To-do fixture failed');
+    await todos.updateTask(TEST_UID, pid, projectTodo.task.id, { status: 'done' });
+    const globalAuto = await autos.createTask(TEST_UID, {
+      title: 'Needle daily report', content: 'Prepare report', enabled: false,
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    const projectAuto = await autos.createTask(TEST_UID, {
+      title: 'Weekly report', content: 'Summarize NEEDLE progress', enabled: false, project_id: pid,
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    if (!globalAuto.ok || !projectAuto.ok) throw new Error('Automation fixture failed');
+    const otherTodo = await todos.createTask('other-account', '', { content: 'Needle other checklist', created_by: 'user' });
+    const otherAuto = await autos.createTask('other-account', {
+      title: 'Needle other report', content: 'Other account report', enabled: false,
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    if (!otherTodo.ok || !otherAuto.ok) throw new Error('Second-account fixture failed');
+    const beforeAutos = await autos.listTasks(TEST_UID);
+    const beforeGlobalTodos = await todos.listTasks(TEST_UID, '');
+    const beforeProjectTodos = await todos.listTasks(TEST_UID, pid);
+    const search = await loadSearch();
+    const all = (await search.searchAll(TEST_UID, 'needle')).results;
+    expect(all.filter(row => row.kind === 'automation').map(row => row.id).sort())
+      .toEqual([globalAuto.task.id, projectAuto.task.id].sort());
+    expect(all.filter(row => row.kind === 'todo').map(row => row.id).sort())
+      .toEqual([globalTodo.task.id, projectTodo.task.id].sort());
+    expect(all.find(row => row.id === projectAuto.task.id)).toMatchObject({ project_id: pid, project_name: 'Launch project' });
+    expect(all.find(row => row.id === projectTodo.task.id)).toMatchObject({ project_id: pid, project_name: 'Launch project', status: 'done' });
+    for (const kind of ['automation', 'todo'] as const) {
+      const filtered = await search.searchAll(TEST_UID, 'needle', { scope: kind });
+      expect(filtered.results).toHaveLength(2);
+      expect(filtered.results.every(row => row.kind === kind)).toBe(true);
+      expect((await search.searchAll('other-account', 'needle', { scope: kind })).results.map(row => row.id))
+        .toEqual([kind === 'automation' ? otherAuto.task.id : otherTodo.task.id]);
+    }
+    // The current Project only narrows Library; the other global-search categories remain account-wide.
+    expect((await search.searchAll(TEST_UID, 'needle', { scope: 'todo', projectId: pid })).results).toHaveLength(2);
+    expect(await autos.listTasks(TEST_UID)).toEqual(beforeAutos);
+    expect(await todos.listTasks(TEST_UID, '')).toEqual(beforeGlobalTodos);
+    expect(await todos.listTasks(TEST_UID, pid)).toEqual(beforeProjectTodos);
+    await todos.updateTask(TEST_UID, '', globalTodo.task.id, { content: 'Revised checklist' });
+    await autos.deleteTask(TEST_UID, projectAuto.task.id);
+    expect((await search.searchAll(TEST_UID, 'needle', { scope: 'todo' })).results.map(row => row.id)).toEqual([projectTodo.task.id]);
+    expect((await search.searchAll(TEST_UID, 'needle', { scope: 'automation' })).results.map(row => row.id)).toEqual([globalAuto.task.id]);
+    expect((await search.searchAll(TEST_UID, 'unmatched phrase', { scope: 'todo' })).results).toEqual([]);
+    await autos.updateTask(TEST_UID, globalAuto.task.id, { title: 'Renamed report', content: 'New report body' });
+    await todos.deleteTask(TEST_UID, pid, projectTodo.task.id);
+    expect((await search.searchAll(TEST_UID, 'needle', { scope: 'automation' })).results).toEqual([]);
+    expect((await search.searchAll(TEST_UID, 'needle', { scope: 'todo' })).results).toEqual([]);
+    expect((await search.searchAll(TEST_UID, 'Renamed report', { scope: 'automation' })).results)
+      .toEqual([expect.objectContaining({ id: globalAuto.task.id, enabled: false })]);
+  });
+
   it('returns empty for blank query', async () => {
     const provider = libraryProvider();
     const s = await loadSearch(provider);
@@ -478,18 +668,29 @@ describe('search › searchAll', () => {
       { kind: 'chat' as const, cid: 'chat-1', snippet: '', score: 5 },
       { kind: 'agent' as const, id: 'agent-1', snippet: '', score: 4 },
       { kind: 'skill' as const, id: 'skill-1', snippet: '', score: 3 },
+      { kind: 'automation' as const, id: 'auto-1', snippet: '', score: 2 },
+      { kind: 'todo' as const, id: 'todo-1', snippet: '', score: 1 },
+      { kind: 'connector' as const, id: 'connector-1', snippet: '', score: 1 },
     ];
 
-    const limited = s.__searchTestHooks.limitSearchResults(rows, 8, 'all');
-
-    expect(limited).toHaveLength(8);
-    expect(new Set(limited.map((row) => row.kind))).toEqual(new Set([
+    const kinds = new Set([
       'context',
       'chat',
       'agent',
       'skill',
-    ]));
-    expect(limited.filter((row) => row.kind === 'context')).toHaveLength(5);
+      'automation',
+      'todo',
+      'connector',
+    ]);
+    // Below, at and above the seven populated kinds: preserve diversity
+    // within the cap even when one high-scoring category dominates the input.
+    for (const limit of [6, 7, 8]) {
+      const limited = s.__searchTestHooks.limitSearchResults(rows, limit, 'all');
+      expect(limited).toHaveLength(limit);
+      expect(new Set(limited).size).toBe(limit);
+      expect(new Set(limited.map(row => row.kind)).size).toBe(Math.min(limit, kinds.size));
+      if (limit >= kinds.size) expect(new Set(limited.map(row => row.kind))).toEqual(kinds);
+    }
   });
 
   it('uses the requested user context index even when another user is active', async () => {
@@ -703,6 +904,199 @@ describe('search › searchChats', () => {
     s.__searchTestHooks.cancelChatRepair(TEST_UID);
     await ix.reconcileChatsIndex(TEST_UID);
     expect((await s.searchChatsWithStatus(TEST_UID, 'snapshot token')).indexComplete).toBe(true);
+  });
+
+  it.each([false, true])('excludes deleted postings before the quota and permits restored or uncatalogued history (preview=%s)', async (preview) => {
+    writeChat(TEST_UID, 'removed', [{ role: 'user', content: 'ecommerce domain', time: 't' }]);
+    writeChat(TEST_UID, 'retained', [{ role: 'user', content: 'ecommerce', time: 't' }]);
+    const catalogFile = path.join(tmpDir, TEST_UID, 'cloud', 'chats', '_index.json');
+    const rows = [{ conversation_id: 'removed', title: 'Removed task', created_at: '2020-01-01T00:00:00Z' }];
+    fs.writeFileSync(catalogFile, JSON.stringify(rows));
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    const store = await import('../../../../src/main/features/search/chat_store');
+    const chats = await import('../../../../src/main/features/chats');
+    await ix.reconcileChatsIndex(TEST_UID);
+    // Prime the compact catalog, then perform the actual tombstone/file deletion.
+    expect((await s.searchChats(TEST_UID, 'ecommerce domain', { limit: 1 }))[0].cid).toBe('removed');
+    await chats.deleteConversation(TEST_UID, 'removed');
+    expect(JSON.parse(fs.readFileSync(catalogFile, 'utf8'))[0].deleted_at).toBeTruthy();
+    // A busy repair may still expose committed postings; a delayed sync payload
+    // can also recreate the file. Neither derived state overrides the tombstone.
+    writeChat(TEST_UID, 'removed', [{ role: 'user', content: 'ecommerce domain', time: 't' }]);
+    const st = fs.statSync(path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'removed.jsonl'));
+    store.replaceConversation(TEST_UID, 'removed', [{ cid: 'removed', msgIndex: 0,
+      role: 'user', time: 't', text: 'ecommerce domain' }], { mtime: st.mtimeMs, size: st.size, next: 1 });
+    expect(store.postingsFor(TEST_UID, 'domain')).toHaveLength(1);
+    for (const scope of ['chat', 'all'] as const) {
+      const result = await s.searchAll(TEST_UID, 'ecommerce domain', {
+        scope, limit: 1, includeLibraryContent: false, includeChatSnippets: !preview,
+      });
+      expect(result.results.map(row => row.cid)).toEqual(['retained']);
+    }
+    // A later authoritative restore must become visible even when the earlier
+    // deletion was cached. Uncatalogued, valid legacy history remains searchable.
+    fs.writeFileSync(catalogFile, JSON.stringify(rows));
+    chats.invalidateConversationCaches(TEST_UID);
+    expect((await s.searchChats(TEST_UID, 'domain', { includeSnippets: !preview })).map(row => row.cid))
+      .toEqual(['removed']);
+  });
+
+  it.each([false, true])('omits missing source files even while their postings remain (preview=%s)', async (preview) => {
+    writeChat(TEST_UID, 'missing', [{ role: 'user', content: 'missing orphan', time: 't' }]);
+    writeChat(TEST_UID, 'valid', [{ role: 'user', content: 'orphan', time: 't' }]);
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex(TEST_UID);
+    fs.unlinkSync(path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'missing.jsonl'));
+    const result = await s.searchChatsWithStatus(TEST_UID, 'missing orphan', { limit: 1, includeSnippets: !preview });
+    expect(result.results.map(row => row.cid)).toEqual(['valid']);
+    expect(result.indexComplete).toBe(false);
+  });
+
+  it.each([false, true])('rejects legacy global files owned by an unavailable project, then permits project recovery (preview=%s)', async preview => {
+    const projectDir = path.join(tmpDir, TEST_UID, 'cloud', 'projects', 'old-project');
+    fs.mkdirSync(path.join(projectDir, 'chats'), { recursive: true });
+    fs.writeFileSync(path.join(projectDir, 'chats', '_index.json'), JSON.stringify([
+      { conversation_id: 'old-project-chat', title: 'Project history', project_id: 'old-project', kind: 'normal' },
+    ]));
+    // Exact legacy shape from the reported May 23 records: project index remains,
+    // project.json is absent, and transcript still lives in the old global root.
+    writeChat(TEST_UID, 'old-project-chat', [{ role: 'user', content: '电商领域', time: '2026-05-23T12:26:00' }]);
+    writeChat(TEST_UID, 'legacy-global', [{ role: 'user', content: '电商领域', time: 't' }]);
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex(TEST_UID);
+    const store = await import('../../../../src/main/features/search/chat_store');
+    for (const cid of ['old-project-chat', 'legacy-global']) {
+      store.replaceConversation(TEST_UID, cid, [{ cid, msgIndex: 0, role: 'user', time: '', text: '电商领域' }],
+        { mtime: 1, size: 1, next: 1 });
+    }
+    const s = await loadSearch();
+    expect((await s.searchChats(TEST_UID, '电商领域', { includeSnippets: !preview })).map(row => row.cid))
+      .toEqual(['legacy-global']);
+    fs.writeFileSync(path.join(projectDir, 'project.json'), JSON.stringify({ project_id: 'old-project', name: 'Recovered project' }));
+    (await import('../../../../src/main/features/chats')).invalidateConversationCaches(TEST_UID);
+    const recovered = await s.searchChats(TEST_UID, '电商领域', { includeSnippets: !preview });
+    expect(recovered.find(row => row.cid === 'old-project-chat')).toMatchObject({
+      conv_title: 'Project history', project_id: 'old-project', project_name: 'Recovered project',
+    });
+  });
+
+  it('keeps a current global conversation searchable despite an old unavailable project location', async () => {
+    writeChat(TEST_UID, 'moved', [{ role: 'user', content: 'movedhistory', time: 't' }]);
+    fs.writeFileSync(path.join(tmpDir, TEST_UID, 'cloud', 'chats', '_index.json'), JSON.stringify([
+      { conversation_id: 'moved', title: 'Current global task', kind: 'normal', _sync_rev: 2 },
+    ]));
+    const oldRoot = path.join(tmpDir, TEST_UID, 'cloud', 'projects', 'old-project', 'chats');
+    fs.mkdirSync(oldRoot, { recursive: true });
+    fs.writeFileSync(path.join(oldRoot, '_index.json'), JSON.stringify([
+      { conversation_id: 'moved', project_id: 'old-project', title: 'Old location', _sync_rev: 1 },
+    ]));
+    const s = await loadSearch();
+    await (await import('../../../../src/main/features/search/indexer')).reconcileChatsIndex(TEST_UID);
+    const hits = await s.searchChats(TEST_UID, 'movedhistory');
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({ cid: 'moved', conv_title: 'Current global task' });
+    expect(hits[0]).not.toHaveProperty('project_id');
+  });
+
+  it('preserves healthy search with partial coverage when an orphan ownership catalog is unreadable', async () => {
+    writeChat(TEST_UID, 'healthy', [{ role: 'user', content: 'catalogrecovery', time: 't' }]);
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex(TEST_UID);
+    const broken = path.join(tmpDir, TEST_UID, 'cloud', 'projects', 'missing-project', 'chats');
+    fs.mkdirSync(broken, { recursive: true });
+    fs.writeFileSync(path.join(broken, '_index.json'), '{');
+    (await import('../../../../src/main/features/conversation_deletions')).invalidateTaskDeletions(TEST_UID);
+    s.invalidateChatDisplayCatalog(TEST_UID);
+    const page = await s.searchChatsWithStatus(TEST_UID, 'catalogrecovery');
+    expect(page.results.map(row => row.cid)).toEqual(['healthy']);
+    expect(page.indexComplete).toBe(false);
+    expect(searchDiagnosticLog.warn).toHaveBeenCalledWith('chat ownership catalog unavailable; coverage incomplete');
+  });
+
+  it.each([false, true])('handles snippet failure without reviving a source removed during the read (remove=%s)', async (remove) => {
+    writeChat(TEST_UID, 'c1', [{ role: 'user', content: 'recoverysource', time: 't' }]);
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex(TEST_UID);
+    const snippets = await import('../../../../src/main/features/search/chat-snippets');
+    const spy = vi.spyOn(snippets, 'readChatSnippets').mockImplementationOnce(async file => {
+      if (remove) fs.unlinkSync(file);
+      throw new Error('controlled snippet boundary failure');
+    });
+    try {
+      const result = await s.searchChatsWithStatus(TEST_UID, 'recoverysource');
+      expect(result.indexComplete).toBe(false);
+      expect(result.results.map(row => row.cid)).toEqual(remove ? [] : ['c1']);
+      if (!remove) expect(result.results[0].snippet).toBe('');
+    } finally { spy.mockRestore(); }
+    writeChat(TEST_UID, 'c1', [{ role: 'user', content: 'recoverysource', time: 't' }]);
+    await ix.reconcileChatsIndex(TEST_UID);
+    expect((await s.searchChats(TEST_UID, 'recoverysource'))[0].snippet).toContain('recoverysource');
+  });
+
+  it('revalidates chat deletions after a slower Library result finishes', async () => {
+    const chats = await import('../../../../src/main/features/chats');
+    const removed = await chats.createConversation(TEST_UID, { title: 'Removed during Library search' });
+    const cid = removed.conversation_id;
+    writeChat(TEST_UID, cid, [{ role: 'user', content: 'libraryrace', time: 't' }]);
+    writeChat(TEST_UID, 'retained', [{ role: 'user', content: 'libraryrace', time: 't' }]);
+    let release!: () => void, chatFinished!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const chatReady = new Promise<void>(resolve => { chatFinished = resolve; });
+    const provider = libraryProvider();
+    provider.embedQuery.mockImplementation(async () => { await gate; return [1, 0, 0]; });
+    const s = await loadSearch(provider);
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex(TEST_UID);
+    const snippets = await import('../../../../src/main/features/search/chat-snippets');
+    const read = snippets.readChatSnippets;
+    let reads = 0;
+    const spy = vi.spyOn(snippets, 'readChatSnippets').mockImplementation(async (...args) => {
+      const rows = await read(...args);
+      // Both source reads have finished; allow the chat bucket's final cached
+      // catalog check and promise continuation to settle before deleting it.
+      if (++reads === 2) setImmediate(chatFinished);
+      return rows;
+    });
+    const pending = s.searchAll(TEST_UID, 'libraryrace');
+    try {
+      await chatReady;
+      expect(provider.embedQuery).toHaveBeenCalledOnce();
+      expect(await chats.deleteConversation(TEST_UID, cid)).toBe(true);
+      release();
+      expect((await pending).results.filter(row => row.kind === 'chat').map(row => row.cid)).toEqual(['retained']);
+    } finally { release(); await pending; spy.mockRestore(); }
+  });
+
+  it('rejects an in-flight snippet reply captured before the conversation was deleted', async () => {
+    const chats = await import('../../../../src/main/features/chats');
+    const removed = await chats.createConversation(TEST_UID, { title: 'Removed while enriching' });
+    const cid = removed.conversation_id;
+    writeChat(TEST_UID, cid, [{ role: 'user', content: 'enrichmentrace', time: 't' }]);
+    writeChat(TEST_UID, 'retained', [{ role: 'user', content: 'enrichmentrace', time: 't' }]);
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex(TEST_UID);
+    const snippets = await import('../../../../src/main/features/search/chat-snippets');
+    const read = snippets.readChatSnippets;
+    let captured!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { captured = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const spy = vi.spyOn(snippets, 'readChatSnippets').mockImplementation(async (...args) => {
+      const rows = await read(...args);
+      if (args[0].endsWith(`${cid}.jsonl`)) { captured(); await gate; }
+      return rows;
+    });
+    const pending = s.searchChats(TEST_UID, 'enrichmentrace');
+    try {
+      await started;
+      expect(await chats.deleteConversation(TEST_UID, cid)).toBe(true);
+      release();
+      expect((await pending).map(row => row.cid)).toEqual(['retained']);
+    } finally { release(); await pending; spy.mockRestore(); }
   });
 
   it('caches display metadata and invalidates it on conversation/project rename', async () => {

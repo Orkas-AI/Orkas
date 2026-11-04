@@ -98,6 +98,8 @@ export async function visitRepositoryFiles(
   const args = [
     '--files',
     '--hidden',
+    // Plain workspaces must honor .gitignore just like Git checkouts and the fallback walker.
+    '--no-require-git',
     '--null',
     '--glob',
     '!.git/**',
@@ -141,6 +143,8 @@ export async function grepRepository(
   const args = [
     '--json',
     '--hidden',
+    // Plain workspaces must honor .gitignore just like Git checkouts and the fallback walker.
+    '--no-require-git',
     '--line-number',
     '--column',
     '--color',
@@ -358,8 +362,10 @@ function globToRegExpSource(glob: string): string {
     const ch = glob[i];
     if (ch === '*') {
       if (glob[i + 1] === '*') {
-        // `**` spans directory separators; `*` stops at one.
+        // `**` spans directory separators; `*` stops at one. A trailing `**`
+        // (`logs/**`) matches everything inside, at any depth, as in git.
         i += 1;
+        if (i === glob.length - 1) { out += '.*'; continue; }
         if (glob[i + 1] === '/') i += 1;
         out += '(?:.*/)?';
       } else {

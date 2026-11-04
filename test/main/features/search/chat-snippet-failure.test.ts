@@ -38,3 +38,33 @@ it('fails pending and queued reads on worker failure without leaking source deta
   state.workers[1].emit('message', { id: command.id, rows: [[0, { snippet: 'needle', visible: true }]] });
   expect((await recovered).get(0)?.snippet).toBe('needle');
 });
+
+it.each([false, true])('lets another conversation finish while its neighbor is held or fails (failure=%s)', async failure => {
+  const { readChatSnippets } = await import('../../../../src/main/features/search/chat-snippets');
+  const before = state.workers.length;
+  const slow = readChatSnippets('slow-source', new Set([0]), ['needle']);
+  const fast = readChatSnippets('fast-source', new Set([0]), ['needle']);
+  const settled = Promise.allSettled([slow, fast]);
+  try {
+    await vi.waitFor(() => expect(state.workers.length - before).toBe(2));
+    if (failure) state.workers.slice(before).find(worker => worker.commands.some(command => command.file === 'slow-source'))
+      .emit('error', new Error('private failed neighbor'));
+    const fastWorker = state.workers.slice(before).find(worker => worker.commands.some(command => command.file === 'fast-source'));
+    const command = fastWorker.commands.find(command => command.file === 'fast-source');
+    fastWorker.emit('message', { id: command.id, rows: [[0, { snippet: 'fast needle', visible: true }]] });
+    expect((await fast).get(0)?.snippet).toBe('fast needle');
+    if (failure) {
+      const fresh = readChatSnippets('fresh-source', new Set([0]), ['needle']).catch(() => undefined);
+      await vi.waitFor(() => expect(fastWorker.commands.some(command => command.file === 'fresh-source')).toBe(true));
+      const command = fastWorker.commands.find(command => command.file === 'fresh-source');
+      fastWorker.emit('message', { id: command.id, rows: [[0, { snippet: 'fresh needle', visible: true }]] });
+      expect((await fresh)?.get(0)?.snippet).toBe('fresh needle');
+      expect(state.workers.length - before).toBe(2);
+    }
+  } finally {
+    for (const worker of state.workers.slice(before)) for (const command of worker.commands) {
+      worker.emit('message', { id: command.id, rows: [] });
+    }
+    await settled;
+  }
+});
