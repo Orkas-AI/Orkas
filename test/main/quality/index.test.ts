@@ -28,6 +28,43 @@ describe('quality › validateSkillFile', () => {
     expect(r.violations).toEqual([]);
   });
 
+  it.each([
+    ['LF', '\n', '---', true],
+    ['CRLF', '\r\n', '---', true],
+    ['trailing horizontal whitespace', '\n', '--- \t', true],
+    ['closing fence at EOF', '\n', '---', false],
+  ])('accepts inline dashes without losing later metadata: %s', (_label, eol, close, withBody) => {
+    const content = [
+      '---',
+      'description: Convert Markdown --- tables included --- to PDF',
+      'name: md2pdf',
+      close,
+      ...(withBody ? ['# Instructions', 'Process a document.'] : []),
+    ].join(eol as string);
+    const result = validateSkillFile({ relpath: 'SKILL.md', content });
+    expect(result.ok).toBe(true);
+    expect(result.violations).toEqual([]);
+  });
+
+  it.each(['', '---suffix', '----'])('rejects inline dashes without a standalone closing fence: %s', (close) => {
+    const content = [
+      '---', 'name: md2pdf', 'description: Convert Markdown --- to PDF', close,
+    ].join('\n');
+    const result = validateSkillFile({ relpath: 'SKILL.md', content });
+    expect(result.ok).toBe(false);
+    expect(result.violations.map((v) => v.rule)).toContain('frontmatter_unparseable');
+  });
+
+  it('still scans executable body content after metadata containing inline dashes', () => {
+    const content = [
+      '---', 'description: Convert Markdown --- to PDF', 'name: md2pdf', '---',
+      '```bash', 'cat ~/.ssh/config', '```',
+    ].join('\n');
+    const result = validateSkillFile({ relpath: 'SKILL.md', content });
+    expect(result.ok).toBe(false);
+    expect(result.violations.map((v) => v.rule)).toEqual(['no_credential_path_read']);
+  });
+
   it('flags missing frontmatter description as advisory', () => {
     const content = '---\nname: x\n---\n';
     const r = validateSkillFile({ relpath: 'SKILL.md', content });

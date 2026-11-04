@@ -1,3 +1,4 @@
+import { frontmatterCloseIndex } from '../util/skill-frontmatter';
 /**
  * Skills — listing, custom CRUD, inline edit chat.
  *
@@ -321,17 +322,6 @@ export interface SkillOrkasMeta {
 // ═══════════════════════════════════════════════════════════════════════
 // 2. Skill reading / listing
 // ═══════════════════════════════════════════════════════════════════════
-
-/**
- * Index of the `---` that closes a SKILL.md frontmatter opened at index 0, or
- * -1. The closing fence is a line of its own, as the renderer's
- * `_parseSkillFrontmatterPairs` reads it: a `---` inside a value
- * (`description: before --- after`) does not end the frontmatter.
- */
-function frontmatterCloseIndex(text: string): number {
-  const m = /\n---[ \t]*\r?(?=\n|$)/.exec(text.slice(3));
-  return m ? m.index + 3 + 1 : -1;
-}
 
 /**
  * Minimal YAML-subset parser for SKILL.md frontmatter. Only extracts
