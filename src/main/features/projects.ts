@@ -56,6 +56,7 @@ import { readState } from './group_chat/state';
 import { purgeProjectWorkspace } from './user_workspace';
 import { limitNameDisplayText } from '../util/name-limit';
 import { PROJECT_INSTRUCTIONS_CHAR_LIMIT } from '../../../bin/project-instructions-contract.cjs';
+import { FileSnapshotCache } from '../util/file-snapshot';
 
 const log = createLogger('projects');
 
@@ -375,6 +376,10 @@ export async function listProjects(uid: string): Promise<ProjectWithStats[]> {
   return projects.map(({ project, convCount }) => ({ ...project, conv_count: convCount }));
 }
 
+const _projectNameSnapshots = new FileSnapshotCache<{ project_id: string; name: string }>(
+  row => 128 + 2 * (row.project_id.length + row.name.length),
+);
+
 /** Project names only, for chips/search catalogs and per-turn listings that
  *  do not need conversation counts. */
 export async function listProjectNameRows(
@@ -382,9 +387,14 @@ export async function listProjectNameRows(
 ): Promise<Array<{ project_id: string; name: string }>> {
   const ids = await _listProjectIds(uid);
   if (!ids.length) return [];
-  const rows = await _mapBounded(ids, 8, (pid) => _readProject(uid, pid));
+  const rows = await _mapBounded(ids, 8, (pid) => _projectNameSnapshots.read(projectMetaFile(uid, pid), async () => {
+    const project = await _readProject(uid, pid);
+    return project ? {
+      project_id: project.project_id, name: project.name || '',
+    } : null;
+  }));
   return rows
-    .filter((project): project is Project => project !== null)
+    .filter((project): project is NonNullable<typeof project> => project !== null)
     .map((project) => ({
       project_id: project.project_id,
       name: project.name || '',
@@ -578,7 +588,9 @@ export async function writeProjectInstructionsIfUnchanged(
  * Render the project's user-authored instructions as a system-prompt block.
  * Read side for `runner.ts::buildRunner` — low-churn user configuration, so it
  * sits in the stable prompt-prefix region (unlike the per-turn memory block).
- * Returns '' when the project has no instructions (zero prompt tokens).
+ * Returns '' only for missing/blank instructions. A read failure carries a
+ * bounded status at the same prompt position so execution can continue with
+ * the unavailable configuration explicitly distinguished from no rules.
  * Defensive slice: the write path enforces the limit, but the file can arrive
  * oversized via sync — never let it flood the prompt.
  */
@@ -586,8 +598,14 @@ export function formatProjectInstructionsForSystemPrompt(uid: string, projectId:
   let raw = '';
   try {
     raw = fs.readFileSync(projectInstructionsFile(uid, projectId), 'utf8');
-  } catch {
-    return '';
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return '';
+    const { message_hash, message_chars } = logErrorSummary(error);
+    log.warn('project instructions unavailable for prompt', { error: { message_hash, message_chars } });
+    return [
+      '## Project instructions (user-authored)',
+      'Status: unavailable (read_failed). The project instructions could not be read; this does not mean that the project has no instructions. Continue the task with this limitation; do not invent the missing rules.',
+    ].join('\n\n');
   }
   const content = raw.trim().slice(0, PROJECT_INSTRUCTIONS_CHAR_LIMIT);
   if (!content) return '';
@@ -614,7 +632,7 @@ export async function deleteProject(
   const cur = await _readProject(uid, projectId);
   if (!cur) return { ok: false, error: 'not_found' };
 
-  let allConvs: Awaited<ReturnType<typeof chats.listConversations>>;
+  let allConvs: Awaited<ReturnType<typeof chats.listConversationDeletionRows>>;
   let ownedTasks: Awaited<ReturnType<typeof autoTasks.listTasks>>;
   try {
     // Enumerate every durable child before mutating any of them. Treating a
@@ -622,7 +640,7 @@ export async function deleteProject(
     // project tree and reported success even though the cascade scope was
     // unknown.
     [allConvs, ownedTasks] = await Promise.all([
-      chats.listConversations(uid),
+      chats.listConversationDeletionRows(uid, projectId),
       autoTasks.listTasks(uid, { projectId }),
     ]);
   } catch (err) {
@@ -685,6 +703,7 @@ export async function deleteProject(
   // Drop the entire project directory (project.json + bindings.json + any
   // future per-project assets).
   try {
+    await chats.retainProjectConversationDeletes(uid, projectId);
     const d = projectDir(uid, projectId);
     if (fs.existsSync(d)) await projectRootRemover(d);
   } catch (err) {

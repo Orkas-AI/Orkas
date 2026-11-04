@@ -416,7 +416,7 @@ function _renderGlobalTodos() {
 function focusTodo(scope, taskId, opts = {}) {
   const pid = String(scope || '');
   const id = String(taskId || '');
-  _globalTodoPendingFocus = id ? { pid, id } : null;
+  _globalTodoPendingFocus = id ? { pid, id, reportMissing: opts.reportMissing === true } : null;
   if (id) {
     _globalTodoMode = 'project';
     _globalTodoActiveScope = pid;
@@ -431,7 +431,10 @@ function _applyGlobalTodoPendingFocus() {
   const host = document.getElementById('todos-content');
   const row = Array.from(host?.querySelectorAll('.project-todo-item[data-tid]') || [])
     .find((el) => el.dataset.tid === target.id);
-  if (!row) return;
+  if (!row) {
+    if (target.reportMissing && typeof uiToast === 'function') uiToast(t('todo.notification.unavailable'));
+    return;
+  }
   // Reveal it even when the user had collapsed its column; this does not
   // change the remembered collapse state.
   const body = row.closest('.todo-column-body');

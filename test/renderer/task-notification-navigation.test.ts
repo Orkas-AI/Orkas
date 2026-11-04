@@ -8,7 +8,8 @@ const bootSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modu
 
 function extractFunction(source: string, name: string): string {
   const marker = `function ${name}`;
-  const start = source.indexOf(marker);
+  const match = source.indexOf(marker);
+  const start = source.slice(match - 6, match) === 'async ' ? match - 6 : match;
   if (start < 0) throw new Error(`missing ${name}`);
   const braceStart = source.indexOf('{', start);
   let depth = 0;

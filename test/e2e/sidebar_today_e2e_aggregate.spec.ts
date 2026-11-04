@@ -3,9 +3,9 @@ import path from 'node:path';
 
 import { openSidebarEntry, expect, test, type OrkasTestApp } from './fixtures/orkas';
 
-// Sidebar "Recent Tasks" aggregate (today + yesterday) through the real IPC +
-// renderer wiring: the startup slice must carry today's and yesterday's rows
-// from a collapsed project, the aggregate must exclude older rows, and the
+// Sidebar "Recent Tasks" aggregate (pinned or active in the last 24h) through the real IPC +
+// renderer wiring: the startup slice must carry recent rows
+// from a collapsed project, the aggregate must exclude older unpinned rows, and the
 // unread cue must behave as one task mirrored in two lists.
 
 type Conversation = { conversation_id: string; project_id?: string };
@@ -60,7 +60,47 @@ function backdateConversations(workspaceRoot: string, cids: string[], iso: strin
 }
 
 test.describe('sidebar today aggregate', () => {
-  test('lists recent tasks across a collapsed project and the Tasks list and mirrors unread state', async ({ orkas }) => {
+  test('retains old pinned tasks after relaunch and removes an expired task when unpinned', async ({ orkas }, info) => {
+    const project = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: 'Pinned project' });
+    const pid = project.project.project_id;
+    const projectPin = await createConversation(orkas, 'Pinned project task from last month with a long title', pid);
+    const loosePin = await createConversation(orkas, 'Pinned loose task from last month');
+    const expired = await createConversation(orkas, 'Expired task without pin', pid);
+    const recent = await createConversation(orkas, 'Recent task without pin');
+    for (const conv of [projectPin, loosePin]) {
+      await orkas.invoke('conversations.pin', { cid: conv.conversation_id, pinned: true, projectId: conv.project_id });
+    }
+    backdateConversations(orkas.workspaceRoot,
+      [projectPin.conversation_id, loosePin.conversation_id, expired.conversation_id],
+      new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+    await orkas.page!.evaluate(() => localStorage.setItem('sidebar.projectExpanded', '{}'));
+    const page = await orkas.relaunch();
+    const rows = page.locator('#today-list .conv-item');
+    const projectCopy = page.locator(`#today-list .conv-item[data-cid="${projectPin.conversation_id}"]`);
+    const looseCopy = page.locator(`#today-list .conv-item[data-cid="${loosePin.conversation_id}"]`);
+    await expect(rows).toHaveCount(3);
+    await expect(projectCopy).toHaveClass(/\bis-pinned\b/);
+    await expect(looseCopy).toHaveClass(/\bis-pinned\b/);
+    await expect(rows.nth(2)).toHaveAttribute('data-cid', recent.conversation_id);
+    await expect(page.locator('#projects-list .conv-item')).toHaveCount(0);
+    for (const [lang, width, height] of [['en', 1366, 900], ['zh', 900, 650]] as const) {
+      await page.evaluate(language => (window as any).setLang(language), lang);
+      await page.setViewportSize({ width, height });
+      await expect(projectCopy).toBeVisible();
+      await page.screenshot({ path: info.outputPath(`recent-pinned-${lang}.png`) });
+    }
+    await projectCopy.hover();
+    await projectCopy.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="pin"]').click();
+    await expect(projectCopy).toHaveCount(0);
+    await expect(looseCopy).toHaveCount(1);
+    // Relaunch proves the unpin persisted and the remaining pin is still loaded.
+    const restarted = await orkas.relaunch();
+    await expect(restarted.locator(`#today-list .conv-item[data-cid="${projectPin.conversation_id}"]`)).toHaveCount(0);
+    await expect(restarted.locator(`#today-list .conv-item[data-cid="${loosePin.conversation_id}"]`)).toHaveClass(/\bis-pinned\b/);
+  });
+
+  test('lists recent tasks across a collapsed project and the Tasks list and mirrors unread state', async ({ orkas }, info) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;
 
@@ -71,10 +111,13 @@ test.describe('sidebar today aggregate', () => {
     const unprojectedToday = await createConversation(orkas, 'Loose task ran today');
     const unprojectedOld = await createConversation(orkas, 'Loose task from last week');
     const projectYesterday = await createConversation(orkas, 'Project task ran yesterday', pid);
+    const projectExpired = await createConversation(orkas, 'Project task outside recent window', pid);
     const lastWeek = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     backdateConversations(orkas.workspaceRoot, [projectOld.conversation_id, unprojectedOld.conversation_id], lastWeek);
-    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const yesterday = new Date(Date.now() - 23 * 60 * 60 * 1000).toISOString();
     backdateConversations(orkas.workspaceRoot, [projectYesterday.conversation_id], yesterday);
+    backdateConversations(orkas.workspaceRoot, [projectExpired.conversation_id],
+      new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString());
 
     // Keep the project collapsed: the aggregate must not depend on expansion.
     await page.evaluate(() => {
@@ -85,6 +128,7 @@ test.describe('sidebar today aggregate', () => {
     const todayRows = relaunched.locator('#today-list .conv-item');
     await expect(todayRows).toHaveCount(3);
     await expect(relaunched.locator(`#today-list .conv-item[data-cid="${projectYesterday.conversation_id}"]`)).toHaveCount(1);
+    await expect(relaunched.locator(`#today-list .conv-item[data-cid="${projectExpired.conversation_id}"]`)).toHaveCount(0);
     await expect(relaunched.locator(`#today-list .conv-item[data-cid="${projectToday.conversation_id}"]`)).toHaveCount(1);
     await expect(relaunched.locator(`#today-list .conv-item[data-cid="${unprojectedToday.conversation_id}"]`)).toHaveCount(1);
     await expect(relaunched.locator(`#today-list .conv-item[data-cid="${projectOld.conversation_id}"]`)).toHaveCount(0);
@@ -94,12 +138,15 @@ test.describe('sidebar today aggregate', () => {
     const persisted = await orkas.invoke<{ conversations: Conversation[] }>('conversations.list');
     expect(persisted.conversations.map((row) => row.conversation_id))
       .toEqual(expect.arrayContaining([projectYesterday.conversation_id,
-        projectOld.conversation_id, unprojectedOld.conversation_id]));
+        projectOld.conversation_id, unprojectedOld.conversation_id, projectExpired.conversation_id]));
     // The project itself stays collapsed and the Tasks list still owns its
     // own copy of the unprojected task.
     await expect(relaunched.locator('#projects-list .conv-item')).toHaveCount(0);
     await expect(relaunched.locator(`#conversation-list .conv-item[data-cid="${unprojectedToday.conversation_id}"]`)).toHaveCount(1);
     await expect(relaunched.locator(`#conversation-list .conv-item[data-cid="${projectToday.conversation_id}"]`)).toHaveCount(0);
+    await relaunched.evaluate(() => (window as any).setLang('zh'));
+    await expect(relaunched.locator('[data-i18n="sidebar.today_tasks"]')).toHaveText('近期任务');
+    await relaunched.screenshot({ path: info.outputPath('recent-tasks-24h.png') });
 
     // Unread mirror: a terminal on the collapsed-project task lights the Today
     // row, the Today header and the project row.

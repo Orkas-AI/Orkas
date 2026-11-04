@@ -567,6 +567,84 @@ describe('project_tasks › attachments', () => {
 });
 
 describe('project_tasks › concurrent persistence paths', () => {
+  it.each(['project', 'global'] as const)('does not retain an attachment when its %s task is deleted during source validation', async (scope) => {
+    const { pt, pid } = await setup();
+    const taskPid = scope === 'project' ? pid : '';
+    const created = await pt.createTask(TEST_UID, taskPid, { content: 'Remove work and its supporting document' });
+    if (!created.ok) throw new Error('task fixture failed');
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const source = path.join(tmpDir, 'supporting.txt');
+    fs.writeFileSync(source, 'Original supporting document');
+    const handler = createProjectTasksHandler(TEST_UID, taskPid, 'c-overlap', new Map(), {}, { workingDir: tmpDir });
+    const target = taskPid ? taskFile(taskPid, created.task.id) : globalTaskFile(created.task.id);
+    const storage = await import('../../../src/main/storage');
+    const originalRead = storage.readJson;
+    let captured!: () => void, release!: () => void;
+    const waiting = new Promise<void>(resolve => { captured = resolve; });
+    const proceed = new Promise<void>(resolve => { release = resolve; });
+    let reads = 0;
+    // Preserve the actual successful second task read while a concurrent delete
+    // settles. No invented task or failed I/O is supplied to the product.
+    const spy = vi.spyOn(storage, 'readJson').mockImplementation(async file => {
+      const value = await originalRead(file);
+      if (file === target && ++reads === 2) { captured(); await proceed; }
+      return value;
+    });
+    let copying: ReturnType<NonNullable<typeof handler.addAttachment>> | undefined;
+    try {
+      copying = handler.addAttachment!(created.task.id, source);
+      await waiting;
+      expect(await pt.deleteTask(TEST_UID, taskPid, created.task.id)).toEqual({ ok: true });
+      release();
+      expect(await copying).toEqual({ ok: false, error: 'task_not_found' });
+      vi.resetModules();
+      const reopened = await import('../../../src/main/features/project_tasks');
+      expect(await reopened.getTask(TEST_UID, taskPid, created.task.id)).toBeNull();
+      expect(await reopened.listTaskAttachments(TEST_UID, taskPid, created.task.id)).toEqual([]);
+      expect(await reopened.resolveTaskAttachmentPath(TEST_UID, taskPid, created.task.id, 'supporting.txt')).toBeNull();
+      const dir = taskPid ? path.join(path.dirname(target), '..', 'task_attachments', created.task.id) : globalAttachDir(created.task.id);
+      expect(fs.existsSync(dir)).toBe(false);
+      expect(fs.readFileSync(source, 'utf8')).toBe('Original supporting document');
+    } finally {
+      release();
+      await copying;
+      spy.mockRestore();
+    }
+  });
+
+  it('keeps saved supporting bytes when draft cancellation overlaps the first task publication', async () => {
+    const { pt, pid } = await setup();
+    const tid = 't_aabbccdd1122';
+    expect(await pt.uploadTaskAttachment(TEST_UID, pid, tid, 'draft.txt', Buffer.from('Retain the saved supporting document')))
+      .toEqual({ ok: true, name: 'draft.txt' });
+    const storage = await import('../../../src/main/storage');
+    const original = storage.writeJson;
+    let captured!: () => void, release!: () => void;
+    const waiting = new Promise<void>(resolve => { captured = resolve; });
+    const proceed = new Promise<void>(resolve => { release = resolve; });
+    const spy = vi.spyOn(storage, 'writeJson').mockImplementation(async (file, value) => {
+      if (file === taskFile(pid, tid)) { captured(); await proceed; }
+      return original(file, value);
+    });
+    let saving: ReturnType<typeof pt.createTask> | undefined;
+    let discarding: ReturnType<typeof pt.discardTaskAttachmentDraft> | undefined;
+    try {
+      saving = pt.createTask(TEST_UID, pid, { id: tid, content: 'Saved work with its draft document' });
+      await waiting;
+      discarding = pt.discardTaskAttachmentDraft(TEST_UID, pid, tid);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      release();
+      expect(await saving).toMatchObject({ ok: true, task: { attachments: ['draft.txt'] } });
+      expect(await discarding).toEqual({ ok: false });
+      vi.resetModules();
+      const reopened = await import('../../../src/main/features/project_tasks');
+      expect(await reopened.getTask(TEST_UID, pid, tid)).toMatchObject({ attachments: ['draft.txt'] });
+      const resolved = await reopened.resolveTaskAttachmentPath(TEST_UID, pid, tid, 'draft.txt');
+      expect(resolved).not.toBeNull();
+      expect(fs.readFileSync(resolved!, 'utf8')).toBe('Retain the saved supporting document');
+    } finally { release(); await saving; await discarding; spy.mockRestore(); }
+  });
+
   it.each(['project', 'global'] as const)('preserves both task edits and attachment metadata during overlapping writes in %s scope', async (scope) => {
     const { pt, pid } = await setup();
     const taskPid = scope === 'project' ? pid : '';

@@ -49,6 +49,7 @@ async function setupProjectStateTools() {
     set: (instructions) => projects.writeProjectInstructions(UID, pid, instructions),
   });
   const memoryHandler = {
+    batch: (tier: MemoryTier, revision: unknown, operations: unknown) => memory.applyMemoryBatch(UID, memoryScope(tier), revision, operations),
     add: (tier: MemoryTier, content: string) => memory.addEntry(UID, memoryScope(tier), content),
     replace: (tier: MemoryTier, oldText: string, content: string) => memory.replaceEntry(UID, memoryScope(tier), oldText, content),
     remove: (tier: MemoryTier, oldText: string) => memory.removeEntry(UID, memoryScope(tier), oldText),
@@ -209,5 +210,24 @@ describe('project state tools → durable feature stores', () => {
     expect(rejected.content).toContain('read-only');
     expect(state.memory.listEntries(UID, { project: state.pid }).entries)
       .toEqual(['Existing durable decision.']);
+  });
+});
+
+describe('public task member admission', () => {
+  it.each(['private', 'global'])('keeps unavailable member operations and fields from mutating %s work', async scope => {
+    const { projects, projectTasks } = await setupProjectStateTools();
+    const created = await projects.createProject(UID, 'Local assignment boundary');
+    if (!created.ok) throw new Error('project fixture failed');
+    const pid = scope === 'global' ? '' : created.project.project_id;
+    const { createProjectTasksHandler } = await import('../../../../src/main/features/project_tasks_tool_handler');
+    const scoped = createProjectTasksTool(createProjectTasksHandler(UID, pid, 'scope', new Map()), { globalScope: !pid });
+    expect((scoped.inputSchema as any).properties.action.enum).not.toContain('list_members');
+    expect((scoped.inputSchema as any).properties).not.toHaveProperty('assignee_uid');
+    const before = await projectTasks.listTasks(UID, pid);
+    expect((await scoped.execute({ action: 'list_members' }, { state: {} })).isError).toBe(true);
+    const result = await scoped.execute({ action: 'create', content: 'Local work', assignee_uid: 'unavailable-member' }, { state: {} });
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content).error).toContain('unknown task fields: assignee_uid');
+    expect(await projectTasks.listTasks(UID, pid)).toEqual(before);
   });
 });

@@ -257,7 +257,10 @@ export function startTaskNotifications(
     }, true);
   });
 
+  let stopped = false;
   return () => {
+    if (stopped) return;
+    stopped = true;
     unsubscribeTerminals();
     unsubscribeInterventions();
     stopFocusListener();

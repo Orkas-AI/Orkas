@@ -1,4 +1,4 @@
-// Sidebar "Recent Tasks" aggregate (today + yesterday; DOM ids and i18n keys
+// Sidebar "Recent Tasks" aggregate (pinned or active within 24h; DOM ids and i18n keys
 // keep the historical "today" names). The section mirrors rows that also live
 // under a Project or in the catch-all Tasks list, so these cases load the real
 // conversation row renderer/handlers (conversation.js) next to the module and
@@ -74,11 +74,12 @@ function makeContainer() {
 }
 
 function loadTodayTasksRenderer() {
+  let clock = NOW.getTime();
   class FixedDate extends Date {
     constructor(...args: any[]) {
-      if (args.length) super(...(args as [any])); else super(NOW.getTime());
+      if (args.length) super(...(args as [any])); else super(clock);
     }
-    static now() { return NOW.getTime(); }
+    static now() { return clock; }
   }
   const container = makeContainer();
   // The catch-all Tasks list that `renderConversationList` paints alongside
@@ -168,6 +169,7 @@ function loadTodayTasksRenderer() {
     projectReloads,
     recentToggle,
     unreadRefreshes: () => unreadRefreshes,
+    setNow: (date: Date) => { clock = date.getTime(); },
   };
 }
 
@@ -358,13 +360,14 @@ describe('sidebar Today aggregate', () => {
     expect(h.container.cids().filter((cid: string) => cid === 'moved')).toEqual(['moved']);
   });
 
-  it('lists every task active today or yesterday across projects and the unprojected list, pinned first then newest', () => {
+  it('lists tasks active within 24h across projects and the unprojected list, pinned first then newest', () => {
     const h = loadTodayTasksRenderer();
     h.context.conversations.push(
       { conversation_id: 'unprojected-10', title: 'u', last_active_at: at(10 * HOUR) },
       // Lives under a collapsed project: never painted in the Projects tree.
       { conversation_id: 'collapsed-project-09', title: 'c', project_id: 'p-collapsed', last_active_at: at(9 * HOUR) },
       { conversation_id: 'yesterday-2359', title: 'y', project_id: 'p1', last_active_at: at(-1) },
+      { conversation_id: 'yesterday-morning', title: 'expired', project_id: 'p1', last_active_at: at(-23 * HOUR) },
       { conversation_id: 'day-before-2359', title: 'd', project_id: 'p1', last_active_at: at(-24 * HOUR - 1) },
       { conversation_id: 'pinned-08', title: 'p', project_id: 'p1', pinned_at: at(8 * HOUR), last_active_at: at(8 * HOUR) },
       { conversation_id: 'ancient', title: 'a', updated_at: '2020-01-01T00:00:00.000Z' },
@@ -374,13 +377,55 @@ describe('sidebar Today aggregate', () => {
 
     expect(h.container.cids()).toEqual(['pinned-08', 'unprojected-10', 'collapsed-project-09', 'yesterday-2359']);
     // Same row markup as every other sidebar list, no bucket header inside
-    // an all-today section.
+    // the recent-task section.
     expect(h.container.innerHTML).toContain('class="conv-item');
     expect(h.container.innerHTML).not.toContain('conv-list-section-header');
     expect(h.container.innerHTML).not.toContain('conv-item-nested');
   });
 
-  it('opens a task from the Today copy like any sidebar row', () => {
+  it.each([false, true])('updates old pinned tasks immediately on unpin and restores them on failure (%s)', async (fail) => {
+    const h = loadTodayTasksRenderer();
+    const oldPin = { conversation_id: 'old-pin', title: 'Pinned last month', project_id: 'p1',
+      pinned_at: at(-30 * 24 * HOUR), last_active_at: at(-30 * 24 * HOUR) };
+    h.context.conversations.push(oldPin,
+      { conversation_id: 'recent', title: 'Recent task', last_active_at: NOW.toISOString() });
+    h.context._refreshChatHeader = () => {};
+    h.context.uiAlert = async () => {};
+    let release!: () => void;
+    h.context.apiFetch = async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      if (fail) throw new Error('Synthetic unpin failure');
+      return { json: async () => ({ ok: true, conversation: { ...oldPin, pinned_at: undefined } }) };
+    };
+    h.context.renderConversationList();
+    expect(h.container.cids()).toEqual(['old-pin', 'recent']);
+    const unpin = h.context._toggleConversationPinned('old-pin', false);
+    expect(h.container.cids()).toEqual(['recent']);
+    release();
+    await unpin;
+    expect(h.container.cids()).toEqual(fail ? ['old-pin', 'recent'] : ['recent']);
+  });
+
+  it.each(['project', 'unprojected'])('retains pinned tasks beyond the first page when reloading the %s list', async (scope) => {
+    const h = loadTodayTasksRenderer();
+    const pins = Array.from({ length: 12 }, (_, i) => ({ conversation_id: `pin-${i}`, title: `Pinned task ${i}`,
+      ...(scope === 'project' ? { project_id: 'p1' } : {}),
+      pinned_at: at(-i * HOUR), last_active_at: at(-30 * 24 * HOUR) }));
+    h.context.conversations.push(...pins);
+    h.context.apiFetch = async () => ({ json: async () => ({ ok: true,
+      conversations: pins.slice(0, 10), total: 12, next_offset: 10 }) });
+    if (scope === 'project') await h.context.loadConversationProject('p1', { reset: true });
+    else await h.context.loadUnprojectedConversations({ reset: true });
+    expect(h.container.cids()).toEqual(pins.slice(0, 10).map(c => c.conversation_id));
+    h.container.more.click();
+    expect(h.container.cids()).toEqual(pins.map(c => c.conversation_id));
+    // A full refresh remains authoritative for remotely removed or unpinned tasks.
+    h.context.apiFetch = async () => ({ json: async () => ({ ok: true, conversations: [] }) });
+    await h.context.loadConversations();
+    expect(h.container.cids()).toEqual([]);
+  });
+
+  it('opens a task from the Recent copy like any sidebar row', () => {
     const h = loadTodayTasksRenderer();
     h.context.conversations.push(
       { conversation_id: 'c1', title: 'one', project_id: 'p1', last_active_at: at(HOUR) },
@@ -395,7 +440,7 @@ describe('sidebar Today aggregate', () => {
   it.each([
     ['a task from the day before yesterday', [{ conversation_id: 'day-before', title: 'd', last_active_at: at(-25 * HOUR) }]],
     ['no task at all', []],
-  ])('shows the empty hint when nothing ran today or yesterday and the list render clears the header cue (%s)', (_name, rows) => {
+  ])('shows the empty hint when nothing ran within 24h and the list render clears the header cue (%s)', (_name, rows) => {
     const h = loadTodayTasksRenderer();
     h.context.conversations.push(...rows);
 
@@ -406,6 +451,51 @@ describe('sidebar Today aggregate', () => {
     // The header dot follows the rows shown here (date rollover, last row
     // deleted); the one trailing pass of `renderConversationList` settles it.
     expect(h.unreadRefreshes()).toBe(1);
+  });
+
+  it.each(['foreground', 'reopen'])('drops expired rows on %s without changing other task lists', (trigger) => {
+    const h = loadTodayTasksRenderer();
+    h.context.conversations.push(
+      { conversation_id: 'old-pin', title: 'Pinned task', pinned_at: at(-30 * 24 * HOUR), last_active_at: at(-30 * 24 * HOUR) },
+      { conversation_id: 'expires', title: 'old', last_active_at: new Date(NOW.getTime() - 24 * HOUR).toISOString() },
+      { conversation_id: 'kept', title: 'new', last_active_at: NOW.toISOString() },
+    );
+    h.context.renderConversationList();
+    expect(h.container.cids()).toEqual(['old-pin', 'kept', 'expires']);
+    const otherList = h.conversationList.innerHTML;
+    h.setNow(new Date(NOW.getTime() + HOUR));
+    // Merely advancing time does not trigger background work.
+    expect(h.container.cids()).toEqual(['old-pin', 'kept', 'expires']);
+    if (trigger === 'foreground') h.context._refreshConversationBucketsForDateChange(new h.context.Date());
+    else {
+      h.recentToggle.click();
+      h.recentToggle.click();
+    }
+    expect(h.container.cids()).toEqual(['old-pin', 'kept']);
+    expect(h.conversationList.innerHTML).toBe(otherList);
+    expect(h.context.conversations).toHaveLength(3);
+    expect(h.projectReloads).toEqual([]);
+  });
+
+  it('keeps recent row nodes and badges untouched on foreground return when no task has expired', () => {
+    const h = loadTodayTasksRenderer();
+    h.context.conversations.push(
+      { conversation_id: 'old-pin', title: 'Pinned task without activity', pinned_at: at(-30 * 24 * HOUR) },
+      { conversation_id: 'kept', title: 'new', last_active_at: NOW.toISOString() });
+    h.context.renderConversationList();
+    const row = h.container.rows[0];
+    h.setNow(new Date(NOW.getTime() + HOUR));
+    h.context._refreshConversationBucketsForDateChange(new h.context.Date());
+    h.context._refreshConversationBucketsForDateChange(new h.context.Date());
+    expect(h.container.rows[0]).toBe(row);
+    expect(h.unreadRefreshes()).toBe(1);
+  });
+
+  it.each([true, false])('requests exactly the same 24h window at startup (shared helper: %s)', (shared) => {
+    const h = loadTodayTasksRenderer();
+    if (!shared) h.context.recentConversationsSince = undefined;
+    const params = new URLSearchParams(h.context._startupConversationParams());
+    expect(params.get('active_since')).toBe(new Date(NOW.getTime() - 24 * HOUR).toISOString());
   });
 
   it.each([

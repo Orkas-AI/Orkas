@@ -1316,7 +1316,7 @@ function _renderTodoBoard(tasks, context, scope) {
     const key = scope + ':' + status;
     const collapsed = _todoCollapsed.has(key) ? _todoCollapsed.get(key) : status === 'done';
     const column = document.createElement('section');
-    // `is-collapsed` lets the project board narrow a collapsed lane to a strip.
+    // `is-collapsed` lets both boards narrow a collapsed lane to a strip.
     column.className = 'todo-column is-' + status + (collapsed ? ' is-collapsed' : '');
     column.dataset.status = status;
     const header = document.createElement('div');

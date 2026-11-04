@@ -406,4 +406,19 @@ describe('opening a to-do from a shortcut', () => {
     expect(f.error.hidden).toBe(true);
     expect(vm.runInContext('_globalTodoPendingFocus', f.context)).toBe(null);
   });
+
+  it('reports a notification target removed between validation and page load', async () => {
+    const f = backlogFixture();
+    const notices: string[] = [];
+    const host = { setAttribute() {}, querySelectorAll: () => [] };
+    f.context.setView = () => {};
+    f.context.uiToast = (message: string) => notices.push(message);
+    f.context.document.getElementById = (id: string) => (id === 'todos-error' ? f.error : host);
+    f.context.focusTodo('a', 'missing', { entryPoint: 'todo_notification', reportMissing: true });
+    await f.context.loadGlobalTodos();
+    expect(notices).toEqual(['todo.notification.unavailable']);
+    expect(f.error.hidden).toBe(true);
+    await f.context.loadGlobalTodos();
+    expect(notices).toHaveLength(1);
+  });
 });

@@ -9,6 +9,23 @@ the checkbox stores the user's choice, while the recovery row explains when the
 system prevents visible delivery. Notifications do not change task execution,
 window-close, or process-exit behavior.
 
+New shared-project to-dos assigned to the active account also use this native
+attention layer, with distinct To-do copy and grouping. A first complete pull
+establishes a device-local baseline. Later complete pulls notify only about
+new creations by another member, excluding completed tasks; edits and
+reassignments do not generate creation reminders. Repeated pulls and restarts
+retain the boundary, including IDs sharing the same creation second. A batch
+creates one counted alert and its click targets the newest item in that batch.
+The Main process refreshes hidden/minimized/windowless apps at a five-minute
+cadence after the preceding check finishes; visible windows retain their
+existing refresh behavior. Fully quitting Orkas stops this work.
+
+Clicking a To-do notification validates the current account and shared
+membership, refreshes the target task, then opens its project scope on the
+To-dos page and scrolls/highlights its row. Deleted/inaccessible targets show
+localized feedback; transport failure asks the user to retry. Later explicit
+navigation or an account change supersedes an in-flight notification click.
+
 Unread task replies are a separate in-app attention layer. Their red dots are
 sidebar-only: next to the Tasks/Projects section labels, the owning project,
 and each unread task row. No project header, project tab, or content task list
@@ -25,6 +42,20 @@ may mirror those dots.
 | Notice a finished background task | Completed, failed, waiting for input, or cancelled; app focused or backgrounded | Supported background terminal states create one generic native notification; focused/cancelled states do not | Missing notification hides completed work; a false notification distracts the user | Main feature tests observe the native-notification adapter and prohibited calls | Actual banners require platform manual verification |
 
 ## Automated coverage
+
+- `test/main/features/shared-project-task-sync.test.ts` and
+  `test/main/features/shared-project-todo-notifications.test.ts`: initial
+  baseline, assignment/creator/status filtering, equal-time IDs, restart,
+  membership replacement, failed pulls, damaged checkpoint recovery, and a
+  10,000-item catch-up with one notification and no task content in its checkpoint.
+- `test/main/features/shared-project-background.test.ts`: hidden/windowless
+  refresh admission, slow-request serialization, failure cadence and shutdown.
+- `test/e2e/shared_projects_e2e_todo_notifications.spec.ts`: production
+  refresh/sync/default notification subscription, captured OS options and real
+  click handler through Main/Preload/IPC to the visible highlighted row, plus
+  deleted-target feedback in Chinese and English. Only the OS presentation and
+  remote project API are controlled; actual OS banner presentation remains a
+  platform smoke check.
 
 - `test/e2e/settings_e2e_persistence.spec.ts`
   - changes the real Settings checkbox through renderer, preload, Main IPC, and

@@ -42,6 +42,7 @@ import {
   userCloudRoot,
 } from '../paths';
 import { nowIso, readJson, writeJson } from '../storage';
+import { FileSnapshotCache, mapFileSnapshots } from '../util/file-snapshot';
 import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { taskContent } from '../util/project-task-content';
@@ -257,6 +258,27 @@ async function _resolveOwner(
  *  Backlog order = created_at asc. Missing project / tasks dir → []. */
 export async function listTasks(uid: string, pid: string): Promise<ProjectTask[]> {
   return listLocalTasksForMigration(uid, pid);
+}
+
+type TaskSearchRow = Pick<ProjectTask, 'id' | 'content' | 'status'>;
+const _searchSnapshots = new FileSnapshotCache<TaskSearchRow>(row => 128 + 2 * row.content.length);
+
+/** The caller already resolved the account's project catalog. Shared work
+ * keeps using the same authoritative local outbox snapshot as its page. */
+export async function listTaskSearchRows(
+  uid: string, pid: string, _project?: { project_id: string; name: string },
+): Promise<TaskSearchRow[]> {
+  if (!(await _scopeExists(uid, pid))) return [];
+  let entries: fs.Dirent[];
+  try { entries = await fsp.readdir(_tasksDir(uid, pid), { withFileTypes: true }); }
+  catch { return []; }
+  const ids = entries.filter(entry => entry.isFile() && entry.name.endsWith('.json'))
+    .map(entry => entry.name.slice(0, -5)).filter(id => TASK_ID_RE.test(id));
+  const rows = await mapFileSnapshots(ids, id => _searchSnapshots.read(_taskFile(uid, pid, id), async () => {
+    const task = await _readTask(uid, pid, id);
+    return task ? { id: task.id, content: task.content, status: task.status } : null;
+  }));
+  return rows.filter((row): row is TaskSearchRow => row !== null);
 }
 
 export interface OpenTaskRow extends ProjectTask {
@@ -495,24 +517,26 @@ export async function createTask(
     }
 
     const id = suppliedId || genTaskId();
-    const attachments = suppliedId ? orderTaskAttachments(_scanAttachmentsDir(uid, pid, id), input.attachment_order) : [];
-    const now = nowIso();
-    const task: ProjectTask = {
-      id,
-      content,
-      status: requestedStatus,
-      created_by: clampStr(input.created_by, 200) || 'user',
-      created_at: now,
-      updated_at: now,
-      ...owner,
-      ...(dependsOn.length ? { depends_on: dependsOn } : {}),
-      ...(typeof input.origin_cid === 'string' && input.origin_cid ? { origin_cid: input.origin_cid } : {}),
-      ...(attachments.length ? { attachments } : {}),
-      ...(input.due_at ? { due_at: input.due_at } : {}),
-    };
-    await _writeTask(uid, pid, task);
-    log.info('created', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(task.id), status: task.status });
-    return { ok: true, task, alreadyExists: false };
+    return withTaskUpdateLock(uid, pid, id, async () => {
+      const attachments = suppliedId ? orderTaskAttachments(_scanAttachmentsDir(uid, pid, id), input.attachment_order) : [];
+      const now = nowIso();
+      const task: ProjectTask = {
+        id,
+        content,
+        status: requestedStatus,
+        created_by: clampStr(input.created_by, 200) || 'user',
+        created_at: now,
+        updated_at: now,
+        ...owner,
+        ...(dependsOn.length ? { depends_on: dependsOn } : {}),
+        ...(typeof input.origin_cid === 'string' && input.origin_cid ? { origin_cid: input.origin_cid } : {}),
+        ...(attachments.length ? { attachments } : {}),
+        ...(input.due_at ? { due_at: input.due_at } : {}),
+      };
+      await _writeTask(uid, pid, task);
+      log.info('created', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(task.id), status: task.status });
+      return { ok: true, task, alreadyExists: false };
+    });
   });
 }
 
@@ -600,8 +624,10 @@ export async function updateTask(
 
 /** Record the conversation a to-do belongs to without rolling anything back if
  *  the backlink fails. Dispatch entry points call this after an admitted run;
- *  the `todo_tasks` create handler calls it once for a global to-do saved from
- *  a conversation, so opening or running it returns there. Status edits do not. */
+ *  the `todo_tasks` create handler calls it once for a to-do saved from a
+ *  conversation (in a project, only that conversation's first open one) and
+ *  `project_setup` for its first initial to-do, so opening or running it
+ *  returns there. Status edits do not. */
 export async function recordTaskExecution(uid: string, pid: string, tid: string, cid: string): Promise<void> {
   try {
     if (!TASK_ID_RE.test(tid) || !cid.trim()) {
@@ -693,16 +719,15 @@ function _scanAttachmentsDir(uid: string, pid: string, tid: string): string[] {
 }
 
 // Re-derive the task JSON's cached attachment list from the dir (authoritative).
+// Caller holds the task update lock through file persistence and this refresh.
 // No-op when the task JSON doesn't exist yet (a draft — create() adopts the dir).
 async function _syncAttachmentList(uid: string, pid: string, tid: string): Promise<void> {
-  await withTaskUpdateLock(uid, pid, tid, async () => {
-    const cur = await _readTask(uid, pid, tid);
-    if (!cur) return;
-    const names = orderTaskAttachments(_scanAttachmentsDir(uid, pid, tid), cur.attachments);
-    if (names.length) cur.attachments = names; else delete cur.attachments;
-    cur.updated_at = nowIso();
-    await _writeTask(uid, pid, cur);
-  });
+  const cur = await _readTask(uid, pid, tid);
+  if (!cur) return;
+  const names = orderTaskAttachments(_scanAttachmentsDir(uid, pid, tid), cur.attachments);
+  if (names.length) cur.attachments = names; else delete cur.attachments;
+  cur.updated_at = nowIso();
+  await _writeTask(uid, pid, cur);
 }
 
 /** List a task's attachment filenames (directory scan). */
@@ -728,9 +753,21 @@ export async function resolveTaskAttachmentPath(uid: string, pid: string, tid: s
  *  yet). Validates the name + type against the composer's whitelist. */
 export async function uploadTaskAttachment(
   uid: string, pid: string, tid: string, name: string, buf: Buffer,
-  options: { overwrite?: boolean } = {},
+  options: { overwrite?: boolean; requireTask?: boolean } = {},
 ): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
   if (!TASK_ID_RE.test(tid)) return { ok: false, error: 'invalid_task_id' };
+  return withTaskUpdateLock(uid, pid, tid, async () => {
+    // A saved-task copy must not become a draft upload after a concurrent
+    // deletion. Keep existence, bytes and metadata in the deletion's lock.
+    if (options.requireTask && !await getTask(uid, pid, tid)) return { ok: false as const, error: 'task_not_found' };
+    return _uploadTaskAttachment(uid, pid, tid, name, buf, options);
+  });
+}
+
+async function _uploadTaskAttachment(
+  uid: string, pid: string, tid: string, name: string, buf: Buffer,
+  options: { overwrite?: boolean },
+): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
   if (!(await _scopeExists(uid, pid))) return { ok: false, error: 'project_not_found' };
   const safe = _sanitiseAttachmentName(name);
   if (!safe) return { ok: false, error: 'invalid_name' };
@@ -762,6 +799,12 @@ export async function deleteTaskAttachment(
   uid: string, pid: string, tid: string, name: string,
 ): Promise<{ ok: boolean }> {
   if (!TASK_ID_RE.test(tid)) return { ok: false };
+  return withTaskUpdateLock(uid, pid, tid, () => _deleteTaskAttachment(uid, pid, tid, name));
+}
+
+async function _deleteTaskAttachment(
+  uid: string, pid: string, tid: string, name: string,
+): Promise<{ ok: boolean }> {
   const safe = _sanitiseAttachmentName(name);
   if (!safe) return { ok: false };
   const target = path.join(_taskAttachmentsDir(uid, pid, tid), safe);
@@ -780,9 +823,11 @@ export async function deleteTaskAttachment(
  *  deleteTaskAttachment / deleteTask). */
 export async function discardTaskAttachmentDraft(uid: string, pid: string, tid: string): Promise<{ ok: boolean }> {
   if (!TASK_ID_RE.test(tid)) return { ok: false };
-  if (fs.existsSync(_taskFile(uid, pid, tid))) return { ok: false };
-  try { fs.rmSync(_taskAttachmentsDir(uid, pid, tid), { recursive: true, force: true }); }
-  catch (err) { log.warn('attachment draft discard', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), error: logErrorSummary(err) }); return { ok: false }; }
-
-  return { ok: true };
+  return withTaskUpdateLock(uid, pid, tid, async () => {
+    if (fs.existsSync(_taskFile(uid, pid, tid))) return { ok: false };
+    try { fs.rmSync(_taskAttachmentsDir(uid, pid, tid), { recursive: true, force: true }); }
+    catch (err) { log.warn('attachment draft discard', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), error: logErrorSummary(err) }); return { ok: false }; }
+  
+    return { ok: true };
+  });
 }

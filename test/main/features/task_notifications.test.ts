@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../../src/main/i18n', () => ({
   // Default to a stale English process locale. Production must pass the
@@ -62,6 +62,8 @@ describe('task completion notifications', () => {
   let focused: boolean;
   let supported: boolean;
 
+  afterEach(() => { stopTaskNotifications?.(); });
+
   beforeEach(() => {
     clickListener = null;
     closeListener = null;
@@ -99,6 +101,7 @@ describe('task completion notifications', () => {
       },
       createNotification,
       openConversation,
+      openTodo: vi.fn(),
     };
     stopTaskNotifications = startTaskNotifications(runtime, (next) => {
       listener = next;

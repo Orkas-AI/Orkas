@@ -429,7 +429,7 @@ describe('projects › deleteProject', () => {
     const conv = await chats.createConversation(TEST_UID, { projectId: pid });
     const projectFile = path.join(tmpDir, TEST_UID, 'cloud', 'projects', pid, 'project.json');
 
-    vi.spyOn(chats, 'listConversations').mockRejectedValueOnce(new Error('temporary index read failure'));
+    vi.spyOn(chats, 'listConversationDeletionRows').mockRejectedValueOnce(new Error('temporary index read failure'));
     const result = await projects.deleteProject(TEST_UID, pid);
 
     expect(result).toEqual({ ok: false, error: 'cascade_failed' });
@@ -877,6 +877,76 @@ describe('projects › instructions', () => {
     fs.writeFileSync(file, 'y'.repeat(projects.PROJECT_INSTRUCTIONS_CHAR_LIMIT * 3));
     const block = projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid);
     expect(block.length).toBeLessThan(projects.PROJECT_INSTRUCTIONS_CHAR_LIMIT + 300); // content capped + header
+  });
+
+  it.each(['EACCES', 'EIO', 'EPERM', 'EBUSY'])('reports %s to the model without inventing empty instructions or caching the failure', async code => {
+    const records = await capturePrivateDiagnostics();
+    const projects = await loadProjects();
+    const created = await projects.createProject(TEST_UID, 'Instructions');
+    if (!created.ok) throw new Error('create failed');
+    const pid = created.project.project_id;
+    const rule = 'Keep the release channel private.';
+    await projects.writeProjectInstructions(TEST_UID, pid, rule);
+    records.length = 0;
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'projects', pid, 'ORKAS.md');
+    const originalRead = fs.readFileSync;
+    const nativeFs = (await import('node:fs')).default;
+    const read = vi.spyOn(nativeFs, 'readFileSync').mockImplementation(((target: any, ...args: any[]) => {
+      if (String(target) === file) throw Object.assign(new Error(`Private failure: ${file} ${rule}`), { code });
+      return (originalRead as any)(target, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      const block = projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid);
+      expect(block).toContain('## Project instructions (user-authored)');
+      expect(block).toContain('unavailable');
+      expect(block).toContain('not mean that the project has no instructions');
+      expect(block).toContain('Continue the task');
+      expect(block.length).toBeLessThan(400);
+      for (const privateValue of [file, rule, TEST_UID, 'Private failure']) {
+        expect(block).not.toContain(privateValue);
+        expect(JSON.stringify(records)).not.toContain(privateValue);
+      }
+      expect(records).toHaveLength(1);
+    } finally { read.mockRestore(); syncBuiltinESMExports(); }
+    expect(fs.readFileSync(file, 'utf8')).toBe(rule);
+    const recovered = projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid);
+    expect(recovered).toContain(rule);
+    expect(recovered).not.toContain('unavailable');
+  });
+
+  it.each(['temporary-write', 'publish'])('preserves readable instructions if the %s fails', async failurePoint => {
+    const projects = await loadProjects();
+    const created = await projects.createProject(TEST_UID, 'Atomic instructions');
+    if (!created.ok) throw new Error('create failed');
+    const pid = created.project.project_id;
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'projects', pid, 'ORKAS.md');
+    await projects.writeProjectInstructions(TEST_UID, pid, 'Original complete rule.');
+    const nativeFs = (await import('node:fs')).default;
+    const originalWrite = fs.writeFileSync;
+    const originalRename = fs.renameSync;
+    const publish = vi.spyOn(nativeFs, 'renameSync').mockImplementation((from, to) => {
+      if (String(to) === file) {
+        expect(projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid)).toContain('Original complete rule.');
+        if (failurePoint === 'publish') throw Object.assign(new Error('injected publication failure'), { code: 'EIO' });
+      }
+      return originalRename(from, to);
+    });
+    const write = vi.spyOn(nativeFs, 'writeFileSync').mockImplementation(((target: any, ...args: any[]) => {
+      if (String(target).startsWith(`${file}.`)) {
+        (originalWrite as any)(target, 'Partial candidate');
+        if (failurePoint === 'temporary-write') throw Object.assign(new Error('injected write failure'), { code: 'EIO' });
+      }
+      return (originalWrite as any)(target, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      await expect(projects.writeProjectInstructions(TEST_UID, pid, 'New complete rule.')).rejects.toThrow('injected');
+      expect(projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid)).toContain('Original complete rule.');
+      expect(fs.readdirSync(path.dirname(file)).filter(name => name.endsWith('.tmp'))).toEqual([]);
+    } finally { write.mockRestore(); publish.mockRestore(); syncBuiltinESMExports(); }
+    expect(await projects.writeProjectInstructions(TEST_UID, pid, 'New complete rule.')).toEqual({ ok: true });
+    expect(projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid)).toContain('New complete rule.');
   });
 });
 

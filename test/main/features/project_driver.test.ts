@@ -152,6 +152,14 @@ describe('project_driver › config + state IO', () => {
 
   const load = () => import('../../../src/main/features/project_driver');
 
+  it('strict exit checks distinguish malformed auto-advance state from an absent opt-in', async () => {
+    const drv = await load();
+    expect((await drv.readConfig(UID, PID, true)).enabled).toBe(false);
+    await drv.writeConfig(UID, PID, { enabled: true });
+    const file = path.join(tmpDir, UID, 'cloud', 'projects', PID, 'driver.json');
+    fs.writeFileSync(file, '{broken');
+    await expect(drv.readConfig(UID, PID, true)).rejects.toThrow();
+  });
   it('config defaults to disabled when absent, round-trips, and clamps the cap', async () => {
     const drv = await load();
     expect(await drv.readConfig(UID, PID)).toEqual({ enabled: false, max_advances_per_day: drv.DEFAULT_MAX_ADVANCES_PER_DAY });

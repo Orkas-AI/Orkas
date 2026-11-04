@@ -108,7 +108,8 @@ describe('CLI context › user language across dispatch and resume', () => {
     const final = await build({ ...ITEM, outputDelivery: 'final' });
     const process = await build({ ...ITEM, outputDelivery: 'process' });
     expect(final.turnPrompt).toContain('## Keeping work going');
-    expect(final.turnPrompt).toContain('## Giving work a project');
+    // A CLI Agent cannot create a project, so it is never told to offer one.
+    expect(final.turnPrompt).not.toContain('## Giving work a project');
     expect(process.turnPrompt).not.toContain('## Keeping work going');
     expect(final.durableInstructions).toBe(process.durableInstructions);
     const slash = await build({ ...ITEM, llmPayload: `<msg from="user" to="${AGENT.agent_id}">\n/help\n</msg>` });
