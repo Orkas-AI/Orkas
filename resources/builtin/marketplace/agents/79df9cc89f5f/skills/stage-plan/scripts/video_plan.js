@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -84,6 +85,68 @@ function readJson(rawPath, label) {
 
 function fmtIssues(issues) {
   return issues.map((x) => `  - [${x.code}] ${x.path}: ${x.message}`).join('\n');
+}
+
+// A failing validate or promise_check returns its repair list for two repair
+// passes in a run; the next failure hands the plan to the user instead. A
+// shell command cannot end the turn and the runtime does not count failed
+// commands as stalled work, so without this bound an edit/check loop on a
+// plan the model cannot fix ran until the per-turn tool cap (2026-10-31).
+const MAX_REPAIR_PASSES = 2;
+const CHECKS_FILE = '.video_plan_checks.json';
+const HAND_OFF = {
+  requires_user_decision: true,
+  next_step_owner: 'user',
+  next_action: 'present_blocker_to_user_and_end_turn',
+};
+
+/** The budget's run key: the host's per-run token, hashed so the record holds
+ *  no environment value. Without one (standalone use, an older host) a single
+ *  budget spans runs and resets only when the check passes. */
+function currentRunKey() {
+  const token = String(process.env.ORKAS_RUN_TOKEN || '').trim();
+  return token ? crypto.createHash('sha256').update(token).digest('hex').slice(0, 16) : '';
+}
+
+/** Record one check outcome; returns this run's failures of `op` on the plan,
+ *  or 0 when nothing could be recorded, so a result never states a budget it
+ *  did not keep. A pass with no recorded failures writes nothing. */
+function recordCheck(planPath, op, passed) {
+  const file = path.join(path.dirname(planPath), CHECKS_FILE);
+  let checks = {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) checks = parsed;
+  } catch { /* missing or unreadable: start a new record */ }
+  const key = path.basename(planPath);
+  const run = currentRunKey();
+  const prior = checks[key] && typeof checks[key] === 'object' && checks[key].run === run ? checks[key] : {};
+  const count = (name) => (Number.isInteger(prior[name]) && prior[name] > 0 ? prior[name] : 0);
+  const entry = { run, validate: count('validate'), promise_check: count('promise_check') };
+  if (passed && !entry[op]) return 0;
+  entry[op] = passed ? 0 : entry[op] + 1;
+  checks[key] = entry;
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(checks)}\n`, 'utf8');
+    fs.renameSync(tmp, file);
+  } catch {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    return 0;
+  }
+  return entry[op];
+}
+
+function repairBudget(failed) {
+  if (!failed) return {};
+  const remaining = Math.max(0, MAX_REPAIR_PASSES + 1 - failed);
+  return { max_repair_passes: MAX_REPAIR_PASSES, repair_passes_remaining: remaining, ...(remaining ? {} : HAND_OFF) };
+}
+
+function handOffText(failed) {
+  return `This plan failed this check ${failed} times this turn (${MAX_REPAIR_PASSES} repair passes used). `
+    + 'Stop editing the plan. Explain the remaining problems below to the user in plain language, ask how to proceed, '
+    + 'end your reply with <plan-interaction status="open" />, and call no more tools.';
 }
 
 function normalizeTakes(raw) {
@@ -187,6 +250,8 @@ module.exports = async function videoPlan({ args }) {
 
   if (opts.op === 'validate') {
     const valid = result.ok;
+    const failed = recordCheck(planPath, 'validate', valid);
+    const handOff = failed > MAX_REPAIR_PASSES;
     // A valid plan is about to be shown to the user, and this is the last
     // thing the model reads before showing it. Twice on 2026-08-08 the model
     // read "plan VALID", wrote its own six-line abstract, and asked for
@@ -195,14 +260,16 @@ module.exports = async function videoPlan({ args }) {
     // not where the decision to present gets made.
     const summary = valid ? summarizeEdl(plan) : '';
     const text = [
-      valid
-        ? `plan VALID${result.warnings.length ? ` with ${result.warnings.length} warning(s)` : ''}.`
-        : `plan INVALID: ${result.errors.length} error(s) must be fixed before gate B.`,
+      handOff
+        ? handOffText(failed)
+        : valid
+          ? `plan VALID${result.warnings.length ? ` with ${result.warnings.length} warning(s)` : ''}.`
+          : `plan INVALID: ${result.errors.length} error(s) must be fixed before gate B.`,
       result.errors.length ? `Errors:\n${fmtIssues(result.errors)}` : '',
-      result.warnings.length ? `Warnings:\n${fmtIssues(result.warnings)}` : '',
+      result.warnings.length && !handOff ? `Warnings:\n${fmtIssues(result.warnings)}` : '',
       valid ? `Gate B - plan summary (present this to the user in their language):\n${summary}` : '',
     ].filter(Boolean).join('\n');
-    const payload = { ok: valid, op: opts.op, plan_path: planPath, valid, errors: result.errors, warnings: result.warnings, ...(valid ? { summary } : {}), text };
+    const payload = { ok: valid, op: opts.op, plan_path: planPath, valid, errors: result.errors, warnings: result.warnings, ...(valid ? { summary } : repairBudget(failed)), text };
     if (!valid) {
       process.stderr.write(JSON.stringify(payload) + '\n');
       process.exit(1);
@@ -221,19 +288,24 @@ module.exports = async function videoPlan({ args }) {
   if (opts.op === 'promise_check') {
     const produced = opts.probeProduced ? await collectProducedSec(plan, planPath) : null;
     const assessment = assessDelivery(plan, produced ? { producedSec: produced.producedSec } : {});
-    const text = `promise_check: ${assessment.verdict.toUpperCase()} - motion ${Math.round(assessment.motion_ratio * 100)}% of ${assessment.total_primary_sec}s primary`
+    const passed = assessment.verdict !== 'fail';
+    const failed = recordCheck(planPath, 'promise_check', passed);
+    const verdict = `promise_check: ${assessment.verdict.toUpperCase()} - motion ${Math.round(assessment.motion_ratio * 100)}% of ${assessment.total_primary_sec}s primary`
       + (assessment.motion_min_ratio > 0 ? ` (floor ${Math.round(assessment.motion_min_ratio * 100)}%)` : '')
       + (assessment.source_required ? `, source ${assessment.source_present ? 'present' : 'MISSING'}` : '')
       + (produced ? ', using produced_path durations' : ', using planned target_sec durations')
       + '.'
-      + (assessment.issues.length ? `\nIssues:\n${assessment.issues.map((x) => `  - ${x}`).join('\n')}` : '')
-      + (assessment.verdict === 'fail' ? '\nDo NOT deliver - re-plan or re-assemble to honor the promise.' : '');
+      + (assessment.issues.length ? `\nIssues:\n${assessment.issues.map((x) => `  - ${x}`).join('\n')}` : '');
+    const text = failed > MAX_REPAIR_PASSES
+      ? `${handOffText(failed)}\n${verdict}`
+      : verdict + (passed ? '' : '\nDo NOT deliver - re-plan or re-assemble to honor the promise.');
     const payload = {
-      ok: assessment.verdict !== 'fail',
+      ok: passed,
       op: opts.op,
       plan_path: planPath,
       assessment,
       ...(produced ? { produced_sec: produced.producedSec, produced_paths: produced.producedPaths } : {}),
+      ...repairBudget(failed),
       text,
     };
     if (assessment.verdict === 'fail') {

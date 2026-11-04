@@ -174,6 +174,24 @@ describe('bound generated-video caption revisions', () => {
     expect(videoProductionIsCaptionEdit(joined)).toBe(false);
   });
 
+  it('names the assembly route when the approved plan is not a caption revision', async () => {
+    // 2026-10-31 drives: "other edits use the existing EDL assembly path"
+    // named no path, and the refusal was read as multi-segment editing being
+    // unsupported, which ended the turn.
+    plan.segments = [0, 1].map((index) => ({
+      id: `cut-${index}`, order: index + 1, role: 'body', layer: 'primary', source: 'edit', target_sec: 2,
+      spec: { input_id: 'source', in_sec: index * 2, out_sec: index * 2 + 2 },
+    }));
+    plan.tracks = { captions: { lines: [{ text: 'Caption', start_sec: 0, target_sec: 1 }] } };
+    plan.cost_estimate = { billable_generations: 0 };
+    save();
+    await approveVideoProductionPlan({ statePath, planPath, turnId: 'edit-plan' });
+    await expect(editVideoProductionCaptions(options())).rejects.toThrow(
+      /^E_VIDEO_PRODUCTION_EDIT_UNSUPPORTED: .*stage-assemble.*stage-edit edit_video.*produced_path.*The approved plan is unchanged\.$/,
+    );
+    expect((await readVideoProductionControlState(statePath, planPath)).local_outputs).toBeUndefined();
+  });
+
   it('requires the current plan approval and never treats a pure plan as a local edit', async () => {
     await expect(editVideoProductionCaptions(options())).rejects.toThrow('E_VIDEO_PRODUCTION_LOCAL_EDIT_REQUIRED');
     await amend(); plan.tracks.captions.lines[0].text = 'Unsigned amendment'; save();

@@ -38,6 +38,7 @@ type VideoStudio = {
   inspectComposition: (p: CompositionOptions) => Promise<InspectResult>;
   prepareComposition: (p: CompositionOptions) => Promise<InspectResult>;
   snapshotComposition: (p: CompositionOptions) => Promise<InspectResult>;
+  checkCompositionScenes: (p: { compositionDirAbs: string; sceneIds: unknown }) => Promise<InspectResult>;
 };
 
 // The production feature modules are CommonJS; this runner is ESM because the
@@ -166,6 +167,25 @@ type Case = { name: string; run: () => Promise<string[]> };
 /** Each case returns the reasons it failed; an empty list is a pass. */
 function buildCases(root: string): Case[] {
   return [
+    {
+      name: 'scene_check captures start, middle and end of a named scene outside the preview state',
+      run: async () => {
+        const dir = await scaffoldComposition(root, 'scene-check');
+        const failures: string[] = [];
+        const result = await videoStudio.checkCompositionScenes({ compositionDirAbs: dir, sceneIds: ['cover'] });
+        if (result.ok !== true) return [`scene_check failed: ${result.errorCode || ''} ${result.message || ''}`];
+        const samples = (result.samples || []) as Array<{ path: string; label: string }>;
+        if (samples.length !== 3) failures.push(`expected 3 frames, got ${samples.length}`);
+        for (const sample of samples) {
+          if (!sample.path.includes(path.join('preview', 'scene-check'))) failures.push(`frame outside preview/scene-check: ${sample.path}`);
+          const size = nativeImage.createFromPath(sample.path).getSize();
+          if (size.width !== 1920 || size.height !== 1080) failures.push(`${sample.label} is ${size.width}x${size.height}`);
+        }
+        const unknown = await videoStudio.checkCompositionScenes({ compositionDirAbs: dir, sceneIds: ['missing'] });
+        if (unknown.errorCode !== 'E_SCENE_CHECK_SCENE') failures.push(`unknown scene returned ${unknown.errorCode}`);
+        return failures;
+      },
+    },
     {
       name: 'a display-clamped window still previews the full approved video canvas',
       run: async () => {

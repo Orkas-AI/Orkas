@@ -377,3 +377,54 @@ describe.skipIf(!haveFfmpeg)('concat across parts that do not share a canvas', (
     expect((result as any).conform).toBeUndefined();
   }, 120_000);
 });
+
+describe.skipIf(!haveFfmpeg)('concat when only some parts carry sound', () => {
+  // 2026-10-31 runs: a silent composed title card first, narrated cuts after.
+  // The concat demuxer takes its streams from the first input, so the joined
+  // video had no audio at all; a silent part in the middle ended it early.
+  function clip(dir: string, name: string, withAudio: boolean): string {
+    const out = path.join(dir, name);
+    const r = spawnSync(bins.ffmpeg!, [
+      '-y', '-f', 'lavfi', '-i', 'color=c=blue:s=640x360:r=24:d=2',
+      ...(withAudio ? ['-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2', '-c:a', 'aac', '-shortest'] : []),
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', out,
+    ], { encoding: 'utf8' });
+    expect(r.status, r.stderr).toBe(0);
+    return out;
+  }
+  function audioDuration(file: string): number | null {
+    const r = spawnSync(bins.ffprobe!, [
+      '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=duration', '-of', 'csv=p=0', file,
+    ], { encoding: 'utf8' });
+    const value = Number(r.stdout.trim());
+    return r.stdout.trim() && Number.isFinite(value) ? value : null;
+  }
+
+  it.each([
+    ['silent part first', [false, true]],
+    ['silent part last', [true, false]],
+  ])('keeps the sound across the whole join with the %s', async (_label, layout) => {
+    const dir = tmp();
+    const parts = (layout as boolean[]).map((withAudio, index) => clip(dir, `p${index}.mp4`, withAudio));
+    const out = path.join(dir, 'joined.mp4');
+    const result = await editVideo({ op: 'concat', inputAbsPaths: parts, outputAbsPath: out });
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    expect(audioDuration(out)).toBeGreaterThan(3.8);
+    const audioConform = (result as any).audio_conform;
+    expect(audioConform.padded_inputs).toEqual(parts.filter((_, index) => !(layout as boolean[])[index]));
+    expect(audioConform.note).toMatch(/keeps the sound of the others/);
+  }, 120_000);
+
+  it.each([
+    ['every part has sound', [true, true], true],
+    ['no part has sound', [false, false], false],
+  ])('leaves the join unchanged when %s', async (_label, layout, hasAudio) => {
+    const dir = tmp();
+    const parts = (layout as boolean[]).map((withAudio, index) => clip(dir, `q${index}.mp4`, withAudio));
+    const out = path.join(dir, 'joined.mp4');
+    const result = await editVideo({ op: 'concat', inputAbsPaths: parts, outputAbsPath: out });
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    expect(audioDuration(out) !== null).toBe(hasAudio);
+    expect((result as any).audio_conform).toBeUndefined();
+  }, 120_000);
+});

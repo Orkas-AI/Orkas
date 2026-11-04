@@ -120,8 +120,13 @@ export type VideoProductionSegmentReviewFact = {
   /** Why an uncaptured segment has nothing reviewable. One vocabulary for
    *  every consumer — the 2026-08-23 deadlock stayed undiagnosable because
    *  "media path does not resolve" and "composition not authored" were
-   *  collapsed into the same silent false. */
-  reason?: 'no_composition' | 'no_snapshot' | 'snapshot_stale' | 'media_path_unresolved' | 'media_unreadable';
+   *  collapsed into the same silent false. `not_produced` is a cut or
+   *  generated segment whose plan has no produced_path yet, the normal state
+   *  after approval; reported as an unresolved path, it read as missing
+   *  footage and stalled the 2026-10-31 runs. `produced_path_in_spec` is the
+   *  same gap when the path was written inside spec, where nothing reads it. */
+  reason?: 'no_composition' | 'no_snapshot' | 'snapshot_stale' | 'not_produced' | 'produced_path_in_spec'
+    | 'media_path_unresolved' | 'media_unreadable';
 };
 
 /** One narration line the host itself synthesized for this EDL.
@@ -1316,6 +1321,57 @@ export async function releaseVideoProductionGeneration(input: {
   });
   if (!released) throw new Error('E_VIDEO_PRODUCTION_GENERATION_TRANSACTION_STALE');
   return released;
+}
+
+/** Reserve a host-selected collision suffix before the stopped task writes it.
+ * The original output stays the request identity used by completed reuse. */
+export async function reserveVideoProductionGenerationOutput(input: {
+  statePath: string;
+  planPath: string;
+  transactionId: string;
+  segmentId: string;
+  kind: VideoProductionGenerationKind;
+  outputPath: string;
+}): Promise<void> {
+  await mutexFor(input.statePath).runExclusive(async () => {
+    const state = await readVideoProductionControlState(input.statePath, input.planPath);
+    const key = transactionKey(input.kind, input.segmentId);
+    const transaction = state.transactions[key];
+    if (!transaction || transaction.transaction_id !== input.transactionId || transaction.status !== 'pending'
+      || transaction.kind !== input.kind || transaction.segment_id !== input.segmentId) {
+      throw new Error('E_VIDEO_PRODUCTION_GENERATION_TRANSACTION_STALE: transaction no longer owns this segment');
+    }
+    const outputAbs = path.resolve(input.outputPath);
+    const originalAbs = path.resolve(transaction.output_path);
+    const original = path.parse(originalAbs);
+    const selected = path.parse(outputAbs);
+    const suffix = selected.name.startsWith(`${original.name}-`) ? selected.name.slice(original.name.length + 1) : '';
+    const ordinal = Number(suffix);
+    if (outputAbs !== originalAbs && !(selected.dir === original.dir && selected.ext === original.ext
+      && Number.isSafeInteger(ordinal) && ordinal >= 2 && String(ordinal) === suffix)) {
+      throw new Error('E_VIDEO_PRODUCTION_GENERATION_OUTPUT_UNEXPECTED: stopped output is not a collision rename of this transaction');
+    }
+    for (const [otherKey, other] of Object.entries(state.transactions)) {
+      if (otherKey === key || other.status === 'failed') continue;
+      const otherPaths = other.reserved_output_paths?.length ? other.reserved_output_paths : [other.output_path];
+      if (otherPaths.some(candidate => path.resolve(candidate) === outputAbs)) {
+        throw new Error('E_VIDEO_PRODUCTION_OUTPUT_RESERVED: another approved segment already owns the selected output path');
+      }
+    }
+    const exists = await fs.lstat(outputAbs).then(() => true, error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    });
+    if (exists) throw new Error('E_VIDEO_PRODUCTION_OUTPUT_COLLISION: the selected output path already exists');
+    const reserved = (transaction.reserved_output_paths?.length
+      ? transaction.reserved_output_paths : [originalAbs]).map(candidate => path.resolve(candidate));
+    if (reserved.includes(outputAbs)) return;
+    transaction.reserved_output_paths = [...reserved, outputAbs];
+    transaction.updated_at = new Date().toISOString();
+    state.revision += 1;
+    state.updated_at = transaction.updated_at;
+    await writeState(input.statePath, state);
+  });
 }
 
 export async function finishVideoProductionGeneration(input: {

@@ -216,10 +216,62 @@ describe('reference video ingestion through the real tool', () => {
     expect(fs.existsSync(body(success).contact_sheet)).toBe(true);
   });
 
-  it.each([[[-1]], [[2]], [[0, 0]], [[0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]], [['1']]])('rejects invalid or unbounded timestamps %j', async (sample_times) => {
+  it.each([[[-1]], [[2]], [[0, 0]], [Array.from({ length: 33 }, (_v, i) => i * 0.05)], [['1']]])('rejects invalid or unbounded timestamps %j', async (sample_times) => {
     const result = await (await tool()).execute({ op: 'reference.inspect', input_path: source, sample_times }, ctx());
     expect(result.isError).toBe(true);
     expect(result.images).toBeUndefined();
     if (sample_times.length === 1 && sample_times[0] === 2) expect(body(result).duration_sec).toBe(2);
+  });
+
+  it('samples each detected shot and reports cut times and a silent soundtrack on the default pass', async () => {
+    const report = body(await (await tool()).execute({ op: 'reference.inspect', input_path: source }, ctx()));
+    expect(report.ok).toBe(true);
+    expect(report.shots).toMatchObject({ detected: true, count: 2 });
+    expect(report.shots.cuts_sec).toHaveLength(1);
+    expect(Math.abs(report.shots.cuts_sec[0] - 1)).toBeLessThan(0.1);
+    expect(report.audio).toEqual({ present: false, bpm: null, beat: 'none' });
+    const times = report.samples.map((sample: any) => sample.time_seconds);
+    expect(times[0]).toBe(0);
+    // One still just after the cut, besides the evenly spread fallbacks.
+    expect(times.some((t: number) => t > 1 && t <= 1.45)).toBe(true);
+  });
+});
+
+describe('reference rhythm helpers', () => {
+  it('takes one still per shot, thins to the cap and tops up sparse cut lists', async () => {
+    const { referenceSampleTimes } = await import('../../../../src/main/features/video_studio');
+    expect(referenceSampleTimes(10, [2, 2.3, 6])).toEqual([0, 2, 2.15, 2.7, 4, 6, 6.4, 8, 9.8]);
+    const many = referenceSampleTimes(50, Array.from({ length: 40 }, (_v, i) => 1 + i));
+    expect(many).toHaveLength(24);
+    expect(many[0]).toBe(0);
+    expect(Math.max(...many)).toBeLessThanOrEqual(49);
+  });
+
+  it('marks long shots that change inside themselves, strongest first', async () => {
+    const { referenceMovingShots } = await import('../../../../src/main/features/video_studio');
+    const scores = [
+      ...Array.from({ length: 90 }, (_v, i) => ({ t: i / 30, score: 0.001 })),        // 0-3 s: steady build (0.09)
+      ...Array.from({ length: 30 }, (_v, i) => ({ t: 3 + i / 30, score: 0 })),        // 3-4 s: still
+      ...Array.from({ length: 60 }, (_v, i) => ({ t: 4 + i / 30, score: i === 30 ? 0.5 : 0.004 })), // 4-6 s: wipe
+    ];
+    expect(referenceMovingShots(8, [3, 4], scores).map(m => [m.start_sec, m.end_sec])).toEqual([[4, 8], [0, 3]]);
+    // A shot under 1.5 s is a cut beat, not an animation to study.
+    expect(referenceMovingShots(4, [3], scores)).toEqual([expect.objectContaining({ start_sec: 0, end_sec: 3 })]);
+  });
+
+  it('measures a steady beat and withholds a tempo for noise', async () => {
+    const { estimateReferenceTempo } = await import('../../../../src/main/features/video_studio');
+    const rate = 11025;
+    const clicks = new Float32Array(rate * 20);
+    for (let beat = 0; beat < 40; beat += 1) {
+      const start = Math.round(beat * 0.5 * rate);
+      for (let i = 0; i < 400; i += 1) clicks[start + i] = Math.sin(i / 3) * Math.exp(-i / 80);
+    }
+    const steady = estimateReferenceTempo(clicks, rate);
+    expect(steady.bpm).not.toBeNull();
+    expect(Math.abs(steady.bpm! - 120)).toBeLessThan(1);
+    let seed = 7;
+    const noise = new Float32Array(rate * 20).map(() => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 1073741824 - 1; });
+    expect(estimateReferenceTempo(noise, rate).bpm).toBeNull();
   });
 });

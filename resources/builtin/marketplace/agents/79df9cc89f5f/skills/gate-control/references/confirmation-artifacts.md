@@ -71,14 +71,16 @@ text as the user's decision.
 | Paid generation | exact billable segment count plus current credit/billing evidence | `gate_c_decision` | `production.approve_generation` before provider call |
 | COMPOSE narration retry | current visual candidate, uncertain prior request, and exactly one proposed new request | `narration_retry_decision` | one fresh `composition.materialize_narration` transaction |
 | COMPOSE narration timing | complete audio, measured duration/band, visual readiness, and exhausted automatic timing retry | `narration_retry_decision` | one user-authorized synthesis or duration waiver using complete audio |
-| Final video | draft plus QA headline plus the draft result's `delivery_options` | `gate_d_decision` | composition -> `composition.approve_draft`; production -> `production.status` delivery check |
+| Final video | complete current draft/video plus QA headline; returned COMPOSE delivery options as described below | `gate_d_decision` | composition -> `composition.approve_draft`; production -> `production.status` delivery check |
 
 The QA headline is one readiness sentence plus any unresolved issue that affects
-viewing or use. At the final-video stop, show both `delivery_options` with their
-`estimated_minutes` so the wait is chosen knowingly. A plain confirmation
-exports the high-quality default; picking the faster preview-quality option is
-itself the user's acceptance of the lower quality — pass its exact `call`
-parameters and ask nothing further.
+viewing or use. For a COMPOSE draft that returns `delivery_options`, show both
+with their `estimated_minutes`. A plain confirmation exports the high-quality
+default; choosing the faster preview-quality option accepts its lower quality —
+pass its exact `call` parameters and ask nothing further.
+Without returned options, show the complete current video and QA headline and
+proceed with the existing final-video confirmation; do not wait for or invent
+options or estimates.
 
 ## Production plan content and language
 

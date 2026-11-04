@@ -222,6 +222,176 @@ describe('stage-plan video_plan skill script', () => {
     expect(out.assessment.verdict).toBe('fail');
   });
 
+  describe('repair budget', () => {
+    // A shell command cannot end the model's turn, and the runtime does not
+    // count failed commands as stalled work, so an edit/validate loop on a
+    // plan the model cannot fix ran until the per-turn tool cap. The check
+    // itself now gives two repair passes per run, then hands the plan to the
+    // user (requester decision 2026-10-31).
+    const HAND_OFF = 'This plan failed this check 3 times this turn (2 repair passes used). Stop editing the plan.'
+      + ' Explain the remaining problems below to the user in plain language, ask how to proceed, end your reply'
+      + ' with <plan-interaction status="open" />, and call no more tools.';
+
+    function invalidPlan() {
+      const plan = validPlan() as any;
+      plan.segments[0].role = 'not-a-role';
+      return plan;
+    }
+
+    function check(cwd: string, op: 'validate' | 'promise_check', token?: string) {
+      const res = runVideoPlan(cwd, ['--op', op, '--plan', 'project/plan.json'], { ORKAS_RUN_TOKEN: token ?? '' });
+      return { status: res.status, out: parseJsonOutput(res.status === 0 ? res.stdout : res.stderr) };
+    }
+
+    function rewrite(cwd: string, plan: unknown) {
+      fs.writeFileSync(path.join(cwd, 'project', 'plan.json'), `${JSON.stringify(plan)}\n`, 'utf8');
+    }
+
+    it('gives two repair passes in a turn, then hands the plan to the user', () => {
+      const cwd = makeProject(invalidPlan());
+      try {
+        const first = check(cwd, 'validate', 'run-a');
+        expect(first.status).toBe(1);
+        expect(first.out).toMatchObject({ valid: false, max_repair_passes: 2, repair_passes_remaining: 2 });
+        expect(first.out.requires_user_decision).toBeUndefined();
+        expect(first.out.text).toContain('must be fixed before gate B');
+
+        expect(check(cwd, 'validate', 'run-a').out.repair_passes_remaining).toBe(1);
+
+        const third = check(cwd, 'validate', 'run-a');
+        expect(third.status).toBe(1);
+        expect(third.out).toMatchObject({
+          ok: false,
+          valid: false,
+          max_repair_passes: 2,
+          repair_passes_remaining: 0,
+          requires_user_decision: true,
+          next_step_owner: 'user',
+          next_action: 'present_blocker_to_user_and_end_turn',
+        });
+        expect(third.out.text.startsWith(HAND_OFF)).toBe(true);
+        // The remaining problems are still there to explain, and nothing
+        // tells the model to keep fixing them.
+        expect(third.out.text).toContain('[E_SEG_ROLE] segments[0].role');
+        expect(third.out.errors.map((issue: { code: string }) => issue.code)).toContain('E_SEG_ROLE');
+        expect(third.out.text).not.toContain('must be fixed before gate B');
+
+        // Ignoring the hand-off does not reopen the repair list.
+        const fourth = check(cwd, 'validate', 'run-a');
+        expect(fourth.out).toMatchObject({ requires_user_decision: true, repair_passes_remaining: 0 });
+        expect(fourth.out.text).toContain('failed this check 4 times this turn');
+      } finally {
+        fs.rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('restores the full budget after the plan passes and in the next turn', () => {
+      const cwd = makeProject(invalidPlan());
+      try {
+        check(cwd, 'validate', 'run-a');
+        expect(check(cwd, 'validate', 'run-a').out.repair_passes_remaining).toBe(1);
+        rewrite(cwd, validPlan());
+        expect(check(cwd, 'validate', 'run-a').status).toBe(0);
+        rewrite(cwd, invalidPlan());
+        expect(check(cwd, 'validate', 'run-a').out.repair_passes_remaining).toBe(2);
+
+        // The user's reply starts a new run, which gets its own two passes.
+        expect(check(cwd, 'validate', 'run-a').out.repair_passes_remaining).toBe(1);
+        const nextTurn = check(cwd, 'validate', 'run-b');
+        expect(nextTurn.out.repair_passes_remaining).toBe(2);
+        expect(nextTurn.out.requires_user_decision).toBeUndefined();
+      } finally {
+        fs.rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps counting until the plan passes when the host gives no run token', () => {
+      // Standalone use and older hosts: one budget spans the session.
+      const cwd = makeProject(invalidPlan());
+      try {
+        check(cwd, 'validate');
+        check(cwd, 'validate');
+        expect(check(cwd, 'validate').out.requires_user_decision).toBe(true);
+      } finally {
+        fs.rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('counts promise_check on its own and ignores its refusal of an invalid plan', () => {
+      const cwd = makeProject(invalidPlan());
+      try {
+        // An invalid plan is refused before the promise is judged.
+        const refused = check(cwd, 'promise_check', 'run-a');
+        expect(refused.out.code).toBe('E_PLAN_INVALID');
+        check(cwd, 'validate', 'run-a');
+        expect(check(cwd, 'validate', 'run-a').out.repair_passes_remaining).toBe(1);
+
+        const broken = validPlan();
+        broken.segments[0].target_sec = 2;
+        broken.segments[1].target_sec = 18;
+        rewrite(cwd, broken);
+        const first = check(cwd, 'promise_check', 'run-a');
+        expect(first.status).toBe(1);
+        expect(first.out).toMatchObject({ max_repair_passes: 2, repair_passes_remaining: 2 });
+        expect(first.out.text).toContain('Do NOT deliver');
+        check(cwd, 'promise_check', 'run-a');
+        const third = check(cwd, 'promise_check', 'run-a');
+        expect(third.out).toMatchObject({
+          ok: false,
+          requires_user_decision: true,
+          next_action: 'present_blocker_to_user_and_end_turn',
+        });
+        expect(third.out.assessment.verdict).toBe('fail');
+        expect(third.out.text.startsWith(HAND_OFF)).toBe(true);
+        expect(third.out.text).toContain('promise_check: FAIL');
+        expect(third.out.text).not.toContain('Do NOT deliver');
+      } finally {
+        fs.rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps only counts next to the plan and writes nothing for a clean pass', () => {
+      const clean = makeProject(validPlan());
+      const cwd = makeProject(invalidPlan());
+      try {
+        expect(check(clean, 'validate', 'run-a').status).toBe(0);
+        expect(fs.readdirSync(path.join(clean, 'project'))).toEqual(['plan.json']);
+
+        check(cwd, 'validate', 'run-secret-token');
+        const files = fs.readdirSync(path.join(cwd, 'project')).sort();
+        expect(files).toEqual(['.video_plan_checks.json', 'plan.json']);
+        const raw = fs.readFileSync(path.join(cwd, 'project', '.video_plan_checks.json'), 'utf8');
+        expect(raw).not.toContain('run-secret-token');
+        expect(JSON.parse(raw)).toEqual({
+          'plan.json': { run: expect.stringMatching(/^[0-9a-f]{16}$/), validate: 1, promise_check: 0 },
+        });
+      } finally {
+        fs.rmSync(clean, { recursive: true, force: true });
+        fs.rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('still reports the plan when its record cannot be read or written', () => {
+      const cwd = makeProject(invalidPlan());
+      const record = path.join(cwd, 'project', '.video_plan_checks.json');
+      try {
+        fs.writeFileSync(record, '{not json', 'utf8');
+        expect(check(cwd, 'validate', 'run-a').out.repair_passes_remaining).toBe(2);
+
+        fs.rmSync(record);
+        fs.mkdirSync(record);
+        const unrecorded = check(cwd, 'validate', 'run-a');
+        expect(unrecorded.status).toBe(1);
+        expect(unrecorded.out.valid).toBe(false);
+        expect(unrecorded.out.errors.length).toBeGreaterThan(0);
+        expect(unrecorded.out).not.toHaveProperty('max_repair_passes');
+        expect(fs.readdirSync(path.join(cwd, 'project')).sort()).toEqual(['.video_plan_checks.json', 'plan.json']);
+      } finally {
+        fs.rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
   it('can gate-D check the real produced durations instead of the planned target_sec', () => {
     const plan = validPlan() as any;
     plan.segments[0].target_sec = 14; // planned motion ratio passes: 70%

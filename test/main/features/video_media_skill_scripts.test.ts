@@ -184,6 +184,7 @@ describe('video media skill scripts', () => {
     expect(out.ops).toContain('trim');
     expect(out.ops).toContain('mix');
     expect(out.ops).toContain('normalize_loudness');
+    expect(out.ops).toContain('reframe');
   });
 
   it('extracts a real video frame without a Python or uv recognition runtime', async () => {
@@ -253,6 +254,52 @@ describe('video media skill scripts', () => {
     const out = parseJson(res.stderr);
     expect(out.ok).toBe(false);
     expect(out.code).toBe('E_INPUT');
+  });
+
+  it('reframes a landscape clip onto a vertical canvas through the stage-edit runner', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-reframe-runner-'));
+    try {
+      const binDir = path.join(pcDir(), 'resources', 'runtime', 'ffmpeg', `${process.platform}-${process.arch}`);
+      const extension = process.platform === 'win32' ? '.exe' : '';
+      const ffmpeg = path.join(binDir, `ffmpeg${extension}`);
+      const ffprobe = path.join(binDir, `ffprobe${extension}`);
+      const input = path.join(tmp, 'landscape.mp4');
+      const output = path.join(tmp, 'vertical.mp4');
+      const generated = spawnSync(ffmpeg, [
+        '-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
+        '-i', 'color=c=red:s=128x72:r=5:d=1', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', input,
+      ], { encoding: 'utf8', timeout: 20_000 });
+      expect(generated.status, generated.stderr || String(generated.error || '')).toBe(0);
+      const env = { ORKAS_BUNDLED_FFMPEG: ffmpeg, ORKAS_BUNDLED_FFPROBE: ffprobe };
+
+      const missingAspect = runSkill('stage-edit', 'edit_video', ['--op', 'reframe', '--input', input, '--output', output], env);
+      expect(missingAspect.status).toBe(1);
+      expect(parseJson(missingAspect.stderr)).toMatchObject({ code: 'E_ARGS' });
+      const badMode = runSkill('stage-edit', 'edit_video', [
+        '--op', 'reframe', '--input', input, '--aspect', '9:16', '--mode', 'zoom', '--output', output,
+      ], env);
+      expect(badMode.status).toBe(1);
+      expect(parseJson(badMode.stderr).message).toBe('reframe --mode must be one of: pad, crop, blur');
+      expect(fs.existsSync(output)).toBe(false);
+
+      const res = runSkill('stage-edit', 'edit_video', [
+        '--op', 'reframe', '--input', input, '--width', '72', '--height', '128', '--mode', 'blur', '--output', output,
+      ], env);
+      expect(res.status, res.stderr).toBe(0);
+      expect(parseJson(res.stdout)).toMatchObject({
+        ok: true,
+        op: 'reframe',
+        path: output,
+        reframe: { mode: 'blur', canvas: '72x128', from: '128x72' },
+        text: `reframe wrote ${output} at 72x128 (blur).`,
+      });
+      const probed = spawnSync(ffprobe, [
+        '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', output,
+      ], { encoding: 'utf8' });
+      expect(probed.stdout.trim()).toBe('72,128');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
 });

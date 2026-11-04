@@ -91,6 +91,7 @@ const COMPOSITION_RENDER_FRAME_TIMEOUT_MS = Number(process.env.ORKAS_VIDEO_STUDI
 
 export type VideoStudioOp =
   | 'reference.inspect'
+  | 'product.capture'
   | 'production.status'
   | 'production.edit'
   | 'production.approve_plan'
@@ -109,6 +110,7 @@ export type VideoStudioOp =
   | 'composition.draft'
   | 'composition.export'
   | 'composition.snapshot'
+  | 'composition.scene_check'
   | 'composition.submit_design_review'
   | 'composition.approve_draft'
   | 'speech.capabilities'
@@ -1260,6 +1262,7 @@ export async function prepareComposition(p: CompositionOptions): Promise<VideoSt
     compositionDirAbs: p.compositionDirAbs, reviewInputs: contract,
     purpose: 'authoring', signal: p.signal,
   });
+  const designContract = designContractReadiness(prepared.manifest);
   return {
     ok: true,
     op: 'composition.prepare',
@@ -1276,7 +1279,16 @@ export async function prepareComposition(p: CompositionOptions): Promise<VideoSt
     // Prepare stays passing — the contract is authored INTO this manifest
     // next, so blocking on its absence would deadlock the very step that
     // fixes it. Inspect keeps the hard gate.
-    design_contract: designContractReadiness(prepared.manifest),
+    design_contract: designContract,
+    // Nested under design_contract alone, the gap was skipped: in the
+    // 2026-10-31 retests every AUTO child that wrote the contract before its
+    // HTML passed the first check (8 of 8), and every one that wrote only the
+    // HTML was blocked (7 of 7).
+    ...(designContract.status === 'ready' ? {} : {
+      message: 'composition-manifest.json has no complete art_direction design contract yet. Write every section listed '
+        + 'in design_contract.issues into it in one pass before writing index.html; lint and inspect block until it is complete.',
+      next_action: 'write_art_direction_then_index_html',
+    }),
     issues,
     next_allowed_ops: prepared.manifest
       && prepared.manifest.audio.owner !== 'assembler'
@@ -2741,6 +2753,98 @@ export function buildInspectScript(meta: CompositionMeta, tSec: number, expected
 `;
 }
 
+/** Start, middle and end of each named scene, in the order asked. */
+export function sceneCheckSamplePlan(
+  scenes: ReadonlyArray<{ id: string; start: number; duration: number }>,
+  sceneIds: readonly string[],
+): Array<{ sceneId: string; label: string; timeSec: number }> | { unknown: string[] } {
+  const unknown = sceneIds.filter(id => !scenes.some(scene => scene.id === id));
+  if (unknown.length) return { unknown };
+  return sceneIds.flatMap((id) => {
+    const scene = scenes.find(item => item.id === id)!;
+    return [
+      { sceneId: id, label: `${id} start`, timeSec: scene.start + Math.min(0.3, scene.duration * 0.15) },
+      { sceneId: id, label: `${id} mid`, timeSec: scene.start + scene.duration / 2 },
+      { sceneId: id, label: `${id} end`, timeSec: scene.start + scene.duration - Math.min(0.2, scene.duration * 0.1) },
+    ];
+  });
+}
+
+/** Authoring check for scene-by-scene work: captures the start, middle and
+ * end of up to four named scenes under preview/scene-check/ (outside the
+ * composition signature). Evidence for the author only: no QA verdict and no
+ * preview, approval or render state is read or written. */
+export async function checkCompositionScenes(input: {
+  compositionDirAbs: string;
+  sceneIds: unknown;
+  signal?: AbortSignal;
+}): Promise<VideoStudioResult> {
+  const op = 'composition.scene_check' as const;
+  const fail = (errorCode: string, message: string, extra: Record<string, unknown> = {}): VideoStudioResult => (
+    { ok: false, op, errorCode, message, ...extra });
+  const raw = input.sceneIds;
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > 4
+    || raw.some(id => typeof id !== 'string' || !id.trim())
+    || new Set(raw.map(id => String(id).trim())).size !== raw.length) {
+    return fail('E_SCENE_CHECK_INPUT', 'scene_ids must list one to four distinct scene ids.');
+  }
+  const sceneIds = (raw as string[]).map(id => id.trim());
+  const loaded = await loadCompositionMeta(input.compositionDirAbs);
+  if (!loaded.meta) return fail('E_SCENE_CHECK_COMPOSITION', loaded.issues[0]?.message || 'Composition is unavailable.');
+  const meta = loaded.meta;
+  let scenes: Array<{ id: string; start: number; duration: number }> = [];
+  try {
+    const manifest = JSON.parse(await fs.readFile(path.join(input.compositionDirAbs, 'composition-manifest.json'), 'utf8'));
+    scenes = (Array.isArray(manifest?.scenes) ? manifest.scenes : [])
+      .filter((scene: Record<string, unknown>) => typeof scene?.id === 'string'
+        && Number.isFinite(Number(scene.start)) && Number(scene.duration) > 0)
+      .map((scene: Record<string, unknown>) => ({ id: String(scene.id), start: Number(scene.start), duration: Number(scene.duration) }));
+  } catch {
+    scenes = [];
+  }
+  if (!scenes.length) return fail('E_SCENE_CHECK_MANIFEST', 'composition-manifest.json has no timed scenes.');
+  const plan = sceneCheckSamplePlan(scenes, sceneIds);
+  if ('unknown' in plan) {
+    return fail('E_SCENE_CHECK_SCENE', `Unknown scene id: ${plan.unknown.join(', ')}.`, { known_scene_ids: scenes.map(scene => scene.id) });
+  }
+  const dir = path.join(input.compositionDirAbs, 'preview', 'scene-check',
+    `${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`);
+  const samples: Array<{ scene_id: string; label: string; time_seconds: number; path: string }> = [];
+  try {
+    await fs.mkdir(dir, { recursive: true });
+    await withCompositionWindow(meta, { compositionDirAbs: input.compositionDirAbs, signal: input.signal }, async (win) => {
+      for (const [index, item] of plan.entries()) {
+        if (input.signal?.aborted) throw new VideoStudioRuntimeError('E_SCENE_CHECK_CANCELLED', 'Scene check was cancelled.');
+        const time = Math.max(0, Math.min(meta.durationSec - 0.001, item.timeSec));
+        await seek(win, time);
+        await settleCompositionPaint(win);
+        const shot = await withVideoStudioTimeout(
+          win.webContents.capturePage({ x: 0, y: 0, width: meta.width, height: meta.height }),
+          COMPOSITION_CAPTURE_TIMEOUT_MS,
+          'E_SNAPSHOT_TIMEOUT',
+          `scene check timed out while capturing frame ${index + 1}/${plan.length}.`,
+          () => { try { win.destroy(); } catch { /* best effort */ } },
+        );
+        const file = path.join(dir, `${String(index + 1).padStart(2, '0')}-${item.label.replace(/[^a-z0-9_-]+/gi, '-')}.png`);
+        await fs.writeFile(file, normalizeCapturedFrame(shot, meta.width, meta.height).image.toPNG());
+        samples.push({ scene_id: item.sceneId, label: `${item.label} @ ${round2(time)}s`, time_seconds: round2(time), path: file });
+      }
+    });
+    const contactSheet = await writeFrameContactSheet(
+      dir,
+      samples.map(sample => ({ label: sample.label, time_seconds: sample.time_seconds, path: sample.path })),
+      { labelOnly: true, columns: 3, thumbWidth: 480 },
+    );
+    return {
+      ok: true, op, composition_dir: input.compositionDirAbs, scene_ids: sceneIds, samples, contact_sheet: contactSheet,
+      evidence_scope: 'Authoring check of the named scenes only. No QA verdict, preview, approval or render state changed.',
+    };
+  } catch (err) {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    return fail(videoStudioErrorCode(err, 'E_SCENE_CHECK_CAPTURE'), 'The named scenes could not be captured.');
+  }
+}
+
 export async function snapshotComposition(p: CompositionOptions): Promise<VideoStudioResult> {
   if (!p.snapshotAbsPath) {
     // The convention is the host's, and the caller cannot infer it: frames
@@ -3318,7 +3422,9 @@ export async function pruneSegmentCache(
     const entries = await fs.readdir(cacheDirAbs, { withFileTypes: true });
     const stats: Array<{ dirAbs: string; mtimeMs: number; bytes: number }> = [];
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+      // Workspaces may belong to another active assembly. Only completed
+      // cache entries participate in size accounting and eviction.
+      if (!entry.isDirectory() || entry.name.startsWith('.segment-assembly-')) continue;
       const dirAbs = path.join(cacheDirAbs, entry.name);
       let bytes = 0;
       let mtimeMs = 0;
@@ -3706,7 +3812,10 @@ async function renderSceneSegmentAssembly(
     : null;
   const startedAt = Date.now();
   const outputDir = path.dirname(plan.outputAbsPath);
-  const workDirAbs = path.join(outputDir, `.segment-assembly-${crypto.randomUUID()}`);
+  // Segment publication uses an atomic rename into the cache. Stage on that
+  // filesystem even when the requested output is on a different volume; the
+  // final remux still writes beside the requested output for its own rename.
+  const workDirAbs = path.join(plan.segmentCacheDirAbs, `.segment-assembly-${crypto.randomUUID()}`);
   const collected = new Map<string, { evidence: FrameSampleEvidence; reused: boolean }>();
   // Mid-render bookkeeping lives outside the try so the failure path can
   // report an accurate resumable state: completed segments are durable in the
@@ -4109,6 +4218,88 @@ export async function writeProductionContactSheet(input: {
   return writeFrameContactSheet(input.outputDirAbs, samples, { labelOnly: true });
 }
 
+const REFERENCE_SHOT_SAMPLES = 24;
+const REFERENCE_MAX_SAMPLES = 32;
+const REFERENCE_DEFAULT_FRACTIONS = [0, 0.2, 0.4, 0.6, 0.8, 0.98];
+
+/** One still per detected shot (cover frame at 0, otherwise just after the cut
+ * so transitions have settled), thinned evenly to the sample cap. Sparse cut
+ * lists are topped up with the evenly distributed defaults. */
+export function referenceSampleTimes(durationSec: number, cutsSec: readonly number[]): number[] {
+  const end = durationSec * 0.98;
+  const starts = [0, ...cutsSec.filter(t => Number.isFinite(t) && t > 0.2 && t < end)].sort((a, b) => a - b);
+  let times = starts.map((start, i) => (start === 0 ? 0
+    : Math.min(start + Math.min(0.4, ((starts[i + 1] ?? durationSec) - start) / 2), end)));
+  if (times.length > REFERENCE_SHOT_SAMPLES) {
+    const picked = times;
+    times = Array.from({ length: REFERENCE_SHOT_SAMPLES }, (_v, i) => picked[Math.round(i * (picked.length - 1) / (REFERENCE_SHOT_SAMPLES - 1))]);
+  }
+  if (times.length < REFERENCE_DEFAULT_FRACTIONS.length) times.push(...REFERENCE_DEFAULT_FRACTIONS.map(f => f * durationSec));
+  const kept: number[] = [];
+  for (const t of times.map(v => Math.round(v * 1000) / 1000).sort((a, b) => a - b)) {
+    if (!kept.length || t - kept[kept.length - 1] > 0.149) kept.push(t);
+  }
+  return kept;
+}
+
+/** Shots that change inside themselves (builds, typing, camera moves, wipes),
+ * from per-frame scene scores: at least 1.5 s long with a summed in-shot
+ * change of 0.02 or more. Strongest first, so the end stills that fit under
+ * the sample cap go to the shots that move most. */
+export function referenceMovingShots(
+  durationSec: number,
+  cutsSec: readonly number[],
+  frameScores: ReadonlyArray<{ t: number; score: number }>,
+): Array<{ start_sec: number; end_sec: number; change: number }> {
+  const bounds = [0, ...cutsSec, durationSec];
+  const moving: Array<{ start_sec: number; end_sec: number; change: number }> = [];
+  for (let i = 0; i + 1 < bounds.length; i += 1) {
+    const [start, end] = [bounds[i], bounds[i + 1]];
+    if (end - start < 1.5) continue;
+    const change = frameScores.reduce((sum, f) => (f.t > start + 0.05 && f.t < end - 0.02 ? sum + f.score : sum), 0);
+    if (change >= 0.02) moving.push({ start_sec: start, end_sec: end, change: Math.round(change * 1000) / 1000 });
+  }
+  return moving.sort((a, b) => b.change - a.change);
+}
+
+/** Tempo from the onset-strength autocorrelation of a mono signal, searched
+ * between 70 and 180 BPM. `confidence` is the peak over the mean absolute
+ * score; noise and speech stay low, so the BPM is withheld below 5. */
+export function estimateReferenceTempo(samples: Float32Array, sampleRate: number): { bpm: number | null; confidence: number } {
+  const hop = Math.round(sampleRate / 100);
+  const n = Math.floor(samples.length / hop);
+  if (n < 400) return { bpm: null, confidence: 0 };
+  const level = new Float64Array(n);
+  for (let i = 0; i < n; i += 1) {
+    let sum = 0;
+    for (let j = i * hop; j < (i + 1) * hop; j += 1) sum += samples[j] * samples[j];
+    level[i] = Math.log1p(100 * Math.sqrt(sum / hop));
+  }
+  const onset = new Float64Array(n);
+  let mean = 0;
+  for (let i = 1; i < n; i += 1) { onset[i] = Math.max(0, level[i] - level[i - 1]); mean += onset[i]; }
+  mean /= n;
+  for (let i = 0; i < n; i += 1) onset[i] -= mean;
+  const lo = Math.round(6000 / 180), hi = Math.round(6000 / 70);
+  const scores: number[] = [];
+  for (let lag = lo; lag <= hi; lag += 1) {
+    let sum = 0;
+    for (let i = lag; i < n; i += 1) sum += onset[i] * onset[i - lag];
+    scores.push(sum / (n - lag));
+  }
+  let best = 0;
+  scores.forEach((v, i) => { if (v > scores[best]) best = i; });
+  const absMean = scores.reduce((sum, v) => sum + Math.abs(v), 0) / scores.length;
+  const confidence = absMean > 0 ? Math.round((scores[best] / absMean) * 10) / 10 : 0;
+  let offset = 0;
+  if (best > 0 && best < scores.length - 1) {
+    const [a, b, c] = [scores[best - 1], scores[best], scores[best + 1]];
+    const den = a - 2 * b + c;
+    if (den) offset = 0.5 * (a - c) / den;
+  }
+  return { bpm: confidence >= 5 ? Math.round((6000 / (lo + best + offset)) * 10) / 10 : null, confidence };
+}
+
 /** On-demand source evidence before authoring. Read grants never become write
  * grants: freeze the source under the composition, then decode only that copy.
  * No shell, provider, manifest/approval mutation, or semantic verdict is involved. */
@@ -4130,10 +4321,10 @@ export async function inspectVideoReference(input: {
   const demuxer = ({ '.mp4': 'mov', '.mov': 'mov', '.m4v': 'mov', '.webm': 'matroska', '.mkv': 'matroska', '.ogv': 'ogg' } as Record<string, string>)[ext];
   if (!demuxer) return fail('E_REFERENCE_FORMAT', 'Unsupported reference video container.');
   const supplied = input.sampleTimes;
-  if (supplied !== undefined && (!Array.isArray(supplied) || supplied.length < 1 || supplied.length > 6
+  if (supplied !== undefined && (!Array.isArray(supplied) || supplied.length < 1 || supplied.length > REFERENCE_MAX_SAMPLES
     || supplied.some(t => typeof t !== 'number' || !Number.isFinite(t) || t < 0)
     || new Set(supplied).size !== supplied.length)) {
-    return fail('E_REFERENCE_TIMES', 'sample_times must contain one to six distinct non-negative seconds.');
+    return fail('E_REFERENCE_TIMES', `sample_times must contain one to ${REFERENCE_MAX_SAMPLES} distinct non-negative seconds.`);
   }
   const maxBytes = 256 * 1024 * 1024;
   const stat = await fs.stat(input.inputAbsPath).catch(() => null);
@@ -4144,7 +4335,7 @@ export async function inspectVideoReference(input: {
   if (!bins.ffmpeg || !bins.ffprobe) return fail('E_REFERENCE_DECODER', 'Bundled video decoder is unavailable.');
   const timeout = new AbortController();
   const signal = input.signal ? AbortSignal.any([input.signal, timeout.signal]) : timeout.signal;
-  const timer = setTimeout(() => timeout.abort(), 30_000);
+  const timer = setTimeout(() => timeout.abort(), 60_000);
   timer.unref?.();
   let dir = '';
   let completed = false;
@@ -4175,27 +4366,84 @@ export async function inspectVideoReference(input: {
     const duration = Number(stream?.duration || metadata.format?.duration);
     const width = Number(stream?.width), height = Number(stream?.height);
     if (!Number.isFinite(duration) || duration <= 0 || !width || !height) return fail('E_REFERENCE_DECODE', 'Reference has no usable video stream or duration.');
-    const times = (supplied as number[] | undefined) || [0, 0.2, 0.4, 0.6, 0.8, 0.98].map(f => f * duration);
+    // The default pass also reads the edit rhythm: shot cuts on a downscaled
+    // decode and the soundtrack tempo. Neighbor passes with explicit times
+    // reuse that evidence and only decode the requested stills.
+    let shots: { detected: boolean; cuts_sec: number[]; count: number; median_shot_sec: number | null;
+      moving: Array<{ start_sec: number; end_sec: number }> } | undefined;
+    let moving: ReturnType<typeof referenceMovingShots> = [];
+    let audio: { present: boolean; bpm: number | null; beat: 'clear' | 'moderate' | 'unclear' | 'none' } | undefined;
+    if (supplied === undefined) {
+      // One downscaled decode prints every frame's scene score: scores above
+      // 0.3 are cuts, small scores inside a shot are its own motion.
+      const scene = await runProcess(bins.ffmpeg, ['-hide_banner', '-nostats', '-loglevel', 'error', ...safeInput, '-t', '600', '-an',
+        '-vf', "scale=320:-2,select='gte(scene,0)',metadata=print:key=lavfi.scene_score:file=-", '-f', 'null', '-'],
+      { signal, timeoutMs: 20_000, maxOutputBytes: 4 * 1024 * 1024 });
+      if (signal.aborted) return fail('E_REFERENCE_CANCELLED', 'Reference inspection was cancelled or timed out.');
+      const frameScores: Array<{ t: number; score: number }> = [];
+      if (scene.code === 0) {
+        let t = Number.NaN;
+        for (const line of scene.stdout.split('\n')) {
+          const time = /pts_time:([0-9.]+)/.exec(line);
+          if (time) { t = Number(time[1]); continue; }
+          const score = /scene_score=([0-9.]+)/.exec(line);
+          if (score && Number.isFinite(t)) frameScores.push({ t, score: Number(score[1]) });
+        }
+      }
+      const cuts = frameScores.filter(f => f.score > 0.3 && f.t > 0).map(f => Math.round(f.t * 1000) / 1000);
+      moving = referenceMovingShots(duration, cuts, frameScores);
+      const bounds = [0, ...cuts, duration];
+      const lengths = bounds.slice(1).map((t, i) => t - bounds[i]).sort((a, b) => a - b);
+      shots = { detected: scene.code === 0, cuts_sec: cuts, count: cuts.length + 1,
+        median_shot_sec: scene.code === 0 ? Math.round(lengths[Math.floor(lengths.length / 2)] * 100) / 100 : null,
+        moving: moving.map(m => ({ start_sec: m.start_sec, end_sec: m.end_sec })).sort((a, b) => a.start_sec - b.start_sec) };
+      const pcmPath = path.join(dir, 'audio.f32');
+      const decoded = await runProcess(bins.ffmpeg, ['-y', '-loglevel', 'error', ...safeInput, '-t', '120', '-vn', '-ac', '1', '-ar', '11025', '-f', 'f32le', pcmPath],
+        { signal, timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+      const pcm = decoded.code === 0 ? await fs.readFile(pcmPath).catch(() => null) : null;
+      await fs.rm(pcmPath, { force: true }).catch(() => undefined);
+      if (signal.aborted) return fail('E_REFERENCE_CANCELLED', 'Reference inspection was cancelled or timed out.');
+      if (pcm && pcm.length >= 11025 * 4 * 4) {
+        const tempo = estimateReferenceTempo(new Float32Array(pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + pcm.length - (pcm.length % 4))), 11025);
+        audio = { present: true, bpm: tempo.bpm, beat: tempo.confidence >= 8 ? 'clear' : tempo.bpm !== null ? 'moderate' : 'unclear' };
+      } else {
+        audio = { present: false, bpm: null, beat: 'none' };
+      }
+    }
+    let times = (supplied as number[] | undefined) || referenceSampleTimes(duration, shots?.cuts_sec ?? []);
+    // A moving shot also gets a still just before its end, so the sheet shows
+    // where its build, camera move or wipe arrives.
+    const shotEnds = new Set<number>();
+    if (supplied === undefined) {
+      for (const shot of moving) {
+        if (times.length + shotEnds.size >= REFERENCE_MAX_SAMPLES) break;
+        const end = Math.round(Math.min(shot.end_sec - 0.3, duration * 0.99) * 1000) / 1000;
+        if (times.some(t => Math.abs(t - end) < 0.6)) continue;
+        shotEnds.add(end);
+      }
+      times = [...times, ...shotEnds].sort((a, b) => a - b);
+    }
     if (times.some(t => t >= duration)) return { ...fail('E_REFERENCE_TIMES', 'Requested sample is outside the video duration.'), duration_sec: duration };
     const samples: Array<Pick<FrameSampleEvidence, 'label' | 'time_seconds' | 'path'>> = [];
     for (const time of times) {
       const still = path.join(dir, `frame-${samples.length}.png`);
       const decoded = await runProcess(bins.ffmpeg, ['-y', '-loglevel', 'error', '-threads', '2', '-ss', String(time), ...safeInput,
-        '-frames:v', '1', '-threads', '2', '-vf', 'scale=960:540:force_original_aspect_ratio=decrease', still],
+        '-frames:v', '1', '-threads', '2', '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease', still],
       { signal, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 });
       if (signal.aborted) return fail('E_REFERENCE_CANCELLED', 'Reference inspection was cancelled or timed out.');
       if (decoded.code !== 0 || !(await fs.stat(still).catch(() => null))?.size) {
         return fail('E_REFERENCE_DECODE', 'Requested reference frame is unavailable.');
       }
-      samples.push({ label: `source @ ${time.toFixed(3)}s`, time_seconds: time, path: still });
+      samples.push({ label: `source @ ${time.toFixed(3)}s${shotEnds.has(time) ? ' · shot end' : ''}`, time_seconds: time, path: still });
     }
-    const contactSheet = await writeFrameContactSheet(dir, samples, { labelOnly: true });
+    const contactSheet = await writeFrameContactSheet(dir, samples, { labelOnly: true, columns: 4, thumbWidth: 480 });
     if (signal.aborted) return fail('E_REFERENCE_CANCELLED', 'Reference inspection was cancelled or timed out.');
     completed = true;
     return { ok: true, op: 'reference.inspect', composition_dir: input.compositionDirAbs,
       input_path: input.inputAbsPath, source_path: source, reference_path: path.relative(input.compositionDirAbs, source).split(path.sep).join('/'),
       source_sha256: hash.digest('hex'), bytes, duration_sec: duration, width, height, samples, contact_sheet: contactSheet,
-      evidence_scope: 'Sampled source stills only. Unseen intervals, motion, speech and target-product facts are not established.' };
+      ...(shots ? { shots } : {}), ...(audio ? { audio } : {}),
+      evidence_scope: 'Sampled source stills plus measured cut times and soundtrack tempo. Motion inside shots, speech and target-product facts are not established.' };
   } catch {
     return fail(signal.aborted ? 'E_REFERENCE_CANCELLED' : 'E_REFERENCE_DECODE',
       signal.aborted ? 'Reference inspection was cancelled or timed out.' : 'Reference evidence could not be prepared.');
@@ -5644,6 +5892,16 @@ function whisperDtwModel(modelPath: string): string | undefined {
   return undefined;
 }
 
+/** The language argument whisper.cpp accepts: `auto`, or a language without
+ * its region or script. whisper.cpp answers `-l zh-CN` by printing its usage
+ * and exiting 0 with no transcript, and callers pass such tags because the
+ * same `language` field takes one for speech.capabilities (2026-10-31). */
+function whisperLanguageArg(language: string | undefined): string {
+  const value = String(language ?? '').trim();
+  if (!value || value.toLowerCase() === 'auto') return 'auto';
+  return (value.split(/[-_]/)[0] || value).toLowerCase();
+}
+
 export function buildSpeechTranscribeArgs(
   modelPath: string,
   wavPath: string,
@@ -5652,7 +5910,7 @@ export function buildSpeechTranscribeArgs(
 ): string[] {
   const timestampDetail = options.timestamps === 'word' ? 'word' : 'segment';
   const args = ['-m', modelPath, '-f', wavPath, timestampDetail === 'word' ? '-ojf' : '-oj', '-of', outBase, '-np'];
-  args.push('-l', options.language?.trim() || 'auto');
+  args.push('-l', whisperLanguageArg(options.language));
   // Match offline audio projects: the bundled Intel macOS Metal path can corrupt recognition.
   if (process.platform === 'darwin' && process.arch === 'x64') args.push('-ng');
   if (timestampDetail === 'word') {
@@ -5739,6 +5997,17 @@ export async function transcribeSpeech(p: SpeechTranscribeOptions): Promise<Vide
       timestamps: timestampDetail,
     });
     const tr = await runProcess(backend.cli, args, { signal: p.signal, timeoutMs: 45 * 60 * 1000 });
+    // whisper.cpp reports a language it cannot use on stderr and may still
+    // exit 0 without output; name the caller's value instead of "no output".
+    if (/\bunknown language\b/i.test(tr.stderr)) {
+      return {
+        ok: false,
+        op: 'speech.transcribe',
+        errorCode: 'E_TRANSCRIBE_LANGUAGE_UNSUPPORTED',
+        message: `Speech transcription does not support the language "${String(p.language ?? '').trim().slice(0, 40)}". `
+          + 'Use a two-letter language code such as zh or en, or auto.',
+      };
+    }
     if (tr.code !== 0) {
       if (isWindowsNativeRuntimeIncompatible(tr.code)) {
         return {
@@ -5758,11 +6027,26 @@ export async function transcribeSpeech(p: SpeechTranscribeOptions): Promise<Vide
     }
     let parsed: unknown;
     try { parsed = JSON.parse(raw); }
-    catch { parsed = { raw }; }
+    catch { /* Invalid backend output is rejected before replacing a transcript. */ }
+    const transcription = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as WhisperJsonObject).transcription : undefined;
+    if (!Array.isArray(transcription) || transcription.some(segment => {
+      if (!segment || typeof segment !== 'object' || Array.isArray(segment)) return true;
+      const item = segment as WhisperJsonObject;
+      const timing = offsetsMs(item.offsets);
+      return typeof item.text !== 'string' || !timing || timing.from < 0 || timing.to < timing.from
+        || (item.text.trim().length > 0 && timing.to === timing.from);
+    })) {
+      return {
+        ok: false,
+        op: 'speech.transcribe',
+        errorCode: 'E_TRANSCRIBE_INVALID_OUTPUT',
+        message: 'The transcription result could not be read. Try transcribing the recording again.',
+      };
+    }
     const normalized = normalizeWhisperTranscript(parsed, timestampDetail);
     if (p.transcriptAbsPath) {
-      await fs.mkdir(path.dirname(p.transcriptAbsPath), { recursive: true });
-      await fs.writeFile(p.transcriptAbsPath, JSON.stringify(normalized, null, 2), 'utf8');
+      await writeJson(p.transcriptAbsPath, normalized);
     }
     return {
       ok: true,

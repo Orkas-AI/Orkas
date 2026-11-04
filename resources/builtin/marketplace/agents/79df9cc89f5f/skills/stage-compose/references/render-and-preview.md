@@ -57,8 +57,8 @@ rather than inventing another approval gate.
 
 ## HTML Preview Gate
 
-A cost-control gate, not a creative milestone, and only for COMPOSE: it exists
-so visual rework happens before an expensive mp4 rerender. **Preview first (hard gate)** when duration >= 20s or scene count >= 3 — the host enforces it, and `composition.draft` rejects a missing, stale, failed, or not-yet-approved preview. Runbook step 6 owns the judgement calls below that threshold.
+A cost-control gate, only for COMPOSE: it exists
+so visual rework happens before an expensive mp4 rerender. **Preview first (hard gate)** when duration >= 20s or scene count >= 3 — the host enforces it, and `composition.draft` rejects a missing, stale, failed, or not-yet-approved preview. Runbook step 10 owns the judgement calls below that threshold.
 
 ```json
 {"op":"composition.inspect","composition_dir":"project/composition","findings_path":"project/composition/qa/inspect-preview.json"}

@@ -1,8 +1,8 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-edit
-description_zh: 真实素材的智能编辑知识——先用转写/镜头/静音/质量/视觉证据理解视频，再选择确定性时间线编辑或受约束的语义 AI 编辑；clip-factory、蒙太奇、二创和局部内容修改的核心。
-description_en: Intelligent editing knowledge for real footage: understand it through transcript/scene/silence/quality/vision evidence, then choose deterministic timeline editing or constrained semantic AI editing; core of repurpose, montage, cleanup, and local content changes.
+description_zh: 剪辑真实素材：先理解（转写、镜头、静音、质量），再做确定性剪辑或受约束的 AI 修改。
+description_en: Edit real footage: understand it (transcript, scenes, silence, quality), then cut deterministically or make bounded AI edits.
 ---
 
 # stage-edit
@@ -11,17 +11,20 @@ For the VideoStudio EDIT line, the edit decision list lives in `project/plan.jso
 
 How to intelligently edit **real user-supplied footage** while keeping the source and every decision auditable. Deterministic operations still handle cuts, joins, captions, overlays, reframes, and audio. When the request changes pixels semantically—remove an object, alter a background, relight a shot, or make another content-aware local change—keep the EDIT route and execute only that bounded segment through signed video `operation:"edit"` after paid-generation approval.
 
-**Where the footage comes from.** A user-uploaded clip arrives as a chat attachment marked `model_readable="false"` with a `path` (see the attachment list). That flag means "not vision input", NOT "unusable" — the file is exactly what these media scripts operate on. Copy it into the project's `raw/` (or pass its attachment path directly as `--input`) before probing; never treat a `model_readable="false"` clip as something to skip.
+**Where the footage comes from.** A user-uploaded clip arrives as a chat attachment marked `model_readable="false"` with a `path` (see the attachment list). That flag means "not vision input", NOT "unusable" — the file is exactly what these media scripts operate on. Before its first use, copy it once from that exact `path` into `raw/`, then use the `raw/` path in every later call and in the plan: a retyped attachment path is easy to get wrong. Never treat a `model_readable="false"` clip as something to skip. If a tool reports that path missing, copy it again from the attachment list; while the list shows the file, do not ask the user to upload it again.
 
 For semantic model edits, apply [production-method.md](../video-router/references/production-method.md) before source analysis and delivery checks. EDIT does not imply local assembly: one directly delivered semantic edit has `is_generation:true`; follow its lightweight input and output checks. The deterministic loop and local audio mastering below apply only when actually performing local edits.
 
 ## Captions on an existing generated video
 
 A follow-up on a video with a production plan stays with that plan, even when the
-change is small. For caption-only changes to one completed generated clip, keep
-its original generate segment and update `tracks.captions.lines` with exact text,
-`start_sec` and `target_sec`. Author only the requested delta. Use the existing
-Gate B amendment with the current user instruction as authorization, then call
+change is small. `production.edit` is only for caption changes to one completed
+clip VideoStudio generated; a plan that cuts supplied footage, even one with
+captions or title cards, is produced as described below or in stage-assemble.
+For that caption-only case, keep its original generate segment and update
+`tracks.captions.lines` with exact text, `start_sec` and `target_sec`. Author
+only the requested delta. Use the existing Gate B amendment with the current
+user instruction as authorization, then call
 `video_studio` with `op:"production.edit"` and `plan_path`. The host reuses the
 recorded original footage, runs the existing subtitle engine, registers a new
 output and writes the final locator. Repeat caption revisions use that original
@@ -53,9 +56,14 @@ Use these `run-skill` entry points whenever this document says `stage-edit edit_
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op probe --input raw/clip.mp4
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op trim --input raw/clip.mp4 --start 12 --duration 8 --output project/cuts/seg-1.mp4
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op extract_frame --input raw/screen-recording.mp4 --start 3 --output project/frames/screen-3s.png
+"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op reframe --input raw/clip.mp4 --aspect 9:16 --output project/render/clip-9x16.mp4
 ```
 
+**Aspect changes** (vertical, square, or landscape versions) use `--op reframe --aspect 9:16|1:1|4:5|16:9|W:H`. It writes the platform-standard canvas (9:16 → 1080×1920, 1:1 → 1080×1080, 4:5 → 1080×1350, 16:9 → 1920×1080); pass `--width`/`--height` only when the user names a size. `--mode pad` (default) keeps the whole frame on bars (`--pad-color`), `blur` fills the bars with a blurred copy of the frame, and `crop` fills the canvas by cutting the edges (`--focus-x`/`--focus-y` 0–1 keep that part). Keep `pad` or `blur` when the frame carries text, captions, or UI; crop only when losing the edges is acceptable, then check a frame. For several aspects, reframe the same cut once per output, then lay captions out per canvas and burn them on each.
+
 The scripts return JSON. A non-zero exit means the operation failed; fix the input/plan before proceeding.
+
+**When no `edit_video` op covers the change.** These ops are helpers, not the boundary of the EDIT line. For a deterministic transform they lack — rotate or flip, speed change, fps or container conversion, GIF export — run the bundled `ffmpeg` yourself from bash: it is already on `PATH`, and `$ORKAS_BUNDLED_FFMPEG` holds its absolute path. This is in-scope EDIT work, not a capability boundary: do not hand it back or send the user to another app. Write to a new output path (never the input), bound every input (no unbounded `-loop 1`), pass `-nostdin`, then `probe` the result and `extract_frame` to look at it before delivering. It is not a way around an op that refused: the caption rule below and `E_EDIT_OVERLAY_OPAQUE` still stand.
 
 **Subtitle safety hard rule.** Burn captions only through `stage-edit edit_video --op burnsubs`; do not hand-write `ffmpeg` subtitle, `drawtext`, or PNG-overlay fallback commands. In particular, never use `ffmpeg -loop 1` image inputs for subtitle overlays from bash. If `burnsubs` fails with `E_EDIT_BURNSUBS_UNSUPPORTED` or an ffmpeg filter-support error, stop and report the blocker instead of improvising a custom ffmpeg graph.
 

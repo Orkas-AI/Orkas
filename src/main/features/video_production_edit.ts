@@ -60,7 +60,9 @@ export async function editVideoProductionCaptions(input: {
       const tracks = identity.plan.tracks as Record<string, any>;
       const lines = tracks?.captions?.lines;
       if (!videoProductionIsCaptionEdit(identity.plan) || lines.length > 500) {
-        throw new Error('E_VIDEO_PRODUCTION_EDIT_UNSUPPORTED: production.edit supports caption-only revisions of one completed generated clip; other edits use the existing EDL assembly path');
+        // "Other edits use the existing EDL assembly path" named no path, and
+        // the 2026-10-31 runs read it as multi-segment editing being unsupported.
+        throw new Error('E_VIDEO_PRODUCTION_EDIT_UNSUPPORTED: production.edit only revises the captions of one completed generated clip, so it cannot produce this plan. Produce it with stage-assemble (stage-edit for a plan of edit segments only): cut each edit segment with stage-edit edit_video, write the file to that segment\'s produced_path, then assemble. The approved plan is unchanged.');
       }
       const candidates = videoProductionGenerationSources(identity, state).filter((item) => item.segment_id === segments[0].id);
       const source = candidates.find((item) => isPathAllowed(item.output_path, input.roots));
