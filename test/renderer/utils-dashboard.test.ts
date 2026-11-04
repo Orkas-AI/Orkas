@@ -82,6 +82,24 @@ describe('renderDashboard — component coverage (set A)', () => {
     expect(html).toContain('Check uplink');
   });
 
+  it.each(['node', 'props'])('Alert: retains title and nested body from %s children', (location) => {
+    const children = [{ type: 'Markdown', props: { text: '**完整内容** with details' } }];
+    const node = { type: 'Alert', props: { title: '<Status>', ...(location === 'props' ? { children } : {}) },
+      ...(location === 'node' ? { children } : {}) };
+    const html = renderMarkdown(fence({ root: node }));
+    expect(html).toContain('class="db-alert-title">&lt;Status&gt;</div>');
+    expect(html).toContain('class="db-alert-body"');
+    expect(html).toContain('<strong>完整内容</strong> with details');
+    expect(html).not.toContain('<Status>');
+  });
+
+  it('Alert: explicit body keeps precedence over fallback children', () => {
+    const html = renderDashboard({ root: { type: 'Alert', props: { title: 'Status', body: 'Authoritative body' },
+      children: [{ type: 'Markdown', props: { text: 'Fallback duplicate' } }] } });
+    expect(html).toContain('Authoritative body');
+    expect(html).not.toContain('Fallback duplicate');
+  });
+
   it('Alert: accepts common model-guess text aliases', () => {
     const html = renderDashboard({ root: { type: 'Alert', props: { level: 'warning', message: 'Quota near limit' } } });
     expect(html).toMatch(/data-level="warning"/);

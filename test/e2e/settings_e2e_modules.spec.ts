@@ -22,6 +22,30 @@ async function openAddModelDialog(page: import('@playwright/test').Page): Promis
 }
 
 test.describe('settings modules and model guard', () => {
+  test('offers native GPT-6.1 Terra through every public OpenAI model picker', async ({ orkas }, testInfo) => {
+    const page = orkas.page!;
+    await openSettingsTab(page, 'credentials');
+    await openAddModelDialog(page);
+    for (const [provider, id] of [
+      ['openai-codex', 'gpt-6.1-terra'], ['openai', 'gpt-6.1-terra'], ['openrouter', 'openai/gpt-6.1-terra'],
+    ] as const) {
+      const catalog = await orkas.invoke<any>('auth.listModels', { provider });
+      expect(catalog.models).toContainEqual(expect.objectContaining({ id, name: 'GPT-6.1 Terra' }));
+      await page.locator('#settings-picker-provider .ai-select-trigger').click();
+      await page.locator(`body > .ai-select-popover:not([hidden]) .ai-select-item[data-value="${provider}"]`).click();
+      await expect(page.locator('#settings-picker-provider')).toHaveAttribute('data-value', provider);
+      await page.locator('#settings-picker-model .ai-select-trigger').click();
+      const terra = page.locator(`body > .ai-select-popover:not([hidden]) .ai-select-item[data-value="${id}"]`);
+      await expect(terra).toHaveText('GPT-6.1 Terra');
+      await expect(terra).toBeVisible();
+      await terra.scrollIntoViewIfNeeded();
+      await page.screenshot({ path: testInfo.outputPath(`terra-${provider}-picker.png`) });
+      await terra.click();
+      await expect(page.locator('#settings-picker-model')).toHaveAttribute('data-value', id);
+    }
+    expect(orkas.modelRequests).toHaveLength(0);
+  });
+
   test('shows public image and video model details across languages and widths', async ({ orkas }, testInfo) => {
     const page = orkas.page!;
     expect(await orkas.invoke('orkasApi.configureAll', { apiKey: 'orkas-e2e-service-details-xxxxxxxx' }))

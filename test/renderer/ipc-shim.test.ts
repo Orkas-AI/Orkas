@@ -78,6 +78,14 @@ describe('ipc-shim streams', () => {
 describe('ipc-shim invoke results', () => {
   const idleStream = () => ({ promise: Promise.resolve(), cancel: () => {} });
 
+  it('resolves task previews through the bounded host reference route', async () => {
+    const invoke = vi.fn(async () => ({ ok: true, references: [] }));
+    const { apiFetch } = loadShim(idleStream, invoke);
+    const references = [{ kind: 'todo', task_id: 't_e4fe5478466d', project_id: 'p_one' }];
+    await apiFetch('/api/chat/task-references', { method: 'POST', body: JSON.stringify({ references }) });
+    expect(invoke).toHaveBeenCalledWith('chatTaskReferences.resolve', { references });
+  });
+
   it('routes compact conversation-turn pages independently from history', async () => {
     const invoke = vi.fn(async () => ({ ok: true, turns: [], total: 0 }));
     const { apiFetch } = loadShim(idleStream, invoke);

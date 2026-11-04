@@ -1210,6 +1210,17 @@
                       </div>
                       <div class="ai-select settings-row-select" id="settings-language-select"></div>
                     </div>
+                    <div class="settings-row" id="settings-startup-row">
+                      <div class="settings-row-copy">
+                        <div class="settings-row-title" id="settings-startup-title" data-i18n="settings.startup.title"></div>
+                        <div class="settings-row-desc" id="settings-startup-description" data-i18n="settings.startup.sub"></div>
+                        <div class="settings-row-desc" id="settings-startup-status" role="status" aria-live="polite" hidden></div>
+                        <button type="button" class="settings-link-btn" id="settings-startup-open-settings" data-i18n="settings.startup.open_settings" style="display:none" hidden></button>
+                      </div>
+                      <label class="toggle-switch settings-switch">
+                        <input type="checkbox" id="settings-startup-toggle" disabled aria-labelledby="settings-startup-title" aria-describedby="settings-startup-description settings-startup-status" />
+                      </label>
+                    </div>
                     <div class="settings-row">
                       <div class="settings-row-copy">
                         <div class="settings-row-title" id="settings-task-notifications-title" data-i18n="settings.task_notifications.title">任务通知</div>
@@ -1946,17 +1957,21 @@
     <div class="search-modal">
       <div class="search-input-row">
         <span data-ui-icon="search" data-ui-icon-class="search-input-icon"></span>
-        <input type="text" id="search-input" data-i18n-placeholder="search.input_placeholder" placeholder="Search tasks and Library…" autocomplete="off" spellcheck="false" />
+        <input type="text" id="search-input" aria-describedby="search-submit-hint" data-i18n-placeholder="search.input_placeholder" placeholder="Search tasks and Library…" autocomplete="off" spellcheck="false" />
+        <span class="search-submit-hint" id="search-submit-hint" data-i18n="search.submit_hint">Press Enter to search</span>
         <button class="search-close-btn" id="search-close-btn" data-i18n-title="search.close_title" title="Close (Esc)">
           <span data-ui-icon="x" data-ui-icon-class="search-close-icon"></span>
         </button>
       </div>
       <div class="search-tabs" id="search-tabs" role="tablist">
-        <button class="search-tab is-active" data-tab="all" data-i18n="search.tab.all">All</button>
-        <button class="search-tab" data-tab="chat" data-i18n="search.tab.chat">Chats</button>
-        <button class="search-tab" data-tab="agent" data-i18n="search.tab.agent">Agents</button>
-        <button class="search-tab" data-tab="skill" data-i18n="search.tab.skill">Skills</button>
-        <button class="search-tab" data-tab="context" data-i18n="search.tab.context">Library</button>
+        <button class="search-tab is-active" role="tab" aria-selected="true" data-tab="all" data-i18n="search.tab.all">All</button>
+        <button class="search-tab" role="tab" aria-selected="false" data-tab="chat" data-i18n="search.tab.chat">Chats</button>
+        <button class="search-tab" role="tab" aria-selected="false" data-tab="todo" data-i18n="project.todo.title">To-do</button>
+        <button class="search-tab" role="tab" aria-selected="false" data-tab="automation" data-i18n="new_chat.home.source.automation">Automation</button>
+        <button class="search-tab" role="tab" aria-selected="false" data-tab="agent" data-i18n="search.tab.agent">Agents</button>
+        <button class="search-tab" role="tab" aria-selected="false" data-tab="skill" data-i18n="search.tab.skill">Skills</button>
+        <button class="search-tab" role="tab" aria-selected="false" data-tab="connector" data-i18n="connectors.title">Connectors</button>
+        <button class="search-tab" role="tab" aria-selected="false" data-tab="context" data-i18n="search.tab.context">Library</button>
       </div>
       <div class="search-body is-start-state" id="search-body">
         <div class="search-empty" data-i18n="search.empty_hint">Type a keyword to start searching</div>
@@ -1979,6 +1994,7 @@
   <script src="./modules/ipc-shim.js"></script>
   <script src="./modules/lazy-features.js"></script>
   <script src="./modules/i18n.js"></script>
+  <script src="./modules/desktop-startup.js"></script>
   <script src="./modules/chat-use.js"></script>
   <script src="./modules/user-error.js"></script>
   <script src="./modules/overlay-manager.js"></script>
@@ -2033,6 +2049,7 @@
   <script src="./modules/interactive-cli.js"></script>
   <script src="./modules/search.js"></script>
   <script src="./modules/user-workspace.js"></script>
+  <script src="./shared/local-cli-defaults.js"></script>
   <script src="./modules/local-agents.js"></script>
   <script src="./vendor/pinyin-firstletter/data.js"></script>
   <!-- DOMPurify must load before utils.js so inline connector SVGs are sanitized, not disabled. -->

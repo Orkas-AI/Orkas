@@ -135,7 +135,7 @@
   "errors.model_currently_unavailable": "This model is currently unavailable",
   "errors.model_config_unavailable": "A model is configured, but its credential is not currently usable. Check the API key, sign-in state, or fallback model in Settings.",
   "errors.model_oauth_expired": "{provider} authorization has expired. Reauthorize this account in Settings, or switch to a fallback model.",
-  "errors.model_credits_insufficient": "Not enough credits. Add credits, or switch to an available model in Settings.",
+  "errors.model_credits_insufficient": "Not enough credits, so the task stopped. After adding credits, come back to this task and say “Continue” to pick up where it left off. You can also switch to an available model in Settings.",
   "errors.custom_endpoint_suspect": "Your custom model endpoint failed several requests in a row (HTTP {status}) — it may be dead or moved. Check its API URL and key under Settings → Models, or switch to another model to continue.",
   "errors.model_output_cap_repeated": "This model has hit its per-response output limit several times in a row — it may be too small for this task. Switch to a model with a larger output limit in Settings, or split the task.",
   "errors.model_provider_balance_insufficient": "Your configured model provider account is out of balance (this is not Orkas credits). Top up with that provider, or switch models in Settings.",
@@ -361,5 +361,11 @@
   "notification.automation.failed.title": "Automation run failed",
   "notification.automation.failed.title_many": "{count} automation runs failed",
   "notification.automation.waiting_input.title": "An automation run needs your reply",
-  "notification.automation.waiting_input.title_many": "{count} automation runs need your reply"
+  "notification.automation.waiting_input.title_many": "{count} automation runs need your reply",
+  "errors.model_rate_limited_all_configured": "All of your configured models are rate limited. Limits usually reset within a minute or two; try again then.",
+  "errors.model_request_rejected_repeated": "This request has been rejected repeatedly, so retrying as is will not change the result. Switch to another model in Settings and try again, or remove images or attachments and resend.",
+  "errors.provider_reply_detail": "Provider said: {detail}",
+  "cli_agent.repeated_failure_hint": "“{name}” failed again. You can ask @Commander to take over this task instead.",
+  "desktop.open": "Open",
+  "desktop.exit": "Quit"
 }

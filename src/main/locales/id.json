@@ -135,7 +135,7 @@
   "errors.model_currently_unavailable": "Model ini saat ini tidak tersedia",
   "errors.model_config_unavailable": "Sebuah model dikonfigurasi, tetapi kredensialnya saat ini tidak dapat digunakan. Periksa kunci API, status masuk, atau model fallback di Pengaturan.",
   "errors.model_oauth_expired": "Otorisasi {provider} telah kedaluwarsa. Otorisasi ulang akun ini di Pengaturan, atau beralih ke model cadangan.",
-  "errors.model_credits_insufficient": "Kredit tidak cukup. Tambahkan kredit, atau beralih ke model yang tersedia di Pengaturan.",
+  "errors.model_credits_insufficient": "Kredit tidak cukup, jadi tugas berhenti. Setelah menambahkan kredit, kembali ke tugas ini dan ketik \"Melanjutkan\" untuk meneruskan dari titik terakhir. Anda juga bisa beralih ke model yang tersedia di Pengaturan.",
   "errors.custom_endpoint_suspect": "Titik akhir model kustom Anda gagal beberapa permintaan berturut-turut (HTTP {status}) — mungkin mati atau dipindahkan. Periksa URL dan kunci API-nya di bawah Pengaturan → Model, atau beralih ke model lain untuk melanjutkan.",
   "errors.model_output_cap_repeated": "Model ini telah mencapai batas output per responsnya beberapa kali berturut-turut — mungkin terlalu kecil untuk tugas ini. Beralih ke model dengan batas output yang lebih besar di Pengaturan, atau bagi tugas.",
   "errors.model_provider_balance_insufficient": "Akun penyedia model Anda yang dikonfigurasi tidak seimbang (ini bukan kredit Orkas). Isi ulang dengan penyedia tersebut, atau ganti model di Pengaturan.",
@@ -361,5 +361,11 @@
   "notification.automation.failed.title": "Otomatisasi gagal dijalankan",
   "notification.automation.failed.title_many": "{count} otomatisasi gagal dijalankan",
   "notification.automation.waiting_input.title": "Satu otomatisasi menunggu balasan Anda",
-  "notification.automation.waiting_input.title_many": "{count} otomatisasi menunggu balasan Anda"
+  "notification.automation.waiting_input.title_many": "{count} otomatisasi menunggu balasan Anda",
+  "errors.model_rate_limited_all_configured": "Semua model yang Anda konfigurasi sedang terkena batas permintaan. Biasanya pulih dalam satu atau dua menit; coba lagi setelah itu.",
+  "errors.model_request_rejected_repeated": "Permintaan ini ditolak berulang kali, jadi mencoba ulang tanpa perubahan tidak akan mengubah hasilnya. Beralih ke model lain di Pengaturan lalu coba lagi, atau hapus gambar atau lampiran lalu kirim ulang.",
+  "errors.provider_reply_detail": "Balasan penyedia: {detail}",
+  "cli_agent.repeated_failure_hint": "\"{name}\" gagal lagi. Anda bisa meminta @Komandan mengambil alih tugas ini.",
+  "desktop.open": "Buka",
+  "desktop.exit": "Keluar"
 }

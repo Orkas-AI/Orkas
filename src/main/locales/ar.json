@@ -135,7 +135,7 @@
   "errors.model_currently_unavailable": "هذا النموذج غير متاح حاليًا",
   "errors.model_config_unavailable": "يوجد نموذج مضبوط، لكن بيانات اعتماده غير قابلة للاستخدام حاليًا. تحقق من مفتاح API أو حالة تسجيل الدخول أو النموذج البديل في الإعدادات.",
   "errors.model_oauth_expired": "انتهت صلاحية تفويض {provider}. أعد تفويض هذا الحساب في الإعدادات، أو انتقل إلى نموذج بديل.",
-  "errors.model_credits_insufficient": "الرصيد غير كافٍ. أضف رصيدًا، أو انتقل إلى نموذج متاح في الإعدادات.",
+  "errors.model_credits_insufficient": "الرصيد غير كافٍ، لذا توقفت المهمة. بعد إضافة الرصيد، عُد إلى هذه المهمة واكتب «متابعة» لتستكمل من حيث توقفت. يمكنك أيضًا الانتقال إلى نموذج متاح في الإعدادات.",
   "errors.custom_endpoint_suspect": "فشلت عدة طلبات متتالية إلى نقطة نهاية نموذجك المخصصة (HTTP {status}) — قد تكون توقفت أو انتقلت. تحقق من URL ومفتاح API في الإعدادات → النماذج، أو انتقل إلى نموذج آخر للمتابعة.",
   "errors.model_output_cap_repeated": "بلغ هذا النموذج حد مخرجات الاستجابة عدة مرات متتالية — قد يكون الحد صغيرًا لهذه المهمة. انتقل إلى نموذج بحد مخرجات أكبر في الإعدادات، أو قسّم المهمة.",
   "errors.model_provider_balance_insufficient": "نفد رصيد حساب مزوّد النموذج المضبوط (هذا ليس رصيد Orkas). اشحن رصيدك لدى المزوّد، أو بدّل النموذج في الإعدادات.",
@@ -361,5 +361,11 @@
   "notification.automation.failed.title": "فشل تشغيل الأتمتة",
   "notification.automation.failed.title_many": "فشل {count} من عمليات تشغيل الأتمتة",
   "notification.automation.waiting_input.title": "تشغيل أتمتة بانتظار ردك",
-  "notification.automation.waiting_input.title_many": "{count} من عمليات تشغيل الأتمتة بانتظار ردك"
+  "notification.automation.waiting_input.title_many": "{count} من عمليات تشغيل الأتمتة بانتظار ردك",
+  "errors.model_rate_limited_all_configured": "بلغت جميع النماذج التي أعددتها حد الطلبات. يُرفع الحد عادةً خلال دقيقة أو دقيقتين؛ حاول مجددًا بعدها.",
+  "errors.model_request_rejected_repeated": "رُفض هذا الطلب مرات متتالية، لذا لن تغيّر إعادة المحاولة كما هو النتيجة. انتقل إلى نموذج آخر في الإعدادات وحاول مجددًا، أو أزل الصور أو المرفقات وأعد الإرسال.",
+  "errors.provider_reply_detail": "رد مزوّد الخدمة: {detail}",
+  "cli_agent.repeated_failure_hint": "فشل “{name}” مرة أخرى. يمكنك أن تطلب من @القائد تولي هذه المهمة بدلًا منه.",
+  "desktop.open": "فتح",
+  "desktop.exit": "خروج"
 }

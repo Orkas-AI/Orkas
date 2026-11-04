@@ -21,6 +21,8 @@ import { estimateTextTokens } from '../../../src/core-agent/src/agent/session';
 import { BackgroundServices } from './background-services';
 import { closeElectronFixture, requestElectronQuit } from './electron-cleanup';
 import { ownFixtureServer } from './server-cleanup';
+import { expectedBrowserDenialIndices, expectedResourceDenialIndex, invokeFailureReceipt, navigationFailureReceipt, analyzeWebAppLogs,
+  type BrowserDenialObservation, type RecoveredRendererRange } from './web-app-log-analysis';
 import {
   _electron as electron,
   expect,
@@ -454,7 +456,13 @@ input.on('line', line => {
     const state = readState();
     state.hermesInitializations = (state.hermesInitializations || 0) + 1;
     writeState(state);
-    if (state.hermesFault === 'initialize_exit') process.exit(1);
+    if (state.hermesFault === 'initialize_exit') {
+      // Fatal initialization is terminal even if the host already pipelined input.
+      input.removeAllListeners('line');
+      // A real CLI says why it cannot start; wait for the write before exiting.
+      process.stderr.write('Error: no inference provider configured. Run hermes setup, then try again.\n', () => process.exit(1));
+      return;
+    }
     send({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } });
     return;
   }
@@ -912,8 +920,11 @@ export class OrkasTestApp {
   readonly imageGenerationRequests: Array<Record<string, unknown>> = [];
   readonly videoEstimateRequests: Array<Record<string, unknown>> = [];
   readonly videoGenerationRequests: Array<Record<string, unknown>> = [];
+  /** Isolate the reference upload origin from the API in native scenarios. */
+  generationReferenceUploadHost = '127.0.0.1';
   readonly generationReferenceUploads: Array<{
     bytes: number;
+    contentLength: string;
     contentType: string;
     contentMd5: string;
     acl: string;
@@ -930,6 +941,7 @@ export class OrkasTestApp {
   compactionRequestAborts = 0;
   imageTaskPolls = 0;
   videoTaskPolls = 0;
+  videoTaskHeld = false;
 
   electronApp: ElectronApplication | null = null;
   page: Page | null = null;
@@ -965,14 +977,19 @@ export class OrkasTestApp {
   } | null = null;
   private readonly testInfo: TestInfo;
   private readonly diagnostics: string[] = [];
+  private readonly expectedInvokeFailures: RecoveredRendererRange[] = [];
+  private readonly expectedRendererFailures = new Map<number, string>();
   private readonly rendererPageErrors: Array<{ diagnosticIndex: number; detail: string }> = [];
-  private readonly rendererErrors: Array<{ diagnosticIndex: number; type: string; windowId: Promise<number | null> }> = [];
+  private readonly rendererErrors: Array<{ diagnosticIndex: number; type: string; windowId: Promise<number | null>; surface: Page; url?: string; detail?: string }> = [];
   private readonly recoveredRendererErrors = new Set<number>();
+  private readonly resourceDenials = new Map<number, string>();
+  private readonly browserDenials = new Map<number, string>();
   private readonly tracePaths: string[] = [];
   private traceNumber = 0;
   private readonly appClosePromises = new WeakMap<ElectronApplication, Promise<void>>();
   private readonly appTraceStops = new WeakMap<ElectronApplication, Promise<void>>();
   private readonly nativeShutdownProcesses = new WeakMap<ElectronApplication, ChildProcess>();
+  private readonly appProcesses = new WeakMap<ElectronApplication, ReturnType<ElectronApplication['process']>>();
   private activeUserId: string;
   private readonly configuredModelSeededUsers = new Set<string>();
   private modelToolScenario: ModelToolScenario | null = null;
@@ -1106,19 +1123,43 @@ export class OrkasTestApp {
       ...(process.platform === 'darwin' ? ['-AppleLanguages', `(${this.appLocale})`] : []),
     ] : [];
     const app = await electron.launch({
-      args: [...(this.options.softwareRendering ? ['--disable-gpu'] : []), ...(this.options.captureRendererErrorWindows ? ['--require', path.join(__dirname, 'preview-recovery-preload.cjs')] : []), ...(this.appLocale ? ['--require', path.join(__dirname, 'system-locale-preload.cjs')] : []), '.', ...localeArgs],
+      args: [...(!this.enableSystemProxy ? ['--no-proxy-server'] : []), ...(this.options.softwareRendering ? ['--disable-gpu'] : []), ...(this.options.captureRendererErrorWindows ? ['--require', path.join(__dirname, 'preview-recovery-preload.cjs')] : []), ...(this.appLocale ? ['--require', path.join(__dirname, 'system-locale-preload.cjs')] : []), '.', ...localeArgs],
       cwd: PC_ROOT,
       env: environment,
       timeout: 30_000,
     });
     this.electronApp = app;
-
-    app.process().stdout?.on('data', (data) => {
+    const child = app.process();
+    this.appProcesses.set(app, child);
+    child.stdout?.on('data', (data) => {
       this.diagnostics.push(`[main:stdout] ${String(data).trimEnd()}`);
     });
-    app.process().stderr?.on('data', (data) => {
+    child.stderr?.on('data', (data) => {
       this.diagnostics.push(`[main:stderr] ${String(data).trimEnd()}`);
     });
+
+    if (process.env.ORKAS_E2E_GPU_DIAGNOSTICS === '1') {
+      await app.evaluate(({ app: nativeApp }) => {
+        // Observe failures without changing GPU features, rendering or recovery.
+        // Capture only host/process facts; no URLs, profiles or environment.
+        const record = (kind: string, details: Record<string, unknown> = {}) => {
+          console.info('[e2e-gpu-diagnostics]', {
+            at: new Date().toISOString(), pid: process.pid, kind, ...details,
+            versions: { electron: process.versions.electron, chrome: process.versions.chrome },
+            memory: (process as any).getSystemMemoryInfo(),
+            processMemory: process.memoryUsage(),
+            features: nativeApp.isReady() ? nativeApp.getGPUFeatureStatus() : {},
+          });
+        };
+        record('attached');
+        nativeApp.on('child-process-gone', (_event, details) => {
+          if (details.type === 'GPU') record('gpu-process-gone', { reason: details.reason, exitCode: details.exitCode });
+        });
+        nativeApp.on('render-process-gone', (_event, _contents, details) => {
+          record('render-process-gone', { reason: details.reason, exitCode: details.exitCode });
+        });
+      });
+    }
 
     await app.context().tracing.start({
       screenshots: true,
@@ -1138,13 +1179,14 @@ export class OrkasTestApp {
       surface.on('console', message => {
         const diagnosticIndex = this.diagnostics.length;
         this.diagnostics.push(`[renderer:${message.type()}] ${message.text()}`);
-        if (message.type() === 'error') this.rendererErrors.push({ diagnosticIndex, type: 'error', windowId });
+        if (message.type() === 'error') this.rendererErrors.push({ diagnosticIndex, type: 'error', windowId,
+          surface, url: message.location().url, detail: message.text() });
       });
       surface.on('pageerror', error => {
         const detail = error.stack || error.message;
         const diagnosticIndex = this.diagnostics.length;
         this.rendererPageErrors.push({ diagnosticIndex, detail });
-        this.rendererErrors.push({ diagnosticIndex, type: 'pageerror', windowId });
+        this.rendererErrors.push({ diagnosticIndex, type: 'pageerror', windowId, surface });
         this.diagnostics.push(`[renderer:pageerror] ${detail}`);
       });
     };
@@ -1153,6 +1195,11 @@ export class OrkasTestApp {
     this.page = page;
     observePage(page);
     if (this.setDefaultViewport) {
+      // Native child views use the content area's coordinate system. CDP
+      // viewport emulation alone can extend beyond restored native bounds.
+      const window = await app.browserWindow(page);
+      try { await window.evaluate(win => win.setContentSize(1280, 800)); }
+      finally { await window.dispose(); }
       await page.setViewportSize({ width: 1280, height: 800 });
     }
     await page.waitForLoadState('domcontentloaded');
@@ -1970,6 +2017,78 @@ export class OrkasTestApp {
     })));
   }
 
+  rendererDiagnosticCheckpoint(): number { return this.diagnostics.length; }
+
+  /** Exact single-line fixture fault after the owning case proves containment
+   * and recovery. The checkpoint excludes earlier or later incidental errors. */
+  async acknowledgeRendererFailure(request: { surface?: Page; detail: string; after: number; count: number }): Promise<void> {
+    if (!request.detail || /[\r\n]/.test(request.detail) || !Number.isInteger(request.after) || request.after < 0
+      || !Number.isInteger(request.count) || request.count < 1) throw new Error('Invalid renderer failure observation');
+    const matches = () => this.rendererErrors.filter(record => record.diagnosticIndex >= request.after
+      && (!request.surface || record.surface === request.surface) && record.type === 'error' && record.detail === request.detail);
+    await expect.poll(() => matches().length, 'Expected case-owned renderer failures').toBe(request.count);
+    for (const record of matches()) {
+      this.recoveredRendererErrors.add(record.diagnosticIndex);
+      this.expectedRendererFailures.set(record.diagnosticIndex, createHash('sha256').update(`[renderer:error] ${request.detail}`).digest('hex'));
+    }
+  }
+
+  /** Call after proving the negative outcome, prohibited effects and recovery.
+   * Exact timestamps bind the case-owned count to console and persisted logs. */
+  async acknowledgeInvokeFailures(channel: string, count: number, after = 0): Promise<void> {
+    await this.acknowledgeMainFailures(line => invokeFailureReceipt(line, channel), count, after,
+      { reason: 'expected-ipc-failure', channel });
+  }
+
+  async acknowledgeNavigationFailure(url: string, netError: string, after: number): Promise<void> {
+    const pid = await this.electronApp!.evaluate(() => process.pid);
+    const message = `(node:${pid}) electron: Failed to load URL: ${url} with error: ${netError}`;
+    await this.acknowledgeMainFailures(line => navigationFailureReceipt(line, message), 1, after,
+      { reason: 'expected-navigation-failure' });
+  }
+
+  private async acknowledgeMainFailures(match: (line: string) => string | undefined, count: number, after: number,
+    metadata: Pick<RecoveredRendererRange, 'reason' | 'channel'>): Promise<void> {
+    if (!Number.isInteger(count) || count < 1 || !Number.isInteger(after) || after < 0) {
+      throw new Error('Invalid expected IPC failure count or checkpoint');
+    }
+    const receipts = () => {
+      let start = 1;
+      const matches: RecoveredRendererRange[] = [];
+      this.diagnostics.forEach((entry, diagnosticIndex) => {
+        const lines = entry.split('\n');
+        if (diagnosticIndex >= after) lines.forEach((line, offset) => {
+          const messageHash = match(line);
+          if (messageHash) matches.push({ start: start + offset, end: start + offset, diagnosticIndex,
+            ...metadata, messageHash });
+        });
+        start += lines.length;
+      });
+      return matches;
+    };
+    await expect.poll(() => receipts().length, 'Expected case-owned main-process failures').toBe(count);
+    this.expectedInvokeFailures.push(...receipts());
+  }
+
+  /** Call only after asserting the denied response, prohibited side effects and
+   * recovery. Exact page, request URL and phase bind this receipt to one error. */
+  acknowledgeResourceDenial(surface: Page, request: { url: string; after: number; status: number }): void {
+    const index = expectedResourceDenialIndex(this.rendererErrors.filter(record => record.surface === surface), request);
+    this.recoveredRendererErrors.add(index);
+    this.resourceDenials.set(index, createHash('sha256').update(request.url).digest('hex'));
+  }
+
+  /** Exact surface/phase/request receipt, after the security case has verified
+   * prohibited effects and continued usability. Other errors remain fatal. */
+  acknowledgeBrowserDenial(surface: Page, request: BrowserDenialObservation): void {
+    const records = this.rendererErrors.filter(record => record.surface === surface);
+    const indices = expectedBrowserDenialIndices(records, request);
+    for (const index of indices) {
+      this.recoveredRendererErrors.add(index);
+      this.browserDenials.set(index, createHash('sha256').update(records.find(record => record.diagnosticIndex === index)!.detail!).digest('hex'));
+    }
+  }
+
   /** Test-only recovery: the caller must provide independently verified preview
    * windows. Raw diagnostic entries are never rewritten or removed. */
   async recoverPreviewRendererErrors(windowIds: readonly number[]) {
@@ -1982,13 +2101,19 @@ export class OrkasTestApp {
 
   private recoveredDiagnosticRanges() {
     let line = 1;
-    const ranges: Array<{ start: number; end: number; diagnosticIndex: number }> = [];
+    const ranges: RecoveredRendererRange[] = [];
     this.diagnostics.forEach((entry, diagnosticIndex) => {
       const count = entry.split('\n').length;
-      if (this.recoveredRendererErrors.has(diagnosticIndex)) ranges.push({ start: line, end: line + count - 1, diagnosticIndex });
+      if (this.recoveredRendererErrors.has(diagnosticIndex)) ranges.push({ start: line, end: line + count - 1, diagnosticIndex,
+        ...(this.resourceDenials.has(diagnosticIndex) ? { reason: 'expected-resource-denial' as const,
+          requestHash: this.resourceDenials.get(diagnosticIndex), status: 403 } : {}),
+        ...(this.browserDenials.has(diagnosticIndex) ? { reason: 'expected-browser-denial' as const,
+          messageHash: this.browserDenials.get(diagnosticIndex) } : {}),
+        ...(this.expectedRendererFailures.has(diagnosticIndex) ? { reason: 'expected-renderer-failure' as const,
+          messageHash: this.expectedRendererFailures.get(diagnosticIndex) } : {}) });
       line += count;
     });
-    return ranges;
+    return [...ranges, ...this.expectedInvokeFailures];
   }
 
   async dispose(): Promise<void> {
@@ -2015,7 +2140,7 @@ export class OrkasTestApp {
 
     // Export receipts after releasing native/stub ownership. Evidence IO must
     // fail certification without interrupting resource cleanup.
-    if (process.env.ORKAS_TEST_BATCH_REPORT) {
+    {
       try {
         await this.testInfo.attach('electron-log-required', { body: Buffer.from(JSON.stringify(this.recoveredDiagnosticRanges())), contentType: 'application/json' });
       } catch (error) {
@@ -2033,6 +2158,20 @@ export class OrkasTestApp {
       return false;
     });
     failed ||= unexpectedApiFailures.length > 0 || this.expectedApiFailures.length > 0;
+    const appLogs = collectLogFiles(this.root);
+    const diagnosticText = [this.diagnostics.join('\n'), appLogs].filter(Boolean).join('\n');
+    let logFailure: unknown;
+    try {
+      // Downstream owners read this fixed path on both success and failure.
+      // Checkpoint attachments below retain independent per-instance snapshots.
+      mkdirSync(this.testInfo.outputDir, { recursive: true });
+      writeFileSync(this.testInfo.outputPath('electron-main.log'), diagnosticText, 'utf8');
+      const analysis = analyzeWebAppLogs(diagnosticText, this.recoveredDiagnosticRanges());
+      writeFileSync(this.testInfo.outputPath('electron-log-analysis.json'), JSON.stringify(analysis, null, 2));
+      if (!analysis.passed) logFailure = new Error('Unexpected Electron diagnostics; see electron-log-analysis.json');
+    } catch (error) { logFailure = error; }
+    failed ||= !!logFailure;
+
     if (failed || process.env.ORKAS_E2E_KEEP_LOGS === '1' || process.env.ORKAS_TEST_BATCH_REPORT) {
       mkdirSync(this.testInfo.outputDir, { recursive: true });
       writeFileSync(this.testInfo.outputPath('stub-responses.json'), JSON.stringify(this.apiResponses, null, 2));
@@ -2051,8 +2190,6 @@ export class OrkasTestApp {
           contentType: 'application/json',
         }).catch(() => undefined);
       }
-      const appLogs = collectLogFiles(this.root);
-      const diagnosticText = [this.diagnostics.join('\n'), appLogs].filter(Boolean).join('\n');
       if (diagnosticText) {
         // Written to the failure's output directory, not only attached: line/list
         // reporters truncate an inline attachment to a couple of lines, which is
@@ -2075,30 +2212,20 @@ export class OrkasTestApp {
         }
       }
     } else {
-      // Log analysis on PASSING runs (test-case-design §3.1): with
-      // ORKAS_E2E_KEEP_LOGS=1 preserves the same captured stdout/stderr,
-      // renderer diagnostics and app logs as a failed run. File logs alone
-      // omit direct console output, including renderer warnings.
-      if (process.env.ORKAS_E2E_KEEP_LOGS === '1' || process.env.ORKAS_TEST_BATCH_REPORT) {
-        const appLogs = collectLogFiles(this.root);
-        const diagnosticText = [this.diagnostics.join('\n'), appLogs].filter(Boolean).join('\n');
-        if (diagnosticText) {
-          try {
-            mkdirSync(this.testInfo.outputDir, { recursive: true });
-            writeFileSync(path.join(this.testInfo.outputDir, 'electron-main.log'), diagnosticText, 'utf8');
-            if (process.env.ORKAS_TEST_BATCH_REPORT) {
-              const snapshot = this.testInfo.outputPath(`checkpoint-electron-${randomUUID()}.log`);
-              writeFileSync(snapshot, diagnosticText, 'utf8');
-              await this.testInfo.attach('electron-logs', { path: snapshot, contentType: 'text/plain' });
-            }
-          } catch (error) {
-            // Fail reuse after releasing the temporary root and trace files.
-            if (process.env.ORKAS_TEST_BATCH_REPORT) {
-              cleanupError = new Error('Checkpoint Electron log capture failed', { cause: error });
-            }
-            // Ordinary runs preserve their existing diagnostic behavior.
-          }
+      try {
+        // Successful ordinary runs retain the same complete evidence as batches.
+        mkdirSync(this.testInfo.outputDir, { recursive: true });
+        const logPath = this.testInfo.outputPath('electron-main.log');
+        if (process.env.ORKAS_TEST_BATCH_REPORT) {
+          const snapshot = this.testInfo.outputPath(`checkpoint-electron-${randomUUID()}.log`);
+          writeFileSync(snapshot, diagnosticText, 'utf8');
+          await this.testInfo.attach('electron-logs', { path: snapshot, contentType: 'text/plain' });
+        } else {
+          await this.testInfo.attach('electron-logs', { path: logPath, contentType: 'text/plain' });
         }
+      } catch (error) {
+        const evidenceError = new Error('Checkpoint Electron log capture failed', { cause: error });
+        cleanupError = cleanupError ? new AggregateError([cleanupError, evidenceError], 'Fixture evidence failed') : evidenceError;
       }
       for (const tracePath of this.tracePaths) {
         try {
@@ -2124,6 +2251,7 @@ export class OrkasTestApp {
     expect(unexpectedApiFailures, 'Public fixture received unexpected failed HTTP responses').toEqual([]);
     expect(this.expectedApiFailures, 'Expected HTTP failures were not exercised').toEqual([]);
     if (cleanupError) throw cleanupError;
+    if (logFailure) throw logFailure;
   }
 
   private recordCleanupPhase(phase: string, outcome: string): void {
@@ -2141,15 +2269,17 @@ export class OrkasTestApp {
     if (!app) return;
     const existing = this.appClosePromises.get(app);
     if (existing) return existing;
+    // A genuine user/update exit can dispose Playwright before teardown starts.
+    const child = this.appProcesses.get(app) || app.process();
 
     // Relaunch and timeout teardown may overlap. Keep one trace and quit per
     // captured application, including the same failure for every waiting caller.
     const closing = Promise.resolve().then(async () => {
       try {
         await closeElectronFixture({
-          process: () => app.process(),
+          process: () => child,
           context: () => ({ tracing: { stop: () => this.stopAppTrace(app) } }),
-          close: () => requestElectronQuit(app),
+          close: () => child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : requestElectronQuit(app),
         }, '', {
           phase: (phase, outcome) => this.recordCleanupPhase(phase, outcome),
         });
@@ -2314,6 +2444,12 @@ export class OrkasTestApp {
       }
       if (request.method === 'GET' && isVideoTask && this.modelStub) {
         this.videoTaskPolls += 1;
+        if (this.videoTaskHeld) {
+          response.writeHead(202, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({ code: 0, task_id: 'e2e-video-task', status: 'running' }));
+          return;
+        }
+
         response.writeHead(200, { 'Content-Type': 'application/json' });
         response.end(JSON.stringify({
           code: 0,
@@ -2361,7 +2497,7 @@ export class OrkasTestApp {
             code: 0,
             auth: {
               method: 'PUT',
-              upload_url: `${this.apiBaseUrl.replace(/\/api$/, '')}/cos-upload/e2e-reference?q-signature=opaque`,
+              upload_url: `http://${this.generationReferenceUploadHost}:${new URL(this.apiBaseUrl).port}/cos-upload/e2e-reference?q-signature=opaque`,
               file_url: 'https://cos.example/temp/e2e/image/reference.png',
               content_length: authRequest.content_length,
               headers: {
@@ -2380,6 +2516,7 @@ export class OrkasTestApp {
           const body = Buffer.concat(chunks);
           this.generationReferenceUploads.push({
             bytes: body.length,
+            contentLength: String(request.headers['content-length'] || ''),
             contentType: String(request.headers['content-type'] || ''),
             contentMd5: String(request.headers['content-md5'] || ''),
             acl: String(request.headers['x-cos-acl'] || ''),
@@ -2951,7 +3088,7 @@ export class OrkasTestApp {
           ];
           const next = calls[scenario.next];
           if (!next) finishImmediately(finalTextEvents(scenario.finalText));
-          else if (!advertisedToolNames.has(next.name)) requestToolGroup('load-saved-tasks', next.name === 'auto_tasks' ? 'management.automation' : 'management.projects');
+          else if (!advertisedToolNames.has(next.name)) requestToolGroup('load-saved-tasks', next.name === 'auto_tasks' ? 'management.automation' : 'management.todos');
           else {
             scenario.next++;
             finishImmediately(toolCallEvents(`save-task-${scenario.next}`, next.name, next.args));
@@ -3400,7 +3537,7 @@ export class OrkasTestApp {
             finishImmediately(toolCallEvents(
               'call-e2e-project-history-search',
               'chat_history',
-              { action: 'search', query: scenario.query, k: 4 },
+              { action: 'search', scope: 'project', search: { query: scenario.query, k: 4 } },
             ));
           } else if (requestNumber === 2) {
             const searchResult = JSON.stringify(requestBody);
@@ -3412,10 +3549,11 @@ export class OrkasTestApp {
               'chat_history',
               {
                 action: 'read',
+                scope: 'project',
                 cid: scenario.sourceCid,
-                ...(sourceHit
+                read: sourceHit
                   ? { page: { mode: 'around', index: Number(sourceHit[1]), count: 1 } }
-                  : {}),
+                  : {},
               },
             ));
           } else {

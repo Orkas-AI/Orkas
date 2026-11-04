@@ -35,6 +35,9 @@
     return `<svg class="chat-file-kind-icon is-${kind}" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
   }
 
+  const FILE_SHEET = '<path d="M4 3h10l6 6v12H4z"></path><path d="M14 3v6h6"></path>';
+  const FILE_TEXT_LINES = '<path d="M8 11h8M8 14h8M8 17h5"></path>';
+
   const UI_ICONS = {
     search: '<circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path>',
     camera: '<path d="M14.5 4h-5L7 7H3v13h18V7h-4z"></path><circle cx="12" cy="13" r="4"></circle>',
@@ -83,7 +86,7 @@
     'chevron-left': '<path d="m15 6-6 6 6 6"></path>',
     'log-out': '<path d="M10 17l5-5-5-5"></path><path d="M15 12H3"></path><path d="M15 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"></path>',
     plus: '<path d="M12 5v14M5 12h14"></path>',
-    'file-text': '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><path d="M9.5 11h5"></path><path d="M9.5 14h5"></path><path d="M9.5 17h3"></path>',
+    'file-text': FILE_SHEET + FILE_TEXT_LINES,
     presentation: '<rect x="4" y="4" width="16" height="11" rx="2"></rect><path d="M12 15v5"></path><path d="M8 20h8"></path><path d="M8 9h8"></path><path d="M8 12h5"></path>',
     'arrow-right': '<path d="M5 12h14"></path><path d="m13 6 6 6-6 6"></path>',
     zap: '<path d="M13 2 4 14h7l-1 8 9-12h-7z"></path>',
@@ -95,7 +98,7 @@
     panel: '<rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M15 4v16"></path>',
     folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>',
     'folder-open': '<path d="M3 8V6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1"></path><path d="M3.2 10.5A2 2 0 0 1 5.1 9h14.2a1.5 1.5 0 0 1 1.4 1.9l-1.5 5.7A3 3 0 0 1 16.3 19H5.2a2 2 0 0 1-2-1.6L2 12.4a1.6 1.6 0 0 1 1.2-1.9z"></path>',
-    file: '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path>',
+    file: FILE_SHEET,
     'clipboard-list': '<rect width="8" height="4" x="8" y="2" rx="1" ry="1"></rect><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><path d="M12 11h4M12 16h4M8 11h.01M8 16h.01"></path>',
     hourglass: '<path d="M7 3h10M7 21h10M8 3c0 5 8 5 8 9s-8 4-8 9M16 3c0 5-8 5-8 9s8 4 8 9"></path>',
     clock: '<circle cx="12" cy="12" r="9"></circle><polyline points="12 7 12 12 16 14"></polyline>',
@@ -106,7 +109,7 @@
     'check-circle': '<circle cx="12" cy="12" r="9"></circle><path d="M8 12.5l2.6 2.6L16.5 9"></path>',
     'x-circle': '<circle cx="12" cy="12" r="9"></circle><path d="M9 9l6 6M15 9l-6 6"></path>',
     'skip-forward': '<path d="M5 7l6 5-6 5z"></path><path d="M13 7l6 5-6 5z"></path><path d="M21 6v12"></path>',
-    'document-pencil': '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><path d="M9 17l1-3 5.5-5.5 2 2L12 16l-3 1z"></path>',
+    'document-pencil': FILE_SHEET + '<path d="M8 18l1-3 6-6 2 2-6 6-3 1z"></path>',
     'edit-pencil': '<path d="M4 20h4.2L19.1 9.1a2.2 2.2 0 0 0 0-3.1L18 4.9a2.2 2.2 0 0 0-3.1 0L4 15.8V20z"></path><path d="M13.7 6.1l4.2 4.2"></path><path d="M4 20l4.2-1.1"></path>',
     refresh: '<path d="M20 12a8 8 0 0 1-13.7 5.7"></path><path d="M4 12A8 8 0 0 1 17.7 6.3"></path><path d="M17 3v4h-4M7 21v-4h4"></path>',
     warning: '<path d="M12 3l10 18H2z"></path><path d="M12 9v5"></path><path d="M12 18h.01"></path>',
@@ -141,15 +144,15 @@
     image: wrapFileIcon('image', '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"></rect><circle cx="8.5" cy="9" r="1.6"></circle><path d="M5 17l4.4-4.4a1.5 1.5 0 0 1 2.1 0L14 15l2-2a1.5 1.5 0 0 1 2.1 0L20 14.9"></path>'),
     video: wrapFileIcon('video', '<rect x="3.5" y="5.5" width="17" height="13" rx="2.5"></rect><path d="M10 9.2v5.6l5-2.8-5-2.8z"></path>'),
     audio: wrapFileIcon('audio', '<path d="M9 18V6l9-2v12"></path><circle cx="6.5" cy="18" r="2.5"></circle><circle cx="15.5" cy="16" r="2.5"></circle>'),
-    pdf: wrapFileIcon('pdf', '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><path d="M8.8 15.5h6.4"></path><path d="M9.8 12h4.4"></path>'),
-    doc: wrapFileIcon('doc', '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><path d="M9.5 11h5"></path><path d="M9.5 14h5"></path><path d="M9.5 17h3.5"></path>'),
-    spreadsheet: wrapFileIcon('spreadsheet', '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><rect x="9" y="10.5" width="6" height="7" rx=".7"></rect><path d="M9 13.8h6M12 10.5v7"></path>'),
-    presentation: wrapFileIcon('presentation', '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><rect x="9" y="10.5" width="6" height="4.8" rx=".7"></rect><path d="M12 15.3V18M10 18h4"></path>'),
-    text: wrapFileIcon('text', '<path d="M6.5 4.5h11v15h-11z"></path><path d="M9 9h6"></path><path d="M9 12h6"></path><path d="M9 15h4"></path>'),
+    pdf: wrapFileIcon('pdf', FILE_SHEET + '<path d="M7.5 16h9M9 12h6"></path>'),
+    doc: wrapFileIcon('doc', FILE_SHEET + FILE_TEXT_LINES),
+    spreadsheet: wrapFileIcon('spreadsheet', FILE_SHEET + '<rect x="7" y="11" width="10" height="7" rx=".7"></rect><path d="M7 14.5h10M12 11v7"></path>'),
+    presentation: wrapFileIcon('presentation', FILE_SHEET + '<rect x="7" y="11" width="10" height="5" rx=".7"></rect><path d="M12 16v3M9 19h6"></path>'),
+    text: wrapFileIcon('text', '<path d="M4 3h16v18H4z"></path><path d="M8 8h8M8 12h8M8 16h5"></path>'),
     data: wrapFileIcon('data', '<rect x="4.5" y="5.5" width="15" height="13" rx="2"></rect><path d="M4.5 10h15"></path><path d="M9.5 5.5v13"></path><path d="M14.5 5.5v13"></path>'),
     archive: wrapFileIcon('archive', '<path d="M5 8.5 12 5l7 3.5-7 3.5L5 8.5z"></path><path d="M5 8.5v7L12 19l7-3.5v-7"></path><path d="M12 12v7"></path>'),
     code: wrapFileIcon('code', '<path d="m9 8-4 4 4 4"></path><path d="m15 8 4 4-4 4"></path><path d="m13 6-2 12"></path>'),
-    file: wrapFileIcon('file', '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path>'),
+    file: wrapFileIcon('file', FILE_SHEET),
   };
 
   function extOf(name) {

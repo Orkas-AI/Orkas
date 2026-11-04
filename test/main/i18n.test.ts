@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import {
   t, setCurrentLang, getCurrentLang,
   acceptLanguageHeader, detectSystemLang, descriptionLang, getRendererBootTables,
@@ -189,6 +191,14 @@ describe('i18n › t() lookup', () => {
         t('notification.task.waiting_input.body', undefined, lang),
         t('notification.automation.failed.title_many', { count: 3 }, lang),
       ]).toEqual(expected[lang]);
+    }
+  });
+
+  it('ships the missing-to-do recovery copy in every registered locale', () => {
+    for (const { code } of LOCALES) {
+      const rendererTable = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales', code + '.json'), 'utf8'));
+      expect(typeof rendererTable['todo.notification.unavailable']).toBe('string');
+      expect(rendererTable['todo.notification.unavailable'].trim()).not.toBe('');
     }
   });
 

@@ -135,7 +135,7 @@
   "errors.model_currently_unavailable": "Este modelo está indisponível no momento",
   "errors.model_config_unavailable": "Um modelo está configurado, mas sua credencial não pode ser usada no momento. Verifique a chave de API, o estado de login ou o modelo substituto em Configurações.",
   "errors.model_oauth_expired": "A autorização de {provider} expirou. Reautorize esta conta em Configurações ou mude para um modelo alternativo.",
-  "errors.model_credits_insufficient": "Créditos insuficientes. Adicione créditos ou mude para um modelo disponível em Configurações.",
+  "errors.model_credits_insufficient": "Créditos insuficientes, então a tarefa parou. Depois de adicionar créditos, volte a esta tarefa e escreva “Continuar” para retomar de onde parou. Você também pode mudar para um modelo disponível em Configurações.",
   "errors.custom_endpoint_suspect": "Seu endpoint de modelo personalizado falhou em várias solicitações seguidas (HTTP {status}) — ele pode estar inativo ou ter mudado. Verifique o URL da API e a chave em Configurações → Modelos, ou troque de modelo para continuar.",
   "errors.model_output_cap_repeated": "Este modelo atingiu o limite de saída por resposta várias vezes seguidas — pode ser pequeno demais para esta tarefa. Troque para um modelo com limite maior em Configurações, ou divida a tarefa.",
   "errors.model_provider_balance_insufficient": "A conta do provedor de modelo que você configurou está sem saldo (não são créditos Orkas). Recarregue com esse provedor ou troque de modelo em Configurações.",
@@ -361,5 +361,11 @@
   "notification.automation.failed.title": "Execução de automação falhou",
   "notification.automation.failed.title_many": "{count} execuções de automação falharam",
   "notification.automation.waiting_input.title": "Uma execução de automação aguarda sua resposta",
-  "notification.automation.waiting_input.title_many": "{count} execuções de automação aguardam sua resposta"
+  "notification.automation.waiting_input.title_many": "{count} execuções de automação aguardam sua resposta",
+  "errors.model_rate_limited_all_configured": "Todos os modelos que você configurou atingiram o limite de solicitações. Normalmente libera em um ou dois minutos; tente novamente depois.",
+  "errors.model_request_rejected_repeated": "Esta solicitação foi rejeitada várias vezes seguidas, então tentar de novo sem mudanças não vai alterar o resultado. Troque para outro modelo em Configurações e tente de novo, ou remova as imagens ou anexos e envie novamente.",
+  "errors.provider_reply_detail": "Resposta do provedor: {detail}",
+  "cli_agent.repeated_failure_hint": "“{name}” falhou novamente. Você pode pedir ao @Commander para assumir esta tarefa.",
+  "desktop.open": "Abrir",
+  "desktop.exit": "Sair"
 }

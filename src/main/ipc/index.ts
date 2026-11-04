@@ -58,6 +58,8 @@ import * as videoStudioReview from '../features/video_studio_review';
 import * as ttsAuth from '../features/tts_auth';
 import * as voiceInput from '../features/voice_input';
 import * as permissions from '../features/permissions';
+import { getDesktopWindowController } from '../features/desktop_windows';
+import { getLoginStartup } from '../features/login_startup';
 import * as notificationPermissions from '../features/notification_permissions';
 import * as appConfig from '../features/config';
 import * as taskUnreadTray from '../features/task_unread_tray';
@@ -99,7 +101,7 @@ import {
   findAutoTaskLocation,
   globalAutoTaskLocation,
 } from '../util/project-layout';
-import { logErrorRef, logPathRef, maskId } from '../util/log-redact';
+import { logErrorRef, logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { chatMediaLocalPathFromUrl } from '../util/chat-media-url';
 import { captureDeliveredTaskIntervention } from '../util/task-intervention-events';
 import { macosTccSensitivePath } from '../util/macos-tcc';
@@ -122,7 +124,7 @@ const attachmentAddChannels = new Set([
   'conversations.attachments.pickAndUpload', 'orkas.importLocalFiles',
 ]);
 const attachmentFailureCodes = new Set([
-  'invalid_attachment', 'file_too_large', 'invalid_utf8', 'too_many_attachments',
+  'invalid_attachment', 'file_too_large', 'too_many_attachments',
   'source_unavailable', 'not_file', 'read_failed', 'write_failed', 'copy_failed',
   'E_NOT_LOGGED_IN', 'E_IPC_SENDER', 'E_IPC_REQUEST', 'E_STORAGE_FULL', 'mixed',
 ]);
@@ -186,7 +188,7 @@ function logInvokeResultFailure(channel: string, result: Record<string, unknown>
       ...(Number.isInteger(result.failed_count) ? { failed_count: result.failed_count } : {}),
     } : channel === 'contexts.attachToDraft' || channel === 'projects.files.attachToDraft'
       ? { failure_stage: result.failure_stage, failure_kind: result.failure_kind }
-      : { error: typeof result.error === 'string' ? result.error : 'operation rejected' }),
+      : { error: logErrorSummary(typeof result.error === 'string' ? result.error : 'operation rejected') }),
     ...(suppressed > 0 ? { suppressed_count: suppressed } : {}),
   });
 }
@@ -1034,6 +1036,16 @@ async function _afterRecycleRestore(ctx: IpcContext, paths: string[]): Promise<v
 // Contract: `(payload, { userId, sender }) => result` where result is
 // merged into a `{ ok: true, ...result }` response. Throw to signal error.
 
+async function startupOperation(run: () => unknown | Promise<unknown>) {
+  try { return await run(); }
+  catch (error) {
+    const raw = (error as { code?: string }).code;
+    const code = raw && ['E_STARTUP_READ', 'E_STARTUP_SAVE', 'E_STARTUP_UNAVAILABLE', 'E_STARTUP_INPUT'].includes(raw) ? raw : 'E_STARTUP_READ';
+    log.warn('startup operation rejected', { code });
+    return { ok: false, code };
+  }
+}
+
 const invokeHandlers: Record<string, InvokeHandler> = {
   'voiceInput.createSession': () => voiceInput.createVoiceSession(),
   'voiceInput.ensureMicrophoneAccess': () => voiceInput.ensureMicrophoneAccess(),
@@ -1486,6 +1498,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── Project tasks (structured work backlog — user + agent shared) ─────────
+  'chatTaskReferences.resolve': async ({ references } = {}, ctx) => {
+    const { resolveChatTaskReferences } = await import('../features/chat_task_references');
+    return { references: await resolveChatTaskReferences(ctx.userId, references) };
+  },
+
   'projects.tasks.list': async ({ projectId } = {}, ctx) => {
     const scopeProjectId = todoProjectScope(projectId);
     const tasks = await projectTasks.listTasks(ctx.userId, scopeProjectId);
@@ -2476,8 +2493,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     try { r = await savedApps.deleteSavedApp(ctx.userId, String(appId || '')); }
     catch { r = { ok: false, error: 'app_delete_failed' }; }
     if (!r.ok) {
-      // A failed delete leaves the app in place; drop its now-duplicate recycle copy.
-      if (batch) {
+      // Drop the duplicate only after complete rollback. A filesystem refusal
+      // during rollback must retain the user's recovery copy.
+      if (batch && !r.recoveryPending) {
         try { await recycleBin.deleteRecycleBatch(ctx.userId, batch.id); }
         catch (error) { log.warn('saved app recycle batch rollback failed', { error: logErrorRef(error) }); }
       }
@@ -3083,10 +3101,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   // ── Global search (knowledge base + chat history) ──
   'search.status': async (_payload, ctx) => search.searchIndexStatus(ctx.userId),
-  'search.global': async ({ query, limit, scope, projectId }, ctx) => {
+  'search.global': async ({ query, limit, scope, projectId, includeLibraryContent, includeChatSnippets }, ctx) => {
     return search.searchAll(ctx.userId, query || '', {
       limit: typeof limit === 'number' ? limit : 30,
       scope: scope || 'all',
+      includeLibraryContent: includeLibraryContent !== false,
+      includeChatSnippets: includeChatSnippets !== false,
       ...(typeof projectId === 'string' && safeId(projectId) ? { projectId } : {}),
     });
   },
@@ -3114,9 +3134,37 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     runtime_stats: await commanderRuntimeStats.readCommanderRuntimeStats(ctx.userId),
   }),
 
-  // Commander avatar preference (cloud-synced). avatar = { icon, color };
-  // tokens are validated against the catalog allow-list. When absent the
-  // renderer falls back to the commander default (crown + gold).
+  // Device-local lifecycle settings are restricted to owned main renderers.
+  'desktop.getStartup': async (_payload, ctx) => {
+    if (!getDesktopWindowController()?.owns(ctx.sender)) return { ok: false, code: 'E_IPC_SENDER' };
+    return startupOperation(() => ({ startup: getLoginStartup().read() }));
+  },
+  'desktop.setStartup': async ({ enabled }, ctx) => {
+    if (!getDesktopWindowController()?.owns(ctx.sender)) return { ok: false, code: 'E_IPC_SENDER' };
+    if (typeof enabled !== 'boolean') return { ok: false, code: 'E_STARTUP_INPUT' };
+    return startupOperation(() => ({ startup: getLoginStartup().setEnabled(enabled) }));
+  },
+  'desktop.claimStartupPrompt': async (_payload, ctx) => {
+    if (!getDesktopWindowController()?.owns(ctx.sender)) return { ok: false, code: 'E_IPC_SENDER' };
+    return startupOperation(async () => ({ id: await getLoginStartup().claimPrompt(ctx.sender.id, ctx.userId) }));
+  },
+  'desktop.markStartupPromptShown': async ({ id }, ctx) => {
+    if (!getDesktopWindowController()?.owns(ctx.sender)) return { ok: false, code: 'E_IPC_SENDER' };
+    return startupOperation(() => ({ shown: getLoginStartup().markPromptShown(ctx.sender.id, ctx.userId, id) }));
+  },
+  'desktop.releaseStartupPrompt': async (_payload, ctx) => {
+    if (!getDesktopWindowController()?.owns(ctx.sender)) return { ok: false, code: 'E_IPC_SENDER' };
+    return startupOperation(() => { getLoginStartup().releasePrompt(ctx.sender.id); return {}; });
+  },
+  'desktop.openStartupSettings': async (_payload, ctx) => {
+    if (!getDesktopWindowController()?.owns(ctx.sender)) return { ok: false, code: 'E_IPC_SENDER' };
+    if (!getLoginStartup().read().available) return { ok: false, code: 'E_STARTUP_UNAVAILABLE' };
+    return startupOperation(async () => {
+      await shell.openExternal(process.platform === 'darwin' ? 'x-apple.systempreferences:com.apple.LoginItems-Settings.extension' : 'ms-settings:startupapps');
+      return {};
+    });
+  },
+  // Commander avatar preference uses the catalog token allow-list.
   'prefs.getCommanderAvatar': async () => ({ avatar: appConfig.getCommanderAvatar() }),
   'prefs.setCommanderAvatar': async ({ icon, color }) => {
     const avatar = appConfig.setCommanderAvatar({ icon, color });
@@ -3826,6 +3874,16 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 // unexpected throws.
 
 const streamHandlers: Record<string, StreamHandler> = {
+  'search.global': async function* ({ query, limit, scope, projectId, chatSnippetRefs }, ctx, signal) {
+    for await (const page of search.streamSearch(ctx.userId, typeof query === 'string' ? query : '', {
+      limit: typeof limit === 'number' ? limit : 30, scope: scope || 'all',
+      ...(Array.isArray(chatSnippetRefs) ? { chatSnippetRefs: chatSnippetRefs.slice(0, 32)
+        .filter(ref => ref && typeof ref.cid === 'string' && safeId(ref.cid)
+          && Number.isSafeInteger(ref.msg_index) && ref.msg_index >= 0)
+        .map(ref => ({ cid: ref.cid, msg_index: ref.msg_index })) } : {}),
+      ...(typeof projectId === 'string' && safeId(projectId) ? { projectId } : {}),
+    }, signal)) yield { type: 'event', event: page };
+  },
   'webApps.call': webAppCall,
   'conversations.sendStream': async function* ({
     cid,
@@ -4169,7 +4227,7 @@ const streamHandlers: Record<string, StreamHandler> = {
 
 // ── Runtime ──────────────────────────────────────────────────────────────
 
-interface StreamState { cancelled: boolean; controller: AbortController; sender: WebContents }
+interface StreamState { cancelled: boolean; controller: AbortController; sender: WebContents; channel: string }
 const activeStreams = new Map<string, StreamState>();
 interface SettledStreamState { sender: WebContents; settledAt: number }
 const recentlySettledStreams = new Map<string, SettledStreamState>();
@@ -4240,7 +4298,7 @@ export function register(): void {
     if ((channel.startsWith('voice.') || channel.startsWith('voiceInput.')) && (event.senderFrame !== event.sender.mainFrame || previewWindows.isPreviewContents(event.sender))) {
       return { ok: false, code: 'E_IPC_SENDER' };
     }
-    if ((channel.startsWith('webApps.') || channel.startsWith('previewWindows.') || channel === 'savedApps.openInApp' || previewWindows.isPreviewContents(event.sender)) && event.senderFrame !== event.sender.mainFrame) return { ok: false, code: 'E_IPC_SENDER' };
+    if ((channel.startsWith('desktop.') || channel.startsWith('webApps.') || channel.startsWith('previewWindows.') || channel === 'savedApps.openInApp' || previewWindows.isPreviewContents(event.sender)) && event.senderFrame !== event.sender.mainFrame) return { ok: false, code: 'E_IPC_SENDER' };
     const handler = invokeHandlers[channel];
     if (!handler) return { ok: false, error: `unknown channel: ${channel}` };
     try {
@@ -4259,7 +4317,7 @@ export function register(): void {
           ? Number(rawCode.trim())
           : (typeof rawCode === 'string' && rawCode ? rawCode : normalized.code));
       const attachment = attachmentAddChannels.has(channel) ? attachmentFailureDiagnostic({ code, failure_kind: fileFailureKind(err) }) : null;
-      log.error(`invoke ${channel} failed`, attachment || { error: normalized.error, code });
+      log.error(`invoke ${channel} failed`, attachment || { error: logErrorSummary(err), code });
       const out: {
         ok: false;
         error: string;
@@ -4317,7 +4375,7 @@ export function register(): void {
       const normalized = normalizeAppError(err);
       log.warn('local file import request failed', {
         code: normalized.code,
-        error: normalized.error,
+        error: logErrorSummary(err),
       });
       return { ok: false, error: normalized.error, code: normalized.code };
     }
@@ -4347,9 +4405,12 @@ export function register(): void {
       return;
     }
     const controller = new AbortController();
-    const state: StreamState = { cancelled: false, controller, sender: event.sender };
+    const state: StreamState = { cancelled: false, controller, sender: event.sender, channel };
     activeStreams.set(requestId, state);
-    if(channel!=='webApps.call')log.info(`streamStart channel=${channel} requestId=${requestId} cid=${payload?.cid || payload?.id || payload?.agent_id || ''}`);
+    // Search is a per-input stream; retain slow-query/failure diagnostics without
+    // adding routine start/done records for every keystroke.
+    const logLifecycle = channel !== 'webApps.call' && channel !== 'search.global';
+    if(logLifecycle)log.info(`streamStart channel=${channel} requestId=${requestId} cid=${payload?.cid || payload?.id || payload?.agent_id || ''}`);
     try {
       const ctx = await resolveContext(event.sender);
       for await (const ev of handler(payload || {}, ctx, controller.signal)) {
@@ -4358,12 +4419,12 @@ export function register(): void {
         out(ev);
       }
     } catch (err) {
-      log.error(`stream ${channel} failed`, { error: (err as Error)?.message || String(err) });
+      log.error(`stream ${channel} failed`, { error: logErrorSummary(err) });
       out({ type: 'error', text: (err as Error).message || String(err) });
     } finally {
       activeStreams.delete(requestId);
       rememberSettledStream(requestId, event.sender);
-      if(channel!=='webApps.call')log.info(`streamDone channel=${channel} requestId=${requestId} cancelled=${state.cancelled}`);
+      if(logLifecycle)log.info(`streamDone channel=${channel} requestId=${requestId} cancelled=${state.cancelled}`);
       out({ type: 'done' });
     }
   });
@@ -4394,7 +4455,7 @@ export function register(): void {
       log.warn('streamCancel: sender mismatch', { request_id: maskId(requestId) });
       return;
     }
-    log.info('streamCancel', { request_id: maskId(requestId) });
+    if (state.channel !== 'search.global') log.info('streamCancel', { request_id: maskId(requestId) });
     state.cancelled = true;
     // Propagate the cancel into the generator's async work — in particular
     // the in-flight LLM HTTP call inside `streamChatWithModel`. Without this

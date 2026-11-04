@@ -135,7 +135,7 @@
   "errors.model_currently_unavailable": "该模型当前暂不可用",
   "errors.model_config_unavailable": "已配置模型，但当前凭证不可用。请到「设置」页检查 API 密钥、登录状态或切换备用模型。",
   "errors.model_oauth_expired": "{provider} 授权已过期。请到「设置」页重新授权该账号，或切换备用模型。",
-  "errors.model_credits_insufficient": "积分不足，请补充积分，或在「设置」中切换可用模型。",
+  "errors.model_credits_insufficient": "积分不足，任务已停止。补充积分后，回到这个任务说「继续」即可接着做；也可以在「设置」中切换可用模型。",
   "errors.custom_endpoint_suspect": "你的自定义模型服务连续多次请求失败（HTTP {status}），端点可能已失效或已迁移。请前往「设置 → 模型」检查该服务的 API 地址与密钥，或先切换其他模型继续。",
   "errors.model_output_cap_repeated": "当前模型已连续多次达到单次输出上限，可能不适合这个任务量。建议在「设置」中换用输出上限更大的模型，或把任务拆小。",
   "errors.model_provider_balance_insufficient": "你配置的模型服务账户余额不足（这不是 Orkas 积分）。请前往该服务商充值，或在「设置」中切换其他模型。",
@@ -361,5 +361,11 @@
   "notification.automation.failed.title": "自动化运行失败",
   "notification.automation.failed.title_many": "{count} 个自动化运行失败",
   "notification.automation.waiting_input.title": "有自动化运行等你回复",
-  "notification.automation.waiting_input.title_many": "{count} 个自动化运行等你回复"
+  "notification.automation.waiting_input.title_many": "{count} 个自动化运行等你回复",
+  "errors.model_rate_limited_all_configured": "你配置的模型都被限流了，通常一两分钟后恢复，到时再点重试。",
+  "errors.model_request_rejected_repeated": "这个请求已连续被拒绝，原样重试也不会有不同结果。可以在「设置」里换一个模型再试；如果带了图片或附件，也可以去掉后再发。",
+  "errors.provider_reply_detail": "服务商返回：{detail}",
+  "cli_agent.repeated_failure_hint": "「{name}」又失败了，可以先改用 @指挥官 接手这个任务。",
+  "desktop.open": "打开",
+  "desktop.exit": "退出"
 }

@@ -22,6 +22,13 @@ let _ipcErrorSentCount = 0;
 //   - opts.stream: boolean (this call yields an SSE-style stream)
 //   - opts.wrapAsUpdates: wrap the whole body under `updates` key
 const _IPC_ROUTES = [
+  ['GET', '/api/desktop/startup', 'desktop.getStartup'],
+  ['POST', '/api/desktop/startup', 'desktop.setStartup'],
+  ['POST', '/api/desktop/startup/prompt/claim', 'desktop.claimStartupPrompt'],
+  ['POST', '/api/desktop/startup/prompt/shown', 'desktop.markStartupPromptShown'],
+  ['POST', '/api/desktop/startup/prompt/release', 'desktop.releaseStartupPrompt'],
+  ['POST', '/api/desktop/startup/settings', 'desktop.openStartupSettings'],
+  ['POST', '/api/chat/task-references', 'chatTaskReferences.resolve'],
   ['POST', '/api/apps/data-impact-from-path', 'savedApps.dataImpactFromPath'],
   ['POST', '/api/apps/export-data-from-path', 'savedApps.exportDataFromPath'],
   ['POST', '/api/conversations/cleanup/preview', 'conversations.cleanup.preview'],

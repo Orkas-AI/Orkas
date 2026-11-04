@@ -135,7 +135,7 @@
   "errors.model_currently_unavailable": "Ce modèle est actuellement indisponible",
   "errors.model_config_unavailable": "Un modèle est configuré, mais son identifiant d’accès n’est pas utilisable actuellement. Vérifiez la clé API, l’état de connexion ou le modèle de repli dans les paramètres.",
   "errors.model_oauth_expired": "L’autorisation {provider} a expiré. Autorisez à nouveau ce compte dans les paramètres ou passez à un modèle de repli.",
-  "errors.model_credits_insufficient": "Crédits insuffisants. Ajoutez des crédits ou choisissez un modèle disponible dans les paramètres.",
+  "errors.model_credits_insufficient": "Crédits insuffisants : la tâche s’est arrêtée. Après avoir ajouté des crédits, revenez à cette tâche et écrivez « Continuer » pour reprendre là où elle s’est arrêtée. Vous pouvez aussi choisir un modèle disponible dans les paramètres.",
   "errors.custom_endpoint_suspect": "Votre point d’accès de modèle personnalisé a échoué plusieurs fois de suite (HTTP {status}) ; il est peut-être hors service ou a changé d’adresse. Vérifiez l’URL de l’API et la clé dans Paramètres → Modèles ou choisissez un autre modèle pour continuer.",
   "errors.model_output_cap_repeated": "Ce modèle a atteint plusieurs fois de suite sa limite de sortie par réponse ; elle est peut-être trop basse pour cette tâche. Choisissez un modèle avec une limite de sortie plus élevée dans les paramètres ou divisez la tâche.",
   "errors.model_provider_balance_insufficient": "Le solde de votre compte chez le fournisseur du modèle configuré est épuisé (il ne s’agit pas des crédits Orkas). Rechargez ce compte ou changez de modèle dans les paramètres.",
@@ -361,5 +361,11 @@
   "notification.automation.failed.title": "Exécution d'automatisation échouée",
   "notification.automation.failed.title_many": "{count} exécutions d'automatisation échouées",
   "notification.automation.waiting_input.title": "Une exécution d'automatisation attend votre réponse",
-  "notification.automation.waiting_input.title_many": "{count} exécutions d'automatisation attendent votre réponse"
+  "notification.automation.waiting_input.title_many": "{count} exécutions d'automatisation attendent votre réponse",
+  "errors.model_rate_limited_all_configured": "Tous vos modèles configurés sont limités en débit. La limite se lève généralement en une à deux minutes ; réessayez ensuite.",
+  "errors.model_request_rejected_repeated": "Cette requête a été rejetée plusieurs fois de suite : la relancer telle quelle ne changera rien. Choisissez un autre modèle dans les paramètres et réessayez, ou retirez les images ou pièces jointes avant de renvoyer.",
+  "errors.provider_reply_detail": "Réponse du fournisseur : {detail}",
+  "cli_agent.repeated_failure_hint": "« {name} » a de nouveau échoué. Vous pouvez demander à @Commander de prendre le relais sur cette tâche.",
+  "desktop.open": "Ouvrir",
+  "desktop.exit": "Quitter"
 }

@@ -135,7 +135,7 @@
   "errors.model_currently_unavailable": "Bu model şu anda kullanılamıyor",
   "errors.model_config_unavailable": "Bir model yapılandırılmış, ancak kimlik bilgileri şu anda kullanılamıyor. Ayarlar'dan API anahtarını, oturum durumunu veya yedek modeli kontrol edin.",
   "errors.model_oauth_expired": "{provider} yetkilendirmesinin süresi doldu. Ayarlar'dan bu hesabı yeniden yetkilendirin veya yedek modele geçin.",
-  "errors.model_credits_insufficient": "Yeterli kredi yok. Kredi ekleyin veya Ayarlar'dan kullanılabilir bir modele geçin.",
+  "errors.model_credits_insufficient": "Yeterli kredi olmadığı için görev durdu. Kredi ekledikten sonra bu göreve dönüp “Devam et” yazın; görev kaldığı yerden sürer. Ayarlar'dan kullanılabilir bir modele de geçebilirsiniz.",
   "errors.custom_endpoint_suspect": "Özel model uç noktanız art arda birkaç istekte başarısız oldu (HTTP {status}); çalışmıyor veya taşınmış olabilir. Ayarlar → Modeller bölümünden API URL'sini ve anahtarını kontrol edin veya devam etmek için başka bir modele geçin.",
   "errors.model_output_cap_repeated": "Bu model art arda birkaç kez yanıt başına çıktı sınırına ulaştı; bu görev için sınır yetersiz olabilir. Ayarlar'dan daha yüksek çıktı sınırı olan bir modele geçin veya görevi bölün.",
   "errors.model_provider_balance_insufficient": "Yapılandırdığınız model sağlayıcısı hesabının bakiyesi tükendi (Orkas kredisi değil). Sağlayıcıya bakiye yükleyin veya Ayarlar'dan modeli değiştirin.",
@@ -361,5 +361,11 @@
   "notification.automation.failed.title": "Otomasyon çalıştırması başarısız oldu",
   "notification.automation.failed.title_many": "{count} otomasyon çalıştırması başarısız oldu",
   "notification.automation.waiting_input.title": "Bir otomasyon çalıştırması yanıtınızı bekliyor",
-  "notification.automation.waiting_input.title_many": "{count} otomasyon çalıştırması yanıtınızı bekliyor"
+  "notification.automation.waiting_input.title_many": "{count} otomasyon çalıştırması yanıtınızı bekliyor",
+  "errors.model_rate_limited_all_configured": "Yapılandırdığınız tüm modeller istek sınırına takıldı. Sınır genellikle bir iki dakika içinde kalkar; o zaman tekrar deneyin.",
+  "errors.model_request_rejected_repeated": "Bu istek art arda reddedildi; aynı şekilde yeniden denemek sonucu değiştirmez. Ayarlar'dan başka bir modele geçip yeniden deneyin ya da görselleri veya ekleri kaldırıp yeniden gönderin.",
+  "errors.provider_reply_detail": "Sağlayıcının yanıtı: {detail}",
+  "cli_agent.repeated_failure_hint": "“{name}” yine başarısız oldu. Bunun yerine bu görevi @Commander'a devredebilirsiniz.",
+  "desktop.open": "Aç",
+  "desktop.exit": "Çıkış"
 }
