@@ -10820,6 +10820,25 @@ describe('polled history recovery identity', () => {
     return context;
   }
 
+  it('restores a queued user message and its attachments once when live delivery was interrupted', async () => {
+    const context = recoveryHarness();
+    const rendered = new Map<string, any>();
+    context._isVisibleGroupHistoryRecord = (record: any) => !record.dispatch;
+    context._findRenderedGroupMessage = (_container: any, record: any) => rendered.get(record.id) || null;
+    context._renderOrClaimPersistedUserMessage = (_cid: string, record: any) => {
+      rendered.set(record.id, record);
+      return true;
+    };
+    const original = { id: 'user-queued', from: 'user', text: 'Edited attached queued message.', attachments: ['queued.txt', 'edit-added.txt'] };
+    const rows = [original, { id: 'dispatch', from: 'user', dispatch: true, text: 'internal' },
+      { from: 'user', text: 'not yet durable' }];
+    expect(await context._recoverPolledVisibleMessages('c1', rows)).toBe(true);
+    expect(Array.from(rendered.values())).toEqual([original]);
+    expect(await context._recoverPolledVisibleMessages('c1', rows)).toBe(false);
+    expect(Array.from(rendered.values())).toEqual([original]);
+    expect(context.appendChatMessage).not.toHaveBeenCalled();
+  });
+
   it('settles a keyed live row once when its durable reply arrives through polling', async () => {
     const context = recoveryHarness();
     const row = { dataset: { renderKey: 's:turn-a:0', placeholder: '1', finalized: '0' }, parentElement: {} };
