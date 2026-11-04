@@ -38,15 +38,22 @@ afterEach(async () => {
   // Account activation starts a real log worker. Drain and close it before
   // removing its directory so late file creation cannot race the teardown.
   try {
-    for (const delivery of logDeliveries) await vi.waitFor(() => expect(delivery.stats().pending).toBe(0));
-  } finally { await Promise.all(logDeliveries.map(delivery => delivery.close())); }
-  if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
-  else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  if (prevDisableDelivery === undefined) delete process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
-  else process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = prevDisableDelivery;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-  vi.restoreAllMocks();
-  vi.resetModules();
+    for (const delivery of logDeliveries) {
+      await vi.waitFor(() => expect(delivery.stats().pending).toBe(0), { timeout: 5_000 });
+      expect(delivery.stats()).toMatchObject({ dropped: 0, failed: false });
+    }
+  } finally {
+    try { await Promise.all(logDeliveries.map(delivery => delivery.close())); }
+    finally {
+      if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
+      else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+      if (prevDisableDelivery === undefined) delete process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
+      else process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = prevDisableDelivery;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      vi.restoreAllMocks();
+      vi.resetModules();
+    }
+  }
 });
 
 function packagedSystemSkill(id: string): string {
@@ -140,12 +147,15 @@ describe('system skills reconciliation', () => {
     const results = await systemSkills.reconcileAllForActiveUser();
     expect(results.map((r) => [r.id, r.action]).sort()).toEqual([
       ['agent-creator', 'created'],
+      ['orkas-guide', 'created'],
       ['package-installer', 'created'],
       ['skill-creator', 'created'],
       ['web-app-sdk', 'created'],
 
     ]);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), 'SKILL.md'))).toBe(true);
+    expect(fs.readFileSync(path.join(paths.userSystemSkillDir(UID, 'orkas-guide'), 'SKILL.md'), 'utf8'))
+      .toBe(packagedSystemSkill('orkas-guide'));
     expect(fs.existsSync(path.join(
       paths.userSystemSkillDir(UID, 'agent-creator'),
       'references',
@@ -177,12 +187,14 @@ describe('system skills reconciliation', () => {
     const results = await systemSkills.reconcileAllForUser(loginUid);
     expect(results.map((r) => [r.id, r.action]).sort()).toEqual([
       ['agent-creator', 'created'],
+      ['orkas-guide', 'created'],
       ['package-installer', 'created'],
       ['skill-creator', 'created'],
       ['web-app-sdk', 'created'],
 
     ]);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'agent-creator'), 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'orkas-guide'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'package-installer'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'skill-creator'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(paths.userSystemSkillDir(UID, 'agent-creator'))).toBe(false);
@@ -198,6 +210,7 @@ describe('system skills reconciliation', () => {
     fs.writeFileSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), '_system.json'), '{}');
     const skipped = await systemSkills.reconcileAllForActiveUser();
     expect(skipped.map((r) => r.action)).toEqual([
+      'skipped',
       'skipped',
       'skipped',
       'skipped',
@@ -345,7 +358,12 @@ describe('system skills reconciliation', () => {
       expect(roster).not.toContain(id);
       expect([...bindings.values()].some((binding) => binding.id === id)).toBe(false);
     }
-    expect(roster).not.toContain('orkas-guide');
+    expect(roster).toContain('@skill/orkas-guide');
+    const guide = [...bindings.values()].find(binding => binding.id === 'orkas-guide');
+    expect(guide).toMatchObject({ id: 'orkas-guide', source: 'system' });
+    expect(fs.readFileSync(guide.entry, 'utf8')).toBe(packagedSystemSkill('orkas-guide'));
+    expect(fs.readFileSync(path.join(guide.root, 'references/editions.md'), 'utf8'))
+      .toBe(packagedSystemSkillReference('orkas-guide', 'editions.md'));
     expect(memory.listEntries(UID, 'user').entries).toEqual(['Prefer concise replies.']);
     expect((await systemSkills.reconcileAllForUser(UID)).every((result) => result.action === 'skipped')).toBe(true);
   });
@@ -441,9 +459,13 @@ describe('system skills reconciliation', () => {
 });
 
 describe('system skill contracts', () => {
-  it('keeps every platform-managed system Skill bilingual without a generic description', () => {
+  it('loads every hidden system Skill from one English routing description', async () => {
+    const { SkillLoader } = await import('#core-agent');
+    const root = path.resolve(process.cwd(), 'resources/builtin/system/skills');
+    const specs = new SkillLoader({ dirs: [root] }).list();
     const ids = [
       'agent-creator',
+      'orkas-guide',
       'package-installer',
       'skill-creator',
       'web-app-sdk',
@@ -451,9 +473,14 @@ describe('system skill contracts', () => {
     for (const id of ids) {
       const fm = frontmatterOf(packagedSystemSkill(id));
       expect(fm).toMatch(/^name:\s*/m);
-      expect(fm).toMatch(/^description_zh:\s*\S/m);
-      expect(fm).toMatch(/^description_en:\s*\S/m);
-      expect(fm).not.toMatch(/^description:/m);
+      expect(fm).toMatch(/^description:\s*\S/m);
+      expect(fm).not.toMatch(/^description_(?:zh|en):/m);
+      const description = JSON.parse(fm.match(/^description:\s*(.+)$/m)![1]);
+      expect(description).not.toMatch(/[\u4e00-\u9fff]/);
+      expect(specs.find((spec) => spec.id === id)).toMatchObject({
+        description_zh: '',
+        description_en: description,
+      });
     }
   });
 
@@ -540,15 +567,11 @@ describe('system skill contracts', () => {
     expect(md).not.toContain('Both are required');
   });
 
-  it('does not package the hosted-product Orkas guide', () => {
-    expect(fs.existsSync(path.resolve(
-      process.cwd(),
-      'resources',
-      'builtin',
-      'system',
-      'skills',
-      'orkas-guide',
-    ))).toBe(false);
+  it('packages product guidance with edition boundaries and no operation authority', () => {
+    const guide = packagedSystemSkill('orkas-guide');
+    expect(frontmatterOf(guide)).toContain('supplies facts, not task ownership or operation authority');
+    expect(guide).toContain('[editions.md](references/editions.md)');
+    expect(packagedSystemSkillReference('orkas-guide', 'editions.md')).toContain('Commercial edition only');
   });
 
   it('keeps intentional creator-skill category and provenance rules in parity', () => {

@@ -519,6 +519,7 @@ async function loadAgents(forceRefresh, opts = {}) {
       if (summary) query.set('summary', '1');
       const res = await apiFetch(`/api/agents/list${query.size ? `?${query}` : ''}`);
       const data = await res.json();
+      if (!data.ok) return false;
       if (data.ok) {
         // Sort once on cache fill so picker + grid share the order.
         // Order: custom group first, then within each group sort by a key
@@ -574,6 +575,7 @@ async function loadAgents(forceRefresh, opts = {}) {
       }
     } catch (e) {
       _agentsLog.error('load agents failed', e);
+      return false;
     } finally {
       _agentsLoadInFlight = null;
     }
@@ -633,6 +635,51 @@ function renderAgentsList(agents) { renderAgentsGrid(agents); }
 // matches `_mpState.category` semantics in marketplace.js. Persists across
 // re-renders within a session; defaults to All on each load.
 let _agentsActiveCategory = '';
+
+let _agentCardHighlight = null;
+let _agentCardNavigationEpoch = 0;
+function clearAgentCardHighlights() {
+  _agentCardNavigationEpoch += 1;
+  if (_agentCardHighlight?.timer) clearTimeout(_agentCardHighlight.timer);
+  _agentCardHighlight = null;
+  document.querySelectorAll('.agent-card.is-highlighted').forEach(card => card.classList.remove('is-highlighted'));
+}
+function _applyAgentCardHighlights() {
+  const target = _agentCardHighlight;
+  if (!target) return;
+  if (target.userId !== globalThis.currentUserId || currentView !== 'agents' || Date.now() >= target.deadline) {
+    clearAgentCardHighlights(); return;
+  }
+  const cards = Array.from(document.querySelectorAll('#agents-grid .agent-card'))
+    .filter(card => target.ids.includes(card.dataset.id));
+  cards.forEach(card => card.classList.add('is-highlighted'));
+  if (cards.length && !target.scrolled) {
+    target.scrolled = true;
+    cards[0].scrollIntoView({ block: 'center', behavior: 'instant' });
+    cards[0].setAttribute('tabindex', '-1');
+    cards[0].focus({ preventScroll: true });
+  }
+}
+async function showAgentCards(ids) {
+  const safeIds = Array.from(new Set(Array.isArray(ids) ? ids.filter(id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(id)) : [])).slice(0, 5);
+  if (!safeIds.length) return;
+  const userId = globalThis.currentUserId;
+  clearAgentCardHighlights();
+  const epoch = _agentCardNavigationEpoch;
+  _agentsActiveCategory = '';
+  _showAgentsGridView();
+  setView('agents');
+  const loaded = await loadAgents(true);
+  if (globalThis.currentUserId !== userId || currentView !== 'agents' || epoch !== _agentCardNavigationEpoch) return;
+  if (loaded === false) { await uiAlert(t('agents.load_failed')); return; }
+  if (!Array.from(document.querySelectorAll('#agents-grid .agent-card')).some(card => safeIds.includes(card.dataset.id))) {
+    await uiAlert(t('agents.agent_not_found')); return;
+  }
+  _agentCardHighlight = { ids: safeIds, userId, deadline: Date.now() + 2500, scrolled: false };
+  _agentCardHighlight.timer = setTimeout(clearAgentCardHighlights, 2500);
+  _applyAgentCardHighlights();
+}
+window.showAgentCards = showAgentCards;
 
 function renderAgentsGrid(agents) {
   // Commander is a synthetic renderer-owned row, not part of `_agentsCache`.
@@ -826,6 +873,7 @@ function renderAgentsGrid(agents) {
       openAgentDetail(id);
     });
   }
+  _applyAgentCardHighlights();
 }
 
 /** Flip an agent's enabled override (used by both the ⋯ menu's toggle item

@@ -1,7 +1,6 @@
 ---
 name: web-app-sdk
-description_zh: "创建、修改或排查本地应用和可发布的网页应用，按应用类型选择浏览器、通用数据和宿主接口。不用于产品答疑或系统 Skill 修改；不授予执行权限。"
-description_en: "Build, change or debug local apps and publishable web apps, using the matching browser, common data or host contract. Not product help or System Skill editing; grants no execution authority."
+description: "Build, change or debug local apps and publishable web apps, using the matching browser, common data or host contract. Not product help or System Skill editing; grants no execution authority."
 ---
 
 # Application development

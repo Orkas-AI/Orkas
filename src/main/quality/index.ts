@@ -1,3 +1,4 @@
+import { frontmatterCloseIndex } from '../util/skill-frontmatter';
 /**
  * Quality validator — public API.
  *
@@ -357,7 +358,7 @@ function _splitSkillMd(text: string): SplitResult {
   if (!text.startsWith('---')) {
     return { meta: {}, body: text };
   }
-  const end = text.indexOf('---', 3);
+  const end = frontmatterCloseIndex(text);
   if (end === -1) {
     return { meta: {}, body: text, parseError: 'unterminated frontmatter (missing closing ---)' };
   }

@@ -151,11 +151,16 @@ function immediateSkillCount(root: string): number {
     .length;
 }
 
-function platformDescriptionShapeFindings(content: string): string[] {
+function platformDescriptionShapeFindings(content: string, kind: BuiltinSkillGroup['kind'] = 'shared'): string[] {
   const end = content.startsWith('---') ? content.indexOf('---', 3) : -1;
   const frontmatter = end >= 0 ? content.slice(3, end) : '';
   const has = (field: string): boolean => new RegExp(`^${field}:\\s*\\S`, 'm').test(frontmatter);
   const findings: string[] = [];
+  if (kind === 'system') {
+    if (!has('description')) findings.push('system_description_missing');
+    if (has('description_zh') || has('description_en')) findings.push('system_localized_description_present');
+    return findings;
+  }
   if (has('description')) findings.push('generic_description_present');
   if (!has('description_zh')) findings.push('description_zh_missing');
   if (!has('description_en')) findings.push('description_en_missing');
@@ -254,10 +259,10 @@ describe('builtin skill inline budget', () => {
     }
   });
 
-  it('keeps every shipped platform Skill on one bilingual description source', () => {
-    const findings = specs.flatMap((spec) => {
+  it('keeps System descriptions English and marketplace/private descriptions bilingual at one source', () => {
+    const findings = groups.flatMap((group) => group.specs.flatMap((spec) => {
       const content = fs.readFileSync(spec.skillFile, 'utf8');
-      const shape = platformDescriptionShapeFindings(content)
+      const shape = platformDescriptionShapeFindings(content, group.kind)
         .map((finding) => `${path.relative(BUILTIN_ROOT, spec.skillFile)}:${finding}`);
       const sidecarFile = path.join(spec.dir, '_meta.json');
       if (!fs.existsSync(sidecarFile)) return shape;
@@ -266,9 +271,17 @@ describe('builtin skill inline budget', () => {
         ? [`${path.relative(BUILTIN_ROOT, sidecarFile)}:duplicate_description_source`]
         : [];
       return [...shape, ...duplicated];
-    });
+    }));
 
     expect(findings).toEqual([]);
+    const english = '---\nname: sample\ndescription: English protocol\n---';
+    const bilingual = '---\nname: sample\ndescription_zh: 中文\ndescription_en: English\n---';
+    expect(platformDescriptionShapeFindings(english, 'system')).toEqual([]);
+    expect(platformDescriptionShapeFindings(bilingual, 'system')).toEqual([
+      'system_description_missing', 'system_localized_description_present',
+    ]);
+    expect(platformDescriptionShapeFindings(english, 'shared')).toContain('description_en_missing');
+    expect(platformDescriptionShapeFindings(bilingual, 'shared')).toEqual([]);
     expect(platformDescriptionShapeFindings([
       '---',
       'name: broken',
@@ -282,7 +295,9 @@ describe('builtin skill inline budget', () => {
   it('keeps official metadata with its lifecycle owner', () => {
     const findings = groups.flatMap((group) => group.specs.flatMap((spec) => {
       const content = fs.readFileSync(spec.skillFile, 'utf8');
-      const requiredKeys = group.kind === 'agent'
+      const requiredKeys = group.kind === 'system'
+        ? ['description', 'name']
+        : group.kind === 'agent'
         ? ['description_en', 'description_zh', 'name', 'ownerAgent']
         : ['description_en', 'description_zh', 'name'];
       const allowedKeys = group.kind === 'system'
@@ -321,9 +336,12 @@ describe('builtin skill inline budget', () => {
       const lengthAdvisories = report.violations.filter(violation => (
         violation.rule === 'frontmatter_description_too_long'
       ));
-      const expectedLengthFields = (['zh', 'en'] as const)
-        .filter(lang => estimateBudgetTokens(pickDescription(spec, lang)) > SKILL_DESCRIPTION_ROSTER_MAX_TOKENS)
-        .map(lang => `frontmatter:description_${lang}`);
+      const expectedLengthFields = group.kind === 'system'
+        ? (estimateBudgetTokens(pickDescription(spec, 'en')) > SKILL_DESCRIPTION_ROSTER_MAX_TOKENS
+          ? ['frontmatter:description'] : [])
+        : (['zh', 'en'] as const)
+          .filter(lang => estimateBudgetTokens(pickDescription(spec, lang)) > SKILL_DESCRIPTION_ROSTER_MAX_TOKENS)
+          .map(lang => `frontmatter:description_${lang}`);
       expect(lengthAdvisories.map(violation => violation.field)).toEqual(expectedLengthFields);
       expect(lengthAdvisories.every(violation => violation.level === 'MEDIUM')).toBe(true);
       localFindings.push(...report.violations.filter(violation => (

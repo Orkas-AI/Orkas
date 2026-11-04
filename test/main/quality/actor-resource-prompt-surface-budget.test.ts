@@ -4,7 +4,7 @@ import * as path from 'node:path';
 
 const PROMPTS = path.join(__dirname, '..', '..', '..', 'src', 'main', 'prompts');
 // The shared history rule and adjacent Library section own the removed copies.
-const COMMANDER_RESOURCE_CEILING = 1_200;
+const COMMANDER_RESOURCE_CEILING = 1_100;
 const AGENT_CONTEXT_CEILING = 1_000;
 
 function section(file: string, heading: string): string {

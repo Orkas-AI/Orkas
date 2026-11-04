@@ -117,9 +117,8 @@ to platform tool or network ceilings.
 
 For a normal compact run, create exactly three execution-plan milestones:
 gather, verify, deliver. Do not update their intermediate statuses. After clean
-verification and report assembly, make one final plan update; prefer one
-`set_statuses` call because all three final statuses are then known together.
-The API still permits `set_status` for one genuinely isolated change, and work
+verification and report assembly, make one final plan update: one complete
+`plan` snapshot, because all three final statuses are then known together. Work
 must never wait merely to form a batch.
 
 Immediately after each fetch batch, keep only distinct evidence that may support

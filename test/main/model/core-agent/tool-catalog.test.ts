@@ -185,7 +185,7 @@ describe('tool-catalog', () => {
       .map((group) => group.id);
     expect(AGENT_FALLBACK_TOOL_GROUP_IDS).toEqual(expectedFallbackLeaves);
     expect(groupById.get('management')?.agentDependency).toBe(false);
-    expect(TOOL_GROUPS.filter(group => group.parent === 'management' && group.agentDependency).map(group => group.id)).toEqual(['management.projects', 'management.automation']);
+    expect(TOOL_GROUPS.filter(group => group.parent === 'management' && group.agentDependency).map(group => group.id)).toEqual(['management.todos', 'management.automation']);
     expect(problems).toEqual([]);
   });
 
@@ -246,6 +246,7 @@ describe('tool-catalog', () => {
     expect(LOADABLE_TOOL_GROUP_IDS).toEqual(expect.arrayContaining([
       'management.app',
       'management.projects',
+      'management.todos',
       'management.skills',
       'management.marketplace',
       'management.automation',
@@ -259,6 +260,7 @@ describe('tool-catalog', () => {
       .toEqual([
         'management.app',
         'management.projects',
+        'management.todos',
         'management.skills',
         'management.marketplace',
         'management.automation',
@@ -292,9 +294,9 @@ describe('tool-catalog', () => {
     expect(toolNamesForGroups(['management.marketplace'])).toEqual([
       'marketplace_search', 'marketplace_request_install',
     ]);
-    // Creating a project and relocating the conversation is Commander's call, so
-    // the shared backlog group must not carry it into an Agent dependency.
-    expect(toolNamesForGroups(['management.projects'])).toEqual(['todo_tasks', 'project_setup']);
+    // Runtime project management is separate; legacy Agent declarations retain
+    // only their former backlog capability through the compatibility reader.
+    expect(toolNamesForGroups(['management.projects'])).toEqual(['project_setup']);
     expect(toolNamesForAgentGroups(['management.projects'])).toEqual(['todo_tasks']);
     expect(TOOL_CATALOG.find((entry) => entry.name === 'project_setup'))
       .toMatchObject({ loadGroups: ['management.projects'], agentAssignable: false });
@@ -308,6 +310,7 @@ describe('tool-catalog', () => {
       'management',
       'management.app',
       'management.projects',
+      'management.todos',
       'management.skills',
       'management.marketplace',
       'management.automation',
@@ -325,6 +328,65 @@ describe('tool-catalog', () => {
     ]);
   });
 
+  it('makes custom MCP configuration submission discoverable before loading its full schema', () => {
+    const availableToolNames = ['open_app_view', 'add_custom_connector', 'tool_load'];
+    const controller = createToolSurfaceController({
+      availableToolNames, hostRequiredToolNames: ['open_app_view', 'tool_load'],
+      scopedEligible: true, dynamicLoading: true, allowLegacyAll: false,
+    });
+    expect(controller.isActive('add_custom_connector')).toBe(false);
+    const directory = getLoadableToolGroupsSystemPromptBlock({
+      availableToolNames, initialActiveToolNames: controller.activeToolNames(),
+      allowedGroupIds: controller.loadableGroups(),
+    });
+    const line = directory.split('\n').find(row => row.includes('`add_custom_connector`'))!;
+    expect(line).toMatch(/user.provided.*non.secret.*configuration/i);
+    expect(line).toMatch(/installation confirmation/i);
+    expect(TOOL_CATALOG.find(entry => entry.name === 'add_custom_connector')?.programmatic).toBeUndefined();
+    expect(controller.load(['connectors']).isError).not.toBe(true);
+    expect(controller.isActive('add_custom_connector')).toBe(true);
+  });
+
+  it('discovers projects, to-dos and automations independently while keeping old Agent dependencies usable', () => {
+    expect(toolNamesForGroups(['management.projects'])).toEqual(['project_setup']);
+    expect(toolNamesForGroups(['management.todos'])).toEqual(['todo_tasks']);
+    expect(toolNamesForGroups(['management.automation'])).toEqual(['auto_tasks']);
+    expect(canonicalToolGroupId('management.projects')).toBe('management.projects');
+    expect(canonicalizeAgentToolGroups(['management.projects', 'management.todos']))
+      .toEqual(['management.todos']);
+    expect(invalidAgentToolGroupRefs(['management.projects', 'management.todos'])).toEqual([]);
+    expect(toolNamesForAgentGroups(['management.projects'])).toEqual(['todo_tasks']);
+    const names = ['todo_tasks', 'project_setup', 'auto_tasks', 'tool_load'];
+    const runtime = getLoadableToolGroupsSystemPromptBlock({ availableToolNames: names });
+    expect(runtime).toContain('`management.projects` — Projects.');
+    expect(runtime).toContain('`management.todos` — To-dos.');
+    expect(runtime).toContain('`management.automation` — Automations.');
+    const authoring = getLoadableToolGroupsSystemPromptBlock({ availableToolNames: names, purpose: 'agent-authoring' });
+    expect(authoring).toContain('`management.todos`');
+    expect(authoring).not.toContain('`management.projects`');
+    expect(authoring).not.toContain('`project_setup`');
+  });
+
+  it('describes app-health domains separately from saved schedules before either tool is loaded', () => {
+    const availableToolNames = ['open_app_view', 'app_health', 'auto_tasks', 'todo_tasks'];
+    const controller = createToolSurfaceController({
+      availableToolNames, hostRequiredToolNames: ['open_app_view'], scopedEligible: true,
+    });
+    const directory = getLoadableToolGroupsSystemPromptBlock({
+      availableToolNames, initialActiveToolNames: controller.activeToolNames(),
+      allowedGroupIds: controller.loadableGroups(), purpose: 'runtime',
+    });
+    expect(controller.isActive('app_health')).toBe(false);
+    expect(controller.isActive('auto_tasks')).toBe(false);
+    const statusLine = directory.split('\n').find(line => line.includes('`app_health`')) || '';
+    const scheduleLine = directory.split('\n').find(line => line.includes('`auto_tasks`')) || '';
+    expect(statusLine).toContain('model');
+    expect(statusLine).toContain('connectors');
+    expect(statusLine).toContain('knowledge base');
+    expect(statusLine).toContain('running conversation status');
+    expect(scheduleLine).toContain('scheduled automations');
+  });
+
   it('tells an unbound Commander that the to-do group also holds the global list', () => {
     // Outside a project todo_tasks is dormant and the open-work block only
     // appears once to-dos exist, so the directory line is the first place a
@@ -336,7 +398,7 @@ describe('tool-catalog', () => {
     const todoLine = directory.split('\n').find((line) => line.includes('`todo_tasks`')) || '';
     expect(todoLine).toMatch(/global to-do list/);
     expect(todoLine).toMatch(/project/);
-    expect(directory).toContain('`management.projects` — To-dos.');
+    expect(directory).toContain('`management.todos` — To-dos.');
     // Inside a project the tool is resident, so the directory stops describing it.
     const resident = getLoadableToolGroupsSystemPromptBlock({
       availableToolNames: ['todo_tasks', 'project_setup', 'tool_load'],
@@ -557,15 +619,13 @@ describe('tool-catalog', () => {
     const fingerprint = createHash('sha256')
       .update(JSON.stringify(schemas))
       .digest('hex');
-    // 2026-10-19, requester-confirmed: the sole structural addition is an
-    // optional history segment index. Removing it must reproduce the prior
-    // corpus exactly; unrelated names, defaults and permissions cannot drift.
-    const previousSchemas = structuredClone(schemas);
-    const history = previousSchemas.find(tool => tool.name === 'chat_history')!;
-    expect((history.inputSchema as any).properties.process_index).toEqual({ type: 'integer', minimum: 0 });
-    delete (history.inputSchema as any).properties.process_index;
-    expect(createHash('sha256').update(JSON.stringify(previousSchemas)).digest('hex'))
-      .toBe('74dd4963f96a37267a8bbb1080994ccba845619bb062ff77fe7f70f298bea84a');
+    // 2026-10-28, requester-confirmed: grouped history operations supersede
+    // the flat selector schema. Pin that accepted corpus instead of undoing
+    // only the older segment-index addition against a different contract.
+    const history = schemas.find(tool => tool.name === 'chat_history')!.inputSchema as any;
+    expect(history.properties.action.enum).toEqual(['search', 'read', 'read_process', 'read_output']);
+    expect(history.properties.process.properties.process_index).toEqual({ type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
+    expect(history.properties.process_index).toBeUndefined();
     // Requester-confirmed portable root objects replace the nine first-party
     // action unions; executors retain conditional requirements and scope checks.
     // 2026-09-18: inner_browser gained an optional `scope` on observe. It only
@@ -604,10 +664,16 @@ describe('tool-catalog', () => {
     // Tool/schema cases and task-bound artifact cases pin its default and lock.
     // 2026-10-14, requester-approved: appType cloud becomes web; old stored types
     // remain readable and owning artifact cases retain the capability boundary.
+    // 2026-10-28, requester-approved: cross_session_memory adds atomic batch,
+    // expected_revision and bounded closed operations; no new tool or scope.
+    // 2026-10-31, requester-approved: retire model-call input formats and aliases;
+    // append_file requires base_revision and drops expected_size. Data readers stay.
+    // 2026-11-03, requester-approved: read_files path items add a nonempty optional
+    // encoding label; file-tools and file_indexer cases pin decoding and refusals.
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('9eef8d03356d5a886f545d8e88f1e3f97645f152e01cd2d71990ad096045aee6');
+    ).toBe('900cb57814dcdfea27e83df1f02a5cd35f414323c3acc257f9a84cc6fb960051');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {
@@ -615,12 +681,18 @@ describe('tool-catalog', () => {
     // contract's parameter-description decision. Exact wording scopes this
     // exception: it is not permission for arbitrary future growth.
     const approvedWindowsCommand = 'Shell command. Prefer simple, direct commands that are easy to verify. Write final script-generated deliverables under `$env:ORKAS_OUTPUT_DIR`. On Windows this compatibility-named tool runs PowerShell; use PowerShell syntax and invoke quoted executables with `&`.';
+    // 2026-11-04 requester-confirmed raw_text wording: 87 estimated tokens.
+    // The owning contract keeps output variants, incompatible modes and
+    // persistence together; only this exact field qualifies for the exception.
+    const approvedRawText = 'Return complete text as JSON {files:[{requested_path,ok,path,content,total_chars,...}|{requested_path,ok:false,error}]}. UTF-8 results include file_hash; decoded results include encoding instead. Cannot combine with ranges/metadata_only. Large direct results may be persisted.';
     const overBudget: string[] = [];
     for (const tool of enumerateAllInjectedTools()) {
       if (estimateTextTokens(normalizedDescription(tool.description)) > TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS) {
         overBudget.push(`${tool.name}:description=${estimateTextTokens(normalizedDescription(tool.description))} tokens`);
       }
       walkSchemaDescriptions(tool.inputSchema, (path, description) => {
+        if (tool.name === 'read_files' && path === '/inputSchema/properties/raw_text'
+            && normalizedDescription(description) === approvedRawText) return;
         if (
           estimateTextTokens(normalizedDescription(description)) > SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS
           && !OPEN_SOURCE_DESCRIPTION_BUDGET_EXCEPTIONS.has(`${tool.name}:${path}`)
@@ -649,7 +721,8 @@ describe('tool-catalog', () => {
 
     const append = toolByName('append_file');
     expect(append.description).not.toContain('base_revision');
-    expect(propertyDescription(append, 'base_revision')).toContain('Required unless legacy expected_size');
+    expect(append.inputSchema.required).toContain('base_revision');
+    expect(append.inputSchema.properties).not.toHaveProperty('expected_size');
     expect(propertyDescription(append, 'base_revision')).toContain('exact replay is idempotent');
 
     const edit = toolByName('edit_file');
@@ -748,7 +821,7 @@ describe('tool-catalog', () => {
       search_files: ['path is unknown', 'substring', 'glob'],
       grep_files: ['pattern', 'glob', 'output_mode'],
       write_file: ['write', 'path', 'content'],
-      append_file: ['append', 'path', 'content', 'base_revision', 'expected_size', 'replay'],
+      append_file: ['append', 'path', 'content', 'base_revision', 'replay'],
       apply_patch: ['transactional', 'patch', 'add file', 'update file', 'read'],
       edit_file: ['old_string', 'new_string', 'unique', 'optimistic concurrency'],
       publish_outputs: ['complete', 'final', 'paths', 'current turn'],

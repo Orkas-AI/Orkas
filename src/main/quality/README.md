@@ -8,11 +8,11 @@ advisories; owning Resource or built-in tests may apply a stricter official
 prompt budget.
 
 Skill description shapes are source-specific and mutually exclusive. A user
-custom or external portable Skill uses one `description`; a repository-managed
-System, Marketplace, or official Agent-private Skill uses both
-`description_zh` and `description_en`. The schema rule reports a mixed triple
-or an incomplete localized pair, while the official resource inventories make
-the bilingual shape a release-blocking contract.
+custom, external portable, or hidden System Skill uses one `description`
+(English for System Skills); a repository-managed Marketplace or official
+Agent-private Skill uses both `description_zh` and `description_en`. The schema
+rule reports a mixed triple or an incomplete localized pair, while the official
+resource inventories enforce each source's description shape.
 
 See `docs/plans/validator-phase-0.md` (deleted after acceptance) for the design rationale.
 

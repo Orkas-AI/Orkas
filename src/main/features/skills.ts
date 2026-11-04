@@ -1,3 +1,4 @@
+import { frontmatterCloseIndex } from '../util/skill-frontmatter';
 /**
  * Skills — listing, custom CRUD, inline edit chat.
  *
@@ -334,7 +335,7 @@ export function parseSkillFrontmatter(text: string): SkillFrontmatter {
   if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   const meta: SkillFrontmatter = {};
   if (!text.startsWith('---')) return meta;
-  const end = text.indexOf('---', 3);
+  const end = frontmatterCloseIndex(text);
   if (end === -1) return meta;
   const lines = text.slice(3, end).split('\n');
   for (let i = 0; i < lines.length; i++) {
@@ -414,9 +415,12 @@ function skillMetaFile(dir: string): string {
   return path.join(dir, '_meta.json');
 }
 
-function hasSkillMd(dir: string): boolean {
+function hasSkillMd(dir: string, strict = false): boolean {
   try { return fs.statSync(skillMdFile(dir)).isFile(); }
-  catch { return false; }
+  catch (error) {
+    if (strict && (error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+    return false;
+  }
 }
 
 function readSkillOrkasMetaSync(dir: string): SkillOrkasMeta {
@@ -524,9 +528,10 @@ function removeSkillSidecarDescriptionsSync(dir: string): void {
 }
 
 // Module-level cache for `listSkills`.
-// Older projections may have lost ownership metadata on BOM-prefixed files.
+// Older projections may have lost ownership metadata after a failed entry read
+// or on BOM-prefixed files.
 // Rebuild derived rows once; the original Skill files stay untouched.
-const SKILL_CATALOG_CACHE_VERSION = 3;
+const SKILL_CATALOG_CACHE_VERSION = 4;
 const SKILL_PERSISTED_TRUST_MS = 2_000;
 
 interface SkillListCache {
@@ -537,15 +542,40 @@ interface SkillListCache {
 }
 let _skillListCache: SkillListCache | null = null;
 
+// Six content-free source/stage buckets bound diagnostics during read failures.
+const _skillCatalogFailureWarnedAt = new Map<string, number>();
+const SKILL_CATALOG_READ_ERROR_CODES = new Set([
+  'ENOENT', 'EACCES', 'EPERM', 'EIO', 'EBUSY', 'ENOTDIR', 'EISDIR',
+  'EMFILE', 'ENFILE', 'ENOSPC', 'EINVAL', 'ENAMETOOLONG', 'ELOOP',
+]);
+
+function _skillCatalogReadFailure(source: SkillSource, stage: 'stamp' | 'enumerate' | 'definition', error: unknown): Error {
+  const key = `${source}:${stage}`;
+  const now = Date.now();
+  const previous = _skillCatalogFailureWarnedAt.get(key);
+  if (previous === undefined || now < previous || now - previous >= 60_000) {
+    _skillCatalogFailureWarnedAt.set(key, now);
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    log.warn('skill catalog read failed', {
+      source, stage,
+      error_code: typeof code === 'string' && SKILL_CATALOG_READ_ERROR_CODES.has(code) ? code : 'unknown',
+    });
+  }
+  return new Error('Skill catalog unavailable');
+}
+
 function _skillCatalogCacheFile(): string {
   return userSkillCatalogCacheFile(getActiveUserId());
 }
 
 function _skillRootStamp(): string {
   let stamp = '';
-  for (const dir of [CUSTOM_SKILLS_DIR(), userMarketplaceSkillsDir(getActiveUserId())]) {
+  for (const [source, dir] of [['custom', CUSTOM_SKILLS_DIR()], ['marketplace', userMarketplaceSkillsDir(getActiveUserId())]] as const) {
     try { stamp += `${dir}:${fs.statSync(dir).mtimeMs};`; }
-    catch { stamp += `${dir}:0;`; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw _skillCatalogReadFailure(source, 'stamp', error);
+      stamp += `${dir}:0;`;
+    }
   }
   return stamp;
 }
@@ -655,7 +685,7 @@ export async function getSkillForEdit(skillId: string): Promise<SkillForEdit | n
 
 function _skillDirStamp(): string {
   let stamp = '';
-  for (const d of [CUSTOM_SKILLS_DIR(), userMarketplaceSkillsDir(getActiveUserId())]) {
+  for (const [source, d] of [['custom', CUSTOM_SKILLS_DIR()], ['marketplace', userMarketplaceSkillsDir(getActiveUserId())]] as const) {
     try {
       const root = fs.statSync(d);
       stamp += `${d}:${root.mtimeMs};`;
@@ -666,11 +696,15 @@ function _skillDirStamp(): string {
       for (const child of children) {
         const childDir = path.join(d, child);
         let childMtime = 0;
-        try { childMtime = fs.statSync(childDir).mtimeMs; } catch { /* ignore */ }
-        stamp += `${child}:${childMtime}:${hasSkillMd(childDir) ? 1 : 0};`;
+        try { childMtime = fs.statSync(childDir).mtimeMs; }
+        catch (error) { if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error; }
+        stamp += `${child}:${childMtime}:${hasSkillMd(childDir, true) ? 1 : 0};`;
       }
     }
-    catch { stamp += `${d}:0;`; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw _skillCatalogReadFailure(source, 'stamp', error);
+      stamp += `${d}:0;`;
+    }
   }
   return stamp;
 }
@@ -715,7 +749,10 @@ async function _allSkillListingsCached(): Promise<SkillListing[]> {
     const sources: Array<[SkillSource, string]> = [['marketplace', userMarketplaceSkillsDir(getActiveUserId())], ['custom', CUSTOM_SKILLS_DIR()]];
     for (const [source, baseDir] of sources) {
       if (!fs.existsSync(baseDir)) continue;
-      const names = fs.readdirSync(baseDir, { withFileTypes: true })
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(baseDir, { withFileTypes: true }); }
+      catch (error) { throw _skillCatalogReadFailure(source, 'enumerate', error); }
+      const names = entries
         .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
         .map((e) => e.name)
         .sort();
@@ -728,7 +765,8 @@ async function _allSkillListingsCached(): Promise<SkillListing[]> {
         }
         const skillDir = path.join(baseDir, name);
         const skillMd = skillMdFile(skillDir);
-        if (!hasSkillMd(skillDir)) continue;
+        try { if (!hasSkillMd(skillDir, true)) continue; }
+        catch (error) { throw _skillCatalogReadFailure(source, 'definition', error); }
         seen.add(name);
         let displayName = name;
         let descPair = { description_zh: '', description_en: '' };
@@ -740,17 +778,15 @@ async function _allSkillListingsCached(): Promise<SkillListing[]> {
         let defaultInstall: boolean | undefined;
         let isOpenSource: boolean | undefined;
         let ownerAgent = '';
-        if (fs.existsSync(skillMd)) {
-          try {
-            const meta = parseSkillFrontmatter(fs.readFileSync(skillMd, 'utf8'));
-            const sidecar = readSkillOrkasMetaSync(skillDir);
-            descPair = _resolveSkillDescriptions(meta, sidecar);
-            displayName = meta.name as string || name;
-            category = _resolveSkillCategory(meta, sidecar);
-            status = _resolveSkillStatus(meta, sidecar) || undefined;
-            ownerAgent = typeof meta.ownerAgent === 'string' ? meta.ownerAgent.trim() : '';
-          } catch { /* ignore */ }
-        }
+        try {
+          const meta = parseSkillFrontmatter(fs.readFileSync(skillMd, 'utf8'));
+          const sidecar = readSkillOrkasMetaSync(skillDir);
+          descPair = _resolveSkillDescriptions(meta, sidecar);
+          displayName = meta.name as string || name;
+          category = _resolveSkillCategory(meta, sidecar);
+          status = _resolveSkillStatus(meta, sidecar) || undefined;
+          ownerAgent = typeof meta.ownerAgent === 'string' ? meta.ownerAgent.trim() : '';
+        } catch (error) { throw _skillCatalogReadFailure(source, 'definition', error); }
         // Marketplace-installed skills carry `_install.json` with `version`. Author uid may also
         // be present for install/reconcile compatibility, but the global UI intentionally does
         // not surface it.
@@ -1051,7 +1087,7 @@ function platformSkillMdContent(
 export function splitSkillMd(text: string): { meta: SkillFrontmatter; body: string } {
   if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   if (!text.startsWith('---')) return { meta: {}, body: text };
-  const end = text.indexOf('---', 3);
+  const end = frontmatterCloseIndex(text);
   if (end === -1) return { meta: {}, body: text };
   return {
     meta: parseSkillFrontmatter(text),
@@ -1061,7 +1097,7 @@ export function splitSkillMd(text: string): { meta: SkillFrontmatter; body: stri
 
 function ensureSkillMdCategoryForWrite(content: string): string {
   if (!content.startsWith('---')) return content;
-  const end = content.indexOf('---', 3);
+  const end = frontmatterCloseIndex(content);
   if (end === -1) return content;
   const meta = parseSkillFrontmatter(content);
   const current = String(meta.category || '').trim();

@@ -17,7 +17,9 @@ const SHARED_RULES = path.join(PROMPTS_DIR, 'chat_shared_rules.md');
 const USER_INTENT_RULES = path.join(PROMPTS_DIR, 'chat_user_intent_rules.md');
 
 const WHOLE_PROMPT_CEILING = 12_500;
-const COMBINED_STATIC_CEILING = 21_000;
+// Includes the previously uncounted input-confirmation fragment and the
+// resident execution/manual-entry decision approved in October 2026.
+const COMBINED_STATIC_CEILING = 22_000;
 // Review alarm, not a semantic limit: raise deliberately when a proven
 // resident decision is added. The ceiling must not force system-level routing
 // or recovery rules into a Skill, tool schema, or lower-priority runtime data.
@@ -38,6 +40,20 @@ function readSurfaces(): { whole: string; routing: string } {
 }
 
 describe('Commander resident prompt surface', () => {
+  it('keeps execution versus manual assistance in the resident owner decision', () => {
+    const { routing } = readSurfaces();
+    const decision = routing.slice(routing.indexOf('Otherwise Commander owns the outcome'), routing.indexOf('### Delegate'));
+    expect(decision).toMatch(/Commander-owned action requests[\s\S]*available execution capabilities[\s\S]*complete the supported work/i);
+    expect(decision).toMatch(/preserving required confirmation and protected input/i);
+    expect(decision).toMatch(/Provide instructions when requested or when no available execution workflow can advance the remaining work/i);
+    expect(decision).toMatch(/remaining step needs the user in a supported app view[\s\S]*pair concise instructions with its entry card/i);
+    expect(decision).not.toContain('instructions or a manual entry');
+    const guide = fs.readFileSync(path.join(PROMPTS_DIR, '../../../resources/builtin/system/skills/orkas-guide/SKILL.md'), 'utf8');
+    expect(guide).not.toContain('If no dedicated operation exists');
+    expect(guide).toContain('this guide supplies product facts');
+    expect(guide).toContain('navigation and diagnostic results are not mutation evidence');
+  });
+
   it('distinguishes callable connections from support without imposing setup discovery on ordinary use', () => {
     const { whole } = readSurfaces();
     const connectorRule = whole.split('### Connectors (third-party services)')[1].split('### Attachments and files')[0];
@@ -61,6 +77,7 @@ describe('Commander resident prompt surface', () => {
     const combined = whole
       + fs.readFileSync(SHARED_RULES, 'utf8')
       + fs.readFileSync(path.join(PROMPTS_DIR, 'chat_rich_output_rules.md'), 'utf8')
+      + fs.readFileSync(path.join(PROMPTS_DIR, 'chat_input_interaction_rules.md'), 'utf8')
       + fs.readFileSync(USER_INTENT_RULES, 'utf8');
     expect(combined.length).toBeLessThanOrEqual(COMBINED_STATIC_CEILING);
   });
@@ -129,5 +146,18 @@ describe('Commander resident prompt surface', () => {
     const { routing } = readSurfaces();
     const duplicated = `${routing}\n\n${routing}`;
     expect(duplicated.length).toBeGreaterThan(ROUTING_SECTION_CEILING);
+  });
+
+  it('keeps one resident owner for worker, spec-reading and Library rules', () => {
+    const { whole, routing } = readSurfaces();
+    // Owners: the run_worker route, the hand-off inspection rule, and the
+    // Library resource section. Their former restatements stay removed.
+    expect(routing).toMatch(/Use `run_worker` only for a bounded, self-contained, anonymous scan/);
+    expect(routing).toMatch(/Do not inspect an Agent spec or workspace files solely to prepare a terminal hand-off/);
+    expect(whole).toMatch(/Use `library` for durable Library documents/);
+    expect(whole).not.toContain('`run_worker` creates an anonymous private helper');
+    expect(whole).not.toContain('reading a spec is not a dispatch prerequisite');
+    expect(whole).not.toContain('Library files use `library`');
+    expect(whole).not.toContain('Help directly, accurately, and usefully');
   });
 });

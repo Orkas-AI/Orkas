@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -260,6 +260,19 @@ function writeExternalPackageSkill(pkgName: string, skillId: string): string {
 }
 
 describe('agents › normalizeAgent', () => {
+  it('reads a legacy backlog dependency without rewriting it and saves the canonical to-do group on explicit edits', async () => {
+    const a = await loadAgents();
+    writeCustomAgent('abc', { name: 'LegacyBacklog', tool_list: ['management.projects'] });
+    const file = path.join(customAgentsDir(), 'abc', 'agent.json');
+    const before = fs.readFileSync(file, 'utf8');
+    expect((await a.getAgent('abc'))?.tool_list).toEqual(['management.todos']);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    const updated = await a.updateCustomAgent('abc', { tool_list: ['management.projects', 'management.todos'] });
+    expect(updated?.tool_list).toEqual(['management.todos']);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).tool_list).toEqual(['management.todos']);
+    expect((await a.getAgent('abc'))?.tool_list).toEqual(['management.todos']);
+  });
+
   it('returns null for missing agent_id', async () => {
     const a = await loadAgents();
     expect(a.normalizeAgent({}, 'custom')).toBeNull();
@@ -3152,6 +3165,71 @@ describe('agents › buildAgentEditSystemPrompt', () => {
 });
 
 describe('agents › list cache invalidation', () => {
+  it.each([
+    ['custom', 'stamp', 'EPERM'],
+    ['marketplace', 'stamp', 'EIO'],
+    ['custom', 'enumerate', 'EACCES'],
+    ['marketplace', 'enumerate', 'EBUSY'],
+    ['custom', 'definition', 'syntax_error'],
+    ['marketplace', 'definition', 'unknown'],
+  ] as const)('retains private-free %s/%s diagnostics for %s without publishing a partial catalog', async (source, stage, code) => {
+    const a = await loadAgents();
+    const paths = await import('../../../src/main/paths');
+    const dir = source === 'custom' ? customAgentsDir() : paths.userMarketplaceAgentsDir(TEST_UID);
+    const file = path.join(dir, 'private-agent-canary', 'agent.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const raw = { agent_id: 'private-agent-canary', name: 'Private name canary' };
+    fs.writeFileSync(file, code === 'syntax_error' ? '{private-content-canary' : JSON.stringify(raw));
+    const warn = loggerSpies.byName.get('agents')!.warn;
+    warn.mockClear();
+    const privateError = Object.assign(new Error('private-error-canary'), {
+      code: code === 'unknown' ? 'private-code-canary' : code,
+      path: file,
+    });
+    const stamp = fs.statSync.bind(fs);
+    const readdir = fs.promises.readdir.bind(fs.promises);
+    const read = fs.promises.readFile.bind(fs.promises);
+    const spy = stage === 'stamp'
+      ? vi.spyOn(createRequire(import.meta.url)('node:fs'), 'statSync').mockImplementation((...args: any[]) => {
+        if (args[0] === dir) throw privateError;
+        return (stamp as any)(...args);
+      })
+      : stage === 'enumerate'
+        ? vi.spyOn(fs.promises, 'readdir').mockImplementation((...args: any[]) => {
+          if (args[0] === dir) return Promise.reject(privateError);
+          return (readdir as any)(...args);
+        })
+        : vi.spyOn(fs.promises, 'readFile').mockImplementation((...args: any[]) => {
+          if (args[0] === file && code !== 'syntax_error') return Promise.reject(privateError);
+          return (read as any)(...args);
+        });
+    syncBuiltinESMExports();
+    let now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const receipts = () => warn.mock.calls.filter(([message]) => message === 'agent catalog read failed');
+    try {
+      // Lists and startup projections share the strict source boundary.
+      await expect(a.listAgents()).rejects.toThrow('Agent catalog unavailable');
+      for (let i = 0; i < 20; i++) await expect(a.listAgentSummaries()).rejects.toThrow('Agent catalog unavailable');
+      expect(receipts()).toHaveLength(1);
+      expect(receipts()[0][1]).toEqual({ source, stage, error_code: code });
+      now += 59_999;
+      await expect(a.listAgents()).rejects.toThrow('Agent catalog unavailable');
+      expect(receipts()).toHaveLength(1);
+      now += 1;
+      await expect(a.listAgents()).rejects.toThrow('Agent catalog unavailable');
+      expect(receipts()).toHaveLength(2);
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private-|Private name|private-content/);
+      expect(fs.existsSync(paths.userAgentCatalogCacheFile(TEST_UID))).toBe(false);
+    } finally {
+      clock.mockRestore();
+      spy.mockRestore();
+      syncBuiltinESMExports();
+      fs.writeFileSync(file, JSON.stringify(raw));
+    }
+    expect((await a.listAgents()).some(agent => agent.agent_id === raw.agent_id)).toBe(true);
+  });
+
   it('retains the last complete disk snapshot on a failed refresh and reads the recovered source next time', async () => {
     writeCustomAgent('recoverable', { name: 'Old name' });
     const a = await loadAgents();
@@ -3434,5 +3512,39 @@ describe('agents › operator policy', () => {
     expect(fs.readFileSync(file, 'utf8')).toBe(before);
     await expect(a.createCustomAgent({ name: 'Blocked', workflow: 'private-resource' })).rejects.toThrow('Do not reference private-resource.');
     expect(fs.readdirSync(customAgentsDir())).toEqual(ids);
+  });
+});
+
+describe('agents › concurrent manual creation', () => {
+  it('serializes manual creates so two concurrent submissions cannot persist the same name', async () => {
+    const a = await loadAgents();
+    const results = await Promise.allSettled([
+      a.createCustomAgent({ name: 'SameCli', description: 'Coding helper', runtime: { kind: 'cli', cli: 'codex' } }),
+      a.createCustomAgent({ name: 'SameCli', description: 'Coding helper', runtime: { kind: 'cli', cli: 'codex' } }),
+    ]);
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    expect((await a.listAgentSummaries()).filter(agent => agent.name === 'SameCli')).toHaveLength(1);
+  });
+
+});
+
+describe('agents › built-in tool-only definition persistence', () => {
+  it('persists a built-in-only Agent without an optional empty Skill tag', async () => {
+    const agents = await loadAgents();
+    const { blocks } = agents.extractAgentFieldBlocks(`<agent>
+<operation>create</operation><name>ReleaseNotesReviewer</name>
+<description>Review release notes and test reports.</description>
+<icon>clipboard</icon>
+<workflow>Read release notes and test reports with read_files, check blockers and evidence, then deliver go/no-go. Do not deploy or modify code.</workflow>
+<knowhow>Release review</knowhow><standards>Evidence-backed go/no-go</standards>
+<tools>workspace.read</tools><inputs>[]</inputs><interactive>false</interactive><category>data</category>
+</agent>`);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].skill_list).toBeUndefined();
+    const created = await agents.createAgentFromBlocks(blocks[0]);
+    expect(created).not.toBeNull();
+    const saved = await agents.getAgent(created!.agent_id);
+    expect(saved?.tool_list).toEqual(['workspace.read']);
+    expect(saved?.skill_list ?? []).toEqual([]);
   });
 });

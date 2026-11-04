@@ -142,5 +142,7 @@ test.describe('Marketplace install lifecycle', () => {
       ),
     );
     expect(unsafeBundleRequests).toHaveLength(2);
+    await marketplaceOrkas.acknowledgeInvokeFailures('marketplace.installSkill', 1);
+    await marketplaceOrkas.acknowledgeInvokeFailures('quality.readSkillReport', 1);
   });
 });
