@@ -186,6 +186,26 @@ describe('repository-search › ignore rules', () => {
     expect(isIgnoredByScopes(at('src', 'a.ts'), false, deep)).toBe(true);
   });
 
+  it('lets a trailing `**` ignore everything inside the directory, but not the directory itself', () => {
+    const rules = scope(ROOT, 'logs/**\n');
+    expect(isIgnoredByScopes(at('logs', 'today.txt'), false, rules)).toBe(true);
+    expect(isIgnoredByScopes(at('logs', 'old', 'jan.txt'), false, rules)).toBe(true);
+    expect(isIgnoredByScopes(at('logs', 'old'), true, rules)).toBe(true);
+    expect(isIgnoredByScopes(at('logs'), true, rules)).toBe(false);
+    expect(isIgnoredByScopes(at('logsheet.txt'), false, rules)).toBe(false);
+    expect(isIgnoredByScopes(at('src', 'logs', 'a.txt'), false, rules)).toBe(false);
+
+    // `**/` followed by nothing: only the directories inside.
+    const dirs = scope(ROOT, 'cache/**/\n');
+    expect(isIgnoredByScopes(at('cache', 'v1'), true, dirs)).toBe(true);
+    expect(isIgnoredByScopes(at('cache', 'index.json'), false, dirs)).toBe(false);
+
+    // A later negation can still re-include one file inside.
+    const keep = scope(ROOT, 'logs/**\n!logs/keep.txt\n');
+    expect(isIgnoredByScopes(at('logs', 'keep.txt'), false, keep)).toBe(false);
+    expect(isIgnoredByScopes(at('logs', 'drop.txt'), false, keep)).toBe(true);
+  });
+
   it('scopes a nested ignore file to its own subtree', () => {
     const nested = [{ dir: at('pkg'), rules: parseIgnoreRules('dist/\n') }];
     expect(isIgnoredByScopes(at('pkg', 'dist'), true, nested)).toBe(true);
