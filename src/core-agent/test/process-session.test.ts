@@ -19,6 +19,8 @@ import {
   _resetProcessSessionsForTest,
   getProcessSessionTools,
   processReadTool,
+  processStartTool,
+  stopAllProcessSessions,
 } from "../src/tools/process-session.js";
 import { bashTool } from "../src/tools/builtin.js";
 import { commandSessionWait } from "../src/tools/command-sessions.js";
@@ -116,7 +118,7 @@ process.stdin.resume();`);
     const command = shellInvoke(TEST_NODE, [fixture]);
     const started = mode === "managed"
       ? await bashTool.execute({ command, yield_time_ms: 0 }, ctx)
-      : await tool("process_session").execute({ action: "start", command }, ctx);
+      : await processStartTool.execute({ action: "start", command }, ctx);
     const sessionId = json(started.content).session_id;
     const read = await waitForProcessRead(owner, sessionId, 0, value => value.output.includes("BOOTING"));
     expect(read.payload.status).toBe("running");
@@ -163,7 +165,7 @@ process.stdin.resume();`);
         expect(result.error).toBeUndefined();
       }
       const result = mode === "detached" ? { content: "" } : mode === "legacy"
-        ? await tool("process_session").execute({ action: "start", command }, ctx)
+        ? await processStartTool.execute({ action: "start", command }, ctx)
         : await bashTool.execute({ command, ...(mode === "managed" ? { yield_time_ms: 1000 } : {}) }, ctx);
       expect(result.isError).toBeFalsy();
       expect(spawnMock).toHaveBeenCalledOnce();
@@ -188,7 +190,7 @@ process.stdin.resume();`);
     const command = shellInvoke(TEST_NODE, ["-e", "process.stdout.write('hello');process.stdin.resume()"]);
     const started = mode === "managed"
       ? await bashTool.execute({ command, yield_time_ms: 0 }, ctx)
-      : await tool("process_session").execute({ action: "start", command }, ctx);
+      : await processStartTool.execute({ action: "start", command }, ctx);
     const session_id = json(started.content).session_id;
     await waitForProcessRead("reader", session_id, 0, (value) => value.output_end >= 5);
     const result = json((await tool("process_session").execute({
@@ -205,7 +207,7 @@ process.stdin.resume();`);
     const command = shellInvoke(TEST_NODE, ["-e", "process.stdout.write('hello');process.stdin.on('data',d=>{if(d.toString().includes('exit'))process.exit(0);else process.stdout.write('world')})"]);
     const started = mode === "managed"
       ? await bashTool.execute({ command, yield_time_ms: 0 }, ctx)
-      : await sessionTool.execute({ action: "start", command }, ctx);
+      : await processStartTool.execute({ action: "start", command }, ctx);
     const session_id = json(started.content).session_id;
     await waitForProcessRead("reader", session_id, 0, (value) => value.output_end >= 5);
     const fixed = { action: "read", session_id, cursor: 0, max_chars: 5 };
@@ -229,10 +231,13 @@ process.stdin.resume();`);
       { ...fixed, cursor: "5" }, { ...fixed, yield_time_ms: 1.5 }, { ...fixed, max_chars: 0.5 },
     ]) expect(sessionTool.inspectReadContinuation!(input, ctx)).toBeUndefined();
 
-    expect(sessionTool.inspectReadContinuation!({ ...fixed, command: "extra" }, ctx)).toEqual(sessionTool.inspectReadContinuation!(fixed, ctx));
+    expect(sessionTool.inspectReadContinuation!({ ...fixed, command: "extra" }, ctx)).toBeUndefined();
     const unusedMarker = path.join(workingDir, "unused-start-command");
     const ignoredStart = shellInvoke(TEST_NODE, ["-e", `require('fs').writeFileSync(${JSON.stringify(unusedMarker)}, 'wrong')`]);
-    const actualRead = await sessionTool.execute({ ...fixed, command: ignoredStart, chars: { unused: true }, yield_time_ms: 60000 }, ctx);
+    const retiredRead = await sessionTool.execute({ ...fixed, command: ignoredStart }, ctx);
+    expect(retiredRead.isError).toBe(true);
+    expect(retiredRead.content).toContain("does not accept: command");
+    const actualRead = await sessionTool.execute({ ...fixed, chars: { unused: true }, yield_time_ms: 60000 }, ctx);
     expect(actualRead.isError).toBeFalsy();
     expect(json(actualRead.content).output).toBe("hello");
     await expect(fs.stat(unusedMarker)).rejects.toMatchObject({ code: "ENOENT" });
@@ -272,7 +277,7 @@ process.stdin.resume();`);
     await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("uses a portable schema and ignores startup fields on reads", async () => {
+  it("uses a portable schema and rejects retired startup fields on reads", async () => {
     const processSession = tool("process_session");
     const schema = processSession.inputSchema as any;
 
@@ -284,9 +289,8 @@ process.stdin.resume();`);
       command: "must-not-run",
     }, context("owner-a"));
     expect(rejected).toMatchObject({ isError: true });
-    expect(rejected.content).not.toContain("does not accept");
-    expect(rejected.content).toMatch(/not found|unknown|not exist/i);
-    expect(rejected.content).toContain('ignored_fields: ["command"]');
+    expect(rejected.content).toContain("does not accept: command");
+    expect(rejected.content).not.toMatch(/not found|unknown|not exist/i);
     expect(rejected.content).not.toContain('must-not-run');
   });
 
@@ -295,7 +299,7 @@ process.stdin.resume();`);
       "-e",
       "process.stdout.write('first\\n');process.stdin.once('data',()=>{process.stdout.write('second\\n');process.exit(0)})",
     ]);
-    const started = await tool("process_session").execute({ action: "start", command }, context("conversation-a"));
+    const started = await processStartTool.execute({ action: "start", command }, context("conversation-a"));
     expect(started.isError).toBeUndefined();
     let firstResult = { result: started, payload: json(started.content) };
     if (!String(firstResult.payload.output).includes("first")) {
@@ -347,14 +351,14 @@ process.stdin.resume();`);
   });
 
   it("keeps the legacy direct read export nonblocking", async () => {
-    const started = json((await tool("process_session").execute({ action: "start", command: shellInvoke(TEST_NODE, ["-e", "setInterval(()=>{},1000)"]) }, context("owner-a"))).content);
+    const started = json((await processStartTool.execute({ action: "start", command: shellInvoke(TEST_NODE, ["-e", "setInterval(()=>{},1000)"]) }, context("owner-a"))).content);
     const result = await processReadTool.execute({ session_id: started.session_id }, context("owner-a"));
     expect(json(result.content).status).toBe("running");
   });
 
   it("isolates session ids by host owner", async () => {
     const command = shellInvoke(TEST_NODE, ["-e", "setTimeout(()=>process.exit(0),5000)"]);
-    const started = json((await tool("process_session").execute({ action: "start", command }, context("owner-a"))).content);
+    const started = json((await processStartTool.execute({ action: "start", command }, context("owner-a"))).content);
     const denied = await tool("process_session").execute({
       action: "read",
       session_id: started.session_id,
@@ -386,7 +390,7 @@ process.stdin.resume();`);
       "-e",
       "console.log(process.pid);process.stdin.once('data',d=>process.stdout.write('echo:'+d.toString()));setInterval(()=>{},1000)",
     ]);
-    const started = json((await tool("process_session").execute({ action: "start", command }, context("owner-a"))).content);
+    const started = json((await processStartTool.execute({ action: "start", command }, context("owner-a"))).content);
     const written = await tool("process_session").execute({
       action: "write",
       session_id: started.session_id,
@@ -462,7 +466,7 @@ process.stdin.resume();`);
       return setTimer(...args);
     }) as typeof setTimeout) : undefined;
     try {
-      const started = json((await sessionTool.execute({
+      const started = json((await processStartTool.execute({
         action: "start", command: shellInvoke(TEST_NODE, ["-e", script]), max_lifetime_ms: 60_000,
       }, ctx)).content);
       timerSpy?.mockRestore();
@@ -476,7 +480,7 @@ process.stdin.resume();`);
       await expect.poll(() => fs.readFile(ticks, "utf8")).not.toBe("");
       expect(processIsAlive(producerPid)).toBe(true);
 
-      const sibling = json((await sessionTool.execute({
+      const sibling = json((await processStartTool.execute({
         action: "start", command: shellInvoke(TEST_NODE, ["-e", "console.log(process.pid);setInterval(()=>{},1000)"]),
       }, context("other-owner"))).content);
       const siblingReady = await waitForProcessRead("other-owner", sibling.session_id, 0, payload => !!payload.output.trim());
@@ -512,7 +516,7 @@ process.stdin.resume();`);
       "-e",
       "process.stderr.write('failed\\n');process.exit(7)",
     ]);
-    const result = await tool("process_session").execute(
+    const result = await processStartTool.execute(
       { action: "start", command },
       context("owner-a"),
     );
@@ -630,7 +634,10 @@ describe("bash managed continuation", () => {
     waiting.abort();
     expect(json((await resultPromise).content).status).toBe("running");
     run.abort();
-    const result = await read(initial.session_id);
+    // A bounded read may return "running" before the independent five-second
+    // cleanup finishes. Observe terminal cancellation through the public poll.
+    const { result } = await waitForProcessRead("command-owner", initial.session_id, 0,
+      payload => payload.status !== "running");
     expect(result.isError).toBe(true);
     expect(result.observations?.execution?.status).toBe("aborted");
     const stopped = await tool("process_session").execute({ action: "stop", session_id: initial.session_id }, managed());
@@ -653,12 +660,12 @@ describe("bash managed continuation", () => {
     if (process.platform === "win32") vi.mocked(spawn).mockImplementationOnce((() => killer) as typeof spawn);
     const initial = json((await bashTool.execute({ command: "fixture-running", yield_time_ms: 0 }, ctx)).content);
     const stopping = tool("process_session").execute({ action: "stop", session_id: initial.session_id }, managed());
-    if (process.platform === "win32") killer.stdout.emit("data", Buffer.from("ready\n"));
+    if (process.platform === "win32") killer.stdout.emit("data", Buffer.from("accepting\nready:0\n"));
     run.abort();
     child.exitCode = process.platform === "win32" ? 4294967295 : null;
     child.stdout.end(); child.stderr.end(); child.emit("close", child.exitCode);
     if (process.platform === "win32") {
-      killer.stdout.emit("data", Buffer.from("root-terminated\n"));
+      killer.stdout.emit("data", Buffer.from("done:0:1\n"));
       killer.emit("exit", 0); killer.emit("close", 0);
     }
     const stopped = await stopping;
@@ -791,5 +798,112 @@ describe("bash managed continuation", () => {
       expect(terminal.observations?.execution?.status).toBe("aborted");
     } else expect(result.observations?.execution?.status).toBe("aborted");
     await expect(fs.stat(path.join(workingDir, "forbidden"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+// The real shell and its children run here. Commands that keep running after
+// their turn have no other owner once the app process is gone: macOS has no
+// equivalent of the Windows exit sweep, and the 60-minute timer dies with the host.
+describe("application exit", () => {
+  const owner = "exit-owner";
+  const managedContext = (): ToolContext => ({
+    workingDir, state: { processSessionOwner: owner, commandSessionEnabled: true },
+  });
+  const pidFile = () => path.join(workingDir, "child.pid");
+  const service = (extra = "") => shellInvoke(TEST_NODE, ["-e",
+    `require('fs').writeFileSync('child.pid',String(process.pid));${extra}setInterval(()=>{},1000)`]);
+  const children = new Set<number>();
+  const reportedPid = async () => {
+    await expect.poll(() => fs.readFile(pidFile(), "utf8").catch(() => ""), { timeout: 10_000 }).not.toBe("");
+    const pid = Number(await fs.readFile(pidFile(), "utf8"));
+    children.add(pid);
+    return pid;
+  };
+  // A failing case must not leave a TERM-resistant fixture on the machine.
+  afterEach(() => {
+    for (const pid of children) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+    children.clear();
+  });
+  const start = async (kind: "managed" | "legacy", command: string) => {
+    const started = kind === "managed"
+      ? await bashTool.execute({ command, yield_time_ms: 0 }, managedContext())
+      : await processStartTool.execute({ action: "start", command }, managedContext());
+    expect(started.isError).toBeFalsy();
+    return json(started.content).session_id as string;
+  };
+
+  it.each(["managed", "legacy"] as const)("leaves no process behind and reports the stop: %s", async kind => {
+    const sessionId = await start(kind, service());
+    const pid = await reportedPid();
+    expect(processIsAlive(pid)).toBe(true);
+    const startedAt = performance.now();
+    await stopAllProcessSessions();
+    expect(processIsAlive(pid)).toBe(false);
+    // A command that honors TERM must not hold the quit for the SIGKILL grace.
+    expect(performance.now() - startedAt).toBeLessThan(2_500);
+    const read = await tool("process_session").execute({ action: "read", session_id: sessionId, yield_time_ms: 0 }, managedContext());
+    expect(json(read.content).status).toBe("stopped");
+  });
+
+  it("finishes the host's terminal bookkeeping before resolving", async () => {
+    const ctx = managedContext();
+    let finished = 0;
+    ctx.state.commandSessionTerminal = async (result: any) => { finished++; return result; };
+    await bashTool.execute({ command: service(), yield_time_ms: 0 }, ctx);
+    await reportedPid();
+    await stopAllProcessSessions();
+    expect(finished).toBe(1);
+  });
+
+  it.runIf(process.platform !== "win32").each(["managed", "legacy"] as const)("force kills a command that ignores TERM within the budget: %s", async kind => {
+    await start(kind, service("process.on('SIGTERM',()=>{});"));
+    const pid = await reportedPid();
+    const startedAt = performance.now();
+    await stopAllProcessSessions(1_500);
+    expect(processIsAlive(pid)).toBe(false);
+    expect(performance.now() - startedAt).toBeLessThan(3_000);
+  });
+
+  it.runIf(process.platform !== "win32").each(["managed", "legacy"] as const)("force kills a descendant that outlives its shell with its pipes released: %s", async kind => {
+    await start(kind, `(trap '' TERM; exec sleep 300) >/dev/null 2>&1 </dev/null & echo $! > ${shellQuote(pidFile())}; wait`);
+    const pid = await reportedPid();
+    expect(processIsAlive(pid)).toBe(true);
+    await stopAllProcessSessions(1_500);
+    expect(processIsAlive(pid)).toBe(false);
+  });
+
+  it("does not touch an explicitly detached run_in_background command", async () => {
+    const started = await bashTool.execute({ command: service(), run_in_background: true }, managedContext());
+    expect(started.isError).toBeFalsy();
+    const pid = await reportedPid();
+    try {
+      await stopAllProcessSessions();
+      expect(processIsAlive(pid)).toBe(true);
+    } finally {
+      try { process.kill(process.platform === "win32" ? pid : -pid, "SIGKILL"); } catch { /* best effort */ }
+    }
+  });
+
+  it("returns at once with nothing running and keeps a finished command's result", async () => {
+    const quick = await bashTool.execute({ command: shellInvoke(TEST_NODE, ["-e", "setTimeout(()=>{},300)"]), yield_time_ms: 0 }, managedContext());
+    const sessionId = json(quick.content).session_id;
+    await waitForProcessRead(owner, sessionId, 0, value => value.status === "exited");
+    const startedAt = performance.now();
+    await stopAllProcessSessions();
+    expect(performance.now() - startedAt).toBeLessThan(500);
+    const read = await tool("process_session").execute({ action: "read", session_id: sessionId, yield_time_ms: 0 }, managedContext());
+    expect(json(read.content)).toMatchObject({ status: "exited", exit_code: 0 });
+  });
+
+  // Main loads these leaf modules through both tsx/cjs and the ESM hook, which
+  // yields separate module instances. The exit sweep runs from either one.
+  it.each(["managed", "legacy"] as const)("reaches a command started through another module instance: %s", async kind => {
+    await start(kind, service());
+    const pid = await reportedPid();
+    vi.resetModules();
+    const otherInstance = await import("../src/tools/process-session.js");
+    expect(otherInstance.stopAllProcessSessions).not.toBe(stopAllProcessSessions);
+    await otherInstance.stopAllProcessSessions();
+    expect(processIsAlive(pid)).toBe(false);
   });
 });

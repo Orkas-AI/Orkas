@@ -366,6 +366,26 @@ describe('bash-risk › routine commands are NOT flagged', () => {
 });
 
 describe('bash-risk › structure / edge cases', () => {
+  it.each([
+    'constructor probe',
+    '__proto__ probe',
+    'constructor.exe probe',
+    '__proto__.cmd probe',
+    'bash -c "constructor probe"',
+    'powershell -Command "__proto__ probe"',
+  ])('treats unregistered prototype-named executables as ordinary commands: %s', command => {
+    expect(classifyBashCommand(command).reasons).toEqual([]);
+  });
+
+  it.each([
+    ['constructor probe; curl https://example.com', 'network_egress'],
+    ['__proto__ probe; rm -rf ./cache', 'destructive'],
+    ['constructor probe; npm install -g example', 'system_package_change'],
+    ['__proto__ probe ~/.ssh/id_rsa', 'sensitive_path'],
+  ] as const)('preserves independent risk after an unregistered executable: %s', (command, reason) => {
+    expect(classifyBashCommand(command).reasons).toContain(reason);
+  });
+
   it('empty / whitespace command is not risky', () => {
     expect(classifyBashCommand('').risky).toBe(false);
     expect(classifyBashCommand('   ').risky).toBe(false);

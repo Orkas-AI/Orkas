@@ -485,7 +485,7 @@ export function classifyExternalMutationScript(sourceRaw: string, options?: { la
 
 function inspectScript(source: string, depth: number, language?: 'python'): ExternalMutationFinding[] {
   const code = depth < 4 ? scriptCodeMask(source) : new Uint8Array(source.length).fill(1);
-  const resources = language === 'python' ? pythonSqliteResources(source) : new Map<number, SqliteResource>();
+  const resources = language === 'python' ? pythonSqliteResources(source, code) : new Map<number, SqliteResource>();
   const findings: ExternalMutationFinding[] = [];
   const add = (finding: ExternalMutationFinding | null) => {
     if (!finding) return;
@@ -498,7 +498,7 @@ function inspectScript(source: string, depth: number, language?: 'python'): Exte
     if (finding) add({ ...finding, ...(resources.has(at) ? { resource: resources.get(at)! } : {}) });
   };
 
-  const executeCalls = new RegExp('(?:\\.\\s*(?:execute|executemany|query)|\\bmysqli_query)\\s*\\(\\s*' + SCRIPT_LITERAL, 'gim');
+  const executeCalls = new RegExp('(?:\\.\\s*(?:execute|executemany|executescript|query)|\\bmysqli_query)\\s*\\(\\s*' + SCRIPT_LITERAL, 'gim');
   for (const match of executableMatches(source, executeCalls, code)) addSql(matchedLiteral(match), match.index!);
 
   const remoteExecCalls = new RegExp('\\.\\s*(?:exec_command|execCommand)\\s*\\(\\s*' + SCRIPT_LITERAL, 'gim');
@@ -510,7 +510,7 @@ function inspectScript(source: string, depth: number, language?: 'python'): Exte
     }
   }
 
-  const variableSink = /(?:\.\s*(?:execute|executemany|query|exec_command|execCommand)|\bmysqli_query)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\b/gim;
+  const variableSink = /(?:\.\s*(?:execute|executemany|executescript|query|exec_command|execCommand)|\bmysqli_query)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\b/gim;
   for (const match of executableMatches(source, variableSink, code)) {
     const value = assignedLiteral(source, match[1], code);
     if (value) {

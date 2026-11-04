@@ -228,6 +228,22 @@ describe('persisted tool-result retrieval', () => {
     });
   });
 
+  it('does not resolve another session result even when its genuine ref is known', async () => {
+    const otherSession = path.join(dir, 'other-session');
+    const source = 'Historical audit: seven passed, two failed.';
+    const historicalRef = toolResultRefForPath(persistToolResult(otherSession, 'audit', source));
+    expect(resolveToolResultRef(otherSession, historicalRef)).toMatchObject({ ok: true });
+
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'read', requests: [{ ref: historicalRef, cursor: 0 }],
+    }, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_RESULT_REF_MISSING');
+    expect(result.content).not.toContain(source);
+    expect(ctx.state.toolResultReadLedger.readKeys.size).toBe(0);
+    expect(fs.readFileSync(path.join(otherSession, `${historicalRef}.txt`), 'utf8')).toBe(source);
+  });
+
   it('retrieves persisted connector output whose tool name starts with call_', async () => {
     const connectorContent = 'Figma frame title: Checkout\nReview status: needs spacing fix';
     const connectorRef = toolResultRefForPath(

@@ -74,6 +74,7 @@ export function enumerateAllInjectedTools(): AgentTool[] {
     clear: () => {},
   }));
   tools.push(createCrossSessionMemoryTool({
+    batch: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),
     add: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),
     replace: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),
     remove: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),

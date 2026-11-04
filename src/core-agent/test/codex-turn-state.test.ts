@@ -7,11 +7,11 @@ const token = (account: string) => `fixture.${Buffer.from(JSON.stringify({
   "https://api.openai.com/auth": { chatgpt_account_id: account },
 })).toString("base64")}.fixture`;
 const params = (providerTurnContext?: object): CompletionParams => ({
-  model: "gpt-5.5", sessionId: "fixture-session", providerTurnContext,
+  model: "gpt-5.6-sol", sessionId: "fixture-session", providerTurnContext,
   messages: [{ role: "user", content: [{ type: "text", text: "Process the next batch" }] }],
 });
 const provider = (account = "account-a", onPayload?: (value: unknown) => void) => {
-  const config = { provider: "openai-codex", model: "gpt-5.5", apiKey: token(account), onPayload,
+  const config = { provider: "openai-codex", model: "gpt-5.6-sol", apiKey: token(account), onPayload,
     userCacheKey: 'opaque-user-a' };
   return createPiProvider(config);
 };
@@ -39,7 +39,7 @@ describe("Codex user-turn routing continuity", () => {
     }));
     const request = params({});
     for (const userCacheKey of ['user-a', 'user-a', 'user-b', 'user-b']) {
-      const config = { provider: 'openai-codex', model: 'gpt-5.5', apiKey: token('shared'), userCacheKey };
+      const config = { provider: 'openai-codex', model: 'gpt-5.6-sol', apiKey: token('shared'), userCacheKey };
       await stream(createPiProvider(config), request);
     }
     expect(requests.map(h => h.get(routingHeader))).toEqual([null, 'state-1', null, 'state-3']);
@@ -102,7 +102,7 @@ describe("Codex user-turn routing continuity", () => {
     }));
     const request = params({});
     const build = (owner: string) => boundary === 'credential' ? provider(owner)
-      : createPiProvider({ provider: 'openai-codex', model: 'gpt-5.5', apiKey: token('shared'), userCacheKey: owner });
+      : createPiProvider({ provider: 'openai-codex', model: 'gpt-5.6-sol', apiKey: token('shared'), userCacheKey: owner });
     const old = stream(build("old"), request);
     await vi.waitFor(() => expect(release).toBeTypeOf("function"));
     await stream(build("new"), request);
@@ -172,7 +172,7 @@ describe("Codex user-turn routing continuity", () => {
     }));
     const request = params({});
     await stream(provider(), request);
-    const changedEndpoint = createPiProvider({ provider: "openai-codex", model: "gpt-5.5",
+    const changedEndpoint = createPiProvider({ provider: "openai-codex", model: "gpt-5.6-sol",
       apiKey: token("account-a"), baseUrl: "https://fixture.invalid/backend-api" });
     await stream(changedEndpoint, request);
     await stream(changedEndpoint, { ...request, sessionId: "other-session" });
@@ -196,7 +196,7 @@ describe("Codex user-turn routing continuity", () => {
       requests.push(new Headers(init.headers));
       return response("codex-looking-state");
     }));
-    const p = createPiProvider({ provider: "openai", model: "gpt-5.5", apiKey: "fixture-key" });
+    const p = createPiProvider({ provider: "openai", model: "gpt-5.6-sol", apiKey: "fixture-key" });
     const request = params({});
     await stream(p, request);
     await stream(p, request);

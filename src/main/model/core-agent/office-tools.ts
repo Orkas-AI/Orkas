@@ -861,22 +861,12 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
     async execute(input, ctx) {
       const prep = prepareOutput(opts, ctx, input, '.xlsx');
       if ('error' in prep) return prep.error;
-      const hasCanonicalSheets = Array.isArray(input.sheets) && input.sheets.length > 0;
-      const hasLegacyFields = ['sheet', 'rows', 'columns', 'charts']
+      const hasRetiredFields = ['sheet', 'rows', 'columns', 'charts']
         .some((key) => Object.prototype.hasOwnProperty.call(input, key));
-      if (hasCanonicalSheets && hasLegacyFields) {
-        return errResult('E_BAD_INPUT', 'use `sheets` alone; do not mix it with legacy sheet/rows/columns/charts fields');
+      if (hasRetiredFields || !Array.isArray(input.sheets) || input.sheets.length === 0) {
+        return errResult('E_BAD_INPUT', 'provide sheets; flat sheet/rows/columns/charts fields are unsupported');
       }
-      // Direct execution of persisted historical calls remains supported even
-      // though the public schema now exposes only the canonical sheets form.
-      const sheets: XlsxSheetSpec[] = hasCanonicalSheets
-        ? (input.sheets as XlsxSheetSpec[])
-        : [{
-            name: typeof input.sheet === 'string' && input.sheet ? input.sheet : 'Sheet1',
-            rows: Array.isArray(input.rows) ? (input.rows as XlsxCell[][]) : [],
-            ...(Array.isArray(input.columns) ? { columns: input.columns as XlsxSheetSpec['columns'] } : {}),
-            ...(Array.isArray(input.charts) ? { charts: input.charts as XlsxSheetSpec['charts'] } : {}),
-          }];
+      const sheets = input.sheets as XlsxSheetSpec[];
       return runCreate(opts, ctx, {
         inputAbs: prep.abs,
         createFlags: ['--force'],

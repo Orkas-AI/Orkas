@@ -1007,8 +1007,9 @@ function matchSystemPackageChange(cmd: string, args: string[]): boolean {
   if (command === 'add-apt-repository') {
     return !lower.some((arg) => arg === '--help' || arg === '-h' || arg === '--list');
   }
+  // Executable names are arbitrary input, not inherited Object properties.
+  if (!Object.hasOwn(SYSTEM_PACKAGE_ACTIONS, command)) return false;
   const mutating = SYSTEM_PACKAGE_ACTIONS[command];
-  if (!mutating) return false;
   const action = firstRecognizedAction(args, mutating, SYSTEM_PACKAGE_READ_ACTIONS[command]);
   return action !== null && mutating.has(action);
 }

@@ -66,6 +66,10 @@ describe('runtime text-budget calibration', () => {
       const prefix = text.slice(0, end);
       const estimate = estimateToolResultTokens(prefix);
       expect(estimate).toBeGreaterThanOrEqual(previous);
+      // Preview fitting relies on this conservative UTF-16 lower bound.
+      expect(estimate).toBeGreaterThanOrEqual(Math.ceil(prefix.length / 4));
+      const suffix = text.slice(end);
+      expect(estimateToolResultTokens(suffix)).toBeGreaterThanOrEqual(Math.ceil(suffix.length / 4));
       expect(estimateTextTokens(prefix)).toBe(estimate);
       previous = estimate;
     }

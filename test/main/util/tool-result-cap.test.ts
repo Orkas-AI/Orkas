@@ -38,6 +38,35 @@ const ctx: ToolContext = { state: {} };
 const makeTmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-tool-cap-'));
 const cleanup = (dir: string) => fs.rmSync(dir, { recursive: true, force: true });
 
+describe('large output preview equivalence', () => {
+  it.each(['ordinary words ', '1234567890', '!@#$%^&*', '界かな한', '🙂abc', '\ud800x', 'a1界!🙂 '])('preserves exact source bytes and maximal head/tail for %j', unit => {
+    const dir = makeTmpDir();
+    try {
+      const content = unit.repeat(3000);
+      // Linear search is independent of production bisection/window selection.
+      // These budgets and split protect the existing visible 600-token preview.
+      const fit = (text: string, budget: number, suffix: boolean) => {
+        let best = '';
+        for (let n = 1; n <= Math.min(text.length, 2401); n++) {
+          const candidate = suffix ? text.slice(-n) : text.slice(0, n);
+          if (estimateToolResultTokens(candidate) > budget) break;
+          best = candidate;
+        }
+        return best;
+      };
+      const head = fit(content, 432, false);
+      const tail = fit(content.slice(head.length), 168, true);
+      const body = `${head}\n\n... [${content.length - head.length - tail.length} chars omitted; full result is stored] ...\n\n${tail}`;
+      const result = capToolResult('fixture', { content, isError: true }, { state: {} }, { maxInlineTokens: 100, toolResultsDir: dir });
+      expect(result.content).toContain(body + '\n');
+      expect(result.content).toContain(`estimated_tokens="${estimateToolResultTokens(content)}" status="error"`);
+      expect(nativeFs.readFileSync(result.persistedOutput!.path)).toEqual(Buffer.from(content, 'utf8'));
+      const cli = maybeSpillToolResult({ toolResultsDir: dir, toolName: 'fixture', callId: 'one', output: content, maxInlineTokens: 100 });
+      expect(cli.output).toBe(result.content.replace('status="error"', 'status="success"'));
+    } finally { cleanup(dir); }
+  });
+});
+
 describe('tool-result-cap configuration', () => {
   it('keeps ordinary output at 10K and Skill documents at 25K', () => {
     expect(DEFAULT_INLINE_RESULT_TOKENS).toBe(10_000);

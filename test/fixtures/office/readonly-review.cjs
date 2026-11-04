@@ -8,6 +8,7 @@ const assert = require('node:assert/strict');
 const { app, BrowserWindow, nativeImage } = require('electron');
 // Electron otherwise turns a module-load exception into a blocking GUI dialog.
 process.on('uncaughtException', error => { console.error(error); app.exit(1); });
+const { profileSyncCosts } = require('../../helpers/sync-cost.cjs');
 const { foreignDocxBytes } = require('./foreign-docx.cjs');
 const AdmZip = require('adm-zip');
 const pc = process.argv[2];
@@ -41,8 +42,9 @@ const engine = require(enginePath);
 require.cache[enginePath].exports = {
   ...engine,
   runOfficeCli: async (args, opts) => {
+    const started = performance.now();
     const result = await engine.runOfficeCli(args, opts);
-    active?.commands.push({ verb: args[0], code: result.code, stderr: result.stderr, stdoutChars: result.stdout.length });
+    active?.commands.push({ verb: args[0], code: result.code, stderr: result.stderr, stdoutChars: result.stdout.length, elapsedMs: performance.now() - started });
     if (active?.cancel && args[0] === 'view' && args[2] === 'issues') active.cancel.abort();
     return result;
   },
@@ -131,7 +133,7 @@ app.whenReady().then(async () => {
     assert.deepEqual(consoleProbe.browserLogs, [{ level: 'warning', message: 'Office console capture probe' }]);
   } finally { probeWindow.destroy(); active = undefined; }
   const rows = [];
-  for (const id of ['combined-review', 'partial-page-retry', 'cancel-after-check', 'invalid-document', 'edit-then-review', 'xlsx-render', 'pptx-render']) {
+  for (const id of ['combined-review', 'partial-page-retry', 'cancel-after-check', 'invalid-document', 'edit-then-review', 'xlsx-render', 'pptx-render', 'edit-10-paragraphs', 'edit-1000-paragraphs']) {
     const row = { id, logs: [], browserLogs: [], commands: [], renderErrors: [] };
     active = row;
     const format = id === 'xlsx-render' ? 'xlsx' : id === 'pptx-render' ? 'pptx' : 'docx';
@@ -151,7 +153,31 @@ app.whenReady().then(async () => {
     const mtime = fs.statSync(file, { bigint: true }).mtimeNs;
     const writtenBefore = written.length;
     try {
-      if (format !== 'docx') {
+      if (id.startsWith('edit-') && id.endsWith('-paragraphs')) {
+        const count = Number(id.split('-')[1]);
+        const expected = Array.from({ length: count }, (_, n) => `PF_${String(n).padStart(4, '0')}_end`);
+        const target = path.join(root, `authored-${count}.docx`);
+        let last = performance.now(), maxGapMs = 0;
+        const timer = setInterval(() => { const now = performance.now(); maxGapMs = Math.max(maxGapMs, now - last); last = now; }, 2);
+        const costs = process.env.ORKAS_PERFORMANCE_ATTRIBUTION === '1'
+          ? profileSyncCosts(file => typeof file === 'string' && file.startsWith(root + path.sep)) : null;
+        const rssBefore = process.memoryUsage().rss, start = performance.now();
+        let result;
+        try {
+          result = await edit.execute({ path: file, output_path: target, preview: false,
+            operations: expected.map(text => ({ action: 'add', parent: '/body', type: 'p', props: { text } })),
+          }, context);
+          await new Promise(resolve => setTimeout(resolve, 5));
+        } finally { clearInterval(timer); costs?.stop(); }
+        row.measurement = { operations: count, ...(costs ? { callerCosts: costs.report } : {}), elapsedMs: performance.now() - start, maxGapMs,
+          inputBytes: before.length, outputBytes: fs.existsSync(target) ? fs.statSync(target).size : null,
+          rssBefore, rssAfter: process.memoryUsage().rss, scope: 'real pinned engine, host edit/copy/validate/publish/cleanup; endpoints not peak RSS' };
+        assert(!result.isError, result.content);
+        assert.deepEqual(written.slice(writtenBefore), [target]);
+        const xml = new AdmZip(fs.readFileSync(target)).readAsText('word/document.xml');
+        assert.deepEqual(xml.match(/PF_\d{4}_end/g), expected, 'reopened OOXML must retain every ordered paragraph exactly once');
+        await noResident(target);
+      } else if (format !== 'docx') {
         const readback = await engine.runOfficeCli(['view', file, 'text'], { cwd: root });
         assert.equal(readback.code, 0);
         assert.equal(readback.stderr, '');
@@ -215,7 +241,7 @@ app.whenReady().then(async () => {
         }
       }
       preserved(file, before, mtime);
-      if (id !== 'edit-then-review') assert.equal(written.length, writtenBefore, 'review must not register a write');
+      if (id !== 'edit-then-review' && !id.endsWith('-paragraphs')) assert.equal(written.length, writtenBefore, 'review must not register a write');
       await noResident(file);
       assert.equal(BrowserWindow.getAllWindows().length, 0, 'review must release its preview windows');
     } catch (error) {

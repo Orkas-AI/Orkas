@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   classifyExternalMutationCommand,
   classifyExternalMutationScript,
@@ -6,8 +8,28 @@ import {
 } from '../../../../src/main/model/core-agent/external-mutation-risk';
 
 describe('external-mutation-risk › wrapped script inspection', () => {
+  it.each(['orders.py', 'reconcile.py'])('retains in-memory provenance in the recorded local-analysis program %s', name => {
+    const source = fs.readFileSync(path.resolve('test/fixtures/sqlite-local-analysis', name), 'utf8');
+    const findings = classifyExternalMutationScript(source, { language: 'python' });
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings.every(f => f.resource?.database === ':memory:')).toBe(true);
+  });
+
+  it.each([
+    'sql += "; ATTACH DATABASE \'/outside.db\' AS foreign"',
+    'sql, unused = ("ATTACH DATABASE \'/outside.db\' AS foreign", 0)',
+    'for sql in ["ATTACH DATABASE \'/outside.db\' AS foreign"]:\n c.executescript(sql)',
+    'sorted(["ATTACH DATABASE \'/outside.db\' AS foreign"], key=lambda sql: c.execute(sql))',
+  ])('does not trust an SQL constant after rebinding or shadowing: %s', change => {
+    const source = `import sqlite3\nc = sqlite3.connect(":memory:")\nsql = "SELECT 1"\n${change}\nc.executescript(sql)\nc.execute("DELETE FROM foreign.dogs")`;
+    const writes = classifyExternalMutationScript(source, { language: 'python' });
+    expect(writes.some(f => f.action === 'delete')).toBe(true);
+    expect(writes.filter(f => f.action === 'delete').every(f => !f.resource)).toBe(true);
+  });
+
   it.each([
     ['memory', 'import sqlite3\nc = sqlite3.connect(":memory:")\nc.execute("CREATE TABLE dogs (id)")', ':memory:'],
+    ['static SQL script', 'import sqlite3\nc = sqlite3.connect(":memory:")\nc.executescript("CREATE TABLE dogs (id); INSERT INTO dogs VALUES (1);")', ':memory:'],
     ['file and cursor alias', 'import sqlite3 as sql\nfrom pathlib import Path\np = Path("checks.db")\nc = sql.connect(p)\ncursor = c.cursor()\ncursor.execute("INSERT INTO dogs VALUES (1)")', 'checks.db'],
     ['semicolon-separated source', 'from sqlite3 import connect\nc = connect("checks.db"); c.execute("DELETE FROM dogs")', 'checks.db'],
     ['literal SQL parameters', 'import sqlite3\nc = sqlite3.connect("checks.db"); c.execute("INSERT INTO dogs VALUES (?, ?)", ("Cleo", 4))', 'checks.db'],
@@ -34,6 +56,84 @@ describe('external-mutation-risk › wrapped script inspection', () => {
     expect(findings.some(f => f.action === 'delete')).toBe(true);
   });
 
+  // Python joins these forms before SQLite sees them, so each one really attaches
+  // the outside file (checked against CPython). The first token alone proves nothing.
+  it.each([
+    ['adjacent literals', `conn.execute("ATT" "ACH DATABASE '/outside.db' AS y")`],
+    ['adjacent literals on separate lines', `conn.execute(\n "ATT"\n "ACH DATABASE '/outside.db' AS y"\n)`],
+    ['adjacent literals after a line continuation', `conn.execute("ATT" \\\n "ACH DATABASE '/outside.db' AS y")`],
+    ['adjacent literals before parameters', `conn.execute("ATT" "ACH DATABASE ? AS y", ("/outside.db",))`],
+    ['literal concatenation', `conn.execute("ATT" + "ACH DATABASE '/outside.db' AS y")`],
+    ['literal formatting', `conn.execute("ATT%s" % "ACH DATABASE '/outside.db' AS y")`],
+    ['concatenation onto a SQL variable', `head = "ATT"\nconn.execute(head + "ACH DATABASE '/outside.db' AS y")`],
+  ])('keeps approval for a write after SQL hidden past its first token: %s', (_label, attach) => {
+    const source = `import sqlite3\nconn = sqlite3.connect(":memory:")\n${attach}\nconn.execute("INSERT INTO y.t VALUES (1)")`;
+    expect(classifyExternalMutationScript(source, { language: 'python' })).toEqual([
+      { kind: 'database_write', action: 'insert', target: 'y.t' },
+    ]);
+  });
+
+  it.each([
+    ['parameters on the next line', `conn.execute(\n "INSERT INTO t VALUES (?)",\n (1,)\n)`],
+    ['a trailing comma', `conn.execute("INSERT INTO t VALUES (1)",)`],
+    ['a closing parenthesis on the next line', `conn.execute("INSERT INTO t VALUES (1)"\n)`],
+    ['a literal parameter list', `conn.executemany("INSERT INTO t VALUES (?)", [(1,), (2,)])`],
+    ['a SQL variable with literal parameters', `sql = "INSERT INTO t VALUES (?)"\nconn.execute(sql, (1,))`],
+  ])('keeps the local proof for a whole SQL argument followed by %s', (_label, insert) => {
+    const source = `import sqlite3\nconn = sqlite3.connect(":memory:")\nconn.execute("CREATE TABLE t (a)")\n${insert}\nconn.execute("DELETE FROM t")`;
+    const findings = classifyExternalMutationScript(source, { language: 'python' });
+    expect(findings.map(f => f.action).sort()).toEqual(['create', 'delete', 'insert']);
+    expect(findings.every(f => f.resource?.database === ':memory:')).toBe(true);
+  });
+
+  it.each([
+    'c = sqlite3.connect("/outside.db")',
+    'for c in [remote]:\n c.execute("DELETE FROM dogs")',
+    'sink = c.execute',
+    'c.execute("INSERT INTO dogs VALUES (?)", (mutate_connections(),))',
+    'text = f"{c.execute(\'ATTACH DATABASE ? AS foreign\', (\'/outside.db\',))}"',
+    'text = f"{getattr(c, \'execute\')(\'ATTACH DATABASE ? AS foreign\', (\'/outside.db\',))}"',
+    'c.enable_load_extension(True)',
+    'c.execute(f"{sql_verb} INTO dogs VALUES (1)")',
+    'c.executescript(f"CREATE TABLE {table} (id)")',
+    'import user_helpers\nuser_helpers.prepare()',
+    'import constructor',
+    'from toString import connect',
+    'text = f"{"literal"}"',
+  ])('does not widen data-loop proof around an unsafe or unresolved operation: %s', change => {
+    const source = `import sqlite3\nc = sqlite3.connect(":memory:")\nfor value in [1]:\n pass\n${change}\nc.execute("DELETE FROM dogs")`;
+    const writes = classifyExternalMutationScript(source, { language: 'python' });
+    expect(writes.some(f => f.action === 'delete')).toBe(true);
+    expect(writes.filter(f => f.action === 'delete').every(f => !f.resource)).toBe(true);
+  });
+
+  it('retains data-module provenance when identical SQL findings are deduplicated', () => {
+    const source = 'import sqlite3, json\nc=sqlite3.connect(":memory:")\nc.execute("DELETE FROM dogs")\nrows=json.loads("[1]")\nfor row in rows:\n c.execute("DELETE FROM dogs")';
+    const findings = classifyExternalMutationScript(source, { language: 'python' });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].resource?.imports).toContain('json');
+  });
+
+  it('retains in-memory identity with aliased imports, cursor bindings and loop parameters', () => {
+    const source = [
+      'from sqlite3 import connect as local', 'from json import loads as decode',
+      'rows = decode("[1, 2]")', 'db = local(":memory:")', 'cursor = db.cursor()',
+      'cursor.execute("CREATE TABLE dogs (id)")', 'sql = "INSERT INTO dogs VALUES (?)"',
+      'for value in rows:', ' cursor.execute(sql, (value,))',
+    ].join('\n');
+    const findings = classifyExternalMutationScript(source, { language: 'python' });
+    expect(findings).toHaveLength(2);
+    expect(findings.every(f => f.resource?.database === ':memory:')).toBe(true);
+  });
+
+  it('retains approval when repeated SQL exhausts the bounded data-program proof', () => {
+    const source = 'import sqlite3\nc=sqlite3.connect(":memory:")\nsql="DELETE FROM dogs ' + ' '.repeat(1000)
+      + '"\nfor value in [1]:\n pass\n' + 'c.execute(sql)\n'.repeat(300);
+    expect(classifyExternalMutationScript(source, { language: 'python' })).toEqual([
+      { kind: 'database_write', action: 'delete', target: 'dogs' },
+    ]);
+  });
+
   it('does not apply Python provenance to another language or a custom connection factory', () => {
     const source = 'import sqlite3\nc = sqlite3.connect(":memory:")\nc.execute("DELETE FROM dogs")';
     expect(classifyExternalMutationScript(source)[0].resource).toBeUndefined();
@@ -45,6 +145,16 @@ describe('external-mutation-risk › wrapped script inspection', () => {
     const findings = classifyExternalMutationScript(source, { language: 'python' });
     expect(findings).toHaveLength(2);
     expect(findings.filter(f => !f.resource)).toEqual([{ kind: 'database_write', action: 'delete', target: 'dogs' }]);
+  });
+
+  it.each([
+    'remote.executescript("CREATE TABLE dogs (id); INSERT INTO dogs VALUES (1);")',
+    'sql="DELETE FROM dogs"\nremote.executescript(sql)',
+  ])('retains external-write detection for an unresolved script receiver: %s', source => {
+    const findings = classifyExternalMutationScript(source, { language: 'python' });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].kind).toBe('database_write');
+    expect(findings[0].resource).toBeUndefined();
   });
 
   it('retains approval when source exceeds the bounded provenance analysis', () => {

@@ -453,12 +453,49 @@ describe('file-tools › read_file (text)', () => {
     expect(changedRevision).not.toBe(firstRevision);
   });
 
+  it.each([false, true])('delivers a complete current CSV after a save during first read (metadata: %s)', async (metadataOnly) => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'current.csv');
+    fs.writeFileSync(p, 'id,value\nA,1\n');
+    const current = 'id,value\nA,100\nB,200\nC,300\n';
+    const originalRead = fs.promises.readFile;
+    let changed = false;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      const body = await originalRead(file, options);
+      if (String(file) === p && !changed) {
+        changed = true;
+        fs.writeFileSync(p, current);
+        const at = new Date(Date.now() + 10_000);
+        fs.utimesSync(p, at, at);
+      }
+      return body;
+    });
+    try {
+      const result = await run(getTool(tools, 'read_files'), { paths: [{ path: p }], metadata_only: metadataOnly });
+      expect(changed).toBe(true);
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toContain(`total_chars="${current.length}"`);
+      if (metadataOnly) {
+        expect(result.content).toContain(`bytes="${Buffer.byteLength(current)}"`);
+        expect(fs.readFileSync(p, 'utf8')).toBe(current);
+        return;
+      }
+      expect(result.content).toContain(`covered="0-${current.length}"`);
+      expect(result.content).toContain('request_complete="true"');
+      expect(result.content).toContain('4\tC,300');
+      const hash = `sha256:${(await import('node:crypto')).createHash('sha256').update(current).digest('hex')}`;
+      expect(result.content).toContain(`file_hash="${hash}"`);
+      expect(result.observations?.fileReads?.[0]?.hash).toBe(hash);
+      expect(fs.readFileSync(p, 'utf8')).toBe(current);
+    } finally { spy.mockRestore(); }
+  });
+
   it('numbers lines from the absolute line of a mid-file char slice', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'code.txt');
     fs.writeFileSync(p, 'L1\nL2\nL3\nL4\nL5');
     // char 6 is the start of "L3" ("L1\n"=0-2, "L2\n"=3-5).
-    const r = await run(getTool(tools, 'read_file'), { path: p, charStart: 6 });
+    const r = await run(getTool(tools, 'read_file'), {path: p, range: { unit: 'char', start: 6, end: (6) + 24000 } });
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('lines="3-5"');
     expect(r.content).toContain('3\tL3\n4\tL4\n5\tL5');
@@ -466,11 +503,11 @@ describe('file-tools › read_file (text)', () => {
     expect(r.content).not.toContain('1\tL3');
   });
 
-  it('slices by charStart/charEnd', async () => {
+  it('slices by a tagged character range', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'note.md');
     fs.writeFileSync(p, 'abcdefghij');
-    const r = await run(getTool(tools, 'read_file'), { path: p, charStart: 2, charEnd: 7 });
+    const r = await run(getTool(tools, 'read_file'), {path: p, range: { unit: 'char', start: 2, end: 7 } });
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('covered="2-7"');
     expect(r.content).toContain('cdefg');
@@ -480,7 +517,7 @@ describe('file-tools › read_file (text)', () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'range.ts');
     fs.writeFileSync(p, 'one\ntwo\nthree\nfour\nfive\n');
-    const r = await run(getTool(tools, 'read_file'), { path: p, lineStart: 2, lineEnd: 4 });
+    const r = await run(getTool(tools, 'read_file'), {path: p, range: { unit: 'line', start: 2, end: 4 } });
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('lines="2-4"');
     expect(r.content).toContain('2\ttwo\n3\tthree\n4\tfour');
@@ -557,6 +594,16 @@ describe('file-tools › read_file (text)', () => {
     expect(mixed.content).toContain('E_BAD_INPUT');
   });
 
+  it.each([{ charStart: 0 }, { charEnd: 3 }, { lineStart: 1 }, { lineEnd: 2 }])('rejects retired-only range selectors without reading the default file: %j', async selector => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'retired-range.txt');
+    fs.writeFileSync(p, 'UNREQUESTED_DEFAULT_BODY');
+    const result = await run(getTool(tools, 'read_files'), { paths: [{ path: p, ...selector }] });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BAD_INPUT');
+    expect(result.content).not.toContain('UNREQUESTED_DEFAULT_BODY');
+  });
+
   it('rejects mixed line and character addressing', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'range.txt');
@@ -570,7 +617,7 @@ describe('file-tools › read_file (text)', () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'tiny.txt');
     fs.writeFileSync(p, 'xy');
-    const r = await run(getTool(tools, 'read_file'), { path: p, charEnd: 999 });
+    const r = await run(getTool(tools, 'read_file'), {path: p, range: { unit: 'char', start: 0, end: 999 } });
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('covered="0-2"');
   });
@@ -711,7 +758,7 @@ describe('file-tools › read_files (rich documents prepare on first read)', () 
     const p = path.join(wsDir, 'notes.docx');
     fs.writeFileSync(p, makeMinimalDocx({ heading: 'HEAD', paragraphs: ['Body.'] }));
     await run(getTool(tools, 'stat_file'), { path: p });
-    const r = await run(getTool(tools, 'read_file'), { path: p, charStart: 0, charEnd: 4 });
+    const r = await run(getTool(tools, 'read_file'), {path: p, range: { unit: 'char', start: 0, end: 4 } });
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('covered="0-4"');
   });
@@ -1634,7 +1681,7 @@ describe('file-tools › read_files', () => {
     expect(schema.properties.metadata_only.type).toBe('boolean');
     expect(schema.properties.raw_text).toMatchObject({
       type: 'boolean',
-      description: expect.stringContaining('complete UTF-8 text'),
+      description: 'Return complete text as JSON {files:[{requested_path,ok,path,content,total_chars,...}|{requested_path,ok:false,error}]}. UTF-8 results include file_hash; decoded results include encoding instead. Cannot combine with ranges/metadata_only. Large direct results may be persisted.',
     });
     expect(readFiles.description).toMatch(/ranges.*structure or samples/);
     expect(readFiles.description).toMatch(/raw_text when complete original text is needed/);
@@ -2447,7 +2494,325 @@ describe('file-tools › read_files', () => {
   });
 });
 
+describe('file-tools › read_files encoding', () => {
+  // These strings were confirmed word for word with the requester. A change is a
+  // model-facing change, so these are exact on purpose.
+  const READ_NOTE = '<text-encoding-recovery>\nThis file is not valid UTF-8, so the text below may be garbled. Do not infer meaning from garbled text. Read it again with `encoding` set to a likely encoding such as gb18030, big5, shift_jis or utf-16le, and check that the result reads correctly. If none works and most of the text below reads correctly, work from it and tell the user which parts are unreadable. Otherwise tell the user the file could not be decoded.\n</text-encoding-recovery>';
+  const RAW_NOTE = '<text-encoding-recovery>\nThis file is not valid UTF-8. Read it again with `encoding` set to a likely encoding such as gb18030, big5, shift_jis or utf-16le, and check that the result reads correctly. If none works, read it without raw_text to see whether most of it is readable; if not, tell the user the file could not be decoded.\n</text-encoding-recovery>';
+  // Written out by hand so the oracle does not depend on the decoder: 中文,AB\n
+  const GBK = Buffer.from([0xD6, 0xD0, 0xCE, 0xC4, 0x2C, 0x41, 0x42, 0x0A]);
+  const GBK_TEXT = '中文,AB\n';
+  const INVALID_GB18030 = Buffer.from([0xFF, 0xFF]);
+  const plain = (content: string) => /<file [^\n]*>\n([\s\S]*?)\n<\/file>/.exec(content)![1].replace(/^\d+\t/gm, '');
+  const blocks = (content: string) => [...content.matchAll(/<read-result index="\d+" ok="(?:true|false)">[\s\S]*?<\/read-result>/g)].map(match => match[0]);
+  const mismatch = (file: string, encoding: string) =>
+    `E_TEXT_ENCODING: ${file}: the bytes are not valid ${encoding}. Try another likely encoding, or read it without encoding to see whether most of it is readable.`;
+
+  it('advertises encoding on each path item with the confirmed wording', async () => {
+    const { tools } = await buildTools();
+    const { toToolDefinition } = await import('../../../../src/core-agent/src/tools');
+    const schema = toToolDefinition(getTool(tools, 'read_files')).inputSchema as any;
+    expect(schema.properties.paths.items.properties.encoding).toEqual({
+      type: 'string',
+      minLength: 1,
+      description: 'Decode a non-UTF-8 text file with this encoding label, such as gb18030, big5, shift_jis or utf-16le. Fails if the bytes are invalid for it.',
+    });
+    expect(schema.properties.paths.items.required).toEqual(['path']);
+    expect(schema.properties).not.toHaveProperty('encoding');
+  });
+
+  it('warns once before the page, and only for the file that is not UTF-8', async () => {
+    const { tools, wsDir } = await buildTools();
+    const gbk = path.join(wsDir, 'orders.csv');
+    const utf8 = path.join(wsDir, 'notes.txt');
+    fs.writeFileSync(gbk, GBK);
+    fs.writeFileSync(utf8, '中文 notes\n');
+    const result = await run(getTool(tools, 'read_files'), { paths: [{ path: gbk }, { path: utf8 }] });
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('errors="0"');
+    const [first, second] = blocks(result.content);
+    expect(first.split(READ_NOTE)).toHaveLength(2);
+    expect(first.indexOf(READ_NOTE)).toBeLessThan(first.indexOf('<file '));
+    expect(second).not.toContain('text-encoding-recovery');
+    expect(plain(second)).toBe('中文 notes\n');
+  });
+
+  it.each([
+    ['a character range', { unit: 'char', start: 0, end: 3 }],
+    ['a line range', { unit: 'line', start: 1, end: 1 }],
+  ])('warns on %s too', async (_label, range) => {
+    const { tools, wsDir } = await buildTools();
+    const gbk = path.join(wsDir, 'orders.csv');
+    fs.writeFileSync(gbk, GBK);
+    const result = await run(getTool(tools, 'read_files'), { paths: [{ path: gbk, range }] });
+    expect(result.content).toContain(READ_NOTE);
+  });
+
+  it.each([
+    ['a UTF-8 byte-order mark', Buffer.from('﻿中文')],
+    ['an authored replacement character', Buffer.from('a�b')],
+    ['an empty file', Buffer.alloc(0)],
+  ])('does not warn for %s', async (_label, bytes) => {
+    const { tools, wsDir } = await buildTools();
+    const file = path.join(wsDir, 'valid.txt');
+    fs.writeFileSync(file, bytes);
+    const result = await run(getTool(tools, 'read_files'), { paths: [{ path: file }] });
+    expect(result.isError).toBeFalsy();
+    expect(result.content).not.toContain('text-encoding-recovery');
+  });
+
+  it('returns the authored text for the requested encoding, with no edit evidence', async () => {
+    const { tools, wsDir } = await buildTools();
+    const gbk = path.join(wsDir, 'orders.csv');
+    fs.writeFileSync(gbk, GBK);
+    const ctx = { workingDir: wsDir, state: { readFileState: new Map() } } as any;
+    const result = await getTool(tools, 'read_files').execute({ paths: [{ path: gbk, encoding: 'gb18030' }] }, ctx);
+    expect(result.isError).toBeFalsy();
+    expect(plain(result.content)).toBe(GBK_TEXT);
+    expect(result.content).toContain('encoding="gb18030"');
+    expect(result.content).toContain(`total_chars="${GBK_TEXT.length}"`);
+    expect(result.content).toContain('has_more="false"');
+    expect(result.content).not.toContain('text-encoding-recovery');
+    expect(result.content).not.toContain('file_hash=');
+    expect(result.content).not.toContain('revision=');
+    expect(ctx.state.readFileState.size).toBe(0);
+    expect(result.observations?.fileReads).toEqual([{
+      path: gbk, charRange: [0, GBK_TEXT.length], lineRange: [1, expect.any(Number)],
+    }]);
+    expect(fs.readFileSync(gbk)).toEqual(GBK);
+  });
+
+  it('reports the encoding it applied for a label alias', async () => {
+    const { tools, wsDir } = await buildTools();
+    const gbk = path.join(wsDir, 'orders.csv');
+    fs.writeFileSync(gbk, GBK);
+    const result = await run(getTool(tools, 'read_files'), { paths: [{ path: gbk, encoding: 'GB2312' }] });
+    expect(plain(result.content)).toBe(GBK_TEXT);
+    expect(result.content).toContain('encoding="gbk"');
+  });
+
+  it('reconstructs a long file exactly by following next_range with the same encoding', async () => {
+    const { tools, wsDir } = await buildTools();
+    const file = path.join(wsDir, 'long.csv');
+    const rows = 12_000;
+    fs.writeFileSync(file, Buffer.concat(Array.from({ length: rows }, () => GBK)));
+    const expected = GBK_TEXT.repeat(rows);
+    const read = getTool(tools, 'read_files');
+    let range: any;
+    let text = '';
+    for (let page = 0; page < 20; page++) {
+      const result = await run(read, { paths: [{ path: file, encoding: 'gb18030', ...(range ? { range } : {}) }] });
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toContain(`total_chars="${expected.length}"`);
+      const body = /<file [^\n]*>\n([\s\S]*?)\n<\/file>/.exec(result.content)![1].replace(/^\d+\t/gm, '');
+      text += body;
+      const next = /next_range="char:(\d+)-(\d+)"/.exec(result.content);
+      if (!next) break;
+      range = { unit: 'char', start: Number(next[1]), end: Number(next[2]) };
+    }
+    expect(text).toBe(expected);
+  });
+
+  it('clips a decoded page to the inline budget and resumes from the reported range', async () => {
+    const { tools, wsDir } = await buildTools();
+    const file = path.join(wsDir, 'clipped.csv');
+    const wanted = '中文'.repeat(1500);
+    fs.writeFileSync(file, Buffer.concat(Array.from({ length: 1500 }, () => Buffer.from([0xD6, 0xD0, 0xCE, 0xC4]))));
+    const cap = await import('../../../../src/main/util/tool-result-cap');
+    const ctx = { workingDir: wsDir, state: {
+      [cap.TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: { initialTokens: 900, remainingTokens: 900, perResultTokens: 900 },
+    } } as any;
+    const read = getTool(tools, 'read_files');
+    const first = await read.execute({ paths: [{ path: file, encoding: 'gb18030', range: { unit: 'char', start: 0, end: wanted.length } }] }, ctx);
+    const remainder = /remaining_request_range="char:(\d+)-(\d+)"/.exec(first.content);
+    expect(remainder).not.toBeNull();
+    const next = await run(read, { paths: [{ path: file, encoding: 'gb18030', range: { unit: 'char', start: Number(remainder![1]), end: Number(remainder![2]) } }] });
+    expect(next.content).toContain('request_complete="true"');
+    expect(plain(first.content) + plain(next.content)).toBe(wanted);
+  });
+
+  it('reports bytes that do not fit the encoding per item and keeps the sibling', async () => {
+    const { tools, wsDir } = await buildTools();
+    const bad = path.join(wsDir, 'bad.csv');
+    const good = path.join(wsDir, 'good.txt');
+    fs.writeFileSync(bad, INVALID_GB18030);
+    fs.writeFileSync(good, 'still readable\n');
+    const ctx = { workingDir: wsDir, state: { readFileState: new Map() } } as any;
+    const read = getTool(tools, 'read_files');
+    const mixed = await read.execute({ paths: [{ path: bad, encoding: 'gb18030' }, { path: good }] }, ctx);
+    expect(mixed.isError).toBeFalsy();
+    const [first, second] = blocks(mixed.content);
+    expect(first).toContain('ok="false"');
+    expect(first).toContain(mismatch(bad, 'gb18030'));
+    expect(plain(second)).toBe('still readable\n');
+    expect(mixed.observations?.fileReadBatch).toEqual({
+      attempted: 2, succeeded: 1, failed: 1, failures: [{ index: 0, code: 'E_TEXT_ENCODING' }],
+    });
+    expect([...ctx.state.readFileState.keys()]).toEqual([good]);
+
+    const alone = await read.execute({ paths: [{ path: bad, encoding: 'gb18030' }] }, ctx);
+    expect(alone.isError).toBe(true);
+    expect(alone.content).toContain(mismatch(bad, 'gb18030'));
+    expect(alone.content).not.toContain('<file ');
+  });
+
+  it.each([['cp936'], [42], [''], [{ label: 'gbk' }]])('refuses encoding %j before touching the file and keeps the sibling', async (encoding) => {
+    const { tools, wsDir } = await buildTools();
+    const good = path.join(wsDir, 'good.txt');
+    fs.writeFileSync(good, 'still readable\n');
+    const missing = path.join(wsDir, 'never-created.csv');
+    const result = await run(getTool(tools, 'read_files'), { paths: [{ path: missing, encoding }, { path: good }] });
+    expect(result.isError).toBeFalsy();
+    const [first, second] = blocks(result.content);
+    expect(first).toContain('E_BAD_INPUT');
+    expect(first).toContain('unknown encoding');
+    expect(first).toContain('gb18030, big5, shift_jis or utf-16le');
+    expect(first).not.toContain('E_NOT_FOUND');
+    expect(plain(second)).toBe('still readable\n');
+  });
+
+  it('raw_text carries the recovery note without encoding and decodes with it', async () => {
+    const { tools, wsDir } = await buildTools();
+    const gbk = path.join(wsDir, 'orders.csv');
+    const bad = path.join(wsDir, 'bad.csv');
+    fs.writeFileSync(gbk, GBK);
+    fs.writeFileSync(bad, INVALID_GB18030);
+    const ctx = { workingDir: wsDir, state: { readFileState: new Map() } } as any;
+    const read = getTool(tools, 'read_files');
+
+    const refused = await read.execute({ paths: [{ path: gbk }], raw_text: true }, ctx);
+    expect(refused.isError).toBe(true);
+    expect(JSON.parse(refused.content).files[0].error).toBe(
+      `E_RAW_TEXT_ENCODING: ${gbk}: raw_text requires valid UTF-8.\n\n${RAW_NOTE}`,
+    );
+
+    const decoded = await read.execute({ paths: [{ path: gbk, encoding: 'gb18030' }], raw_text: true }, ctx);
+    expect(decoded.isError).toBeFalsy();
+    const file = JSON.parse(decoded.content).files[0];
+    expect(file).toMatchObject({ ok: true, content: GBK_TEXT, encoding: 'gb18030', total_chars: GBK_TEXT.length });
+    expect(file).not.toHaveProperty('file_hash');
+    expect(ctx.state.readFileState.size).toBe(0);
+
+    const wrong = await read.execute({ paths: [{ path: bad, encoding: 'gb18030' }], raw_text: true }, ctx);
+    expect(wrong.isError).toBe(true);
+    expect(JSON.parse(wrong.content).files[0].error).toBe(mismatch(bad, 'gb18030'));
+  });
+
+  it('raw_text keeps its size limit with encoding', async () => {
+    const { tools, wsDir } = await buildTools({ rawTextMaxBytes: 4 });
+    const gbk = path.join(wsDir, 'orders.csv');
+    fs.writeFileSync(gbk, GBK);
+    const result = await run(getTool(tools, 'read_files'), { paths: [{ path: gbk, encoding: 'gb18030' }], raw_text: true });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_RAW_TEXT_LIMIT');
+    expect(result.content).not.toContain('中文');
+  });
+
+  it('treats an explicit utf-8 label as the ordinary read, on both read paths', async () => {
+    const { tools, wsDir } = await buildTools();
+    const valid = path.join(wsDir, 'valid.txt');
+    const gbk = path.join(wsDir, 'orders.csv');
+    fs.writeFileSync(valid, '中文\n');
+    fs.writeFileSync(gbk, GBK);
+    const read = getTool(tools, 'read_files');
+    const page = await run(read, { paths: [{ path: valid, encoding: 'utf-8' }] });
+    expect(page.content).toContain('file_hash="sha256:');
+    expect(page.content).not.toContain('encoding=');
+    const raw = JSON.parse((await run(read, { paths: [{ path: valid, encoding: 'utf8' }], raw_text: true })).content).files[0];
+    expect(raw).toMatchObject({ ok: true, content: '中文\n', file_hash: expect.stringMatching(/^sha256:/) });
+    expect(raw).not.toHaveProperty('encoding');
+
+    const refused = await run(read, { paths: [{ path: gbk, encoding: 'utf-8' }] });
+    expect(refused.isError).toBe(true);
+    expect(refused.content).toContain(mismatch(gbk, 'utf-8'));
+    const rawRefused = JSON.parse((await run(read, { paths: [{ path: gbk, encoding: 'utf-8' }], raw_text: true })).content).files[0];
+    expect(rawRefused.error).toContain('E_RAW_TEXT_ENCODING');
+  });
+
+  it('ignores encoding for kinds that are not plain text and for metadata reads', async () => {
+    const { tools, wsDir } = await buildTools();
+    const pdf = path.join(wsDir, 'report.pdf');
+    fs.writeFileSync(pdf, await makeMinimalPdf(['Quarterly sentinel 8841']));
+    const read = getTool(tools, 'read_files');
+    const plainPdf = await run(read, { paths: [{ path: pdf }] });
+    const labelled = await run(read, { paths: [{ path: pdf, encoding: 'gb18030' }] });
+    expect(labelled.content).toBe(plainPdf.content);
+    expect(labelled.content).toContain('Quarterly sentinel 8841');
+    expect(labelled.content).not.toContain('text-encoding-recovery');
+
+    const gbk = path.join(wsDir, 'orders.csv');
+    fs.writeFileSync(gbk, GBK);
+    const metadata = await run(read, { paths: [{ path: gbk, encoding: 'gb18030' }], metadata_only: true });
+    expect(metadata.isError).toBeFalsy();
+    expect(metadata.content).toContain(`bytes="${GBK.length}"`);
+    expect(metadata.content).not.toContain('中文');
+  });
+
+  it('applies the ordinary scope gate before decoding', async () => {
+    const perm = await import('../../../../src/main/features/permissions');
+    perm.setLocalExecMode('workspace_approval');
+    const { tools } = await buildTools();
+    const outside = path.join(tmpDir, '..', 'outside-encoding', 'secret.csv');
+    fs.mkdirSync(path.dirname(outside), { recursive: true });
+    fs.writeFileSync(outside, GBK);
+    try {
+      const result = await run(getTool(tools, 'read_files'), { paths: [{ path: outside, encoding: 'gb18030' }] });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('E_PATH_OUT_OF_SCOPE');
+      expect(result.content).not.toContain('中文');
+    } finally { fs.rmSync(path.dirname(outside), { recursive: true, force: true }); }
+  });
+
+  it('reads a GBK attachment admitted through the real import, leaving the stored bytes alone', async () => {
+    const { tools, attDir } = await buildTools();
+    const chatAttachments = await import('../../../../src/main/features/chat_attachments');
+    const source = path.join(tmpDir, '订单历史(5378).csv');
+    fs.writeFileSync(source, GBK);
+    const imported = await chatAttachments.importAttachmentFromPath(UID, CID, source);
+    expect(imported).toMatchObject({ ok: true });
+    if (!imported.ok) return;
+    const stored = path.join(attDir, imported.info.name);
+    const read = getTool(tools, 'read_files');
+
+    const first = await run(read, { paths: [{ path: stored }] });
+    expect(first.content).toContain(READ_NOTE);
+    expect(first.content).toContain('ok="true"');
+
+    const second = await run(read, { paths: [{ path: stored, encoding: 'gb18030' }] });
+    expect(plain(second.content)).toBe(GBK_TEXT);
+    expect(fs.readFileSync(stored)).toEqual(GBK);
+    expect(fs.readFileSync(source)).toEqual(GBK);
+  });
+});
+
 describe('file-tools › read_files metadata_only', () => {
+  it('reports a failed analysis per item instead of claiming a populated CSV is empty', async () => {
+    const { tools, wsDir } = await buildTools();
+    const file = path.join(wsDir, 'populated.csv');
+    const empty = path.join(wsDir, 'empty.csv');
+    const text = 'id,value\nA,100\nB,200\n';
+    fs.writeFileSync(file, text);
+    fs.writeFileSync(empty, '');
+    const originalRead = fs.promises.readFile;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (target, options) => {
+      if (String(target) === file) throw Object.assign(new Error('Controlled analysis failure'), { code: 'EIO' });
+      return originalRead(target, options);
+    });
+    const read = getTool(tools, 'read_files');
+    try {
+      const result = await run(read, { paths: [{ path: file }, { path: empty }], metadata_only: true });
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toContain('errors="1"');
+      expect(result.content).toContain('<read-result index="0" ok="false">');
+      expect(result.content).toContain('<read-result index="1" ok="true">');
+      expect(result.content).toContain('E_READ_FAILED');
+    } finally { spy.mockRestore(); }
+    const retry = await run(read, { paths: [{ path: file }], metadata_only: true });
+    expect(retry.isError).toBeFalsy();
+    expect(retry.content).toContain(`total_chars="${text.length}"`);
+    expect(fs.readFileSync(file, 'utf8')).toBe(text);
+  });
+
   it('returns total_chars for text without extra extraction work', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'hello.txt');
@@ -2583,6 +2948,43 @@ describe('file-tools › read_files metadata_only', () => {
 });
 
 describe('file-tools › search_files', () => {
+  it.each(['search_files', 'grep_files'])('honours trailing double-star ignores through the walk fallback (%s)', async (name) => {
+    const { tools, wsDir } = await buildTools();
+    const files = ['logs/today.txt', 'logs/old/jan.txt', 'logs/keep.txt', 'src/logs/a.txt',
+      'cache/index.txt', 'cache/v1/data.txt', 'pkg/generated/data.txt', 'pkg/visible.txt'];
+    for (const relative of files) {
+      const file = path.join(wsDir, relative);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, 'needle\n');
+    }
+    fs.writeFileSync(path.join(wsDir, '.gitignore'), 'logs/**\n!logs/keep.txt\ncache/**/\n');
+    fs.writeFileSync(path.join(wsDir, 'pkg', '.gitignore'), 'generated/**\n');
+    const visible = ['logs/keep.txt', 'src/logs/a.txt', 'cache/index.txt', 'pkg/visible.txt'];
+    const originalPath = process.env.PATH;
+    // Exercise the real tool, traversal, and filesystem with rg unavailable.
+    process.env.PATH = tmpDir;
+    try {
+      for (const includeIgnored of [false, true]) {
+        const result = await run(getTool(tools, name), {
+          root: wsDir, query: '*.txt', pattern: 'needle', include_ignored: includeIgnored,
+        });
+        expect(result.isError, result.content).toBeFalsy();
+        expect(result.content).toContain('backend=walk');
+        expect(result.content).toContain('complete=true');
+        const expected = (includeIgnored ? files : visible).map(relative => path.join(wsDir, relative)).sort();
+        if (name === 'search_files') {
+          const listing = searchResults(result.content);
+          expect(listing.files.map(file => path.join(listing.roots[file.root], file.path)).sort()).toEqual(expected);
+        } else {
+          for (const relative of files) {
+            const marker = `file: ${JSON.stringify(path.join(wsDir, relative))}\n`;
+            expect(result.content.includes(marker), relative).toBe(expected.includes(path.join(wsDir, relative)));
+          }
+        }
+      }
+    } finally { process.env.PATH = originalPath; }
+  });
+
   it.each(['account', 'project'])('reads discovered files directly from a nested %s conversation cwd', async (scope) => {
     const { tools, wsDir, attDir } = scope === 'project' ? await buildProjectTools() : await buildTools();
     const cwd = path.join(wsDir, 'conversation');

@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { createLogger } from "../shared/logger.js";
 import { errorCodeForLog } from "../shared/errors.js";
 import { blockedCommand } from "./command-policy.js";
-import { windowsTreeCleanupCommand } from "./windows-process-tree.js";
+import { queueWindowsTreeCleanup } from "./windows-cleanup-batch.js";
 import { compilePowerShellChain, parsePowerShellChain } from "./powershell-chain.js";
 import {
   ProcessOutputCapture,
@@ -81,7 +81,7 @@ export interface SandboxResult {
 
 /** Optional managed continuation; ordinary execute callers retain closed stdin. */
 export interface SandboxContinuation {
-  onStart(control: { write(chars: string): void; stop(): void }): void;
+  onStart(control: { pid?: number; write(chars: string): void; stop(): void; kill(): void }): void;
   onOutput(bytes: Buffer, stream: "stdout" | "stderr", env: NodeJS.ProcessEnv): void;
 }
 
@@ -114,11 +114,6 @@ export function formatProcessStartFailure(error: unknown): string {
     + "The command was not executed; retry once or use another available tool.";
 }
 
-function windowsSystem32Tool(name: string): string {
-  const root = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
-  return path.win32.join(root, "System32", name);
-}
-
 export function killProcessTree(
   child: KillableChild,
   signal: NodeJS.Signals = "SIGTERM",
@@ -138,12 +133,7 @@ export function killProcessTree(
       opts.onComplete?.();
       return;
     }
-    let completed = false;
-    let helperOutput = "";
-    let authorized = false;
-    const complete = (failed: boolean) => {
-      if (completed) return;
-      completed = true;
+    queueWindowsTreeCleanup(child, KILL_GRACE_MS, opts.spawnFn ?? spawn, (failed, terminated) => {
       if (failed) {
         log.warn("Shell process tree termination failed", {
           platform: "win32", fallback: "direct_child_only",
@@ -152,39 +142,9 @@ export function killProcessTree(
           try { child.kill(signal); } catch { /* Process may already be dead. */ }
         }
       }
-      if (!failed && authorized && helperOutput.replace(/\r\n/g, "\n") === "ready\nroot-terminated\n") {
-        opts.onRootTerminated?.();
-      }
+      if (terminated) opts.onRootTerminated?.();
       opts.onComplete?.();
-    };
-    try {
-      const killer = (opts.spawnFn ?? spawn)(windowsSystem32Tool("WindowsPowerShell\\v1.0\\powershell.exe"), [
-        "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", windowsTreeCleanupCommand(child.pid),
-      ], {
-        stdio: ["pipe", "pipe", "ignore"],
-        windowsHide: true,
-        timeout: KILL_GRACE_MS,
-      });
-      // The helper pins the PID first. Only authorize it while the original
-      // ChildProcess is still live; a late helper must not target a reused PID.
-      let acknowledged = false;
-      killer.stdin?.on("error", () => undefined);
-      killer.stdout?.on("data", (data: Buffer) => {
-        helperOutput = (helperOutput + data.toString("utf8")).slice(0, 64);
-        if (acknowledged || !helperOutput.includes("\n")) return;
-        acknowledged = true;
-        const owned = helperOutput.split(/\r?\n/, 1)[0] === "ready" && child.exitCode == null && child.signalCode == null;
-        authorized = owned;
-        killer.stdin?.end(owned ? "go\n" : "cancel\n");
-      });
-      killer.once("error", () => complete(true));
-      // Exit can precede the final pipe data; close owns the complete receipt.
-      killer.once("close", (code) => complete(code !== 0 &&
-        (authorized || (child.exitCode == null && child.signalCode == null))));
-      if (typeof killer.unref === "function") killer.unref();
-    } catch {
-      complete(true);
-    }
+    });
     return;
   }
 
@@ -894,11 +854,14 @@ export class SandboxExecutor {
       }
       if (continuation) {
         continuation.onStart({
+          pid: child.pid,
           write: (chars) => {
             if (settled || killed || child.stdin.destroyed) throw new Error("Process is not running");
             child.stdin.write(chars, "utf8");
           },
           stop: () => { aborted = true; killChild(); },
+          // Host exit cannot rely on killChild's escalation timer, which dies with the host.
+          kill: () => killProcessTree(child, "SIGKILL"),
         });
       } else child.stdin.end();
 

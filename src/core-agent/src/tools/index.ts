@@ -48,6 +48,7 @@ export {
   processStartTool,
   processStopTool,
   processWriteTool,
+  stopAllProcessSessions,
 } from "./process-session.js";
 export type { ProcessSessionStatus } from "./process-session.js";
 export {

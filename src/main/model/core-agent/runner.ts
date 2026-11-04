@@ -17,7 +17,7 @@
  * to the SDK's default-provider + env-var auth path.
  */
 
-import type { AgentTool, HistoryResource, LLMProvider, Message, ToolContext, ToolResult } from '#core-agent';
+import type { ProviderRequestFailure, AgentTool, HistoryResource, LLMProvider, Message, ToolContext, ToolResult } from '#core-agent';
 import type { Api, Model } from '@earendil-works/pi-ai';
 import { getAgentIdleClock } from '../../util/system-activity';
 import { customModelImageSupport } from './custom-model-image-support';
@@ -55,7 +55,7 @@ import {
   formatForSystemPrompt as formatMemoryForSystemPrompt,
   type MemoryScope,
 } from '../../features/memory';
-import { addMemoryEntry, replaceMemoryEntry, removeMemoryEntry } from '../../features/memory-writes';
+import { addMemoryEntry, replaceMemoryEntry, removeMemoryEntry, batchMemoryEntries } from '../../features/memory-writes';
 import {
   formatProjectContextPolicyForSystemPrompt,
   formatProjectInstructionsForSystemPrompt,
@@ -409,6 +409,7 @@ export interface BuildRunnerParams {
   /** Reports configured/currently available rotating-provider candidates even
    * when the call succeeds on the first candidate. */
   onCandidatesObserved?: (info: { candidateCount: number; availableCandidateCount: number }) => void;
+  onRequestFailure?: (failure: ProviderRequestFailure) => void;
 }
 
 export interface NativeSearchInjectedInfo {
@@ -717,6 +718,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       add: (tier, content, signal) => addMemoryEntry(uid, toScope(tier), content, { signal }),
       replace: (tier, oldText, content, signal) => replaceMemoryEntry(uid, toScope(tier), oldText, content, { signal }),
       remove: (tier, oldText) => removeMemoryEntry(uid, toScope(tier), oldText),
+      batch: (tier, revision, operations, signal) => batchMemoryEntries(uid, toScope(tier), revision, operations, { signal }),
       list: (tier) => listEntries(uid, toScope(tier)),
     };
     const { createCrossSessionMemoryTool } = await import('../../../core-agent/src/tools/memory-tool');
@@ -1584,6 +1586,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       },
       params.cid,
       params.requireImageInput,
+      params.onRequestFailure,
     );
     // Inject the rotating provider into BOTH the factory slot AND the
     // pre-built instance cache. ProviderRegistry.get() short-circuits on
@@ -1821,6 +1824,7 @@ async function buildRotatingProvider(
   usageContext?: OrkasApiUsageContext,
   cid?: string,
   requireImageInput = false,
+  onRequestFailure?: (failure: ProviderRequestFailure) => void,
 ): Promise<LLMProvider> {
   const candidates: RotatingCandidate[] = group.map((choice) => {
     const candProviderId = choice.provider;
@@ -1905,6 +1909,7 @@ async function buildRotatingProvider(
     },
     ...(onCandidateChosen ? { onCandidateChosen } : {}),
     ...(onCandidatesObserved ? { onCandidatesObserved } : {}),
+    ...(onRequestFailure ? { onRequestFailure } : {}),
     ...(Number.isFinite(firstEventTimeoutMs) ? { firstEventTimeoutMs } : {}),
   });
 }

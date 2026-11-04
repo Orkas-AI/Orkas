@@ -78,6 +78,8 @@ export class PersistentSession extends Session {
    * instead of rewriting every retained turn. */
   private messageStartOffsets: number[] = [];
   private sessionFileSize = 0;
+  // Logical queued tail state, captured with each ordered write for retry.
+  private needsAppendSeparator = false;
   // Capture ordered disk operations, not the trimmed model/history window.
   // Runtime barriers stop new work while this queue cannot be drained.
   private pendingWrites: Array<() => void> = [];
@@ -180,6 +182,7 @@ export class PersistentSession extends Session {
     super.clear();
     this.messageStartOffsets = [];
     this.sessionFileSize = 0;
+    this.needsAppendSeparator = false;
     if (!fs.existsSync(this.sessionFile)) {
       // Context can legitimately exist before the first transcript row (for
       // example, a scoped tool surface is established while building the
@@ -192,6 +195,7 @@ export class PersistentSession extends Session {
     try {
       raw = fs.readFileSync(this.sessionFile);
       this.sessionFileSize = raw.length;
+      this.needsAppendSeparator = raw.length > 0 && raw[raw.length - 1] !== 0x0a;
     } catch (err) {
       log.warn("session read failed", { code: errorCodeForLog(err) });
       this.loadContextFromDisk();
@@ -225,8 +229,8 @@ export class PersistentSession extends Session {
         // Skip corrupt line — keep going rather than throwing away everything.
       }
     };
-    for (let index = 0; index < raw.length; index++) {
-      if (raw[index] === 0x0a) loadLine(index);
+    for (let lineEnd = raw.indexOf(0x0a); lineEnd !== -1; lineEnd = raw.indexOf(0x0a, lineStart)) {
+      loadLine(lineEnd);
     }
     if (lineStart < raw.length) loadLine(raw.length);
 
@@ -655,9 +659,11 @@ export class PersistentSession extends Session {
   /** Capture the expected byte offset so partial appends can be retried without
    * duplicating a complete row or joining a new row onto a torn write. */
   private appendToDisk(record: Message): void {
-    const line = JSON.stringify({ ...record, ts: Date.now() }) + "\n";
+    const separator = this.needsAppendSeparator ? "\n" : "";
+    const line = separator + JSON.stringify({ ...record, ts: Date.now() }) + "\n";
     const start = this.sessionFileSize;
-    this.messageStartOffsets.push(start);
+    this.needsAppendSeparator = false;
+    this.messageStartOffsets.push(start + separator.length);
     this.sessionFileSize += Buffer.byteLength(line, "utf-8");
     let attempted = false;
     this.enqueueWrite(() => {
@@ -725,6 +731,7 @@ export class PersistentSession extends Session {
       offset += Buffer.byteLength(line, "utf-8");
     }
     this.sessionFileSize = offset;
+    this.needsAppendSeparator = false;
   }
 
   /** Explicit full replacement (rebase/reset/heal), never an append retry. */

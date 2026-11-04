@@ -281,38 +281,14 @@ describe('Office built-in tools', () => {
     });
   });
 
-  it('keeps historical flat create_xlsx calls executable but rejects mixed input forms', async () => {
+  it('rejects retired flat XLSX input before OfficeCLI or publication', async () => {
     const tool = getTool('create_xlsx');
-    const legacy = await tool.execute({
-      path: 'out/legacy.xlsx',
-      sheet: 'Legacy',
-      rows: [['Label', 'Value'], ['Total', { formula: '=SUM(B3:B4)', bold: true }]],
-      columns: [{ name: 'B', width: '14' }],
-      charts: [{ type: 'column', dataRange: 'Legacy!A1:B2', anchor: 'D2:J14' }],
-      preview: false,
-    }, ctx());
-
-    expect(legacy.isError).toBeUndefined();
-    expect(legacy.content).toContain('(4 cells)');
-    const batchCall = h.runOfficeCli.mock.calls.find(([args]) => args[0] === 'batch');
-    const operations = JSON.parse(batchCall?.[1]?.stdin as string);
-    expect(operations).toContainEqual({
-      command: 'set', path: '/Legacy/B2', props: { formula: 'SUM(B3:B4)', bold: 'true' },
-    });
-    expect(operations).toContainEqual(expect.objectContaining({
-      command: 'add', parent: '/Legacy', type: 'chart',
-    }));
-
-    h.runOfficeCli.mockClear();
-    const mixed = await tool.execute({
-      path: 'out/mixed.xlsx',
-      sheets: [{ name: 'Canonical', rows: [['ok']] }],
-      rows: [['legacy']],
-      preview: false,
-    }, ctx());
-    expect(mixed).toMatchObject({ isError: true });
-    expect(mixed.content).toContain('do not mix');
+    for (const input of [
+      { path: 'retired.xlsx', rows: [['old']] },
+      { path: 'mixed.xlsx', sheets: [{ name: 'Current', rows: [['ok']] }], rows: [['old']] },
+    ]) expect((await tool.execute(input, ctx())).isError).toBe(true);
     expect(h.runOfficeCli).not.toHaveBeenCalled();
+    expect(onFileWritten).not.toHaveBeenCalled();
   });
 
   it('exposes PPTX visual controls and emits native charts in the initial create batch', async () => {
@@ -414,11 +390,7 @@ describe('Office built-in tools', () => {
     h.runOfficeCli
       .mockResolvedValueOnce({ code: 0, stdout: '', stderr: '' })
       .mockResolvedValueOnce({ code: 3, stdout: '', stderr: 'batch failed' });
-    const batchFailed = await getTool('create_xlsx').execute({
-      path: 'failed.xlsx',
-      rows: [['value']],
-      preview: false,
-    }, ctx());
+    const batchFailed = await getTool('create_xlsx').execute({path: 'failed.xlsx', preview: false, sheets: [{name: 'Sheet1', rows: [['value']] }]}, ctx());
     expect(batchFailed.content).toContain('E_OFFICE_BATCH_FAILED: batch failed');
     expect(fs.existsSync(path.join(h.workspace, 'failed.xlsx'))).toBe(false);
     expect(h.closeOfficeFile).toHaveBeenCalledTimes(2);
@@ -473,9 +445,7 @@ describe('Office built-in tools', () => {
       }
       return { code: 0, stdout: 'ok', stderr: '' };
     });
-    const result = await getTool('create_xlsx').execute({
-      path: target, rows: [['value']], preview: false,
-    }, ctx());
+    const result = await getTool('create_xlsx').execute({path: target, preview: false, sheets: [{name: 'Sheet1', rows: [['value']] }]}, ctx());
     expect(batches).toBe(2);
     expect(inputStates).toEqual(['pristine', 'pristine']);
     expect(fs.readFileSync(target, 'utf8')).toBe(retryFails ? 'prior-owned-file' : 'pristine:one-sheet');
@@ -491,9 +461,7 @@ describe('Office built-in tools', () => {
       return { code: 0, stdout: '', stderr: '' };
     }).mockResolvedValueOnce({ code: 3, stdout: '', stderr: 'batch could not be delivered' });
     h.closeOfficeFile.mockImplementationOnce(async () => { abort.abort(); });
-    const result = await getTool('create_xlsx').execute({
-      path: 'cancelled.xlsx', rows: [['value']], preview: false,
-    }, ctx({ signal: abort.signal }));
+    const result = await getTool('create_xlsx').execute({path: 'cancelled.xlsx', preview: false, sheets: [{name: 'Sheet1', rows: [['value']] }]}, ctx({ signal: abort.signal }));
     expect(result.isError).toBe(true);
     expect(h.runOfficeCli).toHaveBeenCalledTimes(2);
     expect(onFileWritten).not.toHaveBeenCalled();
@@ -502,11 +470,7 @@ describe('Office built-in tools', () => {
 
   it('keeps a prior conversation-produced workbook intact when a recreate batch fails', async () => {
     const tool = getTool('create_xlsx');
-    const first = await tool.execute({
-      path: 'stable.xlsx',
-      rows: [['original']],
-      preview: false,
-    }, ctx());
+    const first = await tool.execute({path: 'stable.xlsx', preview: false, sheets: [{name: 'Sheet1', rows: [['original']] }]}, ctx());
     expect(first.isError).toBeUndefined();
     const stable = path.join(h.workspace, 'stable.xlsx');
     const before = fs.readFileSync(stable);
@@ -522,11 +486,7 @@ describe('Office built-in tools', () => {
       }
       return { code: 0, stdout: 'ok', stderr: '' };
     });
-    const failed = await tool.execute({
-      path: 'stable.xlsx',
-      rows: [['replacement']],
-      preview: false,
-    }, ctx());
+    const failed = await tool.execute({path: 'stable.xlsx', preview: false, sheets: [{name: 'Sheet1', rows: [['replacement']] }]}, ctx());
 
     expect(failed).toMatchObject({ isError: true });
     expect(failed.content).toContain('E_OFFICE_BATCH_FAILED');

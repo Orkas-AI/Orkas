@@ -273,3 +273,31 @@ describe("apply_patch", () => {
     await expect(fs.readFile(path.join(dir, "target.txt"), "utf8")).resolves.toBe("same\nsame\n");
   });
 });
+
+// PF-04: invalid last hunk publishes nothing; multi-call work respects the existing 32-file boundary.
+it.each([1, 20, 31, 32, 33, 100])('PF-04 preserves complete %i-file work across bounded patch transactions', async count => {
+  const dir = await tempDir(), original = 'start\n' + 'unchanged\n'.repeat(1000) + 'end\n';
+  const names = Array.from({ length: count }, (_, n) => `source-${n}.txt`);
+  await Promise.all(names.map(name => fs.writeFile(path.join(dir, name), original)));
+  const tool = createApplyPatchTool();
+  const patch = (selected: string[], invalid: boolean) => ['*** Begin Patch', ...selected.flatMap((name, n) => [
+    `*** Update File: ${name}`, '@@', `-${invalid && n === selected.length - 1 ? 'missing' : 'start'}`, '+changed',
+  ]), '*** End Patch'].join('\n');
+  const rejected = await tool.execute({ patch: patch(names.slice(0, 32), true) }, context(dir));
+  expect(rejected.isError).toBe(true); expect(rejected.content).toContain('E_PATCH_NO_MATCH');
+  if (count > 32) {
+    const oversized = await tool.execute({ patch: patch(names, false) }, context(dir));
+    expect(oversized.isError).toBe(true); expect(oversized.content).toContain('E_PATCH_TOO_LARGE');
+  }
+  for (const name of names) expect(await fs.readFile(path.join(dir, name), 'utf8')).toBe(original);
+  const start = performance.now();
+  for (let offset = 0; offset < count; offset += 32) {
+    const accepted = await tool.execute({ patch: patch(names.slice(offset, offset + 32), false) }, context(dir));
+    expect(accepted.isError).not.toBe(true);
+  }
+  const elapsedMs = performance.now() - start;
+  for (const name of names) expect(await fs.readFile(path.join(dir, name), 'utf8')).toBe(original.replace('start', 'changed'));
+  expect((await fs.readdir(dir)).sort()).toEqual(names.sort());
+  console.log('[PF-04 patch transaction]', JSON.stringify({ files: count, transactions: Math.ceil(count / 32),
+    sourceBytes: Buffer.byteLength(original) * count, elapsedMs }));
+});

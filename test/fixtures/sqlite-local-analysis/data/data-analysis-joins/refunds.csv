@@ -1,0 +1,5 @@
+refund_id,order_id,amount_cents
+r1,o1,500
+r2,o1,300
+r1,o1,500
+r3,o2,1000

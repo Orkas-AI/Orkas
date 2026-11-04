@@ -12,6 +12,55 @@ import {
 import { TOOL_CATALOG_REVISION } from '../../../../src/main/model/core-agent/tool-catalog-revision';
 
 describe('tool-surface', () => {
+  it.each([
+    ['management.projects', 'project_setup'],
+    ['management.todos', 'todo_tasks'],
+    ['management.automation', 'auto_tasks'],
+  ])('loads only the requested management capability: %s', (group, expected) => {
+    const mutations = ['todo_tasks', 'project_setup', 'auto_tasks'];
+    const surface = createToolSurfaceController({
+      availableToolNames: [...mutations, 'tool_load'], scopedEligible: true,
+    });
+    expect(surface.load([group]).isError).toBeFalsy();
+    expect(surface.activeToolNames().filter(name => mutations.includes(name))).toEqual([expected]);
+  });
+
+  it.each(['management.projects', 'management.todos'])('preserves saved Agent backlog access from %s without project mutation authority', group => {
+    const surface = createToolSurfaceController({
+      availableToolNames: ['todo_tasks', 'project_setup', 'tool_load'],
+      configuredGroups: [group], scopedEligible: true,
+      dynamicLoadPolicy: 'agent-dependency', allowLegacyAll: false,
+    });
+    expect(surface.isActive('todo_tasks')).toBe(true);
+    expect(surface.isActive('project_setup')).toBe(false);
+    expect(surface.loadableGroups()).toEqual(['management.todos']);
+    expect(surface.loadedGroups()).toEqual(['management.todos']);
+    expect(surface.loadableGroupsForTool('todo_tasks')).toEqual(['management.todos']);
+  });
+
+  it('rejects retired Agent load aliases atomically while accepting the current dependency id', () => {
+    const make = () => createToolSurfaceController({
+      availableToolNames: ['todo_tasks', 'tool_load'], scopedEligible: true,
+      dynamicLoadPolicy: 'agent-dependency', allowLegacyAll: false,
+    });
+    const surface = make();
+    expect(surface.load(['management.projects']).isError).toBe(true);
+    expect(surface.isActive('todo_tasks')).toBe(false);
+    expect(JSON.parse(surface.load(['management.todos']).content)).toMatchObject({
+      ok: true, newly_loaded: ['management.todos'], newly_activated_tools: ['todo_tasks'],
+    });
+    const mixed = make();
+    expect(mixed.load(['management.projects', 'management.todos']).isError).toBe(true);
+    expect(mixed.isActive('todo_tasks')).toBe(false);
+  });
+
+  it.each(['fs', 'shell', 'pdf', 'kb', 'image', 'video', 'connector'])('rejects retired tool-load shorthand without activating any capability: %s', alias => {
+    const surface = createToolSurfaceController({ availableToolNames: TOOL_CATALOG.map(entry => entry.name), scopedEligible: true });
+    const before = surface.activeToolNames();
+    expect(surface.load([alias]).isError).toBe(true);
+    expect(surface.activeToolNames()).toEqual(before);
+  });
+
   it.each(LOADABLE_TOOL_GROUP_IDS)('activates exactly the available descendants of %s, then resets next turn', (groupId) => {
     const available = TOOL_CATALOG.filter((entry) => !entry.ownerAgent).map((entry) => entry.name);
     const surface = createToolSurfaceController({ availableToolNames: available, scopedEligible: true });
@@ -277,7 +326,8 @@ describe('tool-surface', () => {
       availableToolNames: ['add_custom_connector', 'connector_setup', 'tool_load'],
       allowedGroupIds: surface.loadableGroups(),
     });
-    expect(directory).toContain('`add_custom_connector` — Commander-only custom MCP installation request.');
+    expect(directory).toContain('`add_custom_connector` — '
+      + TOOL_CATALOG.find(entry => entry.name === 'add_custom_connector')!.summary);
     expect(directory).toMatch(/`connector_setup`[^\n]*Setup\/reconnect any built-in/);
     expect(directory).not.toContain('`list_connector_tools`');
     expect(directory).not.toContain('`call_connector_tool`');
@@ -746,7 +796,7 @@ describe('tool-surface', () => {
     });
     expect(surface.loadableGroupsForTool('write_file')).toEqual(['workspace.write.output']);
     expect(surface.loadableGroupsForTool('call_connector_tool')).toEqual([]);
-    expect(surface.loadableGroupsForTool('todo_tasks')).toEqual(['management.projects']);
+    expect(surface.loadableGroupsForTool('todo_tasks')).toEqual(['management.todos']);
     expect(surface.loadableGroupsForTool('missing')).toEqual([]);
   });
 

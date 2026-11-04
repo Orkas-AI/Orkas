@@ -86,6 +86,59 @@ it.skipIf(process.platform === 'win32')('preserves a dedicated read across unrel
   expect(fs.readFileSync(target, 'utf8')).toBe('value = 9\n');
 });
 
+it('does not let a decoded read authorize an edit that would rewrite the file as UTF-8', async () => {
+  const { workingDir, ctx, call } = await setup();
+  const file = path.join(workingDir, 'orders.csv');
+  const gbk = Buffer.from([0xD6, 0xD0, 0xCE, 0xC4, 0x2C, 0x41, 0x42, 0x0A]);
+  fs.writeFileSync(file, gbk);
+  const decoded = await call('read_files', { paths: [{ path: 'orders.csv', encoding: 'gb18030' }] });
+  expect(decoded.content).toContain('中文,AB');
+  expect(ctx.state.readFileState.has(file)).toBe(false);
+  const rejected = await call('edit_file', { path: 'orders.csv', old_string: 'AB', new_string: 'CD' });
+  expect(rejected.content).toContain('E_NOT_READ');
+  expect(fs.readFileSync(file)).toEqual(gbk);
+});
+
+it('keeps edit evidence when a valid UTF-8 file is read with an explicit utf-8 label', async () => {
+  const { target, call } = await setup();
+  fs.writeFileSync(target, 'value = 1\n');
+  const read = await call('read_files', { paths: [{ path: 'target.py', encoding: 'utf8' }] });
+  expect(read.content).toContain('file_hash="sha256:');
+  expect(read.content).not.toContain('encoding=');
+  expect((await call('edit_file', { path: 'target.py', old_string: 'value = 1', new_string: 'value = 2' })).isError).toBeFalsy();
+  expect(fs.readFileSync(target, 'utf8')).toBe('value = 2\n');
+});
+
+it('hands the refreshed source byte size from a raced read to one replay-safe append', async () => {
+  const { target, call } = await setup();
+  fs.writeFileSync(target, 'value = 1\n');
+  const current = 'value = 100\nother = 200\n';
+  const originalRead = fs.promises.readFile;
+  let changed = false;
+  const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+    const body = await originalRead(file, options);
+    if (String(file) === target && !changed) {
+      changed = true;
+      fs.writeFileSync(target, current);
+      const at = new Date(Date.now() + 10_000);
+      fs.utimesSync(target, at, at);
+    }
+    return body;
+  });
+  let read;
+  try { read = await call('read_files', { paths: [{ path: 'target.py' }] }); }
+  finally { spy.mockRestore(); }
+  expect(changed).toBe(true);
+  expect(read.isError).toBeFalsy();
+  const revision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(read.content)?.[1];
+  expect(revision).toBeTruthy();
+  const input = { path: 'target.py', content: 'last = 300\n', base_revision: revision };
+  expect((await call('append_file', input)).isError).toBeFalsy();
+  expect(fs.readFileSync(target, 'utf8')).toBe(current + input.content);
+  expect((await call('append_file', input)).isError).toBeFalsy();
+  expect(fs.readFileSync(target, 'utf8')).toBe(current + input.content);
+});
+
 it.each(['write_file', 'apply_patch'])('continues editing after a dedicated %s creates the file without another read', async creator => {
   const { target, call, patch } = await setup();
   const input = creator === 'write_file'

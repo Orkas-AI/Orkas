@@ -3,7 +3,6 @@ import {
   AGENT_FALLBACK_TOOL_GROUP_IDS,
   LOADABLE_TOOL_GROUP_IDS,
   TOOL_CATALOG,
-  canonicalToolGroupId,
   canonicalizeAgentToolGroups,
   canonicalizeToolGroups,
   expandToolGroups,
@@ -246,7 +245,7 @@ export function createToolSurfaceController(input: {
       const seen = new Set<ToolGroupId>();
       const duplicates = new Set<string>();
       for (const raw of groups) {
-        const id = canonicalToolGroupId(raw);
+        const id = typeof raw === 'string' ? raw.trim() as ToolGroupId : undefined;
         if (!id || !acceptsDynamicGroup(id) || !availableDynamicGroups.has(id)) {
           unavailable.push(typeof raw === 'string' ? raw : '<invalid>');
           continue;
@@ -381,7 +380,7 @@ export function createToolLoadTool(
       const activeGroups = new Set(expandToolGroups(controller.loadedGroups()));
       const loadedGroupContext: Partial<Record<ToolGroupId, string>> = {};
       for (const rawGroup of groups) {
-        const group = canonicalToolGroupId(rawGroup);
+        const group = typeof rawGroup === 'string' ? rawGroup.trim() as ToolGroupId : undefined;
         const context = group ? options.contextByGroup[group]?.trim() : '';
         if (group && context && activeGroups.has(group)) loadedGroupContext[group] = context;
       }

@@ -250,6 +250,41 @@ function sanitizePublicDiagnostic(value: unknown): string {
     : sanitized;
 }
 
+const MAX_PUBLIC_STDERR_EXCERPT_LINES = 3;
+const MAX_PUBLIC_STDERR_EXCERPT_CHARS = 400;
+
+/** The CLI's own last words before failing: the line that says to sign in or
+ * fix a setting. The tail was already redacted and bounded at the runner
+ * boundary; this keeps its last lines without terminal colors. */
+function publicStderrExcerpt(tail: unknown): string | undefined {
+  if (typeof tail !== 'string') return undefined;
+  const lines = tail.split(/\r?\n/);
+  // A bounded tail starts mid-line; an unbounded one starts with a full line.
+  if (tail.startsWith('…') && lines.length > 1) lines.shift();
+  const text = lines
+    // eslint-disable-next-line no-control-regex
+    .map(line => line.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').trim())
+    .filter(Boolean)
+    .slice(-MAX_PUBLIC_STDERR_EXCERPT_LINES)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return undefined;
+  return text.length > MAX_PUBLIC_STDERR_EXCERPT_CHARS
+    ? `…${text.slice(-MAX_PUBLIC_STDERR_EXCERPT_CHARS)}`
+    : text;
+}
+
+/** Like `sanitizePublicDiagnostic` but keeps the end, where a CLI's stderr
+ * says why it stopped. The whole tail is redacted before it is bounded so a
+ * secret is never cut in half ahead of redaction. */
+function sanitizePublicDiagnosticTail(value: unknown): string {
+  const sanitized = redactPaths(sanitizeLogTextForUpload(String(value ?? '')));
+  return sanitized.length > MAX_PUBLIC_DIAGNOSTIC_CHARS
+    ? `…${sanitized.slice(-MAX_PUBLIC_DIAGNOSTIC_CHARS)}`
+    : sanitized;
+}
+
 /** Safe user-visible form of an authoritative CLI terminal error. The caller
  * may display this text verbatim; only secrets/paths and the size bound are
  * changed, never its meaning. */
@@ -604,7 +639,7 @@ export function redactPrivateLocalAgentEvent(event: LocalEvent, workingDir?: str
         ? { error: sanitizePublicDiagnostic(event.error) }
         : {}),
       ...(typeof event.stderrTail === 'string'
-        ? { stderrTail: sanitizePublicDiagnostic(event.stderrTail) }
+        ? { stderrTail: sanitizePublicDiagnosticTail(event.stderrTail) }
         : {}),
     };
   }
@@ -1160,11 +1195,23 @@ export interface RunCliAgentOpts {
   onTodoTaskDeleted?: (taskId: string, projectId: string) => void;
 }
 
+/** Where a failed CLI run stopped, from structured run facts only. Its stderr
+ * explains why; that text is shown to the user, never uploaded. */
+export type CliFailureCategory =
+  | 'cli_spawn_failed'
+  | 'cli_protocol_failed'
+  | 'cli_failed_before_output'
+  | 'cli_failed_after_output';
+
 export interface RunCliAgentResult {
   runId: string;
   status: 'completed' | 'failed' | 'cancelled' | 'timeout' | 'missing_cli';
   output?: string;
   error?: string;
+  /** Present only for `failed`. */
+  failureCategory?: CliFailureCategory;
+  /** Redacted, bounded last lines the CLI wrote to stderr before failing. */
+  stderrExcerpt?: string;
   cliError?: LocalCliEntry['error'] | 'model_unsupported' | 'parameter_unsupported';
   cliPath?: string;
   cliVersion?: string;
@@ -1190,6 +1237,11 @@ interface BackgroundMediaDownload {
 
 const backgroundMediaDownloads = new Map<string, BackgroundMediaDownload>();
 let backgroundMediaReservedBytes = 0;
+
+/** Read-only app-lifecycle signal, including work that outlives a conversation turn. */
+export function hasBackgroundWork(): boolean {
+  return backgroundRuns.size > 0 || backgroundMediaDownloads.size > 0;
+}
 
 function linkedAbortSignal(...parents: AbortSignal[]): { signal: AbortSignal; cleanup: () => void } {
   const controller = new AbortController();
@@ -1377,6 +1429,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   // Wrapper writes events to disk before forwarding upstream so that
   // a renderer crash mid-run still leaves a complete jsonl trail.
   let streamedOutput = '';
+  // Completed calls leave the active-call map; execution evidence must survive them.
+  let toolUseObserved = false;
   let terminal: {
     status: RunCliAgentResult['status'];
     output?: string;
@@ -1390,6 +1444,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     retrySafe?: boolean;
     bootstrapTimeout?: boolean;
     cliError?: RunCliAgentResult['cliError'];
+    stderrTail?: string;
   } | null = null;
   // CLI dispatch session id. The per-session spill dir is anchored on this
   // so sweep / read paths can find the file again.
@@ -1440,6 +1495,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       retrySafe: e.retrySafe === true,
       bootstrapTimeout: e.bootstrapTimeout === true,
       cliError: e.cliError === 'model_unsupported' || e.cliError === 'parameter_unsupported' ? e.cliError : undefined,
+      stderrTail: typeof e.stderrTail === 'string' ? e.stderrTail : undefined,
     };
   };
   const materializeMediaItem = (
@@ -1491,6 +1547,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     if (e.type === 'tool-event') {
       const callId = String(e.callId || '').trim();
       const phase = String(e.phase || '').toLowerCase();
+      if (phase === 'use') toolUseObserved = true;
       if (callId && phase === 'use' && !toolStartedAtByCallId.has(callId)) {
         toolStartedAtByCallId.set(callId, eventAtMs);
       } else if (callId && phase === 'result') {
@@ -2351,11 +2408,20 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     duration_ms: endedAtMs - startedAtMs,
     diagnostics: summarizeLocalAgentRunForLog(runDiagnostics, endedAtMs),
   });
+  const stderrExcerpt = terminal.status === 'failed' ? publicStderrExcerpt(terminal.stderrTail) : undefined;
   return {
     runId: handle.runId,
     status: terminal.status,
     output: finalOutput,
     error: terminal.error,
+    ...(terminal.status === 'failed' ? {
+      failureCategory: terminal.failureKind === 'cli_spawn' ? 'cli_spawn_failed'
+        : terminal.failureKind === 'cli_protocol' ? 'cli_protocol_failed'
+          // Completed tool calls still prove that this dispatch started work.
+          : streamedOutput.length === 0 && !toolUseObserved ? 'cli_failed_before_output'
+            : 'cli_failed_after_output',
+    } satisfies Pick<RunCliAgentResult, 'failureCategory'> : {}),
+    ...(stderrExcerpt ? { stderrExcerpt } : {}),
     ...(terminal.cliError ? { cliError: terminal.cliError } : {}),
     ...(entry.path ? { cliPath: entry.path } : {}),
     ...(entry.version ? { cliVersion: entry.fullVersion || entry.version } : {}),
