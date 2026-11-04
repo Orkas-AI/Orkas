@@ -1,5 +1,5 @@
 /**
- * Automation tasks — `isDue` boundary semantics for the 5 schedule types.
+ * Automation tasks — `isDue` boundary semantics for the 6 schedule types.
  *
  * Locks the contract the in-process scheduler relies on:
  *   - one_time: fires once when `now >= at`, never again after `last_run_at`
@@ -69,6 +69,7 @@ import {
   AUTO_TASK_CATCH_UP_WINDOW_MS,
   armedDueAtForTest,
   catchUpBoundaryForTest,
+  latestOccurrenceForTest,
   createTask,
   deleteTask,
   deleteAttachment,
@@ -2153,6 +2154,60 @@ describe('isDue: daily', () => {
   });
 });
 
+describe('isDue: weekdays', () => {
+  // Local-time boundaries like the daily cases. 2026-05-22 is a Friday.
+  const sched: Schedule = { type: 'weekdays', hour: 9, minute: 0 };
+
+  it('fires on a weekday once the boundary is crossed', () => {
+    const task = makeTask(sched);
+    expect(isDue(task, new Date(2026, 4, 22, 8, 59, 0), null)).toBe(false); // Fri 08:59
+    expect(isDue(task, new Date(2026, 4, 22, 9, 0, 0), null)).toBe(true); // Fri 09:00
+    expect(isDue(task, new Date(2026, 4, 18, 9, 30, 0), null)).toBe(true); // Mon
+  });
+
+  it('never fires on a weekend, even past the boundary', () => {
+    const task = makeTask(sched);
+    expect(isDue(task, new Date(2026, 4, 23, 9, 30, 0), null)).toBe(false); // Sat
+    expect(isDue(task, new Date(2026, 4, 24, 23, 0, 0), null)).toBe(false); // Sun
+  });
+
+  it('does not re-fire the same weekday after a run past the boundary', () => {
+    const task = makeTask(sched);
+    const lastRun = new Date(2026, 4, 22, 9, 0, 30); // ran Friday morning
+    expect(isDue(task, new Date(2026, 4, 22, 9, 30, 0), lastRun)).toBe(false);
+    expect(isDue(task, new Date(2026, 4, 25, 9, 0, 0), lastRun)).toBe(true); // next Monday
+  });
+
+  it('offers only a weekday as the latest missed occurrence', () => {
+    const task = makeTask(sched);
+    // Sunday morning: the most recent occurrence is Friday's, not a weekend one.
+    const sunday = latestOccurrenceForTest(task, new Date(2026, 4, 24, 10, 0, 0));
+    expect(sunday?.getDay()).toBe(5);
+    expect(sunday?.getHours()).toBe(9);
+    // Tuesday before the boundary: the most recent occurrence is Monday's.
+    const tuesday = latestOccurrenceForTest(task, new Date(2026, 4, 26, 8, 0, 0));
+    expect(tuesday?.getDay()).toBe(1);
+    expect(tuesday?.getDate()).toBe(25);
+    // Monday before the boundary: the most recent occurrence is last Friday's.
+    const monday = latestOccurrenceForTest(task, new Date(2026, 4, 25, 8, 0, 0));
+    expect(monday?.getDay()).toBe(5);
+    expect(monday?.getDate()).toBe(22);
+  });
+
+  it('does not catch up a weekend and stays inside the catch-up window', () => {
+    const task = makeTask(sched);
+    // Weekend mornings must not offer a phantom same-day boundary. The real
+    // latest occurrence (Friday 09:00) is older than the catch-up window, so
+    // there is nothing to run late.
+    expect(catchUpBoundaryForTest(task, new Date(2026, 4, 23, 10, 0, 0))).toBeNull();
+    expect(catchUpBoundaryForTest(task, new Date(2026, 4, 24, 10, 0, 0))).toBeNull();
+    // Friday evening: today's missed 09:00 boundary is still catchable.
+    const friday = catchUpBoundaryForTest(task, new Date(2026, 4, 22, 20, 0, 0));
+    expect(friday?.getDay()).toBe(5);
+    expect(friday?.getHours()).toBe(9);
+  });
+});
+
 describe('isDue: hourly and end conditions', () => {
   it('uses create / last-run time as the hourly interval baseline', () => {
     const createdAt = new Date(2026, 4, 22, 8, 0, 0);
@@ -2250,6 +2305,45 @@ describe('scheduler next due: recurring creation baseline', () => {
       new Date(2026, 4, 22, 10, 0, 0),
     );
     expect(afterRun?.getDate()).toBe(29);
+    expect(afterRun?.getHours()).toBe(9);
+  });
+
+  it('projects weekday schedules across the weekend and after a run', () => {
+    const task = makeTask(
+      { type: 'weekdays', hour: 9, minute: 0 },
+      {
+        created_at: new Date(2026, 4, 18, 8, 0, 0).toISOString(),
+        updated_at: new Date(2026, 4, 18, 8, 0, 0).toISOString(),
+      },
+    );
+    // Friday evening after today's run → Monday.
+    const ranFriday = { ...task, last_run_at: new Date(2026, 4, 22, 9, 0, 30).toISOString() };
+    const fromFriday = nextDueAtForTest(ranFriday, new Date(2026, 4, 22, 20, 0, 0));
+    expect(fromFriday?.getDay()).toBe(1);
+    expect(fromFriday?.getDate()).toBe(25);
+    expect(fromFriday?.getHours()).toBe(9);
+    // Friday evening with no run yet → due now, not skipped to Monday.
+    const dueFriday = nextDueAtForTest(task, new Date(2026, 4, 22, 20, 0, 0));
+    expect(dueFriday?.getDay()).toBe(5);
+    expect(dueFriday?.getDate()).toBe(22);
+    // Saturday → Monday, skipping the weekend entirely.
+    const fromSaturday = nextDueAtForTest(ranFriday, new Date(2026, 4, 23, 10, 0, 0));
+    expect(fromSaturday?.getDay()).toBe(1);
+    expect(fromSaturday?.getDate()).toBe(25);
+    // Same weekday before the boundary → today.
+    const sameDay = nextDueAtForTest(task, new Date(2026, 4, 25, 8, 0, 0));
+    expect(sameDay?.getDate()).toBe(25);
+    expect(sameDay?.getHours()).toBe(9);
+    // Already due (boundary crossed, no run yet) → fire now.
+    const due = nextDueAtForTest(task, new Date(2026, 4, 25, 10, 0, 0));
+    expect(due?.getDate()).toBe(25);
+    expect(due?.getHours()).toBe(10);
+    // After a run past today's boundary → next weekday.
+    const afterRun = nextDueAtForTest(
+      { ...task, last_run_at: new Date(2026, 4, 25, 9, 0, 30).toISOString() },
+      new Date(2026, 4, 25, 10, 0, 0),
+    );
+    expect(afterRun?.getDate()).toBe(26);
     expect(afterRun?.getHours()).toBe(9);
   });
 
