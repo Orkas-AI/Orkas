@@ -284,13 +284,18 @@ function _getLineLock(filePath: string): MutexInterface {
   return m;
 }
 
+/** Count existing rows and leave the file ready for the next append. A crash,
+ * power loss or ENOSPC can leave a partial last line, and writing straight after
+ * it would fuse the new record into one unreadable row. The partial row is not a
+ * record, so it takes no slot in the valid-record numbering readers use. */
 async function _loadLineCount(filePath: string): Promise<number> {
-  try {
-    const text = await fsp.readFile(filePath, 'utf8');
-    let n = 0;
-    for (const line of text.split('\n')) if (line.trim()) n++;
-    return n;
-  } catch { return 0; }
+  let text: string;
+  try { text = await fsp.readFile(filePath, 'utf8'); } catch { return 0; }
+  let n = 0;
+  for (const line of text.split('\n')) if (_parseJsonlRecord(line) !== undefined) n++;
+  if (text.endsWith('\n') || !text.trim()) return n;
+  await fsp.appendFile(filePath, '\n', 'utf8');
+  return n;
 }
 
 export interface AtomicAppendResult<T = unknown> {
@@ -331,17 +336,23 @@ export async function appendJsonlAtomic<T>(filePath: string, record: T, withSour
     const finishIndex = await prepareIndexedJsonlAppend(filePath);
     const line = JSON.stringify(record) + '\n';
     let source: JsonlAppendSource | undefined;
-    if (withSource) {
-      const handle = await fsp.open(filePath, 'a');
-      try {
-        const before = await handle.stat();
-        await handle.writeFile(line, 'utf8');
-        const after = await handle.stat();
-        source = { kind: 'jsonl-append', file: filePath, offset: before.size,
-          bytes: Buffer.byteLength(line), dev: after.dev, ino: after.ino,
-          beforeMtime: before.mtimeMs, mtime: after.mtimeMs, size: after.size };
-      } finally { await handle.close(); }
-    } else await fsp.appendFile(filePath, line, 'utf8');
+    try {
+      if (withSource) {
+        const handle = await fsp.open(filePath, 'a');
+        try {
+          const before = await handle.stat();
+          await handle.writeFile(line, 'utf8');
+          const after = await handle.stat();
+          source = { kind: 'jsonl-append', file: filePath, offset: before.size,
+            bytes: Buffer.byteLength(line), dev: after.dev, ino: after.ino,
+            beforeMtime: before.mtimeMs, mtime: after.mtimeMs, size: after.size };
+        } finally { await handle.close(); }
+      } else await fsp.appendFile(filePath, line, 'utf8');
+    } catch (error) {
+      // Recount after a failed write may have left a partial row.
+      _lineCounts.delete(filePath);
+      throw error;
+    }
     await finishIndex(record, Buffer.byteLength(line));
     _lineCounts.set(filePath, count + 1);
     return { record, msgIndex: count, ...(source ? { source } : {}) };
@@ -389,18 +400,28 @@ export async function rewriteJsonlLine<T extends object>(
     const hasTrailing = lines.length > 0 && lines[lines.length - 1] === '';
     const body = hasTrailing ? lines.slice(0, -1) : lines;
 
-    if (msgIndex < 0 || msgIndex >= body.length) {
-      return { ok: false, error: `index out of range (${msgIndex}/${body.length})` };
+    // Callers obtain msgIndex from the tolerant readers or atomic append.
+    // Keep their valid-record positions even when crash residue is preserved.
+    let validIndex = 0;
+    let lineIndex = -1;
+    let current!: T;
+    for (let i = 0; i < body.length; i++) {
+      const record = _parseJsonlRecord<T>(body[i]);
+      if (record === undefined) continue;
+      if (validIndex++ === msgIndex) {
+        lineIndex = i;
+        current = record;
+        break;
+      }
     }
-
-    let current: T;
-    try { current = JSON.parse(body[msgIndex]) as T; }
-    catch (err) { return { ok: false, error: `line ${msgIndex} not JSON: ${(err as Error).message}` }; }
+    if (lineIndex < 0) {
+      return { ok: false, error: `index out of range (${msgIndex}/${validIndex})` };
+    }
 
     const next = mutate(current);
     if (next === null) return { ok: false, error: 'mutate aborted' };
 
-    body[msgIndex] = JSON.stringify(next);
+    body[lineIndex] = JSON.stringify(next);
     const out = body.join('\n') + '\n';
     // Write to tmp + rename — rewrite is a "full file" op; we can't use
     // append here. Line count stays the same.
