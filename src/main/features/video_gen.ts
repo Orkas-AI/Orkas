@@ -180,6 +180,30 @@ class VideoControlHttpError extends Error {
   }
 }
 
+/** A structured terminal failure must not be confused with lost tracking. */
+class VideoTaskFailedError extends Error {
+  /** `reason` is safe to show the Agent; it never carries provider prose. */
+  constructor(message: string, readonly reason = '', readonly inputRejected = false) {
+    super(message);
+  }
+}
+
+const VIDEO_TASK_NEW_ATTEMPT = 'Calling generate_video again starts a new paid generation.';
+
+// Provider prose can echo a private prompt, so a rejection is identified and
+// reported only by its structured code.
+const PROVIDER_ERROR_CODE = /^[A-Za-z][A-Za-z0-9_.-]{0,100}$/;
+// https://docs.volcengine.com/docs/82379/1299023
+const DOUBAO_INPUT_REJECTION_CODE =
+  /^(?:Input(?:Text|Image|Video|Audio)(?:SensitiveContentDetected|RiskDetection)|SensitiveContentDetected|InvalidParameter|InvalidImageURL)(?:\.[A-Za-z]*)?$/;
+
+function providerErrorCode(error: unknown): string {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  return typeof code === 'string' && PROVIDER_ERROR_CODE.test(code) ? code : '';
+}
+
+class VideoInputRejectedError extends VideoControlHttpError {}
+
 const TRANSIENT_VIDEO_ERROR_RE =
   /系统繁忙|请稍?后(?:重|再)?试|\b(?:429|50[0-4])\b|timed?\s*out|timeout|service unavailable|temporarily unavailable|too many requests|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|fetch failed|socket hang up|\bnet::ERR_[A-Z0-9_]+/i;
 export function classifyVideoGenError(message: string): 'TIMEOUT' | 'PROVIDER_API_ERROR' | 'BAD_INPUT' {
@@ -242,6 +266,7 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
   }
 
   let lastProviderError = '';
+  let lastInputRejected = false;
   for (let i = 0; i < candidates.length; i += 1) {
     const candidate = candidates[i];
     const inputError = candidate.entry.provider === 'kling' ? klingVideoInputError(input) : null;
@@ -309,8 +334,11 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
         });
         return {
           ok: false,
-          errorCode: input.signal?.aborted ? 'BAD_INPUT' : lastProviderError.includes('timed out') ? 'TIMEOUT' : 'PROVIDER_API_ERROR',
-          message: 'Video task tracking stopped after a generation request was sent. The task or charge status may be unknown.',
+          errorCode: input.signal?.aborted || (err instanceof VideoTaskFailedError && err.inputRejected)
+            ? 'BAD_INPUT' : lastProviderError.includes('timed out') ? 'TIMEOUT' : 'PROVIDER_API_ERROR',
+          message: err instanceof VideoTaskFailedError
+            ? `${err.reason} ${VIDEO_TASK_NEW_ATTEMPT}`
+            : 'Video task tracking stopped after a generation request was sent. The task or charge status may be unknown.',
           ...(acceptedTaskId ? { taskId: acceptedTaskId } : {}),
           postDispatch: true,
         };
@@ -322,6 +350,7 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
           message: sanitizeLogTextForUpload(lastProviderError),
         };
       }
+      lastInputRejected = err instanceof VideoInputRejectedError;
       const suffix = i < candidates.length - 1 ? '; trying next provider' : '';
       log.warn(`video gen API call failed (${candidate.entry.provider}/${candidate.entry.model})${suffix}`, {
         error: logErrorSummary(err),
@@ -382,7 +411,7 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
 
   return {
     ok: false,
-    errorCode: lastProviderError.includes('timed out') ? 'TIMEOUT' : 'PROVIDER_API_ERROR',
+    errorCode: lastInputRejected ? 'BAD_INPUT' : lastProviderError.includes('timed out') ? 'TIMEOUT' : 'PROVIDER_API_ERROR',
     message: sanitizeLogTextForUpload(lastProviderError || 'video generation failed'),
   };
 }
@@ -672,7 +701,16 @@ async function fetchVideoControl<T>(
 
 async function readNativeVideoResponse(response: Response, label: string): Promise<any> {
   const text = await response.text();
-  if (!response.ok) throw new VideoControlHttpError(`${label} API ${response.status}`, response.status);
+  if (!response.ok) {
+    let body: any;
+    try { body = JSON.parse(text); } catch { /* an unparsable body names no code */ }
+    const code = providerErrorCode(body?.error);
+    const message = `${label} API ${response.status}${code ? `: ${code}` : ''}`;
+    if (label.startsWith('DouBao') && DOUBAO_INPUT_REJECTION_CODE.test(code)) {
+      throw new VideoInputRejectedError(message, response.status);
+    }
+    throw new VideoControlHttpError(message, response.status);
+  }
   try { return text ? JSON.parse(text) : {}; }
   catch { return {}; } // Invalid successful bodies remain missing receipts.
 }
@@ -853,7 +891,14 @@ export async function callDoubaoVideo(req: AdapterVideoRequest): Promise<Adapter
       continue;
     }
     if (VIDEO_TASK_FAILED_STATUSES.includes(status)) {
-      throw new Error(`DouBao video task ${taskId} ${status}: ${truncate(JSON.stringify((last as any)?.error || last), 500)}`);
+      const failureCode = providerErrorCode((last as any)?.error);
+      const reason = failureCode
+        ? `The provider failed this video task with code ${failureCode}.`
+        : 'The provider reported that this video task failed.';
+      throw new VideoTaskFailedError(
+        `DouBao video task ${taskId} ${status}${failureCode ? `: ${failureCode}` : ''}`,
+        reason, DOUBAO_INPUT_REJECTION_CODE.test(failureCode),
+      );
     }
     if (['succeeded', 'success', 'completed', 'done'].includes(status)) {
       const videoUrl = extractVideoUrl(last);
