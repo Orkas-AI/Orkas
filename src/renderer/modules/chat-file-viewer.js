@@ -1446,18 +1446,19 @@ async function _ensureViewerFileExists(absPath, cid, projectId) {
 
 async function openChatFileViewer(absPath, displayName, opts) {
   if (!absPath) return;
-  if (window.OrkasPreviewWindows) {
-    if (!(await _ensureViewerFileExists(absPath, opts?.cid, opts?.projectId))) return;
-    if (_kindOf(absPath) === 'image') return window.OrkasPreviewWindows.image(_chatMediaLocalUrl(absPath), displayName || absPath.split(/[\\/]/).pop(), { ...opts, absPath });
-    if (_kindOf(absPath) === 'video') return openChatVideoUrlViewer(_chatMediaLocalUrl(absPath), displayName || absPath.split(/[\\/]/).pop(), { ...opts, absPath });
-    return window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: displayName || absPath.split(/[\\/]/).pop(), options: window.OrkasPreviewWindows.options(opts) });
-  }
   const cid = (opts && opts.cid) || null;
   const projectId = (opts && opts.projectId) || null;
   const name = displayName || (absPath.split(/[\\/]/).pop() || absPath);
   const exists = await _ensureViewerFileExists(absPath, cid, projectId);
   if (!exists) return;
   const kind = _kindOf(absPath);
+  // Unsupported files need only the owner dialog, never a preview window.
+  if (kind === 'unsupported') return _showUnsupportedDialog(absPath, cid, projectId, {});
+  if (window.OrkasPreviewWindows) {
+    if (kind === 'image') return window.OrkasPreviewWindows.image(_chatMediaLocalUrl(absPath), name, { ...opts, absPath });
+    if (kind === 'video') return openChatVideoUrlViewer(_chatMediaLocalUrl(absPath), name, { ...opts, absPath });
+    return window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: name, options: window.OrkasPreviewWindows.options(opts) });
+  }
 
   if (kind === 'image') {
     // Delegate — the image lightbox already has zoom / pan / keyboard. We
