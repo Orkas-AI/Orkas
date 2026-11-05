@@ -1,4 +1,5 @@
-import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { appendFileSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { expect, test } from './fixtures/orkas';
 
@@ -219,3 +220,43 @@ test('native local image previews decode common raster formats and aliases', asy
     await orkas.closePreview(preview);
   }
 });
+
+for (const language of ['en', 'zh'] as const) {
+  test.describe(`unsupported bubble files (${language})`, () => {
+    test('shows only the owner dialog and restores bubble focus when dismissed', async ({ orkas }, info) => {
+      const page = orkas.page!;
+      await page.evaluate(language => (window as any).setLang(language), language);
+      const name = `${'release-package-'.repeat(8)}2.5.0.zip`;
+      const file = orkas.createWorkspaceFile(name, 'unsupported preview fixture');
+      const created: any = await orkas.invoke('conversations.create', { title: 'Unsupported file preview' });
+      const cid = created.conversation.conversation_id;
+      appendFileSync(path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', `${cid}.jsonl`), JSON.stringify({
+        id: 'unsupported-file', from: 'commander', to: ['user'], ts: new Date().toISOString(),
+        text: `[${name}](${pathToFileURL(file).href})`,
+      }) + '\n');
+      await page.evaluate(async cid => {
+        await (window as any).loadConversations();
+        await (window as any).setView('conversation', cid);
+      }, cid);
+      const chip = page.locator('#chat-history [data-chat-md-file-open="1"]');
+      await expect(chip).toBeVisible();
+      const countWindows = () => orkas.electronApp!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length);
+      const windows = await countWindows();
+      for (const [width, height] of [[1280, 800], [960, 640]]) {
+        await page.setViewportSize({ width, height });
+        await chip.click();
+        const dialog = page.locator('.ui-dialog-overlay.open');
+        await expect(dialog).toContainText(language === 'zh' ? '无法在应用内预览 .zip 文件' : 'Cannot preview .zip files in app.');
+        await expect(dialog.getByRole('button', { name: language === 'zh' ? '打开文件夹' : 'Open Folder', exact: true })).toBeFocused();
+        expect(await countWindows()).toBe(windows);
+        await expect(page.locator('.chat-file-viewer.is-open')).toHaveCount(0);
+        await page.screenshot({ path: info.outputPath(`unsupported-${language}-${width}.png`) });
+        if (width === 1280) await dialog.getByRole('button', { name: language === 'zh' ? '关闭' : 'Close', exact: true }).click();
+        else await page.keyboard.press('Escape');
+        await expect(dialog).toHaveCount(0);
+        await expect(chip).toBeFocused();
+        expect(await countWindows()).toBe(windows);
+      }
+    });
+  });
+}
