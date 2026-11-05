@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   }>,
   registerGeneratedMediaUrl: vi.fn(),
   downloadBinaryWithProxyPolicy: vi.fn(),
+  warn: vi.fn(),
 }));
 
 vi.mock('../../../src/main/features/auth', () => ({
@@ -30,7 +31,7 @@ vi.mock('../../../src/main/util/proxy-dispatcher', () => ({
 }));
 
 vi.mock('../../../src/main/logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: mocks.warn, error: vi.fn() }),
 }));
 
 import { generateVideo, validateDownloadedVideo } from '../../../src/main/features/video_gen';
@@ -59,6 +60,7 @@ beforeEach(() => {
     createdAt: 1,
   }];
   mocks.registerGeneratedMediaUrl.mockReset();
+  mocks.warn.mockReset();
   mocks.downloadBinaryWithProxyPolicy.mockReset();
   mocks.downloadBinaryWithProxyPolicy.mockImplementation(async (_url, options) => {
     const body = mp4Fixture();
@@ -434,5 +436,95 @@ describe('public Orkas API poll timeout budget', () => {
       expect(mocks.downloadBinaryWithProxyPolicy).not.toHaveBeenCalled();
       expect(fs.existsSync(path.join(tmpDir, 'timed-out.mp4'))).toBe(false);
     } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('video_gen public provider rejection reason', () => {
+  const output = path.join(os.tmpdir(), 'uncreated-video-rejection.mp4');
+  it('reports a user-key Doubao input rejection by its code and never its prose', async () => {
+    mocks.profiles = [{ id: 'primary', provider: 'doubao', model: 'doubao-seedance-2-0-260128', apiKey: 'fixture-key', label: 'Fixture', createdAt: 1 }];
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: { code: 'InputImageSensitiveContentDetected.PrivacyInformation', message: 'private-generation-prompt' },
+    }), { status: 400 })));
+    const { generateVideo } = await import('../../../src/main/features/video_gen');
+    const result = await generateVideo({ prompt: 'A quiet landscape', outputAbsPath: output });
+    expect(result).toMatchObject({ ok: false, errorCode: 'BAD_INPUT' });
+    expect(JSON.stringify(result)).toContain('InputImageSensitiveContentDetected.PrivacyInformation');
+    expect(JSON.stringify(result)).not.toContain('private-generation-prompt');
+  });
+
+  it.each([
+    [{ error: { code: 'AuthenticationError', message: 'private-generation-prompt' } }, 401, 'AuthenticationError'],
+    [{ error: { code: 'private-generation-prompt and more words' } }, 400, null],
+    [{ error: { code: 1613 } }, 400, null],
+    ['private-generation-prompt', 400, null],
+  ])('does not treat a user-key response as an input rejection: %j', async (body, status, code) => {
+    mocks.profiles = [{ id: 'primary', provider: 'doubao', model: 'doubao-seedance-2-0-260128', apiKey: 'fixture-key', label: 'Fixture', createdAt: 1 }];
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status })));
+    const { generateVideo } = await import('../../../src/main/features/video_gen');
+    const result = await generateVideo({ prompt: 'A quiet landscape', outputAbsPath: output });
+    expect(result).toMatchObject({ ok: false, errorCode: 'PROVIDER_API_ERROR' });
+    expect(JSON.stringify(result)).not.toContain('private-generation-prompt');
+    if (code) expect(JSON.stringify(result)).toContain(code);
+  });
+
+  it('reports why a user-key Doubao task failed by its code', async () => {
+    mocks.profiles = [{ id: 'primary', provider: 'doubao', model: 'doubao-seedance-2-0-260128', apiKey: 'fixture-key', label: 'Fixture', createdAt: 1 }];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => (init?.method === 'POST'
+      ? new Response(JSON.stringify({ id: 'byok-task' }))
+      : new Response(JSON.stringify({ status: 'failed', error: { code: 'OutputVideoSensitiveContentDetected', message: 'private-generation-prompt' } })))));
+    const { generateVideo } = await import('../../../src/main/features/video_gen');
+    const result = await generateVideo({ prompt: 'A quiet landscape', outputAbsPath: output, pollIntervalMs: 1 });
+    expect(result).toMatchObject({ ok: false, errorCode: 'PROVIDER_API_ERROR', postDispatch: true, taskId: 'byok-task' });
+    expect(JSON.stringify(result)).toContain('OutputVideoSensitiveContentDetected');
+    expect(JSON.stringify(result)).not.toContain('private-generation-prompt');
+  });
+});
+
+// A terminal task and a rejected create have different replay and billing facts.
+describe('public video rejection recovery boundaries', () => {
+  const primary = { id: 'primary', provider: 'doubao', model: 'doubao-seedance-2-0-260128', apiKey: 'fixture-key', label: 'Fixture', createdAt: 1 };
+  it.each([
+    ['InputImageSensitiveContentDetected.PrivacyInformation', 'BAD_INPUT'],
+    ['UpstreamFailure', 'PROVIDER_API_ERROR'],
+    ['InvalidParameter and private prose', 'PROVIDER_API_ERROR'],
+    [null, 'PROVIDER_API_ERROR'],
+  ])('preserves terminal failure and no replay for code %s', async (code, errorCode) => {
+    mocks.profiles = [primary, { ...primary, id: 'fallback' }];
+    const fetch = vi.fn(async (_url: unknown, init?: RequestInit) => new Response(JSON.stringify(init?.method === 'POST'
+      ? { id: 'terminal-task' }
+      : { status: 'failed', error: { code, message: 'private-provider-prose' } })));
+    vi.stubGlobal('fetch', fetch);
+    const result = await generateVideo({ prompt: 'A quiet landscape', outputAbsPath: path.join(tmpDir, 'failed.mp4'), pollIntervalMs: 1 });
+    expect(result).toMatchObject({ ok: false, errorCode, postDispatch: true, taskId: 'terminal-task' });
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    expect(mocks.downloadBinaryWithProxyPolicy).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(tmpDir, 'failed.mp4'))).toBe(false);
+    expect(JSON.stringify([result, mocks.warn.mock.calls])).not.toContain('private-provider-prose');
+    expect(JSON.stringify(result)).not.toMatch(/nothing was charged|no credits were charged/i);
+    expect((result as {message: string}).message).toContain('video task');
+  });
+  it('uses the configured fallback only after an explicitly rejected creation', async () => {
+    mocks.profiles = [primary, { ...primary, id: 'fallback' }];
+    let creations = 0;
+    const fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      if (init?.method === 'POST') return ++creations === 1
+        ? new Response(JSON.stringify({error: {code: 'InvalidParameter', message: 'private-provider-prose'}}), {status: 400})
+        : new Response(JSON.stringify({id: 'fallback-task'}));
+      return new Response(JSON.stringify({status: 'succeeded', content: {video_url: 'https://cdn.example.test/video.mp4'}}));
+    });
+    vi.stubGlobal('fetch', fetch);
+    const output = path.join(tmpDir, 'fallback.mp4');
+    expect(await generateVideo({prompt: 'A quiet landscape', outputAbsPath: output, pollIntervalMs: 1}))
+      .toMatchObject({ok: true, taskId: 'fallback-task'});
+    expect(creations).toBe(2);
+    expect(fs.readFileSync(output)).toEqual(mp4Fixture());
+    expect(JSON.stringify(mocks.warn.mock.calls)).not.toContain('private-provider-prose');
+  });
+  it.each(['InvalidParameterLookalike', 'Prefix.InvalidImageURL', 'InputImageSensitiveContentDetected.PrivacyInformation.extra'])('keeps an unrecognized structured code a provider error: %s', async code => {
+    mocks.profiles = [primary];
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({error: {code}}), {status: 400})));
+    expect(await generateVideo({prompt: 'A quiet landscape', outputAbsPath: path.join(tmpDir, 'unknown.mp4')}))
+      .toMatchObject({ok: false, errorCode: 'PROVIDER_API_ERROR'});
   });
 });
