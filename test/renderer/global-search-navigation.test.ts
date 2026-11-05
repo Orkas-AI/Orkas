@@ -630,6 +630,38 @@ it('hydrates only visible chat rows and requests newly visible rows after scroll
   } finally { vi.useRealTimers(); vi.restoreAllMocks(); }
 });
 
+it.each([0, 40])('keeps the reading position at scrollTop=%i when summaries above the selection grow', async initialTop => {
+  vi.useFakeTimers();
+  try {
+    const { body, input, context, streams } = progressiveHarness(domHarness());
+    vi.spyOn(MiniElement.prototype, 'getBoundingClientRect').mockImplementation(function(this: MiniElement) {
+      if (this.id === 'search-body') return { top: 0, bottom: 200, left: 0, right: 0, width: 0, height: 200 };
+      const index = Number(this.dataset.idx);
+      const growth = index > 0 && body.querySelector('.search-result-snippet') ? 120 : 0;
+      const top = index * 80 + growth - body.scrollTop;
+      return { top, bottom: top + 80, left: 0, right: 0, width: 0, height: 80 };
+    });
+    input.value = 'needle';
+    const rows = [0, 1].map(index => ({ kind: 'chat', cid: `c${index}`, msg_index: 0, conv_title: `Result ${index}` }));
+    const search = context._runSearchNow(input.value);
+    streams[0].finish({ results: rows, pending_kinds: [], failed_kinds: [] });
+    await search;
+    vm.runInContext('_searchActiveIdx = 1', context);
+    context._renderSearchResults(input.value);
+    body.scrollTop = initialTop;
+    const before = body.querySelector('.search-result.active').getBoundingClientRect().top;
+    const summaries = context._loadVisibleChatSnippets();
+    streams[1].finish({
+      results: rows.map((row, index) => ({ ...row, snippet_loaded: true, snippet: index === 0 ? 'needle summary' : '' })),
+      pending_kinds: [], failed_kinds: [],
+    });
+    await summaries;
+    expect(body.querySelector('.search-result-snippet').textContent).toBe('needle summary');
+    if (initialTop === 0) expect(body.scrollTop).toBe(0);
+    else expect(body.querySelector('.search-result.active').getBoundingClientRect().top).toBe(before);
+  } finally { vi.useRealTimers(); vi.restoreAllMocks(); }
+});
+
 it('paints completed modules while chats are held and retains selection when chat and Library results arrive', async () => {
   const { body, context, streams } = progressiveHarness();
    
