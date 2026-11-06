@@ -20,10 +20,10 @@
 import * as crypto from 'node:crypto';
 
 const SENSITIVE_FIELD =
-  '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|conversation_?id|cid|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie|path|abs_?path|rel_?path|file_?path|file_?name|filename|working_?dir|cwd)';
+  '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|conversation_?id|cid|client_?secret|private_?key|password|passwd|pwd|secret|token|(?:proxy[-_]?)?authorization|cookie|set-cookie|path|abs_?path|rel_?path|file_?path|file_?name|filename|working_?dir|cwd)';
 
 const SENSITIVE_QUERY_FIELD =
-  '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|conversation_?id|cid|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie|code|state|signature|sign|q-ak|q-signature|x-cos-security-token|x-amz-signature|x-amz-security-token|x-amz-credential|ossaccesskeyid|security-token)';
+  '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|conversation_?id|cid|client_?secret|private_?key|password|passwd|pwd|secret|token|(?:proxy[-_]?)?authorization|cookie|set-cookie|code|state|signature|sign|q-ak|q-signature|x-cos-security-token|x-amz-signature|x-amz-security-token|x-amz-credential|ossaccesskeyid|security-token)';
 
 const JSON_SECRET_FIELD_RE = new RegExp(
   `(["'])(${SENSITIVE_FIELD})\\1(\\s*:\\s*)(["'])(.*?)\\4`,
@@ -81,9 +81,12 @@ export function sanitizeLogTextForUpload(text: string): string {
     // and JSON-stringified "\"authorization\":\"Bearer X\"". Case-insensitive
     // because RFC 6750 declares the scheme name case-insensitive.
     .replace(/Bearer\s+[A-Za-z0-9._\-~+/=]+/gi, 'Bearer ***')
-    // Basic credentials are base64 of "user-id:password" (RFC 7617), so only a
-    // token that decodes to something with a colon is masked. A plain word
-    // after "basic" in prose ("falling back to basic retrieval") is kept.
+    // An explicit authentication field stays private even when its Basic
+    // value is invalid or truncated. Preserve its surrounding diagnostics.
+    .replace(/(\b(?:proxy[-_]?)?authorization["']?\s*[:=]\s*["']?Basic\s+)[^\s"',;)\]}]+/gi, '$1***')
+    // Outside explicit fields, distinguish Basic credentials (base64 of
+    // "user-id:password", RFC 7617) from prose by the decoded colon. Keep
+    // ordinary text such as "falling back to basic retrieval" unchanged.
     .replace(/Basic\s+([A-Za-z0-9+/=]+)/gi, (m, token: string) =>
       (Buffer.from(token, 'base64').toString('latin1').includes(':') ? 'Basic ***' : m))
     // JWT — three base64url segments, first two starting "eyJ" (base64 of "{").

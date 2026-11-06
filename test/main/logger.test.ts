@@ -150,6 +150,27 @@ describe('logger › redact', () => {
     // The self-reference is replaced, not traversed forever.
     expect(out.self).toBe('[circular]');
   });
+
+  it('keeps incomplete Basic headers private in Error messages and stacks', async () => {
+    const { redact } = await import('../../src/main/logger');
+    const value = Buffer.from('synthetic-only').toString('base64');
+    const error = new Error(`request rejected Proxy-Authorization: Basic ${value}`);
+    error.stack = `Error: ${error.message}\n    at request`;
+    const out = redact(error) as Error;
+    expect(out.message).toBe('request rejected Proxy-Authorization: Basic ***');
+    expect(out.stack).toBe('Error: request rejected Proxy-Authorization: Basic ***\n    at request');
+    expect(error.message).toContain(value);
+    expect(redact('falling back to basic retrieval')).toBe('falling back to basic retrieval');
+    expect(redact({ authorization: `Basic ${value}` })).toEqual({ authorization: '***REDACTED***' });
+  });
+
+  it('masks proxy authorization fields before serializing structured log records', async () => {
+    const { redact } = await import('../../src/main/logger');
+    for (const field of ['Proxy-Authorization', 'proxy_authorization', 'proxyAuthorization']) {
+      expect(redact({ [field]: 'Basic incomplete', status: 401 }))
+        .toEqual({ [field]: '***REDACTED***', status: 401 });
+    }
+  });
 });
 
 describe('logger › sweepLogs', () => {
