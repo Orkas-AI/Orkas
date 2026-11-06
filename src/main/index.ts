@@ -1534,6 +1534,10 @@ if (!gotLock) {
       library.closeAllLibraryCorpora();
     },
     localTasks: [
+      { name: 'conversation-history', run: async () => {
+        const history = await import('./features/conversation-history-client');
+        await history.closeConversationHistoryWorker();
+      } },
       { name: 'open-lifecycle', run: async () => { await openLifecycleTracking?.flushQuit(); } },
       { name: 'connectors', run: () => connectorsFeature.shutdown() },
       { name: 'search', run: () => searchFeature.flushAll() },
