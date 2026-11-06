@@ -846,6 +846,9 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     recovered = await recovered;
     expect(recovered.turns).toHaveLength(1);
     const records = recovered.turns[0].records;
+    expect(recovered.turns[0].activity_after_message_id).toBe(
+      live.find(event => event.type === 'message' && event.msg.from === 'user').msg.id,
+    );
     expect(records.at(-1).text).toBe('Partial reply\n');
     expect(records.flatMap((r: any) => r.process || []).filter((p: any) => p.event?.data?.type === 'tool-event')).toHaveLength(350);
     if (cli === 'claude') expect(records[0].text).toBe('Inspect the code.\n');

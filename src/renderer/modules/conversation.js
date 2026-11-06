@@ -7580,6 +7580,7 @@ function _restoreLiveDisplaySnapshot(cid, snapshot) {
     }
     _replayPersistedProcessItems(row, current.process);
     if (current.text) _streamingAppendFinalDelta(row, current.text);
+    _restoreStreamingMessageActivityPosition(row, turn.activity_after_message_id);
     const details = row.querySelector?.('.stream-process');
     if (details && typeof wasOpen === 'boolean') details.open = wasOpen;
     const pending = pendingConvs.get(cid);
@@ -12405,19 +12406,21 @@ function _appendBeforeSpacer(container, msg) {
  *
  *  Bubbles without `data-ts` (legacy / history-load) are treated as
  *  earlier-than-anything new — new bubbles always append after them. */
-function _insertByTimestamp(container, msg) {
+function _insertByTimestamp(container, msg, afterMessage = null) {
   // A background reorder must not make Chromium follow the appended user
   // bubble upward when the live reply crosses it. Preserve the viewport only
   // for an existing row; new messages retain the ordinary sticky-follow path.
   const previousTop = msg.parentElement === container ? container.scrollTop : null;
   const newTs = Number(msg.dataset.ts || 0);
-  const children = container.querySelectorAll(':scope > .chat-message[data-ts]');
-  let reference = null;
-  for (const existing of children) {
-    const existingTs = Number(existing.dataset.ts || 0);
-    if (existingTs > newTs) {
-      reference = existing;
-      break;
+  let reference = afterMessage ? _nextChatMessage(afterMessage) : null;
+  if (!afterMessage) {
+    const children = container.querySelectorAll(':scope > .chat-message[data-ts]');
+    for (const existing of children) {
+      const existingTs = Number(existing.dataset.ts || 0);
+      if (existingTs > newTs) {
+        reference = existing;
+        break;
+      }
     }
   }
   if (reference) container.insertBefore(msg, reference);
@@ -12430,6 +12433,26 @@ function _insertByTimestamp(container, msg) {
     if (prev) container.style.scrollBehavior = prev;
     else container.style.removeProperty('scroll-behavior');
   }
+}
+
+// A recovered snapshot is existing output, not new activity. Restore only the
+// user boundary recorded when that output arrived; newer user messages stay
+// below it until the next live update, even when their timestamps are equal.
+function _restoreStreamingMessageActivityPosition(msg, afterMessageId) {
+  if (!_isLivePlaceholderMessage(msg) || !msg.parentElement || !afterMessageId) return;
+  const container = msg.parentElement;
+  const user = container.querySelector(`.chat-message.user[data-msg-id="${CSS.escape(String(afterMessageId))}"]`);
+  if (!user) return;
+  let following = _nextChatMessage(msg);
+  while (following && following !== user) following = _nextChatMessage(following);
+  if (!following) return;
+  const userTs = Number(user.dataset.ts || 0);
+  if (!Number.isFinite(userTs) || userTs <= 0) return;
+  const floor = Math.max(userTs, Number(msg.dataset.activitySortAfter || 0) || 0);
+  msg.dataset.ts = String(floor);
+  msg.dataset.activitySortAfter = String(floor);
+  if (Number(msg.dataset.activitySortFloor || 0) <= floor) delete msg.dataset.activitySortFloor;
+  _insertByTimestamp(container, msg, user);
 }
 
 function _isTimestampPositionCorrect(container, msg) {
@@ -15247,10 +15270,11 @@ function _anchorPlaceholderToTurnStart(ph, startedAtMs) {
   const startMs = Number(startedAtMs);
   if (!ph || !Number.isFinite(startMs) || startMs <= 0) return;
   const activitySortAfter = Number(ph.dataset.activitySortAfter || 0);
-  ph.dataset.ts = String(Math.max(
-    startMs,
-    Number.isFinite(activitySortAfter) ? activitySortAfter : 0,
-  ));
+  // A crossed user boundary owns the row's position. Its persisted clock has
+  // second precision and can precede this turn's millisecond start; replacing
+  // it with the start would cross still-newer users on the next runtime poll.
+  ph.dataset.ts = String(Number.isFinite(activitySortAfter) && activitySortAfter > 0
+    ? activitySortAfter : startMs);
   // Recovery creates the DOM now, but this header describes the running turn,
   // not when the user reopened the page. Keep it aligned with the row anchor.
   const timeEl = ph.querySelector?.('.chat-msg-time');

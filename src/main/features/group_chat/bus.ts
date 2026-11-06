@@ -1113,7 +1113,8 @@ interface CidState {
   skillImportPreviews?: Map<string, { sourcePath: string; fingerprint: string; expiresAt: number }>;
   // Read the existing public process trail only when a view is rebuilt. These
   // closures own no second event log and are released with their actor turn.
-  liveDisplays?: Map<string, () => GroupMessage[]>;
+  liveDisplays?: Map<string, { read: () => GroupMessage[]; afterMessageId?: string }>;
+  latestDisplayUserMessageId?: string;
   shuttingDown?: boolean;
   shutdownArchives?: Map<string, Promise<GroupMessage | null>>;
   displaySequence?: number;
@@ -1611,8 +1612,20 @@ function _emitTaskRunTerminalIfQuiescent(state: CidState, stateFile?: StateFile)
 }
 
 function emit(state: CidState, ev: GroupEvent, processItems?: ProcessItem[]): void {
+  if (ev.type === 'message' && ev.msg.from === USER_ID) {
+    state.latestDisplayUserMessageId = ev.msg.id;
+  }
   if (ev.type === 'process') {
     ev.display_seq = state.displaySequence = (state.displaySequence || 0) + 1;
+  }
+  // Preserve the user boundary crossed by visible output, including while the
+  // renderer is elsewhere. Message identity avoids second-resolution clock
+  // ties and never promotes old recovered content past a later user update.
+  if (ev.type === 'artifact_created' || (ev.type === 'process'
+    && (ev.data.type === 'event' || ev.data.type === 'commentary-finalized'
+      || ((ev.data.type === 'delta' || ev.data.type === 'progress') && ev.data.text)))) {
+    const display = ev.turn_id ? state.liveDisplays?.get(ev.turn_id) : null;
+    if (display) display.afterMessageId = state.latestDisplayUserMessageId;
   }
   // Single chokepoint feeding the `after` admission gate: every task
   // terminal — turn settlement, queue drops, per-task cancel, waiting_input
@@ -1763,8 +1776,11 @@ export function liveDisplaySnapshot(uid: string, cid: string) {
     sequence: state?.displaySequence || 0,
     active_turns: activeTurns,
     turns: activeTurns.flatMap((turn) => {
-      const read = state?.liveDisplays?.get(turn.turn_id);
-      return read ? [{ ...turn, records: read() }] : [];
+      const display = state?.liveDisplays?.get(turn.turn_id);
+      return display ? [{ ...turn,
+        ...(display.afterMessageId ? { activity_after_message_id: display.afterMessageId } : {}),
+        records: display.read(),
+      }] : [];
     }),
   };
 }
@@ -5683,11 +5699,11 @@ async function runActorTurn(
   w.pendingSavedTasks = undefined;
   if (item.actor.kind !== 'worker') {
     state.liveDisplays ||= new Map();
-    state.liveDisplays.set(item.turnId, () => [{
+    state.liveDisplays.set(item.turnId, { read: () => [{
       id: '', from: item.actor.id, to: [USER_ID], ts: localIsoAt(turnStartedAt), text: '',
       turn_id: item.turnId, source_message_id: item.msgId,
       ...(item.taskId ? { task_id: item.taskId } : {}),
-    }]);
+    }] });
   }
   try {
     return await (() => runActorTurnWithDisplay(state, w, item, turnStartedAt))();
@@ -6290,7 +6306,7 @@ async function runActorTurnWithDisplay(
   const nativeDisplaySegments: GroupMessage[] = [];
   if (actor.kind !== 'worker') {
     state.liveDisplays ||= new Map();
-    state.liveDisplays.set(item.turnId, () => [
+    state.liveDisplays.set(item.turnId, { read: () => [
       ...nativeDisplaySegments,
       {
         id: '', from: actor.id, to: [USER_ID],
@@ -6303,7 +6319,7 @@ async function runActorTurnWithDisplay(
         ...(turnArtifacts.length ? { artifacts: turnArtifacts.map(a => ({ ...a, agent_id: actor.id })) } : {}),
         ...(item.taskId ? { task_id: item.taskId } : {}),
       },
-    ]);
+    ] });
   }
   let errText: string | null = null;
   // Shown beside errText to the user only; see TurnFinishedEvent.errDetail.
@@ -10185,7 +10201,7 @@ async function archiveInterruptedTurn(state: CidState, turnId: string): Promise<
   state.shutdownArchives ||= new Map();
   const previous = state.shutdownArchives.get(turnId);
   if (previous) return previous;
-  const tail = state.liveDisplays?.get(turnId)?.().find(row => !row.id);
+  const tail = state.liveDisplays?.get(turnId)?.read().find(row => !row.id);
   if (!tail) return null;
   const snapshot = structuredClone(tail);
   const process = snapshot.process || [];
