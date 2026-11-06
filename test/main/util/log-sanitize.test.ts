@@ -31,6 +31,53 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
     expect(out).toBe('proxy header Basic *** rejected');
   });
 
+  it.each([
+    ['colonless', Buffer.from('synthetic-only').toString('base64')],
+    ['truncated', Buffer.from('long-user-name:synthetic-only').toString('base64').slice(0, 8)],
+    ['malformed', 'not-base64_credential'],
+  ])('masks %s Basic values in explicit authentication headers', (_label, credential) => {
+    // Authentication failures can echo invalid or incomplete credentials.
+    // Their header context is sufficient to establish that they are private.
+    for (const prefix of ['Authorization: Basic ', 'pRoXy-AuThOrIzAtIoN:\t bAsIc\t', 'authorization:\nBasic ']) {
+      expect(sanitizeLogTextForUpload(`${prefix}${credential} rejected`)).toBe(`${prefix}*** rejected`);
+    }
+  });
+
+  it('masks repeated authentication headers without swallowing diagnostic delimiters', () => {
+    const input = '(Authorization: Basic bad), Proxy-Authorization: Basic incomplete; status=401';
+    expect(sanitizeLogTextForUpload(input)).toBe('(Authorization: Basic ***), Proxy-Authorization: Basic ***; status=401');
+  });
+
+  it('masks malformed credentials in structured text representations of authentication fields', () => {
+    for (const field of ['authorization', 'Proxy-Authorization', 'proxy_authorization', 'proxyAuthorization']) {
+      const input = JSON.stringify({ [field]: 'Basic incomplete', status: 401 });
+      expect(sanitizeLogTextForUpload(input)).toBe(JSON.stringify({ [field]: '***', status: 401 }));
+      expect(sanitizeLogTextForUpload(`${field}=Basic incomplete retry=true`)).not.toContain('incomplete');
+      expect(sanitizeLogTextForUpload(`https://example.test/?${field}=Basic%20incomplete&retry=true`))
+        .toBe(`https://example.test/?${field}=***&retry=true`);
+    }
+    expect(sanitizeLogTextForUpload("'Proxy-Authorization': 'Basic incomplete'"))
+      .toBe("'Proxy-Authorization': '***'");
+  });
+
+  it('masks standard credentials with empty fields, Unicode and omitted padding', () => {
+    for (const user of ['', 'a', 'ab', 'alice', '用户', 'ü']) {
+      for (const password of ['', 'x', 'xy', 'xyz', 'long:password', '密码']) {
+        const token = Buffer.from(`${user}:${password}`).toString('base64');
+        for (const value of [token, token.replace(/=+$/, '')]) {
+          expect(sanitizeLogTextForUpload(`bAsIc ${value}`)).toBe('Basic ***');
+        }
+      }
+    }
+  });
+
+  it('keeps redaction stable when an error crosses multiple sanitizing consumers', () => {
+    const input = 'Authorization: Basic incomplete; falling back to basic retrieval';
+    const once = sanitizeLogTextForUpload(input);
+    expect(once).toBe('Authorization: Basic ***; falling back to basic retrieval');
+    expect(sanitizeLogTextForUpload(once)).toBe(once);
+  });
+
   it('is case-insensitive on the Bearer scheme name (RFC 6750)', () => {
     const out = sanitizeLogTextForUpload('Cookie: bearer x.y.z');
     expect(out).toBe('Cookie: Bearer ***');

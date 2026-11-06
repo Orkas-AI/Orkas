@@ -98,6 +98,14 @@ describe('log-redact', () => {
     expect(serialized).not.toContain('not-a-directory');
   });
 
+  it('keeps malformed Basic authentication private in failed-request diagnostics', () => {
+    const value = Buffer.from('synthetic-only').toString('base64');
+    const ref = logErrorRef(new Error(`request rejected Authorization: Basic ${value}`));
+    expect(ref.message).toBe('request rejected Authorization: Basic ***');
+    expect(JSON.stringify(ref)).not.toContain(value);
+    expect(sanitizeLogText('falling back to basic retrieval')).toBe('falling back to basic retrieval');
+  });
+
   it('preserves safe URLs adjacent to cloud paths while redacting secrets', () => {
     const text = sanitizeLogText(
       'failed cloud/agents/abc123/skills/private/SKILL.md via https://example.com/sync/sts?token=secret ghp_abcdefghijklmnopqrstuvwxyz',
