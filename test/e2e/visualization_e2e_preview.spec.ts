@@ -19,7 +19,8 @@ button { font: inherit; padding: 8px 12px; } output { margin-left: 12px; }
 </style><h1>时间选择器 / Time picker</h1>
 <button onclick="document.querySelector('output').textContent = ++window.count">Add / 添加</button><output>0</output>
 <script>window.count = 0;</script>`);
-  const marker = `\uE200visualize\uE202${JSON.stringify({ path: file, mode: 'wide' })}\uE201`;
+  const title = '时间选择器（中文）';
+  const marker = `\uE200visualize\uE202${JSON.stringify({ path: file, mode: 'wide', title })}\uE201`;
   app.setModelTextReplies([`UI 已完成。\n\n${marker}\n\n检查结果：预览可以交互。`]);
   await page.locator('#new-chat-btn').click();
   await page.locator('#new-chat-input').fill('展示时间选择器的交互预览。');
@@ -30,6 +31,7 @@ button { font: inherit; padding: 8px 12px; } output { margin-left: 12px; }
   await expect(final.locator(frameSelector)).toHaveCount(1);
   await expect(final).not.toContainText('\uE200visualize');
   await expect(final.locator(frameSelector)).toHaveAttribute('sandbox', 'allow-scripts');
+  await expect(final.locator(frameSelector)).toHaveAttribute('title', new RegExp(`${title}$`));
   let preview = final.locator(frameSelector).contentFrame();
   await preview.getByRole('button', { name: 'Add / 添加' }).press('Enter');
   await expect(preview.locator('output')).toHaveText('1');
@@ -62,6 +64,7 @@ button { font: inherit; padding: 8px 12px; } output { margin-left: 12px; }
   final = page.locator('#chat-history .chat-message.assistant').filter({ hasText: 'UI 已完成。' }).last();
   await expect(final.locator(frameSelector)).toHaveCount(1);
   await expect(final).not.toContainText('\uE200visualize');
+  await expect(final.locator(frameSelector)).toHaveAttribute('title', new RegExp(`${title}$`));
   preview = final.locator(frameSelector).contentFrame();
   await preview.getByRole('button', { name: 'Add / 添加' }).press('Enter');
   await expect(preview.locator('output')).toHaveText('1');

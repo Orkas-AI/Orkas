@@ -24,8 +24,26 @@ describe('visualization content references in replies', () => {
     expect(html).not.toContain('<iframe');
   });
 
+  it.each([undefined, 'wide'])('renders the optional visualization title with mode %s', mode => {
+    // The visualization protocol permits title; this is the shape of the
+    // reported feedback-dialog reply that previously stayed as raw source.
+    const marker = visualize({ path: '/workspace/message-feedback.html', title: '消息反馈弹窗（中文）', ...(mode ? { mode } : {}) });
+    const html = renderMarkdown(marker);
+    expect(html).toContain('data-chat-md-html-embed="1"');
+    expect(html).toContain('aria-label="Preview: 消息反馈弹窗（中文）"');
+    expect(html).not.toContain('\uE200');
+  });
+
+  it('treats the optional title as escaped text rather than markup', () => {
+    const html = renderMarkdown(visualize({ path: '/workspace/preview.html', title: '\"><img src=x onerror="alert(1)"> & preview' }));
+    expect(html).toContain('data-chat-md-html-embed="1"');
+    expect(html).toContain('&quot;&gt;&lt;img src=x onerror=&quot;alert(1)&quot;&gt; &amp; preview');
+    expect(html).not.toContain('<img');
+    expect(html).not.toContain('<script');
+  });
+
   it('keeps reference examples literal inside code and prose', () => {
-    const marker = visualize({ path: '/workspace/preview.html' });
+    const marker = visualize({ path: '/workspace/preview.html', title: 'Preview' });
     for (const source of [`\`${marker}\``, `\`\`\`text\n${marker}\n\`\`\``, `Example: ${marker}`, `> ${marker}`]) {
       const html = renderMarkdown(source);
       expect(html).toContain('\uE200visualize\uE202');
@@ -43,6 +61,7 @@ describe('visualization content references in replies', () => {
     { path: '/workspace/preview\ud800.html' },
     { path: `/workspace/${'a'.repeat(16_384)}.html` },
     { path: '/workspace/preview.html', mode: 'unknown' },
+    ...[null, 42, [], {}].map(title => ({ path: '/workspace/preview.html', title })),
     { path: '/workspace/preview.html', script: '<script>alert(1)</script>' },
   ].map(spec => [spec]))('does not activate an invalid or lookalike reference (case %#)', spec => {
     const html = renderMarkdown(`Before\n${visualize(spec)}\nAfter`);
@@ -61,7 +80,7 @@ describe('visualization content references in replies', () => {
   });
 
   it('activates only a complete streamed reference and keeps cached rendering equivalent', () => {
-    const marker = visualize({ path: '/workspace/preview.html' });
+    const marker = visualize({ path: '/workspace/preview.html', title: '消息反馈弹窗（中文）' });
     const cache: any = {};
     for (let end = 1; end <= marker.length; end++) {
       const source = `Before\n\n${marker.slice(0, end)}`;
