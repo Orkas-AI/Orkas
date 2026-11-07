@@ -2948,6 +2948,51 @@ describe('file-tools › read_files metadata_only', () => {
 });
 
 describe('file-tools › search_files', () => {
+  it.each(['search_files', 'grep_files'])('keeps file and directory ignore scopes distinct across rescans (%s)', async (name) => {
+    const { tools, wsDir } = await buildTools();
+    const files = ['excluded.txt/hidden.txt', 'visible/excluded.txt', 'visible/deep/needle.txt',
+      'pkg/keep.txt', 'pkg/drop.txt', 'pkg/child/drop.txt', 'pkg/child/keep.txt', 'peer/other.txt'];
+    for (const relative of files) {
+      const file = path.join(wsDir, relative);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, 'needle\n');
+    }
+    fs.writeFileSync(path.join(wsDir, '.gitignore'), 'excluded.txt/\n');
+    fs.writeFileSync(path.join(wsDir, 'pkg', '.gitignore'), '*.txt\n!keep.txt\n');
+    const originalPath = process.env.PATH;
+    process.env.PATH = tmpDir;
+    try {
+      for (const phase of [0, 1]) {
+        if (phase === 1) fs.writeFileSync(path.join(wsDir, '.gitignore'), 'visible/\n');
+        const visible = phase === 0
+          ? ['visible/excluded.txt', 'visible/deep/needle.txt', 'pkg/keep.txt', 'pkg/child/keep.txt', 'peer/other.txt']
+          : ['excluded.txt/hidden.txt', 'pkg/keep.txt', 'pkg/child/keep.txt', 'peer/other.txt'];
+        for (const includeIgnored of [false, true]) {
+          const result = await run(getTool(tools, name), {
+            root: wsDir, query: '*.txt', pattern: 'needle', include_glob: ['*.txt'], include_ignored: includeIgnored,
+          });
+          expect(result.isError, result.content).toBeFalsy();
+          expect(result.content).toContain('backend=walk');
+          expect(result.content).toContain('complete=true');
+          const expected = (includeIgnored ? files : visible).map(relative => path.join(wsDir, relative)).sort();
+          if (name === 'search_files') {
+            const listing = searchResults(result.content);
+            expect(listing.files.map(file => path.join(listing.roots[file.root], file.path)).sort()).toEqual(expected);
+          } else {
+            expect(result.content).toContain(`${expected.length} match(es)`);
+            for (const relative of files) {
+              const absolute = path.join(wsDir, relative);
+              expect(result.content.includes(`file: ${JSON.stringify(absolute)}\n`), relative).toBe(expected.includes(absolute));
+            }
+          }
+        }
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  });
+
   it.each(['search_files', 'grep_files'])('honours trailing double-star ignores through the walk fallback (%s)', async (name) => {
     const { tools, wsDir } = await buildTools();
     const files = ['logs/today.txt', 'logs/old/jan.txt', 'logs/keep.txt', 'src/logs/a.txt',
