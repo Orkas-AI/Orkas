@@ -77,7 +77,7 @@ import {
   visitRepositoryFiles,
   createRepositorySearchBudget,
   readIgnoreScope,
-  isIgnoredByScopes,
+  createDirectoryIgnoreMatcher,
   type IgnoreScope,
 } from './repository-search';
 
@@ -1430,6 +1430,7 @@ async function visitFiles(
     if (capped || opts.signal.aborted) return;
     const local = honourIgnores ? readIgnoreScope(dir) : null;
     const scopes = local ? [...inherited, local] : inherited;
+    const isIgnored = createDirectoryIgnoreMatcher(dir, scopes);
     try {
       const entries = await fs.promises.opendir(dir);
       for await (const entry of entries) {
@@ -1438,7 +1439,7 @@ async function visitFiles(
         if (opts.signal.aborted) break;
         if (entry.name === '.git' || (entry.isDirectory() && fallbackDirectoryExcluded(entry.name))) continue;
         const file = path.join(dir, entry.name);
-        if (honourIgnores && isIgnoredByScopes(file, entry.isDirectory(), scopes)) continue;
+        if (honourIgnores && isIgnored(entry.name, entry.isDirectory())) continue;
         if (entry.isDirectory()) await walk(file, scopes);
         else if (entry.isFile() && !fallbackFileExcluded(entry.name)) capped = await visit(file);
       }

@@ -9,7 +9,8 @@ import { PassThrough } from 'node:stream';
 
 import {
   grepRepository,
-  isIgnoredByScopes,
+  isIgnoredByScopes as isIgnoredByAbsolutePath,
+  createDirectoryIgnoreMatcher,
   listRepositoryFiles,
   parseIgnoreRules,
   visitRepositoryFiles,
@@ -145,7 +146,10 @@ describe('repository search interruption', () => {
 // implementation these cases pin. A miss here means `search_files` starts
 // surfacing build output, logs and local config that the project ignored —
 // the model's context fills with noise nobody asked for.
-describe('repository-search › ignore rules', () => {
+describe.each(['absolute', 'directory'] as const)('repository-search › ignore rules (%s)', backend => {
+  const isIgnoredByScopes: typeof isIgnoredByAbsolutePath = backend === 'absolute'
+    ? isIgnoredByAbsolutePath
+    : (file, isDir, scopes) => createDirectoryIgnoreMatcher(path.dirname(file), scopes)(path.basename(file), isDir);
   function scope(dir: string, content: string) {
     return [{ dir, rules: parseIgnoreRules(content) }];
   }
@@ -211,6 +215,15 @@ describe('repository-search › ignore rules', () => {
     expect(isIgnoredByScopes(at('pkg', 'dist'), true, nested)).toBe(true);
     // A sibling tree is governed by its own file, not this one.
     expect(isIgnoredByScopes(at('other', 'dist'), true, nested)).toBe(false);
+  });
+
+  it('applies nested scope overrides in declaration order without leaking to sibling directories', () => {
+    const scopes = [...scope(ROOT, '*.log\n'), ...scope(at('pkg'), '!keep.log\nprivate/\n')];
+    expect(isIgnoredByScopes(at('pkg', 'keep.log'), false, scopes)).toBe(false);
+    expect(isIgnoredByScopes(at('pkg', 'drop.log'), false, scopes)).toBe(true);
+    expect(isIgnoredByScopes(at('peer', 'keep.log'), false, scopes)).toBe(true);
+    expect(isIgnoredByScopes(at('pkg', 'private'), true, scopes)).toBe(true);
+    expect(isIgnoredByScopes(at('pkg', 'private'), false, scopes)).toBe(false);
   });
 
   it('skips comments and blank lines instead of treating them as patterns', () => {

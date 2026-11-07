@@ -422,11 +422,36 @@ export function isIgnoredByScopes(
     const rel = path.relative(scope.dir, absPath);
     if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
     const posix = rel.split(path.sep).join('/');
-    for (const rule of scope.rules) {
-      if (rule.dirOnly && !isDir) continue;
-      if (!rule.re.test(posix)) continue;
-      ignored = !rule.negate;
-    }
+    ignored = applyIgnoreRules(ignored, posix, isDir, scope.rules);
   }
   return ignored;
+}
+
+function applyIgnoreRules(ignored: boolean, relative: string, isDir: boolean, rules: readonly IgnoreRule[]): boolean {
+  for (const rule of rules) {
+    if (rule.dirOnly && !isDir) continue;
+    if (rule.re.test(relative)) ignored = !rule.negate;
+  }
+  return ignored;
+}
+
+/** Prepare inherited ignore scopes once for direct opendir entries in this directory. */
+export function createDirectoryIgnoreMatcher(dir: string, scopes: readonly IgnoreScope[]): (name: string, isDir: boolean) => boolean {
+  const prepared = scopes.flatMap(scope => {
+    const relative = path.relative(scope.dir, dir);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) return [];
+    const prefix = relative ? relative.split(path.sep).join('/') + '/' : '';
+    return [{ prefix, rules: scope.rules, fileRules: scope.rules.filter(rule => !rule.dirOnly) }];
+  });
+  const fileScopes = prepared.filter(scope => scope.fileRules.length > 0);
+  return (name, isDir) => {
+    let ignored = false;
+    for (const scope of isDir ? prepared : fileScopes) {
+      const relative = scope.prefix + name;
+      // Preserve the absolute-path helper's existing relative-path boundary.
+      if (relative.startsWith('..')) continue;
+      ignored = applyIgnoreRules(ignored, relative, isDir, isDir ? scope.rules : scope.fileRules);
+    }
+    return ignored;
+  };
 }
