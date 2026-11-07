@@ -1530,15 +1530,16 @@ function _markdownVisualizationHtml(body) {
     const spec = JSON.parse(body);
     if (!spec || Array.isArray(spec) || typeof spec !== 'object'
         || !Object.hasOwn(spec, 'path')
-        || Object.keys(spec).some(key => key !== 'path' && key !== 'mode')
+        || Object.keys(spec).some(key => key !== 'path' && key !== 'mode' && key !== 'title')
         || (Object.hasOwn(spec, 'mode') && spec.mode !== 'wide')
+        || (Object.hasOwn(spec, 'title') && typeof spec.title !== 'string')
         || typeof spec.path !== 'string'
         || !/^(?:\/(?!\/)|[A-Za-z]:[\\/])/.test(spec.path)
         || /[\u0000-\u001f\u007f]/.test(spec.path)
         || !_HTML_EXT_RE.test(spec.path)) return '';
     // Both default and wide references fit the existing chat preview surface.
     // Hydration and main's normal HTML resolver retain the sandbox boundary.
-    return _markdownHtmlEmbedHtml(_normalizeLocalMediaSrc(spec.path), '');
+    return _markdownHtmlEmbedHtml(_normalizeLocalMediaSrc(spec.path), spec.title || '');
   } catch (_) {
     return '';
   }
