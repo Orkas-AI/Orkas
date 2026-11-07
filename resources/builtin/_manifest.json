@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "54cef74ed7725cbe6967e1a9e1c406caf33ecdea4bf777b5a4e801aa73ed3b20",
+  "content_tree_sha256": "d277e10c20a718aab69407a4bdfb2887d65d084a0a8b33e5604f734c31f9d42c",
   "files": [
     {
       "path": "marketplace/agents/1040b336306f/agent.json",
@@ -704,8 +704,8 @@
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-crawl/scripts/crawl.py",
-      "bytes": 31041,
-      "sha256": "091b6c270b95fd0fd26d78c94671d560cf0dc1bdec729d5bd893eab9a32a8461"
+      "bytes": 32113,
+      "sha256": "55dc0156a6e4ea271ce87170ba7882d24d05d5dfb89df049819a3a873b580706"
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-crawl/scripts/url_safety.py",
@@ -719,8 +719,8 @@
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-crawl/test/test_crawl.py",
-      "bytes": 34031,
-      "sha256": "b6c305a91f61e625194eb64bcf0fc9ef916f158fab1bd5143e56fb1a702454f1"
+      "bytes": 38123,
+      "sha256": "a504fe0750959bd10f44e356fc472d23cc8c36acbe40f2184ea4b6cb77f3f7f4"
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-cwv/scripts/cwv.py",
