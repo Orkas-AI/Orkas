@@ -79,39 +79,42 @@ const opencodeRunBackend: LocalBackend = {
     child.stdin.end(opts.prompt, 'utf8');
 
     const splitter = new LineSplitter();
+    const stdoutLine = (line: string) => {
+      if (exited) return;
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let obj: any;
+      try { obj = JSON.parse(trimmed); }
+      catch {
+        // Non-NDJSON line on stdout — surface so users see CLI's
+        // own logging / startup banner instead of a silent gap.
+        opts.onEvent({ type: 'raw-line', line: trimmed });
+        return;
+      }
+      protocolRecordCount = Math.min(1_000_000, protocolRecordCount + 1);
+      const ev = mapOpencodeEvent(obj);
+      if (ev?.captureSessionId) observedSessionId = ev.captureSessionId;
+      const events = ev?.events || (ev?.event ? [ev.event] : []);
+      for (const event of events) {
+        opts.onEvent(event);
+        if (event.type === 'text-delta' && typeof (event as any).text === 'string') {
+          textOut += (event as any).text as string;
+        }
+        if (event.type === 'status' && (event as any).status === 'usage') {
+          const u = (event as any).usage;
+          if (u && typeof u === 'object') lastUsage = u;
+        }
+      }
+      if (ev?.terminal) {
+        resultStatus = ev.terminal.status;
+        resultError = ev.terminal.error;
+      }
+    };
     child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => {
-      splitter.push(chunk, line => {
-        const trimmed = line.trim();
-        if (!trimmed) return;
-        let obj: any;
-        try { obj = JSON.parse(trimmed); }
-        catch {
-          // Non-NDJSON line on stdout — surface so users see CLI's
-          // own logging / startup banner instead of a silent gap.
-          opts.onEvent({ type: 'raw-line', line: trimmed });
-          return;
-        }
-        protocolRecordCount = Math.min(1_000_000, protocolRecordCount + 1);
-        const ev = mapOpencodeEvent(obj);
-        if (ev?.captureSessionId) observedSessionId = ev.captureSessionId;
-        const events = ev?.events || (ev?.event ? [ev.event] : []);
-        for (const event of events) {
-          opts.onEvent(event);
-          if (event.type === 'text-delta' && typeof (event as any).text === 'string') {
-            textOut += (event as any).text as string;
-          }
-          if (event.type === 'status' && (event as any).status === 'usage') {
-            const u = (event as any).usage;
-            if (u && typeof u === 'object') lastUsage = u;
-          }
-        }
-        if (ev?.terminal) {
-          resultStatus = ev.terminal.status;
-          resultError = ev.terminal.error;
-        }
-      });
-    });
+    child.stdout.on('data', (chunk: string) => splitter.push(chunk, stdoutLine));
+    // EOF may terminate a complete record without a trailing newline. Parse it
+    // through the normal mapper before close publishes the terminal result.
+    child.stdout.on('end', () => splitter.flush(stdoutLine));
 
     const stderrLines = new LineSplitter(64 * 1024);
     const stderrLine = (line: string) => {
