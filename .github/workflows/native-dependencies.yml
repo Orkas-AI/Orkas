@@ -68,6 +68,13 @@ jobs:
           test/renderer/cli-account-usage.test.ts
           test/renderer/local-agents-status.test.ts
           test/renderer/agent-detail-return-navigation.test.ts
+      - name: Verify OpenCode stream termination and recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/local_agents/opencode_backend.test.ts
+          test/main/features/local_agents/opencode_parser.test.ts
+          test/main/features/local_agents/base.test.ts
+          test/main/features/local_agents/watchdog.test.ts
       - name: Verify workbook formulas and interrupted directory recovery
         run: >-
           npm run test:js -- --maxWorkers=1

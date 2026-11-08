@@ -23,6 +23,29 @@ function fixture() {
     process.stdin.on('end', () => {
       const input = Buffer.concat(chunks);
       const args = process.argv.slice(2);
+      const eofMode = args.find(arg => arg.startsWith('--fixture-eof='))?.split('=')[1];
+      if (eofMode) {
+        if (eofMode === 'malformed') {
+          process.stdout.write('{"type":"error","error":');
+          process.exitCode = 1;
+          return;
+        }
+        const failed = eofMode === 'error';
+        const prefix = failed
+          ? { type: 'text', part: { text: 'Partial answer' } }
+          : { type: 'step_finish', part: { tokens: { input: 13, output: 2 } } };
+        process.stdout.write(JSON.stringify(prefix) + '\\n');
+        const record = failed
+          ? { type: 'error', sessionID: 'eof-session', error: { data: { message: 'configured model unavailable' } } }
+          : { type: 'text', sessionID: 'eof-session', part: { text: 'Final answer 中文 🧪' } };
+        const bytes = Buffer.from(JSON.stringify(record));
+        // Independent producer ends at EOF, including a split UTF8 code point.
+        const split = failed ? 17 : bytes.indexOf(Buffer.from('中')) + 1;
+        process.stdout.write(bytes.subarray(0, split));
+        setTimeout(() => process.stdout.write(bytes.subarray(split)), 10);
+        process.exitCode = failed ? 1 : 0;
+        return;
+      }
       if (args.includes('--fixture-silent-fail')) {
         process.stderr.write('startup failed before JSON output\\n');
         process.exitCode = 1;
@@ -118,4 +141,44 @@ describe('OpenCode prompt pipe transport', () => {
     });
     expect(events.some(event => event.type === 'stderr-line')).toBe(false);
   });
+
+  it.each(['success', 'error', 'malformed', 'cancel'] as const)(
+    'retains the final unterminated stdout record before settling %s', async mode => {
+      const events: LocalEvent[] = [];
+      const controller = new AbortController();
+      await opencodeBackend.run({
+        binPath: process.env.ORKAS_TEST_NODE || process.execPath,
+        cwd: fixture(), prompt: 'read then terminate', customArgs: [`--fixture-eof=${mode}`],
+        signal: controller.signal, timeoutMs: 10_000,
+        onEvent: event => {
+          events.push(event);
+          if (mode === 'cancel' && event.type === 'text-delta') controller.abort();
+        },
+      });
+      const terminals = events.filter(event => event.type === 'done');
+      expect(terminals).toHaveLength(1);
+      const done = terminals[0];
+      expect(events.at(-1)).toBe(done);
+      if (mode === 'malformed') {
+        expect(events.filter(event => event.type === 'raw-line').map(event => event.line))
+          .toEqual(['{"type":"error","error":']);
+        expect(done).toMatchObject({ status: 'failed', protocolRecordCount: 0, protocolErrorSeen: false });
+        expect(events.some(event => event.type === 'text-delta')).toBe(false);
+      } else {
+        expect(done.sessionId).toBe('eof-session');
+        expect(events.filter(event => event.type === 'text-delta').map(event => event.text))
+          .toEqual([mode === 'error' ? 'Partial answer' : 'Final answer 中文 🧪']);
+        expect(done.output).toBe(mode === 'error' ? 'Partial answer' : 'Final answer 中文 🧪');
+        if (mode === 'error') {
+          expect(done).toMatchObject({
+            status: 'failed', error: 'configured model unavailable', exitCode: 1,
+            protocolRecordCount: 2, protocolErrorSeen: true,
+          });
+        } else {
+          expect(done.status).toBe(mode === 'cancel' ? 'cancelled' : 'completed');
+          expect(done.usage).toMatchObject({ input: 13, output: 2 });
+        }
+      }
+    },
+  );
 });
