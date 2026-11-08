@@ -1390,8 +1390,12 @@ export async function setAgentCliProjectDir(
 // snapshots that older tolerant reads could persist after a source failure.
 const AGENT_CATALOG_CACHE_VERSION = 4;
 const AGENT_ENRICHED_CACHE_TTL_MS = 2_000;
+// A scan that skipped an unreadable definition is reused only briefly, then
+// retried, so a repaired file reappears without a catalog-root change.
+const AGENT_PARTIAL_CATALOG_TTL_MS = 2_000;
 
-interface AgentListCache { stamp: string; data: Agent[] }
+// `expiresAt` is set only for partial scans; complete scans live until the stamp changes.
+interface AgentListCache { stamp: string; data: Agent[]; expiresAt?: number }
 interface AgentEnrichedCache { specs: Agent[]; uid: string; expiresAt: number; data: Agent[] }
 let _agentListCache: AgentListCache | null = null;
 let _agentEnrichedCache: AgentEnrichedCache | null = null;
@@ -1475,7 +1479,12 @@ const CATALOG_READ_ERROR_CODES = new Set([
   'EMFILE', 'ENFILE', 'ENOSPC', 'EINVAL', 'ENAMETOOLONG', 'ELOOP',
 ]);
 
-function _catalogReadFailure(source: 'custom' | 'marketplace', stage: 'stamp' | 'enumerate' | 'definition', error: unknown): Error {
+function _catalogReadFailure(source: 'custom' | 'marketplace', stage: 'stamp' | 'enumerate', error: unknown): Error {
+  _warnCatalogReadFailure(source, stage, error);
+  return new Error('Agent catalog unavailable');
+}
+
+function _warnCatalogReadFailure(source: 'custom' | 'marketplace', stage: 'stamp' | 'enumerate' | 'definition', error: unknown): void {
   const key = `${source}:${stage}`;
   const now = Date.now();
   const previous = _catalogFailureWarnedAt.get(key);
@@ -1488,7 +1497,6 @@ function _catalogReadFailure(source: 'custom' | 'marketplace', stage: 'stamp' | 
         : typeof code === 'string' && CATALOG_READ_ERROR_CODES.has(code) ? code : 'unknown',
     });
   }
-  return new Error('Agent catalog unavailable');
 }
 
 function _agentDirStamp(): string {
@@ -1554,10 +1562,17 @@ async function _listAgentSpecs(): Promise<Agent[]> {
   const generation = _agentListCacheGeneration;
   const stamp = _agentDirStamp();
   let specs: Agent[];
-  if (_agentListCache && _agentListCache.stamp === stamp) {
+  const now = Date.now();
+  const expiresAt = _agentListCache?.expiresAt;
+  if (
+    _agentListCache && _agentListCache.stamp === stamp
+    // A backwards clock jump must not extend a partial scan's lifetime.
+    && (expiresAt === undefined || (expiresAt > now && expiresAt - now <= AGENT_PARTIAL_CATALOG_TTL_MS))
+  ) {
     specs = _agentListCache.data;
   } else {
     const persisted = _readPersistedAgentCatalog(stamp);
+    let partial = false;
     if (persisted) {
       specs = persisted;
     } else {
@@ -1565,6 +1580,8 @@ async function _listAgentSpecs(): Promise<Agent[]> {
       const seen = new Set<string>();
       const sources = [['marketplace', userMarketplaceAgentsDir(getActiveUserId())], ['custom', CUSTOM_AGENTS_DIR()]] as const;
       for (const [source, dir] of sources) {
+        // An unreadable root hides every Agent in that source, so the catalog
+        // is unknown rather than smaller.
         const entries = (await fsp.readdir(dir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
           if (error?.code === 'ENOENT') return [];
           throw _catalogReadFailure(source, 'enumerate', error);
@@ -1576,10 +1593,14 @@ async function _listAgentSpecs(): Promise<Agent[]> {
           let data: AgentRaw;
           try { data = await readJson<AgentRaw>(full, { strict: true }); }
           catch (error) {
-            // A staging directory may not contain a definition yet. Existing
-            // but unreadable/malformed definitions make the scan incomplete.
+            // A staging directory may not contain a definition yet.
             if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
-            throw _catalogReadFailure(source, 'definition', error);
+            // One unreadable/malformed definition hides only that Agent. Keep
+            // its id reserved so a same-id custom copy cannot take its place.
+            _warnCatalogReadFailure(source, 'definition', error);
+            partial = true;
+            seen.add(e.name);
+            continue;
           }
           const norm = normalizeAgent(data, source);
           if (!norm) continue;
@@ -1603,9 +1624,12 @@ async function _listAgentSpecs(): Promise<Agent[]> {
       // mtime alone cannot detect it: creating agent.json changes the child,
       // not the catalog root. Never republish a pre-invalidation snapshot.
       if (generation !== _agentListCacheGeneration) return _listAgentSpecs();
-      _writePersistedAgentCatalog(stamp, specs);
+      // Never persist a partial scan: a later restart must retry the skipped file.
+      if (!partial) _writePersistedAgentCatalog(stamp, specs);
     }
-    _agentListCache = { stamp, data: specs };
+    _agentListCache = partial
+      ? { stamp, data: specs, expiresAt: Date.now() + AGENT_PARTIAL_CATALOG_TTL_MS }
+      : { stamp, data: specs };
     _agentEnrichedCache = null;
   }
   return specs;

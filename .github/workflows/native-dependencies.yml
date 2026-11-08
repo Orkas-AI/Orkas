@@ -83,6 +83,11 @@ jobs:
           test/main/features/auto_tasks.test.ts
           test/main/model/core-agent/office-batch.test.ts
           test/main/model/core-agent/office-tools.test.ts
+      - name: Verify Agent catalog isolation and recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/agents.test.ts
+          test/main/features/group_chat/agents-index.test.ts
       - name: Verify operator policy Worker, ASAR runtime and write boundaries
         run: >-
           npm run test:js -- --maxWorkers=1
