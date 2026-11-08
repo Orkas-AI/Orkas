@@ -3170,8 +3170,6 @@ describe('agents › list cache invalidation', () => {
     ['marketplace', 'stamp', 'EIO'],
     ['custom', 'enumerate', 'EACCES'],
     ['marketplace', 'enumerate', 'EBUSY'],
-    ['custom', 'definition', 'syntax_error'],
-    ['marketplace', 'definition', 'unknown'],
   ] as const)('retains private-free %s/%s diagnostics for %s without publishing a partial catalog', async (source, stage, code) => {
     const a = await loadAgents();
     const paths = await import('../../../src/main/paths');
@@ -3179,36 +3177,27 @@ describe('agents › list cache invalidation', () => {
     const file = path.join(dir, 'private-agent-canary', 'agent.json');
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const raw = { agent_id: 'private-agent-canary', name: 'Private name canary' };
-    fs.writeFileSync(file, code === 'syntax_error' ? '{private-content-canary' : JSON.stringify(raw));
+    fs.writeFileSync(file, JSON.stringify(raw));
     const warn = loggerSpies.byName.get('agents')!.warn;
     warn.mockClear();
-    const privateError = Object.assign(new Error('private-error-canary'), {
-      code: code === 'unknown' ? 'private-code-canary' : code,
-      path: file,
-    });
+    const privateError = Object.assign(new Error('private-error-canary'), { code, path: file });
     const stamp = fs.statSync.bind(fs);
     const readdir = fs.promises.readdir.bind(fs.promises);
-    const read = fs.promises.readFile.bind(fs.promises);
     const spy = stage === 'stamp'
       ? vi.spyOn(createRequire(import.meta.url)('node:fs'), 'statSync').mockImplementation((...args: any[]) => {
         if (args[0] === dir) throw privateError;
         return (stamp as any)(...args);
       })
-      : stage === 'enumerate'
-        ? vi.spyOn(fs.promises, 'readdir').mockImplementation((...args: any[]) => {
-          if (args[0] === dir) return Promise.reject(privateError);
-          return (readdir as any)(...args);
-        })
-        : vi.spyOn(fs.promises, 'readFile').mockImplementation((...args: any[]) => {
-          if (args[0] === file && code !== 'syntax_error') return Promise.reject(privateError);
-          return (read as any)(...args);
-        });
+      : vi.spyOn(fs.promises, 'readdir').mockImplementation((...args: any[]) => {
+        if (args[0] === dir) return Promise.reject(privateError);
+        return (readdir as any)(...args);
+      });
     syncBuiltinESMExports();
     let now = Date.now();
     const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
     const receipts = () => warn.mock.calls.filter(([message]) => message === 'agent catalog read failed');
     try {
-      // Lists and startup projections share the strict source boundary.
+      // An unreadable root makes the whole source unknown.
       await expect(a.listAgents()).rejects.toThrow('Agent catalog unavailable');
       for (let i = 0; i < 20; i++) await expect(a.listAgentSummaries()).rejects.toThrow('Agent catalog unavailable');
       expect(receipts()).toHaveLength(1);
@@ -3230,10 +3219,79 @@ describe('agents › list cache invalidation', () => {
     expect((await a.listAgents()).some(agent => agent.agent_id === raw.agent_id)).toBe(true);
   });
 
-  it('retains the last complete disk snapshot on a failed refresh and reads the recovered source next time', async () => {
+  it.each([
+    ['custom', 'syntax_error'],
+    ['marketplace', 'unknown'],
+  ] as const)('skips one unreadable %s definition (%s) and keeps every other Agent available', async (source, code) => {
+    writeCustomAgent('a-healthy', { name: 'Healthy' });
+    writeCustomAgent('b-codex', { name: 'Codex', runtime: { kind: 'cli', cli: 'codex' } });
+    const a = await loadAgents();
+    const paths = await import('../../../src/main/paths');
+    const dir = source === 'custom' ? customAgentsDir() : paths.userMarketplaceAgentsDir(TEST_UID);
+    const file = path.join(dir, 'private-agent-canary', 'agent.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const raw = { agent_id: 'private-agent-canary', name: 'Private name canary', runtime: { kind: 'cli', cli: 'codex' } };
+    fs.writeFileSync(file, code === 'syntax_error' ? '{private-content-canary' : JSON.stringify(raw));
+    const warn = loggerSpies.byName.get('agents')!.warn;
+    warn.mockClear();
+    const privateError = Object.assign(new Error('private-error-canary'), { code: 'private-code-canary', path: file });
+    const read = fs.promises.readFile.bind(fs.promises);
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((...args: any[]) => {
+      if (args[0] === file && code !== 'syntax_error') return Promise.reject(privateError);
+      return (read as any)(...args);
+    });
+    syncBuiltinESMExports();
+    let now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const receipts = () => warn.mock.calls.filter(([message]) => message === 'agent catalog read failed');
+    const brokenReads = () => spy.mock.calls.filter(([target]) => target === file).length;
+    const ids = (rows: Array<{ agent_id: string }>) => rows.map(agent => agent.agent_id).sort();
+    try {
+      expect(ids(await a.listAgents())).toEqual(['a-healthy', 'b-codex']);
+      for (let i = 0; i < 20; i++) expect(ids(await a.listAgentSummaries())).toEqual(['a-healthy', 'b-codex']);
+      expect(ids(await a.listAgentSearchListings())).toEqual(['a-healthy', 'b-codex']);
+      // The partial scan is reused within its retry window instead of rereading per call.
+      expect(brokenReads()).toBe(1);
+      expect(receipts()).toHaveLength(1);
+      expect(receipts()[0][1]).toEqual({ source, stage: 'definition', error_code: code });
+      now += 59_999;
+      expect(ids(await a.listAgents())).toEqual(['a-healthy', 'b-codex']);
+      expect(brokenReads()).toBe(2);
+      expect(receipts()).toHaveLength(1);
+      now += 2_001;
+      expect(ids(await a.listAgents())).toEqual(['a-healthy', 'b-codex']);
+      expect(receipts()).toHaveLength(2);
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private-|Private name|private-content/);
+      expect(fs.existsSync(paths.userAgentCatalogCacheFile(TEST_UID))).toBe(false);
+    } finally {
+      clock.mockRestore();
+      spy.mockRestore();
+      syncBuiltinESMExports();
+      fs.writeFileSync(file, JSON.stringify(raw));
+    }
+    // The mocked clock ran ahead; returning to real time is a backwards jump
+    // that must expire the partial scan rather than extend it.
+    expect(ids(await a.listAgents())).toEqual(['a-healthy', 'b-codex', 'private-agent-canary']);
+    expect(fs.existsSync(paths.userAgentCatalogCacheFile(TEST_UID))).toBe(true);
+  });
+
+  it('keeps an unreadable marketplace id reserved instead of surfacing a same-id custom copy', async () => {
+    const paths = await import('../../../src/main/paths');
+    const file = path.join(paths.userMarketplaceAgentsDir(TEST_UID), 'shadowed', 'agent.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{broken');
+    writeCustomAgent('shadowed', { name: 'Custom copy' });
+    writeCustomAgent('other', { name: 'Other' });
+    const a = await loadAgents();
+    expect((await a.listAgents()).map(agent => agent.agent_id)).toEqual(['other']);
+  });
+
+  it('keeps healthy Agents and the last complete snapshot when one definition fails, then reads the repaired file after the retry window', async () => {
+    writeCustomAgent('healthy', { name: 'Healthy' });
     writeCustomAgent('recoverable', { name: 'Old name' });
     const a = await loadAgents();
-    expect((await a.listAgents())[0].name).toBe('Old name');
+    const nameOf = (rows: Array<{ agent_id: string; name: string }>) => rows.find(agent => agent.agent_id === 'recoverable')?.name;
+    expect(nameOf(await a.listAgents())).toBe('Old name');
     const paths = await import('../../../src/main/paths');
     const cache = paths.userAgentCatalogCacheFile(TEST_UID);
     const snapshot = fs.readFileSync(cache, 'utf8');
@@ -3249,12 +3307,14 @@ describe('agents › list cache invalidation', () => {
     });
     syncBuiltinESMExports();
     try {
-      await expect(a.listAgents()).rejects.toThrow('Agent catalog unavailable');
-      await expect(a.listAgentSummaries()).rejects.toThrow('Agent catalog unavailable');
+      expect((await a.listAgents()).map(agent => agent.agent_id)).toEqual(['healthy']);
+      expect((await a.listAgentSummaries()).map(agent => agent.agent_id)).toEqual(['healthy']);
       expect(fs.readFileSync(cache, 'utf8')).toBe(snapshot);
     } finally { spy.mockRestore(); syncBuiltinESMExports(); }
-    expect((await a.listAgents())[0].name).toBe('Fresh name');
-    expect(JSON.parse(fs.readFileSync(cache, 'utf8')).data[0].name).toBe('Fresh name');
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2_001);
+    try { expect(nameOf(await a.listAgents())).toBe('Fresh name'); }
+    finally { clock.mockRestore(); }
+    expect(JSON.parse(fs.readFileSync(cache, 'utf8')).data.find((agent: any) => agent.agent_id === 'recoverable').name).toBe('Fresh name');
   });
 
   it.each([2, 3])('rebuilds a v%s catalog instead of trusting an obsolete or poisoned empty snapshot', async (version) => {
@@ -3289,7 +3349,7 @@ describe('agents › list cache invalidation', () => {
     expect(JSON.parse(fs.readFileSync(cacheFile, 'utf8')).version).toBe(4);
   });
 
-  it.each(['EACCES', 'EIO', 'malformed'])('does not publish a partial catalog after %s and recovers without manual invalidation', async (fault) => {
+  it.each(['EACCES', 'EIO', 'malformed'])('serves the healthy Agents without publishing a partial catalog after %s and recovers without manual invalidation', async (fault) => {
     writeCustomAgent('a-healthy', { name: 'Healthy' });
     writeCustomAgent('z-recoverable', { name: 'Recoverable' });
     const file = path.join(customAgentsDir(), 'z-recoverable', 'agent.json');
@@ -3312,7 +3372,7 @@ describe('agents › list cache invalidation', () => {
       fs.writeFileSync(file, '{broken');
     }
     try {
-      await expect(a.listAgents()).rejects.toThrow('Agent catalog unavailable');
+      expect((await a.listAgents()).map(agent => agent.agent_id)).toEqual(['a-healthy']);
       expect(fs.existsSync(cache)).toBe(false);
       expect(fs.readFileSync(path.join(customAgentsDir(), 'a-healthy', 'agent.json'), 'utf8')).toContain('Healthy');
     } finally {
@@ -3320,7 +3380,9 @@ describe('agents › list cache invalidation', () => {
       syncBuiltinESMExports();
       fs.writeFileSync(file, source);
     }
-    expect((await a.listAgents()).map(agent => agent.agent_id).sort()).toEqual(['a-healthy', 'z-recoverable']);
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2_001);
+    try { expect((await a.listAgents()).map(agent => agent.agent_id).sort()).toEqual(['a-healthy', 'z-recoverable']); }
+    finally { clock.mockRestore(); }
     expect(fs.readFileSync(file, 'utf8')).toBe(source);
     vi.resetModules();
     (await import('../../../src/main/features/users')).activateUser(TEST_UID);
@@ -3347,9 +3409,11 @@ describe('agents › list cache invalidation', () => {
     expect((await restarted.listAgents())[0].name).toBe('Persisted Agent');
 
     restarted.clearAgentListCache();
-    await expect(restarted.listAgents()).rejects.toThrow('Agent catalog unavailable');
+    expect(await restarted.listAgents()).toEqual([]);
     writeCustomAgent('persisted-agent', { name: 'Recovered Agent' });
-    expect((await restarted.listAgents())[0].name).toBe('Recovered Agent');
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2_001);
+    try { expect((await restarted.listAgents())[0].name).toBe('Recovered Agent'); }
+    finally { clock.mockRestore(); }
   });
 
   it('picks up newly created agents on next listAgents', async () => {

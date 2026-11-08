@@ -601,7 +601,7 @@ describe('group_chat bus integration › unexpected host-turn failure recovery',
     await import('../../../../src/main/features/group_chat');
   }, 60_000);
 
-  it.each(['catalog', 'bindings'])('stops before inference on %s read failure and retries with the original project scope', async (fault) => {
+  it.each(['bindings'])('stops before inference on %s read failure and retries with the original project scope', async (fault) => {
     const paths = await import('../../../../src/main/paths');
     const projects = await import('../../../../src/main/features/projects');
     const chats = await import('../../../../src/main/features/chats');
@@ -621,8 +621,7 @@ describe('group_chat bus integration › unexpected host-turn failure recovery',
     cidsToDrop.add(cid);
     const bindingFile = paths.projectBindingsFile(TEST_UID, pid);
     const before = fs.readFileSync(bindingFile, 'utf8');
-    const target = fault === 'catalog' ? paths.agentDefinitionFile(TEST_UID, AGENT_ID)
-      : bindingFile;
+    const target = bindingFile;
     let active = false;
     const read = fs.promises.readFile.bind(fs.promises);
     const readSpy = vi.spyOn(fs.promises, 'readFile').mockImplementation((...args: any[]) => {
@@ -670,6 +669,73 @@ describe('group_chat bus integration › unexpected host-turn failure recovery',
     expect(fs.readFileSync(bindingFile, 'utf8')).toBe(before);
     expect(fs.readdirSync(paths.userAgentsDir(TEST_UID)).sort()).toEqual([AGENT_ID, 'unbound-fixture'].sort());
     expect((await groupChat.readMessages(TEST_UID, cid)).some((row: any) => row.text === 'Recovered within project')).toBe(true);
+    expect((await state.readMembers(TEST_UID, cid)).actors.find(actor => actor.id === 'commander')?.in_flight).not.toBe(true);
+  }, 10_000);
+
+  // Scenario: one bound Agent's definition becomes unreadable mid-session.
+  // Only that Agent drops out; Commander still runs with the other project
+  // member, and no binding or Agent file is rewritten to "repair" the gap.
+  it('keeps the Commander turn running with the remaining project Agents when one bound definition is unreadable', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const projects = await import('../../../../src/main/features/projects');
+    const chats = await import('../../../../src/main/features/chats');
+    const agents = await import('../../../../src/main/features/agents');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const publishing = await import('../../../../src/main/features/runtime_content_publish');
+    const project = await projects.createProject(TEST_UID, 'Partial roster');
+    if (!project.ok) throw new Error('Project fixture failed');
+    const pid = project.project.project_id;
+    const secondDir = paths.agentDir(TEST_UID, SECOND_AGENT_ID);
+    fs.mkdirSync(secondDir, { recursive: true });
+    fs.writeFileSync(path.join(secondDir, 'agent.json'), JSON.stringify({
+      agent_id: SECOND_AGENT_ID, name: SECOND_AGENT_NAME, description: 'Finds sources', created_at: 't', updated_at: 't',
+    }));
+    await projects.addAgentBinding(TEST_UID, pid, AGENT_ID);
+    await projects.addAgentBinding(TEST_UID, pid, SECOND_AGENT_ID);
+    const outsiderDir = paths.agentDir(TEST_UID, 'unbound-fixture');
+    fs.mkdirSync(outsiderDir, { recursive: true });
+    fs.writeFileSync(path.join(outsiderDir, 'agent.json'), JSON.stringify({ agent_id: 'unbound-fixture', name: 'UnboundFixture' }));
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID, { kind: 'normal', projectId: pid });
+    cidsToDrop.add(cid);
+    const bindingFile = paths.projectBindingsFile(TEST_UID, pid);
+    const before = fs.readFileSync(bindingFile, 'utf8');
+    const target = paths.agentDefinitionFile(TEST_UID, AGENT_ID);
+    let active = false;
+    const read = fs.promises.readFile.bind(fs.promises);
+    const readSpy = vi.spyOn(fs.promises, 'readFile').mockImplementation((...args: any[]) => {
+      if (active && args[0] === target) return Promise.reject(Object.assign(new Error('private fixture read failure'), { code: 'EACCES' }));
+      return (read as any)(...args);
+    });
+    syncBuiltinESMExports();
+    const enter = publishing.enterRuntimeContentTurn;
+    const gateSpy = vi.spyOn(publishing, 'enterRuntimeContentTurn').mockImplementationOnce(async (userId) => {
+      const release = await enter(userId);
+      agents.clearAgentListCache();
+      active = true;
+      return release;
+    });
+    _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: 'Handled with the remaining Agent' }]);
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Complete the scoped task' });
+      await waitForQuiescent(TEST_UID, cid, 4000);
+    } finally {
+      active = false;
+      readSpy.mockRestore();
+      syncBuiltinESMExports();
+      gateSpy.mockRestore();
+    }
+    expect(_recordedCalls).toHaveLength(1);
+    expect(_recordedCalls[0].systemPrompt).toContain(`id: ${SECOND_AGENT_ID}`);
+    expect(_recordedCalls[0].systemPrompt).not.toContain(`id: ${AGENT_ID}`);
+    expect(_recordedCalls[0].systemPrompt).not.toContain('UnboundFixture');
+    const rows = await groupChat.readMessages(TEST_UID, cid);
+    expect(rows.filter((row: any) => row.failure_code === 'worker_turn_exception')).toHaveLength(0);
+    expect(rows.some((row: any) => row.text === 'Handled with the remaining Agent')).toBe(true);
+    expect(hostErrorLog.mock.calls.filter(call => call[0] === 'worker turn failed')).toHaveLength(0);
+    expect(fs.readFileSync(bindingFile, 'utf8')).toBe(before);
+    expect(fs.readdirSync(paths.userAgentsDir(TEST_UID)).sort()).toEqual([AGENT_ID, SECOND_AGENT_ID, 'unbound-fixture'].sort());
     expect((await state.readMembers(TEST_UID, cid)).actors.find(actor => actor.id === 'commander')?.in_flight).not.toBe(true);
   }, 10_000);
 
