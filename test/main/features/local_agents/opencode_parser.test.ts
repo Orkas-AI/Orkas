@@ -454,6 +454,16 @@ describe('local_agents/backends/opencode › 1.x and 2.x run command boundaries'
     expect(args.slice(-customArgs.length)).toEqual(customArgs);
   });
 
+  it('keeps the private server when server-like prompt text follows the argument terminator', () => {
+    const args = buildOpencodeArgs({
+      prompt: 'hi', cwd: selected, cliFlags: parseCliHelpFlags(OPENCODE_2_RUN_HELP),
+      customArgs: ['--', '--server', 'https://opencode.example:4096'],
+    });
+    expect(args).toEqual([
+      'run', '--auto', '--format', 'json', '--standalone', '--', '--server', 'https://opencode.example:4096',
+    ]);
+  });
+
   it('sends neither version-specific flag when help discovery failed', () => {
     expect(buildOpencodeArgs({ prompt: 'hi', cwd: selected, cliFlags: [] })).toEqual([
       'run', '--auto', '--format', 'json',

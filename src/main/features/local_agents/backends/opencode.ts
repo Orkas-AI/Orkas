@@ -260,7 +260,10 @@ function opencodeRunShape(opts: Pick<BackendRunOptions, 'cliFlags' | 'customArgs
   projectDirFlag: boolean;
   standalone: boolean;
 } {
-  const customServerMode = (opts.customArgs || []).some(arg => arg === '--standalone' || arg === '--server'
+  const customArgs = opts.customArgs || [];
+  const terminator = customArgs.indexOf('--');
+  const optionArgs = terminator < 0 ? customArgs : customArgs.slice(0, terminator);
+  const customServerMode = optionArgs.some(arg => arg === '--standalone' || arg === '--server'
     || arg.startsWith('--standalone=') || arg.startsWith('--server='));
   return {
     projectDirFlag: opts.cliFlags === undefined || opts.cliFlags.includes('--dir'),
