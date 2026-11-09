@@ -251,6 +251,15 @@ Native warnings remain a separate review result. Real permission UI, other-platf
   与 spawn cwd 不一致，任务会静默写入旧目录。命令构造必须过滤 custom args 中拆分或
   等号形式的旧 `--dir`，只传一个宿主选择的绝对目录；spawn 环境同步 `PWD`，并由测试
   分别固定参数唯一性、环境值及 result-only 协议形状。
+- OpenCode 2.x (verified by the source canary with 2.2.6) rejects the removed
+  `run --dir` flag and selects the directory from `PWD ?? process.cwd()`.
+  Pass `--dir` only when `run --help` lists it; otherwise set the selected
+  `PWD` on every platform. When help lists `--standalone`, use a private
+  server for runs and model discovery so the per-run bridge environment is
+  available and discovery leaves no shared background service. Preserve an
+  explicit saved `--standalone` or `--server` choice without adding a second
+  server mode. Accept 2.x `error.message` as well as 1.x `error.data.message`.
+  The regression fixtures use released 1.19.5 and 2.2.6 help text.
 - ACP 不能只测解析函数：真实 NDJSON 子进程在 initialize acknowledgement 后只给
   100 ms 接收 `session/new`，由此发现固定 250 ms fallback 会让快速服务端先行退出。
   后端现在收到初始化确认即发送且保持 one-shot，timer 只用于兼容不回确认的旧实现。
@@ -394,6 +403,8 @@ npm run benchmark:local-agents -- --agents codex --k 1 --no-save
    同时存在时 custom override 胜出并标记 explicit。两种情况首轮都不得弹目录表单。
 3. **真实启动边界**：详情页显示的目录、唯一宿主 `--dir`、child `process.cwd()` 与 POSIX
    `PWD` 必须一致；custom args 的 `--dir value`/`--dir=value` 不能覆盖它。
+   For 2.x, omit `--dir`; the selected directory, child cwd and PWD (including
+   Windows) must match, with `--standalone` unless a saved server choice exists.
 4. **失效恢复**：Agent 保存目录在首轮前失效，或 conversation cwd 在后续轮次前被移动、
    删除/变成文件时，都不得启动 child 或静默 fallback；清掉 stale cwd/session 后给出可重试
    `project_dir` 表单。
@@ -411,6 +422,10 @@ npm run benchmark:local-agents -- --agents codex --k 1 --no-save
 canary 应在隔离临时目录用 OpenCode 1.18.x 复核详情 workspace/custom、会话切换、实际
 cwd/PWD/`--dir`、result-only 命令/文件行和刷新后展开；未执行该付费/认证 smoke 时不得把
 parser 或 fake E2E 描述成真实模型验证。
+For 2.x, also verify the bridge with an already-running shared service, correct
+session directory, no remaining serve process after cancellation, and no shared
+service started by model discovery. Model-backed canaries require separate
+provider authorization; deterministic fixtures do not prove live model access.
 
 ## CLI 上下文协议
 

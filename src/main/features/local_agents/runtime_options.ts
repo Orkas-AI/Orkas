@@ -677,10 +677,11 @@ async function discover(entry: LocalCliEntry, cwd: string, force: boolean, custo
     return out;
   }
   if (entry.type === 'opencode') {
-    const [models, help] = await Promise.all([
-      captureCli(entry, ['models'], cwd),
-      captureCli(entry, ['run', '--help'], cwd),
-    ]);
+    const help = await captureCli(entry, ['run', '--help'], cwd);
+    // OpenCode 2 `models` otherwise starts a shared background service that
+    // keeps running after discovery; 1.x has no `--standalone`.
+    const models = await captureCli(entry,
+      supportedFlags(help).includes('--standalone') ? ['models', '--standalone'] : ['models'], cwd);
     out.models = parseOpenCodeModels(models.stdout);
     out.status = models.ok || help.ok ? (models.ok && help.ok ? 'ready' : 'partial') : 'unavailable';
     out.thinking_kind = 'variant';
