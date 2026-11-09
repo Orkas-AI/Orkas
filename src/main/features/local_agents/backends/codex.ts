@@ -670,95 +670,96 @@ export const codexBackend: LocalBackend = {
 
     // ─── stdout JSON-RPC framing ─────────────────────────────────────
     const splitter = new LineSplitter();
+    const stdoutLine = (line: string): void => {
+      if (exited) return;
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let env: any;
+      try { env = JSON.parse(trimmed); }
+      catch {
+        // codex stdout is supposed to be pure JSON-RPC; a non-JSON
+        // line here means the binary logged something directly to
+        // stdout (rare, but diagnostic-worthy when it happens — we
+        // were swallowing these before).
+        if (!exited) opts.onEvent({ type: 'raw-line', line: trimmed });
+        return;
+      }
+      // Response (matches a pending request by id).
+      if (env && typeof env.id === 'number' && pending.has(env.id)) {
+        const p = pending.get(env.id)!;
+        pending.delete(env.id);
+        if (env.error) {
+          p.reject(new Error(`${p.method}: ${env.error.message || 'rpc error'} (code=${env.error.code ?? 0})`));
+        } else {
+          p.resolve(env.result);
+        }
+        return;
+      }
+      // App-server callbacks (method + id) are requests, not notifications,
+      // and every one must receive a JSON-RPC response. Silently treating a
+      // request added by a newer CLI as a notification leaves that CLI
+      // waiting forever. Known permission methods use the host bridge;
+      // unknown methods fail fast and let the runner quarantine/fallback.
+      if (env && env.id !== undefined && typeof env.method === 'string') {
+        if (CODEX_PERMISSION_REQUEST_METHODS.has(env.method)) {
+          void respondToServerRequest(env).catch((err) => {
+            log.warn('codex permission response failed', { error: logErrorSummary(err) });
+            sendLine({
+              jsonrpc: '2.0',
+              id: env.id,
+              error: { code: -32603, message: 'Permission request could not be completed.' },
+            });
+          });
+        } else if (env.method === CODEX_USER_INPUT_REQUEST_METHOD) {
+          const controller = new AbortController();
+          userInputRequests.set(env.id, controller);
+          void respondToUserInputRequest(env, controller.signal).catch((err) => {
+            if (controller.signal.aborted) return;
+            log.warn('codex user-input response failed', { error: logErrorSummary(err) });
+            sendLine({
+              jsonrpc: '2.0',
+              id: env.id,
+              error: { code: -32603, message: 'User input request could not be completed.' },
+            });
+          }).finally(() => {
+            if (userInputRequests.get(env.id) === controller) userInputRequests.delete(env.id);
+            inputCancellations.delete(env.id);
+          });
+        } else if (env.method === CODEX_MCP_ELICITATION_METHOD) {
+          void respondToMcpElicitation(env).catch((err) => {
+            log.warn('codex MCP elicitation response failed', { error: logErrorSummary(err) });
+            // Stay inside the elicitation contract. A JSON-RPC error here is
+            // exactly what made Codex report a rejection the user never made.
+            sendLine({ jsonrpc: '2.0', id: env.id, result: { action: 'decline' } });
+          });
+        } else if (CODEX_OPTIONAL_SERVER_REQUEST_METHODS.has(env.method)) {
+          // These callbacks require an explicit client capability or a
+          // feature Orkas did not register (dynamic tools, openai forms,
+          // auth/attestation). Reply immediately so Codex can degrade; an
+          // absent optional integration must not wedge or kill the turn.
+          sendLine({
+            jsonrpc: '2.0',
+            id: env.id,
+            error: { code: -32601, message: 'Optional Codex callback is not supported by Orkas.' },
+          });
+        } else {
+          sendLine({
+            jsonrpc: '2.0',
+            id: env.id,
+            error: { code: -32601, message: 'Unsupported Codex app-server request.' },
+          });
+          failProtocol(`unsupported Codex app-server request: ${env.method}`);
+        }
+        return;
+      }
+      // Notification (no id, has method).
+      if (env && typeof env.method === 'string') {
+        handleNotification(env.method, env.params || {});
+      }
+    };
     child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => {
-      splitter.push(chunk, line => {
-        const trimmed = line.trim();
-        if (!trimmed) return;
-        let env: any;
-        try { env = JSON.parse(trimmed); }
-        catch {
-          // codex stdout is supposed to be pure JSON-RPC; a non-JSON
-          // line here means the binary logged something directly to
-          // stdout (rare, but diagnostic-worthy when it happens — we
-          // were swallowing these before).
-          if (!exited) opts.onEvent({ type: 'raw-line', line: trimmed });
-          return;
-        }
-        // Response (matches a pending request by id).
-        if (env && typeof env.id === 'number' && pending.has(env.id)) {
-          const p = pending.get(env.id)!;
-          pending.delete(env.id);
-          if (env.error) {
-            p.reject(new Error(`${p.method}: ${env.error.message || 'rpc error'} (code=${env.error.code ?? 0})`));
-          } else {
-            p.resolve(env.result);
-          }
-          return;
-        }
-        // App-server callbacks (method + id) are requests, not notifications,
-        // and every one must receive a JSON-RPC response. Silently treating a
-        // request added by a newer CLI as a notification leaves that CLI
-        // waiting forever. Known permission methods use the host bridge;
-        // unknown methods fail fast and let the runner quarantine/fallback.
-        if (env && env.id !== undefined && typeof env.method === 'string') {
-          if (CODEX_PERMISSION_REQUEST_METHODS.has(env.method)) {
-            void respondToServerRequest(env).catch((err) => {
-              log.warn('codex permission response failed', { error: logErrorSummary(err) });
-              sendLine({
-                jsonrpc: '2.0',
-                id: env.id,
-                error: { code: -32603, message: 'Permission request could not be completed.' },
-              });
-            });
-          } else if (env.method === CODEX_USER_INPUT_REQUEST_METHOD) {
-            const controller = new AbortController();
-            userInputRequests.set(env.id, controller);
-            void respondToUserInputRequest(env, controller.signal).catch((err) => {
-              if (controller.signal.aborted) return;
-              log.warn('codex user-input response failed', { error: logErrorSummary(err) });
-              sendLine({
-                jsonrpc: '2.0',
-                id: env.id,
-                error: { code: -32603, message: 'User input request could not be completed.' },
-              });
-            }).finally(() => {
-              if (userInputRequests.get(env.id) === controller) userInputRequests.delete(env.id);
-              inputCancellations.delete(env.id);
-            });
-          } else if (env.method === CODEX_MCP_ELICITATION_METHOD) {
-            void respondToMcpElicitation(env).catch((err) => {
-              log.warn('codex MCP elicitation response failed', { error: logErrorSummary(err) });
-              // Stay inside the elicitation contract. A JSON-RPC error here is
-              // exactly what made Codex report a rejection the user never made.
-              sendLine({ jsonrpc: '2.0', id: env.id, result: { action: 'decline' } });
-            });
-          } else if (CODEX_OPTIONAL_SERVER_REQUEST_METHODS.has(env.method)) {
-            // These callbacks require an explicit client capability or a
-            // feature Orkas did not register (dynamic tools, openai forms,
-            // auth/attestation). Reply immediately so Codex can degrade; an
-            // absent optional integration must not wedge or kill the turn.
-            sendLine({
-              jsonrpc: '2.0',
-              id: env.id,
-              error: { code: -32601, message: 'Optional Codex callback is not supported by Orkas.' },
-            });
-          } else {
-            sendLine({
-              jsonrpc: '2.0',
-              id: env.id,
-              error: { code: -32601, message: 'Unsupported Codex app-server request.' },
-            });
-            failProtocol(`unsupported Codex app-server request: ${env.method}`);
-          }
-          return;
-        }
-        // Notification (no id, has method).
-        if (env && typeof env.method === 'string') {
-          handleNotification(env.method, env.params || {});
-        }
-      });
-    });
+    child.stdout.on('data', (chunk: string) => splitter.push(chunk, stdoutLine));
+    child.stdout.on('end', () => splitter.flush(stdoutLine));
 
     const stderrLines = new LineSplitter(64 * 1024);
     const stderrLine = (raw: string) => {
