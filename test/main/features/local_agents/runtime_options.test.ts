@@ -572,6 +572,30 @@ process.stdin.on('data', chunk => {
     });
   });
 
+  it.each([
+    ['2.x', '  --standalone    Run with a private server instead of the background service', ['models', '--standalone']],
+    ['1.x', '      --dir          directory to run in', ['models']],
+  ] as const)('lists OpenCode %s models without starting a shared background service', async (_line, helpLine, expected) => {
+    const dir = makeTempDir();
+    const trace = path.join(dir, 'models-argv.json');
+    const binPath = writeFakeCli(dir, `
+const args = process.argv.slice(2);
+if (args[0] === 'run' && args.includes('--help')) {
+  process.stdout.write('  --model, -m string    Model to use\\n' + ${JSON.stringify(helpLine)} + '\\n');
+} else if (args[0] === 'models') {
+  require('node:fs').writeFileSync(${JSON.stringify(trace)}, JSON.stringify(args));
+  process.stdout.write('opencode/big-pickle\\n');
+} else {
+  process.exitCode = 2;
+}
+`);
+
+    const options = await getLocalCliRuntimeOptions(entry('opencode', binPath), dir, { force: true });
+
+    expect(JSON.parse(fs.readFileSync(trace, 'utf8'))).toEqual(expected);
+    expect(options).toMatchObject({ status: 'ready', models: [{ id: 'opencode/big-pickle' }], can_select_model: true });
+  }, 10_000);
+
   it('kills an oversized catalog and returns only sanitized partial metadata', async () => {
     const dir = makeTempDir();
     const binPath = writeFakeCli(dir, `

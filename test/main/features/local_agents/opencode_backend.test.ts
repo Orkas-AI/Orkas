@@ -56,7 +56,10 @@ function fixture() {
         process.exitCode = 1;
         return;
       }
-      const text = JSON.stringify({ hash: createHash('sha256').update(input).digest('hex'), bytes: input.length, args });
+      const text = JSON.stringify({
+        hash: createHash('sha256').update(input).digest('hex'), bytes: input.length, args,
+        pwd: process.env.PWD ?? null, cwd: process.cwd(),
+      });
       process.stdout.write(JSON.stringify({ type: 'text', part: { text } }) + '\\n');
       if (args.includes('--fixture-wait')) { setInterval(() => {}, 1000); return; }
       process.exitCode = args.includes('--fixture-fail') ? 7 : 0;
@@ -89,6 +92,32 @@ describe('OpenCode prompt pipe transport', () => {
       '--model', 'provider/model', '--variant', 'high', '--dir', cwd, '--title', 'fixture',
     ]);
     expect(events.find(event => event.type === 'process-info')?.args).not.toContain(prompt);
+  });
+
+  it('starts a 2.x run in the selected directory through PWD, without the rejected --dir', async () => {
+    const cwd = fixture();
+    const inheritedPwd = process.env.PWD;
+    // A stale launch directory must not win; 2.x reads PWD before process.cwd().
+    process.env.PWD = os.tmpdir();
+    const events: LocalEvent[] = [];
+    try {
+      await opencodeBackend.run({
+        binPath: process.env.ORKAS_TEST_NODE || process.execPath,
+        cwd, prompt: 'where am I', customArgs: ['--dir', '/stale/project'],
+        cliFlags: ['--continue', '--session', '--model', '--format', '--auto', '--standalone', '--server'],
+        signal: new AbortController().signal, timeoutMs: 10_000,
+        onEvent: event => events.push(event),
+      });
+    } finally {
+      if (inheritedPwd === undefined) delete process.env.PWD;
+      else process.env.PWD = inheritedPwd;
+    }
+    const done = events.find(event => event.type === 'done');
+    expect(done?.status).toBe('completed');
+    const result = JSON.parse(String(done?.output));
+    expect(result.args).toEqual(['--auto', '--format', 'json', '--standalone']);
+    expect(result.pwd).toBe(path.resolve(cwd));
+    expect(fs.realpathSync(result.cwd)).toBe(fs.realpathSync(cwd));
   });
 
   it.each(['cancel', 'fail'] as const)('preserves one terminal result when the pipe consumer ends by %s', async (mode) => {

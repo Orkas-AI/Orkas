@@ -3,7 +3,7 @@
  *
  * OpenCode runs through its one-shot NDJSON transport in automatic mode:
  *
- *   opencode run --auto --format json --dir <absolute-cwd> [--session <id>]
+ *   opencode run --auto --format json [--standalone] [--dir <absolute-cwd>] [--session <id>]
  *
  * The run protocol cannot carry an interactive permission decision back to
  * the CLI. Orkas therefore treats this adapter as fixed full access instead
@@ -13,7 +13,12 @@
  *   - Prompt is sent over stdin, avoiding OS command-line length limits and
  *     keeping user content out of process arguments.
  *   - The selected project directory is passed explicitly because OpenCode
- *     otherwise prefers an inherited PWD over the process cwd.
+ *     otherwise prefers an inherited PWD over the process cwd. 1.x takes
+ *     `--dir`; 2.x removed it from `run` and rejects the whole invocation, so
+ *     the flag follows `run --help` and PWD carries the directory instead.
+ *   - 2.x `run` attaches to a shared background service when one is running.
+ *     That service never receives this run's environment (Orkas bridge MCP
+ *     config, PWD), so 2.x gets `--standalone`: a private per-run server.
  *   - Model selection is left to OpenCode's own configuration.
  *   - Resume: `--session <id>` (different flag name from claude).
  *   - Output: NDJSON events on stdout. We care about:
@@ -42,7 +47,9 @@ const log = createLogger('local-agents:opencode');
 const opencodeRunBackend: LocalBackend = {
   async run(opts: BackendRunOptions): Promise<void> {
     const args = buildOpencodeArgs(opts);
-    const env = buildOpencodeEnv(opts.bridge);
+    const env = buildOpencodeEnv(
+      opts.bridge, process.env, opencodeRunShape(opts).projectDirFlag ? undefined : opts.cwd,
+    );
     const child = spawnCli(opts.binPath, args, opts.cwd, env);
     const detachAbort = bindAbort(child, opts.signal);
     const tail = new StderrTail();
@@ -183,8 +190,12 @@ export const opencodeBackend: LocalBackend = opencodeRunBackend;
 export function buildOpencodeEnv(
   bridge: BackendRunOptions['bridge'],
   inherited: NodeJS.ProcessEnv = process.env,
+  projectDir?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...inherited, OPENCODE_PERMISSION: JSON.stringify('allow') };
+  // Without `--dir`, OpenCode resolves `process.env.PWD ?? process.cwd()` on
+  // every platform. spawnCli syncs PWD on POSIX only, so set it here as well.
+  if (projectDir) env.PWD = path.resolve(projectDir);
   if (!bridge) return env;
   const raw = inherited.OPENCODE_CONFIG_CONTENT || '{}';
   let config: Record<string, unknown>;
@@ -219,24 +230,45 @@ export function buildOpencodeEnv(
 }
 
 export function buildOpencodeArgs(opts: Pick<BackendRunOptions,
-  'resumeSessionId' | 'customArgs' | 'prompt' | 'modelOverride' | 'thinkingLevel' | 'cwd'
+  'resumeSessionId' | 'customArgs' | 'prompt' | 'modelOverride' | 'thinkingLevel' | 'cwd' | 'cliFlags'
 >): string[] {
+  const shape = opencodeRunShape(opts);
   const args = [
     'run',
     '--auto',
     '--format', 'json',
   ];
+  if (shape.standalone) args.push('--standalone');
   if (opts.resumeSessionId) args.push('--session', opts.resumeSessionId);
   if (opts.modelOverride) args.push('--model', opts.modelOverride);
   if (opts.thinkingLevel) args.push('--variant', opts.thinkingLevel);
   // Put the host-owned flag before custom arguments so a user-supplied `--`
   // terminator cannot turn it into prompt text. Stale custom --dir variants
-  // are removed below, so there is still exactly one authoritative value.
-  args.push('--dir', path.resolve(opts.cwd));
+  // are removed below, so there is at most one authoritative value.
+  if (shape.projectDirFlag) args.push('--dir', path.resolve(opts.cwd));
   if (opts.customArgs && opts.customArgs.length) {
     args.push(...withoutCustomProjectDir(opts.customArgs));
   }
   return args;
+}
+
+/** `run --help` is authoritative for these flags (compatibility.ts). Without
+ * discovered flags, keep the 1.x contract. A failed probe (`[]`) sends no
+ * `--dir`; PWD still selects the directory. A saved `--standalone`/`--server`
+ * is the user's server choice; adding ours would make OpenCode reject the run. */
+function opencodeRunShape(opts: Pick<BackendRunOptions, 'cliFlags' | 'customArgs'>): {
+  projectDirFlag: boolean;
+  standalone: boolean;
+} {
+  const customArgs = opts.customArgs || [];
+  const terminator = customArgs.indexOf('--');
+  const optionArgs = terminator < 0 ? customArgs : customArgs.slice(0, terminator);
+  const customServerMode = optionArgs.some(arg => arg === '--standalone' || arg === '--server'
+    || arg.startsWith('--standalone=') || arg.startsWith('--server='));
+  return {
+    projectDirFlag: opts.cliFlags === undefined || opts.cliFlags.includes('--dir'),
+    standalone: !!opts.cliFlags?.includes('--standalone') && !customServerMode,
+  };
 }
 
 /** Remove stale user-saved directory overrides before custom arguments are
@@ -340,8 +372,10 @@ export function mapOpencodeEvent(obj: any):
       return out;
     }
     case 'error': {
+      // 1.x: { name, data: { message } }; 2.x: { type, message }.
       const errObj = obj.error || {};
-      const msg = errObj.data?.message || errObj.name || 'opencode reported error';
+      const msg = errObj.data?.message || errObj.message || errObj.name || errObj.type
+        || 'opencode reported error';
       out!.terminal = { status: 'failed', error: String(msg) };
       return out;
     }

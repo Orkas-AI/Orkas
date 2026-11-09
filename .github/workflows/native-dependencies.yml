@@ -73,6 +73,8 @@ jobs:
           npm run test:js -- --maxWorkers=1
           test/main/features/local_agents/opencode_backend.test.ts
           test/main/features/local_agents/opencode_parser.test.ts
+          test/main/features/local_agents/runtime_options.test.ts
+          test/main/features/local_agents/version.test.ts
           test/main/features/local_agents/base.test.ts
           test/main/features/local_agents/watchdog.test.ts
       - name: Verify Claude final stream records and lifecycle

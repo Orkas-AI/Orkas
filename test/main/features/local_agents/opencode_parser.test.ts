@@ -6,6 +6,7 @@ import {
   mapOpencodeEvent,
   extractOpencodeUsage,
 } from '../../../../src/main/features/local_agents/backends/opencode';
+import { parseCliHelpFlags } from '../../../../src/main/features/local_agents/runtime_options';
 
 describe('OpenCode run-scoped MCP configuration', () => {
   const bridge = {
@@ -212,6 +213,17 @@ describe('local_agents/backends/opencode › mapOpencodeEvent', () => {
     expect(r?.terminal).toEqual({ status: 'failed', error: 'auth fail' });
   });
 
+  it('reads the 2.x error message, which is no longer nested under data', () => {
+    // Real 2.2.6 record for `--model nope/nope`.
+    const r = mapOpencodeEvent({
+      type: 'error', timestamp: 1794143600585, sessionID: 'ses_e44b540b3ffeM0PlmjcIGx0lmZ',
+      error: { type: 'provider.no-route', message: 'Model unavailable: nope/nope' },
+    });
+    expect(r?.terminal).toEqual({ status: 'failed', error: 'Model unavailable: nope/nope' });
+    expect(mapOpencodeEvent({ type: 'error', error: { type: 'provider.no-route' } })?.terminal)
+      .toEqual({ status: 'failed', error: 'provider.no-route' });
+  });
+
   it('step_finish with extractable usage produces status:usage (not log)', () => {
     const r = mapOpencodeEvent({
       type: 'step_finish',
@@ -359,5 +371,108 @@ describe('local_agents/backends/opencode › fixed full access', () => {
       '--dir', selected, '--verbose', '--',
     ]);
     expect(args.indexOf('--dir')).toBeLessThan(args.indexOf('--'));
+  });
+});
+
+// `opencode run --help` excerpts from released binaries; example addresses
+// use documentation hosts without contacting a service
+// (opencode-darwin-arm64 1.19.5 and @opencode/cli-darwin-arm64 2.2.6).
+const OPENCODE_1_RUN_HELP = `opencode run [message..]
+
+run opencode with a message
+
+Options:
+  -h, --help         show help                                                             [boolean]
+  -c, --continue     continue the last session                                             [boolean]
+  -s, --session      session id to continue                                                 [string]
+  -m, --model        model to use in the format of provider/model                           [string]
+      --format       format: default (formatted) or json (raw JSON events)
+                                          [string] [choices: "default", "json"] [default: "default"]
+      --attach       attach to a running opencode server (e.g., https://opencode.example:4096)      [string]
+      --dir          directory to run in, path on remote server if attaching                [string]
+      --port         port for the local server (defaults to random port if no value provided)
+                                                                                            [number]
+      --variant      model variant (provider-specific reasoning effort, e.g., high, max, minimal)
+                                                                                            [string]
+      --auto         auto-approve permissions that are not explicitly denied (dangerous!)
+                                                                          [boolean] [default: false]`;
+const OPENCODE_2_RUN_HELP = `DESCRIPTION
+  Run OpenCode with a message
+
+USAGE
+  opencode run [flags] [<message...>]
+
+FLAGS
+  --continue, -c            Continue the last session
+  --session, -s string      Session ID to continue, or to create if it does not exist
+  --model, -m string        Model to use in the format provider/model#variant
+  --format choice           Output format (choices: default, json)
+  --auto                    Auto-approve permissions that are not explicitly denied
+
+GLOBAL FLAGS
+  --help, -h                                                          Show help information
+  --print-logs                                                        Print logs to stderr (server logs require --standalone)
+  --standalone                                                        Run with a private server instead of the background service
+  --server string                                                     Connect to a server URL instead of the background service`;
+
+describe('local_agents/backends/opencode › 1.x and 2.x run command boundaries', () => {
+  const selected = path.resolve('/workspace/selected');
+
+  it('keeps the 1.x host directory flag and never asks 1.x for a private server', () => {
+    const cliFlags = parseCliHelpFlags(OPENCODE_1_RUN_HELP);
+    expect(cliFlags).toEqual(expect.arrayContaining(['--dir', '--variant', '--auto', '--session']));
+    expect(cliFlags).not.toContain('--standalone');
+    expect(buildOpencodeArgs({ prompt: 'hi', cwd: selected, cliFlags, resumeSessionId: 'ses_1' })).toEqual([
+      'run', '--auto', '--format', 'json', '--session', 'ses_1', '--dir', selected,
+    ]);
+  });
+
+  it('omits the rejected --dir on 2.x and runs a private server instead of the shared service', () => {
+    const cliFlags = parseCliHelpFlags(OPENCODE_2_RUN_HELP);
+    expect(cliFlags).toEqual(expect.arrayContaining(['--standalone', '--server', '--auto', '--session']));
+    expect(cliFlags).not.toContain('--dir');
+    expect(cliFlags).not.toContain('--variant');
+    const args = buildOpencodeArgs({
+      prompt: 'hi', cwd: selected, cliFlags, resumeSessionId: 'ses_2',
+      customArgs: ['--dir', '/workspace/stale', '--dir=/workspace/stale-b', '--title', 'kept'],
+    });
+    expect(args).toEqual([
+      'run', '--auto', '--format', 'json', '--standalone', '--session', 'ses_2', '--title', 'kept',
+    ]);
+  });
+
+  it.each([
+    [['--server', 'https://opencode.example:4096']],
+    [['--server=https://opencode.example:4096']],
+    [['--standalone']],
+  ])('leaves a saved server choice alone instead of adding a conflicting --standalone: %j', (customArgs) => {
+    const args = buildOpencodeArgs({
+      prompt: 'hi', cwd: selected, cliFlags: parseCliHelpFlags(OPENCODE_2_RUN_HELP), customArgs,
+    });
+    expect(args.filter(arg => arg === '--standalone' || arg.startsWith('--standalone=')))
+      .toHaveLength(customArgs[0] === '--standalone' ? 1 : 0);
+    expect(args.slice(-customArgs.length)).toEqual(customArgs);
+  });
+
+  it('keeps the private server when server-like prompt text follows the argument terminator', () => {
+    const args = buildOpencodeArgs({
+      prompt: 'hi', cwd: selected, cliFlags: parseCliHelpFlags(OPENCODE_2_RUN_HELP),
+      customArgs: ['--', '--server', 'https://opencode.example:4096'],
+    });
+    expect(args).toEqual([
+      'run', '--auto', '--format', 'json', '--standalone', '--', '--server', 'https://opencode.example:4096',
+    ]);
+  });
+
+  it('sends neither version-specific flag when help discovery failed', () => {
+    expect(buildOpencodeArgs({ prompt: 'hi', cwd: selected, cliFlags: [] })).toEqual([
+      'run', '--auto', '--format', 'json',
+    ]);
+  });
+
+  it('carries the selected directory in PWD on every platform when --dir is not sent', () => {
+    const inherited = { PWD: '/stale/launch/dir' };
+    expect(buildOpencodeEnv(undefined, inherited, selected).PWD).toBe(selected);
+    expect(buildOpencodeEnv(undefined, inherited).PWD).toBe('/stale/launch/dir');
   });
 });
