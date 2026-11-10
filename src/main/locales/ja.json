@@ -289,6 +289,7 @@
   "model.balance_fallback": "設定した {provider} アカウントの残高が不足しています（Orkas クレジットではありません）。タスクを続行するため代替モデルに切り替えています。チャージすると再び利用できます。",
   "model.provider_unavailable_fallback": "設定した {provider} は現在利用できません。タスクを続行するため代替モデルに切り替えています。",
   "cli_agent.parameter_unsupported": "{cli} は選択したパラメーター {parameter} に対応していません。実行設定を変更してください。",
+  "cli_agent.capability_probe_failed": "{cli} の実行オプションを確認できませんでした。もう一度お試しください。",
   "cli_agent.model_unsupported": "{cli} はモデル {model} に対応していません。実行設定を変更してください。",
   "auto_tasks.catch_up_title": "{title}（遅れて実行）",
   "web_assist.permission_title": "サイトの権限",

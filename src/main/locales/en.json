@@ -289,6 +289,7 @@
   "model.balance_fallback": "Your {provider} account is out of balance (this is not Orkas credits). Switching to a fallback model so the task can continue; top up that account to use it again.",
   "model.provider_unavailable_fallback": "Your {provider} model is unavailable right now. Switching to a fallback model so the task can continue.",
   "cli_agent.parameter_unsupported": "{cli} does not support the selected parameter {parameter}. Change the runtime settings.",
+  "cli_agent.capability_probe_failed": "Could not check {cli}'s run options. Please retry.",
   "cli_agent.model_unsupported": "{cli} does not support model {model}. Change the runtime settings.",
   "auto_tasks.catch_up_title": "{title} (catch-up)",
   "web_assist.permission_title": "Website permission",

@@ -86,6 +86,7 @@ vi.mock('../../../../src/main/features/local_agents/backends/hermes', () => ({
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let restoreCapabilities: (() => void) | undefined;
 const TEST_UID = 'u1';
 const PNG_1X1_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6nKsAAAAASUVORK5CYII=';
 const MP4_FTYP = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
@@ -99,6 +100,14 @@ beforeEach(async () => {
   vi.resetModules();
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
+  // These backend tests use synthetic executable paths. Supply a successful
+  // OpenCode help probe unless the scenario explicitly injects its failure.
+  const capabilities = await import('../../../../src/main/features/local_agents/runtime_options');
+  const originalFlags = capabilities.getLocalCliSupportedFlags;
+  const capabilitySpy = vi.spyOn(capabilities, 'getLocalCliSupportedFlags').mockImplementation((entry, cwd, args) => (
+    entry.type === 'opencode' ? Promise.resolve(['--dir', '--model', '--variant']) : originalFlags(entry, cwd, args)
+  ));
+  restoreCapabilities = () => capabilitySpy.mockRestore();
   mockDetect.mockReset();
   mockCliFallback.mockReset();
   mockCliFallback.mockReturnValue(null);
@@ -116,6 +125,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  restoreCapabilities?.();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -805,6 +815,40 @@ describe('local_agents/runner', () => {
       expect(capabilities).toHaveBeenCalledTimes(2);
       expect(result).toMatchObject({ status: 'completed', output: 'compatible fallback completed' });
     } finally { capabilities.mockRestore(); if (previous === undefined) delete process.env.ORKAS_BRIDGE_DISABLED; else process.env.ORKAS_BRIDGE_DISABLED = previous; }
+  });
+
+  it.each([undefined, 'provider/model'])('stops OpenCode before dispatch on failed help and permits a later retry (model=%s)', async modelOverride => {
+    mockDetect.mockResolvedValue({ type: 'opencode', available: true, path: '/fake/opencode', version: '2.2.6' });
+    const capabilities = vi.spyOn(await import('../../../../src/main/features/local_agents/runtime_options'), 'getLocalCliSupportedFlags')
+      .mockRejectedValueOnce(new Error('PRIVATE_PROBE_OUTPUT'))
+      .mockResolvedValue(['--model', '--standalone']);
+    const backend = vi.fn(async ({ onEvent }: any) => onEvent({ type: 'done', status: 'completed', output: 'recovered' }));
+    mockOpencodeBackendImpl = backend;
+    const previous = process.env.ORKAS_BRIDGE_DISABLED;
+    process.env.ORKAS_BRIDGE_DISABLED = '1';
+    try {
+      const runner = await loadRunner();
+      const events: any[] = [];
+      const options = { uid: TEST_UID, cid: 'c-opencode-probe-retry', agentId: 'agent-x', cli: 'opencode' as const,
+        prompt: 'fixture', cwd: tmpDir, modelOverride, signal: new AbortController().signal,
+        resumeSessionId: 'existing-session', resumeFallbackPrompt: 'retained history', onEvent: (e: any) => events.push(e) };
+      const failed = await runner.run(options);
+      expect(failed.status).toBe('failed');
+      expect(failed.error).toContain('OpenCode');
+      expect(failed.error).not.toContain('PRIVATE_PROBE_OUTPUT');
+      expect(backend).not.toHaveBeenCalled();
+      expect(mockCliFallback).not.toHaveBeenCalled();
+      expect(events.filter(e => e.type === 'done')).toEqual([
+        expect.objectContaining({ status: 'failed', failureKind: 'cli_compatibility', retrySafe: false }),
+      ]);
+      const recovered = await runner.run(options);
+      expect(recovered).toMatchObject({ status: 'completed', output: 'recovered' });
+      expect(backend).toHaveBeenCalledTimes(1);
+    } finally {
+      capabilities.mockRestore();
+      if (previous === undefined) delete process.env.ORKAS_BRIDGE_DISABLED;
+      else process.env.ORKAS_BRIDGE_DISABLED = previous;
+    }
   });
 
   it('cancels promptly while shared capability discovery is still pending', async () => {

@@ -464,7 +464,7 @@ describe('local_agents/backends/opencode › 1.x and 2.x run command boundaries'
     ]);
   });
 
-  it('sends neither version-specific flag when help discovery failed', () => {
+  it('sends neither version-specific flag for an empty successful help discovery', () => {
     expect(buildOpencodeArgs({ prompt: 'hi', cwd: selected, cliFlags: [] })).toEqual([
       'run', '--auto', '--format', 'json',
     ]);

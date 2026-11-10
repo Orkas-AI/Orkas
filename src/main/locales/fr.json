@@ -289,6 +289,7 @@
   "model.balance_fallback": "Le solde de votre compte {provider} est épuisé (il ne s’agit pas des crédits Orkas). Passage à un modèle de repli pour poursuivre la tâche ; rechargez ce compte pour l’utiliser à nouveau.",
   "model.provider_unavailable_fallback": "Votre modèle {provider} est indisponible pour le moment. Passage à un modèle de repli pour poursuivre la tâche.",
   "cli_agent.parameter_unsupported": "{cli} ne prend pas en charge le paramètre choisi {parameter}. Modifiez les paramètres d’exécution.",
+  "cli_agent.capability_probe_failed": "Impossible de vérifier les options d’exécution de {cli}. Réessayez.",
   "cli_agent.model_unsupported": "{cli} ne prend pas en charge le modèle {model}. Modifiez les paramètres d’exécution.",
   "auto_tasks.catch_up_title": "{title} (rattrapage)",
   "web_assist.permission_title": "Autorisation du site",

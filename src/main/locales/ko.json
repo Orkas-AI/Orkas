@@ -289,6 +289,7 @@
   "model.balance_fallback": "{provider} 계정의 잔액이 부족합니다(Orkas 크레딧이 아닙니다). 작업을 계속할 수 있도록 대체 모델로 전환합니다. 해당 계정을 충전하면 다시 사용할 수 있습니다.",
   "model.provider_unavailable_fallback": "설정한 {provider} 모델을 지금 사용할 수 없습니다. 작업을 계속할 수 있도록 대체 모델로 전환합니다.",
   "cli_agent.parameter_unsupported": "{cli}는 선택한 매개변수 {parameter}을 지원하지 않습니다. 실행 설정을 변경하세요.",
+  "cli_agent.capability_probe_failed": "{cli} 실행 옵션을 확인하지 못했습니다. 다시 시도해 주세요.",
   "cli_agent.model_unsupported": "{cli}는 {model} 모델을 지원하지 않습니다. 실행 설정을 변경하세요.",
   "auto_tasks.catch_up_title": "{title} (늦은 실행)",
   "web_assist.permission_title": "웹사이트 권한",

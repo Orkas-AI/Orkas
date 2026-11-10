@@ -260,6 +260,7 @@ Native warnings remain a separate review result. Real permission UI, other-platf
   explicit saved `--standalone` or `--server` choice without adding a second
   server mode. Accept 2.x `error.message` as well as 1.x `error.data.message`.
   The regression fixtures use released 1.19.5 and 2.2.6 help text.
+- If OpenCode `run --help` fails, do not dispatch `models` or a task `run`. Return a localized retryable option-check error without raw CLI output. Do not cache failed help or model discovery; a failed forced refresh also evicts the old model catalog. Verify user retry recovers and successful 1.x/2.x shapes remain unchanged.
 - ACP 不能只测解析函数：真实 NDJSON 子进程在 initialize acknowledgement 后只给
   100 ms 接收 `session/new`，由此发现固定 250 ms fallback 会让快速服务端先行退出。
   后端现在收到初始化确认即发送且保持 one-shot，timer 只用于兼容不回确认的旧实现。

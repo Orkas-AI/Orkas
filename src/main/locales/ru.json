@@ -289,6 +289,7 @@
   "model.balance_fallback": "На вашем аккаунте {provider} закончились средства (это не кредиты Orkas). Переключаемся на резервную модель, чтобы продолжить задачу; пополните баланс, чтобы снова им пользоваться.",
   "model.provider_unavailable_fallback": "Ваша модель {provider} сейчас недоступна. Переключаемся на резервную модель, чтобы продолжить задачу.",
   "cli_agent.parameter_unsupported": "{cli} не поддерживает выбранный параметр {parameter}. Измените настройки запуска.",
+  "cli_agent.capability_probe_failed": "Не удалось проверить параметры запуска {cli}. Повторите попытку.",
   "cli_agent.model_unsupported": "{cli} не поддерживает модель {model}. Измените настройки запуска.",
   "auto_tasks.catch_up_title": "{title} (запуск с опозданием)",
   "web_assist.permission_title": "Разрешение сайта",

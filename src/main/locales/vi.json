@@ -289,6 +289,7 @@
   "model.balance_fallback": "Tài khoản {provider} của bạn đã hết số dư (không phải tín dụng Orkas). Đang chuyển sang mô hình dự phòng để tác vụ có thể tiếp tục; hãy nạp tiền vào tài khoản đó để dùng lại.",
   "model.provider_unavailable_fallback": "Mô hình {provider} của bạn hiện không dùng được. Đang chuyển sang mô hình dự phòng để tác vụ có thể tiếp tục.",
   "cli_agent.parameter_unsupported": "{cli} không hỗ trợ tham số đã chọn {parameter}. Hãy đổi cài đặt chạy.",
+  "cli_agent.capability_probe_failed": "Không thể kiểm tra các tùy chọn chạy của {cli}. Vui lòng thử lại.",
   "cli_agent.model_unsupported": "{cli} không hỗ trợ mô hình {model}. Hãy đổi cài đặt chạy.",
   "auto_tasks.catch_up_title": "{title} (chạy bù)",
   "web_assist.permission_title": "Quyền của trang web",

@@ -289,6 +289,7 @@
   "model.balance_fallback": "Il saldo del tuo account {provider} è esaurito (non si tratta dei crediti Orkas). Passaggio a un modello di riserva per continuare l'attività; ricarica l'account per usarlo di nuovo.",
   "model.provider_unavailable_fallback": "Il tuo modello {provider} non è disponibile al momento. Passaggio a un modello di riserva per continuare l'attività.",
   "cli_agent.parameter_unsupported": "{cli} non supporta il parametro selezionato {parameter}. Modifica le impostazioni di esecuzione.",
+  "cli_agent.capability_probe_failed": "Impossibile verificare le opzioni di esecuzione di {cli}. Riprova.",
   "cli_agent.model_unsupported": "{cli} non supporta il modello {model}. Modifica le impostazioni di esecuzione.",
   "auto_tasks.catch_up_title": "{title} (esecuzione recuperata)",
   "web_assist.permission_title": "Autorizzazione del sito",

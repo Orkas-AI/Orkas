@@ -9,6 +9,7 @@
 
 import * as fs from 'node:fs';
 
+import { t } from '../../i18n.js';
 import { createLogger } from '../../logger.js';
 import { logErrorSummary } from '../../util/log-redact.js';
 import { killProcessTree, LineSplitter, spawnCli, stripAnsi } from './backends/base.js';
@@ -95,6 +96,12 @@ export interface LocalCliRuntimeOptions {
 }
 
 type CaptureResult = { ok: boolean; stdout: string; stderr: string };
+class OpenCodeHelpProbeError extends Error {
+  constructor() {
+    super(t('cli_agent.capability_probe_failed', { cli: 'OpenCode' }));
+    this.name = 'OpenCodeHelpProbeError';
+  }
+}
 type CachedOptions = { expiresAt: number; value: LocalCliRuntimeOptions };
 const cache = new Map<string, CachedOptions>();
 const helpCache = new Map<string, { identity: string; value: CaptureResult }>();
@@ -154,7 +161,11 @@ function supportedFlags(help: CaptureResult): string[] {
 
 export async function getLocalCliSupportedFlags(entry: LocalCliEntry, cwd: string, args: readonly string[] = ['--help']): Promise<string[]> {
   if (!entry.available || !entry.path) return [];
-  return supportedFlags(await cliHelp(entry, cwd, false, args));
+  const help = await cliHelp(entry, cwd, false, args);
+  // Unknown OpenCode capabilities cannot safely select a private server.
+  // Failed probes are not cached by cliHelp, so a later task can retry.
+  if (entry.type === 'opencode' && !help.ok) throw new OpenCodeHelpProbeError();
+  return supportedFlags(help);
 }
 
 function safeToken(value: unknown): string {
@@ -678,6 +689,7 @@ async function discover(entry: LocalCliEntry, cwd: string, force: boolean, custo
   }
   if (entry.type === 'opencode') {
     const help = await captureCli(entry, ['run', '--help'], cwd);
+    if (!help.ok) throw new OpenCodeHelpProbeError();
     // OpenCode 2 `models` otherwise starts a shared background service that
     // keeps running after discovery; 1.x has no `--standalone`.
     const models = await captureCli(entry,
@@ -714,6 +726,12 @@ export async function getLocalCliRuntimeOptions(
     cache.set(key, { expiresAt: Date.now() + CACHE_TTL_MS, value });
     return value;
   } catch (err) {
+    // Preserve a recoverable probe failure through IPC without caching it or
+    // replacing it with defaults. Never expose raw CLI help/stderr.
+    if (err instanceof OpenCodeHelpProbeError) {
+      cache.delete(key);
+      throw err;
+    }
     log.warn('runtime option discovery failed', {
       cli: entry.type,
       error: logErrorSummary(err),

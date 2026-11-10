@@ -289,6 +289,7 @@
   "model.balance_fallback": "{provider} hesabınızın bakiyesi tükendi (Orkas kredisi değil). Görevin devam edebilmesi için yedek modele geçiliyor; yeniden kullanmak için bu hesaba bakiye yükleyin.",
   "model.provider_unavailable_fallback": "{provider} modeliniz şu anda kullanılamıyor. Görevin devam edebilmesi için yedek modele geçiliyor.",
   "cli_agent.parameter_unsupported": "{cli}, seçilen {parameter} parametresini desteklemiyor. Çalıştırma ayarlarını değiştirin.",
+  "cli_agent.capability_probe_failed": "{cli} çalıştırma seçenekleri denetlenemedi. Lütfen yeniden deneyin.",
   "cli_agent.model_unsupported": "{cli}, {model} modelini desteklemiyor. Çalıştırma ayarlarını değiştirin.",
   "auto_tasks.catch_up_title": "{title} (telafi çalıştırması)",
   "web_assist.permission_title": "Site izni",

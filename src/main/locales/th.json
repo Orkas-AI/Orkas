@@ -289,6 +289,7 @@
   "model.balance_fallback": "ยอดเงินในบัญชี {provider} ของคุณหมดแล้ว (ไม่ใช่เครดิต Orkas) กำลังเปลี่ยนไปใช้โมเดลสำรองเพื่อให้งานดำเนินต่อได้ เติมเงินบัญชีนั้นเพื่อใช้งานอีกครั้ง",
   "model.provider_unavailable_fallback": "โมเดล {provider} ที่คุณตั้งค่าไว้ใช้งานไม่ได้ในขณะนี้ กำลังเปลี่ยนไปใช้โมเดลสำรองเพื่อให้งานดำเนินต่อได้",
   "cli_agent.parameter_unsupported": "{cli} ไม่รองรับพารามิเตอร์ที่เลือก {parameter} โปรดเปลี่ยนการตั้งค่าการทำงาน",
+  "cli_agent.capability_probe_failed": "ตรวจสอบตัวเลือกการทำงานของ {cli} ไม่สำเร็จ โปรดลองอีกครั้ง",
   "cli_agent.model_unsupported": "{cli} ไม่รองรับโมเดล {model} โปรดเปลี่ยนการตั้งค่าการทำงาน",
   "auto_tasks.catch_up_title": "{title} (ทำงานย้อนหลัง)",
   "web_assist.permission_title": "สิทธิ์เว็บไซต์",
