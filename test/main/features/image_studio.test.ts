@@ -511,6 +511,25 @@ describe('ImageStudio project contract', () => {
     }])).toEqual([]);
   });
 
+  it('accepts equivalent currency references but rejects escaped or absent visible prices', async () => {
+    fs.writeFileSync(path.join(root, 'image-manifest.json'), JSON.stringify(manifest({
+      brief: { purpose: 'Product image', audience: 'Buyers', required_copy: ['¥99'], must_include: [], must_avoid: [] },
+    })));
+    for (const text of ['¥99', '&yen;99', '&#165;99', '&#xA5;99']) {
+      fs.writeFileSync(path.join(root, 'index.html'), `<html><body><div>${text}</div></body></html>`);
+      const inspection = await inspectImageStudioProject(root);
+      expect(inspection.blockers, text).toEqual([]);
+      expect(inspection.ok).toBe(true);
+    }
+    for (const html of ['<div>&amp;yen;99</div>', '<div>&amp;#165;99</div>',
+      '<!-- ¥99 --><script>const price="¥99";</script><div title="¥99">Offer</div>', '<div>¥199</div>']) {
+      fs.writeFileSync(path.join(root, 'index.html'), `<html><body>${html}</body></html>`);
+      const inspection = await inspectImageStudioProject(root);
+      expect(inspection.ok).toBe(false);
+      expect(inspection.blockers.map(issue => issue.code)).toContain('E_REQUIRED_COPY_MISSING');
+    }
+  });
+
   it('blocks missing required copy, remote resources, embedded pages, and traversal', async () => {
     fs.writeFileSync(path.join(root, 'image-manifest.json'), JSON.stringify(manifest(), null, 2));
     fs.writeFileSync(path.join(root, 'index.html'), [
