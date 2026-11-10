@@ -289,6 +289,7 @@
   "model.balance_fallback": "Das Guthaben Ihres {provider}-Kontos ist aufgebraucht (dies betrifft keine Orkas-Credits). Es wird zu einem Ausweichmodell gewechselt, damit die Aufgabe fortgesetzt werden kann; laden Sie das Konto auf, um es wieder zu nutzen.",
   "model.provider_unavailable_fallback": "Ihr {provider}-Modell ist gerade nicht verfügbar. Es wird zu einem Ausweichmodell gewechselt, damit die Aufgabe fortgesetzt werden kann.",
   "cli_agent.parameter_unsupported": "{cli} unterstützt den gewählten Parameter {parameter} nicht. Ändern Sie die Ausführungseinstellungen.",
+  "cli_agent.capability_probe_failed": "Die Ausführungsoptionen von {cli} konnten nicht geprüft werden. Bitte erneut versuchen.",
   "cli_agent.model_unsupported": "{cli} unterstützt das Modell {model} nicht. Ändern Sie die Ausführungseinstellungen.",
   "auto_tasks.catch_up_title": "{title} (nachgeholt)",
   "web_assist.permission_title": "Website-Berechtigung",

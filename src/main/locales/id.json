@@ -289,6 +289,7 @@
   "model.balance_fallback": "Saldo akun {provider} Anda habis (ini bukan kredit Orkas). Beralih ke model cadangan sehingga tugas dapat dilanjutkan; isi ulang akun tersebut untuk menggunakannya lagi.",
   "model.provider_unavailable_fallback": "Model {provider} Anda sedang tidak tersedia. Beralih ke model cadangan sehingga tugas dapat dilanjutkan.",
   "cli_agent.parameter_unsupported": "{cli} tidak mendukung parameter yang dipilih {parameter}. Ubah pengaturan runtime.",
+  "cli_agent.capability_probe_failed": "Tidak dapat memeriksa opsi eksekusi {cli}. Silakan coba lagi.",
   "cli_agent.model_unsupported": "{cli} tidak mendukung model {model}. Ubah pengaturan runtime.",
   "auto_tasks.catch_up_title": "{title} (susulan)",
   "web_assist.permission_title": "Izin situs",

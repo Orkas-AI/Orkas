@@ -289,6 +289,7 @@
   "model.balance_fallback": "आपके {provider} खाते का बैलेंस खत्म हो गया है (यह Orkas क्रेडिट नहीं है)। कार्य जारी रखने के लिए वैकल्पिक मॉडल चुना जा रहा है; दोबारा इस्तेमाल करने के लिए उस खाते में राशि जोड़ें।",
   "model.provider_unavailable_fallback": "आपका {provider} मॉडल अभी उपलब्ध नहीं है। कार्य जारी रखने के लिए वैकल्पिक मॉडल चुना जा रहा है।",
   "cli_agent.parameter_unsupported": "{cli} चुने गए पैरामीटर {parameter} का समर्थन नहीं करता। रनटाइम सेटिंग बदलें।",
+  "cli_agent.capability_probe_failed": "{cli} के रन विकल्प जाँचे नहीं जा सके। कृपया फिर कोशिश करें।",
   "cli_agent.model_unsupported": "{cli} मॉडल {model} का समर्थन नहीं करता। रनटाइम सेटिंग बदलें।",
   "auto_tasks.catch_up_title": "{title} (देर से चलाया गया)",
   "web_assist.permission_title": "वेबसाइट की अनुमति",

@@ -289,6 +289,7 @@
   "model.balance_fallback": "你配置的 {provider} 账户余额不足（这不是 Orkas 积分），正在切换到备用模型继续执行；为该账户充值后即可恢复使用。",
   "model.provider_unavailable_fallback": "你配置的 {provider} 当前用不了，正在切换到备用模型继续执行。",
   "cli_agent.parameter_unsupported": "{cli} 不支持所选参数 {parameter}，请修改运行设置。",
+  "cli_agent.capability_probe_failed": "无法检查 {cli} 的运行选项，请重试。",
   "cli_agent.model_unsupported": "{cli} 不支持模型 {model}，请修改运行设置。",
   "auto_tasks.catch_up_title": "{title}（补跑）",
   "web_assist.permission_title": "网站权限",

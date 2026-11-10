@@ -355,7 +355,7 @@ process.stdout.write('Options:\\n  --model <id>\\n');
     const cli = { ...entry('opencode', fake), version: '1.2.3' };
     const spawns = () => fs.readFileSync(counter, 'utf8').length;
 
-    expect(await getLocalCliSupportedFlags(cli, dir, ['run', '--help'])).toEqual([]);
+    await expect(getLocalCliSupportedFlags(cli, dir, ['run', '--help'])).rejects.toThrow('OpenCode');
     expect(await getLocalCliSupportedFlags(cli, dir, ['run', '--help'])).toEqual(['--model']);
     expect(spawns()).toBe(2);
     expect(await getLocalCliSupportedFlags(cli, otherWorkspace, ['run', '--help'])).toEqual(['--model']);
@@ -595,6 +595,46 @@ if (args[0] === 'run' && args.includes('--help')) {
     expect(JSON.parse(fs.readFileSync(trace, 'utf8'))).toEqual(expected);
     expect(options).toMatchObject({ status: 'ready', models: [{ id: 'opencode/big-pickle' }], can_select_model: true });
   }, 10_000);
+
+  it.each([
+    ['1.x', ['  --model <id>    Model', '  --dir <path>    Directory'].join('\n'), ['models']],
+    ['2.x', ['  --model string    Model', '  --standalone    Private server'].join('\n'), ['models', '--standalone']],
+  ] as const)('stops OpenCode %s catalog discovery on failed help and retries without caching the failure', async (_line, helpLine, expected) => {
+    const dir = makeTempDir();
+    const failed = path.join(dir, 'fail-help');
+    const trace = path.join(dir, 'models.json');
+    fs.writeFileSync(failed, 'fail');
+    const binPath = writeFakeCli(dir, `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] === 'run' && args.includes('--help')) {
+  if (fs.existsSync(${JSON.stringify(failed)})) {
+    process.stderr.write('PRIVATE_PROBE_OUTPUT');
+    process.exit(1);
+  }
+  process.stdout.write(${JSON.stringify(helpLine)});
+} else if (args[0] === 'models') {
+  fs.writeFileSync(${JSON.stringify(trace)}, JSON.stringify(args));
+  process.stdout.write('opencode/fixture\\n');
+}
+`);
+    const cli = entry('opencode', binPath);
+    await expect(getLocalCliRuntimeOptions(cli, dir)).rejects.toThrow('OpenCode');
+    expect(fs.existsSync(trace)).toBe(false);
+    // Recover without force or a binary identity change: no failed option TTL.
+    fs.unlinkSync(failed);
+    const recovered = await getLocalCliRuntimeOptions(cli, dir);
+    expect(recovered).toMatchObject({ status: 'ready', models: [{ id: 'opencode/fixture' }] });
+    expect(JSON.parse(fs.readFileSync(trace, 'utf8'))).toEqual(expected);
+    // A failed forced refresh must also evict an older successful catalog.
+    fs.unlinkSync(trace);
+    fs.writeFileSync(failed, 'fail');
+    await expect(getLocalCliRuntimeOptions(cli, dir, { force: true })).rejects.toThrow('OpenCode');
+    expect(fs.existsSync(trace)).toBe(false);
+    fs.unlinkSync(failed);
+    await getLocalCliRuntimeOptions(cli, dir);
+    expect(JSON.parse(fs.readFileSync(trace, 'utf8'))).toEqual(expected);
+  });
 
   it('kills an oversized catalog and returns only sanitized partial metadata', async () => {
     const dir = makeTempDir();

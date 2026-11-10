@@ -77,6 +77,12 @@ jobs:
           test/main/features/local_agents/version.test.ts
           test/main/features/local_agents/base.test.ts
           test/main/features/local_agents/watchdog.test.ts
+      - name: Verify failed OpenCode capability discovery and retry
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/local_agents/runner.test.ts
+          test/main/ipc/local-agents-runtime-options.test.ts
+          test/main/features/local_agents/sessions.test.ts
       - name: Verify Claude final stream records and lifecycle
         run: >-
           npm run test:js -- --maxWorkers=1

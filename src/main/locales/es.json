@@ -289,6 +289,7 @@
   "model.balance_fallback": "Tu cuenta de {provider} no tiene saldo (no son los créditos de Orkas). Se cambia a un modelo alternativo para continuar la tarea; recarga esa cuenta para volver a usarla.",
   "model.provider_unavailable_fallback": "Tu modelo de {provider} no está disponible ahora. Se cambia a un modelo alternativo para continuar la tarea.",
   "cli_agent.parameter_unsupported": "{cli} no admite el parámetro seleccionado {parameter}. Cambia la configuración de ejecución.",
+  "cli_agent.capability_probe_failed": "No se pudieron comprobar las opciones de ejecución de {cli}. Vuelve a intentarlo.",
   "cli_agent.model_unsupported": "{cli} no admite el modelo {model}. Cambia la configuración de ejecución.",
   "auto_tasks.catch_up_title": "{title} (ejecución recuperada)",
   "web_assist.permission_title": "Permiso del sitio",

@@ -253,8 +253,8 @@ export function buildOpencodeArgs(opts: Pick<BackendRunOptions,
 }
 
 /** `run --help` is authoritative for these flags (compatibility.ts). Without
- * discovered flags, keep the 1.x contract. A failed probe (`[]`) sends no
- * `--dir`; PWD still selects the directory. A saved `--standalone`/`--server`
+ * discovered flags, keep the 1.x contract. An empty successful discovery sends
+ * no `--dir`; the runner rejects failed probes before dispatch. A saved `--standalone`/`--server`
  * is the user's server choice; adding ours would make OpenCode reject the run. */
 function opencodeRunShape(opts: Pick<BackendRunOptions, 'cliFlags' | 'customArgs'>): {
   projectDirFlag: boolean;

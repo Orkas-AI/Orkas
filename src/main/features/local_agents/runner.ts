@@ -2072,10 +2072,10 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
 
   // A shared read-only probe may serve another caller. Stop waiting promptly
   // on this task's cancellation/deadline without cancelling their bounded probe.
-  const taskFlags = (helpArgs: readonly string[]): Promise<string[] | undefined> => new Promise(resolve => {
+  const taskFlags = (helpArgs: readonly string[]): Promise<string[] | null | undefined> => new Promise(resolve => {
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
-    const finish = (flags?: string[]) => {
+    const finish = (flags?: string[] | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -2087,7 +2087,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     if (opts.signal.aborted) { finish(); return; }
     timer = setTimeout(() => finish(), Math.max(1, deadlineAt - Date.now()));
     timer.unref?.();
-    void getLocalCliSupportedFlags(entry, opts.cwd, helpArgs).then(finish, () => finish([]));
+    void getLocalCliSupportedFlags(entry, opts.cwd, helpArgs)
+      .then(finish, () => finish(opts.cli === 'opencode' ? null : []));
   });
   const runBackendAttempt = async (attempt: {
     prompt: string;
@@ -2110,6 +2111,11 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
           error: 'Agent execution deadline reached before CLI dispatch',
           durationMs: Date.now() - executionStartedAt,
         });
+        return;
+      }
+      if (cliFlags === null) {
+        onEvent({ type: 'done', status: 'failed', failureKind: 'cli_compatibility', retrySafe: false,
+          error: t('cli_agent.capability_probe_failed', { cli: 'OpenCode' }) });
         return;
       }
       const unsupported = unsupportedCliOverride(opts.cli, { ...opts, cliFlags });

@@ -314,6 +314,12 @@ if (args[0] === 'models') {
   process.exit(0);
 }
 if (args[0] === 'run' && args.includes('--help')) {
+  let helpFault = false;
+  try { helpFault = JSON.parse(fs.readFileSync(process.env.ORKAS_E2E_CLI_STATE, 'utf8')).opencodeHelpFault === true; } catch {}
+  if (helpFault) {
+    process.stderr.write('deterministic OpenCode help failure\n');
+    process.exit(1);
+  }
   // 1.x run shape: the host directory flag follows this help.
   process.stdout.write('Usage: opencode run --model <id> --variant <name> --dir <path>\n');
   process.exit(0);

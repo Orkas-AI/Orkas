@@ -289,6 +289,7 @@
   "model.balance_fallback": "نفد رصيد حساب {provider} (هذا ليس رصيد Orkas). جارٍ الانتقال إلى نموذج بديل لمتابعة المهمة؛ اشحن رصيد هذا الحساب لاستخدامه مجددًا.",
   "model.provider_unavailable_fallback": "نموذج {provider} الذي أعددته غير متاح حاليًا. جارٍ الانتقال إلى نموذج بديل لمتابعة المهمة.",
   "cli_agent.parameter_unsupported": "لا يدعم {cli} المعلمة المحددة {parameter}. غيّر إعدادات التشغيل.",
+  "cli_agent.capability_probe_failed": "تعذّر التحقق من خيارات تشغيل {cli}. يُرجى المحاولة مجددًا.",
   "cli_agent.model_unsupported": "لا يدعم {cli} النموذج {model}. غيّر إعدادات التشغيل.",
   "auto_tasks.catch_up_title": "{title} (تشغيل متأخر)",
   "web_assist.permission_title": "إذن الموقع",
