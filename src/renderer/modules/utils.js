@@ -2370,8 +2370,7 @@ function formatTime(iso) {
     if (isNaN(d.getTime())) return String(iso).replace('T', ' ').substring(0, 16);
     const formatter = new Intl.DateTimeFormat('zh-CN', {
       year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', hour12: false,
-      timeZone: 'Asia/Shanghai'
+      hour: '2-digit', minute: '2-digit', hour12: false
     });
     const parts = formatter.formatToParts(d);
     const map = {};
@@ -2831,6 +2830,7 @@ function _aiSelectPick(api, value) {
 // Matching tests: `utils-autolink.test.ts`, `utils-ai-select.test.ts`.
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
   module.exports = {
+    formatTime,
     _BARE_URL_RE,
     _BARE_EMAIL_RE,
     _linkifyBareUrls,
