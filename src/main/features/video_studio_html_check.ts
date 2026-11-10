@@ -1,3 +1,6 @@
+import { TextDecoder } from 'node:util';
+import { XMLParser } from 'fast-xml-parser';
+
 export type HtmlStartTag = {
   tagName: string;
   attrs: Record<string, string>;
@@ -24,6 +27,28 @@ function decodeHtmlAttribute(value: string): string {
     .replace(/&#39;|&apos;/gi, "'")
     .replace(/&lt;/gi, '<')
     .replace(/&gt;/gi, '>');
+}
+
+const legacyHtmlControls = new TextDecoder('windows-1252');
+
+function decodeHtmlText(value: string): string {
+  if (!value.includes('&')) return value;
+  // Escape actual markup before using the existing parser's common HTML names.
+  // Numeric references follow HTML scalar/control rules and are XML-escaped so
+  // a decoded ampersand cannot start a second round of entity expansion.
+  const escapeText = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const text = value.replace(/[<>]|&(?:AMP|QUOT|LT|GT);|&#([xX][\da-fA-F]+|\d+);/g, (reference, digits: string | undefined) => {
+    if (!digits) return reference.startsWith('&') ? reference.toLowerCase() : escapeText(reference);
+    const point = digits[0].toLowerCase() === 'x' ? parseInt(digits.slice(1), 16) : Number(digits);
+    const character = !point || point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff) ? '\ufffd'
+      : point >= 0x80 && point <= 0x9f ? legacyHtmlControls.decode(Uint8Array.of(point)) : String.fromCodePoint(point);
+    return escapeText(character);
+  });
+  const parser = new XMLParser({
+    htmlEntities: true, parseTagValue: false, trimValues: false,
+    processEntities: { maxExpandedLength: Math.max(1024, value.length * 2) },
+  });
+  return parser.parse(`<text>${text}</text>`).text;
 }
 
 function findTagEnd(html: string, start: number): number {
@@ -137,7 +162,7 @@ export function parseHtmlStructure(html: string): HtmlStructure {
   return {
     tags,
     diagnostics,
-    textContent: decodeHtmlAttribute(textParts.join(' ')).replace(/\s+/g, ' ').trim(),
+    textContent: decodeHtmlText(textParts.join(' ')).replace(/\s+/g, ' ').trim(),
   };
 }
 

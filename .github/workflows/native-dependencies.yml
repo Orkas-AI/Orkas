@@ -97,6 +97,15 @@ jobs:
           test/main/features/local_agents/codex_backend.test.ts
           test/main/features/local_agents/codex_parser.test.ts
           test/main/features/local_agents/cli_input_cancel.test.ts
+      - name: Verify HTML copy references and project acceptance
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/video_studio_html_check.test.ts
+          test/main/features/image_studio.test.ts
+          test/main/features/video_studio_review.test.ts
+          test/main/features/video_studio_core_freshness.test.ts
+          test/main/features/video_studio_delivery.test.ts
+          test/main/features/image_studio_provenance.test.ts
       - name: Verify Agent catalog isolation and recovery
         run: >-
           npm run test:js -- --maxWorkers=1
