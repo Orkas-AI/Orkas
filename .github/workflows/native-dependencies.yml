@@ -107,6 +107,15 @@ jobs:
           test/main/features/local_agents/claude_e2e.test.ts
           test/main/features/local_agents/claude_parser.test.ts
           test/main/features/local_agents/cli_input_cancel.test.ts
+      - name: Verify malformed local media recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/renderer/utils-autolink.test.ts
+          test/renderer/conversation-video-error-recovery.test.ts
+          test/renderer/utils-html-embed.test.ts
+          test/renderer/utils-sanitize.test.ts
+          test/main/util/window-security.test.ts
+          test/main/util/http-range.test.ts
       - name: Verify workbook formulas and interrupted directory recovery
         run: >-
           npm run test:js -- --maxWorkers=1

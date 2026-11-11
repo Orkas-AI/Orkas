@@ -389,6 +389,15 @@ describe('markdown media links', () => {
     expect(_localMediaReferenceBasename('data:audio/wav;base64,AAAA')).toBe('');
   });
 
+  it('names a local link whose folder encoding was copied wrong by its intact file name', () => {
+    // 2026-11-07: Luna copied a delivery link and broke a Chinese folder name's encoding mid-character.
+    const broken = 'chat-media://local/var/T/userWorkSpace/%E8%BF%99%E6%98%AF%E护眼台灯/lamp/versions/main-v1.mp4?v=1-1-3502446';
+    expect(_chatMediaLocalPathFromUrl(broken)).toBe('');
+    expect(_localMediaReferenceBasename(broken)).toBe('main-v1.mp4');
+    // A file name that is itself broken names nothing to compare.
+    expect(_localMediaReferenceBasename('chat-media://local/Users/test/%E8%BF%E护.mp4')).toBe('');
+  });
+
   it('reserves native video controls while allowing the rest of the surface to toggle playback', () => {
     expect(_chatVideoNativeControlsHit(351, 100, 360)).toBe(true);
     expect(_chatVideoNativeControlsHit(312, 100, 360)).toBe(true);
