@@ -1324,6 +1324,24 @@ function _chatMediaLocalPathFromUrl(src) {
   }
 }
 
+// The still-encoded path of a chat-media://local link whose path cannot be decoded. A model
+// copying a long link can break one segment's encoding (2026-11-07: a Chinese folder name cut
+// mid-character); the link then names no file and can never load.
+function _undecodableChatMediaLocalPath(src) {
+  try {
+    const u = new URL(String(src || '').trim());
+    if (u.protocol !== 'chat-media:' || u.hostname.toLowerCase() !== 'local') return '';
+    try {
+      decodeURIComponent(u.pathname || '');
+      return '';
+    } catch (_) {
+      return u.pathname || '';
+    }
+  } catch (_) {
+    return '';
+  }
+}
+
 // A markdown media src that names a local file the app can serve, rewritten to
 // the protocol that actually serves it. Models write the path they were handed,
 // sometimes under a convention from their own training (`sandbox:/abs/path`) or
@@ -1827,7 +1845,8 @@ function _replaceMissingMarkdownVideo(video) {
 
   chip.appendChild(icon);
   chip.appendChild(text);
-  video.replaceWith(chip);
+  // The chip replaces the player's black frame too, as a missing image's chip replaces its shell.
+  (video.closest?.('.chat-md-video-shell') || video).replaceWith(chip);
 }
 
 function _clearMarkdownVideoLoadFailure(video) {
@@ -1981,7 +2000,8 @@ function _dropFailedProducedPreview(el) {
 function _localMediaReferenceBasename(src) {
   const raw = String(src || '').trim();
   if (!raw || /[\u0000-\u001f\u007f]/.test(raw)) return '';
-  let local = _chatMediaLocalPathFromUrl(raw);
+  // A broken segment elsewhere in a local link leaves its file name readable.
+  let local = _chatMediaLocalPathFromUrl(raw) || _undecodableChatMediaLocalPath(raw);
   if (!local) {
     if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(raw)) return '';
     local = raw.split(/[?#]/, 1)[0];
@@ -2029,9 +2049,14 @@ if (typeof document !== 'undefined') document.addEventListener('error', (e) => {
     _replaceMissingMarkdownImage(target);
     return;
   }
+  // A link that names no file can never play, so it gets no player and no retry.
+  const unreadable = !!_undecodableChatMediaLocalPath(target.getAttribute?.('src') || target.currentSrc);
   if (target.tagName === 'VIDEO') {
-    _diagnoseMarkdownVideoError(target);
+    if (unreadable) _replaceMissingMarkdownVideo(target);
+    else _diagnoseMarkdownVideoError(target);
+    return;
   }
+  if (unreadable) (target.closest?.('.chat-md-audio-card') || target).remove();
 }, true);
 
 const _CHAT_VIDEO_NATIVE_CONTROLS_GUARD_PX = 48;

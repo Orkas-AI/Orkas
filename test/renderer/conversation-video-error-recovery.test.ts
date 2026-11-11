@@ -150,14 +150,17 @@ function loadHarness(invoke: (channel: string, payload: Record<string, unknown>)
   };
   vm.runInNewContext(utilsSource, sandbox, { filename: 'utils.js' });
 
+  const reply = new FakeElement('div', 'markdown-body');
   const shell = new FakeElement('span', 'chat-md-video-shell');
   const video = new FakeElement('video', 'chat-md-video');
   video.currentSrc = 'chat-media://local/Users/test/final.mp4?v=1-1-100';
   video.setAttribute('src', video.currentSrc);
   video.setAttribute('aria-label', 'final');
+  reply.appendChild(shell);
   shell.appendChild(video);
   return {
     listeners,
+    reply,
     shell,
     video,
     applyMaterializedMedia: (sandbox as any)._applyMaterializedMarkdownMedia as (
@@ -235,13 +238,28 @@ describe('markdown video error recovery', () => {
   });
 
   it('shows the missing-video chip only after the host confirms not_found', async () => {
-    const { listeners, shell, video } = loadHarness(async () => ({ diagnosis: 'not_found' }));
+    const { listeners, reply, shell, video } = loadHarness(async () => ({ diagnosis: 'not_found' }));
 
     emit(listeners, 'error', { target: video });
-    await vi.waitFor(() => expect(video.parentNode).toBeNull());
+    await vi.waitFor(() => expect(shell.parentNode).toBeNull());
 
-    expect(shell.children.some((child) => child.className === 'chat-md-video-missing')).toBe(true);
+    // The chip takes the player's place, black frame included, so nothing looks playable.
+    expect(reply.children.map((child) => child.className)).toEqual(['chat-md-video-missing']);
     expect(shell.querySelector('[data-chat-md-video-load-failure="1"]')).toBeNull();
+  });
+
+  it('gives a link that names no file the missing-video chip without a retry or a host check', () => {
+    const invoke = vi.fn(async () => ({ diagnosis: 'bad_input' }));
+    const { listeners, reply, video } = loadHarness(invoke);
+    // 2026-11-07: a model copied a delivery link and broke a Chinese folder name's encoding.
+    const broken = 'chat-media://local/Users/test/%E8%BF%99%E6%98%AF%E护眼台灯/final.mp4?v=1';
+    video.currentSrc = broken;
+    video.setAttribute('src', broken);
+
+    emit(listeners, 'error', { target: video });
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(reply.children.map((child) => child.className)).toEqual(['chat-md-video-missing']);
   });
 
   it('falls back to a recoverable load failure when diagnosis itself fails', async () => {

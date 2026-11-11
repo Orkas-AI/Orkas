@@ -307,6 +307,68 @@ test('surfaces produced files, outside files, and artifacts for one conversation
   await orkas.acknowledgeRendererFailure({ surface: page, after: staleNarrationDiagnostics, count: 1,
     detail: 'Failed to load resource: the server responded with a status of 404 (Not Found)' });
 
+  // A model can copy a long delivery link wrong: on 2026-11-07 Luna's link broke the
+  // percent-encoding of a Chinese folder name mid-character. Such a link names no file, so it
+  // never plays and retrying cannot help. With the delivered file shown by the host in the same
+  // reply, the reply keeps that one player; without it, the link becomes the missing-video chip.
+  const deliveredPath = path.join(wsDir, 'main-v1.mp4');
+  await orkas.electronApp!.evaluate(async (_electron, args) => {
+    const require = (process as any).mainModule.require.bind((process as any).mainModule);
+    const { ffmpeg } = require(args.module).bundledFfmpegPaths();
+    if (!ffmpeg) throw new Error('Bundled FFmpeg is required for this fixture');
+    await new Promise<void>((resolve, reject) => {
+      require('node:child_process').execFile(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'testsrc2=s=320x568:r=30:d=1', '-c:v', 'libx264', '-preset', 'veryfast',
+        '-pix_fmt', 'yuv420p', '-threads', '1', args.file],
+      { windowsHide: true, timeout: 60000 }, (error: Error | null) => (error ? reject(error) : resolve()));
+    });
+  }, { module: path.resolve(__dirname, '../../src/main/util/bundled-runtime.ts'), file: deliveredPath });
+  const encodedReports = wsDir.replace(/^\//, '').split(/[\\/]/).map(encodeURIComponent).join('/');
+  const brokenDeliveryUrl = `chat-media://local/${encodedReports}/%E8%BF%99%E6%98%AF%E护眼台灯/main-v1.mp4?v=1-1-1`;
+  const brokenDiagnostics = orkas.rendererDiagnosticCheckpoint();
+  const brokenResponse = page.waitForResponse(response => response.url().startsWith(`chat-media://local/${encodedReports}/%E8%BF%99`));
+  appendFileSync(chatFile(cid), `${JSON.stringify({
+    id: 'm_outputs_reply_broken_delivery_link',
+    ts: new Date().toISOString(),
+    from: 'commander',
+    to: ['user'],
+    text: `[Download the video](${brokenDeliveryUrl}) The video is ready.`,
+    produced: [deliveredPath],
+  })}\n`, 'utf8');
+  await reopen();
+  const delivered = page.locator('#chat-history .chat-message.assistant').last();
+  await expect(delivered.locator('.chat-msg-produced-media video')).toHaveCount(1);
+  await expect(delivered.locator('video')).toHaveCount(1);
+  await expect(delivered.locator('.chat-md-video-load-failure, .chat-md-video-missing')).toHaveCount(0);
+  await expect.poll(() => delivered.locator('.chat-msg-produced-media video')
+    .evaluate((video: HTMLVideoElement) => video.duration)).toBeGreaterThan(0.9);
+  expect((await brokenResponse).status()).toBe(400);
+  await orkas.acknowledgeRendererFailure({ surface: page, after: brokenDiagnostics, count: 1,
+    detail: 'Failed to load resource: the server responded with a status of 400 (Bad Request)' });
+
+  const brokenAloneDiagnostics = orkas.rendererDiagnosticCheckpoint();
+  appendFileSync(chatFile(cid), `${JSON.stringify({
+    id: 'm_outputs_reply_broken_link_alone',
+    ts: new Date().toISOString(),
+    from: 'commander',
+    to: ['user'],
+    text: `Earlier cut:\n\n[Earlier cut](chat-media://local/${encodedReports}/%E8%BF%99%E6%98%AF%E护眼台灯/earlier-cut.mp4)`,
+  })}\n`, 'utf8');
+  await reopen();
+  const alone = page.locator('#chat-history .chat-message.assistant').last();
+  await expect(alone.locator('.chat-md-video-missing')).toHaveCount(1);
+  for (const [language, width, height] of [['en', 1280, 720], ['zh', 900, 600]] as const) {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(lang => (window as any).setLang(lang), language);
+    await alone.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath('missing-media-' + language + '.png') });
+  }
+  await page.evaluate(() => (window as any).setLang('en'));
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await expect(alone.locator('.chat-md-video-shell, video, .chat-md-video-load-failure')).toHaveCount(0);
+  await orkas.acknowledgeRendererFailure({ surface: page, after: brokenAloneDiagnostics, count: 1,
+    detail: 'Failed to load resource: the server responded with a status of 400 (Bad Request)' });
+
   // Revisit existing files in the body while the footer contains only this
   // reply's new output. The outside file needs the current conversation scope;
   // a custom link label must not replace the filename used to select a viewer.

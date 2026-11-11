@@ -1314,7 +1314,14 @@ function registerChatMediaProtocol(): void {
         // on bad-ext only — every other failure (not_found / too_large) is
         // terminal, so we don't mask a real error by re-checking under a
         // different bucket.
-        const abs = _pathnameToAbsPath(u.pathname || '');
+        let abs: string;
+        try {
+          abs = _pathnameToAbsPath(u.pathname || '');
+        } catch {
+          // A link whose path encoding is broken names no file: the request is at fault.
+          log.warn('chat-media/local: reject', { error_code: 'bad_input' });
+          return new Response('bad request', { status: 400 });
+        }
         let resolved: ReturnType<typeof chatAttachments.resolveLocalMediaPath>
           | ReturnType<typeof chatAttachments.resolveLocalPreviewPath>
           = chatAttachments.resolveLocalMediaPath(abs);
