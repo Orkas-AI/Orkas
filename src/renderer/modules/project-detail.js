@@ -120,6 +120,7 @@ async function loadProjectDetail(pid) {
   _closeProjectDriverHint();
   const loadSeq = ++_projectDetailLoadSeq;
   const libraryRevision = _projectLibraryRevision;
+  const instructionsRevision = _projectInstructionsRevision;
   const account = typeof currentUserId === 'string' ? currentUserId : '';
   const isCurrent = () => loadSeq === _projectDetailLoadSeq && pid === _projectDetailPid
     && account === (typeof currentUserId === 'string' ? currentUserId : '');
@@ -224,7 +225,7 @@ async function loadProjectDetail(pid) {
     // These cards read persisted project files. Show each answer as soon as it
     // arrives, even if an unrelated card or startup refresh is still pending.
     instructionsCall.then((res) => {
-      if (!isCurrent() || !res?.ok || !_projectDetailMeta) return;
+      if (!isCurrent() || !res?.ok || !_projectDetailMeta || instructionsRevision !== _projectInstructionsRevision) return;
       _projectDetailMeta.instructions = { content: String(res.content || ''), limit: Number(res.limit) || 4000 };
       _renderProjectInstructions();
     }).catch(() => { /* the batch below owns the load failure */ });
@@ -256,7 +257,9 @@ async function loadProjectDetail(pid) {
       agentDetails: Array.isArray(listRes.agentDetails) ? listRes.agentDetails : [],
       files: fileTree,
       libraryStatus: kbRes?.ok ? kbRes : null,
-      instructions: instrRes?.ok ? { content: String(instrRes.content || ''), limit: Number(instrRes.limit) || 4000 } : null,
+      instructions: instructionsRevision !== _projectInstructionsRevision
+        ? _projectDetailMeta.instructions
+        : (instrRes?.ok ? { content: String(instrRes.content || ''), limit: Number(instrRes.limit) || 4000 } : null),
     };
     _projectDetailResolvedPid = pid;
     _renderProjectDetail({ refreshMemory: false });
@@ -540,6 +543,12 @@ function _bindProjectAutoAddBtn() {
 // a dialog, so a draft is never mistaken for what conversations actually get.
 
 let _projectInstructionsStatusTimer = 0;
+let _projectInstructionsRevision = 0;
+let _projectInstructionsEditorEpoch = 0;
+let _projectInstructionsReadSeq = 0;
+let _projectInstructionsSaveSeq = 0;
+let _projectInstructionsLastSaveSeq = 0;
+let _projectInstructionsScopeEpoch = 0;
 
 function _renderProjectInstructions() {
   const input = document.getElementById('project-instructions-input');
@@ -549,6 +558,11 @@ function _renderProjectInstructions() {
   const editing = input.dataset.projectId === _projectDetailPid
     && document.getElementById('project-instructions-modal')?.classList.contains('open');
   if (!editing) input.value = meta ? meta.content : '';
+  if (input.dataset.projectId !== _projectDetailPid) {
+    _projectInstructionsEditorEpoch++;
+    _projectInstructionsScopeEpoch++;
+    _projectInstructionsLastSaveSeq = 0;
+  }
   input.dataset.savedValue = meta ? meta.content : '';
   input.dataset.projectId = String(_projectDetailPid || '');
   input.dataset.limit = String(limit);
@@ -594,6 +608,7 @@ function _openProjectInstructionsEditor() {
   const modal = document.getElementById('project-instructions-modal');
   const input = document.getElementById('project-instructions-input');
   if (!modal || !input || input.disabled) return;
+  _projectInstructionsEditorEpoch++;
   input.value = input.dataset.savedValue || '';
   _setProjectInstructionsStatus('');
   modal.classList.add('open');
@@ -616,6 +631,7 @@ async function _closeProjectInstructionsEditor({ force = false } = {}) {
     const ok = await uiConfirm(t('project.instructions.discard_confirm'));
     if (!ok) return;
   }
+  _projectInstructionsEditorEpoch++;
   if (input) input.value = saved;
   modal.classList.remove('open');
   modal.setAttribute('aria-hidden', 'true');
@@ -675,33 +691,47 @@ function _bindProjectInstructions() {
   saveBtn?.addEventListener('click', async () => {
     if (!_projectDetailPid || input.disabled) return;
     const projectId = _projectDetailPid;
+    const account = typeof currentUserId === 'string' ? currentUserId : '';
+    const editorEpoch = _projectInstructionsEditorEpoch;
+    const scopeEpoch = _projectInstructionsScopeEpoch;
+    const saveSeq = ++_projectInstructionsSaveSeq;
     const content = input.value;
-    const startedAt = performance.now();
+    const ownsProject = () => projectId === _projectDetailPid
+      && account === (typeof currentUserId === 'string' ? currentUserId : '')
+      && input.dataset.projectId === projectId && scopeEpoch === _projectInstructionsScopeEpoch;
+    const ownsEditor = () => ownsProject() && editorEpoch === _projectInstructionsEditorEpoch
+      && input.value === content && (typeof currentView !== 'string' || currentView === 'project');
     saveBtn.disabled = true;
     try {
       const res = await window.orkas.invoke('projects.instructions.set', { projectId, content });
       if (!res?.ok) {
         const failure = _projectDetailFailure(res, 'instructions_save_failed');
         _projectLogFailure('project_instructions_update', { source: 'detail', ...failure });
-        if (typeof uiAlert === 'function') uiAlert(t('project.instructions.save_failed'));
+        if (ownsEditor() && typeof uiAlert === 'function') uiAlert(t('project.instructions.save_failed'));
         _updateProjectInstructionsFoot();
         return;
       }
       // The user may switch projects while this save is in flight. The
       // mutation still belongs to the captured project and its result is
       // valid, but the shared detail input may already render another one.
-      if (input.dataset.projectId === projectId) input.dataset.savedValue = content;
-      if (projectId === _projectDetailPid && _projectDetailMeta?.instructions) {
-        _projectDetailMeta.instructions.content = content;
+      const closeEditor = ownsEditor();
+      const newerSave = _projectInstructionsLastSaveSeq > saveSeq;
+      if (ownsProject() && !newerSave) {
+        _projectInstructionsLastSaveSeq = saveSeq;
+        _projectInstructionsRevision++;
+        input.dataset.savedValue = content;
+        if (_projectDetailMeta?.instructions) _projectDetailMeta.instructions.content = content;
+        _renderProjectInstructionsRead();
       }
-      _renderProjectInstructionsRead();
-      _closeProjectInstructionsEditor({ force: true });
-      _setProjectInstructionsStatus(t('project.instructions.saved'));
+      if (closeEditor) {
+        _closeProjectInstructionsEditor({ force: true });
+        _setProjectInstructionsStatus(t('project.instructions.saved'));
+      }
     } catch (err) {
       const failure = _projectDetailFailure(err, 'instructions_save_exception');
       _projectLogFailure('project_instructions_update', { source: 'detail', ...failure });
       _projectDetailLog.warn('save project instructions failed', err);
-      if (typeof uiAlert === 'function') uiAlert(t('project.instructions.save_failed'));
+      if (ownsEditor() && typeof uiAlert === 'function') uiAlert(t('project.instructions.save_failed'));
     }
     _updateProjectInstructionsFoot();
   });
@@ -746,8 +776,16 @@ let _projectTasksReloadTimer = null;
 function _onProjectInstructionsChanged(payload) {
   const pid = payload && payload.projectId;
   if (!pid || pid !== _projectDetailPid || currentView !== 'project' || !_projectDetailMeta) return;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  const loadSeq = _projectDetailLoadSeq;
+  const revision = _projectInstructionsRevision;
+  const readSeq = ++_projectInstructionsReadSeq;
   window.orkas.invoke('projects.instructions.get', { projectId: pid }).then((res) => {
-    if (!res?.ok || pid !== _projectDetailPid || !_projectDetailMeta) return;
+    if (!res?.ok || pid !== _projectDetailPid || !_projectDetailMeta
+      || account !== (typeof currentUserId === 'string' ? currentUserId : '')
+      || loadSeq !== _projectDetailLoadSeq || revision !== _projectInstructionsRevision
+      || readSeq !== _projectInstructionsReadSeq) return;
+    _projectInstructionsRevision++;
     _projectDetailMeta.instructions = { content: String(res.content || ''), limit: Number(res.limit) || 4000 };
     _renderProjectInstructions();
   }).catch(() => { /* the next page load reads the saved rules */ });

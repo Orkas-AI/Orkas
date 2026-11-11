@@ -75,6 +75,37 @@ function mountWithSlowSecondaryCard({ delayInstructionsFor = '' } = {}) {
 }
 
 describe('project detail local cache after restart', () => {
+  it.each(['secondary card', 'instructions read'])('keeps an acknowledged rules save after an older %s finishes', async pending => {
+    const { context, nodes, finishAutoTasks, releaseInstructions } = mountWithSlowSecondaryCard({
+      delayInstructionsFor: pending === 'instructions read' ? 'project_a' : '',
+    });
+    const handlers: Record<string, () => Promise<void>> = {};
+    nodes['project-instructions-input'].addEventListener = () => {};
+    nodes['project-instructions-save-btn'] = { disabled: false,
+      addEventListener: (name: string, handler: () => Promise<void>) => { handlers[name] = handler; } };
+    nodes['project-instructions-edit-btn'].addEventListener = () => {};
+    nodes['project-instructions-setup-btn'].addEventListener = () => {};
+    const invoke = context.window.orkas.invoke;
+    context.window.orkas.invoke = (channel: string, args: any) => channel === 'projects.instructions.set'
+      ? Promise.resolve({ ok: true }) : invoke(channel, args);
+    vm.runInContext('_projectDetailPid = "project_a"; _projectDetailMeta = { instructions: { content: "Saved local rules", limit: 4000 } }', context);
+    context._renderProjectInstructions();
+    const loading = context.loadProjectDetail('project_a');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    context._bindProjectInstructions();
+    nodes['project-instructions-input'].value = 'New acknowledged rules';
+    await handlers.click();
+    expect(nodes['project-instructions-read'].textContent).toBe('New acknowledged rules');
+    releaseInstructions();
+    finishAutoTasks({ ok: true, tasks: [] });
+    await loading;
+    context._renderProjectInstructions();
+    expect(vm.runInContext('_projectDetailMeta.instructions.content', context)).toBe('New acknowledged rules');
+    expect(nodes['project-instructions-read'].textContent).toBe('New acknowledged rules');
+    expect(nodes['project-files-list'].innerHTML).toContain('cached.md');
+    expect(nodes['project-agents-list'].innerHTML).toContain('Cached Writer');
+  });
+
   it('does not restore a deleted file from a project load started before deletion', async () => {
     const { context, nodes, finishAutoTasks } = mountWithSlowSecondaryCard();
     let finishTree!: (value: unknown) => void;

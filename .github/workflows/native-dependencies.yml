@@ -77,6 +77,15 @@ jobs:
           test/main/features/local_agents/version.test.ts
           test/main/features/local_agents/base.test.ts
           test/main/features/local_agents/watchdog.test.ts
+      - name: Verify project rules draft and acknowledgement ownership
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/renderer/project-instructions-editor.test.ts
+          test/renderer/project-detail-local-cache.test.ts
+          test/renderer/project-memory-controls.test.ts
+          test/renderer/project-library-index-recovery.test.ts
+          test/renderer/project-viewer-ownership.test.ts
+          test/main/features/projects.test.ts
       - name: Verify failed OpenCode capability discovery and retry
         run: >-
           npm run test:js -- --maxWorkers=1
