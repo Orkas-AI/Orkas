@@ -56,6 +56,7 @@
   // contexts row menus); the acting context is stashed per-open.
   let _menuEl = null;
   let _menuCtx = null;     // { frame, cid, artifactId, title } of the open menu
+  let _menuRect = null;
   let _menuAnchor = null;
 
   function _logArtifactFailure(action, data) {
@@ -303,6 +304,7 @@
     if (_menuAnchor) _menuAnchor.classList.remove('is-menu-open');
     _menuCtx = null;
     _menuAnchor = null;
+    _menuRect = null;
   }
 
   function _ensureMenuEl() {
@@ -318,7 +320,13 @@
       _closeMenu();
     });
     document.addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Escape' && el.style.display !== 'none') _closeMenu(); });
-    window.addEventListener('scroll', _closeMenu, true);
+    window.addEventListener('scroll', () => {
+      // Scrolling an iframe, or a delayed click-to-scroll notification, does
+      // not move the card header. Only invalidate an actually displaced anchor.
+      if (!_menuAnchor || !_menuRect) return;
+      const rect = _menuAnchor.getBoundingClientRect();
+      if (['top', 'left', 'right', 'bottom'].some(key => rect[key] !== _menuRect[key])) _closeMenu();
+    }, true);
     window.addEventListener('resize', _closeMenu);
     window.addEventListener('i18n-change', _closeMenu);
     _menuEl = el;
@@ -357,6 +365,7 @@
     el.style.left = '-9999px';
     el.style.top = '-9999px';
     const rect = anchorEl.getBoundingClientRect();
+    _menuRect = rect;
     const mr = el.getBoundingClientRect();
     const margin = 8;
     const gap = 4;

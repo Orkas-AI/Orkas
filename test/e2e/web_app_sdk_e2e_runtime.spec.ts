@@ -574,7 +574,7 @@ test('isolated origin denies forged messages, foreign data and revoked SDK calls
   orkas.acknowledgeBrowserDenial(frame.owner().page(), { kind: 'csp-connect', url: remote.url, after: denialAfter });
 });
 
-test('local SDK chat artifacts submit results but external destinations cannot submit or call the SDK', async ({ modelOrkas: orkas }) => {
+test('local SDK chat artifacts submit results but external destinations cannot submit or call the SDK', async ({ modelOrkas: orkas }, testInfo) => {
   const artifact: any = await orkas.electronApp!.evaluate(async (_electron, args) => {
     const { createArtifact } = (process as any).mainModule.require(args.artifacts);
     const { getActiveUserId } = (process as any).mainModule.require(args.users);
@@ -592,6 +592,23 @@ test('local SDK chat artifacts submit results but external destinations cannot s
     (window as any).sendInCurrentConversation = () => { (window as any).artifactSubmissions++; };
     (window as any).renderChatArtifact(host, { cid: 'sdk-chat-test', artifactId: id, title: 'SDK chat', agentId: 'commander' });
   }, artifact.artifactId);
+  const more = orkas.page!.locator('#sdk-artifact-test .chat-artifact-more');
+  await more.click();
+  const menu = orkas.page!.locator('.chat-artifact-menu');
+  await expect(menu).toBeVisible();
+  await orkas.page!.evaluate(() => window.dispatchEvent(new Event('scroll')));
+  await expect(menu).toBeVisible();
+  await orkas.page!.screenshot({ path: testInfo.outputPath('artifact-menu-stationary.png') });
+  await orkas.page!.evaluate(() => {
+    document.getElementById('sdk-artifact-test')!.style.transform = 'translateY(16px)';
+    window.dispatchEvent(new Event('scroll'));
+  });
+  await expect(menu).toBeHidden();
+  await orkas.page!.evaluate(() => { document.getElementById('sdk-artifact-test')!.style.transform = ''; });
+  await more.click();
+  await expect(menu).toBeVisible();
+  await orkas.page!.keyboard.press('Escape');
+  await expect(menu).toBeHidden();
   const frame = orkas.page!.locator('#sdk-artifact-test iframe').contentFrame();
   await expect(frame.locator('h1')).toHaveText('SDK App');
   await frame.locator('body').evaluate(async () => {

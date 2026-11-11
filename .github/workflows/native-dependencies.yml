@@ -92,6 +92,15 @@ jobs:
           test/main/features/local_agents/runner.test.ts
           test/main/ipc/local-agents-runtime-options.test.ts
           test/main/features/local_agents/sessions.test.ts
+      - name: Verify artifact menu scroll ownership
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/renderer/artifact-menu-scroll.test.ts
+          test/renderer/artifact-security.test.ts
+          test/renderer/artifact-submit.test.ts
+          test/renderer/artifact-revisions.test.ts
+          test/main/features/chat-artifact-frame-contract.test.ts
+          test/main/features/chat-artifact-revisions.test.ts
       - name: Verify Claude final stream records and lifecycle
         run: >-
           npm run test:js -- --maxWorkers=1
