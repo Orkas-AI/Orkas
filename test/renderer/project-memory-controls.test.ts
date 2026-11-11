@@ -99,6 +99,7 @@ describe('project memory controls', () => {
     expect(source).toContain('saveBtn.disabled = !dirty || over');
     expect(source).toContain("uiAlert(t('project.instructions.save_failed'))");
     expect(source).toContain("input.dataset.projectId = String(_projectDetailPid || '')");
-    expect(source).toContain('if (input.dataset.projectId === projectId) input.dataset.savedValue = content');
+    // Async save ownership is exercised through the actual handler in
+    // project-instructions-editor.test.ts, including navigation and drafts.
   });
 });
