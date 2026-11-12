@@ -103,3 +103,100 @@ describe('project memory controls', () => {
     // project-instructions-editor.test.ts, including navigation and drafts.
   });
 });
+
+function mountMemory() {
+  const node = (): any => ({
+    dataset: {}, style: {}, hidden: false, value: '', disabled: false, maxLength: 4000,
+    listeners: {} as Record<string, (...args: any[]) => any>,
+    appendChild() {}, setAttribute() {}, focus() {}, setSelectionRange() {},
+    addEventListener(name: string, handler: (...args: any[]) => any) { this.listeners[name] = handler; },
+  });
+  const nodes: Record<string, any> = Object.fromEntries([
+    'project-memory-list', 'project-memory-editor', 'project-memory-editor-input',
+    'project-memory-editor-save', 'project-memory-editor-cancel', 'project-memory-editor-counter',
+  ].map(id => [id, node()]));
+  const requests: any[] = [], alerts: unknown[] = [];
+  const context = vm.createContext({
+    console, currentUserId: 'account_a', currentView: 'project',
+    createLogger: () => ({warn() {}, info() {}, error() {}}),
+    document: { readyState: 'loading', addEventListener() {},
+      getElementById: (id: string) => nodes[id] || null, querySelector: () => null, createElement: node },
+    window: {addEventListener() {}, orkas: {invoke: async (channel: string, payload: unknown) => {
+      requests.push({channel, payload}); return {ok: true, entries: ['Protected fact']};
+    }}},
+    uiAlert: (message: unknown) => alerts.push(message), escapeHtml: (s: string) => s,
+    t: (key: string) => key, setTimeout, clearTimeout,
+  });
+  vm.runInContext(source, context, {filename: 'project-detail.js'});
+  vm.runInContext('_projectDetailPid = "project_a"; _projectMemory = ["Shared wording", "Protected fact"]', context);
+  context._bindProjectMemory();
+  return {context, nodes, requests, alerts};
+}
+
+it.each(['project', 'account'])('does not delete another scope after an old memory confirmation crosses %s', async transition => {
+  const {context, nodes, requests} = mountMemory();
+  let finish!: (value: boolean) => void;
+  context.uiConfirm = () => new Promise(resolve => { finish = resolve; });
+  const button = {dataset: {action: 'project-memory-delete', memoryIndex: '0'}};
+  const deleting = nodes['project-memory-list'].listeners.click({target: {closest: () => button}});
+  if (transition === 'project') vm.runInContext('_projectDetailPid = "project_b"; _projectMemory = ["Shared wording", "B protected fact"]', context);
+  else context.currentUserId = 'account_b';
+  finish(true);
+  await deleting;
+  expect(requests).toEqual([]);
+  expect(vm.runInContext('_projectMemory', context)).toEqual(transition === 'project' ? ['Shared wording', 'B protected fact'] : ['Shared wording', 'Protected fact']);
+});
+
+it('still deletes the confirmed memory entry in its unchanged project', async () => {
+  const {context, nodes, requests} = mountMemory();
+  context.uiConfirm = async () => true;
+  const button = {dataset: {action: 'project-memory-delete', memoryIndex: '0'}};
+  await nodes['project-memory-list'].listeners.click({target: {closest: () => button}});
+  expect(requests).toEqual([{channel: 'memory.remove', payload: {target: 'project', projectId: 'project_a', oldText: 'Shared wording'}}]);
+  expect(vm.runInContext('_projectMemory', context)).toEqual(['Protected fact']);
+});
+
+it.each(['new draft', 'new editor', 'project', 'account'])('preserves the %s when a prior memory save completes', async transition => {
+  const {context, nodes} = mountMemory();
+  let finish!: (value: unknown) => void;
+  context.window.orkas.invoke = () => new Promise(resolve => { finish = resolve; });
+  context._openProjectMemoryEditor('add');
+  const input = nodes['project-memory-editor-input'];
+  input.value = 'Submitted memory fact';
+  const saving = context._saveProjectMemoryEditor();
+  if (transition === 'new editor') context._openProjectMemoryEditor('add');
+  if (transition === 'project') {
+    vm.runInContext('_projectDetailPid = "project_b"; _projectMemory = ["B protected fact"]', context);
+    context._openProjectMemoryEditor('add');
+  }
+  if (transition === 'account') context.currentUserId = 'account_b';
+  input.value = 'Current unsaved memory draft';
+  finish({ok: true, entries: ['Submitted memory fact', 'Protected fact']});
+  await saving;
+  expect(nodes['project-memory-editor'].hidden).toBe(false);
+  expect(input.value).toBe('Current unsaved memory draft');
+  if (transition === 'account') expect(vm.runInContext('_projectMemory', context)).toEqual(['Shared wording', 'Protected fact']);
+  if (transition === 'project') expect(vm.runInContext('_projectMemory', context)).toEqual(['B protected fact']);
+});
+
+it('keeps a successful unchanged memory save and closes only that editor', async () => {
+  const {context, nodes, requests} = mountMemory();
+  context._openProjectMemoryEditor('add');
+  nodes['project-memory-editor-input'].value = 'New fact';
+  await context._saveProjectMemoryEditor();
+  expect(requests).toEqual([{channel: 'memory.add', payload: {target: 'project', projectId: 'project_a', content: 'New fact'}}]);
+  expect(nodes['project-memory-editor'].hidden).toBe(true);
+});
+
+it.each(['rejection', 'exception'])('keeps a memory mutation %s from alerting a later account', async outcome => {
+  const {context, nodes, alerts} = mountMemory();
+  let finish!: (value: unknown) => void, fail!: (error: Error) => void;
+  context.window.orkas.invoke = () => new Promise((resolve, reject) => { finish = resolve; fail = reject; });
+  context._openProjectMemoryEditor('add');
+  nodes['project-memory-editor-input'].value = 'Submitted fact';
+  const saving = context._saveProjectMemoryEditor();
+  context.currentUserId = 'account_b';
+  if (outcome === 'exception') fail(new Error('controlled mutation failure')); else finish({ok: false, error: 'controlled rejection'});
+  await saving;
+  expect(alerts).toEqual([]);
+});

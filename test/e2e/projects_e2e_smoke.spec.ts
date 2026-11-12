@@ -64,6 +64,76 @@ async function createProject(orkas: OrkasTestApp, name: string): Promise<void> {
 }
 
 test.describe('projects', () => {
+  test('memory deletion confirmation never retargets the newly opened project', async ({ orkas }) => {
+    await createProject(orkas, 'E2E Memory Delete A');
+    await createProject(orkas, 'E2E Memory Delete B');
+    const page = orkas.page!;
+    const { projects } = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const a = projects.find(p => p.name === 'E2E Memory Delete A')!.project_id;
+    const b = projects.find(p => p.name === 'E2E Memory Delete B')!.project_id;
+    for (const projectId of [a, b]) {
+      await orkas.invoke('memory.add', {target: 'project', projectId, content: 'Same project-scoped fact'});
+      await orkas.invoke('memory.add', {target: 'project', projectId, content: 'Protected project fact'});
+    }
+    await page.evaluate(id => (window as any).loadProjectDetail(id), a);
+    await page.locator('[data-project-side-tabs="context"] [data-project-side-tab="memory"]').click();
+    const item = page.locator('.project-memory-item', {hasText: 'Same project-scoped fact'});
+    await item.hover();
+    await page.evaluate(() => {
+      const original = (window as any).orkas.invoke;
+      (window as any).orkas.invoke = (...args: unknown[]) => {
+        const pending = original(...args);
+        if (args[0] === 'memory.remove') (window as any).__memoryDeletionPending = pending;
+        return pending;
+      };
+    });
+    await item.locator('[data-action="project-memory-delete"]').click();
+    const confirm = page.locator('.ui-dialog-overlay.open').last();
+    await expect(confirm).toBeVisible();
+    await page.evaluate(id => (window as any).loadProjectDetail(id), b);
+    await confirm.locator('.btn-primary').click();
+    await expect(confirm).not.toBeVisible();
+    await page.evaluate(async () => { await (window as any).__memoryDeletionPending; });
+    // Consume the native stores, not a UI success flag or a mocked remove.
+    for (const projectId of [a, b]) {
+      expect(await orkas.invoke('memory.list', {target: 'project', projectId}))
+        .toMatchObject({ok: true, entries: ['Same project-scoped fact', 'Protected project fact']});
+    }
+  });
+
+  test('memory save keeps a later unsaved editor draft', async ({ orkas }, testInfo) => {
+    await createProject(orkas, 'E2E Memory Save Ownership');
+    const page = orkas.page!;
+    const { projects } = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const projectId = projects.find(p => p.name === 'E2E Memory Save Ownership')!.project_id;
+    await page.locator('[data-project-side-tabs="context"] [data-project-side-tab="memory"]').click();
+    await page.locator('#project-memory-add-empty-btn').click();
+    await page.locator('#project-memory-editor-input').fill('Submitted fact');
+    await orkas.electronApp!.evaluate(({ipcMain}) => {
+      const original = (ipcMain as any)._invokeHandlers.get('orkas.invoke');
+      const state = {finish: null as any, restore: () => {ipcMain.removeHandler('orkas.invoke'); ipcMain.handle('orkas.invoke', original);}};
+      (globalThis as any).__memorySave = state;
+      ipcMain.removeHandler('orkas.invoke');
+      ipcMain.handle('orkas.invoke', async (event, request) => {
+        const response = await original(event, request);
+        if (request?.channel === 'memory.add') return new Promise(resolve => {state.finish = () => {state.finish = null; resolve(response);};});
+        return response;
+      });
+    });
+    try {
+      await page.locator('#project-memory-editor-save').click();
+      await expect.poll(() => orkas.electronApp!.evaluate(() => !!(globalThis as any).__memorySave.finish)).toBe(true);
+      await page.locator('#project-memory-editor-input').fill('Later unsaved memory draft');
+      await orkas.electronApp!.evaluate(() => (globalThis as any).__memorySave.finish());
+      await expect(page.locator('#project-memory-editor')).toBeVisible();
+      await expect(page.locator('#project-memory-editor-input')).toHaveValue('Later unsaved memory draft');
+      expect(await orkas.invoke('memory.list', {target: 'project', projectId})).toMatchObject({entries: ['Submitted fact']});
+      await page.screenshot({path: testInfo.outputPath('memory-later-draft.png')});
+    } finally {
+      await orkas.electronApp!.evaluate(() => {const s=(globalThis as any).__memorySave;s.finish?.();s.restore();});
+    }
+  });
+
   test('a stale discard confirmation preserves the current project draft', async ({ orkas }, testInfo) => {
     await createProject(orkas, 'E2E Discard A');
     await createProject(orkas, 'E2E Discard B');
