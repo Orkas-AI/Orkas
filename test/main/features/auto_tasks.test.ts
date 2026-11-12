@@ -2905,6 +2905,87 @@ describe('multi-selection recovery and clock changes', () => {
     await waitForSchedulerOutcome(() => armedDueAtForTest(created.task.id) === new Date(2026, 11, 1, 9).getTime(), 'next selected month');
   });
 
+  it('does not re-arm after shutdown while an admission-failure read is pending', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 10, 2, 8));
+    activateUser(TEST_UID);
+    const created = await createTask(TEST_UID, { content: 'Stop during failure recovery', schedule: { type: 'daily', hour: 9, minute: 0 } });
+    if (!created.ok) throw new Error('Scheduler failure fixture rejected');
+    startScheduler();
+    await rescheduleAllForTest(TEST_UID);
+    vi.setSystemTime(new Date(2026, 10, 2, 9));
+    const events: any[] = [];
+    const unsubscribe = subscribeFiresForUser(TEST_UID, event => events.push(event));
+    let release!: () => void;
+    let paused = false;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const readJson = storage.readJson;
+    const spy = vi.spyOn(storage, 'readJson').mockImplementation(async (...args) => {
+      const value = await readJson(...args);
+      if (!paused && args[0] === autoTaskConfigFile(TEST_UID, created.task.id)
+        && events.some(event => event.type === 'fire_failed')) {
+        paused = true;
+        await pending;
+      }
+      return value;
+    });
+    _setMarkRanFailureForTest(new Error('injected admission failure'));
+    const firing = _onTimerFireForTest(TEST_UID, created.task.id);
+    try {
+      await waitForSchedulerOutcome(() => paused, 'the failure recovery read to pause');
+      stopScheduler();
+      release();
+      await firing;
+      expect(armedDueAtForTest(created.task.id)).toBeNull();
+      expect(autoRuntime.send).not.toHaveBeenCalled();
+      expect(events).toEqual([expect.objectContaining({ type: 'fire_failed', task_id: created.task.id, error_code: 'mark_ran_failed' })]);
+      expect((await getTask(TEST_UID, created.task.id))?.last_run_at).toBeUndefined();
+    } finally {
+      release();
+      await firing;
+      spy.mockRestore();
+      _setMarkRanFailureForTest(null);
+      unsubscribe();
+    }
+  });
+
+  it('does not re-arm a stopped scheduler after an admitted dispatch finishes', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 10, 2, 8));
+    activateUser(TEST_UID);
+    const created = await createTask(TEST_UID, { content: 'Stop during dispatch', schedule: { type: 'daily', hour: 9, minute: 0 } });
+    if (!created.ok) throw new Error('Scheduler stop fixture rejected');
+    startScheduler();
+    await rescheduleAllForTest(TEST_UID);
+    vi.setSystemTime(new Date(2026, 10, 2, 9));
+    let release!: () => void;
+    let admitted = false;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const send = autoRuntime.send.getMockImplementation()!;
+    autoRuntime.send.mockImplementationOnce(async input => {
+      const result = await send(input);
+      admitted = true;
+      await pending;
+      return result;
+    });
+    const firing = _onTimerFireForTest(TEST_UID, created.task.id);
+    try {
+      await waitForSchedulerOutcome(() => admitted, 'the admitted dispatch to pause');
+      stopScheduler();
+      expect(armedDueAtForTest(created.task.id)).toBeNull();
+      release();
+      await firing;
+      expect(armedDueAtForTest(created.task.id)).toBeNull();
+      expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+      expect((await getTask(TEST_UID, created.task.id))?.last_run_at).toBe(new Date(2026, 10, 2, 9).toISOString());
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+      expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    } finally {
+      release();
+      await firing;
+    }
+  });
+
   it('detects a forward wall-clock correction, catches up once and stops monitoring on shutdown', async () => {
     vi.useFakeTimers();vi.setSystemTime(new Date(2026, 10, 2, 8));activateUser(TEST_UID);
     const created = await createTask(TEST_UID, { content: 'Clock correction', schedule: { type: 'daily', hour: 9, minute: 0 } });
