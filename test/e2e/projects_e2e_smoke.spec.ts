@@ -64,6 +64,39 @@ async function createProject(orkas: OrkasTestApp, name: string): Promise<void> {
 }
 
 test.describe('projects', () => {
+  test('a stale discard confirmation preserves the current project draft', async ({ orkas }, testInfo) => {
+    await createProject(orkas, 'E2E Discard A');
+    await createProject(orkas, 'E2E Discard B');
+    const page = orkas.page!;
+    const { projects } = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const a = projects.find(p => p.name === 'E2E Discard A')!.project_id;
+    const b = projects.find(p => p.name === 'E2E Discard B')!.project_id;
+    await orkas.invoke('projects.instructions.set', { projectId: a, content: 'A saved rules' });
+    await orkas.invoke('projects.instructions.set', { projectId: b, content: 'B saved rules' });
+    await page.evaluate(id => (window as any).loadProjectDetail(id), a);
+    await page.locator('#project-instructions-edit-btn').click();
+    await page.locator('#project-instructions-input').fill('A abandoned draft');
+    await page.locator('#project-instructions-cancel-btn').click();
+    const confirm = page.locator('.ui-dialog-overlay.open').last();
+    await expect(confirm).toBeVisible();
+    // Account/project refresh can replace the shared editor while a global
+    // decision is pending. Keep the real dialog and production load path.
+    await page.evaluate(async id => {
+      await (window as any).loadProjectDetail(id);
+      (window as any)._openProjectInstructionsEditor();
+      const input = document.getElementById('project-instructions-input') as HTMLTextAreaElement;
+      input.value = 'B current unsaved draft';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }, b);
+    await confirm.locator('.btn-primary').click();
+    await expect(page.locator('#project-instructions-modal')).toHaveClass(/\bopen\b/);
+    await expect(page.locator('#project-instructions-input')).toHaveValue('B current unsaved draft');
+    await expect(page.locator('#project-instructions-read')).toHaveText('B saved rules');
+    expect(await orkas.invoke('projects.instructions.get', { projectId: a })).toMatchObject({ content: 'A saved rules' });
+    expect(await orkas.invoke('projects.instructions.get', { projectId: b })).toMatchObject({ content: 'B saved rules' });
+    await page.screenshot({ path: testInfo.outputPath('discard-preserved-project-draft.png') });
+  });
+
   test('keeps the newest persisted rules after two save replies arrive out of order', async ({ orkas }) => {
     await createProject(orkas, 'E2E Rules Save Order');
     const page = orkas.page!;

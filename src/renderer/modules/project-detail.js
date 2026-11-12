@@ -628,15 +628,25 @@ async function _closeProjectInstructionsEditor({ force = false } = {}) {
   const saved = input ? (input.dataset.savedValue || '') : '';
   const dirty = !!input && !input.disabled && input.value !== saved;
   if (!force && dirty && typeof uiConfirm === 'function') {
+    const projectId = _projectDetailPid;
+    const account = typeof currentUserId === 'string' ? currentUserId : '';
+    const editorEpoch = _projectInstructionsEditorEpoch;
+    const scopeEpoch = _projectInstructionsScopeEpoch;
+    const draft = input.value;
     const ok = await uiConfirm(t('project.instructions.discard_confirm'));
-    if (!ok) return;
+    // A discard decision belongs only to the draft that requested it.
+    if (!ok || projectId !== _projectDetailPid
+      || account !== (typeof currentUserId === 'string' ? currentUserId : '')
+      || editorEpoch !== _projectInstructionsEditorEpoch || scopeEpoch !== _projectInstructionsScopeEpoch
+      || input.dataset.projectId !== projectId || input.value !== draft
+      || !modal.classList.contains('open')) return;
   }
   _projectInstructionsEditorEpoch++;
-  if (input) input.value = saved;
+  if (input) input.value = input.dataset.savedValue || '';
   modal.classList.remove('open');
   modal.setAttribute('aria-hidden', 'true');
   _updateProjectInstructionsFoot();
-  const returnTo = saved.trim()
+  const returnTo = String(input?.dataset.savedValue || '').trim()
     ? document.getElementById('project-instructions-edit-btn')
     : document.getElementById('project-instructions-setup-btn');
   returnTo?.focus();
