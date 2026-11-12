@@ -47,7 +47,7 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform))('real Office re
     ['cancel-after-check', 'preserves the source and can render again after cancellation following a real check'],
     ['invalid-document', 'rejects invalid OpenXML without rendering or changing the source'],
     ['edit-then-review', 'saves an intentional edit, preserves the original and reviews the new revision'],
-    ['xlsx-render', 'renders a real workbook with no browser warnings or source mutation'],
+    ['xlsx-render', 'renders requested positions 1, 3 and 4 of a real workbook without source mutation'],
     ['pptx-render', 'renders a real presentation with no browser warnings or source mutation'],
     ['edit-10-paragraphs', 'PF-09 preserves every paragraph through a small real edit and cleanup'],
     ['edit-1000-paragraphs', 'PF-09 preserves every paragraph through a large real edit and cleanup'],
@@ -66,7 +66,7 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform))('real Office re
       expect(log).toMatchObject({ scope: 'office-tools', level: 'warn' });
       expect(log.args[0]).toBe('render error');
     }
-    if (row.measurement) console.log('[PF-09 native edit]', JSON.stringify({ ...row.measurement,
+    if (row.measurement) console.log(id === 'xlsx-render' ? '[Office worksheet selection]' : '[PF-09 native edit]', JSON.stringify({ ...row.measurement,
       commands: row.commands.map(command => ({ verb: command.verb, elapsedMs: command.elapsedMs })) }));
     const failures = row.commands.filter(command => command.code !== 0);
     if (id === 'invalid-document') {

@@ -122,6 +122,10 @@ jobs:
           test/renderer/utils-sanitize.test.ts
           test/main/util/window-security.test.ts
           test/main/util/http-range.test.ts
+      - name: Verify worksheet selection failure and cleanup
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/office/office_page_renderer.test.ts
       - name: Verify workbook formulas and interrupted directory recovery
         run: >-
           npm run test:js -- --maxWorkers=1

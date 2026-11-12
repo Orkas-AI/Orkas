@@ -197,6 +197,39 @@ describe('embedded Office page renderer', () => {
     } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
   });
 
+  it.each(['unavailable', 'cancelled'] as const)('does not capture a substitute worksheet when selection is %s', async (outcome) => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-office-worksheet-'));
+    const ses = fakeSession();
+    const controller = new AbortController();
+    mocks.runOfficeCli.mockImplementation(async (args: string[]) => {
+      fs.writeFileSync(args[args.indexOf('-o') + 1], '<html></html>');
+      return { code: 0, stdout: '', stderr: '' };
+    });
+    class SelectionWindow extends FakeBrowserWindow {
+      constructor(options: Record<string, unknown>) {
+        super(options);
+        const ordinary = this.webContents.executeJavaScript.getMockImplementation()!;
+        this.webContents.executeJavaScript.mockImplementation(async script => {
+          if (!script.includes("getAttribute('data-sheet')")) return ordinary(script);
+          if (outcome === 'cancelled') controller.abort();
+          return outcome === 'cancelled';
+        });
+      }
+    }
+    try {
+      await expect(renderOfficePageToPng(path.join(cwd, 'workbook.xlsx'), cwd, '3', controller.signal, {
+        loadElectron: async () => ({ BrowserWindow: SelectionWindow as any, session: { fromPartition: () => ses as any } }),
+      })).rejects.toThrow(outcome === 'cancelled' ? 'E_OFFICE_ABORTED' : 'E_OFFICE_RENDER_PAGE_UNAVAILABLE');
+      const win = FakeBrowserWindow.instances[0];
+      expect(win.webContents.capturePage).not.toHaveBeenCalled();
+      expect(win.destroy).toHaveBeenCalled();
+      expect(ses.clearCache).toHaveBeenCalled();
+      expect(ses.clearStorageData).toHaveBeenCalled();
+      const preview = fileURLToPath(new URL(win.loadURL.mock.calls[0][0]));
+      expect(fs.existsSync(path.dirname(preview))).toBe(false);
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
   it('installs the Office policy before generated scripts and preserves the source document', async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-office-policy-'));
     const source = path.join(cwd, 'fixture.docx');

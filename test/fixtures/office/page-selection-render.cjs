@@ -1,6 +1,7 @@
 // Exercise the production renderer in real Chromium with known Office HTML.
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { app, BrowserWindow, session } = require('electron');
 const pc = process.argv[2];
 const output = process.argv[3];
@@ -24,7 +25,14 @@ class ObservedWindow extends BrowserWindow {
     this.webContents.on('console-message', details => security.logs.push({ level: details.level, message: details.message }));
     const capture = this.webContents.capturePage.bind(this.webContents);
     this.webContents.capturePage = async rect => {
-      Object.assign(security, await this.webContents.executeJavaScript('window.securityProbe.finished.then(() => window.securityProbe.facts)'));
+      Object.assign(security, await this.webContents.executeJavaScript(`(async () => {
+        if (window.securityProbe) return window.securityProbe.finished.then(() => window.securityProbe.facts);
+        return {
+          sheets: Array.from(document.querySelectorAll('.sheet-content')).filter(el => el.offsetParent !== null)
+            .map(el => ({ index: el.dataset.sheet, text: el.textContent })),
+          tabs: Array.from(document.querySelectorAll('.sheet-tab.active')).map(el => el.dataset.sheet),
+        };
+      })()`));
       return capture(rect);
     };
   }
@@ -32,25 +40,44 @@ class ObservedWindow extends BrowserWindow {
 app.whenReady().then(async () => {
   const rows = [];
   try {
-    for (const [extension, container] of [['docx', 'page'], ['pptx', 'slide'], ['xlsx', 'sheet-content']]) {
-      for (const visible of [true, false]) {
-        // A real, empty page is valid. Hidden pages model an out-of-range
-        // selection emitted with exit code 0 by the pinned native engine.
+    if (process.argv[4] === 'worksheets') {
+      // Positions 2 and 4 deliberately have identical content. Identity, not
+      // differing image hashes, determines whether the requested sheet exists.
+      for (const page of ['1', '3', '4', '2', '5', '1']) {
         security = { logs: [] };
-        html = `<!doctype html><style>body{margin:0}.${container}{width:200px;height:200px;display:${visible ? 'block' : 'none'}}</style><div class="${container}"></div>
-<script>
-window.securityProbe = { facts: { inlineScript: true, nodeAccess: typeof require !== 'undefined', evalBlocked: false, connectBlocked: false } };
-try { eval('window.securityProbe.facts.evalRan = true'); } catch { window.securityProbe.facts.evalBlocked = true; }
-window.securityProbe.finished = fetch('data:text/plain,controlled-probe')
-  .then(() => {}).catch(() => { window.securityProbe.facts.connectBlocked = true; });
-</script>`;
+        html = `<!doctype html><style>body{margin:0}.sheet-content{display:none}.sheet-content.active{display:block}</style>
+          ${['FIRST', 'IDENTICAL', 'THIRD', 'IDENTICAL'].map((text, index) =>
+            `<div class="sheet-content${index === 0 ? ' active' : ''}" data-sheet="${index}">${text}</div>`).join('')}
+          ${[0, 1, 2, 3].map(index => `<div class="sheet-tab${index === 0 ? ' active' : ''}" data-sheet="${index}"></div>`).join('')}`;
         try {
-          const png = await renderOfficePageToPng(path.join(process.env.ORKAS_WORKSPACE_ROOT, `fixture.${extension}`), process.env.ORKAS_WORKSPACE_ROOT, visible ? '1' : '3', undefined, {
+          const png = await renderOfficePageToPng(path.join(process.env.ORKAS_WORKSPACE_ROOT, 'fixture.xlsx'), process.env.ORKAS_WORKSPACE_ROOT, page, undefined, {
             loadElectron: async () => ({ BrowserWindow: ObservedWindow, session }),
           });
-          rows.push({ extension, visible, rendered: png.length > 0, security });
-        } catch (error) {
-          rows.push({ extension, visible, rendered: false, error: error.message });
+          rows.push({ page, rendered: true, security, pngHash: crypto.createHash('sha256').update(png).digest('hex') });
+        } catch (error) { rows.push({ page, rendered: false, error: error.message }); }
+        if (BrowserWindow.getAllWindows().length !== 0) throw new Error('Preview window leaked');
+      }
+    } else {
+      for (const [extension, container] of [['docx', 'page'], ['pptx', 'slide'], ['xlsx', 'sheet-content']]) {
+        for (const visible of [true, false]) {
+          // A real, empty page is valid. Hidden pages model an out-of-range
+          // selection emitted with exit code 0 by the pinned native engine.
+          security = { logs: [] };
+          html = `<!doctype html><style>body{margin:0}.${container}{width:200px;height:200px;display:${visible ? 'block' : 'none'}}</style><div class="${container} active" data-sheet="0"></div>
+  <script>
+  window.securityProbe = { facts: { inlineScript: true, nodeAccess: typeof require !== 'undefined', evalBlocked: false, connectBlocked: false } };
+  try { eval('window.securityProbe.facts.evalRan = true'); } catch { window.securityProbe.facts.evalBlocked = true; }
+  window.securityProbe.finished = fetch('data:text/plain,controlled-probe')
+    .then(() => {}).catch(() => { window.securityProbe.facts.connectBlocked = true; });
+  </script>`;
+          try {
+            const png = await renderOfficePageToPng(path.join(process.env.ORKAS_WORKSPACE_ROOT, `fixture.${extension}`), process.env.ORKAS_WORKSPACE_ROOT, visible ? '1' : '3', undefined, {
+              loadElectron: async () => ({ BrowserWindow: ObservedWindow, session }),
+            });
+            rows.push({ extension, visible, rendered: png.length > 0, security });
+          } catch (error) {
+            rows.push({ extension, visible, rendered: false, error: error.message });
+          }
         }
       }
     }

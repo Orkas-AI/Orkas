@@ -50,6 +50,32 @@ it('renders actual blank Office pages but rejects absent selections in native Ch
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }, 40_000);
 
+it('selects worksheet positions including identical sheets and recovers after an absent worksheet', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-worksheet-selection-'));
+  const env = { ...process.env, ORKAS_WORKSPACE_ROOT: root };
+  delete env.ELECTRON_RUN_AS_NODE;
+  try {
+    const resultPath = path.join(root, 'results.json');
+    const logs = await promisify(execFile)(require('electron'), [
+      path.resolve('test/fixtures/office/page-selection-render.cjs'), process.cwd(), resultPath, 'worksheets',
+    ], { env, timeout: 30_000, maxBuffer: 256 * 1024 });
+    expect(process.platform === 'win32' ? ['', '\r\n'] : ['']).toContain(logs.stdout);
+    await checkNativeStderr(logs.stderr);
+    const rows = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+    expect(rows.map((row: { page: string }) => row.page)).toEqual(['1', '3', '4', '2', '5', '1']);
+    for (const [index, text] of ['FIRST', 'THIRD', 'IDENTICAL', 'IDENTICAL', null, 'FIRST'].entries()) {
+      const row = rows[index];
+      expect(row.rendered, JSON.stringify(row)).toBe(text !== null);
+      if (text === null) expect(row.error).toContain('E_OFFICE_RENDER_PAGE_UNAVAILABLE');
+      else {
+        expect(row.security).toEqual({ logs: [], sheets: [{ index: String(Number(row.page) - 1), text }], tabs: [String(Number(row.page) - 1)] });
+      }
+    }
+    // Equal contents are valid at both positions; do not reject duplicate PNGs.
+    expect(rows[2].pngHash).toBe(rows[3].pngHash);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}, 40_000);
+
 it.skipIf(!['darwin', 'win32'].includes(process.platform))('partitions a Word handover consistently across the first two real preview pages', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-word-pagination-'));
   const env = { ...process.env, ORKAS_WORKSPACE_ROOT: root };

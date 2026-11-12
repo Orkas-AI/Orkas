@@ -40,7 +40,7 @@ failed page must retain successful page evidence while returning an overall
 failure, so callers can repair or retry without a false all-pages success.
 
 `office-readonly_e2e.test.ts` runs the real bundled engine and embedded Chromium
-through `office_review` and `edit_office`. Its five scenarios cover combined
+through `office_review` and `edit_office`. Its scenarios cover combined
 check/render, a missing page followed by a successful retry, cancellation after
 a completed issue scan, invalid OpenXML, and an intentional edit followed by
 review of the saved copy. They verify source bytes/mtime, receipt hashes, decoded
@@ -50,6 +50,16 @@ render warning; other application/browser logs and command stderr fail the run.
 The fixture replaces only the log sink and observes real command completion
 to trigger cancellation; it does not stub engine results or Chromium rendering.
 Run these cases after artifact provisioning.
+
+The workbook scenario reviews positions 1, 3 and 4 of an independently authored
+four-sheet XLSX, checking visible sheet identities/cell values at capture time
+and distinct decoded images. `office-page-selection_e2e.test.ts` also exercises
+blank sheets, identical contents at different positions, out-of-range rejection
+and a subsequent valid render. The pinned XLSX HTML defaults to its first
+worksheet despite `--page`; the embedded renderer must select the requested
+zero-based `data-sheet` before capture. Duplicate image hashes alone are not
+an error. Word pagination and PowerPoint rendering retain their existing checks.
+
 
 ## Real Binary Smoke
 
