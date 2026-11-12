@@ -75,6 +75,41 @@ describe('task browser file selection ownership', () => {
     b.page.emit('destroyed');
   });
 
+  it.each([['retired', true], ['live', false]] as const)(
+    'isolates a %s child setup failure from an unrelated pending root upload', async (_label, retired) => {
+      const b = browser(); await webAssistFrames(b.page); b.show();
+      const rootSelection = webAssistFileChooser(b.page)!;
+      let rejectSetup!: (error: Error) => void;
+      const delayedSetup = new Promise<never>((_resolve, reject) => { rejectSetup = reject; });
+      const send = b.debuggerSession.sendCommand.getMockImplementation()!;
+      b.debuggerSession.sendCommand.mockImplementation((method, params, session) => (
+        method === 'Runtime.enable' && session === 'transient-child'
+          ? delayedSetup : send(method, params, session)
+      ));
+      b.debuggerSession.emit('message', {}, 'Target.attachedToTarget', {
+        sessionId: 'transient-child', targetInfo: { type: 'iframe' },
+      });
+      const refresh = refreshWebAssistFileChoosers(b.page);
+      // Drain runnable protocol work; refresh now awaits the child setup.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      if (retired) b.debuggerSession.emit('message', {}, 'Target.detachedFromTarget', { sessionId: 'transient-child' });
+      rejectSetup(new Error('synthetic child setup failure'));
+      try {
+        if (retired) {
+          await expect(refresh).resolves.toBeUndefined();
+          expect(b.debuggerSession.isAttached()).toBe(true);
+          expect(webAssistFileChooser(b.page)).toBe(rootSelection);
+          expect((await webAssistFrames(b.page)).map(frame => frame.id)).toEqual(['main']);
+        } else {
+          await expect(refresh).rejects.toThrow('synthetic child setup failure');
+          expect(b.debuggerSession.isAttached()).toBe(false);
+          expect(webAssistFileChooser(b.page)).toBeUndefined();
+        }
+        expect(b.commands.some(command => command.method === 'DOM.setFileInputFiles')).toBe(false);
+      } finally { b.page.emit('destroyed'); }
+    },
+  );
+
   it('invalidates a chooser when its frame navigates without discarding an unrelated frame selection', async () => {
     const b = browser(); await webAssistFrames(b.page); b.show('');
     expect(webAssistFileChooser(b.page)?.sessionId).toBeUndefined();
@@ -83,6 +118,33 @@ describe('task browser file selection ownership', () => {
     b.debuggerSession.emit('message', {}, 'Page.frameNavigated', { frame: { id: 'main' } });
     expect(webAssistFileChooser(b.page)).toBeUndefined();
     b.page.emit('destroyed');
+  });
+
+  it('keeps frame inventory usable when a newly discovered child retires during setup', async () => {
+    const b = browser(); await webAssistFrames(b.page);
+    let rejectSetup!: (error: Error) => void;
+    const delayedSetup = new Promise<never>((_resolve, reject) => { rejectSetup = reject; });
+    const send = b.debuggerSession.sendCommand.getMockImplementation()!;
+    let discovered = false;
+    b.debuggerSession.sendCommand.mockImplementation((method, params, session) => {
+      if (method === 'Runtime.enable' && session === 'new-child') return delayedSetup;
+      if (method === 'Page.getFrameTree' && !session && !discovered) {
+        discovered = true;
+        b.debuggerSession.emit('message', {}, 'Target.attachedToTarget', {
+          sessionId: 'new-child', targetInfo: { type: 'iframe' },
+        });
+      }
+      return send(method, params, session);
+    });
+    const frames = webAssistFrames(b.page);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(discovered).toBe(true);
+    b.debuggerSession.emit('message', {}, 'Target.detachedFromTarget', { sessionId: 'new-child' });
+    rejectSetup(new Error('synthetic child setup failure'));
+    try {
+      await expect(frames).resolves.toEqual([{ id: 'main', parentId: undefined, sessionId: undefined, url: 'https://example.com', name: '' }]);
+      expect(b.debuggerSession.isAttached()).toBe(true);
+    } finally { b.page.emit('destroyed'); }
   });
 
   it('finishes explicit cancellation without uploading and restores normal interception for the next request', async () => {
