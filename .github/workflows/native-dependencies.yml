@@ -136,6 +136,10 @@ jobs:
           test/main/features/local_agents/codex_backend.test.ts
           test/main/features/local_agents/codex_parser.test.ts
           test/main/features/local_agents/cli_input_cancel.test.ts
+      - name: Verify BGRA brightness and contrast calibration
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/video_studio_bitmap.test.ts
       - name: Verify HTML copy references and project acceptance
         run: >-
           npm run test:js -- --maxWorkers=1

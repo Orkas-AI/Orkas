@@ -2989,9 +2989,10 @@ export function analyzeNativeImage(image: ElectronNativeImage): { hash: string; 
   let sum = 0;
   let sumSq = 0;
   for (let i = 0; i < bitmap.length; i += stride) {
-    const r = bitmap[i] ?? 0;
-    const g = bitmap[i + 1] ?? r;
-    const b = bitmap[i + 2] ?? r;
+    // Match the BGRA layout used by the frame encoder and perceptual hash.
+    const b = bitmap[i] ?? 0;
+    const g = bitmap[i + 1] ?? b;
+    const r = bitmap[i + 2] ?? b;
     const y = (0.2126 * r) + (0.7152 * g) + (0.0722 * b);
     sum += y;
     sumSq += y * y;
