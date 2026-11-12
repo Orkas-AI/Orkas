@@ -17600,14 +17600,9 @@ function _updateConvSidebarBadge(cid, _unused, deferRunningChips, snapshot) {
     const badge = document.createElement('span');
     badge.className = 'conv-status-badge is-streaming';
     badge.innerHTML = '<span class="conv-status-dot"></span>';
-    // Keep the live execution indicator as the first visible row icon. Auto-task
-    // rows also have a clock, so anchoring only on the title would put the live
-    // dot after that clock.
-    const title = item.querySelector('.conv-item-title');
-    const row = title ? title.parentElement : null;
-    const autoIcon = item.querySelector('.conv-item-row > .conv-item-auto-icon');
-    if (title && row) row.insertBefore(badge, autoIcon || title);
-    else if (title) title.parentElement?.insertBefore(badge, title);
+    // Keep the live indicator before pin/source icons, including during rename.
+    const row = item.querySelector('.conv-item-row');
+    if (row) row.insertBefore(badge, row.firstChild);
     else item.prepend(badge);
   });
 }

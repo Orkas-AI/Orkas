@@ -1456,13 +1456,21 @@ describe('conversation sidebar task row actions', () => {
     expect(html).not.toContain('conv-item-status-label');
   });
 
-  it('places the live running icon to the left of an automation icon on every sidebar copy', () => {
+  it.each([
+    [],
+    ['pin'],
+    ['automation'],
+    ['todo'],
+    ['pin', 'automation', 'todo'],
+  ].map(icons => ({ icons })))('places the live running icon first on every sidebar copy with icons $icons', ({ icons }) => {
     const context = loadConversationRenderer();
     const makeCopy = () => {
-      const autoIcon: any = { kind: 'automation' };
+      const sourceIcons = icons.map(kind => ({ kind }));
+      const autoIcon = sourceIcons.find(icon => icon.kind === 'automation');
       const title: any = { kind: 'title', parentElement: null };
       const row: any = {
-        children: [autoIcon, title],
+        children: [...sourceIcons, title],
+        get firstChild() { return this.children[0]; },
         insertBefore(node: any, anchor: any) {
           const anchorIndex = this.children.indexOf(anchor);
           this.children.splice(anchorIndex, 0, node);
@@ -1472,6 +1480,7 @@ describe('conversation sidebar task row actions', () => {
       const item = {
         querySelector(selector: string) {
           if (selector === '.conv-status-badge') return null;
+          if (selector === '.conv-item-row') return row;
           if (selector === '.conv-item-title') return title;
           if (selector === '.conv-item-row > .conv-item-auto-icon') return autoIcon;
           return null;
@@ -1497,8 +1506,8 @@ describe('conversation sidebar task row actions', () => {
 
     context._updateConvSidebarBadge('c1');
 
-    expect(todayCopy.row.children.map((c: any) => c.kind)).toEqual(['running-1', 'automation', 'title']);
-    expect(projectCopy.row.children.map((c: any) => c.kind)).toEqual(['running-2', 'automation', 'title']);
+    expect(todayCopy.row.children.map((c: any) => c.kind)).toEqual(['running-1', ...icons, 'title']);
+    expect(projectCopy.row.children.map((c: any) => c.kind)).toEqual(['running-2', ...icons, 'title']);
   });
 
   it('focuses the rename editor in the list the menu was opened from', async () => {
