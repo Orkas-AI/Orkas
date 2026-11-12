@@ -1056,6 +1056,9 @@ async function _mutateProjectMemory(channel, payload) {
     };
   }
   const pid = _projectDetailPid;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  const isAccountCurrent = () => account === (typeof currentUserId === 'string' ? currentUserId : '');
+  const isCurrent = () => pid === _projectDetailPid && isAccountCurrent();
   _projectMemoryMutating = true;
   _projectMemoryLoadSeq += 1;
   _updateProjectMemoryEditor();
@@ -1068,23 +1071,23 @@ async function _mutateProjectMemory(channel, payload) {
         ...(payload || {}),
       });
     } catch (err) {
-      _projectDetailLog.warn('project memory mutate failed', _projectMemoryFailure(err, true));
-      if (typeof uiAlert === 'function') uiAlert(t('project.memory.failed'));
+      if (isAccountCurrent()) _projectDetailLog.warn('project memory mutate failed', _projectMemoryFailure(err, true));
+      if (isCurrent() && typeof uiAlert === 'function') uiAlert(t('project.memory.failed'));
       return { ok: false, failure: _projectMemoryFailure(err, true) };
     }
     if (!res || res.ok === false) {
       const failure = _projectMemoryFailure(res);
-      _projectDetailLog.warn('project memory mutate rejected', failure);
-      if (failure.error_code === 'memory_full') {
+      if (isAccountCurrent()) _projectDetailLog.warn('project memory mutate rejected', failure);
+      if (isCurrent() && failure.error_code === 'memory_full') {
         _projectMemoryFull = true;
         _renderProjectMemoryList();
       }
-      if (typeof uiAlert === 'function') {
+      if (isCurrent() && typeof uiAlert === 'function') {
         uiAlert(t(failure.error_code === 'memory_full' ? 'memory.error_full' : 'project.memory.failed'));
       }
       return { ok: false, failure };
     }
-    if (pid !== _projectDetailPid) return { ok: true, failure: null };
+    if (!isCurrent()) return { ok: true, failure: null };
     try {
       if (Array.isArray(res.entries)) {
         _projectMemory = res.entries;
@@ -1107,14 +1110,21 @@ async function _saveProjectMemoryEditor() {
   const input = document.getElementById('project-memory-editor-input');
   const content = String(input?.value || '').trim();
   if (!content || !_projectMemoryEditor) return;
+  const editor = _projectMemoryEditor;
+  const projectId = _projectDetailPid;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+
   const isEdit = _projectMemoryEditor.mode === 'edit';
   const oldText = _projectMemoryEditor.oldText;
-  const startedAt = Date.now();
+
   const outcome = await _mutateProjectMemory(
     isEdit ? 'memory.replace' : 'memory.add',
     isEdit ? { oldText, content } : { content },
   );
-  if (outcome.ok) _closeProjectMemoryEditor();
+
+  if (outcome.ok && projectId === _projectDetailPid
+    && account === (typeof currentUserId === 'string' ? currentUserId : '')
+    && editor === _projectMemoryEditor && input.value.trim() === content) _closeProjectMemoryEditor();
 }
 
 function _bindProjectMemory() {
@@ -1169,6 +1179,11 @@ function _bindProjectMemory() {
         return;
       }
       if (button.dataset.action !== 'project-memory-delete') return;
+      const projectId = _projectDetailPid;
+      const account = typeof currentUserId === 'string' ? currentUserId : '';
+      const editor = _projectMemoryEditor;
+      const isCurrent = () => projectId === _projectDetailPid
+        && account === (typeof currentUserId === 'string' ? currentUserId : '');
       const confirmed = typeof uiConfirm === 'function'
         ? await uiConfirm({
           message: t('project.memory.delete_confirm'),
@@ -1176,10 +1191,12 @@ function _bindProjectMemory() {
           cancelLabel: t('project.memory.cancel'),
         })
         : false;
-      if (!confirmed) return;
-      const startedAt = Date.now();
+      if (!confirmed || !isCurrent()) return;
+
       const outcome = await _mutateProjectMemory('memory.remove', { oldText: text });
-      if (outcome.ok && _projectMemoryEditor?.oldText === text) _closeProjectMemoryEditor();
+
+      if (outcome.ok && isCurrent() && editor === _projectMemoryEditor
+        && _projectMemoryEditor?.oldText === text) _closeProjectMemoryEditor();
     });
   }
   if (!_projectMemoryEditor) _closeProjectMemoryEditor();
