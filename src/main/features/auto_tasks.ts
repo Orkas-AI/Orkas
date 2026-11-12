@@ -2171,11 +2171,12 @@ async function _onTimerFire(
           duration_ms: Math.max(0, Date.now() - markStartedAt),
         });
         const fresh = await _readOne(uid, taskId);
+        if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
         if (fresh && catchUp) {
           // Retry the same late run after the settle delay; an on-time timer
           // could not find a boundary that is already in the past. Like
           // `_scheduleTask`, never re-arm across a suspend or account switch.
-          if (!schedulerEpochIsCurrent(schedulerEpoch) || (_started && !isActiveUser(uid))) return;
+          if (_started && !isActiveUser(uid)) return;
           _cancelTimer(taskId);
           _armTimerAt(uid, taskId, Date.now() + CATCH_UP_DELAY_MS, _scheduleStateKey(fresh), dueBoundary.getTime());
         } else if (fresh) {
@@ -2195,7 +2196,7 @@ async function _onTimerFire(
   // capped timer fired before the actual due time, no fire happens but a
   // new timer goes in for the remaining gap (or up to another MAX cap).
   const fresh = await _readOne(uid, taskId);
-  if (!fresh) return;
+  if (!fresh || !schedulerEpochIsCurrent(schedulerEpoch)) return;
   // A late run that is no longer owed must not fall back to back-filling.
   const baseline = claimedElsewhereBoundary
     || (catchUp && !canFireHere ? _baselineWithoutBackfill(fresh, new Date()) : undefined);
@@ -2203,7 +2204,7 @@ async function _onTimerFire(
 }
 
 export function _onTimerFireForTest(uid: string, taskId: string): Promise<void> {
-  return _onTimerFire(uid, taskId);
+  return _onTimerFire(uid, taskId, undefined, undefined, _schedulerEpoch);
 }
 
 function _baselineWithoutBackfill(task: AutoTask, now: Date): Date | null {
