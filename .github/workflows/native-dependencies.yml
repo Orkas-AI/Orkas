@@ -163,3 +163,8 @@ jobs:
           test/main/quality/operator-policy.test.ts
           test/main/quality/operator-policy-asar.test.ts
           test/main/features/skills.test.ts
+      - name: Verify retired browser frame upload ownership
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/web-assist-file-chooser.test.ts
+          test/main/features/web-assist-upload.test.ts
