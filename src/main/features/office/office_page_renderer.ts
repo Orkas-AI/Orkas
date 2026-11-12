@@ -53,6 +53,26 @@ const WORD_FIRST_PAGE_SCRIPT = `(async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
 })()`;
 
+// XLSX HTML contains every worksheet and defaults to the first, even when
+// OfficeCLI receives --page. Select its zero-based sheet identity explicitly;
+// missing or hidden selections must not silently capture another worksheet.
+function worksheetSelectionScript(page: string): string {
+  return `(() => {
+    const index = Number(${JSON.stringify(page)}) - 1;
+    if (!Number.isSafeInteger(index) || index < 0) return false;
+    const sheets = Array.from(document.querySelectorAll('.sheet-content'));
+    const matches = sheets.filter(sheet => sheet.getAttribute('data-sheet') === String(index));
+    if (matches.length !== 1) return false;
+    const target = matches[0];
+    sheets.forEach(sheet => sheet.classList.toggle('active', sheet === target));
+    document.querySelectorAll('.sheet-tab').forEach(tab => {
+      tab.classList.toggle('active', tab.getAttribute('data-sheet') === String(index));
+    });
+    window.scrollTo(0, 0);
+    return sheets.every(sheet => (sheet.offsetParent !== null) === (sheet === target));
+  })()`;
+}
+
 const CONTENT_SIZE_SCRIPT = `(() => {
   const visible = (element) => element && element.offsetParent !== null;
   const slide = Array.from(document.querySelectorAll('.slide')).find(visible);
@@ -211,6 +231,17 @@ export async function renderOfficePageToPng(
       'E_OFFICE_RENDER_PAGINATION_TIMEOUT: preview pagination did not settle',
     );
     assertNotAborted(signal);
+
+    if (path.extname(file).toLowerCase() === '.xlsx') {
+      const selected = await withTimeout(
+        win.webContents.executeJavaScript(worksheetSelectionScript(page), true),
+        'E_OFFICE_RENDER_SELECTION_TIMEOUT: worksheet selection did not settle',
+      );
+      assertNotAborted(signal);
+      if (selected !== true) {
+        throw new Error(`E_OFFICE_RENDER_PAGE_UNAVAILABLE: worksheet ${page} has no unique visible selection.`);
+      }
+    }
 
     const layout = await win.webContents.executeJavaScript(CONTENT_SIZE_SCRIPT, true);
     if (layout?.missingPage) {

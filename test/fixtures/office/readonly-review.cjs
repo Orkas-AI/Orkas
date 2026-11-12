@@ -36,6 +36,15 @@ app.on('browser-window-created', (_event, win) => {
   win.webContents.on('console-message', details => {
     owner?.browserLogs.push({ level: details.level, message: details.message });
   });
+  if (owner?.id === 'xlsx-render') {
+    owner.captures ||= [];
+    const capture = win.webContents.capturePage.bind(win.webContents);
+    win.webContents.capturePage = async rect => {
+      owner.captures.push(await win.webContents.executeJavaScript(`Array.from(document.querySelectorAll('.sheet-content'))
+        .filter(el => el.offsetParent !== null).map(el => ({ index: el.dataset.sheet, text: el.textContent }))`));
+      return capture(rect);
+    };
+  }
 });
 const enginePath = path.join(pc, 'src/main/features/office/office_engine.ts');
 const engine = require(enginePath);
@@ -72,6 +81,23 @@ const review = tools.find(tool => tool.name === 'office_review');
 const edit = tools.find(tool => tool.name === 'edit_office');
 const context = { workingDir: root };
 const hash = bytes => `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
+function fourSheetWorkbook() {
+  // Author independent OOXML inputs rather than using the production builder
+  // to define the workbook that its own review must distinguish.
+  const zip = new AdmZip(makeNamespacedDirectXlsx());
+  const names = ['North', 'East', 'South', 'West'];
+  names.forEach((name, index) => {
+    const sheet = new AdmZip(makeNamespacedDirectXlsx({
+      rows: Array.from({ length: 12 }, (_, i) => [`Review fixture ${name}`, String(i + 1), String((index + 1) * 101)]),
+    }));
+    zip.addFile(`xl/worksheets/sheet${index + 1}.xml`, sheet.readFile('xl/worksheets/sheet1.xml'));
+  });
+  zip.updateFile('xl/workbook.xml', Buffer.from(`<x:workbook xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><x:sheets>${names.map((name, index) => `<x:sheet name="${name}" sheetId="${index + 1}" r:id="rId${index + 1}"/>`).join('')}</x:sheets></x:workbook>`));
+  zip.updateFile('xl/_rels/workbook.xml.rels', Buffer.from(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${names.map((_, index) => `<Relationship Id="rId${index + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="/xl/worksheets/sheet${index + 1}.xml"/>`).join('')}</Relationships>`));
+  zip.updateFile('[Content_Types].xml', Buffer.from(zip.readAsText('[Content_Types].xml').replace('</Types>',
+    names.slice(1).map((_, index) => `<Override PartName="/xl/worksheets/sheet${index + 2}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('') + '</Types>')));
+  return zip.toBuffer();
+}
 function reviewPresentationBytes() {
   // The shared minimal PPTX is an extraction fixture: its text has no shape
   // geometry. Give this rendering fixture an explicitly visible text box.
@@ -140,9 +166,7 @@ app.whenReady().then(async () => {
     const file = path.join(root, `${id}.${format}`);
     // Use a populated worksheet: a single short cell has fewer painted dark
     // pixels than the document-oriented nonblank image oracle below.
-    const original = format === 'xlsx' ? makeNamespacedDirectXlsx({
-      rows: Array.from({ length: 12 }, (_, i) => ['Review fixture', String(i + 1), '42']),
-    })
+    const original = format === 'xlsx' ? fourSheetWorkbook()
       : format === 'pptx' ? reviewPresentationBytes() : foreignDocxBytes(true);
     if (id === 'invalid-document') {
       const zip = new AdmZip(original);
@@ -182,10 +206,24 @@ app.whenReady().then(async () => {
         assert.equal(readback.code, 0);
         assert.equal(readback.stderr, '');
         assert(readback.stdout.includes('Review fixture'), 'native fixture must contain the intended text');
-        const result = await review.execute({ action: 'render', path: file, pages: ['1'] }, context);
+        const pages = format === 'xlsx' ? ['1', '3', '4'] : ['1'];
+        const started = performance.now();
+        const result = await review.execute({ action: 'render', path: file, pages }, context);
         assert(!result.isError, result.content);
-        assert.equal(result.images.length, 1);
-        checkImage(result.images[0]);
+        assert.equal(result.images.length, pages.length);
+        result.images.forEach(checkImage);
+        if (format === 'xlsx') {
+          assert.deepEqual(row.captures.map(sheets => sheets.map(sheet => sheet.index)), [['0'], ['2'], ['3']]);
+          for (const [index, name] of ['North', 'South', 'West'].entries()) {
+            assert(row.captures[index][0].text.includes(`Review fixture ${name}`), 'visible cells must match the requested worksheet');
+            assert(row.captures[index][0].text.includes(String([101, 303, 404][index])), 'visible values must match the source cells');
+          }
+          const imageHashes = result.images.map(image => hash(Buffer.from(image.data, 'base64')));
+          assert.equal(new Set(imageHashes).size, 3, 'distinct source sheets must produce distinct images');
+          row.measurement = { scope: 'native four-sheet workbook review', pages, imageHashes,
+            elapsedMs: performance.now() - started, writtenFiles: written.length - writtenBefore,
+            visibleSheets: row.captures };
+        }
       } else if (id === 'edit-then-review') {
         const target = path.join(root, 'edited-copy.docx');
         const result = await edit.execute({ path: file, output_path: target,
