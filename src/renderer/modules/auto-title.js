@@ -46,6 +46,7 @@ function _autoTitleCodePointWidth(cp) {
     || (cp >= 0xfe10 && cp <= 0xfe6f)
     || (cp >= 0xff00 && cp <= 0xffef)
     || (cp >= 0x1f300 && cp <= 0x1faff)
+    || (cp >= 0x20000 && cp <= 0x3fffd)
   ) return 2;
   return 1;
 }
