@@ -8501,6 +8501,23 @@ describe('conversation auto recipient', () => {
     expect(context.applyRecipientPrefix('Continue', 'conversation')).toBe('@commander Continue');
   });
 
+  it('reconciles an Agent floor received while its Commander acknowledgement was delayed', async () => {
+    const context = loadConversationRenderer();
+    let release!: (value:unknown) => void;
+    context.apiFetch = () => new Promise(resolve => { release = resolve; });
+    vm.runInContext('currentCid="c1"; _groupMembersCache.set("c1", [{kind:"agent",id:"a1",name:"Writing Helper"}]); _rememberServerFloor("c1", {active_recipient:"a1", active_recipient_revision:1})', context);
+    context.setChatRecipient('conversation', { kind:'commander' });
+    const ack = vm.runInContext('_floorSyncByCid.get("c1")', context);
+    vm.runInContext('_rememberServerFloor("c1", {active_recipient:"a1", active_recipient_revision:3})', context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+    expect(context.getChatRecipient('conversation')).toMatchObject({ kind:'commander' });
+    release({ json:async () => ({ ok:true, state:{ active_recipient_revision:2 } }) });
+    await ack;
+    await Promise.resolve();
+    expect(context.getChatRecipient('conversation')).toMatchObject({ kind:'agent', id:'a1' });
+    expect(context.applyRecipientPrefix('Continue', 'conversation')).toBe('Continue');
+  });
+
   it('does not let a superseded acknowledgement clear the latest Commander reset', async () => {
     const context = loadConversationRenderer();
     const releases: Array<(value:unknown) => void> = [];
