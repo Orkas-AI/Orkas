@@ -176,3 +176,8 @@ jobs:
           npm run test:js -- --maxWorkers=1
           test/main/features/web-assist-file-chooser.test.ts
           test/main/features/web-assist-upload.test.ts
+
+      - name: Verify painted video text contrast
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/video_studio_contrast.test.ts
