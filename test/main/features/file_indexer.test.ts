@@ -1038,6 +1038,11 @@ describe('file_indexer › rich-document source revisions', () => {
     try {
       const first = m.statFile(UID, abs); await entered;
       replace(abs, fixture('docx', 'Bravo'));
+      // Isolate concurrent publication with an explicit source revision. Some
+      // filesystems give back-to-back rewrites identical ctime values; the
+      // timestamp-preserving saves are covered separately with verified ctime changes.
+      fs.utimesSync(abs, stamp, new Date(stamp.getTime() + 1000));
+      expect(fs.statSync(abs).mtimeMs).toBe(stamp.getTime() + 1000);
       const rest = Array.from({ length: 12 }, () => m.statFile(UID, abs));
       release();
       const all = await Promise.all([first, ...rest]);
