@@ -1890,8 +1890,9 @@ function _rememberServerFloor(cid, state) {
   _serverFloorByCid.set(cid, _serverFloorFromState(state));
 }
 // One-shot: the user picked "commander" in the composer while an agent held the
-// floor. The next send injects `@commander` (the server parses it and resets the
-// floor); the auto-target evaluation respects this until the reset is confirmed.
+// floor. Until the server confirms that floor write, the next send injects
+// `@commander` (the server parses it and resets the floor) and the auto-target
+// evaluation ignores the agent's floor.
 const _pendingFloorResetByCid = new Set();
 // In-flight chip → floor IPC writes; the send path awaits the latest one so
 // the routed message always sees the floor the user just picked.
@@ -2045,7 +2046,12 @@ function setChatRecipient(target, next, _opts = {}) {
         // leave a permanent "write in flight" marker — and floor
         // reconciliation below skips reconciling while one is pending.
         sync.then((data) => {
-          if (data?.ok && data.state) _rememberServerFloor(floorCid, data.state);
+          if (data?.ok && data.state) {
+            _rememberServerFloor(floorCid, data.state);
+            // The server took the return to Commander, so the floor it reports next, such as an
+            // Agent that stops to ask the user, is who the next message goes to (2026-11-12).
+            if (floorTarget === 'commander' && _floorSyncByCid.get(floorCid) === sync) _pendingFloorResetByCid.delete(floorCid);
+          }
           if (_floorSyncByCid.get(floorCid) === sync) _floorSyncByCid.delete(floorCid);
         });
       }
