@@ -4,9 +4,11 @@ import fsDefault, * as fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import AdmZip from 'adm-zip';
 
 import { makeMinimalPdf } from '../../fixtures/make-minimal-pdf';
 import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
+import { makeMinimalXlsx, makeMinimalPptx } from '../../fixtures/make-minimal-office';
 
 const loggerMocks = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn() }));
 vi.mock('../../../src/main/logger', () => ({
@@ -900,6 +902,279 @@ describe('file_indexer › readRange on pdf/docx', () => {
     await new Promise((r) => setTimeout(r, 10));
     await m.readRange(UID, abs);
     expect(fs.statSync(textMd).mtimeMs).toBe(firstMtime);
+  });
+});
+
+describe('file_indexer › rich-document source revisions', () => {
+  const formats = ['pdf', 'docx', 'xlsx', 'pptx'] as const;
+  const stamp = new Date('2026-01-01T00:00:00Z');
+  function fixture(ext: typeof formats[number], text: string) {
+    if (ext === 'pdf') return makeMinimalPdf([text]);
+    if (ext === 'docx') return makeMinimalDocx({ paragraphs: [text] });
+    if (ext === 'xlsx') return makeMinimalXlsx({ rows: [[text]] });
+    // STORED entries keep equal-length text edits equal-size on disk, rather
+    // than relying on incidental differences in DEFLATE compression ratios.
+    const zip = new AdmZip(makeMinimalPptx({ slides: [[text]] })), stored = new AdmZip();
+    for (const entry of zip.getEntries()) {
+      stored.addFile(entry.entryName, entry.getData());
+      stored.getEntry(entry.entryName)!.header.method = 0;
+    }
+    return stored.toBuffer();
+  }
+  function replace(abs: string, body: Buffer) {
+    fs.writeFileSync(abs, body); fs.utimesSync(abs, stamp, stamp);
+  }
+  function cacheDir(abs: string) {
+    return path.join(userFileCacheRoot(), crypto.createHash('sha1').update(abs).digest('hex').slice(0, 16));
+  }
+  it.each(formats)('refreshes %s after an equal-size edit preserving mtime and reuses unchanged content', async ext => {
+    const m = await loadMod();
+    const old = fixture(ext, 'Alpha'), current = fixture(ext, 'Bravo');
+    expect(current.length).toBe(old.length);
+    const abs = writeWorkspaceFile(`preserved.${ext}`, old); fs.utimesSync(abs, stamp, stamp);
+    await m.statFile(UID, abs);
+    expect((await m.readRange(UID, abs)).content).toContain('Alpha');
+    const before = fs.statSync(abs);
+    await new Promise(r => setTimeout(r, 10)); replace(abs, current);
+    const after = fs.statSync(abs);
+    expect(after.size).toBe(before.size); expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect(after.ctimeMs).not.toBe(before.ctimeMs);
+    expect(m.getCachedMeta(UID, abs)).toBeNull();
+    await expect(m.readRange(UID, abs)).rejects.toBeInstanceOf(m.NeedStatError);
+    await m.statFile(UID, abs);
+    const result = await m.readRange(UID, abs);
+    expect(result.content).toContain('Bravo'); expect(result.content).not.toContain('Alpha');
+    expect(result.meta.totalChars).toBe(result.content.length);
+    const readFile = fs.promises.readFile;
+    let sourceReads = 0;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      if (String(file) === abs) sourceReads++;
+      return readFile(file, options);
+    });
+    try {
+      for (let i = 0; i < 10; i++) {
+        await m.statFile(UID, abs);
+        expect((await m.readRange(UID, abs)).content).toBe(result.content);
+        expect((await m.getExtractedText(UID, abs)).text).toBe(result.content);
+      }
+      expect(sourceReads).toBe(0);
+    } finally { spy.mockRestore(); }
+    expect(fs.readFileSync(abs)).toEqual(current);
+  });
+  it.each(formats)('rebuilds a legacy %s cache once, without invalidating other source files', async ext => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile(`legacy.${ext}`, fixture(ext, 'Alpha'));
+    const other = writeWorkspaceFile('unrelated.pdf', makeMinimalPdf(['Unchanged']));
+    await m.statFile(UID, other);
+    const otherMeta = m.getCachedMeta(UID, other);
+    await m.statFile(UID, abs);
+    const metaFile = path.join(cacheDir(abs), 'meta.json');
+    const legacy = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+    delete legacy.sourceVersion;
+    fs.writeFileSync(metaFile, JSON.stringify(legacy));
+    expect(m.getCachedMeta(UID, abs)).toBeNull();
+    await m.statFile(UID, abs);
+    expect((await m.readRange(UID, abs)).content).toContain('Alpha');
+    expect(m.getCachedMeta(UID, abs)).not.toBeNull();
+    expect(m.getCachedMeta(UID, other)).toEqual(otherMeta);
+  });
+  it.each(formats)('discards an old %s extraction if the source is replaced while its bytes are being read', async ext => {
+    const m = await loadMod();
+    const current = fixture(ext, 'Bravo');
+    const abs = writeWorkspaceFile(`during.${ext}`, fixture(ext, 'Alpha')); fs.utimesSync(abs, stamp, stamp);
+    const readFile = fs.promises.readFile;
+    let reads = 0;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      const body = await readFile(file, options);
+      if (String(file) === abs && ++reads === 1) {
+        await new Promise(r => setTimeout(r, 10)); replace(abs, current);
+      }
+      return body;
+    });
+    try {
+      await m.statFile(UID, abs);
+      const result = await m.readRange(UID, abs);
+      expect(result.content).toContain('Bravo'); expect(result.content).not.toContain('Alpha');
+      expect(result.meta.totalChars).toBe(result.content.length);
+      expect(reads).toBe(2);
+    } finally { spy.mockRestore(); }
+    expect(fs.readFileSync(abs)).toEqual(current);
+  });
+  it.each(['char', 'line', 'whole'] as const)('rejects a mixed-revision %s read and recovers after the document stops changing', async mode => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('changing.docx', fixture('docx', 'Alpha')); fs.utimesSync(abs, stamp, stamp);
+    await m.statFile(UID, abs);
+    const readFile = fs.promises.readFile;
+    let changed = false;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      const body = await readFile(file, options);
+      if (String(file) === path.join(cacheDir(abs), 'text.md') && !changed) {
+        changed = true; replace(abs, fixture('docx', 'Bravo'));
+        await m.statFile(UID, abs);
+      }
+      return body;
+    });
+    try {
+      const work = mode === 'whole' ? m.getExtractedText(UID, abs)
+        : m.readRange(UID, abs, mode === 'line' ? { lineStart: 1, lineEnd: 1 } : {});
+      await expect(work).rejects.toBeInstanceOf(m.NeedStatError);
+      expect(changed).toBe(true);
+    } finally { spy.mockRestore(); }
+    expect((await m.getExtractedText(UID, abs)).text).toContain('Bravo');
+    expect((await m.readRange(UID, abs)).content).not.toContain('Alpha');
+  });
+  it('shares concurrent extraction and never lets the delayed old source overwrite the current cache', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('concurrent.docx', fixture('docx', 'Alpha')); fs.utimesSync(abs, stamp, stamp);
+    const readFile = fs.promises.readFile;
+    let release!: () => void, started!: () => void, reads = 0;
+    const entered = new Promise<void>(r => { started = r; });
+    const gate = new Promise<void>(r => { release = r; });
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      const body = await readFile(file, options);
+      if (String(file) === abs && ++reads === 1) { started(); await gate; }
+      return body;
+    });
+    try {
+      const first = m.statFile(UID, abs); await entered;
+      replace(abs, fixture('docx', 'Bravo'));
+      const rest = Array.from({ length: 12 }, () => m.statFile(UID, abs));
+      release();
+      const all = await Promise.all([first, ...rest]);
+      const result = await m.readRange(UID, abs);
+      expect(result.content).toContain('Bravo'); expect(result.content).not.toContain('Alpha');
+      expect(all.every(meta => meta.totalChars === result.content.length)).toBe(true);
+      expect(reads).toBe(2);
+    } finally { release(); spy.mockRestore(); }
+  });
+  it('bounds extraction while saves continue and can recover without clearing any source', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('continuous.docx', fixture('docx', 'A0000')); fs.utimesSync(abs, stamp, stamp);
+    const readFile = fs.promises.readFile; let reads = 0;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      const body = await readFile(file, options);
+      if (String(file) === abs) {
+        await new Promise(r => setTimeout(r, 2));
+        replace(abs, fixture('docx', `A${String(++reads).padStart(4, '0')}`));
+      }
+      return body;
+    });
+    try {
+      await expect(m.statFile(UID, abs)).rejects.toThrow('file changed while preparing text metadata');
+      expect(reads).toBe(3); expect(m.getCachedMeta(UID, abs)).toBeNull();
+    } finally { spy.mockRestore(); }
+    expect((await m.getExtractedText(UID, abs)).text).toContain('A0003');
+  });
+  it('detects atomic replacement even if stat timestamps collide', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('atomic.docx', fixture('docx', 'Alpha'));
+    fs.utimesSync(abs, stamp, stamp);
+    const stat = fsDefault.statSync, initial = stat(abs);
+    const spy = vi.spyOn(fsDefault, 'statSync').mockImplementation(((file: any, ...args: any[]) => {
+      const result = (stat as any)(file, ...args);
+      if (String(file) === abs) {
+        result.ctimeMs = initial.ctimeMs; result.birthtimeMs = initial.birthtimeMs;
+      }
+      return result;
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      await m.statFile(UID, abs);
+      const replacement = writeWorkspaceFile('replacement.docx', fixture('docx', 'Bravo'));
+      fs.utimesSync(replacement, stamp, stamp); fs.renameSync(replacement, abs);
+      expect(stat(abs).ino).not.toBe(initial.ino);
+      expect(m.getCachedMeta(UID, abs)).toBeNull();
+      expect((await m.getExtractedText(UID, abs)).text).toContain('Bravo');
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  });
+  it('rechecks the source after an interrupted candidate write before making the cache readable', async () => {
+    const m = await loadMod();
+    const abs = writeWorkspaceFile('publication.docx', fixture('docx', 'Alpha'));
+    const writeFile = fs.promises.writeFile; let changed = false;
+    const spy = vi.spyOn(fs.promises, 'writeFile').mockImplementation(async (file, body, ...args: any[]) => {
+      if (String(file).startsWith(cacheDir(abs) + path.sep) && !changed) {
+        changed = true;
+        expect(m.getCachedMeta(UID, abs)).toBeNull();
+        replace(abs, fixture('docx', 'Bravo'));
+      }
+      return (writeFile as any)(file, body, ...args);
+    });
+    try {
+      expect((await m.getExtractedText(UID, abs)).text).toContain('Bravo');
+      expect(changed).toBe(true);
+      expect(fs.readdirSync(cacheDir(abs)).sort()).toEqual(['meta.json', 'text.md']);
+    } finally { spy.mockRestore(); }
+  });
+  it('releases shared failed preparation so an explicit retry can extract the unchanged source', async () => {
+    const m = await loadMod();
+    const source = fixture('docx', 'Alpha'), abs = writeWorkspaceFile('failure.docx', source);
+    const readFile = fs.promises.readFile; let reads = 0;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      if (String(file) === abs) { reads++; throw Object.assign(new Error('Controlled I/O failure'), { code: 'EIO' }); }
+      return readFile(file, options);
+    });
+    try {
+      const results = await Promise.allSettled(Array.from({ length: 8 }, () => m.statFile(UID, abs)));
+      for (const result of results) {
+        expect(result.status).toBe('rejected');
+        if (result.status === 'rejected') expect(result.reason.code).toBe('EIO');
+      }
+      expect(reads).toBe(1); expect(m.getCachedMeta(UID, abs)).toBeNull();
+    } finally { spy.mockRestore(); }
+    expect((await m.getExtractedText(UID, abs)).text).toContain('Alpha');
+    expect(fs.readFileSync(abs)).toEqual(source);
+  });
+  it('reports a stale page rather than a missing source while its replacement is still being written', async () => {
+    const m = await loadMod(), abs = writeWorkspaceFile('pending.docx', fixture('docx', 'Alpha'));
+    await m.statFile(UID, abs);
+    let beginRead!: () => void, resumeRead!: () => void, beginWrite!: () => void, resumeWrite!: () => void;
+    const reading = new Promise<void>(r => { beginRead = r; });
+    const readGate = new Promise<void>(r => { resumeRead = r; });
+    const writing = new Promise<void>(r => { beginWrite = r; });
+    const writeGate = new Promise<void>(r => { resumeWrite = r; });
+    const readFile = fs.promises.readFile, writeFile = fs.promises.writeFile;
+    const readSpy = vi.spyOn(fs.promises, 'readFile').mockImplementation(async (file, options) => {
+      if (String(file) === path.join(cacheDir(abs), 'text.md')) { beginRead(); await readGate; }
+      return readFile(file, options);
+    });
+    const writeSpy = vi.spyOn(fs.promises, 'writeFile').mockImplementation(async (file, body, ...args: any[]) => {
+      if (String(file).startsWith(cacheDir(abs) + path.sep)) { beginWrite(); await writeGate; }
+      return (writeFile as any)(file, body, ...args);
+    });
+    try {
+      const pendingRead = m.readRange(UID, abs).catch(error => error); await reading;
+      replace(abs, fixture('docx', 'Bravo'));
+      const pendingWrite = m.statFile(UID, abs); await writing;
+      resumeRead(); expect(await pendingRead).toBeInstanceOf(m.NeedStatError);
+      resumeWrite(); await pendingWrite;
+    } finally { resumeRead(); resumeWrite(); readSpy.mockRestore(); writeSpy.mockRestore(); }
+    expect((await m.readRange(UID, abs)).content).toContain('Bravo');
+  });
+  it.each(['payload', 'metadata'] as const)('does not expose an interrupted %s publication and recovers without touching the source', async phase => {
+    const m = await loadMod(), abs = writeWorkspaceFile('publish-failure.docx', fixture('docx', 'Alpha'));
+    await m.statFile(UID, abs);
+    const source = fixture('docx', 'Bravo'); replace(abs, source);
+    const writeFile = fs.promises.writeFile, rename = fsDefault.renameSync;
+    const writeSpy = vi.spyOn(fs.promises, 'writeFile').mockImplementation(async (file, body, ...args: any[]) => {
+      if (phase === 'payload' && String(file).startsWith(cacheDir(abs) + path.sep)) {
+        await writeFile(file, 'incomplete'); throw Object.assign(new Error('Controlled publication failure'), { code: 'EIO' });
+      }
+      return (writeFile as any)(file, body, ...args);
+    });
+    const renameSpy = vi.spyOn(fsDefault, 'renameSync').mockImplementation((from, to) => {
+      if (phase === 'metadata' && String(to) === path.join(cacheDir(abs), 'meta.json')) {
+        throw Object.assign(new Error('Controlled commit failure'), { code: 'EIO' });
+      }
+      return rename(from, to);
+    });
+    syncBuiltinESMExports();
+    try {
+      await expect(m.getExtractedText(UID, abs)).rejects.toMatchObject({ code: 'EIO' });
+      expect(m.getCachedMeta(UID, abs)).toBeNull();
+      expect(fs.readFileSync(abs)).toEqual(source);
+    } finally { writeSpy.mockRestore(); renameSpy.mockRestore(); syncBuiltinESMExports(); }
+    expect((await m.getExtractedText(UID, abs)).text).toContain('Bravo');
+    expect(fs.readdirSync(cacheDir(abs)).sort()).toEqual(['meta.json', 'text.md']);
   });
 });
 

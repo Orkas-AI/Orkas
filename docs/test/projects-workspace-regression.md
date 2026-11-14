@@ -2,6 +2,18 @@
 
 本规范覆盖本机项目、任务、资料库、工作区和恢复。使用隔离的本地用户与临时文件。
 
+## Rich-document source revisions
+
+Rich-document reads and searches share `file_indexer.test.ts` and
+`file-tools.test.ts` source-revision coverage: PDF/DOCX/XLSX/PPTX edits that keep
+size and mtime, legacy metadata, atomic replacement with colliding timestamps,
+replacement during extraction/publication/read, shared concurrent preparation,
+and failure recovery. A current cache hit must not reread the original document.
+Persistent changes get at most three preparations; a changed in-flight page
+must fail rather than claim complete content. Local caches rebuild on demand;
+source files and other entries remain untouched. Windows/native package and
+unusual filesystem timestamp semantics need separate platform verification.
+
 ## 分层评测矩阵
 
 | 核心场景 | 预期用户结果 | 单测 / 集成 | Electron E2E | 模型 benchmark |

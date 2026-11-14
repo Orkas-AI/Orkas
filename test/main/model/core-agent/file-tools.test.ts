@@ -691,6 +691,26 @@ describe('file-tools › portable skill documents', () => {
 });
 
 describe('file-tools › read_files (rich documents prepare on first read)', () => {
+  it('reads and greps the current DOCX revision after an equal-size save preserving mtime', async () => {
+    const { tools, wsDir } = await buildTools();
+    const file = path.join(wsDir, 'current.docx');
+    const old = makeMinimalDocx({ paragraphs: ['Alpha'] });
+    const current = makeMinimalDocx({ paragraphs: ['Bravo'] });
+    expect(current.length).toBe(old.length);
+    const stamp = new Date('2026-01-01T00:00:00Z');
+    fs.writeFileSync(file, old); fs.utimesSync(file, stamp, stamp);
+    const read = getTool(tools, 'read_files'), grep = getTool(tools, 'grep_files');
+    expect((await run(read, { paths: [{ path: file }] })).content).toContain('Alpha');
+    await new Promise(r => setTimeout(r, 10));
+    fs.writeFileSync(file, current); fs.utimesSync(file, stamp, stamp);
+    const found = await run(grep, { root: file, pattern: 'Bravo' });
+    expect(found.isError).toBeFalsy(); expect(found.content).toContain('Bravo');
+    const result = await run(read, { paths: [{ path: file }] });
+    expect(result.isError).toBeFalsy(); expect(result.content).toContain('Bravo');
+    expect(result.content).not.toContain('Alpha');
+    expect(result.content).toContain('request_complete="true"');
+    expect(fs.readFileSync(file)).toEqual(current);
+  });
   it('renders image-only PDF pages for vision after reporting empty extraction, without an OCR tool', async () => {
     const { tools, wsDir } = await buildTools();
     const { PDFDocument } = await import('pdf-lib');
