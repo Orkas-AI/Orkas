@@ -2627,22 +2627,95 @@ export function buildInspectScript(meta: CompositionMeta, tSec: number, expected
     .replace(/\\s+/g, ' ')
     .trim();
   const parseColor = (value) => {
-    const m = /rgba?\\(([^)]+)\\)/i.exec(String(value || ''));
+    const m = /^rgba?\\(([^)]+)\\)$/i.exec(String(value || '').trim());
     if (!m) return null;
-    const parts = m[1].split(',').map((part) => Number(part.trim()));
-    if (parts.length < 3 || parts.slice(0, 3).some((n) => !Number.isFinite(n))) return null;
-    const alpha = parts.length >= 4 && Number.isFinite(parts[3]) ? parts[3] : 1;
-    if (alpha <= 0.03) return null;
-    return { r: parts[0], g: parts[1], b: parts[2], a: alpha };
+    const parts = m[1].split(/[\\s,/]+/).filter(Boolean);
+    if (parts.length !== 3 && parts.length !== 4) return null;
+    const channels = parts.slice(0, 3).map((part) => Number(part.replace('%', '')) * (part.endsWith('%') ? 2.55 : 1));
+    const alpha = parts.length === 4 ? Number(parts[3].replace('%', '')) / (parts[3].endsWith('%') ? 100 : 1) : 1;
+    if (channels.some((n) => !Number.isFinite(n) || n < 0 || n > 255) || !Number.isFinite(alpha) || alpha < 0 || alpha > 1) return null;
+    return { r: channels[0], g: channels[1], b: channels[2], a: alpha };
   };
-  const bgColorFor = (el) => {
+  // Source-over is applied to ink and paper separately. Element opacity then
+  // flattens the whole group, not just its foreground colour (W3C compositing-1).
+  const over = (front, back) => {
+    const a = front.a + back.a * (1 - front.a);
+    if (!a) return { r: 0, g: 0, b: 0, a: 0 };
+    const channel = (key) => (front[key] * front.a + back[key] * back.a * (1 - front.a)) / a;
+    return { r: channel('r'), g: channel('g'), b: channel('b'), a };
+  };
+  const contrastStyles = new WeakMap();
+  const contrastStyle = (el) => {
+    if (!contrastStyles.has(el)) contrastStyles.set(el, getComputedStyle(el));
+    return contrastStyles.get(el);
+  };
+  const canvasRoot = document.documentElement;
+  const rootStyle = canvasRoot ? contrastStyle(canvasRoot) : null;
+  const rootBg = rootStyle ? parseColor(rootStyle.backgroundColor) : null;
+  const bodyStyle = contrastStyle(document.body);
+  // CSS Backgrounds propagates an HTML body's background to an otherwise
+  // transparent root canvas, outside the body's box and opacity group.
+  const bodyPaintsCanvas = canvasRoot && canvasRoot.tagName === 'HTML'
+    && document.body.parentElement === canvasRoot && rootBg && rootBg.a === 0
+    && rootStyle.backgroundImage === 'none'
+    && (!rootStyle.contain || rootStyle.contain === 'none') && (!bodyStyle.contain || bodyStyle.contain === 'none');
+  const contrastColorsFor = (el, fg, rect) => {
+    let ink = fg;
+    let paper = { r: 0, g: 0, b: 0, a: 0 };
+    let backing = null;
     let cur = el;
-    while (cur) {
-      const c = parseColor(getComputedStyle(cur).backgroundColor);
-      if (c) return c;
+    let depth = 0;
+    while (cur && depth++ < 64) {
+      const style = contrastStyle(cur);
+      // Images, gradients and non-source-over effects need frame review. A
+      // guessed solid colour must not become a repair finding.
+      if (['filter', 'backdropFilter', 'mixBlendMode', 'maskImage', 'webkitMaskImage'].some((key) =>
+        style[key] && style[key] !== 'none' && style[key] !== 'normal')) return null;
+      const paint = bodyPaintsCanvas && cur === document.body ? null : bodyPaintsCanvas && cur === canvasRoot ? bodyStyle : style;
+      if (paint && (ink.a < 1 || paper.a < 1)) {
+        if (paint.backgroundImage && paint.backgroundImage !== 'none') return null;
+        const bg = parseColor(paint.backgroundColor);
+        if (!bg) return null;
+        if (bg.a > 0) {
+          if (cur !== canvasRoot && paint.backgroundClip && paint.backgroundClip !== 'border-box') return null;
+          const box = cur === canvasRoot ? { left: 0, top: 0, right: width, bottom: height } : cur === el ? rect : cur.getBoundingClientRect();
+          const covers = box.left <= rect.left && box.top <= rect.top && box.right >= rect.right && box.bottom >= rect.bottom;
+          const overlaps = box.left < rect.right && box.right > rect.left && box.top < rect.bottom && box.bottom > rect.top;
+          if (!covers && overlaps) return null;
+          if (covers) {
+            ink = over(ink, bg);
+            paper = over(paper, bg);
+            if (paper.a === 1) backing = cur;
+          }
+        }
+      }
+      const opacity = Number(style.opacity || 1);
+      if (!Number.isFinite(opacity) || opacity < 0 || opacity > 1) return null;
+      ink = { ...ink, a: ink.a * opacity };
+      paper = { ...paper, a: paper.a * opacity };
+      if (paper.a < 1) backing = null;
       cur = cur.parentElement;
     }
-    return { r: 0, g: 0, b: 0, a: 1 };
+    // An unobserved/transparent canvas or an over-deep tree is unknown, not
+    // a black background. Opaque child plates still work over unknown images.
+    return !cur && ink.a === 1 && paper.a === 1 ? { ink, paper, backing } : null;
+  };
+  const knownContrastBackdrop = (el, colours, rect) => {
+    if (colours.backing === el) return true;
+    if (typeof document.elementsFromPoint !== 'function') return false;
+    // A sibling image/plate can sit between transparent text and its ancestor
+    // background. Hit-test only candidate findings, with a bounded paint stack.
+    const stack = document.elementsFromPoint((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2).slice(0, 32);
+    if (stack[0] !== el) return false;
+    for (const node of stack.slice(1)) {
+      if (node === colours.backing) return true;
+      if (node.contains && node.contains(el)) continue;
+      const style = contrastStyle(node);
+      const bg = parseColor(style.backgroundColor);
+      if (!bg || bg.a > 0 || (style.backgroundImage && style.backgroundImage !== 'none')
+        || ['IMG', 'VIDEO', 'CANVAS', 'SVG'].includes(node.tagName)) return false;
+    }
+    return false;
   };
   const luminance = (c) => {
     const channel = (v) => {
@@ -2722,12 +2795,12 @@ export function buildInspectScript(meta: CompositionMeta, tSec: number, expected
       if (text.length > 180 || (text.length > 110 && rect.height > height * 0.32)) {
         add('TEXT_DENSITY_HIGH', 'warning', 'low', el, 'text block is dense for phone-size video review.', { ...rectEvidence, character_count: text.length });
       }
-      const fg = parseColor(style.color);
-      const bg = bgColorFor(el.parentElement || el);
-      if (fg && bg) {
-        const ratio = contrastRatio(fg, bg);
+      const fg = parseColor(style.webkitTextFillColor || style.color);
+      const colours = fg ? contrastColorsFor(el, fg, rect) : null;
+      if (colours) {
+        const ratio = contrastRatio(colours.ink, colours.paper);
         const minRatio = fs >= 32 ? 3 : 4.5;
-        if (ratio < minRatio) {
+        if (ratio < minRatio && knownContrastBackdrop(el, colours, rect)) {
           add('LOW_CONTRAST', 'warning', 'medium', el, 'text contrast is low against its nearest solid background.', { ...rectEvidence, contrast_ratio: round(ratio), minimum_ratio: minRatio });
         }
       }
