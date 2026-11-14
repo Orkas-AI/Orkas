@@ -68,6 +68,14 @@ jobs:
           test/renderer/cli-account-usage.test.ts
           test/renderer/local-agents-status.test.ts
           test/renderer/agent-detail-return-navigation.test.ts
+
+      - name: Prepare the declared Chromium test browser
+        run: node node_modules/playwright/cli.js install chromium --only-shell
+      - name: Verify unread task status geometry and sidebar transitions
+        run: >-
+          npm run test:e2e --
+          test/e2e/sidebar_e2e_badges.spec.ts
+
       - name: Verify OpenCode stream termination and recovery
         run: >-
           npm run test:js -- --maxWorkers=1
