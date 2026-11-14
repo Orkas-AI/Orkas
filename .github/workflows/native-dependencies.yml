@@ -197,6 +197,8 @@ jobs:
           test/main/features/group_chat/bus-integration.test.ts
           -t "generated-media URL freshness"
 
+      - name: Prepare the declared Python runtime for legacy spreadsheet coverage
+        run: node bin/ensure-runtime.cjs --kind python --root resources/runtime
       - name: Verify single-owner attachment paste and recovery
         run: >-
           npm run test:js -- --maxWorkers=1
