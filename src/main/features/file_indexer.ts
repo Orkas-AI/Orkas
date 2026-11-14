@@ -28,7 +28,7 @@
  *     whether to extract first.
  *
  * Eviction:
- *   - source mtime/size changed        → lazy rebuild on next access
+ *   - source revision changed         → lazy rebuild on next access
  *   - cacheVersion != EXTRACT_CACHE_VERSION → lazy rebuild on next access
  *   - source file missing              → drop on access + pruneOrphans sweep
  *   - conversation deleted             → purgeByCid() drops entries for its cid
@@ -232,6 +232,8 @@ interface OnDiskMeta {
   utf8Valid?: boolean;
   /** Plain-text source change time. Missing legacy values rebuild lazily. */
   ctime?: number;
+  /** Rich-document stat identity; missing legacy values rebuild on demand. */
+  sourceVersion?: string;
   /** pdf only — see FileMeta.extractionEmpty. */
   extractionEmpty?: boolean;
   /** Per-page [charStart, charEnd) offsets into text.md. Populated for pdf only.
@@ -293,11 +295,22 @@ function metaToPublic(meta: OnDiskMeta): FileMeta {
 
 // ── Source validation / cache freshness ─────────────────────────────────
 
+function isRichDocument(kind: FileKind): boolean {
+  return kind === 'pdf' || kind === 'docx' || kind === 'spreadsheet' || kind === 'presentation';
+}
+
+function richSourceVersion(stat: fs.Stats): string {
+  // Detect in-place saves and atomic replacements without hashing the whole
+  // source on every cache hit. Keep sub-millisecond source precision here.
+  return JSON.stringify([stat.size, stat.mtimeMs, stat.ctimeMs, stat.birthtimeMs, stat.dev, stat.ino]);
+}
+
 function isFresh(meta: OnDiskMeta, stat: fs.Stats): boolean {
   return meta.cacheVersion === EXTRACT_CACHE_VERSION
       && meta.size === stat.size
       && meta.mtime === Math.floor(stat.mtimeMs)
-      && (meta.kind !== 'text' || meta.ctime === stat.ctimeMs);
+      && (meta.kind !== 'text' || meta.ctime === stat.ctimeMs)
+      && (!isRichDocument(meta.kind) || meta.sourceVersion === richSourceVersion(stat));
 }
 
 /** Stat the source; throw if missing/not a file. Normalises mtime to ms-int. */
@@ -598,7 +611,9 @@ async function materialise(
     cacheVersion: EXTRACT_CACHE_VERSION,
     lastAccessed: Date.now(),
     ...(kind === 'text' ? { ctime: stat.stat.ctimeMs } : {}),
+    ...(isRichDocument(kind) ? { sourceVersion: richSourceVersion(stat.stat) } : {}),
   };
+  let extracted: string | undefined;
 
   if (kind === 'pdf') {
     const buf = await fs.promises.readFile(absPath);
@@ -612,7 +627,7 @@ async function materialise(
       acc += header + pages[i] + (i < pages.length - 1 ? '\n\n' : '');
       pageMap.push({ page: i + 1, charStart, charEnd: acc.length });
     }
-    fs.writeFileSync(path.join(dir, 'text.md'), acc, 'utf8');
+    extracted = acc;
     base.totalChars = acc.length;
     base.pageMap = pageMap;
     // Every page came back blank → pdfjs almost certainly failed to map the
@@ -625,15 +640,15 @@ async function materialise(
   } else if (kind === 'docx') {
     const buf = await fs.promises.readFile(absPath);
     const md = await docxBufferToMarkdown(buf);
-    fs.writeFileSync(path.join(dir, 'text.md'), md, 'utf8');
+    extracted = md;
     base.totalChars = md.length;
   } else if (kind === 'spreadsheet') {
     const md = await extractOffice('spreadsheet-markdown', signal => fs.promises.readFile(absPath, { signal }));
-    await fs.promises.writeFile(path.join(dir, 'text.md'), md, 'utf8');
+    extracted = md;
     base.totalChars = md.length;
   } else if (kind === 'presentation') {
     const md = await extractOffice('pptx-markdown', signal => fs.promises.readFile(absPath, { signal }));
-    await fs.promises.writeFile(path.join(dir, 'text.md'), md, 'utf8');
+    extracted = md;
     base.totalChars = md.length;
   } else if (kind === 'legacy_office') {
     throw new UnsupportedFileKindError(absPath, kind);
@@ -648,8 +663,21 @@ async function materialise(
 
   // An awaited analysis must not replace a newer cache published meanwhile.
   // ensureFresh owns bounded recovery from this uncommitted source version.
-  if (kind === 'text' && !isFresh(base, statSource(absPath).stat)) return base;
-  writeMeta(dir, base);
+  if (!isFresh(base, statSource(absPath).stat)) return base;
+  if (extracted !== undefined) {
+    const candidate = path.join(dir, `text-${crypto.randomUUID()}.tmp`);
+    try {
+      await fs.promises.writeFile(candidate, extracted, 'utf8');
+      if (!isFresh(base, statSource(absPath).stat)) return base;
+      // No await between payload and metadata publication. Main-process
+      // readers cannot interleave a different cache revision with this pair;
+      // readers already awaiting I/O recheck the source before returning.
+      fs.renameSync(candidate, path.join(dir, 'text.md'));
+      writeMeta(dir, base);
+    } finally { fs.rmSync(candidate, { force: true }); }
+  } else {
+    writeMeta(dir, base);
+  }
   log.info('materialise', {
     user_id: maskId(userId),
     kind,
@@ -662,7 +690,7 @@ async function materialise(
   return base;
 }
 
-async function ensureFresh(
+async function prepareFresh(
   userId: string,
   absPath: string,
   textBufferLimit = TEXT_STREAM_THRESHOLD_BYTES,
@@ -700,15 +728,38 @@ async function ensureFresh(
     if (kind === 'text' && --analysisBudget.remaining < 0) {
       throw new Error('file changed while preparing text metadata');
     }
-    if (existing) removeDir(dir);
+    // Keep the previous rich payload until its replacement is ready. An
+    // already-started page read must not mistake cache deletion for a missing
+    // source; its final source-version check will reject the obsolete page.
+    if (existing && !isRichDocument(kind)) removeDir(dir);
     const prepared = await materialise(userId, absPath, kind, src, textBufferLimit);
-    if (kind !== 'text') return prepared;
     // Analysis awaits I/O; an editor or another reader may replace the source
     // and cache before it finishes. Never pair old metadata with a new page.
     src = statSource(absPath);
     if (isFresh(prepared, src.stat)) return prepared;
   }
   throw new Error('file changed while preparing text metadata');
+}
+
+// Share only active rich-document preparation, not a persistent in-memory
+// cache. Unrelated sources remain concurrent and failures release the entry.
+const richPreparations = new Map<string, Promise<OnDiskMeta>>();
+async function ensureFresh(
+  userId: string,
+  absPath: string,
+  textBufferLimit = TEXT_STREAM_THRESHOLD_BYTES,
+  analysisBudget = { remaining: 3 },
+): Promise<OnDiskMeta> {
+  if (!isRichDocument(kindOf(absPath))) return prepareFresh(userId, absPath, textBufferLimit, analysisBudget);
+  const key = cacheDirFor(userId, absPath);
+  let pending = richPreparations.get(key);
+  if (!pending) {
+    pending = prepareFresh(userId, absPath, textBufferLimit, analysisBudget);
+    richPreparations.set(key, pending);
+    const release = () => { if (richPreparations.get(key) === pending) richPreparations.delete(key); };
+    void pending.then(release, release);
+  }
+  return pending;
 }
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -878,6 +929,9 @@ export async function readRange(
   if (kind === 'text' && !isFresh(meta, statSource(absPath).stat)) {
     throw new Error('file changed while preparing text metadata');
   }
+  if (isRichDocument(kind) && !isFresh(meta, statSource(absPath).stat)) {
+    throw new NeedStatError(absPath, kind);
+  }
   return {
     content: slice.content,
     meta: encoding ? { ...metaToPublic(meta), totalChars: total } : metaToPublic(meta),
@@ -923,6 +977,9 @@ export async function getExtractedText(
       : path.join(cacheDirFor(userId, absPath), 'text.md'),
     'utf8',
   );
+  if (isRichDocument(meta.kind) && !isFresh(meta, statSource(absPath).stat)) {
+    throw new NeedStatError(absPath, meta.kind);
+  }
   return { text, meta: metaToPublic(meta) };
 }
 

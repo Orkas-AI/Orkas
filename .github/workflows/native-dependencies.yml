@@ -181,3 +181,10 @@ jobs:
         run: >-
           npm run test:js -- --maxWorkers=1
           test/main/features/video_studio_contrast.test.ts
+      - name: Prepare bundled Python for document regression cases
+        run: node bin/ensure-runtime.cjs --kind python --root resources/runtime
+      - name: Verify rich-document source revision and recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/file_indexer.test.ts
+          test/main/model/core-agent/file-tools.test.ts
