@@ -196,3 +196,17 @@ jobs:
           npm run test:js -- --maxWorkers=1
           test/main/features/group_chat/bus-integration.test.ts
           -t "generated-media URL freshness"
+
+      - name: Prepare the declared Python runtime for legacy spreadsheet coverage
+        run: node bin/ensure-runtime.cjs --kind python --root resources/runtime
+      - name: Verify single-owner attachment paste and recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/chat_attachments.test.ts
+          test/renderer/chat-rich-composer-paste.test.ts
+          test/renderer/chat-rich-composer-newline.test.ts
+          test/renderer/conversation-attachment-drop-route.test.ts
+          test/renderer/project-chat-attachment-binding.test.ts
+          test/renderer/conversation-submit-attach-guards.test.ts
+      - name: Type-check portable attachment journeys
+        run: npm run test:e2e:typecheck
