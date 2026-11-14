@@ -8490,6 +8490,56 @@ describe('conversation auto recipient', () => {
       .toBe('@commander 先回到你这里');
   });
 
+  it('keeps the explicit Commander reset after a failed acknowledgement', async () => {
+    const context = loadConversationRenderer();
+    context.apiFetch = async () => ({ json:async () => ({ ok:false }) });
+    vm.runInContext('currentCid="c1"; _rememberServerFloor("c1", {active_recipient:"a1", active_recipient_revision:1})', context);
+    context.setChatRecipient('conversation', { kind:'commander' });
+    await vm.runInContext('_floorSyncByCid.get("c1")', context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+    expect(context.getChatRecipient('conversation')).toMatchObject({ kind:'commander' });
+    expect(context.applyRecipientPrefix('Continue', 'conversation')).toBe('@commander Continue');
+  });
+
+  it('does not let a superseded acknowledgement clear the latest Commander reset', async () => {
+    const context = loadConversationRenderer();
+    const releases: Array<(value:unknown) => void> = [];
+    context.apiFetch = () => new Promise(resolve => releases.push(resolve));
+    vm.runInContext('currentCid="c1"; _rememberServerFloor("c1", {active_recipient:"a1", active_recipient_revision:1})', context);
+    context.setChatRecipient('conversation', { kind:'commander' });
+    const first = vm.runInContext('_floorSyncByCid.get("c1")', context);
+    context.setChatRecipient('conversation', { kind:'commander' });
+    releases[0]({ json:async () => ({ ok:true, state:{ active_recipient_revision:2 } }) });
+    await first;
+    expect(context.applyRecipientPrefix('Continue', 'conversation')).toBe('@commander Continue');
+    const second = vm.runInContext('_floorSyncByCid.get("c1")', context);
+    releases[1]({ json:async () => ({ ok:true, state:{ active_recipient_revision:3 } }) });
+    await second;
+    expect(context.applyRecipientPrefix('Continue', 'conversation')).toBe('Continue');
+  });
+
+  // 2026-11-12 live run: the user went back to Commander while VideoStudio priced a video, and
+  // VideoStudio later stopped to ask about a shot and took the floor. The reply "继续剪辑" still
+  // went to Commander behind a hidden @commander, and the chip kept saying Commander.
+  it('follows a floor an Agent takes after the return to Commander is confirmed', async () => {
+    const context = loadConversationRenderer();
+    context.apiFetch = async () => ({ json: async () => ({ ok: true, state: { active_recipient_revision: 2 } }) });
+    vm.runInContext(`
+      currentCid = "c1";
+      _groupMembersCache.set("c1", [{ kind: "agent", id: "a1", name: "VideoStudio" }]);
+      _rememberServerFloor("c1", { active_recipient: "a1", active_recipient_revision: 1 });
+    `, context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+
+    context.setChatRecipient('conversation', { kind: 'commander' });
+    await vm.runInContext('_floorSyncByCid.get("c1")', context);
+    vm.runInContext('_rememberServerFloor("c1", { active_recipient: "a1", active_recipient_revision: 3 })', context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+
+    expect(context.getChatRecipient('conversation')).toMatchObject({ kind: 'agent', id: 'a1' });
+    expect(context.applyRecipientPrefix('继续剪辑', 'conversation')).toBe('继续剪辑');
+  });
+
   it('prefixes from a send-time recipient snapshot instead of a later chip state', () => {
     const context = loadConversationRenderer();
     context._agentsCache = [
