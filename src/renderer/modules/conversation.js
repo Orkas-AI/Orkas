@@ -2052,7 +2052,12 @@ function setChatRecipient(target, next, _opts = {}) {
             // Agent that stops to ask the user, is who the next message goes to (2026-11-12).
             if (floorTarget === 'commander' && _floorSyncByCid.get(floorCid) === sync) _pendingFloorResetByCid.delete(floorCid);
           }
-          if (_floorSyncByCid.get(floorCid) === sync) _floorSyncByCid.delete(floorCid);
+          if (_floorSyncByCid.get(floorCid) === sync) {
+            _floorSyncByCid.delete(floorCid);
+            // A newer floor may already have arrived while this acknowledgement
+            // was pending. Reconcile it after releasing this write's guard.
+            if (data?.ok && data.state && floorTarget === 'commander') void _evaluateAutoRecipient(floorCid);
+          }
         });
       }
     }
