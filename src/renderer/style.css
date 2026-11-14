@@ -700,8 +700,13 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 .sidebar-conversation-nav .conv-item.has-unread .conv-item-title-input {
   flex: 0 1 auto;
 }
+/* Keep the trailing status and menu together when the title stops growing. */
+.sidebar-conversation-nav .conv-item.has-unread .conv-item-status-label,
 .sidebar-conversation-nav .conv-item.has-unread .conv-item-actions {
   margin-left: auto;
+}
+.sidebar-conversation-nav .conv-item.has-unread .conv-item-status-label ~ .conv-item-actions {
+  margin-left: 0;
 }
 .project-name-unread-group {
   display: flex;
