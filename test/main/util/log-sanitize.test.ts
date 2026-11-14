@@ -226,6 +226,23 @@ describe('sanitizeLogTextForUpload › set B (must be preserved)', () => {
   });
 });
 
+describe('sanitizeLogTextForUpload › quoted key=value fields', () => {
+  it('masks double- and single-quoted values, including spaces', () => {
+    expect(sanitizeLogTextForUpload('login failed password="hunter2 is long" for user'))
+      .toBe('login failed password=*** for user');
+    expect(sanitizeLogTextForUpload("retry api_key='abc def' now")).toBe('retry api_key=*** now');
+    expect(sanitizeLogTextForUpload('token="abcDEF123456"')).toBe('token=***');
+  });
+
+  it('masks two quoted secrets on one line', () => {
+    expect(sanitizeLogTextForUpload('secret="a b" token="c d"')).toBe('secret=*** token=***');
+  });
+
+  it('keeps masking an unquoted value that contains a quote', () => {
+    expect(sanitizeLogTextForUpload('token=abc"def')).toBe('token=***"def');
+  });
+});
+
 describe('sanitizeLogTextForUpload › edge cases', () => {
   it('returns empty input unchanged', () => {
     expect(sanitizeLogTextForUpload('')).toBe('');
