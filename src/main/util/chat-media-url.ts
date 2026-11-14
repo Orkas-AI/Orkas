@@ -279,7 +279,7 @@ export function versionChatMediaLocalUrlsInText(text: string, baseDirAbs = ''): 
   const normalized = _normalizeLocalMediaAliasesInMarkdown(
     _normalizeWorkspaceDocumentLinks(String(text || ''), baseDirAbs, tokens), baseDirAbs,
   );
-  return normalized.replace(CHAT_MEDIA_LOCAL_URL_IN_TEXT, (raw) => {
+  const versionBareUrls = (segment: string): string => segment.replace(CHAT_MEDIA_LOCAL_URL_IN_TEXT, (raw) => {
     let candidate = raw;
     let suffix = '';
 
@@ -307,4 +307,20 @@ export function versionChatMediaLocalUrlsInText(text: string, baseDirAbs = ''): 
     }
     return versioned ? versioned + suffix : raw;
   });
+
+  // Parse the existing Markdown destination contract before scanning bare URLs.
+  // Otherwise a query can absorb the closing parenthesis and emphasis (e.g.
+  // `?v=old)**`), which URLSearchParams.set then silently replaces with the token.
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const match of normalized.matchAll(MARKDOWN_LOCAL_MEDIA_DESTINATION)) {
+    const index = match.index!;
+    parts.push(versionBareUrls(normalized.slice(cursor, index)));
+    const [full, prefix, destination, suffix] = match;
+    const versioned = destination && _versionLocalUrlCandidate(destination, tokens);
+    parts.push(versioned ? `${prefix}${versioned}${suffix}` : versionBareUrls(full));
+    cursor = index + full.length;
+  }
+  parts.push(versionBareUrls(normalized.slice(cursor)));
+  return parts.join('');
 }
