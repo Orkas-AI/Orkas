@@ -434,6 +434,22 @@ def _meta_get(metas, *, name=None, prop=None, http_equiv=None):
     return None
 
 
+def _meta_robots_noindex(metas: list[dict]) -> bool:
+    """Combine all generic robots tags, matching exact indexing directives.
+
+    `none` means noindex,nofollow. Values such as max-image-preview: none
+    and look-alikes such as noindexing are not independent noindex rules.
+    Crawler-specific meta tags are outside this generic indexability signal.
+    """
+    for meta in metas:
+        if meta.get("name", "").lower() != "robots":
+            continue
+        for part in meta.get("content", "").lower().split(","):
+            if ":" not in part and any(token in {"noindex", "none"} for token in part.split()):
+                return True
+    return False
+
+
 def _raw_anchor_hrefs(html: str) -> list[str]:
     """Best-effort href fallback for badly nested HTML that traps tags in text."""
     return [unescape(next(v for v in m.groups() if v is not None)) for m in _RAW_ANCHOR_HREF_RE.finditer(html or "")]
@@ -514,7 +530,7 @@ def extract_fields(html: str, page_url: str, *, status: int | None = 200,
     text = p.visible_text()
     word_count = _count_words(text)
 
-    noindex = bool(meta_robots and "noindex" in meta_robots.lower())
+    noindex = _meta_robots_noindex(p.metas)
     # Indexability needs both halves. The directive is in the HTML, but the 200
     # is a response fact, so without a request this is unknown rather than false:
     # reporting false here would accuse a page of being blocked on no evidence.
