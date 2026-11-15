@@ -657,8 +657,7 @@ describe('builtin marketplace seed', () => {
     } finally { fs.rmSync(foreign, { recursive: true, force: true }); }
   });
 
-  it.each(['ancestor', 'leaf'] as const)('protects foreign bytes when pruning a stale managed %s link', async (location, context) => {
-    if (location === 'leaf' && process.platform === 'win32') context.skip();
+  it.each(['ancestor', 'leaf'] as const)('protects foreign bytes when pruning a stale managed %s link', async location => {
     writeBuiltinAgent(TEST_AGENT_ID, { version: '2.0.0', name: 'Writer', category: 'general' });
     const seed = await import('../../../src/main/features/builtin_marketplace');
     const paths = await import('../../../src/main/paths');
