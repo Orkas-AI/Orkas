@@ -75,6 +75,7 @@ jobs:
         run: >-
           npm run test:e2e --
           test/e2e/sidebar_e2e_badges.spec.ts
+          test/e2e/ai_select_e2e_geometry.spec.ts
 
       - name: Verify OpenCode stream termination and recovery
         run: >-

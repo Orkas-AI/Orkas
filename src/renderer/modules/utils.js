@@ -2656,6 +2656,8 @@ function _aiSelectMount(el, config) {
     const rect = trigger.getBoundingClientRect();
     popover.dataset.uiOverlay = '';
     popover.style.position = 'fixed';
+    // Release the in-slot opposite edge so RTL keeps the measured left anchor.
+    popover.style.right = 'auto';
     popover.style.left = rect.left + 'px';
     popover.style.width = rect.width + 'px';
     popover.style.maxHeight = '';
@@ -2699,6 +2701,7 @@ function _aiSelectMount(el, config) {
     popover.hidden = true;
     popover.style.position = '';
     popover.style.left = '';
+    popover.style.right = '';
     popover.style.top = '';
     popover.style.width = '';
     popover.style.maxHeight = '';
