@@ -854,7 +854,7 @@ function _renderProjectAllTasks() {
         .join('');
   if (typeof _projectConversationHasMore === 'function'
       && _projectConversationHasMore(_projectDetailPid)) {
-    listEl.insertAdjacentHTML('beforeend', `<button type="button" class="conversation-list-load-more" data-project-detail-conv-more="1">
+    listEl.insertAdjacentHTML('beforeend', `<button type="button" class="conversation-list-load-more" data-i18n="sidebar.load_more_conversations" data-project-detail-conv-more="1">
       ${escapeHtml(t('sidebar.load_more_conversations'))}</button>`);
     listEl.querySelector('[data-project-detail-conv-more]')?.addEventListener('click', async (e) => {
       const button = e.currentTarget;

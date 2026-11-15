@@ -31,10 +31,16 @@ test('keeps task pagination close to its rows without losing focus or page navig
   const lists = ['#conversation-list', `[data-pid-children="${project.project_id}"]`, '#project-tasks-list'];
   for (const [language, width, height] of [['zh', 1100, 740], ['en', 900, 600]] as const) {
     await page.setViewportSize({ width, height });
+    const existingMore = page.locator('#conversation-list > .conversation-list-load-more');
+    const originalButton = await existingMore.elementHandle();
+    await existingMore.focus();
     await page.evaluate(async (lang) => { await (window as any).setLang(lang); }, language);
+    await expect(existingMore).toBeFocused();
+    expect(await existingMore.evaluate((button, original) => button === original, originalButton)).toBe(true);
     for (const list of lists) {
       const more = page.locator(`${list} > .conversation-list-load-more`);
       await expect(more).toBeVisible();
+      await expect(more).toHaveText(language === 'zh' ? '显示更多' : 'Show more');
       await more.scrollIntoViewIfNeeded();
       const geometry = await more.evaluate((button) => {
         const row = button.previousElementSibling!;
@@ -69,6 +75,21 @@ test('keeps task pagination close to its rows without losing focus or page navig
     await expect(page.locator(`${list} > .conv-item`)).toHaveCount(11);
     await expect(more).toHaveCount(0);
   }
+  // Recent tasks use a separate local page cursor. Repaint labels without
+  // replacing the focused control or revealing additional rows.
+  if (await page.locator('#today-list').isHidden()) await page.locator('#today-section-toggle').click();
+  const recent = page.locator('#today-list > .conversation-list-load-more');
+  for (const language of ['zh', 'en']) {
+    const original = await recent.elementHandle();
+    await recent.focus();
+    await page.evaluate(async lang => { await (window as any).setLang(lang); }, language);
+    await expect(recent).toBeFocused();
+    expect(await recent.evaluate((button, old) => button === old, original)).toBe(true);
+    await expect(recent).toHaveText(language === 'zh' ? '显示更多' : 'Show more');
+    await expect(page.locator('#today-list > .conv-item')).toHaveCount(10);
+  }
+  await recent.click();
+  await expect(page.locator('#today-list > .conv-item')).toHaveCount(20);
   // The automation history shares the same row and pagination styles. Seed
   // only its read cache; render with the shipped row component and handlers.
   await page.locator('#auto-btn').click();
@@ -78,15 +99,24 @@ test('keeps task pagination close to its rows without losing focus or page navig
       _autoTaskConversationPages.set('layout-history', {
         initialized: true, items: conversations.slice(0, 10), total: 11, nextOffset: 10,
       });
-      document.getElementById('auto-list').replaceChildren(_autoRenderRow({
+      _autoTasks = [{
         id: 'layout-history', title: 'Execution history', content: 'Layout preview',
         enabled: false, schedule: { type: 'daily', hour: 3, minute: 0 },
-      }, { expanded: true }));
+      }];
+      _autoExpandedRows.add('layout-history');
+      _autoRenderList();
       document.getElementById('auto-empty').style.display = 'none';
     `);
   });
   const historyMore = page.locator('#auto-list .conversation-list-load-more');
   await expect(historyMore).toBeVisible();
+  for (const language of ['zh', 'en']) {
+    await page.evaluate(async lang => { await (window as any).setLang(lang); }, language);
+    // Automation intentionally rebuilds its list on language changes. Its
+    // cached page and translated navigation must survive that existing repaint.
+    await expect(page.locator('#auto-list .conv-item')).toHaveCount(10);
+    await expect(historyMore).toHaveText(language === 'zh' ? '显示更多' : 'Show more');
+  }
   const historyGeometry = await historyMore.evaluate((button) => {
     const rect = button.getBoundingClientRect();
     const style = getComputedStyle(button);
