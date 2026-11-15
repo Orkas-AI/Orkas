@@ -27,6 +27,7 @@ import { compareVersions, minAppVersionFrom } from '../util/app-version-compat';
 import { logErrorSummary } from '../util/log-redact';
 import { sha256OfFile } from '../util/sha256';
 import { replaceDirectoryAtomically } from '../util/atomic-directory-replace';
+import { isPathAllowed, resolveSandboxRoot } from '../util/path-sandbox';
 import {
   MARKETPLACE_RESOURCE_MANIFEST_NAME,
   MARKETPLACE_TREE_HASH_SKIP_NAMES,
@@ -539,24 +540,34 @@ async function _copyExistingDirectoryContents(src: string, dst: string): Promise
   }
 }
 
+function _assertManagedPath(candidate: string, root: string, followFinalSymlink = true): void {
+  if (!isPathAllowed(candidate, [root], { rootsResolved: true, followFinalSymlink })) {
+    throw Object.assign(new Error('builtin content path is outside the install'), { code: 'E_PATH_OUT_OF_SCOPE' });
+  }
+}
+
 async function _copyManagedFiles(src: string, dst: string, files: string[]): Promise<void> {
+  const root = resolveSandboxRoot(dst);
   for (const rel of files) {
     const safeRel = _normalizeManagedRel(rel);
     if (!safeRel) continue;
     const from = path.join(src, safeRel);
     const to = path.join(dst, safeRel);
+    _assertManagedPath(to, root);
     await fsp.mkdir(path.dirname(to), { recursive: true });
     await fsp.copyFile(from, to);
   }
 }
 
 async function _removeStaleManagedFiles(dst: string, previousFiles: string[], currentFiles: string[]): Promise<void> {
+  const root = resolveSandboxRoot(dst);
   const current = new Set(currentFiles);
   for (const rel of previousFiles) {
     if (current.has(rel)) continue;
     const safeRel = _normalizeManagedRel(rel);
     if (!safeRel) continue;
     const target = path.join(dst, safeRel);
+    _assertManagedPath(target, root, false);
     try {
       const stat = await fsp.lstat(target);
       if (stat.isFile() || stat.isSymbolicLink()) {
