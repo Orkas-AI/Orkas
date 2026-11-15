@@ -94,13 +94,19 @@ jobs:
           --grep "launches the hidden real renderer and preload bridge"
 
 
-      - name: Retain content-free Electron startup log findings
+      - name: Verify task pagination labels and navigation
+        run: >-
+          xvfb-run --auto-servernum npm run test:e2e --
+          test/e2e/sidebar_e2e_pagination_spacing.spec.ts
+          --output=test-results/pagination
+
+      - name: Retain content-free Electron journey log findings
         if: always()
         run: |
           node <<'NODE'
           const fs = require('node:fs');
           const path = require('node:path');
-          const root = 'test-results/e2e';
+          for (const root of ['test-results/e2e', 'test-results/pagination']) {
           const entries = fs.existsSync(root) ? fs.readdirSync(root).sort().slice(0, 64) : [];
           for (const [index, entry] of entries.entries()) {
             const dir = path.join(root, entry);
@@ -109,13 +115,14 @@ jobs:
             if (fs.statSync(report).size > 1024 * 1024) throw new Error('Startup log summary exceeds its bound');
             const value = JSON.parse(fs.readFileSync(report, 'utf8'));
             const { passed, coveragePassed, capturedLineCount, analyzedLineCount, droppedLineCount, levelCounts, findings } = value;
-            console.log(JSON.stringify({ startupLogSummary: index, passed, coveragePassed, capturedLineCount, analyzedLineCount, droppedLineCount, levelCounts, findings }));
+            console.log(JSON.stringify({ suite: path.basename(root), startupLogSummary: index, passed, coveragePassed, capturedLineCount, analyzedLineCount, droppedLineCount, levelCounts, findings }));
             const log = path.join(dir, 'electron-main.log');
             if (!fs.existsSync(log)) continue;
             if (fs.statSync(log).size > 8 * 1024 * 1024) throw new Error('Startup log exceeds its diagnostic bound');
             const body = fs.readFileSync(log, 'utf8');
             const identities = [...body.matchAll(/message_hash:\s*'([a-f0-9]{12})',\s*message_chars:\s*(\d+)/g)];
-            console.log(JSON.stringify({ startupErrorIdentities: index, retained: identities.length, errors: identities.slice(0, 32).map(match => ({ hash: match[1], chars: Number(match[2]) })) }));
+            console.log(JSON.stringify({ suite: path.basename(root), startupErrorIdentities: index, retained: identities.length, errors: identities.slice(0, 32).map(match => ({ hash: match[1], chars: Number(match[2]) })) }));
+          }
           }
           NODE
 

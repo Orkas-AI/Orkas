@@ -683,7 +683,7 @@ function _autoRenderTaskConvs(taskId, container) {
         .map((c) => _renderConversationSidebarItem(c, { nested: true, hidePin: true }))
         .join('');
   if (page.nextOffset !== null) {
-    html += `<button type="button" class="conversation-list-load-more" data-auto-task-convs-more="1">${escapeHtml(t('sidebar.load_more_conversations'))}</button>`;
+    html += `<button type="button" class="conversation-list-load-more" data-i18n="sidebar.load_more_conversations" data-auto-task-convs-more="1">${escapeHtml(t('sidebar.load_more_conversations'))}</button>`;
   }
   container.innerHTML = html;
   if (typeof _bindConversationSidebarItems === 'function') {

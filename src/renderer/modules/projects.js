@@ -346,7 +346,7 @@ function _renderProjectRow(p, convs) {
       }
     }
     if (typeof _projectConversationHasMore === 'function' && _projectConversationHasMore(p.project_id)) {
-      html += `<button type="button" class="conversation-list-load-more" data-project-conv-more="${escapeHtml(p.project_id)}">
+      html += `<button type="button" class="conversation-list-load-more" data-i18n="sidebar.load_more_conversations" data-project-conv-more="${escapeHtml(p.project_id)}">
         ${escapeHtml(t('sidebar.load_more_conversations'))}</button>`;
     }
     html += '</div>';

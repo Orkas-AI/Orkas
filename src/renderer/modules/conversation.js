@@ -6810,7 +6810,7 @@ function renderConversationList() {
   }
   container.innerHTML = _renderConversationTimeBucketList(unprojected, { listId: 'conversation-list' });
   if (_unprojectedConversationPage.nextOffset !== null) {
-    container.insertAdjacentHTML('beforeend', `<button type="button" class="conversation-list-load-more" data-unprojected-conv-more="1">
+    container.insertAdjacentHTML('beforeend', `<button type="button" class="conversation-list-load-more" data-i18n="sidebar.load_more_conversations" data-unprojected-conv-more="1">
       ${escapeHtml(t('sidebar.load_more_conversations'))}</button>`);
   }
 
