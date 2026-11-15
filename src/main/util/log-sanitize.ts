@@ -31,7 +31,7 @@ const JSON_SECRET_FIELD_RE = new RegExp(
 );
 
 const KV_SECRET_FIELD_RE = new RegExp(
-  `\\b(${SENSITIVE_FIELD})(\\s*=\\s*)([^\\s,;&"']+)`,
+  `\\b(${SENSITIVE_FIELD})(\\s*=\\s*)(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|[^\\s,;&"']+)`,
   'gi',
 );
 
