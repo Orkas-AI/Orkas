@@ -120,6 +120,18 @@ jobs:
             if (!fs.existsSync(log)) continue;
             if (fs.statSync(log).size > 8 * 1024 * 1024) throw new Error('Startup log exceeds its diagnostic bound');
             const body = fs.readFileSync(log, 'utf8');
+            if (!passed && root.endsWith('/pagination')) {
+              require('tsx/cjs');
+              const { sanitizeLogText } = require('./src/main/util/log-redact.ts');
+              let stderr = false;
+              const diagnostic = [];
+              for (const line of body.split(/\r?\n/)) {
+                const stream = /^\[main:(stdout|stderr)\]/.exec(line);
+                if (stream) stderr = stream[1] === 'stderr';
+                if (stderr && !/\[\d\d:\d\d:\d\d\.\d+\] \[(?:info|warn|error|debug)\]/.test(line)) diagnostic.push(sanitizeLogText(line));
+              }
+              console.log(JSON.stringify({ paginationProcessDiagnostics: index, count: diagnostic.length, lines: diagnostic.slice(0, 64) }));
+            }
             const identities = [...body.matchAll(/message_hash:\s*'([a-f0-9]{12})',\s*message_chars:\s*(\d+)/g)];
             console.log(JSON.stringify({ suite: path.basename(root), startupErrorIdentities: index, retained: identities.length, errors: identities.slice(0, 32).map(match => ({ hash: match[1], chars: Number(match[2]) })) }));
           }
