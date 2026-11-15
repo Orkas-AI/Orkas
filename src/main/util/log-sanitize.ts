@@ -30,8 +30,15 @@ const JSON_SECRET_FIELD_RE = new RegExp(
   'gi',
 );
 
+// Escaped characters belong to the value, including escaped quote delimiters.
+// A truncated quoted value is private through the end of that line, not the
+// next diagnostic line. Keep the escape and ordinary-character branches disjoint.
+const QUOTED_SECRET_VALUE =
+  String.raw`"(?:\\[^\r\n]|[^"\\\r\n])*(?:"|\\?(?=[\r\n]|$))` +
+  String.raw`|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|\\?(?=[\r\n]|$))`;
+
 const KV_SECRET_FIELD_RE = new RegExp(
-  `\\b(${SENSITIVE_FIELD})(\\s*=\\s*)(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|[^\\s,;&"']+)`,
+  `\\b(${SENSITIVE_FIELD})(\\s*=\\s*)(?:${QUOTED_SECRET_VALUE}|[^\\s,;&"']+)`,
   'gi',
 );
 

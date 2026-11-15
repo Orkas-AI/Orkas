@@ -106,6 +106,13 @@ describe('log-redact', () => {
     expect(sanitizeLogText('falling back to basic retrieval')).toBe('falling back to basic retrieval');
   });
 
+  it('keeps escaped and truncated quoted credentials out of error references', () => {
+    const ref = logErrorRef(new Error(String.raw`request failed password="private\" tail" status=401`));
+    expect(ref.message).toBe('request failed password=*** status=401');
+    expect(sanitizeLogText('request token="unfinished private value\nstatus=401'))
+      .toBe('request token=***\nstatus=401');
+  });
+
   it('preserves safe URLs adjacent to cloud paths while redacting secrets', () => {
     const text = sanitizeLogText(
       'failed cloud/agents/abc123/skills/private/SKILL.md via https://example.com/sync/sts?token=secret ghp_abcdefghijklmnopqrstuvwxyz',
