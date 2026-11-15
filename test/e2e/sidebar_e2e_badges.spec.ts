@@ -20,7 +20,7 @@ async function setup(page: Page, count: number) {
   page.on('pageerror', e => captured.push(`error: ${e.message}`));
   const file = test.info().outputPath('sidebar.html');
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `<!doctype html><html><head><base href="${pathToFileURL(renderer + path.sep).href}">
+  fs.writeFileSync(file, `<!doctype html><html><head><meta charset="utf-8"><base href="${pathToFileURL(renderer + path.sep).href}">
     <link rel="stylesheet" href="style.css"><script>
     window.createLogger=()=>console; window.t=(key,args)=>args?.n ? args.n+' running' : key;
     window.currentCid=null; window.currentView='conversation'; window.conversations=[];
@@ -123,4 +123,95 @@ test('repeated refresh preserves live indicators, rename focus and status transi
     w._updateConvSidebarBadge('c2');
   });
   await expect(page.locator('[data-cid="c2"] .conv-status-badge')).toHaveCount(2);
+});
+
+test('task status stays at the trailing edge beside the menu when replies become unread', async ({ page }, info) => {
+  await setup(page, 0);
+  await page.addScriptTag({ path: path.join(renderer, 'modules/cli_async_input.js') });
+  await page.addScriptTag({ path: path.join(renderer, 'modules/task-unread.js') });
+  const index = fs.readFileSync(path.join(renderer, 'index.html'), 'utf8');
+  const sidebar = index.slice(index.indexOf('<aside class="sidebar">'), index.indexOf('</aside>') + 8);
+  const locales = Object.fromEntries(['zh', 'en', 'ar'].map(lang => [lang,
+    JSON.parse(fs.readFileSync(path.join(renderer, 'locales', `${lang}.json`), 'utf8'))]));
+  await page.evaluate(({ sidebar, locales }) => {
+    const w = window as any;
+    document.body.innerHTML = `<div class="app-container">${sidebar}<main class="main-content"></main></div>`;
+    w.currentUserId = 'sidebar-layout-fixture';
+    w.currentView = 'new-chat';
+    w.CliAsyncInput.waitingCount = (cid: string) => cid.startsWith('waiting-') ? 1 : 0;
+    w.renderLayout = (lang: string) => {
+      w.t = (key: string) => locales[lang][key] || key;
+      document.querySelectorAll('[data-i18n]').forEach(el => {
+        el.textContent = w.t((el as HTMLElement).dataset.i18n);
+      });
+      w.conversations = ['failed', 'blocked', 'waiting', 'done'].flatMap(status => ['short', 'long'].map(length => ({
+        conversation_id: `${status}-${length}`, status,
+        title: length === 'short' ? (lang === 'zh' ? '任务' : 'Task') : '需要处理的长任务标题 · A long task title that must truncate safely',
+      })));
+      document.getElementById('today-list')!.innerHTML = w.conversations.map((c: any) => w._renderConversationSidebarItem(c)).join('');
+      document.getElementById('projects-list')!.innerHTML = `<div class="project-conv-list">${w.conversations.map((c: any) =>
+        w._renderConversationSidebarItem(c, { nested: true })).join('')}</div>`;
+      w.TaskUnread.refresh();
+      w.hydrateUiIcons(document.body);
+    };
+  }, { sidebar, locales });
+  const assertGeometry = async () => {
+    const rows = await page.locator('.sidebar-conversation-nav .conv-item').evaluateAll(items => items.map(item => {
+      const row = item.querySelector('.conv-item-row')!;
+      const title = row.querySelector('.conv-item-title')!;
+      const label = row.querySelector('.conv-item-status-label');
+      const dot = row.querySelector('.task-unread-dot');
+      const actions = row.querySelector('.conv-item-actions')!;
+      const gap = parseFloat(getComputedStyle(row).columnGap);
+      const rtl = getComputedStyle(row).direction === 'rtl';
+      const rowRect = row.getBoundingClientRect();
+      const actionRect = actions.getBoundingClientRect();
+      const labelRect = label?.getBoundingClientRect();
+      const titleRect = title.getBoundingClientRect();
+      const dotRect = dot?.getBoundingClientRect();
+      return {
+        cid: (item as HTMLElement).dataset.cid,
+        statusGap: labelRect ? (rtl ? labelRect.left - actionRect.right : actionRect.left - labelRect.right) - gap : 0,
+        dotGap: dotRect ? (rtl ? titleRect.left - dotRect.right : dotRect.left - titleRect.right) - gap : 0,
+        titleWidth: title.getBoundingClientRect().width,
+        overflow: Math.max(rowRect.left - actionRect.left, actionRect.right - rowRect.right),
+      };
+    }));
+    for (const row of rows) {
+      expect(Math.abs(row.statusGap), `${row.cid}: status beside trailing menu`).toBeLessThan(1);
+      expect(Math.abs(row.dotGap), `${row.cid}: unread dot beside title`).toBeLessThan(1);
+      expect(row.titleWidth, `${row.cid}: readable title space`).toBeGreaterThan(0);
+      expect(row.overflow, `${row.cid}: no row overflow`).toBeLessThanOrEqual(1);
+    }
+  };
+  for (const [lang, width, height, sidebarWidth] of [['zh', 1280, 800, 180], ['en', 800, 600, 280], ['ar', 1000, 700, 280]] as const) {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(({ lang, sidebarWidth }) => {
+      const w = window as any;
+      document.documentElement.setAttribute('dir', lang === 'ar' ? 'rtl' : 'ltr');
+      document.documentElement.style.setProperty('--sidebar-width', `${sidebarWidth}px`);
+      w.renderLayout(lang);
+    }, { lang, sidebarWidth });
+    await assertGeometry();
+    await page.evaluate(() => {
+      const w = window as any;
+      for (const c of w.conversations) w._markConversationUnread(c.conversation_id, { finishedAt: Date.now() });
+      w._refreshAllConvBadges();
+    });
+    await expect(page.locator('.conv-item.has-unread')).toHaveCount(16);
+    await assertGeometry();
+    const failed = page.locator('#today-list [data-cid="failed-short"]');
+    await failed.hover();
+    await failed.locator('.conv-item-menu').focus();
+    await assertGeometry();
+    await page.screenshot({ path: info.outputPath(`status-alignment-${lang}.png`) });
+    await page.locator('.project-conv-list').scrollIntoViewIfNeeded();
+    await page.screenshot({ path: info.outputPath(`status-alignment-project-${lang}.png`) });
+    await page.evaluate(() => {
+      const w = window as any;
+      for (const c of w.conversations) w.TaskUnread.markRead(c.conversation_id);
+    });
+    await expect(page.locator('.conv-item.has-unread')).toHaveCount(0);
+    await assertGeometry();
+  }
 });

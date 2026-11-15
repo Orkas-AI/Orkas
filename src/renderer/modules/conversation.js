@@ -5712,7 +5712,9 @@ function _hydrateMessageAttachments(msgDiv, cid) {
 // empty FileList and fall through to the textarea's native paste handler.
 function _bindChatPasteAttach(inputSelector, getCid) {
   const el = document.querySelector(inputSelector);
-  if (!el || el.dataset.pasteBound === '1') return;
+  // Rich composers own paste through EditorView. A second listener on the
+  // same element uploads twice when the editor was initialized first.
+  if (!el || el.matches('[data-composer]') || el.dataset.pasteBound === '1') return;
   el.addEventListener('paste', (e) => {
     const cid = getCid();
     if (!cid) return;

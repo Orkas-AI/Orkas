@@ -15,6 +15,57 @@ import {
 } from '../../../src/main/util/chat-media-url';
 
 describe('util/chat-media-url', () => {
+  it.each([
+    ['bold video', '**', '.mp4', '?v=old', '后续说明', 'video'],
+    ['unversioned bold video', '**', '.mp4', '', '', 'video'],
+    ['italic image', '*', '.png', '?v=old', '', 'img'],
+    ['underscored audio', '__', '.wav', '?download=1&v=old#preview', '', 'audio'],
+    ['struck video', '~~', '.mp4', '?v=old', '', 'video'],
+  ])('keeps the %s renderable when refreshing its URL', (_label, emphasis, ext, query, prose, tag) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-media-markdown-'));
+    const file = path.join(dir, `成片 (final)!${ext}`);
+    try {
+      fs.writeFileSync(file, 'media');
+      const base = chatMediaLocalUrl(file);
+      const source = `${emphasis}[Result](${base}${query})${emphasis}${prose}`;
+      const output = versionChatMediaLocalUrlsInText(source);
+      const expected = new URL(versionedChatMediaLocalUrl(file));
+      if (query.includes('download')) { expected.searchParams.set('download', '1'); expected.hash = 'preview'; }
+      const destination = /\[Result\]\(([^)]+)\)/.exec(output)?.[1];
+      expect(destination).toBeDefined();
+      expect(path.normalize(chatMediaLocalPathFromUrl(destination!))).toBe(path.normalize(file));
+      expect(new URL(destination!).searchParams.get('v')).toBe(expected.searchParams.get('v'));
+      expect(new URL(destination!).searchParams.get('download')).toBe(expected.searchParams.get('download'));
+      expect(new URL(destination!).hash).toBe(expected.hash);
+      expect(output).toBe(`${emphasis}[Result](${destination})${emphasis}${prose}`);
+      const { renderMarkdown } = require('../../../src/renderer/modules/utils.js');
+      expect(renderMarkdown(output)).toContain(`<${tag}`);
+      expect(versionChatMediaLocalUrlsInText(output)).toBe(output);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves adjacent links, titles and literal query punctuation without consuming surrounding prose', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-media-boundaries-'));
+    const file = path.join(dir, 'video.mp4');
+    try {
+      fs.writeFileSync(file, 'media');
+      const base = chatMediaLocalUrl(file);
+      const current = versionedChatMediaLocalUrl(file);
+      const source = `**[One](${base}?v=old "Preview")**后续[Two](${base}?v=old)_尾注_`;
+      expect(versionChatMediaLocalUrlsInText(source)).toBe(
+        `**[One](${current} "Preview")**后续[Two](${current})_尾注_`,
+      );
+      const bare = versionChatMediaLocalUrlsInText(`${base}?note=literal*`);
+      expect(new URL(bare).searchParams.get('note')).toBe('literal*');
+      const missing = `**[Missing](${chatMediaLocalUrl(path.join(dir, 'missing.mp4'))}?v=old)**`;
+      expect(versionChatMediaLocalUrlsInText(missing)).toBe(missing);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('encodes every filename segment without encoding path separators', () => {
     expect(chatMediaLocalUrl('/Users/user/frames/hero #1?.png')).toBe(
       'chat-media://local/Users/user/frames/hero%20%231%3F.png',
