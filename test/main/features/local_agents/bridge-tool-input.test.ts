@@ -5,10 +5,25 @@ const { bridgeToolInput } = require('../../../../bin/bridge-tool-input.cjs');
 
 function register(shape: z.ZodRawShape, handler: (...args: any[]) => any) {
   const [config, execute] = bridgeToolInput(z, 'Read fixture', shape, handler);
-  return (input: unknown) => execute(config.inputSchema.parse(input), {});
+  return async (input: unknown) => {
+    // Use the same Standard Schema path as the installed MCP SDK.
+    const parsed = await config.inputSchema['~standard'].validate(input);
+    if (parsed.issues) throw new Error('SDK rejected before the owned formatter');
+    return execute(parsed.value, {});
+  };
 }
 
 describe('tolerant MCP argument receipts', () => {
+  it('preserves owning custom numeric and enum constraint messages', async () => {
+    const handler = vi.fn();
+    const reply = await register({ limit: z.number().min(1, 'Choose at least one result.'),
+      scope: z.enum(['local', 'cloud'], { error: 'Choose local or cloud.' }) }, handler)({ limit: 0, scope: 'foreign' });
+    expect(JSON.parse(reply.content[0].text).issues).toEqual([
+      { field: 'limit', reason: 'too_small', expected: 'Choose at least one result.' },
+      { field: 'scope', reason: 'invalid_value', expected: 'Choose local or cloud.' },
+    ]);
+    expect(handler).not.toHaveBeenCalled();
+  });
   it('advertises required fields, numeric bounds and nested maps without requiring defaulted inputs', () => {
     const [config] = bridgeToolInput(z, 'Read fixture', {
       id: z.string().min(1),
@@ -97,10 +112,43 @@ describe('tolerant MCP argument receipts', () => {
     const call = register({ id: z.string(), page: z.object({ count: z.number().int().min(1) }).strict() }, handler);
     for (const args of [{ id: 4, page: { count: 1 } }, { id: 'item', page: { count: 0 } },
       { id: 'item', page: { count: 1, alternate_scope: 'foreign' } }]) {
-      expect(() => call({ ...args, extra_note: 'irrelevant' })).toThrow();
+      const reply = await call({ ...args, extra_note: 'irrelevant' });
+      expect(reply.isError).toBe(true);
+      expect(JSON.parse(reply.content[0].text)).toMatchObject({ code: 'E_BAD_INPUT', issues: [expect.objectContaining({ field: expect.any(String), reason: expect.any(String), expected: expect.any(String) })] });
     }
     expect(handler).not.toHaveBeenCalled();
     expect((await call({ id: 'item', page: { count: 1 } })).content[0].text).toBe('read');
     expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it('reports multiple actual fields, preserves compatibility transforms once and never dispatches invalid input', async () => {
+    const normalize = vi.fn((value: unknown) => value === 0 ? 10 : value);
+    const handler = vi.fn(async (input) => ({ content: [{ type: 'text', text: JSON.stringify(input) }] }));
+    const call = register({ id: z.string(), limit: z.preprocess(normalize, z.number().default(10)),
+      unused: z.string().optional().catch(ctx => ctx.input) }, handler);
+    const bad = await call({ id: 4, limit: 'bad', extra: 'PRIVATE_VALUE' });
+    expect(JSON.parse(bad.content[0].text)).toMatchObject({ code: 'E_BAD_INPUT', issues: [
+      { field: 'id', reason: 'invalid_type', expected: expect.any(String) },
+      { field: 'limit', reason: 'invalid_type', expected: expect.any(String) },
+    ] });
+    expect(handler).not.toHaveBeenCalled();
+    expect(JSON.stringify(bad)).not.toContain('PRIVATE_VALUE');
+    normalize.mockClear();
+    await call({ id: 'ok', limit: 0, unused: 4 });
+    expect(normalize).toHaveBeenCalledOnce();
+    expect(handler).toHaveBeenCalledExactlyOnceWith({ id: 'ok', limit: 10, unused: 4 }, {});
+  });
+
+  it('formats an owning compatibility catch that rethrows Zod issues without calling the host', async () => {
+    const handler = vi.fn(async () => ({ content: [] }));
+    const shape = require('../../../../bin/connector-discovery-contract.cjs').shape(z);
+    const call = register(shape, handler);
+    const reply = await call({ limit: 1.5 });
+    expect(JSON.parse(reply.content[0].text)).toMatchObject({ code: 'E_BAD_INPUT', issues: [
+      { field: 'limit', reason: 'invalid_type', expected: 'Expected integer, received float' },
+    ] });
+    expect(handler).not.toHaveBeenCalled();
+    await call({ limit: 51 }); // Existing numeric compatibility remains host-owned.
+    expect(handler).toHaveBeenCalledExactlyOnceWith({ limit: 51 }, {});
   });
 });

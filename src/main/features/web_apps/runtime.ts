@@ -1,3 +1,4 @@
+import type { BuiltinAppName } from '../builtin_apps';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import { constants, lstatSync, unlinkSync, rmdirSync } from 'node:fs';
@@ -11,9 +12,10 @@ import { isPathAllowed } from '../../util/path-sandbox';
 import { MAX_TEXT_FILE_BYTES } from '../../util/file-size-limits';
 import { LocalAppData } from './data';
 import {createLogger} from '../../logger';
-import { logErrorSummary } from '../../util/log-redact';
 import { commonMethod, type AppType, type DataDefinition } from './data-contract';
 import { RequestHistory } from './request-history';
+import { logErrorSummary } from '../../util/log-redact';
+import { z } from 'zod';
 
 export class AppError extends Error {
   constructor(readonly code: string) { super(code); }
@@ -22,6 +24,8 @@ class SourceRevisionError extends AppError {
   constructor() { super('E_CLOSED'); }
 }
 export interface Bundle {
+  /** Trusted saved-app resolver only; never read from an app manifest. */
+  builtinApp?: BuiltinAppName;
   browserOnly?: boolean;
   kind?: 'saved' | 'artifact';
   /** Unresolved is runtime-only; it allows rendering/common data, never host authority. */
@@ -55,10 +59,16 @@ export interface HostAdapters {
   language(): string;
   modelAvailable(): boolean;
   closed?(uid: string, usage: AppUsageScope): void;
+  openFile?(file: string, reveal: boolean): Promise<void>;
   pick(): Promise<string | null>;
   save(name: string): Promise<string | null>;
   generate(uid: string, args: { prompt: string; maxTokens?: number }, signal: AbortSignal, progress: (event: unknown) => void): Promise<unknown>;
   tools(uid: string, usage: AppUsageScope): Promise<AppTool[]>;
+  tasks?(uid:string,key:string,method:string,args:unknown,signal:AbortSignal):Promise<unknown>;
+  connectors?(uid:string,args:{offset:number;limit:number}):Promise<unknown>;
+  openConnectors?(uid: string): Promise<{ opened: true }>;
+  configureModels?(uid: string, kind: 'image' | 'video' | 'audio'): Promise<{ opened: true }>;
+  uploadAsset?(uid:string,key:string,args:{connectorId:string;path:string},usage:AppUsageScope,signal:AbortSignal):Promise<unknown>;
 }
 interface Instance {
   token: string;
@@ -227,6 +237,7 @@ export class WebAppRuntime {
   private parsedBytes = 0;
   constructor(private host: HostAdapters, private preview?: { storageRoot: string }) {liveRuntimes.add(new WeakRef(this));}
   closeSource(uid:string,key:string){for(const s of [...this.instances.values()])if(s.uid===uid&&s.bundle.key===key)this.close(uid,s.owner,s.token);}
+  hasSource(uid:string,key:string):boolean{return [...this.instances.values()].some(s=>s.uid===uid&&s.bundle.key===key);}
 
   private static storeOwner(s: Instance): string { return `${s.uid}\0${s.bundle.key}`; }
   private ownerOpen(owner: string): boolean {
@@ -252,6 +263,8 @@ export class WebAppRuntime {
 
   private available(capability: string | null | undefined): boolean {
     if (this.preview && capability && capability !== 'storage' && capability !== 'appFiles' && capability !== 'data') return false;
+    if(capability==='tasks')return !!this.host.tasks;
+    if(capability==='connectors')return true;
     return capability !== 'ai' || this.host.modelAvailable();
   }
 
@@ -378,10 +391,12 @@ export class WebAppRuntime {
     if (s.bundle.browserOnly) return error('E_UNAVAILABLE');
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(requestId)) return error('E_INPUT');
     if (s.seen.has(requestId)) return error('E_DUPLICATE');
-    if (!Object.hasOwn(METHODS, method)) return error('E_METHOD');
+    const openConnectors = method === '__builtin.openConnectors' && !this.preview && s.bundle.builtinApp === 'product_listing';
+    const configureModels = method === '__builtin.configureModels' && !this.preview && ['content_workbench','product_listing'].includes(s.bundle.builtinApp || '');
+    if (!openConnectors && !configureModels && !Object.hasOwn(METHODS, method)) return error('E_METHOD');
     if(s.bundle.appType!=='local'&&!commonMethod(method))return error('E_UNAVAILABLE');
     boundedJson(raw,method.startsWith('data.')?1024*1024:MAX_PAYLOAD_BYTES);
-    const def = METHODS[method as Method];
+    const def = openConnectors ? { capability: 'connectors', input: z.object({}).strict() } : configureModels ? {capability:'tasks',input:z.object({kind:z.enum(['image','video','audio'])}).strict()} : METHODS[method as Method];
     const parsed = def.input.safeParse(raw);
     if (!parsed.success) return error('E_INPUT');
     if (!this.available(def.capability) || (this.preview && method === 'tools.call')) return error('E_UNAVAILABLE');
@@ -392,7 +407,9 @@ export class WebAppRuntime {
     try {
       if (def.capability) this.requireCapability(s, def.capability);
       await this.check(s, signal);
-      const value = await this.execute(s, method as Method, parsed.data, signal, event => {
+      const value = openConnectors
+        ? await (this.host.openConnectors?.(s.uid) ?? error('E_UNAVAILABLE')) : configureModels
+        ? await (this.host.configureModels?.(s.uid,(parsed.data as {kind:'image'|'video'|'audio'}).kind) ?? error('E_UNAVAILABLE')) : await this.execute(s, method as Method, parsed.data, signal, event => {
         this.checkCurrent(s, signal); boundedJson(event, 64 * 1024); progress(event);
       });
       if (method !== 'permissions.revoke') await this.check(s, signal);
@@ -514,6 +531,19 @@ export class WebAppRuntime {
           try { return { text: new TextDecoder('utf-8', { fatal: true }).decode(data) }; } catch { return error('E_ENCODING'); }
         } finally { await handle.close(); }
       }
+      if (action === 'appFiles.open' || action === 'appFiles.reveal') {
+        if (this.preview || !this.host.openFile) return error('E_UNAVAILABLE');
+        guard(file);
+        let st; try { st = await fs.lstat(file); } catch { return error('E_FILE'); }
+        if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1) return error('E_FILE');
+        // System opening is limited to inert documents and media, never code.
+        const readable = new Set(['png','jpg','jpeg','webp','gif','avif','mp4','webm','mov','mp3','wav','ogg','opus','m4a','flac','aac','txt','md','json','srt','vtt','pdf','psd','csv','docx','xlsx','pptx']);
+        if (action === 'appFiles.open' && !readable.has(path.extname(file).slice(1).toLowerCase())) return error('E_FILE');
+        this.checkCurrent(s, signal);guard(file);
+        await this.host.openFile(file, action === 'appFiles.reveal');
+        this.checkCurrent(s, signal);
+        return action === 'appFiles.open' ? { opened: true } : { revealed: true };
+      }
       if (action === 'appFiles.remove') {
         guard(file);
         try { if (!lstatSync(file).isFile()) return error('E_FILE'); unlinkSync(file); }
@@ -553,6 +583,12 @@ export class WebAppRuntime {
     }); } finally { if (--lock.users === 0) this.stores.delete(root); }
   }
   private async execute(s: Instance, method: Method, a: any, signal: AbortSignal, progress: (event: unknown) => void): Promise<any> {
+    if(method==='connectors.uploadAsset'){
+      this.requireCapability(s,'appFiles');
+      return this.host.uploadAsset?.(s.uid,s.bundle.key,a,{id:s.token,owner:s.owner},signal)??error('E_UNAVAILABLE');
+    }
+    if(method.startsWith('tasks.'))return this.host.tasks?.(s.uid,s.bundle.key,method,a,signal)??error('E_UNAVAILABLE');
+    if(method==='connectors.list')return this.host.connectors?.(s.uid,a)??error('E_UNAVAILABLE');
     if (method.startsWith('data.')) return this.dataCall(s,method,a,signal);
     if (method.startsWith('appFiles.')) return this.appFiles(s, method, a, signal);
     if (method.startsWith('storage.')) return this.store(s, method, a, signal);
@@ -561,10 +597,12 @@ export class WebAppRuntime {
       case 'capabilities.describe': return (s.bundle.appType==='local'||commonMethod(a.method)) && describeMethod(a.method) || error('E_METHOD');
       case 'capabilities.list': return { sdkVersion: SDK_VERSION, methods: Object.keys(METHODS).filter(name=>s.bundle.appType==='local'||commonMethod(name)).map(name => {
         const def = METHODS[name as Method];
+        const available = name !== 'tasks.open' && this.available(def.capability) && !(this.preview && name === 'tools.call')
+          && (!['appFiles.open','appFiles.reveal'].includes(name) || !this.preview && !!this.host.openFile);
         return { name, capability: def.capability, supported: true,
-          available: this.available(def.capability) && !(this.preview && name === 'tools.call'),
+          available,
           declared: !def.capability || s.manifest.capabilities.includes(def.capability as any),
-          authorized: this.available(def.capability) && name !== 'tools.call' && def.capability !== 'files' && (!def.capability || s.manifest.capabilities.includes(def.capability as any)),
+          authorized: available && name !== 'tools.call' && def.capability !== 'files' && (!def.capability || s.manifest.capabilities.includes(def.capability as any)),
           authorization: name === 'tools.call' ? 'per_tool' : def.capability === 'files' ? 'picker' : 'none' };
       }), unsupported: UNSUPPORTED };
       case 'permissions.revoke': this.close(s.uid, s.owner, s.token); return { revoked: true };

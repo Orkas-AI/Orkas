@@ -25,6 +25,12 @@ it('discovers a full Shopify input, reads variants, writes a reviewed product an
       if(url!=='https://merchant.myshopify.com/admin/api/2026-07/graphql.json'||init.headers['x-shopify-access-token']!=='fixture-token')throw new Error('Unexpected authority');
       const body=JSON.parse(init.body);
       if(body.query.includes('shop{')){fs.appendFileSync(process.env.FIXTURE_JOURNAL,'identity\\n');return new Response(JSON.stringify({data:{shop:{id:'gid://shopify/Shop/1',name:'Merchant'}}}));}
+      if(body.query.includes('stagedUploadsCreate(')){
+        fs.appendFileSync(process.env.FIXTURE_JOURNAL,'stage\\n');
+        const expected={filename:'cup.png',mimeType:'image/png',resource:'PRODUCT_IMAGE',httpMethod:'POST',fileSize:'128'};
+        require('node:assert/strict').deepEqual(body.variables.input,[expected]);
+        return new Response(JSON.stringify({data:{stagedUploadsCreate:{stagedTargets:[{url:'https://shopify-staged-uploads.storage.googleapis.com/',resourceUrl:'https://shopify-staged-uploads.storage.googleapis.com/cup.png',parameters:[{name:'key',value:'product-cup'}]}],userErrors:[]}}}));
+      }
       if(body.query.includes('productVariants(')){
         fs.appendFileSync(process.env.FIXTURE_JOURNAL,'variants\\n');
         return new Response(JSON.stringify({data:{productVariants:{nodes:[{id:'gid://shopify/ProductVariant/1',title:'Blue'}],pageInfo:{hasNextPage:true,endCursor:'next'}}}}));
@@ -53,13 +59,20 @@ it('discovers a full Shopify input, reads variants, writes a reviewed product an
     expect(type.isError).not.toBe(true); expect(content(type).fields.variants.arguments.properties).toHaveProperty('first');
     const read = await client.callTool({ name: 'execute_read', arguments: { action: 'productVariants', parameters: { arguments: { first: 5, query: 'sku:BLUE' } } } });
     expect(read.isError).not.toBe(true); expect(content(read).result.data.productVariants.pageInfo).toEqual({ hasNextPage: true, endCursor: 'next' });
+    const staged = await client.callTool({name:'execute_write',arguments:{action:'media.stage_product',parameters:{filename:'cup.png',mime_type:'image/png',resource:'PRODUCT_IMAGE',file_size:'128'}}});
+    expect(staged.isError).not.toBe(true);expect(content(staged).result.stagedTargets[0].resourceUrl).toBe('https://shopify-staged-uploads.storage.googleapis.com/cup.png');
+    const badStage=await client.callTool({name:'execute_write',arguments:{action:'media.stage_product',parameters:{filename:'cup.png',mime_type:'image/png',resource:'FILE',file_size:'128'}}});expect(badStage.isError).toBe(true);
+    for(const invalid of [{filename:'../cup.png'},{file_size:'0'},{file_size:'1e4'},{file_size:'1000000000'},{resource:'VIDEO'}]){
+      const result=await client.callTool({name:'execute_write',arguments:{action:'media.stage_product',parameters:{filename:'cup.png',mime_type:'image/png',resource:'PRODUCT_IMAGE',file_size:'128',...invalid}}});
+      expect(result.isError,JSON.stringify(invalid)).toBe(true);
+    }
     const parameters = { arguments: { input: { title: 'Blue', metafields: [{ namespace: 'custom', key: 'count', type: 'number_integer', value: '0' }] } } };
     const denied = await client.callTool({ name: 'execute_read', arguments: { action: 'productSet', parameters } }); expect(denied.isError).toBe(true);
     const write = await client.callTool({ name: 'execute_destructive', arguments: { action: 'productSet', parameters } }); expect(write.isError).not.toBe(true); expect(content(write).result.status).toBe('acknowledged');
     await client.close(); const restarted = await connect(); parameters.arguments.input.title = 'partial';
     const partial = await restarted.callTool({ name: 'execute_destructive', arguments: { action: 'productSet', parameters } });
     expect(partial.isError).toBe(true); expect(content(partial).result).toMatchObject({ status: 'partial_or_failed', error_count: 1 });
-    expect(fs.readFileSync(journal, 'utf8').trim().split('\n')).toEqual(['token', 'identity', 'variants', 'write', 'token', 'write']); expect(stderr).toEqual([]);
+    expect(fs.readFileSync(journal, 'utf8').trim().split('\n')).toEqual(['token', 'identity', 'variants', 'stage', 'write', 'token', 'write']); expect(stderr).toEqual([]);
     expect(JSON.stringify([described, read, denied, write, partial])).not.toContain('fixture-token');
   } finally { await Promise.allSettled(clients.map(client => client.close())); fs.rmSync(directory, { recursive: true, force: true }); }
 }, 20000);

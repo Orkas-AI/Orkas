@@ -171,6 +171,29 @@ function sourceFiles(root: string): string[] {
 }
 
 describe('renderer i18n runtime', () => {
+  it('keeps composer guidance in one paragraph with parallel and sequential examples in every locale', () => {
+    for (const [lang, table] of Object.entries(localeTables('renderer'))) {
+      for (const key of ['chat.input_placeholder', 'project.chat.placeholder', 'auto.content_placeholder']) {
+        expect(table[key], `${lang}/${key}`).not.toMatch(/[\r\n]/);
+        expect(table[key], `${lang}/${key}`).toContain('@A @B ');
+        expect(table[key].match(/@A/g), `${lang}/${key}`).toHaveLength(2);
+        expect(table[key].match(/@B/g), `${lang}/${key}`).toHaveLength(2);
+      }
+    }
+  });
+  it('can repaint built-in catalog labels in every supported language without cached main-process copy', () => {
+    const builtinRoot = path.resolve(rendererRoot, '../../resources/builtin/apps');
+    const keys = fs.readdirSync(builtinRoot, { withFileTypes: true }).filter(entry => entry.isDirectory()).flatMap(entry => {
+      const meta = JSON.parse(fs.readFileSync(path.join(builtinRoot, entry.name, '__orkas-meta.json'), 'utf8'));
+      return [meta.titleKey, meta.descriptionKey].filter((key): key is string => typeof key === 'string');
+    });
+    const main = localeTables('main'), renderer = localeTables('renderer');
+    expect(keys.length).toBeGreaterThan(0);
+    for (const lang of LANGS) for (const key of keys) {
+      expect(renderer[lang][key], `${lang}: ${key}`).toBeTruthy();
+      expect(renderer[lang][key], `${lang}: ${key}`).toBe(main[lang][key]);
+    }
+  });
   it('collects translation keys used by fallback wrappers as well as ordinary lookups', () => {
     const keys = literalTranslationKeys(path.join(rendererRoot, 'modules', 'saved-apps.js'));
     expect(keys).toContain('apps.publish_action');

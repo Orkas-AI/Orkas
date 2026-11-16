@@ -307,3 +307,28 @@ describe('selection toolbar actual controls', () => {
     expect(context.apiFetch).toHaveBeenCalledTimes(2);
   });
 });
+
+
+it.each([false, true])('coalesces task navigation refreshes and rejects a previous local user timer (switch=%s)', async switched => {
+  vi.useFakeTimers();
+  try {
+    const load = vi.fn(async () => {});
+    const context = vm.createContext({ currentUserId: 'local-a', loadConversations: load, setTimeout, clearTimeout });
+    const start = conversationSource.indexOf('let _conversationTaskLinksRefreshTimer =');
+    const end = conversationSource.indexOf('let _conversationRemovalRevision', start);
+    expect(start).toBeGreaterThan(0);
+    vm.runInContext(conversationSource.slice(start, end), context);
+    for (let i = 0; i < 50; i++) context._scheduleConversationTaskLinksRefresh();
+    await vi.advanceTimersByTimeAsync(149);
+    expect(load).not.toHaveBeenCalled();
+    if (switched) context.currentUserId = 'local-b';
+    await vi.advanceTimersByTimeAsync(1);
+    expect(load).toHaveBeenCalledTimes(switched ? 0 : 1);
+    if (!switched) expect(load).toHaveBeenCalledWith({ fresh: true });
+    load.mockClear();
+    context._scheduleConversationTaskLinksRefresh();
+    await vi.advanceTimersByTimeAsync(150);
+    expect(load).toHaveBeenCalledExactlyOnceWith({ fresh: true });
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
+});

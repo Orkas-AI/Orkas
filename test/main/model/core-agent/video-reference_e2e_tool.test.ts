@@ -2,8 +2,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import sharp from 'sharp';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Preparation checks browser availability but never opens a render window.
 vi.mock('electron', () => ({ BrowserWindow: function BrowserWindow() {} }));
@@ -50,6 +50,9 @@ async function tool(extra: Record<string, unknown> = {}) {
 const ctx = () => ({ workingDir: workspace, state: {} } as any);
 function body(result: any) { return JSON.parse(result.content); }
 
+const NOTES = 'These frames stay in your context until this turn ends or six newer images arrive. '
+  + 'If this video is the reference, before writing the video list in reference-notes.md what a viewer would name as its look and whether you reuse, recreate or drop each, then build the video from that list.';
+
 describe('reference video ingestion through the real tool', () => {
   it('keeps inspected source pixels visible while planning after intervening tool reads, then releases them', async () => {
     const { Session } = await import('../../../../src/core-agent/src/agent/session');
@@ -74,7 +77,29 @@ describe('reference video ingestion through the real tool', () => {
     expect(modelImages()).toEqual([]);
   });
 
-  it('freezes a cross-chat source, delivers colored frames, and feeds later paired review without a plan', async () => {
+  it('asks for written notes, and keeps the frames beside later images until six newer ones arrive', async () => {
+    const { Session } = await import('../../../../src/core-agent/src/agent/session');
+    const session = new Session();
+    session.beginUserTurn([{ type: 'text', text: 'Remake this reference for my product.' }]);
+    const input = { op: 'reference.inspect', input_path: source, sample_times: [0.25, 1.25] };
+    session.addAssistantMessage([{ type: 'tool_use', id: 'inspect', name: 'video_studio', input }]);
+    const inspected = await (await tool()).execute(input, ctx());
+    expect(inspected.isError, inspected.content).toBeFalsy();
+    expect(body(inspected)).toMatchObject({ ok: true, message: NOTES });
+    session.addToolResult('inspect', inspected.content, inspected.images, inspected.isError, undefined, inspected.imageRetention);
+    const capture = (id: string) => {
+      session.addAssistantMessage([{ type: 'tool_use', id, name: 'video_studio', input: { op: 'video.sheet' } }]);
+      session.addToolResult(id, '{"ok":true}', [{ type: 'image' as const, data: id, mediaType: 'image/png' }], false, undefined, 'active_turn');
+    };
+    const modelImages = () => session.getMessagesForModel().flatMap(m => m.content).flatMap(c => c.type === 'tool_result' ? c.images ?? [] : []);
+    const sheet = inspected.images![0].data;
+    for (const id of ['sheet-1', 'sheet-2', 'sheet-3', 'sheet-4', 'sheet-5']) capture(id);
+    expect(modelImages().map(image => image.data)).toEqual([sheet, 'sheet-1', 'sheet-2', 'sheet-3', 'sheet-4', 'sheet-5']);
+    capture('sheet-6');
+    expect(modelImages().map(image => image.data)).not.toContain(sheet);
+  });
+
+  it('freezes a cross-chat source and returns its colored frames without a plan', async () => {
     const bytes = fs.readFileSync(source);
     const t = await tool();
     const result = await t.execute({ op: 'reference.inspect', input_path: source, sample_times: [0.25, 1.25] }, ctx());
@@ -85,7 +110,7 @@ describe('reference video ingestion through the real tool', () => {
     expect(result.images).toHaveLength(1);
     expect(fs.readFileSync(source)).toEqual(bytes);
     expect(fs.readFileSync(report.source_path)).toEqual(bytes);
-    expect(report.source_path.startsWith(path.join(workspace, 'project/composition/assets/references'))).toBe(true);
+    expect(report.source_path.startsWith(path.join(workspace, 'references/assets/references'))).toBe(true);
     expect(report.samples.map((s: any) => s.time_seconds)).toEqual([0.25, 1.25]);
     const pixels = await sharp(Buffer.from(result.images![0].data, 'base64')).raw().toBuffer({ resolveWithObject: true });
     for (const channel of [0, 2]) {
@@ -95,57 +120,6 @@ describe('reference video ingestion through the real tool', () => {
       }
       expect(count).toBeGreaterThan(1000);
     }
-    const { writeReferenceComparison } = await import('../../../../src/main/features/video_studio');
-    const comparison = await writeReferenceComparison({ compositionDirAbs: report.composition_dir,
-      reviewInputs: { references: [{ id: 'source', path: report.reference_path, media_type: 'video',
-        temporal_anchors: [{ source_start_sec: 1, source_end_sec: 1.5, target_scene_id: 'hero' }] }] },
-      frameEvidence: { samples: [{ label: 'hero-mid', expected_scene_id: 'hero', path: report.samples[0].path, time_seconds: 0.5 }] },
-    });
-    expect(comparison).toMatchObject({ status: 'available', pairs: [{ source_time_sec: 1.25, target_scene_id: 'hero' }] });
-    const red = await sharp((comparison!.pairs as any[])[0].source_frame).stats();
-    expect(red.channels[0].mean - red.channels[2].mean).toBeGreaterThan(180);
-    expect(fs.existsSync(path.join(report.composition_dir, 'composition-manifest.json'))).toBe(false);
-  });
-
-  it('delivers mapped source pixels at preparation without requiring a target render or another image read', async () => {
-    const t = await tool({ turnId: 'prepare-turn', userMessage: '确认' });
-    const inspected = body(await t.execute({ op: 'reference.inspect', input_path: source, sample_times: [0.25, 1.25] }, ctx()));
-    const composition = inspected.composition_dir;
-    const manifest = {
-      schema_version: 1,
-      composition: { id: 'main', width: 1920, height: 1080, duration: 10, fps: 30, language: 'en' },
-      scenes: [{ id: 'hero', start: 0, duration: 10, approved_copy: ['Launch'], narration_refs: [], source_shots: [], roles: ['title', 'visual'] }],
-      audio: { owner: 'none', tracks: [] },
-      art_direction: { references: [{ id: 'source', path: inspected.reference_path, media_type: 'video',
-        temporal_anchors: [{ source_start_sec: 1, source_end_sec: 1.5, target_scene_id: 'hero' }] }] },
-    };
-    fs.writeFileSync(path.join(composition, 'composition-manifest.json'), JSON.stringify(manifest));
-    const approved = await t.execute({ op: 'composition.approve_plan', composition_dir: composition,
-      decision_evidence: { source: 'user_message', gate: 'plan', decision: 'approve', quote: '确认' } }, ctx());
-    expect(approved.isError, approved.content).toBeFalsy();
-    const prepared = await t.execute({ op: 'composition.prepare', composition_dir: composition }, ctx());
-    expect(prepared.isError, prepared.content).toBeFalsy();
-    expect(prepared.images).toHaveLength(1);
-    expect(prepared).toMatchObject({ imageRetention: 'active_turn' });
-    expect(body(prepared).reference_authoring).toMatchObject({ status: 'available', attached: true,
-      pairs: [{ source_time_sec: 1.25, target_scene_id: 'hero' }] });
-    const stats = await sharp(Buffer.from(prepared.images![0].data, 'base64')).stats();
-    expect(stats.channels[0].mean - stats.channels[2].mean).toBeGreaterThan(100);
-    expect(fs.existsSync(path.join(composition, 'preview', 'first-frame.png'))).toBe(false);
-    const manifestPath = path.join(composition, 'composition-manifest.json');
-    const saved = fs.readFileSync(manifestPath);
-    const { prepareComposition } = await import('../../../../src/main/features/video_studio');
-    const cancelled = new AbortController(); cancelled.abort();
-    const interrupted = await prepareComposition({ compositionDirAbs: composition, signal: cancelled.signal });
-    expect(interrupted).toMatchObject({ ok: true, reference_authoring: { status: 'unavailable', pairs: [], contact_sheet: '' } });
-    expect(fs.readFileSync(manifestPath)).toEqual(saved);
-    fs.unlinkSync(inspected.source_path);
-    fs.symlinkSync(source, inspected.source_path);
-    const denied = await prepareComposition({ compositionDirAbs: composition });
-    expect(denied).toMatchObject({ ok: true, reference_authoring: { status: 'unavailable',
-      pairs: [], contact_sheet: '', issues: [{ reason: 'source_out_of_scope' }] } });
-    expect(fs.readFileSync(manifestPath)).toEqual(saved);
-
   });
 
   it('accepts a read root appended after tool construction without granting output writes there', async () => {
@@ -223,6 +197,22 @@ describe('reference video ingestion through the real tool', () => {
     if (sample_times.length === 1 && sample_times[0] === 2) expect(body(result).duration_sec).toBe(2);
   });
 
+  it.each([{ seconds: 2, silent: false }, { seconds: 3.9, silent: false }, { seconds: 4, silent: false }, { seconds: 2, silent: true }])(
+    'reports an audio track independently of tempo for $seconds seconds (silent=$silent)', async ({ seconds, silent }) => {
+      const { bundledFfmpegPaths } = await import('../../../../src/main/util/bundled-runtime');
+      const { runVideoProcessForTest } = await import('../../../../src/main/features/video_studio');
+      const file = path.join(sourceDir, 'with-audio.mp4');
+      const made = await runVideoProcessForTest(bundledFfmpegPaths().ffmpeg!, ['-v', 'error', '-f', 'lavfi', '-i', `color=s=32x32:d=${seconds}`,
+        '-f', 'lavfi', '-i', silent ? `anullsrc=r=11025:cl=mono:d=${seconds}` : `sine=frequency=440:sample_rate=11025:duration=${seconds}`,
+        '-c:v', 'mpeg4', '-c:a', 'aac', file], { timeoutMs: 10000 });
+      expect(made.code).toBe(0); expect(made.stderr).toBe('');
+      const bytes = fs.readFileSync(file);
+      const report = body(await (await tool()).execute({ op: 'reference.inspect', input_path: file }, ctx()));
+      expect(report.ok).toBe(true); expect(report.audio.present).toBe(true);
+      if (seconds < 4 || silent) expect(report.audio).toEqual({ present: true, bpm: null, beat: 'unclear' });
+      expect(fs.readFileSync(file)).toEqual(bytes);
+    });
+
   it('samples each detected shot and reports cut times and a silent soundtrack on the default pass', async () => {
     const report = body(await (await tool()).execute({ op: 'reference.inspect', input_path: source }, ctx()));
     expect(report.ok).toBe(true);
@@ -234,6 +224,31 @@ describe('reference video ingestion through the real tool', () => {
     expect(times[0]).toBe(0);
     // One still just after the cut, besides the evenly spread fallbacks.
     expect(times.some((t: number) => t > 1 && t <= 1.45)).toBe(true);
+  });
+
+  it.skipIf(process.platform === 'win32')('keeps audio presence when rhythm decoding fails and skips it for explicit stills', async () => {
+    const { bundledFfmpegPaths } = await import('../../../../src/main/util/bundled-runtime');
+    const { runVideoProcessForTest } = await import('../../../../src/main/features/video_studio');
+    const real = bundledFfmpegPaths().ffmpeg!;
+    const file = path.join(sourceDir, 'undecodable-audio.mp4');
+    const made = await runVideoProcessForTest(real, ['-v', 'error', '-i', source, '-f', 'lavfi', '-i', 'sine=duration=2', '-c:v', 'copy', '-c:a', 'aac', file], { timeoutMs: 10000 });
+    expect(made.code).toBe(0);
+    const wrapper = path.join(root, 'decode-wrapper'), calls = path.join(root, 'audio-calls');
+    fs.writeFileSync(wrapper, '#!/usr/bin/env node\nconst fs=require("node:fs"), cp=require("node:child_process"), a=process.argv.slice(2);\n'
+      + `if(a.includes('f32le')){fs.appendFileSync(${JSON.stringify(calls)},'1');process.exit(1);}\n`
+      + `const r=cp.spawnSync(${JSON.stringify(real)},a,{stdio:'inherit'});process.exit(r.status??1);\n`);
+    fs.chmodSync(wrapper, 0o755);
+    const previous = process.env.ORKAS_BUNDLED_FFMPEG; process.env.ORKAS_BUNDLED_FFMPEG = wrapper;
+    try {
+      const t = await tool();
+      const report = body(await t.execute({ op: 'reference.inspect', input_path: file }, ctx()));
+      expect(report.ok).toBe(true); expect(report.audio).toEqual({ present: true, bpm: null, beat: 'unclear' });
+      expect(fs.readFileSync(calls, 'utf8')).toBe('1');
+      const stills = body(await t.execute({ op: 'reference.inspect', input_path: file, sample_times: [0] }, ctx()));
+      expect(stills.ok).toBe(true); expect(fs.readFileSync(calls, 'utf8')).toBe('1');
+    } finally {
+      if (previous === undefined) delete process.env.ORKAS_BUNDLED_FFMPEG; else process.env.ORKAS_BUNDLED_FFMPEG = previous;
+    }
   });
 });
 
@@ -259,19 +274,30 @@ describe('reference rhythm helpers', () => {
     expect(referenceMovingShots(4, [3], scores)).toEqual([expect.objectContaining({ start_sec: 0, end_sec: 3 })]);
   });
 
-  it('measures a steady beat and withholds a tempo for noise', async () => {
-    const { estimateReferenceTempo } = await import('../../../../src/main/features/video_studio');
-    const rate = 11025;
-    const clicks = new Float32Array(rate * 20);
-    for (let beat = 0; beat < 40; beat += 1) {
-      const start = Math.round(beat * 0.5 * rate);
-      for (let i = 0; i < 400; i += 1) clicks[start + i] = Math.sin(i / 3) * Math.exp(-i / 80);
-    }
-    const steady = estimateReferenceTempo(clicks, rate);
-    expect(steady.bpm).not.toBeNull();
-    expect(Math.abs(steady.bpm! - 120)).toBeLessThan(1);
+  it('measures a steady beat, a slow one, and withholds a tempo for noise', async () => {
+    const { referenceTempo } = await import('../../../../src/main/features/video_studio');
+    const rate = 22050;
+    /** A kick on every beat. */
+    const kicks = (bpm: number, seconds: number) => {
+      const out = new Float32Array(rate * seconds);
+      for (let i = 0; i < out.length; i += 1) {
+        const inBeat = (i / rate) % (60 / bpm);
+        out[i] = 0.8 * Math.sin(2 * Math.PI * 60 * inBeat) * Math.exp(-inBeat * 18);
+      }
+      return out;
+    };
+    const steady = await referenceTempo(kicks(120, 20), rate);
+    expect(steady?.beat).toBe('clear');
+    expect(Math.abs(steady!.bpm! - 120)).toBeLessThan(1);
+    // The estimator this replaced found no tempo at 64 BPM.
+    expect((await referenceTempo(kicks(64, 24), rate))?.bpm).toBeCloseTo(64, 0);
+    // 32-bit arithmetic: the float version of this generator loops every 0.47 s,
+    // which is a beat.
     let seed = 7;
-    const noise = new Float32Array(rate * 20).map(() => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 1073741824 - 1; });
-    expect(estimateReferenceTempo(noise, rate).bpm).toBeNull();
+    const noise = new Float32Array(rate * 20).map(() => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2147483648 - 1; });
+    expect(await referenceTempo(noise, rate)).toEqual({ bpm: null, beat: 'unclear' });
+    const cancelled = new AbortController();
+    cancelled.abort();
+    expect(await referenceTempo(kicks(120, 120), rate, cancelled.signal)).toBeNull();
   });
 });

@@ -2,6 +2,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
+import { fileSystemForPath } from './user-file-fs';
 
 export interface LocalImportSource {
   absPath: string;
@@ -229,6 +230,7 @@ export function localEntryRevisionMatches(
 }
 
 export async function isUtf8File(absPath: string): Promise<boolean> {
+  const fs = fileSystemForPath(absPath);
   const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
   const stream = fs.createReadStream(absPath);
   try {

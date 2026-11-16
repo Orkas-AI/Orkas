@@ -1,3 +1,4 @@
+import { appConversationRoot } from '../../paths';
 /**
  * Group-chat state — members.json + state.json IO + session id builders.
  *
@@ -165,16 +166,7 @@ export interface StateFile {
    *  the next no-@ user message"; this answers "what commander task should be
    *  resumed when that interaction completes." */
   orchestration_ledger?: OrchestrationLedger;
-  /** System-created sync-conflict resolution metadata. A commander turn may
-   *  close only these records, and only by emitting a matching XML result. */
-  sync_conflict_resolution?: {
-    version: 1;
-    conflicts: {
-      id: string;
-      rel_path: string;
-      current_path: string;
-    }[];
-  };
+
 }
 
 export const COMMANDER_ID = 'commander';
@@ -186,6 +178,11 @@ function _cleanLedgerText(v: unknown, max = 4000): string {
     .replace(/\0/g, '')
     .trim()
     .slice(0, max);
+}
+
+/** The existing ledger goal bound also applies to its host-owned source copy. */
+export function boundOrchestrationGoal(value: unknown): string {
+  return _cleanLedgerText(value);
 }
 
 function _sanitizeOrchestrationLedger(v: unknown): OrchestrationLedger | undefined {
@@ -519,27 +516,6 @@ async function readCloudState(
             }
           : {}),
         ...(orchestrationLedger ? { orchestration_ledger: orchestrationLedger } : {}),
-        ...(Array.isArray(data.sync_conflict_resolution?.conflicts)
-          ? {
-              sync_conflict_resolution: {
-                version: 1,
-                conflicts: data.sync_conflict_resolution.conflicts
-                  .map((item: unknown) => {
-                    const row = item as Record<string, unknown>;
-                    return {
-                      id: typeof row?.id === 'string' ? row.id : '',
-                      rel_path: typeof row?.rel_path === 'string' ? row.rel_path : '',
-                      current_path: typeof row?.current_path === 'string' ? row.current_path : '',
-                    };
-                  })
-                  .filter((item: { id: string; rel_path: string; current_path: string }) => (
-                    /^[A-Za-z0-9_.-]+$/.test(item.id)
-                    && item.rel_path.startsWith('cloud/')
-                    && path.isAbsolute(item.current_path)
-                  )),
-              },
-            }
-          : {}),
       };
     }
   } catch (err) {
@@ -618,6 +594,7 @@ export async function ensureRunningConversationRegistry(uid: string): Promise<vo
 }
 
 async function _trackRunningConversation(uid: string, cid: string): Promise<void> {
+  if (appConversationRoot(uid, cid)) return;
   await _runningRegistryLock(uid).runExclusive(async () => {
     const registry = await _readRunningRegistry(uid) || { version: 1 as const, items: [] };
     const layout = conversationLayout(uid, cid);
@@ -635,6 +612,7 @@ async function _trackRunningConversation(uid: string, cid: string): Promise<void
 }
 
 export async function untrackRunningConversation(uid: string, cid: string): Promise<void> {
+  if (appConversationRoot(uid, cid)) return;
   await _runningRegistryLock(uid).runExclusive(async () => {
     const registry = await _readRunningRegistry(uid);
     if (!registry) return;
@@ -1284,29 +1262,15 @@ export async function setToolExtraRoots(uid: string, cid: string, roots: readonl
   });
 }
 
-export async function setSyncConflictResolution(
-  uid: string,
-  cid: string,
-  conflicts: readonly { id: string; rel_path: string; current_path: string }[],
-): Promise<StateFile> {
+/** Add roots to those the conversation's tools may already write, keeping
+ *  the existing ones in their order. */
+export async function addToolExtraRoots(uid: string, cid: string, roots: readonly string[]): Promise<StateFile> {
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
-    const clean = conflicts
-      .map((item) => ({
-        id: String(item.id || '').trim(),
-        rel_path: String(item.rel_path || '').replace(/\\/g, '/'),
-        current_path: String(item.current_path || '').trim(),
-      }))
-      .filter((item) => (
-        /^[A-Za-z0-9_.-]+$/.test(item.id)
-        && item.rel_path.startsWith('cloud/')
-        && path.isAbsolute(item.current_path)
-      ));
-    if (clean.length) {
-      s.sync_conflict_resolution = { version: 1, conflicts: clean };
-    } else {
-      delete s.sync_conflict_resolution;
-    }
+    const added = roots.map((r) => String(r || '').trim()).filter((r) => r && path.isAbsolute(r));
+    const merged = Array.from(new Set([...(s.tool_extra_roots || []), ...added]));
+    if (merged.length === (s.tool_extra_roots || []).length) return s;
+    s.tool_extra_roots = merged;
     s.last_active_at = nowIso();
     await writeStateRaw(uid, cid, s);
     return s;

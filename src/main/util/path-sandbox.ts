@@ -19,9 +19,10 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileSystemForPath } from './user-file-fs';
 
 function realOrResolve(p: string, identityOnly = false, seenLinks?: Set<string>): string | null {
-  try { return fs.realpathSync(p); }
+  try { return fileSystemForPath(p).realpathSync(p); }
   catch {
     // Missing descendants inherit the real existing ancestor. Existing links
     // retain their actual target even when that target has not been created.
@@ -29,11 +30,11 @@ function realOrResolve(p: string, identityOnly = false, seenLinks?: Set<string>)
     let existing = resolved;
     const missing: string[] = [];
     while (existing && existing !== path.dirname(existing)) {
-      try { existing = fs.realpathSync(existing); break; }
+      try { existing = fileSystemForPath(existing).realpathSync(existing); break; }
       catch {
         if (!identityOnly) {
           let entry: fs.Stats | undefined;
-          try { entry = fs.lstatSync(existing); }
+          try { entry = fileSystemForPath(existing).lstatSync(existing); }
           catch (error) {
             const code = (error as NodeJS.ErrnoException).code;
             if (code !== 'ENOENT' && code !== 'ENOTDIR') return null;
@@ -45,7 +46,7 @@ function realOrResolve(p: string, identityOnly = false, seenLinks?: Set<string>)
             if (!entry.isSymbolicLink() || links.has(existing) || links.size >= 40) return null;
             links.add(existing);
             try {
-              const target = path.resolve(path.dirname(existing), fs.readlinkSync(existing), ...missing);
+              const target = path.resolve(path.dirname(existing), fileSystemForPath(existing).readlinkSync(existing), ...missing);
               return realOrResolve(target, false, links);
             } catch { return null; }
           }

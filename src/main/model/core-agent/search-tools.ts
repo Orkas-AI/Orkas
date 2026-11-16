@@ -1,3 +1,4 @@
+import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
 /**
  * `web_search` override — last-write-wins replacement for core-agent's
  * built-in keyless web_search.
@@ -31,6 +32,8 @@ import { runSearchAdapter, SEARCH_PROVIDER_LABEL, SearchAccountError } from './s
 import { createLogger } from '../../logger';
 import { logErrorSummary } from '../../util/log-redact';
 import { getSearchQueryMaxChars, validateSearchQuery } from '../../util/search-contract';
+import { createTavilySearchTurn, currentTavilySearchTurn, recordTavilySearchRequest,
+  type TavilySearchTurn } from '../../util/tavily-search-turn';
 
 // core-agent is ESM; main is CJS. Static import would yank pi-ai into the
 // CJS load graph and crash with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Same
@@ -97,7 +100,10 @@ function formatPaidResults(query: string, providerLabel: string, results: { titl
 }
 
 export async function createWebSearchOverrideTool(context?: SearchExecutionContext): Promise<AgentTool> {
+  const cid = context?.conversationId || '';
+  const owningTurn = currentTavilySearchTurn(getActiveUserId(), cid);
   const mod = await ca();
+  let fallbackTurn: TavilySearchTurn | undefined;
   const firstProfile = listSearchProfiles()[0];
   // Keyless search retains its existing unrestricted query contract.
   const maxQueryChars = firstProfile ? getSearchQueryMaxChars(firstProfile.provider) : undefined;
@@ -153,7 +159,7 @@ export async function createWebSearchOverrideTool(context?: SearchExecutionConte
       const query = String((input as any)?.query || '').trim();
       const requested = Number((input as any)?.count) || DEFAULT_COUNT;
       const count = Math.min(Math.max(1, requested), MAX_COUNT);
-      if (!query) return { content: 'Error: query is required', isError: true };
+      if (!query) return parameterError('Error: query is required', ['query'], 'required');
 
       const profiles = listSearchProfiles();
       // A changed setting can tighten this run's advertised bound. A wider
@@ -161,10 +167,26 @@ export async function createWebSearchOverrideTool(context?: SearchExecutionConte
       const currentMax = profiles[0] ? getSearchQueryMaxChars(profiles[0].provider) : undefined;
       const applicableMax = Math.min(maxQueryChars ?? Infinity, currentMax ?? Infinity);
       try { if (Number.isFinite(applicableMax)) validateSearchQuery(query, applicableMax); } catch (error) {
-        return { content: (error as Error).message, isError: true };
+        return parameterError((error as Error).message, ['query'], 'invalid_value');
       }
+      const userId = getActiveUserId();
+      let searchTurn = owningTurn?.userId === userId ? owningTurn : currentTavilySearchTurn(userId, cid);
+      if (!searchTurn) {
+        if (!fallbackTurn || fallbackTurn.userId !== userId || fallbackTurn.cid !== cid) {
+          fallbackTurn = createTavilySearchTurn(userId, cid);
+        }
+        searchTurn = fallbackTurn;
+      }
+      // Count one admitted tool invocation, independently of provider fallback
+      // or retry attempts. Reserve synchronously so parallel results retain
+      // their own threshold even when responses finish out of order.
+      const reminderCount = recordTavilySearchRequest(searchTurn);
+      const finish = (result: ToolResult): ToolResult => reminderCount === undefined ? result : {
+        ...result,
+        content: `${result.content}\n\nThis turn: ${reminderCount} web searches. Prioritize completing the task with existing evidence; search further if necessary.`,
+      };
+
       if (profiles.length) {
-        const userId = getActiveUserId();
         const candidates = profiles.map(profile => ({ profile, key: searchCooldownKey(userId, profile) }));
         const errors: string[] = [];
         let accountErr: string | null = null;
@@ -178,16 +200,16 @@ export async function createWebSearchOverrideTool(context?: SearchExecutionConte
           paidSearchCooldowns.delete(key);
           // Input incompatibility must not advance the fallback chain or dispatch a request.
           try { validateSearchQuery(query, getSearchQueryMaxChars(profile.provider)); } catch (error) {
-            return { content: (error as Error).message, isError: true };
+            return finish({ content: (error as Error).message, isError: true });
           }
           log.info('web_search via paid API', { provider: profile.provider, query_len: query.length, count });
           try {
             const res = await runSearchAdapter(profile, query, count, context);
             log.info('web_search paid API ok', { provider: profile.provider, results: res.results.length });
             const text = formatPaidResults(query, label, res.results);
-            return res.results.length
+            return finish(res.results.length
               ? { content: text, displayName: label }
-              : { content: text, displayName: label, isError: true };
+              : { content: text, displayName: label, isError: true });
           } catch (err) {
             const msg = (err as Error).message || String(err);
             errors.push(`${label}: ${msg}`);
@@ -203,11 +225,11 @@ export async function createWebSearchOverrideTool(context?: SearchExecutionConte
             });
           }
         }
-        return runKeylessFallback(query, count, errors, accountErr);
+        return finish(await runKeylessFallback(query, count, errors, accountErr));
       }
 
       log.info('web_search via builtin keyless (no paid profile configured)', { query_len: query.length, count });
-      return mod.runBuiltinWebSearch(query, count);
+      return finish(await mod.runBuiltinWebSearch(query, count));
     },
   });
 }

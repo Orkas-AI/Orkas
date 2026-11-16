@@ -185,6 +185,35 @@ export async function main(): Promise<number> {
     }
   };
   try {
+    await check('local HTML loads relative CSS, images and scripts without reading outside its entry directory', async () => {
+      const site = path.join(root, 'local-site');
+      const dir = path.join(root, 'local-capture');
+      await fs.mkdir(site);
+      await fs.mkdir(dir);
+      const pixels = Buffer.alloc(16 * 16 * 4);
+      for (let i = 0; i < pixels.length; i += 4) pixels.set([0x56, 0x34, 0x12, 0xff], i);
+      await fs.writeFile(path.join(site, 'pixel.png'), nativeImage.createFromBitmap(pixels, { width: 16, height: 16 }).toPNG());
+      await fs.writeFile(path.join(site, 'style.css'), 'body{margin:0} #panel{width:400px;height:200px;background:#0F766E} img{width:100px;height:100px;display:block}');
+      await fs.writeFile(path.join(site, 'app.js'), 'document.querySelector("h1").textContent="Local product ready"');
+      await fs.writeFile(path.join(root, 'outside.css'), '#panel{background:#E11D48!important}');
+      await fs.symlink(path.join(root, 'outside.css'), path.join(site, 'escape.css'));
+      const entry = path.join(site, 'index.html');
+      await fs.writeFile(entry, '<!doctype html><title>Local product</title><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="../outside.css"><link rel="stylesheet" href="escape.css"><h1>Loading</h1><div id="panel"></div><img id="photo" src="pixel.png"><script src="app.js"></script>');
+      const result = await capture.captureProductSource({ inputAbsPath: entry, readRoots: [root], compositionDirAbs: dir, writeRoots: [root], selectors: ['#panel', '#photo'] });
+      if (!result.ok) return [`local capture failed: ${result.errorCode}`];
+      const report = result as any;
+      const failures: string[] = [];
+      if (!report.headings.some((heading: any) => heading.text === 'Local product ready')) failures.push('relative JavaScript did not run');
+      if (!report.source_url.startsWith('file:') || report.final_url !== report.source_url) failures.push('local source provenance was lost');
+      if (report.images.length !== 2) return [...failures, 'local elements were not captured'];
+      const panel = path.join(dir, report.images[0].path);
+      const photo = path.join(dir, report.images[1].path);
+      if (!near(await centerColor(panel), '#0F766E')) failures.push('relative CSS missing or outside stylesheet was read');
+      if (!near(await centerColor(photo), '#123456')) failures.push('relative image did not render');
+      const size = await pngSize(panel);
+      if (size.width !== 800 || size.height !== 400) failures.push('local page CSS geometry or 2x capture was lost');
+      return failures;
+    });
     const compositionDir = path.join(root, 'auto', 'composition');
     await fs.mkdir(compositionDir, { recursive: true });
     const auto = await capture.captureProductSource({ url: fixture.url, compositionDirAbs: compositionDir, writeRoots: [root] });

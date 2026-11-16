@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { checkpointOptions, runCheckpoint } from './test-checkpoint.mjs';
 import { createStderrReceipt } from './test-stderr-receipt.mjs';
-import { createModelEvalLogCollector, mergeModelEvalLogAnalyses } from './model-eval-log-policy.mjs';
+import { createModelEvalLogCollector, mergeModelEvalLogAnalyses, normalizePytestLogFrame } from './model-eval-log-policy.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -26,10 +26,11 @@ const digest = async file => {
 async function finish(reportPath, attempt, directory, discovery) {
   if (!fs.existsSync(reportPath)) return;
   const report = readJson(reportPath);
+  const pytestProgress = Array.isArray(report.expectedErrors);
   const analyses = [];
   const receipt = createStderrReceipt();
   for (const stream of ['stdout', 'stderr']) {
-    const collector = createModelEvalLogCollector(`process-${stream}`);
+    const collector = createModelEvalLogCollector(`process-${stream}`, { pytestProgress });
     for await (const chunk of fs.createReadStream(path.join(directory, attempt[stream]), { encoding: 'utf8' })) {
       collector.ingest(stream, chunk);
       if (stream === 'stderr') receipt.ingest(chunk);
@@ -38,6 +39,21 @@ async function finish(reportPath, attempt, directory, discovery) {
   }
   const eventsPath = reportPath.replace(/\.json$/, '.events.jsonl');
   const scopes = new Map();
+  const expectedErrors = discovery ? [] : report.expectedErrors || [];
+  const inventory = new Set(report.inventory);
+  if (!Array.isArray(expectedErrors) || expectedErrors.length > 10_000
+    || expectedErrors.some(item => !inventory.has(item.case) || typeof item.prefix !== 'string'
+      || !item.prefix.length || item.prefix.length > 512 || /[\r\n]/.test(item.prefix)
+      || !Number.isSafeInteger(item.count) || item.count < 1 || item.count > 200)) throw new Error('Invalid expected Python error logs');
+  const skipped = new Set(report.files.filter(item => item.state === 'skipped').map(item => item.file));
+  const declarations = expectedErrors.filter(item => !skipped.has(item.case)).map(item => ({ ...item, matched: 0 }));
+  const expectedByCase = new Map();
+  for (const item of declarations) {
+    const own = expectedByCase.get(item.case) || [];
+    own.push(item);
+    if (own.length > 16 || own.reduce((sum, entry) => sum + entry.count, 0) > 200) throw new Error('Expected Python error logs exceed the case limit');
+    expectedByCase.set(item.case, own);
+  }
   const input = fs.createReadStream(eventsPath, { encoding: 'utf8' });
   try {
     for await (const line of createInterface({ input, crlfDelay: Infinity })) {
@@ -47,20 +63,43 @@ async function finish(reportPath, attempt, directory, discovery) {
       const key = JSON.stringify([event.case, event.phase]);
       if (!scopes.has(key)) {
         if (scopes.size >= 100_000) throw new Error('Checkpoint event inventory exceeds its size limit');
-        scopes.set(key, createModelEvalLogCollector(key));
+        const expected = event.phase === 'call' ? expectedByCase.get(event.case) || [] : [];
+        const collector = createModelEvalLogCollector(key, { pytestProgress});
+        scopes.set(key, { collector, raw: expected.length ? createModelEvalLogCollector(key, { pytestProgress }) : collector, expected });
       }
-      scopes.get(key).ingest(event.stream, event.text);
+      const scope = scopes.get(key);
+      if (scope.raw !== scope.collector) {
+        scope.raw.ingest(event.stream, event.text);
+        for (const chunk of event.text.split(/(?<=\n)/)) {
+          const clean = normalizePytestLogFrame(chunk.replace(/\x1b\[[0-9;]*m/g, '').replace(/\r?\n$/, ''));
+          const server = /^\[\d{2}:\d{2}:\d{2}\.\d{3}\]\[(ERROR)\]\[rid=[^\]\r\n]{1,128}\]\s*(.*)$/.exec(clean);
+          const standard = /^\[\d{2}:\d{2}:\d{2}\.\d{3}\] \[error\] \[\(python\)\] (.*)$/.exec(clean);
+          const message = server?.[2] ?? standard?.[1];
+          const expected = message === undefined ? null : scope.expected.find(item => item.matched < item.count && message.startsWith(item.prefix));
+          if (expected) expected.matched++;
+          scope.collector.ingest(event.stream, expected
+            ? `[00:00:00.000] [warn] [(expected-python-error)] Case-verified injected error; original bytes and severity retained.${chunk.endsWith('\n') ? '\n' : ''}`
+            : chunk);
+        }
+      } else scope.collector.ingest(event.stream, event.text);
     }
   } finally { input.destroy(); }
-  analyses.push(...[...scopes.values()].map(scope => scope.finish()), ...(report.appAnalyses || []));
+  const processAnalyses = [...analyses];
+  const completedScopes = [...scopes.values()].map(scope => ({ reviewed: scope.collector.finish(),
+    raw: scope.raw === scope.collector ? null : scope.raw.finish(), expected: scope.expected }));
+  const expected = declarations;
+  const unmetExpectations = expected.filter(item => item.matched !== item.count).length;
+  analyses.push(...completedScopes.map(scope => scope.reviewed), ...(report.appAnalyses || []));
   const analysis = mergeModelEvalLogAnalyses(analyses);
-  report.logs = { status: !analysis.passed ? 'FAIL' : analysis.requiresReview ? 'WARN' : 'PASS',
+  report.logs = { status: !analysis.passed || unmetExpectations ? 'FAIL' : analysis.requiresReview ? 'WARN' : 'PASS',
     cases: report.files.reduce((sum, file) => sum + file.passed + file.failed, 0),
     files: report.files.filter(file => file.passed + file.failed > 0).length,
     unexpected: analysis.findings.filter(item => item.severity === 'error').reduce((sum, item) => sum + item.count, 0),
-    unmetExpectations: 0, coverageGaps: analysis.coveragePassed ? [] : ['capture'], analysis };
+    expected: expected.reduce((sum, item) => sum + item.matched, 0),
+    unmetExpectations, coverageGaps: analysis.coveragePassed ? [] : ['capture'], analysis,
+    rawAnalysis: mergeModelEvalLogAnalyses([...processAnalyses, ...completedScopes.map(scope => scope.raw || scope.reviewed), ...(report.appAnalyses || [])]) };
   report.stderr = receipt.finish();
-  report.discoveryPassed = discovery && report.reason === 'passed' && report.unhandledErrors === 0 && analysis.passed;
+  report.discoveryPassed = discovery && report.reason === 'passed' && report.unhandledErrors === 0 && analysis.passed && !unmetExpectations;
   const artifactPaths = [eventsPath, ...(report.artifactPaths || [])];
   // Playwright owns attachments, traces and its last-run metadata. Each batch
   // has a unique output directory so a later batch cannot erase failed evidence.
@@ -139,7 +178,8 @@ export async function runRunnerCheckpoint(lane, argv, { cwd, env, python } = {})
   try {
     code = await runCheckpoint({ ...options, args, directory, executable, env,
       onChild: value => { child = value; }, cancelled: () => signal,
-      adapter: { lane, cwd, prefix, extraRoots, discoveryArgs, batchArgs, finish,
+      adapter: { lane, cwd, prefix, extraRoots, discoveryArgs, batchArgs,
+        finish,
         inventory } });
   } catch (error) {
     if (error.signal) signal ||= error.signal;

@@ -1,3 +1,4 @@
+import { appConversationOwner } from '../../src/main/paths';
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
@@ -161,3 +162,28 @@ describe('Main task-terminal UI delivery', () => {
     );
   });
 });
+
+it('keeps app terminals out of ordinary task UI while delivering ordinary and automation results', () => {
+    const delivered: unknown[] = [];
+    const context = vm.createContext({
+      paths: { appConversationOwner },
+      taskTerminalUi: { emit: (payload: unknown, owner: string) => delivered.push({ payload, owner }) },
+    });
+    vm.runInContext(ts.transpileModule(functionSource('emitTaskTerminalToRenderer'), {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText, context);
+    for (const mode of ['once', 'retain']) {
+      for (const status of ['completed', 'failed', 'stopped', 'waiting_input']) {
+        context.event = { user_id: 'owner-a', conversation_id: `app_${'a'.repeat(64)}_${mode}_${'b'.repeat(32)}`, status };
+        vm.runInContext('emitTaskTerminalToRenderer(event)', context);
+      }
+    }
+    expect(delivered).toEqual([]);
+    for (const kind of ['task', 'automation']) {
+      context.event = { user_id: 'owner-a', conversation_id: 'ordinary-task', status: 'completed', kind };
+      vm.runInContext('emitTaskTerminalToRenderer(event)', context);
+    }
+    expect(delivered).toEqual(['task', 'automation'].map(kind => ({
+      owner: 'owner-a', payload: { type: 'terminal', conversation_id: 'ordinary-task', status: 'completed', kind },
+    })));
+  });

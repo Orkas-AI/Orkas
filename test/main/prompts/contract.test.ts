@@ -290,7 +290,7 @@ describe('prompts ↔ code contract', () => {
     expect(account).not.toContain('When asked about them, explain');
     expect(context).toContain("prompts.load('global_todo_scope'");
     expect(fs.readFileSync(path.join(PROMPTS_DIR, 'global_todo_scope.md'), 'utf8'))
-      .toContain('explain that this non-project conversation cannot access them');
+      .toContain('except that Commander can manage the project it creates for this conversation during this turn immediately');
     expect(project).not.toContain('untrusted');
     expect(context).toContain("prompts.load('open_work_account'");
     expect(context).toContain("prompts.load('open_work_project'");
@@ -332,9 +332,15 @@ describe('prompts ↔ code contract', () => {
     expect(commander).not.toContain('Tool Execution Access');
   });
 
-  it('grounds Commander in the desktop surface with the approved shared edition-aware product guide', () => {
+  it('grounds Commander in the desktop surface and keeps product guidance in the Orkas guide', () => {
     const commander = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
     const guidePath = path.join(PROJECT_ROOT, 'resources/builtin/system/skills/orkas-guide/SKILL.md');
+    const guide = readFile('resources/builtin/system/skills/orkas-guide/SKILL.md');
+    expect(fs.existsSync(guidePath)).toBe(true);
+    expect(guide).toContain('references/editions.md');
+    const settingsGuide = readFile(
+      'resources/builtin/system/skills/orkas-guide/references/settings-data-and-safety.md',
+    );
 
     expect(commander).toMatch(/installed desktop application/i);
     expect(commander).toMatch(/client shell does not imply browser-only controls/i);
@@ -343,9 +349,16 @@ describe('prompts ↔ code contract', () => {
     expect(commander).toMatch(/Match and read the owning System Skill before work/i);
     expect(commander).not.toMatch(/visible features, paths, settings, models\/providers/i);
     expect(commander).not.toMatch(/microphone troubleshooting/i);
-    expect(fs.existsSync(guidePath)).toBe(true);
-    expect(fs.readFileSync(guidePath, 'utf8')).toContain('references/editions.md');
-    expect(fs.readFileSync(guidePath, 'utf8')).toContain('It does not authorize an operation or prove that one succeeded');
+    const settingsRoute = guide.split('\n').find(line => line.includes('(references/settings-data-and-safety.md)')) ?? '';
+    for (const topic of ['models', 'permission', 'credits', 'membership']) {
+      expect(settingsRoute).toContain(topic);
+    }
+    expect(guide).toMatch(/product facts needed to answer or carry out the user's request/i);
+    expect(guide).toMatch(/Leave creation, editing, installation, and other work to the matching owner/i);
+    expect(guide).toMatch(/click-to-open affordance/i);
+    expect(guide).toMatch(/smallest available sanitized app-status domain/i);
+    expect(guide).toMatch(/does not authorize an operation or prove that one succeeded/i);
+    expect(guide).toContain('[settings-data-and-safety.md](references/settings-data-and-safety.md)');
   });
 
   it('keeps the Skill read contract canonical in the generated roster', () => {
@@ -616,12 +629,30 @@ describe('prompts ↔ code contract', () => {
     expect(skillCreator).toMatch(/filename plus a short request is not enough/i);
   });
 
+  it('keeps the Orkas Guide composer explanation complete before recommendations', () => {
+    const guide = readFile('resources/builtin/system/skills/orkas-guide/SKILL.md');
+    const gettingStarted = readFile(
+      'resources/builtin/system/skills/orkas-guide/references/getting-started.md',
+    );
+
+    for (const action of ['view models', 'switch models', 'add a model']) {
+      expect(guide).toContain(`**${action}**`);
+      expect(gettingStarted).toContain(`**${action}**`);
+    }
+    expect(guide).toMatch(/do not collapse those three actions/i);
+  });
+
   it('skill-creator keeps complex roots as direct navigation plus the common execution path', () => {
+    const creator = readFile('resources/builtin/system/skills/skill-creator/SKILL.md');
     const authoring = readFile(
       'resources/builtin/system/skills/skill-creator/references/authoring.md',
     );
 
+    expect(creator).toMatch(/close every file block[\s\S]{0,180}close the outer `<\/skill>`/i);
+    expect(creator).toMatch(/response space is tight[\s\S]{0,120}never truncate/i);
+    expect(creator).toMatch(/straightforward guide[\s\S]{0,180}3–7 steps/i);
     expect(authoring).toMatch(/root SKILL\.md as the routing and common execution spine/i);
+    expect(authoring).toMatch(/do not expand a compact request into a tutorial/i);
     expect(authoring).toMatch(/do not repeat branch checklists, branch schemas, or empty branch templates/i);
     expect(authoring).toMatch(/explicit Markdown link[^\n]+same sentence[^\n]+read condition/i);
     expect(authoring).toMatch(/bare or backticked path is not a link/i);

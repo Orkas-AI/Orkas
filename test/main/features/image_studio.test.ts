@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import sharp from 'sharp';
+import sharp from '../../helpers/fixture-sharp';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -9,6 +9,7 @@ import {
   assertImageQualityVerdict,
   compileImageQualityScorecard,
   imageStudioEvidenceIsGeneration,
+  imageStudioViewportZoom,
   inspectImageStudioProject,
   normalizeImageStudioSnapshot,
   requiredCopyLayoutIssues,
@@ -52,6 +53,30 @@ afterEach(() => {
 });
 
 describe('ImageStudio project contract', () => {
+  it.each([
+    { viewport: { width: 641.5999755859375, height: 360 }, canvas: { width: 641, height: 359 } },
+    { viewport: { width: 641.5999755859375, height: 359.2 }, canvas: { width: 641, height: 359 } },
+    { viewport: { width: 1281.5999755859375, height: 720 }, canvas: { width: 1281, height: 719 } },
+    { viewport: { width: 1281.5999755859375, height: 719.2 }, canvas: { width: 1281, height: 719 } },
+  ])('fractional viewport preserves both requested canvas axes: %j', ({ viewport, canvas }) => {
+    const zoom = imageStudioViewportZoom(viewport, canvas)!;
+    expect(Number.isFinite(zoom)).toBe(true);
+    expect(Math.round(viewport.width / zoom)).toBe(canvas.width);
+    expect(Math.round(viewport.height / zoom)).toBe(canvas.height);
+  });
+
+  it.each([{ width: 640, height: 360 }, { width: 1080, height: 2160 }])(
+    'fractional viewport leaves an exact canvas unchanged: %j', canvas => {
+      expect(imageStudioViewportZoom(canvas, canvas)).toBe(1);
+    },
+  );
+
+  it.each([{ width: 320, height: 180 }, { width: 654, height: 362 }])(
+    'fractional viewport refuses clipping or larger geometry changes: %j', viewport => {
+      expect(imageStudioViewportZoom(viewport, { width: 641, height: 359 })).toBeUndefined();
+    },
+  );
+
   it('delivers exact canvas pixels at normal, fractional and retina display densities without cropping product geometry', async () => {
     for (const density of [1, 1.25, 2]) {
       const captured = await sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${400 * density}" height="${240 * density}" viewBox="0 0 400 240">
@@ -268,6 +293,15 @@ describe('ImageStudio project contract', () => {
     expect(invalidBasis.issues).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: 'E_MANIFEST_REFERENCE_INTENT_BASIS' }),
     ]));
+  });
+
+  it('requires a mode in an explicitly persisted execution reference intent even when public prose may omit it', () => {
+    const checked = validateImageStudioManifest(manifest({
+      references: [{ id: 'anchor', path: 'anchor.png', role: 'style', required: true,
+        strength: 1, preserve: ['palette', 'typography'], may_change: ['member content'], region_ids: [] }],
+      reference_intent: { basis: 'user', instructions: [], minimum_score: 85 },
+    }));
+    expect(checked.issues.map(item => item.code)).toContain('E_MANIFEST_REFERENCE_INTENT_MODE');
   });
 
   it('reports reference-local and reproduction blockers in one validation pass', () => {
@@ -509,6 +543,50 @@ describe('ImageStudio project contract', () => {
       explicitBreak: false,
       writingMode: 'vertical-rl',
     }])).toEqual([]);
+  });
+
+  it('accepts equivalent currency references but rejects escaped or absent visible prices', async () => {
+    fs.writeFileSync(path.join(root, 'image-manifest.json'), JSON.stringify(manifest({
+      brief: { purpose: 'Product image', audience: 'Buyers', required_copy: ['¥99'], must_include: [], must_avoid: [] },
+    })));
+    for (const text of ['¥99', '&yen;99', '&#165;99', '&#xA5;99']) {
+      fs.writeFileSync(path.join(root, 'index.html'), `<html><body><div>${text}</div></body></html>`);
+      const inspection = await inspectImageStudioProject(root);
+      expect(inspection.blockers, text).toEqual([]);
+      expect(inspection.ok).toBe(true);
+    }
+    for (const html of ['<div>&amp;yen;99</div>', '<div>&amp;#165;99</div>',
+      '<!-- ¥99 --><script>const price="¥99";</script><div title="¥99">Offer</div>', '<div>¥199</div>']) {
+      fs.writeFileSync(path.join(root, 'index.html'), `<html><body>${html}</body></html>`);
+      const inspection = await inspectImageStudioProject(root);
+      expect(inspection.ok).toBe(false);
+      expect(inspection.blockers.map(issue => issue.code)).toContain('E_REQUIRED_COPY_MISSING');
+    }
+  });
+
+  it.each([
+    ['inline headline', '让协作更简单', '<h1><span>让协作</span><strong>更简单</strong></h1>', true],
+    ['deliberate title break', '让协作更简单', '<h1>让协作<br>更简单</h1>', true],
+    ['SVG title lines', '让协作更简单', '<svg><text><tspan>让协作</tspan><tspan>更简单</tspan></text></svg>', true],
+    ['styled word', 'cooperate', '<h1>co<em>operate</em></h1>', true],
+    ['separate currency style', '¥99', '<h1><span>&yen;</span><span>99</span></h1>', true],
+    ['authored word space', 'Orkas Studio', '<h1>Orkas <em>Studio</em></h1>', true],
+    ['nonbreaking word space', 'Orkas Studio', '<h1>Orkas&nbsp;<em>Studio</em></h1>', true],
+    ['missing word space', 'Orkas Studio', '<h1>Orkas<em>Studio</em></h1>', false],
+    ['separate paragraphs', 'cooperate', '<p>co</p><p>operate</p>', false],
+    ['separate SVG labels', 'cooperate', '<svg><text>co</text><text>operate</text></svg>', false],
+    ['escaped currency fragments', '¥99', '<h1><span>&amp;</span><span>yen;99</span></h1>', false],
+    ['entity split across nodes', '¥99', '<h1><span>&#1</span><span>65;99</span></h1>', false],
+    ['wrong fragment order', '让协作更简单', '<h1><span>更简单</span><span>让协作</span></h1>', false],
+  ])('checks exact copy after styling: %s', async (_name, copy, markup, accepted) => {
+    fs.writeFileSync(path.join(root, 'image-manifest.json'), JSON.stringify(manifest({
+      brief: { purpose: 'Poster', audience: 'Teams', required_copy: [copy], must_include: [], must_avoid: [] },
+    })));
+    fs.writeFileSync(path.join(root, 'index.html'), `<html><body>${markup}</body></html>`);
+    const inspection = await inspectImageStudioProject(root);
+    expect(inspection.ok).toBe(accepted);
+    expect(inspection.blockers.map(issue => issue.code)).toEqual(accepted ? [] : ['E_REQUIRED_COPY_MISSING']);
+    expect(Boolean(inspection.signature)).toBe(accepted);
   });
 
   it('blocks missing required copy, remote resources, embedded pages, and traversal', async () => {

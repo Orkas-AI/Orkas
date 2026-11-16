@@ -27,14 +27,6 @@ const outputs = [
     entry: path.join(scriptCoreSrcDir, 'video_analyze.ts'),
     outfile: path.join(agentSkillsDir, 'stage-edit', 'scripts', 'lib', 'video_analyze_core.cjs'),
   },
-  {
-    entry: path.join(scriptCoreSrcDir, 'video_edl.ts'),
-    outfile: path.join(agentSkillsDir, 'stage-plan', 'scripts', 'lib', 'video_edl_core.cjs'),
-  },
-  {
-    entry: path.join(scriptCoreSrcDir, 'video_decide.ts'),
-    outfile: path.join(agentSkillsDir, 'stage-plan', 'scripts', 'lib', 'video_decide_core.cjs'),
-  },
 ];
 
 const aliasMainLogger = {
@@ -62,7 +54,8 @@ async function buildOne(item, outfile = item.outfile) {
     platform: 'node',
     target: 'node20',
     format: 'cjs',
-    legalComments: 'none',
+    // Keep /*! license notices (the beat tracker ported from HyperFrames, Apache-2.0).
+    legalComments: 'eof',
     minifyWhitespace: true,
     sourcemap: false,
     plugins: [aliasMainLogger],

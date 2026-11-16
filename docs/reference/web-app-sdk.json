@@ -15,7 +15,7 @@
           "const": "1.9.0"
         },
         "capabilities": {
-          "maxItems": 7,
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "string",
@@ -26,7 +26,8 @@
               "ai",
               "library",
               "connectors",
-              "data"
+              "data",
+              "tasks"
             ]
           }
         },
@@ -106,13 +107,15 @@
                         "type"
                       ],
                       "additionalProperties": false
-                    }
+                    },
+                    "description": "Custom field definitions. Do not define fields named id or createdAt; the platform generates them."
                   },
                   "access": {
                     "type": "object",
                     "properties": {
                       "read": {
                         "default": [],
+                        "description": "Field names visitors may select or filter, including id and createdAt when needed. Undeclared selected or filtered fields reject the query with E_PERMISSION.",
                         "type": "array",
                         "items": {
                           "type": "string",
@@ -121,6 +124,7 @@
                       },
                       "insert": {
                         "default": [],
+                        "description": "Custom field names visitors may insert. Never include platform-generated id or createdAt.",
                         "type": "array",
                         "items": {
                           "type": "string",
@@ -333,13 +337,15 @@
                   "type"
                 ],
                 "additionalProperties": false
-              }
+              },
+              "description": "Custom field definitions. Do not define fields named id or createdAt; the platform generates them."
             },
             "access": {
               "type": "object",
               "properties": {
                 "read": {
                   "default": [],
+                  "description": "Field names visitors may select or filter, including id and createdAt when needed. Undeclared selected or filtered fields reject the query with E_PERMISSION.",
                   "type": "array",
                   "items": {
                     "type": "string",
@@ -348,6 +354,7 @@
                 },
                 "insert": {
                   "default": [],
+                  "description": "Custom field names visitors may insert. Never include platform-generated id or createdAt.",
                   "type": "array",
                   "items": {
                     "type": "string",
@@ -452,6 +459,529 @@
   },
   "methods": [
     {
+      "name": "connectors.uploadAsset",
+      "capability": "connectors",
+      "description": "Upload one selected cloud appFiles image/video to the bound Shopify product-media staging service. Requires both connectors and appFiles. Uses existing connector permissions; returns a temporary source URL, never account credentials.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "connectorId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Relative path. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+          }
+        },
+        "required": [
+          "connectorId",
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "result": "{sourceUrl:string}",
+      "example": {
+        "connectorId": "shopify-admin",
+        "path": "media/product.png"
+      }
+    },
+    {
+      "name": "tasks.agents",
+      "capability": "tasks",
+      "description": "List installed enabled Agents available for an explicit application task.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "result": "{agents:[{id,name}]}",
+      "example": {}
+    },
+    {
+      "name": "tasks.services",
+      "capability": "tasks",
+      "description": "List configured media services in Settings order without secrets. Unavailable service models cannot be selected. Selection applies only to an app task and never reorders Settings. refresh=true bypasses the short model catalog cache.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "image",
+              "video",
+              "audio"
+            ]
+          },
+          "refresh": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "additionalProperties": false
+      },
+      "result": "{services:[{id,provider,model,name,nameZh?,label,managed,available}],managedStatus:complete|unavailable}",
+      "example": {
+        "kind": "video"
+      }
+    },
+    {
+      "name": "tasks.start",
+      "capability": "tasks",
+      "description": "Start a fully private app-owned Agent run. Default one-shot runs directly deliver without interactive replies; media generation uses the selected user-owned service and its existing authorization. They archive final files into appFiles then clean execution context, even after page closure. Optional deliverable requires a matching saved media file; text allows a direct text answer. Optional output records advisory aspect and format preferences, requires deliverable, and is part of request identity. Include creative preferences in prompt or attached brief for the Agent; they do not enforce tool arguments or fail completed output. Duration is also guidance. keepSession=true retains context for multiple turns; reuse its opaque sessionId with a new requestId. Concurrent turns are rejected. A retained session keeps its initial media selection; repeat that selection on each turn and start a new session to change it. Reuse requestId to retrieve admission after an uncertain response; changed input conflicts. Closing the app does not stop an admitted task. Files are relative cloud appFiles paths. Optional media uses a current tasks.services identity; only that service is used for that media kind, without changing global priorities.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40000
+          },
+          "agentId": {
+            "default": "commander",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "files": {
+            "default": [],
+            "maxItems": 20,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Relative path. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+            }
+          },
+          "keepSession": {
+            "default": false,
+            "type": "boolean"
+          },
+          "sessionId": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$"
+          },
+          "media": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "image",
+                  "video",
+                  "audio"
+                ]
+              },
+              "serviceId": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{32}$"
+              }
+            },
+            "required": [
+              "kind",
+              "serviceId"
+            ],
+            "additionalProperties": false
+          },
+          "deliverable": {
+            "type": "string",
+            "enum": [
+              "image",
+              "video",
+              "audio",
+              "text"
+            ]
+          },
+          "output": {
+            "type": "object",
+            "properties": {
+              "aspect": {
+                "type": "string",
+                "enum": [
+                  "1:1",
+                  "4:5",
+                  "9:16",
+                  "16:9",
+                  "3:2"
+                ]
+              },
+              "format": {
+                "type": "string",
+                "enum": [
+                  "png",
+                  "jpg",
+                  "webp",
+                  "pdf",
+                  "psd",
+                  "mp4",
+                  "wav",
+                  "mp3",
+                  "flac",
+                  "m4a",
+                  "aac",
+                  "ogg",
+                  "opus",
+                  "txt",
+                  "srt",
+                  "json"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "requestId",
+          "title",
+          "prompt"
+        ],
+        "additionalProperties": false
+      },
+      "result": "{requestId,status:submitted|unknown|rejected,sessionId?}",
+      "example": {
+        "requestId": "draft-1",
+        "title": "Product copy",
+        "prompt": "Write the product description.",
+        "agentId": "commander",
+        "files": [
+          "product.json"
+        ]
+      }
+    },
+    {
+      "name": "tasks.get",
+      "capability": "tasks",
+      "description": "Read app-owned status, final reply and immutable saved output descriptors (path is a cloud appFiles path). Saving is a nonterminal state. Only retained sessions and historical interactive receipts expose forms or permission interactions; use tasks.respond for those. New one-shot runs never expose a reply channel. Unknown is not success.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+          }
+        },
+        "required": [
+          "requestId"
+        ],
+        "additionalProperties": false
+      },
+      "result": "{requestId,status,text,files:[{id,name,bytes,version?,path?,published?}],saved?,sessionId?,inputId?,interactions?,form?,storageError?,error?:{code}}",
+      "example": {
+        "requestId": "draft-1"
+      }
+    },
+    {
+      "name": "tasks.cancel",
+      "capability": "tasks",
+      "description": "Request cancellation of an app-owned task. Completed external actions cannot be undone.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+          }
+        },
+        "required": [
+          "requestId"
+        ],
+        "additionalProperties": false
+      },
+      "result": "{cancelRequested:true}",
+      "example": {
+        "requestId": "draft-1"
+      }
+    },
+    {
+      "name": "tasks.open",
+      "capability": "tasks",
+      "description": "Deprecated and unavailable: app Agent sessions never open a normal task conversation. Render tasks.get forms/interactions inside the app and use tasks.respond.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+          }
+        },
+        "required": [
+          "requestId"
+        ],
+        "additionalProperties": false
+      },
+      "result": "{opened:true}",
+      "example": {
+        "requestId": "draft-1"
+      }
+    },
+    {
+      "name": "tasks.release",
+      "capability": "tasks",
+      "description": "Release an idle retained session after all its turns were archived. Saved outputs and receipts remain. A busy or closed session cannot accept another turn.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+          }
+        },
+        "required": [
+          "requestId"
+        ],
+        "additionalProperties": false
+      },
+      "result": "{released:true}",
+      "example": {
+        "requestId": "draft-1"
+      }
+    },
+    {
+      "name": "tasks.respond",
+      "capability": "tasks",
+      "description": "Answer only a current form or approval returned by a retained session or historical interactive receipt. New one-shot runs reject replies. The original permission and form owners validate the answer. Never sends an ordinary conversation navigation.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "form",
+              "text",
+              "bash:permission",
+              "connectors:action-confirm",
+              "local-agent:permission",
+              "local-agent:user-input",
+              "delete_file.confirmation_required"
+            ]
+          },
+          "visible": {
+            "type": "boolean"
+          },
+          "inputId": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "responseId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40000
+          },
+          "interactionId": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "allow_once",
+              "allow_run",
+              "deny"
+            ]
+          },
+          "messageId": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "formId": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "values": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "requestId",
+          "kind"
+        ],
+        "additionalProperties": false
+      },
+      "result": "{handled:true}",
+      "example": {
+        "requestId": "draft-1",
+        "kind": "bash:permission",
+        "interactionId": "host-issued-id",
+        "decision": "allow_once"
+      }
+    },
+    {
+      "name": "tasks.output",
+      "capability": "tasks",
+      "description": "Read a regular output file of an app-owned task by its opaque descriptor ID. No arbitrary path or conversation access.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+          },
+          "outputId": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "required": [
+          "requestId",
+          "outputId"
+        ],
+        "additionalProperties": false
+      },
+      "result": "{base64,name}",
+      "example": {
+        "requestId": "draft-1",
+        "outputId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "name": "connectors.list",
+      "capability": "connectors",
+      "description": "List live-visible enabled connector identities and eligible action tool names without secrets. Presence is not proof of a specific business permission.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "offset": {
+            "default": 0,
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100000
+          },
+          "limit": {
+            "default": 20,
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50
+          }
+        },
+        "additionalProperties": false
+      },
+      "result": "{connectors:[{id,name,tools:string[]}],nextOffset:number|null}",
+      "example": {}
+    },
+    {
       "name": "data.query",
       "capability": "data",
       "description": "Read declared fields under readFilters; default limit 20, maximum 100, offset maximum 100000. Ordering adds id as a stable tie-breaker; include reads at most four declared one-hop relations.",
@@ -474,6 +1004,7 @@
             "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
           },
           "fields": {
+            "description": "Returned field names; defaults to access.read when omitted. Every selected field must be in access.read, including id and createdAt.",
             "maxItems": 130,
             "type": "array",
             "items": {
@@ -490,6 +1021,7 @@
             }
           },
           "filters": {
+            "description": "Visitor filters require access.read for every field, including id and createdAt.",
             "maxItems": 16,
             "type": "array",
             "items": {
@@ -548,6 +1080,7 @@
             "maximum": 100000
           },
           "order": {
+            "description": "Defaults to id ascending. Other ordering fields require access.read. Ordering by id does not grant permission to select or filter id.",
             "type": "object",
             "properties": {
               "field": {
@@ -975,7 +1508,7 @@
     {
       "name": "storage.get",
       "capability": "storage",
-      "description": "Read app-private JSON; scope defaults to local for compatibility. cloud participates in account sync.",
+      "description": "Read app-private JSON; scope defaults to local for compatibility. Both scope names select local stores; neither synchronizes data.",
       "appTypes": [
         "local"
       ],
@@ -1125,7 +1658,7 @@
     {
       "name": "appFiles.list",
       "capability": "appFiles",
-      "description": "List sandbox files recursively. cloud (default) syncs with the account; local is for caches.",
+      "description": "List sandbox files recursively. Both scope names stay local; cloud is the default.",
       "appTypes": [
         "local"
       ],
@@ -1324,6 +1857,86 @@
       "example": {
         "path": "images/icon.bin",
         "base64": "AAE="
+      }
+    },
+    {
+      "name": "appFiles.open",
+      "capability": "appFiles",
+      "description": "Open an existing app-private document or media file in its system application. Executable and active web formats are rejected; previews and public browsers cannot open files.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Relative path. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+          },
+          "scope": {
+            "default": "cloud",
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ]
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "result": "{opened:true}",
+      "example": {
+        "path": "media/result.png"
+      }
+    },
+    {
+      "name": "appFiles.reveal",
+      "capability": "appFiles",
+      "description": "Reveal an existing app-private file in the system file manager. No arbitrary path access; unavailable in previews and public browsers.",
+      "appTypes": [
+        "local"
+      ],
+      "environments": [
+        "desktop",
+        "preview"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Relative path. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+          },
+          "scope": {
+            "default": "cloud",
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ]
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "result": "{revealed:true}",
+      "example": {
+        "path": "media/result.png"
       }
     },
     {
@@ -1623,10 +2236,6 @@
   ],
   "unsupported": [
     {
-      "capability": "account.renewalReminders",
-      "reason": "Host-only: account-wide reminder claims and billing navigation belong to the signed-in desktop account UI, not saved applications."
-    },
-    {
       "capability": "browser",
       "reason": "Host-only: task browser control, native file selection and site consent require a live conversation and its user-owned Chromium profile."
     },
@@ -1647,10 +2256,6 @@
       "reason": "Deferred: needs an explicit conversation grant and bounded history projection."
     },
     {
-      "capability": "agents.tasks",
-      "reason": "Deferred: needs a host-owned task lifetime, permissions and billing association."
-    },
-    {
       "capability": "skills",
       "reason": "Host-only: Skill script execution needs an explicitly scoped application sandbox and execution contract."
     },
@@ -1660,7 +2265,7 @@
     },
     {
       "capability": "media.generate",
-      "reason": "Deferred: owning studio plan, output and spending gates must be adapted first."
+      "reason": "Host-only: direct media spending remains with the owning Studio. Declared tasks run a private app-owned Studio session, with its existing plan and spending gates."
     }
   ]
 }

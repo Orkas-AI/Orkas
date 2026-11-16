@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { getIndexedJsonl, readIndexedJsonlRecords, mapIndexedJsonlRecords } from '../../../src/main/util/indexed-jsonl';
@@ -9,13 +10,102 @@ vi.mock('node:fs', async (original) => {
   const actual = await original<typeof import('node:fs')>();
   return { ...actual, createReadStream: vi.fn(actual.createReadStream) };
 });
+vi.mock('node:fs/promises', async original => ({ ...await original<typeof import('node:fs/promises')>() }));
 
 let directory: string;
 beforeEach(() => { directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-indexed-history-')); });
-afterEach(() => { fs.rmSync(directory, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); fs.rmSync(directory, { recursive: true, force: true }); });
 const metadata = (record: { id: string }) => ({ id: record.id });
 
 describe('indexed JSONL history reads', () => {
+  it('reads a warm contiguous selection with bounded IO while preserving every message', async () => {
+    const file = path.join(directory, 'contiguous.jsonl');
+    const records = Array.from({ length: 2048 }, (_, i) => ({ id: `m${i}`, text: `用户🧾 ${i} ` + 'x'.repeat(80) }));
+    const source = records.map(row => JSON.stringify(row)).join('\n') + '\n';
+    fs.writeFileSync(file, source);
+    const index = await getIndexedJsonl(file, metadata);
+    const open = fsp.open;
+    const samples: Array<{ wallMs: number; cpuMs: number; reads: number; bytes: number; maxReadBytes: number }> = [];
+    let reads = 0, bytes = 0, maxReadBytes = 0, closes = 0;
+    vi.spyOn(fsp, 'open').mockImplementation(async (...args: any[]) => {
+      const handle = await (open as any)(...args);
+      const read = handle.read.bind(handle), close = handle.close.bind(handle);
+      handle.read = async (...args: any[]) => {
+        reads++; maxReadBytes = Math.max(maxReadBytes, args[2]);
+        const result = await (read as any)(...args); bytes += result.bytesRead; return result;
+      };
+      handle.close = async () => { closes++; await close(); };
+      return handle;
+    });
+    for (let i = 0; i < 5; i++) {
+      reads = bytes = maxReadBytes = 0;
+      const start = performance.now(), cpu = process.cpuUsage();
+      const result = await readIndexedJsonlRecords(file, index, index.entries);
+      const used = process.cpuUsage(cpu);
+      samples.push({ wallMs: performance.now() - start, cpuMs: (used.user + used.system) / 1000, reads, bytes, maxReadBytes });
+      expect(result).toEqual(records);
+    }
+    console.info('indexed-contiguous-performance', JSON.stringify({ records: records.length,
+      sourceBytes: Buffer.byteLength(source), samples, scope: 'warm exact source read; real filesystem; not UI latency or peak RSS' }));
+    expect(closes).toBe(5);
+    expect(fs.readFileSync(file, 'utf8')).toBe(source);
+    for (const sample of samples) {
+      expect(sample.bytes).toBeLessThanOrEqual(Buffer.byteLength(source));
+      expect(sample.maxReadBytes).toBeLessThanOrEqual(64 * 1024);
+      expect(sample.reads, 'Adjacent small records must not require one filesystem request per message').toBeLessThan(records.length / 10);
+    }
+  });
+
+  it('preserves sparse, duplicate and reordered selections around large and malformed records', async () => {
+    const file = path.join(directory, 'sparse.jsonl');
+    const records = [{ id: 'first', text: 'first' }, { id: 'large', text: '用户🧾'.repeat(30_000) },
+      { id: 'third', text: 'third' }, { id: 'last', text: 'last' }];
+    const source = records.map(row => JSON.stringify(row)).join('\r\ninvalid\r\n') + '\r\n';
+    fs.writeFileSync(file, source);
+    const index = await getIndexedJsonl(file, metadata);
+    const wanted = [3, 0, 0, 1, 2, 3];
+    expect(await readIndexedJsonlRecords(file, index, wanted.map(i => index.entries[i])))
+      .toEqual(wanted.map(i => records[i]));
+    expect(fs.readFileSync(file, 'utf8')).toBe(source);
+  });
+
+  it.each(['short', 'cancel_before', 'cancel', 'error', 'truncate'] as const)('closes the source and preserves projection/cancellation boundaries on %s reads', async fault => {
+    const file = path.join(directory, 'fault.jsonl');
+    const records = Array.from({ length: 20 }, (_, i) => ({ id: `m${i}`, text: 'message' }));
+    const source = records.map(row => JSON.stringify(row)).join('\n') + '\n';
+    fs.writeFileSync(file, source);
+    const index = await getIndexedJsonl(file, metadata), open = fsp.open;
+    let closes = 0, reads = 0;
+    const signal = { aborted: fault === 'cancel_before' }, projected: string[] = [];
+    vi.spyOn(fsp, 'open').mockImplementation(async (...args: any[]) => {
+      const handle = await (open as any)(...args);
+      if (fault === 'truncate') fs.truncateSync(file, index.entries[1].offset);
+      const read = handle.read.bind(handle), close = handle.close.bind(handle);
+      handle.read = async (buffer: Buffer, offset: number, length: number, position: number) => {
+        reads++;
+        if (fault === 'error' && position >= index.entries[1].offset) throw Object.assign(new Error('Synthetic read failure'), { code: 'EIO' });
+        return read(buffer, offset, fault === 'error' ? Math.min(length, index.entries[1].offset - position)
+          : fault === 'short' ? Math.min(length, 7) : length, position);
+      };
+      handle.close = async () => { closes++; await close(); };
+      return handle;
+    });
+    const result = readIndexedJsonlRecords(file, index, index.entries, row => {
+      projected.push(row.id);
+      if (fault === 'cancel') signal.aborted = true;
+      return row;
+    }, signal);
+    if (fault === 'short') expect(await result).toEqual(records);
+    else {
+      await expect(result).rejects.toThrow(fault.startsWith('cancel') ? 'History read cancelled'
+        : fault === 'truncate' ? 'Conversation record is incomplete' : 'Synthetic read failure');
+      expect(projected).toEqual(fault === 'cancel_before' ? [] : ['m0']);
+      if (fault === 'cancel_before') expect(reads).toBe(0);
+    }
+    expect(closes).toBe(1);
+    if (fault !== 'truncate') expect(fs.readFileSync(file, 'utf8')).toBe(source);
+  });
+
   it('reads only the requested prefix, projects cold records once, and closes the source before returning', async () => {
     const file = path.join(directory, 'prefix.jsonl');
     fs.writeFileSync(file, '\ninvalid\n' + JSON.stringify({ id: 'first', text: '用户🧾' }) + '\n' +

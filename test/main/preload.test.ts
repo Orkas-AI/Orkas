@@ -170,6 +170,7 @@ describe('preload bridge', () => {
     const handler = vi.fn();
 
     expect(() => api.onPushEvent('account:session-secret', handler)).toThrow(/not allowed/);
+    expect(() => api.onPushEvent('marketplace:changed', null as never)).toThrow(/handler/);
     const unsubscribe = api.onPushEvent('marketplace:changed', handler);
     emit('marketplace:changed', { id: 'a' });
     unsubscribe();
@@ -274,6 +275,7 @@ describe('preload bridge', () => {
     const { api } = loadPreload();
     const inspected = productionRendererPushSubscriptions();
     expect(inspected.nonLiteralCalls).toEqual([]);
+    expect(inspected.channels).toContain('conversation:task_terminal');
     expect(inspected.channels).toContain('conversation:media_materialized');
 
     const rejected: Array<{ channel: string; error: string }> = [];
@@ -386,6 +388,17 @@ describe('preload bridge', () => {
       targetDir: '',
       cid: 'conv-1',
       entries: [{ index: 1, path: '/Users/test/Desktop/report.csv', name: 'report.csv', size: 3000 }],
+    });
+  });
+
+
+  it('routes selected canvas files privately to their conversation and production',async()=>{
+    const osFile={name:'box.png',size:5};
+    const {api,ipcRenderer}=loadPreload(null,{webUtils:{getPathForFile:()=>'/tmp/box.png'}});
+    await api.importLocalFiles('video_canvas',[osFile],{cid:'conv-1',targetDir:'ad'});
+    expect(ipcRenderer.invoke).toHaveBeenLastCalledWith('orkas.importLocalFiles',{
+      scope:'video_canvas',projectId:'',targetDir:'ad',cid:'conv-1',
+      entries:[{index:0,path:'/tmp/box.png',name:'box.png',size:5}],
     });
   });
 

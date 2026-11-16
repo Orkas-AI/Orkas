@@ -64,6 +64,263 @@ async function createProject(orkas: OrkasTestApp, name: string): Promise<void> {
 }
 
 test.describe('projects', () => {
+  test('memory deletion confirmation never retargets the newly opened project', async ({ orkas }) => {
+    await createProject(orkas, 'E2E Memory Delete A');
+    await createProject(orkas, 'E2E Memory Delete B');
+    const page = orkas.page!;
+    const { projects } = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const a = projects.find(p => p.name === 'E2E Memory Delete A')!.project_id;
+    const b = projects.find(p => p.name === 'E2E Memory Delete B')!.project_id;
+    for (const projectId of [a, b]) {
+      await orkas.invoke('memory.add', {target: 'project', projectId, content: 'Same project-scoped fact'});
+      await orkas.invoke('memory.add', {target: 'project', projectId, content: 'Protected project fact'});
+    }
+    await page.evaluate(id => (window as any).loadProjectDetail(id), a);
+    await page.locator('[data-project-side-tabs="context"] [data-project-side-tab="memory"]').click();
+    const item = page.locator('.project-memory-item', {hasText: 'Same project-scoped fact'});
+    await item.hover();
+    await page.evaluate(() => {
+      const original = (window as any).orkas.invoke;
+      (window as any).orkas.invoke = (...args: unknown[]) => {
+        const pending = original(...args);
+        if (args[0] === 'memory.remove') (window as any).__memoryDeletionPending = pending;
+        return pending;
+      };
+    });
+    await item.locator('[data-action="project-memory-delete"]').click();
+    const confirm = page.locator('.ui-dialog-overlay.open').last();
+    await expect(confirm).toBeVisible();
+    await page.evaluate(id => (window as any).loadProjectDetail(id), b);
+    await confirm.locator('.btn-primary').click();
+    await expect(confirm).not.toBeVisible();
+    await page.evaluate(async () => { await (window as any).__memoryDeletionPending; });
+    // Consume the native stores, not a UI success flag or a mocked remove.
+    for (const projectId of [a, b]) {
+      expect(await orkas.invoke('memory.list', {target: 'project', projectId}))
+        .toMatchObject({ok: true, entries: ['Same project-scoped fact', 'Protected project fact']});
+    }
+  });
+
+  test('memory save keeps a later unsaved editor draft', async ({ orkas }, testInfo) => {
+    await createProject(orkas, 'E2E Memory Save Ownership');
+    const page = orkas.page!;
+    const { projects } = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const projectId = projects.find(p => p.name === 'E2E Memory Save Ownership')!.project_id;
+    await page.locator('[data-project-side-tabs="context"] [data-project-side-tab="memory"]').click();
+    await page.locator('#project-memory-add-empty-btn').click();
+    await page.locator('#project-memory-editor-input').fill('Submitted fact');
+    await orkas.electronApp!.evaluate(({ipcMain}) => {
+      const original = (ipcMain as any)._invokeHandlers.get('orkas.invoke');
+      const state = {finish: null as any, restore: () => {ipcMain.removeHandler('orkas.invoke'); ipcMain.handle('orkas.invoke', original);}};
+      (globalThis as any).__memorySave = state;
+      ipcMain.removeHandler('orkas.invoke');
+      ipcMain.handle('orkas.invoke', async (event, request) => {
+        const response = await original(event, request);
+        if (request?.channel === 'memory.add') return new Promise(resolve => {state.finish = () => {state.finish = null; resolve(response);};});
+        return response;
+      });
+    });
+    try {
+      await page.locator('#project-memory-editor-save').click();
+      await expect.poll(() => orkas.electronApp!.evaluate(() => !!(globalThis as any).__memorySave.finish)).toBe(true);
+      await page.locator('#project-memory-editor-input').fill('Later unsaved memory draft');
+      await orkas.electronApp!.evaluate(() => (globalThis as any).__memorySave.finish());
+      await expect(page.locator('#project-memory-editor')).toBeVisible();
+      await expect(page.locator('#project-memory-editor-input')).toHaveValue('Later unsaved memory draft');
+      expect(await orkas.invoke('memory.list', {target: 'project', projectId})).toMatchObject({entries: ['Submitted fact']});
+      await page.screenshot({path: testInfo.outputPath('memory-later-draft.png')});
+    } finally {
+      await orkas.electronApp!.evaluate(() => {const s=(globalThis as any).__memorySave;s.finish?.();s.restore();});
+    }
+  });
+
+  test('a stale discard confirmation preserves the current project draft', async ({ orkas }, testInfo) => {
+    await createProject(orkas, 'E2E Discard A');
+    await createProject(orkas, 'E2E Discard B');
+    const page = orkas.page!;
+    const { projects } = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const a = projects.find(p => p.name === 'E2E Discard A')!.project_id;
+    const b = projects.find(p => p.name === 'E2E Discard B')!.project_id;
+    await orkas.invoke('projects.instructions.set', { projectId: a, content: 'A saved rules' });
+    await orkas.invoke('projects.instructions.set', { projectId: b, content: 'B saved rules' });
+    await page.evaluate(id => (window as any).loadProjectDetail(id), a);
+    await page.locator('#project-instructions-edit-btn').click();
+    await page.locator('#project-instructions-input').fill('A abandoned draft');
+    await page.locator('#project-instructions-cancel-btn').click();
+    const confirm = page.locator('.ui-dialog-overlay.open').last();
+    await expect(confirm).toBeVisible();
+    // Account/project refresh can replace the shared editor while a global
+    // decision is pending. Keep the real dialog and production load path.
+    await page.evaluate(async id => {
+      await (window as any).loadProjectDetail(id);
+      (window as any)._openProjectInstructionsEditor();
+      const input = document.getElementById('project-instructions-input') as HTMLTextAreaElement;
+      input.value = 'B current unsaved draft';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }, b);
+    await confirm.locator('.btn-primary').click();
+    await expect(page.locator('#project-instructions-modal')).toHaveClass(/\bopen\b/);
+    await expect(page.locator('#project-instructions-input')).toHaveValue('B current unsaved draft');
+    await expect(page.locator('#project-instructions-read')).toHaveText('B saved rules');
+    expect(await orkas.invoke('projects.instructions.get', { projectId: a })).toMatchObject({ content: 'A saved rules' });
+    expect(await orkas.invoke('projects.instructions.get', { projectId: b })).toMatchObject({ content: 'B saved rules' });
+    await page.screenshot({ path: testInfo.outputPath('discard-preserved-project-draft.png') });
+  });
+
+  test('keeps the newest persisted rules after two save replies arrive out of order', async ({ orkas }) => {
+    await createProject(orkas, 'E2E Rules Save Order');
+    const page = orkas.page!;
+    const { projects } = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const projectId = projects.find(p => p.name === 'E2E Rules Save Order')!.project_id;
+    await orkas.electronApp!.evaluate(({ ipcMain }) => {
+      const original = (ipcMain as any)._invokeHandlers.get('orkas.invoke');
+      const state = { armed: true, finish: null as any, restore: () => {
+        ipcMain.removeHandler('orkas.invoke');
+        ipcMain.handle('orkas.invoke', original);
+      } };
+      (globalThis as any).__rulesSaveOrder = state;
+      ipcMain.removeHandler('orkas.invoke');
+      ipcMain.handle('orkas.invoke', async (event, request) => {
+        const response = await original(event, request);
+        if (state.armed && request?.channel === 'projects.instructions.set') {
+          state.armed = false;
+          return new Promise(resolve => { state.finish = () => { state.finish = null; resolve(response); }; });
+        }
+        return response;
+      });
+    });
+    try {
+      await page.locator('#project-instructions-setup-btn').click();
+      const input = page.locator('#project-instructions-input');
+      await input.fill('First submitted rules');
+      await page.locator('#project-instructions-save-btn').click();
+      await expect.poll(() => orkas.electronApp!.evaluate(() => !!(globalThis as any).__rulesSaveOrder.finish)).toBe(true);
+      await input.fill('Latest submitted rules');
+      await page.locator('#project-instructions-save-btn').click();
+      await expect(page.locator('#project-instructions-read')).toHaveText('Latest submitted rules');
+      await expect(page.locator('#project-instructions-modal')).not.toHaveClass(/\bopen\b/);
+      await orkas.electronApp!.evaluate(() => (globalThis as any).__rulesSaveOrder.finish());
+      await expect(page.locator('#project-instructions-read')).toHaveText('Latest submitted rules');
+      expect(await orkas.invoke('projects.instructions.get', { projectId })).toMatchObject({ content: 'Latest submitted rules' });
+      await page.locator('#project-instructions-edit-btn').click();
+      await expect(input).toHaveValue('Latest submitted rules');
+      await page.keyboard.press('Escape');
+    } finally {
+      await orkas.electronApp!.evaluate(() => {
+        const state = (globalThis as any).__rulesSaveOrder;
+        state.finish?.();
+        state.restore();
+      });
+    }
+  });
+
+  for (const boundary of ['autoTasks.list', 'projects.instructions.get']) {
+    test(`keeps newly saved rules after an older ${boundary} response`, async ({ orkas }) => {
+      await createProject(orkas, `E2E Rules Read ${boundary}`);
+      const page = orkas.page!;
+      const { projects } = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+      const projectId = projects.find(p => p.name === `E2E Rules Read ${boundary}`)!.project_id;
+      await orkas.invoke('projects.instructions.set', { projectId, content: 'Original persisted rules' });
+      await page.evaluate(id => (window as any).loadProjectDetail(id), projectId);
+      await expect(page.locator('#project-instructions-read')).toHaveText('Original persisted rules');
+      await orkas.electronApp!.evaluate(({ ipcMain }, scope) => {
+        const original = (ipcMain as any)._invokeHandlers.get('orkas.invoke');
+        const state = { armed: true, finish: null as any, restore: () => {
+          ipcMain.removeHandler('orkas.invoke');
+          ipcMain.handle('orkas.invoke', original);
+        } };
+        (globalThis as any).__instructionsRead = state;
+        ipcMain.removeHandler('orkas.invoke');
+        ipcMain.handle('orkas.invoke', async (event, request) => {
+          const response = await original(event, request);
+          if (state.armed && request?.channel === scope.boundary && request?.payload?.projectId === scope.projectId) {
+            state.armed = false;
+            return new Promise(resolve => { state.finish = () => { state.finish = null; resolve(response); }; });
+          }
+          return response;
+        });
+      }, { boundary, projectId });
+      try {
+        await page.evaluate(id => {
+          (window as any).__rulesPendingLoad = (window as any).loadProjectDetail(id);
+        }, projectId);
+        await expect.poll(() => orkas.electronApp!.evaluate(() => !!(globalThis as any).__instructionsRead.finish)).toBe(true);
+        await page.locator('#project-instructions-edit-btn').click();
+        await page.locator('#project-instructions-input').fill('Newest acknowledged rules');
+        await page.locator('#project-instructions-save-btn').click();
+        await expect(page.locator('#project-instructions-modal')).not.toHaveClass(/\bopen\b/);
+        await expect(page.locator('#project-instructions-read')).toHaveText('Newest acknowledged rules');
+        await orkas.electronApp!.evaluate(() => (globalThis as any).__instructionsRead.finish());
+        await page.evaluate(() => (window as any).__rulesPendingLoad);
+        await expect(page.locator('#project-instructions-read')).toHaveText('Newest acknowledged rules');
+        expect(await orkas.invoke('projects.instructions.get', { projectId })).toMatchObject({ content: 'Newest acknowledged rules' });
+        await page.locator('#project-instructions-edit-btn').click();
+        await expect(page.locator('#project-instructions-input')).toHaveValue('Newest acknowledged rules');
+        await page.keyboard.press('Escape');
+      } finally {
+        await orkas.electronApp!.evaluate(() => {
+          const state = (globalThis as any).__instructionsRead;
+          state.finish?.();
+          state.restore();
+        });
+      }
+    });
+  }
+
+  test('preserves a newer instructions draft when an earlier save completes', async ({ orkas }, testInfo) => {
+    await createProject(orkas, 'E2E Instructions Ownership');
+    const page = orkas.page!;
+    const { projects } = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const projectId = projects.find(p => p.name === 'E2E Instructions Ownership')!.project_id;
+    await orkas.electronApp!.evaluate(({ ipcMain }) => {
+      const original = (ipcMain as any)._invokeHandlers.get('orkas.invoke');
+      const state = { finish: null as any, restore: () => {
+        ipcMain.removeHandler('orkas.invoke');
+        ipcMain.handle('orkas.invoke', original);
+      } };
+      (globalThis as any).__instructionsSave = state;
+      ipcMain.removeHandler('orkas.invoke');
+      ipcMain.handle('orkas.invoke', async (event, request) => {
+        const response = await original(event, request);
+        if (request?.channel === 'projects.instructions.set') {
+          return new Promise(resolve => { state.finish = () => { state.finish = null; resolve(response); }; });
+        }
+        return response;
+      });
+    });
+    try {
+      for (const [locale, width, height] of [['zh', 1440, 900], ['en', 900, 600]] as const) {
+        await page.setViewportSize({ width, height });
+        await page.evaluate(lang => (window as any).setLang(lang), locale);
+        const saved = `Submitted rules ${locale}`;
+        const draft = `Newer unsaved draft ${locale}: preserve the user's additional instructions.`;
+        await page.locator(locale === 'zh' ? '#project-instructions-setup-btn' : '#project-instructions-edit-btn').click();
+        const input = page.locator('#project-instructions-input');
+        await input.fill(saved);
+        await page.locator('#project-instructions-save-btn').click();
+        await expect.poll(() => orkas.electronApp!.evaluate(() => !!(globalThis as any).__instructionsSave.finish)).toBe(true);
+        await input.fill(draft);
+        await orkas.electronApp!.evaluate(() => (globalThis as any).__instructionsSave.finish());
+        await expect(page.locator('#project-instructions-read')).toHaveText(saved);
+        await expect(page.locator('#project-instructions-modal')).toHaveClass(/\bopen\b/);
+        await expect(input).toHaveValue(draft);
+        await expect(page.locator('#project-instructions-save-btn')).toBeEnabled();
+        expect(await orkas.invoke<{ content: string }>('projects.instructions.get', { projectId })).toMatchObject({ content: saved });
+        await page.screenshot({ path: testInfo.outputPath(`instructions-draft-${locale}.png`) });
+        // Restore the acknowledged snapshot through the editor, then dismiss.
+        await input.fill(saved);
+        await page.keyboard.press('Escape');
+        await expect(page.locator('#project-instructions-modal')).not.toHaveClass(/\bopen\b/);
+      }
+    } finally {
+      await orkas.electronApp!.evaluate(() => {
+        const state = (globalThis as any).__instructionsSave;
+        state.finish?.();
+        state.restore();
+      });
+    }
+  });
+
   test('selects and reveals a project opened outside the sidebar without pinning later scroll', async ({ orkas }, testInfo) => {
     const page = orkas.page!;
     let targetId = '';
@@ -303,6 +560,7 @@ test.describe('projects', () => {
     // relying on permission bits that elevated users or Windows may ignore.
     renameSync(file, preserved);
     mkdirSync(file);
+    const failureAfter = orkas.rendererDiagnosticCheckpoint();
     try {
       await page.evaluate(pid => (window as any).loadProjectDetail(pid), projectId);
       await expect(page.locator('#project-instructions-input')).toBeDisabled();
@@ -323,6 +581,7 @@ test.describe('projects', () => {
     await page.locator('#project-instructions-cancel-btn').click();
     expect(await orkas.invoke('projects.instructions.get', { projectId })).toMatchObject({ content: original });
     await expect(page.locator('#project-instructions-read')).toHaveText(original);
+    await orkas.acknowledgeInvokeFailures('projects.instructions.get', 1, failureAfter);
   });
 
   test('uploads, previews, persists, and deletes a project Library file', async ({ orkas }) => {
@@ -1282,3 +1541,34 @@ test.describe('projects', () => {
   });
 
 });
+
+  test('renames a project and keeps the new name after relaunch', async ({ orkas }) => {
+    const originalName = 'E2E Project Before Rename';
+    const renamedName = 'E2E Project After Rename';
+    await createProject(orkas, originalName);
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+
+    const originalRow = orkas.page.locator('.project-row', {
+      has: orkas.page.locator('.project-name', { hasText: originalName }),
+    });
+    await originalRow.hover();
+    const renameMenuButton = originalRow.locator('[data-project-menu]');
+    await expect(renameMenuButton).toBeVisible();
+    await renameMenuButton.click();
+    await orkas.page.locator('#project-row-menu [data-action="rename"]').click();
+    const renameInput = orkas.page.locator('input.project-rename-input[data-rename-pid]');
+    await expect(renameInput).toBeFocused();
+    await renameInput.fill(renamedName);
+    await renameInput.press('Enter');
+
+    await expect(orkas.page.locator('.project-name', { hasText: originalName })).toHaveCount(0);
+    await expect(orkas.page.locator('.project-name', { hasText: renamedName })).toHaveCount(1);
+
+    const relaunchedPage = await orkas.relaunch();
+    const renamedRow = relaunchedPage.locator('.project-row', {
+      has: relaunchedPage.locator('.project-name', { hasText: renamedName }),
+    });
+    await expect(renamedRow).toHaveCount(1);
+    await renamedRow.click();
+    await expect(relaunchedPage.locator('#project-detail-title')).toHaveText(renamedName);
+  });

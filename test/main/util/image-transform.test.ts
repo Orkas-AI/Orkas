@@ -90,6 +90,52 @@ describe('image-transform › toCompressedJpeg', () => {
 });
 
 describe('image-transform › prepareFeedbackUploadImage', () => {
+  async function texturedImage(transparent = false): Promise<any> {
+    const { Jimp } = await import('jimp' as any);
+    const image: any = new Jimp({ width: 320, height: 240, color: 0xFFFFFFFF });
+    let seed = 12345;
+    image.scan(0, 0, 320, 240, function (this: any, x: number, y: number, idx: number) {
+      for (let channel = 0; channel < 3; channel++) {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        this.bitmap.data[idx + channel] = seed >>> 24;
+      }
+      if (transparent && x < 40 && y < 40) {
+        this.bitmap.data.fill(0, idx, idx + 4);
+      }
+    });
+    return image;
+  }
+
+  it.each(['image/png', 'image/jpeg'])('compresses %s below 1.5 MiB without changing its source', async (mimeType) => {
+    const image = await texturedImage();
+    const input: Buffer = await image.getBuffer(mimeType, { quality: 100 });
+    const original = Buffer.from(input);
+    expect(input.length).toBeLessThan(1536 * 1024);
+    const result = await prepareFeedbackUploadImage(input, {
+      fileName: mimeType === 'image/png' ? 'small.png' : 'small.jpeg', mimeType,
+    });
+
+    expect(result.compressed).toBe(true);
+    expect(result.mimeType).toBe('image/jpeg');
+    expect(result.fileName).toBe('small.jpg');
+    expect(result.buf.length).toBeLessThan(input.length);
+    const { Jimp } = await import('jimp' as any);
+    const decoded: any = await Jimp.read(result.buf);
+    expect([decoded.bitmap.width, decoded.bitmap.height]).toEqual([320, 240]);
+    expect(input.equals(original)).toBe(true);
+  });
+
+  it('keeps transparent backgrounds readable when a small PNG becomes JPEG', async () => {
+    const image = await texturedImage(true);
+    const input: Buffer = await image.getBuffer('image/png');
+    const result = await prepareFeedbackUploadImage(input, { fileName: 'transparent.png' });
+    expect(result.compressed).toBe(true);
+    const { Jimp } = await import('jimp' as any);
+    const decoded: any = await Jimp.read(result.buf);
+    const pixel = decoded.getPixelColor(10, 10);
+    for (const shift of [24, 16, 8]) expect((pixel >>> shift) & 0xff).toBeGreaterThan(240);
+  });
+
   it('compresses large feedback images as color JPEG', async () => {
     const r = await prepareFeedbackUploadImage(sourcePng, {
       fileName: 'screen.png',
@@ -136,5 +182,16 @@ describe('image-transform › prepareFeedbackUploadImage', () => {
       mimeType: 'image/gif',
       maxBytes: 10,
     })).rejects.toMatchObject({ code: 'image_too_large' });
+  });
+
+  it('preserves GIF bytes and undecodable in-budget images', async () => {
+    for (const [fileName, mimeType, input] of [
+      ['clip.gif', 'image/gif', Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64')],
+      ['unsupported.webp', 'image/webp', Buffer.from('undecodable image')],
+    ] as const) {
+      const result = await prepareFeedbackUploadImage(input, { fileName, mimeType });
+      expect(result).toMatchObject({ fileName, mimeType, compressed: false });
+      expect(result.buf.equals(input)).toBe(true);
+    }
   });
 });

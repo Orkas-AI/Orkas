@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 const { syncBuiltinESMExports } = require('node:module');
 
 function profileSyncCosts(inScope) {
-  const report = { fs: {}, syncFsMs: 0, hashMs: 0, hashCalls: 0, hashBytes: 0 };
+  const report = { fs: {}, syncFsMs: 0, hashMs: 0, hashCalls: 0, hashCopies: 0, hashBytes: 0 };
   const restore = [];
   let depth = 0, active = true;
   for (const name of ['readFileSync', 'writeFileSync', 'appendFileSync', 'statSync', 'lstatSync',
@@ -31,17 +31,17 @@ function profileSyncCosts(inScope) {
     };
     restore.push(() => { fs[name] = original; });
   }
-  const createHash = crypto.createHash;
-  crypto.createHash = function (...args) {
-    const hash = Reflect.apply(createHash, this, args);
-    if (!active || args[0] !== 'sha256') return hash;
-    report.hashCalls++;
-    for (const name of ['update', 'digest']) {
+  const instrumentHash = hash => {
+    for (const name of ['update', 'digest', 'copy']) {
       const original = hash[name];
       hash[name] = function (...values) {
         if (!active) return Reflect.apply(original, this, values);
         const start = performance.now();
-        try { return Reflect.apply(original, this, values); }
+        try {
+          const result = Reflect.apply(original, this, values);
+          if (name === 'copy') { report.hashCopies++; return instrumentHash(result); }
+          return result;
+        }
         finally {
           report.hashMs += performance.now() - start;
           if (name === 'update') {
@@ -53,6 +53,13 @@ function profileSyncCosts(inScope) {
       };
     }
     return hash;
+  };
+  const createHash = crypto.createHash;
+  crypto.createHash = function (...args) {
+    const hash = Reflect.apply(createHash, this, args);
+    if (!active || args[0] !== 'sha256') return hash;
+    report.hashCalls++;
+    return instrumentHash(hash);
   };
   restore.push(() => { crypto.createHash = createHash; });
   syncBuiltinESMExports();

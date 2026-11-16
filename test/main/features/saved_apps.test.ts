@@ -67,6 +67,82 @@ async function makeArtifact(title: string, extra: Array<{ path: string; content:
 }
 
 describe('saved_apps › saveFromArtifact', () => {
+  it('rejects a guarded stale update without replacing code or creating a copy', async () => {
+    const { savedApps } = await mods();
+    const artifact = await makeArtifact('Original');
+    const saved = await savedApps.saveFromArtifact(UID, CID, artifact);
+    if (!saved.ok) throw new Error(saved.error);
+    const entry = path.join(APPS_ROOT(), saved.id, 'index.html');
+    const before = fs.readFileSync(entry, 'utf8');
+    const result = await savedApps.saveFromArtifact(UID, CID, artifact, 'update', undefined, undefined, {
+      isActive: () => true, target: { appId: saved.id, revision: '0'.repeat(64) },
+    });
+    expect(result).toEqual({ ok: false, error: 'app_edit_conflict' });
+    expect(fs.readFileSync(entry, 'utf8')).toBe(before);
+    expect(savedApps.listSavedApps(UID).map(row => row.id)).toEqual([saved.id]);
+  });
+
+  it('does not turn a guarded update without a destination into a new application', async () => {
+    const { savedApps } = await mods();
+    const artifact = await makeArtifact('Unsaved');
+    expect(await savedApps.saveFromArtifact(UID, CID, artifact, 'update', undefined, undefined, {
+      isActive: () => true, target: null,
+    })).toEqual({ ok: false, error: 'app_edit_target_missing' });
+    expect(savedApps.listSavedApps(UID)).toEqual([]);
+  });
+
+  it('does not commit a guarded save after its task has stopped', async () => {
+    const { savedApps } = await mods();
+    const artifact = await makeArtifact('Stopped');
+    expect(await savedApps.saveFromArtifact(UID, CID, artifact, 'auto', undefined, undefined, {
+      isActive: () => false, target: null,
+    })).toEqual({ ok: false, error: 'app_save_closed' });
+    expect(savedApps.listSavedApps(UID)).toEqual([]);
+  });
+
+  it('discards a guarded staged copy when its task stops during copying', async () => {
+    const { savedApps } = await mods();
+    const artifact = await makeArtifact('Stop during copy');
+    let active = true;
+    const fsp = await import('node:fs/promises');
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    vi.mocked(fsp.cp).mockImplementationOnce(async (...args) => { await actual.cp(...args); active = false; });
+    expect(await savedApps.saveFromArtifact(UID, CID, artifact, 'auto', undefined, undefined, {
+      isActive: () => active, target: null,
+    })).toEqual({ ok: false, error: 'app_save_closed' });
+    expect(savedApps.listSavedApps(UID)).toEqual([]);
+    expect(fs.readdirSync(APPS_ROOT()).filter(name => !name.startsWith('.'))).toEqual([]);
+  });
+
+  it.each(['local','web'])('forks built-in %s edits even for update requests, retains assets and subsequently updates only the custom copy', async appType => {
+    const { savedApps, chatArtifacts } = await mods();
+    const id = 'builtin-test-seed';
+    const root = path.join(tmpDir, UID, 'local', 'builtin_apps', id);
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, '__orkas-meta.json'), JSON.stringify({ title: 'Pomodoro', version: '1.0.0', appType, entry: 'index.html', browserStorage: 'isolated-v1' }));
+    fs.writeFileSync(path.join(root, 'index.html'), '<h1>Original timer</h1>');
+    fs.writeFileSync(path.join(root, 'timer.png'), Buffer.from([1, 2, 3]));
+    const before = fs.readFileSync(path.join(root, 'index.html'));
+    expect(savedApps.resolveSavedAppIndex(UID, id).ok).toBe(true);
+    expect(savedApps.renameSavedApp(UID, id, 'Changed').ok).toBe(false);
+    expect((await savedApps.deleteSavedApp(UID, id)).ok).toBe(false);
+    const edit = await savedApps.openForEditing(UID, id);
+    if (!edit.ok) throw new Error(edit.error);
+    const cid = (edit.conversation as any).conversation_id;
+    expect(await savedApps.getEditTarget(UID, cid)).toBeNull();
+    const artifact = await chatArtifacts.createArtifact(UID, cid, 'helper', { title: 'My timer', files: [{path:'index.html',content:'<h1>My timer</h1>'}] });
+    if (!artifact.ok) throw new Error(artifact.error);
+    const copy = await savedApps.saveFromArtifact(UID, cid, artifact.artifactId, 'update');
+    if (!copy.ok) throw new Error(copy.error);
+    expect(copy.id).not.toBe(id);
+    expect(savedApps.declaredSavedAppType(UID,copy.id)).toBe(appType);
+    expect(fs.readFileSync(path.join(root, 'index.html'))).toEqual(before);
+    expect(fs.readFileSync(path.join(APPS_ROOT(), copy.id, 'timer.png'))).toEqual(Buffer.from([1, 2, 3]));
+    expect(await savedApps.saveFromArtifact(UID, cid, artifact.artifactId, 'auto')).toMatchObject({ok:true,id:copy.id});
+    expect(JSON.parse(fs.readFileSync(path.join(APPS_ROOT(),copy.id,'__orkas-meta.json'),'utf8')).builtinOrigin).toEqual({id,version:'1.0.0'});
+    expect(fs.readFileSync(path.join(root, 'index.html'))).toEqual(before);
+  });
+
   it.each(['artifact','workspace'] as const)('does not turn an unreadable %s save destination into a new app',async source=>{
     const {savedApps}=await mods();
     const artifactId=source==='artifact'?await makeArtifact('Original planner'):'';
@@ -1469,6 +1545,44 @@ describe('saved_apps › listSavedApps', () => {
 });
 
 describe('saved_apps › openForEditing', () => {
+  it.each([
+    ['zh', '内容工作台', '修改「内容工作台」', '修改「My own workspace」'],
+    ['zh-tw', '內容工作台', '修改「內容工作台」', '修改「My own workspace」'],
+    ['en', 'Content workspace', 'Edit "Content workspace"', 'Edit "My own workspace"'],
+  ] as const)('keeps the built-in display name throughout a %s edit and preserves custom names', async (lang, title, conversationTitle, customConversationTitle) => {
+    const { savedApps } = await mods();
+    const i18n = await import('../../../src/main/i18n');
+    const previousLang = i18n.getCurrentLang();
+    i18n.setCurrentLang(lang);
+    try {
+      const id = 'builtin-test-content';
+      const root = path.join(tmpDir, UID, 'local', 'builtin_apps', id);
+      fs.mkdirSync(root, { recursive: true });
+      const metadata = JSON.stringify({ title: 'Content workspace', titleKey: 'apps.builtin_content_title', version: '1.0.0', appType: 'local', entry: 'index.html' });
+      fs.writeFileSync(path.join(root, '__orkas-meta.json'), metadata);
+      fs.writeFileSync(path.join(root, 'index.html'), '<h1>Content</h1>');
+      const edit = await savedApps.openForEditing(UID, id);
+      if (!edit.ok) throw new Error(edit.error);
+      expect(edit.title).toBe(title);
+      const conversation = edit.conversation as any;
+      expect(conversation.title).toBe(conversationTitle);
+      expect(conversation.assistance).toMatchObject({ kind: 'app_editing', title });
+      expect(fs.readFileSync(path.join(attachDir(conversation.conversation_id), edit.sourceFileName), 'utf8'))
+        .toContain(`# Interactive app source — "${title}"`);
+      expect(fs.readFileSync(path.join(root, '__orkas-meta.json'), 'utf8')).toBe(metadata);
+
+      const custom = await savedApps.saveFromArtifact(UID, CID, await makeArtifact('My own workspace'));
+      if (!custom.ok) throw new Error(custom.error);
+      const metaPath = path.join(APPS_ROOT(), custom.id, '__orkas-meta.json');
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      fs.writeFileSync(metaPath, JSON.stringify({ ...meta, titleKey: 'apps.builtin_content_title' }));
+      expect(await savedApps.openForEditing(UID, custom.id)).toMatchObject({
+        ok: true, title: 'My own workspace', conversation: { title: customConversationTitle },
+      });
+    } finally { i18n.setCurrentLang(previousLang); }
+  });
+
+
   it.each(['source', 'bundle'] as const)('rejects an unreadable nested %s inventory and retries with all source files', async stage => {
     const { savedApps } = await mods();
     const script = 'window.preservedNestedSource = 42;';

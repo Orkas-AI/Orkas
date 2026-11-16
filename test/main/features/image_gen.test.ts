@@ -1348,3 +1348,218 @@ describe('image call isolation', () => {
     expect(fs.readFileSync(path.join(tmpDir, 'second.png'))).toEqual(Buffer.from(PNG_B64, 'base64'));
   });
 });
+
+describe('public image dispatch route and rejection recovery', () => {
+  const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+it('waits out a rejected image limit on the chosen service and writes the successful bytes', async () => {
+    writeProfilesFile({}, [], [{ id: 'own', provider: 'doubao', model: 'doubao-seedream-5-0-flash-260915', apiKey: 'fixture', createdAt: 1 }]);
+    const m = await import('../../../src/main/features/image_gen');
+    const fetch = vi.fn().mockResolvedValueOnce(new Response('{"error":{"code":"RateLimitExceeded.IPM"}}', { status: 429 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ b64_json: PNG_B64 }] })));
+    vi.stubGlobal('fetch', fetch);
+    const outputAbsPath = path.join(tmpDir, 'limited.png');
+    const pending = m.generateImage({ prompt: 'One image', outputAbsPath });
+    expect(await pending).toMatchObject({ ok: true, path: outputAbsPath });
+    expect(fs.readFileSync(outputAbsPath)).toEqual(Buffer.from(PNG_B64, 'base64'));
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch.mock.calls[0][0]).toBe(fetch.mock.calls[1][0]);
+    expect(fetch.mock.calls[0][1].body).toBe(fetch.mock.calls[1][1].body);
+  });
+it('uses only the task-selected image service, preserves settings order and never falls back after refusal',async()=>{
+    const profiles=[{id:'first',provider:'openai',model:'gpt-image-2',apiKey:'fixture-first',label:'First',createdAt:1},{id:'chosen',provider:'openai',model:'gpt-image-2.5-flare',apiKey:'fixture-chosen',label:'Chosen',createdAt:2}];writeProfilesFile({},[],profiles);
+    const fetch=vi.fn(async()=>new Response(JSON.stringify({error:{message:'Controlled refusal'}}),{status:400}));vi.stubGlobal('fetch',fetch);
+    const m=await import('../../../src/main/features/image_gen'),auth=await import('../../../src/main/features/auth');
+    const result=await m.generateImage({prompt:'A product picture',outputAbsPath:path.join(tmpDir,'chosen.png'),profileId:'chosen'});
+    expect(result.ok).toBe(false);expect(fetch).toHaveBeenCalledOnce();const init=fetch.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(String(init.body)).model).toBe('gpt-image-2.5-flare');expect(init.headers).toMatchObject({Authorization:'Bearer fixture-chosen'});expect(auth.loadImageProfiles().map(p=>p.id)).toEqual(['first','chosen']);expect(fs.existsSync(path.join(tmpDir,'chosen.png'))).toBe(false);
+    fetch.mockClear();expect(await m.generateImage({prompt:'A product picture',outputAbsPath:path.join(tmpDir,'gone.png'),profileId:'removed'})).toMatchObject({ok:false,errorCode:'NO_CAPABLE_MODEL',dispatched:false});expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('image_gen › a size for a shape', () => {
+  const FLASH = 'doubao-seedream-5-0-flash-260915';
+  const PRO = 'doubao-seedream-5-0-pro-260628';
+  const LITE = 'doubao-seedream-5-0-lite-260128';
+  const shapes: Array<[number, number]> = [[1080, 1920], [1920, 1080], [1080, 1080], [1080, 1440], [1080, 1350], [2560, 1080]];
+
+  it('keeps supported 2K shapes for configured Seedream and public API services', async () => {
+    const { imageSizeForAspect, normaliseSeedreamSize } = await import('../../../src/main/features/image_size');
+    // Ark's recommended 2K sizes for the common shapes.
+    expect(imageSizeForAspect({ api: 'doubao', model: FLASH }, 1080 / 1920)).toBe('1440x2560');
+    expect(imageSizeForAspect({ api: 'doubao', model: FLASH }, 1920 / 1080)).toBe('2560x1440');
+    expect(imageSizeForAspect({ api: 'doubao', model: FLASH }, 1)).toBe('2048x2048');
+    expect(imageSizeForAspect({ api: 'orkas', model: 'orkas-image' }, 1080 / 1920)).toBe('1440x2560');
+    for (const [width, height] of shapes) {
+      for (const model of [FLASH, PRO, LITE]) {
+        const size = imageSizeForAspect({ api: 'doubao', model }, width / height)!;
+        expect(normaliseSeedreamSize(size, model)).toBe(size);
+        const [w, h] = size.split('x').map(Number);
+        // Upright stays upright and wide stays wide.
+        expect(Math.sign(w - h)).toBe(Math.sign(width - height));
+      }
+      const publicSize = imageSizeForAspect({ api: 'orkas', model: 'orkas-image' }, width / height)!;
+      expect(normaliseSeedreamSize(publicSize, FLASH)).toBe(publicSize);
+      const [w, h] = publicSize.split('x').map(Number);
+      expect(w * h).toBeLessThanOrEqual(4_624_220);
+      expect(Math.sign(w - h)).toBe(Math.sign(width - height));
+    }
+  });
+
+  it('asks Gemini for an exact size from its own table, at that shape', async () => {
+    const { imageSizeForAspect, normaliseGeminiImageSize } = await import('../../../src/main/features/image_size');
+    for (const model of ['gemini-nano-banana-2.1', 'gemini-3.1-flash-image', 'gemini-3-pro-image']) {
+      expect(normaliseGeminiImageSize(imageSizeForAspect({ api: 'gemini', model }, 1080 / 1920)!, model)).toEqual({ aspectRatio: '9:16', imageSize: '2K' });
+      expect(normaliseGeminiImageSize(imageSizeForAspect({ api: 'gemini', model }, 1920 / 1080)!, model)).toEqual({ aspectRatio: '16:9', imageSize: '2K' });
+    }
+    // The older model makes one size per shape.
+    expect(normaliseGeminiImageSize(imageSizeForAspect({ api: 'gemini', model: 'gemini-2.5-flash-image' }, 1080 / 1920)!, 'gemini-2.5-flash-image'))
+      .toEqual({ aspectRatio: '9:16' });
+  });
+
+  it('leaves a service that takes no shape, or a model it does not know, at its own default', async () => {
+    const { imageSizeForAspect } = await import('../../../src/main/features/image_size');
+    expect(imageSizeForAspect({ api: 'openai', model: 'gpt-image-2' }, 1080 / 1920)).toBeUndefined();
+    expect(imageSizeForAspect({ api: 'gemini', model: 'gemini-unknown-image' }, 1080 / 1920)).toBeUndefined();
+    expect(imageSizeForAspect({ api: 'doubao', model: FLASH }, Number.NaN)).toBeUndefined();
+    expect(imageSizeForAspect({ api: 'doubao', model: FLASH }, 0)).toBeUndefined();
+  });
+});
+
+
+describe('public image query timeout ownership', () => {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+  const input = () => ({ apiKey: 'fixture-key', model: 'orkas-image', prompt: 'a circle', size: '2k' });
+
+  it.each(['request', 'response body'] as const)('retains the accepted job after a timed out %s and only repeats its status GET', async phase => {
+    const m = await import('../../../src/main/features/image_gen');
+    const calls: Array<{ url: string; method: string }> = [];
+    let polls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, method: init?.method || 'GET' });
+      if (init?.method === 'POST') return Response.json({ id: 'accepted-job', status: 'queued' }, { status: 202 });
+      if (++polls > 1) return Response.json({ status: 'succeeded', data: [{ b64_json: png.toString('base64') }] });
+      const signal = init!.signal!;
+      if (phase === 'request') return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+      return new Response(new ReadableStream({ start(controller) {
+        signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+      } }), { headers: { 'content-type': 'application/json' } });
+    }));
+    vi.useFakeTimers();
+    try {
+      const pending = m.callOrkasImage(input()).then(value => ({ value }), error => ({ error }));
+      await vi.advanceTimersByTimeAsync(26_001);
+      expect(await pending).toMatchObject({ value: { buffer: png, width: 1, height: 1 } });
+      expect(calls).toEqual([
+        { url: 'https://orkas.ai/v1/images/generations', method: 'POST' },
+        { url: 'https://orkas.ai/v1/images/generations/accepted-job', method: 'GET' },
+        { url: 'https://orkas.ai/v1/images/generations/accepted-job', method: 'GET' },
+      ]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('stops repeated query timeouts at the existing overall deadline without replaying the generation', async () => {
+    const m = await import('../../../src/main/features/image_gen');
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      calls.push(init?.method || 'GET');
+      if (init?.method === 'POST') return Response.json({ id: 'accepted-job', status: 'queued' }, { status: 202 });
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init!.signal!;
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    }));
+    vi.useFakeTimers();
+    try {
+      const pending = m.callOrkasImage(input()).then(() => 'unexpected success', error => error.message);
+      await vi.advanceTimersByTimeAsync(15 * 60_000 + 1);
+      expect(await pending).toMatch(/aborted|timed out/i);
+      expect(calls.filter(method => method === 'POST')).toHaveLength(1);
+      expect(calls.filter(method => method === 'GET').length).toBeGreaterThan(1);
+      expect(calls.length).toBeLessThanOrEqual(41);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('honors cancellation after a timed out query without starting another status request', async () => {
+    const m = await import('../../../src/main/features/image_gen');
+    const caller = new AbortController();
+    const calls = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return Response.json({ id: 'accepted-job', status: 'queued' }, { status: 202 });
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init!.signal!;
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    });
+    vi.stubGlobal('fetch', calls);
+    vi.useFakeTimers();
+    try {
+      const pending = m.callOrkasImage({ ...input(), signal: caller.signal }).then(() => 'unexpected success', error => error.message);
+      await vi.advanceTimersByTimeAsync(23_001);
+      caller.abort();
+      expect(await pending).toMatch(/aborted/i);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(calls).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('retains an authoritative failed status even when its error text says timeout', async () => {
+    const m = await import('../../../src/main/features/image_gen');
+    const calls = vi.fn(async (_url: string, init?: RequestInit) => init?.method === 'POST'
+      ? Response.json({ id: 'accepted-job', status: 'queued' }, { status: 202 })
+      : Response.json({ error: { message: 'The private record is named timeout' } }, { status: 403 }));
+    vi.stubGlobal('fetch', calls);
+    vi.useFakeTimers();
+    try {
+      const pending = m.callOrkasImage(input()).then(() => 'unexpected success', error => error.message);
+      await vi.advanceTimersByTimeAsync(3_001);
+      expect(await pending).toContain('403');
+      expect(calls).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+
+describe('public completed-image delivery ownership', () => {
+  it.each([false, true])('retries only the output GET and preserves the accepted generation (exhausted=%s)', async exhausted => {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+    writeProfilesFile({}, [], [
+      { id: 'public', provider: 'orkas-api', model: 'orkas-image', apiKey: 'fixture-key', createdAt: 1 },
+      { id: 'fallback', provider: 'openai', model: 'gpt-image-2', apiKey: 'fixture-key', createdAt: 2 },
+    ]);
+    const m = await import('../../../src/main/features/image_gen');
+    const calls: string[] = [];
+    let downloads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      calls.push(url);
+      if (url === 'https://orkas.ai/v1/images/generations') return Response.json({
+        id: 'completed-job', status: 'succeeded', data: [{ url: 'https://cdn.test/completed-image.png' }],
+      });
+      expect(url).toBe('https://cdn.test/completed-image.png');
+      if (++downloads === 1 || exhausted) throw new TypeError('fixture connection reset');
+      return new Response(png);
+    }));
+    const output = path.join(tmpDir, 'completed-image.png');
+    vi.useFakeTimers();
+    try {
+      const pending = m.generateImage({ prompt: 'a circle', outputAbsPath: output })
+        .then(value => ({ value }), error => ({ error }));
+      await vi.advanceTimersByTimeAsync(2_100);
+      const result = await pending;
+      if (exhausted) {
+        expect(result).toMatchObject({ error: { name: 'ImageGenerationDeliveryError' } });
+        expect(fs.existsSync(output)).toBe(false);
+      } else {
+        expect(result).toMatchObject({ value: { ok: true, path: output } });
+        expect(fs.readFileSync(output)).toEqual(png);
+      }
+      expect(calls).toEqual(['https://orkas.ai/v1/images/generations',
+        ...Array.from({ length: exhausted ? 3 : 2 }, () => 'https://cdn.test/completed-image.png')]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+});

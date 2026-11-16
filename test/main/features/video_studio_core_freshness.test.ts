@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 // build script would silently ship stale behavior — this test is the guard:
 // rebuild every core with the repo's own esbuild and byte-compare against the
 // committed bundle. Deterministic because esbuild is version-locked and the
-// build disables sourcemaps/legal comments.
+// build disables sourcemaps and retains upstream license notices.
 const requireCjs = createRequire(import.meta.url);
 const { outputs, buildTo, pcDir } = requireCjs('../../../scripts/build-video-studio-skill-core.cjs') as {
   outputs: Array<{ entry: string; outfile: string }>;
@@ -33,7 +33,7 @@ describe('video-studio bundled skill cores', () => {
       }
       expect(
         stale,
-        `stale bundled cores (source changed without rebuild): ${stale.join(', ')} — run: node PC/scripts/build-video-studio-skill-core.cjs and commit the updated bundles`,
+        `stale bundled cores (source changed without rebuild): ${stale.join(', ')} — run: node scripts/build-video-studio-skill-core.cjs and commit the updated bundles`,
       ).toEqual([]);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });

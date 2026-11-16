@@ -6,7 +6,11 @@ import {
   AGENT_GUIDANCE_ITEM_LIMIT,
   normalizeAgent,
 } from '../../../src/main/features/agents';
-import { _buildAgentRuntimeGuidanceForTest } from '../../../src/main/features/group_chat/bus';
+import {
+  _buildAgentInGroupSystemPromptForTest,
+  _buildAgentRuntimeGuidanceForTest,
+} from '../../../src/main/features/group_chat/bus';
+import { BUILTIN_AGENT_TOOL_SURFACE_CASES } from '../model/core-agent/builtin-agent-tool-surface-fixture';
 
 /**
  * `knowhow` is display-only and `standards` is resident runtime guidance;
@@ -24,6 +28,7 @@ const AGENTS_ROOT = path.join(
 type GuidanceField = 'knowhow' | 'standards';
 
 interface AgentGuidanceReach {
+  id: string;
   name: string;
   authored: Record<GuidanceField, string[]>;
   normalized: Record<GuidanceField, string[]>;
@@ -50,6 +55,7 @@ function measure(dir: string): AgentGuidanceReach | null {
       .filter(Boolean),
   ])) as Record<GuidanceField, string[]>;
   return {
+    id: dir,
     name: raw.name || dir,
     authored,
     normalized: {
@@ -71,7 +77,9 @@ describe('built-in Agent runtime guidance contract', () => {
   const rows = measureAll();
 
   it('finds the complete built-in Agent corpus', () => {
-    expect(rows).toHaveLength(16);
+    expect(rows.map(row => row.name).sort()).toEqual(
+      BUILTIN_AGENT_TOOL_SURFACE_CASES.map(agent => agent.name).sort(),
+    );
   });
 
   it('keeps knowhow and standards at five items or fewer', () => {
@@ -102,6 +110,19 @@ describe('built-in Agent runtime guidance contract', () => {
         .map((item) => `${row.name}.${field}=${item.length}`)
     )));
     expect(long, 'shorten the line instead of relying on runtime truncation').toEqual([]);
+  });
+
+  it.each(rows)('carries $name delivery criteria once into the real prompt while keeping capability display out', async ({ id, name }) => {
+    const raw = JSON.parse(fs.readFileSync(path.join(AGENTS_ROOT, id, 'agent.json'), 'utf8'));
+    const agent = normalizeAgent(raw, 'builtin');
+    expect(agent?.name).toBe(name);
+    for (const language of ['en', 'zh'] as const) {
+      const prompt = await _buildAgentInGroupSystemPromptForTest(agent!, '/tmp/studio-guidance', language);
+      expect(prompt.match(/^### Delivery standards$/gm)).toHaveLength(1);
+      for (const standard of raw.standards) expect(prompt.split(standard), `${name}/${language}`).toHaveLength(2);
+      for (const capability of raw.knowhow || []) expect(prompt, `${name}/${language}`).not.toContain(capability);
+      expect(prompt).not.toMatch(/\$(?:workflow|agent_runtime_guidance|input_channel_protocol)/);
+    }
   });
 
   it('reports the profile item count for each Agent', () => {

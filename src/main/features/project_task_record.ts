@@ -5,6 +5,14 @@ import { taskContent } from '../util/project-task-content';
 import type { ProjectTask, TaskStatus } from './project_tasks';
 
 export const TASK_STATUSES: readonly TaskStatus[] = ['todo', 'progress', 'review', 'done'];
+/** Cleanup deletes the version the user reviewed, never a later edit. */
+export type TaskDeleteExpectation = Pick<ProjectTask, 'content' | 'status' | 'created_at' | 'updated_at'>;
+export function matchesTaskDeleteExpectation(task: ProjectTask | null | undefined, expected: TaskDeleteExpectation): boolean {
+  return !!task && !!expected && typeof expected.content === 'string' && TASK_STATUSES.includes(expected.status)
+    && typeof expected.created_at === 'string' && typeof expected.updated_at === 'string'
+    && task.content === expected.content && task.status === expected.status
+    && task.created_at === expected.created_at && task.updated_at === expected.updated_at;
+}
 const TASK_ID_RE = /^t_[a-f0-9]{12}$/;
 
 /** Reorder only validated members; an order hint cannot add or remove a file. */

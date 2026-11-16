@@ -1,3 +1,4 @@
+import { appConversationOwner } from '../paths';
 import type { Tray } from 'electron';
 import { subscribeTaskTerminals, type TaskTerminalEvent } from './group_chat/bus';
 
@@ -44,7 +45,7 @@ function onTerminal(event: TaskTerminalEvent): void {
   if (!runtime || runtime.isMainWindowFocused()) return;
   if (!['completed', 'stopped', 'failed', 'waiting_input'].includes(event.status)) return;
   ensureOwner();
-  if (!ownerUserId || event.user_id !== ownerUserId || !event.conversation_id
+  if (appConversationOwner(event.conversation_id) || !ownerUserId || event.user_id !== ownerUserId || !event.conversation_id
       || unreadCids.has(event.conversation_id) || unreadCids.size >= MAX_UNREAD_CONVERSATIONS) return;
   unreadCids.add(event.conversation_id);
   render();

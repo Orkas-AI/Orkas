@@ -328,7 +328,7 @@ describe('MCP stdio diagnostic boundary', () => {
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it.each(['stdio', 'streamable-http'])('closes a %s channel that never completes initialization within 30s', (kind) => {
+  it.each(['stdio', 'streamable-http'])('closes a %s channel that never completes initialization within 30s', async (kind) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mcp-connect-'));
     const childPath = path.join(root, 'silent.cjs');
     const probePath = path.join(root, 'probe.cjs');
@@ -339,9 +339,7 @@ describe('MCP stdio diagnostic boundary', () => {
       `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/util/proxy-dispatcher.ts'))})] = { exports: { buildChildProxyEnvironment: async () => ({}) } };`,
       `const { McpConnection } = require(${JSON.stringify(path.resolve('src/main/features/connectors/mcp-client.ts'))});`,
       'const realSetTimeout = global.setTimeout; const deadlines = [];',
-      // Assert configured defaults independently of a one-millisecond setup
-      // tick. Timers and the native peer stay real; only connect's clock is
-      // pinned and it is restored before operations and cleanup.
+      // Pin only connect budget arithmetic; real timers, native peer and cleanup remain live.
       'const realNow = Date.now; const connectEpoch = realNow();',
       // Scale only the production 30s budget. An incorrect 180s/60s default fails the probe deadline.
       'global.setTimeout = (fn, ms, ...args) => { deadlines.push(ms); return realSetTimeout(fn, ms === 30000 ? 500 : ms, ...args); };',
@@ -352,6 +350,7 @@ describe('MCP stdio diagnostic boundary', () => {
       `    ? { kind: 'stdio', command: process.execPath, args: [${JSON.stringify(childPath)}], env: { ELECTRON_RUN_AS_NODE: '1' } }`,
       "    : { kind: 'streamable-http', url: 'http://127.0.0.1:' + server.address().port + '/mcp' };",
       "  const connection = new McpConnection('fixture', transport);",
+      '  process.send({ ready: true }); process.disconnect();',
       '  try {',
       '    Date.now = () => connectEpoch;',
       '    await connection.connect();',
@@ -364,10 +363,32 @@ describe('MCP stdio diagnostic boundary', () => {
     try {
       const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', ORKAS_WORKSPACE_ROOT: root };
       for (const key of ['ORKAS_MCP_CONNECT_TIMEOUT_MS', 'ORKAS_MCP_STDIO_CONNECT_TIMEOUT_MS', 'ORKAS_MCP_HTTP_CONNECT_TIMEOUT_MS']) delete env[key];
-      const result = spawnSync(process.execPath, ['-r', require.resolve('tsx/cjs'), probePath], {
-        cwd: root, env, encoding: 'utf8', timeout: 8000, maxBuffer: 1024 * 1024,
+      const result = await new Promise<{ status: number | null; stdout: string; stderr: string; timedOut?: string }>((resolve, reject) => {
+        const child = spawn(process.execPath, ['-r', require.resolve('tsx/cjs'), probePath], {
+          cwd: root, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+        });
+        let stdout = '', stderr = '', timedOut: string | undefined;
+        // Import/transform cost is not connection time. Keep the original
+        // operation/cleanup deadline, measured from an explicit ready signal.
+        let timer = setTimeout(() => { timedOut = 'bootstrap'; child.kill(); }, 20000);
+        child.on('message', message => {
+          if ((message as { ready?: boolean })?.ready !== true) return;
+          clearTimeout(timer);
+          timer = setTimeout(() => { timedOut = 'connect-close'; child.kill(); }, 8000);
+        });
+        child.stdout.on('data', chunk => {
+          if (stdout.length + chunk.length > 1024 * 1024) { timedOut = 'stdout-limit'; child.kill(); }
+          else stdout += chunk;
+        });
+        child.stderr.on('data', chunk => {
+          if (stderr.length + chunk.length > 1024 * 1024) { timedOut = 'stderr-limit'; child.kill(); }
+          else stderr += chunk;
+        });
+        child.once('error', error => { clearTimeout(timer); reject(error); });
+        child.once('close', status => { clearTimeout(timer); resolve({ status, stdout, stderr, timedOut }); });
       });
-      expect(result.status).toBe(0);
+      expect(result.timedOut).toBeUndefined();
+      expect(result.status, result.stderr || result.stdout).toBe(0);
       expect(result.stderr).toBe('');
       const outcome = JSON.parse(result.stdout);
       expect(outcome.connected).toBe(false);
@@ -377,7 +398,12 @@ describe('MCP stdio diagnostic boundary', () => {
         expect(fs.existsSync(pidPath)).toBe(true);
         expect(() => process.kill(Number(fs.readFileSync(pidPath, 'utf8')), 0)).toThrow();
       }
-    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    } finally {
+      if (fs.existsSync(pidPath)) {
+        try { process.kill(Number(fs.readFileSync(pidPath, 'utf8')), 'SIGKILL'); } catch { /* Already closed. */ }
+      }
+      await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
   });
 
   it.each(['quiet', 'progress', 'endless', 'late-progress'])('bounds a %s operation and never replays it after timeout', (mode) => {

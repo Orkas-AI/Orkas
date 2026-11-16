@@ -19,9 +19,9 @@ fixture does not establish model output quality or live third-party availability
    Create, save, update, edit, open, preview and local execution remain available
    without a commercial-version dialog. Legacy metadata preserves its capability
    identity; a web app still cannot invoke host-only SDK methods.
-2. Publish remains in every app menu. Invoking it opens the standard localized
+2. Publish remains in every custom app menu and as a direct card action. Built-in cards retain their edit-copy menu. Invoking it opens the standard localized
    Cancel / Download commercial version dialog. Cancellation preserves the app,
-   draft and invoking focus. Check English and Chinese at normal and narrow sizes.
+   draft and invoking focus. Check English, Chinese and Arabic at normal and narrow sizes. Refresh preserves the focused direct action; cancelling guidance restores that same action.
 3. Only an explicit Download action opens the official download page with the
    current supported Web language. An opener failure presents localized recovery
    and preserves the app. Page load, creation and ordinary app errors never open
@@ -41,7 +41,9 @@ fixture does not establish model output quality or live third-party availability
   Cancel/backdrop/Escape retain a session draft; a reset clears it.
 - The list uses local metadata, preserves cards after a failed/malformed refresh,
   rejects a late stale listing after deletion, and confirms a genuine empty list.
-  Counts, one creation entry, menus and long titles remain stable at narrow widths.
+  Counts include installed built-in apps and custom apps. Deleting the final custom
+  app removes only its section; installed built-ins remain. One creation entry,
+  menus and long titles remain stable at narrow widths.
 - Save an artifact and a complete file bundle, including a non-index entry,
   CSS/module/JSON/font/audio assets, binary content and ordinary long paths.
   Reject traversal, hidden/managed paths, symlinks, invalid encoding and oversized
@@ -56,7 +58,12 @@ fixture does not establish model output quality or live third-party availability
 - Open a card of any retained app type with mouse, Enter and Space. One action opens one preview;
   rename preserves identity and icon. Refresh/restart retain the saved result.
 - Editing creates a source-attached task with the exact original identity and
-  capability identity. Updating retains its ID and compatible records. Saving a new
+  capability identity. The composer starts empty with the localized edit hint.
+  The selected source attachment supplies the existing framing only through
+  invisible `model_text`; the visible and persisted authored requirement stays
+  unchanged. Reload retains the source and draft; later turns use the normal or
+  busy hint. Preparation shows immediate feedback, prevents duplicate requests
+  and restores retry after failure. Updating retains its ID and compatible records. Saving a new
   app binds this source to an independent copy; a deleted destination creates a
   new ID. Repeated or interrupted commits do not lose the original or duplicate data.
 - Exercise each save-journal crash point and cleanup failure. Recovery retains a
@@ -124,3 +131,107 @@ Owning evidence: `chat-artifact-revisions.test.ts`, `saved_apps.test.ts`,
 `web_apps.test.ts`, `preview-windows.test.ts`, `app-save-recovery.test.ts`,
 `artifact-revisions.test.ts`, `artifact_revisions_e2e_lifecycle.spec.ts`,
 `saved_apps_e2e_lifecycle.spec.ts` and `web_app_sdk_e2e_lifecycle.spec.ts`.
+
+
+## Built-in Content and Commerce journeys
+
+Content and composed Commerce share creation, parameters, draft/reopen, task
+history, result actions and the material library. Changes to those shared flows
+must assess both actual packaged workspaces. App data stays isolated. Content
+retains Images, Video and Audio; Commerce adds Copy before Images and Video.
+Both packaged apps are mandatory resources. Engineering cases stay outside
+release bundles.
+
+- Exercise sticky tabs, inline History, Show more/reopen, per-record deletion,
+  cancellation and failed-delete retry. Preserve independent authored drafts,
+  immutable selected source/settings identities, bounded file snapshots, exact
+  authored requests, durable records and explicit result acceptance.
+- Use real SDK/native admission with controlled models and services. Cover lost
+  admission replies, unavailable initial storage, failed saves, missing Studio,
+  explicit Stop, questions and approvals, delayed or failed output retrieval
+  across work switches. Retain one admission, original-work ownership, no
+  invented media success and no redispatch during storage recovery.
+- Cover selected file attachments, PDF/PSD, image/video/audio/subtitle retrieval,
+  binary export, text-reply saving and result reuse without replacing the draft.
+  Reset includes settings-only changes, references and resized inputs, durable
+  reopen and failed-save recovery. It does not archive seeded old drafts or stop
+  already admitted tasks.
+- Verify all registered locales, narrow English, Chinese and Arabic RTL,
+  compact controls, numeric-input recovery and readable first-viewport entries.
+  SDK failure and damaged app data preserve prior state; repair/reopen works.
+  Controlled outputs establish these journeys, not live media quality or
+  Windows-native rendering.
+- Ordinary history access cannot expose app-private sessions. Archived results
+  remain readable after context removal; a foreign host cannot settle an
+  unarchived run. Retained turns, exact required-input continuation, native
+  approval ownership, cleanup retry and uncertain/cancelled states remain
+  covered by the app-session, task, private IPC and native owners.
+- Commerce Copy retains authored input, applicable output parameters, private
+  references and independent persisted drafts. Generate/read/reopen text,
+  preview saved files, preserve separate image drafts, retry an explicit failed
+  save and recover uncertain admission without dispatching twice. Controlled
+  successful image fixtures contain actual bytes in the selected shape.
+- Existing product facts, explicit references, filtered history and media
+  adoption remain available without a product manager. Seed old files through
+  the fixture, reopen and verify original facts/bytes. Failed adoption preserves
+  selection and old media; retry adds one result without duplication or changes
+  to copy/publication data. New accounts expose no product controls. Existing
+  product records are neither deleted nor migrated.
+- Stores distinguishes empty, failed and disconnected connector discovery.
+  Connect store opens Connectors; Back reuses the live app window and refreshes
+  discovery while retaining the draft. Cover legacy SDK recovery, failure/retry,
+  in-flight return, bounded entry caching, manual refresh, reopen and identity
+  changes. Old desktop hosts explain restart/main-window recovery. These reads
+  never imply remote publication.
+- Per-tab media choices remain independent across reopen. Text-only work omits
+  media. The first configured service is selected initially and after reset;
+  an explicit choice survives Settings reordering. Discovery changes never
+  save/promote a service profile. Remove a configuration and verify recovery;
+  retain failed replies. Service identities remain secret-free, disabled or
+  deleted choices cannot run, and quotation/dispatch use the same choice.
+
+Owning entries include `content-workbench.test.ts`, the media/recovery renderer
+owners, `commerce-copy.test.ts`, `product-listing.test.ts`, `builtin-apps.test.ts`,
+`web-app-tasks.test.ts`, `app-agent-sessions.test.ts`, `web-app-host.test.ts`,
+`content_workbench_e2e_lifecycle.spec.ts`,
+`content_workbench_e2e_recovery.spec.ts`,
+`content_workbench_e2e_media.spec.ts` and `app_output_e2e_commerce.spec.ts`.
+Listing a scenario is not a claim that it ran. Use the affected-case selector;
+`test:apps:e2e` remains the public native application entry.
+
+## Additional local compatibility and failure matrix
+
+- Paint eleven untyped legacy local copies plus the installed built-ins without
+  changing their metadata or sources. Failed local reads retain exact card IDs;
+  a confirmed empty custom inventory removes its section. Local controls never
+  need publication discovery.
+- For an untyped original, displaying Update original app preserves its unknown
+  type and changes no metadata. Explicit saving resolves its capability at the
+  write boundary, updates the same ID and retains compatible records. Exercise
+  both artifact and detached file previews.
+- Preserve non-index nested entries, known binary digests, zero/false/null,
+  Unicode and boundary timestamps. Isolate two app IDs and local users. Cancel
+  a request before invocation, replay its completed ID, use malformed credentials
+  or reuse the ID in a sibling app; each rejection invokes no adapter and leaks
+  no token. A fresh authorized request still works.
+- Inject association-write failure while saving a copy; the prior binding and
+  app remain intact. Duplicate automatic requests share one destination.
+  Changing the source after inspection or stopping its task rejects a guarded
+  update without producing a replacement. Correcting an artifact refreshes one
+  card and retains its data; independent creations remain independent.
+- Check every save-journal crash point, code/schema consistency, failed cleanup,
+  export record values, stale clear consent and account change. A restart chooses
+  a consistent version and never clears newer records or automatically replays
+  external work. Windows process/lock behavior remains a native-host canary.
+- IME Escape cannot submit/cancel a creation dialog. Local and built-in long
+  titles leave upper-right menus reachable, contain overflow, preserve focus
+  through refresh and restore invoking focus after cancellation.
+- Automatic conversation-card load failures stay inline with Reload, without
+  stacked modal dialogs. Retry only that card and preserve siblings; explicit
+  standalone-preview errors retain their feedback.
+
+Record actual versions, selected cases, fault ordering, final rendered results,
+record/digest comparisons and cleanup. Review attributed logs separately from
+injected failures. A toast or successful API result alone never completes a
+manual row. Live models, media services and paid settlement require their own
+explicit execution authority and remain separate from deterministic evidence.

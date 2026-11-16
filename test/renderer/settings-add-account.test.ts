@@ -116,6 +116,7 @@ function loadSettingsClickHarness(
     'settings-image-add-btn',
     'settings-image-status',
     'settings-image-entries',
+    'settings-video-key-row', 'settings-video-key-label', 'settings-video-workspace-row', 'settings-video-workspace-input', 'settings-video-region-row', 'settings-video-region',
     'settings-video-provider',
     'settings-video-key-input',
     'settings-video-add-btn',
@@ -168,7 +169,6 @@ function loadSettingsClickHarness(
     selects.set(element, api);
     return api;
   };
-  const monitor = { event: vi.fn(), error: vi.fn(), click: vi.fn() };
 
   const context: any = {
     console,
@@ -189,10 +189,8 @@ function loadSettingsClickHarness(
     },
     window: {
       addEventListener: vi.fn(),
-      Monitor: monitor,
       orkas: { invoke },
     },
-    Monitor: monitor,
     setTimeout,
     clearTimeout,
     setInterval,
@@ -211,7 +209,7 @@ function loadSettingsClickHarness(
     }];
     _settingsState.modelsCache = {};
   `, context);
-  return { context, elements, indexHtml, settingsSource: source, invoke, monitor, selects };
+  return { context, elements, indexHtml, settingsSource: source, invoke, selects };
 }
 
 it.each(['anthropic', 'responses'])('submits the %s protocol picker selection without losing a gateway prefix', async protocol => {
@@ -237,6 +235,47 @@ it.each(['anthropic', 'responses'])('submits the %s protocol picker selection wi
 });
 
 describe('settings model authorization add account', () => {
+it('shows the localized credential recovery message while retaining an invalid Cloud configuration for correction', async () => {
+    const { context, elements, invoke } = loadSettingsClickHarness();
+    context._settingsRenderVideoPicker();
+    vm.runInContext("_settingsState.videoProviderSel.setValue('google-cloud:veo-3.1-fast-generate-001')", context);
+    elements.get('settings-video-key-input')!.value = 'invalid-json';
+    invoke.mockResolvedValueOnce({ ok: false, error: 'English backend diagnostic', errorKey: 'settings.video.error_cloud_credentials' });
+    await context._settingsClickAddVideoKey();
+    expect(elements.get('settings-video-status')!.textContent).toBe('settings.video.error_cloud_credentials');
+    expect(elements.get('settings-video-key-input')!.value).toBe('invalid-json');
+  });
+it('adds a Wan tier with its chosen region and workspace and clears the submitted fields', async () => {
+    const { context, elements, invoke } = loadSettingsClickHarness();
+    context._settingsRenderVideoPicker();
+    const picker = vm.runInContext('_settingsState.videoProviderSel', context);
+    expect(picker.getOptions()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ value: 'doubao:doubao-seedance-2-5-flash', label: 'Doubao Seedance 2.5 Flash' }),
+      expect.objectContaining({ value: 'aliyun:wan3.0-video-prime' }),
+    ]));
+    picker.emitChange('aliyun:wan3.0-video-prime');
+    expect(elements.get('settings-video-workspace-row')!.hidden).toBe(false);
+    vm.runInContext("_settingsState.videoRegionSel.setValue('ap-southeast-1')", context);
+    elements.get('settings-video-key-input')!.value = 'synthetic-wan-key';
+    elements.get('settings-video-workspace-input')!.value = 'workspace123';
+    await context._settingsClickAddVideoKey();
+    expect(invoke).toHaveBeenCalledWith('videoAuth.add', {
+      provider: 'aliyun', model: 'wan3.0-video-prime', apiKey: 'synthetic-wan-key', label: 'default', workspaceId: 'workspace123', region: 'ap-southeast-1',
+    });
+    expect(elements.get('settings-video-key-input')!.value).toBe('');
+    expect(elements.get('settings-video-workspace-input')!.value).toBe('');
+  });
+it('labels Google Cloud JSON credentials separately and restores the API-key form on provider change', () => {
+    const { context, elements } = loadSettingsClickHarness();
+    context._settingsRenderVideoPicker();
+    const picker = vm.runInContext('_settingsState.videoProviderSel', context);
+    picker.emitChange('google-cloud:veo-3.1-fast-generate-001');
+    expect(elements.get('settings-video-key-label')!.textContent).toBe('settings.video.service_account');
+    expect(elements.get('settings-video-workspace-row')!.hidden).toBe(true);
+    picker.emitChange('google');
+    expect(elements.get('settings-video-key-label')!.textContent).toBe('settings.video.api_key');
+    expect(elements.get('settings-video-key-input')!.placeholder).toBe('');
+  });
   it.each(['doubao-seedance-2-0-fast-260128', 'doubao-seedance-2-0-mini'])('preserves a flattened video model choice through the real add button: %s', async (model) => {
     const option = { id: `doubao:${model}`, provider: 'doubao', model, label: `DouBao · ${model}` };
     const { context, elements, invoke } = loadSettingsClickHarness(async (channel) => (
@@ -733,7 +772,6 @@ describe('settings model authorization add account', () => {
         modelId: 'gpt-5.6-sol'
       };
       _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
-      _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
       _oauthFlowRender(
         { id: 'openai-codex' },
         { kind: 'done', profileId: 'openai-codex:new-account' },
@@ -770,7 +808,6 @@ describe('settings model authorization add account', () => {
         modelId: 'gpt-5.6-sol'
       };
       _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
-      _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
       _oauthFlowRender(
         { id: 'openai-codex' },
         { kind: 'done', profileId: 'openai-codex:new-account' },
@@ -797,7 +834,6 @@ describe('settings model authorization add account', () => {
         oauthProviderId: 'openai-codex',
         modelId: 'gpt-5.6-sol'
       };
-      _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
       _oauthFlowOwner = { closeFlow: __closeFlow, settling: false };
       _oauthFlowRender(
         { id: 'openai-codex' },
@@ -840,7 +876,7 @@ describe('credential form repeated keyboard submission', () => {
     let reject!: (error: Error) => void;
     const gate = new Promise<Record<string, unknown>>((resolve, fail) => { release = resolve; reject = fail; });
     let attempts = 0;
-    const { context, elements, invoke, monitor } = loadSettingsClickHarness(async current => {
+    const { context, elements, invoke } = loadSettingsClickHarness(async current => {
       if (current !== channel) return { ok: true };
       attempts += 1;
       return attempts === 1 ? gate : { ok: true };
@@ -910,7 +946,7 @@ describe('credential dialog response ownership', () => {
     let release!: (result: Record<string, unknown>) => void;
     const gate = new Promise<Record<string, unknown>>(resolve => { release = resolve; });
     const channel = method === 'custom' ? 'auth.addCustomModelEntry' : 'auth.addApiKeyEntry';
-    const { context, elements, invoke, monitor } = loadSettingsClickHarness(async current => current === channel ? gate : { ok: true });
+    const { context, elements, invoke } = loadSettingsClickHarness(async current => current === channel ? gate : { ok: true });
     vm.runInContext('_settingsReload = async () => {};', context);
     openCredential(context, elements, method);
     const actions = elements.get('add-account-actions')!;
@@ -975,7 +1011,7 @@ describe('OAuth dialog asynchronous ownership', () => {
     let release!: (result: Record<string, unknown>) => void;
     const gate = new Promise<Record<string, unknown>>(resolve => { release = resolve; });
     let starts = 0;
-    const { context, elements, invoke, monitor } = loadSettingsClickHarness(async channel => {
+    const { context, elements, invoke } = loadSettingsClickHarness(async channel => {
       if (channel === 'auth.startOAuth') return { ok: true, flowId: ++starts === 1 ? 'old-flow' : 'new-flow' };
       if (channel === 'auth.pollOAuthFlow') return gate;
       return { ok: true };
@@ -1005,7 +1041,7 @@ describe('OAuth dialog asynchronous ownership', () => {
     let releaseWrite!: (value: Record<string, unknown>) => void;
     const poll = new Promise<Record<string, unknown>>(resolve => { releasePoll = resolve; });
     const write = new Promise<Record<string, unknown>>(resolve => { releaseWrite = resolve; });
-    const { context, elements, invoke, monitor } = loadSettingsClickHarness(async channel => {
+    const { context, elements, invoke } = loadSettingsClickHarness(async channel => {
       if (channel === 'auth.startOAuth') return { ok: true, flowId: 'single-flow' };
       if (channel === 'auth.pollOAuthFlow') return poll;
       if (channel === 'auth.addEntry') return write;
@@ -1037,7 +1073,7 @@ describe('OAuth admitted write compatibility across dialog changes', () => {
     const gate = new Promise<Record<string, unknown>>(resolve => { release = resolve; });
     let entered = false;
     let starts = 0;
-    const { context, elements, invoke, monitor } = loadSettingsClickHarness(async channel => {
+    const { context, elements, invoke } = loadSettingsClickHarness(async channel => {
       if (channel === 'auth.startOAuth') return { ok: true, flowId: ++starts === 1 ? 'old-flow' : 'new-flow' };
       if (channel === 'auth.pollOAuthFlow') return { ok: true, status: { kind: 'done', profileId: 'backend:completed' } };
       if (channel === 'auth.listModels') {
@@ -1093,7 +1129,7 @@ it('does not undo the first completed OAuth entry when a duplicate completion wo
   const poll = new Promise<Record<string, unknown>>(resolve => { releasePoll = resolve; });
   const write = new Promise<Record<string, unknown>>(resolve => { releaseWrite = resolve; });
   let writes = 0;
-  const { context, elements, invoke, monitor } = loadSettingsClickHarness(async channel => {
+  const { context, elements, invoke } = loadSettingsClickHarness(async channel => {
     if (channel === 'auth.startOAuth') return { ok: true, flowId: 'single-flow' };
     if (channel === 'auth.pollOAuthFlow') return poll;
     if (channel === 'auth.addEntry') {
@@ -1143,4 +1179,62 @@ describe('legacy context capacity remediation', () => {
     const actions = row.children.find((child: FakeElement) => child.className === 'entry-actions');
     expect(actions?.children.some((child: FakeElement) => child.className === 'icon-btn danger')).toBe(true);
   });
+});
+
+describe('portable configured image and model remediation', () => {
+  it.each([
+    ['gpt-image-2', 'GPT Image 2'],
+    ['gpt-image-2.5-flare', 'GPT Image 2.5 Flare'],
+    ['gpt-image-2.5-sunburst', 'GPT Image 2.5 Sunburst'],
+  ])('adds and displays the selected OpenAI image model %s from the fallback picker', async (model, name) => {
+    let saved: Record<string, unknown> | undefined;
+    const { context, elements, invoke } = loadSettingsClickHarness(async (channel, payload) => {
+      if (channel === 'imageAuth.add') saved = payload;
+      if (channel === 'imageAuth.list') return {
+        ok: true,
+        profiles: saved ? [{
+          id: 'selected-image', provider: saved.provider, model: saved.model,
+          label: saved.label, apiKeyMasked: 'sk-***', createdAt: 1,
+        }] : [],
+      };
+      return { ok: true };
+    });
+    context._settingsRenderImagePicker();
+    const picker = vm.runInContext('_settingsState.imageProviderSel', context);
+    const option = picker.getOptions().find((item: { label: string }) => item.label === `OpenAI · ${name}`);
+    expect(option).toBeDefined();
+    picker.emitChange(option.value);
+    elements.get('settings-image-key-input')!.value = 'sk-selected';
+    await elements.get('settings-image-add-btn')!.click();
+
+    expect(invoke).toHaveBeenCalledWith('imageAuth.add', {
+      provider: 'openai', model, apiKey: 'sk-selected', label: 'default',
+    });
+    expect(elements.get('settings-image-key-input')!.value).toBe('');
+    const row = elements.get('settings-image-entries')!.children.at(-1)!;
+    const main = row.children.find((child) => child.className === 'entry-main')!;
+    expect(main.children[0].innerHTML).toContain(`OpenAI · ${name}`);
+    expect(main.children[0].innerHTML).not.toContain('sk-selected');
+  });
+it('shows the capacity recovery reason for a saved unavailable custom model', () => {
+  const { context, elements } = loadSettingsClickHarness();
+  context.capacityEntry = { entryId: 'legacy-small', provider: 'custom', model: 'fixture',
+    modelName: 'Fixture', providerLabel: 'Custom', profileId: 'custom:legacy', profileLabel: 'legacy',
+    profileType: 'api_key', profileAvailable: true, modelAvailable: true, modelEditable: false,
+    selectable: false, availability: 'context_too_small',
+    availabilityReason: 'Choose a model with at least 32000 tokens.' };
+  const container = new FakeElement(); elements.set('settings-entries', container);
+  context.availableEntry = { ...context.capacityEntry, entryId: 'usable',
+    availability: 'available', selectable: true, availabilityReason: undefined };
+  vm.runInContext('_settingsState.entries = [capacityEntry, availableEntry]; _settingsRenderEntries();', context);
+  expect(container.children.map(row => row.dataset.entryId)).toEqual(['usable', 'legacy-small']);
+  const row = container.children[1];
+  const texts: string[] = [];
+  const visit = (node: FakeElement) => { texts.push(node.textContent); node.children.forEach(visit); };
+  visit(row);
+  expect(row.draggable).toBe(false);
+  expect(texts).not.toContain('settings.entries.default_tag');
+  expect(texts).toContain('Choose a model with at least 32000 tokens.');
+});
+
 });

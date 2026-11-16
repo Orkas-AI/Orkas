@@ -54,7 +54,7 @@ export function loadAppsRenderer(options: { invoke: Invoke; lang?: 'zh' | 'en'; 
     orkas: { invoke, onPushEvent: () => () => {}, ...options.orkas },
   };
   const context: any = {
-    console, Date, Math, Set, Map, Intl, Promise, Object, Array, JSON, Number, String, Error, URL,
+    console, Date, Math, Set, Map, Intl, Promise, Object, Array, JSON, Number, String, Error, URL, currentUserId: 'account-a',
     __tables: locales, __lang: options.lang || 'zh',
     window, document, navigator: { language: options.lang || 'zh' },
     MutationObserver: class { observe() {} disconnect() {} },

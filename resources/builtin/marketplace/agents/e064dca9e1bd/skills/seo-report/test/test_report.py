@@ -5,6 +5,9 @@ import os
 import sys
 import tempfile
 import unittest
+import builtins
+import io
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
@@ -12,6 +15,7 @@ from report import build_action_plan, build_dashboard, merge_audits, validate_da
 from report import validate_data_tiers, _DATA_TIERS  # noqa: E402
 from report import _tone_for_percent, _health_tone, _data_of_optional  # noqa: E402
 from report import main as report_main  # noqa: E402
+import report as report_module  # noqa: E402
 
 AUDIT = {"ok": True, "data": {
     "health_score": 51,
@@ -143,6 +147,119 @@ class ActionPlanTest(unittest.TestCase):
         md = build_action_plan({"data": {"findings": [], "summary": {}, "meta": {"url": "u"},
                                          "health_score": 100}})
         self.assertIn("No technical issues found", md)
+
+
+class PageEvidenceTest(unittest.TestCase):
+    def render(self, pages):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_path = os.path.join(tmp, 'audit.json')
+            crawl_path = os.path.join(tmp, 'crawl.json')
+            for target, value in [(audit_path, AUDIT), (crawl_path, {'data': {'pages': pages}})]:
+                with open(target, 'w', encoding='utf-8') as handle:
+                    json.dump(value, handle)
+            return report_main(['--audit', audit_path, '--crawl', crawl_path])
+
+    def test_returns_page_meaning_for_different_sites_without_changing_existing_report(self):
+        for url, title, heading, paragraph in [
+            ('https://example.com/pricing', 'Plans', 'Choose your plan', 'Compare limits and billing terms.'),
+            ('https://other.example/compare/a', 'Comparison', 'Compare workflows', 'These capabilities differ by product.'),
+            ('https://third.example/use-cases/research', 'Research', 'Review your sources', 'Collect and verify research evidence.'),
+        ]:
+            with self.subTest(url=url):
+                page = {'url': url, 'title': title, 'h1s': [heading], 'canonical': url,
+                        'meta_description': 'Page description', 'first_paragraph': paragraph, 'source': 'file'}
+                result = self.render([page])
+                evidence = result['page_evidence']
+                for field, expected in page.items():
+                    self.assertEqual(evidence[field], expected)
+                self.assertEqual(evidence['truncated_fields'], [])
+                self.assertEqual(result['dashboard'], build_dashboard(AUDIT))
+                self.assertEqual(result['action_plan_md'], build_action_plan(AUDIT))
+                self.assertEqual(result['health_score'], 51)
+
+    def test_missing_evidence_stays_unknown_and_absent_pages_add_no_claim(self):
+        evidence = self.render([{'url': 'https://example.com/'}])['page_evidence']
+        for field in ['canonical', 'h1s', 'meta_description', 'first_paragraph', 'source']:
+            self.assertIsNone(evidence[field])
+        self.assertEqual(evidence['truncated_fields'], [])
+        for pages in [[], [None]]:
+            self.assertNotIn('page_evidence', self.render(pages))
+
+    def test_bounds_unicode_and_escaped_content_without_turning_partial_urls_into_targets(self):
+        long_text = '\"\\\n\x00中😀' * 2000
+        page = {'url': 'https://example.com/' + 'x' * 10000, 'canonical': 'https://example.com/' + 'y' * 10000,
+                'title': long_text, 'meta_description': long_text, 'first_paragraph': long_text,
+                'h1s': [long_text] * 100, 'source': 'file', 'truncated': True,
+                'text_sample': 'RAW_BODY_NOT_FOR_INLINE_EVIDENCE' * 20000}
+        evidence = self.render([page])['page_evidence']
+        self.assertLessEqual(len(json.dumps(evidence, ensure_ascii=False).encode('utf-8')), 8192)
+        self.assertEqual(len(evidence['h1s']), 4)
+        self.assertIsNone(evidence['url'])
+        self.assertIsNone(evidence['canonical'])
+        self.assertTrue(evidence['source_truncated'])
+        self.assertEqual(set(evidence['truncated_fields']),
+                         {'url', 'canonical', 'title', 'meta_description', 'first_paragraph', 'h1s'})
+        for field in ['title', 'meta_description', 'first_paragraph']:
+            self.assertTrue(long_text.startswith(evidence[field]))
+        self.assertNotIn('RAW_BODY_NOT_FOR_INLINE_EVIDENCE', json.dumps(evidence))
+
+    def test_reports_truncation_only_above_the_encoded_title_boundary(self):
+        for length in [253, 254, 255]:
+            with self.subTest(length=length):
+                evidence = self.render([{'title': 'a' * length}])['page_evidence']
+                self.assertEqual(evidence['title'], 'a' * min(length, 254))
+                self.assertEqual('title' in evidence['truncated_fields'], length > 254)
+
+    def test_largest_retained_urls_and_all_text_fields_share_the_page_bound(self):
+        url = 'https://example.com/' + 'a' * 2026
+        page = {key: 'a' * 10000 for key in ['title', 'meta_description', 'first_paragraph']}
+        page.update(url=url, canonical=url, h1s=['b' * 10000] * 4, source='file')
+        evidence = self.render([page])['page_evidence']
+        self.assertEqual(evidence['url'], url)
+        self.assertEqual(evidence['canonical'], url)
+        self.assertNotIn('url', evidence['truncated_fields'])
+        self.assertLessEqual(len(json.dumps(evidence, ensure_ascii=False).encode('utf-8')), 8192)
+
+    def test_malformed_optional_facts_are_not_coerced_into_evidence(self):
+        evidence = self.render([{'url': ['wrong-shape'], 'canonical': {}, 'h1s': 'not a list',
+                                 'meta_description': {'text': 'not extracted'}, 'title': '\ud800'}])['page_evidence']
+        for field in ['url', 'canonical', 'h1s', 'meta_description', 'title']:
+            self.assertIsNone(evidence[field])
+        self.assertIn('title', evidence['truncated_fields'])
+
+
+class InputHandleTest(unittest.TestCase):
+    def test_closes_real_files_after_valid_or_invalid_json(self):
+        real_open = builtins.open
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, body in [('valid.json', '{"ok":true}'), ('invalid.json', '{invalid')]:
+                filename = os.path.join(tmp, name)
+                with real_open(filename, 'w', encoding='utf-8') as handle:
+                    handle.write(body)
+                opened = []
+                def track(*args, **kwargs):
+                    handle = real_open(*args, **kwargs)
+                    opened.append(handle)
+                    return handle
+                try:
+                    with patch('builtins.open', side_effect=track):
+                        if name == 'valid.json':
+                            self.assertEqual(report_module._load(filename), {'ok': True})
+                        else:
+                            with self.assertRaises(json.JSONDecodeError):
+                                report_module._load(filename)
+                    self.assertTrue(opened)
+                    self.assertTrue(all(handle.closed for handle in opened))
+                finally:
+                    for handle in opened:
+                        handle.close()
+
+    def test_stdin_remains_owned_by_the_caller(self):
+        stream = io.StringIO('{"ok":true}')
+        with patch.object(sys, 'stdin', stream):
+            self.assertEqual(report_module._load('-'), {'ok': True})
+        self.assertFalse(stream.closed)
+        stream.close()
 
 
 class GeoMergeTest(unittest.TestCase):

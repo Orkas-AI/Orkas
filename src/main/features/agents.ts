@@ -1390,8 +1390,12 @@ export async function setAgentCliProjectDir(
 // snapshots that older tolerant reads could persist after a source failure.
 const AGENT_CATALOG_CACHE_VERSION = 4;
 const AGENT_ENRICHED_CACHE_TTL_MS = 2_000;
+// A scan that skipped an unreadable definition is reused only briefly, then
+// retried, so a repaired file reappears without a catalog-root change.
+const AGENT_PARTIAL_CATALOG_TTL_MS = 2_000;
 
-interface AgentListCache { stamp: string; data: Agent[] }
+// `expiresAt` is set only for partial scans; complete scans live until the stamp changes.
+interface AgentListCache { stamp: string; data: Agent[]; expiresAt?: number }
 interface AgentEnrichedCache { specs: Agent[]; uid: string; expiresAt: number; data: Agent[] }
 let _agentListCache: AgentListCache | null = null;
 let _agentEnrichedCache: AgentEnrichedCache | null = null;
@@ -1423,46 +1427,25 @@ function _writePersistedAgentCatalog(stamp: string, data: Agent[]): void {
   }
 }
 
-function _invalidateAgentListCache(opts: { markDirty?: boolean; userId?: string } = {}): void {
+function _invalidateAgentListCache(opts: { userId?: string } = {}): void {
   const userId = opts.userId || getActiveUserId();
   _agentListCacheGeneration += 1;
   _agentListCache = null;
   _agentEnrichedCache = null;
   try { fs.rmSync(_agentCatalogCacheFile(userId), { force: true }); } catch { /* cache is best-effort */ }
-  if (opts.markDirty === false) return;
-  // Notify the sync engine (lazy-require — stripped in the open-source build builds). Every cache-invalidate
-  // is also a disk-mutation point, so co-locating the dirty signal here covers all the
-  // existing call sites without sprinkling sync calls across the file. The relPath here is
-  // informational only — the engine ignores it and walks `cloud/` itself.
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('agents', 'cloud/agents');
-  } catch { /* features/sync stripped */ }
 }
 
-/** Public re-export of `_invalidateAgentListCache` for cross-module callers (sync engine).
- *  **Why exposed**: `listAgents` caches the disk spec list keyed on the two source dirs'
- *  `mtimeMs`. Local create/update/delete go through this module and call `_invalidateAgentListCache`
- *  inline. But the sync engine writes (and `unlink`s) files directly under `<uid>/cloud/agents/<aid>/`,
- *  which updates the AGENT dir's mtime but NOT the parent (`CUSTOM_AGENTS_DIR`). The parent's
- *  mtime stays unchanged, the cache stamp stays valid, and `listAgents` returns ghosts of the
- *  agents sync just deleted. The sync bridge calls this so the next `listAgents` re-scans. */
+/** Re-read definitions after an external writer changes Agent files. */
 export function invalidateAgentListCache(): void {
-  _invalidateAgentListCache({ markDirty: false });
+  _invalidateAgentListCache();
 }
 
-/** Drop only the in-memory list cache. Marketplace reconcile updates live under
- *  `<uid>/local/marketplace/agents`, not cloud-synced custom agents, so it must not mark the
- *  `agents` sync domain dirty just to make the next list call re-read disk. */
+/** Drop memory and disk catalog caches after marketplace reconciliation. */
 export function clearAgentListCache(): void {
-  _invalidateAgentListCache({ markDirty: false });
+  _invalidateAgentListCache();
 }
 
-/** Toggle the active user's enabled override for an agent. Wrapping the
- *  raw setter so the IPC handler stays one-line and the per-uid resolution
- *  happens here. The disk-spec cache doesn't need invalidating (enabled is
- *  overlaid outside it), but we no-op'd that explicitly to avoid surprise. */
+/** Persist the active user's enabled override; list reads overlay it separately. */
 export function setAgentEnabledForActiveUser(agentId: string, enabled: boolean): void {
   setAgentEnabled(getActiveUserId(), agentId, enabled);
 }
@@ -1475,7 +1458,12 @@ const CATALOG_READ_ERROR_CODES = new Set([
   'EMFILE', 'ENFILE', 'ENOSPC', 'EINVAL', 'ENAMETOOLONG', 'ELOOP',
 ]);
 
-function _catalogReadFailure(source: 'custom' | 'marketplace', stage: 'stamp' | 'enumerate' | 'definition', error: unknown): Error {
+function _catalogReadFailure(source: 'custom' | 'marketplace', stage: 'stamp' | 'enumerate', error: unknown): Error {
+  _warnCatalogReadFailure(source, stage, error);
+  return new Error('Agent catalog unavailable');
+}
+
+function _warnCatalogReadFailure(source: 'custom' | 'marketplace', stage: 'stamp' | 'enumerate' | 'definition', error: unknown): void {
   const key = `${source}:${stage}`;
   const now = Date.now();
   const previous = _catalogFailureWarnedAt.get(key);
@@ -1488,7 +1476,6 @@ function _catalogReadFailure(source: 'custom' | 'marketplace', stage: 'stamp' | 
         : typeof code === 'string' && CATALOG_READ_ERROR_CODES.has(code) ? code : 'unknown',
     });
   }
-  return new Error('Agent catalog unavailable');
 }
 
 function _agentDirStamp(): string {
@@ -1554,10 +1541,17 @@ async function _listAgentSpecs(): Promise<Agent[]> {
   const generation = _agentListCacheGeneration;
   const stamp = _agentDirStamp();
   let specs: Agent[];
-  if (_agentListCache && _agentListCache.stamp === stamp) {
+  const now = Date.now();
+  const expiresAt = _agentListCache?.expiresAt;
+  if (
+    _agentListCache && _agentListCache.stamp === stamp
+    // A backwards clock jump must not extend a partial scan's lifetime.
+    && (expiresAt === undefined || (expiresAt > now && expiresAt - now <= AGENT_PARTIAL_CATALOG_TTL_MS))
+  ) {
     specs = _agentListCache.data;
   } else {
     const persisted = _readPersistedAgentCatalog(stamp);
+    let partial = false;
     if (persisted) {
       specs = persisted;
     } else {
@@ -1565,6 +1559,8 @@ async function _listAgentSpecs(): Promise<Agent[]> {
       const seen = new Set<string>();
       const sources = [['marketplace', userMarketplaceAgentsDir(getActiveUserId())], ['custom', CUSTOM_AGENTS_DIR()]] as const;
       for (const [source, dir] of sources) {
+        // An unreadable root hides every Agent in that source, so the catalog
+        // is unknown rather than smaller.
         const entries = (await fsp.readdir(dir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
           if (error?.code === 'ENOENT') return [];
           throw _catalogReadFailure(source, 'enumerate', error);
@@ -1576,10 +1572,14 @@ async function _listAgentSpecs(): Promise<Agent[]> {
           let data: AgentRaw;
           try { data = await readJson<AgentRaw>(full, { strict: true }); }
           catch (error) {
-            // A staging directory may not contain a definition yet. Existing
-            // but unreadable/malformed definitions make the scan incomplete.
+            // A staging directory may not contain a definition yet.
             if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
-            throw _catalogReadFailure(source, 'definition', error);
+            // One unreadable/malformed definition hides only that Agent. Keep
+            // its id reserved so a same-id custom copy cannot take its place.
+            _warnCatalogReadFailure(source, 'definition', error);
+            partial = true;
+            seen.add(e.name);
+            continue;
           }
           const norm = normalizeAgent(data, source);
           if (!norm) continue;
@@ -1603,9 +1603,12 @@ async function _listAgentSpecs(): Promise<Agent[]> {
       // mtime alone cannot detect it: creating agent.json changes the child,
       // not the catalog root. Never republish a pre-invalidation snapshot.
       if (generation !== _agentListCacheGeneration) return _listAgentSpecs();
-      _writePersistedAgentCatalog(stamp, specs);
+      // Never persist a partial scan: a later restart must retry the skipped file.
+      if (!partial) _writePersistedAgentCatalog(stamp, specs);
     }
-    _agentListCache = { stamp, data: specs };
+    _agentListCache = partial
+      ? { stamp, data: specs, expiresAt: Date.now() + AGENT_PARTIAL_CATALOG_TTL_MS }
+      : { stamp, data: specs };
     _agentEnrichedCache = null;
   }
   return specs;
@@ -2907,10 +2910,9 @@ async function _appendAgentChatMessage(userId: string, agentId: string, record: 
 
 export async function clearAgentChat(userId: string, agentId: string): Promise<boolean> {
   const agent = await getAgent(agentId);
-  // Custom agents always allow clearing; built-in chat dirs only exist when
-  // dev mode has been editing them — allow clearing those too.
+  // Only custom Agent chat records can be cleared locally.
   if (!agent) return false;
-  if (agent.source !== 'custom' && !false) return false;
+  if (agent.source !== 'custom') return false;
   for (const p of [agentChatMsgsPath(userId, agentId), agentChatMetaPath(userId, agentId)]) {
     if (fs.existsSync(p)) {
       try { await fsp.unlink(p); }
@@ -3078,7 +3080,7 @@ export async function sendToAgentEditChat(
 ): Promise<AgentEditResult> {
   const agent = await getAgent(agentId);
   if (!agent) return { ok: false, error: 'agent not found' };
-  if (agent.source !== 'custom' && !false) {
+  if (agent.source !== 'custom') {
     return { ok: false, error: t('errors.builtin_agent_not_editable') };
   }
 
@@ -3152,7 +3154,7 @@ export async function* streamSendToAgentEditChat(
     yield { type: 'done' };
     return;
   }
-  if (agent.source !== 'custom' && !false) {
+  if (agent.source !== 'custom') {
     yield { type: 'error', text: t('errors.builtin_agent_not_editable') };
     yield { type: 'done' };
     return;

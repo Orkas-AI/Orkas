@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { runProgramWithTools } from '../../helpers/programmatic-tools';
 
 // Keep the test hermetic: mock the project_files feature so we assert
 // library_save's OWN logic (workspace-scope sandbox gate, arg mapping, result
@@ -50,6 +51,24 @@ async function librarySaveTool(projectId?: string) {
 function ctx() { return { workingDir: tmpDir, state: {} } as any; }
 
 describe('local-tools › library_save', () => {
+  it('keeps the project binding and conflict receipt through a programmatic save', async () => {
+    const tool = (await librarySaveTool(PID))!;
+    fs.writeFileSync(path.join(tmpDir, 'report.pdf'), 'original');
+    copyMock.mockResolvedValue({ ok: true, name: 'report.pdf', bytes: 8 });
+    replaceMock.mockResolvedValue({ ok: false, error: 'conflict' });
+    const result = await runProgramWithTools([tool], `
+      const saved = await tools.library_save({ source_path: 'report.pdf' });
+      if (!saved.ok) throw Error(saved.content);
+      const replaced = await tools.library_save({ source_path: 'report.pdf', name: 'report.pdf', expected_revision: '${'a'.repeat(64)}' });
+      json({ saved: JSON.parse(saved.content), conflict: !replaced.ok && JSON.parse(replaced.content).error });
+    `, tmpDir);
+    expect(result.isError).not.toBe(true);
+    expect(result.content).toContain('"conflict":"conflict"');
+    expect(copyMock).toHaveBeenCalledWith('u1', PID, path.join(tmpDir, 'report.pdf'), 'report.pdf');
+    expect(replaceMock).toHaveBeenCalledWith('u1', PID, path.join(tmpDir, 'report.pdf'), 'report.pdf', 'a'.repeat(64));
+    expect(fs.readFileSync(path.join(tmpDir, 'report.pdf'), 'utf8')).toBe('original');
+  });
+
   it('keeps only selection-relevant behavior in the model-visible description', async () => {
     const tool = await librarySaveTool(PID);
     expect(tool?.description).toContain('durable, searchable deliverable');

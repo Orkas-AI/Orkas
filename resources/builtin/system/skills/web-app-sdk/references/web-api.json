@@ -15,7 +15,7 @@
           "const": "1.9.0"
         },
         "capabilities": {
-          "maxItems": 7,
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "string",
@@ -100,13 +100,15 @@
                         "type"
                       ],
                       "additionalProperties": false
-                    }
+                    },
+                    "description": "Custom field definitions. Do not define fields named id or createdAt; the platform generates them."
                   },
                   "access": {
                     "type": "object",
                     "properties": {
                       "read": {
                         "default": [],
+                        "description": "Field names visitors may select or filter, including id and createdAt when needed. Undeclared selected or filtered fields reject the query with E_PERMISSION.",
                         "type": "array",
                         "items": {
                           "type": "string",
@@ -115,6 +117,7 @@
                       },
                       "insert": {
                         "default": [],
+                        "description": "Custom field names visitors may insert. Never include platform-generated id or createdAt.",
                         "type": "array",
                         "items": {
                           "type": "string",
@@ -327,13 +330,15 @@
                   "type"
                 ],
                 "additionalProperties": false
-              }
+              },
+              "description": "Custom field definitions. Do not define fields named id or createdAt; the platform generates them."
             },
             "access": {
               "type": "object",
               "properties": {
                 "read": {
                   "default": [],
+                  "description": "Field names visitors may select or filter, including id and createdAt when needed. Undeclared selected or filtered fields reject the query with E_PERMISSION.",
                   "type": "array",
                   "items": {
                     "type": "string",
@@ -342,6 +347,7 @@
                 },
                 "insert": {
                   "default": [],
+                  "description": "Custom field names visitors may insert. Never include platform-generated id or createdAt.",
                   "type": "array",
                   "items": {
                     "type": "string",
@@ -468,6 +474,7 @@
             "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
           },
           "fields": {
+            "description": "Returned field names; defaults to access.read when omitted. Every selected field must be in access.read, including id and createdAt.",
             "maxItems": 130,
             "type": "array",
             "items": {
@@ -484,6 +491,7 @@
             }
           },
           "filters": {
+            "description": "Visitor filters require access.read for every field, including id and createdAt.",
             "maxItems": 16,
             "type": "array",
             "items": {
@@ -542,6 +550,7 @@
             "maximum": 100000
           },
           "order": {
+            "description": "Defaults to id ascending. Other ordering fields require access.read. Ordering by id does not grant permission to select or filter id.",
             "type": "object",
             "properties": {
               "field": {
@@ -948,10 +957,6 @@
   ],
   "unsupported": [
     {
-      "capability": "account.renewalReminders",
-      "reason": "Host-only: account-wide reminder claims and billing navigation belong to the signed-in desktop account UI, not saved applications."
-    },
-    {
       "capability": "browser",
       "reason": "Host-only: task browser control, native file selection and site consent require a live conversation and its user-owned Chromium profile."
     },
@@ -972,10 +977,6 @@
       "reason": "Deferred: needs an explicit conversation grant and bounded history projection."
     },
     {
-      "capability": "agents.tasks",
-      "reason": "Deferred: needs a host-owned task lifetime, permissions and billing association."
-    },
-    {
       "capability": "skills",
       "reason": "Host-only: Skill script execution needs an explicitly scoped application sandbox and execution contract."
     },
@@ -985,7 +986,7 @@
     },
     {
       "capability": "media.generate",
-      "reason": "Deferred: owning studio plan, output and spending gates must be adapted first."
+      "reason": "Host-only: direct media spending remains with the owning Studio. Declared tasks run a private app-owned Studio session, with its existing plan and spending gates."
     }
   ]
 }

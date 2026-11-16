@@ -860,6 +860,48 @@ describe('search › searchChats — group-chat shape end-to-end', () => {
 });
 
 describe('search › searchChats', () => {
+  it('excludes app-owned background history from both real search and rebuild without deleting its source',async()=>{
+    const chats=await import('../../../../src/main/features/chats');const hidden=await chats.createConversation(TEST_UID,{kind:'app_task',title:'Background media'}),visible=await chats.createConversation(TEST_UID,{title:'My media task'});
+    for(const row of [hidden,visible])writeChat(TEST_UID,row.conversation_id,[{role:'user',content:'unique media archive reference',time:'2026-11-12T00:00:00Z'}]);
+    const ix=await import('../../../../src/main/features/search/indexer');await ix.reconcileChatsIndex(TEST_UID);const search=await loadSearch();
+    expect((await search.searchChats(TEST_UID,'unique media archive reference')).map(r=>r.cid)).toEqual([visible.conversation_id]);
+    expect(fs.existsSync(path.join(tmpDir,TEST_UID,'cloud/chats',hidden.conversation_id+'.jsonl'))).toBe(true);expect((await chats.getConversationMetadata(TEST_UID,hidden.conversation_id))?.kind).toBe('app_task');
+  });
+
+  it('filters old app-task postings from previews, snippets and progressive results before repairing only derived data', async () => {
+    const boot = await import('../../../../src/main/util/boot_init');
+    boot.configureBootAdmission({ isRuntimeBusy: () => true });
+    try {
+      const chats = await import('../../../../src/main/features/chats');
+      const store = await import('../../../../src/main/features/search/chat_store');
+      const hidden = await chats.createConversation(TEST_UID, { kind: 'app_task', title: 'Internal archive' });
+      const visible = await chats.createConversation(TEST_UID, { title: 'App notes' });
+      const text = 'archivevisibilitymarker';
+      for (const row of [hidden, visible]) {
+        writeChat(TEST_UID, row.conversation_id, [{ role: 'user', content: text, time: 't' }]);
+        store.replaceConversation(TEST_UID, row.conversation_id,
+          [{ cid: row.conversation_id, msgIndex: 0, role: 'user', time: 't', text }],
+          { mtime: 1, size: 1, next: 1 });
+      }
+      const source = path.join(tmpDir, TEST_UID, 'cloud/chats', `${hidden.conversation_id}.jsonl`);
+      const before = fs.readFileSync(source);
+      const search = await loadSearch();
+      for (const includeChatSnippets of [false, true]) {
+        expect((await search.searchAll(TEST_UID, text, { scope: 'chat', includeChatSnippets })).results.map(row => row.cid))
+          .toEqual([visible.conversation_id]);
+      }
+      const pages = [];
+      for await (const page of search.streamSearch(TEST_UID, text, { scope: 'chat' })) pages.push(page);
+      expect(pages.length).toBeGreaterThan(0);
+      for (const page of pages) expect(page.results.map(row => row.cid)).toEqual([visible.conversation_id]);
+      const ix = await import('../../../../src/main/features/search/indexer');
+      expect((await ix.reconcileChatsIndex(TEST_UID)).complete).toBe(true);
+      expect(store.indexedConversationIds(TEST_UID)).toEqual(new Set([visible.conversation_id]));
+      expect(fs.readFileSync(source)).toEqual(before);
+      expect((await chats.getConversationMetadata(TEST_UID, hidden.conversation_id))?.kind).toBe('app_task');
+    } finally { boot._resetForTests(); }
+  });
+
   it('fills conv_title from _index.json when present', async () => {
     writeChat('u1', 'c1', [{ role: 'user', content: 'widget question', time: 't' }]);
     const indexFile = path.join(tmpDir, 'u1', 'cloud', 'chats', '_index.json');

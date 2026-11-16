@@ -1,6 +1,56 @@
 import path from 'node:path';
-import { expect, test } from './fixtures/orkas';
+import { openSidebarEntry, expect, test } from './fixtures/orkas';
+declare const currentCid: string;
 
+
+test('a program reads an edit source and delivers one working application that survives reopening', async ({ modelOrkas: orkas }, info) => {
+  const page = orkas.page!;
+  const source = orkas.createWorkspaceFile('program-app/index.html', '<!doctype html><h1>Original workspace</h1><button onclick="this.textContent=\'Working\'">Try</button>');
+  const saved = await orkas.invoke<any>('savedApps.saveFromPath', { path: source, title: 'Workspace' });
+  expect(saved.ok).toBe(true);
+  await openSidebarEntry(page, '#apps-btn');
+  const card = page.locator(`.app-card[data-app-id="${saved.id}"]`);
+  await card.hover(); await card.locator('[data-app-more]').click();
+  await page.locator('.app-row-menu [data-action="edit"]').click();
+  await expect(page.locator('#chat-attachments')).toContainText('app-source.md');
+  const cid = await page.evaluate(() => currentCid);
+  const attachment = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chat_attachments', cid, 'app-source.md');
+  let invoked = false;
+  orkas.setModelRequestScript((_request, tools) => {
+    if (!tools.has('create_artifact')) return { calls: [{ callId: 'load-app', name: 'tool_load', args: { groups: ['workspace.artifact'] } }] };
+    if (invoked) return { text: 'Program application delivered.' };
+    invoked = true;
+    return { calls: [{ callId: 'program-app', name: 'run_program', args: { code: `
+      const source = await tools.read_files({ paths: [{ path: ${JSON.stringify(attachment)} }], raw_text: true });
+      if (!source.ok) throw Error(source.content);
+      const file = JSON.parse(source.content).files[0];
+      const parts = file.content.split(/^========== FILE: (.+?) ==========\\s*\\n/m);
+      const html = parts[2].split('========== END ==========')[0].replace('Original workspace', 'Image workspace');
+      const app = await tools.create_artifact({ title: 'Image workspace', files: [{ path: 'index.html', content: html }] });
+      if (!app.ok) throw Error(app.content);
+      text('Source transformed and application created.');
+    ` } }] };
+  });
+  await page.locator('.chat-rich-editor[data-rich-input-id="chat-input"]').fill('Keep only the image workspace.');
+  await page.locator('#chat-send-btn').click();
+  await expect(page.locator('#chat-history .chat-message.assistant')).toContainText('Program application delivered.', { timeout: 60000 });
+  await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+  const apps = page.locator('#chat-history .chat-artifact-card');
+  await expect(apps).toHaveCount(1);
+  const frame = page.frameLocator('#chat-history .chat-artifact-card iframe');
+  await expect(frame.locator('h1')).toHaveText('Image workspace');
+  await frame.getByRole('button', { name: 'Try', exact: true }).click();
+  await expect(frame.getByRole('button', { name: 'Working', exact: true })).toBeVisible();
+  const artifactId = await apps.locator('iframe').getAttribute('data-artifact-id');
+  await apps.screenshot({ path: info.outputPath('program-application-delivered.png') });
+  await page.reload();
+  await page.evaluate(async cid => { await (window as any).loadConversations(); (window as any).setView('conversation', cid); }, cid);
+  await expect(apps).toHaveCount(1);
+  await expect(apps.locator('iframe')).toHaveAttribute('data-artifact-id', artifactId!);
+  await expect(frame.locator('h1')).toHaveText('Image workspace');
+  await expect(frame.getByRole('button', { name: 'Try', exact: true })).toBeVisible();
+  await apps.screenshot({ path: info.outputPath('program-application-reopened.png') });
+});
 
 test('a corrected application keeps one card and its SDK data through reload and explicit save', async ({ orkas }, info) => {
   const page = orkas.page!;

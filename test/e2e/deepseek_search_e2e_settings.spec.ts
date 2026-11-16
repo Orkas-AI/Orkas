@@ -9,26 +9,11 @@ for (const language of ['en', 'zh'] as const) {
         await page.locator('[data-settings-model-tab="search"]').click();
       };
       if (!orkas.page) throw new Error('Renderer unavailable');
-      const installNetworkGuard = async () => {
-        await orkas.electronApp!.evaluate(() => {
-          const state = globalThis as typeof globalThis & { __deepseekSettingsExternalRequests?: number };
-          state.__deepseekSettingsExternalRequests = 0;
-          const original = globalThis.fetch;
-          globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
-            const raw = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-            if (!['localhost', '127.0.0.1', '[::1]'].includes(new URL(raw).hostname)) {
-              state.__deepseekSettingsExternalRequests! += 1;
-              return Promise.reject(new Error('E_E2E_UNEXPECTED_EXTERNAL_REQUEST'));
-            }
-            return original(input, init);
-          }) as typeof fetch;
-        });
-      };
+      const installNetworkGuard = () => orkas.guardExternalFetches();
       const expectLocalOnly = async () => {
-        expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__deepseekSettingsExternalRequests)).toBe(0);
+        expect(await orkas.externalFetchAttempts()).toBe(0);
         expect(orkas.modelRequests).toHaveLength(0);
-        expect(orkas.imageGenerationRequests).toHaveLength(0);
-        expect(orkas.videoGenerationRequests).toHaveLength(0);
+        expect(orkas.apiRequests).toEqual([]);
       };
       await installNetworkGuard();
       expect(await orkas.invoke('orkasApi.configureAll', { apiKey: 'orkas-e2e-deepseek-public-row-xxxxxxxx' }))

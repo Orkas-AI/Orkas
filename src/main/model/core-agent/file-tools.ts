@@ -31,6 +31,7 @@ import { fileFailure, type FileFailureDiagnostic } from '../../../core-agent/src
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileSystemForPath } from '../../util/user-file-fs';
 
 import type { AgentTool, ProgramSourceLoader, ToolContext, ToolObservations, ToolResult } from '#core-agent';
 import { createLogger } from '../../logger';
@@ -77,7 +78,7 @@ import {
   visitRepositoryFiles,
   createRepositorySearchBudget,
   readIgnoreScope,
-  isIgnoredByScopes,
+  createDirectoryIgnoreMatcher,
   type IgnoreScope,
 } from './repository-search';
 
@@ -172,7 +173,7 @@ export interface FileToolsOpts {
 function allowedRoots(opts: FileToolsOpts): string[] {
   const roots: string[] = [];
   try {
-    const ws = getWorkspacePath(opts.userId, opts.projectId);
+    const ws = getWorkspacePath(opts.userId, opts.projectId, opts.cid);
     if (ws) roots.push(ws);
   } catch (err) { log.warn('resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
   if (opts.cid) {
@@ -289,7 +290,7 @@ export function isPortableSkillDocumentPath(absPath: string): boolean {
     if (path.basename(cursor) === 'references') {
       const skillBody = path.join(path.dirname(cursor), 'SKILL.md');
       try {
-        if (fs.statSync(skillBody).isFile()) return true;
+        if (fileSystemForPath(skillBody).statSync(skillBody).isFile()) return true;
       } catch { /* this references/ directory does not belong to a skill */ }
     }
     const parent = path.dirname(cursor);
@@ -460,7 +461,7 @@ export function createProgramSourceLoader(opts: FileToolsOpts): ProgramSourceLoa
     }
 
     try {
-      const stat = await fs.promises.stat(abs);
+      const stat = await fileSystemForPath(abs).promises.stat(abs);
       if (!stat.isFile()) {
         return {
           status: 'denied',
@@ -478,7 +479,7 @@ export function createProgramSourceLoader(opts: FileToolsOpts): ProgramSourceLoa
           reason: `Program source exceeds the ${maxSourceChars}-character limit.`,
         };
       }
-      const bytes = await fs.promises.readFile(abs);
+      const bytes = await fileSystemForPath(abs).promises.readFile(abs);
       let source: string;
       try {
         // Keep a UTF-8 BOM as U+FEFF so re-encoding the evaluated source has
@@ -689,7 +690,7 @@ function createReadFileTool(
       }
 
       let sourceStat: fs.Stats;
-      try { sourceStat = fs.statSync(abs); }
+      try { sourceStat = fileSystemForPath(abs).statSync(abs); }
       catch (err) {
         const osCode = typeof (err as NodeJS.ErrnoException)?.code === 'string'
           ? (err as NodeJS.ErrnoException).code!
@@ -772,7 +773,7 @@ function createReadFileTool(
               isError: true,
             };
           }
-          const bytes = await fs.promises.readFile(abs);
+          const bytes = await fileSystemForPath(abs).promises.readFile(abs);
           let content: string;
           // Decoded text is not the file's bytes, so it carries no hash or edit evidence.
           if (input.encoding && input.encoding !== 'utf-8') {
@@ -915,7 +916,7 @@ function createReadFileTool(
         const executionReadPrelude = isRuntimeSkillEntry
           && resolvedPath.skillRef
           && (() => {
-            try { return fs.statSync(path.join(runtimeBinding!.root, 'scripts')).isDirectory(); }
+            try { return fileSystemForPath(runtimeBinding!.root).statSync(path.join(runtimeBinding!.root, 'scripts')).isDirectory(); }
             catch { return false; }
           })()
           ? renderSkillExecutionReadPrelude(resolvedPath.skillRef)
@@ -1415,7 +1416,7 @@ async function visitFiles(
   const protectedRoot = macosTccSensitivePath(path.resolve(root), { recursive: true });
   if (protectedRoot) return { backend: 'walk', capped: false, skippedReason: protectedRoot.reason };
   try {
-    if (!(await fs.promises.stat(root)).isDirectory()) return { backend: 'walk', capped: false };
+    if (!(await fileSystemForPath(root).promises.stat(root)).isDirectory()) return { backend: 'walk', capped: false };
   } catch (error) {
     return { backend: 'walk', capped: false,
       ...((error as NodeJS.ErrnoException).code === 'ENOENT' ? {} : { error: 'directory could not be inspected' }) };
@@ -1430,15 +1431,16 @@ async function visitFiles(
     if (capped || opts.signal.aborted) return;
     const local = honourIgnores ? readIgnoreScope(dir) : null;
     const scopes = local ? [...inherited, local] : inherited;
+    const isIgnored = createDirectoryIgnoreMatcher(dir, scopes);
     try {
-      const entries = await fs.promises.opendir(dir);
+      const entries = await fileSystemForPath(dir).promises.opendir(dir);
       for await (const entry of entries) {
         if (capped || opts.signal.aborted) break;
         if (++visited % GREP_YIELD_EVERY === 0) await new Promise<void>(resolve => setImmediate(resolve));
         if (opts.signal.aborted) break;
         if (entry.name === '.git' || (entry.isDirectory() && fallbackDirectoryExcluded(entry.name))) continue;
         const file = path.join(dir, entry.name);
-        if (honourIgnores && isIgnoredByScopes(file, entry.isDirectory(), scopes)) continue;
+        if (honourIgnores && isIgnored(entry.name, entry.isDirectory())) continue;
         if (entry.isDirectory()) await walk(file, scopes);
         else if (entry.isFile() && !fallbackFileExcluded(entry.name)) capped = await visit(file);
       }
@@ -1477,7 +1479,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
 
       const rootKinds: Array<{ root: string; source: 'attachment' | 'workspace' | 'extra' }> = [];
       try {
-        rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId), source: 'workspace' });
+        rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId, opts.cid), source: 'workspace' });
       } catch { /* workspace unavailable → skip */ }
       if (opts.cid) {
         rootKinds.push({ root: chatAttachmentDirForConversation(opts.userId, opts.cid), source: 'attachment' });
@@ -1498,7 +1500,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
         const scopeErr = await gatePathAccess(opts, requestedRoot, 'search_files', ctx);
         if (scopeErr) return { content: scopeErr, isError: true };
         let st: fs.Stats;
-        try { st = fs.statSync(requestedRoot); }
+        try { st = fileSystemForPath(requestedRoot).statSync(requestedRoot); }
         catch (err) {
           return {
             content: errText(
@@ -1552,7 +1554,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
             if (includeGlobs.length && !includeGlobs.some(glob => targetMatchesGrepGlob(target, glob))) return false;
             if (excludeGlobs.some(glob => targetMatchesGrepGlob(target, glob))) return false;
             let st: fs.Stats;
-            try { st = await fs.promises.stat(abs); }
+            try { st = await fileSystemForPath(abs).promises.stat(abs); }
             catch { reasons.add('io_error'); return false; }
             const hit: SearchFileHit = {
               root: requestedRootResolution?.skillRef ? requestedRootDisplay : root,
@@ -1769,7 +1771,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       );
 
       const roots: string[] = [];
-      try { roots.push(getWorkspacePath(opts.userId, opts.projectId)); }
+      try { roots.push(getWorkspacePath(opts.userId, opts.projectId, opts.cid)); }
       catch { /* workspace unavailable */ }
       if (opts.cid) roots.push(chatAttachmentDirForConversation(opts.userId, opts.cid));
       for (const root of [...(opts.extraRoots || []), ...(opts.readOnlyExtraRoots || [])]) {
@@ -1790,7 +1792,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
         const scopeErr = await gatePathAccess(opts, requestedRoot, 'grep_files', ctx);
         if (scopeErr) return { content: scopeErr, isError: true };
         let st: fs.Stats;
-        try { st = fs.statSync(requestedRoot); }
+        try { st = fileSystemForPath(requestedRoot).statSync(requestedRoot); }
         catch (err) {
           return {
             content: errText(
@@ -1859,7 +1861,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
           let nativeHandled = false;
           if (!singleFileTarget) {
             try {
-              if (!(await fs.promises.stat(root)).isDirectory()) continue;
+              if (!(await fileSystemForPath(root).promises.stat(root)).isDirectory()) continue;
             } catch (error) {
               if ((error as NodeJS.ErrnoException).code !== 'ENOENT') reasons.add('io_error');
               continue;
@@ -1900,7 +1902,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
             } else if (kind === 'text') {
               if (!nativeHandled) {
                 scanned++;
-                try { collectMatches(target, await fs.promises.readFile(abs, { encoding: 'utf8', signal: budget.signal })); }
+                try { collectMatches(target, await fileSystemForPath(abs).promises.readFile(abs, { encoding: 'utf8', signal: budget.signal })); }
                 catch { if (!budget.reason()) reasons.add('io_error'); }
               }
             } else skipped++;
@@ -1977,7 +1979,7 @@ function findUniquifySiblings(absPath: string): string[] {
   const { dir, name, ext } = path.parse(absPath);
   if (!dir) return [];
   let entries: string[];
-  try { entries = fs.readdirSync(dir); }
+  try { entries = fileSystemForPath(dir).readdirSync(dir); }
   catch { return []; }
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const re = new RegExp(`^${esc(name)}-(\\d+)${esc(ext)}$`);
@@ -2038,7 +2040,7 @@ function createListFilesTool(opts: FileToolsOpts): AgentTool {
       }
 
       try {
-        const entries = await fs.promises.readdir(abs, { withFileTypes: true });
+        const entries = await fileSystemForPath(abs).promises.readdir(abs, { withFileTypes: true });
         const lines = entries.map((e) => `${e.isDirectory() ? 'd' : 'f'} ${e.name}`);
         return { content: lines.join('\n') };
       } catch (err) {

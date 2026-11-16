@@ -666,6 +666,8 @@ export interface ProviderMeta {
   id: string;
   label: string;
   docsUrl?: string;
+  /** False retains a legacy label for a flow absent from the installed SDK. */
+  supportsOAuth?: boolean;
 }
 
 /**
@@ -683,9 +685,15 @@ export const FEATURED_API_PROVIDERS: readonly ProviderMeta[] = CATALOG
  */
 export const OAUTH_PROVIDERS: readonly ProviderMeta[] = [
   { id: 'anthropic',          label: 'Anthropic (Claude Pro/Max)' },
+  { id: 'openai',             label: 'OpenAI' },
+  { id: 'kimi-coding',        label: 'Moonshot Coding Plan' },
+  { id: 'meta',               label: 'meta' },
+  { id: 'openrouter',         label: 'OpenRouter' },
+  { id: 'radius',             label: 'radius' },
+  { id: 'xai',                label: 'xai' },
   { id: 'openai-codex',       label: 'OpenAI Codex' },
-  { id: 'google-gemini-cli',  label: 'Google Gemini' },
-  { id: 'google-antigravity', label: 'Google Antigravity' },
+  { id: 'google-gemini-cli',  label: 'Google Gemini', supportsOAuth: false },
+  { id: 'google-antigravity', label: 'Google Antigravity', supportsOAuth: false },
   { id: 'github-copilot',     label: 'GitHub Copilot' },
   // Custom providers registered at runtime (features/oauth-minimax.ts).
   { id: 'minimax-portal',     label: 'MiniMax Subscription (Global)' },

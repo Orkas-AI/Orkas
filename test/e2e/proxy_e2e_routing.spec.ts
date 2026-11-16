@@ -67,3 +67,51 @@ test('uploads a signed body once through Chromium without mutating caller header
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+// The server delays its receipt after accepting the complete body. A writable
+// request close must not become a failed upload or cause a second submission.
+test('keeps accepted upload receipts after Chromium closes its writable request', async ({}, testInfo) => {
+  const uploads: Array<{ path: string; body: string }> = [];
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+    request.on('end', () => {
+      uploads.push({ path: request.url || '', body: Buffer.concat(chunks).toString('utf8') });
+      setTimeout(() => {
+        response.writeHead(request.url?.endsWith('/conflict') ? 409 : 200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ received: true }));
+      }, 150);
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Proxy fixture has no port');
+  const app = new OrkasTestApp(testInfo, { enableSystemProxy: true, configuredModel: false });
+  try {
+    await app.launch();
+    const results = await app.electronApp!.evaluate(async ({ session }, input) => {
+      const require = (process as any).mainModule.require.bind((process as any).mainModule);
+      const transport = require(`${input.root}/src/main/util/proxy-dispatcher.ts`);
+      await session.defaultSession.setProxy({ proxyRules: `http=127.0.0.1:${input.port}` });
+      await transport.installSystemProxyDispatcher();
+      const rows = [];
+      for (const name of ['success', 'conflict']) {
+        const response = await transport.fetchUploadWithProxyPolicy(`http://orkas-proxy-receipt.invalid/${name}`, {
+          method: 'POST', body: JSON.stringify({ operation: name }), signal: AbortSignal.timeout(5000),
+          headers: { 'content-type': 'application/json' },
+        }, () => {});
+        rows.push({ status: response.status, body: await response.json() });
+      }
+      return rows;
+    }, { root: process.cwd(), port: address.port });
+    expect(results).toEqual([{ status: 200, body: { received: true } }, { status: 409, body: { received: true } }]);
+    expect(uploads).toEqual(['success', 'conflict'].map(name => ({
+      path: `http://orkas-proxy-receipt.invalid/${name}`, body: JSON.stringify({ operation: name }),
+    })));
+    expect(app.modelRequests).toHaveLength(0);
+  } finally {
+    await app.dispose();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

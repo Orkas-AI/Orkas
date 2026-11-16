@@ -17,7 +17,13 @@ Before routing any request with a supplied image, classify the user's relationsh
 - `edit`: treat one required `edit_source` as the original and change only the requested attributes or regions.
 - `guide`: use only the declared roles as guidance while allowing the stated changes. This is the safe default for an otherwise unspecified reference.
 
-Record this as `reference_intent:{mode,basis:"user|inferred",instructions,minimum_score}`. Use `basis:"user"` when the mode or constraint comes from the user's words and `basis:"inferred"` only for a fallback. Inspect the supplied images before production and translate the request into each reference's roles, preserved attributes, allowed changes, and regions. Reproduction needs at least one reference and concrete preserved attributes. A requested source edit implies edit; an explicit match/recreate/restore request implies reproduce; an otherwise unspecified reference defaults to guide. If instructions combine editing with strong preservation, keep mode edit and place the user's exact preservation requirements in the protected boundary. The intent is about the requested outcome, never about which app or technique produced the reference.
+Record this as `reference_intent:{mode,basis:"user|inferred",instructions,minimum_score}`. Use `basis:"user"` when the mode or constraint comes from the user's words and `basis:"inferred"` only for a fallback. Inspect the supplied images before production and translate the request into each reference's roles, preserved attributes, allowed changes, and regions. Reproduction needs at least one reference and concrete preserved attributes. An explicit match/recreate/restore request takes precedence: use reproduce even when the user allows a limited edit, and record only those allowed edits in may_change. Otherwise, a requested source edit implies edit; an otherwise unspecified reference defaults to guide. For edit mode, place the user's exact preservation requirements in the protected boundary. The intent is about the requested outcome, never about which app or technique produced the reference.
+
+## Product creative before route lock
+
+For product listing or sales creative, resolve the requested picture before applying the generic routes below. New product scenes, creative campaign images and hero images needing a new photographic treatment default to `GENERATE` or `HYBRID`; a semantic change to the supplied source canvas uses `EDIT`. Do not choose `COMPOSE` merely because a product photograph and headline can be arranged in HTML: a layout is not a substitute for the requested scene or photographic treatment.
+
+Explicit user constraints take precedence. Specification/comparison graphics, requested graphic layouts, ordinary white-background processing, crop/resize work, exact reproduction and scoped edits keep their appropriate existing routes. When product appearance must remain exact, prefer the real product pixels with separately generated surroundings and deterministic copy. Resolve visual need before comparing costs; the existing quote, authority and call-budget rules still apply.
 
 ## Route selection
 
@@ -91,13 +97,15 @@ This is the single structural template for `image-manifest.json`. Production ski
 
 ## Progressive-disclosure handoff
 
-After route lock, for product listing or sales-creative work, also read [image-craft/references/ecommerce.md](../image-craft/references/ecommerce.md).
+After route lock, for product listing or sales-creative work, also read [image-craft/references/ecommerce.md](@skill/image-craft/references/ecommerce.md).
+
+After route lock, before a non-generation multi-image set's production or acceptance plan, read [multi-image-sets.md](@skill/image-compose/references/multi-image-sets.md). Keep a planning-only task read-only.
 
 Return `route`, `reason`, `generation_budget`, and a phased `next_skills` list:
 
 - Add `image-craft` only for original creation, restyling, or an underspecified visual direction.
 - Add `image-canvas` only for multiple meaningful regions, explicit reading order, exact layout constraints, or region-bound references.
-- Add `image-compose` for `COMPOSE`, or later in another route only for a deterministic overlay, layout, diagram, crop, mask, or composite.
+- Add `image-compose` for `COMPOSE`, or later in another route only for a deterministic photo adjustment, batch processing, overlay, layout, diagram, crop, mask, composite, layered source, PSD delivery, SVG/HTML conversion or requested vector PDF delivery.
 - Add `image-generate` for `GENERATE`, semantic `EDIT`, or the synthesized raster phase of `HYBRID`.
 - Never add `image-design-review` to startup. Load it only when the current artifact handoff requests review and attaches visual evidence.
 

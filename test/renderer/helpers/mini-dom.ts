@@ -101,6 +101,8 @@ export class MiniElement extends MiniNode {
   readonly style: Record<string, string> = {};
   readonly localName: string;
   value = '';
+  selectionStart = 0;
+  selectionEnd = 0;
   checked = false;
   scrollTop = 0;
   [handler: `on${string}`]: any;
@@ -206,6 +208,7 @@ export class MiniElement extends MiniNode {
   querySelectorAll(selector: string): MiniElement[] { return this.descendants().filter(node => node.matches(selector)); }
   querySelector(selector: string): MiniElement | null { return this.querySelectorAll(selector)[0] || null; }
   focus(): void { if (this.isConnected) this.ownerDocument.activeElement = this; }
+  select(): void { this.selectionStart = 0; this.selectionEnd = this.value.length; }
   blur(): void { if (this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = this.ownerDocument.body; }
   click(): void { if (!this.disabled) this.dispatchEvent(new MiniEvent('click', { bubbles: true })); }
   getBoundingClientRect() { return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }

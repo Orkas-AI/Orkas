@@ -79,6 +79,14 @@ const QUERY = { type: 'object', description: 'Provider query filters; raw URL, h
 const IDS = { type: 'array', minItems: 1, maxItems: 10, items: ID };
 const BODIES = { type: 'array', minItems: 1, maxItems: 10, items: BODY };
 const SHOPIFY_ACTIONS = Object.freeze({
+  // Fixed product-media staging only; no general file or raw GraphQL authority.
+  // https://shopify.dev/docs/api/admin-graphql/2026-07/mutations/stagedUploadsCreate
+  'media.stage_product': action('W', 'Prepare a temporary upload destination for selected product image or video bytes. Does not publish a product.', {
+    filename: {type:'string',minLength:1,maxLength:160,pattern:'^[a-zA-Z0-9._-]+$'},
+    mime_type: {type:'string',enum:['image/png','image/jpeg','image/webp','image/gif','video/mp4','video/webm','video/quicktime']},
+    resource: {type:'string',enum:['PRODUCT_IMAGE','VIDEO']},
+    file_size: {type:'string',pattern:'^[1-9][0-9]{0,8}$'},
+  }, ['filename','mime_type','resource','file_size']),
   'shop.get': action('R', 'Get the bound Shopify shop identity.'),
   'products.list': action('R', 'List products.', { first: { type: 'integer', minimum: 1, maximum: 100 }, after: ID, query: { type: 'string', maxLength: 1000 } }),
   'products.get': action('R', 'Get one product by Shopify GID.', { id: ID }, ['id']),
@@ -1435,7 +1443,8 @@ function validateActionParameters(spec, value) {
     if (descriptor.type === 'string' && (typeof item !== 'string'
         || item.length < Number(descriptor.minLength || 0)
         || item.length > Number(descriptor.maxLength || Number.MAX_SAFE_INTEGER)
-        || (descriptor.enum && !descriptor.enum.includes(item)))) {
+        || (descriptor.enum && !descriptor.enum.includes(item))
+        || (descriptor.pattern && !new RegExp(descriptor.pattern).test(item)))) {
       throw new Error(`invalid action parameter: ${path}`);
     }
     if (descriptor.type === 'integer' && (!Number.isInteger(item)
@@ -1698,6 +1707,13 @@ const INVENTORY_FIELDS = 'id sku tracked requiresShipping countryCodeOfOrigin pr
 const DISCOUNT_FIELDS = 'id discount { ... on DiscountCodeBasic { title summary status startsAt endsAt codes(first:10){nodes{id code}} } ... on DiscountAutomaticBasic { title summary status startsAt endsAt } ... on DiscountCodeBxgy { title summary status } ... on DiscountAutomaticBxgy { title summary status } ... on DiscountCodeFreeShipping { title summary status } ... on DiscountAutomaticFreeShipping { title summary status } }';
 
 async function executeShopify(config, name, p) {
+  if(name==='media.stage_product'){
+    if((p.resource==='VIDEO')!==p.mime_type.startsWith('video/'))throw commerceError('E_BAD_INPUT','Media type does not match the upload resource');
+    const data=await shopifyGraphql(config,'mutation($input:[StagedUploadInput!]!){stagedUploadsCreate(input:$input){stagedTargets{url resourceUrl parameters{name value}} userErrors{field message}}}',{input:[{filename:p.filename,mimeType:p.mime_type,resource:p.resource,httpMethod:'POST',fileSize:p.file_size}]});
+    const target=data.stagedUploadsCreate?.stagedTargets?.[0];
+    if(!target?.url||!target.resourceUrl||!Array.isArray(target.parameters))throw commerceError('E_TOOL_CALL_UPSTREAM','Shopify omitted the upload destination');
+    return {stagedTargets:[target]};
+  }
   const connection = (resource, fields, extra = '') => `query($first:Int!,$after:String,$query:String){${resource}(first:$first,after:$after,query:$query){nodes{${fields}} pageInfo{hasNextPage endCursor}}${extra}}`;
   const variables = { first: Math.min(100, Math.max(1, Number(p.first || 50))), after: p.after || null, query: p.query || null };
   if (name === 'shop.get') return shopifyGraphql(config, `query{shop{${SHOP_FIELDS}}}`);

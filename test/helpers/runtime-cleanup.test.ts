@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import { parseJsonObjectAt } from './parse-json-object';
@@ -85,9 +86,13 @@ describe('reviewed test runtime boundaries', () => {
     const prior = process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY;
     process.env.ORKAS_TEST_DISABLE_LOG_DELIVERY = 'caller-sentinel';
     const failure = new Error('synthetic worker termination failure');
-    const worker = (fail: boolean) => Object.assign(new EventEmitter(), {
-      unref: vi.fn(), postMessage: vi.fn(), terminate: vi.fn(async () => { if (fail) throw failure; return 0; }),
-    });
+    const worker = (fail: boolean) => {
+      const stdout = new PassThrough(), stderr = new PassThrough();
+      return Object.assign(new EventEmitter(), {
+        stdout, stderr, unref: vi.fn(), postMessage: vi.fn(),
+        terminate: vi.fn(async () => { stdout.end(); stderr.end(); if (fail) throw failure; return 0; }),
+      });
+    };
     const first = worker(true), second = worker(false);
     const cleanup = await captureMainLogWorkers();
     try {

@@ -9,6 +9,7 @@ const gate = require('../../../bin/builtin-resource-gate.cjs') as {
   createBuiltinManifest(root: string, options?: { allowIgnoredJunk?: boolean }): {
     files: unknown[];
     inventory: {
+      apps: Array<{id:string}>;
       system_skills: unknown[];
       marketplace_agents: Array<{
         id: string;
@@ -29,7 +30,7 @@ const gate = require('../../../bin/builtin-resource-gate.cjs') as {
   };
   validateBuiltinAgentContract(agent: Record<string, unknown>, id: string): boolean;
   verifyBuiltinExtraResourcesConfig(extraResources: unknown): boolean;
-  verifyBuiltinRoot(root: string, options?: { allowIgnoredJunk?: boolean }): string;
+  verifyBuiltinRoot(root: string, options?: { allowIgnoredJunk?: boolean; allowDevelopmentFiles?: boolean }): string;
 };
 
 let tmpDir: string;
@@ -44,7 +45,11 @@ afterEach(() => {
 
 function copyBuiltin(): string {
   const root = path.join(tmpDir, 'builtin');
-  fs.cpSync(path.join(process.cwd(), 'resources', 'builtin'), root, { recursive: true });
+  const source = path.join(process.cwd(), 'resources', 'builtin');
+  const manifest = JSON.parse(fs.readFileSync(path.join(source,'_manifest.json'),'utf8'));
+  for (const relative of ['_manifest.json', ...manifest.files.map((file:any)=>file.path)]) {
+    const destination = path.join(root,relative);fs.mkdirSync(path.dirname(destination),{recursive:true});fs.copyFileSync(path.join(source,relative),destination);
+  }
   return root;
 }
 
@@ -56,6 +61,39 @@ function readBuiltinAgent(id: string): Record<string, unknown> {
 }
 
 describe('builtin-resource-gate', () => {
+  it('requires both platform workspaces and keeps either missing application out of a deliverable package', () => {
+    const source=path.join(process.cwd(),'resources','builtin');
+    expect(gate.createBuiltinManifest(source,{allowIgnoredJunk:true}).inventory.apps.map(app=>app.id).sort())
+      .toEqual(['builtin-content-workbench','builtin-product-listing']);
+    const root=copyBuiltin();
+    fs.rmSync(path.join(root,'apps','builtin-content-workbench'),{recursive:true});
+    expect(()=>gate.createBuiltinManifest(root)).toThrow(/required builtin app inventory.*missing/);
+  });
+  it('leaves engineering tests in source while excluding them from the builtin delivery manifest', () => {
+    const root = copyBuiltin();
+    const files = ['apps/builtin-product-listing/test/draft.test.ts',
+      'apps/builtin-product-listing/logic.spec.js',
+      'marketplace/skills/6743aa0797a2/tests/input.json',
+      'marketplace/skills/6743aa0797a2/scripts/test_fixture.py'];
+    for (const relative of [...files, 'apps/builtin-product-listing/testing-example.html']) {
+      const file = path.join(root, relative);fs.mkdirSync(path.dirname(file), { recursive: true });fs.writeFileSync(file, 'fixture');
+    }
+    const manifest = gate.createBuiltinManifest(root, { allowIgnoredJunk: true });
+    const paths = manifest.files.map((file: any) => file.path);
+    for (const file of files) { expect(paths).not.toContain(file);expect(fs.existsSync(path.join(root,file))).toBe(true); }
+    expect(paths).toContain('apps/builtin-product-listing/testing-example.html');
+    expect(paths).toContain('apps/builtin-product-listing/model.js');
+  });
+  it('rejects tests in a packaged builtin even if its content manifest could otherwise be regenerated', () => {
+    const root = copyBuiltin(), file = path.join(root,'apps/builtin-product-listing/test/regression.js');
+    fs.mkdirSync(path.dirname(file), { recursive: true });fs.writeFileSync(file,'fixture');
+    expect(() => gate.createBuiltinManifest(root)).toThrow(/development-only/);
+  });
+  it('rejects a missing bundled listing entry before packaging', () => {
+    const root = copyBuiltin();
+    fs.rmSync(path.join(root,'apps','builtin-product-listing','index.html'));
+    expect(() => gate.createBuiltinManifest(root)).toThrow(/builtin app.*entry/);
+  });
   it('verifies every tracked file and the complete semantic inventory', () => {
     const root = path.join(process.cwd(), 'resources', 'builtin');
     const manifest = gate.createBuiltinManifest(root, { allowIgnoredJunk: true });
@@ -97,7 +135,7 @@ describe('builtin-resource-gate', () => {
         name: 'ContentWriter',
         icon: 'document',
         color: 'lavender',
-        skill_list: ['9dfbd4e00c0d'],
+        skill_list: ['9dfbd4e00c0d', 'de1fe2e2c26a', 'de52c67d49dd'],
       }));
     expect(manifest.inventory.marketplace_agents
       .filter((row) => row.name.startsWith('ECommerce'))
@@ -122,11 +160,6 @@ describe('builtin-resource-gate', () => {
           id: 'e0f3a98c624b',
           name: 'ECommerceOperator',
           skill_list: ['d47b20f9a631'],
-        },
-        {
-          id: 'fa3e1f2f9e07',
-          name: 'ECommerceWriter',
-          skill_list: ['59d186285161', 'de52c67d49dd', 'e8868f762c1d'],
         },
       ]);
     expect(manifest.inventory.marketplace_agents)
@@ -192,8 +225,26 @@ describe('builtin-resource-gate', () => {
     expect(productDeveloper.workflow).toMatch(/current writable workspace/i);
   });
 
+  // A real Agent carrying one input of each kind the contract has rules for.
+  const agentWithEveryInputKind = () => ({
+    ...readBuiltinAgent('79df9cc89f5f'),
+    inputs: [
+      { id: 'topic', label: 'Topic', type: 'textarea', required: true, default: '' },
+      {
+        id: 'aspect_ratio', label: 'Aspect ratio', type: 'select', required: false, default: '16:9',
+        options: [{ value: '16:9', label: 'Landscape' }, { value: '9:16', label: 'Vertical' }],
+      },
+      {
+        id: 'language', label: 'Language', type: 'select', required: false, default: 'en',
+        default_by_ui_language: { zh: 'zh-CN', en: 'en' },
+        options: [{ value: 'en', label: 'English' }, { value: 'zh-CN', label: '简体中文' }],
+      },
+      { id: 'duration_seconds', label: 'Duration', type: 'number', required: false, default: 60 },
+    ],
+  });
+
   it('rejects shipped input definitions that runtime normalization would drop or rewrite', () => {
-    const valid = readBuiltinAgent('79df9cc89f5f');
+    const valid = agentWithEveryInputKind();
     const cases: Array<[string, (agent: any) => void, RegExp]> = [
       ['duplicate ids', (agent) => { agent.inputs[1].id = agent.inputs[0].id; }, /invalid or duplicate id/],
       ['string number', (agent) => { agent.inputs[3].default = '60'; }, /finite number/],
@@ -215,7 +266,7 @@ describe('builtin-resource-gate', () => {
   });
 
   it('allows valid select defaults for every newly supported UI language', () => {
-    const candidate = readBuiltinAgent('79df9cc89f5f');
+    const candidate = agentWithEveryInputKind();
     const inputs = candidate.inputs as Array<Record<string, unknown>>;
     inputs[2].default_by_ui_language = Object.fromEntries(
       ['es', 'fr', 'ko', 'de', 'ru', 'it'].map((language) => [language, 'en']),
@@ -292,6 +343,7 @@ describe('builtin-resource-gate', () => {
     expect(gate.verifyBuiltinRoot(root, { allowIgnoredJunk: true }))
       .toBe('resource:builtin:manifest-v1');
     expect(() => gate.verifyBuiltinRoot(root)).toThrow(/builtin content tree mismatch/);
+    expect(() => gate.verifyBuiltinRoot(root, { allowDevelopmentFiles: true })).toThrow(/builtin content tree mismatch/);
   });
 
   it('requires explicit cache exclusions on the builtin extraResources entry', () => {

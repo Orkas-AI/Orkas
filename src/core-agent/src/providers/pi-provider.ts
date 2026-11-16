@@ -49,7 +49,7 @@ import {
   isStorageFullError,
 } from "../shared/errors.js";
 import { createLogger } from "../shared/logger.js";
-import { providerCredentialFailure, providerErrorFacts } from "../shared/provider-error-facts.js";
+import { providerCredentialFailure, providerErrorFacts, providerRetryAfterMs as retryAfterMsFrom } from "../shared/provider-error-facts.js";
 import type { CompletionParams, CompletionResult, LLMProvider, ToolDefinition } from "./base.js";
 
 import { createResponsesTerminalReasoning } from './responses-terminal-reasoning.js';
@@ -81,8 +81,8 @@ function withUserCacheAffinity(
   enabled: boolean, suppliedHeaders?: Record<string, string>,
 ): typeof globalThis.fetch {
   if (!enabled || !key) return next;
-  const name = model.api === 'openai-codex-responses' ? 'session-id'
-    : model.api === 'openai-responses' || model.api === 'openai-completions' ? 'session_id' : undefined;
+  const name = model.api === 'openai-codex-responses' || model.api === 'openai-responses' ? 'session-id'
+    : model.api === 'openai-completions' ? 'session_id' : undefined;
   if (!name || (model.api !== 'openai-codex-responses'
     && new Headers(suppliedHeaders).has(name))) return next;
   return (input, init) => {
@@ -201,7 +201,7 @@ type RuntimePiContext = PiContext & { hostMessageIndexes: number[]; foreignRespo
  * ordering in `transform-messages`, one image trailer per contiguous tool-result
  * batch in `openai-completions`). Bump only after re-checking those rules against
  * the new release; `providers.test.ts` pins the installed package to this value. */
-export const MIRRORED_PI_AI_SERIALIZER_VERSION = "1.5.0";
+export const MIRRORED_PI_AI_SERIALIZER_VERSION = "1.5.2";
 
 /** pi-ai's portable history has no developer role. Responses has one, so
  * restore explicitly typed host messages at the native serialization boundary.
@@ -534,6 +534,7 @@ function mapUsage(u: PiAssistantMessage["usage"]): Usage {
 
 type MapContentOptions = {
   stripLeadingThinkText?: boolean;
+  onInvalidToolArguments?: (input: unknown) => void;
 };
 
 type LeadingThinkTextFilter = {
@@ -711,7 +712,10 @@ function mapContent(
       // pi-ai 1.3 marks invalid final JSON separately from its empty-object
       // fallback. Never turn that fallback into an executable host call.
       // The SDK error contains raw arguments, so keep it out of diagnostics.
-      if (block.argumentsError) throw new Error("Invalid tool call arguments");
+      if (block.argumentsError) {
+        try { options.onInvalidToolArguments?.(block.arguments); } catch { /* Diagnostics cannot change rejection. */ }
+        throw new Error("Invalid tool call arguments");
+      }
       result.push({
         type: "tool_use",
         id: block.id,
@@ -752,8 +756,9 @@ function mapProviderContent(
   normalizeLiteralLeadingThinkText = false,
   replay?: GoogleNativeReplay,
   origin?: MessageContent["replayOrigin"],
+  onInvalidToolArguments?: MapContentOptions['onInvalidToolArguments'],
 ): MessageContent[] {
-  const mapped = mapContent(content, { stripLeadingThinkText: normalizeLiteralLeadingThinkText });
+  const mapped = mapContent(content, { stripLeadingThinkText: normalizeLiteralLeadingThinkText, onInvalidToolArguments });
   if (replay && mapped.length) mapped[0] = { ...mapped[0], googleNativeReplay: replay };
   return origin ? mapped.map(block => (block.type === 'thinking'
     || block.type === 'text' && block.textSignature
@@ -762,6 +767,31 @@ function mapProviderContent(
 }
 
 export const mapProviderContentForTest = mapProviderContent;
+
+/** Preserve an authoritative output limit even when the SDK cannot decode a
+ * final tool argument. Drop the whole proposed batch, including valid siblings,
+ * rather than manufacturing executable arguments. Runner owns bounded recovery. */
+function mapCompletionContent(
+  content: PiAssistantMessage["content"],
+  stopReason: StopReason,
+  normalizeLiteralLeadingThinkText: boolean,
+  replay?: GoogleNativeReplay,
+  origin?: MessageContent["replayOrigin"],
+  onInvalidToolArguments?: MapContentOptions['onInvalidToolArguments'],
+): Pick<CompletionResult, "content" | "incompleteToolCall"> {
+  const incompleteToolCall = stopReason === "max_tokens"
+    && content.some(block => block.type === "toolCall" && !!block.argumentsError);
+  return {
+    content: mapProviderContent(
+      incompleteToolCall ? content.filter(block => block.type !== "toolCall") : content,
+      normalizeLiteralLeadingThinkText,
+      incompleteToolCall ? undefined : replay,
+      origin,
+      onInvalidToolArguments,
+    ),
+    ...(incompleteToolCall ? { incompleteToolCall: true as const } : {}),
+  };
+}
 
 export const createLeadingThinkTextFilterForTest = createLeadingThinkTextFilter;
 export const stripLeadingThinkTextForTest = stripLeadingThinkText;
@@ -1038,9 +1068,9 @@ export function createPiProvider(config: {
 
     async complete(params: CompletionParams): Promise<CompletionResult> {
       const model = resolveModel(providerId, params.model, resolvedModel, config.baseUrl);
-      const requestDiagnostics = createRequestDiagnostics(params.signal, params.onRequestFailure, undefined, params.requestMetadata?.contextBudgetDiagnostics);
+      const requestDiagnostics = createRequestDiagnostics(params.signal, params.onRequestFailure, params.requestMetadata?.contextBudgetDiagnostics);
       const statusDiagnostics = createResponsesStatusDiagnostics(params.onRequestFailure, model,
-        requestDiagnostics.sequence, undefined);
+        requestDiagnostics.sequence);
       const suppliedHeaders = requestHeaders(params);
       const apiKey = config.apiKey ?? getEnvApiKey(model.provider);
       const origin = replayOrigin(model, apiKey, suppliedHeaders);
@@ -1049,6 +1079,10 @@ export function createPiProvider(config: {
       const reasoning = effectiveReasoning(params.reasoning);
       const sessionId = cacheSafeSessionId(params.sessionId);
       const terminalReasoning = createResponsesTerminalReasoning(model.api, params.signal);
+      const onProviderStreamEvent = terminalReasoning ? (event: unknown) => {
+        terminalReasoning.observe(event);
+        if (model.api === 'openai-codex-responses') requestDiagnostics.observeProviderStreamEvent(event);
+      } : undefined;
       const useOfficialReasoningDefaults = model.reasoning === true
         && ((params.reasoning === undefined && config.defaultReasoning === undefined)
           || (params.reasoning === "off" && (model.thinkingLevelMap as { off?: string | null })?.off === null));
@@ -1106,7 +1140,8 @@ export function createPiProvider(config: {
         return response;
       };
       const reportFailure = (error: unknown, aborted = false, boundary: ProviderFailureSource = 'exception') => {
-        const failure = requestDiagnostics.report(error, aborted, boundary, aborted || params.signal?.aborted ? undefined : statusDiagnostics?.failure(errorCapture.rejectedInputIndex));
+        const rejected = errorCapture.rejectedInput ?? requestDiagnostics.rejectedInput;
+        const failure = requestDiagnostics.report(error, aborted, boundary, aborted || params.signal?.aborted ? undefined : statusDiagnostics?.failure(rejected?.index, rejected?.field));
         try { if (failure && !requestDiagnostics.observed) log.warn("provider complete failed", { ...failure }); } catch { /* Best-effort diagnostics. */ }
       };
       try {
@@ -1137,8 +1172,11 @@ export function createPiProvider(config: {
             reasoning,
             cacheRetention: params.cacheRetention,
             sessionId,
+            // The host owns complete history replay and retry admission. Keep
+            // session affinity without SDK-owned server continuation state.
+            disableContinuation: true,
             onResponse,
-            onProviderStreamEvent: terminalReasoning?.observe,
+            onProviderStreamEvent,
             ...(model.api === 'openai-completions' || model.api === 'openai-responses' || model.api === 'openai-codex-responses' || model.api === 'anthropic-messages'
               ? { fetch: requestFetch } : {}),
             ...(onPayload ? { onPayload: onPayload as any } : {}),
@@ -1154,8 +1192,9 @@ export function createPiProvider(config: {
             temperature: params.temperature,
             cacheRetention: params.cacheRetention,
             sessionId,
+            disableContinuation: true,
             onResponse,
-            onProviderStreamEvent: terminalReasoning?.observe,
+            onProviderStreamEvent,
             ...(model.api === 'openai-completions' || model.api === 'openai-responses' || model.api === 'openai-codex-responses' || model.api === 'anthropic-messages'
               ? { fetch: requestFetch } : {}),
             ...(onPayload ? { onPayload: onPayload as any } : {}),
@@ -1170,14 +1209,17 @@ export function createPiProvider(config: {
 
         const completedContent = terminalReasoning?.apply(result) ?? result.content;
         statusDiagnostics?.output(completedContent, result.rawStopReason);
+        const stopReason = mapStopReason(result.stopReason);
         return {
-          content: mapProviderContent(
+          ...mapCompletionContent(
             completedContent,
+            stopReason,
             config.normalizeLiteralLeadingThinkText === true,
             (result as PiAssistantMessage & { googleNativeReplay?: GoogleNativeReplay }).googleNativeReplay,
             origin,
+            input => requestDiagnostics.observeInvalidToolArguments(input, model.api, stopReason),
           ),
-          stopReason: mapStopReason(result.stopReason),
+          stopReason,
           usage: mapUsage(result.usage),
           model: resolvedResponseModel(result, model.id),
         };
@@ -1189,9 +1231,9 @@ export function createPiProvider(config: {
 
     async *stream(params: CompletionParams): AsyncIterable<StreamEvent> {
       const model = resolveModel(providerId, params.model, resolvedModel, config.baseUrl);
-      const requestDiagnostics = createRequestDiagnostics(params.signal, params.onRequestFailure, undefined, params.requestMetadata?.contextBudgetDiagnostics);
+      const requestDiagnostics = createRequestDiagnostics(params.signal, params.onRequestFailure, params.requestMetadata?.contextBudgetDiagnostics);
       const statusDiagnostics = createResponsesStatusDiagnostics(params.onRequestFailure, model,
-        requestDiagnostics.sequence, undefined);
+        requestDiagnostics.sequence);
       const suppliedHeaders = requestHeaders(params);
       const apiKey = config.apiKey ?? getEnvApiKey(model.provider);
       const origin = replayOrigin(model, apiKey, suppliedHeaders);
@@ -1200,6 +1242,10 @@ export function createPiProvider(config: {
       const reasoning = effectiveReasoning(params.reasoning);
       const sessionId = cacheSafeSessionId(params.sessionId);
       const terminalReasoning = createResponsesTerminalReasoning(model.api, params.signal);
+      const onProviderStreamEvent = terminalReasoning ? (event: unknown) => {
+        terminalReasoning.observe(event);
+        if (model.api === 'openai-codex-responses') requestDiagnostics.observeProviderStreamEvent(event);
+      } : undefined;
       const useOfficialReasoningDefaults = model.reasoning === true
         && ((params.reasoning === undefined && config.defaultReasoning === undefined)
           || (params.reasoning === "off" && (model.thinkingLevelMap as { off?: string | null })?.off === null));
@@ -1225,7 +1271,8 @@ export function createPiProvider(config: {
         return response;
       };
       const reportFailure = (error: unknown, aborted = false, boundary: ProviderFailureSource = 'exception') => {
-        const failure = requestDiagnostics.report(error, aborted, boundary, aborted || params.signal?.aborted ? undefined : statusDiagnostics?.failure(errorCapture.rejectedInputIndex));
+        const rejected = errorCapture.rejectedInput ?? requestDiagnostics.rejectedInput;
+        const failure = requestDiagnostics.report(error, aborted, boundary, aborted || params.signal?.aborted ? undefined : statusDiagnostics?.failure(rejected?.index, rejected?.field));
         try { if (failure && !requestDiagnostics.observed) log.warn("provider stream failed", { ...failure }); } catch { /* Best-effort diagnostics. */ }
       };
       let effectiveMaxTokens: number | undefined;
@@ -1288,8 +1335,9 @@ export function createPiProvider(config: {
               reasoning,
               cacheRetention: params.cacheRetention,
               sessionId,
+              disableContinuation: true,
               onResponse,
-              onProviderStreamEvent: terminalReasoning?.observe,
+              onProviderStreamEvent,
               ...(model.api === 'openai-completions' || model.api === 'openai-responses' || model.api === 'openai-codex-responses' || model.api === 'anthropic-messages'
                 ? { fetch: requestFetch } : {}),
               onPayload: onPayload as any,
@@ -1304,8 +1352,9 @@ export function createPiProvider(config: {
               temperature: params.temperature,
               cacheRetention: params.cacheRetention,
               sessionId,
+              disableContinuation: true,
               onResponse,
-              onProviderStreamEvent: terminalReasoning?.observe,
+              onProviderStreamEvent,
               ...(model.api === 'openai-completions' || model.api === 'openai-responses' || model.api === 'openai-codex-responses' || model.api === 'anthropic-messages'
                 ? { fetch: requestFetch } : {}),
               onPayload: onPayload as any,
@@ -1381,15 +1430,18 @@ export function createPiProvider(config: {
                 if (text) yield { type: "text_delta", text };
               }
               const serverFallbackReason = serverFallbackReasonFromResponseId(event.message.responseId);
+              const stopReason = mapStopReason(event.reason);
               yield {
                 type: "message_end",
-                stopReason: mapStopReason(event.reason),
+                stopReason,
                 usage: mapUsage(event.message.usage),
-                content: mapProviderContent(
+                ...mapCompletionContent(
                   completedContent,
+                  stopReason,
                   config.normalizeLiteralLeadingThinkText === true,
                   (event.message as PiAssistantMessage & { googleNativeReplay?: GoogleNativeReplay }).googleNativeReplay,
                   origin,
+                  input => requestDiagnostics.observeInvalidToolArguments(input, model.api, stopReason),
                 ),
                 model: resolvedResponseModel(event.message, model.id),
                 reasoningBoundary: {
@@ -1506,65 +1558,6 @@ function resolveModel(
   }
 
   throw new ProviderError(`No model found for provider: ${providerId}`, providerId);
-}
-
-/** Case-insensitive header lookup supporting both WHATWG `Headers` (what
- * undici / newer SDK errors expose) and the plain record shape older
- * OpenAI/Anthropic SDK `APIError.headers` used. */
-function headerValue(headers: unknown, name: string): string | undefined {
-  if (!headers || typeof headers !== "object") return undefined;
-  const maybeGet = (headers as { get?: unknown }).get;
-  if (typeof maybeGet === "function") {
-    try {
-      const v = (headers as { get: (n: string) => unknown }).get(name);
-      if (typeof v === "string" && v) return v;
-    } catch { /* fall through to record scan */ }
-  }
-  const lower = name.toLowerCase();
-  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
-    if (key.toLowerCase() === lower && typeof value === "string" && value) return value;
-  }
-  return undefined;
-}
-
-/** Milliseconds the provider asked us to wait before retrying a 429, or
- * undefined when no parsable hint exists (the runner then keeps its default
- * backoff; it clamps honored values to 120s).
- *
- * SDK-level errors (OpenAI/Anthropic `APIError`, undici response errors)
- * expose the failing response's headers as `.headers` or `.response.headers`;
- * pi-ai rethrows them unwrapped or one `cause` level deep, so we walk a short
- * chain. Recognized forms: `retry-after-ms` (milliseconds, OpenAI extension)
- * and `retry-after` (delta-seconds or an HTTP-date per RFC 9110). */
-function retryAfterMsFrom(err: unknown): number | undefined {
-  let cur: unknown = err;
-  for (let depth = 0; cur && typeof cur === "object" && depth < 4; depth++) {
-    const rec = cur as Record<string, unknown>;
-    const headers = rec.headers
-      ?? (rec.response && typeof rec.response === "object"
-        ? (rec.response as Record<string, unknown>).headers
-        : undefined);
-
-    const rawMs = headerValue(headers, "retry-after-ms");
-    if (rawMs !== undefined) {
-      const ms = Number(rawMs);
-      if (Number.isFinite(ms) && ms >= 0) return Math.round(ms);
-    }
-    const raw = headerValue(headers, "retry-after");
-    if (raw !== undefined) {
-      const seconds = Number(raw);
-      if (Number.isFinite(seconds)) {
-        // Numeric → delta-seconds form; a negative value is malformed and
-        // must NOT fall through to Date.parse (V8 parses "-5" as a date).
-        if (seconds >= 0) return Math.round(seconds * 1000);
-      } else {
-        const dateMs = Date.parse(raw);
-        if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
-      }
-    }
-    cur = rec.cause ?? rec.error;
-  }
-  return undefined;
 }
 
 /** Wrap pi-ai errors into our error hierarchy.

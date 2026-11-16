@@ -13,7 +13,7 @@ Read this skill only after a passing `image_studio project.inspect` or `project.
 
 Check, in order:
 
-1. Intent: the image communicates the manifest's `one_job` and honors required subject, copy, references, and exclusions. Supplementary creative copy is allowed unless strict fidelity was requested. For strict, exact-only, or no-added-copy requests, treat any visible text outside the user's supplied copy as a blocker.
+1. Intent: compare the image with the user's current requirements and approved brief, then with the manifest's `one_job`. A self-authored manifest must not narrow those requirements; flag a missing requested message even when the candidate matches its own plan. Honor required subject, copy, references, and exclusions. Supplementary creative copy is allowed unless strict fidelity was requested. For strict, exact-only, or no-added-copy requests, treat any visible text outside the user's supplied copy as a blocker.
 2. Canvas and references: first read `reference_intent.mode`. For reproduce, compare every preserved attribute; for edit, verify every instruction while checking that protected/unaffected regions remain stable; for guide, ensure references influence only their declared role. Every planned region must remain visible in the intended reading order and no unrequested reference drift may appear.
    Review the exact candidate path returned by the generation/edit handoff. Use the current evidence, including any declared local edit or composition; never substitute an earlier provider output or guess a missing path.
 3. Composition: focal hierarchy, crop, scale, balance, negative space, edge tension, and thumbnail legibility. Read each required headline line by line. An automatic wrap that leaves a one-glyph orphan line is a `fix`; widen the text box, reduce the type size, or use an intentional balanced break before passing. A decorative rule, stroke, or signature device that crosses, crowds, masks, or visually splits required copy is a `fix` (or a `blocker` when the copy becomes unreadable), never a passing flourish.
@@ -23,9 +23,7 @@ Check, in order:
 
 ## Multi-image style consistency
 
-When the user requests multiple non-generation images as one set, use the first image that passes design review as the style anchor. For every later image, place a project-local copy of that anchor in `references` as a required reference with `role:"style"`; use `reference_intent.mode:"guide"`, recording `basis:"user"` only when the user explicitly requested the shared style and `basis:"inferred"` otherwise; preserve palette roles, typography roles, spacing/grid rhythm, shape/icon/stroke language, material or lighting treatment, and the signature device; allow only the content and local composition changes needed by that member; and set `reference_intent.minimum_score` to at least 85.
-
-Inspect each later candidate and the style anchor side by side. Use the existing `reference_fidelity` score as the style-consistency score for that comparison. Treat an undeclared change in the preserved style axes as a `fix`, while normal content differences are not drift. Before delivery, inspect all final images side by side once, repair and re-review any visual outlier, and only then report that the set is style-consistent. Separate high individual scores are not evidence of set-level consistency.
+For a non-generation set, follow [multi-image-sets.md](@skill/image-compose/references/multi-image-sets.md) for the shared production and acceptance contract, using the current attached evidence.
 
 Then decide what the user sees. Preview every exported image in its intended order so the set reads as a set; a representative image or a contact sheet is enough when the user asked for a summary or showing everything inline would be less useful. This shapes the reply, not the export: never withhold or delay a passing export because of how many images the message shows.
 

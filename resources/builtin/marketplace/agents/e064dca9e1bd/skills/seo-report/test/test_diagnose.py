@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "scripts"))
@@ -72,6 +73,8 @@ class DiagnoseTest(unittest.TestCase):
                 self.assertIn("dashboard", result)
                 self.assertIn("action_plan_md", result)
                 self.assertEqual(result["multi_page"], [])
+                self.assertEqual(result['page_evidence']['h1s'], ['Example Product Platform'])
+                self.assertEqual(result['page_evidence']['source'], 'file')
                 for name in (
                     "tech.json",
                     "content.json",
@@ -84,6 +87,33 @@ class DiagnoseTest(unittest.TestCase):
                     self.assertTrue((Path(".orkas-seo-audit") / name).is_file(), name)
             finally:
                 os.chdir(prior)
+
+    def test_sample_evidence_survives_pipeline_and_partial_failure_without_extra_acquisition(self):
+        urls = ['https://example.com/pricing', 'https://example.com/unavailable']
+        calls = []
+        def run(skill, script, argv, **kwargs):
+            calls.append((skill, list(argv)))
+            if skill == 'seo-crawl' and argv[0] == urls[1]:
+                raise RuntimeError('controlled page failure')
+            output = Path(argv[argv.index('--out') + 1])
+            if skill == 'seo-crawl':
+                output.write_text(json.dumps({'data': {'pages': [{
+                    'url': urls[0], 'status_code': 200, 'title': 'Product Plans',
+                    'h1s': ['Plans for your team'], 'first_paragraph': 'Compare feature and usage limits.',
+                    'meta_description': 'Billing and plan terms', 'canonical': urls[0],
+                }]}}), encoding='utf-8')
+            else:
+                output.write_text(json.dumps({'data': {'health_score': 94, 'geo_score': 86}}), encoding='utf-8')
+            return {'ok': True}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(diagnose, '_run_script', side_effect=run):
+            rows = diagnose._run_samples(urls, Path(tmp))
+        self.assertEqual(rows[0]['url'], urls[0])
+        self.assertEqual(rows[0]['health_score'], 94)
+        self.assertEqual(rows[0]['page_evidence']['h1s'], ['Plans for your team'])
+        self.assertEqual(rows[0]['page_evidence']['canonical'], urls[0])
+        self.assertFalse(rows[1]['ok'])
+        self.assertNotIn('page_evidence', rows[1])
+        self.assertEqual([argv[0] for skill, argv in calls if skill == 'seo-crawl'], urls)
 
 
 if __name__ == "__main__":

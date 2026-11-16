@@ -87,4 +87,4 @@ Use one series. Labels and values must have equal lengths and values must total 
 }
 ```
 
-After rendering, place the SVG in `index.html` through a local `<img>` or inline it when custom annotations are needed. Map the containing element to the matching `visual_plan` region and continue through native inspect, snapshot, scored review, and export.
+After rendering, place the SVG in `index.html` through a local `<img>` or inline it when custom annotations are needed. Map the containing element to the matching `visual_plan` region and follow the [native workflow](../SKILL.md#native-workflow).

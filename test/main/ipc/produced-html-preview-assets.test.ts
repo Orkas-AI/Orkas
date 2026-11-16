@@ -85,19 +85,25 @@ describe('produced.grantHtmlPreviewAssets', () => {
       .toMatchObject({ ok: true, absPath: path.join(site, 'style.css') });
   });
 
-  it('does not grant a page outside the file-action scope', async () => {
+  it('grants an external page its sibling assets without granting unrelated folders', async () => {
     await workspaceSite();
-    const outside = path.join(tmpDir, 'outside');
-    fs.mkdirSync(outside);
-    fs.writeFileSync(path.join(outside, 'index.html'), '<!doctype html>');
-    fs.writeFileSync(path.join(outside, 'secret.json'), '{}');
+    const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-external-html-')));
+    try {
+      fs.writeFileSync(path.join(outside, 'index.html'), '<!doctype html>');
+      fs.writeFileSync(path.join(outside, 'data.json'), '{}');
+      const unrelated = path.join(tmpDir, 'unrelated');
+      fs.mkdirSync(unrelated);
+      fs.writeFileSync(path.join(unrelated, 'data.json'), '{}');
 
-    const result = await invoke({ path: path.join(outside, 'index.html') });
+      const result = await invoke({ path: path.join(outside, 'index.html') });
 
-    expect(result).toMatchObject({ ok: false, error: 'path is outside the user workspace' });
-    const attachments = await import('../../../src/main/features/chat_attachments');
-    expect(attachments.resolveLocalHtmlPreviewAssetPath(path.join(outside, 'secret.json')))
-      .toMatchObject({ ok: false, code: 'forbidden' });
+      expect(result).toEqual({ ok: true });
+      const attachments = await import('../../../src/main/features/chat_attachments');
+      expect(attachments.resolveLocalHtmlPreviewAssetPath(path.join(outside, 'data.json')))
+        .toMatchObject({ ok: true });
+      expect(attachments.resolveLocalHtmlPreviewAssetPath(path.join(unrelated, 'data.json')))
+        .toMatchObject({ ok: false, code: 'forbidden' });
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
   });
 
   it('reports a non-HTML target without granting anything', async () => {

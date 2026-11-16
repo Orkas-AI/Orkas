@@ -1,7 +1,8 @@
+import { getActiveUserId, hasActiveUser } from './users';
 /**
  * tts — pluggable text-to-speech backend for the `generate_speech`
- * runtime. Encapsulated so new user-configured backends slot in behind one
- * interface:
+ * tool. Encapsulated so new backends slot in behind one interface (mirrors the
+ * image_gen / video_gen provider-adapter shape):
  *
  *   - 'openai-compatible' (PRIMARY): BYO user TTS API in the OpenAI
  *     `/audio/speech` shape — OpenAI / any compatible gateway.
@@ -20,6 +21,10 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { Semaphore } from 'async-mutex';
+import { acquireWithAbort } from '../util/locks';
+import { mediaRateLimitDelay, mediaRateLimitCode, mediaLimitDiagnostics, mediaLimitRetryDelay } from '../util/media-rate-limit';
 
 import type { TtsProfile } from './auth';
 import {
@@ -29,10 +34,15 @@ import {
 import { probeMediaDurationSec } from '../util/media_probe';
 import { createLogger } from '../logger';
 import { throwIfAborted } from '../util/abort';
+import { RetriableHttpStatusError } from '../util/retry';
 import { resolveTtsSelection } from './tts_capabilities';
+import { DOUBAO_TTS_FORMATS, ttsModelPreset } from './tts_catalog';
+import { decodeSpeechBase64, synthesizeNativeWebSocket } from './tts_native_websocket';
+import { convertTtsWav, ttsWavConversionAvailable } from '../util/tts-audio';
 import { estimateNarrationDuration, measureNarrationUnits, type NarrationDurationEstimate } from '../util/narration-timing';
 export { estimateNarrationDuration, measureNarrationUnits } from '../util/narration-timing';
 export type { NarrationDurationEstimate } from '../util/narration-timing';
+
 import {
   ORKAS_API_PROVIDER,
   orkasApiUsageHeaders,
@@ -66,7 +76,18 @@ export interface TtsParams {
 }
 
 export type TtsResult =
-  | { ok: true; path: string; bytes: number; backend: string; durationSec?: number }
+  | {
+    ok: true;
+    path: string;
+    bytes: number;
+    backend: string;
+    durationSec?: number;
+    /** The route and voice the line was made with, including a default the caller left out. */
+    routeRef?: string;
+    voiceRef?: string;
+    /** Made on a service the user configured, which bills them, rather than on credits. */
+    billedToOwnAccount?: boolean;
+  }
   | {
     ok: false;
     errorCode: string;
@@ -260,7 +281,22 @@ export function assessEstimatedNarrationFit(input: {
 
 interface TtsBackend {
   id: string;
-  synthesize(p: TtsParams): Promise<TtsResult>;
+  synthesize(p: TtsParams, timeoutMs?: number): Promise<TtsResult>;
+}
+
+// Shared by every PC speech entry, not just one Agent's adjacent tool batch.
+// Waiting has no new timeout; transport timers start inside synthesize after admission.
+const speechSlots = new Semaphore(2);
+const rateLimitReceipts = new WeakMap<TtsFailure, { delay: number; status: number; code: string }>();
+const speechOwnerChanged = (owner: string) => !!owner && (!hasActiveUser() || getActiveUserId() !== owner);
+
+async function speechLimitFailure(response: Response, signal?: AbortSignal): Promise<TtsFailure | null> {
+  if (response.status !== 429) return null;
+  const delay = await mediaRateLimitDelay(response, signal);
+  if (delay === null) return null;
+  const failure = sentFailure('E_TTS_API_ERROR', 'The speech service is rate limited.', 'unknown', 'not_charged');
+  rateLimitReceipts.set(failure, { delay, status: response.status, code: mediaRateLimitCode(response) });
+  return failure;
 }
 
 function isClearlyNonAudioResponse(resp: Response): boolean {
@@ -352,7 +388,6 @@ async function persistSynthesizedAudio(
 /** Default request timeout for a synthesis call. Speech of a sentence is quick;
  *  generous enough for a paragraph without hanging forever. */
 const TTS_TIMEOUT_MS = 120_000;
-
 function combineSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
   const timeout = AbortSignal.timeout(timeoutMs);
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
@@ -430,12 +465,13 @@ class HttpAudioTtsBackend implements TtsBackend {
     this.id = profile.provider === 'elevenlabs' ? 'elevenlabs' : 'openai-compatible';
   }
 
-  async synthesize(p: TtsParams): Promise<TtsResult> {
+  async synthesize(p: TtsParams, timeoutMs = TTS_TIMEOUT_MS): Promise<TtsResult> {
     const base = this.profile.baseUrl.replace(/\/+$/, '');
     const voice = p.voice || this.profile.voice;
     const format = (p.format || this.profile.format || 'mp3').toLowerCase();
     let url = `${base}/audio/speech`;
-    let headers: Record<string, string> = { Authorization: `Bearer ${this.profile.apiKey}`, 'Content-Type': 'application/json' };
+    let headers: Record<string, string> = { Authorization: `Bearer ${this.profile.apiKey}`, 'Content-Type': 'application/json',
+      ...(this.profile.provider === ORKAS_API_PROVIDER ? orkasApiUsageHeaders(p.usageContext) : {}) };
     let body: Record<string, unknown> = {
       model: this.profile.model,
       input: p.text,
@@ -443,6 +479,9 @@ class HttpAudioTtsBackend implements TtsBackend {
       response_format: format,
       ...(typeof p.speed === 'number' ? { speed: p.speed } : {}),
     };
+    const capability = ttsModelPreset(this.profile.provider || '', this.profile.model);
+    const invalid = validateNativeTtsArgs(capability, p, format, voice);
+    if (invalid) return invalid;
     if (this.id === 'elevenlabs') {
       // Native contract: https://elevenlabs.io/docs/api-reference/text-to-speech/convert
       // Request PCM 24k for WAV; 44.1k PCM/WAV requires a Pro subscription.
@@ -452,19 +491,22 @@ class HttpAudioTtsBackend implements TtsBackend {
       }
       url = `${base}/text-to-speech/${encodeURIComponent(voice)}?${new URLSearchParams({ output_format: codecs[format] })}`;
       headers = { 'xi-api-key': this.profile.apiKey, 'Content-Type': 'application/json' };
-      body = { text: p.text, model_id: this.profile.model, ...(p.speed !== undefined ? { voice_settings: { speed: p.speed } } : {}) };
+      body = { text: p.text, model_id: this.profile.model, ...(p.speed !== undefined && (!capability || capability.speed) ? { voice_settings: { speed: p.speed } } : {}) };
+      if (this.profile.model === 'eleven_v4_turbo') {
+        p.onProgress?.({ phase: 'tts.request', message: 'Requesting speech from the selected provider.' });
+        const result = await synthesizeNativeWebSocket(this.profile as TtsProfile, p, combineSignal(p.signal, timeoutMs), format, codecs[format]);
+        if (result.ok === false) return nativeSocketFailure(result, p.signal);
+        return persistSynthesizedAudio(this.id, p.outputAbsPath, format === 'wav' ? wrapPcm16MonoWav(result.audio) : result.audio);
+      }
     }
 
     p.onProgress?.({ phase: 'tts.request', message: `requesting speech from ${this.profile.label || base}` });
-    const requestSignal = combineSignal(p.signal, TTS_TIMEOUT_MS);
+    const requestSignal = combineSignal(p.signal, timeoutMs);
     let resp: Response;
     try {
       resp = await fetch(url, {
         method: 'POST',
-        headers: {
-          ...headers,
-          ...(this.profile.provider === ORKAS_API_PROVIDER ? orkasApiUsageHeaders(p.usageContext) : {}),
-        },
+        headers,
         body: JSON.stringify(body),
         signal: requestSignal,
       });
@@ -480,6 +522,8 @@ class HttpAudioTtsBackend implements TtsBackend {
       );
     }
     if (!resp.ok) {
+      const limited = await speechLimitFailure(resp, p.signal);
+      if (limited) { void resp.body?.cancel().catch(() => {}); return limited; }
       void resp.body?.cancel().catch(() => {});
       return providerHttpFailure('The speech provider', resp.status);
     }
@@ -493,6 +537,122 @@ class HttpAudioTtsBackend implements TtsBackend {
     if (!buf.length) return sentFailure('E_TTS_EMPTY', 'The speech provider returned empty audio.');
     const audio = this.id === 'elevenlabs' && format === 'wav' ? wrapPcm16MonoWav(buf) : buf;
     return persistSynthesizedAudio(this.id, p.outputAbsPath, audio);
+  }
+}
+
+function validateNativeTtsArgs(capability: ReturnType<typeof ttsModelPreset>, p: TtsParams, format: string, voice?: string): TtsFailure | undefined {
+  if (!capability) return undefined; // Legacy/custom profiles retain their protocol contract.
+  const speed = p.speed;
+  if (!voice || !capability.formats.includes(format)
+    || (speed !== undefined && (!Number.isFinite(speed) || (capability.speed
+      ? speed < capability.speed[0] || speed > capability.speed[1] : speed !== 1)))
+    || (capability.maxCharacters !== undefined && exceedsSpeechCharacterLimit(p.text, capability.maxCharacters))) {
+    return { ok: false, errorCode: 'E_TTS_ARG', message: 'Check the selected speech model, voice, text length, output format, and speed.',
+      requestDisposition: 'rejected_preflight', chargeStatus: 'not_charged', retryPolicy: 'safe_after_plan_fix' };
+  }
+}
+
+function exceedsSpeechCharacterLimit(text: string, limit: number): boolean {
+  let count = 0;
+  for (const _character of text) if (++count > limit) return true;
+  return false;
+}
+
+function nativeSocketFailure(result: { errorCode: string; dispatched: boolean }, signal?: AbortSignal): TtsFailure {
+  const failure = { ok: false as const, errorCode: signal?.aborted ? 'E_TTS_ABORTED' : result.errorCode,
+    message: result.errorCode === 'E_TTS_PROXY'
+      ? 'Speech could not connect through the configured proxy. Use a supported HTTP proxy before retrying.'
+      : 'Speech did not complete. Check the provider credentials, model and voice before starting a new retry.' };
+  return result.dispatched ? { ...failure, requestDisposition: 'sent', chargeStatus: 'unknown', retryPolicy: 'unknown' }
+    : { ...failure, requestDisposition: 'not_sent', chargeStatus: 'not_charged', retryPolicy: 'requires_user_action' };
+}
+
+/** Native JSON and task protocols share the existing bounded receipt, durable
+ * result and billing-uncertainty boundaries; none falls back to another vendor. */
+class NativeTtsBackend implements TtsBackend {
+  readonly id: string;
+  constructor(private readonly profile: TtsProfile) { this.id = profile.provider; }
+  async synthesize(p: TtsParams, timeoutMs = TTS_TIMEOUT_MS): Promise<TtsResult> {
+    const capability = ttsModelPreset(this.id, this.profile.model);
+    const format = (p.format || this.profile.format || capability?.formats[0] || 'mp3').toLowerCase();
+    if (!capability) return { ok: false, errorCode: 'E_TTS_ARG', message: 'Select a supported speech model in Settings.',
+      requestDisposition: 'rejected_preflight', chargeStatus: 'not_charged', retryPolicy: 'requires_user_action' };
+    const invalid = validateNativeTtsArgs(capability, p, format, p.voice);
+    if (invalid) return invalid;
+    if (this.id === 'google' && !ttsWavConversionAvailable(format)) return { ok: false, errorCode: 'E_TTS_ARG',
+      message: 'Select WAV output or restore the local audio converter before retrying.',
+      requestDisposition: 'rejected_preflight', chargeStatus: 'not_charged', retryPolicy: 'requires_user_action' };
+    const signal = combineSignal(p.signal, timeoutMs);
+    if (this.profile.model.startsWith('cosyvoice-')) {
+      p.onProgress?.({ phase: 'tts.request', message: 'Requesting speech from the selected provider.' });
+      const result = await synthesizeNativeWebSocket(this.profile, p, signal, format);
+      if (result.ok === false) return nativeSocketFailure(result, p.signal);
+      return persistSynthesizedAudio(this.id, p.outputAbsPath, result.audio);
+    }
+    const base = this.profile.baseUrl.replace(/\/+$/, '');
+    let url: string;
+    let body: unknown;
+    let headers: Record<string, string> = { Authorization: `Bearer ${this.profile.apiKey}`, 'Content-Type': 'application/json' };
+    if (this.id === 'minimax') {
+      url = `${base}/t2a_v2`;
+      body = { model: this.profile.model, text: p.text, stream: false, output_format: 'hex',
+        voice_setting: { voice_id: p.voice, speed: p.speed ?? 1 },
+        audio_setting: { format, sample_rate: format === 'opus' ? 24000 : 32000, bitrate: 128000, channel: 1 } };
+    } else if (this.id === 'aliyun') {
+      url = `${base}/api/v1/services/audio/tts/SpeechSynthesizer`;
+      body = { model: this.profile.model, input: { text: p.text, voice: p.voice, format, sample_rate: 24000, rate: p.speed ?? 1 } };
+    } else {
+      url = `${base}/interactions`;
+      headers = { 'x-goog-api-key': this.profile.apiKey, 'Content-Type': 'application/json' };
+      body = { model: this.profile.model, input: [{ type: 'user_input', content: [{ type: 'text', text: p.text }] }],
+        response_format: { type: 'audio' }, generation_config: { speech_config: [{ voice: p.voice }] }, store: false };
+    }
+    p.onProgress?.({ phase: 'tts.request', message: 'Requesting speech from the selected provider.' });
+    try {
+      const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal, redirect: 'error' });
+      if (!response.ok) {
+        const limited = await speechLimitFailure(response, p.signal);
+        void response.body?.cancel().catch(() => {});
+        return limited ?? providerHttpFailure('The speech provider', response.status);
+      }
+      const receipt = await readTtsResponse(response, this.id === 'aliyun' ? 1024 * 1024 : MAX_TTS_BYTES * 2 + 1024 * 1024, signal, p.signal);
+      if (receipt.ok === false) return receipt;
+      const data = JSON.parse(receipt.buffer.toString('utf8'));
+      let audio: Buffer | undefined;
+      if (this.id === 'minimax') {
+        const hex = data.data?.audio;
+        if (data.base_resp?.status_code === 0 && data.data?.status === 2 && typeof hex === 'string'
+          && hex.length > 0 && hex.length <= MAX_TTS_BYTES * 2 && hex.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(hex)) audio = Buffer.from(hex, 'hex');
+      } else if (this.id === 'google') {
+        if (data.status !== 'completed' || !Array.isArray(data.steps)) return invalidAudioResponse();
+        const outputs = data.steps.filter((step: any) => step?.type === 'model_output')
+          .flatMap((step: any) => Array.isArray(step.content) ? step.content : []).filter((part: any) => part?.type === 'audio');
+        // Single-speaker unary synthesis must yield one complete audio artifact.
+        if (outputs.length !== 1 || outputs[0].mime_type !== 'audio/wav') return invalidAudioResponse();
+        const wav = decodeSpeechBase64(outputs[0].data);
+        if (wav) audio = await convertTtsWav(wav, format, signal);
+      } else {
+        if (data.output?.finish_reason !== 'stop' || data.code) return invalidAudioResponse();
+        const resultUrl = new URL(data.output.audio.url);
+        if (!['http:', 'https:'].includes(resultUrl.protocol) || resultUrl.username || resultUrl.password || resultUrl.port
+          || resultUrl.hostname !== 'dashscope-result-bj.oss-cn-beijing.aliyuncs.com') return invalidAudioResponse();
+        resultUrl.protocol = 'https:';
+        // Download only the documented result host. Never forward provider credentials or follow redirects.
+        const download = await fetch(resultUrl.href, { signal, redirect: 'error' });
+        if (!download.ok || isClearlyNonAudioResponse(download)) {
+          void download.body?.cancel().catch(() => {}); return invalidAudioResponse();
+        }
+        const result = await readTtsResponse(download, MAX_TTS_BYTES, signal, p.signal);
+        if (result.ok === false) return result;
+        audio = result.buffer;
+      }
+      if (!audio?.length) return invalidAudioResponse();
+      if (signal.aborted) return sentFailure(p.signal?.aborted ? 'E_TTS_ABORTED' : 'E_TTS_NETWORK', 'Speech receipt was interrupted; the provider charge status is unknown.');
+      return persistSynthesizedAudio(this.id, p.outputAbsPath, audio);
+    } catch {
+      return sentFailure(p.signal?.aborted ? 'E_TTS_ABORTED' : signal.aborted ? 'E_TTS_NETWORK' : 'E_TTS_API_ERROR',
+        'Speech did not complete. Check the selected provider before starting a new retry.');
+    }
   }
 }
 
@@ -563,6 +723,7 @@ export function parseDoubaoV3Ndjson(raw: string): { ok: true; audio: Buffer } | 
 export function normalizeDoubaoAudioFormat(format: string): string {
   const value = String(format || 'mp3').trim().toLowerCase();
   if (value === 'wav') return 'pcm';
+  if (value === 'pcm') return 'pcm';
   if (value === 'opus' || value === 'ogg') return 'ogg_opus';
   return 'mp3';
 }
@@ -592,7 +753,7 @@ class DoubaoTtsBackend implements TtsBackend {
     voice?: string; format?: string; label?: string;
   }) {}
 
-  async synthesize(p: TtsParams): Promise<TtsResult> {
+  async synthesize(p: TtsParams, timeoutMs = TTS_TIMEOUT_MS): Promise<TtsResult> {
     if (p.speed !== undefined && (!Number.isFinite(p.speed) || p.speed < 0.5 || p.speed > 2)) {
       return { ok: false, errorCode: 'E_TTS_ARG', message: 'Doubao speech speed must be between 0.5 and 2.', requestDisposition: 'rejected_preflight', chargeStatus: 'not_charged', retryPolicy: 'safe_after_plan_fix' };
     }
@@ -601,6 +762,10 @@ class DoubaoTtsBackend implements TtsBackend {
     const base = (this.profile.baseUrl || 'https://openspeech.bytedance.com').replace(/\/+$/, '');
     const url = `${base}/api/v3/tts/unidirectional`;
     const format = (p.format || this.profile.format || 'mp3').toLowerCase();
+    if (!DOUBAO_TTS_FORMATS.includes(format)) {
+      return { ok: false, errorCode: 'E_TTS_ARG', message: 'Doubao speech supports mp3, wav, pcm, opus and ogg output.',
+        requestDisposition: 'rejected_preflight', chargeStatus: 'not_charged', retryPolicy: 'safe_after_plan_fix' };
+    }
     const upstreamFormat = normalizeDoubaoAudioFormat(format);
     const resourceId = this.profile.resourceId?.trim() || deriveDoubaoResourceId(speaker);
     const body = {
@@ -608,8 +773,9 @@ class DoubaoTtsBackend implements TtsBackend {
       req_params: {
         text: p.text,
         speaker,
+        ...(resourceId === 'seed-icl-2.0' ? { model: 'seed-tts-2.0-standard' } : {}),
         audio_params: {
-          format: upstreamFormat, sample_rate: 24000,
+          format: upstreamFormat, sample_rate: upstreamFormat === 'ogg_opus' ? 48000 : 24000,
           // V3 uses a percentage offset: -50 = 0.5x, 0 = 1x, 100 = 2x.
           ...(p.speed !== undefined ? { speech_rate: Math.round((p.speed - 1) * 100) } : {}),
         },
@@ -617,7 +783,7 @@ class DoubaoTtsBackend implements TtsBackend {
     };
 
     p.onProgress?.({ phase: 'tts.request', message: `requesting speech from ${this.profile.label || 'Doubao'}` });
-    const requestSignal = combineSignal(p.signal, TTS_TIMEOUT_MS);
+    const requestSignal = combineSignal(p.signal, timeoutMs);
     let resp: Response;
     try {
       resp = await fetch(url, {
@@ -625,6 +791,7 @@ class DoubaoTtsBackend implements TtsBackend {
         headers: {
           'X-Api-Key': this.profile.apiKey,
           'X-Api-Resource-Id': resourceId,
+          'X-Api-Request-Id': randomUUID(),
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
@@ -641,6 +808,8 @@ class DoubaoTtsBackend implements TtsBackend {
       );
     }
     if (!resp.ok) {
+      const limited = await speechLimitFailure(resp, p.signal);
+      if (limited) { void resp.body?.cancel().catch(() => {}); return limited; }
       void resp.body?.cancel().catch(() => {});
       return providerHttpFailure('Doubao TTS', resp.status);
     }
@@ -648,6 +817,18 @@ class DoubaoTtsBackend implements TtsBackend {
     const receipt = await readTtsResponse(resp, MAX_TTS_BYTES * 2, requestSignal, p.signal);
     if (receipt.ok === false) return receipt;
     const raw = receipt.buffer.toString('utf8');
+    if (receipt.buffer.length <= 16 * 1024) {
+      try {
+        const rejection = JSON.parse(raw);
+        if (rejection && !['data', 'id', 'task_id', 'audio', 'output'].some(field => rejection[field]) && String(rejection.code) === '45000000'
+          && (rejection.message ?? rejection.msg) === 'quota exceeded for types: concurrency') {
+          const failure = sentFailure('E_TTS_API_ERROR', 'The speech service is rate limited.', 'unknown', 'not_charged');
+          const delay = new RetriableHttpStatusError(429, 'tts', resp.headers.get('retry-after')).retryAfterMs ?? 0;
+          rateLimitReceipts.set(failure, { delay, status: 200, code: '45000000_concurrency' });
+          return failure;
+        }
+      } catch { /* Multiple events/partial audio never establish a safe rejection. */ }
+    }
     const parsed = parseDoubaoV3Ndjson(raw);
     if (parsed.ok === false) {
       return sentFailure(
@@ -699,6 +880,7 @@ function resolveTtsBackend(routeRef?: string): TtsBackend {
         label: p.label,
       });
     }
+    if (['minimax', 'aliyun', 'google'].includes(p.provider)) return new NativeTtsBackend(p);
     return new HttpAudioTtsBackend(p);
   }
   return new UnconfiguredTtsBackend();
@@ -718,10 +900,35 @@ export function configuredTtsBackendId(): string {
 }
 
 export async function generateSpeech(p: TtsParams): Promise<TtsResult> {
-  return generateSpeechWithProvider(p);
+  const owner = hasActiveUser() ? getActiveUserId() : '';
+  let release: (() => void) | undefined;
+  const queuedAt = Date.now();
+  const queueRef = speechSlots.isLocked() ? randomUUID() : undefined;
+  const queueLog = (event: 'wait' | 'result', result?: 'admitted' | 'cancelled' | 'owner_changed') => {
+    if (!queueRef) return;
+    try { log.warn('media_admission_wait', { event, operation: 'tts', request_ref: queueRef,
+      concurrency: 2, wait_ms: Math.max(0, Date.now() - queuedAt), ...(result ? { outcome: result } : {}) }); } catch { /* Best effort. */ }
+  };
+  queueLog('wait');
+  try {
+    try {
+      const acquire = async () => (await speechSlots.acquire())[1];
+      release = p.signal ? await acquireWithAbort(acquire, p.signal) : await acquire();
+      throwIfAborted(p.signal);
+      if (speechOwnerChanged(owner)) throw new Error('speech owner changed');
+      queueLog('result', 'admitted');
+    } catch {
+      queueLog('result', speechOwnerChanged(owner) && !p.signal?.aborted ? 'owner_changed' : 'cancelled');
+      return { ok: false, errorCode: 'E_TTS_ABORTED', message: 'TTS was aborted before dispatch.',
+        requestDisposition: 'not_sent', chargeStatus: 'not_charged', retryPolicy: 'unknown' };
+    }
+    return await generateSpeechObserved(p, owner);
+  } finally {
+    release?.();
+  }
 }
 
-async function generateSpeechWithProvider(p: TtsParams): Promise<TtsResult> {
+async function generateSpeechObserved(p: TtsParams, owner: string): Promise<TtsResult> {
   if (!p.text.trim()) return { ok: false, errorCode: 'E_TTS_ARG', message: 'text is required' };
   const resolved = await resolveTtsSelection({
     ...(p.routeRef ? { routeRef: p.routeRef } : {}),
@@ -758,20 +965,60 @@ async function generateSpeechWithProvider(p: TtsParams): Promise<TtsResult> {
     };
   }
   const backend = resolveTtsBackend(resolved.selection.routeRef);
-  const res = await backend.synthesize({
-    ...p,
+  const diagnostics = mediaLimitDiagnostics('tts');
+  // Admission wait has no new timeout. Once dispatched, attempts and backoff
+  // consume one monotonic budget instead of restarting the timer on each retry.
+  const deadline = performance.now() + TTS_TIMEOUT_MS;
+  let res: TtsResult;
+  try {
+    for (let attempt = 0; ; attempt++) {
+      if (p.signal?.aborted || speechOwnerChanged(owner)) {
+        diagnostics.finish(p.signal?.aborted ? 'cancelled' : 'owner_changed');
+        return { ok: false, errorCode: 'E_TTS_ABORTED', message: 'TTS was aborted before dispatch.',
+          requestDisposition: 'not_sent', chargeStatus: 'not_charged', retryPolicy: 'unknown' };
+      }
+      const remaining = Math.ceil(deadline - performance.now());
+      if (attempt > 0 && remaining <= 0) {
+        diagnostics.finish('budget_exhausted');
+        res = sentFailure('E_TTS_NETWORK', 'Speech timed out waiting for service capacity.', 'unknown', 'not_charged');
+        break;
+      }
+      diagnostics.attempt(attempt);
+      res = await backend.synthesize({
+        ...p,
+        routeRef: resolved.selection.routeRef,
+        voiceRef: resolved.selection.voiceRef,
+        voice: resolved.selection.providerVoiceId,
+        language: resolved.selection.language,
+      }, Math.max(1, remaining));
+      const receipt = res.ok === false ? rateLimitReceipts.get(res) : undefined;
+      const delay = receipt ? Math.min(mediaLimitRetryDelay(attempt, receipt.delay, 'tts'), Math.max(0, deadline - performance.now())) : 0;
+      if (receipt) diagnostics.rejected(receipt.status, receipt.code, delay);
+      if (receipt === undefined) {
+        diagnostics.finish(res.ok ? 'recovered' : p.signal?.aborted ? 'cancelled' : 'failed', res.ok ? 200 : undefined);
+        break;
+      }
+      p.onProgress?.({ phase: 'tts.rate_limit', message: 'Speech service is busy; waiting before retrying the rejected request.' });
+      try { await diagnostics.wait(attempt, delay, p.signal); }
+      catch {
+        diagnostics.finish('cancelled');
+        return { ok: false, errorCode: 'E_TTS_ABORTED', message: 'TTS was aborted while waiting for service capacity.',
+          requestDisposition: 'sent', chargeStatus: 'not_charged', retryPolicy: 'unknown' };
+      }
+    }
+  } catch (error) { diagnostics.finish(p.signal?.aborted ? 'cancelled' : 'failed'); throw error; }
+  if (!res.ok) return res;
+  const made = {
+    ...res,
     routeRef: resolved.selection.routeRef,
     voiceRef: resolved.selection.voiceRef,
-    voice: resolved.selection.providerVoiceId,
-    language: resolved.selection.language,
-  });
-  if (res.ok) {
-    // Best-effort: measure the synthesized length so callers can check it fits
-    // the clip. Never fail a good synthesis on a probe error.
-    try {
-      const dur = await probeMediaDurationSec(res.path, p.signal);
-      if (dur != null) return { ...res, durationSec: dur };
-    } catch { log.warn('probe narration duration failed'); }
-  }
-  return res;
+    billedToOwnAccount: true,
+  };
+  // Best-effort: measure the synthesized length so callers can check it fits
+  // the clip. Never fail a good synthesis on a probe error.
+  try {
+    const dur = await probeMediaDurationSec(res.path, p.signal);
+    if (dur != null) return { ...made, durationSec: dur };
+  } catch { log.warn('probe narration duration failed'); }
+  return made;
 }

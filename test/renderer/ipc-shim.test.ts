@@ -7,7 +7,6 @@ function loadShim(
   streamImpl: (...args: any[]) => { promise: Promise<void>; cancel: () => void },
   invokeImpl: (...args: any[]) => Promise<any> = vi.fn(),
 ) {
-  const monitorError = vi.fn();
   const loggerWarn = vi.fn();
   const sandbox: any = {
     console,
@@ -21,25 +20,23 @@ function loadShim(
     fetch: vi.fn(),
     createLogger: () => ({ warn: loggerWarn, info() {}, error() {} }),
     window: {
-      Monitor: { error: monitorError },
       orkas: {
         invoke: invokeImpl,
         stream: streamImpl,
       },
     },
   };
-  sandbox.Monitor = sandbox.window.Monitor;
   sandbox.window.window = sandbox.window;
   vm.createContext(sandbox);
   const source = readFileSync(resolve(__dirname, '../../src/renderer/modules/ipc-shim.js'), 'utf8');
   vm.runInContext(source, sandbox, { filename: 'ipc-shim.js' });
-  return { apiFetch: sandbox.apiFetch as Function, apiLibraryFetch: sandbox.apiLibraryFetch as Function, monitorError, loggerWarn };
+  return { apiFetch: sandbox.apiFetch as Function, apiLibraryFetch: sandbox.apiLibraryFetch as Function, loggerWarn };
 }
 
 describe('ipc-shim streams', () => {
   it('closes renderer-cancelled streams without reporting ipc_stream errors', async () => {
     let rejectStream: (err: Error) => void = () => {};
-    const { apiFetch, monitorError } = loadShim(() => ({
+    const { apiFetch, loggerWarn } = loadShim(() => ({
       promise: new Promise<void>((_resolve, reject) => { rejectStream = reject; }),
       cancel: () => {
         const err = Object.assign(new Error('stream cancelled'), { name: 'AbortError' });
@@ -57,12 +54,12 @@ describe('ipc-shim streams', () => {
     controller.abort();
 
     await expect(reader.read()).resolves.toEqual({ value: undefined, done: true });
-    expect(monitorError).not.toHaveBeenCalled();
+    expect(loggerWarn).not.toHaveBeenCalled();
   });
 
-  it('surfaces unexpected stream failures without exposing raw bridge errors', async () => {
+  it('still reports unexpected stream failures', async () => {
     const boom = new Error('boom');
-    const { apiFetch, monitorError } = loadShim(() => ({
+    const { apiFetch, loggerWarn } = loadShim(() => ({
       promise: Promise.reject(boom),
       cancel: () => {},
     }));
@@ -71,7 +68,12 @@ describe('ipc-shim streams', () => {
     const reader = res.body.getReader();
 
     await expect(reader.read()).rejects.toThrow('ipc stream failed');
-    expect(monitorError).not.toHaveBeenCalled();
+    expect(loggerWarn).toHaveBeenCalledWith('IPC bridge failure', {
+      kind: 'ipc_stream',
+      channel: 'groupChat.events',
+      error_name: 'Error',
+    });
+    expect(JSON.stringify(loggerWarn.mock.calls)).not.toContain('boom');
   });
 });
 
@@ -139,17 +141,17 @@ describe('ipc-shim invoke results', () => {
 
   it('does not classify expected business failures as IPC transport errors', async () => {
     const invoke = vi.fn(async () => ({ ok: false, error: 'conversation not found', code: 'E_NOT_FOUND' }));
-    const { apiFetch, monitorError } = loadShim(idleStream, invoke);
+    const { apiFetch, loggerWarn } = loadShim(idleStream, invoke);
 
     const response = await apiFetch('/api/conversations/c1/history');
 
     await expect(response.json()).resolves.toMatchObject({ ok: false, code: 'E_NOT_FOUND' });
-    expect(monitorError).not.toHaveBeenCalled();
+    expect(loggerWarn).not.toHaveBeenCalled();
   });
 
   it('does not classify upload validation results as IPC transport errors', async () => {
     const invoke = vi.fn(async () => ({ ok: false, error: 'binary too large', code: 'E_TOO_LARGE' }));
-    const { apiFetch, monitorError } = loadShim(idleStream, invoke);
+    const { apiFetch, loggerWarn } = loadShim(idleStream, invoke);
 
     const response = await apiFetch('/api/contexts/upload', {
       method: 'POST',
@@ -158,32 +160,32 @@ describe('ipc-shim invoke results', () => {
     });
 
     await expect(response.json()).resolves.toMatchObject({ ok: false, code: 'E_TOO_LARGE' });
-    expect(monitorError).not.toHaveBeenCalled();
+    expect(loggerWarn).not.toHaveBeenCalled();
   });
 
-  it('returns a failed response for rejected bridge invocations', async () => {
-    const invoke = vi.fn(async () => { throw new Error('bridge disconnected'); });
-    const { apiFetch, monitorError, loggerWarn } = loadShim(idleStream, invoke);
+  it('still reports rejected bridge invocations', async () => {
+    const invoke = vi.fn(async () => { throw new Error('/Users/test/private/bridge.sock disconnected'); });
+    const { apiFetch, loggerWarn } = loadShim(idleStream, invoke);
 
     const response = await apiFetch('/api/conversations/list');
 
     expect(response.ok).toBe(false);
-    expect(monitorError).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toEqual({ ok: false, error: 'ipc request failed' });
     expect(loggerWarn).toHaveBeenCalledWith('IPC bridge failure', expect.objectContaining({
       kind: 'ipc_invoke',
       channel: 'conversations.list',
       error_name: 'Error',
     }));
+    expect(JSON.stringify(loggerWarn.mock.calls)).not.toContain('/Users/test');
   });
 
   it('collapses repeated bridge failures for the same channel and cause', async () => {
     const invoke = vi.fn(async () => { throw Object.assign(new Error('disconnected'), { code: 'E_PIPE' }); });
-    const { apiFetch, monitorError, loggerWarn } = loadShim(idleStream, invoke);
+    const { apiFetch, loggerWarn } = loadShim(idleStream, invoke);
 
     await apiFetch('/api/conversations/list');
     await apiFetch('/api/conversations/list');
 
-    expect(monitorError).not.toHaveBeenCalled();
     expect(loggerWarn).toHaveBeenCalledTimes(1);
     expect(loggerWarn).toHaveBeenCalledWith('IPC bridge failure', {
       kind: 'ipc_invoke',
@@ -191,6 +193,26 @@ describe('ipc-shim invoke results', () => {
       error_name: 'Error',
       error_code: 'E_PIPE',
     });
+  });
+
+  it('uses the canonical invoke diagnostic for rejected binary uploads', async () => {
+    const invoke = vi.fn(async () => { throw new Error('bridge disconnected'); });
+    const { apiFetch, loggerWarn } = loadShim(idleStream, invoke);
+
+    const response = await apiFetch('/api/contexts/upload', {
+      method: 'POST',
+      headers: { 'X-Filename': 'report.bin' },
+      body: new Uint8Array([1, 2, 3]),
+    });
+
+    expect(response.ok).toBe(false);
+    expect(loggerWarn).toHaveBeenCalledWith('IPC bridge failure', {
+      kind: 'ipc_invoke',
+      channel: 'contexts.upload',
+      error_name: 'Error',
+      transport: 'upload',
+    });
+    expect(loggerWarn).not.toHaveBeenCalledWith('IPC bridge failure', expect.objectContaining({ kind: 'ipc_upload' }));
   });
 
   it('uploads only the selected typed-array bytes and accepts Fetch Headers casing', async () => {
@@ -252,15 +274,14 @@ describe('ipc-shim invoke results', () => {
   });
 
   it('does not echo unmatched route identifiers to logs or the UI response', async () => {
-    const { apiFetch, monitorError, loggerWarn } = loadShim(idleStream);
+    const { apiFetch, loggerWarn } = loadShim(idleStream);
 
     const response = await apiFetch('/api/conversations/private-conversation-id/unknown');
     const body = await response.json();
-    const diagnostics = JSON.stringify([monitorError.mock.calls, loggerWarn.mock.calls, body]);
+    const diagnostics = JSON.stringify([loggerWarn.mock.calls, body]);
 
     expect(response.status).toBe(404);
     expect(body).toEqual({ ok: false, error: 'unknown API route' });
-    expect(monitorError).not.toHaveBeenCalled();
     expect(loggerWarn).toHaveBeenCalledWith('IPC bridge failure', {
       kind: 'ipc_unmatched_route',
       channel: 'unmatched',
@@ -306,10 +327,10 @@ describe('scoped Library IPC', () => {
 
   it('never falls back to the global Library after a project request fails', async () => {
     const invoke = vi.fn(async () => { throw new Error('project unavailable'); });
-    const { apiLibraryFetch, monitorError } = loadShim(vi.fn(), invoke);
+    const { apiLibraryFetch, loggerWarn } = loadShim(vi.fn(), invoke);
     const result = await (await apiLibraryFetch('p1', '/api/contexts/read?path=same.md')).json();
     expect(result).toMatchObject({ ok: false, error: 'ipc request failed' });
     expect(invoke).toHaveBeenCalledExactlyOnceWith('projects.files.readText', { projectId: 'p1', name: 'same.md' });
-    expect(monitorError).not.toHaveBeenCalled();
+    expect(loggerWarn).toHaveBeenCalledOnce();
   });
 });

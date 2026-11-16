@@ -28,7 +28,7 @@ export function createWebAssistDiagnostics() {
   const suppressed = new Map<Failure, number>();
   let emitted: number[] = [];
   return (sender: Pick<WebContents, 'isDestroyed'>, failure: Failure, netCode?: unknown,
-    _context?: unknown, exitDetails?: RendererExitDetails): void => {
+    exitDetails?: RendererExitDetails): void => {
     if (!Object.hasOwn(FAILURES, failure) || sender.isDestroyed()) return;
     const now = Date.now();
     emitted = emitted.filter(time => now - time < WINDOW_MS);
@@ -47,7 +47,7 @@ export function createWebAssistDiagnostics() {
         ? { net_error_code: netCode } : {}),
     };
     suppressed.delete(failure);
-    // Native exit facts stay in the sampled local warning. No page, URL or exception data is retained.
+    // Native exit facts stay in the rate-limited local warning. No page, URL or exception data is retained.
     let localExitDiagnostic = {};
     if (failure === 'renderer_gone') {
       let reason = 'unknown';

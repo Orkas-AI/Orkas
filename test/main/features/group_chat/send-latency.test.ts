@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
-import { checkLatencyBudget, FIRST_REQUEST_LATENCY_LIMIT_MS, type LatencySample } from '../../../helpers/latency-budget';
+import { checkLatencyBudget, FIRST_REQUEST_LATENCY_LIMIT_MS, LATENCY_LIMIT_MS, type LatencySample } from '../../../helpers/latency-budget';
 
 // Measure the real send -> bus -> client -> Runner -> SDK fetch path. Only the external
 // model response is simulated; configuration, connectors, sessions, and tools stay real.
@@ -60,6 +60,7 @@ function completeCliDispatch(opts: any): void {
   // ends after the real runner has prepared persistence, context, and its live bridge.
   const bridgeEnv = JSON.parse(fs.readFileSync(opts.bridge.server.env.ORKAS_BRIDGE_ENV_FILE, 'utf8'));
   expect(bridgeEnv.ORKAS_BRIDGE_CAPABILITIES).toContain('chat.read');
+  expect(bridgeEnv.ORKAS_BRIDGE_CAPABILITIES).toContain('connectors');
   onRequest?.({ messages: [{ role: 'user', content: opts.prompt }] });
   opts.onEvent({ type: 'done', status: 'completed', output: 'Ready.', durationMs: 1 });
 }
@@ -86,10 +87,6 @@ beforeAll(async () => {
   nativeEsmHooks = require('../../../../src/main/util/native-esm-loader.js').registerNativeEsmLoader();
   const { installSdkTimeoutPatch } = await import('../../../../src/main/model/core-agent/sdk-timeout-patch');
   installSdkTimeoutPatch();
-  // SDK 1.2 loads this transport lazily. Compile its module graph alongside
-  // the other loaded-app code, before the fixture data exists. Do not create
-  // an SDK client or send a request: both still happen on the measured path.
-  await import('@earendil-works/pi-ai/api/anthropic-messages');
   await import('#core-agent');
   await import('../../../../src/main/model/client');
   await import('../../../../src/main/features/local_agents/runner');
@@ -160,12 +157,13 @@ function seedConnectors(count: number): void {
   storage.writeJsonSync(paths.userRemoteConfigFile(UID), { active: { immediate: { 'connectors.catalog': catalog } } });
   storage.writeJsonSync(paths.userConnectorsConfigFile(UID), {
     version: 2, oauth_hints: {}, _deleted_at: {},
-    connections: Object.fromEntries(catalog.slice(0, count).map(entry => [entry.id, {
-      id: entry.id, origin: 'catalog', display_name: entry.display_name, transport: null,
+    connections: Object.fromEntries(catalog.slice(0, count).map(entry => [`custom-${entry.id}`, {
+      id: `custom-${entry.id}`, origin: 'custom', custom_auth_mode: 'none', display_name: entry.display_name,
+      transport: { kind: 'streamable-http', url: 'https://latency-fixture.invalid/mcp' },
       status: { kind: 'connected', since: 1 }, enabled_subtools: null,
       tools_cache: Array.from({ length: 20 }, (_, index) => ({
         name: `read_items_${index}`, description: 'Read items',
-        inputSchema: { type: 'object', properties: { query: { type: 'string', description: 'q'.repeat(4_000) } } },
+        input_schema: { type: 'object', properties: { query: { type: 'string', description: 'q'.repeat(4_000) } } },
       })),
       created_at: '2026-09-12T00:00:00Z', updated_at: '2026-09-12T00:00:00Z',
     }])),
@@ -211,9 +209,9 @@ describe('initial model request latency', () => {
       const result = await sendUntilRequest(cid);
       samples.push(result.elapsedMs);
       expect(result.body.messages.length).toBeGreaterThan(0);
-      checkLatencyBudget('send to first model request', result, BUDGET_MS);
+      checkLatencyBudget('send to first model request', result, turn === 0 ? BUDGET_MS : LATENCY_LIMIT_MS);
     }
-    console.log('[send-latency]', JSON.stringify({ actor, connectors: count, budget_ms: BUDGET_MS, samples_ms: samples }));
+    console.log('[send-latency]', JSON.stringify({ actor, connectors: count, first_budget_ms: BUDGET_MS, repeated_budget_ms: LATENCY_LIMIT_MS, samples_ms: samples }));
   });
 
   it.each(['claude', 'codex'] as const)(`%s prepares the real CLI bridge within ${BUDGET_MS} ms on first and repeated sends`, async cli => {
@@ -233,9 +231,9 @@ describe('initial model request latency', () => {
     for (let turn = 0; turn < 3; turn++) {
       const result = await sendUntilRequest(cid);
       samples.push(result.elapsedMs);
-      checkLatencyBudget('send to CLI backend dispatch', result, BUDGET_MS);
+      checkLatencyBudget('send to CLI backend dispatch', result, turn === 0 ? BUDGET_MS : LATENCY_LIMIT_MS);
     }
-    console.log('[send-latency]', JSON.stringify({ actor: cli, boundary: 'CLI backend dispatch', connectors: 10, budget_ms: BUDGET_MS, samples_ms: samples }));
+    console.log('[send-latency]', JSON.stringify({ actor: cli, boundary: 'CLI backend dispatch', connectors: 10, first_budget_ms: BUDGET_MS, repeated_budget_ms: LATENCY_LIMIT_MS, samples_ms: samples }));
   });
 
   it('reports which hop delayed a deferred bubble, without carrying the message', async () => {

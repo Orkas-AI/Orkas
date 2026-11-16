@@ -38,6 +38,8 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 
 import {
+  appExecutionSessionRoot,
+  appExecutionFileStem,
   sessionAnalysisInputsDir,
   sessionToolResultsDir,
   userLocalSessionFile,
@@ -133,6 +135,8 @@ export function resolveSessionPath(userId: string, sessionId: string): string {
       `(gconv | gmember | gworker | skill | agent | extract-img | reflect | anon | cli)`,
     );
   }
+  const appRoot = appExecutionSessionRoot(userId, sessionId);
+  if (appRoot) return path.join(appRoot, `${appExecutionFileStem(sessionId)}.jsonl`);
   return isEphemeralSessionId(sessionId)
     ? userLocalSessionFile(userId, sessionId)
     : cloudSessionFileFor(userId, sessionId);
@@ -145,6 +149,8 @@ export function sessionFileFor(sessionId: string): string {
 export function toolResultsDirForSession(userId: string, sessionId: string): string {
   // Validate the id with the same router that owns the session jsonl path.
   resolveSessionPath(userId, sessionId);
+  const appRoot = appExecutionSessionRoot(userId, sessionId);
+  if (appRoot) return path.join(appRoot, `${appExecutionFileStem(sessionId)}.tool-results`);
   return isEphemeralSessionId(sessionId)
     ? sessionToolResultsDir(userId, sessionId)
     : cloudSessionToolResultsDirFor(userId, sessionId);
@@ -226,6 +232,18 @@ export function evictSession(sessionId: string): void {
   cacheGeneration += 1;
   cache.delete(key);
   pending.delete(key);
+}
+
+/** Only after the owning executor has drained all writers. Unsaved state
+ * prevents destructive cleanup rather than being silently discarded. */
+export function evictAppSessions(userId: string, cid: string): boolean {
+  if (!appExecutionSessionRoot(userId, `gconv-${cid}`)) return false;
+  const prefix = `${userId}\0`;
+  const owned = (key: string) => key.startsWith(prefix)
+    && appExecutionSessionRoot(userId, key.slice(prefix.length)) === appExecutionSessionRoot(userId, `gconv-${cid}`);
+  if ([...pending.keys()].some(owned) || [...cache].some(([key, session]) => owned(key) && session.hasPendingPersistence())) return false;
+  for (const key of cache.keys()) if (owned(key)) cache.delete(key);
+  return true;
 }
 
 /**

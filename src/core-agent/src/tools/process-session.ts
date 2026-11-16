@@ -67,6 +67,13 @@ const PROCESS_HOST_EXIT_BUDGET_MS = 5_000;
 const SESSIONS_KEY = Symbol.for("orkas.core_agent.process_sessions");
 const sessions: Map<string, ProcessSession> = ((globalThis as any)[SESSIONS_KEY] ??= new Map<string, ProcessSession>());
 
+/** Host-owned storage cleanup must wait until managed children close. */
+export function runningProcessSessions(owner: string): number {
+  let count = 0;
+  for (const session of sessions.values()) if (session.owner === owner && !session.closed) count++;
+  return count;
+}
+
 function processOwner(ctx: ToolContext): string {
   const owner = ctx.state?.processSessionOwner;
   return typeof owner === "string" ? owner : "";

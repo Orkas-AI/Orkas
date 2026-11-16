@@ -87,7 +87,34 @@ export function logErrorRef(err: unknown): Record<string, unknown> {
   };
 }
 
-export function logErrorSummary(err: unknown): Record<string, unknown> {
+const CLOSED_ERROR_TYPES = new Set([
+  'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError',
+  'AbortError', 'TimeoutError', 'RequestTimeoutError',
+]);
+const CLOSED_ERROR_CODES = new Set([
+  'EACCES', 'EPERM', 'ENOENT', 'ENOSPC', 'EIO', 'EPIPE', 'EROFS',
+  'ENOTDIR', 'EISDIR', 'EEXIST', 'ECONNRESET', 'ECONNREFUSED',
+  'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ABORT_ERR',
+]);
+
+export function logErrorSummary(err: unknown, options: { closed?: boolean } = {}): Record<string, unknown> {
+  if (options.closed) {
+    // Logging must not run arbitrary exception coercion or interrupt recovery.
+    const field = (key: string): unknown => {
+      try { return (err as Record<string, unknown> | null)?.[key]; } catch { return undefined; }
+    };
+    const name = field('name');
+    const code = field('code') ?? field('Code');
+    const status = field('status') ?? field('statusCode');
+    const rawMessage = field('message');
+    const message = typeof rawMessage === 'string' ? rawMessage : typeof err === 'string' ? err : '';
+    return {
+      error_type: typeof name === 'string' && CLOSED_ERROR_TYPES.has(name) ? name : 'exception',
+      error_code: typeof code === 'string' && CLOSED_ERROR_CODES.has(code) ? code : 'operation_failed',
+      ...(typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599 ? { status } : {}),
+      message_hash: hashForLog(message), message_chars: message.length,
+    };
+  }
   const e = err as any;
   const message = String(e?.message || err || '');
   return {

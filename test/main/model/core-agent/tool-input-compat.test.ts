@@ -48,6 +48,39 @@ const call = (name: string, input: Record<string, unknown>, id = 'call'): ToolUs
 const extras = { future_option: 'PRIVATE_VALUE' };
 
 describe('uniform model tool argument compatibility', () => {
+  it('keeps a failed process stdout quotation out of parameter-error classification', async () => {
+    const source = 'E_BAD_INPUT: quoted command output';
+    const tool: AgentTool = { name: 'store', description: 'Fixture', inputSchema: { type: 'object', properties: {} },
+      execute: async () => ({ content: source, isError: true, observations: { execution: {
+        status: 'failed', exitCode: 1, durationMs: 1, timedOut: false, outputLimitExceeded: false,
+        stdout: { bytes: source.length, truncated: false }, stderr: { bytes: 0, truncated: false },
+      } } }) };
+    const [event] = await setup([tool], [call('store', {})]).run();
+    expect(event.result).toBe(source);
+    expect(event.isError).toBe(true);
+  });
+  it.each(['sequential', 'parallel', 'programmatic', 'reflection'] as const)('formats only final parameter refusals in the %s lane without replay', async lane => {
+    const execute = vi.fn(async () => ({ content: 'E_BAD_INPUT: content must be a string', isError: true }));
+    const tool: AgentTool = { name: 'store', description: 'Fixture', executionMode: lane === 'parallel' ? 'parallel' : 'sequential',
+      inputSchema: { type: 'object', properties: { content: {} } }, execute };
+    const count = lane === 'parallel' ? 2 : 1;
+    const calls = lane === 'programmatic'
+      ? [call('run_program', { code: 'json(await tools.store({content: 4}));' })]
+      : Array.from({ length: count }, (_, index) => call('store', { content: 4, ...extras }, `rejected-${index}`));
+    const run = setup([tool], calls, lane === 'programmatic');
+    if (lane === 'reflection') await run.runner.runReflection('Review fixture');
+    else await run.run();
+    const replies = run.requests[1].messages.flatMap(m => m.content).filter(c => c.type === 'tool_result') as any[];
+    // Program output contains a serialized child result, not a second tool-error envelope.
+    expect(replies).toHaveLength(count);
+    for (const reply of replies) {
+      expect(reply.content).toContain('invalid_arguments');
+      expect(reply.content).toContain('expected');
+      expect(reply.content).toContain('content must be a string');
+      expect(reply.content).not.toContain('PRIVATE_VALUE');
+    }
+    expect(execute).toHaveBeenCalledTimes(count);
+  });
   it.each(['sequential', 'parallel', 'programmatic', 'reflection'] as const)('executes exactly once per %s call with only declared arguments and reports ignored names', async lane => {
     const execute = vi.fn(async () => ({ content: '{"saved":true}', observations: { coordination: { changed: true } } }));
     const tool: AgentTool = { name: 'store', description: 'Save a fixture', executionMode: lane === 'parallel' ? 'parallel' : 'sequential',

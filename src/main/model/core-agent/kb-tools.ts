@@ -1,3 +1,4 @@
+import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
 /**
  * Library-scoped action tool injected into every main-conv runner.
  *
@@ -271,7 +272,7 @@ function createKbSearchTool(opts: KbToolsOpts): AgentTool {
     },
     async execute(input) {
       const query = String(input.query ?? '').trim();
-      if (!query) return { content: 'library(search): `query` is required', isError: true };
+      if (!query) return parameterError('library(search): `query` is required', ['query'], 'required');
       const k = Math.min(30, Math.max(1, Math.floor(Number(input.k ?? 8))));
       const kind = parseKbKind(input.kind);
       const rawDir = typeof input.dir === 'string' ? input.dir.trim() : '';
@@ -426,7 +427,7 @@ function createKbReadTool(opts: KbToolsOpts): AgentTool {
     },
     async execute(input) {
       const relPath = String(input.path ?? '').trim();
-      if (!relPath) return { content: 'library(read): `path` is required', isError: true };
+      if (!relPath) return parameterError('library(read): `path` is required', ['path'], 'required');
       const scope = parseScope(input.scope, hasProject);
       let source: {
         scope: LibraryScope;
@@ -563,13 +564,10 @@ export function createLibraryTool(opts: KbToolsOpts): AgentTool {
     async execute(input, ctx) {
       const action = String(input.action ?? '').trim() as LibraryAction;
       if (action !== 'list' && action !== 'search' && action !== 'read') {
-        return {
-          content: 'library: `action` must be one of "list", "search", or "read"',
-          isError: true,
-        };
+        return parameterError('library: `action` must be one of "list", "search", or "read"', ['action'], 'invalid_value');
       }
       const fieldError = libraryActionError(action, input);
-      if (fieldError) return { content: fieldError, isError: true };
+      if (fieldError) return parameterError(fieldError);
       const allowed = LIBRARY_ACTION_FIELDS[action];
       const ignoredFields = Object.keys(input).filter((key) => !allowed.has(key)).sort();
       const effectiveInput = Object.fromEntries(Object.entries(input).filter(([key]) => allowed.has(key)));

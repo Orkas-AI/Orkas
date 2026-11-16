@@ -15,6 +15,7 @@
 
 import type { AgentTool, ToolContext, ToolResult } from "./base.js";
 import { PROJECT_INSTRUCTIONS_TEXT_DESCRIPTION } from '../../../../bin/project-instructions-contract.cjs';
+import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
 
 export interface ProjectInstructionsToolHandler {
   /** Replace the project's instructions with `instructions` (full content). */
@@ -42,7 +43,7 @@ export function createProjectInstructionsTool(handler: ProjectInstructionsToolHa
     async execute(input: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {
       const instructions = typeof input.instructions === 'string' ? input.instructions : '';
       if (!instructions.trim()) {
-        return { content: JSON.stringify({ ok: false, error: '"instructions" is required' }), isError: true };
+        return parameterError('"instructions" is required', ['instructions'], 'required', { ok: false, error: '"instructions" is required' });
       }
       try {
         const r = await handler.set(instructions);

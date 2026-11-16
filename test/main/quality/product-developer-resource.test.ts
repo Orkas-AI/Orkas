@@ -45,7 +45,7 @@ describe('ProductDeveloper Resource contract', () => {
       expect(spec.workflow, marker).toContain(marker);
     }
     expect(spec.dispatch).toContain('without inventing MVP');
-    expect(spec.dispatch).toContain('Hand disposable validation demos');
+    expect(spec.dispatch).not.toMatch(/hand.*prototyp/i);
 
     expect(spec.description_zh).toMatch(/bug|重构|代码评审|性能|CI|测试修复/i);
     expect(spec.description_en).toMatch(/bug|refactor|code review|performance|CI|test repair/i);
@@ -110,7 +110,7 @@ describe('ProductDeveloper Resource contract', () => {
 
     const skillMd = fs.readFileSync(path.join(productDevDir, 'SKILL.md'), 'utf8');
     expect(skillMd).toMatch(/do not invent an MVP, PRD, scope, architecture, or code/i);
-    expect(skillMd).toMatch(/disposable demo[\s\S]*do not produce implementation\s+artifacts/i);
+    expect(skillMd).not.toContain('hand off to prototyping');
     const frontmatter = skillMd.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
     const frontmatterKeys = frontmatter.split('\n')
       .map((line) => line.match(/^([a-z_]+):/)?.[1])

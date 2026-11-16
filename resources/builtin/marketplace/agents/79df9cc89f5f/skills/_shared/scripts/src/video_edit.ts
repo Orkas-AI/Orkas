@@ -2,7 +2,7 @@
  * video_edit — local backend for the `edit_video` tool (deterministic real-
  * footage editing). Runs the bundled ffmpeg/ffprobe (see util/bundled-runtime
  * `bundledFfmpegPaths`) — zero new dependencies, no network, no npx. This is
- * the "C 剪辑" capability axis; COMPOSE rendering is owned by the native
+ * the deterministic editing capability axis; COMPOSE rendering is owned by the native
  * `video_studio` tool.
  *
  * Multi-op (per the design decision that edit_video is one multi-sub-op tool):
@@ -23,12 +23,13 @@ import * as fsSync from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { bundledFfmpegPaths } from './bundled-runtime';
 import { redactPaths } from './redact';
 import { createLogger } from './logger-shim';
 import {
+  ACTIVITY_SAMPLE_RATE,
   keepIntervalsFromRemovals,
   complementIntervals,
   fillerSpansFromWords,
@@ -40,6 +41,10 @@ import {
   summarizeQuality,
   decisionEvidence,
   DEFAULT_FILLERS,
+  normalizeFocusPlan,
+  piecewiseExpr,
+  type FocusStep,
+  type ActivityRegion,
   type Span,
   type SceneCandidate,
   type DecisionEvidence,
@@ -97,6 +102,8 @@ export interface ReframeReport {
   canvas: string;
   from: string | null;
   focus?: { x: number; y: number };
+  /** The point kept centred per stretch, when the reframe followed a plan. */
+  plan?: Array<{ start: number; centre_x: number; centre_y: number }>;
   pad_color?: string;
   note?: string;
 }
@@ -162,7 +169,7 @@ export interface EditParams {
    *  (multi-adelay = per-line placement, so plan.json's per-line `start_sec`
    *  actually lands on its scene). Takes precedence over audioAbsPath/start
    *  when non-empty. */
-  audioSegments?: Array<{ audioAbsPath: string; startSec?: number }>;
+  audioSegments?: Array<{ audioAbsPath: string; startSec?: number; endSec?: number }>;
   /** mix: what to do when the BASE video already carries an audio track.
    *  - 'reject' (DEFAULT): fail — prevents silently stacking a SECOND narration
    *    onto a base that already has one (e.g. a compose render that baked it in;
@@ -170,6 +177,8 @@ export interface EditParams {
    *  - 'mix': intentionally layer (music under a talking-head's built-in voice).
    *  - 'replace': drop the base audio, keep only the added narration. */
   onExistingAudio?: 'reject' | 'mix' | 'replace';
+  /** mix with on_existing_audio 'mix': lower the base under the added audio. */
+  duck?: boolean;
   /** Output path (all ops except probe / loudness). */
   outputAbsPath?: string;
   /** trim: seconds. mix: lead-in offset (delay) for the added audio. */
@@ -177,6 +186,9 @@ export interface EditParams {
   duration?: number;
   /** burnsubs: subtitle file (.srt/.ass). */
   subtitlesAbsPath?: string;
+  /** burnsubs: a band of the picture, as fractions of its height from the top, to cover with
+   *  an opaque bar before the captions go on it: captions already burned into the source. */
+  cover?: { top: number; bottom: number };
   /** overlay: the overlaid media + position (px, defaults 0,0). */
   overlayAbsPath?: string;
   x?: number;
@@ -202,6 +214,10 @@ export interface EditParams {
   mode?: ReframeMode;
   focusX?: number;
   focusY?: number;
+  /** reframe (crop): the point to keep centred per stretch, `[{start, centre_x, centre_y?}]`
+   *  as fractions of the source, each holding until the next start, so a cut can
+   *  follow whoever is speaking. */
+  focusPlan?: unknown;
   padColor?: string;
   signal?: AbortSignal;
 }
@@ -288,6 +304,8 @@ export function buildReframeFilter(opts: {
   height: number;
   focusX?: number;
   focusY?: number;
+  /** crop only: the point to keep centred per stretch, overriding focusX/focusY. */
+  plan?: FocusStep[];
   padColor?: string;
 }): { filter: string; complex: boolean } {
   const W = opts.width;
@@ -299,6 +317,13 @@ export function buildReframeFilter(opts: {
   if (opts.mode === 'crop') {
     const fx = clamp(finiteNum(opts.focusX) ?? 0.5, 0, 1);
     const fy = clamp(finiteNum(opts.focusY) ?? 0.5, 0, 1);
+    if (opts.plan && opts.plan.length) {
+      // `t` is the source time of each frame; the window cuts at each step's start
+      // to keep that step's point centred, stopping at the frame edges.
+      const ex = piecewiseExpr(opts.plan, (s) => s.centreX);
+      const ey = piecewiseExpr(opts.plan, (s) => s.centreY ?? 0.5);
+      return { complex: false, filter: `${squarePixels},${fill},crop=${W}:${H}:x='clip(iw*${ex}-ow/2,0,iw-ow)':y='clip(ih*${ey}-oh/2,0,ih-oh)',${tail}` };
+    }
     return { complex: false, filter: `${squarePixels},${fill},crop=${W}:${H}:(iw-ow)*${fx}:(ih-oh)*${fy},${tail}` };
   }
   if (opts.mode === 'blur') {
@@ -455,6 +480,8 @@ export function assessVoiceoverCoverage(input: {
    *  report can only see the head and tail, which is how a half-silent draft
    *  once scored 95%. */
   voicedSpans?: Array<{ startSec: number; endSec: number }>;
+  /** Explicit fixed picture windows: report gaps without suggesting a picture edit. */
+  preservePicture?: boolean;
 }): CoverageReport {
   const ref = Math.max(0, input.referenceDurationSec);
   const offset = Math.max(0, input.offsetSec ?? 0);
@@ -520,10 +547,13 @@ export function assessVoiceoverCoverage(input: {
     if (trailingGapSec > COVERAGE_TRAILING_GAP_SEC) {
       if (status === 'ok') status = 'under';
       const pct = ref > 0 ? Math.round((trailingGapSec / ref) * 100) : 0;
-      warnings.push(`Narration ends at ${round2(voicedEnd)}s, leaving ${trailingGapSec}s of silent tail on a ${round2(ref)}s clip (~${pct}% uncovered) — lengthen the script, add a closing line, or trim the clip to match.`);
+      warnings.push(`The added audio ends at ${round2(voicedEnd)}s, leaving ${trailingGapSec}s not covered by this audio on a ${round2(ref)}s clip (~${pct}% uncovered).`
+        + (input.preservePicture ? ' The declared picture timing is retained.' : '')
+        + ' Audio coverage alone does not establish missing narration or an intended pause.');
     }
     if (leadingGapSec > COVERAGE_LEAD_GAP_SEC) {
-      warnings.push(`Narration only starts at ${leadingGapSec}s — long silent lead-in; reduce the offset or trim the head.`);
+      warnings.push(`The added audio starts at ${leadingGapSec}s; its measured audio span does not cover 0–${leadingGapSec}s.`
+        + (input.preservePicture ? ' The declared picture timing is retained.' : ''));
     }
     if (overlapCount > 0 && maxOverlapSec > 0.3) {
       // Double narration outranks everything except truncation: two voices at
@@ -537,7 +567,9 @@ export function assessVoiceoverCoverage(input: {
       // hear first. Truncation ('over') and double voice keep priority.
       if (status === 'ok' || status === 'under') status = 'gapped';
       const silentTotal = round2(interiorGaps.reduce((sum, g) => sum + g.durationSec, 0));
-      warnings.push(`Narration has ${interiorGaps.length} interior silent hole(s) totalling ${silentTotal}s (largest ${maxInteriorGapSec}s) — on a track with no music bed this is dead air. Re-time the lines inside their scenes, add the planned music bed, or shorten the over-long scenes; do not pad the script with filler words.`);
+      warnings.push(`The added audio leaves ${interiorGaps.length} interior uncovered interval(s) totalling ${silentTotal}s (largest ${maxInteriorGapSec}s).`
+        + (input.preservePicture ? ' The declared picture timing is retained.' : '')
+        + ' Audio coverage alone does not establish missing narration or intended pauses.');
     }
   }
   return { referenceDurationSec: round2(ref), voicedStartSec: round2(voicedStart), voicedEndSec: round2(voicedEnd), leadingGapSec, trailingGapSec, overshootSec, coverageRatio, voicedRatio, interiorGaps, maxInteriorGapSec, maxOverlapSec, overlapCount, status, warnings };
@@ -562,8 +594,11 @@ export function buildMixFilter(opts: {
   mode: 'mix' | 'replace';
   padWholeDurSec: number | null;
   loudnorm: string;
+  /** Lower the base's own sound while the added segments play (narration over
+   *  kept dialogue or ambience), as the timeline ducks music under speech. */
+  duck?: boolean;
 }): string {
-  const { sr, segmentStartSec, baseHasAudio, mode, padWholeDurSec, loudnorm } = opts;
+  const { sr, segmentStartSec, baseHasAudio, mode, padWholeDurSec, loudnorm, duck } = opts;
   const chains: string[] = [];
   const segLabels: string[] = [];
   segmentStartSec.forEach((startSec, i) => {
@@ -589,7 +624,20 @@ export function buildMixFilter(opts: {
   // note on normalize_loudness; without it a TTS-only (all-mono) mix writes a
   // track its own loudness pass cannot process.
   const tail = `${padWholeDurSec && padWholeDurSec > 0 ? `apad=whole_dur=${padWholeDurSec.toFixed(3)},` : ''}${loudnorm},aresample=${sr},aformat=channel_layouts=stereo`;
-  if (baseHasAudio && mode === 'mix') {
+  if (baseHasAudio && mode === 'mix' && duck) {
+    // Same keying as the timeline's music duck: the added bed drives a sidechain
+    // compressor on the base, so the base dips only while something is said.
+    // sidechaincompress stops at the FIRST input to end, so the key is padded
+    // with silence: otherwise the base is cut off where the last added segment
+    // ends. Open-ended apad is safe here (unlike on the output) because the
+    // compressor still ends with the base.
+    const keyPad = padWholeDurSec && padWholeDurSec > 0 ? `apad=whole_dur=${padWholeDurSec.toFixed(3)}` : 'apad';
+    chains.push(`${bed}asplit=2[bedmix][bedkey0]`);
+    chains.push(`[bedkey0]${keyPad}[bedkey]`);
+    chains.push(`[0:a]aresample=${sr}[base0]`);
+    chains.push(`[base0][bedkey]sidechaincompress=threshold=0.02:ratio=10:attack=20:release=400[base]`);
+    chains.push(`[base][bedmix]amix=inputs=2:duration=longest:normalize=0,${tail}[aout]`);
+  } else if (baseHasAudio && mode === 'mix') {
     chains.push(`[0:a]aresample=${sr}[base]`);
     chains.push(`[base]${bed}amix=inputs=2:duration=longest:normalize=0,${tail}[aout]`);
   } else {
@@ -801,6 +849,40 @@ function fail(errorCode: string, message: string): EditResult {
  * family named here must cover the deliverable script. Kana wins over Han
  * because Japanese text contains both. Latin-only captions keep the platform
  * default. Pure → unit-tested. */
+/** Bottom margin for burned captions on a vertical frame, in libass script units
+ *  (288 per frame height). Measured on 1080×1920: the default left the caption
+ *  81 px above the bottom, under the buttons and text TikTok, Reels and Shorts lay
+ *  over roughly the lowest 380 px; 60 puts it 415 px up, at any vertical size. */
+export const VERTICAL_CAPTION_MARGIN_V = 60;
+
+/** `force_style` for `burnsubs`: the caption font, plus the raised margin on a
+ *  vertical frame. An .ass file keeps the margins its author set. Pure. */
+export function burnsubsForceStyle(
+  fontName: string,
+  displaySize: { width: number; height: number } | null,
+  subtitlesPath: string,
+): string {
+  const parts: string[] = [];
+  if (fontName) parts.push(`FontName=${fontName}`);
+  const authored = /\.(ass|ssa)$/i.test(subtitlesPath);
+  if (!authored && displaySize && displaySize.height > displaySize.width) parts.push(`MarginV=${VERTICAL_CAPTION_MARGIN_V}`);
+  return parts.length ? `:force_style='${parts.join(',')}'` : '';
+}
+
+/** A translated version once went out with the original captions still showing under the
+ *  new ones (2026-11-14). The band is covered with an opaque bar across the frame, and plain
+ *  captions are placed inside it. SRT captions are laid out on a 288-unit-high script. */
+export function coverBandFilter(cover: { top: number; bottom: number }): { filter: string; marginV: number } {
+  const top = Math.max(0, Math.min(1, cover.top));
+  const bottom = Math.max(top, Math.min(1, cover.bottom));
+  const band = bottom - top;
+  const line = 20;
+  return {
+    filter: `drawbox=x=0:y=ih*${top.toFixed(4)}:w=iw:h=ih*${band.toFixed(4)}:color=black@1:t=fill`,
+    marginV: Math.max(0, Math.round((1 - bottom) * 288 + Math.max(2, (band * 288 - line) / 2))),
+  };
+}
+
 export function captionFontForText(text: string, platform: NodeJS.Platform): string {
   const hasKana = /[\u3040-\u30ff]/u.test(text);
   const hasHan = /[\u4e00-\u9fff]/u.test(text);
@@ -884,6 +966,25 @@ async function probeDurationSec(ffprobe: string, input: string, signal?: AbortSi
   return Number.isFinite(v2) && v2 > 0 ? v2 : 0;
 }
 
+/** Length of a file's picture alone, or null when it has none or it cannot be read. */
+async function probeVideoDurationSec(ffprobe: string, input: string, signal?: AbortSignal): Promise<number | null> {
+  const r = await run(ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=duration', '-of', 'default=nokey=1:noprint_wrappers=1', input], signal);
+  const v = Number(r.stdout.trim());
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/** The concat list: each file holds the timeline for its picture's length. Left to
+ *  itself the demuxer advances by the whole file, whose AAC sound runs a few
+ *  milliseconds past the picture, and over sixteen beat-length cuts that added a
+ *  frame (2026-11-13). Pure. */
+export function concatListBody(files: string[], videoDurations: Array<number | null>): string {
+  return files.map((f, i) => {
+    const line = `file '${f.replace(/'/g, "'\\''")}'`;
+    const d = videoDurations[i];
+    return typeof d === 'number' && d > 0 ? `${line}\nduration ${d.toFixed(6)}` : line;
+  }).join('\n');
+}
+
 /** Probe duration + whether the file carries an audio stream (one ffprobe). */
 /** Pixel formats that can carry transparency — the only overlays that can sit
  *  on a full frame without erasing it. */
@@ -931,7 +1032,7 @@ async function conformConcatInput(
   target: ConcatInputSpec,
   outPath: string,
   signal?: AbortSignal,
-): Promise<{ code: number; stderr: string }> {
+): Promise<Awaited<ReturnType<typeof run>>> {
   const filter = [
     `scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease`,
     `pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2`,
@@ -980,7 +1081,7 @@ async function addConcatSilence(
   audio: ConcatAudioSpec,
   outPath: string,
   signal?: AbortSignal,
-): Promise<{ code: number; stderr: string }> {
+): Promise<Awaited<ReturnType<typeof run>>> {
   const layout = audio.channels === 1 ? 'mono' : 'stereo';
   return run(bins.ffmpeg, [
     '-y', '-i', input, '-f', 'lavfi', '-i', `anullsrc=channel_layout=${layout}:sample_rate=${audio.sampleRate}`,
@@ -1035,17 +1136,19 @@ async function probeDisplaySize(
   } catch { return null; }
 }
 
-async function probeBasic(ffprobe: string, input: string, signal?: AbortSignal): Promise<{ durationSec: number; hasAudio: boolean }> {
-  const r = await run(ffprobe, ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type', '-of', 'json', input], signal);
+async function probeBasic(ffprobe: string, input: string, signal?: AbortSignal): Promise<{ durationSec: number; hasAudio: boolean; comment: string }> {
+  const r = await run(ffprobe, ['-v', 'error', '-show_entries', 'format=duration:format_tags=comment:stream=codec_type', '-of', 'json', input], signal);
   let durationSec = 0;
   let hasAudio = false;
+  let comment = '';
   try {
-    const j = JSON.parse(r.stdout) as { format?: { duration?: string }; streams?: Array<{ codec_type?: string }> };
+    const j = JSON.parse(r.stdout) as { format?: { duration?: string; tags?: { comment?: unknown } }; streams?: Array<{ codec_type?: string }> };
     const d = Number(j.format?.duration);
     if (Number.isFinite(d) && d > 0) durationSec = d;
     hasAudio = (j.streams ?? []).some((s) => s.codec_type === 'audio');
+    if (typeof j.format?.tags?.comment === 'string') comment = j.format.tags.comment;
   } catch { /* leave defaults */ }
-  return { durationSec, hasAudio };
+  return { durationSec, hasAudio, comment };
 }
 
 /** Public duration probe (resolves the bundled ffprobe itself). Best-effort:
@@ -1088,17 +1191,20 @@ export async function measureSilenceCoverage(
   return { ok: true, timing: parseSilenceDetect(r.stderr, dur) };
 }
 
-/** Run the single-pass select/aselect jump-cut that keeps `kept` from input.
- *  Returns the raw run() result — the caller checks `.code` like the other ops. */
-function runJumpCut(
-  ffmpeg: string,
+/** Run the single-pass jump-cut that keeps `kept` from input, on frame-aligned
+ *  pieces when the frame rate is known. Returns the raw run() result — the caller
+ *  checks `.code` like the other ops. */
+async function runJumpCut(
+  bins: { ffmpeg: string; ffprobe: string },
   inputAbsPath: string,
   kept: Span[],
   outputAbsPath: string,
   signal?: AbortSignal,
   progress?: RunProgressOptions,
 ): ReturnType<typeof run> {
-  const { filter, maps } = buildKeepFilterComplex(kept);
+  const ffmpeg = bins.ffmpeg;
+  const spec = await probeConcatInputSpec(bins.ffprobe, inputAbsPath, signal);
+  const { filter, maps } = buildKeepFilterComplex(kept, spec ? { fps: spec.fps } : {});
   return run(ffmpeg, withFfmpegProgress([
     '-y', '-i', inputAbsPath, '-filter_complex', filter, ...maps,
     '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', outputAbsPath,
@@ -1181,7 +1287,155 @@ export async function detectQuality(
   return { ok: true, report };
 }
 
+/** Decode a file's sound to mono 32-bit float PCM at `rate`, through a temporary file
+ *  (run() collects text). Null when there is no sound or decoding fails. */
+export async function decodeMonoPcm(inputAbsPath: string, rate: number, signal?: AbortSignal): Promise<Float32Array | null> {
+  const bins = resolveBins();
+  if (!bins) return null;
+  const tmp = path.join(os.tmpdir(), `orkas-pcm-${randomUUID()}.f32`);
+  try {
+    const r = await run(bins.ffmpeg, ['-hide_banner', '-nostats', '-y', '-i', inputAbsPath, '-vn', '-ac', '1', '-ar', String(rate), '-f', 'f32le', tmp], signal);
+    if (r.code !== 0) return null;
+    const buf = await fs.readFile(tmp);
+    if (!buf.length) return null;
+    const out = new Float32Array(Math.floor(buf.length / 4));
+    for (let i = 0; i < out.length; i += 1) out[i] = buf.readFloatLE(i * 4);
+    return out;
+  } catch {
+    return null;
+  } finally {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+  }
+}
+
+/** Frame rate of a file's picture, or null when it has none. */
+export async function probeVideoFps(inputAbsPath: string, signal?: AbortSignal): Promise<number | null> {
+  const bins = resolveBins();
+  if (!bins) return null;
+  const spec = await probeConcatInputSpec(bins.ffprobe, inputAbsPath, signal);
+  return spec ? spec.fps : null;
+}
+
+/** Frames per second sampled when measuring motion inside regions. */
+
+/** Per-frame motion inside each region: the mean luma change between consecutive
+ *  sampled frames, one ffmpeg pass per region on a small grey crop. */
+export async function measureRegionActivity(
+  inputAbsPath: string,
+  regions: ActivityRegion[],
+  opts?: { signal?: AbortSignal },
+): Promise<
+  | { ok: true; durationSec: number; series: Record<string, Array<{ tSec: number; value: number }>> }
+  | { ok: false; errorCode: string; message: string }
+> {
+  const bins = resolveBins();
+  if (!bins) return { ok: false, errorCode: 'E_EDIT_FFMPEG_MISSING', message: 'Bundled ffmpeg/ffprobe not found.' };
+  const dur = await probeDurationSec(bins.ffprobe, inputAbsPath, opts?.signal);
+  const series: Record<string, Array<{ tSec: number; value: number }>> = Object.create(null);
+  for (const region of regions) {
+    const [l, t, r, b] = region.box;
+    const crop = `crop=iw*${(r - l).toFixed(4)}:ih*${(b - t).toFixed(4)}:iw*${l.toFixed(4)}:ih*${t.toFixed(4)}`;
+    const vf = `fps=${ACTIVITY_SAMPLE_RATE},${crop},scale=160:-2,format=gray,tblend=all_mode=difference,signalstats,metadata=print`;
+    const res = await run(
+      bins.ffmpeg,
+      withFfmpegProgress(['-hide_banner', '-nostats', '-i', inputAbsPath, '-vf', vf, '-an', '-f', 'null', '-']),
+      opts?.signal,
+      { op: 'activity_scan', phase: 'analyze', durationSec: dur },
+    );
+    if (res.code !== 0) {
+      if (res.aborted) return { ok: false, errorCode: 'E_EDIT_ABORTED', message: 'activity scan aborted.' };
+      if (res.timedOut) return { ok: false, errorCode: 'E_EDIT_TIMEOUT', message: 'activity scan timed out.' };
+      const tail = res.stderr.trim().slice(-800);
+      return { ok: false, errorCode: 'E_EDIT_FAILED', message: `activity scan failed (exit ${res.code}). ${tail || 'No diagnostic output.'}` };
+    }
+    series[region.id] = parseQualityFrames(`${res.stdout}\n${res.stderr}`)
+      .filter((f) => typeof f.brightness === 'number')
+      .map((f) => ({ tSec: f.tSec, value: f.brightness as number }));
+  }
+  return { ok: true, durationSec: dur, series };
+}
+
+/** Where a mix records the narration it laid over a clip's own sound: a hidden file
+ *  beside the output. Delivery reads it to find lines that play while someone in the
+ *  clip is talking, which the mixed file alone cannot show. */
+export function narrationRecordPath(videoAbsPath: string): string {
+  return path.join(path.dirname(videoAbsPath), `.${path.basename(videoAbsPath)}.narration.json`);
+}
+
+/** Execute an explicit selection in one synchronized pass; no semantic choices. */
+export async function editSelectedIntervals(p: {
+  inputAbsPath: string; outputAbsPath: string; kept: Span[]; signal?: AbortSignal;
+}): Promise<EditResult> {
+  const bins = resolveBins();
+  if (!bins) return fail('E_EDIT_FFMPEG_MISSING', 'Bundled ffmpeg/ffprobe not found.');
+  const duration = await probeDurationSec(bins.ffprobe, p.inputAbsPath, p.signal);
+  const spec = await probeConcatInputSpec(bins.ffprobe, p.inputAbsPath, p.signal);
+  if (!(duration > 0) || !spec) return fail('E_EDIT_SELECTION', 'Selection source has no readable duration or frame rate.');
+  if (!Array.isArray(p.kept) || !p.kept.length || p.kept.length > 1000 || p.kept.some((s, i) =>
+    !Number.isFinite(s.startSec) || !Number.isFinite(s.endSec) || s.startSec < 0 || s.endSec > duration + 0.01
+    || s.endSec <= s.startSec || (i > 0 && s.startSec < p.kept[i - 1].endSec))) {
+    return fail('E_EDIT_SELECTION', 'Selection requires 1–1000 ordered, nonoverlapping source intervals.');
+  }
+  const kept = p.kept.map(s => ({ startSec: Math.round(s.startSec * spec.fps) / spec.fps,
+    endSec: Math.min(duration, Math.round(s.endSec * spec.fps) / spec.fps) }));
+  if (kept.some(s => s.endSec <= s.startSec)) return fail('E_EDIT_SELECTION', 'A selected interval contains no complete video frame.');
+  await fs.mkdir(path.dirname(p.outputAbsPath), { recursive: true });
+  const unchanged = kept.length === 1 && kept[0].startSec === 0 && Math.abs(kept[0].endSec - duration) < 0.01;
+  try {
+    if (unchanged) await fs.copyFile(p.inputAbsPath, p.outputAbsPath, fsSync.constants.COPYFILE_EXCL);
+    else {
+      const claim = await fs.open(p.outputAbsPath, 'wx'); await claim.close();
+      const cut = await runJumpCut(bins, p.inputAbsPath, kept, p.outputAbsPath, p.signal,
+        { op: 'phrase_selection', phase: 'edit', durationSec: totalSpanSeconds(kept) });
+      if (cut.code !== 0) return ffmpegFailure('phrase_selection', cut, p.outputAbsPath);
+      const actual = await probeDurationSec(bins.ffprobe, p.outputAbsPath, p.signal);
+      if (Math.abs(actual - totalSpanSeconds(kept)) > 1 / spec.fps + 0.05) {
+        return fail('E_EDIT_SELECTION_DRIFT', 'The selected output duration does not match its frame-aligned cut list.');
+      }
+    }
+  } catch (err) {
+    return fail('E_EDIT_SELECTION', `Selection output was not written: ${(err as NodeJS.ErrnoException).code ?? (err as Error).name}`);
+  }
+  return { ok: true, op: 'concat', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath),
+    decision: decisionEvidence(complementIntervals(kept, duration), kept, 'explicit measured phrase selection') };
+}
+
+export interface NarrationRecord {
+  kind: 'orkas-mix-narration';
+  version: 1;
+  /** The bytes carrying these placed lines, not just their unchanged base clip. */
+  output: { sha256: string };
+  /** The clip the narration was laid over, with its hash so a changed file is ignored. */
+  base: { path: string; sha256: string };
+  /** Each line's voiced span on the clip's timeline, in seconds. */
+  lines: Array<{ index: number; start: number; end: number }>;
+}
+
+async function sha256OfFile(fileAbs: string): Promise<string> {
+  const hash = createHash('sha256');
+  for await (const chunk of fsSync.createReadStream(fileAbs)) hash.update(chunk as Buffer);
+  return hash.digest('hex');
+}
+
+/** Ops that keep every moment where it was, so a narration record still holds for their output. */
+const TIMING_PRESERVING_OPS = new Set<EditOp>(['normalize_loudness', 'burnsubs', 'reframe', 'overlay']);
+
 export async function editVideo(p: EditParams): Promise<EditResult> {
+  const result = await runEdit(p);
+  if (result.ok && TIMING_PRESERVING_OPS.has(p.op) && p.inputAbsPath && p.outputAbsPath) {
+    try {
+      const record = JSON.parse(await fs.readFile(narrationRecordPath(p.inputAbsPath), 'utf8')) as NarrationRecord;
+      if (record?.kind === 'orkas-mix-narration' && record.version === 1
+        && record.output?.sha256 === await sha256OfFile(p.inputAbsPath)) {
+        record.output = { sha256: await sha256OfFile(p.outputAbsPath) };
+        await fs.writeFile(narrationRecordPath(p.outputAbsPath), `${JSON.stringify(record)}\n`);
+      }
+    } catch { /* Missing or obsolete advisory evidence does not fail a successful edit. */ }
+  }
+  return result;
+}
+
+async function runEdit(p: EditParams): Promise<EditResult> {
   const bins = resolveBins();
   if (!bins) return fail('E_EDIT_FFMPEG_MISSING', 'Bundled ffmpeg/ffprobe not found.');
 
@@ -1214,11 +1468,27 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     const inputDurationSec = await probeDurationSec(bins.ffprobe, p.inputAbsPath, p.signal);
     const trimRangeError = validateTrimRequest(inputDurationSec, start, duration);
     if (trimRangeError) return trimRangeError;
-    // Accurate seek (-ss/-t after -i) + re-encode so arbitrary cut points are frame-exact.
-    const r = await run(bins.ffmpeg, withFfmpegProgress([
-      '-y', '-i', p.inputAbsPath, '-ss', String(start), '-t', String(duration),
-      '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', p.outputAbsPath,
-    ]), p.signal, { op: 'trim', phase: 'edit', durationSec: duration });
+    // A cut is a whole number of frames, rounded to the nearest: `-t` alone keeps every
+    // frame that starts before the end, so each piece came out up to a frame long while
+    // its sound did not (2026-11-13: sixteen 128 BPM beats at 30 fps joined to 8.03 s
+    // instead of 7.5 s, the last cut more than a beat late). Picture and sound both get
+    // exactly that many frames' time; a caller cutting to a grid rounds each cut from
+    // its absolute frame so the pieces add up.
+    const spec = await probeConcatInputSpec(bins.ffprobe, p.inputAbsPath, p.signal);
+    const basic = spec ? await probeBasic(bins.ffprobe, p.inputAbsPath, p.signal) : null;
+    const frames = spec ? Math.max(1, Math.round(duration * spec.fps)) : 0;
+    const args = spec && basic
+      ? [
+          '-y', '-ss', String(start), '-i', p.inputAbsPath,
+          '-filter_complex', `[0:v]trim=end_frame=${frames},setpts=PTS-STARTPTS[v]`
+            + (basic.hasAudio ? `;[0:a]atrim=end=${(frames / spec.fps).toFixed(6)},asetpts=PTS-STARTPTS[a]` : ''),
+          '-map', '[v]', ...(basic.hasAudio ? ['-map', '[a]'] : []),
+          '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', p.outputAbsPath,
+        ]
+      // Accurate seek (-ss/-t after -i) + re-encode when the frame rate is unknown.
+      : ['-y', '-i', p.inputAbsPath, '-ss', String(start), '-t', String(duration),
+          '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', p.outputAbsPath];
+    const r = await run(bins.ffmpeg, withFfmpegProgress(args), p.signal, { op: 'trim', phase: 'edit', durationSec: duration });
     if (r.code !== 0) return ffmpegFailure('trim', r, p.outputAbsPath);
     const checked = await validateTrimOutput(bins.ffprobe, p.outputAbsPath, p.signal);
     if (checked.ok === false) return fail(checked.errorCode, checked.message);
@@ -1350,10 +1620,17 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
         };
       }
 
-      const listBody = joinInputs.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n');
+      const videoDurations = await Promise.all(joinInputs.map((f) => probeVideoDurationSec(bins.ffprobe, f, p.signal)));
+      const listBody = concatListBody(joinInputs, videoDurations);
       await fs.writeFile(listPath, listBody, 'utf8');
       const r = await run(bins.ffmpeg, withFfmpegProgress([
         '-y', '-f', 'concat', '-safe', '0', '-i', listPath,
+        // The parts already share one rate (conformed above); a constant-rate output
+        // would add a frame wherever their timestamps do not land exactly on its grid.
+        '-fps_mode', 'passthrough',
+        // Kept as they come, the picture's timestamps start one frame after the sound, so
+        // every cut of a montage landed a frame late against its music (2026-11-14).
+        '-vf', 'setpts=PTS-STARTPTS',
         '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', p.outputAbsPath,
       ]), p.signal, { op: 'concat', phase: 'edit', durationSec: concatDurationSec });
       if (r.code !== 0) return ffmpegFailure('concat', r, p.outputAbsPath);
@@ -1394,12 +1671,24 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     const subEsc = escapeFfmpegFilterValue(p.subtitlesAbsPath);
     const subtitleText = await fs.readFile(p.subtitlesAbsPath, 'utf8').catch(() => '');
     const fontName = captionFontForText(subtitleText, process.platform);
-    const styleSuffix = fontName
-      ? `:force_style='FontName=${fontName}'`
-      : '';
+    const displaySize = await probeDisplaySize(bins.ffprobe, p.inputAbsPath, p.signal);
+    let styleSuffix = burnsubsForceStyle(fontName, displaySize, p.subtitlesAbsPath);
+    let coverFilter = '';
+    if (p.cover) {
+      const { top, bottom } = p.cover;
+      if (!(Number.isFinite(top) && Number.isFinite(bottom) && top >= 0 && bottom <= 1 && bottom - top > 0 && bottom - top <= 0.5)) {
+        return fail('E_EDIT_ARG', 'cover takes the band of the old captions as two fractions of the picture height from the top, top then bottom, at most half the height apart (for example 0.78,0.88).');
+      }
+      const band = coverBandFilter(p.cover);
+      coverFilter = `${band.filter},`;
+      // Plain captions sit in the band; an .ass file keeps its own placement.
+      if (!/\.(ass|ssa)$/i.test(p.subtitlesAbsPath)) {
+        styleSuffix = `:force_style='${[fontName ? `FontName=${fontName}` : '', 'Alignment=2', `MarginV=${band.marginV}`].filter(Boolean).join(',')}'`;
+      }
+    }
     const durationSec = await probeDurationSec(bins.ffprobe, p.inputAbsPath, p.signal);
     const r = await run(bins.ffmpeg, withFfmpegProgress([
-      '-y', '-i', p.inputAbsPath, '-vf', `subtitles=filename=${subEsc}${styleSuffix}`,
+      '-y', '-i', p.inputAbsPath, '-vf', `${coverFilter}subtitles=filename=${subEsc}${styleSuffix}`,
       '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'copy', '-movflags', '+faststart', p.outputAbsPath,
     ]), p.signal, { op: 'burnsubs', phase: 'edit', durationSec });
     if (r.code !== 0) return ffmpegFailure('burnsubs', r, p.outputAbsPath);
@@ -1447,7 +1736,14 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     }
     const canvas = reframeCanvas({ aspect: p.aspect, width: p.width, height: p.height });
     if (canvas.ok === false) return fail('E_EDIT_ARG', canvas.message);
-    const mode: ReframeMode = p.mode ?? 'pad';
+    let plan: FocusStep[] | undefined;
+    if (p.focusPlan !== undefined) {
+      const parsed = normalizeFocusPlan(p.focusPlan);
+      if (typeof parsed === 'string') return fail('E_EDIT_ARG', `reframe ${parsed}`);
+      if (p.mode && p.mode !== 'crop') return fail('E_EDIT_ARG', 'reframe plan needs mode crop: it moves the crop position over time.');
+      plan = parsed;
+    }
+    const mode: ReframeMode = p.mode ?? (plan ? 'crop' : 'pad');
     if (mode !== 'pad' && mode !== 'crop' && mode !== 'blur') {
       return fail('E_EDIT_ARG', `reframe mode must be pad, crop or blur; got ${String(mode)}`);
     }
@@ -1459,7 +1755,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     if (!source) return fail('E_EDIT_NO_VIDEO', 'reframe needs an input with a readable video stream.');
     const { width, height } = canvas;
     const built = buildReframeFilter({
-      mode, width, height, focusX: p.focusX, focusY: p.focusY, ...(padColor ? { padColor } : {}),
+      mode, width, height, focusX: p.focusX, focusY: p.focusY, ...(plan ? { plan } : {}), ...(padColor ? { padColor } : {}),
     });
     const durationSec = await probeDurationSec(bins.ffprobe, p.inputAbsPath, p.signal);
     const r = await run(bins.ffmpeg, withFfmpegProgress([
@@ -1499,7 +1795,9 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
       ...(padColor ? { pad_color: padColor } : {}),
       ...(mode === 'crop'
         ? {
-            focus: { x: clamp(finiteNum(p.focusX) ?? 0.5, 0, 1), y: clamp(finiteNum(p.focusY) ?? 0.5, 0, 1) },
+            ...(plan
+              ? { plan: plan.map((s) => ({ start: s.startSec, centre_x: s.centreX, centre_y: s.centreY ?? 0.5 })) }
+              : { focus: { x: clamp(finiteNum(p.focusX) ?? 0.5, 0, 1), y: clamp(finiteNum(p.focusY) ?? 0.5, 0, 1) } }),
             note: 'crop cut the source edges outside the canvas; extract a frame and confirm no text, captions or faces were lost.',
           }
         : {}),
@@ -1541,7 +1839,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     if (!removed.length || !kept.length) {
       return fail('E_EDIT_NO_CHANGE', `No silence ≥ ${minSilenceSec ?? SILENCE_MIN_SEC}s found below ${noiseDb ?? SILENCE_NOISE_DB} dB — nothing to trim; use the original clip.`);
     }
-    const cut = await runJumpCut(bins.ffmpeg, p.inputAbsPath, kept, p.outputAbsPath, p.signal, {
+    const cut = await runJumpCut(bins, p.inputAbsPath, kept, p.outputAbsPath, p.signal, {
       op: 'trim_silence',
       phase: 'edit',
       durationSec: totalSpanSeconds(kept),
@@ -1576,7 +1874,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
       ...(minKeepSec !== undefined ? { minKeepSec } : {}),
     });
     if (!kept.length) return fail('E_EDIT_NO_CHANGE', 'filler removal left nothing to keep.');
-    const cut = await runJumpCut(bins.ffmpeg, p.inputAbsPath, kept, p.outputAbsPath, p.signal, {
+    const cut = await runJumpCut(bins, p.inputAbsPath, kept, p.outputAbsPath, p.signal, {
       op: 'remove_fillers',
       phase: 'edit',
       durationSec: totalSpanSeconds(kept),
@@ -1593,16 +1891,41 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
   if (p.op === 'mix') {
     if (!p.inputAbsPath) return fail('E_EDIT_ARG', 'mix requires input_path (the base video)');
     // Per-line segments take precedence; otherwise the single audio_path + start.
-    const segs: Array<{ audioAbsPath: string; startSec: number }> =
+    const segs: Array<{ audioAbsPath: string; startSec: number; endSec?: number }> =
       (p.audioSegments && p.audioSegments.length)
         ? p.audioSegments
             .filter((s) => s && typeof s.audioAbsPath === 'string' && s.audioAbsPath)
-            .map((s) => ({ audioAbsPath: s.audioAbsPath, startSec: Math.max(0, finiteNum(s.startSec) ?? 0) }))
+            .map((s) => ({ audioAbsPath: s.audioAbsPath, startSec: Math.max(0, finiteNum(s.startSec) ?? 0), ...(s.endSec !== undefined ? { endSec: s.endSec } : {}) }))
         : (p.audioAbsPath ? [{ audioAbsPath: p.audioAbsPath, startSec: Math.max(0, finiteNum(p.start) ?? 0) }] : []);
     if (!segs.length) return fail('E_EDIT_ARG', 'mix requires audio_path (the narration/music to add) or a non-empty audio_segments');
 
     const mode = p.onExistingAudio ?? 'reject';
     const base = await probeBasic(bins.ffprobe, p.inputAbsPath, p.signal);
+    const pictureLocked = segs.some(s => s.endSec !== undefined);
+    let windowMeasurements: SilenceMeasureResult[] | undefined;
+    if (pictureLocked) {
+      if (p.audioSegments!.some(s => s.startSec !== undefined && (!Number.isFinite(s.startSec) || s.startSec < 0))
+        || segs.some((s, i) => !Number.isFinite(s.endSec) || !(s.endSec! > s.startSec)
+        || s.endSec! > base.durationSec || (i > 0 && s.startSec < segs[i - 1].endSec!))) {
+        return fail('E_EDIT_VOICE_WINDOW', 'Every fixed picture window must have a finite end, fit the source and follow the previous window.');
+      }
+      windowMeasurements = await mapWithConcurrencyLimit(segs, MIX_COVERAGE_CONCURRENCY, s =>
+        measureSilenceCoverage(s.audioAbsPath, p.signal ? { signal: p.signal } : {}));
+      for (let i = 0; i < segs.length; i++) {
+        const measured = windowMeasurements[i];
+        if (!measured.ok) return fail('E_EDIT_VOICE_WINDOW', `Speech timing for segment ${i + 1} is unavailable; no mix was written.`);
+        if (segs[i].startSec + measured.timing.voicedEndSec > segs[i].endSec! + 0.001) {
+          return fail('E_EDIT_VOICE_WINDOW', `Speech in segment ${i + 1} exceeds its declared picture window; no mix was written.`);
+        }
+      }
+    }
+    // A standard MP4 comment survives ordinary external ffmpeg transforms.
+    // It signals that a missing sidecar is unknown, never that audio is clean.
+    const marker = 'ORKAS_NARRATION_MIX_V1';
+    const comment = base.comment.split('\n').filter(line => line !== marker).join('\n');
+    const recordsNarration = (p.audioSegments?.length ?? 0) > 0 && base.hasAudio && mode === 'mix';
+    const markedComment = recordsNarration || (mode === 'mix' && base.comment.split('\n').includes(marker))
+      ? [comment, marker].filter(Boolean).join('\n') : comment;
     // Guard the "two voices" defect: a base that already carries audio + a
     // narration mix = stacked voices. Refuse by default; the caller must opt into
     // layering ('mix') or replacing ('replace') the base audio on purpose.
@@ -1626,8 +1949,9 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
       mode: mode === 'replace' ? 'replace' : 'mix',
       padWholeDurSec: base.durationSec > 0 ? base.durationSec : null,
       loudnorm: ln,
+      duck: p.duck === true,
     });
-    // Video is the master: copy it untouched (画面不动) and -shortest trims the
+    // Video is the master: copy it untouched and -shortest trims the
     // padded audio bed back to the clip length.
     const inputArgs: string[] = ['-y', '-i', p.inputAbsPath];
     for (const s of segs) inputArgs.push('-i', s.audioAbsPath);
@@ -1636,6 +1960,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
       '-filter_complex', filter,
       '-map', '0:v', '-map', '[aout]',
       '-c:v', 'copy', '-c:a', 'aac', '-ar', String(sr),
+      '-metadata', `comment=${markedComment}`,
       '-shortest', '-movflags', '+faststart', p.outputAbsPath,
     ]), p.signal, { op: 'mix', phase: 'edit', durationSec: base.durationSec });
     if (r.code !== 0) return ffmpegFailure('mix', r, p.outputAbsPath);
@@ -1648,7 +1973,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     const placedEnds: number[] = [];
     const placedAudioEnds: number[] = [];
     const placedSpans: Array<{ startSec: number; endSec: number }> = [];
-    const measurements = await mapWithConcurrencyLimit(segs, MIX_COVERAGE_CONCURRENCY, (s) =>
+    const measurements = windowMeasurements ?? await mapWithConcurrencyLimit(segs, MIX_COVERAGE_CONCURRENCY, (s) =>
       measureSilenceCoverage(s.audioAbsPath, p.signal ? { signal: p.signal } : {}));
     const measuredAll = measurements.every((meas) => meas.ok);
     if (measuredAll) {
@@ -1673,6 +1998,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
         voicedStartSec: Math.min(...placedStarts),
         voicedEndSec: Math.max(...placedEnds),
         voicedSpans: placedSpans,
+        preservePicture: pictureLocked,
       });
     }
     // Overshoot means `-shortest` already cut words off the end of the last
@@ -1688,6 +2014,18 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     // single `audio_path` ducked under it. A bed longer than the clip is meant
     // to be trimmed, so only the per-line call can be truncated wrongly.
     // Interior gaps and overlaps stay warnings — those are editorial calls.
+    // Narration laid line by line over a clip that keeps its own sound: record where each
+    // line speaks, so delivery can check it against where the clip's people speak.
+    if (measuredAll && placedSpans.length && (p.audioSegments?.length ?? 0) > 0 && base.hasAudio && mode === 'mix') {
+      const record: NarrationRecord = {
+        kind: 'orkas-mix-narration',
+        version: 1,
+        output: { sha256: await sha256OfFile(p.outputAbsPath) },
+        base: { path: p.inputAbsPath, sha256: await sha256OfFile(p.inputAbsPath) },
+        lines: placedSpans.map((span, index) => ({ index: index + 1, start: round2(span.startSec), end: round2(span.endSec) })),
+      };
+      await fs.writeFile(narrationRecordPath(p.outputAbsPath), `${JSON.stringify(record)}\n`).catch(() => {});
+    }
     if (coverage && coverage.status === 'over' && (p.audioSegments?.length ?? 0) > 0) {
       return fail(
         'E_EDIT_MIX_NARRATION_TRUNCATED',

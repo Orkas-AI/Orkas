@@ -4,8 +4,8 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import { classifyRetryableError, classifyTransientNetworkError } from '../../../../src/core-agent/src/shared/errors';
 import {
-  ALL_CONFIGURED_RATE_LIMITED_MESSAGE,
   boundMessagesForImageLimit,
+  ALL_CONFIGURED_RATE_LIMITED_MESSAGE,
   createRotatingProvider,
   PROVIDER_EMPTY_NORMAL_CODE,
   PROVIDER_EMPTY_SAFETY_CODE,
@@ -75,6 +75,63 @@ const PARAMS: CompletionParams = {
 };
 
 describe('recovery of actual upstream rejections', () => {
+  it.each(['openai-completions', 'openai-responses'] as const)
+  ('leaves malformed length recovery with Runner through the configured wrapper (%s)', async api => {
+    _clearAll();
+    const bodies: any[] = [];
+    const execute = vi.fn(async () => ({ content: 'must not execute' }));
+    const fallbackBuild = vi.fn(async () => fakeProvider('fallback', {}));
+    vi.stubGlobal('fetch', vi.fn(async (input, init) => {
+      bodies.push(JSON.parse(await new Request(input, init).text()));
+      expect(bodies.length).toBeLessThanOrEqual(2);
+      const first = bodies.length === 1;
+      if (api === 'openai-completions') return new Response(`data: ${JSON.stringify({ choices: [{ index: 0,
+        delta: first ? { role: 'assistant', tool_calls: [{ index: 0, id: 'partial', type: 'function',
+          function: { name: 'write_file', arguments: '{"value":' } }] } : { role: 'assistant', content: 'Recovered.' },
+        finish_reason: first ? 'length' : 'stop',
+      }] })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+      const item = first ? { type: 'function_call', id: 'fc_partial', call_id: 'partial', name: 'write_file', arguments: '{"value":' }
+        : { type: 'message', id: 'msg_final', role: 'assistant', content: [{ type: 'output_text', text: 'Recovered.', annotations: [] }] };
+      const events = [
+        { type: 'response.output_item.added', output_index: 0, item: { ...item, arguments: '', content: [] } },
+        ...(first ? [{ type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"value":' }] : []),
+        { type: 'response.output_item.done', output_index: 0, item },
+        { type: first ? 'response.incomplete' : 'response.completed', response: { id: 'resp_fixture',
+          status: first ? 'incomplete' : 'completed', output: [item],
+          ...(first ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
+          usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 } } },
+      ];
+      return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''),
+        { headers: { 'content-type': 'text/event-stream' } });
+    }));
+    try {
+      const provider = createRotatingProvider({ providerId: 'custom', networkRetryAttempts: 0,
+        candidates: [{ profileId: 'primary', providerId: 'custom', modelId: 'fixture',
+          build: async () => createPiProvider({ provider: 'custom', apiKey: 'fixture', customModel: {
+            id: 'fixture', name: 'Fixture', provider: 'custom', api, baseUrl: 'https://fixture.invalid/v1',
+            reasoning: false, input: ['text'], contextWindow: 128000, maxTokens: 4096,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          } }),
+        }, { profileId: 'fallback', providerId: 'custom', modelId: 'fixture', build: fallbackBuild }],
+      });
+      const registry = new ProviderRegistry();
+      registry.registerFactory('custom', () => provider);
+      const runner = new AgentRunner({ providers: registry,
+        config: createConfig({ agent: { defaultProvider: 'custom', defaultModel: 'fixture', maxRetries: 0 } }),
+        tools: [defineTool({ name: 'write_file', description: 'Synthetic write', inputSchema: { type: 'object' }, execute })],
+      });
+      const result = await runner.run({ message: 'Prepare the explanation.' });
+      expect(result.meta.error).toBeUndefined();
+      expect(result.text).toBe('Recovered.');
+      expect(bodies).toHaveLength(2);
+      expect(JSON.stringify(bodies[1])).toContain('at or below 12000 characters');
+      expect(execute).not.toHaveBeenCalled();
+      expect(fallbackBuild).not.toHaveBeenCalled();
+      expect(getCooldown('primary')).toBeUndefined();
+    } finally { vi.unstubAllGlobals(); _clearAll(); }
+  });
+
+
   it.each(['complete', 'stream'] as const)('leaves local context overflow to Runner without rotating or cooling down (%s)', async method => {
     _clearAll();
     const fetchStub = vi.fn(async () => new Response(JSON.stringify({ error: {
@@ -238,8 +295,12 @@ describe('rotating-provider › rotatable stream failures', () => {
     expect(getCooldown('openai:Personal')).toBeUndefined();
   });
 
-  it('invalidated OAuth is shown once, falls back immediately, and stays skipped for later model rounds', async () => {
-    const authErr = Object.assign(new Error('Encountered invalidated oauth token for user, failing request'), { status: 401, code: 'token_invalidated' });
+  it.each([
+    ['Encountered invalidated oauth token for user, failing request', 401],
+    ['Encountered invalidated oauth token for user, failing request', undefined],
+    ['The authentication token is expired', undefined],
+  ] as const)('invalidated or expired OAuth stays skipped for later rounds (%s, status=%s)', async (message, status) => {
+    const authErr = Object.assign(new Error(message), { ...(status ? { status } : {}), code: 'token_invalidated' });
     let primaryBuilds = 0;
     let fallbackBuilds = 0;
     const p = createRotatingProvider({
@@ -843,7 +904,7 @@ describe('rotating-provider › non-rotatable stream failures', () => {
     expect(getCooldown('p1')).toBeUndefined();
   });
 
-  it('legacy Server message patterns cannot suppress structured transient recovery', async () => {
+  it.each([false, true])('legacy Server message patterns cannot suppress bounded recovery (structured=%s)', async structured => {
     const users = await import('../../../../src/main/features/users');
     const paths = await import('../../../../src/main/paths');
     const storage = await import('../../../../src/main/storage');
@@ -869,7 +930,7 @@ describe('rotating-provider › non-rotatable stream failures', () => {
         providerId: 'test',
         networkRetryDelayMs: () => 0,
         candidates: [
-          candidate('p1', { throwBefore: Object.assign(new Error('custom_non_retryable'), { status: 503 }) }),
+          candidate('p1', { throwBefore: Object.assign(new Error('custom_non_retryable'), structured ? { status: 503 } : {}) }),
           {
             profileId: 'p2',
             providerId: 'test',
@@ -1085,7 +1146,6 @@ describe('rotating-provider › stream preamble drain', () => {
   it.each([
     ['safety', 'safety_filtered_empty', PROVIDER_EMPTY_SAFETY_CODE],
     ['unknown', 'unknown_empty', PROVIDER_EMPTY_UNKNOWN_CODE],
-    ['length', 'unknown_empty', PROVIDER_EMPTY_UNKNOWN_CODE],
   ] as const)('does not retry or fall back for %s terminal emptiness', async (category, kind, code) => {
     let primaryBuilds = 0;
     let fallbackBuilds = 0;
@@ -1100,7 +1160,7 @@ describe('rotating-provider › stream preamble drain', () => {
             primaryBuilds += 1;
             return fakeProvider('p1', { streamEvents: [{
               type: 'message_end',
-              stopReason: category === 'length' ? 'max_tokens' : 'end_turn',
+              stopReason: 'end_turn',
               content: [],
               providerTermination: { category },
             } as any] });
@@ -2521,7 +2581,11 @@ describe('structured stream rejection through the real SDK', () => {
   });
 });
 
-it('continues a real SDK tool round on a configured fallback without foreign ciphertext or a duplicate write', async () => {
+it.each([
+  { status: 401, code: 'invalid_api_key', retries: 0 },
+  { status: 400, code: 'server_error', retries: 3 },
+  { status: 400, code: 'invalid_request_error', retries: 0 },
+])('continues a real SDK tool round after $status/$code without foreign ciphertext or a duplicate write', async ({ status, code, retries }) => {
   _clearAll();
   const wire: any[] = [];
   let writes = 0;
@@ -2542,8 +2606,8 @@ it('continues a real SDK tool round on a configured fallback without foreign cip
       { type: 'reasoning', id: 'rs_fixture', status: 'completed', summary: [], encrypted_content: 'source-private-state' },
       { type: 'function_call', id: 'fc_fixture', call_id: 'call_fixture', name: 'write_once', arguments: '{}' },
     ]);
-    if (wire.length === 2) return new Response('{"error":{"type":"authentication_error","code":"invalid_api_key"}}',
-      { status: 401, headers: { 'content-type': 'application/json' } });
+    if (payload.model === 'model-a') return new Response(JSON.stringify({ error: { code } }),
+      { status, headers: { 'content-type': 'application/json' } });
     expect(payload.model).toBe('model-b');
     expect(payload.input.some((i: any) => i.type === 'reasoning')).toBe(false);
     expect(payload.input.filter((i: any) => i.type === 'function_call_output')).toEqual([
@@ -2555,7 +2619,7 @@ it('continues a real SDK tool round on a configured fallback without foreign cip
   const originalFetch = globalThis.fetch;
   globalThis.fetch = fetch;
   try {
-    const rotating = createRotatingProvider({ providerId: 'mock', candidates: ['a', 'b'].map(id => ({
+    const rotating = createRotatingProvider({ providerId: 'mock', networkRetryDelayMs: () => 0, candidates: ['a', 'b'].map(id => ({
       profileId: `replay-${id}`, providerId: 'openai', modelId: `model-${id}`,
       build: async () => createPiProvider({ provider: 'openai', apiKey: `key-${id}`, customModel: {
         api: 'openai-responses', provider: 'openai', id: `model-${id}`, name: 'fixture',
@@ -2576,7 +2640,7 @@ it('continues a real SDK tool round on a configured fallback without foreign cip
     const result = await runner.run({ message: 'Save the record and report the result.' });
     expect(result.text).toBe('Saved once.');
     expect(writes).toBe(1);
-    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch).toHaveBeenCalledTimes(3 + retries);
     expect(wire[1].input.find((i: any) => i.type === 'reasoning')).toEqual({
       type: 'reasoning', id: 'rs_fixture', summary: [], encrypted_content: 'source-private-state',
     });
@@ -2769,4 +2833,725 @@ it('does not dispatch another model under a credential invalidated earlier in th
     expect(result.filter(item => item.type === 'text_delta')).toEqual([{ type: 'text_delta', text: 'recovered' }]);
     expect(getCooldown('same-key')?.kind).toBe('auth');
   } finally { _clearAll(); }
+});
+
+
+describe('public configured-provider balance fallback notices', () => {
+  beforeEach(() => _clearAll());
+  it('announces an empty user-owned account once before continuing with another configured account', async () => {
+    const balance = new ProviderError('insufficient_quota', 'openai', 429, Object.assign(new Error('Provider HTTP error'), {
+      status: 429, error: { type: 'insufficient_quota', code: 'insufficient_quota' },
+    }));
+    const p = createRotatingProvider({ providerId: 'openai', networkRetryDelayMs: () => 0, candidates: [
+      candidate('public-empty-balance', { throwBefore: balance }, 'openai', 'gpt-test'),
+      candidate('public-fallback', { streamEvents: [{ type: 'text_delta', text: 'Continued.' } as any] }, 'deepseek', 'fixture-model'),
+    ] });
+    const first = await collect(p.stream(PARAMS));
+    expect(first.filter(event => event.type === 'provider_fallback')).toEqual([
+      expect.objectContaining({ type: 'provider_fallback', reason: 'balance', providerId: 'openai', candidateIndex: 1, candidateCount: 2 }),
+    ]);
+    expect(first.filter(event => event.type === 'retry')).toEqual([]);
+    expect((first.at(-1) as any).text).toBe('Continued.');
+    expect(getCooldown('public-empty-balance')?.kind).toBe('balance');
+    const second = await collect(p.stream(PARAMS));
+    expect(second.some(event => event.type === 'provider_fallback')).toBe(false);
+    expect((second.at(-1) as any).text).toBe('Continued.');
+  });
+});
+
+describe('configured-provider credential, auxiliary and exhaustion recovery', () => {
+  beforeEach(() => _clearAll());
+  it.each(['complete', 'stream'] as const)('continues %s through real SDK rejection and configured fallback', async method => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      for (const api of ['openai-responses', 'openai-completions'] as const) {
+        for (const code of ['server_error', 'invalid_request_error', 'model_not_found']) {
+          _clearAll();
+          const requests: string[] = [];
+          vi.stubGlobal('fetch', vi.fn(async (input) => {
+            const primary = String(input).includes('primary.invalid');
+            requests.push(primary ? 'primary' : 'fallback');
+            if (primary) return new Response(JSON.stringify({ error: { type: code, message: 'private diagnostic' } }),
+              { status: 400, headers: { 'content-type': 'application/json' } });
+            if (api === 'openai-completions') return new Response('data: ' + JSON.stringify({
+              choices: [{ index: 0, delta: { role: 'assistant', content: 'Finished' }, finish_reason: 'stop' }],
+            }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+            const item = { id: 'msg_finished', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Finished' }] };
+            return new Response('event: response.output_item.done\ndata: ' + JSON.stringify({ type: 'response.output_item.done', output_index: 0, item })
+              + '\n\nevent: response.completed\ndata: ' + JSON.stringify({ type: 'response.completed', response: { status: 'completed', output: [item], usage: { input_tokens: 2, output_tokens: 1 } } }) + '\n\n',
+            { headers: { 'content-type': 'text/event-stream' } });
+          }));
+          const provider = createRotatingProvider({ providerId: 'custom', networkRetryDelayMs: () => 0,
+            candidates: ['primary', 'fallback'].map(name => ({ profileId: name, providerId: 'custom', modelId: 'fixture',
+              build: async () => createPiProvider({ provider: 'custom', apiKey: 'fixture', customModel: {
+                id: 'fixture', name: 'fixture', api, provider: 'custom', baseUrl: `https://${name}.invalid/v1`,
+                reasoning: false, input: ['text'], contextWindow: 128000, maxTokens: 4096,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              } }),
+            })),
+          });
+          if (method === 'complete') expect((await provider.complete(PARAMS)).content.some(block => block.type === 'text' && block.text === 'Finished')).toBe(true);
+          else expect((await collect(provider.stream(PARAMS))).filter(event => event.type === 'message_end')).toHaveLength(1);
+          expect(requests).toEqual(code === 'server_error' ? ['primary', 'primary', 'primary', 'primary', 'fallback'] : ['primary', 'fallback']);
+          expect(getCooldown('primary')).toBeUndefined();
+        }
+      }
+      expect(JSON.stringify(warning.mock.calls)).not.toContain('private diagnostic');
+    } finally { vi.unstubAllGlobals(); warning.mockRestore(); _clearAll(); }
+  });
+
+  it('refreshes OAuth once after a pre-content auth failure and retries the same candidate invisibly', async () => {
+    let token = 'stale-access';
+    let builds = 0;
+    let refreshes = 0;
+    let fallbackBuilds = 0;
+    const authErr = Object.assign(new Error('The authentication token is expired'), { code: 'oauth_token_expired' });
+    const p = createRotatingProvider({
+      providerId: 'openai-codex',
+      candidates: [
+        {
+          profileId: 'oauth-profile',
+          providerId: 'openai-codex',
+          modelId: 'gpt-test',
+          refreshCredential: async () => {
+            refreshes += 1;
+            token = 'fresh-access';
+            return true;
+          },
+          build: async () => {
+            builds += 1;
+            return token === 'stale-access'
+              ? fakeProvider('oauth-profile', {
+                  // Mirrors pi-ai: a harmless stream preamble followed by an
+                  // in-band, statusless authentication error event.
+                  streamEvents: [
+                    { type: 'message_start' } as any,
+                    { type: 'error', error: authErr } as any,
+                  ],
+                })
+              : fakeProvider('oauth-profile', { streamEvents: [{ type: 'text_delta', text: 'renewed' } as any] });
+          },
+        },
+        {
+          profileId: 'fallback',
+          providerId: 'fallback',
+          modelId: 'fallback-model',
+          build: async () => {
+            fallbackBuilds += 1;
+            return fakeProvider('fallback', { streamEvents: [{ type: 'text_delta', text: 'fallback' } as any] });
+          },
+        },
+      ],
+    });
+
+    const events = await collect(p.stream(PARAMS));
+
+    expect(events).toEqual([{ type: 'text_delta', text: 'renewed' }]);
+    expect(events.some((event) => event.type === 'retry')).toBe(false);
+    expect(events.some((event) => event.type === 'provider_fallback')).toBe(false);
+    expect(builds).toBe(2);
+    expect(refreshes).toBe(1);
+    expect(fallbackBuilds).toBe(0);
+    expect(getCooldown('oauth-profile')).toBeUndefined();
+  });
+
+  it.each([
+    ['refresh returns unavailable', 'unavailable'],
+    ['refresh throws', 'throws'],
+    ['the refreshed credential is rejected again', 'success'],
+  ] as const)('%s: refreshes at most once, then falls back as auth', async (_label, refreshResult) => {
+    let builds = 0;
+    let refreshes = 0;
+    const authErr = Object.assign(new Error('The authentication token is expired'), { code: 'oauth_token_expired' });
+    const p = createRotatingProvider({
+      providerId: 'openai-codex',
+      candidates: [
+        {
+          profileId: 'oauth-profile',
+          providerId: 'openai-codex',
+          modelId: 'gpt-test',
+          refreshCredential: async () => {
+            refreshes += 1;
+            if (refreshResult === 'throws') throw new Error('refresh grant expired');
+            return refreshResult === 'success';
+          },
+          build: async () => {
+            builds += 1;
+            return fakeProvider('oauth-profile', { throwBefore: authErr });
+          },
+        },
+        candidate('fallback', { streamEvents: [{ type: 'text_delta', text: 'fallback' } as any] }),
+      ],
+    });
+
+    const events = await collect(p.stream(PARAMS));
+
+    expect(refreshes).toBe(1);
+    expect(builds).toBe(refreshResult === 'success' ? 2 : 1);
+    expect(events.filter((event) => event.type === 'provider_fallback')).toEqual([
+      expect.objectContaining({ reason: 'auth', providerId: 'openai-codex' }),
+    ]);
+    expect(events.some((event) => event.type === 'retry')).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'text_delta', text: 'fallback' });
+    expect(getCooldown('oauth-profile')?.kind).toBe('auth');
+  });
+
+  it('also refreshes once for complete() and rebuilds with the renewed credential', async () => {
+    let token = 'stale-access';
+    let builds = 0;
+    const authErr = Object.assign(new Error('The authentication token is expired'), { code: 'oauth_token_expired' });
+    const p = createRotatingProvider({
+      providerId: 'openai-codex',
+      networkRetryAttempts: 0,
+      candidates: [{
+        profileId: 'oauth-profile',
+        providerId: 'openai-codex',
+        modelId: 'gpt-test',
+        refreshCredential: async () => {
+          token = 'fresh-access';
+          return true;
+        },
+        build: async () => {
+          builds += 1;
+          return fakeProvider('oauth-profile', token === 'stale-access'
+            ? { completeError: authErr }
+            : { completeResult: { content: [{ type: 'text', text: 'renewed' }] } });
+        },
+      }],
+    });
+
+    await expect(p.complete(PARAMS)).resolves.toMatchObject({
+      content: [{ type: 'text', text: 'renewed' }],
+    });
+    expect(builds).toBe(2);
+    expect(getCooldown('oauth-profile')).toBeUndefined();
+  });
+
+  it('leaves committed rate-limit retries to Runner without switching candidates', async () => {
+    let requests = 0;
+    let fallbackBuilds = 0;
+    const primary: RotatingCandidate = { profileId: 'p1', providerId: 'test', modelId: 'test-model',
+      build: async () => ({ id: 'test', name: 'test',
+        async complete() { requests++; throw Object.assign(new Error('opaque'), { status: 429 }); },
+        async *stream() {
+          requests++;
+          yield { type: 'text_delta', text: 'partial' };
+          yield { type: 'error', error: Object.assign(new Error('opaque'), { status: 429 }) };
+        },
+        async validateAuth() { return true; },
+      }),
+    };
+    const create = () => createRotatingProvider({ providerId: 'test', networkRetryDelayMs: () => 0,
+      candidates: [primary, { ...candidate('fallback', {}), build: async () => {
+        fallbackBuilds++; return fakeProvider('fallback', {});
+      } }],
+    });
+    const p = create();
+    const invoke = (provider: LLMProvider) => collect(provider.stream(PARAMS));
+    await expect(invoke(p)).rejects.toMatchObject({ code: 'COMMITTED_STREAM_RATE_LIMIT' });
+    await expect(invoke(p)).rejects.toMatchObject({ code: 'COMMITTED_STREAM_RATE_LIMIT' });
+    expect(requests).toBe(2);
+    expect(fallbackBuilds).toBe(0);
+    expect(getCooldown('p1')).toBeUndefined();
+    await expect(invoke(create())).rejects.toMatchObject({ code: 'COMMITTED_STREAM_RATE_LIMIT' });
+    expect(requests).toBe(3);
+    expect(fallbackBuilds).toBe(0);
+  });
+
+  it.each([
+    'There is no rate limit; the operation failed',
+    'The record number is 429 and operation failed',
+    'Opaque gateway rule Z7 rejected the request',
+    'require is not defined',
+    'EPERM: operation not permitted, open <redacted>',
+  ])('preserves unknown diagnostics through rotation, runner and display: %s', async (message) => {
+    let calls = 0;
+    const rotating = createRotatingProvider({
+      providerId: 'mock',
+      networkRetryAttempts: 1,
+      networkRetryDelayMs: () => 0,
+      candidates: [{
+        profileId: 'unknown-error', providerId: 'mock', modelId: 'mock-model',
+        build: async () => {
+          calls++;
+          return fakeProvider('unknown-error', { throwBefore: new Error(message) });
+        },
+      }],
+    });
+    const registry = new ProviderRegistry();
+    registry.registerFactory('mock', () => rotating);
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'mock-model' } }),
+      providers: registry,
+      tools: [],
+    });
+    const events = [];
+    for await (const event of mapCoreAgentEvents(runner.runStream({ message: 'fixture' }), { failureTrackingScope: {} })) events.push(event);
+    expect(calls).toBe(2);
+    expect(getCooldown('unknown-error')).toBeUndefined();
+    expect(events.filter((event) => event.type === 'progress')).toEqual([
+      expect.objectContaining({ text: expect.stringContaining(message) }),
+    ]);
+    expect(events.filter((event) => event.type === 'error' || event.type === 'final')).toEqual([
+      expect.objectContaining({ type: 'error', text: message, failureCode: 'provider_retries_exhausted' }),
+    ]);
+  });
+
+  it.each([false, true])('preserves candidate recovery before reporting exhaustion through runner and mapper (fallbackFails=%s)', async (fallbackFails) => {
+    const requests = { primary: 0, fallback: 0 };
+    const rotating = createRotatingProvider({
+      providerId: 'mock', networkRetryAttempts: 3, networkRetryDelayMs: () => 0,
+      candidates: (['primary', 'fallback'] as const).map((name) => ({
+        profileId: name, providerId: 'mock', modelId: 'mock-model',
+        build: async () => {
+          requests[name]++;
+          return name === 'primary' || fallbackFails
+            ? fakeProvider(name, { throwBefore: Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' }) })
+            : fakeProvider(name, { streamEvents: [
+              { type: 'text_delta', text: 'recovered with fallback' },
+              { type: 'message_end', stopReason: 'end_turn', model: 'mock-model',
+                content: [{ type: 'text', text: 'recovered with fallback' }],
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
+            ] });
+        },
+      })),
+    });
+    const registry = new ProviderRegistry();
+    registry.registerFactory('mock', () => rotating);
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'mock-model' } }),
+      providers: registry, tools: [],
+    });
+    const events = [];
+    for await (const event of mapCoreAgentEvents(runner.runStream({ message: 'Finish the report' }), { failureTrackingScope: {} })) events.push(event);
+    expect(requests).toEqual({ primary: 4, fallback: fallbackFails ? 4 : 1 });
+    expect(events.filter((event) => event.type === 'error' || event.type === 'final')).toEqual([
+      expect.objectContaining(fallbackFails
+        ? { type: 'error', failureCode: 'provider_network', retryExhausted: true }
+        : { type: 'final', text: 'recovered with fallback' }),
+    ]);
+    expect(events.filter((event) => event.type !== 'error').some((event) => event.retryExhausted)).toBe(false);
+    expect(getCooldown('primary')).toBeUndefined();
+    expect(getCooldown('fallback')).toBeUndefined();
+  });
+
+  it('exhausted-rotation error is non-retryable so the runner cannot amplify the rotation', async () => {
+    // Each candidate already got its per-candidate network retries inside the
+    // rotation; the summary error must classify as permanent, otherwise the
+    // agent runner re-runs the WHOLE rotation up to maxRetries more times
+    // (candidates × inner retries × outer retries full-prompt calls).
+    const { classifyRetryableError } = await import('#core-agent');
+    const netErr = Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' });
+    const p = createRotatingProvider({
+      providerId: 'test',
+      networkRetryDelayMs: () => 0,
+      networkRetryAttempts: 1,
+      candidates: [
+        candidate('p1', { throwBefore: netErr }),
+        candidate('p2', { throwBefore: netErr }),
+      ],
+    });
+    let thrown: unknown;
+    try { await collect(p.stream(PARAMS)); } catch (err) { thrown = err; }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as { code?: string }).code).toBe('PROVIDER_NETWORK_EXHAUSTED');
+    expect((thrown as { cause?: unknown }).cause).toBe(netErr);
+    expect(classifyRetryableError(thrown)).toBeNull();
+    // Look-alike guard: the raw per-candidate network error itself stays
+    // retryable — only the exhausted summary is exempt.
+    expect(classifyRetryableError(netErr)).toBe('connection_dropped');
+  });
+
+  it('complete() retries a normal empty completion once on the same candidate', async () => {
+    const empty = { content: [], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 }, model: 'test' };
+    const ok = { content: [{ type: 'text', text: 'ok' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, model: 'test' };
+    let calls = 0;
+    const p = createRotatingProvider({
+      providerId: 'test',
+      candidates: [{
+        profileId: 'p1', providerId: 'test', modelId: 'test-model',
+        build: async () => ({
+          id: 'p1', name: 'p1',
+          async *stream() { throw new Error('stream not used'); },
+          async complete() { calls += 1; return calls === 1 ? empty : ok; },
+          async validateAuth() { return true; },
+        }),
+      }],
+    });
+    const res = await p.complete(PARAMS);
+    expect((res.content[0] as any).text).toBe('ok');
+    expect(calls).toBe(2);
+  });
+
+  it.each([{ content: [] }, { content: [{ type: 'thinking', thinking: 'hmm' }] }, { content: [{ type: 'text', text: '  ' }] }])(
+    'complete() fails repeated empty output without fallback or cooldown (%j)', async ({ content }) => {
+      const empty = { content, stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 }, model: 'test' };
+      const primary = vi.fn(async () => fakeProvider('p1', { completeResult: empty }));
+      const fallback = vi.fn(async () => fakeProvider('p2', { completeResult: { ...empty, content: [{ type: 'text', text: 'must not be requested' }] } }));
+      const chosen = vi.fn();
+      const success = vi.fn();
+      const p = createRotatingProvider({
+        providerId: 'test', onCandidateChosen: chosen, onSuccess: success,
+        candidates: [
+          { profileId: 'p1', providerId: 'test', modelId: 'test-model', build: primary },
+          { profileId: 'p2', providerId: 'test', modelId: 'other-model', build: fallback },
+        ],
+      });
+      await expect(p.complete(PARAMS)).rejects.toMatchObject({ code: PROVIDER_EMPTY_NORMAL_CODE });
+      expect(primary).toHaveBeenCalledTimes(2);
+      expect(fallback).not.toHaveBeenCalled();
+      expect(success).not.toHaveBeenCalled();
+      expect(chosen.mock.calls).toEqual([[{ profileId: 'p1', providerId: 'test', modelId: 'test-model' }]]);
+      expect(getCooldown('p1')).toBeUndefined();
+    },
+  );
+
+  it.each([new TypeError('fetch failed'), Object.assign(new Error('Too Many Requests'), { status: 429 })])(
+    'complete() retains fault recovery when the empty retry encounters %s', async error => {
+      let calls = 0;
+      const answer = { content: [{ type: 'text', text: 'recovered' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, model: 'test' };
+      const p = createRotatingProvider({
+        providerId: 'test', networkRetryAttempts: 1, networkRetryDelayMs: () => 0,
+        candidates: [{ profileId: 'p1', providerId: 'test', modelId: 'test-model', build: async () => {
+          calls++;
+          return calls === 1
+            ? fakeProvider('p1', { completeResult: { ...answer, content: [] } })
+            : fakeProvider('p1', { completeError: error });
+        } }, candidate('p2', { completeResult: answer })],
+      });
+      await expect(p.complete(PARAMS)).resolves.toEqual(answer);
+      expect(calls).toBe('status' in error ? 2 : 3);
+      expect(getCooldown('p1')).toBeUndefined();
+    },
+  );
+
+  it.each(['reflection', 'summary'] as const)('contains empty %s failure without losing execution results', async mode => {
+    let streams = 0;
+    let completions = 0;
+    let writes = 0;
+    const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+    const fallback = vi.fn(async () => fakeProvider('fallback', {}));
+    const primary: LLMProvider = {
+      id: 'mock', name: 'Mock', async validateAuth() { return true; },
+      async complete() {
+        completions++;
+        return { content: [], stopReason: 'end_turn', usage, model: 'mock-model' };
+      },
+      async *stream(): AsyncIterable<StreamEvent> {
+        streams++;
+        const finish = mode === 'reflection' && streams > 1;
+        yield { type: 'message_end', stopReason: finish ? 'end_turn' : 'tool_use', usage,
+          model: 'mock-model', providerTermination: { category: 'normal' },
+          content: finish ? [{ type: 'text', text: 'Saved the record.' }]
+            : [{ type: 'tool_use', id: `write-${streams}`, name: 'save_record', input: {} }],
+        };
+      },
+    };
+    const rotating = createRotatingProvider({ providerId: 'mock', candidates: [
+      { profileId: 'primary', providerId: 'mock', modelId: 'mock-model', build: async () => primary },
+      { profileId: 'fallback', providerId: 'mock', modelId: 'other-model', build: fallback },
+    ] });
+    const registry = new ProviderRegistry();
+    registry.registerFactory('mock', () => rotating);
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'mock-model', maxToolLoops: 1 } }),
+      providers: registry, evolution: { enabled: false },
+      tools: [defineTool({ name: 'save_record', description: 'Save a record', inputSchema: { type: 'object' },
+        async execute() { writes++; return { content: 'Saved record 42' }; },
+      })],
+    });
+    const events = [];
+    for await (const event of runner.runStream({ message: 'Save the record.' })) events.push(event);
+    const done = events.filter(event => event.type === 'done');
+    expect(done).toHaveLength(1);
+    const result = done[0].result;
+    expect(result.meta.error).toBeUndefined();
+    if (mode === 'reflection') {
+      const messages = structuredClone(runner.getSession().getMessages());
+      const failure = vi.fn();
+      const durableWrite = vi.fn();
+      await expect(runner.runReflection('Review the completed task.', undefined, undefined, undefined, durableWrite, failure)).resolves.toBe('');
+      expect(failure).toHaveBeenCalledWith({ kind: 'llm_error', error: expect.objectContaining({ code: PROVIDER_EMPTY_NORMAL_CODE }) });
+      expect(durableWrite).not.toHaveBeenCalled();
+      expect(runner.getSession().getMessages()).toEqual(messages);
+      expect(result.text).toBe('Saved the record.');
+      expect(result.meta.termination).toBeUndefined();
+    } else {
+      expect(result.meta.termination).toEqual({ status: 'stopped', reason: 'tool_loop_limit',
+        summaryIncomplete: true, toolRoundLimit: 1,
+      });
+      expect(result.text).toBe('');
+      const saved = JSON.stringify(runner.getSession().getMessages());
+      expect(saved).toContain('Saved record 42');
+      expect(saved).not.toContain('Recent successful results:');
+      expect(events.filter(event => event.type === 'provider_call').at(-1)).toMatchObject({ outcome: 'failed' });
+    }
+    expect(completions).toBe(2);
+    expect(writes).toBe(1);
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
+  it('complete() does not add a nested empty retry during an AgentRunner recovery attempt', async () => {
+    const empty = { content: [], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 }, model: 'test' };
+    let calls = 0;
+    const p = createRotatingProvider({
+      providerId: 'test',
+      candidates: [{
+        profileId: 'p1', providerId: 'test', modelId: 'test-model',
+        build: async () => ({
+          id: 'p1', name: 'p1',
+          async *stream() { throw new Error('stream not used'); },
+          async complete() { calls += 1; return empty; },
+          async validateAuth() { return true; },
+        }),
+      }],
+    });
+    await expect(p.complete({ ...PARAMS, retryContext: { agentAttempt: 1 } } as any)).rejects.toMatchObject({ code: PROVIDER_EMPTY_NORMAL_CODE });
+    expect(calls).toBe(1);
+  });
+
+  it('complete() treats a truncated reply as an answer, not as empty', async () => {
+    const truncated = { content: [], stopReason: 'max_tokens', usage: { inputTokens: 1, outputTokens: 9, totalTokens: 10 }, model: 'test' };
+    let calls = 0;
+    const p = createRotatingProvider({
+      providerId: 'test',
+      candidates: [{
+        profileId: 'p1', providerId: 'test', modelId: 'test-model',
+        build: async () => ({
+          id: 'p1', name: 'p1',
+          async *stream() { throw new Error('stream not used'); },
+          async complete() { calls += 1; return truncated; },
+          async validateAuth() { return true; },
+        }),
+      }],
+    });
+    await expect(p.complete(PARAMS)).resolves.toBe(truncated);
+    expect(calls).toBe(1);
+  });
+});
+
+describe('rotating-provider › user-confirmed rate-limit fallback', () => {
+  beforeEach(() => _clearAll());
+
+  for (const mode of ['stream', 'complete'] as const) {
+    const invoke = async (provider: LLMProvider) => mode === 'stream'
+      ? collect(provider.stream(PARAMS)) : provider.complete(PARAMS);
+
+    it(`${mode}: tries every configured model even with a shared credential, then reopens them on a new request`, async () => {
+      const attempts: string[] = [];
+      let recovered = false;
+      const configured = ['a', 'b', 'c'].map((modelId): RotatingCandidate => ({
+        profileId: 'shared', providerId: 'test', modelId,
+        build: async () => {
+          attempts.push(modelId);
+          const error = !recovered && modelId !== 'c'
+            ? Object.assign(new Error('Too Many Requests'), { status: 429 }) : undefined;
+          return fakeProvider(modelId, {
+            throwBefore: error, completeError: error,
+            streamEvents: [{ type: 'text_delta', text: modelId } as any],
+            completeResult: { content: [{ type: 'text', text: modelId }], stopReason: 'end_turn' },
+          });
+        },
+      }));
+      const makeRequest = () => createRotatingProvider({ providerId: 'test', candidates: configured });
+      const provider = makeRequest();
+      const result = await invoke(provider);
+      expect(JSON.stringify(result)).toContain('"text":"c"');
+      expect(attempts).toEqual(['a', 'b', 'c']);
+      await invoke(provider); // The same task's next model round must not revisit a/b.
+      expect(attempts).toEqual(['a', 'b', 'c', 'c']);
+      expect(getCooldown('shared')).toBeUndefined();
+      recovered = true;
+      const retry = await invoke(makeRequest());
+      expect(JSON.stringify(retry)).toContain('"text":"a"');
+      expect(attempts).toEqual(['a', 'b', 'c', 'c', 'a']);
+    });
+
+    it(`${mode}: stops after all candidates rate-limit without replaying the exhausted sweep`, async () => {
+      const attempts: string[] = [];
+      const p = createRotatingProvider({ providerId: 'test', candidates: ['a', 'b'].map((modelId) => ({
+        profileId: modelId, providerId: 'test', modelId,
+        build: async () => {
+          attempts.push(modelId);
+          const error = Object.assign(new Error('Too Many Requests'), { status: 429 });
+          return fakeProvider(modelId, { throwBefore: error, completeError: error });
+        },
+      })) });
+      const { classifyRetryableError } = await import('#core-agent');
+      for (let round = 0; round < 2; round++) {
+        let failure: unknown;
+        try { await invoke(p); } catch (error) { failure = error; }
+        expect(failure).toMatchObject({ code: 'PROVIDER_RATE_LIMIT_EXHAUSTED' });
+        expect(classifyRetryableError(failure)).toBeNull();
+      }
+      expect(attempts).toEqual(['a', 'b']);
+      expect(getCooldown('a')).toBeUndefined();
+      expect(getCooldown('b')).toBeUndefined();
+    });
+  }
+
+  it('does not run a fallback after the user cancels a rate-limited request', async () => {
+    const controller = new AbortController();
+    let fallbackAttempts = 0;
+    const p = createRotatingProvider({ providerId: 'test', candidates: [{
+      profileId: 'a', providerId: 'test', modelId: 'a',
+      build: async () => {
+        controller.abort(new Error('user cancelled'));
+        throw Object.assign(new Error('Too Many Requests'), { status: 429 });
+      },
+    }, {
+      profileId: 'b', providerId: 'test', modelId: 'b',
+      build: async () => { fallbackAttempts++; return fakeProvider('b', {}); },
+    }] });
+    await expect(collect(p.stream({ ...PARAMS, signal: controller.signal }))).rejects.toThrow('user cancelled');
+    expect(fallbackAttempts).toBe(0);
+    expect(getCooldown('a')).toBeUndefined();
+  });
+});
+
+
+describe('rate-limit fallback across a real AgentRunner tool round', () => {
+  beforeEach(() => _clearAll());
+
+  it('continues with another configured model using committed results, without replaying the tool', async () => {
+    let primaryCalls = 0;
+    let fallbackCalls = 0;
+    let toolCalls = 0;
+    const fallbackMessages: CompletionParams['messages'][] = [];
+    const rotating = createRotatingProvider({ providerId: 'mock', candidates: [{
+      profileId: 'shared', providerId: 'mock', modelId: 'model-a',
+      build: async () => ({
+        ...fakeProvider('mock', {}),
+        async *stream(): AsyncIterable<StreamEvent> {
+          primaryCalls++;
+          if (primaryCalls > 1) throw Object.assign(new Error('Too Many Requests'), { status: 429 });
+          yield { type: 'message_end', stopReason: 'tool_use',
+            usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+            content: [{ type: 'tool_use', id: 'one-write', name: 'write_once', input: {} }],
+            model: 'model-a', providerTermination: { category: 'normal' } };
+        },
+      }),
+    }, {
+      profileId: 'shared', providerId: 'mock', modelId: 'model-b',
+      build: async () => ({
+        ...fakeProvider('mock', {}),
+        async *stream(params: CompletionParams): AsyncIterable<StreamEvent> {
+          fallbackCalls++;
+          fallbackMessages.push(params.messages);
+          expect(params.model).toBe('model-b');
+          yield { type: 'message_end', stopReason: 'end_turn',
+            usage: { inputTokens: 4, outputTokens: 1, totalTokens: 5 },
+            content: [{ type: 'text', text: 'saved once' }],
+            model: 'model-b', providerTermination: { category: 'normal' } };
+        },
+      }),
+    }] });
+    const registry = new ProviderRegistry();
+    registry.registerFactory('mock', () => rotating);
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'model-a' } }),
+      providers: registry,
+      tools: [defineTool({ name: 'write_once', description: 'Save fixture',
+        inputSchema: { type: 'object', properties: {} },
+        async execute() { toolCalls++; return { content: 'saved-record-42' }; },
+      })],
+    });
+    const result = await runner.run({ message: 'Save the record and report the result.' });
+    expect(result.text).toBe('saved once');
+    expect(toolCalls).toBe(1);
+    expect(primaryCalls).toBe(2);
+    expect(fallbackCalls).toBe(1);
+    expect(JSON.stringify(fallbackMessages)).toContain('saved-record-42');
+    expect(getCooldown('shared')).toBeUndefined();
+  });
+
+  it('advances after the one empty-response recovery attempt is rate-limited', async () => {
+    let primaryCalls = 0;
+    const p = createRotatingProvider({ providerId: 'test', candidates: [{
+      profileId: 'a', providerId: 'test', modelId: 'a',
+      build: async () => {
+        primaryCalls++;
+        return primaryCalls === 1
+          ? fakeProvider('a', { streamEvents: [{ type: 'message_end', stopReason: 'end_turn',
+            content: [], providerTermination: { category: 'normal' } } as any] })
+          : fakeProvider('a', { throwBefore: Object.assign(new Error('Too Many Requests'), { status: 429 }) });
+      },
+    }, candidate('b', { streamEvents: [{ type: 'text_delta', text: 'fallback answer' } as any] })] });
+    const events = await collect(p.stream(PARAMS));
+    expect(events).toContainEqual({ type: 'text_delta', text: 'fallback answer' });
+    expect(primaryCalls).toBe(2);
+    expect(getCooldown('a')).toBeUndefined();
+  });
+});
+
+// of retrying into the same limit. Other endings keep the provider's error.
+describe('all configured models rate limited', () => {
+  const throttled = () => Object.assign(new Error('Too Many Requests'), { status: 429 });
+  const ownCandidates = () => [
+    candidate('own-a', { throwBefore: throttled(), completeError: throttled() }, 'custom', 'free-a'),
+    candidate('own-b', { throwBefore: throttled(), completeError: throttled() }, 'deepseek', 'free-b'),
+  ];
+
+  it.each(['stream', 'complete'] as const)('says every configured model is throttled (%s)', async method => {
+    _clearAll();
+    const p = createRotatingProvider({ providerId: 'custom', networkRetryAttempts: 0, candidates: ownCandidates() });
+    const invoke = () => method === 'stream' ? collect(p.stream(PARAMS)) : p.complete(PARAMS);
+    for (let i = 0; i < 2; i++) {
+      await expect(invoke()).rejects.toMatchObject({
+        code: 'PROVIDER_RATE_LIMIT_EXHAUSTED', message: ALL_CONFIGURED_RATE_LIMITED_MESSAGE,
+      });
+    }
+  });
+
+  it('keeps the provider error when another configured model failed for a different reason', async () => {
+    _clearAll();
+    const reset = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    const p = createRotatingProvider({ providerId: 'custom', networkRetryAttempts: 0, candidates: [
+      candidate('own-a', { throwBefore: reset }, 'custom', 'free-a'),
+      candidate('own-b', { throwBefore: throttled() }, 'deepseek', 'free-b'),
+    ] });
+    const err = await collect(p.stream(PARAMS)).catch(error => error);
+    expect(err).toMatchObject({ code: 'PROVIDER_RATE_LIMIT_EXHAUSTED' });
+    expect(err.message).not.toBe(ALL_CONFIGURED_RATE_LIMITED_MESSAGE);
+  });
+
+  it('keeps the provider error when a stream is throttled after output began', async () => {
+    _clearAll();
+    const p = createRotatingProvider({ providerId: 'custom', networkRetryAttempts: 0, candidates: [
+      candidate('own-a', { streamEvents: [{ type: 'text_delta', text: 'partial' } as any,
+        { type: 'error', error: throttled() } as any] }, 'custom', 'free-a'),
+      candidate('own-b', { streamEvents: [{ type: 'text_delta', text: 'ok' } as any] }, 'deepseek', 'free-b'),
+    ] });
+    const err = await collect(p.stream(PARAMS)).catch(error => error);
+    expect(err).toMatchObject({ code: 'COMMITTED_STREAM_RATE_LIMIT' });
+    expect(err.message).not.toBe(ALL_CONFIGURED_RATE_LIMITED_MESSAGE);
+  });
+});
+
+
+describe('user-owned provider balance isolation', () => {
+  beforeEach(() => _clearAll());
+  it('keeps an Orkas-looking quota code from a user endpoint as an ordinary balance failure', async () => {
+    const lookalike = Object.assign(new Error('payment required'), { status: 402, code: 'orkas_llm_quota_exceeded' });
+    const p = createRotatingProvider({
+      providerId: 'custom',
+      networkRetryDelayMs: () => 0,
+      candidates: [candidate('custom-key', { throwBefore: lookalike }, 'custom', 'custom-model')],
+    });
+    await expect(collect(p.stream(PARAMS))).rejects.toMatchObject({ code: 'PROVIDER_BALANCE_EXHAUSTED' });
+    expect(getCooldown('custom-key')?.kind).toBe('balance');
+  });
+  it('stays quiet when throttling moves the run between the user\'s own credentials', async () => {
+    const p = createRotatingProvider({
+      providerId: 'openai',
+      networkRetryDelayMs: () => 0,
+      candidates: [
+        candidate('mine', { throwBefore: Object.assign(new Error('Too Many Requests'), { status: 429 }) }, 'openai', 'gpt-test'),
+        candidate('also-mine', { streamEvents: [{ type: 'text_delta', text: 'ok' } as any] }, 'deepseek', 'deepseek-test'),
+      ],
+    });
+    const events = await collect(p.stream(PARAMS));
+    expect(events.some((event: any) => event.type === 'provider_fallback')).toBe(false);
+    expect((events.at(-1) as any).text).toBe('ok');
+  });
 });

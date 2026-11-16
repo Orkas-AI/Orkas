@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import { buildTimelineAdapterScript } from '../../../src/main/features/video_studio';
 import type { CompositionMeta } from '../../../src/main/features/video_studio_qa';
+import { buildVideoTimelineAdapterScript } from '../../../src/main/features/video_timeline';
 
 // Why this file exists: for three days every composed opening captured blank
 // (EMPTY_HOOK_FRAME + EXPECTED_SCENE_NOT_VISIBLE + HOOK_PROMISE_NOT_VISIBLE)
@@ -18,7 +19,7 @@ import type { CompositionMeta } from '../../../src/main/features/video_studio_qa
 
 const GSAP_PATH = path.join(
   __dirname, '../../../resources/builtin/marketplace/agents/79df9cc89f5f',
-  'skills/stage-compose/scripts/vendor/gsap.min.js',
+  'skills/video-studio/assets/vendor/gsap.min.js',
 );
 
 type Style = { opacity: string; visibility: string };
@@ -126,6 +127,11 @@ describe('frame-zero seek against the bundled GSAP', () => {
   });
 
   it('ships that guard in the timeline adapter the renderer injects', () => {
+    const script = buildVideoTimelineAdapterScript();
+    expect(script).toContain('tl.render(t, false, true)');
+    expect(script).toMatch(/Math\.abs\(before - t\) < 1e-6/);
+  });
+  it('also keeps the normal seek and forced-render guard in the native composition adapter', () => {
     const meta = {
       htmlPath: '/ws/index.html',
       html: '',

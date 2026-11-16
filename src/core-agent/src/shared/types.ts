@@ -41,8 +41,8 @@ export type ToolResultContent = {
   /** Images returned by this actual call, not a separate user turn. New
    * receipts always include this array; absence identifies legacy trailers. */
   images?: ImageContent[];
-  /** Host-selected authoring input; latest set (at most six images) survives
-   * active-turn elision/checkpoints. Empty replaces/clears the prior set. */
+  /** Host-selected authoring input; the newest sets (six images in all) survive
+   * active-turn elision/checkpoints. An empty set clears the sets before it. */
   imageRetention?: "active_turn";
 };
 
@@ -206,6 +206,9 @@ export type StreamEvent =
   | {
       type: "message_end";
       stopReason: StopReason;
+      /** A known output limit discarded malformed tool proposals. Request-local
+       * recovery evidence only; never executable arguments or persisted state. */
+      incompleteToolCall?: true;
       usage?: Partial<Usage>;
       /**
        * Full reconstructed assistant message content. Populated by providers

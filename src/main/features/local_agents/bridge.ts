@@ -50,6 +50,7 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { outputPublicationReceipt } from '../../util/output-publication';
 
 import { createLogger } from '../../logger';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
@@ -442,109 +443,106 @@ function _buildMethods(
         return { text: page.content, ...page, output_ref: params.output_ref,
           ...(stored.isError ? { isError: true } : {}), };
       }
-      const reject = (message: string, _errorCode: string, _errorType = 'validation'): never => {
+      const reject = (message: string): never => {
         throw new Error(message);
       };
-      try {
-        if (params.action !== undefined && params.action !== 'call') reject('action must be call or read', 'E_BAD_INPUT');
-        if (Object.keys(params).some((key) => !['action', 'connector_id', 'tool_name', 'args'].includes(key))) reject('call accepts only connector_id, tool_name and args', 'E_BAD_INPUT');
-        const connectorId = String(params.connector_id || '');
-        const toolName = String(params.tool_name || '');
-        const rawArgs = (params.args && typeof params.args === 'object') ? params.args as Record<string, unknown> : {};
-        if (!connectorId || !toolName) reject('connector_id and tool_name required', 'E_BAD_INPUT');
-        // The client stops waiting on its own timeout or an MCP cancel. Once it
-        // has, no later user approval may run the side effect: the model has
-        // already been told the call failed and may have retried it.
-        const cancelled = () => new Error('E_BRIDGE_CALL_CANCELLED: the CLI stopped waiting for this connector call');
-        if (call.signal.aborted) throw cancelled();
-        const visible = await connectors.resolveVisibleConnectors(opts.uid);
-        for (const { instance } of visible) {
-          recordConnectorDisplayName(instance.id, instance.display_name);
-        }
-        const target = visible.find((v) => v.instance.id === connectorId);
-        if (!target) reject(`connector not available: ${connectorId}`, 'E_CONNECTOR_NOT_VISIBLE');
-        const tool = target.tools.find((item) => item.name === toolName);
-        if (!tool) {
-          reject(`tool not exposed by connector ${connectorId}: ${toolName}`, 'E_TOOL_NOT_AVAILABLE');
-        }
-        if (isConnectorActionBlocked(connectorId, toolName)) {
-          reject('E_CONNECTOR_ACTION_UNAVAILABLE: this action is not available in Orkas', 'E_TOOL_NOT_AVAILABLE');
-        }
-        // Same normalisation as the in-process `call_connector_tool` (camelCase
-        // keys, Gmail defaults): an external CLI must not reach the provider with
-        // a different request shape than a built-in Agent for the same action.
-        const args = applyConnectorArgDefaults(
-          connectorId,
-          toolName,
-          rawArgs,
-          (tool.input_schema && typeof tool.input_schema === 'object')
-            ? tool.input_schema as Record<string, unknown>
-            : undefined,
-        );
-        const policy = tool.orkas_action_policy;
-        const isComposioCommerce = !!target.instance.composio_grant
-          && connectors.findCatalogEntry(connectorId)?.category === 'commerce';
-        if (isComposioCommerce && !policy) {
-          reject('E_CONNECTOR_POLICY_MISSING: this commerce action has no trusted policy', 'E_CONNECTOR_POLICY_MISSING');
-        }
-        if (policy && !_argumentsWithinBatchLimit(args, policy.max_batch_size)) {
-          reject(`E_CONNECTOR_BATCH_LIMIT: at most ${policy.max_batch_size} items are allowed in any array argument`, 'E_CONNECTOR_BATCH_LIMIT');
-        }
-
-        if (call.signal.aborted) throw cancelled();
-        const draftScope = !target.instance.composio_grant
-          ? { uid: opts.uid, cid: opts.cid, connectorId, accountKey: connectorAccountKey(target.instance) } : undefined;
-        const actionRisk = connectorActionRisk(target.instance, tool, args, draftScope);
-        if (actionRisk.risk === 'H' || actionRisk.risk === 'D') {
-          const resumeIdle = opts.onPermissionWaitStart?.();
-          let approved: boolean;
-          try {
-            approved = await requestActionConfirm({
-              userId: opts.uid,
-              cid: opts.cid,
-              connectorId,
-              displayName: target.instance.display_name,
-              accountKey: connectorAccountKey(target.instance),
-              accountLabel: target.instance.composio_grant?.account_label
-                || target.instance.oauth_grant?.account_label,
-              toolName,
-              risk: actionRisk.risk,
-              sensitiveOperation: actionRisk.sensitive_operation,
-              args,
-              signal: call.signal,
-              onWaiting: opts.onPermissionWaiting,
-            });
-          } finally {
-            resumeIdle?.();
-          }
-          if (call.signal.aborted) throw cancelled();
-          if (!approved) {
-            reject('E_CONNECTOR_CONFIRMATION_DENIED: the user declined this sensitive connector action', 'E_CONNECTOR_CONFIRMATION_DENIED', 'cancelled');
-          }
-        }
-
-        const raw = await connectors.callTool(opts.uid, connectorId, toolName, args, {
-          signal: call.signal, conversationId: opts.cid,
-        });
-        if (!call.signal.aborted) observeTaskDraftResult(draftScope, toolName, args, raw);
-        const isError = !!raw && typeof raw === 'object' && (raw as { isError?: unknown }).isError === true;
-        const text = connectors.stringifyMcpResult(raw);
-        assertActive();
-        const failureStatus = isError ? { isError: true as const } : {};
-        if (Buffer.byteLength(text, 'utf8') <= CONNECTOR_RESULT_CAP) return { text, ...failureStatus };
-        try {
-          const file = persistToolResult(path.join(opts.configDir, '.orkas-bridge-results'), 'connector', text);
-          const ref = crypto.randomBytes(16).toString('hex');
-          connectorResults.set(ref, { file, connectorId, accountKey: connectorAccountKey(target.instance), toolName, ...failureStatus });
-          const page = readBridgeFilePage(file, {});
-          return { text: page.content, ...page, output_ref: ref, ...failureStatus };
-        } catch {
-          return { text: '', execution_completed: true, result_unavailable: true, ...failureStatus,
-            error: 'The connector returned, but its result could not be retained. Do not repeat a modifying action to recover its output.' };
-        }
-      } catch (error) {
-        throw error;
+      if (params.action !== undefined && params.action !== 'call') reject('action must be call or read');
+      if (Object.keys(params).some((key) => !['action', 'connector_id', 'tool_name', 'args'].includes(key))) reject('call accepts only connector_id, tool_name and args');
+      const connectorId = String(params.connector_id || '');
+      const toolName = String(params.tool_name || '');
+      const rawArgs = (params.args && typeof params.args === 'object') ? params.args as Record<string, unknown> : {};
+      if (!connectorId || !toolName) reject('connector_id and tool_name required');
+      // The client stops waiting on its own timeout or an MCP cancel. Once it
+      // has, no later user approval may run the side effect: the model has
+      // already been told the call failed and may have retried it.
+      const cancelled = () => new Error('E_BRIDGE_CALL_CANCELLED: the CLI stopped waiting for this connector call');
+      if (call.signal.aborted) throw cancelled();
+      const visible = await connectors.resolveVisibleConnectors(opts.uid);
+      for (const { instance } of visible) {
+        recordConnectorDisplayName(instance.id, instance.display_name);
       }
+      const target = visible.find((v) => v.instance.id === connectorId);
+      if (!target) reject(`connector not available: ${connectorId}`);
+      const tool = target.tools.find((item) => item.name === toolName);
+      if (!tool) {
+        reject(`tool not exposed by connector ${connectorId}: ${toolName}`);
+      }
+      if (isConnectorActionBlocked(connectorId, toolName)) {
+        reject('E_CONNECTOR_ACTION_UNAVAILABLE: this action is not available in Orkas');
+      }
+      // Same normalisation as the in-process `call_connector_tool` (camelCase
+      // keys, Gmail defaults): an external CLI must not reach the provider with
+      // a different request shape than a built-in Agent for the same action.
+      const args = applyConnectorArgDefaults(
+        connectorId,
+        toolName,
+        rawArgs,
+        (tool.input_schema && typeof tool.input_schema === 'object')
+          ? tool.input_schema as Record<string, unknown>
+          : undefined,
+      );
+      const policy = tool.orkas_action_policy;
+      const isComposioCommerce = !!target.instance.composio_grant
+        && connectors.findCatalogEntry(connectorId)?.category === 'commerce';
+      if (isComposioCommerce && !policy) {
+        reject('E_CONNECTOR_POLICY_MISSING: this commerce action has no trusted policy');
+      }
+      if (policy && !_argumentsWithinBatchLimit(args, policy.max_batch_size)) {
+        reject(`E_CONNECTOR_BATCH_LIMIT: at most ${policy.max_batch_size} items are allowed in any array argument`);
+      }
+
+      if (call.signal.aborted) throw cancelled();
+      const draftScope = !target.instance.composio_grant
+        ? { uid: opts.uid, cid: opts.cid, connectorId, accountKey: connectorAccountKey(target.instance) } : undefined;
+      const actionRisk = connectorActionRisk(target.instance, tool, args, draftScope);
+      if (actionRisk.risk === 'H' || actionRisk.risk === 'D') {
+        const resumeIdle = opts.onPermissionWaitStart?.();
+        let approved: boolean;
+        try {
+          approved = await requestActionConfirm({
+            userId: opts.uid,
+            cid: opts.cid,
+            connectorId,
+            displayName: target.instance.display_name,
+            accountKey: connectorAccountKey(target.instance),
+            accountLabel: target.instance.composio_grant?.account_label
+              || target.instance.oauth_grant?.account_label,
+            toolName,
+            risk: actionRisk.risk,
+            sensitiveOperation: actionRisk.sensitive_operation,
+            args,
+            signal: call.signal,
+            onWaiting: opts.onPermissionWaiting,
+          });
+        } finally {
+          resumeIdle?.();
+        }
+        if (call.signal.aborted) throw cancelled();
+        if (!approved) {
+          reject('E_CONNECTOR_CONFIRMATION_DENIED: the user declined this sensitive connector action');
+        }
+      }
+
+      const raw = await connectors.callTool(opts.uid, connectorId, toolName, args, {
+        signal: call.signal, conversationId: opts.cid,
+      });
+      if (!call.signal.aborted) observeTaskDraftResult(draftScope, toolName, args, raw);
+      const isError = !!raw && typeof raw === 'object' && (raw as { isError?: unknown }).isError === true;
+      const text = connectors.stringifyMcpResult(raw);
+      assertActive();
+      const failureStatus = isError ? { isError: true as const } : {};
+      if (Buffer.byteLength(text, 'utf8') <= CONNECTOR_RESULT_CAP) return { text, ...failureStatus };
+      try {
+        const file = persistToolResult(path.join(opts.configDir, '.orkas-bridge-results'), 'connector', text);
+        const ref = crypto.randomBytes(16).toString('hex');
+        connectorResults.set(ref, { file, connectorId, accountKey: connectorAccountKey(target.instance), toolName, ...failureStatus });
+        const page = readBridgeFilePage(file, {});
+        return { text: page.content, ...page, output_ref: ref, ...failureStatus };
+      } catch {
+        return { text: '', execution_completed: true, result_unavailable: true, ...failureStatus,
+          error: 'The connector returned, but its result could not be retained. Do not repeat a modifying action to recover its output.' };
+      }
+
     },
   });
 
@@ -558,7 +556,7 @@ function _buildMethods(
       const paths = [...new Set((params.paths as string[]).map((p) => path.resolve(opts.workingDir!, p)))];
       if (paths.some((p) => !isPathAllowed(p, [opts.workingDir!]))) throw new Error('output must be inside the current workspace');
       const accepted = opts.onOutputsPublished!(paths);
-      return { published: accepted.length, requested: paths.length };
+      return outputPublicationReceipt(paths, accepted);
     },
   });
 

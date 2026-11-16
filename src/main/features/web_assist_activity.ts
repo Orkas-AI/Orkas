@@ -88,5 +88,5 @@ export function watchWebAssistUserActivity(contents: WebContents, changed: (acti
     clearTimeout(timer); timer = undefined;
     active = false; changed(false); return true;
   };
-  return { release, dispose, handback, pointerHeld: () => buttons.size > 0 };
+  return { release, dispose, handback, touch, pointerHeld: () => buttons.size > 0 };
 }

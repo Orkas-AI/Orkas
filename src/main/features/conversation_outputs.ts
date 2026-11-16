@@ -30,13 +30,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { createLogger } from '../logger';
-import { readState as readGroupChatState } from './group_chat/state';
+import { getConversationWorkspacePath } from './group_chat/conv_workspace';
 import * as chatArtifacts from './chat_artifacts';
 import type { ArtifactSummary } from './chat_artifacts';
 import { listWorkspaceFiles } from './conversation_files';
 import type { ConversationWorkspaceFileList } from './conversation_files';
 import * as chats from './chats';
-import * as userWorkspace from './user_workspace';
 
 const log = createLogger('conversation_outputs');
 
@@ -195,24 +194,15 @@ function statRegularFile(absPath: string): ProducedFileStat | null {
   }
 }
 
-/** Resolve the directory this conversation's own file output is scanned from.
- *  A conversation that has run a turn has a frozen `workspace_dir`; one that
- *  has not falls back to the workspace root, which is also where conversations
- *  predating that field genuinely wrote. */
-async function conversationScanRoot(userId: string, cid: string): Promise<string> {
-  const projectId = await userWorkspace.resolveProjectIdForCid(userId, cid);
-  const workspaceRoot = userWorkspace.getWorkspacePath(userId, projectId);
-  const state = await readGroupChatState(userId, cid);
-  return state.workspace_dir ? path.join(workspaceRoot, state.workspace_dir) : workspaceRoot;
-}
-
 /** Everything this conversation produced: the workspace scan, its artifact
  *  bundles, and the history-recorded paths the scan structurally cannot see. */
 export async function listConversationOutputs(
   userId: string,
   cid: string,
 ): Promise<ConversationOutputList> {
-  const root = await conversationScanRoot(userId, cid);
+  // The folder its turns run in. One that has not run yet gets it named here, as its first
+  // turn would, so its panel never lists the whole workspace.
+  const root = await getConversationWorkspacePath(userId, cid);
   const workspace = await listWorkspaceFiles(root);
 
   let artifacts: ArtifactSummary[] = [];

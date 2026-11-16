@@ -1,3 +1,4 @@
+import { appConversationRoot } from '../paths';
 /**
  * User Workspace — manages the user-facing working directory(s).
  *
@@ -278,7 +279,9 @@ function _isManagedWorkspaceRoot(dirPath: string): boolean {
  * their downstream opts (group_chat does this at the top of runTurn,
  * threading through ChatOptions / LocalToolsOpts / FileToolsOpts).
  */
-export function getWorkspacePath(userId: string, projectId?: string): string {
+export function getWorkspacePath(userId: string, projectId?: string, cid?: string): string {
+  const appRoot = cid && appConversationRoot(userId, cid);
+  if (appRoot) return path.join(appRoot, 'workspace');
   const cfg = readConfig(userId);
   return _effectivePath(cfg, projectId);
 }

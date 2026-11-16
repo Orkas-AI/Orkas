@@ -428,6 +428,54 @@ describe('composer attachment send lifecycle', () => {
     return { context, elements, inputId, cid, submit, sends, alerts, requests };
   }
 
+  it('uses the edit hint only before the first source send and then restores the normal placeholder rules', () => {
+    const h = setup('conversation');
+    h.context.conversations = [{ conversation_id: h.cid, assistance: { kind: 'app_editing', title: 'Budget', sourceFileName: 'app-source.md' } }];
+    let attachments: any[] = [{ name: 'app-source.md', status: 'ready' }];
+    h.context._chatAttachList = () => attachments;
+    h.context._updateConvInputPlaceholder(h.cid);
+    expect(h.elements[h.inputId].placeholder).toBe('skills.chat_input_placeholder');
+    attachments = [];
+    h.context._updateConvInputPlaceholder(h.cid);
+    expect(h.elements[h.inputId].placeholder).toBe('chat.input_placeholder');
+    attachments = [{ name: 'app-source.md', status: 'ready', reused: true }];
+    h.context._updateConvInputPlaceholder(h.cid);
+    expect(h.elements[h.inputId].placeholder).toBe('chat.input_placeholder');
+    h.context.isConvPending = () => true;
+    h.context._activeRecipient = () => ({ kind: 'commander' });
+    vm.runInContext(`_latestInFlight.set('${h.cid}', ['commander'])`, h.context);
+    h.context._updateConvInputPlaceholder(h.cid);
+    expect(h.elements[h.inputId].placeholder).toBe('chat.input_placeholder_queue');
+  });
+
+  it.each([false, true].flatMap(busy => ['zh', 'en'].map(lang => ({ busy, lang }))))(
+    'uses English hidden app framing in $lang while preserving source and visible requirements (busy: $busy)', async ({ busy, lang }) => {
+    const h = setup('conversation');
+    h.context.conversations = [{ conversation_id: h.cid, assistance: {
+      kind: 'app_editing', title: 'Budget', sourceFileName: 'app-source.md',
+    } }];
+    const table = JSON.parse(fs.readFileSync(path.join(rendererRoot, 'locales', `${lang}.json`), 'utf8'));
+    h.context.t = (key: string, vars: any = {}) => String(table[key] || key)
+      .replace(/\{(\w+)\}/g, (_match, name) => String(vars[name] ?? ''));
+    h.context._chatAttachSet(h.cid, [{ name: 'app-source.md', status: 'ready', kind: 'text' }]);
+    h.context.isConvPending = () => busy;
+    const requests: any[] = [];
+    h.context.apiFetch = async (url: string, options: any) => {
+      if (url.endsWith('/send')) { requests.push(JSON.parse(options.body)); return { json: async () => ({ ok: true }) }; }
+      return { json: async () => ({ ok: true, items: [{ name: 'app-source.md', status: 'ready', kind: 'text' }] }) };
+    };
+    await h.submit();
+    const sent = busy ? requests[0] : { content: h.sends[0][1], ...h.sends[0][2] };
+    expect(sent.content).toBe('Send this text');
+    expect(sent.attachments).toEqual(['app-source.md']);
+    expect(sent.model_text).toContain('Modify the interactive app "Budget". Source: attached "app-source.md":');
+    expect(sent.model_text.endsWith('\nSend this text')).toBe(true);
+    expect(sent.model_text).not.toContain('Prepare the app for web publication');
+    expect(h.elements[h.inputId].value).toBe('');
+    expect(h.context._appEditSendContext(h.cid, 'Follow-up', [])).toEqual({});
+    expect(h.context._appEditSendContext('other-task', 'Normal text', ['app-source.md'])).toEqual({});
+  });
+
   it.each(['new-chat', 'conversation', 'project'])('preserves authored attachment order through refresh and %s send', async (entry) => {
     const { context, elements, cid, submit, sends, alerts } = setup(entry);
     const names = ['image.png', 'image-20261021-122943.png', 'alpha.txt'];

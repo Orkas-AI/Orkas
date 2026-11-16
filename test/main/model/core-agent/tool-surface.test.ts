@@ -12,6 +12,22 @@ import {
 import { TOOL_CATALOG_REVISION } from '../../../../src/main/model/core-agent/tool-catalog-revision';
 
 describe('tool-surface', () => {
+  it('loads application operations separately from Orkas navigation and keeps them unavailable to named Agents', () => {
+    const available = ['list_apps', 'save_app', 'open_app_view', 'app_health', 'tool_load'];
+    const surface = createToolSurfaceController({ availableToolNames: available, scopedEligible: true });
+    expect(surface.isActive('save_app')).toBe(false);
+    surface.load(['management.app']);
+    expect(surface.isActive('open_app_view')).toBe(true);
+    expect(surface.isActive('app_health')).toBe(true);
+    expect(surface.isActive('list_apps')).toBe(false);
+    expect(surface.isActive('save_app')).toBe(false);
+    expect(JSON.parse(surface.load(['apps']).content)).toMatchObject({ newly_activated_tools: ['list_apps', 'save_app'] });
+    const agent = createToolSurfaceController({ availableToolNames: ['tool_load'], scopedEligible: true,
+      dynamicLoadPolicy: 'agent-dependency', allowLegacyAll: false });
+    expect(agent.load(['apps']).isError).toBe(true);
+    expect(agent.loadableGroups()).not.toContain('apps');
+  });
+
   it.each([
     ['management.projects', 'project_setup'],
     ['management.todos', 'todo_tasks'],

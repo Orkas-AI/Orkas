@@ -239,176 +239,178 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         opts.onEvent({ type: 'status', status: 'session_ready', sessionId });
         applyNextSelection(id);
       };
+      const stdoutLine = (line: string): void => {
+        if (exited) return;
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        let env: any;
+        try { env = JSON.parse(trimmed); }
+        catch {
+          diagnostics.malformed();
+          // ACP wire is NDJSON; a non-JSON line means the CLI logged
+          // something straight to stdout (hermes occasionally does
+          // this on startup). Surface as raw-line so it appears in
+          // the process rail.
+          opts.onEvent({ type: 'raw-line', line: trimmed });
+          return;
+        }
+        diagnostics.received(env);
+        if (env?.method === 'session/request_permission' && env.id !== undefined) {
+          const params = env.params && typeof env.params === 'object' ? env.params : {};
+          const toolCall = params.toolCall && typeof params.toolCall === 'object'
+            ? params.toolCall
+            : {};
+          const rawInput = toolCall.rawInput && typeof toolCall.rawInput === 'object'
+            ? toolCall.rawInput
+            : {};
+          const options = Array.isArray(params.options) ? params.options : [];
+          const optionId = () => {
+            const once = options.find((option: any) => {
+              const id = String(option?.optionId || option?.option_id || '');
+              const kind = String(option?.kind || '');
+              return id === 'allow_once' || id === 'once' || kind === 'allow_once' || kind === 'once';
+            });
+            if (once) return String(once.optionId || once.option_id || 'allow_once');
+            // Version-skewed agents may expose a differently named allow
+            // choice. Prefer a non-persistent option and never select an
+            // explicit always/session grant on the user's behalf.
+            const bounded = options.find((option: any) => {
+              const id = String(option?.optionId || option?.option_id || '').toLowerCase();
+              const kind = String(option?.kind || '').toLowerCase();
+              return !id.includes('deny') && !id.includes('reject') && !id.includes('always') && !id.includes('session')
+                && !kind.includes('deny') && !kind.includes('reject') && !kind.includes('always') && !kind.includes('session');
+            });
+            return bounded ? String(bounded.optionId || bounded.option_id || '') : '';
+          };
+          diagnostics.permissionStarted();
+          void (async () => {
+            const fullAccess = opts.permissionPolicy === 'full_access';
+            const decision = fullAccess
+              ? 'allow_once'
+              : await (opts.requestPermission?.({
+                id: String(env.id),
+                tool: String(toolCall.kind || 'command'),
+                description: typeof rawInput.description === 'string'
+                  ? rawInput.description
+                  : typeof toolCall.title === 'string' ? toolCall.title : undefined,
+                command: typeof rawInput.command === 'string' ? rawInput.command : undefined,
+              }) ?? Promise.resolve('deny'));
+            if (exited) return;
+            const selected = decision === 'deny' ? '' : optionId();
+            send({
+              jsonrpc: '2.0',
+              id: env.id,
+              result: {
+                outcome: selected
+                  ? { outcome: 'selected', optionId: selected }
+                  : { outcome: 'cancelled' },
+              },
+            });
+            opts.onEvent({
+              type: 'permission-request',
+              id: String(env.id),
+              tool: String(toolCall.kind || 'command'),
+              ...(fullAccess
+                ? { autoDecided: 'allow', reason: 'full_access' }
+                : { decision: selected ? 'allow' : 'deny', reason: 'user' }),
+            });
+          })().catch((err) => {
+            if (exited) return;
+            log.warn('acp permission response failed', { error: logErrorSummary(err) });
+            send({
+              jsonrpc: '2.0',
+              id: env.id,
+              result: { outcome: { outcome: 'cancelled' } },
+            });
+          }).finally(() => diagnostics.permissionEnded());
+          return;
+        }
+        if (Number(env.id) === 1 && !env.error) {
+          supportsSessionLoad = env.result?.agentCapabilities?.loadSession === true;
+          sendSessionStart();
+        }
+        if (Number(env.id) === 4 && sessionId && mcpRefreshPending) {
+          mcpRefreshPending = false;
+          if (modelSetTimer) clearTimeout(modelSetTimer);
+          if (env.error || !env.result || typeof env.result !== 'object') { failSelection('model'); return; }
+          sendPrompt(sessionId); return;
+        }
+        if (Number(env.id) === 3 && sessionId && pendingSelection) {
+          if (modelSetTimer) clearTimeout(modelSetTimer);
+          const selection = pendingSelection; pendingSelection = undefined;
+          const accepted = !env.error && (!selection.configId ||
+            (Array.isArray(env.result?.configOptions) && env.result.configOptions.some((option: any) => option?.id === selection.configId
+              && option.currentValue === selection.value)));
+          if (!accepted) { failSelection(selection.configId || 'model'); return; }
+          if (selection.configId) sessionConfiguration = env.result;
+          applyNextSelection(sessionId);
+          return;
+        }
+        if (Number(env.id) === 2 && !env.error) sessionConfiguration = env.result;
+        if (Number(env.id) === 2 && env.error) {
+          resultStatus = 'failed';
+          resultError = typeof env.error.message === 'string'
+            ? env.error.message
+            : 'ACP session could not be started';
+          finishProtocol();
+          return;
+        }
+        if (Number(env.id) === 2 && requestedResumeId && !env.error) {
+          onSessionReady(requestedResumeId);
+          return;
+        }
+        handleAcpMessage(env, {
+          onSessionNew: onSessionReady,
+          onTextDelta: text => {
+            resultText += text;
+            opts.onEvent({ type: 'text-delta', text });
+          },
+          onThinking: text => opts.onEvent({ type: 'thinking', text }),
+          onToolUse: tool => {
+            if (tool.callId) toolNames.set(tool.callId, tool.name);
+            opts.onEvent({ type: 'tool-event', tool: tool.name, callId: tool.callId, phase: 'use', input: tool.input });
+          },
+          onToolResult: tool => {
+            const name = tool.name === 'tool' && tool.callId
+              ? toolNames.get(tool.callId) || tool.name
+              : tool.name;
+            opts.onEvent({ type: 'tool-event', tool: name, callId: tool.callId, phase: 'result', output: tool.output });
+            if (tool.callId) toolNames.delete(tool.callId);
+          },
+          onMediaOutput: media => opts.onEvent({
+            type: 'media-output',
+            source: 'acp',
+            callId: media.callId,
+            items: media.items,
+          }),
+          onPromptResult: r => {
+            resultStatus = r.ok ? 'completed' : 'failed';
+            if (r.ok && r.text) resultText = r.text;
+            if (!r.ok) resultError = r.error;
+            finishProtocol();
+          },
+          onUnknown: raw => {
+            // Previously surfaced as a fake `tool:'acp'` tool-event,
+            // which polluted the tools rail with category-error rows.
+            // Reroute to a log event so the rail's tool list stays
+            // honest and unknown ACP traffic still gets visibility.
+            const summary = JSON.stringify(raw).slice(0, 200);
+            opts.onEvent({
+              type: 'log',
+              level: 'info',
+              message: `acp: ${summary}`,
+              source: 'acp',
+            });
+          },
+        });
+      };
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', chunk => {
         if (exited) return;
         diagnostics.bytes('stdout');
-        splitter.push(chunk, line => {
-          if (exited) return;
-          const trimmed = line.trim();
-          if (!trimmed) return;
-          let env: any;
-          try { env = JSON.parse(trimmed); }
-          catch {
-            diagnostics.malformed();
-            // ACP wire is NDJSON; a non-JSON line means the CLI logged
-            // something straight to stdout (hermes occasionally does
-            // this on startup). Surface as raw-line so it appears in
-            // the process rail.
-            opts.onEvent({ type: 'raw-line', line: trimmed });
-            return;
-          }
-          diagnostics.received(env);
-          if (env?.method === 'session/request_permission' && env.id !== undefined) {
-            const params = env.params && typeof env.params === 'object' ? env.params : {};
-            const toolCall = params.toolCall && typeof params.toolCall === 'object'
-              ? params.toolCall
-              : {};
-            const rawInput = toolCall.rawInput && typeof toolCall.rawInput === 'object'
-              ? toolCall.rawInput
-              : {};
-            const options = Array.isArray(params.options) ? params.options : [];
-            const optionId = () => {
-              const once = options.find((option: any) => {
-                const id = String(option?.optionId || option?.option_id || '');
-                const kind = String(option?.kind || '');
-                return id === 'allow_once' || id === 'once' || kind === 'allow_once' || kind === 'once';
-              });
-              if (once) return String(once.optionId || once.option_id || 'allow_once');
-              // Version-skewed agents may expose a differently named allow
-              // choice. Prefer a non-persistent option and never select an
-              // explicit always/session grant on the user's behalf.
-              const bounded = options.find((option: any) => {
-                const id = String(option?.optionId || option?.option_id || '').toLowerCase();
-                const kind = String(option?.kind || '').toLowerCase();
-                return !id.includes('deny') && !id.includes('reject') && !id.includes('always') && !id.includes('session')
-                  && !kind.includes('deny') && !kind.includes('reject') && !kind.includes('always') && !kind.includes('session');
-              });
-              return bounded ? String(bounded.optionId || bounded.option_id || '') : '';
-            };
-            diagnostics.permissionStarted();
-            void (async () => {
-              const fullAccess = opts.permissionPolicy === 'full_access';
-              const decision = fullAccess
-                ? 'allow_once'
-                : await (opts.requestPermission?.({
-                  id: String(env.id),
-                  tool: String(toolCall.kind || 'command'),
-                  description: typeof rawInput.description === 'string'
-                    ? rawInput.description
-                    : typeof toolCall.title === 'string' ? toolCall.title : undefined,
-                  command: typeof rawInput.command === 'string' ? rawInput.command : undefined,
-                }) ?? Promise.resolve('deny'));
-              if (exited) return;
-              const selected = decision === 'deny' ? '' : optionId();
-              send({
-                jsonrpc: '2.0',
-                id: env.id,
-                result: {
-                  outcome: selected
-                    ? { outcome: 'selected', optionId: selected }
-                    : { outcome: 'cancelled' },
-                },
-              });
-              opts.onEvent({
-                type: 'permission-request',
-                id: String(env.id),
-                tool: String(toolCall.kind || 'command'),
-                ...(fullAccess
-                  ? { autoDecided: 'allow', reason: 'full_access' }
-                  : { decision: selected ? 'allow' : 'deny', reason: 'user' }),
-              });
-            })().catch((err) => {
-              if (exited) return;
-              log.warn('acp permission response failed', { error: logErrorSummary(err) });
-              send({
-                jsonrpc: '2.0',
-                id: env.id,
-                result: { outcome: { outcome: 'cancelled' } },
-              });
-            }).finally(() => diagnostics.permissionEnded());
-            return;
-          }
-          if (Number(env.id) === 1 && !env.error) {
-            supportsSessionLoad = env.result?.agentCapabilities?.loadSession === true;
-            sendSessionStart();
-          }
-          if (Number(env.id) === 4 && sessionId && mcpRefreshPending) {
-            mcpRefreshPending = false;
-            if (modelSetTimer) clearTimeout(modelSetTimer);
-            if (env.error || !env.result || typeof env.result !== 'object') { failSelection('model'); return; }
-            sendPrompt(sessionId); return;
-          }
-          if (Number(env.id) === 3 && sessionId && pendingSelection) {
-            if (modelSetTimer) clearTimeout(modelSetTimer);
-            const selection = pendingSelection; pendingSelection = undefined;
-            const accepted = !env.error && (!selection.configId ||
-              (Array.isArray(env.result?.configOptions) && env.result.configOptions.some((option: any) => option?.id === selection.configId
-                && option.currentValue === selection.value)));
-            if (!accepted) { failSelection(selection.configId || 'model'); return; }
-            if (selection.configId) sessionConfiguration = env.result;
-            applyNextSelection(sessionId);
-            return;
-          }
-          if (Number(env.id) === 2 && !env.error) sessionConfiguration = env.result;
-          if (Number(env.id) === 2 && env.error) {
-            resultStatus = 'failed';
-            resultError = typeof env.error.message === 'string'
-              ? env.error.message
-              : 'ACP session could not be started';
-            finishProtocol();
-            return;
-          }
-          if (Number(env.id) === 2 && requestedResumeId && !env.error) {
-            onSessionReady(requestedResumeId);
-            return;
-          }
-          handleAcpMessage(env, {
-            onSessionNew: onSessionReady,
-            onTextDelta: text => {
-              resultText += text;
-              opts.onEvent({ type: 'text-delta', text });
-            },
-            onThinking: text => opts.onEvent({ type: 'thinking', text }),
-            onToolUse: tool => {
-              if (tool.callId) toolNames.set(tool.callId, tool.name);
-              opts.onEvent({ type: 'tool-event', tool: tool.name, callId: tool.callId, phase: 'use', input: tool.input });
-            },
-            onToolResult: tool => {
-              const name = tool.name === 'tool' && tool.callId
-                ? toolNames.get(tool.callId) || tool.name
-                : tool.name;
-              opts.onEvent({ type: 'tool-event', tool: name, callId: tool.callId, phase: 'result', output: tool.output });
-              if (tool.callId) toolNames.delete(tool.callId);
-            },
-            onMediaOutput: media => opts.onEvent({
-              type: 'media-output',
-              source: 'acp',
-              callId: media.callId,
-              items: media.items,
-            }),
-            onPromptResult: r => {
-              resultStatus = r.ok ? 'completed' : 'failed';
-              if (r.ok && r.text) resultText = r.text;
-              if (!r.ok) resultError = r.error;
-              finishProtocol();
-            },
-            onUnknown: raw => {
-              // Previously surfaced as a fake `tool:'acp'` tool-event,
-              // which polluted the tools rail with category-error rows.
-              // Reroute to a log event so the rail's tool list stays
-              // honest and unknown ACP traffic still gets visibility.
-              const summary = JSON.stringify(raw).slice(0, 200);
-              opts.onEvent({
-                type: 'log',
-                level: 'info',
-                message: `acp: ${summary}`,
-                source: 'acp',
-              });
-            },
-          });
-        });
+        splitter.push(chunk, stdoutLine);
       });
+      child.stdout.on('end', () => splitter.flush(stdoutLine));
 
       // Fire-and-forget timeout to be sure session start goes; some CLIs
       // ack initialize without printing anything we'd recognize as the
@@ -452,8 +454,8 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           clearTimeout(initTimer);
           if (modelSetTimer) clearTimeout(modelSetTimer);
           detachAbort();
-          // One content-free summary survives both local archives and sampled
-          // conversations. It must not count as fresh CLI progress.
+          // Keep one bounded local diagnostic summary per dispatch.
+          // It must not count as fresh CLI progress.
           const summary = diagnostics.snapshot(status, endReason, processState, child.exitCode);
           log.info('ACP run diagnostics', summary);
           opts.onEvent({

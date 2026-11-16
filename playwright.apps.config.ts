@@ -5,6 +5,11 @@ import base from './playwright.config';
 // oracle coverage stays here even when it is outside the release selection.
 export default defineConfig(base, {
   testMatch: [
+    '**/builtin_apps_e2e_lifecycle.spec.ts',
+    '**/content_workbench_e2e_lifecycle.spec.ts',
+    '**/content_workbench_e2e_recovery.spec.ts',
+    '**/content_workbench_e2e_media.spec.ts',
+    '**/app_output_e2e_commerce.spec.ts',
     '**/saved_apps_e2e_lifecycle.spec.ts',
     '**/artifact_revisions_e2e_lifecycle.spec.ts',
     '**/web_app_sdk_e2e_lifecycle.spec.ts',

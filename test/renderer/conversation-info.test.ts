@@ -15,7 +15,7 @@ function renderFilesResult(snapshot: {
   history: any[];
   files: any;
   attachments?: any[];
-  syncEnabled?: boolean;
+  pendingAttachments?: any[];
   activeTab?: 'files' | 'attachments';
 }, afterMount?: (context: any) => Promise<void> | void): Promise<RenderFilesResult> {
   const elements = new Map<string, any>();
@@ -63,7 +63,12 @@ function renderFilesResult(snapshot: {
       json: async () => {
         if (url.includes('/history')) return { ok: true, conversation: { title: 'Current title' }, history: snapshot.history };
         if (url.includes('/files')) return { ok: true, ...snapshot.files };
-        if (url.includes('/attachments')) return { ok: true, items: snapshot.attachments || [] };
+        if (url.includes('/attachments')) return {
+          ok: true,
+          items: new URL(url, 'https://orkas.test').searchParams.get('scope') === 'all'
+            ? snapshot.attachments || []
+            : snapshot.pendingAttachments || snapshot.attachments || [],
+        };
         return { ok: false, error: 'unknown' };
       },
     }),
@@ -77,11 +82,7 @@ function renderFilesResult(snapshot: {
       addEventListener() {},
       uiIconHtml: (name: string) => `[${name}]`,
       fileKindIconHtml: () => '',
-      orkas: {
-        sync: {
-          getEnabled: async () => ({ ok: true, enabled: snapshot.syncEnabled === true }),
-        },
-      },
+
     },
   };
   context.window.window = context.window;
@@ -114,13 +115,115 @@ function renderFilesHtml(snapshot: {
   history: any[];
   files: any;
   attachments?: any[];
-  syncEnabled?: boolean;
+  pendingAttachments?: any[];
   activeTab?: 'files' | 'attachments';
 }, afterMount?: (context: any) => Promise<void> | void): Promise<string> {
   return renderFilesResult(snapshot, afterMount).then((result) => result.html);
 }
 
 describe('ConversationInfo files tab', () => {
+  it('lists old sent attachments outside the recent history page alongside pending uploads', async () => {
+    const result = await renderFilesResult({
+      activeTab: 'attachments',
+      history: [{ role: 'assistant', text: 'Recent reply without attachments' }],
+      files: { items: [] },
+      attachments: [{ name: 'old-brief.txt', bytes: 64 }, { name: 'next-image.png', bytes: 32 }],
+      pendingAttachments: [{ name: 'next-image.png', bytes: 32 }],
+    });
+    expect(result.html).toContain('old-brief.txt');
+    expect(result.html).toContain('next-image.png');
+    expect(result.counts.attachments).toBe('2');
+  });
+
+  it('keeps sent attachments when the composer clears and removes deleted files on refresh', async () => {
+    const snapshot = {
+      activeTab: 'attachments' as const,
+      history: [], files: { items: [] },
+      attachments: [{ name: 'old-brief.txt' }, { name: 'new-upload.txt' }],
+      pendingAttachments: [] as any[],
+    };
+    await renderFilesResult(snapshot, async context => {
+      const info = context.window.ConversationInfo;
+      const body = context.document.getElementById('conversation-info-body');
+      await info.refreshAttachments('c1', { items: [] });
+      expect(body.innerHTML).toContain('old-brief.txt');
+      expect(body.innerHTML).toContain('new-upload.txt');
+      snapshot.attachments = [{ name: 'old-brief.txt' }];
+      await info.refreshAttachments('c1', { items: [] });
+      expect(body.innerHTML).toContain('old-brief.txt');
+      expect(body.innerHTML).not.toContain('new-upload.txt');
+      expect(context.document.getElementById('conversation-info-tab-count-attachments').textContent).toBe('1');
+    });
+  });
+
+  it('rejects stale attachment refreshes and responses for a previous task', async () => {
+    await renderFilesResult({ activeTab: 'attachments', history: [], files: { items: [] } }, async context => {
+      const info = context.window.ConversationInfo;
+      const body = context.document.getElementById('conversation-info-body');
+      const replies: Array<(value: any) => void> = [];
+      const apiFetch = context.apiFetch;
+      context.apiFetch = () => new Promise(resolve => replies.push(resolve));
+      const first = info.refreshAttachments('c1');
+      const second = info.refreshAttachments('c1');
+      replies[1]({ json: async () => ({ ok: true, items: [{ name: 'latest.txt' }] }) });
+      await second;
+      replies[0]({ json: async () => ({ ok: true, items: [{ name: 'stale.txt' }] }) });
+      await first;
+      expect(body.innerHTML).toContain('latest.txt');
+      expect(body.innerHTML).not.toContain('stale.txt');
+      const previousTask = info.refreshAttachments('c1');
+      info.bind('c2');
+      context.apiFetch = apiFetch;
+      info.openAndSetTab('attachments');
+      await info.refresh('c2');
+      replies[2]({ json: async () => ({ ok: true, items: [{ name: 'foreign.txt' }] }) });
+      await previousTask;
+      expect(body.innerHTML).not.toContain('foreign.txt');
+    });
+  });
+
+  it.each(['files', 'attachments'] as const)('keeps the newer %s refresh when an older full panel load finishes last', async resource => {
+    await renderFilesResult({ history: [], files: { items: [] }, activeTab: resource }, async context => {
+      const info = context.window.ConversationInfo;
+      const body = context.document.getElementById('conversation-info-body');
+      const originalFetch = context.apiFetch;
+      let resolveOld!: (value: any) => void;
+      const item = (name: string) => ({ name, relPath: name, path: '/tmp/workspace/' + name, bytes: 4 });
+      context.apiFetch = (url: string) => url.includes('/' + resource)
+        ? new Promise(resolve => { resolveOld = resolve; }) : originalFetch(url);
+      const oldFull = info.refresh('c1', { silent: true });
+      context.apiFetch = async (url: string) => url.includes('/' + resource)
+        ? { json: async () => ({ ok: true, items: [item('latest.txt')], count: 1 }) } : originalFetch(url);
+      await (resource === 'files' ? info.refreshFiles('c1', { silent: true }) : info.refreshAttachments('c1'));
+      resolveOld({ json: async () => ({ ok: true, items: [item('obsolete.txt')], count: 1 }) });
+      await oldFull;
+      expect(body.innerHTML).toContain('latest.txt');
+      expect(body.innerHTML).not.toContain('obsolete.txt');
+      expect(context.document.getElementById('conversation-info-tab-count-' + resource).textContent).toBe('1');
+    });
+  });
+
+  it.each(['files', 'attachments'] as const)('keeps a newer full panel load when an older %s refresh finishes last', async resource => {
+    await renderFilesResult({ history: [], files: { items: [] }, activeTab: resource }, async context => {
+      const info = context.window.ConversationInfo;
+      const body = context.document.getElementById('conversation-info-body');
+      const originalFetch = context.apiFetch;
+      let resolveOld!: (value: any) => void;
+      const item = (name: string) => ({ name, relPath: name, path: '/tmp/workspace/' + name, bytes: 4 });
+      context.apiFetch = (url: string) => url.includes('/' + resource)
+        ? new Promise(resolve => { resolveOld = resolve; }) : originalFetch(url);
+      const oldPartial = resource === 'files' ? info.refreshFiles('c1', { silent: true }) : info.refreshAttachments('c1');
+      context.apiFetch = async (url: string) => url.includes('/' + resource)
+        ? { json: async () => ({ ok: true, items: [item('latest.txt')], count: 1 }) } : originalFetch(url);
+      await info.refresh('c1', { silent: true });
+      resolveOld({ json: async () => ({ ok: true, items: [item('obsolete.txt')], count: 1 }) });
+      await oldPartial;
+      expect(body.innerHTML).toContain('latest.txt');
+      expect(body.innerHTML).not.toContain('obsolete.txt');
+      expect(context.document.getElementById('conversation-info-tab-count-' + resource).textContent).toBe('1');
+    });
+  });
+
   it('restores each task panel visibility and selected tab after switching away and back', async () => {
     await renderFilesResult({ history: [], files: { items: [] } }, context => {
       const info = context.window.ConversationInfo;
@@ -503,4 +606,15 @@ describe('ConversationInfo files tab', () => {
     expect(html).toContain('XLS');
     expect(html).not.toContain('spreadsheet');
   });
+});
+
+
+it('has no hosted sync-setting stub, notice or fixture dependency while ordinary files stay visible', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation-info.js'), 'utf8');
+  expect(source).not.toMatch(/_loadSyncEnabled|syncEnabled|ci-files-sync-note/);
+  const html = await renderFilesHtml({ history: [], files: { items: [
+    { path: '/tmp/workspace/report.md', name: 'report.md', relPath: 'report.md', bytes: 42 },
+  ] } });
+  expect(html).toContain('report.md');
+  expect(html).not.toContain('ci-files-sync-note');
 });

@@ -572,3 +572,125 @@ describe('group_chat bus › native CLI interrupt-steer', () => {
     expect(w.queue).toEqual([first, second]);
   });
 });
+
+it('updates the approval source only after a matching user steer is committed and never replays an old acknowledgement', async () => {
+    const currentUserMessage = { text: '<msg from="user">original</msg>' };
+    const queued = item({ actor: agentX, fromActorId: 'user', llmPayload: '<msg from="user">批准修订旁白并继续制作</msg>' });
+    const w = fakeW([queued, item({ actor: agentX, fromActorId: 'commander', llmPayload: 'approve' }),
+      item({ actor: agentY, fromActorId: 'user', llmPayload: 'wrong actor' })]);
+    const prepared = await drainSteerInto(w, agentX, { currentUserMessage } as any);
+    expect(prepared).toHaveLength(1);
+    expect(currentUserMessage.text).toBe('<msg from="user">original</msg>');
+    await acknowledge(prepared);
+    expect(currentUserMessage.text).toBe(queued.llmPayload);
+    const later = item({ actor: agentX, fromActorId: 'user', llmPayload: '<msg from="user">先暂停</msg>' });
+    w.queue.push(later);
+    await acknowledge(await drainSteerInto(w, agentX, { currentUserMessage } as any));
+    await acknowledge(prepared);
+    expect(currentUserMessage.text).toBe(later.llmPayload);
+  });
+it.each(['addressed-child', 'ordinary-followup', 'other-recipient'] as const)(
+    'checks actual file reads when a requirement changes during inference (%s)', async delivery => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-delegation-read-'));
+      const file = path.join(root, 'archive.txt');
+      const canary = 'Fixture archive bytes reached the production reader.';
+      fs.writeFileSync(file, canary);
+      // setup-env pins all account state to this worker's temporary workspace.
+      const users = await import('../../../../src/main/features/users');
+      const priorUser = users.hasActiveUser() ? users.getActiveUserId() : undefined;
+      users.activateUser('user-test');
+      const { createFileTools } = await import('../../../../src/main/model/core-agent/file-tools');
+      const readTool = createFileTools({ userId: 'user-test', readOnlyExtraRoots: [root] })
+        .find(tool => tool.name === 'read_files')!;
+      const read = vi.spyOn(fs.promises, 'readFile');
+      const requests: Message[][] = [];
+      let entered!: () => void;
+      let resume!: () => void;
+      const firstInference = new Promise<void>(resolve => { entered = resolve; });
+      const releaseInference = new Promise<void>(resolve => { resume = resolve; });
+      const original = 'Inspect the archive. Return JSON with status and size; use at most two requests.';
+      const update = 'Change only the read scope: keep the archive without inspecting its contents.';
+      const w = fakeW([]);
+      let rounds = 0;
+      const provider: LLMProvider = {
+        id: 'mock', name: 'Mock',
+        async complete(): Promise<CompletionResult> { throw new Error('unused'); },
+        async *stream(params: CompletionParams) {
+          requests.push(JSON.parse(JSON.stringify(params.messages)));
+          yield { type: 'message_start' as const };
+          if (++rounds === 1) {
+            entered();
+            await releaseInference;
+            const input = { paths: [{ path: file }], raw_text: true };
+            yield { type: 'tool_use_start' as const, id: 'read-archive', name: 'read_files' };
+            yield { type: 'tool_use_delta' as const, id: 'read-archive', input: JSON.stringify(input) };
+            yield { type: 'tool_use_end' as const, id: 'read-archive' };
+            yield { type: 'message_end' as const, stopReason: 'tool_use' as const,
+              usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 }, model: 'mock-model',
+              content: [{ type: 'tool_use' as const, id: 'read-archive', name: 'read_files', input }] };
+          } else {
+            yield { type: 'message_end' as const, stopReason: 'end_turn' as const,
+              usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 }, model: 'mock-model',
+              content: [{ type: 'text' as const, text: 'Input boundary observed.' }] };
+          }
+        },
+        async validateAuth() { return true; },
+      };
+      const registry = new ProviderRegistry();
+      registry.registerFactory('mock', () => provider);
+      const toolFaults: string[] = [];
+      const observedReader = { ...readTool, execute: async (input: any, ctx: any) => {
+        try { return await readTool.execute(input, ctx); }
+        catch (error) { toolFaults.push(String((error as Error).message)); throw error; }
+      } };
+      const runner = new AgentRunner({
+        config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'mock-model' } }),
+        providers: registry, tools: [observedReader],
+      });
+      const events: AgentRunEvent[] = [];
+      const running = (async () => {
+        for await (const event of runner.runStream({ message: original, workingDir: root,
+          drainSteer: () => drainSteerInto(w, agentX) })) events.push(event);
+      })();
+      try {
+        await firstInference;
+        const queued = item({ actor: delivery === 'other-recipient' ? commander : agentX,
+          fromActorId: 'user', steerActiveTurn: delivery !== 'ordinary-followup', llmPayload: update });
+        w.queue.push(queued);
+        resume();
+        await running;
+        const applied = delivery === 'addressed-child';
+        expect(toolFaults).toEqual([]);
+        const reads = read.mock.calls.filter(([target]) => String(target) === file);
+        expect(reads).toHaveLength(applied ? 0 : 1);
+        expect(requests).toHaveLength(2);
+        expect(JSON.stringify(requests[1])).toContain(original);
+        if (applied) {
+          expect(w.queue).toEqual([]);
+          expect(JSON.stringify(requests[1])).toContain(update);
+          expect(JSON.stringify(requests[1])).not.toContain(canary);
+          expect(events.find(event => event.type === 'tool_end')).toMatchObject({
+            name: 'read_files', skipped: true, isError: true,
+          });
+        } else {
+          expect(w.queue).toEqual([queued]);
+          expect(JSON.stringify(requests[1])).not.toContain(update);
+          // The negative controls must actually cross the real filesystem
+          // boundary; a mock success or a permission failure cannot pass.
+          expect(JSON.stringify(requests[1])).toContain(canary);
+          const end = events.find(event => event.type === 'tool_end') as Extract<AgentRunEvent, { type: 'tool_end' }>;
+          expect(end).toMatchObject({ name: 'read_files' });
+          expect(end.isError).not.toBe(true);
+          expect(end.skipped).not.toBe(true);
+          expect(end.result).toContain(canary);
+        }
+        expect(fs.readFileSync(file, 'utf8')).toBe(canary);
+      } finally {
+        resume();
+        await running;
+        read.mockRestore();
+        if (priorUser) users.activateUser(priorUser);
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );

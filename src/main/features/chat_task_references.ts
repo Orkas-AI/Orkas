@@ -9,6 +9,42 @@ interface TaskReference {
   fallback_global?: boolean;
 }
 
+export type ConversationTaskLink = Omit<TaskReference, 'fallback_global'> & { title: string };
+
+/** Read-only sidebar/header projection. One cached task inventory per displayed
+ * scope, never one scan per conversation or a new persisted association. */
+export async function conversationTaskLinks(uid: string, rows: Array<{
+  conversation_id: string; project_id?: string; origin_auto_task_id?: string;
+}>): Promise<Map<string, ConversationTaskLink[]>> {
+  const links = new Map(rows.map(row => [row.conversation_id, [] as ConversationTaskLink[]]));
+  if (!rows.length) return links;
+  const automationIds = new Map(rows.map(row => [row.conversation_id,
+    autoTasks.activeRunTaskId(uid, row.conversation_id) || row.origin_auto_task_id || '']));
+  const automations = [...automationIds.values()].some(Boolean) ? await autoTasks.listTaskSearchRows(uid) : [];
+  const byId = new Map(automations.map(task => [task.id, task]));
+  const scopes = new Map<string, Set<string>>();
+  for (const row of rows) {
+    const pid = row.project_id || '';
+    const cids = scopes.get(pid) || new Set<string>();
+    cids.add(row.conversation_id);
+    scopes.set(pid, cids);
+    // A saved future target is not a fired task. Reused ordinary conversations
+    // belong to an automation only while that run is actually in progress.
+    const task = byId.get(automationIds.get(row.conversation_id) || '');
+    if (task) links.get(row.conversation_id)!.push({ kind: 'automation', task_id: task.id,
+      project_id: task.project_id || '', title: (task.title || task.content || '').slice(0, 160) });
+  }
+  for (const [pid, cids] of scopes) {
+    for (const task of await projectTasks.listTaskSearchRows(uid, pid)) {
+      if (task.origin_cid && cids.has(task.origin_cid)) {
+        links.get(task.origin_cid)!.push({ kind: 'todo', task_id: task.id,
+          project_id: pid, title: task.content.slice(0, 160) });
+      }
+    }
+  }
+  return links;
+}
+
 /** Compact read projection for chat links. Never executes a task. */
 export async function resolveChatTaskReferences(
   uid: string, input: unknown,

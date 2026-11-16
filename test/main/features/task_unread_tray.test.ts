@@ -41,6 +41,19 @@ function start() {
 }
 
 describe('macOS menu bar unread task count', () => {
+  it.each(['once', 'retain'])('does not count %s app executions and still counts an ordinary app-named task', (mode) => {
+    const runtime = start();
+    try {
+      const cid = `app_${'a'.repeat(64)}_${mode}_${'b'.repeat(32)}`;
+      for (const status of ['completed', 'stopped', 'failed', 'waiting_input']) runtime.terminal(cid, 'u1', status);
+      expect(runtime.titles).toEqual(['']);
+      runtime.terminal('app_notes');
+      runtime.terminal('app_notes');
+      expect(runtime.titles).toEqual(['', '1']);
+      expect(runtime.warn).not.toHaveBeenCalled();
+    } finally { runtime.stop(); }
+  });
+
   it('stays optional before an account has been activated', () => {
     const setTitle = vi.fn();
     const stop = startTaskUnreadTray({

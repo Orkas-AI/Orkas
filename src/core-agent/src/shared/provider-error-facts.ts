@@ -99,3 +99,66 @@ export function providerCredentialFailure(error: unknown, includeSerializedMessa
   if (status === 429) return 'rate_limit';
   return null;
 }
+
+/** Case-insensitive header lookup supporting both WHATWG `Headers` (what
+ * undici / newer SDK errors expose) and the plain record shape older
+ * OpenAI/Anthropic SDK `APIError.headers` used. */
+function headerValue(headers: unknown, name: string): string | undefined {
+  if (!headers || typeof headers !== "object") return undefined;
+  const maybeGet = (headers as { get?: unknown }).get;
+  if (typeof maybeGet === "function") {
+    try {
+      const v = (headers as { get: (n: string) => unknown }).get(name);
+      if (typeof v === "string" && v) return v;
+    } catch { /* fall through to record scan */ }
+  }
+  const lower = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+    if (key.toLowerCase() === lower && typeof value === "string" && value) return value;
+  }
+  return undefined;
+}
+
+/** Milliseconds the provider asked us to wait before retrying a 429, or
+ * undefined when no parsable hint exists (the runner then keeps its default
+ * backoff; it clamps honored values to 120s).
+ *
+ * SDK-level errors (OpenAI/Anthropic `APIError`, undici response errors)
+ * expose the failing response's headers as `.headers` or `.response.headers`;
+ * pi-ai rethrows them unwrapped or one `cause` level deep, so we walk a short
+ * chain. Recognized forms: `retry-after-ms` (milliseconds, OpenAI extension)
+ * and `retry-after` (delta-seconds or an HTTP-date per RFC 9110). */
+export function providerRetryAfterMs(err: unknown): number | undefined {
+  let cur: unknown = err;
+  for (let depth = 0; cur && typeof cur === "object" && depth < 8; depth++) {
+    const rec = cur as Record<string, unknown>;
+    for (const field of ['retryAfterMs', 'retry_after_ms']) {
+      const value = rec[field];
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.ceil(value);
+    }
+    const headers = rec.headers
+      ?? (rec.response && typeof rec.response === "object"
+        ? (rec.response as Record<string, unknown>).headers
+        : undefined);
+
+    const rawMs = headerValue(headers, "retry-after-ms");
+    if (rawMs !== undefined) {
+      const ms = Number(rawMs);
+      if (Number.isFinite(ms) && ms >= 0) return Math.ceil(ms);
+    }
+    const raw = headerValue(headers, "retry-after");
+    if (raw !== undefined) {
+      const seconds = Number(raw);
+      if (Number.isFinite(seconds)) {
+        // Numeric → delta-seconds form; a negative value is malformed and
+        // must NOT fall through to Date.parse (V8 parses "-5" as a date).
+        if (seconds >= 0) return Math.ceil(seconds * 1000);
+      } else {
+        const dateMs = Date.parse(raw);
+        if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+      }
+    }
+    cur = rec.cause ?? rec.error;
+  }
+  return undefined;
+}

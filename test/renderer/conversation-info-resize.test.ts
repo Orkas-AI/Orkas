@@ -44,14 +44,43 @@ function createHarness(viewport = 1800, saved?: string) {
   const secondPanel = { ...panel, style: {} as Record<string, string> };
   const secondHandle = { ...handle, addEventListener() {} };
   const getElement = context.document.getElementById;
-  context.document.getElementById = (id: string) => id === 'video-review-panel' ? secondPanel
-    : id === 'video-review-resize' ? secondHandle : getElement(id);
-  const second = (window as any).TaskSidePanel.bind('video-review-panel', 'video-review-resize');
-  return { panel, attributes, storage, dispatch, secondPanel, second, resize: (width: number) => {
+  context.document.getElementById = (id: string) => id === 'video-canvas-panel' ? secondPanel
+    : id === 'video-canvas-resize' ? secondHandle : getElement(id);
+  const second = (window as any).TaskSidePanel.bind('video-canvas-panel', 'video-canvas-resize');
+  const ownPanel = { ...panel, style: {} as Record<string, string> };
+  const ownHandle = { ...handle, addEventListener() {} };
+  const beforeOwn = context.document.getElementById;
+  context.document.getElementById = (id: string) => id === 'own-panel' ? ownPanel
+    : id === 'own-resize' ? ownHandle : beforeOwn(id);
+  (window as any).TaskSidePanel.bind('own-panel', 'own-resize', undefined, {
+    storageKey: 'orkas.own.width',
+    defaultWidth: (available: number) => available * 0.66,
+  });
+  return { panel, attributes, storage, dispatch, secondPanel, second, ownPanel, resize: (width: number) => {
     window.innerWidth = width;
     windowListeners.get('resize')!();
   } };
 }
+
+describe('a side panel with its own width', () => {
+  it('starts from its own default, within the room the chat leaves', () => {
+    const harness = createHarness();
+    // 66% of the 1520px beside the sidebar. At 1000px it would leave the chat too little.
+    expect(harness.ownPanel.style.width).toBe('1003px');
+    harness.resize(1000);
+    expect(harness.ownPanel.style.width).toBe('400px');
+  });
+
+  it('is not moved by resizing the panels that share a width', () => {
+    const harness = createHarness();
+    harness.dispatch('pointerdown', { button: 0, pointerId: 1 });
+    harness.dispatch('pointermove', { clientX: 1000 });
+    harness.dispatch('pointerup');
+    expect(harness.panel.style.width).toBe('800px');
+    expect(harness.ownPanel.style.width).toBe('1003px');
+    expect(harness.storage.has('orkas.own.width')).toBe(false);
+  });
+});
 
 describe('conversation info resizing', () => {
   it('defaults to 30% of the app width with a 400px minimum before the user resizes', () => {

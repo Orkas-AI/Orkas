@@ -1,9 +1,142 @@
 import { appendFileSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { expectComposerText } from './fixtures/composer';
+import { reopenCompletedConversation } from './fixtures/conversation-completion';
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
 declare const currentCid: string;
 
+
+test('saves and updates a workspace app through Commander and reopens the durable result', async ({ modelOrkas: orkas }, info) => {
+  test.setTimeout(120000);
+  let page = orkas.page!;
+  const source = orkas.createWorkspaceFile('commander-quote/index.html', '<!doctype html><title>Quote</title><h1>Original quote</h1>');
+  let appId = '', loaded = false;
+  orkas.setModelRequestScript((request, tools) => {
+    const receipt = (id: string) => {
+      const row = (request.messages as any[]).find(row => row.role === 'tool' && row.tool_call_id === id);
+      return row ? JSON.parse(row.content) : null;
+    };
+    if (!tools.has('save_app')) {
+      loaded = true;
+      return { calls: [{ callId: 'load-app-saving', name: 'tool_load', args: { groups: ['apps'] } }] };
+    }
+    if (!receipt('save-quote')) return { calls: [{ callId: 'save-quote', name: 'save_app', args: { path: source } }] };
+    expect(receipt('save-quote')).toMatchObject({ status: 'saved', action: 'created' });
+    appId = receipt('save-quote').app.id;
+    if (!receipt('inspect-quote')) {
+      writeFileSync(source, '<!doctype html><title>Quote</title><h1>Updated quote</h1><button onclick="this.textContent=\'Working\'">Try</button>');
+      return { calls: [{ callId: 'inspect-quote', name: 'save_app', args: { action: 'inspect', path: source } }] };
+    }
+    const target = receipt('inspect-quote').target;
+    if (!receipt('update-quote')) return { calls: [{ callId: 'update-quote', name: 'save_app',
+      args: { path: source, mode: 'update', app_id: target.app_id, expected_revision: target.revision } }] };
+    expect(receipt('update-quote')).toMatchObject({ status: 'saved', action: 'updated', app: { id: appId } });
+    if (!receipt('open-quote')) return { calls: [{ callId: 'open-quote', name: 'open_app_view', args: receipt('update-quote').navigation }] };
+    return { text: 'The updated quote application is saved.' };
+  });
+  await page.locator('#new-chat-input').fill('Save this quote tool and then save its revised version to the same application.');
+  await page.locator('#new-chat-send-btn').click();
+  await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
+    .toContainText('The updated quote application is saved.', { timeout: 60000 });
+  expect(loaded).toBe(true);
+  const apps = await orkas.invoke<any>('savedApps.list', { localOnly: true });
+  expect(apps.apps.map((row: any) => row.id)).toEqual([appId]);
+  const cid = await page.evaluate<string>('currentCid');
+  page = await orkas.relaunch();
+  await page.evaluate(async cid => { await (window as any).loadConversations(); (window as any).setView('conversation', cid); }, cid);
+  const entry = page.locator('#chat-history .chat-app-nav-btn');
+  await expect(entry).toHaveCount(1);
+  const preview = await orkas.openPreview(() => entry.click());
+  const frame = preview.frameLocator('.saved-app-viewer-frame');
+  await expect(frame.getByRole('heading', { name: 'Updated quote' })).toBeVisible();
+  await frame.getByRole('button', { name: 'Try', exact: true }).click();
+  await expect(frame.getByRole('button', { name: 'Working', exact: true })).toBeVisible();
+  await preview.screenshot({ path: info.outputPath('commander-saved-app-reopened.png') });
+  await orkas.closePreview(preview);
+});
+
+test('prepares a legacy app with immediate feedback and sends hidden edit context after reopening', async ({ modelOrkas: orkas }, info) => {
+  const page = orkas.page!;
+  orkas.setModelTextReplies(['APP_EDIT_ACK']);
+  const title = 'ROI 计算器 — Quarterly return and investment planner';
+  const source = orkas.createWorkspaceFile('edit-requirements/index.html', '<!doctype html><h1>ROI calculator</h1>');
+  const saved = await orkas.invoke<any>('savedApps.saveFromPath', { path: source, title });
+  expect(saved.ok).toBe(true);
+  const metaPath = path.join(orkas.workspaceRoot, 'account-e2e/cloud/saved_apps', saved.id, '__orkas-meta.json');
+  const meta = JSON.parse(readFileSync(metaPath, 'utf8')); delete meta.appType;
+  writeFileSync(metaPath, JSON.stringify(meta));
+  await openSidebarEntry(page, '#apps-btn');
+  await orkas.electronApp!.evaluate(() => {
+    const main = (process as any).mainModule;
+    const fs = main.require('node:fs/promises');
+    const original = fs.cp;
+    let release: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    (globalThis as any).__releaseEditPreparation = () => { release(); fs.cp = original; main.require('node:module').syncBuiltinESMExports(); };
+    fs.cp = async (...args: any[]) => {
+      if (String(args[1]).includes('app-edits')) await held;
+      return original(...args);
+    };
+    main.require('node:module').syncBuiltinESMExports();
+  });
+  try {
+    const card = page.locator(`.app-card[data-app-id="${saved.id}"]`);
+    await card.hover();
+    await card.locator('[data-app-more]').click();
+    await page.locator('.app-row-menu [data-action="edit"]').evaluate((el: HTMLButtonElement) => { el.click(); el.click(); });
+    await expect(card).toHaveAttribute('aria-busy', 'true');
+    for (const [lang, width, height, label] of [['zh', 1100, 760, '加载中…'], ['en', 640, 600, 'Loading…']] as const) {
+      await page.evaluate(lang => (window as any).setLang(lang), lang);
+      await page.setViewportSize({ width, height });
+      await expect(card.locator('[data-app-edit-status]')).toHaveText(label);
+      await card.hover();
+      await card.locator('[data-app-more]').click();
+      await expect(page.locator('.app-row-menu [data-action="edit"]')).toBeDisabled();
+      await page.keyboard.press('Escape');
+      expect(await card.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+      await page.screenshot({ path: info.outputPath(`edit-preparing-${lang}.png`) });
+    }
+  } finally {
+    await orkas.electronApp!.evaluate(() => { (globalThis as any).__releaseEditPreparation(); delete (globalThis as any).__releaseEditPreparation; });
+  }
+  await expect(page.locator('#panel-conversation')).toHaveClass(/active/);
+  const cid = await page.evaluate(() => currentCid);
+  const input = page.locator('#chat-input');
+  await expectComposerText(input, '');
+  const editor = page.locator('.chat-rich-editor[data-rich-input-id="chat-input"]');
+  await expect(editor).toBeFocused();
+  await expect(page.locator('#chat-attachments')).toContainText('app-source.md');
+  for (const [lang, width, height, hint] of [['zh', 1100, 760, '描述需要修改的内容...'], ['en', 640, 600, 'Describe what to change...']] as const) {
+    await page.evaluate(lang => (window as any).setLang(lang), lang);
+    await page.setViewportSize({ width, height });
+    await expect(input).toHaveAttribute('placeholder', hint);
+    await page.screenshot({ path: info.outputPath(`edit-empty-${lang}.png`) });
+  }
+  await editor.fill('Add a reset button to the calculator');
+  // A real renderer reload restores both the requirements draft and persisted
+  // source association before sending through the normal native transport.
+  await page.reload();
+  await page.evaluate(async cid => { await (window as any).loadConversations(); (window as any).setView('conversation', cid); }, cid);
+  await expectComposerText(input, 'Add a reset button to the calculator');
+  await expect(input).toHaveAttribute('placeholder', 'Describe what to change...');
+  await page.locator('#chat-send-btn').click();
+  const bubble = page.locator('#chat-history .chat-message.user .chat-bubble');
+  await expect(bubble).toContainText('Add a reset button to the calculator');
+  await expect(bubble).not.toContainText('Modify the interactive app');
+  await expect.poll(() => orkas.modelRequests.length).toBeGreaterThan(0);
+  expect(JSON.stringify(orkas.modelRequests).includes('Modify the interactive app')).toBe(true);
+  expect(JSON.stringify(orkas.modelRequests).includes(title)).toBe(true);
+  await expect(page.locator('#chat-history .chat-message.assistant')).toContainText('APP_EDIT_ACK');
+  await expect(input).toHaveAttribute('placeholder', await page.evaluate(() => (window as any).t('chat.input_placeholder')));
+  const listed = await orkas.invoke<any>('conversations.list');
+  expect(listed.conversations.filter((conv: any) => conv.assistance?.kind === 'app_editing')).toHaveLength(1);
+  const record = readFileSync(path.join(orkas.workspaceRoot, 'account-e2e/cloud/chats', `${cid}.jsonl`), 'utf8')
+    .split('\n').filter(Boolean).map(line => JSON.parse(line)).find(row => row.from === 'user');
+  expect(record.text).toBe('Add a reset button to the calculator');
+  expect(record.model_text).toContain('app-source.md');
+  expect(record.model_text).toContain(title);
+  expect(readFileSync(metaPath, 'utf8')).toBe(JSON.stringify(meta));
+});
 
 test('retains saved app cards when the local inventory is unreadable and recovers the same app', async ({orkas}, info) => {
   const page=orkas.page!;
@@ -13,6 +146,8 @@ test('retains saved app cards when the local inventory is unreadable and recover
   await openSidebarEntry(page,'#apps-btn');
   const card=page.locator(`.app-card[data-app-id="${saved.id}"]`);
   await expect(card).toBeVisible();
+  const initialIds=await page.locator('.app-card[data-app-id]').evaluateAll(nodes=>nodes.map(n=>(n as HTMLElement).dataset.appId).sort());
+  expect(initialIds).toEqual(['builtin-content-workbench','builtin-product-listing',saved.id].sort());
   const root=path.join(orkas.workspaceRoot,'account-e2e/cloud/saved_apps');
   await orkas.electronApp!.evaluate((_electron,root)=>{
     const main=(process as any).mainModule,fs=main.require('node:fs'),modules=main.require('node:module');
@@ -28,7 +163,8 @@ test('retains saved app cards when the local inventory is unreadable and recover
     await page.evaluate(()=>(window as any).loadSavedApps(true));
     await expect(card).toBeVisible();
     await expect(page.locator('#apps-empty')).toBeHidden();
-    await expect(page.locator('#apps-page-header-count')).toHaveText('1');
+    expect(await page.locator('.app-card[data-app-id]').evaluateAll(nodes=>nodes.map(n=>(n as HTMLElement).dataset.appId).sort())).toEqual(initialIds);
+    await expect(page.locator('#apps-page-header-count')).toHaveText('3');
   } finally {
     await orkas.electronApp!.evaluate(()=>{
       (globalThis as any).__restoreSavedInventory();delete (globalThis as any).__restoreSavedInventory;
@@ -137,7 +273,8 @@ test('retains the focused app through refresh and dismisses a removed app menu',
   await page.evaluate(() => (window as any).loadSavedApps(true));
   await expect(card).toHaveCount(0);
   await expect(page.locator('.app-row-menu')).toBeHidden();
-  await expect(page.locator('#apps-empty')).toBeVisible();
+  await expect(page.locator('[data-app-source="custom"]')).toHaveCount(0);
+  await expect(page.locator('[data-app-source="builtin"]')).toBeVisible();
   await expect(page.locator('#apps-create-btn')).toBeFocused();
 });
 
@@ -193,7 +330,7 @@ test.describe('My Apps', () => {
     const web = orkas.createWorkspaceFile('legacy-web/index.html', '<h1>Notes</h1>');
     await orkas.invoke('savedApps.saveFromPath', { path: web, title: 'Notes', cid: creation.conversation.conversation_id });
     await openSidebarEntry(page, '#apps-btn');
-    await expect(page.locator('.app-card')).toHaveCount(2);
+    await expect(page.locator('[data-app-source="custom"] .app-card')).toHaveCount(2);
     await expect(page.locator('[data-app-filter]')).toHaveCount(0);
     await expect(page.locator('.app-card-description')).toHaveCount(0);
     for (const language of ['en', 'zh', 'de', 'ar']) {
@@ -295,6 +432,15 @@ test.describe('My Apps', () => {
       expect(JSON.stringify(orkas.modelRequests)).not.toContain('Unrelated home draft');
       await page.locator('#new-chat-btn').click();
       await expectComposerText(page.locator('#new-chat-input'), 'Unrelated home draft');
+      const created = listed.conversations.find((conversation: any) => (
+        conversation.assistance?.kind === 'app_creation'
+      )) as { conversation_id: string };
+      await reopenCompletedConversation(page, created.conversation_id);
+      await expect(page.locator(
+        '#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])',
+        { hasText: 'APP_CREATE_ACK' },
+      )).toHaveCount(1);
+      expect(orkas.modelRequests).toHaveLength(1);
     });
   }
 
@@ -348,7 +494,7 @@ test.describe('My Apps', () => {
       await orkas.invoke('savedApps.saveFromPath', { path: entry, title, mode: 'new' });
     }
     await openSidebarEntry(page, '#apps-btn');
-    await expect(page.locator('.app-card')).toHaveCount(7);
+    await expect(page.locator('[data-app-source="custom"] .app-card')).toHaveCount(7);
     await expect(page.locator('.app-card img')).toHaveCount(0);
     const scrollArea = page.locator('#panel-apps .agents-grid-scroll');
     expect(await scrollArea.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
@@ -412,7 +558,7 @@ test.describe('My Apps', () => {
     await expect(page.locator('#panel-apps')).toHaveClass(/\bactive\b/);
     let card = page.locator(`.app-card[data-app-id="${saved.id}"]`);
     await expect(card).toContainText('E2E Saved App');
-    await expect(page.locator('#apps-page-header-count')).toHaveText('1');
+    await expect(page.locator('#apps-page-header-count')).toHaveText('3');
 
     const opened = orkas.electronApp!.waitForEvent('window');
     await card.click();
@@ -459,7 +605,8 @@ test.describe('My Apps', () => {
     await page.locator('.app-row-menu-item[data-action="edit"]').click();
     await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
     await expect(page.locator('#chat-header .chat-app-type-tag')).toHaveCount(0);
-    await expectComposerText(page.locator('#chat-input'), /E2E Renamed App/);
+    await expectComposerText(page.locator('#chat-input'), '');
+    await expect(page.locator('#chat-input')).toHaveAttribute('placeholder', 'Describe what to change...');
     await expect(page.locator('#chat-attachments')).toContainText('app-source.md');
     const editComposer = page.locator('.chat-rich-editor[data-rich-input-id="chat-input"]');
     await expect(editComposer).toBeFocused();
@@ -483,8 +630,9 @@ test.describe('My Apps', () => {
     await expect(relaunchedPage.locator('.ui-dialog-overlay:visible .ui-dialog-danger')).toBeVisible();
     await relaunchedPage.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
     await expect(card).toHaveCount(0);
-    await expect(relaunchedPage.locator('#apps-empty')).toBeVisible();
-    await expect(relaunchedPage.locator('#apps-page-header-count')).toHaveText('');
+    await expect(relaunchedPage.locator('[data-app-source="custom"]')).toHaveCount(0);
+    await expect(relaunchedPage.locator('[data-app-source="builtin"]')).toBeVisible();
+    await expect(relaunchedPage.locator('#apps-page-header-count')).toHaveText('2');
   });
 });
 
@@ -584,8 +732,8 @@ test('uses unified app icons for local and legacy web apps', async ({ orkas }, t
   const cloud = orkas.createWorkspaceFile('icon-cloud/index.html', '<h1>Cloud</h1>');
   await orkas.invoke('savedApps.saveFromPath', { path: cloud, title: 'Cloud example', cid: creation.conversation.conversation_id });
   await openSidebarEntry(page, '#apps-btn');
-  await expect(page.locator('.app-card')).toHaveCount(2);
-  await expect(page.locator('.app-card-icon svg.is-layout-grid')).toHaveCount(2);
+  await expect(page.locator('[data-app-source="custom"] .app-card')).toHaveCount(2);
+  await expect(page.locator('[data-app-source="custom"] .app-card-icon svg.is-layout-grid')).toHaveCount(2);
   await expect(page.locator('.app-card-published')).toHaveCount(0);
   await page.locator('#apps-grid').screenshot({ path: testInfo.outputPath('cloud-icons.png') });
 });
@@ -923,18 +1071,32 @@ test('publication guidance preserves the app and direct publication refuses with
   }
   const page = orkas.page!;
   await openSidebarEntry(page, '#apps-btn');
-  for (const [language, width] of [['en', 1133], ['zh', 560]] as const) {
+  for (const [language, width] of [['en', 1133], ['zh', 560], ['ar', 400]] as const) {
     await page.evaluate(language => (window as any).setLang(language), language);
     await page.setViewportSize({width,height:720});
     const card = page.locator(`.app-card[data-app-id="${saved.id}"]`);
     await card.hover();
+    const direct = card.locator('[data-app-action="publish"]');
+    await expect(direct).toBeVisible();
+    await expect(direct).toHaveText(await page.evaluate(() => (window as any).t('apps.publish_action')));
+    await direct.focus();
+    await page.evaluate(() => (window as any).loadSavedApps(true, { localOnly: true }));
+    await expect(direct).toBeFocused();
+    expect(await card.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath(`direct-publication-${language}-${width}.png`) });
+    await direct.click();
+    const directDialog = page.locator('.ui-dialog-overlay.open');
+    await expect(directDialog.locator('.ui-dialog-message')).toHaveText(await page.evaluate(() => (window as any).t('apps.commercial_required')));
+    await directDialog.locator('[data-act="cancel"]').click();
+    await expect(direct).toBeFocused();
+    expect(readFileSync(metadata, 'utf8')).toBe(before);
     await card.locator('[data-app-more]').click();
     await expect(page.locator('.app-row-menu [data-action="publish"]'))
-      .toHaveText(language === 'zh' ? '发布' : 'Publish');
+      .toHaveText(await page.evaluate(() => (window as any).t('apps.publish_action')));
     await page.locator('.app-row-menu').screenshot({path:testInfo.outputPath(`publication-menu-${language}.png`)});
     await page.locator('.app-row-menu [data-action="publish"]').click();
     const dialog = page.locator('.ui-dialog-overlay.open');
-    await expect(dialog).toContainText(language === 'zh' ? '发布' : 'publish', {ignoreCase:true});
+    await expect(dialog.locator('.ui-dialog-message')).toHaveText(await page.evaluate(() => (window as any).t('apps.commercial_required')));
     expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
     await dialog.screenshot({path:testInfo.outputPath(`publication-guidance-${language}-${width}.png`)});
     await dialog.locator('[data-act="cancel"]').click();
@@ -942,5 +1104,215 @@ test('publication guidance preserves the app and direct publication refuses with
     await expect(card.locator('[data-app-more]')).toBeFocused();
     expect(readFileSync(metadata, 'utf8')).toBe(before);
   }
+  expect(orkas.modelRequests).toHaveLength(0);
+});
+
+test('uses the localized built-in name when opening and reopening an edit copy', async ({ orkas }, info) => {
+  const page = orkas.page!;
+  for (const [lang, width, title, taskTitle] of [
+    ['zh', 1100, '内容工作台', '修改「内容工作台」'],
+    ['en', 640, 'Content workspace', 'Edit "Content workspace"'],
+  ] as const) {
+    await page.evaluate(lang => (window as any).setLang(lang), lang);
+    await page.setViewportSize({ width, height: 700 });
+    await openSidebarEntry(page, '#apps-btn');
+    const card = page.locator('.app-card[data-app-id="builtin-content-workbench"]');
+    await expect(card).toContainText(title);
+    await card.hover();
+    await card.locator('[data-app-more]').click();
+    await expect(page.locator('.app-row-menu [data-action="edit"]')).toHaveText(lang==='zh'?'修改':'Edit a copy');
+    await page.screenshot({path:info.outputPath('app-modify-menu-'+lang+'.png')});
+    await page.locator('.app-row-menu [data-action="edit"]').click();
+    await expect(page.locator('#chat-header-title')).toHaveText(taskTitle);
+    const cid = await page.evaluate(() => currentCid);
+    await expect(page.locator('#chat-attachments')).toContainText('app-source.md');
+    await expectComposerText(page.locator('#chat-input'), '');
+    await page.reload();
+    await page.evaluate(async cid => { await (window as any).loadConversations(); (window as any).setView('conversation', cid); }, cid);
+    await expect(page.locator('#chat-header-title')).toHaveText(taskTitle);
+    await expect(page.locator('#chat-history')).toContainText(await page.evaluate(() => (window as any).t('chat.empty')));
+    await expect(page.locator('#chat-attachments')).toContainText('app-source.md');
+    await page.screenshot({ path: info.outputPath(`builtin-edit-title-${lang}.png`) });
+  }
+});
+
+
+test('paints legacy apps from disk without changing their metadata', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  const source = orkas.createWorkspaceFile('legacy-loading/index.html', '<h1>Legacy app</h1>');
+  const kept: Array<{ id: string; meta: string; bytes: string }> = [];
+  for (let i = 0; i < 11; i++) {
+    const app = await orkas.invoke<any>('savedApps.saveFromPath', { path: source, title: `Legacy ${i}`, mode: 'new' });
+    expect(app.ok).toBe(true);
+    const meta = path.join(orkas.workspaceRoot, 'account-e2e/cloud/saved_apps', app.id, '__orkas-meta.json');
+    const value = JSON.parse(readFileSync(meta, 'utf8')); delete value.appType;
+    const bytes = JSON.stringify(value); writeFileSync(meta, bytes);
+    kept.push({ id: app.id, meta, bytes });
+  }
+  const start = Date.now();
+  await openSidebarEntry(page, '#apps-btn');
+  await expect(page.locator('[data-app-source="custom"] .app-card')).toHaveCount(11);
+  await expect(page.locator('.app-card')).toHaveCount(13);
+  await expect(page.locator('#apps-empty')).toBeHidden();
+  const timingPath = testInfo.outputPath('first-paint.json');
+  writeFileSync(timingPath, JSON.stringify({apps: kept.length, firstPaintMs: Date.now() - start}));
+  await testInfo.attach('first-paint', {path: timingPath, contentType: 'application/json'});
+  await page.screenshot({path: testInfo.outputPath('apps-local-legacy.png')});
+  await page.evaluate(() => (window as any).loadSavedApps(true, {localOnly: true}));
+  await expect(page.locator('[data-app-source="custom"] .app-card')).toHaveCount(11);
+  for (const app of kept) expect(readFileSync(app.meta, 'utf8')).toBe(app.bytes);
+  expect(readFileSync(source, 'utf8')).toBe('<h1>Legacy app</h1>');
+  expect(orkas.modelRequests).toHaveLength(0);
+});
+
+test('keeps a legacy app visible and editable without granting an unverified editing type', async ({ orkas }) => {
+  const page = orkas.page!;
+  const source = orkas.createWorkspaceFile('offline-legacy/index.html', '<h1>Keep offline source</h1>');
+  const app = await orkas.invoke<any>('savedApps.saveFromPath', { path: source, title: 'Offline legacy' });
+  expect(app.ok).toBe(true);
+  const meta = path.join(orkas.workspaceRoot, 'account-e2e/cloud/saved_apps', app.id, '__orkas-meta.json');
+  const value = JSON.parse(readFileSync(meta, 'utf8')); delete value.appType;
+  const bytes = JSON.stringify(value); writeFileSync(meta, bytes);
+  await openSidebarEntry(page, '#apps-btn');
+  const card = page.locator(`.app-card[data-app-id="${app.id}"]`);
+  await expect(card).toBeVisible();
+  // Editing copies local source offline; an unresolved identity grants no host type.
+  const editing = await orkas.invoke<any>('savedApps.openForEditing', { appId: app.id });
+  expect(editing.ok).toBe(true);
+  const cid = editing.conversation.conversation_id;
+  const context = JSON.parse(readFileSync(path.join(orkas.workspaceRoot, 'account-e2e/local/app-edits', cid, 'context.json'), 'utf8'));
+  expect(context.appType).toBeUndefined();
+  expect(readFileSync(path.join(orkas.workspaceRoot, 'account-e2e/cloud/chat_attachments', cid, 'app-source.md'), 'utf8')).toContain('Keep offline source');
+  await expect(card).toBeVisible();
+  expect(readFileSync(meta, 'utf8')).toBe(bytes);
+  await page.evaluate(() => (window as any).loadSavedApps(true, {localOnly: true}));
+  await expect(card).toHaveCount(1);
+  await expect(card).toBeVisible();
+  expect(readFileSync(meta, 'utf8')).toBe(bytes);
+  expect(orkas.modelRequests).toHaveLength(0);
+});
+
+test('keeps local and built-in card actions in the same corner without covering long titles', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  const creation = await orkas.invoke<any>('conversations.create', { title: 'Draft', assistance: { kind: 'app_creation', appType: 'web' } });
+  const entry = orkas.createWorkspaceFile('card-layout/index.html', '<h1>Draft</h1>');
+  await orkas.invoke('savedApps.saveFromPath', { path: entry, title: 'Unpublished draft', cid: creation.conversation.conversation_id });
+  await orkas.invoke('savedApps.saveFromPath', { path: entry, title: 'A local application with a deliberately long title '.repeat(3), mode: 'new' });
+  await openSidebarEntry(page, '#apps-btn');
+
+  await expect(page.locator('[data-app-source="custom"] .app-card')).toHaveCount(2);
+  for (const [lang, width] of [['en', 1133], ['zh', 560]] as const) {
+    await page.evaluate(value => (window as any).setLang(value), lang);
+    await page.setViewportSize({ width, height: 720 });
+    const content = page.locator('.app-card[data-app-id="builtin-content-workbench"]');
+    await expect(content.locator('.app-card-name')).toHaveText(lang === 'zh' ? '内容工作台' : 'Content workspace');
+    await expect(content.locator('.app-card-meta')).toHaveText(lang === 'zh' ? '从想法或已有素材开始' : 'Start from an idea or your own media');
+    for (const card of await page.locator('.app-card').all()) {
+      await card.focus();
+      await expect(card.locator('[data-app-more]')).toBeVisible();
+      const geometry = await card.evaluate(el => {
+        const rect = el.getBoundingClientRect();
+        const menu = el.querySelector('[data-app-more]')!.getBoundingClientRect();
+        const badge = el.querySelector('.app-card-published')?.getBoundingClientRect();
+        return { top: menu.top - rect.top, right: rect.right - menu.right,
+          overlap: !!badge && menu.left < badge.right && menu.right > badge.left && menu.top < badge.bottom && menu.bottom > badge.top,
+          overflow: el.scrollWidth > el.clientWidth };
+      });
+      expect(geometry.top, 'P4 places every resource-card menu at its upper-right corner').toBeLessThanOrEqual(14);
+      expect(geometry.right).toBeLessThanOrEqual(14);
+      expect(geometry.overlap).toBe(false);
+      expect(geometry.overflow).toBe(false);
+      await expect(card.locator('[data-app-details]')).toHaveCount(0);
+    }
+    await page.locator('#apps-grid').screenshot({ path: testInfo.outputPath(`card-actions-${lang}-${width}.png`) });
+  }
+});
+
+test('updates the original untyped app from preview without resolving its display type', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  const state = await orkas.electronApp!.evaluate(async (_electron, modules) => {
+    const main = (process as any).mainModule;
+    const artifacts = main.require(modules.artifacts), saved = main.require(modules.saved);
+    const fs = main.require('node:fs'), paths = main.require(modules.paths);
+    const original = await artifacts.createArtifact('account-e2e', 'legacy-original', 'commander', {
+      title: 'Legacy editor', files: [{ path: 'index.html', content: '<h1>Original source</h1>' }],
+    });
+    if (!original.ok) throw new Error(original.error);
+    const kept = await saved.saveFromArtifact('account-e2e', 'legacy-original', original.artifactId);
+    if (!kept.ok) throw new Error(kept.error);
+    const edited = await saved.openForEditing('account-e2e', kept.id);
+    if (!edited.ok) throw new Error(edited.error);
+    const cid = edited.conversation.conversation_id;
+    const revised = await artifacts.createArtifact('account-e2e', cid, 'commander', {
+      title: 'Revised editor', files: [{ path: 'index.html', content: '<h1>Revised source</h1>' }],
+    });
+    if (!revised.ok) throw new Error(revised.error);
+    // Legacy edits can retain an unclassified original even when the new artifact has a type.
+    for (const file of [paths.savedAppDir('account-e2e', kept.id) + '/__orkas-meta.json',
+      paths.userAppEditsDir('account-e2e') + '/' + cid + '/context.json']) {
+      const value = JSON.parse(fs.readFileSync(file, 'utf8')); delete value.appType;
+      fs.writeFileSync(file, JSON.stringify(value));
+    }
+    return { cid, artifactId: revised.artifactId, title: revised.title, appId: kept.id };
+  }, { artifacts: path.resolve('src/main/features/chat_artifacts.ts'), saved: path.resolve('src/main/features/saved_apps.ts'),
+    paths: path.resolve('src/main/paths.ts') });
+  appendFileSync(path.join(orkas.workspaceRoot, 'account-e2e/cloud/chats', `${state.cid}.jsonl`), JSON.stringify({
+    id: 'legacy-edit-result', ts: new Date().toISOString(), from: 'commander', to: ['user'], text: 'Revised source ready.',
+    artifacts: [{ id: state.artifactId, title: state.title, agent_id: 'commander' }],
+  }) + '\n');
+  const display = await orkas.invoke<any>('conversations.artifacts.editTarget', {cid: state.cid, artifactId: state.artifactId});
+  expect(display.target).toMatchObject({appId: state.appId, title: 'Legacy editor'});
+  expect(display.target.appType).toBeUndefined();
+  await page.evaluate(async cid => {
+    await (window as any).loadConversations(); await (window as any).setView('conversation', cid);
+  }, state.cid);
+  await page.locator('.chat-artifact-more').click();
+  const preview = await orkas.openPreview(() => page.evaluate(input => (window as any).openChatArtifactViewer(input), state));
+  await testInfo.attach('legacy-save-controls', { contentType: 'application/json', body: Buffer.from(JSON.stringify({
+    updateMenuVisible: await page.locator('.chat-artifact-menu [data-action="update"]').isVisible(),
+    previewSaveDisabled: await preview.locator('.chat-artifact-viewer-save').isDisabled(),
+  })) });
+  await expect.soft(page.locator('.chat-artifact-menu [data-action="update"]')).toBeVisible();
+  await expect.soft(preview.locator('.chat-artifact-viewer-save')).toBeEnabled();
+  await expect.soft(preview.locator('.chat-artifact-viewer-save')).toHaveAttribute('title', 'Update original app');
+  const root = path.join(orkas.workspaceRoot, 'account-e2e/cloud/saved_apps');
+  expect(readFileSync(path.join(root, state.appId, 'index.html'), 'utf8')).toContain('Original source');
+  await preview.locator('.chat-artifact-viewer-save').click();
+  await expect.poll(() => readFileSync(path.join(root, state.appId, 'index.html'), 'utf8')).toContain('Revised source');
+  await expect(preview.locator('.chat-artifact-viewer-save')).toBeEnabled();
+  expect((await orkas.invoke<any>('savedApps.list', { localOnly: true })).apps.map((app: any) => app.id)).toEqual([state.appId]);
+  expect(JSON.parse(readFileSync(path.join(root, state.appId, '__orkas-meta.json'), 'utf8')).appType).toBe('local');
+  await orkas.closePreview(preview);
+});
+
+test('renames, opens and updates the same app through a detached file preview', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  const entry = orkas.createWorkspaceFile('local-network/index.html', '<h1>Original local source</h1>');
+  const saved = await orkas.invoke<any>('savedApps.saveFromPath', { path: entry, title: 'Local app' });
+  expect(saved.ok).toBe(true);
+  await openSidebarEntry(page, '#apps-btn');
+  const card = page.locator(`.app-card[data-app-id="${saved.id}"]`);
+  await card.hover(); await card.locator('[data-app-more]').click();
+  await page.locator('.app-row-menu [data-action="rename"]').click();
+  const prompt = page.locator('.ui-dialog-overlay:visible');
+  await prompt.locator('.ui-dialog-input').fill('Renamed local app');
+  await prompt.locator('[data-act="ok"]').click();
+  await expect(card.locator('.app-card-name')).toHaveText('Renamed local app');
+  const appPreview = await orkas.openPreview(() => card.click());
+  await expect(appPreview.frameLocator('.saved-app-viewer-frame').locator('h1')).toHaveText('Original local source');
+  await orkas.closePreview(appPreview);
+  // An explicitly selected HTML entry supplies its title on save.
+  writeFileSync(entry, '<title>Renamed local app</title><h1>Updated local source</h1>');
+  const preview = await orkas.openPreview(() => page.evaluate(file => (window as any).openChatFileViewer(file, 'index.html'), entry));
+  await expect(preview.locator('.chat-file-viewer-save-app')).toHaveAttribute('title', 'Update original app');
+  await preview.locator('.chat-file-viewer-save-app').click();
+  const updated = path.join(orkas.workspaceRoot, 'account-e2e/cloud/saved_apps', saved.id, 'index.html');
+  await expect.poll(() => readFileSync(updated, 'utf8')).toContain('Updated local source');
+  await expect(preview.locator('.chat-file-viewer-save-app')).toBeEnabled();
+  await orkas.closePreview(preview);
+  await page.evaluate(() => (window as any).loadSavedApps(true, { localOnly: true }));
+  expect((await orkas.invoke<any>('savedApps.list')).apps).toMatchObject([{ id: saved.id, title: 'Renamed local app' }]);
+  await expect(card.locator('.app-card-name')).toHaveText('Renamed local app');
+  await page.screenshot({ path: testInfo.outputPath('local-save-after-rename.png') });
   expect(orkas.modelRequests).toHaveLength(0);
 });

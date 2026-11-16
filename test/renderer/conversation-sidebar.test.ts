@@ -279,6 +279,7 @@ function loadConversationRenderer() {
       'sidebar.bucket.today': 'Today',
       'sidebar.bucket.last30': 'Last 30 days',
       'sidebar.load_more_conversations': 'Load more',
+      'sidebar.conv_waiting_answer': 'Needs answer',
       'sidebar.commander_running': `${params?.n} running`,
     }[key] || key),
     _BUCKET_ORDER: ['today', 'last30'],
@@ -309,6 +310,9 @@ function loadConversationRenderer() {
   const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
   vm.runInContext(source, context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/queue-draft.js'), 'utf8'), context);
+  // Transcript/sidebar scenarios own their state, not secondary catalog IPC.
+  // The native saved-task journey exercises that asynchronous navigation owner.
+  context._scheduleConversationTaskLinksRefresh = vi.fn();
   return context;
 }
 
@@ -653,6 +657,23 @@ describe('conversation create-agent inline gate', () => {
 });
 
 describe('sidebar running task counts', () => {
+  it('shows one waiting label ahead of a failure and restores the failure after the last answer', () => {
+    const context = loadConversationRenderer();
+    let count = 2;
+    context.window.CliAsyncInput = { waitingCount: () => count };
+    vm.runInContext('_failedConvs.add("c1")', context);
+    const conv = { conversation_id: 'c1', title: 'Awaiting a decision' };
+    for (const remaining of [2, 1]) {
+      count = remaining;
+      const html = context._renderConversationSidebarItem(conv);
+      expect(html).toContain('conv-item-status-label is-waiting');
+      expect(html).toContain('Needs answer</span>');
+      expect(html).not.toContain('conv-item-status-label is-failed');
+    }
+    count = 0;
+    expect(context._renderConversationSidebarItem(conv)).toContain('conv-item-status-label is-failed');
+  });
+
   it('shows the app-wide total on Commander and isolates Tasks and Project totals', () => {
     const context = loadConversationRenderer();
     const commanderChip: any = { hidden: true, textContent: '' };
@@ -1456,13 +1477,21 @@ describe('conversation sidebar task row actions', () => {
     expect(html).not.toContain('conv-item-status-label');
   });
 
-  it('places the live running icon to the left of an automation icon on every sidebar copy', () => {
+  it.each([
+    [],
+    ['pin'],
+    ['automation'],
+    ['todo'],
+    ['pin', 'automation', 'todo'],
+  ].map(icons => ({ icons })))('places the live running icon first on every sidebar copy with icons $icons', ({ icons }) => {
     const context = loadConversationRenderer();
     const makeCopy = () => {
-      const autoIcon: any = { kind: 'automation' };
+      const sourceIcons = icons.map(kind => ({ kind }));
+      const autoIcon = sourceIcons.find(icon => icon.kind === 'automation');
       const title: any = { kind: 'title', parentElement: null };
       const row: any = {
-        children: [autoIcon, title],
+        children: [...sourceIcons, title],
+        get firstChild() { return this.children[0]; },
         insertBefore(node: any, anchor: any) {
           const anchorIndex = this.children.indexOf(anchor);
           this.children.splice(anchorIndex, 0, node);
@@ -1472,6 +1501,7 @@ describe('conversation sidebar task row actions', () => {
       const item = {
         querySelector(selector: string) {
           if (selector === '.conv-status-badge') return null;
+          if (selector === '.conv-item-row') return row;
           if (selector === '.conv-item-title') return title;
           if (selector === '.conv-item-row > .conv-item-auto-icon') return autoIcon;
           return null;
@@ -1497,8 +1527,8 @@ describe('conversation sidebar task row actions', () => {
 
     context._updateConvSidebarBadge('c1');
 
-    expect(todayCopy.row.children.map((c: any) => c.kind)).toEqual(['running-1', 'automation', 'title']);
-    expect(projectCopy.row.children.map((c: any) => c.kind)).toEqual(['running-2', 'automation', 'title']);
+    expect(todayCopy.row.children.map((c: any) => c.kind)).toEqual(['running-1', ...icons, 'title']);
+    expect(projectCopy.row.children.map((c: any) => c.kind)).toEqual(['running-2', ...icons, 'title']);
   });
 
   it('focuses the rename editor in the list the menu was opened from', async () => {
@@ -8481,6 +8511,73 @@ describe('conversation auto recipient', () => {
       .toBe('@commander 先回到你这里');
   });
 
+  it('reconciles an Agent floor received while its Commander acknowledgement was delayed', async () => {
+    const context = loadConversationRenderer();
+    let release!: (value:unknown) => void;
+    context.apiFetch = () => new Promise(resolve => { release = resolve; });
+    vm.runInContext('currentCid="c1"; _groupMembersCache.set("c1", [{kind:"agent",id:"a1",name:"Writing Helper"}]); _rememberServerFloor("c1", {active_recipient:"a1", active_recipient_revision:1})', context);
+    context.setChatRecipient('conversation', { kind:'commander' });
+    const ack = vm.runInContext('_floorSyncByCid.get("c1")', context);
+    vm.runInContext('_rememberServerFloor("c1", {active_recipient:"a1", active_recipient_revision:3})', context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+    expect(context.getChatRecipient('conversation')).toMatchObject({ kind:'commander' });
+    release({ json:async () => ({ ok:true, state:{ active_recipient_revision:2 } }) });
+    await ack;
+    await Promise.resolve();
+    expect(context.getChatRecipient('conversation')).toMatchObject({ kind:'agent', id:'a1' });
+    expect(context.applyRecipientPrefix('Continue', 'conversation')).toBe('Continue');
+  });
+
+  it('keeps the explicit Commander reset after a failed acknowledgement', async () => {
+    const context = loadConversationRenderer();
+    context.apiFetch = async () => ({ json:async () => ({ ok:false }) });
+    vm.runInContext('currentCid="c1"; _rememberServerFloor("c1", {active_recipient:"a1", active_recipient_revision:1})', context);
+    context.setChatRecipient('conversation', { kind:'commander' });
+    await vm.runInContext('_floorSyncByCid.get("c1")', context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+    expect(context.getChatRecipient('conversation')).toMatchObject({ kind:'commander' });
+    expect(context.applyRecipientPrefix('Continue', 'conversation')).toBe('@commander Continue');
+  });
+
+  it('does not let a superseded acknowledgement clear the latest Commander reset', async () => {
+    const context = loadConversationRenderer();
+    const releases: Array<(value:unknown) => void> = [];
+    context.apiFetch = () => new Promise(resolve => releases.push(resolve));
+    vm.runInContext('currentCid="c1"; _rememberServerFloor("c1", {active_recipient:"a1", active_recipient_revision:1})', context);
+    context.setChatRecipient('conversation', { kind:'commander' });
+    const first = vm.runInContext('_floorSyncByCid.get("c1")', context);
+    context.setChatRecipient('conversation', { kind:'commander' });
+    releases[0]({ json:async () => ({ ok:true, state:{ active_recipient_revision:2 } }) });
+    await first;
+    expect(context.applyRecipientPrefix('Continue', 'conversation')).toBe('@commander Continue');
+    const second = vm.runInContext('_floorSyncByCid.get("c1")', context);
+    releases[1]({ json:async () => ({ ok:true, state:{ active_recipient_revision:3 } }) });
+    await second;
+    expect(context.applyRecipientPrefix('Continue', 'conversation')).toBe('Continue');
+  });
+
+  // 2026-11-12 live run: the user went back to Commander while VideoStudio priced a video, and
+  // VideoStudio later stopped to ask about a shot and took the floor. The reply "继续剪辑" still
+  // went to Commander behind a hidden @commander, and the chip kept saying Commander.
+  it('follows a floor an Agent takes after the return to Commander is confirmed', async () => {
+    const context = loadConversationRenderer();
+    context.apiFetch = async () => ({ json: async () => ({ ok: true, state: { active_recipient_revision: 2 } }) });
+    vm.runInContext(`
+      currentCid = "c1";
+      _groupMembersCache.set("c1", [{ kind: "agent", id: "a1", name: "VideoStudio" }]);
+      _rememberServerFloor("c1", { active_recipient: "a1", active_recipient_revision: 1 });
+    `, context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+
+    context.setChatRecipient('conversation', { kind: 'commander' });
+    await vm.runInContext('_floorSyncByCid.get("c1")', context);
+    vm.runInContext('_rememberServerFloor("c1", { active_recipient: "a1", active_recipient_revision: 3 })', context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+
+    expect(context.getChatRecipient('conversation')).toMatchObject({ kind: 'agent', id: 'a1' });
+    expect(context.applyRecipientPrefix('继续剪辑', 'conversation')).toBe('继续剪辑');
+  });
+
   it('prefixes from a send-time recipient snapshot instead of a later chip state', () => {
     const context = loadConversationRenderer();
     context._agentsCache = [
@@ -10216,7 +10313,7 @@ describe('chat attachment picker targeting', () => {
       ...['projects', 'agents', 'skills', 'auto', 'settings'].map(surface_id => ({ surface_id, action: 'create' })),
       { surface_id: 'projects', action: 'create', target_id: 'existing-project' },
     ] });
-    expect(host.children[0].children.map((button: any) => button.textContent))
+    expect(host.children[0].children.map((button: any) => button.querySelector('.chat-msg-created-agent-label')?.textContent))
       .toEqual(['New project', 'New agent', 'New skill', 'New auto task']);
   });
 
@@ -11211,5 +11308,52 @@ describe('conversation observer admission-gap recovery', () => {
     expect(await recovering).toBe(false);
     expect(rows).toEqual([]);
     expect(context._recoverPolledVisibleMessages).not.toHaveBeenCalled();
+  });
+});
+
+describe('conversation task source navigation', () => {
+  it.each([
+    [[], false, false],
+    [[{ kind: 'todo' }], true, false],
+    [[{ kind: 'automation' }], false, true],
+    [[{ kind: 'todo' }, { kind: 'automation' }], true, true],
+  ])('shows each associated source beside its conversation title (%#)', (task_links, todo, auto) => {
+    const context = loadConversationRenderer();
+    const html = context._renderConversationSidebarItem({ conversation_id: 'c1', title: 'Review', task_links });
+    expect(html.includes('class="conv-item-todo-icon"')).toBe(todo);
+    expect(html.includes('class="conv-item-auto-icon"')).toBe(auto);
+    expect(html).toContain('class="conv-item-title" title="Review"');
+  });
+
+  it('retains known task destinations on a failed secondary read and clears them after confirmed deletion', () => {
+    const context = loadConversationRenderer();
+    const link = { kind: 'todo', task_id: 't_0123456789ab', project_id: '', title: 'Review' };
+    context.conversations = [{ conversation_id: 'c1', title: 'Task', task_links: [link] }];
+    context._replaceConversationSlice([{ conversation_id: 'c1', title: 'Task' }], () => true);
+    expect(context.conversations[0].task_links).toEqual([link]);
+    context._replaceConversationSlice([{ conversation_id: 'c1', title: 'Task', task_links: [] }], () => true);
+    expect(context.conversations[0].task_links).toEqual([]);
+  });
+
+});
+
+
+describe('shared sidebar and navigation affordances', () => {
+  it('identifies pinned conversations separately from automation and task origin', () => {
+    const h = loadConversationRenderer();
+    const pinned = h._renderConversationSidebarItem({conversation_id:'pinned', title:'Pinned task', pinned_at:'2026-11-01T00:00:00Z'});
+    expect(pinned).toContain('class="conv-item-pin-icon"');
+    expect(pinned).toContain('aria-label="Pin"');
+    expect(h._renderConversationSidebarItem({conversation_id:'ordinary',title:'Ordinary task'})).not.toContain('class="conv-item-pin-icon"');
+  });
+  it('keeps long navigation labels in their truncation element with an accessible full title', () => {
+    const h = loadConversationRenderer();
+    h.document.createElement = createProcessTestElement;
+    const button = createProcessTestElement('button');
+    const label = 'Open a project whose name extends beyond the task card';
+    h._paintAppNavButton(button, label, '<svg></svg>');
+    expect(button.title).toBe(label);
+    expect(button.querySelector('.chat-msg-created-agent-label')?.textContent).toBe(label);
+    expect(button.querySelector('.chat-app-nav-btn-page-icon')).not.toBeNull();
   });
 });

@@ -249,6 +249,24 @@ describe('ipc › groupChat.send active-turn control', () => {
 });
 
 describe('ipc › conversations.sendStream', () => {
+  it.each(['Modify app X using attached app-source.md:\nAdd reset', '  ', 42])('preserves validated hidden app context on both send paths: %s', async modelText => {
+    const payload = { cid: 'c123abc', content: 'Add reset', model_text: modelText };
+    const expected = typeof modelText === 'string' && modelText.trim() ? modelText.trim() : undefined;
+    const invokeRun = callGroupChatSend(payload);
+    await groupChatMock.sendStarted;
+    expect(groupChatMock.sendCalls[0]).toMatchObject({ text: 'Add reset' });
+    expect((groupChatMock.sendCalls[0] as any).model_text).toBe(expected);
+    groupChatMock.releaseSend?.(); await invokeRun;
+    groupChatMock.sendStarted = new Promise<void>(resolve => { groupChatMock.resolveSendStarted = resolve; });
+    const sender = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+    const streamRun = streamStartHandler!({ sender }, { requestId: 'hidden-app-context', channel: 'conversations.sendStream', payload });
+    await groupChatMock.sendStarted;
+    expect(groupChatMock.sendCalls[1]).toMatchObject({ text: 'Add reset' });
+    expect((groupChatMock.sendCalls[1] as any).model_text).toBe(expected);
+    groupChatMock.quiescent = true;
+    groupChatMock.releaseSend?.(); await streamRun;
+  });
+
   it.each(['preserve', 'hide_generated_prefix', 'invalid'])('forwards validated Commander display provenance %s on both send paths', async (mode) => {
     const content = '@commander first @指挥官 second';
     const payload = { cid: 'c123abc', content, commander_mention_display: mode };
@@ -563,5 +581,41 @@ describe('ipc › conversations.sendStream', () => {
     await run;
 
     expect(sent.at(-1)).toEqual({ channel: 'stream:req2', payload: { type: 'done' } });
+  });
+});
+
+
+describe('private application execution IPC boundary', () => {
+  const appCid = `app_${'a'.repeat(64)}_retain_${'b'.repeat(32)}`;
+  it.each([
+    { cid: appCid }, { conversation_id: appCid }, { id: appCid }, { cids: ['ordinary', appCid] },
+  ])('rejects reserved application identities before ordinary lookup: %j', async payload => {
+    expect(await invokeHandler!({ sender: trustedIpcSender() }, {
+      channel: 'conversations.getMany', payload,
+    })).toEqual({ ok: false, code: 'E_NOT_FOUND' });
+    expect(groupChatMock.sendCalls).toEqual([]);
+  });
+
+  it.each(['conversations.get', 'conversations.history', 'conversations.getMany'])(
+    'does not expose a legacy app task through %s', async channel => {
+      const chats = await import('../../../src/main/features/chats');
+      const legacy = await chats.createConversation(TEST_UID, { kind: 'app_task', title: 'Private application task' });
+      expect(await chats.getConversationMetadata(TEST_UID, legacy.conversation_id)).toMatchObject({ kind: 'app_task' });
+      expect(await invokeHandler!({ sender: trustedIpcSender() }, {
+        channel, payload: channel.endsWith('getMany') ? { cids: [legacy.conversation_id] } : { cid: legacy.conversation_id },
+      })).toEqual({ ok: false, code: 'E_NOT_FOUND' });
+    });
+
+  it.each(['reserved', 'legacy'])('closes a denied %s application stream once without subscribing or sending', async mode => {
+    const chats = await import('../../../src/main/features/chats');
+    const cid = mode === 'reserved' ? appCid : (await chats.createConversation(TEST_UID, { kind: 'app_task' })).conversation_id;
+    const sent = vi.fn(), sender = trustedIpcSender({ isDestroyed: () => false, send: sent });
+    await streamStartHandler!({ sender }, { requestId: 'private-stream', channel: 'groupChat.events', payload: { cid } });
+    expect(sent.mock.calls.map(row => row[1])).toEqual([{ type: 'error', code: 'E_NOT_FOUND' }, { type: 'done' }]);
+    expect(groupChatMock.subscribers.size).toBe(0);
+    expect(groupChatMock.sendCalls).toEqual([]);
+    expect(groupChatMock.retryCalls).toEqual([]);
+    streamCancelHandler!({ sender }, 'private-stream');
+    expect(loggerMocks.warn).not.toHaveBeenCalled();
   });
 });

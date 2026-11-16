@@ -18,7 +18,9 @@ const estimateStub = {
   unitsPerSec: 4,
   breakdown: {
     cjkCharacters: 24,
+    thaiCharacters: 0,
     latinWords: 0,
+    otherWords: 0,
     numericDigits: 0,
     numericSeparators: 0,
     majorPauses: 0,
@@ -250,5 +252,76 @@ describe('measureNarrationUnits', () => {
     const m = measureNarrationUnits('你只要跟主 agent 说需求，它就会把子 agent 拉进来');
     expect(m.unit).toBe('characters');
     expect(m.units).toBeGreaterThan(12);
+  });
+});
+
+// Scripts and median durations are from live managed-voice synthesis across
+// every voice of each language (2026-11-03). Latin-only word matching read a
+// Vietnamese line as 2.97x its real length and Russian, Arabic and Thai as under
+// 10%, and the delivery band blocks both sides before synthesis.
+describe('estimateNarrationDuration across managed-voice languages', () => {
+  const measured: Array<[string, string, number]> = [
+    ['pt', 'Nosso novo aplicativo já está disponível. Organize suas finanças em um só lugar, acompanhe seus gastos e alcance suas metas com mais tranquilidade.', 10.25],
+    ['fr', 'Notre nouvelle application est disponible. Gérez vos finances au même endroit, suivez vos dépenses et atteignez vos objectifs plus sereinement.', 8.42],
+    ['es', 'Nuestra nueva aplicación ya está disponible. Gestiona tus finanzas en un solo lugar, controla tus gastos y alcanza tus objetivos con más tranquilidad.', 9.13],
+    ['es-MX', 'Nuestra nueva aplicación ya está disponible. Administra tus finanzas en un solo lugar, revisa tus gastos y alcanza tus metas con más tranquilidad.', 10.03],
+    ['de', 'Unsere neue App ist jetzt verfügbar. Verwalten Sie Ihre Finanzen an einem Ort, behalten Sie Ihre Ausgaben im Blick und erreichen Sie Ihre Ziele entspannter.', 11.56],
+    ['it', 'La nostra nuova applicazione è ora disponibile. Gestisci le tue finanze in un unico posto, controlla le spese e raggiungi i tuoi obiettivi con più serenità.', 11.09],
+    ['id', 'Aplikasi baru kami sudah tersedia. Kelola keuangan Anda di satu tempat, pantau pengeluaran, dan capai tujuan Anda dengan lebih tenang.', 8.83],
+    ['vi', 'Ứng dụng mới của chúng tôi đã sẵn sàng. Hãy quản lý tài chính ở một nơi, theo dõi chi tiêu và đạt được mục tiêu một cách nhẹ nhàng hơn.', 6.96],
+    ['ko', '새로운 앱이 출시되었습니다. 한곳에서 재정을 관리하고 지출을 확인하면서 목표를 더 편안하게 달성해 보세요.', 9.14],
+    ['ja', '新しいアプリが登場しました。お金の管理を一か所にまとめて、支出を確認しながら、目標を無理なく達成しましょう。', 10.27],
+    ['ru', 'Наше новое приложение уже доступно. Управляйте финансами в одном месте, следите за расходами и достигайте целей спокойнее.', 8.66],
+    ['ar', 'تطبيقنا الجديد متاح الآن. أدر أموالك في مكان واحد، وتابع نفقاتك، وحقق أهدافك بكل سهولة وراحة.', 10.08],
+    ['th', 'แอปใหม่ของเราพร้อมใช้งานแล้ว จัดการการเงินได้ในที่เดียว ติดตามค่าใช้จ่าย และบรรลุเป้าหมายได้อย่างสบายใจ', 8.74],
+  ];
+
+  it.each(measured)('stays within the estimator tolerance of measured %s audio', (_language, script, seconds) => {
+    const ratio = estimateNarrationDuration(script).estimatedSec / seconds;
+    expect(ratio).toBeGreaterThan(0.8);
+    expect(ratio).toBeLessThan(1.2);
+  });
+
+  it.each(measured)('does not misjudge a %s line that fits its measured length', (_language, script, seconds) => {
+    expect(assessEstimatedNarrationFit({
+      estimate: estimateNarrationDuration(script),
+      targetSec: seconds,
+    })?.status).toBe('fits');
+  });
+
+  it('keeps Chinese and English estimates on their existing rates', () => {
+    expect(estimateNarrationDuration('这是一条测试旁白，确认时长估算没有变化。')).toMatchObject({
+      estimatedSec: 4.9,
+      unit: 'characters',
+      units: 18,
+      unitsPerSec: 4,
+    });
+    expect(estimateNarrationDuration('White ceramic, a blue wave, and room for 350 mL of coffee or tea.')).toMatchObject({
+      estimatedSec: 6.26,
+      unit: 'words',
+      unitsPerSec: 2.5,
+    });
+  });
+
+  it('counts an accented word once however it is encoded', () => {
+    const composed = estimateNarrationDuration('Não há complicação');
+    const decomposed = estimateNarrationDuration('Não há complicação'.normalize('NFD'));
+    expect(composed.breakdown.latinWords).toBe(3);
+    expect(decomposed).toEqual(composed);
+  });
+
+  it('does not treat accented European Latin as Vietnamese', () => {
+    const french = estimateNarrationDuration('Découvrez la création française dès aujourd’hui avec élégance');
+    expect(french.unitsPerSec).toBe(2.5);
+  });
+
+  it('does not read emoji variation selectors or symbols as words', () => {
+    expect(estimateNarrationDuration('Great news ❤️ 350 µm').breakdown.otherWords).toBe(0);
+  });
+
+  it('budgets a spaceless Thai line in characters', () => {
+    const measuredUnits = measureNarrationUnits('แอปใหม่ของเราพร้อมใช้งานแล้ว');
+    expect(measuredUnits.unit).toBe('characters');
+    expect(measuredUnits.units).toBeGreaterThan(20);
   });
 });

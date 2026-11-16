@@ -1,5 +1,17 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+const coreAgentMocks = vi.hoisted(() => ({createPiProvider:vi.fn(({provider}: {provider:string}) => ({id:provider,name:provider,complete:vi.fn(),stream:vi.fn(),validateAuth:vi.fn()}))}));
+vi.mock('#core-agent',()=>({createPiProvider:coreAgentMocks.createPiProvider}));
 import { describe, it, expect, vi } from 'vitest';
 import {
+  buildRuntimeMoonshotModel,
+  createDeepSeekProvider,
+  createDoubaoProvider,
+  createCustomOpenAICompatibleProvider,
+  buildConfiguredOpenAICompatibleModel,
+  createConfiguredOpenAICompatibleProvider,
+  repairOpenAICompatiblePayload,
+  omitReservedOutputLimitForProvider,
   buildCustomOpenAICompatibleModel,
   buildCustomAnthropicModel,
   buildDeepSeekModel,
@@ -277,3 +289,588 @@ describe('DeepSeek host reservation wire boundary',()=>{
   expect(request.max_tokens).toBe(128000);
  });
 });
+
+describe('external-providers › custom OpenAI-compatible model', () => {
+  const runtimeConfig = {
+    baseUrl: 'https://gateway.example.test/v1',
+    contextWindow: 262_144,
+    maxTokens: 16_384,
+  };
+
+  it.each(['complete', 'stream'] as const)('omits unsupported long-cache extensions from custom %s requests', async (mode) => {
+    const { createPiProvider } = await vi.importActual<typeof import('#core-agent')>('#core-agent');
+    for (const cacheRetention of ['long', 'short', 'none'] as const) {
+      let wire: Record<string, unknown> | undefined;
+      const provider = createPiProvider({
+        provider: 'custom', apiKey: 'test',
+        customModel: buildCustomOpenAICompatibleModel('custom-model', runtimeConfig),
+        onPayload: payload => {
+          wire = JSON.parse(JSON.stringify(payload));
+          throw new Error('captured before network');
+        },
+      });
+      const request = {
+        model: 'custom-model', sessionId: 'cache-contract', cacheRetention,
+        messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hello' }] }],
+      };
+      if (mode === 'complete') {
+        await expect(provider.complete(request)).rejects.toThrow('captured before network');
+      } else {
+        const events = [];
+        for await (const event of provider.stream(request)) events.push(event);
+        expect(events.some(event => event.type === 'error')).toBe(true);
+      }
+      expect(wire).toMatchObject({ model: 'custom-model', stream: true });
+      expect(wire).not.toHaveProperty('prompt_cache_retention');
+      expect(wire).not.toHaveProperty('prompt_cache_key');
+      expect(wire).not.toHaveProperty('prompt_cache_options');
+    }
+  });
+
+  it.each(['complete', 'stream'] as const)('preserves a bodyless HTTP 402 status through the real custom SDK %s path', async mode => {
+    const { createPiProvider } = await vi.importActual<typeof import('#core-agent')>('#core-agent');
+    const requestFetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(null, { status: 402 }));
+    try {
+      const provider = createPiProvider({
+        provider: 'custom', apiKey: 'synthetic',
+        customModel: buildCustomOpenAICompatibleModel('custom-model', runtimeConfig),
+      });
+      const request = {
+        model: 'custom-model',
+        messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hello' }] }],
+      };
+      if (mode === 'complete') {
+        await expect(provider.complete(request)).rejects.toMatchObject({ statusCode: 402 });
+      } else {
+        const events = [];
+        for await (const event of provider.stream(request)) events.push(event);
+        expect(events).toContainEqual(expect.objectContaining({
+          type: 'error', error: expect.objectContaining({ statusCode: 402 }),
+        }));
+      }
+      expect(requestFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      requestFetch.mockRestore();
+    }
+  });
+
+  it('preserves the endpoint and sizing metadata used by runtime planning', () => {
+    expect(buildCustomOpenAICompatibleModel('acme/reasoner-v2', runtimeConfig)).toMatchObject({
+      id: 'acme/reasoner-v2',
+      api: 'openai-completions',
+      provider: 'custom',
+      baseUrl: 'https://gateway.example.test/v1',
+      input: ['text', 'image'],
+      contextWindow: 262_144,
+      maxTokens: 16_384,
+    });
+  });
+
+  it('enables explicit reasoning only for a curated relay profile', () => {
+    expect(buildCustomOpenAICompatibleModel('gpt-5.6-luna', {
+      ...runtimeConfig,
+      reasoningEffort: 'medium',
+    })).toMatchObject({
+      reasoning: true,
+      compat: { supportsReasoningEffort: true },
+    });
+    expect(buildCustomOpenAICompatibleModel('acme/plain-chat', runtimeConfig)).toMatchObject({
+      reasoning: false,
+      input: ['text', 'image'],
+      compat: { supportsReasoningEffort: false },
+    });
+  });
+
+  it('retains provider-default reasoning and vision without sending an effort', () => {
+    expect(buildCustomOpenAICompatibleModel('gpt-5.6-luna', {
+      ...runtimeConfig,
+      supportsReasoning: true,
+      supportsVision: true,
+    })).toMatchObject({
+      reasoning: true,
+      input: ['text', 'image'],
+      compat: { supportsReasoningEffort: false },
+    });
+  });
+
+  it('preserves custom gateway capabilities regardless of namesake official models', () => {
+    // A custom gateway may remap a model ID or handle image input itself.
+    // Its configured capabilities, not a namesake model's public card, own input.
+    for (const modelId of [
+      'glm-5.3', 'z-ai/GLM-5.3', 'z-ai/glm-5.3:free',
+      'deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-flash',
+      'deepseek-v4-pro[1m]', 'deepseek/deepseek-v4-flash-0731',
+      'deepseek-v4-flash-vision-exp', 'acme/text-only',
+    ]) {
+      for (const supportsVision of [undefined, true]) {
+        const model = buildCustomOpenAICompatibleModel(modelId, {
+          ...runtimeConfig,
+          supportsVision,
+        });
+        expect(model?.input).toEqual(['text', 'image']);
+        expect(modelInputImageLimit('custom', modelId, model)).toBe(20);
+      }
+      const textOnly = buildCustomOpenAICompatibleModel(modelId, {
+        ...runtimeConfig,
+        supportsVision: false,
+      });
+      expect(textOnly.input).toEqual(['text']);
+      expect(modelInputImageLimit('custom', modelId, textOnly)).toBe(0);
+    }
+  });
+
+  it('constructs the provider only when all required runtime fields are present', async () => {
+    await expect(createCustomOpenAICompatibleProvider({
+      apiKey: '',
+      modelId: 'acme/reasoner-v2',
+      ...runtimeConfig,
+    })).rejects.toThrow(/apiKey required/);
+
+    const provider = await createCustomOpenAICompatibleProvider({
+      apiKey: 'sk-custom-test',
+      modelId: 'acme/reasoner-v2',
+      ...runtimeConfig,
+    });
+    expect(provider.id).toBe('custom');
+    expect(coreAgentMocks.createPiProvider).toHaveBeenLastCalledWith(
+      expect.objectContaining({ normalizeLiteralLeadingThinkText: true }),
+    );
+  });
+
+  it('rejects a legacy API key that cannot form an Authorization header before provider construction', async () => {
+    const callsBefore = coreAgentMocks.createPiProvider.mock.calls.length;
+
+    await expect(createCustomOpenAICompatibleProvider({
+      apiKey: 'щ-custom-key',
+      modelId: 'acme/reasoner-v2',
+      ...runtimeConfig,
+    })).rejects.toMatchObject({ code: 'CUSTOM_API_KEY_INVALID' });
+
+    expect(coreAgentMocks.createPiProvider.mock.calls).toHaveLength(callsBefore);
+  });
+});
+
+
+describe('external-providers › OpenAI-compatible payload hooks', () => {
+  it('keeps explicit DeepSeek thinking enabled for a fresh or reasoning-consistent history', () => {
+    const fresh = repairDeepSeekPayload({
+      thinking: { type: 'enabled' },
+      reasoning_effort: 'medium',
+      messages: [{ role: 'user', content: 'start' }],
+    }) as Record<string, unknown>;
+    const consistent = repairDeepSeekPayload({
+      thinking: { type: 'enabled' },
+      reasoning_effort: 'medium',
+      messages: [
+        { role: 'assistant', content: 'earlier answer', reasoning_content: 'earlier reasoning' },
+        { role: 'user', content: 'continue' },
+      ],
+    }) as Record<string, unknown>;
+
+    expect(fresh).toMatchObject({
+      thinking: { type: 'enabled' },
+      reasoning_effort: 'medium',
+    });
+    expect(consistent).toMatchObject({
+      thinking: { type: 'enabled' },
+      reasoning_effort: 'medium',
+    });
+  });
+
+  it('repairs orphan tool messages for direct OpenAI-compatible providers', () => {
+    const payload = {
+      model: 'kimi-k2.7-code',
+      messages: [
+        { role: 'user', content: 'continue' },
+        { role: 'tool', tool_call_id: 'lost_call', content: 'tool output' },
+      ],
+    };
+
+    const repaired = repairOpenAICompatiblePayload(payload) as typeof payload;
+
+    expect(repaired).not.toBe(payload);
+    expect(repaired.messages[1]).toMatchObject({
+      role: 'user',
+      content: expect.stringContaining('tool output'),
+    });
+  });
+
+  it('retains the DeepSeek V4 window and host output reservation across SDK catalog changes', async () => {
+    const { getBuiltinModel } = await import('@earendil-works/pi-ai/providers/all');
+    expect(getBuiltinModel('deepseek', 'deepseek-v4-pro')?.contextWindow).toBe(1_000_000);
+    expect(getBuiltinModel('deepseek', 'deepseek-flash')?.contextWindow).toBe(1_000_000);
+    for (const modelId of ['deepseek-v4-pro', 'deepseek-v4-flash']) {
+      expect(buildDeepSeekModel( modelId)).toMatchObject({
+        id: modelId,
+        reasoning: true,
+        input: ['text'],
+        contextWindow: 1_000_000,
+        // 128K is what the host reserves for output, not DeepSeek's 384K ceiling.
+        maxTokens: 128_000,
+      });
+    }
+  });
+
+  // A DeepSeek main turn used to ask for the full 384K ceiling and reserve it
+  // from the window, so a third of 1M was idle. Main turns now leave the limit
+  // to DeepSeek's mode default; the reservation stays host-side. Explicit
+  // caller limits and the compactor's small caps are untouched.
+  // OpenAI-hosted main turns are handled the same way as DeepSeek's: the
+  // catalog reservation sizes input, the wire carries no output limit.
+  it.each(['openai', 'openai-codex'])('leaves the output limit to %s on main turns and to the caller elsewhere', (providerId) => {
+    const seen: unknown[] = [];
+    const inner = (params: unknown) => { seen.push(params); return params; };
+    const hook = omitReservedOutputLimitForProvider(providerId, inner);
+    const model = { maxTokens: 64_000 };
+    const mainTurn = hook({ input: [], max_output_tokens: 64_000 }, model, { outputLimitSource: 'model_default' }) as Record<string, unknown>;
+    const explicit = hook({ input: [], max_output_tokens: 32_000 }, model, { outputLimitSource: 'model_default' }) as Record<string, unknown>;
+    const untagged = hook({ input: [], max_output_tokens: 64_000 }, model, undefined) as Record<string, unknown>;
+    expect(mainTurn.max_output_tokens).toBeUndefined();
+    expect(explicit.max_output_tokens).toBe(32_000);
+    expect(untagged.max_output_tokens).toBe(64_000);
+    // The inner hook (native search repair) still runs on the stripped payload.
+    expect(seen).toHaveLength(3);
+    // Other providers get the inner hook back unchanged.
+    expect(omitReservedOutputLimitForProvider('anthropic', inner)).toBe(inner);
+  });
+
+  it('drops the reserved output limit from DeepSeek main turns and keeps every other limit', () => {
+    const model = buildDeepSeekModel( 'deepseek-v4-pro');
+    const mainTurn = repairDeepSeekRequest(
+      { model: 'deepseek-v4-pro', messages: [{ role: 'user', content: 'ping' }], max_tokens: 128_000 },
+      model,
+      { outputLimitSource: 'model_default' },
+    ) as Record<string, unknown>;
+    const explicit = repairDeepSeekRequest(
+      { model: 'deepseek-v4-pro', messages: [{ role: 'user', content: 'full report' }], max_tokens: 128_000 },
+      model,
+      undefined,
+    ) as Record<string, unknown>;
+    const auxiliary = repairDeepSeekRequest(
+      { model: 'deepseek-v4-pro', messages: [{ role: 'user', content: 'summarize' }], max_tokens: 2_048 },
+      model,
+      { outputLimitSource: 'provider_default' },
+    ) as Record<string, unknown>;
+    const otherValue = repairDeepSeekRequest(
+      { model: 'deepseek-v4-pro', messages: [{ role: 'user', content: 'ping' }], max_tokens: 64_000 },
+      model,
+      { outputLimitSource: 'model_default' },
+    ) as Record<string, unknown>;
+
+    expect(mainTurn.max_tokens).toBeUndefined();
+    expect(explicit.max_tokens).toBe(128_000);
+    expect(auxiliary.max_tokens).toBe(2_048);
+    expect(otherValue.max_tokens).toBe(64_000);
+  });
+
+  it('enables official image input for DeepSeek V4 Flash Vision', () => {
+    const model = buildDeepSeekModel( 'deepseek-v4-flash-vision-exp');
+    expect(model).toMatchObject({
+      id: 'deepseek-v4-flash-vision-exp',
+      name: 'DeepSeek V4 Flash Vision',
+      reasoning: true,
+      input: ['text', 'image'],
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
+    });
+    expect(modelInputImageLimit('deepseek', 'deepseek-v4-flash-vision-exp', model)).toBe(20);
+  });
+
+  it('selects V4.1 Flash and sends its canonical id with vision and reasoning capabilities', async () => {
+    // DeepSeek's 2026-09-10 release uses deepseek-flash, not a versioned API id.
+    expect(isSelectableModel('deepseek', 'deepseek-flash')).toBe(true);
+    const model = buildDeepSeekModel( 'deepseek-flash');
+    expect(model).toMatchObject({
+      id: 'deepseek-flash',
+      name: 'DeepSeek V4.1 Flash',
+      api: 'openai-completions',
+      baseUrl: 'https://api.deepseek.com/v1',
+      reasoning: true,
+      input: ['text', 'image'],
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
+    });
+    expect(modelInputImageLimit('deepseek', 'deepseek-flash', model)).toBe(20);
+    await createDeepSeekProvider({ apiKey: 'sk-test', modelId: 'deepseek-flash', userCacheKey: 'opaque-user-scope' });
+    expect(coreAgentMocks.createPiProvider).toHaveBeenLastCalledWith(expect.objectContaining({
+      provider: 'deepseek',
+      customModel: model,
+      userCacheKey: 'opaque-user-scope',
+    }));
+    expect(coreAgentMocks.createPiProvider.mock.lastCall?.[0]).not.toHaveProperty('defaultReasoning');
+  });
+});
+
+describe('external-providers › Doubao Pro upgrade', () => {
+  it('sends the September Pro model with a 1M window and preserves Turbo sizing', async () => {
+    const modelId = 'doubao-seed-2-1-pro-260915';
+    coreAgentMocks.createPiProvider.mockClear();
+    await createDoubaoProvider({ apiKey: 'test-key', modelId, userCacheKey: 'opaque-user-scope' });
+    expect(coreAgentMocks.createPiProvider).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'doubao',
+      userCacheKey: 'opaque-user-scope',
+      customModel: expect.objectContaining({
+        id: modelId, contextWindow: 1_000_000, maxTokens: 32768,
+        api: 'openai-completions', reasoning: true, input: ['text', 'image'],
+      }),
+    }));
+    expect(buildDoubaoModel( 'doubao-seed-2-1-turbo-260628'))
+      .toMatchObject({ contextWindow: 256000, maxTokens: 32768 });
+  });
+});
+
+
+describe('native Moonshot metadata',()=>{
+  it('loads K3 protocol metadata from the upgraded pi-ai catalog', async () => {
+    const model = await buildRuntimeMoonshotModel('kimi-k3');
+    expect(model).toMatchObject({
+      id: 'kimi-k3',
+      provider: 'moonshot',
+      api: 'openai-completions',
+      reasoning: true,
+      contextWindow: 1_000_000,
+      maxTokens: 131_072,
+      compat: {
+        requiresReasoningContentOnAssistantMessages: true,
+        supportsMidConvoSystemMessages: true,
+        supportsMidConvoToolAdditions: true,
+      },
+      thinkingLevelMap: { max: 'max' },
+    });
+  });
+
+  it('preserves native protocol input when Server capability fields are omitted', () => {
+    const nativeTextModel = {
+      id: 'kimi-k2.7-code',
+      name: 'Kimi K2.7 Code',
+      api: 'openai-completions',
+      provider: 'moonshotai-cn',
+      baseUrl: 'https://api.moonshot.cn/v1',
+      reasoning: false,
+      input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 262144,
+      maxTokens: 32768,
+    } as any;
+    expect(buildMoonshotModel('kimi-k2.7-code', nativeTextModel).input).toEqual(['text']);
+  });
+
+
+});
+
+describe('external-providers › Server-configured OpenAI-compatible provider', () => {
+  it('uses one endpoint with per-model text and image capabilities', async () => {
+    const users = await import('../../../../src/main/features/users');
+    const paths = await import('../../../../src/main/paths');
+    const storage = await import('../../../../src/main/storage');
+    const uid = 'externalconfiguredprovider';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              acme: [
+                {
+                  id: 'acme-vision',
+                  name: 'Acme Vision',
+                  contextWindow: 262_144,
+                  maxTokens: 16_384,
+                  supportsVision: true,
+                  maxInputImages: 12,
+                },
+                { id: 'acme-default', name: 'Acme Default' },
+                { id: 'acme-text', name: 'Acme Text', supportsVision: false },
+                {
+                  id: 'acme-explicit-text',
+                  name: 'Acme Explicit Text',
+                  supportsVision: false,
+                  maxInputImages: 0,
+                },
+                { id: 'acme-legacy-text', name: 'Acme Legacy Text', maxInputImages: 0 },
+                { id: 'glm-5.3', name: 'GLM-5.3', supportsVision: true, maxInputImages: 12 },
+              ],
+            },
+            openai_compatible_providers: {
+              acme: { label: 'Acme AI', baseUrl: 'https://api.acme.example/v1' },
+            },
+          },
+        },
+      },
+    });
+    try {
+      const vision = buildConfiguredOpenAICompatibleModel('acme', 'acme-vision');
+      const defaultVision = buildConfiguredOpenAICompatibleModel('acme', 'acme-default');
+      const textOnly = buildConfiguredOpenAICompatibleModel('acme', 'acme-text');
+      const explicitTextOnly = buildConfiguredOpenAICompatibleModel('acme', 'acme-explicit-text');
+      const legacyTextOnly = buildConfiguredOpenAICompatibleModel('acme', 'acme-legacy-text');
+      const glmGateway = buildConfiguredOpenAICompatibleModel('acme', 'glm-5.3');
+      expect(vision).toMatchObject({
+        id: 'acme-vision',
+        name: 'Acme Vision',
+        provider: 'acme',
+        api: 'openai-completions',
+        baseUrl: 'https://api.acme.example/v1',
+        input: ['text', 'image'],
+        contextWindow: 262_144,
+        maxTokens: 16_384,
+      });
+      expect(defaultVision).toMatchObject({ input: ['text', 'image'] });
+      expect(textOnly).toMatchObject({ input: ['text'] });
+      expect(explicitTextOnly).toMatchObject({ input: ['text'] });
+      expect(legacyTextOnly).toMatchObject({ input: ['text'] });
+      expect(modelInputImageLimit('acme', 'acme-vision', vision)).toBe(12);
+      expect(modelInputImageLimit('acme', 'acme-default', defaultVision)).toBe(20);
+      expect(modelInputImageLimit('acme', 'acme-text', textOnly)).toBe(0);
+      expect(modelInputImageLimit('acme', 'acme-explicit-text', explicitTextOnly)).toBe(0);
+      expect(modelInputImageLimit('acme', 'acme-legacy-text', legacyTextOnly)).toBe(0);
+      expect(glmGateway?.input).toEqual(['text', 'image']);
+      expect(modelInputImageLimit('acme', 'glm-5.3', glmGateway)).toBe(12);
+      expect(buildConfiguredOpenAICompatibleModel('acme', 'missing')).toBeNull();
+
+      coreAgentMocks.createPiProvider.mockClear();
+      await createConfiguredOpenAICompatibleProvider({
+        providerId: 'acme',
+        apiKey: 'sk-acme-valid-xxxxxxxx',
+        modelId: 'acme-vision',
+        userCacheKey: 'opaque-user-scope',
+      });
+      expect(coreAgentMocks.createPiProvider).toHaveBeenCalledWith(expect.objectContaining({
+        provider: 'acme',
+        apiKey: 'sk-acme-valid-xxxxxxxx',
+        userCacheKey: 'opaque-user-scope',
+        customModel: expect.objectContaining({ id: 'acme-vision', input: ['text', 'image'] }),
+        onPayload: repairOpenAICompatiblePayload,
+      }));
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe('public discovered catalog contracts',()=>{
+  it('applies Server limits to direct external providers before local fallbacks', async () => {
+    const users = await import('../../../../src/main/features/users');
+    const paths = await import('../../../../src/main/paths');
+    const storage = await import('../../../../src/main/storage');
+    const uid = 'externalproviderlimits';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              moonshot: [{
+                id: 'kimi-k3',
+                name: 'Kimi K3',
+                contextWindow: 1_048_576,
+                maxTokens: 131_072,
+              }],
+              deepseek: [{
+                id: 'deepseek-next',
+                name: 'DeepSeek Next',
+                contextWindow: 524_288,
+                maxTokens: 65_536,
+                maxInputImages: 8,
+              }],
+              doubao: [{
+                id: 'doubao-next',
+                name: 'Doubao Next',
+                contextWindow: 393_216,
+                maxTokens: 49_152,
+              }],
+            },
+          },
+        },
+      },
+    });
+
+    try {
+      expect(buildMoonshotModel( 'kimi-k3')).toMatchObject({
+        name: 'Kimi K3',
+        contextWindow: 1_048_576,
+        maxTokens: 131_072,
+      });
+      const deepseekNext = buildDeepSeekModel( 'deepseek-next');
+      expect(deepseekNext).toMatchObject({
+        name: 'DeepSeek Next',
+        input: ['text', 'image'],
+        contextWindow: 524_288,
+        maxTokens: 65_536,
+      });
+      expect(isSelectableModel('deepseek', 'deepseek-next')).toBe(true);
+      expect(modelInputImageLimit('deepseek', 'deepseek-next', deepseekNext)).toBe(8);
+      // A partial Server catalog must not restore the old binary-meg token
+      // window through the adapter's fallback table. Unknown ids stay conservative.
+      for (const modelId of ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-flash']) {
+        expect(buildDeepSeekModel( modelId)).toMatchObject({
+          contextWindow: 1_000_000,
+          maxTokens: 128_000,
+        });
+      }
+      expect(buildDeepSeekModel( 'deepseek-unknown')?.contextWindow).toBe(131_072);
+      expect(buildDoubaoModel( 'doubao-seed-2-1-pro-260915')).toMatchObject({
+        contextWindow: 1_000_000,
+        maxTokens: 32768,
+      });
+      expect(buildDoubaoModel( 'doubao-next')).toMatchObject({
+        name: 'Doubao Next',
+        contextWindow: 393_216,
+        maxTokens: 49_152,
+      });
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('applies explicit Server vision declarations across direct provider adapters', async () => {
+    const users = await import('../../../../src/main/features/users');
+    const paths = await import('../../../../src/main/paths');
+    const storage = await import('../../../../src/main/storage');
+    const uid = 'externalprovidervision';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              moonshot: [{ id: 'kimi-k3', name: 'Kimi K3', supportsVision: false }],
+              doubao: [{ id: 'doubao-next', name: 'Doubao Next', maxInputImages: 0 }],
+              deepseek: [
+                { id: 'deepseek-next', name: 'DeepSeek Next' },
+                { id: 'deepseek-next-text', name: 'DeepSeek Next Text', supportsVision: false },
+                {
+                  id: 'deepseek-v4-flash',
+                  name: 'DeepSeek V4 Flash',
+                  supportsVision: true,
+                },
+              ],
+            },
+          },
+        },
+      },
+    });
+    try {
+      expect(buildMoonshotModel( 'kimi-k3')?.input).toEqual(['text']);
+      expect(buildDoubaoModel( 'doubao-next')?.input).toEqual(['text']);
+      expect(buildDeepSeekModel( 'deepseek-next')?.input)
+        .toEqual(['text', 'image']);
+      expect(buildDeepSeekModel( 'deepseek-next-text')?.input)
+        .toEqual(['text']);
+      // The official known text-only alias remains authoritative even when a
+      // malformed rollout tries to enable vision for it.
+      expect(buildDeepSeekModel( 'deepseek-v4-flash')?.input)
+        .toEqual(['text']);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+});
+

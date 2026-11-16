@@ -30,4 +30,37 @@ function foreignDocxBytes(spacedBreaks) {
 }
 
 
-module.exports = { foreignDocxBytes };
+function annotatedDocxBytes(kinds, footnoteCount = 1) {
+  const zip = new AdmZip(foreignDocxBytes(true));
+  let document = zip.readAsText('word/document.xml');
+  let types = zip.readAsText('[Content_Types].xml');
+  const relationships = [];
+  for (const kind of kinds) {
+    const id = kind === 'footnote' ? 7 : 12;
+    const text = kind === 'footnote' ? 'FOOTNOTE_RECEIPT_529' : 'ENDNOTE_RECEIPT_731';
+    let notes = '';
+    for (let index = 0; index < (kind === 'footnote' ? footnoteCount : 1); index++) {
+      const noteId = id + index;
+      const noteText = index === 0 ? text : `FOOTNOTE_RECEIPT_${noteId}`;
+      document = document.replace('</w:p>', `<w:r><w:${kind}Reference w:id="${noteId}"/></w:r></w:p>`);
+      notes += `<w:${kind} w:id="${noteId}"><w:p><w:r><w:${kind}Ref/></w:r><w:r><w:t>${noteText}</w:t></w:r></w:p></w:${kind}>`;
+    }
+    zip.addFile(`word/${kind}s.xml`, Buffer.from(
+      `<?xml version="1.0"?><w:${kind}s xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">`
+      + `<w:${kind} w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:${kind}>`
+      + `<w:${kind} w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:${kind}>`
+      + notes + `</w:${kind}s>`,
+    ));
+    relationships.push(`<Relationship Id="rId${kind}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/${kind}s" Target="${kind}s.xml"/>`);
+    types = types.replace('</Types>', `<Override PartName="/word/${kind}s.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.${kind}s+xml"/></Types>`);
+  }
+  if (relationships.length) zip.addFile('word/_rels/document.xml.rels', Buffer.from(
+    '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    + relationships.join('') + '</Relationships>',
+  ));
+  zip.updateFile('word/document.xml', Buffer.from(document));
+  zip.updateFile('[Content_Types].xml', Buffer.from(types));
+  return zip.toBuffer();
+}
+
+module.exports = { foreignDocxBytes, annotatedDocxBytes };

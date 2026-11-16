@@ -134,3 +134,49 @@ describe('uniquifyPathForWrite › concurrent same-target writers', () => {
     expect(fs.readFileSync(target, 'utf8')).toBe('second try');
   });
 });
+
+it('keeps both files when a renamed destination is another concurrent writer\'s requested name', async () => {
+  const original = path.join(tmpDir, 'speech.mp3'), suffix = path.join(tmpDir, 'speech-2.mp3');
+  fs.writeFileSync(original, 'user audio');
+  let entered!: () => void, finish!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const first = uniquifyPathForWrite(original, NEVER_MINE, async decision => {
+    entered();
+    await new Promise<void>(resolve => { finish = resolve; });
+    fs.writeFileSync(decision.finalPath, 'first new voice');
+    return decision.finalPath;
+  });
+  await started;
+  const second = await uniquifyPathForWrite(suffix, NEVER_MINE, async decision => {
+    fs.writeFileSync(decision.finalPath, 'second new voice');
+    return decision.finalPath;
+  });
+  finish();
+  const one = await first;
+  expect(one).not.toBe(second);
+  expect(fs.readFileSync(original, 'utf8')).toBe('user audio');
+  expect(fs.readFileSync(one, 'utf8')).toBe('first new voice');
+  expect(fs.readFileSync(second, 'utf8')).toBe('second new voice');
+});
+
+it('cancels only the waiting writer without dispatching it or releasing the active writer', async () => {
+  const target = path.join(tmpDir, 'held.mp3');
+  let entered!: () => void, finish!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const first = uniquifyPathForWrite(target, NEVER_MINE, async decision => {
+    entered(); await new Promise<void>(resolve => { finish = resolve; });
+    fs.writeFileSync(decision.finalPath, 'first');
+  });
+  await started;
+  const stop = new AbortController(); let dispatched = false;
+  const second = uniquifyPathForWrite(target, NEVER_MINE, async () => { dispatched = true; }, stop.signal);
+  const rejected = expect(second).rejects.toThrow();
+  stop.abort(); await rejected;
+  expect(dispatched).toBe(false); expect(fs.existsSync(target)).toBe(false);
+  finish(); await first;
+  const next = await uniquifyPathForWrite(target, NEVER_MINE, async decision => {
+    fs.writeFileSync(decision.finalPath, 'next'); return decision.finalPath;
+  });
+  expect(fs.readFileSync(target, 'utf8')).toBe('first');
+  expect(fs.readFileSync(next, 'utf8')).toBe('next');
+});

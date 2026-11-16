@@ -25,7 +25,8 @@ export async function trayMenu(electron: ElectronApplication, event: 'click' | '
     finally { tray.destroy(); }
     if (!menu) throw new Error('Tray click did not open a native menu');
     (app as any).__desktopTestMenu = menu;
-    return menu.items.map((item: any) => ({ label: item.label, type: item.type, enabled: item.enabled }));
+    // Ignore native-menu layout padding when checking the localized action copy.
+    return menu.items.map((item: any) => ({ label: item.label.trimEnd(), type: item.type, enabled: item.enabled }));
   }, event);
 }
 export async function selectTrayItem(electron: ElectronApplication, index: 0 | 1) {

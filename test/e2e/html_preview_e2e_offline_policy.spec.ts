@@ -229,6 +229,7 @@ test.describe('local HTML preview', () => {
     context.on('console', onConsole);
     context.on('requestfailed', onRequestFailed);
     try {
+      const denialAfter = orkas.rendererDiagnosticCheckpoint();
       const startedAt = Date.now();
       const preview = await orkas.openPreview(() => appPage.evaluate((pathValue) => {
         void (window as any).openChatFileViewer(pathValue, 'blocking-resource-preview.html');
@@ -252,6 +253,10 @@ test.describe('local HTML preview', () => {
       expect(requestFailures.every(failure => failure.error === 'net::ERR_ABORTED'
         && failure.status === 404 && failure.responseUrl === failure.url)).toBe(true);
       expect(pageErrors).toEqual([]);
+      await orkas.acknowledgeRendererFailure({
+        surface: preview, after: denialAfter, count: 32,
+        detail: 'Failed to load resource: the server responded with a status of 404 (Not Found)',
+      });
     } finally {
       context.off('weberror', onWebError);
       context.off('response', onResponse);

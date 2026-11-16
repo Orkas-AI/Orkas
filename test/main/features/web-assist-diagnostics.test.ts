@@ -18,12 +18,14 @@ describe('local browser diagnostics', () => {
   ])('retains native exit %s/%s in local diagnostics without expanding telemetry', (reason, exitCode, safeReason, safeCode) => {
     const sender = { isDestroyed: () => false, send: vi.fn() };
     const report = createWebAssistDiagnostics();
-    report(sender, 'renderer_gone', undefined, undefined, { reason, exitCode });
-    expect(warn).toHaveBeenCalledExactlyOnceWith('browser failure', expect.objectContaining({
+    report(sender, 'renderer_gone', undefined, { reason, exitCode });
+    expect(warn).toHaveBeenCalledExactlyOnceWith('browser failure', {
+      stage: 'renderer', error_type: 'runtime', error_message: 'Browser renderer exited unexpectedly',
+      error_code: 'renderer_gone', suppressed_count: 0,
       renderer_exit_reason: safeReason, renderer_exit_code: safeCode,
-    }));
+    });
     expect(sender.send).not.toHaveBeenCalled();
-    for (let i = 0; i < 100; i++) report(sender, 'renderer_gone', undefined, undefined, { reason, exitCode });
+    for (let i = 0; i < 100; i++) report(sender, 'renderer_gone', undefined, { reason, exitCode });
     expect(warn).toHaveBeenCalledOnce();
     expect(sender.send).not.toHaveBeenCalled();
     expect(JSON.stringify(warn.mock.calls)).not.toContain('PRIVATE');
