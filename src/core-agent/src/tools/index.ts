@@ -49,7 +49,9 @@ export {
   processStopTool,
   processWriteTool,
   stopAllProcessSessions,
+  runningProcessSessions,
 } from "./process-session.js";
+export { runningCommandSessions } from "./command-sessions.js";
 export type { ProcessSessionStatus } from "./process-session.js";
 export {
   WORKSPACE_DIFF_PROVIDER_STATE_KEY,

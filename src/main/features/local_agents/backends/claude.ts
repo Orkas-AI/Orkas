@@ -505,177 +505,174 @@ export const claudeBackend: LocalBackend = {
 
     // stdout: line-buffered JSON parsing.
     const splitter = new LineSplitter();
+    const stdoutLine = (line: string): void => {
+      if (exited) return;
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let obj: any;
+      try { obj = JSON.parse(trimmed); }
+      catch {
+        // Non-JSON stdout — two distinct paths:
+        //   - Before sessionId: surface as text-delta so a pre-stream
+        //     banner / startup error still lands in the user bubble
+        //     even when the CLI never gets far enough to talk
+        //     stream-json. This is the only signal the user has when
+        //     the CLI itself failed to boot.
+        //   - After sessionId: emit as raw-line. Banner, MCP startup
+        //     warnings, --verbose debug noise — direct-terminal users
+        //     see these every run; previously we dropped them
+        //     silently after session_id was captured, which is the
+        //     "Orkas shows less than the terminal" symptom users
+        //     reported. Raw-line renders as a kind-meta row in the
+        //     process rail.
+        if (!sessionId) emit({ type: 'text-delta', text: trimmed + '\n' });
+        else emit({ type: 'raw-line', line: trimmed });
+        return;
+      }
+      streamDiagnostics?.record(obj);
+      // Side-channel: control_request needs a stdin write back AND a
+      // rail event. Handled outside mapClaudeEvent so the mapper
+      // stays a pure translator (no I/O, easier to unit-test).
+      if (obj?.type === 'control_request') {
+        const inputController = obj.request?.subtype === 'can_use_tool' && obj.request?.tool_name === 'AskUserQuestion'
+          ? new AbortController() : undefined;
+        if (inputController) userInputRequests.set(obj.request_id, inputController);
+        permissionResponseQueue = permissionResponseQueue
+          .then(() => respondToControlRequest(obj, inputController?.signal))
+          .catch((err) => {
+            log.warn('claude permission response failed', { error: logErrorSummary(err) });
+          }).finally(() => {
+            if (inputController && userInputRequests.get(obj.request_id) === inputController) {
+              userInputRequests.delete(obj.request_id);
+            }
+            for (const [id, entry] of inputCancellations) {
+              if (entry.requestId === obj.request_id) inputCancellations.delete(id);
+            }
+          });
+        return;
+      }
+      if (obj?.type === 'control_cancel_request') {
+        userInputRequests.get(obj.request_id)?.abort();
+        userInputRequests.delete(obj.request_id);
+        return;
+      }
+      // Only the result for this exact tool invocation proves the CLI has
+      // finished the declined question. Text, unrelated tool results, and
+      // successful stdin writes cannot acknowledge a cancellation.
+      if (obj?.type === 'user' && Array.isArray(obj.message?.content)) {
+        for (const part of obj.message.content) {
+          if (part?.type !== 'tool_result') continue;
+          const entry = inputCancellations.get(part.tool_use_id);
+          if (!entry) continue;
+          entry.cancellation.confirm();
+          userInputRequests.get(entry.requestId)?.abort();
+        }
+      }
+      // Side-channel: each `assistant` block carries a `message.usage`
+      // snapshot for that turn-piece. Multica accumulates these per
+      // model and reports a flat total at the end. We do the same
+      // accumulation AND additionally emit a streaming
+      // `status:'usage'` event so the rail shows a live token
+      // counter (matches the codex / opencode parity — claude only
+      // emits one usage record otherwise, at the terminal result).
+      if (obj?.type === 'assistant' && obj?.message?.usage) {
+        const inc = extractClaudeUsage({ usage: obj.message.usage, message: { model: obj.message.model } });
+        if (inc) {
+          accUsage = mergeUsage(accUsage, inc);
+          emit({ type: 'status', status: 'usage', usage: accUsage });
+        }
+      }
+      const ev = mapClaudeEvent(obj, sessionId, partialState);
+      if (streamDiagnostics && obj?.type === 'assistant' && !obj.parent_tool_use_id
+          && (ev?.events || (ev?.event ? [ev.event] : [])).some(event => event.type === 'text-delta')) {
+        streamDiagnostics.recordFallback();
+      }
+      const hadSession = !!sessionId;
+      if (ev?.captureSession && obj.session_id) sessionId = String(obj.session_id);
+      if (obj?.session_id && !sessionId) sessionId = String(obj.session_id);
+      if (!hadSession && sessionId) publishActiveIngress(true);
+      if (ev?.events) {
+        for (const event of ev.events) emit(event);
+      } else if (ev?.event) {
+        emit(ev.event);
+      }
+      if (ev?.terminal) {
+        resultStatus = ev.terminal.status;
+        resultText = ev.terminal.text;
+        // Preserve each canonical result exactly as Claude returned it. The
+        // multi-phase join adds only the boundary between turns; ordinary
+        // one-result runs must not acquire a whitespace normalization.
+        if (resultText.trim()) completedTurnTexts.push(resultText);
+        resultError = ev.terminal.error;
+        resultUsage = ev.terminal.usage as typeof resultUsage;
+        const combinedOutput = completedTurnTexts.join('\n\n');
+        const terminalExtra = {
+          output: combinedOutput,
+          finalMessageText: resultText,
+          ...(resultError ? { error: resultError, stderrTail: tail.toString() } : {}),
+          ...(resultUsage || accUsage ? { usage: resultUsage || accUsage } : {}),
+        };
+        // Partial-message support is turn-scoped inside one long-lived
+        // stream-json process. A later self-woken turn may fall back to full
+        // assistant blocks even when the previous turn streamed deltas.
+        partialState.sawTextStreamEvent = false;
+        partialState.messageId = undefined;
+        partialState.subagentMessages?.clear();
+        // Tool calls never span turns; drop any callId whose result
+        // never arrived so the map stays turn-scoped.
+        partialState.toolNamesByCallId?.clear();
+        // Only a successful foreground result can hand execution to live
+        // background work. A terminal failure must release the caller and
+        // retain its original error even if task retirement never arrives.
+        if (liveTasks.size > 0 && resultStatus === 'completed'
+            && !opts.signal.aborted && !backgroundTimedOut && !watchdog.fired()) {
+          enterBackground();
+          // `result` would otherwise be the latest activity row. Reassert the
+          // phase after it so the always-visible label tells the user why the
+          // reply remains loading even when Claude emits no task_progress.
+          const activeTaskId = liveTasks.values().next().value as string | undefined;
+          const activeTask = activeTaskId ? liveTaskDetails.get(activeTaskId) : undefined;
+          emit({
+            type: 'status',
+            status: 'background-running',
+            taskId: activeTaskId,
+            ...(activeTask?.taskType ? { taskType: activeTask.taskType } : {}),
+            ...(activeTask?.message ? { message: activeTask.message } : {}),
+          });
+        } else {
+          closingForTerminal = true;
+          if (opts.signal.aborted) {
+            finishRun('cancelled');
+          } else if (backgroundTimedOut) {
+            finishRun('timeout', {
+              error: `claude timed out: exceeded ${backgroundTimeoutMs()}ms background cap`,
+              timeoutPhase: 'background',
+              timeoutKind: 'wall',
+              stderrTail: tail.toString(),
+            });
+          } else if (watchdog.fired()) {
+            finishRun('timeout', {
+              error: `claude ${watchdog.reason()}`,
+              timeoutKind: watchdog.fired(),
+              timeoutPhase: phase,
+              stderrTail: tail.toString(),
+            });
+          } else {
+            finishRun(resultStatus, terminalExtra);
+          }
+          // The result record is the authoritative terminal boundary. Do not
+          // keep Orkas loading while an inherited stdio pipe delays the CLI
+          // process's close event.
+          reapCliAfterProtocolTerminal(child);
+        }
+      }
+    };
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
       streamDiagnostics?.beginRead(chunk.length);
-      splitter.push(chunk, line => {
-        if (exited) return;
-        const trimmed = line.trim();
-        if (!trimmed) return;
-        let obj: any;
-        try { obj = JSON.parse(trimmed); }
-        catch {
-          // Non-JSON stdout — two distinct paths:
-          //   - Before sessionId: surface as text-delta so a pre-stream
-          //     banner / startup error still lands in the user bubble
-          //     even when the CLI never gets far enough to talk
-          //     stream-json. This is the only signal the user has when
-          //     the CLI itself failed to boot.
-          //   - After sessionId: emit as raw-line. Banner, MCP startup
-          //     warnings, --verbose debug noise — direct-terminal users
-          //     see these every run; previously we dropped them
-          //     silently after session_id was captured, which is the
-          //     "Orkas shows less than the terminal" symptom users
-          //     reported. Raw-line renders as a kind-meta row in the
-          //     process rail.
-          if (!sessionId) emit({ type: 'text-delta', text: trimmed + '\n' });
-          else emit({ type: 'raw-line', line: trimmed });
-          return;
-        }
-        streamDiagnostics?.record(obj);
-        // Side-channel: control_request needs a stdin write back AND a
-        // rail event. Handled outside mapClaudeEvent so the mapper
-        // stays a pure translator (no I/O, easier to unit-test).
-        if (obj?.type === 'control_request') {
-          const inputController = obj.request?.subtype === 'can_use_tool' && obj.request?.tool_name === 'AskUserQuestion'
-            ? new AbortController() : undefined;
-          if (inputController) userInputRequests.set(obj.request_id, inputController);
-          permissionResponseQueue = permissionResponseQueue
-            .then(() => respondToControlRequest(obj, inputController?.signal))
-            .catch((err) => {
-              log.warn('claude permission response failed', { error: logErrorSummary(err) });
-            }).finally(() => {
-              if (inputController && userInputRequests.get(obj.request_id) === inputController) {
-                userInputRequests.delete(obj.request_id);
-              }
-              for (const [id, entry] of inputCancellations) {
-                if (entry.requestId === obj.request_id) inputCancellations.delete(id);
-              }
-            });
-          return;
-        }
-        if (obj?.type === 'control_cancel_request') {
-          userInputRequests.get(obj.request_id)?.abort();
-          userInputRequests.delete(obj.request_id);
-          return;
-        }
-        // Only the result for this exact tool invocation proves the CLI has
-        // finished the declined question. Text, unrelated tool results, and
-        // successful stdin writes cannot acknowledge a cancellation.
-        if (obj?.type === 'user' && Array.isArray(obj.message?.content)) {
-          for (const part of obj.message.content) {
-            if (part?.type !== 'tool_result') continue;
-            const entry = inputCancellations.get(part.tool_use_id);
-            if (!entry) continue;
-            entry.cancellation.confirm();
-            userInputRequests.get(entry.requestId)?.abort();
-          }
-        }
-        // Side-channel: each `assistant` block carries a `message.usage`
-        // snapshot for that turn-piece. Multica accumulates these per
-        // model and reports a flat total at the end. We do the same
-        // accumulation AND additionally emit a streaming
-        // `status:'usage'` event so the rail shows a live token
-        // counter (matches the codex / opencode parity — claude only
-        // emits one usage record otherwise, at the terminal result).
-        if (obj?.type === 'assistant' && obj?.message?.usage) {
-          const inc = extractClaudeUsage({ usage: obj.message.usage, message: { model: obj.message.model } });
-          if (inc) {
-            accUsage = mergeUsage(accUsage, inc);
-            emit({ type: 'status', status: 'usage', usage: accUsage });
-          }
-        }
-        const ev = mapClaudeEvent(obj, sessionId, partialState);
-        if (streamDiagnostics && obj?.type === 'assistant' && !obj.parent_tool_use_id
-            && (ev?.events || (ev?.event ? [ev.event] : [])).some(event => event.type === 'text-delta')) {
-          streamDiagnostics.recordFallback();
-        }
-        const hadSession = !!sessionId;
-        if (ev?.captureSession && obj.session_id) sessionId = String(obj.session_id);
-        if (obj?.session_id && !sessionId) sessionId = String(obj.session_id);
-        if (!hadSession && sessionId) publishActiveIngress(true);
-        if (ev?.events) {
-          for (const event of ev.events) emit(event);
-        } else if (ev?.event) {
-          emit(ev.event);
-        }
-        if (ev?.terminal) {
-          resultStatus = ev.terminal.status;
-          resultText = ev.terminal.text;
-          // Preserve each canonical result exactly as Claude returned it. The
-          // multi-phase join adds only the boundary between turns; ordinary
-          // one-result runs must not acquire a whitespace normalization.
-          if (resultText.trim()) completedTurnTexts.push(resultText);
-          resultError = ev.terminal.error;
-          resultUsage = ev.terminal.usage as typeof resultUsage;
-          const combinedOutput = completedTurnTexts.join('\n\n');
-          const terminalExtra = {
-            output: combinedOutput,
-            finalMessageText: resultText,
-            ...(resultError ? { error: resultError, stderrTail: tail.toString() } : {}),
-            ...(resultUsage || accUsage ? { usage: resultUsage || accUsage } : {}),
-          };
-          // Partial-message support is turn-scoped inside one long-lived
-          // stream-json process. A later self-woken turn may fall back to full
-          // assistant blocks even when the previous turn streamed deltas.
-          partialState.sawTextStreamEvent = false;
-          partialState.messageId = undefined;
-          partialState.subagentMessages?.clear();
-          // Tool calls never span turns; drop any callId whose result
-          // never arrived so the map stays turn-scoped.
-          partialState.toolNamesByCallId?.clear();
-          // Only a successful foreground result can hand execution to live
-          // background work. A terminal failure must release the caller and
-          // retain its original error even if task retirement never arrives.
-          if (liveTasks.size > 0 && resultStatus === 'completed'
-              && !opts.signal.aborted && !backgroundTimedOut && !watchdog.fired()) {
-            enterBackground();
-            // `result` would otherwise be the latest activity row. Reassert the
-            // phase after it so the always-visible label tells the user why the
-            // reply remains loading even when Claude emits no task_progress.
-            const activeTaskId = liveTasks.values().next().value as string | undefined;
-            const activeTask = activeTaskId ? liveTaskDetails.get(activeTaskId) : undefined;
-            emit({
-              type: 'status',
-              status: 'background-running',
-              taskId: activeTaskId,
-              ...(activeTask?.taskType ? { taskType: activeTask.taskType } : {}),
-              ...(activeTask?.message ? { message: activeTask.message } : {}),
-            });
-          } else {
-            closingForTerminal = true;
-            if (opts.signal.aborted) {
-              finishRun('cancelled');
-            } else if (backgroundTimedOut) {
-              finishRun('timeout', {
-                error: `claude timed out: exceeded ${backgroundTimeoutMs()}ms background cap`,
-                timeoutPhase: 'background',
-                timeoutKind: 'wall',
-                stderrTail: tail.toString(),
-              });
-            } else if (watchdog.fired()) {
-              finishRun('timeout', {
-                error: `claude ${watchdog.reason()}`,
-                timeoutKind: watchdog.fired(),
-                timeoutPhase: phase,
-                stderrTail: tail.toString(),
-              });
-            } else {
-              finishRun(resultStatus, terminalExtra);
-            }
-            // The result record is the authoritative terminal boundary. Do not
-            // keep Orkas loading while an inherited stdio pipe delays the CLI
-            // process's close event.
-            reapCliAfterProtocolTerminal(child);
-          }
-        }
-      });
+      splitter.push(chunk, stdoutLine);
     });
-    child.stdout.on('end', () => splitter.flush(line => {
-      if (exited) return;
-      const trimmed = line.trim();
-      if (trimmed) emit({ type: 'text-delta', text: trimmed });
-    }));
+    child.stdout.on('end', () => splitter.flush(stdoutLine));
 
     const stderrLines = new LineSplitter(64 * 1024);
     const stderrLine = (line: string): void => { if (line) emit({ type: 'stderr-line', line }); };

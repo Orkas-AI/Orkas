@@ -10,6 +10,11 @@
  */
 
 import type { AgentTool, ToolContext, ToolResult } from "./base.js";
+import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
+
+function inputError(message: string, fields: string[], reason = 'invalid_arguments'): ToolResult {
+  return parameterError(message, fields, reason, { ok: false, error: message });
+}
 
 /** Handler interface implemented by the features layer. */
 export interface MetacognitionToolHandler {
@@ -66,17 +71,11 @@ export function createMetacognitionTool(
       const content = typeof input.content === 'string' ? input.content : '';
       const unknownFields = Object.keys(input).filter((key) => !['action', 'target', 'content'].includes(key)).sort();
       if (unknownFields.length) {
-        return {
-          content: JSON.stringify({ ok: false, error: `unknown fields: ${unknownFields.join(', ')}` }),
-          isError: true,
-        };
+        return inputError(`unknown fields: ${unknownFields.join(', ')}`, unknownFields, 'unsupported_field');
       }
 
       if (target !== 'competence' && target !== 'strategies') {
-        return {
-          content: JSON.stringify({ ok: false, error: 'target must be "competence" or "strategies"' }),
-          isError: true,
-        };
+        return inputError('target must be "competence" or "strategies"', ['target'], 'invalid_value');
       }
 
       switch (action) {
@@ -88,19 +87,13 @@ export function createMetacognitionTool(
         }
         case 'write': {
           if (!content.trim()) {
-            return {
-              content: JSON.stringify({ ok: false, error: '"content" is required for write' }),
-              isError: true,
-            };
+            return inputError('"content" is required for write', ['content'], 'required');
           }
           const result = handler.write(target, content);
           return { content: JSON.stringify(result), isError: !result.ok };
         }
         default:
-          return {
-            content: JSON.stringify({ ok: false, error: `unknown action: ${action}` }),
-            isError: true,
-          };
+          return inputError(`unknown action: ${action}`, ['action'], 'invalid_value');
       }
     },
   };

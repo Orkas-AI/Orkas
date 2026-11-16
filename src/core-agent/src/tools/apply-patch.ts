@@ -1,4 +1,5 @@
 import { fileFailure, type FileFailureDiagnostic } from "./file-diagnostics.js";
+import { parameterErrorContent } from '../../../../bin/tool-parameter-errors.cjs';
 import { matchRecoveryContext } from "./match-context.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -154,7 +155,7 @@ function patchHeaderHint(header: string): string {
  * It is intentionally a general text transaction, not a coding-mode protocol. */
 export function parseApplyPatch(patch: unknown): ParsedPatchFile[] | ToolResult {
   const invalid = (code: FileFailureDiagnostic["code"], message: string, reason: FileFailureDiagnostic["reason"], facts: Omit<FileFailureDiagnostic, "code" | "reason"> = {}): ToolResult => ({
-    content: patchError(code, message), isError: true,
+    content: parameterErrorContent(message, [{ field: 'patch', reason, expected: message }], code), isError: true,
     observations: fileFailure(code, reason, { stage: "parse", ...facts }),
   });
   if (typeof patch !== "string" || !patch) {

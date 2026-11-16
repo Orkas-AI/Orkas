@@ -691,6 +691,26 @@ describe('file-tools › portable skill documents', () => {
 });
 
 describe('file-tools › read_files (rich documents prepare on first read)', () => {
+  it('reads and greps the current DOCX revision after an equal-size save preserving mtime', async () => {
+    const { tools, wsDir } = await buildTools();
+    const file = path.join(wsDir, 'current.docx');
+    const old = makeMinimalDocx({ paragraphs: ['Alpha'] });
+    const current = makeMinimalDocx({ paragraphs: ['Bravo'] });
+    expect(current.length).toBe(old.length);
+    const stamp = new Date('2026-01-01T00:00:00Z');
+    fs.writeFileSync(file, old); fs.utimesSync(file, stamp, stamp);
+    const read = getTool(tools, 'read_files'), grep = getTool(tools, 'grep_files');
+    expect((await run(read, { paths: [{ path: file }] })).content).toContain('Alpha');
+    await new Promise(r => setTimeout(r, 10));
+    fs.writeFileSync(file, current); fs.utimesSync(file, stamp, stamp);
+    const found = await run(grep, { root: file, pattern: 'Bravo' });
+    expect(found.isError).toBeFalsy(); expect(found.content).toContain('Bravo');
+    const result = await run(read, { paths: [{ path: file }] });
+    expect(result.isError).toBeFalsy(); expect(result.content).toContain('Bravo');
+    expect(result.content).not.toContain('Alpha');
+    expect(result.content).toContain('request_complete="true"');
+    expect(fs.readFileSync(file)).toEqual(current);
+  });
   it('renders image-only PDF pages for vision after reporting empty extraction, without an OCR tool', async () => {
     const { tools, wsDir } = await buildTools();
     const { PDFDocument } = await import('pdf-lib');
@@ -2948,6 +2968,51 @@ describe('file-tools › read_files metadata_only', () => {
 });
 
 describe('file-tools › search_files', () => {
+  it.each(['search_files', 'grep_files'])('keeps file and directory ignore scopes distinct across rescans (%s)', async (name) => {
+    const { tools, wsDir } = await buildTools();
+    const files = ['excluded.txt/hidden.txt', 'visible/excluded.txt', 'visible/deep/needle.txt',
+      'pkg/keep.txt', 'pkg/drop.txt', 'pkg/child/drop.txt', 'pkg/child/keep.txt', 'peer/other.txt'];
+    for (const relative of files) {
+      const file = path.join(wsDir, relative);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, 'needle\n');
+    }
+    fs.writeFileSync(path.join(wsDir, '.gitignore'), 'excluded.txt/\n');
+    fs.writeFileSync(path.join(wsDir, 'pkg', '.gitignore'), '*.txt\n!keep.txt\n');
+    const originalPath = process.env.PATH;
+    process.env.PATH = tmpDir;
+    try {
+      for (const phase of [0, 1]) {
+        if (phase === 1) fs.writeFileSync(path.join(wsDir, '.gitignore'), 'visible/\n');
+        const visible = phase === 0
+          ? ['visible/excluded.txt', 'visible/deep/needle.txt', 'pkg/keep.txt', 'pkg/child/keep.txt', 'peer/other.txt']
+          : ['excluded.txt/hidden.txt', 'pkg/keep.txt', 'pkg/child/keep.txt', 'peer/other.txt'];
+        for (const includeIgnored of [false, true]) {
+          const result = await run(getTool(tools, name), {
+            root: wsDir, query: '*.txt', pattern: 'needle', include_glob: ['*.txt'], include_ignored: includeIgnored,
+          });
+          expect(result.isError, result.content).toBeFalsy();
+          expect(result.content).toContain('backend=walk');
+          expect(result.content).toContain('complete=true');
+          const expected = (includeIgnored ? files : visible).map(relative => path.join(wsDir, relative)).sort();
+          if (name === 'search_files') {
+            const listing = searchResults(result.content);
+            expect(listing.files.map(file => path.join(listing.roots[file.root], file.path)).sort()).toEqual(expected);
+          } else {
+            expect(result.content).toContain(`${expected.length} match(es)`);
+            for (const relative of files) {
+              const absolute = path.join(wsDir, relative);
+              expect(result.content.includes(`file: ${JSON.stringify(absolute)}\n`), relative).toBe(expected.includes(absolute));
+            }
+          }
+        }
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  });
+
   it.each(['search_files', 'grep_files'])('honours trailing double-star ignores through the walk fallback (%s)', async (name) => {
     const { tools, wsDir } = await buildTools();
     const files = ['logs/today.txt', 'logs/old/jan.txt', 'logs/keep.txt', 'src/logs/a.txt',
@@ -3018,6 +3083,57 @@ describe('file-tools › search_files', () => {
     const wrong = await getTool(tools, 'read_files').execute({ paths: [{ path: current.path }] }, ctx);
     expect(wrong.isError).toBe(true);
     expect(wrong.content).toContain('E_NOT_FOUND');
+  });
+
+  it.each(['native', 'fallback'])('discovers an existing admin page outside a guessed app directory without confusing another root (%s)', async backend => {
+    const { wsDir } = await buildTools();
+    const cwd = path.join(wsDir, 'apps', 'web');
+    const relative = path.join('packages', 'control-panel', '.routes', 'AdminDashboard.tsx');
+    const otherRoot = path.join(tmpDir, 'other-project');
+    const current = path.join(wsDir, relative);
+    const decoy = path.join(otherRoot, relative);
+    const source = 'export const AdminDashboard = () => "active-project-admin-revision-7";';
+    const otherSource = 'export const AdminDashboard = () => "other-project-admin-revision-2";';
+    fs.mkdirSync(cwd, { recursive: true });
+    for (const [file, body] of [[current, source], [decoy, otherSource]]) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, body);
+    }
+    const { createFileTools } = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = createFileTools({ userId: UID, cid: CID, readOnlyExtraRoots: [otherRoot] });
+    const ctx = { workingDir: cwd, state: {} } as any;
+    const tree = fs.readdirSync(wsDir, { recursive: true }).sort();
+    const originalPath = process.env.PATH;
+    if (backend === 'fallback') process.env.PATH = tmpDir;
+    try {
+      const search = getTool(tools, 'search_files');
+      const narrow = await search.execute({ root: '.', query: 'AdminDashboard.tsx' }, ctx);
+      expect(narrow.isError, narrow.content).toBeFalsy();
+      expect(narrow.content).toContain('No matches');
+      expect(narrow.content).toContain('complete=true');
+      // A complete search in apps/web says nothing about the rest of this project.
+      const expanded = await search.execute({ root: '../..', query: 'AdminDashboard.tsx' }, ctx);
+      expect(expanded.isError, expanded.content).toBeFalsy();
+      expect(expanded.content).toContain(`backend=${backend === 'native' ? 'rg' : 'walk'}`);
+      expect(expanded.content).toContain('complete=true');
+      const selected = searchResults(expanded.content);
+      expect(selected.roots).toEqual([wsDir]);
+      expect(selected.files).toHaveLength(1);
+      expect(path.join(selected.roots[selected.files[0].root], selected.files[0].path)).toBe(current);
+      const all = searchResults((await search.execute({ query: 'AdminDashboard.tsx' }, ctx)).content);
+      expect(all.files).toHaveLength(2);
+      // Consume the actual returned read_path, retaining each root's identity.
+      for (const [file, body, wrong] of [[current, source, otherSource], [decoy, otherSource, source]]) {
+        const hit = all.files.find(f => path.join(all.roots[f.root], f.path) === file)!;
+        expect(hit, file).toBeDefined();
+        const read = await getTool(tools, 'read_files').execute({ paths: [{ path: hit.read_path }] }, ctx);
+        expect(read.isError, read.content).toBeFalsy();
+        expect(read.content).toContain(body);
+        expect(read.content).not.toContain(wrong);
+        expect(fs.readFileSync(file, 'utf8')).toBe(body);
+      }
+      expect(fs.readdirSync(wsDir, { recursive: true }).sort()).toEqual(tree);
+    } finally { process.env.PATH = originalPath; }
   });
 
   it('keeps discovered read paths subject to the existing scope check', async () => {

@@ -19,6 +19,9 @@ export class AuthError extends CoreAgentError {
   }
 }
 
+/** Host marker for a committed model call; only AgentRunner may recover it. */
+export const COMMITTED_STREAM_RATE_LIMIT_CODE = "COMMITTED_STREAM_RATE_LIMIT";
+
 export class RateLimitError extends CoreAgentError {
   public readonly retryAfterMs?: number;
 

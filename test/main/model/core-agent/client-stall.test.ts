@@ -205,6 +205,21 @@ async function drain(opts: Record<string, unknown>): Promise<{ events: DrainedEv
 }
 
 describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
+  it.each([false, true])('releases the shared run activity count after a started reply, fails=%s', async fails => {
+    const hooks = await import('../../../../src/main/model/core-agent/run-hooks');
+    expect(hooks.activeAgentRunCount()).toBe(0);
+    h.makeStream = async function* () {
+      expect(hooks.activeAgentRunCount()).toBe(1);
+      if (fails) throw new Error('Controlled provider failure');
+      yield completedEvent('done');
+    };
+    const { events } = await drain({});
+    expect(events.some(event => event.type === 'error')).toBe(fails);
+    expect(events.at(-1)?.type).toBe('done');
+    expect(hooks.activeAgentRunCount()).toBe(0);
+    expect(h.runStreamCalls).toBe(1);
+  });
+
   it.each(['wall', 'idle', 'cancel'] as const)('aborts a pending transport once on %s termination and settles the stream', async (termination) => {
     await import('../../../../src/main/model/core-agent/client');
     const transportAborted = vi.fn();
@@ -1110,6 +1125,31 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
     });
   }, 8000);
 
+  it('forwards the host-owned current user message by reference to approval tools', async () => {
+    h.makeStream = async function* () { yield completedEvent('ok'); };
+    const currentUserMessage = { text: '<msg from="user">original</msg>' };
+    await drain({ currentUserMessage });
+    expect(h.lastBuildRunnerParams?.currentUserMessage).toBe(currentUserMessage);
+    expect(h.lastRunStreamParams).not.toHaveProperty('currentUserMessage');
+  });
+
+  it('preserves the exhausted first-event timeout in the visible error and local terminal event', async () => {
+    h.makeStream = async function* () {
+      const event = completedEvent('');
+      yield { ...event, result: { ...event.result, meta: { ...event.result.meta,
+        error: { kind: 'provider_error', message: 'provider never started', code: 'PROVIDER_NO_FIRST_EVENT_TIMEOUT' },
+      } } };
+    };
+    const { events } = await drain({});
+    expect(events.filter(event => event.type === 'error')).toEqual([expect.objectContaining({
+      failureKind: 'model', failureCode: 'provider_no_first_event', failurePhase: 'provider_wait',
+    })]);
+    expect(events.find(event => event.event?.stream === 'agent_run_terminal')?.event?.data)
+      .toMatchObject({ terminal_status: 'error', error_code: 'provider_no_first_event', failure_phase: 'provider_wait' });
+    expect(h.runStreamCalls).toBe(1);
+    expect(events.at(-1)?.type).toBe('done');
+  });
+
   it('forwards the host-owned system skill allowlist to buildRunner', async () => {
     h.makeStream = () => (async function* () { yield { type: 'text_delta', text: 'ok' }; })();
     h.lastBuildRunnerParams = null;
@@ -1529,4 +1569,146 @@ it('keeps local provider failure summaries bounded, content-free and separate fr
   } });
   expect((finish.data!.diagnostics as any).providerRequestFailures).not.toHaveProperty('provider_last_failure_http_status');
   expect(JSON.stringify(h.logEntries)).not.toContain('PRIVATE_');
+});
+
+describe('local provider failure context through the model client', () => {
+  const chromiumCodes = [
+    'ERR_EMPTY_RESPONSE', 'ERR_SSL_PROTOCOL_ERROR', 'ERR_CONNECTION_CLOSED',
+    'ERR_CONNECTION_RESET', 'ERR_CONNECTION_REFUSED', 'ERR_CONNECTION_TIMED_OUT',
+    'ERR_TIMED_OUT', 'ERR_NAME_NOT_RESOLVED', 'ERR_INTERNET_DISCONNECTED',
+    'ERR_NETWORK_CHANGED', 'ERR_PROXY_CONNECTION_FAILED', 'ERR_TUNNEL_CONNECTION_FAILED',
+    'ERR_CERT_AUTHORITY_INVALID', 'ERR_CERT_DATE_INVALID', 'ERR_CERT_COMMON_NAME_INVALID',
+  ];
+  const receipt = (extra: Record<string, unknown> = {}) => ({ phase: 'after_response',
+    code: 'invalid_request_error', elapsedMs: 5, httpStatus: 400, source: 'http',
+    lastEvent: 'toolcall_delta', requestSequence: 1, aborted: false, ...extra });
+  async function reportOnce(failure: Record<string, unknown>) {
+    h.makeStream = async function* () {
+      (h.lastBuildRunnerParams!.onRequestFailure as (failure: unknown) => void)(failure);
+      yield completedEvent('recovered');
+    };
+    const { events } = await drain({});
+    expect(events.filter(event => event.type === 'error')).toEqual([]);
+    expect(events.find(event => event.type === 'final')).toMatchObject({ text: 'recovered' });
+    expect(h.runStreamCalls).toBe(1);
+    const warnings = h.logEntries.filter(entry => entry.level === 'warn');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].message).toBe('provider request failed');
+    return warnings[0].data!;
+  }
+
+  it.each(chromiumCodes)('retains %s in the local warning and run summary', async code => {
+    const data = await reportOnce(receipt({ code, source: 'transport', phase: 'before_response', httpStatus: undefined }));
+    expect(data).toMatchObject({ provider_last_failure_code: code.toLowerCase(),
+      provider_attempt_failure_count: 1, provider_request_failure_count: 1 });
+    const finish = h.logEntries.find(entry => entry.message === 'model turn finish')!.data!;
+    expect((finish.diagnostics as any).providerRequestFailures).toMatchObject({
+      provider_last_failure_code: code.toLowerCase(), provider_request_failure_count: 1,
+    });
+  });
+
+  it.each(['openai-completions', 'openai-responses'])('keeps the portable %s argument failure shape without its content', async api => {
+    const data = await reportOnce(receipt({ toolArguments: { version: 1,
+      code: 'tool_arguments_invalid', api, stop_reason: 'tool_use', stream_json: 'non_strict',
+      json_root: 'invalid_json', stream_chars: 42, stream_chunks: 2,
+      arguments: 'PRIVATE_ARGUMENT', argumentsError: 'PRIVATE_ERROR', tool: 'PRIVATE_TOOL' } }));
+    expect(data.tool_arguments).toEqual({ version: 1, code: 'tool_arguments_invalid', api,
+      stop_reason: 'tool_use', stream_json: 'non_strict', json_root: 'invalid_json',
+      stream_chars: 42, stream_chunks: 2 });
+    expect(JSON.stringify(h.logEntries)).not.toContain('PRIVATE_');
+  });
+
+  it('preserves bounded argument, Responses and budget facts through the real log redactor', async () => {
+    const rows = Array.from({ length: 4 }, (_, i) => ({ i, kind: 'reasoning', origin: 'observed',
+      source_sequence: 2, wire_status: 'in_progress', history_status: 'incomplete',
+      source_status: 'completed', source_response_status: 'completed', same_model: true,
+      source_request_ref: 'a'.repeat(32), private: 'PRIVATE_STATUS' }));
+    // An enormous history must not be traversed beyond the four-row contract.
+    Object.defineProperty(rows, 4, { get() { throw new Error('PRIVATE_EXTRA_ROW'); } });
+    rows.length = 1_000_000;
+    const data = await reportOnce(receipt({ requestRef: 'b'.repeat(32),
+      toolArguments: { version: 1, code: 'tool_arguments_invalid', api: 'openai-responses',
+        stop_reason: 'max_tokens', stream_json: 'non_strict', json_root: 'invalid_json',
+        stream_chars: 2_000_000_000, stream_chunks: 8, arguments: 'PRIVATE_ARGUMENTS' },
+      responsesStatus: { version: 1, input_count: 9, prefix_limit: 6, rejected_index: 2,
+        rejected_field: 'status', rows, private: 'PRIVATE_STATUS' },
+      contextBudget: { version: 1, estimated_input_tokens: 14_000, output_reservation: 32_000,
+        compaction_before_tokens: 28_000, compaction_after_tokens: 12_000,
+        compaction_attempts: 1, compaction_failures: 0, input_ceiling_tokens: 2_000_000_000,
+        estimate_source: 'anchored', window_source: 'catalog', emergency_result: 'not_needed',
+        private: 'PRIVATE_BUDGET' }, contextWindow: 128_000, outputLimit: 1_000,
+    }));
+    const { redact } = await vi.importActual<typeof import('../../../../src/main/logger')>('../../../../src/main/logger');
+    const [, logged] = redact(['provider request failed', data]) as [string, any];
+    expect(logged.tool_arguments).toEqual({ version: 1, code: 'tool_arguments_invalid',
+      api: 'openai-responses', stop_reason: 'max_tokens', stream_json: 'non_strict',
+      json_root: 'invalid_json', stream_chars: 1_000_000_000, stream_chunks: 8 });
+    expect(logged.responses_status).toEqual({ version: 1, input_count: 9, prefix_limit: 6,
+      rejected_index: 2, rejected_field: 'status', rows: Array.from({ length: 4 }, (_, i) => ({
+        i, kind: 'reasoning', origin: 'observed', source_sequence: 2,
+        wire_status: 'in_progress', history_status: 'incomplete', source_status: 'completed',
+        source_response_status: 'completed', same_model: true,
+      })) });
+    expect(logged.context_budget).toEqual({ version: 1, estimated_input_tokens: 14_000,
+      output_reservation: 32_000, compaction_before_tokens: 28_000, compaction_after_tokens: 12_000,
+      compaction_attempts: 1, compaction_failures: 0, input_ceiling_tokens: 1_000_000_000,
+      estimate_source: 'anchored', window_source: 'catalog', emergency_result: 'not_needed' });
+    expect(logged).toMatchObject({ context_window: 128_000, output_limit: 1_000 });
+    expect(JSON.stringify(h.logEntries)).not.toContain('PRIVATE_');
+    expect(JSON.stringify(h.logEntries)).not.toContain('a'.repeat(32));
+    expect(JSON.stringify(h.logEntries)).not.toContain('b'.repeat(32));
+    expect(data).not.toHaveProperty('request_ref');
+    const finish = h.logEntries.find(entry => entry.message === 'model turn finish')!.data!;
+    expect((finish.diagnostics as any).providerRequestFailures).not.toHaveProperty('context_budget');
+  });
+
+  it('rejects unregistered enums and non-numeric look-alikes without logging their content', async () => {
+    const data = await reportOnce(receipt({
+      toolArguments: { version: 1, code: 'tool_arguments_invalid', api: 'PRIVATE_API',
+        stop_reason: 'PRIVATE_REASON', stream_json: 'PRIVATE_JSON', json_root: 'PRIVATE_ROOT',
+        stream_chars: 'PRIVATE_COUNT', stream_chunks: -1 },
+      responsesStatus: { version: 1, input_count: -1, prefix_limit: Infinity,
+        rejected_index: 'PRIVATE_INDEX', rejected_field: 'PRIVATE_FIELD', rows: [null, [], {
+          kind: 'PRIVATE_KIND', origin: 'PRIVATE_ORIGIN', i: 1.5, source_sequence: -1,
+          wire_status: 'PRIVATE_STATE', same_model: 'PRIVATE_BOOL', source_request_ref: 'c'.repeat(32),
+        }] },
+      contextBudget: { version: 1, estimated_input_tokens: 'PRIVATE_COUNT', output_reservation: -1,
+        estimate_source: 'PRIVATE_SOURCE', emergency_result: 'PRIVATE_RESULT' },
+      contextWindow: 'PRIVATE_WINDOW', outputLimit: Infinity,
+    }));
+    expect(data.tool_arguments).toEqual({ version: 1, code: 'tool_arguments_invalid',
+      api: 'unknown', stop_reason: 'unknown', stream_json: 'unobserved', json_root: 'unobserved' });
+    expect(data.responses_status).toEqual({ version: 1,
+      rows: [{ kind: 'other', origin: 'unobserved', wire_status: 'other_string' }] });
+    expect(data.context_budget).toEqual({ version: 1 });
+    expect(data).not.toHaveProperty('context_window');
+    expect(data).not.toHaveProperty('output_limit');
+    expect(JSON.stringify(h.logEntries)).not.toMatch(/PRIVATE_|cccccccccccccccccccccccccccccccc/);
+  });
+
+  it.each([null, [], 'PRIVATE_TEXT', { version: 2 }, { version: '1', code: 'tool_arguments_invalid' }])
+  ('omits malformed diagnostic envelopes (%#)', async value => {
+    const data = await reportOnce(receipt({ toolArguments: value, responsesStatus: value, contextBudget: value }));
+    for (const key of ['tool_arguments', 'responses_status', 'context_budget']) expect(data[key]).toBeUndefined();
+    expect(JSON.stringify(h.logEntries)).not.toContain('PRIVATE_');
+  });
+
+  it('does not inspect optional failure context during cancellation', async () => {
+    const read = vi.fn(() => { throw new Error('PRIVATE_CANCELLED_CONTEXT'); });
+    const metadata = new Proxy({}, { get: read });
+    const data = await reportOnce(receipt({ aborted: true, toolArguments: metadata,
+      responsesStatus: metadata, contextBudget: metadata, contextWindow: 128_000, outputLimit: 1_000 }));
+    expect(read).not.toHaveBeenCalled();
+    for (const key of ['tool_arguments', 'responses_status', 'context_budget', 'context_window', 'output_limit'])
+      expect(data[key]).toBeUndefined();
+    expect(data.aborted).toBe(true);
+    const finish = h.logEntries.find(entry => entry.message === 'model turn finish')!.data!;
+    expect((finish.diagnostics as any).providerRequestFailures).toEqual({ provider_request_abort_count: 1 });
+  });
+
+  it('keeps diagnostic accessors from changing a recovered model outcome', async () => {
+    const metadata = new Proxy({}, { get() { throw new Error('PRIVATE_METADATA'); } });
+    const data = await reportOnce(receipt({ toolArguments: metadata, responsesStatus: metadata, contextBudget: metadata }));
+    expect(JSON.stringify(data)).not.toContain('PRIVATE_');
+  });
 });

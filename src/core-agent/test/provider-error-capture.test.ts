@@ -2,8 +2,31 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createProviderErrorCapture } from '../src/providers/provider-error-capture.js';
 import { providerErrorFacts, providerRequestWasRejected } from '../src/shared/provider-error-facts.js';
 import { classifyRetryableError } from '../src/shared/errors.js';
+import { wrapErrorForTest } from '../src/providers/pi-provider.js';
 
 afterEach(() => vi.useRealTimers());
+
+it('retains HTTP Retry-After through SDK error flattening', async () => {
+  const capture = createProviderErrorCapture();
+  await capture.wrapFetch(async () => new Response('{"error":{"code":"rate_limit_exceeded"}}', {
+    status: 429, headers: { 'content-type': 'application/json', 'retry-after': '7' },
+  }))('https://fixture.invalid');
+  expect(wrapErrorForTest(capture.cause(), 'fixture')).toMatchObject({ retryAfterMs: 7000 });
+});
+
+it('retains only the numeric recovery delay from a structured SSE rejection', async () => {
+  const capture = createProviderErrorCapture('openai-responses');
+  const body = 'event: response.failed\ndata: ' + JSON.stringify({ type: 'response.failed', response: {
+    error: { code: 'rate_limit_exceeded', retry_after_ms: 25_000, message: 'private fixture diagnostic' },
+  } }) + '\n\n';
+  const response = await capture.wrapFetch(async () => new Response(body, {
+    headers: { 'content-type': 'text/event-stream' },
+  }))('https://fixture.invalid');
+  expect(await response.text()).toBe(body);
+  const cause = capture.cause();
+  expect(wrapErrorForTest(cause, 'fixture')).toMatchObject({ retryAfterMs: 25_000 });
+  expect(JSON.stringify(cause)).not.toContain('private fixture diagnostic');
+});
 
 describe('SDK error evidence retention', () => {
   it('distinguishes actual upstream rejection from a local payload failure', async () => {
@@ -46,6 +69,22 @@ describe('SDK error evidence retention', () => {
     }
     await capture.wrapFetch(async () => new Response('{}'))('https://fixture.invalid');
     expect(capture.rejectedInputIndex).toBeUndefined();
+  });
+  it('retains safe id/status field positions without retaining arbitrary parameters or changing HTTP errors', async () => {
+    const capture = createProviderErrorCapture();
+    for (const param of ['input[0].id', 'input[999999].status', 'input[1000000].id', 'input[-1].id',
+      'input[1].id.extra', 'input[1].PRIVATE', 'PRIVATE', ['input[0].id']]) {
+      const body = JSON.stringify({ error: { code: 'invalid_request_error', param, message: 'PRIVATE' } });
+      const response = new Response(body, { status: 400, headers: { 'content-type': 'application/json' } });
+      await capture.wrapFetch(async () => response)('https://fixture.invalid');
+      const expected = param === 'input[0].id' ? { index: 0, field: 'id' }
+        : param === 'input[999999].status' ? { index: 999999, field: 'status' } : undefined;
+      expect((capture as any).rejectedInput).toEqual(expected);
+      expect(classifyRetryableError(capture.cause())).toBeNull();
+      expect(await response.text()).toBe(body);
+    }
+    await capture.wrapFetch(async () => new Response('{}'))('https://fixture.invalid');
+    expect((capture as any).rejectedInput).toBeUndefined();
   });
   it('retains the original transport cause and isolates concurrent requests', async () => {
     const first = createProviderErrorCapture(), second = createProviderErrorCapture();

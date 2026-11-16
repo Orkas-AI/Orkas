@@ -1,5 +1,6 @@
 export type {
   LLMProvider,
+  ProviderContextBudget,
   ProviderFactory,
   CompletionParams,
   CompletionResult,

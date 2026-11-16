@@ -243,6 +243,45 @@ if (${version === '2.0.0'} && (args.includes('--include-hook-events') || args.in
     expect(done.sessionId).toBe('sess-fake');
   });
 
+  it.each(['success', 'failure', 'truncated'])('preserves the final stdout record at EOF: %s', async scenario => {
+    const prefix = scenario === 'success' ? '' : [
+      { type: 'system', subtype: 'init', session_id: 'eof-session' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'Partial reply.' }] } },
+    ].map(record => JSON.stringify(record) + '\n').join('');
+    const final = scenario === 'truncated' ? '{"type":"result","result":' : JSON.stringify({
+      type: 'result', subtype: 'success', session_id: 'eof-session',
+      result: scenario === 'success' ? '  Final 中文🙂 reply.  ' : '',
+      ...(scenario === 'failure' ? { is_error: true, errors: ['Fixture connection failed'] } : {}),
+      usage: { input_tokens: 7, output_tokens: 3 },
+    });
+    const fake = writeNodeExecutable(tmpDir, 'claude-eof', `
+process.stdin.once('data', () => {
+  process.stdout.write(${JSON.stringify(prefix)});
+  const bytes = Buffer.from(${JSON.stringify(final)});
+  const split = bytes.indexOf(Buffer.from('中')) + 1;
+  process.stdout.write(bytes.subarray(0, split));
+  setTimeout(() => process.stdout.end(bytes.subarray(split), () => process.exit(0)), 20);
+});`);
+    const events: any[] = [];
+    await claudeBackend.run({ binPath: fake, prompt: 'Complete the EOF fixture', cwd: tmpDir,
+      signal: new AbortController().signal, timeoutMs: 3_000, onEvent: event => events.push(event) });
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: 'done', sessionId: 'eof-session' });
+    if (scenario === 'success') {
+      expect(events.at(-1)).toMatchObject({ status: 'completed', output: '  Final 中文🙂 reply.  ',
+        finalMessageText: '  Final 中文🙂 reply.  ', usage: { input: 7, output: 3 } });
+      expect(events.filter(event => event.type === 'text-delta')).toEqual([]);
+    } else {
+      expect(events.filter(event => event.type === 'text-delta').map(event => event.text)).toEqual(['Partial reply.']);
+      expect(events.at(-1).status).toBe('failed');
+      if (scenario === 'failure') {
+        expect(events.at(-1)).toMatchObject({ error: 'Fixture connection failed', usage: { input: 7, output: 3 } });
+      } else {
+        expect(events).toContainEqual({ type: 'raw-line', line: final });
+      }
+    }
+  });
+
   it('classifies non-JSON stdout before and after session initialization', async () => {
     const fake = writeNodeExecutable(tmpDir, 'claude', `
 process.stdin.once('data', () => {

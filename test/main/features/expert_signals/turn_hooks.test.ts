@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -28,6 +28,12 @@ async function wait() { return new Promise((r) => setTimeout(r, 30)); }
 afterEach(() => { _clearAllPending(); });
 
 describe('onAgentTurnEnd › objective events', () => {
+  it('keeps app conversation excerpts out of ordinary learning signals', async () => {
+    const cid = `app_${'a'.repeat(64)}_once_${'b'.repeat(32)}`;
+    onAgentTurnEnd({ uid: UID, cid, actorId: 'agent_x', isCommander: false,
+      agentMsg: { id: 'app-reply', text: 'Private app output' }, errText: 'E_FILE: private app execution detail' });
+    await wait();expect(await querySignals({ cid })).toEqual([]);
+  });
   it('does not emit failure signals on a clean turn', async () => {
     const cid = 'cid-tha-a1';
     onAgentTurnEnd({
@@ -167,4 +173,33 @@ it('a user reply cancels only its conversation inactivity observation', async ()
   await new Promise(resolve => setTimeout(resolve, 80));
   expect(await querySignals({ cid: 'replied-conversation', types: ['silence', 'accept', 'correction', 'reject', 'edit'] })).toEqual([]);
   expect(await querySignals({ cid: 'still-inactive', types: ['silence'] })).toHaveLength(1);
+});
+
+
+it.each(['once', 'retain'])('isolates app signal writes and inactivity timers at every public entry (%s)', async lifetime => {
+  const { emitSignal, querySignalsForUser } = await import('../../../../src/main/features/expert_signals');
+  const { createSkillTurnBuffer } = await import('../../../../src/main/features/expert_signals/turn_hooks');
+  const app = `app_${'c'.repeat(64)}_${lifetime}_${'d'.repeat(32)}`;
+  const ordinary = `app-notes-${lifetime}`;
+  const input = (cid: string) => ({
+    type: 'tool_failure' as const, source: 'event' as const, cid, aid: 'agent_x',
+    turn_id: 'isolated-turn', context_ref: { msg_ids: ['isolated-message'] }, extractor_version: 'fixture@1',
+    metadata: { error_excerpt: 'A local operation failed.' },
+  });
+  emitSignal(UID, input(app));
+  emitSignal(UID, input(ordinary));
+  const buffer = createSkillTurnBuffer();
+  buffer.recordAdvertised('example-skill', 'A.custom');
+  buffer.recordInvoked('example-skill', 'A.custom', 'read_file');
+  buffer.drainAndEmit({ uid: UID, cid: app, aid: 'agent_x', turn_id: 'skill-turn', msg_ids: ['skill-message'], errText: 'A permanent fixture failure.' });
+  const timer = vi.spyOn(globalThis, 'setTimeout');
+  try {
+    onAgentTurnEnd({ uid: UID, cid: app, actorId: 'agent_x', isCommander: false,
+      agentMsg: { id: 'app-message', text: 'An app-private answer.' }, errText: 'E_FILE: app-private detail' });
+    expect(timer).not.toHaveBeenCalled();
+  } finally { timer.mockRestore(); }
+  await vi.waitFor(async () => expect(await querySignalsForUser(UID, { cid: ordinary })).toHaveLength(1));
+  await wait();
+  expect(await querySignalsForUser(UID, { cid: app })).toEqual([]);
+  expect((await querySignalsForUser(UID, { cid: ordinary }))[0]).toMatchObject({ type: 'tool_failure', turn_id: 'isolated-turn' });
 });

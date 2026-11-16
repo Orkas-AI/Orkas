@@ -4,6 +4,7 @@ import * as path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import sharp from 'sharp';
+import { runProgramWithTools } from '../../../helpers/programmatic-tools';
 
 const UID = 'html-preview-tool-user';
 const CID = 'html-preview-tool-conversation';
@@ -211,6 +212,126 @@ async function buildTool(rendered: {
   };
 }
 
+function nextModelImages(result: Awaited<ReturnType<typeof runProgramWithTools>>) {
+  return result.requests[1].messages.flatMap((message: any) =>
+    Array.isArray(message.content) ? message.content.flatMap((block: any) =>
+      block.type === 'tool_result' ? block.images ?? [] : []) : []);
+}
+
+describe('programmatic html_preview', () => {
+  it.each([
+    [{ path: 'index.html' }, [{ name: 'desktop', width: 1440, height: 900 }], 0, { fileViewer: true }],
+    [{ path: 'index.html', target: 'mobile', screenshots: true, interactions: false,
+      mobile: { width: 360, height: 780 } }, [{ name: 'mobile', width: 360, height: 780 }], 1,
+    { fileViewer: true, interactions: false }],
+    [{ path: 'index.html', target: 'responsive', screenshots: true,
+      desktop: { width: 1280, height: 720 }, mobile: { width: 390, height: 844 } },
+    [{ name: 'desktop', width: 1280, height: 720 }, { name: 'mobile', width: 390, height: 844 }], 2,
+    { fileViewer: true }],
+  ])('preserves direct parameters, defaults and model-visible pixels for %j', async (input, viewports, count, options) => {
+    const { tool, workspace, render, screenshots } = await buildTool();
+    const source = '<!doctype html><button>Review</button>';
+    fs.writeFileSync(path.join(workspace, 'index.html'), source);
+    const result = await runProgramWithTools([tool], `
+      const preview = await tools.html_preview(${JSON.stringify(input)});
+      if (!preview.ok) throw Error(preview.content);
+      if ('images' in preview) throw Error('Image bytes entered the guest');
+      text(preview.content);
+    `, workspace, UID);
+    expect(result.isError, result.content).not.toBe(true);
+    expect(render).toHaveBeenCalledExactlyOnceWith(path.join(workspace, 'index.html'), viewports, {}, options);
+    expect(result.content).toContain('"ok":true');
+    const images = nextModelImages(result);
+    expect(images).toHaveLength(count);
+    for (const [index, image] of images.entries()) {
+      await expectLosslessImageMatch(image, screenshots[input.target === 'mobile' ? 1 : index]);
+    }
+    expect(fs.readFileSync(path.join(workspace, 'index.html'), 'utf8')).toBe(source);
+  });
+
+  it('previews the ID returned by native creation in the same program and delivers one app', async () => {
+    const { workspace, render, screenshots } = await buildTool();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const created = vi.fn();
+    const tools = createLocalTools({ userId: UID, cid: CID, onArtifactCreated: created,
+      artifactInteractionSmoke: async () => ({ ok: true, blockers: [], warnings: [] }) });
+    const result = await runProgramWithTools(tools, `
+      const app = await tools.create_artifact({ title: 'Preview app', files: [
+        { path: 'index.html', content: '<!doctype html><button>Review</button>' }
+      ] });
+      if (!app.ok) throw Error(app.content);
+      const id = app.content.split('(id ')[1].split(')')[0];
+      const preview = await tools.html_preview({ artifact_id: id, screenshots: true });
+      if (!preview.ok) throw Error(preview.content);
+      text(preview.content);
+    `, workspace, UID);
+    expect(result.isError, result.content).not.toBe(true);
+    expect(created).toHaveBeenCalledOnce();
+    expect(result.content).toContain(`"artifact_id":"${created.mock.calls[0][0].id}"`);
+    expect(result.content).not.toContain(root);
+    expect(render).toHaveBeenCalledOnce();
+    expect(render.mock.calls[0][3]).toMatchObject({ bridgeJavaScript: expect.any(String) });
+    expect(fs.existsSync(path.join(workspace, 'index.html'))).toBe(false);
+    expect(nextModelImages(result)).toHaveLength(1);
+    await expectLosslessImageMatch(nextModelImages(result)[0], screenshots[0]);
+  });
+
+  it.each([
+    [{}, 'E_BAD_INPUT'],
+    [{ path: 'index.html', artifact_id: 'app' }, 'E_BAD_INPUT'],
+    [{ artifact_id: 'unknown-app' }, 'E_HTML_PREVIEW_NOT_FOUND'],
+    [{ path: 'index.html', target: 'tablet' }, 'E_BAD_INPUT'],
+    [{ path: 'index.html', screenshots: 'true' }, 'E_BAD_INPUT'],
+    [{ path: 'index.html', interactions: 'false' }, 'E_BAD_INPUT'],
+    [{ path: 'index.html', target: 'mobile', mobile: { width: 360.5 } }, 'E_BAD_INPUT'],
+    [{ path: 'missing.html' }, 'E_HTML_PREVIEW_NOT_FOUND'],
+    [{ path: '../outside.html' }, 'E_PATH_OUT_OF_SCOPE'],
+  ])('returns a recoverable child failure without rendering an invalid request: %j', async (input, code) => {
+    const { tool, workspace, render } = await buildTool();
+    fs.writeFileSync(path.join(workspace, 'index.html'), '<!doctype html><button>Review</button>');
+    fs.writeFileSync(path.join(root, 'outside.html'), '<!doctype html><button>Private</button>');
+    const result = await runProgramWithTools([tool], `
+      const rejected = await tools.html_preview(${JSON.stringify(input)});
+      if (rejected.ok || !rejected.content.includes(${JSON.stringify(code)})) throw Error('Invalid request accepted');
+      const recovered = await tools.html_preview({ path: 'index.html' });
+      if (!recovered.ok) throw Error(recovered.content);
+      text('Recovered from ' + ${JSON.stringify(code)});
+    `, workspace, UID);
+    expect(result.isError, result.content).not.toBe(true);
+    expect(result.content).toContain(`Recovered from ${code}`);
+    expect(render).toHaveBeenCalledOnce();
+    expect(nextModelImages(result)).toEqual([]);
+  });
+
+  it.each(['failed-checks', 'browser-unavailable'])('withholds misleading screenshots after %s and permits an explicit recovery', async failure => {
+    const { tool, workspace, render } = await buildTool();
+    fs.writeFileSync(path.join(workspace, 'index.html'), '<!doctype html><button>Review</button>');
+    if (failure === 'failed-checks') {
+      const original = render.getMockImplementation()!;
+      render.mockImplementationOnce(async (...args) => {
+        const result = await original(...args);
+        result.evidence.ok = false;
+        result.evidence.blockers = ['mobile: horizontal overflow is 28px'];
+        return result;
+      });
+    } else render.mockRejectedValueOnce(new Error('E_HTML_PREVIEW_BROWSER_UNAVAILABLE: browser unavailable'));
+    const result = await runProgramWithTools([tool], `
+      const failed = await tools.html_preview({ path: 'index.html', screenshots: true });
+      if (failed.ok) throw Error('Failed preview reported success');
+      text(failed.content);
+      const recovered = await tools.html_preview({ path: 'index.html' });
+      if (!recovered.ok) throw Error(recovered.content);
+      text('Recovery passed');
+    `, workspace, UID);
+    expect(result.isError, result.content).not.toBe(true);
+    expect(result.content).toContain(failure === 'failed-checks'
+      ? 'deterministic_checks_failed' : 'E_HTML_PREVIEW_BROWSER_UNAVAILABLE');
+    expect(result.content).toContain('Recovery passed');
+    expect(render).toHaveBeenCalledTimes(2);
+    expect(nextModelImages(result)).toEqual([]);
+  });
+});
+
 describe('html_preview tool', () => {
   it('publishes a desktop default while keeping responsive review opt-in in the model-facing schema', async () => {
     const { tool } = await buildTool();
@@ -272,6 +393,28 @@ describe('html_preview tool', () => {
     expect(fs.existsSync(path.join(path.dirname((entry as { absPath: string }).absPath), '__orkas', 'bridge.js'))).toBe(false);
     expect(result.content).not.toContain(root);
     await expectLosslessImageMatch(result.images![0], screenshots[0]);
+  });
+
+  it.each(['', 'index.html'])('recovers an ambiguous source without recreating or changing the app (%j)', async alternate => {
+    const { tool, render, context } = await buildTool();
+    const artifacts = await import('../../../../src/main/features/chat_artifacts');
+    const created = await artifacts.createArtifact(UID, CID, '', {
+      files: [{ path: 'index.html', content: '<!doctype html><button>Retained app</button>' }],
+    });
+    if (!created.ok) throw new Error('fixture creation failed');
+    const entry = artifacts.resolveArtifactFilePath(UID, CID, created.artifactId, 'index.html');
+    if (!entry.ok) throw new Error('fixture resolution failed');
+    const bytes = fs.readFileSync(entry.absPath);
+    const rejected = await tool.execute({ artifact_id: created.artifactId, path: alternate }, context);
+    expect(rejected.isError).toBe(true);
+    expect(rejected.content).toContain('exactly one');
+    expect(render).not.toHaveBeenCalled();
+    const recovered = await tool.execute({ artifact_id: created.artifactId, screenshots: true }, context);
+    expect(recovered.isError).toBeUndefined();
+    expect(JSON.parse(recovered.content)).toMatchObject({ ok: true, artifact_id: created.artifactId });
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(recovered.images).toHaveLength(1);
+    expect(fs.readFileSync(entry.absPath)).toEqual(bytes);
   });
 
   it.each([

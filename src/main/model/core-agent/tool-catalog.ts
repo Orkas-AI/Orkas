@@ -26,6 +26,7 @@ export type ToolGroupId =
   | 'office.presentation'
   | 'office.pdf'
   | 'library'
+  | 'apps'
   | 'web'
   | 'media'
   | 'media.image'
@@ -105,6 +106,7 @@ export const TOOL_GROUPS: readonly ToolGroupEntry[] = [
   { id: 'office.presentation', title: 'Presentation', summary: 'Create, inspect, edit, and review PPTX files.', parent: 'office', activation: 'loadable', agentDependency: true },
   { id: 'office.pdf', title: 'PDF', summary: 'Create, edit, and render PDF files.', parent: 'office', activation: 'loadable', agentDependency: true },
   { id: 'library', title: 'Library', summary: 'List, search, and read the user Library.', activation: 'loadable', agentDependency: true },
+  { id: 'apps', title: 'Apps', summary: 'Discover applications and save or update task applications.', activation: 'loadable', agentDependency: false },
   { id: 'web', title: 'Web', summary: 'Search or fetch web evidence, control the visible task browser, and verify citations.', activation: 'loadable', agentDependency: true },
   { id: 'media', title: 'Media', summary: 'Generate images, video, and speech or use an owned Studio runtime.', activation: 'loadable', agentDependency: true },
   { id: 'media.image', title: 'Image media', summary: 'Generate images or use the ImageStudio-owned runtime.', parent: 'media', activation: 'loadable', agentDependency: true },
@@ -162,8 +164,8 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   // path scope, permission, approval, sandbox, and command-safety enforcement.
   { name: 'write_file', loadGroups: ['workspace.write.output'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Write a text file.' },
   { name: 'append_file', loadGroups: ['workspace.write.output'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Append a checked chunk to a text file.' },
-  { name: 'publish_outputs', loadGroups: ['workspace.write.output'], summary: 'Declare final file deliverables for the turn.' },
-  { name: 'library_save', loadGroups: ['workspace.write.output'], permission: 'localExec', summary: 'Save a produced project file into the durable user Library.' },
+  { name: 'publish_outputs', loadGroups: ['workspace.write.output'], programmatic: { mode: 'allow' }, summary: 'Declare final file deliverables for the turn.' },
+  { name: 'library_save', loadGroups: ['workspace.write.output'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Save a produced project file into the durable user Library.' },
   { name: 'apply_patch', loadGroups: ['workspace.write.edit'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Apply a transactional patch to one or more files.' },
   { name: 'edit_file', loadGroups: ['workspace.write.edit'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Replace exact text in an existing file.' },
   { name: 'delete_file', loadGroups: ['workspace.write.edit'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Delete one file, requesting confirmation only outside the active workspace scope.' },
@@ -172,17 +174,17 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'bash', loadGroups: ['workspace.execute.command', 'workspace.execute.session'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Run shell commands or Python/Node scripts for deterministic local and batch processing.' },
   { name: 'process_session', loadGroups: ['workspace.execute.command', 'workspace.execute.session'], permission: 'localExec', summary: 'Manage a persistent process session.' },
   { name: 'interactive_cli', loadGroups: ['workspace.execute.session'], permission: 'localExec', summary: 'Manage a live user-input CLI session.' },
-  { name: 'create_artifact', loadGroups: ['workspace.artifact'], permission: 'localExec', summary: 'Build an interactive HTML/CSS/JS artifact.' },
-  { name: 'html_preview', loadGroups: ['workspace.artifact'], permission: 'localExec', summary: 'Audit local HTML or a current-conversation app at desktop or mobile targets.' },
+  { name: 'create_artifact', loadGroups: ['workspace.artifact'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Build an interactive HTML/CSS/JS artifact.' },
+  { name: 'html_preview', loadGroups: ['workspace.artifact'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Audit local HTML or a current-conversation app at desktop or mobile targets.' },
 
-  { name: 'create_pdf', loadGroups: ['office.pdf'], permission: 'localExec', summary: 'Create a PDF from Markdown or HTML.' },
-  { name: 'edit_pdf', loadGroups: ['office.pdf'], permission: 'localExec', summary: 'Edit PDF pages, overlays, watermarks, and forms.' },
+  { name: 'create_pdf', loadGroups: ['office.pdf'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Create a PDF from Markdown or HTML.' },
+  { name: 'edit_pdf', loadGroups: ['office.pdf'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Edit PDF pages, overlays, watermarks, and forms.' },
   { name: 'pdf_render', loadGroups: ['office.pdf'], permission: 'localExec', programmatic: { mode: 'conditional', policy: 'workspace-read' }, summary: 'Render a PDF page for visual review.' },
-  { name: 'create_docx', loadGroups: ['office.word'], permission: 'localExec', summary: 'Create a Word document.' },
-  { name: 'create_xlsx', loadGroups: ['office.spreadsheet'], permission: 'localExec', summary: 'Create an Excel workbook.' },
-  { name: 'create_pptx', loadGroups: ['office.presentation'], permission: 'localExec', summary: 'Create a PowerPoint deck.' },
+  { name: 'create_docx', loadGroups: ['office.word'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Create a Word document.' },
+  { name: 'create_xlsx', loadGroups: ['office.spreadsheet'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Create an Excel workbook.' },
+  { name: 'create_pptx', loadGroups: ['office.presentation'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Create a PowerPoint deck.' },
   { name: 'office_read', loadGroups: ['office.word', 'office.spreadsheet', 'office.presentation'], permission: 'localExec', programmatic: { mode: 'conditional', policy: 'workspace-read' }, summary: 'Inspect an Office document with editable paths.' },
-  { name: 'edit_office', loadGroups: ['office.word', 'office.spreadsheet', 'office.presentation'], permission: 'localExec', summary: 'Edit an existing Word, Excel, or PowerPoint file; optionally returns a first-page PNG with preview:true.' },
+  { name: 'edit_office', loadGroups: ['office.word', 'office.spreadsheet', 'office.presentation'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Edit an existing Word, Excel, or PowerPoint file; optionally returns a first-page PNG with preview:true.' },
   { name: 'office_review', loadGroups: ['office.word', 'office.spreadsheet', 'office.presentation'], permission: 'localExec', programmatic: { mode: 'conditional', policy: 'workspace-read' }, summary: 'Validate and render an Office file for review.' },
 
   { name: 'library', loadGroups: ['library'], programmatic: { mode: 'allow' }, summary: 'List, search, or read the user Library.' },
@@ -193,7 +195,7 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
 
   { name: 'generate_image', loadGroups: ['media.image'], permission: 'localExec', summary: 'Generate an image into the workspace.' },
   { name: 'image_studio', loadGroups: ['media.image'], permission: 'localExec', ownerAgent: IMAGE_STUDIO_AGENT_ID, summary: 'ImageStudio-owned QA and export runtime.' },
-  { name: 'generate_video', loadGroups: ['media.video'], permission: 'localExec', summary: 'Generate or edit a short video into the workspace.' },
+  { name: 'generate_video', loadGroups: ['media.video'], permission: 'localExec', summary: 'Generate or edit a video into the workspace.' },
   { name: 'video_studio', loadGroups: ['media.video'], permission: 'localExec', ownerAgent: VIDEO_STUDIO_AGENT_ID, summary: 'VideoStudio-owned production runtime.' },
   { name: 'generate_speech', loadGroups: ['media.speech'], permission: 'localExec', summary: 'Generate speech audio.' },
 
@@ -207,7 +209,7 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'cross_session_memory', loadGroups: ['context'], summary: 'Read or update cross-session memory.' },
   { name: 'metacognition', loadGroups: ['context'], summary: 'Read or update agent competence and strategies.' },
   { name: 'project_instructions', loadGroups: ['context'], summary: 'Update project standing instructions.' },
-  { name: 'todo_tasks', loadGroups: ['management.todos'], programmatic: { mode: 'allow' }, summary: "Manage the global to-do list outside a project; project to-dos require a conversation in that project." },
+  { name: 'todo_tasks', loadGroups: ['management.todos'], programmatic: { mode: 'allow' }, summary: "Manage global to-dos or this conversation's project backlog; Commander can also use the project it just created here." },
   // Commander-only: it relocates this conversation, which is an orchestration
   // decision, and `run_program` gets no access to that side effect.
   { name: 'project_setup', loadGroups: ['management.projects'], agentAssignable: false, summary: "Create or rename a project; move this conversation into or out of one." },
@@ -222,7 +224,9 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'marketplace_search', loadGroups: ['management.marketplace'], programmatic: { mode: 'conditional', policy: 'catalog-read' }, summary: 'Search the marketplace.' },
   { name: 'marketplace_request_install', loadGroups: ['management.marketplace'], summary: 'Request a user-confirmed marketplace installation.' },
   { name: 'auto_tasks', loadGroups: ['management.automation'], programmatic: { mode: 'allow' }, summary: 'Manage scheduled automations.' },
-  { name: 'open_app_view', loadGroups: ['management.app'], summary: 'Stage a click-to-open navigation card to an app surface.' },
+  { name: 'open_app_view', loadGroups: ['management.app'], programmatic: { mode: 'allow' }, summary: 'Stage a click-to-open navigation card to an app surface.' },
+  { name: 'list_apps', loadGroups: ['apps'], agentAssignable: false, summary: 'Discover built-in and saved applications with exact per-app navigation targets.' },
+  { name: 'save_app', loadGroups: ['apps'], agentAssignable: false, summary: 'Inspect a task application destination; save, update, or copy it without publishing.' },
   { name: 'app_health', loadGroups: ['management.app'], programmatic: { mode: 'allow' }, summary: 'Read-only Orkas diagnosis: model, connectors, knowledge base, and running conversation status.' },
 
   { name: 'tool_load', loadGroups: ['runtime'], summary: 'Activate one or more loadable tool groups.' },

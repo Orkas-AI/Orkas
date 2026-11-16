@@ -6,6 +6,7 @@ import { PDFDocument, StandardFonts, degrees } from 'pdf-lib';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createPdfTools } from '../../../../src/main/model/core-agent/pdf-tools';
+import { runProgramWithTools } from '../../../helpers/programmatic-tools';
 
 let root = '';
 let written: string[] = [];
@@ -43,6 +44,23 @@ afterEach(() => {
 });
 
 describe('PDF built-in tools', () => {
+  it('edits a PDF through a program without replacing its source and keeps the native output callback', async () => {
+    const source = path.join(root, 'source.pdf');
+    await makePdf(source, [300, 400]);
+    const original = fs.readFileSync(source);
+    const result = await runProgramWithTools([tool('edit_pdf')], `
+      const result = await tools.edit_pdf({ action: 'extract_pages', input_path: 'source.pdf', output_path: 'final.pdf', pages: [2] });
+      if (!result.ok) throw Error(result.content);
+      text('PDF edited.');
+    `, root);
+    expect(result.isError).not.toBe(true);
+    expect(written).toEqual([path.join(root, 'final.pdf')]);
+    const final = await PDFDocument.load(fs.readFileSync(written[0]));
+    expect(final.getPageCount()).toBe(1);
+    expect(final.getPage(0).getWidth()).toBe(400);
+    expect(fs.readFileSync(source)).toEqual(original);
+  });
+
   it('uses the default render scale for out-of-range values without changing the selected page', async () => {
     await makePdf(path.join(root, 'source.pdf'), [300, 400]);
     const render = tool('pdf_render');

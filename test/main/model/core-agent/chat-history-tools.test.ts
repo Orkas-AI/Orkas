@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { Compile } from 'typebox/compile';
+import { validateToolArguments } from '@earendil-works/pi-ai';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 
 vi.mock('../../../../src/main/logger', () => ({
@@ -919,12 +919,15 @@ describe('chat-history-tools › shape', () => {
     const { buildPiContextForTest } = await import('../../../../src/core-agent/src/providers/pi-provider');
     const { toToolDefinition } = await import('../../../../src/core-agent/src/tools');
     const providerContext = buildPiContextForTest([], undefined, [toToolDefinition(tool)]);
-    const schema = Compile(JSON.parse(JSON.stringify(providerContext.tools![0].parameters)));
+    const providerTool = { ...providerContext.tools![0], parameters: JSON.parse(JSON.stringify(providerContext.tools![0].parameters)) };
+    const validate = (args: Record<string, unknown>) => validateToolArguments(providerTool, {
+      type: 'toolCall', id: 'schema-probe', name: providerTool.name, arguments: args,
+    });
     const scope = currentOnly ? 'current' : 'all';
     const search = { action: 'search', scope, search: { query: 'contractword', k: 2 } };
     const read = { action: 'read', scope, ...(currentOnly ? {} : { cid: 'sibling' }), read: { page: { mode: 'latest', count: 1 } } };
     for (const valid of [search, read]) {
-      expect(schema.Check(valid), JSON.stringify(valid)).toBe(true);
+      expect(validate(valid), JSON.stringify(valid)).toEqual(valid);
       const result = await tool.execute(valid, ctxFor());
       expect(result.isError).toBeFalsy();
       expect(result.content).toContain('contractword');
@@ -944,8 +947,8 @@ describe('chat-history-tools › shape', () => {
       expect(result.isError).toBe(true);
       expect(result.content).toMatch(/unsupported_search_selector|unsupported_fields/);
     }
-    expect(schema.Check({ ...search, action: 'invalid' })).toBe(false);
-    expect(schema.Check({action: 'search', scope})).toBe(true);
+    expect(() => validate({ ...search, action: 'invalid' })).toThrow(/Validation failed/);
+    expect(validate({ action: 'search', scope })).toEqual({ action: 'search', scope });
     expect((await tool.execute({action: 'search', scope, search: {}}, ctxFor())).isError).toBe(true);
   });
 

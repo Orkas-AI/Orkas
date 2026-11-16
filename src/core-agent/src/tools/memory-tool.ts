@@ -12,6 +12,11 @@
 
 import type { AgentTool, ToolContext, ToolResult } from "./base.js";
 import { createHash } from "node:crypto";
+import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
+
+function inputError(message: string, fields: string[], reason = 'invalid_arguments'): ToolResult {
+  return parameterError(message, fields, reason, { ok: false, error: message });
+}
 
 /** Which store a memory op targets. `agent` is bound by the host to the CALLING
  *  agent (the LLM cannot reach another agent's store); `project` is bound to
@@ -150,22 +155,19 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
       if (allowedFields) {
         const unrelated = Object.keys(input).filter((key) => !['action', 'target', 'content', 'old_text', 'expected_revision', 'operations'].includes(key));
         if (unrelated.length) {
-          return {
-            content: JSON.stringify({ ok: false, error: `fields not allowed for ${action}: ${unrelated.sort().join(', ')}` }),
-            isError: true,
-          };
+          return inputError(`fields not allowed for ${action}: ${unrelated.sort().join(', ')}`, unrelated, 'unsupported_field');
         }
       }
 
       if (action === 'add' && input.old_text != null && (typeof input.old_text !== 'string' || input.old_text.trim())) {
-        return { content: JSON.stringify({ ok: false, error: 'add cannot match old_text; use replace to change an existing entry' }), isError: true };
+        return inputError('add cannot match old_text; use replace to change an existing entry', ['old_text'], 'conflict');
       }
       const ignoredFields = allowedFields
         ? Object.keys(input).filter((key) => !allowedFields.has(key)).sort()
         : [];
 
       if (!tiers.includes(target)) {
-        return { content: JSON.stringify({ ok: false, error: `target must be one of: ${tiers.map(t => `"${t}"`).join(', ')}` }), isError: true };
+        return inputError(`target must be one of: ${tiers.map(t => `"${t}"`).join(', ')}`, ['target'], 'invalid_value');
       }
 
       if (projectReadOnly && target === 'project' && action !== 'list') {
@@ -183,23 +185,23 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
           result = await handler.batch(target, input.expected_revision, input.operations, _ctx.signal);
           break;
         case 'add':
-          if (!content.trim()) return { content: JSON.stringify({ ok: false, error: '"content" is required for add' }), isError: true };
+          if (!content.trim()) return inputError('"content" is required for add', ['content'], 'required');
           result = await handler.add(target, content, _ctx.signal);
           break;
         case 'replace':
-          if (!oldText.trim()) return { content: JSON.stringify({ ok: false, error: '"old_text" is required for replace' }), isError: true };
-          if (!content.trim()) return { content: JSON.stringify({ ok: false, error: '"content" is required for replace' }), isError: true };
+          if (!oldText.trim()) return inputError('"old_text" is required for replace', ['old_text'], 'required');
+          if (!content.trim()) return inputError('"content" is required for replace', ['content'], 'required');
           result = await handler.replace(target, oldText, content, _ctx.signal);
           break;
         case 'remove':
-          if (!oldText.trim()) return { content: JSON.stringify({ ok: false, error: '"old_text" is required for remove' }), isError: true };
+          if (!oldText.trim()) return inputError('"old_text" is required for remove', ['old_text'], 'required');
           result = await handler.remove(target, oldText);
           break;
         case 'list':
           result = handler.list(target);
           break;
         default:
-          return { content: JSON.stringify({ ok: false, error: `unknown action: ${action}` }), isError: true };
+          return inputError(`unknown action: ${action}`, ['action'], 'invalid_value');
       }
 
       return {

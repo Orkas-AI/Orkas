@@ -15,6 +15,7 @@ import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { Worker } from 'node:worker_threads';
+import { parameterErrorContent } from '../../../../bin/tool-parameter-errors.cjs';
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
 import { createLogger } from '../../logger';
 import { fileEditLock } from '../../util/locks';
@@ -246,11 +247,12 @@ function toolResultActionRequestError(
     const ignored = action === 'read' ? ['query'] : ['cursor', 'max_tokens'];
     const unexpected = Object.keys(item).filter((key) => !allowed.has(key) && !ignored.includes(key)).sort();
     if (!unexpected.length) continue;
-    return error(
-      'E_BAD_INPUT',
+    return { content: parameterErrorContent(
       `tool_result(${action}) request ${index + 1}: unsupported field(s): ${unexpected.join(', ')}. `
       + 'Use only the fields advertised for the selected action.',
-    );
+      unexpected.map(field => ({ field: `requests[${index}].${field}`, reason: 'unsupported_field',
+        expected: `Allowed fields: ${[...allowed].join(', ')}. Unused compatibility fields: ${ignored.join(', ')}.` })),
+    ), isError: true };
   }
   return null;
 }
@@ -1129,6 +1131,7 @@ function budgetError(): ReturnType<typeof error> {
 }
 
 function error(code: string, message: string): { content: string; isError: true } {
+  if (code === 'E_BAD_INPUT') return { content: parameterErrorContent(message), isError: true };
   return { content: `<tool-error code="${code}">${message}</tool-error>`, isError: true };
 }
 

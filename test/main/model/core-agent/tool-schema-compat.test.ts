@@ -81,12 +81,18 @@ describe('Chat Completions root-schema compatibility through the real SDK', () =
   it.each(['complete', 'stream'] as const)('admits common and runtime tools on %s and rejects root or nested unions', async mode => {
     // Historical root rejection plus a stricter nested-union compatibility
     // target. Nested rejection is a negative control, not a production trace.
+    // The provider must preserve the exact host-supplied names, including the
+    // newly approved local list_apps schema; catalog inventory has its own gate.
+    const expectedNames = definitions().map(tool => tool.name);
     const requestFetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
       const payload = JSON.parse(String(init?.body));
-      expect(payload.tools).toHaveLength(43);
+      expect(payload.tools.map((tool: any) => tool.function.name)).toEqual(expectedNames);
       expect(payload.tools.map((tool: any) => tool.function.name)).toEqual(expect.arrayContaining([
-        'skill_manage', 'tool_result', 'todo_tasks', 'run_program', 'cross_session_memory', 'create_xlsx', 'auto_tasks',
+        'skill_manage', 'tool_result', 'todo_tasks', 'run_program', 'cross_session_memory', 'create_xlsx', 'auto_tasks', 'list_apps', 'save_app',
       ]));
+      const saving = payload.tools.find((tool: any) => tool.function.name === 'save_app').function.parameters;
+      expect(saving.properties.action.description).toBe('Both actions require exactly one source: artifact_id or path. Inspect returns the bound saved destination and its revision without saving.');
+      expect(saving.properties.artifact_id.description).toBe('Application artifact ID in the current conversation.');
       const invalid = payload.tools.some((tool: any) => {
         const schema = tool.function.parameters;
         return schema.type !== 'object' || containsUnion(schema)
