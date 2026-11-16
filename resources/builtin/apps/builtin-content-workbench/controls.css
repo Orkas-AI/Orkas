@@ -1,0 +1,120 @@
+/* Generated from desktop AiSelect; run node scripts/update-builtin-app-controls.cjs. */
+/* ── Custom dropdown (AiSelect) ────────────────────────────────────────── */
+.ai-select {
+  position: relative;
+  display: inline-block;
+  min-width: 180px;
+  font-size: 13px;
+  font-family: inherit;
+}
+.ai-select-trigger {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  background: #fff;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  color: #111827;
+  transition: border-color .15s, box-shadow .15s;
+}
+.ai-select-trigger:hover { border-color: #cbd5e1; }
+.ai-select.open .ai-select-trigger,
+.ai-select-trigger:focus {
+  border-color: var(--primary, #2563eb);
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(37,99,235,.12);
+}
+.ai-select-label {
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ai-select-label.placeholder { color: var(--muted); }
+.ai-select-label > span:last-child,
+.ai-select-item-label > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ai-select-caret {
+  flex: 0 0 auto;
+  color: #6b7280;
+  transition: transform .15s;
+}
+.ai-select.open .ai-select-caret { transform: rotate(180deg); }
+.ai-select-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  /* Base layer for body-portaled popovers. `_aiSelectMount` also raises
+     this dynamically against currently open app overlays. */
+  --orkas-ui-layer: overlay;
+  z-index: 14000;
+  background: #fff;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  box-shadow: 0 10px 24px rgba(15,23,42,.12);
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 4px;
+}
+.ai-select-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.ai-select-item.hover,
+.ai-select-item:hover { background: #f3f4f6; }
+.ai-select-item.disabled {
+  cursor: default;
+  opacity: .58;
+}
+.ai-select-item.disabled.hover,
+.ai-select-item.disabled:hover { background: transparent; }
+.ai-select-item.active {
+  background: rgba(37,99,235,.08);
+  color: var(--primary, #2563eb);
+}
+.ai-select-item-label {
+  font-size: 13px;
+  color: #111827;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ai-select-item.is-action { margin-top:4px; border-top:1px solid var(--border); border-radius:0 0 6px 6px; }
+.ai-select-item.is-action .ai-select-option-icon { color:var(--text-2); }
+.ai-select-item.active .ai-select-item-label { color: var(--primary, #2563eb); font-weight: 500; }
+.ai-select-option-icon {
+  display: inline-flex;
+  color: #d97706;
+}
+.ai-select-svg-icon {
+  width: 14px;
+  height: 14px;
+}
+.ai-select-item-hint {
+  font-size: 11px;
+  color: var(--muted);
+}
+.ai-select-empty {
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+

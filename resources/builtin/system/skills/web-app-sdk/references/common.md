@@ -4,8 +4,9 @@ The generated API reference includes the exact version-1 data definition schema.
 Use stable table/field IDs. Renaming a display name preserves data; removal,
 constraint/type changes and incompatible references fail migration.
 
-Records have a platform-generated id and UTC createdAt; do not redeclare these
-names in table fields. Values are finite safe
+Records have platform-generated `id` and UTC `createdAt` fields. Do not define
+these names in custom table `fields` or include them in `access.insert`.
+Values are finite safe
 numbers, booleans, UTF-8 strings, JSON objects/arrays or null on nullable fields.
 Timestamp fields use UTC ISO strings, normalized to millisecond precision.
 Omitted fields use explicit defaults or remain absent. Query comparisons use
@@ -14,16 +15,18 @@ UTF-8 record bytes meter the online 20 MiB limit, including id/createdAt. JSON
 null and absent fields both match a null filter. User-provided SQL is rejected.
 
 Queries, counts and aggregates apply the declared read fields and readFilters.
-A query's selected fields, filters and non-id ordering require access.read;
-createdAt ordering requires it too. Explicit query fields determine the returned
-projection: granting read access alone does not add a field to that projection.
-For example, reading message text and creation time in newest-first order:
+Every selected or visitor-filtered field must be in `access.read`, including
+`id` and `createdAt`; otherwise the whole query fails with `E_PERMISSION`.
+Ordering by `id` alone is allowed without that grant; selecting or filtering it
+still requires the grant. Other ordering fields, including `createdAt`, require
+read access. Omitted query `fields` defaults to `access.read`; explicit `fields`
+returns only that selection. For example, reading IDs, text and creation time:
 
 ```json
 {
-  "access": { "read": ["body", "createdAt"], "insert": ["body"] },
+  "access": { "read": ["id", "body", "createdAt"], "insert": ["body"] },
   "query": {
-    "table": "messages", "fields": ["body", "createdAt"],
+    "table": "messages", "fields": ["id", "body", "createdAt"],
     "order": { "field": "createdAt", "direction": "desc" }
   }
 }
@@ -40,8 +43,7 @@ requestId deduplicates the same insert across reopening; conflicting reuse fails
 Bounded retention covers the latest 2048 requests. Show an explicit outcome when
 a retry is outside this window. Runtime update/delete are not supported in v1.
 
-Personal desktop sync restores local data on another device; it never migrates
-online data. Previews use temporary records. Handle unavailable/busy/permission/
+Previews use temporary records. Handle unavailable/busy/permission/
 capacity conditions visibly; do not fabricate successful records.
 
 Use host.getContext().language for labels, errors, empty states, accessible names

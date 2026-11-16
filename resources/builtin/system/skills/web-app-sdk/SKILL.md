@@ -10,15 +10,19 @@ Omit `create_artifact.appType` to inherit that platform binding. In ordinary
 conversations, new apps default to local; use web only when the user requests it.
 Editing retains the original type. Converting requires a new app identity.
 
-Read [the common data contract](references/common.md), then the appropriate
-reference before choosing APIs:
+When editing an existing app, inspect its source and `orkas-app.json` first.
+Changes to only presentation (titles, text or styles) that preserve existing
+SDK calls, data definitions and capabilities do not need the API references or starter.
+For new apps, or before choosing or changing SDK APIs, data definitions or capabilities,
+read [the common data contract](references/common.md), then the matching references:
 
-- Local: [local guidance](references/local.md), [API contract](references/api.json)
-  and [starter](assets/starter/index.html). Local host JSON/files retain their
-  200 MiB ceiling and account-sync meaning.
-- Web: [web guidance](references/web.md), [API contract](references/web-api.json)
-  and [starter](assets/web/index.html). Apply this contract during generation,
-  preview, unpublished desktop use and online use.
+- Local: [local guidance](references/local.md), [API contract](references/api.json),
+  [starter page](assets/starter/index.html) and
+  [declaration](assets/starter/orkas-app.json). Local host JSON/files retain their
+  200 MiB ceiling.
+- Web: [web guidance](references/web.md), [API contract](references/web-api.json),
+  [starter page](assets/web/index.html) and [declaration](assets/web/orkas-app.json).
+  Apply this contract during generation, preview, unpublished desktop use and online use.
 
 Build through `create_artifact` with a complete top-level index.html and relative
 bundled paths. Include `orkas-app.json` in that same call, declaring every SDK

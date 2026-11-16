@@ -19,6 +19,7 @@
         ],
         "access": {
           "read": [
+            "id",
             "body"
           ],
           "insert": [

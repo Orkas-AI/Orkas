@@ -31,6 +31,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await drainMainRuntimeForTest();
+  vi.restoreAllMocks();
   if (previousWorkspace === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = previousWorkspace;
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -105,3 +106,23 @@ it('refuses private paths before resolving data or opening a native dialog',asyn
   }
   expect(dialog.showSaveDialog).not.toHaveBeenCalled();
 });
+
+
+it('offers and completes the bound untyped file update locally while retaining its records', async () => {
+  const { payload, app, records } = await sourceWithData();
+  const metadata = path.join(tmpDir, UID, 'cloud/saved_apps', app.id, '__orkas-meta.json');
+  const value = JSON.parse(fs.readFileSync(metadata, 'utf8')); delete value.appType;
+  const before = JSON.stringify(value); fs.writeFileSync(metadata, before);
+  expect(await invoke('savedApps.inspectBundleFromPath', payload)).toMatchObject({
+    ok: true, canSave: true, target: { appId: app.id },
+  });
+  expect((await invoke('savedApps.inspectBundleFromPath', payload)).target.appType).toBeUndefined();
+  expect(fs.readFileSync(metadata, 'utf8')).toBe(before);
+  // Keep the compatible data declaration; the edit changes only the source HTML.
+  fs.copyFileSync(path.join(path.dirname(metadata), 'orkas-app.json'), path.join(path.dirname(payload.path), 'orkas-app.json'));
+  expect(await invoke('savedApps.saveFromPath', payload)).toMatchObject({ ok: true, id: app.id });
+  expect(fs.readFileSync(path.join(path.dirname(metadata), 'index.html'), 'utf8')).toContain('Updated');
+  expect(JSON.parse(fs.readFileSync(metadata, 'utf8')).appType).toBe('local');
+  expect(await records()).toEqual({ records: [{ body: 'KEEP' }] });
+});
+
