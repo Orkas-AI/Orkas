@@ -68,6 +68,15 @@ jobs:
           test/renderer/cli-account-usage.test.ts
           test/renderer/local-agents-status.test.ts
           test/renderer/agent-detail-return-navigation.test.ts
+
+      - name: Prepare the declared Chromium test browser
+        run: node node_modules/playwright/cli.js install chromium --only-shell
+      - name: Verify unread task status geometry and sidebar transitions
+        run: >-
+          npm run test:e2e --
+          test/e2e/sidebar_e2e_badges.spec.ts
+          test/e2e/ai_select_e2e_geometry.spec.ts
+
       - name: Verify OpenCode stream termination and recovery
         run: >-
           npm run test:js -- --maxWorkers=1
@@ -181,3 +190,32 @@ jobs:
         run: >-
           npm run test:js -- --maxWorkers=1
           test/main/features/video_studio_contrast.test.ts
+
+      - name: Verify local media Markdown boundaries and recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/util/chat-media-url.test.ts
+          test/main/util/chat-media-protocol.test.ts
+          test/main/util/history-media.test.ts
+          test/main/features/conversation-history-cache.test.ts
+          test/renderer/utils-autolink.test.ts
+          test/renderer/conversation-video-error-recovery.test.ts
+      - name: Verify media persistence and history reload
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/group_chat/bus-integration.test.ts
+          -t "generated-media URL freshness"
+
+      - name: Prepare the declared Python runtime for legacy spreadsheet coverage
+        run: node bin/ensure-runtime.cjs --kind python --root resources/runtime
+      - name: Verify single-owner attachment paste and recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/chat_attachments.test.ts
+          test/renderer/chat-rich-composer-paste.test.ts
+          test/renderer/chat-rich-composer-newline.test.ts
+          test/renderer/conversation-attachment-drop-route.test.ts
+          test/renderer/project-chat-attachment-binding.test.ts
+          test/renderer/conversation-submit-attach-guards.test.ts
+      - name: Type-check portable attachment journeys
+        run: npm run test:e2e:typecheck

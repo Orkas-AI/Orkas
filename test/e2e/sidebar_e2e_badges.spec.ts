@@ -223,10 +223,11 @@ test('background CLI questions show attention in every sidebar copy and clear af
 
 test('task status stays at the trailing edge beside the menu when replies become unread', async ({ page }, info) => {
   await setup(page, 0);
+  await page.addScriptTag({ path: path.join(renderer, 'modules/cli_async_input.js') });
   await page.addScriptTag({ path: path.join(renderer, 'modules/task-unread.js') });
   const index = fs.readFileSync(path.join(renderer, 'index.html'), 'utf8');
   const sidebar = index.slice(index.indexOf('<aside class="sidebar">'), index.indexOf('</aside>') + 8);
-  const locales = Object.fromEntries(['zh', 'en'].map(lang => [lang,
+  const locales = Object.fromEntries(['zh', 'en', 'ar'].map(lang => [lang,
     JSON.parse(fs.readFileSync(path.join(renderer, 'locales', `${lang}.json`), 'utf8'))]));
   await page.evaluate(({ sidebar, locales }) => {
     const w = window as any;
@@ -258,12 +259,18 @@ test('task status stays at the trailing edge beside the menu when replies become
       const dot = row.querySelector('.task-unread-dot');
       const actions = row.querySelector('.conv-item-actions')!;
       const gap = parseFloat(getComputedStyle(row).columnGap);
+      const rtl = getComputedStyle(row).direction === 'rtl';
+      const rowRect = row.getBoundingClientRect();
+      const actionRect = actions.getBoundingClientRect();
+      const labelRect = label?.getBoundingClientRect();
+      const titleRect = title.getBoundingClientRect();
+      const dotRect = dot?.getBoundingClientRect();
       return {
         cid: (item as HTMLElement).dataset.cid,
-        statusGap: label ? actions.getBoundingClientRect().left - label.getBoundingClientRect().right - gap : 0,
-        dotGap: dot ? dot.getBoundingClientRect().left - title.getBoundingClientRect().right - gap : 0,
+        statusGap: labelRect ? (rtl ? labelRect.left - actionRect.right : actionRect.left - labelRect.right) - gap : 0,
+        dotGap: dotRect ? (rtl ? titleRect.left - dotRect.right : dotRect.left - titleRect.right) - gap : 0,
         titleWidth: title.getBoundingClientRect().width,
-        overflow: actions.getBoundingClientRect().right - row.getBoundingClientRect().right,
+        overflow: Math.max(rowRect.left - actionRect.left, actionRect.right - rowRect.right),
       };
     }));
     for (const row of rows) {
@@ -273,10 +280,11 @@ test('task status stays at the trailing edge beside the menu when replies become
       expect(row.overflow, `${row.cid}: no row overflow`).toBeLessThanOrEqual(1);
     }
   };
-  for (const [lang, width, height, sidebarWidth] of [['zh', 1280, 800, 180], ['en', 800, 600, 280]] as const) {
+  for (const [lang, width, height, sidebarWidth] of [['zh', 1280, 800, 180], ['en', 800, 600, 280], ['ar', 1000, 700, 280]] as const) {
     await page.setViewportSize({ width, height });
     await page.evaluate(({ lang, sidebarWidth }) => {
       const w = window as any;
+      document.documentElement.setAttribute('dir', lang === 'ar' ? 'rtl' : 'ltr');
       document.documentElement.style.setProperty('--sidebar-width', `${sidebarWidth}px`);
       w.renderLayout(lang);
     }, { lang, sidebarWidth });

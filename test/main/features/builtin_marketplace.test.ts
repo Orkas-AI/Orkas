@@ -696,6 +696,49 @@ describe('builtin marketplace seed', () => {
       expect(outcome).toMatchObject({ error: { code: 'E_PATH_OUT_OF_SCOPE' } });
       expect(fs.readFileSync(path.join(local, 'agent.json'), 'utf8')).toBe(oldAgent);
       expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+      expect((await installs.readInstalls('u1')).agents.find(row => row.id === TEST_AGENT_ID)?.version).toBe('1.0.0');
+      expect(fs.readdirSync(path.dirname(local)).filter(name => name.startsWith('.' + TEST_AGENT_ID + '.install-'))).toEqual([]);
+      fs.unlinkSync(link);
+      const retried = await seed.seedBuiltinMarketplaceForUser('u1');
+      expect(retried.seeded_agents).toBe(1);
+      expect(JSON.parse(fs.readFileSync(path.join(local, 'agent.json'), 'utf8')).version).toBe('2.0.0');
+      expect(fs.readFileSync(current, 'utf8')).toBe('foreign-owned bytes');
+    } finally { fs.rmSync(foreign, { recursive: true, force: true }); }
+  });
+
+  it.each(['ancestor', 'leaf'] as const)('protects foreign bytes when pruning a stale managed %s link', async location => {
+    writeBuiltinAgent(TEST_AGENT_ID, { version: '2.0.0', name: 'Writer', category: 'general' });
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await installs.addAgentInstall('u1', { id: TEST_AGENT_ID, version: '1.0.0', create_uid: '0', default_install: true,
+      published_at: 0, agent_json_url: '', agent_skills_bundle_url: '', seed_source: 'builtin' });
+    const local = paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID);
+    fs.mkdirSync(path.join(local, 'skills'), { recursive: true });
+    const oldAgent = JSON.stringify({ agent_id: TEST_AGENT_ID, version: '1.0.0', name: 'Old Writer' });
+    fs.writeFileSync(path.join(local, 'agent.json'), oldAgent);
+    fs.writeFileSync(path.join(local, '_install.json'), JSON.stringify({ version: '1.0.0', seed_source: 'builtin',
+      builtin_files: ['agent.json', 'skills/retired/SKILL.md'] }));
+    const foreign = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-prune-foreign-'));
+    const outside = path.join(foreign, 'SKILL.md');
+    fs.writeFileSync(outside, 'foreign-owned bytes');
+    const link = path.join(local, 'skills/retired');
+    if (location === 'ancestor') fs.symlinkSync(foreign, link, process.platform === 'win32' ? 'junction' : 'dir');
+    else {
+      fs.mkdirSync(link); fs.symlinkSync(outside, path.join(link, 'SKILL.md'));
+    }
+    try {
+      const outcome = await seed.seedBuiltinMarketplaceForUser('u1').then(value => ({ value }), error => ({ error }));
+      expect(fs.readFileSync(outside, 'utf8')).toBe('foreign-owned bytes');
+      if (location === 'ancestor') {
+        expect(outcome).toMatchObject({ error: { code: 'E_PATH_OUT_OF_SCOPE' } });
+        expect(fs.readFileSync(path.join(local, 'agent.json'), 'utf8')).toBe(oldAgent);
+        expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+      } else {
+        expect(outcome).toMatchObject({ value: { seeded_agents: 1 } });
+        expect(fs.existsSync(link)).toBe(false);
+        expect(JSON.parse(fs.readFileSync(path.join(local, 'agent.json'), 'utf8')).version).toBe('2.0.0');
+      }
     } finally { fs.rmSync(foreign, { recursive: true, force: true }); }
   });
 

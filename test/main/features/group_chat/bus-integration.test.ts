@@ -1448,6 +1448,33 @@ describe('group_chat bus integration › delegation prose does not control execu
 });
 
 describe('group_chat bus integration › generated-media URL freshness', () => {
+  it('keeps an emphasized video link renderable after persistence and history reload', async () => {
+    const chats = await import('../../../../src/main/features/chats');
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID, { kind: 'normal' });
+    cidsToDrop.add(cid);
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const storage = await import('../../../../src/main/storage');
+    const mediaUrls = await import('../../../../src/main/util/chat-media-url');
+    const file = path.join(tmpDir, 'workspace', 'main-v2.mp4');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'video-bytes');
+    const text = `**[AI 发展史 · v2](${mediaUrls.versionedChatMediaLocalUrl(file)})**`;
+    const assistant = await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'commander', text, forceTo: ['user'] });
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text, forceTo: ['user'] });
+    expect(assistant.text).toBe(text);
+    const historyFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const saved = await storage.readJsonl<any>(historyFile);
+    expect(saved.map(row => row.text)).toEqual([text, text]);
+    const { renderMarkdown } = require('../../../../src/renderer/modules/utils.js');
+    for (let reopen = 0; reopen < 2; reopen++) {
+      const page = await chats.getMessagesPage(TEST_UID, cid, 10);
+      expect(page.history.map(row => row.text)).toEqual([text, text]);
+      expect(renderMarkdown(page.history[0].text)).toContain('<video');
+    }
+    expect((await storage.readJsonl<any>(historyFile)).map(row => row.text)).toEqual([text, text]);
+  });
+
   it('versions assistant URLs at persistence while preserving user-authored text', async () => {
     const cid = newCid();
     const bus = await import('../../../../src/main/features/group_chat/bus');

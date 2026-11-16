@@ -164,6 +164,18 @@ describe('logger › redact', () => {
     expect(redact({ authorization: `Basic ${value}` })).toEqual({ authorization: '***REDACTED***' });
   });
 
+  it('keeps escaped quoted credentials out of nested strings and Error snapshots', async () => {
+    const { redact } = await import('../../src/main/logger');
+    const message = String.raw`request failed password="private\" tail" status=401`;
+    const error = new Error(message);
+    error.stack = `Error: ${message}\n    at request`;
+    const out = redact({ errors: [error], detail: 'token="unfinished private value' }) as any;
+    expect(out.errors[0].message).toBe('request failed password=*** status=401');
+    expect(out.errors[0].stack).toBe('Error: request failed password=*** status=401\n    at request');
+    expect(out.detail).toBe('token=***');
+    expect(error.message).toBe(message);
+  });
+
   it('masks proxy authorization fields before serializing structured log records', async () => {
     const { redact } = await import('../../src/main/logger');
     for (const field of ['Proxy-Authorization', 'proxy_authorization', 'proxyAuthorization']) {

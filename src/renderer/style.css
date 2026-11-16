@@ -704,10 +704,10 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 /* Keep the trailing status and menu together when the title stops growing. */
 .sidebar-conversation-nav .conv-item.has-unread .conv-item-status-label,
 .sidebar-conversation-nav .conv-item.has-unread .conv-item-actions {
-  margin-left: auto;
+  margin-inline-start: auto;
 }
 .sidebar-conversation-nav .conv-item.has-unread .conv-item-status-label ~ .conv-item-actions {
-  margin-left: 0;
+  margin-inline-start: 0;
 }
 .project-name-unread-group {
   display: flex;

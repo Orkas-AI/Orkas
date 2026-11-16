@@ -51,6 +51,28 @@ function loadPasteRouter(projectId = '') {
 }
 
 describe('chat rich composer attachment paste routing', () => {
+  it('uploads one pasted file once when EditorView already owns the rich composer', () => {
+    const input = Object.assign(new EventTarget(), { dataset: {}, matches: () => true });
+    const uploads: unknown[] = [];
+    const files = [{ name: 'clipboard.png' }];
+    input.addEventListener('paste', event => {
+      event.preventDefault();
+      uploads.push(['conversation-1', files, 'paste']);
+    });
+    const context: any = {
+      document: { querySelector: () => input },
+      _chatAttachUpload: (...args: unknown[]) => uploads.push(args),
+    };
+    vm.createContext(context);
+    vm.runInContext(extractFunction('_bindChatPasteAttach'), context);
+    context._bindChatPasteAttach('#chat-input', () => 'conversation-1');
+    const event = new Event('paste', { cancelable: true });
+    Object.assign(event, { clipboardData: { files } });
+    input.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(uploads).toEqual([['conversation-1', files, 'paste']]);
+  });
+
   it('keeps native textareas pasting files once and leaves plain text to the browser', () => {
     const input = Object.assign(new EventTarget(), { dataset: {}, matches: () => false });
     const uploads: unknown[] = [];

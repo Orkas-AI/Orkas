@@ -556,6 +556,12 @@ async function _copyExistingDirectoryContents(src: string, dst: string): Promise
   }
 }
 
+function _assertManagedPath(candidate: string, root: string, followFinalSymlink = true): void {
+  if (!isPathAllowed(candidate, [root], { rootsResolved: true, followFinalSymlink })) {
+    throw Object.assign(new Error('builtin content path is outside the install'), { code: 'E_PATH_OUT_OF_SCOPE' });
+  }
+}
+
 async function _copyManagedFiles(src: string, dst: string, files: string[]): Promise<void> {
   const root = resolveSandboxRoot(dst);
   for (const rel of files) {

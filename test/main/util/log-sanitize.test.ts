@@ -268,6 +268,62 @@ describe('sanitizeLogTextForUpload › set B (must be preserved)', () => {
   });
 });
 
+describe('sanitizeLogTextForUpload › quoted key=value fields', () => {
+  it('masks double- and single-quoted values, including spaces', () => {
+    expect(sanitizeLogTextForUpload('login failed password="hunter2 is long" for user'))
+      .toBe('login failed password=*** for user');
+    expect(sanitizeLogTextForUpload("retry api_key='abc def' now")).toBe('retry api_key=*** now');
+    expect(sanitizeLogTextForUpload('token="abcDEF123456"')).toBe('token=***');
+  });
+
+  it('masks two quoted secrets on one line', () => {
+    expect(sanitizeLogTextForUpload('secret="a b" token="c d"')).toBe('secret=*** token=***');
+  });
+
+  it('keeps masking an unquoted value that contains a quote', () => {
+    expect(sanitizeLogTextForUpload('token=abc"def')).toBe('token=***"def');
+  });
+
+  it.each(['"', "'"])('keeps escaped %s quotes inside the sensitive value', (quote) => {
+    // A quoted credential can contain escaped delimiters or backslashes.
+    // Even runs end at the following quote; odd runs escape that quote.
+    for (const count of [1, 2, 3, 4]) {
+      const slashes = '\\'.repeat(count);
+      const tail = count % 2 ? `${quote}private tail` : '';
+      const input = `request password=${quote}private${slashes}${tail}${quote} status=401`;
+      const out = sanitizeLogTextForUpload(input);
+      expect(out).toBe('request password=*** status=401');
+      expect(sanitizeLogTextForUpload(out)).toBe(out);
+    }
+  });
+
+  it.each(['"', "'"])('masks an unfinished %s value through the end of its log line', (quote) => {
+    for (const trailing of ['', '\\']) {
+      for (const lineEnd of ['', '\n', '\r', '\r\n']) {
+        const nextLine = lineEnd ? `${lineEnd}status=401; retry=false` : '';
+        const input = `request token=${quote}unfinished private value${trailing}${nextLine}`;
+        expect(sanitizeLogTextForUpload(input)).toBe(`request token=***${nextLine}`);
+      }
+    }
+  });
+
+  it('keeps neighboring fields and diagnostics after escaped quoted credentials', () => {
+    const input = String.raw`password="private\" tail" status=401 api_key='private\' tail' retry=false`;
+    expect(sanitizeLogTextForUpload(input)).toBe('password=*** status=401 api_key=*** retry=false');
+  });
+
+  it('preserves non-sensitive quoted fields and similar field names', () => {
+    const input = String.raw`reason="expected \"value\"" tokenizer='visible' my_password="visible"`;
+    expect(sanitizeLogTextForUpload(input)).toBe(input);
+  });
+
+  it('masks a long quoted value with repeated escapes without leaving a tail', () => {
+    const input = `password="${String.raw`private\"`.repeat(16_384)}" status=401`;
+    // Keep a regression failure bounded instead of echoing the large value.
+    expect(sanitizeLogTextForUpload(input) === 'password=*** status=401').toBe(true);
+  });
+});
+
 describe('sanitizeLogTextForUpload › edge cases', () => {
   it('returns empty input unchanged', () => {
     expect(sanitizeLogTextForUpload('')).toBe('');
