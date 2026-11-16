@@ -70,7 +70,7 @@ jobs:
 
       - name: Run Linux platform-native test lane
         run: |
-          xvfb-run --auto-servernum bash -eu -c '
+          dbus-run-session -- xvfb-run --auto-servernum bash -eu -c '
             openbox --sm-disable &
             window_manager_pid=$!
             trap "kill $window_manager_pid 2>/dev/null || true" EXIT
