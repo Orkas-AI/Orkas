@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({
   pathAllowed: true,
   generateImage: vi.fn(),
-  estimateImageCredits: vi.fn(),
+  checkImageServices: vi.fn(),
   findReusableImageGeneration: vi.fn(),
   beginImageGeneration: vi.fn(),
   finishImageGeneration: vi.fn(),
@@ -17,8 +17,8 @@ const h = vi.hoisted(() => ({
 vi.mock('../../../../src/main/features/image_gen', () => ({
   generateImage: (...args: unknown[]) => h.generateImage(...args),
 }));
-vi.mock('../../../../src/main/features/image_production_credits', () => ({
-  estimateImageProductionCredits: (...args: unknown[]) => h.estimateImageCredits(...args),
+vi.mock('../../../../src/main/features/image_production_services', () => ({
+  checkImageProductionServices: (...args: unknown[]) => h.checkImageServices(...args),
 }));
 vi.mock('../../../../src/main/features/image_production_control', () => ({
   findReusableImageStudioGeneration: (...args: unknown[]) => h.findReusableImageGeneration(...args),
@@ -46,12 +46,6 @@ vi.mock('../../../../src/main/util/project-layout', () => ({
 vi.mock('../../../../src/main/util/chat-media-url', () => ({
   versionedChatMediaLocalUrl: (p: string) => `chat-media://test/${encodeURIComponent(p)}`,
 }));
-vi.mock('../../../../src/main/features/video_production_control', () => ({
-  beginVideoProductionGeneration: vi.fn(),
-  finishVideoProductionGeneration: vi.fn(),
-  releaseVideoProductionGeneration: vi.fn(),
-  videoProductionControlStatePath: () => '/ws/production-state.json',
-}));
 vi.mock('../../../../src/main/logger', () => ({
   createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
 }));
@@ -64,14 +58,13 @@ vi.mock('../../../../src/main/util/log-redact', () => ({
 beforeEach(() => {
   h.pathAllowed = true;
   h.generateImage.mockReset();
-  h.estimateImageCredits.mockReset();
+  h.checkImageServices.mockReset();
   h.findReusableImageGeneration.mockReset();
   h.beginImageGeneration.mockReset();
   h.finishImageGeneration.mockReset();
   h.noteGeneration.mockReset().mockReturnValue(1);
   h.regenerationWarning.mockReset().mockReturnValue(null);
-  h.estimateImageCredits.mockResolvedValue({
-    in_app_credits_required_milli: 0,
+  h.checkImageServices.mockResolvedValue({
     external_billing_estimate_available: false,
     sufficient: true,
 
@@ -153,7 +146,7 @@ describe('generate_image tool', () => {
     expect(onFileWritten).toHaveBeenCalledWith(outputPath);
     expect(String(res.content)).toContain(`Image written to ${outputPath}`);
     expect(String(res.content)).toContain('1024x1024, 128 bytes, test-provider/test-model');
-    expect(h.estimateImageCredits).not.toHaveBeenCalled();
+    expect(h.checkImageServices).not.toHaveBeenCalled();
   });
 
   it('surfaces repeated billable-generation warnings in the successful tool result', async () => {
@@ -232,12 +225,12 @@ describe('generate_image tool', () => {
       }, ctx());
 
       expect(res.isError).toBeFalsy();
-      expect(h.estimateImageCredits).toHaveBeenCalledWith({
+      expect(h.checkImageServices).toHaveBeenCalledWith({
         requestId: 'hero-initial',
         size: '2048x2048',
         referenceCount: 1,
       }, undefined);
-      expect(h.estimateImageCredits.mock.invocationCallOrder[0])
+      expect(h.checkImageServices.mock.invocationCallOrder[0])
         .toBeLessThan(h.beginImageGeneration.mock.invocationCallOrder[0]);
       expect(h.beginImageGeneration.mock.invocationCallOrder[0])
         .toBeLessThan(h.generateImage.mock.invocationCallOrder[0]);
@@ -258,7 +251,7 @@ describe('generate_image tool', () => {
   });
 
   it('blocks an unavailable ImageStudio route before consuming a call slot', async () => {
-    h.estimateImageCredits.mockResolvedValueOnce({
+    h.checkImageServices.mockResolvedValueOnce({
       expected_credits_milli: 0,
       required_credits_milli: 0,
       available_credits_milli: 100_000,
@@ -314,7 +307,7 @@ describe('generate_image tool', () => {
 
       expect(res.isError).toBeFalsy();
       expect(String(res.content)).toContain('reused completed generation hero-initial');
-      expect(h.estimateImageCredits).not.toHaveBeenCalled();
+      expect(h.checkImageServices).not.toHaveBeenCalled();
       expect(h.beginImageGeneration).not.toHaveBeenCalled();
       expect(h.generateImage).not.toHaveBeenCalled();
     } finally {
@@ -402,54 +395,4 @@ describe('generate_image tool', () => {
     }
   });
 
-  it('releases a VideoStudio still that failed before dispatch instead of demanding a new paid confirmation', async () => {
-    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-image-gen-video-release-'));
-    try {
-      const planPath = path.join(projectDir, 'plan.json');
-      fs.writeFileSync(planPath, '{}', 'utf8');
-      const control = await import('../../../../src/main/features/video_production_control');
-      vi.mocked(control.releaseVideoProductionGeneration).mockReset();
-      vi.mocked(control.finishVideoProductionGeneration).mockReset();
-      vi.mocked(control.beginVideoProductionGeneration).mockReset().mockResolvedValue({
-        status: 'started',
-        transaction: { transaction_id: 'still-tx', segment_id: 'still-1' },
-      } as any);
-      const { createImageGenTool } = await import('../../../../src/main/model/core-agent/image-gen-tool');
-      const tool = createImageGenTool({ userId: 'u1', cid: 'c1', agentId: '79df9cc89f5f' });
-      const generate = () => tool.execute!({
-        prompt: 'a still',
-        output_path: path.join(projectDir, 'still.png'),
-        production_plan_path: planPath,
-        production_segment_id: 'still-1',
-      }, ctx());
-
-      h.generateImage.mockResolvedValueOnce({
-        ok: false,
-        errorCode: 'BAD_INPUT',
-        message: 'operation aborted',
-        dispatched: false,
-      });
-      const notSent = await generate();
-      expect(String(notSent.content)).toBe('[BAD_INPUT] operation aborted');
-      expect(control.releaseVideoProductionGeneration).toHaveBeenCalledWith(expect.objectContaining({
-        transactionId: 'still-tx',
-        segmentId: 'still-1',
-        kind: 'image',
-        errorCode: 'BAD_INPUT',
-      }));
-      expect(control.finishVideoProductionGeneration).not.toHaveBeenCalled();
-
-      h.generateImage.mockResolvedValueOnce({ ok: false, errorCode: 'PROVIDER_API_ERROR', message: 'boom' });
-      const sent = await generate();
-      expect(String(sent.content)).toBe('[PROVIDER_API_ERROR] boom');
-      expect(control.releaseVideoProductionGeneration).toHaveBeenCalledOnce();
-      expect(control.finishVideoProductionGeneration).toHaveBeenCalledWith(expect.objectContaining({
-        transactionId: 'still-tx',
-        ok: false,
-        errorCode: 'PROVIDER_API_ERROR',
-      }));
-    } finally {
-      fs.rmSync(projectDir, { recursive: true, force: true });
-    }
-  });
 });

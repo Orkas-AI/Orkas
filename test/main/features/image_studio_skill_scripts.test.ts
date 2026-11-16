@@ -5,11 +5,14 @@ import * as path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import sharp from 'sharp';
+import { inspectPsdBytes } from '../../../eval/model-eval/regression/psd-inspection';
 
 const require = createRequire(import.meta.url);
 const structuredVisual = require('../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/structured_visual.js') as
   ((input: { args: string[] }) => Promise<Record<string, unknown>>);
 const imageAsset = require('../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/image_asset.js') as
+  ((input: { args: string[] }) => Promise<Record<string, unknown>>);
+const layeredDocument = require('../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/layered_document.js') as
   ((input: { args: string[] }) => Promise<Record<string, unknown>>);
 
 let root = '';
@@ -27,6 +30,102 @@ function writeJson(name: string, value: unknown): void {
 }
 
 describe('ImageStudio private skill scripts', () => {
+  it.each(['compose', 'edit'])('prepares the layered-source reference and native %s manifest without flattening', async route => {
+    const skillsDir = path.resolve(process.cwd(), 'resources/builtin/marketplace/agents/814b61b027f0/skills');
+    const compose = fs.readFileSync(path.join(skillsDir, 'image-compose/SKILL.md'), 'utf8');
+    const router = fs.readFileSync(path.join(skillsDir, 'image-router/SKILL.md'), 'utf8');
+    const composeHandoff = router.split('\n').find(line => line.startsWith('- Add `image-compose`'));
+    expect(composeHandoff).toContain('layered source');
+    expect(composeHandoff).toContain('PSD delivery');
+    expect(compose).toContain('](references/layered-documents.md)');
+    expect(compose).toContain('a flattened image stays a single layer');
+    expect(compose).toMatch(/After PNG export succeeds[^\n]*requested PSD[^\n]*same verified layered source/);
+    const reference = fs.readFileSync(path.join(skillsDir, 'image-compose/references/layered-documents.md'), 'utf8');
+    const examples = [...reference.matchAll(/```json\s*\n([\s\S]*?)\n```/g)].map(match => JSON.parse(match[1]));
+    const document = examples.find(value => value.layers);
+    const requests = examples.filter(value => value.op);
+    expect(requests.map(value => value.op)).toEqual(['capabilities', 'render', 'export_psd']);
+    fs.mkdirSync(path.join(root, 'assets'));
+    const sources = new Map<string, Buffer>([
+      ['assets/base.png', await sharp({ create: { width: 320, height: 240, channels: 4, background: '#f2ede4' } }).png().toBuffer()],
+      ['assets/badge.png', await sharp({ create: { width: 64, height: 32, channels: 4, background: '#326496' } }).png().toBuffer()],
+      ['assets/badge-mask.png', await sharp(Buffer.alloc(64 * 32, 128), { raw: { width: 64, height: 32, channels: 1 } }).png().toBuffer()],
+    ]);
+    for (const [file, bytes] of sources) fs.writeFileSync(path.join(root, file), bytes);
+    writeJson('design.json', document);
+    const native = await import('../../../src/main/features/image_studio');
+    const original = structuredClone(document);
+    original.layers[1].children[1].text = 'Draft notes';
+    writeJson('original-design.json', original);
+    if (route === 'edit') {
+      writeJson('original-request.json', { op: 'render', document_path: 'original-design.json', output_path: 'out/original.png' });
+      await layeredDocument({ args: ['--project', root, '--request', 'original-request.json'] });
+    }
+    for (const request of requests) {
+      if (request.op === 'export_psd') {
+        const manifest = JSON.parse(router.match(/```json\s*([\s\S]*?)\s*```/)![1]);
+        manifest.canvas = document.canvas; manifest.route = route;
+        manifest.raster_source = 'out/preview.png';
+        manifest.brief.required_copy = ['Field notes'];
+        if (route === 'edit') Object.assign(manifest, examples.find(value => value.reference_intent));
+        expect(native.validateImageStudioManifest(manifest).issues).toEqual([]);
+        writeJson('image-manifest.json', manifest);
+        expect(fs.existsSync(path.resolve(root, manifest.raster_source))).toBe(true);
+        for (const ref of manifest.references || []) expect(fs.existsSync(path.resolve(root, ref.path))).toBe(true);
+      }
+      writeJson('layered-request.json', request);
+      const result = await layeredDocument({ args: ['--project', root, '--request', 'layered-request.json'] });
+      expect(result).toMatchObject({ ok: true, model_calls: 0 });
+      if (request.op === 'export_psd') expect(result).toMatchObject({
+        delivery_state: 'candidate', structure_verified: true, external_editor_verified: false,
+        final_export: { tool: 'image_studio', op: 'project.export', format: 'psd', input_path: fs.realpathSync(path.join(root, 'out/candidate.psd')) },
+      });
+    }
+    const exported = inspectPsdBytes(fs.readFileSync(path.join(root, 'out/candidate.psd')));
+    expect(exported.layers.find(layer => layer.name === 'Headline')?.text).toBe('Field notes');
+    expect(exported.layers.find(layer => layer.name === 'Badge')?.channels.get(-2)).toEqual(Buffer.alloc(64 * 32, 128));
+    expect(exported.rgba).toEqual(await sharp(path.join(root, 'out/preview.png')).ensureAlpha().raw().toBuffer());
+    for (const [file, bytes] of sources) expect(fs.readFileSync(path.join(root, file))).toEqual(bytes);
+    expect(JSON.parse(fs.readFileSync(path.join(root, 'design.json'), 'utf8'))).toEqual(document);
+  });
+
+  it('executes the discoverable photo-processing examples with exact pixels, preserved sources and verified resume', async () => {
+    const skillDir = path.resolve(process.cwd(), 'resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose');
+    const skill = fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8');
+    const reference = 'references/photo-processing.md';
+    expect(skill).toContain(`](${reference})`);
+    const docs = fs.readFileSync(path.join(skillDir, reference), 'utf8');
+    const requests = [...docs.matchAll(/```json\s*\n([\s\S]*?)\n```/g)].map(match => JSON.parse(match[1]));
+    const batch = requests.find(request => request.op === 'batch');
+    const mask = requests.find(request => request.op === 'masked_composite');
+    expect(batch).toBeDefined();
+    expect(mask).toBeDefined();
+    fs.mkdirSync(path.join(root, 'photos'));
+    fs.mkdirSync(path.join(root, 'artwork'));
+    const photo = await sharp(Buffer.from([20, 40, 60, 255]), { raw: { width: 1, height: 1, channels: 4 } }).png().toBuffer();
+    const originals = new Map<string, Buffer>();
+    for (const name of ['a', 'b', 'c']) originals.set(`photos/${name}.png`, photo);
+    const source = Buffer.from([20, 40, 60, 128, 10, 20, 30, 255]);
+    for (const [name, pixels] of Object.entries({
+      source,
+      background: Buffer.from([100, 110, 120, 255, 130, 140, 150, 200]),
+      mask: Buffer.from([0, 0, 0, 255, 255, 255, 255, 255]),
+    })) originals.set(`artwork/${name}.png`, await sharp(pixels, { raw: { width: 2, height: 1, channels: 4 } }).png().toBuffer());
+    for (const [file, bytes] of originals) fs.writeFileSync(path.join(root, file), bytes);
+    writeJson('batch.json', batch);
+    const run = (request: string) => imageAsset({ args: ['--project', root, '--request', request] });
+    expect(await run('batch.json')).toMatchObject({ ok: true, completed: 3, reused: 0, failed: 0, model_calls: 0 });
+    for (const [name, expected] of [['a', [27, 51, 75, 255]], ['b', [27, 51, 75, 255]], ['c', [20, 40, 30, 255]]] as const) {
+      expect([...(await sharp(path.join(root, `out/${name}.png`)).ensureAlpha().raw().toBuffer())]).toEqual(expected);
+    }
+    expect(await run('batch.json')).toMatchObject({ completed: 0, reused: 3, failed: 0 });
+    writeJson('mask.json', mask);
+    expect(await run('mask.json')).toMatchObject({ ok: true, protected_pixels_verified: true, model_calls: 0 });
+    expect([...(await sharp(path.join(root, 'out/masked.png')).ensureAlpha().raw().toBuffer())])
+      .toEqual([20, 40, 60, 128, 130, 140, 150, 200]);
+    for (const [file, bytes] of originals) expect(fs.readFileSync(path.join(root, file))).toEqual(bytes);
+  });
+
   it.each(['diagram', 'bar', 'line', 'donut'] as const)('renders a deterministic zero-call %s SVG', async (kind) => {
     const common = {
       schema_version: 1,
@@ -74,6 +173,38 @@ describe('ImageStudio private skill scripts', () => {
 
     expect(result).toMatchObject({ ok: true, op: 'process', engine: 'image-compose-skill-sharp', width: 160, height: 80, model_calls: 0 });
     expect(fs.statSync(path.join(root, 'processed.webp')).size).toBeGreaterThan(0);
+  });
+
+  it('executes the documented crop, edge-trim and resize requests without changing their source', async () => {
+    const docs = fs.readFileSync(path.resolve('resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/references/photo-processing.md'), 'utf8');
+    const requests = [...docs.matchAll(/```json\s*\n([\s\S]*?)\n```/g)]
+      .map(match => JSON.parse(match[1])).filter(request => request.op === 'process');
+    expect(requests.map(request => request.operations[0].type).sort()).toEqual(['extract', 'resize', 'trim']);
+    fs.mkdirSync(path.join(root, 'photos'));
+    const source = await sharp({ create: { width: 640, height: 480, channels: 4, background: '#ffffff' } })
+      .composite([{ input: await sharp({ create: { width: 320, height: 240, channels: 4, background: '#1a6699' } }).png().toBuffer(), left: 160, top: 120 }])
+      .png().toBuffer();
+    fs.writeFileSync(path.join(root, 'photos/source.png'), source);
+    for (const request of requests) {
+      writeJson('asset.json', request);
+      expect(await imageAsset({ args: ['--project', root, '--request', 'asset.json'] }))
+        .toMatchObject({ ok: true, width: 320, height: 240, model_calls: 0 });
+      const decoded = await sharp(path.join(root, request.output_path)).ensureAlpha().raw().toBuffer();
+      const center = (120 * 320 + 160) * 4;
+      expect([...decoded.subarray(center, center + 4)]).toEqual([26, 102, 153, 255]);
+      if (request.operations[0].type === 'resize') {
+        expect([...decoded.subarray(0, 4)]).toEqual([255, 255, 255, 255]);
+      } else {
+        expect(decoded).toEqual(Buffer.alloc(320 * 240 * 4).fill(Buffer.from([26, 102, 153, 255])));
+      }
+      expect(fs.readFileSync(path.join(root, 'photos/source.png'))).toEqual(source);
+    }
+    const crop = requests.find(request => request.operations[0].type === 'extract');
+    writeJson('invalid-crop.json', { ...crop, output_path: 'out/invalid.png',
+      operations: [{ type: 'extract', left: 639, top: 0, width: 2, height: 1 }] });
+    await expect(imageAsset({ args: ['--project', root, '--request', 'invalid-crop.json'] })).rejects.toThrow();
+    expect(fs.existsSync(path.join(root, 'out/invalid.png'))).toBe(false);
+    expect(fs.readFileSync(path.join(root, 'photos/source.png'))).toEqual(source);
   });
 
   it('recovers a rejected resize request into the delivery size without changing source or provider pixels', async () => {
@@ -151,5 +282,69 @@ describe('ImageStudio private skill scripts', () => {
       fs.rmSync(escape, { recursive: true, force: true });
       fs.rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('ImageStudio shipped resource handoffs', () => {
+  it('hands authored revisions from current evidence to the on-demand review skill before submitting a verdict', () => {
+    const compose = fs.readFileSync(new URL(
+      '../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/SKILL.md', import.meta.url,
+    ), 'utf8');
+    const reviewStep = compose.split('## Native workflow')[1]?.split('\n').find(line => line.startsWith('4.')) || '';
+    // Protect the handoff at the production step the Agent is following, rather
+    // than accepting a reviewer name elsewhere in a startup catalog.
+    expect(reviewStep).toMatch(/non-generation[\s\S]*current visual evidence[\s\S]*read `image-design-review`[\s\S]*already loaded[\s\S]*project\.submit_design_review/i);
+    expect(compose).toMatch(/skipping the scored-review steps only for `is_generation:true`/);
+    expect(compose).toMatch(/changed manifest, HTML file, or local resource invalidates the prior review/i);
+  });
+
+  it('reviews the requested outcome rather than accepting a narrowed self-authored plan', () => {
+    const review = fs.readFileSync(new URL(
+      '../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-design-review/SKILL.md', import.meta.url,
+    ), 'utf8');
+    const intent = review.split('1. Intent:')[1].split('\n2. ')[0];
+    expect(intent).toMatch(/user.*current requirements.*approved brief/i);
+    expect(intent).toMatch(/self-authored manifest.*not narrow/i);
+    expect(intent).toMatch(/missing requested message.*candidate matches.*plan/i);
+    expect(intent).toMatch(/strict.*exact-only.*no-added-copy[\s\S]*blocker/i);
+  });
+
+  it('hands permitted product reframing to the existing photo owner before placement', () => {
+    const root = '../../../resources/builtin/marketplace/agents/814b61b027f0/skills/';
+    const compose = fs.readFileSync(new URL(root + 'image-compose/SKILL.md', import.meta.url), 'utf8');
+    const photo = fs.readFileSync(new URL(root + 'image-compose/references/photo-processing.md', import.meta.url), 'utf8');
+    const commerce = fs.readFileSync(new URL(root + 'image-craft/references/ecommerce.md', import.meta.url), 'utf8');
+    const authoring = compose.split('## Authoring contract')[1].split('\n## ')[0];
+    expect(authoring).toContain('references/photo-processing.md#source-region-before-placement');
+    expect(photo).toMatch(/## Source region before placement[\s\S]*original framing[\s\S]*scoped edits/i);
+    expect(photo).toMatch(/new asset[\s\S]*before choosing.*frame scale/i);
+    expect(photo).toMatch(/cover[\s\S]*crop[\s\S]*contain[\s\S]*inside/i);
+    expect(commerce).toContain('@skill/image-compose/references/photo-processing.md#source-region-before-placement');
+    // Commerce owns the communication criterion; the photo reference owns processing.
+    expect(commerce).not.toContain('trim unused surroundings or frame a verified subject region');
+  });
+
+});
+
+
+describe('portable local trimming request boundary', () => {
+  it('executes a real trim while rejecting an external request file without changing source pixels', async () => {
+    const source = await sharp({ create: { width: 720, height: 1280, channels: 3, background: '#f5f5f2' } })
+      .composite([{ input: await sharp({ create: { width: 200, height: 565, channels: 3, background: '#2468ae' } }).png().toBuffer(), left: 260, top: 325 }]).png().toBuffer();
+    fs.writeFileSync(path.join(root, 'source.png'), source);
+    const external = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-external-image-request-'));
+    try {
+      const request = { op: 'process', input_path: 'source.png', output_path: 'trimmed.png', operations: [{ type: 'trim', background: '#f5f5f2' }] };
+      const outside = path.join(external, 'request.json');
+      fs.writeFileSync(outside, JSON.stringify(request));
+      await expect(imageAsset({ args: ['--project', root, '--request', outside] })).rejects.toThrow('E_IMAGE_ASSET_PATH');
+      expect(fs.existsSync(path.join(root, 'trimmed.png'))).toBe(false);
+      writeJson('trim.json', request);
+      expect(await imageAsset({ args: ['--project', root, '--request', 'trim.json'] })).toMatchObject({ ok: true, width: 200, height: 565, model_calls: 0 });
+      const pixels = await sharp(path.join(root, 'trimmed.png')).metadata();
+      expect([pixels.width, pixels.height]).toEqual([200, 565]);
+      expect(fs.readFileSync(path.join(root, 'source.png'))).toEqual(source);
+    } finally { fs.rmSync(external, { recursive: true, force: true }); }
   });
 });

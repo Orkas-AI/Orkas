@@ -1,3 +1,4 @@
+import { normaliseSeedreamSize } from './image_size';
 import {
   listOpenImageGenCandidates,
   type PickedImageGenProfile,
@@ -5,10 +6,12 @@ import {
 
 export type ImageProductionBillingMode = 'external' | 'unavailable';
 
-export type ImageProductionCreditIntent = {
+export type ImageProductionGenerationIntent = {
   requestId: string;
   size?: string;
   referenceCount?: number;
+  /** Host-only task selection, shared with actual dispatch. */
+  profileId?: string;
 };
 
 export type ImageProductionQuoteSegment = {
@@ -20,8 +23,7 @@ export type ImageProductionQuoteSegment = {
   reference_images?: string[];
 };
 
-export type ImageProductionCreditQuote = {
-  in_app_credits_required_milli: 0;
+export type ImageProductionServiceAvailability = {
   sufficient: boolean;
   external_billing_estimate_available: false;
   externally_billed_segment_ids: string[];
@@ -39,11 +41,13 @@ function capableCandidates(
 }
 
 export function buildImageProductionQuoteSegment(
-  intent: ImageProductionCreditIntent,
+  intent: ImageProductionGenerationIntent,
   candidates = listOpenImageGenCandidates(),
 ): ImageProductionQuoteSegment {
   const referenceCount = Math.max(0, Math.trunc(Number(intent.referenceCount) || 0));
-  const first = capableCandidates(referenceCount, candidates)[0];
+  const selected = intent.profileId ? candidates.filter(candidate => candidate.entry.entryId === intent.profileId) : candidates;
+  const first = capableCandidates(referenceCount, selected)[0];
+  if (first?.capability.api === 'doubao') normaliseSeedreamSize(intent.size || '2k', first.capability.model);
   const common = {
     segment_id: String(intent.requestId || '').trim(),
     kind: 'image' as const,
@@ -66,21 +70,20 @@ export function buildImageProductionQuoteSegment(
 }
 
 export function imageProductionQuotePayloadSegments(
-  intent: ImageProductionCreditIntent,
+  intent: ImageProductionGenerationIntent,
   candidates = listOpenImageGenCandidates(),
 ): ImageProductionQuoteSegment[] {
   return [buildImageProductionQuoteSegment(intent, candidates)];
 }
 
 /**
- * Open builds have no Orkas billing account. This local quote discloses
- * whether a configured BYO/local provider can handle the request while
- * leaving provider-side price estimation to that provider.
+ * Check whether the selected configured provider can handle the request.
+ * Provider-side charges are disclosed without estimating their price.
  */
-export async function estimateImageProductionCredits(
-  intent: ImageProductionCreditIntent,
+export async function checkImageProductionServices(
+  intent: ImageProductionGenerationIntent,
   signal?: AbortSignal,
-): Promise<ImageProductionCreditQuote> {
+): Promise<ImageProductionServiceAvailability> {
   if (signal?.aborted) throw new Error('E_IMAGE_PRODUCTION_QUOTE_ABORTED: request aborted');
   const requestId = String(intent.requestId || '').trim();
   if (!requestId) throw new Error('E_IMAGE_PRODUCTION_QUOTE_REQUEST_REQUIRED: requestId is required');
@@ -92,7 +95,6 @@ export async function estimateImageProductionCredits(
     .filter((segment) => segment.billing_mode === 'unavailable')
     .map((segment) => segment.segment_id);
   return {
-    in_app_credits_required_milli: 0,
     sufficient: unavailableIds.length === 0,
     external_billing_estimate_available: false,
     externally_billed_segment_ids: externalIds,

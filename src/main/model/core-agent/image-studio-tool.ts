@@ -1,3 +1,4 @@
+import { appTaskMediaRoute } from '../../features/app_media_route';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -13,7 +14,7 @@ import {
   readImageGenerationControlState,
   summarizeImageGenerationBudget,
 } from '../../features/image_production_control';
-import { estimateImageProductionCredits } from '../../features/image_production_credits';
+import { checkImageProductionServices } from '../../features/image_production_services';
 import {
   ImageWorkflowError,
   assertImageWorkflowHostConfigured,
@@ -36,7 +37,8 @@ import {
   submitImageStudioDesignReview,
   type ImageStudioReviewVerdict,
 } from '../../features/image_studio';
-import { finalizeProducedFile } from '../../features/produced_output_hooks';
+import { exportImageStudioDocument, imageStudioDocumentPage, inspectImageStudioDocument, readImageStudioDocument } from '../../features/image_studio_document';
+import { finalizeProducedFile, producedDocumentFooterText } from '../../features/produced_output_hooks';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { userLocalRoot } from '../../paths';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
@@ -85,9 +87,9 @@ function allowedRoots(opts: ImageStudioToolOpts): string[] {
     const resolved = path.resolve(value);
     if (!roots.includes(resolved)) roots.push(resolved);
   };
-  try { add(getWorkspacePath(opts.userId)); } catch { /* unavailable in narrow tests */ }
+  try { add(getWorkspacePath(opts.userId, undefined, opts.cid)); } catch { /* unavailable in narrow tests */ }
   if (opts.projectId) {
-    try { add(getWorkspacePath(opts.userId, opts.projectId)); } catch { /* unavailable in narrow tests */ }
+    try { add(getWorkspacePath(opts.userId, opts.projectId, opts.cid)); } catch { /* unavailable in narrow tests */ }
   }
   if (opts.cid) {
     try { add(chatAttachmentDirForConversation(opts.userId, opts.cid)); } catch { /* unavailable in narrow tests */ }
@@ -100,7 +102,7 @@ function resolveAbs(ctx: ToolContext, opts: ImageStudioToolOpts, raw: unknown): 
   const value = String(raw || '').trim();
   if (path.isAbsolute(value)) return path.resolve(value);
   if (ctx.workingDir) return path.resolve(ctx.workingDir, value);
-  try { return path.resolve(getWorkspacePath(opts.userId, opts.projectId), value); }
+  try { return path.resolve(getWorkspacePath(opts.userId, opts.projectId, opts.cid), value); }
   catch { return path.resolve(value); }
 }
 
@@ -109,15 +111,15 @@ function resolveProjectAsset(projectDirAbs: string, raw: unknown): string {
   return path.resolve(path.isAbsolute(value) ? value : path.join(projectDirAbs, value));
 }
 
-function stateKey(opts: ImageStudioToolOpts, projectDirAbs: string): string {
+function stateKey(opts: ImageStudioToolOpts, projectDirAbs: string, pageId?: string): string {
   return crypto.createHash('sha256')
-    .update(`${opts.userId}\0${path.resolve(projectDirAbs)}`)
+    .update(`${opts.userId}\0${path.resolve(projectDirAbs)}${pageId === undefined ? '' : `\0${pageId}`}`)
     .digest('hex')
     .slice(0, 32);
 }
 
-export function imageStudioStatePath(opts: ImageStudioToolOpts, projectDirAbs: string): string {
-  return path.join(userLocalRoot(opts.userId), 'image_studio', 'evidence', `${stateKey(opts, projectDirAbs)}.json`);
+export function imageStudioStatePath(opts: ImageStudioToolOpts, projectDirAbs: string, pageId?: string): string {
+  return path.join(userLocalRoot(opts.userId), 'image_studio', 'evidence', `${stateKey(opts, projectDirAbs, pageId)}.json`);
 }
 
 // Results are read by a model, not a person: compact JSON and no echo of
@@ -147,8 +149,13 @@ async function jsonResultWithVisualEvidence(
     list.findIndex((candidate) => path.resolve(candidate.absPath) === path.resolve(entry.absPath)) === index
   ));
   const preparedEvidence = await Promise.all(uniqueEvidence.map(async (entry, index) => {
-    const source = await fs.readFile(entry.absPath);
-    const inspected = await inspectImageAssetBuffer(source);
+    let source: Buffer = await fs.readFile(entry.absPath);
+    let inspected = await inspectImageAssetBuffer(source);
+    if (index > 0 && inspected.format === 'svg') {
+      const { svgReferencePng } = await import('../../features/image_studio_svg_reference');
+      source = await svgReferencePng(source);
+      inspected = await inspectImageAssetBuffer(source);
+    }
     const prepared = inspected.format === 'png'
       ? await prepareLosslessModelImage(source)
       : {
@@ -245,7 +252,9 @@ function nextImageStudioRecoveryOperation(input: {
   reviewRequired: boolean;
   reviewVerdict: ImageStudioReviewVerdict | null;
 }): string {
-  if (!input.inspection.ok) return 'repair_project_then_project.inspect';
+  if (!input.inspection.ok) return input.inspection.source_kind === 'html'
+    ? 'repair_project_then_project.snapshot'
+    : 'repair_project_then_project.inspect';
   if (!input.evidenceAvailable || !input.evidenceCurrent) {
     return input.inspection.source_kind === 'html'
       ? 'project.snapshot'
@@ -253,7 +262,9 @@ function nextImageStudioRecoveryOperation(input: {
   }
   if (input.reviewVerdict === 'passed') return 'project.export';
   if (input.reviewVerdict === 'repair' || input.reviewVerdict === 'blocked') {
-    return 'repair_candidate_then_reinspect';
+    return input.inspection.source_kind === 'html'
+      ? 'repair_candidate_then_project.snapshot'
+      : 'repair_candidate_then_reinspect';
   }
   if (!input.reviewRequired) return 'project.export';
   return 'project.submit_design_review';
@@ -267,11 +278,12 @@ async function inspectCurrentImageStudioProject(
   generation: Awaited<ReturnType<typeof readImageGenerationControlState>>,
   turnId: string,
   explicitInput?: string,
+  pageId?: string,
 ): Promise<ProjectInspection> {
-  const inspection = await inspectImageStudioProject(projectDirAbs, explicitInput);
+  const inspection = await inspectImageStudioProject(projectDirAbs, explicitInput, pageId);
   if (explicitInput || !inspection.blockers.some(item => item.code === 'E_RASTER_SOURCE_REQUIRED')) return inspection;
   const fallback = state?.source_path || latestCompletedImageStudioGenerationOutput(generation, turnId);
-  return fallback ? inspectImageStudioProject(projectDirAbs, fallback) : inspection;
+  return fallback ? inspectImageStudioProject(projectDirAbs, fallback, pageId) : inspection;
 }
 
 async function buildImageStudioRecoveryHandoff(input: {
@@ -279,6 +291,7 @@ async function buildImageStudioRecoveryHandoff(input: {
   stateAbsPath: string;
   generationStateAbsPath: string;
   turnId: string;
+  pageId?: string;
   inspection?: Awaited<ReturnType<typeof inspectImageStudioProject>>;
   generation?: Awaited<ReturnType<typeof readImageGenerationControlState>>;
 }): Promise<Record<string, unknown>> {
@@ -287,7 +300,7 @@ async function buildImageStudioRecoveryHandoff(input: {
     ? await readImageGenerationControlState(input.generationStateAbsPath)
     : input.generation;
   const inspection = input.inspection
-    || await inspectCurrentImageStudioProject(input.projectDirAbs, state, generation, input.turnId);
+    || await inspectCurrentImageStudioProject(input.projectDirAbs, state, generation, input.turnId, undefined, input.pageId);
   const maxCalls = generation?.max_calls ?? inspection.manifest?.generation_budget.max_calls ?? null;
   const usage = summarizeImageGenerationBudget(generation, maxCalls ?? 0, input.turnId);
   const evidenceAvailable = await existingFile(state?.evidence_path);
@@ -355,8 +368,8 @@ async function ensureDirectory(absPath: string): Promise<string | null> {
   } catch { return `E_IMAGE_PROJECT_MISSING: ${absPath}`; }
 }
 
-function withFormatExtension(absPath: string, format: 'png' | 'jpeg'): string {
-  const extension = format === 'jpeg' ? '.jpg' : '.png';
+function withFormatExtension(absPath: string, format: 'png' | 'jpeg' | 'psd' | 'pdf'): string {
+  const extension = format === 'pdf' ? '.pdf' : format === 'psd' ? '.psd' : format === 'jpeg' ? '.jpg' : '.png';
   const current = path.extname(absPath);
   if ((format === 'jpeg' && /\.jpe?g$/i.test(current)) || (format === 'png' && current.toLowerCase() === '.png')) return absPath;
   return current ? `${absPath.slice(0, -current.length)}${extension}` : `${absPath}${extension}`;
@@ -370,7 +383,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
   const currentTurnId = String(opts.turnId || '').trim();
   return {
     name: 'image_studio',
-    description: 'Minimal ImageStudio security kernel for BYO/local provider availability quotes, local HTML/SVG capture, project inspection, host-configured image workflow execution, signature-bound visual review, and approved PNG/JPEG export. Evolving authoring and asset operations live in private skills.',
+    description: 'Inspect, review, and export ImageStudio projects; quote generations, capture local HTML/SVG, and run host-configured image workflows.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -380,9 +393,10 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
           description: 'Project QA/export or host-configured external workflow operation.',
         },
         project_dir: { type: 'string', description: 'Image project directory containing image-manifest.json and local assets.' },
-        input_path: { type: 'string', description: 'Optional current project-local raster for project.inspect. Otherwise uses manifest raster_source, then prior evidence or the current turn completed generation. Use manifest entry for HTML.' },
+        page_id: { type: 'string', description: 'Version 2 documents only: stable page id for inspect, snapshot, review or export. Omit for whole-document status/inspection or PDF export. Single-page projects omit this.' },
+        input_path: { type: 'string', description: 'For project.inspect, optional current project-local raster; otherwise uses manifest raster_source, prior evidence or current generation. For PSD project.export, required project-local verified PSD candidate. Use manifest entry for HTML.' },
         output_path: { type: 'string', description: 'Snapshot, external workflow, or final export path.' },
-        format: { type: 'string', enum: ['png', 'jpeg'], description: 'Final project.export format. Defaults from output_path, otherwise PNG.' },
+        format: { type: 'string', enum: ['png', 'jpeg', 'psd', 'pdf'], description: 'Defaults from output_path, otherwise PNG. PSD preserves its candidate bytes after current native PNG export. PDF prints the manifest HTML entry at canvas size; wrap standalone SVG in local HTML. Photos/effects may stay raster. Scored review is only for non-generation evidence.' },
         evidence_path: { type: 'string', description: 'Required for project.submit_design_review: exact current evidence path returned by project.inspect or project.snapshot.' },
         review_verdict: { type: 'string', enum: ['passed', 'repair', 'blocked'], description: 'For project.submit_design_review; send in the same call as review_scope, review_findings, and complete quality_scores. One submission per exact evidence; retry requires changed source signature and rendered pixels.' },
         review_scope: { type: 'string', description: 'Required for project.submit_design_review: concise statement of what was visually inspected.' },
@@ -443,14 +457,33 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
       }
       const dirError = await ensureDirectory(projectDirAbs);
       if (dirError) return { content: dirError, isError: true } as ToolResult;
-      const stateAbsPath = imageStudioStatePath(opts, projectDirAbs);
+      const pageId = typeof input.page_id === 'string' ? input.page_id : undefined;
+      const stateAbsPath = imageStudioStatePath(opts, projectDirAbs, pageId);
+      let document: Awaited<ReturnType<typeof readImageStudioDocument>>;
       const generationStateAbsPath = imageGenerationControlStatePath(opts.userId, projectDirAbs);
 
       try {
-        if (op === 'workflow.capabilities') {
+        if (input.page_id !== undefined && (!pageId || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(pageId)))
+          throw new Error('E_IMAGE_DOCUMENT_PAGE_ID: page_id must be a stable document page identifier.');
+        if (op === 'workflow.capabilities' && input.page_id === undefined)
           return jsonResult({ ok: true, op, capabilities: await imageWorkflowCapabilities(ctx.signal) });
+        document = await readImageStudioDocument(projectDirAbs);
+        if (pageId !== undefined) {
+          if (!document) throw new Error('E_IMAGE_DOCUMENT_PAGE_UNEXPECTED: single-page projects omit page_id.');
+          imageStudioDocumentPage(document, pageId);
+          if (op === 'workflow.capabilities' || op === 'workflow.run' || op === 'generation.quote')
+            throw new Error('E_IMAGE_DOCUMENT_PAGE_UNEXPECTED: page_id selects project QA and export operations only.');
         }
-
+        if (document && !pageId && (op === 'project.status' || op === 'project.inspect')) {
+          const inventory = await inspectImageStudioDocument(projectDirAbs, id => imageStudioStatePath(opts, projectDirAbs, id));
+          return jsonResult({ ok: inventory.ok, op, document: inventory });
+        }
+        if (document && (op === 'generation.quote' || op === 'workflow.run'))
+          throw new Error('E_IMAGE_DOCUMENT_ROUTE: fixed-page documents use local sources and no generation calls.');
+        const wholeDocumentPdf = document && !pageId && op === 'project.export'
+          && (input.format === 'pdf' || (!input.format && /\.pdf$/i.test(String(input.output_path || ''))));
+        if (document && !pageId && op !== 'workflow.capabilities' && !wholeDocumentPdf)
+          throw new Error('E_IMAGE_DOCUMENT_PAGE_REQUIRED: select page_id from project.status for this operation.');
         if (op === 'workflow.run') {
           const engine = String(input.workflow_engine || '').trim() as ImageWorkflowEngine;
           const workflowRaw = String(input.workflow_path || '').trim();
@@ -492,9 +525,8 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               output_path: reusedPath,
               media: versionedChatMediaLocalUrl(reusedPath),
               generation: { calls_started: begun.callCount, max_calls: begun.maxCalls },
-              credit_quote: {
+              service_availability: {
                 source: 'not_applicable_reused_output',
-                in_app_credits_required_milli: 0,
                 new_external_charge: false,
               },
             });
@@ -523,9 +555,8 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               request_id: requestId,
               result,
               generation: { calls_started: begun.callCount, max_calls: begun.maxCalls },
-              credit_quote: {
+              service_availability: {
                 source: 'host_configured_external_workflow',
-                in_app_credits_required_milli: 0,
                 external_billing_not_estimated: true,
               },
               media: versionedChatMediaLocalUrl(result.output_path),
@@ -549,6 +580,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               stateAbsPath,
               generationStateAbsPath,
               turnId: currentTurnId,
+              pageId,
               generation,
             });
             return jsonResult({
@@ -575,6 +607,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               stateAbsPath,
               generationStateAbsPath,
               turnId: currentTurnId,
+              pageId,
               inspection: inspectionForModel(inspection),
             });
             return jsonResult({ ok: false, op, inspection, ...handoff });
@@ -590,6 +623,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               stateAbsPath,
               generationStateAbsPath,
               turnId: currentTurnId,
+              pageId,
               inspection: inspectionForModel(inspection),
               generation,
             });
@@ -611,7 +645,9 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
           const requestId = String(input.image_request_id || 'next-image-generation').trim();
           assertImageGenerationRequestId(requestId);
           const size = String(input.size || '').trim();
-          const quote = await estimateImageProductionCredits({
+          const imageProfileId=await appTaskMediaRoute(opts.userId,opts.cid,'image',ctx.signal);
+          const quote = await checkImageProductionServices({
+            ...(imageProfileId?{profileId:imageProfileId}:{}),
             requestId,
             ...(size ? { size } : {}),
             referenceCount: rawReferenceCount,
@@ -629,7 +665,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               ...usage,
               max_calls: maxCalls,
             },
-            credit_quote: quote,
+            service_availability: quote,
             invariant: 'Provider availability is checked again immediately before dispatch; external provider billing is not estimated in-app.',
           });
         }
@@ -639,22 +675,24 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             readImageStudioEvidenceState(stateAbsPath),
             readImageGenerationControlState(generationStateAbsPath),
           ]);
-          const inspection = await inspectCurrentImageStudioProject(projectDirAbs, state, generation, currentTurnId);
+          const inspection = await inspectCurrentImageStudioProject(projectDirAbs, state, generation, currentTurnId, undefined, pageId);
           const maxCalls = generation?.max_calls ?? inspection.manifest?.generation_budget.max_calls ?? null;
           const usage = summarizeImageGenerationBudget(generation, maxCalls ?? 0, currentTurnId);
-          let creditQuote: Record<string, unknown> | undefined;
+          let serviceAvailability: Record<string, unknown> | undefined;
           if (
             inspection.manifest
             && maxCalls !== null
             && usage.calls_remaining > 0
           ) {
             try {
-              creditQuote = await estimateImageProductionCredits({
+              const imageProfileId=await appTaskMediaRoute(opts.userId,opts.cid,'image',ctx.signal);
+              serviceAvailability = await checkImageProductionServices({
+                ...(imageProfileId?{profileId:imageProfileId}:{}),
                 requestId: 'project-status-next-generation',
                 referenceCount: inspection.manifest.references?.length || 0,
               }, ctx.signal);
             } catch (err) {
-              creditQuote = {
+              serviceAvailability = {
                 status: 'unavailable',
                 sufficient: false,
                 error: (err as Error).message || String(err),
@@ -666,6 +704,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             stateAbsPath,
             generationStateAbsPath,
             turnId: currentTurnId,
+            pageId,
             inspection: inspectionForModel(inspection),
             generation,
           });
@@ -680,9 +719,9 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               max_calls: maxCalls,
               calls_remaining: maxCalls === null ? null : usage.calls_remaining,
             },
-            ...(creditQuote ? {
-              credit_quote: creditQuote,
-              credit_quote_assumptions: {
+            ...(serviceAvailability ? {
+              service_availability: serviceAvailability,
+              service_availability_assumptions: {
                 size: 'provider_default',
                 reference_count: inspection.manifest?.references?.length || 0,
                 note: 'Call generation.quote with exact size/reference_count before dispatch; external provider billing is not estimated in-app.',
@@ -700,7 +739,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
           }
           const generation = await readImageGenerationControlState(generationStateAbsPath);
           const state = await readImageStudioEvidenceState(stateAbsPath);
-          const preliminary = await inspectCurrentImageStudioProject(projectDirAbs, state, generation, currentTurnId, explicitInputAbs);
+          const preliminary = await inspectCurrentImageStudioProject(projectDirAbs, state, generation, currentTurnId, explicitInputAbs, pageId);
           const inspection = preliminary.source_kind === 'raster'
             ? await recordRasterEvidence({ projectDirAbs, rasterAbsPath: preliminary.source_path, stateAbsPath, generationOutputs: imageStudioGenerationOutputs(generation) })
             : preliminary;
@@ -709,12 +748,13 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             stateAbsPath,
             generationStateAbsPath,
             turnId: currentTurnId,
+            pageId,
             inspection: inspectionForModel(inspection),
             generation,
           });
           const result = { ok: inspection.ok, op, inspection: inspectionForModel(inspection), ...handoff };
           if (inspection.ok && inspection.evidence_path && inspection.is_generation === false) {
-            return jsonResultWithVisualEvidence(result, imageStudioVisualEvidence(projectDirAbs, inspection));
+            return await jsonResultWithVisualEvidence(result, imageStudioVisualEvidence(projectDirAbs, inspection));
           }
           return jsonResult(result);
         }
@@ -727,13 +767,14 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             return { content: `E_PATH_OUT_OF_SCOPE: output_path is outside scope: ${requested}`, isError: true } as ToolResult;
           }
           const unique = await uniquifyPath(requested, (candidate) => !!opts.hasProducedPath?.(candidate));
-          const inspection = await snapshotImageStudioProject({ projectDirAbs, outputAbsPath: unique.finalPath, stateAbsPath });
+          const inspection = await snapshotImageStudioProject({ projectDirAbs, outputAbsPath: unique.finalPath, stateAbsPath, pageId });
           if (inspection.ok) await reportWritten(opts, unique.finalPath);
           const handoff = await buildImageStudioRecoveryHandoff({
             projectDirAbs,
             stateAbsPath,
             generationStateAbsPath,
             turnId: currentTurnId,
+            pageId,
             inspection: inspectionForModel(inspection),
           });
           const result = {
@@ -744,7 +785,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             ...handoff,
           };
           if (inspection.ok && inspection.evidence_path) {
-            return jsonResultWithVisualEvidence(
+            return await jsonResultWithVisualEvidence(
               result,
               imageStudioVisualEvidence(projectDirAbs, inspection),
               unique.renamed ? renderRenameSignal(requested, unique.finalPath) : '',
@@ -784,20 +825,22 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             stateAbsPath,
             generationStateAbsPath,
             turnId: currentTurnId,
+            pageId,
           });
           return jsonResult({
             ok: true,
             op,
             status: verdict,
             review: state.review,
-            next_action: verdict === 'passed' ? 'project.export' : 'repair_then_inspect',
+            next_action: verdict === 'passed' ? 'project.export'
+              : state.source_kind === 'html' ? 'repair_then_snapshot' : 'repair_then_inspect',
             ...handoff,
           });
         }
 
         const outputRaw = String(input.output_path || '').trim();
         if (!outputRaw) return { content: 'output_path is required for project.export', isError: true } as ToolResult;
-        const format: 'png' | 'jpeg' = input.format === 'jpeg' || /\.jpe?g$/i.test(outputRaw) ? 'jpeg' : 'png';
+        const format = input.format === 'pdf' || (!input.format && /\.pdf$/i.test(outputRaw)) ? 'pdf' : input.format === 'psd' || /\.psd$/i.test(outputRaw) ? 'psd' : input.format === 'jpeg' || /\.jpe?g$/i.test(outputRaw) ? 'jpeg' : 'png';
         const requested = withFormatExtension(resolveAbs(ctx, opts, outputRaw), format);
         if (!isPathAllowed(requested, roots)) {
           return { content: `E_PATH_OUT_OF_SCOPE: output_path is outside scope: ${requested}`, isError: true } as ToolResult;
@@ -813,30 +856,47 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
         // the model can tell the user where the new version landed. Same reasoning
         // as the document export in `office-tools.ts`.
         const unique = await uniquifyPath(requested, () => false);
-        const exported = await exportImageStudioProject({ stateAbsPath, outputAbsPath: unique.finalPath, format });
-        await finalizeProducedFile(unique.finalPath, {
+        const inputAbsPath = input.input_path ? resolveAbs(ctx, opts, input.input_path) : undefined;
+        if (format === 'psd' && (!inputAbsPath || !isPathAllowed(inputAbsPath, [projectDirAbs]))) {
+          return { content: 'E_IMAGE_PSD_INPUT_REQUIRED: input_path must name a project-local PSD candidate.', isError: true } as ToolResult;
+        }
+        const finalizeOutput = async (absPath: string) => finalizeProducedFile(absPath, {
           userId: opts.userId,
           ...(opts.cid ? { cid: opts.cid } : {}),
           ...(opts.projectId ? { projectId: opts.projectId } : {}),
           source: 'image_studio.export_pre_publish',
         });
+        const footerText = format === 'pdf'
+          ? producedDocumentFooterText({ userId: opts.userId, cid: opts.cid, projectId: opts.projectId }) || undefined : undefined;
+        const exported = wholeDocumentPdf
+          ? await exportImageStudioDocument({ projectDir: projectDirAbs,
+            statePath: id => imageStudioStatePath(opts, projectDirAbs, id),
+            outputAbsPath: unique.finalPath, scratchDir: path.join(userLocalRoot(opts.userId), 'image_studio', 'temporary'),
+            footerText, signal: ctx.signal, finalizeOutput })
+          : await exportImageStudioProject({ stateAbsPath, outputAbsPath: unique.finalPath, format, inputAbsPath,
+            footerText, signal: ctx.signal, finalizeOutput });
         await reportWritten(opts, unique.finalPath);
         if (opts.onOutputsPublished) await opts.onOutputsPublished([unique.finalPath]);
         return jsonResult({
           ok: true,
           op,
           ...exported,
-          media: versionedChatMediaLocalUrl(unique.finalPath),
+          ...(pageId ? { page_id: pageId } : {}),
+          format,
+          ...(['psd', 'pdf'].includes(format) ? {} : { media: versionedChatMediaLocalUrl(unique.finalPath) }),
         }, unique.renamed ? renderRenameSignal(requested, unique.finalPath) : '');
       } catch (err) {
         const message = (err as Error).message || String(err);
         let handoff: Record<string, unknown> = {};
         try {
-          handoff = await buildImageStudioRecoveryHandoff({
+          handoff = document && !pageId
+            ? { document: await inspectImageStudioDocument(projectDirAbs, id => imageStudioStatePath(opts, projectDirAbs, id)) }
+            : await buildImageStudioRecoveryHandoff({
             projectDirAbs,
             stateAbsPath,
             generationStateAbsPath,
             turnId: currentTurnId,
+            pageId,
           });
         } catch { /* retain the original failure when recovery inspection is unavailable */ }
         return jsonResult({

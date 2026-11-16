@@ -44,6 +44,16 @@ afterEach(async () => {
 });
 
 describe('isolated bundled-Node image processing', () => {
+  it('compares bounded PSD candidates in stock Node without accepting a different preview', async () => {
+    const images = client();
+    const { writePsdBuffer } = require('ag-psd');
+    const imageData = { width: 4, height: 3, data: new Uint8ClampedArray(Array.from({ length: 12 }, () => [20, 40, 60, 255]).flat()) };
+    const psd = writePsdBuffer({ width: 4, height: 3, imageData, children: [{ name: 'Base', imageData }] }, { noBackground: true });
+    expect(await images.request('psd-check', psd, { canvas: { width: 4, height: 3 }, reference: input(4, 3) })).toEqual({ matches: true });
+    expect(await images.request('psd-check', psd, { canvas: { width: 4, height: 3 }, reference: Buffer.from('<svg width="4" height="3"><rect width="4" height="3" fill="red"/></svg>') })).toEqual({ matches: false });
+    await expect(images.request('psd-check', Buffer.from('not PSD'), { canvas: { width: 4, height: 3 }, reference: input(4, 3) })).rejects.toThrow('E_IMAGE_PROCESS');
+    await expect(images.request('psd-check', psd, { canvas: { width: 8192, height: 8192 }, reference: input(4, 3) })).rejects.toThrow('E_IMAGE_PROCESS');
+  });
   it('masks private screenshot pixels before cropping and resizing in stock Node', async () => {
     const images = client();
     const masked = await images.request('encode', input(12, 6), {
@@ -169,6 +179,7 @@ describe('isolated bundled-Node image processing', () => {
     const entry = path.join(unpacked, 'bin', 'sharp-worker.cjs');
     fs.mkdirSync(path.dirname(entry), { recursive: true });
     fs.copyFileSync(worker, entry);
+    fs.copyFileSync(path.join(process.cwd(), 'bin/psd-preview.cjs'), path.join(unpacked, 'bin/psd-preview.cjs'));
     const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
     const gate = require('../../../bin/packaged-entrypoint-gate.cjs');
     for (const glob of gate.PACKAGED_IMAGE_RUNTIME_UNPACK_GLOBS) {
@@ -177,10 +188,43 @@ describe('isolated bundled-Node image processing', () => {
       const relative = glob.slice(0, -5);
       fs.cpSync(path.join(process.cwd(), relative), path.join(unpacked, relative), { recursive: true });
     }
+    // Use only paths shipped by both package lists, including ag-psd's nested
+    // pako rather than borrowing an unrelated checkout resolution.
+    const minimatchModule = require('minimatch');
+    const minimatch = minimatchModule.minimatch || minimatchModule;
+    // Keep the manifest's ordered include/exclude semantics without depending
+    // on a separate product-builder toolchain.
+    const included = (file: string, patterns: string[]) => {
+      let result = false;
+      for (const raw of patterns || []) {
+        if (typeof raw !== 'string') throw new Error('Package patterns must be strings.');
+        const negative = raw.startsWith('!');
+        const pattern = (negative ? raw.slice(1) : raw).replace(/\\/g, '/').replace(/^\.\//, '');
+        if (minimatch(file, pattern, { dot: true })
+          || (!/[.*?{}[\]()]/.test(pattern) && file.startsWith(`${pattern}/`))) result = !negative;
+      }
+      return result;
+    };
+    for (const name of ['ag-psd', 'base64-js']) {
+      fs.cpSync(path.join(process.cwd(), 'node_modules', name), path.join(unpacked, 'node_modules', name), {
+        recursive: true,
+        filter: (file: string) => {
+          if (fs.statSync(file).isDirectory()) return true;
+          const relative = path.relative(process.cwd(), file).split(path.sep).join('/');
+          return included(relative, pkg.build.files) && included(relative, pkg.build.asarUnpack);
+        },
+      });
+    }
+    const pixels = { width: 4, height: 3, data: new Uint8ClampedArray(Array.from({ length: 12 }, () => [20, 40, 60, 255]).flat()) };
+    const candidate = require('ag-psd').writePsdBuffer({ width: 4, height: 3, imageData: pixels, children: [{ name: 'Base', imageData: pixels }] }, { noBackground: true });
+    const packagedImages = client({ workerPath: entry });
+    expect(await packagedImages.request('psd-check', candidate, { canvas: { width: 4, height: 3 }, reference: input(4, 3) })).toEqual({ matches: true });
     expect(probeImageRuntime(node, entry)).toMatchObject({ status: 'passed', sharp: 'png-2x2', electron: null, arch: process.arch });
-    // Electron on Windows can reject synchronous deletion immediately after
-    // the native probe. Await real removal before testing the missing closure;
-    // bounded filesystem retries still fail if the fixture cannot be removed.
+    // The persistent client still owns the native DLLs on Windows. Unload it
+    // before deleting the payload for the separate missing-dependency probe.
+    const packagedClosed = once(children.at(-1)!, 'close');
+    packagedImages.close();
+    await packagedClosed;
     const imageDependencies = path.join(unpacked, 'node_modules', '@img');
     await fs.promises.rm(imageDependencies, { recursive: true, maxRetries: 10, retryDelay: 50 });
     expect(fs.existsSync(imageDependencies)).toBe(false);

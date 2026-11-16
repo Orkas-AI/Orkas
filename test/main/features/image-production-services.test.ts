@@ -10,11 +10,9 @@ vi.mock('../../../src/main/features/image_gen', () => ({
 
 import {
   buildImageProductionQuoteSegment,
-  creditsFromMilli,
-  estimateImageProductionCredits,
+  checkImageProductionServices,
   imageProductionQuotePayloadSegments,
-  withCreditTwins,
-} from '../../../src/main/features/image_production_credits';
+} from '../../../src/main/features/image_production_services';
 
 function candidate(provider: string, supportsEdit = true): any {
   return {
@@ -64,13 +62,13 @@ describe('ImageStudio open-provider availability quote', () => {
 
   it('returns a local disclosure without network or in-app billing', async () => {
     h.candidates = [candidate('openai')];
-    const quote = await estimateImageProductionCredits({
+    const quote = await checkImageProductionServices({
       requestId: 'private-edit',
       size: '2048x2048',
       referenceCount: 2,
     });
+    expect(quote).not.toHaveProperty('in_app_credits_required_milli');
     expect(quote).toMatchObject({
-      in_app_credits_required_milli: 0,
       sufficient: true,
       external_billing_estimate_available: false,
       externally_billed_segment_ids: ['private-edit'],
@@ -93,4 +91,25 @@ describe('ImageStudio open-provider availability quote', () => {
     }]);
     expect(JSON.stringify(payload)).not.toContain('openai-secret');
   });
+});
+
+// The app's explicit service choice must not silently quote a different provider.
+it('quotes the selected configured service and keeps a missing or incapable selection unavailable', () => {
+  const candidates = [candidate('openai'), candidate('google'), candidate('text-only', false)];
+  expect(buildImageProductionQuoteSegment({ requestId: 'selected', profileId: 'google' }, candidates))
+    .toMatchObject({ provider: 'google', billing_mode: 'external' });
+  for (const profileId of ['missing', 'text-only']) {
+    expect(buildImageProductionQuoteSegment({ requestId: 'selected', profileId, referenceCount: 1 }, candidates))
+      .toMatchObject({ provider: '', billing_mode: 'unavailable' });
+  }
+  expect(candidates.map(row => row.entry.entryId)).toEqual(['openai', 'google', 'text-only']);
+});
+
+it('refuses an unsupported Seedream size before quoting its selected provider', () => {
+  const row = { entry: { provider: 'doubao', entryId: 'seedream' },
+    capability: { api: 'doubao', model: 'doubao-seedream-5-0-flash-260915', supportsEdit: true } } as any;
+  expect(() => buildImageProductionQuoteSegment({ requestId: 'size', profileId: 'seedream', size: '4k' }, [row]))
+    .toThrow('Unsupported image size');
+  expect(buildImageProductionQuoteSegment({ requestId: 'size', profileId: 'seedream', size: '2k' }, [row]))
+    .toMatchObject({ provider: 'doubao', billing_mode: 'external', size: '2k' });
 });
