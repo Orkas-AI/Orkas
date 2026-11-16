@@ -1483,6 +1483,8 @@ async function runEdit(p: EditParams): Promise<EditResult> {
           '-filter_complex', `[0:v]trim=end_frame=${frames},setpts=PTS-STARTPTS[v]`
             + (basic.hasAudio ? `;[0:a]atrim=end=${(frames / spec.fps).toFixed(6)},asetpts=PTS-STARTPTS[a]` : ''),
           '-map', '[v]', ...(basic.hasAudio ? ['-map', '[a]'] : []),
+          // Preserve the selected frame count instead of inferring an output cadence after seeking.
+          '-r', String(spec.fps),
           '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', p.outputAbsPath,
         ]
       // Accurate seek (-ss/-t after -i) + re-encode when the frame rate is unknown.
