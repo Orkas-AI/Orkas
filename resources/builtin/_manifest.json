@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "5df9dc3594a36160035034b51acd8a68f33518a460be44b066200ef36a08920f",
+  "content_tree_sha256": "d01a8614f3581a7e6f4df07ef56b0d032609166aea11b5ca3a173d50bb7717cd",
   "files": [
     {
       "path": "apps/builtin-content-workbench/__orkas-meta.json",
@@ -194,8 +194,8 @@
     },
     {
       "path": "marketplace/agents/5f890bd72ac4/agent.json",
-      "bytes": 3690,
-      "sha256": "de4c819ba14cf8c9116a9cc9c3f4586f5ee491dcdfa6b056db1c323854aea0c9"
+      "bytes": 3693,
+      "sha256": "77c221858704637f48d735e06ca579ab04a0a8be5b63f501c829805f7c5ec0d5"
     },
     {
       "path": "marketplace/agents/5f890bd72ac4/skills/voice-project/references/audio-processing.md",
@@ -234,8 +234,8 @@
     },
     {
       "path": "marketplace/agents/5f890bd72ac4/skills/voice-project/scripts/audio.js",
-      "bytes": 29743,
-      "sha256": "b63ed87dddce695d39fbd01fa48423d9a579045974631d7614b0ab83f01445c4"
+      "bytes": 30740,
+      "sha256": "9add3314253791381a2bb5cf6b5519c8c51fa99f621f7379109426bac1448ee4"
     },
     {
       "path": "marketplace/agents/5f890bd72ac4/skills/voice-project/scripts/composition.js",
@@ -2192,10 +2192,10 @@
       {
         "id": "5f890bd72ac4",
         "name": "VoiceStudio",
-        "version": "1.0.25",
+        "version": "1.0.26",
         "icon": "music",
         "color": "violet",
-        "updated_at": "2026-11-13T08:41:19.669Z",
+        "updated_at": "2026-11-16T19:26:57.241361Z",
         "skill_list": [
           "voice-project"
         ],

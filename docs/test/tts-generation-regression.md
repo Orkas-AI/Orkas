@@ -396,3 +396,18 @@ are unchanged. Managed separation/music, official credits, private model cohort
 history and monorepo retained logs are excluded. Local effects and supplied BGM
 remain available. No document update marks model behavior, paid suppliers,
 packaging, Windows/Linux native paths or perceptual listening accepted.
+
+### Untreated same-rate PCM cuts (2026-11-17)
+
+VoiceStudio 1.0.26 preserves retained integer PCM samples for recorded-only WAV
+cuts with matching source/export rate, precision and channels, unit speed/gain,
+and normalization disabled. Processing, fades, gaps, word edits, music and timed
+tracks retain their existing treatment pipeline.
+
+Run `npm run test:js -- --maxWorkers=1 test/main/features/voice_studio_pcm.test.ts`
+for exact source-byte-slice oracles at 16/24/32-bit precision, mono/stereo output,
+fresh bundled-Node reopen, explicit gain, concatenation, request overrides and
+rejected-trim/cancel/retry preservation. The wider VoiceStudio owner cases cover
+normalization, processing, word timing, synthesis receipts and supplied music.
+These local codec checks do not establish perceptual listening quality, live
+provider availability or signed-package acceptance.
