@@ -48,6 +48,26 @@ function presentationTree(background: string = '#0F172A') {
 }
 
 describe('PPTX deterministic contrast audit', () => {
+  it('audits the native title type without treating paragraph containers as separate objects', () => {
+    const tree = presentationTree('#10243A');
+    tree.data.format['theme.color.dk1'] = '#10243A';
+    const title = tree.data.children[0].children[0] as any;
+    title.type = 'title';
+    title.path = '/slide[1]/shape[@id=2]';
+    title.children = [{ type: 'paragraph', children: [{
+      type: 'run', text: 'Value starts with a pilot', format: { 'effective.size': '44pt' },
+    }] }];
+
+    const result = auditPptxContrast({ issues: [] }, tree);
+    expect(result.scannedTextCount).toBe(2);
+    expect((result.issues as any).issues).toContainEqual(expect.objectContaining({
+      path: title.path, severity: 'blocker', foreground: '#10243A',
+      background: '#10243A', contrast_ratio: 1,
+    }));
+    title.children[0].children[0].format.color = '#FFFFFF';
+    expect(auditPptxContrast({ issues: [] }, tree).findingCount).toBe(0);
+  });
+
   it.each(['bare', 'direct', 'query'] as const)('audits %s tree output, catching dark-slide text without retaining an engine false positive', (envelope) => {
     const rawIssues = {
       success: true,

@@ -97,6 +97,28 @@ describe('embedded Office page renderer', () => {
     } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
   });
 
+  it.each([
+    { code: 3, stdout: '', stderr: 'Resident main pipe busy or unresponsive', message: 'Resident main pipe busy or unresponsive' },
+    { code: 2, stdout: 'Native stdout diagnostic', stderr: '', message: 'Native stdout diagnostic' },
+    { code: 1, stdout: '', stderr: '', message: 'OfficeCLI exited 1' },
+    { code: 0, stdout: '', stderr: '', message: 'OfficeCLI did not produce preview HTML' },
+  ])('retains native failure facts and cleans up without opening a browser: $code $message', async ({ code, stdout, stderr, message }) => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-office-render-failure-'));
+    const file = path.join(cwd, 'source.pptx');
+    fs.writeFileSync(file, 'unchanged document');
+    const loadElectron = vi.fn();
+    mocks.runOfficeCli.mockResolvedValueOnce({ code, stdout, stderr });
+    try {
+      await expect(renderOfficePageToPng(file, cwd, '2', undefined, { loadElectron }))
+        .rejects.toMatchObject({ message, exitCode: code });
+      const args = mocks.runOfficeCli.mock.calls[0][0];
+      expect(fs.existsSync(path.dirname(args[args.indexOf('-o') + 1]))).toBe(false);
+      expect(loadElectron).not.toHaveBeenCalled();
+      expect(mocks.runOfficeCli).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(file, 'utf8')).toBe('unchanged document');
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
   it('renders OfficeCLI HTML in embedded Electron without invoking its screenshot backend', async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-office-page-renderer-'));
     const source = path.join(cwd, 'deck.pptx');
@@ -134,6 +156,47 @@ describe('embedded Office page renderer', () => {
       expect(win.destroy).toHaveBeenCalled();
       expect(ses.clearStorageData).toHaveBeenCalled();
     } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retains cancellation as a structured cause without dispatching native work', async () => {
+    const abort = new AbortController();
+    abort.abort();
+    await expect(renderOfficePageToPng('source.pptx', '.', '1', abort.signal)).rejects.toMatchObject({
+      code: 'E_OFFICE_ABORTED', message: 'E_OFFICE_ABORTED: Office preview render aborted',
+    });
+    expect(mocks.runOfficeCli).not.toHaveBeenCalled();
+    expect(FakeBrowserWindow.instances).toHaveLength(0);
+  });
+
+  it('retains a render deadline as a structured cause and releases the window and session', async () => {
+    vi.useFakeTimers();
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-office-render-timeout-'));
+    const ses = fakeSession();
+    mocks.runOfficeCli.mockImplementation(async (args: string[]) => {
+      fs.writeFileSync(args[args.indexOf('-o') + 1], '<html></html>');
+      return { code: 0, stdout: '', stderr: '' };
+    });
+    class SlowWindow extends FakeBrowserWindow {
+      loadURL = vi.fn(() => new Promise<void>(() => {}));
+    }
+    try {
+      const pending = expect(renderOfficePageToPng(path.join(cwd, 'source.pptx'), cwd, '1', undefined, {
+        loadElectron: async () => ({ BrowserWindow: SlowWindow as any, session: { fromPartition: () => ses as any } }),
+      })).rejects.toMatchObject({ code: 'E_OFFICE_RENDER_LOAD_TIMEOUT',
+        message: 'E_OFFICE_RENDER_LOAD_TIMEOUT: preview HTML did not load' });
+      // readFile/writeFile use real I/O even with fake timers.
+      await vi.waitFor(() => expect(FakeBrowserWindow.instances).toHaveLength(1));
+      await vi.advanceTimersByTimeAsync(60_000);
+      await pending;
+      expect(FakeBrowserWindow.instances[0].destroy).toHaveBeenCalledTimes(1);
+      expect(ses.clearStorageData).toHaveBeenCalledTimes(1);
+      const args = mocks.runOfficeCli.mock.calls[0][0];
+      expect(fs.existsSync(path.dirname(args[args.indexOf('-o') + 1]))).toBe(false);
+      expect(mocks.runOfficeCli).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
       fs.rmSync(cwd, { recursive: true, force: true });
     }
   });
@@ -194,6 +257,39 @@ describe('embedded Office page renderer', () => {
       expect(win.webContents.capturePage).not.toHaveBeenCalled();
       expect(win.destroy).toHaveBeenCalled();
       expect(ses.clearStorageData).toHaveBeenCalled();
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it.each(['unavailable', 'cancelled'] as const)('does not capture a substitute worksheet when selection is %s', async (outcome) => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-office-worksheet-'));
+    const ses = fakeSession();
+    const controller = new AbortController();
+    mocks.runOfficeCli.mockImplementation(async (args: string[]) => {
+      fs.writeFileSync(args[args.indexOf('-o') + 1], '<html></html>');
+      return { code: 0, stdout: '', stderr: '' };
+    });
+    class SelectionWindow extends FakeBrowserWindow {
+      constructor(options: Record<string, unknown>) {
+        super(options);
+        const ordinary = this.webContents.executeJavaScript.getMockImplementation()!;
+        this.webContents.executeJavaScript.mockImplementation(async script => {
+          if (!script.includes("getAttribute('data-sheet')")) return ordinary(script);
+          if (outcome === 'cancelled') controller.abort();
+          return outcome === 'cancelled';
+        });
+      }
+    }
+    try {
+      await expect(renderOfficePageToPng(path.join(cwd, 'workbook.xlsx'), cwd, '3', controller.signal, {
+        loadElectron: async () => ({ BrowserWindow: SelectionWindow as any, session: { fromPartition: () => ses as any } }),
+      })).rejects.toThrow(outcome === 'cancelled' ? 'E_OFFICE_ABORTED' : 'E_OFFICE_RENDER_PAGE_UNAVAILABLE');
+      const win = FakeBrowserWindow.instances[0];
+      expect(win.webContents.capturePage).not.toHaveBeenCalled();
+      expect(win.destroy).toHaveBeenCalled();
+      expect(ses.clearCache).toHaveBeenCalled();
+      expect(ses.clearStorageData).toHaveBeenCalled();
+      const preview = fileURLToPath(new URL(win.loadURL.mock.calls[0][0]));
+      expect(fs.existsSync(path.dirname(preview))).toBe(false);
     } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
   });
 

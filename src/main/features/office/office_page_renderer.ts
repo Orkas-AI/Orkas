@@ -30,6 +30,17 @@ export interface OfficePageRendererDeps {
   onTextCollisionAudit?: (audit: TextCollisionAudit) => void;
 }
 
+class OfficePageRenderError extends Error {
+  readonly code?: string;
+  readonly exitCode?: number;
+
+  constructor(message: string, details: { code?: string; exitCode?: number }) {
+    super(details.code ? `${details.code}: ${message}` : message);
+    this.code = details.code;
+    this.exitCode = details.exitCode;
+  }
+}
+
 const READY_SCRIPT = `(async () => {
   if (document.fonts && document.fonts.ready) await document.fonts.ready;
   const images = Array.from(document.images || []);
@@ -53,6 +64,26 @@ const WORD_FIRST_PAGE_SCRIPT = `(async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
 })()`;
 
+// XLSX HTML contains every worksheet and defaults to the first, even when
+// OfficeCLI receives --page. Select its zero-based sheet identity explicitly;
+// missing or hidden selections must not silently capture another worksheet.
+function worksheetSelectionScript(page: string): string {
+  return `(() => {
+    const index = Number(${JSON.stringify(page)}) - 1;
+    if (!Number.isSafeInteger(index) || index < 0) return false;
+    const sheets = Array.from(document.querySelectorAll('.sheet-content'));
+    const matches = sheets.filter(sheet => sheet.getAttribute('data-sheet') === String(index));
+    if (matches.length !== 1) return false;
+    const target = matches[0];
+    sheets.forEach(sheet => sheet.classList.toggle('active', sheet === target));
+    document.querySelectorAll('.sheet-tab').forEach(tab => {
+      tab.classList.toggle('active', tab.getAttribute('data-sheet') === String(index));
+    });
+    window.scrollTo(0, 0);
+    return sheets.every(sheet => (sheet.offsetParent !== null) === (sheet === target));
+  })()`;
+}
+
 const CONTENT_SIZE_SCRIPT = `(() => {
   const visible = (element) => element && element.offsetParent !== null;
   const slide = Array.from(document.querySelectorAll('.slide')).find(visible);
@@ -68,9 +99,9 @@ const CONTENT_SIZE_SCRIPT = `(() => {
   };
 })()`;
 
-function withTimeout<T>(promise: Promise<T>, message: string, timeoutMs = OFFICE_RENDER_TIMEOUT_MS): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, code: string, message: string, timeoutMs = OFFICE_RENDER_TIMEOUT_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    const timer = setTimeout(() => reject(new OfficePageRenderError(message, { code })), timeoutMs);
     promise.then(
       (value) => { clearTimeout(timer); resolve(value); },
       (error) => { clearTimeout(timer); reject(error); },
@@ -79,7 +110,7 @@ function withTimeout<T>(promise: Promise<T>, message: string, timeoutMs = OFFICE
 }
 
 function assertNotAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw new Error('E_OFFICE_ABORTED: Office preview render aborted');
+  if (signal?.aborted) throw new OfficePageRenderError('Office preview render aborted', { code: 'E_OFFICE_ABORTED' });
 }
 
 function normalizeContentSize(value: unknown): { width: number; height: number } {
@@ -160,7 +191,11 @@ export async function renderOfficePageToPng(
       { cwd, timeoutMs: OFFICE_RENDER_TIMEOUT_MS, ...(signal ? { signal } : {}) },
     );
     if (rendered.code !== 0 || !fs.existsSync(htmlPath)) {
-      throw new Error(rendered.stderr || rendered.stdout || `OfficeCLI exited ${rendered.code}`);
+      throw new OfficePageRenderError(
+        rendered.stderr || rendered.stdout || (rendered.code !== 0
+          ? `OfficeCLI exited ${rendered.code}` : 'OfficeCLI did not produce preview HTML'),
+        { exitCode: rendered.code },
+      );
     }
     assertNotAborted(signal);
 
@@ -173,7 +208,7 @@ export async function renderOfficePageToPng(
     const electron = await (deps.loadElectron?.() ?? import('electron') as Promise<ElectronRuntime>);
     const BrowserWindow = electron.BrowserWindow;
     if (!BrowserWindow || !electron.session) {
-      throw new Error('E_OFFICE_RENDERER_UNAVAILABLE: Electron BrowserWindow is unavailable');
+      throw new OfficePageRenderError('Electron BrowserWindow is unavailable', { code: 'E_OFFICE_RENDERER_UNAVAILABLE' });
     }
 
     const partition = `office-render-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
@@ -199,28 +234,39 @@ export async function renderOfficePageToPng(
     }
 
     const entryUrl = `${pathToFileURL(htmlPath).toString()}#screenshot`;
-    await withTimeout(win.loadURL(entryUrl), 'E_OFFICE_RENDER_LOAD_TIMEOUT: preview HTML did not load');
+    await withTimeout(win.loadURL(entryUrl), 'E_OFFICE_RENDER_LOAD_TIMEOUT', 'preview HTML did not load');
     await withTimeout(
       win.webContents.executeJavaScript(READY_SCRIPT, true),
-      'E_OFFICE_RENDER_READY_TIMEOUT: fonts or images did not settle',
+      'E_OFFICE_RENDER_READY_TIMEOUT', 'fonts or images did not settle',
     );
     assertNotAborted(signal);
 
     await withTimeout(
       win.webContents.executeJavaScript(WORD_FIRST_PAGE_SCRIPT, true),
-      'E_OFFICE_RENDER_PAGINATION_TIMEOUT: preview pagination did not settle',
+      'E_OFFICE_RENDER_PAGINATION_TIMEOUT', 'preview pagination did not settle',
     );
     assertNotAborted(signal);
 
+    if (path.extname(file).toLowerCase() === '.xlsx') {
+      const selected = await withTimeout(
+        win.webContents.executeJavaScript(worksheetSelectionScript(page), true),
+        'E_OFFICE_RENDER_SELECTION_TIMEOUT', 'worksheet selection did not settle',
+      );
+      assertNotAborted(signal);
+      if (selected !== true) {
+        throw new OfficePageRenderError(`worksheet ${page} has no unique visible selection.`, { code: 'E_OFFICE_RENDER_PAGE_UNAVAILABLE' });
+      }
+    }
+
     const layout = await win.webContents.executeJavaScript(CONTENT_SIZE_SCRIPT, true);
     if (layout?.missingPage) {
-      throw new Error(`E_OFFICE_RENDER_PAGE_UNAVAILABLE: page ${page} has no visible Office page or worksheet.`);
+      throw new OfficePageRenderError(`page ${page} has no visible Office page or worksheet.`, { code: 'E_OFFICE_RENDER_PAGE_UNAVAILABLE' });
     }
     const size = normalizeContentSize(layout);
     win.setContentSize(size.width, size.height, false);
     await withTimeout(
       win.webContents.executeJavaScript(READY_SCRIPT, true),
-      'E_OFFICE_RENDER_RESIZE_TIMEOUT: resized preview did not settle',
+      'E_OFFICE_RENDER_RESIZE_TIMEOUT', 'resized preview did not settle',
     );
     assertNotAborted(signal);
 
@@ -229,7 +275,7 @@ export async function renderOfficePageToPng(
       try {
         const collected = await withTimeout(
           win.webContents.executeJavaScript(PPTX_TEXT_COLLISION_SCRIPT, true),
-          'E_OFFICE_TEXT_AUDIT_TIMEOUT: text layout collection timed out',
+          'E_OFFICE_TEXT_AUDIT_TIMEOUT', 'text layout collection timed out',
           2_000,
         );
         if (collected && ['checked', 'partial', 'not_assessed'].includes(collected.status)) audit = collected;
@@ -240,7 +286,7 @@ export async function renderOfficePageToPng(
 
     const image = await withTimeout(
       win.webContents.capturePage({ x: 0, y: 0, width: size.width, height: size.height }),
-      'E_OFFICE_RENDER_CAPTURE_TIMEOUT: preview screenshot timed out',
+      'E_OFFICE_RENDER_CAPTURE_TIMEOUT', 'preview screenshot timed out',
     );
     // capturePage uses the display's backing scale on Retina Macs. Normalize
     // back to the requested CSS-pixel dimensions so a 1280x720 slide does not
@@ -250,7 +296,7 @@ export async function renderOfficePageToPng(
       ? image
       : image.resize({ width: size.width, height: size.height, quality: 'best' });
     const png = normalizedImage.toPNG();
-    if (!png.length) throw new Error('E_OFFICE_RENDER_EMPTY: preview screenshot was empty');
+    if (!png.length) throw new OfficePageRenderError('preview screenshot was empty', { code: 'E_OFFICE_RENDER_EMPTY' });
     return png;
   } finally {
     if (signal && onAbort) signal.removeEventListener('abort', onAbort);

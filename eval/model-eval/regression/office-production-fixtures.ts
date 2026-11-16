@@ -5,6 +5,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import AdmZip from "adm-zip";
+import { XMLParser, XMLValidator } from "fast-xml-parser";
+// Shared immutable fixture data; private scenario catalog remains excluded.
+const PPT_MIXED_SOURCE_METRICS = [
+  { attribute: "实际", period: "2025-Q1", region: "全部", value: 120, unit: "万元", status: "已核验" },
+  { attribute: "实际", period: "2025-Q2", region: "全部", value: 138, unit: "万元", status: "已核验" },
+  { attribute: "实际", period: "2025-Q3", region: "全部", value: 151, unit: "万元", status: "已核验" },
+  { attribute: "实际", period: "2025-Q4", region: "全部", value: 169, unit: "万元", status: "已核验" },
+  { attribute: "目标", period: "2026", region: "全年", value: 210, unit: "万元", status: "未实现" },
+  { attribute: "实际", period: "2025", region: "华东", value: 72, unit: "万元", status: "已核验" },
+  { attribute: "实际", period: "2025", region: "华南", value: 55, unit: "万元", status: "已核验" },
+  { attribute: "实际", period: "2025", region: "华北", value: 42, unit: "万元", status: "已核验" },
+] as const;
 import {
   PDFDocument,
   StandardFonts,
@@ -14,6 +26,7 @@ import {
 export interface OfficeProductionFixtureState {
   baselineFiles: string[];
   sourceHashes: Record<string, string>;
+  mixedSourceReference?: { brief: string; metrics: string };
   pptxPreservation?: {
     sourceFile: string;
     expectedShapeRemovals: Array<{
@@ -383,14 +396,7 @@ function seedPptMixedSourcePack(root: string): string[] {
     "metrics.csv",
     [
       "属性,周期,区域,数值,单位,状态",
-      "实际,2025-Q1,全部,120,万元,已核验",
-      "实际,2025-Q2,全部,138,万元,已核验",
-      "实际,2025-Q3,全部,151,万元,已核验",
-      "实际,2025-Q4,全部,169,万元,已核验",
-      "目标,2026,全年,210,万元,未实现",
-      "实际,2025,华东,72,万元,已核验",
-      "实际,2025,华南,55,万元,已核验",
-      "实际,2025,华北,42,万元,已核验",
+      ...PPT_MIXED_SOURCE_METRICS.map(row => [row.attribute, row.period, row.region, row.value, row.unit, row.status].join(",")),
     ].join("\n"),
   );
   return [brief, metrics];
@@ -519,6 +525,12 @@ export async function seedOfficeProductionFixture(
     sourceHashes: Object.fromEntries(
       baselineFiles.map((file) => [file, sha256(path.join(root, ...file.split("/")))]),
     ),
+    ...(scenarioId === "ppt-mixed-source-executive-update" ? {
+      mixedSourceReference: {
+        brief: fs.readFileSync(path.join(root, "project-update.md"), "utf8"),
+        metrics: fs.readFileSync(path.join(root, "metrics.csv"), "utf8"),
+      },
+    } : {}),
     ...(scenarioId === "office-existing-deck-cleanup" ? {
       pptxPreservation: {
         sourceFile: "annual-review.pptx",
@@ -699,6 +711,79 @@ function pptxRawRecordRows(xml: string): number {
   return worst;
 }
 
+/** Bounded, evaluator-only observations. No answer reconstruction: even wrong
+ * associations stay wrong, chart point indices stay attached, and orphan parts
+ * cannot establish visible facts. Rendered evidence still owns actual pixels. */
+function inspectPptxGroundingEvidence(file: string, evidence: string[]): boolean {
+  if (fs.statSync(file).size > 8 * 1024 * 1024) {
+    evidence.push("pptx_observation_incomplete=file-budget");
+    return false;
+  }
+  const zip = new AdmZip(file);
+  const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true,
+    parseTagValue: false, processEntities: false });
+  let remaining = 14000;
+  // Bound cumulative parsing too: a slide can reference the same chart many
+  // times. Per-part limits alone would still allow unbounded repeated work.
+  let partsLeft = 64;
+  let complete = true;
+  let observed = 0;
+  const identity = sha256(file);
+  const nodes = (value: any, key: string): any[] => {
+    if (!value || typeof value !== "object") return [];
+    if (Array.isArray(value)) return value.flatMap(item => nodes(item, key));
+    return Object.entries(value).flatMap(([name, child]) => name === key
+      ? (Array.isArray(child) ? child : [child]) : nodes(child, key));
+  };
+  const paragraphs = (node: any): string[] => nodes(node, "p").map(paragraph =>
+    nodes(paragraph, "t").map(value => decodeXmlText(typeof value === "object" ? String(value?.["#text"] ?? "") : String(value))).join(""));
+  const read = (part: string): any => {
+    if (partsLeft-- <= 0) throw new Error("part-budget");
+    const entry = zip.getEntry(part);
+    if (!entry || entry.header.size > 128 * 1024) throw new Error("part-unavailable");
+    const xml = entry.getData().toString("utf8");
+    if (xml.length > 128 * 1024 || /<!DOCTYPE/i.test(xml) || XMLValidator.validate(xml) !== true) throw new Error("part-invalid");
+    return parser.parse(xml);
+  };
+  const emit = (part: string, kind: string, content: unknown) => {
+    const row = "pptx_observed=" + JSON.stringify({ file: path.basename(file), sha256: identity, part, kind, content });
+    if (row.length > remaining) { complete = false; return; }
+    remaining -= row.length; observed++; evidence.push(row);
+  };
+  const slides = zip.getEntries().filter(entry => /^ppt\/slides\/slide\d+\.xml$/.test(entry.entryName))
+    .sort((a, b) => a.entryName.localeCompare(b.entryName, undefined, { numeric: true }));
+  if (!slides.length || slides.length > 16) complete = false;
+  for (const slide of slides.slice(0, 16)) {
+    try {
+      const body = read(slide.entryName);
+      for (const shape of nodes(body, "sp")) {
+        const text = paragraphs(shape);
+        if (text.some(line => line.trim())) emit(slide.entryName, "text", text.join("\n"));
+      }
+      for (const table of nodes(body, "tbl")) {
+        emit(slide.entryName, "table", nodes(table, "tr").map(row => nodes(row, "tc").map(cell => paragraphs(cell).join("\n"))));
+      }
+      const charts = nodes(body, "chart");
+      if (charts.length) {
+        const relations = nodes(read(path.posix.join(path.posix.dirname(slide.entryName), "_rels", path.posix.basename(slide.entryName) + ".rels")), "Relationship");
+        for (const chart of charts) {
+          const relation = relations.find(item => item["@_Id"] === chart["@_id"]);
+          if (!relation || relation["@_TargetMode"] === "External") throw new Error("chart-unavailable");
+          const part = path.posix.normalize(path.posix.join(path.posix.dirname(slide.entryName), relation["@_Target"]));
+          if (!part.startsWith("ppt/charts/") || !part.endsWith(".xml")) throw new Error("chart-outside");
+          const parsed = read(part);
+          const series = nodes(parsed, "ser").map(item => ({ name: item.tx, categories: item.cat,
+            values: item.val, xValues: item.xVal, yValues: item.yVal }));
+          if (!series.length) throw new Error("chart-no-series");
+          emit(part, "chart", { slide: slide.entryName, titles: nodes(parsed, "title").map(paragraphs), series });
+        }
+      }
+    } catch { complete = false; }
+  }
+  if (!complete || !observed) evidence.push("pptx_observation_incomplete=missing-invalid-or-budgeted-content");
+  return complete && observed > 0;
+}
+
 function inspectPptx(file: string, features: Set<string>, evidence: string[]): void {
   const zip = new AdmZip(file);
   const slideEntries = zip.getEntries()
@@ -741,7 +826,7 @@ function inspectPptx(file: string, features: Set<string>, evidence: string[]): v
   // `实际｜2025-Q1｜全部｜120 万元｜已核验`, which satisfied every value and label
   // it asks for while the rendered-aesthetic judge scored 73. Pasting the source
   // pack was the cheapest way to pass. This is the separate signal, so the
-  // facts check stays exactly as strict as before and no longer rewards a dump.
+  // lexical presence signal is separate from relation judgment and presentation.
   const rawRecordDumpSlides = slideXml.filter(
     (xml) => pptxRawRecordRows(xml) >= PPTX_RECORD_ROWS_PER_DUMP,
   ).length;
@@ -770,7 +855,7 @@ function inspectPptx(file: string, features: Set<string>, evidence: string[]): v
     mixedSourceLabels.every((value) => text.includes(value))
     && mixedSourceValues.every(hasMixedSourceValue)
   ) {
-    features.add("pptx-source-pack-facts-preserved");
+    features.add("pptx-source-pack-terms-present");
   }
   if (notesCount > 0) features.add("pptx-notes-preserved");
   if (!text.includes("旧公司名称")) features.add("pptx-old-label-removed");
@@ -1122,6 +1207,10 @@ export async function inspectOfficeProductionArtifacts(
   });
   if (preserved.length && preserved.every(Boolean)) features.add("source-fixtures-preserved");
 
+  if (fixture.mixedSourceReference) {
+    evidence.push("pptx_source_reference=" + JSON.stringify(fixture.mixedSourceReference));
+  }
+
   const sourcePdf = Object.keys(fixture.sourceHashes).find((file) => file.endsWith(".pdf"));
   const sourcePdfBytes = sourcePdf
     ? fs.statSync(path.join(root, ...sourcePdf.split("/"))).size
@@ -1134,7 +1223,12 @@ export async function inspectOfficeProductionArtifacts(
       const extension = path.extname(relative).toLowerCase();
       if (extension === ".xlsx") inspectXlsx(absolute, features, evidence);
       else if (extension === ".docx") inspectDocx(absolute, features, evidence);
-      else if (extension === ".pptx") inspectPptx(absolute, features, evidence);
+      else if (extension === ".pptx") {
+        inspectPptx(absolute, features, evidence);
+        if (fixture.mixedSourceReference && inspectPptxGroundingEvidence(absolute, evidence)) {
+          features.add("pptx-source-grounding-evidence-complete");
+        }
+      }
       else if (extension === ".pdf") await inspectPdf(absolute, sourcePdfBytes, features, evidence);
     } catch (error) {
       evidence.push(

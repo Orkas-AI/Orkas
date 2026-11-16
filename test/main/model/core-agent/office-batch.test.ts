@@ -246,6 +246,41 @@ describe('buildXlsxBatch', () => {
 });
 
 describe('buildPptxBatch', () => {
+  it('sets optional placeholder geometry and styles without adding a second text object', () => {
+    expect(buildPptxBatch([{ title: 'Clear title', body: 'Supporting copy',
+      titleStyle: { x: '0.8in', y: '0.5in', width: '10in', height: '0.6in', size: '28', color: '#FFFFFF' },
+      bodyStyle: { y: '1.5in', size: '18', color: '#D4DFEA' },
+    }])).toEqual([
+      { command: 'add', parent: '/', type: 'slide', props: { title: 'Clear title', text: 'Supporting copy' } },
+      { command: 'set', path: '/slide[1]/shape[1]', props: { x: '0.8in', y: '0.5in', width: '10in', height: '0.6in', size: '28', color: '#FFFFFF' } },
+      { command: 'set', path: '/slide[1]/shape[2]', props: { y: '1.5in', size: '18', color: '#D4DFEA' } },
+    ]);
+    expect(buildPptxBatch([{ body: 'Body only', bodyStyle: { color: '#FFFFFF' } }])[1])
+      .toEqual({ command: 'set', path: '/slide[1]/shape[1]', props: { color: '#FFFFFF' } });
+  });
+
+  it('constructs a themed canvas and editable relationship diagram without replacing custom objects', () => {
+    const ops = buildPptxBatch([{
+      diagrams: [{ mermaid: 'flowchart LR; A[Input] --> B[Result]', x: '1in', y: '1in', width: '8in', height: '4in' }],
+      shapes: [{ text: 'Custom annotation', color: '#FF5500', x: '9in', y: '1in' }],
+    }], {
+      canvas: { width: '12in', height: '7in' },
+      theme: { bodyFont: 'Arial', 'bodyFont.ea': 'Microsoft YaHei', accent1: '#7C3AED' },
+    });
+    expect(ops.slice(0, 3)).toEqual([
+      { command: 'set', path: '/', props: { slideWidth: '12in', slideHeight: '7in' } },
+      { command: 'set', path: '/theme', props: { bodyFont: 'Arial', 'bodyFont.ea': 'Microsoft YaHei', accent1: '#7C3AED' } },
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+    ]);
+    expect(ops).toContainEqual({ command: 'add', parent: '/slide[1]', type: 'diagram', props: {
+      mermaid: 'flowchart LR; A[Input] --> B[Result]', render: 'native', poster: 'false',
+      x: '1in', y: '1in', width: '8in', height: '4in',
+    } });
+    expect(ops).toContainEqual({ command: 'add', parent: '/slide[1]', type: 'shape', props: {
+      text: 'Custom annotation', color: '#FF5500', x: '9in', y: '1in',
+    } });
+  });
+
   it('emits add-slide ops with title/body(text)/layout', () => {
     const ops = buildPptxBatch([
       { title: '封面', body: '副标题' },
@@ -438,6 +473,31 @@ describe('buildPptxBatch', () => {
 });
 
 describe('buildEditBatch', () => {
+  it('appends complete PPTX slides with the creation compiler inside the existing ordered batch', () => {
+    const ops: EditOp[] = [
+      { action: 'remove', path: '/slide[2]' },
+      { action: 'add', parent: '/', type: 'slide', props: {
+        title: 'Added page', body: 'Supporting copy', name: 'New page',
+        titleStyle: { size: '28', height: '0.6in' },
+        shapes: [{ text: 'Editable detail', x: '1in', y: '2in', line: '#112233', lineOpacity: 50 }],
+        tables: [{ rows: [['Status', 'Draft']] }],
+      } },
+      { action: 'add', parent: '/', type: 'slide', props: { shapes: [{ text: 'Next page' }] } },
+    ];
+    expect(buildEditBatch(ops, { pptx: true })).toEqual([
+      { command: 'remove', path: '/slide[2]' },
+      { command: 'add', parent: '/', type: 'slide', props: { title: 'Added page', text: 'Supporting copy', name: 'New page' } },
+      { command: 'set', path: '/slide[last()]/shape[1]', props: { size: '28', height: '0.6in' } },
+      { command: 'add', parent: '/slide[last()]', type: 'shape', props: { text: 'Editable detail', x: '1in', y: '2in', line: '#112233', lineOpacity: '0.5' } },
+      { command: 'add', parent: '/slide[last()]', type: 'table', props: { rows: '1', cols: '2' } },
+      { command: 'set', path: '/slide[last()]/table[1]/tr[1]/tc[1]', props: { text: 'Status' } },
+      { command: 'set', path: '/slide[last()]/table[1]/tr[1]/tc[2]', props: { text: 'Draft' } },
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+      { command: 'add', parent: '/slide[last()]', type: 'shape', props: { text: 'Next page' } },
+    ]);
+    expect(() => buildEditBatch(ops)).toThrow(OfficeEditInputError);
+  });
+
   it('maps set/add/remove to batch commands and stringifies props', () => {
     const ops = buildEditBatch([
       { action: 'set', path: '/body/p[2]', props: { text: '改后', align: 'center' } },
