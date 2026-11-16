@@ -315,7 +315,7 @@ async function _loadVisibleChatSnippets() {
     const anchor = body.querySelector('.search-result.active');
     const rect = anchor?.getBoundingClientRect();
     const bounds = body.getBoundingClientRect();
-    const visible = rect && rect.bottom > bounds.top && rect.top < bounds.bottom;
+    const visible = top > 0 && rect && rect.bottom > bounds.top && rect.top < bounds.bottom;
     _renderSearchResults(query);
     body.scrollTop = top;
     const retained = visible && body.querySelector('.search-result.active');
@@ -362,7 +362,9 @@ async function _runProgressiveSearch(query, seq, startedAt, projectId, pending) 
     const anchor = body?.querySelector('.search-result.active');
     const rect = anchor?.getBoundingClientRect();
     const bounds = anchor ? body.getBoundingClientRect() : null;
-    const visible = rect && rect.bottom > bounds.top && rect.top < bounds.bottom;
+    // At the start of the list, late categories must not pull the viewport
+    // down to the row that happened to be selected by the first page.
+    const visible = top > 0 && rect && rect.bottom > bounds.top && rect.top < bounds.bottom;
     _renderSearchResults(query);
     if (body) {
       body.scrollTop = top;

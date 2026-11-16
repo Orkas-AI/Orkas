@@ -319,10 +319,12 @@ describe('public search query and response bounds', () => {
     await expect(runSearchAdapter({provider, apiKey:'fixture'} as any, '🌏'.repeat(provider === 'tavily' ? 401 : 129), 8)).rejects.toThrow(String(provider === 'tavily' ? 400 : 128));
     expect(fetch).not.toHaveBeenCalled();
   });
-  it.each([['deepseek',128], ['tavily',400]] as const)('sends the complete trimmed %s Unicode query', async(provider,length)=>{
-    const fetch=vi.fn(async()=>new Response(JSON.stringify({results:[]}))); vi.stubGlobal('fetch',fetch);
+  it.each([['deepseek',127], ['deepseek',128], ['tavily',129], ['tavily',399], ['tavily',400]] as const)('sends the complete trimmed %s Unicode query', async(provider,length)=>{
+    const fetch=vi.fn(async()=>new Response(JSON.stringify({results:[{url:'https://example.org',summary:'DS evidence',content:'TV evidence'}]}))); vi.stubGlobal('fetch',fetch);
     const query='🌏'.repeat(length);
-    await runSearchAdapter({provider,apiKey:'fixture'} as any,'  '+query+'  ',3);
+    const result=await runSearchAdapter({provider,apiKey:'fixture'} as any,'  '+query+'  ',3);
+    expect(result.results[0].snippet).toBe(provider==='deepseek'?'DS evidence':'TV evidence');
+    expect(fetch).toHaveBeenCalledOnce();
     expect(JSON.parse((fetch.mock.calls[0] as any)[1].body).query).toBe(query);
   });
   it.each(['deepseek','tavily'])('rejects unsafe result URLs and bounds %s evidence',async provider=>{

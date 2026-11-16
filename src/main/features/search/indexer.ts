@@ -30,6 +30,7 @@ import {
   projectChatIndexFile, userContextsIndexPath, userChatsIndexPath,
 } from '../../paths';
 import { conversationMessageReadFile, listProjectIds } from '../../util/project-layout';
+import { appConversationOwner } from '../../paths';
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
 import { closeChatSnippetReader } from './chat-snippets';
@@ -361,6 +362,7 @@ export function indexChatMessageDeferred(
   msgIndex: number,
   msg: ChatMessage | JsonlAppendSource,
 ): void {
+  if (appConversationOwner(cid)) return;
   void indexChatMessage(userId, cid, msgIndex, msg);
 }
 
@@ -631,7 +633,7 @@ async function _listUserChats(
   const { listConversationDisplayRows } = await import('../chats');
   const projectIds = listProjectIds(userId);
   const eligibility = await chatEligibility(userId,
-    await listConversationDisplayRows(userId, { includeDeleted: true }), new Set(projectIds));
+    await listConversationDisplayRows(userId, { includeDeleted: true, includeHidden: true }), new Set(projectIds));
   const roots = [userChatsDir(userId), ...projectIds.map((pid) => projectChatsDir(userId, pid))];
   const candidates: Array<{ fileKey: string; file: string }> = [];
   let reliable = eligibility.complete;

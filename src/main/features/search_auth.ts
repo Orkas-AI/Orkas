@@ -24,7 +24,7 @@ import {
   type SearchProfile,
 } from './auth';
 import { createLogger } from '../logger';
-import { searchAdaptersByProvider, runSearchAdapter } from '../model/core-agent/search-adapters';
+import { searchAdaptersByProvider, runSearchAdapter, SEARCH_PROVIDER_LABEL, SEARCH_PROVIDER_DOCS } from '../model/core-agent/search-adapters';
 import { logErrorSummary } from '../util/log-redact';
 
 const log = createLogger('search-auth');
@@ -41,6 +41,13 @@ function sanitizeLabel(input: string): string {
 
 export function listSearchProfiles(): SearchProfile[] {
   return loadSearchProfiles();
+}
+
+/** Shipped public choices, without credentials or network/runtime discovery. */
+export function listSearchProviderOptions(): Array<{ id: string; label: string; docs?: string }> {
+  return Object.keys(searchAdaptersByProvider).map(id => ({
+    id, label: SEARCH_PROVIDER_LABEL[id] || id, docs: SEARCH_PROVIDER_DOCS[id],
+  }));
 }
 
 /**

@@ -4,12 +4,19 @@ import type { ProviderRequestFailure } from './request-diagnostics.js';
 
 type ModelKey = { api: string; provider: string; id: string };
 type Row = Record<string, string | number | boolean>;
-type Origin = { status: string; response: string; sequence: number; ref?: string; model: ModelKey; ambiguous?: boolean };
+type Origin = { status: string; response: string; sequence: number; model: ModelKey; ambiguous?: boolean };
 const origins = new WeakMap<object, Map<string, Origin>>();
 const STATES = new Set(['completed', 'in_progress', 'incomplete', 'failed', 'cancelled', 'queued']);
 const KINDS = new Set(['reasoning', 'message', 'function_call', 'function_call_output',
   'custom_tool_call', 'custom_tool_call_output', 'tool_search_call', 'tool_search_output', 'additional_tools']);
 const APIS = new Set(['openai-responses', 'azure-openai-responses', 'openai-codex-responses']);
+export type ResponsesRejectedInput = { index: number; field: 'id' | 'status' };
+/** Closed protocol positions only; never retain arbitrary property names. */
+export function responsesRejectedInput(value: unknown): ResponsesRejectedInput | undefined {
+  if (typeof value !== 'string' || value.length > 32) return;
+  const match = /^input\[(\d{1,6})\]\.(id|status)$/.exec(value);
+  if (match) return { index: Number(match[1]), field: match[2] as 'id' | 'status' };
+}
 const object = (v: unknown): Record<string, unknown> | undefined => v && typeof v === 'object' && !Array.isArray(v)
   ? v as Record<string, unknown> : undefined;
 function status(value: unknown, present = true): string {
@@ -24,7 +31,6 @@ export function createResponsesStatusDiagnostics(
   owner: ((failure: ProviderRequestFailure) => void) | undefined,
   model: ModelKey,
   sequence: number | undefined,
-  requestRef: unknown,
 ) {
   if (!owner || !APIS.has(model.api)) return undefined;
   let source = origins.get(owner);
@@ -68,17 +74,17 @@ export function createResponsesStatusDiagnostics(
           }
           if (!previous && records.size >= 256) records.delete(records.keys().next().value!);
           records.set(key, { status: status(item.status, 'status' in item), response: status(responseStatus, responseStatus !== undefined),
-            sequence: sequence ?? 0, model: { api: model.api, provider: model.provider, id: model.id },
-            ...(typeof requestRef === 'string' && /^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestRef) ? { ref: requestRef } : {}) });
+            sequence: sequence ?? 0, model: { api: model.api, provider: model.provider, id: model.id } });
         }
       } catch { /* Metadata never changes the response result. */ }
     },
-    failure(rejectedIndex?: number): Record<string, unknown> | undefined {
+    failure(rejectedIndex?: number, rejectedField?: 'id' | 'status'): Record<string, unknown> | undefined {
       try {
         const input = payload?.input;
         if (!Array.isArray(input)) return undefined;
         const indices: number[] = [];
-        if (rejectedIndex !== undefined && Number.isInteger(rejectedIndex) && rejectedIndex >= 0 && rejectedIndex < input.length) indices.push(rejectedIndex);
+        const rejectedInRange = rejectedIndex !== undefined && Number.isInteger(rejectedIndex) && rejectedIndex >= 0 && rejectedIndex < input.length;
+        if (rejectedInRange) indices.push(rejectedIndex!);
         for (let i = 0; i < Math.min(input.length, 48) && indices.length < 4; i++) {
           if (object(input[i])?.type === 'reasoning' && !indices.includes(i)) indices.push(i);
         }
@@ -93,13 +99,13 @@ export function createResponsesStatusDiagnostics(
           if (origin && !origin.ambiguous) {
             Object.assign(row, { source_status: origin.status, source_response_status: origin.response,
               source_sequence: origin.sequence,
-              same_model: origin.model.api === model.api && origin.model.provider === model.provider && origin.model.id === model.id,
-              ...(origin.ref ? { source_request_ref: origin.ref } : {}) });
+              same_model: origin.model.api === model.api && origin.model.provider === model.provider && origin.model.id === model.id });
           }
           return row;
         });
         return { version: 1, input_count: input.length, prefix_limit: 48,
-          ...(rejectedIndex === undefined ? {} : { rejected_index: rejectedIndex }), rows };
+          ...(rejectedIndex === undefined ? {} : { rejected_index: rejectedIndex }),
+          ...(rejectedInRange && (rejectedField === 'id' || rejectedField === 'status') ? { rejected_field: rejectedField } : {}), rows };
       } catch { return undefined; }
     },
   };

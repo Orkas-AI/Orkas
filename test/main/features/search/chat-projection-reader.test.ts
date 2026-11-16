@@ -161,7 +161,7 @@ it('avoids history reads and full cache scans for cold summaries, with negative 
       return await new Promise<any>((resolve, reject) => {
         const timeout = setTimeout(() => reject(Error('Cold summary worker timed out')), 10_000);
         worker.once('error', error => { clearTimeout(timeout); reject(error); });
-        worker.once('message', result => { clearTimeout(timeout); resolve(result); });
+        worker.on('message', result => { if (result.id !== 1) return; clearTimeout(timeout); resolve(result); });
         // No entry covers every token: pruning must work even without the
         // early-return path, and the later best match must retain its position.
         worker.postMessage({ id: 1, file, indexes: [0], tokens: ['电商', '领域', 'absent'], ...(cached ? { source: { userId: uid, cid } } : {}) });

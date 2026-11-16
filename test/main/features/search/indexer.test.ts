@@ -56,6 +56,27 @@ async function loadIndexer() {
   return import('../../../../src/main/features/search/indexer');
 }
 
+it('keeps both app execution lifetimes out of live indexing while ordinary app-named conversations remain searchable', async () => {
+  const ix = await loadIndexer();
+  await ix.reconcileChatsIndex(TEST_UID);
+  const storage = await import('../../../../src/main/storage');
+  const { conversationMessageFile } = await import('../../../../src/main/util/project-layout');
+  const cids = ['app_notes', ...['once', 'retain'].map(mode => `app_${'a'.repeat(64)}_${mode}_${'b'.repeat(32)}`)];
+  const sources: string[] = [];
+  for (const cid of cids) {
+    const file = conversationMessageFile(TEST_UID, cid);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const row = await storage.appendJsonlAtomic(file, { role: 'user', content: 'appindexmarker', time: 't' }, true);
+    sources.push(file);
+    ix.indexChatMessageDeferred(TEST_UID, cid, row.msgIndex, row.source!);
+  }
+  await ix.drainDeferredChatWrites(TEST_UID);
+  expect((await loadChatStore()).indexedConversationIds(TEST_UID)).toEqual(new Set(['app_notes']));
+  expect((await (await import('../../../../src/main/features/search')).searchChats(TEST_UID, 'appindexmarker')).map(row => row.cid))
+    .toEqual(['app_notes']);
+  for (const file of sources) expect(fs.readFileSync(file, 'utf8')).toContain('appindexmarker');
+});
+
 // The chat index moved from a JSON snapshot to `chat_store`; these read the
 // same facts the cases used to read off `entry.idx`.
 async function loadChatStore() {
