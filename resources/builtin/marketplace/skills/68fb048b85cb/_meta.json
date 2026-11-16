@@ -1,16 +1,15 @@
 {
-  "version": "1.0.13",
-  "updated_at": "2026-09-18T14:46:49.000Z",
+  "version": "1.0.14",
+  "updated_at": "2026-11-06T09:11:37Z",
   "reseed_if_deleted_before": "2026-07-28T13:32:31Z",
   "category": "rnd",
   "routing": {
     "applicable_domain": [
-      "existing software repositories with a clear feature, bug, refactor, review, performance, build, or test objective",
+      "software workspaces or repositories with a clear feature, prototype, demo, small-tool, bug, refactor, review, performance, build, or test objective",
       "technical decisions, migrations, dependency changes, and implementation verification"
     ],
     "negative_examples": [
       "discover what product to build when the user problem and success criteria are still vague",
-      "make a disposable demo only to validate an idea",
       "write product acceptance scenarios without implementing or testing code",
       "triage pull requests or operate GitHub as a repository maintainer"
     ],

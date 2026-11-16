@@ -24,6 +24,8 @@ def load_script(name: str):
     return module
 
 
+# Match direct script execution: both entrypoints import this sibling module.
+load_script("social_metrics_core")
 analyze = load_script("analyze_performance")
 calculator = load_script("calculate_metrics")
 fetch_core = load_script("social_fetch_core")
@@ -47,6 +49,9 @@ def sample_campaign():
             {
                 "id": "low",
                 "likes": 1,
+                "comments": 0,
+                "shares": 0,
+                "saves": 0,
                 "reach": 100,
                 "impressions": 100,
                 "clicks": 1,
@@ -69,6 +74,7 @@ def test_analyzers_aggregate_benchmark_rank_and_roi_consistently():
         "total_clicks": 5,
         "avg_engagement_rate": 7.5,
         "ctr": 1.67,
+        "unavailable_reasons": {},
     }
     assert metrics["roi_metrics"]["cost_per_click"] == 4.0
     assert analyze.benchmark_performance(metrics["campaign_metrics"])["ctr_status"] == "excellent"
@@ -79,17 +85,27 @@ def test_analyzers_aggregate_benchmark_rank_and_roi_consistently():
     assert detailed["campaign_metrics"] == metrics["campaign_metrics"]
 
 
-def test_analyzers_reject_empty_negative_and_zero_reach_inputs(tmp_path):
+def test_analyzers_reject_empty_and_negative_inputs_but_preserve_zero_reach(tmp_path):
     invalid = calculator.SocialMediaMetricsCalculator({
         "total_spend": -1,
         "posts": [{"reach": 0, "clicks": -1}],
     }).analyze_all()
     assert invalid["ok"] is False
     assert invalid["details"]["errors"] == [
-        "posts[0].reach must be > 0",
-        "posts[0].clicks must be non-negative",
-        "total_spend must be non-negative",
+        "campaign.total_spend must be a finite non-negative number",
+        "posts[0].clicks must be a finite non-negative number",
     ]
+
+    zero_reach = sample_campaign()
+    for post in zero_reach["posts"]:
+        post["reach"] = 0
+    result = calculator.SocialMediaMetricsCalculator(zero_reach).analyze_all()
+    assert result["ok"] is True
+    assert result["campaign_metrics"]["avg_engagement_rate"] is None
+    assert result["campaign_metrics"]["unavailable_reasons"] == {
+        "avg_engagement_rate": "zero denominator: reach",
+    }
+    assert result["roi_metrics"]["cost_per_click"] == 4.0
 
     payload = tmp_path / "invalid.json"
     payload.write_text(json.dumps({"posts": []}), encoding="utf-8")

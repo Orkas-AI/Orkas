@@ -25,6 +25,16 @@ test('publishes bundled resources before boot readiness across first use and res
         expect(existsSync(path.join(app.workspaceRoot, uid, 'local/marketplace', kind, entry.name, file))).toBe(true);
       }
     }
+    for (const entry of readdirSync(path.join(bundled, 'apps'), { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith('builtin-')) continue;
+      const source = path.join(bundled, 'apps', entry.name);
+      const installed = path.join(app.workspaceRoot, uid, 'local/builtin_apps', entry.name);
+      const metadata = JSON.parse(readFileSync(path.join(source, '__orkas-meta.json'), 'utf8'));
+      expect(JSON.parse(readFileSync(path.join(installed, '__orkas-meta.json'), 'utf8')))
+        .toMatchObject({ version: metadata.version, browserStorage: 'isolated-v1' });
+      expect(readFileSync(path.join(installed, metadata.entry || 'index.html'), 'utf8'))
+        .toBe(readFileSync(path.join(source, metadata.entry || 'index.html'), 'utf8'));
+    }
     return localManifest;
   }
   try {

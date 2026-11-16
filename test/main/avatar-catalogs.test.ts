@@ -210,7 +210,6 @@ describe('avatar catalogs', () => {
       ['resources/builtin/marketplace/agents/a4930d19ba6c/agent.json', 'ECommerceReviewer', 'shopping-bag', 'sky'],
       ['resources/builtin/marketplace/agents/bc7e2a904d18/agent.json', 'ECommerceAnalyzer', 'shopping-bag', 'sky'],
       ['resources/builtin/marketplace/agents/e0f3a98c624b/agent.json', 'ECommerceOperator', 'shopping-bag', 'lime'],
-      ['resources/builtin/marketplace/agents/fa3e1f2f9e07/agent.json', 'ECommerceWriter', 'shopping-bag', 'peach'],
     ] as const;
 
     const officialAgentFiles = [

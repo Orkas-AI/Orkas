@@ -1,6 +1,6 @@
 ---
 name: orkas-guide
-description: "Resolve Orkas support, usage conditions, credits and costs, configuration, operation and recovery facts for questions or actions, including implicit product assumptions. Not for Orkas-independent content; supplies facts, not task ownership or operation authority."
+description: "Resolve Orkas support, usage conditions, credits and costs, configuration, operation and recovery facts for questions or actions, including implicit product assumptions. Skip operations fully specified by tool descriptions and current app state. Not for Orkas-independent content; supplies facts, not task ownership or operation authority."
 ---
 
 # Orkas Guide

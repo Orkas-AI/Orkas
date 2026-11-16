@@ -289,3 +289,96 @@ describe('bundled content startup boundary', () => {
       .toBe(true);
   });
 });
+
+
+function writeStartupApp(version = '1.0.0'): string {
+  const id = 'builtin-startup-fixture';
+  const root = path.join(tmpDir, 'builtin/apps', id);
+  writeJson(path.join(root, '__orkas-meta.json'), { version, title: 'Startup fixture', appType: 'local', entry: 'index.html' });
+  fs.writeFileSync(path.join(root, 'index.html'), `<html>Startup app ${version}</html>`);
+  return id;
+}
+
+describe('builtin application publication inside startup', () => {
+  it('installs packaged apps before successful startup completion and keeps repeated boot passes free', async () => {
+    const paths = await activateTestUser();
+    const id = writeStartupApp();
+    const apps = await import('../../../src/main/features/builtin_apps');
+    const publish = vi.spyOn(apps, 'syncBuiltinApps');
+    const startup = await import('../../../src/main/features/bundled_content_startup');
+    await expect(startup.syncBundledContentForUser(UID, { reason: 'first-window' })).resolves.toMatchObject({ failed: [] });
+    expect(publish).toHaveBeenCalledOnce();
+    const file = path.join(paths.userBuiltinAppsDir(UID), id, 'index.html');
+    expect(fs.readFileSync(file, 'utf8')).toBe('<html>Startup app 1.0.0</html>');
+    writeStartupApp('1.1.0');
+    await startup.syncBundledContentForUser(UID, { reason: 'startup' });
+    expect(publish).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(file, 'utf8')).toBe('<html>Startup app 1.0.0</html>');
+    await startup.syncBundledContentForUser(UID, { reason: 'manual-refresh' });
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(fs.readFileSync(file, 'utf8')).toBe('<html>Startup app 1.1.0</html>');
+  });
+
+  it('retries a busy app upgrade on the next startup trigger after its reader releases it', async () => {
+    const paths = await activateTestUser();
+    const id = writeStartupApp();
+    const apps = await import('../../../src/main/features/builtin_apps');
+    await apps.syncBuiltinApps(UID);
+    writeStartupApp('1.1.0');
+    const release = apps.holdBuiltinApp(UID, id);
+    const startup = await import('../../../src/main/features/bundled_content_startup');
+    const file = path.join(paths.userBuiltinAppsDir(UID), id, 'index.html');
+    try {
+      const result = await startup.syncBundledContentForUser(UID, { reason: 'first-window' });
+      expect(result.failed).toEqual(['builtin_apps']);
+      expect(result.marketplace).toMatchObject({ seeded_agents: 1 });
+      expect(fs.readFileSync(file, 'utf8')).toBe('<html>Startup app 1.0.0</html>');
+    } finally { release(); }
+    expect(await startup.syncBundledContentForUser(UID, { reason: 'startup' })).toMatchObject({ failed: [] });
+    expect(fs.readFileSync(file, 'utf8')).toBe('<html>Startup app 1.1.0</html>');
+  });
+
+  it('contains an app publication error, preserves other content and retries without logging private diagnostics', async () => {
+    const paths = await activateTestUser();
+    const id = writeStartupApp();
+    const apps = await import('../../../src/main/features/builtin_apps');
+    const logger = await import('../../../src/main/logger');
+    const original = logger.createLogger;
+    const warnings: unknown[] = [];
+    vi.spyOn(logger, 'createLogger').mockImplementation(scope => {
+      const log = original(scope);
+      return scope !== 'bundled-content' ? log : { ...log, warn: (message, ...args) => { warnings.push([message, ...args].map(x => logger.redact(x))); } };
+    });
+    vi.spyOn(apps, 'syncBuiltinApps').mockRejectedValueOnce(Object.assign(new Error('Confidential app draft'), { code: 'EACCES' }));
+    const startup = await import('../../../src/main/features/bundled_content_startup');
+    const result = await startup.syncBundledContentForUser(UID, { reason: 'first-window' });
+    expect(result.failed).toEqual(['builtin_apps']);
+    expect(result.system_skills).toEqual([expect.objectContaining({ action: 'created' })]);
+    expect(result.marketplace).toMatchObject({ seeded_agents: 1 });
+    expect(JSON.stringify(warnings)).not.toContain('Confidential app draft');
+    expect(JSON.stringify(warnings)).toContain('EACCES');
+    expect(await startup.syncBundledContentForUser(UID, { reason: 'startup' })).toMatchObject({ failed: [] });
+    expect(fs.existsSync(path.join(paths.userBuiltinAppsDir(UID), id, 'index.html'))).toBe(true);
+  });
+
+  it('stops after app publication when its context expires and leaves the next trigger able to recover', async () => {
+    await activateTestUser();
+    writeStartupApp();
+    const apps = await import('../../../src/main/features/builtin_apps');
+    let active = true;
+    vi.spyOn(apps, 'syncBuiltinApps').mockImplementationOnce(async (_uid, allowed) => {
+      expect(allowed?.()).toBe(true);
+      active = false;
+      return { changed: 0, deferred: 0 };
+    });
+    const marketplace = await import('../../../src/main/features/builtin_marketplace_startup');
+    const seed = vi.spyOn(marketplace, 'seedBuiltinMarketplaceForUser');
+    const startup = await import('../../../src/main/features/bundled_content_startup');
+    const result = await startup.syncBundledContentForUser(UID, { reason: 'first-window', shouldContinue: () => active });
+    expect(result.marketplace).toBeNull();
+    expect(seed).not.toHaveBeenCalled();
+    active = true;
+    expect(await startup.syncBundledContentForUser(UID, { reason: 'startup', shouldContinue: () => active })).toMatchObject({ failed: [], marketplace: { seeded_agents: 1 } });
+    expect(seed).toHaveBeenCalledOnce();
+  });
+});

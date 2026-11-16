@@ -1,10 +1,48 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { spawn } from 'node:child_process';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+
+// Allow readers while reproducing Windows' refusal to replace an open file.
+async function holdWindowsManifest(file: string): Promise<{ unlock: () => void; release: () => Promise<void> }> {
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    '$stream = [IO.File]::Open($env:ORKAS_TEST_LOCK_FILE, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)',
+    "try { [Console]::Out.WriteLine('locked'); [Console]::Out.Flush(); [Console]::In.ReadLine() | Out-Null } finally { $stream.Dispose() }",
+  ].join('; ');
+  const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+    env: { ...process.env, ORKAS_TEST_LOCK_FILE: file }, stdio: 'pipe', windowsHide: true,
+  });
+  let stdout = '', stderr = '';
+  const closed = new Promise<void>(resolve => child.once('close', () => resolve()));
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill(); reject(new Error('Windows manifest lock startup timed out')); }, 10_000);
+    child.stdout.on('data', chunk => {
+      stdout += String(chunk);
+      if (stdout.trim() === 'locked') { clearTimeout(timer); resolve(); }
+    });
+    child.stderr.on('data', chunk => { stderr += String(chunk); });
+    child.once('error', error => { clearTimeout(timer); reject(error); });
+    child.once('close', () => {
+      clearTimeout(timer);
+      if (stdout.trim() !== 'locked') reject(new Error(`Windows manifest lock failed: ${stderr}`));
+    });
+  });
+  const unlock = () => { if (!child.stdin.writableEnded) child.stdin.end(); };
+  return { unlock, release: async () => {
+    unlock();
+    const timer = setTimeout(() => child.kill(), 5_000);
+    try { await closed; } finally { clearTimeout(timer); }
+    expect(child.exitCode).toBe(0);
+    expect(stdout.trim()).toBe('locked');
+    expect(stderr).toBe('');
+  } };
+}
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-marketplace-installs-'));
@@ -20,6 +58,52 @@ afterEach(() => {
 });
 
 describe('marketplace install manifest', () => {
+  it.runIf(process.platform === 'win32').each(['agent', 'skill'] as const)(
+    'publishes queued %s installs atomically after a Windows reader releases its file lock', async kind => {
+      const installs = await import('../../../src/main/features/marketplace_installs');
+      const add = kind === 'agent' ? installs.addAgentInstall : installs.addSkillInstall;
+      const bucket = kind === 'agent' ? 'agents' : 'skills';
+      const row = { id: 'existing', version: '1.0.0', published_at: 1, agent_json_url: '', bundle_url: '' };
+      await add('u1', row);
+      const file = path.join(tmpDir, 'u1/cloud/marketplace/installs.json');
+      const before = fs.readFileSync(file, 'utf8');
+      const lock = await holdWindowsManifest(file);
+      const started = performance.now();
+      const unlock = setTimeout(lock.unlock, 100);
+      try {
+        const pending = Promise.allSettled([
+          add('u1', { ...row, version: '2.0.0' }), add('u1', { ...row, id: 'queued' }),
+        ]);
+        expect(fs.readFileSync(file, 'utf8')).toBe(before);
+        const results = await pending;
+        expect(results.map(result => result.status === 'fulfilled' ? result.value : result.reason.code)).toEqual([true, true]);
+        const current = await installs.readInstalls('u1');
+        expect(current[bucket].map(item => [item.id, item.version])).toEqual([
+          ['existing', '2.0.0'], ['queued', '1.0.0'],
+        ]);
+      } finally {
+        console.info('Windows manifest publication duration', { kind, duration_ms: performance.now() - started });
+        clearTimeout(unlock);
+        await lock.release();
+      }
+    },
+  );
+
+  it.runIf(process.platform === 'win32')('preserves the old manifest after a persistent Windows lock and allows the next install', async () => {
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const row = { id: 'existing', version: '1.0.0', published_at: 1, agent_json_url: '' };
+    await installs.addAgentInstall('u1', row);
+    const file = path.join(tmpDir, 'u1/cloud/marketplace/installs.json');
+    const before = fs.readFileSync(file, 'utf8');
+    const lock = await holdWindowsManifest(file);
+    try {
+      await expect(installs.addAgentInstall('u1', { ...row, id: 'rejected' })).rejects.toMatchObject({ code: 'EPERM' });
+      expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    } finally { await lock.release(); }
+    await installs.addAgentInstall('u1', { ...row, id: 'next' });
+    expect((await installs.readInstalls('u1')).agents.map(item => item.id)).toEqual(['existing', 'next']);
+  });
+
   it('records uninstall tombstones and clears them on reinstall', async () => {
     const installs = await import('../../../src/main/features/marketplace_installs');
 
@@ -204,4 +288,68 @@ it.each([false, true])('removes a migrated snapshot ID only while its install cl
   const current = await installs.readInstalls('u1');
   expect(current.agents.some((item) => item.id === 'new-id')).toBe(true);
   expect(current.agents.find((item) => item.id === 'old-id')?.version).toBe(reinstalled ? '2.0.0' : undefined);
+});
+
+
+// These fault-controlled filesystem outcomes execute the Windows publication
+// branch on any host. Native Windows sharing/locking is checked separately above.
+it.each(['agent', 'skill'] as const)('preserves complete bytes through transient Windows %s publication locks and queued installs', async kind => {
+  const installs = await import('../../../src/main/features/marketplace_installs');
+  const add = kind === 'agent' ? installs.addAgentInstall : installs.addSkillInstall;
+  const bucket = kind === 'agent' ? 'agents' : 'skills';
+  const row = { id: 'existing', version: '1.0.0', published_at: 1, agent_json_url: '', bundle_url: '' };
+  await add('u1', row);
+  const file = path.join(tmpDir, 'u1/cloud/marketplace/installs.json');
+  const before = fs.readFileSync(file);
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  const rename = fs.promises.rename.bind(fs.promises);
+  let blocked = 2;
+  let timerRan = false;
+  const timer = setTimeout(() => { timerRan = true; }, 0);
+  vi.spyOn(fs.promises, 'rename').mockImplementation(async (from, to) => {
+    if (String(to) === file && blocked-- > 0) {
+      expect(fs.readFileSync(file)).toEqual(before);
+      throw Object.assign(new Error('fixture reader holds destination'), { code: 'EPERM' });
+    }
+    await rename(from, to);
+  });
+  syncBuiltinESMExports();
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  try {
+    const results = await Promise.allSettled([add('u1', { ...row, version: '2.0.0' }), add('u1', { ...row, id: 'queued' })]);
+    expect(results.map(result => result.status === 'fulfilled' ? result.value : result.reason.code)).toEqual([true, true]);
+    const published = await installs.readInstalls('u1');
+    expect(published[bucket].map(item => [item.id, item.version])).toEqual([['existing', '2.0.0'], ['queued', '1.0.0']]);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))[bucket]).toEqual(published[bucket]);
+    expect(timerRan).toBe(true);
+  } finally {
+    clearTimeout(timer);
+    Object.defineProperty(process, 'platform', platform);
+    vi.restoreAllMocks(); syncBuiltinESMExports();
+  }
+});
+
+it('retains the last complete manifest after a persistent Windows publication fault and permits explicit recovery', async () => {
+  const installs = await import('../../../src/main/features/marketplace_installs');
+  const row = { id: 'existing', version: '1.0.0', published_at: 1, agent_json_url: '' };
+  await installs.addAgentInstall('u1', row);
+  const file = path.join(tmpDir, 'u1/cloud/marketplace/installs.json');
+  const before = fs.readFileSync(file);
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  const rename = fs.promises.rename.bind(fs.promises);
+  vi.spyOn(fs.promises, 'rename').mockImplementation(async (from, to) => {
+    if (String(to) === file) throw Object.assign(new Error('fixture persistent reader'), { code: 'EBUSY' });
+    await rename(from, to);
+  });
+  syncBuiltinESMExports();
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  try {
+    await expect(installs.addAgentInstall('u1', { ...row, id: 'refused' })).rejects.toMatchObject({ code: 'EBUSY' });
+    expect(fs.readFileSync(file)).toEqual(before);
+  } finally {
+    Object.defineProperty(process, 'platform', platform);
+    vi.restoreAllMocks(); syncBuiltinESMExports();
+  }
+  await installs.addAgentInstall('u1', { ...row, id: 'recovered' });
+  expect((await installs.readInstalls('u1')).agents.map(item => item.id)).toEqual(['existing', 'recovered']);
 });

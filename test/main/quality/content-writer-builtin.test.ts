@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import { validateAgentDir, validateSkillDir } from '../../../src/main/quality';
+import { SkillLoader } from '../../../src/core-agent/src/skills/loader';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '../../..');
@@ -14,9 +15,71 @@ const agentDir = path.join(builtinMarketplaceRoot, 'agents', '173d4235a431');
 const skillDir = path.join(builtinMarketplaceRoot, 'skills', '9dfbd4e00c0d');
 
 describe('ContentWriter builtin contract', () => {
+  it('accepts requested planning artifacts while rejecting execution-status substitutes in the real handoff', async () => {
+    const spec = JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8'));
+    const boundary = spec.standards[4];
+    expect(boundary).toMatch(/execution plans or status updates.*cannot substitute/i);
+    expect(boundary).toMatch(/requested outlines, content plans and calendars.*valid artifacts/i);
+    expect(boundary).toMatch(/completion summary.*not an artifact/i);
+    const { normalizeAgent } = await import('../../../src/main/features/agents');
+    const { _buildAgentInGroupSystemPromptForTest } = await import('../../../src/main/features/group_chat/bus');
+    const prompt = await _buildAgentInGroupSystemPromptForTest(normalizeAgent(spec, 'builtin')!, '/test/content-plan', 'en');
+    expect(prompt.split(boundary)).toHaveLength(2);
+    expect(prompt).not.toContain('A plan or status update is not an artifact');
+    expect(prompt).toContain('A content calendar is a writing artifact');
+  });
+
+  it('ships every former social capability with the editorial owner for offline use', () => {
+    const spec = JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8'));
+    const expected = new Map([
+      ['9dfbd4e00c0d', 'content-writer'],
+      ['de1fe2e2c26a', 'social-publish'],
+    ]);
+    const loaded = new SkillLoader({ dirs: [path.join(builtinMarketplaceRoot, 'skills')] }).list();
+    for (const [id, name] of expected) {
+      expect(spec.skill_list).toContain(id);
+      const dir = path.join(builtinMarketplaceRoot, 'skills', id);
+      const entry = fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8');
+      expect(entry).toMatch(new RegExp(`^name: ${name}$`, 'm'));
+      expect(spec.workflow).toContain(`\`${name}\``);
+      expect(loaded.find(skill => skill.id === id)?.name).toBe(name);
+      expect(validateSkillDir(dir).ok).toBe(true);
+      const meta = JSON.parse(fs.readFileSync(path.join(dir, '_meta.json'), 'utf8'));
+      expect(meta.version).toMatch(/^\d+\.\d+\.\d+$/);
+    }
+    expect(spec.skill_list).not.toContain('fb79ebe322c7');
+    expect(spec.workflow).not.toContain('`social-writer`');
+    const publish = fs.readFileSync(path.join(builtinMarketplaceRoot, 'skills/de1fe2e2c26a/SKILL.md'), 'utf8');
+    expect(publish).toContain('The final publish action must be performed manually by the user.');
+    expect(publish).toContain('preserve original content; do not silently rewrite.');
+    expect(spec.workflow).toMatch(/Only for explicitly requested platform preparation/);
+    expect(spec.inputs.find((input: any) => input.id === 'files').accept).toContain('image/*,video/*');
+  });
+
   it('ships from the packaged builtin marketplace paths', () => {
     expect(fs.existsSync(path.join(agentDir, 'agent.json'))).toBe(true);
     expect(fs.existsSync(path.join(skillDir, 'SKILL.md'))).toBe(true);
+  });
+
+  it('uses one writing pipeline with platform craft and calendar/reply extensions', () => {
+    const skill = fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8');
+    const modes = [...skill.matchAll(/^\| `([^`]+)` \|/gm)].map(match => match[1]);
+    expect(modes).toEqual(['plan', 'research', 'draft', 'revise', 'humanize', 'audit', 'adapt', 'calendar', 'respond']);
+    const formats = fs.readFileSync(path.join(skillDir, 'references/content-formats.md'), 'utf8');
+    const programs = fs.readFileSync(path.join(skillDir, 'references/content-programs.md'), 'utf8');
+    expect(skill).toMatch(/calendar.*respond[\s\S]*references\/content-programs\.md/);
+    expect(skill).not.toMatch(/Do not use it for social calendars/);
+    expect(skill).toMatch(/same brief, evidence policy/);
+    for (const platform of ['Xiaohongshu', 'WeChat', 'Zhihu', 'Douyin', 'Kuaishou', 'Bilibili', 'Weibo', 'LinkedIn', 'Instagram', 'TikTok']) {
+      expect(formats).toContain(platform);
+    }
+    expect(formats).toContain('complete revised draft');
+    expect(formats).toContain('plain text');
+    expect(programs).toContain('a table of topics is not a substitute');
+    expect(programs).toContain('low, medium, high, critical');
+    expect(programs).toContain('coordinated attack');
+    expect(programs).toContain('do not promise refunds');
+    expect(programs).toContain('does not authorize scheduling');
   });
 
   it('keeps the packaged agent and skill identities aligned', () => {
@@ -25,7 +88,7 @@ describe('ContentWriter builtin contract', () => {
 
     expect(agent.agent_id).toBe('173d4235a431');
     expect(agent.name).toBe('ContentWriter');
-    expect(agent.skill_list).toEqual(['9dfbd4e00c0d']);
+    expect(agent.skill_list).toEqual(['9dfbd4e00c0d', 'de1fe2e2c26a', 'de52c67d49dd']);
     expect(fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8')).toContain('name: content-writer');
     expect(agent.version).toMatch(/^\d+\.\d+\.\d+$/);
     expect(skillMeta.version).toMatch(/^\d+\.\d+\.\d+$/);
@@ -37,38 +100,32 @@ describe('ContentWriter builtin contract', () => {
     expect(spec.agent_id).toBe('173d4235a431');
     expect(spec.name).toBe('ContentWriter');
     expect(spec.min_app_version).toBeUndefined();
-    expect(spec.skill_list).toEqual(['9dfbd4e00c0d']);
+    expect(spec.skill_list).toEqual(['9dfbd4e00c0d', 'de1fe2e2c26a', 'de52c67d49dd']);
     expect(spec).not.toHaveProperty('delivery_checks');
     expect(spec.interactive).toBe(false);
     expect(spec.inputs.find((input: any) => input.id === 'task')?.required).toBe(true);
     expect(spec.inputs.find((input: any) => input.id === 'files')?.multiple).toBe(true);
     expect(spec.inputs.map((input: any) => input.id)).toEqual(['task', 'files']);
-    expect(spec.description_zh).toContain('社媒成稿');
+    expect(spec.description_zh).toMatch(/文案/);
+    expect(spec.description_zh).toMatch(/社媒/);
     expect(spec.description_en).toContain('social');
-    expect(spec.standards.join('\n')).toContain('user-supplied range only as scope');
-    expect(spec.standards.join('\n')).toContain('internal values');
-    expect(spec.standards.join('\n')).toContain('label that exact occurrence Hypothesis/Proposed');
-    expect(spec.standards.join('\n')).toContain('skip manage_execution_plan');
-    expect(spec.standards.join('\n')).not.toContain('deliver the complete draft in the response');
-    expect(spec.standards.join('\n')).toMatch(/shared delivery rules/i);
+    const standards = spec.standards.join('\n');
+    expect(standards).toMatch(/audience|reader/i);
+    expect(standards).toMatch(/language.*tone.*length/i);
+    expect(standards).toMatch(/claims.*supported|supported.*claims/i);
+    expect(standards).toMatch(/revisions preserve.*scope.*certainty.*citations.*disclosures/i);
+    expect(standards).toMatch(/voice/i);
+    expect(standards).not.toMatch(/manage_execution_plan|population, exposure or intervention/i);
     expect(spec.standards.join('\n')).toContain('completion summary is not an artifact');
     expect(spec.standards.join('\n')).not.toMatch(/20\s*[-–]\s*100|SaaS|remote collaboration/i);
-    expect(spec.workflow).toContain('Never ask which publishing platform to use');
-    expect(spec.workflow).toContain('apply named platform constraints or use a neutral default');
+    expect(spec.workflow).toMatch(/intended use[\s\S]*editorial.*social[\s\S]*product-commerce/i);
 
     expect(spec.workflow).not.toContain('instead of persisting or publishing');
-    expect(spec.workflow.length).toBeLessThan(1_500);
+    expect(spec.workflow.length).toBeLessThanOrEqual(1_800);
     for (const marker of [
       'Read `content-writer` as the governing Skill',
       'smallest applicable mode sequence',
-      'working brief',
-      'evidence policy',
-      'atomic support/limitation pairs',
-      'progressive references',
-      'durable ledger',
-      'deterministic gates',
       'Return the requested artifact in the current turn',
-      'publishing and platform operation remain out of scope',
       'Audit material claims, citations, disclosures, and the requested format',
     ]) {
       expect(spec.workflow, marker).toContain(marker);
@@ -114,7 +171,7 @@ describe('ContentWriter builtin contract', () => {
     expect(report.violations).toEqual([]);
   });
 
-  it('pins all seven modes and the evidence/edit/publication contracts', () => {
+  it('keeps the editorial modes and evidence/edit/publication contracts across formats', () => {
     const skill = fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8');
     const formats = fs.readFileSync(path.join(skillDir, 'references', 'content-formats.md'), 'utf8');
     const research = fs.readFileSync(
@@ -142,7 +199,7 @@ describe('ContentWriter builtin contract', () => {
     expect(skill).toContain('In plan, label Reader');
     expect(skill).toContain('Format/type, Tone, Working assumptions');
     expect(skill).toContain('unsupplied premises or none');
-    expect(skill).toContain('Platform is optional');
+    expect(skill).toMatch(/ordinary social.*editorial.*platform is optional/i);
     expect(skill).toContain('never ask for it or offer choices');
     expect(skill).toContain('Before returning a plan, audit titles, headings, assumptions, examples, and bullets');
     expect(skill).toContain('Input ranges define scope only');
@@ -163,23 +220,23 @@ describe('ContentWriter builtin contract', () => {
     }
     expect(skill).toContain('generic bridge claims');
     expect(skill).toContain('individual social posts');
-    expect(skill).toContain('first non-empty line a distinct headline');
-    expect(skill).toContain('explicit low-friction action or decision prompt');
-    expect(skill).toContain('skip `manage_execution_plan`');
-    expect(skill).toContain('artifact-first `draft`, `revise`, `humanize`, or `adapt`');
-    expect(skill).toContain('not a plan/status update or completion summary');
-    expect(skill).toContain('before/after durations');
-    expect(skill).toContain('quantified performance or outcome claims');
-    expect(skill).toContain('Replaceable options');
-    expect(skill).toContain('alternate CTA');
-    expect(skill).toContain('end the main post with an explicit interaction CTA');
-    expect(skill).toContain('`可替换选项` in Chinese');
-    expect(skill).toContain('at least two qualitative input-to-output mini-examples');
-    expect(skill).toContain('Never invent time saved or outcome metrics');
-    expect(skill).toContain('Add one copy-ready prompt using `[输入材料]`');
-    expect(skill).toContain('`[输出格式]`, `[读者]`, and `[待核验项]`');
-    expect(skill).toContain('a per-scenario placeholder');
-    expect(skill).toContain('not fixed meeting fields');
+    expect(bundle).toContain('first non-empty line a distinct headline');
+    expect(bundle).toContain('explicit low-friction action or decision prompt');
+    expect(bundle).toContain('skip `manage_execution_plan`');
+    expect(bundle).toContain('artifact-first `draft`, `revise`, `humanize`, or `adapt`');
+    expect(bundle).toContain('not a plan/status update or completion summary');
+    expect(bundle).toContain('before/after durations');
+    expect(bundle).toContain('quantified performance or outcome claims');
+    expect(bundle).toContain('Replaceable options');
+    expect(bundle).toContain('alternate CTA');
+    expect(bundle).toContain('end the main post with an explicit interaction CTA');
+    expect(bundle).toContain('`可替换选项` in Chinese');
+    expect(bundle).toContain('at least two qualitative input-to-output mini-examples');
+    expect(bundle).toContain('Never invent time saved or outcome metrics');
+    expect(bundle).toContain('Add one copy-ready prompt using `[输入材料]`');
+    expect(bundle).toContain('`[输出格式]`, `[读者]`, and `[待核验项]`');
+    expect(bundle).toContain('a per-scenario placeholder');
+    expect(bundle).toContain('not fixed meeting fields');
     expect(skill).toContain('add no interpretation, implication, bridge claim');
     expect(skill).toContain('A headline is also a claim');
     expect(skill).toContain('make the first line `主题：...`');
@@ -207,16 +264,16 @@ describe('ContentWriter builtin contract', () => {
     // HOLD is a publication decision; it must not disable the preflight file/runner route.
     expect(skill).toContain('Require qualified review for high-stakes');
     expect(bundle).not.toMatch(/do not persist the blocked\s+input|Skip that runner input|input file would itself be an unsafe/);
-    expect(skill).toContain('vague rhetorical question');
-    expect(skill).toContain('For an unlisted format');
+    expect(bundle).toContain('vague rhetorical question');
+    expect(skill).toMatch(/unlisted copy format within the caller's scope/i);
     expect(skill).toContain('unfamiliar channel');
     expect(skill).toContain('bounded `current-research`, do not load it');
     expect(formats).toContain('roughly 450–700 Chinese characters');
     expect(formats).toContain('Never ask which publishing platform to use');
     expect(formats).toContain('only when they materially change the artifact');
-    expect(formats).toContain('do not call `manage_execution_plan`');
+    expect(formats).toContain('skip `manage_execution_plan`');
     expect(formats).toContain('status/completion summary');
-    expect(formats).toContain('If the exact format is not listed');
+    expect(formats).toMatch(/copy format within the caller's scope that is not listed/i);
     expect(bundle).toContain('Judge the delivered artifact after applied edits');
     expect(bundle).toContain('Evidence required for the stronger claim');
     expect(bundle).toContain('may not drop a limitation');
@@ -288,7 +345,66 @@ describe('ContentWriter builtin contract', () => {
     }
   });
 
-  it('executes the research completeness gate through the real Skill Runner', () => {
+  it('keeps coverage and freshness decisions separate for undated sources', () => {
+    const runner = path.join(repoRoot, 'bin', 'run-skill.cjs');
+    const gate = (sources: unknown[]) => {
+      const result = spawnSync(
+        process.execPath,
+        [runner, 'content-writer', 'research_gate', '--', '-', '--format', 'json'],
+        {
+          cwd: repoRoot,
+          env: { ...process.env, ORKAS_RUN_SKILL_DIR: skillDir },
+          encoding: 'utf8',
+          input: JSON.stringify({
+            required_families: ['market-size', 'buyer-needs'],
+            sources,
+          }),
+        },
+      );
+      expect(result.status, `stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
+      return JSON.parse(result.stdout);
+    };
+
+    const undatedCoverage = gate([
+      { url: 'https://authority.example/reports/market', families: ['market-size'], status: 'usable', published: '2026-07-30' },
+      { url: 'https://research.example/buyer-needs', families: ['buyer-needs'], status: 'usable' },
+    ]);
+    expect(undatedCoverage.decision).toBe('READY_TO_DRAFT');
+    expect(undatedCoverage.missing_families).toEqual([]);
+    expect(undatedCoverage.usable_source_count).toBe(2);
+    expect(undatedCoverage.undated_families).toEqual(['buyer-needs']);
+    expect(undatedCoverage.reasons).toEqual([]);
+    expect(undatedCoverage.advisories.join(' ')).toContain(
+      'assess whether each retained claim needs a dated source',
+    );
+
+    const withDatedCoverage = gate([
+      { url: 'https://authority.example/reports/market', families: ['market-size'], status: 'usable', published: '2026-07-30' },
+      { url: 'https://research.example/buyer-needs', families: ['buyer-needs'], status: 'usable', published: '2026-07-22' },
+    ]);
+    expect(withDatedCoverage.decision).toBe('READY_TO_DRAFT');
+    expect(withDatedCoverage.undated_families).toEqual([]);
+
+    // A date the row cannot actually have is not a date. Invented precision is
+    // already forbidden; this makes an impossible one fail closed rather than
+    // silently unlock a family.
+    const impossibleDate = gate([
+      { url: 'https://authority.example/reports/market', families: ['market-size'], status: 'usable', published: '2026-02-31' },
+      { url: 'https://research.example/buyer-needs', families: ['buyer-needs'], status: 'usable', published: '2026/06/18' },
+    ]);
+    expect(impossibleDate.decision).toBe('READY_TO_DRAFT');
+    expect(impossibleDate.undated_families).toEqual(['market-size', 'buyer-needs']);
+    expect(impossibleDate.advisories).toHaveLength(1);
+
+    const missingCoverage = gate([
+      { url: 'https://authority.example/reports/market', families: ['market-size'], status: 'usable', published: '2026-07-30' },
+    ]);
+    expect(missingCoverage.decision).toBe('CONTINUE_RESEARCH');
+    expect(missingCoverage.missing_families).toEqual(['buyer-needs']);
+    expect(missingCoverage.reasons.join(' ')).toContain('missing evidence families');
+  });
+
+  it('allows one comprehensive source to cover multiple task-derived evidence families', () => {
     const runner = path.join(repoRoot, 'bin', 'run-skill.cjs');
     const result = spawnSync(
       process.execPath,

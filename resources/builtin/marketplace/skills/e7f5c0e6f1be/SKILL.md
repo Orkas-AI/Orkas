@@ -140,5 +140,4 @@ For performance analysis:
 - Public fetches are samples, not complete platform analytics.
 - Anonymous Reddit/Bilibili recall can be weak; browser login cookies may improve results only after explicit user permission and the `--use-browser-cookies` flag.
 - Xiaohongshu requires an external local proxy service at `http://localhost:18060`.
-- ROI estimates based on engagement value are assumptions unless the user provides real revenue, conversion value, or lead value.
 - Benchmark values can become stale and should be treated as rough context, not a pass/fail truth.

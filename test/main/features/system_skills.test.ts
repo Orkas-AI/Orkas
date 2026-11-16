@@ -567,6 +567,46 @@ describe('system skill contracts', () => {
     expect(md).not.toContain('Both are required');
   });
 
+  it('routes product facts in questions and execution requests to truthful Orkas guidance', () => {
+    const guide = packagedSystemSkill('orkas-guide');
+    const fileInputs = packagedSystemSkillReference('orkas-guide', 'file-inputs.md');
+    const settings = packagedSystemSkillReference('orkas-guide', 'settings-data-and-safety.md');
+    const resources = packagedSystemSkillReference(
+      'orkas-guide',
+      'agents-skills-and-connectors.md',
+    );
+
+    expect(frontmatterOf(guide)).toMatch(/answering or carrying out a request|questions or actions/);
+    expect(frontmatterOf(guide)).toMatch(/product assumptions embedded in task requirements|implicit product assumptions/);
+    expect(frontmatterOf(guide)).toMatch(/Owns product facts|supplies facts/);
+    expect(frontmatterOf(guide)).toMatch(/not task ownership or operation authori(?:zation|ty)/);
+    expect(guide).toContain('## Choose the support shape');
+    expect(guide).toContain('[file-inputs.md](references/file-inputs.md)');
+    expect(fileInputs).toMatch(/ZIP attachments are only for importing Skills; they cannot be read as ordinary documents/);
+    expect(fileInputs).toMatch(/attach it in\s+\*\*Commander\*\*/);
+    expect(fileInputs).toContain('Library or Project Library does not');
+    expect(fileInputs).toMatch(/extract (?:the archive|ordinary archives?).*(?:device|outside\s+Orkas)/is);
+    expect(fileInputs).toContain('Use the **Workspace** chip');
+    expect(settings).toContain('To use OpenAI or another model provider, add it in **Account settings > Models**');
+    expect(settings).toContain('Account settings > Models');
+    expect(settings).not.toContain('Settings > Credentials');
+    expect(settings).toContain('video generation, and text-to-speech are separate tabs');
+    expect(settings).toContain('service/model options currently shown');
+    expect(settings).not.toContain('**Runway · Gen-4.5**');
+    expect(settings).not.toContain('32,768');
+    expect(settings).toContain('does not expose a separate model picker or a **Test** action');
+    expect(settings).toContain('validate it with a small real generation');
+    expect(settings).toContain('Search and image providers use their own protected setup dialogs');
+    expect(settings).toContain('**Orkas · Voice** row can be enabled or disabled, but it is not deleted');
+    expect(settings).toContain('waiting or retrying without');
+    expect(settings).toMatch(
+      /Do not present a service connector or a\s+custom Agent as if it changed the model provider/,
+    );
+    expect(resources).toMatch(/A\s+model\/provider is configured separately/);
+    expect(resources).toMatch(/A connector is also not a model-provider substitute/);
+    expect(resources).toContain('does not provide a general Agent JSON import screen');
+  });
+
   it('packages product guidance with edition boundaries and no operation authority', () => {
     const guide = packagedSystemSkill('orkas-guide');
     expect(frontmatterOf(guide)).toContain('supplies facts, not task ownership or operation authority');

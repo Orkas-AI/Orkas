@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import AdmZip from 'adm-zip';
+import { sanitizeLogTextForUpload } from '../../../src/main/util/log-sanitize';
 
 const postJson = vi.hoisted(() => vi.fn());
 const warnings = vi.hoisted(() => vi.fn());
@@ -81,7 +82,9 @@ describe('marketplace update scheduling end to end', () => {
     const agents = Array.from({ length: 12 }, (_, i) => `agent-${i}`);
     const skills = Array.from({ length: 32 }, (_, i) => `skill-${i}`);
     const ctx = await setup(agents, skills);
-    expect(await ctx.reconcile.reconcileInstalls('u1')).toMatchObject({ pulled_agents: 12, pulled_skills: 32, failed: [] });
+    const result = await ctx.reconcile.reconcileInstalls('u1');
+    const diagnostics = warnings.mock.calls.map(([message]) => sanitizeLogTextForUpload(String(message)));
+    expect(result, JSON.stringify(diagnostics)).toMatchObject({ pulled_agents: 12, pulled_skills: 32, failed: [] });
     expectInstalled('agents', agents);
     expectInstalled('skills', skills);
     expect(ctx.peak()).toBeLessThanOrEqual(4);
